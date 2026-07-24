@@ -8,6 +8,7 @@ import {
   cycleSwipe,
   getMessage,
   getMessages,
+  listHiddenRecentChats,
   listRecentChats,
   listRecentChatsGrouped,
   patchMessageExtra,
@@ -257,6 +258,65 @@ describe("recent chats", () => {
     expect(result.total).toBe(1);
     expect(result.data[0].latest_chat_id).toBe("group-dup");
     expect(result.data[0].chat_count).toBe(2);
+  });
+
+  test("hides chats marked hidden_from_recent and surfaces the next recent chat", () => {
+    seedChat("c1-old", "c1", "Alpha old", "{}", 100);
+    seedChat("c1-new", "c1", "Alpha new", JSON.stringify({ hidden_from_recent: true }), 200);
+    seedChat("c2-only", "c2", "Beta only", "{}", 150);
+
+    const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 });
+
+    expect(result.total).toBe(2);
+    expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["c2-only", "c1-old"]);
+    expect(result.data[1].chat_count).toBe(1);
+  });
+
+  test("lists explicitly hidden chats for the landing-page restore manager", () => {
+    seedChat("visible", "c1", "Visible chat", "{}", 100);
+    seedChat("hidden-solo", "c1", "Hidden chat", JSON.stringify({ hidden_from_recent: true }), 200);
+    seedChat("hidden-group", "c2", "Hidden group", JSON.stringify({
+      hidden_from_recent: true,
+      group: true,
+      character_ids: ["c1", "c2"],
+    }), 300);
+
+    expect(listHiddenRecentChats("u1")).toEqual([
+      expect.objectContaining({ id: "hidden-group", name: "Hidden group", character_name: "Beta", is_group: true }),
+      expect.objectContaining({ id: "hidden-solo", name: "Hidden chat", character_name: "Alpha", is_group: false }),
+    ]);
+  });
+
+  test("pins favorite solo characters before pagination without moving groups", () => {
+    seedChat("favorite-old", "c1", "Favorite", "{}", 100);
+    seedChat("recent", "c2", "Recent", "{}", 300);
+    seedChat("group", "c2", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 200);
+
+    const result = listRecentChatsGrouped(
+      "u1",
+      { limit: 2, offset: 0 },
+      { favoriteCharacterIds: ["c1"] },
+    );
+
+    expect(result.total).toBe(3);
+    expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["favorite-old", "recent"]);
+  });
+
+  test("hides solo character cards before grouping and pagination but keeps groups", () => {
+    seedChat("c1-old", "c1", "Alpha old", "{}", 100);
+    seedChat("c1-new", "c1", "Alpha new", "{}", 300);
+    seedChat("c2-only", "c2", "Beta only", "{}", 200);
+    seedChat("group", "c1", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 250);
+
+    const result = listRecentChatsGrouped(
+      "u1",
+      { limit: 10, offset: 0 },
+      { hiddenCharacterIds: ["c1"] },
+    );
+
+    expect(result.total).toBe(2);
+    expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["group", "c2-only"]);
+    expect(result.data[0].is_group).toBe(true);
   });
 
   test("keeps reasoning scoped to the swipe it belongs to", () => {

@@ -92,6 +92,11 @@
   opacity: 0.4;
 }
 
+/* Let the desktop backdrop be the visual texture in translucent mode. */
+:global(html[data-tauri-desktop][data-desktop-background]) .grid {
+  display: none;
+}
+
 /* Content */
 .content {
   position: relative;
@@ -112,8 +117,47 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 16px 0;
-  margin-bottom: 24px;
+  padding: 16px 0 12px;
+  margin-bottom: 16px;
+}
+
+.landingToolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.landingSearch {
+  /* Allow the search field to yield space to the fixed-width toolbar actions
+     at high UI scales and narrow viewports. Without this, its intrinsic
+     minimum width can push the hidden-items button off screen. */
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.hiddenManagerBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--lumiverse-btn-icon, 34px);
+  height: var(--lumiverse-btn-icon, 34px);
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: 8px;
+  background: var(--lumiverse-fill-subtle);
+  color: var(--lumiverse-text-dim);
+  cursor: pointer;
+  transition: color var(--lumiverse-transition-fast), background var(--lumiverse-transition-fast), border-color var(--lumiverse-transition-fast);
+}
+
+.hiddenManagerBtn:hover,
+.hiddenManagerBtn:focus-visible {
+  color: var(--lumiverse-primary);
+  border-color: var(--lumiverse-primary-050);
+  background: var(--lumiverse-primary-010);
+  outline: none;
 }
 
 .logo {
@@ -667,6 +711,9 @@
 }
 
 .cardName {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-size: calc(14px * var(--lumiverse-font-scale, 1));
   font-weight: 600;
   color: var(--lumiverse-text);
@@ -674,6 +721,25 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   margin: 0;
+}
+
+.cardName svg,
+.listName svg {
+  flex-shrink: 0;
+  color: var(--lumiverse-primary-muted);
+}
+
+.cardName span,
+.listName span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.favoriteCard,
+.favoriteListItem {
+  border-color: var(--lumiverse-primary-030);
 }
 
 .cardMeta {
@@ -749,6 +815,21 @@
 .deleteBtn:hover {
   color: var(--lumiverse-danger);
   border-color: var(--lumiverse-danger-020);
+}
+
+/* Shift mode: make the remove-from-recent button visible and use a
+   non-destructive color cue so the user knows this is not a delete. */
+.deleteBtnShift,
+.card:hover .deleteBtnShift {
+  opacity: 1;
+  color: var(--lumiverse-primary);
+  border-color: var(--lumiverse-primary-030);
+  background: rgba(10, 10, 14, 0.85);
+}
+
+.deleteBtnShift:hover {
+  color: var(--lumiverse-primary-hover);
+  border-color: var(--lumiverse-primary-050);
 }
 
 /* ---- Group Chat Card ---- */
@@ -931,6 +1012,9 @@
 }
 
 .listName {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   margin: 0;
   min-width: 0;
   overflow: hidden;
@@ -1010,6 +1094,20 @@
 .listDeleteBtn:hover {
   color: var(--lumiverse-danger);
   border-color: var(--lumiverse-danger-020);
+}
+
+.listDeleteBtnShift,
+.listItem:hover .listDeleteBtnShift,
+.listItem:focus-within .listDeleteBtnShift {
+  opacity: 1;
+  color: var(--lumiverse-primary);
+  border-color: var(--lumiverse-primary-030);
+  background: color-mix(in srgb, var(--lumiverse-bg-deep) 92%, transparent);
+}
+
+.listDeleteBtnShift:hover {
+  color: var(--lumiverse-primary-hover);
+  border-color: var(--lumiverse-primary-050);
 }
 
 .listSkeleton {
@@ -1154,6 +1252,15 @@
 }
 
 @media (max-width: 600px) {
+  .header {
+    padding-bottom: 4px;
+    margin-bottom: 8px;
+  }
+
+  .landingToolbar {
+    margin-bottom: 14px;
+  }
+
   .content {
     padding: 16px;
   }

@@ -13,6 +13,7 @@ export interface Character {
   creator_notes: string;
   system_prompt: string;
   post_history_instructions: string;
+  folder: string;
   tags: string[];
   alternate_greetings: string[];
   talkativeness: number; // 0.0–1.0, default 0.5
@@ -39,6 +40,7 @@ export interface CreateCharacterInput {
   creator_notes?: string;
   system_prompt?: string;
   post_history_instructions?: string;
+  folder?: string;
   tags?: string[];
   alternate_greetings?: string[];
   talkativeness?: number;
@@ -51,11 +53,17 @@ export interface CharacterSummary {
   id: string;
   name: string;
   creator: string;
+  folder: string;
   tags: string[];
   image_id: string | null;
   created_at: number;
   updated_at: number;
   has_alternate_greetings: boolean;
+}
+
+export interface CharacterFolderMutationResponse {
+  updated: Character[];
+  count: number;
 }
 
 export interface TagCount {
@@ -108,6 +116,17 @@ export interface GroupedRecentChat {
   group_character_ids?: string[];
   group_name?: string;
   multiplayer?: boolean;
+}
+
+export interface HiddenRecentChat {
+  id: string;
+  character_id: string;
+  name: string;
+  character_name: string;
+  character_avatar_path: string | null;
+  character_image_id: string | null;
+  updated_at: number;
+  is_group: boolean;
 }
 
 export interface ChatSummary {
@@ -626,6 +645,12 @@ export interface PersonaAddon {
   content: string
   enabled: boolean
   sort_order: number
+  /** When set, content is exposed as {{persona_outlet::name}} instead of {{persona}}. */
+  outlet_name?: string | null
+  /** Persona-specific artwork shown while this add-on is active. */
+  avatar_image_id?: string
+  /** Optional square crop of avatar_image_id, preferred for avatar surfaces. */
+  avatar_crop_image_id?: string
 }
 
 export interface GlobalAddon {
@@ -641,6 +666,9 @@ export interface GlobalAddon {
 export interface AttachedGlobalAddon {
   id: string
   enabled: boolean
+  /** Avatar overrides belong to the persona attachment, not the shared add-on. */
+  avatar_image_id?: string
+  avatar_crop_image_id?: string
 }
 
 export interface CharacterPersonaBinding {
@@ -656,6 +684,8 @@ export interface Persona {
   subjective_pronoun: string;
   objective_pronoun: string;
   possessive_pronoun: string;
+  reflexive_pronoun: string;
+  possessive_pronoun_standalone: string;
   avatar_path: string | null;
   image_id: string | null;
   attached_world_book_id: string | null;
@@ -674,6 +704,8 @@ export interface CreatePersonaInput {
   subjective_pronoun?: string;
   objective_pronoun?: string;
   possessive_pronoun?: string;
+  reflexive_pronoun?: string;
+  possessive_pronoun_standalone?: string;
   folder?: string;
   is_default?: boolean;
   is_narrator?: boolean;

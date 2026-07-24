@@ -2045,9 +2045,10 @@ function AdvancedSettingsPanel({
   const seed = settings.seed ?? defaults.seed
   const stopStrings: string[] = settings.customStopStrings ?? defaults.customStopStrings
   const collapseMessages: boolean = settings.collapseMessages ?? defaults.collapseMessages
+  const trimIncompleteWords: boolean = settings.trimIncompleteWords ?? defaults.trimIncompleteWords
   const namesBehavior = completion.namesBehavior ?? completionDefaults.namesBehavior
 
-  const isActive = seed >= 0 || stopStrings.length > 0 || collapseMessages || namesBehavior !== completionDefaults.namesBehavior
+  const isActive = seed >= 0 || stopStrings.length > 0 || collapseMessages || trimIncompleteWords || namesBehavior !== completionDefaults.namesBehavior
 
   const handleSeedChange = (value: string) => {
     const num = parseInt(value)
@@ -2070,7 +2071,7 @@ function AdvancedSettingsPanel({
       <div className={clsx(s.accordionHeader, isActive && s.accordionHeaderActive)} onClick={() => setIsExpanded(!isExpanded)}>
         <Wrench size={12} style={{ color: isActive ? 'var(--lumiverse-primary)' : 'var(--lumiverse-text-dim)', flexShrink: 0 }} />
         <span className={s.accordionTitle}>{t('settings.advanced')}</span>
-        {isActive && <span className={s.accordionBadge}>{(seed >= 0 ? 1 : 0) + (stopStrings.length > 0 ? 1 : 0) + (collapseMessages ? 1 : 0) + (namesBehavior !== completionDefaults.namesBehavior ? 1 : 0)}</span>}
+        {isActive && <span className={s.accordionBadge}>{(seed >= 0 ? 1 : 0) + (stopStrings.length > 0 ? 1 : 0) + (collapseMessages ? 1 : 0) + (trimIncompleteWords ? 1 : 0) + (namesBehavior !== completionDefaults.namesBehavior ? 1 : 0)}</span>}
         {isExpanded ? <ChevronDown size={11} style={{ color: 'var(--lumiverse-text-dim)', flexShrink: 0 }} /> : <ChevronRight size={11} style={{ color: 'var(--lumiverse-text-dim)', flexShrink: 0 }} />}
       </div>
       {isExpanded && (
@@ -2114,6 +2115,9 @@ function AdvancedSettingsPanel({
           </div>
           <div className={s.settingsField}>
             <Toggle.Checkbox checked={collapseMessages} onChange={v => onSave({ collapseMessages: v })} label={t('settings.collapseMessages')} hint={t('settings.collapseHint')} />
+          </div>
+          <div className={s.settingsField}>
+            <Toggle.Checkbox checked={trimIncompleteWords} onChange={v => onSave({ trimIncompleteWords: v })} label={t('settings.trimIncompleteWords')} hint={t('settings.trimIncompleteWordsHint')} />
           </div>
         </div>
       )}
@@ -2238,8 +2242,8 @@ export default function LoomBuilder({
   const suppressNextProfileApplyRef = useRef<string | null>(null)
 
   const getProfileContextKey = useCallback(() => (
-    `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
-  ), [presetProfiles.activeChatId, presetProfiles.activeCharacterId, presetProfiles.activeProfileId])
+    `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activePersonaId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
+  ), [presetProfiles.activeChatId, presetProfiles.activePersonaId, presetProfiles.activeCharacterId, presetProfiles.activeProfileId])
 
   const captureDefaults = useCallback(() => {
     suppressNextProfileApplyRef.current = getProfileContextKey()
@@ -2279,7 +2283,7 @@ export default function LoomBuilder({
   useEffect(() => {
     if (!presetProfiles.isResolved) return
 
-    const contextKey = `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
+    const contextKey = `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activePersonaId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
     const contextChanged = lastProfileContextRef.current !== contextKey
 
     if (
@@ -2320,6 +2324,7 @@ export default function LoomBuilder({
     presetProfiles.activeBinding,
     presetProfiles.activeSource,
     presetProfiles.activeChatId,
+    presetProfiles.activePersonaId,
     presetProfiles.activeCharacterId,
     presetProfiles.activeProfileId,
     presetProfiles,
@@ -2973,6 +2978,43 @@ export default function LoomBuilder({
               </button>
             )}
 
+            {/* Bind / unbind active persona. Persona profiles outrank character
+                profiles, so switching persona restores its own writing mode. */}
+            {!presetProfiles.hasPersonaBinding ? (
+              <button
+                className={s.profileBtn}
+                onClick={presetProfiles.bindToPersona}
+                disabled={!presetProfiles.hasDefaults || presetProfiles.isLoading || !activePreset || !presetProfiles.activePersonaId}
+                title={
+                  !presetProfiles.activePersonaId ? lb('profiles.noPersona')
+                    : !presetProfiles.hasDefaults ? lb('profiles.captureFirst')
+                      : lb('profiles.bindPersona')
+                }
+                type="button"
+              >
+                <Link size={10} /> {lb('profiles.persona')}
+              </button>
+            ) : (
+              <button
+                className={clsx(s.profileBtn, s.profileBtnActive)}
+                onClick={presetProfiles.bindToPersona}
+                disabled={presetProfiles.isLoading || !presetProfiles.activePersonaId}
+                title={lb('profiles.rebindPersona')}
+                type="button"
+              >
+                <RotateCcw size={10} /> {lb('profiles.persona')}
+                <span
+                  className={s.profileBtnDismiss}
+                  onClick={(e) => { e.stopPropagation(); presetProfiles.unbindPersona() }}
+                  title={lb('profiles.removePersona')}
+                  role="button"
+                  tabIndex={0}
+                >
+                  <X size={8} />
+                </span>
+              </button>
+            )}
+
             {/* Bind / unbind character — hidden in group chats (chat-only) */}
             {presetProfiles.characterBindingEnabled && (!presetProfiles.hasCharacterBinding ? (
               <button
@@ -3086,6 +3128,7 @@ export default function LoomBuilder({
           {presetProfiles.activeSource !== 'none' && (
             <span className={s.profileSourceBadge}>
               {presetProfiles.activeSource === 'chat' ? lb('profiles.sourceChat') :
+               presetProfiles.activeSource === 'persona' ? lb('profiles.sourcePersona') :
                presetProfiles.activeSource === 'character' ? lb('profiles.sourceCharacter') :
                presetProfiles.activeSource === 'connection' ? lb('profiles.sourceConnection') : lb('profiles.sourceDefault')}
             </span>

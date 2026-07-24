@@ -5,6 +5,7 @@ import type {
   ConnectionDispatchDescriptorDTO,
   ExtensionInfo,
   SpindleManifest,
+  QuietTrackedResultDTO,
 } from "lumiverse-spindle-types";
 import { interceptorPipeline, type InterceptorResult } from "./interceptor-pipeline";
 import { createBoundHostContainmentFatal } from "./bound-generation";
@@ -245,7 +246,11 @@ function boundParentDispatch(parent: ParentGenerationSnapshot): Promise<Intercep
     },
     "user-1",
     undefined,
-    { parentGenerationSnapshot: parent },
+    {
+      parentGenerationSnapshot: parent,
+      parentPrefillAttestation:
+        boundGeneration.createParentPrefillAttestation(parent),
+    },
   );
 }
 
@@ -263,6 +268,169 @@ function expectNoBoundLeaks(internals: WorkerHostInternals): void {
 }
 
 describe("WorkerHost bound containment fatal boundary", () => {
+  test("rejects bound generation without the generation permission", async () => {
+    const { internals, messages } = makeTestHost(false);
+    internals.hasPermission = (permission) => permission === "interceptor";
+    const assembleSpy = spyOn(boundGeneration, "runBoundAssembly");
+    const quietSpy = spyOn(boundGeneration, "runBoundQuietTracked");
+    try {
+      await internals.handleBoundAssemble({
+        type: "generate_assemble",
+        requestId: "permission-assemble",
+        input: {},
+      });
+      await internals.handleBoundQuietTracked({
+        type: "generate_quiet_tracked",
+        requestId: "permission-quiet",
+        input: {},
+      });
+      expect(assembleSpy).not.toHaveBeenCalled();
+      expect(quietSpy).not.toHaveBeenCalled();
+      expect(messages.find((message) => message.requestId === "permission-assemble")?.error)
+        .toContain("generation");
+      expect(messages.find((message) => message.requestId === "permission-quiet")?.error)
+        .toContain("generation");
+    } finally {
+      assembleSpy.mockRestore();
+      quietSpy.mockRestore();
+      internals.cleanup();
+    }
+  });
+
+  test("mints an operation-bound child for quiet continuations", async () => {
+    const { internals, messages } = makeTestHost(false);
+    const grantSpy = spyOn(managerSvc, "getPermissionGrantId").mockImplementation(
+      (_identifier, permission) =>
+        permission === "interceptor" ? "interceptor-grant" : undefined,
+    );
+    const now = Date.now();
+    const baseParent = makeParentSnapshot("parent-host-generation-continuation");
+    const parent = {
+      ...baseParent,
+      main: {
+        kind: "main",
+        descriptor: {
+          connectionId: "connection-1",
+          connectionName: "Connection",
+          provider: "test",
+          model: "model",
+          endpointOrigin: "https://example.test",
+          dispatchKind: "concrete",
+          connectionDispatchRevision: "continuation-revision",
+        },
+        dispatchRevision: "continuation-revision",
+        parameters: {},
+        reasoning: {},
+      },
+      retrieval: {
+        ...baseParent.retrieval,
+        capturedAt: now,
+        expiresAt: now + 10_000,
+      },
+      parentPrefill: { id: "prefill-worker-host-test", state: "available" },
+      parentPrefillCarrier: [{ role: "assistant", content: "seed" }],
+      interceptorDeadlineAt: now + 10_000,
+      boundWorkDeadlineAt: now + 9_000,
+    } as unknown as ParentGenerationSnapshot;
+    const dispatch = boundParentDispatch(parent);
+    const request = requireBoundInterceptRequest(messages);
+    const operationRequestId = "bound-quiet-continuation";
+    const operation = makeBoundOperationMessage(
+      request,
+      "generate_quiet_tracked",
+      operationRequestId,
+    );
+    operation.input = {
+      messages: [{ role: "user", content: "continue" }],
+      dispatch: {
+        source: "main",
+        expectedConnectionDispatchRevision: "continuation-revision",
+      },
+      deadlineAt: now + 5_000,
+      continuation: {
+        mode: "append-parent-carrier-last",
+        parentPrefill: parent.parentPrefill,
+      },
+    };
+    let capturedChild: unknown;
+    let providerMessages: readonly unknown[] = [];
+    let capturedRunResult: QuietTrackedResultDTO | undefined;
+    let capturedRunError: unknown;
+    const realRunBoundQuietTracked = boundGeneration.runBoundQuietTracked;
+    const runSpy = spyOn(boundGeneration, "runBoundQuietTracked").mockImplementation(
+      async (input) => {
+        capturedChild = input.child;
+        try {
+          const result = await realRunBoundQuietTracked({
+            ...input,
+            resolveDispatch: async () => ({
+              source: "main",
+              connectionId: "connection-1",
+              descriptor: {
+                connectionId: "connection-1",
+                connectionName: "Connection",
+                provider: "test",
+                model: "model",
+                endpointOrigin: "https://example.test",
+                dispatchKind: "concrete",
+                connectionDispatchRevision: "continuation-revision",
+              },
+              dispatchRevision: "continuation-revision",
+            }),
+            provider: async ({ messages: outboundMessages }) => {
+              providerMessages = outboundMessages;
+              return {
+                response: {
+                  content: "continued",
+                  finish_reason: "stop",
+                },
+                terminalResponse: true,
+              };
+            },
+          });
+          capturedRunResult = result;
+          return result;
+        } catch (error) {
+          capturedRunError = error;
+          throw error;
+        }
+      },
+    );
+    try {
+      await internals.handleBoundQuietTracked(operation);
+      expect(capturedChild).toMatchObject({
+        childUse: {
+          requestId: operationRequestId,
+          purpose: "thread-continuation",
+        },
+      });
+      expect(capturedRunError).toBeUndefined();
+      expect(capturedRunResult).toMatchObject({ ok: true });
+      const operationResult = messages.find(
+        (message) =>
+          message.type === "response" &&
+          message.requestId === operationRequestId,
+      )?.result;
+      expect(operationResult).toMatchObject({ ok: true });
+      expect(providerMessages).toEqual([
+        { role: "user", content: "continue" },
+        { role: "assistant", content: "seed" },
+      ]);
+      expect(internals.boundOperationControllers.size).toBe(0);
+      internals.handleInterceptorResult(makeWorkerInterceptResult(request));
+      const dispatchResult = await dispatch;
+      for (const lease of dispatchResult.terminalLeases ?? []) {
+        lease.release();
+      }
+      expectNoBoundLeaks(internals);
+    } finally {
+      runSpy.mockRestore();
+      grantSpy.mockRestore();
+      internals.cleanup();
+      await dispatch.catch(() => undefined);
+    }
+  });
+
   test("assemble authentic fatal rejects the exact invocation and cleans every bound resource", async () => {
     const { internals, messages } = makeTestHost(false);
     const parent = makeParentSnapshot("parent-host-generation-assemble-fatal");
@@ -969,15 +1137,38 @@ describe("WorkerHost image generation stream bridge", () => {
       })(),
     };
     const providerSpy = spyOn(imageRegistry, "getImageProvider").mockReturnValue(provider as never);
+    const terminal = Promise.withResolvers<void>();
+    const runtime = internals.runtime!;
+    const originalPostMessage = runtime.postMessage.bind(runtime);
+    runtime.postMessage = (message) => {
+      originalPostMessage(message);
+      if (
+        message &&
+        typeof message === "object" &&
+        "type" in message &&
+        message.type === "image_gen_stream_error" &&
+        "requestId" in message &&
+        message.requestId === "image-stream-cancel"
+      ) {
+        terminal.resolve();
+      }
+    };
     try {
-      const operation = internals.handleImageGenGenerateStream("image-stream-cancel", {
-        prompt: "test",
-        connection_id: "image-connection-1",
-        userId: "user-1",
+      internals.handleMessage({
+        type: "image_gen_generate_stream",
+        requestId: "image-stream-cancel",
+        input: {
+          prompt: "test",
+          connection_id: "image-connection-1",
+          userId: "user-1",
+        },
       });
       await started.promise;
-      internals.handleImageGenCancelStream("image-stream-cancel");
-      await operation;
+      internals.handleMessage({
+        type: "image_gen_cancel_stream",
+        requestId: "image-stream-cancel",
+      });
+      await terminal.promise;
 
       expect(providerSignal?.aborted ?? false).toBe(true);
       expect(internals.imageGenerationAbortControllers.size).toBe(0);

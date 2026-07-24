@@ -40,6 +40,12 @@ function parseMetadataObject(value: unknown): Record<string, any> {
   }
 }
 
+const HIDDEN_FROM_RECENT_KEY = "hidden_from_recent";
+
+function isHiddenFromRecent(metadata: Record<string, any>): boolean {
+  return metadata[HIDDEN_FROM_RECENT_KEY] === true;
+}
+
 function isGroupMetadata(metadata: Record<string, any>): boolean {
   return metadata.group === true || metadata.group === 1;
 }
@@ -602,6 +608,20 @@ export interface GroupedRecentChatOptions {
   search?: string;
   sort?: GroupedRecentChatSort;
   direction?: 'asc' | 'desc';
+  favoriteCharacterIds?: string[];
+  hiddenCharacterIds?: string[];
+}
+
+/** A chat explicitly removed from the landing-page recent list. */
+export interface HiddenRecentChat {
+  id: string;
+  character_id: string;
+  name: string;
+  character_name: string;
+  character_avatar_path: string | null;
+  character_image_id: string | null;
+  updated_at: number;
+  is_group: boolean;
 }
 
 interface RecentChatCharacterInfo {
@@ -659,7 +679,12 @@ export function listRecentChatsGrouped(
   const searchTerm = options.search?.trim().toLowerCase() ?? '';
   const sort: GroupedRecentChatSort = options.sort ?? 'recent';
   const direction = options.direction ?? (sort === 'name' ? 'asc' : 'desc');
-  const isDefaultRecentSort = !searchTerm && sort === 'recent' && direction === 'desc';
+  const favoriteCharacterIds = new Set(options.favoriteCharacterIds ?? []);
+  const hiddenCharacterIds = new Set(options.hiddenCharacterIds ?? []);
+  const isDefaultRecentSort = !searchTerm
+    && favoriteCharacterIds.size === 0
+    && sort === 'recent'
+    && direction === 'desc';
 
   // Parse metadata in JS so a single malformed row cannot make SQLite abort
   // the landing-page recent-chat query while evaluating json_extract().
@@ -690,14 +715,27 @@ export function listRecentChatsGrouped(
         `).all(userId) as any[]
   );
 
-  const soloCounts = new Map<string, number>();
-  const groupCounts = new Map<string, number>();
-  const parsedRows = rows.map((row) => {
+  // Parse metadata first, then filter out chats the user has explicitly
+  // hidden from the landing-page recent list. Build the lineage lookup from
+  // the full set so forking/grouping resolution stays correct even when a
+  // hidden chat sits in a group's ancestry.
+  const allParsedRows = rows.map((row) => {
     const metadata = parseMetadataObject(row.metadata);
     const isGroup = isGroupMetadata(metadata);
-    if (!isGroup) soloCounts.set(row.character_id, (soloCounts.get(row.character_id) ?? 0) + 1);
     return { ...row, metadata, isGroup, groupKey: null as string | null };
   });
+  const parsedRows = allParsedRows.filter((row) => {
+    if (isHiddenFromRecent(row.metadata)) return false;
+    // Character visibility applies only to solo cards. Group chats remain
+    // chat-scoped entities even when one of their members is hidden from home.
+    return row.isGroup || !hiddenCharacterIds.has(row.character_id);
+  });
+
+  const soloCounts = new Map<string, number>();
+  const groupCounts = new Map<string, number>();
+  for (const row of parsedRows) {
+    if (!row.isGroup) soloCounts.set(row.character_id, (soloCounts.get(row.character_id) ?? 0) + 1);
+  }
 
   // Build a metadata lookup so we can resolve each group chat's lineage root.
   // Branches inherit the root's member-set key — without this, mutating the
@@ -705,7 +743,7 @@ export function listRecentChatsGrouped(
   // a separate landing-page entry, which users perceive as "new group chats
   // spawning on every fork."
   const metadataById = new Map<string, Record<string, any>>();
-  for (const row of parsedRows) metadataById.set(row.id, row.metadata);
+  for (const row of allParsedRows) metadataById.set(row.id, row.metadata);
 
   const resolveGroupDedupKey = (rowId: string, metadata: Record<string, any>): string | null => {
     const visited = new Set<string>([rowId]);
@@ -759,6 +797,9 @@ export function listRecentChatsGrouped(
 
   const sign = direction === 'asc' ? 1 : -1;
   const sortedRows = isDefaultRecentSort ? filteredRows : [...filteredRows].sort((a, b) => {
+    const aFavorite = !a.isGroup && favoriteCharacterIds.has(a.character_id) ? 1 : 0;
+    const bFavorite = !b.isGroup && favoriteCharacterIds.has(b.character_id) ? 1 : 0;
+    if (aFavorite !== bFavorite) return bFavorite - aFavorite;
     if (sort === 'name') {
       return sign * displayName(a).localeCompare(displayName(b), undefined, { sensitivity: 'base' });
     }
@@ -796,6 +837,44 @@ export function listRecentChatsGrouped(
     limit: pagination.limit,
     offset: pagination.offset,
   };
+}
+
+/**
+ * Return only chats explicitly hidden from the landing-page recent list.
+ * This intentionally does not consider `landingHiddenCharacterIds`: that
+ * preference is client-owned and is managed separately from per-chat hides.
+ */
+export function listHiddenRecentChats(userId: string): HiddenRecentChat[] {
+  const rows = getDb().query(`
+    SELECT
+      c.id,
+      c.character_id,
+      c.name,
+      c.metadata,
+      c.updated_at,
+      ch.name AS character_name,
+      ch.avatar_path AS character_avatar_path,
+      ch.image_id AS character_image_id
+    FROM chats c
+    LEFT JOIN characters ch ON ch.id = c.character_id
+    WHERE c.user_id = ? AND c.character_id IS NOT NULL
+    ORDER BY c.updated_at DESC
+  `).all(userId) as any[];
+
+  return rows.flatMap((row): HiddenRecentChat[] => {
+    const metadata = parseMetadataObject(row.metadata);
+    if (!isHiddenFromRecent(metadata)) return [];
+    return [{
+      id: row.id,
+      character_id: row.character_id,
+      name: row.name || '',
+      character_name: row.character_name || '',
+      character_avatar_path: row.character_avatar_path || null,
+      character_image_id: row.character_image_id || null,
+      updated_at: row.updated_at,
+      is_group: isGroupMetadata(metadata),
+    }];
+  });
 }
 
 export function listChatSummaries(userId: string, characterId: string): ChatSummary[] {
@@ -3318,7 +3397,7 @@ async function updateChatChunks(userId: string, chatId: string, newMessage: Mess
     const chunk = getDb().query("SELECT * FROM chat_chunks WHERE id = ?").get(chunkId) as any;
     if (chunk) {
       const cortexConfig = memoryCortex.getCortexConfig(userId);
-      if (!cortexConfig.enabled) return;
+      if (!memoryCortex.isCortexEnabledForChat(cortexConfig, chat?.metadata)) return;
 
       const characterNames: string[] = [];
       const aliasMaps: Map<string, string>[] = [];

@@ -2,7 +2,7 @@
 import { getSafeInAppNavigationUrl } from './lib/navigationSafety'
 import { precacheAndRoute, cleanupOutdatedCaches, createHandlerBoundToURL } from 'workbox-precaching'
 import { registerRoute, NavigationRoute } from 'workbox-routing'
-import { CacheFirst, NetworkOnly } from 'workbox-strategies'
+import { CacheFirst, NetworkFirst, NetworkOnly } from 'workbox-strategies'
 import { ExpirationPlugin } from 'workbox-expiration'
 import { BackgroundSyncPlugin } from 'workbox-background-sync'
 
@@ -41,9 +41,14 @@ registerRoute(new NavigationRoute(
 ))
 
 // ── Runtime caching: avatars ────────────────────────────────────────
+// Avatar resolver URLs are stable entity routes rather than immutable image
+// URLs. Use the network response whenever available so a newly uploaded avatar
+// replaces an earlier response at the same URL; retain the cache only as an
+// offline fallback. Direct /images/:id assets below remain CacheFirst because
+// their image IDs make them immutable.
 registerRoute(
   /\/api\/v1\/(characters|personas)\/[^/]+\/avatar/,
-  new CacheFirst({
+  new NetworkFirst({
     cacheName: 'avatar-cache',
     plugins: [new ExpirationPlugin({ maxEntries: 200, maxAgeSeconds: 7 * 24 * 60 * 60 })],
   })
@@ -189,7 +194,16 @@ self.addEventListener('notificationclick', (event) => {
 })
 
 
-// Take control of clients immediately on activation
+// Manual Blob-backed video wallpaper caching was removed in favor of native
+// HTTP/range caching. Delete the old cache so existing installs recover the
+// potentially large files it retained on disk.
+const OBSOLETE_RUNTIME_CACHES = ['wallpaper-video-cache-v1']
+
+// Take control of clients immediately on activation and clean caches that are
+// no longer managed by a current route.
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim())
+  event.waitUntil(Promise.all([
+    self.clients.claim(),
+    ...OBSOLETE_RUNTIME_CACHES.map((cacheName) => caches.delete(cacheName)),
+  ]).then(() => undefined))
 })

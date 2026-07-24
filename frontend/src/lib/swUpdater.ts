@@ -2,12 +2,12 @@ import { useStore } from '@/store'
 import { isServiceWorkerReplacement } from './swUpdatePolicy'
 
 /**
- * Module-level handle to the active service worker registration. Held outside
- * React so the connection-lost overlay can ask the SW to check for a new
- * bundle the moment the WebSocket reconnects.
+ * Holds the active service-worker registration outside React so a recovered
+ * server connection can immediately check whether its frontend bundle changed.
  *
- * In dev mode (vite dev) or environments where service workers aren't
- * supported, `registration` stays null and all operations no-op gracefully.
+ * The reconnect path only reaches this after a previously healthy connection
+ * has completed a new authenticated ping/pong round trip. That avoids update
+ * checks during initial load or while a transient connection is still down.
  */
 let registration: ServiceWorkerRegistration | null = null
 let updateUiTimeout: ReturnType<typeof setTimeout> | null = null
@@ -65,19 +65,14 @@ export function rememberRegistration(reg: ServiceWorkerRegistration | undefined)
 }
 
 /**
- * Ask the service worker to check for a new bundle right now (vs. waiting for
- * the hourly poll set up in main.tsx). If a new worker is found, the
- * registration's `updatefound` event will fire and flip `wsUpdatePending`.
- *
- * Returns silently if no registration is available (dev mode, unsupported
- * browser) or if the network request fails — this is best-effort.
+ * Check for a new service worker immediately after a verified server
+ * reconnect. The normal hourly poll remains the fallback for long-lived tabs.
  */
 export async function checkForBundleUpdate(): Promise<void> {
   if (!registration) return
   try {
     await registration.update()
   } catch {
-    // Network glitch checking for the SW update — ignore. The hourly poll and
-    // the next reconnect will both retry.
+    // A failed best-effort check should not interfere with socket recovery.
   }
 }

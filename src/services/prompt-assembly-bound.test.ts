@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import type { AssemblyContext, AssemblyResult } from "../llm/types";
 import {
@@ -25,6 +25,8 @@ import {
 import {
   assembleBoundParentPrompt,
   assemblePrompt,
+  setMultiplayerMacroContextProvider,
+  setMultiplayerPersonaProvider,
   type BoundParentAssemblyInput,
 } from "./prompt-assembly.service";
 import type { Chat } from "../types/chat";
@@ -43,6 +45,16 @@ import * as packsSvc from "./packs.service";
 import * as personasSvc from "./personas.service";
 import * as presetsSvc from "./presets.service";
 import * as settingsSvc from "./settings.service";
+
+beforeEach(() => {
+  setMultiplayerMacroContextProvider(null);
+  setMultiplayerPersonaProvider(null);
+});
+
+afterEach(() => {
+  setMultiplayerMacroContextProvider(null);
+  setMultiplayerPersonaProvider(null);
+});
 
 const hostGeneration = brandHostGenerationId("bound-assembly-test-host");
 const userId = "bound-assembly-test-user";
@@ -72,6 +84,7 @@ const character: Character = {
   creator_notes: "",
   system_prompt: "",
   post_history_instructions: "",
+  folder: "",
   tags: [],
   alternate_greetings: [],
   extensions: {},
@@ -142,7 +155,13 @@ const preset: Preset = {
   updated_at: 1,
 };
 
-function makeSnapshot(options: Readonly<{ chat?: Chat; character?: Character; groupCharacters?: Map<string, Character> }> = {}): ParentGenerationSnapshot {
+function makeSnapshot(options: Readonly<{
+  chat?: Chat;
+  character?: Character;
+  groupCharacters?: Map<string, Character>;
+  messages?: Message[];
+  snapshotOptions?: Record<string, unknown>;
+}> = {}): ParentGenerationSnapshot {
   const capturedAt = Date.now();
   const mainInput: MainDispatchSnapshotInput = {
     hostGeneration,
@@ -231,7 +250,7 @@ function makeSnapshot(options: Readonly<{ chat?: Chat; character?: Character; gr
       worldInfoSettings: {},
     },
     results: {
-      messages: [message],
+      messages: options.messages ?? [message],
       chat: options.chat ?? chat,
       character: options.character ?? character,
       persona: null,
@@ -250,7 +269,7 @@ function makeSnapshot(options: Readonly<{ chat?: Chat; character?: Character; gr
     main: captureMainDispatchSnapshot(mainInput),
     retrieval: captureParentRetrievalSnapshot(retrievalInput),
     parentIdentities: { personaId: null, targetCharacterId: null },
-    options: { generationType: "normal" },
+    options: options.snapshotOptions ?? { generationType: "normal" },
     parentPrefill: { id: "bound-prefill", state: "absent" },
     interceptorDeadlineAt: capturedAt + 60_000,
     boundWorkDeadlineAt: capturedAt + 50_000,
@@ -399,6 +418,44 @@ describe("assembleBoundParentPrompt", () => {
     } finally {
       for (const spy of spies) spy.mockRestore();
     }
+  });
+
+  test("restores captured continuation targeting and postfix", async () => {
+    const continuedMessage: Message = {
+      ...message,
+      id: "continued-message",
+      is_user: false,
+      name: character.name,
+      content: "Original answer",
+    };
+    const laterAssistant: Message = {
+      ...continuedMessage,
+      id: "later-assistant",
+      index_in_chat: 1,
+      content: "Later answer",
+    };
+    const snapshot = makeSnapshot({
+      messages: [continuedMessage, laterAssistant],
+      snapshotOptions: {
+        generationType: "continue",
+        continueMessageId: continuedMessage.id,
+        continuePostfix: "\n\n",
+      },
+    });
+
+    const result = await assembleBoundParentPrompt(request(snapshot));
+    expect(result.messages).toContainEqual(
+      expect.objectContaining({
+        role: "assistant",
+        content: "Original answer\n\n",
+      }),
+    );
+    expect(result.messages).toContainEqual(
+      expect.objectContaining({
+        role: "assistant",
+        content: "Later answer",
+      }),
+    );
   });
 
   test("applies the captured custom group scenario without live character lookup", async () => {

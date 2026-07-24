@@ -422,6 +422,68 @@ describe("Worker nested generation authority", () => {
       await stopRuntime(runtime);
     }
   }, { timeout: 30_000 });
+
+  test("settles bound RPCs when the enclosing interceptor is aborted", async () => {
+    const runtime = await startRuntime(`
+      spindle.registerInterceptor(async (messages) => {
+        try {
+          await spindle.generate.quietTracked({
+            messages,
+            dispatch: {
+              source: "main",
+              expectedConnectionDispatchRevision: "revision-1",
+            },
+            deadlineAt: Date.now() + 5_000,
+          });
+        } catch (error) {
+          spindle.log.info("bound-abort:" + JSON.stringify(error));
+        }
+        return messages;
+      });
+    `);
+
+    try {
+      const registration = await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "register_interceptor",
+      );
+      const parentRequestId = "parent-bound-abort";
+      runtime.worker.postMessage({
+        type: "intercept_request",
+        requestId: parentRequestId,
+        registrationId: registration.registrationId,
+        messages: [{ role: "user", content: "hello" }],
+        context: callbackContext(),
+        __spindle_private_bound: parentBoundEnvelope(parentRequestId),
+      });
+      await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "generate_quiet_tracked",
+      );
+
+      runtime.worker.postMessage({
+        type: "intercept_abort",
+        requestId: parentRequestId,
+        registrationId: registration.registrationId,
+        reason: "containment timeout",
+      });
+      const abortLog = await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "log" && message.message?.startsWith("bound-abort:") === true,
+      );
+      expect(abortLog.message).toContain("BOUND_REQUEST_ABORTED");
+      expect(runtime.messages.some(
+        (message) =>
+          message.type === "intercept_result"
+          && message.requestId === parentRequestId,
+      )).toBe(false);
+    } finally {
+      await stopRuntime(runtime);
+    }
+  }, { timeout: 30_000 });
 });
 
 describe("Worker frontend-message dispatch authority", () => {

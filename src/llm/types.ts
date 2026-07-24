@@ -269,6 +269,10 @@ export interface AssemblyContext {
   excludeMessageId?: string;
   /** For regenerate/swipe: content of the active target swipe before it was replaced. */
   rejectedSwipe?: string;
+  /** For continue: source message id of the assistant turn being extended. */
+  continueMessageId?: string;
+  /** For continue: separator to append to the target in the model prompt and saved reply. */
+  continuePostfix?: string;
   /** For group chats: generate a response as this specific character. */
   targetCharacterId?: string;
   /** Council tool results (passed from generate.service when council executes before assembly). */
@@ -505,13 +509,13 @@ export interface ContextClipStats {
   budgetInvalid?: boolean;
   /** True when fixed prompt overhead alone is larger than the available input budget. */
   fixedOverBudget?: boolean;
-  /** True when a chat context anchor protected one or more history messages. */
+  /** True when a context anchor set the first chat-history message the model may read. */
   anchorActive?: boolean;
-  /** Exact tokens required by the protected anchor tail. */
+  /** Exact tokens required by the anchored history tail. */
   protectedHistoryTokens?: number;
-  /** Space left for history before the protected anchor. Negative means the anchor cannot fit. */
+  /** Budget remaining after the anchored history tail. Negative means the anchor cannot fit. */
   remainingBeforeAnchor?: number;
-  /** True when the protected anchor tail cannot fit in the remaining history budget. */
+  /** True when the anchored history tail cannot fit in the remaining history budget. */
   anchorOverflow?: boolean;
 }
 
@@ -519,6 +523,8 @@ export interface AssemblyResult {
   messages: LlmMessage[];
   breakdown: AssemblyBreakdownEntry[];
   parameters: Record<string, any>;
+  /** Whether a directly word-terminated streaming response should lose its final word. */
+  trimIncompleteWords?: boolean;
   /** The resolved assistant prefill text (from promptBias / assistantPrefill / assistantImpersonation).
    *  When set, the last message in `messages` is an assistant message containing this text.
    *  The generate service must prepend this to the LLM response content since the model

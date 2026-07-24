@@ -16,6 +16,7 @@ import type {
   ConnectionProfileDTO,
   ToolRegistration,
   ExtensionInfo,
+
   ReasoningSettingsDTO,
   ReasoningEffortDTO,
   ThinkingDisplayDTO,
@@ -26,6 +27,7 @@ import type {
   SpindleCommandContextDTO,
   CouncilMemberContext,
   ImageUploadDTO,
+  ImageGenStreamRequestDTO,
 } from "lumiverse-spindle-types";
 import {
   PERMISSION_DENIED_PREFIX,
@@ -120,6 +122,7 @@ import { WorkerHostStorageApi } from "./worker-host-storage-api";
 import { WorkerHostStateApi } from "./worker-host-state-api";
 import { WorkerHostContentApi } from "./worker-host-content-api";
 import { WorkerHostMemoryApi } from "./worker-host-memory-api";
+import { WorkerHostImageGenApi } from "./worker-host-image-gen-api";
 import { WorkerHostProcessApi } from "./worker-host-process-api";
 import { WorkerHostInteractionApi } from "./worker-host-interaction-api";
 import { WorkerHostPresentationApi } from "./worker-host-presentation-api";
@@ -133,7 +136,7 @@ import {
   type SharedRpcEndpointPolicy,
 } from "./shared-rpc-pool.service";
 import { getTextContent, type LlmMessage } from "../llm/types";
-import type { CreatePresetInput, UpdatePresetInput } from "../types/preset";
+import type { CreatePresetInput, PromptBlock, UpdatePresetInput } from "../types/preset";
 import { getDb } from "../db/connection";
 import {
   getMessages as getChatMessages,
@@ -661,7 +664,13 @@ type RuntimeWorkerToHost =
       tabId?: string;
       viewId?: string;
       userId?: string;
-    };
+    }
+  | {
+      type: "image_gen_generate_stream";
+      requestId: string;
+      input: Omit<ImageGenStreamRequestDTO, "signal">;
+    }
+  | { type: "image_gen_cancel_stream"; requestId: string };
 
 type RuntimeHostToWorker =
   | Exclude<
@@ -731,7 +740,16 @@ type RuntimeHostToWorker =
   | { type: "frontend_process_lifecycle"; event: FrontendProcessLifecycleEvent }
   | { type: "frontend_process_message"; processId: string; payload: unknown; userId: string }
   | { type: "backend_process_lifecycle"; event: BackendProcessLifecycleEvent }
-  | { type: "backend_process_message"; processId: string; payload: unknown; userId: string };
+  | { type: "backend_process_message"; processId: string; payload: unknown; userId: string }
+  | {
+      type: "image_gen_stream_chunk";
+      requestId: string;
+      event:
+        | { type: "status"; step?: number; totalSteps?: number; nodeId?: string }
+        | { type: "preview"; imageDataUrl: string; step?: number; totalSteps?: number; nodeId?: string }
+        | { type: "done"; result: Record<string, unknown> };
+    }
+  | { type: "image_gen_stream_error"; requestId: string; error: string };
 
 let cachedBackendVersion: string | null = null;
 let cachedFrontendVersion: string | null = null;
@@ -1114,6 +1132,7 @@ export class WorkerHost {
   private readonly stateApi: WorkerHostStateApi;
   private readonly contentApi: WorkerHostContentApi;
   private readonly memoryApi: WorkerHostMemoryApi;
+  private readonly imageGenApi: WorkerHostImageGenApi;
   private readonly processApi: WorkerHostProcessApi;
   private readonly interactionApi: WorkerHostInteractionApi;
   private readonly presentationApi: WorkerHostPresentationApi;
@@ -1157,6 +1176,13 @@ export class WorkerHost {
       resolveEffectiveUserId: (userId) => this.resolveEffectiveUserId(userId),
       enforceScopedUser: (userId) => this.enforceScopedUser(userId),
       postResponse: (message) => this.postToWorker(message),
+    });
+    this.imageGenApi = new WorkerHostImageGenApi({
+      extensionIdentifier: manifest.identifier,
+      hasPermission: (permission) => this.hasPermission(permission),
+      resolveEffectiveUserId: (userId) => this.resolveEffectiveUserId(userId),
+      enforceScopedUser: (userId) => this.enforceScopedUser(userId),
+      post: (message) => this.postToWorker(message as RuntimeHostToWorker),
     });
     this.processApi = new WorkerHostProcessApi({
       extensionId,
@@ -2676,7 +2702,7 @@ export class WorkerHost {
         break;
       // ─── Image Generation (gated: "image_gen") ─────────────────────────
       case "image_gen_generate":
-        this.handleImageGenGenerate(msg.requestId, msg.input);
+        void this.imageGenApi.handleGenerate(msg.requestId, msg.input);
         break;
       case "image_gen_generate_stream":
         void this.handleImageGenGenerateStream(msg.requestId, msg.input);
@@ -2685,16 +2711,16 @@ export class WorkerHost {
         this.handleImageGenCancelStream(msg.requestId);
         break;
       case "image_gen_providers":
-        this.handleImageGenProviders(msg.requestId, msg.userId);
+        this.imageGenApi.handleProviders(msg.requestId);
         break;
       case "image_gen_connections_list":
-        this.handleImageGenConnectionsList(msg.requestId, msg.userId);
+        this.imageGenApi.handleConnectionsList(msg.requestId, msg.userId);
         break;
       case "image_gen_connections_get":
-        this.handleImageGenConnectionsGet(msg.requestId, msg.connectionId, msg.userId);
+        this.imageGenApi.handleConnectionsGet(msg.requestId, msg.connectionId, msg.userId);
         break;
       case "image_gen_models":
-        this.handleImageGenModels(msg.requestId, msg.connectionId, msg.userId);
+        void this.imageGenApi.handleModels(msg.requestId, msg.connectionId, msg.userId);
         break;
       // ─── Chat style mode (gated: "app_manipulation") ────────────────────
       case "chat_set_style_mode":
@@ -3674,7 +3700,7 @@ export class WorkerHost {
       registrationGeneration: envelope.registrationGeneration,
       callbackUserId: envelope.callbackUserId,
       hostGeneration: parent.hostGeneration,
-      requestId: envelope.requestId,
+      requestId,
       invocationToken: brandInvocationToken(envelope.token),
       parent,
       signal: controller.signal,
@@ -3689,6 +3715,14 @@ export class WorkerHost {
   }
 
   private async handleBoundAssemble(msg: Extract<RuntimeWorkerToHost, { type: "generate_assemble" }>): Promise<void> {
+    if (!this.hasPermission("generation")) {
+      this.postToWorker({
+        type: "response",
+        requestId: msg.requestId,
+        error: `${PERMISSION_DENIED_PREFIX} generation — Bound assembly requires the generation permission`,
+      });
+      return;
+    }
     const bound = this.boundInvocation(msg.requestId, msg.__spindle_private_bound);
     if (!bound) {
       this.postToWorker({ type: "response", requestId: msg.requestId, error: "BOUND_BINDING_REQUIRED" });
@@ -3719,17 +3753,38 @@ export class WorkerHost {
   }
 
   private async handleBoundQuietTracked(msg: Extract<RuntimeWorkerToHost, { type: "generate_quiet_tracked" }>): Promise<void> {
+    if (!this.hasPermission("generation")) {
+      this.postToWorker({
+        type: "response",
+        requestId: msg.requestId,
+        error: `${PERMISSION_DENIED_PREFIX} generation — Bound quiet generation requires the generation permission`,
+      });
+      return;
+    }
     const bound = this.boundInvocation(msg.requestId, msg.__spindle_private_bound);
     if (!bound) {
       this.postToWorker({ type: "response", requestId: msg.requestId, error: "BOUND_BINDING_REQUIRED" });
       return;
     }
     try {
+      const parentPrefillAttestation =
+        bound.invocation.privateState.parentPrefillAttestation;
+      const child =
+        msg.input.continuation && parentPrefillAttestation
+          ? {
+              childUse: mintParentPrefillChildUse(
+                bound.context.parent,
+                parentPrefillAttestation,
+                msg.requestId,
+              ),
+            }
+          : undefined;
       const result = await runBoundQuietTracked({
         context: bound.context,
         request: { ...msg.input, signal: bound.controller.signal },
         resolveDispatch: bound.callbacks.resolveDispatch,
         provider: bound.callbacks.provider,
+        child,
       });
       this.postToWorker({ type: "response", requestId: msg.requestId, result });
     } catch (error) {
@@ -3827,6 +3882,7 @@ export class WorkerHost {
       });
     }
   }
+
 
   private normalizeInterceptorBreakdownEntry(
     entry: InterceptorBreakdownEntryDTO,
@@ -4510,7 +4566,6 @@ export class WorkerHost {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }
   }
-
   // ─── Connection Profiles (gated by "generation" permission) ─────────
 
   /**
@@ -4621,6 +4676,7 @@ export class WorkerHost {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }
   }
+
 
   // ─── Permissions ───────────────────────────────────────────────────────
 
@@ -5867,7 +5923,7 @@ export class WorkerHost {
         return;
       }
 
-      const { evaluate, buildEnv, initMacros, registry, resolvePersonaPronouns } = await import("../macros");
+      const { evaluate, buildEnv, initMacros, registry } = await import("../macros");
       initMacros();
 
       const chatsSvc = await import("../services/chats.service");
@@ -5926,36 +5982,31 @@ export class WorkerHost {
       }
 
       if (!env) {
-        // Minimal fallback
-        const persona = personasSvc.getDefaultPersona(resolvedUserId);
-        const personaPronouns = resolvePersonaPronouns(persona);
+        // Minimal fallback. Route through buildEnv so persona add-ons and
+        // outlet-backed add-ons behave the same as other macro contexts.
+        const { makeAssistantCharacter } = await import("../types/character");
+        const persona = personaAddonStatesSvc.resolvePersonaForChatMacros(
+          resolvedUserId,
+          personasSvc.getDefaultPersona(resolvedUserId),
+          null,
+        );
         const connection = connectionsSvc.resolveConnection(resolvedUserId);
-        env = {
-          commit,
-          names: {
-            user: persona?.name || "User", char: "", group: "", groupNotMuted: "", notChar: persona?.name || "User",
-            charGroupFocused: "", groupOthers: "", groupMemberCount: "0", isGroupChat: "no", isNarrator: persona?.is_narrator ? "yes" : "no", groupLastSpeaker: "", groupCardMode: "solo",
-          },
-          character: {
-            name: "", description: "", personality: "", scenario: "", persona: persona?.description || "",
-            personaSubjectivePronoun: personaPronouns.subjective,
-            personaObjectivePronoun: personaPronouns.objective,
-            personaPossessivePronoun: personaPronouns.possessive,
-            mesExamples: "", mesExamplesRaw: "", systemPrompt: "", postHistoryInstructions: "",
-            depthPrompt: "", creatorNotes: "", version: "", creator: "", firstMessage: "",
-          },
+        env = buildEnv({
+          character: makeAssistantCharacter(),
+          persona,
           chat: {
-            id: "", messageCount: 0, lastMessage: "", lastMessageName: "", lastUserMessage: "",
-            lastCharMessage: "", lastMessageId: -1, firstIncludedMessageId: -1, lastSwipeId: 0, currentSwipeId: 0, rejectedSwipe: "",
+            id: "",
+            character_id: null,
+            name: "",
+            metadata: {},
+            created_at: 0,
+            updated_at: 0,
           },
-          system: {
-            model: connection?.model || "", maxPrompt: 0, maxContext: 0, maxResponse: 0,
-            lastGenerationType: "normal", isMobile: false,
-          },
-          variables: { local: new Map(), global: new Map(), chat: new Map() },
-          dynamicMacros: {},
-          extra: {},
-        };
+          messages: [],
+          generationType: "normal",
+          commit,
+          connection,
+        });
       }
 
       const result = await evaluate(template, env, registry);

@@ -19,6 +19,7 @@ import {
   mergeActivatedWorldInfoEntries,
   getSourceMessageId,
   isChatHistoryMessage,
+  resolveContinuePostfix,
   shouldPreserveDisplayReasoningDelimiters,
   type VectorActivatedEntry,
 } from "./prompt-assembly.service";
@@ -44,6 +45,8 @@ import {
   type LlmThinkingBlock,
   type ContextClipStats,
 } from "../llm/types";
+import { trimIncompleteTrailingWord } from "../utils/trim-incomplete-word";
+import { healFormattingArtifacts } from "../utils/format-healing";
 import {
   buildInlineToolContinuation,
   type InlineCouncilToolResult,
@@ -260,6 +263,8 @@ interface GenerationLifecycle {
   presetName?: string;
   /** Resolved preset id */
   presetId?: string;
+  /** Trim the final word after a directly word-terminated streamed response. */
+  trimIncompleteWords?: boolean;
   /** Max context from connection parameters (for breakdown display) */
   maxContext?: number;
   /** Council named results (for expression detection and other post-generation hooks) */
@@ -474,6 +479,7 @@ export const __test__ = {
   resolveDryRunMessageReasoning,
   sumChatHistoryBreakdownTokens,
   isCallbackActiveProviderRoute,
+  buildParentGenerationSnapshotOptions,
 };
 
 export interface RawGenerateInput {
@@ -691,6 +697,8 @@ interface PromptPipelineResult {
   terminalLeases?: readonly InterceptorTerminalLease[];
   /** Host-private normalized final-response winner/protected fallback state. */
   finalResponse?: InterceptorFinalResponseState;
+  /** Resolved per-preset setting for streamed response finalization. */
+  trimIncompleteWords?: boolean;
 }
 
 function findParentPrefillCarrierIndex(
@@ -1558,6 +1566,22 @@ async function resolveProviderAndKey(
   };
 }
 
+function buildParentGenerationSnapshotOptions(input: {
+  generationType: string;
+  excludeMessageId?: string;
+  targetCharacterId?: string;
+  continueMessageId?: string;
+  continuePostfix?: string;
+}): Record<string, unknown> {
+  return {
+    generationType: input.generationType,
+    excludeMessageId: input.excludeMessageId ?? null,
+    targetCharacterId: input.targetCharacterId ?? null,
+    continueMessageId: input.continueMessageId ?? null,
+    continuePostfix: input.continuePostfix ?? null,
+  };
+}
+
 /**
  * Shared prompt pipeline: build spindle context, assemble prompt, run
  * interceptors, apply post-processing, and merge parameters.
@@ -1578,6 +1602,8 @@ async function runPromptPipeline(opts: {
   inputParameters?: GenerationParameters;
   excludeMessageId?: string;
   rejectedSwipe?: string;
+  continueMessageId?: string;
+  continuePostfix?: string;
   targetCharacterId?: string;
   councilToolResults?: any[];
   councilNamedResults?: Record<string, string>;
@@ -1646,6 +1672,7 @@ async function runPromptPipeline(opts: {
     | { chatId: string; partial: Record<string, any> }
     | undefined;
   let macroEnv: import("../macros/types").MacroEnv | undefined;
+  let trimIncompleteWords = false;
 
   let deliberationHandledByMacro = false;
   let parentRetrievalSnapshot: ParentRetrievalSnapshot | undefined;
@@ -1711,6 +1738,8 @@ async function runPromptPipeline(opts: {
       userInput: opts.userInput,
       excludeMessageId: opts.excludeMessageId,
       rejectedSwipe: opts.rejectedSwipe,
+      continueMessageId: opts.continueMessageId,
+      continuePostfix: opts.continuePostfix,
       targetCharacterId: opts.targetCharacterId,
       councilToolResults: opts.councilToolResults,
       councilNamedResults: opts.councilNamedResults,
@@ -1799,6 +1828,7 @@ async function runPromptPipeline(opts: {
     deferredWiState = assemblyResult.deferredWiState;
     deliberationHandledByMacro = !!assemblyResult.deliberationHandledByMacro;
     macroEnv = assemblyResult.macroEnv;
+    trimIncompleteWords = assemblyResult.trimIncompleteWords === true;
   }
   let effectiveMainDispatchSnapshot = opts.mainDispatchSnapshot;
   if (callbackActive && opts.mainDispatchSnapshot) {
@@ -1864,11 +1894,7 @@ async function runPromptPipeline(opts: {
           personaId: spindleContext.personaId ?? null,
           targetCharacterId: opts.targetCharacterId ?? null,
         },
-        options: {
-          generationType: opts.generationType,
-          excludeMessageId: opts.excludeMessageId ?? null,
-          targetCharacterId: opts.targetCharacterId ?? null,
-        },
+        options: buildParentGenerationSnapshotOptions(opts),
         parentPrefill,
         parentPrefillCarrier: assistantPrefill
           ? [{ role: "assistant", content: assistantPrefill }]
@@ -2270,6 +2296,7 @@ async function runPromptPipeline(opts: {
     terminalLeases: interceptorTerminalLeases,
     finalResponse: interceptorFinalResponse,
     parentRetrievalSnapshotError,
+    trimIncompleteWords,
   };
   } catch (error) {
     for (const lease of interceptorTerminalLeases ?? []) {
@@ -2365,15 +2392,6 @@ export async function startGeneration(
     activeChatGenerations.delete(chatKey);
   }
 
-  // Tear down any fire-and-forget background work (cortex cache warming,
-  // databank retrieval) left over from prior generations on this chat.
-  // Successful completions don't abort their own controllers, so without
-  // this, slow embedding APIs can accumulate orphan tasks across sends.
-  // Await teardown so background fetch reader.cancel() completes before
-  // the new generation starts its own fetches — overlapping cancel+start
-  // on Bun's HTTPThread triggers a null-callback segfault.
-  await abortChatBackground(input.userId, input.chat_id);
-
   // Register this generation early (before council) so it can be tracked and aborted.
   // The completion promise is created up-front (deferred) so a replacement
   // generation can always await teardown — even if it arrives during the setup
@@ -2405,8 +2423,36 @@ export async function startGeneration(
 
   // Hoisted so the catch block can clean up the staged message on abort
   let stagedMessageId: string | undefined;
+  // Swipes are staged before the slower preflight work below. Keep both the
+  // original snapshot and the staged result: the former is the response being
+  // replaced, while the latter carries the new swipe index and active state.
+  let stagedSwipeOriginal: Message | null = null;
+  let stagedSwipe: Message | null = null;
+  let stagedSwipeId: number | undefined;
 
   try {
+    // Stage a swipe before cancelling background work, resolving secrets, or
+    // validating the preset. This is the user-visible part of the action, and
+    // it must not wait behind cache-warming HTTP teardown (which is bounded at
+    // two seconds) or any later prompt-assembly preflight.
+    if (genType === "regenerate" || genType === "swipe") {
+      const target = input.message_id
+        ? chatsSvc.getMessage(input.userId, input.message_id)
+        : chatsSvc.getLastAssistantMessage(input.userId, input.chat_id);
+      if (target && !target.is_user) {
+        stagedSwipeOriginal = target;
+        stagedSwipe = chatsSvc.addSwipe(input.userId, target.id, "");
+        stagedSwipeId = stagedSwipe?.swipe_id;
+      }
+    }
+
+    // Tear down any fire-and-forget background work (cortex cache warming,
+    // databank retrieval) left over from prior generations on this chat. The
+    // user-visible swipe above is deliberately staged first; only the later
+    // provider/prompt work needs to wait for this bounded HTTP teardown.
+    await abortChatBackground(input.userId, input.chat_id);
+    checkAborted();
+
     const connection = resolveConnection(input.userId, input.connection_id);
     input.connection_id = connection.id;
     // Loaded before preset resolution: no-preset temp chats bypass the preset
@@ -2459,9 +2505,11 @@ export async function startGeneration(
         : [];
     let targetAssistantMessage: Message | null = null;
     if (genType === "regenerate" || genType === "swipe") {
-      targetAssistantMessage = input.message_id
+      // Reuse the pre-staging snapshot. Re-reading here would see the blank
+      // active swipe and lose the original content for rejected-swipe macros.
+      targetAssistantMessage = stagedSwipeOriginal ?? (input.message_id
         ? chatsSvc.getMessage(input.userId, input.message_id)
-        : chatsSvc.getLastAssistantMessage(input.userId, input.chat_id);
+        : chatsSvc.getLastAssistantMessage(input.userId, input.chat_id));
     } else if (genType === "continue") {
       targetAssistantMessage = input.message_id
         ? chatsSvc.getMessage(input.userId, input.message_id)
@@ -2486,7 +2534,8 @@ export async function startGeneration(
     let characterName = "Assistant";
     const requestedTargetCharId =
       input.target_character_id &&
-      (!isGroupChat || groupCharacterIds.includes(input.target_character_id))
+      isGroupChat &&
+      groupCharacterIds.includes(input.target_character_id)
         ? input.target_character_id
         : undefined;
     const messageTargetCharId =
@@ -2578,13 +2627,13 @@ export async function startGeneration(
         rejectedSwipe = targetMsg.content;
         // Add a blank swipe immediately so the frontend shows cleared content
         // before council/assembly begins (MESSAGE_SWIPED event fires now).
-        const withBlank = chatsSvc.addSwipe(input.userId, targetMsg.id, "");
+        const withBlank = stagedSwipe ?? chatsSvc.addSwipe(input.userId, targetMsg.id, "");
         lifecycle.targetSwipeIdx = withBlank ? withBlank.swipe_id : 0;
         targetSwipeId = lifecycle.targetSwipeIdx;
         // Clear stale generation metrics from the previous swipe so the pill
         // doesn't display outdated values while the new generation runs.
         // Uses patchMessageExtra to avoid triggering chunk rebuilds / WS events.
-        const prevExtra = targetMsg.extra;
+        const prevExtra = withBlank?.extra ?? targetMsg.extra;
         if (
           prevExtra &&
           (prevExtra.tokenCount != null ||
@@ -2617,8 +2666,10 @@ export async function startGeneration(
         const cpPreset = cpPresetId
           ? presetsSvc.getPreset(input.userId, cpPresetId)
           : null;
-        lifecycle.continuePostfix =
-          cpPreset?.prompts?.completionSettings?.continuePostfix || "";
+        lifecycle.continuePostfix = resolveContinuePostfix(
+          lastMsg.content,
+          cpPreset?.prompts?.completionSettings?.continuePostfix || "",
+        );
       }
     }
 
@@ -3372,6 +3423,8 @@ export async function startGeneration(
             inputParameters: input.parameters,
             excludeMessageId,
             rejectedSwipe,
+            continueMessageId: lifecycle.continueMessageId,
+            continuePostfix: lifecycle.continuePostfix,
             targetCharacterId: pipelineTargetCharId,
             councilToolResults,
             councilNamedResults,
@@ -3477,6 +3530,7 @@ export async function startGeneration(
           | undefined;
         lifecycle.councilNamedResults = councilNamedResults;
         lifecycle.contextClipStats = pipeline.contextClipStats;
+        lifecycle.trimIncompleteWords = pipeline.trimIncompleteWords;
 
         // Strip internal-only keys before they reach the provider
         delete mergedParams.max_context_length;
@@ -3648,8 +3702,23 @@ export async function startGeneration(
         /* best-effort cleanup */
       }
     }
+    // A failure before GENERATION_STARTED has no terminal event for the
+    // frontend to reconcile. Remove the early blank swipe ourselves, but only
+    // when its slot is still the empty value we staged.
+    if (stagedSwipeOriginal && stagedSwipeId != null) {
+      try {
+        const current = chatsSvc.getMessage(input.userId, stagedSwipeOriginal.id);
+        if (current?.swipes[stagedSwipeId] === "") {
+          chatsSvc.deleteSwipe(input.userId, stagedSwipeOriginal.id, stagedSwipeId);
+        }
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
     activeGenerations.delete(generationId);
-    activeChatGenerations.delete(chatKey);
+    if (activeChatGenerations.get(chatKey) === generationId) {
+      activeChatGenerations.delete(chatKey);
+    }
     resolveCompletion();
     pool.errorPool(generationId, errorMessage(err));
     throw err;
@@ -3665,10 +3734,9 @@ export async function dryRunGeneration(
   input: GenerateInput,
 ): Promise<DryRunResult> {
   const genType = input.generation_type || "normal";
+  const sourceMessages = chatsSvc.getMessages(input.userId, input.chat_id);
   const sourceMessagesById = new Map(
-    chatsSvc
-      .getMessages(input.userId, input.chat_id)
-      .map((message) => [message.id, message] as const),
+    sourceMessages.map((message) => [message.id, message] as const),
   );
   const dryRunReasoningSettings =
     settingsSvc.getSetting(input.userId, "reasoningSettings")?.value ?? null;
@@ -3676,6 +3744,17 @@ export async function dryRunGeneration(
   // No-preset temp chats bypass preset resolution/assertion (same as
   // startGeneration); assembly falls back to raw message mapping.
   const dryRunChat = chatsSvc.getChat(input.userId, input.chat_id);
+  const dryRunIsGroupChat = dryRunChat?.metadata?.group === true;
+  const dryRunGroupCharacterIds =
+    dryRunIsGroupChat && Array.isArray(dryRunChat?.metadata?.character_ids)
+      ? (dryRunChat.metadata.character_ids as string[])
+      : [];
+  const dryRunTargetCharacterId =
+    dryRunIsGroupChat &&
+    typeof input.target_character_id === "string" &&
+    dryRunGroupCharacterIds.includes(input.target_character_id)
+      ? input.target_character_id
+      : undefined;
   const isNoPresetChat = isNoPresetChatMetadata(dryRunChat?.metadata);
   if (isNoPresetChat) {
     input.preset_id = undefined;
@@ -3709,6 +3788,24 @@ export async function dryRunGeneration(
   }
   const { provider } = await resolveProviderAndKey(input.userId, connection.id);
 
+  const dryRunContinueTarget =
+    genType === "continue"
+      ? input.message_id
+        ? sourceMessagesById.get(input.message_id) ?? null
+        : [...sourceMessages].reverse().find((message) => !message.is_user) ?? null
+      : null;
+  const dryRunPresetId = input.preset_id || connection.preset_id;
+  const dryRunContinueConfiguredPostfix = dryRunPresetId
+    ? presetsSvc.getPreset(input.userId, dryRunPresetId)?.prompts
+        ?.completionSettings?.continuePostfix || ""
+    : "";
+  const dryRunContinuePostfix = dryRunContinueTarget
+    ? resolveContinuePostfix(
+        dryRunContinueTarget.content,
+        dryRunContinueConfiguredPostfix,
+      )
+    : undefined;
+
   const pipeline = await runPromptPipeline({
     userId: input.userId,
     chatId: input.chat_id,
@@ -3728,7 +3825,9 @@ export async function dryRunGeneration(
     inputMessages: input.messages,
     inputParameters: input.parameters,
     excludeMessageId: input.exclude_message_id,
-    targetCharacterId: input.target_character_id,
+    continueMessageId: dryRunContinueTarget?.id,
+    continuePostfix: dryRunContinuePostfix,
+    targetCharacterId: dryRunTargetCharacterId,
     signal: input.signal,
     isDryRun: true,
   });
@@ -3929,6 +4028,7 @@ async function runGeneration(
 
   let fullContent = "";
   let fullReasoning = "";
+  const trimIncompleteWords = lifecycle.trimIncompleteWords === true;
 
   let streamUsage:
     | { prompt_tokens: number; completion_tokens: number; total_tokens: number }
@@ -3990,6 +4090,9 @@ async function runGeneration(
   }> {
     flushCotBuffers();
     let closedContent = closeUnterminatedReasoningTags(userId, fullContent);
+    if (useStreaming && trimIncompleteWords) {
+      closedContent = trimIncompleteStreamTail(closedContent);
+    }
 
     const responseScripts = regexScriptsSvc.getActiveScripts(userId, {
       characterId: lifecycle.targetCharacterId,
@@ -4018,6 +4121,7 @@ async function runGeneration(
         );
       }
     }
+    closedContent = healFormattingArtifacts(closedContent);
 
     let messageId: string | undefined;
     if (lifecycle.targetMessageId && lifecycle.targetSwipeIdx != null) {
@@ -4119,6 +4223,13 @@ async function runGeneration(
   // the prefill is (or starts with) the configured reasoning prefix, it's
   // classified as reasoning from the first token instead of leaking into the
   // content bubble and then being re-extracted by the post-parse safety net.
+
+  // Prefill is explicitly authored and complete by definition. Only the
+  // provider-produced tail is eligible for incomplete-word trimming.
+  const assistantPrefillContentLength = fullContent.length;
+  const trimIncompleteStreamTail = (content: string): string =>
+    content.slice(0, assistantPrefillContentLength) +
+    trimIncompleteTrailingWord(content.slice(assistantPrefillContentLength));
 
   // Determine streaming mode from _streaming parameter (defaults to true)
   const useStreaming = parameters._streaming !== false;
@@ -4679,6 +4790,10 @@ async function runGeneration(
       }
       throwIfFinalResponseAborted();
 
+      if (useStreaming && trimIncompleteWords) {
+        fullContent = trimIncompleteStreamTail(fullContent);
+      }
+
       // Apply regex scripts (response target) to completed content
       {
         const responseScripts = regexScriptsSvc.getActiveScripts(userId, {
@@ -4713,6 +4828,7 @@ async function runGeneration(
           }
         }
       }
+      fullContent = healFormattingArtifacts(fullContent);
 
       throwIfFinalResponseAborted();
       let finalResponseMacroEnv: MacroEnv | undefined;

@@ -331,6 +331,7 @@ export const DEFAULT_PRESET_PROMPTS = {
     seed: -1,
     customStopStrings: [],
     collapseMessages: false,
+    trimIncompleteWords: false,
   },
 };
 

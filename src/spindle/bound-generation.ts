@@ -876,9 +876,23 @@ export async function runBoundAssembly(input: BoundAssemblyExecution): Promise<B
   if (isAbortSignalAborted(request.signal) || isAbortSignalAborted(input.context.signal)) return assemblyAbort();
   const resolved = await resolveDispatch(input.context.parent, request.dispatch, input.resolveDispatch);
   if ("kind" in resolved) return assemblyFailure(resolved.kind, resolved.code, resolved.message);
-  const unusable = parentRetrievalUsable(input.context.parent, now);
+  const afterDispatchNow = nowOf(input.now);
+  const currentDeadline = validateBoundDeadline(
+    request.deadlineAt,
+    afterDispatchNow,
+    input.context.parent.boundWorkDeadlineAt,
+  );
+  if (!currentDeadline.ok) {
+    return assemblyFailure("precondition", currentDeadline.code, currentDeadline.message);
+  }
+  const unusable = parentRetrievalUsable(input.context.parent, afterDispatchNow);
   if (unusable) return unusable;
-  const composed = composeSignal(input.context.signal, request.signal, request.deadlineAt, now);
+  const composed = composeSignal(
+    input.context.signal,
+    request.signal,
+    request.deadlineAt,
+    afterDispatchNow,
+  );
   try {
     if (composed.signal.aborted) return assemblyAbort();
     const assembled = await input.assemble({
@@ -954,7 +968,21 @@ export async function runBoundQuietTracked(input: BoundQuietExecution): Promise<
   if (!prefill.ok) return quietPreflight("security", prefill.code, "PrefillError", prefill.message);
   const resolved = await resolveDispatch(input.context.parent, request.dispatch, input.resolveDispatch);
   if ("kind" in resolved) return quietResolvedFailure(seedForSource(input.context.parent, source), false, false, resolved.kind, resolved.code, "DispatchError", resolved.message);
-  const composed = composeSignal(input.context.signal, request.signal, request.deadlineAt, now);
+  const afterDispatchNow = nowOf(input.now);
+  const currentDeadlineResult = deadlineFailure(
+    validateBoundDeadline(
+      request.deadlineAt,
+      afterDispatchNow,
+      input.context.parent.boundWorkDeadlineAt,
+    ),
+  );
+  if (currentDeadlineResult) return currentDeadlineResult;
+  const composed = composeSignal(
+    input.context.signal,
+    request.signal,
+    request.deadlineAt,
+    afterDispatchNow,
+  );
   let providerInvoked = false;
   try {
     if (composed.signal.aborted) return quietResolvedFailure(resolved.receipt, false, false, "abort", "BOUND_ABORTED", "AbortError", "Bound quiet dispatch was aborted");

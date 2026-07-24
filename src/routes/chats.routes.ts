@@ -20,6 +20,10 @@ import {
   resolveWorldInfoOutlets,
 } from "../services/prompt-assembly.service";
 import { resolveRegexActionEffects } from "../services/associative-regex-effects.service";
+import {
+  personaHasAddon,
+  withChatPersonaAddonState,
+} from "../services/persona-addon-states";
 import type { RegexActionEffect } from "../types/regex-script";
 
 async function runMessageContentProcessors(
@@ -58,9 +62,9 @@ async function processChatGreeting(userId: string, chat: { id: string }) {
 
 const app = new Hono();
 
-/** Matches the `{{outlet::name}}` macro so display resolution can populate
- *  the world-info outlet map only when a message actually references it. */
-const OUTLET_MACRO_RE = /\{\{outlet::/i;
+/** Matches an outlet macro so display resolution can populate Lorebook
+ * outlets when a directly or indirectly referenced persona outlet needs one. */
+const OUTLET_MACRO_RE = /\{\{(?:outlet|persona_outlet|personaoutlet)::/i;
 const DISPLAY_PREPROCESS_BATCH_MAX = 100;
 
 interface DisplayPreprocessItem {
@@ -150,6 +154,14 @@ app.get("/recent-grouped", (c) => {
   const search = c.req.query("search");
   const sortParam = c.req.query("sort");
   const directionParam = c.req.query("direction");
+  const favoriteCharacterIds = c.req.query("favorite_ids")
+    ?.split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const hiddenCharacterIds = c.req.query("hidden_character_ids")
+    ?.split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
   const sort: svc.GroupedRecentChatSort | undefined =
     sortParam === "name" || sortParam === "recent" || sortParam === "created" ? sortParam : undefined;
   const direction: "asc" | "desc" | undefined =
@@ -158,7 +170,14 @@ app.get("/recent-grouped", (c) => {
     ...(search ? { search } : {}),
     ...(sort ? { sort } : {}),
     ...(direction ? { direction } : {}),
+    ...(favoriteCharacterIds?.length ? { favoriteCharacterIds } : {}),
+    ...(hiddenCharacterIds?.length ? { hiddenCharacterIds } : {}),
   }));
+});
+
+app.get("/hidden-from-recent", (c) => {
+  const userId = c.get("userId");
+  return c.json(svc.listHiddenRecentChats(userId));
 });
 
 app.get("/character-chats/:characterId", (c) => {
@@ -297,6 +316,38 @@ app.patch("/:id/members/:characterId/alternate-fields", async (c) => {
   if (!updated) {
     return c.json({ error: "Not found, not a group chat/member, or invalid alternate field selection" }, 400);
   }
+  return c.json(updated);
+});
+
+/**
+ * Atomically toggle one persona add-on in this chat. Besides the existing
+ * boolean override, this records toggle recency so that the newest enabled
+ * add-on with alternative art owns the active persona avatar.
+ */
+app.put("/:id/persona-addons/:personaId/:addonId", async (c) => {
+  const userId = c.get("userId");
+  const chat = svc.getChat(userId, c.req.param("id"));
+  if (!chat) return c.json({ error: "Not found" }, 404);
+
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body.enabled !== "boolean") {
+    return c.json({ error: "enabled must be a boolean" }, 400);
+  }
+
+  const persona = personasSvc.getPersona(userId, c.req.param("personaId"));
+  if (!persona) return c.json({ error: "Persona not found" }, 404);
+  if (!personaHasAddon(persona, c.req.param("addonId"))) {
+    return c.json({ error: "Add-on is not attached to this persona" }, 404);
+  }
+
+  const metadata = withChatPersonaAddonState(
+    chat.metadata,
+    persona.id,
+    c.req.param("addonId"),
+    body.enabled,
+  );
+  const updated = svc.updateChat(userId, chat.id, { metadata });
+  if (!updated) return c.json({ error: "Not found" }, 404);
   return c.json(updated);
 });
 

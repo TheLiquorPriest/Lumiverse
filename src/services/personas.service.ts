@@ -5,6 +5,12 @@ import type { Persona, CreatePersonaInput, UpdatePersonaInput } from "../types/p
 import type { PaginationParams, PaginatedResult } from "../types/pagination";
 import { paginatedQuery } from "./pagination";
 import { getSetting as getUserSetting } from "./settings.service";
+import {
+  resolvePersonaAvatarInfo,
+  type PersonaAddonStateMap,
+  type PersonaAddonToggleOrder,
+  type PersonaAvatarInfo,
+} from "./persona-addon-states";
 
 function rowToPersona(row: any): Persona {
   return {
@@ -13,6 +19,8 @@ function rowToPersona(row: any): Persona {
     subjective_pronoun: row.subjective_pronoun || '',
     objective_pronoun: row.objective_pronoun || '',
     possessive_pronoun: row.possessive_pronoun || '',
+    reflexive_pronoun: row.reflexive_pronoun || '',
+    possessive_pronoun_standalone: row.possessive_pronoun_standalone || '',
     folder: row.folder || '',
     avatar_path: row.avatar_path || null,
     image_id: row.image_id || null,
@@ -41,24 +49,17 @@ export function getPersona(userId: string, id: string): Persona | null {
 
 export function getPersonaAvatarInfo(
   userId: string,
-  id: string
-): { image_id: string | null; avatar_path: string | null; avatar_crop_image_id: string | null } | null {
-  const row = getDb()
-    .query("SELECT image_id, avatar_path, metadata FROM personas WHERE id = ? AND user_id = ?")
-    .get(id, userId) as any;
-  if (!row) return null;
-  let avatarCropImageId: string | null = null;
-  try {
-    const metadata = typeof row.metadata === "string" ? JSON.parse(row.metadata) : row.metadata;
-    avatarCropImageId = typeof metadata?.avatar_crop_image_id === "string" ? metadata.avatar_crop_image_id : null;
-  } catch {
-    avatarCropImageId = null;
-  }
-  return {
-    image_id: row.image_id || null,
-    avatar_path: row.avatar_path || null,
-    avatar_crop_image_id: avatarCropImageId,
-  };
+  id: string,
+  options: {
+    addonStates?: PersonaAddonStateMap;
+    addonToggleOrder?: PersonaAddonToggleOrder;
+  } = {},
+): PersonaAvatarInfo | null {
+  return resolvePersonaAvatarInfo(
+    getPersona(userId, id),
+    options.addonStates,
+    options.addonToggleOrder,
+  );
 }
 
 export function createPersona(userId: string, input: CreatePersonaInput): Persona {
@@ -73,10 +74,10 @@ export function createPersona(userId: string, input: CreatePersonaInput): Person
       .query(
         `INSERT INTO personas (
            id, user_id, name, title, description,
-           subjective_pronoun, objective_pronoun, possessive_pronoun,
+           subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone,
            folder, is_default, is_narrator, attached_world_book_id, metadata, created_at, updated_at
          )
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -87,6 +88,8 @@ export function createPersona(userId: string, input: CreatePersonaInput): Person
         input.subjective_pronoun || "",
         input.objective_pronoun || "",
         input.possessive_pronoun || "",
+        input.reflexive_pronoun || "",
+        input.possessive_pronoun_standalone || "",
         input.folder || "",
         input.is_default ? 1 : 0,
         input.is_narrator ? 1 : 0,
@@ -117,6 +120,8 @@ export function updatePersona(userId: string, id: string, input: UpdatePersonaIn
   if (input.subjective_pronoun !== undefined) { fields.push("subjective_pronoun = ?"); values.push(input.subjective_pronoun); }
   if (input.objective_pronoun !== undefined) { fields.push("objective_pronoun = ?"); values.push(input.objective_pronoun); }
   if (input.possessive_pronoun !== undefined) { fields.push("possessive_pronoun = ?"); values.push(input.possessive_pronoun); }
+  if (input.reflexive_pronoun !== undefined) { fields.push("reflexive_pronoun = ?"); values.push(input.reflexive_pronoun); }
+  if (input.possessive_pronoun_standalone !== undefined) { fields.push("possessive_pronoun_standalone = ?"); values.push(input.possessive_pronoun_standalone); }
   if (input.folder !== undefined) { fields.push("folder = ?"); values.push(input.folder); }
   if (input.is_default !== undefined) { fields.push("is_default = ?"); values.push(input.is_default ? 1 : 0); }
   if (input.is_narrator !== undefined) { fields.push("is_narrator = ?"); values.push(input.is_narrator ? 1 : 0); }
@@ -240,6 +245,47 @@ export function setPersonaImage(userId: string, id: string, imageId: string): bo
   return result.changes > 0;
 }
 
+/**
+ * Attach or clear a persona-specific avatar override for an add-on. The image
+ * lives on the persona's add-on reference, including attached global add-ons,
+ * so a shared global add-on never dictates another persona's appearance.
+ */
+export function setPersonaAddonAvatar(
+  userId: string,
+  personaId: string,
+  addonId: string,
+  avatar: { image_id: string | null; avatar_crop_image_id?: string | null },
+): Persona | null {
+  const existing = getPersona(userId, personaId);
+  if (!existing) return null;
+
+  const metadata = existing.metadata ?? {};
+  let found = false;
+  const updateAddons = (addons: unknown): unknown => {
+    if (!Array.isArray(addons)) return addons;
+    return addons.map((addon: any) => {
+      if (!addon || addon.id !== addonId) return addon;
+      found = true;
+      const next = { ...addon };
+      if (avatar.image_id) next.avatar_image_id = avatar.image_id;
+      else delete next.avatar_image_id;
+      if (avatar.avatar_crop_image_id) next.avatar_crop_image_id = avatar.avatar_crop_image_id;
+      else delete next.avatar_crop_image_id;
+      return next;
+    });
+  };
+
+  const nextMetadata = {
+    ...metadata,
+    ...(Array.isArray(metadata.addons) ? { addons: updateAddons(metadata.addons) } : {}),
+    ...(Array.isArray(metadata.attached_global_addons)
+      ? { attached_global_addons: updateAddons(metadata.attached_global_addons) }
+      : {}),
+  };
+  if (!found) return null;
+  return updatePersona(userId, personaId, { metadata: nextMetadata });
+}
+
 export function duplicatePersona(userId: string, id: string): Persona | null {
   const existing = getPersona(userId, id);
   if (!existing) return null;
@@ -251,10 +297,10 @@ export function duplicatePersona(userId: string, id: string): Persona | null {
     .query(
       `INSERT INTO personas (
          id, user_id, name, title, description,
-         subjective_pronoun, objective_pronoun, possessive_pronoun,
+         subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone,
          folder, avatar_path, image_id, is_default, is_narrator, attached_world_book_id, metadata, created_at, updated_at
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
     )
     .run(
       newId,
@@ -265,6 +311,8 @@ export function duplicatePersona(userId: string, id: string): Persona | null {
       existing.subjective_pronoun,
       existing.objective_pronoun,
       existing.possessive_pronoun,
+      existing.reflexive_pronoun,
+      existing.possessive_pronoun_standalone,
       existing.folder,
       existing.avatar_path,
       existing.image_id,

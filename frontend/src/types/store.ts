@@ -109,6 +109,7 @@ export type CharacterViewMode = 'grid' | 'single' | 'list'
 
 export interface StartupSettings {
   favorites?: string[]
+  landingHiddenCharacterIds?: string[]
   filterTab?: CharacterFilterTab
   sortField?: CharacterSortField
   sortDirection?: CharacterSortDirection
@@ -234,6 +235,7 @@ export interface Toast {
   message: string
   duration?: number
   dismissible?: boolean
+  action?: { label: string; onClick: () => void }
 }
 
 // ---- UI Slice ----
@@ -460,6 +462,7 @@ export interface SettingsSlice {
   fullSettingsLoaded: boolean
   landingPageChatsDisplayed: number
   landingPageLayoutMode: 'cards' | 'compact'
+  landingHiddenCharacterIds: string[]
   charactersPerPage: number
   personasPerPage: number
   messagesPerPage: number
@@ -545,7 +548,8 @@ export interface SettingsSlice {
   renameSavedTheme: (id: string, name: string) => void
   deleteSavedTheme: (id: string) => Promise<void>
   applySavedTheme: (id: string) => void
-  updateSavedTheme: (id: string) => void
+  /** Replace a saved theme with the complete current theme snapshot and persist it. */
+  updateSavedTheme: (id: string) => Promise<void>
   loadSettings: () => Promise<void>
 }
 
@@ -1193,7 +1197,7 @@ export interface SpindlePlacementSlice {
 
   registerFloatWidget: (widget: FloatWidgetState) => void
   unregisterFloatWidget: (widgetId: string) => void
-  updateFloatWidget: (widgetId: string, updates: Partial<Pick<FloatWidgetState, 'x' | 'y' | 'width' | 'height' | 'visible' | 'fullscreen' | 'preFullscreen'>>) => void
+  updateFloatWidget: (widgetId: string, updates: Partial<Pick<FloatWidgetState, 'x' | 'y' | 'width' | 'height' | 'visible' | 'desktopPoppedOut' | 'fullscreen' | 'preFullscreen'>>) => void
 
   registerDockPanel: (panel: DockPanelState) => void
   unregisterDockPanel: (panelId: string) => void

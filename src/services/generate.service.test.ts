@@ -28,6 +28,7 @@ import {
 import { toolRegistry } from "../spindle/tool-registry";
 import * as chatsSvc from "./chats.service";
 import * as regexScriptsSvc from "./regex-scripts.service";
+import * as presetsSvc from "./presets.service";
 
 import type {
   InterceptorBreakdownEntry,
@@ -134,6 +135,22 @@ describe("prompt breakdown visibility", () => {
 });
 
 describe("Callback-active provider route matrix", () => {
+  test("captures continuation facts for callback-bound assembly", () => {
+    expect(__test__.buildParentGenerationSnapshotOptions({
+      generationType: "continue",
+      excludeMessageId: "excluded-message",
+      targetCharacterId: "character-1",
+      continueMessageId: "continued-message",
+      continuePostfix: "\n\n",
+    })).toEqual({
+      generationType: "continue",
+      excludeMessageId: "excluded-message",
+      targetCharacterId: "character-1",
+      continueMessageId: "continued-message",
+      continuePostfix: "\n\n",
+    });
+  });
+
   test("allows only live normal and continue generations", () => {
     expect(__test__.isCallbackActiveProviderRoute("normal", false)).toBe(true);
     expect(__test__.isCallbackActiveProviderRoute("continue", false)).toBe(true);
@@ -700,6 +717,54 @@ function makeGenerationInput(
       : {}),
   };
 }
+test("publishes continuation targeting and postfix through callback authority", async () => {
+  seedMessage(
+    FINAL_RESPONSE_ASSISTANT_MESSAGE,
+    FINAL_RESPONSE_CHAT,
+    1,
+    false,
+    "before",
+  );
+  const preset = presetsSvc.getPreset(
+    FINAL_RESPONSE_USER,
+    FINAL_RESPONSE_PRESET,
+  );
+  if (!preset) throw new Error("Seeded continuation preset is missing");
+  presetsSvc.updatePreset(FINAL_RESPONSE_USER, FINAL_RESPONSE_PRESET, {
+    prompts: {
+      ...preset.prompts,
+      completionSettings: {
+        ...preset.prompts.completionSettings,
+        continuePostfix: "\n--continued--\n",
+      },
+    },
+  });
+  let capturedOptions: Readonly<Record<string, unknown>> | undefined;
+  generationInterceptors.push(
+    interceptorPipeline.register({
+      extensionId: "continuation-snapshot-observer",
+      extensionName: "Continuation snapshot observer",
+      userId: FINAL_RESPONSE_USER,
+      matcher: (_context, authority) => {
+        capturedOptions = authority?.parentGenerationSnapshot?.options;
+        return false;
+      },
+      priority: 0,
+      handler: async (messages) => ({ messages }),
+    }),
+  );
+
+  await waitForGeneration(
+    makeGenerationInput("continue", baseMessages("continue")),
+  );
+
+  expect(capturedOptions).toMatchObject({
+    generationType: "continue",
+    continueMessageId: FINAL_RESPONSE_ASSISTANT_MESSAGE,
+    continuePostfix: "\n--continued--\n",
+  });
+});
+
 
 for (const scenario of [
   { generationType: "normal" as const, expected: "native-normal" },

@@ -575,7 +575,9 @@ type RuntimeWorkerToHost =
       tabId?: string;
       viewId?: string;
       userId?: string;
-    };
+    }
+  | { type: "image_gen_generate_stream"; requestId: string; input: Record<string, unknown> }
+  | { type: "image_gen_cancel_stream"; requestId: string };
 
 type RuntimeHostToWorker =
   | Exclude<
@@ -645,13 +647,18 @@ type RuntimeHostToWorker =
   | { type: "frontend_process_lifecycle"; event: FrontendProcessLifecycleEvent }
   | { type: "frontend_process_message"; processId: string; payload: unknown; userId: string }
   | { type: "backend_process_lifecycle"; event: BackendProcessLifecycleEvent }
-  | { type: "backend_process_message"; processId: string; payload: unknown; userId: string };
+  | { type: "backend_process_message"; processId: string; payload: unknown; userId: string }
+  | { type: "image_gen_stream_chunk"; requestId: string; event: ImageGenStreamEvent }
+  | { type: "image_gen_stream_error"; requestId: string; error: string };
+
+type ImageGenStreamEvent = ImageGenStreamEventDTO;
+type ImageGenStreamInput = ImageGenStreamRequestDTO;
 
 // `presets` is replaced wholesale (not intersected) because the local
 // PromptBlock type also carries host-only sealed-block provenance. Keeping the
 // runtime CRUD surface on the native type avoids narrowing data returned by
 // newer hosts when the installed public type package lags a release.
-type RuntimeSpindleAPI = Omit<SpindleAPI, "presets"> & {
+type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen"> & {
   /** Read-only Lumia DLC catalog. Public extension types expose this as `spindle.dlc`. */
   dlc: {
     getCatalog(options?: { userId?: string }): Promise<LumiaDlcCatalog>;
@@ -666,6 +673,14 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets"> & {
     }): Promise<any>;
   };
   assemble(input: AssembleRequest, userId?: string): Promise<AssembleResult>;
+  imageGen: SpindleAPI["imageGen"] & {
+    /**
+     * Generate through a provider that explicitly supports WebSocket preview
+     * images and status updates. The terminal `done` event contains the saved
+     * image result. Breaking out of the iterator aborts the upstream job.
+     */
+    generateStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void>;
+  };
   contracts: Readonly<Record<string, number>>;
   registerContextHandler(
     handler: (context: unknown) => Promise<unknown>,
@@ -912,6 +927,10 @@ const pendingResponses = new Map<
   string,
   { resolve: (value: unknown) => void; reject: (reason: unknown) => void }
 >();
+const boundResponseAborts = new Map<
+  string,
+  Map<string, (reason: unknown) => void>
+>();
 const streamingGenerations = new Map<
   string,
   { push: (chunk: StreamChunkDTO) => void; fail: (reason: unknown) => void }
@@ -920,12 +939,6 @@ const streamingImageGenerations = new Map<
   string,
   { push: (event: ImageGenStreamEventDTO) => void; fail: (reason: unknown) => void }
 >();
-let interceptHandler:
-  | ((
-      messages: LlmMessageDTO[],
-      context: unknown
-    ) => Promise<LlmMessageDTO[] | InterceptorResultDTO>)
-  | null = null;
 
 type RuntimeInterceptorRegistration = {
   readonly handler: (
@@ -1253,14 +1266,32 @@ function requestBoundGeneration<T>(
   const cleanup = (): void => {
     signal?.removeEventListener("abort", onAbort);
     pendingResponses.delete(requestId);
+    const invocationAborts = boundResponseAborts.get(envelope.requestId);
+    invocationAborts?.delete(requestId);
+    if (invocationAborts?.size === 0) {
+      boundResponseAborts.delete(envelope.requestId);
+    }
   };
-  const onAbort = (): void => {
+  const settleAbort = (reason: unknown, notifyHost: boolean): void => {
     if (settled) return;
     settled = true;
     cleanup();
-    reject(abortFailure(signal?.reason));
-    post({ type: "cancel_generation", requestId, __spindle_private_bound: operationEnvelope });
+    reject(abortFailure(reason));
+    if (notifyHost) {
+      post({
+        type: "cancel_generation",
+        requestId,
+        __spindle_private_bound: operationEnvelope,
+      });
+    }
   };
+  const onAbort = (): void => settleAbort(signal?.reason, true);
+  let invocationAborts = boundResponseAborts.get(envelope.requestId);
+  if (!invocationAborts) {
+    invocationAborts = new Map();
+    boundResponseAborts.set(envelope.requestId, invocationAborts);
+  }
+  invocationAborts.set(requestId, (reason) => settleAbort(reason, false));
   pendingResponses.set(requestId, {
     resolve: (value) => {
       if (settled) return;
@@ -1392,7 +1423,6 @@ function createInterceptorCallbackContext(
   };
   return Object.freeze(callback) as unknown as InterceptorContextDTO;
 }
-
 /**
  * Issue a `request_generation_stream` RPC and return an `AsyncGenerator`
  * that yields `StreamChunkDTO` values as the host forwards them. The
@@ -1652,6 +1682,11 @@ function requestImageGenerationStream(
 // ─── Spindle API (exposed to extensions as globalThis.spindle) ───────────
 
 const spindleApi: RuntimeSpindleAPI = {
+  get host(): SpindleHostDescriptorV1 {
+    if (!hostDescriptor) throw new Error("Spindle host descriptor is not initialized");
+    return hostDescriptor;
+  },
+
   on(event: string, handler: (payload: any) => void): () => void {
     if (!eventHandlers.has(event)) {
       eventHandlers.set(event, new Set());
@@ -4318,10 +4353,6 @@ const spindleApi: RuntimeSpindleAPI = {
     },
   },
 
-  get host(): SpindleHostDescriptorV1 {
-    if (!hostDescriptor) throw new Error("Spindle host descriptor is not initialized");
-    return hostDescriptor;
-  },
   get manifest() {
     return manifest;
   },
@@ -4533,11 +4564,19 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
     case "intercept_abort": {
       const request = interceptorRequests.get(msg.requestId);
       if (!request || request.registrationId !== msg.registrationId) break;
+      const abortReason = makeAbortError(msg.reason);
+      for (const abortBoundResponse of [
+        ...(boundResponseAborts.get(msg.requestId)?.values() ?? []),
+      ]) {
+        abortBoundResponse(abortReason);
+      }
+      boundResponseAborts.delete(msg.requestId);
       request.settled = true;
-      request.controller.abort(makeAbortError(msg.reason));
+      request.controller.abort(abortReason);
       interceptorRequests.delete(msg.requestId);
       break;
     }
+
 
     case "tool_invocation": {
       const handlers = eventHandlers.get("TOOL_INVOCATION");

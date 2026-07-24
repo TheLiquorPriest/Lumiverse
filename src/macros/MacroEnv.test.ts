@@ -19,6 +19,7 @@ const baseCharacter: Character = {
   creator_notes: "",
   system_prompt: "",
   post_history_instructions: "",
+  folder: "",
   tags: [],
   alternate_greetings: [],
   extensions: {},
@@ -43,6 +44,8 @@ const basePersona: Persona = {
   subjective_pronoun: "",
   objective_pronoun: "",
   possessive_pronoun: "",
+  reflexive_pronoun: "",
+  possessive_pronoun_standalone: "",
   folder: "",
   avatar_path: null,
   image_id: null,
@@ -137,6 +140,8 @@ describe("buildEnv persona pronouns", () => {
     expect(env.character.personaSubjectivePronoun).toBe("they");
     expect(env.character.personaObjectivePronoun).toBe("them");
     expect(env.character.personaPossessivePronoun).toBe("their");
+    expect(env.character.personaReflexivePronoun).toBe("themselves");
+    expect(env.character.personaPossessivePronounStandalone).toBe("theirs");
   });
 
   test("uses configured persona pronouns when present", () => {
@@ -147,6 +152,8 @@ describe("buildEnv persona pronouns", () => {
         subjective_pronoun: " she ",
         objective_pronoun: " her ",
         possessive_pronoun: " her ",
+        reflexive_pronoun: " herself ",
+        possessive_pronoun_standalone: " hers ",
       },
       chat: baseChat,
       messages: [],
@@ -157,6 +164,36 @@ describe("buildEnv persona pronouns", () => {
     expect(env.character.personaSubjectivePronoun).toBe("she");
     expect(env.character.personaObjectivePronoun).toBe("her");
     expect(env.character.personaPossessivePronoun).toBe("her");
+    expect(env.character.personaReflexivePronoun).toBe("herself");
+    expect(env.character.personaPossessivePronounStandalone).toBe("hers");
+  });
+});
+
+describe("buildEnv persona add-on outlets", () => {
+  test("publishes enabled outlet add-ons without appending them to {{persona}}", () => {
+    const env = buildEnv({
+      character: baseCharacter,
+      persona: {
+        ...basePersona,
+        description: "Base persona",
+        metadata: {
+          addons: [
+            { id: "append", content: "Appended", enabled: true, sort_order: 1 },
+            { id: "outlet-2", content: "Second outlet", enabled: true, sort_order: 2, outlet_name: " Details " },
+            { id: "outlet-1", content: "First outlet", enabled: true, sort_order: 0, outlet_name: "DETAILS" },
+            { id: "disabled", content: "Hidden", enabled: false, sort_order: 3, outlet_name: "details" },
+          ],
+        },
+      },
+      chat: baseChat,
+      messages: [],
+      generationType: "normal",
+      connection: null,
+    });
+
+    expect(env.character.persona).toBe("Base persona\nAppended");
+    expect(env.extra.personaAddonOutlets).toEqual({ details: "First outlet\n\nSecond outlet" });
+    expect(env.extra.worldInfoOutlets).toBeUndefined();
   });
 });
 

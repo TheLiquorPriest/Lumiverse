@@ -1,6 +1,4 @@
 import {
-  Search,
-  X,
   Star,
   LayoutGrid,
   RectangleVertical,
@@ -15,8 +13,8 @@ import ImportMenu from './ImportMenu'
 import type { CharacterFilterTab, CharacterSortField, CharacterSortDirection, CharacterViewMode } from '@/types/store'
 import styles from './CharacterToolbar.module.css'
 import clsx from 'clsx'
-import { clearSearchOnEscape } from '@/lib/clearableSearch'
 import { SortControl } from '@/components/shared/SortControl'
+import SearchField from '@/components/shared/SearchField'
 
 interface CharacterToolbarProps {
   searchQuery: string
@@ -35,6 +33,7 @@ interface CharacterToolbarProps {
   onImportTagLibrary: (file: File) => void
   onImportUrl: () => void
   onCreateNew: () => void
+  onCreateFolder: (name: string) => void
   importLoading: boolean
   tagLibraryImporting?: boolean
   onGroupChat?: () => void
@@ -64,6 +63,7 @@ export default function CharacterToolbar({
   onImportTagLibrary,
   onImportUrl,
   onCreateNew,
+  onCreateFolder,
   importLoading,
   tagLibraryImporting = false,
   onGroupChat,
@@ -81,30 +81,21 @@ export default function CharacterToolbar({
   return (
     <div className={styles.toolbar}>
       {/* Search bar with create action */}
-      <div className={styles.searchBar}>
-        <Search size={14} className={styles.searchIcon} />
-        <input
-          type="text"
-          className={styles.searchInput}
-          value={searchQuery}
-          onChange={(e) => onSearchChange(e.target.value)}
-          onKeyDown={(e) => clearSearchOnEscape(e, searchQuery, () => onSearchChange(''))}
-          placeholder={isGroupsTab ? t('characterToolbar.searchGroupChats') : t('characterToolbar.searchCharacters')}
-        />
-        {searchQuery && (
-          <button type="button" className={styles.clearBtn} onClick={() => onSearchChange('')} aria-label={t('actions.clear', { ns: 'common' })}>
-            <X size={14} />
-          </button>
-        )}
-        <ImportMenu
+      <SearchField
+        value={searchQuery}
+        onChange={onSearchChange}
+        placeholder={isGroupsTab ? t('characterToolbar.searchGroupChats') : t('characterToolbar.searchCharacters')}
+        clearLabel={t('actions.clear', { ns: 'common' })}
+        actions={<ImportMenu
           onImportFile={onImportFile}
           onImportTagLibrary={onImportTagLibrary}
           onImportUrl={onImportUrl}
           onCreateNew={onCreateNew}
+          onCreateFolder={onCreateFolder}
           importLoading={importLoading}
           tagLibraryImporting={tagLibraryImporting}
-        />
-      </div>
+        />}
+      />
 
       {/* Filter + Sort + View + Actions — single row */}
       <div className={styles.controlRow}>

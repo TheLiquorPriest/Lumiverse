@@ -408,6 +408,55 @@ describe("Bound assembly and tracked dispatch", () => {
     expect(providerCalls).toBe(0);
   });
 
+  test("rechecks deadlines after asynchronous dispatch resolution", async () => {
+    const parentSnapshot = parent();
+    let now = 100;
+    let assemblyCalls = 0;
+    let providerCalls = 0;
+    const resolve = resolverFor(parentSnapshot);
+    const binding = createBoundGenerationBinding({
+      context: context(parentSnapshot),
+      resolveDispatch: async (request) => {
+        const result = await resolve(request);
+        now = 5_000;
+        return result;
+      },
+      assemble: async () => {
+        assemblyCalls += 1;
+        return { messages: [], breakdown: [] };
+      },
+      provider: async (...args) => {
+        providerCalls += 1;
+        return provider(...args);
+      },
+      now: () => now,
+    });
+
+    const assembly = await binding.assemble({
+      blocks: BLOCKS,
+      dispatch: {
+        source: "main",
+        expectedConnectionDispatchRevision: REVISION,
+      },
+      deadlineAt: 5_000,
+    });
+    expect(assembly).toMatchObject({
+      ok: false,
+      error: { code: "DEADLINE_EXPIRED" },
+    });
+
+    now = 100;
+    const quiet = await binding.quietTracked(quietRequest({ deadlineAt: 5_000 }));
+    expect(quiet).toMatchObject({
+      ok: false,
+      phase: "preflight",
+      providerInvoked: false,
+      error: { code: "DEADLINE_EXPIRED" },
+    });
+    expect(assemblyCalls).toBe(0);
+    expect(providerCalls).toBe(0);
+  });
+
   test("keeps Main and slot source identity distinct and emits truthful frozen receipts", async () => {
     const parentSnapshot = parent();
     const sources: string[] = [];

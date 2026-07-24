@@ -1,3 +1,4 @@
+import { existsSync } from "fs";
 import { join } from "path";
 import { PROJECT_ROOT, ENTRY, STOP_SIGTERM_GRACE_MS } from "./lib/constants.js";
 
@@ -35,16 +36,33 @@ function setState(state: ServerState): void {
   onStateChange?.(state);
 }
 
+/**
+ * Where server stdout/stderr bytes go. Defaults to the runner's own
+ * stdio (terminal mode); the headless bridge installs a sink that wraps
+ * output in protocol frames so raw server bytes never reach stdout.
+ */
+export type OutputSink = (chunk: Uint8Array, stream: "stdout" | "stderr") => void;
+
+let outputSink: OutputSink | null = null;
+
+export function setOutputSink(sink: OutputSink | null): void {
+  outputSink = sink;
+}
+
 async function readStream(
   stream: ReadableStream<Uint8Array>,
-  target: NodeJS.WriteStream
+  name: "stdout" | "stderr"
 ): Promise<void> {
   const reader = stream.getReader();
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      target.write(value);
+      if (outputSink) {
+        outputSink(value, name);
+      } else {
+        (name === "stdout" ? process.stdout : process.stderr).write(value);
+      }
     }
   } catch {
     // Stream closed
@@ -60,15 +78,32 @@ function smolEnabled(): boolean {
   return !(v === "false" || v === "0" || v === "off" || v === "no");
 }
 
+/**
+ * The shell launchers export FRONTEND_DIR before starting the runner, but the
+ * desktop tray starts it directly. Fall back to the checkout's existing
+ * production bundle so opening the local server has a document to serve.
+ */
+function frontendDir(): string | undefined {
+  const configured = process.env.FRONTEND_DIR?.trim();
+  if (configured) return configured;
+
+  const bundled = join(PROJECT_ROOT, "frontend", "dist");
+  return existsSync(join(bundled, "index.html")) ? bundled : undefined;
+}
+
 export function startServer(isDev: boolean): void {
   if (instance?.proc) return;
 
   const smol = smolEnabled() ? ["--smol"] : [];
+  // process.execPath, not bare "bun": under a GUI supervisor (desktop
+  // tray) the environment's PATH may not contain bun at all.
+  const bunBin = process.execPath;
   const args = isDev
-    ? ["bun", ...smol, "--watch", ENTRY]
-    : ["bun", ...smol, ENTRY];
+    ? [bunBin, ...smol, "--watch", ENTRY]
+    : [bunBin, ...smol, ENTRY];
 
   const restartCount = instance ? instance.restartCount : 0;
+  const frontend = isDev ? "" : frontendDir() ?? "";
 
   const proc = Bun.spawn(args, {
     cwd: PROJECT_ROOT,
@@ -78,6 +113,7 @@ export function startServer(isDev: boolean): void {
       ...process.env,
       FORCE_COLOR: "1",
       LUMIVERSE_RUNNER_IPC: "1",
+      FRONTEND_DIR: frontend,
       ...("BUN_RUNTIME_TRANSPILER_CACHE_PATH" in process.env
         ? { BUN_RUNTIME_TRANSPILER_CACHE_PATH: process.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH }
         : { BUN_RUNTIME_TRANSPILER_CACHE_PATH: join(PROJECT_ROOT, "data", ".bun-transpiler-cache") }),
@@ -100,9 +136,9 @@ export function startServer(isDev: boolean): void {
 
   onStateChange?.("starting");
 
-  // Pipe stdout/stderr to terminal
-  if (proc.stdout) readStream(proc.stdout, process.stdout);
-  if (proc.stderr) readStream(proc.stderr, process.stderr);
+  // Pipe stdout/stderr to the terminal or the installed output sink
+  if (proc.stdout) readStream(proc.stdout, "stdout");
+  if (proc.stderr) readStream(proc.stderr, "stderr");
 
   // Handle process exit
   proc.exited.then((code) => {

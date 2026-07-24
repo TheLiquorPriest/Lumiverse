@@ -1,8 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import {
   getPersonaAvatarLargeUrl,
+  getPersonaAvatarThumbUrlById,
   getPersonaAvatarThumbUrl,
   getPersonaAvatarUrl,
+  getPersonaAvatarUrlById,
+  getPersonaAvatarTiers,
   pickPersonaOriginalImageId,
   pickPersonaThumbImageId,
 } from './avatarUrls'
@@ -44,5 +47,35 @@ describe('persona avatar URL helpers', () => {
     expect(pickPersonaOriginalImageId(persona)).toBe('persona-image')
     expect(getPersonaAvatarThumbUrl(persona)).toBe('/api/v1/images/persona-image?size=sm')
     expect(getPersonaAvatarUrl(persona)).toBe('/api/v1/images/persona-image')
+  })
+
+  test('uses the chat-scoped crop resolver and toggle version for active persona art', () => {
+    expect(
+      getPersonaAvatarThumbUrlById('persona-mode', 'base-image', {
+        chatId: 'chat-1',
+        version: 'toggle-2',
+      }),
+    ).toBe('/api/v1/personas/persona-mode/avatar?chat_id=chat-1&size=sm&variant=crop&v=toggle-2')
+  })
+
+  test('keeps an upload-derived resolver version in the URL', () => {
+    expect(
+      getPersonaAvatarThumbUrlById('persona-mode', 'base-image', {
+        chatId: 'chat-1',
+        version: 'toggle-2.original-image.crop-image',
+      }),
+    ).toBe('/api/v1/personas/persona-mode/avatar?chat_id=chat-1&size=sm&variant=crop&v=toggle-2.original-image.crop-image')
+  })
+
+  test('keeps original and cropped chat-scoped avatar tiers distinct', () => {
+    const context = { chatId: 'chat-1', version: 'toggle-2' }
+
+    expect(getPersonaAvatarUrlById('persona-mode', null, context))
+      .toBe('/api/v1/personas/persona-mode/avatar?chat_id=chat-1&variant=original&v=toggle-2')
+    expect(getPersonaAvatarTiers('persona-mode', null, context, 'original')).toEqual({
+      sm: '/api/v1/personas/persona-mode/avatar?chat_id=chat-1&size=sm&variant=original&v=toggle-2',
+      lg: '/api/v1/personas/persona-mode/avatar?chat_id=chat-1&size=lg&variant=original&v=toggle-2',
+      full: '/api/v1/personas/persona-mode/avatar?chat_id=chat-1&variant=original&v=toggle-2',
+    })
   })
 })

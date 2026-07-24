@@ -178,6 +178,7 @@ const SOURCE_INDEX_KEY = "__sourceIndexInChat";
 const CONTEXT_ANCHOR_PROTECTED_KEY = "__contextAnchorProtected";
 const PRESERVE_DISPLAY_REASONING_DELIMS_KEY =
   "__preserveDisplayReasoningDelimiters";
+const CONTINUE_NUDGE_KEY = "__continueNudge";
 
 function markAsChatHistory(
   msg: LlmMessage,
@@ -380,10 +381,29 @@ function stripEmptyTextParts(result: LlmMessage[]): void {
   result.length = write;
 }
 
-function rtrimLastHistoryAssistant(result: LlmMessage[]): void {
+export function resolveContinuePostfix(
+  originalContent: string,
+  configuredPostfix: string,
+): string {
+  if (!configuredPostfix || originalContent.endsWith(configuredPostfix)) {
+    return "";
+  }
+  return configuredPostfix;
+}
+
+export function rtrimLastHistoryAssistant(
+  result: LlmMessage[],
+  preserveSourceMessageId?: string,
+): void {
   for (let i = result.length - 1; i >= 0; i--) {
     const msg = result[i];
     if (msg.role !== "assistant" || !isChatHistoryMessage(msg)) continue;
+    if (
+      preserveSourceMessageId &&
+      getSourceMessageId(msg) === preserveSourceMessageId
+    ) {
+      return;
+    }
 
     if (typeof msg.content === "string") {
       const trimmed = msg.content.replace(/\s+$/, "");
@@ -408,6 +428,68 @@ function rtrimLastHistoryAssistant(result: LlmMessage[]): void {
     }
     return;
   }
+}
+
+function markAsContinueNudge(msg: LlmMessage): LlmMessage {
+  (msg as any)[CONTINUE_NUDGE_KEY] = true;
+  return msg;
+}
+
+function isContinueNudge(msg: LlmMessage): boolean {
+  return (msg as any)[CONTINUE_NUDGE_KEY] === true;
+}
+
+function appendTextToMessage(message: LlmMessage, text: string): LlmMessage {
+  if (!text) return message;
+  if (typeof message.content === "string") {
+    return { ...message, content: message.content + text };
+  }
+
+  const parts = [...message.content];
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i];
+    if (part.type !== "text") continue;
+    parts[i] = { ...part, text: part.text + text };
+    return { ...message, content: parts };
+  }
+  parts.push({ type: "text", text });
+  return { ...message, content: parts };
+}
+
+/**
+ * Put the actual assistant turn being continued at the end of the assembled
+ * request. This preserves its postfix, keeps it adjacent to the continuation
+ * nudge, and lets continuePrefill use it as a real assistant prefill.
+ */
+export function finalizeContinuePrompt(
+  result: LlmMessage[],
+  continueMessageId: string | undefined,
+  continuePostfix: string,
+): boolean {
+  let targetIndex = -1;
+  for (let i = result.length - 1; i >= 0; i--) {
+    const message = result[i];
+    if (message.role !== "assistant" || !isChatHistoryMessage(message)) continue;
+    if (continueMessageId && getSourceMessageId(message) !== continueMessageId) continue;
+    targetIndex = i;
+    break;
+  }
+  if (targetIndex < 0) return false;
+
+  const [target] = result.splice(targetIndex, 1);
+  const continued = appendTextToMessage(target, continuePostfix);
+  // It is now fixed prompt overhead rather than chat history, so it survives
+  // history clipping and is not trimmed after we deliberately add a postfix.
+  delete (continued as any)[CHAT_HISTORY_KEY];
+  delete (continued as any)[CONTEXT_ANCHOR_PROTECTED_KEY];
+  result.push(continued);
+
+  const nudgeIndex = result.findIndex(isContinueNudge);
+  if (nudgeIndex >= 0) {
+    const [nudge] = result.splice(nudgeIndex, 1);
+    result.push(nudge);
+  }
+  return true;
 }
 
 async function applyPromptRegexScriptsBeforeClipping(
@@ -1775,6 +1857,14 @@ export async function assembleBoundParentPrompt(
       typeof options.excludeMessageId === "string"
         ? options.excludeMessageId
         : undefined,
+    continueMessageId:
+      typeof options.continueMessageId === "string"
+        ? options.continueMessageId
+        : undefined,
+    continuePostfix:
+      typeof options.continuePostfix === "string"
+        ? options.continuePostfix
+        : undefined,
     generationType,
     macroCommit: false,
     skipPromptRegex: true,
@@ -1925,7 +2015,11 @@ export async function assemblePrompt(
             requestedPresetId,
             chat.id,
             characterId,
-            { isGroup: chat.metadata?.group === true, connectionId: connection?.id ?? null },
+            {
+              isGroup: chat.metadata?.group === true,
+              connectionId: connection?.id ?? null,
+              personaId: persona?.id ?? null,
+            },
           );
   const resolvedPresetId = resolvedProfile.preset_id;
 
@@ -2085,6 +2179,10 @@ export async function assemblePrompt(
         "retrieval.cortex",
       ).config as memoryCortex.MemoryCortexConfig)
     : pf?.cortexConfig ?? memoryCortex.getCortexConfig(ctx.userId);
+  const cortexEnabledForChat = memoryCortex.isCortexEnabledForChat(
+    cortexConfig,
+    chat.metadata,
+  );
   let cortexChatMemSettings:
     | import("./embeddings.service").ChatMemorySettings
     | null = null;
@@ -2097,7 +2195,7 @@ export async function assemblePrompt(
   // would otherwise spawn a nested cortex worker from in here. Cortex warming
   // runs only on the in-process assembly path (where it reaches the real cache),
   // matching prior behavior — the per-call worker killed this task anyway.
-  if (!boundParent && cortexConfig.enabled && !runningInAssemblyWorker()) {
+  if (!boundParent && cortexEnabledForChat && !runningInAssemblyWorker()) {
     const cmRaw =
       pf?.allSettings.get("chatMemorySettings") ??
       settingsSvc.getSetting(ctx.userId, "chatMemorySettings")?.value ??
@@ -2765,7 +2863,7 @@ export async function assemblePrompt(
       "chatMemory.result",
     ) as unknown as Awaited<ReturnType<typeof collectChatVectorMemory>>;
     cortexResult = (boundCortex.result ?? null) as memoryCortex.CortexResult | null;
-  } else if (cortexConfig.enabled) {
+  } else if (cortexEnabledForChat) {
     // Fast path: warm cache from a previous generation (synchronous, no I/O).
     // Require the cached entry to have excluded the current live-context tail
     // (and regen target, if any), otherwise it may re-inject recent messages as
@@ -2823,11 +2921,13 @@ export async function assemblePrompt(
   }
 
   // Merge linked cortex data from the captured parent in bound mode. The
-  // ordinary path retains its warm-cache behavior unchanged.
+  // ordinary path retains its warm-cache behavior only when enabled for this chat.
   const linkedCortexResult = boundParent
     ? ((boundRecord(boundParent.retrieval.cortex, "retrieval.cortex").linkedResult ??
         null) as memoryCortex.LinkedCortexResult | null)
-    : memoryCortex.getCachedLinkedCortexResult(ctx.chatId);
+    : cortexEnabledForChat
+      ? memoryCortex.getCachedLinkedCortexResult(ctx.chatId)
+      : null;
   let linkedMemoryText = "";
   if (
     linkedCortexResult &&
@@ -3944,7 +4044,10 @@ export async function assemblePrompt(
     }
   }
 
-  // Continue type: append continueNudge (unless continuePrefill is on)
+  // Continue nudge is tagged now and moved after the continued assistant turn
+  // once prompt regexes/macros have run. Keeping it in the assembly until then
+  // preserves normal prompt-regex behavior without letting later prompt blocks
+  // separate it from the message it refers to.
   if (
     ctx.generationType === "continue" &&
     !completionSettings.continuePrefill
@@ -3953,46 +4056,13 @@ export async function assemblePrompt(
     if (nudge) {
       const resolved = (await evaluate(nudge, macroEnv, registry)).text;
       if (resolved) {
-        result.push({ role: "system", content: resolved });
+        result.push(markAsContinueNudge({ role: "system", content: resolved }));
         breakdown.push({
           type: "utility",
           name: "Continue Nudge",
           role: "system",
           content: resolved,
         });
-      }
-    }
-  }
-
-  // Continue type: apply continuePostfix to last assistant message
-  if (ctx.generationType === "continue" && completionSettings.continuePostfix) {
-    for (let i = result.length - 1; i >= 0; i--) {
-      if (result[i].role === "assistant") {
-        if (typeof result[i].content === "string") {
-          result[i] = {
-            ...result[i],
-            content: result[i].content + completionSettings.continuePostfix,
-          };
-        } else {
-          const parts = [
-            ...(result[i].content as import("../llm/types").LlmMessagePart[]),
-          ];
-          const textIdx = parts.findIndex((p) => p.type === "text");
-          if (textIdx >= 0) {
-            const tp = parts[textIdx] as import("../llm/types").LlmTextPart;
-            parts[textIdx] = {
-              type: "text",
-              text: tp.text + completionSettings.continuePostfix,
-            };
-          } else {
-            parts.push({
-              type: "text",
-              text: completionSettings.continuePostfix,
-            });
-          }
-          result[i] = { ...result[i], content: parts };
-        }
-        break;
       }
     }
   }
@@ -4075,7 +4145,15 @@ export async function assemblePrompt(
   let assistantPrefill: string | undefined;
 
   // Group chat nudge from preset (e.g. "[Write next reply only as {{char}}]")
-  if (shouldInjectGroupNudge(ctx.targetCharacterId)) {
+  if (
+    shouldInjectGroupNudge({
+      isGroupChat: chat.metadata?.group === true,
+      groupCharacterIds: Array.isArray(chat.metadata?.character_ids)
+        ? (chat.metadata.character_ids as string[])
+        : [],
+      targetCharacterId: ctx.targetCharacterId,
+    })
+  ) {
     const groupNudge = promptBehavior.groupNudge;
     if (groupNudge) {
       const resolved = (await evaluate(groupNudge, macroEnv, registry)).text;
@@ -4091,7 +4169,10 @@ export async function assemblePrompt(
     }
   }
 
-  // Collect assistant prefill: promptBias (Start Reply With) + assistantPrefill/assistantImpersonation
+  // A continuation owns its assistant prefill: the assistant turn being
+  // continued is moved to the end of the request below. Adding a second generic
+  // assistant prefill would make the provider continue that text instead, while
+  // the response still gets appended to the original chat message.
   const prefillParts: string[] = [];
 
   // A connection profile can bind its own Start Reply With value alongside its
@@ -4103,6 +4184,7 @@ export async function assemblePrompt(
     ? boundPromptBias
     : settingsMap.get("promptBias");
   if (
+    ctx.generationType !== "continue" &&
     promptBiasVal &&
     typeof promptBiasVal === "string" &&
     promptBiasVal.trim()
@@ -4113,10 +4195,11 @@ export async function assemblePrompt(
   }
 
   const csPrefill =
-    ctx.generationType === "impersonate" &&
-    completionSettings.assistantImpersonation
-      ? completionSettings.assistantImpersonation
-      : completionSettings.assistantPrefill;
+    ctx.generationType === "continue"
+      ? ""
+      : ctx.generationType === "impersonate" && completionSettings.assistantImpersonation
+        ? completionSettings.assistantImpersonation
+        : completionSettings.assistantPrefill;
   if (csPrefill) {
     const resolvedPrefill = (await evaluate(csPrefill, macroEnv, registry))
       .text;
@@ -4131,20 +4214,6 @@ export async function assemblePrompt(
       name: "Assistant Prefill",
       role: "assistant",
       content: assistantPrefill,
-    });
-  } else if (
-    ctx.generationType === "continue" &&
-    result.length > 0 &&
-    result[result.length - 1].role === "assistant"
-  ) {
-    // Continue generation with no explicit prefill — add a minimal nudge so the
-    // conversation ends on a user message (required by most providers).
-    result.push({ role: "user", content: "[Continue]" });
-    breakdown.push({
-      type: "utility",
-      name: "User Nudge",
-      role: "user",
-      content: "[Continue]",
     });
   }
 
@@ -4178,7 +4247,10 @@ export async function assemblePrompt(
   // Strip trailing whitespace from the last chat-history assistant message.
   // Anthropic (and other strict providers) reject turns ending in whitespace;
   // explicit prefills are left alone so users can intentionally seed responses.
-  rtrimLastHistoryAssistant(result);
+  rtrimLastHistoryAssistant(
+    result,
+    ctx.generationType === "continue" ? ctx.continueMessageId : undefined,
+  );
 
   // Drop blank text parts from multipart messages — caption-less attachments,
   // fully-stripped regex output, etc. can otherwise produce empty content blocks
@@ -4222,9 +4294,35 @@ export async function assemblePrompt(
   );
   stripEmptyTextParts(result);
 
+  if (ctx.generationType === "continue") {
+    const finalized = finalizeContinuePrompt(
+      result,
+      ctx.continueMessageId,
+      ctx.continuePostfix ?? "",
+    );
+    if (finalized) {
+      const continued = [...result].reverse().find(
+        (message) =>
+          message.role === "assistant" &&
+          !isChatHistoryMessage(message) &&
+          (!ctx.continueMessageId ||
+            getSourceMessageId(message) === ctx.continueMessageId),
+      );
+      if (continued) {
+        breakdown.push({
+          type: "utility",
+          name: "Continue Target",
+          role: "assistant",
+          content: getTextContent(continued),
+        });
+      }
+    }
+  }
+
   // ---- Context budget clipping ----
-  // Drop oldest chat history messages until the assembly fits under the
-  // configured `max_context_length` (minus response headroom + safety margin).
+  // A context anchor excludes all earlier chat history; otherwise drop the
+  // oldest history until the assembly fits under the configured
+  // `max_context_length` (minus response headroom + safety margin).
   // Runs AFTER all WI / AN / depth / prefill insertions so fixed overhead is
   // accurately measured. The breakdown recompute below picks up the new
   // chat-history bounds from the mutated `result` array.
@@ -4325,6 +4423,7 @@ export async function assemblePrompt(
     messages: result,
     breakdown,
     parameters,
+    trimIncompleteWords: prompts.advancedSettings?.trimIncompleteWords === true,
     assistantPrefill,
     activatedWorldInfo:
       activatedWorldInfo.length > 0 ? activatedWorldInfo : undefined,
@@ -6478,6 +6577,7 @@ function applyCompletionSettings(
     if (
       squash &&
       isSystem &&
+      !isContinueNudge(msg) &&
       write > 0 &&
       (result[write - 1] as any)._fromSystem
     ) {
@@ -6619,8 +6719,10 @@ const FALLBACK_MAX_RESPONSE_TOKENS = 4096;
 const CLIP_YIELD_CHAR_BUDGET = 262_144;
 
 /**
- * Clip oldest chat-history messages from the assembled prompt so the total
- * fits within the preset's `contextSize` (minus response headroom + margin).
+ * Clip chat-history messages from the assembled prompt so the total fits
+ * within the preset's `contextSize` (minus response headroom + margin). A
+ * manually set context anchor is a hard history start: history before it is
+ * always excluded, then the anchored tail must fit as a whole.
  *
  * Lazy newest→oldest tokenization: fixed (always-included) overhead is counted
  * up front, then chat-history messages are tokenized newest→oldest only until
@@ -6652,6 +6754,40 @@ export async function clipToContextBudget(
       : FALLBACK_MAX_RESPONSE_TOKENS;
 
   if (resolvedContext <= 0) {
+    // A context anchor is meaningful even when automatic context clipping is
+    // disabled. It explicitly defines the first chat message the model may
+    // read, so apply that manual cut without requiring a tokenizer or budget.
+    const historyIndices = result.flatMap((message, index) =>
+      isChatHistoryMessage(message) ? [index] : [],
+    );
+    const protectedHistoryStart = historyIndices.findIndex((index) =>
+      isContextAnchorProtected(result[index]),
+    );
+    const anchorActive = protectedHistoryStart >= 0;
+    const messagesDropped = anchorActive ? protectedHistoryStart : 0;
+    let chatHistoryTokensBefore = 0;
+    let tokensDropped = 0;
+    for (let i = 0; i < historyIndices.length; i++) {
+      const message = result[historyIndices[i]];
+      const estimatedTokens = Math.ceil(
+        (message.role.length + 1 + getTextContent(message).length) / 4,
+      );
+      chatHistoryTokensBefore += estimatedTokens;
+      if (i < messagesDropped) tokensDropped += estimatedTokens;
+    }
+
+    if (messagesDropped > 0) {
+      const firstKeptRawIdx = historyIndices[protectedHistoryStart];
+      let write = 0;
+      for (let read = 0; read < result.length; read++) {
+        const message = result[read];
+        if (isChatHistoryMessage(message) && read < firstKeptRawIdx) continue;
+        if (write !== read) result[write] = message;
+        write++;
+      }
+      result.length = write;
+    }
+
     return {
       enabled: false,
       maxContext: 0,
@@ -6660,11 +6796,12 @@ export async function clipToContextBudget(
       inputBudget: 0,
       fixedTokens: 0,
       remainingHistoryBudget: 0,
-      chatHistoryTokensBefore: 0,
-      chatHistoryTokensAfter: 0,
-      messagesDropped: 0,
-      tokensDropped: 0,
+      chatHistoryTokensBefore,
+      chatHistoryTokensAfter: chatHistoryTokensBefore - tokensDropped,
+      messagesDropped,
+      tokensDropped,
       tokenizerUsed: APPROXIMATE_TOKENIZER_NAME,
+      anchorActive,
     };
   }
 
@@ -6756,15 +6893,37 @@ export async function clipToContextBudget(
     return tokens;
   };
 
+  const anchorPrefixCount = anchorActive ? protectedHistoryStart : 0;
+  const anchorPrefixTokens = anchorActive
+    ? approxHistoryTokens(0, protectedHistoryStart)
+    : 0;
+  const dropHistoryBefore = (historyStart: number): void => {
+    if (historyStart <= 0) return;
+    const firstKeptRawIdx = historyIndices[historyStart];
+    let write = 0;
+    for (let read = 0; read < n; read++) {
+      const msg = result[read];
+      if (isChatHistoryMessage(msg) && read < firstKeptRawIdx) continue;
+      if (write !== read) result[write] = msg;
+      write++;
+    }
+    result.length = write;
+  };
+
   // Misconfigured budget (e.g. maxContext smaller than max_tokens + margin).
   // Don't clip silently — surface the misconfiguration via `budgetInvalid`.
   if (inputBudget <= 0) {
-    const allHistory = approxHistoryTokens(0, historyIndices.length);
     const protectedHistoryTokens = await countProtectedHistory();
+    if (anchorActive) dropHistoryBefore(anchorPrefixCount);
+    const allHistory = anchorActive
+      ? anchorPrefixTokens + protectedHistoryTokens
+      : approxHistoryTokens(0, historyIndices.length);
     return makeStats({
       budgetInvalid: true,
       chatHistoryTokensBefore: allHistory,
-      chatHistoryTokensAfter: allHistory,
+      chatHistoryTokensAfter: anchorActive ? protectedHistoryTokens : allHistory,
+      messagesDropped: anchorPrefixCount,
+      tokensDropped: anchorPrefixTokens,
       protectedHistoryTokens,
       remainingBeforeAnchor: remainingHistoryBudget - protectedHistoryTokens,
       anchorOverflow: anchorActive && protectedHistoryTokens > 0,
@@ -6774,10 +6933,13 @@ export async function clipToContextBudget(
   if (remainingHistoryBudget <= 0) {
     const protectedHistoryTokens = await countProtectedHistory();
     if (anchorActive && protectedHistoryTokens > 0) {
-      const allHistory = approxHistoryTokens(0, historyIndices.length);
+      dropHistoryBefore(anchorPrefixCount);
+      const allHistory = anchorPrefixTokens + protectedHistoryTokens;
       return makeStats({
         chatHistoryTokensBefore: allHistory,
-        chatHistoryTokensAfter: allHistory,
+        chatHistoryTokensAfter: protectedHistoryTokens,
+        messagesDropped: anchorPrefixCount,
+        tokensDropped: anchorPrefixTokens,
         protectedHistoryTokens,
         remainingBeforeAnchor: remainingHistoryBudget - protectedHistoryTokens,
         anchorOverflow: true,
@@ -6812,11 +6974,13 @@ export async function clipToContextBudget(
   const protectedHistoryTokens = await countProtectedHistory();
   const remainingBeforeAnchor = remainingHistoryBudget - protectedHistoryTokens;
   if (anchorActive && remainingBeforeAnchor < 0) {
-    const allHistory =
-      approxHistoryTokens(0, protectedHistoryStart) + protectedHistoryTokens;
+    dropHistoryBefore(anchorPrefixCount);
+    const allHistory = anchorPrefixTokens + protectedHistoryTokens;
     return makeStats({
       chatHistoryTokensBefore: allHistory,
-      chatHistoryTokensAfter: allHistory,
+      chatHistoryTokensAfter: protectedHistoryTokens,
+      messagesDropped: anchorPrefixCount,
+      tokensDropped: anchorPrefixTokens,
       protectedHistoryTokens,
       remainingBeforeAnchor,
       anchorOverflow: true,
@@ -6824,18 +6988,18 @@ export async function clipToContextBudget(
   }
 
   let accHistoryTokens = protectedHistoryTokens;
-  let oldestKeptHistoryIdx = anchorActive
-    ? protectedHistoryStart
-    : -1;
-  for (let i = (anchorActive ? protectedHistoryStart : historyIndices.length) - 1; i >= 0; i--) {
-    const msg = result[historyIndices[i]];
-    const text = `${msg.role}\n${getTextContent(msg)}`;
-    charsSinceYield += text.length;
-    await yieldWhenDue();
-    const t = counter.count(text);
-    if (accHistoryTokens + t > remainingHistoryBudget) break;
-    accHistoryTokens += t;
-    oldestKeptHistoryIdx = i;
+  let oldestKeptHistoryIdx = anchorActive ? protectedHistoryStart : -1;
+  if (!anchorActive) {
+    for (let i = historyIndices.length - 1; i >= 0; i--) {
+      const msg = result[historyIndices[i]];
+      const text = `${msg.role}\n${getTextContent(msg)}`;
+      charsSinceYield += text.length;
+      await yieldWhenDue();
+      const t = counter.count(text);
+      if (accHistoryTokens + t > remainingHistoryBudget) break;
+      accHistoryTokens += t;
+      oldestKeptHistoryIdx = i;
+    }
   }
 
   if (oldestKeptHistoryIdx === 0 || historyIndices.length === 0) {
@@ -7463,6 +7627,7 @@ async function onelinerImpersonation(
     messages: result,
     breakdown,
     parameters,
+    trimIncompleteWords: preset?.prompts?.advancedSettings?.trimIncompleteWords === true,
     assistantPrefill,
     macroEnv,
   };

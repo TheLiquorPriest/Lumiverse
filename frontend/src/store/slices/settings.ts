@@ -28,6 +28,7 @@ export const REASONING_DEFAULTS: ReasoningSettings = {
 const DATA_KEYS: ReadonlySet<string> = new Set([
   'landingPageChatsDisplayed',
   'landingPageLayoutMode',
+  'landingHiddenCharacterIds',
   'charactersPerPage',
   'personasPerPage',
   'messagesPerPage',
@@ -452,6 +453,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   fullSettingsLoaded: false,
   landingPageChatsDisplayed: 12,
   landingPageLayoutMode: 'cards',
+  landingHiddenCharacterIds: [],
   charactersPerPage: 50,
   personasPerPage: 24,
   messagesPerPage: 50,
@@ -575,6 +577,11 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     const patch: Record<string, any> = { settingsLoaded: true }
 
     if (Array.isArray(settings.favorites)) patch.favorites = settings.favorites
+    if (Array.isArray(settings.landingHiddenCharacterIds)) {
+      patch.landingHiddenCharacterIds = settings.landingHiddenCharacterIds.filter(
+        (id): id is string => typeof id === 'string' && id.length > 0,
+      )
+    }
     if (settings.filterTab) patch.filterTab = settings.filterTab
     if (settings.sortField) patch.sortField = settings.sortField
     if (settings.sortDirection) patch.sortDirection = settings.sortDirection
@@ -713,8 +720,15 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     // its accent can't crash the app on the next load.
     const packTheme = normalizeTheme(pack.theme)
     if (packTheme) {
-      patch.theme = packTheme
-      persistKey('theme', packTheme)
+      // Desktop translucency was added after existing theme packs. Treat an
+      // omitted field as “leave the native-wrapper preference unchanged”; an
+      // explicit field in the pack remains authoritative.
+      const theme = {
+        ...packTheme,
+        desktopBackground: packTheme.desktopBackground ?? get().theme?.desktopBackground,
+      }
+      patch.theme = theme
+      persistKey('theme', theme)
     }
 
     // Layer 2: Global CSS
@@ -786,26 +800,53 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     const entry = get().savedThemes.find((e) => e.id === id)
     if (!entry) return
     if (entry.kind === 'config') {
-      get().setTheme(entry.theme)
+      const theme = {
+        ...entry.theme,
+        desktopBackground: entry.theme.desktopBackground ?? get().theme?.desktopBackground,
+      }
+      get().setTheme(theme)
     } else {
       get().applyThemePack(entry.pack)
     }
   },
 
-  updateSavedTheme: (id) => {
-    const currentTheme = get().theme ?? DEFAULT_THEME
-    const savedThemes = get().savedThemes.map((entry) => {
+  updateSavedTheme: async (id) => {
+    const state = get()
+    const currentTheme = state.theme ?? DEFAULT_THEME
+    const savedThemes = state.savedThemes.map((entry) => {
       if (entry.id !== id) return entry
       if (entry.kind === 'config') {
         return { ...entry, theme: currentTheme } as typeof entry
       }
+
+      // A pack owns all three theme layers. Saving only its ThemeConfig made
+      // re-applying it restore its previous global CSS and component overrides,
+      // discarding the user's current edits.
+      const components = Object.fromEntries(
+        Object.entries(state.componentOverrides)
+          .filter(([, override]) => override.css?.trim() || override.tsx?.trim())
+          .map(([name, override]) => [name, {
+            css: override.css || '',
+            tsx: override.tsx || '',
+            enabled: override.enabled,
+          }]),
+      )
       return {
         ...entry,
-        pack: { ...entry.pack, theme: currentTheme },
+        pack: {
+          ...entry.pack,
+          theme: currentTheme,
+          globalCSS: state.customCSS.css || '',
+          components,
+        },
       } as typeof entry
     })
     set({ savedThemes })
     persistKey('savedThemes', savedThemes)
+    // This action is explicitly destructive to the previous snapshot, so do
+    // not leave its replacement vulnerable to a reload or navigation during
+    // the normal settings debounce window.
+    await flushSettingsNow()
   },
 
   loadSettings: async () => {

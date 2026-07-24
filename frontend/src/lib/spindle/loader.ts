@@ -2,11 +2,11 @@ import type {
   SpindleManifest,
   SpindleFrontendContext,
   SpindleFrontendModule,
+  SpindleHostLocale,
   PermissionRequestOptions,
   SpindleMountPoint,
   SpindleTabLocation as TabLocation,
   SpindleHostDescriptorV1,
-  SpindleHostLocale,
 } from 'lumiverse-spindle-types'
 import type { MacroCatalogResponse } from '@/api/macros'
 import type { SpindleCharacterEditorUI } from './character-editor-types'
@@ -187,6 +187,7 @@ async function performCompatibilityHandshake(
     throw compatibilityFailure(error, 'Spindle compatibility handshake validation failed')
   }
 }
+
 
 function isMacroCatalogResponse(value: unknown): value is MacroCatalogResponse {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !('categories' in value) || !Array.isArray(value.categories)) {

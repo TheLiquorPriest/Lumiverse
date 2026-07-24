@@ -30,6 +30,8 @@ function makeMinimalEnv(): MacroEnv {
       personaSubjectivePronoun: "",
       personaObjectivePronoun: "",
       personaPossessivePronoun: "",
+      personaReflexivePronoun: "",
+      personaPossessivePronounStandalone: "",
       mesExamples: "",
       mesExamplesRaw: "",
       systemPrompt: "",
@@ -176,6 +178,19 @@ describe("resolveWorldInfoOutlets", () => {
     expect(result.dossier).toBe("First\n\nSecond");
     expect(result.Dossier).toBeUndefined();
     expect(result.DOSSIER).toBeUndefined();
+  });
+
+  test("does not include persona add-on outlets", async () => {
+    const env = makeMinimalEnv();
+    env.extra.personaAddonOutlets = {
+      dossier: "Persona note for {{char}}",
+    };
+
+    const result = await resolveWorldInfoOutlets([
+      makeEntry({ outlet_name: "dossier", content: "World note" }),
+    ], env);
+
+    expect(result.dossier).toBe("World note");
   });
 
   test("outlet macros inside concatenated content are resolved", async () => {
