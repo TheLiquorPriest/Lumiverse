@@ -8,7 +8,7 @@ import type {
   SpindleTabLocation as TabLocation,
   SpindleHostDescriptorV1,
 } from 'lumiverse-spindle-types'
-import type { MacroCatalogResponse } from '@/api/macros'
+import { getMacroCatalog, type MacroCatalogResponse } from '@/api/macros'
 import type { SpindleCharacterEditorUI } from './character-editor-types'
 import type { SpindlePresetEditorUI } from './preset-editor-types'
 import { createDOMHelper } from './dom-helper'
@@ -188,41 +188,6 @@ async function performCompatibilityHandshake(
   }
 }
 
-
-function isMacroCatalogResponse(value: unknown): value is MacroCatalogResponse {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || !('categories' in value) || !Array.isArray(value.categories)) {
-    return false
-  }
-  return value.categories.every((category) => {
-    if (!category || typeof category !== 'object' || Array.isArray(category) || !('category' in category) || typeof category.category !== 'string' || !('macros' in category) || !Array.isArray(category.macros)) {
-      return false
-    }
-    return category.macros.every((macro) =>
-      !!macro &&
-      typeof macro === 'object' &&
-      !Array.isArray(macro) &&
-      'name' in macro &&
-      typeof macro.name === 'string' &&
-      'syntax' in macro &&
-      typeof macro.syntax === 'string' &&
-      'description' in macro &&
-      typeof macro.description === 'string' &&
-      'category' in macro &&
-      typeof macro.category === 'string'
-    )
-  })
-}
-
-function isMacroCatalogResponseMessage(value: unknown): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || !('type' in value)) return false
-  return value.type === '__loom_macro_catalog_response'
-}
-
-function macroCatalogResponseRequestId(value: unknown): string | null {
-  if (!isMacroCatalogResponseMessage(value) || typeof value !== 'object' || !('requestId' in value)) return null
-  return typeof value.requestId === 'string' && value.requestId.length > 0 ? value.requestId : null
-}
-
 interface LoadedExtension {
   id: string
   generation: number
@@ -236,7 +201,6 @@ interface LoadedExtension {
   backendHandlers: Set<(payload: unknown) => void>
   eventUnsubs: (() => void)[]
   deactivatePresetEditor(): void
-  macroCatalogHandlers: Map<string, (payload: unknown) => void>
   processHandlers: Map<string, FrontendProcessHandler>
   activeProcesses: Map<string, ActiveFrontendProcess>
   mountRoots: Element[]
@@ -406,18 +370,6 @@ function clearExtensionMountPoints(extensionId: string): void {
 
 function deliverBackendMessage(loaded: LoadedExtension, payload: unknown): void {
   if (isCurrentLoadedExtension(loaded) === false) return
-  const macroRequestId = macroCatalogResponseRequestId(payload)
-  if (isMacroCatalogResponseMessage(payload)) {
-    if (!macroRequestId) return
-    const handler = loaded.macroCatalogHandlers.get(macroRequestId)
-    if (!handler) return
-    try {
-      handler(payload)
-    } catch (err) {
-      console.error(`[Spindle] Macro catalog response handler error for ${loaded.identifier}:`, err)
-    }
-    return
-  }
   for (const handler of loaded.backendHandlers) {
     try {
       handler(payload)
@@ -784,8 +736,7 @@ async function doLoadFrontendExtension(
     }
 
     const backendHandlers = new Set<(payload: unknown) => void>()
-    const macroCatalogHandlers = new Map<string, (payload: unknown) => void>()
-    const pendingMacroCatalogCancellers = new Set<() => void>()
+    const pendingMacroCatalogAborts = new Set<AbortController>()
     const pendingCorsProxyCancellers = new Set<() => void>()
     const processHandlers = new Map<string, FrontendProcessHandler>()
     const activeProcesses = new Map<string, ActiveFrontendProcess>()
@@ -794,72 +745,34 @@ async function doLoadFrontendExtension(
     const modalDisposers = new Set<() => void>()
     const pendingFilePickerCleanups = new Set<() => void>()
 
+    // The public Loom picker reads the same authenticated catalog the native
+    // editor uses, scoped to built-ins so one extension's mount never lists
+    // another extension's macro metadata. The API client supplies the request
+    // timeout; unload aborts whatever is still in flight.
     const getMacroCatalogForExtension = (): Promise<MacroCatalogResponse> => {
       if (!currentGeneration() || (loaded && !isCurrentLoadedExtension(loaded))) {
         return Promise.reject(new Error('Macro catalog request cancelled'))
       }
-      const requestId = generateUUID()
-      const { promise, resolve, reject } = Promise.withResolvers<MacroCatalogResponse>()
-      let settled = false
-      const finish = () => {
-        clearTimeout(timeout)
-        macroCatalogHandlers.delete(requestId)
-        pendingMacroCatalogCancellers.delete(cancel)
-      }
-      const cancel = () => {
-        if (settled) return
-        settled = true
-        finish()
-        reject(new Error('Macro catalog request cancelled'))
-      }
-      const timeout = setTimeout(() => {
-        if (settled) return
-        settled = true
-        finish()
-        reject(new Error('Macro catalog request timed out'))
-      }, 30_000)
-      const handler = (payload: unknown) => {
-        if (macroCatalogResponseRequestId(payload) !== requestId) return
-        if (settled) return
-        if (!currentGeneration() || (loaded && !isCurrentLoadedExtension(loaded))) {
-          cancel()
-          return
-        }
-        settled = true
-        finish()
-        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
-          reject(new Error('Invalid macro catalog response'))
-          return
-        }
-        if ('error' in payload && typeof payload.error === 'string' && payload.error.length > 0) {
-          reject(new Error(payload.error))
-          return
-        }
-        if (!('catalog' in payload) || !isMacroCatalogResponse(payload.catalog)) {
-          reject(new Error('Invalid macro catalog response'))
-          return
-        }
-        resolve(payload.catalog)
-      }
-      pendingMacroCatalogCancellers.add(cancel)
-      macroCatalogHandlers.set(requestId, handler)
-      try {
-        wsClient.send({
-          type: 'SPINDLE_BACKEND_MSG',
-          extensionId,
-          payload: {
-            type: '__loom_macro_catalog_request',
-            requestId,
+      const controller = new AbortController()
+      pendingMacroCatalogAborts.add(controller)
+      return getMacroCatalog({ scope: 'core', signal: controller.signal })
+        .then(
+          (catalog) => {
+            // A catalog settling after unload or reload belongs to a generation
+            // the caller no longer owns.
+            if (!currentGeneration() || (loaded && !isCurrentLoadedExtension(loaded))) {
+              throw new Error('Macro catalog request cancelled')
+            }
+            return catalog
           },
+          (error) => {
+            if (controller.signal.aborted) throw new Error('Macro catalog request cancelled')
+            throw error
+          },
+        )
+        .finally(() => {
+          pendingMacroCatalogAborts.delete(controller)
         })
-      } catch (error) {
-        if (!settled) {
-          settled = true
-          finish()
-          reject(error)
-        }
-      }
-      return promise
     }
 
     const corsProxy = (url: string, options?: any): Promise<any> => {
@@ -1842,11 +1755,10 @@ async function doLoadFrontendExtension(
         }
         clearCharacterEditorSubscriptions()
         clearReadyTimeout(loaded)
-        for (const cancel of [...pendingMacroCatalogCancellers]) cancel()
-        pendingMacroCatalogCancellers.clear()
+        for (const controller of [...pendingMacroCatalogAborts]) controller.abort()
+        pendingMacroCatalogAborts.clear()
         for (const cancel of [...pendingCorsProxyCancellers]) cancel()
         pendingCorsProxyCancellers.clear()
-        loaded.macroCatalogHandlers.clear()
         loaded.backendHandlers.clear()
         loaded.processHandlers.clear()
         loaded.activeProcesses.clear()
@@ -1889,7 +1801,6 @@ async function doLoadFrontendExtension(
         scopedPresetAccess.dispose()
       },
       backendHandlers,
-      macroCatalogHandlers,
       processHandlers,
       activeProcesses,
       mountRoots: [],
@@ -2050,11 +1961,10 @@ export async function unloadFrontendExtension(
 export function routeBackendMessage(extensionId: string, payload: unknown): void {
   const loaded = loadedExtensions.get(extensionId)
   if (!loaded) {
-    if (isMacroCatalogResponseMessage(payload)) return
     queueStartupItem(extensionId, { kind: 'backend', payload })
     return
   }
-  if (!loaded.isReady && !isMacroCatalogResponseMessage(payload)) {
+  if (!loaded.isReady) {
     queueStartupItem(extensionId, { kind: 'backend', payload })
     return
   }

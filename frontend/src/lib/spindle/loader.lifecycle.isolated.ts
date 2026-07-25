@@ -31,7 +31,6 @@ const uiEventDestroyAllCalls: string[] = []
 const uiEventDestroyPermissionCalls: Array<{ extensionId: string; permission: string }> = []
 let permissionPromise: Promise<PermissionResult> = Promise.resolve({ granted: [] })
 let uuidSequence = 0
-const macroCatalogMessages: unknown[] = []
 const frontendProcessEvents: unknown[] = []
 let objectUrlSequence = 0
 const moduleDirectory = mkdtempSync(join(import.meta.dir, '.loader-lifecycle-'))
@@ -166,7 +165,6 @@ const wsClientMock = {
     ) {
       frontendProcessEvents.push(payload)
     }
-    macroCatalogMessages.push(payload)
   },
 }
 function dispatchWs(event: string, payload: unknown): void {
@@ -251,6 +249,24 @@ mock.module('@/api/spindle', () => ({
 }))
 mock.module('@/api/characters', () => ({ charactersApi: { get: async () => null } }))
 mock.module('@/api/chats', () => ({ messagesApi: { update: async () => ({ id: 'message' }) } }))
+// Catalog fetches are driven per test: every call parks a settle handle so a
+// test can resolve or abandon a request across a generation change.
+interface MacroCatalogRequest {
+  scope: string | undefined
+  signal: AbortSignal | undefined
+  resolve(catalog: unknown): void
+  reject(error: unknown): void
+}
+const macroCatalogRequests: MacroCatalogRequest[] = []
+mock.module('@/api/macros', () => ({
+  getMacroCatalog: (options?: { scope?: string; signal?: AbortSignal }) => {
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>()
+    macroCatalogRequests.push({ scope: options?.scope, signal: options?.signal, resolve, reject })
+    // Mirrors the real API client: an aborted request rejects rather than hanging.
+    options?.signal?.addEventListener('abort', () => reject(new Error('Aborted')), { once: true })
+    return promise
+  },
+}))
 mock.module('./dom-helper', () => ({ createDOMHelper: () => ({ cleanup() {} }) }))
 mock.module('./message-interceptors', () => ({ registerTagInterceptor: () => () => {}, unregisterTagInterceptorsByExtension() {} }))
 mock.module('./display-resolver-registry', () => ({ registerDisplayResolver: () => () => {}, unregisterDisplayResolver() {} }))
@@ -347,7 +363,6 @@ const {
   getLoadedExtensions,
   loadFrontendExtension: loadRawFrontendExtension,
   unloadFrontendExtension: unloadRawFrontendExtension,
-  routeBackendMessage: routeBackendMessageRaw,
   routeFrontendProcessEvent: routeFrontendProcessEventRaw,
 } = await import('./loader')
 async function loadFrontendExtension(extensionId: string, extensionManifest: SpindleManifest, force = false): Promise<void> {
@@ -355,9 +370,6 @@ async function loadFrontendExtension(extensionId: string, extensionManifest: Spi
 }
 async function unloadFrontendExtension(extensionId: string, options: { invalidateGeneration?: boolean } = {}): Promise<void> {
   return unloadRawFrontendExtension(canonicalInstallationId(extensionId), options)
-}
-function routeBackendMessage(extensionId: string, payload: unknown): void {
-  routeBackendMessageRaw(canonicalInstallationId(extensionId), payload)
 }
 function routeFrontendProcessEvent(extensionId: string, payload: Parameters<typeof routeFrontendProcessEventRaw>[1]): void {
   routeFrontendProcessEventRaw(canonicalInstallationId(extensionId), payload)
@@ -462,7 +474,7 @@ lifecycleGlobals.__lifecycleRegisterProcess = undefined
   wsHandlers.clear()
   clearTrackedWindowHandlers()
   uuidSequence = 0
-  macroCatalogMessages.splice(0)
+  macroCatalogRequests.splice(0)
   removedRoots.splice(0)
   frontendProcessEvents.splice(0)
   placementDestroyCalls.splice(0)
@@ -898,50 +910,41 @@ describe('loader lifecycle orchestration', () => {
 
     expect(lifecycleGlobals.__lifecycleTeardownCalls).toBe(1)
   })
-  test('resolves a current-generation macro catalog response by request id', async () => {
+  test('resolves a current-generation macro catalog request', async () => {
     lifecycleGlobals.__lifecycleRequestCatalog = true
     await loadFrontendExtension('catalog_current', { ...manifest, identifier: 'catalog_current' })
 
     const request = lifecycleGlobals.__catalogPromise as Promise<unknown>
-    const sent = macroCatalogMessages[0] as { payload: { requestId: string } }
-    expect(sent.payload.requestId).toBe('request-id')
-    routeBackendMessage('catalog_current', {
-      type: '__loom_macro_catalog_response',
-      requestId: sent.payload.requestId,
-      catalog: { categories: [] },
-    })
+    expect(macroCatalogRequests).toHaveLength(1)
+    // Public mounts only ever ask for the built-in catalog.
+    expect(macroCatalogRequests[0]!.scope).toBe('core')
+    macroCatalogRequests[0]!.resolve({ categories: [] })
     await expect(request).resolves.toEqual({ categories: [] })
     await unloadFrontendExtension('catalog_current')
   })
 
-  test('drops a late catalog response from an unloaded generation', async () => {
+  test('cancels an in-flight catalog request when its generation unloads', async () => {
     lifecycleGlobals.__lifecycleRequestCatalog = true
     await loadFrontendExtension('catalog_reload', { ...manifest, identifier: 'catalog_reload' })
     const first = lifecycleGlobals.__catalogPromise as Promise<unknown>
-    const firstRequest = (macroCatalogMessages[0] as { payload: { requestId: string } }).payload
+    const firstRequest = macroCatalogRequests[0]!
     await unloadFrontendExtension('catalog_reload')
+    expect(firstRequest.signal?.aborted).toBe(true)
     await expect(first).rejects.toThrow('Macro catalog request cancelled')
 
     await loadFrontendExtension('catalog_reload', { ...manifest, identifier: 'catalog_reload' })
     const second = lifecycleGlobals.__catalogPromise as Promise<unknown>
-    const secondRequest = (macroCatalogMessages.at(-1) as { payload: { requestId: string } }).payload
-    expect(secondRequest.requestId).not.toBe(firstRequest.requestId)
+    const secondRequest = macroCatalogRequests.at(-1)!
+    expect(secondRequest).not.toBe(firstRequest)
 
+    // A settlement belonging to the retired generation must never satisfy the new one.
     let secondResolved = false
     void second.then(() => { secondResolved = true })
-    routeBackendMessage('catalog_reload', {
-      type: '__loom_macro_catalog_response',
-      requestId: firstRequest.requestId,
-      catalog: { categories: [] },
-    })
+    firstRequest.resolve({ categories: [] })
     await flushLifecycleTasks()
     expect(secondResolved).toBe(false)
 
-    routeBackendMessage('catalog_reload', {
-      type: '__loom_macro_catalog_response',
-      requestId: secondRequest.requestId,
-      catalog: { categories: [] },
-    })
+    secondRequest.resolve({ categories: [] })
     await expect(second).resolves.toEqual({ categories: [] })
     await unloadFrontendExtension('catalog_reload')
   })

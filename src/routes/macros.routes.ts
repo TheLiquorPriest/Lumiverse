@@ -133,20 +133,35 @@ app.post("/resolve-batch", async (c) => {
 
 /**
  * GET /
- * Return the full macro catalog grouped by category.
+ * Return the macro catalog grouped by category. `?scope=core` narrows the
+ * result to built-in definitions; the default `all` keeps every registration,
+ * including macros contributed by extensions. `core` exists for public
+ * (Spindle) macro pickers, which must not surface another extension's macro
+ * metadata: `builtIn` is the only core-vs-extension signal the registry
+ * carries, and WorkerHost never sets it for extension-registered definitions.
  */
 app.get("/", (c) => {
-  const categories = registry.getCategories().map((cat) => ({
-    category: cat.category,
-    macros: cat.macros.map((m) => ({
-      name: m.name,
-      syntax: formatSyntax(m),
-      description: m.description,
-      args: m.args?.map((a) => ({ name: a.name, optional: a.optional ?? false })),
-      returns: m.returns || m.returnType,
-      category: m.category,
-    })),
-  }));
+  const scope = c.req.query("scope") || "all";
+  if (scope !== "all" && scope !== "core") {
+    return c.json({ error: "Invalid scope: expected 'all' or 'core'" }, 400);
+  }
+
+  const categories = registry
+    .getCategories()
+    .map((cat) => ({
+      category: cat.category,
+      macros: (scope === "core" ? cat.macros.filter((m) => m.builtIn === true) : cat.macros)
+        .map((m) => ({
+          name: m.name,
+          syntax: formatSyntax(m),
+          description: m.description,
+          args: m.args?.map((a) => ({ name: a.name, optional: a.optional ?? false })),
+          returns: m.returns || m.returnType,
+          category: m.category,
+        })),
+    }))
+    // A scoped catalog can empty a category out entirely; never emit it blank.
+    .filter((cat) => cat.macros.length > 0);
 
   return c.json({ categories });
 });

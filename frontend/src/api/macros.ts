@@ -70,6 +70,20 @@ export async function resolveMacrosBatch(req: MacroBatchResolveRequest): Promise
   return post('/macros/resolve-batch', req)
 }
 
-export function getMacroCatalog(): Promise<MacroCatalogResponse> {
-  return get('/macros')
+/** Catalog audiences understood by `GET /macros`. `core` returns built-in
+ *  definitions only, excluding macros contributed by extensions. */
+export type MacroCatalogScope = 'all' | 'core'
+
+export interface MacroCatalogOptions {
+  scope?: MacroCatalogScope
+  /** Cancels an in-flight catalog fetch (e.g. when an extension unloads). */
+  signal?: AbortSignal
+}
+
+export function getMacroCatalog(options?: MacroCatalogOptions): Promise<MacroCatalogResponse> {
+  return get(
+    '/macros',
+    options?.scope ? { scope: options.scope } : undefined,
+    options?.signal ? { signal: options.signal } : undefined,
+  )
 }
