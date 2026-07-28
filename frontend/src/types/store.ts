@@ -952,6 +952,7 @@ export interface SpindleSlice {
   resolvePermissionRequest: (id: string, approved: boolean) => Promise<void>
   openTextEditor: (request: PendingTextEditorRequest) => void
   closeTextEditor: (requestId: string, text: string, cancelled: boolean) => void
+  dismissTextEditor: (requestId: string) => void
   openSpindleModal: (request: PendingModalRequest) => void
   closeSpindleModal: (requestId: string, dismissedBy: 'user' | 'extension' | 'cleanup') => void
   dismissSpindleModal: (requestId: string) => void

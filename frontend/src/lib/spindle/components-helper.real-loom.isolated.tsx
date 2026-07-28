@@ -243,10 +243,11 @@ function mount(
   extensionId: string,
   initial: SpindleLoomBlockEditorValue,
   onChange: (next: SpindleLoomBlockEditorValue) => void,
+  onDraftChange?: (next: SpindleLoomBlockEditorValue) => void,
 ): { handle: SpindleLoomBlockEditorHandle; target: HTMLElement } {
   const target = ownedRoot(extensionId)
   const handle = createComponentsHelper(extensionId, extensionId, async () => ({ categories: [] }))
-    .mountLoomBlockEditor(target, { value: initial, onChange })
+    .mountLoomBlockEditor(target, { value: initial, onChange, onDraftChange })
   activeHandles.add(handle)
   return { handle, target }
 }
@@ -279,10 +280,13 @@ describe('real Loom component bridge integration', () => {
   test('renders the production editor, updates in place, keeps public controls untrusted, and tears down callbacks', () => {
     const events: string[] = []
     let emitted: SpindleLoomBlockEditorValue | undefined
+    const drafts: SpindleLoomBlockEditorValue[] = []
     let handle!: SpindleLoomBlockEditorHandle
     const mounted = mount('real-loom-bridge', value(), (next) => {
       events.push(`callback:${handle.getValue().blocks[0]?.role}`)
       emitted = next
+    }, (next) => {
+      drafts.push(next)
     })
     handle = mounted.handle
     const target = mounted.target
@@ -314,6 +318,34 @@ describe('real Loom component bridge integration', () => {
     expect(target.textContent).not.toContain('blockEditor.preview')
     expect(target.textContent).not.toContain('blockEditor.sealedBlockTitle')
     expect(target.querySelector('input[spellcheck="false"]')).toBeNull()
+    const contentTextarea = target.querySelector<HTMLTextAreaElement>('textarea')
+    expect(contentTextarea).not.toBeNull()
+    const textareaSetter = Object.getOwnPropertyDescriptor(domWindow.HTMLTextAreaElement.prototype, 'value')!.set!
+    flushSync(() => {
+      textareaSetter.call(contentTextarea, 'draft content')
+      contentTextarea!.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+    })
+    expect(handle.getValue().blocks[0]?.content).toBe('draft content')
+    expect(events).toEqual([])
+    expect(emitted).toBeUndefined()
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0]?.blocks[0]?.content).toBe('draft content')
+    drafts[0]!.blocks[0]!.content = 'mutated detached draft'
+    expect(handle.getValue().blocks[0]?.content).toBe('draft content')
+    const detachedDraft = handle.getValue()
+    detachedDraft.blocks[0]!.content = 'mutated detached copy'
+    expect(handle.getValue().blocks[0]?.content).toBe('draft content')
+    expect(target.querySelector('textarea')).toBe(contentTextarea)
+
+    flushSync(() => handle.update({ readOnly: true }))
+    expect(handle.getValue().blocks[0]?.content).toBe('draft content')
+    expect(target.querySelector('textarea')).toBeNull()
+    flushSync(() => handle.update({ readOnly: false }))
+    const resumedTextarea = target.querySelector<HTMLTextAreaElement>('textarea')
+    expect(resumedTextarea?.value).toBe('draft content')
+    expect(handle.getValue().blocks[0]?.content).toBe('draft content')
+    expect(events).toEqual([])
+
 
     const roleSelect = target.querySelector<HTMLSelectElement>('select')
     expect(roleSelect).not.toBeNull()
@@ -328,7 +360,9 @@ describe('real Loom component bridge integration', () => {
     flushSync(() => saveButton!.click())
 
     expect(emitted?.blocks[0]?.role).toBe('assistant')
+    expect(emitted?.blocks[0]?.content).toBe('draft content')
     expect(events).toEqual(['callback:assistant'])
+    expect(drafts.at(-1)).toBeNull()
     expect(target.textContent).toContain('assistant')
 
     handle.destroy()
@@ -339,4 +373,58 @@ describe('real Loom component bridge integration', () => {
     expect(() => handle.update({ value: value([block('after-destroy')]) })).toThrow('COMPONENT_DESTROYED')
     expect(events).toHaveLength(callbackCount)
   })
+  test('preserves a live draft against known stale authority and accepts an unseen replacement', () => {
+    const initial = value([block('aba-block', { content: 'initial authority' })])
+    const mounted = mount('real-loom-authority', initial, () => {})
+    const { handle, target } = mounted
+
+    flushSync(() => handle.update({ value: value([block('newer-block', { content: 'new authority' })]) }))
+    flushSync(() => handle.update({ value: initial }))
+    expect(handle.getValue().blocks[0]?.id).toBe('aba-block')
+    expect(handle.getValue().blocks[0]?.content).toBe('initial authority')
+
+    const editButton = target.querySelector<HTMLButtonElement>('button[title="actions.edit"]')
+    expect(editButton).not.toBeNull()
+    flushSync(() => editButton!.click())
+    const contentTextarea = target.querySelector<HTMLTextAreaElement>('textarea')
+    expect(contentTextarea).not.toBeNull()
+    flushSync(() => handle.update({ value: initial }))
+    expect(target.querySelector<HTMLTextAreaElement>('textarea')).toBe(contentTextarea)
+    const textareaSetter = Object.getOwnPropertyDescriptor(domWindow.HTMLTextAreaElement.prototype, 'value')!.set!
+    flushSync(() => {
+      textareaSetter.call(contentTextarea, 'live draft')
+      contentTextarea!.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+    })
+    expect(handle.getValue().blocks[0]?.content).toBe('live draft')
+
+    flushSync(() => handle.update({ value: initial }))
+    expect(target.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('live draft')
+    expect(handle.getValue().blocks[0]?.content).toBe('live draft')
+    const reorderedAuthority = {
+      blocks: [Object.fromEntries(Object.entries(initial.blocks[0]!).reverse()) as unknown as PromptBlockDTO],
+      promptVariableValues: {},
+    }
+    flushSync(() => handle.update({ value: reorderedAuthority }))
+    expect(target.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('live draft')
+    expect(handle.getValue().blocks[0]?.content).toBe('live draft')
+
+    flushSync(() => handle.update({ value: value([block('replacement-block', { content: 'replacement authority' })]) }))
+    expect(target.querySelector('textarea')).toBeNull()
+    expect(handle.getValue().blocks[0]?.id).toBe('replacement-block')
+    expect(handle.getValue().blocks[0]?.content).toBe('replacement authority')
+
+    const replacementEditButton = target.querySelector<HTMLButtonElement>('button[title="actions.edit"]')
+    expect(replacementEditButton).not.toBeNull()
+    flushSync(() => replacementEditButton!.click())
+    const replacementTextarea = target.querySelector<HTMLTextAreaElement>('textarea')
+    expect(replacementTextarea).not.toBeNull()
+    flushSync(() => {
+      textareaSetter.call(replacementTextarea, 'replacement draft')
+      replacementTextarea!.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+    })
+    const acknowledgedDraft = handle.getValue()
+    flushSync(() => handle.update({ value: acknowledgedDraft }))
+    expect(target.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('replacement draft')
+  })
 })
+

@@ -29,6 +29,15 @@ import { WorkerHost } from "./worker-host";
 import * as managerSvc from "./manager.service";
 
 const runningExtensions = new Map<string, WorkerHost>();
+const startingExtensions = new Map<string, Promise<void>>();
+const stoppingExtensions = new Map<string, Promise<void>>();
+let stopAllBarrier: Promise<void> | null = null;
+
+export function removeRunningExtensionIfHost(id: string, host: WorkerHost): boolean {
+  if (runningExtensions.get(id) !== host) return false;
+  runningExtensions.delete(id);
+  return true;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,75 +78,109 @@ export async function startAllExtensions(): Promise<void> {
 }
 
 export async function stopAllExtensions(): Promise<void> {
-  console.log(`[Spindle] Stopping ${runningExtensions.size} extension(s)...`);
-
-  const stopPromises: Promise<void>[] = [];
-  for (const [id, host] of runningExtensions) {
-    stopPromises.push(
-      host.stop().catch((err) => {
-        console.error(
-          `[Spindle] Error stopping extension ${host.manifest.identifier}:`,
-          err
-        );
-      })
-    );
+  if (stopAllBarrier) return stopAllBarrier;
+  const barrier = (async () => {
+    const ids = new Set([
+      ...runningExtensions.keys(),
+      ...startingExtensions.keys(),
+      ...stoppingExtensions.keys(),
+    ]);
+    console.log(`[Spindle] Stopping ${ids.size} extension(s)...`);
+    await Promise.all([...ids].map((id) => stopExtension(id).catch((err) => {
+      console.error(`[Spindle] Error stopping extension ${id}:`, err);
+    })));
+  })();
+  stopAllBarrier = barrier;
+  try {
+    await barrier;
+  } finally {
+    if (stopAllBarrier === barrier) stopAllBarrier = null;
   }
-
-  await Promise.all(stopPromises);
-  runningExtensions.clear();
 }
-
 export async function startExtension(id: string): Promise<void> {
+  while (stopAllBarrier) {
+    const stopAll = stopAllBarrier;
+    await stopAll;
+  }
+  const stopping = stoppingExtensions.get(id);
+  if (stopping) await stopping;
   if (runningExtensions.has(id)) {
     console.warn(`[Spindle] Extension ${id} is already running`);
     return;
   }
+  const existingStart = startingExtensions.get(id);
+  if (existingStart) return existingStart;
 
-  const ext = await managerSvc.getExtension(id);
-  if (!ext) throw new Error(`Extension not found: ${id}`);
-
-  // Sync manifest from disk → DB before starting (picks up spindle.json edits)
-  await managerSvc.syncManifestToDb(ext.identifier);
-
+  const operation = (async () => {
+    const ext = await managerSvc.getExtension(id);
+    if (!ext) throw new Error(`Extension not found: ${id}`);
+    await managerSvc.syncManifestToDb(ext.identifier);
+    try {
+      const freshExt = (await managerSvc.getExtension(id)) ?? ext;
+      const manifest = await managerSvc.getManifest(freshExt.identifier);
+      const host = new WorkerHost(freshExt.id, manifest, freshExt);
+      host.setRuntimeExitHandler(() => {
+        removeRunningExtensionIfHost(id, host);
+      });
+      await host.start();
+      runningExtensions.set(id, host);
+      eventBus.emit(EventType.SPINDLE_EXTENSION_LOADED, {
+        extensionId: ext.id,
+        identifier: ext.identifier,
+        name: ext.name,
+      });
+      console.log(`[Spindle] Started extension: ${ext.identifier}`);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err.message : String(err);
+      eventBus.emit(EventType.SPINDLE_EXTENSION_ERROR, {
+        extensionId: ext.id,
+        identifier: ext.identifier,
+        error,
+      });
+      throw err;
+    }
+  })();
+  startingExtensions.set(id, operation);
   try {
-    // Re-fetch after sync in case permissions/metadata changed
-    const freshExt = (await managerSvc.getExtension(id)) ?? ext;
-    const manifest = await managerSvc.getManifest(freshExt.identifier);
-    const host = new WorkerHost(freshExt.id, manifest, freshExt);
-    await host.start();
-    runningExtensions.set(id, host);
-
-    eventBus.emit(EventType.SPINDLE_EXTENSION_LOADED, {
-      extensionId: ext.id,
-      identifier: ext.identifier,
-      name: ext.name,
-    });
-
-    console.log(`[Spindle] Started extension: ${ext.identifier}`);
-  } catch (err: any) {
-    eventBus.emit(EventType.SPINDLE_EXTENSION_ERROR, {
-      extensionId: ext.id,
-      identifier: ext.identifier,
-      error: err.message,
-    });
-    throw err;
+    await operation;
+  } finally {
+    if (startingExtensions.get(id) === operation) startingExtensions.delete(id);
   }
 }
 
 export async function stopExtension(id: string): Promise<void> {
-  const host = runningExtensions.get(id);
-  if (!host) return;
+  const existingStop = stoppingExtensions.get(id);
+  if (existingStop) return existingStop;
 
-  await host.stop();
-  runningExtensions.delete(id);
-
-  eventBus.emit(EventType.SPINDLE_EXTENSION_UNLOADED, {
-    extensionId: id,
-    identifier: host.manifest.identifier,
-    name: host.manifest.name,
-  });
-
-  console.log(`[Spindle] Stopped extension: ${host.manifest.identifier}`);
+  const operation = (async () => {
+    const starting = startingExtensions.get(id);
+    if (starting) {
+      try {
+        await starting;
+      } catch {
+        return;
+      }
+    }
+    const host = runningExtensions.get(id);
+    if (!host) return;
+    try {
+      await host.stop();
+    } finally {
+      removeRunningExtensionIfHost(id, host);
+    }
+    eventBus.emit(EventType.SPINDLE_EXTENSION_UNLOADED, {
+      extensionId: id,
+      identifier: host.manifest.identifier,
+      name: host.manifest.name,
+    });
+    console.log(`[Spindle] Stopped extension: ${host.manifest.identifier}`);
+  })();
+  stoppingExtensions.set(id, operation);
+  try {
+    await operation;
+  } finally {
+    if (stoppingExtensions.get(id) === operation) stoppingExtensions.delete(id);
+  }
 }
 
 export async function restartExtension(id: string): Promise<void> {
@@ -574,7 +617,7 @@ const TERMINAL_MAX_GUIDANCE_CONTENT_BYTES = 1024 * 1024;
 const TERMINAL_MAX_GUIDANCE_TOTAL_BYTES = BOUND_MAX_CARRIER_BYTES;
 const TERMINAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function cloneTerminalGuidance(value: unknown): readonly DeferredGuidanceDTO[] {
+export function cloneTerminalGuidance(value: unknown): readonly DeferredGuidanceDTO[] {
   if (value === undefined) return Object.freeze([]);
   if (!Array.isArray(value) || value.length > TERMINAL_MAX_GUIDANCE_COUNT) {
     throw new TypeError("deferredGuidance must be a bounded array");
@@ -632,8 +675,11 @@ export function createInterceptorTerminalLease(
     ? input.parentPrefillAttestation ?? createParentPrefillAttestation(input.parentGenerationSnapshot)
     : undefined;
   let active = true;
+  let inactiveReason: unknown;
   const ensureActive = (operation: string): void => {
-    if (!active) throw new Error(`Terminal interceptor lease is inactive: ${operation}`);
+    if (!active) {
+      throw inactiveReason ?? new Error(`Terminal interceptor lease is inactive: ${operation}`);
+    }
     if (input.permissionGuard && !input.permissionGuard()) {
       throw new Error(`Terminal interceptor lease permission denied: ${operation}`);
     }
@@ -654,6 +700,11 @@ export function createInterceptorTerminalLease(
     if (!active) return;
     active = false;
     input.onDispose?.();
+  };
+  const revoke = (reason?: unknown): void => {
+    if (!active) return;
+    inactiveReason = reason;
+    release();
   };
   const lease: InterceptorTerminalLease = {
     registrationId: input.registrationId,
@@ -740,7 +791,7 @@ export function createInterceptorTerminalLease(
     },
     release,
     dispose: release,
-    revoke: () => release(),
+    revoke,
   };
   return Object.freeze(lease);
 }
@@ -816,12 +867,12 @@ export async function finalizeInterceptorTerminalLeases<TRequest extends Termina
       }
     }
   };
-  assertAggregateLive();
   const settled: TerminalFinalizeResult<TRequest>[] = [];
   let selectedFinalResponse: InterceptorFinalResponseState | undefined = input.finalResponseState;
   let selectedValidFinalResponse: ValidInterceptorFinalResponse | undefined =
     selectedFinalResponse?.status === "valid" ? selectedFinalResponse : undefined;
   try {
+    assertAggregateLive();
     for (let index = 0; index < input.leases.length; index += 1) {
       const result = await input.leases[index].finalize({
         attemptId: `${input.attemptId}:${index}`,

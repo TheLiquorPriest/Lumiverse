@@ -6,7 +6,9 @@ import type {
 import type { ParentGenerationSnapshot } from "./bound-generation-types";
 import {
   ensureInterceptorFinalResponseFallback,
+  detachInterceptorFinalResponseCarrier,
   normalizeInterceptorFinalResponse,
+  refreshInterceptorFinalResponseCarrier,
   selectInterceptorFinalResponse,
   supersedeInterceptorFinalResponse,
   retainInterceptorFinalResponse,
@@ -125,7 +127,10 @@ describe("interceptor final-response normalization and selection", () => {
     expect(retained?.status).toBe("valid");
     if (!retained || retained.status !== "valid") throw new Error("candidate was not retained");
     expect(retained.extensionId).toBe("next");
-    expect(retained.supersededResponse).toBe(previous.finalResponse);
+    expect(retained.supersededResponse).toMatchObject({
+      extensionId: "prior",
+      extensionName: "Prior",
+    });
 
     const replacement = supersedeInterceptorFinalResponse({
       previous: previous.finalResponse,
@@ -134,7 +139,10 @@ describe("interceptor final-response normalization and selection", () => {
       acceptedBreakdown: previous.breakdown,
       outputBreakdown: next.breakdown,
     });
-    expect(replacement.finalResponse.supersededResponse).toBe(previous.finalResponse);
+    expect(replacement.finalResponse.supersededResponse).toMatchObject({
+      extensionId: "prior",
+      extensionName: "Prior",
+    });
     expect(replacement.finalResponse.extensionId).toBe("next");
 
     const currentAllowed = selectInterceptorFinalResponse({
@@ -158,6 +166,50 @@ describe("interceptor final-response normalization and selection", () => {
       expect(currentRevoked.warning).toContain("permission is no longer granted");
       expect(currentRevoked.messages.find((message) => message.role === "system")?.content).toBe("next-fallback");
     }
+  });
+
+  test("retains only bounded superseded metadata", () => {
+    const previous = normalize({
+      extensionId: "prior",
+      extensionName: "Prior",
+      result: { content: "x".repeat(200_000), fallbackMessageIndex: 1 },
+    });
+    if (!previous.finalResponse || previous.finalResponse.status !== "valid") {
+      throw new Error("previous fixture did not normalize");
+    }
+    const next = normalize({
+      extensionId: "next",
+      extensionName: "Next",
+      inputMessages: previous.messages,
+      outputMessages: [
+        ...previous.messages,
+        { role: "system", content: "next fallback" },
+      ],
+      breakdown: [
+        ...previous.breakdown,
+        { messageIndex: previous.messages.length, name: "Next fallback" },
+      ],
+      result: { content: "next", fallbackMessageIndex: previous.messages.length },
+    });
+    if (!next.finalResponse || next.finalResponse.status !== "valid") {
+      throw new Error("next fixture did not normalize");
+    }
+
+    const retained = retainInterceptorFinalResponse(previous.finalResponse, next.finalResponse);
+    if (!retained || retained.status !== "valid" || !retained.supersededResponse) {
+      throw new Error("superseded fixture did not retain metadata");
+    }
+    expect(Object.keys(retained.supersededResponse).sort()).toEqual([
+      "callbackUserId",
+      "carrierNonce",
+      "extensionId",
+      "extensionName",
+      "fallbackMessageIndex",
+      "hostGeneration",
+      "registrationId",
+      "workerId",
+    ]);
+    expect(JSON.stringify(retained.supersededResponse).length).toBeLessThan(2_000);
   });
 
   test("bounds content and reasoning independently at the UTF-8 boundary", () => {
@@ -205,6 +257,19 @@ describe("interceptor final-response normalization and selection", () => {
     expect(normalize({
       outputMessages: [{ role: "user", content: "ordinary" }, { role: "assistant", content: "fallback" }],
     }).finalResponse?.status).toBe("invalid");
+    const duplicateInherited = normalize({
+      inputMessages: [{ role: "system", content: "fallback" }],
+      outputMessages: [
+        { role: "system", content: "fallback" },
+        { role: "system", content: "fallback" },
+      ],
+      breakdown: [{ messageIndex: 1, name: "Fallback" }],
+      result: { content: "chosen", fallbackMessageIndex: 1 },
+    });
+    expect(duplicateInherited.finalResponse?.status).toBe("invalid");
+    if (duplicateInherited.finalResponse?.status === "invalid") {
+      expect(duplicateInherited.finalResponse.reason).toContain("ambiguous with an inherited");
+    }
   });
 
   test("requires one exact prefill carrier and immediate fallback placement", () => {
@@ -299,6 +364,147 @@ describe("interceptor final-response normalization and selection", () => {
       expect(restored.messages.filter((message) => message.role === "system" && message.content === "fallback")).toHaveLength(1);
     }
   });
+  test("preserves inherited exact copies on final and provider routes", () => {
+    let permission = true;
+    const normalized = normalize({ permissionGuard: () => permission });
+    if (!normalized.finalResponse || normalized.finalResponse.status !== "valid") {
+      throw new Error("fixture did not normalize");
+    }
+    const inherited = { role: "system", content: "fallback" } satisfies LlmMessageDTO;
+    const messages = [inherited, normalized.messages[1]!];
+
+    const selected = selectInterceptorFinalResponse({
+      response: normalized.finalResponse,
+      messages,
+      generationType: "normal",
+      hasTools: false,
+      isDryRun: false,
+    });
+    expect(selected.kind).toBe("final-response");
+    if (selected.kind === "final-response") {
+      expect(selected.messages).toEqual([inherited]);
+      expect(selected.breakdownReplacement?.from).toEqual(
+        normalized.finalResponse.fallbackBreakdown,
+      );
+      expect(selected.breakdownReplacement?.to).toBeUndefined();
+    }
+
+    permission = false;
+    const restored = selectInterceptorFinalResponse({
+      response: normalized.finalResponse,
+      messages,
+      generationType: "normal",
+      hasTools: false,
+      isDryRun: false,
+    });
+    expect(restored.kind).toBe("provider");
+    if (restored.kind === "provider") {
+      expect(restored.messages).toEqual([inherited, inherited]);
+    }
+  });
+
+  test("restores a detached carrier without consuming an inherited exact copy", () => {
+    let allowed = true;
+    const inherited: LlmMessageDTO = { role: "system", content: "fallback" };
+    const normalized = normalize({ permissionGuard: () => allowed });
+    if (!normalized.finalResponse || normalized.finalResponse.status !== "valid") {
+      throw new Error("fixture did not normalize");
+    }
+    const response = {
+      ...normalized.finalResponse,
+      fallbackMessageIndex: normalized.finalResponse.fallbackMessageIndex + 1,
+    };
+    const messages = [inherited, ...normalized.messages];
+    const breakdown = normalized.breakdown.map((entry) => ({
+      ...entry,
+      messageIndex: entry.messageIndex + 1,
+    }));
+    const expectedMessages = messages.map(({ role, content }) => ({ role, content }));
+    const detached = detachInterceptorFinalResponseCarrier(
+      response,
+      messages,
+      breakdown,
+    );
+
+    const refreshed = refreshInterceptorFinalResponseCarrier(
+      {
+        ...response,
+        fallbackMessageIndex: detached.carrierInsertionIndex,
+      },
+      detached.messages,
+      detached.breakdown,
+      { carrierDetached: true },
+    );
+    expect(refreshed.messages.map(({ role, content }) => ({ role, content }))).toEqual(
+      expectedMessages,
+    );
+
+    allowed = false;
+    const restored = selectInterceptorFinalResponse({
+      response: refreshed.finalResponse,
+      messages: refreshed.messages,
+      generationType: "normal",
+      hasTools: false,
+      isDryRun: false,
+    });
+    expect(restored.kind).toBe("provider");
+    if (restored.kind === "provider") {
+      expect(restored.messages.map(({ role, content }) => ({ role, content }))).toEqual(
+        expectedMessages,
+      );
+    }
+  });
+
+
+  test("preserves a mid-prompt fallback position through refresh and provider fallback", () => {
+    let allowed = true;
+    const inputMessages: LlmMessageDTO[] = [
+      { role: "user", content: "before" },
+      { role: "assistant", content: "after" },
+    ];
+    const outputMessages: LlmMessageDTO[] = [
+      inputMessages[0]!,
+      { role: "system", content: "fallback" },
+      inputMessages[1]!,
+    ];
+    const normalized = normalize({
+      inputMessages,
+      outputMessages,
+      breakdown: [{ messageIndex: 1, name: "Fallback" }],
+      permissionGuard: () => allowed,
+      result: { content: "chosen", fallbackMessageIndex: 1 },
+    });
+    if (!normalized.finalResponse || normalized.finalResponse.status !== "valid") {
+      throw new Error("fixture did not normalize");
+    }
+
+    const refreshed = refreshInterceptorFinalResponseCarrier(
+      normalized.finalResponse,
+      normalized.messages,
+      normalized.breakdown,
+    );
+    expect(refreshed.finalResponse.fallbackMessageIndex).toBe(1);
+    expect(refreshed.messages.map(({ role, content }) => ({ role, content }))).toEqual([
+      { role: "user", content: "before" },
+      { role: "system", content: "fallback" },
+      { role: "assistant", content: "after" },
+    ]);
+
+    allowed = false;
+    const restored = selectInterceptorFinalResponse({
+      response: refreshed.finalResponse,
+      messages: refreshed.messages,
+      generationType: "normal",
+      hasTools: false,
+      isDryRun: false,
+    });
+    expect(restored.kind).toBe("provider");
+    if (restored.kind === "provider") {
+      expect(restored.messages.map(({ role, content }) => ({ role, content }))).toEqual(
+        outputMessages,
+      );
+    }
+  });
 
   test("restores before an exact prefill and fails on missing or ambiguous prefill", () => {
     const prefill: LlmMessageDTO = { role: "assistant", content: "Start" };
@@ -321,5 +527,38 @@ describe("interceptor final-response normalization and selection", () => {
 
     const modified = restored.map((message, index) => index === 2 ? { ...message, content: "modified" } : message);
     expect(() => ensureInterceptorFinalResponseFallback(modified, response)).toThrow("PREFILL_CARRIER_MISMATCH");
+  });
+  test("repairs modified and duplicate nonce carriers before provider fallback", () => {
+    const normalized = normalize();
+    if (!normalized.finalResponse || normalized.finalResponse.status !== "valid") {
+      throw new Error("fixture did not normalize");
+    }
+    const carrier = normalized.messages[1]!;
+    const modified = [
+      { ...carrier, content: "tampered" },
+      normalized.messages[0]!,
+      { ...carrier, content: "tampered again" },
+    ];
+
+    const selected = selectInterceptorFinalResponse({
+      response: normalized.finalResponse,
+      messages: modified,
+      generationType: "normal",
+      hasTools: false,
+      isDryRun: false,
+    });
+
+    expect(selected.kind).toBe("provider");
+    if (selected.kind === "provider") {
+      expect(selected.messages).toEqual([
+        { role: "user", content: "ordinary" },
+        { role: "system", content: "fallback" },
+      ]);
+      expect(
+        selected.messages.filter(
+          (message) => message.role === "system" && message.content === "fallback",
+        ),
+      ).toHaveLength(1);
+    }
   });
 });

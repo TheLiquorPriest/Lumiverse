@@ -67,7 +67,7 @@ import { RangeSlider } from '@/components/shared/RangeSlider'
 import { resolveMacros as resolveMacrosApi } from '@/api/macros'
 import { useLoomBuilder } from '@/hooks/useLoomBuilder'
 import { usePresetProfiles } from '@/hooks/usePresetProfiles'
-import { computeGroups, createBlock, createMarkerBlock, normalizeCategoryBlockState, resolvePromptBlockPlacements, toggleBlockWithCategoryRules } from '@/lib/loom/service'
+import { computeGroups, createBlock, createMarkerBlock, normalizeCategoryBlockState, resolvePromptBlockPlacements, toggleBlockWithCategoryRules, validatePromptVariableSchema } from '@/lib/loom/service'
 import { sanitizeCharacterTagTrigger, splitCharacterTagTriggerInput } from '@/lib/loom/characterTagTrigger'
 import {
   PROMPT_TEMPLATES,
@@ -133,13 +133,19 @@ const ROLE_DISPLAY_LABELS: Record<string, string> = {
 const ROOT_DROP_PREFIX = 'root-drop:'
 const BLOCK_DRAG_PREFIX = 'loom-block:'
 
-function blockDragId(id: string) {
-  return `${BLOCK_DRAG_PREFIX}${id}`
+function blockDragId(blockIndex: number, id: string) {
+  return `${BLOCK_DRAG_PREFIX}${blockIndex}:${id}`
 }
 
-function parseBlockDragId(id: unknown) {
-  return typeof id === 'string' && id.startsWith(BLOCK_DRAG_PREFIX)
-    ? id.slice(BLOCK_DRAG_PREFIX.length)
+function parseBlockDragId(id: unknown): { blockIndex: number; blockId: string } | null {
+  if (typeof id !== 'string' || !id.startsWith(BLOCK_DRAG_PREFIX)) return null
+  const value = id.slice(BLOCK_DRAG_PREFIX.length)
+  const separator = value.indexOf(':')
+  if (separator <= 0) return null
+  const blockIndex = Number(value.slice(0, separator))
+  const blockId = value.slice(separator + 1)
+  return Number.isSafeInteger(blockIndex) && blockIndex >= 0 && blockId.length > 0
+    ? { blockIndex, blockId }
     : null
 }
 
@@ -221,17 +227,38 @@ function parseRootDropCategoryId(id: unknown) {
   return markerIndex === -1 ? null : id.slice(markerIndex + marker.length) || null
 }
 
+function toggleBlockOccurrenceWithCategoryRules(
+  blocks: PromptBlock[],
+  blockIndex: number,
+): PromptBlock[] {
+  const target = blocks[blockIndex]
+  if (!target) return blocks
+  const nextBlocks = blocks.map((block, index) => (
+    index === blockIndex ? { ...block, enabled: !block.enabled } : block
+  ))
+  if (target.marker === 'category' || target.enabled) return nextBlocks
+
+  const group = computeGroups(blocks).find((candidate) => candidate.children.includes(target))
+  if (group?.categoryBlock?.categoryMode !== 'radio') return nextBlocks
+  const siblings = new Set(group.children)
+  return nextBlocks.map((block, index) => (
+    index !== blockIndex && siblings.has(block) && block.enabled
+      ? { ...block, enabled: false }
+      : block
+  ))
+}
+
 function reorderLoomBlocks(
   blocks: PromptBlock[],
   activeId: unknown,
   overId: unknown,
   armedAppendRootDropId: string | null,
 ): PromptBlock[] | null {
-  const draggedId = parseBlockDragId(activeId)
-  const overBlockId = parseBlockDragId(overId)
-  if (!draggedId || draggedId === overBlockId) return null
-  const draggedBlock = blocks.find((block) => block.id === draggedId)
-  if (!draggedBlock) return null
+  const dragged = parseBlockDragId(activeId)
+  const overBlock = parseBlockDragId(overId)
+  if (!dragged || dragged.blockIndex === overBlock?.blockIndex) return null
+  const draggedBlock = blocks[dragged.blockIndex]
+  if (!draggedBlock || draggedBlock.id !== dragged.blockId) return null
 
   const rootDropIndex = parseRootDropId(overId)
   const armedAppendCategoryId = armedAppendRootDropId === overId
@@ -239,7 +266,7 @@ function reorderLoomBlocks(
     : null
 
   if (draggedBlock.marker === 'category') {
-    const categoryIndex = blocks.findIndex((block) => block.id === draggedId)
+    const categoryIndex = dragged.blockIndex
     let endIndex = blocks.length
     for (let index = categoryIndex + 1; index < blocks.length; index += 1) {
       if (
@@ -263,29 +290,34 @@ function reorderLoomBlocks(
         ),
       )
     } else {
-      const targetIndex = blocks.findIndex((block) => block.id === overBlockId)
-      const targetCategoryId = targetIndex === -1 ? null : inferGroupAtIndex(blocks, targetIndex)
-      if (targetCategoryId === draggedBlock.id) return null
-      overIndex = remaining.findIndex((block) => (
-        block.id === (targetCategoryId ?? overBlockId)
-      ))
+      const targetIndex = overBlock?.blockIndex ?? -1
+      if (targetIndex < 0 || blocks[targetIndex]?.id !== overBlock?.blockId) return null
+      if (targetIndex >= categoryIndex && targetIndex < endIndex) return null
+      const targetCategoryId = inferGroupAtIndex(blocks, targetIndex)
+      let targetAnchorIndex = targetIndex
+      if (targetCategoryId !== null) {
+        for (let index = targetIndex; index >= 0; index -= 1) {
+          if (blocks[index]?.marker === 'category' && blocks[index]?.id === targetCategoryId) {
+            targetAnchorIndex = index
+            break
+          }
+        }
+      }
+      overIndex = remaining.indexOf(blocks[targetAnchorIndex]!)
     }
     if (overIndex === -1) return null
     remaining.splice(overIndex, 0, ...categoryGroup)
     return remaining
   }
 
-  const oldIndex = blocks.findIndex((block) => block.id === draggedId)
-  if (oldIndex === -1) return null
+  const oldIndex = dragged.blockIndex
 
-  if (armedAppendCategoryId) {
-    const categoryEndIndex = getCategoryEndIndex(blocks, armedAppendCategoryId)
-    if (categoryEndIndex === -1) return null
+  if (armedAppendCategoryId && rootDropIndex != null) {
     const nextBlocks = [...blocks]
     const [moved] = nextBlocks.splice(oldIndex, 1)
     const insertAt = Math.max(
       0,
-      Math.min(nextBlocks.length, categoryEndIndex > oldIndex ? categoryEndIndex - 1 : categoryEndIndex),
+      Math.min(nextBlocks.length, rootDropIndex > oldIndex ? rootDropIndex - 1 : rootDropIndex),
     )
     nextBlocks.splice(insertAt, 0, { ...moved, group: armedAppendCategoryId })
     return nextBlocks
@@ -302,8 +334,8 @@ function reorderLoomBlocks(
     return nextBlocks
   }
 
-  const newIndex = blocks.findIndex((block) => block.id === overBlockId)
-  if (newIndex === -1) return null
+  const newIndex = overBlock?.blockIndex ?? -1
+  if (newIndex < 0 || blocks[newIndex]?.id !== overBlock?.blockId) return null
   if (blocks[newIndex].marker === 'category') {
     const nextBlocks = [...blocks]
     const [moved] = nextBlocks.splice(oldIndex, 1)
@@ -313,8 +345,8 @@ function reorderLoomBlocks(
   }
 
   const movedGroup = inferGroupAtIndex(blocks, newIndex)
-  return arrayMove(blocks, oldIndex, newIndex).map((block) => (
-    block.id === draggedBlock.id ? { ...block, group: movedGroup } : block
+  return arrayMove(blocks, oldIndex, newIndex).map((block, index) => (
+    index === newIndex ? { ...block, group: movedGroup } : block
   ))
 }
 
@@ -345,20 +377,21 @@ function RootDropSlot({ id, active, appendArmed }: { id: string; active: boolean
 
 interface SortableCategoryItemProps {
   block: PromptBlock
+  blockIndex: number
   isCollapsed: boolean
   onToggleCollapse: () => void
   onEdit: (block: PromptBlock) => void
-  onDelete: (id: string) => void
-  onToggle: (id: string) => void
+  onDelete: (block: PromptBlock) => void
+  onToggle: (block: PromptBlock) => void
   childCount: number
   dragDisabled?: boolean
 }
 
 function SortableCategoryItem({
-  block, isCollapsed, onToggleCollapse, onEdit, onDelete, onToggle, childCount, dragDisabled = false,
+  block, blockIndex, isCollapsed, onToggleCollapse, onEdit, onDelete, onToggle, childCount, dragDisabled = false,
 }: SortableCategoryItemProps) {
   const { t } = useLb()
-  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: blockDragId(block.id), disabled: dragDisabled })
+  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: blockDragId(blockIndex, block.id), disabled: dragDisabled })
   const { setNodeRef, style } = useScaledSortableStyle({ setNodeRef: setSortableRef, transform, transition, isDragging })
   const isDisabled = !block.enabled
   const displayName = block.name.replace(/^\u2501\s*/, '')
@@ -393,13 +426,13 @@ function SortableCategoryItem({
           )}
         </span>
       </div>
-      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(block.id)} title={block.enabled ? t('category.disable') : t('category.enable')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(block)} title={block.enabled ? t('category.disable') : t('category.enable')}>
         {block.enabled ? <Eye size={14} /> : <EyeOff size={14} />}
       </Button>
       <Button size="icon-sm" variant="ghost" onClick={() => onEdit(block)} title={t('category.rename')}>
         <Edit2 size={14} />
       </Button>
-      <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(block.id)} title={t('category.deleteCategory')}>
+      <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(block)} title={t('category.deleteCategory')}>
         <Trash2 size={14} />
       </Button>
     </div>
@@ -412,18 +445,19 @@ function SortableCategoryItem({
 
 interface SortableBlockItemProps {
   block: PromptBlock
+  blockIndex: number
   effectiveRole?: PromptBlock['role']
   onEdit: (block: PromptBlock) => void
-  onDelete: (id: string) => void
-  onToggle: (id: string) => void
+  onDelete: (block: PromptBlock) => void
+  onToggle: (block: PromptBlock) => void
   indented: boolean
   dragDisabled?: boolean
 }
 
-function SortableBlockItem({ block, effectiveRole, onEdit, onDelete, onToggle, indented, dragDisabled = false }: SortableBlockItemProps) {
+function SortableBlockItem({ block, blockIndex, effectiveRole, onEdit, onDelete, onToggle, indented, dragDisabled = false }: SortableBlockItemProps) {
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
-  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: blockDragId(block.id), disabled: dragDisabled })
+  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: blockDragId(blockIndex, block.id), disabled: dragDisabled })
   const { setNodeRef, style } = useScaledSortableStyle({ setNodeRef: setSortableRef, transform, transition, isDragging })
   const isMarker = block.marker && block.marker !== 'category'
   const isDisabled = !block.enabled
@@ -471,14 +505,14 @@ function SortableBlockItem({ block, effectiveRole, onEdit, onDelete, onToggle, i
           </span>
         )}
       </span>
-      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(block.id)} title={block.enabled ? t('block.disable') : t('block.enable')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(block)} title={block.enabled ? t('block.disable') : t('block.enable')}>
         {block.enabled ? <Eye size={14} /> : <EyeOff size={14} />}
       </Button>
       <Button size="icon-sm" variant="ghost" onClick={() => onEdit(block)} title={tc('actions.edit')}>
         <Edit2 size={14} />
       </Button>
       {!block.isLocked && (
-        <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(block.id)} title={tc('actions.delete')}>
+        <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(block)} title={tc('actions.delete')}>
           <Trash2 size={14} />
         </Button>
       )}
@@ -522,6 +556,14 @@ function TrustedMacroPreviewControls({
   // A preview can be superseded while its macro request is in flight. Track
   // the request version so a late response never replaces newer context.
   const previewRequestVersionRef = useRef(0)
+  const previewAliveRef = useRef(true)
+  useEffect(() => {
+    previewAliveRef.current = true
+    return () => {
+      previewAliveRef.current = false
+      previewRequestVersionRef.current += 1
+    }
+  }, [])
   const activeChatId = __contextMeterStore((state) => state.activeChatId)
   const activeCharacterId = __contextMeterStore((state) => state.activeCharacterId)
   const activeGroupCharacterId = __contextMeterStore((state) => state.activeGroupCharacterId)
@@ -559,17 +601,17 @@ function TrustedMacroPreviewControls({
           : {}),
       })
         .then((response) => {
-          if (previewRequestVersionRef.current !== requestVersion) return
+          if (!previewAliveRef.current || previewRequestVersionRef.current !== requestVersion) return
           setPreviewText(response.text)
           setPreviewDiagnostics(response.diagnostics)
         })
         .catch(() => {
-          if (previewRequestVersionRef.current !== requestVersion) return
+          if (!previewAliveRef.current || previewRequestVersionRef.current !== requestVersion) return
           setPreviewText(t('blockEditor.previewUnavailable'))
           setPreviewDiagnostics([])
         })
         .finally(() => {
-          if (previewRequestVersionRef.current === requestVersion) {
+          if (previewAliveRef.current && previewRequestVersionRef.current === requestVersion) {
             setPreviewLoading(false)
           }
         })
@@ -644,6 +686,7 @@ interface BlockEditorProps {
   availableMacros: MacroGroup[]
   refreshMacros?: () => void
   compact: boolean
+  onDraftChange?: (updates: Partial<PromptBlock>) => void
   trustedHostFeatures?: boolean
 }
 
@@ -686,6 +729,7 @@ export function BlockEditor({
   availableMacros,
   refreshMacros,
   compact,
+  onDraftChange,
   trustedHostFeatures = false,
 }: BlockEditorProps) {
   const { t } = useLb()
@@ -722,7 +766,7 @@ export function BlockEditor({
     else if (pos === 'pre_history' && role === 'assistant') setRole('system')
   }
 
-  const handleSave = () => {
+  const buildUpdates = useCallback((): Partial<PromptBlock> => {
     const isAppend = role === 'user_append' || role === 'assistant_append'
     const cleanedVariables = variables.filter((variable) => variable && variable.name?.trim().length > 0)
     const cleanedCharacterTagTrigger = sanitizeCharacterTagTrigger(characterTagTrigger)
@@ -742,7 +786,7 @@ export function BlockEditor({
       trustedUpdates.sealedOriginVersion = isInstalledLumiHubSealed ? block.sealedOriginVersion : undefined
       trustedUpdates.sealedSha256 = isInstalledLumiHubSealed ? block.sealedSha256 : undefined
     }
-    onSave({
+    return {
       name,
       role,
       content,
@@ -755,7 +799,32 @@ export function BlockEditor({
       categoryMode: block.marker === 'category' ? categoryMode : null,
       variables: cleanedVariables.length ? cleanedVariables : undefined,
       placementBinding: cleanPlacementBinding(placementBinding, cleanedVariables, fallbackPlacement),
-    })
+    }
+  }, [
+    block,
+    categoryMode,
+    characterTagTrigger,
+    content,
+    depth,
+    injectionTrigger,
+    isInstalledLumiHubSealed,
+    isLocked,
+    name,
+    placementBinding,
+    position,
+    role,
+    sealed,
+    sealedKey,
+    trustedHostFeatures,
+    variables,
+  ])
+
+  useLayoutEffect(() => {
+    onDraftChange?.(buildUpdates())
+  }, [buildUpdates, onDraftChange])
+
+  const handleSave = () => {
+    onSave(buildUpdates())
   }
 
   const toggleTrigger = (value: string) => {
@@ -1072,6 +1141,14 @@ export interface ControlledLoomBlockEditorProps {
   readOnly?: boolean
   compact?: boolean
   trustedHostFeatures?: boolean
+  onDraftChange?: (blocks: PromptBlock[] | null) => void
+  authoritativeValueRevision?: number
+  /**
+   * Host-owned identity for the value/context being edited. The revision is
+   * sufficient for the native Spindle bridge; callers that swap contexts
+   * without changing the revision must supply a distinct identity.
+   */
+  authoritativeValueIdentity?: string | number
 }
 
 /**
@@ -1088,49 +1165,76 @@ export function ControlledLoomBlockEditor({
   readOnly = false,
   compact = true,
   trustedHostFeatures = false,
+  onDraftChange,
+  authoritativeValueRevision = 0,
+  authoritativeValueIdentity,
 }: ControlledLoomBlockEditorProps) {
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
   const { addableMarkers, markerLabel, markerSectionLabel } = useLoomOptionLabels()
-  const [editingBlockId, setEditingBlockId] = useState<string | null>(null)
+  const [editingBlockIndex, setEditingBlockIndex] = useState<number | null>(null)
+  const [editorSession, setEditorSession] = useState(0)
   const [validationError, setValidationError] = useState<string | null>(null)
   const [promptMenuOpen, setPromptMenuOpen] = useState(false)
   const [markerMenuOpen, setMarkerMenuOpen] = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [confirmDeleteIndex, setConfirmDeleteIndex] = useState<number | null>(null)
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set())
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const [hoveredAppendRootDropId, setHoveredAppendRootDropId] = useState<string | null>(null)
   const [armedAppendRootDropId, setArmedAppendRootDropId] = useState<string | null>(null)
+  const draftBlockRef = useRef<{ revision: number; block: PromptBlock } | null>(null)
+  const editingOriginRef = useRef<{ revision: number; identity: string | number } | null>(null)
+  const authorityIdentity = authoritativeValueIdentity ?? authoritativeValueRevision
+  const clearDraft = useCallback(() => {
+    const hadDraft = draftBlockRef.current !== null
+    draftBlockRef.current = null
+    if (hadDraft) onDraftChange?.(null)
+  }, [onDraftChange])
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 200, tolerance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
-  const editingBlock = editingBlockId
-    ? blocks.find((block) => block.id === editingBlockId) ?? null
+  const editingBlock = editingBlockIndex !== null
+    ? blocks[editingBlockIndex] ?? null
     : null
+  const draftBlock = draftBlockRef.current
+  const editingOrigin = editingOriginRef.current
+  const editingContextIsCurrent = editingOrigin !== null
+    && editingOrigin.revision === authoritativeValueRevision
+    && Object.is(editingOrigin.identity, authorityIdentity)
+  const editorBlock = !editingContextIsCurrent
+    ? null
+    : draftBlock
+      && draftBlock.revision === authoritativeValueRevision
+      && draftBlock.block.id === editingBlock?.id
+      ? draftBlock.block
+      : editingBlock
   const groups = useMemo(() => computeGroups(blocks), [blocks])
   const visibleBlockIds = useMemo(() => {
     const ids: string[] = []
     for (const group of groups) {
       if (group.categoryBlock) {
-        ids.push(blockDragId(group.categoryBlock.id))
+        ids.push(blockDragId(blocks.indexOf(group.categoryBlock), group.categoryBlock.id))
         if (!collapsedCategories.has(group.categoryBlock.id)) {
-          for (const child of group.children) ids.push(blockDragId(child.id))
+          for (const child of group.children) ids.push(blockDragId(blocks.indexOf(child), child.id))
         }
       } else {
-        for (const child of group.children) ids.push(blockDragId(child.id))
+        for (const child of group.children) ids.push(blockDragId(blocks.indexOf(child), child.id))
       }
     }
     return ids
-  }, [collapsedCategories, groups])
+  }, [blocks, collapsedCategories, groups])
   const effectiveRoles = useMemo(() => new Map(
     resolvePromptBlockPlacements(blocks, promptVariables)
       .map((block) => [block.id, block.role] as const),
   ), [blocks, promptVariables])
-  const activeDraggedBlock = useMemo(() => (
-    activeDragId ? blocks.find((block) => block.id === activeDragId) ?? null : null
-  ), [activeDragId, blocks])
+  const activeDraggedBlock = useMemo(() => {
+    const parsed = parseBlockDragId(activeDragId)
+    return parsed && blocks[parsed.blockIndex]?.id === parsed.blockId
+      ? blocks[parsed.blockIndex]
+      : null
+  }, [activeDragId, blocks])
   const blockLimitReached = blocks.length >= LOOM_DTO_LIMITS.maxBlocks
 
   const commitBlocks = useCallback((nextBlocks: PromptBlock[]): boolean => {
@@ -1147,22 +1251,42 @@ export function ControlledLoomBlockEditor({
   }, [onChange])
 
   useEffect(() => {
-    if (editingBlockId && !blocks.some((block) => block.id === editingBlockId)) {
-      setEditingBlockId(null)
+    const origin = editingOriginRef.current
+    const authorityChanged = origin !== null
+      && (
+        origin.revision !== authoritativeValueRevision
+        || !Object.is(origin.identity, authorityIdentity)
+      )
+    if (
+      editingBlockIndex !== null
+      && (
+        authorityChanged
+        || blocks[editingBlockIndex] === undefined
+      )
+    ) {
+      clearDraft()
+      editingOriginRef.current = null
+      setEditingBlockIndex(null)
       setValidationError(null)
     }
-    if (confirmDelete && !blocks.some((block) => block.id === confirmDelete)) {
-      setConfirmDelete(null)
+    if (confirmDeleteIndex !== null && blocks[confirmDeleteIndex] === undefined) {
+      setConfirmDeleteIndex(null)
     }
-  }, [blocks, confirmDelete, editingBlockId])
+  }, [
+    authorityIdentity,
+    authoritativeValueRevision,
+    blocks,
+    clearDraft,
+    confirmDeleteIndex,
+    editingBlockIndex,
+  ])
 
   useEffect(() => {
     if (!readOnly) return
-    setEditingBlockId(null)
     setValidationError(null)
     setPromptMenuOpen(false)
     setMarkerMenuOpen(false)
-    setConfirmDelete(null)
+    setConfirmDeleteIndex(null)
     setActiveDragId(null)
     setHoveredAppendRootDropId(null)
     setArmedAppendRootDropId(null)
@@ -1199,22 +1323,53 @@ export function ControlledLoomBlockEditor({
 
   const rootDropIndexAfterGroup = useCallback((group: CategoryGroup) => {
     if (group.categoryBlock) {
-      const endIndex = getCategoryEndIndex(blocks, group.categoryBlock.id)
-      return endIndex === -1 ? blocks.length : endIndex
+      const categoryIndex = blocks.indexOf(group.categoryBlock)
+      if (categoryIndex === -1) return blocks.length
+      let endIndex = categoryIndex + 1
+      while (endIndex < blocks.length) {
+        const block = blocks[endIndex]
+        if (block.marker === 'category') break
+        if (hasExplicitGroup(block) && blockGroup(block) !== group.categoryBlock.id) break
+        endIndex += 1
+      }
+      return endIndex
     }
     const childIndexes = group.children
-      .map((child) => blocks.findIndex((block) => block.id === child.id))
+      .map((child) => blocks.indexOf(child))
       .filter((index) => index >= 0)
     return childIndexes.length > 0 ? Math.max(...childIndexes) + 1 : blocks.length
   }, [blocks])
 
   const handleEdit = useCallback((block: PromptBlock) => {
+    const blockIndex = blocks.indexOf(block)
+    if (blockIndex < 0) return
+    clearDraft()
+    editingOriginRef.current = {
+      revision: authoritativeValueRevision,
+      identity: authorityIdentity,
+    }
     setValidationError(null)
-    setEditingBlockId(block.id)
-  }, [])
+    setEditingBlockIndex(blockIndex)
+    setEditorSession((current) => current + 1)
+  }, [authorityIdentity, authoritativeValueRevision, blocks, clearDraft])
 
-  const handleToggle = useCallback((blockId: string) => {
-    commitBlocks(toggleBlockWithCategoryRules(blocks, blockId))
+  const handleDraftChange = useCallback((updates: Partial<PromptBlock>) => {
+    const origin = editingOriginRef.current
+    if (
+      !editingBlock
+      || editingBlockIndex === null
+      || !origin
+      || origin.revision !== authoritativeValueRevision
+      || !Object.is(origin.identity, authorityIdentity)
+    ) return
+    const nextDraft = { ...editingBlock, ...updates }
+    draftBlockRef.current = { revision: authoritativeValueRevision, block: nextDraft }
+    onDraftChange?.(blocks.map((block, index) => index === editingBlockIndex ? nextDraft : block))
+  }, [authorityIdentity, authoritativeValueRevision, blocks, editingBlock, editingBlockIndex, onDraftChange])
+
+  const handleToggle = useCallback((block: PromptBlock) => {
+    const blockIndex = blocks.indexOf(block)
+    if (blockIndex >= 0) commitBlocks(toggleBlockOccurrenceWithCategoryRules(blocks, blockIndex))
   }, [blocks, commitBlocks])
 
   const handleAddTemplate = useCallback((template: { name: string; content: string; role: string }) => {
@@ -1242,28 +1397,28 @@ export function ControlledLoomBlockEditor({
   }, [blockLimitReached, blocks, commitBlocks])
 
   const confirmDeleteBlock = useCallback(() => {
-    if (!confirmDelete) return
-    const target = blocks.find((block) => block.id === confirmDelete)
+    if (confirmDeleteIndex === null) return
+    const target = blocks[confirmDeleteIndex]
     if (!target || (target.isLocked && target.marker !== 'category')) {
-      setConfirmDelete(null)
+      setConfirmDeleteIndex(null)
       return
     }
-    const detachedChildIds = target.marker === 'category'
+    const detachedChildren = target.marker === 'category'
       ? new Set(
         computeGroups(blocks)
-          .find((group) => group.categoryBlock?.id === target.id)
-          ?.children.map((block) => block.id) ?? [],
+          .find((group) => group.categoryBlock === target)
+          ?.children ?? [],
       )
       : null
     const nextBlocks = blocks
-      .filter((block) => block.id !== target.id)
+      .filter((_block, index) => index !== confirmDeleteIndex)
       .map((block) => (
-        detachedChildIds?.has(block.id) || block.group === target.id
+        detachedChildren?.has(block)
           ? { ...block, group: null }
           : block
       ))
-    if (commitBlocks(nextBlocks)) setConfirmDelete(null)
-  }, [blocks, commitBlocks, confirmDelete])
+    if (commitBlocks(nextBlocks)) setConfirmDeleteIndex(null)
+  }, [blocks, commitBlocks, confirmDeleteIndex])
 
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     setActiveDragId(null)
@@ -1281,8 +1436,10 @@ export function ControlledLoomBlockEditor({
 
   const handleDragOver = useCallback((event: DragOverEvent) => {
     const overId = event.over?.id
-    const activeBlockId = parseBlockDragId(event.active.id)
-    const activeBlock = blocks.find((block) => block.id === activeBlockId)
+    const active = parseBlockDragId(event.active.id)
+    const activeBlock = active && blocks[active.blockIndex]?.id === active.blockId
+      ? blocks[active.blockIndex]
+      : null
     const appendCategoryId = parseRootDropCategoryId(overId)
     setHoveredAppendRootDropId(
       appendCategoryId && activeBlock?.marker !== 'category' && typeof overId === 'string'
@@ -1297,29 +1454,41 @@ export function ControlledLoomBlockEditor({
     setArmedAppendRootDropId(null)
   }, [])
 
-  if (editingBlock && !readOnly) {
+  if (editingBlock && editorBlock && editingContextIsCurrent && !readOnly) {
     return (
       <BlockEditor
-        key={JSON.stringify(editingBlock)}
-        block={editingBlock}
+        key={`${String(authorityIdentity)}:${authoritativeValueRevision}:${editingBlockIndex}:${editorSession}`}
+        block={editorBlock}
         blocks={blocks}
         promptVariables={promptVariables}
         validationError={validationError}
         onSave={(updates) => {
-          const nextBlocks = blocks.map((block) => (
-            block.id === editingBlock.id ? { ...block, ...updates } : block
+          const origin = editingOriginRef.current
+          if (
+            !editingBlock
+            || !origin
+            || origin.revision !== authoritativeValueRevision
+            || !Object.is(origin.identity, authorityIdentity)
+          ) return
+          const nextBlocks = blocks.map((block, index) => (
+            index === editingBlockIndex ? { ...block, ...updates } : block
           ))
           if (!commitBlocks(nextBlocks)) {
             setValidationError(t('blockEditor.validationFailed'))
             return
           }
+          clearDraft()
+          editingOriginRef.current = null
           setValidationError(null)
-          setEditingBlockId(null)
+          setEditingBlockIndex(null)
         }}
         onBack={() => {
+          clearDraft()
+          editingOriginRef.current = null
           setValidationError(null)
-          setEditingBlockId(null)
+          setEditingBlockIndex(null)
         }}
+        onDraftChange={handleDraftChange}
         availableMacros={availableMacros}
         refreshMacros={refreshMacros}
         compact={compact}
@@ -1379,7 +1548,7 @@ export function ControlledLoomBlockEditor({
             <DndContext
               sensors={sensors}
               collisionDetection={closestCenter}
-              onDragStart={(event) => setActiveDragId(parseBlockDragId(event.active.id))}
+              onDragStart={(event) => setActiveDragId(typeof event.active.id === 'string' ? event.active.id : null)}
               onDragOver={handleDragOver}
               onDragEnd={handleDragEnd}
               onDragCancel={handleDragCancel}
@@ -1387,14 +1556,15 @@ export function ControlledLoomBlockEditor({
               <SortableContext items={visibleBlockIds} strategy={verticalListSortingStrategy}>
                 <RootDropSlot id={rootDropId(0)} active={!!activeDragId} />
                 {groups.map((group) => (
-                  <Fragment key={group.categoryBlock?.id || group.children[0]?.id || 'ungrouped'}>
+                  <Fragment key={group.categoryBlock ? blockDragId(blocks.indexOf(group.categoryBlock), group.categoryBlock.id) : group.children[0] ? blockDragId(blocks.indexOf(group.children[0]), group.children[0].id) : 'ungrouped'}>
                     {group.categoryBlock && (
                       <SortableCategoryItem
                         block={group.categoryBlock}
+                        blockIndex={blocks.indexOf(group.categoryBlock)}
                         isCollapsed={collapsedCategories.has(group.categoryBlock.id)}
                         onToggleCollapse={() => toggleCollapse(group.categoryBlock!.id)}
                         onEdit={handleEdit}
-                        onDelete={setConfirmDelete}
+                        onDelete={(block) => setConfirmDeleteIndex(blocks.indexOf(block))}
                         onToggle={handleToggle}
                         childCount={group.children.length}
                       />
@@ -1402,11 +1572,12 @@ export function ControlledLoomBlockEditor({
                     {(!group.categoryBlock || !collapsedCategories.has(group.categoryBlock.id))
                       && group.children.map((block) => (
                         <SortableBlockItem
-                          key={block.id}
+                          key={blockDragId(blocks.indexOf(block), block.id)}
                           block={block}
+                          blockIndex={blocks.indexOf(block)}
                           effectiveRole={effectiveRoles.get(block.id)}
                           onEdit={handleEdit}
-                          onDelete={setConfirmDelete}
+                          onDelete={(block) => setConfirmDeleteIndex(blocks.indexOf(block))}
                           onToggle={handleToggle}
                           indented={!!group.categoryBlock}
                         />
@@ -1516,13 +1687,13 @@ export function ControlledLoomBlockEditor({
         </div>
       </div>
       <ConfirmationModal
-        isOpen={!!confirmDelete}
+        isOpen={confirmDeleteIndex !== null}
         title={t('confirm.deleteBlockTitle')}
         message={t('confirm.deleteBlockMessage')}
         variant="danger"
         confirmText={tc('actions.delete')}
         onConfirm={confirmDeleteBlock}
-        onCancel={() => setConfirmDelete(null)}
+        onCancel={() => setConfirmDeleteIndex(null)}
       />
     </div>
   )
@@ -2220,7 +2391,6 @@ export default function LoomBuilder({
     addBlock,
     removeBlock,
     updateBlock,
-    toggleBlock,
     saveSamplerOverrides,
     savePromptBehavior,
     saveCompletionSettings,
@@ -2239,8 +2409,10 @@ export default function LoomBuilder({
   const presetEditorToolbarItems = __contextMeterStore((state) => state.presetEditorToolbarItems)
   const addToast = __contextMeterStore((s) => s.addToast)
   const activePresetRef = useRef(activePreset)
+  const activePresetIdRef = useRef(activePresetId)
   const suppressNextProfileApplyRef = useRef<string | null>(null)
 
+  activePresetIdRef.current = activePresetId
   const getProfileContextKey = useCallback(() => (
     `${activePresetRef.current?.id ?? 'none'}:${presetProfiles.activeChatId ?? 'none'}:${presetProfiles.activePersonaId ?? 'none'}:${presetProfiles.activeCharacterId ?? 'none'}:${presetProfiles.activeProfileId ?? 'none'}`
   ), [presetProfiles.activeChatId, presetProfiles.activePersonaId, presetProfiles.activeCharacterId, presetProfiles.activeProfileId])
@@ -2333,12 +2505,26 @@ export default function LoomBuilder({
   ])
 
   const [view, setView] = useState<'list' | 'edit'>('list')
+  const [editingSession, setEditingSession] = useState(0)
+  const editingOriginRef = useRef<{
+    presetId: string
+    presetRevision: number
+    blockId: string
+    blockIndex: number
+    block: PromptBlock
+  } | null>(null)
   const [activePresetEditorTab, setActivePresetEditorTab] = useState('preset')
   const [editingBlock, setEditingBlock] = useState<PromptBlock | null>(null)
   const [blockValidationError, setBlockValidationError] = useState<string | null>(null)
-  const [promptMenuOpen, setPromptMenuOpen] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState<{
+    presetId: string
+    presetRevision: number
+    blockId: string
+    blockIndex: number
+    block: PromptBlock
+  } | null>(null)
   const [markerMenuOpen, setMarkerMenuOpen] = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [promptMenuOpen, setPromptMenuOpen] = useState(false)
   const [confirmDeletePreset, setConfirmDeletePreset] = useState(false)
   const [showLegacyExportConfirm, setShowLegacyExportConfirm] = useState(false)
   const [showPromptVariablesModal, setShowPromptVariablesModal] = useState(false)
@@ -2348,6 +2534,13 @@ export default function LoomBuilder({
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const [hoveredAppendRootDropId, setHoveredAppendRootDropId] = useState<string | null>(null)
   const [armedAppendRootDropId, setArmedAppendRootDropId] = useState<string | null>(null)
+  const clearEditingBlock = useCallback(() => {
+    editingOriginRef.current = null
+    setBlockValidationError(null)
+    setView('list')
+    setEditingSession((current) => current + 1)
+    setEditingBlock(null)
+  }, [])
 
   const activePresetEditorTabRef = useRef(activePresetEditorTab)
   const updatePresetDraftRef = useRef(updatePresetDraft)
@@ -2383,8 +2576,7 @@ export default function LoomBuilder({
           : {}
       },
       setActiveTab: (tabId) => {
-        setView('list')
-        setEditingBlock(null)
+        clearEditingBlock()
         setActivePresetEditorTab(tabId)
       },
       updatePreset: (mutator, immediate) => {
@@ -2397,6 +2589,31 @@ export default function LoomBuilder({
     return () => { setPresetEditorController(null) }
   }, [])
 
+  useEffect(() => {
+    const origin = editingOriginRef.current
+    const target = origin && activePreset?.blocks[origin.blockIndex]
+    const presetRevision = activePreset?.cacheRevision ?? activePreset?.updatedAt
+    if (
+      origin
+      && (
+        origin.presetId !== activePresetId
+        || origin.presetRevision !== presetRevision
+        || target !== origin.block
+      )
+    ) {
+      clearEditingBlock()
+    }
+    if (
+      confirmDelete
+      && (
+        confirmDelete.presetId !== activePresetId
+        || confirmDelete.presetRevision !== presetRevision
+        || activePreset?.blocks[confirmDelete.blockIndex] !== confirmDelete.block
+      )
+    ) {
+      setConfirmDelete(null)
+    }
+  }, [activePreset, activePresetId, clearEditingBlock, confirmDelete])
   useEffect(() => {
     if (!activePreset || activePreset.id !== activePresetId) {
       syncPresetEditorState({
@@ -2543,29 +2760,33 @@ export default function LoomBuilder({
   }, [hoveredAppendRootDropId])
 
   const visibleBlockIds = useMemo(() => {
+    const blocks = activePreset?.blocks ?? []
     const ids: string[] = []
     for (const group of displayedGroups) {
       if (group.categoryBlock) {
-        ids.push(blockDragId(group.categoryBlock.id))
+        ids.push(blockDragId(blocks.indexOf(group.categoryBlock), group.categoryBlock.id))
         if (isSearchActive || !collapsedCategories.has(group.categoryBlock.id)) {
-          for (const child of group.children) ids.push(blockDragId(child.id))
+          for (const child of group.children) ids.push(blockDragId(blocks.indexOf(child), child.id))
         }
       } else {
-        for (const child of group.children) ids.push(blockDragId(child.id))
+        for (const child of group.children) ids.push(blockDragId(blocks.indexOf(child), child.id))
       }
     }
     return ids
-  }, [displayedGroups, collapsedCategories, isSearchActive])
+  }, [activePreset?.blocks, displayedGroups, collapsedCategories, isSearchActive])
 
   const activeDraggedBlock = useMemo(() => {
-    if (!activeDragId) return null
-    return activePreset?.blocks.find((block) => block.id === activeDragId) ?? null
+    const parsed = parseBlockDragId(activeDragId)
+    const blocks = activePreset?.blocks
+    return parsed && blocks?.[parsed.blockIndex]?.id === parsed.blockId
+      ? blocks[parsed.blockIndex]
+      : null
   }, [activeDragId, activePreset?.blocks])
 
   const rootDropIndexAfterGroup = useCallback((group: CategoryGroup) => {
     const blocks = activePreset?.blocks ?? []
     if (group.categoryBlock) {
-      const categoryIndex = blocks.findIndex((block) => block.id === group.categoryBlock!.id)
+      const categoryIndex = blocks.indexOf(group.categoryBlock)
       if (categoryIndex === -1) return blocks.length
       let endIndex = categoryIndex + 1
       while (endIndex < blocks.length) {
@@ -2578,7 +2799,7 @@ export default function LoomBuilder({
     }
 
     const childIndexes = group.children
-      .map((child) => blocks.findIndex((block) => block.id === child.id))
+      .map((child) => blocks.indexOf(child))
       .filter((index) => index >= 0)
     return childIndexes.length > 0 ? Math.max(...childIndexes) + 1 : blocks.length
   }, [activePreset?.blocks])
@@ -2625,9 +2846,17 @@ export default function LoomBuilder({
     setIsSearchOpen(false)
   }, [trimmedSearchQuery])
 
+  const handleToggleBlock = useCallback((block: PromptBlock) => {
+    const blocks = activePreset?.blocks
+    if (!blocks) return
+    const blockIndex = blocks.indexOf(block)
+    if (blockIndex >= 0) void saveBlocks(toggleBlockOccurrenceWithCategoryRules(blocks, blockIndex))
+  }, [activePreset?.blocks, saveBlocks])
+
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     const { active, over } = event
     setActiveDragId(null)
+
     setHoveredAppendRootDropId(null)
     setArmedAppendRootDropId(null)
     if (!over || !activePreset) return
@@ -2643,8 +2872,11 @@ export default function LoomBuilder({
 
   const handleDragOver = useCallback((event: DragOverEvent) => {
     const overId = event.over?.id
-    const activeBlockId = parseBlockDragId(event.active.id)
-    const activeBlock = activePreset?.blocks.find((block) => block.id === activeBlockId)
+    const active = parseBlockDragId(event.active.id)
+    const blocks = activePreset?.blocks
+    const activeBlock = active && blocks?.[active.blockIndex]?.id === active.blockId
+      ? blocks[active.blockIndex]
+      : null
     const appendCategoryId = parseRootDropCategoryId(overId)
     setHoveredAppendRootDropId(
       appendCategoryId && activeBlock?.marker !== 'category' && typeof overId === 'string'
@@ -2660,23 +2892,71 @@ export default function LoomBuilder({
   }, [])
 
   const handleEdit = useCallback((block: PromptBlock) => {
+    const currentPreset = activePresetRef.current
+    const currentPresetId = activePresetIdRef.current
+    if (!currentPreset || currentPreset.id !== currentPresetId) return
+    const blockIndex = currentPreset.blocks.indexOf(block)
+    if (blockIndex < 0) return
+    editingOriginRef.current = {
+      presetId: currentPresetId,
+      presetRevision: currentPreset.cacheRevision ?? currentPreset.updatedAt,
+      blockId: block.id,
+      blockIndex,
+      block,
+    }
+    setEditingSession((current) => current + 1)
     setBlockValidationError(null)
     setEditingBlock(block)
     setView('edit')
   }, [])
 
   const handleEditSave = useCallback((updates: Partial<PromptBlock>): boolean => {
-    if (!editingBlock) return false
-    const accepted = updateBlock(editingBlock.id, updates)
+    const origin = editingOriginRef.current
+    const currentPreset = activePresetRef.current
+    const currentPresetId = activePresetIdRef.current
+    const target = origin && currentPreset?.blocks[origin.blockIndex]
+    const currentPresetRevision = currentPreset?.cacheRevision ?? currentPreset?.updatedAt
+    if (
+      !editingBlock
+      || !origin
+      || !currentPreset
+      || currentPreset.id !== currentPresetId
+      || origin.presetId !== currentPresetId
+      || origin.presetRevision !== currentPresetRevision
+      || !target
+      || target !== origin.block
+      || target.id !== origin.blockId
+    ) {
+      return false
+    }
+
+    const hasDuplicateId = currentPreset.blocks.some(
+      (candidate, index) => index !== origin.blockIndex && candidate.id === origin.blockId,
+    )
+    let accepted = false
+    if (!hasDuplicateId) {
+      accepted = updateBlock(origin.blockId, updates)
+    } else {
+      const nextBlocks = currentPreset.blocks.map((candidate, index) => (
+        index === origin.blockIndex ? { ...candidate, ...updates } : candidate
+      ))
+      try {
+        const normalizedBlocks = normalizeCategoryBlockState(nextBlocks)
+        validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: currentPreset.blocks })
+        void saveBlocks(normalizedBlocks).catch(() => {})
+        accepted = true
+      } catch {
+        accepted = false
+      }
+    }
+
     if (!accepted) {
       setBlockValidationError(lb('blockEditor.validationFailed'))
       return false
     }
-    setBlockValidationError(null)
-    setView('list')
-    setEditingBlock(null)
+    clearEditingBlock()
     return true
-  }, [editingBlock, lb, updateBlock])
+  }, [clearEditingBlock, editingBlock, lb, saveBlocks, updateBlock])
 
   const handleAddTemplate = useCallback((template: { name: string; content: string; role: string }) => {
     addBlock(createBlock({ name: template.name, content: template.content, role: template.role as PromptBlock['role'] }))
@@ -2692,16 +2972,54 @@ export default function LoomBuilder({
     setMarkerMenuOpen(false)
   }, [addBlock])
 
-  const handleDelete = useCallback((blockId: string) => {
-    setConfirmDelete(blockId)
+  const handleDelete = useCallback((block: PromptBlock) => {
+    const currentPreset = activePresetRef.current
+    const currentPresetId = activePresetIdRef.current
+    if (!currentPreset || currentPreset.id !== currentPresetId) return
+    const blockIndex = currentPreset.blocks.indexOf(block)
+    if (blockIndex < 0) return
+    setConfirmDelete({
+      presetId: currentPresetId,
+      presetRevision: currentPreset.cacheRevision ?? currentPreset.updatedAt,
+      blockId: block.id,
+      blockIndex,
+      block,
+    })
   }, [])
 
   const confirmDeleteBlock = useCallback(() => {
-    if (confirmDelete) {
-      removeBlock(confirmDelete)
+    if (!confirmDelete) return
+    const currentPreset = activePresetRef.current
+    const currentPresetId = activePresetIdRef.current
+    const target = currentPreset?.blocks[confirmDelete.blockIndex]
+    if (
+      !currentPreset
+      || currentPreset.id !== currentPresetId
+      || confirmDelete.presetId !== currentPresetId
+      || confirmDelete.presetRevision !== (currentPreset.cacheRevision ?? currentPreset.updatedAt)
+      || target !== confirmDelete.block
+      || target.id !== confirmDelete.blockId
+    ) {
+      setConfirmDelete(null)
+      return
+    }
+    const hasDuplicateId = currentPreset.blocks.some(
+      (candidate, index) => index !== confirmDelete.blockIndex && candidate.id === confirmDelete.blockId,
+    )
+    if (!hasDuplicateId) {
+      void removeBlock(confirmDelete.blockId)
+      setConfirmDelete(null)
+      return
+    }
+    try {
+      const nextBlocks = currentPreset.blocks.filter((_, index) => index !== confirmDelete.blockIndex)
+      const normalizedBlocks = normalizeCategoryBlockState(nextBlocks)
+      validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: currentPreset.blocks })
+      void saveBlocks(normalizedBlocks).catch(() => {})
+    } finally {
       setConfirmDelete(null)
     }
-  }, [confirmDelete, removeBlock])
+  }, [confirmDelete, removeBlock, saveBlocks])
 
   const handleRenamePreset = useCallback(async (newName: string) => {
     if (!activePresetId) return
@@ -2779,21 +3097,29 @@ export default function LoomBuilder({
   ) : null
 
   // Edit view
-  if (activePresetEditorTab === 'preset' && view === 'edit' && editingBlock) {
+  const editOrigin = editingOriginRef.current
+  const editTarget = editOrigin && activePreset?.blocks[editOrigin.blockIndex]
+  const editContextIsCurrent = !!(
+    editOrigin
+    && activePreset
+    && activePreset.id === activePresetId
+    && editOrigin.presetId === activePresetId
+    && editOrigin.presetRevision === (activePreset.cacheRevision ?? activePreset.updatedAt)
+    && editTarget === editOrigin.block
+    && editTarget.id === editOrigin.blockId
+  )
+  if (activePresetEditorTab === 'preset' && view === 'edit' && editingBlock && editContextIsCurrent) {
     return (
       <>
         {presetEditorToolbar}
         <BlockEditor
+          key={`${editOrigin.presetId}:${editOrigin.presetRevision}:${editOrigin.blockIndex}:${editingSession}`}
           block={editingBlock}
-          blocks={activePreset?.blocks ?? []}
-          promptVariables={activePreset?.promptVariables ?? {}}
+          blocks={activePreset.blocks}
+          promptVariables={activePreset.promptVariables ?? {}}
           validationError={blockValidationError}
           onSave={handleEditSave}
-          onBack={() => {
-            setBlockValidationError(null)
-            setView('list')
-            setEditingBlock(null)
-          }}
+          onBack={clearEditingBlock}
           availableMacros={availableMacros}
           refreshMacros={refreshMacros}
           compact={compact}
@@ -3193,7 +3519,7 @@ export default function LoomBuilder({
             <DndContext
               sensors={sensors}
               collisionDetection={closestCenter}
-              onDragStart={(event) => setActiveDragId(parseBlockDragId(event.active.id))}
+              onDragStart={(event) => setActiveDragId(typeof event.active.id === 'string' ? event.active.id : null)}
               onDragOver={handleDragOver}
               onDragEnd={handleDragEnd}
               onDragCancel={handleDragCancel}
@@ -3201,15 +3527,16 @@ export default function LoomBuilder({
               <SortableContext items={visibleBlockIds} strategy={verticalListSortingStrategy}>
                 <RootDropSlot id={rootDropId(0)} active={!!activeDragId && !isSearchActive} />
                 {displayedGroups.map(group => (
-                  <Fragment key={group.categoryBlock?.id || group.children[0]?.id || 'ungrouped'}>
+                  <Fragment key={group.categoryBlock ? blockDragId(activePreset.blocks.indexOf(group.categoryBlock), group.categoryBlock.id) : group.children[0] ? blockDragId(activePreset.blocks.indexOf(group.children[0]), group.children[0].id) : 'ungrouped'}>
                     {group.categoryBlock && (
                       <SortableCategoryItem
                         block={group.categoryBlock}
+                        blockIndex={activePreset.blocks.indexOf(group.categoryBlock)}
                         isCollapsed={isSearchActive ? false : collapsedCategories.has(group.categoryBlock.id)}
                         onToggleCollapse={isSearchActive ? () => {} : () => toggleCollapse(group.categoryBlock!.id)}
                         onEdit={handleEdit}
                         onDelete={handleDelete}
-                        onToggle={toggleBlock}
+                        onToggle={handleToggleBlock}
                         childCount={group.children.length}
                         dragDisabled={isSearchActive}
                       />
@@ -3217,12 +3544,13 @@ export default function LoomBuilder({
                     {(!group.categoryBlock || isSearchActive || !collapsedCategories.has(group.categoryBlock.id)) &&
                       group.children.map(block => (
                         <SortableBlockItem
-                          key={block.id}
+                          key={blockDragId(activePreset.blocks.indexOf(block), block.id)}
                           block={block}
+                          blockIndex={activePreset.blocks.indexOf(block)}
                           effectiveRole={effectiveRoles.get(block.id)}
                           onEdit={handleEdit}
                           onDelete={handleDelete}
-                          onToggle={toggleBlock}
+                          onToggle={handleToggleBlock}
                           indented={!!group.categoryBlock}
                           dragDisabled={isSearchActive}
                         />

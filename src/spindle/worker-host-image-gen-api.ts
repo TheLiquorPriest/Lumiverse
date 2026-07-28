@@ -63,7 +63,7 @@ export function supportsWebSocketPreviewStreaming(
  * request/response API and cannot accidentally expose a partial stream.
  */
 export class WorkerHostImageGenApi {
-  private streamAbortControllers = new Map<string, AbortController>();
+  private abortControllers = new Map<string, AbortController>();
 
   constructor(private readonly context: WorkerHostImageGenApiContext) {}
 
@@ -88,7 +88,43 @@ export class WorkerHostImageGenApi {
       throw new Error(`${PERMISSION_DENIED_PREFIX} image_gen — Image generation permission not granted`);
     }
   }
+  private requireActive(signal: AbortSignal): void {
+    if (signal.aborted) {
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("Image generation aborted", "AbortError");
+    }
+    this.requirePermission();
+  }
 
+  private async rollbackPersistedImage(
+    generation: ResolvedImageGeneration,
+    result: Record<string, unknown>,
+  ): Promise<void> {
+    if (typeof result.imageId !== "string") return;
+    const { deleteImagesBulk } = await import("../services/images.service");
+    await deleteImagesBulk(generation.userId, [result.imageId]);
+  }
+
+  private async requireActiveResult(
+    signal: AbortSignal,
+    generation: ResolvedImageGeneration,
+    result: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      this.requireActive(signal);
+    } catch (error) {
+      try {
+        await this.rollbackPersistedImage(generation, result);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Image generation permission was revoked and persisted-image rollback failed",
+        );
+      }
+      throw error;
+    }
+  }
   private async resolveGeneration(input: any, signal?: AbortSignal): Promise<ResolvedImageGeneration> {
     this.requirePermission();
 
@@ -164,16 +200,27 @@ export class WorkerHostImageGenApi {
   }
 
   async handleGenerate(requestId: string, input: any): Promise<void> {
+    const abortController = new AbortController();
+    this.abortControllers.get(requestId)?.abort(new Error("Image generation request replaced"));
+    this.abortControllers.set(requestId, abortController);
     try {
-      const generation = await this.resolveGeneration(input);
+      const generation = await this.resolveGeneration(input, abortController.signal);
+      this.requireActive(abortController.signal);
       const result = await generation.provider.generate(
         generation.apiKey,
         generation.connection.api_url || "",
         generation.request,
       );
-      this.postResponse(requestId, await this.persistResult(result, generation, input));
+      this.requireActive(abortController.signal);
+      const persisted = await this.persistResult(result, generation, input);
+      await this.requireActiveResult(abortController.signal, generation, persisted);
+      this.postResponse(requestId, persisted);
     } catch (err: any) {
       this.postResponse(requestId, undefined, err?.message ?? String(err));
+    } finally {
+      if (this.abortControllers.get(requestId) === abortController) {
+        this.abortControllers.delete(requestId);
+      }
     }
   }
 
@@ -232,10 +279,12 @@ export class WorkerHostImageGenApi {
 
   async handleGenerateStream(requestId: string, input: any): Promise<void> {
     const abortController = new AbortController();
-    this.streamAbortControllers.set(requestId, abortController);
+    this.abortControllers.get(requestId)?.abort(new Error("Image generation request replaced"));
+    this.abortControllers.set(requestId, abortController);
 
     try {
       const generation = await this.resolveGeneration(input, abortController.signal);
+      this.requireActive(abortController.signal);
       const { provider } = generation;
       if (!supportsWebSocketPreviewStreaming(provider)) {
         throw new Error(`${provider.displayName} does not support WebSocket preview/status streaming`);
@@ -248,8 +297,10 @@ export class WorkerHostImageGenApi {
       );
       while (true) {
         const next = await stream.next();
+        this.requireActive(abortController.signal);
         if (next.done) {
           const result = await this.persistResult(next.value, generation, input);
+          await this.requireActiveResult(abortController.signal, generation, result);
           this.postStreamEvent(requestId, { type: "done", result });
           return;
         }
@@ -283,11 +334,16 @@ export class WorkerHostImageGenApi {
         aborted ? "AbortError: Image generation aborted" : err?.message ?? String(err),
       );
     } finally {
-      this.streamAbortControllers.delete(requestId);
+      if (this.abortControllers.get(requestId) === abortController) this.abortControllers.delete(requestId);
     }
   }
 
   cancelStream(requestId: string): void {
-    this.streamAbortControllers.get(requestId)?.abort();
+    this.abortControllers.get(requestId)?.abort();
+  }
+
+  abortAll(reason: unknown = new Error("Image generation host stopped")): void {
+    for (const controller of this.abortControllers.values()) controller.abort(reason);
+    this.abortControllers.clear();
   }
 }

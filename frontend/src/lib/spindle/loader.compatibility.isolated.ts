@@ -27,6 +27,8 @@ const wsHandlers = new Map<string, Set<EventHandler>>()
 let handshakeCalls = 0
 let bundleFetchCalls = 0
 let handshakeFailure = false
+let handshakeGate: Promise<void> | null = null
+let handshakeStarted: (() => void) | null = null
 let nextDescriptor = validateSpindleHostDescriptor({
   descriptorVersion: 1,
   lumiverseVersion: APP_VERSION,
@@ -34,6 +36,7 @@ let nextDescriptor = validateSpindleHostDescriptor({
   extensionInstallationId: INSTALLATION_ID,
 })
 let tamperDigest = false
+let responseDescriptor: unknown = null
 
 function sourceForMode(): string {
   if (globals.__loaderMode === 'setup-reject') {
@@ -52,7 +55,7 @@ function responseForNonce(nonce: string): Promise<unknown> {
   globals.__loaderEvents?.push('handshake')
   return digestSpindleHostDescriptor(nextDescriptor).then((digest) => ({
     nonce,
-    descriptor: nextDescriptor,
+    descriptor: responseDescriptor ?? nextDescriptor,
     digest: tamperDigest ? `${digest}x` : digest,
   }))
 }
@@ -113,6 +116,8 @@ mock.module('@/api/spindle', () => ({
   spindleApi: {
     compatibilityHandshake: async (_id: string, nonce: string) => {
       handshakeCalls += 1
+      handshakeStarted?.()
+      if (handshakeGate) await handshakeGate
       if (handshakeFailure) throw new Error('compatibility handshake timeout')
       return responseForNonce(nonce)
     },
@@ -229,6 +234,9 @@ beforeEach(() => {
   globals.__loaderHost = undefined
   handshakeFailure = false
   tamperDigest = false
+  responseDescriptor = null
+  handshakeGate = null
+  handshakeStarted = null
   nextDescriptor = validateSpindleHostDescriptor({
     descriptorVersion: 1,
     lumiverseVersion: APP_VERSION,
@@ -268,10 +276,29 @@ describe('frontend loader host handshake', () => {
     expect(globals.__loaderMountCalls).toBe(0)
     expect(getLoadedExtensions().has(INSTALLATION_ID)).toBe(false)
   })
-  test('rejects stale local versions and mixed host descriptors before bundle or setup work', async () => {
+  test('does not resurrect a frontend unloaded during its compatibility handshake', async () => {
+    const gate = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    handshakeGate = gate.promise
+    handshakeStarted = started.resolve
+    const beforeBundles = bundleFetchCalls
+    const load = loadFrontendExtension(INSTALLATION_ID, manifest)
+    await started.promise
+    await unloadFrontendExtension(INSTALLATION_ID)
+    gate.resolve()
+    await load
+    expect(bundleFetchCalls).toBe(beforeBundles)
+    expect(globals.__loaderSetupCalls).toBe(0)
+    expect(globals.__loaderMountCalls).toBe(0)
+    expect(getLoadedExtensions().has(INSTALLATION_ID)).toBe(false)
+  })
+  test('enforces manifest minimums while accepting independently versioned host descriptors', async () => {
     globals.__APP_VERSION__ = '1.0.7'
     const beforeBundles = bundleFetchCalls
-    await expect(loadFrontendExtension(INSTALLATION_ID, manifest)).rejects.toMatchObject({ code: 'SPINDLE_COMPATIBILITY_ERROR' })
+    await expect(loadFrontendExtension(
+      INSTALLATION_ID,
+      { ...manifest, minimum_lumiverse_version: '1.0.8' },
+    )).rejects.toMatchObject({ code: 'SPINDLE_COMPATIBILITY_ERROR' })
     expect(bundleFetchCalls).toBe(beforeBundles)
     globals.__APP_VERSION__ = APP_VERSION
     nextDescriptor = validateSpindleHostDescriptor({
@@ -280,8 +307,19 @@ describe('frontend loader host handshake', () => {
       capabilities: { ...SPINDLE_HOST_CAPABILITIES, 'future-capability-v2': 3 },
       extensionInstallationId: INSTALLATION_ID,
     })
+    await loadFrontendExtension(INSTALLATION_ID, manifest)
+    expect(bundleFetchCalls).toBe(beforeBundles + 1)
+    expect(getLoadedExtensions().get(INSTALLATION_ID)?.context.host.lumiverseVersion).toBe('1.0.9')
+    await unloadFrontendExtension(INSTALLATION_ID)
+
+    nextDescriptor = validateSpindleHostDescriptor({
+      descriptorVersion: 1,
+      lumiverseVersion: APP_VERSION,
+      capabilities: { ...SPINDLE_HOST_CAPABILITIES, 'future-capability-v2': 3 },
+      extensionInstallationId: '223e4567-e89b-42d3-a456-426614174000',
+    })
     await expect(loadFrontendExtension(INSTALLATION_ID, manifest)).rejects.toMatchObject({ code: 'SPINDLE_COMPATIBILITY_ERROR' })
-    expect(bundleFetchCalls).toBe(beforeBundles)
+    expect(bundleFetchCalls).toBe(beforeBundles + 1)
   })
 
   test('uses the validated immutable descriptor and awaits async setup/readiness', async () => {
@@ -302,7 +340,24 @@ describe('frontend loader host handshake', () => {
     expect(globals.__loaderEvents).toEqual(['handshake', 'bundle', 'setup'])
   })
 
+  test('loads against an older compatible host capability subset', async () => {
+    const capabilities = { ...SPINDLE_HOST_CAPABILITIES } as Record<string, number>
+    delete capabilities['interceptor-final-response-v1']
+    nextDescriptor = validateSpindleHostDescriptor({
+      descriptorVersion: 1,
+      lumiverseVersion: APP_VERSION,
+      capabilities,
+      extensionInstallationId: INSTALLATION_ID,
+    })
+
+    await loadFrontendExtension(INSTALLATION_ID, manifest)
+    expect(getLoadedExtensions().has(INSTALLATION_ID)).toBe(true)
+    expect(globals.__loaderSetupCalls).toBe(1)
+    await unloadFrontendExtension(INSTALLATION_ID)
+  })
+
   test('cleans every resource and rejects setup failures', async () => {
+
     globals.__loaderMode = 'setup-reject'
     await expect(loadFrontendExtension(INSTALLATION_ID, manifest)).rejects.toThrow('setup rejected')
     expect(getLoadedExtensions().has(INSTALLATION_ID)).toBe(false)

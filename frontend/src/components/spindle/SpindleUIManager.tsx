@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { motion } from 'motion/react'
 import { X } from 'lucide-react'
@@ -17,37 +17,43 @@ function SpindleTextEditor() {
   const reqId = useStore((s) => s.pendingTextEditor?.requestId ?? null)
   const req = useStore((s) => s.pendingTextEditor)
   const closeTextEditor = useStore((s) => s.closeTextEditor)
-  const [value, setValue] = useState('')
+  const [draft, setDraft] = useState<{ requestId: string | null; value: string }>(() => ({
+    requestId: req?.requestId ?? null,
+    value: req?.value ?? '',
+  }))
+  const value = req && draft.requestId === req.requestId
+    ? draft.value
+    : req?.value ?? ''
   const reqRef = useRef(req)
   const valueRef = useRef(value)
   reqRef.current = req
   valueRef.current = value
 
-  useEffect(() => {
-    if (req) setValue(req.value ?? '')
-  }, [reqId, req])
+  const onChange = useCallback((nextValue: string) => {
+    if (!reqId) return
+    setDraft({ requestId: reqId, value: nextValue })
+  }, [reqId])
 
-  // Stable close handler — never changes identity, reads from refs
-  const handleClose = useRef(() => {
-    const r = reqRef.current
-    if (!r) return
-    closeTextEditor(r.requestId, valueRef.current, false)
-  })
-  handleClose.current = () => {
-    const r = reqRef.current
-    if (!r) return
-    closeTextEditor(r.requestId, valueRef.current, false)
-  }
+  const onClose = useCallback(() => {
+    const current = reqRef.current
+    if (!current || current.requestId !== reqId) return
+    closeTextEditor(reqId, valueRef.current, false)
+  }, [closeTextEditor, reqId])
 
-  const onClose = useCallback(() => handleClose.current(), [])
+  const onCancel = useCallback(() => {
+    const current = reqRef.current
+    if (!current || current.requestId !== reqId) return
+    closeTextEditor(reqId, current.value ?? '', true)
+  }, [closeTextEditor, reqId])
 
   if (!req) return null
 
   return (
     <ExpandedTextEditor
       value={value}
-      onChange={setValue}
+      onChange={onChange}
       onClose={onClose}
+      onCancel={onCancel}
       title={req.title}
       placeholder={req.placeholder}
     />

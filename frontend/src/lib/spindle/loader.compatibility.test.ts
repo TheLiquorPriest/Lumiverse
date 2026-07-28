@@ -24,7 +24,7 @@ test('frontend loader compatibility cases pass in an isolated module graph', asy
       .filter((line) => /^\d+ (?:pass|fail|skip)$/.test(line))
     try {
       expect(exitCode).toBe(0)
-      expect(summaryLines).toEqual(['7 pass', '0 fail'])
+      expect(summaryLines).toEqual(['9 pass', '0 fail'])
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
       throw new Error(`Isolated loader compatibility tests failed (${detail}):\n${output}`)

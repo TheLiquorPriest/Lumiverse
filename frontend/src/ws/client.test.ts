@@ -33,12 +33,19 @@ const windowMock = {
 class MockWebSocket {
   static readonly CONNECTING = 0
   static readonly OPEN = 1
+  static instances: MockWebSocket[] = []
 
   readyState = MockWebSocket.OPEN
   sent: string[] = []
   closeCalls = 0
+  onopen: (() => void) | null = null
+  onmessage: ((event: MessageEvent) => void) | null = null
+  onclose: ((event: CloseEvent) => void) | null = null
+  onerror: ((event: Event) => void) | null = null
 
-  constructor(_url: string) {}
+  constructor(_url: string) {
+    MockWebSocket.instances.push(this)
+  }
 
   send(payload: string) {
     this.sent.push(payload)
@@ -75,7 +82,7 @@ class MockWorker {
 ;(globalThis as any).WebSocket = MockWebSocket
 ;(globalThis as any).Worker = MockWorker
 
-const { WebSocketClient, shouldUseHeartbeatWorker } = await import('./client')
+const { WebSocketClient, shouldUseHeartbeatWorker, WS_CLOSE } = await import('./client')
 
 afterAll(() => {
   if (originalWindow === undefined) delete (globalThis as any).window
@@ -180,5 +187,56 @@ describe('WebSocketClient resume watchdog guard', () => {
     expect(socket.closeCalls).toBe(0)
     expect(client.ws).toBe(socket)
     client.disconnect()
+  })
+  test('ignores stale socket messages, opens, errors, and closes after replacement', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    client.startPing = () => undefined
+    client.stopPing = () => undefined
+    client.startVisibilityTracking = () => undefined
+    client.stopVisibilityTracking = () => undefined
+    const received: string[] = []
+    client.on('SPINDLE_TEXT_EDITOR_RESULT', (payload: { requestId: string }) => {
+      received.push(payload.requestId)
+    })
+
+    client.connect()
+    const first = MockWebSocket.instances.at(-1)!
+    first.onopen?.()
+    client.ws = null
+    client.connect()
+    const second = MockWebSocket.instances.at(-1)!
+    second.onopen?.()
+
+    first.onmessage?.({
+      data: JSON.stringify({
+        event: 'SPINDLE_TEXT_EDITOR_RESULT',
+        payload: { requestId: 'stale' },
+      }),
+    } as MessageEvent)
+    first.onclose?.({ code: 1006, reason: 'stale' } as CloseEvent)
+    first.onerror?.(new Event('error'))
+    expect(received).toEqual([])
+
+    second.onmessage?.({
+      data: JSON.stringify({
+        event: 'SPINDLE_TEXT_EDITOR_RESULT',
+        payload: { requestId: 'current' },
+      }),
+    } as MessageEvent)
+    expect(received).toEqual(['current'])
+    client.disconnect()
+  })
+
+  test('returns send acceptance and emits terminal close on explicit disconnect', () => {
+    const client = makeClient()
+    const closePayloads: Array<{ code: number; reason: string }> = []
+    client.on(WS_CLOSE, (payload: { code: number; reason: string }) => {
+      closePayloads.push(payload)
+    })
+
+    expect(client.send({ type: 'editor-result' })).toBe(true)
+    client.disconnect()
+    expect(closePayloads).toEqual([{ code: 1000, reason: 'client disconnect' }])
+    expect(client.send({ type: 'editor-result' })).toBe(false)
   })
 })

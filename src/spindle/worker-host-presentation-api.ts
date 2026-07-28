@@ -46,9 +46,200 @@ export type WorkerHostPresentationApiContext = {
   post: (message: any) => void;
 };
 
+type PendingTextEditor = {
+  key: string;
+  workerRequestId: string;
+  eventRequestId: string;
+  userId: string;
+  initialValue: string;
+  connectionId: string | null;
+  active: boolean;
+  opened: boolean;
+  unsubscribe?: () => void;
+  unsubscribeConnection?: () => void;
+  releaseLease: () => void;
+};
+
+type TextEditorLeaseWaiter = {
+  readonly userId: string;
+  readonly resolve: (acquired: boolean) => void;
+  state: "waiting" | "active" | "cancelled";
+};
+
+const MAX_TEXT_EDITOR_REQUESTS_PER_USER = 32;
+const MAX_TEXT_EDITOR_VALUE_LENGTH = 1_048_576;
+const MAX_TEXT_EDITOR_TITLE_LENGTH = 256;
+const MAX_TEXT_EDITOR_PLACEHOLDER_LENGTH = 4_096;
+const MAX_PRESENTATION_REQUEST_ID_LENGTH = 128;
+const MAX_PRESENTATION_MODAL_REQUEST_ID_LENGTH = 256;
+const MAX_PRESENTATION_EVENT_REQUEST_ID_LENGTH = 512;
+const MAX_PRESENTATION_TITLE_LENGTH = 256;
+const MAX_PRESENTATION_MESSAGE_LENGTH = 1_048_576;
+const MAX_PRESENTATION_LABEL_LENGTH = 256;
+const MAX_PRESENTATION_PLACEHOLDER_LENGTH = 4_096;
+const MAX_PRESENTATION_VALUE_LENGTH = 1_048_576;
+
+type PresentationKind = "modal" | "confirm" | "input";
+type PresentationResult =
+  | { kind: "modal"; dismissedBy: "user" | "extension" | "cleanup" }
+  | { kind: "confirm"; confirmed: boolean }
+  | { kind: "input"; value: string | null; cancelled: boolean };
+
+type PendingPresentation = {
+  key: string;
+  kind: PresentationKind;
+  workerRequestId: string;
+  eventRequestId: string;
+  userId: string;
+  unsubscribe?: () => void;
+};
+
+function validatePresentationRequestId(value: unknown, label = "requestId"): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_PRESENTATION_REQUEST_ID_LENGTH ||
+    !/^[A-Za-z0-9_-]+$/.test(value)
+  ) {
+    throw new Error(`${label} must be a bounded ASCII token`);
+  }
+}
+
+function validatePresentationEventRequestId(value: unknown): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_PRESENTATION_EVENT_REQUEST_ID_LENGTH ||
+    /[\u0000-\u001F\u007F]/.test(value)
+  ) {
+    throw new Error("Presentation request identity must be a bounded string");
+  }
+}
+
+function validatePresentationHandleId(value: unknown, label: string): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_PRESENTATION_MODAL_REQUEST_ID_LENGTH ||
+    /[\u0000-\u001F\u007F]/.test(value)
+  ) {
+    throw new Error(`${label} must be a bounded string`);
+  }
+}
+
+function validatePresentationText(value: unknown, label: string, maxLength: number): string {
+  if (typeof value !== "string" || value.length > maxLength) {
+    throw new Error(`Presentation ${label} must be a bounded string`);
+  }
+  return value;
+}
+
+function validateOptionalPresentationText(
+  value: unknown,
+  label: string,
+  maxLength: number,
+): string | undefined {
+  return value === undefined ? undefined : validatePresentationText(value, label, maxLength);
+}
+
+function parsePresentationResult(
+  kind: PresentationKind,
+  eventRequestId: string,
+  payload: unknown,
+): PresentationResult | null {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const result = payload as Record<string, unknown>;
+  if (result.requestId !== eventRequestId) return null;
+  if (kind === "modal") {
+    const dismissedBy = result.dismissedBy;
+    if (dismissedBy !== "user" && dismissedBy !== "extension" && dismissedBy !== "cleanup") return null;
+    return { kind, dismissedBy };
+  }
+  if (kind === "confirm") {
+    return typeof result.confirmed === "boolean"
+      ? { kind, confirmed: result.confirmed }
+      : null;
+  }
+  if (typeof result.cancelled !== "boolean" || !("value" in result)) return null;
+  if (result.cancelled) {
+    return result.value === null ? { kind, value: null, cancelled: true } : null;
+  }
+  return typeof result.value === "string" && result.value.length <= MAX_PRESENTATION_VALUE_LENGTH
+    ? { kind, value: result.value, cancelled: false }
+    : null;
+}
+const activeTextEditorLeases = new Map<string, TextEditorLeaseWaiter>();
+const waitingTextEditorLeases = new Map<string, TextEditorLeaseWaiter[]>();
+
+function activateNextTextEditor(userId: string): void {
+  const queue = waitingTextEditorLeases.get(userId);
+  while (queue && queue.length > 0) {
+    const next = queue.shift()!;
+    if (next.state !== "waiting") continue;
+    if (queue.length === 0) waitingTextEditorLeases.delete(userId);
+    next.state = "active";
+    activeTextEditorLeases.set(userId, next);
+    next.resolve(true);
+    return;
+  }
+  waitingTextEditorLeases.delete(userId);
+}
+
+function requestTextEditorLease(
+  userId: string,
+): Readonly<{ acquired: Promise<boolean>; cancel: () => void }> {
+  const queue = waitingTextEditorLeases.get(userId) ?? [];
+  if ((activeTextEditorLeases.has(userId) ? 1 : 0) + queue.length >= MAX_TEXT_EDITOR_REQUESTS_PER_USER) {
+    return Object.freeze({ acquired: Promise.resolve(false), cancel: () => {} });
+  }
+  let resolve!: (acquired: boolean) => void;
+  const acquired = new Promise<boolean>((settle) => { resolve = settle; });
+  const waiter: TextEditorLeaseWaiter = { userId, resolve, state: "waiting" };
+  const cancel = (): void => {
+    if (waiter.state === "cancelled") return;
+    const wasActive = waiter.state === "active" && activeTextEditorLeases.get(userId) === waiter;
+    waiter.state = "cancelled";
+    if (wasActive) {
+      activeTextEditorLeases.delete(userId);
+      activateNextTextEditor(userId);
+      return;
+    }
+    const pending = waitingTextEditorLeases.get(userId);
+    if (pending) {
+      const index = pending.indexOf(waiter);
+      if (index >= 0) pending.splice(index, 1);
+      if (pending.length === 0) waitingTextEditorLeases.delete(userId);
+    }
+    resolve(false);
+  };
+  if (!activeTextEditorLeases.has(userId)) {
+    waiter.state = "active";
+    activeTextEditorLeases.set(userId, waiter);
+    resolve(true);
+  } else {
+    queue.push(waiter);
+    waitingTextEditorLeases.set(userId, queue);
+  }
+  return Object.freeze({ acquired, cancel });
+}
+
+function cancelQueuedTextEditorsForDisconnectedUser(userId: string): void {
+  const queue = waitingTextEditorLeases.get(userId);
+  waitingTextEditorLeases.delete(userId);
+  for (const waiter of queue ?? []) {
+    waiter.state = "cancelled";
+    waiter.resolve(false);
+  }
+}
+
+eventBus.onUserDisconnected(cancelQueuedTextEditorsForDisconnectedUser);
+
 /** Owns frontend/presentation-facing Spindle APIs and their per-user style state. */
 export class WorkerHostPresentationApi {
   private chatStyleModes = new Map<string, Map<string, "bounded" | "extension-relaxed">>();
+  private pendingTextEditors = new Map<string, PendingTextEditor>();
+  private pendingPresentations = new Map<string, PendingPresentation>();
+  private presentationDisconnectUnsubscribe: (() => void) | null = null;
   constructor(private readonly context: WorkerHostPresentationApiContext) {}
   private get extensionId(): string { return this.context.extensionId; }
   private get manifest(): SpindleManifest { return this.context.manifest; }
@@ -58,6 +249,147 @@ export class WorkerHostPresentationApi {
   private resolveEffectiveUserId(userId?: string): string { return this.context.resolveEffectiveUserId(userId); }
   private enforceScopedUser(userId: string | null | undefined): void { this.context.enforceScopedUser(userId); }
   private postToWorker(message: any): void { this.context.post(message); }
+
+  private ensurePresentationDisconnectListener(): void {
+    if (this.presentationDisconnectUnsubscribe !== null) return;
+    this.presentationDisconnectUnsubscribe = eventBus.onUserDisconnected((userId) => {
+      for (const pending of [...this.pendingPresentations.values()]) {
+        if (pending.userId !== userId) continue;
+        this.settlePendingPresentation(pending, this.cleanupPresentationResult(pending.kind), false);
+      }
+    });
+  }
+
+  private releasePresentationDisconnectListener(): void {
+    if (this.pendingPresentations.size > 0) return;
+    const unsubscribe = this.presentationDisconnectUnsubscribe;
+    this.presentationDisconnectUnsubscribe = null;
+    try { unsubscribe?.(); } catch { /* cleanup is best effort */ }
+  }
+
+  private presentationKey(kind: PresentationKind, userId: string, eventRequestId: string): string {
+    return `${kind}\u0000${userId}\u0000${eventRequestId}`;
+  }
+
+  private presentationEventType(kind: PresentationKind): EventType {
+    if (kind === "modal") return EventType.SPINDLE_MODAL_RESULT;
+    if (kind === "confirm") return EventType.SPINDLE_CONFIRM_RESULT;
+    return EventType.SPINDLE_INPUT_PROMPT_RESULT;
+  }
+
+  private cleanupPresentationResult(kind: PresentationKind): PresentationResult {
+    if (kind === "modal") return { kind, dismissedBy: "cleanup" };
+    if (kind === "confirm") return { kind, confirmed: false };
+    return { kind, value: null, cancelled: true };
+  }
+
+  private registerPendingPresentation(
+    kind: PresentationKind,
+    workerRequestId: string,
+    eventRequestId: string,
+    userId: string,
+  ): PendingPresentation {
+    const key = this.presentationKey(kind, userId, eventRequestId);
+    if (this.pendingPresentations.has(key)) {
+      throw new Error("Presentation request identity is already active");
+    }
+    this.ensurePresentationDisconnectListener();
+    const pending: PendingPresentation = {
+      key,
+      kind,
+      workerRequestId,
+      eventRequestId,
+      userId,
+    };
+    this.pendingPresentations.set(key, pending);
+    pending.unsubscribe = eventBus.on(this.presentationEventType(kind), (message) => {
+      if (this.pendingPresentations.get(key) !== pending || message.userId !== pending.userId) return;
+      const result = parsePresentationResult(kind, eventRequestId, message.payload);
+      if (result === null) return;
+      this.settlePendingPresentation(pending, result, false);
+    });
+    return pending;
+  }
+
+  private abandonPendingPresentation(pending: PendingPresentation): void {
+    if (this.pendingPresentations.get(pending.key) !== pending) return;
+    this.pendingPresentations.delete(pending.key);
+    try { pending.unsubscribe?.(); } catch { /* cleanup is best effort */ }
+    this.releasePresentationDisconnectListener();
+  }
+
+  private settlePendingPresentation(
+    pending: PendingPresentation,
+    result: PresentationResult,
+    notifyFrontend: boolean,
+  ): void {
+    if (
+      this.pendingPresentations.get(pending.key) !== pending ||
+      result.kind !== pending.kind
+    ) return;
+    this.pendingPresentations.delete(pending.key);
+    try { pending.unsubscribe?.(); } catch { /* cleanup is best effort */ }
+    try {
+      if (result.kind === "modal") {
+        this.postToWorker({
+          type: "response",
+          requestId: pending.workerRequestId,
+          result: { dismissedBy: result.dismissedBy },
+        });
+      } else if (result.kind === "confirm") {
+        this.postToWorker({
+          type: "response",
+          requestId: pending.workerRequestId,
+          result: { confirmed: result.confirmed },
+        });
+      } else {
+        this.postToWorker({
+          type: "response",
+          requestId: pending.workerRequestId,
+          result: { value: result.value, cancelled: result.cancelled },
+        });
+      }
+    } catch {
+      // The worker may already be gone during host teardown.
+    }
+    if (notifyFrontend) {
+      try {
+        if (result.kind === "modal") {
+          eventBus.emit(
+            EventType.SPINDLE_MODAL_RESULT,
+            { requestId: pending.eventRequestId, dismissedBy: result.dismissedBy },
+            pending.userId,
+          );
+        } else if (result.kind === "confirm") {
+          eventBus.emit(
+            EventType.SPINDLE_CONFIRM_RESULT,
+            { requestId: pending.eventRequestId, confirmed: result.confirmed },
+            pending.userId,
+          );
+        } else {
+          eventBus.emit(
+            EventType.SPINDLE_INPUT_PROMPT_RESULT,
+            {
+              requestId: pending.eventRequestId,
+              value: result.value,
+              cancelled: result.cancelled,
+            },
+            pending.userId,
+          );
+        }
+      } catch {
+        // Socket teardown must not prevent worker settlement.
+      }
+    }
+    this.releasePresentationDisconnectListener();
+  }
+
+  clearPresentationRequests(): void {
+    for (const pending of [...this.pendingPresentations.values()]) {
+      this.settlePendingPresentation(pending, this.cleanupPresentationResult(pending.kind), true);
+    }
+    this.releasePresentationDisconnectListener();
+  }
 
   handleUIGetDrawerTabs(requestId: string, userId?: string): void {
     try {
@@ -392,48 +724,210 @@ export class WorkerHostPresentationApi {
     }
   }
 
-  handleTextEditorOpen(
+  async handleTextEditorOpen(
     requestId: string,
+    editorRequestId?: string,
     title?: string,
     value?: string,
     placeholder?: string,
     userId?: string,
-  ): void {
+  ): Promise<void> {
+    let pending: PendingTextEditor | undefined;
     try {
+      this.validateTextEditorRequestId(requestId);
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
-
-      const editorRequestId = `spindle-editor:${this.extensionId}:${requestId}`;
-
-      // Listen for the result from the frontend
-      const unsub = eventBus.on(EventType.SPINDLE_TEXT_EDITOR_RESULT, (msg) => {
-        if (msg.payload?.requestId !== editorRequestId) return;
-        unsub();
+      const resolvedEditorRequestId = editorRequestId === undefined ? requestId : editorRequestId;
+      this.validateTextEditorRequestId(resolvedEditorRequestId);
+      const initialValue = this.validateTextEditorText(value === undefined ? "" : value, "value", MAX_TEXT_EDITOR_VALUE_LENGTH);
+      const resolvedTitle = this.validateTextEditorText(title === undefined ? "Edit Text" : title, "title", MAX_TEXT_EDITOR_TITLE_LENGTH);
+      const resolvedPlaceholder = this.validateTextEditorText(placeholder === undefined ? "" : placeholder, "placeholder", MAX_TEXT_EDITOR_PLACEHOLDER_LENGTH);
+      const key = this.textEditorKey(resolvedUserId, resolvedEditorRequestId);
+      if (this.pendingTextEditors.has(key)) throw new Error("Text editor request identity is already active");
+      if (!eventBus.isUserConnected(resolvedUserId)) {
         this.postToWorker({
           type: "response",
           requestId,
-          result: {
-            text: msg.payload.text ?? value ?? "",
-            cancelled: !!msg.payload.cancelled,
-          },
+          result: { text: initialValue, cancelled: true },
         });
+        return;
+      }
+      const eventRequestId = `spindle-editor:${this.extensionId}:${requestId}`;
+      const lease = requestTextEditorLease(resolvedUserId);
+      pending = {
+        key,
+        workerRequestId: requestId,
+        eventRequestId,
+        userId: resolvedUserId,
+        initialValue,
+        connectionId: null,
+        active: false,
+        opened: false,
+        releaseLease: lease.cancel,
+      };
+      this.pendingTextEditors.set(key, pending);
+      const acquired = await lease.acquired;
+      if (this.pendingTextEditors.get(key) !== pending) {
+        lease.cancel();
+        return;
+      }
+      if (!acquired) {
+        this.completePendingTextEditor(pending, initialValue, true, false);
+        return;
+      }
+
+      const connectionId = eventBus.getPreferredUserConnectionId(resolvedUserId);
+      if (!connectionId) {
+        this.completePendingTextEditor(pending, initialValue, true, false);
+        return;
+      }
+
+      pending.connectionId = connectionId;
+      pending.active = true;
+      pending.unsubscribeConnection = eventBus.onConnectionDisconnected(
+        (disconnectedUserId, disconnectedConnectionId) => {
+          const current = this.pendingTextEditors.get(key);
+          if (
+            current === undefined ||
+            current !== pending ||
+            disconnectedUserId !== current.userId ||
+            disconnectedConnectionId !== current.connectionId
+          ) return;
+          this.cancelPendingTextEditor(current);
+        },
+      );
+      pending.unsubscribe = eventBus.on(EventType.SPINDLE_TEXT_EDITOR_RESULT, (msg) => {
+        const current = this.pendingTextEditors.get(key);
+        if (current === undefined || current !== pending) return;
+        if (
+          msg.userId !== current.userId ||
+          msg.payload?.requestId !== current.eventRequestId ||
+          msg.payload?.connectionId !== current.connectionId ||
+          typeof msg.payload.cancelled !== "boolean" ||
+          typeof msg.payload.text !== "string" ||
+          msg.payload.text.length > MAX_TEXT_EDITOR_VALUE_LENGTH
+        ) return;
+        const cancelled = msg.payload.cancelled;
+        this.completePendingTextEditor(
+          current,
+          cancelled ? current.initialValue : msg.payload.text,
+          cancelled,
+          true,
+        );
       });
 
-      // Send the open request to the user's frontend
-      eventBus.emit(
+      const delivered = eventBus.emitToUserConnection(
         EventType.SPINDLE_TEXT_EDITOR_OPEN,
         {
-          requestId: editorRequestId,
+          requestId: eventRequestId,
           extensionId: this.extensionId,
-          title: title ?? "Edit Text",
-          value: value ?? "",
-          placeholder: placeholder ?? "",
+          title: resolvedTitle,
+          value: initialValue,
+          placeholder: resolvedPlaceholder,
         },
         resolvedUserId,
+        connectionId,
       );
+      if (!delivered) {
+        this.completePendingTextEditor(pending, initialValue, true, false);
+        return;
+      }
+      pending.opened = true;
+    } catch (err: unknown) {
+      if (pending !== undefined) this.dropPendingTextEditor(pending, true);
+      const message = err instanceof Error ? err.message : String(err);
+      this.postToWorker({ type: "response", requestId, error: message });
+    }
+  }
+
+  handleTextEditorClose(requestId: string, editorRequestId: string, userId?: string): void {
+    try {
+      this.validateTextEditorRequestId(requestId);
+      const resolvedUserId = this.resolveEffectiveUserId(userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.validateTextEditorRequestId(editorRequestId);
+      const pending = this.pendingTextEditors.get(this.textEditorKey(resolvedUserId, editorRequestId));
+      if (pending !== undefined) this.cancelPendingTextEditor(pending);
+      this.postToWorker({ type: "response", requestId, result: undefined });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
     }
+  }
+
+  clearTextEditors(): void {
+    for (const pending of [...this.pendingTextEditors.values()]) {
+      this.cancelPendingTextEditor(pending);
+    }
+  }
+
+  private cancelPendingTextEditor(pending: PendingTextEditor): void {
+    this.completePendingTextEditor(pending, pending.initialValue, true, pending.opened);
+  }
+
+  private completePendingTextEditor(
+    pending: PendingTextEditor,
+    text: string,
+    cancelled: boolean,
+    notifyFrontend: boolean,
+  ): void {
+    if (this.pendingTextEditors.get(pending.key) !== pending) return;
+    this.dropPendingTextEditor(pending, false);
+    try {
+      this.postToWorker({
+        type: "response",
+        requestId: pending.workerRequestId,
+        result: { text: cancelled ? pending.initialValue : text, cancelled },
+      });
+    } catch {
+      // The worker may already be gone during host teardown.
+    }
+    if (!notifyFrontend || !pending.opened || !pending.connectionId) return;
+    try {
+      eventBus.emitToUserConnection(
+        EventType.SPINDLE_TEXT_EDITOR_RESULT,
+        { requestId: pending.eventRequestId, text: cancelled ? pending.initialValue : text, cancelled },
+        pending.userId,
+        pending.connectionId,
+      );
+    } catch {
+      // Socket teardown must not prevent the remaining editors from closing.
+    }
+  }
+
+  private dropPendingTextEditor(pending: PendingTextEditor, notifyFrontend: boolean): void {
+    if (this.pendingTextEditors.get(pending.key) !== pending) return;
+    this.pendingTextEditors.delete(pending.key);
+    try { pending.unsubscribe?.(); } catch { /* cleanup is best effort */ }
+    try { pending.unsubscribeConnection?.(); } catch { /* cleanup is best effort */ }
+    try { pending.releaseLease(); } catch { /* queue cleanup is best effort */ }
+    if (!notifyFrontend || !pending.opened || !pending.connectionId) return;
+    try {
+      eventBus.emitToUserConnection(
+        EventType.SPINDLE_TEXT_EDITOR_RESULT,
+        { requestId: pending.eventRequestId, text: pending.initialValue, cancelled: true },
+        pending.userId,
+        pending.connectionId,
+      );
+    } catch {
+      // A failed open cannot leave a frontend editor mounted.
+    }
+  }
+
+  private textEditorKey(userId: string, editorRequestId: string): string {
+    return `${userId}\u0000${editorRequestId}`;
+  }
+
+  private validateTextEditorRequestId(editorRequestId: unknown): asserts editorRequestId is string {
+    if (typeof editorRequestId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(editorRequestId)) {
+      throw new Error("Text editor request identity must be a bounded ASCII token");
+    }
+  }
+
+  private validateTextEditorText(value: unknown, label: string, maxLength: number): string {
+    if (typeof value !== "string" || value.length > maxLength) {
+      throw new Error(`Text editor ${label} must be a bounded string`);
+    }
+    return value;
   }
 
   // ─── Modal (free tier) ──────────────────────────────────────────────
@@ -441,47 +935,64 @@ export class WorkerHostPresentationApi {
   handleModalOpen(
     requestId: string,
     title: string,
-    items: any[],
+    items: unknown[],
     width?: number,
     maxHeight?: number,
     persistent?: boolean,
     userId?: string,
     callerModalRequestId?: string,
   ): void {
+    let pending: PendingPresentation | undefined;
     try {
+      validatePresentationRequestId(requestId);
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
-
-      const modalRequestId = callerModalRequestId
-        ? `spindle-modal:${this.extensionId}:${callerModalRequestId}`
-        : `spindle-modal:${this.extensionId}:${requestId}`;
-
-      const unsub = eventBus.on(EventType.SPINDLE_MODAL_RESULT, (msg) => {
-        if (msg.payload?.requestId !== modalRequestId) return;
-        unsub();
+      const resolvedTitle = validatePresentationText(title, "title", MAX_PRESENTATION_TITLE_LENGTH);
+      if (!Array.isArray(items)) throw new Error("Presentation items must be an array");
+      if (width !== undefined && (typeof width !== "number" || !Number.isFinite(width))) {
+        throw new Error("Presentation width must be a finite number");
+      }
+      if (maxHeight !== undefined && (typeof maxHeight !== "number" || !Number.isFinite(maxHeight))) {
+        throw new Error("Presentation maxHeight must be a finite number");
+      }
+      if (persistent !== undefined && typeof persistent !== "boolean") {
+        throw new Error("Presentation persistent must be a boolean");
+      }
+      const callerRequestId = callerModalRequestId === undefined
+        ? requestId
+        : callerModalRequestId;
+      if (callerModalRequestId !== undefined) {
+        validatePresentationHandleId(callerRequestId, "modalRequestId");
+      }
+      const modalRequestId = `spindle-modal:${this.extensionId}:${callerRequestId}`;
+      validatePresentationEventRequestId(modalRequestId);
+      if (!eventBus.isUserConnected(resolvedUserId)) {
         this.postToWorker({
           type: "response",
           requestId,
-          result: { dismissedBy: msg.payload.dismissedBy ?? "user" },
+          result: { dismissedBy: "cleanup" },
         });
-      });
-
+        return;
+      }
+      pending = this.registerPendingPresentation("modal", requestId, modalRequestId, resolvedUserId);
       eventBus.emit(
         EventType.SPINDLE_MODAL_OPEN,
         {
           requestId: modalRequestId,
           extensionId: this.extensionId,
           extensionName: this.manifest.name,
-          title,
+          title: resolvedTitle,
           items,
           width,
           maxHeight,
-          persistent: persistent ?? false,
+          persistent: persistent === undefined ? false : persistent,
         },
         resolvedUserId,
       );
-    } catch (err: any) {
-      this.postToWorker({ type: "response", requestId, error: err.message });
+    } catch (err: unknown) {
+      if (pending !== undefined) this.abandonPendingPresentation(pending);
+      const message = err instanceof Error ? err.message : String(err);
+      this.postToWorker({ type: "response", requestId, error: message });
     }
   }
 
@@ -491,20 +1002,22 @@ export class WorkerHostPresentationApi {
     userId?: string,
   ): void {
     try {
+      validatePresentationRequestId(requestId);
+      validatePresentationHandleId(openRequestId, "openRequestId");
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
-
       const modalRequestId = `spindle-modal:${this.extensionId}:${openRequestId}`;
-
-      eventBus.emit(
-        EventType.SPINDLE_MODAL_RESULT,
-        { requestId: modalRequestId, dismissedBy: "extension" },
-        resolvedUserId,
+      validatePresentationEventRequestId(modalRequestId);
+      const pending = this.pendingPresentations.get(
+        this.presentationKey("modal", resolvedUserId, modalRequestId),
       );
-
+      if (pending !== undefined) {
+        this.settlePendingPresentation(pending, { kind: "modal", dismissedBy: "extension" }, true);
+      }
       this.postToWorker({ type: "response", requestId, result: undefined });
-      } catch (err: any) {
-      this.postToWorker({ type: "response", requestId, error: err.message });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.postToWorker({ type: "response", requestId, error: message });
     }
   }
 
@@ -517,38 +1030,53 @@ export class WorkerHostPresentationApi {
     cancelLabel?: string,
     userId?: string,
   ): void {
+    let pending: PendingPresentation | undefined;
     try {
+      validatePresentationRequestId(requestId);
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
-
+      const resolvedTitle = validatePresentationText(title, "title", MAX_PRESENTATION_TITLE_LENGTH);
+      const resolvedMessage = validatePresentationText(message, "message", MAX_PRESENTATION_MESSAGE_LENGTH);
+      const resolvedVariant = variant === undefined ? "info" : variant;
+      if (
+        resolvedVariant !== "info" &&
+        resolvedVariant !== "warning" &&
+        resolvedVariant !== "danger" &&
+        resolvedVariant !== "success"
+      ) {
+        throw new Error("Presentation confirm variant is invalid");
+      }
+      const resolvedConfirmLabel = confirmLabel === undefined
+        ? "Confirm"
+        : validatePresentationText(confirmLabel, "confirmLabel", MAX_PRESENTATION_LABEL_LENGTH);
+      const resolvedCancelLabel = cancelLabel === undefined
+        ? "Cancel"
+        : validatePresentationText(cancelLabel, "cancelLabel", MAX_PRESENTATION_LABEL_LENGTH);
       const confirmRequestId = `spindle-confirm:${this.extensionId}:${requestId}`;
-
-      const unsub = eventBus.on(EventType.SPINDLE_CONFIRM_RESULT, (msg) => {
-        if (msg.payload?.requestId !== confirmRequestId) return;
-        unsub();
-        this.postToWorker({
-          type: "response",
-          requestId,
-          result: { confirmed: !!msg.payload.confirmed },
-        });
-      });
-
+      validatePresentationEventRequestId(confirmRequestId);
+      if (!eventBus.isUserConnected(resolvedUserId)) {
+        this.postToWorker({ type: "response", requestId, result: { confirmed: false } });
+        return;
+      }
+      pending = this.registerPendingPresentation("confirm", requestId, confirmRequestId, resolvedUserId);
       eventBus.emit(
         EventType.SPINDLE_CONFIRM_OPEN,
         {
           requestId: confirmRequestId,
           extensionId: this.extensionId,
           extensionName: this.manifest.name,
-          title,
-          message,
-          variant: variant ?? "info",
-          confirmLabel: confirmLabel ?? "Confirm",
-          cancelLabel: cancelLabel ?? "Cancel",
+          title: resolvedTitle,
+          message: resolvedMessage,
+          variant: resolvedVariant,
+          confirmLabel: resolvedConfirmLabel,
+          cancelLabel: resolvedCancelLabel,
         },
         resolvedUserId,
       );
-    } catch (err: any) {
-      this.postToWorker({ type: "response", requestId, error: err.message });
+    } catch (err: unknown) {
+      if (pending !== undefined) this.abandonPendingPresentation(pending);
+      const message = err instanceof Error ? err.message : String(err);
+      this.postToWorker({ type: "response", requestId, error: message });
     }
   }
 
@@ -563,43 +1091,65 @@ export class WorkerHostPresentationApi {
     multiline?: boolean,
     userId?: string,
   ): void {
+    let pending: PendingPresentation | undefined;
     try {
+      validatePresentationRequestId(requestId);
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
-
+      const resolvedTitle = validatePresentationText(title, "title", MAX_PRESENTATION_TITLE_LENGTH);
+      const resolvedMessage = validateOptionalPresentationText(
+        message,
+        "message",
+        MAX_PRESENTATION_MESSAGE_LENGTH,
+      );
+      const resolvedPlaceholder = validateOptionalPresentationText(
+        placeholder,
+        "placeholder",
+        MAX_PRESENTATION_PLACEHOLDER_LENGTH,
+      );
+      const resolvedDefaultValue = defaultValue === undefined
+        ? undefined
+        : validatePresentationText(defaultValue, "defaultValue", MAX_PRESENTATION_VALUE_LENGTH);
+      const resolvedSubmitLabel = submitLabel === undefined
+        ? "Submit"
+        : validatePresentationText(submitLabel, "submitLabel", MAX_PRESENTATION_LABEL_LENGTH);
+      const resolvedCancelLabel = cancelLabel === undefined
+        ? "Cancel"
+        : validatePresentationText(cancelLabel, "cancelLabel", MAX_PRESENTATION_LABEL_LENGTH);
+      if (multiline !== undefined && typeof multiline !== "boolean") {
+        throw new Error("Presentation multiline must be a boolean");
+      }
       const promptRequestId = `spindle-input-prompt:${this.extensionId}:${requestId}`;
-
-      const unsub = eventBus.on(EventType.SPINDLE_INPUT_PROMPT_RESULT, (msg) => {
-        if (msg.payload?.requestId !== promptRequestId) return;
-        unsub();
+      validatePresentationEventRequestId(promptRequestId);
+      if (!eventBus.isUserConnected(resolvedUserId)) {
         this.postToWorker({
           type: "response",
           requestId,
-          result: {
-            value: msg.payload.cancelled ? null : (msg.payload.value ?? null),
-            cancelled: !!msg.payload.cancelled,
-          },
+          result: { value: null, cancelled: true },
         });
-      });
-
+        return;
+      }
+      pending = this.registerPendingPresentation("input", requestId, promptRequestId, resolvedUserId);
       eventBus.emit(
         EventType.SPINDLE_INPUT_PROMPT_OPEN,
         {
           requestId: promptRequestId,
           extensionId: this.extensionId,
           extensionName: this.manifest.name,
-          title,
-          message,
-          placeholder,
-          defaultValue,
-          submitLabel: submitLabel ?? "Submit",
-          cancelLabel: cancelLabel ?? "Cancel",
-          multiline: !!multiline,
+          title: resolvedTitle,
+          message: resolvedMessage,
+          placeholder: resolvedPlaceholder,
+          defaultValue: resolvedDefaultValue,
+          submitLabel: resolvedSubmitLabel,
+          cancelLabel: resolvedCancelLabel,
+          multiline: multiline === undefined ? false : multiline,
         },
         resolvedUserId,
       );
-    } catch (err: any) {
-      this.postToWorker({ type: "response", requestId, error: err.message });
+    } catch (err: unknown) {
+      if (pending !== undefined) this.abandonPendingPresentation(pending);
+      const message = err instanceof Error ? err.message : String(err);
+      this.postToWorker({ type: "response", requestId, error: message });
     }
   }
 

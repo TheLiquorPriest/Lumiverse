@@ -58,6 +58,7 @@ import {
   type InterceptorPrivateState,
   type CompiledInterceptorMatcher,
   createInterceptorTerminalLease,
+  cloneTerminalGuidance,
   type InterceptorTerminalLease,
 } from "./lifecycle";
 import {
@@ -1001,29 +1002,13 @@ function extractReasoningBindingsDTO(
   };
 }
 
-function narrowDeferredGuidance(value: unknown): DeferredGuidanceDTO[] | undefined {
-  if (value === undefined || !Array.isArray(value)) return undefined;
-  const entries: unknown[] = value;
-  const guidance: DeferredGuidanceDTO[] = [];
-  for (const entry of entries) {
-    if (!isRecordValue(entry)) return undefined;
-    if (Object.keys(entry).some((key) => key !== "id" && key !== "content" && key !== "role")) {
-      return undefined;
-    }
-    if (
-      typeof entry.id !== "string" ||
-      typeof entry.content !== "string" ||
-      entry.role !== "system"
-    ) {
-      return undefined;
-    }
-    guidance.push({
-      id: entry.id,
-      content: entry.content,
-      role: "system",
-    });
+export function narrowDeferredGuidance(value: unknown): DeferredGuidanceDTO[] | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return [...cloneTerminalGuidance(value)];
+  } catch {
+    return undefined;
   }
-  return guidance;
 }
 
 function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
@@ -1057,6 +1042,12 @@ type BoundOperationController = {
   teardownRequested: boolean;
 };
 
+type PendingWorkerRequest = {
+  readonly permission?: string | readonly string[];
+  readonly resolve: (value: unknown) => void;
+  readonly reject: (reason: unknown) => void;
+};
+
 const BOUND_CONTAINMENT_WORKER_ABORT_REASON = "Bound interceptor invocation aborted";
 type HostInterceptorInvocation = {
   readonly requestId: string;
@@ -1064,6 +1055,8 @@ type HostInterceptorInvocation = {
   readonly generation: string;
   readonly workerId: string;
   readonly runtimeGeneration: string;
+  readonly interceptorPermissionGrantId?: string;
+  readonly finalResponsePermissionGrantId?: string;
   readonly inputMessages: readonly LlmMessageDTO[];
   boundToken?: string;
   readonly controller: AbortController;
@@ -1089,10 +1082,7 @@ export class WorkerHost {
   private runtime: RuntimeTransport | null = null;
   private runtimeToken: symbol | null = null;
   private eventUnsubscribers = new Map<string, () => void>();
-  private pendingRequests = new Map<
-    string,
-    { resolve: (value: unknown) => void; reject: (reason: unknown) => void }
-  >();
+  private pendingRequests = new Map<string, PendingWorkerRequest>();
   /**
    * AbortControllers for in-flight generation and assembly calls, keyed by the
    * worker-supplied `requestId`. The worker posts `cancel_generation` with the
@@ -1122,9 +1112,11 @@ export class WorkerHost {
   private static readonly FRONTEND_MESSAGE_SCOPE_TIMEOUT_MS = 30_000;
   private onWorkerReady: ((error?: Error) => void) | null = null;
   private onWorkerShutdownAck: (() => void) | null = null;
-  private onRuntimeExit: (() => void) | null = null;
-  private runtimeExitPromise: Promise<void> | null = null;
   private runtimeStopping = false;
+  private cleanupCompleted = false;
+  private onRuntimeExit: (() => void) | null = null;
+  private runtimeExitHandler: (() => void) | null = null;
+  private runtimeExitPromise: Promise<void> | null = null;
   private runtimeStatsInterval: ReturnType<typeof setInterval> | null = null;
   private readonly installScope: "operator" | "user";
   private readonly installedByUserId: string | null;
@@ -1214,6 +1206,28 @@ export class WorkerHost {
       enforceScopedUser: (userId) => this.enforceScopedUser(userId),
       post: (message) => this.postToWorker(message),
     });
+  }
+
+  setRuntimeExitHandler(handler: (() => void) | null): void {
+    this.runtimeExitHandler = handler;
+  }
+
+  isRuntimeActive(): boolean {
+    return this.runtime !== null && !this.runtimeStopping && !this.cleanupCompleted;
+  }
+
+  private notifyRuntimeExit(): void {
+    const handler = this.runtimeExitHandler;
+    this.runtimeExitHandler = null;
+    if (!handler) return;
+    try {
+      handler();
+    } catch (error) {
+      console.error(
+        `[Spindle:${this.manifest.identifier}] Runtime exit handler failed:`,
+        error,
+      );
+    }
   }
 
   private getScopedUserId(): string | null {
@@ -1355,6 +1369,7 @@ export class WorkerHost {
     const storagePath = this.getStorageRootPath(this.manifest.identifier);
     const repoPath = managerSvc.getRepoPath(this.manifest.identifier);
     this.runtimeStopping = false;
+    this.cleanupCompleted = false;
     this.runtimeExitPromise = new Promise<void>((resolve) => {
       this.onRuntimeExit = resolve;
     });
@@ -1382,14 +1397,6 @@ export class WorkerHost {
             error: message,
           });
 
-          try {
-            this.runtime?.postMessage({ type: "ping" } as unknown as RuntimeHostToWorker);
-          } catch {
-            console.warn(
-              `[Spindle:${this.manifest.identifier}] Worker appears dead after error, cleaning up registrations`,
-            );
-            this.cleanup();
-          }
         },
         onExit: (exitCode, signalCode, error) => {
           if (this.runtimeToken !== runtimeToken) return;
@@ -1413,12 +1420,19 @@ export class WorkerHost {
             `[Spindle:${this.manifest.identifier}] Runtime exited unexpectedly:`,
             details,
           );
-          eventBus.emit(EventType.SPINDLE_EXTENSION_ERROR, {
-            extensionId: this.extensionId,
-            identifier: this.manifest.identifier,
-            error: details,
-          });
-          this.cleanup();
+          try {
+            eventBus.emit(EventType.SPINDLE_EXTENSION_ERROR, {
+              extensionId: this.extensionId,
+              identifier: this.manifest.identifier,
+              error: details,
+            });
+          } finally {
+            try {
+              this.cleanup();
+            } finally {
+              this.notifyRuntimeExit();
+            }
+          }
         },
       });
     } catch (error) {
@@ -1558,6 +1572,8 @@ export class WorkerHost {
   }
 
   private cleanup(): void {
+    if (this.cleanupCompleted) return;
+    this.cleanupCompleted = true;
     this.stopRuntimeStatsSampling();
     this.processApi.stopAllFrontendProcesses("backend_unloaded");
     this.processApi.stopAllBackendProcesses("backend_unloaded");
@@ -1622,8 +1638,11 @@ export class WorkerHost {
     this.interactionApi.clear();
 
     // Clear theme overrides and chat-style-mode claims.
+    this.presentationApi.clearPresentationRequests();
     this.presentationApi.clearThemeOverrides();
     this.presentationApi.clearChatStyleModes();
+    this.presentationApi.clearTextEditors();
+    this.imageGenApi.abortAll(new Error("Extension worker stopped"));
 
     // Unregister interceptors and context handlers
     interceptorPipeline.unregisterByExtension(this.extensionId);
@@ -1662,7 +1681,11 @@ export class WorkerHost {
       `[Spindle:${this.manifest.identifier}] Runtime transport failed, cleaning up: ${message}`
     );
     this.runtime = null;
-    this.cleanup();
+    try {
+      this.cleanup();
+    } finally {
+      this.notifyRuntimeExit();
+    }
   }
 
   private postToWorker(msg: RuntimeHostToWorker): boolean {
@@ -1727,6 +1750,18 @@ export class WorkerHost {
     this.processApi.handleFrontendProcessMessage(processId, userId, payload);
   }
 
+  private rejectPendingRequestsForPermission(permission: string, reason: Error): void {
+    for (const [requestId, pending] of this.pendingRequests) {
+      const required = pending.permission;
+      const dependsOnPermission =
+        required === permission
+        || (Array.isArray(required) && required.includes(permission));
+      if (!dependsOnPermission) continue;
+      this.pendingRequests.delete(requestId);
+      pending.reject(reason);
+    }
+  }
+
   /**
    * Notify the worker that a permission was granted or revoked at runtime.
    * The worker updates its internal cache and fires onChanged handlers —
@@ -1740,6 +1775,59 @@ export class WorkerHost {
       granted,
       allGranted,
     });
+    if (granted) return;
+
+    const revoked = new Error(`Extension permission revoked: ${permission}`);
+    this.rejectPendingRequestsForPermission(permission, revoked);
+
+    if (permission === "tools") toolRegistry.unregisterByExtension(this.extensionId);
+    if (permission === "interceptor") {
+      for (const registrationId of [...this.interceptorRegistrations.keys()]) {
+        this.handleUnregisterInterceptor(registrationId);
+      }
+    }
+    if (permission === "context_handler") {
+      this.contextHandlerUnregister?.();
+      this.contextHandlerUnregister = null;
+    }
+    if (permission === "chat_mutation") {
+      this.messageContentProcessorUnregister?.();
+      this.messageContentProcessorUnregister = null;
+    }
+    if (permission === "macro_interceptor") {
+      this.macroInterceptorUnregister?.();
+      this.macroInterceptorUnregister = null;
+    }
+    if (permission === "generation") {
+      this.worldInfoInterceptorUnregister?.();
+      this.worldInfoInterceptorUnregister = null;
+      for (const [event, unsubscribe] of this.eventUnsubscribers) {
+        const eventType = (EventType as any)[event];
+        if (!WorkerHost.GENERATION_EVENTS.has(eventType)) continue;
+        unsubscribe();
+        this.eventUnsubscribers.delete(event);
+      }
+      for (const controller of this.generationAbortControllers.values()) controller.abort(revoked);
+      this.generationAbortControllers.clear();
+      for (const operationRequestId of this.boundOperationControllers.keys()) {
+        this.abortBoundOperationController(operationRequestId, revoked);
+      }
+    }
+    if (permission === "image_gen") {
+      for (const controller of this.imageGenerationAbortControllers.values()) controller.abort(revoked);
+      this.imageGenerationAbortControllers.clear();
+      this.imageGenApi.abortAll(revoked);
+    }
+    if (permission === "final_response") {
+      for (const invocation of this.interceptorInvocations.values()) {
+        if (invocation.finalResponsePermissionGrantId === undefined) continue;
+        invocation.terminalLease?.revoke(revoked);
+      }
+    }
+    if (permission === "app_manipulation") {
+      this.presentationApi.clearThemeOverrides();
+      this.presentationApi.clearChatStyleModes();
+    }
   }
 
   /**
@@ -1766,6 +1854,9 @@ export class WorkerHost {
     councilMember?: CouncilMemberContext,
     contextMessages?: LlmMessage[]
   ): Promise<string> {
+    if (!this.hasPermission("tools")) {
+      return Promise.reject(new Error("Tools permission is not granted"));
+    }
     const requestId = crypto.randomUUID();
 
     // Defensive strip: never forward authentication-style metadata to the
@@ -1802,6 +1893,7 @@ export class WorkerHost {
       }, timeoutMs);
 
       this.pendingRequests.set(requestId, {
+        permission: "tools",
         resolve: (value) => {
           clearTimeout(timeout);
           resolve(String(value ?? ""));
@@ -1832,6 +1924,7 @@ export class WorkerHost {
       }, 30_000);
 
       this.pendingRequests.set(requestId, {
+        permission: "oauth",
         resolve: (value) => {
           clearTimeout(timeout);
           resolve(value as { html?: string; message?: string });
@@ -1873,6 +1966,7 @@ export class WorkerHost {
       }, WorkerHost.SHARED_RPC_REQUEST_TIMEOUT_MS);
 
       this.pendingRequests.set(requestId, {
+        permission: effectivePermissions,
         resolve: (value) => {
           clearTimeout(timeout);
           cleanup();
@@ -2643,7 +2737,10 @@ export class WorkerHost {
         break;
       // ─── Text Editor (free tier — no permission needed) ─────────────────
       case "text_editor_open":
-        this.presentationApi.handleTextEditorOpen(msg.requestId, msg.title, msg.value, msg.placeholder, msg.userId);
+        this.presentationApi.handleTextEditorOpen(msg.requestId, msg.editorRequestId, msg.title, msg.value, msg.placeholder, msg.userId);
+        break;
+      case "text_editor_close":
+        this.presentationApi.handleTextEditorClose(msg.requestId, msg.editorRequestId, msg.userId);
         break;
       // ─── Modal (free tier — no permission needed) ─────────────────────
       case "modal_open":
@@ -2770,6 +2867,20 @@ export class WorkerHost {
     EventType.STREAM_TOKEN_RECEIVED,
   ]);
 
+  /** Host-private presentation events must never fan out to extension listeners. */
+  private static readonly PRIVATE_PRESENTATION_EVENTS = new Set([
+    EventType.SPINDLE_FRONTEND_MSG,
+    EventType.SPINDLE_FRONTEND_PROCESS,
+    EventType.SPINDLE_TEXT_EDITOR_OPEN,
+    EventType.SPINDLE_TEXT_EDITOR_RESULT,
+    EventType.SPINDLE_MODAL_OPEN,
+    EventType.SPINDLE_MODAL_RESULT,
+    EventType.SPINDLE_CONFIRM_OPEN,
+    EventType.SPINDLE_CONFIRM_RESULT,
+    EventType.SPINDLE_INPUT_PROMPT_OPEN,
+    EventType.SPINDLE_INPUT_PROMPT_RESULT,
+  ]);
+
   private handleSubscribeEvent(event: string): void {
     const eventType = (EventType as any)[event];
     if (!eventType) {
@@ -2779,6 +2890,12 @@ export class WorkerHost {
       return;
     }
 
+    if (WorkerHost.PRIVATE_PRESENTATION_EVENTS.has(eventType)) {
+      console.warn(
+        `[Spindle:${this.manifest.identifier}] Private presentation event is not subscribable: ${event}`
+      );
+      return;
+    }
     // Generation lifecycle/streaming events require the generation permission
     if (
       WorkerHost.GENERATION_EVENTS.has(eventType) &&
@@ -2802,7 +2919,17 @@ export class WorkerHost {
     }
 
     const scopedUserId = this.getScopedUserId();
-    const unsub = eventBus.on(eventType, (msg) => {
+    let unsubscribe: () => void = () => undefined;
+    unsubscribe = eventBus.on(eventType, (msg) => {
+      if (this.eventUnsubscribers.get(event) !== unsubscribe) {
+        return;
+      }
+      if (
+        WorkerHost.GENERATION_EVENTS.has(eventType)
+        && (!this.isRuntimeActive() || !this.hasPermission("generation"))
+      ) {
+        return;
+      }
       if (scopedUserId && msg.userId !== scopedUserId) {
         return;
       }
@@ -2819,7 +2946,7 @@ export class WorkerHost {
         userId: msg.userId,
       });
     });
-    this.eventUnsubscribers.set(event, unsub);
+    this.eventUnsubscribers.set(event, unsubscribe);
   }
 
   private handleUnsubscribeEvent(event: string): void {
@@ -3038,7 +3165,7 @@ export class WorkerHost {
       registrationId,
       resolveTimeoutMs,
       matcher: matcher ? (rawContext, authority) => matcher.matches(this.scopedInterceptorContext(rawContext, authority)) : undefined,
-      contextPreparer: (rawContext, outerSignal, authority) => {
+      contextPreparer: (rawContext, outerSignal, authority, deadlineWindow) => {
         const callbackController = new AbortController();
         const outerAbortHandler = () => callbackController.abort(outerSignal?.reason);
         if (outerSignal) {
@@ -3053,6 +3180,8 @@ export class WorkerHost {
           parentGenerationSnapshot: authority?.parentGenerationSnapshot,
           mainDispatchSnapshot: authority?.mainDispatchSnapshot,
           presetMetadata: scopedContext.presetMetadata,
+          interceptorDeadlineAt: deadlineWindow.interceptorDeadlineAt,
+          boundWorkDeadlineAt: deadlineWindow.boundWorkDeadlineAt,
         });
         this.interceptorControllersBySignal.set(callbackController.signal, {
           registrationId,
@@ -3071,6 +3200,14 @@ export class WorkerHost {
         if (!isPreparedInterceptorContext(context)) {
           throw new Error("Interceptor context failed host validation");
         }
+        const interceptorPermissionGrantId = managerSvc.getPermissionGrantId(
+          this.manifest.identifier,
+          "interceptor",
+        );
+        const finalResponsePermissionGrantId = managerSvc.getPermissionGrantId(
+          this.manifest.identifier,
+          "final_response",
+        );
         const typedContext = context;
         const requestId = crypto.randomUUID();
         const privateState = readInterceptorPrivateState(typedContext) ?? { mainApiKey: "" };
@@ -3105,6 +3242,8 @@ export class WorkerHost {
             generation: registrationGeneration,
             workerId: this.workerId,
             runtimeGeneration: this.runtimeGeneration,
+            interceptorPermissionGrantId,
+            finalResponsePermissionGrantId,
             inputMessages: structuredClone(workerMessages),
             controller,
             ...(bridge ? { bridge } : {}),
@@ -3563,14 +3702,8 @@ export class WorkerHost {
       this.handleBoundContainmentFatal(invocation, fatal);
       return;
     }
-    const capturedInterceptorGrantId = managerSvc.getPermissionGrantId(
-      this.manifest.identifier,
-      "interceptor",
-    );
-    const capturedFinalResponseGrantId = managerSvc.getPermissionGrantId(
-      this.manifest.identifier,
-      "final_response",
-    );
+    const capturedInterceptorGrantId = invocation.interceptorPermissionGrantId;
+    const capturedFinalResponseGrantId = invocation.finalResponsePermissionGrantId;
     const hasCapturedGrant = (
       permission: ManagedSpindlePermission,
       grantId: string | undefined,
@@ -3578,6 +3711,34 @@ export class WorkerHost {
       grantId !== undefined
       && this.hasPermission(permission)
       && managerSvc.getPermissionGrantId(this.manifest.identifier, permission) === grantId;
+    const hasCapturedInterceptorPermission = (): boolean => {
+      if (!this.hasPermission("interceptor")) return false;
+      const currentGrantId = managerSvc.getPermissionGrantId(
+        this.manifest.identifier,
+        "interceptor",
+      );
+      return capturedInterceptorGrantId === undefined
+        ? currentGrantId === undefined
+        : currentGrantId === capturedInterceptorGrantId;
+    };
+    const hasCapturedFinalResponsePermission = (): boolean => {
+      if (!this.hasPermission("final_response")) return false;
+      const currentGrantId = managerSvc.getPermissionGrantId(
+        this.manifest.identifier,
+        "final_response",
+      );
+      return capturedFinalResponseGrantId === undefined
+        ? currentGrantId === undefined
+        : currentGrantId === capturedFinalResponseGrantId;
+    };
+    if (!hasCapturedInterceptorPermission()) {
+      this.rejectInterceptorInvocation(
+        invocation,
+        new Error("Interceptor permission grant is no longer valid"),
+        true,
+      );
+      return;
+    }
     const isRegistrationLive = () =>
       this.interceptorRegistrations.get(msg.registrationId) === registration
       && registration.generation === invocation.generation;
@@ -3588,7 +3749,7 @@ export class WorkerHost {
       && this.runtimeGeneration === invocation.runtimeGeneration
       && this.registrationGeneration === invocation.generation;
     const finalPermissionGuard = () =>
-      hasCapturedGrant("final_response", capturedFinalResponseGrantId)
+      hasCapturedFinalResponsePermission()
       && isRegistrationLive()
       && isGenerationLive();
     const interceptorPermissionGuard = () =>
@@ -3603,10 +3764,7 @@ export class WorkerHost {
       outputMessages,
       breakdown: rawBreakdown,
       parent: invocation.privateState.parentGenerationSnapshot,
-      permissionGranted: hasCapturedGrant(
-        "final_response",
-        capturedFinalResponseGrantId,
-      ),
+      permissionGranted: hasCapturedFinalResponsePermission(),
       permissionGuard: finalPermissionGuard,
       extensionId: this.manifest.identifier,
       extensionName: this.manifest.name || this.manifest.identifier,
@@ -3642,6 +3800,7 @@ export class WorkerHost {
           isRegistrationLive,
           isGenerationLive,
           signal: invocation.controller.signal,
+          deadlineAt: invocation.context.interceptorDeadlineAt,
           onDispose: () => this.releaseInterceptorInvocationResources(invocation),
         });
       } catch {
@@ -5357,6 +5516,7 @@ export class WorkerHost {
           }, budgetMs);
 
           this.pendingRequests.set(requestId, {
+            permission: "context_handler",
             resolve: (val) => {
               clearTimeout(timeout);
               resolve(val);
@@ -5412,6 +5572,7 @@ export class WorkerHost {
           }, 10_000);
 
           this.pendingRequests.set(requestId, {
+            permission: "chat_mutation",
             resolve: (val) => {
               clearTimeout(timeout);
               resolve(val as MessageContentProcessorResult | undefined);
@@ -5463,6 +5624,7 @@ export class WorkerHost {
           }, 10_000);
 
           this.pendingRequests.set(requestId, {
+            permission: "macro_interceptor",
             resolve: (val) => {
               clearTimeout(timeout);
               resolve(val as MacroInterceptorResult | undefined);
@@ -5514,6 +5676,7 @@ export class WorkerHost {
           }, 10_000);
 
           this.pendingRequests.set(requestId, {
+            permission: "generation",
             resolve: (val) => {
               clearTimeout(timeout);
               resolve(val as WorldInfoInterceptorResultDTO | undefined);

@@ -12,12 +12,30 @@ import * as multiplayerSvc from "../services/multiplayer.service";
 
 const WS_MESSAGE_SIZE_LIMIT_DEFAULT = 1024 * 1024;
 const WS_MESSAGE_SIZE_LIMIT_SPINDLE_BACKEND_MSG = 4 * 1024 * 1024;
+const WS_MESSAGE_SIZE_LIMIT_SPINDLE_TEXT_EDITOR_RESULT = 8 * 1024 * 1024;
+const WS_MESSAGE_SIZE_LIMIT_SPINDLE_PRESENTATION_RESULT = 8 * 1024 * 1024;
+const MAX_PRESENTATION_EVENT_REQUEST_ID_LENGTH = 512;
+const MAX_PRESENTATION_INPUT_VALUE_LENGTH = 1_048_576;
+
+function isBoundedPresentationEventRequestId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_PRESENTATION_EVENT_REQUEST_ID_LENGTH &&
+    !/[\u0000-\u001F\u007F]/.test(value)
+  );
+}
 
 export const wsHandler = upgradeWebSocket((c) => {
   // Authenticate during upgrade — extract userId + sessionId
   let userId: string | null = null;
   let userRole: string | null = null;
   let sessionId: string | null = null;
+  let connectionId: string | null = null;
+  let pendingVisibility: boolean | null = null;
+  // The browser can send stream_focus before async authentication finishes.
+  // undefined means no focus frame arrived; null is an explicit unfocused state.
+  let pendingStreamFocus: string | null | undefined;
   let heartbeatOnly = false;
   // Multiplayer: set when this socket is a room participant (peer or joined
   // local account). The participantId is connection-scoped and authoritative —
@@ -154,10 +172,19 @@ export const wsHandler = upgradeWebSocket((c) => {
         }
 
         console.log(`[WS] Authenticated as user ${userId}, session ${sessionId}`);
+        connectionId = crypto.randomUUID();
 
         const raw = (ws as any).raw as import("bun").ServerWebSocket<unknown>;
         if (raw) {
-          eventBus.addClient(raw, userId, sessionId);
+          eventBus.addClient(raw, userId, connectionId);
+          if (pendingVisibility !== null && userId && connectionId) {
+            eventBus.setUserVisibility(userId, connectionId, pendingVisibility);
+            pendingVisibility = null;
+          }
+          if (pendingStreamFocus !== undefined && userId && connectionId) {
+            eventBus.setClientStreamFocus(raw, userId, pendingStreamFocus);
+            pendingStreamFocus = undefined;
+          }
           console.log(`[WS] Client registered for user ${userId} (total: ${eventBus.clientCount})`);
         } else {
           console.warn("[WS] Could not extract raw Bun WebSocket — events will not reach this client");
@@ -192,6 +219,14 @@ export const wsHandler = upgradeWebSocket((c) => {
           detectedType = typeMatch?.[1] ?? null;
           if (detectedType === "SPINDLE_BACKEND_MSG") {
             sizeLimit = WS_MESSAGE_SIZE_LIMIT_SPINDLE_BACKEND_MSG;
+          } else if (detectedType === "SPINDLE_TEXT_EDITOR_RESULT") {
+            sizeLimit = WS_MESSAGE_SIZE_LIMIT_SPINDLE_TEXT_EDITOR_RESULT;
+          } else if (
+            detectedType === "SPINDLE_MODAL_RESULT" ||
+            detectedType === "SPINDLE_CONFIRM_RESULT" ||
+            detectedType === "SPINDLE_INPUT_PROMPT_RESULT"
+          ) {
+            sizeLimit = WS_MESSAGE_SIZE_LIMIT_SPINDLE_PRESENTATION_RESULT;
           }
         }
 
@@ -212,16 +247,24 @@ export const wsHandler = upgradeWebSocket((c) => {
         if (heartbeatOnly) return;
 
         if (data.type === "visibility") {
-          if (userId && sessionId) {
-            eventBus.setUserVisibility(userId, sessionId, !!data.visible);
+          if (userId && connectionId) {
+            eventBus.setUserVisibility(userId, connectionId, !!data.visible);
+          } else {
+            // Authentication runs asynchronously; retain the latest browser
+            // state until this socket is registered with the event bus.
+            pendingVisibility = !!data.visible;
           }
           return;
         }
 
         if (data.type === "stream_focus") {
+          const chatId = typeof data.chatId === "string" ? data.chatId : null;
           if (raw && userId) {
-            const chatId = typeof data.chatId === "string" ? data.chatId : null;
             eventBus.setClientStreamFocus(raw, userId, chatId);
+          } else {
+            // Authentication runs asynchronously; retain the latest focus
+            // state until this socket is registered with the event bus.
+            pendingStreamFocus = chatId;
           }
           return;
         }
@@ -311,43 +354,80 @@ export const wsHandler = upgradeWebSocket((c) => {
         }
 
         if (data.type === "SPINDLE_TEXT_EDITOR_RESULT") {
-          if (userId && data.requestId) {
-            eventBus.emit(EventType.SPINDLE_TEXT_EDITOR_RESULT, {
+          if (
+            userId &&
+            connectionId &&
+            typeof data.requestId === "string" &&
+            /^[A-Za-z0-9:_-]{1,512}$/.test(data.requestId) &&
+            typeof data.text === "string" &&
+            data.text.length <= 1_048_576 &&
+            typeof data.cancelled === "boolean"
+          ) {
+            eventBus.emitInternal(EventType.SPINDLE_TEXT_EDITOR_RESULT, {
               requestId: data.requestId,
               text: data.text,
-              cancelled: !!data.cancelled,
-            }, userId);
+              cancelled: data.cancelled,
+              connectionId,
+            }, userId, { synchronous: true });
           }
           return;
         }
 
         if (data.type === "SPINDLE_CONFIRM_RESULT") {
-          if (userId && data.requestId) {
-            eventBus.emit(EventType.SPINDLE_CONFIRM_RESULT, {
-              requestId: data.requestId,
-              confirmed: !!data.confirmed,
-            }, userId);
+          if (
+            userId &&
+            isBoundedPresentationEventRequestId(data.requestId) &&
+            typeof data.confirmed === "boolean"
+          ) {
+            eventBus.emit(
+              EventType.SPINDLE_CONFIRM_RESULT,
+              { requestId: data.requestId, confirmed: data.confirmed },
+              userId,
+              { synchronous: true },
+            );
           }
           return;
         }
 
         if (data.type === "SPINDLE_MODAL_RESULT") {
-          if (userId && data.requestId) {
-            eventBus.emit(EventType.SPINDLE_MODAL_RESULT, {
-              requestId: data.requestId,
-              dismissedBy: data.dismissedBy,
-            }, userId);
+          if (
+            userId &&
+            isBoundedPresentationEventRequestId(data.requestId) &&
+            (data.dismissedBy === "user" ||
+              data.dismissedBy === "extension" ||
+              data.dismissedBy === "cleanup")
+          ) {
+            eventBus.emit(
+              EventType.SPINDLE_MODAL_RESULT,
+              { requestId: data.requestId, dismissedBy: data.dismissedBy },
+              userId,
+              { synchronous: true },
+            );
           }
           return;
         }
 
         if (data.type === "SPINDLE_INPUT_PROMPT_RESULT") {
-          if (userId && data.requestId) {
-            eventBus.emit(EventType.SPINDLE_INPUT_PROMPT_RESULT, {
-              requestId: data.requestId,
-              value: data.value ?? null,
-              cancelled: !!data.cancelled,
-            }, userId);
+          const validValue = data.cancelled
+            ? data.value === null
+            : typeof data.value === "string" &&
+              data.value.length <= MAX_PRESENTATION_INPUT_VALUE_LENGTH;
+          if (
+            userId &&
+            isBoundedPresentationEventRequestId(data.requestId) &&
+            typeof data.cancelled === "boolean" &&
+            validValue
+          ) {
+            eventBus.emit(
+              EventType.SPINDLE_INPUT_PROMPT_RESULT,
+              {
+                requestId: data.requestId,
+                value: data.value,
+                cancelled: data.cancelled,
+              },
+              userId,
+              { synchronous: true },
+            );
           }
           return;
         }

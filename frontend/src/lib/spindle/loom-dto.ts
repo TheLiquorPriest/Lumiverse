@@ -9,6 +9,7 @@ import type { MacroGroup } from '@/lib/loom/types'
 export interface NormalizedLoomOptions {
   value: SpindleLoomBlockEditorValue
   onChange?: (value: SpindleLoomBlockEditorValue) => void
+  onDraftChange?: (value: SpindleLoomBlockEditorValue | null) => void
   readOnly: boolean
   compact: boolean
 }
@@ -85,6 +86,7 @@ const LOOM_VALUE_KEYS: Record<string, true> = {
 const LOOM_OPTION_KEYS: Record<string, true> = {
   value: true,
   onChange: true,
+  onDraftChange: true,
   readOnly: true,
   compact: true,
 }
@@ -873,11 +875,14 @@ export function cloneLoomOptions(options: unknown): NormalizedLoomOptions {
   if (!Object.prototype.hasOwnProperty.call(record, 'value')) throw new Error('Invalid Loom options.value')
   const onChange = record.onChange
   if (onChange !== undefined && typeof onChange !== 'function') throw new Error('Invalid Loom options.onChange')
+  const onDraftChange = record.onDraftChange
+  if (onDraftChange !== undefined && typeof onDraftChange !== 'function') throw new Error('Invalid Loom options.onDraftChange')
   if (record.readOnly !== undefined) assertBoolean(record.readOnly, 'options.readOnly')
   if (record.compact !== undefined) assertBoolean(record.compact, 'options.compact')
   return {
     value: cloneLoomValue(record.value),
     onChange: onChange as ((value: SpindleLoomBlockEditorValue) => void) | undefined,
+    onDraftChange: onDraftChange as ((value: SpindleLoomBlockEditorValue | null) => void) | undefined,
     readOnly: record.readOnly === true,
     compact: record.compact !== false,
   }
@@ -889,6 +894,7 @@ export function patchLoomOptions(current: NormalizedLoomOptions, patch: unknown)
   const next: NormalizedLoomOptions = {
     value: current.value,
     onChange: current.onChange,
+    onDraftChange: current.onDraftChange,
     readOnly: current.readOnly,
     compact: current.compact,
   }
@@ -898,6 +904,12 @@ export function patchLoomOptions(current: NormalizedLoomOptions, patch: unknown)
       throw new Error('Invalid Loom options.onChange')
     }
     next.onChange = record.onChange as typeof next.onChange
+  }
+  if (Object.prototype.hasOwnProperty.call(record, 'onDraftChange')) {
+    if (record.onDraftChange !== undefined && typeof record.onDraftChange !== 'function') {
+      throw new Error('Invalid Loom options.onDraftChange')
+    }
+    next.onDraftChange = record.onDraftChange as typeof next.onDraftChange
   }
   if (Object.prototype.hasOwnProperty.call(record, 'readOnly')) {
     next.readOnly = assertBoolean(record.readOnly, 'options.readOnly')

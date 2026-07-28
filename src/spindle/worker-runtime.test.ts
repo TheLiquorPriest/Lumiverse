@@ -35,6 +35,7 @@ const VALID_HOST_DESCRIPTOR = {
     "interceptor-context-v1": 1,
     "interceptor-final-response-v1": 1,
     "connection-dispatch-resolution-v1": 1,
+    "text-editor-close-v1": 1,
     "unknown-capability-v1": 7,
   },
   extensionInstallationId: "00000000-0000-4000-8000-000000000001",
@@ -418,6 +419,87 @@ describe("Worker nested generation authority", () => {
       );
       expect(callbackResult.registrationId).toBe(registration.registrationId);
       expect(callbackResult.messages).toEqual([{ role: "user", content: "hello" }]);
+    } finally {
+      await stopRuntime(runtime);
+    }
+  }, { timeout: 30_000 });
+
+  test("waits for the host receipt when a posted quiet request is cancelled", async () => {
+    const runtime = await startRuntime(`
+      spindle.registerInterceptor(async (messages) => {
+        const controller = new AbortController();
+        const pending = spindle.generate.quietTracked({
+          messages,
+          dispatch: {
+            source: "main",
+            expectedConnectionDispatchRevision: "revision-1",
+          },
+          deadlineAt: Date.now() + 5_000,
+          signal: controller.signal,
+        });
+        queueMicrotask(() => controller.abort("cancel after dispatch"));
+        const result = await pending;
+        spindle.log.info("bound-cancel-result:" + JSON.stringify(result));
+        return messages;
+      });
+    `);
+
+    try {
+      const registration = await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "register_interceptor",
+      );
+      const parentRequestId = "parent-bound-cancel";
+      runtime.worker.postMessage({
+        type: "intercept_request",
+        requestId: parentRequestId,
+        registrationId: registration.registrationId,
+        messages: [{ role: "user", content: "hello" }],
+        context: callbackContext(),
+        __spindle_private_bound: parentBoundEnvelope(parentRequestId),
+      });
+      const quietRequest = await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "generate_quiet_tracked",
+      );
+      const cancelRequest = await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "cancel_generation",
+      );
+      expect(cancelRequest.requestId).toBe(quietRequest.requestId);
+      expect(runtime.messages.some(
+        (message) => message.type === "log" && message.message?.startsWith("bound-cancel-result:") === true,
+      )).toBe(false);
+
+      runtime.worker.postMessage({
+        type: "response",
+        requestId: quietRequest.requestId,
+        result: {
+          ok: true,
+          response: { content: "provider stopped", finish_reason: "abort" },
+          receipt: {
+            providerInvoked: true,
+            terminalResponse: true,
+            source: "main",
+            connectionId: null,
+            connectionDispatchRevision: "revision-1",
+          },
+        },
+      });
+      const resultLog = await waitForMessage(
+        runtime.messages,
+        runtime.waiters,
+        (message) => message.type === "log" && message.message?.startsWith("bound-cancel-result:") === true,
+      );
+      const result = JSON.parse(resultLog.message!.slice("bound-cancel-result:".length)) as {
+        ok: boolean;
+        receipt: { providerInvoked: boolean } | null;
+      };
+      expect(result.ok).toBe(true);
+      expect(result.receipt?.providerInvoked).toBe(true);
     } finally {
       await stopRuntime(runtime);
     }

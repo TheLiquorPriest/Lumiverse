@@ -945,33 +945,45 @@ function applyFinalResponseBreakdownReplacement(
   base: readonly AssemblyBreakdownEntry[] | undefined,
   replacement: FinalResponseBreakdownReplacement | undefined,
 ): AssemblyBreakdownEntry[] {
-  if (!replacement) return [...(base ?? [])];
+  const entries = [...(base ?? [])];
+  if (!replacement) return entries;
   const { from, to } = replacement;
-  let replaced = false;
-  return (base ?? []).map((entry) => {
+  const matchesFallback = (entry: AssemblyBreakdownEntry): boolean => {
     const extensionMessageIndex = (entry as AssemblyBreakdownEntry & {
       extensionMessageIndex?: number;
     }).extensionMessageIndex;
-    if (
-      !replaced
-      && entry.type === "extension"
+    return entry.type === "extension"
       && extensionMessageIndex === from.messageIndex
       && entry.extensionId === from.extensionId
-      && entry.extensionName === from.extensionName
-    ) {
-      replaced = true;
-      return {
-        ...entry,
-        name: to.name,
-        role: to.role,
-        content: to.content,
-        extensionId: to.extensionId,
-        extensionName: to.extensionName,
-        extensionMessageIndex: to.messageIndex,
-      };
-    }
-    return entry;
-  });
+      && entry.extensionName === from.extensionName;
+  };
+  if (!to) {
+    return entries
+      .filter((entry) => !matchesFallback(entry))
+      .map((entry) => {
+        const extensionMessageIndex = (entry as AssemblyBreakdownEntry & {
+          extensionMessageIndex?: number;
+        }).extensionMessageIndex;
+        if (entry.type !== "extension"
+          || extensionMessageIndex === undefined
+          || extensionMessageIndex <= from.messageIndex) {
+          return entry;
+        }
+        return { ...entry, extensionMessageIndex: extensionMessageIndex - 1 } as AssemblyBreakdownEntry;
+      });
+  }
+  const fallbackIndex = entries.findIndex(matchesFallback);
+  if (fallbackIndex === -1) return entries;
+  entries[fallbackIndex] = {
+    ...entries[fallbackIndex]!,
+    name: to.name,
+    role: to.role,
+    content: to.content,
+    extensionId: to.extensionId,
+    extensionName: to.extensionName,
+    extensionMessageIndex: to.messageIndex,
+  } as AssemblyBreakdownEntry;
+  return entries;
 }
 
 function applyDelimitedReasoningParsing(
@@ -1286,18 +1298,69 @@ const activeChatGenerations = new Map<string, string>();
 
 // Pending council retry decisions: when council tools partially fail, the generation
 // pauses and waits for the user to decide whether to continue or retry. Keyed by
-// generationId → { resolve, timeout }. The user responds via POST /generate/council-retry.
+// generationId; the abort listener and safety timer both settle and clean up the wait.
 /** Safety cap: auto-continue after 10 minutes to prevent permanent resource hangs */
 const COUNCIL_RETRY_SAFETY_CAP_MS = 10 * 60 * 1000;
 
-const pendingCouncilRetries = new Map<
-  string,
-  {
-    userId: string;
-    resolve: (decision: "continue" | "retry") => void;
-    timeout: ReturnType<typeof setTimeout>;
+type PendingCouncilRetry = {
+  userId: string;
+  resolve: (decision: "continue" | "retry") => void;
+  timeout: ReturnType<typeof setTimeout>;
+  signal: AbortSignal;
+  onAbort: () => void;
+};
+
+const pendingCouncilRetries = new Map<string, PendingCouncilRetry>();
+
+function settlePendingCouncilRetry(
+  generationId: string,
+  decision: "continue" | "retry",
+): boolean {
+  const pending = pendingCouncilRetries.get(generationId);
+  if (!pending) return false;
+  pendingCouncilRetries.delete(generationId);
+  clearTimeout(pending.timeout);
+  pending.signal.removeEventListener("abort", pending.onAbort);
+
+  // Clear the pool flag
+  const poolEntry = pool.getPoolEntry(generationId);
+  if (poolEntry) {
+    poolEntry.councilRetryPending = false;
+    delete poolEntry.councilToolsFailure;
   }
->();
+  pending.resolve(decision);
+  return true;
+}
+
+function restoreStagedSwipe(
+  userId: string,
+  stagedSwipeOriginal: Message | null,
+  stagedSwipe: Message | null,
+): void {
+  if (!stagedSwipeOriginal || !stagedSwipe) return;
+  const stagedSwipeId = stagedSwipe.swipe_id;
+  if (
+    stagedSwipeId !== stagedSwipeOriginal.swipes.length ||
+    stagedSwipeId !== stagedSwipe.swipes.length - 1 ||
+    stagedSwipe.swipes[stagedSwipeId] !== ""
+  ) {
+    return;
+  }
+  try {
+    const current = chatsSvc.getMessage(userId, stagedSwipeOriginal.id);
+    if (!current || current.swipes[stagedSwipeId] !== "") return;
+    const stagedPrefixIsIntact = stagedSwipe.swipes.every(
+      (content, index) =>
+        current.swipes[index] === content &&
+        current.swipe_dates[index] === stagedSwipe.swipe_dates[index],
+    );
+    if (stagedPrefixIsIntact) {
+      chatsSvc.deleteSwipe(userId, stagedSwipeOriginal.id, stagedSwipeId);
+    }
+  } catch {
+    /* best-effort cleanup */
+  }
+}
 
 /**
  * Called from the council-retry route to resolve a pending decision. Verifies
@@ -1312,16 +1375,7 @@ export function resolveCouncilRetry(
   const pending = pendingCouncilRetries.get(generationId);
   if (!pending) return false;
   if (pending.userId !== userId) return false;
-  clearTimeout(pending.timeout);
-  pendingCouncilRetries.delete(generationId);
-  // Clear the pool flag
-  const poolEntry = pool.getPoolEntry(generationId);
-  if (poolEntry) {
-    poolEntry.councilRetryPending = false;
-    delete poolEntry.councilToolsFailure;
-  }
-  pending.resolve(decision);
-  return true;
+  return settlePendingCouncilRetry(generationId, decision);
 }
 
 /** Resolve connection profile by ID or fall back to the user's default. */
@@ -2069,6 +2123,7 @@ async function runPromptPipeline(opts: {
         },
         messages as LlmMessageDTO[],
         postProcessedBreakdown,
+        { carrierDetached: true },
       );
       messages = restored.messages as unknown as LlmMessage[];
       interceptorBreakdown = [
@@ -3083,23 +3138,41 @@ export async function startGeneration(
                   // safety cap prevents permanent resource hangs if the user never responds.
                   const decision = await new Promise<"continue" | "retry">(
                     (resolve) => {
-                      const timeout = setTimeout(() => {
+                      let timeout!: ReturnType<typeof setTimeout>;
+                      const onAbort = () => {
+                        if (
+                          settlePendingCouncilRetry(generationId, "continue")
+                        ) {
+                          console.debug(
+                            "[council] Generation %s aborted while awaiting retry decision",
+                            generationId,
+                          );
+                        }
+                      };
+                      timeout = setTimeout(() => {
+                        if (
+                          !settlePendingCouncilRetry(generationId, "continue")
+                        ) {
+                          return;
+                        }
                         console.debug(
                           "[council] Safety cap reached for %s — auto-continuing",
                           generationId,
                         );
-                        pendingCouncilRetries.delete(generationId);
-                        if (poolEntry) {
-                          poolEntry.councilRetryPending = false;
-                          delete poolEntry.councilToolsFailure;
-                        }
-                        resolve("continue");
                       }, COUNCIL_RETRY_SAFETY_CAP_MS);
                       pendingCouncilRetries.set(generationId, {
                         userId: input.userId,
                         resolve,
                         timeout,
+                        signal: abortController.signal,
+                        onAbort,
                       });
+                      abortController.signal.addEventListener(
+                        "abort",
+                        onAbort,
+                        { once: true },
+                      );
+                      if (abortController.signal.aborted) onAbort();
                     },
                   );
 
@@ -3621,16 +3694,22 @@ export async function startGeneration(
         // a newer startGeneration on the same chat may have already taken over the
         // chatKey (see line 590), and wiping it would strand the new generation.
         activeGenerations.delete(generationId);
-        if (activeChatGenerations.get(chatKey) === generationId) {
+        const ownsChatGeneration =
+          activeChatGenerations.get(chatKey) === generationId;
+        if (ownsChatGeneration) {
           activeChatGenerations.delete(chatKey);
         }
 
-        // Clean up any pending council retry decision
-        const pendingRetry = pendingCouncilRetries.get(generationId);
-        if (pendingRetry) {
-          clearTimeout(pendingRetry.timeout);
-          pendingCouncilRetries.delete(generationId);
-        }
+        // Clean up any pending council retry decision.
+        settlePendingCouncilRetry(generationId, "continue");
+
+        // The staged snapshot proves the append slot is still ours even when a
+        // replacement generation has appended a later swipe.
+        restoreStagedSwipe(
+          input.userId,
+          stagedSwipeOriginal,
+          stagedSwipe,
+        );
 
         // User aborts and extension-requested cancels both emit stop events so
         // the frontend resets its streaming state.
@@ -3703,18 +3782,13 @@ export async function startGeneration(
       }
     }
     // A failure before GENERATION_STARTED has no terminal event for the
-    // frontend to reconcile. Remove the early blank swipe ourselves, but only
-    // when its slot is still the empty value we staged.
-    if (stagedSwipeOriginal && stagedSwipeId != null) {
-      try {
-        const current = chatsSvc.getMessage(input.userId, stagedSwipeOriginal.id);
-        if (current?.swipes[stagedSwipeId] === "") {
-          chatsSvc.deleteSwipe(input.userId, stagedSwipeOriginal.id, stagedSwipeId);
-        }
-      } catch {
-        /* best-effort cleanup */
-      }
-    }
+    // frontend to reconcile. Compare the staged append snapshot so cleanup can
+    // safely remove it even if a replacement appended a later swipe.
+    restoreStagedSwipe(
+      input.userId,
+      stagedSwipeOriginal,
+      stagedSwipe,
+    );
     activeGenerations.delete(generationId);
     if (activeChatGenerations.get(chatKey) === generationId) {
       activeChatGenerations.delete(chatKey);
@@ -3941,6 +4015,7 @@ async function runGeneration(
   };
 
   const streamTopic = `stream:${userId}:${chatId}`;
+  const legacyStreamTopic = `stream:${userId}:legacy`;
   const STREAM_EMIT_INTERVAL_MS = 40;
   const STREAM_EMIT_MAX_CHARS = 768;
   let pendingStreamSegments: PendingStreamSegment[] = [];
@@ -3973,7 +4048,7 @@ async function runGeneration(
           offset: segment.offset,
         },
         userId,
-        { topic: streamTopic },
+        { topic: streamTopic, legacyTopic: legacyStreamTopic },
       );
     }
   }
@@ -4379,7 +4454,6 @@ async function runGeneration(
         liveDispatchRevision,
         expectedDispatchSource: "main",
         liveDispatchSource: () => "main",
-        deadlineAt: parentGenerationSnapshot?.boundWorkDeadlineAt,
         permissionGuard: () =>
           activeTerminalLeases.every((lease) => lease.isActive()),
         finalResponseState: finalResponse,

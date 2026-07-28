@@ -1263,6 +1263,8 @@ function requestBoundGeneration<T>(
   void _signal;
   const { promise, resolve, reject } = Promise.withResolvers<T>();
   let settled = false;
+  let posted = false;
+  let cancelRequested = false;
   const cleanup = (): void => {
     signal?.removeEventListener("abort", onAbort);
     pendingResponses.delete(requestId);
@@ -1272,26 +1274,33 @@ function requestBoundGeneration<T>(
       boundResponseAborts.delete(envelope.requestId);
     }
   };
-  const settleAbort = (reason: unknown, notifyHost: boolean): void => {
+  const settleParentAbort = (reason: unknown): void => {
     if (settled) return;
     settled = true;
     cleanup();
     reject(abortFailure(reason));
-    if (notifyHost) {
-      post({
-        type: "cancel_generation",
-        requestId,
-        __spindle_private_bound: operationEnvelope,
-      });
-    }
   };
-  const onAbort = (): void => settleAbort(signal?.reason, true);
+  const onAbort = (): void => {
+    if (settled || cancelRequested) return;
+    if (!posted) {
+      settled = true;
+      cleanup();
+      resolve(abortFailure(signal?.reason));
+      return;
+    }
+    cancelRequested = true;
+    post({
+      type: "cancel_generation",
+      requestId,
+      __spindle_private_bound: operationEnvelope,
+    });
+  };
   let invocationAborts = boundResponseAborts.get(envelope.requestId);
   if (!invocationAborts) {
     invocationAborts = new Map();
     boundResponseAborts.set(envelope.requestId, invocationAborts);
   }
-  invocationAborts.set(requestId, (reason) => settleAbort(reason, false));
+  invocationAborts.set(requestId, settleParentAbort);
   pendingResponses.set(requestId, {
     resolve: (value) => {
       if (settled) return;
@@ -1310,6 +1319,7 @@ function requestBoundGeneration<T>(
   if (signal?.aborted) {
     onAbort();
   } else {
+    posted = true;
     post({
       type,
       requestId,
@@ -3891,18 +3901,30 @@ const spindleApi: RuntimeSpindleAPI = {
       title?: string;
       value?: string;
       placeholder?: string;
+      editorRequestId?: string;
       userId?: string;
     }): Promise<{ text: string; cancelled: boolean }> {
       const requestId = crypto.randomUUID();
+      const editorRequestId = options?.editorRequestId ?? crypto.randomUUID();
       const result = await request({
         type: "text_editor_open",
         requestId,
+        editorRequestId,
         title: options?.title,
         value: options?.value,
         placeholder: options?.placeholder,
         userId: options?.userId,
       } as any);
       return result as { text: string; cancelled: boolean };
+    },
+    async close(editorRequestId: string, userId?: string): Promise<void> {
+      const requestId = crypto.randomUUID();
+      await request({
+        type: "text_editor_close",
+        requestId,
+        editorRequestId,
+        userId,
+      } as any);
     },
   },
 

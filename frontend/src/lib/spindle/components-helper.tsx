@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import clsx from 'clsx'
@@ -1297,6 +1297,62 @@ function CollapsibleSectionBridge({
   )
 }
 
+function publicLoomBlocks(blocks: PromptBlock[]): PromptBlock[] {
+  return normalizeCategoryBlockState(blocks.map((block) => {
+    const clean = { ...block } as Record<string, unknown>
+    for (const key of HOST_ONLY_BLOCK_FIELDS) delete clean[key]
+    return clean as unknown as PromptBlock
+  }))
+}
+
+function loomValueSignature(value: unknown): string {
+  const canonicalize = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(canonicalize)
+    if (candidate === null || typeof candidate !== "object") return candidate
+    const record = candidate as Record<string, unknown>
+    const canonical: Record<string, unknown> = {}
+    for (const key of Object.keys(record).sort()) canonical[key] = canonicalize(record[key])
+    return canonical
+  }
+  return JSON.stringify(canonicalize(value)) ?? ""
+}
+
+function valueContainsDraft(
+  authority: SpindleLoomBlockEditorValue,
+  draft: SpindleLoomBlockEditorValue,
+): boolean {
+  const authorityBlocks = new Map(authority.blocks.map((block) => [block.id, loomValueSignature(block)]))
+  for (const block of draft.blocks) {
+    if (authorityBlocks.get(block.id) !== loomValueSignature(block)) return false
+  }
+
+  for (const [blockId, draftValues] of Object.entries(draft.promptVariableValues)) {
+    const authorityValues = authority.promptVariableValues[blockId]
+    if (!authorityValues) return false
+    for (const [name, draftValue] of Object.entries(draftValues)) {
+      if (loomValueSignature(authorityValues[name]) !== loomValueSignature(draftValue)) return false
+    }
+  }
+  return true
+}
+
+const LOOM_AUTHORITY_HISTORY_LIMIT = 32
+
+function buildPublicLoomValue(
+  blocks: PromptBlock[],
+  previousValue: SpindleLoomBlockEditorValue,
+): SpindleLoomBlockEditorValue {
+  const normalizedBlocks = publicLoomBlocks(blocks)
+  return cloneLoomValue({
+    blocks: normalizedBlocks,
+    promptVariableValues: reconcilePromptVariableValues(
+      previousValue.promptVariableValues,
+      previousValue.blocks,
+      normalizedBlocks,
+    ),
+  })
+}
+
 function LoomBlockEditorBridge({
   initial,
   bridge,
@@ -1310,9 +1366,15 @@ function LoomBlockEditorBridge({
 }) {
   const [props, setProps] = useState<NormalizedLoomOptions>(initial)
   const [valueState, setValueState] = useState<SpindleLoomBlockEditorValue>(initial.value)
+  const [authoritativeValueRevision, setAuthoritativeValueRevision] = useState(0)
   const [availableMacros, setAvailableMacros] = useState<MacroGroup[]>(() => getAvailableMacros())
   const propsRef = useRef(initial)
   const valueRef = useRef(initial.value)
+  const draftValueRef = useRef<SpindleLoomBlockEditorValue | null>(null)
+  const draftAuthorityRef = useRef<SpindleLoomBlockEditorValue | null>(null)
+  const authorityHistoryRef = useRef(new Map<string, true>([
+    [loomValueSignature(initial.value), true],
+  ]))
   const aliveRef = useRef(true)
   const refreshTailRef = useRef<Promise<void>>(Promise.resolve())
   const refreshEpochRef = useRef(0)
@@ -1320,6 +1382,43 @@ function LoomBlockEditorBridge({
     resolve(): void
     reject(error: unknown): void
   }>())
+  const handleDraftChange = useCallback((blocks: PromptBlock[] | null) => {
+    if (!aliveRef.current) return
+    if (!blocks) {
+      draftValueRef.current = null
+      draftAuthorityRef.current = null
+      notifyComponentOnChange('Loom draft', propsRef.current.onDraftChange, null)
+      return
+    }
+    try {
+      const previousValue = draftValueRef.current ?? valueRef.current
+      const candidate = buildPublicLoomValue(blocks, previousValue)
+      if (!draftValueRef.current) {
+        const base = valueRef.current
+        if (loomValueSignature(candidate) === loomValueSignature(base)) return
+        draftAuthorityRef.current = base
+      }
+      draftValueRef.current = candidate
+      notifyComponentOnChange('Loom draft', propsRef.current.onDraftChange, cloneLoomValue(candidate))
+    } catch {
+      // Keep the last validated snapshot while a form edit is transiently invalid.
+    }
+  }, [])
+  const rememberAuthority = useCallback((value: SpindleLoomBlockEditorValue): void => {
+    const history = authorityHistoryRef.current
+    const key = loomValueSignature(value)
+    if (history.has(key)) return
+    history.set(key, true)
+    while (history.size > LOOM_AUTHORITY_HISTORY_LIMIT) {
+      const oldest = history.keys().next().value
+      if (oldest === undefined) break
+      history.delete(oldest)
+    }
+  }, [])
+
+  const hasKnownAuthority = useCallback((value: SpindleLoomBlockEditorValue): boolean => (
+    authorityHistoryRef.current.has(loomValueSignature(value))
+  ), [])
 
   const refreshMacros = useMemo(() => {
     return () => {
@@ -1375,32 +1474,21 @@ function LoomBlockEditorBridge({
   const handleChange = (blocks: PromptBlock[]): boolean => {
     if (!aliveRef.current) return false
     const previousProps = propsRef.current
-    const previousValue = valueRef.current
+    const previousValue = draftValueRef.current ?? valueRef.current
     let cloned: SpindleLoomBlockEditorValue
     try {
       // Blocks arrive from the host block editor, which emits host-only
       // fields on every save (placementBinding, and seal metadata when
       // trusted features are on). The public DTO rejects them by design, so
-      // strip them at the boundary before validating — otherwise every save
-      // fails with "unknown field" and the editor reports validationFailed.
-      const publicBlocks = blocks.map((block) => {
-        const clean = { ...block } as Record<string, unknown>
-        for (const key of HOST_ONLY_BLOCK_FIELDS) delete clean[key]
-        return clean as unknown as PromptBlock
-      })
-      const normalizedBlocks = normalizeCategoryBlockState(publicBlocks)
-      cloned = cloneLoomValue({
-        blocks: normalizedBlocks,
-        promptVariableValues: reconcilePromptVariableValues(
-          previousValue.promptVariableValues,
-          previousValue.blocks,
-          normalizedBlocks,
-        ),
-      })
+      // strip them at the boundary before validating.
+      cloned = buildPublicLoomValue(blocks, previousValue)
     } catch {
       return false
     }
 
+    draftValueRef.current = null
+    draftAuthorityRef.current = null
+    rememberAuthority(cloned)
     const nextProps = { ...previousProps, value: cloned }
     propsRef.current = nextProps
     valueRef.current = cloned
@@ -1413,13 +1501,43 @@ function LoomBlockEditorBridge({
 
   useLayoutEffect(() => {
     bridge.update = (patch) => {
-      const nextProps = patchLoomOptions(propsRef.current, patch)
+      const hasValuePatch = patch !== null
+        && typeof patch === 'object'
+        && Object.prototype.hasOwnProperty.call(patch, 'value')
+      let nextProps = patchLoomOptions(propsRef.current, patch)
+      if (hasValuePatch) {
+        const incoming = nextProps.value
+        const incomingSignature = loomValueSignature(incoming)
+        const draft = draftValueRef.current
+        const acknowledgesDraft = draft !== null
+          && valueContainsDraft(incoming, draft)
+          && incomingSignature === loomValueSignature(draft)
+        const knownAuthority = hasKnownAuthority(incoming)
+          || (
+            draftAuthorityRef.current !== null
+            && loomValueSignature(draftAuthorityRef.current) === incomingSignature
+          )
+        const incomingIsCurrent = incomingSignature === loomValueSignature(valueRef.current)
+        const acceptsIncoming = draft === null || acknowledgesDraft || !knownAuthority
+        if (acceptsIncoming) {
+          draftValueRef.current = null
+          draftAuthorityRef.current = null
+          valueRef.current = incoming
+          rememberAuthority(incoming)
+          if (!acknowledgesDraft && !incomingIsCurrent) {
+            setAuthoritativeValueRevision((current) => current + 1)
+          }
+        } else {
+          // A previously-issued authority is stale while a newer local draft
+          // is open. Keep non-value option patches, but never replace content.
+          nextProps = { ...nextProps, value: valueRef.current }
+        }
+      }
       propsRef.current = nextProps
-      valueRef.current = nextProps.value
       setProps(nextProps)
       setValueState(nextProps.value)
     }
-    bridge.getValue = () => cloneLoomValue(valueRef.current)
+    bridge.getValue = () => cloneLoomValue(draftValueRef.current ?? valueRef.current)
     bridge.refreshMacros = refreshMacros
     bridge.invalidate = () => {
       if (!aliveRef.current) return
@@ -1430,13 +1548,16 @@ function LoomBlockEditorBridge({
       }
       refreshWaitersRef.current.clear()
     }
-  }, [bridge, refreshMacros])
+  }, [bridge, hasKnownAuthority, rememberAuthority, refreshMacros])
 
   return (
     <ControlledLoomBlockEditor
       blocks={valueState.blocks as PromptBlock[]}
       promptVariables={valueState.promptVariableValues as PromptVariableValues}
       onChange={handleChange}
+      onDraftChange={handleDraftChange}
+      authoritativeValueRevision={authoritativeValueRevision}
+      authoritativeValueIdentity={authoritativeValueRevision}
       availableMacros={availableMacros}
       refreshMacros={() => { void refreshMacros().catch(() => {}) }}
       readOnly={props.readOnly}

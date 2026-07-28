@@ -151,11 +151,6 @@ export function validateSpindleHostDescriptor(
     }
     capabilities[name] = version
   }
-  for (const [name, version] of Object.entries(SPINDLE_HOST_CAPABILITIES)) {
-    if (capabilities[name] !== version) {
-      return fail(`Missing or incompatible Spindle host capability: ${name}`)
-    }
-  }
 
   return Object.freeze({
     descriptorVersion: 1,

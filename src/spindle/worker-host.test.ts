@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test, vi } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
@@ -7,19 +7,37 @@ import type {
   SpindleManifest,
   QuietTrackedResultDTO,
 } from "lumiverse-spindle-types";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
 import { interceptorPipeline, type InterceptorResult } from "./interceptor-pipeline";
+import { createInterceptorTerminalLease } from "./lifecycle";
 import { createBoundHostContainmentFatal } from "./bound-generation";
-import { brandHostGenerationId, isHostContainmentFatal } from "./bound-generation-types";
+import {
+  BOUND_INTERCEPTOR_RESERVE_MS,
+  brandHostGenerationId,
+  isHostContainmentFatal,
+} from "./bound-generation-types";
 import type { ParentGenerationSnapshot } from "./bound-generation-types";
 import type { RuntimeTransport } from "./runtime-transport";
 import * as boundGeneration from "./bound-generation";
 import * as managerSvc from "./manager.service";
 import * as dispatchStateSvc from "../services/dispatch-state.service";
-import { WorkerHost } from "./worker-host";
+import { narrowDeferredGuidance, WorkerHost } from "./worker-host";
 import * as imageGenConnSvc from "../services/image-gen-connections.service";
 import * as imageRegistry from "../image-gen/registry";
 import * as secretsSvc from "../services/secrets.service";
 import * as imagesSvc from "../services/images.service";
+
+beforeEach(() => {
+  spyOn(managerSvc, "getPermissionGrantId").mockImplementation(
+    (_identifier, permission) =>
+      permission === "interceptor"
+        ? "interceptor-grant"
+        : permission === "final_response"
+          ? "final-response-grant"
+          : undefined,
+  );
+});
 
 function makeManifest(identifier: string): SpindleManifest {
   return {
@@ -101,6 +119,14 @@ type WorkerHostInternals = {
   runtime: RuntimeTransport | null;
   runtimeGeneration: string;
   hasPermission: (permission: string) => boolean;
+  pendingRequests: Map<
+    string,
+    {
+      permission?: string | readonly string[];
+      resolve: (value: unknown) => void;
+      reject: (reason: unknown) => void;
+    }
+  >;
   handleRegisterInterceptor: (registrationId: string, priority?: number, match?: unknown) => void;
   handleInterceptorResult: (message: unknown) => void;
   handleBoundAssemble: (message: unknown) => Promise<void>;
@@ -126,6 +152,10 @@ type WorkerHostInternals = {
     __spindle_private_bound?: TestBoundEnvelope;
     __spindle_private_frontend?: TestFrontendScopeEnvelope;
   }) => Promise<void>;
+  handleSubscribeEvent: (event: string) => void;
+  eventUnsubscribers: Map<string, () => void>;
+  notifyPermissionChanged: (permission: string, granted: boolean, allGranted: string[]) => void;
+  invokeExtensionTool: (toolName: string, args: Record<string, unknown>) => Promise<string>;
   cleanup: () => void;
 };
 
@@ -148,13 +178,16 @@ function makeParentSnapshot(hostGeneration: string): ParentGenerationSnapshot {
   } as unknown as ParentGenerationSnapshot;
 }
 
-function makeTestHost(failInterceptRequest = true): {
+function makeTestHost(
+  failInterceptRequest = true,
+  interceptorTimeoutMs = 1_000,
+): {
   internals: WorkerHostInternals;
   messages: CapturedRuntimeMessage[];
 } {
   const installationId = crypto.randomUUID();
   const identifier = `worker_host_interceptor_${crypto.randomUUID().replaceAll("-", "")}`;
-  const manifest = makeManifest(identifier);
+  const manifest = { ...makeManifest(identifier), interceptorTimeoutMs };
   const host = new WorkerHost(
     installationId,
     manifest,
@@ -778,8 +811,9 @@ describe("WorkerHost frontend-message dispatch authority", () => {
 
 describe("WorkerHost interceptor transport boundary", () => {
   test("sends a cloneable signal-free context with runtimeGeneration and settles sync transport failure", async () => {
-    const { internals, messages } = makeTestHost();
+    const { internals, messages } = makeTestHost(true, 300_000);
     const outerController = new AbortController();
+    const startedAt = Date.now();
     const dispatch = interceptorPipeline.run(
       [{ role: "user", content: "hello" }],
       {
@@ -803,6 +837,21 @@ describe("WorkerHost interceptor transport boundary", () => {
       expect(context).toBeDefined();
       expect("signal" in (context ?? {})).toBe(false);
       expect(structuredClone(context ?? {})).toEqual(context ?? {});
+      const interceptorDeadlineAt = context?.interceptorDeadlineAt;
+      const boundWorkDeadlineAt = context?.boundWorkDeadlineAt;
+      expect(typeof interceptorDeadlineAt).toBe("number");
+      expect(typeof boundWorkDeadlineAt).toBe("number");
+      if (
+        typeof interceptorDeadlineAt !== "number"
+        || typeof boundWorkDeadlineAt !== "number"
+      ) {
+        throw new Error("prepared interceptor deadlines are unavailable");
+      }
+      expect(interceptorDeadlineAt).toBeGreaterThanOrEqual(startedAt + 300_000);
+      expect(interceptorDeadlineAt).toBeLessThanOrEqual(Date.now() + 300_000);
+      expect(boundWorkDeadlineAt).toBe(
+        interceptorDeadlineAt - BOUND_INTERCEPTOR_RESERVE_MS,
+      );
     } finally {
       outerController.abort(new Error("test cleanup"));
       await dispatch;
@@ -841,6 +890,9 @@ describe("WorkerHost interceptor transport boundary", () => {
   test("settles a parent-bound result with distinct runtime and parent provenance", async () => {
     const { internals, messages } = makeTestHost(false);
     const parent = makeParentSnapshot("parent-host-generation-worker-host-test");
+    const grantSpy = spyOn(managerSvc, "getPermissionGrantId").mockImplementation(
+      (_identifier, permission) => permission === "final_response" ? "final-grant" : undefined,
+    );
     const dispatch = interceptorPipeline.run(
       [{ role: "user", content: "hello" }],
       {
@@ -858,9 +910,6 @@ describe("WorkerHost interceptor transport boundary", () => {
     expect(request?.hostGeneration).toBe(internals.runtimeGeneration);
     expect(request?.hostGeneration).not.toBe(parent.hostGeneration);
     expect(request?.__spindle_private_bound?.hostGeneration).toBe(parent.hostGeneration);
-    const grantSpy = spyOn(managerSvc, "getPermissionGrantId").mockImplementation(
-      (_identifier, permission) => permission === "final_response" ? "final-grant" : undefined,
-    );
 
     try {
       const requestId = request?.requestId;
@@ -956,6 +1005,247 @@ describe("WorkerHost interceptor transport boundary", () => {
       await dispatchB;
     }
   }, { timeout: 1_000 });
+  test("rejects a stale interceptor result after permission revoke and regrant", async () => {
+    const { internals, messages } = makeTestHost(false);
+    let grantId = "interceptor-grant-a";
+    const grantSpy = spyOn(managerSvc, "getPermissionGrantId").mockImplementation(
+      (_identifier, permission) => permission === "interceptor" ? grantId : undefined,
+    );
+    const dispatch = interceptorPipeline.run(
+      [{ role: "user", content: "hello" }],
+      {
+        userId: "user-1",
+        chatId: "chat-1",
+        generationId: "generation-aba",
+        generationType: "normal",
+      },
+      undefined,
+    );
+
+    try {
+      const request = messages.find((message) => message.type === "intercept_request");
+      if (
+        !request?.requestId
+        || !request.registrationId
+        || !request.registrationGeneration
+        || !request.workerId
+        || !request.hostGeneration
+      ) {
+        throw new Error("interceptor request fixture is incomplete");
+      }
+      grantId = "interceptor-grant-b";
+      internals.handleInterceptorResult({
+        type: "intercept_result",
+        requestId: request.requestId,
+        registrationId: request.registrationId,
+        registrationGeneration: request.registrationGeneration,
+        workerId: request.workerId,
+        hostGeneration: request.hostGeneration,
+        messages: [{ role: "user", content: "stale result" }],
+      });
+      const result = await dispatch;
+      expect(result.messages).toEqual([{ role: "user", content: "hello" }]);
+      expect(messages.filter((message) => message.type === "intercept_abort")).toHaveLength(1);
+    } finally {
+      grantSpy.mockRestore();
+      internals.cleanup();
+      await dispatch;
+    }
+  }, { timeout: 1_000 });
+  test("rejects stale final-response delivery after permission revoke and regrant", async () => {
+    const { internals, messages } = makeTestHost(false);
+    let finalGrantId = "final-response-grant-a";
+    const grantSpy = spyOn(managerSvc, "getPermissionGrantId").mockImplementation(
+      (_identifier, permission) =>
+        permission === "interceptor"
+          ? "interceptor-grant-a"
+          : permission === "final_response"
+            ? finalGrantId
+            : undefined,
+    );
+    const dispatch = interceptorPipeline.run(
+      [
+        { role: "system", content: "fallback" },
+        { role: "user", content: "hello" },
+      ],
+      {
+        userId: "user-1",
+        chatId: "chat-1",
+        generationId: "generation-final-aba",
+        generationType: "normal",
+      },
+      undefined,
+    );
+
+    try {
+      const request = messages.find((message) => message.type === "intercept_request");
+      if (
+        !request?.requestId
+        || !request.registrationId
+        || !request.registrationGeneration
+        || !request.workerId
+        || !request.hostGeneration
+      ) {
+        throw new Error("interceptor request fixture is incomplete");
+      }
+      finalGrantId = "final-response-grant-b";
+      internals.handleInterceptorResult({
+        type: "intercept_result",
+        requestId: request.requestId,
+        registrationId: request.registrationId,
+        registrationGeneration: request.registrationGeneration,
+        workerId: request.workerId,
+        hostGeneration: request.hostGeneration,
+        messages: [
+          { role: "system", content: "fallback" },
+          { role: "user", content: "hello" },
+        ],
+        breakdown: [{ messageIndex: 0, name: "Fallback" }],
+        finalResponse: {
+          content: "stale final",
+          fallbackMessageIndex: 0,
+        },
+      });
+      const result = await dispatch;
+      expect(result.messages).toEqual([
+        { role: "system", content: "fallback" },
+        { role: "user", content: "hello" },
+      ]);
+      expect(result.finalResponseState?.status).toBe("unauthorized");
+    } finally {
+      grantSpy.mockRestore();
+      internals.cleanup();
+      await dispatch;
+    }
+  }, { timeout: 1_000 });
+  test("cleans pending interceptor work once on terminal host cleanup", async () => {
+    const { internals, messages } = makeTestHost(false);
+    const dispatch = interceptorPipeline.run(
+      [{ role: "user", content: "hello" }],
+      {
+        userId: "user-1",
+        chatId: "chat-1",
+        generationId: "generation-cleanup",
+        generationType: "normal",
+      },
+      undefined,
+    );
+
+    try {
+      internals.cleanup();
+      internals.cleanup();
+      const result = await dispatch;
+      expect(result.messages).toEqual([{ role: "user", content: "hello" }]);
+      expectNoBoundLeaks(internals);
+      expect(messages.filter((message) => message.type === "intercept_abort")).toHaveLength(0);
+    } finally {
+      await dispatch;
+      internals.cleanup();
+    }
+  }, { timeout: 1_000 });
+});
+
+describe("WorkerHost live permission and event isolation", () => {
+  test("rejects subscriptions to private presentation events", () => {
+    const { internals } = makeTestHost(false);
+    try {
+      internals.handleSubscribeEvent("SPINDLE_FRONTEND_MSG");
+      internals.handleSubscribeEvent("SPINDLE_TEXT_EDITOR_RESULT");
+      expect(internals.eventUnsubscribers.has("SPINDLE_FRONTEND_MSG")).toBe(false);
+      expect(internals.eventUnsubscribers.has("SPINDLE_TEXT_EDITOR_RESULT")).toBe(false);
+    } finally {
+      internals.cleanup();
+    }
+  });
+
+  test("removes generation subscriptions and rejects tool dispatch after revoke", async () => {
+    const { internals } = makeTestHost(false);
+    const granted = new Set(["generation", "tools", "interceptor"]);
+    internals.hasPermission = (permission) => granted.has(permission);
+    try {
+      internals.handleSubscribeEvent("GENERATION_STARTED");
+      expect(internals.eventUnsubscribers.has("GENERATION_STARTED")).toBe(true);
+      granted.delete("generation");
+      internals.notifyPermissionChanged("generation", false, [...granted]);
+      expect(internals.eventUnsubscribers.has("GENERATION_STARTED")).toBe(false);
+      granted.delete("tools");
+      internals.notifyPermissionChanged("tools", false, [...granted]);
+      await expect(internals.invokeExtensionTool("revoked-tool", {})).rejects.toThrow("not granted");
+    } finally {
+      internals.cleanup();
+    }
+  });
+  test("revokes only work that depends on the changed permission", async () => {
+    const { internals } = makeTestHost(false);
+    const generation = Promise.withResolvers<void>();
+    const unrelated = Promise.withResolvers<void>();
+    const boundController = new AbortController();
+    const imageController = new AbortController();
+    const finalLease = createInterceptorTerminalLease({
+      registrationId: "final-response-registration",
+      generationId: "generation-1",
+      callbackUserId: "user-1",
+      guidance: [],
+    });
+    internals.pendingRequests.set("generation-request", {
+      permission: "generation",
+      resolve: () => generation.resolve(),
+      reject: (reason) => generation.reject(reason),
+    });
+    internals.pendingRequests.set("tools-request", {
+      permission: "tools",
+      resolve: () => unrelated.resolve(),
+      reject: (reason) => unrelated.reject(reason),
+    });
+    internals.boundOperationControllers.set("bound-revocation", {
+      invocationRequestId: "missing-invocation",
+      controller: boundController,
+      onInvocationAbort: () => undefined,
+      teardownRequested: false,
+    });
+    internals.imageGenerationAbortControllers.set("image-revocation", imageController);
+    internals.interceptorInvocations.set("final-response-revocation", {
+      finalResponsePermissionGrantId: "final-response-grant",
+      terminalLease: finalLease,
+    });
+    try {
+      internals.notifyPermissionChanged("generation", false, ["tools"]);
+      await expect(generation.promise).rejects.toThrow("generation");
+      expect(internals.pendingRequests.has("tools-request")).toBe(true);
+      expect(boundController.signal.aborted).toBe(true);
+      expect(imageController.signal.aborted).toBe(false);
+
+      internals.notifyPermissionChanged("image_gen", false, ["tools"]);
+      expect(imageController.signal.aborted).toBe(true);
+
+      internals.notifyPermissionChanged("final_response", false, ["tools"]);
+      expect(finalLease.isActive()).toBe(false);
+
+      internals.pendingRequests.get("tools-request")?.resolve(undefined);
+      internals.pendingRequests.delete("tools-request");
+      await unrelated.promise;
+    } finally {
+      internals.interceptorInvocations.delete("final-response-revocation");
+      internals.cleanup();
+    }
+  });
+
+  test("drops a queued generation event after permission revoke", () => {
+    const { internals, messages } = makeTestHost(false);
+    internals.hasPermission = (permission) => permission === "generation";
+    vi.useFakeTimers();
+    try {
+      internals.handleSubscribeEvent("GENERATION_STARTED");
+      eventBus.emit(EventType.GENERATION_STARTED, { generationId: "queued-after-revoke" }, "user-1");
+      internals.notifyPermissionChanged("generation", false, []);
+      vi.runAllTimers();
+      expect(messages.filter((message) => message.type === "event")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+      internals.cleanup();
+    }
+  });
+
 });
 
 describe("WorkerHost image generation stream bridge", () => {
@@ -1244,5 +1534,19 @@ describe("WorkerHost image generation stream bridge", () => {
       connectionSpy.mockRestore();
       internals.cleanup();
     }
+  });
+});
+
+describe("WorkerHost deferred guidance admission", () => {
+  test("accepts only the documented bounded canonical guidance contract", () => {
+    const first = {
+      id: "123e4567-e89b-42d3-a456-426614174000",
+      content: "Use the verified result.",
+      role: "system" as const,
+    };
+    expect(narrowDeferredGuidance([first])).toEqual([first]);
+    expect(narrowDeferredGuidance([{ ...first, id: "guidance-1" }])).toBeUndefined();
+    expect(narrowDeferredGuidance([first, first])).toBeUndefined();
+    expect(narrowDeferredGuidance([{ ...first, content: "" }])).toBeUndefined();
   });
 });

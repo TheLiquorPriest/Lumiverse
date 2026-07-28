@@ -131,6 +131,7 @@ describe("Spindle host compatibility", () => {
           ["loom-block-management-v1", 1],
           ["preset-editor-v1", 1],
           ["preset-extension-data-v1", 1],
+          ["text-editor-close-v1", 1],
         ],
       ]),
     );

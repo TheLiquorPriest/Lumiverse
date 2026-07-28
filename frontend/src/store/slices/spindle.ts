@@ -299,18 +299,44 @@ export const createSpindleSlice: StateCreator<SpindleSlice> = (set, get) => ({
   },
 
   openTextEditor: (request: PendingTextEditorRequest) => {
-    set({ pendingTextEditor: request })
+    const current = get().pendingTextEditor
+    if (!current) {
+      set({ pendingTextEditor: request })
+      return
+    }
+    if (current.requestId === request.requestId) return
+
+    // A second OPEN is anomalous because the backend leases one editor per
+    // user. Preserve the visible request and settle the unexpected one so its
+    // worker cannot remain blocked behind a request this tab did not mount.
+    wsClient.send({
+      type: 'SPINDLE_TEXT_EDITOR_RESULT',
+      requestId: request.requestId,
+      text: request.value ?? '',
+      cancelled: true,
+    })
   },
 
   closeTextEditor: (requestId: string, text: string, cancelled: boolean) => {
-    set({ pendingTextEditor: null })
-    wsClient.send({
+    const current = get().pendingTextEditor
+    if (!current || current.requestId !== requestId) return
+    const accepted = wsClient.send({
       type: 'SPINDLE_TEXT_EDITOR_RESULT',
       requestId,
       text,
       cancelled,
     })
+    if (!accepted) return
+    set({ pendingTextEditor: null })
   },
+  dismissTextEditor: (requestId: string) => {
+    set((state) => {
+      // Server-initiated cancellation must not echo a result back over WebSocket.
+      if (state.pendingTextEditor?.requestId !== requestId) return state
+      return { ...state, pendingTextEditor: null }
+    })
+  },
+
 
   openSpindleModal: (request) => {
     set({ pendingModal: request })

@@ -28,6 +28,38 @@ import {
 } from '@/lib/expandedTextSearch'
 import s from './ExpandedTextEditor.module.css'
 
+const bodyOverflowLocks = new Set<symbol>()
+let bodyOverflowBeforeLock: string | null = null
+
+function acquireBodyOverflowLock(): symbol {
+  const token = Symbol('expanded-text-editor-overflow')
+  if (bodyOverflowLocks.size === 0) bodyOverflowBeforeLock = document.body.style.overflow
+  bodyOverflowLocks.add(token)
+  document.body.style.overflow = 'hidden'
+  return token
+}
+
+function releaseBodyOverflowLock(token: symbol): void {
+  if (!bodyOverflowLocks.delete(token)) return
+  if (bodyOverflowLocks.size > 0) {
+    document.body.style.overflow = 'hidden'
+    return
+  }
+  document.body.style.overflow = bodyOverflowBeforeLock ?? ''
+  bodyOverflowBeforeLock = null
+}
+
+const modalDialogStack = new Set<HTMLElement>()
+const DIALOG_FOCUSABLE_SELECTOR = [
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  'a[href]',
+  '[contenteditable="true"]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
+
 // ============================================================================
 // SYNTAX HIGHLIGHTING
 // ============================================================================
@@ -205,6 +237,7 @@ interface ExpandedTextEditorProps {
   value: string
   onChange: (value: string) => void
   onClose: () => void
+  onCancel?: () => void
   title: string
   placeholder?: string
   initialCursorPos?: number | null
@@ -243,6 +276,7 @@ export default function ExpandedTextEditor({
   value,
   onChange,
   onClose,
+  onCancel,
   title,
   placeholder,
   initialCursorPos,
@@ -257,6 +291,7 @@ export default function ExpandedTextEditor({
   const findInputRef = useRef<HTMLInputElement>(null)
   const overlayMouseDownRef = useRef<EventTarget | null>(null)
   const onCloseRef = useRef(onClose)
+  const onCancelRef = useRef(onCancel)
   const selectionRef = useRef<TextSelectionSnapshot | null>(null)
   const hasInitializedSelectionRef = useRef(false)
   const shouldRestoreSelectionRef = useRef(true)
@@ -267,7 +302,11 @@ export default function ExpandedTextEditor({
   const lastScrolledMatchNavigationRequestRef = useRef(0)
   const macroSearchRef = useRef('')
   const showMacrosRef = useRef(false)
+  const previousFocusRef = useRef<HTMLElement | null>(null)
+  const macroLoadAliveRef = useRef(true)
+  const macroLoadRequestRef = useRef(0)
   onCloseRef.current = onClose
+  onCancelRef.current = onCancel
 
   const [showMacros, setShowMacros] = useState(false)
   const [macroSearch, setMacroSearch] = useState('')
@@ -280,6 +319,80 @@ export default function ExpandedTextEditor({
     () => (macros || markdownOnly) ? null : getAvailableMacros(),
   )
 
+  useEffect(() => {
+    macroLoadAliveRef.current = true
+    return () => {
+      macroLoadAliveRef.current = false
+      macroLoadRequestRef.current += 1
+    }
+  }, [])
+
+  useLayoutEffect(() => {
+    if (previousFocusRef.current === null) {
+      const active = document.activeElement
+      previousFocusRef.current = active instanceof HTMLElement ? active : null
+    }
+    textareaRef.current?.focus({ preventScroll: true })
+    return () => {
+      if (inline) return
+      const previous = previousFocusRef.current
+      if (previous?.isConnected) previous.focus({ preventScroll: true })
+    }
+  }, [inline])
+
+  useLayoutEffect(() => {
+    if (inline) return
+    const dialog = dialogRef.current
+    if (!dialog) return
+    modalDialogStack.add(dialog)
+    return () => {
+      modalDialogStack.delete(dialog)
+    }
+  }, [inline])
+
+  useEffect(() => {
+    if (inline) return
+    const handleTab = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Tab') return
+      const dialog = dialogRef.current
+      const topDialog = [...modalDialogStack].at(-1)
+      if (!dialog || topDialog !== dialog) return
+      const focusable = [...dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE_SELECTOR)]
+        .filter((element) => !element.hidden && element.getAttribute('aria-hidden') !== 'true')
+      const moveFocus = (target: HTMLElement | undefined) => {
+        event.preventDefault()
+        event.stopPropagation()
+        target?.focus({ preventScroll: true })
+      }
+      if (focusable.length === 0) {
+        moveFocus(dialog)
+        return
+      }
+      if (
+        !event.shiftKey
+        && !event.altKey
+        && !event.ctrlKey
+        && !event.metaKey
+        && document.activeElement === textareaRef.current
+        && !isComposingRef.current
+      ) return
+      const active = document.activeElement
+      const currentIndex = active instanceof HTMLElement ? focusable.indexOf(active) : -1
+      if (event.shiftKey) {
+        if (currentIndex <= 0) moveFocus(focusable.at(-1))
+      } else if (currentIndex === -1 || currentIndex === focusable.length - 1) {
+        moveFocus(focusable[0])
+      }
+    }
+    document.addEventListener('keydown', handleTab, true)
+    return () => document.removeEventListener('keydown', handleTab, true)
+  }, [inline])
+
+  useLayoutEffect(() => {
+    if (inline) return
+    const lock = acquireBodyOverflowLock()
+    return () => releaseBodyOverflowLock(lock)
+  }, [inline])
   // Use caller-provided macros, or eagerly-loaded local catalog
   const resolvedMacros = useMemo(() => macros ?? selfLoadedMacros ?? [], [macros, selfLoadedMacros])
   findModeRef.current = findMode
@@ -294,10 +407,12 @@ export default function ExpandedTextEditor({
 
   const loadMacros = useCallback(() => {
     if (macros) { onRefreshMacros?.(); return }
-    // Self-load: start with local fallback, then fetch from API
+    // Self-load: start with local fallback, then fetch from API.
     if (!selfLoadedMacros) setSelfLoadedMacros(getAvailableMacros())
+    const requestId = ++macroLoadRequestRef.current
     getMacroCatalog()
       .then((catalog) => {
+        if (!macroLoadAliveRef.current || macroLoadRequestRef.current !== requestId) return
         const groups: MacroGroup[] = catalog.categories.map((c) => ({
           category: c.category,
           macros: c.macros.map((m) => ({ name: m.name, syntax: m.syntax, description: m.description, args: m.args, returns: m.returns })),
@@ -447,6 +562,8 @@ export default function ExpandedTextEditor({
 
   useEffect(() => {
     const handleEditorShortcut = (e: KeyboardEvent) => {
+      const topDialog = [...modalDialogStack].at(-1)
+      if ((topDialog && topDialog !== dialogRef.current) || (!inline && !topDialog)) return
       const key = e.key.toLowerCase()
       if ((e.ctrlKey || e.metaKey) && !e.altKey && key === 'f') {
         e.preventDefault()
@@ -482,16 +599,14 @@ export default function ExpandedTextEditor({
       } else if (showMacrosRef.current && macroSearchRef.current) {
         setMacroSearch('')
       } else {
-        onCloseRef.current()
+        ;(onCancelRef.current ?? onCloseRef.current)()
       }
     }
     // Capture phase so we intercept before parent modal escape handlers
     document.addEventListener('keydown', handleEditorShortcut, true)
-    if (!inline) document.body.style.overflow = 'hidden'
 
     return () => {
       document.removeEventListener('keydown', handleEditorShortcut, true)
-      if (!inline) document.body.style.overflow = ''
     }
   }, [inline])
 
@@ -595,7 +710,15 @@ export default function ExpandedTextEditor({
   )
 
   const editorContent = (
-    <div ref={dialogRef} className={inline ? s.inlineDialog : s.dialog} onClick={e => e.stopPropagation()}>
+    <div
+      ref={dialogRef}
+      className={inline ? s.inlineDialog : s.dialog}
+      role="dialog"
+      aria-modal={inline ? undefined : 'true'}
+      aria-label={title}
+      tabIndex={-1}
+      onClick={e => e.stopPropagation()}
+    >
       <div className={s.header}>
         <div className={s.headerContent}>
           <h3 className={s.title}>{title}</h3>
@@ -819,7 +942,7 @@ export default function ExpandedTextEditor({
     <div
       className={s.overlay}
       onMouseDown={(e) => { overlayMouseDownRef.current = e.target }}
-      onClick={(e) => { if (e.target === e.currentTarget && overlayMouseDownRef.current === e.currentTarget) onClose() }}
+      onClick={(e) => { if (e.target === e.currentTarget && overlayMouseDownRef.current === e.currentTarget) (onCancel ?? onClose)() }}
     >
       {editorContent}
     </div>,

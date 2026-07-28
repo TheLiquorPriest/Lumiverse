@@ -118,14 +118,19 @@ function timingSafeStringEqual(left: string, right: string): boolean {
   }
   return difference === 0
 }
-function requiredCapabilityDescriptor(descriptor: SpindleHostDescriptorV1): SpindleHostDescriptorV1 {
+function requiredCapabilityDescriptor(
+  descriptor: SpindleHostDescriptorV1,
+  lumiverseVersion = descriptor.lumiverseVersion,
+  capabilityNames: readonly string[] = Object.keys(SPINDLE_HOST_CAPABILITIES),
+): SpindleHostDescriptorV1 {
   const capabilities: Record<string, number> = {}
-  for (const name of Object.keys(SPINDLE_HOST_CAPABILITIES)) {
-    capabilities[name] = descriptor.capabilities[name]
+  for (const name of capabilityNames) {
+    const version = descriptor.capabilities[name]
+    if (version !== undefined) capabilities[name] = version
   }
   return Object.freeze({
     descriptorVersion: descriptor.descriptorVersion,
-    lumiverseVersion: descriptor.lumiverseVersion,
+    lumiverseVersion,
     extensionInstallationId: descriptor.extensionInstallationId,
     capabilities: Object.freeze(capabilities),
   })
@@ -157,16 +162,25 @@ async function performCompatibilityHandshake(
     }
     const descriptor = validateSpindleHostDescriptor(payload.descriptor, extensionId)
     assertManifestCompatibility(manifest, descriptor.lumiverseVersion)
-    const localRequired = requiredCapabilityDescriptor(localDescriptor)
-    const backendRequired = requiredCapabilityDescriptor(descriptor)
+    const sharedCapabilityNames = Object.keys(SPINDLE_HOST_CAPABILITIES)
+      .filter((name) => descriptor.capabilities[name] !== undefined)
+    const localRequired = requiredCapabilityDescriptor(
+      localDescriptor,
+      descriptor.lumiverseVersion,
+      sharedCapabilityNames,
+    )
+    const backendRequired = requiredCapabilityDescriptor(
+      descriptor,
+      descriptor.lumiverseVersion,
+      sharedCapabilityNames,
+    )
     if (
       descriptor.descriptorVersion !== localRequired.descriptorVersion
-      || descriptor.lumiverseVersion !== localRequired.lumiverseVersion
       || descriptor.extensionInstallationId !== localRequired.extensionInstallationId
     ) {
       throw new SpindleCompatibilityError('Spindle compatibility handshake descriptor does not match this frontend')
     }
-    for (const name of Object.keys(SPINDLE_HOST_CAPABILITIES)) {
+    for (const name of sharedCapabilityNames) {
       if (backendRequired.capabilities[name] !== localRequired.capabilities[name]) {
         throw new SpindleCompatibilityError(`Spindle compatibility handshake capability mismatch: ${name}`)
       }
@@ -177,8 +191,7 @@ async function performCompatibilityHandshake(
     if (
       !timingSafeStringEqual(localDigest, backendRequiredDigest)
       || typeof payload.digest !== 'string'
-      || (!timingSafeStringEqual(payload.digest, backendRequiredDigest)
-        && !timingSafeStringEqual(payload.digest, backendFullDigest))
+      || !timingSafeStringEqual(payload.digest, backendFullDigest)
     ) {
       throw new SpindleCompatibilityError('Spindle compatibility handshake descriptor digest mismatch')
     }
@@ -514,15 +527,18 @@ async function doLoadFrontendExtension(
   if (!force && existing?.manifestSignature === manifestSignature) {
     return
   }
+  const generation = (loadGeneration.get(extensionId) || 0) + 1
+  loadGeneration.set(extensionId, generation)
+
 
   const hostDescriptor = await performCompatibilityHandshake(extensionId, manifest, localDescriptor)
+  if (loadGeneration.get(extensionId) !== generation) return
   if (existing) {
-    await unloadFrontendExtension(extensionId)
+    await unloadFrontendExtension(extensionId, { invalidateGeneration: false })
+    if (loadGeneration.get(extensionId) !== generation) return
   }
 
-  const generation = (loadGeneration.get(extensionId) || 0) + 1
   bootstrappingGenerations.set(extensionId, generation)
-  loadGeneration.set(extensionId, generation)
   let frontendLifecycleActive = true
   const currentGeneration = () => loadGeneration.get(extensionId) === generation
   const assertFrontendActive = () => {

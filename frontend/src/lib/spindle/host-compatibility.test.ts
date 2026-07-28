@@ -37,15 +37,11 @@ describe('frontend Spindle host compatibility', () => {
   })
 
   test('rejects malformed and noncanonical descriptor fields', () => {
-    const missing = { ...SPINDLE_HOST_CAPABILITIES } as Record<string, number>
-    delete missing['interceptor-final-response-v1']
     for (const value of [
       descriptor({ descriptorVersion: 2 }),
       descriptor({ lumiverseVersion: 'v1.0.8' }),
       descriptor({ extensionInstallationId: INSTALLATION_ID.toUpperCase() }),
       descriptor({ extensionInstallationId: '123e4567-e89b-02d3-a456-426614174000' }),
-      descriptor({ capabilities: missing }),
-      descriptor({ capabilities: { ...SPINDLE_HOST_CAPABILITIES, 'interceptor-final-response-v1': 2 } }),
       descriptor({ capabilities: { ...SPINDLE_HOST_CAPABILITIES, 'Bad Key': 1 } }),
       descriptor({ capabilities: { ...SPINDLE_HOST_CAPABILITIES, 'future-v1': 0 } }),
     ]) {
@@ -53,11 +49,17 @@ describe('frontend Spindle host compatibility', () => {
     }
   })
 
-  test('requires the loaded installation ID and permits valid unknown capabilities', () => {
+  test('requires the loaded installation ID and permits compatible capability subsets and unknowns', () => {
+    const capabilities = {
+      ...SPINDLE_HOST_CAPABILITIES,
+      'future-capability-v2': 3,
+    } as Record<string, number>
+    delete capabilities['interceptor-final-response-v1']
     const value = validateSpindleHostDescriptor({
       ...descriptor(),
-      capabilities: { ...SPINDLE_HOST_CAPABILITIES, 'future-capability-v2': 3 },
+      capabilities,
     }, INSTALLATION_ID)
+    expect(value.capabilities['interceptor-final-response-v1']).toBeUndefined()
     expect(value.capabilities['future-capability-v2']).toBe(3)
     expect(() => validateSpindleHostDescriptor(descriptor(), '123e4567-e89b-42d3-a456-426614174001')).toThrow(SpindleCompatibilityError)
     expect(Object.isFrozen(value)).toBe(true)

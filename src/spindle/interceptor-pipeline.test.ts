@@ -13,7 +13,11 @@ import {
 } from "./interceptor-pipeline";
 import { createInterceptorTerminalLease } from "./lifecycle";
 import { createBoundHostContainmentFatal } from "./bound-generation";
-import { brandHostGenerationId } from "./bound-generation-types";
+import {
+  BOUND_INTERCEPTOR_RESERVE_MS,
+  brandHostGenerationId,
+  type BoundDeadlineWindow,
+} from "./bound-generation-types";
 
 type NormalizeFixture = Omit<
   NormalizeFinalResponseInput,
@@ -645,6 +649,49 @@ describe("interceptor pipeline callback cancellation", () => {
       });
       await lateResult;
       expect(result.messages).toEqual(inputMessages);
+    } finally {
+      dispose();
+    }
+  });
+
+  test("prepares callback and bound-work deadlines from the resolved interceptor budget", async () => {
+    const inputMessages: LlmMessageDTO[] = [{ role: "user", content: "deadline input" }];
+    const timeoutMs = 300_000;
+    let timeoutResolutions = 0;
+    let preparedWindow: BoundDeadlineWindow | undefined;
+    const dispose = interceptorPipeline.register({
+      extensionId: "deadline-window",
+      extensionName: "Deadline window",
+      priority: 1,
+      resolveTimeoutMs: () => {
+        timeoutResolutions += 1;
+        return timeoutMs;
+      },
+      contextPreparer: (_context, _signal, _authority, deadlineWindow) => {
+        preparedWindow = deadlineWindow;
+        return {};
+      },
+      handler: async (messages) => ({ messages }),
+    });
+    const startedAt = Date.now();
+    try {
+      const result = await interceptorPipeline.run(
+        inputMessages,
+        { chatId: "deadline-window-chat" },
+        "user-pipeline-test",
+      );
+      const settledAt = Date.now();
+      expect(result.messages).toEqual(inputMessages);
+      expect(timeoutResolutions).toBe(1);
+      expect(preparedWindow).toBeDefined();
+      if (!preparedWindow) throw new Error("deadline window was not prepared");
+      expect(preparedWindow.entryAt).toBeGreaterThanOrEqual(startedAt);
+      expect(preparedWindow.entryAt).toBeLessThanOrEqual(settledAt);
+      expect(preparedWindow.interceptorDeadlineAt - preparedWindow.entryAt).toBe(timeoutMs);
+      expect(preparedWindow.boundWorkDeadlineAt).toBe(
+        preparedWindow.interceptorDeadlineAt - BOUND_INTERCEPTOR_RESERVE_MS,
+      );
+      expect(Object.isFrozen(preparedWindow)).toBe(true);
     } finally {
       dispose();
     }

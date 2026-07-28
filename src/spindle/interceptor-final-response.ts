@@ -24,6 +24,16 @@ export interface ProtectedFinalResponseBreakdown {
   readonly extensionName: string;
 }
 
+export interface SupersededFinalResponseMetadata {
+  readonly extensionId: string;
+  readonly extensionName: string;
+  readonly workerId: string;
+  readonly registrationId: string;
+  readonly callbackUserId: string;
+  readonly hostGeneration: string;
+  readonly carrierNonce: string;
+  readonly fallbackMessageIndex: number;
+}
 export interface ValidInterceptorFinalResponse {
   readonly status: "valid";
   readonly content: string;
@@ -33,7 +43,7 @@ export interface ValidInterceptorFinalResponse {
   readonly fallbackBreakdown: ProtectedFinalResponseBreakdown;
   readonly carrierNonce: string;
   readonly prefillCarrier?: LlmMessageDTO;
-  readonly supersededResponse?: ValidInterceptorFinalResponse;
+  readonly supersededResponse?: SupersededFinalResponseMetadata;
   readonly extensionId: string;
   readonly extensionName: string;
   readonly workerId: string;
@@ -84,7 +94,8 @@ export interface NormalizeFinalResponseResult {
 
 export interface FinalResponseBreakdownReplacement {
   readonly from: ProtectedFinalResponseBreakdown;
-  readonly to: ProtectedFinalResponseBreakdown;
+  /** Omitted when the host carrier breakdown must be removed for native delivery. */
+  readonly to?: ProtectedFinalResponseBreakdown;
 }
 
 export type FinalResponseDispatchDecision =
@@ -120,6 +131,20 @@ function hostIdentity(value: unknown, label: string): string {
     throw new TypeError(`${label} must be a non-empty host identity`);
   }
   return value.trim();
+}
+function summarizeSupersededResponse(
+  response: ValidInterceptorFinalResponse,
+): SupersededFinalResponseMetadata {
+  return Object.freeze({
+    extensionId: response.extensionId,
+    extensionName: response.extensionName,
+    workerId: response.workerId,
+    registrationId: response.registrationId,
+    callbackUserId: response.callbackUserId,
+    hostGeneration: response.hostGeneration,
+    carrierNonce: response.carrierNonce,
+    fallbackMessageIndex: response.fallbackMessageIndex,
+  });
 }
 
 function invalid(
@@ -246,6 +271,14 @@ export function normalizeInterceptorFinalResponse(
       || fallbackMessage.content.trim().length === 0
     ) {
       throw new TypeError("finalResponse fallback must identify one nonempty text system message");
+    }
+    const inheritedFallbackIndexes = input.inputMessages
+      .map((message, index) => sameCarrierIdentity(message, fallbackMessage) ? index : -1)
+      .filter((index) => index >= 0);
+    if (inheritedFallbackIndexes.length > 0) {
+      throw new TypeError(
+        "finalResponse fallback is ambiguous with an inherited message",
+      );
     }
     const withoutFallback = input.outputMessages.filter((_, index) => index !== fallbackMessageIndex);
     if (!isDeepStrictEqual(withoutFallback, input.inputMessages)) {
@@ -376,16 +409,29 @@ function fallbackCandidateIndexes(
   messages: readonly LlmMessageDTO[],
   response: ValidInterceptorFinalResponse,
 ): number[] {
-  const marked = carrierIndexes(messages, response.carrierNonce)
-    .filter((index) => sameCarrierIdentity(messages[index], response.fallbackMessage));
-  if (marked.length > 0) return marked;
-  if (sameCarrierIdentity(messages[response.fallbackMessageIndex], response.fallbackMessage)) {
-    return [response.fallbackMessageIndex];
+  const marked = carrierIndexes(messages, response.carrierNonce);
+  if (marked.length > 0) return [...marked].sort((left, right) => left - right);
+
+  const positionalIndex = response.fallbackMessageIndex;
+  if (
+    Number.isSafeInteger(positionalIndex)
+    && positionalIndex >= 0
+    && positionalIndex < messages.length
+    && sameCarrierIdentity(messages[positionalIndex], response.fallbackMessage)
+  ) {
+    return [positionalIndex];
   }
+
+  // An unmarked exact copy cannot identify the host carrier after its
+  // position changed. Reject rather than deleting an inherited message or
+  // forwarding a duplicate canonical fallback.
   const exact = messages
     .map((message, index) => sameCarrierIdentity(message, response.fallbackMessage) ? index : -1)
     .filter((index) => index >= 0);
-  return exact.length === 1 ? exact : [];
+  if (exact.length > 0) {
+    throw new Error("Final response fallback carrier is missing, modified, or ambiguous");
+  }
+  return [];
 }
 
 /** Restore the immutable host snapshot once, preserving an authoritative prefill. */
@@ -398,7 +444,13 @@ export function ensureInterceptorFinalResponseFallback(
   const restoredMessages = stripCarrierMarkers(messages)
     .filter((_, index) => !candidateIndexes.has(index));
 
-  let insertionIndex = restoredMessages.length;
+  const fallbackIndex = Number.isSafeInteger(response.fallbackMessageIndex)
+    ? response.fallbackMessageIndex
+    : restoredMessages.length;
+  let insertionIndex = Math.min(
+    Math.max(fallbackIndex, 0),
+    restoredMessages.length,
+  );
   if (response.prefillCarrier) {
     const prefillIndexes = restoredMessages
       .map((message, index) => sameCarrierIdentity(message, response.prefillCarrier!) ? index : -1)
@@ -465,15 +517,27 @@ export function refreshInterceptorFinalResponseCarrier<TBreakdown extends Interc
   response: ValidInterceptorFinalResponse,
   messages: readonly LlmMessageDTO[],
   breakdown: readonly TBreakdown[],
+  options: { readonly carrierDetached?: boolean } = {},
 ): {
   readonly messages: LlmMessageDTO[];
   readonly breakdown: TBreakdown[];
   readonly finalResponse: ValidInterceptorFinalResponse;
 } {
-  const candidateIndexList = fallbackCandidateIndexes(messages, response);
+  if (options.carrierDetached && carrierIndexes(messages, response.carrierNonce).length > 0) {
+    throw new Error("Detached final response fallback carrier is still present");
+  }
+  const candidateIndexList = options.carrierDetached
+    ? []
+    : fallbackCandidateIndexes(messages, response);
   const candidateIndexes = new Set(candidateIndexList);
   const reconciledMessages = stripCarrierMarkers(messages).filter((_, index) => !candidateIndexes.has(index));
-  let insertionIndex = reconciledMessages.length;
+  const fallbackIndex = Number.isSafeInteger(response.fallbackMessageIndex)
+    ? response.fallbackMessageIndex
+    : reconciledMessages.length;
+  let insertionIndex = Math.min(
+    Math.max(fallbackIndex, 0),
+    reconciledMessages.length,
+  );
   if (response.prefillCarrier) {
     const prefillIndexes = reconciledMessages
       .map((message, index) => sameCarrierIdentity(message, response.prefillCarrier!) ? index : -1)
@@ -550,7 +614,7 @@ export function supersedeInterceptorFinalResponse<TBreakdown extends Interceptor
       ...input.next,
       fallbackMessageIndex: nextIndex,
       fallbackBreakdown: Object.freeze({ ...input.next.fallbackBreakdown, messageIndex: nextIndex }),
-      supersededResponse: input.previous,
+      supersededResponse: summarizeSupersededResponse(input.previous),
     }),
   };
 }
@@ -563,7 +627,7 @@ export function retainInterceptorFinalResponse(
   if (next === undefined) return previous;
   if (next.status === "valid") {
     return previous && previous !== next
-      ? Object.freeze({ ...next, supersededResponse: previous })
+      ? Object.freeze({ ...next, supersededResponse: summarizeSupersededResponse(previous) })
       : next;
   }
   return previous ?? next;
@@ -641,6 +705,7 @@ export function selectInterceptorFinalResponse(input: {
     kind: "final-response",
     response: input.response,
     messages: finalMessages,
+    breakdownReplacement: { from: input.response.fallbackBreakdown },
   };
 }
 

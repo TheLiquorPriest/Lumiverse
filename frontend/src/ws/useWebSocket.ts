@@ -481,6 +481,12 @@ export function useWebSocket() {
       }),
       wsClient.on(WS_CLOSE, () => {
         store.getState().setWsConnected(false)
+        // This is local to the socket that just closed. It must not be
+        // broadcast to another tab, whose editor may have a different owner.
+        const pendingTextEditorId = store.getState().pendingTextEditor?.requestId
+        if (pendingTextEditorId) {
+          store.getState().dismissTextEditor(pendingTextEditorId)
+        }
         if (store.getState().wsHasEverConnected) {
           pendingReconnectBundleCheckRef.current = true
         }
@@ -1463,6 +1469,10 @@ export function useWebSocket() {
 
       wsClient.on(EventType.SPINDLE_TEXT_EDITOR_OPEN, (payload: { requestId: string; extensionId: string; title: string; value: string; placeholder: string }) => {
         store.getState().openTextEditor(payload)
+      }),
+      wsClient.on(EventType.SPINDLE_TEXT_EDITOR_RESULT, (payload: { requestId?: unknown }) => {
+        if (typeof payload?.requestId !== 'string') return
+        store.getState().dismissTextEditor(payload.requestId)
       }),
 
       wsClient.on(EventType.SPINDLE_MODAL_OPEN, (payload: any) => {

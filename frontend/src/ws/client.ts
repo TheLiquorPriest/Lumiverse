@@ -80,9 +80,11 @@ export class WebSocketClient {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    this.ws = new WebSocket(this.url)
+    const socket = new WebSocket(this.url)
+    this.ws = socket
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (this.ws !== socket) return
       console.log('[WS] Connected to', this.url)
       // Cancel any stale reconnect timer from a prior socket's onclose
       if (this.reconnectTimer) {
@@ -95,7 +97,8 @@ export class WebSocketClient {
       this.emit(EventType.CONNECTED, {})
     }
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return
       try {
         const data = JSON.parse(event.data)
         if (data.type === 'pong') {
@@ -119,10 +122,9 @@ export class WebSocketClient {
       }
     }
 
-    const thisSocket = this.ws
-    this.ws.onclose = (e) => {
+    socket.onclose = (e) => {
+      if (this.ws !== socket) return
       console.log('[WS] Closed:', e.code, e.reason)
-      if (this.ws !== thisSocket) return
       this.stopPing()
       this.emit(WS_CLOSE, { code: e.code, reason: e.reason })
       if (this.shouldReconnect) {
@@ -130,7 +132,8 @@ export class WebSocketClient {
       }
     }
 
-    this.ws.onerror = (e) => {
+    socket.onerror = (e) => {
+      if (this.ws !== socket) return
       console.error('[WS] Error:', e)
     }
   }
@@ -143,10 +146,15 @@ export class WebSocketClient {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    if (this.ws) {
-      this.ws.close()
-      this.ws = null
+    const socket = this.ws
+    this.ws = null
+    if (!socket) return
+    try {
+      socket.close()
+    } catch {
+      // The browser may already have completed the close handshake.
     }
+    this.emit(WS_CLOSE, { code: 1000, reason: 'client disconnect' })
   }
 
   on(event: string, handler: EventHandler): () => void {
@@ -443,9 +451,14 @@ export class WebSocketClient {
     }, 3000)
   }
 
-  send(data: any): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data))
+  send(data: unknown): boolean {
+    const socket = this.ws
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false
+    try {
+      socket.send(JSON.stringify(data))
+      return true
+    } catch {
+      return false
     }
   }
 

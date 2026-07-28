@@ -50,6 +50,7 @@ interface InterceptorResultDTO {
   messages: LlmMessageDTO[]
   parameters?: Record<string, unknown>
   breakdown?: InterceptorBreakdownEntryDTO[]
+  deferredGuidance?: DeferredGuidanceDTO[]
   finalResponse?: FinalResponseDTO
 }
 
@@ -57,7 +58,19 @@ interface InterceptorBreakdownEntryDTO {
   messageIndex: number
   name?: string
 }
+
+interface DeferredGuidanceDTO {
+  /** A unique canonical UUID (versions 1-5). */
+  id: string
+  /** Non-empty system guidance, at most 1 MiB encoded as UTF-8. */
+  content: string
+  role: 'system'
+}
 ```
+
+`deferredGuidance` is limited to 128 entries with unique IDs and 2 MiB total
+encoded content. Invalid guidance is discarded without invalidating an otherwise
+valid final-response proposal.
 
 ```ts
 spindle.registerInterceptor(async (messages, context) => {

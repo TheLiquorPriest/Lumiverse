@@ -43,9 +43,21 @@ export class WorkerHostProcessApi {
   private get installScope(): "operator" | "user" { return this.context.installScope; }
   private get installedByUserId(): string | null { return this.context.installedByUserId; }
   private postToWorker(message: any): void { this.context.post(message); }
-  private resolveRequest(requestId: string, result: unknown): void { this.context.resolve(requestId, result); }
-  private rejectRequest(requestId: string, error: unknown): void { this.context.reject(requestId, error); }
+  private resolveRequest(requestId: string, result: unknown): void {
+    this.postToWorker({ type: "response", requestId, result });
+  }
+  private rejectRequest(requestId: string, error: unknown): void {
+    this.postToWorker({
+      type: "response",
+      requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
   private getStorageRootPath(_identifier?: string): string { return this.context.storageRootPath(); }
+  private canAccessProcessForUser(userId: string | undefined): boolean {
+    return this.installScope === "operator" ||
+      (this.installedByUserId !== null && userId === this.installedByUserId);
+  }
 
   private sendFrontendProcessEvent(userId: string, payload: Record<string, unknown>): void {
     eventBus.emit(EventType.SPINDLE_FRONTEND_PROCESS, { extensionId: this.extensionId, identifier: this.manifest.identifier, ...payload }, userId);
@@ -196,6 +208,9 @@ export class WorkerHostProcessApi {
   stopAllFrontendProcesses(exitReason: FrontendProcessExitReason): void {
     for (const record of Array.from(this.frontendProcesses.values())) {
       this.requestFrontendProcessStop(record, exitReason);
+      if (record.state === "starting") {
+        this.rejectRequest(record.requestId, new Error("Frontend process stopped before it became ready"));
+      }
       this.clearFrontendProcessTimers(record);
       this.frontendProcesses.delete(record.processId);
       if (record.key) {
@@ -476,6 +491,9 @@ export class WorkerHostProcessApi {
   stopAllBackendProcesses(exitReason: BackendProcessExitReason): void {
     for (const record of Array.from(this.backendProcesses.values())) {
       this.clearBackendProcessTimers(record);
+      if (record.state === "starting") {
+        this.rejectRequest(record.requestId, new Error("Backend process stopped before it became ready"));
+      }
       try {
         record.runtime.terminate(true);
       } catch {
@@ -531,6 +549,9 @@ export class WorkerHostProcessApi {
         if (record.state === "completed" || record.state === "failed" || record.state === "timed_out" || record.state === "stopped") {
           return;
         }
+        if (record.state === "starting") {
+          this.rejectRequest(record.requestId, new Error("Frontend process completed before it became ready"));
+        }
         this.finalizeFrontendProcess(
           record,
           record.state === "stopping" ? "stopped" : "completed",
@@ -546,7 +567,7 @@ export class WorkerHostProcessApi {
         if (record.state === "starting") {
           this.clearFrontendProcessTimers(record);
           this.finalizeFrontendProcess(record, "failed", "failed", message);
-          this.rejectRequest(processId, new Error(message));
+          this.rejectRequest(record.requestId, new Error(message));
         } else {
           this.finalizeFrontendProcess(record, "failed", "failed", message);
         }
@@ -557,7 +578,7 @@ export class WorkerHostProcessApi {
           const message = "Frontend extension unloaded before the process became ready";
           this.clearFrontendProcessTimers(record);
           this.finalizeFrontendProcess(record, "failed", "frontend_unloaded", message);
-          this.rejectRequest(processId, new Error(message));
+          this.rejectRequest(record.requestId, new Error(message));
           return;
         }
         this.finalizeFrontendProcess(record, "stopped", "frontend_unloaded", error);
@@ -643,7 +664,7 @@ export class WorkerHostProcessApi {
         if (!latest || latest.state !== "starting") return;
         this.requestFrontendProcessStop(latest, "timed_out");
         this.finalizeFrontendProcess(latest, "timed_out", "timed_out", "Frontend process startup timed out");
-        this.rejectRequest(requestId, new Error("Frontend process startup timed out"));
+        this.rejectRequest(latest.requestId, new Error("Frontend process startup timed out"));
       }, startupTimeoutMs);
 
       this.sendFrontendProcessEvent(userId, {
@@ -688,10 +709,11 @@ export class WorkerHostProcessApi {
   handleFrontendProcessGet(requestId: string, processId: string): void {
     try {
       const record = this.getFrontendProcessRecord(processId);
+      const accessibleRecord = record && this.canAccessProcessForUser(record.userId) ? record : null;
       this.postToWorker({
         type: "response",
         requestId,
-        result: record ? this.snapshotFrontendProcess(record) : null,
+        result: accessibleRecord ? this.snapshotFrontendProcess(accessibleRecord) : null,
       });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
@@ -723,6 +745,9 @@ export class WorkerHostProcessApi {
         if (record.startupTimer) {
           clearTimeout(record.startupTimer);
           record.startupTimer = null;
+        }
+        if (record.state === "starting") {
+          this.rejectRequest(record.requestId, new Error("Frontend process stopped before it became ready"));
         }
         this.transitionFrontendProcess(record, "stopping");
       }
@@ -810,6 +835,9 @@ export class WorkerHostProcessApi {
         onError: (message) => {
           const record = this.backendProcesses.get(processId);
           if (!record) return;
+          if (record.state === "starting") {
+            this.rejectRequest(record.requestId, new Error(message));
+          }
           this.finalizeBackendProcess(record, "failed", "failed", message);
         },
         onExit: (exitCode, signalCode, error) => {
@@ -854,7 +882,7 @@ export class WorkerHostProcessApi {
           // ignore
         }
         this.finalizeBackendProcess(latest, "timed_out", "timed_out", "Backend process startup timed out");
-        this.rejectRequest(requestId, new Error("Backend process startup timed out"));
+        this.rejectRequest(latest.requestId, new Error("Backend process startup timed out"));
       }, startupTimeoutMs);
 
       runtime.postMessage({
@@ -904,10 +932,11 @@ export class WorkerHostProcessApi {
   handleBackendProcessGet(requestId: string, processId: string): void {
     try {
       const record = this.getBackendProcessRecord(processId);
+      const accessibleRecord = record && this.canAccessProcessForUser(record.userId) ? record : null;
       this.postToWorker({
         type: "response",
         requestId,
-        result: record ? this.snapshotBackendProcess(record) : null,
+        result: accessibleRecord ? this.snapshotBackendProcess(accessibleRecord) : null,
       });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
@@ -939,6 +968,9 @@ export class WorkerHostProcessApi {
         if (record.startupTimer) {
           clearTimeout(record.startupTimer);
           record.startupTimer = null;
+        }
+        if (record.state === "starting") {
+          this.rejectRequest(record.requestId, new Error("Backend process stopped before it became ready"));
         }
         this.transitionBackendProcess(record, "stopping");
         this.armBackendStopTimer(record);

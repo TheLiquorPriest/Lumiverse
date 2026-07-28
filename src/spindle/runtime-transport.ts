@@ -97,12 +97,38 @@ function resolveRuntimeMode(modeOverride?: RuntimeTransportMode): RuntimeTranspo
 
 function createWorkerTransport(opts: CreateRuntimeTransportOptions): RuntimeTransport {
   const worker = new Worker(opts.runtimePath, { type: "module" });
+  let intentionallyTerminated = false;
+  let exitReported = false;
+
+  const reportExit = (error?: Error): void => {
+    if (exitReported) return;
+    exitReported = true;
+    opts.onExit(
+      null,
+      null,
+      intentionallyTerminated ? undefined : error,
+    );
+  };
+
   worker.onmessage = (event) => {
+    if (exitReported) return;
     opts.onMessage(event.data);
   };
   worker.onerror = (event) => {
-    opts.onError(event.message);
+    if (exitReported) return;
+    const message =
+      typeof event.message === "string" && event.message.length > 0
+        ? event.message
+        : "Bun worker failed";
+    const error = intentionallyTerminated ? undefined : new Error(message);
+    reportExit(error);
+    if (!intentionallyTerminated) {
+      opts.onError(message);
+    }
   };
+  worker.addEventListener("close", () => {
+    reportExit();
+  });
 
   return {
     mode: "worker",
@@ -111,6 +137,7 @@ function createWorkerTransport(opts: CreateRuntimeTransportOptions): RuntimeTran
       worker.postMessage(message);
     },
     terminate(): void {
+      intentionallyTerminated = true;
       worker.terminate();
     },
   };

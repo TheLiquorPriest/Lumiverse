@@ -57,6 +57,9 @@ const NullComponent = () => null
 const translation = (key: string) => key
 let resolverCalls = 0
 const resolverRequests: Array<Record<string, unknown>> = []
+
+type PreviewResponse = { text: string; diagnostics: unknown[] }
+let pendingPreview: Promise<PreviewResponse> | null = null
 const mountedRoots = new Set<Root>()
 const MockToggle = Object.assign(NullComponent, {
   Checkbox: ({ label }: { label?: ReactNode }) => createElement('label', null, label),
@@ -67,8 +70,8 @@ type TestDragEvent = {
   over: { id: string } | null
 }
 
-function dragId(blockId: string): string {
-  return `loom-block:${blockId}`
+function dragId(blockId: string, blockIndex = 0): string {
+  return `loom-block:${blockIndex}:${blockId}`
 }
 
 let latestDragEnd: ((event: TestDragEvent) => void) | null = null
@@ -146,18 +149,20 @@ mock.module('react-i18next', () => ({
   useTranslation: () => ({ t: translation, i18n: { language: 'en' } }),
   Trans: ({ i18nKey }: { i18nKey?: string }) => createElement('span', null, i18nKey),
   I18nextProvider: ({ children }: { children?: ReactNode }) => children ?? null,
+  initReactI18next: { type: '3rdParty', init() {} },
 }))
-mock.module('@/i18n', () => ({ default: { t: translation, language: 'en' } }))
+mock.module('@/i18n', () => ({ default: { language: 'en', t: translation } }))
 mock.module('@/api/macros', () => ({
   resolveMacros: async (request: Record<string, unknown>) => {
     resolverCalls += 1
     resolverRequests.push(request)
-    return { text: 'resolved', diagnostics: [] }
+    return pendingPreview ?? { text: 'resolved', diagnostics: [] }
   },
   resolveMacrosBatch: async () => ({ resolved: {} }),
   getMacroCatalog: async () => ({ categories: [] }),
 }))
 mock.module('@/store', () => ({ useStore: mockedStore }))
+
 mock.module('@/hooks/useLoomBuilder', () => ({ useLoomBuilder: () => mainLoomState }))
 mock.module('@/hooks/usePresetProfiles', () => ({
   usePresetProfiles: () => ({
@@ -403,6 +408,7 @@ function renderControlled(
   onChange: (next: PromptBlock[]) => boolean | void | Promise<unknown>,
   trustedHostFeatures?: boolean,
   readOnly = false,
+  authoritativeValueRevision = 0,
 ): { container: HTMLDivElement; root: Root } {
   const container = document.createElement('div')
   document.body.append(container)
@@ -416,6 +422,7 @@ function renderControlled(
       compact: true,
       readOnly,
       ...(trustedHostFeatures === undefined ? {} : { trustedHostFeatures }),
+      authoritativeValueRevision,
     }))
   })
   mountedRoots.add(root)
@@ -490,6 +497,7 @@ afterEach(() => {
   document.body.replaceChildren()
   resolverCalls = 0
   resolverRequests.length = 0
+  pendingPreview = null
   latestDragEnd = null
   droppableIds.length = 0
   sortableIds.length = 0
@@ -579,6 +587,27 @@ describe('controlled Loom editor trust boundary', () => {
     unmountRoot(root)
   })
 
+  test('ignores a preview response that settles after the editor unmounts', async () => {
+    const deferredPreview = Promise.withResolvers<PreviewResponse>()
+    pendingPreview = deferredPreview.promise
+    const { container, root } = renderBlockEditor(true, () => {})
+    const previewButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('blockEditor.preview'))
+    expect(previewButton).toBeDefined()
+
+    flushSync(() => previewButton!.click())
+    await act(async () => {
+      await Bun.sleep(550)
+    })
+    expect(resolverCalls).toBe(1)
+
+    unmountRoot(root)
+    await act(async () => {
+      deferredPreview.resolve({ text: 'late response', diagnostics: [] })
+    })
+    expect(container.childElementCount).toBe(0)
+  })
+
   test('Main LoomBuilder explicitly opts into trusted host features', () => {
     configureMainLoomState()
     const container = document.createElement('div')
@@ -612,6 +641,45 @@ describe('controlled Loom editor trust boundary', () => {
     expect(container.querySelector('[role="alert"]')).toBeNull()
     expect(container.querySelector('button[title="actions.edit"]')).not.toBeNull()
     assertReopenedCommittedRole(container, root, emitted!)
+    unmountRoot(root)
+  })
+
+  test('closes an open editor before applying a new preset authority with the same block ID', () => {
+    const first = block({ id: 'shared-block', name: 'First preset', content: 'first content' })
+    const second = block({ id: 'shared-block', name: 'Second preset', content: 'second content' })
+    let emitted: PromptBlock[] | undefined
+    const { container, root } = renderControlled([first], (next) => {
+      emitted = next
+    }, undefined, false, 1)
+
+    flushSync(() => container.querySelector<HTMLButtonElement>('button[title="actions.edit"]')!.click())
+    editRole(container, 'assistant')
+
+    flushSync(() => {
+      root.render(createElement(ControlledLoomBlockEditor, {
+        blocks: [second],
+        promptVariables,
+        onChange: (next: PromptBlock[]) => { emitted = next },
+        availableMacros: [],
+        compact: true,
+        authoritativeValueRevision: 2,
+      }))
+    })
+
+    expect(container.querySelector('button[title="blockEditor.backToList"]')).toBeNull()
+    expect(container.textContent).toContain('Second preset')
+
+    flushSync(() => container.querySelector<HTMLButtonElement>('button[title="actions.edit"]')!.click())
+    expect(labeledSelect(container, 'blockEditor.role').value).toBe('system')
+    editRole(container, 'user')
+    flushSync(() => saveButton(container).click())
+
+    expect(emitted?.[0]).toMatchObject({
+      id: 'shared-block',
+      name: 'Second preset',
+      content: 'second content',
+      role: 'user',
+    })
     unmountRoot(root)
   })
 
@@ -962,14 +1030,14 @@ describe('controlled Loom editor trust boundary', () => {
       emitted = next
     })
     expect(droppableIds).toContain(rootBlock.id)
-    expect(sortableIds).toContain(dragId(rootBlock.id))
+    expect(sortableIds).toContain(dragId(rootBlock.id, 2))
     expect(sortableIds).not.toContain(rootBlock.id)
     const dragEnd = latestDragEnd
     expect(dragEnd).not.toBeNull()
 
     flushSync(() => dragEnd!({
-      active: { id: dragId(rootBlock.id) },
-      over: { id: dragId(child.id) },
+      active: { id: dragId(rootBlock.id, 2) },
+      over: { id: dragId(child.id, 1) },
     }))
 
     expect(emitted?.map((entry) => entry.id)).toEqual([category.id, rootBlock.id, child.id])
@@ -1023,8 +1091,8 @@ describe('controlled Loom editor trust boundary', () => {
     expect(dragEnd).not.toBeNull()
 
     flushSync(() => dragEnd!({
-      active: { id: dragId(secondCategory.id) },
-      over: { id: dragId(firstChild.id) },
+      active: { id: dragId(secondCategory.id, 2) },
+      over: { id: dragId(firstChild.id, 1) },
     }))
 
     expect(emitted?.map((entry) => entry.id)).toEqual([

@@ -8,6 +8,15 @@ import type {
 
 const manifestCache = new Map<string, SpindleManifest>()
 const manifestInFlight = new Map<string, Promise<SpindleManifest>>()
+const manifestGenerations = new Map<string, number>()
+
+function invalidateManifestState(id: string): number {
+  const generation = (manifestGenerations.get(id) ?? 0) + 1
+  manifestGenerations.set(id, generation)
+  manifestCache.delete(id)
+  manifestInFlight.delete(id)
+  return generation
+}
 export interface SpindleCompatibilityHandshakeResponse {
   nonce: string
   descriptor: SpindleHostDescriptorV1
@@ -83,36 +92,50 @@ export const spindleApi = {
     }>('/spindle/import-local')
   },
 
-  update(id: string) {
-    return post<ExtensionInfo>(`/spindle/${id}/update`)
+  async update(id: string) {
+    const result = await post<ExtensionInfo>(`/spindle/${id}/update`)
+    invalidateManifestState(id)
+    return result
   },
 
-  updateAll() {
-    return post<{ started: boolean; total: number }>('/spindle/update-all')
+  async updateAll() {
+    const result = await post<{ started: boolean; total: number }>('/spindle/update-all')
+    if (result.started) this.clearManifestCache()
+    return result
   },
 
   getBranches(id: string) {
     return get<{ current: string | null; branches: string[] }>(`/spindle/${id}/branches`)
   },
 
-  switchBranch(id: string, branch: string) {
-    return post<ExtensionInfo>(`/spindle/${id}/switch-branch`, { branch })
+  async switchBranch(id: string, branch: string) {
+    const result = await post<ExtensionInfo>(`/spindle/${id}/switch-branch`, { branch })
+    invalidateManifestState(id)
+    return result
   },
 
-  remove(id: string) {
-    return del<{ success: boolean }>(`/spindle/${id}`)
+  async remove(id: string) {
+    const result = await del<{ success: boolean }>(`/spindle/${id}`)
+    invalidateManifestState(id)
+    return result
   },
 
-  enable(id: string) {
-    return post<{ success: boolean }>(`/spindle/${id}/enable`)
+  async enable(id: string) {
+    const result = await post<{ success: boolean }>(`/spindle/${id}/enable`)
+    invalidateManifestState(id)
+    return result
   },
 
-  disable(id: string) {
-    return post<{ success: boolean }>(`/spindle/${id}/disable`)
+  async disable(id: string) {
+    const result = await post<{ success: boolean }>(`/spindle/${id}/disable`)
+    invalidateManifestState(id)
+    return result
   },
 
-  restart(id: string) {
-    return post<{ success: boolean }>(`/spindle/${id}/restart`)
+  async restart(id: string) {
+    const result = await post<{ success: boolean }>(`/spindle/${id}/restart`)
+    invalidateManifestState(id)
+    return result
   },
 
   getPermissions(id: string) {
@@ -131,6 +154,9 @@ export const spindleApi = {
   },
 
   getManifest(id: string, options?: { force?: boolean }) {
+    const generation = options?.force
+      ? invalidateManifestState(id)
+      : manifestGenerations.get(id) ?? 0
     if (!options?.force) {
       const cached = manifestCache.get(id)
       if (cached) return Promise.resolve(cached)
@@ -141,7 +167,9 @@ export const spindleApi = {
 
     const request = get<SpindleManifest>(`/spindle/${id}/manifest`)
       .then((manifest) => {
-        manifestCache.set(id, manifest)
+        if ((manifestGenerations.get(id) ?? 0) === generation) {
+          manifestCache.set(id, manifest)
+        }
         return manifest
       })
       .finally(() => {
@@ -156,12 +184,15 @@ export const spindleApi = {
 
   clearManifestCache(id?: string) {
     if (id) {
-      manifestCache.delete(id)
-      manifestInFlight.delete(id)
+      invalidateManifestState(id)
       return
     }
-    manifestCache.clear()
-    manifestInFlight.clear()
+    const ids = new Set([
+      ...manifestGenerations.keys(),
+      ...manifestCache.keys(),
+      ...manifestInFlight.keys(),
+    ])
+    for (const extensionId of ids) invalidateManifestState(extensionId)
   },
 
   getTools() {

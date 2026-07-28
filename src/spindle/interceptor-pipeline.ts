@@ -3,7 +3,11 @@ import type {
   DeferredGuidanceDTO,
   LlmMessageDTO,
 } from "lumiverse-spindle-types";
-import { isHostContainmentFatal } from "./bound-generation-types";
+import {
+  computeBoundDeadlineWindow,
+  isHostContainmentFatal,
+  type BoundDeadlineWindow,
+} from "./bound-generation-types";
 import { DEFAULT_INTERCEPTOR_TIMEOUT_MS } from "../services/spindle-settings.service";
 import { emitSpindlePreGenerationActivity } from "./pre-generation-activity";
 import type {
@@ -55,7 +59,8 @@ export interface Interceptor {
   contextPreparer?: (
     context: unknown,
     signal: AbortSignal | undefined,
-    authority?: InterceptorPipelineAuthority,
+    authority: InterceptorPipelineAuthority | undefined,
+    deadlineWindow: BoundDeadlineWindow,
   ) => unknown;
   /**
    * Called immediately before each invocation to determine the wall-clock
@@ -271,6 +276,23 @@ class InterceptorPipeline {
           );
         }
       }
+      const deadlineEntryAt = Date.now();
+      const interceptorDeadlineAt = deadlineEntryAt + timeoutMs;
+      let deadlineWindow: BoundDeadlineWindow;
+      try {
+        deadlineWindow = computeBoundDeadlineWindow(
+          deadlineEntryAt,
+          interceptorDeadlineAt,
+        );
+      } catch {
+        // Short callback budgets cannot safely admit bound work, but ordinary
+        // interceptors must retain their configured callback window.
+        deadlineWindow = Object.freeze({
+          entryAt: deadlineEntryAt,
+          interceptorDeadlineAt,
+          boundWorkDeadlineAt: deadlineEntryAt,
+        });
+      }
       emitSpindlePreGenerationActivity({
         chatId,
         userId,
@@ -306,23 +328,38 @@ class InterceptorPipeline {
           throw signal.reason ?? new DOMException("Aborted", "AbortError");
         }
         const callbackContext = interceptor.contextPreparer
-          ? interceptor.contextPreparer(context, callbackController!.signal, authority)
+          ? interceptor.contextPreparer(
+              context,
+              callbackController!.signal,
+              authority,
+              deadlineWindow,
+            )
           : context;
         if (signal?.aborted) {
           releaseTerminalLeases();
           throw signal.reason ?? new DOMException("Aborted", "AbortError");
         }
+        const createTimeoutError = () =>
+          new Error(
+            `Interceptor from ${interceptor.extensionId} timed out (${Math.round(timeoutMs / 1000)}s)`,
+          );
+        const remainingTimeoutMs = interceptorDeadlineAt - Date.now();
+        if (remainingTimeoutMs <= 0) {
+          const timeoutError = createTimeoutError();
+          if (callbackController && !callbackController.signal.aborted) {
+            callbackController.abort(timeoutError);
+          }
+          throw timeoutError;
+        }
         timeout = setTimeout(
           () => {
-            const timeoutError = new Error(
-              `Interceptor from ${interceptor.extensionId} timed out (${Math.round(timeoutMs / 1000)}s)`,
-            );
+            const timeoutError = createTimeoutError();
             if (callbackController && !callbackController.signal.aborted) {
               callbackController.abort(timeoutError);
             }
             timeoutResult.reject(timeoutError);
           },
-          timeoutMs,
+          remainingTimeoutMs,
         );
         const handlerResult = Promise.resolve(interceptor.handler(result, callbackContext));
         raceStarted = true;

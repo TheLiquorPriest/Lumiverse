@@ -13,6 +13,9 @@ function getUserTopic(userId: string): string {
 function getStreamTopic(userId: string, chatId: string): string {
   return `stream:${userId}:${chatId}`;
 }
+function getLegacyStreamTopic(userId: string): string {
+  return `stream:${userId}:legacy`;
+}
 
 function getRoomTopic(roomId: string): string {
   return `room:${roomId}`;
@@ -29,8 +32,8 @@ function getRoomFeedTopic(roomId: string): string {
 class EventBus {
   private server: import("bun").Server<unknown> | null = null;
   private clientToUser = new Map<ServerWebSocket<unknown>, string>();
-  private sessionToClient = new Map<string, ServerWebSocket<unknown>>();
-  private clientToSession = new Map<ServerWebSocket<unknown>, string>();
+  private connectionToClient = new Map<string, ServerWebSocket<unknown>>();
+  private clientToConnection = new Map<ServerWebSocket<unknown>, string>();
   private clientToFocusedChat = new Map<ServerWebSocket<unknown>, string>();
   private clientLastActivity = new Map<ServerWebSocket<unknown>, number>();
   // ── Multiplayer rooms ──
@@ -45,47 +48,84 @@ class EventBus {
   // peers, since publishToRoom/Feed deliver only to local WS topic subscribers.
   private roomBroadcastListeners = new Set<(roomId: string, event: EventType, payload: any) => void>();
   private listeners = new Map<EventType, Set<Listener>>();
+  private connectionDisconnectedListeners = new Set<(userId: string, connectionId: string) => void>();
+  private userDisconnectedListeners = new Set<(userId: string) => void>();
   private pendingListenerDispatches: Array<() => void> = [];
   private listenerDispatchTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Per-user visibility: true if at least one session reports visible. */
+  /** Per-user visibility: true if at least one connection reports visible. */
   private userVisibility = new Map<string, Map<string, boolean>>();
   private userAllHiddenSince = new Map<string, number>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Store the Bun server reference so we can use native publish(). */
-  setServer(server: import("bun").Server<unknown>): void {
+  setServer(server: import("bun").Server<unknown> | null): void {
     this.server = server;
   }
 
-  addClient(ws: ServerWebSocket<unknown>, userId: string, sessionId?: string): void {
+  onUserDisconnected(listener: (userId: string) => void): () => void {
+    this.userDisconnectedListeners.add(listener);
+    return () => this.userDisconnectedListeners.delete(listener);
+  }
+
+  onConnectionDisconnected(listener: (userId: string, connectionId: string) => void): () => void {
+    this.connectionDisconnectedListeners.add(listener);
+    return () => this.connectionDisconnectedListeners.delete(listener);
+  }
+
+  isUserConnected(userId: string): boolean {
+    for (const connectedUserId of this.clientToUser.values()) {
+      if (connectedUserId === userId) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Choose one live connection for a user. Visible sessions win, then the
+   * most recently active session. Map insertion order is the deterministic
+   * final tie-breaker.
+   */
+  getPreferredUserConnectionId(userId: string): string | null {
+    const visibleSessions = this.userVisibility.get(userId);
+    let preferred: { connectionId: string; visible: boolean; lastActivity: number } | null = null;
+    for (const [ws, connectedUserId] of this.clientToUser) {
+      if (connectedUserId !== userId) continue;
+      if ((ws as { readyState?: number }).readyState !== 1) continue;
+      const connectionId = this.clientToConnection.get(ws);
+      if (!connectionId) continue;
+      const visible = visibleSessions?.get(connectionId) === true;
+      const lastActivity = this.clientLastActivity.get(ws) ?? 0;
+      if (
+        preferred === null ||
+        (visible && !preferred.visible) ||
+        (visible === preferred.visible && lastActivity > preferred.lastActivity)
+      ) {
+        preferred = { connectionId, visible, lastActivity };
+      }
+    }
+    return preferred?.connectionId ?? null;
+  }
+
+
+  addClient(ws: ServerWebSocket<unknown>, userId: string, connectionId?: string): void {
     // If the socket already closed during onOpen's async auth/DB work, don't
     // register it. onClose would have run removeClient as a no-op (not yet in
     // the maps), so inserting a dead socket here would leave tracking that only
     // the 120s sweep reclaims. readyState 1 === OPEN on Bun's ServerWebSocket.
     if ((ws as { readyState?: number }).readyState !== 1) return;
 
-    // Track session → socket mapping for dedup, but do NOT forcefully evict
-    // the old socket. Stale sockets are cleaned up naturally via onClose →
-    // removeClient. Forceful eviction causes reconnect loops because the
-    // close frame triggers the client to reconnect, which evicts again, etc.
-    if (sessionId) {
-      const existing = this.sessionToClient.get(sessionId);
-      if (existing && existing !== ws) {
-        // Just remove tracking — the old socket's onClose will fire and
-        // call removeClient() to clean up subscriptions.
-        this.removeClient(existing);
-      }
-      this.sessionToClient.set(sessionId, ws);
-      this.clientToSession.set(ws, sessionId);
-    }
-
-    this.clientToUser.set(ws, userId);
+    const resolvedConnectionId = connectionId ?? crypto.randomUUID();
+    this.clientToConnection.set(ws, resolvedConnectionId);
+    this.connectionToClient.set(resolvedConnectionId, ws);
     this.clientLastActivity.set(ws, Date.now());
+    this.clientToUser.set(ws, userId);
 
-    // Subscribe to per-user topic and system broadcast topic.
+    // Subscribe to per-user events, legacy stream fallback, and system
+    // broadcasts. Focused sockets switch from the fallback topic to the
+    // chat-specific topic when they send stream_focus.
     // Bun's native pub/sub handles delivery in Zig — no JS iteration needed.
     try {
       ws.subscribe(getUserTopic(userId));
+      ws.subscribe(getLegacyStreamTopic(userId));
       ws.subscribe("system");
     } catch {
       // Socket may already be closed
@@ -96,13 +136,14 @@ class EventBus {
 
   removeClient(ws: ServerWebSocket<unknown>): void {
     const userId = this.clientToUser.get(ws);
-    const sessionId = this.clientToSession.get(ws);
+    const connectionId = this.clientToConnection.get(ws);
     const focusedChatId = this.clientToFocusedChat.get(ws);
     if (userId) {
       try {
         ws.unsubscribe(getUserTopic(userId));
+        ws.unsubscribe(getLegacyStreamTopic(userId));
         ws.unsubscribe("system");
-        if (focusedChatId) {
+        if (focusedChatId !== undefined) {
           ws.unsubscribe(getStreamTopic(userId, focusedChatId));
         }
       } catch {
@@ -111,14 +152,32 @@ class EventBus {
       this.clientToUser.delete(ws);
       this.clientToFocusedChat.delete(ws);
       this.clientLastActivity.delete(ws);
-      if (sessionId) this.removeSessionVisibility(userId, sessionId);
+      if (connectionId) this.removeSessionVisibility(userId, connectionId);
     }
-    if (sessionId) {
-      // Only remove from session map if this socket is still the current one
-      if (this.sessionToClient.get(sessionId) === ws) {
-        this.sessionToClient.delete(sessionId);
+    if (connectionId) {
+      this.clientToConnection.delete(ws);
+      if (this.connectionToClient.get(connectionId) === ws) {
+        this.connectionToClient.delete(connectionId);
       }
-      this.clientToSession.delete(ws);
+      if (userId) {
+        for (const listener of this.connectionDisconnectedListeners) {
+          try { listener(userId, connectionId); } catch { /* one cleanup listener cannot block socket teardown */ }
+        }
+      }
+    }
+    if (userId) {
+      let userStillConnected = false;
+      for (const connectedUserId of this.clientToUser.values()) {
+        if (connectedUserId === userId) {
+          userStillConnected = true;
+          break;
+        }
+      }
+      if (!userStillConnected) {
+        for (const listener of this.userDisconnectedListeners) {
+          try { listener(userId); } catch { /* one cleanup listener cannot block socket teardown */ }
+        }
+      }
     }
 
     // Multiplayer room cleanup (runs for peer sockets that have no userId too).
@@ -164,16 +223,21 @@ class EventBus {
     if (this.clientToUser.get(ws) !== userId) return;
 
     const previousChatId = this.clientToFocusedChat.get(ws);
-    if (previousChatId === chatId) return;
+    if ((previousChatId ?? null) === chatId) return;
 
     try {
-      if (previousChatId) {
+      if (previousChatId !== undefined) {
         ws.unsubscribe(getStreamTopic(userId, previousChatId));
-        this.clientToFocusedChat.delete(ws);
+      } else {
+        ws.unsubscribe(getLegacyStreamTopic(userId));
       }
-      if (chatId) {
+
+      if (chatId !== null) {
         ws.subscribe(getStreamTopic(userId, chatId));
         this.clientToFocusedChat.set(ws, chatId);
+      } else {
+        ws.subscribe(getLegacyStreamTopic(userId));
+        this.clientToFocusedChat.delete(ws);
       }
     } catch {
       // Socket may already be closed
@@ -355,11 +419,35 @@ class EventBus {
     this.listenerDispatchTimer = setTimeout(() => this.flushListenerDispatches(), 0);
   }
 
+  private dispatchListeners(message: EventMessage, synchronous: boolean): void {
+    const eventListeners = this.listeners.get(message.event);
+    if (!eventListeners) return;
+    if (synchronous) {
+      for (const listener of eventListeners) {
+        try {
+          listener(message);
+        } catch (err) {
+          console.error(`Event listener error for ${message.event}:`, err);
+        }
+      }
+      return;
+    }
+    for (const listener of eventListeners) {
+      this.scheduleListenerDispatch(() => {
+        try {
+          listener(message);
+        } catch (err) {
+          console.error(`Event listener error for ${message.event}:`, err);
+        }
+      });
+    }
+  }
+
   emit(
     event: EventType,
     payload: any = {},
     userId?: string,
-    options?: { topic?: string },
+    options?: { topic?: string; legacyTopic?: string; synchronous?: boolean },
   ): void {
     const message: EventMessage = {
       event,
@@ -370,27 +458,71 @@ class EventBus {
 
     const json = JSON.stringify(message);
 
-    // Use Bun's native pub/sub for WebSocket delivery — single native call
-    // instead of iterating over JS Maps and calling ws.send() per-socket.
+    // Use Bun's native pub/sub for WebSocket delivery — a constant number of
+    // native publishes instead of iterating over JS Maps and calling ws.send()
+    // per-socket. Stream callers provide a compatibility topic for sockets
+    // that predate stream_focus; focused sockets are subscribed only to the
+    // chat-specific topic.
     if (this.server) {
       const topic = options?.topic || (userId ? getUserTopic(userId) : "system");
       this.server.publish(topic, json);
+      if (options?.legacyTopic && options.legacyTopic !== topic) {
+        this.server.publish(options.legacyTopic, json);
+      }
     }
 
     // Fire in-process listeners asynchronously so extension worker IPC
-    // doesn't block the streaming hot path.
-    const eventListeners = this.listeners.get(event);
-    if (eventListeners) {
-      for (const listener of eventListeners) {
-        this.scheduleListenerDispatch(() => {
-          try {
-            listener(message);
-          } catch (err) {
-            console.error(`Event listener error for ${event}:`, err);
-          }
-        });
-      }
+    // doesn't block the streaming hot path unless the caller explicitly
+    // needs settlement linearized with this emit.
+    this.dispatchListeners(message, options?.synchronous === true);
+  }
+
+  /** Dispatch an authenticated inbound event to host listeners without WS fan-out. */
+  emitInternal(
+    event: EventType,
+    payload: any = {},
+    userId?: string,
+    options?: { synchronous?: boolean },
+  ): void {
+    this.dispatchListeners({
+      event,
+      payload,
+      timestamp: Date.now(),
+      userId,
+    }, options?.synchronous === true);
+  }
+
+  /**
+   * Deliver an event to exactly one authenticated user connection. Unlike
+   * emit(), this intentionally bypasses the user topic so another tab cannot
+   * observe an editor owned by this connection.
+   */
+  emitToUserConnection(
+    event: EventType,
+    payload: any = {},
+    userId: string,
+    connectionId: string,
+    options?: { synchronous?: boolean },
+  ): boolean {
+    const ws = this.connectionToClient.get(connectionId);
+    if (!ws || this.clientToUser.get(ws) !== userId) return false;
+    if ((ws as { readyState?: number }).readyState !== 1 || typeof ws.send !== "function") return false;
+
+    const message: EventMessage = {
+      event,
+      payload,
+      timestamp: Date.now(),
+      userId,
+    };
+    try {
+      const result: unknown = ws.send(JSON.stringify(message));
+      if (result === false || result === 0) return false;
+    } catch {
+      return false;
     }
+
+    this.dispatchListeners(message, options?.synchronous === true);
+    return true;
   }
 
   // ─── User Visibility ─────────────────────────────────────────────────

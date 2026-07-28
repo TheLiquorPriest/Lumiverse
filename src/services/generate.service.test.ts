@@ -29,6 +29,7 @@ import { toolRegistry } from "../spindle/tool-registry";
 import * as chatsSvc from "./chats.service";
 import * as regexScriptsSvc from "./regex-scripts.service";
 import * as presetsSvc from "./presets.service";
+import * as settingsSvc from "./settings.service";
 
 import type {
   InterceptorBreakdownEntry,
@@ -660,6 +661,13 @@ async function waitForGeneration(
     const started = await startGeneration(input);
     generationId = started.generationId;
     afterStart?.(started);
+    if (events.some((entry) => (
+      entry.payload.generationId === generationId
+      && (
+        entry.event === EventType.GENERATION_ENDED
+        || entry.event === EventType.GENERATION_STOPPED
+      )
+    ))) resolveTerminal();
     await terminal;
     await drainGenerationWork();
     return {
@@ -1167,6 +1175,43 @@ test("stop at persistence leaves no candidate message and emits one STOPPED", as
   )).toHaveLength(0);
   expect(providerState.calls).toHaveLength(0);
   expect(assistantMessages()).toHaveLength(0);
+});
+
+
+test("setup abort after staging a swipe restores the original swipe", async () => {
+  seedMessage(
+    FINAL_RESPONSE_ASSISTANT_MESSAGE,
+    FINAL_RESPONSE_CHAT,
+    1,
+    false,
+    "before",
+  );
+
+  const result = await waitForGeneration(
+    makeGenerationInput("regenerate", baseMessages("regenerate")),
+    (started) => {
+      stopGeneration(FINAL_RESPONSE_USER, started.generationId);
+    },
+  );
+
+  expect(
+    result.events.filter(
+      (entry) => entry.event === EventType.GENERATION_STOPPED,
+    ),
+  ).toHaveLength(1);
+  expect(
+    result.events.filter(
+      (entry) => entry.event === EventType.GENERATION_ENDED,
+    ),
+  ).toHaveLength(0);
+
+  const restored = chatsSvc.getMessage(
+    FINAL_RESPONSE_USER,
+    FINAL_RESPONSE_ASSISTANT_MESSAGE,
+  );
+  expect(restored?.swipes).toEqual(["before"]);
+  expect(restored?.swipe_id).toBe(0);
+  expect(restored?.content).toBe("before");
 });
 
 });

@@ -18,7 +18,7 @@ if (!result.cancelled) {
 }
 ```
 
-The returned Promise resolves when the user either confirms (closes normally) or cancels (presses Escape or clicks outside). It never rejects.
+User dismissal—or an unavailable target user—resolves with `cancelled: true`; confirmation resolves with `cancelled: false`. The Promise can reject when options are invalid, a caller-owned request identity is already active, or the host transport fails.
 
 ### Minimal Call
 
@@ -44,6 +44,7 @@ const result = await spindle.textEditor.open({
 | `title` | `string` | `"Edit Text"` | Modal title displayed at the top of the editor |
 | `value` | `string` | `""` | Initial text content pre-filled in the editor |
 | `placeholder` | `string` | `""` | Placeholder text shown when the editor is empty |
+| `editorRequestId` | `string` | generated | Optional caller-owned 1–128 character ASCII token used with `textEditor.close()` |
 | `userId` | `string` | — | Target user ID. Only needed for operator-scoped extensions that serve multiple users. User-scoped extensions can omit this. |
 
 ## Result
@@ -81,6 +82,29 @@ spindle.onFrontendMessage(async (msg) => {
     }
   }
 })
+```
+
+## Programmatic cancellation
+
+Long-running workflows should assign a caller-owned request identity when opening
+the editor, then close that identity if the workflow is cancelled or times out.
+Request identities are 1–128 character ASCII tokens containing letters, digits,
+underscores, or hyphens. Closing an unknown or already-settled identity is a safe
+no-op.
+
+```ts
+const editorRequestId = crypto.randomUUID()
+const review = spindle.textEditor.open({
+  editorRequestId,
+  title: 'Review output',
+  value: draft,
+})
+
+try {
+  return await review
+} finally {
+  await spindle.textEditor.close(editorRequestId)
+}
 ```
 
 !!! tip "When to use the text editor"
