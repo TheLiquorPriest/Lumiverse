@@ -7,6 +7,7 @@ import {
   fallbackLanguagesFor,
   loadLanguageBundles,
 } from './resources'
+import { setHostLocale } from './host-locale'
 
 export const UI_LANGUAGE_STORAGE_KEY = 'lumiverse-ui-language'
 
@@ -89,6 +90,37 @@ export async function ensureLanguageLoaded(lng: string): Promise<void> {
 }
 
 let initPromise: Promise<typeof i18n> | null = null
+const HOST_LOCALE_LISTENER_KEY = Symbol.for('lumiverse.i18n.host-locale-listener')
+type I18nWithHostLocaleListener = typeof i18n & {
+  [HOST_LOCALE_LISTENER_KEY]?: (language: string) => void
+}
+let ownedHostLocaleListener: ((language: string) => void) | null = null
+let hostLocaleListenerDisposed = false
+
+function registerHostLocaleListener(): void {
+  if (hostLocaleListenerDisposed) return
+  const emitter = i18n as I18nWithHostLocaleListener
+  const previous = emitter[HOST_LOCALE_LISTENER_KEY]
+  if (previous) i18n.off('languageChanged', previous)
+  const listener = (language: string) => setHostLocale(language)
+  emitter[HOST_LOCALE_LISTENER_KEY] = listener
+  ownedHostLocaleListener = listener
+  i18n.on('languageChanged', listener)
+}
+
+function releaseHostLocaleListener(): void {
+  hostLocaleListenerDisposed = true
+  const listener = ownedHostLocaleListener
+  if (!listener) return
+  i18n.off('languageChanged', listener)
+  const emitter = i18n as I18nWithHostLocaleListener
+  if (emitter[HOST_LOCALE_LISTENER_KEY] === listener) {
+    delete emitter[HOST_LOCALE_LISTENER_KEY]
+  }
+  ownedHostLocaleListener = null
+}
+
+import.meta.hot?.dispose(releaseHostLocaleListener)
 
 export function initI18n(): Promise<typeof i18n> {
   if (!initPromise) {
@@ -122,6 +154,9 @@ export function initI18n(): Promise<typeof i18n> {
             caches: ['localStorage'],
           },
         })
+
+      setHostLocale(i18n.resolvedLanguage ?? lng)
+      registerHostLocaleListener()
 
       return i18n
     })()

@@ -62,3 +62,8 @@ export function getIdentity(): ResolvedIdentity {
   }
   return _identity;
 }
+
+/** @internal Only intended for tests that isolate identity state. */
+export function resetIdentityForTests(): void {
+  _identity = null;
+}

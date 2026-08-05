@@ -98,3 +98,8 @@ export async function validateSecret(userId: string, key: string): Promise<boole
     return false;
   }
 }
+
+/** @internal Only intended for tests that isolate encryption identity state. */
+export function resetEncryptionKeyForTests(): void {
+  _cachedKey = null;
+}

@@ -1,4 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   BoundDispatchProvider,
   BoundDispatchResolution,
@@ -11,10 +14,15 @@ import type {
   QuietTrackedRequestDTO,
   ReadOnlyEffectLeaseContext,
 } from "./bound-generation-types";
+import type { GenerationRequest } from "../llm/types";
 import type { LlmProvider } from "../llm/provider";
 import { registerProvider } from "../llm/registry";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { env } from "../env";
+import { initIdentity, resetIdentityForTests } from "../crypto/init";
 import { runMigrations } from "../db/migrate";
+import { connectionSecretKey } from "../services/connections.service";
+import { putSecret, resetEncryptionKeyForTests } from "../services/secrets.service";
 import {
   resolveDispatchDescriptor,
   resolveMainDispatchSnapshot,
@@ -37,6 +45,7 @@ import {
   isHostContainmentFatal,
   mintParentPrefillChildUse,
   runBoundAssembly,
+  runBoundQuietTracked,
 } from "./bound-generation";
 import {
   createHostBoundGenerationCallbacks,
@@ -64,6 +73,9 @@ const HOST_MAIN_PRESET = "main-preset";
 const HOST_SLOT_PRESET = "slot-preset";
 const HOST_SLOT_ALT_PRESET = "slot-alt-preset";
 const HOST_PROVIDER_NAME = "bound-generation-test-provider";
+const HOST_SLOT_API_KEY = "slot-api-key";
+const HOST_AUTH_SECRET_BEFORE_IDENTITY = env.authSecret;
+const HOST_IDENTITY_DIR = mkdtempSync(join(tmpdir(), "lumiverse-bound-generation-"));
 const HOST_MAIN_CONTEXT = {
   connectionId: HOST_MAIN_CONNECTION,
   presetId: HOST_MAIN_PRESET,
@@ -187,6 +199,11 @@ const provider: BoundDispatchProvider = async ({ resolution, parentPrefill }) =>
 });
 
 const hostProviderCalls: Array<{ readonly apiKey: string; readonly apiUrl: string; readonly model: string }> = [];
+const hostProviderRequests: Array<{
+  readonly apiKey: string;
+  readonly apiUrl: string;
+  readonly request: GenerationRequest;
+}> = [];
 
 registerProvider({
   name: HOST_PROVIDER_NAME,
@@ -202,6 +219,7 @@ registerProvider({
   },
   async generate(apiKey, apiUrl, request) {
     hostProviderCalls.push({ apiKey, apiUrl, model: request.model });
+    hostProviderRequests.push({ apiKey, apiUrl, request });
     return { content: "bound-provider-response", finish_reason: "stop" };
   },
   async *generateStream() {
@@ -217,6 +235,7 @@ registerProvider({
 
 interface HostFixture {
   readonly callbacks: HostBoundGenerationCallbacks;
+  readonly controller: AbortController;
   readonly parentSnapshot: ParentGenerationSnapshot;
   readonly mainResolution: ResolvedDispatchDescriptor;
 }
@@ -276,6 +295,58 @@ async function resetHostDispatchDb(): Promise<void> {
   }
 }
 
+let hostIdentityReady: Promise<void> | undefined;
+
+async function ensureHostIdentity(): Promise<void> {
+  if (hostIdentityReady === undefined) {
+    const previousDataDir = env.dataDir;
+    resetIdentityForTests();
+    resetEncryptionKeyForTests();
+    env.dataDir = HOST_IDENTITY_DIR;
+    hostIdentityReady = initIdentity().finally(() => {
+      env.dataDir = previousDataDir;
+    });
+  }
+  await hostIdentityReady;
+}
+
+async function installHostSlotSecret(): Promise<void> {
+  await ensureHostIdentity();
+  await putSecret(HOST_DISPATCH_USER, connectionSecretKey(HOST_SLOT_CONNECTION), HOST_SLOT_API_KEY);
+  getDb()
+    .query("UPDATE connection_profiles SET has_api_key = 1 WHERE id = ? AND user_id = ?")
+    .run(HOST_SLOT_CONNECTION, HOST_DISPATCH_USER);
+}
+
+async function runHostQuietTracked(fixture: HostFixture, request: QuietTrackedRequestDTO) {
+  const operation = runBoundQuietTracked({
+    context: {
+      ...context(fixture.parentSnapshot, "host-quiet-probe"),
+      signal: fixture.controller.signal,
+    },
+    request: { ...request, signal: fixture.controller.signal },
+    resolveDispatch: fixture.callbacks.resolveDispatch,
+    provider: fixture.callbacks.provider,
+    now: () => 100,
+  });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // This real clock race is intentional: WebCrypto and provider callbacks are
+    // host-level work that fake timers cannot drive, and an unresolved callback
+    // must fail instead of leaving the test pending.
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        fixture.controller.abort("host-bound quiet probe timeout");
+        reject(new Error("Bound quiet tracked probe timed out before terminal settlement"));
+      }, 8_000);
+    });
+    return await Promise.race([operation, timeout]);
+  } finally {
+    clearTimeout(timer);
+    if (!fixture.controller.signal.aborted) fixture.controller.abort("host-bound quiet probe cleanup");
+  }
+}
+
 function createHostFixture(): HostFixture {
   const mainResolution = resolveMainDispatchSnapshot(HOST_DISPATCH_USER, HOST_MAIN_CONTEXT);
   const parentSnapshot = parent({
@@ -285,13 +356,14 @@ function createHostFixture(): HostFixture {
       authoritativeContext: HOST_MAIN_CONTEXT,
     })),
   });
+  const controller = new AbortController();
   const callbacks = createHostBoundGenerationCallbacks({
     parent: parentSnapshot,
     extensionIdentifier: "bound-generation-test",
-    signal: new AbortController().signal,
+    signal: controller.signal,
     mainApiKey: "main-api-key",
   });
-  return { callbacks, parentSnapshot, mainResolution };
+  return { callbacks, controller, parentSnapshot, mainResolution };
 }
 
 async function resolveHostSlot(fixture: HostFixture): Promise<HostSlotFixture> {
@@ -456,6 +528,47 @@ describe("Bound assembly and tracked dispatch", () => {
     expect(assemblyCalls).toBe(0);
     expect(providerCalls).toBe(0);
   });
+  test("rejects a dispatch revision rotated after assembly before provider invocation", async () => {
+    const parentSnapshot = parent();
+    let currentRevision = REVISION;
+    let providerCalls = 0;
+    const binding = createBoundGenerationBinding({
+      context: context(parentSnapshot),
+      resolveDispatch: async ({ source }) => {
+        if (source.expectedConnectionDispatchRevision !== currentRevision) {
+          throw new Error("Bound dispatch changed before work");
+        }
+        return {
+          source: source.source,
+          connectionId: source.source === "main"
+            ? parentSnapshot.main.descriptor.connectionId
+            : source.connectionId!,
+          descriptor: DESCRIPTOR,
+          dispatchRevision: currentRevision,
+        };
+      },
+      assemble: async () => ({ messages: [{ role: "user", content: "assembled" }], breakdown: [] }),
+      provider: async (...args) => {
+        providerCalls += 1;
+        return provider(...args);
+      },
+      now: () => 100,
+    });
+
+    await expect(binding.assemble({
+      blocks: BLOCKS,
+      dispatch: { source: "main", expectedConnectionDispatchRevision: REVISION },
+      deadlineAt: 5_000,
+    })).resolves.toMatchObject({ ok: true });
+    currentRevision = "rotated-after-assembly";
+    await expect(binding.quietTracked(quietRequest())).resolves.toMatchObject({
+      ok: false,
+      phase: "resolved",
+      receipt: { providerInvoked: false },
+    });
+    expect(providerCalls).toBe(0);
+  });
+
 
   test("keeps Main and slot source identity distinct and emits truthful frozen receipts", async () => {
     const parentSnapshot = parent();
@@ -539,14 +652,22 @@ describe("Bound assembly and tracked dispatch", () => {
   });
 });
 
+afterAll(() => {
+  resetEncryptionKeyForTests();
+  resetIdentityForTests();
+  rmSync(HOST_IDENTITY_DIR, { recursive: true, force: true });
+});
+
 describe("Host-bound dispatch resolution", () => {
   beforeEach(async () => {
     hostProviderCalls.length = 0;
+    hostProviderRequests.length = 0;
     await resetHostDispatchDb();
   });
 
   afterEach(() => {
     closeDatabase();
+    env.authSecret = HOST_AUTH_SECRET_BEFORE_IDENTITY;
   });
 
   test("resolves an inspected slot without parent Main context through provider", async () => {
@@ -575,6 +696,79 @@ describe("Host-bound dispatch resolution", () => {
       model: "slot-model",
     }]);
   });
+
+  test("settles Main quietTracked through real host callbacks and provider adapter", async () => {
+    const fixture = createHostFixture();
+    const messages = [{ role: "user" as const, content: "main request" }];
+    const result = await runHostQuietTracked(fixture, quietRequest({
+      messages,
+      dispatch: {
+        source: "main",
+        expectedConnectionDispatchRevision: fixture.mainResolution.dispatchRevision,
+      },
+      parameters: { temperature: 0.65 },
+      reasoning: {},
+    }));
+
+    expect(hostProviderRequests).toHaveLength(1);
+    const call = hostProviderRequests[0];
+    if (!call) throw new Error("Expected the registered provider adapter to be entered");
+    expect(call.apiKey).toBe("main-api-key");
+    expect(call.apiUrl).toBe("http://bound-generation.invalid/v1");
+    expect(call.request.messages).toEqual(messages);
+    expect(call.request.model).toBe("main-model");
+    expect(call.request.signal).toBeTruthy();
+    expect(call.request.signal?.aborted).toBe(false);
+    expect(result).toMatchObject({
+      ok: true,
+      response: { content: "bound-provider-response", finish_reason: "stop" },
+      receipt: {
+        providerInvoked: true,
+        terminalResponse: true,
+        source: "main",
+        connectionId: HOST_MAIN_CONNECTION,
+        connectionDispatchRevision: fixture.mainResolution.dispatchRevision,
+      },
+    });
+  }, { timeout: 10_000 });
+
+  test("settles encrypted slot quietTracked through real host callbacks and provider adapter", async () => {
+    await installHostSlotSecret();
+    const fixture = createHostFixture();
+    const slot = await resolveHostSlot(fixture);
+    const messages = [{ role: "user" as const, content: "slot request" }];
+    const result = await runHostQuietTracked(fixture, quietRequest({
+      messages,
+      dispatch: {
+        source: "slot",
+        connectionId: HOST_SLOT_CONNECTION,
+        expectedConnectionDispatchRevision: slot.resolution.dispatchRevision,
+      },
+      parameters: { temperature: 0.35 },
+      reasoning: {},
+    }));
+
+    expect(hostProviderRequests).toHaveLength(1);
+    const call = hostProviderRequests[0];
+    if (!call) throw new Error("Expected the registered provider adapter to be entered");
+    expect(call.apiKey).toBe(HOST_SLOT_API_KEY);
+    expect(call.apiUrl).toBe("http://bound-generation.invalid/v1");
+    expect(call.request.messages).toEqual(messages);
+    expect(call.request.model).toBe("slot-model");
+    expect(call.request.signal).toBeTruthy();
+    expect(call.request.signal?.aborted).toBe(false);
+    expect(result).toMatchObject({
+      ok: true,
+      response: { content: "bound-provider-response", finish_reason: "stop" },
+      receipt: {
+        providerInvoked: true,
+        terminalResponse: true,
+        source: "slot",
+        connectionId: HOST_SLOT_CONNECTION,
+        connectionDispatchRevision: slot.resolution.dispatchRevision,
+      },
+    });
+  }, { timeout: 10_000 });
 
   test("rejects a slot revision after its selected preset changes before provider", async () => {
     const fixture = createHostFixture();

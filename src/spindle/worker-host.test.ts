@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, spyOn, test, vi } from "bun:test";
-import { mkdirSync, rmSync } from "node:fs";
+import { afterAll, beforeEach, describe, expect, spyOn, test, vi } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type {
   ConnectionDispatchDescriptorDTO,
@@ -7,11 +8,19 @@ import type {
   SpindleManifest,
   QuietTrackedResultDTO,
 } from "lumiverse-spindle-types";
+import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { runMigrations } from "../db/migrate";
+import { initIdentity, resetIdentityForTests } from "../crypto/init";
+import { connectionSecretKey } from "../services/connections.service";
+import { env } from "../env";
+import type { LlmProvider } from "../llm/provider";
+import { registerProvider } from "../llm/registry";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { interceptorPipeline, type InterceptorResult } from "./interceptor-pipeline";
 import { createInterceptorTerminalLease } from "./lifecycle";
 import { createBoundHostContainmentFatal } from "./bound-generation";
+import { createSpindleHostDescriptor } from "./host-compatibility";
 import {
   BOUND_INTERCEPTOR_RESERVE_MS,
   brandHostGenerationId,
@@ -103,15 +112,18 @@ type CapturedRuntimeMessage = {
   hostGeneration?: string;
   messages?: Array<{ role: string; content: string }>;
   context?: Record<string, unknown>;
+  input?: unknown;
   finalResponse?: unknown;
   event?: unknown;
-  __spindle_private_bound?: TestBoundEnvelope;
+  level?: string;
+  message?: string;
   result?: unknown;
   error?: unknown;
   reason?: string;
   payload?: unknown;
   userId?: string;
   token?: string;
+  __spindle_private_bound?: TestBoundEnvelope;
   __spindle_private_frontend?: TestFrontendScopeEnvelope;
 };
 
@@ -160,6 +172,173 @@ type WorkerHostInternals = {
 };
 
 const TEST_REGISTRATION_ID = "registration-worker-host-test";
+const WORKER_BRIDGE_PROVIDER = "worker-host-bridge-test-provider";
+const WORKER_BRIDGE_CONNECTION_ID = "worker-host-bridge-connection";
+const WORKER_BRIDGE_REVISION = "worker-host-bridge-revision";
+const WORKER_SLOT_USER_ID = "user-1";
+const WORKER_SLOT_MAIN_CONNECTION_ID = "worker-host-loopback-main";
+const WORKER_SLOT_CONNECTION_ID = "worker-host-loopback-slot";
+const WORKER_SLOT_MAIN_PRESET_ID = "worker-host-loopback-main-preset";
+const WORKER_SLOT_PRESET_ID = "worker-host-loopback-slot-preset";
+const WORKER_SLOT_API_KEY = "worker-host-loopback-secret";
+const WORKER_SLOT_MODEL = "worker-host-loopback-model";
+const WORKER_SLOT_CORRELATION = "worker-host-loopback-correlation";
+const WORKER_SLOT_RESPONSE = `worker-host-loopback-response:${WORKER_SLOT_CORRELATION}`;
+const WORKER_SLOT_TERMINAL_LOG = "__worker_slot_quiet_terminal__";
+const WORKER_HOST_AUTH_SECRET_BEFORE_IDENTITY = env.authSecret;
+const WORKER_HOST_IDENTITY_DIR = mkdtempSync(join(tmpdir(), "lumiverse-worker-host-"));
+
+type WorkerBridgeParentMain = {
+  readonly descriptor: ConnectionDispatchDescriptorDTO;
+  readonly dispatchRevision: string;
+  readonly presetId: string;
+};
+
+let workerHostIdentityReady: Promise<void> | undefined;
+
+async function ensureWorkerHostIdentity(): Promise<void> {
+  if (workerHostIdentityReady === undefined) {
+    const previousDataDir = env.dataDir;
+    resetIdentityForTests();
+    secretsSvc.resetEncryptionKeyForTests();
+    env.dataDir = WORKER_HOST_IDENTITY_DIR;
+    workerHostIdentityReady = initIdentity().finally(() => {
+      env.dataDir = previousDataDir;
+    });
+  }
+  await workerHostIdentityReady;
+}
+
+async function prepareEncryptedWorkerSlotDb(endpointOrigin: string): Promise<{
+  readonly main: WorkerBridgeParentMain;
+  readonly slot: {
+    readonly descriptor: ConnectionDispatchDescriptorDTO;
+    readonly dispatchRevision: string;
+  };
+}> {
+  closeDatabase();
+  initDatabase(":memory:");
+  await runMigrations(getDb());
+  const db = getDb();
+  db.run('INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)', [
+    WORKER_SLOT_USER_ID,
+    "Worker host loopback user",
+    "worker-host-loopback@example.test",
+  ]);
+  for (const [id, name, parameters] of [
+    [WORKER_SLOT_MAIN_PRESET_ID, "Worker host Main preset", '{"temperature":0.2}'],
+    [WORKER_SLOT_PRESET_ID, "Worker host slot preset", '{"temperature":0.3}'],
+  ] as const) {
+    db.run(
+      `INSERT INTO presets
+        (id, name, provider, parameters, prompt_order, metadata, created_at, updated_at, prompts, user_id, engine)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, name, "custom", parameters, "[]", "{}", 10, 10, "{}", WORKER_SLOT_USER_ID, "classic"],
+    );
+  }
+  for (const [id, name, model, presetId, isDefault, hasApiKey] of [
+    [
+      WORKER_SLOT_MAIN_CONNECTION_ID,
+      "Worker host loopback Main",
+      "worker-host-loopback-main-model",
+      WORKER_SLOT_MAIN_PRESET_ID,
+      1,
+      0,
+    ],
+    [
+      WORKER_SLOT_CONNECTION_ID,
+      "Worker host loopback slot",
+      WORKER_SLOT_MODEL,
+      WORKER_SLOT_PRESET_ID,
+      0,
+      0,
+    ],
+  ] as const) {
+    db.run(
+      `INSERT INTO connection_profiles
+        (id, name, provider, api_url, model, preset_id, is_default, metadata, created_at, updated_at, has_api_key, user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        name,
+        "custom",
+        endpointOrigin,
+        model,
+        presetId,
+        isDefault,
+        "{}",
+        10,
+        10,
+        hasApiKey,
+        WORKER_SLOT_USER_ID,
+      ],
+    );
+  }
+  await ensureWorkerHostIdentity();
+  await secretsSvc.putSecret(
+    WORKER_SLOT_USER_ID,
+    connectionSecretKey(WORKER_SLOT_CONNECTION_ID),
+    WORKER_SLOT_API_KEY,
+  );
+  db
+    .query("UPDATE connection_profiles SET has_api_key = 1 WHERE id = ? AND user_id = ?")
+    .run(WORKER_SLOT_CONNECTION_ID, WORKER_SLOT_USER_ID);
+
+  const main = dispatchStateSvc.resolveMainDispatchSnapshot(WORKER_SLOT_USER_ID, {
+    connectionId: WORKER_SLOT_MAIN_CONNECTION_ID,
+    presetId: WORKER_SLOT_MAIN_PRESET_ID,
+    reasoning: {},
+    settings: {},
+  });
+  const slot = dispatchStateSvc.resolveDispatchDescriptor(WORKER_SLOT_USER_ID, {
+    source: "slot",
+    connectionId: WORKER_SLOT_CONNECTION_ID,
+  });
+  return {
+    main: {
+      descriptor: main.descriptor,
+      dispatchRevision: main.dispatchRevision,
+      presetId: WORKER_SLOT_MAIN_PRESET_ID,
+    },
+    slot: {
+      descriptor: slot.descriptor,
+      dispatchRevision: slot.dispatchRevision,
+    },
+  };
+}
+
+const workerBridgeProviderCalls: Array<{
+  readonly apiKey: string;
+  readonly apiUrl: string;
+  readonly model: string;
+}> = [];
+
+registerProvider({
+  name: WORKER_BRIDGE_PROVIDER,
+  displayName: "Worker host bridge test provider",
+  defaultUrl: "https://worker-host-bridge.test/v1",
+  capabilities: {
+    parameters: {},
+    requiresMaxTokens: false,
+    supportsSystemRole: true,
+    supportsStreaming: true,
+    apiKeyRequired: false,
+    modelListStyle: "none",
+  },
+  async generate(apiKey, apiUrl, request) {
+    workerBridgeProviderCalls.push({ apiKey, apiUrl, model: request.model });
+    return { content: "worker-bridge-response", finish_reason: "stop" };
+  },
+  async *generateStream() {
+    yield { token: "worker-bridge-stream", finish_reason: "stop" };
+  },
+  async validateKey() {
+    return true;
+  },
+  async listModels() {
+    return [];
+  },
+} satisfies LlmProvider);
 
 function makeParentSnapshot(hostGeneration: string): ParentGenerationSnapshot {
   return {
@@ -177,11 +356,70 @@ function makeParentSnapshot(hostGeneration: string): ParentGenerationSnapshot {
     boundWorkDeadlineAt: 9_000,
   } as unknown as ParentGenerationSnapshot;
 }
+function makeWorkerBridgeParent(
+  hostGeneration: string,
+  parentMain?: WorkerBridgeParentMain,
+  budgets: { readonly interceptorMs?: number; readonly boundMs?: number } = {},
+): ParentGenerationSnapshot {
+  const base = makeParentSnapshot(hostGeneration);
+  const now = Date.now();
+  const main = parentMain ?? {
+    descriptor: {
+      connectionId: WORKER_BRIDGE_CONNECTION_ID,
+      connectionName: "Worker bridge connection",
+      provider: WORKER_BRIDGE_PROVIDER,
+      model: "worker-bridge-model",
+      endpointOrigin: "https://worker-host-bridge.test/v1",
+      dispatchKind: "concrete" as const,
+      connectionDispatchRevision: WORKER_BRIDGE_REVISION,
+    },
+    dispatchRevision: WORKER_BRIDGE_REVISION,
+    presetId: "worker-bridge-preset",
+  };
+  const interceptorMs = budgets.interceptorMs ?? 2_000;
+  const boundMs = budgets.boundMs ?? 1_500;
+  return {
+    ...base,
+    main: {
+      kind: "main",
+      hostGeneration: base.hostGeneration,
+      generationId: base.generationId,
+      userId: base.userId,
+      chatId: base.chatId,
+      descriptor: main.descriptor,
+      dispatchRevision: main.dispatchRevision,
+      parameters: {},
+      reasoning: {},
+      authoritativeContext: {
+        source: "main",
+        connectionId: main.descriptor.connectionId,
+        presetId: main.presetId,
+        reasoning: {},
+        settings: {},
+      },
+      capturedAt: now,
+    },
+    retrieval: {
+      kind: "parent-retrieval",
+      hostGeneration: base.hostGeneration,
+      generationId: base.generationId,
+      userId: base.userId,
+      chatId: base.chatId,
+      capturedAt: now,
+      expiresAt: now + 10_000,
+      bytes: 0,
+    },
+    interceptorDeadlineAt: now + interceptorMs,
+    boundWorkDeadlineAt: now + boundMs,
+  } as unknown as ParentGenerationSnapshot;
+}
 
 function makeTestHost(
   failInterceptRequest = true,
   interceptorTimeoutMs = 1_000,
+  registerInterceptor = true,
 ): {
+  host: WorkerHost;
   internals: WorkerHostInternals;
   messages: CapturedRuntimeMessage[];
 } {
@@ -208,8 +446,132 @@ function makeTestHost(
     terminate(): void {},
   };
   internals.hasPermission = () => true;
-  internals.handleRegisterInterceptor(TEST_REGISTRATION_ID);
-  return { internals, messages };
+  if (registerInterceptor) internals.handleRegisterInterceptor(TEST_REGISTRATION_ID);
+  return { host, internals, messages };
+}
+type WorkerMessageWaiter = {
+  predicate: (message: CapturedRuntimeMessage) => boolean;
+  resolve: (message: CapturedRuntimeMessage) => void;
+  reject: (reason: unknown) => void;
+};
+
+const WORKER_BRIDGE_MESSAGE_TIMEOUT_MS = 10_000;
+const WORKER_BRIDGE_TEST_BUDGET_MS = 14_000;
+// Real workers and encrypted host callbacks use wall-clock work that fake timers
+// cannot drive. Every waiter shares one deadline that leaves teardown inside the test budget.
+
+function waitForWorkerMessage(
+  messages: CapturedRuntimeMessage[],
+  waiters: WorkerMessageWaiter[],
+  predicate: (message: CapturedRuntimeMessage) => boolean,
+  deadlineAt: number,
+): Promise<CapturedRuntimeMessage> {
+  const existing = messages.find(predicate);
+  if (existing) return Promise.resolve(existing);
+  const { promise, resolve, reject } = Promise.withResolvers<CapturedRuntimeMessage>();
+  let resolveWithTimeout: WorkerMessageWaiter["resolve"];
+  const remainingMs = Math.max(1, Math.min(
+    WORKER_BRIDGE_MESSAGE_TIMEOUT_MS,
+    deadlineAt - Date.now(),
+  ));
+  const timeout = setTimeout(() => {
+    const waiterIndex = waiters.findIndex((waiter) => waiter.resolve === resolveWithTimeout);
+    if (waiterIndex !== -1) waiters.splice(waiterIndex, 1);
+    const queued = messages.slice(-8).map(({ type, requestId, message, error }) =>
+      JSON.stringify({ type, requestId, message, error }),
+    ).join(", ");
+    reject(new Error(`Timed out waiting for worker bridge message; queued=[${queued}]`));
+  }, remainingMs);
+  resolveWithTimeout = (message) => {
+    clearTimeout(timeout);
+    resolve(message);
+  };
+  waiters.push({
+    predicate,
+    resolve: resolveWithTimeout,
+    reject: (reason) => {
+      clearTimeout(timeout);
+      reject(reason);
+    },
+  });
+  return promise;
+}
+
+
+
+type WorkerBridgeFixture = {
+  worker: Worker;
+  workerMessages: CapturedRuntimeMessage[];
+  waiters: WorkerMessageWaiter[];
+};
+
+async function startWorkerBridge(
+  host: WorkerHost,
+  internals: WorkerHostInternals,
+  hostMessages: CapturedRuntimeMessage[],
+  entrySource: string,
+  deadlineAt: number,
+): Promise<WorkerBridgeFixture> {
+  const worker = new Worker(new URL("./worker-runtime.ts", import.meta.url), { type: "module" });
+  const workerMessages: CapturedRuntimeMessage[] = [];
+  const waiters: WorkerMessageWaiter[] = [];
+  const rejectWaiters = (reason: unknown): void => {
+    for (const waiter of waiters.splice(0)) waiter.reject(reason);
+  };
+  worker.onmessage = (event) => {
+    const message = event.data as CapturedRuntimeMessage;
+    workerMessages.push(message);
+    const waiterIndex = waiters.findIndex((waiter) => waiter.predicate(message));
+    if (waiterIndex !== -1) {
+      waiters.splice(waiterIndex, 1)[0]!.resolve(message);
+    }
+    try {
+      internals.handleMessage(message);
+    } catch (error) {
+      rejectWaiters(error);
+    }
+  };
+  worker.onerror = (event) => {
+    rejectWaiters(new Error(event.message || "Worker bridge failed"));
+  };
+  internals.runtime = {
+    mode: "worker",
+    pid: null,
+    postMessage(message: unknown): void {
+      const cloned = structuredClone(message) as CapturedRuntimeMessage;
+      hostMessages.push(cloned);
+      worker.postMessage(message);
+    },
+    terminate(): void {
+      worker.terminate();
+    },
+  };
+
+  const ready = waitForWorkerMessage(
+    workerMessages,
+    waiters,
+    (message) => message.type === "log" && message.message === "__worker_ready__",
+    deadlineAt,
+  );
+  const hostDescriptor = await createSpindleHostDescriptor(host.extensionId);
+  worker.postMessage({
+    type: "init",
+    manifest: {
+      ...host.manifest,
+      entry_backend: `data:text/javascript,${encodeURIComponent(entrySource)}`,
+      requested_capabilities: ["interceptor", "generation"],
+    },
+    host: hostDescriptor,
+    storagePath: `/tmp/worker-host-bridge-${crypto.randomUUID()}`,
+  });
+  try {
+    await ready;
+    return { worker, workerMessages, waiters };
+  } catch (error) {
+    worker.terminate();
+    internals.runtime = null;
+    throw error;
+  }
 }
 
 type BoundInterceptRequest = CapturedRuntimeMessage & {
@@ -268,9 +630,12 @@ function makeWorkerInterceptResult(
   };
 }
 
-function boundParentDispatch(parent: ParentGenerationSnapshot): Promise<InterceptorResult> {
+function boundParentDispatch(
+  parent: ParentGenerationSnapshot,
+  messages: Array<{ role: "user"; content: string }> = [{ role: "user", content: "hello" }],
+): Promise<InterceptorResult> {
   return interceptorPipeline.run(
-    [{ role: "user", content: "hello" }],
+    messages,
     {
       userId: "user-1",
       chatId: "chat-1",
@@ -1144,6 +1509,378 @@ describe("WorkerHost interceptor transport boundary", () => {
     }
   }, { timeout: 1_000 });
 });
+describe("WorkerHost nested quietTracked worker bridge", () => {
+  test("settles one nested quietTracked call through a real worker and host provider", async () => {
+    const { host, internals, messages } = makeTestHost(false, 2_000, false);
+    const testDeadlineAt = Date.now() + WORKER_BRIDGE_TEST_BUDGET_MS;
+    const grantedPermissionsSpy = spyOn(managerSvc, "getGrantedPermissions").mockReturnValue([
+      "interceptor",
+      "generation",
+      "generation_parameters",
+      "final_response",
+    ]);
+    let workerBridge: WorkerBridgeFixture | undefined;
+    let dispatch: Promise<InterceptorResult> | undefined;
+    let quietRequestPromise: Promise<CapturedRuntimeMessage> | undefined;
+    let quietLogPromise: Promise<CapturedRuntimeMessage> | undefined;
+    let resolveMainSpy: { mockRestore(): void } | undefined;
+    let resolveSourceSpy: { mockRestore(): void } | undefined;
+    const providerCallsBefore = workerBridgeProviderCalls.length;
+    const quietLogPrefix = "__worker_bridge_quiet__";
+    try {
+      workerBridge = await startWorkerBridge(
+        host,
+        internals,
+        messages,
+        `
+          spindle.registerInterceptor(async (messages) => {
+            const result = await spindle.generate.quietTracked({
+              messages,
+              dispatch: {
+                source: "main",
+                expectedConnectionDispatchRevision: "${WORKER_BRIDGE_REVISION}",
+              },
+              deadlineAt: Date.now() + 1_000,
+            });
+            spindle.log.info("${quietLogPrefix}" + JSON.stringify(result));
+            return messages;
+          });
+        `,
+        testDeadlineAt,
+      );
+      const registration = await waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "register_interceptor",
+        testDeadlineAt,
+      );
+      expect(registration.registrationId).toEqual(expect.any(String));
+      const parent = makeWorkerBridgeParent("parent-worker-bridge");
+      const resolution = {
+        source: "main" as const,
+        connectionId: WORKER_BRIDGE_CONNECTION_ID,
+        descriptor: parent.main.descriptor,
+        dispatchRevision: WORKER_BRIDGE_REVISION,
+      };
+      resolveMainSpy = spyOn(dispatchStateSvc, "resolveMainDispatchSnapshot")
+        .mockReturnValue(resolution as never);
+      resolveSourceSpy = spyOn(dispatchStateSvc, "resolveDispatchForSource")
+        .mockReturnValue(resolution as never);
+
+      quietRequestPromise = waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "generate_quiet_tracked",
+        testDeadlineAt,
+      );
+      quietLogPromise = waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "log" && message.message?.startsWith(quietLogPrefix) === true,
+        testDeadlineAt,
+      );
+      dispatch = boundParentDispatch(parent);
+
+      const quietRequest = await quietRequestPromise;
+      const parentRequest = requireBoundInterceptRequest(messages);
+      if (!quietRequest.requestId || !quietRequest.__spindle_private_bound) {
+        throw new Error("nested quietTracked request fixture is incomplete");
+      }
+      expect(quietRequest.__spindle_private_bound.requestId).toBe(parentRequest.requestId);
+      expect(quietRequest.__spindle_private_bound.operationRequestId).toBe(quietRequest.requestId);
+      expect(workerBridge.workerMessages.filter((message) => message.type === "generate_quiet_tracked"))
+        .toHaveLength(1);
+
+      const quietLog = await quietLogPromise;
+      const quietResult = JSON.parse(
+        quietLog.message!.slice(quietLogPrefix.length),
+      ) as QuietTrackedResultDTO;
+      expect(quietResult).toMatchObject({
+        ok: true,
+        response: { content: "worker-bridge-response", finish_reason: "stop" },
+        receipt: {
+          providerInvoked: true,
+          terminalResponse: true,
+          source: "main",
+          connectionId: WORKER_BRIDGE_CONNECTION_ID,
+          connectionDispatchRevision: WORKER_BRIDGE_REVISION,
+        },
+      });
+      expect(workerBridgeProviderCalls.slice(providerCallsBefore)).toHaveLength(1);
+      expect(messages.filter(
+        (message) => message.type === "response" && message.requestId === quietRequest.requestId,
+      )).toHaveLength(1);
+
+      const result = await dispatch;
+      for (const lease of result.terminalLeases ?? []) lease.release();
+      expectNoBoundLeaks(internals);
+    } finally {
+      for (const waiter of workerBridge?.waiters.splice(0) ?? []) {
+        waiter.reject(new Error("nested quietTracked worker bridge teardown"));
+      }
+      await Promise.allSettled(
+        [quietRequestPromise, quietLogPromise].filter(
+          (promise): promise is Promise<CapturedRuntimeMessage> => promise !== undefined,
+        ),
+      );
+      internals.cleanup();
+      workerBridge?.worker.terminate();
+      await dispatch?.catch(() => undefined);
+      resolveSourceSpy?.mockRestore();
+      resolveMainSpy?.mockRestore();
+      grantedPermissionsSpy.mockRestore();
+    }
+  }, { timeout: 15_000 });
+  test("settles an encrypted explicit slot through the real worker-host bridge and loopback adapter", async () => {
+    type LoopbackRequestLedgerEntry = {
+      readonly requestId: string;
+      readonly correlation: string | null;
+      readonly method: string;
+      readonly url: string;
+      readonly authorization: string | null;
+      readonly body: Record<string, unknown>;
+      readonly valid: boolean;
+    };
+
+    const requestLedger: LoopbackRequestLedgerEntry[] = [];
+    const loopbackServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url);
+        let body: Record<string, unknown> = {};
+        try {
+          const parsed = await request.json();
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            body = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // The request ledger records malformed requests before the assertion
+          // below rejects the transport path.
+        }
+        const firstMessage = Array.isArray(body.messages) &&
+          body.messages[0] &&
+          typeof body.messages[0] === "object" &&
+          !Array.isArray(body.messages[0])
+          ? body.messages[0] as Record<string, unknown>
+          : undefined;
+        const correlation = typeof firstMessage?.content === "string"
+          ? firstMessage.content
+          : null;
+        const entry: LoopbackRequestLedgerEntry = {
+          correlation,
+          requestId: `worker-host-loopback-request-${requestLedger.length + 1}`,
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body,
+          valid: request.method === "POST" && url.pathname === "/v1/chat/completions",
+        };
+        requestLedger.push(entry);
+        if (!entry.valid) return new Response("not found", { status: 404 });
+        return Response.json({
+          id: entry.requestId,
+          object: "chat.completion",
+          created: 0,
+          model: body.model,
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: WORKER_SLOT_RESPONSE },
+            finish_reason: "stop",
+          }],
+          usage: {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+          },
+        });
+      },
+    });
+    const endpointOrigin = `http://127.0.0.1:${loopbackServer.port}/v1`;
+    const { host, internals, messages } = makeTestHost(false, 4_000, false);
+    const testDeadlineAt = Date.now() + WORKER_BRIDGE_TEST_BUDGET_MS;
+    const grantedPermissionsSpy = spyOn(managerSvc, "getGrantedPermissions").mockReturnValue([
+      "interceptor",
+      "generation",
+      "generation_parameters",
+      "final_response",
+    ]);
+    let workerBridge: WorkerBridgeFixture | undefined;
+    let dispatch: Promise<InterceptorResult> | undefined;
+    const quietLogPrefix = "__worker_slot_quiet__";
+    let quietRequestPromise: Promise<CapturedRuntimeMessage> | undefined;
+    let quietLogPromise: Promise<CapturedRuntimeMessage> | undefined;
+    let terminalLogPromise: Promise<CapturedRuntimeMessage> | undefined;
+    try {
+      const fixture = await prepareEncryptedWorkerSlotDb(endpointOrigin);
+      expect(fixture.slot.descriptor).toMatchObject({
+        provider: "custom",
+        endpointOrigin,
+        model: WORKER_SLOT_MODEL,
+        dispatchKind: "concrete",
+        connectionId: WORKER_SLOT_CONNECTION_ID,
+        connectionDispatchRevision: fixture.slot.dispatchRevision,
+      });
+      workerBridge = await startWorkerBridge(
+        host,
+        internals,
+        messages,
+        `
+          spindle.registerInterceptor(async (messages) => {
+            const result = await spindle.generate.quietTracked({
+              messages,
+              dispatch: {
+                source: "slot",
+                connectionId: "${WORKER_SLOT_CONNECTION_ID}",
+                expectedConnectionDispatchRevision: "${fixture.slot.dispatchRevision}",
+              },
+              parameters: { temperature: 0.3 },
+              deadlineAt: Date.now() + 2_500,
+            });
+            spindle.log.info("${quietLogPrefix}" + JSON.stringify(result));
+            spindle.log.info("${WORKER_SLOT_TERMINAL_LOG}");
+            return messages;
+          });
+        `,
+        testDeadlineAt,
+      );
+      const registration = await waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "register_interceptor",
+        testDeadlineAt,
+      );
+      expect(registration.registrationId).toEqual(expect.any(String));
+      const parent = makeWorkerBridgeParent(
+        "parent-worker-slot-loopback",
+        fixture.main,
+        { interceptorMs: 4_000, boundMs: 3_500 },
+      );
+
+      quietRequestPromise = waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "generate_quiet_tracked",
+        testDeadlineAt,
+      );
+      quietLogPromise = waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "log" && message.message?.startsWith(quietLogPrefix) === true,
+        testDeadlineAt,
+      );
+      terminalLogPromise = waitForWorkerMessage(
+        workerBridge.workerMessages,
+        workerBridge.waiters,
+        (message) => message.type === "log" && message.message === WORKER_SLOT_TERMINAL_LOG,
+        testDeadlineAt,
+      );
+      dispatch = boundParentDispatch(parent, [{
+        role: "user",
+        content: WORKER_SLOT_CORRELATION,
+      }]);
+
+      const quietRequest = await quietRequestPromise!;
+      const parentRequest = requireBoundInterceptRequest(messages);
+      if (!quietRequest.requestId || !quietRequest.__spindle_private_bound) {
+        throw new Error("encrypted explicit-slot quietTracked request fixture is incomplete");
+      }
+      expect(quietRequest.__spindle_private_bound.requestId).toBe(parentRequest.requestId);
+      expect(quietRequest.__spindle_private_bound.operationRequestId).toBe(quietRequest.requestId);
+      expect(quietRequest.input).toMatchObject({
+        messages: [{ role: "user", content: WORKER_SLOT_CORRELATION }],
+        dispatch: {
+          source: "slot",
+          connectionId: WORKER_SLOT_CONNECTION_ID,
+          expectedConnectionDispatchRevision: fixture.slot.dispatchRevision,
+        },
+        parameters: { temperature: 0.3 },
+      });
+      expect(workerBridge.workerMessages.filter((message) => message.type === "generate_quiet_tracked"))
+        .toHaveLength(1);
+
+      const quietLog = await quietLogPromise!;
+      const terminalLog = await terminalLogPromise!;
+      expect(terminalLog.message).toBe(WORKER_SLOT_TERMINAL_LOG);
+      const quietResult = JSON.parse(
+        quietLog.message!.slice(quietLogPrefix.length),
+      ) as QuietTrackedResultDTO;
+      expect(requestLedger).toHaveLength(1);
+      const request = requestLedger[0];
+      if (!request) throw new Error("Expected one loopback request ledger entry");
+      expect(request).toMatchObject({
+        correlation: WORKER_SLOT_CORRELATION,
+        requestId: "worker-host-loopback-request-1",
+        method: "POST",
+        url: `${endpointOrigin}/chat/completions`,
+        authorization: `Bearer ${WORKER_SLOT_API_KEY}`,
+        valid: true,
+      });
+      expect(request.body).toMatchObject({
+        model: WORKER_SLOT_MODEL,
+        messages: [{ role: "user", content: WORKER_SLOT_CORRELATION }],
+        stream: false,
+        temperature: 0.3,
+      });
+      expect(quietResult).toMatchObject({
+        ok: true,
+        response: { content: WORKER_SLOT_RESPONSE, finish_reason: "stop" },
+        receipt: {
+          providerInvoked: true,
+          terminalResponse: true,
+          source: "slot",
+          connectionId: WORKER_SLOT_CONNECTION_ID,
+          connectionDispatchRevision: fixture.slot.dispatchRevision,
+        },
+      });
+
+      const result = await dispatch;
+      expect(result.messages).toEqual([{
+        role: "user",
+        content: WORKER_SLOT_CORRELATION,
+      }]);
+      for (const lease of result.terminalLeases ?? []) lease.release();
+      await expect(host.stop()).resolves.toBeUndefined();
+      expect(requestLedger).toHaveLength(1);
+      const correlatedMessages = messages.filter(
+        (message) => message.requestId === quietRequest.requestId,
+      );
+      expect(correlatedMessages).toHaveLength(1);
+      expect(correlatedMessages[0]).toMatchObject({
+        type: "response",
+        requestId: quietRequest.requestId,
+        result: quietResult,
+      });
+    } finally {
+      const pendingWaits = [
+        quietRequestPromise,
+        quietLogPromise,
+        terminalLogPromise,
+      ].filter(
+        (promise): promise is Promise<CapturedRuntimeMessage> => promise !== undefined,
+      );
+      for (const waiter of workerBridge?.waiters.splice(0) ?? []) {
+        waiter.reject(new Error("encrypted explicit-slot worker bridge teardown"));
+      }
+      await Promise.allSettled(pendingWaits);
+      internals.cleanup();
+      workerBridge?.worker.terminate();
+      await dispatch?.catch(() => undefined);
+      grantedPermissionsSpy.mockRestore();
+      closeDatabase();
+      env.authSecret = WORKER_HOST_AUTH_SECRET_BEFORE_IDENTITY;
+      loopbackServer.stop(true);
+    }
+  }, { timeout: 15_000 });
+
+afterAll(() => {
+  secretsSvc.resetEncryptionKeyForTests();
+  resetIdentityForTests();
+  rmSync(WORKER_HOST_IDENTITY_DIR, { recursive: true, force: true });
+});
+
+});
+
 
 describe("WorkerHost live permission and event isolation", () => {
   test("rejects subscriptions to private presentation events", () => {
