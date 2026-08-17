@@ -620,19 +620,26 @@ export async function createConnection(userId: string, input: CreateConnectionPr
     hasApiKey = 1;
   }
 
-  getDb()
-    .query(
-      "INSERT INTO connection_profiles (id, user_id, name, provider, api_url, model, preset_id, is_default, has_api_key, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .run(
-      id, userId, input.name, input.provider,
-      input.api_url || "", input.model || "",
-      input.preset_id || null,
-      input.is_default ? 1 : 0,
-      hasApiKey,
-      JSON.stringify(clearImportedConnectionReview(input.metadata || {})),
-      now, now
-    );
+  try {
+    getDb()
+      .query(
+        "INSERT INTO connection_profiles (id, user_id, name, provider, api_url, model, preset_id, is_default, has_api_key, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+      .run(
+        id, userId, input.name, input.provider,
+        input.api_url || "", input.model || "",
+        input.preset_id || null,
+        input.is_default ? 1 : 0,
+        hasApiKey,
+        JSON.stringify(clearImportedConnectionReview(input.metadata || {})),
+        now, now
+      );
+  } catch (error) {
+    // The secret is written before the profile row; a failed insert must not
+    // leave an orphaned credential behind.
+    if (hasApiKey) secretsSvc.deleteSecret(userId, connectionSecretKey(id));
+    throw error;
+  }
 
   return getConnection(userId, id)!;
 }

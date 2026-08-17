@@ -1537,6 +1537,17 @@ export async function persistUploadedArchive(
     // tests and tooling; startImport performs the durable admission CAS.
   }
   if (controlDb) {
+    // A global DB can exist without the import schema (partially migrated
+    // in-memory databases in unrelated tests); absence is not an error here
+    // for the same reason a missing database is not.
+    const controlTable = controlDb.query(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_data_imports'",
+    ).get();
+    if (!controlTable) {
+      controlDb = null;
+    }
+  }
+  if (controlDb) {
     const control = controlDb.query(
       `SELECT state, lease_owner, lease_expires_at
          FROM user_data_imports
