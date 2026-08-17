@@ -19,7 +19,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { strToU8, zipSync } from "fflate";
+import { createHash } from "crypto";
+import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 import { join } from "path";
 import { writeFileSync, mkdtempSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
@@ -28,14 +29,16 @@ import {
   getDb,
   initDatabase,
 } from "../src/db/connection";
+import { runMigrations } from "../src/db/migrate";
 import { buildExportStream } from "../src/services/user-data/export.service";
 import { verifyArchiveFast, verifyArchive } from "../src/services/user-data/import.service";
 import {
   ARCHIVE_SCHEMA_VERSION,
   NDJSON_FORMAT_VERSION,
   NDJSON_MAX_RECORD_BYTES,
+  MAX_ARCHIVE_FILE_BYTES,
+  parseManifest,
 } from "../src/services/user-data/manifest";
-
 const USER_ID = "export-roundtrip-user";
 
 function testManifest(archiveId: string): Record<string, unknown> {
@@ -52,13 +55,6 @@ function testManifest(archiveId: string): Record<string, unknown> {
   };
 }
 
-async function applyBaseline(): Promise<void> {
-  const db = getDb();
-  db.run("PRAGMA foreign_keys = OFF");
-  db.run(
-    await Bun.file(join(import.meta.dir, "..", "src", "db", "baseline.sql")).text(),
-  );
-}
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = stream.getReader();
@@ -117,7 +113,7 @@ describe("user-data export ZIP64 round-trip", () => {
     closeDatabase();
     workDir = mkdtempSync(join(tmpdir(), "lvbak-test-"));
     initDatabase(":memory:");
-    await applyBaseline();
+    await runMigrations(getDb());
     // Minimal user row — the registry-driven export filters everything by
     // user_id, so we need at least one row in `user` for the joins to
     // resolve to a non-empty result set.
@@ -158,6 +154,318 @@ describe("user-data export ZIP64 round-trip", () => {
     expect(manifest.ndjsonFormatVersion).toBe(NDJSON_FORMAT_VERSION);
     expect(manifest.ndjsonMaxRecordBytes).toBe(NDJSON_MAX_RECORD_BYTES);
     expect(manifest.archiveId).toMatch(/^[0-9a-f-]{36}$/i);
+  });
+  test("V3 manifest is last and authenticates every emitted entry", async () => {
+    const bytes = await readAll(
+      buildExportStream({
+        userId: USER_ID,
+        includeVectors: false,
+        producerVersion: "test",
+      }),
+    );
+    const archive = unzipSync(bytes);
+    const names = Object.keys(archive);
+    expect(names[names.length - 1]).toBe("manifest.json");
+    expect(new Set(names).size).toBe(names.length);
+    const manifest = parseManifest(JSON.parse(strFromU8(archive["manifest.json"] ?? new Uint8Array())));
+    expect(manifest.schemaVersion).toBe(3);
+    expect(manifest.entries?.map((entry) => entry.path)).toEqual(
+      manifest.entries?.map((entry) => entry.path).slice().sort((a, b) => a.localeCompare(b)),
+    );
+    for (const entry of manifest.entries ?? []) {
+      const payload = archive[entry.path];
+      if (!payload) throw new Error(`archive is missing ${entry.path}`);
+      expect(payload.byteLength).toBe(entry.bytes);
+      expect(createHash("sha256").update(payload).digest("hex")).toBe(entry.sha256);
+      expect(manifest.byteCounts?.[entry.path]).toBe(entry.bytes);
+    }
+  });
+  test("secret export fails closed when a selected key is missing", async () => {
+    await expect(
+      readAll(
+        buildExportStream({
+          userId: USER_ID,
+          includeVectors: false,
+          producerVersion: "test",
+          secrets: { smk: new Uint8Array(32), secretKeys: ["missing-secret"] },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  test("V3 parser rejects duplicate, traversal, and invalid SHA metadata", () => {
+    const base = {
+      schemaVersion: 3,
+      producer: "lumiverse",
+      exportedAt: 0,
+      archiveId: crypto.randomUUID(),
+      producerVersion: "test",
+      ndjsonFormatVersion: 2,
+      ndjsonMaxRecordBytes: NDJSON_MAX_RECORD_BYTES,
+      includeVectors: false,
+      embeddingConfig: { provider: null, model: null, dimension: null },
+      embeddingIdentity: "test-embedding",
+      vectorStatus: "rebuild_required",
+      registryVersion: 2,
+      snapshotId: "snapshot-test",
+      counts: {},
+      missingFiles: [],
+      missingOptionalFiles: [],
+      fileAliases: [],
+      byteCounts: { "database/settings.ndjson": 0 },
+      entries: [
+        {
+          path: "database/settings.ndjson",
+          kind: "database",
+          required: true,
+          bytes: 0,
+          sha256: "0".repeat(64),
+        },
+      ],
+    };
+    expect(() => parseManifest({
+      ...base,
+      entries: undefined,
+    })).toThrow(/entries/);
+    expect(() => parseManifest({
+      ...base,
+      byteCounts: undefined,
+    })).toThrow(/counts/);
+    expect(() => parseManifest({
+      ...base,
+      byteCounts: { "database/settings.ndjson": Number.MAX_SAFE_INTEGER },
+    })).toThrow(/exceeds/);
+    const exactEntry = parseManifest({
+      ...base,
+      byteCounts: { "database/settings.ndjson": MAX_ARCHIVE_FILE_BYTES },
+      entries: [{ ...base.entries[0], bytes: MAX_ARCHIVE_FILE_BYTES }],
+    });
+    expect(exactEntry.entries?.[0].bytes).toBe(MAX_ARCHIVE_FILE_BYTES);
+    expect(() => parseManifest({
+      ...base,
+      byteCounts: { "database/settings.ndjson": MAX_ARCHIVE_FILE_BYTES + 1 },
+      entries: [{ ...base.entries[0], bytes: MAX_ARCHIVE_FILE_BYTES + 1 }],
+    })).toThrow(/exceeds/);
+    expect(() => parseManifest({
+      ...base,
+      entries: [base.entries[0], { ...base.entries[0] }],
+    })).toThrow(/duplicate archive entry/);
+    expect(() => parseManifest({
+      ...base,
+      entries: [{ ...base.entries[0], sha256: "not-a-sha" }],
+    })).toThrow(/SHA-256/);
+    for (const path of ["../settings.ndjson", "database/../settings.ndjson", "./settings.ndjson", "database//settings.ndjson"]) {
+      expect(() => parseManifest({
+        ...base,
+        entries: [{ ...base.entries[0], path }],
+      })).toThrow(/invalid archive entry path/);
+    }
+  });
+  test("V1/V2 manifests retain legacy defaults while V3 remains strict", () => {
+    const legacy = parseManifest({
+      schemaVersion: 1,
+      producer: "lumiverse",
+    });
+    expect(legacy.archiveId).toBe("");
+    expect(legacy.exportedAt).toBe(0);
+    expect(legacy.producerVersion).toBeNull();
+    expect(legacy.includeVectors).toBe(false);
+    expect(legacy.embeddingConfig).toEqual({ provider: null, model: null, dimension: null });
+    expect(legacy.counts).toEqual({});
+    expect(legacy.missingFiles).toEqual([]);
+    const legacyV2 = parseManifest({
+      schemaVersion: 2,
+      producer: "lumiverse",
+    });
+    expect(legacyV2).toMatchObject({
+      archiveId: "",
+      exportedAt: 0,
+      producerVersion: null,
+      includeVectors: false,
+      embeddingConfig: { provider: null, model: null, dimension: null },
+      counts: {},
+      missingFiles: [],
+    });
+
+    expect(() => parseManifest({
+      schemaVersion: 2,
+      producer: "lumiverse",
+      ndjsonMaxRecordBytes: NDJSON_MAX_RECORD_BYTES + 1,
+    })).toThrow(/advertises an NDJSON limit/);
+
+
+    expect(() => parseManifest({
+      schemaVersion: 3,
+      producer: "lumiverse",
+      includeVectors: false,
+      embeddingConfig: { provider: null, model: null, dimension: null },
+      ndjsonFormatVersion: 2,
+      ndjsonMaxRecordBytes: NDJSON_MAX_RECORD_BYTES,
+      counts: {},
+      missingFiles: [],
+      registryVersion: 2,
+      snapshotId: "snapshot",
+      entries: [],
+      fileAliases: [],
+      byteCounts: {},
+      missingOptionalFiles: [],
+      vectorStatus: "rebuild_required",
+      embeddingIdentity: "embedding",
+    })).toThrow(/exportedAt|archiveId|producerVersion/);
+  });
+
+  test("V3 file entries require source identity bytes to match the payload", () => {
+    const base = {
+      schemaVersion: 3,
+      producer: "lumiverse",
+      exportedAt: 0,
+      archiveId: crypto.randomUUID(),
+      producerVersion: "test",
+      ndjsonFormatVersion: 2,
+      ndjsonMaxRecordBytes: NDJSON_MAX_RECORD_BYTES,
+      includeVectors: false,
+      embeddingConfig: { provider: null, model: null, dimension: null },
+      embeddingIdentity: "embedding",
+      vectorStatus: "rebuild_required",
+      registryVersion: 2,
+      snapshotId: "snapshot",
+      counts: {},
+      missingFiles: [],
+      missingOptionalFiles: [],
+      fileAliases: [],
+      byteCounts: { "files/images/a.bin": 2 },
+    };
+    const entry = {
+      path: "files/images/a.bin",
+      kind: "file",
+      required: true,
+      bytes: 2,
+      sha256: "0".repeat(64),
+    };
+    expect(() => parseManifest({ ...base, entries: [entry] })).toThrow(/sourceIdentity.size/);
+    expect(() => parseManifest({
+      ...base,
+      entries: [{ ...entry, sourceIdentity: { device: 1, inode: 2, size: 1, mtimeMs: 3 } }],
+    })).toThrow(/sourceIdentity.size/);
+    expect(parseManifest({
+      ...base,
+      entries: [{ ...entry, sourceIdentity: { device: 1, inode: 2, size: 2, mtimeMs: 3 } }],
+    }).entries?.[0].sourceIdentity).toEqual({ device: 1, inode: 2, size: 2, mtimeMs: 3 });
+  });
+
+
+  test("V3 ledger preserves required and optional file references", () => {
+    const manifest = parseManifest({
+      schemaVersion: 3,
+      producer: "lumiverse",
+      exportedAt: 0,
+      archiveId: crypto.randomUUID(),
+      producerVersion: "test",
+      ndjsonFormatVersion: 2,
+      ndjsonMaxRecordBytes: NDJSON_MAX_RECORD_BYTES,
+      includeVectors: false,
+      embeddingConfig: { provider: null, model: null, dimension: null },
+      embeddingIdentity: "test-embedding",
+      vectorStatus: "rebuild_required",
+      registryVersion: 2,
+      snapshotId: "snapshot-test",
+      counts: {},
+      missingFiles: ["optional-image"],
+      missingOptionalFiles: ["files/images/optional.bin"],
+      fileAliases: [],
+      byteCounts: { "files/images/required.bin": 1 },
+      entries: [
+        {
+          path: "files/images/required.bin",
+          kind: "file",
+          required: true,
+          bytes: 1,
+          sha256: "0".repeat(64),
+          sourceIdentity: { device: 1, inode: 2, size: 1, mtimeMs: 3 },
+        },
+      ],
+    });
+    expect(manifest.entries?.[0].required).toBe(true);
+    expect(manifest.missingOptionalFiles).toEqual(["files/images/optional.bin"]);
+  });
+
+
+  test("exports canonical agent tool-call limits and strips legacy metadata authority", async () => {
+    const baseConfig = {
+      version: 1,
+      enabled: false,
+      maxInvocations: 64,
+      mainToolIds: [],
+      mainLoreScope: "active",
+      profiles: [],
+    };
+    for (const [index, maxToolCalls] of [1, 64, Number.MAX_SAFE_INTEGER].entries()) {
+      getDb().query(
+        "INSERT INTO presets (id, name, provider, metadata, user_id) VALUES (?, ?, ?, ?, ?)",
+      ).run(
+        `agent-${index}`,
+        `Agent ${index}`,
+        "loom",
+        JSON.stringify({ agentConfig: { ...baseConfig, maxToolCalls } }),
+        USER_ID,
+      );
+      getDb().query(
+        "INSERT INTO preset_agent_configs (user_id, preset_id, max_invocations, max_tool_calls) VALUES (?, ?, 64, ?)",
+      ).run(USER_ID, `agent-${index}`, maxToolCalls);
+    }
+    getDb().query(
+      "INSERT INTO presets (id, name, provider, metadata, user_id) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+      "agent-legacy",
+      "Agent legacy",
+      "loom",
+      JSON.stringify({ agentConfig: baseConfig }),
+      USER_ID,
+    );
+    getDb().query(
+      "INSERT INTO presets (id, name, provider, metadata, user_id) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+      "agent-absent",
+      "Agent absent",
+      "loom",
+      '{"extensionData":{"keep":true}}',
+      USER_ID,
+    );
+
+
+    const bytes = await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }));
+    const entries = unzipSync(bytes);
+    const rows = strFromU8(entries["database/presets.ndjson"] ?? new Uint8Array())
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { id: string; metadata: string });
+    type ExportedMetadata = {
+      agentConfig?: unknown;
+      [key: string]: unknown;
+    };
+    const byId = new Map(rows.map((row) => [
+      row.id,
+      JSON.parse(row.metadata) as ExportedMetadata,
+    ]));
+    expect(byId.get("agent-0")?.agentConfig).toBeUndefined();
+    expect(byId.get("agent-1")?.agentConfig).toBeUndefined();
+    expect(byId.get("agent-2")?.agentConfig).toBeUndefined();
+    expect(byId.get("agent-legacy")?.agentConfig).toBeUndefined();
+    expect(byId.get("agent-absent")).toEqual({ extensionData: { keep: true } });
+
+    const configRows = strFromU8(entries["database/preset_agent_configs.ndjson"] ?? new Uint8Array())
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { preset_id: string; max_tool_calls: number });
+    const limitsByPreset = new Map(configRows.map((row) => [row.preset_id, row.max_tool_calls]));
+    expect(limitsByPreset.get("agent-0")).toBe(1);
+    expect(limitsByPreset.get("agent-1")).toBe(64);
+    expect(limitsByPreset.get("agent-2")).toBe(Number.MAX_SAFE_INTEGER);
+    expect(limitsByPreset.has("agent-legacy")).toBe(false);
   });
 
   test("compatibility verifier also accepts the export", async () => {

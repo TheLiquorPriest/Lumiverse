@@ -11,6 +11,13 @@ describe('LorebookEditorWorkspace reorder selection contract', () => {
     expect(source).toContain('refresh: () => loadEntries(reorderBookId)')
     expect(source).toMatch(/setSavedAt\(null\)[\s\S]*\[selectedBookId\]/)
     expect(source).not.toContain('worldBooksApi.reorderEntries(selectedBookId')
-    expect(source).not.toContain('loadEntries(selectedBookId)\n      setSavedAt')
+
+    const reorderStart = source.indexOf('const reorderEntries = useCallback(')
+    const nextHandlerStart = source.indexOf('\n  const saveEntry =', reorderStart)
+    expect(reorderStart).toBeGreaterThanOrEqual(0)
+    expect(nextHandlerStart).toBeGreaterThan(reorderStart)
+    expect(source.slice(reorderStart, nextHandlerStart)).not.toContain(
+      'loadEntries(selectedBookId)\n      setSavedAt',
+    )
   })
 })

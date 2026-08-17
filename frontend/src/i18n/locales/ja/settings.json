@@ -106,6 +106,16 @@
       "shortName": "マイグレーション",
       "tabName": "マイグレーション",
       "tabDescription": "SillyTavernやその他のソースからデータをインポートする"
+    },
+    "agentRuntime": {
+      "shortName": "エージェントランタイム",
+      "tabName": "エージェントランタイム",
+      "tabDescription": "ランタイムのデフォルト、保持設定、ホスト管理の上限を確認"
+    },
+    "contextLibrary": {
+      "shortName": "コンテキストライブラリ",
+      "tabName": "コンテキストライブラリ",
+      "tabDescription": "バージョン管理されたコンテキストパックと添付を管理"
     }
   },
   "account": {
@@ -636,13 +646,11 @@
     "importWarn": "アーカイブはアップロード後にバックグラウンドで処理されます。完了の概要が表示されるまで、このタブを閉じないでください。ただし、実行中は Lumiverse を使い続けても安全です。",
     "importing": "インポート中…",
     "uploadImport": "アップロードとインポート",
+    "reuploadImport": "アーカイブを再アップロード",
     "cancel": "キャンセル",
     "ticketPrompt": "このアーカイブには、{{count}} 暗号化されたシークレットが含まれています。チケット ファイルをアップロードして復元してください。",
     "ticketPrompt_other": "このアーカイブには {{count}} 暗号化されたシークレットが含まれています。チケット ファイルをアップロードして復元してください。",
     "skipApiKeys": "API キーをスキップ",
-    "ticketReuse": "注意: このチケットは {{uses}} 回使用されています。続行すると、このアカウントで一致する API キーが上書きされます。",
-    "ticketReuse_other": "注意: このチケットは {{uses}} 回{{lastUsed}} 回使用されています。続行すると、このアカウントの一致する API キーが上書きされます。",
-    "ticketLastUsed": " (最後に使用された {{date}})",
     "uploading": "アップロード中… {{pct}}%",
     "verifying": "アーカイブを検証中…",
     "importQueued": "キューに入れられました — インポートを開始しています…",
@@ -659,6 +667,7 @@
     "filesRestored": "復元されたファイル",
     "vectorsRestored": "{{table}} 用に復元されたベクトル",
     "vectorsSkipped": "ベクトルをスキップ (構成の不一致)",
+    "cleanupPending": "インポートのクリーンアップを完了中",
     "importGeneric": "インポート中…",
     "importComplete": "インポート完了",
     "uploadFailed": "アップロード失敗",
@@ -666,6 +675,7 @@
     "ticketSubmitFailed": "チケットの送信に失敗しました",
     "skipFailed": "スキップに失敗しました",
     "cancelFailed": "キャンセルに失敗しました",
+    "cancelTooLate": "インポートをキャンセルできません",
     "summaryTable": "テーブル",
     "summaryImported": "輸入",
     "summarySkipped": "スキップ",
@@ -674,7 +684,71 @@
     "importFailed": "読み込めませんでした",
     "exportPrepareFailed": "エクスポートの準備に失敗しました",
     "exportAnchorMissing": "内部: ダウンロード アンカーがありません",
-    "exportTableSuffix": " ({{processed}})"
+    "exportTableSuffix": " ({{processed}})",
+    "cancelling": "キャンセル中…",
+    "skippingTicket": "スキップ中…",
+    "reconnect": "状態を更新",
+    "jobStatus": "インポート状態: {{status}}",
+    "archiveId": "アーカイブ {{id}}",
+    "noActiveJob": "このタブには現在関連付けられたインポートがありません。",
+    "summaryFilesNone": "復元されたファイルはありません",
+    "summarySecrets": "シークレット",
+    "summaryVectors": "ベクトル",
+    "vectorStatuses": {
+      "included": "含まれています",
+      "rebuild_required": "再構築が必要",
+      "skipped": "スキップ済み",
+      "unknown": "不明"
+    },
+    "statuses": {
+      "queued": "待機中",
+      "validating": "検証中",
+      "awaiting_ticket": "チケット待ち",
+      "running": "実行中",
+      "installing": "ファイルを復元中",
+      "ready": "適用の準備完了",
+      "committing": "コミット中",
+      "cancelling": "キャンセル中",
+      "cleanup_pending": "クリーンアップを完了中",
+      "complete": "完了",
+      "failed": "失敗",
+      "cancelled": "キャンセル済み"
+    },
+    "failureReasons": {
+      "unknown": "原因不明のためインポートに失敗しました。",
+      "malformed_response": "サーバーが無効なポータビリティ状態を返しました。",
+      "archive_validation_failed": "アーカイブの検証に失敗しました。",
+      "not_zip": "ファイルは ZIP アーカイブではありません。",
+      "size": "アーカイブが大きすぎます。",
+      "no_manifest": "アーカイブ マニフェストがありません。",
+      "bad_manifest": "アーカイブ マニフェストが無効です。",
+      "archive_identity_mismatch": "このアーカイブは既存のインポートと一致しません。",
+      "upload_failed": "アーカイブのアップロードに失敗しました。",
+      "upload_timeout": "アーカイブのアップロードがタイムアウトしました。",
+      "upload_aborted": "アーカイブのアップロードがキャンセルされました。",
+      "import_start_failed": "インポートを開始できませんでした。",
+      "import_failed": "インポートに失敗しました。",
+      "integrity_failure": "アーカイブの整合性チェックに失敗しました。",
+      "multipart_not_supported": "マルチパート アーカイブのアップロードはサポートされていません。",
+      "export_capacity": "実行中のポータビリティ操作が多すぎます。",
+      "manual_recovery_required": "インポートにはサーバーの復旧が必要です。",
+      "process_interrupted": "再起動によりインポートが中断されました。",
+      "cancelled": "インポートはキャンセルされました。",
+      "too_late": "インポートをキャンセルできません。",
+      "not_found": "インポート ジョブが見つかりません。",
+      "ticket_required": "復号チケットが必要です。",
+      "ticket_invalid": "復号チケットが無効です。",
+      "ticket_submission_failed": "復号チケットを送信できませんでした。",
+      "ticket_gate_conflict": "チケット処理はすでに完了しています。",
+      "replayed": "このチケットはすでに使用されています。",
+      "stale": "チケットの期限が切れているか無効です。",
+      "wrong_issuer": "チケットの発行者は受け入れられません。",
+      "invalid_issuer_instance": "チケットの発行元 ID が無効です。",
+      "unsupported_version": "チケットのバージョンはサポートされていません。",
+      "archive_mismatch": "チケットはこのアーカイブに一致しません。",
+      "binding_mismatch": "チケットはこのインポートでは無効です。",
+      "network": "ポータビリティサービスに接続できません。"
+    }
   },
   "advanced": {
     "title": "高度な",
@@ -1470,5 +1544,243 @@
     "memoryModeConservative": "保守的 - 少数、高品質のメモリ",
     "memoryModeBalanced": "バランス型 - 標準取得 (推奨)",
     "memoryModeAggressive": "積極的 - より多くのメモリ、低いしきい値"
+  },
+  "agentRuntimeSettings": {
+    "eyebrow": "Agenticランタイム",
+    "title": "エージェントランタイム",
+    "description": "有効なデフォルト、保持動作、読み取り専用のホスト上限を確認します。",
+    "defaults": {
+      "title": "モードの優先順位",
+      "description": "Lumiverseはプリセットを変更せず、ターンごとにモードを決定します。",
+      "oneTurn": "1ターンのみの選択",
+      "oneTurnHelp": "認証済みの選択が1回だけ適用され、使い切りの決定トークンを使用します。",
+      "chat": "チャットの上書き",
+      "chatHelp": "明示的に変更するまで、チャットでの選択が継続して適用されます。",
+      "preset": "プリセットのデフォルト",
+      "presetHelp": "選択したプリセットの確認済みデフォルトモードを使用します。",
+      "response": "レスポンスへのフォールバック",
+      "responseHelp": "Agenticが利用できない、または選択されていない場合もレスポンスを利用できます。"
+    },
+    "retention": {
+      "title": "ワークスペースの保持",
+      "description": "保持設定は、ホスト管理の上限内でプリセットごとに定義されます。",
+      "operational": "実行中",
+      "operationalHelp": "アクティブなターン中のみ利用でき、終了時のクリーンアップで削除されます。",
+      "terminal": "ターン終了後",
+      "terminalHelp": "表示のみの操作とワークスペース確認のため、終了後の一定期間保持されます。",
+      "chatLifetime": "チャット存続中",
+      "chatLifetimeHelp": "明示的に公開された成果物のみ、所有元のチャットに保持されます。"
+    },
+    "limits": {
+      "title": "ホスト上限",
+      "description": "これらの有効なプロセス上限により、プロバイダー、分離環境、アクティビティ、リソース容量が保護されます。",
+      "loading": "ホスト上限を読み込み中…",
+      "error": "ホスト上限は一時的に利用できません。",
+      "retry": "再試行",
+      "readOnly": "これらの値は参照専用です。プリセット、インポート、拡張機能では引き上げられません。",
+      "turn": "ターンの上限",
+      "activity": "アクティビティストレージ",
+      "capacity": "プロセス容量",
+      "fields": {
+        "childAdmissions": "子処理の受け入れ数",
+        "aggregateToolCalls": "ツール呼び出し合計数",
+        "logicalProviderRequests": "論理プロバイダーリクエスト数",
+        "physicalDispatchAttempts": "物理ディスパッチ試行数",
+        "childOutputTokens": "子処理の出力トークン数",
+        "rootWallClockMs": "ルートの実時間（ミリ秒）",
+        "activityEvents": "アクティビティイベント数",
+        "activityBytes": "アクティビティのバイト数",
+        "lifecycleLogRecords": "ライフサイクルログ件数",
+        "activeRootsPerUser": "ユーザーごとのアクティブルート数",
+        "activeRootsProcess": "プロセス全体のアクティブルート数",
+        "providerDispatchesPerUser": "ユーザーごとのプロバイダーディスパッチ数",
+        "providerDispatchesProcess": "プロセス全体のプロバイダーディスパッチ数",
+        "toolExecutionsPerUser": "ユーザーごとのツール実行数",
+        "toolExecutionsProcess": "プロセス全体のツール実行数"
+      }
+    }
+  },
+  "contextLibrary": {
+    "eyebrow": "アカウントコンテキスト",
+    "title": "コンテキストライブラリ",
+    "description": "不変でバージョン管理されたコンテキストパックを作成し、確認済みリビジョンをプリセット、チャット、ワールドブックに添付します。",
+    "copySuffix": "コピー",
+    "packs": "パック",
+    "packList": "コンテキストパック",
+    "loading": "コンテキストパックを読み込み中…",
+    "loadingDetail": "パックの詳細を読み込み中…",
+    "loadingTargets": "所有対象を読み込み中…",
+    "targetLoadError": "所有する添付先を読み込めませんでした。",
+    "targetsLoaded": "所有する添付先を読み込みました。",
+    "noTargetsAvailable": "このスコープで利用できる所有対象はありません。",
+    "selectTarget": "所有対象を選択",
+    "selectPack": "確認するコンテキストパックを選択してください。",
+    "emptyTitle": "最初のコンテキストパックを作成",
+    "emptyDescription": "安定した参照資料を追加し、必要な場所に不変のリビジョンを添付します。",
+    "noDescription": "説明なし",
+    "noAttachments": "添付なし",
+    "privateOnly": "追加のアカウントアクセスは許可されていません。",
+    "unavailableTarget": "利用できない対象",
+    "exportComplete": "ポータブルスナップショットをエクスポートしました。",
+    "exporting": "ポータブルスナップショットをエクスポート中…",
+    "importing": "ポータブルスナップショットをインポート中…",
+    "importComplete": "「{{name}}」をインポートしました。添付または有効化する前に確認してください。",
+    "importFileLabel": "インポートするコンテキストパックのJSONスナップショットを選択",
+    "versionNumber": "リビジョン{{number}}",
+    "byteCount": "{{count}}バイト",
+    "versionHistoryCaption": "コンテキストパックの不変なリビジョン履歴",
+    "versionImmutableHelp": "公開済みのリビジョンは編集できません。内容を変更するには新しいリビジョンを作成してください。",
+    "immutable": "不変",
+    "previewTitle": "リビジョン{{number}}のプレビュー",
+    "contentHelp": "エントリはリテラルコンテキストとして順番に保存されます。このリビジョン内でIDが重複しないようにしてください。",
+    "entryNumber": "エントリ{{number}}",
+    "addEntry": "エントリを追加",
+    "removeEntry": "エントリ{{number}}を削除",
+    "tagsHelp": "タグはカンマで区切ってください。",
+    "requiredAttachment": "この添付をAgenticの事前チェックで必須として扱う",
+    "attachmentsDescription": "添付では、正確な不変リビジョンを1つの所有対象に関連付けます。",
+    "accessDescription": "可視性とACL許可は、操作のたびにサーバーで再検証されます。",
+    "accessList": "アカウントアクセスリスト",
+    "accessFor": "{{name}}のアクセス権",
+    "addAccess": "アクセス権を追加",
+    "removeAccess": "{{name}}のアクセス権を削除",
+    "aclServerAuthority": "サーバーがプリンシパル、所有権、現在のACLリビジョン、要求された権限を検証します。",
+    "reviewTitle": "認証済みの確認が必要です",
+    "reviewDescription": "内容を確認し、ローカルでの使用を明示的に承認するまで、このパックは無効です。",
+    "repairDescription": "このパックは、確認または添付する前に修復が必要です。",
+    "reviewAcknowledgement": "このパックの可視性、内容、アクセス許可を確認し、有効化することに同意します。",
+    "preserveAttachments": "現在許可されている添付を複製",
+    "deleteTitle": "コンテキストパックを削除",
+    "deleteDescription": "このパックと、所有するリビジョンおよび添付を削除します。",
+    "deleteWarning": "「{{name}}」を削除しますか？この操作は取り消せません。",
+    "detachFrom": "{{name}}から切り離す",
+    "status": {
+      "active": "準備完了",
+      "disabled": "無効",
+      "review_required": "確認が必要",
+      "repair_required": "修復が必要"
+    },
+    "source": {
+      "local": "ローカル",
+      "portable_import": "ポータブルインポート",
+      "archive_restore": "アーカイブから復元",
+      "same_account_duplicate": "同一アカウント内の複製"
+    },
+    "visibility": {
+      "private": "非公開",
+      "account": "アカウント",
+      "restricted": "制限付き",
+      "help": "すべてのACLおよび対象操作について、サーバーが最終的な権限を持ちます。"
+    },
+    "scopes": {
+      "preset": "プリセット",
+      "chat": "チャット",
+      "world_book": "ワールドブック"
+    },
+    "acl": {
+      "read": "読み取り",
+      "use": "使用",
+      "edit": "編集"
+    },
+    "attachmentState": {
+      "active": "有効",
+      "disabled": "無効",
+      "review_required": "確認が必要",
+      "repair_required": "修復が必要"
+    },
+    "sections": {
+      "versions": "リビジョン履歴",
+      "attachments": "添付",
+      "access": "可視性とアクセス"
+    },
+    "fields": {
+      "name": "名前",
+      "description": "説明",
+      "visibility": "可視性",
+      "content": "リビジョン内容",
+      "entryId": "エントリID",
+      "entryTitle": "エントリタイトル",
+      "tags": "タグ",
+      "body": "本文",
+      "scope": "添付範囲",
+      "target": "対象",
+      "version": "リビジョン",
+      "account": "アカウントユーザーID",
+      "access": "権限",
+      "source": "ソース",
+      "updated": "更新日時"
+    },
+    "columns": {
+      "version": "リビジョン",
+      "state": "状態",
+      "size": "サイズ",
+      "created": "作成日時",
+      "actions": "操作"
+    },
+    "actions": {
+      "create": "パックを作成",
+      "import": "スナップショットをインポート",
+      "cancel": "キャンセル",
+      "refresh": "更新",
+      "reviewLatest": "最新バージョンを確認",
+      "retryTargets": "対象の読み込みを再試行",
+      "edit": "詳細を編集",
+      "duplicate": "複製",
+      "export": "選択したリビジョンをエクスポート",
+      "review": "確認して有効化",
+      "newVersion": "新しいリビジョン",
+      "preview": "プレビュー",
+      "attach": "リビジョンを添付",
+      "manageAccess": "アクセスを管理",
+      "delete": "削除"
+    },
+    "dialogs": {
+      "create": {
+        "title": "コンテキストパックを作成",
+        "description": "ローカルパックと最初の不変リビジョンを作成します。",
+        "confirm": "パックを作成"
+      },
+      "edit": {
+        "title": "パックの詳細を編集",
+        "description": "不変のリビジョン内容を変更せずにメタデータを更新します。",
+        "confirm": "詳細を保存"
+      },
+      "revision": {
+        "title": "リビジョンを作成",
+        "description": "最新の内容を基に、新しい不変リビジョンを公開します。",
+        "confirm": "リビジョンを作成"
+      },
+      "attach": {
+        "title": "リビジョンを添付",
+        "description": "正確なリビジョンを、所有するプリセット、チャット、ワールドブックのいずれか1つに関連付けます。",
+        "confirm": "添付"
+      },
+      "acl": {
+        "title": "アクセスを管理",
+        "description": "明示的なアカウント権限を要求します。サーバーが各プリンシパルを再検証します。",
+        "confirm": "アクセス権を保存"
+      },
+      "review": {
+        "title": "インポートしたパックを確認",
+        "description": "有効化には明示的な認証済み操作が必要で、インポートだけで有効になることはありません。",
+        "confirm": "パックを有効化"
+      },
+      "duplicate": {
+        "title": "パックを複製",
+        "description": "不変のリビジョン履歴を含む、同一アカウント内の非公開コピーを作成します。",
+        "confirm": "複製"
+      },
+      "delete": {
+        "title": "パックを削除",
+        "description": "このコンテキストパックをアカウントから削除します。",
+        "confirm": "パックを削除"
+      }
+    },
+    "errors": {
+      "not_found": "このコンテキストパックは利用できないか、アクセス権がありません。",
+      "revision_conflict": "このパックは別のセッションで変更されました。サーバーの最新バージョンが表示されています。変更を再試行する前に確認してください。",
+      "validation_failed": "コンテキストパックの変更がサーバーに拒否されました。項目を確認して再試行してください。",
+      "unavailable": "コンテキストライブラリは一時的に利用できません。"
+    }
   }
 }

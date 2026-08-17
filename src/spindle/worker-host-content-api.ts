@@ -37,6 +37,11 @@ import * as audioSvc from "../services/audio.service";
 import * as promptAssemblySvc from "../services/prompt-assembly.service";
 import * as presetsSvc from "../services/presets.service";
 import {
+  assertSpindlePresetMutationSafe,
+  projectSpindlePreset,
+  projectSpindlePresetEntityExtension,
+} from "./worker-host-state-api";
+import {
   mapPeerBookSourceToPersona,
   projectActivationProvenance,
   type ActivationProvenance,
@@ -1338,6 +1343,9 @@ export class WorkerHostContentApi {
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
       this.enforceScopedUser(resolvedUserId);
       if (typeof namespace !== "string") throw new Error("namespace is required");
+      if (entity === "preset") {
+        assertSpindlePresetMutationSafe({ metadata: { [namespace]: value } });
+      }
       const jsonValue = value === null ? null : this.toBatchJson(value);
 
       const setEntityExtensionNamespace = this.context.setEntityExtensionNamespace ?? worldBooksSvc.setEntityExtensionNamespace;
@@ -1349,7 +1357,7 @@ export class WorkerHostContentApi {
         jsonValue,
       );
       if (!result) throw new Error(`${entity} not found or not owned by the effective user`);
-      this.postToWorker({ type: "response", requestId, result: this.toBatchJson(result) });
+      this.postToWorker({ type: "response", requestId, result: this.toBatchJson(projectSpindlePresetEntityExtension(result)) });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err?.message || String(err) });
     }
@@ -1459,15 +1467,19 @@ export class WorkerHostContentApi {
       if (!this.hasPermission(permission)) throw new Error(`${PERMISSION_DENIED_PREFIX} ${permission}`);
       const entityId = this.asBatchString(args.entityId ?? args.id, "entityId");
       const namespace = this.asBatchString(args.namespace, "namespace");
+      const value = args.value === undefined ? null : args.value;
+      if (entity === "preset") {
+        assertSpindlePresetMutationSafe({ metadata: { [namespace]: value } });
+      }
       const result = worldBooksSvc.setEntityExtensionNamespace(
         userId,
         entity as SpindleEntityExtensionEntity,
         entityId,
         namespace,
-        args.value === undefined ? null : args.value,
+        value,
       );
       if (!result) throw new Error(`${entity} not found or not owned by the effective user`);
-      return this.toBatchJson(result);
+      return this.toBatchJson(projectSpindlePresetEntityExtension(result));
     }
 
     if (operation.domain === "characters" && operation.op === "update") {
@@ -1485,13 +1497,15 @@ export class WorkerHostContentApi {
     if (operation.domain === "presets" && operation.op === "update") {
       if (!this.hasPermission("presets")) throw new Error(`${PERMISSION_DENIED_PREFIX} presets`);
       const presetId = this.asBatchString(id, "presetId");
+      const input = this.asBatchRecord(args.input ?? {}, "input");
+      assertSpindlePresetMutationSafe(input);
       const preset = presetsSvc.updatePreset(
         userId,
         presetId,
-        this.asBatchRecord(args.input ?? {}, "input") as unknown as Parameters<typeof presetsSvc.updatePreset>[2],
+        input as unknown as Parameters<typeof presetsSvc.updatePreset>[2],
       );
       if (!preset) throw new Error("Preset not found");
-      return this.toBatchJson(preset);
+      return this.toBatchJson(projectSpindlePreset(preset));
     }
 
     if (operation.domain === "personas" && operation.op === "update") {

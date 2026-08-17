@@ -112,6 +112,43 @@
     "modCmd": "Cmd",
     "modCtrl": "Ctrl"
   },
+  "agentRuntime": {
+    "label": "Generation mode",
+    "oneTurnLegend": "Next turn",
+    "mode": {
+      "response": "Response",
+      "agentic": "Agentic"
+    },
+    "useForChat": "Use for this chat",
+    "savingOverride": "Saving…",
+    "useResponse": "Use Response",
+    "repair": {
+      "title": "Agentic mode needs attention",
+      "slot": "Map the preset's connection slot",
+      "provider": "Choose a provider with the required capabilities",
+      "isolate": "Restore the secure runtime worker",
+      "egress": "Use one provider domain for this turn",
+      "readiness": "Complete runtime setup or review"
+    },
+    "announcement": {
+      "oneTurn": "{{mode}} selected for the next turn.",
+      "overrideSaved": "{{mode}} is now the chat default.",
+      "overrideFailed": "The chat default could not be saved. Try again.",
+      "responseEscape": "Response selected for the next turn."
+    },
+    "preflight": {
+      "refreshRequired": "The runtime changed before generation started. Review the mode and try again.",
+      "unavailable": "Agentic mode is not ready. Use Response or complete the listed repair."
+    },
+    "stop": {
+      "stop": "Stop run",
+      "locating": "Preparing exact stop control…",
+      "stopping": "Stopping…",
+      "retry": "Retry stop",
+      "tooLate": "Too late to stop",
+      "terminal": "Run ended"
+    }
+  },
   "findInChat": {
     "open": "Find in chat",
     "placeholder": "Find in chat…",
@@ -416,6 +453,281 @@
     "renderModeAria": "Reasoning render mode",
     "text": "Text",
     "markdown": "Markdown"
+  },
+  "agentActivity": {
+    "liveLabel": "Agent activity · {{count}} active",
+    "idleLabel": "Agent activity · no active runs",
+    "summaryLabel": "Agent activity · {{status}} · {{count}} runs",
+    "liveAria": "Live agent and tool activity",
+    "rowAria": "{{profile}}: {{status}}",
+    "usage": "{{total}} tokens · {{input}} in / {{output}} out",
+    "actors": {
+      "mainModel": "Main model"
+    },
+    "status": {
+      "pending": "Pending",
+      "running": "Running",
+      "succeeded": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "timed_out": "Timed out"
+    },
+    "phase": {
+      "queued": "Queued",
+      "started": "Working",
+      "tool_call": "Using a tool",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "timed_out": "Timed out"
+    },
+    "tools": {
+      "lore_list_books": "List lorebooks",
+      "lore_get_book": "Read lorebook",
+      "lore_list_entries": "List lore entries",
+      "lore_get_entry": "Read lore entry",
+      "lore_search_entries": "Search lore",
+      "chat_search_history": "Search chat history",
+      "agent_delegate": "Delegate to agent"
+    },
+    "summary": {
+      "invocations": "{{count}} runs",
+      "succeeded": "{{count}} completed",
+      "failed": "{{count}} failed",
+      "cancelled": "{{count}} cancelled",
+      "timedOut": "{{count}} timed out",
+      "tools": "{{count}} tool calls"
+    }
+  },
+  "agentRun": {
+    "title": "Agent activity",
+    "subtitle": "Status-only chronology for this response",
+    "close": "Close agent activity",
+    "tabsAria": "Agent run details",
+    "stripLabel": "Agentic run",
+    "tabs": {
+      "activity": "Activity Tree",
+      "workspace": "Workspace"
+    },
+    "actors": {
+      "root": "Root agent",
+      "provider": "Model round",
+      "child": "Child agent",
+      "childNamed": "Agent {{name}}",
+      "tool": "Tool"
+    },
+    "tools": {
+      "lore_list_books": "List lorebooks",
+      "lore_get_book": "Read lorebook",
+      "lore_list_entries": "List lore entries",
+      "lore_get_entry": "Read lore entry",
+      "lore_search_entries": "Search lore",
+      "chat_search_history": "Search chat history",
+      "agent_delegate": "Delegate to agent",
+      "context_pack_list": "List context packs",
+      "context_pack_get": "Read context pack",
+      "workspace_read_section": "Read workspace section",
+      "workspace_read_page": "Read workspace page",
+      "workspace_create_task": "Create task",
+      "workspace_update_progress": "Update task",
+      "workspace_submit_result": "Submit result",
+      "workspace_accept_submission": "Accept submission",
+      "workspace_record_finding": "Record finding",
+      "workspace_record_decision": "Record decision",
+      "workspace_record_question": "Record question",
+      "workspace_attach_artifact": "Attach artifact",
+      "workspace_propose_publication": "Propose publication",
+      "complete_turn": "Complete turn",
+      "unknown_tool": "Tool"
+    },
+    "phase": {
+      "ASSEMBLE": "Assembling",
+      "WORK": "Working",
+      "COMPLETE": "Work complete",
+      "RENDER": "Writing response",
+      "PREPARE_COMMIT": "Preparing response",
+      "COMMITTING": "Saving response",
+      "COMMITTED": "Saved",
+      "COMMIT_FAILED": "Save failed",
+      "EXHAUSTED": "Budget exhausted",
+      "FAILED": "Failed",
+      "CANCELLED": "Cancelled",
+      "TIMED_OUT": "Timed out"
+    },
+    "status": {
+      "ASSEMBLE": "Assembling",
+      "WORK": "Working",
+      "COMPLETE": "Work complete",
+      "RENDER": "Writing",
+      "PREPARE_COMMIT": "Preparing",
+      "COMMITTING": "Saving",
+      "COMMITTED": "Completed",
+      "COMMIT_FAILED": "Save failed",
+      "EXHAUSTED": "Budget exhausted",
+      "FAILED": "Failed",
+      "CANCELLED": "Cancelled",
+      "TIMED_OUT": "Timed out"
+    },
+    "nodeStatus": {
+      "pending": "Pending",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "timed_out": "Timed out",
+      "omitted": "Omitted"
+    },
+    "activityTreeAria": "Agent and tool chronology",
+    "activityEmpty": "No public activity rows are available yet.",
+    "usageCompact": "{{total}} tokens · {{input}} in / {{output}} out",
+    "duration": {
+      "seconds": "{{count}} sec",
+      "minutes": "{{count}} min",
+      "minutesSeconds": "{{minutes}} min {{seconds}} sec",
+      "hours": "{{count}} hr",
+      "hoursMinutes": "{{hours}} hr {{minutes}} min"
+    },
+    "usage": {
+      "total": "Total tokens",
+      "input": "Input tokens",
+      "output": "Output tokens",
+      "tools": "Tool calls",
+      "children": "Child agents",
+      "toolsCount": "Tool calls: {{count}}",
+      "childrenCount": "Child agents: {{count}}"
+    },
+    "sync": {
+      "stale": "Showing the last known tree while the connection recovers.",
+      "restoring": "Restoring activity from the server.",
+      "error": "The last known tree is preserved. Recovery can be retried."
+    },
+    "omission": "{{nodes}} activity rows and {{events}} updates were omitted by the server.",
+    "errors": {
+      "unknown": "The run ended with a safe server error.",
+      "capacity_exceeded": "Capacity limit reached.",
+      "host_child_admission_limit_exceeded": "Host child-agent limit reached.",
+      "host_tool_call_limit_exceeded": "Host tool-call limit reached.",
+      "child_admission_limit_exceeded": "Child-agent limit reached.",
+      "tool_call_limit_exceeded": "Tool-call limit reached.",
+      "logical_provider_request_limit_exceeded": "Model request limit reached.",
+      "physical_dispatch_attempt_limit_exceeded": "Dispatch limit reached.",
+      "child_output_token_limit_exceeded": "Child-agent output limit reached.",
+      "root_wall_clock_limit_exceeded": "Time limit reached.",
+      "activity_event_limit_exceeded": "Activity update limit reached.",
+      "activity_byte_limit_exceeded": "Activity size limit reached.",
+      "lifecycle_log_record_limit_exceeded": "Activity history limit reached.",
+      "context_limit_exceeded": "Context limit reached.",
+      "initial_input_limit_exceeded": "Input limit reached.",
+      "argument_limit_exceeded": "Tool argument limit reached.",
+      "result_limit_exceeded": "Tool result limit reached.",
+      "continuation_limit_exceeded": "Continuation limit reached.",
+      "retained_output_limit_exceeded": "Response size limit reached.",
+      "materialized_limit_exceeded": "Materialization limit reached.",
+      "timeout": "The run timed out.",
+      "cancelled": "The run was cancelled.",
+      "provider_unavailable": "Model service unavailable.",
+      "provider_unsupported": "Model capability unavailable.",
+      "provider_tool_calling_unsupported": "Tool calling unavailable.",
+      "provider_tool_continuation_unsupported": "Tool continuation unavailable.",
+      "provider_tool_finalization_unsupported": "Final response mode unavailable.",
+      "provider_request_error": "Model request failed.",
+      "provider_protocol_error": "The model response could not be understood.",
+      "provider_schema_error": "The model response format was invalid.",
+      "invalid_task": "The task was invalid.",
+      "invalid_profile": "The agent profile was invalid.",
+      "invalid_arguments": "The tool arguments were invalid.",
+      "batch_rejected": "The action batch was rejected.",
+      "unknown_tool": "The requested tool was unavailable.",
+      "unauthorized": "The action was not authorized.",
+      "integrity_error": "The run integrity check failed.",
+      "internal_error": "An internal server error occurred.",
+      "not_found": "The requested runtime target was not found.",
+      "invalid_request": "The runtime request was invalid.",
+      "decision_refresh_required": "The runtime decision is stale. Review the mode and try again.",
+      "decision_capacity_exceeded": "Too many runtime decisions are pending. Try again shortly.",
+      "runtime_decision_unavailable": "The runtime decision service is unavailable.",
+      "agentic_unsupported_surface": "This generation surface requires Response mode.",
+      "agentic_runtime_unavailable": "Agentic runtime is unavailable. Use Response mode.",
+      "agentic_preflight_failed": "Agentic preflight failed. Use Response mode or review runtime setup.",
+      "agentic_chat_busy": "This chat already has an Agentic run in progress.",
+      "agentic_protocol_failure": "The Agentic protocol response was invalid.",
+      "agentic_work_exhausted": "The Agentic work budget was exhausted.",
+      "agentic_cancelled": "The Agentic run was cancelled.",
+      "agentic_timed_out": "The Agentic run timed out.",
+      "agentic_commit_failed": "The Agentic result could not be committed.",
+      "agentic_revision_conflict": "The runtime changed before the Agentic result could be committed.",
+      "agentic_provider_failure": "The Agentic model request failed.",
+      "agentic_internal_error": "The Agentic runtime encountered an internal error."
+    },
+    "announcements": {
+      "restoring": "Restoring agent activity.",
+      "stale": "Agent activity connection interrupted. Last known state preserved.",
+      "recoveryFailed": "Agent activity recovery failed. Last known state preserved.",
+      "cancelled": "Agent run cancelled.",
+      "terminal": "Agent run {{status}}.",
+      "phase": "Agent run phase: {{phase}}."
+    },
+    "workspace": {
+      "loading": "Loading the workspace index…",
+      "error": "The workspace could not be loaded.",
+      "retry": "Retry",
+      "viewOnly": "This workspace is view-only and contains only approved status summaries.",
+      "empty": "No public workspace sections are available.",
+      "loadingSection": "Loading section…",
+      "sectionEmpty": "No public entries in this section.",
+      "omitted": "{{count}} entries were omitted by the server.",
+      "loadMore": "Load more",
+      "sections": {
+        "objective": "Objective",
+        "tasks": "Tasks",
+        "records": "Findings, decisions, and questions",
+        "submissions": "Submissions",
+        "artifacts": "Published artifacts"
+      },
+      "retention": {
+        "operational": "Turn only",
+        "turn_terminal": "Until turn cleanup",
+        "chat_lifetime": "Chat lifetime"
+      },
+      "visibility": {
+        "owner": "Visible to you",
+        "participants": "Visible to participants",
+        "public": "Published"
+      },
+      "taskState": {
+        "active": "Active",
+        "blocked": "Blocked",
+        "submitted": "Submitted",
+        "done": "Done",
+        "omitted": "Omitted"
+      },
+      "required": "Required",
+      "optional": "Optional",
+      "assigned": "Assigned",
+      "dependencies": "{{count}} dependencies",
+      "submissionFor": "Submission for {{task}}",
+      "submissionState": {
+        "proposed": "Proposed",
+        "accepted": "Accepted",
+        "rejected": "Rejected",
+        "omitted": "Omitted"
+      },
+      "agent": "Agent {{name}}",
+      "published": "Published",
+      "notPublished": "Not published",
+      "bytes": "{{count}} bytes",
+      "digest": "Digest {{digest}}",
+      "recordState": {
+        "active": "Active",
+        "accepted": "Accepted",
+        "omitted": "Omitted"
+      },
+      "recordKind": {
+        "finding": "Finding",
+        "decision": "Decision",
+        "question": "Question"
+      }
+    }
   },
   "swipe": {
     "previous": "Previous swipe",

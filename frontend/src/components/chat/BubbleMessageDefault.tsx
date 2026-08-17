@@ -14,6 +14,7 @@ import MessageAudioSlot from './MessageAudioSlot'
 import SwipeControls from './SwipeControls'
 import GreetingNav from './GreetingNav'
 import ReasoningBlock from './ReasoningBlock'
+import { AgentRunActivityStrip } from './AgentRunActivity'
 import StreamingIndicator from './StreamingIndicator'
 import BubbleActions from './BubbleActions'
 import LazyImage from '@/components/shared/LazyImage'
@@ -27,8 +28,8 @@ import { copyTextToClipboard, getSelectionTextWithin } from '@/lib/clipboard'
 import { scheduleReplay as scheduleSpindleInjectionReplay } from '@/lib/spindle/dom-injection-registry'
 import { useStore } from '@/store'
 import { requestHostIntent } from '@/lib/hostIntents'
-import type { Message } from '@/types/api'
-import type { GenerationMetrics } from '@/types/ws-events'
+import type { AgentSummary, Message } from '@/types/api'
+import type { AgentActivityGeneration, GenerationMetrics } from '@/types/ws-events'
 import styles from './BubbleMessage.module.css'
 import clsx from 'clsx'
 
@@ -53,6 +54,8 @@ export interface BubbleMessageDefaultProps {
   reasoning: string | undefined
   reasoningDuration: number | undefined
   reasoningStartedAt: number | undefined
+  agentActivity: AgentActivityGeneration | undefined
+  agentSummary: AgentSummary | undefined
   tokenCount: number | undefined
   generationMetrics: GenerationMetrics | undefined
   avatarUrl: string | null
@@ -179,7 +182,7 @@ export default function BubbleMessageDefault({
   message, chatId, depth, isSelectMode, isSelected, onToggleSelect,
   findQuery,
   isEditing, editContent, setEditContent, editReasoning, setEditReasoning, showReasoningEditor,
-  isUser, isActivelyStreaming, displayContent, reasoning, reasoningDuration, reasoningStartedAt,
+  isUser, isActivelyStreaming, displayContent, reasoning, reasoningDuration, reasoningStartedAt, agentActivity, agentSummary,
   tokenCount, generationMetrics, avatarUrl, fullAvatarUrl, displayAvatarUrl, displayName, macroUserName, isHidden, isContextAnchor, userLeft,
   handleEdit, handleSaveEdit, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
   handleFork, handlePromptBreakdown,
@@ -431,16 +434,22 @@ export default function BubbleMessageDefault({
           </div>
         </div>
 
-        {reasoning && !isEditing && (
+        {(reasoning || agentActivity || agentSummary) && !isEditing && (
           <ReasoningBlock
-            reasoning={reasoning}
+            reasoning={reasoning ?? ''}
             reasoningDuration={reasoningDuration}
             reasoningStartedAt={reasoningStartedAt}
             isStreaming={isActivelyStreaming}
+            agentActivity={agentActivity}
+            agentSummary={agentSummary}
             variant="bubble"
             align={isUser && !userLeft ? 'right' : undefined}
           />
         )}
+
+        {!isUser && !isEditing ? (
+          <AgentRunActivityStrip chatId={chatId} messageId={message.id} swipeId={message.swipe_id} />
+        ) : null}
 
         {!isUser && message.extra?.attachments && message.extra.attachments.length > 0 && !isEditing && (
           <div className={styles.content}>

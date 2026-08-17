@@ -1,17 +1,31 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useStore } from '@/store'
 import { presetsApi } from '@/api/presets'
+import { agenticRuntimeApi } from '@/api/agentic-runtime'
 import { connectionsApi } from '@/api/connections'
 import { ApiError } from '@/api/client'
 import { regexApi } from '@/api/regex'
 import { toast } from '@/lib/toast'
 import i18n from '@/i18n'
-import { enqueuePresetRegexOperation } from '@/lib/presetRegexQueue'
-import { bindImportedRegexesToPreset } from '@/lib/loom/preset-regex-import'
-import { flushPresetForGeneration, presetSaveCoordinator, StalePresetHydrationError } from '@/lib/loom/preset-save-coordinator'
+import {
+  createPresetSaveCoordinator,
+  flushPresetForGeneration as defaultFlushPresetForGeneration,
+  presetSaveCoordinator as defaultPresetSaveCoordinator,
+  StalePresetHydrationError,
+  type PresetSaveCoordinator,
+} from '@/lib/loom/preset-save-coordinator'
 import { beginActiveLoomPresetSelection, transitionActiveLoomPreset } from '@/lib/loom/preset-selection-coordinator'
 import { getMacroCatalog } from '@/api/macros'
-import type { LoomPreset, PromptBlock, LoomConnectionProfile, MacroGroup, PromptVariableDef, PromptVariableValues } from '@/lib/loom/types'
+import type { SaveAgenticRuntimeEditorResult } from '@/api/agentic-runtime'
+import type {
+  AgenticRuntimeSaveDraft,
+  LoomPreset,
+  PromptBlock,
+  LoomConnectionProfile,
+  MacroGroup,
+  PromptVariableDef,
+  PromptVariableValues,
+} from '@/lib/loom/types'
 import {
   DEFAULT_SAMPLER_OVERRIDES,
   DEFAULT_PROMPT_BEHAVIOR,
@@ -26,6 +40,11 @@ import {
   detectSupportedParamsFromProviders,
   getAvailableMacros,
   exportToSTPreset,
+  createPortableLoomExportPayload,
+  extractPortableAgenticRuntimeEnvelope,
+  stripPortableRegexOwnership,
+  shouldRollbackImportedPreset,
+  toPortableAgentConfigV1,
   sanitizeLumiHubSealedBlocksForExport,
   normalizeCategoryBlockState,
   toggleBlockWithCategoryRules,
@@ -38,7 +57,6 @@ import {
 } from '@/lib/loom/service'
 import { mergePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
 
-
 type LoomPrivateBlockFields = Pick<
   PromptBlock,
   'sealed' | 'sealedKey' | 'sealedSource' | 'sealedOriginPresetId' | 'sealedOriginVersion' | 'sealedSha256'
@@ -49,6 +67,34 @@ type LoomPrivateBlockChange = {
   /** Zero-based occurrence among blocks sharing blockId; required for duplicates. */
   occurrence?: number
   patch: Partial<LoomPrivateBlockFields>
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+}
+function portableSnapshotKey(value: unknown): string {
+  return JSON.stringify(value) ?? ''
+}
+
+
+function normalizeAgentSlotBindings(value: unknown): Record<string, string | null> {
+  if (Array.isArray(value)) {
+    const output: Record<string, string | null> = {}
+    for (const entry of value) {
+      if (!isObjectRecord(entry) || typeof entry.slotId !== 'string') continue
+      output[entry.slotId] = typeof entry.connectionId === 'string' ? entry.connectionId : null
+    }
+    return output
+  }
+  if (!isObjectRecord(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter(([, connectionId]) => (
+      connectionId === null || typeof connectionId === 'string'
+    )),
+  ) as Record<string, string | null>
 }
 
 function applyPrivateBlockChange(
@@ -86,7 +132,40 @@ function applyPrivateBlockChange(
   return updated
 }
 
-export function useLoomBuilder() {
+type LoomBuilderDependencies = {
+  presetsApi?: typeof presetsApi
+  saveCoordinator?: PresetSaveCoordinator
+  flushPresetForGeneration?: typeof defaultFlushPresetForGeneration
+}
+
+export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
+  const presetApi = dependencies.presetsApi ?? presetsApi
+  const presetSaveCoordinator = useMemo(
+    () => dependencies.saveCoordinator ?? (
+      dependencies.presetsApi
+        ? createPresetSaveCoordinator({
+            get: (presetId) => presetApi.get(presetId),
+            update: (presetId, input) => presetApi.update(presetId, input),
+          })
+        : defaultPresetSaveCoordinator
+    ),
+    [dependencies.presetsApi, dependencies.saveCoordinator, presetApi],
+  )
+  const flushPresetForGeneration = useMemo(
+    () => dependencies.flushPresetForGeneration ?? (
+      dependencies.presetsApi || dependencies.saveCoordinator
+        ? async (presetId: string | undefined) => {
+            if (presetId) await presetSaveCoordinator.flush(presetId)
+          }
+        : defaultFlushPresetForGeneration
+    ),
+    [
+      dependencies.flushPresetForGeneration,
+      dependencies.presetsApi,
+      dependencies.saveCoordinator,
+      presetSaveCoordinator,
+    ],
+  )
   const activeLoomPresetId = useStore((s) => s.activeLoomPresetId)
   const loomRegistry = useStore((s) => s.loomRegistry)
   const setActiveLoomPreset = useStore((s) => s.setActiveLoomPreset)
@@ -150,7 +229,7 @@ export function useLoomBuilder() {
     let cancelled = false
     setIsLoading(true)
     const hydration = presetSaveCoordinator.beginHydration(activeLoomPresetId, 'loom-editor')
-    presetsApi.get(activeLoomPresetId).then((preset) => {
+    presetApi.get(activeLoomPresetId).then((preset) => {
       if (cancelled) {
         presetSaveCoordinator.cancelHydration(hydration)
         return
@@ -193,7 +272,7 @@ export function useLoomBuilder() {
   // Refresh registry from API
   const refreshRegistry = useCallback(async () => {
     try {
-      const result = await presetsApi.listRegistry({ provider: 'loom', limit: 200 })
+      const result = await presetApi.listRegistry({ provider: 'loom', limit: 200 })
       const registry = Object.fromEntries(
         result.data.map((p) => [
           p.id,
@@ -209,7 +288,7 @@ export function useLoomBuilder() {
     } catch (err) {
       console.warn('[LoomBuilder] Failed to refresh registry:', err)
     }
-  }, [setLoomRegistry])
+  }, [presetApi, setLoomRegistry])
 
   // Load registry on mount. The registry is kept in the store across panel
   // open/close cycles, and every mutation path below (create/delete/rename/
@@ -226,7 +305,7 @@ export function useLoomBuilder() {
     setIsLoading(true)
     try {
       const loom = createNewLoomPreset(name, description)
-      const created = await presetsApi.create(marshalPreset(loom))
+      const created = await presetApi.create(marshalPreset(loom))
       const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
       await refreshRegistry()
       if (await selection.transition(created.id)) {
@@ -241,7 +320,7 @@ export function useLoomBuilder() {
     } finally {
       setIsLoading(false)
     }
-  }, [refreshRegistry])
+  }, [presetApi, presetSaveCoordinator, refreshRegistry])
 
   const flushPendingPreset = useCallback(async (): Promise<void> => {
     const presetId = activePresetRef.current?.id ?? activeLoomPresetId
@@ -292,7 +371,7 @@ export function useLoomBuilder() {
       const presetId = activePresetRef.current?.id
       if (!presetId) return
       const hydration = presetSaveCoordinator.beginHydration(presetId, 'loom-editor')
-      void presetsApi.get(presetId).then((preset) => {
+    void presetApi.get(presetId).then((preset) => {
         if (useStore.getState().activeLoomPresetId !== presetId) {
           presetSaveCoordinator.cancelHydration(hydration)
           return
@@ -395,6 +474,42 @@ export function useLoomBuilder() {
   const saveBlocks = useCallback(async (blocks: PromptBlock[]) => {
     await saveStructure(blocks)
   }, [saveStructure])
+  const saveAgenticRuntime = useCallback(async (
+    draft: AgenticRuntimeSaveDraft,
+    promptOrder: PromptBlock[],
+    expectedPresetRevision?: number,
+  ): Promise<SaveAgenticRuntimeEditorResult> => {
+    const current = activePresetRef.current
+    if (!current || useStore.getState().activeLoomPresetId !== current.id) {
+      throw new Error('No active preset')
+    }
+    await presetSaveCoordinator.flush(current.id)
+    const flushed = presetSaveCoordinator.getDraft(current.id) ?? activePresetRef.current ?? current
+    if (useStore.getState().activeLoomPresetId !== flushed.id) throw new Error('No active preset')
+    activePresetRef.current = flushed
+    setActivePreset(flushed)
+    const normalizedBlocks = normalizeCategoryBlockState(promptOrder)
+    if (
+      expectedPresetRevision !== undefined
+      && (flushed.cacheRevision ?? 0) !== expectedPresetRevision
+      && JSON.stringify(normalizedBlocks) !== JSON.stringify(flushed.blocks)
+    ) {
+      throw new ApiError(409, 'Conflict', { code: 'PRESET_REVISION_CONFLICT' })
+    }
+    validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: flushed.blocks })
+    const result = await agenticRuntimeApi.saveEditor(flushed.id, {
+      ...draft,
+      expectedPresetRevision: flushed.cacheRevision ?? 0,
+      expectedConfigRevision: flushed.agentConfigRevision,
+      promptOrder: normalizedBlocks,
+    })
+    const refreshed = presetSaveCoordinator.hydrate(unmarshalPreset(result.preset))
+    if (useStore.getState().activeLoomPresetId !== refreshed.id) return result
+    activePresetRef.current = refreshed
+    setActivePreset(refreshed)
+    await refreshRegistry()
+    return result
+  }, [refreshRegistry])
 
   const saveLoomValue = useCallback(async (
     blocks: PromptBlock[],
@@ -440,7 +555,7 @@ export function useLoomBuilder() {
     if (!current) {
       const hydration = presetSaveCoordinator.beginHydration(presetId, 'preset-rename')
       try {
-        current = presetSaveCoordinator.hydrate(unmarshalPreset(await presetsApi.get(presetId)), hydration)
+        current = presetSaveCoordinator.hydrate(unmarshalPreset(await presetApi.get(presetId)), hydration)
       } catch (error) {
         presetSaveCoordinator.cancelHydration(hydration)
         throw error
@@ -463,7 +578,7 @@ export function useLoomBuilder() {
   // Delete a preset
   const deletePreset = useCallback(async (presetId: string) => {
     await flushPresetForGeneration(presetId)
-    await presetsApi.delete(presetId)
+    await presetApi.delete(presetId)
     presetSaveCoordinator.remove(presetId)
     await refreshRegistry()
     // A later coordinated selection may have committed while deletion was in
@@ -483,55 +598,32 @@ export function useLoomBuilder() {
     }
   }, [refreshRegistry])
 
-  // Duplicate a preset
+  // Duplicate a preset through the authenticated server operation. The
+  // endpoint copies normalized Agentic configuration, authored cognition
+  // envelope, bindings, and regex companions transactionally; reconstructing
+  // a Loom object locally would silently drop those fields.
   const duplicatePreset = useCallback(async (presetId: string, newName: string) => {
     const selection = beginActiveLoomPresetSelection()
     setIsLoading(true)
     try {
       await flushPresetForGeneration(presetId)
-      const hydration = presetSaveCoordinator.beginHydration(presetId, 'preset-duplicate')
-      let hydratedSource: LoomPreset
-      try {
-        hydratedSource = presetSaveCoordinator.hydrate(
-          unmarshalPreset(await presetsApi.get(presetId)),
-          hydration,
-        )
-      } catch (error) {
-        presetSaveCoordinator.cancelHydration(hydration)
-        throw error
-      }
-      const source = await presetSaveCoordinator.flush(presetId) ?? hydratedSource
-      const copy = createNewLoomPreset(newName)
-      // Copy all content from the coordinator-confirmed persisted source.
-      copy.blocks = JSON.parse(JSON.stringify(source.blocks))
-      copy.samplerOverrides = { ...source.samplerOverrides }
-      copy.customBody = { ...source.customBody }
-      copy.promptBehavior = { ...source.promptBehavior }
-      copy.completionSettings = { ...source.completionSettings }
-      copy.advancedSettings = { ...source.advancedSettings }
-      copy.modelProfiles = { ...source.modelProfiles }
-      copy.passthroughMetadata = JSON.parse(JSON.stringify(source.passthroughMetadata))
-      copy.promptVariables = JSON.parse(JSON.stringify(source.promptVariables))
-      copy.source = source.source ? { ...source.source } : null
-      copy.coverUrl = source.coverUrl
-
-      const created = await presetsApi.create(marshalPreset(copy))
-      const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
+      const duplicated = await presetApi.duplicate(presetId, newName)
+      const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(duplicated.preset))
       await refreshRegistry()
-      await flushPresetForGeneration(presetId)
-      if (await selection.transition(created.id)) {
+      if (await selection.transition(duplicated.preset.id)) {
         activePresetRef.current = newLoom
         setActivePreset(newLoom)
       }
       return newLoom
-    } catch (err: any) {
+    } catch (err: unknown) {
       selection.cancel()
-      setError(err.message)
+      const message = err instanceof Error ? err.message : String(err)
+      setError(message)
       throw err
     } finally {
       setIsLoading(false)
     }
-  }, [refreshRegistry])
+  }, [flushPresetForGeneration, presetApi, presetSaveCoordinator, refreshRegistry])
 
   // Block manipulation helpers
   const addBlock = useCallback((block: PromptBlock, index?: number) => {
@@ -730,56 +822,99 @@ export function useLoomBuilder() {
     }
   }, [])
 
-  const persistImportedPreset = useCallback(async (payload: any, fileName?: string) => {
+  const persistImportedPreset = useCallback(async (payload: unknown, fileName?: string) => {
     const selection = beginActiveLoomPresetSelection()
+    let importedPresetId: string | null = null
+    let portableImportCommitted = false
     setIsLoading(true)
     try {
       const fallbackName = fileName?.replace(/\.json$/i, '') || 'Imported Preset'
+      const payloadRecord = isObjectRecord(payload) ? payload : null
+      const agentRuntime = extractPortableAgenticRuntimeEnvelope(payload)
+      portableImportCommitted = agentRuntime !== null
+      const sourceRecord = payloadRecord?.type === 'lumiverse_preset'
+        && isObjectRecord(payloadRecord.preset)
+        ? payloadRecord.preset
+        : payloadRecord
+      const extensions = sourceRecord && isObjectRecord(sourceRecord.extensions)
+        ? sourceRecord.extensions
+        : null
+      const embeddedRegex = Array.isArray(extensions?.regex_scripts)
+        ? extensions.regex_scripts
+        : sourceRecord && Array.isArray(sourceRecord.regex_scripts)
+          ? sourceRecord.regex_scripts
+          : null
       const loom = coerceImportedLoomPreset(payload, fallbackName)
-      const created = await presetsApi.create(marshalPreset(loom))
+      const presetInput = marshalPreset(loom)
+      const portablePresetInput = embeddedRegex === null
+        ? presetInput
+        : {
+            ...presetInput,
+            regex_scripts: embeddedRegex as unknown as readonly Record<string, unknown>[],
+          }
+      const legacyPortableConfig = agentRuntime === null && loom.agentConfig
+        ? toPortableAgentConfigV1(loom.agentConfig)
+        : null
+      let created = agentRuntime
+        ? (await presetApi.importPortable({ preset: portablePresetInput, agentRuntime })).preset
+        : legacyPortableConfig
+          ? (await presetApi.importPortableAgentConfig({
+              ...portablePresetInput,
+              agent_config: legacyPortableConfig,
+            })).preset
+          : await presetApi.create(portablePresetInput)
+      importedPresetId = created.id
+
+      if (agentRuntime) {
+        const editor = await agenticRuntimeApi.getEditor(created.id)
+        created = {
+          ...created,
+          agent_config: editor.config,
+          agent_config_review: editor.review,
+          agent_context_pack_selections: editor.contextPackSelections.map((selection) => ({
+            ...selection,
+            label: typeof selection.label === 'string' && selection.label.length > 0
+              ? selection.label
+              : selection.packId,
+            revisionLabel: typeof selection.revisionLabel === 'string' && selection.revisionLabel.length > 0
+              ? selection.revisionLabel
+              : String(selection.revision),
+          })),
+          agent_context_rules: editor.contextRules,
+          agent_task_templates: editor.taskTemplates,
+        }
+
+      }
+
       const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
       await refreshRegistry()
-      if (await selection.transition(created.id)) {
-        activePresetRef.current = newLoom
-        setActivePreset(newLoom)
+      if (!(await selection.transition(created.id))) {
+        throw new Error('Imported preset selection was superseded')
       }
+      activePresetRef.current = newLoom
+      setActivePreset(newLoom)
 
-      const embeddedRegex = Array.isArray(payload?.extensions?.regex_scripts)
-        ? payload.extensions.regex_scripts
-        : Array.isArray(payload?.regex_scripts)
-          ? payload.regex_scripts
-          : null
-      if (Array.isArray(embeddedRegex) && embeddedRegex.length > 0) {
-        try {
-          const regexResult = await enqueuePresetRegexOperation(() => regexApi.importScripts({
-            // Imported scripts may carry their source preset_id. Force the new
-            // ownership here; otherwise the backend treats them as inactive
-            // source-preset scripts and their toggles become no-ops.
-            scripts: bindImportedRegexesToPreset(embeddedRegex, created.id),
-            folder: loom.name,
-            preset_id: created.id,
-            active_preset_id: created.id,
-          }))
-          if (regexResult.imported > 0) {
-            const { loadRegexScripts } = useStore.getState() as any
-            if (loadRegexScripts) await loadRegexScripts()
-            toast.success(i18n.t('panels.loomBuilder.toast.importedRegexFromPreset', { count: regexResult.imported }))
-          }
-          if (regexResult.errors.length > 0) {
-            toast.error(i18n.t('panels.loomBuilder.toast.regexImportFailed', { count: regexResult.errors.length }))
-          }
-        } catch { /* regex import is best-effort */ }
-      }
 
       return newLoom
-    } catch (err: any) {
+    } catch (err: unknown) {
+      // Portable import is one backend transaction that also owns newly
+      // imported context-pack copies. Never delete that preset after the
+      // transaction has committed; a navigation/editor hydration failure must
+      // preserve the completed import and its canonical context data.
+      if (shouldRollbackImportedPreset(importedPresetId, portableImportCommitted)) {
+        try {
+          await presetApi.delete(importedPresetId)
+        } catch {
+          // Cleanup is best-effort for the legacy create-only path.
+        }
+      }
       selection.cancel()
-      setError(err.message)
+      setError(err instanceof Error ? err.message : String(err))
       throw err
     } finally {
       setIsLoading(false)
     }
-  }, [refreshRegistry])
+  }, [presetApi, presetSaveCoordinator, refreshRegistry])
 
   // Import from legacy preset JSON
   const importFromST = useCallback(async (stData: any, fileName: string) => {
@@ -799,20 +934,46 @@ export function useLoomBuilder() {
     return persistImportedPreset(jsonData, fileName)
   }, [persistImportedPreset])
 
-  // Export internal JSON
+  // Export internal JSON. The runtime envelope is fetched from the server
+  // after all pending Loom saves settle, so prompt revisions and runtime
+  // cognition/context snapshots cannot drift across the export boundary.
   const exportInternal = useCallback(async () => {
-    if (!activePreset) return null
-    const exportPreset = sanitizeLumiHubSealedBlocksForExport(activePreset)
-    const regexExport = await regexApi.exportScripts(undefined, { preset_id: activePreset.id })
-    if (regexExport.scripts.length === 0) return exportPreset
-    return {
-      ...exportPreset,
-      extensions: {
-        ...((exportPreset as any).extensions || {}),
-        regex_scripts: regexExport.scripts,
-      },
+    const current = activePresetRef.current ?? activePreset
+    if (!current) return null
+    const maxAttempts = 2
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      await flushPendingPreset()
+      const persistedBefore = await presetApi.get(current.id)
+      const envelopeBefore = await presetApi.getPortableAgentRuntime(current.id)
+      const regexBefore = await regexApi.exportScripts(undefined, { preset_id: current.id })
+      const persistedAfter = await presetApi.get(current.id)
+      const envelopeAfter = await presetApi.getPortableAgentRuntime(current.id)
+      const regexAfter = await regexApi.exportScripts(undefined, { preset_id: current.id })
+      const presetStable = persistedBefore.cache_revision === persistedAfter.cache_revision
+        && persistedBefore.updated_at === persistedAfter.updated_at
+      const envelopeStable = portableSnapshotKey(envelopeBefore) === portableSnapshotKey(envelopeAfter)
+      const regexBeforePortable = stripPortableRegexOwnership(regexBefore.scripts)
+      const regexAfterPortable = stripPortableRegexOwnership(regexAfter.scripts)
+      const regexStable = portableSnapshotKey(regexBeforePortable) === portableSnapshotKey(regexAfterPortable)
+      if (!presetStable || !envelopeStable || !regexStable) {
+        if (attempt + 1 < maxAttempts) continue
+        throw new Error('Portable export changed while it was being read; please retry.')
+      }
+      const exportPreset = createPortableLoomExportPayload(unmarshalPreset(persistedAfter), envelopeAfter)
+      if (regexAfterPortable.length === 0) return exportPreset
+      const extensions = isObjectRecord(exportPreset.extensions)
+        ? { ...exportPreset.extensions }
+        : {}
+      return {
+        ...exportPreset,
+        extensions: {
+          ...extensions,
+          regex_scripts: regexAfterPortable,
+        },
+      }
     }
-  }, [activePreset])
+    return null
+  }, [activePreset, flushPendingPreset])
 
   // Export as legacy (SillyTavern) JSON
   const exportLegacy = useCallback(() => {
@@ -850,7 +1011,7 @@ export function useLoomBuilder() {
 
   // Connection profile detection from store
   const connectionProfile = useMemo<LoomConnectionProfile>(() => {
-    const profile = profiles.find(p => p.id === activeProfileId)
+    const profile = profiles.find((p) => p.id === activeProfileId && p.review_required !== true)
     if (profile) {
       return {
         mainApi: 'openai',
@@ -897,6 +1058,7 @@ export function useLoomBuilder() {
     selectPreset,
     saveBlocks,
     saveLoomValue,
+    saveAgenticRuntime,
     deletePreset,
     duplicatePreset,
     renamePreset,

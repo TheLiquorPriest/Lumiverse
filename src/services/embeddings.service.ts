@@ -1,4 +1,5 @@
 import { getDb } from "../db/connection";
+import { computeUserDataSourceDigest, getUserDataProjectionStamp, hasPendingUserVectorProjection, withUserDataProjection, withUserDataProjectionMutation } from "./user-data/snapshot";
 import * as settingsSvc from "./settings.service";
 import * as secretsSvc from "./secrets.service";
 import type {
@@ -43,12 +44,12 @@ import {
   cosineSimilarity,
   distanceFromSimilarity,
   eq,
-  idsIn,
   inSet,
   mmrSelect,
   notInSet,
   ownerScope,
   ownersScope,
+  isFiniteVector,
   reciprocalRankFusion,
   rowId,
   sourceIdsIn,
@@ -1244,15 +1245,135 @@ async function tryRecoverVaultChunkEmbeddingWithAutoSplit(
   };
 }
 
-async function deleteStoreRows(collection: CollectionName, filter: VectorFilter): Promise<void> {
-  const store = await getActiveVectorStore();
-  await store.deleteByFilter(collection, filter);
+function vectorFilterUserId(filter: VectorFilter): string | null {
+  if (filter.op === "eq" && filter.field === "user_id" && typeof filter.value === "string") return filter.value;
+  if (filter.op !== "and") return null;
+  const userIds = filter.clauses.map(vectorFilterUserId).filter((value): value is string => value !== null);
+  return userIds.length > 0 && userIds.every((value) => value === userIds[0]) ? userIds[0]! : null;
 }
 
+async function deleteStoreRows(collection: CollectionName, filter: VectorFilter): Promise<void> {
+  const userId = vectorFilterUserId(filter);
+  if (!userId) throw new Error("vector deletion must be scoped to one user");
+  await withUserDataProjectionMutation(userId, async () => {
+    const store = await getActiveVectorStore();
+    await store.deleteByFilter(collection, filter);
+  });
+}
+const MAX_STORED_VECTOR_DIMENSION = 16_384;
+const MAX_STORED_VECTOR_ID_BYTES = 4 * 1024;
+const MAX_STORED_VECTOR_ROW_BYTES = 8 * 1024 * 1024;
+const MAX_STORED_VECTOR_BATCH_BYTES = 4 * 1024 * 1024;
+
+function assertSafeEmbeddingRows(collection: CollectionName, rows: readonly EmbeddingRow[]): void {
+  const seenIds = new Set<string>();
+  if (rows.length === 0) return;
+  const tenant = rows[0]?.user_id;
+  const dimension = rows[0]?.vector?.length;
+  if (
+    typeof tenant !== "string"
+    || tenant.length === 0
+    || Buffer.byteLength(tenant, "utf8") > MAX_STORED_VECTOR_ID_BYTES
+  ) {
+    throw new Error("vector row tenant is malformed");
+  }
+  for (const row of rows) {
+    if (
+      typeof row.id !== "string"
+      || typeof row.user_id !== "string"
+      || row.user_id !== tenant
+      || typeof row.source_type !== "string"
+      || typeof row.source_id !== "string"
+      || typeof row.owner_id !== "string"
+      || row.source_id.length === 0
+      || row.owner_id.length === 0
+      || Buffer.byteLength(row.id, "utf8") > MAX_STORED_VECTOR_ID_BYTES
+      || Buffer.byteLength(row.source_id, "utf8") > MAX_STORED_VECTOR_ID_BYTES
+      || Buffer.byteLength(row.owner_id, "utf8") > MAX_STORED_VECTOR_ID_BYTES
+    ) {
+      throw new Error("vector row identity is malformed");
+    }
+    if (!["chat_chunk", "world_book_entry", "vault_chunk", "databank"].includes(row.source_type)) {
+      throw new Error(`unsupported vector source type: ${row.source_type}`);
+    }
+    const expectedCollection = row.source_type === "world_book_entry"
+      ? "embeddings_world_books"
+      : "embeddings";
+    if (collection !== expectedCollection) {
+      throw new Error("vector row is in the wrong collection");
+    }
+    const expectedId = rowId(row.user_id, row.source_type, row.source_id, row.chunk_index);
+    if (seenIds.has(row.id)) throw new Error("duplicate vector row ID");
+    seenIds.add(row.id);
+    if (row.id !== expectedId) throw new Error("vector row ID is not tenant-scoped");
+    if (!Number.isSafeInteger(row.chunk_index) || row.chunk_index < 0 || row.chunk_index > MAX_STORED_VECTOR_DIMENSION) {
+      throw new Error("vector chunk index is out of range");
+    }
+    if (
+      !Array.isArray(row.vector)
+      || row.vector.length === 0
+      || row.vector.length > MAX_STORED_VECTOR_DIMENSION
+      || !isFiniteVector(row.vector)
+    ) {
+      throw new Error("vector dimension or elements are invalid");
+    }
+    if (dimension === undefined || row.vector.length !== dimension) {
+      throw new Error("vector batch dimensions do not match");
+    }
+  }
+}
 async function upsertStoreRows(collection: CollectionName, rows: EmbeddingRow[]): Promise<void> {
   if (rows.length === 0) return;
-  const store = await getActiveVectorStore();
-  await store.upsert(collection, rows);
+  assertSafeEmbeddingRows(collection, rows);
+  const userId = rows[0]!.user_id;
+  // Individual writes are serialized with exports but never publish
+  // projection coverage. A complete high-level operation owns the single
+  // coverage publication after its final batch succeeds.
+  await withUserDataProjectionMutation(userId, async () => {
+    const store = await getActiveVectorStore();
+    await store.upsert(collection, rows);
+  });
+}
+
+/**
+ * Run one complete per-user vector projection. Coverage is published exactly
+ * once, by the barrier, only when the operation succeeded, the canonical
+ * source is byte-identical to the digest observed before the first batch, and
+ * no vector-relevant row is still awaiting embedding. Anything else leaves the
+ * previous (or missing) coverage in place so an export reports
+ * `rebuild_required` instead of shipping a partial dump as stable.
+ */
+async function withCompleteUserProjection<T>(
+  userId: string,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const stamp = getUserDataProjectionStamp(userId);
+  const sourceDigest = computeUserDataSourceDigest(getDb(), userId);
+  return withUserDataProjection(userId, stamp.sourceEpoch, sourceDigest, operation, {
+    verifySourceDigest: () => computeUserDataSourceDigest(getDb(), userId),
+    isProjectionComplete: () => !hasPendingUserVectorProjection(getDb(), userId),
+  });
+}
+
+export async function restoreArchivedVectorRows(
+  userId: string,
+  collection: CollectionName,
+  rows: VectorRow[],
+): Promise<number> {
+  if (rows.length === 0) return 0;
+  if (rows.some((row) => row.user_id !== userId)) {
+    throw new Error("archived vector batch is not owned by the importing user");
+  }
+  let batchBytes = 0;
+  for (const row of rows) {
+    const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
+    if (rowBytes > MAX_STORED_VECTOR_ROW_BYTES || batchBytes > MAX_STORED_VECTOR_BATCH_BYTES - rowBytes) {
+      throw new Error("archived vector batch exceeds byte cap");
+    }
+    batchBytes += rowBytes;
+  }
+  await upsertStoreRows(collection, rows);
+  return rows.length;
 }
 
 async function scheduleStoreOptimize(reason: "general" | "chat_chunk" | "world_book" = "general"): Promise<void> {
@@ -2315,6 +2436,12 @@ async function deleteWorldBookRowsUnlocked(userId: string, worldBookIds: string[
   ]));
 }
 
+function sourceDeleteSucceeded(result: unknown): boolean {
+  if (typeof result === "boolean") return result;
+  if (Array.isArray(result)) return result.length > 0;
+  return true;
+}
+
 async function coordinateWorldBookVectorAndSourceDelete<T>(
   userId: string,
   lockEntryIds: string[],
@@ -2322,8 +2449,11 @@ async function coordinateWorldBookVectorAndSourceDelete<T>(
   deleteSource: () => T | Promise<T>,
 ): Promise<T> {
   return withWorldBookEntryVectorCommitLocks(userId, lockEntryIds, async () => {
-    await deleteVectors();
-    return await deleteSource();
+    // The source CAS is the authority. If it rejects or throws, leave vectors
+    // untouched so a stale delete cannot erase data owned by the winning write.
+    const result = await deleteSource();
+    if (sourceDeleteSucceeded(result)) await deleteVectors();
+    return result;
   });
 }
 
@@ -2626,6 +2756,7 @@ export const __test__ = {
   coordinateWorldBookVectorAndSourceDelete,
   updateWorldBookEntriesVectorStateIfCurrent,
   withWorldBookEntryVectorCommitLocks,
+  assertSafeEmbeddingRows,
 };
 
 export async function markWorldBookEntriesVectorErrorIfCurrent(
@@ -3453,7 +3584,7 @@ export async function syncChatChunkEmbedding(
     await deleteChatChunkEmbeddings(userId, chatId, chunkId);
     return;
   }
-  
+
   const text = content.trim();
   if (!text) {
     await deleteChatChunkEmbeddings(userId, chatId, chunkId);
@@ -3466,7 +3597,6 @@ export async function syncChatChunkEmbedding(
     ...(metadata || {}),
   };
   const leaves = await embedChatChunkContentLeaves(userId, text);
-  if (leaves.length === 0) return;
   const rows = buildChatChunkEmbeddingRows(
     userId,
     chatId,
@@ -3474,6 +3604,7 @@ export async function syncChatChunkEmbedding(
     text,
     leaves,
     baseMetadata,
+    Math.floor(Date.now() / 1000),
   );
   await replaceChatChunkEmbeddingRows(userId, [{ chatId, chunkId }], rows);
 
@@ -3494,7 +3625,7 @@ export async function batchUpsertChunkVectors(
   chunks: Array<{ chatId: string; chunkId: string; vector: number[]; content: string; metadata?: Record<string, any> }>,
 ): Promise<void> {
   if (chunks.length === 0) return;
-
+  return withCompleteUserProjection(userId, async () => {
   const now = Math.floor(Date.now() / 1000);
   const rows: EmbeddingRow[] = chunks.flatMap((c) => buildChatChunkEmbeddingRows(
     userId,
@@ -3514,6 +3645,7 @@ export async function batchUpsertChunkVectors(
 
   console.info(`[embeddings] Batch-vectorized ${rows.length} chat chunk(s)`);
   await scheduleStoreOptimize("chat_chunk");
+  });
 }
 
 async function getExistingChatChunks(userId: string, chatId: string): Promise<Record<string, string>> {
@@ -3534,6 +3666,7 @@ export async function reindexChatMessages(
   chatId: string,
   chunks: Array<{ chunkId: string; content: string; metadata?: Record<string, any> }>
 ): Promise<void> {
+  return withCompleteUserProjection(userId, async () => {
   const cfg = await getEmbeddingConfig(userId);
   if (!cfg.enabled || !cfg.vectorize_chat_messages) {
     // If disabled, just ensure it's wiped
@@ -3617,6 +3750,7 @@ export async function reindexChatMessages(
   }
 
   await scheduleStoreOptimize("chat_chunk");
+  });
 }
 
 export async function searchChatChunks(
@@ -3905,7 +4039,7 @@ export async function copyChunksToVault(
   chunkIdMap: Map<string, string>,
 ): Promise<{ copied: number }> {
   if (chunkIdMap.size === 0) return { copied: 0 };
-
+  return withCompleteUserProjection(userId, async () => {
   const sourceIds = [...chunkIdMap.keys()];
   const now = Math.floor(Date.now() / 1000);
   let copied = 0;
@@ -3956,6 +4090,7 @@ export async function copyChunksToVault(
 
   if (copied > 0) await scheduleStoreOptimize();
   return { copied };
+  });
 }
 
 /**
@@ -3969,7 +4104,7 @@ export async function rebuildVaultEmbeddings(
   chunks: Array<{ vaultChunkId: string; content: string }>,
 ): Promise<{ embedded: number }> {
   if (chunks.length === 0) return { embedded: 0 };
-
+  return withCompleteUserProjection(userId, async () => {
   const cfg = await getEmbeddingConfig(userId);
   if (!cfg.enabled) return { embedded: 0 };
 
@@ -4043,6 +4178,7 @@ export async function rebuildVaultEmbeddings(
 
   if (embeddedChunkIds.size > 0) await scheduleStoreOptimize();
   return { embedded: embeddedChunkIds.size };
+  });
 }
 
 /**
@@ -4111,7 +4247,7 @@ export async function batchUpsertDatabankVectors(
   chunks: Array<{ chatId: string; chunkId: string; vector: number[]; content: string; metadata?: Record<string, any> }>,
 ): Promise<void> {
   if (chunks.length === 0) return;
-
+  return withCompleteUserProjection(userId, async () => {
   const now = Math.floor(Date.now() / 1000);
   const rows: EmbeddingRow[] = chunks.map((c) => ({
     id: rowId(userId, "databank", c.chunkId, 0),
@@ -4130,6 +4266,7 @@ export async function batchUpsertDatabankVectors(
 
   console.info(`[embeddings] Batch-vectorized ${rows.length} databank chunk(s)`);
   await scheduleStoreOptimize();
+  });
 }
 
 /**
@@ -4151,10 +4288,12 @@ export async function deleteDatabankEmbeddings(
  */
 export async function deleteDatabankChunksByIds(userId: string, chunkIds: string[]): Promise<void> {
   if (chunkIds.length === 0) return;
-  const store = await getActiveVectorStore();
-  const ids = chunkIds.map((id) => rowId(userId, "databank", id, 0));
-  for (let i = 0; i < ids.length; i += 500) {
-    await store.deleteByIds("embeddings", ids.slice(i, i + 500));
+  for (let i = 0; i < chunkIds.length; i += 500) {
+    await deleteStoreRows("embeddings", andFilter([
+      eq("user_id", userId),
+      eq("source_type", "databank"),
+      inSet("source_id", chunkIds.slice(i, i + 500)),
+    ]));
   }
   await scheduleStoreOptimize();
 }
@@ -4173,44 +4312,76 @@ export async function moveDatabankChunkVectorsToOwner(
   newOwnerId: string,
 ): Promise<void> {
   if (chunkIds.length === 0) return;
+  return withCompleteUserProjection(userId, async () => {
+  if (
+    typeof newOwnerId !== "string"
+    || newOwnerId.length === 0
+    || !getDb().query("SELECT 1 FROM databanks WHERE id = ? AND user_id = ?").get(newOwnerId, userId)
+  ) {
+    throw new Error("databank vector target is not owned by the user");
+  }
+  if (chunkIds.length > MAX_SOURCE_FILTER_IDS || chunkIds.some((id) => (
+    typeof id !== "string"
+    || id.length === 0
+    || Buffer.byteLength(id, "utf8") > MAX_STORED_VECTOR_ID_BYTES
+  ))) {
+    throw new Error("databank vector chunk IDs exceed the bounded move contract");
+  }
+  const db = getDb();
 
   const store = await getActiveVectorStore();
   const BATCH = 500;
   for (let i = 0; i < chunkIds.length; i += BATCH) {
     const batch = chunkIds.slice(i, i + BATCH);
-    const ids = batch.map((id) => rowId(userId, "databank", id, 0));
-    const existing = await store.getRowsByFilter("embeddings", idsIn(ids));
+    const canonicalIds = new Set(
+      (db.query(
+        `SELECT id FROM databank_chunks
+           WHERE user_id = ? AND databank_id = ?
+             AND id IN (${batch.map(() => "?").join(",")})`,
+      ).all(userId, newOwnerId, ...batch) as Array<{ id: string }>).map((row) => row.id),
+    );
+    if (canonicalIds.size !== batch.length || batch.some((id) => !canonicalIds.has(id))) {
+      throw new Error("databank vector chunk is not owned by the target databank");
+    }
+    const existing = await store.getRowsByFilter("embeddings", andFilter([
+      eq("user_id", userId),
+      eq("source_type", "databank"),
+      inSet("source_id", batch),
+    ]));
     if (existing.length === 0) continue;
 
     const now = Math.floor(Date.now() / 1000);
     const updated: EmbeddingRow[] = existing.map((row) => {
-        let meta: Record<string, unknown> = {};
-        try {
-          const raw = typeof row.metadata_json === "string" ? row.metadata_json : JSON.stringify(row.metadata_json ?? {});
-          meta = JSON.parse(raw || "{}");
-        } catch {
-          meta = {};
-        }
-        meta.databankId = newOwnerId;
+      let meta: Record<string, unknown> = {};
+      try {
+        const raw = typeof row.metadata_json === "string"
+          ? row.metadata_json
+          : JSON.stringify(row.metadata_json ?? {});
+        meta = JSON.parse(raw || "{}");
+      } catch {
+        meta = {};
+      }
+      meta.databankId = newOwnerId;
 
-        return {
-          id: String(row.id),
-          user_id: String(row.user_id),
-          source_type: String(row.source_type),
-          source_id: String(row.source_id),
-          owner_id: newOwnerId,
-          chunk_index: Number(row.chunk_index ?? 0),
-          content: String(row.content || ""),
-          vector: row.vector,
-          metadata_json: JSON.stringify(meta),
-          updated_at: now,
-        };
-      }).filter((r) => r.vector.length > 0);
+      return {
+        id: String(row.id),
+        user_id: String(row.user_id),
+        source_type: String(row.source_type),
+        source_id: String(row.source_id),
+        owner_id: newOwnerId,
+        chunk_index: Number(row.chunk_index ?? 0),
+        content: String(row.content || ""),
+        vector: row.vector,
+        metadata_json: JSON.stringify(meta),
+        updated_at: now,
+      };
+    }).filter((r) => Array.isArray(r.vector) && r.vector.length > 0);
 
     if (updated.length === 0) continue;
-    await store.upsert("embeddings", updated);
+    await upsertStoreRows("embeddings", updated);
   }
   await scheduleStoreOptimize();
+  });
 }
 
 /**

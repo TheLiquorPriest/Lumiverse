@@ -1103,7 +1103,9 @@ export default function LandingPage() {
   const activeLoomPresetId = useStore((s) => s.activeLoomPresetId)
   const loomRegistry = useStore((s) => s.loomRegistry)
   const activeProfile = useMemo(
-    () => profiles.find((p) => p.id === activeProfileId) ?? profiles.find((p) => p.is_default) ?? null,
+    () => profiles.find((p) => p.id === activeProfileId && p.review_required !== true)
+      ?? profiles.find((p) => p.is_default && p.review_required !== true)
+      ?? null,
     [profiles, activeProfileId]
   )
   const activePresetName = activeLoomPresetId ? loomRegistry[activeLoomPresetId]?.name ?? null : null

@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import type { MacroEnv } from "../macros/types";
 import {
   activatePresetBoundRegexScripts,
   applyRegexScripts,
@@ -56,19 +57,18 @@ function runtimeScript(overrides: Partial<RegexScript>): RegexScript {
     preset_id: null,
     character_id: null,
     owner_extension_identifier: null,
+    validation_error_code: null,
     metadata: {},
     created_at: 0,
     updated_at: 0,
     ...overrides,
   };
 }
-
 beforeAll(() => {
   initMacros();
   closeDatabase();
   initDatabase(":memory:");
   const db = getDb();
-
   db.run(`CREATE TABLE settings (
     key TEXT NOT NULL,
     value TEXT NOT NULL,
@@ -102,6 +102,7 @@ beforeAll(() => {
     pack_id TEXT,
     preset_id TEXT,
     character_id TEXT,
+    validation_error_code TEXT,
     owner_extension_identifier TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
     created_at INTEGER NOT NULL,
@@ -830,6 +831,7 @@ describe("raw capture processing", () => {
       preset_id: null,
       character_id: null,
       owner_extension_identifier: null,
+      validation_error_code: null,
       metadata: {},
       created_at: 0,
       updated_at: 0,
@@ -855,6 +857,32 @@ describe("raw capture processing", () => {
   });
 });
 
+
+describe("ordinary replacement processing", () => {
+  test("uses native GetSubstitution in after mode", async () => {
+    const script = runtimeScript({
+      find_regex: "(?<word>ab)(c)?",
+      replace_string: "$10|$<word>|$`|$'|$$",
+      substitute_macros: "after",
+    });
+    const macroEnv = {
+      commit: true,
+      variables: {
+        local: new Map<string, string>(),
+        global: new Map<string, string>(),
+        chat: new Map<string, string>(),
+      },
+      dynamicMacros: {},
+      extra: {},
+    } as unknown as MacroEnv;
+    const input = "xxabcYY";
+    const expected = input.replace(
+      /(?<word>ab)(c)?/,
+      "$10|$<word>|$`|$'|$$",
+    );
+    expect(await applyRegexScripts(input, [script], "ai_output", undefined, macroEnv)).toBe(expected);
+  });
+});
 describe("find-only macro processing", () => {
   test("resolves the find pattern without resolving the replacement", async () => {
     const script = runtimeScript({
@@ -1253,5 +1281,77 @@ describe("associative regex actions", () => {
       },
     ]);
     expect(multiActions.every((action) => action.multi_select === true)).toBe(true);
+  });
+});
+
+describe("bounded regex validation", () => {
+  test("rejects UTF-8 pattern and empty trim without mutating local rows", () => {
+    const before = Number((getDb().query("SELECT COUNT(*) AS count FROM regex_scripts").get() as { count: number }).count);
+    const invalid = createRegexScript(USER_ID, {
+      name: "Too large",
+      find_regex: "😀".repeat(20_000),
+      trim_strings: [""],
+    });
+    expect(typeof invalid).toBe("string");
+    const after = Number((getDb().query("SELECT COUNT(*) AS count FROM regex_scripts").get() as { count: number }).count);
+    expect(after).toBe(before);
+  });
+
+  test("retains invalid foreign imports disabled with a repair code", () => {
+    const imported = createRegexScript(USER_ID, {
+      name: "Imported invalid",
+      find_regex: "[",
+    }, { foreignImport: true });
+    expect(typeof imported).not.toBe("string");
+    expect((imported as RegexScript).disabled).toBe(true);
+    expect((imported as RegexScript).validation_error_code).toBe("invalid_regex");
+  });
+
+  test("lazily quarantines invalid legacy rows before execution", () => {
+    getDb().query(
+      `INSERT INTO regex_scripts
+       (id, user_id, name, script_id, find_regex, replace_string, actions, flags, placement,
+        scope, target, trim_strings, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, '', ?, '', '[]', 'g', ?, 'global', ?, ?, '{}', 0, 0)`,
+    ).run(
+      "legacy-invalid",
+      USER_ID,
+      "Legacy invalid",
+      "[",
+      JSON.stringify(["ai_output"]),
+      JSON.stringify(["response"]),
+      JSON.stringify([]),
+    );
+    const row = getRegexScript(USER_ID, "legacy-invalid");
+    expect(row?.disabled).toBe(true);
+    expect(row?.validation_error_code).toBe("invalid_regex");
+    const stored = getDb().query("SELECT disabled, validation_error_code FROM regex_scripts WHERE id = ?").get("legacy-invalid") as {
+      disabled: number;
+      validation_error_code: string;
+    };
+    expect(stored).toEqual({ disabled: 1, validation_error_code: "invalid_regex" });
+  });
+
+  test("cancellation and deadline fail before isolate admission", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(applyRegexScripts(
+      "x",
+      [runtimeScript({ find_regex: "x", replace_string: "y" })],
+      "ai_output",
+      undefined,
+      undefined,
+      undefined,
+      { signal: controller.signal },
+    )).rejects.toThrow();
+    await expect(applyRegexScripts(
+      "x",
+      [runtimeScript({ find_regex: "x", replace_string: "y" })],
+      "ai_output",
+      undefined,
+      undefined,
+      undefined,
+      { deadlineAt: Date.now() - 1 },
+    )).rejects.toThrow();
   });
 });

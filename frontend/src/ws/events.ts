@@ -4,6 +4,7 @@ export type {
   StreamTokenPayload,
   GenerationStartedPayload,
   GenerationInProgressPayload,
+  AgentActivityPayload,
   GenerationEndedPayload,
   MessageSentPayload,
   MessageEditedPayload,

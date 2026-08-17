@@ -14,7 +14,9 @@ import {
   getChatTree,
   cycleSwipe,
   getMessage,
+  getMessageForProviderHistory,
   getMessages,
+  getMessagesForProviderHistory,
   getPreviousSameRoleContent,
   getTrailingVisibleUserMessageIds,
   listHiddenRecentChats,
@@ -24,6 +26,7 @@ import {
   removeGroupMember,
   searchMessages,
   setGroupMemberAlternateFields,
+  setSwipeScopedExtra,
   updateMessage,
 } from "./chats.service";
 
@@ -503,8 +506,55 @@ describe("recent chats", () => {
 
     const restoredSecondSwipe = cycleSwipe("u1", "msg-1", "right")!;
     expect(restoredSecondSwipe.swipe_id).toBe(1);
+
     expect(restoredSecondSwipe.extra.reasoning).toBe("second swipe reasoning");
     expect(restoredSecondSwipe.extra.reasoningDuration).toBe(456);
+  });
+  test("keeps provider-native reasoning carriers private and scoped to each swipe", () => {
+    seedChat("chat-1", "c1", "Carrier chat", "{}", 100);
+    seedMessage("msg-1", "chat-1", "first swipe", {
+      reasoningCarrier: {
+        type: "reasoning_details",
+        details: [{ type: "reasoning.text", text: "first native" }],
+      },
+    });
+
+    const publicFirst = getMessage("u1", "msg-1")!;
+    expect(publicFirst.extra.reasoningCarrier).toBeUndefined();
+
+    const privateFirst = getMessageForProviderHistory("u1", "msg-1")!;
+    expect(privateFirst.extra.reasoningCarrier).toEqual({
+      type: "reasoning_details",
+      details: [{ type: "reasoning.text", text: "first native" }],
+    });
+
+    const added = addSwipe("u1", "msg-1", "second swipe")!;
+    setSwipeScopedExtra("u1", "msg-1", added.swipe_id, {
+      reasoningCarrier: {
+        type: "thinking_blocks",
+        blocks: [{ type: "thinking", thinking: "second native", signature: "sig-2" }],
+      },
+    });
+
+    expect(getMessage("u1", "msg-1")!.extra.reasoningCarrier).toBeUndefined();
+    expect(getMessageForProviderHistory("u1", "msg-1")!.extra.reasoningCarrier).toEqual({
+      type: "thinking_blocks",
+      blocks: [{ type: "thinking", thinking: "second native", signature: "sig-2" }],
+    });
+
+    const firstAgain = cycleSwipe("u1", "msg-1", "left")!;
+    expect(firstAgain.extra.reasoningCarrier).toBeUndefined();
+    expect(getMessageForProviderHistory("u1", "msg-1")!.extra.reasoningCarrier).toEqual({
+      type: "reasoning_details",
+      details: [{ type: "reasoning.text", text: "first native" }],
+    });
+
+    const providerHistory = getMessagesForProviderHistory("u1", "chat-1");
+    expect(providerHistory).toHaveLength(1);
+    expect(providerHistory[0].extra.reasoningCarrier).toEqual({
+      type: "reasoning_details",
+      details: [{ type: "reasoning.text", text: "first native" }],
+    });
   });
 
   test("clears active swipe reasoning with explicit null without clearing other swipes", () => {
@@ -545,10 +595,13 @@ describe("recent chats", () => {
     expect(restoredSecondSwipe.extra.reasoningDuration).toBeUndefined();
   });
 
-  test("keeps native reasoning carriers scoped to the swipe that produced them", () => {
+  test("discards native reasoning carriers at the persistence boundary", () => {
     seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
     seedMessage("msg-1", "chat-1", "first swipe", {
       reasoningCarrier: { type: "reasoning_content", content: "first native" },
+      reasoningCarrierBySwipe: [
+        { type: "reasoning_content", content: "first native" },
+      ],
     });
 
     const added = addSwipe("u1", "msg-1", "second swipe")!;
@@ -558,17 +611,19 @@ describe("recent chats", () => {
         type: "reasoning_details",
         details: [{ type: "reasoning.text", text: "second native" }],
       },
+      reasoningCarrierBySwipe: [
+        null,
+        { type: "reasoning_details", details: [] },
+      ],
     });
 
-    expect(getMessage("u1", "msg-1")!.extra.reasoningCarrier).toEqual({
-      type: "reasoning_details",
-      details: [{ type: "reasoning.text", text: "second native" }],
-    });
+    const secondSwipe = getMessage("u1", "msg-1")!;
+    expect(secondSwipe.extra).not.toHaveProperty("reasoningCarrier");
+    expect(secondSwipe.extra).not.toHaveProperty("reasoningCarrierBySwipe");
 
-    expect(cycleSwipe("u1", "msg-1", "left")!.extra.reasoningCarrier).toEqual({
-      type: "reasoning_content",
-      content: "first native",
-    });
+    const firstSwipe = cycleSwipe("u1", "msg-1", "left")!;
+    expect(firstSwipe.extra).not.toHaveProperty("reasoningCarrier");
+    expect(firstSwipe.extra).not.toHaveProperty("reasoningCarrierBySwipe");
   });
 
   test("keeps generation metadata scoped to the active swipe", () => {

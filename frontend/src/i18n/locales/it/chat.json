@@ -86,6 +86,43 @@
     "modCmd": "Cmd",
     "modCtrl": "Ctrl"
   },
+  "agentRuntime": {
+    "label": "Modalità di generazione",
+    "oneTurnLegend": "Prossimo turno",
+    "mode": {
+      "response": "Risposta",
+      "agentic": "Agentica"
+    },
+    "useForChat": "Usa come predefinita per questa chat",
+    "savingOverride": "Salvataggio…",
+    "useResponse": "Usa Risposta",
+    "repair": {
+      "title": "La modalità agentica richiede attenzione",
+      "slot": "Associa lo slot di connessione del preset",
+      "provider": "Scegli un provider con le capacità richieste",
+      "isolate": "Ripristina il processo runtime sicuro",
+      "egress": "Usa un unico dominio provider per questo turno",
+      "readiness": "Completa la configurazione o revisione del runtime"
+    },
+    "announcement": {
+      "oneTurn": "{{mode}} è selezionata per il prossimo turno.",
+      "overrideSaved": "{{mode}} è ora la modalità predefinita della chat.",
+      "overrideFailed": "Impossibile salvare la modalità predefinita. Riprova.",
+      "responseEscape": "Risposta è selezionata per il prossimo turno."
+    },
+    "preflight": {
+      "refreshRequired": "Il runtime è cambiato prima dell’avvio della generazione. Controlla la modalità e riprova.",
+      "unavailable": "La modalità agentica non è pronta. Usa Risposta o completa la correzione indicata."
+    },
+    "stop": {
+      "stop": "Ferma esecuzione",
+      "locating": "Preparazione dell’arresto esatto…",
+      "stopping": "Arresto…",
+      "retry": "Riprova arresto",
+      "tooLate": "Troppo tardi per fermare",
+      "terminal": "Esecuzione terminata"
+    }
+  },
   "findInChat": {
     "open": "Cerca nella chat",
     "placeholder": "Cerca nella chat…",
@@ -358,6 +395,281 @@
     "renderModeAria": "Modalità rendering ragionamento",
     "text": "Testo",
     "markdown": "Markdown"
+  },
+  "agentActivity": {
+    "liveLabel": "Attività agenti · {{count}} in corso",
+    "idleLabel": "Attività agenti · nessuna esecuzione in corso",
+    "summaryLabel": "Attività agenti · {{status}} · {{count}} esecuzioni",
+    "liveAria": "Attività in tempo reale di agenti e strumenti",
+    "rowAria": "{{profile}}: {{status}}",
+    "usage": "{{total}} token · {{input}} in ingresso / {{output}} in uscita",
+    "actors": {
+      "mainModel": "Modello principale"
+    },
+    "status": {
+      "pending": "In attesa",
+      "running": "In corso",
+      "succeeded": "Completato",
+      "failed": "Non riuscito",
+      "cancelled": "Annullato",
+      "timed_out": "Tempo scaduto"
+    },
+    "phase": {
+      "queued": "In coda",
+      "started": "Al lavoro",
+      "tool_call": "Uso di uno strumento",
+      "completed": "Completato",
+      "failed": "Non riuscito",
+      "cancelled": "Annullato",
+      "timed_out": "Tempo scaduto"
+    },
+    "tools": {
+      "lore_list_books": "Elenca libri lore",
+      "lore_get_book": "Leggi libro lore",
+      "lore_list_entries": "Elenca voci lore",
+      "lore_get_entry": "Leggi voce lore",
+      "lore_search_entries": "Cerca nella lore",
+      "chat_search_history": "Cerca nella cronologia chat",
+      "agent_delegate": "Delega a un agente"
+    },
+    "summary": {
+      "invocations": "{{count}} esecuzioni",
+      "succeeded": "{{count}} completate",
+      "failed": "{{count}} non riuscite",
+      "cancelled": "{{count}} annullate",
+      "timedOut": "{{count}} scadute",
+      "tools": "{{count}} chiamate strumento"
+    }
+  },
+  "agentRun": {
+    "title": "Attività dell'agente",
+    "subtitle": "Cronologia dei soli stati per questa risposta",
+    "close": "Chiudi l'attività dell'agente",
+    "tabsAria": "Dettagli dell'esecuzione dell'agente",
+    "stripLabel": "Esecuzione dell'agente",
+    "tabs": {
+      "activity": "Albero delle attività",
+      "workspace": "Area di lavoro"
+    },
+    "actors": {
+      "root": "Agente principale",
+      "provider": "Ciclo del modello",
+      "child": "Agente secondario",
+      "childNamed": "Agente {{name}}",
+      "tool": "Strumento"
+    },
+    "tools": {
+      "lore_list_books": "Elenca i libri di conoscenze",
+      "lore_get_book": "Leggi il libro di conoscenze",
+      "lore_list_entries": "Elenca le voci delle conoscenze",
+      "lore_get_entry": "Leggi la voce delle conoscenze",
+      "lore_search_entries": "Cerca nelle conoscenze",
+      "chat_search_history": "Cerca nella cronologia della chat",
+      "agent_delegate": "Delega all'agente",
+      "context_pack_list": "Elenca i pacchetti di contesto",
+      "context_pack_get": "Leggi il pacchetto di contesto",
+      "workspace_read_section": "Leggi la sezione dell'area di lavoro",
+      "workspace_read_page": "Leggi la pagina dell'area di lavoro",
+      "workspace_create_task": "Crea attività",
+      "workspace_update_progress": "Aggiorna avanzamento",
+      "workspace_submit_result": "Invia risultato",
+      "workspace_accept_submission": "Accetta invio",
+      "workspace_record_finding": "Registra risultato",
+      "workspace_record_decision": "Registra decisione",
+      "workspace_record_question": "Registra domanda",
+      "workspace_attach_artifact": "Allega artefatto",
+      "workspace_propose_publication": "Proponi pubblicazione",
+      "complete_turn": "Completa turno",
+      "unknown_tool": "Strumento"
+    },
+    "phase": {
+      "ASSEMBLE": "Assemblaggio in corso",
+      "WORK": "Elaborazione in corso",
+      "COMPLETE": "Lavoro completato",
+      "RENDER": "Scrittura della risposta",
+      "PREPARE_COMMIT": "Preparazione della risposta",
+      "COMMITTING": "Salvataggio della risposta",
+      "COMMITTED": "Salvato",
+      "COMMIT_FAILED": "Salvataggio non riuscito",
+      "EXHAUSTED": "Budget esaurito",
+      "FAILED": "Non riuscito",
+      "CANCELLED": "Annullato",
+      "TIMED_OUT": "Tempo scaduto"
+    },
+    "status": {
+      "ASSEMBLE": "Assemblaggio in corso",
+      "WORK": "Elaborazione in corso",
+      "COMPLETE": "Lavoro completato",
+      "RENDER": "Scrittura in corso",
+      "PREPARE_COMMIT": "Preparazione in corso",
+      "COMMITTING": "Salvataggio in corso",
+      "COMMITTED": "Completato",
+      "COMMIT_FAILED": "Salvataggio non riuscito",
+      "EXHAUSTED": "Budget esaurito",
+      "FAILED": "Non riuscito",
+      "CANCELLED": "Annullato",
+      "TIMED_OUT": "Tempo scaduto"
+    },
+    "nodeStatus": {
+      "pending": "In attesa",
+      "running": "In esecuzione",
+      "completed": "Completato",
+      "failed": "Non riuscito",
+      "cancelled": "Annullato",
+      "timed_out": "Tempo scaduto",
+      "omitted": "Omissis"
+    },
+    "activityTreeAria": "Cronologia di agenti e strumenti",
+    "activityEmpty": "Non sono ancora disponibili righe di attività pubbliche.",
+    "usageCompact": "{{total}} token · {{input}} in ingresso / {{output}} in uscita",
+    "duration": {
+      "seconds": "{{count}} s",
+      "minutes": "{{count}} min",
+      "minutesSeconds": "{{minutes}} min {{seconds}} s",
+      "hours": "{{count}} h",
+      "hoursMinutes": "{{hours}} h {{minutes}} min"
+    },
+    "usage": {
+      "total": "Token totali",
+      "input": "Token in ingresso",
+      "output": "Token in uscita",
+      "tools": "Chiamate agli strumenti",
+      "children": "Agenti secondari",
+      "toolsCount": "Chiamate agli strumenti: {{count}}",
+      "childrenCount": "Agenti secondari: {{count}}"
+    },
+    "sync": {
+      "stale": "Viene mostrato l'ultimo albero noto durante il ripristino della connessione.",
+      "restoring": "Ripristino dell'attività dal server.",
+      "error": "L'ultimo albero noto è stato conservato. È possibile riprovare il ripristino."
+    },
+    "omission": "Il server ha omesso {{nodes}} righe di attività e {{events}} aggiornamenti.",
+    "errors": {
+      "unknown": "L'esecuzione si è conclusa con un errore sicuro del server.",
+      "capacity_exceeded": "Limite di capacità raggiunto.",
+      "host_child_admission_limit_exceeded": "Limite degli agenti secondari dell'host raggiunto.",
+      "host_tool_call_limit_exceeded": "Limite delle chiamate agli strumenti dell'host raggiunto.",
+      "child_admission_limit_exceeded": "Limite degli agenti secondari raggiunto.",
+      "tool_call_limit_exceeded": "Limite delle chiamate agli strumenti raggiunto.",
+      "logical_provider_request_limit_exceeded": "Limite delle richieste al modello raggiunto.",
+      "physical_dispatch_attempt_limit_exceeded": "Limite dei tentativi di invio raggiunto.",
+      "child_output_token_limit_exceeded": "Limite dell'output degli agenti secondari raggiunto.",
+      "root_wall_clock_limit_exceeded": "Limite di tempo raggiunto.",
+      "activity_event_limit_exceeded": "Limite degli aggiornamenti dell'attività raggiunto.",
+      "activity_byte_limit_exceeded": "Limite delle dimensioni dell'attività raggiunto.",
+      "lifecycle_log_record_limit_exceeded": "Limite della cronologia dell'attività raggiunto.",
+      "context_limit_exceeded": "Limite del contesto raggiunto.",
+      "initial_input_limit_exceeded": "Limite dell'input raggiunto.",
+      "argument_limit_exceeded": "Limite degli argomenti dello strumento raggiunto.",
+      "result_limit_exceeded": "Limite del risultato dello strumento raggiunto.",
+      "continuation_limit_exceeded": "Limite della continuazione raggiunto.",
+      "retained_output_limit_exceeded": "Limite delle dimensioni della risposta raggiunto.",
+      "materialized_limit_exceeded": "Limite della materializzazione raggiunto.",
+      "timeout": "L'esecuzione è scaduta.",
+      "cancelled": "L'esecuzione è stata annullata.",
+      "provider_unavailable": "Il servizio del modello non è disponibile.",
+      "provider_unsupported": "La capacità del modello non è disponibile.",
+      "provider_tool_calling_unsupported": "Le chiamate agli strumenti non sono disponibili.",
+      "provider_tool_continuation_unsupported": "La continuazione degli strumenti non è disponibile.",
+      "provider_tool_finalization_unsupported": "La modalità di risposta finale non è disponibile.",
+      "provider_request_error": "La richiesta al modello non è riuscita.",
+      "provider_protocol_error": "Non è stato possibile comprendere la risposta del modello.",
+      "provider_schema_error": "Il formato della risposta del modello non è valido.",
+      "invalid_task": "L'attività non è valida.",
+      "invalid_profile": "Il profilo dell'agente non è valido.",
+      "invalid_arguments": "Gli argomenti dello strumento non sono validi.",
+      "batch_rejected": "Il lotto di azioni è stato rifiutato.",
+      "unknown_tool": "Lo strumento richiesto non è disponibile.",
+      "unauthorized": "L'azione non è autorizzata.",
+      "integrity_error": "Il controllo di integrità dell'esecuzione non è riuscito.",
+      "internal_error": "Si è verificato un errore interno del server.",
+      "not_found": "La destinazione runtime richiesta non è stata trovata.",
+      "invalid_request": "La richiesta runtime non è valida.",
+      "decision_refresh_required": "La decisione runtime è obsoleta. Controlla la modalità e riprova.",
+      "decision_capacity_exceeded": "Troppe decisioni runtime in sospeso. Riprova tra poco.",
+      "runtime_decision_unavailable": "Il servizio decisionale runtime non è disponibile.",
+      "agentic_unsupported_surface": "Questa superficie di generazione richiede la modalità Risposta.",
+      "agentic_runtime_unavailable": "Il runtime agentico non è disponibile. Usa la modalità Risposta.",
+      "agentic_preflight_failed": "Il preflight agentico non è riuscito. Usa Risposta o controlla la configurazione runtime.",
+      "agentic_chat_busy": "Questa chat ha già un'esecuzione agentica in corso.",
+      "agentic_protocol_failure": "La risposta del protocollo agentico non è valida.",
+      "agentic_work_exhausted": "Il budget di lavoro agentico è esaurito.",
+      "agentic_cancelled": "L'esecuzione agentica è stata annullata.",
+      "agentic_timed_out": "L'esecuzione agentica è scaduta.",
+      "agentic_commit_failed": "Non è stato possibile salvare il risultato agentico.",
+      "agentic_revision_conflict": "Il runtime è cambiato prima del salvataggio del risultato agentico.",
+      "agentic_provider_failure": "La richiesta al modello agentico non è riuscita.",
+      "agentic_internal_error": "Si è verificato un errore interno nel runtime agentico."
+    },
+    "announcements": {
+      "restoring": "Ripristino dell'attività dell'agente.",
+      "stale": "Connessione all'attività dell'agente interrotta. L'ultimo stato noto è stato conservato.",
+      "recoveryFailed": "Ripristino dell'attività dell'agente non riuscito. L'ultimo stato noto è stato conservato.",
+      "cancelled": "Esecuzione dell'agente annullata.",
+      "terminal": "Esecuzione dell'agente: {{status}}.",
+      "phase": "Fase di esecuzione dell'agente: {{phase}}."
+    },
+    "workspace": {
+      "loading": "Caricamento dell'indice dell'area di lavoro…",
+      "error": "Impossibile caricare l'area di lavoro.",
+      "retry": "Riprova",
+      "viewOnly": "Questa area di lavoro è di sola lettura e contiene esclusivamente riepiloghi di stato approvati.",
+      "empty": "Non sono disponibili sezioni pubbliche dell'area di lavoro.",
+      "loadingSection": "Caricamento della sezione…",
+      "sectionEmpty": "Nessuna voce pubblica in questa sezione.",
+      "omitted": "Il server ha omesso {{count}} voci.",
+      "loadMore": "Carica altro",
+      "sections": {
+        "objective": "Obiettivo",
+        "tasks": "Attività",
+        "records": "Risultati, decisioni e domande",
+        "submissions": "Invii",
+        "artifacts": "Artefatti pubblicati"
+      },
+      "retention": {
+        "operational": "Solo per il turno",
+        "turn_terminal": "Fino alla pulizia del turno",
+        "chat_lifetime": "Durata della chat"
+      },
+      "visibility": {
+        "owner": "Visibile a te",
+        "participants": "Visibile ai partecipanti",
+        "public": "Pubblicato"
+      },
+      "taskState": {
+        "active": "Attiva",
+        "blocked": "Bloccata",
+        "submitted": "Inviata",
+        "done": "Completata",
+        "omitted": "Omessa"
+      },
+      "required": "Obbligatorio",
+      "optional": "Facoltativo",
+      "assigned": "Assegnato",
+      "dependencies": "{{count}} dipendenze",
+      "submissionFor": "Invio per {{task}}",
+      "submissionState": {
+        "proposed": "Proposto",
+        "accepted": "Accettato",
+        "rejected": "Rifiutato",
+        "omitted": "Omesso"
+      },
+      "agent": "Agente {{name}}",
+      "published": "Pubblicato",
+      "notPublished": "Non pubblicato",
+      "bytes": "{{count}} byte",
+      "digest": "Digest {{digest}}",
+      "recordState": {
+        "active": "Attivo",
+        "accepted": "Accettato",
+        "omitted": "Omesso"
+      },
+      "recordKind": {
+        "finding": "Risultato",
+        "decision": "Decisione",
+        "question": "Domanda"
+      }
+    }
   },
   "swipe": {
     "previous": "Scorri precedente",

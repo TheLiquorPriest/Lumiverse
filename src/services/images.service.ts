@@ -6,7 +6,7 @@ import { env } from "../env";
 import type { Image } from "../types/image";
 import { mkdirSync, existsSync, lstatSync, statSync, unlinkSync } from "fs";
 import { unlink } from "fs/promises";
-import { join, extname } from "path";
+import { join, extname, basename } from "path";
 import {
   extractVideoPosterBuffer,
   isLikelyVideoUpload,
@@ -18,6 +18,10 @@ import {
 import * as settingsSvc from "./settings.service";
 import * as chatsSvc from "./chats.service";
 
+import { SERVER_IMAGE_GENERATION_PROVENANCE } from "./image-provenance";
+import { validateSafeMediaBytes, validateSafeMediaFile } from "./user-data/media-validation";
+import { mediaPolicyLimit } from "../types/media-limits";
+import { withUserDataMutation, withUserDataMutationSync } from "./user-data/snapshot";
 const IMAGES_DIR = "images";
 
 const DEFAULT_SMALL_SIZE = 300;
@@ -319,8 +323,7 @@ async function ensureThumbnail(
   inflightThumbnailGenerations.set(cacheKey, job);
   return job;
 }
-
-export async function uploadImage(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
+async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
   const id = crypto.randomUUID();
   const dir = getImagesDir();
 
@@ -404,6 +407,14 @@ export async function uploadImage(userId: string, file: File, options?: ImageOwn
     if (stripped) buffer = Buffer.from(stripped);
   }
 
+  const validated = validateSafeMediaBytes(buffer, {
+    filename: `${id}${storedExtension}`,
+    bucket: "images",
+    mediaPolicy: isVideo ? "image_or_video" : "image",
+    expectedMimeType: mimeType,
+  });
+  mimeType = validated.contentType;
+  storedExtension = validated.extension;
   const filename = `${id}${storedExtension}`;
   const filepath = join(dir, filename);
   await writeImageFile(filepath, buffer);
@@ -492,7 +503,11 @@ export async function uploadImage(userId: string, file: File, options?: ImageOwn
   return image;
 }
 
-export async function uploadOptimizedWebpImage(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
+export async function uploadImage(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
+  return withUserDataMutation(userId, () => uploadImageUnsafe(userId, file, options));
+}
+
+async function uploadOptimizedWebpImageUnsafe(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
   const id = crypto.randomUUID();
   const filename = `${id}.webp`;
   const dir = getImagesDir();
@@ -569,11 +584,15 @@ export async function uploadOptimizedWebpImage(userId: string, file: File, optio
   return image;
 }
 
+export async function uploadOptimizedWebpImage(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
+  return withUserDataMutation(userId, () => uploadOptimizedWebpImageUnsafe(userId, file, options));
+}
+
 /**
  * Save an image from a base64 data URL (e.g. from image generation).
  * Creates the image record, generates thumbnails, and returns the Image entity.
  */
-export async function saveImageFromDataUrl(
+async function saveImageFromDataUrlUnsafe(
   userId: string,
   dataUrl: string,
   originalFilename?: string,
@@ -591,7 +610,21 @@ export async function saveImageFromDataUrl(
   const dir = getImagesDir();
   const filepath = join(dir, filename);
 
+  const mediaPolicy = mimeType.startsWith("video/") ? "image_or_video" : "image";
+  const maxBytes = mediaPolicyLimit(mediaPolicy);
+  if (maxBytes === null) throw new Error("Unsupported generated image media policy");
+  // Bound the allocation before decoding: base64 expands to 3 bytes per 4 chars.
+  if (Math.floor((base64.length * 3) / 4) > maxBytes) {
+    throw new Error("Generated image exceeds the image byte ceiling");
+  }
   const buffer = Buffer.from(base64, "base64");
+
+  validateSafeMediaBytes(buffer, {
+    filename,
+    bucket: "images",
+    mediaPolicy,
+    expectedMimeType: mimeType,
+  });
   await writeImageFile(filepath, buffer);
 
   const { width, height, hasThumbnail } = await deriveMediaMetadataAndThumbnails(
@@ -621,8 +654,9 @@ export async function saveImageFromDataUrl(
          owner_extension_identifier,
          owner_character_id,
          owner_chat_id,
+         public_provenance,
          created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -637,12 +671,22 @@ export async function saveImageFromDataUrl(
       ownerExtensionIdentifier,
       ownerCharacterId,
       ownerChatId,
+      SERVER_IMAGE_GENERATION_PROVENANCE,
       now,
     );
 
   const image = getImage(userId, id)!;
   eventBus.emit(EventType.IMAGE_UPLOADED, { image }, userId);
   return image;
+}
+
+export async function saveImageFromDataUrl(
+  userId: string,
+  dataUrl: string,
+  originalFilename?: string,
+  options?: ImageOwnershipOptions,
+): Promise<Image> {
+  return withUserDataMutation(userId, () => saveImageFromDataUrlUnsafe(userId, dataUrl, originalFilename, options));
 }
 
 export interface UploadImagesItem {
@@ -659,7 +703,7 @@ export interface UploadImagesResult {
   image?: Image;
 }
 
-export async function uploadImages(
+async function uploadImagesUnsafe(
   userId: string,
   items: ReadonlyArray<UploadImagesItem>,
   options?: {
@@ -689,11 +733,14 @@ export async function uploadImages(
       if (i >= items.length) return;
       const item = items[i]!;
       try {
-        if (!(item.data instanceof Uint8Array) || item.data.byteLength === 0) {
-          throw new Error("Image data must be a non-empty Uint8Array");
-        }
+        validateSafeMediaBytes(item.data, {
+          filename: item.filename,
+          bucket: "images",
+          mediaPolicy: item.mime_type.startsWith("video/") ? "image_or_video" : "image",
+          expectedMimeType: item.mime_type,
+        });
         const id = crypto.randomUUID();
-        const ext = extname(item.filename || "") || ".bin";
+        const ext = extname(item.filename || "").toLowerCase();
         const filename = `${id}${ext}`;
         const filepath = join(dir, filename);
         await writeImageFile(filepath, item.data);
@@ -774,12 +821,23 @@ export async function uploadImages(
   return results;
 }
 
+export async function uploadImages(
+  userId: string,
+  items: ReadonlyArray<UploadImagesItem>,
+  options?: {
+    owner_extension_identifier?: string;
+    concurrency?: number;
+  },
+): Promise<UploadImagesResult[]> {
+  return withUserDataMutation(userId, () => uploadImagesUnsafe(userId, items, options));
+}
+
 function scheduleDeferredImageProcessing(
   userId: string,
   id: string,
   filepath: string,
 ): void {
-  void (async () => {
+  void withUserDataMutation(userId, async () => {
     try {
       const buffer = Buffer.from(await Bun.file(filepath).arrayBuffer());
       let width: number | null = null;
@@ -804,39 +862,80 @@ function scheduleDeferredImageProcessing(
     } catch (err) {
       console.warn(`[images] deferred image processing failed for ${id}:`, err);
     }
-  })();
+  });
 }
 
 export const IMAGE_GEN_FILENAME_PREFIX = "image-gen-";
 
-/**
- * Get an image file path without user scoping — for public access routes.
- * Only serves images whose original_filename starts with the image-gen prefix,
- * preventing the unauthenticated endpoint from leaking user-uploaded images.
- */
-export async function getImageFilePathPublic(id: string, tier?: ThumbTier): Promise<string | null> {
-  const row = getDb().query("SELECT * FROM images WHERE id = ?").get(id) as any;
-  if (!row) return null;
+export interface PublicImageFile {
+  filepath: string;
+  contentType: string;
+}
 
-  // Only allow public access to image gen results, not arbitrary user uploads
-  if (!row.original_filename || !row.original_filename.startsWith(IMAGE_GEN_FILENAME_PREFIX)) return null;
+/**
+ * Resolve an unauthenticated image-generation result only when the row carries
+ * server-owned provenance and the staged file still has an allowlisted media
+ * type. The filename prefix remains a compatibility guard, never the
+ * authority.
+ */
+export async function getPublicImageFile(id: string, tier?: ThumbTier): Promise<PublicImageFile | null> {
+  const row = getDb().query("SELECT * FROM images WHERE id = ?").get(id) as Record<string, unknown> | null;
+  if (!row) return null;
+  if (row.public_provenance !== SERVER_IMAGE_GENERATION_PROVENANCE) return null;
+  if (typeof row.original_filename !== "string" || !row.original_filename.startsWith(IMAGE_GEN_FILENAME_PREFIX)) return null;
+  if (typeof row.filename !== "string" || basename(row.filename) !== row.filename) return null;
 
   const dir = getImagesDir();
-  if (tier) {
-    const thumbPath = join(dir, `${id}${thumbSuffix(tier)}`);
-    if (existsSync(thumbPath)) return thumbPath;
-    // Lazy generate if original exists
-    const originalPath = join(dir, row.filename);
+  const filename = row.filename;
+  const originalPath = join(dir, filename);
+  const expectedMimeType = typeof row.mime_type === "string" ? row.mime_type : null;
+  const validateOriginal = (): PublicImageFile | null => {
     if (!existsSync(originalPath)) return null;
-    const userId = row.user_id;
-    const sizes = getThumbnailSettings(userId);
-    const size = tier === "sm" ? sizes.smallSize : sizes.largeSize;
-    const ok = await ensureThumbnail(`${id}:${tier}:public`, originalPath, thumbPath, size);
-    return ok ? thumbPath : originalPath;
-  }
+    try {
+      const validated = validateSafeMediaFile(originalPath, {
+        filename,
+        bucket: "images",
+        mediaPolicy: expectedMimeType?.startsWith("video/") ? "image_or_video" : "image",
+        expectedMimeType,
+      });
+      return { filepath: originalPath, contentType: validated.contentType };
+    } catch {
+      return null;
+    }
+  };
 
-  const filepath = join(dir, row.filename);
-  return existsSync(filepath) ? filepath : null;
+  if (!tier) return validateOriginal();
+
+  const thumbPath = join(dir, `${id}${thumbSuffix(tier)}`);
+  const validateThumbnail = (): PublicImageFile | null => {
+    if (!existsSync(thumbPath)) return null;
+    try {
+      const validated = validateSafeMediaFile(thumbPath, {
+        filename: `${id}${thumbSuffix(tier)}`,
+        bucket: "thumbnails",
+        mediaPolicy: "image",
+        expectedMimeType: "image/webp",
+      });
+      return { filepath: thumbPath, contentType: validated.contentType };
+    } catch {
+      return null;
+    }
+  };
+  const existingThumbnail = validateThumbnail();
+  if (existingThumbnail) return existingThumbnail;
+
+  const original = validateOriginal();
+  if (!original) return null;
+  const userId = typeof row.user_id === "string" ? row.user_id : "";
+  const sizes = getThumbnailSettings(userId);
+  const size = tier === "sm" ? sizes.smallSize : sizes.largeSize;
+  const ok = await ensureThumbnail(`${id}:${tier}:public`, original.filepath, thumbPath, size);
+  if (!ok) return original;
+  return validateThumbnail() ?? original;
+}
+
+export async function getImageFilePathPublic(id: string, tier?: ThumbTier): Promise<string | null> {
+  return (await getPublicImageFile(id, tier))?.filepath ?? null;
 }
 
 export function getImage(userId: string, id: string, options?: ImageQueryOptions): Image | null {
@@ -1111,7 +1210,7 @@ function unlinkPathsSync(paths: readonly string[]): void {
   }
 }
 
-export function deleteImage(userId: string, id: string): boolean {
+function deleteImageUnsafe(userId: string, id: string): boolean {
   const row = getDb()
     .query("SELECT id, filename FROM images WHERE user_id = ? AND id = ?")
     .get(userId, id) as { id: string; filename: string } | undefined;
@@ -1122,6 +1221,10 @@ export function deleteImage(userId: string, id: string): boolean {
     eventBus.emit(EventType.IMAGE_DELETED, { id }, userId);
   }
   return result.changes > 0;
+}
+
+export function deleteImage(userId: string, id: string): boolean {
+  return withUserDataMutationSync(userId, () => deleteImageUnsafe(userId, id));
 }
 
 export function imageDeletePlan(
@@ -1165,12 +1268,14 @@ export async function deleteImagesBulk(
 ): Promise<number> {
   const plan = imageDeletePlan(userId, ids);
   if (plan.rowIds.length === 0) return 0;
-  await unlinkPaths(plan.paths);
-  const deleted = getDb().transaction(() => deleteImageRowsOnly(userId, plan.rowIds))();
-  if (options?.emitEvents) {
-    for (const rowId of plan.rowIds) eventBus.emit(EventType.IMAGE_DELETED, { id: rowId }, userId);
-  }
-  return deleted;
+  return withUserDataMutation(userId, async () => {
+    await unlinkPaths(plan.paths);
+    const deleted = getDb().transaction(() => deleteImageRowsOnly(userId, plan.rowIds))();
+    if (options?.emitEvents) {
+      for (const rowId of plan.rowIds) eventBus.emit(EventType.IMAGE_DELETED, { id: rowId }, userId);
+    }
+    return deleted;
+  });
 }
 
 function clearWallpaperAssignments(userId: string, imageId: string): void {

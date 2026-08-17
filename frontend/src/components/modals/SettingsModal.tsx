@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { motion } from 'motion/react'
+import { motion, useReducedMotion } from 'motion/react'
 import { RefreshCw, GripVertical } from 'lucide-react'
 import {
   DndContext,
@@ -54,6 +54,8 @@ import VoiceSettings from '@/components/settings/VoiceSettings'
 import McpServerSettings from '@/components/settings/mcp-servers/McpServerSettings'
 import DataPortability from '@/components/settings/DataPortability'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
+import AgentRuntimeSettings from '@/components/settings/AgentRuntimeSettings'
+import ContextLibrarySettings from '@/components/settings/ContextLibrarySettings'
 import CollapsibleSection from '@/components/shared/CollapsibleSection'
 import ModelCombobox from '@/components/panels/connection-manager/ModelCombobox'
 import { getVisibleSettingsTabs, sectionAnchorId, SETTINGS_TABS } from '@/lib/settings-tab-registry'
@@ -70,6 +72,7 @@ interface SettingsModalProps {
 
 export default function SettingsModal({ onClose }: SettingsModalProps) {
   const { t: ts } = useTranslation('settings')
+  const reduceMotion = useReducedMotion()
   const settingsActiveView = useStore((s) => s.settingsActiveView)
   const settingsScrollTarget = useStore((s) => s.settingsScrollTarget)
   const user = useStore((s) => s.user)
@@ -182,10 +185,10 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
       <motion.div
         className={styles.modal}
         onClick={(e) => e.stopPropagation()}
-        initial={{ opacity: 0, scale: 0.95 }}
+        initial={reduceMotion ? false : { opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
-        exit={{ opacity: 0, scale: 0.95 }}
-        transition={{ duration: 0.15 }}
+        exit={reduceMotion ? { opacity: 1, scale: 1 } : { opacity: 0, scale: 0.95 }}
+        transition={{ duration: reduceMotion ? 0 : 0.15 }}
       >
         <div className={styles.header}>
           <h2 className={styles.title}>{ts('title')}</h2>
@@ -276,6 +279,10 @@ function SettingsView({ view }: { view: string }) {
       coreContent = <SsoProviderSettings />; break
     case 'memoryCortex':
       coreContent = <MemoryCortexSettings />; break
+    case 'agentRuntime':
+      coreContent = <AgentRuntimeSettings />; break
+    case 'contextLibrary':
+      coreContent = <ContextLibrarySettings />; break
     case 'notifications':
       coreContent = <NotificationSettings />; break
     case 'voice':

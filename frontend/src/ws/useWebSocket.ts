@@ -24,14 +24,27 @@ import {
   invalidateDisplayRegexCacheForVars,
 } from '@/hooks/useDisplayRegex'
 import { triggerTTSAutoPlay } from '@/hooks/useTTSAutoPlay'
-import { recoverPooledGeneration, requestStreamGapRecovery } from '@/lib/generation-recovery'
+import {
+  recoverPooledGeneration,
+  recoverAgentActivityRuns,
+  requestStreamGapRecovery,
+  beginGenerationRequest,
+  acceptGenerationStarted,
+  acceptGenerationEnded,
+  captureGenerationRequest,
+  isGenerationRequestCurrent,
+} from '@/lib/generation-recovery'
+import { startGenerationWithRecovery } from '@/lib/generation-recovery'
+import { recoverAgentRuns } from '@/lib/agent-run-recovery'
 import { checkForBundleUpdate } from '@/lib/swUpdater'
 import type {
   StreamTokenPayload,
   GenerationStartedPayload,
   GenerationInProgressPayload,
   GenerationPhaseChangedPayload,
+  AgentActivityPayload,
   GenerationEndedPayload,
+  GenerationStoppedPayload,
   GenerationMetricsReadyPayload,
   GenerationBreakdownReadyPayload,
   GenerationAcknowledgedPayload,
@@ -57,8 +70,9 @@ import type {
   RoomPresencePayload,
   SystemSmartAlertPayload,
 } from '@/types/ws-events'
+import type { AgentRunChangedEventV2 } from '@/types/agent-runs'
 import type { ConnectionProfile, Message } from '@/types/api'
-import type { ChatHeadStatus } from '@/types/store'
+import type { ChatHeadStatus, ChatSlice, GroupChatSlice } from '@/types/store'
 import type { RoomStateView } from '@/types/multiplayer'
 import type { CouncilToolResult } from 'lumiverse-spindle-types'
 import type { ActivatedWorldInfoEntry, WorldInfoStats } from '@/types/api'
@@ -217,6 +231,17 @@ function sanitizeToastMessage(raw: string | undefined | null): string {
     ? `${stripped.slice(0, MAX_TOAST_ERROR_LENGTH - 1)}…`
     : stripped
 }
+function localizedAgentError(error: unknown): string | null {
+  if (error === null || typeof error !== 'object' || Array.isArray(error) || !('code' in error)) return null
+  const code = error.code
+  if (typeof code !== 'string' || code.length === 0) return null
+  const key = `chat.agentActivity.errors.${code}`
+  const translated = i18n.t(key)
+  return translated === key
+    ? i18n.t('chat.agentActivity.errors.generic')
+    : translated
+}
+
 
 interface EmptyGeneratedSwipeTarget {
   chatId: string
@@ -231,6 +256,33 @@ function getEmptyGeneratedSwipeTarget(state: ReturnType<typeof useStore.getState
   if (buffered.trim().length > 0) return null
   return { chatId, messageId: state.regeneratingMessageId, swipeId: state.streamingSwipeId }
 }
+function mergeTerminalAgentState(
+  state: ChatSlice,
+  payload: {
+    generationId: string
+    chatId: string
+    messageId?: string
+    targetMessageId?: string
+    targetSwipeId?: number
+    agentActivity?: unknown
+    agentError?: unknown
+  },
+): void {
+  if (payload.agentActivity) {
+    state.mergeAgentActivityRuns([{
+      version: 1,
+      generationId: payload.generationId,
+      chatId: payload.chatId,
+      targetMessageId: payload.targetMessageId ?? payload.messageId ?? null,
+      targetSwipeId: payload.targetSwipeId ?? null,
+      snapshot: payload.agentActivity,
+    }])
+  }
+  if (payload.agentError !== undefined) {
+    state.setAgentTerminalError(payload.generationId, payload.agentError)
+  }
+}
+
 
 async function deleteEmptyGeneratedSwipe(
   target: EmptyGeneratedSwipeTarget | null,
@@ -611,6 +663,7 @@ export function useWebSocket() {
       wsClient.on(WS_CLOSE, () => {
         store.getState().setWsConnected(false)
         if (store.getState().wsHasEverConnected) {
+          store.getState().markAgentRunsStale()
           pendingReconnectBundleCheckRef.current = true
         }
       }),
@@ -744,6 +797,7 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_STARTED, (payload: GenerationStartedPayload) => {
+        if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId) {
           if (state.isGroupChat && payload.characterId) {
@@ -781,6 +835,7 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_IN_PROGRESS, (payload: GenerationInProgressPayload) => {
+        if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId) {
           if (state.activeGenerationId !== payload.generationId) {
@@ -844,6 +899,17 @@ export function useWebSocket() {
         })
       }),
 
+      wsClient.on(EventType.GENERATION_AGENT_ACTIVITY, (payload: AgentActivityPayload) => {
+        store.getState().reconcileAgentActivity(payload)
+      }),
+      wsClient.on(EventType.AGENT_RUN_CHANGED, (payload: AgentRunChangedEventV2) => {
+        const result = store.getState().reconcileAgentRunEvent(payload)
+        if (result === 'gap') {
+          void recoverAgentRuns(payload.chatId)
+        }
+      }),
+
+
       wsClient.on(EventType.GENERATION_PHASE_CHANGED, (payload: GenerationPhaseChangedPayload) => {
         const state = store.getState()
         if (payload.generationId) {
@@ -876,6 +942,17 @@ export function useWebSocket() {
 
       wsClient.on(EventType.GENERATION_ENDED, (payload: GenerationEndedPayload) => {
         const state = store.getState()
+        if (
+          payload.generationId &&
+          !acceptGenerationEnded(payload.chatId, payload.generationId)
+        ) {
+          return
+        }
+        mergeTerminalAgentState(state, payload)
+        state.clearAgentActivity(payload.generationId)
+        const terminalRequest = payload.chatId && payload.generationId
+          ? captureGenerationRequest(payload.chatId, payload.generationId)
+          : null
         if (payload.chatId === state.activeChatId) {
           // Guard: ignore events from stale generations that were replaced by a newer one
           if (state.activeGenerationId && payload.generationId && payload.generationId !== state.activeGenerationId) return
@@ -885,14 +962,16 @@ export function useWebSocket() {
             state.markGenerationEnded(payload.generationId)
           }
 
-          if (payload.error) {
+          const agentErrorMessage = localizedAgentError(payload.agentError)
+          const terminalErrorMessage = agentErrorMessage ?? payload.error
+          if (terminalErrorMessage) {
             const emptySwipeTarget = getEmptyGeneratedSwipeTarget(state, payload.chatId)
             // Remove client-side placeholder if regeneration failed before backend saved a real message
             const regenId = state.regeneratingMessageId
             if (isLocalStreamPlaceholderId(regenId)) {
               state.removeMessage(regenId)
             }
-            state.setStreamingError(payload.error)
+            state.setStreamingError(terminalErrorMessage)
             // Drop any pending @mention chain so we don't spam-fire through failures
             if (state.mentionQueue && state.mentionQueue.chatId === payload.chatId) {
               state.setMentionQueue(null)
@@ -905,7 +984,7 @@ export function useWebSocket() {
             // Defense-in-depth: cap the toast message so a misbehaving provider
             // (Cloudflare 503 HTML page, etc.) cannot wedge the toast layout
             // even if it slips past the backend sanitizer.
-            const safeError = sanitizeToastMessage(payload.error)
+            const safeError = sanitizeToastMessage(terminalErrorMessage)
             toast.error(
               partialSaved
                 ? i18n.t('common.toast.partialResponseSaved', { error: safeError })
@@ -923,7 +1002,10 @@ export function useWebSocket() {
               fetchLatestMessages(payload.chatId).then(async (res) => {
                 const messages = await deleteEmptyGeneratedSwipe(emptySwipeTarget, res.data)
                 const s = store.getState()
-                if (s.activeChatId === payload.chatId) {
+                if (
+                  s.activeChatId === payload.chatId &&
+                  (!terminalRequest || isGenerationRequestCurrent(terminalRequest, payload.generationId, false))
+                ) {
                   s.reconcileMessagesTail({ ...res, data: messages })
                 }
               }).catch(() => { /* ignore */ })
@@ -1031,10 +1113,12 @@ export function useWebSocket() {
             // visible snapdown before the saved message arrives.
             // Image gen is deferred until AFTER reconciliation completes so its
             // backend work (sidecar LLM scene analysis, DB reads) cannot delay
-            // message delivery and cause a perceived UI stall.
             fetchLatestMessages(payload.chatId).then((res) => {
               const s = store.getState()
-              if (s.activeChatId === payload.chatId) {
+              if (
+                s.activeChatId === payload.chatId &&
+                (!terminalRequest || isGenerationRequestCurrent(terminalRequest, payload.generationId, false))
+              ) {
                 const messages = completedMessageId && completedReasoning
                   ? res.data.map((message) => message.id === completedMessageId
                       ? withReasoningSnapshot(
@@ -1079,21 +1163,23 @@ export function useWebSocket() {
               }
             }).finally(() => {
               const latest = store.getState()
+              const queue: GroupChatSlice['mentionQueue'] = latest.mentionQueue
               // Drain the @mention queue — kick off the next mentioned member's
               // turn. Skips if the active chat no longer matches, the queue is
               // for a different chat, or a new generation has already started.
-              const queue = latest.mentionQueue
               if (
                 queue &&
                 queue.chatId === payload.chatId &&
                 queue.ids.length > 0 &&
                 !latest.isStreaming &&
-                latest.activeChatId === payload.chatId
+                latest.activeChatId === payload.chatId &&
+                (!terminalRequest || isGenerationRequestCurrent(terminalRequest, payload.generationId, false))
               ) {
                 const nextId = latest.shiftMentionQueue()
                 if (nextId) {
+                  const generationAbortController = new AbortController()
                   latest.beginStreaming()
-                  generateApi.start({
+                  startGenerationWithRecovery('start', {
                     chat_id: queue.chatId,
                     connection_id: queue.opts.connection_id,
                     persona_id: queue.opts.persona_id,
@@ -1103,17 +1189,29 @@ export function useWebSocket() {
                     user_input: queue.opts.user_input,
                     target_character_id: nextId,
                     generation_type: 'normal',
+                    mode: 'response',
+                  }, {
+                    forceResponse: true,
+                    signal: generationAbortController.signal,
                   }).then((res) => {
                     const s = store.getState()
-                    if (s.activeChatId === queue.chatId) {
+                    if (
+                      s.activeChatId === queue.chatId
+                      && s.isStreaming
+                    ) {
                       s.startStreaming(res.generationId)
                     }
-                  }).catch((err) => {
-                    console.error('[MentionQueue] Failed to start next generation:', err)
+                  }).catch((err: unknown) => {
                     const s = store.getState()
-                    s.setStreamingError(
-                      err?.body?.error || err?.message || i18n.t('errors.failedMentionChain'),
-                    )
+                    if (store.getState().activeChatId !== queue.chatId) return
+                    console.error('[MentionQueue] Failed to start next generation:', err)
+                    const source = err && typeof err === 'object' ? err as { body?: { error?: unknown }; message?: unknown } : null
+                    const message = typeof source?.body?.error === 'string'
+                      ? source.body.error
+                      : typeof source?.message === 'string'
+                        ? source.message
+                        : i18n.t('errors.failedMentionChain')
+                    s.setStreamingError(message)
                     s.setMentionQueue(null)
                     s.stopStreaming()
                   })
@@ -1132,6 +1230,7 @@ export function useWebSocket() {
                 !latest.isStreaming &&
                 !latest.isNudgeLoopActive &&
                 latest.activeChatId === payload.chatId &&
+                (!terminalRequest || isGenerationRequestCurrent(terminalRequest, payload.generationId, false)) &&
                 latest.imageGeneration.enabled &&
                 latest.imageGeneration.autoGenerate !== false &&
                 !latest.sceneGenerating
@@ -1168,15 +1267,21 @@ export function useWebSocket() {
                   bypassActiveLoraPreset: !!ig.bypassActiveLoraPreset,
                   loraStrengthScale: ig.loraStrengthScale,
                   promptGenerationTimeoutSeconds: ig.promptGenerationTimeoutSeconds,
-                  generationTimeoutSeconds: ig.generationTimeoutSeconds,
                 }).then((res) => {
-                  if (outputTarget === 'background' && res.generated && res.imageDataUrl) {
+                  if (
+                    (!terminalRequest || isGenerationRequestCurrent(terminalRequest, payload.generationId, false)) &&
+                    outputTarget === 'background' &&
+                    res.generated &&
+                    res.imageDataUrl
+                  ) {
                     store.getState().setSceneBackground(res.imageDataUrl)
                   }
                 }).catch((err) => {
                   console.warn('[ImageGen] Auto-generate failed:', err)
                 }).finally(() => {
-                  store.getState().setSceneGenerating(false)
+                  if (!terminalRequest || isGenerationRequestCurrent(terminalRequest, payload.generationId, false)) {
+                    store.getState().setSceneGenerating(false)
+                  }
                 })
               }
             })
@@ -1191,10 +1296,10 @@ export function useWebSocket() {
             generateApi.acknowledge(payload.chatId).catch(() => {})
           } else {
             state.updateChatHead(payload.generationId, {
-              status: payload.error ? 'error' : 'completed',
+              status: payload.error || payload.agentError ? 'error' : 'completed',
             })
             // Ping when a backgrounded chat finishes successfully
-            if (!payload.error && state.chatHeadsEnabled && state.chatHeadsCompletionSoundEnabled) {
+            if (!payload.error && !payload.agentError && state.chatHeadsEnabled && state.chatHeadsCompletionSoundEnabled) {
               playNotificationPing(state.chatHeadsCustomCompletionSound?.uploadedAt ?? null)
             }
           }
@@ -1228,64 +1333,78 @@ export function useWebSocket() {
         })
       }),
 
-      wsClient.on(EventType.GENERATION_STOPPED, (payload: { generationId?: string; chatId?: string }) => {
+      wsClient.on(EventType.GENERATION_STOPPED, (payload: GenerationStoppedPayload) => {
         const state = store.getState()
-        // Guard: only stop streaming if this event matches the active generation
-        // (a newer generation may have already replaced it)
-        if (state.activeGenerationId && payload.generationId && payload.generationId !== state.activeGenerationId) return
-        // User stop also cancels any pending @mention chain for this chat
-        if (state.mentionQueue && payload.chatId && state.mentionQueue.chatId === payload.chatId) {
+        const isActiveChat = !!payload.chatId && payload.chatId === state.activeChatId
+        if (
+          payload.generationId &&
+          !acceptGenerationEnded(payload.chatId, payload.generationId)
+        ) {
+          return
+        }
+        mergeTerminalAgentState(state, payload)
+        state.clearAgentActivity(payload.generationId)
+
+        // A stopped event for another chat may update that chat's head, but it
+        // must never stop/reconcile the local stream or clear local queues.
+        if (!isActiveChat) {
+          if (payload.chatId && payload.generationId) {
+            state.updateChatHead(payload.generationId, { status: 'stopped' })
+            if (state.mpChatId === payload.chatId) syncMultiplayerChatHeadFromStore()
+          }
+          return
+        }
+
+        // User stop also cancels any pending @mention chain for this chat.
+        if (state.mentionQueue && state.mentionQueue.chatId === payload.chatId) {
           state.setMentionQueue(null)
         }
-        // Mark as ended to prevent zombie resurrection from late HTTP responses
         if (payload.generationId) {
           state.markGenerationEnded(payload.generationId)
         }
-        // Reset council executing state in case stop fired during council tools
         if (state.councilExecuting) {
           state.setCouncilExecuting(false)
         }
+
         // Delay stopStreaming until after message reconciliation completes.
-        // This keeps the streaming bubble visible while the HTTP fetch runs,
-        // then both updates (stop streaming + set messages) happen in a single
-        // React render — no flash of empty content.
-        const chatId = payload?.chatId || state.activeChatId
+        // Keep this request fenced: a new generation may begin while the
+        // message list or empty-swipe cleanup is awaiting.
+        const chatId = payload.chatId
+        const stopRequest = payload.generationId
+          ? captureGenerationRequest(chatId, payload.generationId)
+          : null
         const emptySwipeTarget = getEmptyGeneratedSwipeTarget(state, chatId)
-        const mpPeerStop = !!state.mpRoomId && !state.mpIsHost && !!chatId && state.mpChatId === chatId
+        const mpPeerStop = !!state.mpRoomId && !state.mpIsHost && state.mpChatId === chatId
         if (mpPeerStop) {
-          // Peers can't re-fetch the host's chat — finalize the streamed partial
-          // from the live buffer and stop (the backend's MESSAGE_EDITED re-broadcast
-          // reconciles the authoritative saved partial). Avoids wiping the view.
           if (state.regeneratingMessageId && state.streamingContent) {
             state.updateMessage(state.regeneratingMessageId, { content: state.streamingContent })
           }
           state.stopStreaming()
-        } else if (chatId) {
+        } else {
           fetchLatestMessages(chatId).then(async (res) => {
             const messages = await deleteEmptyGeneratedSwipe(emptySwipeTarget, res.data)
             const s = store.getState()
-            if (s.activeChatId === chatId) {
+            if (
+              s.activeChatId === chatId &&
+              (!stopRequest || isGenerationRequestCurrent(stopRequest, payload.generationId, false))
+            ) {
               s.stopStreaming()
               s.reconcileMessagesTail({ ...res, data: messages })
-            } else {
-              s.stopStreaming()
             }
           }).catch(() => {
-            store.getState().stopStreaming()
+            const s = store.getState()
+            if (
+              !stopRequest ||
+              isGenerationRequestCurrent(stopRequest, payload.generationId, false)
+            ) {
+              s.stopStreaming()
+            }
           })
-        } else {
-          state.stopStreaming()
         }
-        // Transition chat head to stopped state (auto-dismisses after a delay).
-        // If the user is viewing this chat, dismiss & acknowledge instead so it
-        // doesn't reappear when they navigate away.
-        if (payload.chatId && payload.generationId) {
-          if (payload.chatId === state.activeChatId) {
-            state.deleteChatHead(payload.chatId)
-            generateApi.acknowledge(payload.chatId).catch(() => {})
-          } else {
-            state.updateChatHead(payload.generationId, { status: 'stopped' })
-          }
+
+        if (payload.generationId) {
+          state.deleteChatHead(payload.chatId)
+          generateApi.acknowledge(payload.chatId).catch(() => {})
           if (state.mpChatId === payload.chatId) syncMultiplayerChatHeadFromStore()
         }
       }),
@@ -1362,6 +1481,8 @@ export function useWebSocket() {
         const activeChatId = store.getState().activeChatId
         if (activeChatId) {
           recoverPooledGeneration(activeChatId).catch(() => { /* best-effort */ })
+          recoverAgentActivityRuns(activeChatId).catch(() => { /* best-effort */ })
+          recoverAgentRuns(activeChatId).catch(() => { /* status-only recovery is best-effort */ })
         }
         store.getState().reconcileChatHeads().catch(() => { /* best-effort */ })
       }),

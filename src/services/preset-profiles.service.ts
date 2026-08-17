@@ -368,7 +368,7 @@ export function setConnectionBinding(
   blockStates: Record<string, boolean>,
   promptVariables?: PromptVariableValues,
 ): PresetProfileBinding {
-  const connection = connectionsSvc.getConnection(userId, connectionId);
+  const connection = connectionsSvc.getUsableConnection(userId, connectionId);
   if (!connection) throw new Error("Connection not found");
   assertPresetExists(userId, presetId);
 

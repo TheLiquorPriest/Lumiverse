@@ -329,7 +329,7 @@ function EntryTokenCell({ bookId, entry, selected }: { bookId: string; entry: Wo
     entryId: entry.id,
     content: entry.content,
     extensions: entry.extensions,
-  })
+  }, { store: useStore })
   const dwellTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const displayedCount = count ?? estimateTokens(entry.content)
   const displayedApproximate = count == null || approximate
@@ -701,6 +701,7 @@ export default function WorldBookEntriesSection({
   const isMobile = useIsMobile()
 
   const [entries, setEntries] = useState<WorldBookEntry[]>([])
+
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null)
   const [entryPage, setEntryPage] = useState(1)
   const [loadingEntries, setLoadingEntries] = useState(false)
@@ -920,7 +921,7 @@ export default function WorldBookEntriesSection({
       : filteredEntries.slice((entryPage - 1) * pageSize, entryPage * pageSize),
     [entryPage, filteredEntries, pageSize],
   )
-  useTokenCountSweep(visibleEntries)
+  useTokenCountSweep(visibleEntries, true, useStore)
   const entrySearchResultsById = useMemo(
     () => new Map(entrySearchResults?.map((result) => [result.entry.id, result]) ?? []),
     [entrySearchResults],

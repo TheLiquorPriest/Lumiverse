@@ -1,4 +1,11 @@
 import type { MacroEnv } from "../macros/types";
+import type { AgentRuntimeOwner } from "../services/agent-runtime.service";
+import type { ResolvedConcreteConnectionV1 } from "../services/connections.service";
+import type { AgentConfigV2 } from "../types/agents";
+import type { AgentToolSnapshot } from "../types/agents";
+import type { WorldBook } from "../types/world-book";
+
+export type { ProviderCapabilities, ToolContinuationMode } from "./param-schema";
 
 // --- Multi-part content types (for multimodal messages) ---
 
@@ -68,6 +75,12 @@ export interface LlmThinkingBlock {
   signature?: string;
   /** Opaque encrypted payload for `redacted_thinking` blocks — replay unmodified. */
   data?: string;
+  /**
+   * Internal cloneable provenance: this carrier's thinking text was exposed
+   * as visible output because the request disabled thinking. Providers must
+   * omit it from native wire blocks and validate it as the literal `true`.
+   */
+  display_suppressed?: true;
 }
 
 export interface LlmMessage {
@@ -174,7 +187,98 @@ export interface GenerationRequest {
   tools?: ToolDefinition[];
   /** Optional abort signal — when fired, cancels the in-flight HTTP request. */
   signal?: AbortSignal;
+  /** Receive-boundary cap selected by the root/child runtime frame. */
+  receiveLimitBytes?: number;
+  /** Host-owned tool policy; provider parameters cannot override it. */
+  toolMode?: "ordinary" | "finalization";
+  /**
+   * Provider-native continuation state. This is owned by the active loop frame,
+   * must never be copied into an LlmMessage or persisted, and is cleared after
+   * the request/frame reaches a terminal state.
+   */
+  providerTransientCarrier?: ProviderTransientCarrier;
 }
+
+export type ResponsesOutputTextAnnotation = Readonly<Record<string, unknown>>;
+export type ResponsesOutputTextLogprob = Readonly<Record<string, unknown>>;
+
+export interface ResponsesOutputTextPart {
+  readonly type: "output_text";
+  readonly text: string;
+  /**
+   * Provider-owned output metadata is retained only in the transient
+   * Responses continuation carrier. It must never be persisted or rendered.
+   */
+  readonly annotations?: readonly ResponsesOutputTextAnnotation[] | null;
+  readonly logprobs?: readonly ResponsesOutputTextLogprob[] | null;
+}
+
+export interface ResponsesRefusalPart {
+  readonly type: "refusal";
+  readonly refusal: string;
+}
+
+export type ResponsesMessageContentPart =
+  | ResponsesOutputTextPart
+  | ResponsesRefusalPart;
+
+export interface ResponsesMessageOutputItem {
+  readonly type: "message";
+  readonly id: string;
+  readonly role: "assistant";
+  readonly status?: string;
+  readonly content: readonly ResponsesMessageContentPart[];
+}
+
+export interface ResponsesReasoningSummaryPart {
+  readonly type: "summary_text";
+  readonly text: string;
+}
+
+export interface ResponsesReasoningOutputItem {
+  readonly type: "reasoning";
+  readonly id: string;
+  readonly status?: string;
+  readonly summary: readonly ResponsesReasoningSummaryPart[];
+  readonly encrypted_content?: string;
+}
+
+export interface ResponsesFunctionCallOutputItem {
+  readonly type: "function_call";
+  readonly id: string;
+  readonly call_id: string;
+  readonly name: string;
+  readonly arguments: string;
+  readonly status?: string;
+}
+
+export type ResponsesOutputItem =
+  | ResponsesMessageOutputItem
+  | ResponsesReasoningOutputItem
+  | ResponsesFunctionCallOutputItem;
+
+export interface ResponsesFunctionCallOutput {
+  readonly type: "function_call_output";
+  readonly call_id: string;
+  readonly output: string;
+}
+/** Bounded host-authored text appended to an ordered Responses continuation. */
+export interface ResponsesInputMessageItem {
+  readonly type: "message";
+  readonly role: "user" | "assistant" | "system";
+  readonly content: string;
+}
+
+/** Closed, in-memory-only provider continuation carriers. */
+export type ProviderTransientCarrier = {
+  readonly kind: "openai_responses";
+  /** Exact chronology across provider output and host input items. */
+  readonly items: readonly (
+    | ResponsesOutputItem
+    | ResponsesFunctionCallOutput
+    | ResponsesInputMessageItem
+  )[];
+};
 
 export interface ToolDefinition {
   name: string;
@@ -223,6 +327,11 @@ export interface GenerationResponse {
   /** OpenRouter `reasoning_details` captured this turn, to replay on tool-use
    *  continuations. */
   reasoning_details?: Record<string, unknown>[];
+  /**
+   * Frame-private provider state. It is intentionally not part of LlmMessage
+   * and must never reach persistence, logs, error payloads, or activity DTOs.
+   */
+  providerTransientCarrier?: ProviderTransientCarrier;
   usage?: GenerationUsage;
 }
 
@@ -239,6 +348,8 @@ export interface StreamChunk {
   /** OpenRouter `reasoning_details`, accumulated across stream chunks and set on
    *  the final chunk alongside tool_calls. */
   reasoning_details?: Record<string, unknown>[];
+  /** Frame-private provider state; never persisted or rendered. */
+  providerTransientCarrier?: ProviderTransientCarrier;
   usage?: GenerationUsage;
 }
 
@@ -250,6 +361,8 @@ export type ImpersonateMode = 'prompts' | 'oneliner' | 'sovereign_hand';
 
 export interface AssemblyContext {
   userId: string;
+  generationId: string;
+  dryRun: boolean;
   chatId: string;
   connectionId?: string;
   presetId?: string;
@@ -257,6 +370,11 @@ export interface AssemblyContext {
   presetOverride?: import("../types/preset").Preset;
   /** Skip per-chat/character/connection preset-profile block overrides. */
   skipPresetProfileBinding?: boolean;
+  /** Immutable effective preset/profile binding admitted before async sidecar work. */
+  effectivePresetSnapshot?: {
+    preset: import("../types/preset").Preset | null;
+    binding: import("../types/preset-profile").PresetProfileBinding | null;
+  };
   /** Whether macro handlers may commit side effects. Defaults to true. */
   macroCommit?: boolean;
   /** When true, bypass preset-profile preset selection and use presetId directly. */
@@ -300,6 +418,13 @@ export interface AssemblyContext {
   /** Pre-fetched data to avoid redundant DB calls during assembly.
    *  When provided, assembly reads from this instead of querying DB. */
   prefetched?: PrefetchedData;
+  /** Main-process-only bounded child/tool runtime. Never structured-cloned. */
+  agentRuntimeOwner?: AgentRuntimeOwner;
+  /** Main-process factory created only after assembly resolves the frozen concrete identity. */
+  createAgentRuntimeOwner?: (
+    config: AgentConfigV2,
+    rootConnection: ResolvedConcreteConnectionV1 | null,
+  ) => AgentRuntimeOwner;
   /** Optional abort signal. When fired, in-flight embedding requests
    *  (WI vector retrieval) are cancelled and assembly short-circuits with
    *  an AbortError so the caller can unwind cleanly. */
@@ -327,6 +452,7 @@ export interface PrefetchedData {
     worldBookIds: string[];
     bookSourceMap: Map<string, import("../services/world-info-sources.service").BookSource>;
     bookNameMap: Map<string, string>;
+    bookMap: Map<string, WorldBook>;
   };
   /** Group chat members, batch-loaded. */
   groupCharacters?: Map<string, import("../types/character").Character>;

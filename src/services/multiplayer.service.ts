@@ -1388,15 +1388,16 @@ export function passTurn(roomId: string, participantId: string): void {
 export function resolveHostConnectionId(userId: string): string | undefined {
   const active = settingsSvc.getSetting(userId, "activeProfileId");
   if (
-    typeof active?.value === "string" &&
-    active.value &&
-    connectionsSvc.getConnection(userId, active.value)
+    typeof active?.value === "string"
+    && active.value
+    && connectionsSvc.getUsableConnection(userId, active.value)
   ) {
     return active.value;
   }
   const def = connectionsSvc.getDefaultConnection(userId);
   if (def) return def.id;
-  return connectionsSvc.listConnections(userId, { limit: 1, offset: 0 }).data[0]?.id;
+  return connectionsSvc.listConnections(userId, { limit: 100, offset: 0 }).data
+    .find((profile) => connectionsSvc.isConnectionUsable(profile))?.id;
 }
 
 async function triggerHostGeneration(room: Room): Promise<void> {

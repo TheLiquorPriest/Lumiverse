@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { getConnInfo } from "hono/bun";
 import type { Context, Next } from "hono";
 import * as svc from "../services/generate.service";
+import type { GenerateInput } from "../services/generate.service";
 import * as breakdownSvc from "../services/breakdown.service";
 import * as poolSvc from "../services/generation-pool.service";
 import * as summarizePoolSvc from "../services/summarize-pool.service";
@@ -9,6 +10,13 @@ import { getSummarizationPromptDefaults } from "../services/summarization-prompt
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { clampErrorMessage, describeProviderError } from "../utils/provider-errors";
+import {
+  normalizeEffectiveRuntimeRequest,
+  resolveEffectiveRuntime,
+  RuntimeDecisionError,
+  toPublicRuntimeDecision,
+} from "../services/agent-runtime-decision.service";
+import { AgenticGenerationError } from "../services/agentic-generation.service";
 
 const LOCALHOST_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 
@@ -22,17 +30,61 @@ async function localhostOnly(c: Context, next: Next) {
 }
 
 const app = new Hono();
+app.post("/effective-runtime", async (c) => {
+  const userId = c.get("userId");
+  try {
+    const body = await c.req.json();
+    const request = normalizeEffectiveRuntimeRequest(body);
+    const decision = await resolveEffectiveRuntime(userId, request);
+    return c.json(toPublicRuntimeDecision(decision));
+  } catch (error) {
+    if (error instanceof RuntimeDecisionError) {
+      if (error.code === "not_found") {
+        return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
+      }
+      return c.json({
+        error: error.message,
+        code: error.code.toUpperCase(),
+      }, error.status as 400 | 404 | 409 | 503);
+    }
+    return c.json({ error: "Runtime decision unavailable", code: "RUNTIME_DECISION_UNAVAILABLE" }, 503);
+  }
+});
 
-function chatRoute(handler: (input: any) => Promise<any>, extras?: Record<string, string>) {
+function chatRoute(
+  handler: (input: GenerateInput) => Promise<unknown>,
+  extras?: Record<string, string>,
+) {
   return async (c: Context) => {
     const userId = c.get("userId");
-    const body = await c.req.json();
-    if (!body.chat_id) return c.json({ error: "chat_id is required" }, 400);
+    const body = await c.req.json() as Record<string, unknown>;
+    if (typeof body.chat_id !== "string" || body.chat_id.length === 0) {
+      return c.json({ error: "chat_id is required" }, 400);
+    }
     try {
-      const result = await handler({ ...body, userId, signal: c.req.raw.signal, ...extras });
+      const result = await handler({
+        ...body,
+        userId,
+        signal: c.req.raw.signal,
+        ...extras,
+      } as GenerateInput);
       return c.json(result);
-    } catch (err: any) {
-      return c.json({ error: clampErrorMessage(describeProviderError(err, "Generation failed")) }, 400);
+    } catch (err: unknown) {
+      if (err instanceof AgenticGenerationError) {
+        const status = err.code === "decision_refresh_required"
+          ? 409
+          : err.code === "agentic_runtime_unavailable"
+            ? 503
+            : 400;
+        return c.json({
+          error: err.message,
+          code: err.code,
+          responseModeAvailable: true,
+        }, status);
+      }
+      return c.json({
+        error: clampErrorMessage(describeProviderError(err, "Generation failed")),
+      }, 400);
     }
   };
 }
@@ -46,22 +98,34 @@ app.post("/stop", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
   if (body.generation_id) {
-    const stopped = svc.stopGeneration(userId, body.generation_id);
+    const stopped = await svc.stopGeneration(userId, body.generation_id);
     // Stale id (the client's generation state raced a newer generation, e.g.
     // council retry or a quick regen): never let stop be a silent no-op —
     // fall back to whatever is actually running for the chat.
     if (!stopped && body.chat_id) {
-      return c.json({ stopped: svc.stopChatGenerations(userId, body.chat_id) });
+      const fallback = await svc.stopChatGenerations(userId, body.chat_id);
+      return c.json({ stopped: fallback === true });
     }
-    return c.json({ stopped });
+    return c.json({ stopped: stopped === true });
   }
   // No generation id yet (optimistic phase). Prefer the chat-scoped stop so a
   // background generation in another chat isn't collateral damage.
   if (body.chat_id) {
-    return c.json({ stopped: svc.stopChatGenerations(userId, body.chat_id) });
+    const stopped = await svc.stopChatGenerations(userId, body.chat_id);
+    return c.json({ stopped: stopped === true });
   }
-  svc.stopUserGenerations(userId);
-  return c.json({ stopped: true });
+  const stopped = await svc.stopUserGenerations(userId);
+  return c.json({ stopped: stopped === true });
+});
+
+// Legacy chat-scoped alias. Response-mode clients historically consume a
+// boolean payload; Agentic's durable too_late status remains on /agent-runs.
+app.post("/stop-chat/:chatId", async (c) => {
+  const userId = c.get("userId");
+  const chatId = c.req.param("chatId");
+  if (!chatId) return c.json({ stopped: false }, 400);
+  const stopped = await svc.stopChatGenerations(userId, chatId);
+  return c.json({ stopped: stopped === true });
 });
 
 // --- Generation status / recovery ---

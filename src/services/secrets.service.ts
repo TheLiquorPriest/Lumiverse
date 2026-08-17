@@ -9,6 +9,41 @@ interface SecretRow {
   updated_at: number;
 }
 
+function canonicalSecretJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value) ?? "null";
+  if (typeof value === "number") return Number.isFinite(value) ? (JSON.stringify(value) ?? "null") : "null";
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalSecretJson(entry)).join(",")}]`;
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalSecretJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(String(value)) ?? "null";
+}
+
+function secretRevision(key: string, row: SecretRow | null): string {
+  const encryptedIdentity = row
+    ? (() => {
+      const hasher = new Bun.CryptoHasher("sha256");
+      hasher.update(canonicalSecretJson({
+        encrypted_value: row.encrypted_value,
+        iv: row.iv,
+        tag: row.tag,
+      }));
+      return hasher.digest("hex");
+    })()
+    : null;
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(canonicalSecretJson({
+    secret_ref: key,
+    present: !!row,
+    updated_at: row?.updated_at ?? null,
+    encrypted_identity: encryptedIdentity,
+  }));
+  return hasher.digest("hex");
+}
+
 let _cachedKey: CryptoKey | null = null;
 const warnedUnreadableSecrets = new Set<string>();
 
@@ -98,6 +133,28 @@ export async function putSecret(userId: string, key: string, value: string): Pro
 
 export async function getSecret(userId: string, key: string): Promise<string | null> {
   const row = getDb().query("SELECT * FROM secrets WHERE key = ? AND user_id = ?").get(key, userId) as SecretRow | null;
+  if (!row) return null;
+  try {
+    return await decrypt(row.encrypted_value, row.iv, row.tag);
+  } catch (err) {
+    throw normalizeSecretReadError(err, key);
+  }
+}
+/**
+ * Load one encrypted credential at the revision frozen during runtime
+ * admission. The row and revision are read together; callers never fall back
+ * to a fresh read after this fence.
+ */
+export async function getSecretAtRevision(
+  userId: string,
+  key: string,
+  expectedRevision: string,
+): Promise<string | null> {
+  const row = getDb().query("SELECT * FROM secrets WHERE key = ? AND user_id = ?").get(key, userId) as SecretRow | null;
+  const actualRevision = secretRevision(key, row);
+  if (actualRevision !== expectedRevision) {
+    throw new Error("credential_revision_mismatch");
+  }
   if (!row) return null;
   try {
     return await decrypt(row.encrypted_value, row.iv, row.tag);

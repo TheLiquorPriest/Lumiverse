@@ -4,7 +4,7 @@ import { type LlmMessage } from "../llm/types";
 import { __reasoningHistoryTest } from "./prompt-assembly.service";
 
 describe("native reasoning prompt history", () => {
-  test("hydrates persisted provider reasoning onto assistant messages", () => {
+  test("does not expose persisted provider reasoning carriers to prompt history", () => {
     const message = {
       is_user: false,
       extra: {
@@ -15,9 +15,8 @@ describe("native reasoning prompt history", () => {
       },
     } as any;
 
-    expect(__reasoningHistoryTest.getStoredReasoningCarrier(message)).toEqual({
-      reasoning_details: [{ type: "reasoning.text", text: "Native reasoning" }],
-    });
+    expect(__reasoningHistoryTest).not.toHaveProperty("getStoredReasoningCarrier");
+    expect(message.extra.reasoningCarrier).toBeDefined();
   });
 
   test("keepInHistory removes old native carriers without converting them to CoT", () => {

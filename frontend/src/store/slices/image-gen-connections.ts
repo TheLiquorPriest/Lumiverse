@@ -8,8 +8,8 @@ function resolveActiveConnectionId(
   profiles: AppStore['imageGenProfiles'],
   preferredId: string | null | undefined,
 ): string | null {
-  if (preferredId && profiles.some((profile) => profile.id === preferredId)) return preferredId
-  return profiles.find((profile) => profile.is_default)?.id ?? null
+  if (preferredId && profiles.some((profile) => profile.id === preferredId && profile.review_required !== true)) return preferredId
+  return profiles.find((profile) => profile.is_default && profile.review_required !== true)?.id ?? null
 }
 
 function persistImageGeneration(imageGeneration: AppStore['imageGeneration']) {
@@ -60,12 +60,19 @@ export const createImageGenConnectionsSlice: StateCreator<AppStore, [], [], Imag
   },
 
   setActiveImageGenConnection: (id) => {
+    // Trust the caller's id: a selection can precede profile hydration (e.g.
+    // the BYOP pending-connection handoff), and review-required profiles are
+    // already gated by the selection surfaces and reconciled by
+    // setImageGenProfiles once the profile list is authoritative.
     get().setImageGenSettings({ activeImageGenConnectionId: id })
   },
 
   addImageGenProfile: (profile) => {
     const state = get()
-    const imageGenProfiles = [...state.imageGenProfiles, profile]
+    const existingIndex = state.imageGenProfiles.findIndex((candidate) => candidate.id === profile.id)
+    const imageGenProfiles = existingIndex === -1
+      ? [...state.imageGenProfiles, profile]
+      : state.imageGenProfiles.map((candidate, index) => index === existingIndex ? profile : candidate)
     const activeImageGenConnectionId = resolveActiveConnectionId(
       imageGenProfiles,
       state.imageGeneration.activeImageGenConnectionId ?? state.activeImageGenConnectionId,
@@ -81,7 +88,10 @@ export const createImageGenConnectionsSlice: StateCreator<AppStore, [], [], Imag
       imageGenProfilesVersion: state.imageGenProfilesVersion + 1,
       activeImageGenConnectionId,
       imageGeneration,
-      connectionsOrder: { ...connectionsOrder, imageGen: [...order, profile.id] },
+      connectionsOrder: {
+        ...connectionsOrder,
+        imageGen: order.includes(profile.id) ? order : [...order, profile.id],
+      },
     })
     if (activeChanged) {
       if (state.fullSettingsLoaded) {
@@ -121,9 +131,12 @@ export const createImageGenConnectionsSlice: StateCreator<AppStore, [], [], Imag
   removeImageGenProfile: (id) => {
     const state = get()
     const imageGenProfiles = state.imageGenProfiles.filter((p) => p.id !== id)
+    const preferredId = state.imageGeneration.activeImageGenConnectionId === id
+      ? null
+      : state.imageGeneration.activeImageGenConnectionId ?? state.activeImageGenConnectionId
     const activeImageGenConnectionId = resolveActiveConnectionId(
       imageGenProfiles,
-      state.activeImageGenConnectionId === id ? null : state.activeImageGenConnectionId,
+      preferredId,
     )
     const imageGeneration = state.imageGeneration.activeImageGenConnectionId === activeImageGenConnectionId
       ? state.imageGeneration

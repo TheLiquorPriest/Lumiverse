@@ -26,7 +26,7 @@ import type {
   PromptVariableValue,
   PromptVariableValues,
 } from "../types/preset";
-import type { WorldInfoCache, WorldBookEntry } from "../types/world-book";
+import type { WorldInfoCache, WorldBook, WorldBookEntry } from "../types/world-book";
 import type { Character } from "../types/character";
 import { getEffectiveCharacterName, makeAssistantCharacter } from "../types/character";
 import type { Persona } from "../types/persona";
@@ -45,6 +45,7 @@ import {
   withPromptBlockContext,
 } from "../macros";
 import type { MacroEnv } from "../macros";
+import { createExpansionBudget, type ExpansionBudgetV1 } from "../types/agent-preprocessing";
 import {
   activateWorldInfo,
   applyWorldInfoGroupLogic,
@@ -144,6 +145,23 @@ import {
   shouldInjectEmptySendNudge,
   shouldInjectGroupNudge,
 } from "./prompt-behavior";
+import { createAgentToolSnapshot } from "./agent-tools.service";
+import type {
+  AgentLoreSource,
+  AgentOwnedLoreReader,
+  AgentSnapshotBook,
+  AgentSnapshotEntry,
+} from "../types/agents";
+import {
+  AgentRuntimeFailure,
+  type AgentRunOutcome,
+} from "./agent-runtime.service";
+import {
+  AgentAssemblyRequiresMainProcessError,
+  preflightAgentIntrinsics,
+  resolveAgentFeatureRuntimeAdmission,
+} from "./agent-intrinsics.service";
+import { withAgentSealStage } from "./agent-seals.service";
 
 export type {
   VectorActivatedEntry,
@@ -242,11 +260,10 @@ export function getSourceIndexInChat(msg: LlmMessage): number | undefined {
 }
 
 export { getSourceMessageMetadata };
-
 /**
- * Native reasoning is persisted separately from the display-only `extra.reasoning`
- * string. Keeping the carrier name and opaque payload lets prompt history replay
- * what the provider actually returned instead of converting it into CoT tags.
+ * Provider-native reasoning is persisted only for private Response history
+ * replay. Never expose the opaque carrier through public message DTOs or
+ * convert it into display reasoning.
  */
 function getStoredReasoningCarrier(message: Message): Pick<
   LlmMessage,
@@ -254,36 +271,21 @@ function getStoredReasoningCarrier(message: Message): Pick<
 > {
   if (message.is_user) return {};
   const carrier = message.extra?.reasoningCarrier;
-  if (!carrier || typeof carrier !== "object" || Array.isArray(carrier)) {
-    return {};
-  }
-
+  if (!carrier || typeof carrier !== "object" || Array.isArray(carrier)) return {};
   const value = carrier as Record<string, unknown>;
-  if (
-    value.type === "thinking_blocks" &&
-    Array.isArray(value.blocks) &&
-    value.blocks.length > 0
-  ) {
+  if (value.type === "reasoning_content" && typeof value.content === "string" && value.content.length > 0) {
+    return { reasoning_content: value.content };
+  }
+  if (value.type === "thinking_blocks" && Array.isArray(value.blocks) && value.blocks.length > 0) {
     return { thinking_blocks: value.blocks as LlmMessage["thinking_blocks"] };
   }
-  if (
-    value.type === "reasoning_details" &&
-    Array.isArray(value.details) &&
-    value.details.length > 0
-  ) {
-    return {
-      reasoning_details: value.details as LlmMessage["reasoning_details"],
-    };
-  }
-  if (
-    value.type === "reasoning_content" &&
-    typeof value.content === "string" &&
-    value.content.length > 0
-  ) {
-    return { reasoning_content: value.content };
+  if (value.type === "reasoning_details" && Array.isArray(value.details) && value.details.length > 0) {
+    return { reasoning_details: value.details as LlmMessage["reasoning_details"] };
   }
   return {};
 }
+
+
 
 function hasNativeReasoningCarrier(message: LlmMessage): boolean {
   return Boolean(
@@ -1202,7 +1204,7 @@ function isAppendRole(role: string): boolean {
  * blocks with position "pre_history" that sit after the marker are moved to
  * just before it.  Marker blocks and append-role blocks are left in place.
  */
-function reorderBlocksByPosition(blocks: PromptBlock[]): void {
+export function reorderBlocksByPosition(blocks: PromptBlock[]): void {
   const chatHistoryIdx = blocks.findIndex((b) => b.marker === "chat_history");
   if (chatHistoryIdx < 0) return;
 
@@ -1304,11 +1306,13 @@ async function evaluateHostPromptSource(
   content: string,
   macroEnv: MacroEnv,
   sourceHint = "prompt_source:preset_setting",
+  budget?: ExpansionBudgetV1,
 ): Promise<string> {
   return (await evaluate(content, macroEnv, registry, {
     phase: "prompt",
     sourceHint,
     sourceOwner: "host",
+    ...(budget ? { budget } : {}),
   })).text;
 }
 
@@ -1316,11 +1320,67 @@ async function evaluatePromptBlockContent(
   content: string,
   macroEnv: MacroEnv,
   block: Pick<PromptBlock, "id" | "role" | "position" | "depth">,
+  budget?: ExpansionBudgetV1,
 ): Promise<string> {
   return withPromptBlockContext(macroEnv, block, async () =>
-    evaluateHostPromptSource(content, macroEnv, "prompt_source:preset_block"),
+    evaluateHostPromptSource(content, macroEnv, "prompt_source:preset_block", budget),
   );
 }
+/**
+ * Clone macro-extra state for a child task without attempting to clone
+ * functions or host objects. Macro extras are normally JSON-shaped, but this
+ * preserves Map/Set identity boundaries and cycles for extension-provided
+ * values while leaving opaque class instances usable by their handlers.
+ */
+function cloneMacroTaskValue(
+  value: unknown,
+  seen: WeakMap<object, unknown>,
+): unknown {
+  if (value === null || typeof value !== "object") return value;
+  const existing = seen.get(value);
+  if (existing !== undefined) return existing;
+
+  if (value instanceof Date) return new Date(value.getTime());
+  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+
+  if (value instanceof Map) {
+    const copy = new Map<unknown, unknown>();
+    seen.set(value, copy);
+    for (const [key, child] of value.entries()) {
+      copy.set(
+        cloneMacroTaskValue(key, seen),
+        cloneMacroTaskValue(child, seen),
+      );
+    }
+    return copy;
+  }
+  if (value instanceof Set) {
+    const copy = new Set<unknown>();
+    seen.set(value, copy);
+    for (const child of value.values()) {
+      copy.add(cloneMacroTaskValue(child, seen));
+    }
+    return copy;
+  }
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    for (const child of value) {
+      copy.push(cloneMacroTaskValue(child, seen));
+    }
+    return copy;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return value;
+  const copy = Object.create(prototype) as Record<string, unknown>;
+  seen.set(value, copy);
+  for (const [key, child] of Object.entries(value)) {
+    copy[key] = cloneMacroTaskValue(child, seen);
+  }
+  return copy;
+}
+
 
 /**
  * Walk enabled prompt blocks, merge stored overrides over creator defaults,
@@ -1650,6 +1710,50 @@ export function setMultiplayerMacroContextProvider(
   multiplayerMacroContextProvider = fn;
 }
 
+export interface AgentToolChatCorpusSelection {
+  promptMessages: Message[];
+  snapshotMessages: Message[];
+}
+
+/**
+ * Selects the prompt and immutable tool views of chat history. The prompt may
+ * retain a pre-anchor prefix for the context clipper; the tool view never does.
+ */
+export function selectAgentToolChatCorpora(
+  messages: Message[],
+  contextAnchorIndex: number | undefined,
+  options: {
+    agentRuntime: boolean;
+    promptBlockCount: number;
+    messageLimitEnabled?: boolean;
+    messageLimitCount?: number;
+  },
+): AgentToolChatCorpusSelection {
+  const anchorStart = contextAnchorIndex == null
+    ? -1
+    : messages.findIndex((message) => message.index_in_chat >= contextAnchorIndex);
+  const messageLimitActive =
+    options.promptBlockCount > 0 &&
+    options.agentRuntime &&
+    options.messageLimitEnabled === true &&
+    options.messageLimitCount != null &&
+    options.messageLimitCount > 0;
+  const requestedStart = messageLimitActive
+    ? Math.max(0, messages.length - (options.messageLimitCount ?? 0))
+    : 0;
+  const promptMessages = messageLimitActive
+    ? messages.slice(anchorStart >= 0 ? Math.min(requestedStart, anchorStart) : requestedStart)
+    : messages;
+  const snapshotMessages = options.agentRuntime
+    ? anchorStart >= 0
+      ? messages.slice(anchorStart)
+      : messageLimitActive
+        ? messages.slice(requestedStart)
+        : messages
+    : messages;
+  return { promptMessages, snapshotMessages };
+}
+
 export async function assemblePrompt(
   ctx: AssemblyContext,
 ): Promise<AssemblyResult> {
@@ -1680,6 +1784,7 @@ export async function assemblePrompt(
   if (ctx.signal?.aborted)
     throw ctx.signal.reason ?? new DOMException("Aborted", "AbortError");
 
+  const macroBudget = createExpansionBudget(undefined, ctx.signal);
   const pf = ctx.prefetched; // shorthand for prefetched data
   let phaseStartedAt = performance.now();
 
@@ -1743,31 +1848,44 @@ export async function assemblePrompt(
   // preset selection for the active chat/character context. No-preset temp
   // chats opt out entirely — no preset blocks or parameters, no bindings, no
   // fallback — so assembly drops to the raw legacy message mapping below.
-  const noPreset = isNoPresetChatMetadata(chat.metadata) && !ctx.presetOverride;
+  const effectivePresetSnapshot = ctx.effectivePresetSnapshot;
+  const hasEffectivePresetSnapshot = effectivePresetSnapshot !== undefined;
+  const noPreset =
+    !hasEffectivePresetSnapshot &&
+    isNoPresetChatMetadata(chat.metadata) &&
+    !ctx.presetOverride;
   const requestedPresetId = noPreset ? null : ctx.presetId || connection?.preset_id || null;
-  const resolvedProfile =
-    ctx.presetOverride || ctx.skipPresetProfileBinding
+  const resolvedProfile = hasEffectivePresetSnapshot
+    ? {
+        preset_id: effectivePresetSnapshot!.preset?.id ?? null,
+        binding: effectivePresetSnapshot!.binding,
+        source: "none" as const,
+      }
+    : ctx.presetOverride || ctx.skipPresetProfileBinding
       ? { preset_id: ctx.presetOverride?.id ?? requestedPresetId, binding: null, source: "none" as const }
       : noPreset
-      ? { preset_id: null, binding: null, source: "none" as const }
-      : ctx.forcePresetId && ctx.presetId
-        ? { preset_id: ctx.presetId, binding: null, source: "none" as const }
-        : presetProfilesSvc.resolveProfile(
-            ctx.userId,
-            requestedPresetId,
-            chat.id,
-            characterId,
-            {
-              isGroup: chat.metadata?.group === true,
-              connectionId: connection?.id ?? null,
-              personaId: persona?.id ?? null,
-            },
-          );
+        ? { preset_id: null, binding: null, source: "none" as const }
+        : ctx.forcePresetId && ctx.presetId
+          ? { preset_id: ctx.presetId, binding: null, source: "none" as const }
+          : presetProfilesSvc.resolveProfile(
+              ctx.userId,
+              requestedPresetId,
+              chat.id,
+              characterId,
+              {
+                isGroup: chat.metadata?.group === true,
+                connectionId: connection?.id ?? null,
+                personaId: persona?.id ?? null,
+              },
+            );
   const resolvedPresetId = resolvedProfile.preset_id;
-
-  let preset: Preset | null = ctx.presetOverride ?? null;
+  let preset: Preset | null = hasEffectivePresetSnapshot
+    ? effectivePresetSnapshot!.preset
+    : ctx.presetOverride ?? null;
   const prefetchedPreset = noPreset ? null : pf?.preset !== undefined ? pf.preset : null;
-  if (ctx.presetOverride) {
+  if (hasEffectivePresetSnapshot) {
+    preset = effectivePresetSnapshot!.preset;
+  } else if (ctx.presetOverride) {
     preset = ctx.presetOverride;
   } else if (resolvedPresetId) {
     preset =
@@ -1798,10 +1916,96 @@ export async function assemblePrompt(
   }
   presetProfilesSvc.normalizeCategoryBlockStates(blocks);
 
+  const profilePromptVariables = resolvedProfile.binding
+    ? resolvedProfile.binding.prompt_variables ?? {}
+    : undefined;
+  const effectiveBlocks = resolvePromptBlockPlacements(
+    blocks,
+    preset,
+    profilePromptVariables,
+  );
+  reorderBlocksByPosition(effectiveBlocks);
+
+  const agentConfig = preset?.agent_config;
+  // Preflight only blocks that the assembly loop will actually traverse. A
+  // producer hidden behind an injection trigger or character-tag filter must
+  // not satisfy a result reference in a later active block.
+  const agentTraversalCharacter = resolveCharacterWithAlternateFields(
+    character,
+    chat,
+  );
+  const agentSkipsBlockTraversal =
+    ctx.generationType === "impersonate" &&
+    ctx.impersonateMode === "oneliner";
+  const agentPreflightBlocks = agentConfig
+    ? effectiveBlocks.map((block) => ({
+        ...block,
+        active:
+          !agentSkipsBlockTraversal &&
+          block.enabled === true &&
+          !(
+            block.marker === "category" &&
+            !block.content?.trim()
+          ) &&
+          !(
+            block.injectionTrigger &&
+            block.injectionTrigger.length > 0 &&
+            !block.injectionTrigger.includes(ctx.generationType)
+          ) &&
+          promptBlockMatchesCharacterTags(
+            block.characterTagTrigger,
+            agentTraversalCharacter.tags,
+          ),
+      }))
+    : effectiveBlocks;
+  const agentIntrinsicPlan = preflightAgentIntrinsics(
+    agentPreflightBlocks,
+    agentConfig,
+  );
+  if (agentConfig && !agentConfig.agentsEnabled) {
+    for (const blockPlan of agentIntrinsicPlan.blocks) {
+      if (blockPlan.replacementContent !== blockPlan.originalContent) {
+        effectiveBlocks[blockPlan.blockIndex] = {
+          ...effectiveBlocks[blockPlan.blockIndex],
+          content: blockPlan.replacementContent,
+        };
+      }
+    }
+  }
+  const executableAgentIntrinsics =
+    agentConfig?.agentsEnabled === true &&
+    agentIntrinsicPlan.executableIntrinsics.length > 0;
+  const activeMultiplayer =
+    typeof chat.metadata?.multiplayer_room_id === "string";
+  const agentFeatureNeedsRuntime = resolveAgentFeatureRuntimeAdmission({
+    config: agentConfig,
+    hasExecutableIntrinsic: executableAgentIntrinsics,
+    dryRun: ctx.dryRun === true,
+    activeMultiplayer,
+  });
+  if (agentFeatureNeedsRuntime && !ctx.dryRun && runningInAssemblyWorker()) {
+    throw new AgentAssemblyRequiresMainProcessError();
+  }
+  let agentRuntimeOwner = ctx.agentRuntimeOwner;
+  if (agentFeatureNeedsRuntime && !ctx.dryRun && !agentRuntimeOwner) {
+    if (!ctx.createAgentRuntimeOwner) {
+      throw new Error("Agent runtime owner is unavailable");
+    }
+    agentRuntimeOwner = ctx.createAgentRuntimeOwner(
+      agentConfig!,
+      connection
+        ? connectionsSvc.resolveConcreteConnectionV1(ctx.userId, connection.id)
+        : null,
+    );
+  }
+
   profiler.addPhase("load-core-data", performance.now() - phaseStartedAt);
 
-  // If no blocks, fall back to legacy mapping
-  if (!blocks.length) {
+  // Preset-less/empty-order chats keep the legacy prompt mapping. When the
+  // feature runtime exists, continue through the shared world-info/macro setup
+  // first so its provider tools receive the same immutable snapshot as normal
+  // prompt-order assembly.
+  if (!blocks.length && !agentRuntimeOwner) {
     return await legacyAssembly(
       messages,
       ctx.generationType,
@@ -2477,6 +2681,7 @@ export async function assemblePrompt(
       : undefined,
     signal: ctx.signal,
   });
+  macroEnv._expansionBudget = macroBudget;
   if (preset) {
     macroEnv.extra.presetId = preset.id;
     macroEnv.extra.presetMetadata = preset.metadata || {};
@@ -2485,14 +2690,8 @@ export async function assemblePrompt(
   // Prompt variables — resolve creator-defined schemas + end-user overrides and
   // surface them on env.extra so {{var::name}} / {{hasVar::name}} / {{varDefault::name}}
   // can read consistent values across every block in this assembly.
-  const profilePromptVariables = resolvedProfile.binding?.prompt_variables;
   resolvePromptVariables(macroEnv, blocks, preset, profilePromptVariables);
 
-  // A select variable may choose an in-memory insertion profile for its own
-  // block. Project that configuration before ordering/rendering, rather than
-  // asking macro output to mutate placement during the render pass.
-  const effectiveBlocks = resolvePromptBlockPlacements(blocks, preset, profilePromptVariables);
-  reorderBlocksByPosition(effectiveBlocks);
 
   // Use prefetched settings or batch-load all needed settings in a single query
   const settingsMap =
@@ -2522,6 +2721,22 @@ export async function assemblePrompt(
       "databankSettings",
       "council_settings",
     ]);
+
+  // Resolve the generation's exact chat corpus once. Prompt insertion may keep
+  // a prefix so the context clipper can account for anchor semantics, but the
+  // frozen tool corpus must contain only rows the final prompt can retain.
+  const summarizationSettings = settingsMap.get("summarization") as
+    | { messageLimitEnabled?: boolean; messageLimitCount?: number }
+    | undefined;
+  const {
+    promptMessages: agentToolChatMessages,
+    snapshotMessages: agentToolSnapshotMessages,
+  } = selectAgentToolChatCorpora(messages, contextAnchorIndex, {
+    agentRuntime: agentRuntimeOwner != null,
+    promptBlockCount: blocks.length,
+    messageLimitEnabled: summarizationSettings?.messageLimitEnabled,
+    messageLimitCount: summarizationSettings?.messageLimitCount,
+  });
 
   // A connection's reasoning binding is the effective source for all
   // reasoning settings, including its custom request body. Fall back to the
@@ -2554,7 +2769,231 @@ export async function assemblePrompt(
   // Populate Lumia / Loom / Council / OOC / Sovereign Hand context for macros
   populateLumiaLoomContext(macroEnv, ctx.userId, chat, ctx, settingsMap);
   const macroEnvSeed = cloneEnv(macroEnv);
+  const activeDeterministicLoreProfiles = agentRuntimeOwner
+    ? new Set(
+        agentIntrinsicPlan.executableIntrinsics
+          .filter((intrinsic) => {
+            const block = effectiveBlocks[intrinsic.blockIndex];
+            if (!block) return false;
+            if (
+              block.injectionTrigger?.length &&
+              !block.injectionTrigger.includes(ctx.generationType)
+            ) {
+              return false;
+            }
+            if (!promptBlockMatchesCharacterTags(block.characterTagTrigger, agentTraversalCharacter.tags)) {
+              return false;
+            }
+            return intrinsic.toolIds.some((toolId) => toolId.startsWith("lore_"));
+          })
+          .map((intrinsic) => intrinsic.profileId),
+      )
+    : undefined;
+  const allOwnedLoreRequested =
+    agentRuntimeOwner &&
+    agentConfig?.agentsEnabled === true &&
+    (
+      (
+        agentConfig.mainLoreScope === "all_owned" &&
+        agentConfig.mainToolIds.some((toolId) => toolId.startsWith("lore_"))
+      ) ||
+      agentConfig.profiles.some(
+        (profile) =>
+          profile.loreScope === "all_owned" &&
+          profile.toolIds.some((toolId) => toolId.startsWith("lore_")) &&
+          (
+            profile.allowMainDelegation ||
+            activeDeterministicLoreProfiles?.has(profile.id) === true
+          ),
+      )
+    );
+  const agentToolBooks = agentRuntimeOwner
+    ? [...wiSources.bookMap.values()].map((book) => ({
+        id: book.id,
+        name: book.name,
+        description: book.description ?? "",
+        folder: book.folder ?? "",
+        source: (wiSources.bookSourceMap.get(book.id) ?? "injected") as AgentLoreSource,
+        active: true,
+      }))
+    : undefined;
+  const agentToolEntries = agentRuntimeOwner ? [...intercepted] : undefined;
+  const agentToolBookNames = agentRuntimeOwner
+    ? new Map(wiSources.bookNameMap)
+    : undefined;
+  const agentToolBookSources = agentRuntimeOwner
+    ? new Map<string, AgentLoreSource>(wiSources.bookSourceMap)
+    : undefined;
+  const ownedBookProjection = (book: WorldBook): AgentSnapshotBook => Object.freeze({
+    id: book.id,
+    name: book.name,
+    description: book.description ?? "",
+    folder: book.folder ?? "",
+    source: "owned",
+    active: false,
+  });
+  const ownedEntryProjection = (
+    entry: WorldBookEntry,
+    book: WorldBook | null,
+  ): AgentSnapshotEntry | null => {
+    if (!book) return null;
+    return Object.freeze({
+      id: entry.id,
+      bookId: entry.world_book_id,
+      bookName: book.name,
+      bookSource: "owned" as const,
+      comment: entry.comment,
+      keys: Object.freeze([...entry.key]),
+      secondaryKeys: Object.freeze([...entry.keysecondary]),
+      content: entry.content,
+      position: entry.position,
+      depth: entry.depth,
+      role: entry.role,
+      activated: false,
+    });
+  };
+  const ownedLoreReader: AgentOwnedLoreReader | undefined =
+    agentRuntimeOwner && allOwnedLoreRequested
+      ? {
+          listBooks: ({ limit, offset, folder, query }) => {
+            const page = worldBooksSvc.listOwnedAgentLoreBooks(ctx.userId, {
+              limit,
+              offset,
+              ...(folder !== undefined ? { folder } : {}),
+              ...(query !== undefined ? { query } : {}),
+            });
+            return {
+              data: page.data.map(ownedBookProjection),
+              total: page.total,
+              limit: page.limit,
+              offset: page.offset,
+              truncated: page.offset + page.data.length < page.total,
+            };
+          },
+          resolveBookName: (name) => {
+            const resolution = worldBooksSvc.resolveOwnedAgentLoreBookName(ctx.userId, name);
+            return {
+              candidates: resolution.candidates,
+              total: resolution.total,
+              truncated: resolution.truncated,
+            };
+          },
+          getBook: (bookId) => {
+            const book = worldBooksSvc.getOwnedAgentLoreBook(ctx.userId, bookId);
+            return book ? ownedBookProjection(book) : null;
+          },
+          listEntries: ({ bookId, limit, offset, query }) => {
+            const page = worldBooksSvc.listOwnedAgentLoreEntries(ctx.userId, {
+              bookId,
+              limit,
+              offset,
+              ...(query !== undefined ? { query } : {}),
+            });
+            const book = worldBooksSvc.getOwnedAgentLoreBook(ctx.userId, bookId);
+            const data = page.data
+              .map((entry) => ownedEntryProjection(entry, book))
+              .filter((entry): entry is AgentSnapshotEntry => entry !== null);
+            return {
+              data,
+              total: page.total,
+              limit: page.limit,
+              offset: page.offset,
+              truncated: page.offset + data.length < page.total,
+            };
+          },
+          getEntry: (entryId) => {
+            const entry = worldBooksSvc.getOwnedAgentLoreEntry(ctx.userId, entryId);
+            return entry
+              ? ownedEntryProjection(
+                  entry,
+                  worldBooksSvc.getOwnedAgentLoreBook(ctx.userId, entry.world_book_id),
+                )
+              : null;
+          },
+          searchEntries: ({ query, bookId, limit, offset }) => {
+            const page = worldBooksSvc.searchOwnedAgentLoreEntries(ctx.userId, {
+              query,
+              ...(bookId !== undefined ? { bookId } : {}),
+              limit,
+              offset,
+            });
+            const booksById = new Map<string, WorldBook | null>();
+            const data = page.data
+              .map((entry) => {
+                let book: WorldBook | null;
+                if (booksById.has(entry.world_book_id)) {
+                  book = booksById.get(entry.world_book_id) ?? null;
+                } else {
+                  book = worldBooksSvc.getOwnedAgentLoreBook(
+                    ctx.userId,
+                    entry.world_book_id,
+                  );
+                  booksById.set(entry.world_book_id, book);
+                }
+                return ownedEntryProjection(entry, book);
+              })
+              .filter((entry): entry is AgentSnapshotEntry => entry !== null);
+            return {
+              data,
+              total: page.total,
+              limit: page.limit,
+              offset: page.offset,
+              truncated: page.offset + data.length < page.total,
+            };
+          },
+        }
+      : undefined;
+  const agentToolSnapshot = agentRuntimeOwner
+    ? createAgentToolSnapshot({
+        rootUserId: ctx.userId,
+        chatId: ctx.chatId,
+        books: agentToolBooks ?? [],
+        entries: agentToolEntries ?? [],
+        activatedEntries: mergedWorldInfo.activatedEntries,
+        bookNames: agentToolBookNames,
+        bookSources: agentToolBookSources,
+        messages: agentToolSnapshotMessages,
+        excludedMessageIds: new Set(
+          [ctx.excludeMessageId, ctx.continueMessageId].filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          ),
+        ),
+        names: {
+          user: macroEnv.names.user,
+          char: macroEnv.names.char,
+          group: macroEnv.names.group,
+          groupNotMuted: macroEnv.names.groupNotMuted,
+          notChar: macroEnv.names.notChar,
+          charGroupFocused: macroEnv.names.charGroupFocused,
+          groupOthers: macroEnv.names.groupOthers,
+          groupMemberCount: macroEnv.names.groupMemberCount,
+          isGroupChat: macroEnv.names.isGroupChat,
+        },
+        ...(ownedLoreReader ? { ownedLore: ownedLoreReader } : {}),
+        signal: ctx.signal,
+      })
+    : undefined;
+  if (
+    agentToolSnapshot &&
+    agentRuntimeOwner &&
+    !agentRuntimeOwner.hasSnapshot()
+  ) {
+    agentRuntimeOwner.setSnapshot(agentToolSnapshot);
+  }
   profiler.addPhase("macro-setup", performance.now() - phaseStartedAt);
+  if (!blocks.length) {
+    return await legacyAssembly(
+      messages,
+      ctx.generationType,
+      character,
+      persona,
+      chat,
+      connection,
+      ctx.userId,
+      ctx.userInput,
+      ctx.signal,
+    );
+  }
 
   // ---- Impersonate one-liner mode: skip preset blocks, just chat history + impersonation prompt ----
   if (
@@ -2957,7 +3396,15 @@ export async function assemblePrompt(
   // advances. The final block's after-entries are flushed after the loop.
   let pendingPinnedAfter: PinnedMarkerEntry[] | null = null;
 
-  for (const block of effectiveBlocks) {
+  for (
+    let effectiveBlockIndex = 0;
+    effectiveBlockIndex < effectiveBlocks.length;
+    effectiveBlockIndex++
+  ) {
+    const block = effectiveBlocks[effectiveBlockIndex];
+    const agentBlockPlan = agentIntrinsicPlan.blocks[effectiveBlockIndex];
+    const hasAgentSyntax =
+      agentConfig?.agentsEnabled === true && agentBlockPlan.nodes.length > 0;
     // Flush the previous block's marker-pinned "after" entries before this
     // iteration emits anything. Runs unconditionally — it belongs to the
     // previous block, so it must land even if this block is skipped below.
@@ -3001,7 +3448,7 @@ export async function assemblePrompt(
 
     // ---- Handle by marker type ----
 
-    if (block.marker === "chat_history") {
+    if (!hasAgentSyntax && block.marker === "chat_history") {
       // Inject memories as system message ONLY if no macro handles them AND
       // the global injection strategy allows fallback injection.
       if (
@@ -3076,35 +3523,7 @@ export async function assemblePrompt(
 
       firstChatIdx = result.length;
 
-      // Apply message limit — keep only the N most recent messages when enabled.
-      // This works independently of summarization; users can use {{loomSummary}}
-      // in their preset to retain context from older messages.
-      const summarizationSettings = settingsMap.get("summarization") as
-        | { messageLimitEnabled?: boolean; messageLimitCount?: number }
-        | undefined;
-      let effectiveMessages = messages;
-      if (
-        summarizationSettings?.messageLimitEnabled &&
-        summarizationSettings.messageLimitCount != null &&
-        summarizationSettings.messageLimitCount > 0
-      ) {
-        const requestedStart = Math.max(
-          0,
-          messages.length - summarizationSettings.messageLimitCount,
-        );
-        const anchorStart = contextAnchorIndex == null
-          ? -1
-          : messages.findIndex(
-              (message) => message.index_in_chat >= contextAnchorIndex,
-            );
-        // An anchor tail always wins over the count-based Message Limit. This
-        // may include more than N messages, but never slices the marked
-        // message or anything newer out of model context.
-        const start = anchorStart >= 0
-          ? Math.min(requestedStart, anchorStart)
-          : requestedStart;
-        effectiveMessages = messages.slice(start);
-      }
+      const effectiveMessages = agentToolChatMessages;
       const generatedImageContextPolicy = resolveGeneratedImageContextPolicy(
         settingsMap.get("imageGeneration"),
         effectiveMessages,
@@ -3338,7 +3757,7 @@ export async function assemblePrompt(
       continue;
     }
 
-    if (block.marker === "world_info_before") {
+    if (!hasAgentSyntax && block.marker === "world_info_before") {
       hasWiBefore = true;
       if (wiCache.before.length > 0) {
         for (const entry of wiCache.before) {
@@ -3358,7 +3777,7 @@ export async function assemblePrompt(
       continue;
     }
 
-    if (block.marker === "world_info_after") {
+    if (!hasAgentSyntax && block.marker === "world_info_after") {
       hasWiAfter = true;
       if (wiCache.after.length > 0) {
         for (const entry of wiCache.after) {
@@ -3380,6 +3799,7 @@ export async function assemblePrompt(
 
     // Structural markers → resolve via macro
     if (
+      !hasAgentSyntax &&
       block.marker &&
       STRUCTURAL_MARKERS.has(block.marker) &&
       MARKER_TO_MACRO[block.marker]
@@ -3403,8 +3823,8 @@ export async function assemblePrompt(
       continue;
     }
 
-    // Content-bearing markers and regular blocks → resolve block.content
-    const content = block.content || "";
+    // Content-bearing markers and regular blocks → resolve block.content.
+    let content = block.content || "";
     if (
       !phiMacroReferenced &&
       /\{\{\s*(?:jailbreak|charJailbreak|charInstruction|charPostHistoryInstructions)\s*(?:\}\}|::)/i.test(
@@ -3413,11 +3833,108 @@ export async function assemblePrompt(
     ) {
       phiMacroReferenced = true;
     }
-    const rawResolved = await evaluatePromptBlockContent(
-      content,
-      macroEnv,
-      block,
-    );
+    let rawResolved: string;
+
+    if (hasAgentSyntax && agentBlockPlan.intrinsic) {
+      if (!agentRuntimeOwner) {
+        throw new Error("Agent runtime owner is unavailable");
+      }
+      const intrinsic = agentBlockPlan.intrinsic;
+      // Keep the task expansion lazy. AgentRuntimeOwner admits the child and
+      // creates its profile signal before this thunk runs, so rejected or
+      // timed-out children cannot consume macro/retrieval work or dispatch.
+      const childRequest = {
+        profileId: intrinsic.profileId,
+        task: async (childSignal: AbortSignal): Promise<string> => {
+          if (childSignal.aborted) {
+            throw new AgentRuntimeFailure("cancelled");
+          }
+          // Child task expansion is observational. Clone the current macro
+          // environment so handlers can populate temporary variables or other
+          // state without mutating the main assembly environment.
+          const taskMacroEnv = cloneEnv(macroEnv);
+          taskMacroEnv.commit = false;
+          taskMacroEnv.extra = cloneMacroTaskValue(
+            macroEnv.extra,
+            new WeakMap<object, unknown>(),
+          ) as Record<string, unknown>;
+          const task = await evaluatePromptBlockContent(
+            intrinsic.taskTemplate,
+            taskMacroEnv,
+            block,
+          );
+          if (childSignal.aborted) {
+            throw new AgentRuntimeFailure("cancelled");
+          }
+          return task;
+        },
+        kind: "deterministic" as const,
+        toolIds: intrinsic.toolIds,
+        stream: intrinsic.stream,
+      };
+      let outcome: AgentRunOutcome;
+      try {
+        outcome = await agentRuntimeOwner.invoke(childRequest);
+      } catch (error) {
+        // Admission failures happen before AgentRuntimeOwner can start a
+        // provider invocation. Record them through the same runtime path so
+        // optional blocks bind an empty result while the failed status still
+        // contributes to activity and the retained summary.
+        if (!(error instanceof AgentRuntimeFailure)) throw error;
+        outcome = agentRuntimeOwner.recordInvocationFailure(
+          childRequest,
+          error.code,
+        );
+      }
+      let agentContent = outcome.content;
+      if (outcome.status !== "succeeded") {
+        if (intrinsic.profile.failurePolicy === "required") {
+          throw new AgentRuntimeFailure(
+            outcome.errorCode ?? "provider_failed",
+          );
+        }
+        // Optional failures are still materialized as failed frames, but
+        // never leak a sentinel string into the authored prompt.
+        agentContent = "";
+      }
+      const sealedOutput = {
+        producerLabel: intrinsic.profile.name,
+        status: outcome.status,
+        content: agentContent,
+      };
+      const seals = agentRuntimeOwner.seals;
+      rawResolved = withAgentSealStage("intrinsic_result", () => {
+        if (intrinsic.resultName) {
+          seals.bindNamedResult(intrinsic.resultName, sealedOutput);
+        }
+        return seals.createDirectSeal(sealedOutput);
+      });
+      content = "";
+    } else {
+      if (hasAgentSyntax && agentBlockPlan.resultReferences.length > 0) {
+        if (!agentRuntimeOwner) {
+          throw new Error("Agent runtime owner is unavailable");
+        }
+        const seals = agentRuntimeOwner.seals;
+        withAgentSealStage("intrinsic_result", () => {
+          for (
+            let index = agentBlockPlan.resultReferences.length - 1;
+            index >= 0;
+            index--
+          ) {
+            const reference = agentBlockPlan.resultReferences[index];
+            const seal = seals.createNamedResultSeal(
+              reference.resultName,
+            );
+            content =
+              content.slice(0, reference.start) +
+              seal +
+              content.slice(reference.end);
+          }
+        });
+      }
+      rawResolved = await evaluatePromptBlockContent(content, macroEnv, block);
+    }
 
     // Append roles: collect for deferred application after full assembly.
     // Check BEFORE the trim gate so whitespace-only appends (e.g. lone
@@ -4021,6 +4538,16 @@ export async function assemblePrompt(
     parameters._include_usage = true;
   }
 
+  if (agentRuntimeOwner?.seals.size) {
+    // Capture every message slot before regex can clone or transform
+    // messages. The registry carries this clone-safe metadata through later
+    // transforms and rejects any unproven movement.
+    const seals = agentRuntimeOwner.seals;
+    withAgentSealStage("pre_prompt_transforms", () =>
+      seals.captureBeforePromptTransforms(result),
+    );
+  }
+
   // Prompt-target regex scripts can materially shrink or expand chat history;
   // run them before the token-budget clipper so clipping uses final content.
   await profiler.measure("prompt-regex", () =>
@@ -4035,14 +4562,28 @@ export async function assemblePrompt(
     resolvePromptMacrosAfterRegexPass(result, macroEnv)
   );
   stripEmptyTextParts(result);
+  if (agentRuntimeOwner?.seals.size) {
+    const seals = agentRuntimeOwner.seals;
+    withAgentSealStage("prompt_regex", () =>
+      seals.validateAfterTransforms(result),
+    );
+  }
+
 
   if (ctx.generationType === "continue") {
-    const finalized = finalizeContinuePrompt(
-      result,
-      ctx.continueMessageId,
-      ctx.continuePostfix ?? "",
-      completionSettings.continuePrefill === true,
-    );
+    const finalize = () =>
+      finalizeContinuePrompt(
+        result,
+        ctx.continueMessageId,
+        ctx.continuePostfix ?? "",
+        completionSettings.continuePrefill === true,
+      );
+    const seals = agentRuntimeOwner?.seals;
+    const finalized = seals?.size
+      ? withAgentSealStage("continue_reorder", () =>
+          seals.withTrustedContinueReorder(result, finalize),
+        )
+      : finalize();
     if (finalized) {
       const continued = [...result].reverse().find(
         (message) =>
@@ -4061,6 +4602,7 @@ export async function assemblePrompt(
       }
     }
   }
+
 
   // ---- Context budget clipping ----
   // A context anchor excludes all earlier chat history; otherwise drop the
@@ -4085,6 +4627,12 @@ export async function assemblePrompt(
     result,
     runtimeWorldInfoPlacements,
   );
+  if (agentRuntimeOwner?.seals.size) {
+    const seals = agentRuntimeOwner.seals;
+    withAgentSealStage("context_clipping", () =>
+      seals.retireClippedSeals(result),
+    );
+  }
 
   // Build memory stats for dry-run diagnostics
   const memoryStats: MemoryStats = {
@@ -4165,6 +4713,7 @@ export async function assemblePrompt(
         contextClipStats.chatHistoryTokensAfter;
     }
   }
+
 
   return {
     messages: result,
@@ -6383,7 +6932,6 @@ function stripReasoningFromChatHistory(
 }
 
 export const __reasoningHistoryTest = {
-  getStoredReasoningCarrier,
   stripReasoningFromChatHistory,
 };
 
@@ -8006,7 +8554,6 @@ async function legacyAssembly(
           {
             role: (m.is_user ? "user" : "assistant") as LlmMessage["role"],
             content: parts.length > 0 ? parts : resolved,
-            ...getStoredReasoningCarrier(m),
           },
           {
             id: m.id,
@@ -8021,7 +8568,6 @@ async function legacyAssembly(
           {
             role: (m.is_user ? "user" : "assistant") as LlmMessage["role"],
             content: resolved,
-            ...getStoredReasoningCarrier(m),
           },
           {
             id: m.id,

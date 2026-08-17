@@ -55,6 +55,77 @@ function initInstallerTestDb(): void {
     preset_id TEXT,
     owner_extension_identifier TEXT
   )`);
+  db.exec(`
+    CREATE TABLE preset_agent_configs (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      agents_enabled INTEGER NOT NULL,
+      allowed_modes TEXT NOT NULL,
+      default_mode TEXT NOT NULL,
+      max_invocations INTEGER NOT NULL,
+      max_tool_calls INTEGER NOT NULL,
+      main_tool_ids TEXT NOT NULL,
+      main_lore_scope TEXT NOT NULL,
+      phase_policy_json TEXT NOT NULL,
+      cognition_policy_json TEXT NOT NULL,
+      context_policy_json TEXT NOT NULL,
+      task_policy_json TEXT NOT NULL,
+      workspace_policy_json TEXT NOT NULL,
+      state TEXT NOT NULL,
+      review_code TEXT,
+      review_acknowledged INTEGER NOT NULL,
+      config_json TEXT NOT NULL,
+      config_revision INTEGER NOT NULL,
+      binding_revision INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, preset_id)
+    );
+    CREATE TABLE preset_agent_connection_slots (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      slot_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      required_capabilities TEXT NOT NULL,
+      slot_revision INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, preset_id, slot_id)
+    );
+    CREATE TABLE preset_agent_profiles (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      system_prompt TEXT NOT NULL,
+      connection_ref_kind TEXT NOT NULL,
+      slot_id TEXT,
+      tool_ids TEXT NOT NULL,
+      workspace_capabilities TEXT NOT NULL,
+      lore_scope TEXT NOT NULL,
+      allow_main_delegation INTEGER NOT NULL,
+      failure_policy TEXT NOT NULL,
+      stream_activity INTEGER NOT NULL,
+      max_output_tokens INTEGER NOT NULL,
+      timeout_ms INTEGER NOT NULL,
+      profile_revision INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, preset_id, profile_id)
+    );
+    CREATE TABLE preset_agent_slot_bindings (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      slot_id TEXT NOT NULL,
+      connection_id TEXT,
+      binding_revision INTEGER NOT NULL,
+      state TEXT NOT NULL,
+      review_code TEXT,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, preset_id, slot_id)
+    );
+  `);
 }
 
 function installPayload(
@@ -75,10 +146,76 @@ function installPayload(
   };
 }
 
+function portableRuntimeEnvelope(): Record<string, unknown> {
+  return {
+    version: 1,
+    agentConfig: {
+      portableVersion: 1,
+      agentsEnabled: true,
+      allowedModes: ["response", "agentic"],
+      defaultMode: "agentic",
+      maxInvocations: 4,
+      maxToolCalls: 8,
+      mainToolIds: [],
+      mainLoreScope: "active",
+      profiles: [],
+      connectionSlots: [],
+    },
+    contextPacks: [],
+    contextSelections: [],
+    contextRules: [],
+    taskTemplates: [],
+  };
+}
+
 beforeEach(initInstallerTestDb);
 afterEach(() => closeDatabase());
 
 describe("LumiHub preset installer metadata", () => {
+  test("routes an embedded portable runtime envelope through the atomic importer", async () => {
+    const payload = installPayload("hub-runtime", {
+      name: "Runtime Hub",
+      blocks: [],
+    });
+    const runtime = portableRuntimeEnvelope();
+    payload.presetData.agentRuntime = runtime;
+    const calls: Array<{ userId: string; input: unknown }> = [];
+    const result = await installPreset("request-runtime", payload, USER_ID, {
+      importPortablePresetRuntime: (userId, input) => {
+        calls.push({ userId, input });
+        return {
+          preset: { id: "imported-runtime", name: "Runtime Hub" },
+          agent_config: { version: 2, agentsEnabled: false, allowedModes: ["response"], defaultMode: "response" },
+          agent_config_review: { state: "review_required", reasonCode: "foreign_import", unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false },
+        } as any;
+      },
+    });
+    expect(result).toEqual({ requestId: "request-runtime", success: true, presetId: "imported-runtime", presetName: "Runtime Hub" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.userId).toBe(USER_ID);
+    const input = calls[0]?.input;
+    const forwardedRuntime = input && typeof input === "object" && "agentRuntime" in input ? input.agentRuntime : undefined;
+    expect(forwardedRuntime).toEqual(runtime);
+  });
+
+  test("rejects a malformed embedded runtime envelope before importer dispatch", async () => {
+    const payload = installPayload("hub-runtime-invalid", {
+      name: "Invalid Runtime Hub",
+      blocks: [],
+    });
+    payload.presetData.agentRuntime = { version: 2 };
+    let called = false;
+    const result = await installPreset("request-runtime-invalid", payload, USER_ID, {
+      importPortablePresetRuntime: () => {
+        called = true;
+        throw new Error("must not dispatch");
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("AGENT_RUNTIME_PORTABLE_INVALID");
+    expect(called).toBe(false);
+  });
+
   test("preserves internal passthrough metadata on create and serialized metadata on update", async () => {
     const first = await installPreset("request-1", installPayload("hub-1", {
       name: "Hub preset",
@@ -131,6 +268,104 @@ describe("LumiHub preset installer metadata", () => {
       _lumiverse_lumihub_id: "hub-1",
       _lumiverse_install_source: "lumihub",
     });
+  });
+
+  test("validates authored agentConfig but never persists executable metadata without normalized storage", async () => {
+    const agentConfig = {
+      version: 1,
+      enabled: true,
+      maxInvocations: 64,
+      maxToolCalls: 64,
+      mainToolIds: ["chat_search_history"],
+      mainLoreScope: "active",
+      profiles: [{
+        id: "writer",
+        name: "Writer",
+        systemPrompt: "literal",
+        connectionProfileId: null,
+        toolIds: ["lore_search_entries"],
+        loreScope: "active",
+        allowMainDelegation: true,
+        failurePolicy: "required",
+        streamActivity: true,
+        maxOutputTokens: 64,
+        timeoutMs: 5_000,
+      }],
+    };
+    const first = await installPreset("request-agent-1", installPayload("hub-agent", {
+      name: "Agent Hub",
+      blocks: [],
+      passthroughMetadata: { agentConfig, untouched: { value: 1 } },
+    }));
+    expect(first.success).toBe(true);
+    const created = getPreset(USER_ID, first.presetId!);
+    expect(created?.metadata.agentConfig).toBeUndefined();
+    expect(created?.metadata.agentConfigReviewRequired).toBeUndefined();
+    expect(created?.metadata.untouched).toEqual({ value: 1 });
+
+    const second = await installPreset("request-agent-2", installPayload("hub-agent", {
+      name: "Agent Hub Updated",
+      blocks: [],
+      metadata: { agentConfig },
+    }));
+    expect(second.success).toBe(true);
+    const updated = getPreset(USER_ID, first.presetId!);
+    expect(updated?.metadata.agentConfig).toBeUndefined();
+
+    const alreadyDisabled = await installPreset("request-agent-3", installPayload("hub-agent-disabled", {
+      name: "Hub Agent Already Disabled",
+      blocks: [],
+      metadata: {
+        agentConfig: { ...agentConfig, enabled: false },
+        untouched: { value: 2 },
+      },
+    }));
+    expect(alreadyDisabled.success).toBe(true);
+    const disabledCreated = getPreset(USER_ID, alreadyDisabled.presetId!);
+    expect(disabledCreated?.metadata.agentConfig).toBeUndefined();
+    expect(disabledCreated?.metadata.agentConfigReviewRequired).toBeUndefined();
+    expect(disabledCreated?.metadata.untouched).toEqual({ value: 2 });
+
+    const invalid = await installPreset("request-agent-4", installPayload("hub-agent-invalid", {
+      name: "Hub Agent Invalid",
+      blocks: [],
+      metadata: {
+        agentConfig: { ...agentConfig, mainToolIds: ["not_a_tool"] },
+      },
+    }));
+    expect(invalid.success).toBe(false);
+    expect(invalid.error).toContain("agentConfig.mainToolIds[0]");
+  });
+
+  test("validates legacy limits without persisting executable metadata", async () => {
+    const legacyConfig = {
+      version: 1,
+      enabled: true,
+      maxInvocations: 64,
+      mainToolIds: [],
+      mainLoreScope: "active",
+      profiles: [],
+    };
+    const legacy = await installPreset("request-agent-legacy", installPayload("hub-agent-legacy", {
+      name: "Legacy Agent",
+      blocks: [],
+      metadata: { agentConfig: legacyConfig },
+    }));
+    expect(legacy.success).toBe(true);
+    expect(getPreset(USER_ID, legacy.presetId!)?.metadata.agentConfig).toBeUndefined();
+
+    for (const maxToolCalls of [1, 64, Number.MAX_SAFE_INTEGER]) {
+      const result = await installPreset(
+        `request-agent-${maxToolCalls}`,
+        installPayload(`hub-agent-${maxToolCalls}`, {
+          name: `Agent ${maxToolCalls}`,
+          blocks: [],
+          metadata: { agentConfig: { ...legacyConfig, maxToolCalls } },
+        }),
+      );
+      expect(result.success).toBe(true);
+      expect(getPreset(USER_ID, result.presetId!)?.metadata.agentConfig).toBeUndefined();
+    }
   });
 
   test("preserves a locally-added passthrough key when an update omits it", async () => {

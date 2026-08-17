@@ -1,3 +1,11 @@
+import type {
+  AgentConfigReview,
+  AgentConfigV2,
+  AgentContextActivationRule,
+  AgentContextPackSelection,
+  AgentTaskTemplate,
+} from '@/lib/loom/types'
+
 // ---- Character ----
 export type CharacterLibraryScope = 'mine' | 'shared';
 
@@ -230,6 +238,24 @@ export interface MessageAttachment {
   swipe_id?: number;
 }
 
+export interface AgentUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface AgentSummary {
+  status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
+  invocationCount: number;
+  succeededCount: number;
+  failedCount: number;
+  cancelledCount: number;
+  timedOutCount: number;
+  toolCallCount: number;
+  usage: AgentUsage;
+  errorCodes?: string[];
+}
+
 // ---- Message ----
 export interface MessageExtra {
   persona_id?: string;
@@ -244,6 +270,10 @@ export interface MessageExtra {
     action_id: string;
     used_at: number;
   }>;
+  /** Active-swipe compact child-agent summary; never contains prompts or results. */
+  agentActivity?: AgentSummary;
+  /** Full-message projection used by swipe mutation endpoints. */
+  agentActivityBySwipe?: (AgentSummary | null)[];
   [key: string]: any;
 }
 
@@ -299,7 +329,13 @@ export interface UpdateMessageInput {
 }
 
 // ---- Connection Profile ----
-export interface ConnectionProfile {
+export interface ConnectionReviewFields {
+  /** Imported/repairable connections remain inert until explicitly reviewed. */
+  review_required: boolean;
+  review_code: string | null;
+}
+
+export interface ConnectionProfile extends ConnectionReviewFields {
   id: string;
   name: string;
   provider: string;
@@ -323,8 +359,7 @@ export interface CreateConnectionProfileInput {
   is_default?: boolean;
   metadata?: Record<string, any>;
 }
-
-export type UpdateConnectionProfileInput = Partial<CreateConnectionProfileInput>;
+export type UpdateConnectionProfileInput = Partial<CreateConnectionProfileInput> & { reviewed?: boolean };
 
 export interface ProviderInfo {
   id: string
@@ -332,6 +367,12 @@ export interface ProviderInfo {
   default_url: string
   capabilities?: {
     parameters?: Record<string, unknown>
+    supportsStreaming?: boolean
+    toolCalling?: boolean
+    nativeToolContinuation?: boolean
+    toolContinuationMode?: 'native' | 'legacy' | 'unsupported'
+    toolsDisabledFinalization?: boolean
+    supportsToolFinalization?: boolean
   }
 }
 
@@ -397,7 +438,7 @@ export interface PollinationsAuthUrlResponse {
 }
 
 // ---- Image Gen Connection Profile ----
-export interface ImageGenConnectionProfile {
+export interface ImageGenConnectionProfile extends ConnectionReviewFields {
   id: string;
   name: string;
   provider: string;
@@ -422,7 +463,7 @@ export interface CreateImageGenConnectionInput {
   api_key?: string;
 }
 
-export type UpdateImageGenConnectionInput = Partial<CreateImageGenConnectionInput>;
+export type UpdateImageGenConnectionInput = Partial<CreateImageGenConnectionInput> & { reviewed?: boolean };
 
 export interface ImageGenConnectionTestResult {
   success: boolean;
@@ -472,7 +513,7 @@ export interface ImageGenProviderInfo {
 }
 
 // ---- STT Connection ----
-export interface SttConnectionProfile {
+export interface SttConnectionProfile extends ConnectionReviewFields {
   id: string;
   name: string;
   provider: string;
@@ -497,7 +538,7 @@ export interface CreateSttConnectionInput {
   api_key?: string;
 }
 
-export type UpdateSttConnectionInput = Partial<CreateSttConnectionInput>;
+export type UpdateSttConnectionInput = Partial<CreateSttConnectionInput> & { reviewed?: boolean };
 
 export interface SttConnectionTestResult {
   success: boolean;
@@ -525,7 +566,7 @@ export interface SttProviderInfo {
 }
 
 // ---- TTS Connection ----
-export interface TtsConnectionProfile {
+export interface TtsConnectionProfile extends ConnectionReviewFields {
   id: string;
   name: string;
   provider: string;
@@ -552,7 +593,7 @@ export interface CreateTtsConnectionInput {
   api_key?: string;
 }
 
-export type UpdateTtsConnectionInput = Partial<CreateTtsConnectionInput>;
+export type UpdateTtsConnectionInput = Partial<CreateTtsConnectionInput> & { reviewed?: boolean };
 
 export interface TtsConnectionTestResult {
   success: boolean;
@@ -757,6 +798,13 @@ export interface Preset {
   prompt_order: any[];
   prompts: Record<string, any>;
   metadata: Record<string, any>;
+  agent_config?: AgentConfigV2 | null;
+  agent_config_revision?: number;
+  agent_config_review?: AgentConfigReview | null;
+  agent_slot_bindings?: Record<string, string | null>;
+  agent_context_pack_selections?: AgentContextPackSelection[];
+  agent_context_rules?: AgentContextActivationRule[];
+  agent_task_templates?: AgentTaskTemplate[];
   created_at: number;
   updated_at: number;
   /** Monotonic persisted revision used for conditional preset updates. */
@@ -770,6 +818,8 @@ export interface CreatePresetInput {
   prompt_order?: any[];
   prompts?: Record<string, any>;
   metadata?: Record<string, any>;
+  /** Import-only preset-bound regex companions; never persisted in the preset row. */
+  regex_scripts?: readonly Record<string, unknown>[];
 }
 
 export type UpdatePresetInput = Partial<CreatePresetInput> & {

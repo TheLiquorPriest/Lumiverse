@@ -1,4 +1,15 @@
 {
+  "connectionReview": {
+    "title": "Vérification requise",
+    "description": "Cette connexion importée est désactivée jusqu'à sa vérification et son activation.",
+    "enable": "Activer la connexion",
+    "enabling": "Activation…",
+    "reasons": {
+      "foreignImport": "La connexion importée doit être approuvée localement.",
+      "repairRequired": "Les données de connexion doivent être réparées avant activation.",
+      "unknown": "La connexion doit être vérifiée avant activation."
+    }
+  },
   "drawer": {
     "profile": {
       "shortName": "Profil",
@@ -3070,7 +3081,8 @@
     "unknownProvider": "Inconnu",
     "editorTabs": {
       "ariaLabel": "Onglets de l’éditeur de préréglages",
-      "preset": "Préréglage"
+      "preset": "Préréglage",
+      "agenticRuntime": "Runtime agentique"
     },
     "tokens": " jetons",
     "category": {
@@ -3316,6 +3328,509 @@
       "sourceDefault": "DÉFAUT",
       "reapplied": "Profil par défaut réappliqué",
       "alreadyDefault": "Les états de blocage correspondent déjà aux valeurs par défaut"
+    },
+    "agenticRuntime": {
+      "eyebrow": "Environnement d’exécution prédéfini",
+      "title": "Environnement d’exécution agentique",
+      "description": "Configurez l’activation, les agents enfants, les instructions par phases, le contexte, les tâches, la politique d’espace de travail et les réparations locales dans un même brouillon versionné.",
+      "status": {
+        "enabled": "Activé",
+        "disabled": "Désactivé"
+      },
+      "navigation": {
+        "ariaLabel": "Sections de l’environnement d’exécution agentique",
+        "saveBeforePresetAction": "Enregistrez ou corrigez le brouillon de l’environnement d’exécution agentique avant de modifier, d’importer ou d’exporter des préréglages."
+      },
+      "sections": {
+        "activation": {
+          "nav": "Activation et mode",
+          "title": "Activation et mode",
+          "description": "Choisissez les modes autorisés par ce préréglage. Le choix entre une conversation et un tour unique est traité séparément et ne modifie jamais ce préréglage."
+        },
+        "agents": {
+          "nav": "Agents",
+          "title": "Agents",
+          "description": "Définissez des profils enfants réutilisables et des références portables d’emplacements de connexion."
+        },
+        "tools": {
+          "nav": "Outils principaux et dépendances",
+          "title": "Outils principaux et dépendances",
+          "description": "N’accordez que les outils de récupération détenus par l’hôte et les budgets requis par ce préréglage."
+        },
+        "phases": {
+          "nav": "Instructions par phases",
+          "title": "Instructions par phases",
+          "description": "Sélectionnez des blocs Loom existants selon leur révision exacte. Agentic n’ajoute pas un second système d’invites libres."
+        },
+        "context": {
+          "nav": "Contexte progressif",
+          "title": "Contexte progressif",
+          "description": "Sélectionnez les révisions de packs autorisées et les règles d’activation déterministes."
+        },
+        "tasks": {
+          "nav": "Tâches dynamiques",
+          "title": "Tâches dynamiques",
+          "description": "Définissez des modèles de tâches bornés, la clôture des dépendances, le caractère obligatoire et l’activation."
+        },
+        "workspace": {
+          "nav": "Conservation et partage de l’espace de travail",
+          "title": "Conservation et partage de l’espace de travail",
+          "description": "Choisissez la conservation et le partage en lecture seule dans les limites imposées par l’hôte."
+        },
+        "repair": {
+          "nav": "Portabilité et réparation",
+          "title": "Portabilité et réparation",
+          "description": "Résolvez les emplacements locaux, les révisions obsolètes, les éléments importés à examiner et les incompatibilités de capacités avant l’activation."
+        }
+      },
+      "activation": {
+        "reviewTitle": "L’examen local est incomplet",
+        "reviewDescription": "Confirmez chaque élément à examiner et effectuez chaque réparation requise avant d’activer cette configuration importée.",
+        "enable": "Activer les agents du préréglage",
+        "enableHint": "Rend la configuration créée utilisable en mode Response et, lorsqu’elle est entièrement prête, en mode Agentic.",
+        "allowedModes": "Modes autorisés",
+        "defaultMode": "Mode par défaut du préréglage"
+      },
+      "modes": {
+        "response": "Response",
+        "responseHint": "Utilise le processus de génération établi et reste disponible à des fins de réparation ou de compatibilité.",
+        "agentic": "Agentic",
+        "agenticHint": "Utilise la machine à phases fermée à tour unique uniquement lorsque toutes les vérifications de l’environnement d’exécution effectif sont prêtes."
+      },
+      "agents": {
+        "connectionRef": "Emplacement de connexion portable"
+      },
+      "generationTypes": {
+        "normal": "Normal",
+        "continue": "Continuer",
+        "regenerate": "Régénérer",
+        "swipe": "Balayer"
+      },
+      "phases": {
+        "names": {
+          "assemble": "Assembler",
+          "work": "Travailler",
+          "complete": "Terminer",
+          "render": "Effectuer le rendu",
+          "prepare_commit": "Préparer la validation",
+          "committing": "Validation en cours",
+          "committed": "Validé",
+          "commit_failed": "Échec de validation",
+          "exhausted": "Épuisé",
+          "failed": "Échec",
+          "cancelled": "Annulé",
+          "timed_out": "Délai dépassé"
+        },
+        "workPolicy": {
+          "title": "Politique de travail",
+          "description": "Instructions disponibles uniquement pendant le travail privé de l’agent."
+        },
+        "workspaceUsage": {
+          "title": "Utilisation de l’espace de travail",
+          "description": "Instructions relatives à l’utilisation des tâches bornées, des enregistrements et des soumissions."
+        },
+        "completionCriteria": {
+          "title": "Critères d’achèvement",
+          "description": "Instructions évaluées avant que l’hôte n’accepte l’achèvement."
+        },
+        "renderPolicy": {
+          "title": "Politique de rendu",
+          "description": "Instructions utilisées uniquement pour le rendu final avec les outils désactivés."
+        },
+        "stale": "La révision du bloc a changé — sélectionnez-la à nouveau avant d’enregistrer",
+        "revision": "Révision {{revision}}"
+      },
+      "context": {
+        "addPack": "Révision de pack autorisée",
+        "choosePack": "Choisir une révision de pack",
+        "revisionLabel": "Révision {{revision}}",
+        "removePack": "Supprimer {{name}}",
+        "removePackInUse": "Cette révision de pack est référencée par une règle d’activation.",
+        "addRule": "Ajouter une règle d’activation",
+        "ruleId": "ID de la règle",
+        "ruleReference": "Révision de pack",
+        "unavailableReference": "Révision indisponible {{id}}",
+        "referenceHint": "Choisissez la révision exacte du pack autorisé pour cette règle.",
+        "required": "Contexte requis",
+        "requiredHint": "Un échec ou un accès révoqué bloque l’achèvement en mode Agentic au lieu d’omettre silencieusement ce contexte.",
+        "dependencies": "Règles dépendantes",
+        "dependency": "Dépend de {{name}}",
+        "removeRule": "Supprimer la règle",
+        "scopeLabel": "Portées autorisées",
+        "alwaysInclude": "Toujours inclure",
+        "alwaysIncludeHint": "Gardez cette révision sélectionnée active sans attendre une règle d’activation.",
+        "alwaysIncludeFor": "Toujours inclure {{name}}",
+        "scopes": { "preset": "Préréglage", "chat": "Chat", "world_book": "Livre du monde" },
+        "scopeUnavailable": "Informations de portée indisponibles",
+        "attachmentRequired": "Pièce jointe obligatoire",
+        "attachmentOptional": "Pièce jointe facultative",
+        "attachmentUnavailable": "État de la pièce jointe indisponible",
+        "quarantineTitle": "La politique de contexte doit être réparée",
+        "quarantineHint": "Les valeurs de contexte importées sont conservées et isolées. Réparez-les ou supprimez-les explicitement avant d’enregistrer.",
+        "quarantinedSelection": "Sélection de pack isolée",
+        "quarantinedSelectionHint": "Cette valeur importée n’est pas un instantané de pack valide et ne peut pas être utilisée.",
+        "quarantinedRule": "Règle d’activation isolée",
+        "quarantinedRuleHint": "Cette valeur importée n’est pas une règle d’activation valide et ne peut pas être utilisée.",
+        "repairPolicy": "Réparer la politique à partir des références valides",
+        "discardQuarantined": "Supprimer la valeur de contexte isolée"
+      },
+      "tasks": {
+        "add": "Ajouter un modèle de tâche",
+        "defaultName": "Tâche {{number}}",
+        "id": "ID du modèle",
+        "label": "Libellé",
+        "description": "Description de la tâche",
+        "required": "Obligatoire",
+        "optional": "Facultatif",
+        "requiredHint": "Les tâches obligatoires activées doivent être résolues avant l’achèvement. Les tâches créées par le modèle restent facultatives.",
+        "dependencies": "Modèles de dépendances",
+        "quarantined": "Modèle de tâche en quarantaine",
+        "quarantinedHint": "Ce modèle de tâche importé est invalide et ne peut pas être modifié avant d’être supprimé.",
+        "discardQuarantined": "Supprimer le modèle de tâche en quarantaine",
+        "remove": "Supprimer le modèle"
+      },
+      "workspace": {
+        "retention": "Conservation",
+        "sharing": "Partage",
+        "retentionOptions": {
+          "turn_terminal": "Fin du tour",
+          "chat_lifetime": "Durée de vie de la conversation"
+        },
+        "retentionHints": {
+          "turn_terminal": "Conserver l’espace de travail en lecture seule uniquement pendant la fenêtre de conservation finale du tour.",
+          "chat_lifetime": "Conserver les métadonnées publiées et autorisées de l’espace de travail pendant toute la durée de vie de la conversation."
+        },
+        "sharingOptions": {
+          "root_only": "Racine uniquement",
+          "view_only": "Participants en lecture seule"
+        },
+        "sharingHints": {
+          "root_only": "Seul l’agent racine reçoit les capacités de l’espace de travail.",
+          "view_only": "Les personnes peuvent consulter l’espace de travail expurgé ; celui-ci reste non modifiable."
+        },
+        "ceilings": "Limites effectives de l’hôte",
+        "ceilingsHint": "Mesures de protection informatives imposées par cet hôte. Les préréglages et les importations ne peuvent pas les relever.",
+        "readOnly": "Lecture seule",
+        "loading": "Chargement des limites de l’hôte…",
+        "ceilingLabels": {
+          "childAdmissions": "Admissions d’agents enfants",
+          "aggregateToolCalls": "Appels d’outils cumulés",
+          "logicalProviderRequests": "Requêtes logiques du fournisseur",
+          "physicalDispatchAttempts": "Tentatives de distribution physiques",
+          "childOutputTokens": "Jetons de sortie des agents enfants",
+          "rootWallClockMs": "Temps réel de la racine (ms)",
+          "activityEvents": "Événements d’activité",
+          "activityBytes": "Octets d’activité",
+          "lifecycleLogRecords": "Enregistrements du journal du cycle de vie",
+          "activeRootsPerUser": "Racines actives par utilisateur",
+          "activeRootsProcess": "Racines actives par processus",
+          "providerDispatchesPerUser": "Distributions du fournisseur par utilisateur",
+          "providerDispatchesProcess": "Distributions du fournisseur par processus",
+          "toolExecutionsPerUser": "Exécutions d’outils par utilisateur",
+          "toolExecutionsProcess": "Exécutions d’outils par processus"
+        }
+      },
+      "repair": {
+        "acknowledge": "J’ai examiné cet élément",
+        "chooseConnection": "Choisir une connexion locale",
+        "searchConnections": "Rechercher des connexions…",
+        "noConnections": "Aucune connexion compatible",
+        "mapSlot": "Associer {{name}} à une connexion locale",
+        "ready": "Aucun élément de portabilité ou de réparation ne nécessite d’intervention.",
+        "boundary": "Seuls les agents du préréglage, les outils principaux de récupération, les blocs Loom, les packs de contexte, les tâches et la politique d’espace de travail sont disponibles ici. Les outils d’extension, les hooks, les autorisations de sortie et les éditeurs de rôles ne font pas partie de cet environnement d’exécution.",
+        "kinds": {
+          "unresolved_slot": "Emplacement de connexion non résolu",
+          "stale_slot": "Association de connexion obsolète",
+          "invalid_rule": "Règle de cognition non valide",
+          "invalid_pack": "Pack de contexte indisponible",
+          "disabled_import": "Configuration importée désactivée",
+          "capability_mismatch": "Incompatibilité de capacité du fournisseur",
+          "stale_block": "Révision de bloc Loom obsolète",
+          "unknown": "Élément d’exécution à réparer"
+        },
+        "actions": {
+          "acknowledge": "Examiner",
+          "map_slot": "Associer une connexion",
+          "select_revision": "Sélectionner une révision",
+          "edit_rule": "Modifier la règle",
+          "choose_response": "Utiliser Response",
+          "unknown": "Traiter cet élément"
+        },
+        "reasons": {
+          "unresolved_slot": "Choisissez une connexion locale authentifiée.",
+          "stale_slot": "Confirmez ou remplacez l’association locale précédente.",
+          "review_required": "Une confirmation locale explicite est requise.",
+          "repair_required": "Réparez les données créées avant l’activation.",
+          "capability_mismatch": "Le fournisseur associé ne dispose pas d’une capacité requise.",
+          "unknown": "Cet élément d’exécution doit être réparé."
+        }
+      },
+      "predicate": {
+        "kind": "Type de condition",
+        "add": "Ajouter une condition",
+        "remove": "Supprimer la condition",
+        "generationType": "Type de génération",
+        "phase": "Phase",
+        "variableKey": "Nom de la variable du préréglage",
+        "factKey": "Nom du fait relatif au participant",
+        "operator": "Opérateur",
+        "value": "Valeur",
+        "valueType": "Type de valeur",
+        "values": "Valeurs d’appartenance",
+        "addValue": "Ajouter une valeur",
+        "removeValue": "Supprimer la valeur {{number}}",
+        "valueTypes": { "string": "Texte", "number": "Nombre", "boolean": "Booléen", "stringList": "Liste de textes" },
+        "boolean": { "true": "Vrai", "false": "Faux" },
+        "tool": "Outil",
+        "available": "L’outil doit être disponible",
+        "task": "Modèle de tâche",
+        "chooseTask": "Choisir une tâche",
+        "transition": "Transition",
+        "kinds": {
+          "all": "Toutes les conditions",
+          "any": "N’importe quelle condition",
+          "not": "Non",
+          "generation_type": "Type de génération",
+          "phase": "Phase actuelle",
+          "preset_variable": "Variable du préréglage",
+          "participant_fact": "Fait relatif au participant",
+          "tool_available": "Disponibilité de l’outil",
+          "task_transition": "Transition de tâche"
+        },
+        "operators": {
+          "equals": "Est égal à",
+          "in": "Dans la liste",
+          "includes": "Inclut",
+          "present": "Est présent"
+        },
+        "transitions": {
+          "pending": "En attente",
+          "active": "Actif",
+          "blocked": "Bloqué",
+          "submitted": "Soumis",
+          "accepted": "Accepté",
+          "done": "Terminé"
+        }
+      },
+      "save": {
+        "action": "Enregistrer l’environnement d’exécution agentique",
+        "saving": "Enregistrement du brouillon complet de l’environnement d’exécution…",
+        "saved": "Environnement d’exécution agentique enregistré",
+        "unsaved": "Modifications non enregistrées de l’environnement d’exécution agentique",
+        "reset": "Réinitialiser le brouillon",
+        "conflict": "Le préréglage ou l’environnement d’exécution a été modifié ailleurs. Rechargez et examinez les modifications avant d’enregistrer.",
+        "error": "L’environnement d’exécution agentique n’a pas pu être enregistré. Votre brouillon reste disponible."
+      },
+      "validation": {
+        "invalid_config": "La configuration de l’environnement d’exécution n’est pas valide.",
+        "invalid_modes": "Les modes autorisés doivent être uniques, ordonnés et inclure Response en premier.",
+        "invalid_default_mode": "Le mode par défaut doit être autorisé.",
+        "invalid_profile": "Un profil enfant est incomplet ou utilise un ID en double.",
+        "invalid_slot": "Un emplacement de connexion portable n’est pas valide.",
+        "unresolved_slot": "Associez chaque emplacement de connexion requis.",
+        "invalid_block_reference": "Un bloc Loom sélectionné n’existe plus.",
+        "stale_block_revision": "La révision d’un bloc Loom sélectionné a changé.",
+        "invalid_predicate": "Une condition de cognition est incomplète.",
+        "predicate_limit_exceeded": "La condition de cognition dépasse les limites de profondeur ou de taille de l’hôte.",
+        "invalid_task_template": "Un modèle de tâche n’est pas valide.",
+        "invalid_task_policy": "Les références de la stratégie de tâches doivent correspondre aux modèles déclarés.",
+        "missing_task_dependency": "Une dépendance de tâche n’existe plus.",
+        "cyclic_task_dependency": "Les dépendances de tâches doivent être acycliques.",
+        "invalid_context_rule": "Une règle d’activation du contexte n’est pas valide.",
+        "missing_context_pack_revision": "Sélectionnez la révision exacte du pack de contexte utilisée par chaque règle.",
+        "invalid_context_policy": "La politique de contexte n’est pas valide.",
+        "context_policy_reference": "Chaque pack de contexte et chaque règle sélectionnés doivent être référencés par la politique.",
+        "invalid_context_selection": "La révision du pack de contexte sélectionnée n’est pas valide.",
+        "missing_context_dependency": "Une dépendance de règle de contexte n’existe plus.",
+        "cyclic_context_dependency": "Les dépendances des règles de contexte doivent être acycliques.",
+        "review_acknowledgement_unknown": "Supprimez les confirmations qui ne font pas partie de la revue actuelle.",
+        "review_acknowledgement_required": "Confirmez chaque élément importé à examiner avant l’activation."
+      }
+    },
+    "agentsTools": {
+      "eyebrow": "Capacités du préréglage",
+      "title": "Agents et outils",
+      "description": "Autorisez les agents enfants réutilisables et les outils de recherche intégrés que ce préréglage peut utiliser. Rien ne s’exécute avant l’activation et l’enregistrement.",
+      "limits": {
+        "title": "Plafonds d’exécution de l’hôte",
+        "description": "Plafonds effectifs en lecture seule imposés par cet hôte Lumiverse. Les budgets du préréglage restent portables, mais l’exécution ne peut pas dépasser ces valeurs.",
+        "readOnly": "Lecture seule",
+        "loading": "Chargement des plafonds de l’hôte…",
+        "rows": {
+          "childAdmissions": "Admissions d’agents enfants",
+          "aggregateToolCalls": "Appels d’outils cumulés",
+          "logicalProviderRequests": "Requêtes logiques du fournisseur",
+          "physicalDispatchAttempts": "Tentatives de distribution physiques",
+          "childOutputTokens": "Jetons de sortie des agents enfants",
+          "rootWallClockMs": "Temps réel de la racine (ms)",
+          "activityEvents": "Événements d’activité",
+          "activityBytes": "Octets d’activité",
+          "lifecycleLogRecords": "Enregistrements du journal du cycle de vie",
+          "activeRootsPerUser": "Racines actives par utilisateur",
+          "activeRootsProcess": "Racines actives par processus",
+          "providerDispatchesPerUser": "Distributions du fournisseur par utilisateur",
+          "providerDispatchesProcess": "Distributions du fournisseur par processus",
+          "toolExecutionsPerUser": "Exécutions d’outils par utilisateur",
+          "toolExecutionsProcess": "Exécutions d’outils par processus"
+        }
+      },
+      "maxInvocations": {
+        "label": "Invocations maximales d’agents enfants",
+        "hint": "Nombre maximal d’exécutions d’agents enfants par génération. Par défaut : 64 ; minimum : 1 ; aucun maximum imposé par le préréglage. Saisissez un entier sûr.",
+        "error": "Saisissez un entier sûr supérieur ou égal à 1."
+      },
+      "maxToolCalls": {
+        "label": "Nombre maximal d’appels d’outils",
+        "hint": "Nombre maximal d’appels d’outils cumulés par génération. Par défaut : 64 ; minimum : 1 ; aucun maximum imposé par le préréglage. Saisissez un entier sûr.",
+        "error": "Saisissez un entier sûr supérieur ou égal à 1."
+      },
+      "enabled": "Activé",
+      "disabled": "Désactivé",
+      "enableAria": "Activer les agents et outils pour ce préréglage",
+      "review": {
+        "title": "Vérifier les capacités importées",
+        "description": "Les configurations d’agents importées sont désactivées par sécurité. Vérifiez les profils, connexions, outils et accès au lore avant de les activer sur cet appareil.",
+        "action": "Marquer comme vérifié"
+      },
+      "unsupported": {
+        "title": "Configuration d’agents non prise en charge",
+        "description": "Ce préréglage contient des paramètres que cet éditeur ne peut pas lire en toute sécurité. Une modification crée une nouvelle configuration désactivée ; les métadonnées actuelles restent intactes jusqu’à l’enregistrement."
+      },
+      "main": {
+        "title": "Outils du modèle principal",
+        "description": "Choisissez les outils de recherche accessibles directement au modèle principal, indépendamment de chaque profil enfant."
+      },
+      "tools": {
+        "legend": "Outils principaux autorisés",
+        "lore_list_books": {
+          "label": "Lister les livres de lore",
+          "description": "Parcourir les livres de lore disponibles et leur provenance."
+        },
+        "lore_get_book": {
+          "label": "Obtenir un livre de lore",
+          "description": "Lire un livre activé au moyen de pages limitées."
+        },
+        "lore_list_entries": {
+          "label": "Lister les entrées de lore",
+          "description": "Parcourir les entrées activées du livre sélectionné."
+        },
+        "lore_get_entry": {
+          "label": "Obtenir une entrée de lore",
+          "description": "Lire une entrée activée par son identifiant exact."
+        },
+        "lore_search_entries": {
+          "label": "Rechercher dans le lore",
+          "description": "Rechercher du contenu activé dans la portée accordée."
+        },
+        "chat_search_history": {
+          "label": "Rechercher dans le chat actuel",
+          "description": "Rechercher dans l’historique immuable choisi pour cette génération."
+        }
+      },
+      "scope": {
+        "label": "Plafond d’accès au lore",
+        "active": "Lore actif",
+        "all_owned": "Tout le lore possédé",
+        "activeHint": "Uniquement le lore déjà disponible pour cette génération.",
+        "all_ownedHint": "Peut rechercher tous les livres de lore activés appartenant à l’utilisateur local."
+      },
+      "profiles": {
+        "title": "Profils d’agents enfants",
+        "description": "Les profils définissent un modèle subordonné réutilisable, ses autorisations et ses limites d’échec.",
+        "add": "Ajouter un profil",
+        "defaultName": "Agent {{number}}",
+        "listAria": "Profils d’agents enfants",
+        "moveUp": "Monter {{name}}",
+        "moveDown": "Descendre {{name}}",
+        "delete": "Supprimer {{name}}",
+        "confirmDeleteTitle": "Supprimer ce profil ?",
+        "confirmDeleteDescription": "Les blocs qui référencent ce profil deviendront invalides. La modification n’est appliquée qu’à l’enregistrement.",
+        "name": "Nom affiché",
+        "id": "ID du profil",
+        "idHint": "ID snake_case stable utilisé dans la syntaxe. Renommer le profil ne le modifie pas.",
+        "connection": "Profil de connexion",
+        "selectConnection": "Sélectionner une connexion",
+        "searchConnections": "Rechercher des connexions…",
+        "noConnections": "Aucun profil de connexion configuré",
+        "useMainConnection": "Utiliser la connexion principale",
+        "connectionHint": "Utilisez la connexion principale actuelle ou associez cet enfant à un profil existant.",
+        "systemPrompt": "Invite système",
+        "systemPromptPlaceholder": "Définissez le rôle, les limites et la sortie attendue de cet agent.",
+        "systemPromptHint": "Instruction littérale de l’agent enfant. Les macros du préréglage ne sont pas évaluées ici.",
+        "tools": "Outils autorisés",
+        "workspaceCapabilities": "Opérations de l’espace de travail",
+        "workspaceCapabilitiesHint": "Accordez uniquement les opérations nécessaires à cet agent enfant. Une sélection vide n’accorde aucune opération.",
+        "delegation": "Autoriser la délégation par le modèle principal",
+        "delegationHint": "Permet au modèle principal de choisir ce profil via agent_delegate.",
+        "activity": "Autoriser l’activité en direct",
+        "activityHint": "Autorise les états et l’activité des outils lorsque la syntaxe demande le streaming. Le texte enfant n’est jamais diffusé.",
+        "failurePolicy": "Politique d’échec",
+        "failureRequired": "Requis — arrêter la génération",
+        "failureOptional": "Facultatif — continuer avec un résultat vide",
+        "failureHint": "Contrôle les échecs des blocs déterministes.",
+        "maxOutputTokens": "Jetons de sortie maximum",
+        "timeout": "Délai (secondes)",
+        "timeoutHint": "Limite par appel, en secondes entières (minimum 5 secondes, sans maximum imposé par le préréglage).",
+        "empty": "Ajoutez un profil enfant pour définir sa connexion, ses outils et son invite."
+      },
+      "syntax": {
+        "title": "Syntaxe de l’invite",
+        "description": "Copiez un producteur de résultat nommé pour la création manuelle, ou créez un bloc utilisateur direct et activé, réutilisable sans conflit de nom de résultat.",
+        "taskPlaceholder": "Décrivez la tâche de cet agent.",
+        "copy": "Copier la syntaxe de l’agent",
+        "copied": "Copié",
+        "copyFailed": "L’accès au presse-papiers a échoué. Sélectionnez et copiez la syntaxe manuellement.",
+        "createBlock": "Créer un bloc d’invite avec cet agent",
+        "saveFirst": "Enregistrez la configuration avant de créer un bloc.",
+        "blockName": "Agent : {{name}}"
+      },
+      "navigation": {
+        "saveBeforePresetAction": "Enregistrez la configuration Agents et outils avant de changer, d’importer ou d’exporter des préréglages."
+      },
+      "actions": {
+        "cancel": "Annuler",
+        "delete": "Supprimer"
+      },
+      "save": {
+        "reviewFirst": "Vérifiez les capacités importées avant de les enregistrer ou de les activer.",
+        "notConfigured": "Les agents et outils ne sont pas configurés pour ce préréglage.",
+        "unsaved": "Configuration d’agents non enregistrée",
+        "saved": "Configuration d’agents enregistrée",
+        "action": "Enregistrer la configuration"
+      },
+      "validation": {
+        "invalid_config": "La configuration d’agents doit être un objet.",
+        "unknown_config_key": "La configuration contient des champs non pris en charge.",
+        "invalid_version": "Seule la version 1 de la configuration est prise en charge.",
+        "invalid_enabled": "L’état d’activation est invalide.",
+        "invalid_max_invocations": "Le nombre maximal d’invocations d’agents enfants doit être un entier sûr fini.",
+        "max_invocations_below_minimum": "Le nombre maximal d’invocations d’agents enfants doit être d’au moins 1.",
+        "invalid_main_tools": "La sélection d’outils principaux est invalide.",
+        "invalid_profiles": "La liste des profils est invalide.",
+        "too_many_profiles": "Un préréglage peut contenir au maximum {{profileLimit}} profils enfants.",
+        "unknown_profile_key": "Ce profil contient des champs non pris en charge.",
+        "unknown_tool": "Un outil principal inconnu est sélectionné.",
+        "duplicate_tool": "Un outil ne peut être sélectionné qu’une fois.",
+        "invalid_main_scope": "La portée de lore du modèle principal est invalide.",
+        "invalid_scope": "La portée de lore est invalide.",
+        "scope_requires_lore_tool": "Tout le lore possédé exige au moins un outil de lore.",
+        "invalid_id": "Utilisez 1 à 64 lettres minuscules, chiffres ou traits de soulignement, en commençant par une lettre.",
+        "duplicate_id": "Les ID de profil doivent être uniques.",
+        "invalid_name": "Le nom du profil est invalide.",
+        "name_too_long": "Le nom affiché ne peut dépasser {{nameMax}} caractères.",
+        "invalid_system_prompt": "L’invite système doit être du texte.",
+        "system_prompt_too_long": "L’invite système ne peut dépasser {{promptMax}} octets UTF-8.",
+        "invalid_connection": "Choisissez un profil valide ou utilisez la connexion principale.",
+        "connection_not_found": "Ce profil de connexion a été supprimé ou n’est plus disponible.",
+        "main_connection_unavailable": "Sélectionnez une connexion existante, car aucune connexion principale n’est active.",
+        "invalid_delegation": "Le paramètre de délégation est invalide.",
+        "invalid_failure_policy": "Choisissez une gestion d’échec requise ou facultative.",
+        "invalid_stream_activity": "Le paramètre d’activité est invalide.",
+        "invalid_max_output_tokens": "Le maximum de jetons doit être un nombre entier.",
+        "max_output_tokens_out_of_range": "Le maximum de jetons doit être compris entre {{tokenMin}} et {{tokenMax}}.",
+        "invalid_timeout": "Le délai doit être un nombre entier de secondes.",
+        "timeout_below_minimum": "Le délai doit être d’au moins {{timeoutMin}} secondes."
+      }
     },
     "empty": {
       "loading": "Chargement...",

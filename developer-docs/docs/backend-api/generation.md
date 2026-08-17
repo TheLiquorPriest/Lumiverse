@@ -142,6 +142,374 @@ Use the same `call_id` returned in `ToolCallDTO` as `tool_use.id` and `tool_resu
 
 ---
 
+## Response-mode Agents & Tools during generation
+
+The existing preset-owned Agents & Tools pipeline is **Response mode**. Its
+only executable source is `Preset.agent_config` (`AgentConfigV2`) returned by
+the authenticated normalized authority. Ordinary create/update calls reject
+V1 in the top-level `agent_config` DTO and scrub every runtime-looking metadata
+alias without interpreting it. Explicit archive, preset-file, and LumiHub
+import/migration boundaries may parse legacy `metadata.agentConfig`; they write
+it once as disabled, Response-only normalized V2 and remove the legacy field.
+Generation never reads runtime authority from preset metadata.
+`spindle.generate.raw()`, `quiet()`, and `batch()` remain direct
+provider helpers: they do not assemble a preset and do not execute
+preset-owned intrinsics. With no executable Response-mode configuration,
+ordinary generation and existing Council continuation behavior are unchanged.
+
+### Child runtime
+
+An enabled directly-authored intrinsic executes serially at its prompt-block
+position. The child receives exactly two initial messages:
+
+1. one host/provider-safe `system` message containing the fixed lower-authority
+   derived-data guidance and the profile's literal `systemPrompt`; and
+2. one `user` message containing the resolved task.
+
+The root prompt, raw chat transcript, attachments, metadata, arbitrary chat
+rows, and credentials are not copied into child context. Child tool results are
+host-framed derived data and are not re-evaluated as macros. A child may use
+only its profile's checked core tools and lore-scope ceiling. Dynamic
+`agent_delegate` calls may narrow a selected profile at call time, but cannot
+widen either grant or delegate again.
+
+Feature admission and continuation are bounded by one root-owned ledger shared
+by the root model and all child frames. The authored `maxInvocations` and
+`maxToolCalls` values default to `64`, require finite safe integers of at least
+`1`, and remain portable; the host rejects execution above its effective
+ceilings.
+
+| Host ceiling | Default |
+|---|---:|
+| Child admissions | 1,024 |
+| Aggregate tool-call attempts | 1,024 |
+| Logical provider requests | 2,048 |
+| Physical dispatch attempts (including eligible pre-carrier retries) | 4,096 |
+| Aggregate child output | 1,048,576 tokens |
+| Root wall-clock duration | 3,600,000 ms |
+| Detailed activity events / bytes | 512 / 512 KiB |
+| Detailed lifecycle log records | 512 |
+| Active roots (process / user) | 16 / 2 |
+| Provider dispatches (process / user) | 16 / 4 |
+| Tool executions (process / user) | 32 / 8 |
+
+The operator may tune these process settings with the existing
+`LUMIVERSE_AGENT_HOST_*` variables. The authenticated
+`GET /api/v1/presets/agent-runtime-limits` endpoint exposes effective values
+to the editor; it never exposes credentials or provider details.
+
+Each provider response is consumed to an explicit complete boundary. A
+complete call batch is validated before side effects, charged once, executed
+serially in provider order, and appended with exactly one correlated result per
+call before the next request. The loop repeats until a tool-free answer,
+cancellation, deadline, context/integrity ceiling, or budget exhaustion.
+Response-mode transport retries are allowed only before any carrier, token, or
+tool side effect is accepted.
+
+The host emits additive stable terminal error codes and status-only activity.
+Live activity is capped at 128 retained nodes/64 KiB in the UI; the backend
+publisher caps detailed events at 512/512 KiB and logs at 512 records.
+Target-backed messages retain only a compact swipe-scoped aggregate. No-target
+or zero-output runs use the bounded authenticated activity-runs fallback
+(newest 16 per chat, 512 KiB total, 32 KiB each), so reconnect can recover
+status without storing prompts, prose, arguments, results, provider carriers,
+or raw exception strings.
+
+Authored values above a host ceiling remain readable and editable but are
+non-executable until lowered.
+`GENERATION_ENDED` and `GENERATION_STOPPED` expose only the allowlisted
+`AgentPublicErrorV1` shape when an active Agent runtime has a terminal error:
+version, stable code/category, an optional bounded budget observation, and
+retryability. They do not expose adapter identifiers, HTTP/provider status
+codes, raw provider errors, prompts, arguments, or results.
+
+There is one absolute root deadline and one terminal compare-and-set owner.
+Completion, stop, cancellation, timeout, watchdog, provider failure, and setup
+failure race through that owner; only the winner aborts descendants, persists
+the bounded snapshot, emits the terminal event, and releases permits.
+
+Each task is at most 32 KiB UTF-8 and aggregate child initial-input data is at
+most 256 KiB per root. Deterministic requests rejected before admission
+(invalid, unauthorized, or pre-admission limit failures) return ordered typed
+errors and remain in failure summaries/activity without consuming the
+child-invocation ceiling. An admitted child invocation consumes one admission
+even if it later fails, is cancelled, times out, or exceeds a runtime, tool,
+output, or retention budget. Deterministic profiles use their configured
+`required` or `optional` failure policy: required failure aborts generation,
+while optional failure records the failure, restores an empty direct value, and
+binds an empty named result. A dynamic delegation failure is returned as a
+typed tool error to the main model instead of aborting it.
+
+### Main-model continuation and provider support
+
+For Response-mode rounds with feature tools, the host uses native structured
+tool continuation only when the provider advertises both
+`nativeToolContinuation: true` and `toolContinuationMode: "native"`. Otherwise
+it uses bounded legacy assistant-text/user-result continuation. Tool and child
+results remain host-framed, untrusted derived data. Provider capability
+declarations, rather than a provider-name allowlist, select the serializer.
+
+Those declarations live on `ProviderCapabilities` (`src/llm/param-schema.ts`).
+Every adapter states them as literals so readiness can never infer them from an
+adapter base class:
+
+| Field | Meaning |
+|---|---|
+| `toolCalling` | The adapter advertises and parses host function calls. Deliberately independent of continuation mode. |
+| `nativeToolContinuation` | The adapter has a provider-native tool continuation wire format. Declared even when the mode is `legacy`/`unsupported`. |
+| `toolContinuationMode` | `native` (correlated provider call identities and results), `legacy` (bounded assistant-text/user-result, retained for feature-inactive Council compatibility), or `unsupported` (reject agent tools before any provider request). |
+| `toolsDisabledFinalization` | The adapter can issue an explicit tools-disabled finalization request once a continuation reaches its budget. `supportsToolFinalization` is the older Response/Council projection; readiness reads `toolsDisabledFinalization`. |
+
+Response-mode feature tools are gated by `assertAgentToolCapability()`
+(`src/llm/provider.ts`), which reports `provider_tool_calling_unsupported`,
+`provider_tool_continuation_unsupported`, or
+`provider_tool_finalization_unsupported`. Agentic admission re-checks the same
+declarations on every frozen concrete connection and reports
+`agentic_capability_missing_tool_calling` or
+`agentic_capability_missing_tools_disabled_finalization` instead. An adapter
+declaring `toolCalling: false` with `toolContinuationMode: "unsupported"` and
+`toolsDisabledFinalization: false` — `pollinations-text` today — is admitted by
+neither path.
+
+Council calls are part of this existing Response-only compatibility path.
+Council, extension callbacks, MCP tools, and generic Spindle tools are not
+admitted by the strict Agentic runtime described below.
+
+### Dry run, multiplayer, and retained activity
+
+Dry Run carries its inspection flag across the worker boundary but never
+constructs an agent runtime, exposes tools, or calls a child provider. An
+executable Response-mode intrinsic reports `AgentDryRunUnsupportedError`
+before provider work. An active multiplayer room omits main feature tools and
+an executable intrinsic reports `AgentMultiplayerUnsupportedError` before
+snapshot/provider work. Merely storing a disabled or review-required config
+does not break ordinary room generation.
+
+`stream` controls live child activity only when the profile's
+`streamActivity` ceiling permits it. Activity is status-only (phase/status,
+profile and tool names, timing, and cumulative counts/usage); it never carries
+task text, child prose, arguments, retrieval data, result bodies, or arbitrary
+provider exceptions. After a real staged/target assistant message exists, the
+message may retain a compact swipe-scoped summary, not a child transcript.
+Cancellation, stop, timeout, required failure, seal failure, and other
+terminal paths close the child runtime and abort descendants.
+
+## Strict single-turn Agentic runtime
+
+Agentic is an explicit, opt-in branch of the authenticated core generation
+route. It is not an extension `spindle.generate.*` helper and it never
+silently downgrades to Response. A client first asks
+`POST /api/v1/generate/effective-runtime` for the requested target and
+`mode: "agentic"`. The UI supplies the returned one-use token; a direct caller
+may omit it and the generation endpoint performs the same authenticated
+resolution internally. When a token is supplied it must be unexpired and
+match the current target, revisions, and readiness. If preflight reports a
+repair/capability failure, the caller must explicitly choose
+`mode: "response"`; an Agentic request otherwise fails closed with
+`decision_refresh_required`, `agentic_runtime_unavailable`, or its stable
+preflight code.
+
+### Admission, target identity, and capability gates
+
+The closed Agentic target union is `normal | continue | regenerate | swipe`.
+`GenerationTargetV1` is an internal server snapshot that freezes
+`generationType`, optional `messageId`, `swipeId`, `branchId`,
+`targetCharacterId`, and target revisions before provider work. The public
+generation request must not supply `branchId` or revision fields: they are not
+currently wired through request normalization, and adding them produces a
+target-digest mismatch. The server-owned `LiveTargetBinding` derives and
+freezes authoritative branch/chat/message revisions, message index, swipe
+count, and selected swipe before execution and commit.
+
+| Target | Frozen identity and write intent |
+|---|---|
+| `normal` | The owned chat and its current generation revision; no target message or swipe. Commit creates the assistant message. |
+| `continue` | An owned message plus an existing selected/current swipe; extends that swipe. |
+| `regenerate` | An owned message; defaults to the current swipe and may target the next free swipe slot to append. |
+| `swipe` | An owned message; defaults to the next free swipe slot and appends an alternative. |
+
+The binding rejects missing or out-of-range message/swipe identity with
+`agentic_target_unsupported`; concurrent changes become a revision conflict,
+not an overwrite. The strict branch is limited to a single-character,
+non-multiplayer, non-Council surface. Groups, multiplayer, Council, Council
+tools, `impersonate`, `quiet`, and raw/batch generation remain Response/direct
+paths.
+
+Runtime resolution is concrete-first. It freezes one root logical/concrete
+connection, provider, model, normalized endpoint, endpoint/credential/candidate
+revisions, and an internal same-provider-domain fingerprint. Every deterministic
+child connection must have the same trust-domain fingerprint. The required
+capability set is `generation`, `streaming`, `tool_calling`,
+`native_tool_continuation`, and `tools_disabled_finalization`; a missing
+capability, unresolved/stale slot, changed target, incomplete revision set,
+invalid cognition/context authorization, unavailable isolate/publication
+health, or kill switch prevents Agentic admission and exposes the Response
+escape.
+
+The decision token is opaque, bound to the authenticated user, chat/target,
+request epoch, concrete candidate and revisions, config/bindings, input
+revision digest, and readiness digest. It expires after 60 seconds; at most 16
+live tokens are held per user and 512 process-wide. Purging happens before
+capacity checks; a live token is never evicted. Consumption deletes the token
+before ownership/binding checks, so replay, mismatch, cross-user use, and
+expiry all require a fresh decision.
+
+### Frozen snapshot and strict phases
+
+`prompt-assembly-snapshot.service.ts` builds one bounded,
+serializable `GenerationAssemblySnapshotV1` immediately before the strict
+preprocessing isolate. It contains the selected preset and ordered blocks,
+target chat/messages/swipes, persona/character/group facts, prompt-variable
+state, active regex rows, deterministic world/lore books, entries and state,
+settings used by macros/token accounting, concrete connection identity,
+normalized V2 config, frozen context-pack candidates/attachments/ACL, immutable
+tool/participant availability, preparation limits, and a closed
+`InputRevisionSetV1`. `extensionData` and `ambientSpindleData` are explicitly
+`null`; no database handle, callback, extension registry, or live Spindle
+registry crosses the boundary.
+
+The strict worker protocol has only two operations:
+`compile_agent_assembly` and `prepare_agent_render`. `AssemblyPlanV1` returns
+ordered provider messages made of literal/result-slot segments, deterministic
+child descriptors in traversal order, bounded result slots, activation/token
+evidence, the complete input revision set, context snapshot, and typed deferred
+deltas. Preflight rejects generated, nested, transformed, recursive, or
+out-of-order result-slot references. The host reserves and runs children in
+descriptor order, then substitutes each bounded child result exactly once as
+literal bytes; it does not run macros, regexes, assembly, or callbacks over
+child output or final messages.
+
+`compile_agent_assembly` is verified in two distinct, terminable isolates:
+`agentic-preprocessing` produces the accepted plan and
+`agentic-assembly-verifier` independently compiles the same frozen snapshot.
+Each pool has one worker; their outputs are compared after request identity is
+removed, and verifier bytes are discarded. The pair shares one queue admission,
+abort signal, wall-clock deadline, and host limits; the cooperative CPU budget
+is split between the two isolates. A mismatch, malformed result, cancellation,
+timeout, or unhealthy backend fails the operation. The host never executes the
+assembly compiler in the main process. `prepare_agent_render` runs through the
+terminable strict pool and has the same no-provider/no-live-DB/no-callback
+boundary.
+
+| Phase | Contract |
+|---|---|
+| `ASSEMBLE` | Freeze the snapshot, validate the effective decision, compile `AssemblyPlanV1` in two independently supervised terminable isolates, and compare their plans. No generation mutation or child execution occurs. |
+| `WORK` | First reserve and execute the deterministic child descriptors in traversal order, substituting each bounded result once; then run the root provider loop with bounded in-memory provider work notes. The allowlist is `complete_turn`, workspace reads (`workspace_read_section`, `workspace_read_page`), workspace mutations (`workspace_create_task` (root-only), `workspace_update_assigned_progress` (child-only), `workspace_submit_child_result` (child-only), `workspace_accept_submission` (root-only), `workspace_record_finding`, `workspace_record_decision`, `workspace_record_question`, `workspace_attach_artifact`, `workspace_propose_publication`), `context_pack_list`, `context_pack_get`, `agent_delegate`, and the six core retrieval tools: `lore_list_books`, `lore_get_book`, `lore_list_entries`, `lore_get_entry`, `lore_search_entries`, and `chat_search_history`. Extension, MCP, Council, and generic Spindle tools are absent. |
+| `COMPLETE` | The post-acceptance boundary after WORK's sole-call `complete_turn`: required tasks, actions, submissions, and calls are settled, and the workspace is frozen for finalization. Tool-free boundaries are re-prompted in WORK while budget remains; exhaustion enters `EXHAUSTED` with no render or commit. |
+| `RENDER` | Use the same frozen root connection and model with `tools: []`, `toolMode: "finalization"`, and one final-render reservation. Native continuation may reuse only that frame's opaque adapter carrier; legacy continuation uses only the private frame transcript. A returned tool call is a protocol failure and is never executed. |
+| `PREPARE_COMMIT` | Send frozen render content plus pure snapshotted inputs to `prepare_agent_render` in the strict isolate. It performs bounded reasoning-tag cleanup, response transforms, formatting healing, source-message/macro preparation, target/swipe reconciliation, and usage calculation, returning typed deltas only. |
+| `COMMITTING` | Recompute every `InputRevisionSetV1` member and context ACL gate. A single CAS owns this boundary; cancellation/deadline can win before it, while Stop after it is `too_late`. |
+| `COMMITTED` | One synchronous SQLite transaction writes the message/swipe/extras, authorized macro/source/chat/world-info/regex deltas, artifact references, terminal handoff, projection, and idempotent receipt. Duplicate commit returns the existing receipt. |
+Unknown phase transitions fail closed. A reversible-phase provider/protocol
+failure, cancellation, or deadline enters `FAILED`, `CANCELLED`, or
+`TIMED_OUT`; budget exhaustion enters `EXHAUSTED`. `COMMITTING` enters
+`COMMITTED` only with its receipt, otherwise `COMMIT_FAILED`. One terminal
+owner emits the terminal event; later callers may only release resources.
+
+The strict preprocessing ceilings are immutable host defaults: 8 MiB input,
+8 MiB output, 16 MiB cumulative expansion, 2 MiB per operation, 1,024 prompt
+blocks, 512 active scripts, 1,024 compiled patterns, 10,000 macro
+resolutions, 512 trim strings, 30 seconds cooperative CPU, 60 seconds wall
+clock, two total workers (one in each paired assembly pool), four queued jobs
+per user, and 32 process-wide queued jobs. Only lower test/host overrides are
+accepted. Stable isolate failures are
+`invalid_input`, `limit_exceeded`, `queue_full`, `worker_disabled`,
+`worker_unavailable`, `worker_crashed`, `worker_timed_out`,
+`worker_malformed`, `cancelled`, and `requires_response_mode`.
+
+### Cancellation, recovery, and compatibility events
+
+The request `AbortSignal` is connected to the Agentic owner. Exact root
+`POST /api/v1/agent-runs/:turnId/stop` is projection-gated: it accepts a
+reversible `ASSEMBLE` or `WORK` run and returns `too_late` from `COMPLETE`,
+`RENDER`, `PREPARE_COMMIT`, or `COMMITTING` onward. The existing
+`/api/v1/generate/stop` generation- or chat-scoped route uses the
+same Agentic owner but currently serializes its boolean compatibility result:
+an accepted cancellation returns `{ stopped: true }`; a terminal or
+`COMMITTING`/later cancellation that cannot be accepted returns
+`{ stopped: false }` (and a generation-id race may try the supplied chat
+fallback). Use the exact Agent Run Stop route when the `too_late` distinction
+is required. A stop or deadline that wins before `COMMITTING` leaves no
+authoritative generation write.
+Startup runs `reconcileStartupState()` before `Bun.serve`: imports, artifact
+blobs, turns, and Agent Run projections reconcile sequentially, then isolate
+backends are probed. Agentic readiness requires successful import/artifact/turn
+and healthy projection stages, a usable publication store, and terminable
+isolate health; any failed gate closes Agentic while Response remains
+available. The startup stage records stable failure outcomes rather than
+dispatching providers or publishing events. Readiness additionally requires the
+operational rollback switch below to be `auto`: the readiness vector carries
+`killSwitchState` and adds the `kill_switch_off` reason whenever it is not.
+
+Agentic turns join the standard generation compatibility stream without
+exposing private work:
+
+| Event | Agentic emission |
+|---|---|
+| `GENERATION_STARTED` | Emitted when the owned execution/pool entry is created; includes generation/chat IDs, root model, target message/swipe, and target type. |
+| `STREAM_TOKEN_RECEIVED` | Emitted only for provisional final-render tokens; carries the generation/chat IDs, token, sequence, and stream offset. It never carries WORK notes, reasoning, tool data, or child output. |
+| `MESSAGE_SENT` / `MESSAGE_EDITED` | Emitted after the commit transaction, for `normal` or an existing target respectively; carries the chat/message handoff identifiers and content, not private work data. |
+| `GENERATION_ENDED` | Emitted for completed or failed terminal status with generation/chat IDs, optional `messageId` and content, target identity, and a stable error code when applicable. |
+| `GENERATION_STOPPED` | Emitted for cancellation with generation/chat IDs, content, target identity, and the same allowlisted terminal fields. |
+
+Detailed phase/activity data is read from the authenticated Agent Run
+projection, not inferred from message text or stream silence. Work prose,
+reasoning, provider carriers, raw tool arguments/results, credentials, and
+private child content never enter compatibility events, messages, or the
+view-only workspace projection.
+
+### Operational rollback switch
+
+`LUMIVERSE_AGENTIC_RUNTIME` is a server-process environment variable and the
+supported way to withdraw the strict runtime without a schema change. It is read
+only from the server environment — never from a request, token, preset, chat, or
+stored setting — so no client can raise it.
+
+| Value | Effect |
+|---|---|
+| `auto` | The runtime may become ready. Every gate above still applies; `auto` alone never forces readiness. |
+| anything else | `off`. Agentic is closed and Response-mode Agents & Tools continues unchanged. |
+
+Only the exact literal `auto` enables the branch: unset, empty, `off`, `AUTO`,
+`1`, and `true` all resolve to `off`, so a default install is fail-closed even
+when a preset is fully configured. While the switch is `off`,
+`getAgenticRuntimeStatus()` reports `enabled: false`, the readiness vector
+carries `killSwitchState: "off"` and the `kill_switch_off` reason, and
+`POST /api/v1/generate/effective-runtime` reports the Response escape; an
+Agentic request still fails closed instead of downgrading silently.
+
+Rollback is therefore a restart with the variable removed or set to `off`. It
+changes no schema and deletes no data: preset `AgentConfigV2`, context packs,
+cognition state, and existing Agent Run projections are retained and become live
+again when the switch returns to `auto`. Schema rollback is the separate,
+narrower boundary in
+[Storage > Pre-bundle SQLite backup and downgrade boundary](storage.md#pre-bundle-sqlite-backup-and-downgrade-boundary).
+
+### Implementation anchors
+
+- `src/services/generate.service.ts`: `GenerateInput.mode`,
+  `runtime_decision_token`, and the Response/Agentic branch in
+  `startGeneration()`.
+- `src/services/agent-runtime-decision.service.ts` and
+  `src/types/agent-runtime-decision.ts`: concrete-first resolution,
+  capability/readiness checks, `GenerationTargetV1`, and one-use token store.
+- `src/services/prompt-assembly-snapshot.service.ts`:
+  `GenerationAssemblySnapshotV1`; `src/types/agent-preprocessing.ts`:
+  `AssemblyPlanV1`, `RenderPreparationInputV1`, and preparation limits.
+- `src/services/agentic-preprocessing-worker-client.ts` and
+  `src/services/isolate-pool.ts`: paired independent assembly compilers,
+  shared admission/deadline, strict render preparation, and no main-process
+  preprocessing execution.
+- `src/services/agentic-generation.service.ts`,
+  `agentic-generation-coordinator.service.ts`, `agentic-work-phase.service.ts`,
+  `agentic-render-phase.service.ts`, and `agentic-commit.service.ts`: phase
+  machine, allowlist, root/model finalization, strict preparation, CAS gate,
+  atomic commit, receipt, and compatibility events.
+- `src/services/startup-recovery.service.ts`, `src/main.ts`, and
+  `getAgenticRuntimeMode()` in `src/services/turn-execution.service.ts`:
+  pre-`Bun.serve` reconciliation, fail-closed readiness, and the rollback
+  switch.
+
 ## Reasoning / extended thinking
 
 Most modern frontier models expose a "thinking" knob — Anthropic's `thinking` block, Google's `thinkingConfig`, DeepSeek's `reasoning_effort`, the OpenAI-compatible `reasoning.effort`, and so on. Lumiverse wraps that surface in a single high-level shape so extensions don't have to encode each provider's quirks.
@@ -398,7 +766,11 @@ persona, memory, and world-info content.
 
 ## Dry Run (Prompt Assembly)
 
-Run the full prompt assembly pipeline — macros, world info, context filters, memory retrieval, token counting — without actually calling the LLM. Useful for prompt debugging, token budget analysis, and previewing what the model will see.
+!!! warning "Agents & Tools"
+    This Dry Run result contract applies only when the effective preset has no executable Agents & Tools intrinsic (for example, the feature is absent or disabled). An executable intrinsic fails with `AgentDryRunUnsupportedError` before child/runtime/provider work; Dry Run never exposes feature tools or returns a partially assembled result.
+
+When the effective preset contains no executable Agents & Tools intrinsic, run the full prompt assembly pipeline — macros, world info, context filters, memory retrieval, and token counting — without actually calling the LLM. This is useful for prompt debugging, token budget analysis, and previewing what the model will see.
+
 
 ### `spindle.generate.dryRun(input, userId?)`
 
@@ -458,7 +830,7 @@ const result = await spindle.generate.dryRun({
 
 | Field | Type | Description |
 |---|---|---|
-| `messages` | `LlmMessageDTO[]` | The fully assembled message array that would be sent to the LLM. |
+| `messages` | `LlmMessageDTO[]` | The fully assembled message array that would be sent to the LLM when no executable Agents & Tools intrinsic is present. |
 | `breakdown` | `AssemblyBreakdownEntryDTO[]` | Ordered list of prompt blocks showing how the prompt was built. |
 | `parameters` | `Record<string, unknown>` | Final merged sampler parameters. |
 | `model` | `string` | The model that would be used. |
@@ -509,7 +881,7 @@ When an interceptor returns `breakdown: [{ messageIndex, name? }]`, the host tur
 | `settingsSource` | `string` | Whether settings came from `"global"` or `"per_chat"` overrides. |
 
 !!! tip
-    Dry run mirrors the exact assembly pipeline used during real generation (macros, world info, context filters, memory) but skips the council execution and LLM call. It's the fastest way to debug prompt construction.
+    When no executable Agents & Tools intrinsic is present, Dry Run mirrors the exact assembly pipeline used during real generation (macros, world info, context filters, memory) but skips the Council execution and LLM call. An executable intrinsic instead returns `AgentDryRunUnsupportedError`.
 
 ---
 

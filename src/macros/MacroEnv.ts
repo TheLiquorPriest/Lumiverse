@@ -206,9 +206,10 @@ export function cloneEnv(env: MacroEnv): MacroEnv {
       global: new Map(env.variables.global),
       chat: new Map(env.variables.chat),
     },
-    ...(env._chatVarsDirty ? { _chatVarsDirty: true } : {}),
-    ...(env.promptBlock ? { promptBlock: { ...env.promptBlock } } : {}),
     dynamicMacros: { ...env.dynamicMacros },
+    ...(env._chatVarsDirty ? { _chatVarsDirty: true } : {}),
+    ...(env._expansionBudget ? { _expansionBudget: env._expansionBudget } : {}),
+    ...(env.promptBlock ? { promptBlock: { ...env.promptBlock } } : {}),
     _dynamicMacrosLower: env._dynamicMacrosLower
       ? new Map(env._dynamicMacrosLower)
       : undefined,

@@ -86,6 +86,43 @@
     "modCmd": "Commande",
     "modCtrl": "Ctrl"
   },
+  "agentRuntime": {
+    "label": "Mode de génération",
+    "oneTurnLegend": "Prochain tour",
+    "mode": {
+      "response": "Réponse",
+      "agentic": "Agentique"
+    },
+    "useForChat": "Utiliser par défaut pour ce chat",
+    "savingOverride": "Enregistrement…",
+    "useResponse": "Utiliser Réponse",
+    "repair": {
+      "title": "Le mode agentique nécessite votre attention",
+      "slot": "Associez l’emplacement de connexion du préréglage",
+      "provider": "Choisissez un fournisseur avec les capacités requises",
+      "isolate": "Rétablissez le processus d’exécution sécurisé",
+      "egress": "Utilisez un seul domaine fournisseur pour ce tour",
+      "readiness": "Terminez la configuration ou la vérification de l’exécution"
+    },
+    "announcement": {
+      "oneTurn": "{{mode}} est sélectionné pour le prochain tour.",
+      "overrideSaved": "{{mode}} est maintenant le mode par défaut du chat.",
+      "overrideFailed": "Impossible d’enregistrer le mode par défaut. Réessayez.",
+      "responseEscape": "Réponse est sélectionné pour le prochain tour."
+    },
+    "preflight": {
+      "refreshRequired": "L’exécution a changé avant le début de la génération. Vérifiez le mode et réessayez.",
+      "unavailable": "Le mode agentique n’est pas prêt. Utilisez Réponse ou effectuez la correction indiquée."
+    },
+    "stop": {
+      "stop": "Arrêter l’exécution",
+      "locating": "Préparation de l’arrêt exact…",
+      "stopping": "Arrêt…",
+      "retry": "Réessayer l’arrêt",
+      "tooLate": "Trop tard pour arrêter",
+      "terminal": "Exécution terminée"
+    }
+  },
   "findInChat": {
     "open": "Rechercher dans le chat",
     "placeholder": "Rechercher dans le chat…",
@@ -358,6 +395,281 @@
     "renderModeAria": "Mode de rendu du raisonnement",
     "text": "Texte",
     "markdown": "Réduction"
+  },
+  "agentActivity": {
+    "liveLabel": "Activité des agents · {{count}} en cours",
+    "idleLabel": "Activité des agents · aucune exécution en cours",
+    "summaryLabel": "Activité des agents · {{status}} · {{count}} exécutions",
+    "liveAria": "Activité en direct des agents et des outils",
+    "rowAria": "{{profile}} : {{status}}",
+    "usage": "{{total}} jetons · {{input}} en entrée / {{output}} en sortie",
+    "actors": {
+      "mainModel": "Modèle principal"
+    },
+    "status": {
+      "pending": "En attente",
+      "running": "En cours",
+      "succeeded": "Terminé",
+      "failed": "Échec",
+      "cancelled": "Annulé",
+      "timed_out": "Délai dépassé"
+    },
+    "phase": {
+      "queued": "En file d’attente",
+      "started": "Au travail",
+      "tool_call": "Utilisation d’un outil",
+      "completed": "Terminé",
+      "failed": "Échec",
+      "cancelled": "Annulé",
+      "timed_out": "Délai dépassé"
+    },
+    "tools": {
+      "lore_list_books": "Lister les livres de lore",
+      "lore_get_book": "Lire le livre de lore",
+      "lore_list_entries": "Lister les entrées de lore",
+      "lore_get_entry": "Lire l’entrée de lore",
+      "lore_search_entries": "Rechercher dans le lore",
+      "chat_search_history": "Rechercher dans l’historique",
+      "agent_delegate": "Déléguer à un agent"
+    },
+    "summary": {
+      "invocations": "{{count}} exécutions",
+      "succeeded": "{{count}} terminées",
+      "failed": "{{count}} en échec",
+      "cancelled": "{{count}} annulées",
+      "timedOut": "{{count}} expirées",
+      "tools": "{{count}} appels d’outil"
+    }
+  },
+  "agentRun": {
+    "title": "Activité de l’agent",
+    "subtitle": "Chronologie des statuts uniquement pour cette réponse",
+    "close": "Fermer l’activité de l’agent",
+    "tabsAria": "Détails de l’exécution de l’agent",
+    "stripLabel": "Exécution agentique",
+    "tabs": {
+      "activity": "Arborescence de l’activité",
+      "workspace": "Espace de travail"
+    },
+    "actors": {
+      "root": "Agent racine",
+      "provider": "Tour du modèle",
+      "child": "Agent enfant",
+      "childNamed": "Agent {{name}}",
+      "tool": "Outil"
+    },
+    "tools": {
+      "lore_list_books": "Répertorier les livres de connaissances",
+      "lore_get_book": "Lire le livre de connaissances",
+      "lore_list_entries": "Répertorier les entrées de connaissances",
+      "lore_get_entry": "Lire l’entrée de connaissances",
+      "lore_search_entries": "Rechercher dans les connaissances",
+      "chat_search_history": "Rechercher dans l’historique de la discussion",
+      "agent_delegate": "Déléguer à un agent",
+      "context_pack_list": "Répertorier les packs de contexte",
+      "context_pack_get": "Lire le pack de contexte",
+      "workspace_read_section": "Lire la section de l’espace de travail",
+      "workspace_read_page": "Lire la page de l’espace de travail",
+      "workspace_create_task": "Créer une tâche",
+      "workspace_update_progress": "Mettre à jour la progression",
+      "workspace_submit_result": "Soumettre le résultat",
+      "workspace_accept_submission": "Accepter la soumission",
+      "workspace_record_finding": "Consigner un constat",
+      "workspace_record_decision": "Consigner une décision",
+      "workspace_record_question": "Consigner une question",
+      "workspace_attach_artifact": "Joindre un artefact",
+      "workspace_propose_publication": "Proposer la publication",
+      "complete_turn": "Terminer le tour",
+      "unknown_tool": "Outil"
+    },
+    "phase": {
+      "ASSEMBLE": "Assemblage en cours",
+      "WORK": "Travail en cours",
+      "COMPLETE": "Travail terminé",
+      "RENDER": "Rédaction de la réponse",
+      "PREPARE_COMMIT": "Préparation de la réponse",
+      "COMMITTING": "Enregistrement de la réponse",
+      "COMMITTED": "Enregistrée",
+      "COMMIT_FAILED": "Échec de l’enregistrement",
+      "EXHAUSTED": "Budget épuisé",
+      "FAILED": "Échec",
+      "CANCELLED": "Annulée",
+      "TIMED_OUT": "Délai dépassé"
+    },
+    "status": {
+      "ASSEMBLE": "Assemblage en cours",
+      "WORK": "Travail en cours",
+      "COMPLETE": "Travail terminé",
+      "RENDER": "Rédaction en cours",
+      "PREPARE_COMMIT": "Préparation en cours",
+      "COMMITTING": "Enregistrement en cours",
+      "COMMITTED": "Terminé",
+      "COMMIT_FAILED": "Échec de l’enregistrement",
+      "EXHAUSTED": "Budget épuisé",
+      "FAILED": "Échec",
+      "CANCELLED": "Annulé",
+      "TIMED_OUT": "Délai dépassé"
+    },
+    "nodeStatus": {
+      "pending": "En attente",
+      "running": "En cours",
+      "completed": "Terminé",
+      "failed": "Échec",
+      "cancelled": "Annulé",
+      "timed_out": "Délai dépassé",
+      "omitted": "Omis"
+    },
+    "activityTreeAria": "Chronologie des agents et des outils",
+    "activityEmpty": "Aucune ligne d’activité publique n’est encore disponible.",
+    "usageCompact": "{{total}} jetons · {{input}} en entrée / {{output}} en sortie",
+    "duration": {
+      "seconds": "{{count}} s",
+      "minutes": "{{count}} min",
+      "minutesSeconds": "{{minutes}} min {{seconds}} s",
+      "hours": "{{count}} h",
+      "hoursMinutes": "{{hours}} h {{minutes}} min"
+    },
+    "usage": {
+      "total": "Nombre total de jetons",
+      "input": "Jetons d’entrée",
+      "output": "Jetons de sortie",
+      "tools": "Appels d’outils",
+      "children": "Agents enfants",
+      "toolsCount": "Appels d’outils : {{count}}",
+      "childrenCount": "Agents enfants : {{count}}"
+    },
+    "sync": {
+      "stale": "Affichage de la dernière arborescence connue pendant le rétablissement de la connexion.",
+      "restoring": "Restauration de l’activité depuis le serveur.",
+      "error": "La dernière arborescence connue est conservée. Une nouvelle tentative de récupération est possible."
+    },
+    "omission": "{{nodes}} lignes d’activité et {{events}} mises à jour ont été omises par le serveur.",
+    "errors": {
+      "unknown": "L’exécution s’est terminée par une erreur serveur sans danger.",
+      "capacity_exceeded": "Limite de capacité atteinte.",
+      "host_child_admission_limit_exceeded": "Limite d’agents enfants de l’hôte atteinte.",
+      "host_tool_call_limit_exceeded": "Limite d’appels d’outils de l’hôte atteinte.",
+      "child_admission_limit_exceeded": "Limite d’agents enfants atteinte.",
+      "tool_call_limit_exceeded": "Limite d’appels d’outils atteinte.",
+      "logical_provider_request_limit_exceeded": "Limite de requêtes au modèle atteinte.",
+      "physical_dispatch_attempt_limit_exceeded": "Limite de tentatives d’envoi atteinte.",
+      "child_output_token_limit_exceeded": "Limite de sortie des agents enfants atteinte.",
+      "root_wall_clock_limit_exceeded": "Limite de temps atteinte.",
+      "activity_event_limit_exceeded": "Limite de mises à jour d’activité atteinte.",
+      "activity_byte_limit_exceeded": "Limite de taille de l’activité atteinte.",
+      "lifecycle_log_record_limit_exceeded": "Limite d’historique d’activité atteinte.",
+      "context_limit_exceeded": "Limite de contexte atteinte.",
+      "initial_input_limit_exceeded": "Limite d’entrée atteinte.",
+      "argument_limit_exceeded": "Limite d’arguments d’outil atteinte.",
+      "result_limit_exceeded": "Limite de résultat d’outil atteinte.",
+      "continuation_limit_exceeded": "Limite de continuation atteinte.",
+      "retained_output_limit_exceeded": "Limite de taille de réponse atteinte.",
+      "materialized_limit_exceeded": "Limite de matérialisation atteinte.",
+      "timeout": "L’exécution a expiré.",
+      "cancelled": "L’exécution a été annulée.",
+      "provider_unavailable": "Le service de modèle est indisponible.",
+      "provider_unsupported": "La capacité du modèle est indisponible.",
+      "provider_tool_calling_unsupported": "Les appels d’outils sont indisponibles.",
+      "provider_tool_continuation_unsupported": "La continuation des outils est indisponible.",
+      "provider_tool_finalization_unsupported": "Le mode de réponse finale est indisponible.",
+      "provider_request_error": "La requête au modèle a échoué.",
+      "provider_protocol_error": "La réponse du modèle n’a pas pu être comprise.",
+      "provider_schema_error": "Le format de réponse du modèle est invalide.",
+      "invalid_task": "La tâche est invalide.",
+      "invalid_profile": "Le profil d’agent est invalide.",
+      "invalid_arguments": "Les arguments de l’outil sont invalides.",
+      "batch_rejected": "Le lot d’actions a été rejeté.",
+      "unknown_tool": "L’outil demandé est indisponible.",
+      "unauthorized": "L’action n’est pas autorisée.",
+      "integrity_error": "La vérification d’intégrité de l’exécution a échoué.",
+      "internal_error": "Une erreur interne du serveur est survenue.",
+      "not_found": "La cible d’exécution demandée est introuvable.",
+      "invalid_request": "La requête d’exécution est invalide.",
+      "decision_refresh_required": "La décision d’exécution est obsolète. Vérifiez le mode et réessayez.",
+      "decision_capacity_exceeded": "Trop de décisions d’exécution sont en attente. Réessayez bientôt.",
+      "runtime_decision_unavailable": "Le service de décision d’exécution est indisponible.",
+      "agentic_unsupported_surface": "Cette surface de génération nécessite le mode Réponse.",
+      "agentic_runtime_unavailable": "L’exécution agentique est indisponible. Utilisez le mode Réponse.",
+      "agentic_preflight_failed": "La vérification agentique a échoué. Utilisez Réponse ou vérifiez la configuration.",
+      "agentic_chat_busy": "Une exécution agentique est déjà en cours dans cette discussion.",
+      "agentic_protocol_failure": "La réponse du protocole agentique est invalide.",
+      "agentic_work_exhausted": "Le budget de travail agentique est épuisé.",
+      "agentic_cancelled": "L’exécution agentique a été annulée.",
+      "agentic_timed_out": "L’exécution agentique a expiré.",
+      "agentic_commit_failed": "Le résultat agentique n’a pas pu être validé.",
+      "agentic_revision_conflict": "L’exécution a changé avant la validation du résultat agentique.",
+      "agentic_provider_failure": "La requête au modèle agentique a échoué.",
+      "agentic_internal_error": "Une erreur interne est survenue dans l’exécution agentique."
+    },
+    "announcements": {
+      "restoring": "Restauration de l’activité de l’agent.",
+      "stale": "Connexion à l’activité de l’agent interrompue. Le dernier état connu a été conservé.",
+      "recoveryFailed": "Échec de la récupération de l’activité de l’agent. Le dernier état connu a été conservé.",
+      "cancelled": "Exécution de l’agent annulée.",
+      "terminal": "Exécution de l’agent : {{status}}.",
+      "phase": "Phase d’exécution de l’agent : {{phase}}."
+    },
+    "workspace": {
+      "loading": "Chargement de l’index de l’espace de travail…",
+      "error": "Impossible de charger l’espace de travail.",
+      "retry": "Réessayer",
+      "viewOnly": "Cet espace de travail est en lecture seule et ne contient que des résumés de statut approuvés.",
+      "empty": "Aucune section publique de l’espace de travail n’est disponible.",
+      "loadingSection": "Chargement de la section…",
+      "sectionEmpty": "Aucune entrée publique dans cette section.",
+      "omitted": "{{count}} entrées ont été omises par le serveur.",
+      "loadMore": "Charger davantage",
+      "sections": {
+        "objective": "Objectif",
+        "tasks": "Tâches",
+        "records": "Constats, décisions et questions",
+        "submissions": "Soumissions",
+        "artifacts": "Artefacts publiés"
+      },
+      "retention": {
+        "operational": "Pendant le tour uniquement",
+        "turn_terminal": "Jusqu’au nettoyage du tour",
+        "chat_lifetime": "Durée de vie de la discussion"
+      },
+      "visibility": {
+        "owner": "Visible par vous",
+        "participants": "Visible par les participants",
+        "public": "Publié"
+      },
+      "taskState": {
+        "active": "Active",
+        "blocked": "Bloquée",
+        "submitted": "Soumise",
+        "done": "Terminée",
+        "omitted": "Omise"
+      },
+      "required": "Obligatoire",
+      "optional": "Facultatif",
+      "assigned": "Attribué",
+      "dependencies": "{{count}} dépendances",
+      "submissionFor": "Soumission pour {{task}}",
+      "submissionState": {
+        "proposed": "Proposée",
+        "accepted": "Acceptée",
+        "rejected": "Rejetée",
+        "omitted": "Omise"
+      },
+      "agent": "Agent {{name}}",
+      "published": "Publié",
+      "notPublished": "Non publié",
+      "bytes": "{{count}} octets",
+      "digest": "Empreinte {{digest}}",
+      "recordState": {
+        "active": "Actif",
+        "accepted": "Accepté",
+        "omitted": "Omis"
+      },
+      "recordKind": {
+        "finding": "Constat",
+        "decision": "Décision",
+        "question": "Question"
+      }
+    }
   },
   "swipe": {
     "previous": "Swipe précédent",

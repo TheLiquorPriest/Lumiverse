@@ -95,10 +95,12 @@ import { PromptStashModal } from './PromptStashModal'
 import { Button } from '@/components/shared/FormComponents'
 import { toast } from '@/lib/toast'
 import { markLoomRuntimeProfileContext } from '@/lib/loom/runtimeProfile'
+import { registerActiveLoomPresetSelectionBlocker } from '@/lib/loom/preset-selection-coordinator'
 import SpindlePresetEditorTabContent from '@/components/spindle/SpindlePresetEditorTabContent'
 import SpindlePresetEditorToolbarItem from '@/components/spindle/SpindlePresetEditorToolbarItem'
 import { applyPresetEditorDraft, toPresetEditorDraft } from '@/lib/spindle/preset-editor-adapter'
 import { setPresetEditorController, syncPresetEditorState } from '@/lib/spindle/preset-editor-helper'
+import AgenticRuntimePanel from './AgenticRuntimePanel'
 import s from './LoomBuilder.module.css'
 
 function useLb() {
@@ -106,6 +108,11 @@ function useLb() {
 }
 
 // ============================================================================
+const OUTER_EDITOR_TAB_PREFIX = 'loom-builder'
+
+function outerEditorDomId(kind: 'tab' | 'panel', tabId: string): string {
+  return `${OUTER_EDITOR_TAB_PREFIX}-${kind}-${encodeURIComponent(tabId)}`
+}
 // HELPERS
 // ============================================================================
 
@@ -1825,6 +1832,7 @@ export default function LoomBuilder({
     createPreset,
     selectPreset,
     saveBlocks,
+    saveAgenticRuntime,
     deletePreset,
     duplicatePreset,
     renamePreset,
@@ -1882,6 +1890,10 @@ export default function LoomBuilder({
     if (!savedToProfile) await savePresetPromptVariableValues(values)
   }, [activePreset?.id, isResolved, resolvedPresetId, saveActivePromptVariableValues, savePresetPromptVariableValues])
   const presetEditorTabs = __contextMeterStore((state) => state.presetEditorTabs)
+  const outerEditorTabIds = useMemo(
+    () => ['preset', 'agentic-runtime', ...presetEditorTabs.map((tab) => tab.id)],
+    [presetEditorTabs],
+  )
   const presetEditorToolbarItems = __contextMeterStore((state) => state.presetEditorToolbarItems)
   const addToast = __contextMeterStore((s) => s.addToast)
   const activePresetRef = useRef(activePreset)
@@ -1967,14 +1979,13 @@ export default function LoomBuilder({
     activeChatId,
     activePersonaId,
     activeCharacterId,
-    activeProfileId,
-    activePreset?.id,
     applyRuntimeBlockProfile,
   ])
 
   const [view, setView] = useState<'list' | 'edit'>('list')
   const [activePresetEditorTab, setActivePresetEditorTab] = useState('preset')
   const [guideOpen, setGuideOpen] = useState(false)
+  const [agenticRuntimeDirty, setAgenticRuntimeDirty] = useState(false)
   const [editingBlock, setEditingBlock] = useState<PromptBlock | null>(null)
   const [blockValidationError, setBlockValidationError] = useState<string | null>(null)
   const [promptMenuOpen, setPromptMenuOpen] = useState(false)
@@ -1999,6 +2010,8 @@ export default function LoomBuilder({
     presetProfiles.activeCharacterId,
     presetProfiles.activeProfileId,
   ])
+  const outerEditorTabRefs = useRef(new Map<string, HTMLButtonElement>())
+  const editorTabChangeRef = useRef<(tabId: string) => boolean>(() => false)
 
   const activePresetEditorTabRef = useRef(activePresetEditorTab)
   const updatePresetDraftRef = useRef(updatePresetDraft)
@@ -2027,16 +2040,8 @@ export default function LoomBuilder({
           preset: toPresetEditorDraft(preset),
         }
       },
-      getPromptVariableValues: () => {
-        const preset = activePresetRef.current
-        return preset && preset.id === __contextMeterStore.getState().activeLoomPresetId
-          ? preset.promptVariables
-          : {}
-      },
       setActiveTab: (tabId) => {
-        setView('list')
-        setEditingBlock(null)
-        setActivePresetEditorTab(tabId)
+        editorTabChangeRef.current(tabId)
       },
       updatePreset: (mutator, immediate) => {
         updatePresetDraftRef.current((current) => (
@@ -2068,9 +2073,10 @@ export default function LoomBuilder({
 
   useEffect(() => {
     if (activePresetEditorTab === 'preset') return
+    if (activePresetEditorTab === 'agentic-runtime' && activePreset) return
     if (presetEditorTabs.some((tab) => tab.id === activePresetEditorTab)) return
-    setActivePresetEditorTab('preset')
-  }, [activePresetEditorTab, presetEditorTabs])
+    editorTabChangeRef.current('preset')
+  }, [activePreset, activePresetEditorTab, presetEditorTabs])
 
   const activePresetExtensionTab = useMemo(
   () =>
@@ -2079,9 +2085,79 @@ export default function LoomBuilder({
     ) ?? null,
   [presetEditorTabs, activePresetEditorTab],
 )
-useEffect(() => {
-  setGuideOpen(false)
-}, [activePresetEditorTab])
+
+
+  const blockPresetChangeForDirtyAgenticRuntime = useCallback(() => {
+    if (!agenticRuntimeDirty) return false
+    setView('list')
+    setEditingBlock(null)
+    setActivePresetEditorTab('agentic-runtime')
+    addToast({
+      type: 'warning',
+      message: lb('agenticRuntime.navigation.saveBeforePresetAction'),
+    })
+    return true
+  }, [addToast, agenticRuntimeDirty, lb])
+  const handleEditorTabChange = useCallback((tabId: string): boolean => {
+    if (tabId === activePresetEditorTab) return true
+    if (!outerEditorTabIds.includes(tabId)) return false
+    if (tabId === 'agentic-runtime' && !activePreset) return false
+    if (tabId !== 'agentic-runtime' && blockPresetChangeForDirtyAgenticRuntime()) return false
+    setView('list')
+    setEditingBlock(null)
+    setActivePresetEditorTab(tabId)
+    return true
+  }, [
+    activePreset,
+    activePresetEditorTab,
+    blockPresetChangeForDirtyAgenticRuntime,
+    outerEditorTabIds,
+  ])
+  editorTabChangeRef.current = handleEditorTabChange
+
+  const handleEditorTabKeyDown = useCallback((
+    event: React.KeyboardEvent<HTMLButtonElement>,
+    tabId: string,
+  ) => {
+    const navigableTabIds = outerEditorTabIds.filter((id) => id !== 'agentic-runtime' || !!activePreset)
+    const currentIndex = navigableTabIds.indexOf(tabId)
+    if (currentIndex < 0) return
+    let nextIndex: number | null = null
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      nextIndex = (currentIndex + 1) % navigableTabIds.length
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      nextIndex = (currentIndex - 1 + navigableTabIds.length) % navigableTabIds.length
+    } else if (event.key === 'Home') {
+      nextIndex = 0
+    } else if (event.key === 'End') {
+      nextIndex = navigableTabIds.length - 1
+    }
+    if (nextIndex === null) return
+    event.preventDefault()
+    const nextTabId = navigableTabIds[nextIndex]
+    if (!nextTabId || !handleEditorTabChange(nextTabId)) return
+    outerEditorTabRefs.current.get(nextTabId)?.focus()
+  }, [activePreset, handleEditorTabChange, outerEditorTabIds])
+
+  useLayoutEffect(() => {
+    if (!agenticRuntimeDirty) return
+    return registerActiveLoomPresetSelectionBlocker((presetId) => (
+      presetId !== activePresetRef.current?.id
+        && blockPresetChangeForDirtyAgenticRuntime()
+    ))
+  }, [agenticRuntimeDirty, blockPresetChangeForDirtyAgenticRuntime])
+  useEffect(() => {
+    if (!agenticRuntimeDirty || typeof window === 'undefined') return
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [agenticRuntimeDirty])
+  useEffect(() => {
+    setGuideOpen(false)
+  }, [activePresetEditorTab])
 
   const configurableVariableCount = useMemo(() => {
     return (activePreset?.blocks ?? []).reduce((count, b) => {
@@ -2435,23 +2511,39 @@ useEffect(() => {
     }
   }, [confirmDelete, removeBlock])
 
+  const handleSelectPreset = useCallback((presetId: string | null) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
+    selectPreset(presetId)
+  }, [blockPresetChangeForDirtyAgenticRuntime, selectPreset])
+
+  const handleCreatePreset = useCallback((name: string) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
+    void createPreset(name)
+  }, [blockPresetChangeForDirtyAgenticRuntime, createPreset])
+
   const handleRenamePreset = useCallback(async (newName: string) => {
     if (!activePresetId) return
     await renamePreset(activePresetId, newName)
   }, [activePresetId, renamePreset])
 
   const handleDuplicatePreset = useCallback(async () => {
-    if (!activePreset || !activePresetId) return
+    if (blockPresetChangeForDirtyAgenticRuntime() || !activePreset || !activePresetId) return
     await duplicatePreset(activePresetId, `${activePreset.name}${lb('preset.copySuffix')}`)
-  }, [activePreset, activePresetId, duplicatePreset, lb])
+  }, [activePreset, activePresetId, blockPresetChangeForDirtyAgenticRuntime, duplicatePreset, lb])
+
+  const handleRequestDeletePreset = useCallback(() => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
+    setConfirmDeletePreset(true)
+  }, [blockPresetChangeForDirtyAgenticRuntime])
 
   const handleDeletePreset = useCallback(async () => {
-    if (!activePresetId) return
+    if (blockPresetChangeForDirtyAgenticRuntime() || !activePresetId) return
     setConfirmDeletePreset(false)
     await deletePreset(activePresetId)
-  }, [activePresetId, deletePreset])
+  }, [activePresetId, blockPresetChangeForDirtyAgenticRuntime, deletePreset])
 
   const handleExport = useCallback(async () => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
     try {
       const data = await exportInternal()
       if (!data) return
@@ -2465,9 +2557,15 @@ useEffect(() => {
     } catch (err: any) {
       toast.error(err.body?.error || err.message || lb('toast.exportFailed'))
     }
-  }, [exportInternal, lb])
+  }, [blockPresetChangeForDirtyAgenticRuntime, exportInternal, lb])
+
+  const handleRequestLegacyExport = useCallback(() => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
+    setShowLegacyExportConfirm(true)
+  }, [blockPresetChangeForDirtyAgenticRuntime])
 
   const handleExportLegacy = useCallback(() => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
     const data = exportLegacy()
     if (!data) return
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
@@ -2478,16 +2576,21 @@ useEffect(() => {
     a.click()
     URL.revokeObjectURL(url)
     setShowLegacyExportConfirm(false)
-  }, [exportLegacy])
+  }, [blockPresetChangeForDirtyAgenticRuntime, exportLegacy])
 
   const handleImport = useCallback((type: string) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
     importTypeRef.current = type
     fileInputRef.current?.click()
-  }, [])
+  }, [blockPresetChangeForDirtyAgenticRuntime])
 
   const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
+    if (blockPresetChangeForDirtyAgenticRuntime()) {
+      e.target.value = ''
+      return
+    }
     try {
       const text = await file.text()
       const json = JSON.parse(text)
@@ -2500,7 +2603,7 @@ useEffect(() => {
       console.error('[LoomBuilder] Import failed:', err)
     }
     e.target.value = ''
-  }, [importFromFile, importFromST])
+  }, [blockPresetChangeForDirtyAgenticRuntime, importFromFile, importFromST])
 
   const presetEditorToolbar = presetEditorToolbarItems.some((item) => item.visible) ? (
     <div className={s.extensionToolbar}>
@@ -2546,14 +2649,14 @@ useEffect(() => {
             registry={registry}
             activePresetId={activePresetId}
             activePresetName={activePreset?.name ?? null}
-            onSelect={selectPreset}
-            onCreate={createPreset}
+            onSelect={handleSelectPreset}
+            onCreate={handleCreatePreset}
             onRename={handleRenamePreset}
             onDuplicate={handleDuplicatePreset}
-            onDelete={() => setConfirmDeletePreset(true)}
+            onDelete={handleRequestDeletePreset}
             onImport={handleImport}
             onExport={handleExport}
-            onExportLegacy={() => setShowLegacyExportConfirm(true)}
+            onExportLegacy={handleRequestLegacyExport}
           />
           <div className={s.toolbarActions}>
             <button
@@ -2618,69 +2721,126 @@ useEffect(() => {
 
         {presetEditorToolbar}
 
-        {presetEditorTabs.length > 0 && (
-          <div className={s.extensionTabRow}>
-            <div
-              className={s.extensionTabBar}
-              role="tablist"
-              aria-label={lb('editorTabs.ariaLabel')}
-            >
+        <div
+          className={s.extensionTabRow}
+        >
+          <div
+            className={s.extensionTabBar}
+            role="tablist"
+            aria-label={lb('editorTabs.ariaLabel')}
+            aria-orientation="horizontal"
+          >
             <button
+              ref={(element) => {
+                if (element) outerEditorTabRefs.current.set('preset', element)
+                else outerEditorTabRefs.current.delete('preset')
+              }}
               type="button"
               role="tab"
+              id={outerEditorDomId('tab', 'preset')}
+              aria-controls={outerEditorDomId('panel', 'preset')}
               aria-selected={activePresetEditorTab === 'preset'}
+              tabIndex={activePresetEditorTab === 'preset' ? 0 : -1}
               className={clsx(
-              s.extensionTab,
-              activePresetEditorTab === 'preset' &&
-              s.extensionTabActive,
-            )}
-              onClick={() => setActivePresetEditorTab('preset')}
-          >
-             {lb('editorTabs.preset')}
-          </button>
-
-          {presetEditorTabs.map((tab) => (
+                s.extensionTab,
+                activePresetEditorTab === 'preset' && s.extensionTabActive,
+              )}
+              onClick={() => handleEditorTabChange('preset')}
+              onKeyDown={(event) => handleEditorTabKeyDown(event, 'preset')}
+            >
+              {lb('editorTabs.preset')}
+            </button>
             <button
-              key={tab.id}
+              ref={(element) => {
+                if (element) outerEditorTabRefs.current.set('agentic-runtime', element)
+                else outerEditorTabRefs.current.delete('agentic-runtime')
+              }}
               type="button"
               role="tab"
-              aria-selected={activePresetEditorTab === tab.id}
+              id={outerEditorDomId('tab', 'agentic-runtime')}
+              aria-controls={outerEditorDomId('panel', 'agentic-runtime')}
+              aria-selected={activePresetEditorTab === 'agentic-runtime'}
+              tabIndex={activePresetEditorTab === 'agentic-runtime' ? 0 : -1}
               className={clsx(
-              s.extensionTab,
-              activePresetEditorTab === tab.id &&
-              s.extensionTabActive,
-          )}
-             onClick={() => setActivePresetEditorTab(tab.id)}
+                s.extensionTab,
+                activePresetEditorTab === 'agentic-runtime' && s.extensionTabActive,
+              )}
+              onClick={() => handleEditorTabChange('agentic-runtime')}
+              onKeyDown={(event) => handleEditorTabKeyDown(event, 'agentic-runtime')}
+              disabled={!activePreset}
             >
-              {tab.title}
+              {lb('editorTabs.agenticRuntime')}
             </button>
-          ))}
-      </div>
+            {presetEditorTabs.map((tab) => (
+              <button
+                ref={(element) => {
+                  if (element) outerEditorTabRefs.current.set(tab.id, element)
+                  else outerEditorTabRefs.current.delete(tab.id)
+                }}
+                key={tab.id}
+                type="button"
+                role="tab"
+                id={outerEditorDomId('tab', tab.id)}
+                aria-controls={outerEditorDomId('panel', tab.id)}
+                aria-selected={activePresetEditorTab === tab.id}
+                tabIndex={activePresetEditorTab === tab.id ? 0 : -1}
+                className={clsx(
+                  s.extensionTab,
+                  activePresetEditorTab === tab.id && s.extensionTabActive,
+                )}
+                onClick={() => handleEditorTabChange(tab.id)}
+                onKeyDown={(event) => handleEditorTabKeyDown(event, tab.id)}
+              >
+                {tab.title}
+              </button>
+            ))}
+          </div>
 
-        {activePresetExtensionTab?.guide && (
-          <button
-            type="button"
-            className={s.extensionGuideButton}
-            onClick={() => setGuideOpen(true)}
-            aria-label={`Open guide for ${activePresetExtensionTab.title}`}
-            title="Open guide"
-          >
-            <CircleHelp size={15} strokeWidth={1.7} />
-          </button>
+          {activePresetExtensionTab?.guide && (
+            <button
+              type="button"
+              className={s.extensionGuideButton}
+              onClick={() => setGuideOpen(true)}
+              aria-label={`Open guide for ${activePresetExtensionTab.title}`}
+              title="Open guide"
+            >
+              <CircleHelp size={15} strokeWidth={1.7} />
+            </button>
+          )}
+        </div>
+      {presetEditorTabs.map((tab) => (
+        <div
+          key={tab.id}
+          className={s.extensionTabContent}
+          role="tabpanel"
+          id={outerEditorDomId('panel', tab.id)}
+          aria-labelledby={outerEditorDomId('tab', tab.id)}
+          tabIndex={0}
+          hidden={activePresetEditorTab !== tab.id}
+        >
+          {activePresetEditorTab === tab.id && (
+            <SpindlePresetEditorTabContent tab={tab} />
+          )}
+        </div>
+      ))}
+
+      <div
+        className={s.agentsTabContent}
+        role="tabpanel"
+        id={outerEditorDomId('panel', 'agentic-runtime')}
+        aria-labelledby={outerEditorDomId('tab', 'agentic-runtime')}
+        tabIndex={0}
+        hidden={!activePreset || activePresetEditorTab !== 'agentic-runtime'}
+      >
+        {activePreset && (
+          <AgenticRuntimePanel
+            key={activePreset.id}
+            preset={activePreset}
+            onSave={saveAgenticRuntime}
+            onDirtyChange={setAgenticRuntimeDirty}
+          />
         )}
       </div>
-    )}
-
-      {activePresetExtensionTab && (
-      <div
-        className={s.extensionTabContent}
-        role="tabpanel"
-      >
-        <SpindlePresetEditorTabContent
-          tab={activePresetExtensionTab}
-        />
-      </div>
-    )}
 
     {activePresetExtensionTab?.guide && (
   <GuideViewer
@@ -2694,7 +2854,14 @@ useEffect(() => {
   />
 )}
 
-      <div style={{ display: activePresetEditorTab === 'preset' ? 'contents' : 'none' }}>
+      <div
+        role="tabpanel"
+        id={outerEditorDomId('panel', 'preset')}
+        aria-labelledby={outerEditorDomId('tab', 'preset')}
+        tabIndex={0}
+        hidden={activePresetEditorTab !== 'preset'}
+        style={{ display: activePresetEditorTab === 'preset' ? 'contents' : 'none' }}
+      >
 
       {activePreset && <PresetCoverHeader preset={activePreset} />}
 

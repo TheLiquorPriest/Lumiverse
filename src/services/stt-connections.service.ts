@@ -10,6 +10,13 @@ import type {
 import type { PaginationParams, PaginatedResult } from "../types/pagination";
 import { paginatedQuery } from "./pagination";
 import { describeProviderError, fetchProviderJson } from "../utils/provider-errors";
+import {
+  clearImportedConnectionReview,
+  importedConnectionReviewCode,
+  isImportedConnectionReviewRequired,
+  markImportedConnectionForReview,
+  sanitizeConnectionMetadata,
+} from "./connection-authority";
 
 export interface SttProviderCapabilities {
   apiKeyRequired: boolean;
@@ -50,13 +57,31 @@ export function sttConnectionSecretKey(id: string): string {
 }
 
 function rowToProfile(row: any): SttConnectionProfile {
+  const metadata = JSON.parse(row.metadata || "{}") as Record<string, unknown>;
   return {
     ...row,
     is_default: !!row.is_default,
     has_api_key: !!row.has_api_key,
+    review_required: isImportedConnectionReviewRequired(metadata),
+    review_code: importedConnectionReviewCode(metadata),
     default_parameters: JSON.parse(row.default_parameters || "{}"),
-    metadata: JSON.parse(row.metadata || "{}"),
+    metadata,
   };
+}
+
+export function toPublicSttConnection(profile: SttConnectionProfile): SttConnectionProfile {
+  return { ...profile, metadata: sanitizeConnectionMetadata(profile.metadata) };
+}
+
+export function isSttConnectionUsable(
+  profile: Pick<SttConnectionProfile, "review_required"> | null | undefined,
+): boolean {
+  return profile?.review_required !== true;
+}
+
+export function getUsableConnection(userId: string, id: string): SttConnectionProfile | null {
+  const profile = getConnection(userId, id);
+  return isSttConnectionUsable(profile) ? profile : null;
 }
 
 export function listProviders(): SttProviderInfo[] {
@@ -166,21 +191,23 @@ export async function createConnection(userId: string, input: CreateSttConnectio
       input.is_default ? 1 : 0,
       hasApiKey,
       JSON.stringify(input.default_parameters || {}),
-      JSON.stringify(input.metadata || {}),
+      JSON.stringify(clearImportedConnectionReview(input.metadata || {})),
       now,
       now,
     );
 
   const profile = getConnection(userId, id)!;
-  eventBus.emit(EventType.STT_CONNECTION_CHANGED, { id, profile }, userId);
+  eventBus.emit(EventType.STT_CONNECTION_CHANGED, { id, profile: toPublicSttConnection(profile) }, userId);
   return profile;
 }
 
 export async function updateConnection(userId: string, id: string, input: UpdateSttConnectionInput): Promise<SttConnectionProfile | null> {
   const existing = getConnection(userId, id);
   if (!existing) return null;
+  const reviewRequested = input.reviewed === true;
+  const canSetDefault = !existing.review_required || reviewRequested;
 
-  if (input.is_default) {
+  if (input.is_default && canSetDefault) {
     getDb()
       .query("UPDATE stt_connections SET is_default = 0 WHERE is_default = 1 AND user_id = ?")
       .run(userId);
@@ -201,9 +228,19 @@ export async function updateConnection(userId: string, id: string, input: Update
   if (input.provider !== undefined) { fields.push("provider = ?"); values.push(input.provider); }
   if (input.api_url !== undefined) { fields.push("api_url = ?"); values.push(input.api_url); }
   if (input.model !== undefined) { fields.push("model = ?"); values.push(input.model); }
-  if (input.is_default !== undefined) { fields.push("is_default = ?"); values.push(input.is_default ? 1 : 0); }
+  if (input.is_default !== undefined) { fields.push("is_default = ?"); values.push(input.is_default && canSetDefault ? 1 : 0); }
   if (input.default_parameters !== undefined) { fields.push("default_parameters = ?"); values.push(JSON.stringify(input.default_parameters)); }
-  if (input.metadata !== undefined) { fields.push("metadata = ?"); values.push(JSON.stringify(input.metadata)); }
+  if (input.metadata !== undefined) {
+    fields.push("metadata = ?");
+    values.push(JSON.stringify(reviewRequested
+      ? clearImportedConnectionReview(input.metadata)
+      : existing.review_required
+        ? markImportedConnectionForReview(input.metadata, existing.review_code || "foreign_import")
+        : clearImportedConnectionReview(input.metadata)));
+  } else if (reviewRequested) {
+    fields.push("metadata = ?");
+    values.push(JSON.stringify(clearImportedConnectionReview(existing.metadata)));
+  }
 
   if (fields.length === 0 && input.api_key === undefined) return existing;
 
@@ -217,7 +254,7 @@ export async function updateConnection(userId: string, id: string, input: Update
     .run(...values);
 
   const updated = getConnection(userId, id)!;
-  eventBus.emit(EventType.STT_CONNECTION_CHANGED, { id, profile: updated }, userId);
+  eventBus.emit(EventType.STT_CONNECTION_CHANGED, { id, profile: toPublicSttConnection(updated) }, userId);
   return updated;
 }
 
@@ -227,9 +264,10 @@ export async function duplicateConnection(userId: string, id: string): Promise<S
 
   const newId = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
+  const reviewRequired = existing.review_required;
 
   let hasApiKey = 0;
-  if (existing.has_api_key) {
+  if (!reviewRequired && existing.has_api_key) {
     try {
       const apiKey = await secretsSvc.getSecret(userId, sttConnectionSecretKey(id));
       if (apiKey) {
@@ -241,6 +279,9 @@ export async function duplicateConnection(userId: string, id: string): Promise<S
     }
   }
 
+  const metadata = existing.review_required
+    ? markImportedConnectionForReview(clearImportedConnectionReview(existing.metadata), existing.review_code || "foreign_import")
+    : clearImportedConnectionReview(existing.metadata);
   getDb()
     .query(
       `INSERT INTO stt_connections
@@ -257,13 +298,13 @@ export async function duplicateConnection(userId: string, id: string): Promise<S
       0,
       hasApiKey,
       JSON.stringify(existing.default_parameters),
-      JSON.stringify(existing.metadata),
+      JSON.stringify(metadata),
       now,
       now,
     );
 
   const profile = getConnection(userId, newId)!;
-  eventBus.emit(EventType.STT_CONNECTION_CHANGED, { id: newId, profile }, userId);
+  eventBus.emit(EventType.STT_CONNECTION_CHANGED, { id: newId, profile: toPublicSttConnection(profile) }, userId);
   return profile;
 }
 
@@ -296,8 +337,8 @@ export async function clearConnectionApiKey(userId: string, id: string): Promise
 }
 
 export async function testConnection(userId: string, id: string): Promise<{ success: boolean; message: string; provider: string }> {
-  const profile = getConnection(userId, id);
-  if (!profile) return { success: false, message: "Connection not found", provider: "" };
+  const profile = getUsableConnection(userId, id);
+  if (!profile) return { success: false, message: "Connection requires owner review", provider: "" };
 
   const provider = getProvider(profile.provider);
   if (!provider) {
@@ -336,8 +377,8 @@ export async function listConnectionModels(
   userId: string,
   id: string,
 ): Promise<{ models: Array<{ id: string; label: string }>; provider: string; error?: string }> {
-  const profile = getConnection(userId, id);
-  if (!profile) return { models: [], provider: "", error: "Connection not found" };
+  const profile = getUsableConnection(userId, id);
+  if (!profile) return { models: [], provider: "", error: "Connection requires owner review" };
 
   const apiKey = await secretsSvc.getSecret(userId, sttConnectionSecretKey(id));
   return listConnectionModelsPreview(userId, {
@@ -353,6 +394,9 @@ export async function listConnectionModelsPreview(
   input: SttConnectionModelsPreviewInput,
 ): Promise<{ models: Array<{ id: string; label: string }>; provider: string; error?: string }> {
   const existing = input.connection_id ? getConnection(userId, input.connection_id) : null;
+  if (existing && !isSttConnectionUsable(existing)) {
+    return { models: [], provider: input.provider, error: "Connection requires owner review" };
+  }
   const providerId = input.provider;
 
   const provider = getProvider(providerId);

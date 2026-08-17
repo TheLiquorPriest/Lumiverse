@@ -15,6 +15,7 @@ function initCharactersTestDb(): void {
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
     name TEXT NOT NULL,
+    library_scope TEXT NOT NULL DEFAULT 'mine' CHECK(library_scope IN ('mine', 'shared')),
     avatar_path TEXT,
     image_id TEXT,
     description TEXT NOT NULL DEFAULT '',
@@ -113,6 +114,9 @@ describe("POST /:id/replace-card", () => {
       alternate_greetings: ["new alternate"],
     });
     expect(character.extensions).toEqual({
+      // Every character read canonicalizes the library-scope mirror into
+      // extensions (099), and replace-card preserves _lumiverse_ keys.
+      _lumiverse_library_scope: "mine",
       importedExtension: "kept",
       ttsVoice: { connectionId: "voice-connection", voice: "Original voice" },
       avatar_crop_image_id: "avatar-crop",

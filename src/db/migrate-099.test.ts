@@ -77,24 +77,19 @@ describe("099 character library scope migration", () => {
     expect(sql.replaceAll("\r\n", "\n")).toBe(MIGRATION_099_SQL);
   });
 
-  test("excludes 099 from the baseline and applies it once after bootstrap", async () => {
+  test("ships 099 in the baseline and never re-applies it", async () => {
     const db = new Database(":memory:");
     const migrationsDir = makeMigrationDir();
     try {
       await runMigrations(db, migrationsDir);
 
-      expect(
-        (db.query("PRAGMA table_info('characters')").all() as Array<{ name: string }>).some(
-          (column) => column.name === "library_scope",
-        ),
-      ).toBe(false);
+      // Baseline bootstrap carries the 099 schema and records the migration
+      // as squashed, so the baseline and the migrated schema stay in sync.
       expect(
         db.query("SELECT COUNT(*) AS count FROM _migrations WHERE name = ?").get(MIGRATION_099),
-      ).toEqual({ count: 0 });
+      ).toEqual({ count: 1 });
 
       db.run("INSERT INTO characters (id, name) VALUES ('existing', 'Existing')");
-      installMigration(migrationsDir);
-      await runMigrations(db, migrationsDir);
 
       expect(db.query("SELECT library_scope FROM characters WHERE id = 'existing'").get()).toEqual({
         library_scope: "mine",
@@ -130,6 +125,10 @@ describe("099 character library scope migration", () => {
         db.run("INSERT INTO characters (id, name, library_scope) VALUES ('invalid', 'Invalid', 'invalid')"),
       ).toThrow();
 
+      // A migration file reappearing after bootstrap (e.g. a release install
+      // that still ships it) must be skipped, not re-applied — re-running
+      // ALTER TABLE would fail with a duplicate column name.
+      installMigration(migrationsDir);
       await runMigrations(db, migrationsDir);
       expect(
         db.query("SELECT COUNT(*) AS count FROM _migrations WHERE name = ?").get(MIGRATION_099),

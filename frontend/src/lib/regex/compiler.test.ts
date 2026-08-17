@@ -6,7 +6,13 @@ mock.module('@/lib/spindle/display-resolver-registry', () => ({
   getDisplayResolverForChat: () => undefined,
 }))
 
-const { applyDisplayRegex } = await import('./compiler')
+const {
+  REGEX_LIMITS_V1,
+  applyDisplayRegex,
+  compileRegex,
+  regexUtf8ByteLength,
+  validateRegexScriptInput,
+} = await import('./compiler')
 
 function script(overrides: Partial<RegexScript>): RegexScript {
   return {
@@ -121,5 +127,65 @@ describe('display regex performance reporting', () => {
 
     expect(recovered).toHaveLength(1)
     expect(recovered[0].elapsedMs).toBeLessThan(5000)
+  })
+})
+
+describe('bounded regex validation', () => {
+  test('uses UTF-8 byte limits and rejects empty trim strings', () => {
+    const invalid = validateRegexScriptInput({
+      find_regex: '😀'.repeat(20_000),
+      replace_string: '',
+      flags: 'g',
+      trim_strings: [],
+      actions: [],
+    })
+    expect(invalid?.code).toBe('pattern_too_large')
+    expect(compileRegex('😀'.repeat(20_000), 'g')).toBeNull()
+    expect(validateRegexScriptInput({
+      find_regex: 'x',
+      replace_string: 'y',
+      flags: 'g',
+      trim_strings: [''],
+      actions: [],
+    })?.code).toBe('trim_string_empty')
+  })
+
+  test('empty trim strings never enter a repeated replacement loop', () => {
+    expect(applyDisplayRegex(
+      'x',
+      [script({ find_regex: 'x', replace_string: 'y', trim_strings: [''] })],
+      { isUser: false, depth: 0 },
+    )).toBe('y')
+  })
+})
+
+describe('exact output byte accounting', () => {
+  test('accepts an exact-cap split-surrogate replacement and rejects cap plus one', () => {
+    const emojiCount = Math.floor(REGEX_LIMITS_V1.maxOutputBytes / 4)
+    const base = '😀'.repeat(emojiCount)
+    const replacementScript = script({
+      find_regex: '\\uD83D',
+      replace_string: 'a',
+      flags: '',
+      substitute_macros: 'raw',
+    })
+
+    const atCapInput = base
+    const atCapOutput = atCapInput.replace('\uD83D', 'a')
+    expect(regexUtf8ByteLength(atCapInput)).toBe(REGEX_LIMITS_V1.maxInputBytes)
+    expect(regexUtf8ByteLength(atCapOutput)).toBe(REGEX_LIMITS_V1.maxOutputBytes)
+    expect(applyDisplayRegex(
+      atCapInput,
+      [replacementScript],
+      { isUser: false, depth: 0 },
+    )).toBe(atCapOutput)
+
+    const overCapOutput = atCapInput.replace('\uD83D', 'aa')
+    expect(regexUtf8ByteLength(overCapOutput)).toBe(REGEX_LIMITS_V1.maxOutputBytes + 1)
+    expect(applyDisplayRegex(
+      atCapInput,
+      [{ ...replacementScript, replace_string: 'aa' }],
+      { isUser: false, depth: 0 },
+    )).toBe(atCapInput)
   })
 })

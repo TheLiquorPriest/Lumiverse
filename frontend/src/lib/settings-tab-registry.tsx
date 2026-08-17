@@ -3,7 +3,7 @@ import {
   Sliders, MessageSquare, Users, PanelRight,
   Compass, Reply, HardDrive, Puzzle, Database, Hash, Activity,
   Globe, Bell, Import, Brain, Terminal, Volume2, Plug, Search, UserRound,
-  PackageOpen, KeyRound,
+  PackageOpen, KeyRound, Bot, Library,
   Keyboard,
 } from 'lucide-react'
 import { useStore } from '@/store'
@@ -179,6 +179,34 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabDescription: 'Configure memory cortex extraction and salience',
     tabIcon: Brain,
     keywords: ['memory', 'cortex', 'entities', 'relations', 'salience', 'extraction', 'brain', 'recall'],
+    component: INLINE_SENTINEL,
+  },
+  {
+    id: 'agentRuntime',
+    shortName: 'Agent Runtime',
+    tabName: 'Agent Runtime',
+    tabDescription: 'Review runtime defaults, retention, and host-owned ceilings',
+    tabIcon: Bot,
+    keywords: ['agent', 'runtime', 'agentic', 'defaults', 'retention', 'limits', 'isolate', 'workspace'],
+    sections: [
+      { key: 'defaults', titleKey: 'agentRuntimeSettings.defaults.title', titleFallback: 'Mode precedence', keywords: ['mode', 'response', 'agentic', 'default', 'override'] },
+      { key: 'retention', titleKey: 'agentRuntimeSettings.retention.title', titleFallback: 'Workspace retention', keywords: ['workspace', 'retention', 'terminal', 'published', 'artifacts'] },
+      { key: 'limits', titleKey: 'agentRuntimeSettings.limits.title', titleFallback: 'Host ceilings', keywords: ['limits', 'ceilings', 'isolate', 'resource', 'capacity'] },
+    ],
+    component: INLINE_SENTINEL,
+  },
+  {
+    id: 'contextLibrary',
+    shortName: 'Context Library',
+    tabName: 'Context Library',
+    tabDescription: 'Manage versioned context packs and their attachments',
+    tabIcon: Library,
+    keywords: ['context', 'library', 'packs', 'versions', 'attachments', 'acl', 'portable'],
+    sections: [
+      { key: 'versions', titleKey: 'contextLibrary.sections.versions', titleFallback: 'Version history', keywords: ['versions', 'immutable', 'history', 'content'] },
+      { key: 'attachments', titleKey: 'contextLibrary.sections.attachments', titleFallback: 'Attachments', keywords: ['attach', 'preset', 'chat', 'world book'] },
+      { key: 'access', titleKey: 'contextLibrary.sections.access', titleFallback: 'Access', keywords: ['visibility', 'access', 'acl', 'review'] },
+    ],
     component: INLINE_SENTINEL,
   },
   {
@@ -400,8 +428,8 @@ export function getSettingsSearchIndex(userRole?: string): SettingsSearchEntry[]
 export function settingsRegistryToCommands(entries: SettingsTabEntry[]): Command[] {
   return entries.map((entry) => ({
     id: `settings-${entry.id}`,
-    label: entry.tabName,
-    description: entry.tabDescription,
+    label: translateSettingsField(entry.id, 'tabName', entry.tabName),
+    description: translateSettingsField(entry.id, 'tabDescription', entry.tabDescription),
     icon: entry.tabIcon,
     keywords: entry.keywords,
     group: 'settings',

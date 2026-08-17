@@ -24,6 +24,7 @@ function initTestDb(): void {
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
     name TEXT NOT NULL,
+    library_scope TEXT NOT NULL DEFAULT 'mine' CHECK(library_scope IN ('mine', 'shared')),
     description TEXT NOT NULL DEFAULT '',
     personality TEXT NOT NULL DEFAULT '',
     scenario TEXT NOT NULL DEFAULT '',

@@ -9,6 +9,8 @@ import * as gallerySvc from "./character-gallery.service";
 import * as secretsSvc from "./secrets.service";
 import * as imageGenConnSvc from "./image-gen-connections.service";
 import { imageGenConnectionSecretKey } from "./image-gen-connections.service";
+import * as connectionsSvc from "./connections.service";
+import { connectionSecretKey } from "./connections.service";
 import * as imageGenBindingsSvc from "./image-gen-preset-bindings.service";
 import * as characterLoraSvc from "./character-lora.service";
 import {
@@ -338,8 +340,8 @@ export async function generateSceneBackground(
     throw new Error("No image generation connection selected. Create one in Settings → Image Gen Connections.");
   }
 
-  const connection = imageGenConnSvc.getConnection(userId, connectionId);
-  if (!connection) throw new Error("Image generation connection not found");
+  const connection = imageGenConnSvc.getUsableConnection(userId, connectionId);
+  if (!connection) throw new Error("Image generation connection not found or requires owner review");
 
   const provider = getImageProvider(connection.provider);
   if (!provider) throw new Error(`Unknown image generation provider: ${connection.provider}`);
@@ -722,8 +724,8 @@ export async function previewImagePrompt(
   if (!connectionId) {
     throw new Error("No image generation connection selected. Create one in Settings → Image Gen Connections.");
   }
-  const connection = imageGenConnSvc.getConnection(userId, connectionId);
-  if (!connection) throw new Error("Image generation connection not found");
+  const connection = imageGenConnSvc.getUsableConnection(userId, connectionId);
+  if (!connection) throw new Error("Image generation connection not found or requires owner review");
   const provider = getImageProvider(connection.provider);
   if (!provider) throw new Error(`Unknown image generation provider: ${connection.provider}`);
 
@@ -1402,14 +1404,13 @@ function parsePromptResponse(input: string, fallbackNegative?: string): { prompt
 }
 
 async function resolvePromptParser(userId: string, settings: ImageGenSettings, input?: ImageGenPromptPreset) {
-  const { getConnection } = await import("./connections.service");
   const configuredId = input?.parserConnectionId || settings.promptParserConnectionId;
   let model = input?.parserModel || settings.promptParserModel || "";
   let parameters = input?.parserParameters || settings.promptParserParameters || {};
 
   if (configuredId) {
-    const connection = getConnection(userId, configuredId);
-    if (!connection) throw new Error("Image prompt parser connection not found");
+    const connection = connectionsSvc.getUsableConnection(userId, configuredId);
+    if (!connection) throw new Error("Image prompt parser connection not found or requires owner review");
     return { connection, model: model || connection.model, parameters };
   }
 
@@ -1418,8 +1419,8 @@ async function resolvePromptParser(userId: string, settings: ImageGenSettings, i
     throw new Error("Image prompt parser connection is required. Select one in ImageGen settings or configure the Council sidecar.");
   }
 
-  const connection = getConnection(userId, sidecar.connectionProfileId);
-  if (!connection) throw new Error("Sidecar connection not found");
+  const connection = connectionsSvc.getUsableConnection(userId, sidecar.connectionProfileId);
+  if (!connection) throw new Error("Sidecar connection not found or requires owner review");
   model = model || sidecar.model;
   parameters = Object.keys(parameters).length > 0 ? parameters : {
     temperature: sidecar.temperature,
@@ -1800,7 +1801,7 @@ export function getImageGenSettings(userId: string): ImageGenSettings {
   };
   const savedConnectionId = settings.activeImageGenConnectionId || null;
   const savedConnection = savedConnectionId
-    ? imageGenConnSvc.getConnection(userId, savedConnectionId)
+    ? imageGenConnSvc.getUsableConnection(userId, savedConnectionId)
     : null;
 
   if (savedConnection) return settings;
@@ -1888,8 +1889,7 @@ async function maybeAutoMigrate(userId: string, settings: ImageGenSettings): Pro
 
   // Migrate Google Gemini (borrow API key from LLM connection)
   if (settings.google?.connectionProfileId) {
-    const { getConnection, connectionSecretKey } = await import("./connections.service");
-    const llmConn = getConnection(userId, settings.google.connectionProfileId);
+    const llmConn = connectionsSvc.getUsableConnection(userId, settings.google.connectionProfileId);
     if (llmConn) {
       const llmApiKey = await secretsSvc.getSecret(userId, connectionSecretKey(settings.google.connectionProfileId));
       const conn = await imageGenConnSvc.createConnection(userId, {
@@ -2040,7 +2040,7 @@ export function exportImageGenConfig(
 
   if (options?.includeParameters !== false) {
     const activeId = settings.activeImageGenConnectionId;
-    const active = activeId ? imageGenConnSvc.getConnection(userId, activeId) : null;
+    const active = activeId ? imageGenConnSvc.getUsableConnection(userId, activeId) : null;
     if (active) {
       out.generation_parameters = {
         provider: active.provider,
@@ -2237,7 +2237,7 @@ export async function importImageGenConfig(
         ? generationParams.parameters
         : null;
     const activeId = current.activeImageGenConnectionId;
-    const active = activeId ? imageGenConnSvc.getConnection(userId, activeId) : null;
+    const active = activeId ? imageGenConnSvc.getUsableConnection(userId, activeId) : null;
     if (!parameters) {
       errors.push("Generation parameters entry is malformed and was skipped");
     } else if (!active) {

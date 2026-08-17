@@ -106,6 +106,16 @@
       "shortName": "遷移",
       "tabName": "遷移",
       "tabDescription": "從 SillyTavern 等來源導入數據"
+    },
+    "agentRuntime": {
+      "shortName": "Agentic 執行階段",
+      "tabName": "Agentic 執行階段",
+      "tabDescription": "檢視執行階段預設值、保留政策與主機上限"
+    },
+    "contextLibrary": {
+      "shortName": "脈絡庫",
+      "tabName": "脈絡庫",
+      "tabDescription": "管理具版本的脈絡套件及其附件"
     }
   },
   "account": {
@@ -636,13 +646,11 @@
     "importWarn": "上傳後在後臺處理。在看到完成摘要前請勿關閉此標籤頁——處理期間可繼續使用 Lumiverse。",
     "importing": "導入中…",
     "uploadImport": "上傳並導入",
+    "reuploadImport": "重新上傳歸檔",
     "cancel": "取消",
     "ticketPrompt": "此歸檔含 {{count}} 個加密機密。上傳票據文件以恢復。",
     "ticketPrompt_other": "此歸檔含 {{count}} 個加密機密。上傳票據文件以恢復。",
     "skipApiKeys": "跳過 API 密鑰",
-    "ticketReuse": "注意：此票據已使用 {{uses}} 次。繼續將覆蓋本賬戶上匹配的 API 密鑰。",
-    "ticketReuse_other": "注意：此票據已使用 {{uses}} 次{{lastUsed}}。繼續將覆蓋本賬戶上匹配的 API 密鑰。",
-    "ticketLastUsed": "（上次使用 {{date}}）",
     "uploading": "上傳中… {{pct}}%",
     "verifying": "正在驗證歸檔…",
     "importQueued": "已排隊，開始導入…",
@@ -659,6 +667,7 @@
     "filesRestored": "文件已恢復",
     "vectorsRestored": "已恢復 {{table}} 的向量",
     "vectorsSkipped": "跳過向量（配置不匹配）",
+    "cleanupPending": "正在完成導入清理",
     "importGeneric": "導入中…",
     "importComplete": "導入完成",
     "uploadFailed": "上傳失敗",
@@ -666,6 +675,7 @@
     "ticketSubmitFailed": "提交票據失敗",
     "skipFailed": "跳過失敗",
     "cancelFailed": "取消失敗",
+    "cancelTooLate": "導入已無法取消",
     "summaryTable": "表",
     "summaryImported": "已導入",
     "summarySkipped": "已跳過",
@@ -674,7 +684,71 @@
     "importFailed": "導入失敗",
     "exportPrepareFailed": "導出準備失敗",
     "exportAnchorMissing": "內部錯誤：缺少下載錨點",
-    "exportTableSuffix": " ({{processed}})"
+    "exportTableSuffix": " ({{processed}})",
+    "cancelling": "正在取消…",
+    "skippingTicket": "正在跳過…",
+    "reconnect": "重新整理狀態",
+    "jobStatus": "導入狀態：{{status}}",
+    "archiveId": "歸檔 {{id}}",
+    "noActiveJob": "此分頁目前沒有連結的導入工作。",
+    "summaryFilesNone": "沒有恢復文件",
+    "summarySecrets": "機密",
+    "summaryVectors": "向量",
+    "vectorStatuses": {
+      "included": "已包含",
+      "rebuild_required": "需要重建",
+      "skipped": "已略過",
+      "unknown": "未知"
+    },
+    "statuses": {
+      "queued": "排隊中",
+      "validating": "驗證中",
+      "awaiting_ticket": "等待票據",
+      "running": "執行中",
+      "installing": "恢復文件中",
+      "ready": "準備套用",
+      "committing": "提交中",
+      "cancelling": "正在取消",
+      "cleanup_pending": "正在完成清理",
+      "complete": "已完成",
+      "failed": "失敗",
+      "cancelled": "已取消"
+    },
+    "failureReasons": {
+      "unknown": "導入失敗，原因不明。",
+      "malformed_response": "伺服器回傳了無效的可移植性狀態。",
+      "archive_validation_failed": "歸檔驗證失敗。",
+      "not_zip": "文件不是 ZIP 歸檔。",
+      "size": "歸檔過大。",
+      "no_manifest": "缺少歸檔清單。",
+      "bad_manifest": "歸檔清單無效。",
+      "archive_identity_mismatch": "此歸檔與現有導入不匹配。",
+      "upload_failed": "歸檔上傳失敗。",
+      "upload_timeout": "歸檔上傳逾時。",
+      "upload_aborted": "歸檔上傳已取消。",
+      "import_start_failed": "無法啟動導入。",
+      "import_failed": "導入失敗。",
+      "integrity_failure": "歸檔完整性檢查失敗。",
+      "multipart_not_supported": "不支援多部分歸檔上傳。",
+      "export_capacity": "正在執行的可移植性操作過多。",
+      "manual_recovery_required": "導入需要伺服器恢復。",
+      "process_interrupted": "導入因重新啟動而中斷。",
+      "cancelled": "導入已取消。",
+      "too_late": "導入已無法取消。",
+      "not_found": "找不到導入工作。",
+      "ticket_required": "需要解密票據。",
+      "ticket_invalid": "解密票據無效。",
+      "ticket_submission_failed": "無法提交解密票據。",
+      "ticket_gate_conflict": "票據狀態已由其他操作處理。",
+      "replayed": "票據已使用。",
+      "stale": "票據已過期或失效。",
+      "wrong_issuer": "不接受此票據簽發者。",
+      "invalid_issuer_instance": "票據簽發者身分無效。",
+      "unsupported_version": "不支援此票據版本。",
+      "archive_mismatch": "票據與歸檔不匹配。",
+      "binding_mismatch": "票據對此導入無效。",
+      "network": "無法連線至可移植性服務。"
+    }
   },
   "advanced": {
     "title": "高級",
@@ -1470,5 +1544,243 @@
     "memoryModeConservative": "保守 — 更少、更高質量的記憶",
     "memoryModeBalanced": "均衡 — 標準檢索（推薦）",
     "memoryModeAggressive": "激進 — 更多記憶、更低閾值"
+  },
+  "agentRuntimeSettings": {
+    "eyebrow": "Agentic 執行階段",
+    "title": "Agentic 執行階段",
+    "description": "檢視實際套用的預設值、保留行為與唯讀主機上限。",
+    "defaults": {
+      "title": "模式優先順序",
+      "description": "Lumiverse 會為每輪選擇模式，而不變更預設集。",
+      "oneTurn": "單輪選擇",
+      "oneTurnHelp": "通過驗證的選擇只套用一次，並使用一次性決策權杖。",
+      "chat": "聊天覆寫",
+      "chatHelp": "聊天選擇會持續套用，直到明確變更為止。",
+      "preset": "預設集預設值",
+      "presetHelp": "所選預設集會提供經審核的預設模式。",
+      "response": "回應備用模式",
+      "responseHelp": "Agentic 無法使用或未被選取時，仍可使用回應模式。"
+    },
+    "retention": {
+      "title": "工作區保留政策",
+      "description": "各預設集可在主機上限內分別設定保留政策。",
+      "operational": "作業期間",
+      "operationalHelp": "僅在目前回合進行時可用，並在結束清理時移除。",
+      "terminal": "回合結束期",
+      "terminalHelp": "在有限的回合結束期間內保留，僅供檢視活動與工作區。",
+      "chatLifetime": "聊天存續期間",
+      "chatLifetimeHelp": "只有明確發布的成品會保留在所屬聊天中。"
+    },
+    "limits": {
+      "title": "主機上限",
+      "description": "這些實際程序限制可保護供應商、隔離環境、活動與資源容量。",
+      "loading": "正在載入主機上限…",
+      "error": "主機上限暫時無法使用。",
+      "retry": "重試",
+      "readOnly": "這些值僅供參考。預設集、匯入內容與擴充功能皆無法提高上限。",
+      "turn": "回合配額",
+      "activity": "活動儲存空間",
+      "capacity": "程序容量",
+      "fields": {
+        "childAdmissions": "子項准入數",
+        "aggregateToolCalls": "工具呼叫總數",
+        "logicalProviderRequests": "邏輯供應商要求數",
+        "physicalDispatchAttempts": "實際分派嘗試次數",
+        "childOutputTokens": "子項輸出權杖數",
+        "rootWallClockMs": "根工作執行時間（毫秒）",
+        "activityEvents": "活動事件數",
+        "activityBytes": "活動資料位元組數",
+        "lifecycleLogRecords": "生命週期記錄數",
+        "activeRootsPerUser": "每位使用者的作用中根工作數",
+        "activeRootsProcess": "每個程序的作用中根工作數",
+        "providerDispatchesPerUser": "每位使用者的供應商分派數",
+        "providerDispatchesProcess": "每個程序的供應商分派數",
+        "toolExecutionsPerUser": "每位使用者的工具執行數",
+        "toolExecutionsProcess": "每個程序的工具執行數"
+      }
+    }
+  },
+  "contextLibrary": {
+    "eyebrow": "帳號脈絡",
+    "title": "脈絡庫",
+    "description": "建立不可變且具版本的脈絡套件，並將經審核的修訂版本附加至預設集、聊天或世界書。",
+    "copySuffix": "副本",
+    "packs": "套件",
+    "packList": "脈絡套件",
+    "loading": "正在載入脈絡套件…",
+    "loadingDetail": "正在載入套件詳細資料…",
+    "loadingTargets": "正在載入擁有的目標…",
+    "targetLoadError": "無法載入您擁有的附加目標。",
+    "targetsLoaded": "已載入您擁有的附加目標。",
+    "noTargetsAvailable": "此範圍沒有可用的自有目標。",
+    "selectTarget": "選取您擁有的目標",
+    "selectPack": "選取脈絡套件以檢視。",
+    "emptyTitle": "建立第一個脈絡套件",
+    "emptyDescription": "加入穩定的參考資料，再將不可變的修訂版本附加至所需位置。",
+    "noDescription": "無描述",
+    "noAttachments": "無附件",
+    "privateOnly": "尚未授予其他帳號存取權。",
+    "unavailableTarget": "目標無法使用",
+    "exportComplete": "可攜式快照已匯出。",
+    "exporting": "正在匯出可攜式快照…",
+    "importing": "正在匯入可攜式快照…",
+    "importComplete": "已匯入「{{name}}」。請先審核，再附加或啟用。",
+    "importFileLabel": "選擇要匯入的脈絡套件 JSON 快照",
+    "versionNumber": "修訂版本 {{number}}",
+    "byteCount": "{{count}} 位元組",
+    "versionHistoryCaption": "不可變的脈絡套件修訂記錄",
+    "versionImmutableHelp": "已發布的修訂版本無法編輯。若要變更內容，請建立新的修訂版本。",
+    "immutable": "不可變",
+    "previewTitle": "修訂版本 {{number}} 預覽",
+    "contentHelp": "項目會依序儲存為原始脈絡。同一修訂版本內的 ID 不可重複。",
+    "entryNumber": "項目 {{number}}",
+    "addEntry": "新增項目",
+    "removeEntry": "移除項目 {{number}}",
+    "tagsHelp": "請以逗號分隔標籤。",
+    "requiredAttachment": "將此附件視為 Agentic 預檢的必要項目",
+    "attachmentsDescription": "附件會將指定的不可變修訂版本綁定至您擁有的一個目標。",
+    "accessDescription": "伺服器會在每次操作時重新驗證可見性與 ACL 授權。",
+    "accessList": "帳號存取清單",
+    "accessFor": "{{name}} 的存取權",
+    "addAccess": "新增存取權",
+    "removeAccess": "移除 {{name}} 的存取權",
+    "aclServerAuthority": "伺服器會驗證主體、擁有權、目前的 ACL 修訂版本與要求的權限。",
+    "reviewTitle": "需要驗證後審核",
+    "reviewDescription": "此套件目前停用。請檢查其內容並明確同意在本機使用，才能啟用。",
+    "repairDescription": "此套件必須先修復，才能進行審核或附加。",
+    "reviewAcknowledgement": "我已檢查此套件的可見性、內容與存取授權，並要啟用此套件。",
+    "preserveAttachments": "複製目前已授權的附件",
+    "deleteTitle": "刪除脈絡套件",
+    "deleteDescription": "刪除此套件及其擁有的修訂版本與附件。",
+    "deleteWarning": "要刪除「{{name}}」嗎？此操作無法復原。",
+    "detachFrom": "從 {{name}} 卸離",
+    "status": {
+      "active": "就緒",
+      "disabled": "已停用",
+      "review_required": "需要審核",
+      "repair_required": "需要修復"
+    },
+    "source": {
+      "local": "本機",
+      "portable_import": "可攜式匯入",
+      "archive_restore": "封存還原",
+      "same_account_duplicate": "相同帳號副本"
+    },
+    "visibility": {
+      "private": "私人",
+      "account": "帳號",
+      "restricted": "受限",
+      "help": "所有 ACL 與目標操作皆以伺服器的判定為準。"
+    },
+    "scopes": {
+      "preset": "預設集",
+      "chat": "聊天",
+      "world_book": "世界書"
+    },
+    "acl": {
+      "read": "讀取",
+      "use": "使用",
+      "edit": "編輯"
+    },
+    "attachmentState": {
+      "active": "作用中",
+      "disabled": "已停用",
+      "review_required": "需要審核",
+      "repair_required": "需要修復"
+    },
+    "sections": {
+      "versions": "版本記錄",
+      "attachments": "附件",
+      "access": "可見性與存取權"
+    },
+    "fields": {
+      "name": "名稱",
+      "description": "描述",
+      "visibility": "可見性",
+      "content": "修訂內容",
+      "entryId": "項目 ID",
+      "entryTitle": "項目標題",
+      "tags": "標籤",
+      "body": "內文",
+      "scope": "附件範圍",
+      "target": "目標",
+      "version": "修訂版本",
+      "account": "帳號使用者 ID",
+      "access": "權限",
+      "source": "來源",
+      "updated": "更新時間"
+    },
+    "columns": {
+      "version": "修訂版本",
+      "state": "狀態",
+      "size": "大小",
+      "created": "建立時間",
+      "actions": "操作"
+    },
+    "actions": {
+      "create": "建立套件",
+      "import": "匯入快照",
+      "cancel": "取消",
+      "refresh": "重新整理",
+      "reviewLatest": "檢視最新版本",
+      "retryTargets": "重試目標載入",
+      "edit": "編輯詳細資料",
+      "duplicate": "建立副本",
+      "export": "匯出所選修訂版本",
+      "review": "審核並啟用",
+      "newVersion": "新增修訂版本",
+      "preview": "預覽",
+      "attach": "附加修訂版本",
+      "manageAccess": "管理存取權",
+      "delete": "刪除"
+    },
+    "dialogs": {
+      "create": {
+        "title": "建立脈絡套件",
+        "description": "建立本機套件及其第一個不可變修訂版本。",
+        "confirm": "建立套件"
+      },
+      "edit": {
+        "title": "編輯套件詳細資料",
+        "description": "更新中繼資料，而不變更不可變的修訂內容。",
+        "confirm": "儲存詳細資料"
+      },
+      "revision": {
+        "title": "建立修訂版本",
+        "description": "以最新內容為基礎，發布新的不可變修訂版本。",
+        "confirm": "建立修訂版本"
+      },
+      "attach": {
+        "title": "附加修訂版本",
+        "description": "將指定修訂版本綁定至您擁有的一個預設集、聊天或世界書。",
+        "confirm": "附加"
+      },
+      "acl": {
+        "title": "管理存取權",
+        "description": "要求明確的帳號權限。伺服器會重新驗證每個主體。",
+        "confirm": "儲存存取權"
+      },
+      "review": {
+        "title": "審核匯入的套件",
+        "description": "啟用是需要驗證的明確操作，絕不會因匯入而自動執行。",
+        "confirm": "啟用套件"
+      },
+      "duplicate": {
+        "title": "建立套件副本",
+        "description": "在相同帳號中建立私人副本，並保留不可變的修訂記錄。",
+        "confirm": "建立副本"
+      },
+      "delete": {
+        "title": "刪除套件",
+        "description": "從帳號中移除此脈絡套件。",
+        "confirm": "刪除套件"
+      }
+    },
+    "errors": {
+      "not_found": "此脈絡套件無法使用，或您已無權存取。",
+      "revision_conflict": "此套件已在其他工作階段中變更。目前顯示伺服器上的最新版本；請先檢視再重試此變更。",
+      "validation_failed": "伺服器拒絕此脈絡套件的變更。請檢查欄位後再試一次。",
+      "unavailable": "脈絡庫暫時無法使用。"
+    }
   }
 }

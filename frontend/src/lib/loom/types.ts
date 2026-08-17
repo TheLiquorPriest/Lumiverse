@@ -1,3 +1,8 @@
+export const AGENT_INVOCATION_DEFAULT = 64
+export const AGENT_INVOCATION_MIN = 1
+export const AGENT_TOOL_CALL_DEFAULT = 64
+export const AGENT_TOOL_CALL_MIN = 1
+
 export type LoomInjectTag = 'user_append' | 'assistant_append'
 
 export interface PromptVariableOption {
@@ -123,6 +128,8 @@ export interface PromptBlock {
   sealedOriginPresetId?: string
   sealedOriginVersion?: string | null
   sealedSha256?: string
+  /** Monotonic block revision used by Agentic cognition references. */
+  revision?: number
 }
 
 export interface SamplerOverrides {
@@ -176,6 +183,252 @@ export interface AdvancedSettings {
   trimIncompleteWords: boolean
 }
 
+export type CoreAgentToolId =
+  | 'lore_list_books'
+  | 'lore_get_book'
+  | 'lore_list_entries'
+  | 'lore_get_entry'
+  | 'lore_search_entries'
+  | 'chat_search_history'
+
+export type AgentLoreScope = 'active' | 'all_owned'
+export type AgentFailurePolicy = 'required' | 'optional'
+
+
+export type LoomPassthroughMetadata = Record<string, unknown>
+
+export type AgentMode = 'response' | 'agentic'
+
+export type AgentCapability =
+  | 'generation'
+  | 'streaming'
+  | 'tool_calling'
+  | 'native_tool_continuation'
+  | 'tools_disabled_finalization'
+
+/** Mirrors the closed server workspace operation vocabulary in canonical order. */
+export const WORKSPACE_CAPABILITIES = [
+  'read_section',
+  'read_page',
+  'create_task',
+  'update_assigned_progress',
+  'submit_child_result',
+  'accept_submission',
+  'record_finding',
+  'record_decision',
+  'record_question',
+  'attach_artifact',
+  'propose_publication',
+] as const
+export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number]
+
+export type AgentConnectionRef =
+  | { kind: 'inherit_main' }
+  | { kind: 'slot'; slotId: string }
+
+export interface AgentConnectionSlot {
+  id: string
+  label: string
+  requiredCapabilities: AgentCapability[]
+}
+
+export interface AgentPromptBlockRef {
+  blockId: string
+  expectedPresetRevision: number
+  expectedBlockRevision: number
+}
+
+export interface AgentCognitionPolicy {
+  workPolicy: AgentPromptBlockRef[]
+  workspaceUsage: AgentPromptBlockRef[]
+  completionCriteria: AgentPromptBlockRef[]
+  renderPolicy: AgentPromptBlockRef[]
+}
+
+export type CognitionScalar = string | number | boolean
+export type CognitionValue = CognitionScalar | string[]
+export type CognitionPhase =
+  | 'ASSEMBLE'
+  | 'WORK'
+  | 'COMPLETE'
+  | 'RENDER'
+  | 'PREPARE_COMMIT'
+  | 'COMMITTING'
+  | 'COMMITTED'
+  | 'COMMIT_FAILED'
+  | 'EXHAUSTED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'TIMED_OUT'
+export type CognitionTaskTransition = 'pending' | 'active' | 'blocked' | 'submitted' | 'accepted' | 'done'
+
+export type CognitionPredicate =
+  | { kind: 'all'; children: CognitionPredicate[] }
+  | { kind: 'any'; children: CognitionPredicate[] }
+  | { kind: 'not'; child: CognitionPredicate }
+  | { kind: 'generation_type'; value: 'normal' | 'continue' | 'regenerate' | 'swipe' }
+  | { kind: 'phase'; value: CognitionPhase }
+  | {
+      kind: 'preset_variable' | 'participant_fact'
+      name: string
+      operator: 'equals'
+      value: CognitionValue
+    }
+  | {
+      kind: 'preset_variable' | 'participant_fact'
+      name: string
+      operator: 'in'
+      values: CognitionScalar[]
+    }
+  | {
+      kind: 'preset_variable' | 'participant_fact'
+      name: string
+      operator: 'includes'
+      value: CognitionScalar
+    }
+  | {
+      kind: 'preset_variable' | 'participant_fact'
+      name: string
+      operator: 'present'
+    }
+  | { kind: 'tool_available'; toolId: string; available: boolean }
+  | { kind: 'task_transition'; taskId: string; transition: CognitionTaskTransition }
+
+export interface AgentTaskTemplate {
+  id: string
+  required: boolean
+  dependencies?: string[]
+  activation?: CognitionPredicate
+  label?: string
+  description?: string
+}
+
+export interface AgentContextActivationRule {
+  id: string
+  packId: string
+  revisionId: string
+  required: boolean
+  dependencies?: string[]
+  activation?: CognitionPredicate
+}
+
+export interface AgentContextPackSelection {
+  packId: string
+  revisionId: string
+  revision: number
+  label?: string
+  revisionLabel?: string
+  digest: string
+}
+
+export interface AgentWorkspacePolicy {
+  retention: 'turn_terminal' | 'chat_lifetime'
+  sharing: 'root_only' | 'view_only'
+}
+
+export interface AgentProfileConfigV2 {
+  id: string
+  name: string
+  systemPrompt: string
+  connectionRef: AgentConnectionRef
+  toolIds: CoreAgentToolId[]
+  /** Explicit child workspace grants; absent legacy values normalize to none. */
+  workspaceCapabilities?: WorkspaceCapability[]
+  loreScope: AgentLoreScope
+  allowMainDelegation: boolean
+  failurePolicy: AgentFailurePolicy
+  streamActivity: boolean
+  maxOutputTokens: number
+  timeoutMs: number
+}
+
+export interface AgentContextPolicyV1 {
+  ruleIds: string[]
+  packIds: string[]
+}
+
+export interface AgentConfigV2 {
+  version: 2
+  agentsEnabled: boolean
+  allowedModes: AgentMode[]
+  defaultMode: AgentMode
+  maxInvocations: number
+  maxToolCalls: number
+  mainToolIds: CoreAgentToolId[]
+  mainLoreScope: AgentLoreScope
+  profiles: AgentProfileConfigV2[]
+  connectionSlots: AgentConnectionSlot[]
+  cognitionPolicy?: AgentCognitionPolicy
+  contextPolicy?: AgentContextPolicyV1
+  taskPolicy?: {
+    templateIds: string[]
+  }
+  workspacePolicy?: AgentWorkspacePolicy
+}
+
+export type AgentConfigReviewState = 'ready' | 'review_required' | 'repair_required'
+
+export type AgentConfigRepairKind =
+  | 'unresolved_slot'
+  | 'stale_slot'
+  | 'invalid_rule'
+  | 'invalid_pack'
+  | 'disabled_import'
+  | 'capability_mismatch'
+  | 'stale_block'
+
+export interface AgentConfigRepairItem {
+  id: string
+  kind: AgentConfigRepairKind
+  /** Legacy server projections may include a display label; the editor never renders it. */
+  label?: string
+  reasonCode: string
+  action: {
+    kind: 'acknowledge' | 'map_slot' | 'select_revision' | 'edit_rule' | 'choose_response'
+    href?: string
+  }
+  /** Legacy compatibility only; acknowledgements are sent as ID lists. */
+  acknowledged?: boolean
+}
+
+export interface AgentConfigReview {
+  state: AgentConfigReviewState
+  revision: number
+  reasonCode: string | null
+  unresolvedSlotIds: string[]
+  staleSlotIds: string[]
+  /** Legacy compatibility only; acknowledgements are sent as ID lists. */
+  acknowledged?: boolean
+  items: AgentConfigRepairItem[]
+}
+
+export interface AgenticRuntimeHostCeilings {
+  childAdmissions: number
+  aggregateToolCalls: number
+  logicalProviderRequests: number
+  physicalDispatchAttempts: number
+  childOutputTokens: number
+  rootWallClockMs: number
+  activityEvents: number
+  activityBytes: number
+  lifecycleLogRecords: number
+  activeRootsPerUser: number
+  activeRootsProcess: number
+  providerDispatchesPerUser: number
+  providerDispatchesProcess: number
+  toolExecutionsPerUser: number
+  toolExecutionsProcess: number
+}
+
+export interface AgenticRuntimeSaveDraft {
+  config: AgentConfigV2
+  slotBindings: Record<string, string | null>
+  contextPackSelections: AgentContextPackSelection[]
+  contextRules: AgentContextActivationRule[]
+  taskTemplates: AgentTaskTemplate[]
+  reviewAcknowledgements: string[]
+}
+
 export interface PresetSource {
   type: string
   slug: string | null
@@ -194,12 +447,19 @@ export interface LoomPreset {
   /** LumiHub provenance metadata (install source, hub id, slug, creator) preserved verbatim across edits. Null when not LumiHub-sourced. */
   lumihubMeta: Record<string, unknown> | null
   /** Metadata not owned by Loom itself, preserved verbatim for extensions and forward compatibility. */
-  passthroughMetadata: Record<string, unknown>
+  passthroughMetadata: LoomPassthroughMetadata
   schemaVersion: number
   createdAt: number
   updatedAt: number
   /** Monotonic persisted revision for conditional coordinator updates. Omitted for raw imports. */
   cacheRevision?: number
+  agentConfig: AgentConfigV2 | null
+  agentConfigRevision: number
+  agentConfigReview: AgentConfigReview | null
+  agentSlotBindings: Record<string, string | null>
+  agentContextPackSelections: AgentContextPackSelection[]
+  agentContextRules: AgentContextActivationRule[]
+  agentTaskTemplates: AgentTaskTemplate[]
   blocks: PromptBlock[]
   source: PresetSource | null
   isDefault: boolean

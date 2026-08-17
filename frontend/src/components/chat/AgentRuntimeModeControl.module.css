@@ -1,0 +1,202 @@
+.surface {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.modeRow {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+
+.modeFieldset {
+  display: inline-flex;
+  min-width: 0;
+  margin: 0;
+  padding: 2px;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-fill-subtle);
+}
+
+.scopeLabel {
+  padding: 0 4px;
+  color: var(--lumiverse-text-dim);
+  font-size: calc(10px * var(--lumiverse-font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.modeOption {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 88px;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: var(--lumiverse-radius-sm);
+  color: var(--lumiverse-text-muted);
+  cursor: pointer;
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-weight: 600;
+  transition: color var(--lumiverse-transition-fast), background var(--lumiverse-transition-fast);
+}
+
+.modeOption:hover {
+  color: var(--lumiverse-text);
+  background: var(--lumiverse-fill-hover);
+}
+
+.modeOption[data-selected] {
+  color: var(--lumiverse-primary-text);
+  background: var(--lumiverse-primary-015);
+}
+
+.modeOption input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.modeOption:focus-within {
+  outline: 2px solid var(--lumiverse-primary-050);
+  outline-offset: 2px;
+}
+
+.overrideButton,
+.responseEscape {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-fill-subtle);
+  color: var(--lumiverse-text-muted);
+  font: inherit;
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-weight: 600;
+  cursor: pointer;
+  transition: color var(--lumiverse-transition-fast), background var(--lumiverse-transition-fast), border-color var(--lumiverse-transition-fast);
+}
+
+.overrideButton:hover:not(:disabled),
+.responseEscape:hover:not(:disabled) {
+  color: var(--lumiverse-text);
+  background: var(--lumiverse-fill-hover);
+  border-color: var(--lumiverse-border-hover);
+}
+
+.overrideButton:focus-visible,
+.responseEscape:focus-visible {
+  outline: 2px solid var(--lumiverse-primary-050);
+  outline-offset: 2px;
+}
+
+.overrideButton:disabled,
+.responseEscape:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.repair {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--lumiverse-warning-050);
+  border-radius: var(--lumiverse-radius);
+  background: var(--lumiverse-warning-015);
+}
+
+.repairCopy {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  color: var(--lumiverse-text);
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+}
+
+.repairCopy > svg {
+  flex: 0 0 auto;
+  color: var(--lumiverse-warning);
+}
+
+.repairList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 4px 0 0;
+  padding: 0;
+  color: var(--lumiverse-text-muted);
+  list-style: none;
+}
+
+.repairList li::before {
+  content: "•";
+  margin-right: 4px;
+  color: var(--lumiverse-warning);
+}
+
+.responseEscape {
+  flex: 0 0 auto;
+  border-color: var(--lumiverse-warning-050);
+  color: var(--lumiverse-text);
+  background: var(--lumiverse-bg-elevated);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 600px) {
+  .modeRow,
+  .repair {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .modeFieldset {
+    display: flex;
+  }
+
+  .modeOption {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .overrideButton,
+  .responseEscape {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modeOption,
+  .overrideButton,
+  .responseEscape {
+    transition: none;
+  }
+}

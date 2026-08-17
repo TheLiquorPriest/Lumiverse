@@ -21,6 +21,19 @@ import { getCharacterWorldBookIds, setCharacterWorldBookIds } from "../utils/cha
 import { applyCharxModulesAndAssets } from "../services/charx-import.service";
 import { resolveSealedPresetBlocksForInstall, type SealedManifest } from "./sealed-presets";
 import { cloneSafePlainJsonObject } from "./payload-validation";
+import {
+  migrateParsedLegacyAgentConfigV1,
+  parseLegacyAgentConfigV1,
+  toPortableAgentConfigV1,
+} from "../types/agents";
+import {
+  importPortablePresetRuntime,
+  parsePortablePresetRuntimeEnvelope,
+  scrubPresetMetadata,
+  type PortablePresetPayload,
+  type PortablePresetRuntimeEnvelopeV1,
+  type PortablePresetRuntimeImportInput,
+} from "../services/agent-config-portability.service";
 import type { PromptBlock, PromptVariableDef, PromptVariableValue } from "../types/preset";
 import type {
   InstallCharacterPayload,
@@ -655,6 +668,16 @@ export async function installPreset(
       return { requestId, success: false, error: "Preset export is missing preset data" };
     }
     const p = preset as Record<string, any>;
+    const hasEmbeddedRuntime = Object.hasOwn(exported, "agentRuntime") || Object.hasOwn(p, "agentRuntime");
+    const embeddedRuntime = Object.hasOwn(exported, "agentRuntime") ? exported.agentRuntime : p.agentRuntime;
+    let runtimeEnvelope: ReturnType<typeof parsePortablePresetRuntimeEnvelope> | null = null;
+    if (hasEmbeddedRuntime) {
+      try {
+        runtimeEnvelope = parsePortablePresetRuntimeEnvelope(embeddedRuntime);
+      } catch {
+        throw new Error("AGENT_RUNTIME_PORTABLE_INVALID");
+      }
+    }
     const name = typeof p.name === "string" && p.name.trim() ? p.name : payload.presetName;
     const blocks = Array.isArray(p.blocks) ? p.blocks : [];
 
@@ -703,6 +726,43 @@ export async function installPreset(
         )
       : incomingPromptVariables;
 
+    const authoredMetadata: Record<string, unknown> = {
+      ...existingPassthroughMetadata,
+      ...passthroughMetadata,
+      source: isPlainObject(p.source) ? p.source : null,
+      modelProfiles: isPlainObject(p.modelProfiles) ? p.modelProfiles : {},
+      schemaVersion: typeof p.schemaVersion === "number" ? p.schemaVersion : exported.schemaVersion ?? 1,
+      description: typeof p.description === "string" ? p.description : "",
+      isDefault: !!p.isDefault,
+      lastProfileKey: typeof p.lastProfileKey === "string" ? p.lastProfileKey : null,
+      promptVariables,
+      compatibility: isPlainObject(exported.compatibility) ? exported.compatibility : {},
+      coverUrl: typeof exported.cover_url === "string" ? exported.cover_url : null,
+      _lumiverse_install_source: "lumihub",
+      _lumiverse_lumihub_id: payload.presetId,
+      _lumiverse_preset_version: presetVersion,
+      _lumiverse_preset_slug: presetSlug,
+      _lumiverse_preset_creator: presetCreator,
+      _lumiverse_sealed_preset: sealedPreset,
+    };
+    const legacyRuntimeEnvelope: PortablePresetRuntimeEnvelopeV1 | null = Object.hasOwn(authoredMetadata, "agentConfig")
+      ? {
+          version: 1,
+          agentConfig: toPortableAgentConfigV1(
+            migrateParsedLegacyAgentConfigV1(
+              parseLegacyAgentConfigV1(authoredMetadata.agentConfig),
+              () => false,
+            ).config,
+          ),
+          contextPacks: [],
+          contextSelections: [],
+          contextRules: [],
+          taskTemplates: [],
+        }
+      : null;
+    const importedMetadata = scrubPresetMetadata(authoredMetadata);
+
+    const importedRegexScripts = extractPresetRegexScripts(exported);
     const presetInput = {
       name,
       provider: "loom",
@@ -716,31 +776,27 @@ export async function installPreset(
         completionSettings: isPlainObject(p.completionSettings) ? p.completionSettings : {},
         advancedSettings: isPlainObject(p.advancedSettings) ? p.advancedSettings : {},
       },
-      metadata: {
-        ...existingPassthroughMetadata,
-        ...passthroughMetadata,
-        source: isPlainObject(p.source) ? p.source : null,
-        modelProfiles: isPlainObject(p.modelProfiles) ? p.modelProfiles : {},
-        schemaVersion: typeof p.schemaVersion === "number" ? p.schemaVersion : exported.schemaVersion ?? 1,
-        description: typeof p.description === "string" ? p.description : "",
-        isDefault: !!p.isDefault,
-        lastProfileKey: typeof p.lastProfileKey === "string" ? p.lastProfileKey : null,
-        promptVariables,
-        compatibility: isPlainObject(exported.compatibility) ? exported.compatibility : {},
-        coverUrl: typeof exported.cover_url === "string" ? exported.cover_url : null,
-        _lumiverse_install_source: "lumihub",
-        _lumiverse_lumihub_id: payload.presetId,
-        _lumiverse_preset_version: presetVersion,
-        _lumiverse_preset_slug: presetSlug,
-        _lumiverse_preset_creator: presetCreator,
-        _lumiverse_sealed_preset: sealedPreset,
-      },
+      metadata: importedMetadata,
+      regex_scripts: importedRegexScripts,
     };
 
-    // Update the existing installation in place when this preset was installed
-    // from LumiHub before, so "Update" advances the version instead of duplicating.
+    // A runtime envelope is an authenticated portable wire contract. Parse it
+    // before any write and route the complete preset/config/context graph
+    // through the atomic importer; legacy metadata.agentConfig is never used
+    // as the runtime authority.
     let saved;
-    if (existing) {
+    const importedRuntimeEnvelope = runtimeEnvelope ?? legacyRuntimeEnvelope;
+    if (importedRuntimeEnvelope) {
+      const importer = dependencies.importPortablePresetRuntime ?? importPortablePresetRuntime;
+      const imported = importer(userId, {
+        preset: presetInput as PortablePresetPayload,
+        agentRuntime: importedRuntimeEnvelope,
+        existingPresetId: existing?.id,
+        expectedPresetRevision: existing?.cache_revision,
+      });
+      saved = imported.preset;
+      if (!existing) eventBus.emit(EventType.PRESET_CHANGED, { id: saved.id, preset: saved }, userId);
+    } else if (existing) {
       saved = presetsSvc.updatePreset(userId, existing.id, {
         ...presetInput,
         expected_cache_revision: existing.cache_revision,
@@ -750,21 +806,6 @@ export async function installPreset(
       eventBus.emit(EventType.PRESET_CHANGED, { id: saved.id, preset: saved }, userId);
     }
 
-    // Preset-bound regex scripts ride at the top level of the export (sibling to
-    // `preset`); import them so remote installs keep parity with local preset
-    // imports. On update, clear the previous install's scripts first so successive
-    // versions don't accumulate duplicates. Best-effort — the preset is already saved.
-    try {
-      if (existing) {
-        regexSvc.deleteRegexScriptsByPresetId(userId, saved.id);
-      }
-      const regexScripts = extractPresetRegexScripts(exported);
-      if (regexScripts.length > 0) {
-        regexSvc.importPresetBoundRegexScripts(userId, saved.id, saved.name, regexScripts);
-      }
-    } catch (err) {
-      console.warn("[LumiHub Installer] Preset regex import failed:", err);
-    }
 
     eventBus.emit(EventType.LUMIHUB_INSTALL_COMPLETED, {
       characterId: saved.id,
@@ -787,6 +828,7 @@ export async function installPreset(
 
 export interface InstallPresetDependencies {
   resolveSealedBlocks?: typeof resolveSealedPresetBlocksForInstall;
+  importPortablePresetRuntime?: (userId: string, input: PortablePresetRuntimeImportInput) => ReturnType<typeof importPortablePresetRuntime>;
 }
 
 /**

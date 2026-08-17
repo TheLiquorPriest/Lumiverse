@@ -1,8 +1,7 @@
 -- Lumiverse Database Baseline Schema
--- Generated from migrations 001 through 065.
--- Fresh databases bootstrap from this file instead of replaying the full
--- migration stack. All squashed migration names are recorded in _migrations
--- so the runner treats them as already applied.
+-- Squashed migrations are listed in BASELINE_MIGRATIONS in src/db/migrate.ts
+-- (001-065 plus later folds); the runner records them as already applied on
+-- fresh databases instead of replaying the full migration stack.
 
 CREATE TABLE "account" (
   id TEXT PRIMARY KEY NOT NULL,
@@ -18,6 +17,19 @@ CREATE TABLE "account" (
   password TEXT,
   createdAt INTEGER NOT NULL DEFAULT (unixepoch()),
   updatedAt INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE agent_activity_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  generation_id TEXT NOT NULL,
+  target_message_id TEXT,
+  target_swipe_id INTEGER,
+  snapshot_json TEXT NOT NULL,
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0 AND byte_size <= 32768),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(user_id, chat_id, generation_id)
 );
 
 CREATE TABLE character_gallery (
@@ -48,7 +60,7 @@ CREATE TABLE characters (
   extensions TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-, image_id TEXT REFERENCES images(id) ON DELETE SET NULL, user_id TEXT REFERENCES "user"(id) ON DELETE CASCADE);
+, image_id TEXT REFERENCES images(id) ON DELETE SET NULL, user_id TEXT REFERENCES "user"(id) ON DELETE CASCADE, folder TEXT NOT NULL DEFAULT '', library_scope TEXT NOT NULL DEFAULT 'mine' CHECK(library_scope IN ('mine', 'shared')));
 
 CREATE VIRTUAL TABLE characters_fts USING fts5(
   name, creator, tags,
@@ -768,7 +780,7 @@ CREATE TABLE world_book_entries (
   extensions TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-, use_regex INTEGER NOT NULL DEFAULT 0, prevent_recursion INTEGER NOT NULL DEFAULT 0, exclude_recursion INTEGER NOT NULL DEFAULT 0, delay_until_recursion INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 10, sticky INTEGER NOT NULL DEFAULT 0, cooldown INTEGER NOT NULL DEFAULT 0, delay INTEGER NOT NULL DEFAULT 0, selective_logic INTEGER NOT NULL DEFAULT 0, use_probability INTEGER NOT NULL DEFAULT 1, vectorized INTEGER NOT NULL DEFAULT 0, vector_index_status TEXT NOT NULL DEFAULT 'not_enabled', vector_indexed_at INTEGER, vector_index_error TEXT);
+, use_regex INTEGER NOT NULL DEFAULT 0, prevent_recursion INTEGER NOT NULL DEFAULT 0, exclude_recursion INTEGER NOT NULL DEFAULT 0, delay_until_recursion INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 10, sticky INTEGER NOT NULL DEFAULT 0, cooldown INTEGER NOT NULL DEFAULT 0, delay INTEGER NOT NULL DEFAULT 0, selective_logic INTEGER NOT NULL DEFAULT 0, use_probability INTEGER NOT NULL DEFAULT 1, vectorized INTEGER NOT NULL DEFAULT 0, vector_index_status TEXT NOT NULL DEFAULT 'not_enabled', vector_indexed_at INTEGER, vector_index_error TEXT, revision INTEGER NOT NULL DEFAULT 1);
 
 CREATE VIRTUAL TABLE world_book_entries_fts USING fts5(
   comment, content, key, keysecondary,
@@ -787,6 +799,9 @@ CREATE TABLE world_books (
 , user_id TEXT REFERENCES "user"(id) ON DELETE CASCADE, folder TEXT NOT NULL DEFAULT '');
 
 CREATE INDEX idx_account_userId ON "account"(userId);
+
+CREATE INDEX idx_agent_activity_runs_chat
+  ON agent_activity_runs(user_id, chat_id, created_at DESC, id DESC);
 
 CREATE INDEX idx_cc_chat_created_desc
   ON chat_chunks(chat_id, created_at DESC);
@@ -811,6 +826,12 @@ CREATE INDEX idx_character_gallery_lookup
 CREATE INDEX idx_characters_image_id ON characters(image_id);
 
 CREATE INDEX idx_characters_user_id ON characters(user_id);
+
+CREATE INDEX idx_characters_user_library_scope
+  ON characters(user_id, library_scope);
+
+CREATE INDEX idx_characters_user_library_scope_updated
+  ON characters(user_id, library_scope, updated_at DESC);
 
 CREATE INDEX idx_characters_user_updated ON characters(user_id, updated_at DESC);
 

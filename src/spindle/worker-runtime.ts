@@ -9,9 +9,10 @@ import type {
   WorkerToHost,
   HostToWorker,
   LlmMessageDTO,
-  InterceptorResultDTO,
   SpindleAPI,
-  ConnectionProfileDTO,
+  UserPresetDTO,
+  UserPresetCreateDTO,
+  UserPresetUpdateDTO,
   PermissionDeniedDetail,
   PermissionChangedDetail,
   CharacterDTO,
@@ -84,6 +85,8 @@ import type {
   ImageGenStreamRequestDTO,
   InterceptorContextDTO,
   InterceptorDisposer,
+  ConnectionProfileDTO,
+  InterceptorResultDTO,
   InterceptorHandler,
   InterceptorRegistrationMatchOptions,
   InterceptorRegistrationOptions,
@@ -108,7 +111,7 @@ import {
   normalizeOwnedSharedRpcEndpoint,
 } from "./shared-rpc";
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Preset, CreatePresetInput, UpdatePresetInput, PromptBlock } from "../types/preset";
+import type { PromptBlock } from "../types/preset";
 import type { LumiaDlcCatalog } from "../types/pack";
 
 const nativeProcessExit = process.exit.bind(process);
@@ -337,8 +340,8 @@ type RuntimeWorkerToHost =
   | { type: "user_get_role"; requestId: string; userId?: string }
   | { type: "presets_list"; requestId: string; limit?: number; offset?: number; userId?: string }
   | { type: "presets_get"; requestId: string; presetId: string; userId?: string }
-  | { type: "presets_create"; requestId: string; input: CreatePresetInput; userId?: string }
-  | { type: "presets_update"; requestId: string; presetId: string; input: UpdatePresetInput; userId?: string }
+  | { type: "presets_create"; requestId: string; input: UserPresetCreateDTO; userId?: string }
+  | { type: "presets_update"; requestId: string; presetId: string; input: UserPresetUpdateDTO; userId?: string }
   | { type: "presets_delete"; requestId: string; presetId: string; userId?: string }
   | { type: "preset_blocks_list"; requestId: string; presetId: string; userId?: string }
   | { type: "preset_blocks_get"; requestId: string; presetId: string; blockId: string; userId?: string }
@@ -588,7 +591,8 @@ type RuntimeHostToWorker =
   | { type: "backend_process_lifecycle"; event: BackendProcessLifecycleEvent }
   | { type: "backend_process_message"; processId: string; payload: unknown; userId: string }
   | { type: "image_gen_stream_chunk"; requestId: string; event: ImageGenStreamEvent }
-  | { type: "image_gen_stream_error"; requestId: string; error: string };
+  | { type: "image_gen_stream_error"; requestId: string; error: string }
+  | { type: "tool_invocation_abort"; requestId: string; reason?: string };
 
 type ImageGenStreamEvent = ImageGenStreamEventDTO;
 type ImageGenStreamInput = ImageGenStreamRequestDTO;
@@ -750,10 +754,10 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen" | "world_books"
     priority?: number
   ): void;
   presets: {
-    list(options?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: Preset[]; total: number }>;
-    get(presetId: string, userId?: string): Promise<Preset | null>;
-    create(input: CreatePresetInput, userId?: string): Promise<Preset>;
-    update(presetId: string, input: UpdatePresetInput, userId?: string): Promise<Preset>;
+    list(options?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: UserPresetDTO[]; total: number }>;
+    get(presetId: string, userId?: string): Promise<UserPresetDTO | null>;
+    create(input: UserPresetCreateDTO, userId?: string): Promise<UserPresetDTO>;
+    update(presetId: string, input: UserPresetUpdateDTO, userId?: string): Promise<UserPresetDTO>;
     delete(presetId: string, userId?: string): Promise<boolean>;
     blocks: {
       list(presetId: string, userId?: string): Promise<PromptBlock[]>;
@@ -920,6 +924,7 @@ const streamingImageGenerations = new Map<
   { push: (event: ImageGenStreamEvent) => void; fail: (reason: unknown) => void }
 >();
 const interceptorAbortControllers = new Map<string, AbortController>();
+const toolInvocationAbortControllers = new Map<string, AbortController>();
 let interceptHandler:
   | InterceptorHandler
   | null = null;
@@ -2503,7 +2508,7 @@ const spindleApi: RuntimeSpindleAPI = {
   },
 
   presets: {
-    async list(options?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: Preset[]; total: number }> {
+    async list(options?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: UserPresetDTO[]; total: number }> {
       const requestId = crypto.randomUUID();
       const result = await request({
         type: "presets_list",
@@ -2512,24 +2517,24 @@ const spindleApi: RuntimeSpindleAPI = {
         offset: options?.offset,
         userId: options?.userId,
       });
-      return result as { data: Preset[]; total: number };
+      return result as { data: UserPresetDTO[]; total: number };
     },
-    async get(presetId: string, userId?: string): Promise<Preset | null> {
+    async get(presetId: string, userId?: string): Promise<UserPresetDTO | null> {
       const requestId = crypto.randomUUID();
       const result = await request({ type: "presets_get", requestId, presetId, userId });
-      return result as Preset | null;
+      return result as UserPresetDTO | null;
     },
-    async create(input: CreatePresetInput, userId?: string): Promise<Preset> {
+    async create(input: UserPresetCreateDTO, userId?: string): Promise<UserPresetDTO> {
       assertMutationAllowed("spindle.presets.create()");
       const requestId = crypto.randomUUID();
       const result = await request({ type: "presets_create", requestId, input, userId });
-      return result as Preset;
+      return result as UserPresetDTO;
     },
-    async update(presetId: string, input: UpdatePresetInput, userId?: string): Promise<Preset> {
+    async update(presetId: string, input: UserPresetUpdateDTO, userId?: string): Promise<UserPresetDTO> {
       assertMutationAllowed("spindle.presets.update()");
       const requestId = crypto.randomUUID();
       const result = await request({ type: "presets_update", requestId, presetId, input, userId });
-      return result as Preset;
+      return result as UserPresetDTO;
     },
     async delete(presetId: string, userId?: string): Promise<boolean> {
       assertMutationAllowed("spindle.presets.delete()");
@@ -4257,11 +4262,14 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
         break;
       }
 
+      const abortController = new AbortController();
+      toolInvocationAbortControllers.set(msg.requestId, abortController);
       try {
         const payload = {
           toolName: msg.toolName,
           args: msg.args,
           requestId: msg.requestId,
+          signal: abortController.signal,
           ...(msg.councilMember ? { councilMember: msg.councilMember } : {}),
           ...(msg.contextMessages ? { contextMessages: msg.contextMessages } : {}),
         };
@@ -4272,18 +4280,34 @@ async function handleHostMessage(msg: RuntimeHostToWorker): Promise<void> {
             result = String(val);
           }
         }
+        if (abortController.signal.aborted) {
+          throw abortController.signal.reason ?? makeAbortError();
+        }
         post({
           type: "tool_invocation_result",
           requestId: msg.requestId,
           result: result ?? "",
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const errorMessage =
+          err && typeof err === "object" && "message" in err && typeof err.message === "string"
+            ? err.message
+            : String(err);
         post({
           type: "tool_invocation_result",
           requestId: msg.requestId,
-          error: err?.message || "Tool invocation failed",
+          error: errorMessage || "Tool invocation failed",
         });
+      } finally {
+        toolInvocationAbortControllers.delete(msg.requestId);
       }
+      break;
+    }
+
+    case "tool_invocation_abort": {
+      toolInvocationAbortControllers
+        .get(msg.requestId)
+        ?.abort(makeAbortError(msg.reason));
       break;
     }
 

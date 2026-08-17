@@ -11,20 +11,33 @@ export const createConnectionsSlice: StateCreator<AppStore, [], [], ConnectionsS
   activeProfileId: null,
 
   setProfiles: (profiles) =>
-    set((state) => ({
-      profiles: reorderProfiles(profiles, normalizeConnectionsOrder(state.connectionsOrder).llm),
-    })),
+    set((state) => {
+      const nextProfiles = reorderProfiles(profiles, normalizeConnectionsOrder(state.connectionsOrder).llm)
+      const active = state.activeProfileId
+        ? nextProfiles.find((profile) => profile.id === state.activeProfileId)
+        : null
+      return {
+        profiles: nextProfiles,
+        activeProfileId: active?.review_required === true ? null : active?.id ?? null,
+      }
+    }),
   setActiveProfile: (id) => {
     const state = get()
     const oldProfile = state.activeProfileId
       ? state.profiles.find((p) => p.id === state.activeProfileId)
       : null
-    const newProfile = id
+    const requestedProfile = id
       ? state.profiles.find((p) => p.id === id)
       : null
+    // Selection is a closed operation: unknown and review-required IDs both
+    // resolve to no active profile rather than persisting an unusable ID.
+    const nextId = requestedProfile?.review_required === true ? null : requestedProfile?.id ?? null
+    const newProfile = nextId
+      ? state.profiles.find((p) => p.id === nextId)
+      : null
 
-    set({ activeProfileId: id })
-    settingsApi.put('activeProfileId', id).catch(() => {})
+    set({ activeProfileId: nextId })
+    settingsApi.put('activeProfileId', nextId).catch(() => {})
 
     // Apply or restore reasoning settings based on profile bindings
     const newBindings = newProfile?.metadata?.reasoningBindings?.settings
@@ -70,13 +83,16 @@ export const createConnectionsSlice: StateCreator<AppStore, [], [], ConnectionsS
     const connectionsOrder = normalizeConnectionsOrder(state.connectionsOrder)
     const order = connectionsOrder.llm
     const existingIndex = state.profiles.findIndex((candidate) => candidate.id === profile.id)
+    const nextProfiles = existingIndex === -1
+      ? [...state.profiles, profile]
+      : state.profiles.map((candidate, index) => index === existingIndex ? profile : candidate)
+    const active = nextProfiles.find((candidate) => candidate.id === state.activeProfileId)
     return {
       // A connection mutation is delivered both over WebSocket and in the
       // initiating request's REST response. Either can arrive first, so treat
       // adding an already-known id as an update instead of creating two rows.
-      profiles: existingIndex === -1
-        ? [...state.profiles, profile]
-        : state.profiles.map((candidate, index) => index === existingIndex ? profile : candidate),
+      profiles: nextProfiles,
+      activeProfileId: active?.review_required === true ? null : active?.id ?? null,
       connectionsOrder: {
         ...connectionsOrder,
         llm: order.includes(profile.id) ? order : [...order, profile.id],
@@ -84,9 +100,14 @@ export const createConnectionsSlice: StateCreator<AppStore, [], [], ConnectionsS
     }
   }),
   updateProfile: (id, updates) =>
-    set((state) => ({
-      profiles: state.profiles.map((p) => (p.id === id ? { ...p, ...updates } : p)),
-    })),
+    set((state) => {
+      const profiles = state.profiles.map((p) => (p.id === id ? { ...p, ...updates } : p))
+      const active = profiles.find((p) => p.id === state.activeProfileId)
+      return {
+        profiles,
+        activeProfileId: active?.review_required === true ? null : active?.id ?? null,
+      }
+    }),
   removeProfile: (id) => {
     const state = get()
     const wasActive = state.activeProfileId === id

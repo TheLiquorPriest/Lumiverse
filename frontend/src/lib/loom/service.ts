@@ -1,17 +1,34 @@
 import type { PromptBlockDTO, PromptVariableDefDTO, PromptVariableOptionDTO, PromptVariableValuesDTO } from 'lumiverse-spindle-types'
 import type { Preset, CreatePresetInput, UpdatePresetInput, ProviderInfo } from '@/types/api'
-import type {
-  PromptBlock,
-  PromptBlockPlacement,
-  PromptVariableValue,
-  PromptVariableDef,
-  PromptVariableValues,
-  LoomPreset,
-  LoomRegistryEntry,
-  LoomConnectionProfile,
-  MacroGroup,
-  CategoryGroup,
+import {
+  parsePortableContextPackSnapshotV1,
+  type PortableContextPackSnapshotV1,
+} from '@/types/agent-context-packs'
+import {
+  isAgentContextActivationRule,
+} from './agenticRuntime'
+import {
+  AGENT_INVOCATION_DEFAULT,
+  AGENT_INVOCATION_MIN,
+  AGENT_TOOL_CALL_DEFAULT,
+  AGENT_TOOL_CALL_MIN,
+  type AgentConfigV2,
+  type AgentContextActivationRule,
+  type AgentTaskTemplate,
+  type PromptBlock,
+  type PromptBlockPlacement,
+  type PromptVariableValue,
+  type PromptVariableDef,
+  type PromptVariableValues,
+  type LoomPreset,
+  type LoomRegistryEntry,
+  type LoomConnectionProfile,
+  type MacroGroup,
+  type CategoryGroup,
+  WORKSPACE_CAPABILITIES,
+  type WorkspaceCapability,
 } from './types'
+
 import { sanitizeCharacterTagTrigger } from './characterTagTrigger'
 import { generateUUID } from '@/lib/uuid'
 import {
@@ -31,6 +48,291 @@ import {
   ST_IDENTIFIER_TO_MARKER,
   MARKER_TO_ST_IDENTIFIER,
 } from './constants'
+
+export type PortableAgentConfigV1 = Omit<AgentConfigV2, 'version'> & {
+  portableVersion: 1
+}
+
+export interface PortableAgentRuntimeContextSelectionV1 {
+  packSnapshotId: string
+  revisionId: string
+  digest: string
+}
+
+export interface PortableAgenticRuntimeEnvelopeV1 {
+  version: 1
+  agentConfig: PortableAgentConfigV1 | null
+  contextPacks: PortableContextPackSnapshotV1[]
+  contextSelections: PortableAgentRuntimeContextSelectionV1[]
+  contextRules: AgentContextActivationRule[]
+  taskTemplates: AgentTaskTemplate[]
+}
+
+const PORTABLE_AGENT_RUNTIME_KEYS = [
+  'version',
+  'agentConfig',
+  'contextPacks',
+  'contextSelections',
+  'contextRules',
+  'taskTemplates',
+] as const
+
+const PORTABLE_AGENT_CONFIG_REQUIRED_KEYS = [
+  'portableVersion',
+  'agentsEnabled',
+  'allowedModes',
+  'defaultMode',
+  'maxInvocations',
+  'maxToolCalls',
+  'mainToolIds',
+  'mainLoreScope',
+  'profiles',
+  'connectionSlots',
+] as const
+
+const PORTABLE_AGENT_CONFIG_OPTIONAL_KEYS = [
+  'phasePolicy',
+  'cognitionPolicy',
+  'contextPolicy',
+  'taskPolicy',
+  'workspacePolicy',
+] as const
+
+const PORTABLE_AGENT_PROFILE_REQUIRED_KEYS = [
+  'id',
+  'name',
+  'systemPrompt',
+  'connectionRef',
+  'toolIds',
+  'loreScope',
+  'allowMainDelegation',
+  'failurePolicy',
+  'streamActivity',
+  'maxOutputTokens',
+  'timeoutMs',
+] as const
+const PORTABLE_AGENT_PROFILE_OPTIONAL_KEYS = [
+  'workspaceCapabilities',
+] as const
+
+const PORTABLE_AGENT_SLOT_KEYS = [
+  'id',
+  'label',
+  'requiredCapabilities',
+] as const
+
+
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort()
+  const wanted = [...expected].sort()
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index])
+}
+
+function hasAllowedKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): boolean {
+  const allowed = new Set([...required, ...optional])
+  return required.every((key) => Object.hasOwn(value, key))
+    && Object.keys(value).every((key) => allowed.has(key))
+}
+
+function hasSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+}
+
+function hasNoPortableAuthorityLeak(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== 'object') return true
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) return value.every((entry) => hasNoPortableAuthorityLeak(entry, seen))
+  if (!isPlainDataRecord(value)) return false
+  const forbidden = /^(?:connection(ProfileId|Id)|localConnectionId|connection_id|agentSlotBindings?|slotBindings?|bindingRevision|credential|secret|grant|acl|enabledAuthority)$/i
+  return Object.entries(value).every(([key, entry]) => !forbidden.test(key) && hasNoPortableAuthorityLeak(entry, seen))
+}
+
+function isWorkspaceCapabilityList(value: unknown): value is WorkspaceCapability[] {
+  if (value === undefined) return true
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false
+  let previousIndex = -1
+  const seen = new Set<string>()
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, String(index)) || typeof value[index] !== 'string') return false
+    const operationIndex = WORKSPACE_CAPABILITIES.indexOf(value[index] as WorkspaceCapability)
+    if (operationIndex < 0 || operationIndex <= previousIndex || seen.has(value[index])) return false
+    seen.add(value[index])
+    previousIndex = operationIndex
+  }
+  return Reflect.ownKeys(value).every((key) => typeof key === 'string' && (key === 'length' || /^\d+$/.test(key)))
+}
+
+function isPortableAgentConfig(value: unknown): value is PortableAgentConfigV1 {
+  if (!isPlainDataRecord(value)
+    || !hasAllowedKeys(value, PORTABLE_AGENT_CONFIG_REQUIRED_KEYS, PORTABLE_AGENT_CONFIG_OPTIONAL_KEYS)) return false
+  if (value.portableVersion !== 1
+    || typeof value.agentsEnabled !== 'boolean'
+    || !Array.isArray(value.allowedModes)
+    || !value.allowedModes.every((mode) => mode === 'response' || mode === 'agentic')
+    || (value.allowedModes as unknown[]).includes('response') === false
+    || (value.allowedModes as unknown[]).some((mode, index, modes) => modes.indexOf(mode) !== index)
+    || (value.defaultMode !== 'response' && value.defaultMode !== 'agentic')
+    || !(value.allowedModes as unknown[]).includes(value.defaultMode)
+    || !Number.isSafeInteger(value.maxInvocations) || value.maxInvocations < AGENT_INVOCATION_MIN
+    || !Number.isSafeInteger(value.maxToolCalls) || value.maxToolCalls < AGENT_TOOL_CALL_MIN
+    || !Array.isArray(value.mainToolIds)
+    || typeof value.mainLoreScope !== 'string'
+    || !Array.isArray(value.profiles)
+    || !Array.isArray(value.connectionSlots)
+    || !hasNoPortableAuthorityLeak(value)) {
+    return false
+  }
+  if (!(value.profiles as unknown[]).every((profile) => (
+    isPlainDataRecord(profile)
+    && hasAllowedKeys(profile, PORTABLE_AGENT_PROFILE_REQUIRED_KEYS, PORTABLE_AGENT_PROFILE_OPTIONAL_KEYS)
+    && typeof profile.id === 'string'
+    && typeof profile.name === 'string'
+    && typeof profile.systemPrompt === 'string'
+    && isPlainDataRecord(profile.connectionRef)
+    && (hasExactKeys(profile.connectionRef, ['kind']) && profile.connectionRef.kind === 'inherit_main'
+      || hasExactKeys(profile.connectionRef, ['kind', 'slotId'])
+        && profile.connectionRef.kind === 'slot'
+        && typeof profile.connectionRef.slotId === 'string')
+    && Array.isArray(profile.toolIds)
+    && isWorkspaceCapabilityList(profile.workspaceCapabilities)
+    && (profile.loreScope === 'active' || profile.loreScope === 'all_owned')
+    && typeof profile.allowMainDelegation === 'boolean'
+    && (profile.failurePolicy === 'required' || profile.failurePolicy === 'optional')
+    && typeof profile.streamActivity === 'boolean'
+    && Number.isSafeInteger(profile.maxOutputTokens)
+    && Number.isSafeInteger(profile.timeoutMs)
+  ))) return false
+  return (value.connectionSlots as unknown[]).every((slot) => (
+    isPlainDataRecord(slot)
+    && hasExactKeys(slot, PORTABLE_AGENT_SLOT_KEYS)
+    && typeof slot.id === 'string'
+    && typeof slot.label === 'string'
+    && Array.isArray(slot.requiredCapabilities)
+    && (slot.requiredCapabilities as unknown[]).every((capability) => (
+      capability === 'generation'
+      || capability === 'streaming'
+      || capability === 'tool_calling'
+      || capability === 'native_tool_continuation'
+      || capability === 'tools_disabled_finalization'
+    ))
+  ))
+}
+
+function isPortableContextSnapshot(value: unknown): value is PortableContextPackSnapshotV1 {
+  try {
+    parsePortableContextPackSnapshotV1(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function isPortableContextSelection(value: unknown): value is PortableAgentRuntimeContextSelectionV1 {
+  return isPlainDataRecord(value)
+    && hasExactKeys(value, ['packSnapshotId', 'revisionId', 'digest'])
+    && typeof value.packSnapshotId === 'string'
+    && typeof value.revisionId === 'string'
+    && hasSha256(value.digest)
+}
+
+function isPortableTaskTemplate(value: unknown): value is AgentTaskTemplate {
+  if (!isPlainDataRecord(value)
+    || !hasAllowedKeys(value, ['id', 'required'], ['dependencies', 'activation', 'label', 'description'])
+    || typeof value.id !== 'string'
+    || typeof value.required !== 'boolean') return false
+  if (value.dependencies !== undefined
+    && (!Array.isArray(value.dependencies) || !value.dependencies.every((dependency) => typeof dependency === 'string'))) return false
+  if (value.label !== undefined && typeof value.label !== 'string') return false
+  if (value.description !== undefined && typeof value.description !== 'string') return false
+  return value.activation === undefined || isAgentContextActivationRule({
+    id: 'portable-task',
+    packId: 'portable-pack',
+    revisionId: 'portable-pack@1',
+    required: false,
+    activation: value.activation,
+  })
+}
+
+export function isPortableAgenticRuntimeEnvelope(value: unknown): value is PortableAgenticRuntimeEnvelopeV1 {
+  if (!isPlainDataRecord(value)
+    || !hasExactKeys(value, PORTABLE_AGENT_RUNTIME_KEYS)
+    || value.version !== 1
+    || (value.agentConfig !== null && !isPortableAgentConfig(value.agentConfig))
+    || !Array.isArray(value.contextPacks)
+    || !Array.isArray(value.contextSelections)
+    || !Array.isArray(value.contextRules)
+    || !Array.isArray(value.taskTemplates)
+    || !value.contextPacks.every(isPortableContextSnapshot)
+    || !value.contextSelections.every(isPortableContextSelection)
+    || !value.contextRules.every(isAgentContextActivationRule)
+    || !value.taskTemplates.every(isPortableTaskTemplate)
+    || !hasNoPortableAuthorityLeak(value)) return false
+  const snapshots = new Map(value.contextPacks.map((snapshot) => [snapshot.snapshotId, snapshot]))
+  const selections = new Map(value.contextSelections.map((selection) => [selection.packSnapshotId, selection]))
+  if (snapshots.size !== value.contextPacks.length || selections.size !== value.contextSelections.length) return false
+  if (value.contextSelections.some((selection) => {
+    const snapshot = snapshots.get(selection.packSnapshotId)
+    return !snapshot
+      || selection.revisionId !== `${snapshot.snapshotId}@${snapshot.revision}`
+      || selection.digest !== snapshot.contentDigest
+  })) return false
+  return value.contextRules.every((rule) => {
+    const selection = selections.get(rule.packId)
+    return !!selection && rule.revisionId === selection.revisionId
+  })
+}
+
+export function parsePortableAgenticRuntimeEnvelope(value: unknown): PortableAgenticRuntimeEnvelopeV1 {
+  if (!isPortableAgenticRuntimeEnvelope(value)) {
+    throw new Error('AGENT_RUNTIME_PORTABLE_INVALID')
+  }
+  const clone = structuredClone(value)
+  if (clone.agentConfig) {
+    clone.agentConfig = {
+      ...clone.agentConfig,
+      profiles: clone.agentConfig.profiles.map((profile) => ({
+        ...profile,
+        workspaceCapabilities: [...(profile.workspaceCapabilities ?? [])],
+      })),
+    }
+  }
+  return clone
+}
+
+function stripPortableAgentRuntimeField(value: object): Record<string, unknown> {
+  const clone = { ...(value as Record<string, unknown>) }
+  delete clone.agentRuntime
+  return clone
+}
+
+export function extractPortableAgenticRuntimeEnvelope(value: unknown): PortableAgenticRuntimeEnvelopeV1 | null {
+  if (!isPlainDataRecord(value)) return null
+  if (Object.hasOwn(value, 'agentRuntime')) {
+    return parsePortableAgenticRuntimeEnvelope(value.agentRuntime)
+  }
+  if (value.type === 'lumiverse_preset' && isPlainDataRecord(value.preset) && Object.hasOwn(value.preset, 'agentRuntime')) {
+    return parsePortableAgenticRuntimeEnvelope(value.preset.agentRuntime)
+  }
+  return null
+}
+
+/** A committed portable import owns context-pack copies; never roll it back client-side. */
+export function shouldRollbackImportedPreset(
+  importedPresetId: string | null,
+  portableImportCommitted: boolean,
+): importedPresetId is string {
+  return importedPresetId !== null && !portableImportCommitted
+}
+
+function withoutPortableAgentRuntimeField(value: object): Record<string, unknown> {
+  return stripPortableAgentRuntimeField(value)
+}
 
 // ============================================================================
 // BLOCK FACTORY
@@ -197,6 +499,7 @@ export function projectPublicPromptBlocks(blocks: PromptBlock[]): PromptBlockDTO
 // PRESET MIGRATION
 // ============================================================================
 
+
 function migratePreset(preset: LoomPreset): LoomPreset {
   preset.samplerOverrides = { ...DEFAULT_SAMPLER_OVERRIDES, ...(preset.samplerOverrides || {}) }
   preset.customBody = { ...DEFAULT_CUSTOM_BODY, ...(preset.customBody || {}) }
@@ -212,7 +515,29 @@ function migratePreset(preset: LoomPreset): LoomPreset {
     ? preset.presetVersion.trim()
     : null
   preset.lumihubMeta = isRecord(preset.lumihubMeta) ? preset.lumihubMeta : null
-  preset.passthroughMetadata = isRecord(preset.passthroughMetadata) ? preset.passthroughMetadata : {}
+  preset.passthroughMetadata = isRecord(preset.passthroughMetadata)
+    ? preset.passthroughMetadata
+    : {}
+  preset.agentConfig ??= null
+  if (preset.agentConfig) {
+    preset.agentConfig = {
+      ...preset.agentConfig,
+      profiles: preset.agentConfig.profiles.map((profile) => ({
+        ...profile,
+        workspaceCapabilities: [...(profile.workspaceCapabilities ?? [])],
+      })),
+    }
+  }
+  preset.agentConfigRevision = Number.isSafeInteger(preset.agentConfigRevision)
+    ? preset.agentConfigRevision
+    : 0
+  preset.agentConfigReview ??= null
+  preset.agentSlotBindings = isRecord(preset.agentSlotBindings) ? { ...preset.agentSlotBindings } : {}
+  preset.agentContextPackSelections = Array.isArray(preset.agentContextPackSelections)
+    ? preset.agentContextPackSelections
+    : []
+  preset.agentContextRules = Array.isArray(preset.agentContextRules) ? preset.agentContextRules : []
+  preset.agentTaskTemplates = Array.isArray(preset.agentTaskTemplates) ? preset.agentTaskTemplates : []
   if (Array.isArray(preset.blocks)) {
     for (const block of preset.blocks) {
       if (!Array.isArray(block.injectionTrigger)) {
@@ -249,6 +574,207 @@ function isRecord(value: unknown): value is Record<string, any> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+function isPlainDataRecord(value: unknown): value is Record<string, any> {
+  if (!isRecord(value)) return false
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) return false
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string') return false
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+const IMPORTED_AGENT_TOOL_IDS = [
+  'lore_list_books',
+  'lore_get_book',
+  'lore_list_entries',
+  'lore_get_entry',
+  'lore_search_entries',
+  'chat_search_history',
+] as const
+const IMPORTED_AGENT_TOOL_SET = new Set<string>(IMPORTED_AGENT_TOOL_IDS)
+const IMPORTED_AGENT_LORE_TOOL_SET = new Set<string>(IMPORTED_AGENT_TOOL_IDS.slice(0, 5))
+const IMPORTED_AGENT_PROFILE_KEYS = [
+  'id', 'name', 'systemPrompt', 'connectionProfileId', 'toolIds', 'loreScope',
+  'allowMainDelegation', 'failurePolicy', 'streamActivity', 'maxOutputTokens', 'timeoutMs',
+]
+const IMPORTED_AGENT_CONFIG_KEYS = [
+  'version',
+  'enabled',
+  'maxInvocations',
+  'maxToolCalls',
+  'mainToolIds',
+  'mainLoreScope',
+  'profiles',
+]
+
+function isImportedAgentToolList(value: unknown): value is string[] {
+  if (!Array.isArray(value)) return false
+  try {
+    if (Object.getPrototypeOf(value) !== Array.prototype) return false
+    const seen = new Set<string>()
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, String(index))) return false
+      const tool = value[index]
+      if (typeof tool !== 'string' || !IMPORTED_AGENT_TOOL_SET.has(tool) || seen.has(tool)) return false
+      seen.add(tool)
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string' || (key !== 'length' && !/^(0|[1-9]\d*)$/.test(key))) return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+function isImportedAgentConfig(value: unknown): value is Record<string, any> {
+  if (!isPlainDataRecord(value)) return false
+  try {
+    const configKeys = Object.keys(value)
+    const hasMaxInvocations = Object.hasOwn(value, 'maxInvocations')
+    const hasMaxToolCalls = Object.hasOwn(value, 'maxToolCalls')
+    const expectedKeyCount = IMPORTED_AGENT_CONFIG_KEYS.length
+      - (hasMaxInvocations ? 0 : 1)
+      - (hasMaxToolCalls ? 0 : 1)
+    if (configKeys.some((key) => !IMPORTED_AGENT_CONFIG_KEYS.includes(key))) return false
+    if (configKeys.length !== expectedKeyCount
+      || value.version !== 1
+      || typeof value.enabled !== 'boolean'
+      || (hasMaxInvocations
+        && (!Number.isSafeInteger(value.maxInvocations)
+          || value.maxInvocations < AGENT_INVOCATION_MIN))
+      || (hasMaxToolCalls
+        && (!Number.isSafeInteger(value.maxToolCalls)
+          || value.maxToolCalls < AGENT_TOOL_CALL_MIN))
+      || !isImportedAgentToolList(value.mainToolIds)
+      || (value.mainLoreScope !== 'active'
+        && value.mainLoreScope !== 'all_owned')
+      || !Array.isArray(value.profiles)
+      || Object.getPrototypeOf(value.profiles) !== Array.prototype
+      || value.profiles.length > 16) return false
+    if (value.mainLoreScope === 'all_owned'
+      && !value.mainToolIds.some((tool: string) => IMPORTED_AGENT_LORE_TOOL_SET.has(tool))) return false
+
+    const ids = new Set<string>()
+    for (let index = 0; index < value.profiles.length; index += 1) {
+      if (!Object.hasOwn(value.profiles, String(index))) return false
+    }
+    return value.profiles.every((profile: unknown) => {
+      if (!isPlainDataRecord(profile)
+        || Object.keys(profile).length !== IMPORTED_AGENT_PROFILE_KEYS.length
+        || Object.keys(profile).some((key) => !IMPORTED_AGENT_PROFILE_KEYS.includes(key))
+        || typeof profile.id !== 'string'
+        || !/^[a-z][a-z0-9_]{0,63}$/.test(profile.id)
+        || ids.has(profile.id)
+        || typeof profile.name !== 'string' || profile.name.length > 80
+        || typeof profile.systemPrompt !== 'string'
+        || new TextEncoder().encode(profile.systemPrompt).byteLength > 32 * 1024
+        || (profile.connectionProfileId !== null && typeof profile.connectionProfileId !== 'string')
+        || profile.connectionProfileId === ''
+        || !isImportedAgentToolList(profile.toolIds)
+        || (profile.loreScope !== 'active' && profile.loreScope !== 'all_owned')
+        || (profile.loreScope === 'all_owned'
+          && !profile.toolIds.some((tool: string) => IMPORTED_AGENT_LORE_TOOL_SET.has(tool)))
+        || typeof profile.allowMainDelegation !== 'boolean'
+        || (profile.failurePolicy !== 'required' && profile.failurePolicy !== 'optional')
+        || typeof profile.streamActivity !== 'boolean'
+        || !Number.isSafeInteger(profile.maxOutputTokens) || profile.maxOutputTokens < 64 || profile.maxOutputTokens > 8192
+        || !Number.isSafeInteger(profile.timeoutMs) || profile.timeoutMs < 5000 || profile.timeoutMs % 1000 !== 0) return false
+      ids.add(profile.id)
+      return true
+    })
+  } catch {
+    return false
+  }
+}
+
+/** Convert explicit imported V1 metadata into an inert normalized V2 draft. */
+function migrateImportedLegacyAgentConfigMetadataV1(
+  metadata: Record<string, unknown>,
+): { metadata: Record<string, unknown>; config: AgentConfigV2 | null } {
+  if (!isRecord(metadata) || !Object.hasOwn(metadata, 'agentConfig')) {
+    return { metadata: extractPassthroughMetadata(metadata), config: null }
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(metadata, 'agentConfig')
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+    throw new Error('metadata.agentConfig: must be a data property')
+  }
+  const legacy = descriptor.value
+  if (!isImportedAgentConfig(legacy)) {
+    throw new Error('metadata.agentConfig: invalid configuration')
+  }
+  const profiles = legacy.profiles.map((profile: Record<string, any>) => ({
+    id: profile.id,
+    name: profile.name,
+    systemPrompt: profile.systemPrompt,
+    connectionRef: profile.connectionProfileId === null
+      ? { kind: 'inherit_main' as const }
+      : { kind: 'slot' as const, slotId: `profile/${profile.id}` },
+    toolIds: [...profile.toolIds],
+    workspaceCapabilities: [],
+    loreScope: profile.loreScope,
+    allowMainDelegation: profile.allowMainDelegation,
+    failurePolicy: profile.failurePolicy,
+    streamActivity: profile.streamActivity,
+    maxOutputTokens: profile.maxOutputTokens,
+    timeoutMs: profile.timeoutMs,
+  }))
+  return {
+    metadata: extractPassthroughMetadata(metadata),
+    config: {
+      version: 2,
+      agentsEnabled: false,
+      allowedModes: ['response'],
+      defaultMode: 'response',
+      maxInvocations: Object.hasOwn(legacy, 'maxInvocations')
+        ? legacy.maxInvocations
+        : AGENT_INVOCATION_DEFAULT,
+      maxToolCalls: Object.hasOwn(legacy, 'maxToolCalls')
+        ? legacy.maxToolCalls
+        : AGENT_TOOL_CALL_DEFAULT,
+      mainToolIds: [...legacy.mainToolIds],
+      mainLoreScope: legacy.mainLoreScope,
+      profiles,
+      connectionSlots: profiles.flatMap((profile) => profile.connectionRef.kind === 'slot'
+        ? [{
+            id: profile.connectionRef.slotId,
+            label: profile.name,
+            requiredCapabilities: ['generation' as const],
+          }]
+        : []),
+    },
+  }
+}
+
+function migrateImportedLegacyAgentConfigV1(
+  preset: LoomPreset,
+  hasCanonicalRuntime = false,
+): LoomPreset {
+  // Canonical V2 data is authoritative. In particular, never let an
+  // obsolete metadata.agentConfig overwrite a top-level config or portable
+  // runtime envelope. Still strip the reserved metadata key so it cannot
+  // become executable authority on the next round-trip.
+  if (hasCanonicalRuntime || preset.agentConfig !== null) {
+    return {
+      ...preset,
+      passthroughMetadata: extractPassthroughMetadata(preset.passthroughMetadata),
+    }
+  }
+  const migrated = migrateImportedLegacyAgentConfigMetadataV1(preset.passthroughMetadata)
+  return {
+    ...preset,
+    passthroughMetadata: migrated.metadata,
+    agentConfig: migrated.config,
+  }
+}
+
 /** Version key is surfaced separately as `presetVersion`; the rest of the bag round-trips verbatim. */
 const LUMIHUB_VERSION_META_KEY = '_lumiverse_preset_version'
 const LOOM_OWNED_META_KEYS = new Set([
@@ -261,6 +787,21 @@ const LOOM_OWNED_META_KEYS = new Set([
   'isDefault',
   'lastProfileKey',
   'promptVariables',
+])
+
+const AGENT_RUNTIME_RESERVED_METADATA_KEYS = new Set([
+  'agent_config',
+  'agent_config_revision',
+  'agent_config_review',
+  'agent_config_review_required',
+  'agentConfig',
+  'agentConfigRevision',
+  'agentConfigReview',
+  'agentConfigReviewRequired',
+  'portableAgentConfig',
+  'portable_agent_config',
+  'agentRuntime',
+  'agent_runtime',
 ])
 
 export function isLoomOwnedPresetMetadataKey(key: string): boolean {
@@ -287,7 +828,7 @@ function extractLumihubMeta(meta: Record<string, any>): Record<string, unknown> 
 function extractPassthroughMetadata(meta: Record<string, any>): Record<string, unknown> {
   const bag: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(meta)) {
-    if (isLoomOwnedPresetMetadataKey(key)) continue
+    if (isLoomOwnedPresetMetadataKey(key) || AGENT_RUNTIME_RESERVED_METADATA_KEYS.has(key)) continue
     bag[key] = value
   }
   return bag
@@ -333,27 +874,35 @@ export function detectImportedPresetKind(data: unknown): 'loom' | 'legacy' | nul
 }
 
 export function coerceImportedLoomPreset(data: unknown, fallbackName: string): LoomPreset {
+  // Validate the portable envelope before looking at legacy metadata. A
+  // canonical envelope (including one with a null config) is still an
+  // authority boundary and must prevent metadata.agentConfig fallback.
+  const hasCanonicalRuntime = extractPortableAgenticRuntimeEnvelope(data) !== null
   if (looksLikeWrappedLumiHubPresetData(data)) {
-    return migratePreset({
-      ...data.preset,
+    const presetData = withoutPortableAgentRuntimeField(data.preset)
+    return migrateImportedLegacyAgentConfigV1(migratePreset({
+      ...presetData,
       name: data.preset.name || fallbackName,
       coverUrl: typeof data.cover_url === 'string' ? data.cover_url : null,
-    } as LoomPreset)
+    } as LoomPreset), hasCanonicalRuntime)
   }
 
   if (looksLikeLoomPresetData(data)) {
-    return migratePreset({
-      ...data,
+    const presetData = withoutPortableAgentRuntimeField(data)
+    return migrateImportedLegacyAgentConfigV1(migratePreset({
+      ...presetData,
       name: data.name || fallbackName,
-    })
+    } as LoomPreset), hasCanonicalRuntime)
   }
 
   if (looksLikeBackendLoomPresetData(data)) {
-    return unmarshalPreset(data)
+    return migrateImportedLegacyAgentConfigV1({
+      ...unmarshalPreset(data),
+      passthroughMetadata: { ...data.metadata },
+    }, hasCanonicalRuntime)
   }
-
   if (looksLikeLegacyPresetData(data)) {
-    return importFromSTPreset(data, fallbackName)
+    return migrateImportedLegacyAgentConfigV1(importFromSTPreset(data, fallbackName), hasCanonicalRuntime)
   }
 
   throw new Error('Unrecognized preset JSON format')
@@ -545,6 +1094,13 @@ export function unmarshalPreset(preset: Preset): LoomPreset {
     createdAt: preset.created_at,
     updatedAt: preset.updated_at,
     ...(typeof preset.cache_revision === 'number' ? { cacheRevision: preset.cache_revision } : {}),
+    agentConfig: preset.agent_config ?? null,
+    agentConfigRevision: preset.agent_config_revision ?? 0,
+    agentConfigReview: preset.agent_config_review ?? null,
+    agentSlotBindings: { ...(preset.agent_slot_bindings ?? {}) },
+    agentContextPackSelections: [...(preset.agent_context_pack_selections ?? [])],
+    agentContextRules: [...(preset.agent_context_rules ?? [])],
+    agentTaskTemplates: [...(preset.agent_task_templates ?? [])],
     blocks: (preset.prompt_order || []) as PromptBlock[],
     source: meta.source || null,
     isDefault: meta.isDefault || false,
@@ -614,6 +1170,44 @@ export function sanitizeLumiHubSealedBlocksForExport<T extends LoomPreset>(loom:
       }
     }),
   }
+}
+
+export function toPortableAgentConfigV1(config: AgentConfigV2): PortableAgentConfigV1 {
+  const { version: _version, ...authored } = structuredClone(config)
+  return { portableVersion: 1, ...authored }
+}
+
+export function createPortableLoomExportPayload(
+  loom: LoomPreset,
+  agentRuntime: PortableAgenticRuntimeEnvelopeV1,
+): Record<string, unknown> {
+  const exportLoom = sanitizeLumiHubSealedBlocksForExport(loom)
+  const portablePreset: Record<string, unknown> = { ...exportLoom }
+  for (const field of [
+    'agentConfig',
+    'agentConfigRevision',
+    'agentConfigReview',
+    'agentSlotBindings',
+    'agentContextPackSelections',
+    'agentContextRules',
+    'agentTaskTemplates',
+  ]) {
+    delete portablePreset[field]
+  }
+  portablePreset.passthroughMetadata = extractPassthroughMetadata(exportLoom.passthroughMetadata ?? {})
+  portablePreset.agentRuntime = structuredClone(parsePortableAgenticRuntimeEnvelope(agentRuntime))
+  return portablePreset
+}
+/** Remove source-local ownership from regex companions before portable export. */
+export function stripPortableRegexOwnership(
+  scripts: readonly object[],
+): Record<string, unknown>[] {
+  return scripts.map((script) => {
+    const portable: Record<string, unknown> = Object.fromEntries(Object.entries(script))
+    delete portable.preset_id
+    delete portable.presetId
+    return portable
+  })
 }
 
 function getLumiHubSealedExportKey(block: PromptBlock, manifestKeys: Set<string>): string | null {
@@ -1550,6 +2144,13 @@ export function importFromSTPreset(stPresetData: STPresetData, name: string): Lo
     schemaVersion: 1,
     createdAt: now,
     updatedAt: now,
+    agentConfig: null,
+    agentConfigRevision: 0,
+    agentConfigReview: null,
+    agentSlotBindings: {},
+    agentContextPackSelections: [],
+    agentContextRules: [],
+    agentTaskTemplates: [],
     // `createBlock` gives every block a `group: null` default. That is the
     // right default for a manually-created block, but a null group is explicit
     // to the category renderer, so it prevents the imported blocks from being
@@ -1744,6 +2345,13 @@ export function createNewLoomPreset(name: string, description = ''): LoomPreset 
     schemaVersion: 1,
     createdAt: now,
     updatedAt: now,
+    agentConfig: null,
+    agentConfigRevision: 0,
+    agentConfigReview: null,
+    agentSlotBindings: {},
+    agentContextPackSelections: [],
+    agentContextRules: [],
+    agentTaskTemplates: [],
     blocks: [
       createBlock({ name: 'System Prompt', content: '', role: 'system', position: 'pre_history' }),
       createMarkerBlock('chat_history'),

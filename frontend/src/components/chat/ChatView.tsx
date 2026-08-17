@@ -8,7 +8,8 @@ import { chatsApi, messagesApi } from '@/api/chats'
 import { memoryCortexApi, type CortexIngestionStatus } from '@/api/memory-cortex'
 import { generateApi } from '@/api/generate'
 import { loadoutsApi } from '@/api/loadouts'
-import { recoverPooledGeneration } from '@/lib/generation-recovery'
+import { recoverPooledGeneration, recoverAgentActivityRuns } from '@/lib/generation-recovery'
+import { recoverAgentRuns } from '@/lib/agent-run-recovery'
 import { charactersApi } from '@/api/characters'
 import { packsApi } from '@/api/packs'
 import { expressionsApi } from '@/api/expressions'
@@ -23,6 +24,7 @@ import WallpaperLayer from '@/components/shared/WallpaperLayer'
 import useSwipeKeyboard from '@/hooks/useSwipeKeyboard'
 import useEditKeyboard from '@/hooks/useEditKeyboard'
 import useIsMobile from '@/hooks/useIsMobile'
+import { AgentRunLiveRegion } from './AgentRunActivity'
 import { chatLoreDockMode, chatTopDockMode } from '@/lib/chatSurfaceLayout'
 import { measureLayoutHeight } from '@/lib/uiScale'
 import { resolveCouncilForChat } from '@/hooks/useCouncilProfiles'
@@ -703,6 +705,10 @@ export default function ChatView() {
         // also invoked on visibilitychange and WS reconnect so that any path
         // back to this chat re-syncs pooled tokens.
         if (!cancelled) await recoverPooledGeneration(chatId)
+        // A terminal run may have no target message or the pool entry may have
+        // expired before reload. Merge the authenticated status-only fallback.
+        if (!cancelled) await recoverAgentActivityRuns(chatId)
+        if (!cancelled) await recoverAgentRuns(chatId)
 
         // Opening a chat acknowledges any terminal chat-head state globally so
         // other devices stop showing a stale completed/stopped/error badge too.
@@ -1049,6 +1055,7 @@ export default function ChatView() {
       )}
       data-streaming={isStreaming || undefined}
     >
+      <AgentRunLiveRegion chatId={chatId} />
       {/* Wallpaper layer (z-index 0) — lowest background, overridden by scene */}
       <WallpaperLayer
         wallpaper={displayedWallpaper}

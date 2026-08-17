@@ -20,6 +20,7 @@ type ProfileSetterHarness = Pick<
   AppStore,
   | 'connectionsOrder'
   | 'profiles'
+  | 'activeProfileId'
   | 'imageGenProfiles'
   | 'imageGenProfilesVersion'
   | 'imageGenProfilesLoaded'
@@ -27,6 +28,7 @@ type ProfileSetterHarness = Pick<
   | 'sttProfiles'
   | 'ttsProfiles'
   | 'setProfiles'
+  | 'setActiveProfile'
   | 'addProfile'
   | 'setImageGenProfiles'
   | 'addImageGenProfile'
@@ -49,7 +51,14 @@ function persistedDragOrder(): CompleteConnectionsOrder {
 }
 
 function createHarness(connectionsOrder: unknown): ProfileSetterHarness {
-  const state = { connectionsOrder, fullSettingsLoaded: false }
+  const state = {
+    connectionsOrder,
+    fullSettingsLoaded: false,
+    voiceSettings: {
+      sttConnectionId: null as string | null,
+      ttsConnectionId: null as string | null,
+    },
+  }
   // Slice creators are typed against the aggregate store; these setters read only fields initialized below.
   const appState = state as unknown as AppStore
   const get: StoreApi<AppStore>['getState'] = () => appState
@@ -87,6 +96,8 @@ function llmProfile(id: string): ConnectionProfile {
     metadata: {},
     created_at: 0,
     updated_at: 0,
+    review_required: false,
+    review_code: null,
   }
 }
 
@@ -103,6 +114,8 @@ function imageProfile(id: string): ImageGenConnectionProfile {
     metadata: {},
     created_at: 0,
     updated_at: 0,
+    review_required: false,
+    review_code: null,
   }
 }
 
@@ -119,6 +132,8 @@ function sttProfile(id: string): SttConnectionProfile {
     metadata: {},
     created_at: 0,
     updated_at: 0,
+    review_required: false,
+    review_code: null,
   }
 }
 
@@ -136,6 +151,8 @@ function ttsProfile(id: string): TtsConnectionProfile {
     metadata: {},
     created_at: 0,
     updated_at: 0,
+    review_required: false,
+    review_code: null,
   }
 }
 
@@ -175,7 +192,19 @@ describe('profile replacement ordering', () => {
       'llm-copy',
     ])
   })
+  test('never activates unknown or review-required LLM profile IDs', () => {
+    const store = createHarness(persistedDragOrder())
+    store.profiles = [
+      llmProfile('llm-ready'),
+      { ...llmProfile('llm-review'), review_required: true },
+    ]
 
+    store.setActiveProfile('missing')
+    expect(store.activeProfileId).toBeNull()
+
+    store.setActiveProfile('llm-review')
+    expect(store.activeProfileId).toBeNull()
+  })
   test('keeps image manager refreshes in persisted drag order and appends new profiles in backend order', () => {
     const store = createHarness(persistedDragOrder())
     store.imageGenProfiles = [imageProfile('image-third'), imageProfile('image-first')]

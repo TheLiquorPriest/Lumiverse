@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -28,7 +29,12 @@ const PERMISSIONS = [
 const workspaces: string[] = [];
 
 function workspace(): string {
-  const path = mkdtempSync(join(tmpdir(), "lumiverse-deploy-test-"));
+  // macOS resolves TMPDIR through a symlink (/var -> /private/var), while the
+  // deploy preflight canonicalizes the project root and compares literal
+  // source/destination paths against it. Use the real path so the fixture
+  // workspace behaves like a real checkout root and every containment,
+  // symlink, and escape check still runs below it.
+  const path = realpathSync(mkdtempSync(join(tmpdir(), "lumiverse-deploy-test-")));
   workspaces.push(path);
   return path;
 }

@@ -20,6 +20,11 @@ export class DeepSeekProvider extends OpenAICompatibleProvider {
     supportsStreaming: true,
     apiKeyRequired: true,
     modelListStyle: "openai",
+    toolCalling: true,
+    nativeToolContinuation: true,
+    toolContinuationMode: "native",
+    toolsDisabledFinalization: true,
+    supportsToolFinalization: true,
     // DeepSeek thinking mode (deepseek-reasoner / deepseek-chat with thinking
     // enabled) round-trips its chain of thought via `reasoning_content`, which
     // `OpenAICompatibleProvider.flattenForChat` echoes back on assistant

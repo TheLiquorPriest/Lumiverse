@@ -22,7 +22,17 @@
     "operator": { "shortName": "运维", "tabName": "运维面板", "tabDescription": "服务器管理、更新与重启控制" },
     "tokenizers": { "shortName": "分词器", "tabName": "分词器管理", "tabDescription": "管理并测试分词器配置" },
     "users": { "shortName": "用户", "tabName": "用户管理", "tabDescription": "管理用户账户、角色与权限" },
-    "migration": { "shortName": "迁移", "tabName": "迁移", "tabDescription": "从 SillyTavern 等来源导入数据" }
+    "migration": { "shortName": "迁移", "tabName": "迁移", "tabDescription": "从 SillyTavern 等来源导入数据" },
+    "agentRuntime": {
+      "shortName": "智能体运行时",
+      "tabName": "智能体运行时",
+      "tabDescription": "查看运行时默认值、保留策略和主机上限"
+    },
+    "contextLibrary": {
+      "shortName": "上下文库",
+      "tabName": "上下文库",
+      "tabDescription": "管理版本化上下文包及其附件"
+    }
   },
   "account": {
     "title": "账户",
@@ -552,13 +562,11 @@
     "importWarn": "上传后在后台处理。在看到完成摘要前请勿关闭此标签页——处理期间可继续使用 Lumiverse。",
     "importing": "导入中…",
     "uploadImport": "上传并导入",
+    "reuploadImport": "重新上传归档",
     "cancel": "取消",
     "ticketPrompt": "此归档含 {{count}} 个加密机密。上传票据文件以恢复。",
     "ticketPrompt_other": "此归档含 {{count}} 个加密机密。上传票据文件以恢复。",
     "skipApiKeys": "跳过 API 密钥",
-    "ticketReuse": "注意：此票据已使用 {{uses}} 次。继续将覆盖本账户上匹配的 API 密钥。",
-    "ticketReuse_other": "注意：此票据已使用 {{uses}} 次{{lastUsed}}。继续将覆盖本账户上匹配的 API 密钥。",
-    "ticketLastUsed": "（上次使用 {{date}}）",
     "uploading": "上传中… {{pct}}%",
     "verifying": "正在验证归档…",
     "importQueued": "已排队，开始导入…",
@@ -575,6 +583,7 @@
     "filesRestored": "文件已恢复",
     "vectorsRestored": "已恢复 {{table}} 的向量",
     "vectorsSkipped": "跳过向量（配置不匹配）",
+    "cleanupPending": "正在完成导入清理",
     "importGeneric": "导入中…",
     "importComplete": "导入完成",
     "uploadFailed": "上传失败",
@@ -582,6 +591,7 @@
     "ticketSubmitFailed": "提交票据失败",
     "skipFailed": "跳过失败",
     "cancelFailed": "取消失败",
+    "cancelTooLate": "导入已无法取消",
     "summaryTable": "表",
     "summaryImported": "已导入",
     "summarySkipped": "已跳过",
@@ -590,7 +600,71 @@
     "importFailed": "导入失败",
     "exportPrepareFailed": "导出准备失败",
     "exportAnchorMissing": "内部错误：缺少下载锚点",
-    "exportTableSuffix": " ({{processed}})"
+    "exportTableSuffix": " ({{processed}})",
+    "cancelling": "正在取消…",
+    "skippingTicket": "正在跳过…",
+    "reconnect": "刷新状态",
+    "jobStatus": "导入状态：{{status}}",
+    "archiveId": "归档 {{id}}",
+    "noActiveJob": "此标签页当前没有关联的导入任务。",
+    "summaryFilesNone": "没有恢复文件",
+    "summarySecrets": "机密",
+    "summaryVectors": "向量",
+    "vectorStatuses": {
+      "included": "已包含",
+      "rebuild_required": "需要重建",
+      "skipped": "已跳过",
+      "unknown": "未知"
+    },
+    "statuses": {
+      "queued": "排队中",
+      "validating": "验证中",
+      "awaiting_ticket": "等待票据",
+      "running": "运行中",
+      "installing": "恢复文件中",
+      "ready": "准备应用",
+      "committing": "提交中",
+      "cancelling": "正在取消",
+      "cleanup_pending": "正在完成清理",
+      "complete": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消"
+    },
+    "failureReasons": {
+      "unknown": "导入失败，原因未知。",
+      "malformed_response": "服务器返回了无效的可移植性状态。",
+      "archive_validation_failed": "归档验证失败。",
+      "not_zip": "文件不是 ZIP 归档。",
+      "size": "归档过大。",
+      "no_manifest": "缺少归档清单。",
+      "bad_manifest": "归档清单无效。",
+      "archive_identity_mismatch": "此归档与现有导入不匹配。",
+      "upload_failed": "归档上传失败。",
+      "upload_timeout": "归档上传超时。",
+      "upload_aborted": "归档上传已取消。",
+      "import_start_failed": "无法启动导入。",
+      "import_failed": "导入失败。",
+      "integrity_failure": "归档完整性检查失败。",
+      "multipart_not_supported": "不支持多部分归档上传。",
+      "export_capacity": "正在运行的可移植性操作过多。",
+      "manual_recovery_required": "导入需要服务器恢复。",
+      "process_interrupted": "导入因重启而中断。",
+      "cancelled": "导入已取消。",
+      "too_late": "导入已无法取消。",
+      "not_found": "找不到导入任务。",
+      "ticket_required": "需要解密票据。",
+      "ticket_invalid": "解密票据无效。",
+      "ticket_submission_failed": "无法提交解密票据。",
+      "ticket_gate_conflict": "票据状态已被其他操作解决。",
+      "replayed": "票据已使用。",
+      "stale": "票据已过期或失效。",
+      "wrong_issuer": "不接受该票据签发者。",
+      "invalid_issuer_instance": "票据签发者身份无效。",
+      "unsupported_version": "不支持该票据版本。",
+      "archive_mismatch": "票据与归档不匹配。",
+      "binding_mismatch": "票据对该导入无效。",
+      "network": "无法连接可移植性服务。"
+    }
   },
   "advanced": {
     "title": "高级",
@@ -1386,5 +1460,243 @@
     "memoryModeConservative": "保守 — 更少、更高质量的记忆",
     "memoryModeBalanced": "均衡 — 标准检索（推荐）",
     "memoryModeAggressive": "激进 — 更多记忆、更低阈值"
+  },
+  "agentRuntimeSettings": {
+    "eyebrow": "Agentic 运行时",
+    "title": "智能体运行时",
+    "description": "查看生效的默认值、保留行为和只读主机上限。",
+    "defaults": {
+      "title": "模式优先级",
+      "description": "Lumiverse 会为每轮解析模式，而不更改预设。",
+      "oneTurn": "单轮选择",
+      "oneTurnHelp": "经身份验证的选择仅生效一次，并使用一次性决策令牌。",
+      "chat": "聊天覆盖",
+      "chatHelp": "持久的聊天选择会一直生效，直到明确更改。",
+      "preset": "预设默认值",
+      "presetHelp": "所选预设提供经审核的默认模式。",
+      "response": "响应回退",
+      "responseHelp": "Agentic 不可用或未选中时，仍可使用响应模式。"
+    },
+    "retention": {
+      "title": "工作区保留策略",
+      "description": "保留策略按预设配置，并受主机上限约束。",
+      "operational": "运行期间",
+      "operationalHelp": "仅在当前轮次中可用，并在终止清理时移除。",
+      "terminal": "轮次结束后",
+      "terminalHelp": "在有限的结束后时段内保留，仅供查看活动和检查工作区。",
+      "chatLifetime": "聊天生命周期",
+      "chatLifetimeHelp": "只有明确发布的产物会随所属聊天保留。"
+    },
+    "limits": {
+      "title": "主机上限",
+      "description": "这些生效的进程限制用于保护提供商、隔离环境、活动存储和资源容量。",
+      "loading": "正在加载主机上限…",
+      "error": "主机上限暂时不可用。",
+      "retry": "重试",
+      "readOnly": "这些值仅供参考。预设、导入项和扩展无法提高这些上限。",
+      "turn": "轮次预算",
+      "activity": "活动存储",
+      "capacity": "进程容量",
+      "fields": {
+        "childAdmissions": "子任务准入数",
+        "aggregateToolCalls": "工具调用总数",
+        "logicalProviderRequests": "逻辑提供商请求数",
+        "physicalDispatchAttempts": "实际分派尝试次数",
+        "childOutputTokens": "子任务输出令牌数",
+        "rootWallClockMs": "根任务实际耗时（毫秒）",
+        "activityEvents": "活动事件数",
+        "activityBytes": "活动字节数",
+        "lifecycleLogRecords": "生命周期日志记录数",
+        "activeRootsPerUser": "每用户活动根任务数",
+        "activeRootsProcess": "每进程活动根任务数",
+        "providerDispatchesPerUser": "每用户提供商分派数",
+        "providerDispatchesProcess": "每进程提供商分派数",
+        "toolExecutionsPerUser": "每用户工具执行数",
+        "toolExecutionsProcess": "每进程工具执行数"
+      }
+    }
+  },
+  "contextLibrary": {
+    "eyebrow": "账户上下文",
+    "title": "上下文库",
+    "description": "创建不可变的版本化上下文包，并将经审核的修订版附加到预设、聊天或世界书。",
+    "copySuffix": "副本",
+    "packs": "上下文包",
+    "packList": "上下文包",
+    "loading": "正在加载上下文包…",
+    "loadingDetail": "正在加载上下文包详情…",
+    "loadingTargets": "正在加载自有目标…",
+    "targetLoadError": "无法加载您拥有的附加目标。",
+    "targetsLoaded": "已加载您拥有的附加目标。",
+    "noTargetsAvailable": "此范围没有可用的自有目标。",
+    "selectTarget": "选择一个自有目标",
+    "selectPack": "选择要查看的上下文包。",
+    "emptyTitle": "创建第一个上下文包",
+    "emptyDescription": "添加稳定的参考资料，然后在需要的位置附加不可变修订版。",
+    "noDescription": "无描述",
+    "noAttachments": "无附件",
+    "privateOnly": "尚未授予其他账户访问权限。",
+    "unavailableTarget": "目标不可用",
+    "exportComplete": "便携快照已导出。",
+    "exporting": "正在导出便携快照…",
+    "importing": "正在导入便携快照…",
+    "importComplete": "已导入“{{name}}”。请先审核，再附加或启用。",
+    "importFileLabel": "选择要导入的上下文包 JSON 快照",
+    "versionNumber": "修订版 {{number}}",
+    "byteCount": "{{count}} 字节",
+    "versionHistoryCaption": "不可变上下文包修订历史",
+    "versionImmutableHelp": "已发布的修订版无法编辑。请创建新修订版以更改内容。",
+    "immutable": "不可变",
+    "previewTitle": "修订版 {{number}} 预览",
+    "contentHelp": "条目按顺序存储为原样上下文。ID 在此修订版中必须唯一。",
+    "entryNumber": "条目 {{number}}",
+    "addEntry": "添加条目",
+    "removeEntry": "移除条目 {{number}}",
+    "tagsHelp": "用逗号分隔标签。",
+    "requiredAttachment": "将此附件视为 Agentic 预检的必需项",
+    "attachmentsDescription": "附件会将一个确切的不可变修订版绑定到一个自有目标。",
+    "accessDescription": "服务器会为每项操作重新验证可见性和 ACL 授权。",
+    "accessList": "账户访问列表",
+    "accessFor": "{{name}} 的访问权限",
+    "addAccess": "添加访问权限",
+    "removeAccess": "移除 {{name}} 的访问权限",
+    "aclServerAuthority": "服务器会验证主体、所有权、当前 ACL 修订版和所请求的权限。",
+    "reviewTitle": "需要身份验证审核",
+    "reviewDescription": "此上下文包已禁用。请检查其内容并明确接受后再在本地使用。",
+    "repairDescription": "此上下文包需修复后才能审核或附加。",
+    "reviewAcknowledgement": "我已审核此上下文包及其可见性、内容和访问授权，并希望将其激活。",
+    "preserveAttachments": "复制当前已授权的附件",
+    "deleteTitle": "删除上下文包",
+    "deleteDescription": "删除此上下文包及其自有修订版和附件。",
+    "deleteWarning": "删除“{{name}}”？此操作无法撤销。",
+    "detachFrom": "从 {{name}} 分离",
+    "status": {
+      "active": "就绪",
+      "disabled": "已禁用",
+      "review_required": "需要审核",
+      "repair_required": "需要修复"
+    },
+    "source": {
+      "local": "本地",
+      "portable_import": "便携导入",
+      "archive_restore": "归档恢复",
+      "same_account_duplicate": "同账户副本"
+    },
+    "visibility": {
+      "private": "私有",
+      "account": "账户内",
+      "restricted": "受限",
+      "help": "所有 ACL 和目标操作均以服务器判定为准。"
+    },
+    "scopes": {
+      "preset": "预设",
+      "chat": "聊天",
+      "world_book": "世界书"
+    },
+    "acl": {
+      "read": "读取",
+      "use": "使用",
+      "edit": "编辑"
+    },
+    "attachmentState": {
+      "active": "已启用",
+      "disabled": "已禁用",
+      "review_required": "需要审核",
+      "repair_required": "需要修复"
+    },
+    "sections": {
+      "versions": "版本历史",
+      "attachments": "附件",
+      "access": "可见性和访问权限"
+    },
+    "fields": {
+      "name": "名称",
+      "description": "描述",
+      "visibility": "可见性",
+      "content": "修订版内容",
+      "entryId": "条目 ID",
+      "entryTitle": "条目标题",
+      "tags": "标签",
+      "body": "正文",
+      "scope": "附件范围",
+      "target": "目标",
+      "version": "修订版",
+      "account": "账户用户 ID",
+      "access": "权限",
+      "source": "来源",
+      "updated": "更新时间"
+    },
+    "columns": {
+      "version": "修订版",
+      "state": "状态",
+      "size": "大小",
+      "created": "创建时间",
+      "actions": "操作"
+    },
+    "actions": {
+      "create": "创建上下文包",
+      "import": "导入快照",
+      "cancel": "取消",
+      "refresh": "刷新",
+      "reviewLatest": "查看最新版本",
+      "retryTargets": "重试目标加载",
+      "edit": "编辑详情",
+      "duplicate": "复制",
+      "export": "导出所选修订版",
+      "review": "审核并激活",
+      "newVersion": "新建修订版",
+      "preview": "预览",
+      "attach": "附加修订版",
+      "manageAccess": "管理访问权限",
+      "delete": "删除"
+    },
+    "dialogs": {
+      "create": {
+        "title": "创建上下文包",
+        "description": "创建本地上下文包及其首个不可变修订版。",
+        "confirm": "创建上下文包"
+      },
+      "edit": {
+        "title": "编辑上下文包详情",
+        "description": "更新元数据，但不更改不可变修订版的内容。",
+        "confirm": "保存详情"
+      },
+      "revision": {
+        "title": "创建修订版",
+        "description": "基于最新内容发布新的不可变修订版。",
+        "confirm": "创建修订版"
+      },
+      "attach": {
+        "title": "附加修订版",
+        "description": "将一个确切的修订版绑定到一个自有预设、聊天或世界书。",
+        "confirm": "附加"
+      },
+      "acl": {
+        "title": "管理访问权限",
+        "description": "请求明确的账户权限。服务器会重新验证每个主体。",
+        "confirm": "保存访问权限"
+      },
+      "review": {
+        "title": "审核导入的上下文包",
+        "description": "激活必须是明确且经过身份验证的操作，导入本身绝不会自动激活。",
+        "confirm": "激活上下文包"
+      },
+      "duplicate": {
+        "title": "复制上下文包",
+        "description": "创建包含不可变修订历史的同账户私有副本。",
+        "confirm": "复制"
+      },
+      "delete": {
+        "title": "删除上下文包",
+        "description": "从账户中移除此上下文包。",
+        "confirm": "删除上下文包"
+      }
+    },
+    "errors": {
+      "not_found": "此上下文包不可用，或您已无权访问。",
+      "revision_conflict": "此上下文包已在其他会话中更改。当前显示服务器上的最新版本；请先查看再重试此更改。",
+      "validation_failed": "服务器拒绝了此次上下文包更改。请检查各字段后重试。",
+      "unavailable": "上下文库暂时不可用。"
+    }
   }
 }

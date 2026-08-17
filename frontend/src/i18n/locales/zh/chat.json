@@ -86,6 +86,43 @@
     "modCmd": "Cmd",
     "modCtrl": "Ctrl"
   },
+  "agentRuntime": {
+    "label": "生成模式",
+    "oneTurnLegend": "下一回合",
+    "mode": {
+      "response": "响应",
+      "agentic": "智能体"
+    },
+    "useForChat": "设为此聊天默认",
+    "savingOverride": "正在保存…",
+    "useResponse": "使用响应模式",
+    "repair": {
+      "title": "智能体模式需要处理",
+      "slot": "映射预设的连接槽",
+      "provider": "选择具备所需能力的提供商",
+      "isolate": "恢复安全运行时工作进程",
+      "egress": "本回合使用同一提供商域",
+      "readiness": "完成运行时设置或审核"
+    },
+    "announcement": {
+      "oneTurn": "下一回合已选择{{mode}}模式。",
+      "overrideSaved": "{{mode}}模式现已设为聊天默认。",
+      "overrideFailed": "无法保存聊天默认设置，请重试。",
+      "responseEscape": "下一回合已选择响应模式。"
+    },
+    "preflight": {
+      "refreshRequired": "生成开始前运行时已发生变化。请检查模式后重试。",
+      "unavailable": "智能体模式尚未就绪。请使用响应模式或完成列出的修复。"
+    },
+    "stop": {
+      "stop": "停止运行",
+      "locating": "正在准备精确停止控制…",
+      "stopping": "正在停止…",
+      "retry": "重试停止",
+      "tooLate": "已无法停止",
+      "terminal": "运行已结束"
+    }
+  },
   "findInChat": {
     "open": "在聊天中查找",
     "placeholder": "在聊天中查找…",
@@ -366,6 +403,281 @@
     "renderModeAria": "推理渲染模式",
     "text": "文本",
     "markdown": "Markdown"
+  },
+  "agentActivity": {
+    "liveLabel": "智能体活动 · {{count}} 项进行中",
+    "idleLabel": "智能体活动 · 无进行中的任务",
+    "summaryLabel": "智能体活动 · {{status}} · {{count}} 次执行",
+    "liveAria": "智能体与工具实时活动",
+    "rowAria": "{{profile}}：{{status}}",
+    "usage": "{{total}} 个 token · 输入 {{input}} / 输出 {{output}}",
+    "actors": {
+      "mainModel": "主模型"
+    },
+    "status": {
+      "pending": "等待中",
+      "running": "执行中",
+      "succeeded": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "timed_out": "超时"
+    },
+    "phase": {
+      "queued": "已加入队列",
+      "started": "处理中",
+      "tool_call": "正在使用工具",
+      "completed": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "timed_out": "超时"
+    },
+    "tools": {
+      "lore_list_books": "列出世界书",
+      "lore_get_book": "读取世界书",
+      "lore_list_entries": "列出世界设定条目",
+      "lore_get_entry": "读取世界设定条目",
+      "lore_search_entries": "搜索世界设定",
+      "chat_search_history": "搜索聊天记录",
+      "agent_delegate": "委派给智能体"
+    },
+    "summary": {
+      "invocations": "{{count}} 次执行",
+      "succeeded": "{{count}} 次完成",
+      "failed": "{{count}} 次失败",
+      "cancelled": "{{count}} 次取消",
+      "timedOut": "{{count}} 次超时",
+      "tools": "{{count}} 次工具调用"
+    }
+  },
+  "agentRun": {
+    "title": "智能体活动",
+    "subtitle": "此响应的仅状态时间顺序记录",
+    "close": "关闭智能体活动",
+    "tabsAria": "智能体运行详情",
+    "stripLabel": "智能体运行",
+    "tabs": {
+      "activity": "活动树",
+      "workspace": "工作区"
+    },
+    "actors": {
+      "root": "根智能体",
+      "provider": "模型轮次",
+      "child": "子智能体",
+      "childNamed": "智能体 {{name}}",
+      "tool": "工具"
+    },
+    "tools": {
+      "lore_list_books": "列出设定集",
+      "lore_get_book": "读取设定集",
+      "lore_list_entries": "列出设定条目",
+      "lore_get_entry": "读取设定条目",
+      "lore_search_entries": "搜索设定",
+      "chat_search_history": "搜索聊天记录",
+      "agent_delegate": "委派给智能体",
+      "context_pack_list": "列出上下文包",
+      "context_pack_get": "读取上下文包",
+      "workspace_read_section": "读取工作区分区",
+      "workspace_read_page": "读取工作区页面",
+      "workspace_create_task": "创建任务",
+      "workspace_update_progress": "更新任务进度",
+      "workspace_submit_result": "提交结果",
+      "workspace_accept_submission": "接受提交",
+      "workspace_record_finding": "记录发现",
+      "workspace_record_decision": "记录决定",
+      "workspace_record_question": "记录问题",
+      "workspace_attach_artifact": "附加产物",
+      "workspace_propose_publication": "提议发布",
+      "complete_turn": "完成本轮",
+      "unknown_tool": "工具"
+    },
+    "phase": {
+      "ASSEMBLE": "正在汇总",
+      "WORK": "正在工作",
+      "COMPLETE": "工作完成",
+      "RENDER": "正在撰写响应",
+      "PREPARE_COMMIT": "正在准备响应",
+      "COMMITTING": "正在保存响应",
+      "COMMITTED": "已保存",
+      "COMMIT_FAILED": "保存失败",
+      "EXHAUSTED": "预算已耗尽",
+      "FAILED": "失败",
+      "CANCELLED": "已取消",
+      "TIMED_OUT": "已超时"
+    },
+    "status": {
+      "ASSEMBLE": "正在汇总",
+      "WORK": "正在工作",
+      "COMPLETE": "工作完成",
+      "RENDER": "正在撰写",
+      "PREPARE_COMMIT": "正在准备",
+      "COMMITTING": "正在保存",
+      "COMMITTED": "已完成",
+      "COMMIT_FAILED": "保存失败",
+      "EXHAUSTED": "预算已耗尽",
+      "FAILED": "失败",
+      "CANCELLED": "已取消",
+      "TIMED_OUT": "已超时"
+    },
+    "nodeStatus": {
+      "pending": "待处理",
+      "running": "运行中",
+      "completed": "已完成",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "timed_out": "已超时",
+      "omitted": "已省略"
+    },
+    "activityTreeAria": "智能体和工具活动时间顺序记录",
+    "activityEmpty": "暂无可公开的活动行。",
+    "usageCompact": "{{total}} 个令牌 · 输入 {{input}} / 输出 {{output}}",
+    "duration": {
+      "seconds": "{{count}} 秒",
+      "minutes": "{{count}} 分钟",
+      "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
+      "hours": "{{count}} 小时",
+      "hoursMinutes": "{{hours}} 小时 {{minutes}} 分"
+    },
+    "usage": {
+      "total": "令牌总数",
+      "input": "输入令牌",
+      "output": "输出令牌",
+      "tools": "工具调用",
+      "children": "子智能体",
+      "toolsCount": "工具调用：{{count}}",
+      "childrenCount": "子智能体：{{count}}"
+    },
+    "sync": {
+      "stale": "连接恢复期间显示最后已知的活动树。",
+      "restoring": "正在从服务器恢复活动。",
+      "error": "已保留最后已知的活动树。可以重试恢复。"
+    },
+    "omission": "服务器省略了 {{nodes}} 个活动行和 {{events}} 次更新。",
+    "errors": {
+      "unknown": "此次运行因服务器安全错误而结束。",
+      "capacity_exceeded": "已达到容量上限。",
+      "host_child_admission_limit_exceeded": "已达到主机子智能体上限。",
+      "host_tool_call_limit_exceeded": "已达到主机工具调用上限。",
+      "child_admission_limit_exceeded": "已达到子智能体上限。",
+      "tool_call_limit_exceeded": "已达到工具调用上限。",
+      "logical_provider_request_limit_exceeded": "已达到模型请求上限。",
+      "physical_dispatch_attempt_limit_exceeded": "已达到调度上限。",
+      "child_output_token_limit_exceeded": "已达到子智能体输出上限。",
+      "root_wall_clock_limit_exceeded": "已达到时间上限。",
+      "activity_event_limit_exceeded": "已达到活动更新上限。",
+      "activity_byte_limit_exceeded": "已达到活动大小上限。",
+      "lifecycle_log_record_limit_exceeded": "已达到活动历史上限。",
+      "context_limit_exceeded": "已达到上下文上限。",
+      "initial_input_limit_exceeded": "已达到输入上限。",
+      "argument_limit_exceeded": "已达到工具参数上限。",
+      "result_limit_exceeded": "已达到工具结果上限。",
+      "continuation_limit_exceeded": "已达到继续生成上限。",
+      "retained_output_limit_exceeded": "已达到响应大小上限。",
+      "materialized_limit_exceeded": "已达到物化上限。",
+      "timeout": "运行已超时。",
+      "cancelled": "运行已取消。",
+      "provider_unavailable": "模型服务不可用。",
+      "provider_unsupported": "模型能力不可用。",
+      "provider_tool_calling_unsupported": "工具调用不可用。",
+      "provider_tool_continuation_unsupported": "工具继续调用不可用。",
+      "provider_tool_finalization_unsupported": "最终响应模式不可用。",
+      "provider_request_error": "模型请求失败。",
+      "provider_protocol_error": "无法理解模型响应。",
+      "provider_schema_error": "模型响应格式无效。",
+      "invalid_task": "任务无效。",
+      "invalid_profile": "智能体配置无效。",
+      "invalid_arguments": "工具参数无效。",
+      "batch_rejected": "操作批次已拒绝。",
+      "unknown_tool": "请求的工具不可用。",
+      "unauthorized": "操作未获授权。",
+      "integrity_error": "运行完整性检查失败。",
+      "internal_error": "服务器内部错误。",
+      "not_found": "找不到请求的运行时目标。",
+      "invalid_request": "运行时请求无效。",
+      "decision_refresh_required": "运行时决策已过期。请检查模式后重试。",
+      "decision_capacity_exceeded": "待处理的运行时决策过多，请稍后重试。",
+      "runtime_decision_unavailable": "运行时决策服务不可用。",
+      "agentic_unsupported_surface": "此生成界面需要使用响应模式。",
+      "agentic_runtime_unavailable": "智能体运行时不可用，请使用响应模式。",
+      "agentic_preflight_failed": "智能体预检失败。请使用响应模式或检查运行时设置。",
+      "agentic_chat_busy": "此聊天已有智能体运行正在进行。",
+      "agentic_protocol_failure": "智能体协议响应无效。",
+      "agentic_work_exhausted": "智能体工作预算已用尽。",
+      "agentic_cancelled": "智能体运行已取消。",
+      "agentic_timed_out": "智能体运行已超时。",
+      "agentic_commit_failed": "无法提交智能体结果。",
+      "agentic_revision_conflict": "运行时在提交智能体结果前发生了变化。",
+      "agentic_provider_failure": "智能体模型请求失败。",
+      "agentic_internal_error": "智能体运行时发生内部错误。"
+    },
+    "announcements": {
+      "restoring": "正在恢复智能体活动。",
+      "stale": "智能体活动连接中断。已保留最后已知状态。",
+      "recoveryFailed": "智能体活动恢复失败。已保留最后已知状态。",
+      "cancelled": "智能体运行已取消。",
+      "terminal": "智能体运行状态：{{status}}。",
+      "phase": "智能体运行阶段：{{phase}}。"
+    },
+    "workspace": {
+      "loading": "正在加载工作区索引…",
+      "error": "无法加载工作区。",
+      "retry": "重试",
+      "viewOnly": "此工作区仅供查看，且只包含已获批准的状态摘要。",
+      "empty": "没有可公开的工作区分区。",
+      "loadingSection": "正在加载分区…",
+      "sectionEmpty": "此分区中没有可公开的条目。",
+      "omitted": "服务器省略了 {{count}} 个条目。",
+      "loadMore": "加载更多",
+      "sections": {
+        "objective": "目标",
+        "tasks": "任务",
+        "records": "发现、决定和问题",
+        "submissions": "提交内容",
+        "artifacts": "已发布的产物"
+      },
+      "retention": {
+        "operational": "仅本轮",
+        "turn_terminal": "直至本轮清理",
+        "chat_lifetime": "聊天生命周期"
+      },
+      "visibility": {
+        "owner": "仅你可见",
+        "participants": "参与者可见",
+        "public": "已发布"
+      },
+      "taskState": {
+        "active": "进行中",
+        "blocked": "受阻",
+        "submitted": "已提交",
+        "done": "已完成",
+        "omitted": "已省略"
+      },
+      "required": "必需",
+      "optional": "可选",
+      "assigned": "已分配",
+      "dependencies": "{{count}} 个依赖项",
+      "submissionFor": "针对 {{task}} 的提交内容",
+      "submissionState": {
+        "proposed": "已提议",
+        "accepted": "已接受",
+        "rejected": "已拒绝",
+        "omitted": "已省略"
+      },
+      "agent": "智能体 {{name}}",
+      "published": "已发布",
+      "notPublished": "未发布",
+      "bytes": "{{count}} 字节",
+      "digest": "摘要 {{digest}}",
+      "recordState": {
+        "active": "有效",
+        "accepted": "已接受",
+        "omitted": "已省略"
+      },
+      "recordKind": {
+        "finding": "发现",
+        "decision": "决定",
+        "question": "问题"
+      }
+    }
   },
   "swipe": {
     "previous": "上一个变体",

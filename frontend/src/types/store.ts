@@ -1,6 +1,30 @@
 import type { Message, Character, Persona, Preset, ConnectionProfile, ProviderInfo, RecentChat, GroupedRecentChat, PaginatedResult, Pack, PackWithItems, LumiaItem, LoomItem, ImageGenConnectionProfile, ImageGenProviderInfo } from './api'
 import type { WeaverSession, WeaverStage, WeaverExtraction, WeaverSpineSlot, WeaverSynthesisGroup, WeaverBookRole, WeaverBuildType, WeaverNarrationMode, WeaverPersonaRegister, WeaverPersonaPlan, PersonaDraft, CreateWeaverSessionInput, WeaverCommittedFact, WeaverGap, WeaverInterviewQuestion, WeaverInterviewState, WeaverResponseKind, WeaverCandidate, WeaverBible, UpdateWeaverBibleInput, WeaverFieldDef, WeaverField, WeaverFinalizeResult, WeaverFinalizeInput, WeaverStartChatResult } from '@/api/weaver'
-
+import type { AgentActivityGeneration } from '@/types/ws-events'
+import type { AgentActivityRunV1, AgentPublicErrorV1 } from '@/types/agent-runtime'
+import type {
+  AgentRunPublicV2,
+  AgentRunSyncStatus,
+  AgentWorkspaceSectionV2,
+  AgentWorkspaceViewStateV2,
+} from './agent-runs'
+import type {
+  AttachContextPackInput,
+  ContextPackAttachment,
+  ContextPackDetail,
+  AgentContextPack,
+  ContextPackUiErrorCode,
+  CreateContextPackInput,
+  CreateContextPackRevisionInput,
+  DuplicateContextPackInput,
+  ReplaceContextPackAclInput,
+  ReviewContextPackInput,
+  UpdateContextPackInput,
+} from './agent-context-packs'
+import type {
+  UserDataFailure,
+  UserDataJob,
+} from './user-data'
 // ---- Chat Slice ----
 export interface ChatSlice {
   activeChatId: string | null
@@ -26,6 +50,11 @@ export interface ChatSlice {
   streamingReasoningStartedAt: number | null
   streamingError: string | null
   activeGenerationId: string | null
+  /** Live activity is keyed by generation + target message + swipe. */
+  agentActivityByGeneration: Record<string, AgentActivityGeneration>
+  /** Terminal fallback runs retained when no assistant target/pool exists. */
+  agentActivityRunsByGeneration: Record<string, AgentActivityRunV1>
+  agentTerminalErrorsByGeneration: Record<string, AgentPublicErrorV1>
   regeneratingMessageId: string | null
   /** Index of the swipe the active generation streams into. Lets the UI gate the
    *  streaming buffer to that swipe so the user can navigate to other swipes
@@ -89,6 +118,13 @@ export interface ChatSlice {
   setRegeneratingMessageId: (messageId: string | null) => void
   /** Mark a generation ID as ended (prevents zombie resurrection from late HTTP responses) */
   markGenerationEnded: (generationId: string) => void
+  /** Validate and reconcile one compact child/tool activity event. */
+  reconcileAgentActivity: (payload: unknown) => void
+  /** Merge sanitized terminal fallback runs idempotently. */
+  mergeAgentActivityRuns: (runs: unknown[]) => void
+  setAgentTerminalError: (generationId: string, error: unknown) => void
+  /** Clear one terminal generation, or every activity tree when omitted. */
+  clearAgentActivity: (generationId?: string) => void
   /** Set impersonate draft content (from completed impersonate-draft generation) */
   setImpersonateDraftContent: (content: string | null) => void
 
@@ -100,6 +136,58 @@ export interface ChatSlice {
   selectAllMessages: () => void
   clearMessageSelection: () => void
   selectMessageRange: (fromId: string, toId: string) => void
+}
+
+// ---- Agent Run Projection Slice ----
+export interface AgentRunsSlice {
+  agentRunProvisionalByKey: Record<string, AgentRunPublicV2>
+  agentRunTerminalByTarget: Record<string, AgentRunPublicV2>
+  agentRunCursorByChat: Record<string, string>
+  /** Highest public event sequence observed, including live websocket events. */
+  agentRunLastSequenceByChat: Record<string, number>
+  /** Sequence consumed by the opaque cursor; it may lag the public watermark while a request is in flight. */
+  agentRunCursorSequenceByChat: Record<string, number>
+  /** Current bounded full-resync page offset, when pagination is incomplete. */
+  agentRunResyncOffsetByChat: Record<string, number>
+  agentRunSyncByChat: Record<string, AgentRunSyncStatus>
+  agentRunOmittedEventsByChat: Record<string, number>
+  agentRunRequestEpochByChat: Record<string, number>
+  /** View-only workspace projections stay keyed by turn, independent of run revisions. */
+  agentWorkspaceByTurn: Record<string, AgentWorkspaceViewStateV2>
+  /** Each workspace index/section request has its own monotonic stale-response epoch. */
+  agentWorkspaceRequestEpochByKey: Record<string, number>
+  beginAgentRunRestore: (chatId: string) => number
+  applyAgentRunChanges: (chatId: string, requestEpoch: number, payload: unknown) => boolean
+  failAgentRunRestore: (chatId: string, requestEpoch: number) => void
+  reconcileAgentRunEvent: (payload: unknown) => 'applied' | 'stale' | 'gap' | 'rejected'
+  reconcileExactAgentRun: (chatId: string, payload: unknown) => boolean
+  markAgentRunsStale: (chatId?: string) => void
+  clearAgentRunsForChat: (chatId: string) => void
+  beginAgentWorkspaceRequest: (
+    chatId: string,
+    turnId: string,
+    section?: AgentWorkspaceSectionV2,
+  ) => number
+  applyAgentWorkspaceIndex: (
+    chatId: string,
+    turnId: string,
+    requestEpoch: number,
+    payload: unknown,
+  ) => boolean
+  applyAgentWorkspaceSection: (
+    chatId: string,
+    turnId: string,
+    section: AgentWorkspaceSectionV2,
+    requestEpoch: number,
+    payload: unknown,
+    append: boolean,
+  ) => boolean
+  failAgentWorkspaceRequest: (
+    chatId: string,
+    turnId: string,
+    requestEpoch: number,
+    section?: AgentWorkspaceSectionV2,
+  ) => void
 }
 
 // ---- Characters Slice ----
@@ -1921,6 +2009,72 @@ export interface WeaverSlice {
   startWeaverChat: (sessionId: string) => Promise<WeaverStartChatResult>
 }
 
+// ---- Agent Context Packs Slice ----
+export interface AgentContextPacksSlice {
+  contextPacks: AgentContextPack[]
+  selectedContextPackId: string | null
+  selectedContextPack: ContextPackDetail | null
+  contextPackAclRevision: number
+  contextPacksLoading: boolean
+  contextPackDetailLoading: boolean
+  contextPackBusyAction: string | null
+  contextPackError: ContextPackUiErrorCode | null
+  loadContextPacks: () => Promise<void>
+  selectContextPack: (packId: string | null) => Promise<void>
+  createContextPack: (input: CreateContextPackInput) => Promise<ContextPackDetail | null>
+  updateContextPack: (
+    packId: string,
+    input: UpdateContextPackInput,
+  ) => Promise<ContextPackDetail | null>
+  deleteContextPack: (packId: string, expectedRevision: number) => Promise<boolean>
+  createContextPackRevision: (
+    packId: string,
+    input: CreateContextPackRevisionInput,
+  ) => Promise<ContextPackDetail | null>
+  attachContextPack: (
+    packId: string,
+    input: AttachContextPackInput,
+  ) => Promise<ContextPackDetail | null>
+  detachContextPack: (
+    packId: string,
+    attachment: ContextPackAttachment,
+    expectedContextAclRevision: number,
+  ) => Promise<ContextPackDetail | null>
+  replaceContextPackAcl: (
+    packId: string,
+    input: ReplaceContextPackAclInput,
+  ) => Promise<ContextPackDetail | null>
+  reviewContextPack: (
+    packId: string,
+    input: ReviewContextPackInput,
+  ) => Promise<ContextPackDetail | null>
+  duplicateContextPack: (
+    packId: string,
+    input: DuplicateContextPackInput,
+  ) => Promise<ContextPackDetail | null>
+  importContextPack: (snapshot: unknown) => Promise<ContextPackDetail | null>
+  clearContextPackError: () => void
+}
+
+// ---- User-data portability slice ----
+export type UserDataJobAction = 'upload' | 'ticket' | 'skip-ticket' | 'cancel'
+
+export interface UserDataSlice {
+  userDataJob: UserDataJob | null
+  userDataJobLoading: boolean
+  userDataJobAction: UserDataJobAction | null
+  userDataJobError: UserDataFailure | null
+  userDataRequestEpoch: number
+  setUserDataJob: (job: UserDataJob) => void
+  clearUserDataJob: () => void
+  refreshUserDataJob: (jobId?: string | null) => Promise<UserDataJob | null>
+  startUserDataImport: (file: File, onProgress?: (percent: number) => void) => Promise<string>
+  submitUserDataTicket: (jobId: string, ticket: unknown) => Promise<boolean>
+  skipUserDataTicket: (jobId: string) => Promise<boolean>
+  cancelUserDataImport: (jobId: string) => Promise<'cancelled' | 'cancelling' | 'cleanup_pending' | 'too_late' | 'not_found' | null>
+  reconnectUserDataJob: (jobId?: string | null) => Promise<UserDataJob | null>
+}
+
 export type AppStore = ChatSlice &
   CharactersSlice &
   PersonasSlice &
@@ -1954,4 +2108,7 @@ export type AppStore = ChatSlice &
   ChatHeadsSlice &
   DatabankSlice &
   ConnectionSlice &
-  ContainersSlice
+  ContainersSlice &
+  AgentContextPacksSlice &
+  AgentRunsSlice &
+  UserDataSlice

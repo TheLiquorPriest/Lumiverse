@@ -22,7 +22,17 @@
     "operator": { "shortName": "Operatore", "tabName": "Pannello operatore", "tabDescription": "Gestione server, aggiornamenti e controlli di riavvio" },
     "tokenizers": { "shortName": "Tokenizzatori", "tabName": "Gestore tokenizer", "tabDescription": "Gestisci e testa le configurazioni del tokenizer" },
     "users": { "shortName": "Utenti", "tabName": "Gestione utenti", "tabDescription": "Gestisci account utente, ruoli e autorizzazioni" },
-    "migration": { "shortName": "Migratione", "tabName": "Migratione", "tabDescription": "Importa dati da SillyTavern e altre fonti" }
+    "migration": { "shortName": "Migratione", "tabName": "Migratione", "tabDescription": "Importa dati da SillyTavern e altre fonti" },
+    "agentRuntime": {
+      "shortName": "Runtime Agentic",
+      "tabName": "Runtime Agentic",
+      "tabDescription": "Controlla valori predefiniti, conservazione e limiti imposti dall'host"
+    },
+    "contextLibrary": {
+      "shortName": "Libreria contesti",
+      "tabName": "Libreria contesti",
+      "tabDescription": "Gestisci pacchetti di contesto con versioni e relativi allegati"
+    }
   },
   "account": {
     "title": "Account",
@@ -552,13 +562,11 @@
     "importWarn": "L'archivio viene elaborato in background dopo il caricamento. Non chiudere questa scheda finché non vedi il riepilogo di completamento — ma è sicuro continuare a usare Lumiverse mentre viene eseguito.",
     "importing": "Importazione…",
     "uploadImport": "Carica e importa",
+    "reuploadImport": "Ricarica l’archivio",
     "cancel": "Annulla",
     "ticketPrompt": "Questo archivio contiene {{count}} segreto crittato. Carica il tuo file ticket per ripristinarli.",
     "ticketPrompt_other": "Questo archivio contiene {{count}} segreti crittati. Carica il tuo file ticket per ripristinarli.",
     "skipApiKeys": "Salta chiavi API",
-    "ticketReuse": "Attenzione: questo ticket è stato utilizzato {{uses}} volta. Procedendo sovrascriverai eventuali chiavi API corrispondenti su questo account.",
-    "ticketReuse_other": "Attenzione: questo ticket è stato utilizzato {{uses}} volte{{lastUsed}}. Procedendo sovrascriverai eventuali chiavi API corrispondenti su questo account.",
-    "ticketLastUsed": " (ultima utilizzo {{date}})",
     "uploading": "Caricamento… {{pct}}%",
     "verifying": "Verifica archivio…",
     "importQueued": "In coda — avvio importazione…",
@@ -575,6 +583,7 @@
     "filesRestored": "File ripristinati",
     "vectorsRestored": "Vettori ripristinati per {{table}}",
     "vectorsSkipped": "Salto vettori (configurazione non corrispondente)",
+    "cleanupPending": "Pulizia dell’importazione in corso",
     "importGeneric": "Importazione…",
     "importComplete": "Importazione completata",
     "uploadFailed": "Caricamento fallito",
@@ -582,6 +591,7 @@
     "ticketSubmitFailed": "Invio ticket fallito",
     "skipFailed": "Salto fallito",
     "cancelFailed": "Annullamento fallito",
+    "cancelTooLate": "L’importazione non può più essere annullata",
     "summaryTable": "Tabella",
     "summaryImported": "Importato",
     "summarySkipped": "Saltato",
@@ -590,7 +600,71 @@
     "importFailed": "Importazione fallita",
     "exportPrepareFailed": "Preparazione esportazione fallita",
     "exportAnchorMissing": "Interno: anchor di download mancante",
-    "exportTableSuffix": " ({{processed}})"
+    "exportTableSuffix": " ({{processed}})",
+    "cancelling": "Annullamento…",
+    "skippingTicket": "Ignoramento…",
+    "reconnect": "Aggiorna stato",
+    "jobStatus": "Stato importazione: {{status}}",
+    "archiveId": "Archivio {{id}}",
+    "noActiveJob": "Nessuna importazione è associata a questa scheda.",
+    "summaryFilesNone": "Nessun file ripristinato",
+    "summarySecrets": "Segreti",
+    "summaryVectors": "Vettori",
+    "vectorStatuses": {
+      "included": "Inclusi",
+      "rebuild_required": "Ricostruzione richiesta",
+      "skipped": "Saltati",
+      "unknown": "Sconosciuto"
+    },
+    "statuses": {
+      "queued": "In coda",
+      "validating": "Verifica",
+      "awaiting_ticket": "In attesa del ticket",
+      "running": "In esecuzione",
+      "installing": "Ripristino file",
+      "ready": "Pronto ad applicare",
+      "committing": "Commit in corso",
+      "cancelling": "Annullamento in corso",
+      "cleanup_pending": "Pulizia in corso",
+      "complete": "Completato",
+      "failed": "Fallito",
+      "cancelled": "Annullato"
+    },
+    "failureReasons": {
+      "unknown": "Importazione fallita per un motivo sconosciuto.",
+      "malformed_response": "Il server ha restituito uno stato di portabilità non valido.",
+      "archive_validation_failed": "La validazione dell’archivio è fallita.",
+      "not_zip": "Il file non è un archivio ZIP.",
+      "size": "L’archivio è troppo grande.",
+      "no_manifest": "Manca il manifest dell’archivio.",
+      "bad_manifest": "Il manifest dell’archivio non è valido.",
+      "archive_identity_mismatch": "Questo archivio non corrisponde all’importazione esistente.",
+      "upload_failed": "Caricamento dell’archivio fallito.",
+      "upload_timeout": "Il caricamento dell’archivio è scaduto.",
+      "upload_aborted": "Il caricamento dell’archivio è stato annullato.",
+      "import_start_failed": "Impossibile avviare l’importazione.",
+      "import_failed": "Importazione fallita.",
+      "integrity_failure": "Controllo di integrità dell’archivio fallito.",
+      "multipart_not_supported": "I caricamenti multipart non sono supportati.",
+      "export_capacity": "Sono in corso troppe operazioni di portabilità.",
+      "manual_recovery_required": "L’importazione richiede il recupero del server.",
+      "process_interrupted": "L’importazione è stata interrotta da un riavvio.",
+      "cancelled": "Importazione annullata.",
+      "too_late": "L’importazione non può più essere annullata.",
+      "not_found": "Lavoro di importazione non trovato.",
+      "ticket_required": "È richiesto un ticket di decrittazione.",
+      "ticket_invalid": "Il ticket di decrittazione non è valido.",
+      "ticket_submission_failed": "Impossibile inviare il ticket di decrittazione.",
+      "ticket_gate_conflict": "Il ticket è già stato elaborato.",
+      "replayed": "Il ticket è già stato utilizzato.",
+      "stale": "Il ticket è scaduto o non più valido.",
+      "wrong_issuer": "L’emittente del ticket non è accettato.",
+      "invalid_issuer_instance": "L’identità dell’emittente non è valida.",
+      "unsupported_version": "La versione del ticket non è supportata.",
+      "archive_mismatch": "Il ticket non corrisponde a questo archivio.",
+      "binding_mismatch": "Il ticket non è valido per questa importazione.",
+      "network": "Impossibile raggiungere il servizio di portabilità."
+    }
   },
   "advanced": {
     "title": "Avanzate",
@@ -1386,5 +1460,243 @@
     "memoryModeConservative": "Conservativo - Meno ricordi di alta qualità",
     "memoryModeBalanced": "Bilanciato - Recupero standard (consigliato)",
     "memoryModeAggressive": "Aggressivo - Più ricordi, soglia inferiore"
+  },
+  "agentRuntimeSettings": {
+    "eyebrow": "Runtime Agentic",
+    "title": "Runtime Agentic",
+    "description": "Controlla valori predefiniti effettivi, conservazione e limiti di sola lettura imposti dall'host.",
+    "defaults": {
+      "title": "Precedenza modalità",
+      "description": "Lumiverse determina una modalità per ogni turno senza modificare il preset.",
+      "oneTurn": "Scelta per un turno",
+      "oneTurnHelp": "Una scelta autenticata si applica una sola volta e usa un token decisionale monouso.",
+      "chat": "Override della chat",
+      "chatHelp": "Una scelta permanente per la chat si applica finché non viene modificata esplicitamente.",
+      "preset": "Predefinito del preset",
+      "presetHelp": "Il preset selezionato fornisce la modalità predefinita approvata.",
+      "response": "Ripiego su Risposta",
+      "responseHelp": "Risposta resta disponibile quando Agentic non è disponibile o non è selezionata."
+    },
+    "retention": {
+      "title": "Conservazione area di lavoro",
+      "description": "La conservazione è definita per ogni preset entro i limiti imposti dall'host.",
+      "operational": "Operativa",
+      "operationalHelp": "Disponibile solo durante il turno attivo e rimossa durante la pulizia finale.",
+      "terminal": "Fine turno",
+      "terminalHelp": "Conservata per un periodo finale limitato per attività di sola visualizzazione e ispezione dell'area di lavoro.",
+      "chatLifetime": "Durata della chat",
+      "chatLifetimeHelp": "Solo gli artefatti pubblicati esplicitamente restano nella chat proprietaria."
+    },
+    "limits": {
+      "title": "Limiti dell'host",
+      "description": "Questi limiti effettivi del processo proteggono la capacità del provider, dell'ambiente isolato, delle attività e delle risorse.",
+      "loading": "Caricamento limiti dell'host…",
+      "error": "I limiti dell'host non sono temporaneamente disponibili.",
+      "retry": "Riprova",
+      "readOnly": "Questi valori sono informativi. Preset, importazioni ed estensioni non possono aumentarli.",
+      "turn": "Budget del turno",
+      "activity": "Archiviazione attività",
+      "capacity": "Capacità del processo",
+      "fields": {
+        "childAdmissions": "Ammissioni secondarie",
+        "aggregateToolCalls": "Chiamate totali agli strumenti",
+        "logicalProviderRequests": "Richieste logiche al provider",
+        "physicalDispatchAttempts": "Tentativi fisici di invio",
+        "childOutputTokens": "Token di output secondari",
+        "rootWallClockMs": "Millisecondi effettivi del processo radice",
+        "activityEvents": "Eventi attività",
+        "activityBytes": "Byte attività",
+        "lifecycleLogRecords": "Record del log del ciclo di vita",
+        "activeRootsPerUser": "Processi radice attivi per utente",
+        "activeRootsProcess": "Processi radice attivi per processo",
+        "providerDispatchesPerUser": "Invii al provider per utente",
+        "providerDispatchesProcess": "Invii al provider per processo",
+        "toolExecutionsPerUser": "Esecuzioni strumenti per utente",
+        "toolExecutionsProcess": "Esecuzioni strumenti per processo"
+      }
+    }
+  },
+  "contextLibrary": {
+    "eyebrow": "Contesto account",
+    "title": "Libreria contesti",
+    "description": "Crea pacchetti di contesto immutabili e versionati e collega le revisioni approvate a preset, chat o libri del mondo.",
+    "copySuffix": "copia",
+    "packs": "Pacchetti",
+    "packList": "Pacchetti di contesto",
+    "loading": "Caricamento pacchetti di contesto…",
+    "loadingDetail": "Caricamento dettagli del pacchetto…",
+    "loadingTargets": "Caricamento destinazioni di proprietà…",
+    "targetLoadError": "Impossibile caricare le destinazioni di collegamento di tua proprietà.",
+    "targetsLoaded": "Destinazioni di collegamento caricate.",
+    "noTargetsAvailable": "Nessuna destinazione di proprietà è disponibile per questo ambito.",
+    "selectTarget": "Seleziona una destinazione di proprietà",
+    "selectPack": "Seleziona un pacchetto di contesto per esaminarlo.",
+    "emptyTitle": "Crea il tuo primo pacchetto di contesto",
+    "emptyDescription": "Aggiungi materiale di riferimento stabile, quindi collega una revisione immutabile dove serve.",
+    "noDescription": "Nessuna descrizione",
+    "noAttachments": "Nessun allegato",
+    "privateOnly": "Non è stato concesso alcun accesso aggiuntivo all'account.",
+    "unavailableTarget": "Destinazione non disponibile",
+    "exportComplete": "Snapshot portabile esportato.",
+    "exporting": "Esportazione dello snapshot portabile…",
+    "importing": "Importazione dello snapshot portabile…",
+    "importComplete": "“{{name}}” è stato importato. Esaminalo prima di collegarlo o attivarlo.",
+    "importFileLabel": "Scegli uno snapshot JSON di un pacchetto di contesto da importare",
+    "versionNumber": "Revisione {{number}}",
+    "byteCount": "{{count}} byte",
+    "versionHistoryCaption": "Cronologia immutabile delle revisioni del pacchetto di contesto",
+    "versionImmutableHelp": "Le revisioni pubblicate non possono essere modificate. Crea una nuova revisione per cambiare il contenuto.",
+    "immutable": "Immutabile",
+    "previewTitle": "Anteprima revisione {{number}}",
+    "contentHelp": "Le voci vengono memorizzate in ordine come contesto letterale. Gli ID devono essere univoci nella revisione.",
+    "entryNumber": "Voce {{number}}",
+    "addEntry": "Aggiungi voce",
+    "removeEntry": "Rimuovi voce {{number}}",
+    "tagsHelp": "Separa i tag con virgole.",
+    "requiredAttachment": "Considera questo allegato obbligatorio per il controllo preliminare Agentic",
+    "attachmentsDescription": "Gli allegati associano una revisione immutabile esatta a una destinazione di proprietà.",
+    "accessDescription": "Visibilità e autorizzazioni ACL vengono riconvalidate dal server per ogni operazione.",
+    "accessList": "Elenco accessi dell'account",
+    "accessFor": "Accesso per {{name}}",
+    "addAccess": "Aggiungi accesso",
+    "removeAccess": "Rimuovi accesso per {{name}}",
+    "aclServerAuthority": "Il server verifica identità, proprietà, revisione ACL corrente e autorizzazione richiesta.",
+    "reviewTitle": "Revisione autenticata obbligatoria",
+    "reviewDescription": "Questo pacchetto resta disabilitato finché non ne esamini il contenuto e ne accetti esplicitamente l'uso locale.",
+    "repairDescription": "Questo pacchetto deve essere riparato prima di poter essere esaminato o collegato.",
+    "reviewAcknowledgement": "Ho esaminato questo pacchetto, la sua visibilità, il contenuto e le autorizzazioni di accesso e desidero attivarlo.",
+    "preserveAttachments": "Duplica gli allegati attualmente autorizzati",
+    "deleteTitle": "Elimina pacchetto di contesto",
+    "deleteDescription": "Elimina questo pacchetto e le revisioni e gli allegati di sua proprietà.",
+    "deleteWarning": "Eliminare “{{name}}”? L'azione è irreversibile.",
+    "detachFrom": "Scollega da {{name}}",
+    "status": {
+      "active": "Pronto",
+      "disabled": "Disabilitato",
+      "review_required": "Revisione obbligatoria",
+      "repair_required": "Riparazione obbligatoria"
+    },
+    "source": {
+      "local": "Locale",
+      "portable_import": "Importazione portabile",
+      "archive_restore": "Ripristino da archivio",
+      "same_account_duplicate": "Duplicato nello stesso account"
+    },
+    "visibility": {
+      "private": "Privata",
+      "account": "Account",
+      "restricted": "Limitata",
+      "help": "Il server resta l'autorità per ogni operazione su ACL e destinazioni."
+    },
+    "scopes": {
+      "preset": "Preset",
+      "chat": "Chat",
+      "world_book": "Libro del mondo"
+    },
+    "acl": {
+      "read": "Lettura",
+      "use": "Uso",
+      "edit": "Modifica"
+    },
+    "attachmentState": {
+      "active": "Attivo",
+      "disabled": "Disabilitato",
+      "review_required": "Revisione obbligatoria",
+      "repair_required": "Riparazione obbligatoria"
+    },
+    "sections": {
+      "versions": "Cronologia versioni",
+      "attachments": "Allegati",
+      "access": "Visibilità e accesso"
+    },
+    "fields": {
+      "name": "Nome",
+      "description": "Descrizione",
+      "visibility": "Visibilità",
+      "content": "Contenuto revisione",
+      "entryId": "ID voce",
+      "entryTitle": "Titolo voce",
+      "tags": "Tag",
+      "body": "Corpo",
+      "scope": "Ambito allegato",
+      "target": "Destinazione",
+      "version": "Revisione",
+      "account": "ID utente account",
+      "access": "Autorizzazione",
+      "source": "Origine",
+      "updated": "Aggiornato"
+    },
+    "columns": {
+      "version": "Revisione",
+      "state": "Stato",
+      "size": "Dimensione",
+      "created": "Creazione",
+      "actions": "Azioni"
+    },
+    "actions": {
+      "create": "Crea pacchetto",
+      "import": "Importa snapshot",
+      "cancel": "Annulla",
+      "refresh": "Aggiorna",
+      "reviewLatest": "Rivedi la versione più recente",
+      "retryTargets": "Riprova il caricamento",
+      "edit": "Modifica dettagli",
+      "duplicate": "Duplica",
+      "export": "Esporta revisione selezionata",
+      "review": "Esamina e attiva",
+      "newVersion": "Nuova revisione",
+      "preview": "Anteprima",
+      "attach": "Collega revisione",
+      "manageAccess": "Gestisci accesso",
+      "delete": "Elimina"
+    },
+    "dialogs": {
+      "create": {
+        "title": "Crea pacchetto di contesto",
+        "description": "Crea un pacchetto locale e la sua prima revisione immutabile.",
+        "confirm": "Crea pacchetto"
+      },
+      "edit": {
+        "title": "Modifica dettagli pacchetto",
+        "description": "Aggiorna i metadati senza modificare il contenuto immutabile della revisione.",
+        "confirm": "Salva dettagli"
+      },
+      "revision": {
+        "title": "Crea revisione",
+        "description": "Parti dal contenuto più recente e pubblica una nuova revisione immutabile.",
+        "confirm": "Crea revisione"
+      },
+      "attach": {
+        "title": "Collega revisione",
+        "description": "Associa una revisione esatta a un preset, una chat o un libro del mondo di proprietà.",
+        "confirm": "Collega"
+      },
+      "acl": {
+        "title": "Gestisci accesso",
+        "description": "Richiedi autorizzazioni esplicite per l'account. Il server riconvalida ogni identità.",
+        "confirm": "Salva accesso"
+      },
+      "review": {
+        "title": "Esamina pacchetto importato",
+        "description": "L'attivazione è un'azione autenticata esplicita e non deriva mai dalla sola importazione.",
+        "confirm": "Attiva pacchetto"
+      },
+      "duplicate": {
+        "title": "Duplica pacchetto",
+        "description": "Crea una copia privata nello stesso account con cronologia immutabile delle revisioni.",
+        "confirm": "Duplica"
+      },
+      "delete": {
+        "title": "Elimina pacchetto",
+        "description": "Rimuovi questo pacchetto di contesto dall'account.",
+        "confirm": "Elimina pacchetto"
+      }
+    },
+    "errors": {
+      "not_found": "Questo pacchetto di contesto non è disponibile o non hai più accesso.",
+      "revision_conflict": "Questo pacchetto è stato modificato in un'altra sessione. È mostrata la versione più recente del server; esaminala prima di riprovare la modifica.",
+      "validation_failed": "Il server ha rifiutato la modifica al pacchetto di contesto. Controlla i campi e riprova.",
+      "unavailable": "La Libreria contesti non è temporaneamente disponibile."
+    }
   }
 }

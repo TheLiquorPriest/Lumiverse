@@ -8,6 +8,7 @@ import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { env } from "../env";
 import { resolveFfmpegBinary } from "./ffmpeg-binary.service";
 import * as chatsSvc from "./chats.service";
+import { SERVER_IMAGE_GENERATION_PROVENANCE } from "./image-provenance";
 import * as settingsSvc from "./settings.service";
 import {
   WALLPAPER_LIBRARY_OWNER,
@@ -17,6 +18,7 @@ import {
   deleteWallpaperLibraryImage,
   getImage,
   getImageFilePath,
+  getPublicImageFile,
   listImages,
   uploadImage,
 } from "./images.service";
@@ -49,6 +51,7 @@ function initImagesTestDb(): void {
     owner_extension_identifier TEXT,
     owner_character_id TEXT,
     owner_chat_id TEXT,
+    public_provenance TEXT,
     created_at INTEGER NOT NULL
   )`);
 
@@ -81,6 +84,7 @@ function seedImage(
     filename?: string;
     original_filename?: string;
     mime_type?: string;
+    public_provenance?: string;
   },
 ): void {
   getDb()
@@ -98,8 +102,9 @@ function seedImage(
         owner_extension_identifier,
         owner_character_id,
         owner_chat_id,
+        public_provenance,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
@@ -114,6 +119,7 @@ function seedImage(
       options?.owner_extension_identifier ?? null,
       options?.owner_character_id ?? null,
       options?.owner_chat_id ?? null,
+      options?.public_provenance ?? null,
       createdAt,
     );
 }
@@ -154,12 +160,62 @@ afterEach(() => {
     testDataDir = "";
   }
 });
+describe("images.service public results", () => {
+  test("does not treat a filename prefix as public provenance", async () => {
+    seedImage("spoofed", 100, {
+      filename: "spoofed.png",
+      original_filename: "image-gen-spoof.png",
+    });
+    const imagesDir = join(env.dataDir, "images");
+    mkdirSync(imagesDir, { recursive: true });
+    writeFileSync(join(imagesDir, "spoofed.png"), Uint8Array.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]));
+
+    await expect(getPublicImageFile("spoofed")).resolves.toBeNull();
+  });
+
+  test("serves only server-provenanced valid media with a canonical type", async () => {
+    seedImage("generated", 100, {
+      filename: "generated.png",
+      original_filename: "image-gen-test.png",
+      public_provenance: SERVER_IMAGE_GENERATION_PROVENANCE,
+    });
+    const imagesDir = join(env.dataDir, "images");
+    mkdirSync(imagesDir, { recursive: true });
+    writeFileSync(join(imagesDir, "generated.png"), Uint8Array.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ]));
+
+    await expect(getPublicImageFile("generated")).resolves.toEqual({
+      filepath: join(imagesDir, "generated.png"),
+      contentType: "image/png",
+    });
+  });
+
+  test("rejects active HTML bytes even when provenance is present", async () => {
+    seedImage("active", 100, {
+      filename: "active.html",
+      original_filename: "image-gen-active.html",
+      mime_type: "text/html",
+      public_provenance: SERVER_IMAGE_GENERATION_PROVENANCE,
+    });
+    const imagesDir = join(env.dataDir, "images");
+    mkdirSync(imagesDir, { recursive: true });
+    writeFileSync(join(imagesDir, "active.html"), "<!doctype html><script>alert(1)</script>");
+
+    await expect(getPublicImageFile("active")).resolves.toBeNull();
+  });
+
+});
 
 describe("images.service ownership filters", () => {
   test("does not create an image row when a write reports success without creating the file", async () => {
     const writeSpy = spyOn(Bun, "write").mockImplementation(async () => 1);
     try {
-      const file = new File([new Uint8Array([0])], "missing.png", { type: "image/png" });
+      const file = new File([
+        Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      ], "missing.png", { type: "image/png" });
 
       await expect(uploadImage("u1", file)).rejects.toThrow("Image file was not created");
       const count = getDb().query("SELECT COUNT(*) AS count FROM images").get() as { count: number };

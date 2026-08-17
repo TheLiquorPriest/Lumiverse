@@ -1,13 +1,31 @@
+import {
+  startAgenticGeneration,
+  requestAgenticGenerationCancellation,
+  requestAgenticChatCancellation,
+  waitForAgenticGeneration,
+  getActiveAgenticGenerationForChat,
+  getActiveAgenticGenerationContext,
+  stopAgenticUserGenerations,
+  stopAllAgenticGenerations,
+  getActiveAgenticGenerationCount,
+  AgenticGenerationError,
+  type AgenticGenerationDependencies,
+  type AgenticGenerationInput,
+} from "./agentic-generation.service";
 import { getProvider } from "../llm/registry";
-import type { LlmProvider } from "../llm/provider";
+import {
+  AgentToolCapabilityError,
+  assertAgentToolCapability,
+  type LlmProvider,
+} from "../llm/provider";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import * as secretsSvc from "./secrets.service";
 import * as connectionsSvc from "./connections.service";
 import * as chatsSvc from "./chats.service";
 import * as presetsSvc from "./presets.service";
+import * as presetProfilesSvc from "./preset-profiles.service";
 import * as settingsSvc from "./settings.service";
-import * as personasSvc from "./personas.service";
 import {
   assemblePrompt,
   applyCustomBodyParameters,
@@ -20,8 +38,15 @@ import {
   resolveContinuePostfix,
   shouldPreserveDisplayReasoningDelimiters,
   type VectorActivatedEntry,
+  clipToContextBudget,
+  resolvePromptBlockPlacements,
+  reorderBlocksByPosition,
 } from "./prompt-assembly.service";
+import { resolveEffectiveRuntime } from "./agent-runtime-decision.service";
+import type { EffectiveRuntimeRequestV1 } from "../types/agent-runtime-decision";
+import { getPresetAgentConfig } from "./agent-config-portability.service";
 import * as charactersSvc from "./characters.service";
+import * as personasSvc from "./personas.service";
 import { getEffectiveCharacterName } from "../types/character";
 import { isNoPresetChatMetadata, isTemporaryChatMetadata } from "../types/chat";
 import {
@@ -32,6 +57,10 @@ import {
   type GenerationParameters,
   type GenerationRequest,
   type GenerationResponse,
+  type ProviderTransientCarrier,
+  type ResponsesFunctionCallOutput,
+  type ResponsesInputMessageItem,
+  type ResponsesOutputItem,
   type StreamChunk,
   type GenerationType,
   type ImpersonateMode,
@@ -40,16 +69,22 @@ import {
   type ToolDefinition,
   type ToolCallResult,
   type LlmThinkingBlock,
+  type ContextClipStats,
 } from "../llm/types";
 import { trimIncompleteTrailingWord } from "../utils/trim-incomplete-word";
+import { promptBlockMatchesCharacterTags } from "../utils/prompt-block-character-tags";
 import { healFormattingArtifacts } from "../utils/format-healing";
 import {
   buildInlineToolContinuation,
+  validateInlineToolCallIds,
   type InlineCouncilToolResult,
 } from "./inline-tool-continuation";
 import type { Message } from "../types/message";
 import type { ConnectionProfile } from "../types/connection-profile";
+import type { ResolvedConcreteConnectionV1 } from "./connections.service";
+import type { Preset, PromptBlock } from "../types/preset";
 import type { CustomBody } from "../types/preset";
+import type { PresetProfileBinding } from "../types/preset-profile";
 import {
   interceptorPipeline,
   type InterceptorBreakdownEntry,
@@ -71,7 +106,9 @@ import {
 import type {
   CachedCouncilResult,
   CouncilMember,
+  CouncilMemberContext,
   GenerationReasoningOverrideDTO,
+  LlmMessageDTO,
 } from "lumiverse-spindle-types";
 import {
   getCouncilSettings,
@@ -79,6 +116,7 @@ import {
 } from "./council/council-settings.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
 import * as tokenizerSvc from "./tokenizer.service";
+import type { ResolvedTokenCounter } from "./tokenizer.service";
 import * as breakdownSvc from "./breakdown.service";
 import * as regexScriptsSvc from "./regex-scripts.service";
 import * as pool from "./generation-pool.service";
@@ -106,6 +144,8 @@ import {
 } from "./chat-background.service";
 import {
   createCooperativeYielder,
+  ProviderProtocolError,
+  ProviderResponseTooLargeError,
   yieldToEventLoop,
 } from "../llm/stream-utils";
 import { getMcpClientManager } from "./mcp-client-manager";
@@ -145,12 +185,216 @@ import { cloneEnv } from "../macros";
 import {
   assemblePromptInWorker,
   canUsePromptAssemblyWorker,
+  isSafeResponseAssemblyFallbackError,
 } from "./prompt-assembly-worker-client";
 import { isPromptRegexChatOwned } from "../spindle/prompt-regex-ownership";
 import { isRunning as isExtensionRunning } from "../spindle/lifecycle";
 import { clampErrorMessage, describeProviderError, ProviderRequestError } from "../utils/provider-errors";
+import {
+  AgentRuntimeFailure,
+  asPublicRuntimeCode,
+  type AgentProviderDispatchRequest,
+  type AgentProviderDispatchResponse,
+  AgentRuntimeOwner,
+} from "./agent-runtime.service";
+import { AgentAccountingFailure, observeOutputTokens, utf8ByteLength } from "./agent-runtime-accounting";
+import { AgentLedgerFailure } from "./agent-runtime-ledger";
+import type { ToolBatchReservation } from "./agent-runtime-frame";
+import type { AgentAdmissionPermit } from "./agent-runtime-admission";
+import {
+  AgentAssemblyRequiresMainProcessError,
+  AgentMultiplayerUnsupportedError,
+  preflightAgentIntrinsics,
+  type AgentIntrinsicBlockInput,
+} from "./agent-intrinsics.service";
+import { CORE_AGENT_TOOL_CATALOG } from "./agent-tools.service";
+import {
+  AgentSealError,
+  redactAgentOutputFrames,
+  withAgentSealStage,
+  type AgentSealRegistry,
+  type AgentSealStage,
+} from "./agent-seals.service";
+import type { AgentUsage } from "../types/agents";
+import { persistTerminalAgentActivityRun } from "./agent-activity-runs.service";
+import type {
+  AgentActivityLifecycle,
+  AgentActivitySnapshotV1,
+  AgentLedgerReservation,
+  AgentPublicErrorCategory,
+  AgentPublicErrorCode,
+  AgentPublicErrorV1,
+  AgentTerminalReason,
+} from "../types/agent-runtime";
 
-interface GenerateInput {
+const RECOGNIZED_AGENT_TOOL_NAMES = new Set<string>([
+  ...Object.keys(CORE_AGENT_TOOL_CATALOG),
+  "agent_delegate",
+]);
+
+const PROVIDER_TRANSIENT_HISTORY_MAX_BYTES = 2 * 1024 * 1024;
+/**
+ * The carrier is an insertion-ordered transcript. Callers append every
+ * post-response item (results and host guidance) in the order it occurred;
+ * never regroup items by provider kind.
+ */
+
+type ResponsesCarrierItem =
+  | ResponsesOutputItem
+  | ResponsesFunctionCallOutput
+  | ResponsesInputMessageItem;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isResponsesOutputItem(value: unknown): value is ResponsesOutputItem {
+  if (!isRecord(value) || typeof value.type !== "string") return false;
+  switch (value.type) {
+    case "message":
+      return (
+        value.role === "assistant" &&
+        typeof value.id === "string" &&
+        Array.isArray(value.content)
+      );
+    case "reasoning":
+      return typeof value.id === "string" && Array.isArray(value.summary);
+    case "function_call":
+      return (
+        typeof value.id === "string" &&
+        typeof value.call_id === "string" &&
+        typeof value.name === "string" &&
+        typeof value.arguments === "string"
+      );
+    default:
+      return false;
+  }
+}
+
+function isResponsesInputMessageItem(
+  value: unknown,
+): value is ResponsesInputMessageItem {
+  return (
+    isRecord(value) &&
+    value.type === "message" &&
+    (value.role === "user" || value.role === "assistant" || value.role === "system") &&
+    typeof value.content === "string" &&
+    !Object.hasOwn(value, "id")
+  );
+}
+
+function isResponsesFunctionCallOutput(
+  value: unknown,
+): value is ResponsesFunctionCallOutput {
+  return (
+    isRecord(value) &&
+    value.type === "function_call_output" &&
+    typeof value.call_id === "string" &&
+    typeof value.output === "string"
+  );
+}
+
+function isResponsesCarrierItem(value: unknown): value is ResponsesCarrierItem {
+  return (
+    isResponsesOutputItem(value) ||
+    isResponsesInputMessageItem(value) ||
+    isResponsesFunctionCallOutput(value)
+  );
+}
+
+function isResponsesCarrier(value: unknown): value is ProviderTransientCarrier {
+  return (
+    isRecord(value) &&
+    value.kind === "openai_responses" &&
+    Array.isArray(value.items) &&
+    value.items.every(isResponsesCarrierItem)
+  );
+}
+
+function assertResponsesCarrier(
+  value: unknown,
+): asserts value is ProviderTransientCarrier {
+  if (!isResponsesCarrier(value)) {
+    throw new ProviderProtocolError(
+      "OpenAI Responses continuation carrier is malformed",
+    );
+  }
+}
+
+function assertResponsesProviderCarrier(
+  value: unknown,
+): asserts value is ProviderTransientCarrier {
+  if (
+    !isRecord(value) ||
+    value.kind !== "openai_responses" ||
+    !Array.isArray(value.items) ||
+    !value.items.every(isResponsesOutputItem)
+  ) {
+    throw new ProviderProtocolError(
+      "OpenAI Responses provider output carrier is malformed",
+    );
+  }
+}
+
+function mergeProviderTransientCarrier(
+  previous: ProviderTransientCarrier | undefined,
+  current: ProviderTransientCarrier,
+  appendedItems: readonly ResponsesCarrierItem[],
+): ProviderTransientCarrier {
+  if (previous !== undefined) assertResponsesCarrier(previous);
+  assertResponsesProviderCarrier(current);
+  if (!appendedItems.every(isResponsesCarrierItem)) {
+    throw new ProviderProtocolError(
+      "OpenAI Responses continuation item is malformed",
+    );
+  }
+  const merged: ProviderTransientCarrier = Object.freeze({
+    kind: "openai_responses",
+    items: Object.freeze([
+      ...(previous?.items ?? []),
+      ...current.items,
+      ...appendedItems,
+    ]),
+  });
+  const bytes = Buffer.byteLength(JSON.stringify(merged), "utf8");
+  if (bytes > PROVIDER_TRANSIENT_HISTORY_MAX_BYTES) {
+    throw new AgentRuntimeFailure("continuation_limit_exceeded");
+  }
+  return merged;
+}
+function isUsageOnlyStreamChunk(chunk: StreamChunk): boolean {
+  return chunk.usage !== undefined
+    && !chunk.finish_reason
+    && !chunk.token
+    && !chunk.reasoning
+    && !(chunk.tool_calls && chunk.tool_calls.length > 0)
+    && !chunk.providerTransientCarrier
+    && !(chunk.thinking_blocks && chunk.thinking_blocks.length > 0)
+    && !(chunk.reasoning_details && chunk.reasoning_details.length > 0);
+}
+function resolveInlineToolContinuationPolicy(
+  hasTools: boolean,
+  agentToolsExposed: boolean,
+  capabilities: Pick<
+    LlmProvider["capabilities"],
+    "nativeToolContinuation" | "toolContinuationMode" | "interleavedThinking"
+  >,
+): {
+  structured: boolean;
+  legacyResultRole: "system" | "user";
+} {
+  return {
+    structured: hasTools &&
+      (agentToolsExposed
+        ? capabilities.nativeToolContinuation === true &&
+          capabilities.toolContinuationMode === "native"
+        : capabilities.interleavedThinking === true),
+    legacyResultRole: agentToolsExposed ? "user" : "system",
+  };
+}
+
+
+export interface GenerateInput {
   userId: string;
   chat_id: string;
   connection_id?: string;
@@ -159,9 +403,17 @@ interface GenerateInput {
   preset_id?: string;
   force_preset_id?: boolean;
   message_id?: string;
+  /** Exact swipe selected for continue/regenerate/swipe targets. */
+  swipe_id?: number;
   messages?: LlmMessage[];
   parameters?: GenerationParameters;
   generation_type?: GenerationType;
+  /** Explicit runtime selection. Omitted preserves the existing Response path. */
+  mode?: "response" | "agentic";
+  /** One-use effective-runtime decision token for Agentic admission. */
+  runtime_decision_token?: string;
+  /** Monotonic request epoch captured by effective-runtime preflight. */
+  request_epoch?: number;
   impersonate_mode?: ImpersonateMode;
   /** For impersonate: free-form text from the user's input box, appended to the impersonation prompt. */
   impersonate_input?: string;
@@ -234,6 +486,39 @@ interface GenerationLifecycle {
   /** Context-budget clipping stats (for GENERATION_IN_PROGRESS payload + breakdown). */
   contextClipStats?: import("../llm/types").ContextClipStats;
 }
+function isAgentSummaryPersistenceTarget(
+  lifecycle: Pick<
+    GenerationLifecycle,
+    | "generationType"
+    | "targetMessageId"
+    | "targetSwipeIdx"
+    | "stagedMessageId"
+    | "continueMessageId"
+  >,
+  messageId: string,
+  swipeId: number | undefined,
+): swipeId is number {
+  if (
+    lifecycle.generationType === "impersonate" ||
+    typeof swipeId !== "number" ||
+    !Number.isSafeInteger(swipeId) ||
+    swipeId < 0
+  ) {
+    return false;
+  }
+
+  const existingTargetIds = [
+    lifecycle.targetMessageId,
+    lifecycle.stagedMessageId,
+    lifecycle.continueMessageId,
+  ].filter((targetId): targetId is string => targetId !== undefined);
+  return (
+    existingTargetIds.every((targetId) => targetId === messageId) &&
+    (lifecycle.targetSwipeIdx == null ||
+      lifecycle.targetSwipeIdx === swipeId)
+  );
+}
+
 
 function collectTrailingUserMessageIds(userId: string, chatId: string): string[] {
   return chatsSvc.getTrailingVisibleUserMessageIds(userId, chatId);
@@ -316,6 +601,167 @@ function extractReasoningDetailsText(
     .join("\n");
   return combined.trim().length > 0 ? combined : undefined;
 }
+function validatedGenerationUsage(
+  usage: unknown,
+): NonNullable<GenerationResponse["usage"]> {
+  if (usage === null || typeof usage !== "object") {
+    throw new AgentRuntimeFailure("provider_protocol_error");
+  }
+  const candidate = usage as Record<string, unknown>;
+  const promptTokens = candidate.prompt_tokens;
+  const completionTokens = candidate.completion_tokens;
+  const totalTokens = candidate.total_tokens;
+  if (
+    typeof promptTokens !== "number" ||
+    typeof completionTokens !== "number" ||
+    typeof totalTokens !== "number" ||
+    !Number.isSafeInteger(promptTokens) ||
+    !Number.isSafeInteger(completionTokens) ||
+    !Number.isSafeInteger(totalTokens) ||
+    promptTokens < 0 ||
+    completionTokens < 0 ||
+    totalTokens < 0 ||
+    promptTokens > Number.MAX_SAFE_INTEGER - completionTokens ||
+    totalTokens < promptTokens + completionTokens
+  ) {
+    throw new AgentRuntimeFailure("provider_protocol_error");
+  }
+  return usage as NonNullable<GenerationResponse["usage"]>;
+}
+
+function addGenerationTokenCount(left: number, right: number): number {
+  if (left > Number.MAX_SAFE_INTEGER - right) {
+    throw new AgentRuntimeFailure("provider_protocol_error");
+  }
+  return left + right;
+}
+
+
+function addCheckedGenerationUsage(
+  current: GenerationResponse["usage"],
+  additional: GenerationResponse["usage"],
+): GenerationResponse["usage"] {
+  if (additional === undefined) {
+    return current === undefined
+      ? undefined
+      : { ...validatedGenerationUsage(current) };
+  }
+  const next = validatedGenerationUsage(additional);
+  if (current === undefined) return { ...next };
+  const accumulated = validatedGenerationUsage(current);
+  return {
+    prompt_tokens: addGenerationTokenCount(
+      accumulated.prompt_tokens,
+      next.prompt_tokens,
+    ),
+    completion_tokens: addGenerationTokenCount(
+      accumulated.completion_tokens,
+      next.completion_tokens,
+    ),
+    total_tokens: addGenerationTokenCount(
+      accumulated.total_tokens,
+      next.total_tokens,
+    ),
+    ...(next.provider_raw !== undefined
+      ? { provider_raw: next.provider_raw }
+      : accumulated.provider_raw !== undefined
+        ? { provider_raw: accumulated.provider_raw }
+        : {}),
+  };
+}
+function addUncheckedGenerationUsage(
+  current: GenerationResponse["usage"],
+  additional: GenerationResponse["usage"],
+): GenerationResponse["usage"] {
+  if (!current) return additional ? { ...additional } : undefined;
+  if (!additional) return { ...current };
+  return {
+    prompt_tokens: current.prompt_tokens + additional.prompt_tokens,
+    completion_tokens:
+      current.completion_tokens + additional.completion_tokens,
+    total_tokens: current.total_tokens + additional.total_tokens,
+    ...(additional.provider_raw !== undefined
+      ? { provider_raw: additional.provider_raw }
+      : current.provider_raw !== undefined
+        ? { provider_raw: current.provider_raw }
+        : {}),
+  };
+}
+
+function reconcileObservedGenerationUsage(
+  usage: GenerationResponse["usage"],
+  observedOutputTokens: number,
+): NonNullable<GenerationResponse["usage"]> {
+  if (
+    !Number.isSafeInteger(observedOutputTokens) ||
+    observedOutputTokens < 0
+  ) {
+    throw new AgentRuntimeFailure("provider_protocol_error");
+  }
+  const validated = usage === undefined
+    ? undefined
+    : validatedGenerationUsage(usage);
+  const promptTokens = validated?.prompt_tokens ?? 0;
+  const completionTokens = Math.max(
+    validated?.completion_tokens ?? 0,
+    observedOutputTokens,
+  );
+  const minimumTotal = addGenerationTokenCount(
+    promptTokens,
+    completionTokens,
+  );
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: Math.max(validated?.total_tokens ?? 0, minimumTotal),
+    ...(validated?.provider_raw !== undefined
+      ? { provider_raw: validated.provider_raw }
+      : {}),
+  };
+}
+
+function settleGenerationRoundUsage(
+  current: GenerationResponse["usage"],
+  round: GenerationResponse["usage"],
+  checked: boolean,
+): GenerationResponse["usage"] {
+  if (round === undefined) return current;
+  // The unchecked staging path records the provider's latest usage trailer as
+  // the generation usage. Agent-owned rounds use checked accumulation below
+  // so each provider round can be reconciled independently.
+  return checked ? addCheckedGenerationUsage(current, round) : { ...round };
+}
+
+function addAgentUsageToGenerationUsage(
+  current: GenerationResponse["usage"],
+  usage: AgentUsage | undefined,
+): GenerationResponse["usage"] {
+  if (!usage) return current;
+  if (
+    usage.inputTokens === 0 &&
+    usage.outputTokens === 0 &&
+    usage.totalTokens === 0
+  ) {
+    return current;
+  }
+  return addCheckedGenerationUsage(current, {
+    prompt_tokens: usage.inputTokens,
+    completion_tokens: usage.outputTokens,
+    total_tokens: usage.totalTokens,
+  });
+}
+function isMainProcessAssemblyRetryError(error: unknown): boolean {
+  return (
+    isSafeResponseAssemblyFallbackError(error)
+    || error instanceof AgentAssemblyRequiresMainProcessError
+    || (error !== null &&
+      typeof error === "object" &&
+      "name" in error &&
+      error.name === "AgentAssemblyRequiresMainProcessError")
+    || (error instanceof Error && error.message === "Chat not found")
+  );
+}
+
 
 function resolveDryRunMessageReasoning(
   message: LlmMessage,
@@ -398,14 +844,38 @@ function buildDryRunDisplayMessages(
 }
 
 export const __test__ = {
+  addAgentUsageToGenerationUsage,
+  addCheckedGenerationUsage,
+  reconcileObservedGenerationUsage,
+  settleGenerationRoundUsage,
   buildDryRunDisplayMessages,
   extractReasoningDetailsText,
   extractThinkingBlockText,
   injectConnectionMetadataFlags,
+  resolveEffectiveAgentPreset,
+  cloneEffectiveAgentPresetResolution,
+  assertRoomAgentIntrinsicsBeforeCouncil,
+  prepareAgentProviderRequest,
+  observeAgentProviderOutput,
+  terminalAgentError,
+  terminalReasonForError,
+  isMainProcessAssemblyRetryError,
+  isAgentSummaryPersistenceTarget,
   omitChatHistoryBreakdownEntries,
   omitChatHistoryTokenBreakdown,
+  recognizedAgentToolNames: RECOGNIZED_AGENT_TOOL_NAMES,
+  resolveInlineToolContinuationPolicy,
+  completeInlineToolResults,
+  validateInlineToolCallIds,
+  mergeProviderTransientCarrier,
   resolveDryRunMessageReasoning,
+  validateAgentSealBoundary,
+  assertAgentFinalContextFit,
+  errorMessage,
   sumChatHistoryBreakdownTokens,
+  toAgenticGenerationInput,
+  encodeExtensionToolName,
+  validateTerminalProviderToolBatch,
 };
 
 export interface RawGenerateInput {
@@ -602,6 +1072,7 @@ interface PromptPipelineResult {
   memoryStats?: import("../llm/types").MemoryStats;
   databankStats?: import("../llm/types").DatabankStats;
   contextClipStats?: import("../llm/types").ContextClipStats;
+  agentRuntimeOwner?: AgentRuntimeOwner;
   deferredWiState?: { chatId: string; partial: Record<string, any> };
   spindleContext: SpindleContext;
   /** True if the {{lumiaCouncilDeliberation}} macro was resolved during assembly. */
@@ -689,6 +1160,25 @@ function wrapDelimitedReasoningForUser(
   return wrapDelimitedReasoningStream(stream, delimiters, enabled);
 }
 
+/** Validates protected results at a named pipeline boundary. */
+function validateAgentSealBoundary(
+  stage: AgentSealStage,
+  seals: Pick<AgentSealRegistry, "validateAfterTransforms">,
+  messages: readonly LlmMessage[],
+): void {
+  withAgentSealStage(stage, () => seals.validateAfterTransforms(messages));
+}
+
+function assertAgentFinalContextFit(stats: ContextClipStats): void {
+  if (
+    stats.budgetInvalid ||
+    stats.fixedOverBudget ||
+    stats.anchorOverflow
+  ) {
+    throw new AgentSealError("context_limit_exceeded", "final_context_fit");
+  }
+}
+
 /**
  * Safely extract a human-readable message from a thrown value.
  * Bun's fetch/stream internals on Windows can reject with `null` when an
@@ -697,6 +1187,13 @@ function wrapDelimitedReasoningForUser(
  * objects gracefully.
  */
 function errorMessage(err: unknown): string {
+  if (err instanceof AgentSealError) {
+    console.error("[agents] Agent result integrity failure", {
+      reason: err.reasonCode,
+      stage: err.stage ?? null,
+    });
+    return err.message;
+  }
   const described = describeProviderError(err, "");
   if (described) return clampErrorMessage(described);
   if (err == null) return "Unknown error";
@@ -726,6 +1223,138 @@ function parseInlineToolCallName(
   };
 }
 
+/**
+ * Provider function names cannot contain the qualified registration separator
+ * (`:`). Encode the complete qualified key instead of attempting a reversible
+ * punctuation substitution: valid extension IDs/tool names may themselves
+ * contain `__`.
+ */
+function encodeExtensionToolName(qualifiedName: string): string {
+  return `spindle_ext_${Buffer.from(qualifiedName, "utf8").toString("base64url")}`;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * A provider terminal `tool_calls` marker is an atomic contract: an absent,
+ * empty, duplicate, or structurally malformed batch is a protocol failure,
+ * never a normal text completion.
+ */
+function validateTerminalProviderToolBatch(
+  finishReason: string | undefined,
+  toolCalls: unknown,
+): ToolCallResult[] | undefined {
+  if (finishReason !== "tool_calls") return undefined;
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    throw new ProviderProtocolError(
+      "Provider returned a tool_calls finish reason without a complete batch",
+    );
+  }
+
+  const seenIds = new Set<string>();
+  for (const rawCall of toolCalls) {
+    if (!isPlainRecord(rawCall)) {
+      throw new ProviderProtocolError("Provider returned a malformed tool call");
+    }
+    const name = rawCall.name;
+    const callId = rawCall.call_id;
+    const args = rawCall.args;
+    if (
+      typeof name !== "string" ||
+      name.trim().length === 0 ||
+      typeof callId !== "string" ||
+      callId.trim().length === 0 ||
+      seenIds.has(callId) ||
+      !isPlainRecord(args)
+    ) {
+      throw new ProviderProtocolError("Provider returned a malformed tool call");
+    }
+    seenIds.add(callId);
+    if (
+      rawCall.thought_signature !== undefined &&
+      typeof rawCall.thought_signature !== "string"
+    ) {
+      throw new ProviderProtocolError("Provider returned a malformed tool call");
+    }
+  }
+
+  return toolCalls as unknown as ToolCallResult[];
+}
+
+function unavailableInlineToolResult(
+  toolCall: ToolCallResult,
+): InlineCouncilToolResult {
+  return {
+    callId: toolCall.call_id,
+    qualifiedName: "unavailable",
+    toolName: "unavailable",
+    toolDisplayName: "Unavailable tool",
+    result: JSON.stringify({
+      status: "error",
+      errorCode: "invalid_arguments",
+      message: "Tool call is unavailable",
+    }),
+  };
+}
+function resultLimitExceededResult(
+  toolCall: ToolCallResult,
+): InlineCouncilToolResult {
+  return {
+    callId: toolCall.call_id,
+    qualifiedName: toolCall.name,
+    toolName: toolCall.name,
+    toolDisplayName: toolCall.name,
+    result: JSON.stringify({
+      status: "error",
+      errorCode: "limit_exceeded",
+      message: "Tool result exceeded its bounded result envelope",
+    }),
+  };
+}
+
+function completeInlineToolResults(
+  toolCalls: readonly ToolCallResult[],
+  resultsByIndex: readonly (InlineCouncilToolResult | undefined)[],
+): InlineCouncilToolResult[] {
+  return toolCalls.map(
+    (toolCall, index) =>
+      resultsByIndex[index] ?? unavailableInlineToolResult(toolCall),
+  );
+}
+
+function buildInlineToolValidationDefinitions(
+  userId: string,
+  toolsByName: ReadonlyMap<string, RuntimeCouncilToolDefinition> | undefined,
+  membersByPrefix: ReadonlyMap<string, CouncilMember> | undefined,
+): Map<string, ToolDefinition> | undefined {
+  if (!toolsByName) return undefined;
+  const definitions = new Map<string, ToolDefinition>();
+  for (const [name, tool] of toolsByName) {
+    const parameters = getCouncilToolArgsSchema(userId, tool);
+    if (!parameters) continue;
+    const definition = {
+      name,
+      description: tool.description,
+      parameters,
+      ...(tool.strict === undefined ? {} : { strict: tool.strict }),
+    } satisfies ToolDefinition;
+    definitions.set(name, definition);
+    if (!membersByPrefix) continue;
+    for (const [prefix, member] of membersByPrefix) {
+      if (member.tools.includes(tool.name)) {
+        definitions.set(`${prefix}_${tool.name}`, {
+          ...definition,
+          name: `${prefix}_${tool.name}`,
+        });
+      }
+    }
+  }
+  return definitions;
+}
 async function executeInlineCouncilToolCalls(
   userId: string,
   toolCalls: ToolCallResult[],
@@ -733,42 +1362,69 @@ async function executeInlineCouncilToolCalls(
   toolsByName: Map<string, RuntimeCouncilToolDefinition>,
   membersByPrefix: Map<string, CouncilMember> | undefined,
   contextMessages: LlmMessage[],
+  signal: AbortSignal,
+  safeNameToQualifiedName?: ReadonlyMap<string, string>,
 ): Promise<InlineCouncilToolResult[]> {
   const results: InlineCouncilToolResult[] = [];
 
   for (const toolCall of toolCalls) {
-    // Try Council-prefixed tool name first (memberIdPrefix_toolName)
-    const parsedName = parseInlineToolCallName(toolCall.name);
+    const mappedQualifiedName = safeNameToQualifiedName?.get(toolCall.name);
     let tool: RuntimeCouncilToolDefinition | undefined;
     let member: CouncilMember | undefined;
-    let resolvedQualifiedName: string;
+    let resolvedQualifiedName = mappedQualifiedName ?? "";
+    let isCouncilCall = false;
 
-    if (parsedName) {
-      const { memberIdPrefix, qualifiedName } = parsedName;
-      tool = toolsByName.get(qualifiedName);
-      member = membersByPrefix?.get(memberIdPrefix);
-      resolvedQualifiedName = qualifiedName;
-    }
-
-    // Fall back to direct lookup — extension inline tools use the sanitized
-    // name directly (extensionId__toolName) without a member prefix.
-    if (!tool) {
+    // Mapped provider names are authoritative. Never reverse-map punctuation:
+    // an extension identifier or tool name may legitimately contain "__".
+    if (mappedQualifiedName) {
       tool = toolsByName.get(toolCall.name);
-      resolvedQualifiedName = toolCall.name;
+    } else {
+      // Try Council-prefixed tool name first (memberIdPrefix_toolName).
+      const parsedName = parseInlineToolCallName(toolCall.name);
+      if (parsedName) {
+        const { memberIdPrefix, qualifiedName } = parsedName;
+        tool = toolsByName.get(qualifiedName);
+        if (tool) {
+          isCouncilCall = true;
+          member = membersByPrefix?.get(memberIdPrefix);
+          resolvedQualifiedName = qualifiedName;
+        }
+      }
+
+      // Fall back to direct lookup for Council/host definitions and legacy
+      // extension calls that were not built through the mapped inline path.
+      if (!tool) {
+        tool = toolsByName.get(toolCall.name);
+        resolvedQualifiedName = toolCall.name;
+      }
     }
 
-    if (!tool) continue;
-    // Council tools require a member match; extension inline tools do not
-    if (parsedName && !member && membersByPrefix?.size) continue;
+    if (!tool) {
+      results.push(unavailableInlineToolResult(toolCall));
+      continue;
+    }
+    // Only an actually resolved Council-prefixed definition requires a member
+    // match. A direct extension name can contain underscores and must not be
+    // misclassified by the syntactic prefix parser.
+    if (isCouncilCall && !member) {
+      results.push(unavailableInlineToolResult(toolCall));
+      continue;
+    }
 
     const execution = getCouncilToolExecution(userId, tool);
-    if (execution === "llm") continue;
+    if (execution === "llm") {
+      results.push(unavailableInlineToolResult(toolCall));
+      continue;
+    }
 
     let result = "";
 
     if (execution === "mcp") {
-      const mcpMatch = parseMcpToolName(userId, resolvedQualifiedName!);
-      if (!mcpMatch) continue;
+      const mcpMatch = parseMcpToolName(userId, resolvedQualifiedName);
+      if (!mcpMatch) {
+        results.push(unavailableInlineToolResult(toolCall));
+        continue;
+      }
 
       result = await getMcpClientManager().callTool(
         userId,
@@ -776,15 +1432,18 @@ async function executeInlineCouncilToolCalls(
         mcpMatch.toolName,
         toolCall.args ?? {},
         timeoutMs,
+        signal,
       );
     } else if (execution === "extension") {
-      // Resolve the extension tool registration. For extension inline tools,
-      // the qualified name uses __ instead of : (sanitized for LLM function names).
-      const extQualified = resolvedQualifiedName!.replace(/__/g, ":");
-      const extToolReg = getExtensionToolRegistration(extQualified);
-      if (!extToolReg) continue;
+      // The host map is the only authority for provider-safe extension names.
+      // Never decode "__" back to ":"; both characters are valid user names.
+      const extToolReg = getExtensionToolRegistration(resolvedQualifiedName);
+      if (!extToolReg) {
+        results.push(unavailableInlineToolResult(toolCall));
+        continue;
+      }
 
-      let memberContext: import("lumiverse-spindle-types").CouncilMemberContext | undefined;
+      let memberContext: CouncilMemberContext | undefined;
       if (member) {
         let lumiaItem: ReturnType<typeof packsSvc.getLumiaItem> = null;
         try {
@@ -816,9 +1475,13 @@ async function executeInlineCouncilToolCalls(
         timeoutMs,
         memberContext,
         contextMessages,
+        signal,
       );
     } else if (execution === "host") {
-      if (!member) continue; // Host tools require a council member
+      if (!member) {
+        results.push(unavailableInlineToolResult(toolCall));
+        continue;
+      }
       let lumiaItem: ReturnType<typeof packsSvc.getLumiaItem> = null;
       try {
         lumiaItem = packsSvc.getLumiaItem(userId, member.itemId);
@@ -826,15 +1489,19 @@ async function executeInlineCouncilToolCalls(
         // Pack/item may have been removed mid-generation.
       }
 
-      result = await executeHostCouncilTool({
-        userId,
-        tool,
-        args: toolCall.args ?? {},
-        member,
-        memberContext: buildCouncilMemberContext(member, lumiaItem),
-        contextMessages,
-        timeoutMs,
-      });
+      result = await raceWithSignal(
+        executeHostCouncilTool({
+          userId,
+          tool,
+          args: toolCall.args ?? {},
+          member,
+          memberContext: buildCouncilMemberContext(member, lumiaItem),
+          contextMessages,
+          timeoutMs,
+          signal,
+        }),
+        signal,
+      );
     }
 
     results.push({
@@ -882,6 +1549,22 @@ function raceWithSignal<T>(
     );
   });
 }
+/**
+ * Iterator teardown is advisory after cancellation. Some provider generators
+ * serialize `return()` behind a pending `next()`, so awaiting it here can hold
+ * the terminal projection forever even though the ledger has already closed.
+ */
+function closeProviderIterator(
+  iterator: AsyncIterator<StreamChunk, void> | undefined,
+): void {
+  try {
+    const cleanup = iterator?.return?.(undefined);
+    if (cleanup) void Promise.resolve(cleanup).catch(() => {});
+  } catch {
+    /* best-effort */
+  }
+}
+
 
 // ── Pre-token transient retry ────────────────────────────────────────────────
 // A momentary provider 429/5xx/529 otherwise fails the whole generation. We
@@ -930,7 +1613,482 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
       reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
     };
     signal.addEventListener("abort", onAbort, { once: true });
+
   });
+}
+function terminalErrorCategory(code: AgentPublicErrorCode): AgentPublicErrorCategory {
+  if (
+    code === "capacity_exceeded" ||
+    code.startsWith("host_")
+  ) return "capacity";
+  if (
+    code.endsWith("_limit_exceeded") ||
+    code === "activity_event_limit_exceeded" ||
+    code === "activity_byte_limit_exceeded"
+  ) return "budget";
+  if (code === "context_limit_exceeded") return "context";
+  if (code === "timeout" || code === "root_wall_clock_limit_exceeded") return "timeout";
+  if (code === "cancelled") return "cancelled";
+  if (code.startsWith("provider_")) return "provider";
+  if (
+    code === "invalid_task" ||
+    code === "invalid_profile" ||
+    code === "invalid_arguments" ||
+    code === "batch_rejected" ||
+    code === "unknown_tool" ||
+    code === "unauthorized"
+  ) return "validation";
+  if (code === "integrity_error") return "integrity";
+  return "internal";
+}
+
+function publicTerminalCodeForError(
+  error: unknown,
+): AgentPublicErrorCode | undefined {
+  if (error instanceof AgentAccountingFailure) return error.code;
+  if (error instanceof AgentLedgerFailure) return error.code;
+  if (error instanceof AgentRuntimeFailure) {
+    return asPublicRuntimeCode(error.code);
+  }
+  if (error instanceof AgentSealError) {
+    if (
+      error.reasonCode === "context_limit_exceeded" ||
+      error.reasonCode === "materialized_limit_exceeded"
+    ) {
+      return error.reasonCode;
+    }
+    return "integrity_error";
+  }
+  if (
+    error instanceof ProviderProtocolError ||
+    error instanceof ProviderResponseTooLargeError
+  ) {
+    return "provider_protocol_error";
+  }
+  if (error instanceof ProviderRequestError) return "provider_request_error";
+  return undefined;
+}
+function terminalReasonForError(
+  error: unknown,
+  owner: AgentRuntimeOwner | undefined,
+  agentRuntimeActive = owner !== undefined,
+): AgentTerminalReason {
+  if (!agentRuntimeActive) return "failed";
+  return publicTerminalCodeForError(error) ?? "failed";
+}
+
+function createPublicAgentError(
+  code: AgentPublicErrorCode,
+  failure?: AgentLedgerFailure,
+): AgentPublicErrorV1 {
+  return {
+    version: 1,
+    code,
+    category: terminalErrorCategory(code),
+    ...(failure
+      ? {
+          budget: {
+            id: failure.context.id,
+            limit: failure.context.limit,
+            observed: failure.context.observed,
+          },
+        }
+      : {}),
+    retryable: code === "provider_unavailable" || code === "provider_request_error",
+  };
+}
+
+function terminalAgentError(
+  owner: AgentRuntimeOwner | undefined,
+  reason: AgentTerminalReason,
+  agentRuntimeActive = owner !== undefined,
+  unattachedFailure?: AgentLedgerFailure,
+  unattachedError?: AgentPublicErrorV1,
+): AgentPublicErrorV1 | undefined {
+  if (!agentRuntimeActive) return undefined;
+  const failure = owner?.ledger.failure ?? unattachedFailure;
+  if (!failure && unattachedError) return unattachedError;
+  const failureCode = failure?.code;
+  const code: AgentPublicErrorCode | undefined =
+    failureCode ??
+    (reason === "stopped" ? "cancelled" :
+      reason === "cancelled" ? "cancelled" :
+        reason === "completed" || reason === "completed_at_tool_budget"
+          ? undefined
+          : reason === "failed" ? "internal_error" : reason);
+  return code ? createPublicAgentError(code, failure) : undefined;
+}
+
+/**
+ * Only errors with a closed public code are promoted into AgentError. Unknown
+ * owner-construction failures still surface through the ordinary generation
+ * error path instead of being silently classified here.
+ */
+function publicAgentErrorForFailure(error: unknown): AgentPublicErrorV1 | undefined {
+  const code = publicTerminalCodeForError(error);
+  return code
+    ? createPublicAgentError(
+        code,
+        error instanceof AgentLedgerFailure ? error : undefined,
+      )
+    : undefined;
+}
+
+/**
+ * One terminal coordinator per generation. Feature-active generations attach
+ * their AgentTurnLedger; feature-inactive generations retain the same CAS
+ */
+class GenerationTerminalCoordinator {
+  readonly generationId: string;
+  readonly controller: AbortController;
+  readonly #userId: string;
+  readonly #chatId: string;
+  #owner: AgentRuntimeOwner | undefined;
+  #agentRuntimeActive = false;
+  #unattachedAgentError: AgentPublicErrorV1 | undefined;
+  #unattachedAgentFailure: AgentLedgerFailure | undefined;
+  #reason: AgentTerminalReason | null = null;
+  #eventEmitted = false;
+  #pendingProjection: pool.PoolTerminalProjection | undefined;
+  #runLoopProjectionReady = true;
+  #activityPersisted = false;
+  #persistedActivitySnapshot: AgentActivitySnapshotV1 | undefined;
+
+  constructor(
+    generationId: string,
+    controller: AbortController,
+    userId: string,
+    chatId: string,
+  ) {
+    this.generationId = generationId;
+    this.controller = controller;
+    this.#userId = userId;
+    this.#chatId = chatId;
+  }
+
+  get reason(): AgentTerminalReason | null {
+    return this.#reason;
+  }
+
+  get agentRuntimeActive(): boolean {
+    return this.#agentRuntimeActive;
+  }
+
+  markAgentRuntimeActive(): void {
+    this.#agentRuntimeActive = true;
+  }
+
+  recordAgentRuntimeFailure(error: unknown): void {
+    if (!this.#agentRuntimeActive || this.#owner) return;
+    if (error instanceof AgentLedgerFailure) {
+      this.#unattachedAgentFailure ??= error;
+      return;
+    }
+    const normalized = publicAgentErrorForFailure(error);
+    if (normalized) this.#unattachedAgentError ??= normalized;
+  }
+
+  attachRuntimeOwner(owner: AgentRuntimeOwner): void {
+    this.markAgentRuntimeActive();
+    this.#owner = owner;
+    if (this.#reason !== null) {
+      if (owner.ledger.terminal === null) {
+        owner.ledger.tryTerminate(this.#reason);
+      }
+      if (!this.controller.signal.aborted) {
+        this.controller.abort(new DOMException(this.#reason, "AbortError"));
+      }
+      return;
+    }
+    const ledgerReason = owner.ledger.terminal;
+    if (ledgerReason !== null) {
+      this.#reason = ledgerReason;
+      if (!this.controller.signal.aborted) {
+        this.controller.abort(new DOMException(ledgerReason, "AbortError"));
+      }
+    }
+  }
+
+  tryTerminate(reason: AgentTerminalReason): boolean {
+    if (this.#reason !== null) return false;
+
+    if (!this.#owner) {
+      this.#reason = reason;
+      if (!this.controller.signal.aborted) {
+        this.controller.abort(new DOMException(reason, "AbortError"));
+      }
+      return true;
+    }
+
+    const ledgerReason = this.#owner.ledger.terminal;
+    if (ledgerReason !== null) {
+      this.#reason = ledgerReason;
+      if (!this.controller.signal.aborted) {
+        this.controller.abort(new DOMException(ledgerReason, "AbortError"));
+      }
+      return true;
+    }
+    if (!this.#owner.ledger.tryTerminate(reason)) {
+      const racedReason = this.#owner.ledger.terminal;
+      if (racedReason === null) return false;
+      this.#reason = racedReason;
+      if (!this.controller.signal.aborted) {
+        this.controller.abort(new DOMException(racedReason, "AbortError"));
+      }
+      return true;
+    }
+
+    this.#reason = this.#owner.ledger.terminal ?? reason;
+    if (!this.controller.signal.aborted) {
+      this.controller.abort(new DOMException(this.#reason, "AbortError"));
+    }
+    return true;
+  }
+
+  markRunLoopStarted(): void {
+    this.#runLoopProjectionReady = false;
+  }
+
+  markRunLoopReconciled(): void {
+    this.#runLoopProjectionReady = true;
+    this.#emitPendingProjection();
+  }
+
+  #persistActivity(
+    status: AgentActivityLifecycle,
+    agentError?: AgentPublicErrorV1,
+  ): AgentActivitySnapshotV1 | undefined {
+    if (!this.#agentRuntimeActive) return undefined;
+    if (this.#activityPersisted && this.#persistedActivitySnapshot) {
+      return this.#persistedActivitySnapshot;
+    }
+    const entry = pool.getPoolEntry(this.generationId);
+    const snapshot: AgentActivitySnapshotV1 = this.#owner
+      ? this.#owner.ledger.activitySnapshot(status, agentError?.code)
+      : {
+          version: 1,
+          rootId: this.generationId,
+          nodes: [],
+          omittedNodeCount: 0,
+          errorCounts: agentError ? { [agentError.code]: 1 } : {},
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            toolCalls: 0,
+            childInvocations: 0,
+          },
+          status,
+          ...(agentError ? { terminalErrorCode: agentError.code } : {}),
+        };
+    this.#persistedActivitySnapshot = snapshot;
+    this.#activityPersisted = true;
+    persistTerminalAgentActivityRun({
+      userId: entry?.userId ?? this.#userId,
+      chatId: entry?.chatId ?? this.#chatId,
+      generationId: this.generationId,
+      targetMessageId: entry?.targetMessageId ?? null,
+      targetSwipeId: entry?.targetSwipeId ?? null,
+      snapshot,
+      status,
+    });
+    return snapshot;
+  }
+
+  claimWithoutPool(
+    reason: AgentTerminalReason,
+    status: AgentActivityLifecycle = "failed",
+  ): boolean {
+    if (!this.tryTerminate(reason)) return false;
+    this.#persistActivity(
+      status,
+      terminalAgentError(
+        this.#owner,
+        this.#reason ?? reason,
+        this.#agentRuntimeActive,
+        this.#unattachedAgentFailure,
+        this.#unattachedAgentError,
+      ),
+    );
+    return true;
+  }
+
+  #normalizePoolProjection(
+    projection: pool.PoolTerminalProjection,
+  ): pool.PoolTerminalProjection {
+    const winningReason = this.#reason ?? "failed";
+    const isStopped =
+      winningReason === "stopped" || winningReason === "cancelled";
+    const isCompleted =
+      winningReason === "completed" ||
+      winningReason === "completed_at_tool_budget";
+    if (isStopped) return { status: "stopped" };
+    if (isCompleted) {
+      return {
+        status: "completed",
+        ...(projection.messageId !== undefined
+          ? { messageId: projection.messageId }
+          : {}),
+      };
+    }
+    return {
+      status: "error",
+      error: projection.error ?? winningReason,
+      ...(projection.messageId !== undefined
+        ? { messageId: projection.messageId }
+        : {}),
+    };
+  }
+
+  #queuePoolProjection(projection: pool.PoolTerminalProjection): void {
+    const normalized = this.#normalizePoolProjection(projection);
+    const previous = this.#pendingProjection;
+    this.#pendingProjection = previous
+      ? {
+          ...previous,
+          ...(normalized.messageId !== undefined
+            ? { messageId: normalized.messageId }
+            : {}),
+          ...(previous.error === undefined && normalized.error !== undefined
+            ? { error: normalized.error }
+            : {}),
+        }
+      : normalized;
+  }
+
+  #emitPendingProjection(
+    allowBeforeRunLoopReconciliation = false,
+  ): void {
+    if (
+      (!this.#runLoopProjectionReady &&
+        !allowBeforeRunLoopReconciliation) ||
+      !this.#pendingProjection ||
+      this.#eventEmitted
+    ) {
+      return;
+    }
+    const projection = this.#pendingProjection;
+    this.#pendingProjection = undefined;
+    const projected = pool.projectPoolTerminal(
+      this.generationId,
+      projection,
+    );
+    if (projected || this.hasTerminalPoolProjection()) {
+      this.emitPoolProjection(projection);
+    }
+  }
+
+  poolOwner(): pool.PoolTerminalOwner {
+    return {
+      tryTerminate: (reason) =>
+        this.tryTerminate(
+          reason === "completed"
+            ? "completed"
+            : reason === "stopped"
+              ? "stopped"
+              : reason === "timeout"
+                ? "timeout"
+                : "failed",
+        ),
+      projectTerminal: (projection) => {
+        this.#queuePoolProjection(projection);
+        this.#emitPendingProjection(!this.#agentRuntimeActive);
+        return true;
+      },
+    };
+  }
+
+  claimAndProject(
+    reason: AgentTerminalReason,
+    projection: pool.PoolTerminalProjection,
+  ): boolean {
+    const claimed = this.tryTerminate(reason);
+    if (!claimed && this.#reason === null) return false;
+    this.#queuePoolProjection(projection);
+    this.#emitPendingProjection();
+    return true;
+  }
+
+  hasTerminalPoolProjection(): boolean {
+    const entry = pool.getPoolEntry(this.generationId);
+    return (
+      !entry ||
+      entry.status === "completed" ||
+      entry.status === "stopped" ||
+      entry.status === "error"
+    );
+  }
+
+  ensurePoolProjection(): boolean {
+    if (this.hasTerminalPoolProjection()) return true;
+    const winningReason = this.#reason ?? "failed";
+    this.claimAndProject(winningReason, {
+      status: "error",
+      error: winningReason,
+    });
+    return this.hasTerminalPoolProjection();
+  }
+  emitPoolProjection(projection: pool.PoolTerminalProjection): void {
+    if (this.#eventEmitted) return;
+    this.#eventEmitted = true;
+    const winningReason = this.#reason ?? "failed";
+    const terminalStatus: AgentActivityLifecycle =
+      projection.status === "stopped"
+        ? "cancelled"
+        : winningReason === "timeout" ||
+            winningReason === "root_wall_clock_limit_exceeded"
+          ? "timed_out"
+          : projection.status === "completed"
+            ? "completed"
+            : "failed";
+    const agentError = terminalAgentError(
+      this.#owner,
+      winningReason,
+      this.#agentRuntimeActive,
+      this.#unattachedAgentFailure,
+      this.#unattachedAgentError,
+    );
+    const agentActivity = this.#persistActivity(terminalStatus, agentError);
+    const entry = pool.getPoolEntry(this.generationId);
+    const content = entry?.content ?? "";
+    const chatId = entry?.chatId ?? this.#chatId;
+    const userId = entry?.userId ?? this.#userId;
+    const target = {
+      ...(entry?.targetMessageId ? { targetMessageId: entry.targetMessageId } : {}),
+      ...(entry?.targetSwipeId !== undefined
+        ? { targetSwipeId: entry.targetSwipeId }
+        : {}),
+    };
+    if (projection.status === "stopped") {
+      eventBus.emit(
+        EventType.GENERATION_STOPPED,
+        {
+          generationId: this.generationId,
+          chatId,
+          content,
+          ...target,
+          ...(agentActivity ? { agentActivity } : {}),
+          ...(agentError ? { agentError } : {}),
+        },
+        userId,
+      );
+      return;
+    }
+    eventBus.emit(
+      EventType.GENERATION_ENDED,
+      {
+        generationId: this.generationId,
+        chatId,
+        ...(projection.messageId ? { messageId: projection.messageId } : {}),
+        content,
+        ...target,
+        ...(projection.error ? { error: projection.error } : {}),
+        ...(agentActivity ? { agentActivity } : {}),
+        ...(agentError ? { agentError } : {}),
+      },
+      userId,
+    );
+  }
 }
 
 // Track active generations for stop support
@@ -938,11 +2096,14 @@ const activeGenerations = new Map<
   string,
   {
     controller: AbortController;
+    terminal: GenerationTerminalCoordinator;
     userId: string;
     chatId: string;
     startedAt: number;
     /** Timestamp of the most recently received content or reasoning token. */
     lastTokenAt: number;
+    /** Timestamp of the most recent provider/tool/activity progress. */
+    lastActivityAt: number;
     /** Resolves when the generation's streaming continuation finishes
      *  (success, error, or abort). Used by the per-chat lock to wait for
      *  teardown before starting a replacement generation — this prevents
@@ -953,12 +2114,86 @@ const activeGenerations = new Map<
      *  during the setup phase before the streaming IIFE starts. */
     completion: Promise<void>;
   }
+
 >();
+
+function claimGenerationTerminal(
+  generationId: string,
+  reason: AgentTerminalReason,
+  projection: pool.PoolTerminalProjection,
+): boolean {
+  const entry = activeGenerations.get(generationId);
+  return entry?.terminal.claimAndProject(reason, projection) ?? false;
+}
 
 // Per-chat generation lock: prevents concurrent generations (including council) in the same chat.
 // Keyed by `${userId}:${chatId}` → generationId. Registered BEFORE council execution so that
 // a second request for the same chat will abort the in-flight one (including its council tools).
 const activeChatGenerations = new Map<string, string>();
+type ChatModeReservation = {
+  readonly mode: "response" | "agentic";
+  readonly ownerId: string;
+  readonly done?: Promise<void>;
+};
+// Admission is shared by Response and Agentic. A reservation is installed
+// synchronously before either mode awaits preflight, so a concurrent request
+// cannot enter the other mode between its checks and durable registration.
+const chatModeReservations = new Map<string, ChatModeReservation>();
+
+function chatModeKey(userId: string, chatId: string): string {
+  return `${userId}:${chatId}`;
+}
+
+function releaseChatModeReservation(
+  userId: string,
+  chatId: string,
+  ownerId: string,
+): void {
+  const key = chatModeKey(userId, chatId);
+  if (chatModeReservations.get(key)?.ownerId === ownerId) {
+    chatModeReservations.delete(key);
+  }
+}
+
+async function reserveChatMode(
+  userId: string,
+  chatId: string,
+  mode: "response" | "agentic",
+  ownerId: string,
+  done?: Promise<void>,
+): Promise<void> {
+  const key = chatModeKey(userId, chatId);
+  const previous = chatModeReservations.get(key);
+  chatModeReservations.set(key, { mode, ownerId, ...(done ? { done } : {}) });
+  if (!previous || previous.ownerId === ownerId) return;
+  if (previous.done) {
+    await previous.done;
+    return;
+  }
+
+  if (previous.mode === "agentic") {
+    const generationId = getActiveAgenticGenerationForChat(userId, chatId);
+    if (generationId) {
+      await requestAgenticChatCancellation(userId, chatId);
+      await waitForAgenticGeneration(generationId);
+    }
+    return;
+  }
+
+  const entry = activeGenerations.get(previous.ownerId);
+  if (entry) {
+    entry.terminal.claimAndProject("stopped", { status: "stopped" });
+    await entry.completion;
+  }
+}
+
+function ownsChatModeReservation(
+  userId: string,
+  chatId: string,
+  ownerId: string,
+): boolean {
+  return chatModeReservations.get(chatModeKey(userId, chatId))?.ownerId === ownerId;
+}
 
 // Pending council retry decisions: when council tools partially fail, the generation
 // pauses and waits for the user to decide whether to continue or retry. Keyed by
@@ -972,8 +2207,16 @@ const pendingCouncilRetries = new Map<
     userId: string;
     resolve: (decision: "continue" | "retry") => void;
     timeout: ReturnType<typeof setTimeout>;
+    abortCleanup: () => void;
   }
 >();
+
+function clearPendingCouncilRetry(generationId: string): boolean {
+  const pending = pendingCouncilRetries.get(generationId);
+  if (!pending) return false;
+  pending.resolve("continue");
+  return true;
+}
 
 /**
  * Called from the council-retry route to resolve a pending decision. Verifies
@@ -988,14 +2231,6 @@ export function resolveCouncilRetry(
   const pending = pendingCouncilRetries.get(generationId);
   if (!pending) return false;
   if (pending.userId !== userId) return false;
-  clearTimeout(pending.timeout);
-  pendingCouncilRetries.delete(generationId);
-  // Clear the pool flag
-  const poolEntry = pool.getPoolEntry(generationId);
-  if (poolEntry) {
-    poolEntry.councilRetryPending = false;
-    delete poolEntry.councilToolsFailure;
-  }
   pending.resolve(decision);
   return true;
 }
@@ -1241,6 +2476,296 @@ async function resolveProviderAndKey(
     connection,
   };
 }
+type EffectiveAgentPresetResolution = {
+  preset: Preset | null;
+  binding: PresetProfileBinding | null;
+};
+
+type EffectiveAgentPresetResolvers = {
+  resolveProfile: (
+    userId: string,
+    fallbackPresetId: string | null,
+    chatId: string,
+    characterId: string | null,
+    options: {
+      isGroup?: boolean;
+      connectionId?: string | null;
+      personaId?: string | null;
+    },
+  ) => { preset_id: string | null; binding: PresetProfileBinding | null };
+  getPreset: (userId: string, presetId: string) => Preset | null;
+};
+
+function resolveEffectiveAgentPreset(
+  args: {
+    userId: string;
+    chat: { id: string; metadata?: Record<string, any> | null; character_id?: string | null };
+    connection: ConnectionProfile;
+    presetId?: string;
+    forcePresetId?: boolean;
+    targetCharacterId?: string;
+    personaId?: string;
+  },
+  resolvers: EffectiveAgentPresetResolvers = {
+    resolveProfile: presetProfilesSvc.resolveProfile,
+    getPreset: presetsSvc.getPreset,
+  },
+): EffectiveAgentPresetResolution {
+  const noPreset = isNoPresetChatMetadata(args.chat.metadata);
+  const requestedPresetId = noPreset
+    ? null
+    : args.presetId || args.connection.preset_id || null;
+  const resolvedProfile =
+    noPreset
+      ? { preset_id: null, binding: null }
+      : args.forcePresetId && args.presetId
+        ? { preset_id: args.presetId, binding: null }
+        : resolvers.resolveProfile(
+            args.userId,
+            requestedPresetId,
+            args.chat.id,
+            args.targetCharacterId || args.chat.character_id || null,
+            {
+              isGroup: args.chat.metadata?.group === true,
+              connectionId: args.connection.id,
+              personaId: args.personaId ?? null,
+            },
+          );
+  return {
+    preset: resolvedProfile.preset_id
+      ? resolvers.getPreset(args.userId, resolvedProfile.preset_id)
+      : null,
+    binding: resolvedProfile.binding,
+  };
+}
+function cloneEffectiveAgentPresetResolution(
+  resolution: EffectiveAgentPresetResolution,
+): EffectiveAgentPresetResolution {
+  return {
+    preset: resolution.preset ? structuredClone(resolution.preset) : null,
+    binding: resolution.binding ? structuredClone(resolution.binding) : null,
+  };
+}
+function assertRoomAgentIntrinsicsBeforeCouncil(args: {
+  userId: string;
+  chat: {
+    id: string;
+    metadata?: Record<string, any> | null;
+  };
+  preset: Preset | null | undefined;
+  binding: PresetProfileBinding | null;
+  generationType: string;
+  impersonateMode?: string;
+  targetCharacterId?: string;
+}): void {
+  if (typeof args.chat.metadata?.multiplayer_room_id !== "string" || !args.preset) {
+    return;
+  }
+  const rawAgentConfig = args.preset.agent_config;
+  if (rawAgentConfig === undefined) return;
+  const config = presetsSvc.validateAgentConfigForExecution(
+    args.userId,
+    rawAgentConfig,
+  );
+  const blocks: PromptBlock[] = (args.preset.prompt_order ?? []).map(
+    (block: PromptBlock) => ({ ...block }),
+  );
+  if (args.binding && blocks.length > 0) {
+    presetProfilesSvc.applyProfileToBlocks(blocks, args.binding);
+  }
+  presetProfilesSvc.normalizeCategoryBlockStates(blocks);
+  const effectiveBlocks = resolvePromptBlockPlacements(
+    blocks,
+    args.preset,
+    args.binding?.prompt_variables,
+  );
+  reorderBlocksByPosition(effectiveBlocks);
+  const character = args.targetCharacterId
+    ? charactersSvc.getCharacter(args.userId, args.targetCharacterId)
+    : null;
+  const characterTags = Array.isArray(character?.tags) ? character.tags : [];
+  const agentSkipsBlockTraversal =
+    args.generationType === "impersonate" &&
+    args.impersonateMode === "oneliner";
+  const preflightBlocks: AgentIntrinsicBlockInput[] = effectiveBlocks.map(
+    (block) => ({
+      ...block,
+      active:
+        !agentSkipsBlockTraversal &&
+        block.enabled === true &&
+        !(block.marker === "category" && !block.content?.trim()) &&
+        !(
+          block.injectionTrigger &&
+          block.injectionTrigger.length > 0 &&
+          !block.injectionTrigger.includes(args.generationType)
+        ) &&
+        promptBlockMatchesCharacterTags(block.characterTagTrigger, characterTags),
+    }),
+  );
+  const plan = preflightAgentIntrinsics(preflightBlocks, config);
+  if (config.agentsEnabled && plan.executableIntrinsics.length > 0) {
+    throw new AgentMultiplayerUnsupportedError();
+  }
+}
+
+function prepareAgentProviderRequest(
+  resolved: {
+    provider: Pick<LlmProvider, "name">;
+    connection: Pick<ConnectionProfile, "model" | "metadata">;
+  },
+  request: AgentProviderDispatchRequest,
+  parameters: GenerationParameters,
+): GenerationRequest {
+  const cached = applyPromptCaching(
+    {
+      provider: resolved.provider.name,
+      model: resolved.connection.model,
+      metadata: resolved.connection.metadata,
+    },
+    {
+      params: parameters,
+      messages: request.messages,
+      tools: request.tools,
+    },
+  );
+  return {
+    messages: cached.messages,
+    model: resolved.connection.model,
+    parameters: {
+      ...cached.params,
+      max_tokens: request.maxOutputTokens,
+    },
+    stream: false,
+    tools: cached.tools,
+    signal: request.signal,
+    toolMode: request.toolMode,
+    receiveLimitBytes: request.receiveLimitBytes,
+    providerTransientCarrier: request.providerTransientCarrier,
+  };
+}
+type AgentOutputTokenCounterResolver = (
+  modelId: string,
+) => Promise<ResolvedTokenCounter | null>;
+
+async function observeAgentProviderOutput(
+  modelId: string,
+  response: GenerationResponse,
+  signal: AbortSignal,
+  resolveCounter: AgentOutputTokenCounterResolver = tokenizerSvc.resolveStrictCounter,
+): Promise<number> {
+  let resolved: ResolvedTokenCounter | null;
+  try {
+    resolved = await raceWithSignal(resolveCounter(modelId), signal);
+  } catch {
+    // A cancellation may win while strict-tokenizer resolution is still
+    // pending. The response itself is already bounded by the provider receive
+    // limit, so preserve its accounting evidence synchronously instead of
+    // turning tokenizer teardown into a second failure.
+    return observeOutputTokens(response);
+  }
+  if (!resolved) return observeOutputTokens(response);
+  try {
+    return observeOutputTokens(response, { countTokens: resolved.count });
+  } catch (error) {
+    if (error instanceof AgentAccountingFailure) throw error;
+    return observeOutputTokens(response);
+  }
+}
+
+
+async function dispatchAgentProvider(
+  userId: string,
+  request: AgentProviderDispatchRequest,
+): Promise<AgentProviderDispatchResponse> {
+  const connection = request.connection;
+  if (!connection) throw new AgentRuntimeFailure("provider_unavailable");
+  const provider = getProvider(connection.provider);
+  if (!provider) throw new AgentRuntimeFailure("provider_unavailable");
+  let apiKey = "";
+  try {
+    apiKey = await secretsSvc.getSecret(
+      userId,
+      connectionsSvc.connectionSecretKey(connection.concreteId),
+    ) || "";
+  } catch {
+    throw new AgentRuntimeFailure("provider_unavailable");
+  }
+  if (request.tools?.length) {
+    try {
+      assertAgentToolCapability(provider);
+    } catch (error) {
+      if (error instanceof AgentToolCapabilityError) {
+        throw new AgentRuntimeFailure(error.code);
+      }
+      throw error;
+    }
+  }
+  const parameters: GenerationParameters = {
+    max_tokens: request.maxOutputTokens,
+  };
+  const connectionView = { model: connection.model, metadata: {} };
+  applyEffectiveReasoningSettings(
+    userId,
+    connectionView,
+    provider.name,
+    connection.model || undefined,
+    parameters,
+    undefined,
+    true,
+  );
+  const providerRequest = prepareAgentProviderRequest(
+    { provider, connection: connectionView },
+    request,
+    parameters,
+  );
+  try {
+    const response = await provider.generate(
+      apiKey,
+      connection.endpoint,
+      providerRequest,
+    );
+    let observedOutputTokens: number;
+    let postResponseErrorCode: AgentPublicErrorCode | undefined;
+    if (request.signal.aborted) {
+      observedOutputTokens = observeOutputTokens(response);
+      postResponseErrorCode = "cancelled";
+    } else {
+      try {
+        observedOutputTokens = await observeAgentProviderOutput(
+          connection.model,
+          response,
+          request.signal,
+        );
+      } catch (error) {
+        observedOutputTokens = observeOutputTokens(response);
+        if (error instanceof AgentAccountingFailure) {
+          postResponseErrorCode = error.code;
+        } else if (request.signal.aborted) {
+          postResponseErrorCode = "cancelled";
+        } else {
+          throw error;
+        }
+      }
+      if (request.signal.aborted) postResponseErrorCode = "cancelled";
+    }
+    return {
+      ...response,
+      observedOutputTokens,
+      ...(postResponseErrorCode ? { postResponseErrorCode } : {}),
+      providerTransientCarrier: response.providerTransientCarrier,
+      toolContinuationMode: provider.capabilities.toolContinuationMode,
+      supportsToolFinalization: provider.capabilities.supportsToolFinalization,
+    };
+  } catch (error) {
+    if (request.signal.aborted) throw error;
+    if (error instanceof AgentAccountingFailure) throw error;
+    if (error instanceof ProviderProtocolError || error instanceof ProviderResponseTooLargeError) {
+      throw new AgentRuntimeFailure("provider_protocol_error");
+    }
+    throw new AgentRuntimeFailure("provider_failed");
+  }
+}
+
 
 /**
  * Shared prompt pipeline: build spindle context, assemble prompt, run
@@ -1248,10 +2773,12 @@ async function resolveProviderAndKey(
  */
 async function runPromptPipeline(opts: {
   userId: string;
+  generationId: string;
   chatId: string;
   connectionId?: string;
   presetId?: string;
   forcePresetId?: boolean;
+  effectivePresetSnapshot?: EffectiveAgentPresetResolution;
   personaId?: string;
   personaAddonStates?: Record<string, boolean>;
   generationType: string;
@@ -1267,12 +2794,16 @@ async function runPromptPipeline(opts: {
   targetCharacterId?: string;
   councilToolResults?: any[];
   councilNamedResults?: Record<string, string>;
+  councilDeliberationBlock?: string;
   councilHistoricalDeliberationBlock?: string;
   precomputedVectorEntries?: VectorActivatedEntry[];
   regenFeedback?: string;
   regenFeedbackPosition?: "system" | "user";
   signal?: AbortSignal;
+  activityMessageId?: string;
   isDryRun?: boolean;
+  onAgentRuntimeOwnerCreated?: (owner: AgentRuntimeOwner) => void;
+  onAgentRuntimeRequired?: () => void;
 }): Promise<PromptPipelineResult> {
   // Yield to the event loop before entering the assembly pipeline so a stop
   // clicked in the first few ticks after the generation starts can actually
@@ -1323,6 +2854,7 @@ async function runPromptPipeline(opts: {
   let deferredWiState:
     | { chatId: string; partial: Record<string, any> }
     | undefined;
+  let agentRuntimeOwner: AgentRuntimeOwner | undefined;
   let macroEnv: import("../macros/types").MacroEnv | undefined;
   let trimIncompleteWords = false;
 
@@ -1333,18 +2865,19 @@ async function runPromptPipeline(opts: {
   } else {
     const assemblyCtx = {
       userId: opts.userId,
+      generationId: opts.generationId,
+      dryRun: opts.isDryRun === true,
       chatId: opts.chatId,
       connectionId: opts.connectionId,
       presetId: opts.presetId,
       forcePresetId: opts.forcePresetId,
+      effectivePresetSnapshot: opts.effectivePresetSnapshot,
       personaId: opts.personaId,
       personaAddonStates: opts.personaAddonStates,
       generationType: opts.generationType as GenerationType,
       impersonateMode: opts.impersonateMode,
       impersonateInput: opts.impersonateInput,
       userInput: opts.userInput,
-      excludeMessageId: opts.excludeMessageId,
-      rejectedSwipe: opts.rejectedSwipe,
       continueMessageId: opts.continueMessageId,
       continuePostfix: opts.continuePostfix,
       targetCharacterId: opts.targetCharacterId,
@@ -1352,6 +2885,66 @@ async function runPromptPipeline(opts: {
       councilNamedResults: opts.councilNamedResults,
       councilHistoricalDeliberationBlock: opts.councilHistoricalDeliberationBlock,
       precomputedVectorEntries: opts.precomputedVectorEntries,
+      createAgentRuntimeOwner: (
+        config: import("../types/agents").AgentConfigV2,
+        rootConnection: ResolvedConcreteConnectionV1 | null,
+      ) => {
+        if (agentRuntimeOwner) return agentRuntimeOwner;
+        opts.onAgentRuntimeRequired?.();
+        const presetIdForBindings =
+          opts.effectivePresetSnapshot?.preset?.id ?? opts.presetId ?? null;
+        const normalizedProjection = presetIdForBindings
+          ? getPresetAgentConfig(opts.userId, presetIdForBindings)
+          : null;
+        const frozenSlotConnections = new Map<
+          string,
+          ResolvedConcreteConnectionV1 | null
+        >();
+        for (const profile of config.profiles) {
+          if (profile.connectionRef.kind !== "slot") continue;
+          const slotId = profile.connectionRef.slotId;
+          if (frozenSlotConnections.has(slotId)) continue;
+          const binding = normalizedProjection?.bindings.find(
+            (candidate) => candidate.slotId === slotId,
+          );
+          const connectionId =
+            binding?.state === "ready" ? binding.connectionId : null;
+          frozenSlotConnections.set(
+            slotId,
+            connectionId
+              ? connectionsSvc.resolveConcreteConnectionV1(
+                  opts.userId,
+                  connectionId,
+                )
+              : null,
+          );
+        }
+        agentRuntimeOwner = new AgentRuntimeOwner({
+          generationId: opts.generationId,
+          userId: opts.userId,
+          config,
+          rootConnection,
+          resolveConnectionRef: (ref) =>
+            ref.kind === "inherit_main"
+              ? rootConnection
+              : frozenSlotConnections.get(ref.slotId) ?? null,
+          signal: opts.signal,
+          dispatch: (request) => dispatchAgentProvider(opts.userId, request),
+          onActivity: (activity) =>
+            eventBus.emit(
+              EventType.GENERATION_AGENT_ACTIVITY,
+              {
+                ...activity,
+                ...(opts.activityMessageId
+                  ? { messageId: opts.activityMessageId }
+                  : {}),
+              },
+              opts.userId,
+            ),
+        });
+        opts.onAgentRuntimeOwnerCreated?.(agentRuntimeOwner);
+        return agentRuntimeOwner;
+      },
       regenFeedback: opts.regenFeedback,
       regenFeedbackPosition: opts.regenFeedbackPosition,
       skipPromptRegex: isPromptRegexChatOwned(opts.chatId, isExtensionRunning),
@@ -1363,11 +2956,21 @@ async function runPromptPipeline(opts: {
     if (canUsePromptAssemblyWorker()) {
       try {
         assemblyResult = await assemblePromptInWorker(assemblyCtx);
-      } catch (err: any) {
-        if (opts.signal?.aborted || err?.name === "AbortError") throw err;
+      } catch (err: unknown) {
+        const errorName =
+          err instanceof Error
+            ? err.name
+            : err &&
+                typeof err === "object" &&
+                "name" in err &&
+                typeof err.name === "string"
+              ? err.name
+              : undefined;
+        if (opts.signal?.aborted || errorName === "AbortError") throw err;
+        if (!isMainProcessAssemblyRetryError(err)) throw err;
         console.warn(
-          "[generate] Prompt assembly worker failed; falling back to in-process assembly:",
-          err?.message || err,
+          "[generate] Prompt assembly worker requested main-process retry:",
+          err instanceof Error ? err.message : String(err),
         );
         const { prefetchAssemblyData } = await import("./prompt-assembly-prefetch");
         const prefetched = await prefetchAssemblyData(assemblyCtx);
@@ -1428,25 +3031,47 @@ async function runPromptPipeline(opts: {
   // The pipeline uses LlmMessageDTO (string-only content) — at this stage
   // multimodal parts have already been serialised so the cast is safe.
   let interceptorParameters: Record<string, unknown> | undefined;
+  const seals = agentRuntimeOwner?.seals;
+  const postHandlerValidator =
+    seals && seals.size > 0
+      ? (
+          candidateMessages: LlmMessageDTO[],
+        ) =>
+          withAgentSealStage("spindle_interceptors", () =>
+            seals.adoptAfterInterceptorTransforms(
+              candidateMessages as unknown as LlmMessage[],
+            ),
+          )
+      : undefined;
   if (interceptorPipeline.count > 0) {
     const interceptorResult = await interceptorPipeline.run(
-      messages as import("lumiverse-spindle-types").LlmMessageDTO[],
+      messages as LlmMessageDTO[],
       spindleContext,
       opts.userId,
       opts.signal,
+      postHandlerValidator,
     );
     messages = interceptorResult.messages as unknown as LlmMessage[];
     interceptorParameters = interceptorResult.parameters;
     interceptorBreakdown = interceptorResult.breakdown;
   }
+  if (seals?.size) {
+    validateAgentSealBoundary("spindle_interceptors", seals, messages);
+  }
+
 
   // Apply promptPostProcessing
   const postProcessing = settingsSvc.getSetting(
+
     opts.userId,
     "promptPostProcessing",
   );
   if (postProcessing?.value) {
     applyPostProcessing(messages, postProcessing.value);
+  }
+  if (agentRuntimeOwner?.seals.size) {
+    const seals = agentRuntimeOwner.seals;
+    validateAgentSealBoundary("prompt_post_processing", seals, messages);
   }
 
   // Normal assembly applies prompt-target regexes before context clipping.
@@ -1603,6 +3228,10 @@ async function runPromptPipeline(opts: {
         }
       }
     }
+    if (agentRuntimeOwner?.seals.size) {
+      const seals = agentRuntimeOwner.seals;
+      validateAgentSealBoundary("fallback_prompt_regex", seals, messages);
+    }
   }
 
   // Filter out any messages that became entirely empty after interceptors/regex scripts.
@@ -1644,6 +3273,82 @@ async function runPromptPipeline(opts: {
     !!opts.inputMessages,
   );
 
+  // Presets that do not use {{lumiaCouncilDeliberation}} still receive the
+  // Council output before agent seal restoration and the final context fit.
+  // Keep this host-authored insertion opaque to later macro/regex passes.
+  if (opts.councilDeliberationBlock && !deliberationHandledByMacro) {
+    const insertIdx = Math.max(0, messages.length - 4);
+    const deliberationContent = [
+      opts.councilHistoricalDeliberationBlock,
+      opts.councilDeliberationBlock,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const deliberationMessage: LlmMessage = {
+      role: "system",
+      content: deliberationContent,
+    };
+    if (agentRuntimeOwner?.seals.size) {
+      const seals = agentRuntimeOwner.seals;
+      withAgentSealStage("council_insertion", () =>
+        seals.insertTrustedSystemMessage(
+          messages,
+          insertIdx,
+          deliberationMessage,
+        ),
+      );
+    } else {
+      messages.splice(insertIdx, 0, deliberationMessage);
+    }
+  }
+
+  if (agentRuntimeOwner?.seals.size) {
+    const seals = agentRuntimeOwner.seals;
+    // Spindle, post-processing, fallback regex, and empty-message filtering
+    // are all untrusted prompt transforms. Validate slot identity/order one
+    // last time before restoring any child output.
+    validateAgentSealBoundary("final_prompt_transforms", seals, messages);
+  }
+
+  if (
+    agentRuntimeOwner &&
+    (agentRuntimeOwner.seals.size > 0 ||
+      agentRuntimeOwner.getMainToolDefinitions().length > 0)
+  ) {
+    const seals = agentRuntimeOwner.seals;
+    withAgentSealStage("result_materialization", () =>
+      seals.restore(messages),
+    );
+    let guidanceIndex = 0;
+    while (
+      guidanceIndex < messages.length &&
+      messages[guidanceIndex].role === "system"
+    ) {
+      guidanceIndex++;
+    }
+    messages.splice(guidanceIndex, 0, {
+      role: "system",
+      content: agentRuntimeOwner.seals.guidanceContent,
+    });
+    const finalClipStats = await clipToContextBudget(
+      messages,
+      effectiveConnection.model ?? null,
+      parameters.max_context_length as number | null | undefined,
+      parameters.max_tokens as number | null | undefined,
+      opts.signal,
+    );
+    assertAgentFinalContextFit(finalClipStats);
+    contextClipStats = finalClipStats;
+    if (breakdown) {
+      const chatHistoryEntry = breakdown.find(
+        (entry) => entry.type === "chat_history",
+      );
+      if (chatHistoryEntry) delete chatHistoryEntry.preCountedTokens;
+    }
+    const finalHistory = messages.filter(isChatHistoryMessage);
+    chatHistoryMessages =
+      finalHistory.length > 0 ? finalHistory : undefined;
+  }
   return {
     messages,
     parameters,
@@ -1657,6 +3362,7 @@ async function runPromptPipeline(opts: {
     databankStats,
     contextClipStats,
     deferredWiState,
+    agentRuntimeOwner,
     spindleContext,
     deliberationHandledByMacro,
     macroEnv,
@@ -1691,14 +3397,13 @@ async function resolveRawProviderAndKey(
       `No API key provided. Pass api_key or connection_id in the request.`,
     );
   }
-
   return { provider, apiKey: "", apiUrl: input.api_url || "", connection: null };
 }
-
-export async function startGeneration(
+async function startResponseGeneration(
   input: GenerateInput,
 ): Promise<{ generationId: string; status: string }> {
   const generationId = crypto.randomUUID();
+
   let genType = input.generation_type || "normal";
 
   // Safety fallback: regenerate/continue should only target an assistant
@@ -1717,7 +3422,6 @@ export async function startGeneration(
       genType = "normal";
     }
   }
-
   // --- Per-chat generation lock ---
   // Stop any existing generation for this chat (including in-flight council tools)
   // before proceeding. This prevents council re-firing and generation interruption.
@@ -1731,8 +3435,9 @@ export async function startGeneration(
         existingGenId,
         input.chat_id,
       );
-      existing.controller.abort();
-      // Wait for the previous generation's streaming teardown to complete
+      existing.terminal.claimAndProject("stopped", {
+        status: "stopped",
+      });
       // before starting the new one. This serializes the HTTP abort+connect
       // sequence, preventing two fetch operations from overlapping on Bun's
       // HTTPThread which has a known race on concurrent cancel+start. Bounded
@@ -1751,11 +3456,18 @@ export async function startGeneration(
   // generation can always await teardown — even if it arrives during the setup
   // phase before the streaming IIFE has started.
   const abortController = new AbortController();
+  const terminal = new GenerationTerminalCoordinator(
+    generationId,
+    abortController,
+    input.userId,
+    input.chat_id,
+  );
   let resolveCompletion!: () => void;
   const completion = new Promise<void>((r) => { resolveCompletion = r; });
   const generationStartedAt = Date.now();
   activeGenerations.set(generationId, {
     controller: abortController,
+    terminal,
     userId: input.userId,
     chatId: input.chat_id,
     startedAt: generationStartedAt,
@@ -1763,6 +3475,7 @@ export async function startGeneration(
     // last observed progress. This still protects requests that never begin
     // streaming while allowing long-running streams to continue indefinitely.
     lastTokenAt: generationStartedAt,
+    lastActivityAt: generationStartedAt,
     completion,
   });
   activeChatGenerations.set(chatKey, generationId);
@@ -2072,6 +3785,8 @@ export async function startGeneration(
       targetMessageId: lifecycle.targetMessageId,
       targetSwipeId,
     });
+    terminal.markRunLoopStarted();
+    pool.registerPoolTerminalOwner(generationId, terminal.poolOwner());
 
     // Emit GENERATION_STARTED immediately so the frontend can show a chat head
     // and streaming indicator BEFORE prompt assembly (which may involve slow
@@ -2113,7 +3828,32 @@ export async function startGeneration(
       // and delaying the response (and every other request) until that first
       // internal `await` yields.
       await new Promise<void>((r) => setTimeout(r, 0));
+      let generationAgentRuntimeOwner: AgentRuntimeOwner | undefined;
+      let effectivePresetSnapshot: EffectiveAgentPresetResolution | undefined;
       try {
+        if (chat) {
+          const effectiveResolution = resolveEffectiveAgentPreset({
+            userId: input.userId,
+            chat,
+            connection,
+            presetId: input.preset_id,
+            forcePresetId: input.force_preset_id,
+            targetCharacterId: targetCharId,
+            personaId: resolvedPersona?.id,
+          });
+          effectivePresetSnapshot = cloneEffectiveAgentPresetResolution(
+            effectiveResolution,
+          );
+          assertRoomAgentIntrinsicsBeforeCouncil({
+            userId: input.userId,
+            chat,
+            preset: effectivePresetSnapshot.preset,
+            binding: effectivePresetSnapshot.binding,
+            generationType: genType,
+            impersonateMode: input.impersonate_mode,
+            targetCharacterId: targetCharId,
+          });
+        }
         // Execute council if enabled (before prompt assembly so it doesn't slow the critical path visibly)
         const resolvedCouncilProfile = councilProfilesSvc.resolveProfile(
           input.userId,
@@ -2131,6 +3871,7 @@ export async function startGeneration(
         let inlineToolDefsByName:
           | Map<string, RuntimeCouncilToolDefinition>
           | undefined;
+        let inlineToolSafeNames: Map<string, string> | undefined;
         let inlineMembersByPrefix: Map<string, CouncilMember> | undefined;
         let precomputedVectorEntries: VectorActivatedEntry[] | undefined;
 
@@ -2419,6 +4160,7 @@ export async function startGeneration(
                   // Mark pool entry so the active endpoint surfaces the pending state to chat heads
                   const poolEntry = pool.getPoolEntry(generationId);
                   if (poolEntry) {
+                    pool.setPoolStatus(generationId, "waiting");
                     poolEntry.councilRetryPending = true;
                     poolEntry.councilToolsFailure = {
                       generationId,
@@ -2441,23 +4183,53 @@ export async function startGeneration(
                   // safety cap prevents permanent resource hangs if the user never responds.
                   const decision = await new Promise<"continue" | "retry">(
                     (resolve) => {
+                      let pending!: {
+                        userId: string;
+                        resolve: (decision: "continue" | "retry") => void;
+                        timeout: ReturnType<typeof setTimeout>;
+                        abortCleanup: () => void;
+                      };
+                      const finish = (value: "continue" | "retry"): void => {
+                        if (pendingCouncilRetries.get(generationId) !== pending) {
+                          return;
+                        }
+                        clearTimeout(pending.timeout);
+                        pendingCouncilRetries.delete(generationId);
+                        pending.abortCleanup();
+                        if (poolEntry) {
+                          poolEntry.councilRetryPending = false;
+                          delete poolEntry.councilToolsFailure;
+                          if (poolEntry.status === "waiting") {
+                            pool.setPoolStatus(generationId, "council");
+                          }
+                        }
+                        resolve(value);
+                      };
+                      const onAbort = (): void => finish("continue");
                       const timeout = setTimeout(() => {
                         console.debug(
                           "[council] Safety cap reached for %s — auto-continuing",
                           generationId,
                         );
-                        pendingCouncilRetries.delete(generationId);
-                        if (poolEntry) {
-                          poolEntry.councilRetryPending = false;
-                          delete poolEntry.councilToolsFailure;
-                        }
-                        resolve("continue");
+                        finish("continue");
                       }, COUNCIL_RETRY_SAFETY_CAP_MS);
-                      pendingCouncilRetries.set(generationId, {
+                      pending = {
                         userId: input.userId,
-                        resolve,
+                        resolve: finish,
                         timeout,
-                      });
+                        abortCleanup: () =>
+                          abortController.signal.removeEventListener(
+                            "abort",
+                            onAbort,
+                          ),
+                      };
+                      pendingCouncilRetries.set(generationId, pending);
+                      abortController.signal.addEventListener(
+                        "abort",
+                        onAbort,
+                        { once: true },
+                      );
+                      if (abortController.signal.aborted) finish("continue");
                     },
                   );
 
@@ -2555,12 +4327,17 @@ export async function startGeneration(
                 string,
                 RuntimeCouncilToolDefinition
               >();
+            if (!inlineToolSafeNames) inlineToolSafeNames = new Map<string, string>();
 
             for (const extTool of extensionInlineTools) {
               const qualifiedName = toolRegistry.getQualifiedName(extTool);
-              // Sanitize the qualified name for LLM function calling —
-              // some providers reject colons in function names.
-              const safeName = qualifiedName.replace(/:/g, "__");
+              const encodedName = encodeExtensionToolName(qualifiedName);
+              let safeName = encodedName;
+              let collisionIndex = 1;
+              while (inlineToolDefsByName.has(safeName)) {
+                safeName = `${encodedName}_${collisionIndex}`;
+                collisionIndex += 1;
+              }
 
               // Wrap as RuntimeCouncilToolDefinition for the dispatch lookup
               const runtimeDef: RuntimeCouncilToolDefinition = {
@@ -2574,6 +4351,7 @@ export async function startGeneration(
 
               const argsSchema = normalizeToolJsonSchema(extTool.parameters);
               inlineToolDefsByName.set(safeName, runtimeDef);
+              inlineToolSafeNames.set(safeName, qualifiedName);
               inlineTools.push({
                 name: safeName,
                 description: extTool.description,
@@ -2715,10 +4493,12 @@ export async function startGeneration(
         const pipeline = await raceWithSignal(
           runPromptPipeline({
             userId: input.userId,
+            generationId,
             chatId: input.chat_id,
             connectionId: input.connection_id,
             presetId: input.preset_id,
             forcePresetId: input.force_preset_id,
+            effectivePresetSnapshot,
             personaId: input.persona_id,
             personaAddonStates: input.persona_addon_states,
             generationType: genType,
@@ -2738,12 +4518,21 @@ export async function startGeneration(
             targetCharacterId: pipelineTargetCharId,
             councilToolResults,
             councilNamedResults,
+            councilDeliberationBlock: councilResult?.deliberationBlock,
             councilHistoricalDeliberationBlock:
               councilResult?.historicalDeliberationBlock,
             precomputedVectorEntries,
             regenFeedback: input.regen_feedback,
             regenFeedbackPosition: input.regen_feedback_position,
             signal: abortController.signal,
+            activityMessageId: lifecycle.targetMessageId,
+            onAgentRuntimeRequired: () => {
+              terminal.markAgentRuntimeActive();
+            },
+            onAgentRuntimeOwnerCreated: (owner) => {
+              generationAgentRuntimeOwner = owner;
+              terminal.attachRuntimeOwner(owner);
+            },
           }),
           abortController.signal,
         );
@@ -2755,6 +4544,27 @@ export async function startGeneration(
           activatedWorldInfo,
           deliberationHandledByMacro,
         } = pipeline;
+        const agentRuntimeOwner = pipeline.agentRuntimeOwner;
+        if (agentRuntimeOwner && genType !== "impersonate") {
+          const agentToolDefinitions =
+            agentRuntimeOwner.getMainToolDefinitions();
+          if (agentToolDefinitions.length > 0) {
+            const existingNames = new Set(
+              (inlineTools ?? []).map((definition) => definition.name),
+            );
+            if (
+              agentToolDefinitions.some((definition) =>
+                existingNames.has(definition.name),
+              )
+            ) {
+              throw new Error("Agent tool name conflicts with another tool");
+            }
+            inlineTools = [
+              ...(inlineTools ?? []),
+              ...agentToolDefinitions,
+            ];
+          }
+        }
 
         // A context anchor is a strict guardrail: older history may be clipped,
         // but the marked message and every newer turn must fit together. Abort
@@ -2808,19 +4618,6 @@ export async function startGeneration(
           );
         }
 
-        // Inject council deliberation block into assembled messages (fallback for presets
-        // that don't use {{lumiaCouncilDeliberation}} macro)
-        if (councilResult?.deliberationBlock && !deliberationHandledByMacro) {
-          const insertIdx = Math.max(0, messages.length - 4);
-          const deliberationContent = [
-            councilResult.historicalDeliberationBlock,
-            councilResult.deliberationBlock,
-          ].filter(Boolean).join("\n\n");
-          messages.splice(insertIdx, 0, {
-            role: "system",
-            content: deliberationContent,
-          });
-        }
 
         // Attach assembly metadata to lifecycle
         lifecycle.breakdown = breakdown;
@@ -2902,28 +4699,22 @@ export async function startGeneration(
           inlineTools,
           inlineToolDefsByName,
           inlineMembersByPrefix,
+          inlineToolSafeNames,
           councilSettings.toolsSettings.timeoutMs,
           pipeline.assistantPrefill,
           pipeline.assistantReasoningPrefill,
           pipeline.macroEnv,
           pipeline.macroEnvSeed,
+          agentRuntimeOwner,
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
         // Clean up tracking maps if setup (council, assembly, etc.) fails or is aborted.
         // Only clear the per-chat mapping if it still points at THIS generation —
         // a newer startGeneration on the same chat may have already taken over the
         // chatKey (see line 590), and wiping it would strand the new generation.
-        activeGenerations.delete(generationId);
-        if (activeChatGenerations.get(chatKey) === generationId) {
-          activeChatGenerations.delete(chatKey);
-        }
 
-        // Clean up any pending council retry decision
-        const pendingRetry = pendingCouncilRetries.get(generationId);
-        if (pendingRetry) {
-          clearTimeout(pendingRetry.timeout);
-          pendingCouncilRetries.delete(generationId);
-        }
+        // Clean up any pending council retry decision and wake its waiter.
+        clearPendingCouncilRetry(generationId);
 
         // User aborts and extension-requested cancels both emit stop events so
         // the frontend resets its streaming state.
@@ -2936,16 +4727,13 @@ export async function startGeneration(
               /* best-effort cleanup */
             }
           }
-          pool.stopPool(generationId);
-          eventBus.emit(
-            EventType.GENERATION_STOPPED,
-            {
-              generationId,
-              chatId: input.chat_id,
-              content: "",
-            },
-            input.userId,
-          );
+          claimGenerationTerminal(generationId, "stopped", {
+            status: "stopped",
+          });
+          activeGenerations.delete(generationId);
+          if (activeChatGenerations.get(chatKey) === generationId) {
+            activeChatGenerations.delete(chatKey);
+          }
           return;
         }
 
@@ -2957,21 +4745,39 @@ export async function startGeneration(
           }
         }
 
+        terminal.recordAgentRuntimeFailure(err);
         abortChatBackground(input.userId, input.chat_id);
 
         const msg = errorMessage(err);
-        pool.errorPool(generationId, msg);
-        eventBus.emit(
-          EventType.GENERATION_ENDED,
+        claimGenerationTerminal(
+          generationId,
+          terminalReasonForError(
+            err,
+            generationAgentRuntimeOwner,
+            terminal.agentRuntimeActive,
+          ),
           {
-            generationId,
-            chatId: input.chat_id,
+            status: "error",
             error: msg,
-            generationType: lifecycle.generationType,
           },
-          input.userId,
         );
+        activeGenerations.delete(generationId);
+        if (activeChatGenerations.get(chatKey) === generationId) {
+          activeChatGenerations.delete(chatKey);
+        }
       } finally {
+        terminal.markRunLoopReconciled();
+        try {
+          terminal.ensurePoolProjection();
+        } catch (error) {
+          console.warn(
+            "[generate] Failed to reconcile terminal pool state:",
+            error,
+          );
+        }
+        const poolSettled = terminal.hasTerminalPoolProjection();
+        generationAgentRuntimeOwner?.close();
+        if (poolSettled) pool.unregisterPoolTerminalOwner(generationId);
         resolveCompletion();
       }
     })();
@@ -3000,14 +4806,187 @@ export async function startGeneration(
         /* best-effort cleanup */
       }
     }
+    terminal.claimWithoutPool("failed");
+    pool.unregisterPoolTerminalOwner(generationId);
     activeGenerations.delete(generationId);
     if (activeChatGenerations.get(chatKey) === generationId) {
       activeChatGenerations.delete(chatKey);
     }
     resolveCompletion();
-    pool.errorPool(generationId, errorMessage(err));
     throw err;
   }
+}
+let agenticGenerationDependencies: AgenticGenerationDependencies | undefined;
+
+/** Install concrete decision, snapshot, phase, and commit authorities during startup. */
+export function configureAgenticGenerationDependencies(
+  dependencies: AgenticGenerationDependencies,
+): void {
+  agenticGenerationDependencies = dependencies;
+}
+
+function toAgenticGenerationInput(input: GenerateInput): AgenticGenerationInput {
+  const chat = chatsSvc.getChat(input.userId, input.chat_id);
+  const metadata = chat?.metadata as Record<string, unknown> | undefined;
+  const generationType = input.generation_type ?? "normal";
+  const isGroupChat = metadata?.group === true || metadata?.group === 1;
+  const councilProfile = councilProfilesSvc.resolveProfile(
+    input.userId,
+    input.chat_id,
+    chat?.character_id ?? null,
+    { isGroup: isGroupChat },
+  );
+  const councilSettings = councilProfile.council_settings;
+  const councilEnabled =
+    councilSettings.councilMode === true &&
+    councilSettings.members.length > 0;
+  const councilToolsEnabled = councilSettings.members.some(
+    (member) => member.tools.length > 0,
+  );
+  return {
+    userId: input.userId,
+    chatId: input.chat_id,
+    ...(input.connection_id ? { connectionId: input.connection_id } : {}),
+    ...(input.preset_id ? { presetId: input.preset_id } : {}),
+    ...(input.force_preset_id !== undefined ? { forcePresetId: input.force_preset_id } : {}),
+    ...(input.persona_id ? { personaId: input.persona_id } : {}),
+    ...(input.message_id ? { messageId: input.message_id } : {}),
+    ...(input.swipe_id !== undefined ? { swipeId: input.swipe_id } : {}),
+    ...(input.target_character_id ? { targetCharacterId: input.target_character_id } : {}),
+    generationType,
+    ...(input.parameters ? { parameters: input.parameters } : {}),
+    userInput: input.user_input ?? "",
+    ...(input.regen_feedback !== undefined ? { regenFeedback: input.regen_feedback } : {}),
+    ...(input.runtime_decision_token ? { runtimeDecisionToken: input.runtime_decision_token } : {}),
+    ...(input.request_epoch !== undefined ? { requestEpoch: input.request_epoch } : {}),
+    signal: input.signal,
+    isImpersonate: input.generation_type === "impersonate" || input.impersonate_mode !== undefined,
+    isGroupChat,
+    isMultiplayer: metadata?.multiplayer === true || typeof metadata?.multiplayer_room_id === "string",
+    councilEnabled,
+    councilToolsEnabled,
+  };
+}
+function toEffectiveRuntimeRequest(input: GenerateInput): EffectiveRuntimeRequestV1 {
+  const generationType = input.generation_type ?? "normal";
+  const targetGenerationType = generationType === "normal"
+    || generationType === "continue"
+    || generationType === "regenerate"
+    || generationType === "swipe"
+    ? generationType
+    : "normal";
+  return {
+    chatId: input.chat_id,
+    logicalConnectionId: input.connection_id ?? null,
+    presetId: input.preset_id ?? null,
+    forcePresetId: input.force_preset_id === true,
+    personaId: input.persona_id ?? null,
+    targetCharacterId: input.target_character_id ?? null,
+    generationType,
+    target: {
+      generationType: targetGenerationType,
+      messageId: input.message_id ?? null,
+      swipeId: input.swipe_id ?? null,
+      targetCharacterId: input.target_character_id ?? null,
+    },
+    ...(input.request_epoch !== undefined ? { requestEpoch: input.request_epoch } : {}),
+  };
+}
+
+async function startReservedGeneration(
+  input: GenerateInput,
+  mode: "response" | "agentic",
+  start: () => Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }>,
+): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
+  const reservationId = `${mode}:${crypto.randomUUID()}`;
+  let finishReservation!: () => void;
+  const done = new Promise<void>((resolve) => {
+    finishReservation = resolve;
+  });
+  await reserveChatMode(input.userId, input.chat_id, mode, reservationId, done);
+  if (!ownsChatModeReservation(input.userId, input.chat_id, reservationId)) {
+    finishReservation();
+    throw new AgenticGenerationError("agentic_chat_busy", "Another generation owns this chat.", { retryable: true });
+  }
+  try {
+    const result = await start();
+    if (!ownsChatModeReservation(input.userId, input.chat_id, reservationId)) {
+      if (mode === "agentic") {
+        await requestAgenticGenerationCancellation(input.userId, result.generationId);
+      } else {
+        activeGenerations.get(result.generationId)?.terminal.claimAndProject("stopped", { status: "stopped" });
+      }
+      finishReservation();
+      throw new AgenticGenerationError("agentic_chat_busy", "Another generation owns this chat.", { retryable: true });
+    }
+    chatModeReservations.set(chatModeKey(input.userId, input.chat_id), {
+      mode,
+      ownerId: result.generationId,
+      done,
+    });
+    if (mode === "agentic") {
+      void waitForAgenticGeneration(result.generationId).finally(() => {
+        finishReservation();
+        releaseChatModeReservation(input.userId, input.chat_id, result.generationId);
+      });
+    } else {
+      const completion = activeGenerations.get(result.generationId)?.completion;
+      if (completion) {
+        void completion.finally(() => {
+          finishReservation();
+          releaseChatModeReservation(input.userId, input.chat_id, result.generationId);
+        });
+      } else {
+        finishReservation();
+        releaseChatModeReservation(input.userId, input.chat_id, result.generationId);
+      }
+    }
+    return result;
+  } catch (error) {
+    finishReservation();
+    releaseChatModeReservation(input.userId, input.chat_id, reservationId);
+    throw error;
+  }
+}
+
+/**
+ * Common authenticated generation admission. Response remains the legacy
+ * implementation; omitted mode resolves the durable chat/preset default and
+ * enters Agentic only with a fresh one-use decision token.
+ */
+export async function startGeneration(
+  input: GenerateInput,
+): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
+  if (input.mode !== undefined && input.mode !== "response" && input.mode !== "agentic") {
+    throw new Error("Unsupported generation mode.");
+  }
+
+  let mode = input.mode;
+  let agenticInput = input;
+  if (mode === undefined) {
+    const decision = await resolveEffectiveRuntime(input.userId, toEffectiveRuntimeRequest(input));
+    mode = decision.effectiveMode;
+    if (mode === "agentic") {
+      if (!decision.runtimeDecisionToken) {
+        throw new AgenticGenerationError(
+          "decision_refresh_required",
+          "Agentic runtime decision is no longer valid.",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      }
+      agenticInput = {
+        ...input,
+        mode: "agentic",
+        runtime_decision_token: decision.runtimeDecisionToken,
+      };
+    }
+  }
+  if (mode === "agentic") {
+    return startReservedGeneration(input, "agentic", () =>
+      startAgenticGeneration(toAgenticGenerationInput(agenticInput), agenticGenerationDependencies),
+    );
+  }
+  return startReservedGeneration(input, "response", () => startResponseGeneration(input));
 }
 
 /**
@@ -3018,6 +4997,12 @@ export async function startGeneration(
 export async function dryRunGeneration(
   input: GenerateInput,
 ): Promise<DryRunResult> {
+  if (input.mode === "agentic") {
+    throw new AgenticGenerationError(
+      "agentic_unsupported_surface",
+      "Agentic dry-run inspection is only available in Response mode.",
+    );
+  }
   const genType = input.generation_type || "normal";
   const sourceMessages = chatsSvc.getMessages(input.userId, input.chat_id);
   const sourceMessagesById = new Map(
@@ -3093,6 +5078,7 @@ export async function dryRunGeneration(
 
   const pipeline = await runPromptPipeline({
     userId: input.userId,
+    generationId: crypto.randomUUID(),
     chatId: input.chat_id,
     connectionId: input.connection_id,
     presetId: input.preset_id,
@@ -3138,6 +5124,7 @@ export async function dryRunGeneration(
   const outboundParams: Record<string, any> = { ...pipeline.parameters };
   delete outboundParams.max_context_length;
   delete outboundParams._include_usage;
+  injectConnectionMetadataFlags(connection, outboundParams);
 
   // Providers with requiresMaxTokens inject a default when max_tokens is absent
   if (
@@ -3193,18 +5180,22 @@ async function runGeneration(
   tools?: ToolDefinition[],
   inlineToolDefsByName?: Map<string, RuntimeCouncilToolDefinition>,
   inlineMembersByPrefix?: Map<string, CouncilMember>,
+  inlineToolSafeNames?: ReadonlyMap<string, string>,
   inlineToolTimeoutMs?: number,
   assistantPrefill?: string,
   assistantReasoningPrefill?: string,
   macroEnv?: import("../macros/types").MacroEnv,
   macroEnvSeed?: import("../macros/types").MacroEnv,
+  agentRuntimeOwner?: AgentRuntimeOwner,
 ): Promise<void> {
+  const effectiveSignal = agentRuntimeOwner
+    ? AbortSignal.any([signal, agentRuntimeOwner.ledger.signal])
+    : signal;
   // GENERATION_STARTED was already emitted when the pool entry was created
   // (before assembly). Once the provider stream is live, emit a lighter
   // progress event with the resolved breakdown metadata.
   // Pool status transitions to 'streaming' when the first actual token arrives
   // so that reconnecting clients see 'assembling' while waiting for TTFT.
-  pool.setPoolStatus(generationId, "waiting");
   pool.markStreamingStarted(generationId);
 
   type PendingStreamSegment = {
@@ -3339,9 +5330,57 @@ async function runGeneration(
       ? getResponseBehaviorOptions()
       : { source: "response_backend" as const };
 
-  let streamUsage:
-    | { prompt_tokens: number; completion_tokens: number; total_tokens: number }
-    | undefined;
+  let streamUsage: GenerationResponse["usage"];
+  let roundUsage: GenerationResponse["usage"];
+  let agentUsageMerged = false;
+  const settleRoundUsage = (): void => {
+    if (roundUsage === undefined) return;
+    const settled = roundUsage;
+    roundUsage = undefined;
+    streamUsage = settleGenerationRoundUsage(
+      streamUsage,
+      settled,
+      agentRuntimeOwner !== undefined,
+    );
+  };
+  const mergeAgentUsage = (): void => {
+    if (agentUsageMerged) return;
+    agentUsageMerged = true;
+    streamUsage = addAgentUsageToGenerationUsage(
+      streamUsage,
+      agentRuntimeOwner?.usage,
+    );
+  };
+  const persistAgentSummaryForGeneratedAssistant = (
+    messageId: string | undefined,
+  ): void => {
+    const agentSummary = agentRuntimeOwner?.summary;
+    const swipeId = lifecycle.streamingSwipeId;
+    if (
+      !messageId ||
+      !agentSummary ||
+      !isAgentSummaryPersistenceTarget(lifecycle, messageId, swipeId)
+    ) {
+      return;
+    }
+
+    const storedMessage = chatsSvc.getMessage(userId, messageId);
+    if (
+      !storedMessage ||
+      storedMessage.chat_id !== chatId ||
+      storedMessage.is_user ||
+      swipeId >= storedMessage.swipes.length
+    ) {
+      return;
+    }
+
+    chatsSvc.setSwipeScopedExtra(
+      userId,
+      messageId,
+      swipeId,
+      { agentActivity: agentSummary },
+    );
+  };
   let reasoningStartedAt = 0;
   let reasoningDurationMs = 0;
   // Keep the provider-native carrier independently from the text shown in the
@@ -3350,19 +5389,32 @@ async function runGeneration(
   let nativeReasoningContent = "";
   let nativeThinkingBlocks: LlmThinkingBlock[] | undefined;
   let nativeReasoningDetails: Record<string, unknown>[] | undefined;
-
-  function storedReasoningCarrier(): Record<string, unknown> | undefined {
-    if (nativeThinkingBlocks?.length) {
-      return { type: "thinking_blocks", blocks: nativeThinkingBlocks };
+  const persistedNativeReasoningCarrier = (): Record<string, unknown> | undefined => {
+    // Agentic work carriers are frame-private by contract. Only Response
+    // history may retain the provider-native replay payload on its target
+    // swipe, and never the display-only parsed reasoning text.
+    if (agentRuntimeOwner) return undefined;
+    if (nativeThinkingBlocks && nativeThinkingBlocks.length > 0) {
+      return {
+        type: "thinking_blocks",
+        blocks: nativeThinkingBlocks.map((block) => ({ ...block })),
+      };
     }
-    if (nativeReasoningDetails?.length) {
-      return { type: "reasoning_details", details: nativeReasoningDetails };
+    if (nativeReasoningDetails && nativeReasoningDetails.length > 0) {
+      return {
+        type: "reasoning_details",
+        details: nativeReasoningDetails.map((detail) => ({ ...detail })),
+      };
     }
-    if (nativeReasoningContent) {
-      return { type: "reasoning_content", content: nativeReasoningContent };
+    if (nativeReasoningContent.length > 0) {
+      return {
+        type: "reasoning_content",
+        content: nativeReasoningContent,
+      };
     }
     return undefined;
-  }
+  };
+
 
   // ── Guided CoT detection ───────────────────────────────────────────
   // When autoParse is enabled, detect the user's configured reasoning
@@ -3450,7 +5502,7 @@ async function runGeneration(
       }
     }
     closedContent = healFormattingArtifacts(closedContent);
-    const carrier = storedReasoningCarrier();
+    const nativeCarrier = persistedNativeReasoningCarrier();
 
     let messageId: string | undefined;
     if (lifecycle.targetMessageId && lifecycle.targetSwipeIdx != null) {
@@ -3461,7 +5513,7 @@ async function runGeneration(
         closedContent,
       );
       messageId = updated?.id ?? lifecycle.targetMessageId;
-      if (fullReasoning || carrier) {
+      if (fullReasoning || streamUsage || nativeCarrier) {
         // Target the regenerated swipe, not the displayed one (the user may have
         // navigated away mid-stream before stopping).
         chatsSvc.setSwipeScopedExtra(
@@ -3470,12 +5522,13 @@ async function runGeneration(
           lifecycle.streamingSwipeId,
           {
             ...(fullReasoning ? { reasoning: fullReasoning } : {}),
-            ...(carrier ? { reasoningCarrier: carrier } : {}),
+            ...(streamUsage ? { usage: streamUsage } : {}),
+            ...(nativeCarrier ? { reasoningCarrier: nativeCarrier } : {}),
           },
         );
       }
     } else if (lifecycle.stagedMessageId) {
-      if (!closedContent && !fullReasoning && !carrier) {
+      if (!closedContent && !fullReasoning && !streamUsage && !nativeCarrier) {
         try {
           chatsSvc.deleteMessage(userId, lifecycle.stagedMessageId);
         } catch {
@@ -3487,11 +5540,12 @@ async function runGeneration(
       const existingStagedExtra =
         chatsSvc.getMessage(userId, lifecycle.stagedMessageId)?.extra || {};
       const partialExtra =
-        fullReasoning || carrier
+        fullReasoning || streamUsage || nativeCarrier
           ? {
               ...existingStagedExtra,
               ...(fullReasoning ? { reasoning: fullReasoning } : {}),
-              ...(carrier ? { reasoningCarrier: carrier } : {}),
+              ...(streamUsage ? { usage: streamUsage } : {}),
+              ...(nativeCarrier ? { reasoningCarrier: nativeCarrier } : {}),
             }
           : existingStagedExtra;
       chatsSvc.updateMessage(userId, lifecycle.stagedMessageId, {
@@ -3502,7 +5556,10 @@ async function runGeneration(
         skipCouncilCacheInvalidation: true,
       });
       messageId = lifecycle.stagedMessageId;
-    } else if (lifecycle.continueMessageId && closedContent) {
+    } else if (
+      lifecycle.continueMessageId &&
+      (closedContent || streamUsage || nativeCarrier)
+    ) {
       const combined =
         (lifecycle.continueOriginalContent ?? "") +
         (lifecycle.continuePostfix ?? "") +
@@ -3514,14 +5571,15 @@ async function runGeneration(
         contentSwipeId: lifecycle.streamingSwipeId,
         skipCouncilCacheInvalidation: true,
       });
-      if (fullReasoning || carrier) {
+      if (fullReasoning || streamUsage || nativeCarrier) {
         chatsSvc.setSwipeScopedExtra(
           userId,
           lifecycle.continueMessageId,
           lifecycle.streamingSwipeId,
           {
             ...(fullReasoning ? { reasoning: fullReasoning } : {}),
-            ...(carrier ? { reasoningCarrier: carrier } : {}),
+            ...(streamUsage ? { usage: streamUsage } : {}),
+            ...(nativeCarrier ? { reasoningCarrier: nativeCarrier } : {}),
           },
         );
       }
@@ -3529,7 +5587,7 @@ async function runGeneration(
     } else if (lifecycle.impersonateDraft) {
       // Impersonate draft: do not persist the partial content as a message.
       // The streamed text is already in the frontend's input box.
-    } else if (closedContent) {
+    } else if (closedContent || nativeCarrier) {
       const isImpersonate = lifecycle.generationType === "impersonate";
       const extra: Record<string, any> = {};
       if (isImpersonate && lifecycle.personaId)
@@ -3537,7 +5595,8 @@ async function runGeneration(
       if (!isImpersonate && lifecycle.targetCharacterId)
         extra.character_id = lifecycle.targetCharacterId;
       if (fullReasoning) extra.reasoning = fullReasoning;
-      if (!isImpersonate && carrier) extra.reasoningCarrier = carrier;
+      if (!isImpersonate && streamUsage) extra.usage = streamUsage;
+      if (!isImpersonate && nativeCarrier) extra.reasoningCarrier = nativeCarrier;
       const created = chatsSvc.createMessage(
         chatId,
         {
@@ -3553,6 +5612,7 @@ async function runGeneration(
       messageId = created.id;
     }
 
+    persistAgentSummaryForGeneratedAssistant(messageId);
     return { messageId, content: closedContent };
   }
 
@@ -3587,44 +5647,176 @@ async function runGeneration(
   if (poolEntry) poolEntry.wasStreaming = useStreaming;
 
   let emittedStopped = false;
+  let reconcileActiveRoundUsage: (() => Promise<void>) | undefined;
   try {
     const inlineMcpTimeoutMs = tools?.length
       ? inlineToolTimeoutMs ?? getCouncilSettings(userId).toolsSettings.timeoutMs
       : 30_000;
     let generationMessages = messages;
 
-    // Providers that round-trip reasoning across tool calls (DeepSeek thinking
-    // mode, etc.) get a native tool_use/tool_result continuation so the model
-    // can keep reasoning between tool calls — interleaved thinking. Everything
-    // else keeps the legacy text continuation (and providers like Anthropic
-    // would *break* on structured tool_use without their thinking blocks, so
-    // they must stay on the legacy path until their carrier is wired).
-    const interleavedStructured =
-      !!tools?.length && provider.capabilities.interleavedThinking === true;
-
-    for (let inlineRound = 0; inlineRound < INLINE_TOOL_MAX_ROUNDS; inlineRound++) {
+    const agentToolsExposed =
+      agentRuntimeOwner?.getMainToolDefinitions().length
+        ? true
+        : false;
+    const ordinaryValidationDefinitions = buildInlineToolValidationDefinitions(
+      userId,
+      inlineToolDefsByName,
+      inlineMembersByPrefix,
+    );
+    // Council-only rounds retain their legacy compatibility path unless the
+    // provider explicitly supports interleaved thinking. Agent-owned tools may
+    // additionally use providers that advertise native tool continuation.
+    const continuationPolicy = resolveInlineToolContinuationPolicy(
+      !!tools?.length,
+      agentToolsExposed,
+      provider.capabilities,
+    );
+    if (agentToolsExposed && tools?.length) {
+      try {
+        assertAgentToolCapability(provider);
+      } catch (error) {
+        if (error instanceof AgentToolCapabilityError) {
+          throw new AgentRuntimeFailure(error.code);
+        }
+        throw error;
+      }
+    }
+    const maxInlineRounds = agentRuntimeOwner
+      ? Number.MAX_SAFE_INTEGER
+      : INLINE_TOOL_MAX_ROUNDS;
+    let sawToolCalls = false;
+    let inlineRound = 0;
+    let nextBatchReservation: ToolBatchReservation | null = null;
+    let agentBudgetExhausted = false;
+    let finalizationMode = false;
+    let providerTransientCarrier: ProviderTransientCarrier | undefined;
+    let activeProviderRoundStartedAt: number | undefined;
+    let activeProviderRoundMode: "ordinary" | "finalization" = "ordinary";
+    for (; inlineRound < maxInlineRounds; inlineRound++) {
       // fullContent/fullReasoning accumulate across rounds for the final
       // persisted message; capture the start offsets so we can slice out just
       // this round's delta for the continuation we feed back to the provider.
+      activeProviderRoundStartedAt = Date.now();
+      activeProviderRoundMode = finalizationMode ? "finalization" : "ordinary";
+      agentRuntimeOwner?.recordRootProviderRound(
+        "queued",
+        inlineRound,
+        activeProviderRoundMode,
+        activeProviderRoundStartedAt,
+      );
       const roundContentStart = fullContent.length;
       const roundReasoningStart = fullReasoning.length;
+      let pendingProviderTransientCarrier: ProviderTransientCarrier | undefined;
       let pendingToolCalls: ToolCallResult[] | undefined;
       // Provider-native reasoning blocks (Anthropic thinking blocks with
       // signatures) captured this round, replayed on the structured continuation.
       let pendingThinkingBlocks: LlmThinkingBlock[] | undefined;
       // OpenRouter reasoning_details captured this round, replayed likewise.
       let pendingReasoningDetails: Record<string, unknown>[] | undefined;
+      const observedContentParts: string[] = [];
+      const observedReasoningParts: string[] = [];
+      let observedFinishReason = "";
+      let roundObservationPromise: Promise<void> | undefined;
+      let roundTerminalRecorded = false;
+      const captureRoundObservation = (chunk: StreamChunk): void => {
+        if (!agentRuntimeOwner) return;
+        if (chunk.token) observedContentParts.push(chunk.token);
+        if (chunk.reasoning) observedReasoningParts.push(chunk.reasoning);
+      };
+      const reconcileRoundUsage = (): Promise<void> => {
+        if (!agentRuntimeOwner) return Promise.resolve();
+        if (!roundObservationPromise) {
+          roundObservationPromise = (async () => {
+            const observedOutputTokens = await observeAgentProviderOutput(
+              model,
+              {
+                content: observedContentParts.join(""),
+                ...(observedReasoningParts.length > 0
+                  ? { reasoning: observedReasoningParts.join("") }
+                  : {}),
+                finish_reason: observedFinishReason,
+                tool_calls: pendingToolCalls,
+                providerTransientCarrier: pendingProviderTransientCarrier,
+                thinking_blocks: pendingThinkingBlocks,
+                reasoning_details: pendingReasoningDetails,
+              },
+              effectiveSignal,
+            );
+            roundUsage = reconcileObservedGenerationUsage(
+              roundUsage,
+              observedOutputTokens,
+            );
+          })();
+        }
+        return roundObservationPromise;
+      };
+      reconcileActiveRoundUsage = reconcileRoundUsage;
+      const recordRootRoundTerminal = async (
+        phase: "completed" | "failed" | "cancelled",
+        toolCalls = 0,
+        errorCode?: AgentPublicErrorCode,
+      ): Promise<unknown> => {
+        if (!agentRuntimeOwner || roundTerminalRecorded) return undefined;
+        let observationError: unknown;
+        try {
+          await reconcileRoundUsage();
+        } catch (error) {
+          observationError = error;
+        }
+        const terminalPhase =
+          observationError && phase === "completed" ? "failed" : phase;
+        const terminalErrorCode = observationError
+          ? publicTerminalCodeForError(observationError) ?? "provider_protocol_error"
+          : errorCode;
+        agentRuntimeOwner.recordRootProviderRound(
+          terminalPhase,
+          inlineRound,
+          activeProviderRoundMode,
+          activeProviderRoundStartedAt ?? Date.now(),
+          roundUsage,
+          toolCalls,
+          terminalErrorCode,
+        );
+        roundTerminalRecorded = true;
+        return observationError;
+      };
+      const reservedBatch = nextBatchReservation;
+      nextBatchReservation = null;
+      let logicalRequest: AgentLedgerReservation | null = null;
+      if (agentRuntimeOwner && !reservedBatch) {
+        logicalRequest = agentRuntimeOwner.ledger.reserve(
+          "logical_provider_requests",
+          1,
+        );
+        if (!logicalRequest) {
+          const error = new AgentRuntimeFailure(
+            agentRuntimeOwner.ledger.failure?.code ??
+              "logical_provider_request_limit_exceeded",
+          );
+          await recordRootRoundTerminal(
+            "failed",
+            0,
+            publicTerminalCodeForError(error) ?? "provider_request_error",
+          );
+          throw error;
+        }
+      }
 
       // Non-streaming path: call generate() once, then synthesize a single-chunk stream.
       // Wrapped in a factory so the pre-token retry below can re-issue a clean request.
-      const makeStream = (): AsyncGenerator<StreamChunk, void, unknown> => useStreaming
+      const makeStream = (
+        requestTools: ToolDefinition[] | undefined = tools,
+      ): AsyncGenerator<StreamChunk, void, unknown> => useStreaming
         ? provider.generateStream(apiKey, apiUrl, {
             messages: generationMessages,
             model,
             parameters,
             stream: true,
-            tools,
-            signal,
+            tools: requestTools,
+            signal: effectiveSignal,
+            toolMode: finalizationMode ? "finalization" : (agentRuntimeOwner ? "ordinary" : undefined),
+            providerTransientCarrier,
+            receiveLimitBytes: agentRuntimeOwner ? 2 * 1024 * 1024 : undefined,
           })
         : (async function* () {
             const result = await provider.generate(apiKey, apiUrl, {
@@ -3632,14 +5824,18 @@ async function runGeneration(
               model,
               parameters,
               stream: false,
-              tools,
-              signal,
+              tools: requestTools,
+              signal: effectiveSignal,
+              toolMode: finalizationMode ? "finalization" : (agentRuntimeOwner ? "ordinary" : undefined),
+              providerTransientCarrier,
+              receiveLimitBytes: agentRuntimeOwner ? 2 * 1024 * 1024 : undefined,
             });
             yield {
               token: result.content,
               reasoning: result.reasoning,
               finish_reason: result.finish_reason,
               tool_calls: result.tool_calls,
+              providerTransientCarrier: result.providerTransientCarrier,
               thinking_blocks: result.thinking_blocks,
               reasoning_details: result.reasoning_details,
               usage: result.usage,
@@ -3653,44 +5849,128 @@ async function runGeneration(
       // we never retry — mid-stream failures fall through to the outer catch.
       let iter!: AsyncIterator<StreamChunk, void>;
       let firstResult!: IteratorResult<StreamChunk, void>;
+      let providerPermit: AgentAdmissionPermit | null = null;
       for (let attempt = 0; ; attempt++) {
-        const candidate = makeStream()[Symbol.asyncIterator]();
+        let attemptPermit: AgentAdmissionPermit | null = null;
+        if (agentRuntimeOwner) {
+          if (reservedBatch && attempt === 0) {
+            reservedBatch.consumeDispatch();
+            attemptPermit = reservedBatch.providerPermit;
+          } else {
+            const physicalAttempt = agentRuntimeOwner.ledger.reserve(
+              "physical_dispatch_attempts",
+              1,
+            );
+            if (!physicalAttempt) {
+              logicalRequest?.release();
+              reservedBatch?.release();
+              const error = new AgentRuntimeFailure(
+                agentRuntimeOwner.ledger.failure?.code ??
+                  "physical_dispatch_attempt_limit_exceeded",
+              );
+              await recordRootRoundTerminal(
+                effectiveSignal.aborted ? "cancelled" : "failed",
+                0,
+                publicTerminalCodeForError(error) ?? "provider_request_error",
+              );
+              throw error;
+            }
+            attemptPermit = agentRuntimeOwner.ledger.acquireProviderPermit();
+            if (!attemptPermit) {
+              physicalAttempt.release();
+              logicalRequest?.release();
+              reservedBatch?.release();
+              const error = new AgentRuntimeFailure(
+                agentRuntimeOwner.ledger.failure?.code ?? "capacity_exceeded",
+              );
+              await recordRootRoundTerminal(
+                effectiveSignal.aborted ? "cancelled" : "failed",
+                0,
+                publicTerminalCodeForError(error) ?? "provider_request_error",
+              );
+              throw error;
+            }
+            logicalRequest?.consume();
+            physicalAttempt.consume();
+          }
+          if (!attemptPermit) {
+            reservedBatch?.release();
+            const error = new AgentRuntimeFailure(
+              agentRuntimeOwner.ledger.failure?.code ?? "capacity_exceeded",
+            );
+            await recordRootRoundTerminal(
+              effectiveSignal.aborted ? "cancelled" : "failed",
+              0,
+              publicTerminalCodeForError(error) ?? "provider_request_error",
+            );
+            throw error;
+          }
+        }
+        let candidate: AsyncIterator<StreamChunk, void> | undefined;
         try {
-          firstResult = await raceWithSignal(candidate.next(), signal);
+          agentRuntimeOwner?.recordRootProviderRound(
+            "running",
+            inlineRound,
+            activeProviderRoundMode,
+            activeProviderRoundStartedAt ?? Date.now(),
+          );
+          candidate = makeStream(finalizationMode ? [] : tools)[Symbol.asyncIterator]();
+          firstResult = await raceWithSignal(candidate.next(), effectiveSignal);
           iter = candidate;
+          providerPermit = attemptPermit;
           break;
         } catch (err) {
-          try {
-            await candidate.return?.(undefined);
-          } catch {
-            /* best-effort */
+          if (attemptPermit && agentRuntimeOwner) {
+            if (reservedBatch?.providerPermit === attemptPermit) {
+              reservedBatch.releaseDispatch();
+            } else {
+              agentRuntimeOwner.ledger.releaseOperationPermit(attemptPermit);
+            }
           }
+          closeProviderIterator(candidate);
           const retryable =
             attempt < GENERATION_MAX_RETRIES &&
-            !signal.aborted &&
+            !effectiveSignal.aborted &&
             err instanceof ProviderRequestError &&
             err.retryable;
-          if (!retryable) throw err;
+          if (!retryable) {
+            const observationError = await recordRootRoundTerminal(
+              effectiveSignal.aborted ? "cancelled" : "failed",
+              0,
+              effectiveSignal.aborted
+                ? "cancelled"
+                : publicTerminalCodeForError(err) ?? "provider_request_error",
+            );
+            if (observationError) throw observationError;
+            throw err;
+          }
           try {
             await abortableSleep(
               computeBackoffMs(attempt, (err as ProviderRequestError).retryAfterMs),
-              signal,
+              effectiveSignal,
             );
           } catch {
+            const observationError = await recordRootRoundTerminal(
+              "cancelled",
+              0,
+              "cancelled",
+            );
+            if (observationError) throw observationError;
             // Aborted during backoff — surface the original provider error.
             throw err;
           }
-        }
-      }
 
+      }
+      }
       // Drive the iterator manually so each `.next()` can be raced against the
       // abort signal. Streaming providers forward aborts only until response
       // headers arrive (so preflight stops cancel the upstream request), then
       // switch to user-space read cancellation to avoid Bun's mid-stream abort
       // crash on Windows.
-      const maybeYieldDuringStream = createCooperativeYielder(32, signal);
-      let consumedFirst = false;
-      while (true) {
+      try {
+        const maybeYieldDuringStream = createCooperativeYielder(32, effectiveSignal);
+        let consumedFirst = false;
+        while (true) {
         let result: IteratorResult<StreamChunk, void>;
         if (!consumedFirst) {
           // The first chunk was already obtained (and signal-raced) during
@@ -3699,36 +5979,81 @@ async function runGeneration(
           result = firstResult;
         } else {
           try {
-            result = await raceWithSignal(iter.next(), signal);
+            result = await raceWithSignal(iter.next(), effectiveSignal);
           } catch (err) {
-            // Signal won the race. Tell the generator to clean up (best-effort)
-            // and rethrow so the outer catch handles emission.
-            try {
-              await iter.return?.(undefined);
-            } catch {
-              /* best-effort */
-            }
+            // Signal won the race. Request generator cleanup without awaiting
+            // an implementation whose return is queued behind this pending pull.
+            closeProviderIterator(iter);
+            const observationError = await recordRootRoundTerminal(
+              effectiveSignal.aborted ? "cancelled" : "failed",
+              0,
+              effectiveSignal.aborted
+                ? "cancelled"
+                : publicTerminalCodeForError(err) ?? "provider_protocol_error",
+            );
+            if (observationError) throw observationError;
             throw err;
           }
         }
-        if (result.done) break;
-        const chunk = result.value;
-
-        if (signal.aborted) {
-          const persisted = await persistPartialContent();
-          flushPendingStreamSegments();
-          pool.stopPool(generationId);
-          eventBus.emit(
-            EventType.GENERATION_STOPPED,
-            { generationId, chatId, content: persisted.content },
-            userId,
-          );
-          emittedStopped = true;
-          try {
-            await iter.return?.(undefined);
-          } catch {
-            /* best-effort */
+        if (result.done) {
+          if (agentRuntimeOwner) {
+            if (effectiveSignal.aborted) {
+              const observationError = await recordRootRoundTerminal(
+                "cancelled",
+                0,
+                "cancelled",
+              );
+              if (observationError) throw observationError;
+              break;
+            }
+            const error = new ProviderProtocolError(
+              "Provider stream ended without a terminal chunk",
+            );
+            const observationError = await recordRootRoundTerminal(
+              "failed",
+              0,
+              "provider_protocol_error",
+            );
+            if (observationError) throw observationError;
+            throw error;
           }
+          break;
+        }
+        const chunk = result.value;
+        if (chunk.providerTransientCarrier) {
+          assertResponsesProviderCarrier(chunk.providerTransientCarrier);
+        }
+        captureRoundObservation(chunk);
+        if (agentRuntimeOwner && chunk.usage !== undefined) {
+          try {
+            roundUsage = validatedGenerationUsage(chunk.usage);
+          } catch (error) {
+            const observationError = await recordRootRoundTerminal(
+              "failed",
+              pendingToolCalls?.length ?? 0,
+              publicTerminalCodeForError(error) ?? "provider_protocol_error",
+            );
+            if (observationError) throw observationError;
+            throw error;
+          }
+        }
+
+        if (effectiveSignal.aborted) {
+          const observationError = await recordRootRoundTerminal(
+            "cancelled",
+            0,
+            "cancelled",
+          );
+          settleRoundUsage();
+          mergeAgentUsage();
+          await persistPartialContent();
+          flushPendingStreamSegments();
+          claimGenerationTerminal(generationId, "stopped", {
+            status: "stopped",
+          });
+          emittedStopped = true;
+          closeProviderIterator(iter);
+          if (observationError) throw observationError;
           break;
         }
 
@@ -3740,12 +6065,14 @@ async function runGeneration(
           if (entry) entry.lastTokenAt = Date.now();
         }
 
-        // Emit reasoning tokens (provider thinking/extended thinking)
         if (chunk.reasoning) {
           if (!reasoningStartedAt) reasoningStartedAt = Date.now();
           fullReasoning += chunk.reasoning;
           nativeReasoningContent += chunk.reasoning;
-          const appended = pool.appendPoolReasoning(generationId, chunk.reasoning);
+          const appended = pool.appendPoolReasoning(
+            generationId,
+            chunk.reasoning,
+          );
           queueStreamSegment(chunk.reasoning, appended.seq, appended.offset, "reasoning");
         }
 
@@ -3755,6 +6082,9 @@ async function runGeneration(
 
         if (chunk.tool_calls) {
           pendingToolCalls = chunk.tool_calls;
+        }
+        if (chunk.providerTransientCarrier) {
+          pendingProviderTransientCarrier = chunk.providerTransientCarrier;
         }
 
         if (chunk.thinking_blocks) {
@@ -3773,22 +6103,115 @@ async function runGeneration(
           ];
         }
 
-        // Capture provider usage data (token counts) from the stream
-        if (chunk.usage) {
-          streamUsage = chunk.usage;
+        // Feature-inactive generation keeps staging's unchecked provider
+        // usage shape; round settlement still accumulates every request.
+        if (!agentRuntimeOwner && chunk.usage) {
+          roundUsage = chunk.usage;
         }
 
         await maybeYieldDuringStream();
 
         if (chunk.finish_reason) {
+          observedFinishReason = chunk.finish_reason;
+          validateTerminalProviderToolBatch(
+            observedFinishReason,
+            pendingToolCalls,
+          );
+          if (!agentRuntimeOwner) {
+            closeProviderIterator(iter);
+            break;
+          }
+          try {
+            while (true) {
+              const trailing = await raceWithSignal(
+                iter.next(),
+                effectiveSignal,
+              );
+              if (trailing.done) break;
+              captureRoundObservation(trailing.value);
+              if (isUsageOnlyStreamChunk(trailing.value)) {
+                roundUsage = validatedGenerationUsage(trailing.value.usage);
+                continue;
+              }
+              throw new ProviderProtocolError(
+                "Provider stream emitted data after its terminal chunk",
+              );
+            }
+          } catch (error) {
+            const observationError = await recordRootRoundTerminal(
+              effectiveSignal.aborted ? "cancelled" : "failed",
+              pendingToolCalls?.length ?? 0,
+              effectiveSignal.aborted
+                ? "cancelled"
+                : publicTerminalCodeForError(error) ??
+                  "provider_protocol_error",
+            );
+            if (observationError) throw observationError;
+            throw error;
+          }
+
+          let observationError: unknown;
+          try {
+            await reconcileRoundUsage();
+          } catch (error) {
+            observationError = error;
+          }
+          const completedUsage = roundUsage;
+          if (observationError) {
+            agentRuntimeOwner.recordRootProviderRound(
+              "failed",
+              inlineRound,
+              activeProviderRoundMode,
+              activeProviderRoundStartedAt ?? Date.now(),
+              completedUsage,
+              pendingToolCalls?.length ?? 0,
+              publicTerminalCodeForError(observationError) ??
+                "provider_protocol_error",
+            );
+            roundTerminalRecorded = true;
+            throw observationError;
+          }
+          try {
+            settleRoundUsage();
+          } catch (error) {
+            agentRuntimeOwner.recordRootProviderRound(
+              "failed",
+              inlineRound,
+              activeProviderRoundMode,
+              activeProviderRoundStartedAt ?? Date.now(),
+              completedUsage,
+              pendingToolCalls?.length ?? 0,
+              publicTerminalCodeForError(error) ?? "provider_protocol_error",
+            );
+            roundTerminalRecorded = true;
+            throw error;
+          }
+          agentRuntimeOwner.recordRootProviderRound(
+            "completed",
+            inlineRound,
+            activeProviderRoundMode,
+            activeProviderRoundStartedAt ?? Date.now(),
+            completedUsage,
+            pendingToolCalls?.length ?? 0,
+          );
+          roundTerminalRecorded = true;
           break;
         }
+        }
+      } finally {
+        if (providerPermit && agentRuntimeOwner) {
+          if (reservedBatch?.providerPermit === providerPermit) {
+            reservedBatch.releaseDispatch();
+          } else {
+            agentRuntimeOwner.ledger.releaseOperationPermit(providerPermit);
+          }
+        }
       }
-
-      if (signal.aborted) {
-        break;
-      }
-
+      const validatedToolCalls = validateTerminalProviderToolBatch(
+        observedFinishReason,
+        pendingToolCalls,
+      );
+      const roundToolCalls = validatedToolCalls ?? [];
       // This round's freshly-streamed deltas (not the cross-round accumulation).
       const roundContent = fullContent.slice(roundContentStart);
       const roundReasoning = fullReasoning.slice(roundReasoningStart);
@@ -3802,33 +6225,152 @@ async function runGeneration(
         ? `${cotDelimiters.prefix}${fullReasoning}${cotDelimiters.suffix}\n${fullContent}`
         : fullContent;
 
+      await reconcileActiveRoundUsage?.();
+      settleRoundUsage();
       const inlineContextMessages = [
         ...generationMessages,
         ...(fullAssistantOutput
           ? [{ role: "assistant", content: fullAssistantOutput } satisfies LlmMessage]
           : []),
       ];
-
-      const inlineCouncilResults =
-        pendingToolCalls?.length && inlineToolDefsByName
-          ? await executeInlineCouncilToolCalls(
-              userId,
-              pendingToolCalls,
-              inlineMcpTimeoutMs,
-              inlineToolDefsByName,
-              inlineMembersByPrefix,
-              inlineContextMessages,
-            )
-          : [];
+      if (roundToolCalls.length > 0) sawToolCalls = true;
+      validateInlineToolCallIds(roundToolCalls);
+      // A complete tool-free provider response is terminal for this frame.
+      // AgentRuntimeOwner validates tool batches atomically, and its validator
+      // intentionally rejects an empty batch; do not route ordinary completion
+      // through that protocol-error path.
+      if (roundToolCalls.length === 0) {
+        providerTransientCarrier = undefined;
+        break;
+      }
+      if (finalizationMode) {
+        // Budget finalization is explicitly tool-disabled. Any returned call
+        // is rejected without invoking a host side effect.
+        reservedBatch?.release();
+        throw new AgentRuntimeFailure("tool_round_limit_exceeded");
+      }
+      const resultsByIndex: Array<InlineCouncilToolResult | undefined> =
+        new Array(roundToolCalls.length);
+      if (agentRuntimeOwner) {
+        const plan = agentRuntimeOwner.planMainToolBatch(roundToolCalls, {
+          ordinaryDefinitions: ordinaryValidationDefinitions,
+          messages: generationMessages,
+          signal: effectiveSignal,
+        });
+        if (!plan.reservation) {
+          throw new AgentRuntimeFailure(
+            plan.failureCode ?? "capacity_exceeded",
+          );
+        }
+        const reservation = plan.reservation;
+        const batchRejected = plan.rejected;
+        for (let index = 0; index < plan.calls.length; index += 1) {
+          const call = plan.calls[index]!;
+          try {
+            let result: InlineCouncilToolResult;
+            if (batchRejected) {
+              const semanticError = plan.semanticErrors.get(call.call_id);
+              result = agentRuntimeOwner.buildMainToolBatchErrorResult(
+                call,
+                semanticError?.code ?? "batch_rejected",
+              );
+            } else {
+              result = plan.featureCallIndexes.includes(index)
+                ? await agentRuntimeOwner.executePlannedMainToolCall(plan, index)
+                : await agentRuntimeOwner.executePlannedOrdinaryToolCall(
+                    plan,
+                    index,
+                    async () => {
+                      if (!inlineToolDefsByName) {
+                        return unavailableInlineToolResult(call);
+                      }
+                      const [ordinaryResult] = await executeInlineCouncilToolCalls(
+                        userId,
+                        [call],
+                        inlineMcpTimeoutMs,
+                        inlineToolDefsByName,
+                        inlineMembersByPrefix,
+                        inlineContextMessages,
+                        effectiveSignal,
+                        inlineToolSafeNames,
+                      );
+                      return ordinaryResult ?? unavailableInlineToolResult(call);
+                    },
+                  );
+            }
+            if (
+              utf8ByteLength(result.result) > reservation.resultCapacity(index) ||
+              !reservation.settleResult(index, utf8ByteLength(result.result))
+            ) {
+              // The side effect has already settled, so always submit one
+              // bounded correlated result rather than failing the generation
+              // with an unconsumable envelope.
+              result = resultLimitExceededResult(call);
+              if (!reservation.settleResult(index, utf8ByteLength(result.result))) {
+                throw new AgentRuntimeFailure(
+                  agentRuntimeOwner.ledger.failure?.code ?? "result_limit_exceeded",
+                );
+              }
+            }
+            resultsByIndex[index] = result;
+          } finally {
+            reservation.releaseToolPermit(index);
+          }
+        }
+        nextBatchReservation = reservation;
+      } else if (inlineToolDefsByName) {
+        const ordinaryResults = await executeInlineCouncilToolCalls(
+          userId,
+          roundToolCalls,
+          inlineMcpTimeoutMs,
+          inlineToolDefsByName,
+          inlineMembersByPrefix,
+          inlineContextMessages,
+          effectiveSignal,
+          inlineToolSafeNames,
+        );
+        for (let index = 0; index < ordinaryResults.length; index += 1) {
+          resultsByIndex[index] = ordinaryResults[index];
+        }
+      }
+      const inlineCouncilResults = completeInlineToolResults(
+        roundToolCalls,
+        resultsByIndex,
+      );
 
       if (inlineCouncilResults.length === 0) {
+        providerTransientCarrier = undefined;
         break;
       }
 
-      generationMessages = [
-        ...generationMessages,
-        ...buildInlineToolContinuation({
-          structured: interleavedStructured,
+      if (pendingProviderTransientCarrier !== undefined) {
+        providerTransientCarrier = mergeProviderTransientCarrier(
+          providerTransientCarrier,
+          pendingProviderTransientCarrier,
+          inlineCouncilResults.map((result) => ({
+            type: "function_call_output" as const,
+            call_id: result.callId,
+            output: result.result,
+          })),
+        );
+        if (agentRuntimeOwner) {
+          const reservation = nextBatchReservation;
+          if (
+            !reservation ||
+            !reservation.settleContinuation(
+              utf8ByteLength(JSON.stringify(providerTransientCarrier)),
+            )
+          ) {
+            throw new AgentRuntimeFailure(
+              agentRuntimeOwner.ledger.failure?.code ?? "continuation_limit_exceeded",
+            );
+          }
+          agentRuntimeOwner.rootFrame.replaceMessages(generationMessages);
+        }
+      } else {
+        const continuation = buildInlineToolContinuation({
+          structured: continuationPolicy.structured,
+          legacyResultRole: continuationPolicy.legacyResultRole,
           legacyAssistantOutput: fullAssistantOutput,
           roundContent,
           roundReasoning,
@@ -3836,26 +6378,126 @@ async function runGeneration(
           results: inlineCouncilResults,
           thinkingBlocks: pendingThinkingBlocks,
           reasoningDetails: pendingReasoningDetails,
-        }),
-      ];
+        });
+        generationMessages = [...generationMessages, ...continuation];
+        if (agentRuntimeOwner) {
+          const reservation = nextBatchReservation;
+          if (
+            !reservation ||
+            !reservation.settleContinuation(
+              utf8ByteLength(JSON.stringify(continuation)),
+            )
+          ) {
+            throw new AgentRuntimeFailure(
+              agentRuntimeOwner.ledger.failure?.code ?? "continuation_limit_exceeded",
+            );
+          }
+          agentRuntimeOwner.rootFrame.replaceMessages(generationMessages);
+        }
+      }
+      if (
+        agentRuntimeOwner &&
+        agentRuntimeOwner.ledger.remaining("aggregate_tool_calls") <= 0
+      ) {
+        agentBudgetExhausted = true;
+        finalizationMode = true;
+      }
     }
+    const needsFinalization =
+      sawToolCalls &&
+      !agentRuntimeOwner &&
+      inlineRound >= maxInlineRounds;
+    if (needsFinalization && !effectiveSignal.aborted) {
+        nextBatchReservation?.release();
+        nextBatchReservation = null;
+      try {
+        const finalStream = useStreaming
+          ? provider.generateStream(apiKey, apiUrl, {
+              messages: generationMessages,
+              model,
+              parameters,
+              stream: true,
+              tools: [],
+              signal: effectiveSignal,
+              toolMode: "finalization",
+              providerTransientCarrier,
+            })
+          : (async function* () {
+              const result = await provider.generate(apiKey, apiUrl, {
+                messages: generationMessages,
+                model,
+                parameters,
+                stream: false,
+                tools: [],
+                signal: effectiveSignal,
+                toolMode: "finalization",
+                providerTransientCarrier,
+              });
+              yield {
+                token: result.content,
+                reasoning: result.reasoning,
+                finish_reason: result.finish_reason,
+                tool_calls: result.tool_calls,
+                providerTransientCarrier: result.providerTransientCarrier,
+                thinking_blocks: result.thinking_blocks,
+                reasoning_details: result.reasoning_details,
+                usage: result.usage,
+              };
+            })();
+        let finalToolCalls: ToolCallResult[] | undefined;
+        let finalFinishReason: string | undefined;
+        for await (const chunk of finalStream) {
+          if (effectiveSignal.aborted) break;
+          if (chunk.finish_reason) finalFinishReason = chunk.finish_reason;
+          if (chunk.reasoning) {
+            if (!reasoningStartedAt) reasoningStartedAt = Date.now();
+            fullReasoning += chunk.reasoning;
+            nativeReasoningContent += chunk.reasoning;
+            const appended = pool.appendPoolReasoning(
+              generationId,
+              chunk.reasoning,
+            );
+            queueStreamSegment(
+              chunk.reasoning,
+              appended.seq,
+              appended.offset,
+              "reasoning",
+            );
+          }
+          if (chunk.token) processContentToken(chunk.token);
+          if (chunk.tool_calls) finalToolCalls = chunk.tool_calls;
+          if (chunk.usage) roundUsage = chunk.usage;
+        }
+        settleRoundUsage();
+        const validatedFinalToolCalls = validateTerminalProviderToolBatch(
+          finalFinishReason,
+          finalToolCalls,
+        );
+        if (
+          (validatedFinalToolCalls?.length ?? 0) > 0 ||
+          (finalFinishReason !== "tool_calls" &&
+            (finalToolCalls?.length ?? 0) > 0)
+        ) {
+          throw new AgentRuntimeFailure("tool_round_limit_exceeded");
+        }
+      } finally {
+      }
+    }
+    mergeAgentUsage();
 
     // Clean exit after abort — the stream may have returned done:true via
     // readWithAbort without ever re-entering the for-await body, so the
     // in-loop STOPPED emission above never fired. Emit now so the frontend
     // gets its completion signal and can unblock its streaming UI.
-    if (signal.aborted && !emittedStopped) {
-      const persisted = await persistPartialContent();
-      pool.stopPool(generationId);
-      eventBus.emit(
-        EventType.GENERATION_STOPPED,
-        { generationId, chatId, content: persisted.content },
-        userId,
-      );
+    if (effectiveSignal.aborted && !emittedStopped) {
+      await persistPartialContent();
+      claimGenerationTerminal(generationId, "stopped", {
+        status: "stopped",
+      });
       emittedStopped = true;
     }
 
-    if (!signal.aborted) {
+    if (!effectiveSignal.aborted) {
       // Flush any remaining CoT detection buffers before saving
       flushCotBuffers();
 
@@ -3912,6 +6554,7 @@ async function runGeneration(
         }
       }
       fullContent = healFormattingArtifacts(fullContent);
+      const nativeCarrier = persistedNativeReasoningCarrier();
 
       let messageId: string | undefined;
 
@@ -3949,11 +6592,16 @@ async function runGeneration(
         // Merge with existing extra to preserve character_id etc. set during staging
         const existingStagedExtra =
           chatsSvc.getMessage(userId, lifecycle.stagedMessageId)?.extra || {};
-        const stagedExtra = fullReasoning
-          ? { ...existingStagedExtra, reasoning: fullReasoning }
-          : Object.keys(existingStagedExtra).length > 0
-            ? existingStagedExtra
-            : undefined;
+        const stagedExtra =
+          fullReasoning || nativeCarrier
+            ? {
+                ...existingStagedExtra,
+                ...(fullReasoning ? { reasoning: fullReasoning } : {}),
+                ...(nativeCarrier ? { reasoningCarrier: nativeCarrier } : {}),
+              }
+            : Object.keys(existingStagedExtra).length > 0
+              ? existingStagedExtra
+              : undefined;
         chatsSvc.updateMessage(userId, lifecycle.stagedMessageId, {
           content: fullContent,
           ...(stagedExtra ? { extra: stagedExtra } : {}),
@@ -3972,7 +6620,7 @@ async function runGeneration(
           extra.persona_id = lifecycle.personaId;
         if (!isImpersonate && lifecycle.targetCharacterId)
           extra.character_id = lifecycle.targetCharacterId;
-        if (fullReasoning) extra.reasoning = fullReasoning;
+        if (nativeCarrier) extra.reasoningCarrier = nativeCarrier;
 
         const message = chatsSvc.createMessage(
           chatId,
@@ -4046,13 +6694,11 @@ async function runGeneration(
       {
         const immediateExtra: Record<string, any> = {};
         if (fullReasoning) immediateExtra.reasoning = fullReasoning;
-        const carrier = storedReasoningCarrier();
-        if (carrier && lifecycle.generationType !== "impersonate") {
-          immediateExtra.reasoningCarrier = carrier;
-        }
         if (streamUsage) immediateExtra.usage = streamUsage;
-        if (reasoningDurationMs > 0)
+        if (nativeCarrier) immediateExtra.reasoningCarrier = nativeCarrier;
+        if (reasoningDurationMs > 0) {
           immediateExtra.reasoningDuration = reasoningDurationMs;
+        }
         if (messageId && Object.keys(immediateExtra).length > 0) {
           // Anchor reasoning/usage to the generated swipe, not the displayed one —
           // the user may have navigated to another swipe while this streamed.
@@ -4063,22 +6709,17 @@ async function runGeneration(
             immediateExtra,
           );
         }
+        persistAgentSummaryForGeneratedAssistant(messageId);
       }
 
       flushPendingStreamSegments();
-      pool.completePool(generationId, messageId);
-      eventBus.emit(
-        EventType.GENERATION_ENDED,
+      claimGenerationTerminal(
+        generationId,
+        agentBudgetExhausted ? "completed_at_tool_budget" : "completed",
         {
-          generationId,
-          chatId,
-          messageId,
-          content: fullContent,
-          usage: streamUsage,
-          generationType: lifecycle.generationType,
-          impersonateDraft: lifecycle.impersonateDraft || undefined,
+        status: "completed",
+        ...(messageId !== undefined ? { messageId } : {}),
         },
-        userId,
       );
 
       // Non-critical post-processing can be expensive on low-power/mobile
@@ -4196,22 +6837,31 @@ async function runGeneration(
               lifecycle.breakdown,
               lifecycle.chatHistoryMessages,
             );
-            const entries = tokenResult.breakdown.map((entry, index) => ({
-              ...entry,
-              content: lifecycle.breakdown?.[index]?.content,
-            }));
+            const entries = tokenResult.breakdown.map((entry, index) => {
+              const content = lifecycle.breakdown?.[index]?.content;
+              return {
+                ...entry,
+                content:
+                  typeof content === "string"
+                    ? redactAgentOutputFrames(content)
+                    : content,
+              };
+            });
             const chatHistoryTokens = sumChatHistoryBreakdownTokens(entries);
             const breakdownPayload = {
               entries: omitChatHistoryBreakdownEntries(entries),
               chatHistoryTokens,
               messages: (lifecycle.messages || []).map((message) => ({
                 role: message.role,
-                content:
+                content: redactAgentOutputFrames(
                   typeof message.content === "string"
                     ? message.content
                     : message.content
-                        .map((part) => (part.type === "text" ? part.text : ""))
+                        .map((part) =>
+                          part.type === "text" ? part.text : "",
+                        )
                         .join(""),
+                ),
               })),
               totalTokens: tokenResult.total_tokens,
               maxContext: lifecycle.maxContext || 0,
@@ -4256,70 +6906,89 @@ async function runGeneration(
       fireExpressionDetection(userId, chatId, lifecycle).catch(() => {});
     }
   } catch (err: unknown) {
-    // If the stream iterator threw because the abort signal fired (rather than
-    // the in-loop `signal.aborted` branch catching it first), treat this as a
-    // user-initiated stop, not an error. On Bun for Windows the thrown value
-    // may be `null` in this case, which is why errorMessage() is used.
-    if (signal.aborted) {
+    let terminalError = err;
+    try {
+      await reconcileActiveRoundUsage?.();
+    } catch (observationError) {
+      terminalError = observationError;
+    }
+    try {
+      settleRoundUsage();
+    } catch (accountingError) {
+      terminalError = accountingError;
+    }
+    try {
+      mergeAgentUsage();
+    } catch (accountingError) {
+      terminalError = accountingError;
+    }
+    const coordinatorReason =
+      activeGenerations.get(generationId)?.terminal.reason ??
+      agentRuntimeOwner?.ledger.terminal ??
+      null;
+    const isStopAbort =
+      coordinatorReason === null ||
+      coordinatorReason === "stopped" ||
+      coordinatorReason === "cancelled";
+    // A root deadline, idle timeout, or typed runtime failure also aborts the
+    // stream, but must retain its exact failure projection rather than being
+    // misclassified as a user stop.
+    if (effectiveSignal.aborted && isStopAbort) {
       // Skip if the post-loop / in-loop branch already emitted — catches
       // the case where a later .next() race threw AFTER the loop body's
       // STOPPED emission had already fired.
       if (!emittedStopped) {
-        // Persist whatever was already streamed — same recovery as the
-        // non-abort error path. Without this, cancelling mid-stream wiped the
-        // message even though the tokens had already rendered for the user.
-        // Yield a macrotask first so the provider's stream teardown finishes
-        // before we kick off SQLite writes; on Bun-Windows, interleaving DB
-        // work with ReadableStream teardown was a reproducible panic trigger.
         await new Promise((resolve) => setTimeout(resolve, 0));
-        let savedContent = fullContent;
         try {
-          const persisted = await persistPartialContent();
-          savedContent = persisted.content;
+          await persistPartialContent();
         } catch {
           /* best-effort; fall back to in-memory content */
         }
         flushPendingStreamSegments();
-        pool.stopPool(generationId);
-        eventBus.emit(
-          EventType.GENERATION_STOPPED,
+        claimGenerationTerminal(generationId, "stopped", {
+          status: "stopped",
+        });
+        emittedStopped = true;
+      }
+    } else if (effectiveSignal.aborted) {
+      if (!emittedStopped) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        try {
+          await persistPartialContent();
+        } catch {
+          /* best-effort; fall back to in-memory content */
+        }
+        flushPendingStreamSegments();
+        claimGenerationTerminal(
+          generationId,
+          coordinatorReason ??
+            terminalReasonForError(terminalError, agentRuntimeOwner),
           {
-            generationId,
-            chatId,
-            content: savedContent,
+            status: "error",
+            error: coordinatorReason ?? "failed",
           },
-          userId,
         );
         emittedStopped = true;
       }
     } else {
-      const msg = errorMessage(err);
+      const msg = errorMessage(terminalError);
       abortChatBackground(userId, chatId);
       // Socket drops, provider 5xx mid-stream, etc. — persist whatever was
       // already streamed so the user keeps the visible content rather than
       // having the streaming bubble wiped on error.
-      let savedMessageId: string | undefined;
-      let savedContent = fullContent;
       try {
-        const persisted = await persistPartialContent();
-        savedMessageId = persisted.messageId;
-        savedContent = persisted.content;
+        await persistPartialContent();
       } catch {
         /* best-effort; never let save failure shadow the original error */
       }
       flushPendingStreamSegments();
-      pool.errorPool(generationId, msg);
-      eventBus.emit(
-        EventType.GENERATION_ENDED,
+      claimGenerationTerminal(
+        generationId,
+        terminalReasonForError(terminalError, agentRuntimeOwner),
         {
-          generationId,
-          chatId,
-          messageId: savedMessageId,
-          content: savedContent,
+          status: "error",
           error: msg,
-          generationType: lifecycle.generationType,
         },
-        userId,
       );
     }
   } finally {
@@ -4508,50 +7177,85 @@ function emitExpressionChanged(
   );
 }
 
-export function stopGeneration(userId: string, generationId: string): boolean {
+export async function stopGeneration(
+  userId: string,
+  generationId: string,
+): Promise<boolean | "too_late"> {
+  const agenticContext = getActiveAgenticGenerationContext(userId, generationId);
+  const agenticResult = await requestAgenticGenerationCancellation(userId, generationId);
+  if (agenticResult !== false) {
+    // A legacy Response generation can still exist for the same chat. Settle it
+    // in the same Stop instead of leaving its provider stream and persistence
+    // running behind an accepted Agentic cancellation.
+    let responseStopped = false;
+    if (agenticContext) {
+      const responseId = activeChatGenerations.get(`${userId}:${agenticContext.chatId}`);
+      const raced = responseId ? activeGenerations.get(responseId) : undefined;
+      if (raced && raced.userId === userId) {
+        responseStopped = raced.terminal.tryTerminate("stopped");
+      }
+      abortChatBackground(userId, agenticContext.chatId);
+    }
+    return agenticResult === true || responseStopped ? true : agenticResult;
+  }
   const entry = activeGenerations.get(generationId);
   // User scoping: a generationId is unguessable, but never let one user's
   // stop request abort another user's generation.
   if (!entry || entry.userId !== userId) return false;
-  entry.controller.abort();
+  const claimed = entry.terminal.tryTerminate("stopped");
+  // The same chat may still own an Agentic turn from a legacy race; its durable
+  // owner decides acceptance before this Stop reports a result.
+  const agenticChatResult = await requestAgenticChatCancellation(userId, entry.chatId);
   // Tear down any fire-and-forget background work for this chat too —
   // the user asked to stop, so cache-warming cortex/databank queries
   // should die with the visible generation.
   abortChatBackground(entry.userId, entry.chatId);
-  return true;
+  if (claimed || agenticChatResult === true) return true;
+  return agenticChatResult === "too_late" ? "too_late" : claimed;
 }
-
-export function stopUserGenerations(userId: string): void {
-  for (const [id, entry] of activeGenerations) {
-    if (entry.userId === userId) {
-      entry.controller.abort();
+export async function stopUserGenerations(userId: string): Promise<boolean | "too_late"> {
+  // Durable Agentic cancellation must win before any live controller or
+  // background work is aborted. The regular Response terminal owner performs
+  // its own CAS synchronously below.
+  const agenticResult = await stopAgenticUserGenerations(userId);
+  let stopped = agenticResult === true;
+  for (const entry of activeGenerations.values()) {
+    if (entry.userId === userId && entry.terminal.tryTerminate("stopped")) {
+      stopped = true;
     }
   }
   abortUserBackgrounds(userId);
+  return stopped ? true : agenticResult === "too_late" ? "too_late" : false;
 }
 
-export function stopChatGenerations(userId: string, chatId: string): boolean {
+export async function stopChatGenerations(
+  userId: string,
+  chatId: string,
+): Promise<boolean | "too_late"> {
+  const agenticResult = await requestAgenticChatCancellation(userId, chatId);
+  if (agenticResult !== false) return agenticResult;
   const chatKey = `${userId}:${chatId}`;
   const genId = activeChatGenerations.get(chatKey);
   let stopped = false;
   if (genId) {
     const entry = activeGenerations.get(genId);
-    if (entry) {
-      entry.controller.abort();
-      stopped = true;
-    }
+    if (entry) stopped = entry.terminal.tryTerminate("stopped");
   }
   abortChatBackground(userId, chatId);
   return stopped;
 }
 
-export function stopAllGenerations(): void {
-  for (const [id, entry] of activeGenerations) {
-    entry.controller.abort();
+export async function stopAllGenerations(): Promise<boolean | "too_late"> {
+  // Shutdown/global Stop follows the same durable-first ordering as a
+  // user-scoped Stop. No Agentic controller is aborted until its execution CAS
+  // has accepted cancellation (or reported too_late).
+  const agenticResult = await stopAllAgenticGenerations();
+  let stopped = agenticResult === true;
+  for (const entry of activeGenerations.values()) {
+    if (entry.terminal.tryTerminate("stopped")) stopped = true;
   }
-  activeGenerations.clear();
-  activeChatGenerations.clear();
   abortAllBackgrounds();
+  return stopped ? true : agenticResult === "too_late" ? "too_late" : false;
 }
 
 /** Returns the active generationId for a chat, if any. */
@@ -4563,7 +7267,7 @@ export function getActiveChatGeneration(
 }
 
 export function getActiveGenerationCount(): number {
-  return activeGenerations.size;
+  return activeGenerations.size + getActiveAgenticGenerationCount();
 }
 
 // Abort only stalled generations. A slow model may legitimately stream for
@@ -4580,7 +7284,7 @@ export function sweepInactiveGenerations(now = Date.now()): void {
       console.warn(
         `[generate] Aborting inactive generation ${id} (no tokens for ${Math.round(idleForMs / 1000)}s; age: ${Math.round((now - entry.startedAt) / 1000)}s)`,
       );
-      entry.controller.abort();
+      entry.terminal.tryTerminate("timeout");
     }
   }
 }
@@ -4610,6 +7314,8 @@ async function consumeStream(
   let reasoning = "";
   let finishReason = "stop";
   let toolCalls: import("../llm/types").ToolCallResult[] | undefined;
+  let thinkingBlocks: LlmThinkingBlock[] | undefined;
+  let reasoningDetails: Record<string, unknown>[] | undefined;
   let usage: GenerationResponse["usage"];
 
   const source = userId
@@ -4621,6 +7327,8 @@ async function consumeStream(
     if (chunk.usage) usage = chunk.usage;
     if (chunk.finish_reason) finishReason = chunk.finish_reason;
     if (chunk.tool_calls) toolCalls = chunk.tool_calls;
+    if (chunk.thinking_blocks) thinkingBlocks = chunk.thinking_blocks;
+    if (chunk.reasoning_details) reasoningDetails = chunk.reasoning_details;
   }
 
   return {
@@ -4628,6 +7336,8 @@ async function consumeStream(
     reasoning: reasoning || undefined,
     finish_reason: finishReason,
     tool_calls: toolCalls,
+    thinking_blocks: thinkingBlocks,
+    reasoning_details: reasoningDetails,
     usage,
   };
 }

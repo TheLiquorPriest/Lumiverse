@@ -62,8 +62,8 @@ const DRAWER_TAB_IDS = [
 
 const SETTINGS_TAB_IDS = [
   'productivity', 'account', 'display', 'chat', 'extensions', 'guided', 'quickReplies', 'extensionPools',
-  'webSearch', 'embeddings', 'memoryCortex', 'notifications', 'voice', 'mcpServers',
-  'advanced', 'lumihub', 'dataPortability', 'diagnostics', 'ssoProviders', 'operator',
+  'webSearch', 'embeddings', 'memoryCortex', 'agentRuntime', 'contextLibrary', 'notifications', 'voice', 'mcpServers',
+  'advanced', 'lumihub', 'dataPortability', 'diagnostics', 'streamDeck', 'ssoProviders', 'operator',
   'tokenizers', 'users', 'migration',
 ] as const
 
@@ -101,6 +101,7 @@ const HOST_ACTION_ROWS: readonly AuthorityRow[] = [
   free({ surface: 'host_action', id: 'route:/characters', source: 'nav.route:/characters', freeBecause: 'pure-host-action: React Router navigation to an allowlisted route' }),
   free({ surface: 'host_action', id: 'route:/characters/:id', source: 'nav.route:/characters/:id', freeBecause: 'pure-host-action: React Router navigation to an allowlisted route' }),
   gated('characters', { surface: 'host_action', id: 'modal:character_editor', source: 'characters.editingId', gatedBecause: 'Rule-B clause (d): opens the protected character-editor entity by id' }),
+  gated('world_books', { surface: 'host_action', id: 'modal:world_book_editor', source: 'worldBooks.editingId', gatedBecause: 'Rule-B clause (d): opens the protected world-book editor entity by id' }),
   free({ surface: 'host_action', id: 'input_bar_action:self', source: 'ui.inputBarAction.self', freeBecause: 'pure-host-action: invokes the caller extension’s own registered handler' }),
   gated('app_manipulation', { surface: 'host_action', id: 'input_bar_action:cross_extension', source: 'ui.inputBarAction.crossExtension', gatedBecause: 'Rule-B clause (c): invokes another extension’s handler under its owner boundary' }),
   free({ surface: 'host_action', id: 'ext_command:self', source: 'ui.extCommand.self', freeBecause: 'pure-host-action: invokes the caller extension’s own backend command' }),

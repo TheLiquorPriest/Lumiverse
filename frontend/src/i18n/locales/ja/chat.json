@@ -86,6 +86,43 @@
     "modCmd": "CMD",
     "modCtrl": "Ctrl"
   },
+  "agentRuntime": {
+    "label": "生成モード",
+    "oneTurnLegend": "次のターン",
+    "mode": {
+      "response": "レスポンス",
+      "agentic": "エージェント"
+    },
+    "useForChat": "このチャットの既定にする",
+    "savingOverride": "保存中…",
+    "useResponse": "レスポンスを使用",
+    "repair": {
+      "title": "エージェントモードの確認が必要です",
+      "slot": "プリセットの接続スロットを割り当ててください",
+      "provider": "必要な機能を持つプロバイダーを選択してください",
+      "isolate": "安全なランタイムワーカーを復旧してください",
+      "egress": "このターンでは同じプロバイダードメインを使用してください",
+      "readiness": "ランタイムの設定または確認を完了してください"
+    },
+    "announcement": {
+      "oneTurn": "次のターンに{{mode}}を選択しました。",
+      "overrideSaved": "{{mode}}をチャットの既定に設定しました。",
+      "overrideFailed": "チャットの既定を保存できませんでした。もう一度お試しください。",
+      "responseEscape": "次のターンにレスポンスを選択しました。"
+    },
+    "preflight": {
+      "refreshRequired": "生成開始前にランタイムが変更されました。モードを確認して再試行してください。",
+      "unavailable": "エージェントモードの準備ができていません。レスポンスを使用するか、表示された修復を完了してください。"
+    },
+    "stop": {
+      "stop": "実行を停止",
+      "locating": "正確な停止操作を準備しています…",
+      "stopping": "停止中…",
+      "retry": "停止を再試行",
+      "tooLate": "停止するには遅すぎます",
+      "terminal": "実行終了"
+    }
+  },
   "findInChat": {
     "open": "チャット内を検索",
     "placeholder": "チャット内を検索…",
@@ -358,6 +395,281 @@
     "renderModeAria": "レンダリングモードの推論",
     "text": "テキスト",
     "markdown": "マークダウン"
+  },
+  "agentActivity": {
+    "liveLabel": "エージェント活動 · {{count}} 件実行中",
+    "idleLabel": "エージェント活動 · 実行中なし",
+    "summaryLabel": "エージェント活動 · {{status}} · {{count}} 件",
+    "liveAria": "エージェントとツールのライブ活動",
+    "rowAria": "{{profile}}：{{status}}",
+    "usage": "{{total}} トークン · 入力 {{input}} / 出力 {{output}}",
+    "actors": {
+      "mainModel": "メインモデル"
+    },
+    "status": {
+      "pending": "待機中",
+      "running": "実行中",
+      "succeeded": "完了",
+      "failed": "失敗",
+      "cancelled": "キャンセル",
+      "timed_out": "タイムアウト"
+    },
+    "phase": {
+      "queued": "キュー待ち",
+      "started": "処理中",
+      "tool_call": "ツールを使用中",
+      "completed": "完了",
+      "failed": "失敗",
+      "cancelled": "キャンセル",
+      "timed_out": "タイムアウト"
+    },
+    "tools": {
+      "lore_list_books": "ロアブック一覧",
+      "lore_get_book": "ロアブックを読む",
+      "lore_list_entries": "ロア項目一覧",
+      "lore_get_entry": "ロア項目を読む",
+      "lore_search_entries": "ロアを検索",
+      "chat_search_history": "チャット履歴を検索",
+      "agent_delegate": "エージェントに委任"
+    },
+    "summary": {
+      "invocations": "{{count}} 件の実行",
+      "succeeded": "{{count}} 件完了",
+      "failed": "{{count}} 件失敗",
+      "cancelled": "{{count}} 件キャンセル",
+      "timedOut": "{{count}} 件タイムアウト",
+      "tools": "{{count}} 件のツール呼び出し"
+    }
+  },
+  "agentRun": {
+    "title": "エージェントのアクティビティ",
+    "subtitle": "この応答のステータスのみの時系列",
+    "close": "エージェントのアクティビティを閉じる",
+    "tabsAria": "エージェント実行の詳細",
+    "stripLabel": "エージェント実行",
+    "tabs": {
+      "activity": "アクティビティツリー",
+      "workspace": "ワークスペース"
+    },
+    "actors": {
+      "root": "ルートエージェント",
+      "provider": "モデルラウンド",
+      "child": "子エージェント",
+      "childNamed": "エージェント {{name}}",
+      "tool": "ツール"
+    },
+    "tools": {
+      "lore_list_books": "ロアブックを一覧表示",
+      "lore_get_book": "ロアブックを読む",
+      "lore_list_entries": "ロアエントリを一覧表示",
+      "lore_get_entry": "ロアエントリを読む",
+      "lore_search_entries": "ロアを検索",
+      "chat_search_history": "チャット履歴を検索",
+      "agent_delegate": "エージェントに委任",
+      "context_pack_list": "コンテキストパックを一覧表示",
+      "context_pack_get": "コンテキストパックを読む",
+      "workspace_read_section": "ワークスペースのセクションを読む",
+      "workspace_read_page": "ワークスペースのページを読む",
+      "workspace_create_task": "タスクを作成",
+      "workspace_update_progress": "タスクを更新",
+      "workspace_submit_result": "結果を送信",
+      "workspace_accept_submission": "提出を承認",
+      "workspace_record_finding": "知見を記録",
+      "workspace_record_decision": "決定を記録",
+      "workspace_record_question": "質問を記録",
+      "workspace_attach_artifact": "成果物を添付",
+      "workspace_propose_publication": "公開を提案",
+      "complete_turn": "ターンを完了",
+      "unknown_tool": "ツール"
+    },
+    "phase": {
+      "ASSEMBLE": "構成中",
+      "WORK": "作業中",
+      "COMPLETE": "作業完了",
+      "RENDER": "応答を作成中",
+      "PREPARE_COMMIT": "応答を準備中",
+      "COMMITTING": "応答を保存中",
+      "COMMITTED": "保存済み",
+      "COMMIT_FAILED": "保存に失敗",
+      "EXHAUSTED": "予算を使い切りました",
+      "FAILED": "失敗",
+      "CANCELLED": "キャンセル済み",
+      "TIMED_OUT": "タイムアウト"
+    },
+    "status": {
+      "ASSEMBLE": "構成中",
+      "WORK": "作業中",
+      "COMPLETE": "作業完了",
+      "RENDER": "作成中",
+      "PREPARE_COMMIT": "準備中",
+      "COMMITTING": "保存中",
+      "COMMITTED": "完了",
+      "COMMIT_FAILED": "保存に失敗",
+      "EXHAUSTED": "予算を使い切りました",
+      "FAILED": "失敗",
+      "CANCELLED": "キャンセル済み",
+      "TIMED_OUT": "タイムアウト"
+    },
+    "nodeStatus": {
+      "pending": "保留中",
+      "running": "実行中",
+      "completed": "完了",
+      "failed": "失敗",
+      "cancelled": "キャンセル済み",
+      "timed_out": "タイムアウト",
+      "omitted": "省略"
+    },
+    "activityTreeAria": "エージェントとツールの時系列",
+    "activityEmpty": "公開アクティビティ行はまだありません。",
+    "usageCompact": "{{total}} トークン · 入力 {{input}} / 出力 {{output}}",
+    "duration": {
+      "seconds": "{{count}}秒",
+      "minutes": "{{count}}分",
+      "minutesSeconds": "{{minutes}}分{{seconds}}秒",
+      "hours": "{{count}}時間",
+      "hoursMinutes": "{{hours}}時間{{minutes}}分"
+    },
+    "usage": {
+      "total": "合計トークン数",
+      "input": "入力トークン数",
+      "output": "出力トークン数",
+      "tools": "ツール呼び出し",
+      "children": "子エージェント",
+      "toolsCount": "ツール呼び出し: {{count}}",
+      "childrenCount": "子エージェント: {{count}}"
+    },
+    "sync": {
+      "stale": "接続が復旧するまで、最後に確認されたツリーを表示しています。",
+      "restoring": "サーバーからアクティビティを復元しています。",
+      "error": "最後に確認されたツリーは保持されています。復旧を再試行できます。"
+    },
+    "omission": "{{nodes}} 件のアクティビティ行と {{events}} 件の更新がサーバーによって省略されました。",
+    "errors": {
+      "unknown": "実行は、安全に処理されたサーバーエラーにより終了しました。",
+      "capacity_exceeded": "容量上限に達しました。",
+      "host_child_admission_limit_exceeded": "ホストの子エージェント上限に達しました。",
+      "host_tool_call_limit_exceeded": "ホストのツール呼び出し上限に達しました。",
+      "child_admission_limit_exceeded": "子エージェント上限に達しました。",
+      "tool_call_limit_exceeded": "ツール呼び出し上限に達しました。",
+      "logical_provider_request_limit_exceeded": "モデルリクエスト上限に達しました。",
+      "physical_dispatch_attempt_limit_exceeded": "ディスパッチ上限に達しました。",
+      "child_output_token_limit_exceeded": "子エージェントの出力上限に達しました。",
+      "root_wall_clock_limit_exceeded": "時間上限に達しました。",
+      "activity_event_limit_exceeded": "アクティビティ更新上限に達しました。",
+      "activity_byte_limit_exceeded": "アクティビティサイズ上限に達しました。",
+      "lifecycle_log_record_limit_exceeded": "アクティビティ履歴上限に達しました。",
+      "context_limit_exceeded": "コンテキスト上限に達しました。",
+      "initial_input_limit_exceeded": "入力上限に達しました。",
+      "argument_limit_exceeded": "ツール引数の上限に達しました。",
+      "result_limit_exceeded": "ツール結果の上限に達しました。",
+      "continuation_limit_exceeded": "継続処理上限に達しました。",
+      "retained_output_limit_exceeded": "応答サイズ上限に達しました。",
+      "materialized_limit_exceeded": "マテリアライズ上限に達しました。",
+      "timeout": "実行がタイムアウトしました。",
+      "cancelled": "実行がキャンセルされました。",
+      "provider_unavailable": "モデルサービスを利用できません。",
+      "provider_unsupported": "モデル機能を利用できません。",
+      "provider_tool_calling_unsupported": "ツール呼び出しを利用できません。",
+      "provider_tool_continuation_unsupported": "ツール継続処理を利用できません。",
+      "provider_tool_finalization_unsupported": "最終応答モードを利用できません。",
+      "provider_request_error": "モデルリクエストに失敗しました。",
+      "provider_protocol_error": "モデル応答を解釈できませんでした。",
+      "provider_schema_error": "モデル応答の形式が無効です。",
+      "invalid_task": "タスクが無効です。",
+      "invalid_profile": "エージェントプロファイルが無効です。",
+      "invalid_arguments": "ツール引数が無効です。",
+      "batch_rejected": "操作バッチが拒否されました。",
+      "unknown_tool": "要求されたツールを利用できません。",
+      "unauthorized": "操作が認可されていません。",
+      "integrity_error": "実行の整合性チェックに失敗しました。",
+      "internal_error": "サーバー内部エラーが発生しました。",
+      "not_found": "要求されたランタイム対象が見つかりません。",
+      "invalid_request": "ランタイムリクエストが無効です。",
+      "decision_refresh_required": "ランタイムの決定が古くなっています。モードを確認して再試行してください。",
+      "decision_capacity_exceeded": "保留中のランタイム決定が多すぎます。しばらくしてから再試行してください。",
+      "runtime_decision_unavailable": "ランタイム決定サービスを利用できません。",
+      "agentic_unsupported_surface": "この生成画面ではレスポンスモードを使用してください。",
+      "agentic_runtime_unavailable": "エージェントランタイムを利用できません。レスポンスモードを使用してください。",
+      "agentic_preflight_failed": "エージェントの事前チェックに失敗しました。レスポンスモードを使用するか設定を確認してください。",
+      "agentic_chat_busy": "このチャットではすでにエージェント実行中です。",
+      "agentic_protocol_failure": "エージェントプロトコルの応答が無効です。",
+      "agentic_work_exhausted": "エージェントの作業予算を使い切りました。",
+      "agentic_cancelled": "エージェント実行がキャンセルされました。",
+      "agentic_timed_out": "エージェント実行がタイムアウトしました。",
+      "agentic_commit_failed": "エージェントの結果を確定できませんでした。",
+      "agentic_revision_conflict": "エージェント結果の確定前にランタイムが変更されました。",
+      "agentic_provider_failure": "エージェントのモデルリクエストに失敗しました。",
+      "agentic_internal_error": "エージェントランタイムで内部エラーが発生しました。"
+    },
+    "announcements": {
+      "restoring": "エージェントのアクティビティを復元しています。",
+      "stale": "エージェントのアクティビティ接続が中断されました。最後に確認された状態は保持されています。",
+      "recoveryFailed": "エージェントのアクティビティの復旧に失敗しました。最後に確認された状態は保持されています。",
+      "cancelled": "エージェント実行がキャンセルされました。",
+      "terminal": "エージェント実行: {{status}}。",
+      "phase": "エージェント実行フェーズ: {{phase}}。"
+    },
+    "workspace": {
+      "loading": "ワークスペースのインデックスを読み込んでいます…",
+      "error": "ワークスペースを読み込めませんでした。",
+      "retry": "再試行",
+      "viewOnly": "このワークスペースは閲覧専用で、承認されたステータス概要のみが含まれています。",
+      "empty": "公開ワークスペースセクションはありません。",
+      "loadingSection": "セクションを読み込んでいます…",
+      "sectionEmpty": "このセクションには公開エントリがありません。",
+      "omitted": "{{count}} 件のエントリがサーバーによって省略されました。",
+      "loadMore": "さらに読み込む",
+      "sections": {
+        "objective": "目的",
+        "tasks": "タスク",
+        "records": "知見、決定、質問",
+        "submissions": "提出物",
+        "artifacts": "公開済み成果物"
+      },
+      "retention": {
+        "operational": "ターン中のみ",
+        "turn_terminal": "ターンのクリーンアップまで",
+        "chat_lifetime": "チャットの存続期間中"
+      },
+      "visibility": {
+        "owner": "あなたにのみ表示",
+        "participants": "参加者に表示",
+        "public": "公開済み"
+      },
+      "taskState": {
+        "active": "進行中",
+        "blocked": "ブロック中",
+        "submitted": "提出済み",
+        "done": "完了",
+        "omitted": "省略"
+      },
+      "required": "必須",
+      "optional": "任意",
+      "assigned": "割り当て済み",
+      "dependencies": "依存関係 {{count}} 件",
+      "submissionFor": "{{task}} の提出物",
+      "submissionState": {
+        "proposed": "提案済み",
+        "accepted": "承認済み",
+        "rejected": "却下済み",
+        "omitted": "省略"
+      },
+      "agent": "エージェント {{name}}",
+      "published": "公開済み",
+      "notPublished": "未公開",
+      "bytes": "{{count}} バイト",
+      "digest": "ダイジェスト {{digest}}",
+      "recordState": {
+        "active": "有効",
+        "accepted": "承認済み",
+        "omitted": "省略"
+      },
+      "recordKind": {
+        "finding": "知見",
+        "decision": "決定",
+        "question": "質問"
+      }
+    }
   },
   "swipe": {
     "previous": "前のスワイプ",

@@ -1,7 +1,17 @@
 import type { LlmProvider } from "../provider";
 import { COMMON_PARAMS, type ProviderCapabilities } from "../param-schema";
-import { cancelStreamAndCloseConnection, createCooperativeYielder, fetchWithPreflightAbort, readJsonWithAbort, readWithAbort } from "../stream-utils";
-import { getTextContent, type GenerationRequest, type GenerationResponse, type StreamChunk, type ToolCallResult, type LlmMessage, type LlmMessagePart } from "../types";
+import {
+  createBoundedSseReader,
+  ProviderProtocolError,
+  ProviderResponseTooLargeError,
+  PROVIDER_STREAM_LIMITS,
+  fetchWithPreflightAbort,
+  readJsonWithAbort,
+  yieldToEventLoop,
+} from "../stream-utils";
+import { getTextContent, type GenerationRequest, type GenerationResponse, type GenerationUsage, type StreamChunk, type ToolCallResult, type LlmMessage, type LlmMessagePart } from "../types";
+import { parseModelToolArguments } from "../tool-arguments";
+import { AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES } from "../../services/agent-runtime-accounting";
 import { fetchProviderJson, ProviderRequestError, throwProviderResponseError } from "../../utils/provider-errors";
 import {
   appendGoogleSearchTool,
@@ -9,6 +19,142 @@ import {
   GOOGLE_SEARCH_HANDLED_PARAMS,
   GOOGLE_SEARCH_PARAMETERS,
 } from "./google-search";
+
+/**
+ * Delegate provider-controlled arguments to the strict shared parser while
+ * preserving the ToolCallResult carrier type used by both Gemini adapters.
+ */
+function parseGoogleToolArguments(raw: unknown): ToolCallResult["args"] {
+  return parseModelToolArguments(raw) as ToolCallResult["args"];
+}
+
+const GEMINI_OPTIONAL_USAGE_FIELDS = [
+  "cachedContentTokenCount",
+  "toolUsePromptTokenCount",
+  "thoughtsTokenCount",
+] as const;
+
+function readGeminiUsageCount(
+  usage: Record<string, unknown>,
+  field: string,
+  providerName: string,
+): number {
+  const value = usage[field];
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new ProviderProtocolError(`${providerName} usageMetadata.${field} must be a non-negative safe integer`);
+  }
+  return value as number;
+}
+
+/**
+ * Convert Gemini's usageMetadata only after checking all canonical counts and
+ * every optional token-count field that is present. Provider usage is
+ * untrusted wire data and must never be normalized through `|| 0`.
+ */
+export function parseGeminiUsageMetadata(
+  raw: unknown,
+  providerName: string,
+  groundingMetadata?: unknown,
+): GenerationUsage | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ProviderProtocolError(`${providerName} usageMetadata is malformed`);
+  }
+  const usage = raw as Record<string, unknown>;
+  const promptTokens = readGeminiUsageCount(usage, "promptTokenCount", providerName);
+  const completionTokens = readGeminiUsageCount(usage, "candidatesTokenCount", providerName);
+  const totalTokens = readGeminiUsageCount(usage, "totalTokenCount", providerName);
+  for (const field of GEMINI_OPTIONAL_USAGE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(usage, field)) {
+      readGeminiUsageCount(usage, field, providerName);
+    }
+  }
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+    ...(groundingMetadata !== undefined ? { provider_raw: { groundingMetadata } } : {}),
+  };
+}
+/**
+ * Check a complete merged function-call argument object. Streaming providers
+ * often send successive object fragments; checking only each fragment leaves
+ * the merged carrier unbounded.
+ */
+export function assertGeminiFunctionCallArguments(
+  args: Record<string, unknown>,
+  providerName: string,
+): void {
+  const bytes = Buffer.byteLength(JSON.stringify(args), "utf8");
+  if (bytes > PROVIDER_STREAM_LIMITS.maxArgumentsBytes) {
+    throw new ProviderResponseTooLargeError(
+      `${providerName} functionCall arguments exceeded their bounded carrier`,
+      PROVIDER_STREAM_LIMITS.maxArgumentsBytes,
+      bytes,
+    );
+  }
+}
+
+export function mergeGeminiFunctionCallArguments(
+  current: Record<string, unknown>,
+  incoming: Record<string, unknown>,
+  providerName: string,
+): Record<string, unknown> {
+  const merged = { ...current };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (
+      Object.prototype.hasOwnProperty.call(merged, key) &&
+      JSON.stringify(merged[key]) !== JSON.stringify(value)
+    ) {
+      throw new ProviderProtocolError(`${providerName} functionCall arguments changed during streaming`);
+    }
+    Object.defineProperty(merged, key, {
+      configurable: true,
+      enumerable: true,
+      value,
+      writable: true,
+    });
+  }
+  assertGeminiFunctionCallArguments(merged, providerName);
+  return merged;
+}
+
+/**
+ * Count every provider-supplied signature before it is assigned to a call
+ * carrier. Repeated signatures are still charged: otherwise an upstream can
+ * send unbounded signature fragments while each individual assignment looks
+ * harmless.
+ */
+export class GeminiThoughtSignatureAccumulator {
+  private totalBytes = 0;
+
+  private reserve(raw: string, providerName: string, label: string): string {
+    const bytes = Buffer.byteLength(raw, "utf8");
+    const nextBytes = this.totalBytes + bytes;
+    if (!Number.isSafeInteger(nextBytes) || nextBytes > AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES) {
+      throw new ProviderResponseTooLargeError(
+        `${providerName} ${label} exceeded their bounded reasoning carrier`,
+        AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES,
+        nextBytes,
+      );
+    }
+    this.totalBytes = nextBytes;
+    return raw;
+  }
+
+  add(raw: unknown, providerName: string): string | undefined {
+    if (raw === undefined) return undefined;
+    if (typeof raw !== "string") {
+      throw new ProviderProtocolError(`${providerName} thought signature is malformed`);
+    }
+    return this.reserve(raw, providerName, "thought signatures");
+  }
+
+  /** Reserve provider-authored reasoning text before concatenation or yield. */
+  addText(raw: string, providerName: string): string {
+    return this.reserve(raw, providerName, "reasoning text");
+  }
+}
 
 const GEMINI_SCHEMA_FIELDS = new Set(["type","format","title","description","nullable","enum","maxItems","minItems","properties","required","minProperties","maxProperties","minLength","maxLength","pattern","example","anyOf","propertyOrdering","default","items","minimum","maximum"]);
 
@@ -47,6 +193,11 @@ export class GoogleProvider implements LlmProvider {
     supportsStreaming: true,
     apiKeyRequired: true,
     modelListStyle: "google",
+    toolCalling: true,
+    nativeToolContinuation: true,
+    toolContinuationMode: "native",
+    toolsDisabledFinalization: true,
+    supportsToolFinalization: true,
     // Gemini preserves reasoning across tool calls via the opaque
     // `thoughtSignature` attached to each functionCall part. generate()/
     // generateStream() capture it onto ToolCallResult.thought_signature and
@@ -73,42 +224,76 @@ export class GoogleProvider implements LlmProvider {
       body: JSON.stringify(body),
     }, request.signal);
 
-    if (!res.ok) await throwProviderResponseError(this.displayName, "generate", res);
+    if (!res.ok) await throwProviderResponseError(
+      this.displayName,
+      "generate",
+      res,
+      request.signal,
+      request.receiveLimitBytes,
+    );
 
-    const data = await readJsonWithAbort<any>(res, request.signal) as any;
-    const candidate = data.candidates?.[0];
-    const parts = candidate?.content?.parts || [];
-
-    // Separate thinking parts from regular text, and collect function calls
+    const data = await readJsonWithAbort<any>(res, request.signal, request.receiveLimitBytes) as any;
+    if (!data || typeof data !== "object" || !Array.isArray(data.candidates)) {
+      throw new ProviderProtocolError("Gemini response shape is invalid");
+    }
+    const candidate = data.candidates[0];
+    if (!candidate || typeof candidate !== "object") {
+      throw new ProviderProtocolError("Gemini response candidate is missing");
+    }
+    if (!candidate.content || typeof candidate.content !== "object" || !Array.isArray(candidate.content.parts)) {
+      throw new ProviderProtocolError("Gemini response content parts are invalid");
+    }
+    const parts = candidate.content.parts;
     let content = "";
     let reasoning = "";
     const fnCalls: ToolCallResult[] = [];
+    const seenIds = new Set<string>();
+    const thoughtSignatures = new GeminiThoughtSignatureAccumulator();
     for (const p of parts) {
-      if (p.thought) {
-        reasoning += p.text || "";
-      } else if (p.functionCall) {
-        fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
-      } else {
-        content += p.text || "";
+      if (!p || typeof p !== "object") throw new ProviderProtocolError("Gemini response part is malformed");
+      if (p.thought !== undefined && typeof p.thought !== "boolean") {
+        throw new ProviderProtocolError("Gemini thought marker is malformed");
       }
+      if (p.thoughtSignature !== undefined && !p.functionCall) {
+        throw new ProviderProtocolError("Gemini thought signature must accompany a functionCall");
+      }
+      if (p.thought) {
+        if (typeof p.text !== "string") throw new ProviderProtocolError("Gemini reasoning part is malformed");
+        reasoning += thoughtSignatures.addText(p.text, this.displayName);
+      } else if (p.functionCall) {
+        const call = p.functionCall;
+        if (!call || typeof call !== "object" || typeof call.name !== "string" || call.name.length === 0) {
+          throw new ProviderProtocolError("Gemini functionCall is malformed");
+        }
+        if (fnCalls.length >= PROVIDER_STREAM_LIMITS.maxCalls) {
+          throw new ProviderResponseTooLargeError("Gemini call count exceeded its limit", PROVIDER_STREAM_LIMITS.maxCalls, fnCalls.length + 1);
+        }
+        const args = parseGoogleToolArguments(call.args);
+        assertGeminiFunctionCallArguments(args, this.displayName);
+        const thoughtSignature = thoughtSignatures.add(p.thoughtSignature, this.displayName);
+        const callId = typeof call.id === "string" && call.id.length > 0 ? call.id : crypto.randomUUID();
+        if (seenIds.has(callId)) throw new ProviderProtocolError("Gemini native tool call IDs must be unique");
+        seenIds.add(callId);
+        fnCalls.push({ name: call.name, args, call_id: callId, thought_signature: thoughtSignature });
+      } else if (typeof p.text === "string") {
+        content += p.text;
+      } else if (p.text !== undefined) {
+        throw new ProviderProtocolError("Gemini text part is malformed");
+      }
+    }
+    if (candidate.finishReason !== undefined && typeof candidate.finishReason !== "string") {
+      throw new ProviderProtocolError("Gemini finishReason must be a string");
     }
 
     const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
-    const groundingMetadata = candidate?.groundingMetadata ?? data.groundingMetadata;
+    const groundingMetadata = candidate.groundingMetadata ?? data.groundingMetadata;
 
     return {
       content,
       reasoning: reasoning || undefined,
       finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
       tool_calls: toolCalls,
-      usage: data.usageMetadata
-        ? {
-            prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-            completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-            total_tokens: data.usageMetadata.totalTokenCount || 0,
-            ...(groundingMetadata ? { provider_raw: { groundingMetadata } } : {}),
-          }
-        : undefined,
+      usage: parseGeminiUsageMetadata(data.usageMetadata, this.displayName, groundingMetadata),
     };
   }
 
@@ -126,80 +311,168 @@ export class GoogleProvider implements LlmProvider {
       body: JSON.stringify(body),
     }, request.signal);
 
-    if (!res.ok) await throwProviderResponseError(this.displayName, "stream", res);
+    if (!res.ok) await throwProviderResponseError(
+      this.displayName,
+      "stream",
+      res,
+      request.signal,
+      request.receiveLimitBytes,
+    );
 
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    const maybeYield = createCooperativeYielder(64, request.signal);
+    const sse = createBoundedSseReader(res, request.signal, {
+      maxResponseBytes: request.receiveLimitBytes,
+    });
+    const toolCallBuffer = new Map<number, {
+      name: string;
+      args: ToolCallResult["args"];
+      callId: string;
+      thoughtSignature?: string;
+    }>();
+    let eventCount = 0;
+    const seenNativeIds = new Set<string>();
+    let lastNewToolIndex = -1;
+    const thoughtSignatures = new GeminiThoughtSignatureAccumulator();
 
-    let streamDoneNaturally = false;
-    try {
-    while (true) {
-      const { done, value } = await readWithAbort(reader, request.signal);
-      if (done) { streamDoneNaturally = !request.signal?.aborted; break; }
+    for await (const event of sse) {
+      if (request.signal?.aborted) {
+        throw request.signal.reason ?? new DOMException("Aborted", "AbortError");
+      }
+      eventCount += 1;
+      if (eventCount % 64 === 0) await yieldToEventLoop(request.signal);
+      let data: any;
+      try {
+        data = JSON.parse(event.data);
+      } catch (error) {
+        throw new ProviderProtocolError("Malformed Gemini SSE JSON", { cause: error });
+      }
+      if (event.event !== undefined && event.event !== "message") {
+        throw new ProviderProtocolError("Gemini SSE event name does not match its payload");
+      }
+      if (!data || typeof data !== "object" || !Array.isArray(data.candidates)) {
+        throw new ProviderProtocolError("Gemini SSE payload is malformed");
+      }
+      const candidate = data.candidates[0];
+      if (!candidate || typeof candidate !== "object") {
+        throw new ProviderProtocolError("Gemini SSE candidate is missing");
+      }
+      const parts = candidate.content?.parts;
+      if (parts !== undefined && !Array.isArray(parts)) {
+        throw new ProviderProtocolError("Gemini SSE candidate parts must be an array");
+      }
+      let text = "";
+      let reasoning = "";
+      for (let partIndex = 0; partIndex < (parts?.length ?? 0); partIndex += 1) {
+        const part = parts[partIndex];
+        if (!part || typeof part !== "object") throw new ProviderProtocolError("Gemini SSE part is malformed");
+        if (part.thought !== undefined && typeof part.thought !== "boolean") {
+          throw new ProviderProtocolError("Gemini thought marker is malformed");
+        }
+        if (part.thoughtSignature !== undefined && !part.functionCall) {
+          throw new ProviderProtocolError("Gemini thought signature must accompany a functionCall");
+        }
+        if (part.thought) {
+          if (typeof part.text !== "string") throw new ProviderProtocolError("Gemini reasoning part is malformed");
+          reasoning += thoughtSignatures.addText(part.text, this.displayName);
+        } else if (part.functionCall) {
+          const call = part.functionCall;
+          if (!call || typeof call !== "object" || typeof call.name !== "string" || call.name.length === 0) {
+            throw new ProviderProtocolError("Gemini functionCall is malformed");
+          }
+          if (call.id !== undefined && (typeof call.id !== "string" || call.id.length === 0)) {
+            throw new ProviderProtocolError("Gemini functionCall ID is malformed");
+          }
+          const existing = toolCallBuffer.get(partIndex);
+          if (!existing && partIndex <= lastNewToolIndex) {
+            throw new ProviderProtocolError("Gemini functionCall parts arrived out of order");
+          }
+          let parsedArgs: ToolCallResult["args"] | undefined;
+          if (call.args !== undefined) {
+            if (!call.args || typeof call.args !== "object" || Array.isArray(call.args)) {
+              throw new ProviderProtocolError("Gemini functionCall args must be an object");
+            }
+            parsedArgs = parseGoogleToolArguments(call.args);
+            assertGeminiFunctionCallArguments(parsedArgs, this.displayName);
+          } else if (!existing) {
+            throw new ProviderProtocolError("Gemini functionCall is missing arguments");
+          }
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        await maybeYield();
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-
-        try {
-          const data = JSON.parse(trimmed.slice(6));
-          const candidate = data.candidates?.[0];
-          const parts = candidate?.content?.parts || [];
-          const finishReason = candidate?.finishReason;
-
-          // Separate thinking parts (thought: true) from regular text parts, and collect function calls
-          let text = "";
-          let reasoning = "";
-          const fnCalls: ToolCallResult[] = [];
-          for (const p of parts) {
-            if (p.thought) {
-              reasoning += p.text || "";
-            } else if (p.functionCall) {
-              fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
-            } else {
-              text += p.text || "";
+          if (!existing) {
+            if (toolCallBuffer.size >= PROVIDER_STREAM_LIMITS.maxCalls) {
+              throw new ProviderResponseTooLargeError(
+                "Gemini call count exceeded its limit",
+                PROVIDER_STREAM_LIMITS.maxCalls,
+                toolCallBuffer.size + 1,
+              );
+            }
+            const callId = call.id ?? crypto.randomUUID();
+            if (seenNativeIds.has(callId)) {
+              throw new ProviderProtocolError("Gemini native tool call IDs must be unique");
+            }
+            const thoughtSignature = thoughtSignatures.add(part.thoughtSignature, this.displayName);
+            seenNativeIds.add(callId);
+            lastNewToolIndex = partIndex;
+            toolCallBuffer.set(partIndex, {
+              name: call.name,
+              args: parsedArgs ?? {},
+              callId,
+              thoughtSignature,
+            });
+          } else {
+            if (call.id !== undefined && call.id !== existing.callId) {
+              throw new ProviderProtocolError("Gemini functionCall ID changed during streaming");
+            }
+            if (call.name !== existing.name) {
+              throw new ProviderProtocolError("Gemini functionCall name changed during streaming");
+            }
+            if (parsedArgs) {
+              existing.args = mergeGeminiFunctionCallArguments(existing.args, parsedArgs, this.displayName);
+            }
+            const thoughtSignature = thoughtSignatures.add(part.thoughtSignature, this.displayName);
+            if (thoughtSignature !== undefined) {
+              if (existing.thoughtSignature && existing.thoughtSignature !== thoughtSignature) {
+                throw new ProviderProtocolError("Gemini thought signature changed during streaming");
+              }
+              existing.thoughtSignature = thoughtSignature;
             }
           }
-
-          // Capture usage metadata (Google includes it in the final streaming chunk)
-          const usage = data.usageMetadata
-            ? {
-                prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-                completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-                total_tokens: data.usageMetadata.totalTokenCount || 0,
-                ...((candidate?.groundingMetadata ?? data.groundingMetadata)
-                  ? { provider_raw: { groundingMetadata: candidate?.groundingMetadata ?? data.groundingMetadata } }
-                  : {}),
-              }
-            : undefined;
-
-          const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
-
-          if (text || reasoning || toolCalls) {
-            yield {
-              token: text,
-              reasoning: reasoning || undefined,
-              finish_reason: toolCalls ? "tool_calls" : (finishReason === "STOP" ? "stop" : undefined),
-              tool_calls: toolCalls,
-              usage,
-            };
-          } else if (finishReason || usage) {
-            yield { token: "", finish_reason: finishReason === "STOP" ? "stop" : (finishReason || undefined), usage };
-          }
-        } catch {
-          // Skip malformed SSE lines
+        } else if (typeof part.text === "string") {
+          text += part.text;
+        } else if (part.text !== undefined) {
+          throw new ProviderProtocolError("Gemini text part is malformed");
         }
       }
-    }
-    } finally {
-      if (!streamDoneNaturally) await cancelStreamAndCloseConnection(reader, res);
+
+      const groundingMetadata = candidate.groundingMetadata ?? data.groundingMetadata;
+      const usage = parseGeminiUsageMetadata(data.usageMetadata, this.displayName, groundingMetadata);
+      const finishReason = candidate.finishReason;
+      if (finishReason !== undefined && finishReason !== null && typeof finishReason !== "string") {
+        throw new ProviderProtocolError("Gemini finishReason must be a string");
+      }
+      const toolCalls = toolCallBuffer.size > 0
+        ? [...toolCallBuffer.entries()]
+          .sort(([a], [b]) => a - b)
+          .map(([, call]) => ({
+            name: call.name,
+            args: call.args,
+            call_id: call.callId,
+            thought_signature: call.thoughtSignature,
+          }))
+        : undefined;
+
+      if (finishReason) {
+        sse.markTerminal();
+        yield {
+          token: text,
+          reasoning: reasoning || undefined,
+          finish_reason: toolCalls ? "tool_calls" : finishReason,
+          tool_calls: toolCalls,
+          usage,
+        };
+      } else if (text || reasoning || usage) {
+        yield { token: text, reasoning: reasoning || undefined, usage };
+      } else if (toolCalls) {
+        yield { token: "", tool_calls: toolCalls };
+      }
     }
   }
 
@@ -242,11 +515,14 @@ export class GoogleProvider implements LlmProvider {
         case "tool_use":
           return { functionCall: { name: part.name, args: part.input }, thoughtSignature: part.thought_signature || "context_engineering_is_the_way_to_go" };
         case "tool_result": {
+          const name = toolNameById.get(part.tool_use_id);
+          if (!name) {
+            throw new ProviderProtocolError("Gemini tool result references an unknown tool call");
+          }
           let payload: unknown = part.content;
           try { payload = JSON.parse(part.content); } catch { /* keep as string */ }
           const key = part.is_error ? "error" : "output";
           const response: Record<string, unknown> = { [key]: payload };
-          const name = toolNameById.get(part.tool_use_id) ?? "tool";
           return { functionResponse: { name, response } };
         }
         default:
@@ -266,8 +542,15 @@ export class GoogleProvider implements LlmProvider {
     return map;
   }
 
-  /** Keys that are internal to Lumiverse and should never be sent to any provider API. */
-  private static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "_streaming"]);
+  /** Keys that are internal to Lumiverse and should never be sent to APIs. */
+  private static readonly INTERNAL_PARAMS = new Set([
+    "max_context_length", "_include_usage", "_streaming",
+  ]);
+  /** Tool controls are scrubbed only for host-owned feature modes. */
+  private static readonly TOOL_CONTROL_PARAMS = new Set([
+    "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call",
+    "plugins", "web_search", "google_search", "enable_web_search", "enableSearch",
+  ]);
 
   /** Keys explicitly handled by Google's buildBody — excluded from passthrough. */
   private static readonly HANDLED_PARAMS = new Set([
@@ -338,6 +621,7 @@ export class GoogleProvider implements LlmProvider {
       if (body[key] !== undefined) continue;          // already set (e.g. generationConfig)
       if (GoogleProvider.HANDLED_PARAMS.has(key)) continue;
       if (GoogleProvider.INTERNAL_PARAMS.has(key)) continue;
+      if (request.toolMode && GoogleProvider.TOOL_CONTROL_PARAMS.has(key)) continue;
       body[key] = params[key];
     }
 
@@ -353,8 +637,23 @@ export class GoogleProvider implements LlmProvider {
       ];
     }
 
-    // Inline council tools: pass as Google function calling format
-    if (hasFunctionDeclarations) {
+    if (request.toolMode === "finalization") {
+      delete body.tools;
+      body.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    } else if (request.toolMode === "ordinary") {
+      if (hasFunctionDeclarations) {
+        body.tools = [{
+          functionDeclarations: functionTools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            parameters: sanitizeGeminiSchema(t.parameters),
+          })),
+        }];
+      } else {
+        delete body.tools;
+        body.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+      }
+    } else if (hasFunctionDeclarations) {
       body.tools = [{
         functionDeclarations: functionTools.map((t) => ({
           name: t.name,
@@ -364,7 +663,6 @@ export class GoogleProvider implements LlmProvider {
       }];
     } else {
       // Insert dummy thought signature on model parts when tools are NOT in use.
-      // This bypasses Google's thought signature validator for non-tool contexts.
       for (const entry of body.contents) {
         if (entry.role === "model") {
           for (const part of entry.parts) {
@@ -374,7 +672,7 @@ export class GoogleProvider implements LlmProvider {
       }
     }
 
-    appendGoogleSearchTool(this.name, body, googleSearchTool);
+    if (!request.toolMode) appendGoogleSearchTool(this.name, body, googleSearchTool);
 
     return body;
   }

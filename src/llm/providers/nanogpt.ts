@@ -21,5 +21,10 @@ export class NanoGPTProvider extends OpenAICompatibleProvider {
     supportsStreaming: true,
     apiKeyRequired: true,
     modelListStyle: "openai",
+    toolCalling: true,
+    nativeToolContinuation: false,
+    toolContinuationMode: "legacy",
+    toolsDisabledFinalization: true,
+    supportsToolFinalization: true,
   };
 }

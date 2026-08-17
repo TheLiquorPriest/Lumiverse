@@ -64,6 +64,8 @@ import { notificationSoundsRoutes } from "./routes/notification-sounds.routes";
 import { bootstrapRoutes } from "./routes/bootstrap.routes";
 import { userDataRoutes } from "./routes/user-data.routes";
 import { streamDeckIntegrationRoutes, streamDeckManagementRoutes } from "./routes/stream-deck.routes";
+import { agentRunsRoutes } from "./routes/agent-runs.routes";
+import { agentContextPacksRoutes } from "./routes/agent-context-packs.routes";
 import { wsHandler } from "./ws/handler";
 import { issueTicket } from "./ws/tickets";
 import { rateLimit } from "./middleware/rate-limit";
@@ -430,14 +432,19 @@ if (error) {
 
 // Image gen results — unauthenticated, public access for push notifications and embeds
 app.get("/api/v1/image-gen/results/:id", async (c) => {
-  const { getImageFilePathPublic } = await import("./services/images.service");
+  const { getPublicImageFile } = await import("./services/images.service");
   const id = c.req.param("id");
   const size = c.req.query("size") as "sm" | "lg" | undefined;
   const tier = size === "sm" || size === "lg" ? size : undefined;
-  const filepath = await getImageFilePathPublic(id, tier);
-  if (!filepath) return c.json({ error: "Not found" }, 404);
-  const response = new Response(Bun.file(filepath));
-  response.headers.set("Cache-Control", "public, max-age=86400");
+  const publicFile = await getPublicImageFile(id, tier);
+  if (!publicFile) return c.json({ error: "Not found" }, 404);
+  const response = new Response(Bun.file(publicFile.filepath), {
+    headers: {
+      "Cache-Control": "public, max-age=86400",
+      "Content-Type": publicFile.contentType,
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
   return response;
 });
 
@@ -515,6 +522,8 @@ app.route("/api/v1/web-search", webSearchRoutes);
 app.route("/api/v1/global-addons", globalAddonsRoutes);
 app.route("/api/v1/bootstrap", bootstrapRoutes);
 app.route("/api/v1/user-data", userDataRoutes);
+app.route("/api/v1/agent-runs", agentRunsRoutes);
+app.route("/api/v1/context-packs", agentContextPacksRoutes);
 app.route("/api/v1/stream-deck", streamDeckManagementRoutes);
 
 // Issue single-use WS tickets (behind auth middleware)

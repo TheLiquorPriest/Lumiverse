@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { JSDOM } from 'jsdom'
 import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
@@ -32,6 +32,7 @@ const tokenizersApiMock = {
     pendingCounts.push(deferred)
     return deferred.promise
   },
+  testPattern: async () => ({ matched: false, tokenizer_id: null, tokenizer_name: null }),
 }
 
 function createDeferred<T>(): Deferred<T> {
@@ -44,8 +45,6 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject }
 }
 
-mock.module('@/store', () => ({ useStore: useStoreMock }))
-mock.module('@/api/tokenizers', () => ({ tokenizersApi: tokenizersApiMock }))
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/', pretendToBeVisual: true })
 const globalObject = globalThis as unknown as Record<string, unknown>
@@ -98,8 +97,10 @@ const {
   TOKEN_COUNT_MODEL_EXTENSION,
 } = await import('@/lib/storedTokenCount')
 const { fnv1a32 } = await import('@/lib/tokenCountCache')
-mock.restore()
 
+beforeEach(() => {
+  resetTokenCountRuntime(tokenizersApiMock)
+})
 type HookOptions = {
   entryId?: string
   content: string
@@ -121,8 +122,8 @@ const mountedRoots = new Set<Root>()
 
 /* eslint-disable react-compiler/react-compiler */
 function HookHarness({ options }: { options: HookOptions }) {
-  activeModel = useActiveTokenizerModel()
-  hookSurface = useTokenCounts(options) as HookSurface
+  activeModel = useActiveTokenizerModel(useStoreMock)
+  hookSurface = useTokenCounts(options, { store: useStoreMock }) as HookSurface
   return null
 }
 /* eslint-enable react-compiler/react-compiler */

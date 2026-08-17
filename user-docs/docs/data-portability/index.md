@@ -67,4 +67,7 @@ These never leave your instance:
 The panel has two cards: **Export your data** and **Import an archive**.
 
 !!! tip "Archives are forever"
-    Archives never expire and have no time-bound license. You can store a `.lvbak` for years and restore it into any compatible Lumiverse instance. The same applies to decryption tickets — they have no TTL.
+    Archives never expire and have no time-bound license. You can store a
+    `.lvbak` for years and restore it into any compatible Lumiverse instance.
+    Decryption tickets are different: they expire after 24 hours and are
+    one-use capabilities.

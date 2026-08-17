@@ -314,7 +314,8 @@ async function executeMemberTools(
             mcpMatch!.serverId,
             mcpMatch!.toolName,
             plannedArgs,
-            settings.toolsSettings.timeoutMs
+            settings.toolsSettings.timeoutMs,
+            input.signal,
           );
         } else if (execution === "extension") {
           // Pass the bare tool name (not qualified) so extension handlers can
@@ -338,7 +339,6 @@ async function executeMemberTools(
               return `${prefix}${typeof m.content === "string" ? m.content : ""}`;
             })
             .join("\n\n");
-
           content = await invokeExtensionCouncilTool(
             extToolReg!.extension_id,
             bareToolName,
@@ -351,7 +351,8 @@ async function executeMemberTools(
             },
             settings.toolsSettings.timeoutMs,
             memberContext,
-            contextMessages
+            contextMessages,
+            input.signal,
           );
         } else if (execution === "host") {
           const plannedArgs = await planCallableToolArgs(

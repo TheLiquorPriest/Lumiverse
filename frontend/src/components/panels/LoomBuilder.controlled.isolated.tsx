@@ -1,8 +1,7 @@
 import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test'
 import { JSDOM } from 'jsdom'
-import { act, createElement, type ReactNode } from 'react'
-import { createRoot, type Root } from 'react-dom/client'
-import { flushSync } from 'react-dom'
+import type { ReactNode } from 'react'
+import type { Root } from 'react-dom/client'
 import type { PromptBlock, PromptVariableDef, PromptVariableValues } from '@/lib/loom/types'
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
@@ -52,14 +51,57 @@ Object.assign(globalThis, {
   cancelAnimationFrame: domWindow.cancelAnimationFrame.bind(domWindow),
 })
 
+const { act, createElement, useEffect, useState } = await import('react')
+const { createRoot } = await import('react-dom/client')
+const { flushSync } = await import('react-dom')
+
 const NullComponent = () => null
 const translation = (key: string) => key
 let resolverCalls = 0
 const resolverRequests: Array<Record<string, unknown>> = []
 const mountedRoots = new Set<Root>()
+let agentPanelMountCount = 0
+let agentPanelUnmountCount = 0
+let agentPanelForceDirty = false
+const toastRequests: Array<{ type: string; message: string }> = []
 const MockToggle = Object.assign(NullComponent, {
   Checkbox: ({ label }: { label?: ReactNode }) => createElement('label', null, label),
 })
+function MockAgenticRuntimePanel({ onDirtyChange }: { onDirtyChange: (dirty: boolean) => void }) {
+  const [draft, setDraft] = useState('')
+  useEffect(() => {
+    agentPanelMountCount += 1
+    if (agentPanelForceDirty) onDirtyChange(true)
+    return () => {
+      agentPanelUnmountCount += 1
+      onDirtyChange(false)
+    }
+  }, [onDirtyChange])
+  const updateDraft = (event: { currentTarget: { value: string } }) => {
+    setDraft(event.currentTarget.value)
+    onDirtyChange(true)
+  }
+  return createElement(
+    'div',
+    null,
+    createElement('input', {
+      'aria-label': 'agent-config-draft',
+      value: draft,
+      onInput: updateDraft,
+      onChange: updateDraft,
+    }),
+    createElement('button', {
+      type: 'button',
+      'data-testid': 'agent-config-mark-dirty',
+      onClick: () => onDirtyChange(true),
+    }, 'mark dirty'),
+    createElement('button', {
+      type: 'button',
+      'data-testid': 'agent-config-clear-dirty',
+      onClick: () => onDirtyChange(false),
+    }, 'clear dirty'),
+  )
+}
 
 
 const mainLoomState: Record<string, unknown> = {}
@@ -70,7 +112,9 @@ const mainPresetProfilesState = {
 const mainStoreState = {
   presetEditorTabs: [],
   presetEditorToolbarItems: [],
-  addToast: () => {},
+  addToast: (toast: { type: string; message: string }) => {
+    toastRequests.push(toast)
+  },
   activeChatId: null,
   activeCharacterId: null,
   activePersonaId: 'preview-persona',
@@ -145,7 +189,11 @@ mock.module('@/components/shared/ExpandedTextEditor', () => ({
   default: NullComponent,
   ExpandableTextarea: NullComponent,
 }))
-mock.module('@/components/shared/ModalShell', () => ({ ModalShell: NullComponent }))
+mock.module('@/components/shared/ModalShell', () => ({
+  ModalShell: ({ isOpen, children }: { isOpen: boolean; children?: ReactNode }) => (
+    isOpen ? createElement('div', { 'data-testid': 'modal-shell' }, children) : null
+  ),
+}))
 mock.module('@/components/shared/RangeSlider', () => ({
   RangeSlider: NullComponent,
   LabeledRangeSlider: NullComponent,
@@ -180,7 +228,11 @@ const MockVariablesEditor = ({
   }),
 )
 mock.module('./PromptVariablesEditor', () => ({ VariablesEditor: MockVariablesEditor }))
-mock.module('@/components/shared/ConfirmationModal', () => ({ default: NullComponent }))
+mock.module('@/components/shared/ConfirmationModal', () => ({
+  default: ({ isOpen, title }: { isOpen: boolean; title?: string }) => (
+    isOpen ? createElement('div', { 'data-testid': 'confirmation-modal' }, title) : null
+  ),
+}))
 mock.module('@/components/shared/NumberStepper', () => ({ default: NullComponent }))
 mock.module('@/components/shared/PanelFadeIn', () => ({
   default: ({ children }: { children?: ReactNode }) => children ?? null,
@@ -189,6 +241,7 @@ mock.module('@/components/shared/Toggle', () => ({ Toggle: MockToggle }))
 mock.module('@/lib/toast', () => ({ toast: {} }))
 mock.module('@/components/spindle/SpindlePresetEditorTabContent', () => ({ default: NullComponent }))
 mock.module('@/components/spindle/SpindlePresetEditorToolbarItem', () => ({ default: NullComponent }))
+mock.module('./AgenticRuntimePanel', () => ({ default: MockAgenticRuntimePanel }))
 mock.module('./LoomBuilder.module.css', () => ({ default: {} }))
 
 // A static import would evaluate LoomBuilder before Bun installs the dependency mocks above.
@@ -409,6 +462,10 @@ afterEach(() => {
   document.body.replaceChildren()
   resolverCalls = 0
   resolverRequests.length = 0
+  agentPanelMountCount = 0
+  agentPanelUnmountCount = 0
+  agentPanelForceDirty = false
+  toastRequests.length = 0
 })
 afterAll(async () => {
   await act(async () => {})
@@ -508,6 +565,224 @@ describe('controlled Loom editor trust boundary', () => {
     flushSync(() => editButton!.click())
     expect(container.textContent).toContain('blockEditor.preview')
     expect(container.textContent).toContain('blockEditor.sealedBlockTitle')
+    unmountRoot(root)
+  })
+
+  test('keeps the Agents & Tools draft mounted and guards dirty outer tab switches', () => {
+    configureMainLoomState()
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    flushSync(() => root.render(createElement(LoomBuilder, { compact: true })))
+    mountedRoots.add(root)
+
+    const runtimeTab = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'editorTabs.agenticRuntime')
+    const presetTab = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'editorTabs.preset')
+    expect(runtimeTab).toBeDefined()
+    expect(presetTab).toBeDefined()
+    flushSync(() => runtimeTab!.click())
+
+    const draftInput = container.querySelector<HTMLInputElement>('input[aria-label="agent-config-draft"]')
+    expect(draftInput).not.toBeNull()
+    const valueSetter = Object.getOwnPropertyDescriptor(domWindow.HTMLInputElement.prototype, 'value')!.set!
+    flushSync(() => {
+      valueSetter.call(draftInput, 'Unsaved profile prompt')
+      draftInput!.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+    })
+
+    flushSync(() => presetTab!.click())
+    expect(runtimeTab?.getAttribute('aria-selected')).toBe('true')
+    expect(toastRequests.at(-1)).toEqual({
+      type: 'warning',
+      message: 'agenticRuntime.navigation.saveBeforePresetAction',
+    })
+    expect(draftInput?.value).toBe('Unsaved profile prompt')
+    expect(draftInput?.closest<HTMLElement>('[role="tabpanel"]')?.hidden).toBe(false)
+
+    mainLoomState.activePreset = {
+      ...(mainLoomState.activePreset as Record<string, unknown>),
+      cacheRevision: 2,
+    }
+    flushSync(() => root.render(createElement(LoomBuilder, { compact: true })))
+    expect(draftInput?.value).toBe('Unsaved profile prompt')
+    expect(agentPanelMountCount).toBe(1)
+
+    flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="agent-config-clear-dirty"]')!.click())
+    flushSync(() => presetTab!.click())
+    expect(presetTab?.getAttribute('aria-selected')).toBe('true')
+    expect(draftInput?.closest<HTMLElement>('[role="tabpanel"]')?.hidden).toBe(true)
+    flushSync(() => runtimeTab!.click())
+    expect(draftInput?.value).toBe('Unsaved profile prompt')
+    expect(agentPanelMountCount).toBe(1)
+
+    const tabs = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+    expect(tabs).toHaveLength(2)
+    expect(tabs.every((tab) => tab.id && tab.getAttribute('aria-controls'))).toBe(true)
+    for (const tab of tabs) {
+      const panel = container.querySelector<HTMLElement>(`#${tab.getAttribute('aria-controls')}`)
+      expect(panel).not.toBeNull()
+      expect(panel?.getAttribute('aria-labelledby')).toBe(tab.id)
+    }
+    const activeTab = tabs.find((tab) => tab.getAttribute('aria-selected') === 'true')
+    expect(activeTab?.tabIndex).toBe(0)
+    const inactiveTab = tabs.find((tab) => tab !== activeTab)
+    expect(inactiveTab?.tabIndex).toBe(-1)
+    flushSync(() => {
+      inactiveTab!.focus()
+      inactiveTab!.dispatchEvent(new domWindow.KeyboardEvent('keydown', { key: 'Home', bubbles: true }))
+    })
+    expect(document.activeElement).toBe(tabs[0])
+    flushSync(() => tabs[0]!.dispatchEvent(new domWindow.KeyboardEvent('keydown', { key: 'End', bubbles: true })))
+    expect(document.activeElement).toBe(tabs[1])
+    expect(tabs[1]?.getAttribute('aria-selected')).toBe('true')
+
+    unmountRoot(root)
+    expect(agentPanelUnmountCount).toBe(1)
+  })
+
+  test('blocks preset replacement and portable actions while the agent draft is dirty', () => {
+    configureMainLoomState()
+    let selectCalls = 0
+    let createCalls = 0
+    let duplicateCalls = 0
+    let deleteCalls = 0
+    let exportCalls = 0
+    let legacyExportCalls = 0
+    Object.assign(mainLoomState, {
+      registry: {
+        'main-preset': { name: 'Main preset', blockCount: 1 },
+        'other-preset': { name: 'Other preset', blockCount: 0 },
+      },
+      selectPreset: () => { selectCalls += 1 },
+      createPreset: () => { createCalls += 1 },
+      duplicatePreset: () => { duplicateCalls += 1 },
+      deletePreset: () => { deleteCalls += 1 },
+      exportInternal: () => {
+        exportCalls += 1
+        return null
+      },
+      exportLegacy: () => {
+        legacyExportCalls += 1
+        return null
+      },
+    })
+
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    flushSync(() => root.render(createElement(LoomBuilder, { compact: true })))
+    mountedRoots.add(root)
+
+    const buttonWithText = (text: string): HTMLButtonElement => {
+      const button = [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((candidate) => candidate.textContent === text)
+      expect(button).toBeDefined()
+      return button!
+    }
+    const openPresetMenu = () => {
+      const menuButton = container.querySelector<HTMLButtonElement>('button[title="preset.moreOptions"]')
+      expect(menuButton).not.toBeNull()
+      flushSync(() => menuButton!.click())
+    }
+    const clearDirty = () => {
+      flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="agent-config-clear-dirty"]')!.click())
+    }
+    const markDirty = () => {
+      flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="agent-config-mark-dirty"]')!.click())
+    }
+    const returnToPresetTab = () => {
+      clearDirty()
+      flushSync(() => buttonWithText('editorTabs.preset').click())
+    }
+    const prepareBlockedAction = () => {
+      returnToPresetTab()
+      markDirty()
+    }
+    const expectBlockedAndReturned = () => {
+      expect(buttonWithText('editorTabs.agenticRuntime').getAttribute('aria-selected')).toBe('true')
+      expect(toastRequests.at(-1)).toEqual({
+        type: 'warning',
+        message: 'agenticRuntime.navigation.saveBeforePresetAction',
+      })
+    }
+
+    flushSync(() => buttonWithText('editorTabs.agenticRuntime').click())
+    const draftInput = container.querySelector<HTMLInputElement>('input[aria-label="agent-config-draft"]')!
+    const valueSetter = Object.getOwnPropertyDescriptor(domWindow.HTMLInputElement.prototype, 'value')!.set!
+    flushSync(() => {
+      valueSetter.call(draftInput, 'Dirty draft')
+      draftInput.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+    })
+
+    returnToPresetTab()
+    markDirty()
+    const presetSelect = container.querySelector<HTMLSelectElement>('select')
+    expect(presetSelect).not.toBeNull()
+    const selectValueSetter = Object.getOwnPropertyDescriptor(
+      domWindow.HTMLSelectElement.prototype,
+      'value',
+    )!.set!
+    flushSync(() => {
+      selectValueSetter.call(presetSelect, 'other-preset')
+      presetSelect!.dispatchEvent(new domWindow.Event('change', { bubbles: true }))
+    })
+    expect(selectCalls).toBe(0)
+    expectBlockedAndReturned()
+
+    prepareBlockedAction()
+    openPresetMenu()
+    flushSync(() => buttonWithText('preset.newPreset').click())
+    const nameInput = container.querySelector<HTMLInputElement>('input[placeholder="preset.namePlaceholder"]')
+    expect(nameInput).not.toBeNull()
+    flushSync(() => {
+      valueSetter.call(nameInput, 'Blocked preset')
+      nameInput!.dispatchEvent(new domWindow.Event('input', { bubbles: true }))
+      nameInput!.dispatchEvent(new domWindow.Event('change', { bubbles: true }))
+    })
+    flushSync(() => buttonWithText('preset.create').click())
+    expect(createCalls).toBe(0)
+    expectBlockedAndReturned()
+
+    prepareBlockedAction()
+    openPresetMenu()
+    flushSync(() => buttonWithText('preset.duplicate').click())
+    expect(duplicateCalls).toBe(0)
+    expectBlockedAndReturned()
+
+    prepareBlockedAction()
+    openPresetMenu()
+    flushSync(() => buttonWithText('actions.delete').click())
+    expect(deleteCalls).toBe(0)
+    expect(container.querySelector('[data-testid="confirmation-modal"]')).toBeNull()
+    expectBlockedAndReturned()
+
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')
+    expect(fileInput).not.toBeNull()
+    let filePickerClicks = 0
+    fileInput?.addEventListener('click', () => { filePickerClicks += 1 })
+    prepareBlockedAction()
+    openPresetMenu()
+    flushSync(() => buttonWithText('preset.importLoomJson').click())
+    expect(filePickerClicks).toBe(0)
+    expectBlockedAndReturned()
+
+    prepareBlockedAction()
+    openPresetMenu()
+    flushSync(() => buttonWithText('preset.exportLoomJson').click())
+    expect(exportCalls).toBe(0)
+    expectBlockedAndReturned()
+
+    prepareBlockedAction()
+    openPresetMenu()
+    flushSync(() => buttonWithText('preset.exportLegacy').click())
+    expect(legacyExportCalls).toBe(0)
+    expect(container.querySelector('[data-testid="confirmation-modal"]')).toBeNull()
+    expectBlockedAndReturned()
+
+    expect(draftInput.value).toBe('Dirty draft')
+    expect(agentPanelMountCount).toBe(1)
     unmountRoot(root)
   })
 

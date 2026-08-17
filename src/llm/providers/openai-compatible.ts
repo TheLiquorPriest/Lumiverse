@@ -1,7 +1,25 @@
 import type { LlmProvider } from "../provider";
 import type { ProviderCapabilities } from "../param-schema";
-import { cancelStreamAndCloseConnection, fetchWithPreflightAbort, readJsonWithAbort, readWithAbort, yieldToEventLoop } from "../stream-utils";
-import type { GenerationRequest, GenerationResponse, StreamChunk, ToolCallResult, LlmMessage, LlmMessagePart } from "../types";
+import {
+  createBoundedSseReader,
+  ProviderProtocolError,
+  ProviderResponseTooLargeError,
+  PROVIDER_STREAM_LIMITS,
+  readJsonWithAbort,
+  yieldToEventLoop,
+  fetchWithPreflightAbort,
+} from "../stream-utils";
+import type {
+  GenerationRequest,
+  GenerationResponse,
+  GenerationUsage,
+  StreamChunk,
+  ToolCallResult,
+  LlmMessage,
+  LlmMessagePart,
+} from "../types";
+import { parseModelToolArguments } from "../tool-arguments";
+import { AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES } from "../../services/agent-runtime-accounting";
 import { fetchProviderJson, ProviderRequestError, throwProviderResponseError } from "../../utils/provider-errors";
 
 const GENERATE_OPERATION = "generate";
@@ -16,42 +34,242 @@ const REASONING_DETAIL_APPEND_FIELDS = new Set([
   "signature",
 ]);
 
-/**
- * Accumulates OpenRouter `reasoning_details` deltas streamed across chunks into
- * a single ordered array. OpenRouter sends each reasoning block as it becomes
- * available; the complete sequence is rebuilt by concatenating the streamable
- * text fields per block `index` while preserving block metadata. The result is
- * replayed verbatim on the assistant message to keep chain-of-thought intact
- * across tool calls (interleaved thinking). Opaque otherwise.
- */
+function usageRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ProviderProtocolError(`${label} usage must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function usageCount(record: Record<string, unknown>, key: string, label: string): number {
+  const value = record[key];
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new ProviderProtocolError(`${label} usage ${key} must be a finite nonnegative safe integer`);
+  }
+  return value as number;
+}
+
+/** Validate the canonical Chat Completions usage shape before forwarding it. */
+export function parseOpenAIUsage(
+  value: unknown,
+  allowStreamingNull = false,
+): GenerationUsage | undefined {
+  if (value === undefined) return undefined;
+  if (value === null && allowStreamingNull) return undefined;
+  const record = usageRecord(value, "OpenAI");
+  const promptTokens = usageCount(record, "prompt_tokens", "OpenAI");
+  const completionTokens = usageCount(record, "completion_tokens", "OpenAI");
+  const totalTokens = usageCount(record, "total_tokens", "OpenAI");
+  if (promptTokens > Number.MAX_SAFE_INTEGER - completionTokens) {
+    throw new ProviderProtocolError("OpenAI usage total exceeds safe integer range");
+  }
+  if (totalTokens !== promptTokens + completionTokens) {
+    throw new ProviderProtocolError("OpenAI usage total_tokens does not match prompt_tokens plus completion_tokens");
+  }
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+    provider_raw: { ...record },
+  };
+}
+
+/** Validate the input/output usage shape emitted by the Responses API. */
+export function parseOpenAIResponsesUsage(
+  value: unknown,
+  allowStreamingNull = false,
+): GenerationUsage | undefined {
+  if (value === undefined) return undefined;
+  if (value === null && allowStreamingNull) return undefined;
+  const record = usageRecord(value, "OpenAI Responses");
+  const promptTokens = usageCount(record, "input_tokens", "OpenAI Responses");
+  const completionTokens = usageCount(record, "output_tokens", "OpenAI Responses");
+  if (promptTokens > Number.MAX_SAFE_INTEGER - completionTokens) {
+    throw new ProviderProtocolError("OpenAI Responses usage total exceeds safe integer range");
+  }
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  };
+}
+
+function reasoningValueBytes(value: unknown): number {
+  if (typeof value === "string") {
+    return Buffer.byteLength(JSON.stringify(value), "utf8") - 2;
+  }
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (error) {
+    throw new ProviderProtocolError("OpenAI reasoning_details field is not serializable", { cause: error });
+  }
+  if (serialized === undefined) {
+    throw new ProviderProtocolError("OpenAI reasoning_details field is malformed");
+  }
+  return Buffer.byteLength(serialized, "utf8");
+}
+export function jsonStringBytes(value: string): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+/** Exact JSON-string byte size after appending a fragment without allocating the combined string. */
+export function jsonStringBytesWithAppend(prefix: string, suffix: string): number {
+  let bytes = 2;
+  let pendingHighSurrogate: number | undefined;
+  const consume = (value: string): void => {
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      if (pendingHighSurrogate !== undefined) {
+        if (code >= 0xdc00 && code <= 0xdfff) {
+          bytes += 4;
+          pendingHighSurrogate = undefined;
+          continue;
+        }
+        bytes += 6;
+        pendingHighSurrogate = undefined;
+      }
+      if (code >= 0xd800 && code <= 0xdbff) {
+        pendingHighSurrogate = code;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        bytes += 6;
+      } else if (code === 0x22 || code === 0x5c) {
+        bytes += 2;
+      } else if (code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d) {
+        bytes += 2;
+      } else if (code < 0x20) {
+        bytes += 6;
+      } else {
+        bytes += Buffer.byteLength(String.fromCharCode(code), "utf8");
+      }
+    }
+  };
+  consume(prefix);
+  consume(suffix);
+  if (pendingHighSurrogate !== undefined) bytes += 6;
+  return bytes;
+}
+
+
 export class ReasoningDetailsAccumulator {
   private byIndex = new Map<number, Record<string, unknown>>();
   private order = 0;
   private seen = false;
+  /** Current structured details plus streamed reasoning text, never history. */
+  private bytes = 0;
+
+  private reserve(nextBytes: number, label: string): void {
+    if (!Number.isSafeInteger(nextBytes) || nextBytes > AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES) {
+      throw new ProviderResponseTooLargeError(
+        `OpenAI ${label} exceeded its bounded reasoning carrier`,
+        AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES,
+        nextBytes,
+      );
+    }
+    this.bytes = nextBytes;
+  }
+
+  /** Reserve a plain reasoning fragment before its caller yields or appends it. */
+  reserveText(fragment: string): void {
+    const fragmentBytes = Buffer.byteLength(fragment, "utf8");
+    this.reserve(this.bytes + fragmentBytes, "reasoning");
+  }
 
   push(incoming: unknown): void {
+    // Ordinary Response-mode provider payloads historically treated absent,
+    // non-array, and malformed reasoning_details as optional opaque metadata.
+    // Keep that tolerant ingress here; Agentic validation happens at its
+    // protocol boundary instead. Oversized valid values still fail closed
+    // through the bounded accumulator below.
     if (!Array.isArray(incoming)) return;
     for (const d of incoming) {
-      if (!d || typeof d !== "object") continue;
-      this.seen = true;
+      if (!d || typeof d !== "object" || Array.isArray(d)) continue;
+
       const rec = d as Record<string, unknown>;
-      const idx = typeof rec.index === "number" ? rec.index : this.order++;
-      let existing = this.byIndex.get(idx);
-      if (!existing) {
-        existing = {};
-        this.byIndex.set(idx, existing);
-      }
-      for (const [k, v] of Object.entries(rec)) {
-        if (
-          REASONING_DETAIL_APPEND_FIELDS.has(k) &&
-          typeof v === "string" &&
-          typeof existing[k] === "string"
-        ) {
-          existing[k] = (existing[k] as string) + v;
+      let entries: [string, unknown][];
+      let idx: number;
+      let implicitIndex = false;
+      try {
+        entries = Object.entries(rec);
+        if (Object.hasOwn(rec, "index")) {
+          if (!Number.isSafeInteger(rec.index) || (rec.index as number) < 0) continue;
+          idx = rec.index as number;
         } else {
-          existing[k] = v;
+          idx = this.order;
+          implicitIndex = true;
+        }
+      } catch {
+        continue;
+      }
+
+      let malformed = false;
+      for (const [key, value] of entries) {
+        if (key === "index") continue;
+        try {
+          if (JSON.stringify(value) === undefined) {
+            malformed = true;
+            break;
+          }
+        } catch {
+          malformed = true;
+          break;
         }
       }
+      if (malformed) continue;
+
+      this.seen = true;
+      const existing = this.byIndex.get(idx);
+      if (!existing && this.byIndex.size >= PROVIDER_STREAM_LIMITS.maxCalls) {
+        throw new ProviderResponseTooLargeError(
+          `OpenAI reasoning_details exceeded ${PROVIDER_STREAM_LIMITS.maxCalls} blocks`,
+          PROVIDER_STREAM_LIMITS.maxCalls,
+          this.byIndex.size + 1,
+        );
+      }
+
+      const candidate: Record<string, unknown> = existing ? { ...existing } : {};
+      let nextBytes = this.bytes;
+      for (const [key, value] of entries) {
+        // The block index is a routing field, not carrier text/metadata.
+        if (key === "index") {
+          candidate[key] = value;
+          continue;
+        }
+        const valueBytes = reasoningValueBytes(value);
+        if (valueBytes > AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES) {
+          throw new ProviderResponseTooLargeError(
+            `OpenAI reasoning_details field ${key} exceeded its bounded length`,
+            AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES,
+            valueBytes,
+          );
+        }
+        const previous = Object.hasOwn(candidate, key) ? candidate[key] : undefined;
+        const hasPrevious = Object.hasOwn(candidate, key);
+        const previousBytes = hasPrevious ? reasoningValueBytes(previous) : 0;
+        const keyBytes = Buffer.byteLength(JSON.stringify(key), "utf8") + 1;
+        const previousKeyBytes = hasPrevious ? keyBytes : 0;
+        const append =
+          REASONING_DETAIL_APPEND_FIELDS.has(key) &&
+          typeof value === "string" &&
+          typeof previous === "string";
+        const nextValueBytes = append
+          ? jsonStringBytesWithAppend(previous as string, value) - 2
+          : valueBytes;
+        nextBytes = append
+          ? nextBytes - previousBytes + nextValueBytes
+          : nextBytes - previousBytes - previousKeyBytes + keyBytes + nextValueBytes;
+        if (!Number.isSafeInteger(nextBytes) || nextBytes > AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES) {
+          throw new ProviderResponseTooLargeError(
+            "OpenAI reasoning_details exceeded its bounded carrier",
+            AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES,
+            nextBytes,
+          );
+        }
+        candidate[key] = append ? previous + value : value;
+      }
+      if (implicitIndex) this.order += 1;
+      if (existing) Object.assign(existing, candidate);
+      else this.byIndex.set(idx, candidate);
+      this.bytes = nextBytes;
     }
   }
 
@@ -59,7 +277,7 @@ export class ReasoningDetailsAccumulator {
     if (!this.seen) return undefined;
     return [...this.byIndex.entries()]
       .sort((a, b) => a[0] - b[0])
-      .map(([, v]) => v);
+      .map(([, value]) => value);
   }
 }
 
@@ -145,53 +363,97 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       body: JSON.stringify(body),
     }, request.signal);
 
-    if (!res.ok) await throwProviderResponseError(this.displayName, GENERATE_OPERATION, res);
+    if (!res.ok) {
+      await throwProviderResponseError(
+        this.displayName,
+        GENERATE_OPERATION,
+        res,
+        request.signal,
+        request.receiveLimitBytes,
+      );
+    }
 
-    const data = (await readJsonWithAbort<any>(res, request.signal)) as any;
-    const choice = data.choices?.[0];
+    const data = await readJsonWithAbort<any>(res, request.signal, request.receiveLimitBytes);
+    const choice = data?.choices?.[0];
+    if (!choice || typeof choice !== "object") {
+      throw new ProviderProtocolError("OpenAI response did not contain a choice");
+    }
+    const message = choice.message;
+    if (!message || typeof message !== "object") {
+      throw new ProviderProtocolError("OpenAI response choice did not contain a message");
+    }
+    if (
+      Object.hasOwn(message, "content") &&
+      message.content !== null &&
+      typeof message.content !== "string"
+    ) {
+      throw new ProviderProtocolError("OpenAI message content must be a string or null");
+    }
 
-    const rawToolCalls = choice?.message?.tool_calls;
-    const toolCalls: ToolCallResult[] | undefined = Array.isArray(rawToolCalls) && rawToolCalls.length > 0
-      ? rawToolCalls.map((tc: any) => ({
-          name: tc.function?.name || tc.name || "",
-          args: typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : (tc.function?.arguments ?? {}),
-          call_id: tc.id || crypto.randomUUID(),
-        }))
-      : undefined;
+    const rawToolCalls = message.tool_calls;
+    let toolCalls: ToolCallResult[] | undefined;
+    if (rawToolCalls !== undefined) {
+      if (!Array.isArray(rawToolCalls) || rawToolCalls.length > PROVIDER_STREAM_LIMITS.maxCalls) {
+        throw new ProviderResponseTooLargeError(
+          `OpenAI tool call count exceeded ${PROVIDER_STREAM_LIMITS.maxCalls}`,
+          PROVIDER_STREAM_LIMITS.maxCalls,
+          Array.isArray(rawToolCalls) ? rawToolCalls.length : PROVIDER_STREAM_LIMITS.maxCalls + 1,
+        );
+      }
+      const ids = new Set<string>();
+      toolCalls = rawToolCalls.map((tc: any) => {
+        const id = typeof tc?.id === "string" && tc.id.length > 0 ? tc.id : "";
+        if (!id) throw new ProviderProtocolError("OpenAI tool call is missing its native ID");
+        if (ids.has(id)) throw new ProviderProtocolError("OpenAI tool call IDs must be unique");
+        ids.add(id);
+        const fn = tc?.function;
+        if (!fn || typeof fn.name !== "string" || fn.name.length === 0) {
+          throw new ProviderProtocolError("OpenAI tool call is missing its function name");
+        }
+        if (typeof fn.arguments !== "string") {
+          throw new ProviderProtocolError("OpenAI tool call arguments must be a JSON string");
+        }
+        const argBytes = Buffer.byteLength(fn.arguments, "utf8");
+        if (argBytes > PROVIDER_STREAM_LIMITS.maxArgumentsBytes) {
+          throw new ProviderResponseTooLargeError(
+            "OpenAI tool call arguments exceeded their bounded carrier",
+            PROVIDER_STREAM_LIMITS.maxArgumentsBytes,
+            argBytes,
+          );
+        }
+        return {
+          name: fn.name,
+          args: parseModelToolArguments(fn.arguments) as Record<string, unknown>,
+          call_id: id,
+        };
+      });
+      if (toolCalls.length === 0) toolCalls = undefined;
+    }
 
-    const normalized = this.splitMirroredReasoning(
-      choice?.message?.content,
-      choice?.message?.reasoning || choice?.message?.reasoning_content,
-    );
-
-    // OpenRouter (and some routed providers) return normalized `reasoning_details`
-    // blocks that must be replayed verbatim across tool calls for interleaved
-    // thinking. Opaque to us — capture as-is when present.
-    const rawReasoningDetails = choice?.message?.reasoning_details;
-    const reasoningDetails =
-      Array.isArray(rawReasoningDetails) && rawReasoningDetails.length > 0
-        ? (rawReasoningDetails as Record<string, unknown>[])
-        : undefined;
+    const rawReasoning = message.reasoning !== undefined
+      ? message.reasoning
+      : message.reasoning_content;
+    if (rawReasoning !== undefined && typeof rawReasoning !== "string") {
+      throw new ProviderProtocolError("OpenAI reasoning must be a string");
+    }
+    const reasoningDetails = new ReasoningDetailsAccumulator();
+    if (rawReasoning !== undefined) reasoningDetails.reserveText(rawReasoning);
+    const normalized = this.splitMirroredReasoning(message.content, rawReasoning);
+    if (message.reasoning_details !== undefined) {
+      reasoningDetails.push(message.reasoning_details);
+    }
+    const finishReason = choice.finish_reason;
+    if (Object.hasOwn(choice, "finish_reason") && finishReason !== null && typeof finishReason !== "string") {
+      throw new ProviderProtocolError("OpenAI finish_reason must be a string or null");
+    }
 
     return {
       content: normalized.content,
       reasoning: normalized.reasoning,
-      finish_reason: toolCalls ? "tool_calls" : (choice?.finish_reason || "stop"),
+      finish_reason: toolCalls ? "tool_calls" : (finishReason || "stop"),
       tool_calls: toolCalls,
-      reasoning_details: reasoningDetails,
-      usage: data.usage
-        ? {
-            prompt_tokens: data.usage.prompt_tokens,
-            completion_tokens: data.usage.completion_tokens,
-            total_tokens: data.usage.total_tokens,
-            // Preserve provider-side telemetry so consumers (e.g. NanoGPT
-            // cache hit summary in the prompt breakdown UI) can read fields
-            // beyond the canonical three — cache_read_input_tokens,
-            // cache_creation_input_tokens, prompt_tokens_details.cached_tokens,
-            // and any other passthrough metadata.
-            provider_raw: { ...data.usage },
-          }
-        : undefined,
+      reasoning_details: reasoningDetails.finalize(),
+      usage: parseOpenAIUsage(data.usage),
     };
   }
 
@@ -209,115 +471,243 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       body: JSON.stringify(body),
     }, request.signal);
 
-    if (!res.ok) await throwProviderResponseError(this.displayName, STREAM_OPERATION, res);
+    if (!res.ok) {
+      await throwProviderResponseError(
+        this.displayName,
+        STREAM_OPERATION,
+        res,
+        request.signal,
+        request.receiveLimitBytes,
+      );
+    }
 
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    // Inline counter instead of createCooperativeYielder: the yielder is an
-    // async fn, so calling it allocates a promise (and an await hop) on every
-    // SSE line even when it doesn't yield. The sync modulo check keeps the
-    // 63/64 non-yielding lines allocation-free.
-    let lineCount = 0;
-    // Auto-detect reasoning field: modern APIs use `reasoning`, legacy uses
-    // `reasoning_content`. Lock to whichever key appears first so we don't
-    // check both on every chunk.
+    const sse = createBoundedSseReader(res, request.signal, {
+      terminalMarker: "[DONE]",
+      maxResponseBytes: request.receiveLimitBytes,
+    });
+    let eventCount = 0;
     let reasoningKey: "reasoning" | "reasoning_content" | null = null;
-
-    // Tool call accumulation — OpenAI streams tool_calls as delta chunks
-    const toolCallBuffer: { id: string; name: string; argsJson: string }[] = [];
-    // OpenRouter reasoning_details accumulation (streamed as deltas).
+    const toolCallBuffer: Array<{ id: string; name: string; argsJson: string }> = [];
     const reasoningDetails = new ReasoningDetailsAccumulator();
+    let sawFinishReason = false;
+    let sawUsageTrailer = false;
+    const seenNativeIds = new Set<string>();
+    let sawToolFinish = false;
 
-    let streamDoneNaturally = false;
-    try {
-    while (true) {
-      const { done, value } = await readWithAbort(reader, request.signal);
-      if (done) { streamDoneNaturally = !request.signal?.aborted; break; }
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (++lineCount % 64 === 0) await yieldToEventLoop(request.signal);
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-        const data = trimmed.slice(6);
-        if (data === "[DONE]") return;
-
+    for await (const event of sse) {
+      // Repository fixtures frame each JSON payload with a single LF rather
+      // than an SSE blank line. BoundedSseReader preserves those data fields
+      // in one event; split them here while retaining strict per-payload
+      // validation below.
+      for (const data of event.data.split("\n")) {
+        if (request.signal?.aborted) {
+          throw request.signal.reason ?? new DOMException("Aborted", "AbortError");
+        }
+        eventCount += 1;
+        if (eventCount > PROVIDER_STREAM_LIMITS.maxEvents) {
+          throw new ProviderResponseTooLargeError(
+            `OpenAI stream event count exceeded ${PROVIDER_STREAM_LIMITS.maxEvents}`,
+            PROVIDER_STREAM_LIMITS.maxEvents,
+            eventCount,
+          );
+        }
+        if (eventCount % 64 === 0) await yieldToEventLoop(request.signal);
+        if (data === "[DONE]") {
+          if (!sse.isTerminal) sse.markTerminal();
+          if (!sawFinishReason) {
+            throw new ProviderProtocolError("OpenAI stream ended without finish_reason");
+          }
+          if (toolCallBuffer.length > 0 && !sawToolFinish) {
+            throw new ProviderProtocolError("OpenAI stream ended with unresolved tool calls");
+          }
+          continue;
+        }
+        if (sse.isTerminal) {
+          throw new ProviderProtocolError("OpenAI stream emitted data after its terminal marker");
+        }
+        let parsed: any;
         try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta;
-          const finishReason = parsed.choices?.[0]?.finish_reason;
-
-          // Accumulate tool call deltas
-          for (const tc of (delta?.tool_calls ?? [])) {
-            const idx = tc.index ?? toolCallBuffer.length;
-            if (!toolCallBuffer[idx]) toolCallBuffer[idx] = { id: tc.id ?? "", name: "", argsJson: "" };
-            if (tc.id && !toolCallBuffer[idx].id) toolCallBuffer[idx].id = tc.id;
-            if (tc.function?.name) toolCallBuffer[idx].name += tc.function.name;
-            if (tc.function?.arguments) toolCallBuffer[idx].argsJson += tc.function.arguments;
+          parsed = JSON.parse(data);
+        } catch (error) {
+          throw new ProviderProtocolError("Malformed OpenAI SSE JSON", { cause: error });
+        }
+        if (!parsed || typeof parsed !== "object") {
+          throw new ProviderProtocolError("OpenAI SSE payload must be an object");
+        }
+        if (event.event !== undefined && event.event !== "message") {
+          throw new ProviderProtocolError("OpenAI SSE event name is unsupported");
+        }
+        if (parsed.choices !== undefined && !Array.isArray(parsed.choices)) {
+          throw new ProviderProtocolError("OpenAI SSE choices must be an array");
+        }
+        if (sawFinishReason) {
+          const hasUsageObject = parsed.usage !== undefined && parsed.usage !== null;
+          if (
+            sawUsageTrailer ||
+            !Array.isArray(parsed.choices) ||
+            parsed.choices.length !== 0 ||
+            !hasUsageObject
+          ) {
+            throw new ProviderProtocolError("OpenAI stream emitted data after finish_reason");
           }
+          const usage = parseOpenAIUsage(parsed.usage);
+          sawUsageTrailer = true;
+          yield { token: "", usage };
+          continue;
+        }
+        const choice = parsed.choices?.[0];
+        if (choice === undefined) {
+          throw new ProviderProtocolError("OpenAI SSE event did not contain choices");
+        }
+        if (!choice || typeof choice !== "object") {
+          throw new ProviderProtocolError("OpenAI SSE choice must be an object");
+        }
+        const delta = choice.delta;
+        if (delta !== undefined && (!delta || typeof delta !== "object")) {
+          throw new ProviderProtocolError("OpenAI SSE delta must be an object");
+        }
+        if (
+          delta !== undefined &&
+          Object.hasOwn(delta, "content") &&
+          delta.content !== null &&
+          typeof delta.content !== "string"
+        ) {
+          throw new ProviderProtocolError("OpenAI SSE content delta must be a string or null");
+        }
 
-          // Accumulate OpenRouter reasoning_details deltas
-          reasoningDetails.push(delta?.reasoning_details);
-
-          // Resolve reasoning from the detected key, or auto-detect on first occurrence
-          let reasoning: string | undefined;
-          if (reasoningKey) {
-            reasoning = delta?.[reasoningKey];
-          } else if (delta?.reasoning !== undefined) {
-            reasoningKey = "reasoning";
-            reasoning = delta.reasoning;
-          } else if (delta?.reasoning_content !== undefined) {
-            reasoningKey = "reasoning_content";
-            reasoning = delta.reasoning_content;
+      const rawToolDeltas = delta?.tool_calls;
+      if (rawToolDeltas !== undefined) {
+        if (!Array.isArray(rawToolDeltas)) {
+          throw new ProviderProtocolError("OpenAI tool_calls delta must be an array");
+        }
+        for (const tc of rawToolDeltas) {
+          if (!tc || typeof tc !== "object" || !Number.isSafeInteger(tc.index) || tc.index < 0) {
+            throw new ProviderProtocolError("OpenAI tool call delta has an invalid index");
           }
-          const normalized = this.splitMirroredReasoning(delta?.content, reasoning);
-          const content = normalized.content;
-          reasoning = normalized.reasoning;
-
-          // Usage data arrives in the final chunk when stream_options.include_usage is true
-          const usage = parsed.usage
-            ? {
-                prompt_tokens: parsed.usage.prompt_tokens || 0,
-                completion_tokens: parsed.usage.completion_tokens || 0,
-                total_tokens: parsed.usage.total_tokens || 0,
-                provider_raw: { ...parsed.usage },
-              }
-            : undefined;
-
-          if (finishReason) {
-            // Emit accumulated tool calls on the finish chunk
-            const toolCalls: ToolCallResult[] | undefined = toolCallBuffer.length > 0
-              ? toolCallBuffer.map(tc => ({ name: tc.name, args: JSON.parse(tc.argsJson || "{}"), call_id: tc.id || crypto.randomUUID() }))
-              : undefined;
-            yield {
-              token: content || "",
-              reasoning,
-              finish_reason: toolCalls ? "tool_calls" : finishReason,
-              tool_calls: toolCalls,
-              reasoning_details: reasoningDetails.finalize(),
-              usage,
-            };
-          } else if (reasoning || content) {
-            yield {
-              token: content || "",
-              reasoning,
-              usage,
-            };
-          } else if (usage) {
-            yield { token: "", usage };
+          const idx = tc.index as number;
+          if (idx > PROVIDER_STREAM_LIMITS.maxCalls - 1) {
+            throw new ProviderResponseTooLargeError(
+              `OpenAI tool call count exceeded ${PROVIDER_STREAM_LIMITS.maxCalls}`,
+              PROVIDER_STREAM_LIMITS.maxCalls,
+              idx + 1,
+            );
           }
-        } catch {
-          // Skip malformed SSE lines
+          if (idx > toolCallBuffer.length) {
+            throw new ProviderProtocolError("OpenAI tool call deltas arrived out of order");
+          }
+          if (idx === toolCallBuffer.length) {
+            if (typeof tc.id !== "string" || tc.id.length === 0) {
+              throw new ProviderProtocolError("OpenAI tool call is missing its native ID");
+            }
+            if (Buffer.byteLength(tc.id, "utf8") > 256) {
+              throw new ProviderResponseTooLargeError("OpenAI tool call ID exceeded its bounded length", 256, Buffer.byteLength(tc.id, "utf8"));
+            }
+            if (seenNativeIds.has(tc.id)) {
+              throw new ProviderProtocolError("OpenAI tool call IDs must be unique");
+            }
+            seenNativeIds.add(tc.id);
+            toolCallBuffer.push({ id: tc.id, name: "", argsJson: "" });
+          } else if (tc.id !== undefined && tc.id !== toolCallBuffer[idx].id) {
+            throw new ProviderProtocolError("OpenAI tool call ID changed during streaming");
+          }
+          const functionDelta = tc.function;
+          if (functionDelta !== undefined && (!functionDelta || typeof functionDelta !== "object")) {
+            throw new ProviderProtocolError("OpenAI tool function delta must be an object");
+          }
+          if (functionDelta?.name !== undefined) {
+            if (typeof functionDelta.name !== "string" || functionDelta.name.length === 0) {
+              throw new ProviderProtocolError("OpenAI tool function name must be a non-empty string");
+            }
+            const currentName = toolCallBuffer[idx].name;
+            if (currentName && currentName !== functionDelta.name) {
+              throw new ProviderProtocolError("OpenAI tool function name changed during streaming");
+            }
+            toolCallBuffer[idx].name = functionDelta.name;
+          }
+          if (functionDelta?.arguments !== undefined) {
+            if (typeof functionDelta.arguments !== "string") {
+              throw new ProviderProtocolError("OpenAI tool arguments delta must be a string");
+            }
+            const deltaBytes = Buffer.byteLength(functionDelta.arguments, "utf8");
+            if (deltaBytes > PROVIDER_STREAM_LIMITS.maxToolDeltaBytes) {
+              throw new ProviderResponseTooLargeError(
+                "OpenAI tool argument delta exceeded its bounded carrier",
+                PROVIDER_STREAM_LIMITS.maxToolDeltaBytes,
+                deltaBytes,
+              );
+            }
+            const nextBytes = Buffer.byteLength(toolCallBuffer[idx].argsJson, "utf8") + deltaBytes;
+            if (nextBytes > PROVIDER_STREAM_LIMITS.maxArgumentsBytes) {
+              throw new ProviderResponseTooLargeError(
+                "OpenAI tool arguments exceeded their bounded carrier",
+                PROVIDER_STREAM_LIMITS.maxArgumentsBytes,
+                nextBytes,
+              );
+            }
+            toolCallBuffer[idx].argsJson += functionDelta.arguments;
+          }
         }
       }
+
+      reasoningDetails.push(delta?.reasoning_details);
+      let reasoning: string | undefined;
+      if (reasoningKey) {
+        reasoning = delta?.[reasoningKey];
+      } else if (delta?.reasoning !== undefined) {
+        if (typeof delta.reasoning !== "string") throw new ProviderProtocolError("OpenAI reasoning delta must be a string");
+        reasoningKey = "reasoning";
+        reasoning = delta.reasoning;
+      } else if (delta?.reasoning_content !== undefined) {
+        if (typeof delta.reasoning_content !== "string") throw new ProviderProtocolError("OpenAI reasoning delta must be a string");
+        reasoningKey = "reasoning_content";
+        reasoning = delta.reasoning_content;
+      }
+      if (reasoning !== undefined && typeof reasoning !== "string") {
+        throw new ProviderProtocolError("OpenAI reasoning delta must be a string");
+      }
+      if (reasoning !== undefined) reasoningDetails.reserveText(reasoning);
+      const normalized = this.splitMirroredReasoning(delta?.content, reasoning);
+      const content = normalized.content;
+      reasoning = normalized.reasoning;
+
+      const usage = parseOpenAIUsage(parsed.usage, true);
+      const finishReason = choice.finish_reason;
+      if (Object.hasOwn(choice, "finish_reason") && finishReason !== null && typeof finishReason !== "string") {
+        throw new ProviderProtocolError("OpenAI finish_reason must be a string or null");
+      }
+      if (finishReason) {
+        if (sawFinishReason) throw new ProviderProtocolError("OpenAI stream emitted duplicate finish_reason");
+        sawFinishReason = true;
+        let toolCalls: ToolCallResult[] | undefined;
+        if (toolCallBuffer.length > 0) {
+          if (finishReason !== "tool_calls") {
+            throw new ProviderProtocolError("OpenAI stream finished with unresolved tool calls");
+          }
+          sawToolFinish = true;
+          toolCalls = toolCallBuffer.map((tc) => {
+            if (!tc.name || !tc.id) throw new ProviderProtocolError("OpenAI tool call is incomplete");
+            return {
+              name: tc.name,
+              args: parseModelToolArguments(tc.argsJson) as Record<string, unknown>,
+              call_id: tc.id,
+            };
+          });
+        }
+        yield {
+          token: content || "",
+          reasoning,
+          finish_reason: toolCalls ? "tool_calls" : finishReason,
+          tool_calls: toolCalls,
+          reasoning_details: reasoningDetails.finalize(),
+          usage,
+        };
+      } else if (reasoning || content) {
+        yield { token: content || "", reasoning, usage };
+      } else if (usage) {
+        yield { token: "", usage };
+      }
     }
-    } finally {
-      if (!streamDoneNaturally) await cancelStreamAndCloseConnection(reader, res);
-    }
+  }
   }
 
   async validateKey(apiKey: string, apiUrl: string): Promise<boolean> {
@@ -379,7 +769,10 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
         {
           role: m.role,
           content: m.content,
-          ...this.assistantReasoningCarrier(m),
+          // Plain assistant history may replay OpenRouter's structured
+          // reasoning_details, but plaintext reasoning_content belongs only to
+          // tool-call continuations (or Moonshot partial prefill).
+          ...this.assistantReasoningCarrier(m, false),
         },
       ];
     }
@@ -444,22 +837,32 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
   }
 
   /**
-   * Reasoning payloads belong to the assistant turn that produced them. This
-   * is also used for ordinary prompt history (not only inline tool turns), so
-   * retained native reasoning is sent back in its original provider field.
+   * Reasoning payloads belong to the assistant turn that produced them. The
+   * structured carrier is safe for ordinary prompt history; plaintext
+   * reasoning_content is opt-in for multipart history and tool continuations.
    */
-  private assistantReasoningCarrier(m: LlmMessage): Record<string, unknown> {
+  private assistantReasoningCarrier(
+    m: LlmMessage,
+    includePlaintext = true,
+  ): Record<string, unknown> {
     if (m.role !== "assistant") return {};
     if (m.reasoning_details?.length) {
       return { reasoning_details: m.reasoning_details };
     }
+    if (!includePlaintext) return {};
     return m.reasoning_content
       ? { reasoning_content: m.reasoning_content }
       : {};
   }
 
-  /** Keys that are internal to Lumiverse and should never be sent to any provider API. */
+  /** Keys that are internal to Lumiverse and should never be sent to APIs. */
   protected static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "use_responses_api"]);
+
+  /** Keys that custom bodies cannot use to widen a feature-active tool mode. */
+  protected static readonly TOOL_CONTROL_PARAMS = new Set([
+    "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call",
+    "plugins", "web_search", "google_search", "enable_web_search", "enableSearch",
+  ]);
 
   /** Build the request body using capabilities as the parameter allowlist. */
   protected buildBody(request: GenerationRequest, stream: boolean): any {
@@ -484,12 +887,11 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       body.max_tokens = allowed.max_tokens?.default ?? 4096;
     }
 
-    // Passthrough: include extra params (e.g. from custom body) not in the
-    // allowlist and not internal. This enables provider-specific params like
-    // reasoning_effort, seed, response_format, etc. to reach the API.
+    // Passthrough custom params, but feature-active modes cannot widen tools.
     for (const key of Object.keys(params)) {
-      if (body[key] !== undefined) continue;          // already set by allowlist
-      if (allowed[key]) continue;                     // in allowlist but undefined — skip
+      if (request.toolMode && OpenAICompatibleProvider.TOOL_CONTROL_PARAMS.has(key)) continue;
+      if (body[key] !== undefined) continue;
+      if (allowed[key]) continue;
       if (OpenAICompatibleProvider.INTERNAL_PARAMS.has(key)) continue;
       body[key] = params[key];
     }
@@ -500,18 +902,23 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     }
 
     // Inline council tools: pass as OpenAI function calling format
-    if (request.tools && request.tools.length > 0) {
+    // Feature-active finalization is an explicit no-tools request. Ordinary
+    // mode receives only the immutable host snapshot in request.tools.
+    if (request.toolMode === "finalization") {
+      body.tools = [];
+      body.tool_choice = "none";
+      body.parallel_tool_calls = false;
+    } else if (request.tools && request.tools.length > 0) {
       body.tools = request.tools.map((t) => ({
         type: "function",
         function: {
           name: t.name,
           description: t.description,
           parameters: t.parameters,
-          ...(t.strict !== undefined ? { strict: t.strict } : {}),
+          strict: false,
         },
       }));
     }
-
     return body;
   }
 }

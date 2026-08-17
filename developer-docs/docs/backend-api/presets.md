@@ -15,6 +15,158 @@ Presets are stored as one record with several JSON fields:
 
 Prompt categories are not separate records. A category is a structural prompt block where `marker === 'category'`. Its children are the following non-category prompt blocks until the next category block. Use `spindle.presets.categories.list()` when you want this grouping precomputed by the host.
 
+## Normalized Agent runtime configuration
+
+Agent runtime configuration is not generic preset metadata. The authenticated
+preset service stores one normalized V2 projection in
+`preset_agent_configs`, `preset_agent_profiles`,
+`preset_agent_connection_slots`, and `preset_agent_slot_bindings`.
+`Preset.agent_config` is the safe projection of that preset-owned data and
+`Preset.agent_config_review` reports review/repair state and items; it does not
+by itself decide executability. The durable chat override lives separately in
+`chat_agent_mode_overrides` and is resolved by the runtime decision service.
+Runtime executability additionally requires enabled/allowed mode, host
+ceilings, concrete capabilities, revisions/readiness, and kill-switch health.
+The runtime reads this projection through `agent-config-portability.service.ts`;
+it does not select a connection from `metadata` or from a
+`connectionProfileId` field.
+
+The closed authored shape is `AgentConfigV2`:
+
+```ts
+{
+  version: 2,
+  agentsEnabled: boolean,
+  allowedModes: ['response'] | ['agentic', 'response'] | ['response', 'agentic'],
+  defaultMode: 'response' | 'agentic',
+  maxInvocations: number,
+  maxToolCalls: number,
+  mainToolIds: CoreAgentToolId[],
+  mainLoreScope: AgentLoreScope,
+  profiles: [{
+    id: string,
+    name: string,
+    systemPrompt: string,
+    connectionRef:
+      | { kind: 'inherit_main' }
+      | { kind: 'slot', slotId: string },
+    toolIds: CoreAgentToolId[],
+    loreScope: AgentLoreScope,
+    allowMainDelegation: boolean,
+    failurePolicy: 'required' | 'optional',
+    streamActivity: boolean,
+    maxOutputTokens: number,
+    timeoutMs: number,
+  }],
+  connectionSlots: [{
+    id: string,
+    label: string,
+    requiredCapabilities: [
+      'generation' | 'streaming' | 'tool_calling' |
+      'native_tool_continuation' | 'tools_disabled_finalization',
+    ][],
+  }],
+  phasePolicy?: { work: AgentPromptBlockRefV1[], render: AgentPromptBlockRefV1[] },
+  cognitionPolicy?: AgentCognitionPolicyV1,
+  contextPolicy?: AgentContextPolicyV1,
+  taskPolicy?: AgentTaskPolicyV1,
+  workspacePolicy?: { retention: 'turn_terminal' | 'chat_lifetime', sharing: 'root_only' | 'view_only' },
+}
+```
+
+`allowedModes` is ordered, unique, always contains `response`, and
+`defaultMode` must be allowed. A profile refers to an authored preset-scoped
+slot or explicitly inherits the root connection. A slot binding is the only
+place that stores a local `connection_id`, and it carries a binding revision
+and `ready | review_required | repair_required` state.
+Capabilities and host ceilings are checked again when the runtime resolves the
+concrete connection; authored values cannot raise process limits.
+
+`AgentConfigV2` in the normalized tables is the only executable authority.
+Ordinary preset create/update DTOs accept only exact top-level
+`agent_config` V2. They reject V1 and scrub all runtime-looking metadata keys,
+including `metadata.agentConfig`, review aliases, portable aliases, and
+runtime-envelope aliases, without interpreting them. Explicit database
+migration, user-data archive, preset-file, and LumiHub import boundaries may
+parse legacy V1 exactly once, normalize it, and remove the legacy carriers.
+Normal preset reads project only normalized tables; no metadata alias is
+executable.
+
+Version-1 migration is deliberately Response-only:
+
+- absent config, marker-only metadata, or V1 `enabled: false` becomes
+  `agentsEnabled: false`, `allowedModes: ['response']`,
+  `defaultMode: 'response'`, and `ready` state;
+- a structurally valid V1 `enabled: true` preserves authored
+  profiles/tools/limits but remains Response-only; no V1 row enables Agentic;
+- a local direct profile binding becomes deterministic slot
+  `profile/<profileId>`; a `null` binding becomes `inherit_main`;
+- malformed legacy config becomes inert `repair_required` with a bounded
+  repair reason; an unresolved foreign/stale binding becomes inert
+  `review_required` until it is mapped and acknowledged.
+
+Loom/LumiHub imports have two explicit paths. If the exported object (or its
+embedded `preset`) contains `agentRuntime`, the installer strictly parses the
+`PortablePresetRuntimeEnvelopeV1` before writing and atomically imports the
+preset, normalized config, portable Context Pack snapshots, selections, rules,
+and task templates. This complete-runtime path preserves authored policy but
+imports it disabled, Response-only, and review-required; it cannot grant
+activation or local bindings. If no envelope is present, the explicit legacy
+import path strictly parses `metadata.agentConfig`, migrates it to a portable
+V2 payload, and sends it through the same transactional importer. Legacy
+authored settings remain preserved but disabled, Response-only, and
+review-required. In both paths metadata is not executable runtime authority;
+normalized authenticated config routes remain the runtime source.
+
+Same-account duplicate copies the preset, normalized config, authorized slot
+bindings, regex companions, and the validated authored runtime envelope
+(`contextPackSelections`, `contextRules`, `taskTemplates`, and
+`reviewAcknowledgements`). It does not clone the Context Library graph; the
+copied same-account references continue to point at the already-authorized
+pack revisions. Foreign import never copies local bindings.
+### Authenticated config and portability routes
+
+These routes are mounted under `/api/v1/presets` and are the server authority
+for normalized config:
+
+| Method | Endpoint | Contract |
+|---|---|---|
+| `GET` | `/:id/agent-config` | Returns the editor object directly (not a `{ preset, editor }` wrapper): `presetId`, `presetRevision`, `configRevision`, `config: AgentConfigV2`, `review`, `slotBindings`, `contextPackSelections`, `contextRules`, `taskTemplates`, `hostCeilings`, and `reviewAcknowledgements`. Missing/foreign presets return `404`. |
+| `PUT` | `/:id/agent-config` | Atomically saves the closed body keys `config`, `slotBindings`, `contextPackSelections`, `contextRules`, `taskTemplates`, `reviewAcknowledgements`, `promptOrder`, `expectedPresetRevision`, and `expectedConfigRevision`; unknown or malformed bodies return `400`, while a missing revision precondition returns `428`. |
+| `GET` | `/:id/agent-runtime/portable` | Returns the complete `PortablePresetRuntimeEnvelopeV1`: portable config, Context Pack snapshots/selections, context rules, and task templates. It contains no local bindings or credentials. |
+| `POST` | `/import-portable` | Accepts `{ preset: PortablePresetPayload, agentRuntime: PortablePresetRuntimeEnvelopeV1 }` and atomically imports the complete preset/runtime/context graph in disabled, Response-only, review-required state (`201`). |
+| `GET` | `/:id/agent-config/portable` | Returns config-only `PortableAgentConfigV1` with no local bindings or credentials. |
+| `POST` | `/agent-config/portable/import` | Creates a foreign preset/config from a config-only `PortablePresetPayload` in inert review-required state (`201`); it does not carry the Context Library graph. |
+| `POST` | `/:id/duplicate` | Same-account transactional duplicate of the preset, normalized config, authorized bindings, regex companions, and validated authored runtime envelope; Context Library rows are referenced, not cloned. |
+| `GET` | `/agent-runtime-limits` | Returns effective process ceilings; it cannot be used to raise them. |
+
+The shared-draft save requires both preset and config revision preconditions.
+It updates prompt order and normalized config in one transaction and rejects
+unknown or malformed bodies with `400`. Omitting either
+`expectedPresetRevision` or `expectedConfigRevision` returns `428`; stale
+preconditions return the route's conflict response. A preset update must
+provide `expected_cache_revision`; callers that include top-level
+`agent_config` are still normalized through the same server authority. Use
+`PUT /api/v1/presets/:id/agent-config` when changing config, slots, cognition,
+context, tasks, and blocks together.
+
+The durable per-chat mode override is separate from the preset:
+`PUT /api/v1/chats/:id/agent-mode` accepts
+`{ mode: 'response' | 'agentic' | null, expectedRevision: number }`
+(`expected_revision` is an alias). The revision precondition is required on
+every write; use `0` for the first write. A stale revision is rejected rather
+than merged. It is not included in portable config, LumiHub data, or archives.
+One-turn choices and decision tokens are likewise never persisted in a preset.
+
+### Extension boundary
+
+The `spindle.presets.*` extension methods continue to manage ordinary preset
+CRUD and prompt blocks. Extensions must preserve unknown metadata keys, but
+must not treat the legacy keys as consent or attempt to implement runtime
+resolution. The normalized Agent runtime routes above are authenticated
+server operations. Agentic execution exposes no extension Tool Library, MCP,
+Council, or generic Spindle callback surface; those remain Response-only.
+
 ## Usage
 
 ```ts
@@ -72,14 +224,20 @@ const deleted = await spindle.presets.delete(newPreset.id)
   parameters: Record<string, unknown>
   prompt_order: PromptBlockDTO[]
   prompts: Record<string, unknown>
-  metadata: Record<string, unknown>
+  metadata: Record<string, unknown> // reserved runtime keys are scrubbed
   cache_revision: number
   created_at: number   // unix epoch seconds
   updated_at: number
 }
 ```
 
+`UserPresetDTO` is the extension wire shape and does not include normalized
+Agent runtime configuration. Use the authenticated
+`/api/v1/presets/:id/agent-config` and portability routes above for V2 config,
+bindings; extension CRUD cannot grant or resolve Agentic execution.
+
 ## UserPresetCreateDTO
+
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -89,7 +247,7 @@ const deleted = await spindle.presets.delete(newPreset.id)
 | `parameters` | `Record<string, unknown>` | No | Provider parameters and Loom sampler/custom-body settings |
 | `prompt_order` | `PromptBlockDTO[]` | No | Ordered prompt blocks, including structural category markers |
 | `prompts` | `Record<string, unknown>` | No | Prompt behavior, completion settings, and advanced settings |
-| `metadata` | `Record<string, unknown>` | No | Preset metadata and extension-specific data |
+| `metadata` | `Record<string, unknown>` | No | Preset metadata and extension-specific data; reserved Agent runtime keys are import-only and are scrubbed |
 
 ## UserPresetUpdateDTO
 

@@ -4,6 +4,11 @@ import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import type { Preset, CreatePresetInput, UpdatePresetInput, PromptBlock, PromptBlockPlacement, PromptVariableValue } from "../types/preset";
 import { PresetRevisionConflictError } from "../types/preset";
+import type { AgentConfigV2 } from "../types/agents";
+import { parseAgentConfigV2 } from "../types/agents";
+import { getPresetAgentConfig, importPortablePresetRegexScriptsWithDb, preparePresetAgentConfigForWrite, scrubPresetMetadata, writePresetAgentConfigWithDb } from "./agent-config-portability.service";
+import { assertAgentConfigWithinHostLimits } from "./agent-runtime-limits";
+import { toPublicConnection } from "./connections.service";
 import type { ConnectionProfile } from "../types/connection-profile";
 import type { PaginationParams, PaginatedResult } from "../types/pagination";
 import { paginatedQuery } from "./pagination";
@@ -14,6 +19,7 @@ import {
   reconcileStashedPromptBlocks,
   syncStashedBlocksAcrossPresets,
 } from "./prompt-stash.service";
+import { withUserDataMutationSync } from "./user-data/snapshot";
 
 /**
  * Drop entries in metadata.promptVariables that no longer correspond to a
@@ -67,10 +73,10 @@ export interface CreatePromptBlockInput extends Partial<PromptBlock> {
 export type UpdatePromptBlockInput = Partial<Omit<PromptBlock, "id">>;
 
 function rowToPreset(row: any): Preset {
-  // Construct explicitly from the Preset fields rather than spreading `...row`:
-  // the latter ships internal columns (e.g. user_id) to the client and carries
-  // the raw JSON-string columns alongside the parsed ones.
-  return {
+  const projection = getPresetAgentConfig(String(row.user_id), String(row.id));
+  const rawMetadata: unknown = JSON.parse(row.metadata);
+  const metadata = scrubPresetMetadata(rawMetadata);
+  const base: Preset = {
     id: row.id,
     name: row.name,
     provider: row.provider,
@@ -78,11 +84,17 @@ function rowToPreset(row: any): Preset {
     parameters: JSON.parse(row.parameters),
     prompt_order: JSON.parse(row.prompt_order),
     prompts: JSON.parse(row.prompts),
-    metadata: JSON.parse(row.metadata),
+    metadata,
     cache_revision: row.cache_revision ?? 0,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+  if (projection) {
+    base.agent_config = projection.config;
+    base.agent_config_revision = projection.configRevision;
+    base.agent_config_review = projection.review;
+  }
+  return base;
 }
 
 export function listPresets(userId: string, pagination: PaginationParams): PaginatedResult<Preset> {
@@ -316,29 +328,65 @@ export function assertUsablePreset(
   throw new Error("No preset selected. Choose a preset before generating.");
 }
 
+/**
+ * Reparse the effective config immediately before generation and verify every
+ * explicitly selected connection through the user-scoped connection service.
+ */
+export function validateAgentConfigForExecution(userId: string, raw: unknown): AgentConfigV2 {
+  void userId;
+  const config = parseAgentConfigV2(raw);
+  if (!config.agentsEnabled) return config;
+  assertAgentConfigWithinHostLimits(config);
+  return config;
+}
+
+function hasNormalizedAgentConfigTable(): boolean {
+  return Boolean(getDb().query(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'preset_agent_configs'",
+  ).get());
+}
+
+
 export function createPreset(userId: string, input: CreatePresetInput): Preset {
+  const db = getDb();
   const id = crypto.randomUUID();
-  const now = Math.floor(Date.now() / 1000);
-
-  const cleanedMetadata = prunePromptVariableOrphans(input.prompt_order, input.metadata) || {};
-
-  getDb()
-    .query(
-      "INSERT INTO presets (id, name, provider, engine, parameters, prompt_order, prompts, metadata, user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .run(
-      id, input.name, input.provider, input.engine || "classic",
-      JSON.stringify(input.parameters || {}),
-      JSON.stringify(input.prompt_order || []),
-      JSON.stringify(input.prompts || {}),
-      JSON.stringify(cleanedMetadata),
-      userId, now, now
-    );
-
-  return getPreset(userId, id)!;
+  return withUserDataMutationSync(userId, () => db.transaction(() => {
+    const now = Math.floor(Date.now() / 1000);
+    const submittedConfig = Object.hasOwn(input as object, "agent_config")
+      ? (input as CreatePresetInput & { agent_config?: unknown }).agent_config
+      : undefined;
+    const preparedConfig = submittedConfig === undefined ? undefined : preparePresetAgentConfigForWrite(submittedConfig);
+    const metadata = input.metadata === undefined ? undefined : scrubPresetMetadata(input.metadata);
+    const cleanedMetadata = prunePromptVariableOrphans(input.prompt_order, metadata) || {};
+    db.query(
+      "INSERT INTO presets (id, name, provider, engine, parameters, prompt_order, prompts, metadata, user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(id, input.name, input.provider, input.engine || "classic", JSON.stringify(input.parameters || {}), JSON.stringify(input.prompt_order || []), JSON.stringify(input.prompts || {}), JSON.stringify(cleanedMetadata), userId, now, now);
+    if (preparedConfig !== undefined && hasNormalizedAgentConfigTable()) {
+      writePresetAgentConfigWithDb(
+        db,
+        userId,
+        id,
+        {
+          config: preparedConfig.config,
+        },
+        preparedConfig,
+      );
+    }
+    if (Object.hasOwn(input as object, "regex_scripts")) {
+      importPortablePresetRegexScriptsWithDb(db, userId, id, input.name, input);
+    }
+    const created = getPreset(userId, id);
+    if (!created) throw new Error("Preset creation failed");
+    return created;
+  })());
 }
 
 export function updatePreset(userId: string, id: string, input: UpdatePresetInput): Preset | null {
+  const db = getDb();
+  return withUserDataMutationSync(userId, () => db.transaction(() => {
+  const submittedConfig = Object.hasOwn(input as object, "agent_config")
+    ? (input as UpdatePresetInput & { agent_config?: unknown }).agent_config
+    : undefined;
   const existing = getPreset(userId, id);
   if (!existing) return null;
   // Avoid mutating shared stash state for a request we already know is stale.
@@ -346,6 +394,7 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
   if (input.expected_cache_revision !== undefined && input.expected_cache_revision !== (existing.cache_revision ?? 0)) {
     throw new PresetRevisionConflictError(id, input.expected_cache_revision, existing.cache_revision ?? 0);
   }
+  const preparedConfig = submittedConfig === undefined ? undefined : preparePresetAgentConfigForWrite(submittedConfig);
 
   // A stashed block has global content/configuration but local visibility and
   // list placement. Reconcile before validating prompt variables so the
@@ -376,7 +425,8 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
   let writeMetadata: Record<string, any> | undefined;
   if (input.metadata !== undefined) {
     const resolvedOrder = reconciledPromptOrder !== undefined ? reconciledPromptOrder : existing.prompt_order;
-    writeMetadata = (prunePromptVariableOrphans(resolvedOrder, input.metadata) as Record<string, any>) ?? input.metadata;
+    const localMetadata = scrubPresetMetadata(input.metadata);
+    writeMetadata = (prunePromptVariableOrphans(resolvedOrder, localMetadata) as Record<string, any>) ?? localMetadata;
   } else if (reconciledPromptOrder !== undefined) {
     const cleaned = prunePromptVariableOrphans(reconciledPromptOrder, existing.metadata as Record<string, unknown>);
     if (cleaned && JSON.stringify(cleaned) !== JSON.stringify(existing.metadata)) {
@@ -393,11 +443,11 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
   if (writeMetadata !== undefined) { fields.push("metadata = ?"); values.push(JSON.stringify(writeMetadata)); }
 
   const expectedCacheRevision = input.expected_cache_revision;
-  if (fields.length === 0) {
+  if (fields.length === 0 && submittedConfig === undefined) {
     if (expectedCacheRevision !== undefined && expectedCacheRevision !== (existing.cache_revision ?? 0)) {
       throw new PresetRevisionConflictError(id, expectedCacheRevision, existing.cache_revision ?? 0);
     }
-    return existing;
+    return getPreset(userId, id)!;
   }
 
   fields.push("updated_at = ?", "cache_revision = cache_revision + 1");
@@ -426,17 +476,39 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
     return null;
   }
 
+  if (preparedConfig !== undefined && hasNormalizedAgentConfigTable()) {
+    writePresetAgentConfigWithDb(
+      db,
+      userId,
+      id,
+      {
+        config: preparedConfig.config,
+        expectedConfigRevision: (input as UpdatePresetInput & { expected_config_revision?: number }).expected_config_revision,
+      },
+      preparedConfig,
+    );
+  }
+  if (Object.hasOwn(input as object, "regex_scripts")) {
+    deleteRegexScriptsByPresetId(userId, id);
+    const nextName = input.name ?? existing.name;
+    importPortablePresetRegexScriptsWithDb(db, userId, id, nextName, {
+      name: nextName,
+      provider: input.provider ?? existing.provider,
+      regex_scripts: input.regex_scripts,
+    });
+  }
   const updated = getPreset(userId, id);
   if (!updated) return null;
   commitStashReconciliation?.();
   syncStashedBlocksAcrossPresets(userId, id, changedStashIds);
   eventBus.emit(EventType.PRESET_CHANGED, { id, preset: updated }, userId);
   return updated;
+  })());
 }
 
 export function deletePreset(userId: string, id: string): boolean {
+  return withUserDataMutationSync(userId, () => {
   const db = getDb();
-
   // Capture connection profiles that reference this preset. The FK on
   // connection_profiles.preset_id (ON DELETE SET NULL) will clear the
   // references when the preset row is removed, but we need the list up front
@@ -487,11 +559,12 @@ export function deletePreset(userId: string, id: string): boolean {
       has_api_key: !!row.has_api_key,
       metadata: JSON.parse(row.metadata),
     };
-    eventBus.emit(EventType.CONNECTION_PROFILE_LOADED, { id: connId, profile }, userId);
+    eventBus.emit(EventType.CONNECTION_PROFILE_LOADED, { id: connId, profile: toPublicConnection(profile) }, userId);
   }
 
   eventBus.emit(EventType.PRESET_DELETED, { id }, userId);
   return true;
+  });
 }
 
 function normalizePromptBlock(input: CreatePromptBlockInput): PromptBlock {

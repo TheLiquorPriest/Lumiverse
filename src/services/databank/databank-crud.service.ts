@@ -7,6 +7,7 @@ import { parsePagination, paginatedQuery } from "../pagination";
 import { eventBus } from "../../ws/bus";
 import { EventType } from "../../ws/events";
 import * as filesSvc from "../files.service";
+import { withUserDataMutation, withUserDataMutationSync } from "../user-data/snapshot";
 import { invalidateDatabankCache } from "./retrieval-cache.service";
 import {
   type Databank,
@@ -28,19 +29,20 @@ import type { PaginationParams, PaginatedResult } from "../../types/pagination";
 // ─── Banks ────────────────────────────────────────────────────
 
 export function createDatabank(userId: string, input: CreateDatabankInput): Databank {
-  const id = crypto.randomUUID();
-  const now = Math.floor(Date.now() / 1000);
-  const db = getDb();
+  return withUserDataMutationSync(userId, () => {
+    const id = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    const db = getDb();
+    db.run(
+      `INSERT INTO databanks (id, user_id, name, description, scope, scope_id, enabled, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, '{}', ?, ?)`,
+      [id, userId, input.name, input.description ?? "", input.scope, input.scopeId ?? null, now, now],
+    );
 
-  db.run(
-    `INSERT INTO databanks (id, user_id, name, description, scope, scope_id, enabled, metadata, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 1, '{}', ?, ?)`,
-    [id, userId, input.name, input.description ?? "", input.scope, input.scopeId ?? null, now, now],
-  );
-
-  const bank = getDatabank(userId, id)!;
-  eventBus.emit(EventType.DATABANK_CHANGED, { databankId: bank.id, databank: bank }, userId);
-  return bank;
+    const bank = getDatabank(userId, id)!;
+    eventBus.emit(EventType.DATABANK_CHANGED, { databankId: bank.id, databank: bank }, userId);
+    return bank;
+  });
 }
 
 export function listDatabanks(
@@ -89,6 +91,7 @@ export function getDatabank(userId: string, id: string): Databank | null {
 }
 
 export function updateDatabank(userId: string, id: string, input: UpdateDatabankInput): Databank | null {
+  return withUserDataMutationSync(userId, () => {
   const now = Math.floor(Date.now() / 1000);
   const sets: string[] = ["updated_at = ?"];
   const params: any[] = [now];
@@ -115,31 +118,27 @@ export function updateDatabank(userId: string, id: string, input: UpdateDatabank
     eventBus.emit(EventType.DATABANK_CHANGED, { databankId: bank.id, databank: bank }, userId);
   }
   return bank;
+  });
 }
-
 export async function deleteDatabank(userId: string, id: string): Promise<boolean> {
-  const db = getDb();
-
-  // Delete all document files from disk
-  const docs = db
-    .query("SELECT file_path FROM databank_documents WHERE databank_id = ? AND user_id = ?")
-    .all(id, userId) as Array<{ file_path: string }>;
-  for (const doc of docs) {
-    try {
-      await filesSvc.deleteFile(userId, doc.file_path, "databank");
-    } catch {
-      // non-fatal — file may already be gone
+  return withUserDataMutation(userId, async () => {
+    const db = getDb();
+    const docs = db
+      .query("SELECT file_path FROM databank_documents WHERE databank_id = ? AND user_id = ?")
+      .all(id, userId) as Array<{ file_path: string }>;
+    for (const doc of docs) {
+      try {
+        await filesSvc.deleteFile(userId, doc.file_path, "databank");
+      } catch {
+        // The file may already be absent.
+      }
     }
-  }
-
-  // CASCADE handles documents and chunks in SQLite
-  const result = db.run("DELETE FROM databanks WHERE id = ? AND user_id = ?", [id, userId]);
-  if (result.changes > 0) {
+    const result = db.run("DELETE FROM databanks WHERE id = ? AND user_id = ?", [id, userId]);
+    if (result.changes === 0) return false;
     invalidateDatabankCache(userId, id);
     eventBus.emit(EventType.DATABANK_DELETED, { databankId: id }, userId);
     return true;
-  }
-  return false;
+  });
 }
 
 /**
@@ -148,6 +147,7 @@ export async function deleteDatabank(userId: string, id: string): Promise<boolea
  * named after the chat.
  */
 export function ensureChatDatabank(userId: string, chatId: string, chatName: string): Databank {
+  return withUserDataMutationSync(userId, () => {
   const db = getDb();
   const existing = db
     .query(
@@ -170,6 +170,7 @@ export function ensureChatDatabank(userId: string, chatId: string, chatName: str
     scope: "chat",
     scopeId: chatId,
   });
+  });
 }
 
 // ─── Documents ────────────────────────────────────────────────
@@ -183,6 +184,7 @@ export function createDocument(
   fileSize: number,
   contentHash: string,
 ): DatabankDocument {
+  return withUserDataMutationSync(userId, () => {
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
   const slug = nameToSlug(name);
@@ -198,6 +200,7 @@ export function createDocument(
   const document = getDocument(userId, id)!;
   invalidateDatabankCache(userId, databankId);
   return document;
+  });
 }
 
 export function listDocuments(
@@ -237,6 +240,7 @@ export function hasSearchableChunks(userId: string, databankIds: string[]): bool
 }
 
 export function renameDocument(userId: string, id: string, newName: string): DatabankDocument | null {
+  return withUserDataMutationSync(userId, () => {
   const now = Math.floor(Date.now() / 1000);
   const slug = nameToSlug(newName);
   getDb().run(
@@ -246,6 +250,7 @@ export function renameDocument(userId: string, id: string, newName: string): Dat
   const document = getDocument(userId, id);
   if (document) invalidateDatabankCache(userId, document.databankId);
   return document;
+  });
 }
 
 export function getDocument(userId: string, id: string): DatabankDocument | null {
@@ -319,20 +324,17 @@ export function searchDocumentsBySlug(
 }
 
 export async function deleteDocument(userId: string, docId: string): Promise<boolean> {
-  const db = getDb();
-  const doc = getDocument(userId, docId);
-  if (!doc) return false;
-
-  // Delete file from disk
-  try {
-    await filesSvc.deleteFile(userId, doc.filePath, "databank");
-  } catch {
-    // non-fatal
-  }
-
-  // CASCADE handles chunks
-  const result = db.run("DELETE FROM databank_documents WHERE id = ? AND user_id = ?", [docId, userId]);
-  if (result.changes > 0) {
+  return withUserDataMutation(userId, async () => {
+    const db = getDb();
+    const doc = getDocument(userId, docId);
+    if (!doc) return false;
+    try {
+      await filesSvc.deleteFile(userId, doc.filePath, "databank");
+    } catch {
+      // The file may already be absent.
+    }
+    const result = db.run("DELETE FROM databank_documents WHERE id = ? AND user_id = ?", [docId, userId]);
+    if (result.changes === 0) return false;
     invalidateDatabankCache(userId, doc.databankId);
     eventBus.emit(EventType.DATABANK_DOCUMENT_STATUS, {
       documentId: docId,
@@ -340,10 +342,8 @@ export async function deleteDocument(userId: string, docId: string): Promise<boo
       status: "deleted",
     }, userId);
     return true;
-  }
-  return false;
+  });
 }
-
 /**
  * Replace a document's file metadata after the underlying file has been
  * rewritten on disk (used by the edit-content flow). Caller is responsible for
@@ -357,6 +357,7 @@ export function updateDocumentFile(
   fileSize: number,
   contentHash: string,
 ): void {
+  withUserDataMutationSync(userId, () => {
   const document = getDocument(userId, docId);
   const now = Math.floor(Date.now() / 1000);
   getDb().run(
@@ -366,6 +367,7 @@ export function updateDocumentFile(
     [filePath, mimeType, fileSize, contentHash, now, docId, userId],
   );
   if (document) invalidateDatabankCache(userId, document.databankId);
+  });
 }
 
 export function updateDocumentStatus(
@@ -376,6 +378,8 @@ export function updateDocumentStatus(
   const document = getDb()
     .query("SELECT user_id, databank_id FROM databank_documents WHERE id = ?")
     .get(docId) as { user_id: string; databank_id: string } | null;
+  if (!document) return;
+  withUserDataMutationSync(document.user_id, () => {
   const now = Math.floor(Date.now() / 1000);
   const sets = ["status = ?", "updated_at = ?"];
   const params: any[] = [status, now];
@@ -392,6 +396,7 @@ export function updateDocumentStatus(
   params.push(docId);
   getDb().run(`UPDATE databank_documents SET ${sets.join(", ")} WHERE id = ?`, params);
   if (document) invalidateDatabankCache(document.user_id, document.databank_id);
+  });
 }
 
 // ─── Chunks ───────────────────────────────────────────────────
@@ -406,19 +411,26 @@ export function insertChunks(chunks: Array<{
   tokenCount: number;
   metadata?: Record<string, unknown>;
 }>): void {
-  const db = getDb();
-  const now = Math.floor(Date.now() / 1000);
-  const stmt = db.query(
-    `INSERT INTO databank_chunks (id, document_id, databank_id, user_id, chunk_index, content, token_count, metadata, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
+  if (chunks.length === 0) return;
+  const userId = chunks[0]!.userId;
+  if (chunks.some((chunk) => chunk.userId !== userId)) {
+    throw new Error("Databank chunks must belong to one user");
+  }
+  withUserDataMutationSync(userId, () => {
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+    const stmt = db.query(
+      `INSERT INTO databank_chunks (id, document_id, databank_id, user_id, chunk_index, content, token_count, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
 
-  const tx = db.transaction(() => {
-    for (const c of chunks) {
-      stmt.run(c.id, c.documentId, c.databankId, c.userId, c.chunkIndex, c.content, c.tokenCount, JSON.stringify(c.metadata ?? {}), now);
-    }
+    const tx = db.transaction(() => {
+      for (const c of chunks) {
+        stmt.run(c.id, c.documentId, c.databankId, c.userId, c.chunkIndex, c.content, c.tokenCount, JSON.stringify(c.metadata ?? {}), now);
+      }
+    });
+    tx();
   });
-  tx();
 }
 
 export function getChunksForDocument(docId: string): DatabankChunk[] {
@@ -440,16 +452,28 @@ export function getChunksByIds(chunkIds: string[]): DatabankChunk[] {
 export function updateChunkVectorization(chunkIds: string[], vectorModel: string): void {
   if (chunkIds.length === 0) return;
   const db = getDb();
-  const now = Math.floor(Date.now() / 1000);
   const placeholders = chunkIds.map(() => "?").join(",");
-  db.run(
-    `UPDATE databank_chunks SET vectorized_at = ?, vector_model = ? WHERE id IN (${placeholders})`,
-    [now, vectorModel, ...chunkIds],
-  );
+  const owner = db.query(
+    `SELECT user_id FROM databank_chunks WHERE id IN (${placeholders}) LIMIT 1`,
+  ).get(...chunkIds) as { user_id: string } | null;
+  if (!owner) return;
+  withUserDataMutationSync(owner.user_id, () => {
+    const now = Math.floor(Date.now() / 1000);
+    db.run(
+      `UPDATE databank_chunks SET vectorized_at = ?, vector_model = ? WHERE id IN (${placeholders})`,
+      [now, vectorModel, ...chunkIds],
+    );
+  });
 }
 
 export function deleteChunksForDocument(docId: string): void {
-  getDb().run("DELETE FROM databank_chunks WHERE document_id = ?", [docId]);
+  const owner = getDb()
+    .query("SELECT user_id FROM databank_chunks WHERE document_id = ? LIMIT 1")
+    .get(docId) as { user_id: string } | null;
+  if (!owner) return;
+  withUserDataMutationSync(owner.user_id, () => {
+    getDb().run("DELETE FROM databank_chunks WHERE document_id = ?", [docId]);
+  });
 }
 
 export function getDocumentContent(userId: string, docId: string): string | null {

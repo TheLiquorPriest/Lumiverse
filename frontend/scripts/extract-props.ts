@@ -1,12 +1,20 @@
 import ts from "typescript";
 import path from "path";
 import { Glob } from "bun";
+import { componentRegistryKeyFromPath, joinComponentRegistryPaths } from "../src/lib/componentRegistryJoin";
 
 // A script to extract props AND module css for components
 console.time("Total Extraction Time");
 
 const glob = new Glob("src/components/**/*.tsx");
 const componentFiles = Array.from(glob.scanSync({ cwd: process.cwd(), absolute: true }));
+const cssModuleFiles = Array.from(new Glob("src/components/**/*.module.css").scanSync({ cwd: process.cwd(), absolute: true }));
+const cssPathByComponentPath = new Map<string, string>();
+for (const entry of joinComponentRegistryPaths(cssModuleFiles, componentFiles)) {
+  if (entry.cssPath !== null && entry.tsxPath !== null) {
+    cssPathByComponentPath.set(componentRegistryKeyFromPath(entry.tsxPath), entry.cssPath);
+  }
+}
 
 console.time("createProgram");
 const program = ts.createProgram(componentFiles, {
@@ -77,8 +85,8 @@ async function processAST() {
       }
 
       const checkAndAddCss = (componentName: string, filePath: string) => {
-        const dir = path.dirname(filePath);
-        const cssPath = path.join(dir, `${componentName}.module.css`);
+        const cssPath = cssPathByComponentPath.get(componentRegistryKeyFromPath(filePath));
+        if (!cssPath) return;
         promises.push(
           Bun.file(cssPath).exists().then((exists) => {
             if (exists) {

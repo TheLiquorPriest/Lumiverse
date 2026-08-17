@@ -1,3 +1,7 @@
+import type { AgentActivitySnapshotV1, AgentPublicErrorV1, AgentActivityContinuationMode, AgentPublicErrorCode } from './agent-runtime'
+import type { AgentUsage } from './api'
+import type { RoomParticipant, RoomStateView, PersonaSnapshot } from '@/types/multiplayer'
+
 export enum EventType {
   CONNECTED = 'CONNECTED',
   SETTINGS_UPDATED = 'SETTINGS_UPDATED',
@@ -15,6 +19,8 @@ export enum EventType {
   GENERATION_STARTED = 'GENERATION_STARTED',
   GENERATION_IN_PROGRESS = 'GENERATION_IN_PROGRESS',
   GENERATION_PHASE_CHANGED = 'GENERATION_PHASE_CHANGED',
+  GENERATION_AGENT_ACTIVITY = 'GENERATION_AGENT_ACTIVITY',
+  AGENT_RUN_CHANGED = 'AGENT_RUN_CHANGED',
   GENERATION_METRICS_READY = 'GENERATION_METRICS_READY',
   GENERATION_BREAKDOWN_READY = 'GENERATION_BREAKDOWN_READY',
   STREAM_TOKEN_RECEIVED = 'STREAM_TOKEN_RECEIVED',
@@ -352,6 +358,72 @@ export interface GenerationPhaseChangedPayload {
   chatId: string
   phase: 'reasoning' | 'streaming'
 }
+export type AgentInvocationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
+export type AgentActivityPhase = 'queued' | 'started' | 'tool_call' | 'completed' | 'failed' | 'cancelled' | 'timed_out'
+export type AgentActivityActor = 'main_model' | 'child_profile'
+export type AgentActivityToolName =
+  | 'lore_list_books'
+  | 'lore_get_book'
+  | 'lore_list_entries'
+  | 'lore_get_entry'
+  | 'lore_search_entries'
+  | 'chat_search_history'
+  | 'agent_delegate'
+
+/** Compact status-only activity. Unknown names/codes are rejected by the store. */
+export interface AgentActivityPayload {
+  generationId: string
+  chatId?: string
+  messageId?: string
+  swipeId?: number
+  targetSwipeId?: number
+  invocationId: string
+  parentInvocationId?: string
+  actor: AgentActivityActor
+  profileName?: string
+  phase: AgentActivityPhase
+  status: AgentInvocationStatus
+  errorCode?: AgentPublicErrorCode
+  toolName?: AgentActivityToolName
+  startedAt: number
+  elapsedMs: number
+  roundIndex?: number
+  continuationMode?: AgentActivityContinuationMode
+  usage?: AgentUsage & { toolCalls?: number; childInvocations?: number }
+}
+
+export interface AgentActivityInvocation {
+  invocationId: string
+  parentInvocationId?: string
+  actor: AgentActivityActor
+  profileName?: string
+  phase: AgentActivityPhase
+  status: AgentInvocationStatus
+  toolName?: AgentActivityToolName
+  startedAt: number
+  elapsedMs: number
+  roundIndex?: number
+  continuationMode?: AgentActivityContinuationMode
+  usage?: AgentUsage & { toolCalls?: number; childInvocations?: number }
+  errorCode?: AgentPublicErrorCode
+}
+
+export interface AgentActivityGeneration {
+  invocationOrder: string[]
+  invocations: Record<string, AgentActivityInvocation>
+  generationId?: string
+  chatId?: string
+  messageId?: string
+  swipeId?: number
+  eventCount?: number
+  eventBytes?: number
+  omittedNodeCount?: number
+  errorCounts?: Partial<Record<AgentPublicErrorCode, number>>
+  status?: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
+  terminalErrorCode?: AgentPublicErrorCode
+  usage?: AgentUsage & { toolCalls?: number; childInvocations?: number }
+}
+
 
 export interface GenerationMetrics {
   ttft?: number
@@ -366,11 +438,27 @@ export interface GenerationEndedPayload {
   generationId: string
   chatId: string
   messageId?: string
+  targetMessageId?: string
+  targetSwipeId?: number
   content?: string
   error?: string
+  agentError?: AgentPublicErrorV1
+  agentActivity?: AgentActivitySnapshotV1
   generationType?: string
   tokenCount?: number
   generationMetrics?: GenerationMetrics
+}
+
+export interface GenerationStoppedPayload {
+  generationId: string
+  chatId: string
+  messageId?: string
+  targetMessageId?: string
+  targetSwipeId?: number
+  content?: string
+  error?: string
+  agentError?: AgentPublicErrorV1
+  agentActivity?: AgentActivitySnapshotV1
 }
 
 /**
@@ -474,7 +562,6 @@ export interface GroupRoundCompletePayload {
 }
 
 // ── Multiplayer room payloads ──
-import type { RoomParticipant, RoomStateView, PersonaSnapshot } from '@/types/multiplayer'
 
 export interface RoomBasePayload {
   chatId: string

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { presetsRoutes } from "./presets.routes";
+import { AGENT_RUNTIME_HOST_LIMITS } from "../services/agent-runtime-limits";
 
 function initPresetsTestDb(): void {
   closeDatabase();
@@ -20,6 +21,20 @@ function initPresetsTestDb(): void {
     engine TEXT NOT NULL DEFAULT 'classic',
     cache_revision INTEGER NOT NULL DEFAULT 0
   )`);
+  getDb().run(`CREATE TABLE connection_profiles (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    api_url TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    preset_id TEXT,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    has_api_key INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+  )`);
 }
 
 function insertPreset(id: string, userId: string, cacheRevision = 0): void {
@@ -32,7 +47,9 @@ function insertPreset(id: string, userId: string, cacheRevision = 0): void {
 
 const app = new Hono();
 app.use("*", async (c, next) => {
-  c.set("userId", c.req.header("x-test-user")!);
+  const userId = c.req.header("x-test-user");
+  if (!userId) return c.json({ error: "Unauthorized" }, 401);
+  c.set("userId", userId);
   await next();
 });
 app.route("/", presetsRoutes);
@@ -126,5 +143,136 @@ describe("preset cache validators", () => {
     });
     const row = getDb().query("SELECT metadata, cache_revision FROM presets WHERE id = ?").get("preset-1");
     expect(row).toEqual({ metadata: "{}", cache_revision: 3 });
+  });
+});
+
+describe("preset agent config validation", () => {
+  test("strips reserved runtime metadata from ordinary create and update DTOs", async () => {
+    const response = await app.request("http://localhost/", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Ordinary preset",
+        provider: "loom",
+        metadata: {
+          agentConfig: { version: 1, enabled: true },
+          agent_config: { version: 2, agentsEnabled: true },
+          portableAgentConfig: { portableVersion: 1 },
+          agentRuntime: { version: 1 },
+          extensionData: { keep: true },
+        },
+      }),
+    });
+
+    expect(response.status).toBe(201);
+    const created = await response.json();
+    expect(created.metadata).toEqual({ extensionData: { keep: true } });
+    expect(created.agent_config).toBeUndefined();
+
+    const updatedResponse = await app.request(`http://localhost/${created.id}`, {
+      method: "PUT",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_cache_revision: created.cache_revision,
+        metadata: {
+          agentConfigReviewRequired: true,
+          agent_config_review: { state: "ready" },
+          agent_runtime: { version: 1 },
+          extensionData: { keep: "updated" },
+        },
+      }),
+    });
+    expect(updatedResponse.status).toBe(200);
+    const updated = await updatedResponse.json();
+    expect(updated.metadata).toEqual({ extensionData: { keep: "updated" } });
+    expect(updated.agent_config).toBeUndefined();
+  });
+
+  test("rejects V1 through the normalized V2 create DTO", async () => {
+    const response = await app.request("http://localhost/", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Legacy authority",
+        provider: "loom",
+        agent_config: {
+          version: 1,
+          enabled: true,
+          maxInvocations: 64,
+          maxToolCalls: 64,
+          mainToolIds: [],
+          mainLoreScope: "active",
+          profiles: [],
+        },
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: "agentConfig.enabled: unknown key",
+      code: "AGENT_CONFIG_INVALID",
+      path: "agentConfig.enabled",
+    });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM presets").get()).toEqual({ count: 0 });
+  });
+
+  test("keeps legacy metadata inert on ordinary preset writes", async () => {
+    const legacy = {
+      version: 1,
+      enabled: false,
+      maxInvocations: 64,
+      mainToolIds: [],
+      mainLoreScope: "active",
+      profiles: [],
+    };
+    const createdResponse = await app.request("http://localhost/", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({ name: "Legacy", provider: "loom", metadata: { agentConfig: legacy } }),
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json();
+    expect(created.metadata.agentConfig).toBeUndefined();
+    expect(created.agent_config).toBeUndefined();
+
+    const updatedResponse = await app.request(`http://localhost/${created.id}`, {
+      method: "PUT",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        expected_cache_revision: created.cache_revision,
+        metadata: {
+          agentConfig: { ...legacy, maxToolCalls: Number.MAX_SAFE_INTEGER },
+        },
+      }),
+    });
+    expect(updatedResponse.status).toBe(200);
+    const updated = await updatedResponse.json();
+    expect(updated.metadata.agentConfig).toBeUndefined();
+    expect(updated.agent_config).toBeUndefined();
+  });
+
+});
+
+describe("agent runtime host limits", () => {
+  test("requires authentication", async () => {
+    const response = await app.request("http://localhost/agent-runtime-limits");
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "Unauthorized" });
+  });
+
+  test("returns the exact sanitized canonical numeric limits", async () => {
+    const response = await app.request("http://localhost/agent-runtime-limits", {
+      headers: { "x-test-user": "u1" },
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual(AGENT_RUNTIME_HOST_LIMITS);
+    expect(Object.keys(body).sort()).toEqual(Object.keys(AGENT_RUNTIME_HOST_LIMITS).sort());
+    for (const value of Object.values(body)) {
+      expect(typeof value).toBe("number");
+      expect(Number.isSafeInteger(value)).toBe(true);
+    }
   });
 });

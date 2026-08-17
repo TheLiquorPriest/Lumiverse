@@ -76,6 +76,14 @@ const originalUrlDescriptors = new Map<string, PropertyDescriptor | undefined>(
     .map((key) => [key, Object.getOwnPropertyDescriptor(URL, key)]),
 )
 const windowMock = dom.window
+Object.defineProperty(windowMock, 'matchMedia', {
+  configurable: true,
+  value: () => ({
+    matches: false,
+    addEventListener() {},
+    removeEventListener() {},
+  }),
+})
 const nativeWindowAddEventListener = windowMock.addEventListener.bind(windowMock)
 const nativeWindowRemoveEventListener = windowMock.removeEventListener.bind(windowMock)
 let trackWindowHandlers = false
@@ -136,6 +144,9 @@ Object.defineProperty(URL, 'createObjectURL', {
 })
 Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: () => {} })
 const storeState = {
+  profiles: [],
+  activeProfileId: null as string | null,
+  spindleSettings: { infoLoggingEnabled: false },
   pendingPermissionRequest: null as { id: string; extensionId: string } | null,
   showPermissionRequest(request: { id: string; extensionId: string }) {
     storeState.pendingPermissionRequest = request
@@ -207,19 +218,57 @@ const presetAccessMock = {
   },
 }
 
+mock.module('@/i18n', () => ({
+  default: { t: (key: string) => key, language: 'en' },
+  UI_LANGUAGE_STORAGE_KEY: 'lumiverse-ui-language',
+  ensureLanguageLoaded: async () => {},
+  initI18n: async () => ({ t: (key: string) => key, language: 'en' }),
+  changeUiLanguage: async () => {},
+}))
 mock.module('@/store', () => ({ useStore: useStoreMock }))
-mock.module('@/ws/client', () => ({ wsClient: wsClientMock }))
+mock.module('@/ws/client', () => ({
+  wsClient: wsClientMock,
+  WS_OPEN: '__ws_open',
+  WS_CLOSE: '__ws_close',
+  WS_PONG: '__ws_pong',
+  WS_AUTH_ERROR: '__ws_auth_error',
+}))
 mock.module('@/api/spindle', () => ({ spindleApi: { getPermissions: () => permissionPromise } }))
 mock.module('@/api/characters', () => ({ charactersApi: { get: async () => null } }))
-mock.module('@/api/chats', () => ({ messagesApi: { update: async () => ({ id: 'message' }) } }))
+mock.module('@/api/chats', () => ({
+  chatsApi: { listCharacterChats: async () => [] },
+  messagesApi: { update: async () => ({ id: 'message' }) },
+}))
 mock.module('./dom-helper', () => ({ createDOMHelper: () => ({ cleanup() {} }) }))
-mock.module('./message-interceptors', () => ({ registerTagInterceptor: () => () => {}, unregisterTagInterceptorsByExtension() {} }))
+mock.module('./message-interceptors', () => ({
+  subscribeTagInterceptorRegistry: () => () => {},
+  getTagInterceptorRegistryVersion: () => 0,
+  registerTagInterceptor: () => () => {},
+  unregisterTagInterceptorsByExtension() {},
+  stripMessageTags: (content: string) => ({ content, intercepts: [] }),
+  dispatchMessageTagIntercepts() {},
+}))
 mock.module('./display-resolver-registry', () => ({ registerDisplayResolver: () => () => {}, unregisterDisplayResolver() {} }))
-mock.module('@/hooks/useDisplayRegex', () => ({ invalidateDisplayRegexCache() {}, invalidateDisplayRegexCacheForVars() {} }))
-mock.module('./message-widgets', () => ({ removeMessageWidgetsByExtension() {}, upsertMessageWidget: () => {}, removeMessageWidget() {} }))
+mock.module('@/hooks/useDisplayRegex', () => ({
+  useDisplayPreprocessed: (content: string) => content,
+  useDisplayRegex: (content: string) => content,
+  invalidateDisplayRegexCache() {},
+  invalidateDisplayRegexCacheForMessage() {},
+  invalidateDisplayRegexCacheForVars() {},
+}))
+mock.module('./message-widgets', () => ({
+  SpindleMessageWidgets: () => null,
+  subscribeMessageWidgets: () => () => {},
+  getMessageWidgetVersion: () => 0,
+  removeMessageWidgetsByExtension() {},
+  upsertMessageWidget: () => {},
+  removeMessageWidget() {},
+}))
 mock.module('./placement-helper', () => ({
   createDrawerTabHandle: () => ({ destroy() {} }),
+  createSettingsTabHandle: () => ({ destroy() {} }),
   createCharacterEditorTabHandle: () => ({ destroy() {} }),
+  createConnectionEditorTabHandle: () => ({ destroy() {} }),
   createPresetEditorTabHandle: () => ({ destroy() {} }),
   createPresetEditorToolbarItemHandle: () => ({ destroy() {} }),
   createFloatWidgetHandle: () => ({ destroy() {} }),
@@ -235,11 +284,19 @@ mock.module('./placement-helper', () => ({
   destroyPresetEditorPlacementsForExtension(extensionId: string) { placementDestroyCalls.push(`preset:${extensionId}`) },
 }))
 mock.module('./character-editor-helper', () => ({
+  setCharacterEditorController() {},
+  syncCharacterEditorState() {},
   getCharacterEditorState: () => ({}),
   subscribeCharacterEditorState: () => () => {},
   setCharacterEditorExtensions() {},
   updateCharacterEditorExtensions() {},
   flushCharacterEditorExtensions: async () => {},
+}))
+mock.module('./connection-editor-helper', () => ({
+  getConnectionEditorState: () => ({}),
+  getEditedConnectionProfileId: () => null,
+  subscribeConnectionEditorState: () => () => {},
+  subscribeConnectionEditorSaved: () => () => {},
 }))
 mock.module('./preset-editor-helper', () => ({
   getPresetEditorState: () => ({}),
@@ -258,13 +315,25 @@ mock.module('./components-helper', () => ({
   destroyComponentsForExtensionPermission() {},
 }))
 mock.module('@/lib/uuid', () => ({
+  uuidv7: () => 'uuid-v7',
   generateUUID: () => {
     uuidSequence += 1
     return uuidSequence === 1 ? 'request-id' : `request-id-${uuidSequence}`
   },
 }))
 mock.module('./navigation-guards', () => ({ installSpindleNavigationGuards() {} }))
-mock.module('@/lib/drawer-tab-registry', () => ({ DRAWER_TABS: [], ensureRegistryRoot: () => undefined }))
+mock.module('@/lib/drawer-tab-registry', () => ({
+  DRAWER_TABS: [],
+  ensureRegistryRoot: () => undefined,
+  isDrawerTabCore: () => false,
+  sanitizeHiddenDrawerTabIds: (ids: unknown) => Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [],
+  sanitizeDrawerTabOrder: (ids: unknown) => Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [],
+  applyDrawerTabOrder: <T>(items: T[]) => items,
+  adaptExtensionTabs: () => [],
+  registryToCommands: () => [],
+  extensionTabsToCommands: () => [],
+  extensionCommandsToCommands: () => [],
+}))
 mock.module('./ui-events-helper', () => ({
   createUIEventsHelper: () => ({}),
   destroyAllUIEventBindingsForExtension(extensionId: string) {
@@ -274,7 +343,10 @@ mock.module('./ui-events-helper', () => ({
     uiEventDestroyPermissionCalls.push({ extensionId, permission })
   },
 }))
-mock.module('./browser-scheduler', () => ({ yieldToBrowser: async () => {} }))
+mock.module('./browser-scheduler', () => ({
+  yieldToBrowser: async () => {},
+  scheduleSpindleDomTask: () => () => {},
+}))
 
 const lifecycleModuleSource = `
   export function teardown() {
