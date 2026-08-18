@@ -1031,8 +1031,14 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       setSavedFingerprint(`${runtimeDraftFingerprint(hydrated)}\n${JSON.stringify(nextPromptOrder)}`)
       setIsHydrated(true)
       if (!revisionMismatch) setSaveState('idle')
-    }).catch(() => {
+    }).catch((error: unknown) => {
       if (!active) return
+      const missingProjection = error instanceof ApiError && error.status === 404
+      if (!missingProjection) {
+        setIsHydrated(false)
+        if (dirtyRef.current) setSaveState('conflict')
+        return
+      }
       if (dirtyRef.current) {
         setIsHydrated(false)
         setSaveState('conflict')

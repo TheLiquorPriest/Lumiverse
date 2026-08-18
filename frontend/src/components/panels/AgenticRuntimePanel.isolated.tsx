@@ -73,7 +73,7 @@ let editorPresetRevision = 8
 let editorConfigRevision = 4
 let editorConfig: AgentConfigV2 | null = null
 let editorReview: LoomPreset['agentConfigReview'] = null
-let editorGetRejects = false
+let editorGetError: Error | null = null
 
 mock.module('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => undefined },
@@ -148,7 +148,7 @@ mock.module('./AgenticRuntimePanel.module.css', () => ({
 mock.module('@/api/agentic-runtime', () => ({
   agenticRuntimeApi: {
     getEditor: async (presetId: string) => {
-      if (editorGetRejects) throw new Error('Not found')
+      if (editorGetError) throw editorGetError
       return {
         presetId,
         config: editorConfig ?? agentConfig(),
@@ -409,7 +409,7 @@ afterEach(() => {
   editorConfigRevision = 4
   editorConfig = null
   editorReview = null
-  editorGetRejects = false
+  editorGetError = null
 })
 
 afterAll(() => {
@@ -1028,7 +1028,7 @@ describe('Agentic Runtime shared editor', () => {
   })
 
   test('lets a new preset enable agents when the editor projection is missing', async () => {
-    editorGetRejects = true
+    editorGetError = new ApiError(404, 'Not Found')
     const value = preset()
     value.agentConfig = null
     value.agentConfigRevision = 0
@@ -1041,6 +1041,17 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => enable!.click())
     expect(enable!.getAttribute('aria-checked')).toBe('true')
     expect(container.textContent).not.toContain('validation.invalid_config')
+  })
+
+  test('does not treat a failed editor load as a dormant writable draft', async () => {
+    editorGetError = new ApiError(500, 'Internal Server Error')
+    const value = preset()
+    const { container } = renderPanel({ value })
+    await settle()
+    const enable = container.querySelector<HTMLButtonElement>('[aria-label="activation.enable"]')
+    expect(enable).not.toBeNull()
+    flushSync(() => enable!.click())
+    expect(enable!.getAttribute('aria-checked')).toBe('false')
   })
 
   test('shows actual runtime ceilings as information and exposes no control that can raise them', async () => {
