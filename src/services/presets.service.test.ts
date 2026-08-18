@@ -21,6 +21,7 @@ import {
   saveAgentRuntimeSharedDraft,
   writePresetAgentConfigWithDb,
 } from "./agent-config-portability.service";
+import { createDisabledAgentConfigV2 } from "../types/agents";
 import type { WorkspaceOperationKindV1 } from "../types/turn-workspace";
 import { PresetRevisionConflictError, type PromptBlock } from "../types/preset";
 import { addPromptBlockToStash, removePromptBlockFromStash } from "./prompt-stash.service";
@@ -968,6 +969,38 @@ describe("presets.service — active preset recovery", () => {
         ...agentConfig,
         agentsEnabled: false,
       }).agentsEnabled).toBe(false);
+    });
+
+    test("projects a dormant editor for an owned preset that has no agent-config row", () => {
+      const created = createPreset("u1", { name: "Plain loom", provider: "loom" });
+      expect(created.agent_config).toBeUndefined();
+      const editor = getAgentRuntimeSharedDraft("u1", created.id);
+      expect(editor).not.toBeNull();
+      expect(editor?.configRevision).toBe(0);
+      expect(editor?.config).toEqual(createDisabledAgentConfigV2());
+      expect(editor?.review.state).toBe("ready");
+      expect(editor?.review.items).toEqual([]);
+    });
+
+    test("creates the first agent-config row from expectedConfigRevision 0", () => {
+      const created = createPreset("u1", { name: "First runtime save", provider: "loom" });
+      const before = getAgentRuntimeSharedDraft("u1", created.id)!;
+      expect(before.configRevision).toBe(0);
+      const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
+        config: { ...createDisabledAgentConfigV2(), agentsEnabled: true, allowedModes: ["response", "agentic"], defaultMode: "response" },
+        slotBindings: [],
+        contextPackSelections: [],
+        contextRules: [],
+        taskTemplates: [],
+        reviewAcknowledgements: [],
+        promptOrder: created.prompt_order ?? [],
+        expectedPresetRevision: before.presetRevision,
+        expectedConfigRevision: 0,
+      });
+      expect(saved.editor.configRevision).toBe(1);
+      expect(saved.editor.config.agentsEnabled).toBe(true);
+      expect(saved.editor.config.allowedModes).toEqual(["response", "agentic"]);
+      expect(getPreset("u1", created.id)?.agent_config?.agentsEnabled).toBe(true);
     });
   });
 

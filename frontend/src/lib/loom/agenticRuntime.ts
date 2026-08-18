@@ -436,26 +436,33 @@ export function createAgentProfileV2(
 }
 
 
+export function normalizeAgentConfigForEditor(config: AgentConfigV2): AgentConfigV2 {
+  const next: AgentConfigV2 = {
+    ...config,
+    profiles: Array.isArray(config.profiles)
+      ? config.profiles.map((profile) => isUnknownRecord(profile)
+        ? {
+            ...profile,
+            workspaceCapabilities: Array.isArray(profile.workspaceCapabilities)
+              ? [...profile.workspaceCapabilities]
+              : profile.workspaceCapabilities,
+          } as AgentProfileConfigV2
+        : profile)
+      : [],
+  }
+  if (next.cognitionPolicy == null) next.cognitionPolicy = defaultCognitionPolicy()
+  if (next.contextPolicy == null) next.contextPolicy = { ruleIds: [], packIds: [] }
+  if (next.taskPolicy == null) next.taskPolicy = { templateIds: [] }
+  if (next.workspacePolicy == null) next.workspacePolicy = { retention: 'turn_terminal', sharing: 'view_only' }
+  return next
+}
+
 export function createAgenticRuntimeDraft(preset: LoomPreset): AgenticRuntimeSaveDraft {
-  const config = (isUnknownRecord(preset.agentConfig)
-    ? structuredClone(preset.agentConfig)
-    : createDefaultAgentConfigV2()) as AgentConfigV2
-  if (config.cognitionPolicy === null || config.cognitionPolicy === undefined) config.cognitionPolicy = defaultCognitionPolicy()
-  if (config.contextPolicy === null || config.contextPolicy === undefined) config.contextPolicy = { ruleIds: [], packIds: [] }
-  if (config.taskPolicy === null || config.taskPolicy === undefined) config.taskPolicy = { templateIds: [] }
-  if (Array.isArray(config.profiles)) {
-    config.profiles = config.profiles.map((profile) => isUnknownRecord(profile)
-      ? {
-          ...profile,
-          workspaceCapabilities: Array.isArray(profile.workspaceCapabilities)
-            ? [...profile.workspaceCapabilities]
-            : profile.workspaceCapabilities,
-        } as AgentProfileConfigV2
-      : profile)
-  }
-  if (config.workspacePolicy === null || config.workspacePolicy === undefined) {
-    config.workspacePolicy = { retention: 'turn_terminal', sharing: 'view_only' }
-  }
+  const config = normalizeAgentConfigForEditor(
+    (isUnknownRecord(preset.agentConfig)
+      ? structuredClone(preset.agentConfig)
+      : createDefaultAgentConfigV2()) as AgentConfigV2,
+  )
   const reviewValue: unknown = preset.agentConfigReview
   const reviewItems = isUnknownRecord(reviewValue) && Array.isArray(reviewValue.items)
     ? reviewValue.items.filter((item): item is AgentConfigRepairItem => isValidRepairItem(item))
@@ -742,6 +749,7 @@ function validateCognitionBlocks(
     }
   }
   const policy: unknown = (config as unknown as Record<string, unknown>).cognitionPolicy
+  if (policy === undefined || policy === null) return
   if (!isCognitionPolicyShape(policy)) {
     issues.push({ code: 'invalid_config', path: 'config.cognitionPolicy' })
     return
@@ -860,14 +868,17 @@ function validateTaskPolicy(
   templateIds: ReadonlySet<string>,
   issues: AgenticRuntimeValidationIssue[],
 ): void {
-  if (!isUnknownRecord(policyValue)
-    || !hasOnlyKeys(policyValue, ['templateIds'])
-    || !isIndexedArray(policyValue.templateIds)) {
+  const policy = policyValue === undefined || policyValue === null
+    ? { templateIds: [] }
+    : policyValue
+  if (!isUnknownRecord(policy)
+    || !hasOnlyKeys(policy, ['templateIds'])
+    || !isIndexedArray(policy.templateIds)) {
     issues.push({ code: 'invalid_task_policy', path: 'config.taskPolicy' })
     return
   }
   const policyIds = new Set<string>()
-  policyValue.templateIds.forEach((templateId, index) => {
+  policy.templateIds.forEach((templateId, index) => {
     if (typeof templateId !== 'string'
       || !POLICY_ID_PATTERN.test(templateId)
       || policyIds.has(templateId)
@@ -987,11 +998,14 @@ function validateContextPolicy(
   selectedRulePackIds: ReadonlySet<string>,
   issues: AgenticRuntimeValidationIssue[],
 ): void {
-  if (!isAgentContextPolicy(policyValue)) {
+  const resolvedPolicy = policyValue === undefined || policyValue === null
+    ? { ruleIds: [], packIds: [] }
+    : policyValue
+  if (!isAgentContextPolicy(resolvedPolicy)) {
     issues.push({ code: 'invalid_context_policy', path: 'config.contextPolicy' })
     return
   }
-  const policy = policyValue
+  const policy = resolvedPolicy
   const policyPackIds = new Set<string>()
   policy.packIds.forEach((packId, index) => {
     if (!packId.trim() || policyPackIds.has(packId)) {

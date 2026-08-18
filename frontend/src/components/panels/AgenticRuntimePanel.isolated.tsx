@@ -73,6 +73,7 @@ let editorPresetRevision = 8
 let editorConfigRevision = 4
 let editorConfig: AgentConfigV2 | null = null
 let editorReview: LoomPreset['agentConfigReview'] = null
+let editorGetRejects = false
 
 mock.module('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => undefined },
@@ -146,19 +147,22 @@ mock.module('./AgenticRuntimePanel.module.css', () => ({
 }))
 mock.module('@/api/agentic-runtime', () => ({
   agenticRuntimeApi: {
-    getEditor: async (presetId: string) => ({
-      presetId,
-      config: editorConfig ?? agentConfig(),
-      review: editorReview,
-      presetRevision: editorPresetRevision,
-      configRevision: editorConfigRevision,
-      contextPackSelections: editorContextSelections,
-      contextRules: editorContextRules,
-      taskTemplates: editorTaskTemplates,
-      reviewAcknowledgements: editorReviewAcknowledgements,
-      slotBindings: {},
-      hostCeilings,
-    }),
+    getEditor: async (presetId: string) => {
+      if (editorGetRejects) throw new Error('Not found')
+      return {
+        presetId,
+        config: editorConfig ?? agentConfig(),
+        review: editorReview,
+        presetRevision: editorPresetRevision,
+        configRevision: editorConfigRevision,
+        contextPackSelections: editorContextSelections,
+        contextRules: editorContextRules,
+        taskTemplates: editorTaskTemplates,
+        reviewAcknowledgements: editorReviewAcknowledgements,
+        slotBindings: {},
+        hostCeilings,
+      }
+    },
   },
 }))
 mock.module('@/api/agent-context-packs', () => ({
@@ -405,6 +409,7 @@ afterEach(() => {
   editorConfigRevision = 4
   editorConfig = null
   editorReview = null
+  editorGetRejects = false
 })
 
 afterAll(() => {
@@ -985,6 +990,57 @@ describe('Agentic Runtime shared editor', () => {
     expect(document.activeElement).toBe(tabs[1])
     expect(tabs[1]?.getAttribute('aria-selected')).toBe('true')
     expect(tabs[1]?.tabIndex).toBe(0)
+  })
+
+  test('does not treat a dormant backend config as invalid or unsavable', async () => {
+    const value = preset()
+    value.agentConfig = {
+      version: 2,
+      agentsEnabled: false,
+      allowedModes: ['response'],
+      defaultMode: 'response',
+      maxInvocations: 64,
+      maxToolCalls: 64,
+      mainToolIds: [],
+      mainLoreScope: 'active',
+      profiles: [],
+      connectionSlots: [],
+    }
+    editorConfig = structuredClone(value.agentConfig)
+    const { container } = renderPanel({ value })
+    await settle()
+    expect(container.textContent).not.toContain('validation.invalid_config')
+    const enable = container.querySelector<HTMLButtonElement>('[aria-label="activation.enable"]')
+    expect(enable).not.toBeNull()
+    expect(enable!.disabled).toBe(false)
+    flushSync(() => enable!.click())
+    expect(enable!.getAttribute('aria-checked')).toBe('true')
+    const agentic = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+      .find((input) => input.closest('label')?.textContent?.includes('modes.agentic'))
+    expect(agentic).not.toBeNull()
+    expect(agentic!.disabled).toBe(false)
+    flushSync(() => {
+      agentic!.checked = true
+      agentic!.dispatchEvent(new domWindow.Event('change', { bubbles: true }))
+    })
+    expect(container.textContent).not.toContain('validation.invalid_config')
+    expect(container.textContent).not.toContain('validation.invalid_modes')
+  })
+
+  test('lets a new preset enable agents when the editor projection is missing', async () => {
+    editorGetRejects = true
+    const value = preset()
+    value.agentConfig = null
+    value.agentConfigRevision = 0
+    value.agentConfigReview = null
+    const { container } = renderPanel({ value })
+    await settle()
+    const enable = container.querySelector<HTMLButtonElement>('[aria-label="activation.enable"]')
+    expect(enable).not.toBeNull()
+    expect(enable!.disabled).toBe(false)
+    flushSync(() => enable!.click())
+    expect(enable!.getAttribute('aria-checked')).toBe('true')
+    expect(container.textContent).not.toContain('validation.invalid_config')
   })
 
   test('shows actual runtime ceilings as information and exposes no control that can raise them', async () => {

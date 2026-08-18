@@ -22,6 +22,7 @@ import {
   AGENT_TIMEOUT_MS_MIN,
   createAgenticRuntimeDraft,
   createDefaultAgentConfigV2,
+  normalizeAgentConfigForEditor,
   validateAgenticRuntimeDraft,
 } from './agenticRuntime'
 
@@ -442,9 +443,40 @@ describe('Agentic Runtime shared draft validation', () => {
     candidate.config.taskPolicy = { templateIds: ['task_1', 'task_1'] }
     expect(validateAgenticRuntimeDraft(candidate, [], 0).issues)
       .toContainEqual({ code: 'invalid_task_policy', path: 'config.taskPolicy.templateIds.1' })
-
     candidate.config.taskPolicy = { templateIds: [] }
     expect(validateAgenticRuntimeDraft(candidate, [], 0).issues)
       .toContainEqual({ code: 'invalid_task_policy', path: 'taskTemplates.task_1' })
+  })
+
+  test('accepts a dormant backend config that omits optional policies', () => {
+    const sparse = {
+      version: 2 as const,
+      agentsEnabled: false,
+      allowedModes: ['response' as const],
+      defaultMode: 'response' as const,
+      maxInvocations: 64,
+      maxToolCalls: 64,
+      mainToolIds: [],
+      mainLoreScope: 'active' as const,
+      profiles: [],
+      connectionSlots: [],
+    }
+    const candidate = draft()
+    candidate.config = sparse
+    expect(validateAgenticRuntimeDraft(candidate, [], 0)).toEqual({ valid: true, issues: [] })
+
+    const hydrated = createAgenticRuntimeDraft({
+      ...presetWithMetadata({}),
+      agentConfig: sparse,
+      blocks: [],
+    })
+    expect(hydrated.config.cognitionPolicy).toEqual({
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    })
+    expect(validateAgenticRuntimeDraft(hydrated, [], 0)).toEqual({ valid: true, issues: [] })
+    expect(normalizeAgentConfigForEditor(sparse).taskPolicy).toEqual({ templateIds: [] })
   })
 })

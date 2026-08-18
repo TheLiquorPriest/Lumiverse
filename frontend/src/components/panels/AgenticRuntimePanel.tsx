@@ -53,6 +53,7 @@ import {
   createAgentPromptBlock,
   createAgentProfileV2,
   createAgenticRuntimeDraft,
+  normalizeAgentConfigForEditor,
   getAgentResultName,
   getAgenticRuntimeRepairItems,
   isAgentContextActivationRule,
@@ -828,14 +829,14 @@ function hydrateDraftFromEditor(
   current: AgenticRuntimeSaveDraft,
   editor: AgenticRuntimeEditorProjection,
 ): AgenticRuntimeSaveDraft {
-  const config = editor.config && typeof editor.config === 'object' && !Array.isArray(editor.config)
-    ? structuredClone(editor.config)
+  const rawConfig = editor.config && typeof editor.config === 'object' && !Array.isArray(editor.config)
+    ? structuredClone(editor.config) as AgenticRuntimeSaveDraft['config']
     : current.config
   const slotBindings = editor.slotBindings && typeof editor.slotBindings === 'object' && !Array.isArray(editor.slotBindings)
     ? { ...editor.slotBindings }
     : current.slotBindings
   return {
-    config,
+    config: normalizeAgentConfigForEditor(rawConfig),
     slotBindings,
     contextPackSelections: editor.contextPackSelections === undefined
       ? current.contextPackSelections
@@ -966,6 +967,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     const currentConfigRevision = preset.agentConfigRevision ?? 0
     const revisionChanged = observedPresetRevisionRef.current !== currentPresetRevision
       || observedConfigRevisionRef.current !== currentConfigRevision
+    if (saveInFlightRef.current) {
+      observedPresetRevisionRef.current = currentPresetRevision
+      observedConfigRevisionRef.current = currentConfigRevision
+      return
+    }
     setIsHydrated(false)
     setContextAvailabilityLoaded(false)
     if (dirtyRef.current && revisionChanged) {
@@ -978,9 +984,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     void agenticRuntimeApi.getEditor(preset.id).then((projection) => {
       if (!active) return
       const authoritative = projection.presetId === preset.id
-        && projection.presetRevision === currentPresetRevision
+        && Number.isSafeInteger(projection.presetRevision)
+        && projection.presetRevision >= 0
         && Number.isSafeInteger(projection.configRevision)
-        && projection.configRevision >= 1
+        && projection.configRevision >= 0
         && projection.config !== null
         && typeof projection.config === 'object'
         && !Array.isArray(projection.config)
@@ -1025,7 +1032,28 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       setIsHydrated(true)
       if (!revisionMismatch) setSaveState('idle')
     }).catch(() => {
-      if (active) setIsHydrated(false)
+      if (!active) return
+      if (dirtyRef.current) {
+        setIsHydrated(false)
+        setSaveState('conflict')
+        return
+      }
+      const local = createAgenticRuntimeDraft(preset)
+      const nextPromptOrder = structuredClone(preset.blocks)
+      committedDraftRef.current = structuredClone(local)
+      committedPromptOrderRef.current = nextPromptOrder
+      pendingExternalDraftRef.current = null
+      pendingExternalPromptOrderRef.current = null
+      observedConfigRevisionRef.current = preset.agentConfigRevision ?? 0
+      setRepairedSlotIds(new Set())
+      setEditorReviewItems(getAgenticRuntimeRepairItems(preset))
+      setDraft(local)
+      setPromptOrder(nextPromptOrder)
+      setMaxInvocationsInput(String(local.config.maxInvocations))
+      setMaxToolCallsInput(String(local.config.maxToolCalls))
+      setSavedFingerprint(`${runtimeDraftFingerprint(local)}\n${JSON.stringify(nextPromptOrder)}`)
+      setIsHydrated(true)
+      setSaveState('idle')
     })
     void agentContextPacksApi.list().then(async ({ data }) => {
       const details = await Promise.all(data
@@ -2183,6 +2211,9 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }
 
   const firstIssue = validation.issues[0]
+  const validationStatus = validation.issues.length === 0
+    ? null
+    : validation.issues.map((issue) => `${t(`validation.${issue.code}`)} (${issue.path})`).join(' ')
   return (
     <div className={styles.panel}>
       <header className={styles.hero}>
@@ -2200,7 +2231,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       </div>
       <div className={styles.liveRegion} aria-live="polite" aria-atomic="true">{saveState === 'saved' ? t('save.saved') : saveState === 'conflict' ? t('save.conflict') : saveState === 'error' ? t('save.error') : ''}</div>
       <footer className={styles.saveBar}>
-        <span id={SAVE_VALIDATION_REASON_ID} className={clsx(styles.saveStatus, (firstIssue || saveState === 'conflict' || saveState === 'error') && styles.saveStatusError)}>{saveState === 'saving' ? t('save.saving') : saveState === 'conflict' ? t('save.conflict') : saveState === 'error' ? t('save.error') : firstIssue ? t(`validation.${firstIssue.code}`) : dirty ? t('save.unsaved') : t('save.saved')}</span>
+        <span id={SAVE_VALIDATION_REASON_ID} className={clsx(styles.saveStatus, (firstIssue || saveState === 'conflict' || saveState === 'error') && styles.saveStatusError)}>{saveState === 'saving' ? t('save.saving') : saveState === 'conflict' ? t('save.conflict') : saveState === 'error' ? t('save.error') : validationStatus ? validationStatus : dirty ? t('save.unsaved') : t('save.saved')}</span>
         <button type="button" className={styles.button} disabled={!dirty || saveState === 'saving'} onClick={resetDraft}>{t('save.reset')}</button>
         <button type="button" className={styles.primaryButton} disabled={!canSave} aria-describedby={SAVE_VALIDATION_REASON_ID} onClick={() => { void handleSave() }}><Save size={17} aria-hidden="true" />{saveState === 'saving' ? t('save.saving') : t('save.action')}</button>
       </footer>

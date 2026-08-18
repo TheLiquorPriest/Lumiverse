@@ -1276,10 +1276,13 @@ export function getPresetAgentCognitionSourceV1(userId: string, presetId: string
 
 export function getAgentRuntimeSharedDraft(userId: string, presetId: string): AgentRuntimeSharedDraftResultV1["editor"] | null {
   const db = getDb();
-  const projection = getPresetAgentConfig(userId, presetId);
-  if (!projection) return null;
   const preset = db.query("SELECT cache_revision FROM presets WHERE user_id = ? AND id = ?").get(userId, presetId) as { cache_revision?: unknown } | null;
   if (!preset) return null;
+  const projection = getPresetAgentConfig(userId, presetId);
+  const config = projection?.config ?? createDisabledAgentConfigV2();
+  const review = projection?.review ?? { state: "ready" as const, reasonCode: null, unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false };
+  const configRevision = projection?.configRevision ?? 0;
+  const bindings = projection?.bindings ?? [];
   const authoredRow = tableExists(db, "preset_agent_configs")
     ? db.query("SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?").get(userId, presetId) as { config_json?: unknown } | null
     : null;
@@ -1291,10 +1294,10 @@ export function getAgentRuntimeSharedDraft(userId: string, presetId: string): Ag
   return {
     presetId,
     presetRevision: Number(preset.cache_revision) || 0,
-    configRevision: projection.configRevision,
-    config: projection.config,
-    review: editorReview(projection.review, projection.configRevision, reviewAcknowledgements),
-    slotBindings: projection.bindings,
+    configRevision,
+    config,
+    review: editorReview(review, configRevision, reviewAcknowledgements),
+    slotBindings: bindings,
     contextPackSelections: boundedList(authored.contextPackSelections),
     contextRules: boundedList(authored.contextRules),
     taskTemplates: boundedList(authored.taskTemplates),
@@ -1386,7 +1389,7 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
     if (!Number.isSafeInteger(expectedPresetRevision) || (expectedPresetRevision as number) < 0) throw new Error("PRESET_REVISION_REQUIRED");
     const actualPresetRevision = Number(preset.cache_revision) || 0;
     if (expectedPresetRevision !== actualPresetRevision) throw new Error("PRESET_REVISION_CONFLICT");
-    if (!Number.isSafeInteger(draft.expectedConfigRevision) || (draft.expectedConfigRevision as number) < 1) throw new Error("AGENT_CONFIG_REVISION_REQUIRED");
+    if (!Number.isSafeInteger(draft.expectedConfigRevision) || (draft.expectedConfigRevision as number) < 0) throw new Error("AGENT_CONFIG_REVISION_REQUIRED");
     const contextPackSelections = normalizeContextPackSelections(normalizeDraftList(draft.contextPackSelections, "contextPackSelections"));
     const contextRules = normalizeContextRules(normalizeDraftList(draft.contextRules, "contextRules"), contextPackSelections);
     const taskTemplates = normalizeDraftList(draft.taskTemplates, "taskTemplates");
