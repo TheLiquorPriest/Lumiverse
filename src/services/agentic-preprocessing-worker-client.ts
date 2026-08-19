@@ -3,6 +3,11 @@ import {
   isPreparationFailureCode,
   isPreparationProtocolEnvelopeV1,
 } from "../types/agent-preprocessing";
+import {
+  CANONICAL_SNAPSHOT_DATA_LIMITS_V1,
+  CanonicalDataError,
+  encodeCanonicalPlainData,
+} from "../utils/canonical-plain-data";
 import { defaultIsolateCommand } from "./isolate-process";
 import type {
   PreparationLimitsV1,
@@ -42,11 +47,17 @@ export type AgenticAssemblyInputV1 =
   | CompileAgentAssemblyRequestV1["snapshot"]
   | Pick<CompileAgentAssemblyRequestV1, "snapshot" | "agentConfig">;
 function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).filter((key) => record[key] !== undefined).sort();
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
+  try {
+    return encodeCanonicalPlainData(value, {
+      ...CANONICAL_SNAPSHOT_DATA_LIMITS_V1,
+      maxBytes: HOST_PREPARATION_LIMITS_V1.maxInputBytes + HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
+    });
+  } catch (error) {
+    if (error instanceof CanonicalDataError && error.code === "limit_exceeded") {
+      throw new IsolatePoolError("worker_malformed", "Agentic render binding exceeds canonical data limits");
+    }
+    throw new IsolatePoolError("worker_malformed", "Agentic render binding is not closed plain data");
+  }
 }
 
 function requestedAssemblySnapshot(job: ActiveIsolateJob<unknown, unknown>): Record<string, unknown> | null {
@@ -237,8 +248,7 @@ function strictWorkerRequest(job: ActiveIsolateJob<unknown, unknown>): unknown {
   }
   return makeRequestEnvelopeV1(job.requestId, job.operation, strictPayload);
 }
-
-export function parseAgenticPreprocessingResponseV1(message: unknown, job: ActiveIsolateJob<unknown, unknown>): unknown {
+export async function parseAgenticPreprocessingResponseV1(message: unknown, job: ActiveIsolateJob<unknown, unknown>): Promise<unknown> {
   if (!isIsolateResponseEnvelopeV1(message) || message.requestId !== job.requestId) {
     throw new IsolatePoolError("worker_malformed", "Agentic preprocessing isolate response is malformed");
   }
@@ -269,7 +279,7 @@ export function parseAgenticPreprocessingResponseV1(message: unknown, job: Activ
       ) {
         throw new IsolatePoolError("worker_malformed", "Agentic assembly request limits are missing");
       }
-      validateAssemblyPlanAgainstSnapshotV1(
+      await validateAssemblyPlanAgainstSnapshotV1(
         result as unknown as CompilerAssemblyPlanV1,
         requested as unknown as GenerationAssemblySnapshotV1,
         requestedLimits as PreparationLimitsV1,
@@ -292,16 +302,11 @@ export function parseAgenticPreprocessingResponseV1(message: unknown, job: Activ
         throw new IsolatePoolError("worker_malformed", "Agentic render request limits are missing");
       }
       const limits = getEffectiveRenderPreparationLimits(requestedLimits as PreparationLimitsV1);
-      const input = validateRenderPreparationInputV1({
-        ...requested,
-        version: 1,
-        operation: job.operation,
-        requestId: job.requestId,
-      }, limits);
-      if (input.operation !== job.operation) {
-        throw new IsolatePoolError("worker_malformed", "Agentic render request identity is invalid");
-      }
+      const input = validateRenderPreparationInputV1(requested, limits);
       const validated = validateRenderPreparationResultV1(result, limits);
+      if (validated.operation !== job.operation || validated.requestId !== job.requestId) {
+        throw new IsolatePoolError("worker_malformed", "Agentic render result identity is invalid");
+      }
       assertRenderResultBinding(validated, input);
     } catch (error) {
       if (error instanceof IsolatePoolError) throw error;
@@ -469,7 +474,7 @@ export async function compileAgentAssemblyPlan(
       try {
         const [primaryRaw, verifier] = await Promise.all([primaryPromise, verifierPromise]);
         const primary = primaryRaw;
-        validateAssemblyPlanAgainstSnapshotV1(primary, sourceSnapshot);
+        await validateAssemblyPlanAgainstSnapshotV1(primary, sourceSnapshot);
         assertPairedAssemblyResultsV1(primary, verifier);
         return primary;
       } catch (error) {

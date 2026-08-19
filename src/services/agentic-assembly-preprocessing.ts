@@ -1,6 +1,8 @@
 import { buildEnv, type BuildEnvContext } from "../macros/MacroEnv";
-import { parse } from "../macros/MacroParser";
-import type { AstNode, MacroEnv } from "../macros/types";
+import { evaluate } from "../macros/MacroEvaluator";
+import { registry } from "../macros/MacroRegistry";
+import { initMacros } from "../macros";
+import type { MacroEnv } from "../macros/types";
 import {
   activateWorldInfo,
   normalizeWorldInfoSettings,
@@ -12,6 +14,7 @@ import type { Message } from "../types/message";
 import type { WorldBookEntry, WorldInfoCache } from "../types/world-book";
 import {
   createExpansionBudget,
+  PreparationLimitExceededError,
   type ExpansionBudgetV1,
   type PreparationDeltaV1,
   type PreparationLimitsV1,
@@ -26,7 +29,6 @@ import type {
 } from "./prompt-assembly-snapshot.service";
 import { runRegexRequest } from "../utils/regex-sandbox-core";
 const RESULT_MARKER_RE = /\{\{(?:agent(?:::|Result::)[^}]*)|\/agent\}\}/;
-const MAX_MACRO_DEPTH = 64;
 const MAX_REGEX_MATCHES = 10_000;
 
 export interface SnapshotWorldPreparationV1 {
@@ -54,6 +56,7 @@ function stringValue(value: unknown, fallback = ""): string {
 function boolValue(value: unknown): boolean {
   return value === true || value === 1 || value === "1";
 }
+
 
 function numberValue(value: unknown, fallback = 0): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
@@ -176,7 +179,8 @@ export function buildSnapshotMacroEnv(snapshot: GenerationAssemblySnapshotV1): M
   const env = buildEnv(context);
   env.commit = false;
   env.dynamicMacros = {};
-  const macroVariables = record(snapshot.chat.metadata).macro_variables;
+  const metadata = record(snapshot.chat.metadata);
+  const macroVariables = record(metadata.macro_variables);
   const globalValues = scalarMap(record(macroVariables).global);
   env.variables.global = new Map(Object.entries(globalValues).map(([key, value]) => [key, String(value)] as [string, string]));
   env.variables.chat = new Map(Object.entries(scalarMap(snapshot.variables.chat)).map(([key, value]) => [key, String(value)] as [string, string]));
@@ -189,6 +193,22 @@ export function buildSnapshotMacroEnv(snapshot: GenerationAssemblySnapshotV1): M
   env.extra.promptVariableSelections = {};
   env.extra.worldInfoOutlets = {};
   env.extra.worldInfoAtMarker = "";
+  env.extra.loom = {
+    summary: stringValue(metadata.loom_summary),
+    selectedStyles: Array.isArray(metadata.selectedLoomStyles) ? metadata.selectedLoomStyles : [],
+    selectedUtils: Array.isArray(metadata.selectedLoomUtils) ? metadata.selectedLoomUtils : [],
+    selectedRetrofits: Array.isArray(metadata.selectedLoomRetrofits) ? metadata.selectedLoomRetrofits : [],
+  };
+  env.extra.sovereignHand = {
+    enabled: boolValue(metadata.sovereignHandEnabled ?? record(metadata.sovereignHand).enabled),
+  };
+  env.extra.memory = record(metadata.memory);
+  env.extra.lumia = record(metadata.lumia);
+  env.extra.council = {
+    councilMode: boolValue(record(metadata.council).councilMode ?? metadata.councilMode),
+  };
+  env.extra.ooc = record(metadata.ooc);
+  env.extra.cortex = record(metadata.cortex);
   return env;
 }
 
@@ -369,265 +389,38 @@ export function activateSnapshotWorldInfo(
   });
 }
 
-function macroValue(env: MacroEnv, name: string, args: readonly string[]): string {
-  const normalized = name.toLowerCase();
-  const values = record(env.extra.promptVariables);
-  const defaults = record(env.extra.promptVariableDefaults);
-  const key = (args[0] ?? "").trim();
-  switch (normalized) {
-    case "user": return env.names.user;
-    case "char":
-    case "charname": return env.names.char;
-    case "group": return env.names.group;
-    case "groupnotmuted":
-    case "group_not_muted": return env.names.groupNotMuted;
-    case "notchar":
-    case "not_char": return env.names.notChar;
-    case "chargroupfocused":
-    case "charfocused":
-    case "char_group_focused": return env.names.charGroupFocused;
-    case "groupothers":
-    case "group_others": return env.names.groupOthers;
-    case "groupmembercount":
-    case "group_member_count": return env.names.groupMemberCount;
-    case "grouplastspeaker":
-    case "group_last_speaker": return env.names.groupLastSpeaker;
-    case "groupcardmode":
-    case "group_card_mode": return env.names.groupCardMode;
-    case "isgroupchat":
-    case "is_group_chat": return env.names.isGroupChat;
-    case "isnarrator":
-    case "is_narrator": return env.names.isNarrator;
-    case "input": return env.chat.lastUserMessage;
-    case "userinput":
-    case "user_input": return stringValue(env.extra.userInput);
-    case "model": return env.system.model;
-    case "lastgenerationtype":
-    case "last_generation_type": return env.system.lastGenerationType;
-    case "promptblockrole":
-    case "blockrole":
-    case "prompt_block_role": return env.promptBlock?.role ?? "";
-    case "promptblockposition":
-    case "blockposition":
-    case "prompt_block_position": return env.promptBlock?.position ?? "";
-    case "promptblockdepth":
-    case "blockdepth":
-    case "prompt_block_depth": return env.promptBlock ? String(env.promptBlock.depth) : "";
-    case "outlet": {
-      const outlets = record(env.extra.worldInfoOutlets);
-      return stringValue(outlets[key.toLowerCase()]);
-    }
-    case "wi_marker": return stringValue(env.extra.worldInfoAtMarker);
-    case "persona_outlet":
-    case "personoutlet": {
-      const outlets = record(env.extra.personaAddonOutlets);
-      return stringValue(outlets[key.toLowerCase()]);
-    }
-    case "var":
-    case "promptvar":
-    case "presetvar": {
-      if (!key) return "";
-      const local = env.variables.local.get(key);
-      if (local !== undefined) return local;
-      if (Object.prototype.hasOwnProperty.call(values, key)) return String(values[key]);
-      if (Object.prototype.hasOwnProperty.call(defaults, key)) return String(defaults[key]);
-      return "";
-    }
-    case "hasvar":
-    case "haspromptvar":
-    case "haspresetvar": return key && (env.variables.local.has(key) || key in values || key in defaults) ? "true" : "false";
-    case "vardefault":
-    case "promptvardefault":
-    case "presetvardefault": return key && key in defaults ? String(defaults[key]) : "";
-    case "getvar": return key ? env.variables.local.get(key) ?? "" : "";
-    case "getgvar":
-    case "getglobalvar": return key ? env.variables.global.get(key) ?? "" : "";
-    case "getchatvar": return key ? env.variables.chat.get(key) ?? "" : "";
-    case "name": return env.names.user;
-    case "description": return env.character.description;
-    case "personality": return env.character.personality;
-    case "scenario": return env.character.scenario;
-    case "persona": return env.character.persona;
-    case "mesexamples":
-    case "mes_example": return env.character.mesExamples;
-    case "systemprompt": return env.character.systemPrompt;
-    case "posthistoryinstructions": return env.character.postHistoryInstructions;
-    case "creatornotes": return env.character.creatorNotes;
-    case "version": return env.character.version;
-    case "creator": return env.character.creator;
-    case "firstmessage": return env.character.firstMessage;
-    default: throw new Error(`requires_response_mode: unsupported macro ${name}`);
-  }
-}
 
-function accountMacroResult(value: string, budget: ExpansionBudgetV1): string {
-  const resultBytes = utf8Bytes(value);
-  budget.accountExpansion(resultBytes, resultBytes);
-  budget.reserveOutputBytes(resultBytes);
-  return value;
-}
-
-function truthy(value: string): boolean {
-  const normalized = value.trim().toLowerCase();
-  return normalized !== "" && normalized !== "0" && normalized !== "false" && normalized !== "no" && normalized !== "off";
-}
-function repeatCount(value: string | undefined): number {
-  const count = value === undefined || value.trim() === "" ? 0 : Number(value);
-  if (!Number.isSafeInteger(count) || count < 0 || count > 1_000) {
-    throw new Error("limit_exceeded: repeat count exceeds the strict 1000 resolution ceiling");
-  }
-  return count;
-}
-
-function resolveNodes(nodes: readonly AstNode[], env: MacroEnv, budget: ExpansionBudgetV1, depth: number): string {
-  if (depth > MAX_MACRO_DEPTH) throw new Error("requires_response_mode: macro nesting exceeds strict depth");
-  const fragments: string[] = [];
-  for (const node of nodes) {
-    budget.checkAbort();
-    if (node.type === "text") {
-      fragments.push(node.value);
-      continue;
-    }
-    budget.reserveMacroResolutions();
-    const args = node.args.map((arg) => resolveNodes(arg, env, budget, depth + 1));
-    if (node.type === "scoped_macro") {
-      const name = node.name.toLowerCase();
-      if (name === "repeat") {
-        const count = repeatCount(args[0]);
-        if (count === 0) {
-          fragments.push("");
-          continue;
-        }
-        const expansionBefore = budget.cumulativeExpansionBytes;
-        const body = resolveNodes(node.body, env, budget, depth + 1);
-        const bodyBytes = utf8Bytes(body);
-        const resultBytes = bodyBytes * count;
-        const nestedExpansion = budget.cumulativeExpansionBytes - expansionBefore;
-        const additionalExpansion = nestedExpansion > 0
-          ? Math.max(0, resultBytes - bodyBytes)
-          : resultBytes;
-        budget.preflightOutput(resultBytes);
-        budget.preflightExpansion(additionalExpansion, resultBytes);
-        const result = body.repeat(count);
-        budget.accountExpansion(additionalExpansion, resultBytes);
-        fragments.push(result);
-        continue;
-      }
-      const body = resolveNodes(node.body, env, budget, depth + 1);
-      if (name === "trim") {
-        budget.reserveTrimString();
-        fragments.push(accountMacroResult(body.trim(), budget));
-      } else if (name === "wrap") {
-        if (!body) fragments.push("");
-        else {
-          const value = `${args[0] ?? ""}${body}${args[1] ?? ""}`;
-          fragments.push(accountMacroResult(value, budget));
-        }
-      } else {
-        throw new Error(`requires_response_mode: unsupported scoped macro ${node.name}`);
-      }
-      continue;
-    }
-    const name = node.name.toLowerCase();
-    if (name === "setvar" || name === "setgvar" || name === "setchatvar" || name === "deletevar" || name === "deletegvar" || name === "deletechatvar") {
-      throw new Error(`requires_response_mode: mutable macro ${node.name}`);
-    }
-    if (name === "upper" || name === "lower" || name === "capitalize" || name === "regex") {
-      throw new Error(`requires_response_mode: expanding macro ${node.name} is not snapshot-safe`);
-    }
-    if (name === "join") {
-      const separator = args[0] ?? ", ";
-      const items = args.slice(1).map((item) => item.trim()).filter(Boolean);
-      budget.reserveTrimString(args.length > 1 ? args.length - 1 : 0);
-      const resultBytes = items.reduce((total, item) => total + utf8Bytes(item), utf8Bytes(separator) * Math.max(0, items.length - 1));
-      budget.accountExpansion(resultBytes, resultBytes);
-      fragments.push(items.join(separator));
-      continue;
-    }
-    if (name === "repeat") {
-      const count = repeatCount(args[0]);
-      const text = args[1] ?? "";
-      const textBytes = utf8Bytes(text);
-      const resultBytes = textBytes * count;
-      budget.preflightOutput(resultBytes);
-      budget.preflightExpansion(resultBytes, resultBytes);
-      const result = text.repeat(count);
-      budget.accountExpansion(resultBytes, resultBytes);
-      fragments.push(result);
-      continue;
-    }
-    if (name === "wrap") {
-      const text = args[2] ?? "";
-      if (!text) fragments.push("");
-      else {
-        const resultBytes = utf8Bytes(args[0] ?? "") + utf8Bytes(text) + utf8Bytes(args[1] ?? "");
-        budget.accountExpansion(resultBytes, resultBytes);
-        fragments.push(`${args[0] ?? ""}${text}${args[1] ?? ""}`);
-      }
-      continue;
-    }
-    if (name === "replace") {
-      const text = args[2] ?? "";
-      const find = args[0] ?? "";
-      const replacement = args[1] ?? "";
-      if (!find) fragments.push(text);
-      else {
-        let count = 0;
-        for (let offset = 0; ; ) {
-          const index = text.indexOf(find, offset);
-          if (index < 0) break;
-          count++;
-          offset = index + find.length;
-        }
-        const resultBytes = utf8Bytes(text) - count * utf8Bytes(find) + count * utf8Bytes(replacement);
-        budget.accountExpansion(resultBytes, resultBytes);
-        fragments.push(text.replaceAll(find, replacement));
-      }
-      continue;
-    }
-    if (name === "len" || name === "length") {
-      fragments.push(accountMacroResult(String((args[0] ?? "").length), budget));
-      continue;
-    }
-    if (name === "substr" || name === "substring") {
-      const value = (args[0] ?? "").substring(Number.parseInt(args[1] ?? "0", 10) || 0, args[2] === undefined ? undefined : Number.parseInt(args[2], 10));
-      fragments.push(accountMacroResult(value, budget));
-      continue;
-    }
-    if (name === "split") {
-      const parts = (args[0] ?? "").split(args[1] ?? ",");
-      const index = Number.parseInt(args[2] ?? "0", 10) || 0;
-      fragments.push(accountMacroResult(parts[index < 0 ? parts.length + index : index]?.trim() ?? "", budget));
-      continue;
-    }
-    if (name === "if" || name === "unless") {
-      const condition = truthy(args.join(" "));
-      fragments.push(accountMacroResult(name === "if" ? (condition ? "true" : "") : (condition ? "" : "true"), budget));
-      continue;
-    }
-    fragments.push(accountMacroResult(macroValue(env, node.name, args), budget));
-  }
-  return fragments.join("");
-}
-
-/** Resolve only the ordinary text portions; agent markers are never parsed. */
-export function resolveSnapshotMacroText(
+/** Resolve ordinary text with the same evaluator Response uses. Agent markers stay outside this call. */
+export async function resolveSnapshotMacroText(
   template: string,
   env: MacroEnv,
   budget: ExpansionBudgetV1,
-): string {
+): Promise<string> {
   if (RESULT_MARKER_RE.test(template)) throw new Error("invalid_input: protected agent marker entered macro resolver");
   if (!template.includes("{{") && !template.includes("<user>") && !template.includes("<char>") && !template.includes("<bot>")) return template;
-  let result: string;
+  initMacros();
+  env._expansionBudget = budget;
+  let text: string;
   try {
-    result = resolveNodes(parse(template), env, budget, 0);
+    const result = await evaluate(template, env, registry, {
+      budget,
+      sourceOwner: "host",
+      maxMacroResolutions: budget.limits.maxMacroResolutions,
+    });
+    const limit = result.diagnostics.find((diagnostic) => diagnostic.code === "limit_exceeded");
+    if (limit) throw new Error(`limit_exceeded: ${limit.message}`);
+    text = result.text;
   } catch (error) {
-    if (error instanceof Error && (error.message.startsWith("requires_response_mode:") || error.message.startsWith("invalid_input:"))) throw error;
+    if (error instanceof PreparationLimitExceededError) throw new Error(`limit_exceeded: ${error.message}`);
+    if (error instanceof Error && (
+      error.message.startsWith("requires_response_mode:")
+      || error.message.startsWith("invalid_input:")
+      || error.message.startsWith("limit_exceeded:")
+    )) throw error;
     throw new Error(`invalid_input: macro resolution failed (${error instanceof Error ? error.message : "unknown"})`);
   }
-  if (RESULT_MARKER_RE.test(result)) throw new Error("generated_result_reference: macro generated a protected agent marker");
-  budget.noteOutput(result);
-  return result.replaceAll("\x01", "{").replaceAll("\x02", "}");
+  if (RESULT_MARKER_RE.test(text)) throw new Error("generated_result_reference: macro generated a protected agent marker");
+  return text;
 }
 
 function placementMatches(script: SnapshotRegexScriptV1, placement: "user_input" | "ai_output" | "world_info"): boolean {

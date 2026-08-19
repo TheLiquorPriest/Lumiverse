@@ -19,11 +19,9 @@ export default function AgentRuntimeModeControl(props: AgentRuntimeModeControlPr
   const { t } = useTranslation('chat')
   const runtime = useEffectiveRuntime(props)
   const [announcement, setAnnouncement] = useState('')
-  const shouldShowRepair = runtime.repairCategories.length > 0 && !!runtime.decision && (
-    runtime.oneTurnMode === 'agentic'
-    || runtime.decision.agentsEnabled
-    || runtime.decision.allowedModes.includes('agentic')
-  )
+  const tryingAgentic = runtime.oneTurnMode === 'agentic'
+    || (runtime.oneTurnMode !== 'response' && runtime.mode === 'agentic')
+  const shouldShowRepair = runtime.repairCategories.length > 0 && !!runtime.decision && tryingAgentic
 
   if (!runtime.canShowSelector && !shouldShowRepair) return null
 

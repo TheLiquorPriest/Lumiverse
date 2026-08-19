@@ -192,6 +192,50 @@ describe('AgentRuntimeModeControl', () => {
     expect(selectCalls).toEqual(['response'])
   })
 
+  test('hides the repair banner after an explicit Response escape', async () => {
+    hookState = baseState({
+      decision: {
+        ...readyDecision,
+        effectiveMode: 'response',
+        capabilityReadiness: {
+          ...readyDecision.capabilityReadiness,
+          ready: false,
+          repairCodes: ['agentic_readiness_unavailable'],
+        },
+        repairCodes: ['agentic_kill_switch'],
+      },
+      oneTurnMode: 'response',
+      mode: 'response',
+      canShowSelector: false,
+      repairCategories: ['readiness', 'isolate'],
+    })
+    const { host } = await renderControl()
+    expect(host.textContent).not.toContain('agentRuntime.repair.title')
+    expect(host.querySelector('button')).toBeNull()
+  })
+
+  test('keeps the mode selector after Response escape when both modes are available', async () => {
+    hookState = baseState({
+      decision: {
+        ...readyDecision,
+        effectiveMode: 'response',
+        capabilityReadiness: {
+          ...readyDecision.capabilityReadiness,
+          ready: false,
+          repairCodes: ['agentic_kill_switch'],
+        },
+        repairCodes: ['agentic_kill_switch'],
+      },
+      oneTurnMode: 'response',
+      mode: 'response',
+      canShowSelector: true,
+      repairCategories: ['readiness'],
+    })
+    const { host } = await renderControl()
+    expect(host.querySelector('input[value="agentic"]')).not.toBeNull()
+    expect(host.textContent).not.toContain('agentRuntime.repair.title')
+  })
+
   test('uses semantic radio controls and one atomic polite announcement region', async () => {
     const { host } = await renderControl()
     expect(host.querySelector('fieldset')).not.toBeNull()

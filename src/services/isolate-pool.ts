@@ -101,7 +101,7 @@ export interface IsolatePoolOptions<TRequest, TResult> {
   readonly subprocessFactory?: () => IsolateTransport;
   readonly workerRequest?: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
   readonly subprocessRequest?: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
-  readonly responseParser?: (message: unknown, job: ActiveIsolateJob<TRequest, TResult>) => TResult;
+  readonly responseParser?: (message: unknown, job: ActiveIsolateJob<TRequest, TResult>) => TResult | Promise<TResult>;
   /**
    * Optional test/host probe for one newly created transport. A replacement is
    * healthy only after this probe resolves.
@@ -121,6 +121,7 @@ export interface ActiveIsolateJob<TRequest, TResult> extends IsolatePoolJob<TReq
   /** Number of bounded backend failovers already attempted for this request. */
   backendFailovers?: number;
   settled: boolean;
+  queueTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface PoolSlot<TRequest, TResult> {
@@ -503,7 +504,7 @@ export class IsolatePoolV1<TRequest, TResult> {
   private subprocessFactory?: () => IsolateTransport;
   private readonly workerRequest: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
   private readonly subprocessRequest: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
-  private readonly responseParser: (message: unknown, job: ActiveIsolateJob<TRequest, TResult>) => TResult;
+  private readonly responseParser: (message: unknown, job: ActiveIsolateJob<TRequest, TResult>) => TResult | Promise<TResult>;
   private readonly disabled: boolean;
   private readonly slots = new Set<PoolSlot<TRequest, TResult>>();
   private readonly waitingByUser = new Map<string, ActiveIsolateJob<TRequest, TResult>[]>();
@@ -603,6 +604,12 @@ export class IsolatePoolV1<TRequest, TResult> {
         this.readyUsers.push(job.userId);
       }
       this.waitingCount++;
+      job.queueTimer = setTimeout(() => {
+        if (job.settled) return;
+        const queue = this.waitingByUser.get(job.userId);
+        if (!queue?.includes(job)) return;
+        this.cancelJob(job, toPoolFailure("worker_timed_out", `${this.name} isolate exceeded ${job.timeoutMs}ms while queued`));
+      }, boundedTimeoutMs);
       if (job.signal) {
         const onAbort = () => this.cancelJob(job);
         (job as ActiveIsolateJob<TRequest, TResult> & { onAbort?: () => void }).onAbort = onAbort;
@@ -1022,18 +1029,21 @@ export class IsolatePoolV1<TRequest, TResult> {
     slot.detachMessage = slot.transport.onMessage(onMessage);
     slot.detachError = slot.transport.onError(onError);
     slot.timeout = setTimeout(() => {
-      if (!this.slotEpochMatches(slot)) {
-        this.failSlot(slot, toPoolFailure("worker_unavailable", `${this.name} transport health epoch changed`), generation);
-        return;
-      }
-      if (!current()) return;
-      this.failSlot(slot, toPoolFailure("worker_timed_out", `${this.name} isolate exceeded ${job.timeoutMs}ms`), generation);
+      if (job.settled || slot.job !== job) return;
+      this.failSlot(
+        slot,
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded ${job.timeoutMs}ms`),
+        generation,
+      );
     }, job.timeoutMs);
     let request: unknown;
     let frame: Uint8Array;
     try {
+      console.error(`[${this.name}] encode start`, job.operation, job.requestId);
       request = kind === "worker" ? this.workerRequest(job) : this.subprocessRequest(job);
+      console.error(`[${this.name}] request built`, job.operation, job.requestId);
       frame = preflightEncodedFrame(request, this.maxFrameBytes);
+      console.error(`[${this.name}] encode done`, job.operation, job.requestId, frame.byteLength);
     } catch (error) {
       const failure = error instanceof IsolatePoolError
         ? error
@@ -1106,37 +1116,62 @@ export class IsolatePoolV1<TRequest, TResult> {
     }
     const job = slot.job;
     if (!job) return;
-    clearTimeout(slot.timeout);
-    slot.timeout = undefined;
     this.detachSlot(slot);
     try {
-      const result = this.responseParser(message, job);
-      this.settle(job, () => job.resolve(result));
-      slot.job = null;
-      // Keep a healthy transport idle so warm tokenizer/databank caches survive
-      // sequential generations. It will be terminated on failure or shutdown.
-      this.drain();
-    } catch (error) {
-      if (
-        error instanceof IsolatePoolError
-        && error.remote
-        && error.code !== "worker_crashed"
-        && error.code !== "worker_timed_out"
-        && error.code !== "worker_malformed"
-      ) {
-        slot.job = null;
-        this.settle(job, () => job.reject(error));
-        this.drain();
+      const parsed = this.responseParser(message, job);
+      if (parsed && typeof parsed === "object" && typeof (parsed as Promise<TResult>).then === "function") {
+        void Promise.resolve(parsed).then(
+          (result) => this.completeParsedSlot(slot, job, result, generation),
+          (error) => this.failParsedSlot(slot, job, error, generation),
+        );
         return;
       }
-      this.failSlot(
-        slot,
-        error instanceof IsolatePoolError
-          ? error
-          : toPoolFailure("worker_malformed", `${this.name} returned a malformed response`, error),
-        generation,
-      );
+      this.completeParsedSlot(slot, job, parsed as TResult, generation);
+    } catch (error) {
+      this.failParsedSlot(slot, job, error, generation);
     }
+  }
+
+  private completeParsedSlot(
+    slot: PoolSlot<TRequest, TResult>,
+    job: ActiveIsolateJob<TRequest, TResult>,
+    result: TResult,
+    generation: number,
+  ): void {
+    if (slot.retired || slot.generation !== generation) return;
+    clearTimeout(slot.timeout);
+    slot.timeout = undefined;
+    this.settle(job, () => job.resolve(result));
+    slot.job = null;
+    this.drain();
+  }
+
+  private failParsedSlot(
+    slot: PoolSlot<TRequest, TResult>,
+    job: ActiveIsolateJob<TRequest, TResult>,
+    error: unknown,
+    generation: number,
+  ): void {
+    if (slot.retired || slot.generation !== generation) return;
+    if (
+      error instanceof IsolatePoolError
+      && error.remote
+      && error.code !== "worker_crashed"
+      && error.code !== "worker_timed_out"
+      && error.code !== "worker_malformed"
+    ) {
+      slot.job = null;
+      this.settle(job, () => job.reject(error));
+      this.drain();
+      return;
+    }
+    this.failSlot(
+      slot,
+      error instanceof IsolatePoolError
+        ? error
+        : toPoolFailure("worker_malformed", `${this.name} returned a malformed response`, error),
+      generation,
+    );
   }
 
   private failSlot(
@@ -1263,8 +1298,9 @@ export class IsolatePoolV1<TRequest, TResult> {
     }
   }
 
-  private cancelJob(job: ActiveIsolateJob<TRequest, TResult>): void {
+  private cancelJob(job: ActiveIsolateJob<TRequest, TResult>, error?: IsolatePoolError): void {
     if (job.settled) return;
+    const failure = error ?? toPoolFailure("cancelled", `${this.name} job was cancelled`);
     const queue = this.waitingByUser.get(job.userId);
     const queuedIndex = queue?.indexOf(job) ?? -1;
     if (queuedIndex >= 0 && queue) {
@@ -1276,20 +1312,24 @@ export class IsolatePoolV1<TRequest, TResult> {
           if (this.readyUsers[index] === job.userId) this.readyUsers.splice(index, 1);
         }
       }
-      this.settle(job, () => job.reject(toPoolFailure("cancelled", `${this.name} job was cancelled`)));
+      this.settle(job, () => job.reject(failure));
       return;
     }
     const slot = [...this.slots].find((candidate) => candidate.job === job);
     if (slot) {
-      this.failSlot(slot, toPoolFailure("cancelled", `${this.name} job was cancelled`));
+      this.failSlot(slot, failure);
       return;
     }
-    this.settle(job, () => job.reject(toPoolFailure("cancelled", `${this.name} job was cancelled`)));
+    this.settle(job, () => job.reject(failure));
   }
 
   private settle(job: ActiveIsolateJob<TRequest, TResult>, action: () => void): void {
     if (job.settled) return;
     job.settled = true;
+    if (job.queueTimer) {
+      clearTimeout(job.queueTimer);
+      job.queueTimer = undefined;
+    }
     const onAbort = (job as ActiveIsolateJob<TRequest, TResult> & { onAbort?: () => void }).onAbort;
     if (job.signal && onAbort) job.signal.removeEventListener("abort", onAbort);
     action();

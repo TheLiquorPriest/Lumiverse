@@ -2166,25 +2166,20 @@ async function reserveChatMode(
   const previous = chatModeReservations.get(key);
   chatModeReservations.set(key, { mode, ownerId, ...(done ? { done } : {}) });
   if (!previous || previous.ownerId === ownerId) return;
-  if (previous.done) {
-    await previous.done;
-    return;
-  }
-
   if (previous.mode === "agentic") {
     const generationId = getActiveAgenticGenerationForChat(userId, chatId);
     if (generationId) {
       await requestAgenticChatCancellation(userId, chatId);
       await waitForAgenticGeneration(generationId);
     }
-    return;
+  } else {
+    const entry = activeGenerations.get(previous.ownerId);
+    if (entry) {
+      entry.terminal.claimAndProject("stopped", { status: "stopped" });
+      await entry.completion;
+    }
   }
-
-  const entry = activeGenerations.get(previous.ownerId);
-  if (entry) {
-    entry.terminal.claimAndProject("stopped", { status: "stopped" });
-    await entry.completion;
-  }
+  if (previous.done) await previous.done;
 }
 
 function ownsChatModeReservation(

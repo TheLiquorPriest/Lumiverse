@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { SnapshotMessageV1, SnapshotWorldInfoV1 } from "./prompt-assembly-snapshot.service";
+import type { AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
 import { createHash } from "node:crypto";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
@@ -594,6 +596,20 @@ describe("production agentic coordinator installation", () => {
     expect(decision.internal.readinessVector.reasons).toContain("cognition_invalid");
   });
 
+  test("omitted mode snapshots revisions when the resolved request is agentic", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    installAgenticGenerationCoordinator();
+    const decision = await resolveEffectiveRuntime(USER_ID, {
+      chatId: AGENTIC_CHAT_ID,
+      logicalConnectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal",
+    });
+    expect(decision.effectiveMode).toBe("agentic");
+    expect(decision.repairCodes).not.toContain("agentic_input_revisions_incomplete");
+  });
+
   test("internal coordinator resolution never leaks one-use decision tokens", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
@@ -955,6 +971,21 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     scriptedWorkRound = 0;
     providerRequests.length = 0;
+    const now = Date.now();
+    getDb().query(
+      "INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, send_date, swipe_id, swipes, swipe_dates, extra, created_at, generation_revision) VALUES (?, ?, 0, 1, ?, ?, ?, 0, ?, ?, '{}', ?, ?)",
+    ).run(
+      "message-user-render-narrative",
+      AGENTIC_CHAT_ID,
+      "User",
+      USER_INPUT,
+      now,
+      JSON.stringify([USER_INPUT]),
+      JSON.stringify([now]),
+      now,
+      ADMITTED_TARGET_REVISION,
+    );
+
 
     const decision = await resolveEffectiveRuntime(USER_ID, {
       chatId: AGENTIC_CHAT_ID,
@@ -989,6 +1020,19 @@ describe("production agentic coordinator installation", () => {
     expect(ordinaryRequests[1]?.tools?.some((tool) => tool.name === "complete_turn")).toBe(true);
     const finalization = providerRequests.find((request) => request.toolMode === "finalization");
     expect(finalization?.tools).toEqual([]);
+    expect(finalization?.parameters?.max_tokens).toBe(256);
+    expect(finalization?.providerTransientCarrier).toBeUndefined();
+    const finalizationMessages = finalization?.messages ?? [];
+    expect(finalizationMessages.some((message) => message.role === "user" && String(message.content).includes(USER_INPUT))).toBe(true);
+    expect(finalizationMessages.some((message) =>
+      message.role === "system" && String(message.content).includes("in-character assistant reply"),
+    )).toBe(true);
+    expect(finalizationMessages.some((message) =>
+      (message.role === "user" || message.role === "assistant") && String(message.content).includes("complete_turn"),
+    )).toBe(false);
+    expect(finalizationMessages.some((message) =>
+      message.role === "system" && String(message.content).includes("Do not mention tools"),
+    )).toBe(true);
 
     const db = getDb();
     const receipt = db.query(
@@ -1014,7 +1058,7 @@ describe("production agentic coordinator installation", () => {
       inputTokens: 17,
       outputTokens: 3,
       totalTokens: 20,
-      toolCalls: 0,
+      toolCalls: 2,
       childInvocations: 0,
     });
     expect(JSON.parse(projection?.terminal_handoff_json ?? "{}").messageId).toBe(messageId);
@@ -1064,6 +1108,68 @@ describe("production agentic coordinator installation", () => {
       clearTimeout(timeout);
       responseRequestActive = false;
       unsubscribeResponse();
+    }
+  });
+  test("WORK and RENDER send authored preset max_tokens and fall back to 4096", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    await probeIsolateBackendsAtStartup();
+    startAgentRuntimeEpoch();
+    installAgenticGenerationCoordinator();
+
+    const runTurn = async (requestEpoch: number) => {
+      scriptedWorkRound = 0;
+      providerRequests.length = 0;
+      const decision = await resolveEffectiveRuntime(USER_ID, {
+        chatId: AGENTIC_CHAT_ID,
+        logicalConnectionId: CONNECTION_ID,
+        presetId: AGENTIC_PRESET_ID,
+        target: { generationType: "normal", messageId: null, swipeId: null },
+        mode: "agentic",
+        requestEpoch,
+      });
+      const started = await startGeneration({
+        userId: USER_ID,
+        chat_id: AGENTIC_CHAT_ID,
+        connection_id: CONNECTION_ID,
+        preset_id: AGENTIC_PRESET_ID,
+        generation_type: "normal",
+        mode: "agentic",
+        runtime_decision_token: decision.runtimeDecisionToken!,
+        request_epoch: requestEpoch,
+        user_input: USER_INPUT,
+      });
+      const settled = await waitForAgenticGeneration(started.generationId);
+      expect(settled).toMatchObject({ status: "completed", phase: "COMMITTED" });
+      const ordinaryRequests = providerRequests.filter((request) => request.toolMode === "ordinary");
+      const finalization = providerRequests.find((request) => request.toolMode === "finalization");
+      expect(ordinaryRequests.length).toBeGreaterThanOrEqual(1);
+      expect(finalization).toBeDefined();
+      return { ordinaryRequests, finalization };
+    };
+
+    getDb().query("UPDATE presets SET parameters = ? WHERE id = ?").run(
+      JSON.stringify({ samplerOverrides: { enabled: true, maxTokens: 1024 } }),
+      AGENTIC_PRESET_ID,
+    );
+    try {
+      const authored = await runTurn(41);
+      for (const request of authored.ordinaryRequests) {
+        expect(request.parameters?.max_tokens).toBe(1024);
+      }
+      expect(authored.finalization?.parameters?.max_tokens).toBe(1024);
+
+      getDb().query("UPDATE presets SET parameters = ? WHERE id = ?").run("{}", AGENTIC_PRESET_ID);
+      const missing = await runTurn(42);
+      for (const request of missing.ordinaryRequests) {
+        expect(request.parameters?.max_tokens).toBe(4096);
+        expect(request.parameters?.max_tokens).toBeLessThan(100_000);
+      }
+      expect(missing.finalization?.parameters?.max_tokens).toBe(4096);
+    } finally {
+      getDb().query("UPDATE presets SET parameters = ? WHERE id = ?").run("{}", AGENTIC_PRESET_ID);
+      scriptedWorkRound = 0;
+      providerRequests.length = 0;
     }
   });
   test("production work adapter persists the delegated task and child frame assignment", async () => {
@@ -1181,5 +1287,218 @@ describe("production agentic coordinator installation", () => {
       scriptedChildSubmitted = false;
       scriptedDelegateProfileId = "delegate";
     }
+  });
+
+  test("GENERATION_ENDED for completed COMMITTED omits error and still sends failure diagnostics", async () => {
+    const deps = __testing.buildDependencies();
+    const waitForEnded = (generationId: string): Promise<Record<string, unknown>> => {
+      const settled = Promise.withResolvers<Record<string, unknown>>();
+      const unsubscribe = eventBus.on(EventType.GENERATION_ENDED, (event) => {
+        const payload = event.payload as Record<string, unknown> | undefined;
+        if (payload?.generationId !== generationId) return;
+        unsubscribe();
+        settled.resolve(payload);
+      });
+      return settled.promise;
+    };
+    const completed = waitForEnded("exec-committed-success");
+    deps.publishTerminal!({
+      executionId: "exec-committed-success",
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      status: "completed",
+      phase: "COMMITTED",
+      target: { generationType: "normal" },
+    });
+    const completedPayload = await completed;
+    expect(completedPayload).not.toHaveProperty("error");
+    expect(completedPayload).not.toHaveProperty("errorCode");
+    expect(completedPayload.phase).toBe("COMMITTED");
+    expect(completedPayload.status).toBe("COMMITTED");
+
+    const failed = waitForEnded("exec-committed-failed");
+    deps.publishTerminal!({
+      executionId: "exec-committed-failed",
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      status: "failed",
+      phase: "WORK",
+      target: { generationType: "normal" },
+      errorCode: "provider_request_error",
+      errorMessage: "upstream refused",
+    });
+    const failedPayload = await failed;
+    expect(failedPayload.errorCode).toBe("provider_request_error");
+    expect(failedPayload.error).toBe("WORK: provider_request_error: upstream refused");
+    expect(failedPayload.phase).toBe("WORK");
+  });
+});
+
+function renderNarrativeMessage(overrides: {
+  readonly is_user: boolean;
+  readonly content?: string;
+  readonly swipe_id?: number;
+  readonly swipes?: readonly string[];
+}): SnapshotMessageV1 {
+  const content = overrides.content ?? "";
+  return {
+    id: overrides.is_user ? "user-1" : "assistant-1",
+    chat_id: AGENTIC_CHAT_ID,
+    index_in_chat: overrides.is_user ? 0 : 1,
+    is_user: overrides.is_user,
+    name: overrides.is_user ? "User" : "Eleanor",
+    content,
+    send_date: 1,
+    swipe_id: overrides.swipe_id ?? 0,
+    swipes: [...(overrides.swipes ?? [content])],
+    swipe_dates: [1],
+    extra: {},
+    parent_message_id: null,
+    branch_id: null,
+    created_at: 1,
+    revision: "1",
+  } as SnapshotMessageV1;
+}
+
+function authoredRenderPolicy(text: string): AssemblyProviderMessageV1 {
+  return {
+    role: "system",
+    contentKind: "segments",
+    provenance: { kind: "cognition", sourceId: "render-policy", sourceRevision: "1", sourceIndex: 0 },
+    segments: [{ kind: "literal", text, bytes: text.length }],
+  } as unknown as AssemblyProviderMessageV1;
+}
+
+const RENDER_NARRATIVE_FACTS = Object.freeze({
+  character: {
+    name: "Eleanor",
+    personality: "Warm, reserved, and precise.",
+    scenario: "A rain-soaked London boarding house.",
+    description: "A retired cartographer.",
+  },
+  worldInfo: {
+    books: [{
+      id: "book-london",
+      name: "London",
+      description: "Fog-bound streets above a shuttered map shop.",
+      source: "character" as const,
+      order: 0,
+      revision: "1",
+    }],
+    entries: [],
+    candidates: [],
+    state: {},
+  } satisfies SnapshotWorldInfoV1,
+});
+
+const RENDER_NARRATIVE_FACT_MESSAGE = [
+  "Character: Eleanor",
+  "Personality: Warm, reserved, and precise.",
+  "Scenario: A rain-soaked London boarding house.",
+  "Description: A retired cartographer.",
+  "World (London): Fog-bound streets above a shuttered map shop.",
+].join("\n");
+
+describe("agentic RENDER narrative prompt", () => {
+  test("uses current swipe chat turns, host contract when policy is empty, and labelled guidance", () => {
+    const messages = __testing.buildAgenticRenderPolicyMessages({
+      snapshotMessages: [
+        renderNarrativeMessage({
+          is_user: true,
+          content: "stale user line",
+          swipe_id: 1,
+          swipes: ["stale user line", USER_INPUT],
+        }),
+        renderNarrativeMessage({
+          is_user: false,
+          content: "stale assistant swipe",
+          swipe_id: 0,
+          swipes: ["Eleanor is already in the room."],
+        }),
+      ],
+      renderPolicyMessages: [],
+      renderGuidance: "Keep the reply intimate and in Eleanor's voice.",
+      character: RENDER_NARRATIVE_FACTS.character,
+      worldInfo: RENDER_NARRATIVE_FACTS.worldInfo,
+    });
+    expect(messages).toEqual([
+      { role: "system", content: RENDER_NARRATIVE_FACT_MESSAGE },
+      { role: "user", content: USER_INPUT },
+      { role: "assistant", content: "Eleanor is already in the room." },
+      { role: "system", content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT },
+      { role: "system", content: "Render guidance (not the reply):\nKeep the reply intimate and in Eleanor's voice." },
+    ]);
+    expect(messages.some((message) => message.role === "user" && message.content === USER_INPUT)).toBe(true);
+    expect(messages.filter((message) => message.role !== "system").map((message) => message.content)).not.toContain("complete_turn");
+    expect(JSON.stringify(messages)).not.toContain("stale user line");
+  });
+
+  test("appends authored render policy instead of the host contract and ignores WORK complete_turn text", () => {
+    const messages = __testing.buildAgenticRenderPolicyMessages({
+      snapshotMessages: [
+        renderNarrativeMessage({ is_user: true, content: USER_INPUT }),
+      ],
+      renderPolicyMessages: [authoredRenderPolicy("Stay in character as Eleanor.")],
+      character: RENDER_NARRATIVE_FACTS.character,
+      worldInfo: RENDER_NARRATIVE_FACTS.worldInfo,
+    });
+    expect(messages).toEqual([
+      { role: "system", content: RENDER_NARRATIVE_FACT_MESSAGE },
+      { role: "user", content: USER_INPUT },
+      { role: "system", content: "Stay in character as Eleanor." },
+    ]);
+    expect(messages.some((message) => message.content === __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT)).toBe(false);
+    expect(JSON.stringify(messages)).not.toContain("complete_turn");
+  });
+
+  test("bounds character and world facts before chat turns", () => {
+    const overflow = `${"x".repeat(80)}${"\u{1F9E0}".repeat(40)}`;
+    const messages = __testing.buildAgenticRenderPolicyMessages({
+      snapshotMessages: [
+        renderNarrativeMessage({ is_user: true, content: USER_INPUT }),
+      ],
+      renderPolicyMessages: [],
+      character: {
+        name: "Eleanor",
+        description: overflow,
+      },
+      worldInfo: {
+        ...RENDER_NARRATIVE_FACTS.worldInfo,
+        books: [
+          {
+            ...RENDER_NARRATIVE_FACTS.worldInfo.books[0]!,
+            description: "y".repeat(200),
+          },
+          {
+            id: "book-late",
+            name: "LateBook",
+            description: "MUST-NOT-APPEAR-LATE-WORLD",
+            source: "character",
+            order: 1,
+            revision: "1",
+          },
+        ],
+        entries: [{
+          disabled: false,
+          constant: true,
+          content: "MUST-NOT-APPEAR-LATE-ENTRY",
+        }] as unknown as SnapshotWorldInfoV1["entries"],
+      },
+      maxFactBytes: 64,
+    });
+    const facts = messages[0];
+    expect(facts?.role).toBe("system");
+    const factsContent = String(facts?.content ?? "");
+    const encoded = new TextEncoder().encode(factsContent);
+    expect(encoded.byteLength).toBeLessThanOrEqual(64);
+    expect(new TextDecoder().decode(encoded)).toBe(factsContent);
+    expect(factsContent).toContain("Eleanor");
+    expect(factsContent).not.toContain("MUST-NOT-APPEAR-LATE-WORLD");
+    expect(factsContent).not.toContain("MUST-NOT-APPEAR-LATE-ENTRY");
+    expect(messages.some((message) => message.role === "user" && message.content === USER_INPUT)).toBe(true);
+    expect(messages).toContainEqual({
+      role: "system",
+      content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT,
+    });
   });
 });

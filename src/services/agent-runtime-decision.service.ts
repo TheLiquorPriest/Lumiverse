@@ -285,6 +285,7 @@ export interface RuntimeDecisionDependencies {
     context: {
       chat: AgentRuntimeChatView;
       target: GenerationTargetV1;
+      requestedMode: AgentRuntimeMode;
       rootConnection?: FrozenConcreteConnectionV1 | null;
       childConnections?: Readonly<Record<string, FrozenConcreteConnectionV1>>;
       preset?: AgentRuntimePresetView | null;
@@ -1118,6 +1119,7 @@ export class AgentRuntimeDecisionService {
       ? this.dependencies.getInputRevisions(userId, request, {
         chat,
         target,
+        requestedMode: normalizedRequestedMode,
         rootConnection,
         childConnections,
         preset,

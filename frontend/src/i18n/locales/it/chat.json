@@ -114,6 +114,25 @@
       "refreshRequired": "Il runtime è cambiato prima dell’avvio della generazione. Controlla la modalità e riprova.",
       "unavailable": "La modalità agentica non è pronta. Usa Risposta o completa la correzione indicata."
     },
+    "errors": {
+      "not_found": "La destinazione runtime richiesta non è stata trovata.",
+      "invalid_request": "La richiesta runtime non è valida.",
+      "decision_refresh_required": "La decisione runtime è obsoleta. Controlla la modalità e riprova.",
+      "decision_capacity_exceeded": "Troppe decisioni runtime in sospeso. Riprova tra poco.",
+      "runtime_decision_unavailable": "Il servizio decisionale runtime non è disponibile.",
+      "agentic_unsupported_surface": "Questa superficie di generazione richiede la modalità Risposta.",
+      "agentic_runtime_unavailable": "Il runtime agentico non è disponibile. Usa la modalità Risposta.",
+      "agentic_preflight_failed": "Il preflight agentico non è riuscito. Usa Risposta o controlla la configurazione runtime.",
+      "agentic_chat_busy": "Questa chat ha già un'esecuzione agentica in corso.",
+      "agentic_protocol_failure": "La risposta del protocollo agentico non è valida.",
+      "agentic_work_exhausted": "Il budget di lavoro agentico è esaurito.",
+      "agentic_cancelled": "L'esecuzione agentica è stata annullata.",
+      "agentic_timed_out": "L'esecuzione agentica è scaduta.",
+      "agentic_commit_failed": "Non è stato possibile salvare il risultato agentico.",
+      "agentic_revision_conflict": "Il runtime è cambiato prima del salvataggio del risultato agentico.",
+      "agentic_provider_failure": "La richiesta al modello agentico non è riuscita.",
+      "agentic_internal_error": "Si è verificato un errore interno nel runtime agentico."
+    },
     "stop": {
       "stop": "Ferma esecuzione",
       "locating": "Preparazione dell’arresto esatto…",

@@ -114,6 +114,25 @@
       "refreshRequired": "生成開始前執行階段已變更。請檢查模式後重試。",
       "unavailable": "代理模式尚未就緒。請使用回應模式或完成列出的修復。"
     },
+    "errors": {
+      "not_found": "找不到要求的執行階段目標。",
+      "invalid_request": "執行階段要求無效。",
+      "decision_refresh_required": "執行階段決策已過期。請檢查模式後重試。",
+      "decision_capacity_exceeded": "待處理的執行階段決策過多，請稍後重試。",
+      "runtime_decision_unavailable": "執行階段決策服務無法使用。",
+      "agentic_unsupported_surface": "此生成介面需要使用回應模式。",
+      "agentic_runtime_unavailable": "代理執行階段無法使用，請使用回應模式。",
+      "agentic_preflight_failed": "代理預檢失敗。請使用回應模式或檢查執行階段設定。",
+      "agentic_chat_busy": "此聊天已有代理執行正在進行。",
+      "agentic_protocol_failure": "代理協定回應無效。",
+      "agentic_work_exhausted": "代理工作預算已用盡。",
+      "agentic_cancelled": "代理執行已取消。",
+      "agentic_timed_out": "代理執行已逾時。",
+      "agentic_commit_failed": "無法提交代理結果。",
+      "agentic_revision_conflict": "執行階段在提交代理結果前發生變更。",
+      "agentic_provider_failure": "代理模型要求失敗。",
+      "agentic_internal_error": "代理執行階段發生內部錯誤。"
+    },
     "stop": {
       "stop": "停止執行",
       "locating": "正在準備精確停止控制…",

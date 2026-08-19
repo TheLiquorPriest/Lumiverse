@@ -280,9 +280,9 @@ function agentConfig(): Record<string, unknown> {
   };
 }
 
-function assembledFixture(
+async function assembledFixture(
   blockContent?: string,
-): { snapshot: GenerationAssemblySnapshotV1; plan: AssemblyPlanV1 } {
+): Promise<{ snapshot: GenerationAssemblySnapshotV1; plan: AssemblyPlanV1 }> {
   const db = schema();
   try {
     seed(db, blockContent);
@@ -294,7 +294,7 @@ function assembledFixture(
       agentConfig: agentConfig(),
       db,
     });
-    return { snapshot, plan: compileAgentAssemblyPlan(snapshot) };
+    return { snapshot, plan: await compileAgentAssemblyPlan(snapshot) };
   } finally {
     db.close();
   }
@@ -493,8 +493,8 @@ describe("Agentic strict phases enter zero host callbacks", () => {
   });
 
 
-  test("ASSEMBLE compiles and materializes a plan without entering any callback", () => {
-    const { snapshot, plan } = assembledFixture();
+  test("ASSEMBLE compiles and materializes a plan without entering any callback", async () => {
+    const { snapshot, plan } = await assembledFixture();
     const materialized = materializeAssemblyPlan(plan, [], HOST_PREPARATION_LIMITS_V1);
 
     const literal = materialized
@@ -514,14 +514,19 @@ describe("Agentic strict phases enter zero host callbacks", () => {
     expectNoCallback(sentinels, { snapshot, plan, materialized });
   });
 
-  test("ASSEMBLE fails closed on an extension macro without consulting the registry", () => {
-    expect(() => assembledFixture(`{{${SENTINEL_MACRO_NAME}}}`))
-      .toThrowError(/requires_response_mode.*zeroCallbackSentinelMacro/s);
-    expectNoCallback(sentinels, null);
+  test("ASSEMBLE leaves unknown macros unresolved without consulting callbacks", async () => {
+    const unknown = "totallyUnknownAssemblyMacro";
+    const { plan } = await assembledFixture(`{{${unknown}}}`);
+    const literal = materializeAssemblyPlan(plan, [], HOST_PREPARATION_LIMITS_V1)
+      .flatMap((message) => message.segments)
+      .map((segment) => (segment.kind === "literal" ? segment.text : ""))
+      .join("\n");
+    expect(literal).toContain(`{{${unknown}}}`);
+    expectNoCallback(sentinels, { plan });
   });
 
   test("WORK dispatches only its closed tool set and never reaches a Response-only executor", async () => {
-    const { plan } = assembledFixture();
+    const { plan } = await assembledFixture();
     let composedTools: readonly string[] = [];
     let round = 0;
 

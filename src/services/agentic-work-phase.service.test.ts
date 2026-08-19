@@ -1720,6 +1720,328 @@ describe("Agentic WORK phase", () => {
     }
   });
 
+  test("rejects unknown assignment task IDs without discarding valid siblings or leaking child budget", async () => {
+    const assigned: string[] = [];
+    const childTasks: string[] = [];
+    let assignCalls = 0;
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) {
+        return response("", [
+          call("agent_delegate", "valid-delegate", {
+            profile_id: "writer",
+            task_id: "task-1",
+            task: "real task",
+          }),
+          call("agent_delegate", "invented-delegate", {
+            profile_id: "writer",
+            task_id: "auditEleanor01",
+            task: "invented task",
+          }),
+        ]);
+      }
+      return response("", [complete("after-unknown")]);
+    }, {
+      workspace: workspace({
+        listOpenTasks: async () => [{ id: "task-1", state: "active", assignedFrameId: null }],
+        assignChildTasks: async ({ assignments }) => {
+          assignCalls += 1;
+          assigned.push(...assignments.map(({ taskId }) => taskId));
+          return {
+            accepted: true,
+            workspaceRevision: assignCalls,
+            assignments,
+          };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async ({ descriptor }) => {
+        childTasks.push(descriptor.taskId ?? "");
+        return "child-result";
+      },
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(assignCalls).toBe(1);
+    expect(assigned).toEqual(["task-1"]);
+    expect(childTasks).toEqual(["task-1"]);
+    expect(result.observations.find((item) => item.callId === "invented-delegate")).toMatchObject({
+      status: "error",
+      code: "not_found",
+    });
+    expect(result.observations.find((item) => item.callId === "valid-delegate")).toMatchObject({
+      status: "success",
+    });
+    expect(result.observations.every((item) => item.code !== "tool_not_allowed")).toBe(true);
+  });
+
+  test("releases reserved child budget when assignment fails and continues the turn", async () => {
+    let assignCalls = 0;
+    let childCalls = 0;
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) {
+        return response("", [
+          call("agent_delegate", "first-delegate", {
+            profile_id: "writer",
+            task_id: "task-1",
+            task: "first",
+          }),
+        ]);
+      }
+      if (round === 2) {
+        return response("", [
+          call("agent_delegate", "retry-delegate", {
+            profile_id: "writer",
+            task_id: "task-1",
+            task: "retry",
+          }),
+        ]);
+      }
+      return response("", [complete("after-release")]);
+    }, {
+      budget: { maxChildFrames: 1, maxProviderRounds: 4 },
+      workspace: workspace({
+        listOpenTasks: async () => [{ id: "task-1", state: "active", assignedFrameId: null }],
+        assignChildTasks: async ({ assignments }) => {
+          assignCalls += 1;
+          if (assignCalls === 1) {
+            const error = Object.assign(new Error("task task-1 was not found"), { code: "not_found" });
+            throw error;
+          }
+          return {
+            accepted: true,
+            workspaceRevision: assignCalls,
+            assignments,
+          };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => {
+        childCalls += 1;
+        return "child-result";
+      },
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(assignCalls).toBe(2);
+    expect(childCalls).toBe(1);
+    expect(result.observations.find((item) => item.callId === "first-delegate")).toMatchObject({
+      status: "error",
+      code: "not_found",
+    });
+    expect(result.observations.find((item) => item.callId === "retry-delegate")).toMatchObject({
+      status: "success",
+    });
+    expect(result.observations.every((item) => item.code !== "tool_not_allowed")).toBe(true);
+  });
+
+  test("keeps an assignable sibling when another task is already assigned", async () => {
+    const assigned: string[] = [];
+    const childTasks: string[] = [];
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) {
+        return response("", [
+          call("agent_delegate", "open-delegate", {
+            profile_id: "writer",
+            task_id: "task-1",
+            task: "open",
+          }),
+          call("agent_delegate", "taken-delegate", {
+            profile_id: "writer",
+            task_id: "task-2",
+            task: "already taken",
+          }),
+        ]);
+      }
+      return response("", [complete("after-conflict")]);
+    }, {
+      workspace: workspace({
+        listOpenTasks: async () => [
+          { id: "task-1", state: "active", assignedFrameId: null },
+          { id: "task-2", state: "active", assignedFrameId: "already-child" },
+        ],
+        assignChildTasks: async ({ assignments }) => {
+          assigned.push(...assignments.map(({ taskId }) => taskId));
+          return {
+            accepted: true,
+            workspaceRevision: 1,
+            assignments,
+          };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async ({ descriptor }) => {
+        childTasks.push(descriptor.taskId ?? "");
+        return "child-result";
+      },
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(assigned).toEqual(["task-1"]);
+    expect(childTasks).toEqual(["task-1"]);
+    expect(result.observations.find((item) => item.callId === "taken-delegate")).toMatchObject({
+      status: "error",
+      code: "conflict",
+    });
+    expect(result.observations.find((item) => item.callId === "open-delegate")).toMatchObject({
+      status: "success",
+    });
+  });
+
+  test("validates assignment task IDs from a workspace task page without listOpenTasks", async () => {
+    const assigned: string[] = [];
+    const childTasks: string[] = [];
+    let assignCalls = 0;
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) {
+        return response("", [
+          call("agent_delegate", "page-valid", {
+            profile_id: "writer",
+            task_id: "task-1",
+            task: "real task",
+          }),
+          call("agent_delegate", "page-invented", {
+            profile_id: "writer",
+            task_id: "auditEleanor01",
+            task: "invented task",
+          }),
+        ]);
+      }
+      return response("", [complete("after-page")]);
+    }, {
+      workspace: workspace({
+        execute: async (operation) => {
+          if (operation !== "read_section" && operation !== "read_page") {
+            throw new Error(`unexpected workspace operation ${operation}`);
+          }
+          return {
+            result: {
+              section: "tasks",
+              page: 0,
+              pageSize: 100,
+              total: 1,
+              items: [{
+                id: "task-1",
+                state: "active",
+                assignedFrameId: null,
+                objective: "x".repeat(70 * 1024),
+              }],
+            },
+          };
+        },
+        assignChildTasks: async ({ assignments }) => {
+          assignCalls += 1;
+          assigned.push(...assignments.map(({ taskId }) => taskId));
+          return {
+            accepted: true,
+            workspaceRevision: assignCalls,
+            assignments,
+          };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async ({ descriptor }) => {
+        childTasks.push(descriptor.taskId ?? "");
+        return "child-result";
+      },
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(assignCalls).toBe(1);
+    expect(assigned).toEqual(["task-1"]);
+    expect(childTasks).toEqual(["task-1"]);
+    expect(result.observations.find((item) => item.callId === "page-invented")).toMatchObject({
+      status: "error",
+      code: "not_found",
+    });
+    expect(result.observations.find((item) => item.callId === "page-valid")).toMatchObject({
+      status: "success",
+    });
+  });
+
+  test("rejects the assignment batch before reserve when the task inventory cannot be read", async () => {
+    let assignCalls = 0;
+    let childCalls = 0;
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) {
+        return response("", [
+          call("agent_delegate", "unread-valid", {
+            profile_id: "writer",
+            task_id: "task-1",
+            task: "real task",
+          }),
+          call("agent_delegate", "unread-invented", {
+            profile_id: "writer",
+            task_id: "auditEleanor01",
+            task: "invented task",
+          }),
+        ]);
+      }
+      return response("", [complete("after-unread")]);
+    }, {
+      workspace: workspace({
+        execute: async () => {
+          throw Object.assign(new Error("workspace section unavailable"), { code: "internal_error" });
+        },
+        assignChildTasks: async ({ assignments }) => {
+          assignCalls += 1;
+          return {
+            accepted: true,
+            workspaceRevision: assignCalls,
+            assignments,
+          };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => {
+        childCalls += 1;
+        return "unexpected";
+      },
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(assignCalls).toBe(0);
+    expect(childCalls).toBe(0);
+    expect(result.observations.find((item) => item.callId === "unread-valid")).toMatchObject({
+      status: "error",
+      code: "not_found",
+    });
+    expect(result.observations.find((item) => item.callId === "unread-invented")).toMatchObject({
+      status: "error",
+      code: "not_found",
+    });
+    expect(result.observations.every((item) => item.code !== "tool_not_allowed")).toBe(true);
+  });
+
   test("fails an empty child result instead of accepting a required slot", async () => {
     const frame = createAgenticChildFrame({
       frameId: "empty-child",
@@ -2049,9 +2371,9 @@ describe("Agentic WORK phase", () => {
     const tokenOverflow = await runAgenticWorkPhase(baseOptions(async () => ({
       content: "ok",
       finish_reason: "stop",
-      usage: { prompt_tokens: 1, completion_tokens: 4, total_tokens: 5 },
     }), {
       budget: { maxProviderRounds: 1, maxOutputTokens: 3 },
+      countTokens: () => 4,
     }));
     expect(tokenOverflow.status).toBe("failed");
     expect(tokenOverflow.code).toBe("child_output_limit_exceeded");
@@ -2124,8 +2446,8 @@ describe("Agentic WORK phase", () => {
     expect(result.status).toBe("succeeded");
     expect(result.content).toBe("a");
     expect(requests).toEqual([
-      { receiveLimitBytes: 1024, maxOutputTokens: firstCallBytes + 1 },
-      { receiveLimitBytes: 1024 - firstFinishReasonBytes - firstCallBytes - toolResultBytes, maxOutputTokens: 1 },
+      { receiveLimitBytes: 8388608, maxOutputTokens: firstCallBytes + 1 },
+      { receiveLimitBytes: 8388608 - firstFinishReasonBytes - firstCallBytes - toolResultBytes, maxOutputTokens: firstCallBytes + 1 },
     ]);
   });
 
@@ -2153,12 +2475,12 @@ describe("Agentic WORK phase", () => {
       task: "bounded task",
       systemPrompt: "bounded system prompt",
       budget: { maxChildRounds: 1, maxChildOutputBytes: 16, maxOutputTokens: 1 },
-      dispatch: async () => response("xx"),
+      dispatch: async () => response("x".repeat(20)),
     });
     expect(tokenOverflow.status).toBe("failed");
     expect(tokenOverflow.code).toBe("child_output_limit_exceeded");
   });
-  test("charges private reasoning payloads toward WORK token caps", async () => {
+  test("charges private reasoning toward the child receive envelope, not published tokens", async () => {
     const privateResponse = (): GenerationResponse => ({
       content: "a",
       finish_reason: "stop",
@@ -2168,12 +2490,28 @@ describe("Agentic WORK phase", () => {
     const rootOverflow = await runAgenticWorkPhase(baseOptions(async () => privateResponse(), {
       budget: { maxProviderRounds: 1, maxOutputTokens: 1 },
     }));
-    expect(rootOverflow.status).toBe("failed");
-    expect(rootOverflow.code).toBe("child_output_limit_exceeded");
+    expect(rootOverflow.code).not.toBe("child_output_limit_exceeded");
 
-    const childOverflow = await executeBoundedAgenticChildFrame({
+    const childReceiveOverflow = await executeBoundedAgenticChildFrame({
       frame: createAgenticChildFrame({
         frameId: "private-reasoning-child",
+        parentFrameId: "root",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        signal: new AbortController().signal,
+      }),
+      task: "bounded task",
+      systemPrompt: "bounded system prompt",
+      budget: { maxChildRounds: 1, maxChildOutputBytes: 8, maxChildReceiveBytes: 8, maxOutputTokens: 16 },
+      dispatch: async () => privateResponse(),
+    });
+    expect(childReceiveOverflow.status).toBe("failed");
+    expect(childReceiveOverflow.code).toBe("child_output_limit_exceeded");
+
+    const childPublishedFits = await executeBoundedAgenticChildFrame({
+      frame: createAgenticChildFrame({
+        frameId: "private-reasoning-child-ok",
         parentFrameId: "root",
         connectionId: "concrete-connection",
         model: "frozen-model",
@@ -2185,8 +2523,29 @@ describe("Agentic WORK phase", () => {
       budget: { maxChildRounds: 1, maxChildOutputBytes: 1024, maxOutputTokens: 1 },
       dispatch: async () => privateResponse(),
     });
-    expect(childOverflow.status).toBe("failed");
-    expect(childOverflow.code).toBe("child_output_limit_exceeded");
+    expect(childPublishedFits.status).toBe("succeeded");
+    expect(childPublishedFits.content).toBe("a");
+  });
+
+  test("settles WORK tokens with the model tokenizer, not UTF-8 bytes", async () => {
+    const privateResponse = (): GenerationResponse => ({
+      content: "x".repeat(8_192),
+      finish_reason: "stop",
+      reasoning: "y".repeat(8_192),
+    });
+    const counted = await runAgenticWorkPhase(baseOptions(async () => privateResponse(), {
+      budget: { maxProviderRounds: 1, maxOutputTokens: 4 },
+      countTokens: () => 1,
+    }));
+    expect(counted.status).not.toBe("failed");
+    expect(counted.code).not.toBe("child_output_limit_exceeded");
+
+    const bytesAsTokens = await runAgenticWorkPhase(baseOptions(async () => privateResponse(), {
+      budget: { maxProviderRounds: 1, maxOutputTokens: 4 },
+      countTokens: (text) => Buffer.byteLength(text, "utf8"),
+    }));
+    expect(bytesAsTokens.status).toBe("failed");
+    expect(bytesAsTokens.code).toBe("child_output_limit_exceeded");
   });
   test("snapshots a stateful child response before bounded accounting", async () => {
     const frame = createAgenticChildFrame({

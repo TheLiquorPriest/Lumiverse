@@ -199,13 +199,23 @@ export function AgentActivityDetails({
   )
 }
 
+export function visibleActivityRunCount(summary: AgentSummary): number {
+  if (summary.invocationCount > 0) return summary.invocationCount
+  if (summary.succeededCount > 0) return summary.succeededCount
+  return summary.status === 'succeeded' ? 1 : 0
+}
+
 export function AgentSummaryDetails({ summary }: { summary: AgentSummary }) {
   const { t } = useTranslation('chat')
   const status = t(`agentActivity.status.${summary.status}`)
+  const invocationCount = visibleActivityRunCount(summary)
+  const succeededCount = summary.succeededCount > 0
+    ? summary.succeededCount
+    : summary.status === 'succeeded' ? 1 : 0
   const counts = [
-    t('agentActivity.summary.invocations', { count: summary.invocationCount }),
-    summary.succeededCount > 0
-      ? t('agentActivity.summary.succeeded', { count: summary.succeededCount })
+    t('agentActivity.summary.invocations', { count: invocationCount }),
+    succeededCount > 0
+      ? t('agentActivity.summary.succeeded', { count: succeededCount })
       : null,
     summary.failedCount > 0
       ? t('agentActivity.summary.failed', { count: summary.failedCount })
@@ -341,7 +351,7 @@ export default function ReasoningBlock({
       : t('agentActivity.idleLabel')
     : agentSummary && !reasoning
       ? t('agentActivity.summaryLabel', {
-          count: agentSummary.invocationCount,
+          count: visibleActivityRunCount(agentSummary),
           status: t(`agentActivity.status.${agentSummary.status}`),
         })
       : reasoningLabel

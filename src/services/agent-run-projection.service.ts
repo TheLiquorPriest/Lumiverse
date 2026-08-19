@@ -289,6 +289,14 @@ function boundedCounter(value: unknown, fallback = 0): number {
   return value;
 }
 
+function coerceNonNegativeSafeInteger(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const numeric = typeof value === "number" || typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : Number.NaN;
+}
+
+
 function boundedBytesJson(value: unknown, maxBytes: number): string | null {
   try {
     const json = JSON.stringify(value);
@@ -426,7 +434,8 @@ function normalizeTarget(messageId: unknown, swipeId: unknown): AgentRunTargetV1
   const normalizedMessageId = messageId === null || messageId === undefined ? null : boundedId(messageId);
   if (messageId !== null && messageId !== undefined && !normalizedMessageId) return null;
   if (normalizedMessageId === null) return null;
-  const normalizedSwipeId = boundedCounter(swipeId, 0);
+  const coercedSwipeId = coerceNonNegativeSafeInteger(swipeId);
+  const normalizedSwipeId = Number.isSafeInteger(coercedSwipeId) ? coercedSwipeId as number : 0;
   return { messageId: normalizedMessageId, swipeId: normalizedSwipeId };
 }
 
@@ -599,7 +608,7 @@ function parseStoredEvent(
     if (!generationType) return null;
     const messageId = parsed.target?.messageId ?? null;
     const swipeId = parsed.target?.swipeId ?? null;
-    if (!assertStoredTarget(db, chatId, messageId, swipeId)) return null;
+    if (!assertStoredTarget(db, chatId, messageId, swipeId, generationType)) return null;
     const run = normalizeRun({
       userId,
       chatId,
@@ -660,27 +669,35 @@ function messageHasSwipe(
   db: Database,
   chatId: string,
   messageId: string,
-  swipeId: number | null | undefined,
+  swipeId: number | string | null | undefined,
+  options?: { readonly allowAppendSlot?: boolean },
 ): boolean {
   const row = db.query(
     "SELECT swipes FROM messages WHERE id = ? AND chat_id = ? LIMIT 1",
   ).get(messageId, chatId) as { swipes?: unknown } | null;
   if (!row) return false;
   if (swipeId === null || swipeId === undefined) return true;
-  if (!Number.isSafeInteger(swipeId) || swipeId < 0) return false;
+  const coercedSwipeId = coerceNonNegativeSafeInteger(swipeId);
+  if (coercedSwipeId === null || coercedSwipeId === undefined || !Number.isSafeInteger(coercedSwipeId)) return false;
   const swipes = parseSwipes(row.swipes);
-  return swipes !== null && swipeId < swipes.length;
+  if (swipes === null) return false;
+  // regenerate/swipe may target swipeCount before that slot exists.
+  if (options?.allowAppendSlot === true && coercedSwipeId === swipes.length) return true;
+  return coercedSwipeId < swipes.length;
 }
 
 function assertStoredTarget(
   db: Database,
   chatId: string,
   messageId: string | null,
-  swipeId: number | null,
+  swipeId: number | string | null,
+  generationType?: unknown,
 ): boolean {
   if (messageId === null) return swipeId === null;
   if (!validId(messageId)) return false;
-  return messageHasSwipe(db, chatId, messageId, swipeId);
+  return messageHasSwipe(db, chatId, messageId, swipeId, {
+    allowAppendSlot: generationType === "regenerate" || generationType === "swipe",
+  });
 }
 
 function executionControlRow(
@@ -778,15 +795,19 @@ function workspaceChildVisible(row: Record<string, unknown>, now = Math.floor(Da
 function assertOwnedTarget(db: Database, input: AgentRunProjectionInputV2): boolean {
   if (!validId(input.userId) || !validId(input.chatId)) return false;
   if (!assertOwnedChat(db, input.userId, input.chatId)) return false;
+  const targetSwipeId = coerceNonNegativeSafeInteger(input.targetSwipeId);
   if (input.targetSwipeId !== undefined && input.targetSwipeId !== null
-    && (!Number.isSafeInteger(input.targetSwipeId) || input.targetSwipeId < 0)) return false;
+    && !Number.isSafeInteger(targetSwipeId)) return false;
   if (input.targetMessageId === undefined || input.targetMessageId === null) {
     return input.targetSwipeId === undefined || input.targetSwipeId === null;
   }
   if (!validId(input.targetMessageId)) return false;
   // normalizeTarget() defaults a message target to swipe zero. Validate that
   // concrete stored association now, not only when the run is later read.
-  return messageHasSwipe(db, input.chatId, input.targetMessageId, input.targetSwipeId ?? 0);
+  // regenerate/swipe may publish ASSEMBLE against the not-yet-written append slot.
+  return messageHasSwipe(db, input.chatId, input.targetMessageId, targetSwipeId ?? 0, {
+    allowAppendSlot: input.generationType === "regenerate" || input.generationType === "swipe",
+  });
 }
 
 function getProjectionRow(db: Database, userId: string, chatId: string, turnId: string): StoredProjectionRow | null {
@@ -1156,7 +1177,7 @@ export function repairAgentRunProjectionFromInterruptedExecution(
   const existing = existingRow ? parseStoredRun(existingRow) : null;
   const requestedMessageId = existing?.target?.messageId ?? execution.targetMessageId;
   const requestedSwipeId = existing?.target?.swipeId ?? execution.targetSwipeId;
-  const targetValid = assertStoredTarget(db, execution.chatId, requestedMessageId, requestedSwipeId);
+  const targetValid = assertStoredTarget(db, execution.chatId, requestedMessageId, requestedSwipeId, execution.targetKind);
   const targetMessageId = targetValid ? requestedMessageId : null;
   const targetSwipeId = targetMessageId === null ? null : requestedSwipeId ?? 0;
   return publishAgentRunCommit(db, {
@@ -1210,13 +1231,15 @@ export function publishAgentRunCommit(
   return writeProjection(db, input);
 }
 
-function writeProjection(db: Database, input: AgentRunProjectionInputV2): AgentRunProjectionCommitResult {
-  if ((input.targetMessageId !== undefined && input.targetMessageId !== null && !validId(input.targetMessageId))
-    || (input.targetSwipeId !== undefined && input.targetSwipeId !== null && (
-      !Number.isSafeInteger(input.targetSwipeId) || input.targetSwipeId < 0
-    ))) {
+function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): AgentRunProjectionCommitResult {
+  const targetSwipeId = coerceNonNegativeSafeInteger(rawInput.targetSwipeId);
+  if ((rawInput.targetMessageId !== undefined && rawInput.targetMessageId !== null && !validId(rawInput.targetMessageId))
+    || (rawInput.targetSwipeId !== undefined && rawInput.targetSwipeId !== null && !Number.isSafeInteger(targetSwipeId))) {
     throw new Error("agent run target association mismatch");
   }
+  const input: AgentRunProjectionInputV2 = targetSwipeId === rawInput.targetSwipeId
+    ? rawInput
+    : { ...rawInput, targetSwipeId: targetSwipeId ?? null };
   if (!assertOwnedTarget(db, input)) throw new Error("agent run projection ownership mismatch");
   const existingRow = getProjectionRow(db, input.userId, input.chatId, input.turnId);
   const existing = existingRow ? (parseStoredRun(existingRow) ?? undefined) : undefined;
@@ -1594,7 +1617,7 @@ function listCurrentRuns(
         LIMIT ? OFFSET ?`,
     ).all(userId, chatId, snapshotSequence, MAX_RUNS, safeOffset) as StoredProjectionRow[];
   const runs = rows
-    .filter((row) => assertStoredTarget(db, row.chat_id, row.target_message_id, row.target_swipe_id))
+    .filter((row) => assertStoredTarget(db, row.chat_id, row.target_message_id, row.target_swipe_id, row.generation_type))
     .map(parseStoredRun)
     .filter((run): run is AgentRunPublicV2 => run !== null);
   const totalRuns = withExecution
@@ -1761,7 +1784,7 @@ export function getAgentRun(userId: string, turnId: string, chatId?: string): Ag
     const row = getProjectionByTurn(db, userId, turnId);
     if (!row || (chatId !== undefined && row.chat_id !== chatId) || !assertOwnedChat(db, userId, row.chat_id)) return null;
     if (!executionReadVisible(db, executionControlRow(db, userId, row.chat_id, turnId))) return null;
-    if (!assertStoredTarget(db, row.chat_id, row.target_message_id, row.target_swipe_id)) return null;
+    if (!assertStoredTarget(db, row.chat_id, row.target_message_id, row.target_swipe_id, row.generation_type)) return null;
     return parseStoredRun(row);
   })();
 }

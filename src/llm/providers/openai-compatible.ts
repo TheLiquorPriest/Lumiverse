@@ -281,6 +281,48 @@ export class ReasoningDetailsAccumulator {
   }
 }
 
+function coerceOpenAIReasoningDelta(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => coerceOpenAIReasoningDelta(entry))
+      .filter((part): part is string => part !== undefined && part.length > 0);
+    return parts.length > 0 ? parts.join("") : undefined;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    for (const key of ["text", "content", "reasoning", "reasoning_content", "thinking"]) {
+      const part = coerceOpenAIReasoningDelta(record[key]);
+      if (part !== undefined) return part;
+    }
+  }
+  return undefined;
+}
+
+type OpenAIStreamToolCallBuffer = { id: string; name: string; argsJson: string };
+
+/** Complete identified stream-end tool calls become executable results; incomplete or malformed calls are dropped. */
+function finalizeOpenAIStreamToolCalls(
+  buffer: OpenAIStreamToolCallBuffer[],
+): ToolCallResult[] | undefined {
+  const completed: ToolCallResult[] = [];
+  for (const tc of buffer) {
+    if (!tc.name || !tc.id) continue;
+    try {
+      completed.push({
+        name: tc.name,
+        args: parseModelToolArguments(tc.argsJson),
+        call_id: tc.id,
+      });
+    } catch {
+      // Truncated, malformed, or non-object arguments drop this call only.
+    }
+  }
+  return completed.length > 0 ? completed : undefined;
+}
+
+
 /**
  * Abstract base class for providers that use the OpenAI-compatible
  * /chat/completions API format. Subclasses override `name`, `defaultUrl`,
@@ -430,12 +472,9 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       if (toolCalls.length === 0) toolCalls = undefined;
     }
 
-    const rawReasoning = message.reasoning !== undefined
-      ? message.reasoning
-      : message.reasoning_content;
-    if (rawReasoning !== undefined && typeof rawReasoning !== "string") {
-      throw new ProviderProtocolError("OpenAI reasoning must be a string");
-    }
+    const rawReasoning = coerceOpenAIReasoningDelta(
+      message.reasoning !== undefined ? message.reasoning : message.reasoning_content,
+    );
     const reasoningDetails = new ReasoningDetailsAccumulator();
     if (rawReasoning !== undefined) reasoningDetails.reserveText(rawReasoning);
     const normalized = this.splitMirroredReasoning(message.content, rawReasoning);
@@ -514,11 +553,18 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
         if (eventCount % 64 === 0) await yieldToEventLoop(request.signal);
         if (data === "[DONE]") {
           if (!sse.isTerminal) sse.markTerminal();
-          if (!sawFinishReason) {
-            throw new ProviderProtocolError("OpenAI stream ended without finish_reason");
-          }
           if (toolCallBuffer.length > 0 && !sawToolFinish) {
-            throw new ProviderProtocolError("OpenAI stream ended with unresolved tool calls");
+            const toolCalls = finalizeOpenAIStreamToolCalls(toolCallBuffer);
+            sawFinishReason = true;
+            sawToolFinish = true;
+            yield {
+              token: "",
+              finish_reason: toolCalls ? "tool_calls" : "stop",
+              tool_calls: toolCalls,
+              reasoning_details: reasoningDetails.finalize(),
+            };
+          } else if (!sawFinishReason) {
+            throw new ProviderProtocolError("OpenAI stream ended without finish_reason");
           }
           continue;
         }
@@ -652,18 +698,13 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       reasoningDetails.push(delta?.reasoning_details);
       let reasoning: string | undefined;
       if (reasoningKey) {
-        reasoning = delta?.[reasoningKey];
+        reasoning = coerceOpenAIReasoningDelta(delta?.[reasoningKey]);
       } else if (delta?.reasoning !== undefined) {
-        if (typeof delta.reasoning !== "string") throw new ProviderProtocolError("OpenAI reasoning delta must be a string");
+        reasoning = coerceOpenAIReasoningDelta(delta.reasoning);
         reasoningKey = "reasoning";
-        reasoning = delta.reasoning;
       } else if (delta?.reasoning_content !== undefined) {
-        if (typeof delta.reasoning_content !== "string") throw new ProviderProtocolError("OpenAI reasoning delta must be a string");
+        reasoning = coerceOpenAIReasoningDelta(delta.reasoning_content);
         reasoningKey = "reasoning_content";
-        reasoning = delta.reasoning_content;
-      }
-      if (reasoning !== undefined && typeof reasoning !== "string") {
-        throw new ProviderProtocolError("OpenAI reasoning delta must be a string");
       }
       if (reasoning !== undefined) reasoningDetails.reserveText(reasoning);
       const normalized = this.splitMirroredReasoning(delta?.content, reasoning);
@@ -679,24 +720,22 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
         if (sawFinishReason) throw new ProviderProtocolError("OpenAI stream emitted duplicate finish_reason");
         sawFinishReason = true;
         let toolCalls: ToolCallResult[] | undefined;
+        let publishedToken = content || "";
+        let publishedFinish = finishReason;
         if (toolCallBuffer.length > 0) {
-          if (finishReason !== "tool_calls") {
-            throw new ProviderProtocolError("OpenAI stream finished with unresolved tool calls");
-          }
           sawToolFinish = true;
-          toolCalls = toolCallBuffer.map((tc) => {
-            if (!tc.name || !tc.id) throw new ProviderProtocolError("OpenAI tool call is incomplete");
-            return {
-              name: tc.name,
-              args: parseModelToolArguments(tc.argsJson) as Record<string, unknown>,
-              call_id: tc.id,
-            };
-          });
+          toolCalls = finalizeOpenAIStreamToolCalls(toolCallBuffer);
+          if (toolCalls) {
+            publishedFinish = "tool_calls";
+          } else {
+            publishedFinish = "stop";
+            publishedToken = "";
+          }
         }
         yield {
-          token: content || "",
+          token: publishedToken,
           reasoning,
-          finish_reason: toolCalls ? "tool_calls" : finishReason,
+          finish_reason: publishedFinish,
           tool_calls: toolCalls,
           reasoning_details: reasoningDetails.finalize(),
           usage,

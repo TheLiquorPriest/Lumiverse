@@ -140,6 +140,25 @@
       "refreshRequired": "The runtime changed before generation started. Review the mode and try again.",
       "unavailable": "Agentic mode is not ready. Use Response or complete the listed repair."
     },
+    "errors": {
+      "not_found": "The requested runtime target was not found.",
+      "invalid_request": "The runtime request was invalid.",
+      "decision_refresh_required": "The runtime decision is stale. Review the mode and try again.",
+      "decision_capacity_exceeded": "Too many runtime decisions are pending. Try again shortly.",
+      "runtime_decision_unavailable": "The runtime decision service is unavailable.",
+      "agentic_unsupported_surface": "This generation surface requires Response mode.",
+      "agentic_runtime_unavailable": "Agentic runtime is unavailable. Use Response mode.",
+      "agentic_preflight_failed": "Agentic preflight failed. Use Response mode or review runtime setup.",
+      "agentic_chat_busy": "This chat already has an Agentic run in progress.",
+      "agentic_protocol_failure": "The Agentic protocol response was invalid.",
+      "agentic_work_exhausted": "The Agentic work budget was exhausted.",
+      "agentic_cancelled": "The Agentic run was cancelled.",
+      "agentic_timed_out": "The Agentic run timed out.",
+      "agentic_commit_failed": "The Agentic result could not be committed.",
+      "agentic_revision_conflict": "The runtime changed before the Agentic result could be committed.",
+      "agentic_provider_failure": "The Agentic model request failed.",
+      "agentic_internal_error": "The Agentic runtime encountered an internal error."
+    },
     "stop": {
       "stop": "Stop run",
       "locating": "Preparing exact stop control…",

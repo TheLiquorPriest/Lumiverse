@@ -442,6 +442,9 @@ export interface GenerationEndedPayload {
   targetSwipeId?: number
   content?: string
   error?: string
+  errorCode?: string
+  phase?: string
+  status?: string
   agentError?: AgentPublicErrorV1
   agentActivity?: AgentActivitySnapshotV1
   generationType?: string

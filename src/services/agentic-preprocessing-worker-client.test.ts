@@ -83,10 +83,10 @@ function makeResponse(input: RenderPreparationInputV1, requestId: string, conten
   };
 }
 
-function expectMalformed(run: () => unknown): void {
+async function expectMalformed(run: () => unknown): Promise<void> {
   let failure: unknown;
   try {
-    run();
+    await run();
   } catch (error) {
     failure = error;
   }
@@ -95,29 +95,29 @@ function expectMalformed(run: () => unknown): void {
 }
 
 describe("agentic preprocessing worker render response validation", () => {
-  test("accepts output exactly at the trusted UTF-8 cap", () => {
+  test("accepts output exactly at the trusted UTF-8 cap", async () => {
     const input = makeInput(4);
     const job = makeJob(input);
     const response = makeResponse(input, job.requestId, "😀");
 
-    expect(parseAgenticPreprocessingResponseV1(response, job)).toEqual(response.result);
+    expect(await parseAgenticPreprocessingResponseV1(response, job)).toEqual(response.result);
   });
 
-  test("rejects forged output at cap plus one byte", () => {
+  test("rejects forged output at cap plus one byte", async () => {
     const input = makeInput(4);
     const job = makeJob(input);
-    expectMalformed(() => parseAgenticPreprocessingResponseV1(makeResponse(input, job.requestId, "😀a"), job));
+    await expectMalformed(() => parseAgenticPreprocessingResponseV1(makeResponse(input, job.requestId, "😀a"), job));
   });
 
-  test("rejects unknown result fields before accepting expanded DTOs", () => {
+  test("rejects unknown result fields before accepting expanded DTOs", async () => {
     const input = makeInput(4);
     const job = makeJob(input);
     const response = makeResponse(input, job.requestId, "😀");
     const result = response.result as Record<string, unknown>;
     result.forgedField = "unexpected";
-    expectMalformed(() => parseAgenticPreprocessingResponseV1(response, job));
+    await expectMalformed(() => parseAgenticPreprocessingResponseV1(response, job));
   });
-  test("rejects forged revision and target bindings", () => {
+  test("rejects forged revision and target bindings", async () => {
     const input = makeInput(4);
     const job = makeJob(input);
     const revisionResponse = makeResponse(input, job.requestId, "😀");
@@ -125,18 +125,62 @@ describe("agentic preprocessing worker render response validation", () => {
       ...input.inputRevisions,
       digest: "forged",
     };
-    expectMalformed(() => parseAgenticPreprocessingResponseV1(revisionResponse, job));
+    await expectMalformed(() => parseAgenticPreprocessingResponseV1(revisionResponse, job));
 
     const targetResponse = makeResponse(input, job.requestId, "😀");
     const metadata = (targetResponse.result as Record<string, unknown>).chatMetadataDeltas as Array<Record<string, unknown>>;
     metadata[0]!.key = "message:forged:continue";
-    expectMalformed(() => parseAgenticPreprocessingResponseV1(targetResponse, job));
+    await expectMalformed(() => parseAgenticPreprocessingResponseV1(targetResponse, job));
   });
-  test("accepts a caller request id distinct from the wire id but rejects forged wire ids", () => {
+  test("accepts a caller request id distinct from the wire id but rejects forged wire ids", async () => {
     const input = makeInput(4);
     const job = makeJob(input);
-    expect(parseAgenticPreprocessingResponseV1(makeResponse(input, job.requestId, "😀"), job)).toBeTruthy();
-    expectMalformed(() => parseAgenticPreprocessingResponseV1(makeResponse(input, "forged-wire-id", "😀"), job));
+    expect(await parseAgenticPreprocessingResponseV1(makeResponse(input, job.requestId, "😀"), job)).toBeTruthy();
+    await expectMalformed(() => parseAgenticPreprocessingResponseV1(makeResponse(input, "forged-wire-id", "😀"), job));
+  });
+
+  test("revalidates a 132KB regenerate request after the worker returns", async () => {
+    const sourceMessages = Array.from({ length: 129 }, (_value, index) => ({
+      sourceMessageId: `msg-${index}`,
+      revision: index + 1,
+      role: (index % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
+      content: { kind: "text" as const, text: "n".repeat(1024) },
+    }));
+    const revisions = sourceMessages.map((message) => ({
+      kind: "message" as const,
+      id: message.sourceMessageId,
+      revision: message.revision,
+      digest: `digest-${message.sourceMessageId}`,
+    }));
+    const input: RenderPreparationInputV1 = {
+      ...makeInput(HOST_PREPARATION_LIMITS_V1.maxOutputBytes),
+      target: { kind: "regenerate", messageId: "msg-0", swipeId: 0 },
+      sourceMessages,
+      swipes: [{
+        swipeId: "0",
+        index: 0,
+        revision: 1,
+        content: { kind: "text", text: "prior" },
+      }],
+      inputRevisions: {
+        version: 1,
+        revisions,
+        digest: "regenerate-inputs",
+      },
+    };
+    const job = makeJob(input);
+    const response = makeResponse(input, job.requestId, "ok");
+    const metadata = (response.result as Record<string, unknown>).chatMetadataDeltas as Array<Record<string, unknown>>;
+    metadata[0] = {
+      kind: "chat_metadata",
+      key: "message:msg-0:swipe:0",
+      operation: "set",
+      value: "ok",
+      expectedRevision: 1,
+    };
+    const started = Date.now();
+    expect(await parseAgenticPreprocessingResponseV1(response, job)).toEqual(response.result);
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });
 

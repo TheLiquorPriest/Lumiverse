@@ -17,6 +17,13 @@ import type {
   WorkspaceTerminalHandoffV1,
 } from "../types/turn-workspace";
 import type { InputRevisionV1 } from "../types/agent-preprocessing";
+import {
+  liveChatInputRevision,
+  liveConnectionInputRevision,
+  liveCredentialInputRevision,
+  liveEndpointInputRevision,
+  liveMessageInputRevision,
+} from "./prompt-assembly-snapshot.service";
 const baselineSql = await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text();
 const turnSql = await Bun.file(join(import.meta.dir, "..", "db", "migrations", "106_agent_turn_workspace.sql")).text();
 const projectionSql = await Bun.file(join(import.meta.dir, "..", "db", "migrations", "108_agent_run_projection.sql")).text();
@@ -214,6 +221,45 @@ describe("agentic commit transaction", () => {
     expect(db.query("SELECT receipt_id FROM agent_published_workspace_artifacts WHERE chat_id = ?").get("chat-1")).toEqual({ receipt_id: receipt.receipt_id });
     expect(db.query("SELECT published_reference_count AS count FROM agent_artifact_blobs WHERE digest = ?").get(artifactDigest)).toEqual({ count: 1 });
   });
+  test("projects host activity tool and child counts without inventing them", () => {
+    db = createDatabase();
+    const result = commitAgenticTurnV1({
+      ...input(db, AGENTIC_COMMIT_DEPENDENCIES_V1, false),
+      activityUsage: {
+        inputTokens: 9,
+        outputTokens: 8,
+        totalTokens: 17,
+        toolCalls: 4,
+        childInvocations: 2,
+      },
+    });
+    expect(result.status).toBe("committed");
+    const row = db.query("SELECT snapshot_json FROM agent_run_projections WHERE turn_id = ?").get("turn-1") as { snapshot_json: string };
+    const snapshot = JSON.parse(row.snapshot_json) as { usage: { inputTokens: number; outputTokens: number; totalTokens: number; toolCalls: number; childInvocations: number } };
+    expect(snapshot.usage).toEqual({
+      inputTokens: 2,
+      outputTokens: 3,
+      totalTokens: 5,
+      toolCalls: 4,
+      childInvocations: 2,
+    });
+  });
+  test("rejects malformed activity usage before the commit gate", () => {
+    db = createDatabase();
+    expect(() => commitAgenticTurnV1({
+      ...input(db, AGENTIC_COMMIT_DEPENDENCIES_V1, false),
+      activityUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        toolCalls: -1,
+        childInvocations: 0,
+      },
+    })).toThrow();
+    expect(db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("turn-1")).toEqual({ state: "PREPARE_COMMIT" });
+    expect(db.query("SELECT COUNT(*) AS count FROM agent_run_projections WHERE turn_id = ?").get("turn-1")).toEqual({ count: 0 });
+  });
+
   test("keeps private render guidance out of the durable receipt summary", () => {
     db = createDatabase();
     const candidate = {
@@ -449,6 +495,200 @@ describe("agentic commit transaction", () => {
     expect(db.query("SELECT metadata FROM chats WHERE id = ?").get("chat-1")).toEqual({ metadata: "{}" });
     expect(db.query("SELECT COUNT(*) AS count FROM messages WHERE chat_id = ?").get("chat-1")).toEqual({ count: 0 });
   });
+
+  test("chat updated_at alone does not stale-fence; generation_revision and preset still fail closed", () => {
+    const digestMembers = (members: readonly InputRevisionV1[]) => createHash("sha256").update(JSON.stringify(members.map((member) => ({
+      digest: member.digest,
+      id: member.id,
+      kind: member.kind,
+      revision: member.revision,
+    })))).digest("hex");
+    const withLiveFence = (database: Database, mutate?: (database: Database) => void) => {
+      database.query("INSERT INTO presets (id, name, provider, user_id) VALUES (?, ?, ?, ?)").run("preset-1", "Preset", "openai", "u1");
+      const chatRow = database.query("SELECT generation_revision FROM chats WHERE id = ? AND user_id = ?").get("chat-1", "u1") as { generation_revision?: unknown };
+      const presetRow = database.query("SELECT updated_at FROM presets WHERE id = ? AND user_id = ?").get("preset-1", "u1") as { updated_at?: unknown };
+      const chatMember = { kind: "chat" as const, id: "chat-1", ...liveChatInputRevision("chat-1", chatRow.generation_revision) };
+      const presetMember = { kind: "preset" as const, id: "preset-1", revision: String(presetRow.updated_at ?? ""), digest: String(presetRow.updated_at ?? "") };
+      const members: InputRevisionV1[] = [...testRevisionSet.revisions.map((member) => member.kind === "chat" ? chatMember : member), presetMember];
+      const revisions = { version: 1 as const, revisions: members, digest: digestMembers(members) };
+      mutate?.(database);
+      const candidate: AgenticCommitInputV1 = {
+        ...input(database, AGENTIC_COMMIT_DEPENDENCIES_V1, false),
+        renderPreparation: { ...render(), inputRevisions: revisions },
+        inputRevisions: revisions,
+        revisionReader: (member, liveDb) => {
+          const fenceDb = liveDb ?? database;
+          if (member.kind === "chat") {
+            const live = fenceDb.query("SELECT generation_revision FROM chats WHERE id = ? AND user_id = ? LIMIT 1").get(member.id, "u1") as { generation_revision?: unknown } | null;
+            return live ? liveChatInputRevision(member.id, live.generation_revision) : null;
+          }
+          if (member.kind === "preset") {
+            const live = fenceDb.query("SELECT updated_at FROM presets WHERE id = ? AND user_id = ? LIMIT 1").get(member.id, "u1") as { updated_at?: unknown } | null;
+            return live ? { revision: String(live.updated_at ?? ""), digest: String(live.updated_at ?? "") } : null;
+          }
+          return members.find((entry) => entry.kind === member.kind && entry.id === member.id) ?? null;
+        },
+      };
+      return candidate;
+    };
+
+    db = createDatabase();
+    expect(commitAgenticTurnV1(withLiveFence(db, (live) => {
+      live.query("UPDATE chats SET updated_at = updated_at + 100 WHERE id = ? AND user_id = ?").run("chat-1", "u1");
+    })).status).toBe("committed");
+    db.close();
+
+    db = createDatabase();
+    let generationCaught: unknown;
+    try {
+      commitAgenticTurnV1(withLiveFence(db, (live) => {
+        live.query("UPDATE chats SET generation_revision = generation_revision + 1 WHERE id = ? AND user_id = ?").run("chat-1", "u1");
+      }));
+    } catch (error) {
+      generationCaught = error;
+    }
+    expect(generationCaught).toBeInstanceOf(AgenticCommitError);
+    expect((generationCaught as AgenticCommitError).code).toBe("stale_input_revision");
+    db.close();
+
+    db = createDatabase();
+    let presetCaught: unknown;
+    try {
+      commitAgenticTurnV1(withLiveFence(db, (live) => {
+        live.query("UPDATE presets SET updated_at = updated_at + 10 WHERE id = ? AND user_id = ?").run("preset-1", "u1");
+      }));
+    } catch (error) {
+      presetCaught = error;
+    }
+    expect(presetCaught).toBeInstanceOf(AgenticCommitError);
+    expect((presetCaught as AgenticCommitError).code).toBe("stale_input_revision");
+  });
+
+  test("rematerialized connection capabilities or updated_at commit; candidateRevision still fails closed", () => {
+    const digestMembers = (members: readonly InputRevisionV1[]) => createHash("sha256").update(JSON.stringify(members.map((member) => ({
+      digest: member.digest,
+      id: member.id,
+      kind: member.kind,
+      revision: member.revision,
+    })))).digest("hex");
+    const connectionId = "240fd0b3-708a-4a62-aacd-7dd78df18fb9";
+    const tokens = {
+      candidateRevision: "8b001dde-candidate",
+      endpointRevision: "ff9b8cc2-endpoint",
+      credentialRevision: "credential-33",
+    };
+    const connectionMember = { kind: "connection" as const, id: connectionId, ...liveConnectionInputRevision(connectionId, tokens.candidateRevision) };
+    const endpointMember = { kind: "endpoint" as const, id: connectionId, ...liveEndpointInputRevision(connectionId, tokens.endpointRevision) };
+    const credentialMember = { kind: "credential" as const, id: connectionId, ...liveCredentialInputRevision(connectionId, tokens.credentialRevision) };
+    const rematerialized = {
+      id: connectionId,
+      label: "Rematerialized",
+      capabilities: { tools: true, vision: true },
+      updated_at: 1_700_000_123,
+      provider: "anthropic",
+      model: "other-model",
+      effectiveEndpoint: "https://rematerialized.example/v1",
+      candidateRevision: tokens.candidateRevision,
+      endpointRevision: tokens.endpointRevision,
+      credentialRevision: tokens.credentialRevision,
+    };
+    expect(createHash("sha256").update(JSON.stringify(rematerialized)).digest("hex")).not.toBe(connectionMember.digest);
+    const withLiveFence = (database: Database, liveTokens = tokens) => {
+      const members: InputRevisionV1[] = [...testRevisionSet.revisions, connectionMember, endpointMember, credentialMember];
+      const revisions = { version: 1 as const, revisions: members, digest: digestMembers(members) };
+      const candidate: AgenticCommitInputV1 = {
+        ...input(database, AGENTIC_COMMIT_DEPENDENCIES_V1, false),
+        renderPreparation: { ...render(), inputRevisions: revisions },
+        inputRevisions: revisions,
+        revisionReader: (member) => {
+          if (member.kind === "connection") {
+            return liveConnectionInputRevision(member.id, liveTokens.candidateRevision);
+          }
+          if (member.kind === "endpoint") {
+            return liveEndpointInputRevision(member.id, liveTokens.endpointRevision);
+          }
+          if (member.kind === "credential") {
+            return liveCredentialInputRevision(member.id, liveTokens.credentialRevision);
+          }
+          return members.find((entry) => entry.kind === member.kind && entry.id === member.id) ?? null;
+        },
+      };
+      return candidate;
+    };
+
+    db = createDatabase();
+    expect(commitAgenticTurnV1(withLiveFence(db)).status).toBe("committed");
+    db.close();
+
+    db = createDatabase();
+    let candidateCaught: unknown;
+    try {
+      commitAgenticTurnV1(withLiveFence(db, { ...tokens, candidateRevision: "candidate-hostile" }));
+    } catch (error) {
+      candidateCaught = error;
+    }
+    expect(candidateCaught).toBeInstanceOf(AgenticCommitError);
+    expect((candidateCaught as AgenticCommitError).code).toBe("stale_input_revision");
+    db.close();
+
+    db = createDatabase();
+    let endpointCaught: unknown;
+    try {
+      commitAgenticTurnV1(withLiveFence(db, { ...tokens, endpointRevision: "endpoint-hostile" }));
+    } catch (error) {
+      endpointCaught = error;
+    }
+    expect(endpointCaught).toBeInstanceOf(AgenticCommitError);
+    expect((endpointCaught as AgenticCommitError).code).toBe("stale_input_revision");
+    db.close();
+
+    db = createDatabase();
+    let credentialCaught: unknown;
+    try {
+      commitAgenticTurnV1(withLiveFence(db, { ...tokens, credentialRevision: "credential-hostile" }));
+    } catch (error) {
+      credentialCaught = error;
+    }
+    expect(credentialCaught).toBeInstanceOf(AgenticCommitError);
+    expect((credentialCaught as AgenticCommitError).code).toBe("stale_input_revision");
+  });
+
+  test("unresolved live connection fence denies commit", () => {
+    const digestMembers = (members: readonly InputRevisionV1[]) => createHash("sha256").update(JSON.stringify(members.map((member) => ({
+      digest: member.digest,
+      id: member.id,
+      kind: member.kind,
+      revision: member.revision,
+    })))).digest("hex");
+    const connectionId = "240fd0b3-708a-4a62-aacd-7dd78df18fb9";
+    const connectionMember = { kind: "connection" as const, id: connectionId, ...liveConnectionInputRevision(connectionId, "8b001dde-candidate") };
+    const endpointMember = { kind: "endpoint" as const, id: connectionId, ...liveEndpointInputRevision(connectionId, "ff9b8cc2-endpoint") };
+    const credentialMember = { kind: "credential" as const, id: connectionId, ...liveCredentialInputRevision(connectionId, "credential-33") };
+    const members: InputRevisionV1[] = [...testRevisionSet.revisions, connectionMember, endpointMember, credentialMember];
+    const revisions = { version: 1 as const, revisions: members, digest: digestMembers(members) };
+    db = createDatabase();
+    const candidate: AgenticCommitInputV1 = {
+      ...input(db, AGENTIC_COMMIT_DEPENDENCIES_V1, false),
+      renderPreparation: { ...render(), inputRevisions: revisions },
+      inputRevisions: revisions,
+      revisionReader: (member) => {
+        if (member.kind === "connection" || member.kind === "endpoint" || member.kind === "credential") {
+          return null;
+        }
+        return members.find((entry) => entry.kind === member.kind && entry.id === member.id) ?? null;
+      },
+    };
+    let caught: unknown;
+    try {
+      commitAgenticTurnV1(candidate);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AgenticCommitError);
+    expect((caught as AgenticCommitError).code).toBe("stale_input_revision");
+    expect(db.query("SELECT COUNT(*) AS count FROM messages WHERE chat_id = ?").get("chat-1")).toEqual({ count: 0 });
+  });
+
 
   test("unchanged live revisions commit once and retry as the same receipt", () => {
     db = createDatabase();
@@ -692,6 +932,110 @@ describe("agentic commit transaction", () => {
     };
     expect(commitAgenticTurnV1(candidate).status).toBe("committed");
     expect(db.query("SELECT content FROM messages WHERE id = ?").get("message-1")).toEqual({ content: "oldcommitted answer" });
+  });
+  test("continue target-reconciliation metadata is not asserted as a chat revision", () => {
+    db = createDatabase();
+    seedTargetMessage(db);
+    bindExecutionTarget(db, "continue", "message-1", 0);
+    const base = input(db, AGENTIC_COMMIT_DEPENDENCIES_V1, false);
+    const candidate = {
+      ...base,
+      target: { ...base.target, target: "continue" as const, messageId: "message-1", swipeId: 0, messageIndex: 0, swipeCount: 2, messageGenerationRevision: 0 },
+      renderPreparation: {
+        ...render(),
+        chatMetadataDeltas: [{
+          kind: "chat_metadata" as const,
+          key: "message:message-1:continue",
+          operation: "set" as const,
+          value: "committed answer",
+          expectedRevision: 0,
+        }],
+      },
+    };
+    expect(commitAgenticTurnV1(candidate).status).toBe("committed");
+    expect(db.query("SELECT content FROM messages WHERE id = ?").get("message-1")).toEqual({ content: "oldcommitted answer" });
+    expect(db.query("SELECT metadata FROM chats WHERE id = ?").get("chat-1")).toEqual({ metadata: "{}" });
+  });
+
+
+  test("continue commits when only the target swipe is applied; other-message edits still stale-fence", () => {
+    const digestMembers = (members: readonly InputRevisionV1[]) => createHash("sha256").update(JSON.stringify(members.map((member) => ({
+      digest: member.digest,
+      id: member.id,
+      kind: member.kind,
+      revision: member.revision,
+    })))).digest("hex");
+    const seedContinueMessages = (database: Database) => {
+      seedTargetMessage(database);
+      database.query("INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, send_date, swipe_id, swipes, swipe_dates, extra, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        "message-2", "chat-1", 1, 1, "User", "prompt", 1, 0, JSON.stringify(["prompt"]), JSON.stringify([1]), "{}", 1,
+      );
+    };
+    const withLiveMessageFence = (database: Database, mutate?: (database: Database) => void) => {
+      seedContinueMessages(database);
+      bindExecutionTarget(database, "continue", "message-1", 0);
+      const targetRow = database.query("SELECT generation_revision FROM messages WHERE id = ? AND chat_id = ?").get("message-1", "chat-1") as { generation_revision?: unknown };
+      const otherRow = database.query("SELECT generation_revision FROM messages WHERE id = ? AND chat_id = ?").get("message-2", "chat-1") as { generation_revision?: unknown };
+      const targetMember = { kind: "message" as const, id: "message-1", ...liveMessageInputRevision("message-1", targetRow.generation_revision) };
+      const otherMember = { kind: "message" as const, id: "message-2", ...liveMessageInputRevision("message-2", otherRow.generation_revision) };
+      const members: InputRevisionV1[] = [...testRevisionSet.revisions, targetMember, otherMember];
+      const revisions = { version: 1 as const, revisions: members, digest: digestMembers(members) };
+      mutate?.(database);
+      const base = input(database, AGENTIC_COMMIT_DEPENDENCIES_V1, false);
+      return {
+        ...base,
+        target: {
+          ...base.target,
+          target: "continue" as const,
+          messageId: "message-1",
+          swipeId: 0,
+          messageIndex: 0,
+          swipeCount: 2,
+          messageGenerationRevision: Number(targetRow.generation_revision ?? 0),
+        },
+        renderPreparation: { ...render(), inputRevisions: revisions },
+        inputRevisions: revisions,
+        revisionReader: (member, liveDb) => {
+          const fenceDb = liveDb ?? database;
+          if (member.kind === "message") {
+            const live = fenceDb.query("SELECT generation_revision FROM messages WHERE id = ? AND chat_id = ? LIMIT 1").get(member.id, "chat-1") as { generation_revision?: unknown } | null;
+            return live ? liveMessageInputRevision(member.id, live.generation_revision) : null;
+          }
+          return members.find((entry) => entry.kind === member.kind && entry.id === member.id) ?? null;
+        },
+      } satisfies AgenticCommitInputV1;
+    };
+
+    db = createDatabase();
+    expect(commitAgenticTurnV1(withLiveMessageFence(db, (live) => {
+      live.query("UPDATE messages SET extra = ?, swipe_dates = ? WHERE id = ? AND chat_id = ?").run(
+        JSON.stringify({ streamed: true }),
+        JSON.stringify([99, 99]),
+        "message-1",
+        "chat-1",
+      );
+    })).status).toBe("committed");
+    expect(db.query("SELECT content FROM messages WHERE id = ?").get("message-1")).toEqual({ content: "oldcommitted answer" });
+    expect(db.query("SELECT content FROM messages WHERE id = ?").get("message-2")).toEqual({ content: "prompt" });
+    db.close();
+
+    db = createDatabase();
+    let otherCaught: unknown;
+    try {
+      commitAgenticTurnV1(withLiveMessageFence(db, (live) => {
+        live.query("UPDATE messages SET generation_revision = generation_revision + 1, content = ? WHERE id = ? AND chat_id = ?").run(
+          "hostile edit",
+          "message-2",
+          "chat-1",
+        );
+      }));
+    } catch (error) {
+      otherCaught = error;
+    }
+    expect(otherCaught).toBeInstanceOf(AgenticCommitError);
+    expect((otherCaught as AgenticCommitError).code).toBe("stale_input_revision");
+    expect(db.query("SELECT content FROM messages WHERE id = ?").get("message-1")).toEqual({ content: "old" });
+    expect(db.query("SELECT content FROM messages WHERE id = ?").get("message-2")).toEqual({ content: "hostile edit" });
   });
 
   test("commits regenerate and swipe targets without creating messages", () => {

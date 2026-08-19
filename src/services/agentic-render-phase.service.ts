@@ -45,9 +45,10 @@ export interface AgenticFrozenRenderPolicyV1 {
 
 
 /**
- * Carrier/transcript/reasoning are frame-private. The render result never
- * exposes any of them. `destroy` is supplied by the owner that allocated the
- * frame state and is called exactly once at settlement.
+ * Frame-private WORK continuation state is never dispatched. RENDER is a
+ * fresh tools-disabled finalization from `renderPolicy.messages` plus the
+ * accepted workspace projection. `destroy` is supplied by the owner that
+ * allocated the frame state and is called exactly once at settlement.
  */
 export interface AgenticRenderFramePrivateV1 {
   readonly continuationMode: "native" | "legacy";
@@ -108,6 +109,8 @@ export interface AgenticRenderPhaseDepsV1 {
   readonly now?: () => number;
   readonly setTimeout?: (callback: () => void, delayMs: number) => unknown;
   readonly clearTimeout?: (handle: unknown) => void;
+  /** Production tokenizer; omitted tests fall back to UTF-8 bytes. */
+  readonly countTokens?: (text: string) => number;
 }
 
 export interface AgenticRenderUsageV1 {
@@ -329,12 +332,6 @@ function serializedContextBytes(input: AgenticRenderPhaseInputV1, messages: read
       messages,
       acceptedWorkspace: input.acceptedWorkspace,
       renderPolicy: input.renderPolicy,
-      frameTranscript: input.framePrivate?.continuationMode === "legacy"
-        ? input.framePrivate.transcript ?? null
-        : null,
-      frameCarrier: input.framePrivate?.continuationMode === "native"
-        ? input.framePrivate.providerTransientCarrier ?? null
-        : null,
     });
     if (typeof serialized !== "string") fail("invalid_input");
     return utf8ByteLength(serialized);
@@ -448,6 +445,28 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+function settleRenderOutputTokens(
+  usage: unknown,
+  response: { content: string; finish_reason: string },
+  allowance: number,
+  options: { countTokens?: (text: string) => number; observedTokens?: number },
+): number {
+  let settlement;
+  try {
+    settlement = evaluateOutputTokens(usage, response, allowance, options);
+  } catch {
+    fail("render_protocol_error");
+  }
+  if (settlement.failure) {
+    if (settlement.failure.code === "provider_protocol_error") fail("render_protocol_error");
+    fail("render_output_limit_exceeded");
+  }
+  if (!Number.isSafeInteger(settlement.tokens) || settlement.tokens < 0) {
+    fail("render_protocol_error");
+  }
+  return settlement.tokens;
+}
+
 /**
  * Creates a key-scoped provisional emitter. It has no persistence operation,
  * no chat-message callback, and closes idempotently at turn settlement.
@@ -524,10 +543,7 @@ export async function runAgenticRenderPhaseV1(
     if (deadlineDelay <= 0 || deadlineController.signal.aborted) {
       fail("render_deadline_exceeded");
     }
-    const continuationMode = frame?.continuationMode ?? "legacy";
-    const baseMessages = continuationMode === "legacy"
-      ? cloneMessages(frame?.transcript ?? input.renderPolicy.messages)
-      : cloneMessages(input.renderPolicy.messages);
+    const baseMessages = cloneMessages(input.renderPolicy.messages);
     const projectionLiteral = input.acceptedWorkspace.workspaceContextProjection.literal;
     const messages = projectionLiteral.length === 0
       ? baseMessages
@@ -549,9 +565,6 @@ export async function runAgenticRenderPhaseV1(
         ? { maxOutputTokens: input.renderPolicy.maxOutputTokens }
         : {}),
       ...(input.renderPolicy.parameters ? { parameters: input.renderPolicy.parameters } : {}),
-      ...(continuationMode === "native" && frame?.providerTransientCarrier
-        ? { providerTransientCarrier: frame.providerTransientCarrier }
-        : {}),
       signal,
     };
 
@@ -588,13 +601,17 @@ export async function runAgenticRenderPhaseV1(
         }
         const chunk = snapshotStreamChunk(next.value);
         if (signal.aborted) fail(abortErrorCode(input.signal, deadlineController.signal));
-        if (!chunk || typeof chunk !== "object" || typeof chunk.token !== "string") {
+        if (!chunk || typeof chunk !== "object") {
+          fail("render_protocol_error");
+        }
+        if (chunk.token !== undefined && typeof chunk.token !== "string") {
           fail("render_protocol_error");
         }
         if (chunk.reasoning !== undefined && typeof chunk.reasoning !== "string") {
           fail("render_protocol_error");
         }
-        const tokenBytes = utf8ByteLength(chunk.token);
+        const token = typeof chunk.token === "string" ? chunk.token : "";
+        const tokenBytes = utf8ByteLength(token);
         const reasoningBytes = chunk.reasoning === undefined ? 0 : utf8ByteLength(chunk.reasoning);
         const payloadBytes = providerChunkPayloadBytes(chunk);
         const nextReceivedBytes = receivedBytes + tokenBytes + reasoningBytes + payloadBytes;
@@ -604,19 +621,14 @@ export async function runAgenticRenderPhaseV1(
         receivedBytes = nextReceivedBytes;
         let deltaTokens: number;
         try {
-          deltaTokens = evaluateOutputTokens(
+          deltaTokens = settleRenderOutputTokens(
             undefined,
-            {
-              content: chunk.token,
-              ...(chunk.reasoning === undefined ? {} : { reasoning: chunk.reasoning }),
-              ...(chunk.tool_calls === undefined ? {} : { tool_calls: chunk.tool_calls }),
-              ...(chunk.thinking_blocks === undefined ? {} : { thinking_blocks: chunk.thinking_blocks }),
-              ...(chunk.reasoning_details === undefined ? {} : { reasoning_details: chunk.reasoning_details }),
-              finish_reason: "delta",
-            },
+            { content: token, finish_reason: "delta" },
             Number.MAX_SAFE_INTEGER,
-          ).tokens;
-        } catch {
+            { countTokens: deps.countTokens },
+          );
+        } catch (error) {
+          if (error instanceof AgenticRenderPhaseError) throw error;
           fail("render_protocol_error");
         }
         if (!Number.isSafeInteger(deltaTokens) || observedOutputTokens > Number.MAX_SAFE_INTEGER - deltaTokens) {
@@ -639,30 +651,17 @@ export async function runAgenticRenderPhaseV1(
         if (candidateUsage) {
           usage = candidateUsage;
           providerUsage = chunk.usage;
-          if (input.renderPolicy.maxOutputTokens !== undefined) {
-            const settlement = evaluateOutputTokens(
-              chunk.usage,
-              { content: "", finish_reason: chunk.finish_reason ?? "delta" },
-              input.renderPolicy.maxOutputTokens,
-              { observedTokens: observedOutputTokens },
-            );
-            if (settlement.failure) fail("render_output_limit_exceeded");
-          }
         }
         const candidateReason = boundedString(chunk.finish_reason, 128);
         if (chunk.finish_reason !== undefined && !candidateReason) fail("render_protocol_error");
         if (candidateReason) finishReason = candidateReason;
-        if (chunk.token.length > 0) {
+        if (token.length > 0) {
           assertRenderDeadline(now, input.reservedBudgets.deadlineAt, input.signal, deadlineController.signal);
-          if (activityEvents >= activityChunkLimit) {
-            fail("render_activity_limit_exceeded");
-          }
-          outputParts.push(chunk.token);
+          outputParts.push(token);
           outputBytes += tokenBytes;
-          activityEvents += 1;
           if (provisionalChannel) {
             assertRenderDeadline(now, input.reservedBudgets.deadlineAt, input.signal, deadlineController.signal);
-            await abortable(provisionalChannel.emitDelta(chunk.token), signal);
+            await abortable(provisionalChannel.emitDelta(token), signal);
           }
         }
       }
@@ -683,17 +682,16 @@ export async function runAgenticRenderPhaseV1(
     }
 
     assertRenderDeadline(now, input.reservedBudgets.deadlineAt, input.signal, deadlineController.signal);
+    const text = outputParts.join("");
     if (input.renderPolicy.maxOutputTokens !== undefined) {
-      const settlement = evaluateOutputTokens(
+      settleRenderOutputTokens(
         providerUsage,
-        { content: "", finish_reason: finishReason ?? "stop" },
+        { content: text, finish_reason: finishReason ?? "stop" },
         input.renderPolicy.maxOutputTokens,
-        { observedTokens: observedOutputTokens },
+        { countTokens: deps.countTokens, observedTokens: observedOutputTokens },
       );
-      if (settlement.failure) fail("render_output_limit_exceeded");
     }
     assertRenderDeadline(now, input.reservedBudgets.deadlineAt, input.signal, deadlineController.signal);
-    const text = outputParts.join("");
     const result: AgenticRenderResultV1 = Object.freeze({
       text,
       bytes: outputBytes,
@@ -707,6 +705,7 @@ export async function runAgenticRenderPhaseV1(
     return result;
   } catch (error) {
     if (error instanceof AgenticRenderPhaseError) throw error;
+    console.error(`[agentic] render provider failed: ${error instanceof Error ? error.message : String(error)}`);
     if (input.signal?.aborted || deadlineController.signal.aborted) {
       const code = deadlineController.signal.aborted || now() >= input.reservedBudgets.deadlineAt
         ? "render_deadline_exceeded"

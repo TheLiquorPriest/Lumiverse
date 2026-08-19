@@ -135,7 +135,10 @@ function assignDataProperty(target: object, key: string, value: unknown): void {
   }
 }
 
-function inspectObject(value: object): PlainObjectShape {
+function inspectObject(
+  value: object,
+  budget?: { readonly nodes: number; readonly maxNodes: number },
+): PlainObjectShape {
   let prototype: object | null;
   let ownKeys: readonly (string | symbol)[];
   try {
@@ -143,6 +146,20 @@ function inspectObject(value: object): PlainObjectShape {
     ownKeys = Reflect.ownKeys(value);
   } catch {
     failure("invalid_input", "Canonical data object cannot be inspected");
+  }
+
+  const remaining = budget === undefined
+    ? Number.MAX_SAFE_INTEGER
+    : budget.maxNodes - budget.nodes;
+  if (remaining < 0 || (budget !== undefined && ownKeys.length > remaining)) {
+    const observed = (budget?.nodes ?? 0) + ownKeys.length;
+    failure(
+      "limit_exceeded",
+      "Canonical data exceeds the node limit",
+      "nodes",
+      budget?.maxNodes ?? ownKeys.length,
+      observed,
+    );
   }
 
   const array = Array.isArray(value);
@@ -153,6 +170,15 @@ function inspectObject(value: object): PlainObjectShape {
       failure("invalid_input", "Canonical data array has an invalid length");
     }
     const length = lengthDescriptor.value as number;
+    if (length > remaining) {
+      failure(
+        "limit_exceeded",
+        "Canonical data exceeds the node limit",
+        "nodes",
+        budget?.maxNodes ?? length,
+        (budget?.nodes ?? 0) + length,
+      );
+    }
     const keys: string[] = [];
     for (const key of ownKeys) {
       if (typeof key !== "string") failure("invalid_input", "Canonical data array contains a symbol key");
@@ -203,33 +229,44 @@ function limits(options: CanonicalDataOptions): { maxDepth: number; maxNodes: nu
   return { maxDepth, maxNodes, maxBytes };
 }
 
+interface WalkBound {
+  readonly maxDepth: number;
+  readonly maxNodes: number;
+  readonly maxBytes: number;
+}
+
 /**
- * Encode closed plain data without recursive calls. Every value and property
- * key is visited iteratively, and depth, node, and UTF-8 output budgets are
- * checked before the next frame is expanded or appended.
+ * Shared iterative walk. Occurrence counting (not unique-object counting) is
+ * intentional: a diamond DAG expands the same way JSON would, and the node/byte
+ * caps are what make that expansion fail closed instead of hanging.
  */
-export function encodeCanonicalPlainData(value: unknown, options: CanonicalDataOptions = {}): string {
-  const bound = limits(options);
+function walkCanonicalPlainData(
+  value: unknown,
+  bound: WalkBound,
+  keepEncoded: boolean,
+): { readonly bytes: number; readonly depth: number; readonly nodes: number; readonly encoded: string } {
   const frames: Frame[] = [{ kind: "value", value, depth: 0 }];
   const active = new WeakSet<object>();
   const output: string[] = [];
   let outputBytes = 0;
   let nodes = 0;
+  let depth = 0;
 
   const append = (text: string): void => {
     outputBytes += bytes(text);
     if (outputBytes > bound.maxBytes) {
       failure("limit_exceeded", "Canonical data exceeds the byte limit", "bytes", bound.maxBytes, outputBytes);
     }
-    output.push(text);
+    if (keepEncoded) output.push(text);
   };
-  const countNode = (depth: number): void => {
+  const countNode = (nodeDepth: number): void => {
     nodes += 1;
+    depth = Math.max(depth, nodeDepth);
     if (nodes > bound.maxNodes) {
       failure("limit_exceeded", "Canonical data exceeds the node limit", "nodes", bound.maxNodes, nodes);
     }
-    if (depth > bound.maxDepth) {
-      failure("limit_exceeded", "Canonical data exceeds the depth limit", "depth", bound.maxDepth, depth);
+    if (nodeDepth > bound.maxDepth) {
+      failure("limit_exceeded", "Canonical data exceeds the depth limit", "depth", bound.maxDepth, nodeDepth);
     }
   };
 
@@ -248,13 +285,25 @@ export function encodeCanonicalPlainData(value: unknown, options: CanonicalDataO
     countNode(frame.depth);
     const item = frame.value;
     if (item === null || typeof item !== "object") {
+      if (typeof item === "string") {
+        const raw = bytes(item);
+        if (outputBytes + raw > bound.maxBytes) {
+          failure(
+            "limit_exceeded",
+            "Canonical data exceeds the byte limit",
+            "bytes",
+            bound.maxBytes,
+            outputBytes + raw,
+          );
+        }
+      }
       append(primitive(item));
       continue;
     }
     if (active.has(item)) failure("invalid_input", "Canonical data contains a cycle");
     active.add(item);
 
-    const shape = inspectObject(item);
+    const shape = inspectObject(item, { nodes, maxNodes: bound.maxNodes });
     append(shape.array ? "[" : "{");
     frames.push({ kind: "exit", value: item });
     for (let index = shape.values.length - 1; index >= 0; index -= 1) {
@@ -268,54 +317,25 @@ export function encodeCanonicalPlainData(value: unknown, options: CanonicalDataO
     }
   }
 
-  return output.join("");
+  return { bytes: outputBytes, depth, nodes, encoded: keepEncoded ? output.join("") : "" };
+}
+
+/**
+ * Encode closed plain data without recursive calls. Every value and property
+ * key is visited iteratively, and depth, node, and UTF-8 output budgets are
+ * checked before the next frame is expanded or appended.
+ */
+export function encodeCanonicalPlainData(value: unknown, options: CanonicalDataOptions = {}): string {
+  return walkCanonicalPlainData(value, limits(options), true).encoded;
 }
 
 export function canonicalPlainDataBounds(value: unknown, options: CanonicalDataOptions = {}): CanonicalDataBounds {
-  const bound = limits(options);
-  // This mirrors encodeCanonicalPlainData's frame order while retaining only
-  // counters. It intentionally keeps an active path rather than a global
-  // visited set so shared subobjects count once per canonical occurrence.
-  const frames: Frame[] = [{ kind: "value", value, depth: 0 }];
-  const active = new WeakSet<object>();
-  let depth = 0;
-  let nodes = 0;
-  while (frames.length > 0) {
-    const frame = frames.pop()!;
-    if (frame.kind === "literal") continue;
-    if (frame.kind === "exit") {
-      active.delete(frame.value);
-      continue;
-    }
-    nodes += 1;
-    depth = Math.max(depth, frame.depth);
-    if (nodes > bound.maxNodes) {
-      failure("limit_exceeded", "Canonical data exceeds the node limit", "nodes", bound.maxNodes, nodes);
-    }
-    if (frame.depth > bound.maxDepth) {
-      failure("limit_exceeded", "Canonical data exceeds the depth limit", "depth", bound.maxDepth, frame.depth);
-    }
-    if (!frame.value || typeof frame.value !== "object") continue;
-    if (active.has(frame.value)) failure("invalid_input", "Canonical data contains a cycle");
-    active.add(frame.value);
-    const shape = inspectObject(frame.value);
-    frames.push({ kind: "exit", value: frame.value });
-    for (let index = shape.values.length - 1; index >= 0; index -= 1) {
-      nodes += 1;
-      const keyDepth = frame.depth;
-      depth = Math.max(depth, keyDepth);
-      if (nodes > bound.maxNodes) {
-        failure("limit_exceeded", "Canonical data exceeds the node limit", "nodes", bound.maxNodes, nodes);
-      }
-      frames.push({ kind: "value", value: shape.values[index], depth: frame.depth + 1 });
-    }
-  }
-  const encoded = encodeCanonicalPlainData(value, options);
-  return { bytes: bytes(encoded), depth, nodes };
+  const measured = walkCanonicalPlainData(value, limits(options), false);
+  return { bytes: measured.bytes, depth: measured.depth, nodes: measured.nodes };
 }
 
 export function validateCanonicalPlainData(value: unknown, options: CanonicalDataOptions = {}): void {
-  encodeCanonicalPlainData(value, options);
+  walkCanonicalPlainData(value, limits(options), false);
 }
 
 export function isCanonicalPlainData(value: unknown, options: CanonicalDataOptions = {}): boolean {
@@ -330,18 +350,38 @@ export function isCanonicalPlainData(value: unknown, options: CanonicalDataOptio
 
 /** Iterative clone used when a closed value must be detached from its source. */
 export function cloneCanonicalPlainData<T>(value: T, options: CanonicalDataOptions = {}): T {
-  validateCanonicalPlainData(value, options);
+  const bound = limits(options);
+  // Measure first so a diamond DAG cannot expand past maxNodes/maxBytes. The
+  // clone walk below is unique-object and also abortable: a second inspect
+  // that materializes new identities (proxy/getter) cannot run unbounded.
+  walkCanonicalPlainData(value, bound, false);
   if (!value || typeof value !== "object") return value;
   const root = Array.isArray(value) ? [] as unknown[] : {} as Record<string, unknown>;
   const targets = new WeakMap<object, object>();
   targets.set(value as object, root);
   const stack: Array<{ source: object; target: object }> = [{ source: value as object, target: root }];
+  let nodes = 0;
+  let outputBytes = 0;
   while (stack.length > 0) {
     const { source, target } = stack.pop()!;
-    const shape = inspectObject(source);
+    nodes += 1;
+    if (nodes > bound.maxNodes) {
+      failure("limit_exceeded", "Canonical data exceeds the node limit", "nodes", bound.maxNodes, nodes);
+    }
+    const shape = inspectObject(source, { nodes, maxNodes: bound.maxNodes });
     for (let index = 0; index < shape.values.length; index += 1) {
+      nodes += 1;
+      if (nodes > bound.maxNodes) {
+        failure("limit_exceeded", "Canonical data exceeds the node limit", "nodes", bound.maxNodes, nodes);
+      }
       const child = shape.values[index];
       const key = shape.keys[index]!;
+      if (!shape.array) {
+        outputBytes += bytes(JSON.stringify(key));
+        if (outputBytes > bound.maxBytes) {
+          failure("limit_exceeded", "Canonical data exceeds the byte limit", "bytes", bound.maxBytes, outputBytes);
+        }
+      }
       if (child && typeof child === "object") {
         let childTarget = targets.get(child);
         if (!childTarget) {
@@ -351,6 +391,19 @@ export function cloneCanonicalPlainData<T>(value: T, options: CanonicalDataOptio
         }
         assignDataProperty(target, key, childTarget);
       } else {
+        if (typeof child === "string") {
+          const raw = bytes(child);
+          if (outputBytes + raw > bound.maxBytes) {
+            failure(
+              "limit_exceeded",
+              "Canonical data exceeds the byte limit",
+              "bytes",
+              bound.maxBytes,
+              outputBytes + raw,
+            );
+          }
+          outputBytes += raw;
+        }
         assignDataProperty(target, key, child);
       }
     }
@@ -360,15 +413,21 @@ export function cloneCanonicalPlainData<T>(value: T, options: CanonicalDataOptio
 
 /** Validate, then freeze every object iteratively (never recurse on input). */
 export function freezeCanonicalPlainData<T>(value: T, options: CanonicalDataOptions = {}): T {
+  const bound = limits(options);
   validateCanonicalPlainData(value, options);
   if (!value || typeof value !== "object") return value;
   const stack: object[] = [value as object];
   const seen = new WeakSet<object>();
+  let nodes = 0;
   while (stack.length > 0) {
     const current = stack.pop()!;
     if (seen.has(current)) continue;
     seen.add(current);
-    const shape = inspectObject(current);
+    nodes += 1;
+    if (nodes > bound.maxNodes) {
+      failure("limit_exceeded", "Canonical data exceeds the node limit", "nodes", bound.maxNodes, nodes);
+    }
+    const shape = inspectObject(current, { nodes, maxNodes: bound.maxNodes });
     for (const child of shape.values) if (child && typeof child === "object") stack.push(child);
     Object.freeze(current);
   }

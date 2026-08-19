@@ -134,13 +134,14 @@ test("enforces context and provisional activity reservations", async () => {
     contextBytes: budgets.contextBytes,
     outputBytes: budgets.outputBytes,
   });
-  await expect(runAgenticRenderPhaseV1(input({
+  const streamed = await runAgenticRenderPhaseV1(input({
     reservedBudgets: { ...budgets, ...narrowActivityReservation },
   }), {
     dispatch: () => stream({ token: "a" }, { token: "b" }),
     emitProvisional: (event) => { events.push(event.text); },
-  })).rejects.toMatchObject({ code: "render_activity_limit_exceeded" });
-  expect(events).toEqual(["a"]);
+  });
+  expect(streamed.text).toBe("ab");
+  expect(events).toEqual(["a", "b"]);
 });
 
 test("uses the exact frozen connection and finalization adapter contract", async () => {
@@ -241,56 +242,45 @@ test("rejects a projection whose source revision is not the accepted workspace r
   })).rejects.toThrow();
 });
 
-test("native continuation forwards only the root carrier and destroys frame-private state", async () => {
+test("never dispatches WORK transcript or WORK providerTransientCarrier", async () => {
   const carrier: ProviderTransientCarrier = {
     kind: "openai_responses",
     items: [],
   };
-  let observed: AgenticRenderProviderRequestV1 | undefined;
-  let destroyed = 0;
-  const result = await runAgenticRenderPhaseV1(input({
-    framePrivate: {
-      continuationMode: "native",
-      providerTransientCarrier: carrier,
-      transcript: [{ role: "assistant", content: "private transcript" }],
-      reasoning: "private reasoning",
-      destroy: () => { destroyed += 1; },
-    },
-  }), {
-    dispatch: (request) => {
-      observed = request;
-      return response("native");
-    },
-  });
-  expect(observed?.providerTransientCarrier).toBe(carrier);
-  expect(result).toEqual(expect.objectContaining({ text: "native" }));
-  expect(result).not.toHaveProperty("providerTransientCarrier");
-  expect(result).not.toHaveProperty("reasoning");
-  expect(result).not.toHaveProperty("transcript");
-  expect(destroyed).toBe(1);
+  const transcript: LlmMessage[] = [
+    { role: "assistant", content: "private transcript" },
+    { role: "user", content: JSON.stringify({ name: "complete_turn", summary: "submitted" }) },
+  ];
+  for (const continuationMode of ["native", "legacy"] as const) {
+    let observed: AgenticRenderProviderRequestV1 | undefined;
+    let destroyed = 0;
+    const result = await runAgenticRenderPhaseV1(input({
+      framePrivate: {
+        continuationMode,
+        providerTransientCarrier: carrier,
+        transcript,
+        reasoning: "private reasoning",
+        destroy: () => { destroyed += 1; },
+      },
+    }), {
+      dispatch: (request) => {
+        observed = request;
+        return response("final");
+      },
+    });
+    expect(observed?.providerTransientCarrier).toBeUndefined();
+    expect(observed?.tools).toEqual([]);
+    expect(observed?.messages).toEqual(policy.messages);
+    expect(JSON.stringify(observed?.messages)).not.toContain("complete_turn");
+    expect(JSON.stringify(observed?.messages)).not.toContain("private transcript");
+    expect(result).toEqual(expect.objectContaining({ text: "final" }));
+    expect(result).not.toHaveProperty("providerTransientCarrier");
+    expect(result).not.toHaveProperty("reasoning");
+    expect(result).not.toHaveProperty("transcript");
+    expect(destroyed).toBe(1);
+  }
 });
 
-test("legacy continuation rebuilds from the private transcript and drops an accidental carrier", async () => {
-  const transcript: LlmMessage[] = [{ role: "assistant", content: "legacy frame" }];
-  const carrier: ProviderTransientCarrier = { kind: "openai_responses", items: [] };
-  let observed: AgenticRenderProviderRequestV1 | undefined;
-  await runAgenticRenderPhaseV1(input({
-    framePrivate: {
-      continuationMode: "legacy",
-      providerTransientCarrier: carrier,
-      transcript,
-      destroy: () => undefined,
-    },
-  }), {
-    dispatch: (request) => {
-      observed = request;
-      return response("legacy");
-    },
-  });
-  expect(observed?.providerTransientCarrier).toBeUndefined();
-  expect(observed?.messages).toEqual(transcript);
-  expect(observed?.messages).not.toBe(transcript);
-});
 
 test("rejects returned tools as a protocol failure without fallback or reroll", async () => {
   let dispatches = 0;
@@ -332,6 +322,66 @@ test("enforces the output token cap before emitting a cap-plus-one chunk", async
   });
   expect(result.text).toBe("abc");
 });
+test("counts published RENDER tokens instead of UTF-8 bytes when countTokens is supplied", async () => {
+  const tenChar = "abcdefghij";
+  const result = await runAgenticRenderPhaseV1(input({
+    renderPolicy: { ...policy, maxOutputTokens: 5 },
+  }), {
+    dispatch: () => stream({ token: tenChar, finish_reason: "stop" }),
+    countTokens: () => 1,
+  });
+  expect(result.text).toBe(tenChar);
+
+  await expect(runAgenticRenderPhaseV1(input({
+    renderPolicy: { ...policy, maxOutputTokens: 5 },
+  }), {
+    dispatch: () => stream(
+      { token: tenChar },
+      { token: tenChar },
+      { token: tenChar },
+      { token: tenChar },
+      { token: tenChar },
+      { token: tenChar },
+    ),
+    countTokens: () => 1,
+  })).rejects.toMatchObject({ code: "render_output_limit_exceeded" });
+});
+test("does not charge reasoning bytes toward the published token cap", async () => {
+  const result = await runAgenticRenderPhaseV1(input({
+    renderPolicy: { ...policy, maxOutputTokens: 1 },
+  }), {
+    dispatch: () => stream({
+      token: "a",
+      reasoning: "xxxxxxxxxx",
+      finish_reason: "stop",
+    }),
+    countTokens: () => 1,
+  });
+  expect(result.text).toBe("a");
+});
+test("reconciles provider usage against the published token cap at stream end", async () => {
+  await expect(runAgenticRenderPhaseV1(input({
+    renderPolicy: { ...policy, maxOutputTokens: 5 },
+  }), {
+    dispatch: () => stream({
+      token: "ok",
+      finish_reason: "stop",
+      usage: { prompt_tokens: 1, completion_tokens: 9, total_tokens: 10 },
+    }),
+    countTokens: () => 1,
+  })).rejects.toMatchObject({ code: "render_output_limit_exceeded" });
+
+  await expect(runAgenticRenderPhaseV1(input({
+    renderPolicy: { ...policy, maxOutputTokens: 5 },
+  }), {
+    dispatch: () => stream({
+      token: "ok",
+      finish_reason: "stop",
+      usage: { prompt_tokens: 1, completion_tokens: 1.5, total_tokens: 2.5 },
+    }),
+    countTokens: () => 1,
+  })).rejects.toMatchObject({ code: "render_protocol_error" });
+});
 test("charges streamed reasoning bytes before provisional emission", async () => {
   const exact = await runAgenticRenderPhaseV1(input({
     reservedBudgets: { ...budgets, outputBytes: 3 },
@@ -349,8 +399,8 @@ test("charges streamed reasoning bytes before provisional emission", async () =>
   })).rejects.toMatchObject({ code: "render_output_limit_exceeded" });
   expect(events).toEqual([]);
 });
-test("charges private reasoning and tool payloads toward RENDER token caps", async () => {
-  await expect(runAgenticRenderPhaseV1(input({
+test("does not charge private reasoning toward RENDER published token caps", async () => {
+  const result = await runAgenticRenderPhaseV1(input({
     renderPolicy: { ...policy, maxOutputTokens: 1 },
   }), {
     dispatch: () => stream({
@@ -359,7 +409,8 @@ test("charges private reasoning and tool payloads toward RENDER token caps", asy
       reasoning_details: [{ type: "summary", data: "private details" }],
       finish_reason: "stop",
     }),
-  })).rejects.toMatchObject({ code: "render_output_limit_exceeded" });
+  });
+  expect(result.text).toBe("a");
 
   await expect(runAgenticRenderPhaseV1(input({
     renderPolicy: { ...policy, maxOutputTokens: 1 },

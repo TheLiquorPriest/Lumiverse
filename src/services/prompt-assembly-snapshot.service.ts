@@ -618,6 +618,112 @@ function revision(kind: InputRevisionKindV1, id: string, value: unknown, sourceR
   });
 }
 
+/** Chat fence identity is generation_revision, never chats.updated_at. */
+export function liveChatInputRevision(chatId: string, generationRevision: unknown): { revision: string; digest: string } {
+  const revisionValue = String(generationRevision ?? "");
+  return {
+    revision: revisionValue,
+    digest: digest({ id: chatId, generationRevision: revisionValue }),
+  };
+}
+
+/** Message fence identity is generation_revision, never content, swipes, extra, or updated_at. */
+export function liveMessageInputRevision(messageId: string, generationRevision: unknown): { revision: string; digest: string } {
+  const revisionValue = String(generationRevision ?? "");
+  return {
+    revision: revisionValue,
+    digest: digest({ id: messageId, generationRevision: revisionValue }),
+  };
+}
+
+/** Connection fence identity is candidateRevision, never rematerialized capabilities/label/updated_at. */
+export function liveConnectionInputRevision(connectionId: string, candidateRevision: unknown): { revision: string; digest: string } {
+  const revisionValue = String(candidateRevision ?? "");
+  return {
+    revision: revisionValue,
+    digest: digest({ id: connectionId, candidateRevision: revisionValue }),
+  };
+}
+
+/** Endpoint fence identity is endpointRevision, never rematerialized provider/model/url. */
+export function liveEndpointInputRevision(connectionId: string, endpointRevision: unknown): { revision: string; digest: string } {
+  const revisionValue = String(endpointRevision ?? "");
+  return {
+    revision: revisionValue,
+    digest: digest({ id: connectionId, endpointRevision: revisionValue }),
+  };
+}
+
+/** Credential fence identity is credentialRevision, never connection.updated_at. */
+export function liveCredentialInputRevision(connectionId: string, credentialRevision: unknown): { revision: string; digest: string } {
+  const revisionValue = String(credentialRevision ?? "");
+  return {
+    revision: revisionValue,
+    digest: digest({ id: connectionId, credentialRevision: revisionValue }),
+  };
+}
+
+function connectionFenceRevision(
+  kind: "connection" | "endpoint" | "credential",
+  id: string,
+  token: unknown,
+): SnapshotRevisionV1 {
+  const live = kind === "connection"
+    ? liveConnectionInputRevision(id, token)
+    : kind === "endpoint"
+      ? liveEndpointInputRevision(id, token)
+      : liveCredentialInputRevision(id, token);
+  return Object.freeze({
+    kind,
+    domain: kind,
+    id,
+    revision: live.revision,
+    digest: live.digest,
+  });
+}
+
+function generationAuthoritativeSettings(
+  settings: Readonly<Record<string, unknown>>,
+  presetId: string | null,
+): Record<string, unknown> {
+  const selected: Record<string, unknown> = {};
+  if (Object.prototype.hasOwnProperty.call(settings, "globalWorldBooks")) {
+    selected.globalWorldBooks = settings.globalWorldBooks;
+  }
+  if (presetId) {
+    const key = `presetRegexEnabled:${presetId}`;
+    if (Object.prototype.hasOwnProperty.call(settings, key)) selected[key] = settings[key];
+  }
+  return selected;
+}
+
+/** Settings fence identity is assembly-authoritative keys only, not every settings.updated_at. */
+export function liveSettingsInputRevision(
+  settings: Readonly<Record<string, unknown>>,
+  presetId: string | null,
+): { revision: string; digest: string } {
+  const identity = generationAuthoritativeSettings(settings, presetId);
+  const value = digest(identity);
+  return { revision: value, digest: value };
+}
+
+export function readLiveSettingsInputRevision(
+  db: Database,
+  userId: string,
+  presetId: string | null,
+): { revision: string; digest: string } {
+  const keys = ["globalWorldBooks"];
+  if (presetId) keys.push(`presetRegexEnabled:${presetId}`);
+  const settings: Record<string, unknown> = {};
+  for (const key of keys) {
+    const row = rowFor<RawRow>(db, "SELECT value FROM settings WHERE user_id = ? AND key = ? LIMIT 1", userId, key);
+    if (!row) continue;
+    settings[key] = parseJson(row.value, `setting ${key}`, FALLBACK_LIMITS.inputBytes, null);
+  }
+  return liveSettingsInputRevision(settings, presetId);
+}
+
+
 function rowsFor<T extends RawRow>(db: Database, sql: string, ...params: SQLQueryBindings[]): T[] {
   return db.query(sql).all(...params) as T[];
 }
@@ -750,7 +856,7 @@ function normalizeChat(row: RawRow, limits: Limits): SnapshotChatV1 {
     metadata,
     created_at: rowNumber(row, "created_at"),
     updated_at: rowNumber(row, "updated_at"),
-    revision: String(row.revision ?? row.generation_revision ?? row.updated_at ?? digest({ id: row.id, metadata })),
+    revision: String(row.generation_revision ?? row.revision ?? digest({ id: row.id, metadata })),
   } as SnapshotChatV1);
 }
 
@@ -1852,17 +1958,19 @@ export function buildGenerationAssemblySnapshot(
       settingsOffset += page.length;
     }
     const settings = deepFreeze(settingsValues);
+    const settingsIdentity = generationAuthoritativeSettings(settings, effectivePresetId);
     const chatVariables = metadata.chat_variables && typeof metadata.chat_variables === "object" && !Array.isArray(metadata.chat_variables)
       ? deepFreeze({ ...(metadata.chat_variables as Record<string, unknown>) })
       : deepFreeze({});
     const presetVariables = preset?.metadata.promptVariables && typeof preset.metadata.promptVariables === "object" && !Array.isArray(preset.metadata.promptVariables)
       ? deepFreeze({ ...(preset.metadata.promptVariables as PromptVariableValues) })
       : deepFreeze({});
+    const variableIdentity = { preset: presetVariables, chat: chatVariables, settings: settingsIdentity };
     const variables = deepFreeze({
       preset: presetVariables,
       chat: chatVariables,
       settings,
-      revision: digest({ preset: presetVariables, chat: chatVariables, settings }),
+      revision: digest(variableIdentity),
     } satisfies SnapshotVariableStateV1);
     const regexScripts = activeRegexRows(db, input.userId, chat, characterId, effectivePresetId, settings, limits);
     const worldInfo = normalizeWorld(db, input.userId, chat, character, persona, group, settings, limits);
@@ -1907,8 +2015,8 @@ export function buildGenerationAssemblySnapshot(
       continueMessageId: target.continueMessageId,
       excludedMessageId: target.excludedMessageId,
     });
-    const chatRevision = revision("chat", chat.id, chat, chat.revision);
-    const messageRevisions = messages.map((message) => revision("message", message.id, message, message.revision));
+    const chatRevision = revision("chat", chat.id, { id: chat.id, generationRevision: chat.revision }, chat.revision);
+    const messageRevisions = messages.map((message) => revision("message", message.id, { id: message.id, generationRevision: message.revision }, message.revision));
     const presetRevision = preset ? [revision("preset", preset.id, preset, preset.revision)] : [];
     const blockRevisions = blocks.map((block) => revision("preset_block", block.id, block, block.revision));
     const concreteConnectionId = String(connection?.concreteId ?? connection?.logicalId ?? connection?.id ?? "default");
@@ -1924,20 +2032,13 @@ export function buildGenerationAssemblySnapshot(
       ? connection?.candidateRevision
       : connection?.revision ?? connection?.updated_at;
     const connectionRevision = connection
-      ? [revision("connection", concreteConnectionId, connection, candidateSourceRevision)]
+      ? [connectionFenceRevision("connection", concreteConnectionId, candidateSourceRevision)]
       : [];
     const endpointRevision = connection
-      ? [revision("endpoint", concreteConnectionId, {
-        provider: connection.provider,
-        model: connection.model,
-        endpoint: connection.effectiveEndpoint ?? connection.api_url ?? null,
-      }, connection.endpointRevision)]
+      ? [connectionFenceRevision("endpoint", concreteConnectionId, connection.endpointRevision)]
       : [];
     const credentialRevision = connection
-      ? [revision("credential", concreteConnectionId, {
-        has_api_key: connection.has_api_key ?? null,
-        updated_at: connection.updated_at ?? null,
-      }, connection.credentialRevision)]
+      ? [connectionFenceRevision("credential", concreteConnectionId, connection.credentialRevision)]
       : [];
     const participantRevisions = [
       persona ? revision("persona", String(persona.id), persona, persona.revision) : null,
@@ -1949,8 +2050,8 @@ export function buildGenerationAssemblySnapshot(
       ...worldInfo.entries.map((entry) => revision("world_lore", entry.id, entry, entry.revision)),
       revision("world_lore", chat.id, worldInfo.state, digest(worldInfo.state)),
     ];
-    const settingsRevision = [revision("settings", input.userId, settings, digest(settings))];
-    const variableRevision = [revision("macro_variables", `${chat.id}:${preset?.id ?? "none"}`, variables, variables.revision)];
+    const settingsRevision = [revision("settings", input.userId, settingsIdentity, digest(settingsIdentity))];
+    const variableRevision = [revision("macro_variables", `${chat.id}:${preset?.id ?? "none"}`, variableIdentity, variables.revision)];
     const regexRevisions = regexScripts.map((script) => revision("regex", script.id, script, script.revision));
     const contextRevision = [
       revision("context_pack", `${input.userId}:context-packs`, contextPacks, contextPacks.revision),

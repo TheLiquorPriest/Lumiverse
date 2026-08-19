@@ -174,6 +174,7 @@ export interface AgenticWorkOutcome {
   usage?: Record<string, number>;
   observations?: readonly Record<string, unknown>[];
   errorCode?: AgenticFailureCode | string;
+  errorMessage?: string;
   /** Work provider response/carriers are intentionally not part of this contract. */
 }
 
@@ -360,6 +361,7 @@ export interface AgenticGenerationDependencies {
     target: AgenticTargetSnapshot;
     receipt?: AgenticCommitReceipt;
     errorCode?: AgenticFailureCode | string;
+    errorMessage?: string;
   }) => Promise<void> | void;
   /**
    * Projection/terminal reconciliation invoked when publication fails after
@@ -392,11 +394,12 @@ export interface AgenticGenerationDependencies {
 
 export interface AgenticGenerationResult {
   generationId: string;
-  status: "streaming" | "completed" | "failed" | "cancelled" | "timed_out" | "exhausted";
+  status: "streaming" | AgenticTerminalStatus;
   mode: "agentic";
   phase: AgenticPhase;
   receipt?: AgenticCommitReceipt;
   errorCode?: AgenticFailureCode | string;
+  errorMessage?: string;
   responseModeAvailable: true;
 }
 
@@ -518,8 +521,9 @@ function assertSupportedSurface(input: AgenticGenerationInput): void {
 function asErrorCode(error: unknown): AgenticFailureCode | string {
   if (error instanceof AgenticGenerationError) return error.code;
   if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
-    return error.code;
+    return mapAgenticFailureCode(error.code);
   }
+  if (error instanceof Error) return mapAgenticFailureCode(error.message);
   return "agentic_internal_error";
 }
 
@@ -557,8 +561,44 @@ function mapAgenticFailureCode(value: unknown): AgenticFailureCode {
     case "timed_out":
     case "timeout":
       return "agentic_timed_out";
+    case "invalid_input":
+    case "invalid_plan":
+    case "unsupported_plan":
+    case "limit_exceeded":
+    case "queue_full":
+    case "worker_disabled":
+    case "worker_unavailable":
+    case "worker_crashed":
+    case "worker_timed_out":
+    case "worker_malformed":
+    case "requires_response_mode":
+      return "agentic_preflight_failed";
+    case "tool_not_allowed":
+    case "tool_protocol_error":
+    case "tool_batch_rejected":
+    case "batch_reservation_failed":
+    case "completion_malformed":
+    case "completion_forged":
+    case "completion_mixed_batch":
+    case "completion_not_root":
+    case "completion_blocked":
+    case "completion_freeze_failed":
+    case "child_required_failed":
+    case "child_schedule_invalid":
+    case "child_executor_unavailable":
+      return "agentic_protocol_failure";
+    case "child_output_limit_exceeded":
+    case "completion_control_budget_exhausted":
+    case "unsigned_boundary_budget_exhausted":
+    case "work_budget_exhausted":
+    case "provider_round_budget_exhausted":
+    case "workspace_budget_exhausted":
+    case "context_budget_exhausted":
+    case "tool_result_limit_exceeded":
     case "exhausted":
       return "agentic_work_exhausted";
+    case "internal_error":
+      return "agentic_internal_error";
     case "commit_failed":
       return "agentic_commit_failed";
     default:
@@ -604,7 +644,10 @@ function asPhaseError(error: unknown, phase: AgenticPhase): AgenticGenerationErr
       });
   }
   const code = mapAgenticFailureCode(asErrorCode(error));
-  return new AgenticGenerationError(code, "Agentic generation failed.", {
+  const message = error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : "Agentic generation failed.";
+  return new AgenticGenerationError(code, message, {
     phase,
     cause: error,
   });
@@ -829,10 +872,17 @@ async function runAgenticGenerationInternal(
     });
     if (work.status === "cancelled") throw new AgenticGenerationError("agentic_cancelled", "Agentic generation cancelled.", { phase: "WORK" });
     if (work.status === "timed_out") throw new AgenticGenerationError("agentic_timed_out", "Agentic generation timed out.", { phase: "WORK" });
-    if (work.status === "exhausted") throw new AgenticGenerationError("agentic_work_exhausted", "Agentic work budget exhausted.", { phase: "WORK" });
+    if (work.status === "exhausted") {
+      const rawCode = typeof work.errorCode === "string" && work.errorCode.trim().length > 0 ? work.errorCode : "exhausted";
+      console.error(`[agentic] WORK exhausted (${rawCode})`);
+      throw new AgenticGenerationError("agentic_work_exhausted", `Agentic work budget exhausted (${rawCode}).`, { phase: "WORK" });
+    }
     if (work.status === "failed") {
-      const code = mapAgenticFailureCode(work.errorCode);
-      throw new AgenticGenerationError(code, "Agentic work failed.", { phase: "WORK" });
+      const rawCode = typeof work.errorCode === "string" && work.errorCode.trim().length > 0 ? work.errorCode : "internal_error";
+      const code = mapAgenticFailureCode(rawCode);
+      const detail = typeof work.errorMessage === "string" && work.errorMessage.trim().length > 0 ? work.errorMessage.trim() : rawCode;
+      console.error(`[agentic] WORK failed (${rawCode} → ${code}): ${detail}`);
+      throw new AgenticGenerationError(code, `Agentic work failed (${rawCode}): ${detail}`, { phase: "WORK" });
     }
     assertNotAborted(signal, "WORK");
 
@@ -920,6 +970,7 @@ async function runAgenticGenerationInternal(
       responseModeAvailable: true,
     };
   } catch (error) {
+    console.error("[agentic] turn failed", active.phase, error);
     let phase = active.phase;
     const durablePhase = await readDurablePhase(deps, active);
     if (durablePhase === "COMMITTED") {
@@ -973,6 +1024,7 @@ async function runAgenticGenerationInternal(
         mode: "agentic",
         phase: durablePhase,
         errorCode: finalCode,
+        errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : undefined,
         responseModeAvailable: true,
       };
     }
@@ -1034,6 +1086,7 @@ async function runAgenticGenerationInternal(
       mode: "agentic",
       phase: terminalPhase,
       errorCode: finalCode,
+      errorMessage: wrapped.message,
       responseModeAvailable: true,
     };
   } finally {
@@ -1110,6 +1163,7 @@ export async function runAgenticGeneration(
         mode: "agentic",
         phase: active.phase,
         errorCode: asErrorCode(error),
+        errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : undefined,
         responseModeAvailable: true,
       };
     }
@@ -1127,6 +1181,7 @@ export async function runAgenticGeneration(
       target: terminalTarget,
       ...(projected.receipt ? { receipt: projected.receipt } : {}),
       ...(projected.errorCode ? { errorCode: projected.errorCode } : {}),
+      ...(projected.errorMessage ? { errorMessage: projected.errorMessage } : {}),
     };
     try {
       if (resolvedDeps.publishTerminal) await resolvedDeps.publishTerminal(terminalEvent);

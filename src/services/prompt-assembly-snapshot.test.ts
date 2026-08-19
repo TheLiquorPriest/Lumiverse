@@ -217,7 +217,7 @@ function seedCanonicalContextDb(db: Database): void {
 }
 
 describe("GenerationAssemblySnapshotV1", () => {
-  test("captures one bounded view, complete revisions, deterministic lore, and no extension data", () => {
+  test("captures one bounded view, complete revisions, deterministic lore, and no extension data", async () => {
     const db = schema();
     seed(db);
     const snapshot = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", connectionId: "connection-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
@@ -234,13 +234,13 @@ describe("GenerationAssemblySnapshotV1", () => {
     db.close();
   });
 
-  test("lowers test caps and rejects oversized input before strict preparation", () => {
+  test("lowers test caps and rejects oversized input before strict preparation", async () => {
     const db = schema();
     seed(db);
     expect(() => buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db, limits: { inputBytes: 2 } })).toThrow(SnapshotLimitError);
     db.close();
   });
-  test("sorts frozen context candidates and rejects duplicate revisions", () => {
+  test("sorts frozen context candidates and rejects duplicate revisions", async () => {
     const frozen = contextSnapshot();
     expect(frozen.candidates.map((candidate) => candidate.packId)).toEqual(["pack-a", "pack-z"]);
     expect(frozen.candidateInputRevisions.map((revision) => revision.packId)).toEqual(["pack-a", "pack-z"]);
@@ -250,7 +250,7 @@ describe("GenerationAssemblySnapshotV1", () => {
       candidates: [...frozen.candidates, frozen.candidates[0]!],
     })).toThrow("duplicate context candidate");
   });
-  test("rejects forged context scope and stale candidate identity", () => {
+  test("rejects forged context scope and stale candidate identity", async () => {
     const db = schema();
     seed(db);
     const original = contextSnapshot();
@@ -297,7 +297,7 @@ describe("GenerationAssemblySnapshotV1", () => {
     }))).toEqual([{ packId: "pack-db", source: "preset", targetId: "preset-1" }]);
     db.close();
   });
-  test("fails required selected context packs while allowing optional omissions", () => {
+  test("fails required selected context packs while allowing optional omissions", async () => {
     const db = schema();
     seed(db);
     const empty = freezeContextPackCandidateSnapshot({
@@ -340,7 +340,7 @@ describe("GenerationAssemblySnapshotV1", () => {
     })).toThrow(ContextPackSnapshotAccessError);
     db.close();
   });
-  test("freezes canonical context policy selections, source graph, and permitted candidate order", () => {
+  test("freezes canonical context policy selections, source graph, and permitted candidate order", async () => {
     const db = schema();
     seed(db);
     const snapshot = buildGenerationAssemblySnapshot({
@@ -375,7 +375,7 @@ describe("GenerationAssemblySnapshotV1", () => {
     db.close();
   });
 
-  test("retains optional target attachments while separating direct and inactive rule account requirements", () => {
+  test("retains optional target attachments while separating direct and inactive rule account requirements", async () => {
     const db = schema();
     seed(db);
     const attached = contextSnapshot();
@@ -437,7 +437,7 @@ describe("GenerationAssemblySnapshotV1", () => {
     db.close();
   });
 
-  test("requires authenticated graph/source and host-prefetched candidates for policy", () => {
+  test("requires authenticated graph/source and host-prefetched candidates for policy", async () => {
     const db = schema();
     seed(db);
     const base = {
@@ -467,7 +467,7 @@ describe("GenerationAssemblySnapshotV1", () => {
     db.close();
   });
 
-  test("accepts account candidates with nullable attachment fields and rejects policy revision mismatches", () => {
+  test("accepts account candidates with nullable attachment fields and rejects policy revision mismatches", async () => {
     const db = schema();
     seed(db);
     const accountCandidate = freezeContextPackCandidateSnapshot({
@@ -515,7 +515,7 @@ describe("GenerationAssemblySnapshotV1", () => {
   });
 
 });
-function compiledAssemblyPlan(): AssemblyPlanV1 {
+async function compiledAssemblyPlan(): Promise<AssemblyPlanV1> {
   const db = schema();
   seed(db);
   const snapshot = buildGenerationAssemblySnapshot({
@@ -527,11 +527,11 @@ function compiledAssemblyPlan(): AssemblyPlanV1 {
     contextPackSnapshotSource: "host_prefetched",
     db,
   });
-  const plan = compileAgentAssemblyPlan(snapshot);
+  const plan = await compileAgentAssemblyPlan(snapshot);
   db.close();
   return plan;
 }
-function compiledAssemblyFixture(): { snapshot: GenerationAssemblySnapshotV1; plan: AssemblyPlanV1 } {
+async function compiledAssemblyFixture(): Promise<{ snapshot: GenerationAssemblySnapshotV1; plan: AssemblyPlanV1 }> {
   const db = schema();
   seed(db);
   const snapshot = buildGenerationAssemblySnapshot({
@@ -543,7 +543,7 @@ function compiledAssemblyFixture(): { snapshot: GenerationAssemblySnapshotV1; pl
     contextPackSnapshotSource: "host_prefetched",
     db,
   });
-  const plan = compileAgentAssemblyPlan(snapshot);
+  const plan = await compileAgentAssemblyPlan(snapshot);
   db.close();
   return { snapshot, plan };
 }
@@ -565,7 +565,7 @@ function policyMessage(blockId: string, blockIndex = 0): AssemblyPlanV1["workPol
 }
 
 describe("strict assembly input boundaries", () => {
-  test("accepts only closed AgentConfig V2 and never treats legacy enabled as authority", () => {
+  test("accepts only closed AgentConfig V2 and never treats legacy enabled as authority", async () => {
     const db = schema();
     seed(db);
     const snapshot = buildGenerationAssemblySnapshot({
@@ -577,7 +577,7 @@ describe("strict assembly input boundaries", () => {
       contextPackSnapshotSource: "host_prefetched",
       db,
     });
-    expect(() => compileAgentAssemblyPlan({
+    await expect(compileAgentAssemblyPlan({
       snapshot,
       agentConfig: {
         version: 1,
@@ -588,16 +588,16 @@ describe("strict assembly input boundaries", () => {
         mainLoreScope: "active",
         profiles: [],
       },
-    })).toThrow(AssemblyPlanValidationError);
-    expect(() => compileAgentAssemblyPlan({
+    })).rejects.toThrow(AssemblyPlanValidationError);
+    await expect(compileAgentAssemblyPlan({
       snapshot,
       agentConfig: { ...config(), unknown: true },
-    })).toThrow(AssemblyPlanValidationError);
-    expect(compileAgentAssemblyPlan(snapshot).children).toHaveLength(1);
+    })).rejects.toThrow(AssemblyPlanValidationError);
+    expect((await compileAgentAssemblyPlan(snapshot)).children).toHaveLength(1);
     db.close();
   });
 
-  test("rejects cap-plus-one depth and node data iteratively across snapshot fields", () => {
+  test("rejects cap-plus-one depth and node data iteratively across snapshot fields", async () => {
     const exactCapDepth = SNAPSHOT_DATA_MAX_DEPTH_V1 - 2;
     const capPlusOneDepth = exactCapDepth + 1;
     for (const field of ["metadata", "extra", "variables"] as const) {
@@ -618,12 +618,12 @@ describe("strict assembly input boundaries", () => {
     )).toThrow(/nodes/i);
     expect(SNAPSHOT_DATA_MAX_NODES_V1).toBeGreaterThan(5);
   });
-  test("uses deterministic key order for canonical snapshot data", () => {
+  test("uses deterministic key order for canonical snapshot data", async () => {
     expect(encodeCanonicalPlainData({ z: 1, a: { d: 4, b: 2 }, m: [3, 1] })).toBe("{\"a\":{\"b\":2,\"d\":4},\"m\":[3,1],\"z\":1}");
     expect(encodeCanonicalPlainData({ a: 1, z: 2 })).toBe(encodeCanonicalPlainData({ z: 2, a: 1 }));
   });
 
-  test("fails closed when an active regex row carries a repair code", () => {
+  test("fails closed when an active regex row carries a repair code", async () => {
     const db = schema();
     seed(db);
     db.run("ALTER TABLE regex_scripts ADD COLUMN validation_error_code TEXT");
@@ -641,13 +641,13 @@ describe("strict assembly input boundaries", () => {
   });
 });
 describe("strict assembly plan", () => {
-  test("orders children, emits direct slots, and substitutes child output once as literal bytes", () => {
+  test("orders children, emits direct slots, and substitutes child output once as literal bytes", async () => {
     const db = schema();
     seed(db);
     const snapshot = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
-    const plan = compileAgentAssemblyPlan(snapshot);
+    const plan = await compileAgentAssemblyPlan(snapshot);
     const wireSnapshot = JSON.parse(JSON.stringify(snapshot)) as GenerationAssemblySnapshotV1;
-    expect(compileAgentAssemblyPlan(wireSnapshot).children.map((child) => child.slotIndex)).toEqual([0]);
+    expect((await compileAgentAssemblyPlan(wireSnapshot)).children.map((child) => child.slotIndex)).toEqual([0]);
     expect(plan.children.map((child) => child.slotIndex)).toEqual([0]);
     expect(plan.children[0]?.maxOutputTokens).toBe(64);
     expect(plan.resultSlots[0]?.slotIndex).toBe(0);
@@ -656,7 +656,7 @@ describe("strict assembly plan", () => {
     expect(segments.some((segment) => segment.kind === "literal" && segment.text === "{{regex_should_not_run}}" && segment.text.includes("{{"))).toBe(true);
     db.close();
   });
-  test("places in-history blocks at their frozen depth between history boundaries", () => {
+  test("places in-history blocks at their frozen depth between history boundaries", async () => {
     const db = schema();
     seed(db);
     const initial = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
@@ -665,12 +665,12 @@ describe("strict assembly plan", () => {
     const inHistory = { ...producer, id: "in-history", name: "In history", content: "Between history", position: "in_history" as const, depth: 0 };
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify([producer, inHistory, consumer]), "preset-1");
     const snapshot = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
-    const plan = compileAgentAssemblyPlan(snapshot);
+    const plan = await compileAgentAssemblyPlan(snapshot);
     expect(plan.providerMessages.map((message) => message.blockId ?? "history")).toEqual(["history", "producer", "history", "in-history", "consumer"]);
     db.close();
   });
 
-  test("rejects transformed, recursive, and out-of-order result references", () => {
+  test("rejects transformed, recursive, and out-of-order result references", async () => {
     const db = schema();
     seed(db);
     const snapshot = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
@@ -680,21 +680,21 @@ describe("strict assembly plan", () => {
         ? { ...block, content: "{{upper::{{agentResult::facts}}}}" }
         : block),
     };
-    expect(() => compileAgentAssemblyPlan(transformed)).toThrow(AssemblyPlanValidationError);
+    await expect(compileAgentAssemblyPlan(transformed)).rejects.toThrow(AssemblyPlanValidationError);
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify([...snapshot.blocks].reverse()), "preset-1");
 
     const reversed = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
-    expect(() => compileAgentAssemblyPlan(reversed)).toThrow(/forward|precede|order/i);
+    await expect(compileAgentAssemblyPlan(reversed)).rejects.toThrow(/forward|precede|order/i);
     const recursiveBlocks = snapshot.blocks.map((block) => block.id === "producer"
       ? { ...block, content: "{{agent::writer::as=facts}}{{agentResult::facts}}{{/agent}}" }
       : block);
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(recursiveBlocks), "preset-1");
     const recursive = buildGenerationAssemblySnapshot({ userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
-    expect(() => compileAgentAssemblyPlan(recursive)).toThrow(/recursive|result reference|nested_intrinsic/i);
+    await expect(compileAgentAssemblyPlan(recursive)).rejects.toThrow(/recursive|result reference|nested_intrinsic/i);
     db.close();
   });
-  test("round-trips closed cognition evidence and rejects public text", () => {
-    const plan = compiledAssemblyPlan();
+  test("round-trips closed cognition evidence and rejects public text", async () => {
+    const plan = await compiledAssemblyPlan();
     const wire = JSON.parse(JSON.stringify(plan)) as AssemblyPlanV1;
     expect(() => validateAssemblyPlanV1(wire, plan.limits)).not.toThrow();
     expect(wire.privateEvidence.cognition).toEqual([]);
@@ -723,7 +723,7 @@ describe("strict assembly plan", () => {
     };
     expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/private cognition|private assembly|cognition activation/i);
   });
-  test("rejects escaped macros that restore protected child markers", () => {
+  test("rejects escaped macros that restore protected child markers", async () => {
     const db = schema();
     seed(db);
     const snapshot = buildGenerationAssemblySnapshot({
@@ -748,10 +748,10 @@ describe("strict assembly plan", () => {
       contextPackSnapshotSource: "host_prefetched",
       db,
     });
-    expect(() => compileAgentAssemblyPlan(escapedSnapshot)).toThrow(/generated|result reference|agent marker/i);
+    await expect(compileAgentAssemblyPlan(escapedSnapshot)).rejects.toThrow(/generated|result reference|agent marker/i);
     db.close();
   });
-  test("rejects prompt regex replacements that generate protected result markers", () => {
+  test("rejects prompt regex replacements that generate protected result markers", async () => {
     const db = schema();
     seed(db);
     db.query("UPDATE regex_scripts SET replace_string = ?, placement = ? WHERE id = ?").run("{{agentResult::facts}}", JSON.stringify(["user_input"]), "regex-1");
@@ -767,10 +767,10 @@ describe("strict assembly plan", () => {
       contextPackSnapshotSource: "host_prefetched",
       db,
     });
-    expect(() => compileAgentAssemblyPlan(snapshot)).toThrow(/generated_result_reference|generated.*result marker/i);
+    await expect(compileAgentAssemblyPlan(snapshot)).rejects.toThrow(/generated_result_reference|generated.*result marker/i);
     db.close();
   });
-  test("accepts a transformed block that becomes empty", () => {
+  test("accepts a transformed block that becomes empty", async () => {
     const db = schema();
     seed(db);
     db.query("UPDATE regex_scripts SET replace_string = ?, placement = ? WHERE id = ?").run("", JSON.stringify(["user_input"]), "regex-1");
@@ -786,12 +786,12 @@ describe("strict assembly plan", () => {
       contextPackSnapshotSource: "host_prefetched",
       db,
     });
-    const plan = compileAgentAssemblyPlan(snapshot);
+    const plan = await compileAgentAssemblyPlan(snapshot);
     expect(plan.providerMessages.some((message) => message.blockId === "consumer")).toBe(false);
-    expect(() => validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).not.toThrow();
+    await expect(validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).resolves.toBeUndefined();
     db.close();
   });
-  test("emits one prompt regex action when a script transforms multiple blocks", () => {
+  test("emits one prompt regex action when a script transforms multiple blocks", async () => {
     const db = schema();
     seed(db);
     db.query("UPDATE regex_scripts SET placement = ? WHERE id = ?").run(JSON.stringify(["user_input"]), "regex-1");
@@ -813,13 +813,13 @@ describe("strict assembly plan", () => {
       contextPackSnapshotSource: "host_prefetched",
       db,
     });
-    const plan = compileAgentAssemblyPlan(snapshot);
+    const plan = await compileAgentAssemblyPlan(snapshot);
     const regexDeltas = plan.deltas.filter((delta) => delta.kind === "regex_action");
     expect(regexDeltas).toHaveLength(1);
     expect(regexDeltas[0]).toMatchObject({ scriptId: "regex-1", operation: "apply" });
     db.close();
   });
-  test("persists a world-info cooldown transition when it reaches zero", () => {
+  test("persists a world-info cooldown transition when it reaches zero", async () => {
     const db = schema();
     seed(db);
     const metadata = {
@@ -840,7 +840,7 @@ describe("strict assembly plan", () => {
       contextPackSnapshotSource: "host_prefetched",
       db,
     });
-    const plan = compileAgentAssemblyPlan(snapshot);
+    const plan = await compileAgentAssemblyPlan(snapshot);
     const delta = plan.deltas.find((candidate) => candidate.kind === "world_info_state" && candidate.entryId === "entry-1");
     expect(delta).toMatchObject({
       operation: "set_cooldown",
@@ -850,15 +850,15 @@ describe("strict assembly plan", () => {
     db.close();
   });
 
-  test("requires trusted snapshot limits for plans received from an isolate", () => {
-    const plan = compiledAssemblyPlan();
+  test("requires trusted snapshot limits for plans received from an isolate", async () => {
+    const plan = await compiledAssemblyPlan();
     const trusted = { ...plan.limits, maxInputBytes: 1024 };
     const widened = { ...plan, limits: { ...plan.limits, maxInputBytes: 2048 } };
     expect(() => validateAssemblyPlanV1(widened, trusted)).toThrow(/trusted|limit/i);
   });
 
-  test("binds profile output ceilings to the authenticated snapshot", () => {
-    const { snapshot, plan } = compiledAssemblyFixture();
+  test("binds profile output ceilings to the authenticated snapshot", async () => {
+    const { snapshot, plan } = await compiledAssemblyFixture();
     expect(plan.profileOutputLimits).toEqual([{ profileId: "writer", maxOutputTokens: 64 }]);
     const forged = {
       ...plan,
@@ -868,11 +868,11 @@ describe("strict assembly plan", () => {
       })),
     };
     expect(() => validateAssemblyPlanV1(forged, plan.limits)).not.toThrow();
-    expect(() => validateAssemblyPlanAgainstSnapshotV1(forged, snapshot)).toThrow(/profile output limits|snapshot/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(forged, snapshot)).rejects.toThrow(/profile output limits|snapshot/i);
   });
 
-  test("requires one-to-one cognition evidence with exact message accounting", () => {
-    const plan = compiledAssemblyPlan();
+  test("requires one-to-one cognition evidence with exact message accounting", async () => {
+    const plan = await compiledAssemblyPlan();
     const message = policyMessage("policy");
     const byteCost = message.segments.reduce((total, segment) => total + (segment.kind === "literal" ? new TextEncoder().encode(segment.text).byteLength : 0), 0);
     const evidence = {
@@ -904,8 +904,8 @@ describe("strict assembly plan", () => {
     }, plan.limits)).toThrow(/cognition evidence|accounting/i);
   });
 
-  test("binds result slots to child coordinates and seals as a closed record", () => {
-    const plan = compiledAssemblyPlan();
+  test("binds result slots to child coordinates and seals as a closed record", async () => {
+    const plan = await compiledAssemblyPlan();
     const child = plan.children[0]!;
     const slot = plan.resultSlots[0]!;
     const forgedChild = { ...child, blockIndex: child.blockIndex + 1, producerSeal: "forged" };
@@ -923,8 +923,8 @@ describe("strict assembly plan", () => {
     }, plan.limits)).toThrow(/result slot|unknown|invalid/i);
   });
 
-  test("rejects protected markers in ordinary provider literals", () => {
-    const plan = compiledAssemblyPlan();
+  test("rejects protected markers in ordinary provider literals", async () => {
+    const plan = await compiledAssemblyPlan();
     const targetIndex = plan.providerMessages.findIndex((message) => message.segments.every((segment) => segment.kind === "literal"));
     expect(targetIndex).toBeGreaterThanOrEqual(0);
     const forgedText = "{{agent::forged::as=facts}}{{/agent}}";
@@ -938,8 +938,8 @@ describe("strict assembly plan", () => {
     expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/literal|agent marker/i);
   });
 
-  test("rejects combined provider and phase message cap plus one", () => {
-    const plan = compiledAssemblyPlan();
+  test("rejects combined provider and phase message cap plus one", async () => {
+    const plan = await compiledAssemblyPlan();
     const policies = Array.from({ length: 13 }, (_, index) => policyMessage(`cap-${index}`, 100 + index));
     const forged = {
       ...plan,
@@ -949,8 +949,8 @@ describe("strict assembly plan", () => {
     expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/message limit/i);
   });
 
-  test("rejects combined provider and phase byte cap plus one", () => {
-    const plan = compiledAssemblyPlan();
+  test("rejects combined provider and phase byte cap plus one", async () => {
+    const plan = await compiledAssemblyPlan();
     const providerBytes = plan.providerMessages.reduce((total, message) => total + message.segments.reduce((sum, segment) => sum + (segment.kind === "literal" ? new TextEncoder().encode(segment.text).byteLength : 0), 0), 0);
     const forged = {
       ...plan,
@@ -960,9 +960,9 @@ describe("strict assembly plan", () => {
     expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/bytes|limit/i);
   });
 
-  test("binds isolate plans to exact source literals and child coordinates", () => {
-    const { snapshot, plan } = compiledAssemblyFixture();
-    expect(() => validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).not.toThrow();
+  test("binds isolate plans to exact source literals and child coordinates", async () => {
+    const { snapshot, plan } = await compiledAssemblyFixture();
+    await expect(validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).resolves.toBeUndefined();
     const blockMessageIndex = plan.providerMessages.findIndex((message) => message.blockIndex !== undefined);
     expect(blockMessageIndex).toBeGreaterThanOrEqual(0);
     const original = plan.providerMessages[blockMessageIndex]!;
@@ -971,9 +971,9 @@ describe("strict assembly plan", () => {
     const forgedMessages = plan.providerMessages.map((message, index) => index === blockMessageIndex
       ? { ...message, segments: [{ kind: "literal" as const, text: forgedText, bytes: new TextEncoder().encode(forgedText).byteLength }] }
       : message);
-    expect(() => validateAssemblyPlanAgainstSnapshotV1({ ...plan, messages: forgedMessages, providerMessages: forgedMessages }, snapshot)).toThrow(/literal|source-bound|seal/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1({ ...plan, messages: forgedMessages, providerMessages: forgedMessages }, snapshot)).rejects.toThrow(/literal|source-bound|seal/i);
     const omitted = plan.providerMessages.filter((_, index) => index !== blockMessageIndex);
-    expect(() => validateAssemblyPlanAgainstSnapshotV1({ ...plan, messages: omitted, providerMessages: omitted }, snapshot)).toThrow(/order|source-bound|seal/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1({ ...plan, messages: omitted, providerMessages: omitted }, snapshot)).rejects.toThrow(/order|source-bound|seal/i);
     if (plan.children.length > 0) {
       const child = plan.children[0]!;
       const forgedChild = { ...child, profileId: `${child.profileId}_forged` };
@@ -984,11 +984,11 @@ describe("strict assembly plan", () => {
         activationEvidence: plan.activationEvidence.map((evidence, index) => index === 0 ? { ...evidence, profileId: forgedChild.profileId } : evidence),
         tokenEvidence: plan.tokenEvidence.map((evidence, index) => index === 0 ? { ...evidence, profileId: forgedChild.profileId } : evidence),
       } as unknown as Parameters<typeof validateAssemblyPlanAgainstSnapshotV1>[0];
-      expect(() => validateAssemblyPlanAgainstSnapshotV1(forgedPlan, snapshot)).toThrow(/child|source-bound/i);
+      await expect(validateAssemblyPlanAgainstSnapshotV1(forgedPlan, snapshot)).rejects.toThrow(/child|source-bound/i);
     }
   });
-  test("binds provider provenance sources and rejects forged provenance", () => {
-    const { snapshot, plan } = compiledAssemblyFixture();
+  test("binds provider provenance sources and rejects forged provenance", async () => {
+    const { snapshot, plan } = await compiledAssemblyFixture();
     const kinds = new Set(plan.providerMessages.map((message) => message.provenance.kind));
     expect(kinds).toEqual(new Set(["block", "history", "world_info"]));
     const withProviderMessages = (providerMessages: typeof plan.providerMessages) => ({
@@ -1005,32 +1005,32 @@ describe("strict assembly plan", () => {
         provenance: { ...message.provenance, sourceRevision: `${message.provenance.sourceRevision}-forged` },
       };
       const forgedMessages = plan.providerMessages.map((candidate, candidateIndex) => candidateIndex === index ? forged : candidate);
-      expect(() => validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(forgedMessages), snapshot)).toThrow(/source-bound|messages/i);
+      await expect(validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(forgedMessages), snapshot)).rejects.toThrow(/source-bound|messages/i);
     }
     const roleIndex = plan.providerMessages.findIndex((message) => message.provenance.kind === "history");
     const roleForged = plan.providerMessages.map((message, candidateIndex) => candidateIndex === roleIndex
       ? { ...message, role: message.role === "user" ? "assistant" as const : "user" as const }
       : message);
-    expect(() => validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(roleForged), snapshot)).toThrow(/source-bound|messages|role/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(roleForged), snapshot)).rejects.toThrow(/source-bound|messages|role/i);
     const sourceIndexForged = plan.providerMessages.map((message, candidateIndex) => candidateIndex === roleIndex
       ? { ...message, provenance: { ...message.provenance, sourceIndex: message.provenance.sourceIndex + 1 } }
       : message);
-    expect(() => validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(sourceIndexForged), snapshot)).toThrow(/source-bound|messages|index/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(sourceIndexForged), snapshot)).rejects.toThrow(/source-bound|messages|index/i);
   });
-  test("rejects coerced nested snapshot records before preprocessing", () => {
-    const { snapshot } = compiledAssemblyFixture();
+  test("rejects coerced nested snapshot records before preprocessing", async () => {
+    const { snapshot } = await compiledAssemblyFixture();
     const forgedMessage = JSON.parse(JSON.stringify(snapshot)) as GenerationAssemblySnapshotV1;
     const forgedMessageRecord = forgedMessage.messages[0] as unknown as Record<string, unknown>;
     forgedMessageRecord.is_user = "false";
-    expect(() => compileAgentAssemblyPlan(forgedMessage)).toThrow(/message\[0\]\.is_user/i);
+    await expect(compileAgentAssemblyPlan(forgedMessage)).rejects.toThrow(/message\[0\]\.is_user/i);
     const forgedBlock = JSON.parse(JSON.stringify(snapshot)) as GenerationAssemblySnapshotV1;
     const forgedBlockRecord = forgedBlock.blocks[0] as unknown as Record<string, unknown>;
     forgedBlockRecord.enabled = "false";
-    expect(() => compileAgentAssemblyPlan(forgedBlock)).toThrow(/block\[0\]\.enabled/i);
+    await expect(compileAgentAssemblyPlan(forgedBlock)).rejects.toThrow(/block\[0\]\.enabled/i);
   });
 
-  test("worker response validation binds a compiled plan to its requested snapshot", () => {
-    const { snapshot, plan } = compiledAssemblyFixture();
+  test("worker response validation binds a compiled plan to its requested snapshot", async () => {
+    const { snapshot, plan } = await compiledAssemblyFixture();
     const job: ActiveIsolateJob<unknown, unknown> = {
       userId: "user-1",
       operation: "compile_agent_assembly",
@@ -1051,11 +1051,11 @@ describe("strict assembly plan", () => {
       }
       : message);
     const malformed = { ...result, providerMessages: malformedMessages, messages: malformedMessages };
-    expect(() => parseAgenticPreprocessingResponseV1({ ...response, result: malformed }, job)).toThrow(/worker_malformed|assembly plan/i);
+    await expect(parseAgenticPreprocessingResponseV1({ ...response, result: malformed }, job)).rejects.toThrow(/worker_malformed|assembly plan/i);
   });
 
-  test("rejects duplicate phase block references across policy sections", () => {
-    const plan = compiledAssemblyPlan();
+  test("rejects duplicate phase block references across policy sections", async () => {
+    const plan = await compiledAssemblyPlan();
     const duplicate = policyMessage("duplicate");
     const forged = {
       ...plan,
@@ -1064,7 +1064,7 @@ describe("strict assembly plan", () => {
     };
     expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/cognition policy|invalid/i);
   });
-  test("rejects malformed worker requests before compile dispatch", () => {
+  test("rejects malformed worker requests before compile dispatch", async () => {
     expect(() => parseCompileAgentAssemblyRequest({
       version: 1,
       operation: "compile_agent_assembly",

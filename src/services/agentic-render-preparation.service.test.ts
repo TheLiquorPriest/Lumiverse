@@ -13,6 +13,7 @@ import {
 import {
   aggregateRenderInputBytesV1,
   RenderPreparationValidationError,
+  validateRenderPreparationInputV1,
 } from "./agentic-render-preparation-validator";
 import { healFormattingArtifacts } from "../utils/format-healing";
 
@@ -674,3 +675,47 @@ describe("strict render closed record validation", () => {
     expect(disabled.content).toEqual({ kind: "text", text: "a" });
   });
 });
+
+describe("strict render request validation bounds", () => {
+  test("validates a 132KB regenerate-shaped input without hanging", () => {
+    const sourceMessages = Array.from({ length: 129 }, (_value, index) => ({
+      sourceMessageId: `msg-${index}`,
+      revision: index + 1,
+      role: (index % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
+      content: { kind: "text" as const, text: "n".repeat(1024) },
+    }));
+    const revisions = sourceMessages.map((message) => ({
+      kind: "message" as const,
+      id: message.sourceMessageId,
+      revision: message.revision,
+      digest: `digest-${message.sourceMessageId}`,
+    }));
+    const started = Date.now();
+    const validated = validateRenderPreparationInputV1(makeInput({
+      target: { kind: "regenerate", messageId: "msg-0", swipeId: 0 },
+      sourceMessages,
+      swipes: [{
+        swipeId: "0",
+        index: 0,
+        revision: 1,
+        content: { kind: "text", text: "prior" },
+      }],
+      inputRevisions: {
+        version: 1,
+        revisions,
+        digest: "regenerate-inputs",
+      },
+    }));
+    expect(validated.sourceMessages).toHaveLength(129);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  test("aborts a diamond DAG at the node cap instead of hanging", () => {
+    let node: Record<string, unknown> = { v: 0 };
+    for (let index = 1; index < 40; index += 1) node = { l: node, r: node };
+    const started = Date.now();
+    expectPreparationFailure(() => validateRenderPreparationInputV1(node as never), "limit_exceeded");
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+});
+

@@ -51,6 +51,8 @@ import type {
 const RESULT_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const OPEN_PREFIX = "{{agent::";
 const CLOSE_TAG = "{{/agent}}";
+/** UTF-8 ceiling for one authored child token. 4 is the tokenizer lower bound, not a safe published max. */
+const CHILD_RESULT_BYTES_PER_AUTHORED_TOKEN = 16;
 const RESULT_PREFIX = "{{agentResult::";
 const encoder = new TextEncoder();
 
@@ -556,11 +558,11 @@ function cacheItemText(item: Readonly<{ content: string }>): string {
   return item.content;
 }
 
-function mapProtectedResultMarkers(
+async function mapProtectedResultMarkers(
   content: string,
-  transform: (text: string) => string,
-): string {
-  if (!content.includes("{{agentResult")) return transform(content);
+  transform: (text: string) => string | Promise<string>,
+): Promise<string> {
+  if (!content.includes("{{agentResult")) return await transform(content);
   let marker = content.indexOf("{{agentResult");
   while (marker >= 0) {
     const end = content.indexOf("}}", marker + "{{agentResult".length);
@@ -572,11 +574,11 @@ function mapProtectedResultMarkers(
   let cursor = 0;
   for (const match of content.matchAll(DIRECT_RESULT_MARKER_RE)) {
     const start = match.index ?? 0;
-    pieces.push(transform(content.slice(cursor, start)));
+    pieces.push(await transform(content.slice(cursor, start)));
     pieces.push(match[0]);
     cursor = start + match[0].length;
   }
-  pieces.push(transform(content.slice(cursor)));
+  pieces.push(await transform(content.slice(cursor)));
   return pieces.join("");
 }
 
@@ -598,10 +600,10 @@ function assertChildMarkersAreSealed(
   return true;
 }
 
-function preprocessSnapshot(
+async function preprocessSnapshot(
   snapshot: GenerationAssemblySnapshotV1,
   phasePolicyBlockIds: ReadonlySet<string> = new Set(),
-): SnapshotPreprocessingResult {
+): Promise<SnapshotPreprocessingResult> {
   const worldInfo = activateSnapshotWorldInfo(snapshot);
   const env = buildSnapshotMacroEnv(snapshot);
   const budget = createSnapshotExpansionBudget(snapshot);
@@ -651,15 +653,15 @@ function preprocessSnapshot(
   env.extra.worldInfoOutlets = outletValues;
   env.extra.worldInfoAtMarker = worldInfo.cache.atMarker.map(cacheItemText).join("\n\n");
 
-  const resolveText = (
+  const resolveText = async (
     raw: string,
     placement: "user_input" | "ai_output" | "world_info",
     block: SnapshotBlockV1 | null,
     blockIndex: number,
-  ): string => {
+  ): Promise<string> => {
     try {
-      const macroResolved = mapProtectedResultMarkers(raw, (text) => {
-        const resolved = resolveSnapshotMacroText(text, env, budget);
+      const macroResolved = await mapProtectedResultMarkers(raw, async (text) => {
+        const resolved = await resolveSnapshotMacroText(text, env, budget);
         if (agentMarkersPresent(resolved)) {
           throw new Error("generated_result_reference: macro generated a protected agent marker");
         }
@@ -674,7 +676,7 @@ function preprocessSnapshot(
         }
         return resolved;
       });
-      return mapProtectedResultMarkers(macroResolved, (text) => {
+      return await mapProtectedResultMarkers(macroResolved, (text) => {
         const before = text;
         const transformed = applySnapshotPromptRegex(
           text,
@@ -733,7 +735,7 @@ function preprocessSnapshot(
     }
   };
 
-  const resolveWorldText = (text: string): string => {
+  const resolveWorldText = async (text: string): Promise<string> => {
     if (agentMarkersPresent(text)) {
       throw new AssemblyPlanValidationError("invalid_input", "Agent markers cannot occur in world-info content");
     }
@@ -741,14 +743,18 @@ function preprocessSnapshot(
   };
   for (const entry of worldInfo.activatedEntries) {
     const outlet = typeof entry.outlet_name === "string" ? entry.outlet_name.trim().toLowerCase() : "";
-    if (outlet) outletValues[outlet] = resolveWorldText(entry.content);
+    if (outlet) outletValues[outlet] = await resolveWorldText(entry.content);
   }
-  const blocks = snapshot.blocks.map((block, blockIndex) => {
+  const blocks: SnapshotBlockV1[] = [];
+  for (const [blockIndex, block] of snapshot.blocks.entries()) {
     const child = assertChildMarkersAreSealed(block.content, block, blockIndex);
     if (child && phasePolicyBlockIds.has(block.id)) {
       failForBlock("requires_response_mode", "Cognition policy blocks cannot contain agent result references", block, blockIndex);
     }
-    if (child || !block.enabled) return block;
+    if (child || !block.enabled) {
+      blocks.push(block);
+      continue;
+    }
     setSnapshotBlockMacroContext(env, snapshot, block);
     const placement = block.role === "user"
       ? "user_input"
@@ -766,24 +772,28 @@ function preprocessSnapshot(
         failForBlock("invalid_input", "Agent markers cannot occur in world-info content", block, blockIndex);
       }
     }
-    const resolved = resolveText(block.content, placement, block, blockIndex);
+    const resolved = await resolveText(block.content, placement, block, blockIndex);
+    const pinBeforeResolved: string[] = [];
+    for (const text of pinsBefore) pinBeforeResolved.push(await resolveWorldText(text));
+    const pinAfterResolved: string[] = [];
+    for (const text of pinsAfter) pinAfterResolved.push(await resolveWorldText(text));
     const content = [
-      ...pinsBefore.map(resolveWorldText),
+      ...pinBeforeResolved,
       resolved,
-      ...pinsAfter.map(resolveWorldText),
+      ...pinAfterResolved,
     ].filter((text) => text.length > 0).join("\n\n");
-    return frozen({ ...block, content });
-  });
+    blocks.push(frozen({ ...block, content }));
+  }
   env.promptBlock = undefined;
-  const history = snapshot.messages
-    .filter((message) => message.id !== snapshot.target.excludedMessageId)
-    .map((message, sourceIndex) => {
-      const raw = typeof message.content === "string" ? message.content : "";
-      const placement = message.is_user ? "user_input" : "ai_output";
-      const content = resolveText(raw, placement, null, -1);
-      if (content !== raw) appendSourceMessageDelta(message, content);
-      return messageForHistory({ ...message, content }, snapshot.limits.maxOperationBytes, sourceIndex);
-    });
+  const history: ReturnType<typeof messageForHistory>[] = [];
+  for (const message of snapshot.messages.filter((candidate) => candidate.id !== snapshot.target.excludedMessageId)) {
+    const sourceIndex = history.length;
+    const raw = typeof message.content === "string" ? message.content : "";
+    const placement = message.is_user ? "user_input" : "ai_output";
+    const content = await resolveText(raw, placement, null, -1);
+    if (content !== raw) appendSourceMessageDelta(message, content);
+    history.push(messageForHistory({ ...message, content }, snapshot.limits.maxOperationBytes, sourceIndex));
+  }
   // Source deltas follow frozen history order, independent of regex-action
   // insertion order, so the deferred write intent is deterministic.
   deltas.push(...sourceMessageDeltas);
@@ -814,24 +824,28 @@ function preprocessSnapshot(
   ];
   const worldSourceRevision = (item: { content: string; entryLabel: string }): string =>
     digest({ entryLabel: item.entryLabel, content: item.content });
-  const worldBefore = worldBeforeItems.map((item, sourceIndex) =>
-    messageForWorldInfo(
-      resolveWorldText(item.content),
+  const worldBefore = [];
+  for (const [sourceIndex, item] of worldBeforeItems.entries()) {
+    worldBefore.push(messageForWorldInfo(
+      await resolveWorldText(item.content),
       item.role,
       snapshot.limits.maxOperationBytes,
       item.entryLabel,
       worldSourceRevision(item),
       sourceIndex,
     ));
-  const worldAfter = worldAfterItems.map((item, sourceIndex) =>
-    messageForWorldInfo(
-      resolveWorldText(item.content),
+  }
+  const worldAfter = [];
+  for (const [sourceIndex, item] of worldAfterItems.entries()) {
+    worldAfter.push(messageForWorldInfo(
+      await resolveWorldText(item.content),
       item.role,
       snapshot.limits.maxOperationBytes,
       item.entryLabel,
       worldSourceRevision(item),
       worldBeforeItems.length + sourceIndex,
     ));
+  }
   return frozen({
     blocks: frozen(blocks),
     history: frozen(history),
@@ -1241,12 +1255,11 @@ function normalizeInput(
 
 /**
  * Compile snapshot data into a strict, literal/result-slot assembly plan.
- * This function is pure and imports no DB, Spindle registry, interceptor, or
- * callback. It is safe to run in a worker/subprocess.
+ * Macro text uses the same evaluator as Response against snapshot-owned extras.
  */
-export function compileAgentAssemblyPlan(
+export async function compileAgentAssemblyPlan(
   input: GenerationAssemblySnapshotV1 | CompileAgentAssemblyRequestV1 | { snapshot: GenerationAssemblySnapshotV1; agentConfig?: unknown; requestId?: string },
-): AssemblyPlanV1 {
+): Promise<AssemblyPlanV1> {
   const { snapshot, agentConfig, requestId } = normalizeInput(input);
   validateSnapshotIdentity(snapshot);
   if (bytes(snapshot.snapshotId) > 256) {
@@ -1268,7 +1281,7 @@ export function compileAgentAssemblyPlan(
   // V1 fields are import-only and never become executable worker authority.
   const parsedConfig = parserConfig(configFor(snapshot, agentConfig));
   const phaseRefs = cognitionPhaseRefs(snapshot, parsedConfig);
-  const preparation = preprocessSnapshot(snapshot, phaseRefs.excludedBlockIds);
+  const preparation = await preprocessSnapshot(snapshot, phaseRefs.excludedBlockIds);
   const parsed = parseBlocks(snapshot, parsedConfig, preparation.blocks, phaseRefs.excludedBlockIds);
   const producerByName = new Map<string, { block: SnapshotBlockV1; blockIndex: number; child: ParsedChild }>();
   for (const item of parsed) {
@@ -1303,7 +1316,7 @@ export function compileAgentAssemblyPlan(
       : Math.max(1, Math.floor(snapshot.limits.maxOperationBytes / 4));
     const maxOutputBytes = Math.min(
       snapshot.limits.maxOutputBytes,
-      authoredOutputTokens * 4,
+      authoredOutputTokens * CHILD_RESULT_BYTES_PER_AUTHORED_TOKEN,
     );
     const maxOutputTokens = Math.min(authoredOutputTokens, Math.max(1, Math.ceil(maxOutputBytes / 4)));
     const taskBytes = bytes(item.child.task);
@@ -2440,11 +2453,11 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
  * from an independent verifier isolate, which closes transform-dependent
  * omissions, replacements, and reorderings.
  */
-export function validateAssemblyPlanAgainstSnapshotV1(
+export async function validateAssemblyPlanAgainstSnapshotV1(
   plan: AssemblyPlanV1,
   snapshot: GenerationAssemblySnapshotV1,
   trustedLimits: PreparationLimitsV1 = snapshot.limits,
-): void {
+): Promise<void> {
   validateAssemblyPlanV1(plan, trustedLimits);
   if (
     plan.snapshotId !== snapshot.snapshotId
@@ -2464,7 +2477,7 @@ export function validateAssemblyPlanAgainstSnapshotV1(
    * validation, never this snapshot validator), so malformed worker data
    * cannot recurse through host validation.
    */
-  const expectedPlan = compileAgentAssemblyPlan(snapshot);
+  const expectedPlan = await compileAgentAssemblyPlan(snapshot);
   const messageCollections = [
     ["provider", plan.providerMessages, expectedPlan.providerMessages],
     ["workPolicy", plan.workPolicyMessages, expectedPlan.workPolicyMessages],
@@ -2494,7 +2507,7 @@ export function validateAssemblyPlanAgainstSnapshotV1(
       : Math.max(1, Math.floor(snapshot.limits.maxOperationBytes / 4));
     const maxOutputBytes = Math.min(
       snapshot.limits.maxOutputBytes,
-      authoredOutputTokens * 4,
+      authoredOutputTokens * CHILD_RESULT_BYTES_PER_AUTHORED_TOKEN,
     );
     const maxOutputTokens = Math.min(authoredOutputTokens, Math.max(1, Math.ceil(maxOutputBytes / 4)));
     const slotIndex = expectedChildren.length;
@@ -2878,8 +2891,8 @@ export function parseCompileAgentAssemblyRequest(value: unknown): CompileAgentAs
   });
 }
 
-/** Worker-side entrypoint hook. It has no DB or live registry imports. */
-export function handleCompileAgentAssembly(value: unknown): AssemblyPlanV1 {
+/** Worker-side entrypoint hook. Snapshot-owned extras only; no DB reads. */
+export async function handleCompileAgentAssembly(value: unknown): Promise<AssemblyPlanV1> {
   const request = parseCompileAgentAssemblyRequest(value);
   return compileAgentAssemblyPlan(request);
 }

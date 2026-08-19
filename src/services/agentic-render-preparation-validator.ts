@@ -17,6 +17,7 @@ import {
   utf8ByteLength,
 } from "../types/agent-preprocessing";
 import {
+  CANONICAL_SNAPSHOT_DATA_LIMITS_V1,
   CanonicalDataError,
   cloneCanonicalPlainData,
   encodeCanonicalPlainData,
@@ -76,10 +77,10 @@ function limitExceeded(message: string, path?: string): never {
 }
 function cloneClosedData(value: unknown, path: string, maxBytes: number): unknown {
   try {
-    return cloneCanonicalPlainData(value, { maxBytes });
+    return cloneCanonicalPlainData(value, { ...CANONICAL_SNAPSHOT_DATA_LIMITS_V1, maxBytes });
   } catch (error) {
     if (error instanceof CanonicalDataError && error.code === "limit_exceeded") {
-      limitExceeded(`${path} exceeds the canonical data limit`, path);
+      limitExceeded(`${path} exceeds the canonical data ${error.dimension ?? "structure"} limit`, path);
     }
     fail("canonical data is not closed plain data", path);
   }
@@ -142,7 +143,7 @@ function validateClosedPlainData(
   maxBytes = HOST_PREPARATION_LIMITS_V1.maxInputBytes,
 ): void {
   try {
-    validateCanonicalPlainData(value, { maxBytes });
+    validateCanonicalPlainData(value, { ...CANONICAL_SNAPSHOT_DATA_LIMITS_V1, maxBytes });
   } catch (error) {
     if (error instanceof CanonicalDataError && error.code === "limit_exceeded") {
       limitExceeded(`${path} exceeds the canonical data ${error.dimension ?? "structure"} limit`, path);
@@ -393,9 +394,19 @@ function validateRevisionSet(value: unknown, path: string): void {
     revisionKeys.add(identity);
   }
 
-  const canonicalValue = (entry: unknown): string => encodeCanonicalPlainData(entry, {
-    maxBytes: HOST_PREPARATION_LIMITS_V1.maxInputBytes,
-  });
+  const encodedRevisions = new WeakMap<object, string>();
+  const canonicalValue = (entry: unknown): string => {
+    if (entry && typeof entry === "object") {
+      const cached = encodedRevisions.get(entry);
+      if (cached !== undefined) return cached;
+    }
+    const encoded = encodeCanonicalPlainData(entry, {
+      ...CANONICAL_SNAPSHOT_DATA_LIMITS_V1,
+      maxBytes: HOST_PREPARATION_LIMITS_V1.maxInputBytes,
+    });
+    if (entry && typeof entry === "object") encodedRevisions.set(entry, encoded);
+    return encoded;
+  };
   const equalProjection = (actual: unknown[], expected: readonly unknown[], projectionPath: string): void => {
     if (actual.length !== expected.length) fail("revision projection length does not match canonical revisions", projectionPath);
     for (let index = 0; index < expected.length; index += 1) {

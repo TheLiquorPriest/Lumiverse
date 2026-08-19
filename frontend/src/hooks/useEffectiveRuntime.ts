@@ -559,9 +559,6 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     && projectedDecision.agentsEnabled
     && projectedDecision.allowedModes.includes('response')
     && projectedDecision.allowedModes.includes('agentic')
-    && projectedDecision.capabilityReadiness.ready
-    && projectedDecision.repairCodes.length === 0
-    && projectedDecision.capabilityReadiness.repairCodes.length === 0
   const mode = selection.oneTurnMode ?? projectedDecision?.effectiveMode ?? 'response'
   const repairCategories = projectedDecision ? repairCategoriesForDecision(projectedDecision) : []
   const refresh = useCallback(async (): Promise<void> => {

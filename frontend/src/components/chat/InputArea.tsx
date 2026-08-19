@@ -441,7 +441,6 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const activeAgentRun = useStore((s) => selectActiveAgentRunForChat(s, chatId, generationIdForChat))
   const agentRunSyncStatus = useStore((s) => s.agentRunSyncByChat[chatId])
   const canRetryExactAgentRunLookup = agentRunSyncStatus === 'error'
-    || agentRunSyncStatus === 'ready'
     || agentRunSyncStatus === 'stale'
   const cancelGenerationLocally = useCallback(() => {
     generationNonceRef.current += 1
@@ -471,6 +470,10 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   useEffect(() => {
     if (!waitingForExactAgentRun || activeAgentRun) return
     void recoverAgentRuns(chatId)
+    const timer = window.setInterval(() => {
+      void recoverAgentRuns(chatId)
+    }, 750)
+    return () => window.clearInterval(timer)
   }, [activeAgentRun, chatId, waitingForExactAgentRun])
   const groupResponseOrder = useMemo(
     () => readGroupResponseOrder(activeChatMetadata),

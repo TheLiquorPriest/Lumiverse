@@ -114,6 +114,25 @@
       "refreshRequired": "生成開始前にランタイムが変更されました。モードを確認して再試行してください。",
       "unavailable": "エージェントモードの準備ができていません。レスポンスを使用するか、表示された修復を完了してください。"
     },
+    "errors": {
+      "not_found": "要求されたランタイム対象が見つかりません。",
+      "invalid_request": "ランタイムリクエストが無効です。",
+      "decision_refresh_required": "ランタイムの決定が古くなっています。モードを確認して再試行してください。",
+      "decision_capacity_exceeded": "保留中のランタイム決定が多すぎます。しばらくしてから再試行してください。",
+      "runtime_decision_unavailable": "ランタイム決定サービスを利用できません。",
+      "agentic_unsupported_surface": "この生成画面ではレスポンスモードを使用してください。",
+      "agentic_runtime_unavailable": "エージェントランタイムを利用できません。レスポンスモードを使用してください。",
+      "agentic_preflight_failed": "エージェントの事前チェックに失敗しました。レスポンスモードを使用するか設定を確認してください。",
+      "agentic_chat_busy": "このチャットではすでにエージェント実行中です。",
+      "agentic_protocol_failure": "エージェントプロトコルの応答が無効です。",
+      "agentic_work_exhausted": "エージェントの作業予算を使い切りました。",
+      "agentic_cancelled": "エージェント実行がキャンセルされました。",
+      "agentic_timed_out": "エージェント実行がタイムアウトしました。",
+      "agentic_commit_failed": "エージェントの結果を確定できませんでした。",
+      "agentic_revision_conflict": "エージェント結果の確定前にランタイムが変更されました。",
+      "agentic_provider_failure": "エージェントのモデルリクエストに失敗しました。",
+      "agentic_internal_error": "エージェントランタイムで内部エラーが発生しました。"
+    },
     "stop": {
       "stop": "実行を停止",
       "locating": "正確な停止操作を準備しています…",

@@ -29,8 +29,16 @@ import { listPromptBlocks } from "./presets.service";
 import {
   buildGenerationAssemblySnapshot,
   isGenerationAssemblySnapshotV1,
+  liveChatInputRevision,
+  liveConnectionInputRevision,
+  liveCredentialInputRevision,
+  liveEndpointInputRevision,
+  liveMessageInputRevision,
+  readLiveSettingsInputRevision,
   type GenerationAssemblySnapshotInputV1,
   type GenerationAssemblySnapshotV1,
+  type SnapshotMessageV1,
+  type SnapshotWorldInfoV1,
 } from "./prompt-assembly-snapshot.service";
 import {
   type AssemblyPlanV1,
@@ -45,6 +53,7 @@ import {
   executeBoundedAgenticChildFrame,
   runAgenticWorkPhase,
   AgenticWorkPhaseError,
+  MAX_CHILD_OUTPUT_BYTES,
   type AgenticWorkPhaseOutcome,
   type AgenticWorkOptions,
   type AgenticWorkRenderHandoff,
@@ -137,6 +146,7 @@ import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import type { GenerationRequest, GenerationResponse, GenerationParameters, LlmMessage, StreamChunk } from "../llm/types";
 import { observeOutputTokens } from "./agent-runtime-accounting";
+import { resolveCounter } from "./tokenizer.service";
 import type {
   FrozenConcreteConnectionV1,
   EffectiveRuntimeRequestV1,
@@ -164,6 +174,12 @@ import type { AgenticWorkProviderRequest, AgenticWorkspaceCapability, AgenticWor
 import type { AgenticRenderProviderRequestV1 } from "./agentic-render-phase.service";
 import { AGENT_RUNTIME_ADMISSION_MANAGER } from "./agent-runtime-admission";
 import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
+import type {
+  AgentActivityLifecycle,
+  AgentActivityNodeV1,
+  AgentActivityToolId,
+  AgentActivityUsageV1,
+} from "../types/agent-runtime";
 type RuntimeExecution = {
   id: string;
   userId: string;
@@ -211,7 +227,9 @@ function isRuntimeExecution(value: AgenticExecutionHandle): value is RuntimeExec
 }
 
 function requireRuntimeExecution(value: AgenticExecutionHandle): RuntimeExecution {
-  if (!isRuntimeExecution(value)) throw new Error("agentic_execution_invalid");
+  if (!isRuntimeExecution(value)) {
+    throw new AgenticGenerationError("agentic_runtime_unavailable", "Agentic execution handle is incomplete.", { phase: "WORK" });
+  }
   return value;
 }
 
@@ -280,6 +298,132 @@ function materializePolicyMessages(messages: readonly AssemblyProviderMessageV1[
     return { role: message.role, content: text };
   });
 }
+const HOST_RENDER_FINAL_RESPONSE_CONTRACT =
+  "Write only the in-character assistant reply for this chat. Do not mention tools, complete_turn, workspace, or that the turn was submitted.";
+
+function snapshotSwipeContent(message: SnapshotMessageV1): string {
+  const swipeId = message.swipe_id;
+  if (Number.isSafeInteger(swipeId) && swipeId >= 0 && swipeId < message.swipes.length) {
+    const swipe = message.swipes[swipeId];
+    if (typeof swipe === "string") return swipe;
+  }
+  return typeof message.content === "string" ? message.content : "";
+}
+function snapshotFactText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function boundUtf8Text(value: string, maxBytes: number): string {
+  if (maxBytes <= 0 || value.length === 0) return "";
+  const encoded = UTF8_ENCODER.encode(value);
+  if (encoded.byteLength <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (encoded[end - 1]! & 0b1100_0000) === 0b1000_0000) end -= 1;
+  if (end > 0 && (encoded[end - 1]! & 0b1100_0000) === 0b1100_0000) end -= 1;
+  return new TextDecoder().decode(encoded.subarray(0, end));
+}
+
+function appendRenderFact(parts: string[], line: string, remaining: { bytes: number }): void {
+  const trimmed = line.trim();
+  if (!trimmed || remaining.bytes <= 0) return;
+  const separator = parts.length === 0 ? "" : "\n";
+  const candidate = `${separator}${trimmed}`;
+  const encoded = UTF8_ENCODER.encode(candidate);
+  if (encoded.byteLength <= remaining.bytes) {
+    parts.push(trimmed);
+    remaining.bytes -= encoded.byteLength;
+    return;
+  }
+  const bounded = boundUtf8Text(candidate, remaining.bytes);
+  remaining.bytes = 0;
+  if (!bounded) return;
+  const text = separator && bounded.startsWith(separator) ? bounded.slice(separator.length) : bounded;
+  if (text.length > 0) parts.push(text);
+}
+
+function buildRenderSnapshotFactMessage(input: {
+  readonly character?: Readonly<Record<string, unknown>>;
+  readonly worldInfo?: SnapshotWorldInfoV1;
+  readonly maxFactBytes?: number;
+}): LlmMessage | null {
+  const hostCap = HOST_PREPARATION_LIMITS_V1.maxOperationBytes;
+  const requested = input.maxFactBytes;
+  const maxBytes = Math.min(
+    hostCap,
+    typeof requested === "number" && Number.isSafeInteger(requested) && requested > 0 ? requested : hostCap,
+  );
+  const remaining = { bytes: maxBytes };
+  const parts: string[] = [];
+  const character = input.character;
+  if (character) {
+    const name = participantName(character, "");
+    if (name) appendRenderFact(parts, `Character: ${name}`, remaining);
+    if (remaining.bytes > 0) {
+      const personality = snapshotFactText(character.personality);
+      if (personality) appendRenderFact(parts, `Personality: ${personality}`, remaining);
+    }
+    if (remaining.bytes > 0) {
+      const scenario = snapshotFactText(character.scenario);
+      if (scenario) appendRenderFact(parts, `Scenario: ${scenario}`, remaining);
+    }
+    if (remaining.bytes > 0) {
+      const description = snapshotFactText(character.description);
+      if (description) appendRenderFact(parts, `Description: ${description}`, remaining);
+    }
+  }
+  for (const book of input.worldInfo?.books ?? []) {
+    if (remaining.bytes <= 0) break;
+    const bookName = snapshotFactText(book.name);
+    const bookDescription = snapshotFactText(book.description);
+    if (bookName && bookDescription) appendRenderFact(parts, `World (${bookName}): ${bookDescription}`, remaining);
+    else if (bookName) appendRenderFact(parts, `World: ${bookName}`, remaining);
+    else if (bookDescription) appendRenderFact(parts, `World: ${bookDescription}`, remaining);
+  }
+  for (const entry of input.worldInfo?.entries ?? []) {
+    if (remaining.bytes <= 0) break;
+    if (entry.disabled || !entry.constant) continue;
+    const content = snapshotFactText(entry.content);
+    if (content) appendRenderFact(parts, `World: ${content}`, remaining);
+  }
+  if (parts.length === 0) return null;
+  return { role: "system", content: parts.join("\n") };
+}
+
+function buildAgenticRenderPolicyMessages(input: {
+  readonly snapshotMessages: readonly SnapshotMessageV1[];
+  readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
+  readonly renderGuidance?: string;
+  readonly character?: Readonly<Record<string, unknown>>;
+  readonly worldInfo?: SnapshotWorldInfoV1;
+  readonly maxFactBytes?: number;
+}): readonly LlmMessage[] {
+  const messages: LlmMessage[] = [];
+  const facts = buildRenderSnapshotFactMessage(input);
+  if (facts) messages.push(facts);
+  for (const message of input.snapshotMessages) {
+    messages.push({
+      role: message.is_user ? "user" : "assistant",
+      content: snapshotSwipeContent(message),
+    });
+  }
+  const authored = materializePolicyMessages(input.renderPolicyMessages);
+  messages.push(...authored);
+  if (authored.length === 0) {
+    messages.push({
+      role: "system",
+      content: HOST_RENDER_FINAL_RESPONSE_CONTRACT,
+    });
+  }
+  const guidance = input.renderGuidance;
+  if (typeof guidance === "string" && guidance.length > 0) {
+    messages.push({
+      role: "system",
+      content: `Render guidance (not the reply):\n${guidance}`,
+    });
+  }
+  return Object.freeze(messages);
+}
+
 /** One request-lifetime handoff between the input and readiness authorities. */
 interface PreflightReadinessRecord {
   readonly snapshot: RuntimeSnapshot | null;
@@ -394,7 +538,6 @@ function normalizeConcreteConnection(
 
 function requireRenderConnection(connection: FrozenConcreteConnectionV1): ResolvedConcreteConnectionV1 {
   const providerName = connection.provider;
-  const effectiveEndpoint = connection.effectiveEndpoint;
   const logicalId = connection.logicalId;
   const concreteId = connection.concreteId;
   const label = connection.label;
@@ -404,9 +547,13 @@ function requireRenderConnection(connection: FrozenConcreteConnectionV1): Resolv
   const endpointRevision = connection.endpointRevision;
   const credentialRevision = connection.credentialRevision;
   const candidateRevision = connection.candidateRevision;
+  const provider = typeof providerName === "string" && providerName ? getProvider(providerName) : undefined;
+  const resolvedEndpoint = connection.effectiveEndpoint
+    || (typeof provider?.defaultUrl === "string" ? provider.defaultUrl : "");
   if (
-    typeof providerName !== "string" || !providerName
-    || typeof effectiveEndpoint !== "string" || !effectiveEndpoint
+    !provider
+    || typeof providerName !== "string" || !providerName
+    || typeof resolvedEndpoint !== "string" || !resolvedEndpoint
     || typeof logicalId !== "string" || !logicalId
     || typeof concreteId !== "string" || !concreteId
     || typeof label !== "string" || !label
@@ -417,10 +564,8 @@ function requireRenderConnection(connection: FrozenConcreteConnectionV1): Resolv
     || (typeof credentialRevision !== "string" && typeof credentialRevision !== "number")
     || (typeof candidateRevision !== "string" && typeof candidateRevision !== "number")
   ) {
-    throw new Error("agentic_provider_failure");
+    throw new AgenticGenerationError("agentic_provider_failure", "Agentic root connection is incomplete.", { phase: "ASSEMBLE" });
   }
-  const provider = getProvider(providerName);
-  if (!provider) throw new Error("agentic_provider_failure");
   validateProviderCapabilities(provider);
   return Object.freeze({
     logicalId,
@@ -428,8 +573,8 @@ function requireRenderConnection(connection: FrozenConcreteConnectionV1): Resolv
     label,
     provider: providerName,
     model,
-    endpoint: effectiveEndpoint,
-    effectiveEndpoint,
+    endpoint: resolvedEndpoint,
+    effectiveEndpoint: resolvedEndpoint,
     endpointRevision: String(endpointRevision),
     credentialSecretRef,
     credentialRevision: String(credentialRevision),
@@ -437,7 +582,7 @@ function requireRenderConnection(connection: FrozenConcreteConnectionV1): Resolv
     fingerprint,
     capabilities: cloneAndFreeze(provider.capabilities),
   });
-}
+ }
 /**
  * Project the frozen candidate down to exactly the accepted members.
  */
@@ -588,11 +733,36 @@ function frozenConfig(value: unknown): FrozenAgentConfig {
   if (value === undefined || value === null) return createDisabledAgentConfigV2();
   return parseAgentConfigV2(value);
 }
-function rootMaxOutputTokens(parameters: GenerationParameters | undefined): number | undefined {
-  const value = parameters?.max_tokens;
+const FALLBACK_ROOT_OUTPUT_TOKENS = 4_096;
+function authoredPositiveTokenCap(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
     ? value
     : undefined;
+}
+function rootMaxOutputTokens(parameters: GenerationParameters | undefined): number | undefined {
+  if (!parameters) return undefined;
+  const record = parameters as Record<string, unknown>;
+  const direct = authoredPositiveTokenCap(record.max_tokens) ?? authoredPositiveTokenCap(record.maxTokens);
+  if (direct !== undefined) return direct;
+  const overrides = record.samplerOverrides;
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) return undefined;
+  const sampler = overrides as Record<string, unknown>;
+  if (sampler.enabled !== true) return undefined;
+  return authoredPositiveTokenCap(sampler.maxTokens);
+}
+function effectiveRootGenerationParameters(
+  snapshot: RuntimeSnapshot,
+  input: Pick<AgenticGenerationInput, "parameters">,
+): { readonly parameters: GenerationParameters; readonly maxOutputTokens: number } {
+  const merged: GenerationParameters = {
+    ...((snapshot.preset?.parameters ?? {}) as GenerationParameters),
+    ...(input.parameters ?? {}),
+  };
+  const maxOutputTokens = rootMaxOutputTokens(merged) ?? FALLBACK_ROOT_OUTPUT_TOKENS;
+  return {
+    parameters: { ...merged, max_tokens: maxOutputTokens },
+    maxOutputTokens,
+  };
 }
 function normalizeLoreScope(value: string | undefined): AgentLoreScope {
   return value === "all_owned" ? "all_owned" : "active";
@@ -813,28 +983,38 @@ function indexSnapshotRevisions(snapshot: RuntimeSnapshot): ReadonlyMap<string, 
 }
 
 function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV1) {
+  let liveSnapshotIndex: ReadonlyMap<string, { revision: string; digest: string }> | null | undefined;
   return (member: RevisionMember, db?: Database): { revision: string; digest: string } | null => {
     if (typeof member?.kind !== "string" || typeof member?.id !== "string") return null;
     // Never retain the commit-preflight snapshot as the revision authority.
     // COMMIT supplies its transaction handle so this read observes the same
     // SQLite fence that protects the subsequent delta/message writes.
     const revisionDb = db ?? getDb();
-    let liveInput = snapshotInputValue;
+    if (member.kind === "chat") {
+      const row = revisionDb.query(
+        "SELECT generation_revision FROM chats WHERE id = ? AND user_id = ? LIMIT 1",
+      ).get(member.id, snapshotInputValue.userId) as { generation_revision?: unknown } | null;
+      if (!row) return null;
+      return liveChatInputRevision(member.id, row.generation_revision);
+    }
+    if (member.kind === "message") {
+      const row = revisionDb.query(
+        "SELECT m.generation_revision FROM messages m JOIN chats c ON c.id = m.chat_id WHERE m.id = ? AND m.chat_id = ? AND c.user_id = ? LIMIT 1",
+      ).get(member.id, snapshotInputValue.chatId, snapshotInputValue.userId) as { generation_revision?: unknown } | null;
+      if (!row) return null;
+      return liveMessageInputRevision(member.id, row.generation_revision);
+    }
+    if (member.kind === "settings") {
+      return readLiveSettingsInputRevision(
+        revisionDb,
+        snapshotInputValue.userId,
+        snapshotInputValue.presetId ?? null,
+      );
+    }
     const frozenConcreteId = typeof snapshotInputValue.concreteConnection?.concreteId === "string"
       ? snapshotInputValue.concreteConnection.concreteId
       : null;
-    if (snapshotInputValue.presetId) {
-      const configRow = revisionDb.query(
-        "SELECT config_revision, binding_revision FROM preset_agent_configs WHERE user_id = ? AND preset_id = ? LIMIT 1",
-      ).get(snapshotInputValue.userId, snapshotInputValue.presetId) as { config_revision?: unknown; binding_revision?: unknown } | null;
-      if (!configRow) return null;
-      liveInput = {
-        ...liveInput,
-        configRevision: configRow.config_revision as number | string,
-        bindingRevision: configRow.binding_revision as number | string,
-      };
-    }
-    if (snapshotInputValue.connectionId || frozenConcreteId) {
+    if (member.kind === "connection" || member.kind === "endpoint" || member.kind === "credential") {
       let liveConnection: FrozenConcreteConnectionV1 | null = null;
       try {
         liveConnection = normalizeConcreteConnection(resolveConcreteConnectionV1(
@@ -845,20 +1025,60 @@ function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV
       } catch {
         liveConnection = null;
       }
-      // A roulette/router candidate is frozen for the frame. A changed
-      // candidate is a revision mismatch, never an implicit reroll.
-      if (frozenConcreteId && liveConnection?.concreteId !== frozenConcreteId) return null;
-      liveInput = {
-        ...liveInput,
-        concreteConnection: snapshotConnection(liveConnection) ?? undefined,
-      };
+      if (!liveConnection) return null;
+      if (frozenConcreteId && liveConnection.concreteId !== frozenConcreteId) return null;
+      const liveId = String(liveConnection.concreteId ?? liveConnection.logicalId ?? "default");
+      if (liveId !== member.id) return null;
+      if (member.kind === "connection") return liveConnectionInputRevision(member.id, liveConnection.candidateRevision);
+      if (member.kind === "endpoint") return liveEndpointInputRevision(member.id, liveConnection.endpointRevision);
+      return liveCredentialInputRevision(member.id, liveConnection.credentialRevision);
     }
-    const liveSnapshot = buildGenerationAssemblySnapshot({
-      ...liveInput,
-      db: revisionDb,
-      useTransaction: false,
-    });
-    return indexSnapshotRevisions(liveSnapshot).get(`${member.kind}:${member.id}`) ?? null;
+    if (liveSnapshotIndex === undefined) {
+      let liveInput = snapshotInputValue;
+      if (snapshotInputValue.presetId) {
+        const configRow = revisionDb.query(
+          "SELECT config_revision, binding_revision FROM preset_agent_configs WHERE user_id = ? AND preset_id = ? LIMIT 1",
+        ).get(snapshotInputValue.userId, snapshotInputValue.presetId) as { config_revision?: unknown; binding_revision?: unknown } | null;
+        if (!configRow) {
+          liveSnapshotIndex = null;
+          return null;
+        }
+        liveInput = {
+          ...liveInput,
+          configRevision: configRow.config_revision as number | string,
+          bindingRevision: configRow.binding_revision as number | string,
+        };
+      }
+      if (snapshotInputValue.connectionId || frozenConcreteId) {
+        let liveConnection: FrozenConcreteConnectionV1 | null = null;
+        try {
+          liveConnection = normalizeConcreteConnection(resolveConcreteConnectionV1(
+            snapshotInputValue.userId,
+            snapshotInputValue.connectionId ?? undefined,
+            frozenConcreteId ?? null,
+          ));
+        } catch {
+          liveConnection = null;
+        }
+        // A roulette/router candidate is frozen for the frame. A changed
+        // candidate is a revision mismatch, never an implicit reroll.
+        if (frozenConcreteId && liveConnection?.concreteId !== frozenConcreteId) {
+          liveSnapshotIndex = null;
+          return null;
+        }
+        liveInput = {
+          ...liveInput,
+          concreteConnection: snapshotConnection(liveConnection) ?? undefined,
+        };
+      }
+      const liveSnapshot = buildGenerationAssemblySnapshot({
+        ...liveInput,
+        db: revisionDb,
+        useTransaction: false,
+      });
+      liveSnapshotIndex = indexSnapshotRevisions(liveSnapshot);
+    }
+    return liveSnapshotIndex?.get(`${member.kind}:${member.id}`) ?? null;
   };
 }
 /** Stable canonical encoding used to compare an applied delta with a frozen one. */
@@ -1048,10 +1268,10 @@ async function providerStream(
   ledger?: AgentRuntimeOwner["ledger"],
 ): Promise<AsyncIterable<StreamChunk>> {
   const providerName = connection.provider;
-  const endpoint = connection.effectiveEndpoint;
-  if (!providerName || !endpoint || !connection.model) throw new Error("provider_unavailable");
-  const provider = getProvider(providerName);
-  if (!provider) throw new Error("provider_unavailable");
+  const provider = typeof providerName === "string" && providerName ? getProvider(providerName) : undefined;
+  const endpoint = connection.effectiveEndpoint
+    || (typeof provider?.defaultUrl === "string" ? provider.defaultUrl : "");
+  if (!providerName || !endpoint || !connection.model || !provider) throw new Error("provider_unavailable");
 
   const reservations = ledger?.reserveProviderDispatch();
   if (ledger && !reservations) throw new Error("agentic_admission_capacity_exceeded");
@@ -1144,6 +1364,7 @@ async function collectProviderResponse(
   receiveLimitBytes: number,
   ledger: AgentRuntimeOwner["ledger"] | undefined,
   chargeChildOutput: boolean,
+  countTokens?: (text: string) => number,
 ): Promise<GenerationResponse> {
   if (!Number.isSafeInteger(receiveLimitBytes) || receiveLimitBytes <= 0) {
     throw new AgenticWorkPhaseError("limit_exceeded", "Provider receive limit is invalid");
@@ -1185,7 +1406,8 @@ async function collectProviderResponse(
     }, 0);
     const nextBytes = receivedBytes + tokenBytes + reasoningChunkBytes + finishBytes + privateChunkBytes;
     if (!Number.isSafeInteger(nextBytes) || nextBytes > limit) {
-      throw new AgenticWorkPhaseError("limit_exceeded", "Provider output exceeds the frozen receive limit");
+      console.error(`[agentic] collect receive ${nextBytes} bytes exceeds ${limit}`);
+      throw new AgenticWorkPhaseError("limit_exceeded", `Provider output exceeds the frozen receive limit (${nextBytes} > ${limit})`);
     }
     // The cap is checked before any retained text or private provider state is
     // appended. A malicious stream therefore cannot bypass the frame budget by
@@ -1213,16 +1435,18 @@ async function collectProviderResponse(
   if (ledger && chargeChildOutput) {
     let observed = 0;
     try {
-      observed = observeOutputTokens(response);
+      observed = observeOutputTokens({
+        content: response.content,
+        finish_reason: response.finish_reason,
+        ...(response.tool_calls ? { tool_calls: response.tool_calls } : {}),
+      }, { countTokens });
     } catch {
       throw new AgenticWorkPhaseError("provider_protocol_error", "Provider child output accounting failed");
     }
-    const reported = usage && Number.isSafeInteger(usage.completion_tokens) && usage.completion_tokens >= 0
-      ? usage.completion_tokens
-      : 0;
-    const amount = Math.max(observed, reported);
-    if (amount > 0 && !ledger.charge("child_output_tokens", amount)) {
-      throw new AgenticWorkPhaseError("child_output_limit_exceeded", "Aggregate child output token limit exceeded");
+    const remaining = ledger.remaining("child_output_tokens");
+    if (observed > 0 && !ledger.charge("child_output_tokens", observed)) {
+      console.error(`[agentic] child ledger charge failed: observed=${observed} remaining=${remaining}`);
+      throw new AgenticWorkPhaseError("child_output_limit_exceeded", `Aggregate child output token limit exceeded (${observed} > ${remaining})`);
     }
   }
   return response;
@@ -1254,10 +1478,20 @@ function makeWorkProvider(
         : {}),
     };
     const stream = await providerStream(userId, connection, generationRequest, frozenCredential, ledger);
-    return collectProviderResponse(stream, request.receiveLimitBytes, ledger, request.frame.kind === "child");
+    const counter = await resolveCounter(connection.model ?? request.model);
+    return collectProviderResponse(stream, request.receiveLimitBytes, ledger, request.frame.kind === "child", counter.count);
   };
 }
 
+
+/** Never throws: tokenizer resolution falls back to chars/4. */
+async function resolveRenderCountTokens(model: string | undefined): Promise<(text: string) => number> {
+  try {
+    return (await resolveCounter(model ?? "")).count;
+  } catch {
+    return (text) => (text ? Math.ceil(text.length / 4) : 0);
+  }
+}
 /**
  * The render phase owns validation and provisional publication. This adapter
  * only acquires the frozen provider stream and returns it unchanged.
@@ -1272,12 +1506,13 @@ function makeRenderProvider(
     if (connection.capabilities.toolsDisabledFinalization !== true) {
       throw new AgenticRenderPhaseError("render_tool_finalization_unsupported");
     }
+    const maxOutputTokens = request.maxOutputTokens
+      ?? rootMaxOutputTokens(request.parameters as GenerationParameters | undefined)
+      ?? FALLBACK_ROOT_OUTPUT_TOKENS;
     const generationRequest: GenerationRequest = {
       messages: [...request.messages],
       model: connection.model ?? request.model,
-      parameters: request.maxOutputTokens === undefined
-        ? request.parameters
-        : { ...(request.parameters ?? {}), max_tokens: request.maxOutputTokens },
+      parameters: { ...(request.parameters ?? {}), max_tokens: maxOutputTokens },
       tools: [],
       stream: true,
       signal: request.signal,
@@ -1445,6 +1680,70 @@ function adoptWorkWorkspaceRevision(
     runtimeExecution.workspaceRevision = workspaceRevision;
   }
   return workspaceRevision;
+}
+
+function publicWorkActivityUsage(
+  outcome: Pick<AgenticWorkPhaseOutcome, "observations" | "childResults">,
+): AgentActivityUsageV1 {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    toolCalls: outcome.observations.length,
+    childInvocations: outcome.childResults.length,
+  };
+}
+
+
+function recordPublicWorkActivity(
+  ledger: { recordActivityNode(node: AgentActivityNodeV1): void },
+  outcome: AgenticWorkPhaseOutcome,
+  generationId: string,
+): AgentActivityUsageV1 {
+  const usage = publicWorkActivityUsage(outcome);
+  if (usage.toolCalls === 0 && usage.childInvocations === 0) return usage;
+  const startedAt = Date.now();
+  for (const observation of outcome.observations) {
+    const id = typeof observation.callId === "string" && observation.callId.length > 0
+      ? observation.callId
+      : `work-tool:${observation.sequence}`;
+    const status: AgentActivityLifecycle = observation.status === "error" || observation.status === "rejected"
+      ? "failed"
+      : "completed";
+    ledger.recordActivityNode({
+      id,
+      parentId: generationId,
+      kind: "tool_attempt",
+      actor: "tool",
+      phase: "running",
+      status,
+      startedAt,
+      elapsedMs: 0,
+      toolId: observation.toolName === "agent_delegate"
+        || (CORE_AGENT_TOOL_IDS as readonly string[]).includes(observation.toolName)
+        ? observation.toolName as AgentActivityToolId
+        : "unknown_tool",
+      usage,
+    });
+  }
+  for (const child of outcome.childResults) {
+    const status: AgentActivityLifecycle = child.status === "succeeded" ? "completed" : child.status;
+    ledger.recordActivityNode({
+      id: child.childId,
+      parentId: generationId,
+      kind: "child_invocation",
+      actor: "child",
+      phase: "running",
+      status,
+      startedAt,
+      elapsedMs: 0,
+      ...(typeof child.profileId === "string" && child.profileId.length > 0
+        ? { profileId: child.profileId }
+        : {}),
+      usage,
+    });
+  }
+  return usage;
 }
 function requireOperationKey(value: unknown): string {
   if (typeof value !== "string" || value.length === 0 || UTF8_ENCODER.encode(value).byteLength > 256) {
@@ -1985,7 +2284,7 @@ function installDecisionAuthorities(): void {
     getInputRevisions: (userId, request, context) => {
       const key = preflightRequestKey(userId, request);
       preflightSnapshots.delete(key);
-      if (request.mode !== "agentic") return request.inputRevisions ?? {};
+      if (context.requestedMode !== "agentic") return request.inputRevisions ?? {};
       const target = context.target;
       const presetId = context.preset?.id ?? request.presetId ?? null;
       // The canonical projection's review state is the durable cognition
@@ -2252,9 +2551,9 @@ function buildDependencies(): AgenticGenerationDependencies {
   const renderProjections = new Map<string, FrozenRenderCommitProjection>();
   const renderFrames = new Map<string, {
     readonly handoff: AgenticWorkRenderHandoff;
-    readonly renderMessages: readonly LlmMessage[];
   }>();
-  const works = new Map<string, any>();
+  const works = new Map<string, AgenticWorkPhaseOutcome>();
+  const workUsages = new Map<string, AgentActivityUsageV1>();
   const caps = new Map<string, WorkspaceOperationCapabilitiesV1>();
   const bindings = new Map<string, LiveTargetBinding>();
   const stopRegistrations = new Map<string, () => void>();
@@ -2371,6 +2670,37 @@ function buildDependencies(): AgenticGenerationDependencies {
       let owner: AgentRuntimeOwner | undefined;
       let credentialCarrier: Map<string, string> | undefined;
       try {
+        const binding = bindLiveTarget(value.userId, value.chatId, value.target);
+        bindings.set(value.executionId, binding);
+        const presetRevision = Number(decision.internal.binding.configRevision);
+        const connectionRevision = Number(root?.candidateRevision ?? root?.revision);
+        const execution = createTurnExecution({
+          id: value.executionId, userId: value.userId, chatId: value.chatId, generationId: value.executionId,
+          target: binding,
+          presetSnapshotId: decision.internal.binding.presetId,
+          presetRevision: Number.isSafeInteger(presetRevision) && presetRevision >= 0 ? presetRevision : 0,
+          configSnapshotId: decision.internal.binding.presetId,
+          configRevision: Number.isSafeInteger(presetRevision) && presetRevision >= 0 ? presetRevision : 0,
+          concreteConnectionSnapshotId: root?.concreteId ?? root?.logicalId ?? null,
+          concreteConnectionRevision: Number.isSafeInteger(connectionRevision) && connectionRevision >= 0 ? connectionRevision : 0,
+          worldLoreSnapshotId: null, worldLoreRevision: 0, mode: "agentic", runtimeEpoch: getRuntimeEpoch(),
+          deadlineAt, workspaceId: `workspace:${value.executionId}`, rootLedger: {}, frameCapabilities: {},
+        });
+        executionOwnerToken = execution.ownerToken;
+        pool.createPoolEntry({
+          generationId: value.executionId, userId: value.userId, chatId: value.chatId,
+          generationType: binding.target, characterName: "", model: root?.model ?? "",
+          ...(binding.messageId ? { targetMessageId: binding.messageId } : {}),
+          ...(binding.swipeId !== null ? { targetSwipeId: binding.swipeId } : {}),
+        });
+        eventBus.emit(
+          EventType.GENERATION_STARTED,
+          {
+            generationId: value.executionId, chatId: value.chatId, model: root?.model ?? "",
+            targetMessageId: binding.messageId, targetSwipeId: binding.swipeId, generationType: binding.target,
+          },
+          value.userId,
+        );
         const frozenConnections = [
           root,
           ...Object.values(decision.internal.childConnections),
@@ -2418,7 +2748,8 @@ function buildDependencies(): AgenticGenerationDependencies {
             );
             let observedOutputTokens: number | undefined;
             try {
-              observedOutputTokens = observeOutputTokens(response);
+              const counter = await resolveCounter(frozen.model ?? "");
+              observedOutputTokens = observeOutputTokens(response, { countTokens: counter.count });
             } catch {
               throw new AgenticGenerationError("agentic_provider_failure", "Provider output accounting failed.", { phase: "WORK" });
             }
@@ -2434,25 +2765,6 @@ function buildDependencies(): AgenticGenerationDependencies {
           credentialCarrier?.clear();
         }, { once: true });
         owner = runtimeOwner;
-        const binding = bindLiveTarget(value.userId, value.chatId, value.target);
-        // Retain the normalized binding before any later setup can throw so a
-        // partially-created turn can publish the exact terminal target.
-        bindings.set(value.executionId, binding);
-        const presetRevision = Number(decision.internal.binding.configRevision);
-        const connectionRevision = Number(root?.candidateRevision ?? root?.revision);
-        const execution = createTurnExecution({
-          id: value.executionId, userId: value.userId, chatId: value.chatId, generationId: value.executionId,
-          target: binding,
-          presetSnapshotId: decision.internal.binding.presetId,
-          presetRevision: Number.isSafeInteger(presetRevision) && presetRevision >= 0 ? presetRevision : 0,
-          configSnapshotId: decision.internal.binding.presetId,
-          configRevision: Number.isSafeInteger(presetRevision) && presetRevision >= 0 ? presetRevision : 0,
-          concreteConnectionSnapshotId: root?.concreteId ?? root?.logicalId ?? null,
-          concreteConnectionRevision: Number.isSafeInteger(connectionRevision) && connectionRevision >= 0 ? connectionRevision : 0,
-          worldLoreSnapshotId: null, worldLoreRevision: 0, mode: "agentic", runtimeEpoch: getRuntimeEpoch(),
-          deadlineAt, workspaceId: `workspace:${value.executionId}`, rootLedger: {}, frameCapabilities: {},
-        });
-        executionOwnerToken = execution.ownerToken;
         // §6.5: reserve the single root RENDER request/context/output/deadline/
         // activity budget at admission so WORK can never starve the frozen
         // render. The envelope derives from immutable host limits; ASSEMBLE
@@ -2521,20 +2833,6 @@ function buildDependencies(): AgenticGenerationDependencies {
           quota: DEFAULT_QUOTA, capabilities: workspaceCapabilities,
         });
         caps.set(value.executionId, workspaceCapabilities);
-        pool.createPoolEntry({
-          generationId: value.executionId, userId: value.userId, chatId: value.chatId,
-          generationType: binding.target, characterName: "", model: root?.model ?? "",
-          ...(binding.messageId ? { targetMessageId: binding.messageId } : {}),
-          ...(binding.swipeId !== null ? { targetSwipeId: binding.swipeId } : {}),
-        });
-        eventBus.emit(
-          EventType.GENERATION_STARTED,
-          {
-            generationId: value.executionId, chatId: value.chatId, model: root?.model ?? "",
-            targetMessageId: binding.messageId, targetSwipeId: binding.swipeId, generationType: binding.target,
-          },
-          value.userId,
-        );
         return {
           id: value.executionId,
           ownerToken: execution.ownerToken,
@@ -2553,6 +2851,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           credentialCarrier: carrier,
         };
       } catch (error) {
+        console.error("[agentic] createExecution failed", error);
         stopRegistrations.get(value.executionId)?.();
         invalidateFrameCapabilitiesForTurn({ userId: value.userId, chatId: value.chatId, turnId: value.executionId });
         stopRegistrations.delete(value.executionId);
@@ -2663,7 +2962,9 @@ function buildDependencies(): AgenticGenerationDependencies {
     },
     createContextRuntime: (snapshot, _input, _decision, _signal, _executionId) => {
       const contextSnapshot = snapshot.contextPackSnapshot;
-      if (!contextSnapshot) throw new Error("context_snapshot_unavailable");
+      if (!contextSnapshot) {
+        throw new AgenticGenerationError("agentic_preflight_failed", "Assembly snapshot is missing context candidates.", { phase: "ASSEMBLE" });
+      }
       const reader = createAccountContextPackReader();
       const tracker = new ContextPackInputRevisionTracker();
       const invalidationSink = createCognitionContextInvalidationSink();
@@ -2719,7 +3020,9 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (!root) return { status: "failed", errorCode: "agentic_provider_failure" };
       const phaseSignal = runtimeExecution.signal ?? signal;
       const workspaceCapabilities = caps.get(execution.id);
-      if (!workspaceCapabilities) throw new Error("agentic_workspace_capability_missing");
+      if (!workspaceCapabilities) {
+        throw new AgenticGenerationError("agentic_runtime_unavailable", "Workspace capabilities were not admitted.", { phase: "WORK" });
+      }
       const coordinatorContextRuntime = requireCoordinatorContextRuntime(contextRuntime);
       if (coordinatorContextRuntime) contextRuntimes.set(execution.id, coordinatorContextRuntime);
       const cognitionRuntime = await withToolPermit(
@@ -2787,12 +3090,15 @@ function buildDependencies(): AgenticGenerationDependencies {
       const profileOutputLimits = new Map(plan.profileOutputLimits.map((entry) => [entry.profileId, entry.maxOutputTokens]));
       const delegatableProfiles = delegatable.map((profile) => {
         const child = connectionFor(profile.id);
-        const workspaceCapabilities = (profile.workspaceCapabilities ?? [])
+        const authoredWorkspaceCapabilities = (profile.workspaceCapabilities ?? [])
           .filter((operation) => CHILD_WORKSPACE_CAPABILITIES.includes(operation));
+        const workspaceCapabilities = authoredWorkspaceCapabilities.length > 0
+          ? authoredWorkspaceCapabilities
+          : CHILD_WORKSPACE_CAPABILITIES;
         return {
           profileId: profile.id,
           toolIds: (profile.toolIds ?? []).filter((id) => available.has(id)),
-          ...(workspaceCapabilities.length > 0 ? { workspaceCapabilities } : {}),
+          workspaceCapabilities,
           ...(profileOutputLimits.has(profile.id) ? { maxOutputTokens: profileOutputLimits.get(profile.id)! } : {}),
           model: child.model ?? root.model ?? "",
           connectionId: child.concreteId ?? child.logicalId ?? null,
@@ -2806,11 +3112,8 @@ function buildDependencies(): AgenticGenerationDependencies {
         cognitionRuntime,
         coordinatorContextRuntime,
       );
-      const effectiveParameters: GenerationParameters = {
-        ...((runtimeSnapshot.preset?.parameters ?? {}) as GenerationParameters),
-        ...(input.parameters ?? {}),
-      };
-      const rootOutputTokenLimit = rootMaxOutputTokens(effectiveParameters);
+      const { parameters: effectiveParameters, maxOutputTokens: rootOutputTokenLimit } =
+        effectiveRootGenerationParameters(runtimeSnapshot, input);
       const options: AgenticWorkOptions = {
         rootFrameId: execution.id,
         trustedAssemblyLimits: runtimeSnapshot.limits,
@@ -2836,7 +3139,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         budget: {
           maxToolCalls: Math.min(config.maxToolCalls ?? hostLimits.aggregateToolCalls, hostLimits.aggregateToolCalls),
           maxChildFrames: Math.min(config.maxInvocations ?? hostLimits.childAdmissions, hostLimits.childAdmissions),
-          ...(rootOutputTokenLimit !== undefined ? { maxOutputTokens: rootOutputTokenLimit } : {}),
+          maxOutputTokens: rootOutputTokenLimit,
         },
         executeChild: ({ frame, descriptor, definitions, workspace: childWorkspace }) =>
           trackChild(execution.id, async () => {
@@ -2855,6 +3158,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             executeCore: executorFor(childToolIds, normalizeLoreScope(profile.loreScope)),
             budget: {
               maxChildOutputBytes: descriptor.maxOutputBytes,
+              maxChildReceiveBytes: MAX_OUTPUT_BYTES,
               maxOutputTokens: descriptor.maxOutputTokens,
             },
           });
@@ -2871,11 +3175,12 @@ function buildDependencies(): AgenticGenerationDependencies {
       // in their result envelope. Read the durable owner row only when WORK
       // can continue; cancellation/timeout retains the pre-cancel revision.
       const workspaceRevision = adoptWorkWorkspaceRevision(runtimeExecution, outcome);
+      const usage = recordPublicWorkActivity(runtimeExecution.owner.ledger, outcome, execution.id);
       works.set(execution.id, outcome);
+      workUsages.set(execution.id, usage);
       if (outcome.renderHandoff) {
         renderFrames.set(execution.id, Object.freeze({
           handoff: outcome.renderHandoff,
-          renderMessages: Object.freeze(materializePolicyMessages(plan.renderPolicyMessages)),
         }));
       }
       return {
@@ -2890,7 +3195,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             workspaceContextProjection: outcome.renderHandoff.workspaceContextProjection,
           }
           : { revision: workspaceRevision },
-        usage: {},
+        usage: { toolCalls: usage.toolCalls, childInvocations: usage.childInvocations },
         observations: outcome.observations.map((observation) => ({
           sequence: observation.sequence,
           callId: observation.callId,
@@ -2958,12 +3263,16 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (!frame || frame.handoff.workspaceRevision !== runtimeExecution.workspaceRevision) {
         throw new Error("workspace_context_projection_stale");
       }
-      const renderMessages = frame.renderMessages;
-      const effectiveParameters: GenerationParameters = {
-        ...((runtimeSnapshot.preset?.parameters ?? {}) as GenerationParameters),
-        ...(input.parameters ?? {}),
-      };
-      const rootOutputTokenLimit = rootMaxOutputTokens(effectiveParameters);
+      const renderMessages = buildAgenticRenderPolicyMessages({
+        snapshotMessages: runtimeSnapshot.messages,
+        renderPolicyMessages: plan.renderPolicyMessages,
+        renderGuidance: work.renderGuidance,
+        character: runtimeSnapshot.participants.character,
+        worldInfo: runtimeSnapshot.worldInfo,
+        maxFactBytes: runtimeSnapshot.limits.maxOperationBytes,
+      });
+      const { parameters: effectiveParameters, maxOutputTokens: rootOutputTokenLimit } =
+        effectiveRootGenerationParameters(runtimeSnapshot, input);
       const renderInput: AgenticRenderPhaseInputV1 = {
         turnId: execution.id,
         target,
@@ -2975,21 +3284,10 @@ function buildDependencies(): AgenticGenerationDependencies {
         renderPolicy: {
           revision: 1,
           messages: renderMessages,
-          maxOutputTokens: rootOutputTokenLimit ?? Math.floor(runtimeSnapshot.limits.maxOutputBytes / 4),
+          maxOutputTokens: rootOutputTokenLimit,
           parameters: effectiveParameters,
         },
         reservedBudgets: reservation,
-        ...(frame ? {
-          framePrivate: {
-            continuationMode: frame.handoff.continuationMode,
-            ...(frame.handoff.providerTransientCarrier
-              ? { providerTransientCarrier: frame.handoff.providerTransientCarrier }
-              : {}),
-            ...(frame.handoff.transcript
-              ? { transcript: frame.handoff.transcript }
-              : {}),
-          },
-        } : {}),
         signal: runtimeExecution.signal ?? signal,
       };
       pool.setPoolStatus(execution.id, "streaming");
@@ -2998,6 +3296,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       try {
         result = await runAgenticRenderPhaseV1(renderInput, {
           dispatch: makeRenderProvider(input.userId, root, runtimeExecution.owner.ledger, frozenCredentialFor(runtimeExecution, root)),
+          countTokens: await resolveRenderCountTokens(root.model ?? undefined),
           emitProvisional: ({ key, text }) => {
             if (text.length === 0) return;
             const appended = pool.appendPoolContent(key.turnId, text);
@@ -3051,24 +3350,35 @@ function buildDependencies(): AgenticGenerationDependencies {
       const contextRuntime = contextRuntimes.get(execution.id);
       if (cognitionRuntime) {
         if (!contextRuntime) throw new Error("agentic_context_runtime_missing");
-        const prepareActivation = await enterCognitionPhase(runtimeExecution, cognitionRuntime, "PREPARE_COMMIT", workspaceCapabilities, runtimeExecution.signal ?? execution.signal);
-        // PREPARE_COMMIT is provisional. Its context requirements become live
-        // only after the owning commit transaction succeeds.
+        console.error("[agentic] PREPARE_COMMIT enterCognitionPhase start", execution.id);
+        await enterCognitionPhase(runtimeExecution, cognitionRuntime, "PREPARE_COMMIT", workspaceCapabilities, runtimeExecution.signal ?? execution.signal);
+        console.error("[agentic] PREPARE_COMMIT enterCognitionPhase done", execution.id);
       }
       const runtimeSnapshot = requireRuntimeSnapshot(snapshot);
       const binding = bindings.get(execution.id);
       if (!binding) throw new Error("agentic_target_binding_missing");
+      const timeoutMs = Math.min(
+        HOST_PREPARATION_LIMITS_V1.maxWallClockMs,
+        Math.max(1, runtimeExecution.deadlineAt - Date.now()),
+      );
+      console.error("[agentic] PREPARE_COMMIT prepareAgentRender start", execution.id, timeoutMs);
+      const preparedInput = prepareInput(input, runtimeExecution, runtimeSnapshot, plan, render, binding);
+      console.error("[agentic] PREPARE_COMMIT prepareInput done", execution.id);
+      try {
+        console.error("[agentic] PREPARE_COMMIT payload bytes", Buffer.byteLength(JSON.stringify(preparedInput)));
+      } catch (error) {
+        console.error("[agentic] PREPARE_COMMIT payload serialize failed", error);
+        throw error;
+      }
       const result = await prepareAgentRender(
-        prepareInput(input, runtimeExecution, runtimeSnapshot, plan, render, binding),
+        preparedInput,
         {
           userId: input.userId,
           signal: runtimeExecution.signal ?? execution.signal,
-          timeoutMs: Math.min(
-            runtimeSnapshot.limits.maxWallClockMs,
-            Math.max(1, runtimeExecution.deadlineAt - Date.now()),
-          ),
+          timeoutMs,
         },
       );
+      console.error("[agentic] PREPARE_COMMIT prepareAgentRender done", execution.id);
       const content = result.content.kind === "text"
         ? result.content.text
         : result.content.parts?.map((part) => part.kind === "text" ? part.text : "").join("");
@@ -3087,6 +3397,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       };
     },
     commit: async ({ execution, input, decision, snapshot, plan, work, prepared }) => {
+      console.error("[agentic] PREPARE_COMMIT commit start", execution.id);
       const runtimeExecution = requireRuntimeExecution(execution);
       const workspaceCapabilities = caps.get(execution.id);
       if (!workspaceCapabilities) throw new Error("agentic_workspace_capability_missing");
@@ -3173,6 +3484,15 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (!renderProjection) throw new Error("agentic_render_projection_missing");
       const renderReservationId = renderProjection.reservation.id;
       const activitySnapshot = runtimeExecution.owner.ledger.activitySnapshot("completed");
+      const workUsage = workUsages.get(execution.id)
+        ?? publicWorkActivityUsage(works.get(execution.id) ?? { observations: [], childResults: [] });
+      const activityUsage: AgentActivityUsageV1 = {
+        inputTokens: activitySnapshot.usage.inputTokens,
+        outputTokens: activitySnapshot.usage.outputTokens,
+        totalTokens: activitySnapshot.usage.totalTokens,
+        toolCalls: Math.max(activitySnapshot.usage.toolCalls, workUsage.toolCalls),
+        childInvocations: Math.max(activitySnapshot.usage.childInvocations, workUsage.childInvocations),
+      };
       const fixedWorkspaceRevision = renderProjection.workspaceRevision;
       // Response attribution is frozen from the assembly snapshot. Do not
       // re-resolve a character after WORK; the message and commit fence must
@@ -3211,6 +3531,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         workspaceUsage,
         activity: activitySnapshot.nodes,
         activityOmittedNodeCount: activitySnapshot.omittedNodeCount,
+        activityUsage,
         renderPreparation: preparedResult,
         artifacts: workspaceArtifacts,
         assemblyPlan: { inputRevisions: runtimePlan.inputRevisions, deltas: assemblyDeltas },
@@ -3274,8 +3595,14 @@ function buildDependencies(): AgenticGenerationDependencies {
         targetMessageId,
         targetSwipeId,
         status: event.phase,
+        ...(workUsages.get(event.executionId) ? { usage: workUsages.get(event.executionId) } : {}),
       };
-      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, projection));
+      try {
+        withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, projection));
+      } catch (error) {
+        console.error("[agentic] phase projection failed", error);
+        throw error;
+      }
     },
     publishTerminal: (event) => {
       const status = event.status === "completed"
@@ -3284,7 +3611,11 @@ function buildDependencies(): AgenticGenerationDependencies {
           ? "CANCELLED"
           : event.status === "timed_out"
             ? "TIMED_OUT"
-            : event.phase;
+            : event.status === "exhausted"
+              ? "EXHAUSTED"
+              : event.status === "failed"
+                ? "FAILED"
+                : event.phase;
       const binding = bindings.get(event.executionId);
       const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
       const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
@@ -3308,15 +3639,22 @@ function buildDependencies(): AgenticGenerationDependencies {
           swipeRevision: null,
         },
         error: event.errorCode ? { code: event.errorCode } : null,
+        ...(workUsages.get(event.executionId) ? { usage: workUsages.get(event.executionId) } : {}),
       };
-      // The standard stream must always terminate, including when the turn
-      // failed before any durable row existed; otherwise the UI hangs.
       const messageId = event.receipt?.messageId ?? undefined;
       const content = pool.getPoolEntry(event.executionId)?.content ?? "";
+      const completed = event.status === "completed";
+      const diagnostic = completed
+        ? ""
+        : [
+          event.phase,
+          event.errorCode,
+          event.errorMessage && event.errorMessage !== event.errorCode ? event.errorMessage : null,
+        ].filter((part): part is string => typeof part === "string" && part.length > 0).join(": ");
       try {
         if (event.status === "cancelled") pool.stopPool(event.executionId);
-        else if (event.status === "completed") pool.completePool(event.executionId, messageId);
-        else pool.errorPool(event.executionId, event.errorCode ?? "agentic_failed");
+        else if (completed) pool.completePool(event.executionId, messageId);
+        else pool.errorPool(event.executionId, diagnostic || event.errorCode || "agentic_failed");
         eventBus.emit(
           event.status === "cancelled" ? EventType.GENERATION_STOPPED : EventType.GENERATION_ENDED,
           {
@@ -3326,15 +3664,37 @@ function buildDependencies(): AgenticGenerationDependencies {
             content,
             ...(targetMessageId ? { targetMessageId } : {}),
             ...(targetSwipeId !== null ? { targetSwipeId } : {}),
-            ...(event.errorCode ? { error: event.errorCode } : {}),
+            phase: event.phase,
+            status,
+            ...(completed || !event.errorCode ? {} : { errorCode: event.errorCode }),
+            ...(completed || !diagnostic ? {} : { error: diagnostic }),
           },
           event.userId,
         );
       } finally {
         try {
+          if (!getTurnExecution(event.executionId, event.userId)) {
+            const fallbackBinding = bindings.get(event.executionId) ?? bindLiveTarget(event.userId, event.chatId, event.target);
+            bindings.set(event.executionId, fallbackBinding);
+            createTurnExecution({
+              id: event.executionId,
+              userId: event.userId,
+              chatId: event.chatId,
+              generationId: event.executionId,
+              target: fallbackBinding,
+              worldLoreSnapshotId: null,
+              worldLoreRevision: 0,
+              mode: "agentic",
+              runtimeEpoch: getRuntimeEpoch(),
+              deadlineAt: Date.now(),
+              workspaceId: `workspace:${event.executionId}`,
+              rootLedger: {},
+              frameCapabilities: {},
+            });
+          }
           withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, projection));
-        } catch {
-          console.error("[agentic] terminal projection failed (stage_failed)");
+        } catch (error) {
+          console.error("[agentic] terminal projection failed", error);
         }
       }
     },
@@ -3398,6 +3758,8 @@ export const __testing = {
     makeWorkspace(requireRuntimeExecution(execution), capabilities, HOST_PREPARATION_LIMITS_V1.maxInputBytes),
   mapRenderPhaseError,
   adoptWorkWorkspaceRevision,
+  HOST_RENDER_FINAL_RESPONSE_CONTRACT,
+  buildAgenticRenderPolicyMessages,
   resetInstallation(): void {
     installed = false;
     preflightSnapshots.clear();

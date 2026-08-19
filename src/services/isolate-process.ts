@@ -533,5 +533,9 @@ export function resolveIsolateEntrypoint(pathOrUrl: string | URL): string {
 }
 
 export function defaultIsolateCommand(pathOrUrl: string | URL): string[] {
-  return bunCmd(resolveIsolateEntrypoint(pathOrUrl));
+  const entry = resolveIsolateEntrypoint(pathOrUrl);
+  if (process.env.LUMIVERSE_BUN_METHOD && process.env.LUMIVERSE_BUN_PATH) {
+    return bunCmd(entry);
+  }
+  return [process.execPath, entry];
 }

@@ -190,4 +190,25 @@ describe('ReasoningBlock agent activity', () => {
     expect(container.textContent).not.toContain('120')
     expect(container.textContent).not.toContain('provider_private_error')
   })
+
+  test('counts a completed root summary as one run', async () => {
+    const container = await renderReasoningBlock({
+      reasoning: '',
+      isStreaming: false,
+      agentSummary: {
+        status: 'succeeded',
+        invocationCount: 0,
+        succeededCount: 0,
+        failedCount: 0,
+        cancelledCount: 0,
+        timedOutCount: 0,
+        toolCallCount: 0,
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      },
+    })
+
+    expect(container.textContent).toContain('Agent activity · Completed · 1 runs')
+    expect(container.textContent).toContain('1 completed')
+    expect(container.textContent).not.toContain('0 runs')
+  })
 })

@@ -3,6 +3,9 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
   buildGenerationAssemblySnapshot,
+  liveConnectionInputRevision,
+  liveCredentialInputRevision,
+  liveEndpointInputRevision,
   SnapshotInputError,
   SnapshotLimitError,
   type GenerationAssemblySnapshotInputV1,
@@ -141,17 +144,42 @@ describe("authenticated assembly snapshot revisions", () => {
       revision: "73",
       digest: digest({ logicalId: concrete.logicalId, concreteId: concrete.concreteId, bindingRevision: 73 }),
     });
-    expect(connectionRevision).toMatchObject({ id: concrete.concreteId, revision: "candidate-11", digest: digest(result.connection) });
+    expect(connectionRevision).toMatchObject({
+      id: concrete.concreteId,
+      ...liveConnectionInputRevision(concrete.concreteId, concrete.candidateRevision),
+    });
     expect(endpointRevision).toMatchObject({
       id: concrete.concreteId,
-      revision: "endpoint-22",
-      digest: digest({ endpoint: concrete.effectiveEndpoint, model: concrete.model, provider: concrete.provider }),
+      ...liveEndpointInputRevision(concrete.concreteId, concrete.endpointRevision),
     });
     expect(credentialRevision).toMatchObject({
       id: concrete.concreteId,
-      revision: "credential-33",
-      digest: digest({ has_api_key: null, updated_at: null }),
+      ...liveCredentialInputRevision(concrete.concreteId, concrete.credentialRevision),
     });
+  });
+
+  test("rematerialized capabilities, label, or URL do not change connection fence identity", () => {
+    const baseline = snapshot();
+    const rematerialized = snapshot({
+      concreteConnection: {
+        ...concrete,
+        label: "Rematerialized provider",
+        capabilities: { tools: true, vision: true },
+        effectiveEndpoint: "https://rematerialized.example/v1",
+        provider: "anthropic",
+        model: "other-model",
+      },
+    });
+    expect(rematerialized.inputRevisionSet.connection[0]).toEqual(baseline.inputRevisionSet.connection[0]);
+    expect(rematerialized.inputRevisionSet.endpoint[0]).toEqual(baseline.inputRevisionSet.endpoint[0]);
+    expect(rematerialized.inputRevisionSet.credential[0]).toEqual(baseline.inputRevisionSet.credential[0]);
+
+    const bumped = snapshot({
+      concreteConnection: { ...concrete, candidateRevision: "candidate-hostile" },
+    });
+    expect(bumped.inputRevisionSet.connection[0]!.revision).toBe("candidate-hostile");
+    expect(bumped.inputRevisionSet.connection[0]!.digest).not.toBe(baseline.inputRevisionSet.connection[0]!.digest);
+    expect(bumped.inputRevisionSet.endpoint[0]).toEqual(baseline.inputRevisionSet.endpoint[0]);
   });
 
   test("binds slot digest to both logical and concrete identities", () => {
@@ -197,9 +225,18 @@ describe("authenticated assembly snapshot revisions", () => {
         credentialRevision: null,
       },
     });
-    expect(nullable.inputRevisionSet.connection[0]!.revision).toBe(nullable.inputRevisionSet.connection[0]!.digest);
-    expect(nullable.inputRevisionSet.endpoint[0]!.revision).toBe(nullable.inputRevisionSet.endpoint[0]!.digest);
-    expect(nullable.inputRevisionSet.credential[0]!.revision).toBe(nullable.inputRevisionSet.credential[0]!.digest);
+    expect(nullable.inputRevisionSet.connection[0]).toMatchObject({
+      id: concrete.concreteId,
+      ...liveConnectionInputRevision(concrete.concreteId, null),
+    });
+    expect(nullable.inputRevisionSet.endpoint[0]).toMatchObject({
+      id: concrete.concreteId,
+      ...liveEndpointInputRevision(concrete.concreteId, null),
+    });
+    expect(nullable.inputRevisionSet.credential[0]).toMatchObject({
+      id: concrete.concreteId,
+      ...liveCredentialInputRevision(concrete.concreteId, null),
+    });
   });
   test("fails closed when an owner-scoped connection points at a missing effective preset", () => {
     const db = schema();

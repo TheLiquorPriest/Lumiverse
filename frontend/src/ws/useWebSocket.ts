@@ -235,11 +235,51 @@ function localizedAgentError(error: unknown): string | null {
   if (error === null || typeof error !== 'object' || Array.isArray(error) || !('code' in error)) return null
   const code = error.code
   if (typeof code !== 'string' || code.length === 0) return null
-  const key = `chat.agentActivity.errors.${code}`
-  const translated = i18n.t(key)
-  return translated === key
-    ? i18n.t('chat.agentActivity.errors.generic')
-    : translated
+  for (const key of [`chat.agentRuntime.errors.${code}`, `chat.agentActivity.errors.${code}`]) {
+    const translated = i18n.t(key)
+    if (translated !== key) return translated
+  }
+  return i18n.t('chat.agentActivity.errors.generic')
+}
+
+function isCommittedSuccessPayload(payload: {
+  error?: string
+  errorCode?: string
+  phase?: string
+  status?: string
+  agentError?: unknown
+}): boolean {
+  if (typeof payload.errorCode === 'string' && payload.errorCode.length > 0) return false
+  if (
+    payload.phase === 'COMMITTED'
+    || payload.status === 'COMMITTED'
+    || payload.status === 'completed'
+  ) {
+    return true
+  }
+  return payload.error === 'COMMITTED'
+}
+
+export function formatTerminalGenerationError(payload: {
+  error?: string
+  errorCode?: string
+  phase?: string
+  status?: string
+  agentError?: unknown
+}): string {
+  if (isCommittedSuccessPayload(payload)) return ''
+  if (!payload.error && !payload.errorCode && !payload.agentError) return ''
+  const code = typeof payload.errorCode === 'string' && payload.errorCode.length > 0
+    ? payload.errorCode
+    : typeof payload.error === 'string' && /^[a-z][a-z0-9_]+$/.test(payload.error)
+      ? payload.error
+      : null
+  const translated = localizedAgentError(code ? { code } : payload.agentError)
+  const diagnostic = typeof payload.error === 'string' && payload.error.trim().length > 0
+    ? payload.error.trim()
+    : null
+  const parts = [translated, diagnostic].filter((part): part is string => typeof part === 'string' && part.length > 0)
+  return [...new Set(parts)].join('\n') || diagnostic || translated || 'Generation failed'
 }
 
 
@@ -962,8 +1002,10 @@ export function useWebSocket() {
             state.markGenerationEnded(payload.generationId)
           }
 
-          const agentErrorMessage = localizedAgentError(payload.agentError)
-          const terminalErrorMessage = agentErrorMessage ?? payload.error
+          const terminalErrorMessage = formatTerminalGenerationError(payload)
+          if (terminalErrorMessage && (payload.error || payload.errorCode || payload.agentError)) {
+            console.error('[generate] terminal failure', payload)
+          }
           if (terminalErrorMessage) {
             const emptySwipeTarget = getEmptyGeneratedSwipeTarget(state, payload.chatId)
             // Remove client-side placeholder if regeneration failed before backend saved a real message
@@ -1295,11 +1337,12 @@ export function useWebSocket() {
             state.deleteChatHead(payload.chatId)
             generateApi.acknowledge(payload.chatId).catch(() => {})
           } else {
+            const terminalHeadError = formatTerminalGenerationError(payload)
             state.updateChatHead(payload.generationId, {
-              status: payload.error || payload.agentError ? 'error' : 'completed',
+              status: terminalHeadError ? 'error' : 'completed',
             })
             // Ping when a backgrounded chat finishes successfully
-            if (!payload.error && !payload.agentError && state.chatHeadsEnabled && state.chatHeadsCompletionSoundEnabled) {
+            if (!terminalHeadError && state.chatHeadsEnabled && state.chatHeadsCompletionSoundEnabled) {
               playNotificationPing(state.chatHeadsCustomCompletionSound?.uploadedAt ?? null)
             }
           }

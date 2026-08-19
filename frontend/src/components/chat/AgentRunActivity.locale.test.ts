@@ -104,4 +104,35 @@ describe('AgentRunActivity locale coverage', () => {
       }
     }
   })
+
+  test('keeps mapped runtime error keys under agentRuntime.errors in all six locales', () => {
+    const expectedErrorKeys = [
+      'not_found',
+      'invalid_request',
+      'decision_refresh_required',
+      'decision_capacity_exceeded',
+      'runtime_decision_unavailable',
+      'agentic_unsupported_surface',
+      'agentic_runtime_unavailable',
+      'agentic_preflight_failed',
+      'agentic_chat_busy',
+      'agentic_protocol_failure',
+      'agentic_work_exhausted',
+      'agentic_cancelled',
+      'agentic_timed_out',
+      'agentic_commit_failed',
+      'agentic_revision_conflict',
+      'agentic_provider_failure',
+      'agentic_internal_error',
+    ]
+    for (const locale of [en, fr, it, ja, zh, zhTW]) {
+      const errors = locale.agentRuntime.errors as Record<string, unknown>
+      expect(Object.keys(errors).sort()).toEqual([...expectedErrorKeys].sort())
+      for (const key of expectedErrorKeys) {
+        const label = errors[key]
+        expect(label).toBeString()
+        if (typeof label === 'string') expect(label.trim()).not.toBe('')
+      }
+    }
+  })
 })

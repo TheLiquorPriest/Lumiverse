@@ -28,7 +28,7 @@ import type {
   WorkspaceCommitReceiptV1,
   WorkspaceTerminalHandoffV1,
 } from "../types/turn-workspace";
-import type { AgentActivityNodeV1 } from "../types/agent-runtime";
+import type { AgentActivityNodeV1, AgentActivityUsageV1 } from "../types/agent-runtime";
 import {
   beginTurnCommit,
   failTurnCommit,
@@ -168,6 +168,8 @@ export interface AgenticCommitInputV1 extends AgenticDeltaAuthorizationV1 {
   /** Already-redacted ledger chronology; never contains work prose or payloads. */
   readonly activity?: readonly AgentActivityNodeV1[];
   readonly activityOmittedNodeCount?: number;
+  /** Host ledger usage; only toolCalls/childInvocations are projected. */
+  readonly activityUsage?: AgentActivityUsageV1;
   readonly artifacts?: readonly WorkspaceArtifactReferenceV1[];
   readonly workspaceId?: string;
   readonly workspaceRevision?: number;
@@ -213,6 +215,7 @@ const MAX_REVISION_MEMBERS = 256;
 const MAX_DELTA_COUNT = 512;
 const MAX_CONTENT_BYTES = 8 * 1024 * 1024;
 const MAX_UNRESOLVED_IDS = 256;
+const MAX_ACTIVITY_USAGE_COUNT = 1_000_000;
 const PRIVATE_KEY = /(?:transcript|carrier|reasoning|credential|secret|password|tool[_-]?(?:arg|argument|result|call|calls)|raw[_-]?(?:prompt|provider|response)|work[_-]?(?:prose|notes|transcript)|private[_-]?(?:body|content|state))/i;
 const SAFE_METADATA_KEYS: Record<string, true> = {
   last_generation_id: true,
@@ -453,9 +456,12 @@ function recheckInputRevisions(input: AgenticCommitInputV1, set: InputRevisionSe
     } catch {
       current = null;
     }
-    if (!current || !revisionEqual(member, current)) mismatches.push({ kind: member.kind, id: member.id });
+    if (!current || !revisionEqual(member, current)) mismatches.push({ kind: member.kind, id: member.id, expected: member.revision, current: current && "revision" in current ? current.revision : null });
   }
-  if (mismatches.length > 0) throw new AgenticCommitError("stale_input_revision", "one or more input revisions changed", { mismatches });
+  if (mismatches.length > 0) {
+    console.error(`[agentic] stale input revisions: ${JSON.stringify(mismatches)}`);
+    throw new AgenticCommitError("stale_input_revision", "one or more input revisions changed", { mismatches });
+  }
 }
 
 
@@ -578,6 +584,28 @@ function validateDeltaUniqueness(
     seen.add(digest);
   }
 }
+function boundedActivityCount(value: unknown, name: string): number {
+  if (value === undefined) return 0;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > MAX_ACTIVITY_USAGE_COUNT) {
+    throw new AgenticCommitError("invalid_input", `${name} is malformed`);
+  }
+  return value;
+}
+
+function validateActivityUsage(usage: AgentActivityUsageV1 | undefined): void {
+  if (usage === undefined) return;
+  if (!isJsonObject(usage)) throw new AgenticCommitError("invalid_input", "activity usage is malformed");
+  boundedActivityCount(usage.toolCalls, "activityUsage.toolCalls");
+  boundedActivityCount(usage.childInvocations, "activityUsage.childInvocations");
+}
+
+function projectionActivityCounts(input: AgenticCommitInputV1): { readonly toolCalls: number; readonly childInvocations: number } {
+  return {
+    toolCalls: boundedActivityCount(input.activityUsage?.toolCalls, "activityUsage.toolCalls"),
+    childInvocations: boundedActivityCount(input.activityUsage?.childInvocations, "activityUsage.childInvocations"),
+  };
+}
+
 
 
 export function prepareAgenticCommitV1(input: AgenticCommitInputV1): AgenticPreparedCommitV1 {
@@ -600,6 +628,7 @@ export function prepareAgenticCommitV1(input: AgenticCommitInputV1): AgenticPrep
   const assembleDeltas = input.assembleDeltas ?? input.assemblyPlan?.deltas ?? [];
   if (assembleDeltas.length > MAX_DELTA_COUNT) throw new AgenticCommitError("invalid_input", "assembly delta list exceeds limit");
   validateAssemblyDeltas(assembleDeltas);
+  validateActivityUsage(input.activityUsage);
   validateDeltaUniqueness(assembleDeltas, render);
   validateArtifactReferences(input);
   return Object.freeze({
@@ -1078,6 +1107,8 @@ function applyDeltas(db: Database, input: AgenticCommitInputV1, prepared: Agenti
   for (const raw of deltas) {
     const kind = deltaKind(raw);
     if (!kind) throw new AgenticCommitError("invalid_input", "commit delta is malformed");
+    if (kind === TARGET_RECONCILIATION_KIND) continue;
+    if (kind === "chat_metadata" && isTargetReconciliationDelta(input, raw as ChatMetadataDeltaV1)) continue;
     switch (kind) {
       case "macro_variable":
         assertDeltaExpectedRevision(input, db, raw, "macro_variables", undefined, tracker);
@@ -1095,8 +1126,6 @@ function applyDeltas(db: Database, input: AgenticCommitInputV1, prepared: Agenti
         assertDeltaExpectedRevision(input, db, raw, "world_lore", (raw as WorldInfoStateDeltaV1).entryId, tracker);
         break;
     }
-    if (kind === TARGET_RECONCILIATION_KIND) continue;
-    if (kind === "chat_metadata" && isTargetReconciliationDelta(input, raw as ChatMetadataDeltaV1)) continue;
     switch (kind) {
       case "macro_variable": applyMacro(db, input, raw as unknown as MacroVariableDeltaV1, metadata, now, tracker); break;
       case "source_message": applySource(db, input, raw as unknown as SourceMessageDeltaV1, now, tracker); break;
@@ -1386,12 +1415,13 @@ function projectionInput(
   swipeId: number | null,
   usage: RenderUsageV1,
 ): AgentRunProjectionInputV2 {
+  const activityCounts = projectionActivityCounts(input);
   const projectionUsage = {
     inputTokens: usage.promptTokens,
     outputTokens: usage.completionTokens,
     totalTokens: usage.totalTokens,
-    toolCalls: 0,
-    childInvocations: 0,
+    toolCalls: activityCounts.toolCalls,
+    childInvocations: activityCounts.childInvocations,
   };
   return {
     userId: input.userId,

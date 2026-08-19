@@ -114,6 +114,25 @@
       "refreshRequired": "L’exécution a changé avant le début de la génération. Vérifiez le mode et réessayez.",
       "unavailable": "Le mode agentique n’est pas prêt. Utilisez Réponse ou effectuez la correction indiquée."
     },
+    "errors": {
+      "not_found": "La cible d’exécution demandée est introuvable.",
+      "invalid_request": "La requête d’exécution est invalide.",
+      "decision_refresh_required": "La décision d’exécution est obsolète. Vérifiez le mode et réessayez.",
+      "decision_capacity_exceeded": "Trop de décisions d’exécution sont en attente. Réessayez bientôt.",
+      "runtime_decision_unavailable": "Le service de décision d’exécution est indisponible.",
+      "agentic_unsupported_surface": "Cette surface de génération nécessite le mode Réponse.",
+      "agentic_runtime_unavailable": "L’exécution agentique est indisponible. Utilisez le mode Réponse.",
+      "agentic_preflight_failed": "La vérification agentique a échoué. Utilisez Réponse ou vérifiez la configuration.",
+      "agentic_chat_busy": "Une exécution agentique est déjà en cours dans cette discussion.",
+      "agentic_protocol_failure": "La réponse du protocole agentique est invalide.",
+      "agentic_work_exhausted": "Le budget de travail agentique est épuisé.",
+      "agentic_cancelled": "L’exécution agentique a été annulée.",
+      "agentic_timed_out": "L’exécution agentique a expiré.",
+      "agentic_commit_failed": "Le résultat agentique n’a pas pu être validé.",
+      "agentic_revision_conflict": "L’exécution a changé avant la validation du résultat agentique.",
+      "agentic_provider_failure": "La requête au modèle agentique a échoué.",
+      "agentic_internal_error": "Une erreur interne est survenue dans l’exécution agentique."
+    },
     "stop": {
       "stop": "Arrêter l’exécution",
       "locating": "Préparation de l’arrêt exact…",

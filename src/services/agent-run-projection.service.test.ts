@@ -221,6 +221,66 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     }
   });
 
+  test("projects executed WORK tool and child counts without private payloads", () => {
+    seedChat(OWNER, "chat-work-usage");
+    seedRun(OWNER, "chat-work-usage", "turn-work-usage");
+    const result = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-work-usage", "turn-work-usage"),
+      status: "COMMITTED",
+      activity: [
+        {
+          id: "root",
+          parentId: null,
+          kind: "root",
+          actor: "root",
+          phase: "COMMITTED",
+          status: "completed",
+          startedAt: 1,
+          elapsedMs: 2,
+        },
+        {
+          id: "tool-a",
+          parentId: "root",
+          kind: "tool",
+          actor: "tool",
+          phase: "WORK",
+          status: "completed",
+          startedAt: 1,
+          elapsedMs: 1,
+          toolId: "chat_search_history",
+          prose: "private work prose",
+          arguments: { query: "secret" },
+          result: "private result",
+        },
+        {
+          id: "child-a",
+          parentId: "root",
+          kind: "child",
+          actor: "child",
+          phase: "WORK",
+          status: "completed",
+          startedAt: 1,
+          elapsedMs: 1,
+          profileId: "writer",
+        },
+      ],
+      usage: { inputTokens: 17, outputTokens: 3, totalTokens: 20, toolCalls: 2, childInvocations: 1 },
+    }));
+    expect(result.run.usage).toEqual({
+      inputTokens: 17,
+      outputTokens: 3,
+      totalTokens: 20,
+      toolCalls: 2,
+      childInvocations: 1,
+    });
+    const encoded = JSON.stringify(result.run);
+    expect(encoded).not.toContain("private work prose");
+    expect(encoded).not.toContain("secret");
+    expect(encoded).not.toContain("private result");
+    expect(result.run.activity.map((node) => node.kind)).toEqual(["root", "tool", "child"]);
+  });
+
+
   test("replays only after an authenticated reconnect subscriber accepts delivery", async () => {
     seedChat(OWNER, "chat-replay");
     seedRun(OWNER, "chat-replay", "turn-replay");
@@ -707,6 +767,76 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(getAgentRun(OWNER, "turn-stale-swipe")).toBeNull();
   });
 
+  test("allows regenerate snapshots to target the append swipe slot", () => {
+    seedChat(OWNER, "chat-append-swipe");
+    seedChat(OTHER, "chat-foreign-append");
+    seedRun(OWNER, "chat-append-swipe", "turn-append-regenerate");
+    seedRun(OWNER, "chat-append-swipe", "turn-append-swipe");
+    seedRun(OWNER, "chat-append-swipe", "turn-append-beyond");
+    seedRun(OWNER, "chat-append-swipe", "turn-append-foreign");
+    seedRun(OWNER, "chat-append-swipe", "turn-append-normal");
+    getDb().query(
+      `INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, swipes)
+       VALUES ('message-append', 'chat-append-swipe', 0, 0, 'assistant', 'safe', '["swipe-0"]')`,
+    ).run();
+    getDb().query(
+      `INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, swipes)
+       VALUES ('message-foreign', 'chat-foreign-append', 0, 0, 'assistant', 'safe', '["swipe-0"]')`,
+    ).run();
+
+    const appended = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-append-swipe", "turn-append-regenerate"),
+      generationType: "regenerate",
+      status: "ASSEMBLE",
+      targetMessageId: "message-append",
+      targetSwipeId: 1,
+    }));
+    expect(appended.changed).toBe(true);
+    expect(appended.run.target).toEqual({ messageId: "message-append", swipeId: 1 });
+    expect(getAgentRun(OWNER, "turn-append-regenerate")?.target?.swipeId).toBe(1);
+
+    const coerced = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-append-swipe", "turn-append-swipe"),
+      generationType: "swipe",
+      status: "ASSEMBLE",
+      targetMessageId: "message-append",
+      targetSwipeId: "1" as unknown as number,
+    }));
+    expect(coerced.run.target?.swipeId).toBe(1);
+
+    expect(() => withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-append-swipe", "turn-append-normal"),
+      generationType: "normal",
+      status: "ASSEMBLE",
+      targetMessageId: "message-append",
+      targetSwipeId: 1,
+    }))).toThrow("agent run projection ownership mismatch");
+
+    expect(() => withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-append-swipe", "turn-append-beyond"),
+      generationType: "regenerate",
+      status: "ASSEMBLE",
+      targetMessageId: "message-append",
+      targetSwipeId: Number.NaN,
+    }))).toThrow("agent run target association mismatch");
+
+
+    expect(() => withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-append-swipe", "turn-append-beyond"),
+      generationType: "regenerate",
+      status: "ASSEMBLE",
+      targetMessageId: "message-append",
+      targetSwipeId: 2,
+    }))).toThrow("agent run projection ownership mismatch");
+
+    expect(() => withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-append-swipe", "turn-append-foreign"),
+      generationType: "regenerate",
+      status: "ASSEMBLE",
+      targetMessageId: "message-foreign",
+      targetSwipeId: 1,
+    }))).toThrow("agent run projection ownership mismatch");
+  });
   test("dispatches live Stop to the registered cancellation owner", () => {
     seedChat(OWNER, "chat-live-stop");
     seedRun(OWNER, "chat-live-stop", "turn-live-stop");

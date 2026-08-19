@@ -114,6 +114,25 @@
       "refreshRequired": "生成开始前运行时已发生变化。请检查模式后重试。",
       "unavailable": "智能体模式尚未就绪。请使用响应模式或完成列出的修复。"
     },
+    "errors": {
+      "not_found": "找不到请求的运行时目标。",
+      "invalid_request": "运行时请求无效。",
+      "decision_refresh_required": "运行时决策已过期。请检查模式后重试。",
+      "decision_capacity_exceeded": "待处理的运行时决策过多，请稍后重试。",
+      "runtime_decision_unavailable": "运行时决策服务不可用。",
+      "agentic_unsupported_surface": "此生成界面需要使用响应模式。",
+      "agentic_runtime_unavailable": "智能体运行时不可用，请使用响应模式。",
+      "agentic_preflight_failed": "智能体预检失败。请使用响应模式或检查运行时设置。",
+      "agentic_chat_busy": "此聊天已有智能体运行正在进行。",
+      "agentic_protocol_failure": "智能体协议响应无效。",
+      "agentic_work_exhausted": "智能体工作预算已用尽。",
+      "agentic_cancelled": "智能体运行已取消。",
+      "agentic_timed_out": "智能体运行已超时。",
+      "agentic_commit_failed": "无法提交智能体结果。",
+      "agentic_revision_conflict": "运行时在提交智能体结果前发生了变化。",
+      "agentic_provider_failure": "智能体模型请求失败。",
+      "agentic_internal_error": "智能体运行时发生内部错误。"
+    },
     "stop": {
       "stop": "停止运行",
       "locating": "正在准备精确停止控制…",

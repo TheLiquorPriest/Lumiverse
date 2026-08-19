@@ -19,6 +19,7 @@ import {
   measureJsonValue,
   utf8ByteLength,
 } from "./agent-runtime-accounting";
+import { resolveCounter } from "./tokenizer.service";
 import type { ContextPackCandidateSnapshotV1 } from "./agent-context-tools.service";
 import type {
   GenerationResponse,
@@ -119,6 +120,8 @@ export type AgenticWorkErrorCode =
   | "provider_protocol_error"
   | "cancelled"
   | "timed_out"
+  | "not_found"
+  | "conflict"
   | "internal_error";
 
 export class AgenticWorkPhaseError extends Error {
@@ -167,7 +170,9 @@ const MAX_ROOT_COMPLETION_ATTEMPTS = 32;
 const MAX_ROOT_UNSIGNED_BOUNDARIES = 32;
 const MAX_ROOT_OBSERVATIONS = 2_048;
 const MAX_CHILD_FRAMES = 1_024;
-const MAX_CHILD_OUTPUT_BYTES = 1 * 1024 * 1024;
+export const MAX_CHILD_OUTPUT_BYTES = 1 * 1024 * 1024;
+export const MAX_CHILD_RECEIVE_BYTES = 8 * 1024 * 1024;
+export const MAX_ROOT_RECEIVE_BYTES = 8 * 1024 * 1024;
 const CHILD_FAILURE_PLACEHOLDER = "[child result unavailable]";
 const MAX_CHILD_ROUNDS = 64;
 
@@ -213,12 +218,14 @@ export interface AgenticWorkBudget {
   readonly maxCompletionAttempts?: number;
   readonly maxUnsignedBoundaries?: number;
   readonly maxWorkOutputBytes?: number;
+  readonly maxRootReceiveBytes?: number;
   readonly maxOutputTokens?: number;
   readonly maxToolResultBytes?: number;
   readonly maxArgumentBytes?: number;
   readonly maxObservations?: number;
   readonly maxChildFrames?: number;
   readonly maxChildOutputBytes?: number;
+  readonly maxChildReceiveBytes?: number;
   readonly maxChildRounds?: number;
 }
 
@@ -230,12 +237,14 @@ export interface NormalizedAgenticWorkBudget {
   readonly maxCompletionAttempts: number;
   readonly maxUnsignedBoundaries: number;
   readonly maxWorkOutputBytes: number;
+  readonly maxRootReceiveBytes: number;
   readonly maxOutputTokens: number;
   readonly maxToolResultBytes: number;
   readonly maxArgumentBytes: number;
   readonly maxObservations: number;
   readonly maxChildFrames: number;
   readonly maxChildOutputBytes: number;
+  readonly maxChildReceiveBytes: number;
   readonly maxChildRounds: number;
 }
 
@@ -250,8 +259,10 @@ export function normalizeAgenticWorkBudget(
 ): NormalizedAgenticWorkBudget {
   for (const [name, value] of [
     ["maxWorkOutputBytes", requested.maxWorkOutputBytes],
+    ["maxRootReceiveBytes", requested.maxRootReceiveBytes],
     ["maxOutputTokens", requested.maxOutputTokens],
     ["maxChildOutputBytes", requested.maxChildOutputBytes],
+    ["maxChildReceiveBytes", requested.maxChildReceiveBytes],
   ] as const) {
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
       throw new AgenticWorkPhaseError("invalid_input", `${name} must be a positive safe integer`);
@@ -265,6 +276,11 @@ export function normalizeAgenticWorkBudget(
     maxCompletionAttempts: positiveInteger(requested.maxCompletionAttempts, 8, MAX_ROOT_COMPLETION_ATTEMPTS),
     maxUnsignedBoundaries: positiveInteger(requested.maxUnsignedBoundaries, 4, MAX_ROOT_UNSIGNED_BOUNDARIES),
     maxWorkOutputBytes: positiveInteger(requested.maxWorkOutputBytes, MAX_WORK_NOTE_BYTES, MAX_WORK_NOTE_BYTES),
+    maxRootReceiveBytes: positiveInteger(
+      requested.maxRootReceiveBytes ?? requested.maxWorkOutputBytes,
+      MAX_ROOT_RECEIVE_BYTES,
+      MAX_ROOT_RECEIVE_BYTES,
+    ),
     maxOutputTokens: positiveInteger(
       requested.maxOutputTokens,
       conservativeOutputTokenBudget(requested.maxWorkOutputBytes ?? MAX_WORK_NOTE_BYTES),
@@ -275,6 +291,11 @@ export function normalizeAgenticWorkBudget(
     maxObservations: positiveInteger(requested.maxObservations, 512, MAX_ROOT_OBSERVATIONS),
     maxChildFrames: positiveInteger(requested.maxChildFrames, 64, MAX_CHILD_FRAMES),
     maxChildOutputBytes: positiveInteger(requested.maxChildOutputBytes, MAX_CHILD_OUTPUT_BYTES, MAX_CHILD_OUTPUT_BYTES),
+    maxChildReceiveBytes: positiveInteger(
+      requested.maxChildReceiveBytes,
+      MAX_CHILD_RECEIVE_BYTES,
+      MAX_CHILD_RECEIVE_BYTES,
+    ),
     maxChildRounds: positiveInteger(requested.maxChildRounds, 16, MAX_CHILD_ROUNDS),
   });
 }
@@ -858,6 +879,10 @@ export interface AgenticWorkspaceCapability {
   readonly assignChildTasks?: (
     input: AgenticWorkspaceChildAssignmentInput,
   ) => AgenticWorkspaceChildAssignmentResult | Promise<AgenticWorkspaceChildAssignmentResult>;
+  /** Enumerate currently open workspace tasks before child reservation. */
+  readonly listOpenTasks?: (
+    context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
+  ) => readonly unknown[] | Promise<readonly unknown[]>;
   /** Read the deterministic projection from the exact workspace revision. */
   readonly projectContext?: (
     input: { readonly frame: AgenticWorkFrame; readonly expectedRevision?: number; readonly signal: AbortSignal },
@@ -1003,6 +1028,8 @@ export interface AgenticWorkOptions {
   readonly workspaceUsageMessages?: readonly AssemblyProviderMessageV1[];
   readonly completionCriteriaMessages?: readonly AssemblyProviderMessageV1[];
   readonly renderPolicyMessages?: readonly AssemblyProviderMessageV1[];
+  /** Test seam. Production resolves the model tokenizer. */
+  readonly countTokens?: (text: string) => number;
 }
 
 export interface AgenticChildResultMetadata {
@@ -1324,10 +1351,23 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
   }
 }
 
+async function workTokenCounter(
+  model: string,
+  override?: (text: string) => number,
+): Promise<(text: string) => number> {
+  if (override) return override;
+  try {
+    return (await resolveCounter(model)).count;
+  } catch {
+    return (text) => (text ? Math.ceil(text.length / 4) : 0);
+  }
+}
+
 function accountProviderResponse(
   response: GenerationResponse,
   receiveLimitBytes: number,
   maxOutputTokens: number,
+  options: { tokenBasis?: "all" | "published_content"; countTokens?: (text: string) => number } = {},
 ): ProviderResponseAccounting {
   if (!response || typeof response !== "object" || typeof response.content !== "string") {
     throw new AgenticWorkPhaseError("provider_protocol_error", "Provider response content is malformed");
@@ -1391,17 +1431,21 @@ function accountProviderResponse(
   }
   let outputTokens: number;
   try {
-    const settlement = evaluateOutputTokens(
-      response.usage,
-      {
+    const tokenResponse = options.tokenBasis === "published_content"
+      ? { content: response.content, finish_reason: response.finish_reason } as GenerationResponse
+      : {
         content: response.content,
         finish_reason: response.finish_reason,
         ...(response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
         ...(response.tool_calls === undefined ? {} : { tool_calls: response.tool_calls }),
         ...(response.thinking_blocks === undefined ? {} : { thinking_blocks: response.thinking_blocks }),
         ...(response.reasoning_details === undefined ? {} : { reasoning_details: response.reasoning_details }),
-      },
+      };
+    const settlement = evaluateOutputTokens(
+      options.tokenBasis === "published_content" ? undefined : response.usage,
+      tokenResponse,
       maxOutputTokens,
+      { countTokens: options.countTokens },
     );
     if (settlement.failure) {
       if (settlement.failure.code === "provider_protocol_error") {
@@ -2462,6 +2506,159 @@ class WorkBudgetState {
   reserveChildIds(ids: readonly string[]): boolean {
     return this.reserveChildBatch(0, ids);
   }
+
+  releaseChildBatch(count: number, ids: readonly string[] = []): boolean {
+    if (!Number.isSafeInteger(count) || count < 0 || this.childFrames < count) return false;
+    const uniqueIds = new Set(ids);
+    if (uniqueIds.size !== ids.length || ids.some((id) => !this.reservedChildIds.has(id))) return false;
+    this.childFrames -= count;
+    for (const id of uniqueIds) this.reservedChildIds.delete(id);
+    return true;
+  }
+}
+
+interface OpenAssignableTask {
+  readonly id: string;
+  readonly assignable: boolean;
+  readonly conflict: boolean;
+}
+
+const WORKSPACE_ASSIGNMENT_CONFLICT_CODES: Record<string, true> = {
+  conflict: true,
+  task_assignment_conflict: true,
+  stale_revision: true,
+  duplicate_id: true,
+};
+
+function workspaceErrorCode(error: unknown): string | undefined {
+  if (error instanceof AgenticWorkPhaseError) return error.code;
+  if (isRecord(error) && typeof error.code === "string" && error.code.length > 0) return error.code;
+  return undefined;
+}
+
+function mapWorkspaceAssignmentError(error: unknown): AgenticWorkErrorCode {
+  const code = workspaceErrorCode(error);
+  if (code === "not_found") return "not_found";
+  if (code !== undefined && WORKSPACE_ASSIGNMENT_CONFLICT_CODES[code]) return "conflict";
+  if (code === "quota_exceeded" || code === "workspace_budget_exhausted") return "workspace_budget_exhausted";
+  if (code === "cancelled" || code === "timed_out") return code;
+  if (error instanceof AgenticWorkPhaseError) return error.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (/(?:^|\b)not found(?:\b|$)/i.test(message)) return "not_found";
+  if (/\b(?:conflict|already assigned|stale)\b/i.test(message)) return "conflict";
+  return "internal_error";
+}
+
+function parseOpenAssignableTask(value: unknown): OpenAssignableTask | undefined {
+  if (typeof value === "string") {
+    if (!value) return undefined;
+    return { id: value, assignable: true, conflict: false };
+  }
+  if (!isRecord(value)) return undefined;
+  const id = typeof value.id === "string" && value.id
+    ? value.id
+    : typeof value.taskId === "string" && value.taskId
+      ? value.taskId
+      : typeof value.task_id === "string" && value.task_id
+        ? value.task_id
+        : "";
+  if (!id) return undefined;
+  const state = typeof value.state === "string" ? value.state : undefined;
+  const assignedFrameId = value.assignedFrameId === null || value.assignedFrameId === undefined
+    ? null
+    : typeof value.assignedFrameId === "string"
+      ? value.assignedFrameId
+      : undefined;
+  const conflict = typeof assignedFrameId === "string" && assignedFrameId.length > 0;
+  return { id, assignable: state !== "submitted" && !conflict, conflict };
+}
+
+function publicWorkspaceExecuteResult(value: unknown): unknown {
+  if (!isRecord(value) || !Object.prototype.hasOwnProperty.call(value, "result")) return value;
+  const keys = Object.keys(value);
+  if (keys.some((key) => key !== "result" && key !== "cognition")) return value;
+  return value.result;
+}
+
+function workspaceTaskItems(value: unknown): readonly unknown[] | undefined {
+  const publicResult = publicWorkspaceExecuteResult(value);
+  if (Array.isArray(publicResult)) return publicResult;
+  if (isRecord(publicResult) && Array.isArray(publicResult.items)) return publicResult.items;
+  if (isRecord(publicResult) && Array.isArray(publicResult.tasks)) return publicResult.tasks;
+  return undefined;
+}
+
+function workspaceTaskPageTotal(value: unknown): number | undefined {
+  const publicResult = publicWorkspaceExecuteResult(value);
+  if (!isRecord(publicResult) || !Number.isSafeInteger(publicResult.total) || (publicResult.total as number) < 0) {
+    return undefined;
+  }
+  return publicResult.total as number;
+}
+
+function parseOpenAssignableTaskInventory(value: unknown): Map<string, OpenAssignableTask> | undefined {
+  const items = Array.isArray(value)
+    ? value
+    : isRecord(value) && Array.isArray(value.items)
+      ? value.items
+      : isRecord(value) && Array.isArray(value.tasks)
+        ? value.tasks
+        : undefined;
+  if (!items) return undefined;
+  const tasks = new Map<string, OpenAssignableTask>();
+  for (const item of items) {
+    const parsed = parseOpenAssignableTask(item);
+    if (!parsed || tasks.has(parsed.id)) continue;
+    tasks.set(parsed.id, parsed);
+  }
+  return tasks;
+}
+
+async function readOpenAssignableTasks(
+  workspace: AgenticWorkspaceCapability,
+  frame: AgenticWorkFrame,
+  signal: AbortSignal,
+): Promise<ReadonlyMap<string, OpenAssignableTask> | undefined> {
+  workspace.authenticateFrame?.(frame);
+  if (workspace.listOpenTasks) {
+    const listed = await abortable(Promise.resolve(workspace.listOpenTasks({ frame, signal })), signal);
+    return parseOpenAssignableTaskInventory(listed) ?? new Map();
+  }
+  if (!workspace.execute) return undefined;
+  try {
+    const pageSize = 100;
+    const tasks = new Map<string, OpenAssignableTask>();
+    let page = 0;
+    let total = Number.POSITIVE_INFINITY;
+    while (page < 32 && tasks.size < total) {
+      const operation = page === 0 ? "read_section" as const : "read_page" as const;
+      const raw = await abortable(Promise.resolve(workspace.execute(operation, {
+        section: "tasks",
+        page,
+        pageSize,
+      }, {
+        actor: frame.kind,
+        frame,
+        operation,
+        signal,
+      })), signal);
+      const items = workspaceTaskItems(raw);
+      if (!items) return tasks;
+      const pageTotal = workspaceTaskPageTotal(raw);
+      if (pageTotal !== undefined) total = pageTotal;
+      const inventory = parseOpenAssignableTaskInventory(items) ?? new Map();
+      if (inventory.size === 0) break;
+      for (const [id, task] of inventory) {
+        if (!tasks.has(id)) tasks.set(id, task);
+      }
+      page += 1;
+      if (items.length < pageSize) break;
+    }
+    return tasks;
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return new Map();
+  }
 }
 
 function workspaceGateBlocked(gates: AgenticWorkspaceCompletionGates): boolean {
@@ -2703,6 +2900,24 @@ function makeOutcome(
   }
   return Object.freeze(outcome);
 }
+function requiredChildFailure(status: string, errorCode?: string): AgenticWorkErrorCode {
+  if (status === "cancelled" || errorCode === "cancelled") return "cancelled";
+  if (status === "timed_out" || errorCode === "timed_out") return "timed_out";
+  if (
+    errorCode === "provider_error"
+    || errorCode === "provider_protocol_error"
+    || errorCode === "child_output_limit_exceeded"
+    || errorCode === "child_executor_unavailable"
+    || errorCode === "child_schedule_invalid"
+    || errorCode === "child_required_failed"
+    || errorCode === "work_budget_exhausted"
+    || errorCode === "provider_round_budget_exhausted"
+    || errorCode === "limit_exceeded"
+    || errorCode === "invalid_input"
+    || errorCode === "tool_not_allowed"
+  ) return errorCode;
+  return "child_required_failed";
+}
 
 async function executeChildSchedule(
   plan: AssemblyPlanV1,
@@ -2788,7 +3003,8 @@ async function executeChildSchedule(
       }
       if (status === "cancelled" || status === "timed_out" || status === "failed") {
         if (descriptor.required) {
-          const failure = status === "cancelled" ? "cancelled" : status === "timed_out" ? "timed_out" : "child_required_failed";
+          const failure = requiredChildFailure(status, errorCode);
+          console.error(`[agentic] required child ${descriptor.profileId} failed (${errorCode ?? status} → ${failure})`);
           return {
             results,
             metadata: [...metadata, { childId: descriptor.childId, profileId: descriptor.profileId, slotIndex: descriptor.slotIndex, required: descriptor.required, status, outputBytes: 0, ...(errorCode ? { errorCode } : {}) }],
@@ -2803,6 +3019,7 @@ async function executeChildSchedule(
         outputBytes > state.limits.maxChildOutputBytes ||
         state.childOutputBytes + outputBytes > state.limits.maxChildOutputBytes
       ) {
+        console.error(`[agentic] child ${descriptor.profileId} published ${outputBytes} bytes over cap ${descriptor.maxOutputBytes}/${state.limits.maxChildOutputBytes}`);
         status = "failed";
         errorCode = "child_output_limit_exceeded";
         content = "";
@@ -2810,7 +3027,7 @@ async function executeChildSchedule(
           return {
             results,
             metadata: [...metadata, { childId: descriptor.childId, profileId: descriptor.profileId, slotIndex: descriptor.slotIndex, required: descriptor.required, status, outputBytes: 0, errorCode }],
-            failure: "child_required_failed",
+            failure: requiredChildFailure("failed", errorCode),
           };
         }
       } else {
@@ -2822,7 +3039,8 @@ async function executeChildSchedule(
       errorCode = error instanceof AgenticWorkPhaseError ? error.code : "child_required_failed";
       content = CHILD_FAILURE_PLACEHOLDER;
       if (descriptor.required) {
-        const failure = status === "cancelled" ? "cancelled" : status === "timed_out" ? "timed_out" : "child_required_failed";
+        const failure = requiredChildFailure(status, errorCode);
+        console.error(`[agentic] required child ${descriptor.profileId} threw (${errorCode ?? status} → ${failure})`);
         return {
           results,
           metadata: [...metadata, { childId: descriptor.childId, profileId: descriptor.profileId, slotIndex: descriptor.slotIndex, required: descriptor.required, status, outputBytes: 0, ...(errorCode ? { errorCode } : {}) }],
@@ -2857,6 +3075,8 @@ export interface BoundedChildFrameOptions {
   readonly executeCore?: AgenticCoreToolCapability;
   readonly workspace?: AgenticWorkspaceCapability;
   readonly budget?: AgenticWorkBudget;
+  /** Test seam. Production resolves the model tokenizer. */
+  readonly countTokens?: (text: string) => number;
 }
 
 export interface BoundedChildFrameOutcome {
@@ -2930,16 +3150,18 @@ export async function executeBoundedAgenticChildFrame(
     { role: "user", content: task },
   ];
   let output = "";
+  let emptyPublishRetries = 0;
   let providerTransientCarrier: ProviderTransientCarrier | undefined;
   let pendingBatchCalls: readonly ToolCallResult[] | undefined;
   let pendingBatchObservationStart = 0;
+  const countTokens = await workTokenCounter(options.frame.model, options.countTokens);
   try {
     for (;;) {
       if (!state.reserveChildRound()) {
         return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "provider_round_budget_exhausted" });
       }
       if (options.frame.signal.aborted) return childOutcome({ status: signalStatus(options.frame.signal), content: "", observations, providerRoundCount: state.providerRounds, code: signalStatus(options.frame.signal) });
-      const receiveLimitBytes = state.remainingReceiveBytes(state.limits.maxChildOutputBytes);
+      const receiveLimitBytes = state.remainingReceiveBytes(state.limits.maxChildReceiveBytes);
       const maxOutputTokens = state.remainingOutputTokens(state.limits.maxOutputTokens);
       if (receiveLimitBytes <= 0 || maxOutputTokens <= 0) {
         return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_output_limit_exceeded" });
@@ -2968,9 +3190,11 @@ export async function executeBoundedAgenticChildFrame(
           response,
           receiveLimitBytes,
           maxOutputTokens,
+          { tokenBasis: "published_content", countTokens },
         );
       } catch (error) {
         const code = error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error";
+        console.error(`[agentic] child accounting failed (${code}): ${error instanceof Error ? error.message : String(error)}`);
         return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code });
       }
       if (!accounting.privateFieldsReadable) {
@@ -2983,17 +3207,40 @@ export async function executeBoundedAgenticChildFrame(
         return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_output_limit_exceeded" });
       }
       if (typeof response.content !== "string") return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "provider_protocol_error" });
-      providerTransientCarrier = mergeResponseProviderCarrier(providerTransientCarrier, assertKnownProviderCarrier(response.providerTransientCarrier));
+      try {
+        providerTransientCarrier = mergeResponseProviderCarrier(providerTransientCarrier, assertKnownProviderCarrier(response.providerTransientCarrier));
+      } catch (error) {
+        const code = error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error";
+        console.error(`[agentic] child carrier failed (${code}): ${error instanceof Error ? error.message : String(error)}`);
+        return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code });
+      }
       const calls = response.tool_calls ?? [];
       if (calls.length === 0) {
         const nextOutputBytes = boundedBytes(output) + boundedBytes(response.content);
-        if (nextOutputBytes > state.limits.maxChildOutputBytes) return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_output_limit_exceeded" });
-        if (nextOutputBytes === 0) return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_required_failed" });
+        if (nextOutputBytes > state.limits.maxChildOutputBytes) {
+          console.error(`[agentic] child frame content ${nextOutputBytes} bytes exceeds published cap ${state.limits.maxChildOutputBytes}`);
+          return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_output_limit_exceeded" });
+        }
+        if (nextOutputBytes === 0) {
+          const reasoningBytes = typeof response.reasoning === "string" ? utf8ByteLength(response.reasoning) : 0;
+          console.error(`[agentic] child published 0 bytes finish=${response.finish_reason} reasoningBytes=${reasoningBytes} retry=${emptyPublishRetries}`);
+          if (emptyPublishRetries < 1) {
+            emptyPublishRetries += 1;
+            const nudge: LlmMessage = { role: "user", content: "Your previous reply had no published content. Publish the assigned task result now as plain text." };
+            if (providerTransientCarrier?.kind === "openai_responses") {
+              providerTransientCarrier = appendNativeInputMessages(providerTransientCarrier, [nudge]);
+            } else {
+              messages.push({ role: "assistant", content: response.content }, nudge);
+            }
+            continue;
+          }
+          return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_required_failed" });
+        }
         output += response.content;
         return childOutcome({ status: "succeeded", content: output, observations, providerRoundCount: state.providerRounds });
       }
       const validation = validateCalls(calls, options.frame, definitions, state.limits.maxArgumentBytes);
-      if (!state.reserveBatch(calls, Math.min(state.limits.maxToolResultBytes, state.limits.maxChildOutputBytes), state.limits.maxChildOutputBytes)) return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "work_budget_exhausted" });
+      if (!state.reserveBatch(calls, Math.min(state.limits.maxToolResultBytes, state.limits.maxChildReceiveBytes), state.limits.maxChildReceiveBytes)) return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "work_budget_exhausted" });
       pendingBatchCalls = calls;
       pendingBatchObservationStart = observations.length;
       const serializedResults: string[] = [];
@@ -3054,7 +3301,7 @@ export async function executeBoundedAgenticChildFrame(
         } catch {
           throw new AgenticWorkPhaseError("tool_result_limit_exceeded");
         }
-        if (!state.reserveToolResult(resultBytes, state.limits.maxChildOutputBytes)) {
+        if (!state.reserveToolResult(resultBytes, state.limits.maxChildReceiveBytes)) {
           throw new AgenticWorkPhaseError("tool_result_limit_exceeded");
         }
         serializedResults.push(serialized);
@@ -3089,7 +3336,9 @@ export async function executeBoundedAgenticChildFrame(
       pendingBatchCalls = undefined;
     }
     if (options.frame.signal.aborted) return childOutcome({ status: signalStatus(options.frame.signal), content: "", observations, providerRoundCount: state.providerRounds, code: signalStatus(options.frame.signal) });
-    return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: providerFailureCode(error) });
+    const code = providerFailureCode(error);
+    console.error(`[agentic] child frame threw (${code}): ${error instanceof Error ? error.message : String(error)}`);
+    return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code });
   }
 }
 
@@ -3788,6 +4037,7 @@ export async function runAgenticWorkPhase(
     }, signal);
     const turnRootFrameId = ensureBoundedString(options.rootFrameId, MAX_FRAME_ID_BYTES, "rootFrameId");
     const rootModel = ensureBoundedString(options.model, MAX_PROVIDER_MODEL_BYTES, "model");
+    const countTokens = await workTokenCounter(rootModel, options.countTokens);
     const rootConnectionId = options.connectionId === null
       ? null
       : ensureBoundedString(options.connectionId, MAX_FRAME_ID_BYTES, "connectionId");
@@ -3859,9 +4109,10 @@ export async function runAgenticWorkPhase(
       if (!state.reserveProviderRound()) {
         return makeOutcome("exhausted", state, observations, childResults, "provider_round_budget_exhausted");
       }
-      const receiveLimitBytes = state.remainingReceiveBytes(limits.maxWorkOutputBytes);
+      const receiveLimitBytes = state.remainingReceiveBytes(limits.maxRootReceiveBytes);
       const maxOutputTokens = state.remainingOutputTokens(limits.maxOutputTokens);
       if (receiveLimitBytes <= 0 || maxOutputTokens <= 0) {
+        console.error(`[agentic] root WORK remaining exhausted receive=${receiveLimitBytes} tokens=${maxOutputTokens}`);
         return makeOutcome("exhausted", state, observations, childResults, "child_output_limit_exceeded");
       }
       let response: GenerationResponse;
@@ -3885,7 +4136,9 @@ export async function runAgenticWorkPhase(
           const status = signalStatus(signal);
           return makeOutcome(status, state, observations, childResults, status);
         }
-        return makeOutcome("failed", state, observations, childResults, providerFailureCode(error));
+        const code = providerFailureCode(error);
+        console.error(`[agentic] root WORK dispatch failed (${code}): ${error instanceof Error ? error.message : String(error)}`);
+        return makeOutcome("failed", state, observations, childResults, code);
       }
       if (signal.aborted) {
         const status = signalStatus(signal);
@@ -3893,20 +4146,24 @@ export async function runAgenticWorkPhase(
       }
       let accounting: ProviderResponseAccounting;
       try {
-        accounting = accountProviderResponse(response, receiveLimitBytes, maxOutputTokens);
+        accounting = accountProviderResponse(response, receiveLimitBytes, maxOutputTokens, { tokenBasis: "published_content", countTokens });
       } catch (error) {
+        const code = error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error";
+        console.error(`[agentic] root WORK accounting failed (${code}): ${error instanceof Error ? error.message : String(error)}`);
         return makeOutcome(
           "failed",
           state,
           observations,
           childResults,
-          error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error",
+          code,
         );
       }
       if (!state.reserveProviderResponse(accounting.totalBytes, receiveLimitBytes)) {
+        console.error(`[agentic] root WORK reserve bytes failed: ${accounting.totalBytes} vs ${receiveLimitBytes}`);
         return makeOutcome("failed", state, observations, childResults, "child_output_limit_exceeded");
       }
       if (!state.reserveProviderTokens(accounting.outputTokens, maxOutputTokens)) {
+        console.error(`[agentic] root WORK reserve tokens failed: ${accounting.outputTokens} vs ${maxOutputTokens}`);
         return makeOutcome("failed", state, observations, childResults, "child_output_limit_exceeded");
       }
       if (!accounting.privateFieldsReadable && (response.tool_calls?.length ?? 0) === 0) {
@@ -3943,7 +4200,7 @@ export async function runAgenticWorkPhase(
       const hasCompletion = calls.some((call) => call.name === COMPLETE_TURN_TOOL);
       const completionCriteria = hasCompletion ? materializeCompletionCriteriaMessages(plan, options) : [];
       if (hasCompletion && calls.length !== 1) {
-        if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxWorkOutputBytes)) {
+        if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes)) {
           appendBoundedBatchFailureObservations(state, observations, calls, "completion_control_budget_exhausted");
           return makeOutcome("exhausted", state, observations, childResults, "completion_control_budget_exhausted");
         }
@@ -3956,7 +4213,7 @@ export async function runAgenticWorkPhase(
           serializedResults.push(JSON.stringify(resultError("completion_mixed_batch")));
         }
         for (const serialized of serializedResults) {
-          if (!state.reserveToolResult(utf8ByteLength(serialized), limits.maxWorkOutputBytes)) {
+          if (!state.reserveToolResult(utf8ByteLength(serialized), limits.maxRootReceiveBytes)) {
             pendingBatchCalls = undefined;
             return makeOutcome("failed", state, observations, childResults, "tool_result_limit_exceeded");
           }
@@ -3973,7 +4230,7 @@ export async function runAgenticWorkPhase(
         pendingBatchCalls = undefined;
         continue;
       }
-      if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxWorkOutputBytes)) {
+      if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes)) {
         appendBoundedBatchFailureObservations(state, observations, calls, "batch_reservation_failed");
         return makeOutcome("exhausted", state, observations, childResults, "batch_reservation_failed");
       }
@@ -4011,6 +4268,7 @@ export async function runAgenticWorkPhase(
         const hasProgress = workspaceCapabilities.includes("update_assigned_progress");
         const hasSubmission = workspaceCapabilities.includes("submit_child_result");
         if (!hasProgress || !hasSubmission) {
+          console.error(`[agentic] root rejected delegate ${profileId}: missing assigned workspace ops`);
           delegateFailures.set(call.call_id, "child_schedule_invalid");
           continue;
         }
@@ -4046,6 +4304,44 @@ export async function runAgenticWorkPhase(
           ));
         }
         return makeOutcome("failed", state, observations, childResults, [...delegateFailures.values()][0] ?? "child_schedule_invalid");
+      }
+      const assignmentRejections = new Map<string, AgenticWorkErrorCode>();
+      if (delegateCandidates.size > 0 && options.workspace) {
+        try {
+          const openTasks = await readOpenAssignableTasks(options.workspace, rootFrame, signal);
+          if (openTasks) {
+            for (const [callId, candidate] of [...delegateCandidates]) {
+              const open = openTasks.get(candidate.taskId);
+              if (!open) {
+                assignmentRejections.set(callId, "not_found");
+                delegateCandidates.delete(callId);
+              } else if (open.conflict) {
+                assignmentRejections.set(callId, "conflict");
+                delegateCandidates.delete(callId);
+              } else if (!open.assignable) {
+                assignmentRejections.set(callId, "not_found");
+                delegateCandidates.delete(callId);
+              }
+            }
+          }
+        } catch (error) {
+          if (signal.aborted) {
+            const status = signalStatus(signal);
+            return finishBatchAbort(status);
+          }
+          const mapped = mapWorkspaceAssignmentError(error);
+          for (const callId of delegateCandidates.keys()) assignmentRejections.set(callId, mapped);
+          delegateCandidates.clear();
+        }
+      }
+      const seenAssignmentTaskIds = new Set<string>();
+      for (const [callId, candidate] of [...delegateCandidates]) {
+        if (seenAssignmentTaskIds.has(candidate.taskId)) {
+          assignmentRejections.set(callId, "conflict");
+          delegateCandidates.delete(callId);
+          continue;
+        }
+        seenAssignmentTaskIds.add(candidate.taskId);
       }
       const delegatedSourceBase = state.childFrames;
       let delegatedSourceIndex = 0;
@@ -4111,11 +4407,12 @@ export async function runAgenticWorkPhase(
         }
         return makeOutcome("failed", state, observations, childResults, "child_schedule_invalid");
       }
-      if (!state.reserveChildBatch(preparedDelegates.size, delegatedIds)) {
+      if (preparedDelegates.size > 0 && !state.reserveChildBatch(preparedDelegates.size, delegatedIds)) {
         appendReservedBatchFailureObservations(state, observations, calls, "work_budget_exhausted");
         return makeOutcome("exhausted", state, observations, childResults, "work_budget_exhausted");
       }
       if (assignments.length > 0) {
+        let assignmentCommitted = false;
         try {
           const assignment = await abortable(Promise.resolve(options.workspace!.assignChildTasks!({
             frame: rootFrame,
@@ -4139,6 +4436,7 @@ export async function runAgenticWorkPhase(
           ) {
             throw new AgenticWorkPhaseError("workspace_budget_exhausted", "Workspace child assignment acknowledgement was not exact");
           }
+          assignmentCommitted = true;
           if (signal.aborted) {
             const status = signalStatus(signal);
             return finishBatchAbort(status);
@@ -4150,13 +4448,24 @@ export async function runAgenticWorkPhase(
             return finishBatchAbort(status);
           }
         } catch (error) {
+          if (!assignmentCommitted) {
+            if (!state.releaseChildBatch(preparedDelegates.size, delegatedIds)) {
+              appendReservedBatchFailureObservations(state, observations, calls, "internal_error");
+              return makeOutcome("failed", state, observations, childResults, "internal_error");
+            }
+          }
           if (signal.aborted) {
             const status = signalStatus(signal);
             return finishBatchAbort(status);
           }
-          const failureCode = error instanceof AgenticWorkPhaseError ? error.code : "workspace_budget_exhausted";
-          appendReservedBatchFailureObservations(state, observations, calls, failureCode);
-          return makeOutcome("failed", state, observations, childResults, failureCode);
+          if (error instanceof AgenticWorkPhaseError) {
+            appendReservedBatchFailureObservations(state, observations, calls, error.code);
+            return makeOutcome("failed", state, observations, childResults, error.code);
+          }
+          const mapped = mapWorkspaceAssignmentError(error);
+          console.error(`[agentic] assignChildTasks failed (${mapped}): ${error instanceof Error ? error.message : String(error)}`);
+          for (const callId of preparedDelegates.keys()) assignmentRejections.set(callId, mapped);
+          preparedDelegates.clear();
         }
       }
       const serializedResults: string[] = [];
@@ -4286,8 +4595,13 @@ export async function runAgenticWorkPhase(
           const profileId = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
           const profile = delegatableProfiles.find((candidate) => candidate.profileId === profileId);
           const task = typeof call.args.task === "string" ? call.args.task : "";
+          const assignmentError = assignmentRejections.get(call.call_id);
           const prepared = preparedDelegates.get(call.call_id);
-          if (!profile || !task || !prepared) {
+          if (assignmentError) {
+            observationStatus = "error";
+            code = assignmentError;
+            result = resultError(code);
+          } else if (!profile || !task || !prepared) {
             observationStatus = "rejected";
             code = "tool_not_allowed";
             result = resultError(code);
@@ -4415,7 +4729,7 @@ export async function runAgenticWorkPhase(
           try {
             serialized = typeof result === "string" ? result : jsonStringifyBounded(result, limits.maxToolResultBytes);
             const resultBytes = utf8ByteLength(serialized);
-            if (!state.reserveToolResult(resultBytes, limits.maxWorkOutputBytes)) {
+            if (!state.reserveToolResult(resultBytes, limits.maxRootReceiveBytes)) {
               throw new AgenticWorkPhaseError("tool_result_limit_exceeded", "Tool result exceeds the response limit");
             }
           } catch {

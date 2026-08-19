@@ -575,6 +575,26 @@ describe('useEffectiveRuntime chat override CAS caller', () => {
     expect(resolve.mock.calls.length).toBe(resolveCallsBeforeUnmount)
   })
 
+  test('shows the selector from availability when Agentic admission is still closed', async () => {
+    resolve.mockResolvedValue({
+      ...response('chat-1', null),
+      agentsEnabled: true,
+      allowedModes: ['response', 'agentic'],
+      capabilityReadiness: {
+        ready: false,
+        sameDomain: true,
+        required: [],
+        missing: [],
+        repairCodes: ['agentic_kill_switch'],
+        responseEscape: 'available',
+      },
+      repairCodes: ['agentic_kill_switch'],
+    })
+    await render()
+    expect(surface.canShowSelector).toBe(true)
+    expect(surface.repairCategories).toContain('readiness')
+  })
+
   for (const [label, changeScope] of scopeChanges) {
     test(`does not reconcile after ${label} changes`, async () => {
       await render()

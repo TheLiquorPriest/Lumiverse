@@ -92,7 +92,7 @@ export const PROVIDER_STREAM_LIMITS = Object.freeze({
   maxLineBytes: 64 * 1024,
   maxEventBytes: 256 * 1024,
   maxBufferBytes: 1 * 1024 * 1024,
-  maxResponseBytes: AGENT_CONTINUATION_FRAME_MAX_BYTES,
+  maxResponseBytes: 8 * 1024 * 1024,
   maxToolDeltaBytes: 64 * 1024,
   maxArgumentsBytes: AGENT_ARGUMENT_MAX_BYTES,
   maxCalls: 64,

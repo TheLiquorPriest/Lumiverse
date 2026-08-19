@@ -60,6 +60,37 @@ describe("OpenAICompatibleProvider reasoning mirroring", () => {
     });
   });
 });
+
+describe("OpenAICompatibleProvider structured reasoning deltas", () => {
+  const provider = new TestOpenAICompatibleProvider();
+
+  test("coerces object reasoning deltas instead of aborting the stream", async () => {
+    const originalFetch = globalThis.fetch;
+    const events = [
+      { choices: [{ delta: { reasoning: { text: "plan" } } }] },
+      { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] },
+    ];
+    globalThis.fetch = (async () => new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch;
+    try {
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of provider.generateStream("key", "https://example.com/v1", {
+        model: "test-model",
+        messages: [{ role: "user", content: "hi" }],
+        parameters: {},
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.map((chunk) => chunk.reasoning ?? "").join("")).toBe("plan");
+      expect(chunks.map((chunk) => chunk.token).join("")).toBe("ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("OpenAI reasoning_details incremental bounds", () => {
   const cap = AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES;
 
@@ -422,7 +453,7 @@ describe("OpenAI-compatible model-controlled tool argument parsing", () => {
     }
   });
 
-  test("streaming malformed arguments reject before execution", async () => {
+  test("streaming malformed arguments drop only the incomplete call", async () => {
     const events = [
       {
         choices: [{
@@ -455,24 +486,197 @@ describe("OpenAI-compatible model-controlled tool argument parsing", () => {
         { status: 200 },
       )) as unknown as typeof fetch;
 
-    let caught: unknown;
+    const chunks: StreamChunk[] = [];
     try {
-      for await (const _chunk of provider.generateStream("key", "https://example.com/v1", {
+      for await (const chunk of provider.generateStream("key", "https://example.com/v1", {
         model: "test-model",
         messages: [{ role: "user", content: "search" }],
         parameters: {},
       })) {
-        // The malformed first call must fail before a tool result can be consumed.
+        chunks.push(chunk);
       }
-    } catch (error) {
-      caught = error;
     } finally {
       globalThis.fetch = originalFetch;
     }
-    expect(caught).toBeDefined();
-    expect(String(caught)).toContain("Provider tool arguments are not valid JSON");
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("tool_calls");
+    expect(finish?.tool_calls).toEqual([
+      { name: "lore_search_entries", args: { query: "x" }, call_id: "call_good_stream" },
+    ]);
   });
 });
+
+describe("OpenAI-compatible stream-end tool call buffer", () => {
+  const provider = new TestOpenAICompatibleProvider();
+  const request = {
+    model: "test-model",
+    messages: [{ role: "user" as const, content: "search" }],
+    parameters: {},
+  };
+
+  async function collectStream(events: unknown[]): Promise<StreamChunk[]> {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(
+      events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch;
+    try {
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of provider.generateStream("key", "https://example.com/v1", request)) {
+        chunks.push(chunk);
+      }
+      return chunks;
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  test("emits tool_calls when [DONE] arrives with a complete buffered call", async () => {
+    const chunks = await collectStream([
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_done_complete",
+              function: { name: "ping", arguments: "{}" },
+            }],
+          },
+        }],
+      },
+    ]);
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("tool_calls");
+    expect(finish?.tool_calls).toEqual([
+      { name: "ping", args: {}, call_id: "call_done_complete" },
+    ]);
+  });
+
+  test("finishes as stop when [DONE] arrives with an incomplete buffered call", async () => {
+    const chunks = await collectStream([
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_done_incomplete",
+            }],
+          },
+        }],
+      },
+    ]);
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("stop");
+    expect(finish?.token).toBe("");
+    expect(finish?.tool_calls).toBeUndefined();
+  });
+
+  test("accepts stop with a complete buffered call", async () => {
+    const chunks = await collectStream([
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_stop_complete",
+              function: { name: "ping", arguments: '{"q":1}' },
+            }],
+          },
+        }],
+      },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ]);
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("tool_calls");
+    expect(finish?.tool_calls).toEqual([
+      { name: "ping", args: { q: 1 }, call_id: "call_stop_complete" },
+    ]);
+  });
+
+  test("finishes as stop when a named call has truncated arguments", async () => {
+    const chunks = await collectStream([
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_truncated_args",
+              function: { name: "ping", arguments: '{"q":' },
+            }],
+          },
+        }],
+      },
+    ]);
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("stop");
+    expect(finish?.tool_calls).toBeUndefined();
+  });
+
+  test("executes a complete sibling when another buffered call has truncated arguments", async () => {
+    const chunks = await collectStream([
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_truncated_sibling",
+              function: { name: "ping", arguments: '{"q":' },
+            }],
+          },
+        }],
+      },
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 1,
+              id: "call_complete_sibling",
+              function: { name: "pong", arguments: '{"ok":true}' },
+            }],
+          },
+        }],
+      },
+    ]);
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("tool_calls");
+    expect(finish?.tool_calls).toEqual([
+      { name: "pong", args: { ok: true }, call_id: "call_complete_sibling" },
+    ]);
+  });
+
+  test("drops a missing-name call without discarding a complete sibling", async () => {
+    const chunks = await collectStream([
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              id: "call_missing_name",
+            }],
+          },
+        }],
+      },
+      {
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 1,
+              id: "call_named_sibling",
+              function: { name: "ping", arguments: "{}" },
+            }],
+          },
+        }],
+      },
+    ]);
+    const finish = chunks.find((chunk) => chunk.finish_reason);
+    expect(finish?.finish_reason).toBe("tool_calls");
+    expect(finish?.tool_calls).toEqual([
+      { name: "ping", args: {}, call_id: "call_named_sibling" },
+    ]);
+  });
+});
+
+
 
 describe("OpenAI-compatible usage and error receive contracts", () => {
   const provider = new TestOpenAICompatibleProvider();
