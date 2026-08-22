@@ -379,6 +379,32 @@ describe("user-data import bounded extraction", () => {
     expect(db.query("SELECT 1 FROM merge_fixture WHERE id = 'two'").get()).toBeNull();
     db.close();
   });
+  test("upserts a canonical row whose triggers inflate the SQLite change count", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE merge_fixture (id TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.run("CREATE TABLE merge_fixture_log (id INTEGER PRIMARY KEY AUTOINCREMENT, fixture_id TEXT NOT NULL)");
+    db.run(`CREATE TRIGGER merge_fixture_touch AFTER UPDATE ON merge_fixture BEGIN
+      INSERT INTO merge_fixture_log(fixture_id) VALUES (new.id);
+      INSERT INTO merge_fixture_log(fixture_id) VALUES (new.id);
+    END`);
+    db.run("INSERT INTO merge_fixture (id, value) VALUES ('one', 'old')");
+    const insert = db.prepare("INSERT INTO merge_fixture (id, value) VALUES (?, ?)");
+    const upsert = { primaryKey: ["id"], uniqueKeys: [["id"]], mergePolicy: "upsert" };
+    const inflated = db.query("UPDATE merge_fixture SET value = ? WHERE id = ?").run("probe", "one");
+    expect(inflated.changes).toBeGreaterThan(1);
+    db.query("UPDATE merge_fixture SET value = ? WHERE id = ?").run("old", "one");
+    expect(importTest.mergeCanonicalImportRow(
+      db,
+      "merge_fixture",
+      upsert,
+      { id: "one", value: "new" },
+      ["id", "value"],
+      insert,
+    )).toBe("imported");
+    expect(db.query("SELECT value FROM merge_fixture WHERE id = 'one'").get()).toEqual({ value: "new" });
+    db.close();
+  });
+
   test("validates canonical context revision digest, UTF-8 bytes, and tokens before apply", () => {
     const content = [{ id: "entry", title: "Title", body: "Café", tags: ["tag"] }];
     const serialized = serializeContextPackContent(content);

@@ -97,6 +97,7 @@ export async function assembleSpindleBlocks(
   const ctx = {
     userId,
     generationId: crypto.randomUUID(),
+    assemblySurface: "RESPONSE" as const,
     dryRun: true,
     chatId,
     connectionId: input.connectionId,

@@ -6,11 +6,14 @@ import type { SaveAgenticRuntimeEditorResult } from '@/api/agentic-runtime'
 import type { Preset } from '@/types/api'
 import type {
   AgentConfigRepairItem,
+  AgentCustomPhaseV1,
   AgentConfigV2,
   AgenticRuntimeSaveDraft,
+  AgentRuntimePolicyV1,
   LoomPreset,
   PromptBlock,
 } from '@/lib/loom/types'
+import type { LoomPolicyEntryV1, LoomPolicySourceV1 } from '@/types/agent-runtime'
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'http://localhost/',
@@ -67,7 +70,6 @@ const hostCeilings = {
 let editorContextSelections: unknown[] = []
 let editorContextRules: unknown[] = []
 let editorTaskTemplates: unknown[] = []
-let contextAttachmentRequired: boolean | string = false
 let editorReviewAcknowledgements: string[] = []
 let editorPresetRevision = 8
 let editorConfigRevision = 4
@@ -168,26 +170,17 @@ mock.module('@/api/agentic-runtime', () => ({
 mock.module('@/api/agent-context-packs', () => ({
   classifyContextPackError: () => 'unavailable',
   agentContextPacksApi: {
-    list: async () => ({ data: [{ id: 'pack-1', name: 'World rules', state: 'active' }] }),
-    get: async () => ({
-      pack: { id: 'pack-1', name: 'World rules', state: 'active' },
-      revisions: [{ packId: 'pack-1', revision: 3, state: 'active', contentDigest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }],
-      attachments: [{
-        attachmentId: 'attachment-1',
+    listSelectable: async () => ({
+      data: [{
+        ownerId: 'user-1',
+        source: 'owned',
         packId: 'pack-1',
+        packName: 'World rules',
+        packDescription: '',
         revision: 3,
-        scope: 'preset',
-        targetId: 'preset-1',
-        required: contextAttachmentRequired,
-        state: 'active',
-      }, {
-        attachmentId: 'attachment-chat',
-        packId: 'pack-1',
-        revision: 3,
-        scope: 'chat',
-        targetId: 'chat-elsewhere',
-        required: true,
-        state: 'active',
+        digest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        byteCount: 128,
+        tokenCount: 32,
       }],
     }),
   },
@@ -224,6 +217,68 @@ function promptBlock(revision = 3): PromptBlock {
     revision,
   }
 }
+function loomSource(): LoomPolicySourceV1 {
+  return {
+    kind: 'loom_block',
+    blockId: 'policy-block',
+    presetRevision: 8,
+    blockRevision: 3,
+    promptOrder: 0,
+  }
+}
+
+function customPhase(
+  id: string,
+  overrides: Partial<AgentCustomPhaseV1> = {},
+): AgentCustomPhaseV1 {
+  return {
+    version: 1,
+    id,
+    label: id,
+    instructionRefs: [],
+    required: true,
+    enter: { kind: 'phase', value: 'WORK' },
+    exit: { kind: 'phase', value: 'COMPLETE' },
+    capabilityRequests: [],
+    repeatLimit: 0,
+    nextPhaseIds: [],
+    ...overrides,
+  }
+}
+
+function workPolicyEntry(delivery: LoomPolicyEntryV1['delivery']): LoomPolicyEntryV1 {
+  return {
+    version: 1,
+    id: 'work-policy-entry',
+    source: loomSource(),
+    destination: 'root_work',
+    checkpoint: 'WORK',
+    required: true,
+    visibility: 'work_only',
+    delivery,
+  }
+}
+
+function runtimePolicy(
+  phases: readonly AgentCustomPhaseV1[] = [],
+  workPolicy: readonly LoomPolicyEntryV1[] = [],
+): AgentRuntimePolicyV1 {
+  return {
+    version: 1,
+    authority: 'loom',
+    scope: 'preset',
+    defaultMode: 'response',
+    loomPolicy: {
+      version: 1,
+      workPolicy,
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    },
+    phases,
+  }
+}
+
 
 function agentConfig(): AgentConfigV2 {
   return {
@@ -516,12 +571,13 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).toContain('save.conflict')
   })
 
-  test('keeps every section tab related to the stable panel', async () => {
+  test('keeps one Phased Instructions surface for phase and context authoring', async () => {
     const { container } = renderPanel()
     await settle()
     const tabs = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
     const panel = container.querySelector<HTMLElement>('#agentic-runtime-panel')
-    expect(tabs.length).toBeGreaterThan(1)
+    expect(tabs).toHaveLength(7)
+    expect(tabs.some((tab) => tab.textContent?.includes('sections.context.nav'))).toBe(false)
     expect(panel).not.toBeNull()
     for (const tab of tabs) {
       expect(tab.getAttribute('aria-controls')).toBe('agentic-runtime-panel')
@@ -533,6 +589,8 @@ describe('Agentic Runtime shared editor', () => {
     const toolsTab = tabs.find((tab) => tab.textContent?.includes('sections.tools.nav'))!
     flushSync(() => toolsTab.click())
     expect(panel?.getAttribute('aria-labelledby')).toBe(toolsTab.id)
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    expect(container.querySelector('select[aria-label="context.addPack"]')).not.toBeNull()
   })
 
   test('removes deleted profile markers before save', async () => {
@@ -622,7 +680,7 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.querySelectorAll('input[type="checkbox"]')).toHaveLength(0)
     expect(button(container, 'save.action').disabled).toBe(false)
   })
-  test('edits canonical context references, required semantics, and saves the policy fields', async () => {
+  test('edits canonical context references for an owned exact revision and saves policy fields', async () => {
     const saves: AgenticRuntimeSaveDraft[] = []
     const { container } = renderPanel({
       onSave: async (draft, promptOrder) => {
@@ -631,14 +689,14 @@ describe('Agentic Runtime shared editor', () => {
       },
     })
     await settle()
-    flushSync(() => button(container, 'sections.context.nav').click())
+    flushSync(() => button(container, 'sections.phases.nav').click())
     const packSelect = container.querySelector<HTMLSelectElement>('select[aria-label="context.addPack"]')
     expect(packSelect).not.toBeNull()
     changeSelect(packSelect!, 'pack-1\u0000pack-1@3')
     await settle()
     expect(container.textContent).toContain('context.scopeLabel')
-    expect(container.textContent).toContain('context.attachmentOptional')
-    expect(container.textContent).not.toContain('context.attachmentRequired')
+    expect(container.textContent).toContain('context.sources.owned')
+    expect(container.textContent).not.toContain('context.attachmentUnavailable')
     const direct = container.querySelector<HTMLInputElement>('input[aria-label="context.alwaysIncludeFor"]')
     expect(direct).not.toBeNull()
     flushSync(() => direct!.click())
@@ -688,7 +746,7 @@ describe('Agentic Runtime shared editor', () => {
       },
     })
     await settle()
-    flushSync(() => button(container, 'sections.context.nav').click())
+    flushSync(() => button(container, 'sections.phases.nav').click())
     expect(container.textContent).toContain('context.revisionLabel')
     expect(container.textContent).not.toContain('Revision 3')
     const ruleIds = [...container.querySelectorAll<HTMLInputElement>('input[aria-label="context.ruleId"]')]
@@ -716,7 +774,7 @@ describe('Agentic Runtime shared editor', () => {
   test('resets an edited context policy to its last committed draft', async () => {
     const { container } = renderPanel()
     await settle()
-    flushSync(() => button(container, 'sections.context.nav').click())
+    flushSync(() => button(container, 'sections.phases.nav').click())
     const packSelect = container.querySelector<HTMLSelectElement>('select[aria-label="context.addPack"]')!
     changeSelect(packSelect, 'pack-1\u0000pack-1@3')
     await settle()
@@ -725,7 +783,7 @@ describe('Agentic Runtime shared editor', () => {
 
     flushSync(() => button(container, 'save.reset').click())
 
-    expect(container.querySelectorAll('details')).toHaveLength(0)
+    expect(container.querySelectorAll('input[aria-label="context.ruleId"]')).toHaveLength(0)
     expect(container.querySelectorAll('li')).toHaveLength(0)
     expect(button(container, 'save.action').disabled).toBe(true)
     expect(button(container, 'save.reset').disabled).toBe(true)
@@ -736,7 +794,7 @@ describe('Agentic Runtime shared editor', () => {
     value.agentConfig!.contextPolicy = { ruleIds: ['missing-rule'], packIds: ['missing-pack'] }
     const { container } = renderPanel({ value })
     await settle()
-    flushSync(() => button(container, 'sections.context.nav').click())
+    flushSync(() => button(container, 'sections.phases.nav').click())
 
     expect(container.textContent).toContain('context.quarantineTitle')
     expect(button(container, 'save.action').disabled).toBe(true)
@@ -755,7 +813,7 @@ describe('Agentic Runtime shared editor', () => {
     }]
     const { container } = renderPanel()
     await settle()
-    flushSync(() => button(container, 'sections.context.nav').click())
+    flushSync(() => button(container, 'sections.phases.nav').click())
     expect(container.textContent).toContain('context.quarantineTitle')
     expect(button(container, 'save.action').disabled).toBe(true)
     const discard = container.querySelector<HTMLButtonElement>('[aria-label="context.discardQuarantined"]')
@@ -772,7 +830,7 @@ describe('Agentic Runtime shared editor', () => {
       activation: {
         kind: 'all' as const,
         children: [
-          { kind: 'task_transition' as const, taskId: 'remove_me', transition: 'done' as const },
+          { kind: 'task_transition' as const, taskId: 'remove_me', transition: 'completed' as const },
           { kind: 'phase' as const, value: 'WORK' as const },
         ],
       },
@@ -852,19 +910,18 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => discard!.click())
     expect(button(container, 'save.action').disabled).toBe(false)
   })
-  test('shows unavailable attachment metadata without trusting unknown requiredness', async () => {
-    contextAttachmentRequired = 'unknown'
+  test('shows unavailable pack metadata without implying current access', async () => {
     editorContextSelections = [{
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
+      packId: 'pack-2',
+      revisionId: 'pack-2@3',
       revision: 3,
-      label: 'World rules',
-      digest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      label: 'Unavailable rules',
+      digest: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
       revisionLabel: 'Revision 3',
     }]
     const { container } = renderPanel()
     await settle()
-    flushSync(() => button(container, 'sections.context.nav').click())
+    flushSync(() => button(container, 'sections.phases.nav').click())
     expect(container.textContent).toContain('context.scopeUnavailable')
     expect(container.textContent).toContain('context.attachmentUnavailable')
     expect(container.textContent).not.toContain('context.scopes.unknown_scope')
@@ -901,7 +958,7 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.querySelector<HTMLInputElement>('input[value="Committed analyst"]')).not.toBeNull()
     expect(button(container, 'save.action').disabled).toBe(true)
   })
-  test('rejects acknowledgement IDs that are not in the server-derived review set', async () => {
+  test('does not let an unknown acknowledgement satisfy a server-derived review item', async () => {
     editorReviewAcknowledgements = ['unknown-review-id']
     const item: AgentConfigRepairItem = {
       id: 'import:review',
@@ -911,24 +968,27 @@ describe('Agentic Runtime shared editor', () => {
     }
     const { container } = renderPanel({ value: preset([item]) })
     await settle()
-    expect(container.textContent).toContain('validation.review_acknowledgement_unknown')
+    expect(container.textContent).toContain('validation.review_acknowledgement_required')
     expect(button(container, 'save.action').disabled).toBe(true)
   })
 
 
-  test('surfaces stale block revisions and never enables a partial save', async () => {
+  test('surfaces stale canonical Loom sources and never enables a partial save', async () => {
     const value = preset()
-    value.agentConfig!.cognitionPolicy!.workPolicy = [{
-      blockId: 'policy-block',
-      expectedPresetRevision: 8,
-      expectedBlockRevision: 2,
-    }]
+    const staleEntry = workPolicyEntry({ delivery: 'direct' })
+    value.agentConfig!.runtimePolicy = runtimePolicy([], [{
+      ...staleEntry,
+      source: {
+        ...staleEntry.source,
+        blockRevision: 2,
+      },
+    }])
     const { container } = renderPanel({ value })
     await settle()
     flushSync(() => button(container, 'sections.agents.nav').click())
     changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Changed')
 
-    expect(container.textContent).toContain('validation.stale_block_revision')
+    expect(container.textContent).toContain('validation.stale_policy_source')
     expect(button(container, 'save.action').disabled).toBe(true)
   })
 
@@ -979,12 +1039,168 @@ describe('Agentic Runtime shared editor', () => {
       ],
     })
   })
+  test('preserves malformed runtime policy through unrelated edits until explicit discard', async () => {
+    const value = preset()
+    value.agentConfig!.runtimePolicy = {
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'response',
+      loomPolicy: null,
+      phases: [{ invalid: true }],
+    } as unknown as AgentRuntimePolicyV1
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Preserved edit')
+    flushSync(() => button(container, 'sections.repair.nav').click())
+    expect(container.textContent).toContain('config.runtimePolicy.phases')
+    expect(button(container, 'save.action').disabled).toBe(true)
+
+    flushSync(() => button(container, 'repair.actions.discard').click())
+    expect(container.textContent).not.toContain('validation.invalid_runtime_policy')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.config.profiles[0]?.name).toBe('Preserved edit')
+    expect(saves[0]?.config.runtimePolicy?.phases).toEqual([])
+  })
+
+  test('rewrites custom-phase and Loom delivery task references when a task ID changes', async () => {
+    const value = preset()
+    const task = {
+      id: 'old_task',
+      label: 'Old task',
+      required: true,
+      activation: { kind: 'phase' as const, value: 'WORK' as const },
+    }
+    value.agentTaskTemplates = [task]
+    value.agentConfig!.taskPolicy = { templateIds: [task.id] }
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('phase_one', {
+        enter: { kind: 'task_transition', taskId: task.id, transition: 'active' },
+      }),
+    ], [
+      workPolicyEntry({
+        delivery: 'condition_gated',
+        condition: { kind: 'task_transition', taskId: task.id, transition: 'completed' },
+      }),
+    ])
+    editorTaskTemplates = [structuredClone(task)]
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+
+    flushSync(() => button(container, 'sections.tasks.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="old_task"]')!, 'renamed_task')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.enter).toEqual({
+      kind: 'task_transition',
+      taskId: 'renamed_task',
+      transition: 'active',
+    })
+    expect(saves[0]?.config.runtimePolicy?.loomPolicy?.workPolicy[0]?.delivery).toEqual({
+      delivery: 'condition_gated',
+      condition: {
+        kind: 'task_transition',
+        taskId: 'renamed_task',
+        transition: 'completed',
+      },
+    })
+  })
+
+  test('blocks context removal while an exact on-demand delivery references it', async () => {
+    const selection = {
+      packId: 'pack-1',
+      revisionId: 'pack-1@3',
+      revision: 3,
+      label: 'World rules',
+      revisionLabel: 'Revision 3',
+      digest: 'a'.repeat(64),
+    }
+    const value = preset()
+    value.agentContextPackSelections = [selection]
+    value.agentConfig!.contextPolicy = { ruleIds: [], packIds: [selection.packId] }
+    value.agentConfig!.runtimePolicy = runtimePolicy([], [
+      workPolicyEntry({
+        delivery: 'on_demand',
+        request: {
+          contextPackId: selection.packId,
+          revisionId: selection.revisionId,
+          digest: selection.digest,
+        },
+      }),
+    ])
+    editorContextSelections = [structuredClone(selection)]
+    const { container } = renderPanel({ value })
+    await settle()
+
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    const remove = container.querySelector<HTMLButtonElement>('[aria-label="context.removePack"]')
+    expect(remove).not.toBeNull()
+    expect(remove!.disabled).toBe(true)
+    expect(remove!.title).toBe('context.removePackOnDemandInUse')
+    expect(container.textContent).toContain('config.runtimePolicy.loomPolicy.workPolicy.0.delivery.request')
+  })
+
+  test('shows automatic phase transitions and custom instructions in Response omission', async () => {
+    const value = preset()
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('phase_one', {
+        label: 'First phase',
+        instructionRefs: [loomSource()],
+      }),
+      customPhase('phase_two', { label: 'Second phase' }),
+    ])
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    expect(container.textContent).toContain('phases.responseOmissionPhaseInstruction')
+    expect(container.textContent).toContain('customPhases.transitionAutomatic')
+    expect(container.textContent).toContain('customPhases.transitionAutomaticNext')
+    flushSync(() => button(container, 'customPhases.useExplicitTransitions').click())
+    const explicitNext = [...container.querySelectorAll<HTMLLabelElement>('label')]
+      .find((label) => label.textContent?.includes('customPhases.nextTarget'))
+      ?.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    expect(explicitNext?.checked).toBe(true)
+
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.nextPhaseIds).toEqual(['phase_two'])
+  })
+
 
   test('supports roving keyboard tabs with focus following selection', async () => {
     const { container } = renderPanel()
     await settle()
     const tabs = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
-    expect(tabs).toHaveLength(8)
+    expect(tabs).toHaveLength(7)
     tabs[0]!.focus()
     flushSync(() => tabs[0]!.dispatchEvent(new domWindow.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })))
     expect(document.activeElement).toBe(tabs[1])

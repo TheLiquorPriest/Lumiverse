@@ -1,3 +1,27 @@
+import type { LoomPromptInspectionV1 } from "./agent-cognition";
+import type { RuntimeRevision } from "./agent-runtime-decision";
+import type {
+  AgentPublicErrorCategory,
+  AgentPublicErrorCode,
+  AgentRecoveryActionV2,
+  AgentWorkAttemptLineageV1,
+  AgentWorkOutcome,
+  AgentWorkPhase,
+  AgentWorkProjectionV1,
+  AgentWorkStatus,
+  AgentWorkTargetIdentityV1,
+} from "./agent-runtime";
+
+export type {
+  AgentWorkAttemptLineageV1,
+  AgentWorkOutcome,
+  AgentWorkPhase,
+  AgentWorkProjectionV1,
+  AgentWorkStatus,
+  AgentWorkTargetIdentityV1,
+} from "./agent-runtime";
+
+
 /**
  * Authenticated, status-only projection contracts for Agentic turns.
  *
@@ -6,19 +30,10 @@
  * provider, tool, workspace, or metadata objects into these DTOs.
  */
 
-export type AgentRunPublicStatusV2 =
-  | "ASSEMBLE"
-  | "WORK"
-  | "COMPLETE"
-  | "RENDER"
-  | "PREPARE_COMMIT"
-  | "COMMITTING"
-  | "COMMITTED"
-  | "COMMIT_FAILED"
-  | "EXHAUSTED"
-  | "FAILED"
-  | "CANCELLED"
-  | "TIMED_OUT";
+export type AgentRunPublicStatusV2 = AgentWorkStatus;
+export type AgentRunPublicPhaseV2 = AgentWorkPhase;
+export type AgentRunPublicOutcomeV2 = AgentWorkOutcome;
+export type AgentRunPublicProjectionV1 = AgentWorkProjectionV1;
 
 export type AgentRunGenerationTypeV1 = "normal" | "continue" | "regenerate" | "swipe";
 
@@ -48,7 +63,7 @@ export interface AgentActivityNodeV2 {
   readonly parentId: string | null;
   readonly kind: AgentActivityNodeKindV2;
   readonly actor: AgentActivityNodeActorV2;
-  readonly phase: AgentRunPublicStatusV2;
+  readonly phase: AgentRunPublicPhaseV2;
   readonly status: AgentActivityNodeStatusV2;
   readonly startedAt: number;
   readonly elapsedMs: number;
@@ -84,8 +99,20 @@ export interface AgentTerminalHandoffV2 {
 
 export interface AgentRunPublicErrorV2 {
   readonly code: string;
-  readonly retryable: boolean;
+  readonly category: AgentPublicErrorCategory;
+  readonly summaryCode: string;
+  readonly recoveryEligible: boolean;
+  readonly recoveryAction: AgentRecoveryActionV2;
+  readonly target: AgentWorkTargetIdentityV1 | null;
+  readonly workPhase: AgentRunPublicPhaseV2;
+  readonly workStatus: AgentRunPublicStatusV2;
+  readonly workOutcome: AgentRunPublicOutcomeV2 | null;
+  readonly reason: string | null;
+  readonly omissionCount: number;
+  readonly inspectionAttemptId: string | null;
 }
+
+
 
 export interface AgentRunPublicV2 {
   readonly version: 2;
@@ -95,8 +122,16 @@ export interface AgentRunPublicV2 {
   readonly chatId: string;
   readonly generationType: AgentRunGenerationTypeV1;
   readonly target: AgentRunTargetV1 | null;
-  readonly status: AgentRunPublicStatusV2;
-  readonly phase: AgentRunPublicStatusV2;
+  readonly workPhase: AgentRunPublicPhaseV2;
+  readonly workStatus: AgentRunPublicStatusV2;
+  readonly workOutcome: AgentRunPublicOutcomeV2 | null;
+  readonly recoveryEligible: boolean;
+  readonly recoveryAction: AgentRecoveryActionV2;
+  readonly omissionCount: number;
+  /** Owner-inspection link for expandable causal detail. */
+  readonly inspectionAttemptId: string;
+  readonly reason: string | null;
+  readonly attemptLineage: AgentWorkAttemptLineageV1;
   readonly revision: number;
   /** The chat event sequence that carried this snapshot; it is not a run cursor. */
   readonly sequence: number;
@@ -107,6 +142,11 @@ export interface AgentRunPublicV2 {
   readonly omission: AgentOmissionMarkerV2;
   readonly error?: AgentRunPublicErrorV2;
   readonly terminalHandoff?: AgentTerminalHandoffV2;
+}
+/** Stable envelope used by every Agent Run route failure. */
+export interface AgentRunErrorResponseV2 {
+  readonly version: 2;
+  readonly error: AgentRunPublicErrorV2;
 }
 
 export type AgentWorkspaceSectionIdV2 =
@@ -146,7 +186,7 @@ export interface AgentWorkspaceEntryBaseV2 {
 export interface AgentWorkspaceTaskPreviewV2 extends AgentWorkspaceEntryBaseV2 {
   readonly kind: "task";
   readonly title: string;
-  readonly state: "active" | "blocked" | "submitted" | "done" | "omitted";
+  readonly state: "pending" | "active" | "blocked" | "completed" | "cancelled" | "failed";
   readonly required: boolean;
   readonly assigned: boolean;
   readonly dependencyCount: number;
@@ -156,7 +196,7 @@ export interface AgentWorkspaceSubmissionPreviewV2 extends AgentWorkspaceEntryBa
   readonly kind: "submission";
   readonly taskId: string;
   readonly profileId: string | null;
-  readonly state: "proposed" | "accepted" | "rejected" | "omitted";
+  readonly state: "submitted" | "accepted" | "rejected";
 }
 
 export interface AgentWorkspaceRecordPreviewV2 extends AgentWorkspaceEntryBaseV2 {
@@ -246,4 +286,547 @@ export interface AgentRunStopResponseV2 {
   readonly status: AgentRunStopResultV2;
   readonly turnId: string;
   readonly revision: number;
+  readonly target: AgentWorkTargetIdentityV1;
+  readonly workPhase: AgentRunPublicPhaseV2;
+  readonly workStatus: AgentRunPublicStatusV2;
+  readonly workOutcome: AgentRunPublicOutcomeV2 | null;
+  readonly reason: string | null;
+  readonly recoveryEligible: boolean;
+  readonly recoveryAction: AgentRecoveryActionV2;
+  readonly omissionCount: number;
+  readonly inspectionAttemptId: string;
+  readonly error?: AgentRunPublicErrorV2;
+}
+export type AgentInspectionLifecycleV1 =
+  | "ADMIT"
+  | "ASSEMBLE"
+  | "WORK"
+  | "PREPARE_COMMIT"
+  | "RENDER"
+  | "COMMIT"
+  | "TERMINAL";
+
+export type AgentInspectionStatusV1 =
+  | "pending"
+  | "running"
+  | "waiting"
+  | "cancelling"
+  | "terminal";
+
+export type AgentInspectionOutcomeV1 =
+  | "completed"
+  | "stopped"
+  | "failed"
+  | "exhausted"
+  | "rejected";
+
+export type AgentInspectionReasonV1 =
+  | "none"
+  | "user_stop"
+  | "deadline"
+  | "provider_failure"
+  | "tool_failure"
+  | "required_work_failure"
+  | "budget_exhausted"
+  | "invalid_input"
+  | "stale_input"
+  | "unavailable"
+  | "needs_attention"
+  | "interrupted"
+  | "retry_requested"
+  | "reconciled"
+  | "unknown";
+
+export type AgentInspectionSectionIdV1 =
+  | "run"
+  | "activity"
+  | "transcript"
+  | "turn_session"
+  | "usage"
+  | "prompt"
+  | "cortex"
+  | "council"
+  | "workspace";
+
+export type AgentInspectionSectionStateV1 =
+  | "available"
+  | "not_recorded"
+  | "source_deleted"
+  | "unavailable"
+  | "withheld";
+
+export interface AgentInspectionSectionAvailabilityV1 {
+  readonly section: AgentInspectionSectionIdV1;
+  readonly state: AgentInspectionSectionStateV1;
+  readonly reason: AgentInspectionReasonV1 | null;
+}
+
+export type AgentInspectionTargetKindV1 = AgentRunGenerationTypeV1;
+
+export interface AgentInspectionCorrelationV1 {
+  readonly turnSessionId: string;
+  readonly runId: string;
+  readonly attemptId: string;
+  readonly chatId: string;
+  readonly generationId: string;
+  readonly messageId: string | null;
+  readonly swipeId: number | null;
+  readonly actorId: string | null;
+  readonly recipientId: string | null;
+  readonly phase: AgentInspectionLifecycleV1;
+  readonly taskId: string | null;
+  readonly toolId: string | null;
+  readonly parentId: string | null;
+  readonly hostCorrelationId: string;
+  readonly hostSequence: number;
+}
+
+export type AgentInspectionAttemptLineageV1 = AgentWorkAttemptLineageV1;
+
+export type AgentInspectionRecordKindV1 =
+  | "prompt"
+  | "provider_exchange"
+  | "agent_exchange"
+  | "delegation"
+  | "child_result"
+  | "tool"
+  | "condition"
+  | "checkpoint"
+  | "task"
+  | "workspace"
+  | "hook"
+  | "usage"
+  | "failure"
+  | "terminal"
+  | "stop"
+  | "recovery"
+  | "milestone";
+
+export type AgentInspectionRecordActorV1 =
+  | "host"
+  | "owner"
+  | "provider"
+  | "agent"
+  | "child"
+  | "tool"
+  | "cortex"
+  | "council";
+
+export interface AgentInspectionProviderIdentityV1 {
+  readonly adapter: string;
+  readonly providerId: string | null;
+  readonly modelId: string | null;
+  readonly connectionRevision: RuntimeRevision | null;
+  readonly fingerprint: string | null;
+}
+
+export interface AgentInspectionTranscriptRecordV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly kind: AgentInspectionRecordKindV1;
+  readonly actor: AgentInspectionRecordActorV1;
+  readonly recipient: AgentInspectionRecordActorV1 | null;
+  readonly correlation: AgentInspectionCorrelationV1;
+  readonly occurredAt: number;
+  readonly durationMs: number | null;
+  readonly late: boolean;
+  readonly content: string | null;
+  readonly arguments: string | null;
+  readonly result: string | null;
+  readonly provider: AgentInspectionProviderIdentityV1 | null;
+  readonly errorReason: AgentInspectionReasonV1 | null;
+}
+
+export type AgentTurnSessionEntryKindV1 =
+  | "target"
+  | "input"
+  | "policy"
+  | "condition"
+  | "hook"
+  | "cancellation"
+  | "completion"
+  | "commit"
+  | "terminal"
+  | "retry"
+  | "recovery";
+
+export interface AgentTurnSessionEntryV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly kind: AgentTurnSessionEntryKindV1;
+  readonly correlation: AgentInspectionCorrelationV1;
+  readonly occurredAt: number;
+  readonly detail: string;
+  readonly transcriptRecordIds: readonly string[];
+}
+
+export type AgentInspectionMarkerKindV1 =
+  | "reconnect_gap"
+  | "late_event"
+  | "reordered_event"
+  | "truncated"
+  | "unavailable"
+  | "credentials_withheld"
+  | "other_user_data_withheld"
+  | "recovered_duplicate";
+
+export type AgentInspectionMarkerScopeV1 =
+  | "run"
+  | "activity"
+  | "transcript"
+  | "turn_session"
+  | "usage"
+  | "prompt"
+  | "cortex"
+  | "council"
+  | "workspace";
+
+export interface AgentInspectionMarkerV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly kind: AgentInspectionMarkerKindV1;
+  readonly scope: AgentInspectionMarkerScopeV1;
+  readonly correlation: AgentInspectionCorrelationV1 | null;
+  readonly firstSequence: number | null;
+  readonly lastSequence: number | null;
+  readonly recoverable: boolean | null;
+  readonly detail: string | null;
+}
+
+export type AgentInspectionUsageSourceV1 =
+  | "provider_reported"
+  | "provisional"
+  | "final"
+  | "recovered_duplicate";
+
+export type AgentInspectionUsageLayerIdV1 =
+  | "root"
+  | "child"
+  | "provider"
+  | "tool"
+  | "cortex"
+  | "council";
+
+export interface AgentInspectionUsageLayerV1 {
+  readonly version: 1;
+  readonly layer: AgentInspectionUsageLayerIdV1;
+  readonly source: AgentInspectionUsageSourceV1;
+  readonly correlation: AgentInspectionCorrelationV1 | null;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly toolCalls: number;
+  readonly childInvocations: number;
+  readonly evidenceIds: readonly string[];
+  readonly canonical: boolean;
+}
+
+export interface AgentInspectionUsageProjectionV1 {
+  readonly version: 1;
+  readonly inspectionAttemptId: string;
+  readonly totals: AgentActivityUsageV2;
+  readonly layers: readonly AgentInspectionUsageLayerV1[];
+  readonly evidenceCount: number;
+  readonly omittedEvidenceCount: number;
+}
+
+export interface AgentInspectionUsageV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly source: AgentInspectionUsageSourceV1;
+  /** The owning accounting layer, when the producer can attribute one. */
+  readonly layer?: AgentInspectionUsageLayerIdV1;
+  readonly correlation: AgentInspectionCorrelationV1 | null;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly toolCalls: number;
+  readonly childInvocations: number;
+  readonly canonical: boolean;
+}
+export type AgentInspectionAuthorityV1 =
+  | "host"
+  | "preset"
+  | "provider"
+  | "owner"
+  | "system"
+  | "cortex"
+  | "council";
+
+export type AgentInspectionSourceV1 =
+  | "execution"
+  | "projection"
+  | "provider"
+  | "tool"
+  | "host"
+  | "recovery"
+  | "cortex"
+  | "council"
+  | "unknown";
+
+export type AgentInspectionScopeV1 =
+  | "run"
+  | "attempt"
+  | "turn_session"
+  | "target"
+  | "phase"
+  | "provider"
+  | "tool"
+  | "usage"
+  | "transcript"
+  | "cortex"
+  | "council"
+  | "workspace";
+
+export interface AgentInspectionCapGateV1 {
+  readonly id: string;
+  readonly limit: number | null;
+  readonly observed: number | null;
+  readonly exceeded: boolean;
+  readonly authority: AgentInspectionAuthorityV1;
+  readonly source: AgentInspectionSourceV1;
+}
+
+/** Owner-only causal error detail; public run DTOs carry only AgentRunPublicErrorV2. */
+export interface AgentInspectionErrorDetailV1 {
+  readonly version: 1;
+  readonly inspectionAttemptId: string;
+  readonly code: string;
+  readonly category: AgentPublicErrorCategory;
+  readonly summaryCode: string;
+  readonly causalCode: AgentPublicErrorCode | null;
+  readonly authority: AgentInspectionAuthorityV1;
+  readonly source: AgentInspectionSourceV1;
+  readonly scope: AgentInspectionScopeV1;
+  readonly capGate: AgentInspectionCapGateV1 | null;
+  readonly target: AgentWorkTargetIdentityV1;
+  readonly workPhase: AgentRunPublicPhaseV2;
+  readonly workStatus: AgentRunPublicStatusV2;
+  readonly workOutcome: AgentRunPublicOutcomeV2 | null;
+  readonly reason: string | null;
+  readonly recoveryEligible: boolean;
+  readonly recoveryAction: AgentRecoveryActionV2;
+  readonly omissionCount: number;
+}
+
+
+export type AgentPromptEvidenceDestinationV1 =
+  | "root_work"
+  | "child_work"
+  | "completion_handoff"
+  | "render"
+  | "council"
+  | "cortex";
+
+export interface AgentPromptEvidenceV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly sourceId: string;
+  readonly sourceRevision: number;
+  readonly destination: AgentPromptEvidenceDestinationV1;
+  readonly role: "system" | "user" | "assistant" | "tool" | "context" | "policy";
+  readonly correlation: AgentInspectionCorrelationV1;
+  readonly included: boolean;
+  readonly content: string;
+  readonly contentDigest: string;
+  readonly omissionReason: string | null;
+  readonly loomInspection: LoomPromptInspectionV1 | null;
+}
+
+export type AgentCortexReceiptStateV1 = "accepted" | "omitted" | "failed" | "cancelled";
+export type AgentCortexCheckpointV1 = "WORK";
+/** Opaque source revision identity; never coerce a digest-like revision to zero. */
+export type AgentCortexRevisionV1 = string | number;
+export type AgentCortexOmissionReasonV1 =
+  | "stale"
+  | "unauthorized"
+  | "unavailable"
+  | "cancelled"
+  | "failed"
+  | "limit_exceeded"
+  | "snapshot_mismatch";
+
+export interface AgentCortexScopeV1 {
+  readonly chatId: string;
+  readonly targetMessageId: string | null;
+  readonly targetSwipeId: number | null;
+}
+
+export interface AgentCortexOmissionV1 {
+  readonly reason: AgentCortexOmissionReasonV1;
+  readonly required: boolean;
+  /** Bounded host diagnostic; never contains the sidecar result or snapshot payload. */
+  readonly detail: string | null;
+}
+
+export interface AgentCortexReceiptV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly requestId: string;
+  readonly attemptId: string;
+  readonly checkpoint: AgentCortexCheckpointV1;
+  readonly snapshotId: string;
+  readonly sourceRevision: AgentCortexRevisionV1;
+  readonly revision: AgentCortexRevisionV1;
+  readonly scope: AgentCortexScopeV1;
+  readonly required: boolean;
+  readonly startedAt: number;
+  readonly completedAt: number | null;
+  readonly state: AgentCortexReceiptStateV1;
+  readonly resultDigest: string | null;
+  readonly resultCount: number;
+  readonly correlation: AgentInspectionCorrelationV1;
+  readonly reason: AgentInspectionReasonV1 | null;
+  readonly omission: AgentCortexOmissionV1 | null;
+  readonly canonical: false;
+}
+
+export type AgentCouncilReceiptStateV1 = AgentCortexReceiptStateV1;
+export type AgentCouncilCheckpointV1 = "WORK";
+
+export interface AgentCouncilReceiptV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly requestId: string;
+  readonly checkpoint: AgentCouncilCheckpointV1;
+  readonly required: boolean;
+  readonly startedAt: number;
+  readonly completedAt: number | null;
+  readonly state: AgentCouncilReceiptStateV1;
+  readonly memberCount: number;
+  readonly resultDigest: string | null;
+  readonly correlation: AgentInspectionCorrelationV1;
+  readonly reason: AgentInspectionReasonV1 | null;
+  readonly canonical: false;
+}
+
+export interface AgentWorkspaceAssociationV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly workspaceId: string;
+  readonly workspaceRevision: number;
+  readonly relation: "linked" | "published" | "omitted";
+  readonly objectKind:
+    | "objective"
+    | "task"
+    | "finding"
+    | "decision"
+    | "question"
+    | "submission"
+    | "artifact"
+    | "publication";
+  readonly objectId: string | null;
+  readonly sourceRevision: number | null;
+  readonly sourceDeleted: boolean;
+  readonly provenanceDigest: string | null;
+  readonly correlation: AgentInspectionCorrelationV1;
+}
+
+export interface AgentActivityMilestoneV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly parentId: string | null;
+  readonly kind: "root" | "provider" | "child" | "tool" | "milestone";
+  readonly actor: "host" | "owner" | "provider" | "agent" | "child" | "tool";
+  readonly phase: AgentInspectionLifecycleV1;
+  readonly status: AgentInspectionStatusV1 | "omitted";
+  readonly label: string;
+  readonly toolId: string | null;
+  readonly taskId: string | null;
+  readonly sequence: number;
+  readonly startedAt: number;
+  readonly endedAt: number | null;
+  readonly elapsedMs: number | null;
+  readonly usage: AgentInspectionUsageV1 | null;
+  readonly correlation: AgentInspectionCorrelationV1;
+}
+
+export interface AgentActivityTreeV1 {
+  readonly version: 1;
+  readonly attempt: AgentInspectionAttemptLineageV1;
+  readonly lifecycle: AgentInspectionLifecycleV1;
+  readonly status: AgentInspectionStatusV1;
+  readonly outcome: AgentInspectionOutcomeV1 | null;
+  readonly reason: AgentInspectionReasonV1;
+  readonly revision: number;
+  readonly startedAt: number;
+  readonly updatedAt: number;
+  readonly terminalAt: number | null;
+  readonly target: AgentRunTargetV1 | null;
+  readonly milestones: readonly AgentActivityMilestoneV1[];
+  readonly usage: AgentActivityUsageV2;
+  readonly markers: readonly AgentInspectionMarkerV1[];
+  readonly reconciliation: "authoritative" | "reconciling" | "recovered" | "stale";
+}
+
+export interface AgentRunInspectionSummaryV1 {
+  readonly version: 1;
+  readonly attempt: AgentInspectionAttemptLineageV1;
+  readonly hostCorrelationId: string;
+  readonly lifecycle: AgentInspectionLifecycleV1;
+  readonly status: AgentInspectionStatusV1;
+  readonly outcome: AgentInspectionOutcomeV1 | null;
+  readonly reason: AgentInspectionReasonV1;
+  readonly target: AgentRunTargetV1 | null;
+  readonly committedTarget: AgentRunTargetV1 | null;
+  readonly revision: number;
+  readonly startedAt: number;
+  readonly updatedAt: number;
+  readonly terminalAt: number | null;
+  readonly activity: AgentActivityTreeV1;
+  readonly markerCount: number;
+  readonly transcriptCount: number;
+  readonly terminal: boolean;
+}
+
+export interface AgentRunInspectionStopV1 {
+  readonly version: 1;
+  readonly state: "accepted" | "too_late" | "terminal" | "failed" | "reconciled";
+  readonly requestedAt: number;
+  readonly receiptAt: number | null;
+  readonly correlation: AgentInspectionCorrelationV1;
+  readonly reason: AgentInspectionReasonV1;
+}
+
+export interface AgentRunInspectionRetryV1 {
+  readonly allowed: boolean;
+  readonly reason: AgentInspectionReasonV1;
+  readonly targetValid: boolean;
+  readonly linkedAttemptId: string | null;
+}
+
+export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 {
+  readonly transcript: readonly AgentInspectionTranscriptRecordV1[];
+  readonly turnSession: readonly AgentTurnSessionEntryV1[];
+  readonly markers: readonly AgentInspectionMarkerV1[];
+  readonly usageEvidence: readonly AgentInspectionUsageV1[];
+  readonly usage: AgentInspectionUsageProjectionV1;
+  readonly error: AgentInspectionErrorDetailV1 | null;
+  readonly promptEvidence: readonly AgentPromptEvidenceV1[];
+  readonly cortexReceipts: readonly AgentCortexReceiptV1[];
+  readonly councilReceipts: readonly AgentCouncilReceiptV1[];
+  readonly workspaceAssociations: readonly AgentWorkspaceAssociationV1[];
+  readonly stop: AgentRunInspectionStopV1 | null;
+  readonly retry: AgentRunInspectionRetryV1;
+  readonly sectionAvailability: readonly AgentInspectionSectionAvailabilityV1[];
+}
+
+export interface AgentRunInspectionListV1 {
+  readonly version: 1;
+  readonly chatId: string;
+  readonly runs: readonly AgentRunInspectionSummaryV1[];
+  readonly nextCursor: string | null;
+  readonly omission: AgentInspectionMarkerV1 | null;
+}
+
+export interface AgentRunInspectionRetryResponseV1 {
+  readonly version: 1;
+  readonly accepted: boolean;
+  readonly attempt: AgentInspectionAttemptLineageV1 | null;
+  readonly reason: AgentInspectionReasonV1;
+  readonly target?: AgentWorkTargetIdentityV1;
+  readonly recoveryEligible?: boolean;
+  readonly recoveryAction?: AgentRecoveryActionV2;
+  readonly inspectionAttemptId?: string | null;
+  readonly error?: AgentRunPublicErrorV2;
 }

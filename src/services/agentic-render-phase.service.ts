@@ -15,6 +15,9 @@ import {
   utf8ByteLength,
 } from "./agent-runtime-accounting";
 
+const ACCEPTED_WORKSPACE_RESPONSE_CONTRACT =
+  "Host-accepted workspace projection from completed WORK follows. The final complete_turn submission was accepted; any earlier rejected attempt is nonterminal history and must not be reported as the final completion result. Its records are authoritative facts for the final reply. RESPONSE intentionally has no tools: do not claim that tools, the workspace, or child agents were unavailable when these records support their completed results. Follow the render policy and guidance using only supported projection facts; do not expose private reasoning or the WORK transcript.";
+
 /** A stable key used by provisional stream consumers, never by chat storage. */
 export interface AgenticProvisionalStreamKeyV1 {
   readonly turnId: string;
@@ -547,7 +550,10 @@ export async function runAgenticRenderPhaseV1(
     const projectionLiteral = input.acceptedWorkspace.workspaceContextProjection.literal;
     const messages = projectionLiteral.length === 0
       ? baseMessages
-      : [...baseMessages, { role: "system" as const, content: projectionLiteral }];
+      : [{
+          role: "system" as const,
+          content: `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\n${projectionLiteral}`,
+        }, ...baseMessages];
     const contextBytes = serializedContextBytes(input, messages);
     if (contextBytes > input.reservedBudgets.contextBytes) fail("render_context_limit_exceeded");
 

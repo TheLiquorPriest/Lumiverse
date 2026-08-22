@@ -10,6 +10,7 @@ import {
   type PreparedRuntimeRequest,
 } from '@/lib/agentRuntimeSelection'
 import type { AgentRuntimeMode } from '@/types/effective-runtime'
+import type { LoomPromptInspectionV1 } from '@/types/agent-runtime'
 
 /** Generation requests go through prompt assembly + council + embedding calls
  *  which can legitimately take longer than the default 30s client timeout. */
@@ -133,6 +134,11 @@ export interface GenerateRequest {
   exclude_message_id?: string
 }
 
+export interface GenerationStopResult {
+  stopped: boolean
+  status: 'accepted' | 'too_late' | 'not_found'
+}
+
 export interface GenerateResponse {
   generationId: string
 }
@@ -229,6 +235,8 @@ export interface DryRunResponse {
   assistantPrefill?: string
   model: string
   provider: string
+  assemblySurface: 'RESPONSE' | 'WORK'
+  loomPromptInspection?: LoomPromptInspectionV1
   usage?: {
     prompt_tokens: number
     completion_tokens: number
@@ -340,6 +348,8 @@ export interface BreakdownResponse {
   maxContext: number
   model: string
   provider: string
+  assemblySurface?: 'RESPONSE' | 'WORK'
+  loomPromptInspection?: LoomPromptInspectionV1
   parameters?: Record<string, unknown>
   usage?: {
     prompt_tokens: number
@@ -481,6 +491,9 @@ async function startPreparedGeneration(
     const prepared = await preflightGeneration(path, request, intentOptions)
     assertGenerationIntent(request.chat_id, intent.epoch, intent.controller.signal)
     return await dispatchPreparedGeneration(path, prepared, intentOptions, intent.epoch)
+  } catch (error) {
+    resetActiveGenerationMode(request.chat_id)
+    throw error
   } finally {
     intent.cleanup()
   }
@@ -502,7 +515,7 @@ export const generateApi = {
     const body: Record<string, string> = {}
     if (generationId) body.generation_id = generationId
     if (chatId) body.chat_id = chatId
-    return post<void>('/generate/stop', body)
+    return post<GenerationStopResult>('/generate/stop', body)
   },
 
   regenerate(request: GenerateRequest, options?: GenerationRequestOptions) {

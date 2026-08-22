@@ -543,6 +543,7 @@
   "dataPortability": {
     "exportTitle": "Esporta i tuoi dati",
     "exportDesc": "Raggruppa tutto ciò che possiedi — personaggi, chat, world books, personas, presets, cortex memoria, databanks, temi, impostazioni e preferenze delle estensioni — in un unico archivio portatile (.lvbak). Chiavi API e altri segreti non sono mai inclusi.",
+    "exportSchemaVersion": "Versione dello schema dell'archivio: {{version}}",
     "includeVectors": "Includi embedding vettoriali (importazione più rapida su un fornitore di embedding corrispondente; file più grande)",
     "includeSecrets": "Includi chiavi API e segreti (scarica un ticket di decrittazione separato)",
     "secretsWarning": "Verranno scaricati due file: l'archivio (.lvbak) e un piccolo ticket (.ticket.json). Tieni il ticket separato dall'archivio — un gestore di password è l'ideale. Senza il ticket, le chiavi non possono essere ripristinate. Con entrambi i file insieme, chiunque li ottenga può leggere le tue chiavi API.",

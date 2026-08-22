@@ -263,6 +263,95 @@ describe("IsolatePoolV1", () => {
     expect(await failedOver).toBe("fallback");
     await pool.shutdown();
   });
+  test("carries one absolute wall deadline across Worker failover", async () => {
+    const workerHealthTransport = new FakeTransport("worker");
+    const workerHealthPool = new IsolatePoolV1<{ value: string }, string>({
+      backend: "worker",
+      maxWorkers: 1,
+      workerFactory: () => workerHealthTransport,
+    });
+    const workerHealthJob = workerHealthPool.submit({
+      userId: "health",
+      operation: "probe",
+      payload: { value: "worker" },
+    });
+    await waitFor(() => workerHealthTransport.sent.length > 0);
+    workerHealthTransport.respond(response(workerHealthTransport.sent[0], "worker"));
+    await workerHealthJob;
+    await workerHealthPool.shutdown();
+
+    const subprocessHealthTransport = new FakeTransport("subprocess");
+    const subprocessHealthPool = new IsolatePoolV1<{ value: string }, string>({
+      backend: "subprocess",
+      maxWorkers: 1,
+      subprocessFactory: () => subprocessHealthTransport,
+    });
+    const subprocessHealthJob = subprocessHealthPool.submit({
+      userId: "health",
+      operation: "probe",
+      payload: { value: "subprocess" },
+    });
+    await waitFor(() => subprocessHealthTransport.sent.length > 0);
+    subprocessHealthTransport.respond(response(subprocessHealthTransport.sent[0], "subprocess"));
+    await subprocessHealthJob;
+    await subprocessHealthPool.shutdown();
+
+    const workers: FakeTransport[] = [];
+    const subprocesses: FakeTransport[] = [];
+    let workerDeadlineAt: number | null = null;
+    let subprocessDeadlineAt: number | null = null;
+    const request = (job: {
+      requestId: string;
+      operation: string;
+      payload: { value: string };
+      deadlineAt: number;
+    }) => ({
+      version: 1,
+      type: "request",
+      requestId: job.requestId,
+      operation: job.operation,
+      payload: job.payload,
+    });
+    const pool = new IsolatePoolV1<{ value: string }, string>({
+      backend: "auto",
+      maxWorkers: 1,
+      workerFactory: () => {
+        const transport = new FakeTransport("worker");
+        workers.push(transport);
+        return transport;
+      },
+      subprocessFactory: () => {
+        const transport = new FakeTransport("subprocess");
+        subprocesses.push(transport);
+        return transport;
+      },
+      workerRequest: (job) => {
+        workerDeadlineAt = job.deadlineAt;
+        return request(job);
+      },
+      subprocessRequest: (job) => {
+        subprocessDeadlineAt = job.deadlineAt;
+        return request(job);
+      },
+      transportProbe: async () => {},
+    });
+
+    const failedOver = pool.submit({
+      userId: "u",
+      operation: "test",
+      payload: { value: "deadline" },
+      timeoutMs: 100,
+    });
+    await waitFor(() => (workers[0]?.sent.length ?? 0) > 0);
+    workers[0]!.crash(new Error("worker crash"));
+    await waitFor(() => (subprocesses[0]?.sent.length ?? 0) > 0, 64);
+
+    expect(workerDeadlineAt).not.toBeNull();
+    expect(subprocessDeadlineAt).toBe(workerDeadlineAt);
+    subprocesses[0]!.respond(response(subprocesses[0]!.sent.at(-1), "fallback"));
+    expect(await failedOver).toBe("fallback");
+    await pool.shutdown();
+  });
   test("does not reuse an idle Worker slot after a sibling Worker crashes", async () => {
     const workerHealthTransport = new FakeTransport("worker");
     const workerHealthPool = new IsolatePoolV1<{ value: string }, string>({

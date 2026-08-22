@@ -62,4 +62,38 @@ describe("authenticated context pack routes", () => {
     });
     expect(otherRead.status).toBe(404);
   });
+
+  test("lists exact shared revisions with use access but excludes read-only shares", async () => {
+    const shared = createContextPack(OWNER, {
+      name: "Shared route pack",
+      content: [{ id: "entry", title: "Entry", body: "shared", tags: [] }],
+    });
+    getDb().query("UPDATE agent_context_packs SET visibility = 'account' WHERE user_id = ? AND id = ?")
+      .run(OWNER, shared.pack.id);
+    getDb().query(`INSERT INTO agent_context_pack_acls
+      (user_id, pack_id, principal_user_id, permission)
+      VALUES (?, ?, ?, 'read')`)
+      .run(OWNER, shared.pack.id, OTHER);
+
+    const readOnly = await app.request("http://localhost/context-packs/selectable", {
+      headers: { "x-test-user": OTHER },
+    });
+    expect(readOnly.status).toBe(200);
+    expect((await readOnly.json() as { data: unknown[] }).data).toEqual([]);
+
+    getDb().query("UPDATE agent_context_pack_acls SET permission = 'use' WHERE user_id = ? AND pack_id = ? AND principal_user_id = ?")
+      .run(OWNER, shared.pack.id, OTHER);
+    const usable = await app.request("http://localhost/context-packs/selectable", {
+      headers: { "x-test-user": OTHER },
+    });
+    expect(usable.status).toBe(200);
+    expect((await usable.json() as { data: Array<Record<string, unknown>> }).data).toEqual([
+      expect.objectContaining({
+        ownerId: OWNER,
+        source: "shared",
+        packId: shared.pack.id,
+        revision: 1,
+      }),
+    ]);
+  });
 });

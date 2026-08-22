@@ -135,13 +135,13 @@ An attachment marked required is part of Agentic preflight. If it is missing, re
 
 ### “This pack changed in another session. Refresh before trying again.”
 
-The Context Library uses revision preconditions and an account ACL revision. Refresh the pack detail, select the current immutable revision, and retry the action. If you changed visibility or access, re-open **Agentic Runtime → Progressive Context**, remove stale selections, choose the current reviewed revision, and save the shared draft.
+The Context Library uses revision preconditions and an account ACL revision. Refresh the pack detail, select the current immutable revision, and retry the action. If you changed visibility or access, re-open **Agentic Runtime → Phased Instructions**, repair the stale context selection or rule, choose the current reviewed revision, and save the shared draft.
 
 Changing an ACL, attachment, or revision invalidates outstanding Agentic readiness. A turn that has already consumed a context revision rechecks it before commit; it fails closed instead of committing with changed or unauthorized bytes.
 
 ### A cognition rule, task, or Loom block needs repair
 
-Open **Loom Builder → Agentic Runtime** and inspect **Phased Instructions**, **Progressive Context**, **Dynamic Tasks**, and **Portability & Repair**:
+Open **Loom Builder → Agentic Runtime** and inspect **Phased Instructions**, **Dynamic Tasks**, and **Portability & Repair**:
 
 - reselect the current revision for a stale Loom block;
 - restore or remove a missing context-pack revision after reviewing it in Context Library;

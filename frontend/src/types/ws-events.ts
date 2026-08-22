@@ -1,4 +1,4 @@
-import type { AgentActivitySnapshotV1, AgentPublicErrorV1, AgentActivityContinuationMode, AgentPublicErrorCode } from './agent-runtime'
+import type { AgentActivitySnapshotV1, AgentPublicErrorV1, AgentActivityContinuationMode, AgentPublicErrorCode, AgentActivityToolName } from './agent-runtime'
 import type { AgentUsage } from './api'
 import type { RoomParticipant, RoomStateView, PersonaSnapshot } from '@/types/multiplayer'
 
@@ -361,14 +361,7 @@ export interface GenerationPhaseChangedPayload {
 export type AgentInvocationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type AgentActivityPhase = 'queued' | 'started' | 'tool_call' | 'completed' | 'failed' | 'cancelled' | 'timed_out'
 export type AgentActivityActor = 'main_model' | 'child_profile'
-export type AgentActivityToolName =
-  | 'lore_list_books'
-  | 'lore_get_book'
-  | 'lore_list_entries'
-  | 'lore_get_entry'
-  | 'lore_search_entries'
-  | 'chat_search_history'
-  | 'agent_delegate'
+export type { AgentActivityToolName }
 
 /** Compact status-only activity. Unknown names/codes are rejected by the store. */
 export interface AgentActivityPayload {

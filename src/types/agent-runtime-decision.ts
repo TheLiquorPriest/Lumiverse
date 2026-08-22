@@ -7,6 +7,8 @@
  * trust-domain fingerprint.
  */
 
+import type { ResolvedCouncilProfile } from "./council-profile";
+
 export const AGENT_RUNTIME_DECISION_VERSION = 1 as const;
 export const AGENT_RUNTIME_DECISION_TOKEN_TTL_MS = 60_000;
 export const AGENT_RUNTIME_DECISION_MAX_LIVE_PER_USER = 16;
@@ -22,6 +24,84 @@ export const AGENTIC_GENERATION_TYPES = [
 export type AgenticGenerationType = (typeof AGENTIC_GENERATION_TYPES)[number];
 export type AgentRuntimeMode = "response" | "agentic";
 export type RuntimeRevision = string | number;
+export const LOOM_RUNTIME_POLICY_VERSION = 1 as const;
+export const LOOM_RUNTIME_POLICY_SOURCES = [
+  "authenticated_one_turn",
+  "durable_chat_override",
+  "reviewed_preset_default",
+  "response_fallback",
+  "host_cap",
+  "host_rejected",
+] as const;
+export const LOOM_RUNTIME_POLICY_SCOPES = ["turn", "chat", "preset", "fallback", "host"] as const;
+export const LOOM_RUNTIME_POLICY_AVAILABILITY = [
+  "available",
+  "unavailable",
+  "stale",
+  "invalid",
+  "denied",
+  "omitted",
+] as const;
+
+export type LoomRuntimePolicySourceV1 = (typeof LOOM_RUNTIME_POLICY_SOURCES)[number];
+export type LoomRuntimePolicyScopeV1 = (typeof LOOM_RUNTIME_POLICY_SCOPES)[number];
+export type LoomRuntimePolicyAvailabilityStateV1 = (typeof LOOM_RUNTIME_POLICY_AVAILABILITY)[number];
+
+export interface LoomRuntimePolicyCapV1 {
+  authority: "host";
+  allowedModes: readonly AgentRuntimeMode[];
+  reasonCode: AgentRuntimeRepairCode | null;
+}
+
+export interface LoomRuntimePolicyAvailabilityV1 {
+  state: LoomRuntimePolicyAvailabilityStateV1;
+  reasonCode: AgentRuntimeRepairCode | null;
+}
+
+export interface LoomRuntimePolicyTransientSelectionV1 {
+  mode: AgentRuntimeMode;
+  turnFence: RuntimeRevision;
+  authenticated: true;
+}
+
+export interface LoomRuntimePolicyDurableChatOverrideV1 {
+  mode: AgentRuntimeMode | null;
+  revision: number;
+  state: "ready" | "review_required" | "repair_required";
+  reviewCode: string | null;
+  acknowledged: boolean;
+}
+
+export interface LoomRuntimePolicyRepairAcknowledgementV1 {
+  state: "not_required" | "required" | "acknowledged";
+  presetRevision: RuntimeRevision | null;
+  reasonCode: string | null;
+  acknowledgedAt: number | null;
+}
+
+export interface LoomRuntimePolicyV1 {
+  version: typeof LOOM_RUNTIME_POLICY_VERSION;
+  authoredValue: AgentRuntimeMode;
+  effectiveValue: AgentRuntimeMode;
+  source: LoomRuntimePolicySourceV1;
+  scope: LoomRuntimePolicyScopeV1;
+  cap: LoomRuntimePolicyCapV1;
+  availability: LoomRuntimePolicyAvailabilityV1;
+  presetRevision: RuntimeRevision | null;
+  transientSelection: LoomRuntimePolicyTransientSelectionV1 | null;
+  durableChatOverride: LoomRuntimePolicyDurableChatOverrideV1 | null;
+  repairAcknowledgement: LoomRuntimePolicyRepairAcknowledgementV1;
+  nextTurnOnly: true;
+}
+export const AGENT_RUNTIME_POLICY_REPAIR_CODES = [
+  "loom_policy_invalid",
+  "loom_policy_unavailable",
+  "loom_policy_stale",
+  "loom_policy_authority_widening",
+  "loom_policy_repair_required",
+] as const;
+
+
 
 export const AGENT_RUNTIME_CAPABILITY_REQUIREMENTS = [
   "generation",
@@ -66,6 +146,11 @@ export const AGENT_RUNTIME_REPAIR_CODES = [
   "agentic_response_escape",
   "decision_capacity_exceeded",
   "decision_refresh_required",
+  "loom_policy_invalid",
+  "loom_policy_unavailable",
+  "loom_policy_stale",
+  "loom_policy_authority_widening",
+  "loom_policy_repair_required",
 ] as const;
 
 export type AgentRuntimeRepairCode = (typeof AGENT_RUNTIME_REPAIR_CODES)[number];
@@ -147,6 +232,7 @@ export interface EffectiveRuntimeRequestV1 {
   generationType?: AgenticGenerationType | string;
   target?: GenerationTargetV1 | null;
   mode?: AgentRuntimeMode;
+  transientSelection?: LoomRuntimePolicyTransientSelectionV1 | null;
   requestEpoch?: RuntimeRevision;
   inputRevisions?: Partial<InputRevisionSetV1> | null;
   readinessVector?: Partial<AgenticReadinessVectorV1> | null;
@@ -179,11 +265,12 @@ export interface CapabilityReadinessV1 {
   repairCodes: readonly AgentRuntimeRepairCode[];
   responseEscape: "available";
 }
-
 export interface ChatAgentModeOverrideV1 {
   mode: AgentRuntimeMode | null;
   revision: number;
   state: "ready" | "review_required" | "repair_required";
+  reviewCode?: string | null;
+  acknowledged?: boolean;
 }
 
 /** Authenticated public response for POST /api/v1/generate/effective-runtime. */
@@ -198,6 +285,7 @@ export interface EffectiveRuntimePublicResponseV1 {
   defaultMode: AgentRuntimeMode;
   requestedMode: AgentRuntimeMode;
   effectiveMode: AgentRuntimeMode;
+  runtimePolicy: LoomRuntimePolicyV1;
   chatOverride: ChatAgentModeOverrideV1 | null;
   capabilityReadiness: CapabilityReadinessV1;
   repairCodes: readonly AgentRuntimeRepairCode[];
@@ -226,6 +314,7 @@ export interface FrozenConcreteConnectionV1 {
 export interface RuntimeDecisionBindingV1 {
   userId: string;
   chatId: string;
+  turnFence?: RuntimeRevision;
   targetDigest: string;
   requestEpoch: RuntimeRevision;
   logicalConnectionId: string | null;
@@ -242,7 +331,6 @@ export interface RuntimeDecisionBindingV1 {
   inputRevisionDigest: string;
   readinessDigest: string;
 }
-
 export interface RuntimeDecisionInternalV1 {
   binding: RuntimeDecisionBindingV1;
   rootConnection: FrozenConcreteConnectionV1 | null;
@@ -252,6 +340,11 @@ export interface RuntimeDecisionInternalV1 {
    * private, in-memory authority; public DTOs and tokens never expose it.
    */
   configSnapshot?: unknown;
+  /** Frozen host-resolved Council profile; never part of public DTOs/tokens. */
+  councilProfile?: Readonly<ResolvedCouncilProfile>;
+  /** Concrete sidecar connection identity resolved with the decision. */
+  councilConnection?: FrozenConcreteConnectionV1 | null;
+  runtimePolicy?: LoomRuntimePolicyV1;
   readinessVector: AgenticReadinessVectorV1;
   issuedAt: number;
   expiresAt: number;
@@ -269,7 +362,13 @@ export interface RuntimeDecisionTokenConsumptionV1 {
 }
 
 export interface ChatAgentModeWriteV1 {
+  action?: "set" | "reset";
   mode: AgentRuntimeMode | null;
+  expectedRevision: number;
+}
+
+export interface ChatAgentModeResetV1 {
+  action: "reset";
   expectedRevision: number;
 }
 

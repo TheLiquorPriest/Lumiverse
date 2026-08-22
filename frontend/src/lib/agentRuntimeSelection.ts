@@ -27,6 +27,12 @@ export interface RuntimeGenerationRequest {
 
 export interface RuntimeSelectionSnapshot {
   oneTurnMode: AgentRuntimeMode | null
+  /**
+   * A selection made while a generation is already admitted is held for the
+   * next turn. Keeping it out of `oneTurnMode` until the active mode is
+   * released prevents dispatch guards from redirecting an in-flight request.
+   */
+  pendingOneTurnMode: AgentRuntimeMode | null
   effectiveMode: AgentRuntimeMode | null
   agenticReady: boolean
   generationType: string | null
@@ -186,6 +192,7 @@ export function redactRuntimeDecision(
 
 const EMPTY_SELECTION: RuntimeSelectionSnapshot = {
   oneTurnMode: null,
+  pendingOneTurnMode: null,
   effectiveMode: null,
   agenticReady: false,
   generationType: null,
@@ -229,9 +236,12 @@ export function getRuntimeSelectionSnapshot(chatId: string): RuntimeSelectionSna
 export function invalidateRuntimeDecision(chatId: string): void {
   decisionTokens.delete(chatId)
   const current = getRuntimeSelectionSnapshot(chatId)
+  // An admitted generation owns its mode until it settles. Invalidation still
+  // fences an unresolved preflight, but never changes the epoch of the active
+  // request or causes an in-flight run to be redirected to Response.
   if (
     (pendingRequestEpochs.get(chatId)?.size ?? 0) > 0
-    || current.activeGenerationMode === 'agentic'
+    && current.activeGenerationMode === null
   ) {
     nextRuntimeRequestEpoch(chatId)
   }
@@ -239,11 +249,18 @@ export function invalidateRuntimeDecision(chatId: string): void {
 
 export function setOneTurnRuntimeMode(chatId: string, mode: AgentRuntimeMode | null): void {
   const current = getRuntimeSelectionSnapshot(chatId)
-  if (current.oneTurnMode === mode) return
+  if (current.activeGenerationMode !== null) {
+    if (current.pendingOneTurnMode === mode) return
+    // The composer can be reopened by another surface while a run is settling.
+    // Keep the admitted mode stable and stage the new choice for the next turn.
+    publish(chatId, { ...current, pendingOneTurnMode: mode })
+    return
+  }
+  if (current.oneTurnMode === mode && current.pendingOneTurnMode === null) return
   // A mode choice is an authority change. Invalidate any cached one-use token
   // and fence a preflight that is still awaiting the backend decision.
   invalidateRuntimeDecision(chatId)
-  publish(chatId, { ...current, oneTurnMode: mode })
+  publish(chatId, { ...current, oneTurnMode: mode, pendingOneTurnMode: null })
 }
 
 export function clearOneTurnRuntimeMode(chatId: string): void {
@@ -254,7 +271,10 @@ function completeOneTurnSelection(chatId: string, ambient: RuntimeSelectionSnaps
   const current = getRuntimeSelectionSnapshot(chatId)
   publish(chatId, {
     ...current,
-    oneTurnMode: null,
+    // A choice staged during the admitted run belongs to the next turn; the
+    // current run's one-turn mode is consumed without clearing that choice.
+    oneTurnMode: current.pendingOneTurnMode,
+    pendingOneTurnMode: null,
     effectiveMode: ambient.effectiveMode,
     agenticReady: ambient.agenticReady,
     generationType: ambient.generationType,
@@ -276,7 +296,12 @@ function completeResponseDispatch(
 export function resetActiveGenerationMode(chatId: string): void {
   const current = getRuntimeSelectionSnapshot(chatId)
   if (current.activeGenerationMode === null) return
-  publish(chatId, { ...current, activeGenerationMode: null })
+  publish(chatId, {
+    ...current,
+    oneTurnMode: current.pendingOneTurnMode ?? current.oneTurnMode,
+    pendingOneTurnMode: null,
+    activeGenerationMode: null,
+  })
 }
 
 function markPreparedGenerationMode(chatId: string, mode: AgentRuntimeMode): void {

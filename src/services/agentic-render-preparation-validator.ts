@@ -34,7 +34,8 @@ type Dict = Record<string, unknown>;
 const MAX_IDENTIFIER_BYTES = 512;
 const MAX_ENUM_BYTES = 64;
 const MAX_DIGEST_BYTES = 128;
-const MAX_REVISION_BYTES = 128;
+/** Matches the compiler/WORK closed revision-identity bound (256 UTF-8 bytes). */
+const MAX_REVISION_BYTES = 256;
 const MAX_VARIABLE_KEY_BYTES = 512;
 const MAX_MIME_TYPE_BYTES = 256;
 const MAX_REGEX_FLAG_BYTES = 16;

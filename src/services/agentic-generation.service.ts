@@ -17,7 +17,12 @@ import type { GenerationAssemblySnapshotV1 } from "./prompt-assembly-snapshot.se
 import type { AssemblyPlanV1 } from "./agentic-assembly-compiler";
 import type { AgenticWorkPhaseOutcome } from "./agentic-work-phase.service";
 import type { RenderUsageV1 } from "../types/agent-preprocessing";
-
+import type {
+  AgentWorkAttemptLineageV1,
+  AgentWorkOutcome,
+  AgentWorkPhase,
+  AgentWorkStatus,
+} from "../types/agent-runtime";
 /** The only generation targets accepted by the closed single-turn Agentic runtime. */
 export type AgenticGenerationTarget = "normal" | "continue" | "regenerate" | "swipe";
 
@@ -40,7 +45,8 @@ export type AgenticTerminalStatus =
   | "failed"
   | "cancelled"
   | "timed_out"
-  | "exhausted";
+  | "exhausted"
+  | "rejected";
 
 export type AgenticFailureCode =
   | "agentic_unsupported_surface"
@@ -87,6 +93,7 @@ export interface AgenticGenerationInput {
   swipeId?: number;
   targetCharacterId?: string;
   generationType: GenerationType | AgenticGenerationTarget;
+  readonly attemptLineage?: Partial<AgentWorkAttemptLineageV1> | null;
   parameters?: GenerationParameters;
   userInput?: string;
   regenFeedback?: string;
@@ -224,6 +231,7 @@ export interface AgenticExecutionCreateInput {
   chatId: string;
   target: AgenticTargetSnapshot;
   decision: AgenticRuntimeDecision;
+  readonly attemptLineage?: Partial<AgentWorkAttemptLineageV1> | null;
   signal: AbortSignal;
   deadlineAt?: number;
 }
@@ -350,6 +358,11 @@ export interface AgenticGenerationDependencies {
     userId: string;
     chatId: string;
     phase: AgenticPhase;
+    workPhase?: AgentWorkPhase;
+    workStatus?: AgentWorkStatus;
+    workOutcome?: AgentWorkOutcome | null;
+    reason?: string | null;
+    attemptLineage?: AgentWorkAttemptLineageV1;
     target: AgenticTargetSnapshot;
   }) => Promise<void> | void;
   publishTerminal?: (event: {
@@ -358,6 +371,11 @@ export interface AgenticGenerationDependencies {
     chatId: string;
     status: AgenticTerminalStatus;
     phase: AgenticPhase;
+    workPhase?: AgentWorkPhase;
+    workStatus?: AgentWorkStatus;
+    workOutcome?: AgentWorkOutcome | null;
+    reason?: string | null;
+    attemptLineage?: AgentWorkAttemptLineageV1;
     target: AgenticTargetSnapshot;
     receipt?: AgenticCommitReceipt;
     errorCode?: AgenticFailureCode | string;
@@ -375,6 +393,11 @@ export interface AgenticGenerationDependencies {
       chatId: string;
       status: AgenticTerminalStatus;
       phase: AgenticPhase;
+      workPhase?: AgentWorkPhase;
+      workStatus?: AgentWorkStatus;
+      workOutcome?: AgentWorkOutcome | null;
+      reason?: string | null;
+      attemptLineage?: AgentWorkAttemptLineageV1;
       target: AgenticTargetSnapshot;
       receipt?: AgenticCommitReceipt;
       errorCode?: AgenticFailureCode | string;
@@ -397,11 +420,20 @@ export interface AgenticGenerationResult {
   status: "streaming" | AgenticTerminalStatus;
   mode: "agentic";
   phase: AgenticPhase;
+  readonly workPhase: AgentWorkPhase;
+  readonly workStatus: AgentWorkStatus;
+  readonly workOutcome: AgentWorkOutcome | null;
+  readonly reason: string | null;
+  readonly attemptLineage: AgentWorkAttemptLineageV1;
   receipt?: AgenticCommitReceipt;
   errorCode?: AgenticFailureCode | string;
   errorMessage?: string;
   responseModeAvailable: true;
 }
+type AgenticInternalGenerationResult = Omit<
+  AgenticGenerationResult,
+  "workPhase" | "workStatus" | "workOutcome" | "reason" | "attemptLineage"
+>;
 
 type ActiveAgenticGeneration = {
   generationId: string;
@@ -412,7 +444,13 @@ type ActiveAgenticGeneration = {
   contextRuntime?: AgenticContextRuntimeV1;
   completion: Promise<AgenticGenerationResult>;
   resolve: (result: AgenticGenerationResult) => void;
+  /** Resolves only after the durable execution row is admitted. */
+  admission: Promise<void>;
+  resolveAdmission: () => void;
+  rejectAdmission: (reason?: unknown) => void;
+  admissionSettled: boolean;
   phase: AgenticPhase;
+  attemptLineage: AgentWorkAttemptLineageV1;
   terminal: boolean;
   /** Stop can arrive before durable execution creation finishes. */
   pendingCancellation: boolean;
@@ -423,9 +461,20 @@ type ActiveAgenticGeneration = {
 };
 
 const activeAgenticGenerations = new Map<string, ActiveAgenticGeneration>();
-const settledAgenticGenerations = new Map<string, AgenticGenerationResult>();
 const activeAgenticChats = new Map<string, string>();
+const settledAgenticGenerations = new Map<string, AgenticGenerationResult>();
+const agenticAdmissions = new Map<string, Promise<void>>();
 let configuredAgenticDependencies: AgenticGenerationDependencies | undefined;
+
+/**
+ * The coordinator installs the same dependency instance used by ordinary
+ * Agentic starts. Explicit Retry must never construct a detached authority.
+ */
+export function configureAgenticGenerationRuntimeDependencies(
+  dependencies: AgenticGenerationDependencies,
+): void {
+  configuredAgenticDependencies = dependencies;
+}
 
 function resolveDependencies(
   dependencies: AgenticGenerationDependencies | undefined,
@@ -689,12 +738,15 @@ async function transition(
     active.phase = next;
   }
   if (deps.publishPhase) {
+    const target = targetFor(active);
+    const canonical = canonicalFor(active, next, "streaming");
     await deps.publishPhase({
       executionId: active.execution?.id ?? active.generationId,
       userId: active.input.userId,
       chatId: active.input.chatId,
       phase: next,
-      target: targetFor(active),
+      ...canonical,
+      target,
     });
   }
 }
@@ -731,6 +783,135 @@ function targetFor(active: ActiveAgenticGeneration): AgenticTargetSnapshot {
   if (active.execution?.target) return active.execution.target;
   return active.dependencies.getExecutionTarget?.(active.generationId) ?? targetFromInput(active.input);
 }
+function boundedAgenticId(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= 256
+    ? value
+    : null;
+}
+
+function attemptLineageFor(
+  generationId: string,
+  input: AgenticGenerationInput,
+  target: AgenticTargetSnapshot,
+): AgentWorkAttemptLineageV1 {
+  const source = input.attemptLineage && typeof input.attemptLineage === "object"
+    ? input.attemptLineage as Record<string, unknown> : {};
+  const createdAt = typeof source.createdAt === "number" && Number.isSafeInteger(source.createdAt) && source.createdAt >= 0
+    ? source.createdAt : Date.now();
+  return {
+    version: 1,
+    attemptId: boundedAgenticId(source.attemptId) ?? generationId,
+    previousAttemptId: source.previousAttemptId === null ? null : boundedAgenticId(source.previousAttemptId),
+    target: {
+      chatId: input.chatId,
+      generationType: target.generationType,
+      messageId: target.messageId ?? null,
+      swipeId: Number.isSafeInteger(target.swipeId) && (target.swipeId as number) >= 0 ? target.swipeId ?? null : null,
+    },
+    createdAt,
+  };
+}
+
+function workPhaseForAgentic(phase: AgenticPhase, terminal: boolean): AgentWorkPhase {
+  if (terminal) return "TERMINAL";
+  if (phase === "ASSEMBLE") return "ASSEMBLE";
+  if (phase === "WORK") return "WORK";
+  if (phase === "COMPLETE") return "PREPARE_COMMIT";
+  if (phase === "RENDER") return "RENDER";
+  if (phase === "PREPARE_COMMIT" || phase === "COMMITTING") return "COMMIT";
+  return "TERMINAL";
+}
+
+type CanonicalTerminalCause = "stopped" | "exhausted" | "failed";
+
+function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
+  if (typeof value !== "string") return null;
+  const code = value.trim().toLowerCase();
+  if (!code) return null;
+  if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
+    return "stopped";
+  }
+  if (
+    code === "exhausted"
+    || code === "budget_exhausted"
+    || code === "limit_exceeded"
+    || code === "agentic_work_exhausted"
+    || code === "root_wall_clock_limit_exceeded"
+    || code.endsWith("_limit_exceeded")
+    || code.endsWith("_budget_exhausted")
+  ) {
+    return "exhausted";
+  }
+  return "failed";
+}
+
+function hostDeadlineExceeded(
+  active: ActiveAgenticGeneration,
+  status: "streaming" | AgenticTerminalStatus,
+  errorCode?: string,
+): boolean {
+  if (status !== "timed_out") return false;
+  const code = typeof errorCode === "string" ? errorCode.trim().toLowerCase() : "";
+  if (code && code !== "timed_out" && code !== "timeout" && code !== "agentic_timed_out") return false;
+  const reason = active.controller.signal.reason;
+  return reason instanceof DOMException && reason.name === "TimeoutError";
+}
+
+function workOutcomeForStatus(
+  active: ActiveAgenticGeneration,
+  status: "streaming" | AgenticTerminalStatus,
+  errorCode?: string,
+): AgentWorkOutcome | null {
+  if (status === "completed") return "completed";
+  if (status === "rejected") return "rejected";
+  const cause = terminalCauseForCode(errorCode);
+  if (cause === "stopped") return active.cancellationRequested ? "stopped" : "failed";
+  if (cause === "exhausted") return "exhausted";
+  if (cause === "failed") return "failed";
+  if (status === "cancelled") return active.cancellationRequested ? "stopped" : "failed";
+  if (status === "timed_out") return hostDeadlineExceeded(active, status, errorCode) ? "exhausted" : "failed";
+  if (status === "exhausted") return "exhausted";
+  if (status === "failed") return "failed";
+  return null;
+}
+
+function workReasonForStatus(
+  active: ActiveAgenticGeneration,
+  status: "streaming" | AgenticTerminalStatus,
+  errorCode?: string,
+): string | null {
+  const outcome = workOutcomeForStatus(active, status, errorCode);
+  if (outcome === null) return null;
+  if (outcome === "completed") return null;
+  if (outcome === "stopped") return "stopped";
+  if (typeof errorCode === "string" && errorCode.trim().length > 0) return errorCode;
+  if (outcome === "exhausted") return "exhausted";
+  if (status === "timed_out") return "timed_out";
+  if (outcome === "rejected") return "rejected";
+  return "failed";
+}
+
+function canonicalFor(
+  active: ActiveAgenticGeneration,
+  phase: AgenticPhase,
+  status: "streaming" | AgenticTerminalStatus,
+  errorCode?: string,
+): Pick<AgenticGenerationResult, "workPhase" | "workStatus" | "workOutcome" | "reason" | "attemptLineage"> {
+  const outcome = workOutcomeForStatus(active, status, errorCode);
+  const terminal = outcome !== null;
+  return {
+    workPhase: workPhaseForAgentic(phase, terminal),
+    workStatus: terminal
+      ? "terminal"
+      : phase === "COMPLETE" || phase === "PREPARE_COMMIT"
+        ? "waiting"
+        : "running",
+    workOutcome: outcome,
+    reason: workReasonForStatus(active, status, errorCode),
+    attemptLineage: active.attemptLineage,
+  };
+}
+
 
 function assertNotAborted(signal: AbortSignal, phase: AgenticPhase): void {
   if (!signal.aborted) return;
@@ -775,7 +956,7 @@ async function cancelAndJoinChildrenBeforeTerminal(
 async function runAgenticGenerationInternal(
   active: ActiveAgenticGeneration,
   deps: AgenticGenerationDependencies,
-): Promise<AgenticGenerationResult> {
+): Promise<AgenticInternalGenerationResult> {
   const { input, controller } = active;
   const signal = controller.signal;
   let decision: AgenticRuntimeDecision | undefined;
@@ -818,9 +999,18 @@ async function runAgenticGenerationInternal(
         chatId: input.chatId,
         target,
         decision,
+        attemptLineage: active.attemptLineage,
         signal,
       });
     }
+    if (deps.createExecution && !active.execution) {
+      throw new AgenticGenerationError(
+        "agentic_runtime_unavailable",
+        "Agentic execution admission did not return a durable handle.",
+        { phase: "ASSEMBLE", retryable: true },
+      );
+    }
+    active.resolveAdmission();
     if (active.pendingCancellation) {
       active.pendingCancellation = false;
       const cancellation = await requestDurableCancellation(active, "stopped");
@@ -970,6 +1160,7 @@ async function runAgenticGenerationInternal(
       responseModeAvailable: true,
     };
   } catch (error) {
+    if (!active.admissionSettled) active.rejectAdmission(error);
     console.error("[agentic] turn failed", active.phase, error);
     let phase = active.phase;
     const durablePhase = await readDurablePhase(deps, active);
@@ -988,27 +1179,40 @@ async function runAgenticGenerationInternal(
     }
     if (durablePhase === "COMMIT_FAILED" || durablePhase === "EXHAUSTED" || durablePhase === "FAILED" || durablePhase === "CANCELLED" || durablePhase === "TIMED_OUT") {
       active.phase = durablePhase;
+      const durableErrorCode = asErrorCode(error);
+      const durableFailureCode = durableErrorCode === "agentic_cancelled" && !active.cancellationRequested
+        ? "agentic_internal_error"
+        : durableErrorCode;
+      const hostTimeout = durablePhase === "TIMED_OUT"
+        && hostDeadlineExceeded(active, "timed_out", durableErrorCode);
+      const acceptedCancellation = durablePhase === "CANCELLED" && active.cancellationRequested;
+      const rejectedBeforeWork = durablePhase === "FAILED"
+        && phase === "ASSEMBLE"
+        && durableFailureCode !== "agentic_cancelled"
+        && durableFailureCode !== "agentic_timed_out";
       finalStatus = durablePhase === "CANCELLED"
-        ? "cancelled"
+        ? (acceptedCancellation ? "cancelled" : "failed")
         : durablePhase === "TIMED_OUT"
           ? "timed_out"
           : durablePhase === "EXHAUSTED"
             ? "exhausted"
-            : "failed";
+            : rejectedBeforeWork
+              ? "rejected"
+              : "failed";
       finalCode = durablePhase === "CANCELLED"
-        ? "agentic_cancelled"
+        ? (acceptedCancellation ? "agentic_cancelled" : "agentic_internal_error")
         : durablePhase === "TIMED_OUT"
-          ? "agentic_timed_out"
+          ? (hostTimeout ? "root_wall_clock_limit_exceeded" : durableFailureCode)
           : durablePhase === "EXHAUSTED"
             ? "agentic_work_exhausted"
             : durablePhase === "COMMIT_FAILED"
               ? "agentic_commit_failed"
-              : asErrorCode(error);
+              : durableFailureCode;
       const joined = await cancelAndJoinChildrenBeforeTerminal(
         active,
         deps,
         durablePhase === "CANCELLED"
-          ? "cancelled"
+          ? (acceptedCancellation ? "cancelled" : "failed")
           : durablePhase === "TIMED_OUT"
             ? "timed_out"
             : durablePhase === "EXHAUSTED"
@@ -1028,23 +1232,31 @@ async function runAgenticGenerationInternal(
         responseModeAvailable: true,
       };
     }
-    if (durablePhase) {
-      phase = durablePhase;
-      active.phase = durablePhase;
-    }
     const wrapped = isAbort(error, signal)
       ? (isTimeout(error, signal)
         ? new AgenticGenerationError("agentic_timed_out", "Agentic generation timed out.", { phase })
         : new AgenticGenerationError("agentic_cancelled", "Agentic generation cancelled.", { phase }))
       : asPhaseError(error, phase);
-    finalCode = wrapped.code;
+    const hostTimeout = hostDeadlineExceeded(active, "timed_out", wrapped.code);
+    const acceptedCancellation = wrapped.code === "agentic_cancelled" && active.cancellationRequested;
+    finalCode = hostTimeout
+      ? "root_wall_clock_limit_exceeded"
+      : wrapped.code === "agentic_cancelled" && !acceptedCancellation
+        ? "agentic_internal_error"
+        : wrapped.code;
+    const rejectedBeforeWork = phase === "ASSEMBLE"
+      && wrapped.code !== "agentic_cancelled"
+      && wrapped.code !== "agentic_timed_out"
+      && wrapped.code !== "agentic_work_exhausted";
     finalStatus = wrapped.code === "agentic_timed_out"
       ? "timed_out"
       : wrapped.code === "agentic_cancelled"
-        ? "cancelled"
+        ? (acceptedCancellation ? "cancelled" : "failed")
         : wrapped.code === "agentic_work_exhausted"
           ? "exhausted"
-          : "failed";
+          : rejectedBeforeWork
+            ? "rejected"
+            : "failed";
     const commitPhase = phase === "COMMITTING";
     if (commitPhase) finalCode = "agentic_commit_failed";
     const terminalPhase: AgenticPhase = finalStatus === "cancelled"
@@ -1109,6 +1321,7 @@ export async function runAgenticGeneration(
   const target = targetFromInput(input);
   assertSupportedSurface(input);
   const generationId = crypto.randomUUID();
+  const attemptLineage = attemptLineageFor(generationId, input, target);
   const controller = new AbortController();
   const abortFromRequest = () => controller.abort(input.signal?.reason ?? new DOMException("Aborted", "AbortError"));
   if (input.signal) {
@@ -1119,6 +1332,29 @@ export async function runAgenticGeneration(
   const completion = new Promise<AgenticGenerationResult>((resolveCompletion) => {
     resolve = resolveCompletion;
   });
+  let resolveAdmissionPromise!: () => void;
+  let rejectAdmissionPromise!: (reason?: unknown) => void;
+  let admissionSettled = false;
+  let activeAdmissionOwner: ActiveAgenticGeneration | undefined;
+  const admission = new Promise<void>((resolveAdmission, rejectAdmission) => {
+    resolveAdmissionPromise = resolveAdmission;
+    rejectAdmissionPromise = rejectAdmission;
+  });
+  // A normal Send does not await admission, but a rejected admission must
+  // still be marked handled while Retry awaits the same promise.
+  void admission.catch(() => undefined);
+  const resolveAdmission = (): void => {
+    if (admissionSettled) return;
+    admissionSettled = true;
+    if (activeAdmissionOwner) activeAdmissionOwner.admissionSettled = true;
+    resolveAdmissionPromise();
+  };
+  const rejectAdmission = (reason?: unknown): void => {
+    if (admissionSettled) return;
+    admissionSettled = true;
+    if (activeAdmissionOwner) activeAdmissionOwner.admissionSettled = true;
+    rejectAdmissionPromise(reason);
+  };
   const active: ActiveAgenticGeneration = {
     generationId,
     input,
@@ -1126,11 +1362,17 @@ export async function runAgenticGeneration(
     controller,
     completion,
     resolve,
+    admission,
+    resolveAdmission,
+    rejectAdmission,
+    admissionSettled: false,
     phase: "ASSEMBLE",
+    attemptLineage,
     terminal: false,
     pendingCancellation: false,
     cancellationRequested: false,
   };
+  activeAdmissionOwner = active;
   const chatKey = `${input.userId}:${input.chatId}`;
   const existingGenerationId = activeAgenticChats.get(chatKey);
   if (existingGenerationId) {
@@ -1145,6 +1387,7 @@ export async function runAgenticGeneration(
     activeAgenticChats.delete(chatKey);
   }
   activeAgenticGenerations.set(generationId, active);
+  agenticAdmissions.set(generationId, admission);
   activeAgenticChats.set(chatKey, generationId);
   // Keep the requested generation ID stable across status/stop/projection surfaces.
   // The execution service may use its own durable ID; callers always use this ID.
@@ -1152,16 +1395,23 @@ export async function runAgenticGeneration(
     let projected: AgenticGenerationResult;
     try {
       const result = await runAgenticGenerationInternal(active, resolvedDeps);
-      projected = { ...result, generationId };
+      projected = {
+        ...result,
+        generationId,
+        ...canonicalFor(active, result.phase, result.status, result.errorCode),
+      };
     } catch (error) {
       // The internal runner normally converts failures into terminal results.
       // Keep the detached owner settling even if an unexpected adapter error
       // escapes that conversion.
+      if (!active.admissionSettled) active.rejectAdmission(error);
+      const escapedStatus: AgenticTerminalStatus = active.phase === "ASSEMBLE" ? "rejected" : "failed";
       projected = {
         generationId,
-        status: "failed",
+        status: escapedStatus,
         mode: "agentic",
         phase: active.phase,
+        ...canonicalFor(active, active.phase, escapedStatus, asErrorCode(error)),
         errorCode: asErrorCode(error),
         errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : undefined,
         responseModeAvailable: true,
@@ -1172,32 +1422,37 @@ export async function runAgenticGeneration(
       ?? target;
     active.terminal = true;
     const terminalStatus = projected.status === "streaming" ? "failed" : projected.status;
+    const terminalCanonical = canonicalFor(active, projected.phase, terminalStatus, projected.errorCode);
     const terminalEvent = {
       executionId: generationId,
       userId: input.userId,
       chatId: input.chatId,
       status: terminalStatus,
       phase: projected.phase,
+      ...terminalCanonical,
       target: terminalTarget,
       ...(projected.receipt ? { receipt: projected.receipt } : {}),
       ...(projected.errorCode ? { errorCode: projected.errorCode } : {}),
       ...(projected.errorMessage ? { errorMessage: projected.errorMessage } : {}),
     };
-    try {
-      if (resolvedDeps.publishTerminal) await resolvedDeps.publishTerminal(terminalEvent);
-    } catch (error) {
-      // Keep the durable result observable, but make publication failure an
-      // explicit reconciliation event instead of silently discarding it.
+    const suppressPhantomRetryPublication = active.attemptLineage.previousAttemptId !== null && !active.execution;
+    if (!suppressPhantomRetryPublication) {
       try {
-        await resolvedDeps.terminalPublicationFailed?.(terminalEvent, error);
-      } catch (reconciliationError) {
-        console.error("[agentic] terminal reconciliation failed", reconciliationError);
-      }
-      if (!resolvedDeps.terminalPublicationFailed) {
-        projected = {
-          ...projected,
-          errorCode: asErrorCode(error),
-        };
+        if (resolvedDeps.publishTerminal) await resolvedDeps.publishTerminal(terminalEvent);
+      } catch (error) {
+        // Keep the durable result observable, but make publication failure an
+        // explicit reconciliation event instead of silently discarding it.
+        try {
+          await resolvedDeps.terminalPublicationFailed?.(terminalEvent, error);
+        } catch (reconciliationError) {
+          console.error("[agentic] terminal reconciliation failed", reconciliationError);
+        }
+        if (!resolvedDeps.terminalPublicationFailed) {
+          projected = {
+            ...projected,
+            errorCode: asErrorCode(error),
+          };
+        }
       }
     }
     try {
@@ -1216,6 +1471,10 @@ export async function runAgenticGeneration(
       const oldest = settledAgenticGenerations.keys().next().value;
       if (typeof oldest === "string") settledAgenticGenerations.delete(oldest);
     }
+    if (agenticAdmissions.size > 256) {
+      const oldestAdmission = agenticAdmissions.keys().next().value;
+      if (typeof oldestAdmission === "string") agenticAdmissions.delete(oldestAdmission);
+    }
     active.resolve(projected);
     activeAgenticGenerations.delete(generationId);
     if (activeAgenticChats.get(`${input.userId}:${input.chatId}`) === generationId) {
@@ -1228,6 +1487,11 @@ export async function runAgenticGeneration(
     status: "streaming",
     mode: "agentic",
     phase: "ASSEMBLE",
+    workPhase: "ADMIT",
+    workStatus: "pending",
+    workOutcome: null,
+    reason: null,
+    attemptLineage,
     responseModeAvailable: true,
   };
 }
@@ -1248,6 +1512,58 @@ export async function waitForAgenticGeneration(
   return active?.completion ?? settledAgenticGenerations.get(generationId);
 }
 
+/** Wait until the durable execution row for a generation has been admitted. */
+export async function waitForAgenticGenerationAdmission(
+  generationId: string,
+): Promise<void> {
+  const admission = agenticAdmissions.get(generationId);
+  if (!admission) {
+    if (settledAgenticGenerations.has(generationId)) return;
+    throw new AgenticGenerationError(
+      "agentic_runtime_unavailable",
+      "Agentic execution admission is unavailable.",
+      { phase: "ASSEMBLE", retryable: true },
+    );
+  }
+  await admission;
+}
+
+/**
+ * Explicit user Retry. Validation of ownership, prior outcome, and the live
+ * target happens in the projection authority before this function is called.
+ * This function only enters the same canonical Agentic admission runner and
+ * waits until its real durable execution exists.
+ */
+export async function retryAgenticGeneration(
+  input: AgenticGenerationInput,
+  previousAttemptId: string,
+  deps?: AgenticGenerationDependencies,
+): Promise<AgenticGenerationResult> {
+  const previous = boundedAgenticId(previousAttemptId);
+  if (!previous) {
+    throw new AgenticGenerationError(
+      "agentic_preflight_failed",
+      "Retry requires a valid previous attempt.",
+      { phase: "ASSEMBLE" },
+    );
+  }
+  const resolvedDeps = resolveDependencies(deps);
+  if (!resolvedDeps.createExecution) {
+    throw new AgenticGenerationError(
+      "agentic_runtime_unavailable",
+      "Agentic execution admission is unavailable.",
+      { phase: "ASSEMBLE", retryable: true },
+    );
+  }
+  targetFromInput(input);
+  const started = await startAgenticGeneration({
+    ...input,
+    attemptLineage: { previousAttemptId: previous },
+  }, resolvedDeps);
+  await waitForAgenticGenerationAdmission(started.generationId);
+  return started;
+}
+
 async function requestDurableCancellation(
   active: ActiveAgenticGeneration,
   reason: "stopped" | "cancelled" | "timed_out" = "stopped",
@@ -1263,12 +1579,21 @@ async function requestDurableCancellation(
     return true;
   }
   if (!active.dependencies.requestCancellation) return false;
-  active.cancellationRequested = true;
   const inFlight = Promise.resolve(
     active.dependencies.requestCancellation(active.execution, reason),
-  ).then((accepted) => {
-    if (accepted === true) abortControllerForAcceptedCancellation(active);
-    return accepted;
+  ).then(async (accepted) => {
+    let acceptedCancellation = accepted === true;
+    if (acceptedCancellation && active.dependencies.readExecutionPhase) {
+      const phase = await active.dependencies.readExecutionPhase(active.execution!);
+      if (phase === "TIMED_OUT" || phase === "EXHAUSTED" || phase === "FAILED" || phase === "COMMIT_FAILED") {
+        acceptedCancellation = false;
+      }
+    }
+    if (acceptedCancellation) {
+      active.cancellationRequested = true;
+      abortControllerForAcceptedCancellation(active);
+    }
+    return acceptedCancellation ? true : accepted;
   }).catch((error: unknown) => {
     let code: unknown;
     if (error && typeof error === "object" && "code" in error) code = error.code;
@@ -1381,5 +1706,12 @@ export function getActiveAgenticGenerationCount(): number {
 export function getActiveAgenticGeneration(userId: string, generationId: string): AgenticGenerationResult | undefined {
   const active = activeAgenticGenerations.get(generationId);
   if (!active || active.input.userId !== userId) return undefined;
-  return { generationId, status: "streaming", mode: "agentic", phase: active.phase, responseModeAvailable: true };
+  return {
+    generationId,
+    status: "streaming",
+    mode: "agentic",
+    phase: active.phase,
+    ...canonicalFor(active, active.phase, "streaming"),
+    responseModeAvailable: true,
+  };
 }

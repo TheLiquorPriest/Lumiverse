@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { getDb } from "../db/connection";
+import type { AgentInspectionWriterV1 } from "./agent-activity-runs.service";
 import {
   getContextAccountRevision,
   listContextPackAccountCandidateMetadata,
@@ -415,6 +416,8 @@ export interface ContextToolInvocationOptionsV1 {
   readonly operationGate?: ContextPackAclOperationGate;
   /** Cognition-activated subset; omitted only for legacy callers that expose all frozen candidates. */
   readonly activeCandidates?: ContextPackActiveCandidateSetV1;
+  /** Owner-only causal inspection; never exposed to the model. */
+  readonly inspection?: AgentInspectionWriterV1;
 }
 
 /** Narrow capability injected into WORK; no database or callback chain is exposed. */
@@ -900,7 +903,7 @@ export function buildHostPrefetchedAgentContextSnapshot(
 
 
 function contextActivationKey(requirement: ContextPackActivationRequirementV1): string {
-  return `${requirement.packId}\u0000${requirement.revisionId}\u0000${requirement.digest ?? "<unknown>"}`;
+  return `${requirement.packId}\u0000${requirement.revisionId}`;
 }
 
 function contextCandidateActivationKey(candidate: ContextPackCandidateV1): string {
@@ -983,6 +986,164 @@ function normalizeActiveCandidateSet(
   return entries;
 }
 
+type ContextInspectionWriter = {
+  readonly record: (kind: "tool" | "condition", value?: unknown, state?: unknown) => unknown;
+};
+
+const CONTEXT_INSPECTION_SECRET_KEY = /(?:secret|credential|password|authorization|token|api[_-]?key|private[_-]?key)/i;
+
+function contextInspectionRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeContextInspectionValue(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "[bounded]";
+  if (typeof value === "string") return value.length > 16_384 ? `${value.slice(0, 16_384)}…` : value;
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, 128).map((item) => safeContextInspectionValue(item, depth + 1));
+  if (!contextInspectionRecord(value)) return "[unavailable]";
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = key.replace(/[-\s]/g, "_");
+    if (
+      CONTEXT_INSPECTION_SECRET_KEY.test(normalized)
+      || normalized === "otheruserdata"
+      || normalized === "other_user_data"
+    ) continue;
+    result[key] = safeContextInspectionValue(item, depth + 1);
+  }
+  return result;
+}
+
+function contextInspectionJson(value: unknown): string {
+  try {
+    const json = JSON.stringify(safeContextInspectionValue(value));
+    if (typeof json !== "string") return "[unavailable]";
+    return json.length > 16_384 ? `${json.slice(0, 16_384)}…` : json;
+  } catch {
+    return "[unavailable]";
+  }
+}
+
+function contextInspectionRecordId(value: unknown): string | undefined {
+  if (!contextInspectionRecord(value) || !Array.isArray(value.transcript)) return undefined;
+  const record = value.transcript[value.transcript.length - 1];
+  return contextInspectionRecord(record) && typeof record.id === "string" ? record.id : undefined;
+}
+
+function contextInspectionErrorReason(errorCode: ContextToolErrorCode | undefined): string | undefined {
+  if (!errorCode) return undefined;
+  if (errorCode === "cancelled") return "interrupted";
+  if (errorCode === "invalid_arguments") return "invalid_input";
+  if (errorCode === "context_access_invalidated") return "stale_input";
+  if (errorCode === "context_pack_limit_exceeded") return "budget_exhausted";
+  if (errorCode === "context_pack_not_found" || errorCode === "context_access_denied") return "unavailable";
+  return "tool_failure";
+}
+
+function recordContextCondition(
+  writer: ContextInspectionWriter | undefined,
+  toolName: ContextToolId,
+  parentId: string | undefined,
+  value: unknown,
+): void {
+  try {
+    writer?.record("condition", {
+      ...(parentId ? { id: `${parentId}:condition` } : {}),
+      kind: "condition",
+      actor: "host",
+      recipient: "tool",
+      toolId: toolName,
+      content: `context gate decision: ${toolName}`,
+      result: contextInspectionJson(value),
+      correlation: {
+        actorId: "host",
+        recipientId: "tool",
+        toolId: toolName,
+        ...(parentId ? { parentId } : {}),
+      },
+    });
+  } catch {
+    // Inspection persistence must not change the authorized tool result.
+  }
+}
+
+
+async function traceContextToolCall(
+  writer: ContextInspectionWriter | undefined,
+  toolName: ContextToolId,
+  args: unknown,
+  invoke: () => Promise<ContextToolResult>,
+): Promise<ContextToolResult> {
+  let requestId: string | undefined;
+  try {
+    requestId = contextInspectionRecordId(writer?.record("tool", {
+      kind: "tool",
+      actor: "agent",
+      recipient: "tool",
+      toolId: toolName,
+      content: `tool request: ${toolName}`,
+      arguments: contextInspectionJson(args),
+      correlation: { actorId: "agent", recipientId: "tool", toolId: toolName },
+    }));
+  } catch {
+    requestId = undefined;
+  }
+  try {
+    const result = await invoke();
+    try {
+      writer?.record("tool", {
+        ...(requestId ? { id: `${requestId}:result` } : {}),
+        kind: "tool",
+        actor: "tool",
+        recipient: "agent",
+        toolId: toolName,
+        content: `tool result: ${toolName}`,
+        result: contextInspectionJson(result),
+        correlation: {
+          actorId: "tool",
+          recipientId: "agent",
+          toolId: toolName,
+          ...(requestId ? { parentId: requestId } : {}),
+        },
+        ...(result.errorCode ? { errorReason: contextInspectionErrorReason(result.errorCode) } : {}),
+      });
+    } catch {
+      // Inspection persistence must not change the authorized tool result.
+    }
+    recordContextCondition(writer, toolName, requestId, {
+      status: result.status,
+      ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+    });
+    return result;
+  } catch (error) {
+    try {
+      writer?.record("tool", {
+        ...(requestId ? { id: `${requestId}:error` } : {}),
+        kind: "tool",
+        actor: "tool",
+        recipient: "agent",
+        toolId: toolName,
+        result: contextInspectionJson(error instanceof Error ? { name: error.name } : { type: typeof error }),
+        errorReason: "tool_failure",
+        correlation: {
+          actorId: "tool",
+          recipientId: "agent",
+          toolId: toolName,
+          ...(requestId ? { parentId: requestId } : {}),
+        },
+      });
+    } catch {
+      // Inspection persistence must not change the authorized tool error.
+    }
+    recordContextCondition(writer, toolName, requestId, {
+      status: "error",
+      error: error instanceof Error ? { name: error.name } : { type: typeof error },
+    });
+    throw error;
+  }
+}
+
 export function createContextToolCapability(
   snapshot: ContextPackCandidateSnapshotV1,
   reader: ContextPackReaderV1,
@@ -992,8 +1153,9 @@ export function createContextToolCapability(
     options.operationGate ?? new ContextPackAclOperationGate(snapshot, reader, options.invalidationSink);
   const activeRequirements = normalizeActiveCandidateSet(options.activeCandidates);
   const activeRequirementFor = (candidate: ContextPackCandidateV1): ContextPackActivationRequirementV1 | undefined => {
-    const requirement = activeRequirements?.get(contextCandidateActivationKey(candidate));
+    const requirement = activeRequirements?.get(`${candidate.packId}\u0000${candidate.revisionId}`);
     if (!requirement) return undefined;
+    if (requirement.digest !== null && requirement.digest !== candidate.digest) return undefined;
     if (
       candidate.source === "account" &&
       (requirement.source === "attachment" || requirement.source === "rule")
@@ -1006,9 +1168,13 @@ export function createContextToolCapability(
     options.requirementFor ??
     ((candidate: ContextPackCandidateV1) => (candidate.required ? "required" : "optional"));
   const budget = options.budget ?? new ContextPackToolBudget();
+  const writer = (options as ContextToolInvocationOptionsV1 & {
+    readonly inspection?: ContextInspectionWriter;
+  }).inspection;
   return Object.freeze({
     operationGate: gate,
-    list: async (args: unknown, signal?: AbortSignal): Promise<ContextToolResult> => {
+    list: (args: unknown, signal?: AbortSignal): Promise<ContextToolResult> =>
+      traceContextToolCall(writer, "context_pack_list", args, async () => {
       const parsed = parsePage(args, CONTEXT_PACK_LIST_LIMIT_MAX);
       if (!parsed) return errorResult("context_pack_list", "invalid_arguments");
       const page = parsed;
@@ -1050,12 +1216,17 @@ export function createContextToolCapability(
         offset: page.offset,
         truncated: page.offset + pageItems.length < visible.length,
       };
+      console.error("[agentic] context_pack_list", { total: data.total, packIds: pageItems.map((item) => item.packId) });
       return reserveAndSuccess("context_pack_list", data, 0, budget);
-    },
+      }),
 
-    get: async (args: unknown, signal?: AbortSignal): Promise<ContextToolResult> => {
+    get: (args: unknown, signal?: AbortSignal): Promise<ContextToolResult> =>
+      traceContextToolCall(writer, "context_pack_get", args, async () => {
       const parsed = parseGet(args);
-      if (!parsed) return errorResult("context_pack_get", "invalid_arguments");
+      if (!parsed) {
+        console.error("[agentic] context_pack_get invalid_arguments", args);
+        return errorResult("context_pack_get", "invalid_arguments");
+      }
       if (signal?.aborted) return errorResult("context_pack_get", "cancelled");
       const candidate = snapshot.candidates.find(
         (item) =>
@@ -1064,7 +1235,10 @@ export function createContextToolCapability(
           item.revision === parsed.revision &&
           (!activeRequirements || activeRequirementFor(item) !== undefined),
       );
-      if (!candidate) return notFoundResult("context_pack_get");
+      if (!candidate) {
+        console.error("[agentic] context_pack_get not_found", parsed);
+        return notFoundResult("context_pack_get");
+      }
       const activeRequirement = activeRequirementFor(candidate);
       const requirement = candidate.required || activeRequirement?.required || requirementFor(candidate) === "required"
         ? "required"
@@ -1119,7 +1293,7 @@ export function createContextToolCapability(
       const result = reserveAndSuccess("context_pack_get", data, contextBytes, budget);
       if (result.status === "success") options.revisionTracker?.add(candidateInputRevision(candidate));
       return result;
-    },
+      }),
   });
 }
 
@@ -1191,12 +1365,14 @@ function normalizeCandidate(
 ): ContextPackCandidateV1 {
   if (!candidate || typeof candidate !== "object") throw new Error("invalid context candidate");
   const candidateOwner = boundedIdentifier(candidate.ownerId, "candidate.ownerId");
-  if (candidateOwner !== ownerId) throw new Error("context candidate owner mismatch");
+  const source = candidate.source;
+  if (source !== "account" && candidateOwner !== ownerId) {
+    throw new Error("context candidate owner mismatch");
+  }
   const summary =
     candidate.summary === undefined
       ? undefined
       : boundedText(candidate.summary, CONTEXT_PACK_DESCRIPTION_MAX_BYTES, "candidate.summary");
-  const source = candidate.source;
   if (source !== "account" && source !== "preset" && source !== "chat" && source !== "world_book") {
     throw new Error("invalid context candidate source");
   }
@@ -1223,7 +1399,7 @@ function normalizeCandidate(
   }
   const digest = boundedDigest(candidate.digest, "candidate.digest");
   return {
-    ownerId,
+    ownerId: candidateOwner,
     packId,
     revisionId,
     revision,
@@ -1417,9 +1593,10 @@ function recordByteCount(record: ContextPackRecordV1): number {
 
 function parseGet(value: unknown): ParsedGet | null {
   const record = plainRecord(value);
-  if (!record || !exactKeys(record, ["pack_id", "revision_id", "revision", "limit", "offset"])) return null;
-  const packId = parseIdentifier(record.pack_id);
-  const revisionId = parseIdentifier(record.revision_id);
+  if (!record) return null;
+  if (!exactKeys(record, ["pack_id", "revision_id", "revision", "limit", "offset", "packId", "revisionId"])) return null;
+  const packId = parseIdentifier(record.pack_id ?? record.packId);
+  const revisionId = parseIdentifier(record.revision_id ?? record.revisionId);
   const revision = parseInteger(record.revision, 1, Number.MAX_SAFE_INTEGER);
   const limit = record.limit === undefined ? 16 : parseInteger(record.limit, 1, CONTEXT_PACK_GET_LIMIT_MAX);
   const offset = record.offset === undefined ? 0 : parseInteger(record.offset, 0, CONTEXT_PACK_PAGE_OFFSET_MAX);

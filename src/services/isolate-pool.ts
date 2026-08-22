@@ -117,6 +117,8 @@ export interface IsolatePoolOptions<TRequest, TResult> {
 export interface ActiveIsolateJob<TRequest, TResult> extends IsolatePoolJob<TRequest> {
   readonly requestId: string;
   readonly resolve: (value: TResult) => void;
+  /** Absolute admission-to-settlement wall-clock deadline. */
+  readonly deadlineAt: number;
   readonly reject: (error: unknown) => void;
   /** Number of bounded backend failovers already attempted for this request. */
   backendFailovers?: number;
@@ -592,6 +594,7 @@ export class IsolatePoolV1<TRequest, TResult> {
       const job: ActiveIsolateJob<TRequest, TResult> = {
         ...jobInput,
         requestId: crypto.randomUUID(),
+        deadlineAt: Date.now() + boundedTimeoutMs,
         timeoutMs: boundedTimeoutMs,
         resolve,
         reject,
@@ -606,9 +609,10 @@ export class IsolatePoolV1<TRequest, TResult> {
       this.waitingCount++;
       job.queueTimer = setTimeout(() => {
         if (job.settled) return;
-        const queue = this.waitingByUser.get(job.userId);
-        if (!queue?.includes(job)) return;
-        this.cancelJob(job, toPoolFailure("worker_timed_out", `${this.name} isolate exceeded ${job.timeoutMs}ms while queued`));
+        this.cancelJob(
+          job,
+          toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        );
       }, boundedTimeoutMs);
       if (job.signal) {
         const onAbort = () => this.cancelJob(job);
@@ -883,6 +887,10 @@ export class IsolatePoolV1<TRequest, TResult> {
     return null;
   }
 
+  private remainingWallClockMs(job: ActiveIsolateJob<TRequest, TResult>): number {
+    return Math.max(0, job.deadlineAt - Date.now());
+  }
+
   private async startJob(job: ActiveIsolateJob<TRequest, TResult>): Promise<void> {
     let slotCreated = false;
     try {
@@ -1028,22 +1036,29 @@ export class IsolatePoolV1<TRequest, TResult> {
     };
     slot.detachMessage = slot.transport.onMessage(onMessage);
     slot.detachError = slot.transport.onError(onError);
+    const remainingWallClockMs = this.remainingWallClockMs(job);
+    if (remainingWallClockMs <= 0) {
+      this.rejectBeforeSend(
+        slot,
+        job,
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        generation,
+      );
+      return;
+    }
     slot.timeout = setTimeout(() => {
       if (job.settled || slot.job !== job) return;
       this.failSlot(
         slot,
-        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded ${job.timeoutMs}ms`),
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
         generation,
       );
-    }, job.timeoutMs);
+    }, remainingWallClockMs);
     let request: unknown;
     let frame: Uint8Array;
     try {
-      console.error(`[${this.name}] encode start`, job.operation, job.requestId);
       request = kind === "worker" ? this.workerRequest(job) : this.subprocessRequest(job);
-      console.error(`[${this.name}] request built`, job.operation, job.requestId);
       frame = preflightEncodedFrame(request, this.maxFrameBytes);
-      console.error(`[${this.name}] encode done`, job.operation, job.requestId, frame.byteLength);
     } catch (error) {
       const failure = error instanceof IsolatePoolError
         ? error
@@ -1051,8 +1066,23 @@ export class IsolatePoolV1<TRequest, TResult> {
       this.rejectBeforeSend(slot, job, failure, generation);
       return;
     }
+    if (this.remainingWallClockMs(job) <= 0) {
+      this.failSlot(
+        slot,
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        generation,
+      );
+      return;
+    }
     try {
       await slot.transport.send(frame);
+      if (current() && this.remainingWallClockMs(job) <= 0) {
+        this.failSlot(
+          slot,
+          toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+          generation,
+        );
+      }
     } catch (error) {
       this.failSlot(
         slot,
@@ -1086,7 +1116,12 @@ export class IsolatePoolV1<TRequest, TResult> {
   }
 
   private requeueFailedJob(job: ActiveIsolateJob<TRequest, TResult>): boolean {
-    if (this.closed || job.settled || job.signal?.aborted) return false;
+    if (
+      this.closed
+      || job.settled
+      || job.signal?.aborted
+      || this.remainingWallClockMs(job) <= 0
+    ) return false;
     const queue = this.waitingByUser.get(job.userId);
     if (
       (queue?.length ?? 0) >= this.maxQueuedPerUser
@@ -1116,6 +1151,14 @@ export class IsolatePoolV1<TRequest, TResult> {
     }
     const job = slot.job;
     if (!job) return;
+    if (this.remainingWallClockMs(job) <= 0) {
+      this.failSlot(
+        slot,
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        generation,
+      );
+      return;
+    }
     this.detachSlot(slot);
     try {
       const parsed = this.responseParser(message, job);
@@ -1138,6 +1181,14 @@ export class IsolatePoolV1<TRequest, TResult> {
     result: TResult,
     generation: number,
   ): void {
+    if (this.remainingWallClockMs(job) <= 0) {
+      this.failSlot(
+        slot,
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        generation,
+      );
+      return;
+    }
     if (slot.retired || slot.generation !== generation) return;
     clearTimeout(slot.timeout);
     slot.timeout = undefined;
@@ -1152,6 +1203,14 @@ export class IsolatePoolV1<TRequest, TResult> {
     error: unknown,
     generation: number,
   ): void {
+    if (this.remainingWallClockMs(job) <= 0) {
+      this.failSlot(
+        slot,
+        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        generation,
+      );
+      return;
+    }
     if (slot.retired || slot.generation !== generation) return;
     if (
       error instanceof IsolatePoolError
@@ -1205,7 +1264,8 @@ export class IsolatePoolV1<TRequest, TResult> {
       && replacementKind === "subprocess"
       && runtimeFailure
       && (job.backendFailovers ?? 0) < 1
-      && !job.signal?.aborted;
+      && !job.signal?.aborted
+      && this.remainingWallClockMs(job) > 0;
     if (job) {
       if (shouldFailover) {
         job.backendFailovers = (job.backendFailovers ?? 0) + 1;

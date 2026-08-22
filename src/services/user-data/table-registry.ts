@@ -696,6 +696,215 @@ const registry: ArchiveTableSpecV2[] = [
       compositeParent(["user_id", "turn_id"], "agent_run_projections", ["user_id", "turn_id"], false),
     ],
   ),
+  // Alpha 1 Persistent Workspace and inspection state is host-owned runtime
+  // state. Archive/restore semantics remain deliberately undefined, so these
+  // rows are purged with the account but never accepted as archive input.
+  operational(
+    "persistent_workspaces",
+    direct("user_id"),
+    ["workspace_id"],
+    [["workspace_id"], ["user_id", "workspace_id"], ["user_id", "chat_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], true),
+    ],
+  ),
+  operational(
+    "persistent_workspace_turn_sessions",
+    direct("user_id"),
+    ["turn_session_id"],
+    [["turn_session_id"], ["user_id", "turn_id", "attempt_id"], ["workspace_id", "turn_id", "attempt_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "workspace_id"], "persistent_workspaces", ["user_id", "workspace_id"], false),
+      compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false),
+    ],
+  ),
+  operational(
+    "persistent_workspace_tasks",
+    direct("user_id"),
+    ["task_id"],
+    [["task_id"], ["workspace_id", "task_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "workspace_id"], "persistent_workspaces", ["user_id", "workspace_id"], false),
+      parent("turn_session_id", "persistent_workspace_turn_sessions", true, false, "turn_session_id"),
+    ],
+  ),
+  operational(
+    "persistent_workspace_records",
+    direct("user_id"),
+    ["record_id"],
+    [["record_id"], ["workspace_id", "record_id"], ["workspace_id", "kind", "summary"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "workspace_id"], "persistent_workspaces", ["user_id", "workspace_id"], false),
+      parent("turn_session_id", "persistent_workspace_turn_sessions", true, false, "turn_session_id"),
+      parent("task_id", "persistent_workspace_tasks", true, false, "task_id"),
+    ],
+  ),
+  operational(
+    "persistent_workspace_submissions",
+    direct("user_id"),
+    ["submission_id"],
+    [["submission_id"], ["workspace_id", "submission_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "workspace_id"], "persistent_workspaces", ["user_id", "workspace_id"], false),
+      parent("turn_session_id", "persistent_workspace_turn_sessions", true, false, "turn_session_id"),
+      parent("task_id", "persistent_workspace_tasks", false, false, "task_id"),
+    ],
+  ),
+  operational(
+    "persistent_workspace_artifacts",
+    direct("user_id"),
+    ["artifact_id"],
+    [["artifact_id"], ["workspace_id", "artifact_id"], ["workspace_id", "blob_digest"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "workspace_id"], "persistent_workspaces", ["user_id", "workspace_id"], false),
+      parent("turn_session_id", "persistent_workspace_turn_sessions", true, false, "turn_session_id"),
+    ],
+  ),
+  operational(
+    "persistent_workspace_publications",
+    direct("user_id"),
+    ["publication_id"],
+    [["publication_id"], ["workspace_id", "category", "source_id", "source_revision"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "workspace_id"], "persistent_workspaces", ["user_id", "workspace_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_attempts",
+    direct("user_id"),
+    ["user_id", "attempt_id"],
+    [["user_id", "attempt_id"], ["user_id", "run_id"], ["user_id", "host_correlation_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false),
+      compositeParent(["user_id", "previous_attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], true),
+      parent("target_message_id", "messages", true),
+    ],
+  ),
+  operational(
+    "agent_run_audit_records",
+    direct("user_id"),
+    ["record_id"],
+    [["record_id"], ["user_id", "attempt_id", "dedupe_key"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_turn_session_entries",
+    direct("user_id"),
+    ["entry_id"],
+    [["entry_id"], ["user_id", "attempt_id", "host_sequence", "entry_kind"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_activity_nodes",
+    direct("user_id"),
+    ["node_id"],
+    [["node_id"], ["user_id", "attempt_id", "node_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_inspection_markers",
+    direct("user_id"),
+    ["marker_id"],
+    [["marker_id"], ["user_id", "attempt_id", "marker_kind", "scope", "host_sequence"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_usage_evidence",
+    direct("user_id"),
+    ["usage_id"],
+    [["usage_id"], ["user_id", "attempt_id", "usage_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_prompt_evidence",
+    direct("user_id"),
+    ["prompt_id"],
+    [["prompt_id"], ["user_id", "attempt_id", "prompt_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_cortex_receipts",
+    direct("user_id"),
+    ["receipt_id"],
+    [["receipt_id"], ["user_id", "attempt_id", "receipt_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_council_receipts",
+    direct("user_id"),
+    ["receipt_id"],
+    [["receipt_id"], ["user_id", "attempt_id", "receipt_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_workspace_associations",
+    direct("user_id"),
+    ["association_id"],
+    [["association_id"], ["user_id", "attempt_id", "association_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_source_deletions",
+    direct("user_id"),
+    ["user_id", "attempt_id"],
+    [["user_id", "attempt_id"]],
+    [parent("user_id", "user", false)],
+  ),
+  operational(
+    "agent_run_source_deletion_workspace",
+    direct("user_id"),
+    ["user_id", "attempt_id", "association_id"],
+    [["user_id", "attempt_id", "association_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "attempt_id"], "agent_run_source_deletions", ["user_id", "attempt_id"], false),
+    ],
+  ),
+  operational(
+    "agent_runtime_repair_acknowledgements",
+    direct("user_id"),
+    ["user_id", "preset_id", "preset_revision", "reason_code"],
+    [["user_id", "preset_id", "preset_revision", "reason_code"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "preset_id"], "presets", ["user_id", "id"], false),
+    ],
+  ),
   canonical({ table: "chat_agent_mode_overrides", owner: direct("user_id"), primaryKey: ["user_id", "chat_id"], uniqueKeys: [["user_id", "chat_id"]], parentEdges: [parent("user_id", "user", false), compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false)], authorityReset: "review_required" }),
 
   // Derived stores and projections ----------------------------------------

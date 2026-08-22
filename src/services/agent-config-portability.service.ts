@@ -13,6 +13,7 @@ import {
   AGENT_CAPABILITIES,
   createDisabledAgentConfigV2,
   parseAgentConfigV2,
+  parseAgentRuntimePolicyV1,
   parsePortableAgentConfigV1,
   toPortableAgentConfigV1,
 } from "../types/agents";
@@ -21,7 +22,6 @@ import type { ContextActivationRuleV1 } from "../types/agent-cognition";
 import { createPortableContextPackSnapshotId, parsePortableContextPackSnapshotV1, type PortableContextPackSnapshotV1 } from "../types/agent-context-packs";
 import * as contextPacksService from "./agent-context-packs.service";
 import type { Preset } from "../types/preset";
-import { normalizeImportedCognition, validateCognitionIntegrity } from "./agent-cognition-integrity.service";
 import { parseContextActivationRule, parseTaskTemplate } from "./agent-cognition.service";
 import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
 import { resolveConcreteConnectionV1, type ResolvedConcreteConnectionV1 } from "./connections.service";
@@ -282,21 +282,24 @@ function rowReview(
 }
 
 
-function cognitionReview(userId: string, presetId: string, config: AgentConfigV2, source: "local" | "legacy" | "imported" | "foreign", importedReviewRequired = false): { state: AgentConfigStateV1; reasonCode: string | null } {
-  if (config.cognitionPolicy === undefined) return { state: "ready", reasonCode: null };
-  const validation = validateCognitionIntegrity({ userId, presetId, cognition: config.cognitionPolicy, source, importedReviewRequired, repairRequired: false });
-  return validation.valid ? { state: "ready", reasonCode: null } : { state: importedReviewRequired || source === "foreign" || source === "imported" || source === "legacy" ? "review_required" : "repair_required", reasonCode: validation.repairCode };
+function cognitionReview(_userId: string, _presetId: string, config: AgentConfigV2, source: "local" | "legacy" | "imported" | "foreign", importedReviewRequired = false): { state: AgentConfigStateV1; reasonCode: string | null } {
+  const loomPolicy = config.runtimePolicy?.loomPolicy;
+  if (loomPolicy === undefined || loomPolicy === null) return { state: "ready", reasonCode: null };
+  if (importedReviewRequired || source === "foreign" || source === "imported" || source === "legacy") {
+    return { state: "review_required", reasonCode: source === "foreign" ? "foreign_import" : "cognition_import_review_required" };
+  }
+  return { state: "ready", reasonCode: null };
 }
 
 function rowToConfig(row: Record<string, unknown>, profiles: AgentProfileConfigV2[], slots: AgentConnectionSlotV1[]): AgentConfigV2 {
-  const config: AgentConfigV2 = {
+  const configInput: Record<string, unknown> = {
     version: 2,
     agentsEnabled: Number(row.agents_enabled) === 1,
-    allowedModes: parseJsonArray(row.allowed_modes, ["response"]) as AgentConfigV2["allowedModes"],
+    allowedModes: parseJsonArray(row.allowed_modes, ["response"]),
     defaultMode: row.default_mode === "agentic" ? "agentic" : "response",
     maxInvocations: Number(row.max_invocations) >= 1 ? Number(row.max_invocations) : 64,
     maxToolCalls: Number(row.max_tool_calls) >= 1 ? Number(row.max_tool_calls) : 64,
-    mainToolIds: parseJsonArray(row.main_tool_ids) as AgentConfigV2["mainToolIds"],
+    mainToolIds: parseJsonArray(row.main_tool_ids),
     mainLoreScope: row.main_lore_scope === "all_owned" ? "all_owned" : "active",
     profiles,
     connectionSlots: slots,
@@ -306,13 +309,25 @@ function rowToConfig(row: Record<string, unknown>, profiles: AgentProfileConfigV
   const contextPolicy = parseJsonObject(row.context_policy_json);
   const taskPolicy = parseJsonObject(row.task_policy_json);
   const workspacePolicy = parseJsonObject(row.workspace_policy_json);
-  if (Object.keys(phasePolicy).length) config.phasePolicy = phasePolicy as unknown as AgentConfigV2["phasePolicy"];
-  if (Object.keys(cognitionPolicy).length) config.cognitionPolicy = cognitionPolicy as unknown as AgentConfigV2["cognitionPolicy"];
-  if (Object.keys(contextPolicy).length) config.contextPolicy = contextPolicy as unknown as AgentConfigV2["contextPolicy"];
-  if (Object.keys(taskPolicy).length) config.taskPolicy = taskPolicy as unknown as AgentConfigV2["taskPolicy"];
-  if (Object.keys(workspacePolicy).length) config.workspacePolicy = workspacePolicy as unknown as AgentConfigV2["workspacePolicy"];
+  const authoredEnvelope = parseJsonObject(row.config_json);
+  const authoredConfig = authoredEnvelope.config;
+  let authoredRuntimePolicy: unknown;
+  let hasCanonicalRuntimePolicy = false;
+  if (authoredConfig && typeof authoredConfig === "object" && !Array.isArray(authoredConfig)) {
+    authoredRuntimePolicy = (authoredConfig as Record<string, unknown>).runtimePolicy;
+    hasCanonicalRuntimePolicy = authoredRuntimePolicy !== undefined;
+  }
+  if (!hasCanonicalRuntimePolicy && Object.keys(phasePolicy).length) configInput.phasePolicy = phasePolicy;
+  // The SQL cognition column is a legacy migration source only. Once an
+  // authored runtime policy exists it is ignored, so two policy authorities
+  // can never become live at the same time.
+  if (!hasCanonicalRuntimePolicy && Object.keys(cognitionPolicy).length) configInput.cognitionPolicy = cognitionPolicy;
+  if (Object.keys(contextPolicy).length) configInput.contextPolicy = contextPolicy;
+  if (Object.keys(taskPolicy).length) configInput.taskPolicy = taskPolicy;
+  if (Object.keys(workspacePolicy).length) configInput.workspacePolicy = workspacePolicy;
   try {
-    return parseAgentConfigV2(config);
+    if (hasCanonicalRuntimePolicy) configInput.runtimePolicy = parseAgentRuntimePolicyV1(authoredRuntimePolicy);
+    return parseAgentConfigV2(configInput);
   } catch (error) {
     if (row.state === "review_required" || row.state === "repair_required") {
       return createDisabledAgentConfigV2();
@@ -320,7 +335,6 @@ function rowToConfig(row: Record<string, unknown>, profiles: AgentProfileConfigV
     throw error;
   }
 }
-
 function readNormalizedProjection(db: Database, userId: string, presetId: string): PresetAgentConfigProjection | null {
   if (!tableExists(db, "preset_agent_configs")) return null;
   const row = db.query("SELECT * FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?").get(userId, presetId) as Record<string, unknown> | null;
@@ -394,7 +408,14 @@ function readNormalizedProjection(db: Database, userId: string, presetId: string
   );
   const review = cognition.state === "ready"
     ? persistedReview
-    : { ...persistedReview, state: cognition.state, reasonCode: cognition.reasonCode, acknowledged: false };
+    : {
+      ...persistedReview,
+      state: cognition.state,
+      reasonCode: persistedReview.reasonCode != null && STICKY_IMPORT_REVIEW_REASON_CODES[persistedReview.reasonCode] === true
+        ? persistedReview.reasonCode
+        : cognition.reasonCode,
+      acknowledged: false,
+    };
   return {
     config,
     review,
@@ -474,14 +495,35 @@ function writeAgentConfigWithDb(
         : requestedReviewState
     : cognition.state;
   let reviewCode: string | null = cognition.reasonCode;
-  if (reviewCode === null && inheritedRepairRequired) {
-    reviewCode = current?.review.reasonCode ?? input.review?.reasonCode ?? null;
+  if (
+    requestedReviewState === "review_required"
+    && input.review?.reasonCode != null
+    && STICKY_IMPORT_REVIEW_REASON_CODES[input.review.reasonCode] === true
+  ) {
+    reviewCode = input.review.reasonCode;
+  } else {
+    if (reviewCode === null && inheritedRepairRequired) {
+      reviewCode = current?.review.reasonCode ?? input.review?.reasonCode ?? null;
+    }
+    if (reviewCode === null && hasCapabilityMismatch) reviewCode = "capability_mismatch";
+    if (reviewCode === null) reviewCode = input.review?.reasonCode ?? null;
   }
-  if (reviewCode === null && hasCapabilityMismatch) reviewCode = "capability_mismatch";
-  if (reviewCode === null) reviewCode = input.review?.reasonCode ?? null;
   const now = Math.floor(Date.now() / 1000);
   const nextRevision = currentConfigRevision + 1;
-  db.query(`INSERT INTO preset_agent_configs (user_id, preset_id, version, agents_enabled, allowed_modes, default_mode, max_invocations, max_tool_calls, main_tool_ids, main_lore_scope, phase_policy_json, cognition_policy_json, context_policy_json, task_policy_json, workspace_policy_json, config_json, state, review_code, review_acknowledged, config_revision, binding_revision, created_at, updated_at) VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, preset_id) DO UPDATE SET agents_enabled = excluded.agents_enabled, allowed_modes = excluded.allowed_modes, default_mode = excluded.default_mode, max_invocations = excluded.max_invocations, max_tool_calls = excluded.max_tool_calls, main_tool_ids = excluded.main_tool_ids, main_lore_scope = excluded.main_lore_scope, phase_policy_json = excluded.phase_policy_json, cognition_policy_json = excluded.cognition_policy_json, context_policy_json = excluded.context_policy_json, task_policy_json = excluded.task_policy_json, workspace_policy_json = excluded.workspace_policy_json, config_json = excluded.config_json, state = excluded.state, review_code = excluded.review_code, review_acknowledged = excluded.review_acknowledged, config_revision = excluded.config_revision, binding_revision = excluded.binding_revision, updated_at = excluded.updated_at`).run(userId, presetId, config.agentsEnabled ? 1 : 0, JSON.stringify(config.allowedModes), config.defaultMode, config.maxInvocations, config.maxToolCalls, JSON.stringify(config.mainToolIds), config.mainLoreScope, JSON.stringify(config.phasePolicy ?? {}), JSON.stringify(input.cognitionPolicyOverride ?? config.cognitionPolicy ?? {}), JSON.stringify(config.contextPolicy ?? {}), JSON.stringify(config.taskPolicy ?? {}), JSON.stringify(config.workspacePolicy ?? {}), JSON.stringify(input.authoredDraft ?? {}), reviewState, reviewCode, input.review?.acknowledged ? 1 : 0, nextRevision, bindingRevisionHighWater, now, now);
+  let authoredEnvelope: Record<string, unknown> = { config };
+  if (input.authoredDraft !== undefined) {
+    if (typeof input.authoredDraft !== "object" || input.authoredDraft === null || Array.isArray(input.authoredDraft)) {
+      throw new Error("AGENT_RUNTIME_AUTHORED_INVALID");
+    }
+    authoredEnvelope = { ...(input.authoredDraft as Record<string, unknown>), config };
+  } else {
+    const previousRow = tableExists(db, "preset_agent_configs")
+      ? db.query("SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?").get(userId, presetId) as { config_json?: unknown } | null
+      : null;
+    const previousEnvelope = parseJsonObject(previousRow?.config_json);
+    if (Object.keys(previousEnvelope).length > 0) authoredEnvelope = { ...previousEnvelope, config };
+  }
+  db.query(`INSERT INTO preset_agent_configs (user_id, preset_id, version, agents_enabled, allowed_modes, default_mode, max_invocations, max_tool_calls, main_tool_ids, main_lore_scope, phase_policy_json, cognition_policy_json, context_policy_json, task_policy_json, workspace_policy_json, config_json, state, review_code, review_acknowledged, config_revision, binding_revision, created_at, updated_at) VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, preset_id) DO UPDATE SET agents_enabled = excluded.agents_enabled, allowed_modes = excluded.allowed_modes, default_mode = excluded.default_mode, max_invocations = excluded.max_invocations, max_tool_calls = excluded.max_tool_calls, main_tool_ids = excluded.main_tool_ids, main_lore_scope = excluded.main_lore_scope, phase_policy_json = excluded.phase_policy_json, cognition_policy_json = excluded.cognition_policy_json, context_policy_json = excluded.context_policy_json, task_policy_json = excluded.task_policy_json, workspace_policy_json = excluded.workspace_policy_json, config_json = excluded.config_json, state = excluded.state, review_code = excluded.review_code, review_acknowledged = excluded.review_acknowledged, config_revision = excluded.config_revision, binding_revision = excluded.binding_revision, updated_at = excluded.updated_at`).run(userId, presetId, config.agentsEnabled ? 1 : 0, JSON.stringify(config.allowedModes), config.defaultMode, config.maxInvocations, config.maxToolCalls, JSON.stringify(config.mainToolIds), config.mainLoreScope, JSON.stringify({}), JSON.stringify(input.cognitionPolicyOverride ?? {}), JSON.stringify(config.contextPolicy ?? {}), JSON.stringify(config.taskPolicy ?? {}), JSON.stringify(config.workspacePolicy ?? {}), JSON.stringify(authoredEnvelope), reviewState, reviewCode, input.review?.acknowledged ? 1 : 0, nextRevision, bindingRevisionHighWater, now, now);
   db.query("DELETE FROM preset_agent_slot_bindings WHERE user_id = ? AND preset_id = ?").run(userId, presetId);
   db.query("DELETE FROM preset_agent_profiles WHERE user_id = ? AND preset_id = ?").run(userId, presetId);
   db.query("DELETE FROM preset_agent_connection_slots WHERE user_id = ? AND preset_id = ?").run(userId, presetId);
@@ -521,10 +563,16 @@ export function writePresetAgentConfig(userId: string, presetId: string, input: 
 export function encodePortableAgentConfig(config: AgentConfigV2): string { return JSON.stringify(toPortableAgentConfigV1(config)); }
 
 
-function assertExactObjectKeys(value: Record<string, unknown>, expected: readonly string[], path: string): void {
-  const actual = Object.keys(value).sort().join(",");
-  const wanted = [...expected].sort().join(",");
-  if (actual !== wanted) throw new Error(`${path} contains unknown or missing fields`);
+function assertExactObjectKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  path: string,
+  optional: readonly string[] = [],
+): void {
+  const allowed = new Set([...expected, ...optional]);
+  if (Object.keys(value).some((key) => !allowed.has(key)) || expected.some((key) => !Object.hasOwn(value, key))) {
+    throw new Error(`${path} contains unknown or missing fields`);
+  }
 }
 
 export function getPortablePresetRuntimeEnvelope(userId: string, presetId: string): PortablePresetRuntimeEnvelopeV1 | null {
@@ -576,14 +624,28 @@ export function getPortablePresetRuntimeEnvelope(userId: string, presetId: strin
   const agentConfig = authored.contextPolicy
     ? { ...authored, contextPolicy: { ...authored.contextPolicy, packIds: directPackIds } }
     : authored;
-  return { version: 1, agentConfig, contextPacks, contextSelections: selections, contextRules, taskTemplates };
+  return {
+    version: 1,
+    agentConfig,
+    contextPacks,
+    contextSelections: selections,
+    contextRules,
+    taskTemplates,
+  };
 }
 
 export function parsePortablePresetRuntimeEnvelope(raw: unknown): PortablePresetRuntimeEnvelopeV1 {
   const object = parsePortableWireObject(raw);
-  assertExactObjectKeys(object, ["version", "agentConfig", "contextPacks", "contextSelections", "contextRules", "taskTemplates"], "agentRuntime");
+  assertExactObjectKeys(object, ["version", "agentConfig", "contextPacks", "contextSelections", "contextRules", "taskTemplates"], "agentRuntime", ["runtimePolicy"]);
   if (object.version !== 1) throw new Error("AGENT_RUNTIME_PORTABLE_VERSION_UNSUPPORTED");
-  const agentConfig = object.agentConfig === null ? null : parsePortableAgentConfigV1(object.agentConfig);
+  let rawAgentConfig = object.agentConfig;
+  if (object.runtimePolicy !== undefined && object.runtimePolicy !== null) {
+    if (rawAgentConfig === null) throw new Error("AGENT_RUNTIME_PORTABLE_CONFIG_INVALID");
+    const agentConfigObject = parsePortableWireObject(rawAgentConfig);
+    if (Object.hasOwn(agentConfigObject, "runtimePolicy")) throw new Error("AGENT_RUNTIME_PORTABLE_DUPLICATE_POLICY");
+    rawAgentConfig = { ...agentConfigObject, runtimePolicy: parseAgentRuntimePolicyV1(object.runtimePolicy) };
+  }
+  const agentConfig = rawAgentConfig === null ? null : parsePortableAgentConfigV1(rawAgentConfig);
   if (!Array.isArray(object.contextPacks) || !Array.isArray(object.contextSelections) || !Array.isArray(object.contextRules) || !Array.isArray(object.taskTemplates)) throw new Error("AGENT_RUNTIME_PORTABLE_INVALID");
   const contextPacks: PortableContextPackSnapshotV1[] = [];
   const bySnapshotId = new Map<string, PortableContextPackSnapshotV1>();
@@ -639,7 +701,14 @@ export function parsePortablePresetRuntimeEnvelope(raw: unknown): PortablePreset
     const referencedPackIds = new Set([...policy.packIds, ...contextRules.map((rule) => rule.packId)]);
     if ([...selectionIds].some((id) => !referencedPackIds.has(id))) throw new Error("AGENT_RUNTIME_PORTABLE_CONFIG_REFERENCE_INVALID");
   }
-  return { version: 1, agentConfig, contextPacks, contextSelections, contextRules, taskTemplates };
+  return {
+    version: 1,
+    agentConfig,
+    contextPacks,
+    contextSelections,
+    contextRules,
+    taskTemplates,
+  };
 }
 function parsePortableWireObject(raw: unknown): Record<string, unknown> {
   if (raw instanceof Uint8Array) raw = new TextDecoder().decode(raw);
@@ -836,8 +905,6 @@ export function importPortablePreset(userId: string, input: PortablePresetPayloa
       return parseAgentConfigV2({ ...authoredPortable, version: 2 });
     })()
     : createDisabledAgentConfigV2();
-  const normalizedCognition = normalizeImportedCognition(hasInvalidCognition ? invalidCognition : authored.cognitionPolicy, { source: "foreign" });
-  void normalizedCognition;
   const preparedBase = prepareForeignAgentConfig(authored);
   const cognition = hasInvalidCognition ? { state: "repair_required" as const, reasonCode: "cognition_invalid" } : cognitionReview(userId, "portable-import", authored, "foreign", true);
   const prepared = {
@@ -963,8 +1030,9 @@ function readValidatedAuthoredRuntimeEnvelopeJson(
   try {
     assertExactObjectKeys(
       envelope,
-      ["config", "contextPackSelections", "contextRules", "taskTemplates", "reviewAcknowledgements"],
+      ["config"],
       "authored agent runtime",
+      ["contextPackSelections", "contextRules", "taskTemplates", "reviewAcknowledgements"],
     );
     const config = parseAgentConfigV2(envelope.config);
     const selections = normalizeContextPackSelections(
@@ -977,7 +1045,7 @@ function readValidatedAuthoredRuntimeEnvelopeJson(
     const taskTemplates = normalizeDraftList(envelope.taskTemplates, "taskTemplates")
       .map((template) => parseTaskTemplate(template));
     normalizeReviewAcknowledgements(
-      envelope.reviewAcknowledgements,
+      envelope.reviewAcknowledgements ?? [],
       reviewItemIds(projection.review),
     );
 
@@ -1053,7 +1121,7 @@ export function duplicatePresetWithAgentConfig(userId: string, sourcePresetId: s
       },
       targetConfig,
       sourceProjection.review,
-      sourceProjection.bindings.map((binding) => ({ slotId: binding.slotId, connectionId: binding.connectionId })),
+      [],
     );
     contextPacksService.copyPresetContextPackAttachmentsWithDb(db, userId, sourcePresetId, inserted.id);
     const targetPreset = assertPresetOwned(db, userId, inserted.id);
@@ -1306,12 +1374,21 @@ export function getAgentRuntimeSharedDraft(userId: string, presetId: string): Ag
   };
 }
 
+const STICKY_IMPORT_REVIEW_REASON_CODES: Record<string, true> = {
+  foreign_import: true,
+  cognition_foreign_authority_blocked: true,
+}
+
 function reviewItemIds(review: AgentConfigReviewV1): string[] {
   const ids = [
     ...review.unresolvedSlotIds.map((slotId) => `slot:${slotId}`),
     ...review.staleSlotIds.map((slotId) => `stale-slot:${slotId}`),
   ];
-  if (ids.length === 0 && review.state !== "ready") ids.push(`review:${review.reasonCode ?? review.state}`);
+  if (review.state !== "ready" && review.reasonCode != null && STICKY_IMPORT_REVIEW_REASON_CODES[review.reasonCode]) {
+    ids.push(`review:${review.reasonCode}`);
+  } else if (ids.length === 0 && review.state !== "ready") {
+    ids.push(`review:${review.reasonCode ?? review.state}`);
+  }
   return [...new Set(ids)].sort();
 }
 
@@ -1320,7 +1397,9 @@ function normalizeReviewAcknowledgements(value: unknown, required: readonly stri
   const ids = value as string[];
   if (new Set(ids).size !== ids.length) throw new Error("AGENT_REVIEW_ACKNOWLEDGEMENTS_INVALID");
   const allowed = new Set(required);
-  if (ids.some((id) => !allowed.has(id))) throw new Error("AGENT_REVIEW_ACKNOWLEDGEMENT_UNKNOWN");
+  if (ids.some((id) => !allowed.has(id) && id !== "review:foreign_import" && id !== "review:cognition_foreign_authority_blocked")) {
+    throw new Error("AGENT_REVIEW_ACKNOWLEDGEMENT_UNKNOWN");
+  }
   return [...ids].sort();
 }
 
@@ -1358,7 +1437,19 @@ function editorReview(review: AgentConfigReviewV1, revision: number, acknowledge
       acknowledged: review.state === "review_required" && acknowledgements.includes(`stale-slot:${slotId}`),
     });
   }
-  if (items.length === 0 && review.state !== "ready") {
+  if (review.state !== "ready" && review.reasonCode != null && STICKY_IMPORT_REVIEW_REASON_CODES[review.reasonCode]) {
+    const reasonCode = review.reasonCode;
+    const importId = `review:${reasonCode}`;
+    if (!items.some((item) => item.id === importId)) {
+      items.push({
+        id: importId,
+        kind: "disabled_import",
+        reasonCode,
+        action: { kind: "acknowledge" },
+        acknowledged: acknowledgements.includes(importId),
+      });
+    }
+  } else if (items.length === 0 && review.state !== "ready") {
     const reasonCode = review.reasonCode ?? review.state;
     items.push({
       id: `review:${reasonCode}`,
@@ -1378,6 +1469,7 @@ function rebindPromptPresetRevisions(value: unknown, presetRevision: number): un
   const rebound: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(object)) rebound[key] = rebindPromptPresetRevisions(item, presetRevision);
   if (Object.hasOwn(rebound, "expectedPresetRevision") && Object.hasOwn(rebound, "expectedBlockRevision")) rebound.expectedPresetRevision = presetRevision;
+  if (rebound.kind === "loom_block" && Object.hasOwn(rebound, "presetRevision") && Object.hasOwn(rebound, "blockRevision")) rebound.presetRevision = presetRevision;
   return rebound;
 }
 
@@ -1424,8 +1516,8 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
     const replacementCognition = cognitionReview(userId, presetId, parsedConfig, "local", false);
     const repairStillRequired = inheritedReview.state === "repair_required" && replacementCognition.state !== "ready";
     const preserveReview = inheritedReview.state === "review_required"
-      && inheritedReview.reasonCode !== null
-      && inheritedReview.reasonCode !== "capability_mismatch";
+      && inheritedReview.reasonCode != null
+      && STICKY_IMPORT_REVIEW_REASON_CODES[inheritedReview.reasonCode] === true;
     const candidateReview = {
       ...inheritedReview,
       state: repairStillRequired
@@ -1435,31 +1527,34 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
           : "ready" as const,
       reasonCode: repairStillRequired
         ? inheritedReview.reasonCode
-        : capabilityMismatchSlotIds.length > 0
-          ? "capability_mismatch"
-          : preserveReview
-            ? inheritedReview.reasonCode
+        : preserveReview
+          ? inheritedReview.reasonCode
+          : capabilityMismatchSlotIds.length > 0
+            ? "capability_mismatch"
             : null,
       unresolvedSlotIds: slotBindings.filter((binding) => binding.connectionId === null).map((binding) => binding.slotId),
       staleSlotIds: capabilityMismatchSlotIds,
     };
     const requiredReviewIds = reviewItemIds(candidateReview);
-    const reviewAcknowledgements = normalizeReviewAcknowledgements(draft.reviewAcknowledgements, requiredReviewIds);
+    const allowedReviewIds = [...new Set([...requiredReviewIds, ...reviewItemIds(inheritedReview)])];
+    const reviewAcknowledgements = normalizeReviewAcknowledgements(draft.reviewAcknowledgements, allowedReviewIds);
     if (candidateReview.state === "repair_required" && reviewAcknowledgements.length > 0) {
       throw new Error("AGENT_REVIEW_ACKNOWLEDGEMENT_NOT_ALLOWED");
     }
     const reviewAcknowledged = requiredReviewIds.every((id) => reviewAcknowledgements.includes(id));
     const hasUnresolvedReviewItems = candidateReview.unresolvedSlotIds.length > 0 || candidateReview.staleSlotIds.length > 0;
+    // Sticky import/cognition review stays until every required item is
+    // acknowledged. Local cognition being structurally ready is not enough.
     const requestedReviewState = candidateReview.state === "repair_required"
       ? "repair_required" as const
-      : candidateReview.state === "review_required" && reviewAcknowledged
+      : candidateReview.state === "review_required"
+        && (hasUnresolvedReviewItems || !reviewAcknowledged || replacementCognition.state !== "ready")
         ? "review_required" as const
-        : candidateReview.state === "review_required" && !reviewAcknowledged
-          ? "review_required" as const
-          : "ready" as const;
+        : "ready" as const;
+    const requestedReasonCode = requestedReviewState === "ready" ? null : candidateReview.reasonCode;
     const committedConfig = rebindPromptPresetRevisions(config, actualPresetRevision + 1);
     const authoredDraft = { config: committedConfig, contextPackSelections, contextRules, taskTemplates, reviewAcknowledgements };
-    const projection = writeAgentConfigWithDb(db, userId, presetId, { config: committedConfig, bindings: slotBindings, expectedConfigRevision: draft.expectedConfigRevision, review: { state: requestedReviewState, reasonCode: candidateReview.reasonCode, unresolvedSlotIds: candidateReview.unresolvedSlotIds, staleSlotIds: candidateReview.staleSlotIds, acknowledged: reviewAcknowledged && !hasUnresolvedReviewItems }, authoredDraft });
+    const projection = writeAgentConfigWithDb(db, userId, presetId, { config: committedConfig, bindings: slotBindings, expectedConfigRevision: draft.expectedConfigRevision, review: { state: requestedReviewState, reasonCode: requestedReasonCode, unresolvedSlotIds: candidateReview.unresolvedSlotIds, staleSlotIds: candidateReview.staleSlotIds, acknowledged: reviewAcknowledged && !hasUnresolvedReviewItems }, authoredDraft });
     const updated = assertPresetOwned(db, userId, presetId);
     const editor = { presetId, presetRevision: actualPresetRevision + 1, configRevision: projection.configRevision, config: projection.config, review: editorReview(projection.review, projection.configRevision, reviewAcknowledgements), slotBindings: projection.bindings, contextPackSelections, contextRules, taskTemplates, hostCeilings: getAgentRuntimeHostLimits(), reviewAcknowledgements };
     return { preset: rowToPreset(updated, projection), editor };

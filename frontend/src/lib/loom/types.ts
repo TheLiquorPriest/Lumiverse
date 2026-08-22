@@ -1,3 +1,5 @@
+import type { LoomPolicyBucketsV1, LoomPolicySourceV1 } from '@/types/agent-runtime'
+
 export const AGENT_INVOCATION_DEFAULT = 64
 export const AGENT_INVOCATION_MIN = 1
 export const AGENT_TOOL_CALL_DEFAULT = 64
@@ -237,6 +239,44 @@ export interface AgentPromptBlockRef {
   expectedPresetRevision: number
   expectedBlockRevision: number
 }
+export interface AgentPhasePolicyV1 {
+  work: AgentPromptBlockRef[]
+  render: AgentPromptBlockRef[]
+}
+
+export const AGENT_CUSTOM_PHASE_CAPABILITIES = [
+  'core_retrieval',
+  'context_retrieval',
+  'workspace_read',
+  'workspace_write',
+  'delegation',
+  'council',
+  'cortex',
+] as const
+export type AgentCustomPhaseCapability = (typeof AGENT_CUSTOM_PHASE_CAPABILITIES)[number]
+
+export interface AgentCustomPhaseV1 {
+  version: 1
+  id: string
+  label: string
+  instructionRefs: readonly LoomPolicySourceV1[]
+  required: boolean
+  enter: CognitionPredicate
+  exit: CognitionPredicate
+  skip?: CognitionPredicate
+  capabilityRequests: readonly AgentCustomPhaseCapability[]
+  repeatLimit: number
+  nextPhaseIds: readonly string[]
+}
+
+export interface AgentRuntimePolicyV1 {
+  version: 1
+  authority: 'loom'
+  scope: 'preset'
+  defaultMode: AgentMode
+  loomPolicy: LoomPolicyBucketsV1 | null
+  phases: readonly AgentCustomPhaseV1[]
+}
 
 export interface AgentCognitionPolicy {
   workPolicy: AgentPromptBlockRef[]
@@ -244,6 +284,7 @@ export interface AgentCognitionPolicy {
   completionCriteria: AgentPromptBlockRef[]
   renderPolicy: AgentPromptBlockRef[]
 }
+
 
 export type CognitionScalar = string | number | boolean
 export type CognitionValue = CognitionScalar | string[]
@@ -260,7 +301,7 @@ export type CognitionPhase =
   | 'FAILED'
   | 'CANCELLED'
   | 'TIMED_OUT'
-export type CognitionTaskTransition = 'pending' | 'active' | 'blocked' | 'submitted' | 'accepted' | 'done'
+export type CognitionTaskTransition = 'pending' | 'active' | 'blocked' | 'completed' | 'cancelled' | 'failed'
 
 export type CognitionPredicate =
   | { kind: 'all'; children: CognitionPredicate[] }
@@ -358,6 +399,8 @@ export interface AgentConfigV2 {
   mainLoreScope: AgentLoreScope
   profiles: AgentProfileConfigV2[]
   connectionSlots: AgentConnectionSlot[]
+  phasePolicy?: AgentPhasePolicyV1
+  runtimePolicy?: AgentRuntimePolicyV1
   cognitionPolicy?: AgentCognitionPolicy
   contextPolicy?: AgentContextPolicyV1
   taskPolicy?: {

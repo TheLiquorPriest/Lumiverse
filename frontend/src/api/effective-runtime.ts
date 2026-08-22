@@ -1,4 +1,4 @@
-import { post, put, type RequestOptions } from './client'
+import { del, post, put, type RequestOptions } from './client'
 import type {
   ChatAgentModeWriteResponseV1,
   ChatAgentModeWriteV1,
@@ -13,5 +13,11 @@ export const effectiveRuntimeApi = {
 
   setChatMode(chatId: string, input: ChatAgentModeWriteV1) {
     return put<ChatAgentModeWriteResponseV1>(`/chats/${chatId}/agent-mode`, input)
+  },
+  resetChatMode(chatId: string, expectedRevision: number) {
+    return del<ChatAgentModeWriteResponseV1>(
+      `/chats/${chatId}/agent-mode`,
+      { body: { expectedRevision } },
+    )
   },
 }

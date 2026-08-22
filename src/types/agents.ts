@@ -7,6 +7,18 @@
  * the persisted contract.
  */
 
+import type {
+  CognitionPredicateV1,
+  LoomPolicyBucketsV1,
+  LoomPolicySourceV1,
+} from "./agent-cognition";
+import { LOOM_POLICY_VERSION } from "./agent-cognition";
+import {
+  LOOM_BUCKET_CHECKPOINT,
+  LOOM_BUCKET_DESTINATION,
+  parseCognitionPredicate,
+  parseLoomPolicyBuckets,
+} from "../services/agent-cognition.service";
 import type { WorkspaceOperationKindV1 } from "./turn-workspace";
 import { WORKSPACE_OPERATIONS } from "./turn-workspace";
 
@@ -83,6 +95,60 @@ export const AGENT_CONFIG_V2_VERSION = 2 as const;
 export const PORTABLE_AGENT_CONFIG_VERSION = 1 as const;
 
 export type AgentMode = "response" | "agentic";
+export const AGENT_RUNTIME_POLICY_VERSION = 1 as const;
+export const AGENT_LOOM_POLICY_BUCKETS = [
+  "workPolicy",
+  "workspaceUsage",
+  "completionCriteria",
+  "renderPolicy",
+] as const;
+
+export type AgentLoomPolicyBucketV1 = (typeof AGENT_LOOM_POLICY_BUCKETS)[number];
+export type AgentRuntimePolicyAuthorityV1 = "loom";
+export type AgentRuntimePolicyScopeV1 = "preset";
+
+/** Canonical, versioned four-bucket Loom authoring record. */
+export type AgentLoomPolicyV1 = LoomPolicyBucketsV1;
+
+export const AGENT_RUNTIME_PHASE_CAPABILITIES = [
+  "core_retrieval",
+  "context_retrieval",
+  "workspace_read",
+  "workspace_write",
+  "delegation",
+  "council",
+  "cortex",
+] as const;
+
+export type AgentRuntimePhaseCapabilityV1 = (typeof AGENT_RUNTIME_PHASE_CAPABILITIES)[number];
+
+export const AGENT_RUNTIME_MAX_CUSTOM_PHASES = 64 as const;
+export const AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS = 64 as const;
+
+/** Ordered preset-authored phase with closed runtime capabilities and transitions. */
+export interface AgentCustomPhaseV1 {
+  version: typeof AGENT_RUNTIME_POLICY_VERSION;
+  id: string;
+  label: string;
+  instructionRefs: readonly LoomPolicySourceV1[];
+  required: boolean;
+  enter: CognitionPredicateV1;
+  exit: CognitionPredicateV1;
+  skip?: CognitionPredicateV1;
+  capabilityRequests: readonly AgentRuntimePhaseCapabilityV1[];
+  repeatLimit: number;
+  nextPhaseIds: readonly string[];
+}
+
+export interface AgentRuntimePolicyV1 {
+  version: typeof AGENT_RUNTIME_POLICY_VERSION;
+  authority: AgentRuntimePolicyAuthorityV1;
+  scope: AgentRuntimePolicyScopeV1;
+  defaultMode: AgentMode;
+  loomPolicy: AgentLoomPolicyV1 | null;
+  phases: readonly AgentCustomPhaseV1[];
+}
+
 export type AgentCapabilityV1 =
   | "generation"
   | "streaming"
@@ -125,12 +191,13 @@ export interface AgentPromptBlockRefV1 {
   expectedBlockRevision: number;
 }
 
-export interface AgentPhasePolicyV1 {
+interface LegacyAgentPhasePolicyV1 {
   work: AgentPromptBlockRefV1[];
   render: AgentPromptBlockRefV1[];
 }
 
-export interface AgentCognitionPolicyV1 {
+/** Legacy plain-reference cognition policy accepted only at ingress. */
+interface LegacyAgentCognitionPolicyV1 {
   workPolicy: AgentPromptBlockRefV1[];
   workspaceUsage: AgentPromptBlockRefV1[];
   completionCriteria: AgentPromptBlockRefV1[];
@@ -182,11 +249,10 @@ export interface AgentConfigV2 {
   mainLoreScope: AgentLoreScope;
   profiles: AgentProfileConfigV2[];
   connectionSlots: AgentConnectionSlotV1[];
-  phasePolicy?: AgentPhasePolicyV1;
-  cognitionPolicy?: AgentCognitionPolicyV1;
   contextPolicy?: AgentContextPolicyV1;
   taskPolicy?: AgentTaskPolicyV1;
   workspacePolicy?: AgentWorkspacePolicyV1;
+  runtimePolicy?: AgentRuntimePolicyV1;
 }
 
 export interface PortableAgentConfigV1 {
@@ -200,11 +266,10 @@ export interface PortableAgentConfigV1 {
   mainLoreScope: AgentLoreScope;
   profiles: AgentProfileConfigV2[];
   connectionSlots: AgentConnectionSlotV1[];
-  phasePolicy?: AgentPhasePolicyV1;
   contextPolicy?: AgentContextPolicyV1;
   taskPolicy?: AgentTaskPolicyV1;
   workspacePolicy?: AgentWorkspacePolicyV1;
-  cognitionPolicy?: AgentCognitionPolicyV1;
+  runtimePolicy?: AgentRuntimePolicyV1;
 }
 
 export type AgentConfigStateV1 = "ready" | "review_required" | "repair_required";
@@ -813,12 +878,135 @@ function parsePromptBlockRefs(value: unknown, path: string): AgentPromptBlockRef
   }
   return refs;
 }
-function parsePhasePolicy(value: unknown, path: string): AgentPhasePolicyV1 {
+function parsePhasePolicy(value: unknown, path: string): LegacyAgentPhasePolicyV1 {
   const policy = ownDataEntries(value, path); exactKeys(policy, ["work", "render"], path);
   return { work: parsePromptBlockRefs(policy.work, `${path}.work`), render: parsePromptBlockRefs(policy.render, `${path}.render`) };
 }
 
-function parseCognitionPolicy(value: unknown, path: string): AgentCognitionPolicyV1 {
+function parseLoomInstructionRefs(value: unknown, path: string): LoomPolicySourceV1[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new AgentConfigValidationError(path, "must be an array");
+  }
+  if (value.length > AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS) {
+    throw new AgentConfigValidationError(path, `must contain at most ${AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS} exact Loom block references`);
+  }
+  const refs: LoomPolicySourceV1[] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < value.length; index += 1) {
+    const refPath = `${path}[${index}]`;
+    const ref = ownDataEntries(value[index], refPath);
+    exactKeys(ref, ["kind", "blockId", "presetRevision", "blockRevision", "promptOrder"], refPath);
+    if (ref.kind !== "loom_block") {
+      throw new AgentConfigValidationError(`${refPath}.kind`, "must be loom_block");
+    }
+    const blockId = requireString(ref.blockId, `${refPath}.blockId`, 128);
+    if (!blockId || seen.has(blockId)) {
+      throw new AgentConfigValidationError(`${refPath}.blockId`, "must be unique and non-empty");
+    }
+    seen.add(blockId);
+    refs.push({
+      kind: "loom_block",
+      blockId,
+      presetRevision: requireIntegerInRange(ref.presetRevision, `${refPath}.presetRevision`, 0, Number.MAX_SAFE_INTEGER),
+      blockRevision: requireIntegerInRange(ref.blockRevision, `${refPath}.blockRevision`, 0, Number.MAX_SAFE_INTEGER),
+      promptOrder: requireIntegerInRange(ref.promptOrder, `${refPath}.promptOrder`, 0, Number.MAX_SAFE_INTEGER),
+    });
+  }
+  return refs;
+}
+
+function parsePhasePredicate(value: unknown, path: string): CognitionPredicateV1 {
+  try {
+    return parseCognitionPredicate(value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid cognition predicate";
+    throw new AgentConfigValidationError(path, message);
+  }
+}
+
+function parsePhaseCapabilities(value: unknown, path: string): AgentRuntimePhaseCapabilityV1[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new AgentConfigValidationError(path, "must be an array");
+  }
+  const capabilities: AgentRuntimePhaseCapabilityV1[] = [];
+  const seen = new Set<string>();
+  const allowed = new Set<string>(AGENT_RUNTIME_PHASE_CAPABILITIES);
+  for (let index = 0; index < value.length; index += 1) {
+    const capabilityPath = `${path}[${index}]`;
+    const capability = requireString(value[index], capabilityPath, 64);
+    if (!allowed.has(capability) || seen.has(capability)) {
+      throw new AgentConfigValidationError(capabilityPath, "must be a unique closed phase capability");
+    }
+    seen.add(capability);
+    capabilities.push(capability as AgentRuntimePhaseCapabilityV1);
+  }
+  return capabilities;
+}
+
+function parseCustomPhases(value: unknown, path: string): AgentCustomPhaseV1[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new AgentConfigValidationError(path, "must be an array");
+  }
+  if (value.length > AGENT_RUNTIME_MAX_CUSTOM_PHASES) {
+    throw new AgentConfigValidationError(path, `must contain at most ${AGENT_RUNTIME_MAX_CUSTOM_PHASES} ordered phases`);
+  }
+  const phases: AgentCustomPhaseV1[] = [];
+  const phaseIds = new Set<string>();
+  for (let index = 0; index < value.length; index += 1) {
+    const phasePath = `${path}[${index}]`;
+    const phase = ownDataEntries(value[index], phasePath);
+    exactKeys(
+      phase,
+      ["version", "id", "label", "instructionRefs", "required", "enter", "exit", "skip", "capabilityRequests", "repeatLimit", "nextPhaseIds"],
+      phasePath,
+      ["skip"],
+    );
+    if (phase.version !== AGENT_RUNTIME_POLICY_VERSION) {
+      throw new AgentConfigValidationError(`${phasePath}.version`, "must be version 1");
+    }
+    const id = requireString(phase.id, `${phasePath}.id`, 64);
+    if (!AGENT_POLICY_ID_PATTERN.test(id) || phaseIds.has(id)) {
+      throw new AgentConfigValidationError(`${phasePath}.id`, "must be a unique lowercase phase id");
+    }
+    phaseIds.add(id);
+    const parsed: AgentCustomPhaseV1 = {
+      version: AGENT_RUNTIME_POLICY_VERSION,
+      id,
+      label: requireString(phase.label, `${phasePath}.label`, AGENT_SLOT_LABEL_MAX_LENGTH),
+      instructionRefs: parseLoomInstructionRefs(phase.instructionRefs, `${phasePath}.instructionRefs`),
+      required: requireBoolean(phase.required, `${phasePath}.required`),
+      enter: parsePhasePredicate(phase.enter, `${phasePath}.enter`),
+      exit: parsePhasePredicate(phase.exit, `${phasePath}.exit`),
+      capabilityRequests: parsePhaseCapabilities(phase.capabilityRequests, `${phasePath}.capabilityRequests`),
+      repeatLimit: requireIntegerInRange(phase.repeatLimit, `${phasePath}.repeatLimit`, 0, 4),
+      nextPhaseIds: requireIdList(phase.nextPhaseIds, `${phasePath}.nextPhaseIds`),
+    };
+    if (Object.hasOwn(phase, "skip")) {
+      (parsed as { skip: CognitionPredicateV1 }).skip = parsePhasePredicate(phase.skip, `${phasePath}.skip`);
+    }
+    phases.push(parsed);
+  }
+  const ids = phases.map((phase) => phase.id);
+  for (let index = 0; index < phases.length; index += 1) {
+    const phase = phases[index];
+    for (const nextId of phase.nextPhaseIds) {
+      if (!phaseIds.has(nextId)) {
+        throw new AgentConfigValidationError(`${path}[${index}].nextPhaseIds`, `references unknown phase ${nextId}`);
+      }
+      const isSelf = nextId === phase.id;
+      const isImmediateNext = nextId === ids[index + 1];
+      if (!isSelf && !isImmediateNext) {
+        throw new AgentConfigValidationError(`${path}[${index}].nextPhaseIds`, "transitions may target only the next phase or itself");
+      }
+      if (isSelf && phase.repeatLimit === 0) {
+        throw new AgentConfigValidationError(`${path}[${index}].nextPhaseIds`, "self transitions require a repeat limit");
+      }
+    }
+  }
+  return phases;
+}
+
+function parseLegacyCognitionPolicy(value: unknown, path: string): LegacyAgentCognitionPolicyV1 {
   const policy = ownDataEntries(value, path);
   exactKeys(policy, ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"], path);
   return {
@@ -828,6 +1016,116 @@ function parseCognitionPolicy(value: unknown, path: string): AgentCognitionPolic
     renderPolicy: parsePromptBlockRefs(policy.renderPolicy, `${path}.renderPolicy`),
   };
 }
+
+/** Translate a stored plain-reference policy once at the V2 ingress boundary. */
+function canonicalizeLegacyCognitionPolicy(policy: LegacyAgentCognitionPolicyV1): AgentLoomPolicyV1 {
+  const entries = (bucket: keyof LegacyAgentCognitionPolicyV1): LoomPolicyBucketsV1[typeof bucket] => policy[bucket].map((ref, index) => ({
+    version: LOOM_POLICY_VERSION,
+    id: `legacy-${bucket}-${ref.blockId}`,
+    source: {
+      kind: "loom_block",
+      blockId: ref.blockId,
+      presetRevision: ref.expectedPresetRevision,
+      blockRevision: ref.expectedBlockRevision,
+      promptOrder: index,
+    },
+    destination: LOOM_BUCKET_DESTINATION[bucket],
+    checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
+    required: true,
+    visibility: "work_only",
+    delivery: { delivery: "direct" },
+  }));
+  return {
+    version: LOOM_POLICY_VERSION,
+    workPolicy: entries("workPolicy"),
+    workspaceUsage: entries("workspaceUsage"),
+    completionCriteria: entries("completionCriteria"),
+    renderPolicy: entries("renderPolicy"),
+  };
+}
+
+function canonicalizeLegacyPhasePolicy(policy: LegacyAgentPhasePolicyV1): AgentLoomPolicyV1 {
+  const entries = (bucket: "workPolicy" | "renderPolicy", refs: readonly AgentPromptBlockRefV1[]): readonly LoomPolicyBucketsV1[typeof bucket][number][] => refs.map((ref, index) => ({
+    version: LOOM_POLICY_VERSION,
+    id: `legacy-phase-${bucket}-${ref.blockId}`,
+    source: {
+      kind: "loom_block",
+      blockId: ref.blockId,
+      presetRevision: ref.expectedPresetRevision,
+      blockRevision: ref.expectedBlockRevision,
+      promptOrder: index,
+    },
+    destination: LOOM_BUCKET_DESTINATION[bucket],
+    checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
+    required: true,
+    visibility: "work_only",
+    delivery: { delivery: "direct" },
+  }));
+  return {
+    version: LOOM_POLICY_VERSION,
+    workPolicy: entries("workPolicy", policy.work),
+    workspaceUsage: [],
+    completionCriteria: [],
+    renderPolicy: entries("renderPolicy", policy.render),
+  };
+}
+
+function mergeCanonicalLoomPolicies(left: AgentLoomPolicyV1, right: AgentLoomPolicyV1): AgentLoomPolicyV1 {
+  const buckets = {
+    workPolicy: [...left.workPolicy, ...right.workPolicy],
+    workspaceUsage: [...left.workspaceUsage, ...right.workspaceUsage],
+    completionCriteria: [...left.completionCriteria, ...right.completionCriteria],
+    renderPolicy: [...left.renderPolicy, ...right.renderPolicy],
+  };
+  const ids = new Set<string>();
+  for (const bucket of AGENT_LOOM_POLICY_BUCKETS) {
+    for (const entry of buckets[bucket]) {
+      if (ids.has(entry.id)) throw new AgentConfigValidationError("agentConfig.runtimePolicy.loomPolicy", "duplicate canonical policy entry id");
+      ids.add(entry.id);
+    }
+  }
+  return { version: LOOM_POLICY_VERSION, ...buckets };
+}
+
+function parseCanonicalLoomPolicy(value: unknown, path: string): AgentLoomPolicyV1 {
+  try {
+    return parseLoomPolicyBuckets(value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid Loom policy";
+    throw new AgentConfigValidationError(path, message);
+  }
+}
+
+function parseRuntimePolicy(value: unknown, path: string): AgentRuntimePolicyV1 {
+  const policy = ownDataEntries(value, path);
+  exactKeys(policy, ["version", "authority", "scope", "defaultMode", "loomPolicy", "phases"], path, ["phases"]);
+  if (policy.version !== AGENT_RUNTIME_POLICY_VERSION) {
+    throw new AgentConfigValidationError(`${path}.version`, "must be version 1");
+  }
+  if (policy.authority !== "loom") {
+    throw new AgentConfigValidationError(`${path}.authority`, "must be loom");
+  }
+  if (policy.scope !== "preset") {
+    throw new AgentConfigValidationError(`${path}.scope`, "must be preset");
+  }
+  if (policy.defaultMode !== "response" && policy.defaultMode !== "agentic") {
+    throw new AgentConfigValidationError(`${path}.defaultMode`, "must be response or agentic");
+  }
+  return {
+    version: AGENT_RUNTIME_POLICY_VERSION,
+    authority: "loom",
+    scope: "preset",
+    defaultMode: policy.defaultMode,
+    loomPolicy: policy.loomPolicy === null
+      ? null
+      : parseCanonicalLoomPolicy(policy.loomPolicy, `${path}.loomPolicy`),
+    phases: Object.hasOwn(policy, "phases") ? parseCustomPhases(policy.phases, `${path}.phases`) : [],
+  };
+}
+export function parseAgentRuntimePolicyV1(raw: unknown): AgentRuntimePolicyV1 {
+  return parseRuntimePolicy(raw, "runtimePolicy");
+}
+
 
 function parseContextPolicy(value: unknown, path: string): AgentContextPolicyV1 {
   const policy = ownDataEntries(value, path); exactKeys(policy, ["ruleIds", "packIds"], path);
@@ -888,8 +1186,7 @@ function parseAgentProfileV2(value: unknown, path: string): AgentProfileConfigV2
 }
 
 function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfigV2 {
-  exactKeys(config, ["version", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy"], path, ["phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy"]);
-  if (config.version !== AGENT_CONFIG_V2_VERSION) throw new AgentConfigValidationError(`${path}.version`, "must be version 2");
+  exactKeys(config, ["version", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], path, ["phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
   const agentsEnabled = requireBoolean(config.agentsEnabled, `${path}.agentsEnabled`);
   const allowedModes = requireModeList(config.allowedModes, `${path}.allowedModes`);
   if (config.defaultMode !== "response" && config.defaultMode !== "agentic") throw new AgentConfigValidationError(`${path}.defaultMode`, "must be response or agentic");
@@ -924,14 +1221,44 @@ function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfi
     maxToolCalls: Object.hasOwn(config, "maxToolCalls") ? requireAgentLimit(config.maxToolCalls, `${path}.maxToolCalls`, AGENT_TOOL_CALL_MIN) : AGENT_TOOL_CALL_DEFAULT,
     mainToolIds, mainLoreScope, profiles, connectionSlots,
   };
-  if (Object.hasOwn(config, "phasePolicy")) parsed.phasePolicy = parsePhasePolicy(config.phasePolicy, `${path}.phasePolicy`);
-  if (Object.hasOwn(config, "cognitionPolicy")) parsed.cognitionPolicy = parseCognitionPolicy(config.cognitionPolicy, `${path}.cognitionPolicy`);
   if (Object.hasOwn(config, "contextPolicy")) parsed.contextPolicy = parseContextPolicy(config.contextPolicy, `${path}.contextPolicy`);
   if (Object.hasOwn(config, "taskPolicy")) parsed.taskPolicy = parseTaskPolicy(config.taskPolicy, `${path}.taskPolicy`);
   if (Object.hasOwn(config, "workspacePolicy")) parsed.workspacePolicy = parseWorkspacePolicy(config.workspacePolicy, `${path}.workspacePolicy`);
+  const hasLegacyPhase = Object.hasOwn(config, "phasePolicy");
+  const legacyPhase = hasLegacyPhase
+    ? parsePhasePolicy(config.phasePolicy, `${path}.phasePolicy`)
+    : undefined;
+  const hasLegacyCognition = Object.hasOwn(config, "cognitionPolicy");
+  const legacyCognition = hasLegacyCognition
+    ? parseLegacyCognitionPolicy(config.cognitionPolicy, `${path}.cognitionPolicy`)
+    : undefined;
+  if (Object.hasOwn(config, "runtimePolicy")) {
+    if (hasLegacyCognition) throw new AgentConfigValidationError(`${path}.cognitionPolicy`, "legacy cognitionPolicy cannot accompany runtimePolicy");
+    if (hasLegacyPhase) throw new AgentConfigValidationError(`${path}.phasePolicy`, "legacy phasePolicy cannot accompany runtimePolicy");
+    parsed.runtimePolicy = parseRuntimePolicy(config.runtimePolicy, `${path}.runtimePolicy`);
+  } else if (legacyCognition !== undefined || legacyPhase !== undefined) {
+    const cognitionPolicy = legacyCognition === undefined
+      ? {
+        version: LOOM_POLICY_VERSION,
+        workPolicy: [],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      } satisfies AgentLoomPolicyV1
+      : canonicalizeLegacyCognitionPolicy(legacyCognition);
+    parsed.runtimePolicy = {
+      version: AGENT_RUNTIME_POLICY_VERSION,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: config.defaultMode,
+      loomPolicy: legacyPhase === undefined
+        ? cognitionPolicy
+        : mergeCanonicalLoomPolicies(cognitionPolicy, canonicalizeLegacyPhasePolicy(legacyPhase)),
+      phases: [],
+    };
+  }
   return parsed;
 }
-
 export function parseAgentConfigV2(raw: unknown): AgentConfigV2 {
   return parseAgentConfigV2Object(ownDataEntries(raw, "agentConfig"), "agentConfig");
 }
@@ -944,7 +1271,7 @@ export function createDisabledAgentConfigV2(): AgentConfigV2 {
 
 export function parsePortableAgentConfigV1(raw: unknown): PortableAgentConfigV1 {
   const portable = ownDataEntries(raw, "portableAgentConfig");
-  exactKeys(portable, ["portableVersion", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy"], "portableAgentConfig", ["phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy"]);
+  exactKeys(portable, ["portableVersion", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], "portableAgentConfig", ["phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
   if (portable.portableVersion !== PORTABLE_AGENT_CONFIG_VERSION) throw new AgentConfigValidationError("portableAgentConfig.portableVersion", "must be version 1");
   const { portableVersion: _portableVersion, ...authoredFields } = portable;
   const v2 = parseAgentConfigV2Object({ ...authoredFields, version: AGENT_CONFIG_V2_VERSION }, "portableAgentConfig");
@@ -1026,3 +1353,4 @@ export {
   AGENT_ACTIVITY_LIVE_NODE_LIMIT,
   AGENT_PUBLIC_PROVIDER_CODE_PATTERN,
 } from "./agent-runtime";
+ 

@@ -5,6 +5,65 @@ import type {
 } from "./agents";
 
 import type { ToolContinuationMode } from "../llm/param-schema";
+export const AGENT_WORK_PHASES = [
+  "ADMIT",
+  "ASSEMBLE",
+  "WORK",
+  "PREPARE_COMMIT",
+  "RENDER",
+  "COMMIT",
+  "TERMINAL",
+] as const;
+
+export type AgentWorkPhase = (typeof AGENT_WORK_PHASES)[number];
+export type AgentWorkLifecycle = AgentWorkPhase;
+
+export const AGENT_WORK_STATUSES = [
+  "pending",
+  "running",
+  "waiting",
+  "cancelling",
+  "terminal",
+] as const;
+
+export type AgentWorkStatus = (typeof AGENT_WORK_STATUSES)[number];
+
+export const AGENT_WORK_OUTCOMES = [
+  "completed",
+  "stopped",
+  "failed",
+  "exhausted",
+  "rejected",
+] as const;
+
+export type AgentWorkOutcome = (typeof AGENT_WORK_OUTCOMES)[number];
+
+export type AgentWorkTargetKind = "normal" | "continue" | "regenerate" | "swipe";
+
+export interface AgentWorkTargetIdentityV1 {
+  readonly chatId: string;
+  readonly generationType: AgentWorkTargetKind;
+  readonly messageId: string | null;
+  readonly swipeId: number | null;
+}
+
+export interface AgentWorkAttemptLineageV1 {
+  readonly version: 1;
+  readonly attemptId: string;
+  readonly previousAttemptId: string | null;
+  readonly target: AgentWorkTargetIdentityV1;
+  readonly createdAt: number;
+}
+
+export interface AgentWorkProjectionV1 {
+  readonly version: 1;
+  readonly workPhase: AgentWorkPhase;
+  readonly workStatus: AgentWorkStatus;
+  readonly workOutcome: AgentWorkOutcome | null;
+  readonly reason: string | null;
+  readonly attemptLineage: AgentWorkAttemptLineageV1;
+}
+
 
 /** Effective process-owned ceilings. Authored preset values are compared at execution time. */
 export interface AgentRuntimeHostLimits {
@@ -35,6 +94,21 @@ export type AgentPublicErrorCategory =
   | "provider"
   | "validation"
   | "internal";
+export const AGENT_RECOVERY_ACTIONS = [
+  "retry",
+  "repair",
+  "reselect",
+  "use_response",
+  "resync",
+  "none",
+] as const;
+
+/** A host-owned next action; it is never inferred by the client. */
+export type AgentRecoveryActionV2 = (typeof AGENT_RECOVERY_ACTIONS)[number];
+
+/** Summary codes are localization keys, not backend prose or provider text. */
+export const AGENT_SUMMARY_CODE_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+
 
 /** Stable, server-owned terminal codes safe for owner-facing responses. */
 export type AgentPublicErrorCode =
@@ -69,12 +143,95 @@ export type AgentPublicErrorCode =
   | "provider_schema_error"
   | "invalid_task"
   | "invalid_profile"
+  | "invalid_input"
   | "invalid_arguments"
   | "batch_rejected"
   | "unknown_tool"
   | "unauthorized"
   | "integrity_error"
-  | "internal_error";
+  | "internal_error"
+  | "not_found"
+  | "invalid_request"
+  | "projection_unavailable"
+  | "inspection_unavailable"
+  | "workspace_unavailable"
+  | "stop_unavailable"
+  | "retry_unavailable"
+  | "target_mismatch"
+  | "stale_target"
+  | "resync_required"
+  | "recovery_unavailable"
+  | "response_mode_required"
+  | "decision_refresh_required"
+  | "limit_exceeded"
+  | "queue_full"
+  | "worker_disabled"
+  | "worker_unavailable"
+  | "worker_crashed"
+  | "worker_timed_out"
+  | "worker_malformed";
+/** Runtime values for the closed public error-code taxonomy. */
+export const AGENT_PUBLIC_ERROR_CODES = [
+  "capacity_exceeded",
+  "host_child_admission_limit_exceeded",
+  "host_tool_call_limit_exceeded",
+  "child_admission_limit_exceeded",
+  "tool_call_limit_exceeded",
+  "logical_provider_request_limit_exceeded",
+  "physical_dispatch_attempt_limit_exceeded",
+  "child_output_token_limit_exceeded",
+  "root_wall_clock_limit_exceeded",
+  "activity_event_limit_exceeded",
+  "activity_byte_limit_exceeded",
+  "lifecycle_log_record_limit_exceeded",
+  "context_limit_exceeded",
+  "initial_input_limit_exceeded",
+  "argument_limit_exceeded",
+  "result_limit_exceeded",
+  "continuation_limit_exceeded",
+  "retained_output_limit_exceeded",
+  "materialized_limit_exceeded",
+  "timeout",
+  "cancelled",
+  "provider_unavailable",
+  "provider_unsupported",
+  "provider_tool_calling_unsupported",
+  "provider_tool_continuation_unsupported",
+  "provider_tool_finalization_unsupported",
+  "provider_request_error",
+  "provider_protocol_error",
+  "provider_schema_error",
+  "invalid_task",
+  "invalid_profile",
+  "invalid_input",
+  "invalid_arguments",
+  "batch_rejected",
+  "unknown_tool",
+  "unauthorized",
+  "integrity_error",
+  "internal_error",
+  "not_found",
+  "invalid_request",
+  "projection_unavailable",
+  "inspection_unavailable",
+  "workspace_unavailable",
+  "stop_unavailable",
+  "retry_unavailable",
+  "target_mismatch",
+  "stale_target",
+  "resync_required",
+  "recovery_unavailable",
+  "response_mode_required",
+  "decision_refresh_required",
+  "limit_exceeded",
+  "queue_full",
+  "worker_disabled",
+  "worker_unavailable",
+  "worker_crashed",
+  "worker_timed_out",
+  "worker_malformed",
+] as const satisfies readonly AgentPublicErrorCode[];
+
 
 /** Server-owned counters that can be named in a public terminal error. */
 export type AgentPublicBudgetId =
@@ -157,7 +314,63 @@ export type AgentActivityContinuationMode = "ordinary" | "finalization" | "none"
 export type AgentActivityActor = "root" | "provider" | "child" | "tool";
 
 /** Tool labels are host catalog identifiers; unknown provider names are never exposed. */
-export type AgentActivityToolId = CoreAgentToolId | "agent_delegate" | "unknown_tool";
+export type AgentActivityToolId =
+  | CoreAgentToolId
+  | "agent_delegate"
+  | "context_pack_list"
+  | "context_pack_get"
+  | "workspace_read_section"
+  | "workspace_read_page"
+  | "workspace_create_task"
+  | "workspace_update_progress"
+  | "workspace_submit_result"
+  | "workspace_accept_submission"
+  | "workspace_record_finding"
+  | "workspace_record_decision"
+  | "workspace_record_question"
+  | "workspace_attach_artifact"
+  | "workspace_propose_publication"
+  | "complete_turn"
+  | "unknown_tool";
+
+export const PUBLIC_ACTIVITY_TOOL_IDS = [
+  "lore_list_books",
+  "lore_get_book",
+  "lore_list_entries",
+  "lore_get_entry",
+  "lore_search_entries",
+  "chat_search_history",
+  "agent_delegate",
+  "context_pack_list",
+  "context_pack_get",
+  "workspace_read_section",
+  "workspace_read_page",
+  "workspace_create_task",
+  "workspace_update_progress",
+  "workspace_submit_result",
+  "workspace_accept_submission",
+  "workspace_record_finding",
+  "workspace_record_decision",
+  "workspace_record_question",
+  "workspace_attach_artifact",
+  "workspace_propose_publication",
+  "complete_turn",
+  "unknown_tool",
+] as const satisfies readonly AgentActivityToolId[];
+
+const PUBLIC_ACTIVITY_TOOL_ID_LOOKUP: Record<string, true> = Object.fromEntries(
+  PUBLIC_ACTIVITY_TOOL_IDS.map((id) => [id, true]),
+);
+
+/** Map a host/WORK tool name onto the closed public activity label, or unknown_tool. */
+export function publicActivityToolId(name: unknown): AgentActivityToolId {
+  if (name === "workspace_update_assigned_progress") return "workspace_update_progress";
+  if (name === "workspace_submit_child_result") return "workspace_submit_result";
+  if (typeof name === "string" && PUBLIC_ACTIVITY_TOOL_ID_LOOKUP[name] === true) {
+    return name as AgentActivityToolId;
+  }
+  return "unknown_tool";
+}
 
 export interface AgentActivityUsageV1 {
   readonly inputTokens: number;

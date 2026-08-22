@@ -1,3 +1,64 @@
+import type { CognitionPredicate } from '@/lib/loom/types'
+export const AGENT_WORK_PHASES = [
+  'ADMIT',
+  'ASSEMBLE',
+  'WORK',
+  'PREPARE_COMMIT',
+  'RENDER',
+  'COMMIT',
+  'TERMINAL',
+] as const
+
+export type AgentWorkPhase = (typeof AGENT_WORK_PHASES)[number]
+export type AgentWorkLifecycle = AgentWorkPhase
+
+export const AGENT_WORK_STATUSES = [
+  'pending',
+  'running',
+  'waiting',
+  'cancelling',
+  'terminal',
+] as const
+
+export type AgentWorkStatus = (typeof AGENT_WORK_STATUSES)[number]
+
+export const AGENT_WORK_OUTCOMES = [
+  'completed',
+  'stopped',
+  'failed',
+  'exhausted',
+  'rejected',
+] as const
+
+export type AgentWorkOutcome = (typeof AGENT_WORK_OUTCOMES)[number]
+
+export type AgentWorkTargetKind = 'normal' | 'continue' | 'regenerate' | 'swipe'
+
+export interface AgentWorkTargetIdentityV1 {
+  readonly chatId: string
+  readonly generationType: AgentWorkTargetKind
+  readonly messageId: string | null
+  readonly swipeId: number | null
+}
+
+export interface AgentWorkAttemptLineageV1 {
+  readonly version: 1
+  readonly attemptId: string
+  readonly previousAttemptId: string | null
+  readonly target: AgentWorkTargetIdentityV1
+  readonly createdAt: number
+}
+
+export interface AgentWorkProjectionV1 {
+  readonly version: 1
+  readonly workPhase: AgentWorkPhase
+  readonly workStatus: AgentWorkStatus
+  readonly workOutcome: AgentWorkOutcome | null
+  readonly reason: string | null
+  readonly attemptLineage: AgentWorkAttemptLineageV1
+}
+
+
 export interface AgentRuntimeHostLimits {
   childAdmissions: number
   aggregateToolCalls: number
@@ -68,7 +129,14 @@ export type AgentActivityActor = 'root' | 'provider' | 'child' | 'tool'
 export type AgentActivityContinuationMode = 'ordinary' | 'finalization' | 'none'
 export type AgentActivityToolId =
   | 'lore_list_books' | 'lore_get_book' | 'lore_list_entries' | 'lore_get_entry'
-  | 'lore_search_entries' | 'chat_search_history' | 'agent_delegate' | 'unknown_tool'
+  | 'lore_search_entries' | 'chat_search_history' | 'agent_delegate'
+  | 'context_pack_list' | 'context_pack_get'
+  | 'workspace_read_section' | 'workspace_read_page' | 'workspace_create_task'
+  | 'workspace_update_progress' | 'workspace_submit_result' | 'workspace_accept_submission'
+  | 'workspace_record_finding' | 'workspace_record_decision' | 'workspace_record_question'
+  | 'workspace_attach_artifact' | 'workspace_propose_publication'
+  | 'complete_turn' | 'unknown_tool'
+export type AgentActivityToolName = AgentActivityToolId
 
 export interface AgentActivityUsageV1 {
   inputTokens: number
@@ -122,3 +190,158 @@ export interface AgentActivityTerminalSummaryV1 {
   errorCounts: Partial<Record<AgentPublicErrorCode, number>>
   terminalErrorCode?: AgentPublicErrorCode
 }
+
+export const LOOM_POLICY_VERSION = 1 as const
+export const LOOM_POLICY_BUCKETS = ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'] as const
+export type LoomPolicyBucketV1 = (typeof LOOM_POLICY_BUCKETS)[number]
+
+export const LOOM_POLICY_DESTINATIONS = ['root_work', 'completion_handoff', 'render'] as const
+export type LoomPolicyDestinationV1 = (typeof LOOM_POLICY_DESTINATIONS)[number]
+
+export const LOOM_POLICY_CHECKPOINTS = ['ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER'] as const
+export type LoomPolicyCheckpointV1 = (typeof LOOM_POLICY_CHECKPOINTS)[number]
+
+export const LOOM_POLICY_VISIBILITY = 'work_only' as const
+export type LoomPolicyVisibilityV1 = typeof LOOM_POLICY_VISIBILITY
+
+export interface LoomPolicySourceV1 {
+  readonly kind: 'loom_block'
+  readonly blockId: string
+  readonly presetRevision: number
+  readonly blockRevision: number
+  readonly promptOrder: number
+}
+
+export interface LoomOnDemandRequestV1 {
+  readonly contextPackId: string
+  readonly revisionId: string
+  readonly digest: string
+}
+
+export type LoomPolicyDeliveryV1 =
+  | { readonly delivery: 'direct' }
+  | { readonly delivery: 'condition_gated'; readonly condition: CognitionPredicate }
+  | { readonly delivery: 'on_demand'; readonly request: LoomOnDemandRequestV1 }
+
+export interface LoomPolicyEntryV1 {
+  readonly version: typeof LOOM_POLICY_VERSION
+  readonly id: string
+  readonly source: LoomPolicySourceV1
+  readonly destination: LoomPolicyDestinationV1
+  readonly checkpoint: LoomPolicyCheckpointV1
+  readonly required: boolean
+  readonly visibility: LoomPolicyVisibilityV1
+  readonly delivery: LoomPolicyDeliveryV1
+}
+
+export interface LoomPolicyBucketsV1 {
+  readonly version: typeof LOOM_POLICY_VERSION
+  readonly workPolicy: readonly LoomPolicyEntryV1[]
+  readonly workspaceUsage: readonly LoomPolicyEntryV1[]
+  readonly completionCriteria: readonly LoomPolicyEntryV1[]
+  readonly renderPolicy: readonly LoomPolicyEntryV1[]
+}
+
+export type LoomOnDemandRetrievalStatusV1 =
+  | 'not_requested'
+  | 'available'
+  | 'unavailable'
+  | 'stale'
+  | 'unauthorized'
+
+export type LoomPromptInspectionOutcomeV1 =
+  | { readonly status: 'included'; readonly effectiveIndex: number }
+  | {
+      readonly status: 'skipped'
+      readonly reason:
+        | 'checkpoint_not_reached'
+        | 'condition_not_met'
+        | 'on_demand_not_requested'
+        | 'on_demand_unavailable'
+    }
+  | {
+      readonly status: 'rejected'
+      readonly reason:
+        | 'invalid_source'
+        | 'stale_source'
+        | 'unsupported_delivery'
+        | 'unauthorized_retrieval'
+        | 'required_source_unavailable'
+    }
+  | {
+      readonly status: 'omitted'
+      readonly reason: 'response_mode' | 'destination_unavailable' | 'not_work_surface'
+    }
+  | {
+      readonly status: 'deduplicated'
+      readonly keptEntryId: string
+      readonly destination: LoomPolicyDestinationV1
+    }
+
+export interface LoomPromptInspectionItemV1 {
+  readonly entryId: string
+  readonly bucket: LoomPolicyBucketV1
+  readonly destination: LoomPolicyDestinationV1
+  readonly checkpoint: LoomPolicyCheckpointV1
+  readonly source: LoomPolicySourceV1
+  readonly delivery: LoomPolicyDeliveryV1
+  readonly effectiveText: string | null
+  readonly retrievalStatus?: LoomOnDemandRetrievalStatusV1
+  readonly outcome: LoomPromptInspectionOutcomeV1
+}
+
+export interface LoomResponsePolicyPhaseInstructionV1 {
+  readonly phaseId: string
+  readonly source: LoomPolicySourceV1
+}
+
+export interface LoomResponsePolicyOmissionV1 {
+  readonly version: typeof LOOM_POLICY_VERSION
+  readonly surface: 'RESPONSE'
+  readonly visibility: LoomPolicyVisibilityV1
+  readonly reason: 'work_only'
+  readonly omittedEntryIds: readonly string[]
+  readonly source: readonly LoomPolicySourceV1[]
+  readonly omittedPhaseInstructions: readonly LoomResponsePolicyPhaseInstructionV1[]
+}
+
+export interface LoomPromptInspectionV1 {
+  readonly version: typeof LOOM_POLICY_VERSION
+  readonly surface: 'WORK' | 'RESPONSE'
+  readonly checkpoint: LoomPolicyCheckpointV1
+  readonly items: readonly LoomPromptInspectionItemV1[]
+  readonly effectiveEntryIds: readonly string[]
+  readonly responseOmission?: LoomResponsePolicyOmissionV1
+}
+export interface LoomPromptInspectionBlockV1 {
+  readonly source: LoomPolicySourceV1
+  readonly content: string
+}
+
+export interface LoomPromptInspectionContextPackV1 extends LoomOnDemandRequestV1 {
+  readonly content: string
+}
+
+export interface LoomPromptEvaluationV1 {
+  readonly generationType: 'normal' | 'continue' | 'regenerate' | 'swipe'
+  readonly phase: 'ASSEMBLE' | 'WORK' | 'COMPLETE' | 'RENDER' | 'PREPARE_COMMIT' | 'COMMITTING' | 'COMMITTED' | 'COMMIT_FAILED' | 'EXHAUSTED' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT'
+  readonly presetVariables: Readonly<Record<string, string | number | boolean | readonly string[]>>
+  readonly participantFacts: Readonly<Record<string, string | number | boolean | readonly string[]>>
+  readonly availableTools: readonly string[]
+  readonly taskTransitions: Readonly<Record<string, 'pending' | 'active' | 'blocked' | 'completed' | 'cancelled' | 'failed'>>
+}
+
+export interface LoomPromptInspectionInputV1 {
+  readonly checkpoint: LoomPolicyCheckpointV1
+  readonly surface: 'WORK' | 'RESPONSE'
+  readonly evaluation?: LoomPromptEvaluationV1
+  readonly blocks: readonly LoomPromptInspectionBlockV1[]
+  readonly contextPacks: readonly LoomPromptInspectionContextPackV1[]
+}
+
+export interface CognitionRuntimePolicySurfaceV1 {
+  readonly policies: LoomPolicyBucketsV1
+  readonly promptInspection?: LoomPromptInspectionV1
+  readonly responseOmission?: LoomResponsePolicyOmissionV1
+}
+

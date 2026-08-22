@@ -127,7 +127,21 @@ describe('AgentRunStopButton', () => {
     expect(button.textContent).toContain('agentRuntime.stop.stopping')
 
     await act(async () => {
-      pendingStops[0].resolve({ status: 'accepted', turnId: 'turn-1', revision: 2 })
+      pendingStops[0].resolve({
+        version: 2,
+        status: 'accepted',
+        turnId: 'turn-1',
+        revision: 2,
+        target: { chatId: 'chat-1', generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'WORK',
+        workStatus: 'cancelling',
+        workOutcome: null,
+        reason: null,
+        recoveryEligible: false,
+        recoveryAction: 'none',
+        omissionCount: 0,
+        inspectionAttemptId: 'inspection-1',
+      })
       await settle()
     })
     expect(button.disabled).toBeTrue()
@@ -155,7 +169,21 @@ describe('AgentRunStopButton', () => {
     const button = host.querySelector('button')!
     await act(async () => button.click())
     await act(async () => {
-      pendingStops[0].resolve({ status: 'too_late', turnId: 'turn-1', revision: 3 })
+      pendingStops[0].resolve({
+        version: 2,
+        status: 'too_late',
+        turnId: 'turn-1',
+        revision: 3,
+        target: { chatId: 'chat-1', generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'TERMINAL',
+        workStatus: 'terminal',
+        workOutcome: 'completed',
+        reason: null,
+        recoveryEligible: false,
+        recoveryAction: 'none',
+        omissionCount: 0,
+        inspectionAttemptId: 'inspection-1',
+      })
       await settle()
     })
 

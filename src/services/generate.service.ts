@@ -64,6 +64,7 @@ import {
   type StreamChunk,
   type GenerationType,
   type ImpersonateMode,
+  type AssemblySurfaceV1,
   type AssemblyBreakdownEntry,
   type ActivatedWorldInfoEntry,
   type ToolDefinition,
@@ -71,6 +72,7 @@ import {
   type LlmThinkingBlock,
   type ContextClipStats,
 } from "../llm/types";
+import type { LoomPromptInspectionV1 } from "../types/agent-cognition";
 import { trimIncompleteTrailingWord } from "../utils/trim-incomplete-word";
 import { promptBlockMatchesCharacterTags } from "../utils/prompt-block-character-tags";
 import { healFormattingArtifacts } from "../utils/format-healing";
@@ -396,6 +398,8 @@ function resolveInlineToolContinuationPolicy(
 
 export interface GenerateInput {
   userId: string;
+  /** Pre-resolved authenticated account name used when no persona is selected. */
+  userName?: string;
   chat_id: string;
   connection_id?: string;
   persona_id?: string;
@@ -455,6 +459,11 @@ interface GenerationLifecycle {
   continuePostfix?: string;
   /** Resolved character name for saved messages */
   characterName: string;
+  /** Explicit assembly surface used for owner-side prompt provenance. */
+  assemblySurface?: AssemblySurfaceV1;
+  /** Owner-visible Loom omission/provenance captured during assembly. */
+  loomPromptInspection?: LoomPromptInspectionV1;
+
   /** Assembly breakdown for WS event */
   breakdown?: AssemblyBreakdownEntry[];
   /** Generation type used for this run */
@@ -943,6 +952,10 @@ export interface SummarizeGenerateInput {
 }
 
 export interface DryRunResult {
+  /** Explicit surface used by this dry-run assembly. */
+  assemblySurface: AssemblySurfaceV1;
+  /** Typed Loom omission/provenance for owner inspection. */
+  loomPromptInspection?: LoomPromptInspectionV1;
   messages: DryRunDisplayMessage[];
   breakdown: AssemblyBreakdownEntry[];
   parameters: Record<string, any>;
@@ -1056,6 +1069,8 @@ class GenerationCancelledByExtensionError extends Error {
 
 /** Result of assembling + post-processing the prompt pipeline. */
 interface PromptPipelineResult {
+  assemblySurface: AssemblySurfaceV1;
+  loomPromptInspection?: LoomPromptInspectionV1;
   messages: LlmMessage[];
   parameters: GenerationParameters;
   breakdown?: AssemblyBreakdownEntry[];
@@ -2768,6 +2783,7 @@ async function dispatchAgentProvider(
  */
 async function runPromptPipeline(opts: {
   userId: string;
+  userName?: string;
   generationId: string;
   chatId: string;
   connectionId?: string;
@@ -2775,6 +2791,7 @@ async function runPromptPipeline(opts: {
   forcePresetId?: boolean;
   effectivePresetSnapshot?: EffectiveAgentPresetResolution;
   personaId?: string;
+  assemblySurface: AssemblySurfaceV1;
   personaAddonStates?: Record<string, boolean>;
   generationType: string;
   impersonateMode?: ImpersonateMode;
@@ -2834,6 +2851,8 @@ async function runPromptPipeline(opts: {
   // Build messages: use explicit messages if provided, otherwise assemble from preset
   let messages: LlmMessage[];
   let assembledParams: GenerationParameters = {};
+  let assemblySurface: AssemblySurfaceV1 = opts.assemblySurface;
+  let loomPromptInspection: LoomPromptInspectionV1 | undefined;
   let breakdown: AssemblyBreakdownEntry[] | undefined;
   let interceptorBreakdown: InterceptorBreakdownEntry[] | undefined;
   let assistantPrefill: string | undefined;
@@ -2860,7 +2879,9 @@ async function runPromptPipeline(opts: {
   } else {
     const assemblyCtx = {
       userId: opts.userId,
+      userName: opts.userName,
       generationId: opts.generationId,
+      assemblySurface: opts.assemblySurface,
       dryRun: opts.isDryRun === true,
       chatId: opts.chatId,
       connectionId: opts.connectionId,
@@ -2992,6 +3013,8 @@ async function runPromptPipeline(opts: {
     spindleWorldInfoCaptures = assemblyResult.spindleWorldInfoCaptures;
     worldInfoStats = assemblyResult.worldInfoStats;
     memoryStats = assemblyResult.memoryStats;
+    assemblySurface = assemblyResult.assemblySurface;
+    loomPromptInspection = assemblyResult.loomPromptInspection;
     databankStats = assemblyResult.databankStats;
     contextClipStats = assemblyResult.contextClipStats;
     deferredWiState = assemblyResult.deferredWiState;
@@ -3345,6 +3368,8 @@ async function runPromptPipeline(opts: {
       finalHistory.length > 0 ? finalHistory : undefined;
   }
   return {
+    assemblySurface,
+    loomPromptInspection,
     messages,
     parameters,
     breakdown,
@@ -4488,7 +4513,9 @@ async function startResponseGeneration(
         const pipeline = await raceWithSignal(
           runPromptPipeline({
             userId: input.userId,
+            userName: input.userName,
             generationId,
+            assemblySurface: "RESPONSE",
             chatId: input.chat_id,
             connectionId: input.connection_id,
             presetId: input.preset_id,
@@ -4616,6 +4643,8 @@ async function startResponseGeneration(
 
         // Attach assembly metadata to lifecycle
         lifecycle.breakdown = breakdown;
+        lifecycle.assemblySurface = pipeline.assemblySurface;
+        lifecycle.loomPromptInspection = pipeline.loomPromptInspection;
         lifecycle.chatHistoryMessages = pipeline.chatHistoryMessages;
         lifecycle.messages = messages;
         lifecycle.model = connection.model;
@@ -4884,6 +4913,7 @@ function toEffectiveRuntimeRequest(input: GenerateInput): EffectiveRuntimeReques
       swipeId: input.swipe_id ?? null,
       targetCharacterId: input.target_character_id ?? null,
     },
+    ...(input.mode !== undefined ? { mode: input.mode } : {}),
     ...(input.request_epoch !== undefined ? { requestEpoch: input.request_epoch } : {}),
   };
 }
@@ -4945,9 +4975,9 @@ async function startReservedGeneration(
 }
 
 /**
- * Common authenticated generation admission. Response remains the legacy
- * implementation; omitted mode resolves the durable chat/preset default and
- * enters Agentic only with a fresh one-use decision token.
+ * Common authenticated generation admission. Every mode, including a
+ * one-turn selection, resolves through the runtime decision authority before
+ * entering Response or Agentic execution.
  */
 export async function startGeneration(
   input: GenerateInput,
@@ -4956,27 +4986,33 @@ export async function startGeneration(
     throw new Error("Unsupported generation mode.");
   }
 
-  let mode = input.mode;
-  let agenticInput = input;
-  if (mode === undefined) {
-    const decision = await resolveEffectiveRuntime(input.userId, toEffectiveRuntimeRequest(input));
-    mode = decision.effectiveMode;
-    if (mode === "agentic") {
-      if (!decision.runtimeDecisionToken) {
-        throw new AgenticGenerationError(
-          "decision_refresh_required",
-          "Agentic runtime decision is no longer valid.",
-          { phase: "ASSEMBLE", retryable: true },
-        );
-      }
-      agenticInput = {
-        ...input,
-        mode: "agentic",
-        runtime_decision_token: decision.runtimeDecisionToken,
-      };
-    }
+  const decision = await resolveEffectiveRuntime(input.userId, toEffectiveRuntimeRequest(input));
+  if (decision.requestedMode === "agentic" && decision.effectiveMode !== "agentic") {
+    const reasons = decision.capabilityReadiness.repairCodes.length > 0
+      ? decision.capabilityReadiness.repairCodes.join(", ")
+      : "agentic_response_escape";
+    throw new AgenticGenerationError(
+      "decision_refresh_required",
+      `Agentic mode is unavailable (${reasons}); choose Response mode explicitly to continue.`,
+      { phase: "ASSEMBLE", retryable: true },
+    );
   }
+
+  const mode = decision.effectiveMode;
+  let agenticInput = input;
   if (mode === "agentic") {
+    if (!decision.runtimeDecisionToken) {
+      throw new AgenticGenerationError(
+        "decision_refresh_required",
+        "Agentic runtime decision is no longer valid.",
+        { phase: "ASSEMBLE", retryable: true },
+      );
+    }
+    agenticInput = {
+      ...input,
+      mode: "agentic",
+      runtime_decision_token: decision.runtimeDecisionToken,
+    };
     return startReservedGeneration(input, "agentic", () =>
       startAgenticGeneration(toAgenticGenerationInput(agenticInput), agenticGenerationDependencies),
     );
@@ -5073,7 +5109,9 @@ export async function dryRunGeneration(
 
   const pipeline = await runPromptPipeline({
     userId: input.userId,
+    userName: input.userName,
     generationId: crypto.randomUUID(),
+    assemblySurface: "RESPONSE",
     chatId: input.chat_id,
     connectionId: input.connection_id,
     presetId: input.preset_id,
@@ -5131,6 +5169,8 @@ export async function dryRunGeneration(
   }
 
   return {
+    assemblySurface: pipeline.assemblySurface,
+    loomPromptInspection: pipeline.loomPromptInspection,
     // The dry-run viewer is display-only and assumes string content. Flatten
     // multimodal parts (image/audio/tool) to placeholder-annotated strings so
     // multipart turns don't crash the frontend (TypeError: e.replace is not a
@@ -6844,6 +6884,8 @@ async function runGeneration(
             });
             const chatHistoryTokens = sumChatHistoryBreakdownTokens(entries);
             const breakdownPayload = {
+              assemblySurface: lifecycle.assemblySurface,
+              loomPromptInspection: lifecycle.loomPromptInspection,
               entries: omitChatHistoryBreakdownEntries(entries),
               chatHistoryTokens,
               messages: (lifecycle.messages || []).map((message) => ({

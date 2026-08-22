@@ -1108,3 +1108,500 @@ CREATE TRIGGER world_book_entries_fts_update_after AFTER UPDATE ON world_book_en
   INSERT INTO world_book_entries_fts(rowid, comment, content, key, keysecondary)
     VALUES (new.rowid, new.comment, new.content, new.key, new.keysecondary);
 END;
+CREATE TABLE IF NOT EXISTS agent_run_attempts (
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL,
+  previous_attempt_id TEXT,
+  run_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  generation_type TEXT NOT NULL CHECK(generation_type IN ('normal', 'continue', 'regenerate', 'swipe')),
+  target_message_id TEXT,
+  target_swipe_id INTEGER CHECK(target_swipe_id IS NULL OR target_swipe_id >= 0),
+  lifecycle TEXT NOT NULL CHECK(lifecycle IN ('ADMIT', 'ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER', 'COMMIT', 'TERMINAL')),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'waiting', 'cancelling', 'terminal')),
+  outcome TEXT CHECK(outcome IS NULL OR outcome IN ('completed', 'stopped', 'failed', 'exhausted', 'rejected')),
+  reason TEXT NOT NULL DEFAULT 'none' CHECK(length(reason) <= 128),
+  terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0, 1)),
+  started_at INTEGER NOT NULL CHECK(started_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+  terminal_at INTEGER CHECK(terminal_at IS NULL OR terminal_at >= 0),
+  host_correlation_id TEXT NOT NULL CHECK(length(host_correlation_id) BETWEEN 1 AND 256),
+  reconciliation_state TEXT NOT NULL DEFAULT 'authoritative' CHECK(reconciliation_state IN ('authoritative', 'reconciling', 'recovered', 'stale')),
+  terminal_receipt_json TEXT CHECK(terminal_receipt_json IS NULL OR length(terminal_receipt_json) <= 16384),
+  version INTEGER NOT NULL DEFAULT 1 CHECK(version = 1),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY(user_id, attempt_id),
+  UNIQUE(user_id, run_id),
+  UNIQUE(user_id, host_correlation_id),
+  FOREIGN KEY (user_id, previous_attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE SET NULL,
+  FOREIGN KEY (target_message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_attempts_chat_updated
+  ON agent_run_attempts(user_id, chat_id, updated_at DESC, attempt_id);
+CREATE INDEX IF NOT EXISTS idx_agent_run_attempts_chat_target
+  ON agent_run_attempts(user_id, chat_id, target_message_id, target_swipe_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_run_attempts_previous
+  ON agent_run_attempts(user_id, previous_attempt_id);
+CREATE INDEX IF NOT EXISTS idx_agent_run_attempts_terminal
+  ON agent_run_attempts(user_id, chat_id, terminal, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_run_audit_records (
+  record_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  record_kind TEXT NOT NULL CHECK(record_kind IN ('transcript', 'turn_session', 'activity', 'marker', 'usage', 'prompt', 'cortex', 'council', 'workspace', 'stop', 'recovery')),
+  event_id TEXT,
+  causal_parent_id TEXT,
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0),
+  late INTEGER NOT NULL DEFAULT 0 CHECK(late IN (0, 1)),
+  payload_json TEXT NOT NULL CHECK(length(payload_json) <= 131072),
+  byte_size INTEGER NOT NULL CHECK(byte_size >= 0 AND byte_size <= 131072),
+  dedupe_key TEXT,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_audit_attempt_sequence
+  ON agent_run_audit_records(user_id, attempt_id, host_sequence, record_id);
+CREATE INDEX IF NOT EXISTS idx_agent_run_audit_chat_time
+  ON agent_run_audit_records(user_id, chat_id, occurred_at, record_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_turn_session_entries (
+  entry_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  entry_kind TEXT NOT NULL CHECK(entry_kind IN ('target', 'input', 'policy', 'condition', 'hook', 'cancellation', 'completion', 'commit', 'terminal', 'retry', 'recovery')),
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0),
+  detail_json TEXT NOT NULL CHECK(length(detail_json) <= 65536),
+  transcript_links_json TEXT NOT NULL DEFAULT '[]' CHECK(length(transcript_links_json) <= 8192),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, host_sequence, entry_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_turn_session_entries_order
+  ON agent_run_turn_session_entries(user_id, attempt_id, host_sequence, entry_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_activity_nodes (
+  node_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  parent_node_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('root', 'provider', 'child', 'tool', 'milestone')),
+  actor TEXT NOT NULL CHECK(actor IN ('host', 'owner', 'provider', 'agent', 'child', 'tool')),
+  phase TEXT NOT NULL CHECK(phase IN ('ADMIT', 'ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER', 'COMMIT', 'TERMINAL')),
+  status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'waiting', 'cancelling', 'terminal', 'omitted')),
+  safe_label TEXT NOT NULL CHECK(length(safe_label) BETWEEN 1 AND 256),
+  tool_id TEXT,
+  task_id TEXT,
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  started_at INTEGER NOT NULL CHECK(started_at >= 0),
+  ended_at INTEGER CHECK(ended_at IS NULL OR ended_at >= started_at),
+  elapsed_ms INTEGER CHECK(elapsed_ms IS NULL OR elapsed_ms >= 0),
+  usage_json TEXT CHECK(usage_json IS NULL OR length(usage_json) <= 8192),
+  detail_json TEXT CHECK(detail_json IS NULL OR length(detail_json) <= 16384),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_activity_nodes_order
+  ON agent_run_activity_nodes(user_id, attempt_id, host_sequence, node_id);
+CREATE INDEX IF NOT EXISTS idx_agent_run_activity_nodes_target
+  ON agent_run_activity_nodes(user_id, chat_id, attempt_id, kind, host_sequence);
+
+CREATE TABLE IF NOT EXISTS agent_run_inspection_markers (
+  marker_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  marker_kind TEXT NOT NULL CHECK(marker_kind IN ('reconnect_gap', 'late_event', 'reordered_event', 'truncated', 'unavailable', 'credentials_withheld', 'other_user_data_withheld', 'recovered_duplicate')),
+  scope TEXT NOT NULL CHECK(scope IN ('run', 'activity', 'transcript', 'turn_session', 'usage', 'prompt', 'cortex', 'council', 'workspace')),
+  host_sequence INTEGER,
+  first_sequence INTEGER,
+  last_sequence INTEGER,
+  recoverable INTEGER CHECK(recoverable IS NULL OR recoverable IN (0, 1)),
+  detail TEXT CHECK(detail IS NULL OR length(detail) <= 2048),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, marker_kind, scope, host_sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_inspection_markers_order
+  ON agent_run_inspection_markers(user_id, attempt_id, COALESCE(host_sequence, 0), marker_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_usage_evidence (
+  usage_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  source TEXT NOT NULL CHECK(source IN ('provider_reported', 'provisional', 'final', 'recovered_duplicate')),
+  actor_id TEXT,
+  phase TEXT,
+  tool_id TEXT,
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens >= 0),
+  output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(output_tokens >= 0),
+  total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(total_tokens >= 0),
+  tool_calls INTEGER NOT NULL DEFAULT 0 CHECK(tool_calls >= 0),
+  child_invocations INTEGER NOT NULL DEFAULT 0 CHECK(child_invocations >= 0),
+  canonical INTEGER NOT NULL DEFAULT 0 CHECK(canonical IN (0, 1)),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, usage_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_usage_attempt
+  ON agent_run_usage_evidence(user_id, attempt_id, host_sequence, usage_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_prompt_evidence (
+  prompt_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 256),
+  source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+  destination TEXT NOT NULL CHECK(destination IN ('root_work', 'child_work', 'completion_handoff', 'render', 'council', 'cortex')),
+  role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant', 'tool', 'context', 'policy')),
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  included INTEGER NOT NULL CHECK(included IN (0, 1)),
+  content TEXT NOT NULL CHECK(length(content) <= 65536),
+  content_digest TEXT NOT NULL CHECK(length(content_digest) = 64),
+  omission_reason TEXT CHECK(omission_reason IS NULL OR length(omission_reason) <= 512),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, prompt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_prompt_attempt
+  ON agent_run_prompt_evidence(user_id, attempt_id, host_sequence, prompt_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_cortex_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 256),
+  source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+  state TEXT NOT NULL CHECK(state IN ('accepted', 'omitted', 'failed', 'cancelled')),
+  result_digest TEXT,
+  result_count INTEGER NOT NULL DEFAULT 0 CHECK(result_count >= 0),
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  reason TEXT CHECK(reason IS NULL OR length(reason) <= 512),
+  canonical INTEGER NOT NULL DEFAULT 0 CHECK(canonical = 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, receipt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_cortex_attempt
+  ON agent_run_cortex_receipts(user_id, attempt_id, host_sequence, receipt_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_council_receipts (
+  receipt_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 256),
+  state TEXT NOT NULL CHECK(state IN ('accepted', 'omitted', 'failed', 'cancelled')),
+  member_count INTEGER NOT NULL DEFAULT 0 CHECK(member_count >= 0),
+  result_digest TEXT,
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  reason TEXT CHECK(reason IS NULL OR length(reason) <= 512),
+  canonical INTEGER NOT NULL DEFAULT 0 CHECK(canonical = 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, receipt_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_council_attempt
+  ON agent_run_council_receipts(user_id, attempt_id, host_sequence, receipt_id);
+
+CREATE TABLE IF NOT EXISTS agent_run_workspace_associations (
+  association_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  attempt_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 256),
+  workspace_revision INTEGER NOT NULL CHECK(workspace_revision >= 0),
+  relation TEXT NOT NULL CHECK(relation IN ('linked', 'published', 'omitted')),
+  object_kind TEXT NOT NULL CHECK(object_kind IN ('objective', 'task', 'finding', 'decision', 'question', 'submission', 'artifact', 'publication')),
+  object_id TEXT,
+  source_revision INTEGER,
+  source_deleted INTEGER NOT NULL DEFAULT 0 CHECK(source_deleted IN (0, 1)),
+  provenance_digest TEXT,
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  FOREIGN KEY (user_id, attempt_id) REFERENCES agent_run_attempts(user_id, attempt_id) ON DELETE CASCADE,
+  UNIQUE(user_id, attempt_id, association_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_run_workspace_associations_attempt
+  ON agent_run_workspace_associations(user_id, attempt_id, host_sequence, association_id);
+CREATE INDEX IF NOT EXISTS idx_agent_run_workspace_associations_workspace
+  ON agent_run_workspace_associations(user_id, workspace_id, workspace_revision);
+
+CREATE TABLE persistent_workspaces (
+  workspace_id TEXT PRIMARY KEY CHECK(length(workspace_id) BETWEEN 1 AND 128),
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+  objective TEXT NOT NULL DEFAULT '' CHECK(length(objective) <= 65536),
+  metadata_json TEXT NOT NULL DEFAULT '{}' CHECK(length(metadata_json) <= 32768 AND json_valid(metadata_json)),
+  progress_json TEXT NOT NULL DEFAULT '{}' CHECK(length(progress_json) <= 16384 AND json_valid(progress_json)),
+  state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active', 'archived')),
+  revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+  quota_tasks INTEGER NOT NULL DEFAULT 256 CHECK(quota_tasks BETWEEN 0 AND 256),
+  quota_records INTEGER NOT NULL DEFAULT 1024 CHECK(quota_records BETWEEN 0 AND 1024),
+  quota_submissions INTEGER NOT NULL DEFAULT 1024 CHECK(quota_submissions BETWEEN 0 AND 1024),
+  quota_artifacts INTEGER NOT NULL DEFAULT 256 CHECK(quota_artifacts BETWEEN 0 AND 256),
+  quota_publications INTEGER NOT NULL DEFAULT 512 CHECK(quota_publications BETWEEN 0 AND 512),
+  quota_bytes INTEGER NOT NULL DEFAULT 4194304 CHECK(quota_bytes BETWEEN 0 AND 4194304),
+  task_count INTEGER NOT NULL DEFAULT 0 CHECK(task_count >= 0),
+  record_count INTEGER NOT NULL DEFAULT 0 CHECK(record_count >= 0),
+  submission_count INTEGER NOT NULL DEFAULT 0 CHECK(submission_count >= 0),
+  artifact_count INTEGER NOT NULL DEFAULT 0 CHECK(artifact_count >= 0),
+  publication_count INTEGER NOT NULL DEFAULT 0 CHECK(publication_count >= 0),
+  byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count >= 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(user_id, workspace_id),
+  UNIQUE(user_id, chat_id)
+);
+
+CREATE TABLE persistent_workspace_turn_sessions (
+  turn_session_id TEXT PRIMARY KEY CHECK(length(turn_session_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 128),
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 128),
+  execution_id TEXT CHECK(execution_id IS NULL OR length(execution_id) BETWEEN 1 AND 128),
+  phase TEXT NOT NULL DEFAULT 'ADMIT' CHECK(phase IN ('ADMIT', 'ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER', 'COMMIT', 'TERMINAL')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'waiting', 'cancelling', 'terminal')),
+  outcome TEXT CHECK(outcome IS NULL OR outcome IN ('completed', 'stopped', 'failed', 'exhausted', 'rejected')),
+  reason TEXT NOT NULL DEFAULT 'none' CHECK(length(reason) <= 128),
+  revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  terminal_at INTEGER,
+  UNIQUE(user_id, turn_id, attempt_id),
+  UNIQUE(workspace_id, turn_id, attempt_id),
+  FOREIGN KEY (workspace_id) REFERENCES persistent_workspaces(workspace_id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id, workspace_id) REFERENCES persistent_workspaces(user_id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE persistent_workspace_tasks (
+  task_id TEXT PRIMARY KEY CHECK(length(task_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL,
+  turn_session_id TEXT,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT,
+  title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 4096),
+  objective TEXT NOT NULL DEFAULT '' CHECK(length(objective) <= 65536),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'active', 'blocked', 'completed', 'cancelled', 'failed')),
+  required INTEGER NOT NULL DEFAULT 0 CHECK(required IN (0, 1)),
+  dependency_ids_json TEXT NOT NULL DEFAULT '[]' CHECK(length(dependency_ids_json) <= 65536 AND json_valid(dependency_ids_json)),
+  creator TEXT NOT NULL DEFAULT 'owner' CHECK(creator IN ('host', 'owner')),
+  host_admitted INTEGER NOT NULL DEFAULT 0 CHECK(host_admitted IN (0, 1)),
+  progress_json TEXT NOT NULL DEFAULT '{}' CHECK(length(progress_json) <= 16384 AND json_valid(progress_json)),
+  summary TEXT NOT NULL DEFAULT '' CHECK(length(summary) <= 16384),
+  byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count BETWEEN 0 AND 4194304),
+  revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(workspace_id, task_id),
+  FOREIGN KEY (workspace_id) REFERENCES persistent_workspaces(workspace_id) ON DELETE CASCADE,
+  FOREIGN KEY (turn_session_id) REFERENCES persistent_workspace_turn_sessions(turn_session_id) ON DELETE SET NULL,
+  FOREIGN KEY (user_id, workspace_id) REFERENCES persistent_workspaces(user_id, workspace_id) ON DELETE CASCADE,
+  CHECK(
+    (creator = 'owner' AND host_admitted = 0 AND required = 0)
+    OR (creator = 'host' AND host_admitted = 1)
+  )
+);
+
+CREATE TABLE persistent_workspace_records (
+  record_id TEXT PRIMARY KEY CHECK(length(record_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL,
+  turn_session_id TEXT,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT,
+  kind TEXT NOT NULL CHECK(kind IN ('finding', 'decision', 'question')),
+  content_json TEXT NOT NULL CHECK(length(content_json) <= 65536 AND json_valid(content_json)),
+  summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 65536),
+  task_id TEXT,
+  byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count BETWEEN 0 AND 4194304),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(workspace_id, record_id),
+  UNIQUE(workspace_id, kind, summary),
+  FOREIGN KEY (workspace_id) REFERENCES persistent_workspaces(workspace_id) ON DELETE CASCADE,
+  FOREIGN KEY (turn_session_id) REFERENCES persistent_workspace_turn_sessions(turn_session_id) ON DELETE SET NULL,
+  FOREIGN KEY (task_id) REFERENCES persistent_workspace_tasks(task_id) ON DELETE SET NULL,
+  FOREIGN KEY (user_id, workspace_id) REFERENCES persistent_workspaces(user_id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE persistent_workspace_submissions (
+  submission_id TEXT PRIMARY KEY CHECK(length(submission_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL,
+  turn_session_id TEXT,
+  task_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT,
+  state TEXT NOT NULL DEFAULT 'submitted' CHECK(state IN ('submitted', 'accepted', 'rejected')),
+  summary TEXT NOT NULL DEFAULT '' CHECK(length(summary) <= 65536),
+  result_digest TEXT NOT NULL CHECK(length(result_digest) = 64 AND result_digest GLOB '[0-9a-fA-F]*'),
+  byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count BETWEEN 0 AND 4194304),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(workspace_id, submission_id),
+  FOREIGN KEY (workspace_id) REFERENCES persistent_workspaces(workspace_id) ON DELETE CASCADE,
+  FOREIGN KEY (turn_session_id) REFERENCES persistent_workspace_turn_sessions(turn_session_id) ON DELETE SET NULL,
+  FOREIGN KEY (task_id) REFERENCES persistent_workspace_tasks(task_id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id, workspace_id) REFERENCES persistent_workspaces(user_id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE persistent_workspace_artifacts (
+  artifact_id TEXT PRIMARY KEY CHECK(length(artifact_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL,
+  turn_session_id TEXT,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT,
+  blob_digest TEXT NOT NULL CHECK(length(blob_digest) = 64 AND blob_digest GLOB '[0-9a-fA-F]*'),
+  mime_type TEXT NOT NULL CHECK(length(mime_type) BETWEEN 1 AND 255),
+  byte_count INTEGER NOT NULL CHECK(byte_count BETWEEN 0 AND 4194304),
+  provenance_json TEXT NOT NULL DEFAULT '{}' CHECK(length(provenance_json) <= 16384 AND json_valid(provenance_json)),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(workspace_id, artifact_id),
+  UNIQUE(workspace_id, blob_digest),
+  FOREIGN KEY (workspace_id) REFERENCES persistent_workspaces(workspace_id) ON DELETE CASCADE,
+  FOREIGN KEY (turn_session_id) REFERENCES persistent_workspace_turn_sessions(turn_session_id) ON DELETE SET NULL,
+  FOREIGN KEY (user_id, workspace_id) REFERENCES persistent_workspaces(user_id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE persistent_workspace_publications (
+  publication_id TEXT PRIMARY KEY CHECK(length(publication_id) BETWEEN 1 AND 128),
+  workspace_id TEXT NOT NULL,
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  chat_id TEXT,
+  category TEXT NOT NULL CHECK(category IN ('task', 'finding', 'objective', 'artifact')),
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 128),
+  source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+  source_provenance_json TEXT NOT NULL CHECK(length(source_provenance_json) <= 16384 AND json_valid(source_provenance_json)),
+  source_created_at INTEGER NOT NULL CHECK(source_created_at >= 0),
+  source_updated_at INTEGER NOT NULL CHECK(source_updated_at >= 0),
+  source_deleted_at INTEGER,
+  copy_json TEXT NOT NULL CHECK(length(copy_json) <= 131072 AND json_valid(copy_json)),
+  copy_digest TEXT NOT NULL CHECK(length(copy_digest) = 64 AND copy_digest GLOB '[0-9a-fA-F]*'),
+  byte_count INTEGER NOT NULL CHECK(byte_count BETWEEN 0 AND 4194304),
+  published_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  published_by TEXT NOT NULL CHECK(length(published_by) BETWEEN 1 AND 128),
+  revision INTEGER NOT NULL DEFAULT 1 CHECK(revision = 1),
+  UNIQUE(workspace_id, category, source_id, source_revision),
+  FOREIGN KEY (workspace_id) REFERENCES persistent_workspaces(workspace_id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id, workspace_id) REFERENCES persistent_workspaces(user_id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_persistent_workspaces_chat ON persistent_workspaces(user_id, chat_id);
+CREATE INDEX IF NOT EXISTS idx_persistent_workspace_sessions_turn ON persistent_workspace_turn_sessions(user_id, chat_id, turn_id, attempt_id);
+CREATE INDEX IF NOT EXISTS idx_persistent_workspace_tasks_state ON persistent_workspace_tasks(user_id, chat_id, workspace_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_persistent_workspace_records_kind ON persistent_workspace_records(user_id, chat_id, workspace_id, kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_persistent_workspace_submissions_state ON persistent_workspace_submissions(user_id, chat_id, workspace_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_persistent_workspace_artifacts_digest ON persistent_workspace_artifacts(user_id, chat_id, workspace_id, blob_digest);
+CREATE INDEX IF NOT EXISTS idx_persistent_workspace_publications_source ON persistent_workspace_publications(user_id, chat_id, workspace_id, category, source_id, source_revision);
+
+CREATE TRIGGER persistent_workspace_publications_immutable_update
+BEFORE UPDATE ON persistent_workspace_publications
+BEGIN
+  SELECT RAISE(ABORT, 'persistent workspace publications are immutable');
+END;
+CREATE TRIGGER trg_persistent_workspaces_archive_on_detach
+AFTER UPDATE OF chat_id ON persistent_workspaces
+WHEN OLD.chat_id IS NOT NULL AND NEW.chat_id IS NULL
+BEGIN
+  UPDATE persistent_workspaces
+     SET state = 'archived',
+         updated_at = unixepoch()
+   WHERE workspace_id = NEW.workspace_id;
+END;
+CREATE TABLE agent_runtime_repair_acknowledgements (
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  preset_id TEXT NOT NULL REFERENCES presets(id) ON DELETE CASCADE,
+  preset_revision TEXT NOT NULL CHECK(length(preset_revision) BETWEEN 1 AND 512),
+  reason_code TEXT NOT NULL CHECK(length(reason_code) BETWEEN 1 AND 512),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  acknowledged_at INTEGER NOT NULL CHECK(acknowledged_at >= 0),
+  PRIMARY KEY (user_id, preset_id, preset_revision, reason_code)
+);
+
+CREATE INDEX idx_agent_runtime_repair_ack_preset_revision
+  ON agent_runtime_repair_acknowledgements(user_id, preset_id, preset_revision, acknowledged_at DESC);
+
+CREATE TABLE agent_run_source_deletions (
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 256),
+  previous_attempt_id TEXT CHECK(previous_attempt_id IS NULL OR length(previous_attempt_id) BETWEEN 1 AND 256),
+  chat_id TEXT NOT NULL CHECK(length(chat_id) BETWEEN 1 AND 256),
+  source_kind TEXT NOT NULL CHECK(source_kind IN ('chat', 'message', 'swipe')),
+  target_message_id TEXT CHECK(target_message_id IS NULL OR length(target_message_id) BETWEEN 1 AND 256),
+  target_swipe_id INTEGER CHECK(target_swipe_id IS NULL OR target_swipe_id >= 0),
+  run_id TEXT CHECK(run_id IS NULL OR length(run_id) BETWEEN 1 AND 256),
+  turn_id TEXT CHECK(turn_id IS NULL OR length(turn_id) BETWEEN 1 AND 256),
+  generation_id TEXT CHECK(generation_id IS NULL OR length(generation_id) BETWEEN 1 AND 256),
+  generation_type TEXT CHECK(generation_type IS NULL OR generation_type IN ('normal', 'continue', 'regenerate', 'swipe')),
+  lifecycle TEXT CHECK(lifecycle IS NULL OR lifecycle IN ('ADMIT', 'ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER', 'COMMIT', 'TERMINAL')),
+  status TEXT CHECK(status IS NULL OR status IN ('pending', 'running', 'waiting', 'cancelling', 'terminal')),
+  outcome TEXT CHECK(outcome IS NULL OR outcome IN ('completed', 'stopped', 'failed', 'exhausted', 'rejected')),
+  terminal INTEGER CHECK(terminal IS NULL OR terminal IN (0, 1)),
+  attempt_reason TEXT CHECK(attempt_reason IS NULL OR length(attempt_reason) <= 128),
+  started_at INTEGER CHECK(started_at IS NULL OR started_at >= 0),
+  updated_at INTEGER CHECK(updated_at IS NULL OR updated_at >= 0),
+  terminal_at INTEGER CHECK(terminal_at IS NULL OR terminal_at >= 0),
+  host_correlation_id TEXT CHECK(host_correlation_id IS NULL OR length(host_correlation_id) BETWEEN 1 AND 256),
+  reconciliation_state TEXT CHECK(reconciliation_state IS NULL OR reconciliation_state IN ('authoritative', 'reconciling', 'recovered', 'stale')),
+  attempt_version INTEGER CHECK(attempt_version IS NULL OR attempt_version >= 1),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  source_deleted_at INTEGER NOT NULL CHECK(source_deleted_at >= 0),
+  reason TEXT NOT NULL DEFAULT 'source_deleted' CHECK(reason = 'source_deleted'),
+  activity_json TEXT NOT NULL DEFAULT '[]' CHECK(length(activity_json) <= 65536 AND json_valid(activity_json)),
+  usage_json TEXT NOT NULL DEFAULT '{"inputTokens":0,"outputTokens":0,"totalTokens":0,"toolCalls":0,"childInvocations":0}' CHECK(length(usage_json) <= 4096 AND json_valid(usage_json)),
+  PRIMARY KEY(user_id, attempt_id),
+  CHECK(target_swipe_id IS NULL OR target_message_id IS NOT NULL),
+  CHECK(source_kind = 'chat' OR target_message_id IS NOT NULL),
+  CHECK(source_kind <> 'swipe' OR target_swipe_id IS NOT NULL)
+);
+CREATE TRIGGER trg_agent_run_attempts_reject_source_deleted
+BEFORE INSERT ON agent_run_attempts
+WHEN EXISTS (
+  SELECT 1
+    FROM agent_run_source_deletions
+   WHERE user_id = NEW.user_id AND attempt_id = NEW.attempt_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'agent run attempt source was deleted');
+END;
+
+CREATE INDEX idx_agent_run_source_deletions_chat
+  ON agent_run_source_deletions(user_id, chat_id, source_kind, target_message_id, target_swipe_id);
+CREATE INDEX idx_agent_run_source_deletions_attempt
+  ON agent_run_source_deletions(user_id, attempt_id);
+CREATE TABLE agent_run_source_deletion_workspace (
+  user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL CHECK(length(attempt_id) BETWEEN 1 AND 256),
+  association_id TEXT NOT NULL CHECK(length(association_id) BETWEEN 1 AND 256),
+  workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 256),
+  workspace_revision INTEGER NOT NULL CHECK(workspace_revision >= 0),
+  relation TEXT NOT NULL CHECK(relation IN ('linked', 'published', 'omitted')),
+  object_kind TEXT NOT NULL CHECK(object_kind IN ('objective', 'task', 'finding', 'decision', 'question', 'submission', 'artifact', 'publication')),
+  object_id TEXT CHECK(object_id IS NULL OR length(object_id) BETWEEN 1 AND 256),
+  source_revision INTEGER CHECK(source_revision IS NULL OR source_revision >= 0),
+  source_deleted INTEGER NOT NULL CHECK(source_deleted IN (0, 1)),
+  provenance_digest TEXT CHECK(provenance_digest IS NULL OR length(provenance_digest) = 64),
+  host_sequence INTEGER NOT NULL CHECK(host_sequence >= 0),
+  PRIMARY KEY(user_id, attempt_id, association_id)
+);
+CREATE INDEX idx_agent_run_source_deletion_workspace_attempt
+  ON agent_run_source_deletion_workspace(user_id, attempt_id, host_sequence, association_id);

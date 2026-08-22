@@ -84,6 +84,20 @@ app.post("/import", async (c) => {
   }
 });
 
+app.get("/selectable", (c) => {
+  const userId = c.get("userId");
+  try {
+    return c.json({
+      data: contextPacks.listSelectableContextPackRevisions(
+        userId,
+        parsePositiveInt(c.req.query("limit")),
+      ),
+    });
+  } catch (error) {
+    return errorResponse(c, error);
+  }
+});
+
 app.get("/:packId/revisions", (c) => {
   const userId = c.get("userId");
   const packId = c.req.param("packId");

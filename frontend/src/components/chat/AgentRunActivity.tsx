@@ -19,13 +19,14 @@ import {
   X,
 } from 'lucide-react'
 import { useStore } from '@/store'
+import { agentRunsApi } from '@/api/agent-runs'
 import {
   selectAgentRunForTarget,
   selectLatestAgentRunForChat,
 } from '@/store/slices/agent-runs'
 import { loadAgentWorkspace, loadAgentWorkspaceSection } from '@/lib/agent-run-recovery'
 import AgentRunStopButton from './AgentRunStopButton'
-import type { AgentPublicErrorCode } from '@/types/agent-runtime'
+import OwnerRunInspector from './OwnerRunInspector'
 import type {
   AgentActivityNodeStatusV2,
   AgentActivityNodeV2,
@@ -74,28 +75,59 @@ const AGENT_PUBLIC_ERROR_LABEL_KEYS = {
   unauthorized: 'agentRun.errors.unauthorized',
   integrity_error: 'agentRun.errors.integrity_error',
   internal_error: 'agentRun.errors.internal_error',
-} as const satisfies Record<AgentPublicErrorCode, string>
+  not_found: 'agentRun.errors.not_found',
+  invalid_request: 'agentRun.errors.invalid_request',
+  projection_unavailable: 'agentRun.errors.projection_unavailable',
+  inspection_unavailable: 'agentRun.errors.inspection_unavailable',
+  workspace_unavailable: 'agentRun.errors.workspace_unavailable',
+  stop_unavailable: 'agentRun.errors.stop_unavailable',
+  retry_unavailable: 'agentRun.errors.retry_unavailable',
+  target_mismatch: 'agentRun.errors.target_mismatch',
+  stale_target: 'agentRun.errors.stale_target',
+  resync_required: 'agentRun.errors.resync_required',
+  recovery_unavailable: 'agentRun.errors.recovery_unavailable',
+  response_mode_required: 'agentRun.errors.response_mode_required',
+  decision_refresh_required: 'agentRun.errors.decision_refresh_required',
+  limit_exceeded: 'agentRun.errors.limit_exceeded',
+  queue_full: 'agentRun.errors.queue_full',
+  worker_disabled: 'agentRun.errors.worker_disabled',
+  worker_unavailable: 'agentRun.errors.worker_unavailable',
+  worker_crashed: 'agentRun.errors.worker_crashed',
+  worker_timed_out: 'agentRun.errors.worker_timed_out',
+  worker_malformed: 'agentRun.errors.worker_malformed',
+} as const
 
 function publicErrorTranslationKey(value: unknown): string {
   if (typeof value !== 'string' || !Object.hasOwn(AGENT_PUBLIC_ERROR_LABEL_KEYS, value)) {
     return 'agentRun.errors.unknown'
   }
-  return AGENT_PUBLIC_ERROR_LABEL_KEYS[value as AgentPublicErrorCode]
+  return AGENT_PUBLIC_ERROR_LABEL_KEYS[value as keyof typeof AGENT_PUBLIC_ERROR_LABEL_KEYS]
 }
 
-const TERMINAL_RUN_STATUSES: Record<AgentRunPublicV2['status'], boolean> = {
-  ASSEMBLE: false,
-  WORK: false,
-  COMPLETE: false,
-  RENDER: false,
-  PREPARE_COMMIT: false,
-  COMMITTING: false,
-  COMMITTED: true,
-  COMMIT_FAILED: true,
-  EXHAUSTED: true,
-  FAILED: true,
-  CANCELLED: true,
-  TIMED_OUT: true,
+function isTerminalRun(run: AgentRunPublicV2): boolean {
+  return run.workStatus === 'terminal' || run.workPhase === 'TERMINAL'
+}
+
+function runStatusToNodeStatus(run: AgentRunPublicV2): AgentActivityNodeStatusV2 {
+  if (run.workOutcome === 'stopped') return 'cancelled'
+  if (run.workOutcome === 'failed' || run.workOutcome === 'exhausted' || run.workOutcome === 'rejected') return 'failed'
+  if (run.workOutcome === 'completed' || isTerminalRun(run)) return 'completed'
+  return 'running'
+}
+
+function useRunClock(running: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!running) {
+      setNow(Date.now())
+      return
+    }
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(timer)
+  }, [running])
+
+  return now
 }
 
 function formatDuration(
@@ -118,6 +150,10 @@ function formatDuration(
     : translate('agentRun.duration.hours', { count: hours })
 }
 
+function epochMilliseconds(value: number): number {
+  return value < 100_000_000_000 ? value * 1_000 : value
+}
+
 function StatusIcon({ status, spinning = false }: { status: AgentActivityNodeStatusV2; spinning?: boolean }) {
   if (status === 'completed') return <CheckCircle2 aria-hidden="true" />
   if (status === 'failed') return <CircleX aria-hidden="true" />
@@ -127,24 +163,19 @@ function StatusIcon({ status, spinning = false }: { status: AgentActivityNodeSta
   return spinning ? <LoaderCircle className={styles.spinner} aria-hidden="true" /> : <CircleDot aria-hidden="true" />
 }
 
-function runStatusToNodeStatus(run: AgentRunPublicV2): AgentActivityNodeStatusV2 {
-  if (run.status === 'COMMITTED') return 'completed'
-  if (run.status === 'CANCELLED') return 'cancelled'
-  if (run.status === 'TIMED_OUT') return 'timed_out'
-  if (run.status === 'FAILED' || run.status === 'COMMIT_FAILED' || run.status === 'EXHAUSTED') return 'failed'
-  return 'running'
-}
 
 function AgentActivityNodeRow({
   node,
   childrenByParent,
   nodesById,
   ancestors,
+  now,
 }: {
   node: AgentActivityNodeV2
   childrenByParent: Record<string, string[]>
   nodesById: Record<string, AgentActivityNodeV2>
   ancestors: readonly string[]
+  now: number
 }) {
   const { t } = useTranslation('chat')
   if (ancestors.includes(node.id)) return null
@@ -161,6 +192,9 @@ function AgentActivityNodeRow({
         : node.toolId
           ? t(`agentRun.tools.${node.toolId}`, { defaultValue: t('agentRun.tools.unknown_tool') })
           : t('agentRun.actors.tool')
+  const elapsedMs = node.status === 'running'
+    ? Math.max(node.elapsedMs, now - epochMilliseconds(node.startedAt))
+    : node.elapsedMs
 
   return (
     <li className={styles.treeItem}>
@@ -173,7 +207,7 @@ function AgentActivityNodeRow({
           <span className={styles.nodePhase}>{t(`agentRun.phase.${node.phase}`)}</span>
         </span>
         <span className={styles.nodeStatus}>{t(`agentRun.nodeStatus.${node.status}`)}</span>
-        <span className={styles.duration}>{formatDuration(node.elapsedMs, t)}</span>
+        <span className={styles.duration}>{formatDuration(elapsedMs, t)}</span>
       </div>
       {node.usage && node.usage.totalTokens > 0 ? (
         <div className={styles.nodeUsage}>
@@ -195,6 +229,7 @@ function AgentActivityNodeRow({
                 childrenByParent={childrenByParent}
                 nodesById={nodesById}
                 ancestors={nextAncestors}
+                now={now}
               />
             ) : null
           })}
@@ -211,6 +246,8 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
   hidden: boolean
 }) {
   const { t } = useTranslation('chat')
+  const panelIdPrefix = `agent-run-${run.runId}`
+  const now = useRunClock(!isTerminalRun(run) && !hidden)
   const { roots, childrenByParent, nodesById } = useMemo(() => {
     const byId: Record<string, AgentActivityNodeV2> = {}
     const children: Record<string, string[]> = {}
@@ -225,9 +262,11 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
     }
     return { roots: rootNodes, childrenByParent: children, nodesById: byId }
   }, [run.activity])
+  const runStatus = t(`agentRun.status.${run.workStatus}`)
+  const outcome = run.workOutcome ? t(`agentRun.outcome.${run.workOutcome}`) : null
 
   return (
-    <section className={styles.tabPanel} role="tabpanel" id="agent-run-activity-panel" aria-labelledby="agent-run-activity-tab" hidden={hidden}>
+    <section className={styles.tabPanel} role="tabpanel" id={`${panelIdPrefix}-activity-panel`} aria-labelledby={`${panelIdPrefix}-activity-tab`} tabIndex={hidden ? -1 : 0} hidden={hidden}>
       {syncStatus === 'stale' || syncStatus === 'restoring' || syncStatus === 'error' ? (
         <div className={styles.syncNotice}>
           <RefreshCw className={syncStatus === 'restoring' ? styles.spinner : undefined} aria-hidden="true" />
@@ -237,13 +276,14 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
 
       <div className={styles.runSummary}>
         <span className={styles.statusIcon} data-status={runStatusToNodeStatus(run)}>
-          <StatusIcon status={runStatusToNodeStatus(run)} spinning={!TERMINAL_RUN_STATUSES[run.status]} />
+          <StatusIcon status={runStatusToNodeStatus(run)} spinning={!isTerminalRun(run)} />
         </span>
         <div>
-          <strong>{t(`agentRun.phase.${run.phase}`)}</strong>
-          <span>{t(`agentRun.status.${run.status}`)}</span>
+          <strong>{t(`agentRun.phase.${run.workPhase}`)}</strong>
+          <span>{runStatus}</span>
+          {outcome ? <span className={styles.runOutcome}>{outcome}</span> : null}
         </div>
-        <span className={styles.duration}>{formatDuration(Math.max(0, run.updatedAt - run.startedAt), t)}</span>
+        <span className={styles.duration}>{formatDuration(Math.max(0, (isTerminalRun(run) ? epochMilliseconds(run.updatedAt) : now) - epochMilliseconds(run.startedAt)), t)}</span>
       </div>
 
       {roots.length > 0 ? (
@@ -255,6 +295,7 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
               childrenByParent={childrenByParent}
               nodesById={nodesById}
               ancestors={[]}
+              now={now}
             />
           ))}
         </ul>
@@ -283,15 +324,16 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
         </div>
       ) : null}
 
-      {Object.hasOwn(run, 'errorCode') && run.errorCode !== undefined ? (
+      {run.error ? (
         <div className={styles.errorNotice}>
           <CircleX aria-hidden="true" />
-          <span>{t(publicErrorTranslationKey(run.errorCode))}</span>
+          <span>{t(publicErrorTranslationKey(run.error.code))}</span>
         </div>
       ) : null}
     </section>
   )
 }
+
 
 function WorkspaceEntry({ entry }: { entry: AgentWorkspaceEntryPreviewV2 }) {
   const { t } = useTranslation('chat')
@@ -347,16 +389,16 @@ function WorkspaceEntry({ entry }: { entry: AgentWorkspaceEntryPreviewV2 }) {
     </li>
   )
 }
-
-function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: string; hidden: boolean }) {
+function WorkspaceTab({ chatId, turnId, runId, hidden }: { chatId: string; turnId: string; runId: string; hidden: boolean }) {
   const { t } = useTranslation('chat')
+  const panelIdPrefix = `agent-run-${runId}`
   const workspace = useStore((state) => state.agentWorkspaceByTurn[turnId])
   const [expanded, setExpanded] = useState<AgentWorkspaceSectionV2 | null>(null)
 
   useEffect(() => {
     if (hidden) return
     if (!workspace || workspace.status === 'idle' || workspace.status === 'loading') {
-      void loadAgentWorkspace(chatId, turnId)
+      void loadAgentWorkspace(chatId, turnId, agentRunsApi, useStore)
     }
   }, [chatId, turnId, hidden, workspace?.status])
 
@@ -369,14 +411,14 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
     ) return
     const sectionState = workspace.sections[expanded]
     if (!sectionState) {
-      void loadAgentWorkspaceSection(chatId, turnId, expanded)
+      void loadAgentWorkspaceSection(chatId, turnId, expanded, agentRunsApi, useStore, false)
       return
     }
     if (
       sectionState.loadingMore || sectionState.error
       || sectionState.preview.workspaceRevision >= workspace.index.workspaceRevision
     ) return
-    void loadAgentWorkspaceSection(chatId, turnId, expanded)
+    void loadAgentWorkspaceSection(chatId, turnId, expanded, agentRunsApi, useStore, false)
   }, [
     chatId,
     turnId,
@@ -393,22 +435,22 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
     const opening = expanded !== section
     setExpanded((current) => current === section ? null : section)
     const sectionState = workspace?.sections[section]
-    if (opening && (!sectionState || sectionState.error)) void loadAgentWorkspaceSection(chatId, turnId, section)
+    if (opening && (!sectionState || sectionState.error)) void loadAgentWorkspaceSection(chatId, turnId, section, agentRunsApi, useStore, false)
   }, [chatId, turnId, workspace, expanded])
   if (!workspace || workspace.status === 'idle' || workspace.status === 'loading') {
     return (
-      <section className={styles.tabPanel} role="tabpanel" id="agent-run-workspace-panel" aria-labelledby="agent-run-workspace-tab" hidden={hidden}>
-        <div className={styles.loadingState}><LoaderCircle className={styles.spinner} aria-hidden="true" />{t('agentRun.workspace.loading')}</div>
+      <section className={styles.tabPanel} role="tabpanel" id={`${panelIdPrefix}-workspace-panel`} aria-labelledby={`${panelIdPrefix}-workspace-tab`} tabIndex={hidden ? -1 : 0} hidden={hidden}>
+        <div className={styles.loadingState} role="status" aria-live="polite"><LoaderCircle className={styles.spinner} aria-hidden="true" />{t('agentRun.workspace.loading')}</div>
       </section>
     )
   }
   if (workspace.status === 'error' || !workspace.index) {
     return (
-      <section className={styles.tabPanel} role="tabpanel" id="agent-run-workspace-panel" aria-labelledby="agent-run-workspace-tab" hidden={hidden}>
-        <div className={styles.emptyState}>
+      <section className={styles.tabPanel} role="tabpanel" id={`${panelIdPrefix}-workspace-panel`} aria-labelledby={`${panelIdPrefix}-workspace-tab`} tabIndex={hidden ? -1 : 0} hidden={hidden}>
+        <div className={styles.emptyState} role="alert">
           <CircleX aria-hidden="true" />
           <p>{t('agentRun.workspace.error')}</p>
-          <button type="button" className={styles.secondaryButton} onClick={() => void loadAgentWorkspace(chatId, turnId)}>
+          <button type="button" className={styles.secondaryButton} onClick={() => void loadAgentWorkspace(chatId, turnId, agentRunsApi, useStore)}>
             <RefreshCw aria-hidden="true" />{t('agentRun.workspace.retry')}
           </button>
         </div>
@@ -417,7 +459,7 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
   }
 
   return (
-    <section className={styles.tabPanel} role="tabpanel" id="agent-run-workspace-panel" aria-labelledby="agent-run-workspace-tab" hidden={hidden}>
+    <section className={styles.tabPanel} role="tabpanel" id={`${panelIdPrefix}-workspace-panel`} aria-labelledby={`${panelIdPrefix}-workspace-tab`} tabIndex={hidden ? -1 : 0} hidden={hidden}>
       <p className={styles.workspaceIntro}>{t('agentRun.workspace.viewOnly')}</p>
       {workspace.index.sections.length === 0 ? (
         <div className={styles.emptyState}>
@@ -435,7 +477,7 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
                   type="button"
                   className={styles.sectionToggle}
                   aria-expanded={open}
-                  aria-controls={`agent-run-workspace-${summary.section}`}
+                  aria-controls={`${panelIdPrefix}-workspace-${summary.section}`}
                   onClick={() => toggleSection(summary.section)}
                 >
                   {open ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
@@ -443,7 +485,7 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
                   <span>{summary.count.toLocaleString()}</span>
                 </button>
                 {open ? (
-                  <div id={`agent-run-workspace-${summary.section}`} className={styles.sectionBody}>
+                  <div id={`${panelIdPrefix}-workspace-${summary.section}`} className={styles.sectionBody}>
                     {!sectionState || sectionState.loadingMore ? (
                       <div className={styles.loadingState}><LoaderCircle className={styles.spinner} aria-hidden="true" />{t('agentRun.workspace.loadingSection')}</div>
                     ) : sectionState.error ? (
@@ -453,7 +495,7 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
                         <button
                           type="button"
                           className={styles.secondaryButton}
-                          onClick={() => void loadAgentWorkspaceSection(chatId, turnId, summary.section)}
+                          onClick={() => void loadAgentWorkspaceSection(chatId, turnId, summary.section, agentRunsApi, useStore, false)}
                         >
                           <RefreshCw aria-hidden="true" />{t('agentRun.workspace.retry')}
                         </button>
@@ -473,7 +515,7 @@ function WorkspaceTab({ chatId, turnId, hidden }: { chatId: string; turnId: stri
                             type="button"
                             className={styles.secondaryButton}
                             disabled={sectionState.loadingMore}
-                            onClick={() => void loadAgentWorkspaceSection(chatId, turnId, summary.section, true)}
+                            onClick={() => void loadAgentWorkspaceSection(chatId, turnId, summary.section, agentRunsApi, useStore, true)}
                           >
                             {sectionState.loadingMore ? <LoaderCircle className={styles.spinner} aria-hidden="true" /> : null}
                             {t('agentRun.workspace.loadMore')}
@@ -502,7 +544,8 @@ function useDialogFocus(isOpen: boolean, onClose: () => void) {
     const dialog = dialogRef.current
     const focusableSelector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
     const focusable = dialog?.querySelectorAll<HTMLElement>(focusableSelector)
-    focusable?.[0]?.focus()
+    const initialFocus = dialog?.querySelector<HTMLElement>('[data-dialog-initial-focus="true"]')
+    ;(initialFocus ?? focusable?.[0] ?? dialog)?.focus()
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -537,12 +580,23 @@ function useDialogFocus(isOpen: boolean, onClose: () => void) {
   return dialogRef
 }
 
-function AgentRunSurface({ run, isOpen, onClose }: { run: AgentRunPublicV2; isOpen: boolean; onClose: () => void }) {
+function AgentRunSurface({
+  run,
+  isOpen,
+  onClose,
+  onInspect,
+}: {
+  run: AgentRunPublicV2
+  isOpen: boolean
+  onClose: () => void
+  onInspect: () => void
+}) {
   const { t } = useTranslation('chat')
   const [tab, setTab] = useState<'activity' | 'workspace'>('activity')
   const dialogRef = useDialogFocus(isOpen, onClose)
   const syncStatus = useStore((state) => state.agentRunSyncByChat[run.chatId] ?? 'idle')
   const omittedEvents = useStore((state) => state.agentRunOmittedEventsByChat[run.chatId] ?? 0)
+  const tabIdPrefix = `agent-run-${run.runId}`
   const handleTabKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
     event.preventDefault()
@@ -552,8 +606,8 @@ function AgentRunSurface({ run, isOpen, onClose }: { run: AgentRunPublicV2; isOp
         ? 'workspace'
         : tab === 'activity' ? 'workspace' : 'activity'
     setTab(nextTab)
-    document.getElementById(`agent-run-${nextTab}-tab`)?.focus()
-  }, [tab])
+    document.getElementById(`${tabIdPrefix}-${nextTab}-tab`)?.focus()
+  }, [tab, tabIdPrefix])
   if (!isOpen) return null
 
   return createPortal(
@@ -565,26 +619,31 @@ function AgentRunSurface({ run, isOpen, onClose }: { run: AgentRunPublicV2; isOp
         className={styles.surface}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="agent-run-surface-title"
+        aria-labelledby={`${tabIdPrefix}-surface-title`}
         tabIndex={-1}
       >
         <header className={styles.surfaceHeader}>
           <div>
-            <h2 id="agent-run-surface-title">{t('agentRun.title')}</h2>
+            <h2 id={`${tabIdPrefix}-surface-title`}>{t('agentRun.title')}</h2>
             <p>{t('agentRun.subtitle')}</p>
           </div>
-          <button type="button" className={styles.closeButton} onClick={onClose} aria-label={t('agentRun.close')}>
-            <X aria-hidden="true" />
-          </button>
+          <div className={styles.surfaceHeaderActions}>
+            <button type="button" className={styles.inspectButton} onClick={onInspect}>
+              <ListTree aria-hidden="true" />{t('agentRun.openInspector')}
+            </button>
+            <button type="button" className={styles.closeButton} onClick={onClose} aria-label={t('agentRun.close')} data-dialog-initial-focus="true">
+              <X aria-hidden="true" />
+            </button>
+          </div>
         </header>
 
         <div className={styles.tabs} role="tablist" aria-label={t('agentRun.tabsAria')} onKeyDown={handleTabKeyDown}>
           <button
             type="button"
             role="tab"
-            id="agent-run-activity-tab"
+            id={`${tabIdPrefix}-activity-tab`}
             aria-selected={tab === 'activity'}
-            aria-controls="agent-run-activity-panel"
+            aria-controls={`${tabIdPrefix}-activity-panel`}
             tabIndex={tab === 'activity' ? 0 : -1}
             onClick={() => setTab('activity')}
           >
@@ -593,9 +652,9 @@ function AgentRunSurface({ run, isOpen, onClose }: { run: AgentRunPublicV2; isOp
           <button
             type="button"
             role="tab"
-            id="agent-run-workspace-tab"
+            id={`${tabIdPrefix}-workspace-tab`}
             aria-selected={tab === 'workspace'}
-            aria-controls="agent-run-workspace-panel"
+            aria-controls={`${tabIdPrefix}-workspace-panel`}
             tabIndex={tab === 'workspace' ? 0 : -1}
             onClick={() => setTab('workspace')}
           >
@@ -605,10 +664,10 @@ function AgentRunSurface({ run, isOpen, onClose }: { run: AgentRunPublicV2; isOp
 
         <div className={styles.surfaceBody}>
           <ActivityTree run={run} syncStatus={syncStatus} omittedEvents={omittedEvents} hidden={tab !== 'activity'} />
-          <WorkspaceTab chatId={run.chatId} turnId={run.turnId} hidden={tab !== 'workspace'} />
+          <WorkspaceTab chatId={run.chatId} turnId={run.turnId} runId={run.runId} hidden={tab !== 'workspace'} />
         </div>
 
-        {!TERMINAL_RUN_STATUSES[run.status] ? (
+        {!isTerminalRun(run) ? (
           <footer className={styles.surfaceFooter}>
             <AgentRunStopButton
               turnId={run.turnId}
@@ -624,6 +683,30 @@ function AgentRunSurface({ run, isOpen, onClose }: { run: AgentRunPublicV2; isOp
   )
 }
 
+function selectProvisionalRunForChat(state: {
+  agentRunProvisionalByKey: Record<string, AgentRunPublicV2>
+  isStreaming: boolean
+  activeChatId: string | null
+  activeGenerationId: string | null
+}, chatId: string): AgentRunPublicV2 | undefined {
+  let selected: AgentRunPublicV2 | undefined
+  const streamingInChat = state.isStreaming && state.activeChatId === chatId
+  for (const run of Object.values(state.agentRunProvisionalByKey)) {
+    if (run.chatId !== chatId || run.target !== null) continue
+    if (streamingInChat && state.activeGenerationId && run.generationId !== state.activeGenerationId) continue
+    if (streamingInChat && !state.activeGenerationId && isTerminalRun(run)) continue
+    if (
+      !selected
+      || run.sequence > selected.sequence
+      || run.sequence === selected.sequence && run.updatedAt > selected.updatedAt
+      || run.sequence === selected.sequence && run.updatedAt === selected.updatedAt && run.revision > selected.revision
+    ) {
+      selected = run
+    }
+  }
+  return selected
+}
+
 export function AgentRunActivityStrip({ chatId, messageId, swipeId }: {
   chatId: string
   messageId: string
@@ -631,30 +714,63 @@ export function AgentRunActivityStrip({ chatId, messageId, swipeId }: {
 }) {
   const { t } = useTranslation('chat')
   const [open, setOpen] = useState(false)
+  const [ownerOpen, setOwnerOpen] = useState(false)
+  const [ownerTarget, setOwnerTarget] = useState<{ attemptId: string | null | undefined; chatId: string } | null>(null)
   const closeSurface = useCallback(() => setOpen(false), [])
   const run = useStore((state) => {
     const candidate = selectAgentRunForTarget(state, chatId, messageId, swipeId)
-    const isStreamingTarget = state.isStreaming
-      && state.activeChatId === chatId
-      && state.regeneratingMessageId === messageId
-      && (state.streamingSwipeId === null || state.streamingSwipeId === swipeId)
-    if (!isStreamingTarget) return candidate
-    return state.activeGenerationId && candidate?.generationId === state.activeGenerationId
-      ? candidate
-      : undefined
+    const streamingInChat = state.isStreaming && state.activeChatId === chatId
+    if (!streamingInChat) return candidate
+    if (state.activeGenerationId) {
+      return candidate?.generationId === state.activeGenerationId ? candidate : undefined
+    }
+    return candidate && !isTerminalRun(candidate) ? candidate : undefined
   })
-  if (!run) return null
+  const inspectRun = useCallback(() => {
+    if (!run) return
+    setOpen(false)
+    setOwnerTarget({ attemptId: run.inspectionAttemptId, chatId: run.chatId })
+    setOwnerOpen(true)
+  }, [run])
+  const closeOwner = useCallback(() => {
+    setOwnerOpen(false)
+    setOwnerTarget(null)
+  }, [])
+  if (!run) {
+    return ownerTarget ? (
+      <OwnerRunInspector
+        attemptId={ownerTarget.attemptId}
+        chatId={ownerTarget.chatId}
+        isOpen={ownerOpen}
+        onClose={closeOwner}
+      />
+    ) : null
+  }
   const nodeStatus = runStatusToNodeStatus(run)
+  const status = t(`agentRun.status.${run.workStatus}`)
+  const outcome = run.workOutcome ? t(`agentRun.outcome.${run.workOutcome}`) : null
 
   return (
     <>
-      <button type="button" className={styles.strip} onClick={() => setOpen(true)} aria-haspopup="dialog">
+      <button
+        type="button"
+        className={styles.strip}
+        onClick={() => setOpen(true)}
+        aria-haspopup="dialog"
+        data-chat-id={chatId}
+        data-message-id={messageId}
+        data-swipe-id={swipeId}
+        data-attempt-id={run.inspectionAttemptId}
+        data-work-phase={run.workPhase}
+        data-work-status={run.workStatus}
+        data-work-outcome={run.workOutcome ?? undefined}
+      >
         <span className={styles.statusIcon} data-status={nodeStatus}>
-          <StatusIcon status={nodeStatus} spinning={!TERMINAL_RUN_STATUSES[run.status]} />
+          <StatusIcon status={nodeStatus} spinning={!isTerminalRun(run)} />
         </span>
         <span className={styles.stripText}>
           <strong>{t('agentRun.stripLabel')}</strong>
-          <span>{t(`agentRun.phase.${run.phase}`)}</span>
+          <span>{t(`agentRun.phase.${run.workPhase}`)} · {status}{outcome ? ` · ${outcome}` : ''}</span>
         </span>
         <span className={styles.stripUsage}>
           <span className={styles.stripMetric}>
@@ -670,7 +786,80 @@ export function AgentRunActivityStrip({ chatId, messageId, swipeId }: {
         </span>
         <ChevronRight aria-hidden="true" />
       </button>
-      <AgentRunSurface run={run} isOpen={open} onClose={closeSurface} />
+      <AgentRunSurface run={run} isOpen={open} onClose={closeSurface} onInspect={inspectRun} />
+      <OwnerRunInspector
+        attemptId={ownerTarget?.attemptId ?? run.inspectionAttemptId}
+        chatId={ownerTarget?.chatId ?? run.chatId}
+        isOpen={ownerOpen}
+        onClose={closeOwner}
+      />
+    </>
+  )
+}
+
+/** Keeps an un-targeted WORK attempt visible until the host supplies its exact message/swipe. */
+export function AgentRunProvisionalLocator({ chatId }: { chatId: string }) {
+  const { t } = useTranslation('chat')
+  const [open, setOpen] = useState(false)
+  const [ownerOpen, setOwnerOpen] = useState(false)
+  const [ownerTarget, setOwnerTarget] = useState<{ attemptId: string | null | undefined; chatId: string } | null>(null)
+  const run = useStore((state) => selectProvisionalRunForChat(state, chatId))
+  const openInspector = useCallback(() => {
+    if (!run) return
+    setOpen(false)
+    setOwnerTarget({ attemptId: run.inspectionAttemptId, chatId: run.chatId })
+    setOwnerOpen(true)
+  }, [run])
+  const closeOwner = useCallback(() => {
+    setOwnerOpen(false)
+    setOwnerTarget(null)
+  }, [])
+  if (!run) {
+    return ownerTarget ? (
+      <OwnerRunInspector
+        attemptId={ownerTarget.attemptId}
+        chatId={ownerTarget.chatId}
+        isOpen={ownerOpen}
+        onClose={closeOwner}
+      />
+    ) : null
+  }
+
+  const nodeStatus = runStatusToNodeStatus(run)
+  const status = t(`agentRun.status.${run.workStatus}`)
+  const outcome = run.workOutcome ? t(`agentRun.outcome.${run.workOutcome}`) : null
+  return (
+    <>
+      <button
+        type="button"
+        className={styles.provisionalLocator}
+        onClick={() => setOpen(true)}
+        aria-haspopup="dialog"
+        aria-label={t('agentRun.provisionalLocatorAria')}
+        data-chat-id={chatId}
+        data-turn-id={run.turnId}
+        data-generation-id={run.generationId}
+        data-attempt-id={run.inspectionAttemptId}
+        data-work-phase={run.workPhase}
+        data-work-status={run.workStatus}
+        data-work-outcome={run.workOutcome ?? undefined}
+      >
+        <span className={styles.statusIcon} data-status={nodeStatus}>
+          <StatusIcon status={nodeStatus} spinning={!isTerminalRun(run)} />
+        </span>
+        <span className={styles.stripText}>
+          <strong>{t('agentRun.provisionalLocator')}</strong>
+          <span>{t('agentRun.targetPending')} · {t(`agentRun.phase.${run.workPhase}`)} · {status}{outcome ? ` · ${outcome}` : ''}</span>
+        </span>
+        <ChevronRight aria-hidden="true" />
+      </button>
+      <AgentRunSurface run={run} isOpen={open} onClose={() => setOpen(false)} onInspect={openInspector} />
+      <OwnerRunInspector
+        attemptId={ownerTarget?.attemptId ?? run.inspectionAttemptId}
+        chatId={ownerTarget?.chatId ?? run.chatId}
+        isOpen={ownerOpen}
+        onClose={closeOwner}
+      />
     </>
   )
 }
@@ -680,11 +869,26 @@ export function AgentRunLiveRegion({ chatId }: { chatId: string }) {
   const { t } = useTranslation('chat')
   const run = useStore((state) => {
     const candidate = selectLatestAgentRunForChat(state, chatId)
-    const isStreamingInChat = state.isStreaming && state.activeChatId === chatId
-    if (!isStreamingInChat) return candidate
-    return state.activeGenerationId && candidate?.generationId === state.activeGenerationId
-      ? candidate
-      : undefined
+    const streamingInChat = state.isStreaming && state.activeChatId === chatId
+    if (!streamingInChat) return candidate
+    if (state.activeGenerationId) {
+      return candidate?.generationId === state.activeGenerationId ? candidate : undefined
+    }
+    return candidate && !isTerminalRun(candidate) ? candidate : undefined
+  })
+  const activeRunCount = useStore((state) => {
+    const generationId = state.isStreaming && state.activeChatId === chatId ? state.activeGenerationId : null
+    const runIds = new Set<string>()
+    for (const candidate of Object.values(state.agentRunProvisionalByKey)) {
+      if (
+        candidate.chatId === chatId
+        && !isTerminalRun(candidate)
+        && (!generationId || candidate.generationId === generationId)
+      ) {
+        runIds.add(candidate.runId)
+      }
+    }
+    return runIds.size
   })
   const syncStatus = useStore((state) => state.agentRunSyncByChat[chatId] ?? 'idle')
   const previousSignatureRef = useRef('')
@@ -695,15 +899,24 @@ export function AgentRunLiveRegion({ chatId }: { chatId: string }) {
     if (syncStatus === 'restoring') next = t('agentRun.announcements.restoring')
     else if (syncStatus === 'stale') next = t('agentRun.announcements.stale')
     else if (syncStatus === 'error') next = t('agentRun.announcements.recoveryFailed')
-    else if (run?.status === 'CANCELLED') next = t('agentRun.announcements.cancelled')
-    else if (run && TERMINAL_RUN_STATUSES[run.status]) next = t('agentRun.announcements.terminal', { status: t(`agentRun.status.${run.status}`) })
-    else if (run) next = t('agentRun.announcements.phase', { phase: t(`agentRun.phase.${run.phase}`) })
-    const signature = `${chatId}\u0000${run?.runId ?? ''}\u0000${syncStatus}\u0000${run?.status ?? ''}\u0000${run?.phase ?? ''}\u0000${next}`
+    else if (run?.workOutcome === 'stopped') next = t('agentRun.announcements.cancelled')
+    else if (run && isTerminalRun(run)) {
+      const terminalStatus = run.workOutcome
+        ? t(`agentRun.outcome.${run.workOutcome}`)
+        : t(`agentRun.status.${run.workStatus}`)
+      next = t('agentRun.announcements.terminal', { status: terminalStatus })
+    } else if (run) {
+      const phase = t(`agentRun.phase.${run.workPhase}`)
+      next = activeRunCount > 1
+        ? t('agentRun.announcements.multiple', { count: activeRunCount, phase })
+        : t('agentRun.announcements.phase', { phase })
+    }
+    const signature = `${chatId}\u0000${run?.runId ?? ''}\u0000${syncStatus}\u0000${run?.workStatus ?? ''}\u0000${run?.workPhase ?? ''}\u0000${run?.workOutcome ?? ''}\u0000${activeRunCount}\u0000${next}`
     if (signature !== previousSignatureRef.current) {
       previousSignatureRef.current = signature
       setAnnouncement((current) => ({ text: next, revision: current.revision + 1 }))
     }
-  }, [chatId, run?.phase, run?.runId, run?.status, syncStatus, t])
+  }, [activeRunCount, chatId, run?.runId, run?.workOutcome, run?.workPhase, run?.workStatus, syncStatus, t])
 
   return (
     <div className={styles.liveRegion} aria-live="polite" aria-atomic="true">

@@ -29,6 +29,7 @@ import { getChatPipelineStatus } from "./chat-pipeline-coordinator.service";
 import * as connectionsSvc from "./connections.service";
 import {
   __test__,
+  dryRunGeneration,
   getActiveGenerationCount,
   startGeneration,
   stopGeneration,
@@ -37,6 +38,7 @@ import * as pool from "./generation-pool.service";
 import { buildInlineToolContinuation } from "./inline-tool-continuation";
 import * as presetsSvc from "./presets.service";
 import { writePresetAgentConfig } from "./agent-config-portability.service";
+import * as worldBooksSvc from "./world-books.service";
 const TEST_CONNECTION: ResolvedConcreteConnectionV1 = {
   logicalId: "child-connection",
   concreteId: "child-connection",
@@ -1003,7 +1005,9 @@ describe.serial("root generation usage accounting", () => {
     | "sparse_usage"
     | "stuck_teardown"
     | "inactive_success"
-    | "inactive_failure";
+    | "inactive_failure"
+    | "response_loom"
+    | "response_phase_loom";
 
   class ProductionUsageProvider implements LlmProvider {
     readonly name = "root-usage-test";
@@ -1053,6 +1057,25 @@ describe.serial("root generation usage accounting", () => {
       request: GenerationRequest,
     ): AsyncGenerator<StreamChunk, void, unknown> {
       this.rootRequests.push(request);
+      if (
+        this.scenario === "response_loom" ||
+        this.scenario === "response_phase_loom"
+      ) {
+        try {
+          yield {
+            token: "ordinary answer",
+            finish_reason: "stop",
+            usage: {
+              prompt_tokens: 7,
+              completion_tokens: 2,
+              total_tokens: 9,
+            },
+          };
+        } finally {
+          this.streamClosed = true;
+        }
+        return;
+      }
       if (this.scenario === "inactive_success") {
         try {
           yield {
@@ -1212,6 +1235,8 @@ describe.serial("root generation usage accounting", () => {
     await runMigrations(getDb());
 
     const userId = `root-usage-${scenario}`;
+    const isResponseLoomScenario =
+      scenario === "response_loom" || scenario === "response_phase_loom";
     getDb().query(
       'INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)',
     ).run(userId, "Usage Owner", `${userId}@example.test`);
@@ -1259,7 +1284,7 @@ describe.serial("root generation usage accounting", () => {
         {
           id: "system",
           name: "System",
-          content: "Answer the user.",
+          content: isResponseLoomScenario ? "Answer {{user}}." : "Answer the user.",
           role: "system",
           enabled: true,
           position: "pre_history",
@@ -1284,12 +1309,108 @@ describe.serial("root generation usage accounting", () => {
           injectionTrigger: [],
           group: null,
         },
+        ...(scenario === "response_loom" ? [{
+          id: "work-policy",
+          name: "Work policy",
+          content: "Internal work-only policy.",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          marker: null,
+          isLocked: false,
+          color: null,
+          injectionTrigger: [],
+          group: null,
+        }] : []),
+        ...(scenario === "response_phase_loom" ? [{
+          id: "phase-policy",
+          name: "Phase policy",
+          content: "Internal phase-only policy.",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          marker: null,
+          isLocked: false,
+          color: null,
+          injectionTrigger: [],
+          group: null,
+        }] : []),
       ],
-      ...(scenarioIsAgentActive(scenario) ? { agent_config: agentConfig } : {}),
+      ...(scenarioIsAgentActive(scenario) && !isResponseLoomScenario
+        ? { agent_config: agentConfig }
+        : {}),
     });
+    const configForPreset: AgentConfigV2 =
+      isResponseLoomScenario
+        ? {
+            ...agentConfig,
+            runtimePolicy: {
+              version: 1,
+              authority: "loom",
+              scope: "preset",
+              defaultMode: "response",
+              loomPolicy: scenario === "response_loom"
+                ? {
+                    version: 1,
+                    workPolicy: [{
+                      version: 1,
+                      id: "work-only-entry",
+                      source: {
+                        kind: "loom_block",
+                        blockId: "work-policy",
+                        presetRevision: preset.cache_revision ?? 1,
+                        blockRevision: 1,
+                        promptOrder: preset.prompt_order.findIndex(
+                          (block) => block?.id === "work-policy",
+                        ),
+                      },
+                      destination: "root_work",
+                      checkpoint: "WORK",
+                      required: false,
+                      visibility: "work_only",
+                      delivery: { delivery: "direct" },
+                    }],
+                    workspaceUsage: [],
+                    completionCriteria: [],
+                    renderPolicy: [],
+                  }
+                : {
+                    version: 1,
+                    workPolicy: [],
+                    workspaceUsage: [],
+                    completionCriteria: [],
+                    renderPolicy: [],
+                  },
+              phases: scenario === "response_phase_loom"
+                ? [{
+                    version: 1,
+                    id: "phase_only",
+                    label: "Phase only",
+                    instructionRefs: [{
+                      kind: "loom_block",
+                      blockId: "phase-policy",
+                      presetRevision: preset.cache_revision ?? 1,
+                      blockRevision: 1,
+                      promptOrder: preset.prompt_order.findIndex(
+                        (block) => block?.id === "phase-policy",
+                      ),
+                    }],
+                    required: false,
+                    enter: { kind: "generation_type", value: "normal" },
+                    exit: { kind: "phase", value: "WORK" },
+                    capabilityRequests: [],
+                    repeatLimit: 0,
+                    nextPhaseIds: [],
+                  }]
+                : [],
+            },
+          }
+        : agentConfig;
     if (scenarioIsAgentActive(scenario)) {
       writePresetAgentConfig(userId, preset.id, {
-        config: agentConfig,
+        config: configForPreset,
         bindings: [{ slotId: "profile/writer", connectionId: connection.id }],
       });
     }
@@ -1298,6 +1419,29 @@ describe.serial("root generation usage accounting", () => {
       name: "Usage accounting",
       metadata: { temporary: true },
     });
+    if (isResponseLoomScenario) {
+      const worldBook = worldBooksSvc.createWorldBook(userId, {
+        name: "Response lore",
+      });
+      const worldEntry = worldBooksSvc.createEntry(userId, worldBook.id, {
+        key: ["blue lantern"],
+        content: "World context for {{user}}: blue lantern.",
+        comment: "Response context",
+        constant: true,
+        disabled: false,
+        role: "system",
+      });
+      if (!worldEntry) {
+        throw new Error("Expected the response world-book entry to be created");
+      }
+      chatsSvc.updateChat(userId, chat.id, {
+        metadata: {
+          temporary: true,
+          chat_world_book_ids: [worldBook.id],
+          active_world_info_entry_ids: [worldEntry.id],
+        },
+      });
+    }
     chatsSvc.createMessage(
       chat.id,
       {
@@ -1307,7 +1451,7 @@ describe.serial("root generation usage accounting", () => {
       },
       userId,
     );
-    return { userId, provider, preset, connection, chat };
+    return { userId, userName: "Usage Owner", provider, preset, connection, chat };
   }
   function scenarioIsAgentActive(scenario: UsageScenario): boolean {
     return scenario !== "inactive_success" && scenario !== "inactive_failure";
@@ -1318,6 +1462,7 @@ describe.serial("root generation usage accounting", () => {
   ) {
     return startGeneration({
       userId: fixture.userId,
+      userName: fixture.userName,
       chat_id: fixture.chat.id,
       connection_id: fixture.connection.id,
       preset_id: fixture.preset.id,
@@ -1325,6 +1470,174 @@ describe.serial("root generation usage accounting", () => {
       generation_type: "normal",
     });
   }
+  test("keeps ordinary Response context and emits typed Loom omission evidence", async () => {
+    const fixture = await createFixture("response_loom");
+    try {
+      const dryRun = await dryRunGeneration({
+        userId: fixture.userId,
+        userName: fixture.userName,
+        chat_id: fixture.chat.id,
+        connection_id: fixture.connection.id,
+        preset_id: fixture.preset.id,
+        force_preset_id: true,
+        generation_type: "normal",
+      });
+      expect(dryRun.assemblySurface).toBe("RESPONSE");
+      expect(dryRun.loomPromptInspection).toMatchObject({
+        version: 1,
+        surface: "RESPONSE",
+        checkpoint: "ASSEMBLE",
+        responseOmission: {
+          version: 1,
+          surface: "RESPONSE",
+          visibility: "work_only",
+          reason: "work_only",
+          omittedEntryIds: ["work-only-entry"],
+          source: [expect.objectContaining({
+            blockId: "work-policy",
+          })],
+        },
+      });
+      expect(dryRun.loomPromptInspection?.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            entryId: "work-only-entry",
+            source: expect.objectContaining({
+              blockId: "work-policy",
+              presetRevision: expect.any(Number),
+              blockRevision: 1,
+            }),
+            outcome: {
+              status: "omitted",
+              reason: "response_mode",
+            },
+          }),
+        ]),
+      );
+
+      const started = await startFixture(fixture);
+      const emittedBreakdownPromise = waitForGenerationEvent(
+        EventType.GENERATION_BREAKDOWN_READY,
+        started.generationId,
+      );
+      const terminal = await waitForGenerationTerminal(started.generationId);
+      const emittedBreakdown = await emittedBreakdownPromise;
+      expect(terminal.event).toBe(EventType.GENERATION_ENDED);
+      expect(emittedBreakdown.breakdown).toMatchObject({
+        assemblySurface: "RESPONSE",
+        loomPromptInspection: {
+          surface: "RESPONSE",
+          responseOmission: {
+            surface: "RESPONSE",
+            visibility: "work_only",
+            reason: "work_only",
+            omittedEntryIds: ["work-only-entry"],
+          },
+        },
+      });
+
+      const requestText = fixture.provider.rootRequests[0]?.messages
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content),
+        )
+        .join("\n") ?? "";
+      expect(requestText).toContain("Answer Usage Owner.");
+      expect(requestText).toContain(
+        "World context for Usage Owner: blue lantern.",
+      );
+      expect(requestText).not.toContain("Internal work-only policy.");
+    } finally {
+      await cleanupFixture(fixture.chat.id);
+    }
+  }, 15_000);
+  test("omits phase-only Loom instructions while retaining ordinary Response context", async () => {
+    const fixture = await createFixture("response_phase_loom");
+    try {
+      const phaseSource = {
+        kind: "loom_block",
+        blockId: "phase-policy",
+        presetRevision: fixture.preset.cache_revision ?? 1,
+        blockRevision: 1,
+        promptOrder: fixture.preset.prompt_order.findIndex(
+          (block) => block?.id === "phase-policy",
+        ),
+      };
+      const dryRun = await dryRunGeneration({
+        userId: fixture.userId,
+        userName: fixture.userName,
+        chat_id: fixture.chat.id,
+        connection_id: fixture.connection.id,
+        preset_id: fixture.preset.id,
+        force_preset_id: true,
+        generation_type: "normal",
+      });
+      expect(dryRun.assemblySurface).toBe("RESPONSE");
+      expect(dryRun.loomPromptInspection).toMatchObject({
+        version: 1,
+        surface: "RESPONSE",
+        checkpoint: "ASSEMBLE",
+        items: [],
+        effectiveEntryIds: [],
+        responseOmission: {
+          version: 1,
+          surface: "RESPONSE",
+          visibility: "work_only",
+          reason: "work_only",
+          omittedEntryIds: [],
+          source: [],
+          omittedPhaseInstructions: [{
+            phaseId: "phase_only",
+            source: phaseSource,
+          }],
+        },
+      });
+
+      const started = await startFixture(fixture);
+      const emittedBreakdownPromise = waitForGenerationEvent(
+        EventType.GENERATION_BREAKDOWN_READY,
+        started.generationId,
+      );
+      const terminal = await waitForGenerationTerminal(started.generationId);
+      const emittedBreakdown = await emittedBreakdownPromise;
+      expect(terminal.event).toBe(EventType.GENERATION_ENDED);
+      expect(emittedBreakdown.breakdown).toMatchObject({
+        assemblySurface: "RESPONSE",
+        loomPromptInspection: {
+          surface: "RESPONSE",
+          items: [],
+          effectiveEntryIds: [],
+          responseOmission: {
+            surface: "RESPONSE",
+            visibility: "work_only",
+            reason: "work_only",
+            omittedEntryIds: [],
+            source: [],
+            omittedPhaseInstructions: [{
+              phaseId: "phase_only",
+              source: phaseSource,
+            }],
+          },
+        },
+      });
+
+      const requestText = fixture.provider.rootRequests[0]?.messages
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content),
+        )
+        .join("\n") ?? "";
+      expect(requestText).toContain("Answer Usage Owner.");
+      expect(requestText).toContain(
+        "World context for Usage Owner: blue lantern.",
+      );
+      expect(requestText).not.toContain("Internal phase-only policy.");
+    } finally {
+      await cleanupFixture(fixture.chat.id);
+    }
+  }, 15_000);
 
   function getPersistedActivity(generationId: string): Record<string, any> {
     const row = getDb().query(

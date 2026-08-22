@@ -627,6 +627,7 @@
   "dataPortability": {
     "exportTitle": "導出數據",
     "exportDesc": "將你擁有的全部內容（角色、聊天、世界書、人設、預設、記憶皮層、數據庫、主題、設置與擴展偏好）打包為單個 .lvbak 歸檔。API 密鑰等機密信息永不包含在內。",
+    "exportSchemaVersion": "歸檔架構版本：{{version}}",
     "includeVectors": "包含向量嵌入（在匹配的嵌入提供商上導入更快；文件更大）",
     "includeSecrets": "包含 API 密鑰與機密（會額外下載解密票據）",
     "secretsWarning": "將下載兩個文件：歸檔 (.lvbak) 與小票據 (.ticket.json)。請與歸檔分開保管票據——密碼管理器最合適。沒有票據無法恢復密鑰；兩者同時洩露則他人可讀取你的 API 密鑰。",

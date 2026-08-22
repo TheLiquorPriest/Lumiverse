@@ -53,6 +53,7 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
   const beginStreaming = useStore((s) => s.beginStreaming)
   const startStreaming = useStore((s) => s.startStreaming)
   const setStreamingError = useStore((s) => s.setStreamingError)
+  const setStreamingSwipeId = useStore((s) => s.setStreamingSwipeId)
   const activeProfileId = useStore((s) => s.activeProfileId)
   const activePersonaId = useStore((s) => s.activePersonaId)
   const activeChatMetadata = useStore((s) => s.activeChatMetadata)
@@ -91,6 +92,7 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
     const generationAbortController = new AbortController()
     generationAbortControllerRef.current = generationAbortController
     beginStreaming(message.id, 'swipe')
+    setStreamingSwipeId(message.swipes.length)
     try {
       const presetId = getActivePresetForGeneration() || undefined
       const targetCharacterId = typeof message.extra?.character_id === 'string'
@@ -157,6 +159,7 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
     beginStreaming,
     startStreaming,
     setStreamingError,
+    setStreamingSwipeId,
   ])
 
   const handleRegenerate = useCallback(() => {
@@ -220,6 +223,7 @@ export async function executeSwipe(message: Message, chatId: string, direction: 
       beginStreaming,
       startStreaming,
       setStreamingError,
+      setStreamingSwipeId,
       activeProfileId,
       activePersonaId,
       activeCharacterId,
@@ -233,6 +237,7 @@ export async function executeSwipe(message: Message, chatId: string, direction: 
       if (useStore.getState().activeChatId !== chatId) return
       const generationAbortController = new AbortController()
       beginStreaming(message.id, 'swipe')
+      setStreamingSwipeId(message.swipes.length)
       try {
         const presetId = getActivePresetForGeneration() || undefined
         const targetCharacterId = typeof message.extra?.character_id === 'string'

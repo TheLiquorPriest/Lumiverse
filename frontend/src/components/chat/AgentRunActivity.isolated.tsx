@@ -7,7 +7,7 @@ import { createInstance } from 'i18next'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
 import chat from '@/i18n/locales/en/chat.json'
 import type { AppStore } from '@/types/store'
-import type { AgentRunPublicV2 } from '@/types/agent-runs'
+import type { AgentRunPublicErrorV2, AgentRunPublicV2 } from '@/types/agent-runs'
 import type { StoreApi } from 'zustand'
 
 const workspaceSectionRequests: Array<{ turnId: string; section: string; revision?: number }> = []
@@ -106,21 +106,39 @@ function terminalRun(): AgentRunPublicV2 {
     chatId: 'chat-public',
     generationType: 'normal',
     target: { messageId: 'message-public', swipeId: 1 },
-    status: 'COMMITTED',
-    phase: 'COMMITTED',
+    workPhase: 'TERMINAL',
+    workStatus: 'terminal',
+    workOutcome: 'completed',
+    recoveryEligible: false,
+    recoveryAction: 'none',
+    omissionCount: 0,
+    inspectionAttemptId: 'attempt-public',
+    reason: null,
+    attemptLineage: {
+      version: 1,
+      attemptId: 'attempt-public',
+      previousAttemptId: null,
+      target: {
+        chatId: 'chat-public',
+        generationType: 'normal',
+        messageId: 'message-public',
+        swipeId: 1,
+      },
+      createdAt: 1_700_000_000,
+    },
     revision: 4,
     sequence: 9,
-    startedAt: 1_000,
-    updatedAt: 5_000,
+    startedAt: 1_700_000_000,
+    updatedAt: 1_700_000_004,
     activity: [{
       version: 2,
       id: 'root-public',
       parentId: null,
       kind: 'root',
       actor: 'root',
-      phase: 'COMMITTED',
+      phase: 'TERMINAL',
       status: 'completed',
-      startedAt: 1_000,
+      startedAt: 1_700_000_000,
       elapsedMs: 4_000,
       usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25, toolCalls: 1, childInvocations: 1 },
     }, {
@@ -131,7 +149,7 @@ function terminalRun(): AgentRunPublicV2 {
       actor: 'tool',
       phase: 'WORK',
       status: 'completed',
-      startedAt: 2_000,
+      startedAt: 1_700_000_002,
       elapsedMs: 500,
       toolId: 'lore_search_entries',
     }],
@@ -145,6 +163,29 @@ function terminalRun(): AgentRunPublicV2 {
       messageRevision: 3,
       swipeRevision: 2,
     },
+  }
+}
+
+function publicError(overrides: Partial<AgentRunPublicErrorV2> = {}): AgentRunPublicErrorV2 {
+  return {
+    code: 'provider_request_error',
+    category: 'provider',
+    summaryCode: 'provider_request_error',
+    recoveryEligible: false,
+    recoveryAction: 'none',
+    target: {
+      chatId: 'chat-public',
+      generationType: 'normal',
+      messageId: 'message-public',
+      swipeId: 1,
+    },
+    workPhase: 'TERMINAL',
+    workStatus: 'terminal',
+    workOutcome: 'failed',
+    reason: 'provider_failure',
+    omissionCount: 0,
+    inspectionAttemptId: 'attempt-public',
+    ...overrides,
   }
 }
 
@@ -163,6 +204,8 @@ beforeAll(async () => {
   AgentRunLiveRegion = activityModule.AgentRunLiveRegion
   // ReactDOM captures browser globals at module evaluation, so load it only after JSDOM is installed.
   ;({ createRoot } = await import('react-dom/client'))
+  // Restore module mocks after the component captures them for this isolated test.
+  mock.restore()
 })
 
 beforeEach(() => {
@@ -210,7 +253,7 @@ beforeEach(() => {
               omitted: 0,
               entries: [{
                 kind: 'task', id: 'task-public', revision: 1, retention: 'chat_lifetime', visibility: 'owner',
-                title: 'Check continuity', state: 'done', required: true, assigned: true, dependencyCount: 1,
+                title: 'Check continuity', state: 'completed', required: true, assigned: true, dependencyCount: 1,
               }],
             },
           },
@@ -272,6 +315,10 @@ async function renderActivity() {
     await Promise.resolve()
   })
 }
+function findAgentRunTab(kind: 'activity' | 'workspace'): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>(`[role="tab"][aria-controls$="-${kind}-panel"]`)
+}
+
 
 describe('AgentRunActivity', () => {
   test('opens a message/swipe-scoped dialog, traps keyboard navigation, and returns focus', async () => {
@@ -284,7 +331,6 @@ describe('AgentRunActivity', () => {
     expect(dialog).not.toBeNull()
     expect(dialog.getAttribute('aria-modal')).toBe('true')
     expect(document.activeElement?.getAttribute('aria-label')).toBe('Close agent activity')
-    expect(document.querySelector('#agent-run-activity-panel')?.firstElementChild?.lastElementChild?.textContent).toBe('4 sec')
     const tabs = [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
     expect(tabs).toHaveLength(2)
     for (const tab of tabs) {
@@ -293,11 +339,14 @@ describe('AgentRunActivity', () => {
       expect(panel).not.toBeNull()
       expect(panel?.getAttribute('aria-labelledby')).toBe(tab.id)
     }
+    const activityTabButton = findAgentRunTab('activity')!
+    const activityPanel = document.getElementById(activityTabButton.getAttribute('aria-controls')!)
+    expect(activityPanel?.firstElementChild?.lastElementChild?.textContent).toBe('4 sec')
 
-    const activityTab = document.getElementById('agent-run-activity-tab') as HTMLButtonElement
+    const activityTab = activityTabButton
     activityTab.focus()
     await act(async () => activityTab.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })))
-    expect(document.getElementById('agent-run-workspace-tab')?.getAttribute('aria-selected')).toBe('true')
+    expect(findAgentRunTab('workspace')?.getAttribute('aria-selected')).toBe('true')
 
     await act(async () => dialog.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
     expect(document.querySelector('[role="dialog"]')).toBeNull()
@@ -310,7 +359,7 @@ describe('AgentRunActivity', () => {
     expect(document.body.textContent).toContain('Search lore')
     expect(document.body.textContent).toContain('25')
 
-    await act(async () => document.getElementById('agent-run-workspace-tab')?.click())
+    await act(async () => findAgentRunTab('workspace')?.click())
     const taskToggle = [...document.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.includes('Tasks'))!
     await act(async () => taskToggle.click())
@@ -343,7 +392,7 @@ describe('AgentRunActivity', () => {
       agentRunTerminalByTarget: {
         'chat-public:message-public:1': {
           ...run,
-          errorCode: 'provider_request_error',
+          error: publicError(),
         },
       },
     })
@@ -358,7 +407,10 @@ describe('AgentRunActivity', () => {
         agentRunTerminalByTarget: {
           'chat-public:message-public:1': {
             ...run,
-            errorCode: 'future_private_prompt' as AgentRunPublicV2['errorCode'],
+            error: publicError({
+              code: 'future_private_prompt',
+              summaryCode: 'future_private_prompt',
+            }),
           },
         },
       })
@@ -367,13 +419,11 @@ describe('AgentRunActivity', () => {
     expect(document.body.textContent).toContain('The run ended with a safe server error.')
     expect(document.body.textContent).not.toContain('future_private_prompt')
 
+    const malformedErrorRun = JSON.parse(JSON.stringify({ ...run, error: 42 }))
     await act(async () => {
       useStore.setState({
         agentRunTerminalByTarget: {
-          'chat-public:message-public:1': {
-            ...run,
-            errorCode: 42 as unknown as AgentRunPublicV2['errorCode'],
-          },
+          'chat-public:message-public:1': malformedErrorRun,
         },
       })
       await Promise.resolve()
@@ -447,15 +497,17 @@ describe('AgentRunActivity', () => {
     await renderActivity()
     expect(document.querySelector('[aria-haspopup="dialog"]')).toBeNull()
 
-    const exactRun = {
-      ...terminalRun(),
-      runId: 'run-current',
-      turnId: 'turn-current',
-      generationId: 'generation-current',
-      status: 'WORK' as const,
-      phase: 'WORK' as const,
-      terminalHandoff: null,
-    }
+    const exactRun = terminalRun()
+    exactRun.runId = 'run-current'
+    exactRun.turnId = 'turn-current'
+    exactRun.generationId = 'generation-current'
+    exactRun.workPhase = 'WORK'
+    exactRun.workStatus = 'running'
+    exactRun.workOutcome = null
+    exactRun.activity = exactRun.activity.map((node) => node.id === 'root-public'
+      ? { ...node, phase: 'WORK', status: 'running', elapsedMs: 1_000 }
+      : node)
+    delete exactRun.terminalHandoff
     await act(async () => {
       useStore.setState({
         activeGenerationId: 'generation-current',
@@ -468,7 +520,7 @@ describe('AgentRunActivity', () => {
   test('reloads an expanded section after a newer workspace index revision', async () => {
     await renderActivity()
     await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
-    await act(async () => document.getElementById('agent-run-workspace-tab')?.click())
+    await act(async () => findAgentRunTab('workspace')?.click())
     const taskToggle = [...document.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.includes('Tasks'))!
     await act(async () => taskToggle.click())
@@ -504,7 +556,7 @@ describe('AgentRunActivity', () => {
   test('does not let an old in-flight section request absorb a newer index revision', async () => {
     await renderActivity()
     await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
-    await act(async () => document.getElementById('agent-run-workspace-tab')?.click())
+    await act(async () => findAgentRunTab('workspace')?.click())
     const taskToggle = [...document.querySelectorAll<HTMLButtonElement>('button')]
       .find((button) => button.textContent?.includes('Tasks'))!
     await act(async () => taskToggle.click())
@@ -555,7 +607,7 @@ describe('AgentRunActivity', () => {
   test('shows a retry action after the first section request fails', async () => {
     await renderActivity()
     await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
-    await act(async () => document.getElementById('agent-run-workspace-tab')?.click())
+    await act(async () => findAgentRunTab('workspace')?.click())
     const workspace = useStore.getState().agentWorkspaceByTurn['turn-public']!
     await act(async () => {
       useStore.setState({

@@ -14,6 +14,7 @@ import type {
   AgentTerminalReason,
   AgentTurnLedger as AgentTurnLedgerContract,
 } from "../types/agent-runtime";
+import { PUBLIC_ACTIVITY_TOOL_IDS } from "../types/agent-runtime";
 import type {
   AgentAdmissionFailureContext,
   AgentAdmissionKind,
@@ -95,10 +96,7 @@ const ACTIVITY_NODE_KINDS = new Set<AgentActivityNodeV1["kind"]>([
 const ACTIVITY_ACTORS = new Set<AgentActivityNodeV1["actor"]>([
   "root", "provider", "child", "tool",
 ]);
-const ACTIVITY_TOOL_IDS = new Set<AgentActivityToolId>([
-  "lore_list_books", "lore_get_book", "lore_list_entries", "lore_get_entry",
-  "lore_search_entries", "chat_search_history", "agent_delegate", "unknown_tool",
-]);
+const ACTIVITY_TOOL_IDS = new Set<AgentActivityToolId>(PUBLIC_ACTIVITY_TOOL_IDS);
 const ACTIVITY_ERROR_CODES = new Set<AgentPublicErrorCode>([
   "capacity_exceeded", "host_child_admission_limit_exceeded", "host_tool_call_limit_exceeded",
   "child_admission_limit_exceeded", "tool_call_limit_exceeded",

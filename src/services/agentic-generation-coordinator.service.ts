@@ -2,20 +2,31 @@ import type { Database } from "bun:sqlite";
 import {
   AgenticGenerationError,
   abortAcceptedAgenticGeneration,
+  configureAgenticGenerationRuntimeDependencies,
   type AgenticContextRuntimeV1,
   type AgenticExecutionHandle,
   type AgenticGenerationDependencies,
   type AgenticGenerationInput,
+  type AgenticPhase,
   type AgenticRuntimeDecision,
   type AgenticTargetSnapshot,
 } from "./agentic-generation.service";
 import { configureAgenticGenerationDependencies } from "./generate.service";
+import * as breakdownSvc from "./breakdown.service";
 import {
   canonicalInputRevisionDigest,
   consumeRuntimeDecisionToken,
   configureAgentRuntimeDecisionDependencies,
   resolveEffectiveRuntimeWithoutToken,
 } from "./agent-runtime-decision.service";
+import type {
+  AgenticReadinessVectorV1,
+  EffectiveRuntimeDecisionV1,
+  EffectiveRuntimeRequestV1,
+  FrozenConcreteConnectionV1,
+  InputRevisionSetV1 as RuntimeInputRevisionSetV1,
+  RuntimeDecisionInternalV1,
+} from "../types/agent-runtime-decision";
 import { ARCHIVE_REGISTRY_VERSION } from "./user-data/table-registry";
 import { CanonicalDataError, canonicalPlainDataBounds } from "../utils/canonical-plain-data";
 import { getIsolateHealthEpoch } from "./isolate-pool";
@@ -41,6 +52,7 @@ import {
   type SnapshotWorldInfoV1,
 } from "./prompt-assembly-snapshot.service";
 import {
+  selectEffectiveLoomPolicyMessagesV1,
   type AssemblyPlanV1,
   type AssemblyProviderMessageV1,
 } from "./agentic-assembly-compiler";
@@ -50,10 +62,26 @@ import {
 } from "./agentic-preprocessing-worker-client";
 import { validateRenderPreparationResultV1 } from "./agentic-render-preparation-validator";
 import {
+  HOST_PREPARATION_LIMITS_V1,
+  type FrozenRegexScriptV1,
+  type FrozenSourceMessageV1,
+  type FrozenSwipeV1,
+  type RegexActionDeltaV1,
+  type RenderMacroSnapshotV1,
+  type RenderPreparationInputV1,
+  type RenderTargetV1,
+  type WorldInfoStateDeltaV1,
+} from "../types/agent-preprocessing";
+import {
   executeBoundedAgenticChildFrame,
   runAgenticWorkPhase,
   AgenticWorkPhaseError,
   MAX_CHILD_OUTPUT_BYTES,
+  type AgenticWorkFrame,
+  type AgenticWorkProviderRequest,
+  type AgenticWorkspaceCapability,
+  type AgenticWorkspaceCompletionFixedPointResult,
+  type AgenticWorkspacePreparationResult,
   type AgenticWorkPhaseOutcome,
   type AgenticWorkOptions,
   type AgenticWorkRenderHandoff,
@@ -62,6 +90,7 @@ import {
   AgenticRenderPhaseError,
   runAgenticRenderPhaseV1,
   type AgenticRenderPhaseInputV1,
+  type AgenticRenderProviderRequestV1,
 } from "./agentic-render-phase.service";
 import {
   AGENTIC_COMMIT_DEPENDENCIES_V1,
@@ -79,12 +108,14 @@ import {
   reserveFinalRender,
   transitionTurnExecution,
 } from "./turn-execution.service";
+import type { FinalRenderReservationV1 } from "../types/turn-execution";
 import {
   createTurnWorkspace,
   freezeFrameCapabilities,
   invalidateFrameCapabilitiesForTurn,
   getCurrentWorkspaceRevisionV1,
   getWorkspaceCompletionGatesV1,
+  listWorkspaceTaskTransitionsV1,
   readTurnWorkspaceSection,
   freezeWorkspaceForCompletionV1,
   createWorkspaceTask,
@@ -99,6 +130,22 @@ import {
   TurnWorkspaceError,
 } from "./turn-workspace.service";
 import {
+  createPersistentWorkspaceHostAuthority,
+  createPersistentWorkspaceHostTask,
+  createPersistentWorkspaceHostTurnSession,
+  ensurePersistentWorkspaceHost,
+  getPersistentWorkspaceById,
+  updatePersistentWorkspaceHostTurnSession,
+} from "./turn-workspace.service";
+import {
+  WORKSPACE_OPERATIONS,
+  type WorkspaceArtifactReferenceV1,
+  type WorkspaceOperationCapabilitiesV1,
+  type WorkspaceOperationKindV1,
+  type WorkspaceTerminalHandoffV1,
+  type WorkspaceUsageV1,
+} from "../types/turn-workspace";
+import {
   appendAgentRunSnapshot,
   registerAgentRunStopHandler,
   withAgentRunProjectionTransaction,
@@ -112,10 +159,27 @@ import {
   recheckContextPackInputRevisionsAtCommit,
   type ContextPackToolBudgetV1,
 } from "./agent-context-tools.service";
+import { readContextPackRevisionForUser } from "./agent-context-packs.service";
 import { freezeAgentCognitionV1 } from "./agent-cognition.service";
 import {
+  cognitionRuntimeCortexSnapshot,
   createAgentCognitionRuntime,
 } from "./agent-cognition-runtime.service";
+import {
+  admitCortexSidecar,
+  createCortexAuthorizedSnapshot,
+  createCortexSidecarRequestId,
+  CortexSidecarError,
+  WORK_CORTEX_CHECKPOINT,
+  type CortexAuthorizedSnapshotV1,
+  type CortexSidecarAcceptedV1,
+  type CortexSidecarReadResultV1,
+  WORK_CORTEX_MAX_RESULT_BYTES,
+} from "./work-cortex-sidecar.service";
+import {
+  createWorkCouncilCapability,
+  type WorkCouncilAdmission,
+} from "./work-council.service";
 import type {
   AgentCognitionRuntimeV1,
   CognitionContextPackRequirementV1,
@@ -123,7 +187,17 @@ import type {
   CognitionRuntimeCompletionV1,
   CognitionRuntimeTaskTransitionInputV1,
 } from "../types/agent-cognition-runtime";
-import type { CognitionValue } from "../types/agent-cognition";
+import type {
+  PersistentWorkspaceHostAuthorityV1,
+  PersistentWorkspaceTurnSession,
+} from "../types/turn-workspace";
+
+import type {
+  CognitionValue,
+  LoomOnDemandRequestV1,
+  LoomPolicyBucketV1,
+  LoomPromptInspectionContextPackV1,
+} from "../types/agent-cognition";
 import { buildWorkspaceContextProjectionFromWorkspaceV1 } from "./workspace-context-projection.service";
 import { createHash } from "node:crypto";
 import {
@@ -133,57 +207,230 @@ import {
   type CognitionRepairCode,
 } from "./agent-cognition-integrity.service";
 import { getDb } from "../db/connection";
+import {
+  createAgentInspectionWriter,
+  type AgentInspectionWriterV1,
+} from "./agent-activity-runs.service";
+import type {
+  AgentInspectionLifecycleV1,
+  AgentInspectionOutcomeV1,
+  AgentInspectionReasonV1,
+  AgentInspectionStatusV1,
+} from "../types/agent-run-projection";
+import {
+  AGENT_RUNTIME_ADMISSION_MANAGER,
+} from "./agent-runtime-admission";
+import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
+import { resolveCounter } from "./tokenizer.service";
+import { withUserDataMutationSync } from "./user-data/snapshot";
+import {
+  publicActivityToolId,
+  type AgentActivityLifecycle,
+  type AgentActivityNodeV1,
+  type AgentActivityUsageV1,
+  type AgentWorkAttemptLineageV1,
+} from "../types/agent-runtime";
 import { getMessage } from "./chats.service";
 import type { Message } from "../types/message";
 import { getProvider, validateProviderCapabilities } from "../llm/registry";
 import * as secretsSvc from "./secrets.service";
 import { CORE_AGENT_TOOL_IDS, createDisabledAgentConfigV2, parseAgentConfigV2, type AgentConfigStateV1, type AgentConfigV2, type AgentLoreScope, type AgentToolSnapshot, type CoreAgentToolId } from "../types/agents";
-import { createAgentToolSnapshot, executeCoreAgentTool } from "./agent-tools.service";
+import { createAgentOwnedLoreReader, createAgentToolSnapshot, executeCoreAgentTool, safeToolInspectionValue } from "./agent-tools.service";
 import { AgentRuntimeOwner } from "./agent-runtime.service";
 import { cloneAndFreeze, resolveConcreteConnectionV1, type ResolvedConcreteConnectionV1 } from "./connections.service";
 import * as pool from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import type { GenerationRequest, GenerationResponse, GenerationParameters, LlmMessage, StreamChunk } from "../llm/types";
+import { redactAgentOutputFrames } from "./agent-seals.service";
 import { observeOutputTokens } from "./agent-runtime-accounting";
-import { resolveCounter } from "./tokenizer.service";
-import type {
-  FrozenConcreteConnectionV1,
-  EffectiveRuntimeRequestV1,
-  EffectiveRuntimeDecisionV1,
-  InputRevisionSetV1 as RuntimeInputRevisionSetV1,
-  RuntimeDecisionInternalV1,
-  AgenticReadinessVectorV1,
-} from "../types/agent-runtime-decision";
-import type { FinalRenderReservationV1 } from "../types/turn-execution";
-import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
-import type {
-  RenderPreparationInputV1,
-  FrozenSourceMessageV1,
-  FrozenSwipeV1,
-  FrozenRegexScriptV1,
-  RenderMacroSnapshotV1,
-  RenderTargetV1,
-  RegexActionDeltaV1,
-  WorldInfoStateDeltaV1,
-} from "../types/agent-preprocessing";
-import type { WorkspaceArtifactReferenceV1, WorkspaceOperationCapabilitiesV1, WorkspaceOperationKindV1, WorkspaceTerminalHandoffV1, WorkspaceUsageV1 } from "../types/turn-workspace";
-import { withUserDataMutationSync } from "./user-data/snapshot";
-import type { AgenticPhase } from "./agentic-generation.service";
-import type { AgenticWorkProviderRequest, AgenticWorkspaceCapability, AgenticWorkspaceCompletionFixedPointResult, AgenticWorkspacePreparationResult, AgenticWorkFrame } from "./agentic-work-phase.service";
-import type { AgenticRenderProviderRequestV1 } from "./agentic-render-phase.service";
-import { AGENT_RUNTIME_ADMISSION_MANAGER } from "./agent-runtime-admission";
-import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
-import type {
-  AgentActivityLifecycle,
-  AgentActivityNodeV1,
-  AgentActivityToolId,
-  AgentActivityUsageV1,
-} from "../types/agent-runtime";
+function cognitionSnapshotInputs(
+  userId: string,
+  presetId: string | null,
+  projectedConfig?: unknown,
+): Pick<GenerationAssemblySnapshotInputV1, "cognitionGraph" | "cognitionSource" | "contextPackSelections" | "contextPackSnapshotSource" | "loomPolicy"> {
+  if (!presetId) return { contextPackSnapshotSource: "host_prefetched" };
+  const projected = frozenConfig(projectedConfig);
+  const authored = getPresetAgentCognitionSourceV1(userId, presetId) as AgentPresetCognitionSourceV1 | null;
+  if (!authored) {
+    const hasPolicy = [projected.runtimePolicy?.loomPolicy, projected.contextPolicy, projected.taskPolicy]
+      .some((value) => value !== undefined && value !== null);
+    if (hasPolicy) throw new Error("cognition_source_unavailable");
+    return { contextPackSnapshotSource: "host_prefetched" };
+  }
+  const config = frozenConfig(authored.config);
+  const loomPolicy = config.runtimePolicy?.loomPolicy;
+  const contextPolicy = config.contextPolicy ?? { ruleIds: [], packIds: [] };
+  type SourceRef = { blockId: string; revision: number; presetRevision: number; promptOrder?: number };
+  const refs: Record<string, SourceRef> = {};
+  const collectCanonicalEntries = (value: unknown): void => {
+    if (!Array.isArray(value)) return;
+    for (const candidate of value) {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      const entry = candidate as Record<string, unknown>;
+      const source = entry.source;
+      if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+      const sourceRecord = source as Record<string, unknown>;
+      const blockRevision = typeof sourceRecord.blockRevision === "number" ? sourceRecord.blockRevision : undefined;
+      const presetRevision = typeof sourceRecord.presetRevision === "number" ? sourceRecord.presetRevision : undefined;
+      const promptOrder = typeof sourceRecord.promptOrder === "number" ? sourceRecord.promptOrder : undefined;
+      if (typeof sourceRecord.blockId !== "string"
+        || blockRevision === undefined || !Number.isSafeInteger(blockRevision)
+        || presetRevision === undefined || !Number.isSafeInteger(presetRevision)
+        || promptOrder === undefined || !Number.isSafeInteger(promptOrder)) continue;
+      const ref: SourceRef = {
+        blockId: sourceRecord.blockId,
+        revision: blockRevision,
+        presetRevision,
+        promptOrder,
+      };
+      const previous = refs[ref.blockId];
+      if (previous && (previous.revision !== ref.revision
+        || previous.presetRevision !== ref.presetRevision
+        || previous.promptOrder !== ref.promptOrder)) {
+        throw new Error(`cognition block provenance conflict: ${ref.blockId}`);
+      }
+      refs[ref.blockId] = ref;
+    }
+  };
+  if (loomPolicy) {
+    collectCanonicalEntries(loomPolicy.workPolicy);
+    collectCanonicalEntries(loomPolicy.workspaceUsage);
+    collectCanonicalEntries(loomPolicy.completionCriteria);
+    collectCanonicalEntries(loomPolicy.renderPolicy);
+  }
+  const blocks = listPromptBlocks(userId, presetId) ?? [];
+  const sourceBlocks = Object.values(refs).map((ref) => {
+    const block = blocks.find((candidate) => candidate.id === ref.blockId);
+    if (!block) throw new Error(`cognition block is unavailable: ${ref.blockId}`);
+    const rawRevision = isRecord(block) ? block.revision : undefined;
+    const actualRevision = typeof rawRevision === "number" && Number.isSafeInteger(rawRevision) && rawRevision >= 0
+      ? rawRevision
+      : typeof rawRevision === "string" && /^\d+$/.test(rawRevision) ? Number(rawRevision) : 1;
+    if (actualRevision !== ref.revision || ref.presetRevision !== authored.presetRevision) {
+      throw new Error(`cognition block provenance is stale: ${ref.blockId}`);
+    }
+    const promptOrder = blocks.indexOf(block);
+    if (ref.promptOrder !== undefined && ref.promptOrder !== promptOrder) {
+      throw new Error(`cognition block order is stale: ${ref.blockId}`);
+    }
+    return { blockId: ref.blockId, revision: actualRevision, promptOrder };
+  });
+  const source = {
+    presetRevision: authored.presetRevision,
+    blocks: sourceBlocks,
+  };
+  const directPackIds = Array.isArray(contextPolicy.packIds) ? contextPolicy.packIds : [];
+  const selections = authored.contextPackSelections.map((selection) => ({
+    packId: selection.packId,
+    revisionId: selection.revisionId,
+    digest: selection.digest,
+    required: directPackIds.includes(selection.packId),
+  }));
+  const frozen = freezeAgentCognitionV1({
+    config: { ...config, contextPolicy: { ...contextPolicy, packIds: directPackIds } },
+    contextRules: authored.contextRules,
+    taskTemplates: authored.taskTemplates,
+    selections,
+  }, source);
+  if (!frozen) return { contextPackSnapshotSource: "host_prefetched" };
+  return {
+    cognitionGraph: frozen.graph,
+    cognitionSource: frozen.source,
+    contextPackSelections: frozen.contextPackSelections,
+    contextPackSnapshotSource: "host_prefetched",
+    loomPolicy: frozen.policyBuckets,
+  };
+}
+
+type AgenticRenderPolicyMessageInputV1 = {
+  readonly snapshotMessages: readonly SnapshotMessageV1[];
+  readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
+  readonly renderGuidance?: string;
+  readonly character: Readonly<Record<string, unknown>>;
+  readonly worldInfo: SnapshotWorldInfoV1;
+  readonly contextPackLines?: readonly string[];
+  readonly maxFactBytes?: number;
+};
+
+function materializePolicyMessages(messages: readonly AssemblyProviderMessageV1[]): readonly LlmMessage[] {
+  return messages.map((message) => {
+    if (message.role !== "system" && message.role !== "user" && message.role !== "assistant") throw new Error("agentic_render_policy_invalid");
+    const text = message.segments.map((segment) => {
+      if (segment.kind !== "literal") throw new Error("agentic_render_policy_invalid");
+      return segment.text;
+    }).join("");
+    return { role: message.role, content: text };
+  });
+}
+
+function boundedRenderFacts(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (UTF8_ENCODER.encode(value).byteLength <= maxBytes) return value;
+  let result = "";
+  for (const character of value) {
+    const candidate = result + character;
+    if (UTF8_ENCODER.encode(candidate).byteLength > maxBytes) break;
+    result = candidate;
+  }
+  return result;
+}
+
+function snapshotFactText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function FactMessage(input: AgenticRenderPolicyMessageInputV1): LlmMessage | null {
+  const lines: string[] = [];
+  const add = (label: string, value: unknown): void => {
+    if (typeof value === "string" && value.trim() !== "") lines.push(`${label}: ${value}`);
+  };
+  for (const key of ["name", "personality", "scenario", "description"] as const) add(key[0]!.toUpperCase() + key.slice(1), input.character[key]);
+  for (const book of input.worldInfo.books) {
+    const name = snapshotFactText(book.name);
+    const description = snapshotFactText(book.description);
+    if (name.trim() !== "" && description.trim() !== "") lines.push(`World (${name}): ${description}`);
+  }
+  for (const entry of input.worldInfo.entries) {
+    if (entry.activated !== true && entry.constant !== true) continue;
+    const content = snapshotFactText(entry.content);
+    if (content.trim() === "") continue;
+    const bookName = snapshotFactText(entry.bookName);
+    lines.push(`${bookName.trim() ? `Lore (${bookName})` : "Lore"}: ${content}`);
+  }
+  for (const line of input.contextPackLines ?? []) if (typeof line === "string" && line.trim() !== "") lines.push(line);
+  if (lines.length === 0) return null;
+  const requested = input.maxFactBytes;
+  const maxBytes = Number.isSafeInteger(requested) && (requested as number) >= 0 ? Math.min(MAX_OUTPUT_BYTES, requested as number) : 16 * 1024;
+  const content = boundedRenderFacts(lines.join("\n"), maxBytes);
+  return content ? { role: "system", content } : null;
+}
+
+function snapshotSwipeContent(message: SnapshotMessageV1): string {
+  const swipeId = Number.isSafeInteger(message.swipe_id) ? message.swipe_id : 0;
+  return typeof message.swipes[swipeId] === "string" ? message.swipes[swipeId]! : message.content;
+}
+
+function buildAgenticRenderPolicyMessages(input: AgenticRenderPolicyMessageInputV1): readonly LlmMessage[] {
+  const messages: LlmMessage[] = [];
+  const facts = FactMessage(input);
+  if (facts) messages.push(facts);
+  for (const message of input.snapshotMessages) messages.push({ role: message.is_user ? "user" : "assistant", content: snapshotSwipeContent(message) });
+  const authored = materializePolicyMessages(input.renderPolicyMessages);
+  messages.push(...authored);
+  if (authored.length === 0) messages.push({ role: "system", content: HOST_RENDER_FINAL_RESPONSE_CONTRACT });
+  if (typeof input.renderGuidance === "string" && input.renderGuidance.length > 0) messages.push({
+    role: "system",
+    content: `Host-accepted render guidance (not the reply): WORK has completed. The accepted workspace projection is authoritative; do not deny its supported facts merely because RESPONSE is tools-disabled. Follow this guidance only where supported by that projection, and do not expose private reasoning or the operational transcript.\n${input.renderGuidance}`,
+  });
+  return Object.freeze(messages);
+}
+
 type RuntimeExecution = {
   id: string;
   userId: string;
   chatId: string;
+  readonly attemptLineage: AgentWorkAttemptLineageV1;
   target: AgenticTargetSnapshot;
   workspaceId: string;
   workspaceRevision: number;
@@ -195,6 +442,12 @@ type RuntimeExecution = {
   ownerToken?: string;
   commitKey?: string;
   signal?: AbortSignal;
+};
+type PersistentRuntimeAssociation = {
+  readonly authority: PersistentWorkspaceHostAuthorityV1;
+  readonly workspaceId: string;
+  workspaceRevision: number;
+  session: PersistentWorkspaceTurnSession;
 };
 type CoordinatorContextRuntime = AgenticContextRuntimeV1 & {
   readonly budget: ContextPackToolBudgetV1;
@@ -222,14 +475,13 @@ function isRuntimeExecution(value: AgenticExecutionHandle): value is RuntimeExec
     && Number.isFinite(value.deadlineAt)
     && (value.workspaceRetention === "turn_terminal" || value.workspaceRetention === "chat_lifetime")
     && (value.workspaceSharing === "root_only" || value.workspaceSharing === "view_only")
+    && isAgentWorkAttemptLineage(value.attemptLineage)
     && value.owner instanceof AgentRuntimeOwner
     && value.credentialCarrier instanceof Map;
 }
 
 function requireRuntimeExecution(value: AgenticExecutionHandle): RuntimeExecution {
-  if (!isRuntimeExecution(value)) {
-    throw new AgenticGenerationError("agentic_runtime_unavailable", "Agentic execution handle is incomplete.", { phase: "WORK" });
-  }
+  if (!isRuntimeExecution(value)) throw new Error("agentic_execution_invalid");
   return value;
 }
 
@@ -254,6 +506,8 @@ function requireCoordinatorContextRuntime(
 const INSTALLATION_KEY = Symbol.for("lumiverse.agentic-generation-coordinator.installed");
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const UTF8_ENCODER = new TextEncoder();
+const HOST_RENDER_FINAL_RESPONSE_CONTRACT =
+  "Produce the final in-character assistant reply to the user. Do not mention tools, internal work, or hidden instructions. Return only the reply.";
 const installationMarker = Object.freeze({
   get(): boolean {
     return Reflect.get(globalThis, INSTALLATION_KEY) === true;
@@ -265,11 +519,6 @@ const installationMarker = Object.freeze({
     Reflect.deleteProperty(globalThis, INSTALLATION_KEY);
   },
 });
-const WORKSPACE_OPERATIONS: readonly WorkspaceOperationKindV1[] = [
-  "read_section", "read_page", "create_task", "update_assigned_progress",
-  "submit_child_result", "accept_submission", "record_finding", "record_decision", "record_question",
-  "attach_artifact", "propose_publication",
-];
 const DEFAULT_QUOTA = Object.freeze({
   maxTasks: 256,
   maxRecords: 1024,
@@ -286,143 +535,6 @@ type RuntimeInternal = RuntimeDecisionInternalV1;
 type DecisionWithInternal = AgenticRuntimeDecision & { internal: RuntimeInternal };
 type RuntimeSnapshot = GenerationAssemblySnapshotV1;
 type RuntimePlan = AssemblyPlanV1;
-function materializePolicyMessages(messages: readonly AssemblyProviderMessageV1[]): readonly LlmMessage[] {
-  return messages.map((message) => {
-    if (message.role !== "system" && message.role !== "user" && message.role !== "assistant") {
-      throw new Error("agentic_render_policy_invalid");
-    }
-    const text = message.segments.map((segment) => {
-      if (segment.kind !== "literal") throw new Error("agentic_render_policy_invalid");
-      return segment.text;
-    }).join("");
-    return { role: message.role, content: text };
-  });
-}
-const HOST_RENDER_FINAL_RESPONSE_CONTRACT =
-  "Write only the in-character assistant reply for this chat. Do not mention tools, complete_turn, workspace, or that the turn was submitted.";
-
-function snapshotSwipeContent(message: SnapshotMessageV1): string {
-  const swipeId = message.swipe_id;
-  if (Number.isSafeInteger(swipeId) && swipeId >= 0 && swipeId < message.swipes.length) {
-    const swipe = message.swipes[swipeId];
-    if (typeof swipe === "string") return swipe;
-  }
-  return typeof message.content === "string" ? message.content : "";
-}
-function snapshotFactText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function boundUtf8Text(value: string, maxBytes: number): string {
-  if (maxBytes <= 0 || value.length === 0) return "";
-  const encoded = UTF8_ENCODER.encode(value);
-  if (encoded.byteLength <= maxBytes) return value;
-  let end = maxBytes;
-  while (end > 0 && (encoded[end - 1]! & 0b1100_0000) === 0b1000_0000) end -= 1;
-  if (end > 0 && (encoded[end - 1]! & 0b1100_0000) === 0b1100_0000) end -= 1;
-  return new TextDecoder().decode(encoded.subarray(0, end));
-}
-
-function appendRenderFact(parts: string[], line: string, remaining: { bytes: number }): void {
-  const trimmed = line.trim();
-  if (!trimmed || remaining.bytes <= 0) return;
-  const separator = parts.length === 0 ? "" : "\n";
-  const candidate = `${separator}${trimmed}`;
-  const encoded = UTF8_ENCODER.encode(candidate);
-  if (encoded.byteLength <= remaining.bytes) {
-    parts.push(trimmed);
-    remaining.bytes -= encoded.byteLength;
-    return;
-  }
-  const bounded = boundUtf8Text(candidate, remaining.bytes);
-  remaining.bytes = 0;
-  if (!bounded) return;
-  const text = separator && bounded.startsWith(separator) ? bounded.slice(separator.length) : bounded;
-  if (text.length > 0) parts.push(text);
-}
-
-function buildRenderSnapshotFactMessage(input: {
-  readonly character?: Readonly<Record<string, unknown>>;
-  readonly worldInfo?: SnapshotWorldInfoV1;
-  readonly maxFactBytes?: number;
-}): LlmMessage | null {
-  const hostCap = HOST_PREPARATION_LIMITS_V1.maxOperationBytes;
-  const requested = input.maxFactBytes;
-  const maxBytes = Math.min(
-    hostCap,
-    typeof requested === "number" && Number.isSafeInteger(requested) && requested > 0 ? requested : hostCap,
-  );
-  const remaining = { bytes: maxBytes };
-  const parts: string[] = [];
-  const character = input.character;
-  if (character) {
-    const name = participantName(character, "");
-    if (name) appendRenderFact(parts, `Character: ${name}`, remaining);
-    if (remaining.bytes > 0) {
-      const personality = snapshotFactText(character.personality);
-      if (personality) appendRenderFact(parts, `Personality: ${personality}`, remaining);
-    }
-    if (remaining.bytes > 0) {
-      const scenario = snapshotFactText(character.scenario);
-      if (scenario) appendRenderFact(parts, `Scenario: ${scenario}`, remaining);
-    }
-    if (remaining.bytes > 0) {
-      const description = snapshotFactText(character.description);
-      if (description) appendRenderFact(parts, `Description: ${description}`, remaining);
-    }
-  }
-  for (const book of input.worldInfo?.books ?? []) {
-    if (remaining.bytes <= 0) break;
-    const bookName = snapshotFactText(book.name);
-    const bookDescription = snapshotFactText(book.description);
-    if (bookName && bookDescription) appendRenderFact(parts, `World (${bookName}): ${bookDescription}`, remaining);
-    else if (bookName) appendRenderFact(parts, `World: ${bookName}`, remaining);
-    else if (bookDescription) appendRenderFact(parts, `World: ${bookDescription}`, remaining);
-  }
-  for (const entry of input.worldInfo?.entries ?? []) {
-    if (remaining.bytes <= 0) break;
-    if (entry.disabled || !entry.constant) continue;
-    const content = snapshotFactText(entry.content);
-    if (content) appendRenderFact(parts, `World: ${content}`, remaining);
-  }
-  if (parts.length === 0) return null;
-  return { role: "system", content: parts.join("\n") };
-}
-
-function buildAgenticRenderPolicyMessages(input: {
-  readonly snapshotMessages: readonly SnapshotMessageV1[];
-  readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
-  readonly renderGuidance?: string;
-  readonly character?: Readonly<Record<string, unknown>>;
-  readonly worldInfo?: SnapshotWorldInfoV1;
-  readonly maxFactBytes?: number;
-}): readonly LlmMessage[] {
-  const messages: LlmMessage[] = [];
-  const facts = buildRenderSnapshotFactMessage(input);
-  if (facts) messages.push(facts);
-  for (const message of input.snapshotMessages) {
-    messages.push({
-      role: message.is_user ? "user" : "assistant",
-      content: snapshotSwipeContent(message),
-    });
-  }
-  const authored = materializePolicyMessages(input.renderPolicyMessages);
-  messages.push(...authored);
-  if (authored.length === 0) {
-    messages.push({
-      role: "system",
-      content: HOST_RENDER_FINAL_RESPONSE_CONTRACT,
-    });
-  }
-  const guidance = input.renderGuidance;
-  if (typeof guidance === "string" && guidance.length > 0) {
-    messages.push({
-      role: "system",
-      content: `Render guidance (not the reply):\n${guidance}`,
-    });
-  }
-  return Object.freeze(messages);
-}
 
 /** One request-lifetime handoff between the input and readiness authorities. */
 interface PreflightReadinessRecord {
@@ -443,11 +555,68 @@ function preflightRequestKey(userId: string, request: EffectiveRuntimeRequestV1)
   ].join("\u0000");
 }
 
+type ContextPackReadinessReason =
+  | "input_revisions_incomplete"
+  | "cognition_authorization_stale"
+  | "cognition_missing_pack_revision";
+
+interface ContextPackReadinessInput {
+  readonly schema: unknown;
+  readonly candidates: readonly {
+    readonly ownerId: unknown;
+    readonly revisionId: unknown;
+    readonly digest: unknown;
+    readonly aclRevision: unknown;
+  }[];
+}
+
+function contextPackReadiness(
+  packs: ContextPackReadinessInput | null | undefined,
+): { readonly ready: boolean; readonly reason: ContextPackReadinessReason | null } {
+  if (!packs || packs.schema !== "present" || !Array.isArray(packs.candidates)) {
+    return { ready: false, reason: "input_revisions_incomplete" };
+  }
+  if (packs.candidates.some((candidate) => (
+    typeof candidate.ownerId !== "string"
+    || candidate.ownerId.length === 0
+    || candidate.aclRevision === null
+    || candidate.aclRevision === undefined
+  ))) {
+    return { ready: false, reason: "cognition_authorization_stale" };
+  }
+  if (packs.candidates.some((candidate) => (
+    typeof candidate.revisionId !== "string"
+    || candidate.revisionId.length === 0
+    || typeof candidate.digest !== "string"
+    || candidate.digest.length === 0
+  ))) {
+    return { ready: false, reason: "cognition_missing_pack_revision" };
+  }
+  return { ready: true, reason: null };
+}
+
 let installed = false;
 let decisionAuthoritiesInstalled = false;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isAgentWorkAttemptLineage(value: unknown): value is AgentWorkAttemptLineageV1 {
+  if (!isRecord(value) || value.version !== 1 || typeof value.attemptId !== "string"
+    || (value.previousAttemptId !== null && typeof value.previousAttemptId !== "string")
+    || typeof value.createdAt !== "number" || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0
+    || !isRecord(value.target)) {
+    return false;
+  }
+  const target = value.target;
+  return typeof target.chatId === "string"
+    && (target.generationType === "normal"
+      || target.generationType === "continue"
+      || target.generationType === "regenerate"
+      || target.generationType === "swipe")
+    && (target.messageId === null || typeof target.messageId === "string")
+    && (target.swipeId === null || (typeof target.swipeId === "number" && Number.isSafeInteger(target.swipeId) && target.swipeId >= 0));
 }
 
 function isRuntimeInternal(value: unknown): value is RuntimeInternal {
@@ -656,7 +825,12 @@ function targetFromBinding(binding: LiveTargetBinding): AgenticTargetSnapshot {
  * concurrent chat or message mutation is observable as a revision conflict
  * instead of being silently overwritten by a hardcoded zero.
  */
-function bindLiveTarget(userId: string, chatId: string, target: AgenticTargetSnapshot): LiveTargetBinding {
+function bindLiveTarget(
+  userId: string,
+  chatId: string,
+  target: AgenticTargetSnapshot,
+  preserveRequestedTarget = false,
+): LiveTargetBinding {
   const db = getDb();
   const chatRow = db.query(
     "SELECT generation_revision FROM chats WHERE id = ? AND user_id = ? LIMIT 1",
@@ -682,10 +856,15 @@ function bindLiveTarget(userId: string, chatId: string, target: AgenticTargetSna
   const currentSwipe = typeof messageRow.swipe_id === "number" ? messageRow.swipe_id : 0;
   // Regenerate always appends one new swipe, regardless of the submitted
   // current swipe. Explicit `swipe` generation retains its requested slot.
-  const appends = kind === "swipe" || kind === "regenerate";
+  const appends = !preserveRequestedTarget && (kind === "swipe" || kind === "regenerate");
   const defaultSwipe = appends ? swipeCount : currentSwipe;
-  const requestedSwipe = kind === "regenerate" ? swipeCount : target.swipeId ?? defaultSwipe;
-  const maximum = appends ? swipeCount : swipeCount - 1;
+  const requestedSwipe = !preserveRequestedTarget && kind === "regenerate"
+    ? swipeCount
+    : target.swipeId ?? defaultSwipe;
+  const preservesAppendSlot = preserveRequestedTarget
+    && (kind === "regenerate" || kind === "swipe")
+    && requestedSwipe === swipeCount;
+  const maximum = appends || preservesAppendSlot ? swipeCount : swipeCount - 1;
   if (!Number.isSafeInteger(requestedSwipe) || requestedSwipe < 0 || requestedSwipe > maximum) {
     throw new Error("agentic_target_unsupported");
   }
@@ -819,87 +998,6 @@ function authoredToolIds(config: unknown): readonly CoreAgentToolId[] {
 }
 
 
-function cognitionSnapshotInputs(
-  userId: string,
-  presetId: string | null,
-  projectedConfig?: unknown,
-): Pick<GenerationAssemblySnapshotInputV1, "cognitionGraph" | "cognitionSource" | "contextPackSelections" | "contextPackSnapshotSource"> {
-  if (!presetId) return { contextPackSnapshotSource: "host_prefetched" };
-  const projected = frozenConfig(projectedConfig);
-  const authored = getPresetAgentCognitionSourceV1(userId, presetId) as AgentPresetCognitionSourceV1 | null;
-  if (!authored) {
-    const hasPolicy = [projected.cognitionPolicy, projected.phasePolicy, projected.contextPolicy, projected.taskPolicy]
-      .some((value) => value !== undefined && value !== null);
-    if (hasPolicy) throw new Error("cognition_source_unavailable");
-    return { contextPackSnapshotSource: "host_prefetched" };
-  }
-  const config = frozenConfig(authored.config);
-  const cognitionPolicy = config.cognitionPolicy ?? {
-    workPolicy: [],
-    workspaceUsage: [],
-    completionCriteria: [],
-    renderPolicy: [],
-  };
-  const phasePolicy = config.phasePolicy ?? { work: [], render: [] };
-  const contextPolicy = config.contextPolicy ?? { ruleIds: [], packIds: [] };
-  const refs: Record<string, { blockId: string; revision: number }> = {};
-  const collectRefs = (value: unknown): void => {
-    if (!Array.isArray(value)) return;
-    for (const candidate of value) {
-      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
-      const ref = candidate as Record<string, unknown>;
-      if (typeof ref.blockId !== "string" || !Number.isSafeInteger(ref.expectedBlockRevision)) continue;
-      const previous = refs[ref.blockId];
-      if (previous && previous.revision !== ref.expectedBlockRevision) {
-        throw new Error(`cognition block revision conflict: ${ref.blockId}`);
-      }
-      refs[ref.blockId] = { blockId: ref.blockId, revision: ref.expectedBlockRevision as number };
-    }
-  };
-  collectRefs(cognitionPolicy.workPolicy);
-  collectRefs(cognitionPolicy.workspaceUsage);
-  collectRefs(cognitionPolicy.completionCriteria);
-  collectRefs(cognitionPolicy.renderPolicy);
-  collectRefs(phasePolicy.work);
-  collectRefs(phasePolicy.render);
-  const blocks = listPromptBlocks(userId, presetId) ?? [];
-  const sourceBlocks = Object.values(refs).map((ref) => {
-    const block = blocks.find((candidate) => candidate.id === ref.blockId);
-    if (!block) throw new Error(`cognition block is unavailable: ${ref.blockId}`);
-    const rawRevision = isRecord(block) ? block.revision : undefined;
-    const actualRevision = typeof rawRevision === "number" && Number.isSafeInteger(rawRevision) && rawRevision >= 0
-      ? rawRevision
-      : typeof rawRevision === "string" && /^\d+$/.test(rawRevision) ? Number(rawRevision) : 1;
-    if (actualRevision !== ref.revision) {
-      throw new Error(`cognition block revision is stale: ${ref.blockId}`);
-    }
-    return { blockId: ref.blockId, revision: actualRevision, promptOrder: blocks.indexOf(block) };
-  });
-  const source = {
-    presetRevision: authored.presetRevision,
-    blocks: sourceBlocks,
-  };
-  const directPackIds = Array.isArray(contextPolicy.packIds) ? contextPolicy.packIds : [];
-  const selections = authored.contextPackSelections.map((selection) => ({
-    packId: selection.packId,
-    revisionId: selection.revisionId,
-    digest: selection.digest,
-    required: directPackIds.includes(selection.packId),
-  }));
-  const frozen = freezeAgentCognitionV1({
-    config: { ...config, contextPolicy: { ...contextPolicy, packIds: directPackIds } },
-    contextRules: authored.contextRules,
-    taskTemplates: authored.taskTemplates,
-    selections,
-  }, source);
-  if (!frozen) return { contextPackSnapshotSource: "host_prefetched" };
-  return {
-    cognitionGraph: frozen.graph,
-    cognitionSource: frozen.source,
-    contextPackSelections: frozen.contextPackSelections,
-    contextPackSnapshotSource: "host_prefetched",
-  };
-}
 /**
  * Build the bounded snapshot input for one turn. `concreteConnection` may be
  * re-resolved so that a provider/endpoint/credential change during WORK is
@@ -917,6 +1015,7 @@ function snapshotInput(
   const connection = concreteConnection ?? internal.rootConnection;
   const cognition = cognitionSnapshotInputs(input.userId, presetId, projection?.config);
   return {
+    assemblySurface: "WORK",
     userId: input.userId,
     chatId: input.chatId,
     generationId: `agentic:${input.chatId}:${target.generationType}:${target.messageId ?? "new"}`,
@@ -983,7 +1082,8 @@ function indexSnapshotRevisions(snapshot: RuntimeSnapshot): ReadonlyMap<string, 
 }
 
 function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV1) {
-  let liveSnapshotIndex: ReadonlyMap<string, { revision: string; digest: string }> | null | undefined;
+  let fencedSnapshotIndex: ReadonlyMap<string, { revision: string; digest: string }> | null | undefined;
+  let fencedSnapshotDb: Database | undefined;
   return (member: RevisionMember, db?: Database): { revision: string; digest: string } | null => {
     if (typeof member?.kind !== "string" || typeof member?.id !== "string") return null;
     // Never retain the commit-preflight snapshot as the revision authority.
@@ -1033,14 +1133,25 @@ function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV
       if (member.kind === "endpoint") return liveEndpointInputRevision(member.id, liveConnection.endpointRevision);
       return liveCredentialInputRevision(member.id, liveConnection.credentialRevision);
     }
-    if (liveSnapshotIndex === undefined) {
+    // Generic members (character, lore, config, context) must not reuse a
+    // snapshot built before acquireCommitWriteFence. Only an in-transaction
+    // view of this same handle may be retained for later members / delta CAS.
+    const inTransaction = revisionDb.inTransaction === true;
+    if (!inTransaction || fencedSnapshotDb !== revisionDb) {
+      fencedSnapshotIndex = undefined;
+      fencedSnapshotDb = undefined;
+    }
+    if (fencedSnapshotIndex === undefined) {
       let liveInput = snapshotInputValue;
       if (snapshotInputValue.presetId) {
         const configRow = revisionDb.query(
           "SELECT config_revision, binding_revision FROM preset_agent_configs WHERE user_id = ? AND preset_id = ? LIMIT 1",
         ).get(snapshotInputValue.userId, snapshotInputValue.presetId) as { config_revision?: unknown; binding_revision?: unknown } | null;
         if (!configRow) {
-          liveSnapshotIndex = null;
+          if (inTransaction) {
+            fencedSnapshotIndex = null;
+            fencedSnapshotDb = revisionDb;
+          }
           return null;
         }
         liveInput = {
@@ -1063,7 +1174,10 @@ function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV
         // A roulette/router candidate is frozen for the frame. A changed
         // candidate is a revision mismatch, never an implicit reroll.
         if (frozenConcreteId && liveConnection?.concreteId !== frozenConcreteId) {
-          liveSnapshotIndex = null;
+          if (inTransaction) {
+            fencedSnapshotIndex = null;
+            fencedSnapshotDb = revisionDb;
+          }
           return null;
         }
         liveInput = {
@@ -1076,9 +1190,12 @@ function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV
         db: revisionDb,
         useTransaction: false,
       });
-      liveSnapshotIndex = indexSnapshotRevisions(liveSnapshot);
+      const index = indexSnapshotRevisions(liveSnapshot);
+      if (!inTransaction) return index.get(`${member.kind}:${member.id}`) ?? null;
+      fencedSnapshotIndex = index;
+      fencedSnapshotDb = revisionDb;
     }
-    return liveSnapshotIndex?.get(`${member.kind}:${member.id}`) ?? null;
+    return fencedSnapshotIndex?.get(`${member.kind}:${member.id}`) ?? null;
   };
 }
 /** Stable canonical encoding used to compare an applied delta with a frozen one. */
@@ -1501,6 +1618,7 @@ function makeRenderProvider(
   connection: FrozenConcreteConnectionV1,
   ledger: AgentRuntimeOwner["ledger"] | undefined,
   frozenCredential: string,
+  onDispatch?: (request: GenerationRequest) => void,
 ) {
   return async (request: AgenticRenderProviderRequestV1): Promise<AsyncIterable<StreamChunk>> => {
     if (connection.capabilities.toolsDisabledFinalization !== true) {
@@ -1522,6 +1640,7 @@ function makeRenderProvider(
         ? { providerTransientCarrier: request.providerTransientCarrier }
         : {}),
     };
+    onDispatch?.(generationRequest);
     return providerStream(userId, connection, generationRequest, frozenCredential, ledger);
   };
 }
@@ -1563,7 +1682,7 @@ function makeToolSnapshot(snapshot: RuntimeSnapshot, signal: AbortSignal): Agent
     id: entry.id, world_book_id: entry.bookId, uid: entry.id, outlet_name: null, wi_marker: null,
     wi_marker_side: null, key: [...entry.keys], keysecondary: [...entry.secondaryKeys], content: entry.content,
     comment: entry.comment, position: entry.position, depth: entry.depth, role: entry.role, order_value: entry.order,
-    selective: false, constant: false, disabled: false, group_name: "", group_override: false, group_weight: 0,
+    selective: false, constant: false, disabled: entry.disabled, group_name: "", group_override: false, group_weight: 0,
     probability: 100, scan_depth: null, exclude_greeting: false, case_sensitive: false, match_whole_words: false,
     automation_id: null, use_regex: false, prevent_recursion: false, exclude_recursion: false,
     delay_until_recursion: false, priority: 0, sticky: 0, cooldown: 0, delay: 0, selective_logic: 0,
@@ -1577,7 +1696,16 @@ function makeToolSnapshot(snapshot: RuntimeSnapshot, signal: AbortSignal): Agent
     swipe_dates: [...message.swipe_dates],
     extra: { ...message.extra },
   }));
-  return createAgentToolSnapshot({ rootUserId: snapshot.userId, chatId: snapshot.chatId, books, entries, messages, names, signal });
+  return createAgentToolSnapshot({
+    rootUserId: snapshot.userId,
+    chatId: snapshot.chatId,
+    books,
+    entries,
+    messages,
+    names,
+    ownedLore: createAgentOwnedLoreReader(snapshot.userId),
+    signal,
+  });
 }
 
 /**
@@ -1654,6 +1782,27 @@ function advanceWorkspaceRevision(execution: Pick<RuntimeExecution, "workspaceRe
   if (next < current) throw new Error("workspace_revision_stale");
   execution.workspaceRevision = next;
 }
+
+/**
+ * Keep the private cognition state aligned with a successful workspace CAS that
+ * cannot change cognition predicates (records, artifacts, or child assignment).
+ */
+function advanceNonCognitionWorkspaceRevision(
+  execution: Pick<RuntimeExecution, "workspaceRevision">,
+  cognitionRuntime: AgentCognitionRuntimeV1 | undefined,
+  workspaceRevision: number,
+): void {
+  if (!cognitionRuntime) {
+    advanceWorkspaceRevision(execution, { workspaceRevision });
+    return;
+  }
+  const current = execution.workspaceRevision ?? 0;
+  if (!Number.isSafeInteger(workspaceRevision) || workspaceRevision !== current + 1) {
+    throw new Error("workspace_revision_conflict");
+  }
+  cognitionRuntime.adoptWorkspaceMutationRevision(workspaceRevision);
+  execution.workspaceRevision = workspaceRevision;
+}
 /**
  * Adopt the workspace revision only for a WORK outcome that can continue.
  * Cancellation and timeout deliberately retain the coordinator's last
@@ -1719,10 +1868,7 @@ function recordPublicWorkActivity(
       status,
       startedAt,
       elapsedMs: 0,
-      toolId: observation.toolName === "agent_delegate"
-        || (CORE_AGENT_TOOL_IDS as readonly string[]).includes(observation.toolName)
-        ? observation.toolName as AgentActivityToolId
-        : "unknown_tool",
+      toolId: publicActivityToolId(observation.toolName),
       usage,
     });
   }
@@ -1936,6 +2082,15 @@ function makeWorkspace(
     expectedRevision,
     ...sanitizeWorkspaceArgs(operationArgs),
   });
+  // Revision reads accept only the immutable workspace identity; actor and
+  // capability fields belong to operation contexts and are intentionally absent.
+  const workspaceIdentity = (): Record<string, unknown> => ({
+    userId: execution.userId,
+    chatId: execution.chatId,
+    turnId: execution.id,
+    workspaceId: execution.workspaceId,
+  });
+
   const authenticatedContext = (
     actor: "root" | "child",
     frameId: string | undefined,
@@ -2060,7 +2215,41 @@ function makeWorkspace(
     : undefined;
   return {
     authenticateFrame: registerFrame,
-    getCompletionGates: ({ frame }) => getWorkspaceCompletionGatesV1(context(frame)),
+    getPhaseEvaluationSnapshot: async ({ phase: _phase, expectedRevision, signal }) => {
+      const expected = expectedRevision ?? execution.workspaceRevision ?? 0;
+      const snapshot = await abortable(withToolPermit(
+        execution.userId,
+        () => {
+          if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+          const beforeRevision = getCurrentWorkspaceRevisionV1(workspaceIdentity());
+          if (expectedRevision !== undefined && beforeRevision !== expectedRevision) {
+            throw new TurnWorkspaceError("stale_revision", "workspace revision changed before phase evaluation");
+          }
+          const transitionSnapshot = listWorkspaceTaskTransitionsV1(rootContext({}, beforeRevision));
+          const afterRevision = getCurrentWorkspaceRevisionV1(workspaceIdentity());
+          if (beforeRevision !== afterRevision || transitionSnapshot.workspaceRevision !== afterRevision) {
+            throw new TurnWorkspaceError("stale_revision", "workspace revision changed during phase evaluation");
+          }
+          return Object.freeze({
+            workspaceRevision: afterRevision,
+            taskTransitions: Object.freeze({ ...transitionSnapshot.taskTransitions }),
+          });
+        },
+        signal,
+        execution.owner.ledger,
+      ), signal);
+      if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      return snapshot;
+    },
+    getCompletionGates: ({ frame }) => {
+      const gates = getWorkspaceCompletionGatesV1(context(frame));
+      return {
+        workspaceRevision: gates.workspaceRevision,
+        canComplete: gates.accepted,
+        requiredOpenTasks: gates.openRequiredTaskIds.length,
+        unacceptedSubmissions: gates.pendingSubmissionCount,
+      };
+    },
     listRequiredOpenTasks: ({ frame }) => {
       const gates = getWorkspaceCompletionGatesV1(context(frame));
       return Array.from({ length: gates.openRequiredTaskIds.length }, () => ({}));
@@ -2105,7 +2294,15 @@ function makeWorkspace(
           const { taskId: _taskId, ...submissionInput } = raw;
           return acceptWorkspaceSubmission(submissionInput);
         }
-        if (operation === "record_finding" || operation === "record_decision" || operation === "record_question") return recordWorkspaceRecord(raw);
+        if (operation === "record_finding" || operation === "record_decision" || operation === "record_question") {
+          const kind = operation === "record_finding"
+            ? "finding"
+            : operation === "record_decision"
+              ? "decision"
+              : "question";
+          const { digest: _untrustedDigest, ...recordInput } = raw;
+          return recordWorkspaceRecord({ ...recordInput, kind });
+        }
         if (operation === "attach_artifact") return attachWorkspaceArtifactReference(raw);
         return proposeWorkspacePublication(raw);
       }, toolContext.signal, execution.owner.ledger);
@@ -2122,7 +2319,7 @@ function makeWorkspace(
         gates = getWorkspaceCompletionGatesV1(context(toolContext.frame, {}, execution.workspaceRevision ?? 0));
       }
       const workspaceRevision = gates.workspaceRevision;
-      advanceWorkspaceRevision(execution, { workspaceRevision });
+      advanceNonCognitionWorkspaceRevision(execution, cognitionRuntime, workspaceRevision);
       const publicResult = isRecord(result)
         ? { ...result, workspaceRevision }
         : { result, workspaceRevision };
@@ -2155,7 +2352,7 @@ function makeWorkspace(
         return { taskId: task.id, frameId: task.assignedFrameId };
       });
       if (signal.aborted) throw signal.reason ?? new Error("workspace_assignment_cancelled");
-      advanceWorkspaceRevision(execution, result);
+      advanceNonCognitionWorkspaceRevision(execution, cognitionRuntime, result.workspaceRevision);
       return {
         accepted: true,
         workspaceRevision: result.workspaceRevision,
@@ -2305,6 +2502,7 @@ function installDecisionAuthorities(): void {
         const canonicalConfig = projection?.config ?? null;
         const cognition = cognitionSnapshotInputs(userId, presetId, canonicalConfig);
         const snapshot = buildGenerationAssemblySnapshot({
+          assemblySurface: "WORK",
           userId,
           chatId: request.chatId,
           // Keep the revision-bearing runtime epoch identical to ASSEMBLE.
@@ -2360,19 +2558,12 @@ function installDecisionAuthorities(): void {
       // are verified only after this request's concrete snapshot is frozen.
       const providerReady = streamingReady && toolCallingReady && continuationReady && finalizationReady;
       const configReady = context.config !== undefined && context.config !== null;
-      // Context readiness is only true when the frozen candidate set is owned by
-      // this user and every required pack carries complete revision identity.
+      // Candidate ownership may differ for an ACL-authorized shared pack. The
+      // frozen caller ACL epoch and each candidate's owner/ACL revision are the
+      // readiness authority; requiring ownership would reject valid shares.
       const packs = snapshot?.contextPacks;
-      const contextReady = !!packs
-        && packs.schema === "present"
-        && packs.candidates.every((candidate) => (
-          candidate.ownerId === userId
-          && (!candidate.required || (
-            typeof candidate.revisionId === "string" && candidate.revisionId.length > 0
-            && typeof candidate.digest === "string" && candidate.digest.length > 0
-            && candidate.aclRevision !== null && candidate.aclRevision !== undefined
-          ))
-        ));
+      const contextReadiness = contextPackReadiness(packs);
+      const contextReady = contextReadiness.ready;
       const inputReady = context.inputRevisionDigest.length > 0;
       const staticReady = status.schema
         && status.reconciliation
@@ -2391,11 +2582,7 @@ function installDecisionAuthorities(): void {
       if (!status.publicationStore) reasons.push("publication_store_unavailable");
       if (!providerReady) reasons.push("provider_capability_unavailable");
       if (!configReady) reasons.push("config_unavailable");
-      if (!contextReady) {
-        if (!packs) reasons.push("input_revisions_incomplete");
-        else if (packs.candidates.some((candidate) => candidate.ownerId !== userId)) reasons.push("cognition_authorization_stale");
-        else reasons.push("cognition_missing_pack_revision");
-      }
+      if (!contextReady && contextReadiness.reason) reasons.push(contextReadiness.reason);
       if (!inputReady) reasons.push("input_revisions_incomplete");
       if (getAgenticRuntimeMode() !== "auto") reasons.push("kill_switch_off");
       // Static components share the readiness authority's own digest. It is the
@@ -2477,11 +2664,400 @@ function cognitionWorkspaceContext(
   };
 }
 
-function createCognitionRuntimeForTurn(
+function selectedContextPackRequirements(
+  snapshot: RuntimeSnapshot,
+): readonly CognitionContextPackRequirementV1[] {
+  const candidates = snapshot.contextPackSnapshot.candidates;
+  const byKey = new Map(candidates.map((candidate) => [`${candidate.packId}\u0000${candidate.revisionId}`, candidate] as const));
+  const requirements = Object.freeze(snapshot.contextPacks.contextPackSelections.flatMap((selection) => {
+    const candidate = byKey.get(`${selection.packId}\u0000${selection.revisionId}`);
+    const digest = candidate?.digest ?? selection.digest ?? null;
+    if (!candidate && digest === null) return [];
+    return [Object.freeze({
+      ruleId: null,
+      source: "direct" as const,
+      packId: selection.packId,
+      revisionId: selection.revisionId,
+      digest,
+      required: selection.required === true,
+    })];
+  }));
+  console.error("[agentic] selected context packs", {
+    selectionCount: snapshot.contextPacks.contextPackSelections.length,
+    candidateCount: candidates.length,
+    requirementCount: requirements.length,
+    selections: snapshot.contextPacks.contextPackSelections.map((selection) => ({
+      packId: selection.packId,
+      revisionId: selection.revisionId,
+      required: selection.required,
+    })),
+    hasGraph: Boolean(snapshot.contextPacks.cognitionGraph),
+  });
+  return requirements;
+}
+
+function loomContextPackIdentity(packId: string, revisionId: string, digest: string): string {
+  return `${packId}\u0000${revisionId}\u0000${digest}`;
+}
+
+function effectiveOnDemandContextPackKeys(
+  activation: CognitionRuntimeActivationV1 | undefined,
+  buckets: readonly LoomPolicyBucketV1[],
+): ReadonlySet<string> {
+  const keys = new Set<string>();
+  for (const item of activation?.policySurface?.promptInspection?.items ?? []) {
+    if (
+      item.outcome.status !== "included"
+      || item.delivery.delivery !== "on_demand"
+      || !buckets.includes(item.bucket)
+    ) {
+      continue;
+    }
+    const request = item.delivery.request;
+    keys.add(loomContextPackIdentity(request.contextPackId, request.revisionId, request.digest));
+  }
+  return keys;
+}
+function selectedContextPackFactLines(
+  snapshot: RuntimeSnapshot,
+  effectiveOnDemandKeys?: ReadonlySet<string>,
+): readonly string[] {
+  const ownerId = snapshot.contextPackSnapshot.ownerId;
+  const byKey = new Map(
+    snapshot.contextPackSnapshot.candidates.map((candidate) => [`${candidate.packId}\u0000${candidate.revisionId}`, candidate] as const),
+  );
+  const lines: string[] = [];
+  for (const selection of snapshot.contextPacks.contextPackSelections) {
+    const candidate = byKey.get(`${selection.packId}\u0000${selection.revisionId}`);
+    const expectedDigest = candidate?.digest ?? selection.digest;
+    if (
+      expectedDigest
+      && effectiveOnDemandKeys?.has(loomContextPackIdentity(selection.packId, selection.revisionId, expectedDigest))
+    ) {
+      continue;
+    }
+    const revision = readContextPackRevisionForUser(ownerId, selection.packId, selection.revision);
+    if (!revision) continue;
+    if (expectedDigest && revision.contentDigest !== expectedDigest) continue;
+    const label = snapshotFactText(candidate?.label) || "Context pack";
+    for (const entry of revision.content) {
+      const body = snapshotFactText(entry.body);
+      if (!body) continue;
+      const title = snapshotFactText(entry.title);
+      lines.push(title ? `Context (${label} — ${title}): ${body}` : `Context (${label}): ${body}`);
+    }
+  }
+  return Object.freeze(lines);
+}
+
+function contextPackPolicyText(
+  records: readonly { readonly text: string; readonly title?: string }[],
+): string {
+  return records.map((record) => {
+    const title = record.title?.trim();
+    return title ? `${title}\n${record.text}` : record.text;
+  }).join("\n\n");
+}
+
+async function sealLoomContextPacksForTurn(
+  plan: AssemblyPlanV1,
+  contextRuntime: CoordinatorContextRuntime,
+  signal?: AbortSignal,
+): Promise<readonly LoomPromptInspectionContextPackV1[]> {
+  const requested = new Map<string, {
+    readonly request: LoomOnDemandRequestV1;
+    required: boolean;
+  }>();
+  for (const entries of [
+    plan.loomPolicy.workPolicy,
+    plan.loomPolicy.workspaceUsage,
+    plan.loomPolicy.completionCriteria,
+    plan.loomPolicy.renderPolicy,
+  ]) {
+    for (const entry of entries) {
+      if (entry.delivery.delivery !== "on_demand") continue;
+      const request = entry.delivery.request;
+      const key = `${request.contextPackId}\u0000${request.revisionId}\u0000${request.digest}`;
+      const previous = requested.get(key);
+      if (previous) {
+        previous.required ||= entry.required;
+      } else {
+        requested.set(key, { request, required: entry.required });
+      }
+    }
+  }
+  if (requested.size === 0) return Object.freeze([]);
+  const result: LoomPromptInspectionContextPackV1[] = [];
+  const gate = contextRuntime.capability.operationGate;
+  for (const { request, required } of requested.values()) {
+    const candidates = contextRuntime.snapshot.candidates
+      .filter((candidate) =>
+        candidate.packId === request.contextPackId
+        && candidate.revisionId === request.revisionId
+        && candidate.digest === request.digest)
+      .sort((left, right) => left.order - right.order);
+    for (const candidate of candidates) {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      const requirement = required ? "required" as const : "optional" as const;
+      const before = await gate.authorize(candidate, requirement, "get", signal);
+      if (!before.allowed) continue;
+      let content;
+      try {
+        content = await contextRuntime.reader.readRevision({
+          ownerId: contextRuntime.snapshot.ownerId,
+          candidate,
+          signal,
+        });
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason ?? error;
+        continue;
+      }
+      if (!content) continue;
+      const after = await gate.authorize(candidate, requirement, "get", signal);
+      if (
+        !after.allowed
+        || content.ownerId !== candidate.ownerId
+        || content.packId !== candidate.packId
+        || content.revisionId !== candidate.revisionId
+        || content.revision !== candidate.revision
+        || content.digest !== candidate.digest
+      ) {
+        continue;
+      }
+      const inputRevision = contextRuntime.snapshot.candidateInputRevisions.find((revision) =>
+        revision.ownerId === candidate.ownerId
+        && revision.packId === candidate.packId
+        && revision.revisionId === candidate.revisionId
+        && revision.revision === candidate.revision
+        && revision.digest === candidate.digest
+        && revision.attachmentId === candidate.attachmentId);
+      if (!inputRevision) continue;
+      const policyText = contextPackPolicyText(content.records);
+      if (!policyText.trim()) continue;
+      contextRuntime.tracker.add(inputRevision);
+      result.push(Object.freeze({ ...request, content: policyText }));
+      break;
+    }
+  }
+  return Object.freeze(result);
+}
+
+
+function mergeContextPackRequirements(
+  selected: readonly CognitionContextPackRequirementV1[],
+  activated: readonly CognitionContextPackRequirementV1[] | undefined,
+): readonly CognitionContextPackRequirementV1[] {
+  if (!activated || activated.length === 0) return selected;
+  const byKey = new Map<string, CognitionContextPackRequirementV1>();
+  for (const requirement of [...selected, ...activated]) {
+    const key = `${requirement.packId}\u0000${requirement.revisionId}`;
+    const prior = byKey.get(key);
+    if (!prior) {
+      byKey.set(key, requirement);
+      continue;
+    }
+    const chosen = requirement.source === "rule"
+      ? requirement
+      : prior.source === "rule"
+        ? prior
+        : requirement.source === "direct" || prior.source !== "direct"
+          ? requirement
+          : prior;
+    byKey.set(key, Object.freeze({
+      ...chosen,
+      digest: chosen.digest ?? prior.digest ?? requirement.digest,
+      required: prior.required || requirement.required,
+    }));
+  }
+  return Object.freeze([...byKey.values()]);
+}
+
+
+type CortexSnapshotCandidateV1 = Readonly<{
+  snapshotId: string;
+  revision: string | number;
+  value: unknown;
+  availability?: "available" | "stale" | "unauthorized" | "unavailable";
+  required?: boolean;
+  ownerId?: string;
+  attemptId?: string;
+  checkpoint?: string;
+  scope?: Readonly<{
+    chatId?: string;
+    targetMessageId?: string | null;
+    targetSwipeId?: number | null;
+  }>;
+}>;
+
+function cortexSnapshotSourceFromAssembly(snapshot: RuntimeSnapshot): unknown {
+  const value = snapshot as unknown as Record<string, unknown>;
+  if (Object.hasOwn(value, "cortexSidecarSnapshot")) return value.cortexSidecarSnapshot;
+  if (isRecord(value.contextPacks) && Object.hasOwn(value.contextPacks, "cortexSidecarSnapshot")) {
+    return value.contextPacks.cortexSidecarSnapshot;
+  }
+  if (isRecord(value.agentConfig) && Object.hasOwn(value.agentConfig, "cortexSidecarSnapshot")) {
+    return value.agentConfig.cortexSidecarSnapshot;
+  }
+  return undefined;
+}
+
+function cortexSnapshotCandidate(value: unknown): CortexSnapshotCandidateV1 | undefined {
+  const record = isRecord(value) && isRecord(value.snapshot) && value.snapshot.version === 1
+    ? value.snapshot
+    : isRecord(value) ? value : undefined;
+  if (!record || typeof record.snapshotId !== "string" || record.snapshotId.length === 0) return undefined;
+  const revision = record.revision ?? record.sourceRevision;
+  if (!((typeof revision === "string" && revision.length > 0) || (typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0))) {
+    return undefined;
+  }
+  if (!Object.hasOwn(record, "value")) return undefined;
+  const availability = record.availability;
+  const normalizedAvailability = availability === "available"
+    || availability === "stale"
+    || availability === "unauthorized"
+    || availability === "unavailable"
+    ? availability
+    : undefined;
+  const required = typeof record.required === "boolean" ? record.required : undefined;
+  const scope = isRecord(record.scope)
+    ? {
+      ...(typeof record.scope.chatId === "string" ? { chatId: record.scope.chatId } : {}),
+      ...(record.scope.targetMessageId === null || typeof record.scope.targetMessageId === "string"
+        ? { targetMessageId: record.scope.targetMessageId }
+        : {}),
+      ...(record.scope.targetSwipeId === null || (typeof record.scope.targetSwipeId === "number" && Number.isSafeInteger(record.scope.targetSwipeId) && record.scope.targetSwipeId >= 0)
+        ? { targetSwipeId: record.scope.targetSwipeId }
+        : {}),
+    }
+    : undefined;
+  return Object.freeze({
+    snapshotId: record.snapshotId,
+    revision: revision as string | number,
+    value: record.value,
+    ...(normalizedAvailability ? { availability: normalizedAvailability } : {}),
+    ...(required === undefined ? {} : { required }),
+    ...(typeof record.ownerId === "string" ? { ownerId: record.ownerId } : {}),
+    ...(typeof record.attemptId === "string" ? { attemptId: record.attemptId } : {}),
+    ...(typeof record.checkpoint === "string" ? { checkpoint: record.checkpoint } : {}),
+    ...(scope ? { scope: Object.freeze(scope) } : {}),
+  });
+}
+
+function cortexRequiredFromConfig(config: unknown): boolean {
+  if (!isRecord(config)) return false;
+  if (typeof config.cortexRequired === "boolean") return config.cortexRequired;
+  for (const key of ["cortexPolicy", "cortexSidecarPolicy", "cortex"]) {
+    const policy = config[key];
+    if (isRecord(policy) && typeof policy.required === "boolean") return policy.required;
+  }
+  return false;
+}
+
+function cortexAttemptId(execution: RuntimeExecution): string {
+  return execution.attemptLineage.attemptId;
+}
+
+function cortexAuthorizedSnapshotForWork(
   execution: RuntimeExecution,
   snapshot: RuntimeSnapshot,
+  cognitionRuntime: AgentCognitionRuntimeV1 | undefined,
+): { readonly attemptId: string; readonly required: boolean; readonly snapshot: CortexAuthorizedSnapshotV1 } {
+  const attemptId = cortexAttemptId(execution);
+  const rawFromRuntime = cognitionRuntime ? cognitionRuntimeCortexSnapshot(cognitionRuntime) : undefined;
+  const raw = rawFromRuntime === undefined ? cortexSnapshotSourceFromAssembly(snapshot) : rawFromRuntime;
+  const candidate = cortexSnapshotCandidate(raw);
+  const required = cortexRequiredFromConfig(snapshot.agentConfig) || candidate?.required === true;
+  const targetMessageId = snapshot.target.messageId ?? null;
+  const targetSwipeId = snapshot.target.swipeId ?? null;
+  const metadataMismatch = candidate !== undefined && (
+    candidate.ownerId !== undefined && candidate.ownerId !== snapshot.userId
+    || candidate.attemptId !== undefined && candidate.attemptId !== attemptId
+    || candidate.checkpoint !== undefined && candidate.checkpoint !== WORK_CORTEX_CHECKPOINT
+    || candidate.scope?.chatId !== undefined && candidate.scope.chatId !== snapshot.chatId
+    || candidate.scope?.targetMessageId !== undefined && candidate.scope.targetMessageId !== targetMessageId
+    || candidate.scope?.targetSwipeId !== undefined && candidate.scope.targetSwipeId !== targetSwipeId
+  );
+  const available = candidate !== undefined && !metadataMismatch;
+  const input = {
+    ownerId: snapshot.userId,
+    attemptId,
+    chatId: snapshot.chatId,
+    targetMessageId,
+    targetSwipeId,
+    checkpoint: WORK_CORTEX_CHECKPOINT,
+    snapshotId: available ? candidate.snapshotId : snapshot.snapshotId,
+    revision: available ? candidate.revision : snapshot.snapshotId,
+    value: available ? candidate.value : null,
+    availability: available ? candidate.availability : "unavailable",
+  } as const;
+  let authorized: CortexAuthorizedSnapshotV1;
+  try {
+    authorized = createCortexAuthorizedSnapshot(input);
+  } catch {
+    authorized = createCortexAuthorizedSnapshot({
+      ...input,
+      snapshotId: snapshot.snapshotId,
+      revision: snapshot.snapshotId,
+      value: null,
+      availability: "unavailable",
+    });
+  }
+  return Object.freeze({ attemptId, required, snapshot: authorized });
+}
+function mapCortexRequiredError(error: CortexSidecarError): AgenticGenerationError {
+  const code = error.code === "stale" || error.code === "snapshot_mismatch"
+    ? "agentic_revision_conflict"
+    : error.code === "cancelled"
+      ? "agentic_cancelled"
+      : error.code === "failed"
+        ? "agentic_provider_failure"
+        : error.code === "limit_exceeded"
+          ? "agentic_work_exhausted"
+          : "agentic_preflight_failed";
+  return new AgenticGenerationError(code, `cortex_required_failed:${error.code}`, {
+    phase: "WORK",
+    retryable: code === "agentic_revision_conflict",
+    cause: error,
+  });
+}
+function recordCortexInspection(
+  writer: AgentInspectionWriterV1 | undefined,
+  result: CortexSidecarReadResultV1,
+): void {
+  if (!writer) return;
+  const receipt = result.receipt;
+  writer.record("cortex", receipt, { lifecycle: "WORK", status: "running" });
+  const included = result.kind === "accepted";
+  const content = boundedRenderFacts(JSON.stringify({
+    nonCanonical: true,
+    snapshotId: receipt.snapshotId,
+    revision: receipt.revision,
+    state: receipt.state,
+    included,
+    ...(included
+      ? { value: safeToolInspectionValue(result.value) }
+      : { omission: safeToolInspectionValue(result.omission) }),
+  }), WORK_CORTEX_MAX_RESULT_BYTES);
+  writer.record("turn_session", {
+    id: `cortex:context:${receipt.id}`,
+    kind: "policy",
+    detail: content,
+    correlation: receipt.correlation,
+    occurredAt: receipt.completedAt ?? receipt.startedAt,
+    transcriptRecordIds: [],
+  }, { lifecycle: "WORK", status: "running" });
+}
+
+
+
+async function createCognitionRuntimeForTurn(
+  execution: RuntimeExecution,
+  snapshot: RuntimeSnapshot,
+  plan: AssemblyPlanV1,
   capabilities: WorkspaceOperationCapabilitiesV1,
-): AgentCognitionRuntimeV1 | undefined {
+  contextRuntime: CoordinatorContextRuntime,
+  signal?: AbortSignal,
+): Promise<AgentCognitionRuntimeV1 | undefined> {
   const contextPacks = snapshot.contextPacks;
   if (!contextPacks.cognitionGraph || !contextPacks.cognitionSource) return undefined;
   const participants = snapshot.participants;
@@ -2493,36 +3069,41 @@ function createCognitionRuntimeForTurn(
   const characterId = typeof participants.character.id === "string" ? participants.character.id : undefined;
   if (characterId) participantFacts.characterId = characterId;
   if (participants.persona && typeof participants.persona.id === "string") participantFacts.personaId = participants.persona.id;
-  return createAgentCognitionRuntime({
-    source: {
-      graph: contextPacks.cognitionGraph,
-      source: contextPacks.cognitionSource,
-      config: Object.freeze({ ...frozenConfig(snapshot.agentConfig) }),
-      contextRules: contextPacks.contextRules,
-      taskTemplateIds: (() => {
-        const config = frozenConfig(snapshot.agentConfig);
-        return config.taskPolicy?.templateIds ?? [];
-      })(),
-      contextPackSelections: contextPacks.contextPackSelections,
-      contextPackCandidates: contextPacks.candidates.map((candidate) => ({
-        packId: candidate.packId,
-        revisionId: candidate.revisionId,
-        digest: candidate.digest,
-        source: candidate.source,
-        required: candidate.required,
-      })),
-    },
-    evaluation: {
-      generationType: snapshot.target.generationType,
-      phase: "ASSEMBLE",
-      presetVariables: cognitionValues(snapshot.variables.preset),
-      participantFacts: Object.freeze(participantFacts),
-      availableTools: snapshot.availability.toolIds,
-      taskTransitions: Object.freeze({}),
-    },
-    workspaceRevision: execution.workspaceRevision ?? 0,
-    workspace: cognitionWorkspaceContext(execution, capabilities),
-  });
+  const cortexSidecarSnapshot = cortexSnapshotSourceFromAssembly(snapshot);
+  const loomContextPacks = await sealLoomContextPacksForTurn(plan, contextRuntime, signal);
+  try {
+    return createAgentCognitionRuntime({
+      source: {
+        graph: contextPacks.cognitionGraph,
+        source: contextPacks.cognitionSource,
+        config: Object.freeze({ ...frozenConfig(snapshot.agentConfig) }),
+        contextPackSelections: contextPacks.contextPackSelections,
+        contextPackCandidates: contextPacks.candidates.map((candidate) => ({
+          packId: candidate.packId,
+          revisionId: candidate.revisionId,
+          digest: candidate.digest,
+          source: candidate.source,
+          required: candidate.required,
+        })),
+        ...(contextPacks.loomPolicy === undefined ? {} : { loomPolicy: contextPacks.loomPolicy }),
+        loomBlocks: plan.loomBlocks,
+        loomContextPacks,
+        ...(cortexSidecarSnapshot === undefined ? {} : { cortexSidecarSnapshot }),
+      },
+      evaluation: {
+        generationType: snapshot.target.generationType,
+        phase: "ASSEMBLE",
+        presetVariables: cognitionValues(snapshot.variables.preset),
+        participantFacts: Object.freeze(participantFacts),
+        availableTools: snapshot.availability.toolIds,
+        taskTransitions: Object.freeze({}),
+      },
+      workspaceRevision: execution.workspaceRevision ?? 0,
+      workspace: cognitionWorkspaceContext(execution, capabilities),
+    });
+  } catch (error) {
+    throw error;
+  }
 }
 
 async function enterCognitionPhase(
@@ -2542,6 +3123,83 @@ async function enterCognitionPhase(
   }, signal ?? execution.signal, execution.owner.ledger);
 }
 
+function inspectionLifecycleForPhase(phase: AgenticPhase): AgentInspectionLifecycleV1 {
+  if (phase === "COMPLETE") return "PREPARE_COMMIT";
+  if (phase === "COMMITTING" || phase === "COMMITTED" || phase === "COMMIT_FAILED") return "COMMIT";
+  if (phase === "CANCELLED" || phase === "TIMED_OUT" || phase === "EXHAUSTED" || phase === "FAILED") return "TERMINAL";
+  return phase as AgentInspectionLifecycleV1;
+}
+
+function inspectionStatusForPhase(
+  phase: AgenticPhase,
+  status: unknown,
+): AgentInspectionStatusV1 {
+  if (status === "pending" || status === "running" || status === "waiting" || status === "cancelling" || status === "terminal") {
+    return status;
+  }
+  return phase === "COMPLETE" || phase === "PREPARE_COMMIT" ? "waiting" : "running";
+}
+
+function inspectionOutcome(value: unknown): AgentInspectionOutcomeV1 | null {
+  return value === "completed" || value === "stopped" || value === "failed"
+    || value === "exhausted" || value === "rejected"
+    ? value
+    : null;
+}
+
+function inspectionReason(value: unknown): AgentInspectionReasonV1 {
+  const reason = typeof value === "string" ? value.toLowerCase() : "";
+  if (reason === "completed") return "none";
+  if (reason === "stopped" || reason === "cancelled" || reason.includes("cancel")) return "user_stop";
+  if (reason.includes("timed") || reason.includes("deadline") || reason.includes("wall_clock")) return "deadline";
+  if (reason.includes("provider")) return "provider_failure";
+  if (reason.includes("tool")) return "tool_failure";
+  if (reason.includes("budget") || reason.includes("exhaust")) return "budget_exhausted";
+  if (reason.includes("revision") || reason.includes("stale")) return "stale_input";
+  if (reason === "none" || reason.length === 0) return "none";
+  if (reason === "reconciled") return "reconciled";
+  if (reason === "retry_requested") return "retry_requested";
+  return "needs_attention";
+}
+
+function terminalInspectionReason(
+  status: unknown,
+  reason: unknown,
+  errorCode: unknown,
+): AgentInspectionReasonV1 {
+  return status === "completed" ? "none" : inspectionReason(reason ?? errorCode ?? status);
+}
+function recordInspectionPrompts(
+  writer: AgentInspectionWriterV1 | undefined,
+  messages: readonly AssemblyProviderMessageV1[] | undefined,
+  destination: "root_work" | "completion_handoff" | "render",
+  lifecycle: AgentInspectionLifecycleV1,
+): void {
+  if (!writer || !messages) return;
+  for (const [index, message] of messages.entries()) {
+    const content = message.segments.map((segment) =>
+      segment.kind === "literal" ? segment.text : "[result_slot]",
+    ).join("");
+    const provenance = message.provenance;
+    const sourceId = provenance?.sourceId ?? `${destination}:${index}`;
+    const parsedRevision = provenance ? Number(provenance.sourceRevision) : 0;
+    const sourceRevision = Number.isSafeInteger(parsedRevision) && parsedRevision >= 0 ? parsedRevision : 0;
+    const role = message.role === "developer" ? "system" : message.role;
+    writer.record("prompt", {
+      id: `prompt:${destination}:${index}`,
+      sourceId,
+      sourceRevision,
+      destination,
+      role,
+      included: true,
+      content,
+      contentDigest: createHash("sha256").update(content).digest("hex"),
+      omissionReason: null,
+    }, { lifecycle, status: lifecycle === "PREPARE_COMMIT" ? "waiting" : "running" });
+  }
+}
+
+
 function buildDependencies(): AgenticGenerationDependencies {
   const cognitionRuntimes = new Map<string, AgentCognitionRuntimeV1>();
   const contextRuntimes = new Map<string, CoordinatorContextRuntime>();
@@ -2549,13 +3207,58 @@ function buildDependencies(): AgenticGenerationDependencies {
   const plans = new Map<string, RuntimePlan>();
   const renders = new Map<string, { content: string }>();
   const renderProjections = new Map<string, FrozenRenderCommitProjection>();
+  const renderBreakdowns = new Map<string, {
+    readonly entries: readonly {
+      readonly name: string;
+      readonly type: "utility";
+      readonly tokens: number;
+      readonly role: LlmMessage["role"];
+      readonly content: string;
+    }[];
+    readonly messages: readonly {
+      readonly role: LlmMessage["role"];
+      readonly content: string;
+    }[];
+    readonly totalTokens: number;
+    readonly model: string;
+    readonly provider: string;
+    readonly parameters: GenerationParameters;
+    readonly loomPromptInspection?: unknown;
+  }>();
   const renderFrames = new Map<string, {
     readonly handoff: AgenticWorkRenderHandoff;
   }>();
   const works = new Map<string, AgenticWorkPhaseOutcome>();
   const workUsages = new Map<string, AgentActivityUsageV1>();
+  const terminalUsages = new Map<string, AgentActivityUsageV1>();
   const caps = new Map<string, WorkspaceOperationCapabilitiesV1>();
   const bindings = new Map<string, LiveTargetBinding>();
+  const inspectionWriters = new Map<string, AgentInspectionWriterV1>();
+  const persistentAssociations = new Map<string, PersistentRuntimeAssociation>();
+  const syncPersistentSession = (
+    executionId: string,
+    phase: PersistentWorkspaceTurnSession["phase"],
+    status: PersistentWorkspaceTurnSession["status"],
+    outcome?: PersistentWorkspaceTurnSession["outcome"],
+  ): void => {
+    const association = persistentAssociations.get(executionId);
+    if (!association) return;
+    const workspace = getPersistentWorkspaceById({
+      userId: association.session.userId,
+      workspaceId: association.workspaceId,
+    });
+    association.workspaceRevision = workspace.revision;
+    association.session = updatePersistentWorkspaceHostTurnSession(association.authority, {
+      userId: association.session.userId,
+      chatId: association.session.chatId,
+      workspaceId: association.workspaceId,
+      expectedRevision: association.workspaceRevision,
+      turnSessionId: association.session.id,
+      phase,
+      status,
+      ...(outcome === undefined ? {} : { outcome }),
+    });
+  };
   const stopRegistrations = new Map<string, () => void>();
   const rootSignals = new Map<string, AbortSignal>();
   const rootDeadlines = new Map<string, number>();
@@ -2585,6 +3288,43 @@ function buildDependencies(): AgenticGenerationDependencies {
       }
       await Promise.all([...joins]);
     }
+  };
+  const ensureInspectionWriter = (event: {
+    readonly executionId: string;
+    readonly userId: string;
+    readonly chatId: string;
+    readonly target: AgenticTargetSnapshot;
+    readonly attemptLineage?: AgentWorkAttemptLineageV1;
+  }): { readonly writer: AgentInspectionWriterV1; readonly recovered: boolean } => {
+    const existing = inspectionWriters.get(event.executionId);
+    if (existing) return { writer: existing, recovered: false };
+    const lineage = event.attemptLineage;
+    const attemptId = lineage?.attemptId ?? event.executionId;
+    const writer = createAgentInspectionWriter({
+      userId: event.userId,
+      chatId: event.chatId,
+      attemptId,
+      ...(lineage?.previousAttemptId !== undefined ? { previousAttemptId: lineage.previousAttemptId } : {}),
+      runId: event.executionId,
+      turnSessionId: event.executionId,
+      generationId: event.executionId,
+      generationType: event.target.generationType,
+      targetMessageId: event.target.messageId ?? null,
+      targetSwipeId: event.target.swipeId ?? null,
+      hostCorrelationId: `agentic:${event.executionId}:${attemptId}`,
+      ...(lineage?.createdAt !== undefined ? { startedAt: lineage.createdAt } : {}),
+      reconciliation: "recovered",
+    });
+    inspectionWriters.set(event.executionId, writer);
+    writer.record("recovery", {
+      id: `recovery:writer:${event.executionId}`,
+      kind: "recovery",
+      actor: "host",
+      recipient: "owner",
+      result: JSON.stringify({ executionId: event.executionId, source: "terminal_publication" }),
+      correlation: { parentId: "root" },
+    }, { lifecycle: "ADMIT", status: "pending", reconciliation: "recovered" });
+    return { writer, recovered: true };
   };
 
   const resolve = async (input: AgenticGenerationInput, target: AgenticTargetSnapshot): Promise<AgenticRuntimeDecision> => {
@@ -2656,6 +3396,13 @@ function buildDependencies(): AgenticGenerationDependencies {
               // that disappeared between the timer and this CAS.
             }
           }
+          inspectionWriters.get(value.executionId)?.record("stop", {
+            id: `stop:deadline:${value.executionId}`,
+            state: "accepted",
+            reason: "deadline",
+            requestedAt: Date.now(),
+            correlation: { actorId: "host", recipientId: "agent" },
+          }, { status: "cancelling", reason: "deadline" });
           deadlineController.abort(new DOMException("Agentic root deadline", "TimeoutError"));
         },
         Math.max(0, deadlineAt - now),
@@ -2670,13 +3417,19 @@ function buildDependencies(): AgenticGenerationDependencies {
       let owner: AgentRuntimeOwner | undefined;
       let credentialCarrier: Map<string, string> | undefined;
       try {
-        const binding = bindLiveTarget(value.userId, value.chatId, value.target);
+        const binding = bindLiveTarget(
+          value.userId,
+          value.chatId,
+          value.target,
+          value.attemptLineage?.previousAttemptId != null,
+        );
         bindings.set(value.executionId, binding);
         const presetRevision = Number(decision.internal.binding.configRevision);
         const connectionRevision = Number(root?.candidateRevision ?? root?.revision);
         const execution = createTurnExecution({
           id: value.executionId, userId: value.userId, chatId: value.chatId, generationId: value.executionId,
           target: binding,
+          attemptLineage: value.attemptLineage,
           presetSnapshotId: decision.internal.binding.presetId,
           presetRevision: Number.isSafeInteger(presetRevision) && presetRevision >= 0 ? presetRevision : 0,
           configSnapshotId: decision.internal.binding.presetId,
@@ -2685,6 +3438,107 @@ function buildDependencies(): AgenticGenerationDependencies {
           concreteConnectionRevision: Number.isSafeInteger(connectionRevision) && connectionRevision >= 0 ? connectionRevision : 0,
           worldLoreSnapshotId: null, worldLoreRevision: 0, mode: "agentic", runtimeEpoch: getRuntimeEpoch(),
           deadlineAt, workspaceId: `workspace:${value.executionId}`, rootLedger: {}, frameCapabilities: {},
+        });
+        const lineage = isAgentWorkAttemptLineage(value.attemptLineage)
+          ? value.attemptLineage
+          : execution.execution.attemptLineage;
+        const attemptId = lineage.attemptId;
+        const previousAttemptId = lineage.previousAttemptId;
+        const recordAdmissionTarget = (
+          writer: AgentInspectionWriterV1,
+          targetLineage: AgentWorkAttemptLineageV1,
+        ): boolean => writer.record("target", {
+          id: "admit:target",
+          kind: "target",
+          actor: "host",
+          recipient: "agent",
+          arguments: JSON.stringify({
+            generationType: targetLineage.target.generationType,
+            messageId: targetLineage.target.messageId,
+            swipeId: targetLineage.target.swipeId,
+            messageRevision: binding.messageGenerationRevision,
+            chatGenerationRevision: binding.chatGenerationRevision,
+          }),
+        }, { lifecycle: "ADMIT", status: "pending" }) !== null;
+        let inspectionWriter = createAgentInspectionWriter({
+          userId: value.userId,
+          chatId: value.chatId,
+          attemptId,
+          ...(previousAttemptId !== undefined ? { previousAttemptId } : {}),
+          runId: value.executionId,
+          turnSessionId: value.executionId,
+          generationId: value.executionId,
+          generationType: lineage.target.generationType,
+          targetMessageId: lineage.target.messageId,
+          targetSwipeId: lineage.target.swipeId,
+          hostCorrelationId: `agentic:${value.executionId}:${attemptId}`,
+          startedAt: lineage.createdAt,
+        });
+        let workspaceAttemptId = attemptId;
+        if (!recordAdmissionTarget(inspectionWriter, lineage)) {
+          // A supplied retry lineage can be externally admitted before its
+          // parent attempt has reached this host. Keep that lineage immutable
+          // on the execution, but give the workspace its own persisted
+          // turn-attempt row rather than weakening the owner/chat/turn check.
+          const canonicalAttemptId = execution.execution.id;
+          const canonicalLineage = execution.execution.attemptLineage;
+          inspectionWriter = createAgentInspectionWriter({
+            userId: value.userId,
+            chatId: value.chatId,
+            attemptId: canonicalAttemptId,
+            runId: value.executionId,
+            turnSessionId: value.executionId,
+            generationId: value.executionId,
+            generationType: execution.execution.targetKind,
+            targetMessageId: execution.execution.targetMessageId,
+            targetSwipeId: execution.execution.targetSwipeId,
+            hostCorrelationId: `agentic:${value.executionId}:${canonicalAttemptId}`,
+            startedAt: execution.execution.createdAt,
+          });
+          if (!recordAdmissionTarget(inspectionWriter, canonicalLineage)) {
+            throw new AgenticGenerationError(
+              "agentic_runtime_unavailable",
+              "Durable turn-attempt admission is unavailable.",
+              { phase: "ASSEMBLE", retryable: true },
+            );
+          }
+          workspaceAttemptId = canonicalAttemptId;
+        }
+        inspectionWriters.set(value.executionId, inspectionWriter);
+        inspectionWriter.record("condition", {
+          id: "admit:condition",
+          kind: "condition",
+          actor: "host",
+          recipient: "agent",
+          result: JSON.stringify({
+            presetId: decision.internal.binding.presetId,
+            configRevision: decision.internal.binding.configRevision,
+            bindingRevision: decision.internal.binding.bindingRevision,
+            connectionRevision: root?.candidateRevision ?? root?.revision ?? null,
+            deadlineAt,
+          }),
+        }, { lifecycle: "ADMIT", status: "running" });
+        const persistentAuthority = createPersistentWorkspaceHostAuthority();
+        const persistentWorkspace = ensurePersistentWorkspaceHost(persistentAuthority, {
+          userId: value.userId,
+          chatId: value.chatId,
+          objective: "Complete the requested turn",
+        });
+        const persistentSession = createPersistentWorkspaceHostTurnSession(persistentAuthority, {
+          userId: value.userId,
+          chatId: value.chatId,
+          workspaceId: persistentWorkspace.id,
+          turnSessionId: value.executionId,
+          turnId: value.executionId,
+          attemptId: workspaceAttemptId,
+          executionId: value.executionId,
+          expectedRevision: persistentWorkspace.revision,
+        });
+        persistentAssociations.set(value.executionId, {
+          authority: persistentAuthority,
+          workspaceId: persistentWorkspace.id,
+          workspaceRevision: persistentWorkspace.revision,
+          session: persistentSession,
         });
         executionOwnerToken = execution.ownerToken;
         pool.createPoolEntry({
@@ -2810,6 +3664,13 @@ function buildDependencies(): AgenticGenerationDependencies {
               });
               if (outcome.code === "too_late") return "too_late";
               if (outcome.code === "already_terminal") return "terminal";
+              inspectionWriters.get(value.executionId)?.record("stop", {
+                id: `stop:user:${value.executionId}`,
+                state: "accepted",
+                reason: "user_stop",
+                requestedAt: Date.now(),
+                correlation: { actorId: "owner", recipientId: "host" },
+              }, { status: "cancelling", reason: "user_stop" });
               // The durable CAS above wins the reversible phase gate. Abort
               // the live controller only after that CAS so provider/tool
               // streams observe the same terminal decision and cannot later
@@ -2833,12 +3694,24 @@ function buildDependencies(): AgenticGenerationDependencies {
           quota: DEFAULT_QUOTA, capabilities: workspaceCapabilities,
         });
         caps.set(value.executionId, workspaceCapabilities);
+        inspectionWriter.record("workspace", {
+          id: "workspace:linked",
+          workspaceId,
+          workspaceRevision: 0,
+          relation: "linked",
+          objectKind: "objective",
+          objectId: null,
+          sourceRevision: 0,
+          sourceDeleted: false,
+          provenanceDigest: null,
+        }, { lifecycle: "ASSEMBLE", status: "running" });
         return {
           id: value.executionId,
           ownerToken: execution.ownerToken,
           commitKey: execution.commitKey,
           phase: "ASSEMBLE",
           target: targetFromBinding(binding),
+          attemptLineage: lineage,
           signal: rootSignal,
           userId: value.userId,
           chatId: value.chatId,
@@ -2851,10 +3724,23 @@ function buildDependencies(): AgenticGenerationDependencies {
           credentialCarrier: carrier,
         };
       } catch (error) {
+        inspectionWriters.get(value.executionId)?.record("failure", {
+          id: `admit:failure:${value.executionId}`,
+          kind: "failure",
+          actor: "host",
+          recipient: "agent",
+          errorReason: error instanceof AgenticGenerationError ? inspectionReason(error.code) : "needs_attention",
+        }, {
+          lifecycle: "TERMINAL",
+          status: "terminal",
+          outcome: "failed",
+          reason: error instanceof AgenticGenerationError ? inspectionReason(error.code) : "needs_attention",
+        });
         console.error("[agentic] createExecution failed", error);
         stopRegistrations.get(value.executionId)?.();
         invalidateFrameCapabilitiesForTurn({ userId: value.userId, chatId: value.chatId, turnId: value.executionId });
         stopRegistrations.delete(value.executionId);
+        persistentAssociations.delete(value.executionId);
         caps.delete(value.executionId);
         snapshots.delete(value.executionId);
         plans.delete(value.executionId);
@@ -2891,7 +3777,40 @@ function buildDependencies(): AgenticGenerationDependencies {
         expectedPhase: expected,
         nextPhase: next,
       });
-      if (result.execution.phase === next) return { ...execution, phase: next };
+      if (result.execution.phase === next) {
+        switch (next) {
+          case "ASSEMBLE":
+          case "WORK":
+          case "RENDER":
+            syncPersistentSession(execution.id, next, "running");
+            break;
+          case "COMPLETE":
+            syncPersistentSession(execution.id, "PREPARE_COMMIT", "waiting");
+            break;
+          case "COMMITTING":
+            syncPersistentSession(execution.id, "COMMIT", "running");
+            break;
+          case "COMMITTED":
+            syncPersistentSession(execution.id, "TERMINAL", "terminal", "completed");
+            break;
+          case "CANCELLED":
+            syncPersistentSession(execution.id, "TERMINAL", "terminal", "stopped");
+            break;
+          case "TIMED_OUT":
+            syncPersistentSession(execution.id, "TERMINAL", "terminal", "failed");
+            break;
+          case "EXHAUSTED":
+            syncPersistentSession(execution.id, "TERMINAL", "terminal", "exhausted");
+            break;
+          case "FAILED":
+          case "COMMIT_FAILED":
+            syncPersistentSession(execution.id, "TERMINAL", "terminal", "failed");
+            break;
+          default:
+            break;
+        }
+        return { ...execution, phase: next };
+      }
       const phase = result.execution.phase;
       const code = phase === "CANCELLED"
         ? "agentic_cancelled"
@@ -2946,6 +3865,32 @@ function buildDependencies(): AgenticGenerationDependencies {
         });
       }
       snapshots.set(executionId, snapshot);
+      const inspectionWriter = inspectionWriters.get(executionId);
+      inspectionWriter?.record("input", {
+        id: "assemble:input",
+        kind: "input",
+        actor: "owner",
+        recipient: "host",
+        arguments: input.userInput ?? "",
+        result: JSON.stringify({
+          target: snapshot.target,
+          inputRevisions: runtimeInputRevisions(snapshot),
+          limits: snapshot.limits,
+        }),
+      }, { lifecycle: "ASSEMBLE", status: "running" });
+      if (input.userInput) {
+        inspectionWriter?.record("prompt", {
+          id: "prompt:root:user_input",
+          sourceId: "turn_input",
+          sourceRevision: 0,
+          destination: "root_work",
+          role: "user",
+          included: true,
+          content: input.userInput,
+          contentDigest: createHash("sha256").update(input.userInput).digest("hex"),
+          omissionReason: null,
+        }, { lifecycle: "ASSEMBLE", status: "running" });
+      }
       return snapshot;
     },
     compileAssemblyPlan: async (snapshot, input, _decision, signal, executionId) => {
@@ -2958,9 +3903,25 @@ function buildDependencies(): AgenticGenerationDependencies {
         timeoutMs,
       });
       plans.set(executionId, plan);
+      const inspectionWriter = inspectionWriters.get(executionId);
+      recordInspectionPrompts(inspectionWriter, plan.workPolicyMessages, "root_work", "ASSEMBLE");
+      recordInspectionPrompts(inspectionWriter, plan.workspaceUsageMessages, "root_work", "ASSEMBLE");
+      recordInspectionPrompts(inspectionWriter, plan.completionCriteriaMessages, "completion_handoff", "ASSEMBLE");
+      recordInspectionPrompts(inspectionWriter, plan.renderPolicyMessages, "render", "ASSEMBLE");
+      inspectionWriter?.record("turn_session", {
+        id: "assemble:policy",
+        kind: "policy",
+        detail: JSON.stringify({
+          workPolicy: plan.workPolicyMessages?.length ?? 0,
+          workspaceUsage: plan.workspaceUsageMessages?.length ?? 0,
+          completionCriteria: plan.completionCriteriaMessages?.length ?? 0,
+          renderPolicy: plan.renderPolicyMessages?.length ?? 0,
+          inputRevisionDigest: canonicalInputRevisionDigest(runtimeInputRevisions(snapshot)),
+        }),
+      }, { lifecycle: "ASSEMBLE", status: "running" });
       return plan;
     },
-    createContextRuntime: (snapshot, _input, _decision, _signal, _executionId) => {
+    createContextRuntime: (snapshot, _input, _decision, _signal, executionId) => {
       const contextSnapshot = snapshot.contextPackSnapshot;
       if (!contextSnapshot) {
         throw new AgenticGenerationError("agentic_preflight_failed", "Assembly snapshot is missing context candidates.", { phase: "ASSEMBLE" });
@@ -2969,12 +3930,14 @@ function buildDependencies(): AgenticGenerationDependencies {
       const tracker = new ContextPackInputRevisionTracker();
       const invalidationSink = createCognitionContextInvalidationSink();
       const budget = new ContextPackToolBudget();
+      const inspection = inspectionWriters.get(executionId);
       // Cognition is the only authority that activates context candidates.
       // Start empty; WORK refreshes this capability from its frozen graph.
       let current = createContextToolCapability(contextSnapshot, reader, {
         budget,
         revisionTracker: tracker,
         invalidationSink,
+        ...(inspection ? { inspection } : {}),
         activeCandidates: { contextPackRequirements: [] },
       });
       const operationGate = current.operationGate;
@@ -2995,6 +3958,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             operationGate,
             revisionTracker: tracker,
             invalidationSink,
+            ...(inspection ? { inspection } : {}),
             activeCandidates: {
               contextPackRequirements: requirements.map((requirement) => Object.freeze({
                 ruleId: requirement.ruleId,
@@ -3023,14 +3987,59 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (!workspaceCapabilities) {
         throw new AgenticGenerationError("agentic_runtime_unavailable", "Workspace capabilities were not admitted.", { phase: "WORK" });
       }
+      const persistentAssociation = persistentAssociations.get(execution.id);
+      if (persistentAssociation) {
+        for (const child of plan.children) {
+          if (!child.required) continue;
+          const currentWorkspace = getPersistentWorkspaceById({
+            userId: persistentAssociation.session.userId,
+            workspaceId: persistentAssociation.workspaceId,
+          });
+          persistentAssociation.workspaceRevision = currentWorkspace.revision;
+          createPersistentWorkspaceHostTask(persistentAssociation.authority, {
+            userId: persistentAssociation.session.userId,
+            chatId: persistentAssociation.session.chatId,
+            workspaceId: persistentAssociation.workspaceId,
+            expectedRevision: persistentAssociation.workspaceRevision,
+            id: `${execution.id}:task:${child.childId}`,
+            turnSessionId: persistentAssociation.session.id,
+            title: `Required task ${child.slotIndex + 1}`,
+            objective: child.task,
+            state: "pending",
+            required: true,
+            dependencyIds: [],
+          });
+          persistentAssociation.workspaceRevision = getPersistentWorkspaceById({
+            userId: persistentAssociation.session.userId,
+            workspaceId: persistentAssociation.workspaceId,
+          }).revision;
+        }
+      }
       const coordinatorContextRuntime = requireCoordinatorContextRuntime(contextRuntime);
+      if (runtimeSnapshot.contextPacks.cognitionGraph && !coordinatorContextRuntime) {
+        throw new AgenticGenerationError(
+          "agentic_runtime_unavailable",
+          "Cognition requires the admitted context runtime.",
+          { phase: "WORK" },
+        );
+      }
       if (coordinatorContextRuntime) contextRuntimes.set(execution.id, coordinatorContextRuntime);
-      const cognitionRuntime = await withToolPermit(
-        input.userId,
-        () => createCognitionRuntimeForTurn(runtimeExecution, runtimeSnapshot, workspaceCapabilities),
-        phaseSignal,
-        runtimeExecution.owner.ledger,
-      );
+      const cognitionRuntime = coordinatorContextRuntime
+        ? await withToolPermit(
+            input.userId,
+            () => createCognitionRuntimeForTurn(
+              runtimeExecution,
+              runtimeSnapshot,
+              plan,
+              workspaceCapabilities,
+              coordinatorContextRuntime,
+              phaseSignal,
+            ),
+            phaseSignal,
+            runtimeExecution.owner.ledger,
+          )
+        : undefined;
+      if (cognitionRuntime) cognitionRuntimes.set(execution.id, cognitionRuntime);
       const contextCapability = coordinatorContextRuntime
         ? {
           list: (args: Record<string, unknown>, toolSignal: AbortSignal) =>
@@ -3056,12 +4065,79 @@ function buildDependencies(): AgenticGenerationDependencies {
             ),
         }
         : undefined;
-      if (cognitionRuntime) {
-        if (!coordinatorContextRuntime || !contextCapability) throw new Error("agentic_context_runtime_missing");
-        runtimeExecution.workspaceRevision = cognitionRuntime.initialActivation.workspaceRevision;
-        await contextCapability.refreshContextCapability!(cognitionRuntime.initialActivation.contextPackRequirements);
-        const workActivation = await enterCognitionPhase(runtimeExecution, cognitionRuntime, "WORK", workspaceCapabilities, phaseSignal);
-        await contextCapability.refreshContextCapability!(workActivation.contextPackRequirements);
+      const selectedRequirements = selectedContextPackRequirements(runtimeSnapshot);
+      if (cognitionRuntime && !contextCapability) throw new Error("agentic_context_runtime_missing");
+      let workActivation: CognitionRuntimeActivationV1 | undefined;
+      if (contextCapability) {
+        if (cognitionRuntime) {
+          runtimeExecution.workspaceRevision = cognitionRuntime.initialActivation.workspaceRevision;
+          await contextCapability.refreshContextCapability!(mergeContextPackRequirements(
+            selectedRequirements,
+            cognitionRuntime.initialActivation.contextPackRequirements,
+          ));
+          workActivation = await enterCognitionPhase(runtimeExecution, cognitionRuntime, "WORK", workspaceCapabilities, phaseSignal);
+          await contextCapability.refreshContextCapability!(mergeContextPackRequirements(
+            selectedRequirements,
+            workActivation.contextPackRequirements,
+          ));
+        } else {
+          await contextCapability.refreshContextCapability!(selectedRequirements);
+        }
+      }
+      const cortexInspectionWriter = inspectionWriters.get(execution.id);
+      const cortexAdmissionInput = cortexAuthorizedSnapshotForWork(runtimeExecution, runtimeSnapshot, cognitionRuntime);
+      const cortexCorrelation = {
+        turnSessionId: execution.id,
+        runId: execution.id,
+        attemptId: cortexAdmissionInput.attemptId,
+        chatId: runtimeSnapshot.chatId,
+        generationId: runtimeSnapshot.generationId,
+        messageId: runtimeSnapshot.target.messageId ?? null,
+        swipeId: runtimeSnapshot.target.swipeId ?? null,
+        actorId: "host",
+        recipientId: "cortex",
+        phase: "WORK" as const,
+        taskId: null,
+        toolId: null,
+        parentId: null,
+        hostCorrelationId: `agentic:${execution.id}:${cortexAdmissionInput.attemptId}:cortex:WORK`,
+        hostSequence: 0,
+      };
+      const cortexAdmission = admitCortexSidecar({
+        ownerId: runtimeSnapshot.userId,
+        attemptId: cortexAdmissionInput.attemptId,
+        scope: cortexAdmissionInput.snapshot.scope,
+        snapshot: cortexAdmissionInput.snapshot,
+        checkpoint: WORK_CORTEX_CHECKPOINT,
+        revision: cortexAdmissionInput.snapshot.revision,
+        required: cortexAdmissionInput.required,
+        requestId: createCortexSidecarRequestId(),
+        correlation: cortexCorrelation,
+        signal: phaseSignal,
+      });
+      let cortexContext: CortexSidecarAcceptedV1 | undefined;
+      try {
+        const cortexResult = await cortexAdmission.read({
+          ownerId: runtimeSnapshot.userId,
+          attemptId: cortexAdmissionInput.attemptId,
+          snapshotId: cortexAdmissionInput.snapshot.snapshotId,
+          checkpoint: WORK_CORTEX_CHECKPOINT,
+          revision: cortexAdmissionInput.snapshot.revision,
+          scope: cortexAdmissionInput.snapshot.scope,
+          signal: phaseSignal,
+        });
+        recordCortexInspection(cortexInspectionWriter, cortexResult);
+        if (cortexResult.kind === "accepted") cortexContext = cortexResult;
+      } catch (error) {
+        if (error instanceof CortexSidecarError) {
+          recordCortexInspection(cortexInspectionWriter, {
+            kind: "omission",
+            omission: error.omission,
+            receipt: error.receipt,
+          });
+          throw mapCortexRequiredError(error);
+        }
+        throw error;
       }
       const config = frozenConfig(runtimeSnapshot.agentConfig);
       const available = new Set(runtimeSnapshot.availability.toolIds.filter(
@@ -3069,6 +4145,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       ));
       const rootToolIds = (config.mainToolIds ?? []).filter((id) => available.has(id));
       const rootLoreScope = normalizeLoreScope(config.mainLoreScope);
+      const inspectionWriter = inspectionWriters.get(execution.id);
       const toolSnapshot = makeToolSnapshot(runtimeSnapshot, phaseSignal);
       // The root grant is exactly the authored main grant narrowed by snapshot
       // availability. A child never inherits it.
@@ -3079,6 +4156,7 @@ function buildDependencies(): AgenticGenerationDependencies {
               snapshot: toolSnapshot,
               grant: { toolIds: grantToolIds, loreScope },
               signal: toolSignal,
+              ...(inspectionWriter ? { inspection: inspectionWriter } : {}),
             }), toolSignal, runtimeExecution.owner.ledger),
       });
       const coreExecutor = executorFor(rootToolIds, rootLoreScope);
@@ -3114,18 +4192,129 @@ function buildDependencies(): AgenticGenerationDependencies {
       );
       const { parameters: effectiveParameters, maxOutputTokens: rootOutputTokenLimit } =
         effectiveRootGenerationParameters(runtimeSnapshot, input);
+      const councilProfile = internal.councilProfile;
+      const councilSettings = councilProfile?.council_settings;
+      const councilAdmission: WorkCouncilAdmission | undefined =
+        councilSettings?.councilMode === true
+          && councilSettings.toolsSettings.mode === "sidecar"
+          && councilSettings.members.length > 0
+          && councilProfile !== undefined
+          ? {
+            userId: runtimeSnapshot.userId,
+            chatId: runtimeSnapshot.chatId,
+            requestId: `council:${execution.id}`,
+            required: false,
+            settings: councilProfile.council_settings,
+            sidecarSettings: councilProfile.sidecar_settings,
+            connection: internal.councilConnection === null || internal.councilConnection === undefined
+              ? null
+              : {
+                concreteId: internal.councilConnection.concreteId,
+                provider: internal.councilConnection.provider,
+                model: internal.councilConnection.model,
+                revision: internal.councilConnection.revision,
+                fingerprint: internal.councilConnection.fingerprint,
+              },
+            toolDefinitions: [],
+            connectionRevision: internal.councilConnection?.revision ?? null,
+            correlation: {
+              turnSessionId: execution.id,
+              runId: execution.id,
+              attemptId: cortexAdmissionInput.attemptId,
+              chatId: runtimeSnapshot.chatId,
+              generationId: runtimeSnapshot.generationId,
+              messageId: runtimeSnapshot.target.messageId ?? null,
+              swipeId: runtimeSnapshot.target.swipeId ?? null,
+              actorId: "host",
+              recipientId: "council",
+              phase: "WORK",
+              taskId: null,
+              toolId: null,
+              parentId: null,
+              hostCorrelationId: `agentic:${execution.id}:${cortexAdmissionInput.attemptId}:council:WORK`,
+              hostSequence: 0,
+            },
+          }
+          : undefined;
+      const council = councilAdmission
+        ? createWorkCouncilCapability(councilAdmission)
+        : undefined;
+      const effectiveWorkPolicyMessages = workActivation?.policySurface?.promptInspection
+        ? selectEffectiveLoomPolicyMessagesV1(
+            plan.workPolicyMessages,
+            workActivation.policySurface.promptInspection,
+            "workPolicy",
+            runtimeSnapshot.limits,
+          )
+        : plan.workPolicyMessages;
+      const effectiveWorkspaceUsageMessages = workActivation?.policySurface?.promptInspection
+        ? selectEffectiveLoomPolicyMessagesV1(
+            plan.workspaceUsageMessages,
+            workActivation.policySurface.promptInspection,
+            "workspaceUsage",
+            runtimeSnapshot.limits,
+          )
+        : plan.workspaceUsageMessages;
       const options: AgenticWorkOptions = {
         rootFrameId: execution.id,
         trustedAssemblyLimits: runtimeSnapshot.limits,
         plan,
         connectionId: root.concreteId ?? root.logicalId ?? null,
         model: root.model ?? "",
+        dispatch: makeWorkProvider(
+          input.userId,
+          root,
+          effectiveParameters,
+          runtimeExecution.owner.ledger,
+          frozenCredentialFor(runtimeExecution, root),
+        ),
         signal: phaseSignal,
         deadlineAt: runtimeExecution.deadlineAt,
-        dispatch: makeWorkProvider(input.userId, root, effectiveParameters, runtimeExecution.owner.ledger, frozenCredentialFor(runtimeExecution, root)),
+        inspection: inspectionWriter,
+        ...(plan.customPhasePlan && plan.customPhasePlan.phases.length > 0
+          ? {
+            phaseEvaluationContext: {
+              generationType: runtimeSnapshot.target.generationType,
+              phase: "WORK" as const,
+              presetVariables: cognitionValues(runtimeSnapshot.variables.preset),
+              participantFacts: Object.freeze({
+                hasPersona: runtimeSnapshot.participants.persona !== null,
+                groupSize: runtimeSnapshot.participants.group.length,
+                hasGroup: runtimeSnapshot.participants.group.length > 0,
+              }),
+              availableTools: runtimeSnapshot.availability.toolIds,
+              taskTransitions: Object.freeze({}),
+            },
+            phaseAdmittedCapabilities: Object.freeze([
+              ...(rootToolIds.length > 0 ? ["core_retrieval" as const] : []),
+              ...(contextCapability ? ["context_retrieval" as const] : []),
+              ...(workspaceCapabilities.allowed.some((operation) => operation === "read_section" || operation === "read_page") ? ["workspace_read" as const] : []),
+              ...(workspaceCapabilities.allowed.some((operation) => operation !== "read_section" && operation !== "read_page") ? ["workspace_write" as const] : []),
+              ...(delegatable.length > 0 ? ["delegation" as const] : []),
+              ...(cortexContext ? ["cortex" as const] : []),
+              ...(council ? ["council" as const] : []),
+            ]),
+            phaseRevision: runtimeExecution.workspaceRevision ?? 0,
+          }
+          : {}),
+        ...(cortexContext ? { cortexContext } : {}),
+        ...(council ? { council } : {}),
         coreToolIds: rootToolIds,
-        workPolicyMessages: plan.workPolicyMessages,
-        workspaceUsageMessages: plan.workspaceUsageMessages,
+        workPolicyMessages: (() => {
+          const packText = selectedContextPackFactLines(
+            runtimeSnapshot,
+            effectiveOnDemandContextPackKeys(workActivation, ["workPolicy", "workspaceUsage"]),
+          ).join("\n");
+          if (!packText) return effectiveWorkPolicyMessages;
+          return Object.freeze([
+            Object.freeze({
+              role: "system" as const,
+              segments: Object.freeze([{ kind: "literal" as const, text: packText }]),
+            }),
+            ...effectiveWorkPolicyMessages,
+          ]);
+        })(),
+        workspaceUsageMessages: effectiveWorkspaceUsageMessages,
         completionCriteriaMessages: plan.completionCriteriaMessages,
         renderPolicyMessages: plan.renderPolicyMessages,
         coreSnapshot: toolSnapshot,
@@ -3166,6 +4355,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             content: result.content,
             status: result.status,
             errorCode: result.code,
+            ...(result.usage ? { usage: result.usage } : {}),
             ...(result.workspaceRevision !== undefined ? { workspaceRevision: result.workspaceRevision } : {}),
           };
           }),
@@ -3215,9 +4405,10 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (!workspaceCapabilities) throw new Error("agentic_workspace_capability_missing");
       const cognitionRuntime = cognitionRuntimes.get(execution.id);
       const contextRuntime = contextRuntimes.get(execution.id);
+      let renderActivation: CognitionRuntimeActivationV1 | undefined;
       if (cognitionRuntime) {
         if (!contextRuntime) throw new Error("agentic_context_runtime_missing");
-        await enterCognitionPhase(runtimeExecution, cognitionRuntime, "RENDER", workspaceCapabilities, runtimeExecution.signal ?? signal);
+        renderActivation = await enterCognitionPhase(runtimeExecution, cognitionRuntime, "RENDER", workspaceCapabilities, runtimeExecution.signal ?? signal);
       }
       const root = internalDecision(decision).internal.rootConnection;
       if (!root) throw new Error("agentic_provider_failure");
@@ -3263,12 +4454,24 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (!frame || frame.handoff.workspaceRevision !== runtimeExecution.workspaceRevision) {
         throw new Error("workspace_context_projection_stale");
       }
+      const effectiveRenderPolicyMessages = renderActivation?.policySurface?.promptInspection
+        ? selectEffectiveLoomPolicyMessagesV1(
+            plan.renderPolicyMessages,
+            renderActivation.policySurface.promptInspection,
+            "renderPolicy",
+            runtimeSnapshot.limits,
+          )
+        : plan.renderPolicyMessages;
       const renderMessages = buildAgenticRenderPolicyMessages({
         snapshotMessages: runtimeSnapshot.messages,
-        renderPolicyMessages: plan.renderPolicyMessages,
+        renderPolicyMessages: effectiveRenderPolicyMessages,
         renderGuidance: work.renderGuidance,
         character: runtimeSnapshot.participants.character,
         worldInfo: runtimeSnapshot.worldInfo,
+        contextPackLines: selectedContextPackFactLines(
+          runtimeSnapshot,
+          effectiveOnDemandContextPackKeys(renderActivation, ["renderPolicy"]),
+        ),
         maxFactBytes: runtimeSnapshot.limits.maxOperationBytes,
       });
       const { parameters: effectiveParameters, maxOutputTokens: rootOutputTokenLimit } =
@@ -3292,11 +4495,49 @@ function buildDependencies(): AgenticGenerationDependencies {
       };
       pool.setPoolStatus(execution.id, "streaming");
       pool.markStreamingStarted(execution.id);
+      const countRenderTokens = await resolveRenderCountTokens(root.model ?? undefined);
+      const captureRenderBreakdown = (request: GenerationRequest): void => {
+        const breakdownMessages = request.messages.map((message) => {
+          const content = typeof message.content === "string"
+            ? message.content
+            : message.content
+                .map((part) => part.type === "text" ? part.text : "")
+                .join("");
+          return {
+            role: message.role,
+            content: redactAgentOutputFrames(content),
+          };
+        });
+        const breakdownEntries = breakdownMessages.map((message, index) => ({
+          name: `Render message ${index + 1}`,
+          type: "utility" as const,
+          tokens: countRenderTokens(message.content),
+          role: message.role,
+          content: message.content,
+        }));
+        renderBreakdowns.set(execution.id, {
+          entries: breakdownEntries,
+          messages: breakdownMessages,
+          totalTokens: breakdownEntries.reduce((total, entry) => total + entry.tokens, 0),
+          model: request.model,
+          provider: root.provider ?? "",
+          parameters: request.parameters ?? {},
+          ...(renderActivation?.policySurface?.promptInspection
+            ? { loomPromptInspection: renderActivation.policySurface.promptInspection }
+            : {}),
+        });
+      };
       let result: Awaited<ReturnType<typeof runAgenticRenderPhaseV1>>;
       try {
         result = await runAgenticRenderPhaseV1(renderInput, {
-          dispatch: makeRenderProvider(input.userId, root, runtimeExecution.owner.ledger, frozenCredentialFor(runtimeExecution, root)),
-          countTokens: await resolveRenderCountTokens(root.model ?? undefined),
+          dispatch: makeRenderProvider(
+            input.userId,
+            root,
+            runtimeExecution.owner.ledger,
+            frozenCredentialFor(runtimeExecution, root),
+            captureRenderBreakdown,
+          ),
+          countTokens: countRenderTokens,
           emitProvisional: ({ key, text }) => {
             if (text.length === 0) return;
             const appended = pool.appendPoolContent(key.turnId, text);
@@ -3350,9 +4591,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       const contextRuntime = contextRuntimes.get(execution.id);
       if (cognitionRuntime) {
         if (!contextRuntime) throw new Error("agentic_context_runtime_missing");
-        console.error("[agentic] PREPARE_COMMIT enterCognitionPhase start", execution.id);
         await enterCognitionPhase(runtimeExecution, cognitionRuntime, "PREPARE_COMMIT", workspaceCapabilities, runtimeExecution.signal ?? execution.signal);
-        console.error("[agentic] PREPARE_COMMIT enterCognitionPhase done", execution.id);
       }
       const runtimeSnapshot = requireRuntimeSnapshot(snapshot);
       const binding = bindings.get(execution.id);
@@ -3361,15 +4600,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         HOST_PREPARATION_LIMITS_V1.maxWallClockMs,
         Math.max(1, runtimeExecution.deadlineAt - Date.now()),
       );
-      console.error("[agentic] PREPARE_COMMIT prepareAgentRender start", execution.id, timeoutMs);
       const preparedInput = prepareInput(input, runtimeExecution, runtimeSnapshot, plan, render, binding);
-      console.error("[agentic] PREPARE_COMMIT prepareInput done", execution.id);
-      try {
-        console.error("[agentic] PREPARE_COMMIT payload bytes", Buffer.byteLength(JSON.stringify(preparedInput)));
-      } catch (error) {
-        console.error("[agentic] PREPARE_COMMIT payload serialize failed", error);
-        throw error;
-      }
       const result = await prepareAgentRender(
         preparedInput,
         {
@@ -3378,7 +4609,6 @@ function buildDependencies(): AgenticGenerationDependencies {
           timeoutMs,
         },
       );
-      console.error("[agentic] PREPARE_COMMIT prepareAgentRender done", execution.id);
       const content = result.content.kind === "text"
         ? result.content.text
         : result.content.parts?.map((part) => part.kind === "text" ? part.text : "").join("");
@@ -3397,7 +4627,6 @@ function buildDependencies(): AgenticGenerationDependencies {
       };
     },
     commit: async ({ execution, input, decision, snapshot, plan, work, prepared }) => {
-      console.error("[agentic] PREPARE_COMMIT commit start", execution.id);
       const runtimeExecution = requireRuntimeExecution(execution);
       const workspaceCapabilities = caps.get(execution.id);
       if (!workspaceCapabilities) throw new Error("agentic_workspace_capability_missing");
@@ -3505,11 +4734,13 @@ function buildDependencies(): AgenticGenerationDependencies {
         : undefined;
       const frozenCharacterName = participantName(frozenCharacter, "Assistant");
       const normalMessageAttribution = binding.target === "normal"
-        ? {
-          name: frozenCharacterName,
-          ...(frozenCharacterId ? { extra: { character_id: frozenCharacterId } } : {}),
-        }
+        ? { name: frozenCharacterName }
         : {};
+      const messageExtra = {
+        generation_id: execution.id,
+        generation_type: runtimeSnapshot.target.generationType,
+        ...(frozenCharacterId ? { character_id: frozenCharacterId } : {}),
+      };
       const workspaceUsage = renderProjection.workspaceUsage;
       const workspaceArtifacts = frozenWorkspaceArtifacts(runtimeExecution, fixedWorkspaceRevision);
       const terminalHandoff = renderProjection.terminalHandoff;
@@ -3540,7 +4771,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           unresolvedIds: work.unresolvedIds ?? [],
           renderGuidance: work.renderGuidance,
         },
-        message: { content: prepared.content, ...normalMessageAttribution },
+        message: { content: prepared.content, ...normalMessageAttribution, extra: messageExtra },
         workspaceId: runtimeExecution.workspaceId,
         workspaceRevision: fixedWorkspaceRevision,
         signal: execution.signal,
@@ -3559,6 +4790,98 @@ function buildDependencies(): AgenticGenerationDependencies {
         input.userId,
         () => commitAgenticTurnV1(commitInput),
       );
+      const renderUsage = prepared.usage
+        ? boundedProviderUsage({
+          promptTokens: prepared.usage.promptTokens,
+          completionTokens: prepared.usage.completionTokens,
+          totalTokens: prepared.usage.totalTokens,
+        })
+        : undefined;
+      const renderBreakdown = renderBreakdowns.get(execution.id);
+      if (result.status === "committed" && result.messageId && renderBreakdown) {
+        try {
+          breakdownSvc.storeBreakdown(
+            input.userId,
+            result.messageId,
+            input.chatId,
+            {
+              assemblySurface: "WORK",
+              entries: renderBreakdown.entries,
+              messages: renderBreakdown.messages,
+              totalTokens: renderBreakdown.totalTokens,
+              chatHistoryTokens: 0,
+              maxContext: 0,
+              model: renderBreakdown.model,
+              provider: renderBreakdown.provider,
+              parameters: renderBreakdown.parameters,
+              ...(renderUsage
+                ? {
+                    usage: {
+                      prompt_tokens: renderUsage.promptTokens,
+                      completion_tokens: renderUsage.completionTokens,
+                      total_tokens: renderUsage.totalTokens,
+                    },
+                  }
+                : {}),
+              ...(renderBreakdown.loomPromptInspection === undefined
+                ? {}
+                : { loomPromptInspection: renderBreakdown.loomPromptInspection }),
+              tokenizer_name: null,
+            },
+          );
+        } catch (error) {
+          console.warn("[agentic] Failed to store WORK prompt breakdown:", error);
+        }
+      }
+      if (result.status === "committed" && renderUsage) {
+        terminalUsages.set(execution.id, {
+          inputTokens: renderUsage.promptTokens,
+          outputTokens: renderUsage.completionTokens,
+          totalTokens: renderUsage.totalTokens,
+          toolCalls: workUsage.toolCalls,
+          childInvocations: workUsage.childInvocations,
+        });
+      }
+      const commitInspectionWriter = inspectionWriters.get(execution.id);
+      if (renderUsage) {
+        commitInspectionWriter?.record("usage", {
+          version: 1,
+          id: `usage:render:${execution.id}`,
+          source: "final",
+          layer: "root",
+          correlation: { parentId: "root" },
+          inputTokens: renderUsage.promptTokens,
+          outputTokens: renderUsage.completionTokens,
+          totalTokens: renderUsage.totalTokens,
+          toolCalls: 0,
+          childInvocations: 0,
+          canonical: true,
+        }, { lifecycle: "COMMIT", status: "waiting" });
+      }
+      commitInspectionWriter?.record("workspace", {
+        id: `workspace:publication:${execution.id}`,
+        workspaceId: runtimeExecution.workspaceId,
+        workspaceRevision: fixedWorkspaceRevision,
+        relation: "published",
+        objectKind: "publication",
+        objectId: result.messageId ?? null,
+        sourceRevision: fixedWorkspaceRevision,
+        sourceDeleted: false,
+        provenanceDigest: null,
+      }, { lifecycle: "COMMIT", status: "waiting" });
+      commitInspectionWriter?.record("commit", {
+        id: `commit:${execution.id}`,
+        kind: "commit",
+        actor: "host",
+        recipient: "owner",
+        result: JSON.stringify({
+          status: result.status,
+          receiptId: result.receipt.id,
+          messageId: result.messageId,
+          swipeId: result.swipeId,
+        }),
+        correlation: { parentId: "root" },
+      }, { lifecycle: "COMMIT", status: "waiting" });
       if (result.status === "committed" && cognitionRuntime) {
         const committedActivation = await enterCognitionPhase(runtimeExecution, cognitionRuntime, "COMMITTED", workspaceCapabilities, runtimeExecution.signal ?? execution.signal);
         if (contextRuntime) {
@@ -3583,6 +4906,26 @@ function buildDependencies(): AgenticGenerationDependencies {
       return { receiptId: result.receipt.id, commitKey: execution.commitKey, messageId: result.messageId ?? undefined, swipeId: result.swipeId ?? undefined, summary: typeof result.receipt.summary === "object" ? result.receipt.summary as Record<string, unknown> : undefined };
     },
     publishPhase: (event) => {
+      const phaseWriter = inspectionWriters.get(event.executionId);
+      phaseWriter?.record("milestone", {
+        id: `phase:${event.executionId}:${event.phase}`,
+        kind: "milestone",
+        actor: "host",
+        recipient: "owner",
+        result: JSON.stringify({
+          phase: event.phase,
+          workPhase: event.workPhase ?? null,
+          workStatus: event.workStatus ?? null,
+          workOutcome: event.workOutcome ?? null,
+          reason: event.reason ?? null,
+        }),
+        correlation: { parentId: "root" },
+      }, {
+        lifecycle: inspectionLifecycleForPhase(event.phase),
+        status: inspectionStatusForPhase(event.phase, event.workStatus),
+        reason: inspectionReason(event.reason),
+        updatedAt: Date.now(),
+      });
       const binding = bindings.get(event.executionId);
       const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
       const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
@@ -3594,6 +4937,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         generationType: event.target.generationType,
         targetMessageId,
         targetSwipeId,
+        ...(event.attemptLineage ? { attemptLineage: event.attemptLineage } : {}),
         status: event.phase,
         ...(workUsages.get(event.executionId) ? { usage: workUsages.get(event.executionId) } : {}),
       };
@@ -3613,14 +4957,51 @@ function buildDependencies(): AgenticGenerationDependencies {
             ? "TIMED_OUT"
             : event.status === "exhausted"
               ? "EXHAUSTED"
-              : event.status === "failed"
+              : event.status === "failed" || event.status === "rejected"
                 ? "FAILED"
                 : event.phase;
+      const terminalInspection = ensureInspectionWriter(event);
+      const terminalOutcome = event.status === "completed"
+        ? "completed"
+        : event.status === "cancelled"
+          ? "stopped"
+          : event.status === "timed_out" || event.status === "exhausted"
+            ? "exhausted"
+            : event.status === "rejected"
+              ? "rejected"
+              : "failed";
+      const terminalReason = terminalInspectionReason(event.status, event.reason, event.errorCode);
+      const terminalAt = Date.now();
+      terminalInspection.writer.record("terminal", {
+        id: `terminal:${event.executionId}`,
+        kind: "terminal",
+        actor: "host",
+        recipient: "owner",
+        result: JSON.stringify({
+          status: event.status,
+          phase: event.phase,
+          errorCode: event.errorCode ?? null,
+          receiptId: event.receipt?.receiptId ?? null,
+        }),
+        errorReason: terminalReason,
+        correlation: { parentId: "root" },
+      }, {
+        lifecycle: "TERMINAL",
+        status: "terminal",
+        outcome: terminalOutcome,
+        reason: terminalReason,
+        terminalAt,
+        updatedAt: terminalAt,
+        terminalReceipt: event.receipt ?? null,
+        ...(terminalInspection.recovered ? { reconciliation: "recovered" as const } : {}),
+      });
+      syncPersistentSession(event.executionId, "TERMINAL", "terminal", terminalOutcome);
       const binding = bindings.get(event.executionId);
       const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
       const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
       const terminalMessageId = event.receipt?.messageId ?? null;
       const terminalSwipeId = event.receipt?.swipeId ?? null;
+      const terminalUsage = terminalUsages.get(event.executionId) ?? workUsages.get(event.executionId);
       const projection: AgentRunProjectionInputV2 = {
         userId: event.userId,
         chatId: event.chatId,
@@ -3629,6 +5010,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         generationType: event.target.generationType,
         targetMessageId,
         targetSwipeId,
+        ...(event.attemptLineage ? { attemptLineage: event.attemptLineage } : {}),
         status,
         terminalHandoff: {
           version: 2,
@@ -3638,8 +5020,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           messageRevision: null,
           swipeRevision: null,
         },
-        error: event.errorCode ? { code: event.errorCode } : null,
-        ...(workUsages.get(event.executionId) ? { usage: workUsages.get(event.executionId) } : {}),
+        ...(terminalUsage ? { usage: terminalUsage } : {}),
       };
       const messageId = event.receipt?.messageId ?? undefined;
       const content = pool.getPoolEntry(event.executionId)?.content ?? "";
@@ -3673,7 +5054,9 @@ function buildDependencies(): AgenticGenerationDependencies {
         );
       } finally {
         try {
-          if (!getTurnExecution(event.executionId, event.userId)) {
+          const existingExecution = getTurnExecution(event.executionId, event.userId);
+          if (!existingExecution && event.attemptLineage?.previousAttemptId) return;
+          if (!existingExecution) {
             const fallbackBinding = bindings.get(event.executionId) ?? bindLiveTarget(event.userId, event.chatId, event.target);
             bindings.set(event.executionId, fallbackBinding);
             createTurnExecution({
@@ -3682,6 +5065,7 @@ function buildDependencies(): AgenticGenerationDependencies {
               chatId: event.chatId,
               generationId: event.executionId,
               target: fallbackBinding,
+              attemptLineage: event.attemptLineage,
               worldLoreSnapshotId: null,
               worldLoreRevision: 0,
               mode: "agentic",
@@ -3711,16 +5095,21 @@ function buildDependencies(): AgenticGenerationDependencies {
         });
       }
       stopRegistrations.get(id)?.();
+      persistentAssociations.delete(id);
       stopRegistrations.delete(id);
       snapshots.delete(id);
       cognitionRuntimes.delete(id);
       contextRuntimes.delete(id);
       plans.delete(id);
       works.delete(id);
+      renderProjections.delete(id);
+      renderBreakdowns.delete(id);
       renderFrames.delete(id);
       renders.delete(id);
-      renderProjections.delete(id);
+      workUsages.delete(id);
+      terminalUsages.delete(id);
       caps.delete(id);
+      inspectionWriters.delete(id);
       bindings.delete(id);
       childJoins.delete(id);
       rootSignals.delete(id);
@@ -3742,7 +5131,9 @@ export function installAgenticGenerationCoordinator(): void {
     // A bootstrap probe may have touched the default fail-closed decision
     // service, but it must not leave a half-installed coordinator behind.
     installDecisionAuthorities();
-    configureAgenticGenerationDependencies(buildDependencies());
+    const dependencies = buildDependencies();
+    configureAgenticGenerationDependencies(dependencies);
+    configureAgenticGenerationRuntimeDependencies(dependencies);
     installed = true;
     installationMarker.set();
   } catch (error) {
@@ -3754,12 +5145,23 @@ export function installAgenticGenerationCoordinator(): void {
 
 export const __testing = {
   buildDependencies,
-  makeWorkspace: (execution: AgenticExecutionHandle, capabilities: WorkspaceOperationCapabilitiesV1) =>
-    makeWorkspace(requireRuntimeExecution(execution), capabilities, HOST_PREPARATION_LIMITS_V1.maxInputBytes),
+  contextPackReadiness,
+  makeWorkspace: (
+    execution: AgenticExecutionHandle,
+    capabilities: WorkspaceOperationCapabilitiesV1,
+    cognitionRuntime?: AgentCognitionRuntimeV1,
+  ) => makeWorkspace(
+    requireRuntimeExecution(execution),
+    capabilities,
+    HOST_PREPARATION_LIMITS_V1.maxInputBytes,
+    cognitionRuntime,
+  ),
   mapRenderPhaseError,
   adoptWorkWorkspaceRevision,
   HOST_RENDER_FINAL_RESPONSE_CONTRACT,
   buildAgenticRenderPolicyMessages,
+  makeRevisionReader,
+  terminalInspectionReason,
   resetInstallation(): void {
     installed = false;
     preflightSnapshots.clear();

@@ -1,3 +1,5 @@
+import type { AssemblySurfaceV1 } from "../llm/types";
+
 import { createHash } from "node:crypto";
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db/connection";
@@ -27,11 +29,16 @@ import {
   freezeCanonicalPlainData,
 } from "../utils/canonical-plain-data";
 import type { AgentContextPolicyV1 } from "../types/agents";
-import { freezeCognitionGraph, parseCognitionSourceSnapshot } from "./agent-cognition.service";
+import {
+  freezeCognitionGraph,
+  normalizeLoomPolicyBucketsV1,
+  parseCognitionSourceSnapshot,
+} from "./agent-cognition.service";
 import type {
   CognitionSourceSnapshotV1,
   ContextActivationRuleV1,
   FrozenCognitionGraphV1,
+  LoomPolicyBucketsV1,
 } from "../types/agent-cognition";
 
 /**
@@ -84,6 +91,8 @@ export interface GenerationAssemblySnapshotInputV1 {
   readonly userId: string;
   readonly chatId: string;
   readonly generationId?: string;
+  /** The caller's authenticated assembly surface; never inferred from policy data. */
+  readonly assemblySurface: AssemblySurfaceV1;
   readonly generationType?: "normal" | "continue" | "regenerate" | "swipe";
   readonly connectionId?: string | null;
   readonly presetId?: string | null;
@@ -113,8 +122,10 @@ export interface GenerationAssemblySnapshotInputV1 {
   /** Authenticated cognition graph/source supplied by the execution loader. */
   readonly cognitionGraph?: unknown;
   readonly cognitionSource?: unknown;
-  /** Optional authenticated config projection supplied by runtime admission. */
+  /** Authenticated normalized V2 config supplied by runtime admission. */
   readonly agentConfig?: unknown;
+  /** Optional authenticated canonical Loom policy buckets. */
+  readonly loomPolicy?: unknown;
   readonly limits?: Partial<Record<LegacyLimitKey | keyof PreparationLimitsV1, number>>;
   readonly db?: Database;
   /**
@@ -183,7 +194,7 @@ export interface SnapshotMessageV1 extends Omit<Message, "extra" | "swipes" | "s
   readonly revision: string;
 }
 
-export interface SnapshotBlockV1 extends PromptBlock {
+export interface SnapshotBlockV1 extends Omit<PromptBlock, "revision"> {
   readonly order: number;
   readonly revision: string;
 }
@@ -315,6 +326,8 @@ export interface SnapshotContextPacksV1 {
   readonly candidateInputRevisions: readonly ContextPackInputRevisionV1[];
   readonly attachments: readonly Readonly<Record<string, unknown>>[];
   readonly acl: readonly Readonly<Record<string, unknown>>[];
+  /** Canonical versioned Loom buckets sealed to this source snapshot. */
+  readonly loomPolicy?: LoomPolicyBucketsV1;
   /** Source-checked cognition graph and Loom source snapshot frozen for this turn. */
   readonly cognitionGraph: FrozenCognitionGraphV1 | null;
   readonly cognitionSource: CognitionSourceSnapshotV1 | null;
@@ -332,6 +345,9 @@ export interface SnapshotAvailabilityV1 {
 
 export interface GenerationAssemblySnapshotV1 {
   readonly version: 1;
+  /** Authenticated surface that produced this closed snapshot. */
+  readonly assemblySurface: AssemblySurfaceV1;
+
   readonly snapshotId: string;
   readonly userId: string;
   readonly generationId: string;
@@ -604,16 +620,28 @@ function digest(value: unknown): string {
   return createHash("sha256").update(canonical(value)).digest("hex");
 }
 
+function authoredLoomBlockRevision(value: unknown): string {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 1) return String(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const parsed = Number(value);
+    if (Number.isSafeInteger(parsed) && parsed >= 1) return String(parsed);
+  }
+  return "1";
+}
+
 function revision(kind: InputRevisionKindV1, id: string, value: unknown, sourceRevision?: unknown): SnapshotRevisionV1 {
   const canonicalValue = canonical(value);
   const valueDigest = createHash("sha256").update(canonicalValue).digest("hex");
+  const hasSourceRevision = (
+    typeof sourceRevision === "number" && Number.isSafeInteger(sourceRevision)
+  ) || (
+    typeof sourceRevision === "string" && sourceRevision.length > 0
+  );
   return Object.freeze({
     kind,
     domain: kind,
     id,
-    revision: typeof sourceRevision === "number" || typeof sourceRevision === "string"
-      ? String(sourceRevision)
-      : valueDigest,
+    revision: hasSourceRevision ? String(sourceRevision) : valueDigest,
     digest: valueDigest,
   });
 }
@@ -677,7 +705,7 @@ function connectionFenceRevision(
     kind,
     domain: kind,
     id,
-    revision: live.revision,
+    revision: live.revision.length > 0 ? live.revision : live.digest,
     digest: live.digest,
   });
 }
@@ -793,7 +821,7 @@ function normalizePromptBlock(raw: unknown, order: number, maxBytes: number): Sn
     sealedOriginVersion: typeof source.sealedOriginVersion === "string" ? source.sealedOriginVersion : source.sealedOriginVersion === null ? null : undefined,
     sealedSha256: typeof source.sealedSha256 === "string" ? source.sealedSha256 : undefined,
   };
-  return deepFreeze({ ...normalized, order, revision: digest(normalized) });
+  return deepFreeze({ ...normalized, order, revision: authoredLoomBlockRevision(source.revision) });
 }
 
 function normalizePreset(row: RawRow, limits: Limits): SnapshotPresetV1 {
@@ -1333,6 +1361,10 @@ function assertRevision(value: unknown, label: string): void {
 
 function assertRequest(input: GenerationAssemblySnapshotInputV1): void {
   if (!input || typeof input !== "object") throw new SnapshotInputError("invalid snapshot input");
+  if (input.assemblySurface !== "RESPONSE" && input.assemblySurface !== "WORK") {
+    throw new SnapshotInputError("invalid assembly surface");
+  }
+
   assertId(input.userId, "user id");
   assertId(input.chatId, "chat id");
   for (const [value, label] of [
@@ -1644,6 +1676,37 @@ function resolveContextPolicy(
     hasPolicy: true,
   };
 }
+const EMPTY_LOOM_POLICY_BUCKETS: LoomPolicyBucketsV1 = Object.freeze({
+  version: 1,
+  workPolicy: Object.freeze([]),
+  workspaceUsage: Object.freeze([]),
+  completionCriteria: Object.freeze([]),
+  renderPolicy: Object.freeze([]),
+});
+
+function resolveLoomPolicyBuckets(
+  input: GenerationAssemblySnapshotInputV1,
+  policy: FrozenContextPolicyV1,
+  normalizedAgentConfig: unknown,
+): LoomPolicyBucketsV1 {
+  if (!policy.cognitionSource) {
+    if (input.loomPolicy !== undefined) {
+      throw new SnapshotInputError("Loom policy buckets require a cognition source");
+    }
+    return EMPTY_LOOM_POLICY_BUCKETS;
+  }
+  const config = normalizedAgentConfig && typeof normalizedAgentConfig === "object" && !Array.isArray(normalizedAgentConfig)
+    ? normalizedAgentConfig as Record<string, unknown>
+    : {};
+  const value = input.loomPolicy !== undefined
+    ? input.loomPolicy
+    : (config.runtimePolicy as Record<string, unknown> | undefined)?.loomPolicy;
+  try {
+    return normalizeLoomPolicyBucketsV1(value, policy.cognitionSource);
+  } catch {
+    throw new SnapshotInputError("invalid Loom policy buckets");
+  }
+}
 
 function candidateMatchesSelection(
   candidate: ContextPackCandidateV1,
@@ -1753,6 +1816,7 @@ function buildContextPackSnapshot(
     ...worldInfo.books.map((book) => ({ scope: "world_book", targetId: book.id }) satisfies ContextPackSnapshotScopeV1),
   ];
   const policy = resolveContextPolicy(input, normalizedAgentConfig);
+  const loomPolicy = resolveLoomPolicyBuckets(input, policy, normalizedAgentConfig);
   const allowedScopeTargets = new Set(scopes.map((scope) => `${scope.scope}\u0000${scope.targetId}`));
   const supplied = input.contextPackSnapshotSource === "host_prefetched"
     ? input.contextPackSnapshot
@@ -1846,6 +1910,7 @@ function buildContextPackSnapshot(
     candidateInputRevisions,
     attachments,
     acl,
+    loomPolicy,
     cognitionGraph: policy.cognitionGraph,
     cognitionSource: policy.cognitionSource,
     contextRules: policy.rules,
@@ -1855,6 +1920,7 @@ function buildContextPackSnapshot(
       candidates,
       contextPackSelections,
       candidateInputRevisions,
+      loomPolicy,
       cognitionSource: policy.cognitionSource,
       contextRules: policy.rules,
     }),
@@ -2095,6 +2161,7 @@ export function buildGenerationAssemblySnapshot(
     ]);
     const base = {
       version: 1 as const,
+      assemblySurface: input.assemblySurface,
       userId: input.userId,
       generationId: input.generationId ?? `${chat.id}:${target.messageId ?? "new"}:${target.swipeId ?? "active"}`,
       chatId: chat.id,
@@ -2128,17 +2195,13 @@ export function buildGenerationAssemblySnapshot(
   return input.useTransaction === false ? readSnapshot() : db.transaction(readSnapshot)();
 }
 
-/** Alias retained for callers that use an imperative name. */
-export const createGenerationAssemblySnapshot = buildGenerationAssemblySnapshot;
-export const buildAssemblySnapshot = buildGenerationAssemblySnapshot;
-
-/** Small helper used by tests and admission code to prove the input is closed. */
 export function isGenerationAssemblySnapshotV1(value: unknown): value is GenerationAssemblySnapshotV1 {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<GenerationAssemblySnapshotV1>;
   return candidate.version === 1
     && typeof candidate.snapshotId === "string"
     && typeof candidate.userId === "string"
+    && (candidate.assemblySurface === "RESPONSE" || candidate.assemblySurface === "WORK")
     && typeof candidate.chatId === "string"
     && candidate.contextPackSnapshot?.version === 1
     && candidate.contextPackSnapshot.ownerId === candidate.userId

@@ -1,15 +1,20 @@
 import {
+  AGENT_CUSTOM_PHASE_CAPABILITIES,
   AGENT_INVOCATION_MIN,
   AGENT_TOOL_CALL_MIN,
   WORKSPACE_CAPABILITIES,
   type AgentCapability,
+  type AgentCognitionPolicy,
   type AgentConfigRepairItem,
+  type AgentCustomPhaseV1,
+  type AgentPromptBlockRef,
   type AgentConfigV2,
   type AgentContextActivationRule,
   type AgentContextPackSelection,
   type AgentContextPolicyV1,
   type AgentMode,
   type AgentProfileConfigV2,
+  type AgentRuntimePolicyV1,
   type AgentTaskTemplate,
   type AgenticRuntimeSaveDraft,
   type CognitionPredicate,
@@ -20,11 +25,33 @@ import {
 } from './types'
 import { generateUUID } from '@/lib/uuid'
 import { isUnknownRecord } from '@/lib/type-guards'
+import type {
+  LoomOnDemandRequestV1,
+  LoomOnDemandRetrievalStatusV1,
+  LoomPolicyBucketV1,
+  LoomPolicyBucketsV1,
+  LoomPolicyCheckpointV1,
+  LoomPolicyDeliveryV1,
+  LoomPolicyDestinationV1,
+  LoomPolicyEntryV1,
+  LoomPolicySourceV1,
+  LoomPromptInspectionBlockV1,
+  LoomPromptInspectionContextPackV1,
+  LoomPromptInspectionInputV1,
+  LoomPromptInspectionItemV1,
+  LoomPromptInspectionOutcomeV1,
+  LoomPromptInspectionV1,
+  LoomResponsePolicyOmissionV1,
+  LoomResponsePolicyPhaseInstructionV1,
+} from '@/types/agent-runtime'
 
 export const AGENTIC_PREDICATE_MAX_DEPTH = 16
 export const AGENTIC_PREDICATE_MAX_NODES = 256
 export const AGENTIC_TASK_TEMPLATE_LIMIT = 256
 export const AGENTIC_CONTEXT_RULE_LIMIT = 256
+export const AGENTIC_CUSTOM_PHASE_LIMIT = 64
+export const AGENTIC_LOOM_POLICY_BUCKET_LIMIT = 64
+export const AGENTIC_LOOM_POLICY_LIMIT = 128
 export const AGENTIC_LABEL_MAX_LENGTH = 80
 export const AGENTIC_DESCRIPTION_MAX_BYTES = 8 * 1024
 const UTF8_ENCODER = new TextEncoder()
@@ -38,6 +65,595 @@ const AGENT_MARKER_PATTERN = /\{\{agent::([^{}\s:]+)(?:::as=[^{}\s:]+)?\}\}/g
 export function isCanonicalBlockRevision(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
 }
+
+
+function promptBlockRevision(block: PromptBlock, path: string): number {
+  if (block.revision === undefined) return 1
+  if (!isCanonicalBlockRevision(block.revision)) {
+    return loomPolicyError(path, 'must be a positive safe integer')
+  }
+  return block.revision
+}
+const LOOM_POLICY_BUCKET_ORDER = ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'] as const
+const LOOM_POLICY_DESTINATION_BY_BUCKET: Record<LoomPolicyBucketV1, LoomPolicyDestinationV1> = {
+  workPolicy: 'root_work',
+  workspaceUsage: 'root_work',
+  completionCriteria: 'completion_handoff',
+  renderPolicy: 'render',
+}
+const LOOM_POLICY_CHECKPOINT_BY_BUCKET: Record<LoomPolicyBucketV1, LoomPolicyCheckpointV1> = {
+  workPolicy: 'WORK',
+  workspaceUsage: 'WORK',
+  completionCriteria: 'PREPARE_COMMIT',
+  renderPolicy: 'RENDER',
+}
+const LOOM_POLICY_CHECKPOINT_RANK: Record<LoomPolicyCheckpointV1, number> = {
+  ASSEMBLE: 0,
+  WORK: 1,
+  PREPARE_COMMIT: 2,
+  RENDER: 3,
+}
+export const LOOM_RESPONSE_OMISSION_MAX_PHASE_INSTRUCTIONS = 4096
+
+function loomPolicyError(path: string, message: string): never {
+  throw new Error(`${path}: ${message}`)
+}
+
+function loomPolicyRecord(value: unknown, path: string): Record<string, unknown> {
+  if (!isUnknownRecord(value)) return loomPolicyError(path, 'must be an object')
+  return value
+}
+
+function loomPolicyExactKeys(value: Record<string, unknown>, keys: readonly string[], path: string): void {
+  const allowed = new Set(keys)
+  for (const key of Object.keys(value)) if (!allowed.has(key)) loomPolicyError(`${path}.${key}`, 'unknown key')
+}
+
+function loomPolicyString(value: unknown, path: string, maxBytes = 4 * 1024): string {
+  if (typeof value !== 'string' || value.length === 0 || UTF8_ENCODER.encode(value).byteLength > maxBytes) {
+    return loomPolicyError(path, 'must be a bounded non-empty string')
+  }
+  return value
+}
+
+function loomPolicyRevision(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return loomPolicyError(path, 'must be a non-negative safe integer')
+  return value
+}
+
+function loomPolicyBoolean(value: unknown, path: string): boolean {
+  if (typeof value !== 'boolean') return loomPolicyError(path, 'must be a boolean')
+  return value
+}
+
+function parseLoomPolicySourceV1(value: unknown, path: string): LoomPolicySourceV1 {
+  const object = loomPolicyRecord(value, path)
+  loomPolicyExactKeys(object, ['kind', 'blockId', 'presetRevision', 'blockRevision', 'promptOrder'], path)
+  if (object.kind !== 'loom_block') loomPolicyError(`${path}.kind`, 'unsupported source kind')
+  const blockRevision = loomPolicyRevision(object.blockRevision, `${path}.blockRevision`)
+  if (!isCanonicalBlockRevision(blockRevision)) {
+    loomPolicyError(`${path}.blockRevision`, 'must be a positive safe integer')
+  }
+  return {
+    kind: 'loom_block',
+    blockId: loomPolicyString(object.blockId, `${path}.blockId`, 256),
+    presetRevision: loomPolicyRevision(object.presetRevision, `${path}.presetRevision`),
+    blockRevision,
+    promptOrder: loomPolicyRevision(object.promptOrder, `${path}.promptOrder`),
+  }
+}
+function parseLoomResponsePolicyPhaseInstructionV1(
+  value: unknown,
+  path: string,
+): LoomResponsePolicyPhaseInstructionV1 {
+  const object = loomPolicyRecord(value, path)
+  loomPolicyExactKeys(object, ['phaseId', 'source'], path)
+  const phaseId = loomPolicyString(object.phaseId, `${path}.phaseId`, 64)
+  if (!POLICY_ID_PATTERN.test(phaseId)) loomPolicyError(`${path}.phaseId`, 'must use a stable lowercase identifier')
+  return {
+    phaseId,
+    source: parseLoomPolicySourceV1(object.source, `${path}.source`),
+  }
+}
+
+export function parseLoomResponsePolicyOmissionV1(value: unknown): LoomResponsePolicyOmissionV1 {
+  const object = loomPolicyRecord(value, 'responseOmission')
+  loomPolicyExactKeys(object, [
+    'version',
+    'surface',
+    'visibility',
+    'reason',
+    'omittedEntryIds',
+    'source',
+    'omittedPhaseInstructions',
+  ], 'responseOmission')
+  if (object.version !== 1) loomPolicyError('responseOmission.version', 'unsupported Loom policy version')
+  if (object.surface !== 'RESPONSE') loomPolicyError('responseOmission.surface', 'must be RESPONSE')
+  if (object.visibility !== 'work_only') loomPolicyError('responseOmission.visibility', 'must be work_only')
+  if (object.reason !== 'work_only') loomPolicyError('responseOmission.reason', 'must be work_only')
+  if (!isIndexedArray(object.omittedEntryIds) || object.omittedEntryIds.length > 128) {
+    loomPolicyError('responseOmission.omittedEntryIds', 'must contain at most 128 entries')
+  }
+  const omittedEntryIds = object.omittedEntryIds.map((entryId, index) => (
+    loomPolicyString(entryId, `responseOmission.omittedEntryIds[${index}]`, 256)
+  ))
+  if (new Set(omittedEntryIds).size !== omittedEntryIds.length) {
+    loomPolicyError('responseOmission.omittedEntryIds', 'contains duplicate entry ids')
+  }
+  if (!isIndexedArray(object.source) || object.source.length > 128) {
+    loomPolicyError('responseOmission.source', 'must contain at most 128 sources')
+  }
+  const source = object.source.map((value, index) => (
+    parseLoomPolicySourceV1(value, `responseOmission.source[${index}]`)
+  ))
+  if (source.length !== omittedEntryIds.length) {
+    loomPolicyError('responseOmission', 'omittedEntryIds and source must preserve one-to-one order')
+  }
+  if (!isIndexedArray(object.omittedPhaseInstructions)
+    || object.omittedPhaseInstructions.length > LOOM_RESPONSE_OMISSION_MAX_PHASE_INSTRUCTIONS) {
+    loomPolicyError(
+      'responseOmission.omittedPhaseInstructions',
+      `must contain at most ${LOOM_RESPONSE_OMISSION_MAX_PHASE_INSTRUCTIONS} entries`,
+    )
+  }
+  const omittedPhaseInstructions = object.omittedPhaseInstructions.map((instruction, index) => (
+    parseLoomResponsePolicyPhaseInstructionV1(
+      instruction,
+      `responseOmission.omittedPhaseInstructions[${index}]`,
+    )
+  ))
+  return Object.freeze({
+    version: 1,
+    surface: 'RESPONSE',
+    visibility: 'work_only',
+    reason: 'work_only',
+    omittedEntryIds: Object.freeze(omittedEntryIds),
+    source: Object.freeze(source),
+    omittedPhaseInstructions: Object.freeze(omittedPhaseInstructions),
+  })
+}
+
+function parseLoomOnDemandRequestV1(value: unknown, path: string): LoomOnDemandRequestV1 {
+  const object = loomPolicyRecord(value, path)
+  loomPolicyExactKeys(object, ['contextPackId', 'revisionId', 'digest'], path)
+  const digest = loomPolicyString(object.digest, `${path}.digest`, 128).toLowerCase()
+  if (!/^[0-9a-f]{64}$/.test(digest)) loomPolicyError(`${path}.digest`, 'must be a SHA-256 digest')
+  return {
+    contextPackId: loomPolicyString(object.contextPackId, `${path}.contextPackId`, 256),
+    revisionId: loomPolicyString(object.revisionId, `${path}.revisionId`, 256),
+    digest,
+  }
+}
+
+function parseLoomPolicyDeliveryV1(value: unknown, path: string): LoomPolicyDeliveryV1 {
+  const object = loomPolicyRecord(value, path)
+  if (object.delivery === 'direct') {
+    loomPolicyExactKeys(object, ['delivery'], path)
+    return { delivery: 'direct' }
+  }
+  if (object.delivery === 'condition_gated') {
+    loomPolicyExactKeys(object, ['delivery', 'condition'], path)
+    if (!isCognitionPredicateShape(object.condition)) loomPolicyError(`${path}.condition`, 'invalid predicate')
+    return { delivery: 'condition_gated', condition: object.condition }
+  }
+  if (object.delivery === 'on_demand') {
+    loomPolicyExactKeys(object, ['delivery', 'request'], path)
+    return { delivery: 'on_demand', request: parseLoomOnDemandRequestV1(object.request, `${path}.request`) }
+  }
+  return loomPolicyError(`${path}.delivery`, 'unsupported delivery')
+}
+
+function parseLoomPolicyEntryV1(value: unknown, path: string, bucket: LoomPolicyBucketV1): LoomPolicyEntryV1 {
+  const object = loomPolicyRecord(value, path)
+  loomPolicyExactKeys(object, ['version', 'id', 'source', 'destination', 'checkpoint', 'required', 'visibility', 'delivery'], path)
+  if (object.version !== 1) loomPolicyError(`${path}.version`, 'unsupported Loom policy version')
+  const destination = object.destination
+  if (destination !== LOOM_POLICY_DESTINATION_BY_BUCKET[bucket]) loomPolicyError(`${path}.destination`, 'destination is not valid for its bucket')
+  if (typeof object.checkpoint !== 'string' || !Object.hasOwn(LOOM_POLICY_CHECKPOINT_RANK, object.checkpoint)) {
+    loomPolicyError(`${path}.checkpoint`, 'unsupported checkpoint')
+  }
+  if (object.checkpoint !== LOOM_POLICY_CHECKPOINT_BY_BUCKET[bucket]) {
+    loomPolicyError(`${path}.checkpoint`, 'checkpoint is not valid for its bucket')
+  }
+  if (object.visibility !== 'work_only') loomPolicyError(`${path}.visibility`, 'unsupported policy visibility')
+  return {
+    version: 1,
+    id: loomPolicyString(object.id, `${path}.id`, 256),
+    source: parseLoomPolicySourceV1(object.source, `${path}.source`),
+    destination: destination as LoomPolicyDestinationV1,
+    checkpoint: object.checkpoint as LoomPolicyCheckpointV1,
+    required: loomPolicyBoolean(object.required, `${path}.required`),
+    visibility: 'work_only',
+    delivery: parseLoomPolicyDeliveryV1(object.delivery, `${path}.delivery`),
+  }
+}
+
+function sortLoomPolicyEntriesV1(entries: readonly LoomPolicyEntryV1[]): LoomPolicyEntryV1[] {
+  return [...entries].sort((left, right) =>
+    left.source.promptOrder - right.source.promptOrder
+    || left.source.blockId.localeCompare(right.source.blockId)
+    || left.id.localeCompare(right.id))
+}
+
+export function parseLoomPolicyBucketsV1(value: unknown): LoomPolicyBucketsV1 {
+  const object = loomPolicyRecord(value, 'policies')
+  loomPolicyExactKeys(object, ['version', ...LOOM_POLICY_BUCKET_ORDER], 'policies')
+  if (object.version !== 1) loomPolicyError('policies.version', 'unsupported Loom policy version')
+  const entriesByBucket = Object.fromEntries(LOOM_POLICY_BUCKET_ORDER.map((bucket) => {
+    const raw = object[bucket]
+    if (!isIndexedArray(raw)) loomPolicyError(`policies.${bucket}`, 'must be a dense array')
+    if (raw.length > AGENTIC_LOOM_POLICY_BUCKET_LIMIT) loomPolicyError(`policies.${bucket}`, 'contains too many policy entries')
+    return [bucket, sortLoomPolicyEntriesV1(raw.map((entry, index) => parseLoomPolicyEntryV1(entry, `policies.${bucket}[${index}]`, bucket)))]
+  })) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>
+  const ids = new Set<string>()
+  for (const bucket of LOOM_POLICY_BUCKET_ORDER) {
+    for (const entry of entriesByBucket[bucket]) {
+      if (ids.has(entry.id)) loomPolicyError(`policies.${bucket}`, 'duplicate policy id')
+      ids.add(entry.id)
+    }
+  }
+  if (ids.size > AGENTIC_LOOM_POLICY_LIMIT) loomPolicyError('policies', 'contains too many policy entries')
+  return Object.freeze({
+    version: 1,
+    workPolicy: Object.freeze(entriesByBucket.workPolicy),
+    workspaceUsage: Object.freeze(entriesByBucket.workspaceUsage),
+    completionCriteria: Object.freeze(entriesByBucket.completionCriteria),
+    renderPolicy: Object.freeze(entriesByBucket.renderPolicy),
+  })
+}
+const CUSTOM_PHASE_CAPABILITY_SET = new Set<string>(AGENT_CUSTOM_PHASE_CAPABILITIES)
+
+function parseAgentCustomPhaseV1(value: unknown, path: string): AgentCustomPhaseV1 {
+  const object = loomPolicyRecord(value, path)
+  loomPolicyExactKeys(object, [
+    'version',
+    'id',
+    'label',
+    'instructionRefs',
+    'required',
+    'enter',
+    'exit',
+    'skip',
+    'capabilityRequests',
+    'repeatLimit',
+    'nextPhaseIds',
+  ], path)
+  if (object.version !== 1) loomPolicyError(`${path}.version`, 'unsupported custom phase version')
+  const id = loomPolicyString(object.id, `${path}.id`, 64)
+  if (!POLICY_ID_PATTERN.test(id)) loomPolicyError(`${path}.id`, 'must use a stable lowercase identifier')
+  const label = loomPolicyString(object.label, `${path}.label`, AGENTIC_LABEL_MAX_LENGTH)
+  if (!isIndexedArray(object.instructionRefs) || object.instructionRefs.length > 64) {
+    loomPolicyError(`${path}.instructionRefs`, 'must contain at most 64 exact Loom block references')
+  }
+  const instructionRefs = object.instructionRefs.map((ref, index) => (
+    parseLoomPolicySourceV1(ref, `${path}.instructionRefs[${index}]`)
+  ))
+  const sourceKeys = new Set<string>()
+  instructionRefs.forEach((source, index) => {
+    const key = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`
+    if (sourceKeys.has(key)) loomPolicyError(`${path}.instructionRefs[${index}]`, 'duplicate instruction reference')
+    sourceKeys.add(key)
+  })
+  const required = loomPolicyBoolean(object.required, `${path}.required`)
+  const enter = isCognitionPredicateShape(object.enter)
+    ? object.enter
+    : loomPolicyError(`${path}.enter`, 'invalid predicate')
+  const exit = isCognitionPredicateShape(object.exit)
+    ? object.exit
+    : loomPolicyError(`${path}.exit`, 'invalid predicate')
+  const skipValue = object.skip
+  const skip = skipValue === undefined
+    ? undefined
+    : isCognitionPredicateShape(skipValue)
+      ? skipValue
+      : loomPolicyError(`${path}.skip`, 'invalid predicate')
+  if (!isIndexedArray(object.capabilityRequests) || object.capabilityRequests.length > AGENT_CUSTOM_PHASE_CAPABILITIES.length) {
+    loomPolicyError(`${path}.capabilityRequests`, 'must contain only closed capability requests')
+  }
+  const capabilityRequests = object.capabilityRequests.map((capability, index) => {
+    if (typeof capability !== 'string' || !CUSTOM_PHASE_CAPABILITY_SET.has(capability)) {
+      return loomPolicyError(`${path}.capabilityRequests[${index}]`, 'unsupported capability request')
+    }
+    return capability as AgentCustomPhaseV1['capabilityRequests'][number]
+  })
+  if (new Set(capabilityRequests).size !== capabilityRequests.length) {
+    loomPolicyError(`${path}.capabilityRequests`, 'duplicate capability request')
+  }
+  if (typeof object.repeatLimit !== 'number'
+    || !Number.isSafeInteger(object.repeatLimit)
+    || object.repeatLimit < 0
+    || object.repeatLimit > 4) {
+    loomPolicyError(`${path}.repeatLimit`, 'must be an integer from 0 through 4')
+  }
+  if (!isIndexedArray(object.nextPhaseIds) || object.nextPhaseIds.length > 2) {
+    loomPolicyError(`${path}.nextPhaseIds`, 'must contain at most self and the immediate next phase')
+  }
+  const nextPhaseIds = object.nextPhaseIds.map((phaseId, index) => {
+    const idValue = loomPolicyString(phaseId, `${path}.nextPhaseIds[${index}]`, 64)
+    if (!POLICY_ID_PATTERN.test(idValue)) loomPolicyError(`${path}.nextPhaseIds[${index}]`, 'must use a stable lowercase identifier')
+    return idValue
+  })
+  if (new Set(nextPhaseIds).size !== nextPhaseIds.length) {
+    loomPolicyError(`${path}.nextPhaseIds`, 'duplicate next phase id')
+  }
+  if (nextPhaseIds.includes(id) && object.repeatLimit === 0) {
+    loomPolicyError(`${path}.nextPhaseIds`, 'self transition requires repeatLimit greater than zero')
+  }
+  return {
+    version: 1,
+    id,
+    label,
+    instructionRefs,
+    required,
+    enter,
+    exit,
+    ...(skip === undefined ? {} : { skip }),
+    capabilityRequests,
+    repeatLimit: object.repeatLimit,
+    nextPhaseIds,
+  }
+}
+
+export function parseAgentCustomPhasesV1(value: unknown): readonly AgentCustomPhaseV1[] {
+  if (!isIndexedArray(value) || value.length > AGENTIC_CUSTOM_PHASE_LIMIT) {
+    loomPolicyError('config.runtimePolicy.phases', `must contain at most ${AGENTIC_CUSTOM_PHASE_LIMIT} ordered phases`)
+  }
+  const phases = value.map((phase, index) => parseAgentCustomPhaseV1(phase, `config.runtimePolicy.phases.${index}`))
+  const ids = new Set<string>()
+  phases.forEach((phase, index) => {
+    if (ids.has(phase.id)) loomPolicyError(`config.runtimePolicy.phases.${index}.id`, 'duplicate custom phase id')
+    ids.add(phase.id)
+  })
+  return Object.freeze(phases)
+}
+
+function refsToLoomPolicyBuckets(
+  refs: AgentCognitionPolicy,
+  blocks: readonly PromptBlock[],
+  legacy = false,
+): LoomPolicyBucketsV1 {
+  const sourceById = new Map(blocks.map((block, index) => [block.id, {
+    kind: 'loom_block' as const,
+    blockId: block.id,
+    presetRevision: 0,
+    blockRevision: promptBlockRevision(block, `blocks[${index}].revision`),
+    promptOrder: index,
+  }]))
+  const convert = (bucket: LoomPolicyBucketV1): LoomPolicyEntryV1[] => {
+    const refsForBucket = refs[bucket] ?? []
+    return sortLoomPolicyEntriesV1(refsForBucket.map((ref, index) => {
+      const source = sourceById.get(ref.blockId)
+      if (!source) loomPolicyError(`${bucket}[${index}].blockId`, 'source block is unavailable')
+      return {
+        version: 1,
+        id: `${legacy ? 'legacy-' : ''}${bucket}-${ref.blockId}`,
+        source: {
+          ...source,
+          presetRevision: ref.expectedPresetRevision,
+          blockRevision: ref.expectedBlockRevision,
+        },
+        destination: LOOM_POLICY_DESTINATION_BY_BUCKET[bucket],
+        checkpoint: LOOM_POLICY_CHECKPOINT_BY_BUCKET[bucket],
+        required: true,
+        visibility: 'work_only',
+        delivery: { delivery: 'direct' },
+      }
+    }))
+  }
+  return {
+    version: 1,
+    workPolicy: convert('workPolicy'),
+    workspaceUsage: convert('workspaceUsage'),
+    completionCriteria: convert('completionCriteria'),
+    renderPolicy: convert('renderPolicy'),
+  }
+}
+
+export function normalizeLegacyLoomPolicyV1(value: unknown): AgentCognitionPolicy {
+  const object = loomPolicyRecord(value, 'config.phasePolicy')
+  loomPolicyExactKeys(object, ['work', 'render'], 'config.phasePolicy')
+  if (!isIndexedArray(object.work) || !isIndexedArray(object.render)) {
+    loomPolicyError('config.phasePolicy', 'work and render must be dense arrays')
+  }
+  if (!object.work.every(isCognitionPolicyRef) || !object.render.every(isCognitionPolicyRef)) {
+    loomPolicyError('config.phasePolicy', 'work and render must contain exact block references')
+  }
+  return {
+    workPolicy: object.work,
+    workspaceUsage: [],
+    completionCriteria: [],
+    renderPolicy: object.render,
+  }
+}
+
+export const normalizeLegacyPhasePolicyV1 = normalizeLegacyLoomPolicyV1
+export function normalizeLoomPolicyBucketsV1(
+  value: unknown,
+  sourceBlocks: readonly PromptBlock[],
+  legacyPhasePolicyValue?: unknown,
+): LoomPolicyBucketsV1 {
+  const parsed = isUnknownRecord(value) && value.version === 1
+    ? parseLoomPolicyBucketsV1(value)
+    : refsToLoomPolicyBuckets((isCognitionPolicyShape(value) ? value : defaultCognitionPolicy()) as AgentCognitionPolicy, sourceBlocks)
+  const legacy = legacyPhasePolicyValue === undefined || legacyPhasePolicyValue === null
+    ? undefined
+    : refsToLoomPolicyBuckets(normalizeLegacyLoomPolicyV1(legacyPhasePolicyValue), sourceBlocks, true)
+  const merged = Object.fromEntries(LOOM_POLICY_BUCKET_ORDER.map((bucket) => [
+    bucket,
+    sortLoomPolicyEntriesV1([...(parsed[bucket] ?? []), ...(legacy?.[bucket] ?? [])]),
+  ])) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>
+  return Object.freeze({
+    version: 1,
+    workPolicy: Object.freeze(merged.workPolicy),
+    workspaceUsage: Object.freeze(merged.workspaceUsage),
+    completionCriteria: Object.freeze(merged.completionCriteria),
+    renderPolicy: Object.freeze(merged.renderPolicy),
+  })
+}
+
+export const normalizeLoomPolicyBuckets = normalizeLoomPolicyBucketsV1
+
+function loomSourceKey(source: LoomPolicySourceV1): string {
+  return `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`
+}
+
+function loomContextKey(request: LoomOnDemandRequestV1): string {
+  return `${request.contextPackId}\u0000${request.revisionId}\u0000${request.digest}`
+}
+
+function loomValuesEqual(left: unknown, right: unknown): boolean {
+  return Array.isArray(left) && Array.isArray(right)
+    ? left.length === right.length && left.every((item, index) => item === right[index])
+    : left === right
+}
+
+function evaluateLoomPredicate(predicate: CognitionPredicate, evaluation: NonNullable<LoomPromptInspectionInputV1['evaluation']>): boolean {
+  switch (predicate.kind) {
+    case 'all':
+      return predicate.children.every((child) => evaluateLoomPredicate(child, evaluation))
+    case 'any':
+      return predicate.children.some((child) => evaluateLoomPredicate(child, evaluation))
+    case 'not':
+      return !evaluateLoomPredicate(predicate.child, evaluation)
+    case 'generation_type':
+      return predicate.value === evaluation.generationType
+    case 'phase':
+      return predicate.value === evaluation.phase
+    case 'tool_available':
+      return evaluation.availableTools.includes(predicate.toolId) === predicate.available
+    case 'task_transition':
+      return evaluation.taskTransitions[predicate.taskId] === predicate.transition
+    case 'preset_variable':
+    case 'participant_fact': {
+      const values = predicate.kind === 'preset_variable' ? evaluation.presetVariables : evaluation.participantFacts
+      const current = values[predicate.name]
+      if (predicate.operator === 'present') return current !== undefined
+      if (predicate.operator === 'equals') return loomValuesEqual(current, predicate.value)
+      if (predicate.operator === 'in') return predicate.values.some((value) => loomValuesEqual(current, value))
+      return Array.isArray(current) && typeof predicate.value === 'string' && current.includes(predicate.value)
+    }
+  }
+}
+
+function loomInspectionItem(
+  entry: LoomPolicyEntryV1,
+  bucket: LoomPolicyBucketV1,
+  outcome: LoomPromptInspectionOutcomeV1,
+  effectiveText: string | null,
+  retrievalStatus?: LoomOnDemandRetrievalStatusV1,
+): LoomPromptInspectionItemV1 {
+  return {
+    entryId: entry.id,
+    bucket,
+    destination: entry.destination,
+    checkpoint: entry.checkpoint,
+    source: entry.source,
+    delivery: entry.delivery,
+    effectiveText,
+    ...(retrievalStatus === undefined ? {} : { retrievalStatus }),
+    outcome,
+  }
+}
+
+export function inspectLoomPromptPoliciesV1(
+  policiesValue: unknown,
+  input: LoomPromptInspectionInputV1,
+): LoomPromptInspectionV1 {
+  const policies = parseLoomPolicyBucketsV1(policiesValue)
+  const sourceBlocks = new Map<string, LoomPromptInspectionBlockV1>()
+  for (const block of input.blocks) sourceBlocks.set(loomSourceKey(block.source), block)
+  const contextPacks = new Map<string, LoomPromptInspectionContextPackV1>()
+  for (const pack of input.contextPacks) {
+    const { content: _content, ...request } = pack
+    contextPacks.set(loomContextKey(request), pack)
+  }
+  const items: LoomPromptInspectionItemV1[] = []
+  const effectiveEntryIds: string[] = []
+  const kept = new Map<string, string>()
+  for (const bucket of LOOM_POLICY_BUCKET_ORDER) {
+    for (const entry of policies[bucket]) {
+      if (input.surface === 'RESPONSE') {
+        items.push(loomInspectionItem(entry, bucket, { status: 'omitted', reason: 'response_mode' }, null))
+        continue
+      }
+      if (LOOM_POLICY_CHECKPOINT_RANK[input.checkpoint] < LOOM_POLICY_CHECKPOINT_RANK[entry.checkpoint]) {
+        items.push(loomInspectionItem(entry, bucket, { status: 'skipped', reason: 'checkpoint_not_reached' }, null))
+        continue
+      }
+      const block = sourceBlocks.get(loomSourceKey(entry.source))
+      if (!block) {
+        items.push(loomInspectionItem(entry, bucket, { status: 'rejected', reason: entry.required ? 'required_source_unavailable' : 'stale_source' }, null))
+        continue
+      }
+      let effectiveText: string | null = block.content
+      let retrievalStatus: LoomOnDemandRetrievalStatusV1 | undefined
+      if (entry.delivery.delivery === 'condition_gated') {
+        if (!input.evaluation) {
+          items.push(loomInspectionItem(entry, bucket, entry.required
+            ? { status: 'rejected', reason: 'required_source_unavailable' }
+            : { status: 'skipped', reason: 'condition_not_met' }, effectiveText))
+          continue
+        }
+        if (!evaluateLoomPredicate(entry.delivery.condition, input.evaluation)) {
+          items.push(loomInspectionItem(entry, bucket, { status: 'skipped', reason: 'condition_not_met' }, effectiveText))
+          continue
+        }
+      } else if (entry.delivery.delivery === 'on_demand') {
+        const request = entry.delivery.request
+        const exact = contextPacks.get(loomContextKey(request))
+        if (!exact) {
+          retrievalStatus = [...contextPacks.values()].some((pack) =>
+            pack.contextPackId === request.contextPackId && pack.revisionId === request.revisionId)
+            ? 'stale'
+            : 'unavailable'
+          items.push(loomInspectionItem(entry, bucket, entry.required
+            ? { status: 'rejected', reason: 'required_source_unavailable' }
+            : { status: 'skipped', reason: 'on_demand_unavailable' }, null, retrievalStatus))
+          continue
+        }
+        retrievalStatus = 'available'
+        effectiveText = exact.content
+      }
+      const dedupKey = `${entry.destination}\u0000${loomSourceKey(entry.source)}`
+      const keptEntryId = kept.get(dedupKey)
+      if (keptEntryId) {
+        items.push(loomInspectionItem(entry, bucket, {
+          status: 'deduplicated',
+          keptEntryId,
+          destination: entry.destination,
+        }, effectiveText, retrievalStatus))
+        continue
+      }
+      kept.set(dedupKey, entry.id)
+      effectiveEntryIds.push(entry.id)
+      items.push(loomInspectionItem(entry, bucket, {
+        status: 'included',
+        effectiveIndex: effectiveEntryIds.length - 1,
+      }, effectiveText, retrievalStatus))
+    }
+  }
+  const responseOmission: LoomResponsePolicyOmissionV1 | undefined = input.surface === 'RESPONSE'
+    ? parseLoomResponsePolicyOmissionV1({
+      version: 1,
+      surface: 'RESPONSE',
+      visibility: 'work_only',
+      reason: 'work_only',
+      omittedEntryIds: items.map((item) => item.entryId),
+      source: items.map((item) => item.source),
+      omittedPhaseInstructions: [],
+    })
+    : undefined
+  return Object.freeze({
+    version: 1,
+    surface: input.surface,
+    checkpoint: input.checkpoint,
+    items: Object.freeze(items),
+    effectiveEntryIds: Object.freeze(effectiveEntryIds),
+    ...(responseOmission === undefined ? {} : { responseOmission }),
+  })
+}
+
+export const inspectLoomPrompt = inspectLoomPromptPoliciesV1
 
 export function getAgentProfileMarkerIds(value: unknown): string[] {
   if (typeof value !== 'string') return []
@@ -190,6 +806,10 @@ export type AgenticRuntimeValidationCode =
   | 'unresolved_slot'
   | 'invalid_block_reference'
   | 'stale_block_revision'
+  | 'invalid_runtime_policy'
+  | 'invalid_policy_entry'
+  | 'stale_policy_source'
+  | 'missing_policy_context'
   | 'invalid_predicate'
   | 'predicate_limit_exceeded'
   | 'invalid_task_template'
@@ -217,7 +837,7 @@ export interface AgenticRuntimeValidationResult {
 }
 
 function isStringList(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+  return isIndexedArray(value) && value.every((entry) => typeof entry === 'string')
 }
 function isCognitionScalar(value: unknown): value is string | number | boolean {
   return typeof value === 'string'
@@ -226,7 +846,7 @@ function isCognitionScalar(value: unknown): value is string | number | boolean {
 }
 
 function isCognitionScalarList(value: unknown): value is Array<string | number | boolean> {
-  return Array.isArray(value) && value.every((entry) => isCognitionScalar(entry))
+  return isIndexedArray(value) && value.every((entry) => isCognitionScalar(entry))
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
@@ -263,7 +883,7 @@ function isCognitionPredicateShape(value: unknown, depth = 1): value is Cognitio
     case 'all':
     case 'any':
       return hasOnlyKeys(value, ['kind', 'children'])
-        && Array.isArray(value.children)
+        && isIndexedArray(value.children)
         && value.children.length > 0
         && value.children.every((child) => isCognitionPredicateShape(child, depth + 1))
     case 'not':
@@ -292,7 +912,7 @@ function isCognitionPredicateShape(value: unknown, depth = 1): value is Cognitio
       if (value.operator === 'equals') {
         return hasOnlyKeys(value, ['kind', 'name', 'operator', 'value'])
           && (isCognitionScalar(value.value)
-            || Array.isArray(value.value) && value.value.every((entry) => typeof entry === 'string'))
+            || isIndexedArray(value.value) && value.value.every((entry) => typeof entry === 'string'))
       }
       if (value.operator === 'includes') {
         return hasOnlyKeys(value, ['kind', 'name', 'operator', 'value'])
@@ -308,7 +928,7 @@ function isCognitionPredicateShape(value: unknown, depth = 1): value is Cognitio
       return hasOnlyKeys(value, ['kind', 'taskId', 'transition'])
         && typeof value.taskId === 'string'
         && POLICY_ID_PATTERN.test(value.taskId)
-        && ['pending', 'active', 'blocked', 'submitted', 'accepted', 'done'].includes(String(value.transition))
+        && ['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed'].includes(String(value.transition))
     default:
       return false
   }
@@ -382,6 +1002,153 @@ function defaultCognitionPolicy() {
     renderPolicy: [],
   }
 }
+const COGNITION_POLICY_REF_KEYS = ['blockId', 'expectedPresetRevision', 'expectedBlockRevision'] as const
+
+function isCognitionPolicyRef(value: unknown): value is AgentPromptBlockRef {
+  return isUnknownRecord(value)
+    && hasOnlyKeys(value, COGNITION_POLICY_REF_KEYS)
+    && typeof value.blockId === 'string'
+    && value.blockId.length > 0
+    && !/\s/.test(value.blockId)
+    && isNonNegativeSafeInteger(value.expectedPresetRevision)
+    && isNonNegativeSafeInteger(value.expectedBlockRevision)
+}
+
+export function createLoomPolicyEntryV1(
+  bucket: LoomPolicyBucketV1,
+  block: PromptBlock,
+  presetRevision: number,
+  promptOrder: number,
+  existing?: LoomPolicyEntryV1,
+): LoomPolicyEntryV1 {
+  const blockRevision = promptBlockRevision(block, `block.${block.id}.revision`)
+  return {
+    version: 1,
+    id: existing?.id ?? `${bucket}-${block.id}`,
+    source: {
+      kind: 'loom_block',
+      blockId: block.id,
+      presetRevision,
+      blockRevision,
+      promptOrder,
+    },
+    destination: LOOM_POLICY_DESTINATION_BY_BUCKET[bucket],
+    checkpoint: LOOM_POLICY_CHECKPOINT_BY_BUCKET[bucket],
+    required: existing?.required ?? true,
+    visibility: 'work_only',
+    delivery: existing?.delivery ?? { delivery: 'direct' },
+  }
+}
+
+export function getAgentRuntimePolicyBuckets(
+  config: AgentConfigV2 | unknown,
+  sourceBlocks: readonly PromptBlock[],
+): LoomPolicyBucketsV1 {
+  const rawConfig = isUnknownRecord(config) ? config : {}
+  if (Object.hasOwn(rawConfig, 'runtimePolicy')) {
+    const rawRuntimePolicy = rawConfig.runtimePolicy
+    if (isUnknownRecord(rawRuntimePolicy)
+      && rawRuntimePolicy.loomPolicy !== null
+      && rawRuntimePolicy.loomPolicy !== undefined) {
+      try {
+        return normalizeLoomPolicyBucketsV1(rawRuntimePolicy.loomPolicy, sourceBlocks)
+      } catch {
+        // Validation retains the malformed canonical value for explicit repair.
+      }
+    }
+    return {
+      version: 1,
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+  }
+  try {
+    return normalizeLoomPolicyBucketsV1(rawConfig.cognitionPolicy, sourceBlocks, rawConfig.phasePolicy)
+  } catch {
+    return {
+      version: 1,
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+  }
+}
+
+export function getAgentRuntimeCustomPhases(
+  config: AgentConfigV2 | unknown,
+): readonly AgentCustomPhaseV1[] {
+  const rawConfig = isUnknownRecord(config) ? config : {}
+  const rawRuntimePolicy = rawConfig.runtimePolicy
+  if (!isUnknownRecord(rawRuntimePolicy) || !Array.isArray(rawRuntimePolicy.phases)) return []
+  try {
+    return parseAgentCustomPhasesV1(rawRuntimePolicy.phases)
+  } catch {
+    return []
+  }
+}
+
+export function setAgentRuntimeCustomPhases(
+  config: AgentConfigV2,
+  phases: readonly AgentCustomPhaseV1[],
+): AgentConfigV2 {
+  const rawConfig = config as unknown as Record<string, unknown>
+  const rawRuntimePolicy = rawConfig.runtimePolicy
+  const loomPolicy = isUnknownRecord(rawRuntimePolicy)
+    && (rawRuntimePolicy.loomPolicy === null || isUnknownRecord(rawRuntimePolicy.loomPolicy))
+    ? rawRuntimePolicy.loomPolicy as LoomPolicyBucketsV1 | null
+    : null
+  const {
+    cognitionPolicy: _legacyCognitionPolicy,
+    phasePolicy: _legacyPhasePolicy,
+    ...withoutLegacyPolicy
+  } = rawConfig
+  const runtimePolicy: AgentRuntimePolicyV1 = {
+    version: 1,
+    authority: 'loom',
+    scope: 'preset',
+    defaultMode: config.defaultMode,
+    loomPolicy,
+    phases,
+  }
+  return {
+    ...withoutLegacyPolicy,
+    runtimePolicy,
+  } as AgentConfigV2
+}
+
+export function setAgentRuntimePolicyBuckets(
+  config: AgentConfigV2,
+  buckets: LoomPolicyBucketsV1,
+): AgentConfigV2 {
+  const rawConfig = config as unknown as Record<string, unknown>
+  const rawRuntimePolicy = rawConfig.runtimePolicy
+  const phases = isUnknownRecord(rawRuntimePolicy) && Array.isArray(rawRuntimePolicy.phases)
+    ? rawRuntimePolicy.phases as readonly AgentCustomPhaseV1[]
+    : []
+  const {
+    cognitionPolicy: _legacyCognitionPolicy,
+    phasePolicy: _legacyPhasePolicy,
+    ...withoutLegacyPolicy
+  } = rawConfig
+  const runtimePolicy: AgentRuntimePolicyV1 = {
+    version: 1,
+    authority: 'loom',
+    scope: 'preset',
+    defaultMode: config.defaultMode,
+    loomPolicy: buckets,
+    phases,
+  }
+  return {
+    ...withoutLegacyPolicy,
+    runtimePolicy,
+  } as AgentConfigV2
+}
+
+
+
 
 export function createDefaultAgentConfigV2(): AgentConfigV2 {
   return {
@@ -395,7 +1162,20 @@ export function createDefaultAgentConfigV2(): AgentConfigV2 {
     mainLoreScope: 'active',
     profiles: [],
     connectionSlots: [],
-    cognitionPolicy: defaultCognitionPolicy(),
+    runtimePolicy: {
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'response',
+      loomPolicy: {
+        version: 1,
+        workPolicy: [],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      },
+      phases: [],
+    },
     contextPolicy: { ruleIds: [], packIds: [] },
     taskPolicy: { templateIds: [] },
     workspacePolicy: { retention: 'turn_terminal', sharing: 'view_only' },
@@ -436,24 +1216,27 @@ export function createAgentProfileV2(
 }
 
 
+
 export function normalizeAgentConfigForEditor(config: AgentConfigV2): AgentConfigV2 {
-  const next: AgentConfigV2 = {
-    ...config,
-    profiles: Array.isArray(config.profiles)
-      ? config.profiles.map((profile) => isUnknownRecord(profile)
+  const raw = config as unknown as Record<string, unknown>
+  const next = {
+    ...raw,
+    profiles: isIndexedArray(raw.profiles)
+      ? raw.profiles.map((profile) => isUnknownRecord(profile)
         ? {
             ...profile,
-            workspaceCapabilities: Array.isArray(profile.workspaceCapabilities)
+            workspaceCapabilities: isIndexedArray(profile.workspaceCapabilities)
               ? [...profile.workspaceCapabilities]
               : profile.workspaceCapabilities,
-          } as AgentProfileConfigV2
+          }
         : profile)
-      : [],
+      : raw.profiles,
+  } as AgentConfigV2
+  if (!Object.hasOwn(raw, 'contextPolicy')) next.contextPolicy = { ruleIds: [], packIds: [] }
+  if (!Object.hasOwn(raw, 'taskPolicy')) next.taskPolicy = { templateIds: [] }
+  if (!Object.hasOwn(raw, 'workspacePolicy')) {
+    next.workspacePolicy = { retention: 'turn_terminal', sharing: 'view_only' }
   }
-  if (next.cognitionPolicy == null) next.cognitionPolicy = defaultCognitionPolicy()
-  if (next.contextPolicy == null) next.contextPolicy = { ruleIds: [], packIds: [] }
-  if (next.taskPolicy == null) next.taskPolicy = { templateIds: [] }
-  if (next.workspacePolicy == null) next.workspacePolicy = { retention: 'turn_terminal', sharing: 'view_only' }
   return next
 }
 
@@ -511,7 +1294,7 @@ function validatePredicate(
       return
     }
     if (current.kind === 'all' || current.kind === 'any') {
-      if (!Array.isArray(current.children) || current.children.length === 0) {
+      if (!isIndexedArray(current.children) || current.children.length === 0) {
         issues.push({ code: 'invalid_predicate', path: currentPath })
         return
       }
@@ -527,7 +1310,7 @@ function validatePredicate(
       const hasScalar = isCognitionScalar(current.value)
       const hasValueList = isCognitionScalarList(current.values) && current.values.length > 0
       const hasEqualsValue = current.operator === 'equals'
-        && (hasScalar || Array.isArray(current.value) && current.value.every((entry) => typeof entry === 'string'))
+        && (hasScalar || isIndexedArray(current.value) && current.value.every((entry) => typeof entry === 'string'))
       const hasIncludesValue = current.operator === 'includes' && hasScalar
       if (!name
         || current.operator === 'in' && !hasValueList
@@ -552,7 +1335,7 @@ function validatePredicate(
       if (
         typeof current.taskId !== 'string'
         || !POLICY_ID_PATTERN.test(current.taskId)
-        || !['pending', 'active', 'blocked', 'submitted', 'accepted', 'done'].includes(String(current.transition))
+        || !['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed'].includes(String(current.transition))
         || taskTemplateIds !== undefined && !taskTemplateIds.has(current.taskId)
       ) {
         issues.push({ code: 'invalid_predicate', path: currentPath })
@@ -736,6 +1519,142 @@ function validateProfiles(
   return profileIds
 }
 
+function validateRuntimePolicy(
+  config: AgentConfigV2,
+  blocks: readonly PromptBlock[],
+  expectedPresetRevision: number,
+  contextSelections: readonly unknown[],
+  availableContextRevisionKeys: ReadonlySet<string> | undefined,
+  predicateBudget: PredicateValidationBudget,
+  issues: AgenticRuntimeValidationIssue[],
+  taskTemplateIds?: ReadonlySet<string>,
+): void {
+  const rawConfig = config as unknown as Record<string, unknown>
+  const value = rawConfig.runtimePolicy
+  if (value === undefined || value === null) return
+  if (!isUnknownRecord(value)
+    || !hasOnlyKeys(value, ['version', 'authority', 'scope', 'defaultMode', 'loomPolicy', 'phases'])
+    || value.version !== 1
+    || value.authority !== 'loom'
+    || value.scope !== 'preset'
+    || value.defaultMode !== config.defaultMode
+    || (value.loomPolicy !== null && !isUnknownRecord(value.loomPolicy))
+    || !isIndexedArray(value.phases)) {
+    issues.push({ code: 'invalid_runtime_policy', path: 'config.runtimePolicy' })
+    return
+  }
+  let phases: readonly AgentCustomPhaseV1[]
+  try {
+    phases = parseAgentCustomPhasesV1(value.phases)
+  } catch {
+    const invalidSelfLoopIndexes = value.phases.flatMap((phase, index) => {
+      if (!isUnknownRecord(phase)
+        || typeof phase.id !== 'string'
+        || phase.repeatLimit !== 0
+        || !Array.isArray(phase.nextPhaseIds)
+        || !phase.nextPhaseIds.some((phaseId) => phaseId === phase.id)) {
+        return []
+      }
+      return [index]
+    })
+    if (invalidSelfLoopIndexes.length > 0) {
+      invalidSelfLoopIndexes.forEach((index) => {
+        issues.push({
+          code: 'invalid_policy_entry',
+          path: `config.runtimePolicy.phases.${index}.repeatLimit`,
+        })
+      })
+    } else {
+      issues.push({ code: 'invalid_runtime_policy', path: 'config.runtimePolicy.phases' })
+    }
+    return
+  }
+  let policies: LoomPolicyBucketsV1 | null = null
+  if (value.loomPolicy !== null) {
+    try {
+      policies = parseLoomPolicyBucketsV1(value.loomPolicy)
+    } catch {
+      issues.push({ code: 'invalid_runtime_policy', path: 'config.runtimePolicy.loomPolicy' })
+      return
+    }
+  }
+  const blocksById = new Map<string, { block: PromptBlock; promptOrder: number }>()
+  blocks.forEach((block, promptOrder) => {
+    if (typeof block.id === 'string') blocksById.set(block.id, { block, promptOrder })
+  })
+  const selections = contextSelections.filter(isAgentContextPackSelection)
+  phases.forEach((phase, index) => {
+    const path = `config.runtimePolicy.phases.${index}`
+    const nextPhaseId = phases[index + 1]?.id
+    phase.instructionRefs.forEach((source, refIndex) => {
+      const current = blocksById.get(source.blockId)
+      const sourcePath = `${path}.instructionRefs.${refIndex}`
+      if (!current || current.block.marker === 'category') {
+        issues.push({ code: 'invalid_policy_entry', path: sourcePath })
+        return
+      }
+      if (current.block.revision !== undefined && !isCanonicalBlockRevision(current.block.revision)) {
+        issues.push({ code: 'invalid_policy_entry', path: sourcePath })
+        return
+      }
+      const blockRevision = current.block.revision ?? 1
+      if (source.presetRevision !== expectedPresetRevision
+        || source.blockRevision !== blockRevision
+        || source.promptOrder !== current.promptOrder) {
+        issues.push({ code: 'stale_policy_source', path: sourcePath })
+      }
+    })
+    validatePredicate(phase.enter, `${path}.enter`, issues, predicateBudget, taskTemplateIds)
+    validatePredicate(phase.exit, `${path}.exit`, issues, predicateBudget, taskTemplateIds)
+    if (phase.skip !== undefined) {
+      validatePredicate(phase.skip, `${path}.skip`, issues, predicateBudget, taskTemplateIds)
+    }
+    if (phase.nextPhaseIds.includes(phase.id) && phase.repeatLimit === 0) {
+      issues.push({ code: 'invalid_policy_entry', path: `${path}.repeatLimit` })
+    }
+    phase.nextPhaseIds.forEach((candidate, nextIndex) => {
+      if (candidate !== phase.id && candidate !== nextPhaseId) {
+        issues.push({ code: 'invalid_policy_entry', path: `${path}.nextPhaseIds.${nextIndex}` })
+      }
+    })
+  })
+  if (policies === null) return
+  for (const bucket of LOOM_POLICY_BUCKET_ORDER) {
+    policies[bucket].forEach((entry, index) => {
+      const path = `config.runtimePolicy.loomPolicy.${bucket}.${index}`
+      const source = blocksById.get(entry.source.blockId)
+      if (!source || source.block.marker === 'category') {
+        issues.push({ code: 'invalid_policy_entry', path })
+        return
+      }
+      if (source.block.revision !== undefined && !isCanonicalBlockRevision(source.block.revision)) {
+        issues.push({ code: 'invalid_policy_entry', path })
+        return
+      }
+      const currentBlockRevision = source.block.revision ?? 1
+      if (entry.source.presetRevision !== expectedPresetRevision
+        || entry.source.blockRevision !== currentBlockRevision
+        || entry.source.promptOrder !== source.promptOrder) {
+        issues.push({ code: 'stale_policy_source', path: `${path}.source` })
+      }
+      if (entry.delivery.delivery === 'condition_gated') {
+        validatePredicate(entry.delivery.condition, `${path}.delivery.condition`, issues, predicateBudget, taskTemplateIds)
+      } else if (entry.delivery.delivery === 'on_demand') {
+        const request = entry.delivery.request
+        const selection = selections.find((candidate) => (
+          candidate.packId === request.contextPackId
+          && candidate.revisionId === request.revisionId
+          && candidate.digest === request.digest
+        ))
+        const key = `${request.contextPackId}\u0000${request.revisionId}`
+        if (!selection || availableContextRevisionKeys !== undefined && !availableContextRevisionKeys.has(key)) {
+          issues.push({ code: 'missing_policy_context', path: `${path}.delivery.request` })
+        }
+      }
+    })
+  }
+}
+
 function validateCognitionBlocks(
   config: AgentConfigV2,
   blocks: readonly PromptBlock[],
@@ -775,11 +1694,12 @@ function validateCognitionBlocks(
         issues.push({ code: 'invalid_block_reference', path })
         return
       }
-      const blockRevision: unknown = (block as unknown as Record<string, unknown>).revision
+      const rawRevision = (block as unknown as Record<string, unknown>).revision
+      const blockRevision = isCanonicalBlockRevision(rawRevision) ? rawRevision : rawRevision === undefined ? 1 : null
       if (!isNonNegativeSafeInteger(expectedPresetRevision)
         || !isNonNegativeSafeInteger(ref.expectedPresetRevision)
         || !isNonNegativeSafeInteger(ref.expectedBlockRevision)
-        || !isCanonicalBlockRevision(blockRevision)) {
+        || blockRevision === null) {
         issues.push({ code: 'invalid_block_reference', path })
       } else if (ref.expectedPresetRevision !== expectedPresetRevision
         || ref.expectedBlockRevision !== blockRevision) {
@@ -1038,6 +1958,22 @@ function validateContextPolicy(
   })
 }
 
+export const INHERITED_IMPORT_REVIEW_ACKNOWLEDGEMENTS: Record<string, true> = {
+  'review:foreign_import': true,
+  'review:cognition_foreign_authority_blocked': true,
+}
+
+export function requiredReviewAcknowledgements(
+  liveRequiredReviewIds: readonly string[],
+  acknowledgements: readonly string[],
+): string[] {
+  const liveIncludesImportReview = liveRequiredReviewIds.some((id) => INHERITED_IMPORT_REVIEW_ACKNOWLEDGEMENTS[id] === true)
+  if (liveIncludesImportReview) return [...liveRequiredReviewIds]
+  const leftover = acknowledgements.filter((id) => INHERITED_IMPORT_REVIEW_ACKNOWLEDGEMENTS[id] === true)
+  if (leftover.length === 0) return [...liveRequiredReviewIds]
+  return [...new Set([...liveRequiredReviewIds, ...leftover])]
+}
+
 export function validateAgenticRuntimeDraft(
   draft: AgenticRuntimeSaveDraft,
   blocks: readonly PromptBlock[],
@@ -1105,6 +2041,16 @@ export function validateAgenticRuntimeDraft(
     issues,
     availableContextRevisionKeys,
   )
+  validateRuntimePolicy(
+    config,
+    promptBlocks as PromptBlock[],
+    expectedPresetRevision,
+    contextPackSelections,
+    availableContextRevisionKeys,
+    predicateBudget,
+    issues,
+    taskTemplateIds,
+  )
   const contextRules = isIndexedArray(draft.contextRules) ? draft.contextRules : []
   if (!isIndexedArray(draft.contextRules)) {
     issues.push({ code: 'invalid_context_rule', path: 'contextRules' })
@@ -1127,11 +2073,10 @@ export function validateAgenticRuntimeDraft(
   if (!isStringList(draft.reviewAcknowledgements)) {
     issues.push({ code: 'review_acknowledgement_unknown', path: 'reviewAcknowledgements' })
   }
-  const requiredReviewIds = new Set(requiredReviewItemIds)
-  if (acknowledgements.some((id) => !requiredReviewIds.has(id))) {
-    issues.push({ code: 'review_acknowledgement_unknown', path: 'reviewAcknowledgements' })
-  }
-  if (requiredReviewItemIds.some((id) => !acknowledgements.includes(id))) {
+  // Live required ids are fail-closed. Leftover inherited import acknowledgements
+  // remain required when they are still the only record of that review.
+  const effectiveRequiredReviewIds = requiredReviewAcknowledgements(requiredReviewItemIds, acknowledgements)
+  if (effectiveRequiredReviewIds.some((id) => !acknowledgements.includes(id))) {
     issues.push({ code: 'review_acknowledgement_required', path: 'reviewAcknowledgements' })
   }
   return { valid: issues.length === 0, issues }
@@ -1173,7 +2118,15 @@ export function getAgenticRuntimeRepairItems(preset: LoomPreset): AgentConfigRep
     ? reviewValue.items.filter((item): item is AgentConfigRepairItem => isValidRepairItem(item))
     : []
   if (reviewShapeIsValid && reviewState === 'ready') return []
-  if (projected.length > 0) return projected
+  const importItem = typeof reviewValue.reasonCode === 'string'
+    && (reviewValue.reasonCode === 'foreign_import' || reviewValue.reasonCode === 'cognition_foreign_authority_blocked')
+    ? invalidReviewItem(reviewValue.reasonCode)
+    : null
+  const withInheritedImportReview = (items: AgentConfigRepairItem[]): AgentConfigRepairItem[] => {
+    if (!importItem || items.some((item) => item.id === importItem.id)) return items
+    return [...items, importItem]
+  }
+  if (projected.length > 0) return withInheritedImportReview(projected)
 
   const unresolvedSlotIds = isStringList(reviewValue.unresolvedSlotIds) ? reviewValue.unresolvedSlotIds : []
   const staleSlotIds = isStringList(reviewValue.staleSlotIds) ? reviewValue.staleSlotIds : []
@@ -1194,7 +2147,7 @@ export function getAgenticRuntimeRepairItems(preset: LoomPreset): AgentConfigRep
     action: { kind: 'map_slot' },
     acknowledged: false,
   }))
-  if (items.length > 0) return items
+  if (items.length > 0) return withInheritedImportReview(items)
 
   const reasonCode = typeof reviewValue.reasonCode === 'string' && reviewValue.reasonCode.trim()
     ? reviewValue.reasonCode

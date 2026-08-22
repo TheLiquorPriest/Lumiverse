@@ -22,7 +22,16 @@ import {
   AGENT_TIMEOUT_MS_MIN,
   createAgenticRuntimeDraft,
   createDefaultAgentConfigV2,
+  createLoomPolicyEntryV1,
+  getAgenticRuntimeRepairItems,
+  getAgentRuntimePolicyBuckets,
   normalizeAgentConfigForEditor,
+  normalizeLoomPolicyBucketsV1,
+  parseAgentCustomPhasesV1,
+  parseLoomPolicyBucketsV1,
+  requiredReviewAcknowledgements,
+  setAgentRuntimeCustomPhases,
+  setAgentRuntimePolicyBuckets,
   validateAgenticRuntimeDraft,
 } from './agenticRuntime'
 
@@ -118,15 +127,24 @@ describe('Agentic Runtime shared draft validation', () => {
 
   test('rejects stale block references instead of silently changing phased instructions', () => {
     const candidate = draft()
-    candidate.config.cognitionPolicy!.workPolicy = [{
-      blockId: 'policy-block',
-      expectedPresetRevision: 8,
-      expectedBlockRevision: 2,
-    }]
+    const staleEntry = createLoomPolicyEntryV1('workPolicy', block(3), 8, 0)
+    candidate.config.runtimePolicy!.loomPolicy = {
+      version: 1,
+      workPolicy: [{
+        ...staleEntry,
+        source: { ...staleEntry.source, blockRevision: 2 },
+      }],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
 
     const result = validateAgenticRuntimeDraft(candidate, [block(3)], 8)
     expect(result.valid).toBe(false)
-    expect(result.issues).toContainEqual({ code: 'stale_block_revision', path: 'config.cognitionPolicy.workPolicy.0' })
+    expect(result.issues).toContainEqual({
+      code: 'stale_policy_source',
+      path: 'config.runtimePolicy.loomPolicy.workPolicy.0.source',
+    })
   })
 
   test('rejects missing context snapshots and cyclic task dependencies as one draft', () => {
@@ -159,6 +177,38 @@ describe('Agentic Runtime shared draft validation', () => {
 
     candidate.reviewAcknowledgements = ['slot:a', 'pack:b']
     expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a', 'pack:b']).valid).toBe(true)
+
+    candidate.reviewAcknowledgements = ['slot:a', 'pack:b', 'review:cognition_foreign_authority_blocked']
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a', 'pack:b']).valid).toBe(true)
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, []).valid).toBe(true)
+    expect(requiredReviewAcknowledgements(['slot:a', 'pack:b'], candidate.reviewAcknowledgements))
+      .toEqual(['slot:a', 'pack:b', 'review:cognition_foreign_authority_blocked'])
+    expect(requiredReviewAcknowledgements(['slot:a', 'pack:b', 'review:foreign_import'], ['review:cognition_foreign_authority_blocked']))
+      .toEqual(['slot:a', 'pack:b', 'review:foreign_import'])
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['review:cognition_foreign_authority_blocked']).valid).toBe(true)
+    candidate.reviewAcknowledgements = []
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['review:cognition_foreign_authority_blocked']).valid).toBe(false)
+
+    const imported = presetWithMetadata({})
+    imported.agentConfigReview = {
+      state: 'review_required',
+      revision: 1,
+      reasonCode: 'foreign_import',
+      unresolvedSlotIds: ['writer'],
+      staleSlotIds: [],
+      items: [{
+        id: 'slot:writer',
+        kind: 'unresolved_slot',
+        reasonCode: 'unresolved_slot',
+        action: { kind: 'map_slot' },
+        acknowledged: false,
+      }],
+    }
+    expect(getAgenticRuntimeRepairItems(imported).map((item) => item.id)).toEqual([
+      'slot:writer',
+      'review:foreign_import',
+    ])
+
   })
 
   test('accepts one internally consistent draft containing phase, context, and task policy', () => {
@@ -188,11 +238,13 @@ describe('Agentic Runtime shared draft validation', () => {
         { kind: 'generation_type', value: 'normal' },
       ] },
     }]
-    candidate.config.cognitionPolicy!.workPolicy = [{
-      blockId: 'policy-block',
-      expectedPresetRevision: 8,
-      expectedBlockRevision: 3,
-    }]
+    candidate.config.runtimePolicy!.loomPolicy = {
+      version: 1,
+      workPolicy: [createLoomPolicyEntryV1('workPolicy', block(3), 8, 0)],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
     candidate.config.contextPolicy = { ruleIds: ['activate_rules'], packIds: ['world-rules'] }
     candidate.config.taskPolicy = { templateIds: ['verify_rules'] }
 
@@ -470,13 +522,406 @@ describe('Agentic Runtime shared draft validation', () => {
       agentConfig: sparse,
       blocks: [],
     })
-    expect(hydrated.config.cognitionPolicy).toEqual({
+    expect(hydrated.config.cognitionPolicy).toBeUndefined()
+    expect(validateAgenticRuntimeDraft(hydrated, [], 0)).toEqual({ valid: true, issues: [] })
+    expect(normalizeAgentConfigForEditor(sparse).taskPolicy).toEqual({ templateIds: [] })
+  })
+})
+describe('Canonical Loom policy and custom phase contracts', () => {
+  const buckets = ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'] as const
+  const destinations = {
+    workPolicy: 'root_work',
+    workspaceUsage: 'root_work',
+    completionCriteria: 'completion_handoff',
+    renderPolicy: 'render',
+  } as const
+  const checkpoints = {
+    workPolicy: 'WORK',
+    workspaceUsage: 'WORK',
+    completionCriteria: 'PREPARE_COMMIT',
+    renderPolicy: 'RENDER',
+  } as const
+
+  const source = (blockId = 'policy-block', promptOrder = 0) => ({
+    kind: 'loom_block' as const,
+    blockId,
+    presetRevision: 8,
+    blockRevision: 3,
+    promptOrder,
+  })
+
+  const policyEntry = (
+    bucket: (typeof buckets)[number],
+    delivery: Record<string, unknown> = { delivery: 'direct' },
+  ) => ({
+    version: 1,
+    id: `${bucket}-entry`,
+    source: source(),
+    destination: destinations[bucket],
+    checkpoint: checkpoints[bucket],
+    required: true,
+    visibility: 'work_only' as const,
+    delivery,
+  })
+
+  const policyDocument = () => ({
+    version: 1,
+    workPolicy: [policyEntry('workPolicy', { delivery: 'direct' })],
+    workspaceUsage: [policyEntry('workspaceUsage', {
+      delivery: 'condition_gated',
+      condition: { kind: 'phase', value: 'WORK' },
+    })],
+    completionCriteria: [policyEntry('completionCriteria', {
+      delivery: 'on_demand',
+      request: {
+        contextPackId: 'workspace-rules',
+        revisionId: 'workspace-rules@3',
+        digest: 'A'.repeat(64),
+      },
+    })],
+    renderPolicy: [policyEntry('renderPolicy', { delivery: 'direct' })],
+  })
+
+  const phase = (
+    id: string,
+    repeatLimit: number,
+    nextPhaseIds: string[],
+    includeSkip = true,
+  ) => {
+    const value: Record<string, unknown> = {
+      version: 1,
+      id,
+      label: id,
+      instructionRefs: [source()],
+      required: true,
+      enter: { kind: 'phase', value: 'WORK' },
+      exit: { kind: 'phase', value: 'COMPLETE' },
+      capabilityRequests: ['workspace_read', 'delegation'],
+      repeatLimit,
+      nextPhaseIds,
+    }
+    if (includeSkip) value.skip = { kind: 'phase', value: 'ASSEMBLE' }
+    return value
+  }
+
+  test('parses the four fixed buckets and all closed delivery forms', () => {
+    const parsed = parseLoomPolicyBucketsV1(policyDocument())
+
+    expect(Object.keys(parsed)).toEqual([
+      'version',
+      'workPolicy',
+      'workspaceUsage',
+      'completionCriteria',
+      'renderPolicy',
+    ])
+    expect(parsed.workPolicy[0]!.delivery).toEqual({ delivery: 'direct' })
+    expect(parsed.workspaceUsage[0]!.delivery).toEqual({
+      delivery: 'condition_gated',
+      condition: { kind: 'phase', value: 'WORK' },
+    })
+    expect(parsed.completionCriteria[0]!.delivery).toEqual({
+      delivery: 'on_demand',
+      request: {
+        contextPackId: 'workspace-rules',
+        revisionId: 'workspace-rules@3',
+        digest: 'a'.repeat(64),
+      },
+    })
+    expect(parsed.renderPolicy[0]!.delivery).toEqual({ delivery: 'direct' })
+    expect(Object.isFrozen(parsed)).toBe(true)
+    expect(Object.isFrozen(parsed.workPolicy)).toBe(true)
+  })
+
+  test('constructor output obeys fixed routing and canonical source provenance', () => {
+    for (const bucket of buckets) {
+      const entry = createLoomPolicyEntryV1(bucket, block(3), 8, 0)
+      const parsed = parseLoomPolicyBucketsV1({
+        version: 1,
+        workPolicy: bucket === 'workPolicy' ? [entry] : [],
+        workspaceUsage: bucket === 'workspaceUsage' ? [entry] : [],
+        completionCriteria: bucket === 'completionCriteria' ? [entry] : [],
+        renderPolicy: bucket === 'renderPolicy' ? [entry] : [],
+      })
+
+      expect(parsed[bucket]).toEqual([entry])
+      expect(entry.source).toEqual(source())
+      expect(entry.destination).toBe(destinations[bucket])
+      expect(entry.checkpoint).toBe(checkpoints[bucket])
+      expect(entry.visibility).toBe('work_only')
+      expect(entry.delivery).toEqual({ delivery: 'direct' })
+    }
+  })
+
+  test('rejects aliases, fifth buckets, and malformed exact references', () => {
+    const valid = policyDocument()
+    const malformedReference = {
+      ...valid,
+      workPolicy: [{
+        ...valid.workPolicy[0],
+        source: { ...valid.workPolicy[0]!.source, phasePolicy: [] },
+      }],
+    }
+
+    expect(() => parseLoomPolicyBucketsV1(malformedReference)).toThrow(/unknown key/)
+    expect(() => parseLoomPolicyBucketsV1({ ...valid, work: [] })).toThrow(/unknown key/)
+    expect(() => parseLoomPolicyBucketsV1({ ...valid, fifthBucket: [] })).toThrow(/unknown key/)
+    expect(() => parseLoomPolicyBucketsV1({
+      ...valid,
+      renderPolicy: [{ ...valid.renderPolicy[0], delivery: { delivery: 'conditional' } }],
+    })).toThrow(/unsupported delivery/)
+  })
+
+  test('rejects sparse policy, phase, predicate, and malformed revision inputs', () => {
+    const sparsePolicy = policyDocument() as Record<string, unknown>
+    sparsePolicy.workPolicy = new Array(1)
+    expect(() => parseLoomPolicyBucketsV1(sparsePolicy)).toThrow(/dense array/)
+
+    const sparsePhases = new Array(1)
+    expect(() => parseAgentCustomPhasesV1(sparsePhases)).toThrow(/ordered phases/)
+
+    const sparsePredicate = policyDocument()
+    sparsePredicate.workspaceUsage = [policyEntry('workspaceUsage', {
+      delivery: 'condition_gated',
+      condition: { kind: 'all', children: new Array(1) },
+    })]
+    expect(() => parseLoomPolicyBucketsV1(sparsePredicate)).toThrow(/invalid predicate/)
+
+    expect(() => createLoomPolicyEntryV1(
+      'workPolicy',
+      { ...block(3), revision: 0 },
+      8,
+      0,
+    )).toThrow(/positive safe integer/)
+    expect(() => parseLoomPolicyBucketsV1({
+      ...policyDocument(),
+      workPolicy: [{
+        ...policyDocument().workPolicy[0],
+        source: { ...source(), blockRevision: 0 },
+      }],
+    })).toThrow(/positive safe integer/)
+  })
+
+  test('parses canonical custom phases with optional skip and repeat boundaries', () => {
+    const parsed = parseAgentCustomPhasesV1([
+      phase('phase_one', 0, []),
+      phase('phase_two', 4, [], false),
+    ])
+
+    expect(parsed.map((entry) => entry.id)).toEqual(['phase_one', 'phase_two'])
+    expect(parsed.map((entry) => entry.repeatLimit)).toEqual([0, 4])
+    expect(parsed[0]!.instructionRefs).toEqual([source()])
+    expect(parsed[0]!.skip).toEqual({ kind: 'phase', value: 'ASSEMBLE' })
+    expect(parsed[1]).not.toHaveProperty('skip')
+    expect(Object.keys(parsed[0]!)).toEqual([
+      'version',
+      'id',
+      'label',
+      'instructionRefs',
+      'required',
+      'enter',
+      'exit',
+      'skip',
+      'capabilityRequests',
+      'repeatLimit',
+      'nextPhaseIds',
+    ])
+  })
+
+  test('rejects duplicate IDs, duplicate or non-exact refs, closed-set capability violations, and bad repeats', () => {
+    const canonical = phase('phase_one', 1, ['phase_one'])
+    expect(() => parseAgentCustomPhasesV1([
+      phase('phase_zero_repeat', 0, ['phase_zero_repeat']),
+    ])).toThrow(/config\.runtimePolicy\.phases\.0\.nextPhaseIds: self transition requires repeatLimit greater than zero/)
+    expect(() => parseAgentCustomPhasesV1([
+      canonical,
+      phase('phase_one', 4, ['phase_one']),
+    ])).toThrow(/duplicate custom phase id/)
+
+    expect(() => parseAgentCustomPhasesV1([{
+      ...canonical,
+      instructionRefs: [source(), source()],
+    }])).toThrow(/duplicate instruction reference/)
+    expect(() => parseAgentCustomPhasesV1([{
+      ...canonical,
+      instructionRefs: [{ ...source(), legacyAlias: true }],
+    }])).toThrow(/unknown key/)
+    expect(() => parseAgentCustomPhasesV1([{
+      ...canonical,
+      capabilityRequests: ['workspace_read', 'workspace_read'],
+    }])).toThrow(/duplicate capability request/)
+    expect(() => parseAgentCustomPhasesV1([{
+      ...canonical,
+      capabilityRequests: ['unknown_capability'],
+    }])).toThrow(/unsupported capability request/)
+
+    for (const repeatLimit of [-1, 5, 1.5]) {
+      expect(() => parseAgentCustomPhasesV1([
+        phase('phase_one', repeatLimit, []),
+      ])).toThrow(/repeatLimit/)
+    }
+  })
+
+  test('validates self and immediate-next transitions but rejects a farther jump', () => {
+    const candidate = draft()
+    const validPhases = parseAgentCustomPhasesV1([
+      phase('phase_one', 1, ['phase_one', 'phase_two']),
+      phase('phase_two', 4, ['phase_two']),
+    ])
+    candidate.config.runtimePolicy = {
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'response',
+      loomPolicy: null,
+      phases: validPhases,
+    }
+    expect(validateAgenticRuntimeDraft(candidate, [block(3)], 8)).toEqual({ valid: true, issues: [] })
+    candidate.config.runtimePolicy.phases = [
+      phase('phase_one', 0, ['phase_one']) as never,
+      phase('phase_two', 4, ['phase_two']) as never,
+    ]
+    expect(validateAgenticRuntimeDraft(candidate, [block(3)], 8).issues)
+      .toContainEqual({
+        code: 'invalid_policy_entry',
+        path: 'config.runtimePolicy.phases.0.repeatLimit',
+      })
+
+
+    candidate.config.runtimePolicy.phases = parseAgentCustomPhasesV1([
+      phase('phase_one', 1, ['phase_one', 'phase_three']),
+      phase('phase_two', 4, ['phase_two']),
+    ])
+    expect(validateAgenticRuntimeDraft(candidate, [block(3)], 8).issues)
+      .toContainEqual({
+        code: 'invalid_policy_entry',
+        path: 'config.runtimePolicy.phases.0.nextPhaseIds.1',
+      })
+  })
+
+  test('normalizes legacy phasePolicy only at ingress into visible global buckets', () => {
+    const legacyPhasePolicy = {
+      work: [{ blockId: 'policy-block', expectedPresetRevision: 8, expectedBlockRevision: 3 }],
+      render: [{ blockId: 'policy-block', expectedPresetRevision: 8, expectedBlockRevision: 3 }],
+    }
+    const { runtimePolicy: _canonicalRuntimePolicy, ...legacyBase } = createDefaultAgentConfigV2()
+    const config = {
+      ...legacyBase,
+      phasePolicy: legacyPhasePolicy,
+    }
+    const normalized = getAgentRuntimePolicyBuckets(config, [block(3)])
+    const directNormalization = normalizeLoomPolicyBucketsV1(null, [block(3)], legacyPhasePolicy)
+
+    expect(normalized).toEqual(directNormalization)
+    expect(Object.keys(normalized)).toEqual([
+      'version',
+      'workPolicy',
+      'workspaceUsage',
+      'completionCriteria',
+      'renderPolicy',
+    ])
+    expect(normalized.workPolicy[0]).toMatchObject({
+      id: 'legacy-workPolicy-policy-block',
+      destination: 'root_work',
+      checkpoint: 'WORK',
+      delivery: { delivery: 'direct' },
+    })
+    expect(normalized.renderPolicy[0]).toMatchObject({
+      id: 'legacy-renderPolicy-policy-block',
+      destination: 'render',
+      checkpoint: 'RENDER',
+      delivery: { delivery: 'direct' },
+    })
+    expect(normalized.workspaceUsage).toEqual([])
+    expect(normalized.completionCriteria).toEqual([])
+    expect(normalized).not.toHaveProperty('work')
+    expect(normalized).not.toHaveProperty('render')
+    expect(normalized).not.toHaveProperty('phasePolicy')
+  })
+
+  test('preserves malformed authored policy and never revives legacy policy beside canonical authority', () => {
+    const legacyReference = {
+      workPolicy: [{ blockId: 'policy-block', expectedPresetRevision: 8, expectedBlockRevision: 3 }],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+    const malformedRuntimePolicy = {
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'response',
+      loomPolicy: { version: 1, workPolicy: null },
+      phases: null,
+    }
+    const authored = {
+      ...createDefaultAgentConfigV2(),
+      cognitionPolicy: legacyReference,
+      phasePolicy: {
+        work: legacyReference.workPolicy,
+        render: [],
+      },
+      runtimePolicy: malformedRuntimePolicy,
+    }
+
+    const hydrated = normalizeAgentConfigForEditor(authored as never) as unknown as Record<string, unknown>
+    expect(hydrated.runtimePolicy).toEqual(malformedRuntimePolicy)
+    expect(hydrated.cognitionPolicy).toEqual(legacyReference)
+    expect(hydrated.phasePolicy).toEqual(authored.phasePolicy)
+    expect(getAgentRuntimePolicyBuckets(authored, [block(3)])).toEqual({
+      version: 1,
       workPolicy: [],
       workspaceUsage: [],
       completionCriteria: [],
       renderPolicy: [],
     })
-    expect(validateAgenticRuntimeDraft(hydrated, [], 0)).toEqual({ valid: true, issues: [] })
-    expect(normalizeAgentConfigForEditor(sparse).taskPolicy).toEqual({ templateIds: [] })
+  })
+
+  test('emits runtimePolicy without legacy aliases or an extra bucket', () => {
+    const config = createDefaultAgentConfigV2()
+    config.phasePolicy = {
+      work: [],
+      render: [],
+    }
+    config.cognitionPolicy = {
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+    const policies = parseLoomPolicyBucketsV1(policyDocument())
+    const emitted = setAgentRuntimePolicyBuckets(config, policies)
+
+    expect(emitted).not.toHaveProperty('phasePolicy')
+    expect(emitted).not.toHaveProperty('cognitionPolicy')
+    expect(Object.keys(emitted.runtimePolicy!)).toEqual([
+      'version',
+      'authority',
+      'scope',
+      'defaultMode',
+      'loomPolicy',
+      'phases',
+    ])
+    expect(Object.keys(emitted.runtimePolicy!.loomPolicy!)).toEqual([
+      'version',
+      'workPolicy',
+      'workspaceUsage',
+      'completionCriteria',
+      'renderPolicy',
+    ])
+    expect(emitted.runtimePolicy!.loomPolicy).toEqual(policies)
+
+    const phases = parseAgentCustomPhasesV1([phase('phase_one', 1, ['phase_one'])])
+    const emittedPhases = setAgentRuntimeCustomPhases(config, phases)
+    expect(emittedPhases).not.toHaveProperty('phasePolicy')
+    expect(emittedPhases).not.toHaveProperty('cognitionPolicy')
+    expect(Object.keys(emittedPhases.runtimePolicy!)).toEqual([
+      'version',
+      'authority',
+      'scope',
+      'defaultMode',
+      'loomPolicy',
+      'phases',
+    ])
+    expect(emittedPhases.runtimePolicy!.phases).toEqual(phases)
   })
 })

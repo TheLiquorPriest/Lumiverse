@@ -391,6 +391,16 @@ assembly compiler in the main process. `prepare_agent_render` runs through the
 terminable strict pool and has the same no-provider/no-live-DB/no-callback
 boundary.
 
+The public Turn Session projection uses the canonical lifecycle
+`ADMIT → ASSEMBLE → WORK → PREPARE_COMMIT → RENDER → COMMIT → TERMINAL`,
+with independent `workStatus` and `workOutcome` fields. The coordinator names
+`COMPLETE`, `COMMITTING`, `COMMITTED`, and `COMMIT_FAILED` in the table below
+are internal execution states, not public phase values: `COMPLETE` projects as
+`PREPARE_COMMIT`; `COMMITTING`/`PREPARE_COMMIT` project as `COMMIT`;
+`COMMITTED` projects as terminal `completed`; and `COMMIT_FAILED` projects as
+terminal `failed`. Internal `CANCELLED`, `TIMED_OUT`, and `EXHAUSTED` states
+project as terminal `stopped`, `failed`, and `exhausted` outcomes respectively.
+
 | Phase | Contract |
 |---|---|
 | `ASSEMBLE` | Freeze the snapshot, validate the effective decision, compile `AssemblyPlanV1` in two independently supervised terminable isolates, and compare their plans. No generation mutation or child execution occurs. |
@@ -509,6 +519,277 @@ narrower boundary in
   `getAgenticRuntimeMode()` in `src/services/turn-execution.service.ts`:
   pre-`Bun.serve` reconciliation, fail-closed readiness, and the rollback
   switch.
+
+
+## WORK Engine public contract
+
+### Runtime mode, provenance, and repair
+
+`POST /api/v1/generate/effective-runtime` returns the authenticated
+`EffectiveRuntimePublicResponseV1`. Its closed public fields are
+`version`, `chatId`, `target`, safe `connection` and `preset` projections,
+`agentsEnabled`, `allowedModes`, `defaultMode`, `requestedMode`,
+`effectiveMode`, `runtimePolicy`, `chatOverride`, `capabilityReadiness`,
+`repairCodes`, `runtimeDecisionToken`, and
+`runtimeDecisionExpiresAt`. It never returns a credential, normalized
+endpoint, or trust-domain fingerprint.
+
+The effective mode has one explicit precedence chain:
+
+1. authenticated one-turn selection supplied as `mode` for this request;
+2. the ready durable chat override;
+3. the reviewed preset default;
+4. the Response fallback.
+
+`mode` is the authenticated one-turn request field. `transientSelection` and
+`transient_selection` are internal runtime-policy fields and are rejected on
+the public effective-runtime request; clients must not send them.
+
+The returned `runtimePolicy` records both decision value and provenance:
+
+```ts
+{
+  version: 1,
+  authoredValue: 'response' | 'agentic',
+  effectiveValue: 'response' | 'agentic',
+  source:
+    | 'authenticated_one_turn'
+    | 'durable_chat_override'
+    | 'reviewed_preset_default'
+    | 'response_fallback'
+    | 'host_cap'
+    | 'host_rejected',
+  scope: 'turn' | 'chat' | 'preset' | 'fallback' | 'host',
+  cap: { authority: 'host', allowedModes: ('response' | 'agentic')[], reasonCode: string | null },
+  availability: {
+    state: 'available' | 'unavailable' | 'stale' | 'invalid' | 'denied' | 'omitted',
+    reasonCode: string | null,
+  },
+  presetRevision: string | number | null,
+  transientSelection: { mode, turnFence, authenticated: true } | null,
+  durableChatOverride: { mode, revision, state, reviewCode, acknowledged } | null,
+  repairAcknowledgement: {
+    state: 'not_required' | 'required' | 'acknowledged',
+    presetRevision: string | number | null,
+    reasonCode: string | null,
+    acknowledgedAt: number | null,
+  },
+  nextTurnOnly: true,
+}
+```
+
+`PUT /api/v1/chats/:id/agent-mode` accepts exactly
+`{ mode: 'response' | 'agentic', expectedRevision: number }`; `DELETE` on
+the same path accepts exactly `{ expectedRevision: number }`. Both return
+`{ chatId, mode, revision, state, appliesTo: 'next_turn' }`. A missing
+precondition is `428 AGENT_CHAT_MODE_REVISION_REQUIRED`; a stale CAS is
+`409 AGENT_CHAT_MODE_REVISION_CONFLICT`. A mode write never changes the
+already-running Turn Session.
+
+`POST /api/v1/presets/:id/agent-runtime/repair-acknowledgement` accepts
+exactly `{ reasonCode: string, expectedPresetRevision: string | number }`.
+Its response is the persisted `{ presetId, presetRevision, reasonCode,
+acknowledgedAt, revision, scope: 'repair/review', state: 'acknowledged' }`.
+The record acknowledges owner review for one preset revision; it does not
+choose a mode or turn a missing capability into an available one.
+
+An Agentic request consumes the opaque decision token once. A stale target,
+revision, binding, capability, context authorization, isolate/publication
+gate, or kill switch fails closed. `effectiveMode: 'response'` is an
+available explicit escape reported by preflight, not permission for an
+Agentic request to downgrade. The caller must submit `mode: 'response'` for
+that escape.
+
+### Explicit assembly surface and Loom delivery
+
+Prompt assembly has one required host-authenticated surface:
+`AssemblySurfaceV1 = 'RESPONSE' | 'WORK'`. The frozen
+`GenerationAssemblySnapshotV1` and the returned `AssemblyPlanV1` both carry
+`assemblySurface`; the compiler never infers it from configuration. The
+direct `raw`, `quiet`, and `batch` helpers remain provider helpers and do
+not run this assembly contract.
+
+The canonical authored policy is
+`AgentConfigV2.runtimePolicy.loomPolicy`, a `LoomPolicyBucketsV1` with
+exactly `workPolicy`, `workspaceUsage`, `completionCriteria`, and
+`renderPolicy` arrays. Every entry carries source provenance
+`{ kind: 'loom_block', blockId, presetRevision, blockRevision, promptOrder }`,
+one fixed `destination` (`root_work`, `completion_handoff`, or `render`),
+one fixed `checkpoint` (`ASSEMBLE`, `WORK`, `PREPARE_COMMIT`, or `RENDER`),
+`required`, `visibility: 'work_only'`, and one delivery:
+`{ delivery: 'direct' }`,
+`{ delivery: 'condition_gated', condition }`, or
+`{ delivery: 'on_demand', request: { contextPackId, revisionId, digest } }`.
+
+Routing is not configurable at runtime: `workPolicy` and `workspaceUsage`
+route to `root_work`/`WORK`, `completionCriteria` routes to
+`completion_handoff`/`PREPARE_COMMIT`, and `renderPolicy` routes to
+`render`/`RENDER`. The plan retains the canonical `loomPolicy` beside its
+materialized message arrays and source blocks. Response assembly excludes
+all `work_only` entries and exposes a typed `responseOmission`; no WORK
+policy, private work note, or child result is copied into a Response.
+
+The owner inspection projection uses `LoomPromptInspectionV1`:
+`{ version, surface, checkpoint, items, effectiveEntryIds,
+responseOmission? }`. Each item identifies its bucket, destination,
+checkpoint, source, delivery, optional effective text/retrieval status, and a
+typed outcome: `included`, `skipped`, `rejected`, `omitted`, or
+`deduplicated`. This is provenance/inspection data, not authority to edit the
+preset.
+
+The outcome reasons are closed. `skipped` uses
+`checkpoint_not_reached | condition_not_met | on_demand_not_requested |
+on_demand_unavailable`; `rejected` uses
+`invalid_source | stale_source | unsupported_delivery |
+unauthorized_retrieval | required_source_unavailable`; `omitted` uses
+`response_mode | destination_unavailable | not_work_surface`; and
+`deduplicated` carries `keptEntryId` and the retained destination.
+`included` carries `effectiveIndex`; on-demand entries may also carry
+`retrievalStatus: not_requested | available | unavailable | stale |
+unauthorized`.
+
+### WORK tools, delegation, and receipts
+
+The strict WORK catalog is closed:
+
+`complete_turn`;
+`workspace_read_section`, `workspace_read_page`,
+`workspace_create_task`, `workspace_update_assigned_progress`,
+`workspace_submit_child_result`, `workspace_accept_submission`,
+`workspace_record_finding`, `workspace_record_decision`,
+`workspace_record_question`, `workspace_attach_artifact`,
+`workspace_propose_publication`;
+`context_pack_list`, `context_pack_get`; and
+`lore_list_books`, `lore_get_book`, `lore_list_entries`, `lore_get_entry`,
+`lore_search_entries`, `chat_search_history`.
+
+`agent_delegate` is not an ordinary catalog entry. It is a separate
+root-only dispatch capability. Its closed arguments are
+`profile_id`, `task_id`, `task`, and optional narrowed `tool_ids`. Admission
+checks the reviewed profile, open task inventory, exact assignment
+acknowledgement, depth-one frame limit, and child output bounds. Root frames
+alone may call `complete_turn` (with bounded `summary`, `unresolvedIds`, and
+optional `renderGuidance`); children cannot complete or delegate.
+
+Root-only workspace operations are `workspace_create_task` and
+`workspace_accept_submission`. A child may use only the read, assigned-progress,
+and assigned-submission operations granted to its frame; all other workspace
+operations require an explicit host grant.
+
+Children receive only granted core tools and host-assigned workspace
+operations. Workspace tool calls carry host-authenticated actor/frame
+context and an expected revision internally. Their result envelope is
+`AgenticWorkspaceResultEnvelopeV1 { result, cognition? }`; `cognition` is
+private host CAS metadata. A completion acceptance carries bounded completion
+data, the accepted workspace revision, and the deterministic workspace context
+projection. Activity/inspection receipts expose identifiers, status, counts,
+and bounded error codes—not arguments, result bodies, or provider carriers.
+
+The host assignment acknowledgement is bounded:
+
+```ts
+{
+  accepted: boolean,
+  workspaceRevision: number,
+  assignments: { taskId: string, frameId: string }[],
+}
+```
+
+Owner inspection child metadata is:
+
+```ts
+{
+  childId: string,
+  profileId: string,
+  slotIndex: number,
+  required: boolean,
+  status: 'succeeded' | 'failed' | 'cancelled' | 'timed_out',
+  outputBytes: number,
+  errorCode?: string,
+}
+```
+
+WORK observations remain metadata-only:
+`{ sequence, callId, correlationId, toolName, status, code?, resultBytes }`.
+Neither observation nor child metadata contains arguments, result bodies, or
+provider carriers.
+
+### Cortex and Council boundaries
+
+Cortex and Council are separate, host-admitted advisory sidecars at the
+`WORK` checkpoint. Neither is a public REST route, a generic WORK tool, a
+child-authority source, or a commit authority. Their values are bounded
+snapshots/advice and their receipts are owner-inspection evidence with
+`canonical: false`; the final Response never contains the private sidecar
+record.
+
+A Cortex read uses a host-owned immutable snapshot identified by owner,
+attempt, chat/target scope, `snapshotId`, and opaque `revision`. It returns
+either `{ kind: 'accepted', value, receipt }` or an optional
+`{ kind: 'omission', omission, receipt }`. A required read fails the WORK
+operation instead of becoming an optional omission. `AgentCortexReceiptV1`
+records `requestId`, `attemptId`, `checkpoint: 'WORK'`, source/current
+revisions, scope, requiredness, timing, state
+(`accepted | omitted | failed | cancelled`), result digest/count,
+correlation, reason, and omission.
+
+Council admission is host-owned and freezes settings, sidecar settings,
+member/tool selections, connection revision, requiredness, and correlation.
+`AgentCouncilReceiptV1` records `requestId`, `checkpoint: 'WORK'`,
+requiredness, timing, state, member count, advice digest, correlation,
+reason, and `canonical: false`. A successful Council result is advisory
+advice only. Optional failure is omitted; required failure is a failed
+WORK operation. Neither sidecar can add tools, spawn children, widen the
+frozen target, or write the canonical message.
+
+### Public errors, usage, and owner reads
+
+Every Agent Run route failure uses
+`{ version: 2, error: AgentRunPublicErrorV2 }`. The error contains
+`code`, `category`, `summaryCode`, `recoveryEligible`, `recoveryAction`,
+`target`, `workPhase`, `workStatus`, `workOutcome`, `reason`,
+`omissionCount`, and `inspectionAttemptId`. `summaryCode` is a stable
+localization key; it is not provider text. `recoveryAction` is host-owned and
+is one of `retry`, `repair`, `reselect`, `use_response`, `resync`, or
+`none`.
+
+`AgentRunPublicV2` is status-only and includes IDs, target, phase/status/
+outcome, attempt lineage, revision/sequence/timestamps, bounded activity,
+aggregate usage, omission markers, recovery fields, and (when applicable)
+the committed terminal handoff. Aggregate usage is
+`{ inputTokens, outputTokens, totalTokens, toolCalls, childInvocations }`.
+Owner inspection detail adds layered usage totals/evidence for
+`root | child | provider | tool | cortex | council`, with source,
+correlation, evidence IDs, and a `canonical` flag, plus causal error
+authority/source/scope/cap-gate detail. Public runs never expose those
+private layers.
+
+Canonical authenticated reads are:
+
+| Method | Endpoint | Result |
+|---|---|---|
+| `GET` | `/api/v1/agent-runs/changes/:chatId` | Cursor delta/full-resync `AgentRunChangesV2` |
+| `GET` | `/api/v1/agent-runs/status/:turnId` | Exact `AgentRunPublicV2` |
+| `GET` | `/api/v1/agent-runs/inspection?chatId=...` | Owner inspection summaries |
+| `GET` | `/api/v1/agent-runs/:attemptId/inspection` | Full owner inspection detail |
+| `POST` | `/api/v1/agent-runs/:attemptId/retry` | Strict retry admission (`202` only after durable admission) |
+| `GET` | `/api/v1/agent-runs/:turnId/workspace` | Redacted Turn Session workspace index |
+| `GET` | `/api/v1/agent-runs/:turnId/workspace/:section` | Redacted page for `objective`, `tasks`, `records`, `submissions`, or `artifacts` |
+| `POST` | `/api/v1/agent-runs/:turnId/stop` | `{ status: 'accepted' | 'too_late' | 'terminal', ... }` |
+
+All reads are owner-scoped and re-check target/Turn Session identity. An
+expired cursor receives one bounded full-resync page and a fresh cursor;
+missing, foreign, or no-longer-retained data is a non-disclosing `404`.
+Inspection retention is layered and bounded; omission markers identify what
+could not be retained or read.
+
+The **Persistent Workspace** is a separate stable, structured owner record.
+Its `/api/v1/agent-runs/workspace...` routes use authenticated owner/chat
+scope and revision CAS; body-supplied owner, chat, actor, or publication
+authority is never trusted. It can outlive a Turn Session or detach from a
+deleted chat. Publication stores an independent bounded copy with source
+digest/provenance; it is not a canonical chat message and does not grant
+WORK authority.
 
 ## Reasoning / extended thinking
 

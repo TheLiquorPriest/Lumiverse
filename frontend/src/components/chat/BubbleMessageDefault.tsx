@@ -448,7 +448,9 @@ export default function BubbleMessageDefault({
         )}
 
         {!isUser && !isEditing ? (
-          <AgentRunActivityStrip chatId={chatId} messageId={message.id} swipeId={message.swipe_id} />
+          <div className={styles.agentRunActivity} data-activity-target={`${message.id}:${message.swipe_id}`}>
+            <AgentRunActivityStrip chatId={chatId} messageId={message.id} swipeId={message.swipe_id} />
+          </div>
         ) : null}
 
         {!isUser && message.extra?.attachments && message.extra.attachments.length > 0 && !isEditing && (

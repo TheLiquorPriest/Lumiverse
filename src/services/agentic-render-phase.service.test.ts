@@ -205,7 +205,7 @@ test("keeps frozen policy messages isolated from provider mutation", async () =>
   expect(policy.messages).toEqual(original);
 });
 
-test("appends only the accepted workspace projection literal to finalization messages", async () => {
+test("frames the accepted workspace projection as authoritative finalization facts", async () => {
   const observed: LlmMessage[] = [];
   const accepted: AgenticAcceptedWorkspaceProjectionV1 = {
     revision: 12,
@@ -225,7 +225,13 @@ test("appends only the accepted workspace projection literal to finalization mes
       return response("isolated");
     },
   });
-  expect(observed.at(-1)).toEqual({ role: "system", content: "Accepted finding: stable" });
+  expect(observed[0]).toEqual({
+    role: "system",
+    content: expect.stringMatching(
+      /Host-accepted workspace projection from completed WORK[\s\S]*final complete_turn submission was accepted[\s\S]*RESPONSE intentionally has no tools[\s\S]*Accepted finding: stable/,
+    ),
+  });
+  expect(observed[1]).toEqual(policy.messages[0]);
 });
 test("rejects a projection whose source revision is not the accepted workspace revision", async () => {
   const stale: AgenticAcceptedWorkspaceProjectionV1 = {

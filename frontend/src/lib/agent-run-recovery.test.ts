@@ -1,8 +1,10 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { beforeEach, describe, expect, test } from 'bun:test'
 import { create } from 'zustand'
 import type { AgentRunChangesV2, AgentRunPublicV2 } from '@/types/agent-runs'
 import type { AgentRunsSlice, AppStore } from '@/types/store'
 import { createAgentRunsSlice, selectActiveAgentRunForChat } from '@/store/slices/agent-runs'
+import { recoverAgentRuns as recoverAgentRunsWithDependencies } from './agent-run-recovery'
+import type { AgentRunChangesApi, AgentRunRecoveryStore } from './agent-run-recovery'
 
 type TestStore = Pick<AppStore, 'activeChatId'> & AgentRunsSlice
 
@@ -14,23 +16,19 @@ const useStore = create<TestStore>()((set, get, api) => ({
     api as unknown as Parameters<typeof createAgentRunsSlice>[2],
   ),
 }))
-
 let changesImpl: (chatId: string, cursor: string | null) => Promise<AgentRunChangesV2>
 let changesCalls = 0
 
-mock.module('@/store', () => ({ useStore }))
-mock.module('@/api/agent-runs', () => ({
-  agentRunsApi: {
-    changes: (chatId: string, cursor: string | null) => {
-      changesCalls += 1
-      return changesImpl(chatId, cursor)
-    },
+const recoveryApi: AgentRunChangesApi = {
+  changes: (chatId, cursor) => {
+    changesCalls += 1
+    return changesImpl(chatId, cursor ?? null)
   },
-}))
-// The recovery module must load after its store/API mocks so this test exercises the bound singleton dependencies.
-
-const { recoverAgentRuns } = await import('./agent-run-recovery')
-mock.restore()
+}
+const recoveryStore: AgentRunRecoveryStore = {
+  getState: () => useStore.getState(),
+}
+const recoverAgentRuns = (chatId: string) => recoverAgentRunsWithDependencies(chatId, recoveryApi, recoveryStore)
 
 function activeRun(overrides: Partial<AgentRunPublicV2> = {}): AgentRunPublicV2 {
   return {
@@ -41,8 +39,26 @@ function activeRun(overrides: Partial<AgentRunPublicV2> = {}): AgentRunPublicV2 
     chatId: 'chat-a',
     generationType: 'normal',
     target: null,
-    status: 'WORK',
-    phase: 'WORK',
+    workPhase: 'WORK',
+    workStatus: 'running',
+    workOutcome: null,
+    recoveryEligible: false,
+    recoveryAction: 'none',
+    omissionCount: 0,
+    inspectionAttemptId: 'attempt-a',
+    reason: null,
+    attemptLineage: {
+      version: 1,
+      attemptId: 'attempt-a',
+      previousAttemptId: null,
+      target: {
+        chatId: 'chat-a',
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+      },
+      createdAt: 1_000,
+    },
     revision: 1,
     sequence: 1,
     startedAt: 1_000,

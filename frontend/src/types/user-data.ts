@@ -35,6 +35,12 @@ export const USER_DATA_LIMITS: {
 })
 
 /**
+ * Schema version written into new .lvbak manifests.
+ * Keep equal to src/services/user-data/manifest.ts `ARCHIVE_SCHEMA_VERSION`.
+ */
+export const ARCHIVE_SCHEMA_VERSION = 3
+
+/**
  * The complete set of stable portability failure reasons. `unknown` is the
  * sentinel used when the server sends a code this build does not know; every
  * other entry has a matching `settings:dataPortability.failureReasons` string
@@ -113,6 +119,58 @@ export interface UserDataProgress {
   total: number | null
 }
 
+export const USER_DATA_RUNTIME_POLICY_VERSION = 1 as const
+export const USER_DATA_RUNTIME_POLICY_SOURCES = [
+  'authenticated_one_turn',
+  'durable_chat_override',
+  'reviewed_preset_default',
+  'response_fallback',
+  'host_cap',
+  'host_rejected',
+] as const
+export const USER_DATA_RUNTIME_POLICY_SCOPES = ['turn', 'chat', 'preset', 'fallback', 'host'] as const
+export const USER_DATA_RUNTIME_POLICY_AVAILABILITY = ['available', 'unavailable', 'stale', 'invalid', 'denied', 'omitted'] as const
+export type UserDataRuntimePolicySource = (typeof USER_DATA_RUNTIME_POLICY_SOURCES)[number]
+export type UserDataRuntimePolicyScope = (typeof USER_DATA_RUNTIME_POLICY_SCOPES)[number]
+export type UserDataRuntimePolicyAvailability = (typeof USER_DATA_RUNTIME_POLICY_AVAILABILITY)[number]
+
+export interface UserDataRuntimePolicyV1 {
+  version: typeof USER_DATA_RUNTIME_POLICY_VERSION
+  authoredValue: 'response' | 'agentic'
+  effectiveValue: 'response' | 'agentic'
+  source: UserDataRuntimePolicySource
+  scope: UserDataRuntimePolicyScope
+  cap: {
+    authority: 'host'
+    allowedModes: ('response' | 'agentic')[]
+    reasonCode: string | null
+  }
+  availability: {
+    state: UserDataRuntimePolicyAvailability
+    reasonCode: string | null
+  }
+  presetRevision: number | string | null
+  transientSelection: {
+    mode: 'response' | 'agentic'
+    turnFence: number | string
+    authenticated: true
+  } | null
+  durableChatOverride: {
+    mode: 'response' | 'agentic' | null
+    revision: number
+    state: 'ready' | 'review_required' | 'repair_required'
+    reviewCode: string | null
+    acknowledged: boolean
+  } | null
+  repairAcknowledgement: {
+    state: 'not_required' | 'required' | 'acknowledged'
+    presetRevision: number | string | null
+    reasonCode: string | null
+    acknowledgedAt: number | null
+  }
+  nextTurnOnly: true
+}
+
 export interface UserDataManifest {
   schemaVersion: number
   exportedAt: number
@@ -131,6 +189,7 @@ export interface UserDataManifest {
   registryVersion: number | null
   snapshotId: string | null
   entryCount: number | null
+  runtimePolicy?: UserDataRuntimePolicyV1 | null
 }
 
 export interface UserDataSummaryCounts {
@@ -376,6 +435,114 @@ export function normalizeUserDataApiFailure(error: unknown, fallback: UserDataFa
 }
 
 
+function parseUserDataRuntimeRevision(value: unknown, field: string, nullable = true): number | string | null {
+  if (value === null && nullable) return null
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= USER_DATA_LIMITS.maxCounter) return value
+  if (typeof value === 'string' && value.length > 0 && byteLength(value) <= USER_DATA_LIMITS.maxStringBytes) return value
+  throw new UserDataProtocolError('malformed_response', `${field} is invalid`)
+}
+function parseUserDataRuntimeBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') throw new UserDataProtocolError('malformed_response', `${field} is invalid`)
+  return value
+}
+
+
+export function normalizeUserDataRuntimePolicy(value: unknown): UserDataRuntimePolicyV1 | null {
+  if (value === null || value === undefined) return null
+  if (!isRecord(value)) throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy is invalid')
+  const requiredKeys = ['version', 'authoredValue', 'effectiveValue', 'source', 'scope', 'cap', 'availability', 'presetRevision', 'transientSelection', 'durableChatOverride', 'repairAcknowledgement', 'nextTurnOnly']
+  if (Object.keys(value).some((key) => !requiredKeys.includes(key)) || requiredKeys.some((key) => !Object.hasOwn(value, key))) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy contains unknown or missing fields')
+  }
+  if (value.version !== USER_DATA_RUNTIME_POLICY_VERSION || value.nextTurnOnly !== true) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy version is invalid')
+  }
+  const modes = ['response', 'agentic'] as const
+  const parseMode = (mode: unknown, field: string): 'response' | 'agentic' => {
+    if (mode !== 'response' && mode !== 'agentic') throw new UserDataProtocolError('malformed_response', `${field} is invalid`)
+    return mode
+  }
+  const source = value.source
+  if (!(USER_DATA_RUNTIME_POLICY_SOURCES as readonly string[]).includes(String(source))) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.source is invalid')
+  }
+  const scope = value.scope
+  if (!(USER_DATA_RUNTIME_POLICY_SCOPES as readonly string[]).includes(String(scope))) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.scope is invalid')
+  }
+  if (!isRecord(value.cap) || Object.keys(value.cap).some((key) => !['authority', 'allowedModes', 'reasonCode'].includes(key)) || Object.keys(value.cap).length !== 3 || value.cap.authority !== 'host' || !Array.isArray(value.cap.allowedModes) || value.cap.allowedModes.length > 2 || value.cap.allowedModes.some((mode) => !modes.includes(mode as typeof modes[number]))) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.cap is invalid')
+  }
+  const cap = value.cap as Record<string, unknown>
+  const allowedModes = (cap.allowedModes as unknown[]).map((mode) => parseMode(mode, 'manifest.runtimePolicy.cap.allowedModes'))
+  if (new Set(allowedModes).size !== allowedModes.length) throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.cap.allowedModes is invalid')
+  const parseReason = (reason: unknown, field: string): string | null => reason === null ? null : optionalString(reason, field)
+  if (!isRecord(value.availability) || Object.keys(value.availability).some((key) => !['state', 'reasonCode'].includes(key)) || Object.keys(value.availability).length !== 2 || !(USER_DATA_RUNTIME_POLICY_AVAILABILITY as readonly string[]).includes(String(value.availability.state))) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.availability is invalid')
+  }
+  const availability = value.availability as Record<string, unknown>
+  const transientSelection = value.transientSelection === null ? null : value.transientSelection as Record<string, unknown>
+  if (transientSelection !== null) {
+    if (!isRecord(transientSelection) || Object.keys(transientSelection).some((key) => !['mode', 'turnFence', 'authenticated'].includes(key)) || Object.keys(transientSelection).length !== 3 || transientSelection.authenticated !== true) {
+      throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.transientSelection is invalid')
+    }
+  }
+  const durableChatOverrideValue = value.durableChatOverride
+  let durableChatOverride: Record<string, unknown> | null
+  if (durableChatOverrideValue === null) {
+    durableChatOverride = null
+  } else if (!isRecord(durableChatOverrideValue)) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.durableChatOverride is invalid')
+  } else {
+    durableChatOverride = durableChatOverrideValue
+  }
+  if (durableChatOverride !== null) {
+    if (Object.keys(durableChatOverride).some((key) => !['mode', 'revision', 'state', 'reviewCode', 'acknowledged'].includes(key)) || Object.keys(durableChatOverride).length !== 5 || !['ready', 'review_required', 'repair_required'].includes(String(durableChatOverride.state)) || typeof durableChatOverride.revision !== 'number' || !Number.isSafeInteger(durableChatOverride.revision) || durableChatOverride.revision < 0 || typeof durableChatOverride.acknowledged !== 'boolean') {
+      throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.durableChatOverride is invalid')
+    }
+  }
+  const repairAcknowledgement = value.repairAcknowledgement as Record<string, unknown>
+  if (!isRecord(repairAcknowledgement) || Object.keys(repairAcknowledgement).some((key) => !['state', 'presetRevision', 'reasonCode', 'acknowledgedAt'].includes(key)) || Object.keys(repairAcknowledgement).length !== 4 || !['not_required', 'required', 'acknowledged'].includes(String(repairAcknowledgement.state))) {
+    throw new UserDataProtocolError('malformed_response', 'manifest.runtimePolicy.repairAcknowledgement is invalid')
+  }
+  return {
+    version: USER_DATA_RUNTIME_POLICY_VERSION,
+    authoredValue: parseMode(value.authoredValue, 'manifest.runtimePolicy.authoredValue'),
+    effectiveValue: parseMode(value.effectiveValue, 'manifest.runtimePolicy.effectiveValue'),
+    source: source as UserDataRuntimePolicySource,
+    scope: scope as UserDataRuntimePolicyScope,
+    cap: {
+      authority: 'host',
+      allowedModes,
+      reasonCode: parseReason(cap.reasonCode, 'manifest.runtimePolicy.cap.reasonCode'),
+    },
+    availability: {
+      state: availability.state as UserDataRuntimePolicyAvailability,
+      reasonCode: parseReason(availability.reasonCode, 'manifest.runtimePolicy.availability.reasonCode'),
+    },
+    presetRevision: parseUserDataRuntimeRevision(value.presetRevision, 'manifest.runtimePolicy.presetRevision'),
+    transientSelection: transientSelection === null ? null : {
+      mode: parseMode(transientSelection.mode, 'manifest.runtimePolicy.transientSelection.mode'),
+      turnFence: parseUserDataRuntimeRevision(transientSelection.turnFence, 'manifest.runtimePolicy.transientSelection.turnFence', false) as number | string,
+      authenticated: true,
+    },
+    durableChatOverride: durableChatOverride === null ? null : {
+      mode: durableChatOverride.mode === null ? null : parseMode(durableChatOverride.mode, 'manifest.runtimePolicy.durableChatOverride.mode'),
+      revision: boundedInteger(durableChatOverride.revision, 'manifest.runtimePolicy.durableChatOverride.revision'),
+      state: durableChatOverride.state as 'ready' | 'review_required' | 'repair_required',
+      reviewCode: parseReason(durableChatOverride.reviewCode, 'manifest.runtimePolicy.durableChatOverride.reviewCode'),
+      acknowledged: parseUserDataRuntimeBoolean(durableChatOverride.acknowledged, 'manifest.runtimePolicy.durableChatOverride.acknowledged'),
+    },
+    repairAcknowledgement: {
+      state: repairAcknowledgement.state as 'not_required' | 'required' | 'acknowledged',
+      presetRevision: parseUserDataRuntimeRevision(repairAcknowledgement.presetRevision, 'manifest.runtimePolicy.repairAcknowledgement.presetRevision'),
+      reasonCode: parseReason(repairAcknowledgement.reasonCode, 'manifest.runtimePolicy.repairAcknowledgement.reasonCode'),
+      acknowledgedAt: repairAcknowledgement.acknowledgedAt === null ? null : optionalTimestamp(repairAcknowledgement.acknowledgedAt, 'manifest.runtimePolicy.repairAcknowledgement.acknowledgedAt'),
+    },
+    nextTurnOnly: true,
+  }
+}
+
 function parseManifest(value: unknown): UserDataManifest | null {
   if (value === null || value === undefined) return null
   if (!isRecord(value)) throw new UserDataProtocolError('malformed_response', 'manifest is invalid')
@@ -408,6 +575,7 @@ function parseManifest(value: unknown): UserDataManifest | null {
     registryVersion: value.registryVersion === undefined ? null : boundedInteger(value.registryVersion, 'manifest.registryVersion', 100_000),
     snapshotId: optionalString(value.snapshotId, 'manifest.snapshotId', USER_DATA_LIMITS.maxJobIdBytes),
     entryCount: Array.isArray(entries) ? entries.length : null,
+    runtimePolicy: Object.hasOwn(value, 'runtimePolicy') ? normalizeUserDataRuntimePolicy(value.runtimePolicy) : null,
   }
 }
 

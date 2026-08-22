@@ -35,6 +35,7 @@ const TEST_CONTEXT_SNAPSHOT: ContextPackCandidateSnapshotV1 = Object.freeze({
 function snapshotFixture(target: AgenticTargetSnapshot, contextPackSnapshot = TEST_CONTEXT_SNAPSHOT): GenerationAssemblySnapshotV1 {
   return {
     version: 1,
+    assemblySurface: "WORK",
     snapshotId: "snapshot-test",
     userId: "user-1",
     generationId: "generation-test",
@@ -77,6 +78,7 @@ function planFixture(snapshot: GenerationAssemblySnapshotV1): AssemblyPlanV1 {
   return {
     version: 1,
     operation: "compile_agent_assembly",
+    assemblySurface: "WORK",
     requestId: "request-test",
     limits: snapshot.limits,
     providerMessages: messages,
@@ -95,9 +97,12 @@ function planFixture(snapshot: GenerationAssemblySnapshotV1): AssemblyPlanV1 {
     inputRevisionSet: snapshot.inputRevisionSet,
     contextPackSnapshot: snapshot.contextPackSnapshot,
     workPolicyMessages: [],
+    customPhasePlan: { status: "ready", phases: [], issues: [], omittedPhaseIds: [] },
     workspaceUsageMessages: [],
     completionCriteriaMessages: [],
     renderPolicyMessages: [],
+    loomPolicy: { version: 1, workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
+    loomBlocks: [],
     snapshotId: snapshot.snapshotId,
   };
 }
@@ -174,6 +179,18 @@ describe("agentic generation orchestration", () => {
       expect(log).toEqual(["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "terminal:completed", "cleanup"]);
     }
   });
+  test("publishes completed orchestration without a failure reason", async () => {
+    let terminalReason: string | null | undefined;
+    const started = await runAgenticGeneration(input(), dependencies([], {
+      publishTerminal: (event) => {
+        terminalReason = event.reason;
+      },
+    }));
+    const result = await settle(started.generationId) as { status: string };
+    expect(result.status).toBe("completed");
+    expect(terminalReason).toBeNull();
+  });
+
 
   test("does not dispatch provider work or mutate through commit when preflight fails", async () => {
     const calls: string[] = [];
@@ -183,9 +200,9 @@ describe("agentic generation orchestration", () => {
       commit: async () => { calls.push("commit"); return { receiptId: "never" }; },
     }));
     const result = await settle(started.generationId) as { status: string; errorCode: string };
-    expect(result.status).toBe("failed");
-    expect(result.errorCode).toBe("agentic_internal_error");
-    expect(calls).toEqual(["snapshot", "FAILED", "terminal:failed", "cleanup"]);
+    expect(result.status).toBe("rejected");
+    expect(result.errorCode).toBe("agentic_preflight_failed");
+    expect(calls).toEqual(["snapshot", "FAILED", "terminal:rejected", "cleanup"]);
   });
 
   test("uses internal resolution when UI did not provide a token", async () => {
@@ -416,4 +433,19 @@ describe("agentic generation orchestration", () => {
     expect((observed as { data: { candidates: readonly unknown[] } }).data.candidates).toHaveLength(0);
   });
 
+  test("refused retry admission does not publish a phantom attempt", async () => {
+    const { retryAgenticGeneration } = await import("./agentic-generation.service");
+    const events: string[] = [];
+    const retryDeps = dependencies(events, {
+      resolveRuntime: async () => ({ mode: "agentic" as const }),
+      createExecution: () => {
+        throw new Error("agentic_target_unsupported");
+      },
+      publishTerminal: () => { events.push("terminal"); },
+    });
+    await expect(retryAgenticGeneration(input({ generationType: "normal" }), "attempt-previous", retryDeps))
+      .rejects.toThrow("agentic_target_unsupported");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).not.toContain("terminal");
+  });
 });

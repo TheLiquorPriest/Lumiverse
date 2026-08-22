@@ -298,7 +298,11 @@ describe("AgentRunPublicV2 projection and cursor", () => {
         ...baseInput(OWNER, "chat-replay", "turn-replay"),
         status: "COMMITTED",
       }))();
-      expect(committed.run.status).toBe("COMMITTED");
+      expect(committed.run).toMatchObject({
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: "completed",
+      });
       getDb().query(
         `UPDATE agent_chat_events
             SET delivery_state = 'leased',
@@ -385,7 +389,11 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       execution,
       receipt,
     ))();
-    expect(repaired.run.status).toBe("COMMITTED");
+    expect(repaired.run).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "completed",
+    });
     expect(repaired.run.terminalHandoff).toMatchObject({
       messageId: "message-repair",
       swipeId: 1,
@@ -546,8 +554,18 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(getDb().query(
       "SELECT state FROM agent_turn_executions WHERE id = ?",
     ).get("turn-recovery-commit-failed")).toEqual({ state: "COMMIT_FAILED" });
-    expect(getAgentRun(OWNER, "turn-recovery-failed", "chat-recovery-terminal")?.status).toBe("FAILED");
-    expect(getAgentRun(OWNER, "turn-recovery-commit-failed", "chat-recovery-terminal")?.status).toBe("COMMIT_FAILED");
+    expect(getAgentRun(OWNER, "turn-recovery-failed", "chat-recovery-terminal")).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      reason: "failed",
+    });
+    expect(getAgentRun(OWNER, "turn-recovery-commit-failed", "chat-recovery-terminal")).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      reason: "commit_failed",
+    });
     expect(getDb().query(
       `SELECT status, event_kind
          FROM agent_chat_events
@@ -562,6 +580,39 @@ describe("AgentRunPublicV2 projection and cursor", () => {
         ORDER BY sequence DESC
         LIMIT 1`,
     ).get("turn-recovery-commit-failed")).toEqual({ status: "COMMIT_FAILED", event_kind: "terminal" });
+  });
+
+  test("terminal status-only snapshots cannot retain a nonterminal public lifecycle", () => {
+    seedChat(OWNER, "chat-terminal-status-only");
+    seedRun(OWNER, "chat-terminal-status-only", "turn-terminal-status-only");
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-terminal-status-only", "turn-terminal-status-only"),
+    }));
+
+    const terminal = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      userId: OWNER,
+      chatId: "chat-terminal-status-only",
+      turnId: "turn-terminal-status-only",
+      generationId: "turn-terminal-status-only",
+      generationType: "normal",
+      status: "FAILED",
+    }));
+
+    expect(terminal.run).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      reason: "failed",
+      activity: [{
+        phase: "TERMINAL",
+        status: "failed",
+      }],
+      error: {
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: "failed",
+      },
+    });
   });
 
   test("keeps target association owner-scoped and atomically writes terminal handoff plus compatibility activity", () => {
@@ -606,9 +657,14 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(getDb().query(
       "SELECT state, cas_owner FROM agent_turn_executions WHERE id = 'turn-stop'",
     ).get()).toEqual({ state: "CANCELLED", cas_owner: null });
-    expect(getAgentRun(OWNER, "turn-stop")?.status).toBe("CANCELLED");
+    expect(getAgentRun(OWNER, "turn-stop")).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "stopped",
+      reason: "stopped",
+    });
     expect(getAgentRun(OWNER, "turn-stop")?.activity[0]).toMatchObject({
-      phase: "CANCELLED",
+      phase: "TERMINAL",
       status: "cancelled",
     });
 
@@ -641,7 +697,12 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       expect(getDb().query(
         "SELECT state, cas_owner FROM agent_turn_executions WHERE id = ?",
       ).get(turnId)).toEqual({ state: "CANCELLED", cas_owner: null });
-      expect(getAgentRun(OWNER, turnId)?.status).toBe("CANCELLED");
+      expect(getAgentRun(OWNER, turnId)).toMatchObject({
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: "stopped",
+        reason: "stopped",
+      });
       expect(getDb().query(
         "SELECT COUNT(*) AS count FROM messages WHERE chat_id = ?",
       ).get(chatId)).toEqual({ count: 0 });
@@ -668,7 +729,11 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(getDb().query(
       "SELECT state, cas_owner FROM agent_turn_executions WHERE id = 'turn-committing-stop'",
     ).get()).toEqual({ state: "COMMITTING", cas_owner: null });
-    expect(getAgentRun(OWNER, "turn-committing-stop")?.status).toBe("COMMITTING");
+    expect(getAgentRun(OWNER, "turn-committing-stop")).toMatchObject({
+      workPhase: "COMMIT",
+      workStatus: "running",
+      workOutcome: null,
+    });
   });
   test("returns too_late for already COMMITTED without rewriting the terminal result", () => {
     seedChat(OWNER, "chat-committed-stop");
@@ -707,7 +772,12 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(getDb().query(
       "SELECT state, cas_owner FROM agent_turn_executions WHERE id = 'turn-terminal-stop'",
     ).get()).toEqual({ state: "CANCELLED", cas_owner: null });
-    expect(getAgentRun(OWNER, "turn-terminal-stop")?.status).toBe("CANCELLED");
+    expect(getAgentRun(OWNER, "turn-terminal-stop")).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "stopped",
+      reason: "stopped",
+    });
   });
 
   test("repairs an active projection only after observing an already-terminal durable row", () => {
@@ -721,7 +791,12 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       turnId: "turn-terminal-repair",
       revision: 2,
     });
-    expect(getAgentRun(OWNER, "turn-terminal-repair")?.status).toBe("CANCELLED");
+    expect(getAgentRun(OWNER, "turn-terminal-repair")).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "stopped",
+      reason: "stopped",
+    });
     expect(getDb().query(
       "SELECT state FROM agent_turn_executions WHERE id = 'turn-terminal-repair'",
     ).get()).toEqual({ state: "CANCELLED" });
@@ -741,15 +816,28 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     ).run(OWNER, "chat-workspace");
     getDb().query(
       `INSERT INTO agent_workspace_tasks
-        (task_id, workspace_id, turn_id, user_id, chat_id, title, state, required,
-         dependencies_json, retention, expires_at)
+        (task_id, workspace_id, turn_id, user_id, chat_id, title, description, state,
+         required, dependencies_json, progress, summary, byte_count, revision,
+         retention, expires_at, created_at, updated_at)
        VALUES ('task-1', 'workspace-1', 'turn-workspace', ?, ?,
-               'private task prose', 'active', 1, '["dependency"]', 'turn_terminal', 9999999999)`,
+               'private task prose', 'private task prose', 'active', 1, '["dependency"]',
+               0, NULL, 0, 0, 'turn_terminal', 9999999999, 1, 1)`,
     ).run(OWNER, "chat-workspace");
+    getDb().query(
+      `INSERT INTO agent_workspace_records
+        (record_id, workspace_id, turn_id, user_id, chat_id, kind, summary, digest,
+         task_id, source_frame_id, byte_count, revision, retention, expires_at, created_at)
+       VALUES ('record-1', 'workspace-1', 'turn-workspace', ?, ?, 'finding',
+               'private record prose', ?, NULL, NULL, 20, 0, 'turn_terminal',
+               9999999999, 1)`,
+    ).run(OWNER, "chat-workspace", "a".repeat(64));
     const preview = getWorkspacePreview(OWNER, "turn-workspace", "tasks");
     expect(preview?.entries[0]).toMatchObject({ kind: "task", id: "task-1", title: "Task task-1" });
     expect(JSON.stringify(preview)).not.toContain("private objective prose");
     expect(JSON.stringify(preview)).not.toContain("private task prose");
+    const recordPreview = getWorkspacePreview(OWNER, "turn-workspace", "records");
+    expect(recordPreview?.entries[0]).toMatchObject({ kind: "finding", id: "record-1", title: "finding" });
+    expect(JSON.stringify(recordPreview)).not.toContain("private record prose");
   });
   test("rejects a stored target when its swipe disappears", () => {
     seedChat(OWNER, "chat-stale-swipe");
@@ -837,6 +925,47 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       targetSwipeId: 1,
     }))).toThrow("agent run projection ownership mismatch");
   });
+  test("preserves immutable attempt lineage across phase and terminal projections", () => {
+    seedChat(OWNER, "chat-lineage");
+    seedRun(OWNER, "chat-lineage", "turn-lineage");
+    getDb().query(
+      `INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, swipes)
+       VALUES ('message-lineage', 'chat-lineage', 0, 0, 'assistant', 'safe', '["zero","one","two"]')`,
+    ).run();
+    const attemptLineage = {
+      version: 1 as const,
+      attemptId: "attempt-lineage",
+      previousAttemptId: "attempt-parent",
+      target: {
+        chatId: "chat-lineage",
+        generationType: "swipe" as const,
+        messageId: "message-lineage",
+        swipeId: 2,
+      },
+      createdAt: 42,
+    };
+    const phase = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-lineage", "turn-lineage"),
+      generationType: "swipe",
+      status: "WORK",
+      targetMessageId: "message-lineage",
+      targetSwipeId: 2,
+      attemptLineage,
+    }));
+    expect(phase.run.attemptLineage).toEqual(attemptLineage);
+
+    const terminal = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-lineage", "turn-lineage"),
+      generationType: "swipe",
+      status: "FAILED",
+      targetMessageId: "message-lineage",
+      targetSwipeId: 2,
+      attemptLineage,
+      error: { code: "provider_error", retryable: true },
+    }));
+    expect(terminal.run.attemptLineage).toEqual(attemptLineage);
+    expect(getAgentRun(OWNER, "turn-lineage")?.attemptLineage).toEqual(attemptLineage);
+  });
   test("dispatches live Stop to the registered cancellation owner", () => {
     seedChat(OWNER, "chat-live-stop");
     seedRun(OWNER, "chat-live-stop", "turn-live-stop");
@@ -853,7 +982,11 @@ describe("AgentRunPublicV2 projection and cursor", () => {
         revision: 1,
       });
       expect(received).toBe(`${OWNER}/chat-live-stop/turn-live-stop/turn-live-stop`);
-      expect(getAgentRun(OWNER, "turn-live-stop")?.status).toBe("WORK");
+      expect(getAgentRun(OWNER, "turn-live-stop")).toMatchObject({
+        workPhase: "WORK",
+        workStatus: "running",
+        workOutcome: null,
+      });
     } finally {
       unregister();
     }
@@ -868,7 +1001,11 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(getDb().query(
       "SELECT state, cas_owner FROM agent_turn_executions WHERE id = 'turn-unowned-stop'",
     ).get()).toEqual({ state: "WORK", cas_owner: "live-owner" });
-    expect(getAgentRun(OWNER, "turn-unowned-stop")?.status).toBe("WORK");
+    expect(getAgentRun(OWNER, "turn-unowned-stop")).toMatchObject({
+      workPhase: "WORK",
+      workStatus: "running",
+      workOutcome: null,
+    });
   });
 
   test("expires reads and bounds cleanup without deleting chat-lifetime workspace entries", () => {
@@ -891,10 +1028,12 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     ).run(OWNER, "chat-expiry");
     getDb().query(
       `INSERT INTO agent_workspace_tasks
-        (task_id, workspace_id, turn_id, user_id, chat_id, title, state, required,
-         dependencies_json, retention, expires_at)
+        (task_id, workspace_id, turn_id, user_id, chat_id, title, description, state,
+         required, dependencies_json, progress, summary, byte_count, revision,
+         retention, expires_at, created_at, updated_at)
        VALUES ('task-chat-life', 'workspace-expiry', 'turn-expiry', ?, ?,
-               'private', 'active', 1, '[]', 'chat_lifetime', 1)`,
+               'private', '', 'active', 1, '[]', 0, NULL, 0, 0,
+               'chat_lifetime', 1, 1, 1)`,
     ).run(OWNER, "chat-expiry");
     const result = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
     expect(result.removedProjections).toBe(1);

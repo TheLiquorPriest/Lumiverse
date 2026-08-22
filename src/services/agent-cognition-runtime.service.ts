@@ -4,6 +4,7 @@ import {
   compareCognitionUtf8,
   completeCognitionFixedPoint,
   createCognitionActivationState,
+  inspectLoomPromptPolicies,
   parseCognitionGraph,
   parseContextActivationRule,
   freezeCognitionGraph,
@@ -19,6 +20,7 @@ import {
   type CognitionContextPackCandidateV1,
   type CognitionContextPackRequirementV1,
   type CognitionContextPackSelectionV1,
+  type CognitionTaskIdentityV1,
   type CognitionRuntimeActivationV1,
   type CognitionRuntimeCompletionInputV1,
   type CognitionRuntimeCompletionV1,
@@ -42,6 +44,9 @@ import type {
   CognitionPhase,
   CognitionTaskTransition,
   FrozenCognitionGraphV1,
+  CognitionLoomBlockRefV1,
+  CognitionPolicyRefsV1,
+  LoomPolicyBucketsV1,
   TaskTemplateV1,
 } from "../types/agent-cognition";
 import {
@@ -57,12 +62,58 @@ import {
 
 const encoder = new TextEncoder();
 const HEX = "0123456789abcdefABCDEF";
-const EMPTY_POLICY = Object.freeze({
+const EMPTY_POLICY: CognitionPolicyRefsV1 = Object.freeze({
   workPolicy: Object.freeze([]),
   workspaceUsage: Object.freeze([]),
   completionCriteria: Object.freeze([]),
   renderPolicy: Object.freeze([]),
 });
+const LOOM_POLICY_BUCKET_KEYS = ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const;
+
+function refsFromCanonicalLoomPolicy(value: unknown): CognitionPolicyRefsV1 {
+  if (value === undefined || value === null) return EMPTY_POLICY;
+  if (!isRecord(value)) failSource("config.runtimePolicy.loomPolicy", "expected a canonical Loom policy object");
+  const result = {} as Record<(typeof LOOM_POLICY_BUCKET_KEYS)[number], CognitionLoomBlockRefV1[]>;
+  for (const bucket of LOOM_POLICY_BUCKET_KEYS) {
+    const rawEntries = value[bucket];
+    if (!Array.isArray(rawEntries)) failSource(`config.runtimePolicy.loomPolicy.${bucket}`, "expected an array");
+    result[bucket] = rawEntries.map((rawEntry, index): CognitionLoomBlockRefV1 => {
+      const path = `config.runtimePolicy.loomPolicy.${bucket}[${index}]`;
+      if (!isRecord(rawEntry) || !isRecord(rawEntry.source)) {
+        failSource(path, "expected a Loom entry with source provenance");
+      }
+      const source = rawEntry.source;
+      if (typeof source.blockId !== "string") {
+        failSource(`${path}.source`, "invalid Loom block provenance");
+      }
+      const presetRevision = nonNegativeSafeInteger(source.presetRevision, `${path}.source.presetRevision`);
+      const blockRevision = nonNegativeSafeInteger(source.blockRevision, `${path}.source.blockRevision`);
+      return {
+        blockId: source.blockId,
+        expectedPresetRevision: presetRevision,
+        expectedBlockRevision: blockRevision,
+      };
+    });
+  }
+  return {
+    workPolicy: result.workPolicy,
+    workspaceUsage: result.workspaceUsage,
+    completionCriteria: result.completionCriteria,
+    renderPolicy: result.renderPolicy,
+  };
+}
+function cortexSnapshotFromSource(source: AgentCognitionRuntimeSourceV1): unknown {
+  if (source.cortexSidecarSnapshot !== undefined) return source.cortexSidecarSnapshot;
+  if (isRecord(source.config) && source.config.cortexSidecarSnapshot !== undefined) {
+    return source.config.cortexSidecarSnapshot;
+  }
+  if (isRecord(source.source) && source.source.cortexSidecarSnapshot !== undefined) {
+    return source.source.cortexSidecarSnapshot;
+  }
+  return undefined;
+}
+
+
 
 function bytes(value: string): number {
   return encoder.encode(value).byteLength;
@@ -78,6 +129,13 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 
 function failSource(path: string, message: string): never {
   throw new AgentCognitionRuntimeError("invalid_source", message, path);
+}
+
+function nonNegativeSafeInteger(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    failSource(path, "expected a non-negative safe integer");
+  }
+  return value;
 }
 
 function text(value: unknown, path: string, allowEmpty = false): string {
@@ -126,6 +184,53 @@ function semanticCompletionPayload(workspace: Record<string, unknown>): Readonly
   return Object.freeze(Object.fromEntries(fields.filter((field) => Object.hasOwn(workspace, field)).map((field) => [field, workspace[field]])));
 }
 
+/**
+ * Cognition templates use authored IDs in the graph while the workspace CAS
+ * stores a turn-scoped operational ID.  Keep the two identities explicit at
+ * the runtime boundary; neither identity is inferred from the other outside
+ * this authenticated graph/workspace pair.
+ */
+function operationalCognitionTaskId(workspace: Record<string, unknown>, authoredTaskId: string): string {
+  return typeof workspace.turnId === "string" && workspace.turnId.length > 0
+    ? `${workspace.turnId}:${authoredTaskId}`
+    : authoredTaskId;
+}
+
+function cognitionTaskIdentity(
+  graph: FrozenCognitionGraphV1,
+  workspace: Record<string, unknown>,
+  taskId: string,
+): CognitionTaskIdentityV1 {
+  const authored = graph.templates.find((template) => template.id === taskId);
+  if (authored) {
+    return Object.freeze({
+      authoredTaskId: authored.id,
+      operationalTaskId: operationalCognitionTaskId(workspace, authored.id),
+    });
+  }
+  const operational = graph.templates.find((template) => operationalCognitionTaskId(workspace, template.id) === taskId);
+  if (operational) {
+    return Object.freeze({ authoredTaskId: operational.id, operationalTaskId: taskId });
+  }
+  return Object.freeze({ authoredTaskId: taskId, operationalTaskId: taskId });
+}
+
+function authoredTaskIdForOperational(
+  graph: FrozenCognitionGraphV1,
+  workspace: Record<string, unknown>,
+  operationalTaskId: string,
+): string {
+  return graph.templates.find((template) => operationalCognitionTaskId(workspace, template.id) === operationalTaskId)?.id ?? operationalTaskId;
+}
+
+function publicMaterializedTaskIds(
+  graph: FrozenCognitionGraphV1,
+  workspace: Record<string, unknown>,
+  operationalTaskIds: readonly string[],
+): readonly string[] {
+  return Object.freeze(operationalTaskIds.map((taskId) => authoredTaskIdForOperational(graph, workspace, taskId)));
+}
+
 
 function sourceDigest(
   graph: FrozenCognitionGraphV1,
@@ -166,6 +271,7 @@ function parseSelections(value: unknown): readonly CognitionContextPackSelection
 function parseCandidates(value: unknown): readonly CognitionContextPackCandidateV1[] {
   if (value === undefined) return Object.freeze([]);
   if (!Array.isArray(value)) failSource("contextPackCandidates", "expected an array");
+  const sourceRank = { chat: 0, world_book: 1, preset: 2, account: 3 } as const;
   const byKey = new Map<string, CognitionContextPackCandidateV1>();
   value.forEach((entry, index) => {
     if (!isRecord(entry)) failSource(`contextPackCandidates[${index}]`, "expected an object");
@@ -181,8 +287,10 @@ function parseCandidates(value: unknown): readonly CognitionContextPackCandidate
     const key = `${packId}\u0000${revisionId}`;
     const prior = byKey.get(key);
     if (prior && prior.digest !== candidate.digest) failSource(`contextPackCandidates[${index}]`, "conflicting candidate digest");
-    if (prior && prior.source !== candidate.source) failSource(`contextPackCandidates[${index}]`, "conflicting candidate source");
-    byKey.set(key, Object.freeze({ ...candidate, required: Boolean(prior?.required || candidate.required) }));
+    // The same authorized pack may appear as a chat attachment and a preset
+    // selection. Matching digest is one candidate; keep the more specific source.
+    const keep = !prior || sourceRank[candidate.source] < sourceRank[prior.source ?? "account"] ? candidate : prior;
+    byKey.set(key, Object.freeze({ ...keep, required: Boolean(prior?.required || candidate.required) }));
   });
   return Object.freeze([...byKey.values()].sort((left, right) => compareCognitionUtf8(left.packId, right.packId) || compareCognitionUtf8(left.revisionId, right.revisionId)));
 }
@@ -230,19 +338,45 @@ function contextRequirements(graph: FrozenCognitionGraphV1, state: CognitionActi
       return;
     }
     if (prior.digest !== null && requirement.digest !== null && prior.digest !== requirement.digest) failSource(`contextRequirements.${requirement.packId}`, "conflicting candidate digest");
-    const selected = prior.source === "rule" ? prior : requirement.source === "rule" ? requirement : prior;
+    const selected = prior.source === "rule"
+      ? prior
+      : requirement.source === "rule"
+        ? requirement
+        : prior.source === "direct"
+          ? prior
+          : requirement.source === "direct"
+            ? requirement
+            : prior;
     byKey.set(key, Object.freeze({
       ...selected,
       digest: selected.digest ?? prior.digest ?? requirement.digest,
       required: prior.required || requirement.required,
     }));
   };
+  for (const selection of selections) {
+    const candidate = candidateByKey.get(`${selection.packId}\u0000${selection.revisionId}`);
+    add(Object.freeze({
+      ruleId: null,
+      source: "direct",
+      packId: selection.packId,
+      revisionId: selection.revisionId,
+      digest: candidate?.digest ?? selection.digest ?? null,
+      required: selection.required,
+    }));
+  }
+  // Attachment candidates are exact host-authorized context and are active
+  // immediately. Account candidates remain inactive until directly selected or
+  // activated by an authored context rule at a named checkpoint.
   for (const candidate of candidateByKey.values()) {
     if (candidate.source === "account") continue;
-    add(Object.freeze({ ruleId: null, source: "attachment", packId: candidate.packId, revisionId: candidate.revisionId, digest: candidate.digest, required: candidate.required === true }));
-  }
-  for (const selection of selections) {
-    add(Object.freeze({ ruleId: null, source: "direct", packId: selection.packId, revisionId: selection.revisionId, digest: candidateByKey.get(`${selection.packId}\u0000${selection.revisionId}`)?.digest ?? null, required: selection.required }));
+    add(Object.freeze({
+      ruleId: null,
+      source: "attachment",
+      packId: candidate.packId,
+      revisionId: candidate.revisionId,
+      digest: candidate.digest,
+      required: candidate.required === true,
+    }));
   }
   const requiredContextRuleIds = new Set(state.requiredContextRuleIds);
   for (const id of state.activatedContextRuleIds) add(contextRequirementForRule(id, graph, candidateByKey, requiredContextRuleIds));
@@ -302,6 +436,7 @@ function completionActivationClosure(
   selections: readonly CognitionContextPackSelectionV1[],
   candidateByKey: ReadonlyMap<string, CognitionContextPackCandidateV1>,
   frozenSourceDigest: string,
+  loomSource: AgentCognitionRuntimeSourceV1,
   roots: CognitionActivationRootsV1,
 ): CognitionCompletionClosureV1 {
   const startingTemplateIds = state.activatedTemplateIds;
@@ -313,7 +448,7 @@ function completionActivationClosure(
     roots,
   );
   const activationViews: CognitionRuntimeActivationV1[] = [
-    runtimeActivation("COMPLETE", current.state, current, graph, selections, candidateByKey, frozenSourceDigest),
+    runtimeActivation("COMPLETE", current.state, current, graph, selections, candidateByKey, frozenSourceDigest, loomSource, phaseContext(baseEvaluation, "COMPLETE", transitions)),
   ];
   let finalActivation: CognitionActivationResultV1 = current;
   for (const phase of SUCCESS_COMPLETION_PHASES) {
@@ -335,12 +470,12 @@ function completionActivationClosure(
       newlyRequiredContextRuleIds: appendedIds(next.state.requiredContextRuleIds, state.requiredContextRuleIds),
     };
     finalActivation = current;
-    activationViews.push(runtimeActivation(phase, next.state, next, graph, selections, candidateByKey, frozenSourceDigest));
+    activationViews.push(runtimeActivation(phase, next.state, next, graph, selections, candidateByKey, frozenSourceDigest, loomSource, phaseContext(baseEvaluation, phase, transitions)));
   }
   const blockingRequiredTaskIds = Object.freeze(
     finalActivation.state.requiredTemplateIds
-      .filter((taskId) => transitions[taskId] !== "accepted" && transitions[taskId] !== "done")
-      .sort(),
+      .filter((taskId) => transitions[taskId] !== "completed")
+      .sort(compareCognitionUtf8),
   );
   const activation = Object.freeze({
     ...finalActivation,
@@ -365,16 +500,65 @@ function completionActivationClosure(
   });
 }
 
-function runtimeActivation(phase: CognitionRuntimePhaseV1 | "COMPLETE", state: CognitionActivationStateV1, activation: CognitionActivationResultV1, graph: FrozenCognitionGraphV1, selections: readonly CognitionContextPackSelectionV1[], candidateByKey: ReadonlyMap<string, CognitionContextPackCandidateV1>, frozenSourceDigest: string): CognitionRuntimeActivationV1 {
+function runtimeActivation(
+  phase: CognitionRuntimePhaseV1 | "COMPLETE",
+  state: CognitionActivationStateV1,
+  activation: CognitionActivationResultV1,
+  graph: FrozenCognitionGraphV1,
+  selections: readonly CognitionContextPackSelectionV1[],
+  candidateByKey: ReadonlyMap<string, CognitionContextPackCandidateV1>,
+  frozenSourceDigest: string,
+  loomSource?: AgentCognitionRuntimeSourceV1,
+  evaluation?: CognitionEvaluationContextV1,
+): CognitionRuntimeActivationV1 {
   const requirements = contextRequirements(graph, state, selections, candidateByKey);
-  return Object.freeze({ phase, state, activation, newlyActivatedContextPackRequirements: newlyActivatedRequirements(activation, graph, candidateByKey), contextPackRequirements: requirements, promptBlocks: phaseRefs(graph, phase), sourceRevisions: graph.sourceRevisions, sourceDigest: frozenSourceDigest, workspaceRevision: state.workspaceRevision });
+  const policySurface = loomPolicySurface(phase, loomSource, evaluation);
+  return Object.freeze({
+    phase,
+    state,
+    activation,
+    newlyActivatedContextPackRequirements: newlyActivatedRequirements(activation, graph, candidateByKey),
+    contextPackRequirements: requirements,
+    promptBlocks: phaseRefs(graph, phase),
+    ...(policySurface === undefined ? {} : { policySurface }),
+    sourceRevisions: graph.sourceRevisions,
+    sourceDigest: frozenSourceDigest,
+    workspaceRevision: state.workspaceRevision,
+  });
 }
+
+function loomPolicySurface(
+  phase: CognitionRuntimePhaseV1 | "COMPLETE",
+  source: AgentCognitionRuntimeSourceV1 | undefined,
+  evaluation: CognitionEvaluationContextV1 | undefined,
+): CognitionRuntimeActivationV1["policySurface"] {
+  if (!source?.loomPolicy) return undefined;
+  const checkpoint = phase === "ASSEMBLE" || phase === "WORK" || phase === "RENDER"
+    ? phase
+    : "PREPARE_COMMIT";
+  const inspection = inspectLoomPromptPolicies(source.loomPolicy, {
+    checkpoint,
+    surface: "WORK",
+    blocks: source.loomBlocks ?? [],
+    contextPacks: source.loomContextPacks ?? [],
+    ...(evaluation === undefined ? {} : { evaluation }),
+  });
+  return Object.freeze({ policies: source.loomPolicy, promptInspection: inspection });
+}
+
 function assertWorkspaceRevision(workspace: Record<string, unknown>, expectedRevision: number): void {
   if (workspace.expectedRevision !== expectedRevision) {
     throw new AgentCognitionRuntimeError("workspace_cas_conflict", "workspace context is stale for cognition CAS");
   }
 }
+
 function graphFromAuthenticatedSource(source: AgentCognitionRuntimeSourceV1): AgentCognitionRuntimeSourceV1 {
+  const cortexSidecarSnapshot = cortexSnapshotFromSource(source);
+  const runtimePolicy = isRecord(source.config?.runtimePolicy) ? source.config.runtimePolicy : null;
+  const loomPolicy = source.loomPolicy
+    ?? (runtimePolicy && Object.hasOwn(runtimePolicy, "loomPolicy")
+      ? runtimePolicy.loomPolicy as LoomPolicyBucketsV1
+      : undefined);
   if (source.graph !== undefined) {
     return {
       graph: source.graph,
@@ -384,17 +568,30 @@ function graphFromAuthenticatedSource(source: AgentCognitionRuntimeSourceV1): Ag
       contextRules: source.contextRules,
       taskTemplates: source.taskTemplates,
       taskTemplateIds: source.taskTemplateIds,
+      ...(loomPolicy === undefined ? {} : { loomPolicy }),
+      ...(source.loomBlocks === undefined ? {} : { loomBlocks: source.loomBlocks }),
+      ...(source.loomContextPacks === undefined ? {} : { loomContextPacks: source.loomContextPacks }),
+      ...(cortexSidecarSnapshot === undefined ? {} : { cortexSidecarSnapshot }),
     };
   }
   if (!source.config) failSource("config", "normalized config is required when graph is absent");
   return {
-    graph: { version: 1, policies: source.config.cognitionPolicy ?? EMPTY_POLICY, templates: source.taskTemplates ?? [], contextRules: source.contextRules ?? [] },
+    graph: {
+      version: 1,
+      policies: refsFromCanonicalLoomPolicy(loomPolicy),
+      templates: source.taskTemplates ?? [],
+      contextRules: source.contextRules ?? [],
+    },
     source: source.source,
     contextPackSelections: source.contextPackSelections,
     contextPackCandidates: source.contextPackCandidates,
     contextRules: source.contextRules,
     taskTemplates: source.taskTemplates,
     taskTemplateIds: source.taskTemplateIds,
+    ...(loomPolicy === undefined ? {} : { loomPolicy }),
+    ...(source.loomBlocks === undefined ? {} : { loomBlocks: source.loomBlocks }),
+    ...(source.loomContextPacks === undefined ? {} : { loomContextPacks: source.loomContextPacks }),
+    ...(cortexSidecarSnapshot === undefined ? {} : { cortexSidecarSnapshot }),
   };
 }
 
@@ -412,6 +609,8 @@ function authoredGraphFromSnapshot(value: unknown): unknown {
 }
 function graphWithSelectedContextRules(graphValue: unknown, selectedContextRules: readonly unknown[] | undefined): unknown {
   const authored = authoredGraphFromSnapshot(graphValue);
+  // Undefined preserves the authenticated graph's complete root set; an
+  // explicit empty array is a closed coordinator selection that activates none.
   if (selectedContextRules === undefined) return authored;
   if (!Array.isArray(selectedContextRules)) failSource("contextRules", "expected an array");
   const parsedGraph = parseCognitionGraph(authored);
@@ -463,9 +662,10 @@ function selectedTaskRootIds(graphValue: unknown, selectedTaskIds: readonly unkn
     return value;
   }));
 }
-
 function graphWithSelectedTaskTemplates(graphValue: unknown, selectedTaskIds: readonly unknown[] | undefined): unknown {
   const authored = authoredGraphFromSnapshot(graphValue);
+  // Undefined preserves all authenticated task roots; an explicit empty array
+  // is the coordinator's closed "select none" task policy.
   if (selectedTaskIds === undefined) return authored;
   if (!Array.isArray(selectedTaskIds)) failSource("taskTemplateIds", "expected an array");
   const parsedGraph = parseCognitionGraph(authored);
@@ -524,23 +724,45 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
   const operationResults = new Map<string, { fingerprint: string; result: CognitionWorkspaceMutationResultV1 }>();
   const completionResults = new Map<string, { fingerprint: string; result: CognitionRuntimeCompletionV1 }>();
   const initialCandidate = activateCognitionAtPoint(graph, state, phaseContext(baseEvaluation, "ASSEMBLE", transitions), "initial", activationRoots);
-  const initialCandidateView = runtimeActivation("ASSEMBLE", initialCandidate.state, initialCandidate, graph, selections, candidateByKey, frozenSourceDigest);
+  const initialCandidateView = runtimeActivation("ASSEMBLE", initialCandidate.state, initialCandidate, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "ASSEMBLE", transitions));
+  assertRequiredContext(initialCandidateView.contextPackRequirements, "ASSEMBLE");
   const committed = activateWorkspaceCognitionAtPhase(input.workspace, {
     state,
     update: (currentState): CognitionWorkspacePhaseUpdateV1 => phaseWorkspaceUpdate(currentState, initialCandidate, graph),
   });
   state = committed.state;
-  const initialView = runtimeActivation("ASSEMBLE", state, committed.activation, graph, selections, candidateByKey, frozenSourceDigest);
+  const initialView = runtimeActivation("ASSEMBLE", state, committed.activation, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "ASSEMBLE", transitions));
 
   const runtime: AgentCognitionRuntimeV1 = {
     graph,
     activationRoots,
-    source: deepFreeze({ graph, source: frozenSource, contextPackSelections: selections, contextPackCandidates: candidates }),
+    source: deepFreeze({
+      graph,
+      source: frozenSource,
+      contextPackSelections: selections,
+      contextPackCandidates: candidates,
+      ...(authenticatedSource.loomPolicy === undefined ? {} : { loomPolicy: authenticatedSource.loomPolicy }),
+      ...(authenticatedSource.loomBlocks === undefined ? {} : { loomBlocks: authenticatedSource.loomBlocks }),
+      ...(authenticatedSource.loomContextPacks === undefined ? {} : { loomContextPacks: authenticatedSource.loomContextPacks }),
+      ...(authenticatedSource.cortexSidecarSnapshot === undefined
+        ? {}
+        : { cortexSidecarSnapshot: authenticatedSource.cortexSidecarSnapshot }),
+    }),
     initialActivation: initialView,
+    adoptWorkspaceMutationRevision(workspaceRevision: number): void {
+      if (!Number.isSafeInteger(workspaceRevision) || workspaceRevision !== state.workspaceRevision + 1) {
+        throw new AgentCognitionRuntimeError("workspace_cas_conflict", "non-cognition workspace mutation is not the next CAS revision");
+      }
+      if (completionAccepted) {
+        throw new AgentCognitionRuntimeError("completion_blocked", "workspace cognition is frozen after completion");
+      }
+      state = Object.freeze({ ...state, workspaceRevision });
+    },
     enterPhase(inputPhase: CognitionRuntimePhaseInputV1): CognitionRuntimeActivationV1 {
       assertWorkspaceRevision(inputPhase.workspace, state.workspaceRevision);
-      const candidate = activateCognitionAtPoint(graph, state, phaseContext(baseEvaluation, inputPhase.phase, transitions), "phase_entry", activationRoots);
-      const candidateView = runtimeActivation(inputPhase.phase, candidate.state, candidate, graph, selections, candidateByKey, frozenSourceDigest);
+      const phaseEvaluation = phaseContext(baseEvaluation, inputPhase.phase, transitions);
+      const candidate = activateCognitionAtPoint(graph, state, phaseEvaluation, "phase_entry", activationRoots);
+      const candidateView = runtimeActivation(inputPhase.phase, candidate.state, candidate, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseEvaluation);
       assertRequiredContext(candidateView.contextPackRequirements, inputPhase.phase);
       if (completionAccepted) {
         if (
@@ -559,33 +781,33 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
         update: (currentState): CognitionWorkspacePhaseUpdateV1 => phaseWorkspaceUpdate(currentState, candidate, graph),
       });
       state = committed.state;
-      const view = runtimeActivation(inputPhase.phase, state, committed.activation, graph, selections, candidateByKey, frozenSourceDigest);
+      const view = runtimeActivation(inputPhase.phase, state, committed.activation, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseEvaluation);
       currentPhase = inputPhase.phase;
       return view;
     },
     applyWorkspaceTransition(input: CognitionRuntimeTaskTransitionInputV1): CognitionWorkspaceMutationResultV1 {
       throwIfAborted(input.signal);
-      if (input.operation === "update_assigned_progress" && input.workspace.state === "submitted") {
-        throw new AgentCognitionRuntimeError("invalid_source", "submitted is reserved for child-result submission", input.taskId);
-      }
+      const identity = cognitionTaskIdentity(graph, input.workspace, input.taskId);
       const operationKey = input.operationKey;
       const transition: CognitionTaskTransition = input.operation === "create_task"
         ? "pending"
-        : input.operation === "submit_child_result"
-          ? "submitted"
-          : input.operation === "accept_submission"
-            ? "accepted"
-            : input.workspace.state === "blocked"
-              ? "blocked"
-              : input.workspace.state === "submitted"
-                ? "done"
-                : input.workspace.state === "active"
-                  ? "active"
-                  : (() => { throw new AgentCognitionRuntimeError("invalid_source", "workspace progress state is invalid"); })();
+        : input.operation === "submit_child_result" || input.operation === "accept_submission"
+          ? "completed"
+          : input.workspace.state === "pending"
+            ? "pending"
+            : input.workspace.state === "active"
+              ? "active"
+              : input.workspace.state === "blocked"
+                ? "blocked"
+                : input.workspace.state === "cancelled"
+                  ? "cancelled"
+                  : input.workspace.state === "failed"
+                    ? "failed"
+                    : (() => { throw new AgentCognitionRuntimeError("invalid_source", "workspace progress state is invalid"); })();
       if (input.transition !== transition) {
         throw new AgentCognitionRuntimeError("invalid_source", "workspace transition does not match the authenticated operation");
       }
-      const fingerprint = canonical({ operation: input.operation, taskId: input.taskId, transition, payload: semanticWorkspacePayload(input.operation, input.workspace) });
+      const fingerprint = canonical({ operation: input.operation, taskId: identity.authoredTaskId, transition, payload: semanticWorkspacePayload(input.operation, input.workspace) });
       if (operationKey) {
         const previous = operationResults.get(operationKey);
         if (previous) {
@@ -597,19 +819,19 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
         throw new AgentCognitionRuntimeError("completion_blocked", "workspace cognition is frozen after completion");
       }
       assertWorkspaceRevision(input.workspace, state.workspaceRevision);
-      if (input.operation === "create_task" && graph.templates.some((template) => template.id === input.taskId)) {
+      if (input.operation === "create_task" && graph.templates.some((template) => template.id === identity.authoredTaskId)) {
         throw new AgentCognitionRuntimeError("invalid_source", "workspace task identifier is reserved by frozen cognition templates", input.taskId);
       }
-      const nextTransitions = { ...transitions, [input.taskId]: transition };
+      const nextTransitions = { ...transitions, [identity.authoredTaskId]: transition };
       const preflightActivation = activateCognitionAtPoint(graph, state, phaseContext(baseEvaluation, currentPhase, nextTransitions), "task_transition", activationRoots);
-      const preflightView = runtimeActivation(currentPhase, preflightActivation.state, preflightActivation, graph, selections, candidateByKey, frozenSourceDigest);
+      const preflightView = runtimeActivation(currentPhase, preflightActivation.state, preflightActivation, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, currentPhase, nextTransitions));
       assertRequiredContext(preflightView.contextPackRequirements, currentPhase);
       let computed: CognitionWorkspaceActivationUpdateV1 | undefined;
       const update = (current: CognitionActivationStateV1): CognitionWorkspaceActivationUpdateV1 => {
         if (current.workspaceRevision !== state.workspaceRevision) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "cognition state is stale for workspace CAS");
         const activation = activateCognitionAtPoint(graph, current, phaseContext(baseEvaluation, currentPhase, nextTransitions), "task_transition", activationRoots);
         computed = {
-          taskId: input.taskId,
+          taskId: identity.operationalTaskId,
           transition,
           ...(operationKey ? { operationKey } : {}),
           state: Object.freeze({ ...activation.state, workspaceRevision: current.workspaceRevision + 1 }),
@@ -624,7 +846,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
           delete normalized.taskId;
           return normalized;
         })()
-        : { ...input.workspace, taskId: input.taskId };
+        : { ...input.workspace, taskId: identity.operationalTaskId };
       const workspaceResult = input.operation === "create_task"
         ? createWorkspaceTaskWithCognition(workspace, { state, update })
         : input.operation === "update_assigned_progress"
@@ -634,19 +856,19 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
             : acceptWorkspaceSubmissionWithCognition(workspace, { state, update });
       const evaluated = computed;
       if (!evaluated) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "workspace CAS did not evaluate cognition");
-      const cognition = runtimeActivation(currentPhase, workspaceResult.state, workspaceResult.activation, graph, selections, candidateByKey, frozenSourceDigest);
+      const cognition = runtimeActivation(currentPhase, workspaceResult.state, workspaceResult.activation, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, currentPhase, nextTransitions));
       const result = deepFreeze({
         workspaceRevision: workspaceResult.workspaceRevision,
         state: workspaceResult.state,
         activation: workspaceResult.activation,
-        materializedTaskIds: workspaceResult.materializedTaskIds,
+        materializedTaskIds: publicMaterializedTaskIds(graph, input.workspace, workspaceResult.materializedTaskIds),
         taskId: evaluated.taskId,
         transition: evaluated.transition,
         cognition,
         ...(operationKey ? { operationKey } : {}),
       });
       state = result.state;
-      transitions[input.taskId] = transition;
+      transitions[identity.authoredTaskId] = transition;
       if (operationKey) operationResults.set(operationKey, { fingerprint, result });
       return result;
     },
@@ -667,9 +889,13 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       assertWorkspaceRevision(input.workspace, state.workspaceRevision);
       let computed: CognitionWorkspaceCompletionUpdateV1 | undefined;
       let closure: CognitionCompletionClosureV1 | undefined;
+      const workspace = { ...input.workspace };
+      delete workspace.completionSummary;
+      delete workspace.completionUnresolvedIds;
+      delete workspace.completionRenderGuidance;
       const update = (current: CognitionActivationStateV1): CognitionWorkspaceCompletionUpdateV1 => {
         if (current.workspaceRevision !== state.workspaceRevision) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "cognition state is stale for completion CAS");
-        const activationClosure = completionActivationClosure(graph, current, baseEvaluation, transitions, selections, candidateByKey, frozenSourceDigest, activationRoots);
+        const activationClosure = completionActivationClosure(graph, current, baseEvaluation, transitions, selections, candidateByKey, frozenSourceDigest, authenticatedSource, activationRoots);
         closure = activationClosure;
         const requirements = contextRequirements(graph, activationClosure.activation.state, selections, candidateByKey);
         const contextBlockers = missingRequired(requirements);
@@ -691,24 +917,25 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       ): CognitionRuntimeCompletionV1 => {
         const finalActivation = Object.freeze({ ...workspaceResult.activation, state: workspaceResult.state });
         const requirements = contextRequirements(graph, workspaceResult.state, selections, candidateByKey);
+        const operationalBlockingRequiredTaskIds = [...new Set(
+          workspaceResult.blockingRequiredTaskIds.map((id) => authoredTaskIdForOperational(graph, workspace, id)),
+        )];
         const blockers = [
-          ...workspaceResult.blockingRequiredTaskIds.map((id) => ({ kind: "task" as const, id })),
-          ...evaluated.blockingRequiredTaskIds.filter((id) => !workspaceResult.blockingRequiredTaskIds.includes(id)).map((id) => ({ kind: "task" as const, id })),
+          ...operationalBlockingRequiredTaskIds.map((id) => ({ kind: "task" as const, id })),
+          ...evaluated.blockingRequiredTaskIds
+            .filter((id) => !operationalBlockingRequiredTaskIds.includes(id))
+            .map((id) => ({ kind: "task" as const, id })),
           ...missingRequired(requirements).map((requirement) => ({ kind: "context" as const, id: requirement.ruleId ?? requirement.packId, packId: requirement.packId, revisionId: requirement.revisionId })),
         ];
         return deepFreeze({
-          ...runtimeActivation("COMPLETE", workspaceResult.state, finalActivation, graph, selections, candidateByKey, frozenSourceDigest),
+          ...runtimeActivation("COMPLETE", workspaceResult.state, finalActivation, graph, selections, candidateByKey, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "PREPARE_COMMIT", transitions)),
           accepted: workspaceResult.accepted && blockers.length === 0,
           blockers,
           blockingRequiredTaskIds: Object.freeze(blockers.filter((blocker) => blocker.kind === "task").map((blocker) => blocker.id)),
-          materializedTaskIds: workspaceResult.materializedTaskIds,
+          materializedTaskIds: publicMaterializedTaskIds(graph, workspace, workspaceResult.materializedTaskIds),
           preCommitActivations: Object.freeze([...evaluatedClosure.activationViews]),
         });
       };
-      const workspace = { ...input.workspace };
-      delete workspace.completionSummary;
-      delete workspace.completionUnresolvedIds;
-      delete workspace.completionRenderGuidance;
 
       // The read-only planner provides fail-fast feedback without mutating the
       // workspace. Accepted handoff preparation is deferred to the transaction
@@ -776,6 +1003,11 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
   };
   return runtime;
 }
+/** Return the authenticated, immutable Cortex input carried by this runtime, if any. */
+export function cognitionRuntimeCortexSnapshot(runtime: AgentCognitionRuntimeV1): unknown | undefined {
+  return cortexSnapshotFromSource(runtime.source);
+}
+
 
 export function createAgentCognitionRuntimeFromAuthenticatedSource(
   source: AuthenticatedAgentCognitionSourceV1,

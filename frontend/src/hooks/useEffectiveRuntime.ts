@@ -13,6 +13,7 @@ import {
 import type {
   AgentRuntimeMode,
   AgentRuntimeRepairCategory,
+  ChatAgentModeWriteResponseV1,
   EffectiveRuntimeDisplayV1,
   EffectiveRuntimePublicResponseV1,
   EffectiveRuntimeRequestV1,
@@ -20,7 +21,15 @@ import type {
 } from '@/types/effective-runtime'
 import { isAgenticGenerationType, repairCategoriesForDecision } from '@/types/effective-runtime'
 
-export type UseEffectiveRuntimeDependencies = Pick<typeof effectiveRuntimeApi, 'resolve' | 'setChatMode'>
+export type ResetChatMode = (
+  chatId: string,
+  expectedRevision: number,
+) => Promise<ChatAgentModeWriteResponseV1>
+
+export type UseEffectiveRuntimeDependencies = Pick<typeof effectiveRuntimeApi, 'resolve' | 'setChatMode'> & {
+  /** DELETE /chats/:id/agent-mode; absent only for legacy test doubles. */
+  resetChatMode?: ResetChatMode
+}
 export interface UseEffectiveRuntimeOptions {
   chatId: string
   generationType: string
@@ -36,18 +45,32 @@ export interface UseEffectiveRuntimeOptions {
   dependencies?: UseEffectiveRuntimeDependencies
 }
 
-
 export interface EffectiveRuntimeState {
   decision: EffectiveRuntimeDisplayV1 | null
   mode: AgentRuntimeMode
   oneTurnMode: AgentRuntimeMode | null
+  pendingOneTurnMode?: AgentRuntimeMode | null
   loading: boolean
   savingOverride: boolean
+  activeGenerationMode: AgentRuntimeMode | null
   error: Error | null
   canShowSelector: boolean
+  /** True when the resolved decision can accept a durable mode write. */
+  canSetChatOverride?: boolean
+  /** True only when a server-backed DELETE reset is available. */
+  canResetChatOverride?: boolean
+  /** Why the surface is Response-only; never silently hide unavailable WORK. */
+  responseOnlyReason?:
+    | 'loading'
+    | 'error'
+    | 'unsupported_surface'
+    | 'agents_disabled'
+    | 'repair_required'
+    | 'unavailable'
   repairCategories: AgentRuntimeRepairCategory[]
   selectOneTurnMode(mode: AgentRuntimeMode): void
   saveChatOverride(mode: AgentRuntimeMode | null): Promise<void>
+  resetChatOverride?: () => Promise<void>
   refresh(): Promise<void>
 }
 interface RuntimeResolutionResult {
@@ -536,7 +559,12 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
           savedChatModeRevisions.current.set(expectedChatId, response.revision)
         }
       }
-      if (isCurrentScope()) setOneTurnRuntimeMode(expectedChatId, null)
+      if (
+        isCurrentScope()
+        && getRuntimeSelectionSnapshot(expectedChatId).activeGenerationMode === null
+      ) {
+        setOneTurnRuntimeMode(expectedChatId, null)
+      }
     } catch (cause) {
       const writeError = cause instanceof Error ? cause : new Error('chat_mode_write_failed')
       pendingWrite.failure = writeError
@@ -554,29 +582,114 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     target,
   ])
 
+  const repairCategories = projectedDecision ? repairCategoriesForDecision(projectedDecision) : []
   const canShowSelector = !!projectedDecision
     && supported
     && projectedDecision.agentsEnabled
     && projectedDecision.allowedModes.includes('response')
     && projectedDecision.allowedModes.includes('agentic')
+    && projectedDecision.capabilityReadiness.ready
+    && projectedDecision.capabilityReadiness.missing.length === 0
+    && repairCategories.length === 0
+  const resetChatOverride = useCallback(async () => {
+    const reset = dependencies.resetChatMode
+    if (!reset) {
+      const unavailable = new Error('chat_mode_reset_unavailable')
+      if (mountedRef.current) setError(unavailable)
+      throw unavailable
+    }
+    const expectedChatId = chatId
+    const expectedFingerprint = scopeFingerprint
+    const expectedScopeRevision = scopeRef.current.revision
+    const isCurrentScope = () => (
+      mountedRef.current
+      && scopeRef.current.fingerprint === expectedFingerprint
+      && scopeRef.current.revision === expectedScopeRevision
+    )
+    let pendingWrite = pendingWritesRef.current.get(expectedFingerprint)
+    if (!pendingWrite || pendingWrite.scopeRevision !== expectedScopeRevision) {
+      pendingWrite = createPendingRuntimeWrite(expectedScopeRevision)
+      pendingWritesRef.current.set(expectedFingerprint, pendingWrite)
+    }
+    pendingWrite.inFlight += 1
+    const expectedRevision = chatModeExpectedRevision(
+      projectedDecision?.chatOverride,
+      savedChatModeRevisions.current.get(expectedChatId),
+    )
+    setSavingOverride(true)
+    setError(null)
+    try {
+      const response = await reset(expectedChatId, expectedRevision)
+      if (Number.isSafeInteger(response.revision)) {
+        const previousRevision = savedChatModeRevisions.current.get(expectedChatId)
+        if (previousRevision === undefined || previousRevision < response.revision) {
+          savedChatModeRevisions.current.set(expectedChatId, response.revision)
+        }
+      }
+      if (
+        isCurrentScope()
+        && getRuntimeSelectionSnapshot(expectedChatId).activeGenerationMode === null
+      ) {
+        setOneTurnRuntimeMode(expectedChatId, null)
+      }
+    } catch (cause) {
+      const writeError = cause instanceof Error ? cause : new Error('chat_mode_reset_failed')
+      pendingWrite.failure = writeError
+      if (isCurrentScope()) setError(writeError)
+      throw cause
+    } finally {
+      await settleWrite(pendingWrite, expectedFingerprint, expectedScopeRevision, resolve)
+    }
+  }, [
+    chatId,
+    dependencies.resetChatMode,
+    projectedDecision?.chatOverride?.revision,
+    resolve,
+    scopeFingerprint,
+  ])
   const mode = selection.oneTurnMode ?? projectedDecision?.effectiveMode ?? 'response'
-  const repairCategories = projectedDecision ? repairCategoriesForDecision(projectedDecision) : []
+  const canSetChatOverride = !!projectedDecision
+    && supported
+    && projectedDecision.allowedModes.includes('response')
+  const canResetChatOverride = !!projectedDecision?.chatOverride
+    && typeof dependencies.resetChatMode === 'function'
+  const responseOnlyReason = !supported || !target
+    ? 'unsupported_surface' as const
+    : loading
+      ? 'loading' as const
+      : error
+        ? 'error' as const
+        : !projectedDecision
+          ? 'unavailable' as const
+          : !projectedDecision.agentsEnabled
+            || !projectedDecision.allowedModes.includes('agentic')
+            ? 'agents_disabled' as const
+            : !projectedDecision.capabilityReadiness.ready
+              || projectedDecision.capabilityReadiness.missing.length > 0
+              || repairCategories.length > 0
+              ? 'repair_required' as const
+              : 'unavailable' as const
   const refresh = useCallback(async (): Promise<void> => {
     await resolve()
   }, [resolve])
-
 
   return {
     decision: projectedDecision,
     mode,
     oneTurnMode: selection.oneTurnMode,
+    pendingOneTurnMode: selection.pendingOneTurnMode,
     loading,
     savingOverride,
+    activeGenerationMode: selection.activeGenerationMode,
     error,
     canShowSelector,
+    canSetChatOverride,
+    canResetChatOverride,
+    responseOnlyReason,
     repairCategories,
     selectOneTurnMode,
     saveChatOverride,
+    resetChatOverride: dependencies.resetChatMode ? resetChatOverride : undefined,
     refresh,
   }
 }

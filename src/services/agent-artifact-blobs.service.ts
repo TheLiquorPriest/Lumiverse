@@ -143,6 +143,12 @@ export interface ArtifactAttachableInput {
   /** Internal capability: only the module-issued token may skip its own fence probe. */
   readonly deletionFence?: symbol;
 }
+export interface ArtifactBlobAvailabilityInput {
+  readonly userId: string;
+  readonly digest: string;
+  readonly byteCount: number;
+  readonly mimeType: string;
+}
 
 export interface ArtifactPublishInput {
   readonly userId: string;
@@ -1376,21 +1382,26 @@ export class ArtifactBlobStore {
   private publishedReferenceCount(userId: string, digest: string): number {
     const db = this.db;
     const columns = tableColumns(db, "agent_published_workspace_artifacts");
-    if (columns.size === 0) return 0;
-    const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_published_workspace_artifacts");
-    const digestColumn = pickColumn(columns, ["blob_digest", "digest"], "agent_published_workspace_artifacts");
-    const row = db.query(`SELECT COUNT(*) AS count FROM agent_published_workspace_artifacts WHERE ${q(userColumn)} = ? AND ${q(digestColumn)} = ?`).get(userId, digest) as { count?: number };
-    return Number(row?.count ?? 0);
+    let count = 0;
+    if (columns.size > 0) {
+      const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_published_workspace_artifacts");
+      const digestColumn = pickColumn(columns, ["blob_digest", "digest"], "agent_published_workspace_artifacts");
+      const row = db.query(`SELECT COUNT(*) AS count FROM agent_published_workspace_artifacts WHERE ${q(userColumn)} = ? AND ${q(digestColumn)} = ?`).get(userId, digest) as { count?: number };
+      count += Number(row?.count ?? 0);
+    }
+    return count + persistentPublicationArtifactReferenceCount(db, userId, digest);
   }
   private workspaceReferenceCount(userId: string, digest: string): number {
     const db = this.db;
     const columns = tableColumns(db, "agent_workspace_artifacts");
-    if (columns.size === 0) return 0;
-    const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_workspace_artifacts");
-
-    const digestColumn = pickColumn(columns, ["blob_digest", "digest"], "agent_workspace_artifacts");
-    const row = db.query(`SELECT COUNT(*) AS count FROM agent_workspace_artifacts WHERE ${q(userColumn)} = ? AND ${q(digestColumn)} = ?`).get(userId, digest) as { count?: number };
-    return Number(row?.count ?? 0);
+    let count = 0;
+    if (columns.size > 0) {
+      const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_workspace_artifacts");
+      const digestColumn = pickColumn(columns, ["blob_digest", "digest"], "agent_workspace_artifacts");
+      const row = db.query(`SELECT COUNT(*) AS count FROM agent_workspace_artifacts WHERE ${q(userColumn)} = ? AND ${q(digestColumn)} = ?`).get(userId, digest) as { count?: number };
+      count += Number(row?.count ?? 0);
+    }
+    return count + persistentArtifactReferenceCount(db, userId, digest);
   }
   private deleteJournal(journal: JournalRow): void {
     const columns = requireTable(this.db, "agent_artifact_blob_journal");
@@ -1404,6 +1415,7 @@ export class ArtifactBlobStore {
     const digestColumn = pickColumn(columns, ["digest", "blob_digest"], "agent_artifact_blobs");
     const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_artifact_blobs");
     const refColumn = pickColumn(columns, ["published_reference_count", "ref_count", "reference_count"], "agent_artifact_blobs");
+    if (this.publishedReferenceCount(userId, digest) > 0 || this.workspaceReferenceCount(userId, digest) > 0) return;
     const journalColumns = tableColumns(db, "agent_artifact_blob_journal");
     if (journalColumns.size > 0) {
       const journalDigest = pickColumn(journalColumns, ["blob_digest", "digest", "artifact_digest"], "agent_artifact_blob_journal");
@@ -1449,6 +1461,26 @@ export class ArtifactBlobStore {
       const workspaceUserColumn = pickColumn(workspaceColumns, ["user_id", "owner_id"], "agent_workspace_artifacts");
       guards.push(`NOT EXISTS (SELECT 1 FROM agent_workspace_artifacts WHERE ${q(workspaceDigestColumn)} = ? AND ${q(workspaceUserColumn)} = ?)`);
       values.push(journal.digest, journal.userId);
+    }
+    const persistentArtifactColumns = tableColumns(this.db, "persistent_workspace_artifacts");
+    if (persistentArtifactColumns.size > 0) {
+      const persistentDigestColumn = pickColumn(persistentArtifactColumns, ["blob_digest", "digest"], "persistent_workspace_artifacts");
+      const persistentUserColumn = pickColumn(persistentArtifactColumns, ["user_id", "owner_id"], "persistent_workspace_artifacts");
+      guards.push(`NOT EXISTS (SELECT 1 FROM persistent_workspace_artifacts WHERE ${q(persistentDigestColumn)} = ? AND ${q(persistentUserColumn)} = ?)`);
+      values.push(journal.digest, journal.userId);
+    }
+    const persistentPublicationColumns = tableColumns(this.db, "persistent_workspace_publications");
+    if (persistentPublicationColumns.size > 0
+      && persistentPublicationColumns.has("category")
+      && persistentPublicationColumns.has("copy_json")) {
+      const persistentPublicationUserColumn = pickColumn(persistentPublicationColumns, ["user_id", "owner_id"], "persistent_workspace_publications");
+      guards.push(`NOT EXISTS (
+        SELECT 1 FROM persistent_workspace_publications
+         WHERE ${q(persistentPublicationUserColumn)} = ?
+           AND ${q("category")} = 'artifact'
+           AND CASE WHEN json_valid(${q("copy_json")}) THEN json_extract(${q("copy_json")}, '$.blobDigest') END = ?
+      )`);
+      values.push(journal.userId, journal.digest);
     }
     const result = this.db.query(
       `UPDATE agent_artifact_blob_journal SET ${updates.join(", ")} WHERE ${q(idColumn)} = ? AND ${q(stateColumn)} IN ('pending', 'installed') AND ${q(observedColumn)} IS ? AND ${q(fenceColumn)} = ? AND ${guards.join(" AND ")}`,
@@ -1561,6 +1593,50 @@ export class ArtifactBlobStore {
     return this.stageArtifact(input);
   }
 }
+export function assertArtifactBlobAvailable(db: Database, input: ArtifactBlobAvailabilityInput): void {
+  const userId = assertSafeId(input.userId, "artifact_invalid_user", "User id");
+  if (!DIGEST_RE.test(input.digest) || !Number.isSafeInteger(input.byteCount) || input.byteCount < 0 || !MIME_RE.test(input.mimeType)) {
+    throw new ArtifactBlobError("artifact_file_mismatch", "Artifact publication metadata is invalid");
+  }
+  const blobColumns = requireTable(db, "agent_artifact_blobs");
+  const blobDigest = pickColumn(blobColumns, ["digest", "blob_digest"], "agent_artifact_blobs");
+  const blobUser = pickColumn(blobColumns, ["user_id", "owner_id"], "agent_artifact_blobs");
+  const blobBytes = pickColumn(blobColumns, ["byte_count", "bytes"], "agent_artifact_blobs");
+  const blobMime = pickColumn(blobColumns, ["mime_type", "mime"], "agent_artifact_blobs");
+  const blobPath = pickColumn(blobColumns, ["storage_path", "final_path", "path"], "agent_artifact_blobs");
+  const blob = db.query(
+    `SELECT ${q(blobBytes)} AS byte_count, ${q(blobMime)} AS mime_type, ${q(blobPath)} AS storage_path
+       FROM agent_artifact_blobs
+      WHERE ${q(blobDigest)} = ? AND ${q(blobUser)} = ? LIMIT 1`,
+  ).get(input.digest, userId) as SqlRow | null;
+  if (!blob) throw new ArtifactBlobError("artifact_not_found", "Artifact blob is not available");
+  const storagePath = String(blob.storage_path ?? "");
+  if (Number(blob.byte_count) !== input.byteCount || String(blob.mime_type) !== input.mimeType) {
+    throw new ArtifactBlobError("artifact_file_mismatch", "Artifact publication metadata does not match the immutable blob");
+  }
+  const identity = readIdentity(storagePath);
+  if (!identity) throw new ArtifactBlobError("artifact_file_missing", "Artifact file is unavailable");
+  if (identity.size !== input.byteCount || hashFileSync(storagePath, input.byteCount) !== input.digest) {
+    throw new ArtifactBlobError("artifact_file_mismatch", "Artifact bytes do not match the immutable blob");
+  }
+  const journalColumns = requireTable(db, "agent_artifact_blob_journal");
+  const journalDigest = pickColumn(journalColumns, ["blob_digest", "digest", "artifact_digest"], "agent_artifact_blob_journal");
+  const journalUser = pickColumn(journalColumns, ["user_id", "owner_id"], "agent_artifact_blob_journal");
+  const journalState = pickColumn(journalColumns, ["state", "install_state"], "agent_artifact_blob_journal");
+  const journalFinal = pickColumn(journalColumns, ["final_path", "storage_path"], "agent_artifact_blob_journal");
+  const journalObserved = pickColumn(journalColumns, ["observed_identity", "final_identity", "identity"], "agent_artifact_blob_journal");
+  const journals = db.query(
+    `SELECT ${q(journalFinal)} AS final_path, ${q(journalObserved)} AS observed_identity
+       FROM agent_artifact_blob_journal
+      WHERE ${q(journalDigest)} = ? AND ${q(journalUser)} = ? AND ${q(journalState)} = 'installed'`,
+  ).all(input.digest, userId) as SqlRow[];
+  const identityValue = identityString(identity);
+  if (!journals.some((row) => String(row.final_path ?? "") === storagePath
+    && parseMarker(row.observed_identity == null ? null : String(row.observed_identity)).after === identityValue
+    && !parseMarker(row.observed_identity == null ? null : String(row.observed_identity)).deleting)) {
+    throw new ArtifactBlobError("artifact_not_found", "Artifact installation is not available");
+  }
+}
 export function assertArtifactAttachable(db: Database, input: ArtifactAttachableInput): void {
   const userId = assertSafeId(input.userId, "artifact_invalid_user", "User id");
   const turnId = assertSafeId(input.turnId, "artifact_invalid_turn", "Turn id");
@@ -1646,6 +1722,76 @@ function ensureChatOwner(db: Database, userId: string, chatId: string): void {
   const row = db.query(`SELECT ${q(userColumn)} AS user_id FROM chats WHERE ${q(idColumn)} = ? LIMIT 1`).get(chatId) as { user_id?: string } | null;
   if (!row || row.user_id !== userId) throw new ArtifactBlobError("artifact_unauthorized", "Chat is not owned by the authenticated user");
 }
+function persistentArtifactReferenceCount(db: Database, userId: string, digest: string): number {
+  const table = "persistent_workspace_artifacts";
+  const columns = tableColumns(db, table);
+  if (columns.size === 0) return 0;
+  const userColumn = pickColumn(columns, ["user_id", "owner_id"], table);
+  const digestColumn = pickColumn(columns, ["blob_digest", "digest"], table);
+  const row = db.query(
+    `SELECT COUNT(*) AS count FROM ${q(table)} WHERE ${q(userColumn)} = ? AND ${q(digestColumn)} = ?`,
+  ).get(userId, digest) as { count?: number };
+  return Number(row?.count ?? 0);
+}
+
+/**
+ * Persistent publication copies intentionally store their artifact digest in
+ * copy_json rather than taking a foreign key to the operational blob. Parse
+ * the copy and compare the digest as a value, never as a substring.
+ */
+function persistentPublicationArtifactReferenceCount(db: Database, userId: string, digest: string): number {
+  const table = "persistent_workspace_publications";
+  const columns = tableColumns(db, table);
+  if (columns.size === 0 || !columns.has("category") || !columns.has("copy_json")) return 0;
+  const userColumn = pickColumn(columns, ["user_id", "owner_id"], table);
+  const rows = db.query(
+    `SELECT ${q("copy_json")} AS copy_json FROM ${q(table)}
+      WHERE ${q(userColumn)} = ? AND ${q("category")} = 'artifact'`,
+  ).all(userId) as Array<{ copy_json?: unknown }>;
+  let count = 0;
+  for (const row of rows) {
+    if (typeof row.copy_json !== "string") continue;
+    try {
+      const copy = JSON.parse(row.copy_json) as unknown;
+      if (copy !== null && typeof copy === "object" && !Array.isArray(copy)
+        && (copy as Record<string, unknown>).blobDigest === digest) {
+        count++;
+      }
+    } catch {
+      // A malformed immutable row cannot prove a reference to these bytes.
+    }
+  }
+  return count;
+}
+
+export function retainArtifactBlobReference(db: Database, digest: string, userId: string): void {
+  if (!DIGEST_RE.test(digest)) throw new ArtifactBlobError("artifact_invalid_digest", "Artifact digest is invalid");
+  assertSafeId(userId, "artifact_invalid_user", "User id");
+  const columns = requireTable(db, "agent_artifact_blobs");
+  const digestColumn = pickColumn(columns, ["digest", "blob_digest"], "agent_artifact_blobs");
+  const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_artifact_blobs");
+  const refColumn = pickColumn(columns, ["published_reference_count", "ref_count", "reference_count"], "agent_artifact_blobs");
+  const result = db.query(
+    `UPDATE agent_artifact_blobs SET ${q(refColumn)} = ${q(refColumn)} + 1
+      WHERE ${q(digestColumn)} = ? AND ${q(userColumn)} = ?`,
+  ).run(digest, userId);
+  if (changes(result) !== 1) throw new ArtifactBlobError("artifact_not_found", "Artifact blob is unavailable");
+}
+
+export function releaseArtifactBlobReference(db: Database, digest: string, userId: string): void {
+  if (!DIGEST_RE.test(digest)) throw new ArtifactBlobError("artifact_invalid_digest", "Artifact digest is invalid");
+  assertSafeId(userId, "artifact_invalid_user", "User id");
+  const columns = tableColumns(db, "agent_artifact_blobs");
+  if (columns.size === 0) return;
+  const digestColumn = pickColumn(columns, ["digest", "blob_digest"], "agent_artifact_blobs");
+  const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_artifact_blobs");
+  const refColumn = pickColumn(columns, ["published_reference_count", "ref_count", "reference_count"], "agent_artifact_blobs");
+  db.query(
+    `UPDATE agent_artifact_blobs SET ${q(refColumn)} = MAX(0, ${q(refColumn)} - 1)
+      WHERE ${q(digestColumn)} = ? AND ${q(userColumn)} = ?`,
+  ).run(digest, userId);
+}
+
 
 
 function insertPublishedReference(db: Database, input: ArtifactPublishInput, ref: ArtifactPublicationInput, receiptId: string, committedAt: number): boolean {

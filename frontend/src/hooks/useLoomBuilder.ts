@@ -497,10 +497,11 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       throw new ApiError(409, 'Conflict', { code: 'PRESET_REVISION_CONFLICT' })
     }
     validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: flushed.blocks })
+    const editorProjection = await agenticRuntimeApi.getEditor(flushed.id)
     const result = await agenticRuntimeApi.saveEditor(flushed.id, {
       ...draft,
       expectedPresetRevision: flushed.cacheRevision ?? 0,
-      expectedConfigRevision: flushed.agentConfigRevision,
+      expectedConfigRevision: editorProjection.configRevision,
       promptOrder: normalizedBlocks,
     })
     const refreshed = presetSaveCoordinator.hydrate(unmarshalPreset(result.preset))

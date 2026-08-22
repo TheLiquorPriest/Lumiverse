@@ -509,7 +509,9 @@ app.get("/import/:jobId/status", (c) => {
     manifest: job.manifest,
     summary: job.summary,
     fileSummary: job.fileSummary,
-    error: job.error ? { code: "import_failed", message: "archive import failed" } : null,
+    error: job.error || job.errorCode
+      ? { code: job.errorCode || "import_failed", message: "archive import failed" }
+      : null,
   });
 });
 

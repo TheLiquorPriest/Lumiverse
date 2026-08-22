@@ -10,12 +10,15 @@ import {
   evaluateCognitionPredicate,
   freezeAgentCognitionV1,
   freezeCognitionGraph,
+  inspectLoomPromptPolicies,
+  normalizeLoomPolicyBucketsV1,
   parseCognitionGraph,
   parseCognitionPredicate,
   parseContextActivationRule,
   parseTaskTemplate,
+  parseLoomPromptInspectionV1,
 } from "./agent-cognition.service";
-import { createTurnWorkspace, createWorkspaceTask, getTurnWorkspace } from "./turn-workspace.service";
+import { createTurnWorkspace, createWorkspaceTask, getTurnWorkspace, recordWorkspaceRecord } from "./turn-workspace.service";
 import { createAgentCognitionRuntime } from "./agent-cognition-runtime.service";
 import { AgentCognitionRuntimeError } from "../types/agent-cognition-runtime";
 
@@ -28,6 +31,10 @@ import {
   COGNITION_MAX_PREDICATE_NODES,
   COGNITION_MAX_STRING_BYTES,
   type CognitionEvaluationContextV1,
+  type CognitionSourceSnapshotV1,
+  type LoomPromptInspectionBlockV1,
+  type LoomPromptInspectionItemV1,
+  type LoomPromptInspectionV1,
 } from "../types/agent-cognition";
 const emptyPolicy = {
   workPolicy: [],
@@ -89,7 +96,7 @@ describe("agent cognition closed AST", () => {
       presetVariables: { mode: "focused", tags: ["alpha", "beta"], count: 2 },
       participantFacts: { role: "writer", traits: ["quiet", "precise"] },
       availableTools: ["lore_get_book"],
-      taskTransitions: { research: "submitted" },
+      taskTransitions: { research: "completed" },
     });
     expect(evaluateCognitionPredicate({ kind: "generation_type", value: "swipe" }, base)).toBe(true);
     expect(evaluateCognitionPredicate({ kind: "phase", value: "RENDER" }, base)).toBe(true);
@@ -103,7 +110,7 @@ describe("agent cognition closed AST", () => {
     expect(evaluateCognitionPredicate({ kind: "participant_fact", name: "missing", operator: "present" }, base)).toBe(false);
     expect(evaluateCognitionPredicate({ kind: "tool_available", toolId: "lore_get_book", available: true }, base)).toBe(true);
     expect(evaluateCognitionPredicate({ kind: "tool_available", toolId: "lore_get_entry", available: false }, base)).toBe(true);
-    expect(evaluateCognitionPredicate({ kind: "task_transition", taskId: "research", transition: "submitted" }, base)).toBe(true);
+    expect(evaluateCognitionPredicate({ kind: "task_transition", taskId: "research", transition: "completed" }, base)).toBe(true);
     expect(evaluateCognitionPredicate({ kind: "all", children: [
       { kind: "generation_type", value: "swipe" },
       { kind: "any", children: [
@@ -128,8 +135,8 @@ describe("agent cognition closed AST", () => {
     variables.__proto__ = "literal";
     const protectedContext = context({ presetVariables: variables as CognitionEvaluationContextV1["presetVariables"] });
     expect(evaluateCognitionPredicate({ kind: "preset_variable", name: "__proto__", operator: "present" }, protectedContext)).toBe(true);
-    const transitions: Record<string, "done"> = Object.create(null);
-    for (let index = 0; index <= COGNITION_MAX_LIST_ITEMS; index += 1) transitions[`task-${index}`] = "done";
+    const transitions: Record<string, "completed"> = Object.create(null);
+    for (let index = 0; index <= COGNITION_MAX_LIST_ITEMS; index += 1) transitions[`task-${index}`] = "completed";
     expectCode(
       () => evaluateCognitionPredicate(
         { kind: "phase", value: "WORK" },
@@ -202,6 +209,7 @@ async function applyRuntimeSchema(): Promise<void> {
   database.run("PRAGMA foreign_keys = OFF");
   database.run(await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text());
   database.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "106_agent_turn_workspace.sql")).text());
+  database.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "120_cognition_task_provenance.sql")).text());
   database.run("PRAGMA foreign_keys = ON");
 }
 
@@ -308,7 +316,7 @@ describe("agent cognition graph freeze and activation", () => {
 
   test("runs task activation inside one CAS and preserves the transition hook contract", () => {
     const frozen = freezeCognitionGraph(graph([
-      { id: "task", required: true, dependencies: [], activation: { kind: "task_transition", taskId: "seed", transition: "done" } },
+      { id: "task", required: true, dependencies: [], activation: { kind: "task_transition", taskId: "seed", transition: "completed" } },
     ]), source());
     const state = createCognitionActivationState(frozen);
     let calls = 0;
@@ -318,7 +326,7 @@ describe("agent cognition graph freeze and activation", () => {
       state,
       context(),
       "seed",
-      "done",
+      "completed",
       {
         commit(expected, update) {
           calls += 1;
@@ -351,7 +359,7 @@ describe("agent cognition graph freeze and activation", () => {
       state,
       { ...context(), taskTransitions: null as never },
       "seed",
-      "done",
+      "completed",
       {
         commit() {
           commits += 1;
@@ -374,37 +382,37 @@ describe("agent cognition graph freeze and activation", () => {
     const accepted = completeCognitionFixedPoint(
       frozen,
       blocked.state,
-      context({ phase: "COMPLETE", taskTransitions: { review: "done" } }),
+      context({ phase: "COMPLETE", taskTransitions: { review: "completed" } }),
     );
     expect(accepted.blockingRequiredTaskIds).toEqual([]);
     expect(accepted.canComplete).toBe(true);
     expect(accepted.state.activatedTemplateIds).toEqual(blocked.state.activatedTemplateIds);
   });
 
-  test("maps submit and accept transitions into completion predicates", () => {
+  test("activates completion criteria on completed tasks", () => {
     const frozen = freezeCognitionGraph(graph([
-      { id: "review", required: true, dependencies: [], activation: { kind: "task_transition", taskId: "child", transition: "submitted" } },
+      { id: "review", required: true, dependencies: [], activation: { kind: "task_transition", taskId: "child", transition: "completed" } },
     ]), source());
     const state = createCognitionActivationState(frozen);
-    const submitted = completeCognitionFixedPoint(
+    const blocked = completeCognitionFixedPoint(
       frozen,
       state,
-      context({ phase: "COMPLETE", taskTransitions: { child: "submitted" } }),
+      context({ phase: "COMPLETE", taskTransitions: { child: "completed" } }),
     );
-    expect(submitted.blockingRequiredTaskIds).toEqual(["review"]);
-    expect(submitted.canComplete).toBe(false);
+    expect(blocked.blockingRequiredTaskIds).toEqual(["review"]);
+    expect(blocked.canComplete).toBe(false);
     const accepted = completeCognitionFixedPoint(
       frozen,
-      submitted.state,
-      context({ phase: "COMPLETE", taskTransitions: { child: "accepted", review: "done" } }),
+      blocked.state,
+      context({ phase: "COMPLETE", taskTransitions: { child: "completed", review: "completed" } }),
     );
     expect(accepted.blockingRequiredTaskIds).toEqual([]);
     expect(accepted.canComplete).toBe(true);
   });
-
+  
   test("builds an authenticated frozen graph from the strict loader", () => {
     const frozen = freezeAgentCognitionV1({
-      config: { cognitionPolicy: emptyPolicy },
+      config: { runtimePolicy: { version: 1, authority: "loom", scope: "preset", defaultMode: "response", loomPolicy: null, phases: [] } },
       contextRules: [{ id: "required-context", packId: "pack", revisionId: "rev", required: true }],
       taskTemplates: [],
       selections: [{ packId: "pack", revisionId: "rev", digest: "a".repeat(64), required: true }],
@@ -415,7 +423,7 @@ describe("agent cognition graph freeze and activation", () => {
   });
   test("rehydrates the coordinator frozen graph and snapshot selection metadata", () => {
     const frozen = freezeAgentCognitionV1({
-      config: { cognitionPolicy: emptyPolicy },
+      config: { runtimePolicy: { version: 1, authority: "loom", scope: "preset", defaultMode: "response", loomPolicy: null, phases: [] } },
       contextRules: [],
       taskTemplates: [],
       selections: [{
@@ -559,6 +567,42 @@ describe("agent cognition graph freeze and activation", () => {
     expect(runtime.initialActivation.workspaceRevision).toBe(1);
     expect((await runtime.enterPhase({ phase: "RENDER", workspace: runtimeWorkspaceContext(1) })).contextPackRequirements.map((item) => item.packId)).toEqual(["attached-pack", "direct-pack", "future-pack"]);
   });
+
+  test("merges the same authorized pack from chat and preset sources", () => {
+    const digestValue = "c".repeat(64);
+    const runtime = createAgentCognitionRuntime({
+      source: {
+        graph: graph(),
+        source: source(),
+        contextPackSelections: [{ packId: "honesty-pack", revisionId: "honesty-pack@1", digest: digestValue, required: true }],
+        contextPackCandidates: [
+          { packId: "honesty-pack", revisionId: "honesty-pack@1", digest: digestValue, source: "preset", required: false },
+          { packId: "honesty-pack", revisionId: "honesty-pack@1", digest: digestValue, source: "chat", required: false },
+        ],
+      },
+      evaluation: context(),
+      workspaceRevision: 0,
+      workspace: runtimeWorkspaceContext(0),
+    });
+    expect(runtime.source.contextPackCandidates).toEqual([
+      { packId: "honesty-pack", revisionId: "honesty-pack@1", digest: digestValue, source: "chat", required: false },
+    ]);
+    expect(() => createAgentCognitionRuntime({
+      source: {
+        graph: graph(),
+        source: source(),
+        contextPackSelections: [],
+        contextPackCandidates: [
+          { packId: "honesty-pack", revisionId: "honesty-pack@1", digest: "d".repeat(64), source: "preset", required: false },
+          { packId: "honesty-pack", revisionId: "honesty-pack@1", digest: "e".repeat(64), source: "chat", required: false },
+        ],
+      },
+      evaluation: context(),
+      workspaceRevision: 0,
+      workspace: runtimeWorkspaceContext(0),
+    })).toThrow(/conflicting candidate digest/);
+  });
+
   test("applies a task transition atomically and returns the same result on an idempotent retry", async () => {
     const runtime = createAgentCognitionRuntime({
       source: {
@@ -598,10 +642,37 @@ describe("agent cognition graph freeze and activation", () => {
     })).toThrow(AgentCognitionRuntimeError);
     expect(first.workspaceRevision).toBe(2);
     expect(first.materializedTaskIds).toEqual(["review"]);
+    expect(getDb().query("SELECT task_id FROM agent_workspace_tasks WHERE task_id = ?").get(`${RUNTIME_TURN}:review`)).toEqual({ task_id: `${RUNTIME_TURN}:review` });
     expect(first.cognition.activation.newlyActivatedTemplateIds).toEqual(["review"]);
     expect(getTurnWorkspace(runtimeWorkspaceContext(2)).revision).toBe(2);
   });
-  test("rejects submitted state before the cognition progress adapter runs", () => {
+  test("adopts one non-cognition workspace CAS before the next cognition operation", async () => {
+    const runtime = createAgentCognitionRuntime({
+      source: { graph: graph(), source: source(), contextPackSelections: [], contextPackCandidates: [] },
+      evaluation: context(),
+      workspaceRevision: 0,
+      workspace: runtimeWorkspaceContext(0),
+    });
+    expect(runtime.initialActivation.workspaceRevision).toBe(1);
+    recordWorkspaceRecord({
+      ...runtimeWorkspaceContext(1),
+      kind: "finding",
+      summary: "A non-cognition record advances the shared workspace CAS.",
+      digest: "f".repeat(64),
+      taskId: null,
+    });
+    expect(getTurnWorkspace(runtimeWorkspaceContext(2)).revision).toBe(2);
+    expect(() => runtime.adoptWorkspaceMutationRevision(3)).toThrow(AgentCognitionRuntimeError);
+    runtime.adoptWorkspaceMutationRevision(2);
+    expect(() => runtime.adoptWorkspaceMutationRevision(2)).toThrow(AgentCognitionRuntimeError);
+    const completion = await runtime.acceptCompletionFixedPoint({
+      operationKey: "completion-after-non-cognition-cas",
+      workspace: runtimeWorkspaceContext(2),
+    });
+    expect(completion.accepted).toBe(true);
+    expect(completion.workspaceRevision).toBe(3);
+  });
+  test("rejects completed state before the cognition progress adapter runs", () => {
     createWorkspaceTask({
       ...runtimeWorkspaceContext(0),
       taskId: "runtime-progress-task",
@@ -618,13 +689,13 @@ describe("agent cognition graph freeze and activation", () => {
       try {
         runtime.applyWorkspaceTransition({
           taskId: "runtime-progress-task",
-          transition: "done",
+          transition: "completed",
           operation: "update_assigned_progress",
           workspace: {
             ...runtimeWorkspaceContext(2),
             actor: "child",
             frameId: "runtime-progress-child",
-            state: "submitted",
+            state: "completed",
             capabilities: {
               revision: 1,
               allowed: ["update_assigned_progress"],
@@ -636,14 +707,14 @@ describe("agent cognition graph freeze and activation", () => {
       } catch (caught) {
         return caught;
       }
-      throw new Error("expected submitted progress rejection");
+      throw new Error("expected completed progress rejection");
     })();
     expect(error).toBeInstanceOf(AgentCognitionRuntimeError);
     expect((error as AgentCognitionRuntimeError).code).toBe("invalid_source");
     expect(getTurnWorkspace(runtimeWorkspaceContext(2)).revision).toBe(2);
     expect(getDb().query("SELECT state FROM agent_workspace_tasks WHERE task_id = ?").get("runtime-progress-task")).toEqual({ state: "active" });
   });
-  test("root completion cannot bypass a submitted required task without an accepted child submission", async () => {
+  test("root completion cannot bypass a pending required task", async () => {
     const task = createWorkspaceTask({
       ...runtimeWorkspaceContext(0),
       actor: "host",
@@ -749,12 +820,12 @@ describe("agent cognition graph freeze and activation", () => {
     expect(getTurnWorkspace(runtimeWorkspaceContext(1)).revision).toBe(1);
   });
 
-  test("materializes a newly required render task, blocks completion, and accepts after the task is done", async () => {
+  test("materializes a newly required render task, blocks completion, and accepts after the task is completed", async () => {
     const runtime = createAgentCognitionRuntime({
       source: {
         graph: graph([
           { id: "render-review", required: true, dependencies: [], activation: { kind: "phase", value: "RENDER" } },
-          { id: "after-review", required: false, dependencies: [], activation: { kind: "task_transition", taskId: "render-review", transition: "accepted" } },
+          { id: "after-review", required: false, dependencies: [], activation: { kind: "task_transition", taskId: "render-review", transition: "completed" } },
         ]),
         source: source(),
         contextPackSelections: [],
@@ -768,37 +839,38 @@ describe("agent cognition graph freeze and activation", () => {
     expect(blocked.accepted).toBe(false);
     expect(blocked.blockingRequiredTaskIds).toEqual(["render-review"]);
     expect(blocked.materializedTaskIds).toEqual(["render-review"]);
+    expect(getDb().query("SELECT task_id FROM agent_workspace_tasks WHERE task_id = ?").get(`${RUNTIME_TURN}:render-review`)).toEqual({ task_id: `${RUNTIME_TURN}:render-review` });
     expect(blocked.preCommitActivations.map((activation) => activation.phase)).toEqual(["COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING", "COMMITTED"]);
     expect(getTurnWorkspace(runtimeWorkspaceContext(2)).revision).toBe(2);
     expect(blocked.preCommitActivations.every((activation) => activation.workspaceRevision === 1)).toBe(true);
-    getDb().query("UPDATE agent_workspace_tasks SET state = 'submitted' WHERE task_id = ? AND workspace_id = ?").run("render-review", RUNTIME_WORKSPACE);
+    getDb().query("UPDATE agent_workspace_tasks SET state = 'completed' WHERE task_id = ? AND workspace_id = ?").run(`${RUNTIME_TURN}:render-review`, RUNTIME_WORKSPACE);
     const now = Math.floor(Date.now() / 1000);
     getDb().query(`INSERT INTO agent_workspace_submissions
       (submission_id, task_id, workspace_id, turn_id, user_id, chat_id, child_frame_id, state, summary, result_digest, byte_count, retention, expires_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, 1, 'operational', ?, ?, ?)`)
-      .run("render-review-submission", "render-review", RUNTIME_WORKSPACE, RUNTIME_TURN, RUNTIME_USER, RUNTIME_CHAT, "render-review-child", "done", "c".repeat(64), now + 100, now, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'submitted', ?, ?, 1, 'operational', ?, ?, ?)`)
+      .run("render-review-submission", `${RUNTIME_TURN}:render-review`, RUNTIME_WORKSPACE, RUNTIME_TURN, RUNTIME_USER, RUNTIME_CHAT, "render-review-child", "completed", "c".repeat(64), now + 100, now, now);
     getDb().query(`INSERT INTO agent_workspace_tasks
       (task_id, workspace_id, turn_id, user_id, chat_id, title, description, state, required, dependencies_json, assigned_frame_id, progress, summary, byte_count, retention, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, '[]', NULL, 0, NULL, 0, 'operational', ?)`)
       .run("other-task", RUNTIME_WORKSPACE, RUNTIME_TURN, RUNTIME_USER, RUNTIME_CHAT, "Other task", "", now + 100);
     const workspaceBeforeReject = getTurnWorkspace(runtimeWorkspaceContext(2));
     const submissionBeforeReject = getDb().query("SELECT state, revision, summary FROM agent_workspace_submissions WHERE submission_id = ?").get("render-review-submission");
-    const renderTaskBeforeReject = getDb().query("SELECT state, revision, summary FROM agent_workspace_tasks WHERE task_id = ?").get("render-review");
+    const renderTaskBeforeReject = getDb().query("SELECT state, revision, summary FROM agent_workspace_tasks WHERE task_id = ?").get(`${RUNTIME_TURN}:render-review`);
     const otherTaskBeforeReject = getDb().query("SELECT state, revision, summary FROM agent_workspace_tasks WHERE task_id = ?").get("other-task");
     expect(() => runtime.applyWorkspaceTransition({
       taskId: "other-task",
-      transition: "accepted",
+      transition: "completed",
       operation: "accept_submission",
       operationKey: "wrong-task-accept",
       workspace: { ...runtimeWorkspaceContext(2), submissionId: "render-review-submission" },
     })).toThrow();
     expect(getTurnWorkspace(runtimeWorkspaceContext(2))).toEqual(workspaceBeforeReject);
     expect(getDb().query("SELECT state, revision, summary FROM agent_workspace_submissions WHERE submission_id = ?").get("render-review-submission")).toEqual(submissionBeforeReject);
-    expect(getDb().query("SELECT state, revision, summary FROM agent_workspace_tasks WHERE task_id = ?").get("render-review")).toEqual(renderTaskBeforeReject);
+    expect(getDb().query("SELECT state, revision, summary FROM agent_workspace_tasks WHERE task_id = ?").get(`${RUNTIME_TURN}:render-review`)).toEqual(renderTaskBeforeReject);
     expect(getDb().query("SELECT state, revision, summary FROM agent_workspace_tasks WHERE task_id = ?").get("other-task")).toEqual(otherTaskBeforeReject);
     const acceptedTask = await runtime.applyWorkspaceTransition({
       taskId: "render-review",
-      transition: "accepted",
+      transition: "completed",
       operation: "accept_submission",
       operationKey: "render-review-accept",
       workspace: { ...runtimeWorkspaceContext(2), submissionId: "render-review-submission" },
@@ -864,4 +936,302 @@ describe("agent cognition graph freeze and activation", () => {
       workspace: runtimeWorkspaceContext(0),
     })).toThrow(AgentCognitionRuntimeError);
   });
+});
+ 
+describe("Loom policy delivery contracts", () => {
+  function entry(
+    id: string,
+    blockId: string,
+    blockRevision: number,
+    promptOrder: number,
+    destination: string,
+    checkpoint: string,
+    delivery: unknown = { delivery: "direct" },
+    required = true,
+  ): Record<string, unknown> {
+    return {
+      version: 1,
+      id,
+      source: {
+        kind: "loom_block",
+        blockId,
+        presetRevision: 7,
+        blockRevision,
+        promptOrder,
+      },
+      destination,
+      checkpoint,
+      required,
+      visibility: "work_only",
+      delivery,
+    };
+  }
+  function policyFixture(): {
+    source: CognitionSourceSnapshotV1;
+    policies: Record<string, unknown>;
+    blocks: LoomPromptInspectionBlockV1[];
+  } {
+    const sourceBlocks = [
+      { blockId: "shared", revision: 1, promptOrder: 0 },
+      { blockId: "condition", revision: 1, promptOrder: 1 },
+      { blockId: "completion", revision: 1, promptOrder: 2 },
+      { blockId: "optional", revision: 1, promptOrder: 3 },
+      { blockId: "render", revision: 1, promptOrder: 4 },
+    ];
+    const frozenSource = source(sourceBlocks);
+    const policies = {
+      version: 1,
+      workPolicy: [
+        entry("work-direct", "shared", 1, 0, "root_work", "WORK"),
+        entry("work-duplicate", "shared", 1, 0, "root_work", "WORK", { delivery: "direct" }, false),
+      ],
+      workspaceUsage: [
+        entry(
+          "usage-condition",
+          "condition",
+          1,
+          1,
+          "root_work",
+          "WORK",
+          {
+            delivery: "condition_gated",
+            condition: {
+              kind: "preset_variable",
+              name: "gate",
+              operator: "equals",
+              value: "open",
+            },
+          },
+        ),
+      ],
+      completionCriteria: [
+        entry("completion-shared", "shared", 1, 0, "completion_handoff", "PREPARE_COMMIT"),
+        entry(
+          "completion-demand",
+          "completion",
+          1,
+          2,
+          "completion_handoff",
+          "PREPARE_COMMIT",
+          {
+            delivery: "on_demand",
+            request: {
+              contextPackId: "pack-demand",
+              revisionId: "revision-1",
+              digest: "a".repeat(64),
+            },
+          },
+        ),
+        entry(
+          "completion-optional",
+          "optional",
+          1,
+          3,
+          "completion_handoff",
+          "PREPARE_COMMIT",
+          {
+            delivery: "on_demand",
+            request: {
+              contextPackId: "pack-optional",
+              revisionId: "revision-1",
+              digest: "b".repeat(64),
+            },
+          },
+          false,
+        ),
+      ],
+      renderPolicy: [
+        entry("render-direct", "render", 1, 4, "render", "RENDER"),
+      ],
+    };
+    return {
+      source: frozenSource,
+      policies,
+      blocks: sourceBlocks.map((block) => ({
+        source: {
+          kind: "loom_block",
+          blockId: block.blockId,
+          presetRevision: frozenSource.presetRevision,
+          blockRevision: block.revision,
+          promptOrder: block.promptOrder,
+        },
+        content: `${block.blockId}-content`,
+      })),
+    };
+  }
+
+  test("normalizes all four buckets with exact sources and fixed destinations/checkpoints", () => {
+    const fixture = policyFixture();
+    const normalized = normalizeLoomPolicyBucketsV1(fixture.policies, fixture.source);
+    expect(normalized.workPolicy[0]).toMatchObject({
+      id: "work-direct",
+      destination: "root_work",
+      checkpoint: "WORK",
+      source: {
+        kind: "loom_block",
+        blockId: "shared",
+        presetRevision: 7,
+        blockRevision: 1,
+        promptOrder: 0,
+      },
+    });
+    expect(normalized.workspaceUsage[0]?.destination).toBe("root_work");
+    expect(normalized.completionCriteria[0]?.destination).toBe("completion_handoff");
+    expect(normalized.renderPolicy[0]).toMatchObject({
+      destination: "render",
+      checkpoint: "RENDER",
+    });
+    expect(() => normalizeLoomPolicyBucketsV1({
+      ...fixture.policies,
+      workPolicy: [entry("wrong-checkpoint", "shared", 1, 0, "root_work", "RENDER")],
+    }, fixture.source)).toThrow(/checkpoint/i);
+    expect(() => normalizeLoomPolicyBucketsV1({
+      ...fixture.policies,
+      workPolicy: [entry("wrong-revision", "shared", 2, 0, "root_work", "WORK")],
+    }, fixture.source)).toThrow(/revision/i);
+  });
+
+  test("separates delivery modes, honors checkpoints, deduplicates per destination, and records typed omissions", () => {
+    const fixture = policyFixture();
+    const policies = normalizeLoomPolicyBucketsV1(fixture.policies, fixture.source);
+    const item = (inspection: LoomPromptInspectionV1, id: string): LoomPromptInspectionItemV1 | undefined => {
+      return inspection.items.find((candidate) => candidate.entryId === id);
+    };
+
+    const atWork = inspectLoomPromptPolicies(policies, {
+      checkpoint: "WORK",
+      surface: "WORK",
+      evaluation: context({ presetVariables: { gate: "closed" } }),
+      blocks: fixture.blocks,
+      contextPacks: [],
+    });
+    expect(item(atWork, "work-direct")?.outcome).toEqual({ status: "included", effectiveIndex: 0 });
+    expect(item(atWork, "work-duplicate")?.outcome).toEqual({
+      status: "deduplicated",
+      keptEntryId: "work-direct",
+      destination: "root_work",
+    });
+    expect(item(atWork, "usage-condition")?.outcome).toEqual({
+      status: "skipped",
+      reason: "condition_not_met",
+    });
+    expect(item(atWork, "completion-demand")?.outcome).toEqual({
+      status: "skipped",
+      reason: "checkpoint_not_reached",
+    });
+    expect(item(atWork, "render-direct")?.outcome).toEqual({
+      status: "skipped",
+      reason: "checkpoint_not_reached",
+    });
+    expect(atWork.effectiveEntryIds).toEqual(["work-direct"]);
+
+    const atPrepareCommit = inspectLoomPromptPolicies(policies, {
+      checkpoint: "PREPARE_COMMIT",
+      surface: "WORK",
+      evaluation: context({ phase: "PREPARE_COMMIT", presetVariables: { gate: "open" } }),
+      blocks: fixture.blocks,
+      contextPacks: [{
+        contextPackId: "pack-demand",
+        revisionId: "revision-1",
+        digest: "a".repeat(64),
+        content: "on-demand-content",
+      }],
+    });
+    expect(item(atPrepareCommit, "usage-condition")?.outcome).toEqual({
+      status: "included",
+      effectiveIndex: 1,
+    });
+    expect(item(atPrepareCommit, "completion-shared")?.outcome).toEqual({
+      status: "included",
+      effectiveIndex: 2,
+    });
+    expect(item(atPrepareCommit, "completion-demand")?.outcome).toEqual({
+      status: "included",
+      effectiveIndex: 3,
+    });
+    expect(item(atPrepareCommit, "completion-optional")?.outcome).toEqual({
+      status: "skipped",
+      reason: "on_demand_unavailable",
+    });
+    expect(atPrepareCommit.effectiveEntryIds).toEqual([
+      "work-direct",
+      "usage-condition",
+      "completion-shared",
+      "completion-demand",
+    ]);
+
+    const staleRequired = inspectLoomPromptPolicies(policies, {
+      checkpoint: "PREPARE_COMMIT",
+      surface: "WORK",
+      evaluation: context({ phase: "PREPARE_COMMIT", presetVariables: { gate: "open" } }),
+      blocks: fixture.blocks,
+      contextPacks: [{
+        contextPackId: "pack-demand",
+        revisionId: "revision-1",
+        digest: "c".repeat(64),
+        content: "stale-content",
+      }],
+    });
+    expect(item(staleRequired, "completion-demand")?.retrievalStatus).toBe("stale");
+    expect(item(staleRequired, "completion-demand")?.outcome).toEqual({
+      status: "rejected",
+      reason: "required_source_unavailable",
+    });
+
+    const response = inspectLoomPromptPolicies(policies, {
+      checkpoint: "ASSEMBLE",
+      surface: "RESPONSE",
+      blocks: fixture.blocks.map((block) => ({ ...block, content: "{{user}}" })),
+      contextPacks: [{
+        contextPackId: "ignored-response-pack",
+        revisionId: "ignored-response-revision",
+        digest: "d".repeat(64),
+        content: "{{char}}",
+      }],
+    });
+    expect(response.effectiveEntryIds).toEqual([]);
+    expect(response.items.every((candidate) => candidate.outcome.status === "omitted" && candidate.outcome.reason === "response_mode")).toBe(true);
+    expect(response.responseOmission).toMatchObject({
+      version: 1,
+      surface: "RESPONSE",
+      visibility: "work_only",
+      reason: "work_only",
+      omittedEntryIds: expect.arrayContaining([
+        "work-direct",
+        "work-duplicate",
+        "usage-condition",
+        "completion-shared",
+        "completion-demand",
+        "completion-optional",
+        "render-direct",
+      ]),
+    });
+  });
+
+  test("strictly parses checkpoint inspection evidence and rejects forged ordering or fields", () => {
+    const fixture = policyFixture();
+    const policies = normalizeLoomPolicyBucketsV1(fixture.policies, fixture.source);
+    const inspection = inspectLoomPromptPolicies(policies, {
+      checkpoint: "WORK",
+      surface: "WORK",
+      evaluation: context({ presetVariables: { gate: "closed" } }),
+      blocks: fixture.blocks,
+      contextPacks: [],
+    });
+    expect(parseLoomPromptInspectionV1(structuredClone(inspection))).toEqual(inspection);
+
+    const forgedOrder = structuredClone(inspection) as unknown as {
+      items: Array<{ outcome: { status: string; effectiveIndex?: number } }>;
+    };
+    const included = forgedOrder.items.find((item) => item.outcome.status === "included");
+    if (!included) throw new Error("inspection fixture is missing its included item");
+    included.outcome.effectiveIndex = 1;
+    expect(() => parseLoomPromptInspectionV1(forgedOrder)).toThrow(/effective/i);
+
+    expect(() => parseLoomPromptInspectionV1({
+      ...structuredClone(inspection),
+      forged: true,
+    })).toThrow(/unknown (?:field|key)/i);
+  });
+
 });

@@ -52,51 +52,43 @@ curl -X PUT http://localhost:7860/api/v1/settings \
 ### `POST /api/v1/generate/effective-runtime`
 
 Resolve the effective concrete connection, preset/config, target, mode,
-capability readiness, and one-turn decision token. The route accepts preferred
-camelCase fields and the documented snake_case aliases:
+capability readiness, and one-turn decision token. The authenticated request
+uses this closed camelCase shape:
 
 ```ts
 {
-  chatId: string,                         // chat_id is also accepted
-  logicalConnectionId?: string | null,    // connectionId / connection_id
-  presetId?: string | null,               // preset_id
-  forcePresetId?: boolean,                // force_preset_id
-  personaId?: string | null,              // persona_id
-  targetCharacterId?: string | null,      // target_character_id
+  chatId: string,
+  logicalConnectionId?: string | null,
+  presetId?: string | null,
+  forcePresetId?: boolean,
+  personaId?: string | null,
+  targetCharacterId?: string | null,
   generationType?: 'normal' | 'continue' | 'regenerate' | 'swipe',
-  // generation_type is also accepted
-  messageId?: string | null,                // message_id
-  swipeId?: number | null,                  // swipe_id
+  messageId?: string | null,
+  swipeId?: number | null,
   target?: {
     generationType: 'normal' | 'continue' | 'regenerate' | 'swipe',
-    messageId?: string | null,              // message_id
-    swipeId?: number | null,                // swipe_id
-    targetCharacterId?: string | null,      // target_character_id
-    branchId?: string | null,               // branch_id; internal, omit
-    revision?: string | number | null,      // internal, omit
+    messageId?: string | null,
+    swipeId?: number | null,
+    targetCharacterId?: string | null,
   } | null,
   mode?: 'response' | 'agentic',
-  requestEpoch?: string | number,           // request_epoch
-  inputRevisions?: Partial<InputRevisionSetV1>, // input_revision_set / input_revisions
-  readinessVector?: Partial<AgenticReadinessVectorV1>, // readiness_vector
+  requestEpoch?: string | number,
+  inputRevisions?: Partial<InputRevisionSetV1>,
+  readinessVector?: Partial<AgenticReadinessVectorV1>,
 }
 ```
-The request is a closed object. Each alias set may be supplied in either
-spelling; `logicalConnectionId` additionally accepts `connectionId` and
-`connection_id`, and `generationType`, `messageId`, and `swipeId` accept their
-snake_case aliases. Supplying two spellings with different values is a
-`400 invalid_request`, as is any unknown key. `target` has the same closed
-alias rule for `messageId`/`message_id`, `swipeId`/`swipe_id`,
-`branchId`/`branch_id`, and `targetCharacterId`/`target_character_id`.
-Although the parser recognizes `target.branchId`/`branch_id` and
-`target.revision` as closed compatibility fields, callers must omit them from
-token-bearing requests: generation currently reconstructs the target without
-those internal fields, so copying them from a prior response can yield
-`decision_refresh_required`. The server freezes authoritative
-chat/message/branch/target revisions and binds them through
-`inputRevisionDigest` plus the durable target CAS. The one-use token therefore
-binds the requested target identity and complete revision digest without
-asking clients to copy internal revision fields.
+
+The body is closed: unknown fields and conflicting values are
+`400 invalid_request`. Branch and revision fields are server-owned; clients
+must not copy them from a previous projection. The server freezes the
+authoritative target and complete revision digest before issuing a token.
+
+`mode` is the authenticated one-turn selection and may be
+`'response'` or `'agentic'`. `transientSelection` and
+`transient_selection` are internal runtime-policy fields, not public request
+fields; sending either is rejected with `400 invalid_request`.
+
 
 The response is the closed `EffectiveRuntimePublicResponseV1` projection:
 
@@ -127,10 +119,13 @@ The response is the closed `EffectiveRuntimePublicResponseV1` projection:
   defaultMode: 'response' | 'agentic',
   requestedMode: 'response' | 'agentic',
   effectiveMode: 'response' | 'agentic',
+  runtimePolicy: LoomRuntimePolicyV1,
   chatOverride: {
     mode: 'response' | 'agentic' | null,
     revision: number,
     state: 'ready' | 'review_required' | 'repair_required',
+    reviewCode?: string | null,
+    acknowledged?: boolean,
   } | null,
   capabilityReadiness: {
     ready: boolean,
@@ -146,56 +141,56 @@ The response is the closed `EffectiveRuntimePublicResponseV1` projection:
 }
 ```
 
-The public projection contains labels and revisions only. The internal
-concrete candidate contains the normalized endpoint, credential reference, and
-trust-domain fingerprint and is never serialized. A ready Agentic response
-requires generation, streaming, tool calling, native tool continuation, tools
-disabled finalization, complete input revisions, same-domain root/child
-connections, valid slots/context/cognition, healthy terminable preprocessing,
-healthy publication storage, and the current runtime readiness vector.
-If an Agentic request is not ready, `effectiveMode: 'response'` is only the
-reported Response escape; it does not authorize an implicit downgrade of a
-generation request that asked for Agentic. The caller must explicitly submit
-`mode: 'response'` to use that path.
+The public projection contains safe labels and revisions only. The internal
+candidate contains the normalized endpoint, credential reference, and
+trust-domain fingerprint and is never serialized. Readiness requires
+generation, streaming, tool calling, native tool continuation, tools-disabled
+finalization, complete input revisions, same-domain root/child connections,
+valid slots/context/cognition, healthy terminable preprocessing, healthy
+publication storage, and the current readiness vector.
 
-`AgenticReadinessVectorV1` is closed and digest-bound. Its invalidation
-epochs/revisions are `schemaEpoch`, `runtimeEpoch`, `reconciliationEpoch`,
-`archiveRegistryVersion`, `isolateHealthEpoch`,
-`publicationStoreHealthEpoch`, `providerCapabilityRevision`, `configRevision`,
-`bindingRevision`, `concreteConnectionRevision`, `targetRevision`,
-`inputRevisionDigest`, `cognitionRevision`, and `contextAclRevision`; it also
-contains `killSwitchState`, `ready`, and bounded `reasons`. A binding,
-credential/candidate, target, cognition, context ACL, isolate, publication,
+The effective mode has explicit precedence:
+authenticated one-turn selection, ready durable chat override, reviewed
+preset default, then Response fallback. If Agentic is unavailable,
+`effectiveMode: 'response'` is only a reported Response escape; it does not
+authorize a request that asked for Agentic to downgrade. The caller must
+submit `mode: 'response'`. A binding, target, context, isolate, publication,
 startup, or runtime epoch change invalidates the decision and requires a new
 preflight.
 
+`AgenticReadinessVectorV1` is digest-bound. Its invalidation fields include
+`schemaEpoch`, `runtimeEpoch`, `reconciliationEpoch`,
+`archiveRegistryVersion`, `isolateHealthEpoch`,
+`publicationStoreHealthEpoch`, `providerCapabilityRevision`,
+`configRevision`, `bindingRevision`, `concreteConnectionRevision`,
+`targetRevision`, `inputRevisionDigest`, `cognitionRevision`, and
+`contextAclRevision`; it also carries `killSwitchState`, `ready`, and bounded
+`reasons`.
+
+
+
 ### `PUT /api/v1/chats/:id/agent-mode`
 
-Set the durable chat override without changing the preset:
+Set the durable chat override without changing the preset. The body is
+exactly:
 
 ```ts
-{
-  mode: 'response' | 'agentic' | null,
-
-  expectedRevision: number, // expected_revision is also accepted
-}
+{ mode: 'response' | 'agentic', expectedRevision: number }
 ```
-The override is not part of portable preset configuration or LumiHub data.
-It is a canonical archived row, but archive import clears its mode and marks
-the restored override `review_required`; it never restores activation
-authority. One-turn decision tokens are never persisted. `null` clears the
-override. A missing precondition returns `428
-AGENT_CHAT_MODE_REVISION_REQUIRED`; a malformed mode or revision returns `400
-INVALID_REQUEST`; a stale expected revision returns `409
-AGENT_CHAT_MODE_REVISION_CONFLICT` with the refresh-and-retry message. The
-response is `ChatAgentModeWriteResponseV1`
-(`{ chatId, mode, revision, state }`).
 
-The route returns `404 { error: 'Not found', code: 'NOT_FOUND' }` when the
-chat does not exist or is not owned by the session. The body must be a JSON
-object containing `mode`; conflicting `expectedRevision`/`expected_revision`
-aliases return `400 INVALID_REQUEST`. A stale revision must be refreshed,
-never merged.
+The response is `{ chatId, mode, revision, state, appliesTo: 'next_turn' }`.
+The write is a revision CAS and applies to the next Turn Session, including
+while another generation is active; it does not alter the current run.
+
+`DELETE /api/v1/chats/:id/agent-mode` resets the override. Its body is
+exactly `{ expectedRevision: number }` and it returns the same response shape
+with `mode: null`. A missing precondition returns
+`428 AGENT_CHAT_MODE_REVISION_REQUIRED`; malformed input returns
+`400 INVALID_REQUEST`; a stale expected revision returns
+`409 AGENT_CHAT_MODE_REVISION_CONFLICT` with current revision/mode/state
+details. A missing or foreign chat is the non-disclosing
+`404 { error: 'Not found', code: 'NOT_FOUND' }`. One-turn decision tokens are
+never persisted.
 
 ## Preset Agent runtime and portability routes
 
@@ -220,6 +215,7 @@ bindings, grants, or one-turn authority.
 | `GET` | `/api/v1/presets/:id/agent-config/portable` | Return config-only `PortableAgentConfigV1` without local bindings or credentials. |
 | `POST` | `/api/v1/presets/agent-config/portable/import` | Accept a config-only `PortablePresetPayload`; create a foreign preset/config as disabled, response-only, and review-required until local slot review. |
 | `POST` | `/api/v1/presets/:id/duplicate` | Same-account transactional duplicate of preset, normalized config, authorized bindings, regex companions, and the validated authored runtime envelope; Context Library rows are referenced, not cloned. |
+| `POST` | `/api/v1/presets/:id/agent-runtime/repair-acknowledgement` | Record a revision-fenced owner review `{ reasonCode, expectedPresetRevision }`; returns the persisted acknowledgement and never grants mode/capability authority. |
 | `GET` | `/api/v1/presets/agent-runtime-limits` | Read immutable effective host ceilings. |
 
 The `PUT /api/v1/presets/:id/agent-config` body is closed: unknown keys and
@@ -228,6 +224,13 @@ precondition is rejected with `428`. Stale preconditions are conflicts, not
 merges. The duplicate operation is the frontend/editor path; callers must not
 marshal a Loom preset locally when duplicating because that omits normalized
 Agentic state and authored cognition selections.
+
+`AgentConfigV2.runtimePolicy.loomPolicy` is the canonical four-bucket Loom
+authoring record (`workPolicy`, `workspaceUsage`, `completionCriteria`,
+`renderPolicy`). Its source revisions, fixed destinations/checkpoints,
+delivery policy, and `visibility: 'work_only'` are preserved by the config
+and portable routes. Response assembly omits WORK-only entries; owner
+inspection reports typed Loom outcomes and Response omission provenance.
 
 `GET /api/v1/presets/agent-runtime-limits` returns the immutable
 `AgentRuntimeHostLimits` object with exactly these numeric fields:
@@ -348,37 +351,74 @@ output.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/v1/agent-runs/changes/:chatId` | Return changed runs/events after `cursor`. |
-| `GET` | `/api/v1/agent-runs/:chatId/changes` | Stable path alias for the same cursor delta. |
-| `GET` | `/api/v1/agent-runs/active/:chatId` | Compatibility alias for chat changes. |
-| `GET` | `/api/v1/agent-runs/:chatId/active` | Compatibility alias for chat changes. |
-| `GET` | `/api/v1/agent-runs/active?chatId=...` | Query-form compatibility alias; `chat_id` is also accepted. |
-| `GET` | `/api/v1/agent-runs/status/:turnId` | Return the exact run by turn ID. |
-| `GET` | `/api/v1/agent-runs/:turnId/status` | Exact-run path alias. |
-| `GET` | `/api/v1/agent-runs/:turnId` | Exact-run path alias. |
+| `GET` | `/api/v1/agent-runs/changes/:chatId` | Return cursor delta/full-resync `AgentRunChangesV2`. |
+| `GET` | `/api/v1/agent-runs/status/:turnId` | Return exact `AgentRunPublicV2` by Turn Session ID. |
+| `GET` | `/api/v1/agent-runs/inspection?chatId=...` | Return owner-scoped `AgentRunInspectionListV1`; `limit` is 1–64 and `cursor` is a decimal offset. |
+| `GET` | `/api/v1/agent-runs/:attemptId/inspection` | Return owner-scoped `AgentRunInspectionDetailV1`. |
+| `POST` | `/api/v1/agent-runs/:attemptId/retry` | Admit a strict retry; body must be empty or `{}`. |
+| `GET` | `/api/v1/agent-runs/:turnId/workspace` | Return the redacted Turn Session workspace index. |
+| `GET` | `/api/v1/agent-runs/:turnId/workspace/:section` | Return one redacted page for `objective`, `tasks`, `records`, `submissions`, or `artifacts`. |
+| `POST` | `/api/v1/agent-runs/:turnId/stop` | Request exact root Stop and return `accepted`, `too_late`, or `terminal`. |
+
 Send the opaque, versioned integrity-protected cursor as `?cursor=...` or
-`x-agent-run-cursor`. The server binds it to the authenticated user/chat and
-the last strictly increasing chat event sequence. Run `revision` is monotonic
-but is not a chat cursor. An expired cursor returns one bounded full-resync
-snapshot and a fresh cursor; clients must not infer failure from a missing
-event or silence. Exact-run reads recheck authenticated user, chat, turn, and
-stored target-message/swipe ownership. Cursor changes bind the authenticated
-user and owned chat; view-only workspace index/page reads recheck the owned
-turn/workspace and its visibility before returning redacted retained metadata.
-Expired or otherwise no-longer-retained/read-visible run, projection, turn, or
-workspace rows return the same non-disclosing `404`; only an expired cursor
-gets the bounded full-resync response.
+`x-agent-run-cursor`. The server binds it to the authenticated owner/chat and
+the last strictly increasing chat event sequence. `revision` is monotonic
+run state, not a chat cursor. An expired cursor returns one bounded
+full-resync snapshot and a fresh cursor; clients must not infer failure from
+missing events or silence. Exact status, inspection, and workspace reads
+recheck owner, chat, attempt/turn, target-message/swipe ownership, and
+visibility. Missing, foreign, expired, or no-longer-retained data is the
+same non-disclosing `404`.
 
-Exact-run status aliases also accept an optional `?chatId=...` (or
-`?chat_id=...`) ownership check; the server never trusts a chat identifier
-copied from another response.
+`AgentRunPublicV2` exposes versioned run/turn/chat IDs, target and generation
+type, `workPhase`, `workStatus`, `workOutcome`, recovery fields,
+`attemptLineage`, revision/sequence/timestamps, bounded activity, aggregate
+usage, omission markers, and (after commit) the terminal message/swipe
+handoff. Public run errors use `{ version: 2, error: AgentRunPublicErrorV2 }`
+with `code`, `category`, `summaryCode`, `recoveryEligible`,
+`recoveryAction`, target/phase/status/outcome, reason, omission count, and
+inspection attempt ID. No public projection exposes prompts, WORK prose,
+reasoning, tool arguments/results, credentials, provider carriers, or private
+child content.
 
+`AgentRunInspectionListV1` returns bounded summaries with attempt lineage,
+host correlation, lifecycle/status/outcome/reason, target, revision and
+timestamps, activity, marker/transcript counts, terminal state, and a
+`nextCursor` plus one omission marker when applicable. The detail DTO adds
+private `transcript`, `turnSession`, `markers`, `usageEvidence`, layered
+`usage`, causal `error`, `promptEvidence` (including `loomInspection`),
+`cortexReceipts`, `councilReceipts`, `workspaceAssociations`, and stop/retry
+inspection records. These fields are owner-inspection data; the public run
+projection remains status-only.
 
-`AgentRunPublicV2` exposes run/turn/chat IDs, target type, phase/status,
-revision/sequence/timestamps, bounded root/provider/child/tool activity labels,
-usage, omission markers, stable error code/retryability, and the committed
-terminal message/swipe handoff. It never exposes prompts, work prose,
-reasoning, arguments, results, credentials, carriers, or private child text.
+`POST /api/v1/agent-runs/:attemptId/retry` accepts only an empty body or `{}`.
+Owner-scoped preflight requires a terminal attempt with outcome `failed`,
+`exhausted`, or `stopped`, a still-valid target, and available WORK
+admission. Refusals are typed `404 not_found`, `409 target_mismatch`,
+`stale_target`, or `response_mode_required`, or `503 retry_unavailable` /
+`recovery_unavailable` as applicable. Accepted returns `202` only after
+durable admission:
+
+```ts
+{
+  version: 1,
+  accepted: true,
+  attempt: {
+    version: 1,
+    attemptId: string,
+    previousAttemptId: string,
+    target: { chatId, generationType, messageId, swipeId },
+    createdAt: number,
+  },
+  reason: 'none',
+  target,
+  recoveryEligible: false,
+  recoveryAction: 'none',
+  inspectionAttemptId: string,
+}
+```
+
+No refused retry creates a phantom attempt, projection, or terminal message.
 
 ### View-only workspace and Stop
 
@@ -386,7 +426,7 @@ reasoning, arguments, results, credentials, carriers, or private child text.
 |---|---|---|
 | `GET` | `/api/v1/agent-runs/:turnId/workspace` | Redacted section index with counts, revisions, retention, visibility, and omission count. |
 | `GET` | `/api/v1/agent-runs/:turnId/workspace/:section` | View one page of `objective`, `tasks`, `records`, `submissions`, or `artifacts`; accepts `page` and optional `revision`. |
-| `POST` | `/api/v1/agent-runs/:turnId/stop` | Exact root Stop; accepts optional `chat_id`/`chatId`, `generation_id`/`generationId`, and `root_id`/`rootId`. |
+| `POST` | `/api/v1/agent-runs/:turnId/stop` | Exact root Stop; verifies the owned Turn Session and returns `accepted`, `too_late`, or `terminal`. |
 
 The workspace page is a redacted `AgentWorkspacePreviewV2`, not a transcript:
 it contains section/page counts, revisions, retention/visibility, omission
@@ -395,9 +435,120 @@ prose, constraints, notes, child content, provider reasoning, tool arguments
 or results, credentials, carriers, or raw artifacts. Invalid section/page or
 revision values are `400`; a missing, expired, hidden, or cross-owner
 turn/workspace is the non-disclosing `404`. `POST .../:turnId/stop` verifies
-any supplied `chat_id`/`generation_id`/`root_id` against the owned execution
-and returns `accepted`, `too_late`, or `terminal`; it never exposes child
-controls.
+the owned execution and returns `accepted`, `too_late`, or `terminal`; it never
+exposes child controls.
+
+## Persistent Workspace routes
+
+The persistent workspace is separate from the redacted Turn Session workspace
+above. It is a stable, structured owner record that may outlive a Turn Session
+and may be detached from its chat. It is not a canonical chat transcript and
+does not grant WORK, tool, child, or commit authority.
+
+All routes below are authenticated. The session supplies `userId`; the
+`chatId` query and `workspaceId` path are the only routing scope. Body fields
+such as `userId`, `chatId`, `actor`, `publisher`, `creator`, `authority`, or
+`hostAdmitted` are ignored as authority. A foreign workspace or a workspace
+whose chat does not match the requested chat is the same non-disclosing `404`.
+
+| Method | Endpoint | Result |
+|---|---|---|
+| `GET` | `/api/v1/agent-runs/workspace?chatId=...` | Read the persistent workspace attached to the authenticated owner's chat. |
+| `POST` | `/api/v1/agent-runs/workspace?chatId=...` | Create or ensure the persistent workspace for the authenticated owner/chat (`201`). |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId` | Read one owner-scoped workspace; an optional `chatId` query verifies its live attachment. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/sessions` | List retained Turn Session associations. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/tasks` | List persistent tasks. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/records` | List findings, decisions, and questions. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/artifacts` | List attached artifact metadata. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/submissions` | List persistent child submissions with `submitted`, `accepted`, or `rejected` state. This is a read-only owner projection. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/publications` | List independent publication copies. |
+| `PATCH` | `/api/v1/agent-runs/workspace/:workspaceId` | Update owner-editable workspace fields with `expectedRevision`. |
+| `POST` | `/api/v1/agent-runs/workspace/:workspaceId/tasks` | Create an owner task with `expectedRevision` (`201`). |
+| `POST` | `/api/v1/agent-runs/workspace/:workspaceId/publications` | Publish an owner-selected workspace item with `expectedRevision` (`201`). |
+| `DELETE` | `/api/v1/agent-runs/workspace/:workspaceId/publications/:publicationId` | Delete a publication copy with `expectedRevision`. |
+| `DELETE` | `/api/v1/agent-runs/workspace/:workspaceId` | Delete the workspace with `expectedRevision`. |
+
+The owner mutation bodies use these closed shapes (server-owned identity and
+authority fields are not client inputs):
+
+```ts
+// POST /workspace?chatId=...
+{
+  objective?: string,
+  metadata?: Partial<PersistentWorkspaceMetadataV1>,
+  progress?: Partial<PersistentWorkspaceProgressV1>,
+  quota?: Partial<PersistentWorkspaceQuotaV1>,
+}
+
+// PATCH /workspace/:workspaceId
+{
+  expectedRevision: number,
+  objective?: string,
+  metadata?: Partial<PersistentWorkspaceMetadataV1>,
+  progress?: Partial<PersistentWorkspaceProgressV1>,
+  record?: {
+    kind: 'finding' | 'decision' | 'question',
+    summary: string,
+    evidenceIds?: string[],
+    provenance?: string | null,
+    taskId?: string | null,
+    turnSessionId?: string | null,
+  },
+}
+
+// POST /workspace/:workspaceId/tasks
+{
+  expectedRevision: number,
+  title: string,
+  objective?: string,
+  state?: 'pending' | 'active' | 'blocked' | 'completed' | 'cancelled' | 'failed',
+  required?: false,
+  dependencyIds?: string[],
+  turnSessionId?: string | null,
+}
+
+// POST /workspace/:workspaceId/publications
+{
+  expectedRevision: number,
+  category: 'task' | 'finding' | 'objective' | 'artifact',
+  sourceId: string,
+  sourceRevision?: number,
+  sourceDigest?: string,
+}
+
+// DELETE .../publications/:publicationId and DELETE .../:workspaceId
+{ expectedRevision: number }
+```
+Create and edit return `PersistentWorkspaceV1`; task creation returns
+`PersistentWorkspaceTaskV1`; publication creation returns
+`PersistentWorkspacePublicationV1`. Deleting a publication returns the
+updated workspace, while deleting a workspace returns its deletion result.
+These operations never return a canonical chat message.
+
+The `PersistentWorkspaceV1` record includes its stable `id`, nullable live
+`chatId`, objective and metadata, progress, active/archived state, monotonic
+`revision`, created/updated timestamps, quota, and usage counters. Its child
+resources are versioned and revisioned: Turn Session associations, tasks,
+records, submissions, artifact metadata, and publications. Submissions are
+read-only through this owner route; WORK admission controls their creation and
+acceptance.
+Owner tasks cannot be marked as required; required host-admitted work is
+created and validated by the WORK host authority instead.
+
+Every mutation is a revision compare-and-set. A malformed request or missing
+revision is `400`; a stale revision or assignment race is `409
+stale_workspace_revision`; a frozen workspace is `409 workspace_frozen`; a
+quota breach is `413 workspace_quota_exceeded`; and a capability/authority
+failure is `403 workspace_forbidden`. No mutation is silently merged.
+
+The chat attachment is live source state, not the workspace's identity. Chat
+deletion detaches the workspace and preserves its stable record; source
+provenance records the detached/deleted state. A publication is an independent
+bounded copy with source digest and provenance (including the originating
+workspace/Turn Session/attempt and message/swipe identity when available).
+Publication copies are noncanonical: they do not become chat messages, do not
+rewrite source workspace records, and do not confer WORK authority.
+
 ## Context Library API
 
 Context packs are account-owned, immutable-revision data with optional

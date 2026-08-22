@@ -8,6 +8,7 @@ import * as presetProfilesSvc from "./preset-profiles.service";
 import * as presetsSvc from "./presets.service";
 import * as settingsSvc from "./settings.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
+import type { ResolvedCouncilProfile } from "../types/council-profile";
 import type {
   AgenticReadinessVectorV1,
   AgentRuntimeCapabilityRequirement,
@@ -21,6 +22,13 @@ import type {
   FrozenConcreteConnectionV1,
   GenerationTargetV1,
   InputRevisionSetV1,
+  LoomRuntimePolicyAvailabilityV1,
+  LoomRuntimePolicyCapV1,
+  LoomRuntimePolicyDurableChatOverrideV1,
+  LoomRuntimePolicyRepairAcknowledgementV1,
+  LoomRuntimePolicySourceV1,
+  LoomRuntimePolicyTransientSelectionV1,
+  LoomRuntimePolicyV1,
   RuntimeDecisionBindingV1,
   RuntimeDecisionInternalV1,
   RuntimeDecisionTokenConsumptionV1,
@@ -31,15 +39,16 @@ import type {
 import {
   isAgenticGenerationType,
   AGENT_RUNTIME_CAPABILITY_REQUIREMENTS,
+  AGENT_RUNTIME_REPAIR_CODES,
   AGENT_RUNTIME_DECISION_TOKEN_TTL_MS,
   AGENT_RUNTIME_DECISION_MAX_LIVE_PER_USER,
   AGENT_RUNTIME_DECISION_MAX_LIVE_PROCESS,
   AGENT_RUNTIME_DECISION_VERSION,
   isAgentRuntimeMode,
 } from "../types/agent-runtime-decision";
-
-import { validateAgentConfigForExecution } from "./agent-runtime-limits";
+import type { AgentRuntimePolicyV1 } from "../types/agents";
 import { parseAgentConfigV2 } from "../types/agents";
+import { validateAgentConfigForExecution } from "./agent-runtime-limits";
 const INPUT_REVISION_KEYS: readonly (keyof InputRevisionSetV1)[] = [
   "target",
   "chat",
@@ -82,17 +91,112 @@ export type RuntimeDecisionErrorCode =
   | "not_found"
   | "invalid_request"
   | "decision_refresh_required"
-  | "decision_capacity_exceeded";
+  | "decision_capacity_exceeded"
+  | "runtime_policy_invalid"
+  | "runtime_policy_unavailable"
+  | "runtime_policy_authority_widening"
+  | "active_turn_immutable"
+  | "chat_mode_revision_conflict";
 
 export class RuntimeDecisionError extends Error {
   readonly code: RuntimeDecisionErrorCode;
   readonly status: number;
+  readonly repairCode: AgentRuntimeRepairCode | null;
+  readonly details: Readonly<Record<string, unknown>> | null;
 
-  constructor(code: RuntimeDecisionErrorCode, message: string, status = 400) {
+  constructor(
+    code: RuntimeDecisionErrorCode,
+    message: string,
+    status = 400,
+    repairCode: AgentRuntimeRepairCode | null = null,
+    details: Readonly<Record<string, unknown>> | null = null,
+  ) {
     super(message);
     this.name = "RuntimeDecisionError";
     this.code = code;
     this.status = status;
+    this.repairCode = repairCode;
+    this.details = details;
+  }
+}
+export interface RuntimeRepairAcknowledgementV1 extends LoomRuntimePolicyRepairAcknowledgementV1 {
+  presetId: string;
+  revision: number;
+  scope: "repair/review";
+}
+
+function sameRuntimeRevision(left: RuntimeRevision | null, right: RuntimeRevision | null): boolean {
+  return left !== null && right !== null && (left === right || String(left) === String(right));
+}
+
+function normalizeRepairReason(value: unknown, fallback: string | null): string | null {
+  const reason = safeString(value, null) ?? fallback;
+  return reason && reason.length <= SAFE_STRING_MAX ? reason : null;
+}
+
+function normalizeDbNonNegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+const RUNTIME_REPAIR_ACK_TABLE = "agent_runtime_repair_acknowledgements";
+
+
+interface PersistedRuntimeRepairAcknowledgement {
+  revision: number;
+  acknowledgedAt: number;
+}
+
+function readPersistedRuntimeRepairAcknowledgement(
+  userId: string,
+  presetId: string,
+  presetRevision: RuntimeRevision,
+  reasonCode: string,
+): PersistedRuntimeRepairAcknowledgement | null {
+  try {
+    const row = getDb().query(
+      `SELECT revision, acknowledged_at
+       FROM ${RUNTIME_REPAIR_ACK_TABLE}
+       WHERE user_id = ? AND preset_id = ? AND preset_revision = ? AND reason_code = ?`,
+    ).get(userId, presetId, String(presetRevision), reasonCode) as { revision?: unknown; acknowledged_at?: unknown } | null;
+    const revision = normalizeDbNonNegativeInteger(row?.revision);
+    const acknowledgedAt = normalizeDbNonNegativeInteger(row?.acknowledged_at);
+    if (revision === null || acknowledgedAt === null) return null;
+    return { revision, acknowledgedAt };
+  } catch {
+    return null;
+  }
+}
+
+function persistRuntimeRepairAcknowledgement(
+  userId: string,
+  presetId: string,
+  presetRevision: RuntimeRevision,
+  reasonCode: string,
+  acknowledgedAt: number,
+): PersistedRuntimeRepairAcknowledgement | null {
+  const normalizedAcknowledgedAt = normalizeDbNonNegativeInteger(acknowledgedAt);
+  if (normalizedAcknowledgedAt === null) return null;
+  try {
+    const db = getDb();
+    const current = db.query(
+      `SELECT revision
+       FROM ${RUNTIME_REPAIR_ACK_TABLE}
+       WHERE user_id = ? AND preset_id = ? AND preset_revision = ? AND reason_code = ?`,
+    ).get(userId, presetId, String(presetRevision), reasonCode) as { revision?: unknown } | null;
+    const currentRevision = normalizeDbNonNegativeInteger(current?.revision);
+    const revision = currentRevision ?? 1;
+    db.query(
+      `INSERT INTO ${RUNTIME_REPAIR_ACK_TABLE}
+         (user_id, preset_id, preset_revision, reason_code, revision, acknowledged_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, preset_id, preset_revision, reason_code)
+       DO UPDATE SET revision = excluded.revision, acknowledged_at = excluded.acknowledged_at`,
+    ).run(userId, presetId, String(presetRevision), reasonCode, revision, normalizedAcknowledgedAt);
+    return { revision, acknowledgedAt: normalizedAcknowledgedAt };
+  } catch {
+    return null;
   }
 }
 
@@ -225,9 +329,12 @@ interface AgentConfigView {
   maxToolCalls: number;
   profiles: AgentConfigProfileView[];
   connectionSlots: AgentConfigSlotView[];
+  runtimePolicy: AgentRuntimePolicyV1 | null;
   revision: RuntimeRevision | null;
   bindingRevision: RuntimeRevision | null;
   state: "ready" | "review_required" | "repair_required";
+  reviewCode: string | null;
+  reviewAcknowledged: boolean;
 }
 
 interface AgentRuntimeChatView {
@@ -243,12 +350,8 @@ interface AgentRuntimePresetView {
   agent_config?: unknown;
 }
 
-export interface RuntimeCouncilProfileView {
-  council_settings: {
-    councilMode?: boolean;
-    members: readonly { tools?: readonly unknown[] }[];
-  };
-}
+export type RuntimeCouncilProfileView = ResolvedCouncilProfile;
+
 export interface RuntimeDecisionDependencies {
   getChat: (userId: string, chatId: string) => AgentRuntimeChatView | null;
   getPreset: (userId: string, presetId: string) => AgentRuntimePresetView | null;
@@ -319,6 +422,8 @@ interface InternalResolutionContext {
   target: GenerationTargetV1;
   rootConnection: FrozenConcreteConnectionV1 | null;
   childConnections: Record<string, FrozenConcreteConnectionV1>;
+  councilProfile: ResolvedCouncilProfile;
+  councilConnection: FrozenConcreteConnectionV1 | null;
   config: AgentConfigView | null;
   preset: AgentRuntimePresetView | null;
   presetSource: SafePresetProjectionV1["source"];
@@ -335,6 +440,7 @@ interface InternalResolutionContext {
     repairCodes: AgentRuntimeRepairCode[];
   };
   repairCodes: AgentRuntimeRepairCode[];
+  runtimePolicy: LoomRuntimePolicyV1;
   requestedMode: AgentRuntimeMode;
   effectiveMode: AgentRuntimeMode;
 }
@@ -396,6 +502,119 @@ function normalizeRequirements(value: unknown): AgentRuntimeCapabilityRequiremen
   }
   return requirements.sort((left, right) => left.localeCompare(right));
 }
+export interface LoomRuntimePolicyResolutionInputV1 {
+  transientSelection?: LoomRuntimePolicyTransientSelectionV1 | null;
+  durableChatOverride?: LoomRuntimePolicyDurableChatOverrideV1 | null;
+  presetDefault?: AgentRuntimeMode | null;
+  presetRevision?: RuntimeRevision | null;
+  presetState?: "ready" | "review_required" | "repair_required";
+  presetRepairCode?: AgentRuntimeRepairCode | null;
+  hostAllowedModes?: readonly AgentRuntimeMode[];
+  hostAvailability?: LoomRuntimePolicyAvailabilityV1["state"];
+  hostReasonCode?: AgentRuntimeRepairCode | null;
+  repairAcknowledgement?: LoomRuntimePolicyRepairAcknowledgementV1;
+}
+
+function freezePolicy<T>(value: T): T {
+  if (value && typeof value === "object") {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      if (child && typeof child === "object" && !Object.isFrozen(child)) freezePolicy(child);
+    }
+  }
+  return value;
+}
+
+export function resolveLoomRuntimePolicy(
+  input: LoomRuntimePolicyResolutionInputV1,
+): LoomRuntimePolicyV1 {
+  const transientSelection = input.transientSelection ?? null;
+  const durableChatOverride = input.durableChatOverride ?? null;
+  const allowedModes = [...new Set(
+    (input.hostAllowedModes ?? ["response", "agentic"])
+      .filter((mode): mode is AgentRuntimeMode => isAgentRuntimeMode(mode)),
+  )];
+  const cap: LoomRuntimePolicyCapV1 = {
+    authority: "host",
+    allowedModes,
+    reasonCode: input.hostReasonCode ?? null,
+  };
+  const hostAvailability = input.hostAvailability ?? "available";
+  const presetState = input.presetState ?? "ready";
+  const presetDefault = isAgentRuntimeMode(input.presetDefault) ? input.presetDefault : null;
+  let authoredValue: AgentRuntimeMode = "response";
+  let source: LoomRuntimePolicySourceV1 = "response_fallback";
+  let scope: LoomRuntimePolicyV1["scope"] = "fallback";
+  let availability: LoomRuntimePolicyAvailabilityV1 = {
+    state: "available",
+    reasonCode: null,
+  };
+
+  if (transientSelection && transientSelection.authenticated === true) {
+    authoredValue = transientSelection.mode;
+    source = "authenticated_one_turn";
+    scope = "turn";
+  } else if (
+    durableChatOverride
+    && durableChatOverride.state === "ready"
+    && durableChatOverride.mode !== null
+  ) {
+    authoredValue = durableChatOverride.mode;
+    source = "durable_chat_override";
+    scope = "chat";
+  } else if (presetState === "ready" && presetDefault !== null) {
+    authoredValue = presetDefault;
+    source = "reviewed_preset_default";
+    scope = "preset";
+  } else {
+    const reasonCode = input.presetRepairCode
+      ?? (presetState === "repair_required" ? "loom_policy_invalid" : "loom_policy_repair_required");
+    availability = {
+      state: presetState === "repair_required" ? "invalid" : "stale",
+      reasonCode,
+    };
+  }
+
+  let effectiveValue = authoredValue;
+  if (hostAvailability !== "available") {
+    effectiveValue = "response";
+    source = "host_rejected";
+    scope = "host";
+    availability = {
+      state: hostAvailability,
+      reasonCode: input.hostReasonCode ?? "loom_policy_unavailable",
+    };
+  } else if (!allowedModes.includes(authoredValue)) {
+    effectiveValue = "response";
+    source = allowedModes.includes("response") ? "host_cap" : "host_rejected";
+    scope = "host";
+    availability = {
+      state: "denied",
+      reasonCode: input.hostReasonCode ?? "loom_policy_unavailable",
+    };
+  }
+  const repairAcknowledgement = input.repairAcknowledgement ?? {
+    state: availability.state === "available" ? "not_required" : "required",
+    presetRevision: input.presetRevision ?? null,
+    reasonCode: availability.reasonCode,
+    acknowledgedAt: null,
+  };
+  return freezePolicy({
+    version: 1,
+    authoredValue,
+    effectiveValue,
+    source,
+    scope,
+    cap: { ...cap, allowedModes: Object.freeze(allowedModes) },
+    availability,
+    presetRevision: input.presetRevision ?? null,
+    transientSelection,
+    durableChatOverride,
+    repairAcknowledgement,
+    nextTurnOnly: true,
+  });
+}
+
 
 function normalizeTarget(request: EffectiveRuntimeRequestV1): { target: GenerationTargetV1; invalidType: boolean } {
   const rawType = request.target?.generationType ?? request.generationType ?? "normal";
@@ -575,6 +794,8 @@ function normalizeConfig(
   revision: RuntimeRevision,
   bindingRevision: RuntimeRevision | null,
   state: "ready" | "review_required" | "repair_required",
+  reviewCode: string | null = null,
+  reviewAcknowledged = false,
 ): AgentConfigView | null {
   let config: ReturnType<typeof parseAgentConfigV2>;
   try {
@@ -600,7 +821,10 @@ function normalizeConfig(
       label: slot.label,
       requiredCapabilities: normalizeRequirements(slot.requiredCapabilities),
     })),
+    runtimePolicy: config.runtimePolicy ?? null,
     revision,
+    reviewCode,
+    reviewAcknowledged,
     bindingRevision,
     state,
   };
@@ -659,6 +883,7 @@ function buildBinding(
   return {
     userId,
     chatId: context.chat.id,
+    turnFence: context.runtimePolicy.transientSelection?.turnFence ?? safeRevision(context.request.requestEpoch) ?? DEFAULT_REVISION,
     targetDigest: hashCanonical(context.target),
     requestEpoch: safeRevision(context.request.requestEpoch) ?? DEFAULT_REVISION,
     logicalConnectionId: root?.logicalId ?? null,
@@ -697,6 +922,8 @@ function readOverrideViaPersistenceService(userId: string, chatId: string): Chat
       mode: isAgentRuntimeMode(result.mode) ? result.mode : null,
       revision: typeof result.revision === "number" && Number.isSafeInteger(result.revision) ? result.revision : 1,
       state: result.state === "review_required" || result.state === "repair_required" ? result.state : "ready",
+      reviewCode: safeString(result.reviewCode, null),
+      acknowledged: result.acknowledged === true,
     };
   } catch {
     return undefined;
@@ -708,17 +935,36 @@ function readOverrideFromDb(userId: string, chatId: string): ChatAgentModeOverri
   if (persisted !== undefined) return persisted;
   try {
     const row = getDb().query(
-      "SELECT mode, revision, state FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?",
-    ).get(userId, chatId) as { mode?: unknown; revision?: unknown; state?: unknown } | null;
+      "SELECT mode, revision, state, review_code, review_acknowledged FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?",
+    ).get(userId, chatId) as { mode?: unknown; revision?: unknown; state?: unknown; review_code?: unknown; review_acknowledged?: unknown } | null;
     if (!row) return null;
     return {
       mode: isAgentRuntimeMode(row.mode) ? row.mode : null,
       revision: typeof row.revision === "number" && Number.isSafeInteger(row.revision) ? row.revision : 1,
       state: row.state === "review_required" || row.state === "repair_required" ? row.state : "ready",
+      reviewCode: safeString(row.review_code, null),
+      acknowledged: row.review_acknowledged === 1,
     };
   } catch {
     return null;
   }
+}
+
+function chatModeRevisionConflict(userId: string, chatId: string): RuntimeDecisionError {
+  const current = readOverrideFromDb(userId, chatId);
+  return new RuntimeDecisionError(
+    "chat_mode_revision_conflict",
+    "Chat agent mode changed; refresh and try again.",
+    409,
+    null,
+    {
+      currentRevision: current?.revision ?? 0,
+      currentMode: current?.mode ?? null,
+      currentState: current?.state ?? "ready",
+      source: "durable_chat_override",
+      appliesTo: "next_turn",
+    },
+  );
 }
 
 function writeOverrideToDb(
@@ -755,7 +1001,7 @@ function writeOverrideToDb(
         throw new RuntimeDecisionError("invalid_request", "Chat agent mode expectedRevision is required (use 0 for the first write).", 428);
       }
       if (error instanceof Error && error.message === "AGENT_CHAT_MODE_REVISION_CONFLICT") {
-        throw new RuntimeDecisionError("invalid_request", "Chat agent mode changed; refresh and try again.", 409);
+        throw chatModeRevisionConflict(userId, chatId);
       }
       throw new RuntimeDecisionError("invalid_request", "Chat agent mode storage is unavailable.", 503);
     }
@@ -791,7 +1037,7 @@ function writeOverrideToDb(
       `).run(mode, expectedRevision + 1, now, userId, chatId, expectedRevision);
     })();
     if (result.changes !== 1) {
-      throw new RuntimeDecisionError("invalid_request", "Chat agent mode changed; refresh and try again.", 409);
+      throw chatModeRevisionConflict(userId, chatId);
     }
   } catch (error) {
     if (error instanceof RuntimeDecisionError) throw error;
@@ -873,7 +1119,17 @@ function normalizeConfigProjection(projection: unknown): { config: AgentConfigVi
     slotBindings,
     slotBindingStates,
   };
-  return { config: normalizeConfig(projectedConfig, configRevision, maxBindingRevision, state), raw };
+  return {
+    config: normalizeConfig(
+      projectedConfig,
+      configRevision,
+      maxBindingRevision,
+      state,
+      safeString(review.reasonCode, null),
+      review.acknowledged === true,
+    ),
+    raw,
+  };
 }
 
 function defaultConfigReader(userId: string, presetId: string): { config: AgentConfigView | null; raw: unknown } {
@@ -919,8 +1175,8 @@ function ensureDependencies(overrides: Partial<RuntimeDecisionDependencies> | un
 
 export class AgentRuntimeDecisionService {
   readonly tokenStore: RuntimeDecisionTokenStore;
-  private dependencies: RuntimeDecisionDependencies;
   private readonly now: () => number;
+  private dependencies: RuntimeDecisionDependencies;
   private dependencyUseStarted = false;
   private dependenciesConfigured = false;
   /**
@@ -937,6 +1193,108 @@ export class AgentRuntimeDecisionService {
     this.startsWithDefaultDependencies = options.dependencies === undefined;
     this.dependencies = ensureDependencies(options.dependencies);
   }
+  private configForPreset(userId: string, presetId: string): AgentConfigView | null {
+    if (!this.dependencies.getPresetAgentConfig) return null;
+    return normalizeConfigProjection(this.dependencies.getPresetAgentConfig(userId, presetId)).config;
+  }
+
+  private repairAcknowledgementFor(
+    userId: string,
+    preset: AgentRuntimePresetView | null,
+    config: AgentConfigView | null,
+  ): LoomRuntimePolicyRepairAcknowledgementV1 | undefined {
+    if (!config) return undefined;
+    const presetRevision = safeRevision(preset?.cache_revision ?? config.revision);
+    if (config.state === "ready") {
+      return {
+        state: "not_required",
+        presetRevision,
+        reasonCode: null,
+        acknowledgedAt: null,
+      };
+    }
+    const reasonCode = normalizeRepairReason(config.reviewCode, "loom_policy_repair_required");
+    if (preset?.id && presetRevision !== null && reasonCode) {
+      const persisted = readPersistedRuntimeRepairAcknowledgement(
+        userId,
+        preset.id,
+        presetRevision,
+        reasonCode,
+      );
+      if (persisted) {
+        return {
+          state: "acknowledged",
+          presetRevision,
+          reasonCode,
+          acknowledgedAt: persisted.acknowledgedAt,
+        };
+      }
+    }
+    return {
+      state: "required",
+      presetRevision,
+      reasonCode: config.reviewCode,
+      acknowledgedAt: null,
+    };
+  }
+
+  acknowledgeRuntimeRepair(
+    userId: string,
+    presetId: string,
+    expectedPresetRevision: RuntimeRevision,
+    reasonCode: string,
+  ): RuntimeRepairAcknowledgementV1 {
+    const preset = this.dependencies.getPreset(userId, presetId);
+    if (!preset) throw new RuntimeDecisionError("not_found", "Not found", 404);
+    const expected = safeRevision(expectedPresetRevision);
+    if (expected === null) {
+      throw new RuntimeDecisionError("invalid_request", "expectedPresetRevision is required.", 428);
+    }
+    const config = this.configForPreset(userId, presetId);
+    const currentRevision = safeRevision(preset.cache_revision ?? config?.revision);
+    if (currentRevision === null || !sameRuntimeRevision(expected, currentRevision)) {
+      throw new RuntimeDecisionError(
+        "decision_refresh_required",
+        "Preset changed; refresh the reviewed runtime revision and try again.",
+        409,
+        null,
+        {
+          presetId,
+          currentRevision,
+          source: "preset_runtime_review",
+          appliesTo: "repair/review",
+        },
+      );
+    }
+    const normalizedReason = normalizeRepairReason(reasonCode, null);
+    if (!normalizedReason || !(AGENT_RUNTIME_REPAIR_CODES as readonly string[]).includes(normalizedReason)) {
+      throw new RuntimeDecisionError("invalid_request", "reasonCode is not an allowlisted runtime repair item.", 400);
+    }
+    if (config?.state === "ready") {
+      throw new RuntimeDecisionError("invalid_request", "The reviewed runtime preset has no repair item to acknowledge.", 409);
+    }
+    const acknowledgedAt = this.now();
+    const persisted = persistRuntimeRepairAcknowledgement(
+      userId,
+      presetId,
+      currentRevision,
+      normalizedReason,
+      acknowledgedAt,
+    );
+    if (!persisted) {
+      throw new RuntimeDecisionError("runtime_policy_unavailable", "Repair acknowledgement storage is unavailable.", 503);
+    }
+    return {
+      presetId,
+      presetRevision: currentRevision,
+      reasonCode: normalizedReason,
+      acknowledgedAt: persisted.acknowledgedAt,
+      revision: persisted.revision,
+      scope: "repair/review",
+      state: "acknowledged",
+    };
+  }
+
 
   async resolve(
     userId: string,
@@ -966,14 +1324,11 @@ export class AgentRuntimeDecisionService {
       { isGroup },
     );
     const councilSettings = councilProfile.council_settings;
-    const councilActive =
-      councilSettings.councilMode === true &&
-      councilSettings.members.length > 0;
     const councilToolsActive = councilSettings.members.some(
       (member) => Array.isArray(member.tools) && member.tools.length > 0,
     );
     const unsupportedAgenticSurface =
-      isGroup || isMultiplayer || councilActive || councilToolsActive;
+      isGroup || isMultiplayer || councilToolsActive;
     const requestedLogicalConnectionId = safeString(request.logicalConnectionId, null);
     const rootConnection = normalizeConcreteConnection(
       await this.dependencies.resolveConcreteConnection(
@@ -983,6 +1338,16 @@ export class AgentRuntimeDecisionService {
       ),
       requestedLogicalConnectionId,
     );
+    const councilConnectionProfileId = safeString(
+      councilProfile.sidecar_settings.connectionProfileId,
+      null,
+    );
+    const councilConnection = councilConnectionProfileId
+      ? normalizeConcreteConnection(
+        await this.dependencies.resolveConcreteConnection(userId, councilConnectionProfileId, null),
+        councilConnectionProfileId,
+      )
+      : null;
 
     const repairCodes: AgentRuntimeRepairCode[] = [];
     if (!rootConnection) repairCodes.push("agentic_connection_unavailable");
@@ -1049,21 +1414,75 @@ export class AgentRuntimeDecisionService {
     }
 
     const chatOverride = this.dependencies.getChatAgentModeOverride(userId, chat.id);
-    const configAllowedModes = config?.allowedModes ?? ["response"];
-    const configDefaultMode = config?.defaultMode ?? "response";
-    const requestedMode: AgentRuntimeMode = request.mode
-      ?? chatOverride?.mode
-      ?? configDefaultMode;
-    const normalizedRequestedMode = isAgentRuntimeMode(requestedMode) ? requestedMode : "response";
+    let configAllowedModes = config?.allowedModes ?? ["response"];
+    let configDefaultMode = config?.runtimePolicy?.defaultMode ?? config?.defaultMode ?? "response";
+    if (noPreset) {
+      config = null;
+      rawConfig = null;
+      configAllowedModes = ["response"];
+      configDefaultMode = "response";
+    }
+    const rawTransientSelection = request.transientSelection
+      ?? (request.mode
+        ? {
+          mode: request.mode,
+          turnFence: request.requestEpoch ?? DEFAULT_REVISION,
+          authenticated: true as const,
+        }
+        : null);
+    const transientSelectionInvalid = rawTransientSelection !== null
+      && rawTransientSelection !== undefined
+      && (!isAgentRuntimeMode(rawTransientSelection.mode)
+        || rawTransientSelection.authenticated !== true
+        || safeRevision(rawTransientSelection.turnFence) === null);
+    const transientSelection = !transientSelectionInvalid && rawTransientSelection && isAgentRuntimeMode(rawTransientSelection.mode)
+      ? {
+        mode: rawTransientSelection.mode,
+        turnFence: safeRevision(rawTransientSelection.turnFence) ?? DEFAULT_REVISION,
+        authenticated: true as const,
+      }
+      : null;
+    const overrideRecord = chatOverride
+      ? chatOverride as ChatAgentModeOverrideV1 & {
+        reviewCode?: unknown;
+        acknowledged?: unknown;
+      }
+      : null;
+    const durableChatOverride: LoomRuntimePolicyDurableChatOverrideV1 | null = overrideRecord
+      ? {
+        mode: overrideRecord.mode,
+        revision: overrideRecord.revision,
+        state: overrideRecord.state,
+        reviewCode: safeString(overrideRecord.reviewCode, null),
+        acknowledged: overrideRecord.acknowledged === true,
+      }
+      : null;
+    const presetRevision = safeRevision(preset?.cache_revision ?? config?.revision);
+    const repairAcknowledgement = this.repairAcknowledgementFor(userId, preset, config);
+    const initialRuntimePolicy = resolveLoomRuntimePolicy({
+      transientSelection,
+      durableChatOverride,
+      presetDefault: config?.runtimePolicy?.defaultMode ?? config?.defaultMode ?? null,
+      presetRevision,
+      presetState: config?.state ?? "repair_required",
+      presetRepairCode: config?.state === "repair_required"
+        ? "loom_policy_invalid"
+        : config?.state === "review_required"
+          ? "loom_policy_repair_required"
+          : null,
+      hostAllowedModes: configAllowedModes,
+      repairAcknowledgement,
+    });
+    const requestedMode = initialRuntimePolicy.authoredValue;
+    const normalizedRequestedMode = requestedMode;
+    if (transientSelectionInvalid) repairCodes.push("loom_policy_invalid");
     if (request.mode && !isAgentRuntimeMode(request.mode)) repairCodes.push("agentic_mode_not_allowed");
+    if (initialRuntimePolicy.availability.reasonCode) repairCodes.push(initialRuntimePolicy.availability.reasonCode);
     if (normalizedRequestedMode === "agentic" && unsupportedAgenticSurface) {
       repairCodes.push("agentic_target_unsupported");
     }
 
-    if (noPreset) {
-      config = null;
-      rawConfig = null;
-    }
+
     if (config?.state === "review_required") repairCodes.push("agent_config_review_required");
     if (config?.state === "repair_required") repairCodes.push("agent_config_repair_required");
     if (normalizedRequestedMode === "agentic" && !config) repairCodes.push("agent_config_missing");
@@ -1153,16 +1572,20 @@ export class AgentRuntimeDecisionService {
       config?.revision ?? null,
       config?.bindingRevision ?? null,
     ));
+    const readinessDigest = hashAgenticReadinessVectorV1(readinessVector);
     if (normalizedRequestedMode === "agentic" && !readinessVector.ready) repairCodes.push("agentic_readiness_unavailable");
     if (normalizedRequestedMode === "agentic" && readinessVector.killSwitchState === "on") repairCodes.push("agentic_kill_switch");
 
     const uniqueRepairCodes = [...new Set(repairCodes)];
+    // Missing overrides stay inert. A review_required import tombstone, including
+    // a null-mode one, blocks Agentic until it is reviewed.
+    const chatOverrideBlocksAgentic = Boolean(chatOverride && chatOverride.state !== "ready");
     const capabilityReady = missingCapabilities.length === 0
       && sameDomain
       && uniqueRepairCodes.every((code) => !code.startsWith("agentic_") || code === "agentic_response_escape")
       && normalizedRequestedMode === "agentic"
       && config?.state === "ready"
-      && (!chatOverride || chatOverride.state === "ready")
+      && !chatOverrideBlocksAgentic
       && !!config?.agentsEnabled
       && configAllowedModes.includes("agentic")
       && revisions.complete
@@ -1178,13 +1601,33 @@ export class AgentRuntimeDecisionService {
       repairCodes: [...new Set(uniqueRepairCodes)],
     };
     const effectiveMode: AgentRuntimeMode = capabilityReady ? "agentic" : "response";
-    const readinessDigest = hashAgenticReadinessVectorV1(readinessVector);
+    const runtimePolicy = resolveLoomRuntimePolicy({
+      transientSelection,
+      durableChatOverride,
+      presetDefault: config?.runtimePolicy?.defaultMode ?? config?.defaultMode ?? null,
+      presetRevision,
+      presetState: config?.state ?? "repair_required",
+      presetRepairCode: config?.state === "repair_required"
+        ? "loom_policy_invalid"
+        : config?.state === "review_required"
+          ? "loom_policy_repair_required"
+          : null,
+      hostAllowedModes: capabilityReady ? configAllowedModes : ["response"],
+      hostReasonCode: capabilityReady ? null : "loom_policy_unavailable",
+      repairAcknowledgement: initialRuntimePolicy.repairAcknowledgement,
+    });
+    if (runtimePolicy.availability.reasonCode && !uniqueRepairCodes.includes(runtimePolicy.availability.reasonCode)) {
+      uniqueRepairCodes.push(runtimePolicy.availability.reasonCode);
+    }
+    capabilityReadiness.repairCodes = [...new Set([...capabilityReadiness.repairCodes, ...uniqueRepairCodes])];
     const context: InternalResolutionContext = {
       request,
       chat,
       target,
       rootConnection,
       childConnections,
+      councilProfile: connectionsSvc.cloneAndFreeze(councilProfile),
+      councilConnection,
       config,
       preset,
       presetSource,
@@ -1197,13 +1640,17 @@ export class AgentRuntimeDecisionService {
       repairCodes: [...new Set(uniqueRepairCodes)],
       requestedMode: normalizedRequestedMode,
       effectiveMode,
+      runtimePolicy,
     };
     const internal: RuntimeDecisionInternalV1 = {
       binding: buildBinding(userId, context),
       rootConnection,
       childConnections,
+      councilProfile: context.councilProfile,
+      councilConnection: context.councilConnection,
       configSnapshot,
       readinessVector,
+      runtimePolicy: context.runtimePolicy,
       issuedAt: this.now(),
       expiresAt: 0,
     };
@@ -1222,6 +1669,18 @@ export class AgentRuntimeDecisionService {
         context.capabilityReadiness.ready = false;
         context.capabilityReadiness.repairCodes = [...new Set([...context.capabilityReadiness.repairCodes, "decision_capacity_exceeded", "agentic_response_escape"] as AgentRuntimeRepairCode[])];
         context.repairCodes = context.capabilityReadiness.repairCodes.slice();
+        context.runtimePolicy = resolveLoomRuntimePolicy({
+          transientSelection,
+          durableChatOverride,
+          presetDefault: config?.runtimePolicy?.defaultMode ?? config?.defaultMode ?? null,
+          presetRevision: safeRevision(preset?.cache_revision ?? config?.revision),
+          presetState: config?.state ?? "repair_required",
+          presetRepairCode: config?.state === "repair_required" ? "loom_policy_invalid" : null,
+          hostAllowedModes: ["response"],
+          hostReasonCode: "decision_capacity_exceeded",
+          repairAcknowledgement: context.runtimePolicy.repairAcknowledgement,
+        });
+        internal.runtimePolicy = context.runtimePolicy;
       }
     }
 
@@ -1230,6 +1689,7 @@ export class AgentRuntimeDecisionService {
       chatId: chat.id,
       target,
       connection: publicConnection(rootConnection),
+      runtimePolicy: context.runtimePolicy,
       preset: {
         id: preset?.id ?? null,
         label: safeString(preset?.name, null),
@@ -1267,12 +1727,14 @@ export class AgentRuntimeDecisionService {
     const incomingBinding = {
       userId,
       chatId: request.chatId,
+      turnFence: safeRevision(request.transientSelection?.turnFence) ?? safeRevision(request.requestEpoch) ?? DEFAULT_REVISION,
       targetDigest: hashCanonical(normalizedIncoming),
       requestEpoch: safeRevision(request.requestEpoch) ?? DEFAULT_REVISION,
     };
     if (incomingBinding.userId !== stored.decision.binding.userId
       || incomingBinding.chatId !== stored.decision.binding.chatId
       || incomingBinding.targetDigest !== stored.decision.binding.targetDigest
+      || incomingBinding.turnFence !== stored.decision.binding.turnFence
       || incomingBinding.requestEpoch !== stored.decision.binding.requestEpoch
       || hashCanonical(normalizedStored) !== stored.decision.binding.targetDigest) {
       return { accepted: false, code: "decision_refresh_required", decision: null };
@@ -1280,18 +1742,16 @@ export class AgentRuntimeDecisionService {
 
     const expected = stored.decision.binding;
     const storedRoot = stored.decision.rootConnection;
-    // Re-resolve against the admitted logical ID and concrete member. This
-    // validates current endpoint/credential/config/input/readiness revisions
-    // without asking a roulette/router to choose a second candidate.
     const currentRequest: EffectiveRuntimeRequestV1 = {
       ...storedRequest,
       ...request,
       chatId: expected.chatId,
-      target: request.target ?? storedRequest.target,
+      target: storedRequest.target,
       requestEpoch: expected.requestEpoch,
       logicalConnectionId: expected.logicalConnectionId,
       presetId: expected.presetId,
       forcePresetId: expected.presetId !== null,
+      transientSelection: stored.decision.runtimePolicy?.transientSelection ?? storedRequest.transientSelection ?? null,
       mode: "agentic",
     };
     const current = await this.resolve(
@@ -1311,6 +1771,7 @@ export class AgentRuntimeDecisionService {
       || currentBinding.chatId !== expected.chatId
       || currentBinding.targetDigest !== expected.targetDigest
       || currentBinding.requestEpoch !== expected.requestEpoch
+      || currentBinding.turnFence !== expected.turnFence
       || currentBinding.logicalConnectionId !== expected.logicalConnectionId
       || currentBinding.concreteConnectionId !== expected.concreteConnectionId
       || currentBinding.provider !== expected.provider
@@ -1324,6 +1785,7 @@ export class AgentRuntimeDecisionService {
       || currentBinding.bindingRevision !== expected.bindingRevision
       || currentBinding.inputRevisionDigest !== expected.inputRevisionDigest
       || currentBinding.readinessDigest !== expected.readinessDigest
+      || stableStringify(current.internal.runtimePolicy) !== stableStringify(stored.decision.runtimePolicy)
       || !sameFrozenConnection(current.internal.rootConnection, storedRoot)) {
       return { accepted: false, code: "decision_refresh_required", decision: null };
     }
@@ -1342,9 +1804,14 @@ export class AgentRuntimeDecisionService {
     return this.dependencies.getChatAgentModeOverride(userId, chatId);
   }
 
-  setChatAgentModeOverride(userId: string, chatId: string, mode: AgentRuntimeMode | null, expectedRevision?: number): ChatAgentModeWriteResponseV1 {
+  setChatAgentModeOverride(
+    userId: string,
+    chatId: string,
+    mode: AgentRuntimeMode | null,
+    expectedRevision?: number,
+  ): ChatAgentModeWriteResponseV1 & { appliesTo: "next_turn" } {
     if (mode !== null && !isAgentRuntimeMode(mode)) {
-      throw new RuntimeDecisionError("invalid_request", "mode must be 'response', 'agentic', or null", 400);
+      throw new RuntimeDecisionError("invalid_request", "mode must be 'response' or 'agentic'", 400);
     }
     if (expectedRevision === undefined || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
       throw new RuntimeDecisionError("invalid_request", "Chat agent mode expectedRevision is required (use 0 for the first write).", 428);
@@ -1352,7 +1819,12 @@ export class AgentRuntimeDecisionService {
     if (expectedRevision >= Number.MAX_SAFE_INTEGER) {
       throw new RuntimeDecisionError("invalid_request", "Chat agent mode revision is exhausted; refresh and try again.", 409);
     }
-    return this.dependencies.setChatAgentModeOverride(userId, chatId, mode, expectedRevision);
+    const updated = this.dependencies.setChatAgentModeOverride(userId, chatId, mode, expectedRevision);
+    return { ...updated, appliesTo: "next_turn" };
+  }
+
+  resetChatAgentModeOverride(userId: string, chatId: string, expectedRevision: number): ChatAgentModeWriteResponseV1 & { appliesTo: "next_turn" } {
+    return this.setChatAgentModeOverride(userId, chatId, null, expectedRevision);
   }
 
   configureDependencies(overrides: Partial<RuntimeDecisionDependencies>): void {
@@ -1389,6 +1861,28 @@ export async function resolveEffectiveRuntimeWithoutToken(
   request: EffectiveRuntimeRequestV1,
 ): Promise<EffectiveRuntimeDecisionV1> {
   return AGENT_RUNTIME_DECISION_SERVICE.resolve(userId, request, { issueToken: false });
+}
+
+export function resetChatAgentModeOverride(
+  userId: string,
+  chatId: string,
+  expectedRevision: number,
+): ChatAgentModeWriteResponseV1 & { appliesTo: "next_turn" } {
+  return AGENT_RUNTIME_DECISION_SERVICE.resetChatAgentModeOverride(userId, chatId, expectedRevision);
+}
+
+export function acknowledgeRuntimeRepair(
+  userId: string,
+  presetId: string,
+  expectedPresetRevision: RuntimeRevision,
+  reasonCode: string,
+): RuntimeRepairAcknowledgementV1 {
+  return AGENT_RUNTIME_DECISION_SERVICE.acknowledgeRuntimeRepair(
+    userId,
+    presetId,
+    expectedPresetRevision,
+    reasonCode,
+  );
 }
 
 export async function consumeRuntimeDecisionToken(
@@ -1455,6 +1949,21 @@ function parseStrictRevision(value: unknown, path: string, nullable = true): Run
     return value;
   }
   throw new RuntimeDecisionError("invalid_request", `${path} must be a revision`, 400);
+}
+function parseStrictTransientSelection(value: unknown, path: string): LoomRuntimePolicyTransientSelectionV1 | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!isRecord(value)) throw new RuntimeDecisionError("runtime_policy_invalid", `${path} must be an object`, 400, "loom_policy_invalid");
+  assertClosedObject(value, ["mode", "turnFence", "authenticated"], path);
+  const mode = parseStrictString(value.mode, `${path}.mode`, false);
+  if (!isAgentRuntimeMode(mode) || value.authenticated !== true) {
+    throw new RuntimeDecisionError("runtime_policy_invalid", `${path} is invalid`, 400, "loom_policy_invalid");
+  }
+  return {
+    mode,
+    turnFence: parseStrictRevision(value.turnFence, `${path}.turnFence`, false) as RuntimeRevision,
+    authenticated: true,
+  };
 }
 
 function parseStrictSwipe(value: unknown, path: string): number | null {
@@ -1534,9 +2043,9 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
     "chatId", "chat_id", "logicalConnectionId", "connectionId", "connection_id",
     "presetId", "preset_id", "forcePresetId", "force_preset_id", "personaId", "persona_id",
     "targetCharacterId", "target_character_id", "generationType", "generation_type", "target",
-    "mode", "requestEpoch", "request_epoch", "inputRevisions", "input_revision_set",
-    "input_revisions", "readinessVector", "readiness_vector", "messageId", "message_id",
-    "swipeId", "swipe_id",
+    "mode", "transientSelection", "transient_selection", "requestEpoch", "request_epoch",
+    "inputRevisions", "input_revision_set", "input_revisions", "readinessVector", "readiness_vector",
+    "messageId", "message_id", "swipeId", "swipe_id",
   ] as const;
   assertClosedObject(raw, topLevelKeys, "request");
 
@@ -1556,11 +2065,13 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
   const readiness = readAliasedField(raw, ["readinessVector", "readiness_vector"], "readinessVector");
   const message = readAliasedField(raw, ["messageId", "message_id"], "messageId");
   const swipe = readAliasedField(raw, ["swipeId", "swipe_id"], "swipeId");
+  const transient = readAliasedField(raw, ["transientSelection", "transient_selection"], "transientSelection");
 
   const parsedMode = mode.present ? parseStrictString(mode.value, "mode", false) : undefined;
   if (parsedMode !== undefined && !isAgentRuntimeMode(parsedMode)) {
     throw new RuntimeDecisionError("invalid_request", "mode must be 'response' or 'agentic'", 400);
   }
+  const parsedTransientSelection = parseStrictTransientSelection(transient.value, "transientSelection");
   const parsedForcePreset = forcePreset.present
     ? (typeof forcePreset.value === "boolean"
       ? forcePreset.value
@@ -1608,10 +2119,21 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
     generationType: generationType as EffectiveRuntimeRequestV1["generationType"],
     target,
     mode: parsedMode as AgentRuntimeMode | undefined,
+    transientSelection: parsedTransientSelection,
     requestEpoch: requestEpoch.present ? parseStrictRevision(requestEpoch.value, "requestEpoch", false) as RuntimeRevision : undefined,
     inputRevisions: parseStrictPartialInputRevisions(inputRevisions.value, "inputRevisions"),
     readinessVector: parseStrictReadinessVector(readiness.value, "readinessVector"),
   };
+}
+export function normalizeAuthenticatedEffectiveRuntimeRequest(raw: unknown): EffectiveRuntimeRequestV1 {
+  if (isRecord(raw) && (Object.hasOwn(raw, "transientSelection") || Object.hasOwn(raw, "transient_selection"))) {
+    throw new RuntimeDecisionError(
+      "invalid_request",
+      "transientSelection is authenticated by the generation request and cannot be supplied directly.",
+      400,
+    );
+  }
+  return normalizeEffectiveRuntimeRequest(raw);
 }
 
 export { publicConnection as toPublicConnectionProjection };

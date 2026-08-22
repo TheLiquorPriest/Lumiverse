@@ -12,6 +12,7 @@ import {
   isUserDataJobCancellable,
   normalizeUserDataApiFailure,
   normalizeUserDataProgress,
+  ARCHIVE_SCHEMA_VERSION,
   USER_DATA_LIMITS,
   type UserDataJob,
   type UserDataJobStatus,
@@ -279,6 +280,7 @@ export default function DataPortability() {
       <section className={styles.section}>
         <h3 className={styles.title}>{t('dataPortability.exportTitle')}</h3>
         <p className={styles.description}>{t('dataPortability.exportDesc')}</p>
+        <p className={styles.schemaVersion}>{t('dataPortability.exportSchemaVersion', { version: ARCHIVE_SCHEMA_VERSION })}</p>
         <label className={styles.checkboxRow}>
           <input type="checkbox" checked={includeVectors} onChange={(event) => setIncludeVectors(event.target.checked)} disabled={exporting} />
           <span>{t('dataPortability.includeVectors')}</span>

@@ -7,12 +7,22 @@ import { runMigrations } from "../db/migrate";
 import { registerProvider, getProvider } from "../llm/registry";
 import type { LlmProvider } from "../llm/provider";
 import type { GenerationRequest, GenerationResponse, StreamChunk } from "../llm/types";
-import { createDisabledAgentConfigV2 } from "../types/agents";
+import { createDisabledAgentConfigV2, type AgentCustomPhaseV1 } from "../types/agents";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
 import { AgentRuntimeOwner } from "./agent-runtime.service";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
-import { createAgenticChildFrame, createAgenticRootFrame } from "./agentic-work-phase.service";
+import { createAgenticChildFrame, createAgenticRootFrame, executeBoundedAgenticChildFrame } from "./agentic-work-phase.service";
+import { compileAgentRuntimePhases } from "./agentic-phase-runtime.service";
+import { createAgentCognitionRuntime } from "./agent-cognition-runtime.service";
+import { evaluateCognitionPredicate } from "./agent-cognition.service";
 import { setAgenticRuntimeReadiness, startAgentRuntimeEpoch, calculateFinalRenderReservationEnvelopeV1, reserveFinalRender, TurnExecutionError } from "./turn-execution.service";
+import {
+  attachContextPack,
+  createContextPack,
+  deleteContextPack,
+  deleteContextPackAttachment,
+} from "./agent-context-packs.service";
+import { getAgentRuntimeSharedDraft } from "./agent-config-portability.service";
 import {
   AGENT_RUNTIME_DECISION_SERVICE,
   resolveEffectiveRuntime,
@@ -24,6 +34,7 @@ import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { waitForAgenticGeneration } from "./agentic-generation.service";
 import { startGeneration } from "./generate.service";
+import * as breakdownSvc from "./breakdown.service";
 
 import {
   __testing,
@@ -60,6 +71,31 @@ function markAgenticRuntimeReady(): void {
   });
 }
 let scriptedWorkRound = 0;
+let scriptedTwoPhase = false;
+let scriptedTwoPhaseTurnId = "";
+let scriptedTwoPhaseMutationIssued = false;
+const scriptedTwoPhaseSnapshots: Array<{
+  readonly state: string;
+  readonly revision: number;
+  readonly taskCount: number;
+  readonly taskState: string;
+  readonly frozenAt: number | null;
+}> = [];
+let scriptedBlockedTerminal = false;
+let scriptedBlockedTerminalTurnId = "";
+let scriptedBlockedTerminalTaskCreated = false;
+let scriptedBlockedTerminalDelegateIssued = false;
+let scriptedBlockedTerminalChildSubmitted = false;
+let scriptedBlockedTerminalAttempted = false;
+let scriptedBlockedTerminalAcceptanceIssued = false;
+let scriptedBlockedTerminalRetryCanAccept = false;
+const scriptedBlockedTerminalSnapshots: Array<{
+  readonly workspaceState: string;
+  readonly workspaceRevision: number;
+  readonly frozenAt: number | null;
+  readonly taskState: string;
+  readonly submissionState: string;
+}> = [];
 /** Records every provider request so the test can prove the real input arrived. */
 const providerRequests: GenerationRequest[] = [];
 
@@ -91,6 +127,205 @@ class ScriptedProvider implements LlmProvider {
     if (request.toolMode === "ordinary") {
       const rootHasCompleteTurn = request.tools?.some((tool) => tool.name === "complete_turn") === true;
       const rootCanDelegate = request.tools?.some((tool) => tool.name === "agent_delegate") === true;
+      if (scriptedBlockedTerminal) {
+        const rootCanWrite = request.tools?.some((tool) => tool.name === "workspace_create_task") === true;
+        if (!rootHasCompleteTurn) {
+          const childCanSubmit = request.tools?.some((tool) => tool.name === "workspace_submit_child_result") === true;
+          if (childCanSubmit && !scriptedBlockedTerminalChildSubmitted) {
+            scriptedBlockedTerminalChildSubmitted = true;
+            yield {
+              token: "",
+              tool_calls: [{
+                name: "workspace_submit_child_result",
+                args: {
+                  summary: "Required task result is ready for owner acceptance.",
+                },
+                call_id: "blocked-terminal-child-submit",
+              }],
+              finish_reason: "tool_calls",
+            };
+            return;
+          }
+          yield { token: "blocked-terminal child result" };
+          yield { token: "", finish_reason: "stop" };
+          return;
+        }
+        if (!rootCanWrite || !rootCanDelegate) {
+          yield {
+            token: "",
+            tool_calls: [{
+              name: "complete_turn",
+              args: { summary: "phase one complete", unresolvedIds: [] },
+              call_id: "blocked-terminal-phase-one-complete",
+            }],
+            finish_reason: "tool_calls",
+          };
+          return;
+        }
+        if (!scriptedBlockedTerminalTaskCreated) {
+          scriptedBlockedTerminalTaskCreated = true;
+          yield {
+            token: "",
+            tool_calls: [{
+              name: "workspace_create_task",
+              args: {
+                taskId: "blocked-terminal-task",
+                title: "Blocked-terminal submission",
+                objective: "Keep terminal completion blocked until the pending submission is accepted.",
+                required: false,
+                dependencyIds: [],
+              },
+              call_id: "blocked-terminal-create-task",
+            }],
+            finish_reason: "tool_calls",
+          };
+          return;
+        }
+        if (!scriptedBlockedTerminalDelegateIssued) {
+          scriptedBlockedTerminalDelegateIssued = true;
+          yield {
+            token: "",
+            tool_calls: [{
+              name: "agent_delegate",
+              args: {
+                profile_id: "delegate",
+                task_id: "blocked-terminal-task",
+                task: "Submit the required blocked-terminal task result.",
+                tool_ids: ["chat_search_history"],
+              },
+              call_id: "blocked-terminal-delegate",
+            }],
+            finish_reason: "tool_calls",
+          };
+          return;
+        }
+        if (!scriptedBlockedTerminalAttempted) {
+          const workspaceRow = getDb().query(
+            "SELECT state, revision, frozen_at FROM agent_turn_workspaces WHERE workspace_id = ? AND turn_id = ?",
+          ).get(`workspace:${scriptedBlockedTerminalTurnId}`, scriptedBlockedTerminalTurnId) as {
+            state: string;
+            revision: number;
+            frozen_at: number | null;
+          } | null;
+          const taskRow = getDb().query(
+            "SELECT state FROM agent_workspace_tasks WHERE workspace_id = ? AND turn_id = ? AND task_id = ?",
+          ).get(`workspace:${scriptedBlockedTerminalTurnId}`, scriptedBlockedTerminalTurnId, "blocked-terminal-task") as { state: string } | null;
+          const submissionRow = getDb().query(
+            "SELECT state FROM agent_workspace_submissions WHERE workspace_id = ? AND turn_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT 1",
+          ).get(`workspace:${scriptedBlockedTerminalTurnId}`, scriptedBlockedTerminalTurnId, "blocked-terminal-task") as { state: string } | null;
+          scriptedBlockedTerminalSnapshots.push({
+            workspaceState: workspaceRow?.state ?? "missing",
+            workspaceRevision: workspaceRow?.revision ?? -1,
+            frozenAt: workspaceRow?.frozen_at ?? null,
+            taskState: taskRow?.state ?? "missing",
+            submissionState: submissionRow?.state ?? "missing",
+          });
+          scriptedBlockedTerminalAttempted = true;
+          yield {
+            token: "",
+            tool_calls: [{
+              name: "complete_turn",
+              args: { summary: "terminal completion before submission acceptance", unresolvedIds: [] },
+              call_id: "blocked-terminal-first-complete",
+            }],
+            finish_reason: "tool_calls",
+          };
+          return;
+        }
+        if (!scriptedBlockedTerminalAcceptanceIssued) {
+          scriptedBlockedTerminalRetryCanAccept = request.tools?.some((tool) => tool.name === "workspace_accept_submission") === true;
+          const submission = getDb().query(
+            "SELECT submission_id FROM agent_workspace_submissions WHERE workspace_id = ? AND turn_id = ? AND task_id = ? AND state = 'submitted' ORDER BY created_at DESC LIMIT 1",
+          ).get(`workspace:${scriptedBlockedTerminalTurnId}`, scriptedBlockedTerminalTurnId, "blocked-terminal-task") as { submission_id: string } | null;
+          if (submission) {
+            scriptedBlockedTerminalAcceptanceIssued = true;
+            yield {
+              token: "",
+              tool_calls: [{
+                name: "workspace_accept_submission",
+                args: { submissionId: submission.submission_id, taskId: "blocked-terminal-task" },
+                call_id: "blocked-terminal-accept-submission",
+              }],
+              finish_reason: "tool_calls",
+            };
+            return;
+          }
+        }
+        yield {
+          token: "",
+          tool_calls: [{
+            name: "complete_turn",
+            args: { summary: "terminal completion after submission acceptance", unresolvedIds: [] },
+            call_id: "blocked-terminal-final-complete",
+          }],
+          finish_reason: "tool_calls",
+        };
+        return;
+      }
+      if (scriptedTwoPhase) {
+        const phaseTwoCanWrite = request.tools?.some((tool) => tool.name === "workspace_create_task") === true;
+        if (!phaseTwoCanWrite) {
+          yield {
+            token: "",
+            tool_calls: [{
+              name: "complete_turn",
+              args: { summary: "phase one complete", unresolvedIds: [] },
+              call_id: "phase-one-complete",
+            }],
+            finish_reason: "tool_calls",
+          };
+          return;
+        }
+        if (!scriptedTwoPhaseMutationIssued) {
+          scriptedTwoPhaseMutationIssued = true;
+          yield {
+            token: "",
+            tool_calls: [{
+              name: "workspace_create_task",
+              args: {
+                taskId: "phase-two-task",
+                title: "Phase two workspace mutation",
+                objective: "Persist the phase-two task before final completion.",
+                required: false,
+                dependencyIds: [],
+              },
+              call_id: "phase-two-create-task",
+            }],
+            finish_reason: "tool_calls",
+          };
+          return;
+        }
+        if (scriptedTwoPhaseSnapshots.length === 0) {
+          const workspaceRow = getDb().query(
+            "SELECT state, revision, task_count, frozen_at FROM agent_turn_workspaces WHERE workspace_id = ? AND turn_id = ?",
+          ).get(`workspace:${scriptedTwoPhaseTurnId}`, scriptedTwoPhaseTurnId) as {
+            state: string;
+            revision: number;
+            task_count: number;
+            frozen_at: number | null;
+          } | null;
+          const taskRow = getDb().query(
+            "SELECT state FROM agent_workspace_tasks WHERE workspace_id = ? AND turn_id = ? AND task_id = ?",
+          ).get(`workspace:${scriptedTwoPhaseTurnId}`, scriptedTwoPhaseTurnId, "phase-two-task") as { state: string } | null;
+          scriptedTwoPhaseSnapshots.push({
+            state: workspaceRow?.state ?? "missing",
+            revision: workspaceRow?.revision ?? -1,
+            taskCount: workspaceRow?.task_count ?? -1,
+            taskState: taskRow?.state ?? "missing",
+            frozenAt: workspaceRow?.frozen_at ?? null,
+          });
+        }
+        yield {
+          token: "",
+          tool_calls: [{
+            name: "complete_turn",
+            args: { summary: "phase two complete", unresolvedIds: [] },
+            call_id: "phase-two-complete",
+          }],
+          finish_reason: "tool_calls",
+        };
+        return;
+      }
       if (scriptedDelegate && rootCanDelegate) {
         if (!scriptedTaskCreated) {
           scriptedTaskCreated = true;
@@ -114,7 +349,7 @@ class ScriptedProvider implements LlmProvider {
         }
         if (scriptedAcceptSubmission && delegateIssued && rootHasCompleteTurn && !scriptedAcceptanceIssued) {
           const submission = getDb().query(
-            "SELECT submission_id, task_id FROM agent_workspace_submissions WHERE user_id = ? AND state = 'proposed' ORDER BY created_at DESC LIMIT 1",
+            "SELECT submission_id, task_id FROM agent_workspace_submissions WHERE user_id = ? AND state = 'submitted' ORDER BY created_at DESC LIMIT 1",
           ).get(USER_ID) as { submission_id: string; task_id: string } | null;
           if (submission) {
             scriptedAcceptanceIssued = true;
@@ -158,10 +393,7 @@ class ScriptedProvider implements LlmProvider {
             tool_calls: [{
               name: "workspace_submit_child_result",
               args: {
-                taskId: "task-delegate",
                 summary: "delegated result",
-                resultDigest: "d".repeat(64),
-                byteCount: 16,
               },
               call_id: "child-submit-1",
             }],
@@ -294,6 +526,26 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     installAgenticGenerationCoordinator();
     expect(true).toBe(true);
+  });
+  test("accepts an exact shared context candidate with frozen owner ACL authority", () => {
+    expect(__testing.contextPackReadiness({
+      schema: "present",
+      candidates: [{
+        ownerId: "shared-pack-owner",
+        revisionId: "shared-pack@1",
+        digest: "a".repeat(64),
+        aclRevision: 7,
+      }],
+    })).toEqual({ ready: true, reason: null });
+    expect(__testing.contextPackReadiness({
+      schema: "present",
+      candidates: [{
+        ownerId: "",
+        revisionId: "shared-pack@1",
+        digest: "a".repeat(64),
+        aclRevision: 7,
+      }],
+    })).toEqual({ ready: false, reason: "cognition_authorization_stale" });
   });
   test("authenticates the root caller before assigning child tasks", async () => {
     markAgenticRuntimeReady();
@@ -1050,6 +1302,16 @@ describe("production agentic coordinator installation", () => {
       character_id: "character-coordinator",
       usage: { promptTokens: 17, completionTokens: 3, totalTokens: 20 },
     });
+    const breakdown = breakdownSvc.getBreakdown(USER_ID, messageId);
+    expect(breakdown).toMatchObject({
+      assemblySurface: "WORK",
+      model: "scripted-model",
+      provider: "scripted-coordinator",
+      usage: { prompt_tokens: 17, completion_tokens: 3, total_tokens: 20 },
+      tokenizer_name: null,
+    });
+    expect(breakdown?.messages).toEqual(finalizationMessages);
+    expect(breakdown?.entries).toHaveLength(finalizationMessages.length);
     const projection = db.query(
       "SELECT status, snapshot_json, terminal_handoff_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
     ).get(USER_ID, started.generationId) as { status: string; snapshot_json: string; terminal_handoff_json: string | null } | null;
@@ -1062,6 +1324,11 @@ describe("production agentic coordinator installation", () => {
       childInvocations: 0,
     });
     expect(JSON.parse(projection?.terminal_handoff_json ?? "{}").messageId).toBe(messageId);
+    const inspection = db.query(
+      "SELECT reason, terminal_receipt_json FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).get(USER_ID, started.generationId) as { reason: string; terminal_receipt_json: string | null } | null;
+    expect(inspection?.reason).toBe("none");
+    expect(JSON.parse(inspection?.terminal_receipt_json ?? "{}").messageId).toBe(messageId);
 
     let responseGenerationId = "";
     let responseRequestActive = true;
@@ -1110,6 +1377,357 @@ describe("production agentic coordinator installation", () => {
       unsubscribeResponse();
     }
   });
+  test("WORK provider delivery uses resolved direct policy and omits false or unavailable entries", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    await probeIsolateBackendsAtStartup();
+    startAgentRuntimeEpoch();
+    installAgenticGenerationCoordinator();
+    scriptedWorkRound = 0;
+    providerRequests.length = 0;
+
+    const db = getDb();
+    const originalPreset = db.query(
+      "SELECT prompt_order, cache_revision FROM presets WHERE id = ? AND user_id = ?",
+    ).get(AGENTIC_PRESET_ID, USER_ID) as { prompt_order: string; cache_revision: number };
+    const originalConfig = db.query(
+      "SELECT config_json, context_policy_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, AGENTIC_PRESET_ID) as { config_json: string; context_policy_json: string };
+    const availableContextText = "Available Loom context from the authenticated pack.";
+    const availableContext = createContextPack(USER_ID, {
+      name: "Available Loom Context",
+      content: [{
+        id: "loom-record",
+        title: "Authenticated context",
+        body: availableContextText,
+        tags: [],
+      }],
+    });
+    const availableAttachment = attachContextPack(USER_ID, availableContext.pack.id, {
+      scope: "preset",
+      targetId: AGENTIC_PRESET_ID,
+      revision: availableContext.revision.revision,
+      position: 0,
+      required: false,
+    });
+    if (!availableAttachment) throw new Error("available Loom context attachment was not created");
+    const presetRevision = 73;
+    const rawPolicyText = "Effective policy for {{char}}.";
+    const resolvedPolicyText = "Effective policy for Coordinator Character.";
+    const source = {
+      kind: "loom_block" as const,
+      blockId: "macro-policy",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 0,
+    };
+    const conditionSentinel = "CONDITION_FALSE_MUST_NOT_REACH_PROVIDER";
+    const conditionSource = {
+      kind: "loom_block" as const,
+      blockId: "condition-policy",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 1,
+    };
+    const onDemandSentinel = "UNAVAILABLE_ON_DEMAND_SOURCE_MUST_NOT_REACH_PROVIDER";
+    const onDemandSource = {
+      kind: "loom_block" as const,
+      blockId: "on-demand-policy",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 2,
+    };
+    const rawRenderPolicyText = "Render policy for {{char}}.";
+    const resolvedRenderPolicyText = "Render policy for Coordinator Character.";
+    const renderSource = {
+      kind: "loom_block" as const,
+      blockId: "render-macro-policy",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 3,
+    };
+    const renderConditionSentinel = "RENDER_CONDITION_FALSE_MUST_NOT_REACH_PROVIDER";
+    const renderConditionSource = {
+      kind: "loom_block" as const,
+      blockId: "render-condition-policy",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 4,
+    };
+    const renderOnDemandSentinel = "RENDER_UNAVAILABLE_ON_DEMAND_MUST_NOT_REACH_PROVIDER";
+    const renderOnDemandSource = {
+      kind: "loom_block" as const,
+      blockId: "render-on-demand-policy",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 5,
+    };
+    const runtimePolicy = {
+      version: 1,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: "agentic",
+      loomPolicy: {
+        version: 1,
+        workPolicy: [{
+          version: 1,
+          id: "macro-policy-entry",
+          source,
+          destination: "root_work",
+          checkpoint: "WORK",
+          required: true,
+          visibility: "work_only",
+          delivery: { delivery: "direct" },
+        }, {
+          version: 1,
+          id: "condition-policy-entry",
+          source: conditionSource,
+          destination: "root_work",
+          checkpoint: "WORK",
+          required: false,
+          visibility: "work_only",
+          delivery: {
+            delivery: "condition_gated",
+            condition: {
+              kind: "preset_variable",
+              name: "gate",
+              operator: "equals",
+              value: "open",
+            },
+          },
+        }, {
+          version: 1,
+          id: "on-demand-policy-entry",
+          source: onDemandSource,
+          destination: "root_work",
+          checkpoint: "WORK",
+          required: true,
+          visibility: "work_only",
+          delivery: {
+            delivery: "on_demand",
+            request: {
+              contextPackId: availableContext.pack.id,
+              revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
+              digest: availableContext.revision.contentDigest,
+            },
+          },
+        }],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [{
+          version: 1,
+          id: "render-macro-policy-entry",
+          source: renderSource,
+          destination: "render",
+          checkpoint: "RENDER",
+          required: true,
+          visibility: "work_only",
+          delivery: { delivery: "direct" },
+        }, {
+          version: 1,
+          id: "render-condition-policy-entry",
+          source: renderConditionSource,
+          destination: "render",
+          checkpoint: "RENDER",
+          required: false,
+          visibility: "work_only",
+          delivery: {
+            delivery: "condition_gated",
+            condition: {
+              kind: "preset_variable",
+              name: "gate",
+              operator: "equals",
+              value: "open",
+            },
+          },
+        }, {
+          version: 1,
+          id: "render-on-demand-policy-entry",
+          source: renderOnDemandSource,
+          destination: "render",
+          checkpoint: "RENDER",
+          required: false,
+          visibility: "work_only",
+          delivery: {
+            delivery: "on_demand",
+            request: {
+              contextPackId: "unavailable-render-pack",
+              revisionId: "unavailable-render-pack@1",
+              digest: "e".repeat(64),
+            },
+          },
+        }],
+      },
+      phases: [],
+    };
+    const deps = __testing.buildDependencies();
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+      parameters: { max_tokens: 1024 },
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const executionId = `exec-loom-macro-${Date.now()}`;
+    try {
+      db.query(
+        "UPDATE presets SET prompt_order = ?, cache_revision = ? WHERE id = ? AND user_id = ?",
+      ).run(JSON.stringify([{
+        id: source.blockId,
+        name: "Macro policy",
+        content: rawPolicyText,
+        role: "system",
+        enabled: true,
+        position: "pre_history",
+        revision: source.blockRevision,
+      }, {
+        id: conditionSource.blockId,
+        name: "False condition policy",
+        content: conditionSentinel,
+        role: "system",
+        enabled: true,
+        position: "pre_history",
+        revision: conditionSource.blockRevision,
+      }, {
+        id: onDemandSource.blockId,
+        name: "Unavailable on-demand policy",
+        content: onDemandSentinel,
+        role: "system",
+        enabled: true,
+        position: "pre_history",
+        revision: onDemandSource.blockRevision,
+      }, {
+        id: renderSource.blockId,
+        name: "Render macro policy",
+        content: rawRenderPolicyText,
+        role: "system",
+        enabled: true,
+        position: "pre_history",
+        revision: renderSource.blockRevision,
+      }, {
+        id: renderConditionSource.blockId,
+        name: "Render false condition policy",
+        content: renderConditionSentinel,
+        role: "system",
+        enabled: true,
+        position: "pre_history",
+        revision: renderConditionSource.blockRevision,
+      }, {
+        id: renderOnDemandSource.blockId,
+        name: "Render on-demand policy",
+        content: renderOnDemandSentinel,
+        role: "system",
+        enabled: true,
+        position: "pre_history",
+        revision: renderOnDemandSource.blockRevision,
+      }]), presetRevision, AGENTIC_PRESET_ID, USER_ID);
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ?, context_policy_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({
+        config: { runtimePolicy },
+        contextPackSelections: [{
+          packId: availableContext.pack.id,
+          revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
+          revision: availableContext.revision.revision,
+          digest: availableContext.revision.contentDigest,
+          label: "Available Loom Context",
+        }],
+      }), JSON.stringify({
+        packIds: [availableContext.pack.id],
+        ruleIds: [],
+      }), USER_ID, AGENTIC_PRESET_ID);
+      expect(getAgentRuntimeSharedDraft(USER_ID, AGENTIC_PRESET_ID)).toMatchObject({
+        config: {
+          contextPolicy: { packIds: [availableContext.pack.id], ruleIds: [] },
+        },
+        contextPackSelections: [{
+          packId: availableContext.pack.id,
+          revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
+          revision: availableContext.revision.revision,
+          digest: availableContext.revision.contentDigest,
+        }],
+      });
+
+      const decision = await deps.resolveRuntime!(input, target, signal);
+      const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, executionId);
+      const plan = await deps.compileAssemblyPlan!(snapshot, input, decision, signal, executionId);
+      const contextRuntime = await deps.createContextRuntime!(snapshot, input, decision, signal, executionId);
+      expect(snapshot.blocks.find((block) => block.id === source.blockId)?.content).toBe(rawPolicyText);
+      expect(plan.loomBlocks.find((block) => block.source.blockId === source.blockId)?.content).toBe(resolvedPolicyText);
+      expect(snapshot.contextPackSnapshot.candidates).toContainEqual(expect.objectContaining({
+        packId: availableContext.pack.id,
+        revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
+        digest: availableContext.revision.contentDigest,
+        source: "preset",
+      }));
+
+      const execution = await deps.createExecution!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal,
+      });
+      try {
+        const work = await deps.runWork!({
+          execution,
+          input,
+          decision,
+          snapshot,
+          plan,
+          signal,
+          contextRuntime,
+        });
+        expect(work).toMatchObject({ status: "completed" });
+        const ordinaryRequests = providerRequests.filter((request) => request.toolMode === "ordinary");
+        const ordinaryPayload = JSON.stringify(ordinaryRequests);
+        expect(ordinaryPayload).toContain(resolvedPolicyText);
+        expect(ordinaryPayload).not.toContain(rawPolicyText);
+        expect(ordinaryPayload).not.toContain(conditionSentinel);
+        expect(ordinaryPayload).not.toContain(onDemandSentinel);
+        for (const request of ordinaryRequests) {
+          expect(JSON.stringify(request.messages).split(availableContextText)).toHaveLength(2);
+        }
+        const render = await deps.render!({
+          execution,
+          input,
+          decision,
+          snapshot,
+          plan,
+          work,
+          signal,
+        });
+        expect(render).toMatchObject({ content: "scripted render" });
+        const finalizationRequests = providerRequests.filter((request) => request.toolMode === "finalization");
+        const finalizationPayload = JSON.stringify(finalizationRequests);
+        expect(finalizationPayload).toContain(resolvedRenderPolicyText);
+        expect(finalizationPayload).not.toContain(rawRenderPolicyText);
+        expect(finalizationPayload).not.toContain(renderConditionSentinel);
+        expect(finalizationPayload).not.toContain(renderOnDemandSentinel);
+        expect(finalizationRequests).toHaveLength(1);
+        expect(JSON.stringify(finalizationRequests[0]?.messages).split(availableContextText)).toHaveLength(2);
+      } finally {
+        deps.cleanup!({ execution } as never);
+      }
+    } finally {
+      db.query(
+        "UPDATE presets SET prompt_order = ?, cache_revision = ? WHERE id = ? AND user_id = ?",
+      ).run(originalPreset.prompt_order, originalPreset.cache_revision, AGENTIC_PRESET_ID, USER_ID);
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ?, context_policy_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(originalConfig.config_json, originalConfig.context_policy_json, USER_ID, AGENTIC_PRESET_ID);
+      deleteContextPackAttachment(USER_ID, "preset", availableAttachment.attachmentId);
+      deleteContextPack(USER_ID, availableContext.pack.id, availableContext.revision.revision);
+      scriptedWorkRound = 0;
+      providerRequests.length = 0;
+    }
+  });
+
   test("WORK and RENDER send authored preset max_tokens and fall back to 4096", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
@@ -1288,6 +1906,164 @@ describe("production agentic coordinator installation", () => {
       scriptedDelegateProfileId = "delegate";
     }
   });
+  test("keeps the real workspace writable through an intermediate phase completion", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    await probeIsolateBackendsAtStartup();
+    startAgentRuntimeEpoch();
+    installAgenticGenerationCoordinator();
+    scriptedTwoPhase = true;
+    scriptedTwoPhaseTurnId = "";
+    scriptedTwoPhaseMutationIssued = false;
+    scriptedTwoPhaseSnapshots.length = 0;
+    providerRequests.length = 0;
+
+    const phaseDefinitions: AgentCustomPhaseV1[] = [
+      {
+        version: 1,
+        id: "two_phase_first",
+        label: "Two-phase first",
+        instructionRefs: [],
+        required: true,
+        enter: { kind: "phase", value: "WORK" },
+        exit: { kind: "phase", value: "COMPLETE" },
+        capabilityRequests: [],
+        repeatLimit: 0,
+        nextPhaseIds: ["two_phase_second"],
+      },
+      {
+        version: 1,
+        id: "two_phase_second",
+        label: "Two-phase second",
+        instructionRefs: [],
+        required: true,
+        enter: { kind: "phase", value: "WORK" },
+        exit: { kind: "phase", value: "COMPLETE" },
+        capabilityRequests: ["workspace_write"],
+        repeatLimit: 0,
+        nextPhaseIds: [],
+      },
+    ];
+    const authoredPhasePlan = compileAgentRuntimePhases(phaseDefinitions);
+    expect(authoredPhasePlan.status).toBe("ready");
+    const db = getDb();
+    const originalConfig = db.query(
+      "SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, AGENTIC_PRESET_ID) as { config_json: string };
+    const runtimePolicy = {
+      version: 1,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: "agentic",
+      loomPolicy: null,
+      phases: phaseDefinitions,
+    };
+
+    const deps = __testing.buildDependencies();
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+      parameters: { max_tokens: 1024 },
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const executionId = `exec-two-phase-${Date.now()}`;
+    try {
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({ config: { runtimePolicy } }), USER_ID, AGENTIC_PRESET_ID);
+      const decision = await deps.resolveRuntime!(input, target, signal);
+      const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, executionId);
+      const plan = await deps.compileAssemblyPlan!(snapshot, input, decision, signal, executionId);
+      const execution = await deps.createExecution!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal,
+      });
+      scriptedTwoPhaseTurnId = execution.id;
+      try {
+        const work = await deps.runWork!({
+          execution,
+          input,
+          decision,
+          snapshot,
+          plan,
+          signal,
+        });
+        expect(work).toMatchObject({ status: "completed" });
+        expect(scriptedTwoPhaseSnapshots).toEqual([{
+          state: "active",
+          revision: 1,
+          taskCount: 1,
+          taskState: "active",
+          frozenAt: null,
+        }]);
+
+        const workspace = db.query(
+          "SELECT state, revision, frozen_at, task_count FROM agent_turn_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id = ? AND turn_id = ?",
+        ).get(`workspace:${execution.id}`, USER_ID, AGENTIC_CHAT_ID, execution.id) as {
+          state: string;
+          revision: number;
+          frozen_at: number | null;
+          task_count: number;
+        } | null;
+        expect(workspace?.state).toBe("frozen");
+        expect(workspace?.frozen_at).not.toBeNull();
+        expect(workspace?.revision).toBeGreaterThan(scriptedTwoPhaseSnapshots[0]?.revision ?? 0);
+        expect(workspace?.task_count).toBe(1);
+
+        const task = db.query(
+          "SELECT task_id, state, workspace_id, turn_id FROM agent_workspace_tasks WHERE workspace_id = ? AND turn_id = ? AND task_id = ?",
+        ).get(`workspace:${execution.id}`, execution.id, "phase-two-task") as {
+          task_id: string;
+          state: string;
+          workspace_id: string;
+          turn_id: string;
+        } | null;
+        expect(task).toEqual({
+          task_id: "phase-two-task",
+          state: "active",
+          workspace_id: `workspace:${execution.id}`,
+          turn_id: execution.id,
+        });
+
+        const session = db.query(
+          "SELECT turn_session_id, execution_id, attempt_id FROM persistent_workspace_turn_sessions WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND execution_id = ?",
+        ).get(USER_ID, AGENTIC_CHAT_ID, execution.id, execution.id) as {
+          turn_session_id: string;
+          execution_id: string;
+          attempt_id: string;
+        } | null;
+        expect(session).toEqual({
+          turn_session_id: execution.id,
+          execution_id: execution.id,
+          attempt_id: execution.id,
+        });
+
+        const completionObservations = (work.observations ?? []).filter((observation) => observation.toolName === "complete_turn");
+        expect(completionObservations).toHaveLength(2);
+        expect(completionObservations.every((observation) => observation.status === "accepted")).toBe(true);
+      } finally {
+        deps.cleanup!({ execution } as never);
+      }
+    } finally {
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(originalConfig.config_json, USER_ID, AGENTIC_PRESET_ID);
+      scriptedTwoPhase = false;
+      scriptedTwoPhaseTurnId = "";
+      scriptedTwoPhaseMutationIssued = false;
+      scriptedTwoPhaseSnapshots.length = 0;
+      providerRequests.length = 0;
+    }
+  });
 
   test("GENERATION_ENDED for completed COMMITTED omits error and still sends failure diagnostics", async () => {
     const deps = __testing.buildDependencies();
@@ -1315,6 +2091,18 @@ describe("production agentic coordinator installation", () => {
     expect(completedPayload).not.toHaveProperty("errorCode");
     expect(completedPayload.phase).toBe("COMMITTED");
     expect(completedPayload.status).toBe("COMMITTED");
+    const completedInspection = getDb().query(
+      "SELECT outcome, reason, terminal FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).get(USER_ID, "exec-committed-success") as {
+      outcome: string | null;
+      reason: string;
+      terminal: number;
+    } | null;
+    expect(completedInspection).toEqual({
+      outcome: "completed",
+      reason: "none",
+      terminal: 1,
+    });
 
     const failed = waitForEnded("exec-committed-failed");
     deps.publishTerminal!({
@@ -1331,6 +2119,125 @@ describe("production agentic coordinator installation", () => {
     expect(failedPayload.errorCode).toBe("provider_request_error");
     expect(failedPayload.error).toBe("WORK: provider_request_error: upstream refused");
     expect(failedPayload.phase).toBe("WORK");
+  });
+
+  test("admission returns the exact retry attempt lineage", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    installAgenticGenerationCoordinator();
+    const deps = __testing.buildDependencies();
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!({
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal",
+    }, target, signal);
+    const attemptLineage = {
+      version: 1 as const,
+      attemptId: "attempt-admission-exact",
+      previousAttemptId: "attempt-admission-parent",
+      target: {
+        chatId: AGENTIC_CHAT_ID,
+        generationType: "normal" as const,
+        messageId: null,
+        swipeId: null,
+      },
+      createdAt: 123456,
+    };
+    const executionId = "exec-attempt-lineage-exact";
+    const execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      attemptLineage,
+      signal,
+    });
+    try {
+      const session = getDb().query(
+        `SELECT attempt_id
+           FROM persistent_workspace_turn_sessions
+          WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND execution_id = ?`,
+      ).get(USER_ID, AGENTIC_CHAT_ID, executionId, executionId) as { attempt_id: string } | null;
+      expect(session).toEqual({ attempt_id: executionId });
+      expect(session?.attempt_id).not.toBe(attemptLineage.attemptId);
+      const canonicalAttempt = getDb().query(
+        `SELECT attempt_id
+           FROM agent_run_attempts
+          WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND attempt_id = ?`,
+      ).get(USER_ID, AGENTIC_CHAT_ID, executionId, executionId) as { attempt_id: string } | null;
+      expect(canonicalAttempt).toEqual({ attempt_id: executionId });
+      expect((execution as typeof execution & { readonly attemptLineage?: unknown }).attemptLineage).toBe(attemptLineage);
+    } finally {
+      deps.cleanup?.({ execution } as never);
+    }
+  });
+
+  test("retry admission preserves the exact admitted regenerate swipe", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    installAgenticGenerationCoordinator();
+    const now = Date.now();
+    const messageId = "message-retry-admitted-swipe";
+    getDb().query("INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, send_date, swipe_id, swipes, swipe_dates, extra, created_at, generation_revision) VALUES (?, ?, 0, 0, ?, ?, ?, 0, ?, ?, '{}', ?, ?)").run(
+      messageId,
+      AGENTIC_CHAT_ID,
+      "Coordinator",
+      "retry target",
+      now,
+      JSON.stringify(["first", "admitted"]),
+      JSON.stringify([now, now]),
+      now,
+      ADMITTED_TARGET_REVISION,
+    );
+    const deps = __testing.buildDependencies();
+    const target = {
+      generationType: "regenerate" as const,
+      messageId,
+      swipeId: 1,
+      revision: ADMITTED_TARGET_REVISION,
+    };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!({
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "regenerate",
+      messageId,
+      swipeId: 1,
+    }, target, signal);
+    const executionId = "exec-retry-admitted-swipe";
+    const execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      attemptLineage: {
+        version: 1,
+        attemptId: "attempt-retry-admitted-swipe",
+        previousAttemptId: "attempt-retry-parent",
+        target: {
+          chatId: AGENTIC_CHAT_ID,
+          generationType: "regenerate",
+          messageId,
+          swipeId: 1,
+        },
+        createdAt: 123457,
+      },
+      signal,
+    });
+    try {
+      expect(getPoolEntry(executionId)?.targetSwipeId).toBe(1);
+      expect((getDb().query("SELECT target_swipe_id FROM agent_turn_executions WHERE id = ?").get(executionId) as { target_swipe_id: number } | null)?.target_swipe_id).toBe(1);
+    } finally {
+      deps.cleanup?.({ execution } as never);
+    }
   });
 });
 
@@ -1392,12 +2299,19 @@ const RENDER_NARRATIVE_FACTS = Object.freeze({
 });
 
 const RENDER_NARRATIVE_FACT_MESSAGE = [
-  "Character: Eleanor",
+  "Name: Eleanor",
   "Personality: Warm, reserved, and precise.",
   "Scenario: A rain-soaked London boarding house.",
   "Description: A retired cartographer.",
   "World (London): Fog-bound streets above a shuttered map shop.",
 ].join("\n");
+
+describe("agentic terminal inspection", () => {
+  test("does not misclassify a completed turn's internal reason as needs attention", () => {
+    expect(__testing.terminalInspectionReason("completed", "commit_finished", null)).toBe("none");
+    expect(__testing.terminalInspectionReason("failed", "provider_failure", null)).toBe("provider_failure");
+  });
+});
 
 describe("agentic RENDER narrative prompt", () => {
   test("uses current swipe chat turns, host contract when policy is empty, and labelled guidance", () => {
@@ -1426,7 +2340,10 @@ describe("agentic RENDER narrative prompt", () => {
       { role: "user", content: USER_INPUT },
       { role: "assistant", content: "Eleanor is already in the room." },
       { role: "system", content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT },
-      { role: "system", content: "Render guidance (not the reply):\nKeep the reply intimate and in Eleanor's voice." },
+      {
+        role: "system",
+        content: "Host-accepted render guidance (not the reply): WORK has completed. The accepted workspace projection is authoritative; do not deny its supported facts merely because RESPONSE is tools-disabled. Follow this guidance only where supported by that projection, and do not expose private reasoning or the operational transcript.\nKeep the reply intimate and in Eleanor's voice.",
+      },
     ]);
     expect(messages.some((message) => message.role === "user" && message.content === USER_INPUT)).toBe(true);
     expect(messages.filter((message) => message.role !== "system").map((message) => message.content)).not.toContain("complete_turn");
@@ -1500,5 +2417,583 @@ describe("agentic RENDER narrative prompt", () => {
       role: "system",
       content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT,
     });
+  });
+});
+
+describe("agentic commit revision reader fence", () => {
+  test("in-transaction recheck does not reuse the commit-preflight snapshot", () => {
+    const db = getDb();
+    const now = Date.now();
+    const chatId = "chat-revision-fence";
+    const characterId = "character-revision-fence";
+    const presetId = "preset-revision-fence";
+    const bookId = "book-revision-fence";
+    db.query(
+      "INSERT INTO characters (id, name, description, personality, scenario, first_mes, mes_example, creator, creator_notes, system_prompt, post_history_instructions, tags, alternate_greetings, extensions, created_at, updated_at, user_id) VALUES (?, ?, '', '', '', '', '', '', '', '', '', '[]', '[]', ?, ?, ?, ?)",
+    ).run(characterId, "Fence Character", JSON.stringify({ world_book_ids: [bookId] }), now, now, USER_ID);
+    db.query(
+      "INSERT INTO chats (id, user_id, character_id, name, created_at, updated_at, metadata, generation_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(chatId, USER_ID, characterId, "Fence Chat", now, now, "{}", 1);
+    db.query(
+      "INSERT INTO presets (id, user_id, name, provider, engine, parameters, prompt_order, prompts, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(presetId, USER_ID, "Fence Preset", "scripted-coordinator", "classic", "{}", "[]", "{}", "{}", now, now);
+    db.query(
+      `INSERT INTO preset_agent_configs
+        (user_id, preset_id, version, agents_enabled, allowed_modes, default_mode,
+         max_invocations, max_tool_calls, main_tool_ids, main_lore_scope,
+         phase_policy_json, cognition_policy_json, context_policy_json, task_policy_json,
+         workspace_policy_json, state, review_acknowledged, config_revision, binding_revision,
+         created_at, updated_at)
+        VALUES (?, ?, 2, 1, ?, 'agentic', 8, 8, ?, 'active',
+          '{}', '{}', '{}', '{}', '{}', 'ready', 1, 1, 1, ?, ?)`,
+    ).run(USER_ID, presetId, JSON.stringify(["response", "agentic"]), JSON.stringify(["chat_search_history"]), now, now);
+    db.query(
+      "INSERT INTO world_books (id, user_id, name, description, folder, metadata, created_at, updated_at) VALUES (?, ?, ?, '', '', '{}', ?, ?)",
+    ).run(bookId, USER_ID, "Fence Book", now, now);
+
+    const reader = __testing.makeRevisionReader({
+      userId: USER_ID,
+      chatId,
+      assemblySurface: "WORK",
+      presetId,
+      targetCharacterId: characterId,
+    });
+    const characterMember = { kind: "character", id: characterId };
+    const configMember = { kind: "config", id: presetId };
+    const loreMember = { kind: "world_lore", id: bookId };
+
+    const preflightCharacter = reader(characterMember, db);
+    const preflightConfig = reader(configMember, db);
+    const preflightLore = reader(loreMember, db);
+    expect(preflightCharacter?.revision).toEqual(expect.any(String));
+    expect(preflightConfig?.revision).toEqual(expect.any(String));
+    expect(preflightLore?.revision).toEqual(expect.any(String));
+
+    db.query("UPDATE characters SET description = ? WHERE id = ?").run("hostile character edit", characterId);
+    db.query("UPDATE preset_agent_configs SET config_revision = 99 WHERE user_id = ? AND preset_id = ?")
+      .run(USER_ID, presetId);
+    db.query("UPDATE world_books SET description = ?, updated_at = ? WHERE id = ?")
+      .run("hostile lore edit", now + 1, bookId);
+
+    const fenced = db.transaction(() => ({
+      character: reader(characterMember, db),
+      config: reader(configMember, db),
+      lore: reader(loreMember, db),
+    }))();
+
+    expect(fenced.character?.revision).not.toBe(preflightCharacter?.revision);
+    expect(fenced.character?.digest).not.toBe(preflightCharacter?.digest);
+    expect(fenced.config?.revision).not.toBe(preflightConfig?.revision);
+    expect(fenced.lore?.revision).not.toBe(preflightLore?.revision);
+    expect(fenced.lore?.digest).not.toBe(preflightLore?.digest);
+  });
+});
+
+
+describe("coordinator cognition transition snapshot seam", () => {
+  test("projects a completed materialized authored task through the real phase snapshot capability", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    installAgenticGenerationCoordinator();
+    const deps = __testing.buildDependencies();
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(input, target, signal);
+    const execution = await deps.createExecution!({
+      executionId: `exec-cognition-snapshot-${Date.now()}`,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      signal,
+    });
+    const runtimeExecution = execution as typeof execution & {
+      readonly userId: string;
+      readonly chatId: string;
+      readonly workspaceId: string;
+      workspaceRevision: number;
+    };
+    const db = getDb();
+    const rootSignal = execution.signal;
+    if (!rootSignal) throw new Error("Cognition snapshot execution signal was not installed");
+    const capabilities = {
+      revision: 1,
+      allowed: WORKSPACE_OPERATIONS,
+      maxOperationBytes: 131_072,
+      maxOperations: 128,
+    };
+    const rootFrame = createAgenticRootFrame({
+      frameId: execution.id,
+      connectionId: null,
+      model: "",
+      coreToolIds: [],
+      workspaceCapabilities: WORKSPACE_OPERATIONS,
+      signal: rootSignal,
+    });
+    const currentWorkspaceRevision = (): number => {
+      const row = db.query(
+        "SELECT revision FROM agent_turn_workspaces WHERE workspace_id = ? AND turn_id = ? AND user_id = ? AND chat_id = ?",
+      ).get(runtimeExecution.workspaceId, runtimeExecution.id, runtimeExecution.userId, runtimeExecution.chatId) as { revision: number } | null;
+      if (!row) throw new Error("Cognition snapshot workspace was not persisted");
+      return row.revision;
+    };
+    const workspaceContext = (expectedRevision: number): Record<string, unknown> => ({
+      userId: runtimeExecution.userId,
+      chatId: runtimeExecution.chatId,
+      turnId: runtimeExecution.id,
+      workspaceId: runtimeExecution.workspaceId,
+      actor: "root",
+      expectedRevision,
+    });
+    const templateId = "authored-review";
+    try {
+      const initialRevision = currentWorkspaceRevision();
+      runtimeExecution.workspaceRevision = initialRevision;
+      const cognition = createAgentCognitionRuntime({
+        source: {
+          graph: {
+            version: 1,
+            policies: {
+              workPolicy: [],
+              workspaceUsage: [],
+              completionCriteria: [],
+              renderPolicy: [],
+            },
+            templates: [{
+              id: templateId,
+              label: "Authored review",
+              description: "Complete the authored review task.",
+              required: false,
+              dependencies: [],
+              activation: { kind: "phase", value: "WORK" },
+            }],
+            contextRules: [],
+          },
+          source: { presetRevision: 1, blocks: [] },
+          contextPackSelections: [],
+          contextPackCandidates: [],
+        },
+        evaluation: {
+          generationType: "normal",
+          phase: "WORK",
+          presetVariables: {},
+          participantFacts: {},
+          availableTools: [],
+          taskTransitions: {},
+        },
+        workspaceRevision: initialRevision,
+        workspace: workspaceContext(initialRevision),
+      });
+      runtimeExecution.workspaceRevision = cognition.initialActivation.workspaceRevision;
+      const workActivation = cognition.enterPhase({
+        phase: "WORK",
+        workspace: workspaceContext(runtimeExecution.workspaceRevision),
+      });
+      runtimeExecution.workspaceRevision = workActivation.workspaceRevision;
+      const workspace = __testing.makeWorkspace(execution, capabilities, cognition);
+
+      const materialized = db.query(
+        `SELECT task_id, cognition_template_id, state
+           FROM agent_workspace_tasks
+          WHERE workspace_id = ? AND turn_id = ? AND user_id = ? AND chat_id = ?
+            AND cognition_template_id = ?`,
+      ).get(runtimeExecution.workspaceId, runtimeExecution.id, runtimeExecution.userId, runtimeExecution.chatId, templateId) as {
+        task_id: string;
+        cognition_template_id: string | null;
+        state: string;
+      } | null;
+      expect(materialized).toEqual({
+        task_id: expect.any(String),
+        cognition_template_id: templateId,
+        state: "active",
+      });
+      if (!materialized) throw new Error("Authored cognition task was not materialized");
+      expect(materialized.task_id).not.toBe(templateId);
+
+      const assignChildTasks = workspace.assignChildTasks;
+      if (!assignChildTasks) throw new Error("Coordinator workspace assignment capability is unavailable");
+      const childFrameId = "cognition-snapshot-child";
+      const assignment = await assignChildTasks({
+        frame: rootFrame,
+        assignments: [{ taskId: materialized.task_id, frameId: childFrameId }],
+        expectedRevision: runtimeExecution.workspaceRevision,
+        signal: rootSignal,
+      });
+      expect(assignment).toMatchObject({
+        accepted: true,
+        assignments: [{ taskId: materialized.task_id, frameId: childFrameId }],
+      });
+      runtimeExecution.workspaceRevision = assignment.workspaceRevision;
+
+      const childFrame = createAgenticChildFrame({
+        frameId: childFrameId,
+        parentFrameId: execution.id,
+        connectionId: null,
+        model: "",
+        coreToolIds: [],
+        taskId: materialized.task_id,
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+        signal: rootSignal,
+      });
+      const execute = workspace.execute;
+      if (!execute) throw new Error("Coordinator workspace execution capability is unavailable");
+      const applyCognition = workspace.applyCognitionWorkspaceTransition;
+      if (!applyCognition) throw new Error("Coordinator cognition workspace capability is unavailable");
+      workspace.authenticateFrame?.(childFrame);
+      const childSummary = "Authored review completed with evidence.";
+      let childRound = 0;
+      const child = await executeBoundedAgenticChildFrame({
+        frame: childFrame,
+        task: "Complete the authored review task.",
+        systemPrompt: "Use the assigned workspace tools and submit the result.",
+        workspace,
+        countTokens: (text) => Math.ceil(text.length / 4),
+        dispatch: async ({ tools }) => {
+          childRound += 1;
+          if (childRound === 1) {
+            expect(tools.find((definition) => definition.name === "workspace_update_assigned_progress")?.parameters).toEqual({
+              type: "object",
+              properties: {
+                state: { type: "string", enum: ["pending", "active", "blocked", "cancelled", "failed"] },
+                progress: { type: "number", minimum: 0, maximum: 1 },
+              },
+              required: ["state"],
+              additionalProperties: false,
+            });
+            return {
+              content: "",
+              finish_reason: "tool_calls",
+              tool_calls: [{
+                name: "workspace_update_assigned_progress",
+                args: { state: "active", progress: 1 },
+                call_id: "cognition-snapshot-progress",
+              }],
+            };
+          }
+          return {
+            content: "",
+            finish_reason: "tool_calls",
+            tool_calls: [{
+              name: "workspace_submit_child_result",
+              args: { summary: childSummary },
+              call_id: "cognition-snapshot-submit",
+            }],
+          };
+        },
+      });
+      expect(child).toMatchObject({
+        status: "succeeded",
+        content: childSummary,
+        providerRoundCount: 2,
+        workspaceRevision: expect.any(Number),
+      });
+      expect(child.observations).toEqual([
+        expect.objectContaining({ toolName: "workspace_update_assigned_progress", status: "success" }),
+        expect.objectContaining({ toolName: "workspace_submit_child_result", status: "success" }),
+      ]);
+      expect(db.query(
+        "SELECT summary, result_digest, byte_count FROM agent_workspace_submissions WHERE task_id = ? AND workspace_id = ?",
+      ).get(materialized.task_id, runtimeExecution.workspaceId)).toEqual({
+        summary: childSummary,
+        result_digest: createHash("sha256").update(childSummary, "utf8").digest("hex"),
+        byte_count: Buffer.byteLength(childSummary, "utf8") * 2,
+      });
+      const recordSummaries = {
+        finding: "A non-cognition record must keep the runtime CAS synchronized.",
+        decision: "The operation-selected record kind is authoritative.",
+        question: "Can every strict record tool omit its implicit kind and digest?",
+      } as const;
+      await execute(
+        "record_finding",
+        {
+          summary: recordSummaries.finding,
+          taskId: null,
+        },
+        { actor: "root", frame: rootFrame, operation: "record_finding", signal: rootSignal },
+      );
+      await execute(
+        "record_decision",
+        {
+          summary: recordSummaries.decision,
+          taskId: null,
+        },
+        { actor: "root", frame: rootFrame, operation: "record_decision", signal: rootSignal },
+      );
+      await execute(
+        "record_question",
+        {
+          summary: recordSummaries.question,
+          taskId: null,
+        },
+        { actor: "root", frame: rootFrame, operation: "record_question", signal: rootSignal },
+      );
+      expect(runtimeExecution.workspaceRevision).toBe(currentWorkspaceRevision());
+      expect(db.query(
+        "SELECT kind, summary, digest FROM agent_workspace_records WHERE workspace_id = ? ORDER BY created_at, kind",
+      ).all(runtimeExecution.workspaceId)).toEqual(
+        (["decision", "finding", "question"] as const).map((kind) => ({
+          kind,
+          summary: recordSummaries[kind],
+          digest: createHash("sha256").update(recordSummaries[kind], "utf8").digest("hex"),
+        })),
+      );
+      expect(db.query(
+        "SELECT state FROM agent_workspace_tasks WHERE task_id = ? AND workspace_id = ?",
+      ).get(materialized.task_id, runtimeExecution.workspaceId)).toEqual({ state: "completed" });
+
+      const getPhaseEvaluationSnapshot = workspace.getPhaseEvaluationSnapshot;
+      if (!getPhaseEvaluationSnapshot) throw new Error("Coordinator phase snapshot capability is unavailable");
+      const snapshot = await getPhaseEvaluationSnapshot({
+        phase: "COMPLETE",
+        expectedRevision: runtimeExecution.workspaceRevision,
+        signal: rootSignal,
+      });
+      expect(snapshot.taskTransitions).toEqual({ [templateId]: "completed" });
+      expect(snapshot.taskTransitions).not.toHaveProperty(materialized.task_id);
+      expect(evaluateCognitionPredicate(
+        { kind: "task_transition", taskId: templateId, transition: "completed" },
+        {
+          generationType: "normal",
+          phase: "WORK",
+          presetVariables: {},
+          participantFacts: {},
+          availableTools: [],
+          taskTransitions: snapshot.taskTransitions,
+        },
+      )).toBe(true);
+
+      await applyCognition({
+        taskId: "ad-hoc-cognition-task",
+        transition: "pending",
+        operation: "create_task",
+        operationKey: "ad-hoc-cognition-create",
+        workspace: {
+          actor: "root",
+          frameId: rootFrame.frameId,
+          taskId: "ad-hoc-cognition-task",
+          title: "Ad-hoc task",
+          objective: "Keep arbitrary host task identity stable.",
+          required: false,
+          dependencyIds: [],
+        },
+        signal: rootSignal,
+      });
+      const withAdHoc = await getPhaseEvaluationSnapshot({
+        phase: "COMPLETE",
+        expectedRevision: runtimeExecution.workspaceRevision,
+        signal: rootSignal,
+      });
+      expect(withAdHoc.taskTransitions).toHaveProperty(templateId, "completed");
+      expect(withAdHoc.taskTransitions).toHaveProperty("ad-hoc-cognition-task");
+      expect(withAdHoc.taskTransitions).not.toHaveProperty(materialized.task_id);
+
+      await execute(
+        "create_task",
+        {
+          taskId: templateId,
+          title: "Conflicting ad-hoc task",
+          objective: "This authored identity must fail closed when duplicated.",
+          required: false,
+          dependencyIds: [],
+        },
+        { actor: "root", frame: rootFrame, operation: "create_task", signal: rootSignal },
+      );
+      runtimeExecution.workspaceRevision = currentWorkspaceRevision();
+      await expect(getPhaseEvaluationSnapshot({
+        phase: "COMPLETE",
+        expectedRevision: runtimeExecution.workspaceRevision,
+        signal: rootSignal,
+      })).rejects.toMatchObject({ code: "invalid_state" });
+    } finally {
+      deps.cleanup?.({ execution } as never);
+    }
+  });
+});
+describe("coordinator blocked terminal completion seam", () => {
+  test("keeps a blocked terminal phase entered until its pending submission is accepted", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    await probeIsolateBackendsAtStartup();
+    startAgentRuntimeEpoch();
+    installAgenticGenerationCoordinator();
+    scriptedBlockedTerminal = true;
+    scriptedBlockedTerminalTurnId = "";
+    scriptedBlockedTerminalTaskCreated = false;
+    scriptedBlockedTerminalDelegateIssued = false;
+    scriptedBlockedTerminalChildSubmitted = false;
+    scriptedBlockedTerminalAttempted = false;
+    scriptedBlockedTerminalAcceptanceIssued = false;
+    scriptedBlockedTerminalRetryCanAccept = false;
+    scriptedBlockedTerminalSnapshots.length = 0;
+    providerRequests.length = 0;
+
+    const phaseDefinitions: AgentCustomPhaseV1[] = [
+      {
+        version: 1,
+        id: "blocked_terminal_first",
+        label: "Blocked terminal first phase",
+        instructionRefs: [],
+        required: true,
+        enter: { kind: "phase", value: "WORK" },
+        exit: { kind: "phase", value: "COMPLETE" },
+        capabilityRequests: [],
+        repeatLimit: 0,
+        nextPhaseIds: ["blocked_terminal_last"],
+      },
+      {
+        version: 1,
+        id: "blocked_terminal_last",
+        label: "Blocked terminal last phase",
+        instructionRefs: [],
+        required: true,
+        enter: { kind: "phase", value: "WORK" },
+        exit: { kind: "phase", value: "COMPLETE" },
+        capabilityRequests: ["workspace_write", "delegation"],
+        repeatLimit: 0,
+        nextPhaseIds: [],
+      },
+    ];
+    const authoredPhasePlan = compileAgentRuntimePhases(phaseDefinitions);
+    expect(authoredPhasePlan.status).toBe("ready");
+    const runtimePolicy = {
+      version: 1,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: "agentic",
+      loomPolicy: null,
+      phases: phaseDefinitions,
+    };
+    const db = getDb();
+    const originalConfig = db.query(
+      "SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, AGENTIC_PRESET_ID) as { config_json: string };
+    const originalProfiles = db.query(
+      "SELECT profile_id, workspace_capabilities, max_output_tokens FROM preset_agent_profiles WHERE user_id = ? AND preset_id = ? AND profile_id IN ('delegate', 'delegate_alt') ORDER BY profile_id",
+    ).all(USER_ID, AGENTIC_PRESET_ID) as Array<{
+      profile_id: string;
+      workspace_capabilities: string;
+      max_output_tokens: number;
+    }>;
+
+    const deps = __testing.buildDependencies();
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+      parameters: { max_tokens: 1024 },
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const executionId = `exec-blocked-terminal-${Date.now()}`;
+    try {
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({ config: { runtimePolicy } }), USER_ID, AGENTIC_PRESET_ID);
+      db.query(
+        "UPDATE preset_agent_profiles SET workspace_capabilities = ?, max_output_tokens = 1024 WHERE user_id = ? AND preset_id = ? AND profile_id IN ('delegate', 'delegate_alt')",
+      ).run(JSON.stringify(["update_assigned_progress", "submit_child_result"]), USER_ID, AGENTIC_PRESET_ID);
+
+      const decision = await deps.resolveRuntime!(input, target, signal);
+      const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, executionId);
+      const plan = await deps.compileAssemblyPlan!(snapshot, input, decision, signal, executionId);
+      const execution = await deps.createExecution!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal,
+      });
+      scriptedBlockedTerminalTurnId = execution.id;
+      try {
+        const work = await deps.runWork!({
+          execution,
+          input,
+          decision,
+          snapshot,
+          plan,
+          signal,
+        });
+        expect(work).toMatchObject({ status: "completed" });
+        expect(scriptedBlockedTerminalRetryCanAccept).toBe(true);
+        expect(scriptedBlockedTerminalSnapshots).toEqual([{
+          workspaceState: "active",
+          workspaceRevision: expect.any(Number),
+          frozenAt: null,
+          taskState: "completed",
+          submissionState: "submitted",
+        }]);
+        const blockedSnapshot = scriptedBlockedTerminalSnapshots[0];
+        if (!blockedSnapshot) throw new Error("Blocked terminal snapshot was not captured");
+        expect(blockedSnapshot.workspaceRevision).toBeGreaterThan(0);
+
+        const workspace = db.query(
+          "SELECT state, revision, frozen_at FROM agent_turn_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id = ? AND turn_id = ?",
+        ).get(`workspace:${execution.id}`, USER_ID, AGENTIC_CHAT_ID, execution.id) as {
+          state: string;
+          revision: number;
+          frozen_at: number | null;
+        } | null;
+        expect(workspace?.state).toBe("frozen");
+        expect(workspace?.frozen_at).not.toBeNull();
+        expect(workspace?.revision).toBeGreaterThan(blockedSnapshot.workspaceRevision);
+
+        const task = db.query(
+          "SELECT task_id, state FROM agent_workspace_tasks WHERE workspace_id = ? AND turn_id = ? AND task_id = ?",
+        ).get(`workspace:${execution.id}`, execution.id, "blocked-terminal-task") as {
+          task_id: string;
+          state: string;
+        } | null;
+        expect(task).toEqual({ task_id: "blocked-terminal-task", state: "completed" });
+
+        const submission = db.query(
+          "SELECT state FROM agent_workspace_submissions WHERE workspace_id = ? AND turn_id = ? AND task_id = ?",
+        ).get(`workspace:${execution.id}`, execution.id, "blocked-terminal-task") as { state: string } | null;
+        expect(submission).toEqual({ state: "accepted" });
+
+        const completions = (work.observations ?? []).filter((observation) => observation.toolName === "complete_turn");
+        expect(completions).toHaveLength(3);
+        expect(completions.map((observation) => observation.status)).toEqual(["accepted", "rejected", "accepted"]);
+        expect(completions[1]?.code).toBe("completion_blocked");
+      } finally {
+        deps.cleanup!({ execution } as never);
+      }
+    } finally {
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(originalConfig.config_json, USER_ID, AGENTIC_PRESET_ID);
+      for (const profile of originalProfiles) {
+        db.query(
+          "UPDATE preset_agent_profiles SET workspace_capabilities = ?, max_output_tokens = ? WHERE user_id = ? AND preset_id = ? AND profile_id = ?",
+        ).run(
+          profile.workspace_capabilities,
+          profile.max_output_tokens,
+          USER_ID,
+          AGENTIC_PRESET_ID,
+          profile.profile_id,
+        );
+      }
+      scriptedBlockedTerminal = false;
+      scriptedBlockedTerminalTurnId = "";
+      scriptedBlockedTerminalTaskCreated = false;
+      scriptedBlockedTerminalDelegateIssued = false;
+      scriptedBlockedTerminalChildSubmitted = false;
+      scriptedBlockedTerminalAttempted = false;
+      scriptedBlockedTerminalAcceptanceIssued = false;
+      scriptedBlockedTerminalRetryCanAccept = false;
+      scriptedBlockedTerminalSnapshots.length = 0;
+      providerRequests.length = 0;
+    }
   });
 });

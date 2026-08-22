@@ -45,7 +45,7 @@ describe("chat Agentic mode CAS", () => {
       body: JSON.stringify({ mode: "agentic", expectedRevision: 0 }),
     });
     expect(first.status).toBe(200);
-    expect(await first.json()).toMatchObject({ mode: "agentic", revision: 1, state: "ready" });
+    expect(await first.json()).toMatchObject({ mode: "agentic", revision: 1, state: "ready", appliesTo: "next_turn" });
   });
 
   test("rejects malformed revisions and stale writes without changing the override", async () => {
@@ -74,7 +74,12 @@ describe("chat Agentic mode CAS", () => {
     expect(stale.status).toBe(409);
     expect(await stale.json()).toEqual({
       error: "Chat agent mode changed; refresh and try again.",
-      code: "INVALID_REQUEST",
+      code: "AGENT_CHAT_MODE_REVISION_CONFLICT",
+      currentMode: "agentic",
+      currentRevision: 1,
+      currentState: "ready",
+      source: "durable_chat_override",
+      appliesTo: "next_turn",
     });
     expect(getDb().query("SELECT mode, revision FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?").get(OWNER, CHAT_ID)).toEqual({ mode: "agentic", revision: 1 });
   });
@@ -99,4 +104,67 @@ describe("chat Agentic mode CAS", () => {
     expect(await malformed.json()).toEqual({ error: "Invalid JSON body", code: "INVALID_REQUEST" });
     expect(getDb().query("SELECT COUNT(*) AS count FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?").get(OWNER, CHAT_ID)).toEqual({ count: 0 });
   });
+  test("resets to the preset with a CAS-protected DELETE", async () => {
+    const first = await app.request(`/chats/${CHAT_ID}/agent-mode`, {
+      method: "PUT",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ mode: "agentic", expectedRevision: 0 }),
+    });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({ mode: "agentic", revision: 1, appliesTo: "next_turn" });
+
+    const reset = await app.request(`/chats/${CHAT_ID}/agent-mode`, {
+      method: "DELETE",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 1 }),
+    });
+    expect(reset.status).toBe(200);
+    expect(await reset.json()).toMatchObject({
+      chatId: CHAT_ID,
+      mode: null,
+      revision: 2,
+      state: "ready",
+      appliesTo: "next_turn",
+    });
+    expect(getDb().query("SELECT mode, revision FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?").get(OWNER, CHAT_ID)).toEqual({ mode: null, revision: 2 });
+
+    const stale = await app.request(`/chats/${CHAT_ID}/agent-mode`, {
+      method: "DELETE",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 1 }),
+    });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({
+      code: "AGENT_CHAT_MODE_REVISION_CONFLICT",
+    });
+    expect(getDb().query("SELECT mode, revision FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?").get(OWNER, CHAT_ID)).toEqual({ mode: null, revision: 2 });
+  });
+
+  test("accepts only the closed mode write and reset DTOs", async () => {
+    const unknownPut = await app.request(`/chats/${CHAT_ID}/agent-mode`, {
+      method: "PUT",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ mode: "response", expectedRevision: 0, appliesTo: "next_turn" }),
+    });
+    expect(unknownPut.status).toBe(400);
+    expect(await unknownPut.json()).toMatchObject({ code: "INVALID_REQUEST" });
+
+    const nullMode = await app.request(`/chats/${CHAT_ID}/agent-mode`, {
+      method: "PUT",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ mode: null, expectedRevision: 0 }),
+    });
+    expect(nullMode.status).toBe(400);
+    expect(await nullMode.json()).toMatchObject({ code: "INVALID_REQUEST" });
+
+    const unknownDelete = await app.request(`/chats/${CHAT_ID}/agent-mode`, {
+      method: "DELETE",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 0, mode: null }),
+    });
+    expect(unknownDelete.status).toBe(400);
+    expect(await unknownDelete.json()).toMatchObject({ code: "INVALID_REQUEST" });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM chat_agent_mode_overrides WHERE user_id = ? AND chat_id = ?").get(OWNER, CHAT_ID)).toEqual({ count: 0 });
+  });
+
 });

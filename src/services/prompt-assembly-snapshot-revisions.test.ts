@@ -93,6 +93,7 @@ function input(db: Database, overrides: Partial<GenerationAssemblySnapshotInputV
     userId: "user-1",
     chatId: "chat-1",
     generationId: "generation-1",
+    assemblySurface: "WORK",
     generationType: "normal",
     connectionId: "logical-connection",
     presetId: "preset-1",
@@ -225,17 +226,23 @@ describe("authenticated assembly snapshot revisions", () => {
         credentialRevision: null,
       },
     });
+    const connectionLive = liveConnectionInputRevision(concrete.concreteId, null);
+    const endpointLive = liveEndpointInputRevision(concrete.concreteId, null);
+    const credentialLive = liveCredentialInputRevision(concrete.concreteId, null);
     expect(nullable.inputRevisionSet.connection[0]).toMatchObject({
       id: concrete.concreteId,
-      ...liveConnectionInputRevision(concrete.concreteId, null),
+      digest: connectionLive.digest,
+      revision: connectionLive.revision.length > 0 ? connectionLive.revision : connectionLive.digest,
     });
     expect(nullable.inputRevisionSet.endpoint[0]).toMatchObject({
       id: concrete.concreteId,
-      ...liveEndpointInputRevision(concrete.concreteId, null),
+      digest: endpointLive.digest,
+      revision: endpointLive.revision.length > 0 ? endpointLive.revision : endpointLive.digest,
     });
     expect(nullable.inputRevisionSet.credential[0]).toMatchObject({
       id: concrete.concreteId,
-      ...liveCredentialInputRevision(concrete.concreteId, null),
+      digest: credentialLive.digest,
+      revision: credentialLive.revision.length > 0 ? credentialLive.revision : credentialLive.digest,
     });
   });
   test("fails closed when an owner-scoped connection points at a missing effective preset", () => {

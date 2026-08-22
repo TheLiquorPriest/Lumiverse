@@ -543,6 +543,7 @@
   "dataPortability": {
     "exportTitle": "导出数据",
     "exportDesc": "将你拥有的全部内容（角色、聊天、世界书、人设、预设、记忆皮层、数据库、主题、设置与扩展偏好）打包为单个 .lvbak 归档。API 密钥等机密信息永不包含在内。",
+    "exportSchemaVersion": "归档架构版本：{{version}}",
     "includeVectors": "包含向量嵌入（在匹配的嵌入提供商上导入更快；文件更大）",
     "includeSecrets": "包含 API 密钥与机密（会额外下载解密票据）",
     "secretsWarning": "将下载两个文件：归档 (.lvbak) 与小票据 (.ticket.json)。请与归档分开保管票据——密码管理器最合适。没有票据无法恢复密钥；两者同时泄露则他人可读取你的 API 密钥。",

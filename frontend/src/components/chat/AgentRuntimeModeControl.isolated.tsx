@@ -2,12 +2,12 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'b
 import { JSDOM } from 'jsdom'
 import { act } from 'react'
 import type { Root } from 'react-dom/client'
-import * as actualReactI18next from 'react-i18next'
 import type { EffectiveRuntimeState } from '@/hooks/useEffectiveRuntime'
 
 const selectCalls: string[] = []
 const overrideCalls: Array<string | null> = []
 
+const refreshCalls: string[] = []
 const readyDecision: NonNullable<EffectiveRuntimeState['decision']> = {
   version: 1,
   chatId: 'chat-1',
@@ -45,9 +45,17 @@ let hookState: EffectiveRuntimeState
 mock.module('@/hooks/useEffectiveRuntime', () => ({
   useEffectiveRuntime: () => hookState,
 }))
-// Keep every react-i18next export available to tests that share this module
-// graph; only a complete pass-through mock is needed for this focused seam.
-mock.module('react-i18next', () => ({ ...actualReactI18next }))
+mock.module('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: Record<string, unknown>) => {
+      if (key === 'agentRuntime.resolutionError.target') {
+        return `${String(options?.generationType)} ${String(options?.messageId)} ${String(options?.swipeId)}`
+      }
+      if (key === 'agentRuntime.resolutionError.code') return String(options?.code)
+      return key
+    },
+  }),
+}))
 const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'http://localhost/',
   pretendToBeVisual: true,
@@ -87,6 +95,7 @@ function baseState(overrides: Partial<EffectiveRuntimeState> = {}): EffectiveRun
     oneTurnMode: null,
     loading: false,
     savingOverride: false,
+    activeGenerationMode: null,
     error: null,
     canShowSelector: true,
     repairCategories: [],
@@ -96,7 +105,9 @@ function baseState(overrides: Partial<EffectiveRuntimeState> = {}): EffectiveRun
     async saveChatOverride(mode) {
       overrideCalls.push(mode)
     },
-    async refresh() {},
+    async refresh() {
+      refreshCalls.push('refresh')
+    },
     ...overrides,
   }
 }
@@ -116,6 +127,7 @@ beforeEach(() => {
   hookState = baseState()
   selectCalls.length = 0
   overrideCalls.length = 0
+  refreshCalls.length = 0
 })
 
 afterEach(async () => {
@@ -242,5 +254,61 @@ describe('AgentRuntimeModeControl', () => {
     expect(host.querySelectorAll('input[type="radio"]')).toHaveLength(2)
     const liveRegions = host.querySelectorAll('[role="status"][aria-live="polite"][aria-atomic="true"]')
     expect(liveRegions).toHaveLength(1)
+  })
+
+  test('keeps next-turn selection available but locks durable chat policy while WORK is active', async () => {
+    hookState = baseState({
+      activeGenerationMode: 'agentic',
+      pendingOneTurnMode: 'response',
+      canResetChatOverride: true,
+      async resetChatOverride() {},
+    })
+    const { host } = await renderControl()
+    const response = host.querySelector<HTMLInputElement>('input[value="response"]')
+    const agentic = host.querySelector<HTMLInputElement>('input[value="agentic"]')
+    const durable = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChat'))
+    const reset = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.resetToPreset'))
+
+    expect(response?.disabled).toBeFalse()
+    expect(agentic?.disabled).toBeFalse()
+    expect(durable?.disabled).toBeTrue()
+    expect(reset?.disabled).toBeTrue()
+    expect(host.textContent).toContain('agentRuntime.nextTurnQueued')
+
+    await act(async () => agentic?.click())
+    await act(async () => durable?.click())
+    expect(selectCalls).toEqual(['agentic'])
+    expect(overrideCalls).toEqual([])
+  })
+
+  test('locks durable chat policy during an active Response generation', async () => {
+    hookState = baseState({
+      activeGenerationMode: 'response',
+      canResetChatOverride: true,
+      async resetChatOverride() {},
+    })
+    const { host } = await renderControl()
+    const durable = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChat'))
+    const reset = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.resetToPreset'))
+    expect(durable?.disabled).toBeTrue()
+    expect(reset?.disabled).toBeTrue()
+  })
+
+  test('shows the exact failed target, stable code, retry, and Response escape', async () => {
+    hookState = baseState({
+      decision: null,
+      error: Object.assign(new Error('Cannot resolve exact target'), { name: 'TargetConflict' }),
+      canShowSelector: false,
+      oneTurnMode: 'agentic',
+    })
+    const { host } = await renderControl()
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('TargetConflict')
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('normal')
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.resolutionError.retry'))
+    const response = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useResponse'))
+    await act(async () => retry?.click())
+    await act(async () => response?.click())
+    expect(refreshCalls).toEqual(['refresh'])
+    expect(selectCalls).toEqual(['response'])
   })
 })

@@ -128,6 +128,7 @@ describe("group chat world-info source selection", () => {
       userId: USER_ID,
       generationId: crypto.randomUUID(),
       dryRun: false,
+      assemblySurface: "RESPONSE",
       chatId: updated.id,
       generationType: "normal",
     });

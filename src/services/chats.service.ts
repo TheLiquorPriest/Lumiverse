@@ -40,6 +40,7 @@ import {
   type AvatarBindingField,
 } from "./avatar-bindings";
 import { withUserDataMutation, withUserDataMutationSync } from "./user-data/snapshot";
+import { retainAgentInspectionSourceDeletionInTransaction } from "./agent-inspection-retention.service";
 
 // --- Chat helpers ---
 
@@ -1480,9 +1481,15 @@ export function deleteChat(userId: string, id: string): boolean {
     console.warn(`[chats] Failed to scan messages for audio cleanup in chat ${id}:`, err);
   }
 
-  const result = withUserDataMutationSync(userId, () =>
-    getDb().query("DELETE FROM chats WHERE id = ? AND user_id = ?").run(id, userId)
-  );
+  const db = getDb();
+  const result = withUserDataMutationSync(userId, () => db.transaction(() => {
+    retainAgentInspectionSourceDeletionInTransaction(db, {
+      userId,
+      chatId: id,
+      sourceKind: "chat",
+    });
+    return db.query("DELETE FROM chats WHERE id = ? AND user_id = ?").run(id, userId);
+  })());
   if (result.changes > 0) {
     cleanupAudioAttachments(userId, audioAttachments);
     invalidateChatMemoryCache(id);
@@ -3303,6 +3310,12 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
       if (!row) continue;
 
       attachmentsToCleanup.push(...collectMessageAttachments(row));
+      retainAgentInspectionSourceDeletionInTransaction(db, {
+        userId,
+        chatId,
+        sourceKind: "message",
+        targetMessageId: msgId,
+      });
       deleteStmt.run(msgId, chatId);
       deleted++;
       deletedIds.push(msgId);
@@ -3350,6 +3363,12 @@ export function deleteMessage(userId: string, id: string): boolean {
   const attachmentsToCleanup = collectMessageAttachments(msg);
   const db = getDb();
   const result = withUserDataMutationSync(userId, () => db.transaction(() => {
+    retainAgentInspectionSourceDeletionInTransaction(db, {
+      userId,
+      chatId: msg.chat_id,
+      sourceKind: "message",
+      targetMessageId: id,
+    });
     const deleted = db.query("DELETE FROM messages WHERE id = ? AND chat_id = ?").run(id, msg.chat_id);
     if (deleted.changes > 0) bumpChatGenerationRevision(db, msg.chat_id, userId);
     return deleted;
@@ -3517,6 +3536,13 @@ export function deleteSwipe(userId: string, messageId: string, swipeIdx: number)
 
   const db = getDb();
   withUserDataMutationSync(userId, () => db.transaction(() => {
+    retainAgentInspectionSourceDeletionInTransaction(db, {
+      userId,
+      chatId: msg.chat_id,
+      sourceKind: "swipe",
+      targetMessageId: messageId,
+      targetSwipeId: swipeIdx,
+    });
     db.query("UPDATE messages SET swipes = ?, swipe_dates = ?, swipe_id = ?, content = ?, extra = ? WHERE id = ? AND chat_id = ?")
       .run(
         JSON.stringify(swipes),

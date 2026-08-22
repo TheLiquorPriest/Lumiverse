@@ -4,7 +4,9 @@ import {
   AGENT_TOOL_CALL_DEFAULT,
   parseLegacyAgentConfigV1,
   parseAgentConfigV2,
+  parseAgentRuntimePolicyV1,
 } from "./agents";
+import type { LoomPolicySourceV1 } from "./agent-cognition";
 
 function profile(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -32,6 +34,59 @@ function config(overrides: Record<string, unknown> = {}): Record<string, unknown
     mainToolIds: ["chat_search_history"],
     mainLoreScope: "active",
     profiles: [profile()],
+    ...overrides,
+  };
+}
+function loomSource(blockId: string, promptOrder = 0, blockRevision = 1): LoomPolicySourceV1 {
+  return {
+    kind: "loom_block",
+    blockId,
+    presetRevision: 7,
+    blockRevision,
+    promptOrder,
+  };
+}
+
+function customPhase(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    id: "draft",
+    label: "Draft",
+    instructionRefs: [loomSource("draft-instructions")],
+    required: true,
+    enter: { kind: "phase", value: "WORK" },
+    exit: { kind: "phase", value: "WORK" },
+    capabilityRequests: ["core_retrieval", "workspace_read"],
+    repeatLimit: 2,
+    nextPhaseIds: [],
+    ...overrides,
+  };
+}
+
+function runtimePolicy(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    authority: "loom",
+    scope: "preset",
+    defaultMode: "agentic",
+    loomPolicy: null,
+    phases: [customPhase()],
+    ...overrides,
+  };
+}
+
+function v2Config(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 2,
+    agentsEnabled: true,
+    allowedModes: ["response", "agentic"],
+    defaultMode: "agentic",
+    maxInvocations: 4,
+    maxToolCalls: 4,
+    mainToolIds: [],
+    mainLoreScope: "active",
+    profiles: [],
+    connectionSlots: [],
     ...overrides,
   };
 }
@@ -126,5 +181,197 @@ describe("agentConfig parser", () => {
         expect(() => parseLegacyAgentConfigV1(config({ [field]: value }))).toThrow();
       }
     }
+  });
+});
+
+describe("canonical custom Phased Instructions policy parser", () => {
+  test("preserves ordered, source-pinned phases and keeps the four Loom buckets separate", () => {
+    const parsed = parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [
+        customPhase({
+          id: "first",
+          label: "First",
+          instructionRefs: [
+            loomSource("later", 3, 4),
+            loomSource("earlier", 1, 2),
+          ],
+          nextPhaseIds: ["second"],
+        }),
+        customPhase({
+          id: "second",
+          label: "Second",
+          instructionRefs: [loomSource("second-instructions", 4, 1)],
+          capabilityRequests: ["delegation", "cortex"],
+          repeatLimit: 4,
+        }),
+      ],
+    }));
+    expect(parsed.phases.map((phase) => phase.id)).toEqual(["first", "second"]);
+    expect(parsed.phases[0]).toMatchObject({
+      version: 1,
+      label: "First",
+      required: true,
+      repeatLimit: 2,
+      capabilityRequests: ["core_retrieval", "workspace_read"],
+      nextPhaseIds: ["second"],
+    });
+    expect(parsed.phases[0]?.instructionRefs ?? []).toEqual([
+      loomSource("later", 3, 4),
+      loomSource("earlier", 1, 2),
+    ]);
+    expect(parsed.phases[1]?.capabilityRequests).toEqual(["delegation", "cortex"]);
+    expect(parsed.loomPolicy).toBeNull();
+    expect(Object.hasOwn(parsed as object, "phasePolicy")).toBe(false);
+  });
+
+  test("rejects duplicate or invalid phase IDs, closed-capability violations, and repeat widening", () => {
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase(), customPhase({ id: "draft" })],
+    }))).toThrow(/duplicate|unique/i);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ id: "Draft" })],
+    }))).toThrow();
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ capabilityRequests: ["network"] })],
+    }))).toThrow();
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ capabilityRequests: ["core_retrieval", "core_retrieval"] })],
+    }))).toThrow(/unique|sorted/i);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ repeatLimit: 5 })],
+    }))).toThrow(/repeat|4/i);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({
+        enter: { kind: "script", source: "return true" },
+      })],
+    }))).toThrow();
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ nextPhaseIds: ["missing"] })],
+    }))).toThrow(/next|phase|reference/i);
+  });
+  test("requires the canonical phase keys rather than legacy aliases", () => {
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({
+        instructions: [loomSource("legacy-instructions")],
+      })],
+    }))).toThrow(/unknown|instructionRefs/i);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({
+        allowedCapabilities: ["core_retrieval"],
+      })],
+    }))).toThrow(/unknown|capabilityRequests/i);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({
+        version: 2,
+      })],
+    }))).toThrow(/version/i);
+  });
+
+
+  test("permits only self or the immediate next ordered phase as a transition target", () => {
+    const immediate = runtimePolicy({
+      phases: [
+        customPhase({ id: "one", nextPhaseIds: ["one", "two"] }),
+        customPhase({ id: "two", nextPhaseIds: ["two", "three"] }),
+        customPhase({ id: "three", nextPhaseIds: ["three"] }),
+      ],
+    });
+    expect(parseAgentRuntimePolicyV1(immediate).phases.map((phase) => phase.nextPhaseIds)).toEqual([
+      ["one", "two"],
+      ["two", "three"],
+      ["three"],
+    ]);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [
+        customPhase({ id: "one", nextPhaseIds: ["three"] }),
+        customPhase({ id: "two" }),
+        customPhase({ id: "three" }),
+      ],
+    }))).toThrow(/next|order|adjacent/i);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ nextPhaseIds: ["draft"], repeatLimit: 0 })],
+    }))).toThrow(/self|repeat/i);
+  });
+  test("enforces the host bound on authored custom phase count", () => {
+    const atLimit = Array.from({ length: 64 }, (_, index) => customPhase({
+      id: `phase_${index}`,
+      label: `Phase ${index}`,
+      instructionRefs: [loomSource(`phase-${index}`)],
+    }));
+    expect(parseAgentRuntimePolicyV1(runtimePolicy({ phases: atLimit })).phases).toHaveLength(64);
+
+    const overLimit = [...atLimit, customPhase({
+      id: "phase_64",
+      label: "Phase 64",
+      instructionRefs: [loomSource("phase-64")],
+    })];
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({ phases: overLimit }))).toThrow(/64|phase|limit/i);
+  });
+
+  test("enforces the host bound on instruction references within one custom phase", () => {
+    const atLimit = Array.from({ length: 64 }, (_, index) =>
+      loomSource(`instruction-${index}`, index, index + 1));
+    expect(parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ instructionRefs: atLimit })],
+    })).phases[0]?.instructionRefs).toHaveLength(64);
+
+    const overLimit = [...atLimit, loomSource("instruction-64", 64, 65)];
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ instructionRefs: overLimit })],
+    }))).toThrow(/64|instruction|limit/i);
+  });
+
+
+
+  test("normalizes legacy phasePolicy ingress into visible Loom buckets without a live alias", () => {
+    const parsed = parseAgentConfigV2(v2Config({
+      phasePolicy: {
+        work: [{
+          blockId: "legacy-work",
+          expectedPresetRevision: 7,
+          expectedBlockRevision: 3,
+        }],
+        render: [{
+          blockId: "legacy-render",
+          expectedPresetRevision: 7,
+          expectedBlockRevision: 5,
+        }],
+      },
+    }));
+    const policy = parsed.runtimePolicy;
+    expect(policy?.phases).toEqual([]);
+    expect(policy?.loomPolicy?.workPolicy).toHaveLength(1);
+    expect(policy?.loomPolicy?.workPolicy[0]).toMatchObject({
+      destination: "root_work",
+      checkpoint: "WORK",
+      source: {
+        blockId: "legacy-work",
+        presetRevision: 7,
+        blockRevision: 3,
+      },
+    });
+    expect(policy?.loomPolicy?.renderPolicy[0]).toMatchObject({
+      destination: "render",
+      checkpoint: "RENDER",
+      source: {
+        blockId: "legacy-render",
+        presetRevision: 7,
+        blockRevision: 5,
+      },
+    });
+    expect(Object.hasOwn(parsed as object, "phasePolicy")).toBe(false);
+    expect(Object.keys(policy?.loomPolicy ?? {})).toEqual([
+      "version",
+      "workPolicy",
+      "workspaceUsage",
+      "completionCriteria",
+      "renderPolicy",
+    ]);
+  });
+
+  test("does not accept a hidden fifth bucket in canonical runtime policy", () => {
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phasePolicy: { work: [], render: [] },
+    }))).toThrow(/unknown|phasePolicy/i);
   });
 });

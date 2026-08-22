@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
+import { join } from "node:path";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { presetsRoutes } from "./presets.routes";
 import { AGENT_RUNTIME_HOST_LIMITS } from "../services/agent-runtime-limits";
 
-function initPresetsTestDb(): void {
+async function initPresetsTestDb(): Promise<void> {
   closeDatabase();
   initDatabase(":memory:");
   getDb().run(`CREATE TABLE presets (
@@ -21,6 +22,9 @@ function initPresetsTestDb(): void {
     engine TEXT NOT NULL DEFAULT 'classic',
     cache_revision INTEGER NOT NULL DEFAULT 0
   )`);
+  getDb().run(`CREATE TABLE "user" (
+    id TEXT PRIMARY KEY
+  )`);
   getDb().run(`CREATE TABLE connection_profiles (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -35,6 +39,8 @@ function initPresetsTestDb(): void {
     created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0
   )`);
+  getDb().run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "117_agent_runtime_repair_acknowledgements.sql")).text());
+  getDb().query('INSERT INTO "user" (id) VALUES (?)').run("u1");
 }
 
 function insertPreset(id: string, userId: string, cacheRevision = 0): void {
@@ -274,5 +280,90 @@ describe("agent runtime host limits", () => {
       expect(typeof value).toBe("number");
       expect(Number.isSafeInteger(value)).toBe(true);
     }
+  });
+});
+describe("preset runtime repair acknowledgement", () => {
+  test("persists an acknowledgement with a preset revision fence and keeps it idempotent", async () => {
+    insertPreset("preset-ack", "u1", 5);
+
+    const first = await app.request("http://localhost/preset-ack/agent-runtime/repair-acknowledgement", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedPresetRevision: 5,
+        reasonCode: "loom_policy_repair_required",
+      }),
+    });
+
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+    expect(firstBody).toMatchObject({
+      presetId: "preset-ack",
+      presetRevision: 5,
+      reasonCode: "loom_policy_repair_required",
+      revision: 1,
+      scope: "repair/review",
+      state: "acknowledged",
+    });
+    expect(typeof firstBody.acknowledgedAt).toBe("number");
+
+    const repeated = await app.request("http://localhost/preset-ack/agent-runtime/repair-acknowledgement", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedPresetRevision: "5",
+        reasonCode: "loom_policy_repair_required",
+      }),
+    });
+    expect(repeated.status).toBe(200);
+    expect(await repeated.json()).toMatchObject({
+      presetId: "preset-ack",
+      presetRevision: 5,
+      reasonCode: "loom_policy_repair_required",
+      revision: 1,
+      scope: "repair/review",
+      state: "acknowledged",
+    });
+
+    const persisted = getDb().query(
+      "SELECT preset_revision, reason_code, revision FROM agent_runtime_repair_acknowledgements WHERE user_id = ? AND preset_id = ?",
+    ).get("u1", "preset-ack");
+    expect(persisted).toEqual({
+      preset_revision: "5",
+      reason_code: "loom_policy_repair_required",
+      revision: 1,
+    });
+  });
+
+  test("rejects stale or open acknowledgement requests without creating an acknowledgement", async () => {
+    insertPreset("preset-ack", "u1", 5);
+
+    const stale = await app.request("http://localhost/preset-ack/agent-runtime/repair-acknowledgement", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedPresetRevision: 4,
+        reasonCode: "loom_policy_repair_required",
+      }),
+    });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ code: "PRESET_REVISION_CONFLICT" });
+
+    const open = await app.request("http://localhost/preset-ack/agent-runtime/repair-acknowledgement", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedPresetRevision: 5,
+        reasonCode: "loom_policy_repair_required",
+        extra: true,
+      }),
+    });
+    expect(open.status).toBe(400);
+    expect(await open.json()).toMatchObject({ code: "INVALID_REQUEST" });
+
+    const count = getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_runtime_repair_acknowledgements",
+    ).get() as { count: number };
+    expect(count.count).toBe(0);
   });
 });

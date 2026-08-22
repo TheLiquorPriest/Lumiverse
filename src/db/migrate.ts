@@ -448,10 +448,10 @@ function repairDreamWeaverBaselineDrift(db: Database): void {
 }
 
 // The shipped baseline.sql was regenerated from a DB that already had
-// migrations 072, 075, and 076 applied, so their schema changes are
-// present after baseline bootstrap. Returns true when the migration's
-// effect is already in place and the runner should record it as applied
-// without re-running.
+// migrations 072, 075, and 076 applied, and includes the persistent workspace
+// session revision introduced by migration 115. Returns true when the
+// migration's effect is already in place and the runner should record it as
+// applied without re-running.
 function isBaselineDriftAlreadyApplied(db: Database, file: string): boolean {
   if (file === "072_world_books_folder.sql") {
     const columns = db.query("PRAGMA table_info('world_books')").all() as Array<{ name: string }>;
@@ -469,6 +469,10 @@ function isBaselineDriftAlreadyApplied(db: Database, file: string): boolean {
     const columns = db.query("PRAGMA table_info('chats')").all() as Array<{ name: string; notnull: number }>;
     const characterId = columns.find((column) => column.name === "character_id");
     return !!characterId && characterId.notnull === 0;
+  }
+  if (file === "118_persistent_workspace_session_revision.sql") {
+    const columns = db.query("PRAGMA table_info('persistent_workspace_turn_sessions')").all() as Array<{ name: string }>;
+    return columns.some((column) => column.name === "revision");
   }
   return false;
 }

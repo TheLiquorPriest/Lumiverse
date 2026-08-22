@@ -14,10 +14,11 @@ export interface UseAgentRunStopOptions {
   terminal?: boolean
   onBeforeStop?: () => void
   onResult?: (result: AgentRunStopResultV2) => void
+  onSettled?: () => void
 }
 
 export function useAgentRunStop(options: UseAgentRunStopOptions) {
-  const { turnId, chatId, generationId, terminal = false, onBeforeStop, onResult } = options
+  const { turnId, chatId, generationId, terminal = false, onBeforeStop, onResult, onSettled } = options
   const [state, setState] = useState<AgentRunStopState>(terminal ? 'terminal' : 'idle')
   const pendingRef = useRef(false)
 
@@ -30,19 +31,21 @@ export function useAgentRunStop(options: UseAgentRunStopOptions) {
     if (pendingRef.current || state === 'stopping' || state === 'too_late' || state === 'terminal') return
     pendingRef.current = true
     setState('stopping')
+    onBeforeStop?.()
     try {
       const result = await agentRunsApi.stop(turnId, { chatId, generationId })
       if (result.turnId !== turnId) {
         throw new Error('agent_run_stop_target_mismatch')
       }
       setState(result.status === 'accepted' ? 'stopping' : result.status)
-      if (result.status === 'accepted') onBeforeStop?.()
       onResult?.(result)
     } catch {
       setState('error')
       pendingRef.current = false
+    } finally {
+      onSettled?.()
     }
-  }, [chatId, generationId, onBeforeStop, onResult, state, turnId])
+  }, [chatId, generationId, onBeforeStop, onResult, onSettled, state, turnId])
 
   return {
     state,

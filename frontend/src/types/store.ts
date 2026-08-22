@@ -1,10 +1,23 @@
 import type { Message, Character, Persona, Preset, ConnectionProfile, ProviderInfo, RecentChat, GroupedRecentChat, PaginatedResult, Pack, PackWithItems, LumiaItem, LoomItem, ImageGenConnectionProfile, ImageGenProviderInfo } from './api'
 import type { WeaverSession, WeaverStage, WeaverExtraction, WeaverSpineSlot, WeaverSynthesisGroup, WeaverBookRole, WeaverBuildType, WeaverNarrationMode, WeaverPersonaRegister, WeaverPersonaPlan, PersonaDraft, CreateWeaverSessionInput, WeaverCommittedFact, WeaverGap, WeaverInterviewQuestion, WeaverInterviewState, WeaverResponseKind, WeaverCandidate, WeaverBible, UpdateWeaverBibleInput, WeaverFieldDef, WeaverField, WeaverFinalizeResult, WeaverFinalizeInput, WeaverStartChatResult } from '@/api/weaver'
 import type { AgentActivityGeneration } from '@/types/ws-events'
-import type { AgentActivityRunV1, AgentPublicErrorV1 } from '@/types/agent-runtime'
+import type { AgentActivityRunV1, AgentPublicErrorV1, LoomPromptInspectionV1 } from '@/types/agent-runtime'
 import type {
+  AgentPersistentWorkspaceArtifactV1,
+  AgentPersistentWorkspaceRecordV1,
+  AgentPersistentWorkspacePublicationV1,
+  AgentPersistentWorkspaceSubmissionV1,
+  AgentPersistentWorkspaceTaskV1,
+  AgentPersistentWorkspaceTurnSessionV1,
+  AgentPersistentWorkspaceStateV1,
+  AgentPersistentWorkspaceV1,
+  AgentRunInspectionListV1,
+  AgentRunInspectionRetryResponseV1,
+  AgentRunInspectionStateV1,
+  AgentRunPublicErrorV2,
   AgentRunPublicV2,
   AgentRunSyncStatus,
+  AgentRuntimeSettingsProjectionV1,
   AgentWorkspaceSectionV2,
   AgentWorkspaceViewStateV2,
 } from './agent-runs'
@@ -132,10 +145,38 @@ export interface ChatSlice {
   messageSelectMode: boolean
   selectedMessageIds: string[]
   setMessageSelectMode: (enabled: boolean) => void
+
   toggleMessageSelect: (id: string) => void
   selectAllMessages: () => void
   clearMessageSelection: () => void
   selectMessageRange: (fromId: string, toId: string) => void
+}
+export interface AgentRunInspectionListStateV1 {
+  status: 'idle' | 'loading' | 'ready' | 'error'
+  list: AgentRunInspectionListV1 | null
+  error: AgentRunPublicErrorV2 | null
+}
+export type AgentPersistentWorkspaceCollectionV1 = 'sessions' | 'tasks' | 'records' | 'artifacts' | 'submissions' | 'publications'
+
+export interface AgentPersistentWorkspaceCollectionStateV1<T> {
+  status: 'idle' | 'loading' | 'ready' | 'error'
+  items: T[]
+  error: string | null
+}
+
+export interface AgentPersistentWorkspaceCollectionsStateV1 {
+  sessions: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceTurnSessionV1>
+  tasks: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceTaskV1>
+  records: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceRecordV1>
+  artifacts: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceArtifactV1>
+  submissions: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceSubmissionV1>
+  publications: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspacePublicationV1>
+}
+
+export interface AgentRunRetryStateV1 {
+  status: 'idle' | 'submitting' | 'accepted' | 'refused' | 'error'
+  response: AgentRunInspectionRetryResponseV1 | null
+  error: AgentRunPublicErrorV2 | null
 }
 
 // ---- Agent Run Projection Slice ----
@@ -143,19 +184,23 @@ export interface AgentRunsSlice {
   agentRunProvisionalByKey: Record<string, AgentRunPublicV2>
   agentRunTerminalByTarget: Record<string, AgentRunPublicV2>
   agentRunCursorByChat: Record<string, string>
-  /** Highest public event sequence observed, including live websocket events. */
   agentRunLastSequenceByChat: Record<string, number>
-  /** Sequence consumed by the opaque cursor; it may lag the public watermark while a request is in flight. */
   agentRunCursorSequenceByChat: Record<string, number>
-  /** Current bounded full-resync page offset, when pagination is incomplete. */
   agentRunResyncOffsetByChat: Record<string, number>
   agentRunSyncByChat: Record<string, AgentRunSyncStatus>
   agentRunOmittedEventsByChat: Record<string, number>
   agentRunRequestEpochByChat: Record<string, number>
-  /** View-only workspace projections stay keyed by turn, independent of run revisions. */
+  agentRunInspectionByAttemptId: Record<string, AgentRunInspectionStateV1>
+  agentRunInspectionListByChat: Record<string, AgentRunInspectionListStateV1>
+  agentRunInspectionRequestEpochByKey: Record<string, number>
+  agentRunRetryByAttemptId: Record<string, AgentRunRetryStateV1>
   agentWorkspaceByTurn: Record<string, AgentWorkspaceViewStateV2>
-  /** Each workspace index/section request has its own monotonic stale-response epoch. */
   agentWorkspaceRequestEpochByKey: Record<string, number>
+  agentPersistentWorkspaceByChat: Record<string, AgentPersistentWorkspaceStateV1>
+  agentPersistentWorkspaceById: Record<string, AgentPersistentWorkspaceStateV1>
+  agentPersistentWorkspaceRequestEpochByKey: Record<string, number>
+  agentPersistentWorkspaceCollectionsById: Record<string, AgentPersistentWorkspaceCollectionsStateV1>
+  agentRuntimeSettingsByChat: Record<string, AgentRuntimeSettingsProjectionV1>
   beginAgentRunRestore: (chatId: string) => number
   applyAgentRunChanges: (chatId: string, requestEpoch: number, payload: unknown) => boolean
   failAgentRunRestore: (chatId: string, requestEpoch: number) => void
@@ -163,17 +208,24 @@ export interface AgentRunsSlice {
   reconcileExactAgentRun: (chatId: string, payload: unknown) => boolean
   markAgentRunsStale: (chatId?: string) => void
   clearAgentRunsForChat: (chatId: string) => void
-  beginAgentWorkspaceRequest: (
+  beginAgentRunInspection: (chatId: string, attemptId: string) => number
+  applyAgentRunInspection: (chatId: string, attemptId: string, requestEpoch: number, payload: unknown) => boolean
+  failAgentRunInspection: (
     chatId: string,
-    turnId: string,
-    section?: AgentWorkspaceSectionV2,
-  ) => number
-  applyAgentWorkspaceIndex: (
-    chatId: string,
-    turnId: string,
+    attemptId: string,
     requestEpoch: number,
-    payload: unknown,
-  ) => boolean
+    availability: 'missing' | 'deleted' | 'unavailable' | 'stale',
+    error: AgentRunPublicErrorV2 | null,
+  ) => void
+  clearAgentRunInspection: (attemptId: string) => void
+  beginAgentRunInspectionList: (chatId: string) => number
+  applyAgentRunInspectionList: (chatId: string, requestEpoch: number, payload: unknown) => boolean
+  failAgentRunInspectionList: (chatId: string, requestEpoch: number, error: AgentRunPublicErrorV2 | null) => void
+  beginAgentRunRetry: (attemptId: string) => void
+  applyAgentRunRetry: (attemptId: string, payload: unknown) => boolean
+  failAgentRunRetry: (attemptId: string, error: AgentRunPublicErrorV2 | null) => void
+  beginAgentWorkspaceRequest: (chatId: string, turnId: string, section?: AgentWorkspaceSectionV2) => number
+  applyAgentWorkspaceIndex: (chatId: string, turnId: string, requestEpoch: number, payload: unknown) => boolean
   applyAgentWorkspaceSection: (
     chatId: string,
     turnId: string,
@@ -182,12 +234,30 @@ export interface AgentRunsSlice {
     payload: unknown,
     append: boolean,
   ) => boolean
-  failAgentWorkspaceRequest: (
-    chatId: string,
-    turnId: string,
+  failAgentWorkspaceRequest: (chatId: string, turnId: string, requestEpoch: number, section?: AgentWorkspaceSectionV2) => void
+  beginPersistentWorkspaceRequest: (scope: string) => number
+  applyPersistentWorkspace: (scope: string, requestEpoch: number, payload: unknown) => boolean
+  failPersistentWorkspaceRequest: (
+    scope: string,
     requestEpoch: number,
-    section?: AgentWorkspaceSectionV2,
+    availability: 'missing' | 'deleted' | 'unavailable' | 'detached',
+    error: string | null,
   ) => void
+  beginPersistentWorkspaceCollection: (workspaceId: string, collection: AgentPersistentWorkspaceCollectionV1) => number
+  applyPersistentWorkspaceCollection: (
+    workspaceId: string,
+    collection: AgentPersistentWorkspaceCollectionV1,
+    requestEpoch: number,
+    payload: unknown,
+  ) => boolean
+  failPersistentWorkspaceCollection: (
+    workspaceId: string,
+    collection: AgentPersistentWorkspaceCollectionV1,
+    requestEpoch: number,
+    error: string | null,
+  ) => void
+  setAgentRuntimeSettings: (chatId: string, projection: AgentRuntimeSettingsProjectionV1) => void
+  clearAgentRuntimeSettings: (chatId: string) => void
 }
 
 // ---- Characters Slice ----
@@ -1608,6 +1678,8 @@ export interface BreakdownCacheEntry {
   maxContext: number
   model: string
   provider: string
+  assemblySurface?: 'RESPONSE' | 'WORK'
+  loomPromptInspection?: LoomPromptInspectionV1
   parameters?: Record<string, unknown>
   usage?: {
     prompt_tokens: number

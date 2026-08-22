@@ -102,6 +102,31 @@ describe("isolate process supervision", () => {
     await expect(transport.terminate("SIGKILL")).rejects.toThrow(/termination failed/);
     exit.resolve(137);
   });
+  test("does not duplicate a large frame when Bun reports a partial immediate flush", async () => {
+    const transport = createLengthPrefixedSubprocessTransport({
+      command: defaultIsolateCommand(new URL("./regex-isolate-subprocess.ts", import.meta.url)),
+      maxFrameBytes: 8 * 1024 * 1024,
+    });
+    try {
+      const requestId = "large-frame-request";
+      const response = receiveIsolateMessage(transport);
+      await transport.send(makeRequestEnvelopeV1(requestId, "replace", {
+        op: "replace",
+        pattern: "x",
+        flags: "g",
+        input: "x".repeat(2_000_000),
+        replacement: "y",
+        limits: { maxInputBytes: 1 },
+      }));
+      expect(await response).toMatchObject({
+        type: "error",
+        requestId,
+        code: "invalid_input",
+      });
+    } finally {
+      await transport.terminate("SIGKILL");
+    }
+  });
   test("regex subprocess uses the framed protocol and preserves request identity/error codes", async () => {
     const entrypoint = resolveIsolateEntrypoint(new URL("./regex-isolate-subprocess.ts", import.meta.url));
     expect(await Bun.file(entrypoint).exists()).toBe(true);

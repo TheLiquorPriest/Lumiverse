@@ -96,33 +96,33 @@ app.put("/:id/agent-mode", async (c) => {
   const chatId = c.req.param("id");
   try {
     const body = await c.req.json();
-    if (!body || typeof body !== "object" || Array.isArray(body) || !Object.hasOwn(body, "mode")) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return c.json({ error: "Request body must be an object", code: "INVALID_REQUEST" }, 400);
+    }
+    const keys = Object.keys(body);
+    if (keys.some((key) => key !== "mode" && key !== "expectedRevision")) {
+      return c.json({ error: "Only mode and expectedRevision are allowed", code: "INVALID_REQUEST" }, 400);
+    }
+    if (!Object.hasOwn(body, "mode")) {
       return c.json({ error: "mode is required", code: "INVALID_REQUEST" }, 400);
     }
-    const mode = body.mode === null ? null : body.mode;
-    if (mode !== null && mode !== "response" && mode !== "agentic") {
-      return c.json({ error: "mode must be 'response', 'agentic', or null", code: "INVALID_REQUEST" }, 400);
+    if (body.mode !== "response" && body.mode !== "agentic") {
+      return c.json({ error: "mode must be 'response' or 'agentic'", code: "INVALID_REQUEST" }, 400);
     }
-    const hasExpectedRevision = Object.hasOwn(body, "expectedRevision") || Object.hasOwn(body, "expected_revision");
-    if (!hasExpectedRevision) {
+    if (!Object.hasOwn(body, "expectedRevision")) {
       return c.json({ error: "expectedRevision is required (use 0 for the first write)", code: "AGENT_CHAT_MODE_REVISION_REQUIRED" }, 428);
     }
-    if (Object.hasOwn(body, "expectedRevision") && Object.hasOwn(body, "expected_revision") && body.expectedRevision !== body.expected_revision) {
-      return c.json({ error: "expectedRevision aliases conflict", code: "INVALID_REQUEST" }, 400);
-    }
-    const expectedRevision = Object.hasOwn(body, "expectedRevision") ? body.expectedRevision : body.expected_revision;
+    const expectedRevision = body.expectedRevision;
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
       return c.json({ error: "expectedRevision must be a non-negative integer", code: "INVALID_REQUEST" }, 400);
     }
     const updated = AGENT_RUNTIME_DECISION_SERVICE.setChatAgentModeOverride(
       userId,
       chatId,
-      mode,
+      body.mode,
       expectedRevision,
     );
-    if (updated === null) {
-      return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
-    }
+    if (updated === null) return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
     return c.json(updated);
   } catch (error) {
     if (error instanceof SyntaxError) {
@@ -130,7 +130,55 @@ app.put("/:id/agent-mode", async (c) => {
     }
     if (error instanceof RuntimeDecisionError) {
       if (error.code === "not_found") return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
-      return c.json({ error: error.message, code: error.code.toUpperCase() }, error.status as 400 | 404 | 409 | 503);
+      const code = error.code === "chat_mode_revision_conflict"
+        ? "AGENT_CHAT_MODE_REVISION_CONFLICT"
+        : error.code.toUpperCase();
+      return c.json({
+        error: error.message,
+        code,
+        ...(error.details ?? {}),
+      }, error.status as 400 | 404 | 409 | 503);
+    }
+    return c.json({ error: "Chat agent mode unavailable", code: "AGENT_MODE_UNAVAILABLE" }, 503);
+  }
+});
+
+app.delete("/:id/agent-mode", async (c) => {
+  const userId = c.get("userId");
+  const chatId = c.req.param("id");
+  try {
+    const body = await c.req.json();
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return c.json({ error: "Request body must be an object", code: "INVALID_REQUEST" }, 400);
+    }
+    const keys = Object.keys(body);
+    if (keys.some((key) => key !== "expectedRevision")) {
+      return c.json({ error: "Only expectedRevision is allowed", code: "INVALID_REQUEST" }, 400);
+    }
+    if (!Object.hasOwn(body, "expectedRevision")) {
+      return c.json({ error: "expectedRevision is required", code: "AGENT_CHAT_MODE_REVISION_REQUIRED" }, 428);
+    }
+    const expectedRevision = body.expectedRevision;
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+      return c.json({ error: "expectedRevision must be a non-negative integer", code: "INVALID_REQUEST" }, 400);
+    }
+    const updated = AGENT_RUNTIME_DECISION_SERVICE.resetChatAgentModeOverride(userId, chatId, expectedRevision);
+    if (updated === null) return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
+    return c.json(updated);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return c.json({ error: "Invalid JSON body", code: "INVALID_REQUEST" }, 400);
+    }
+    if (error instanceof RuntimeDecisionError) {
+      if (error.code === "not_found") return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
+      const code = error.code === "chat_mode_revision_conflict"
+        ? "AGENT_CHAT_MODE_REVISION_CONFLICT"
+        : error.code.toUpperCase();
+      return c.json({
+        error: error.message,
+        code,
+        ...(error.details ?? {}),
+      }, error.status as 400 | 404 | 409 | 503);
     }
     return c.json({ error: "Chat agent mode unavailable", code: "AGENT_MODE_UNAVAILABLE" }, 503);
   }

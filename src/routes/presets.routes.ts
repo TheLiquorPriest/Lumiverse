@@ -7,6 +7,10 @@ import { AgentConfigValidationError } from "../types/agents";
 import { parsePagination } from "../services/pagination";
 import { REVALIDATE_PRIVATE, ifNoneMatchSatisfies } from "../utils/http-cache";
 import { getAgentRuntimeHostLimits } from "../services/agent-runtime-limits";
+import {
+  acknowledgeRuntimeRepair,
+  RuntimeDecisionError,
+} from "../services/agent-runtime-decision.service";
 import { duplicatePresetWithAgentConfig, encodePortableAgentConfig, getAgentRuntimeSharedDraft, getPortablePresetRuntimeEnvelope, getPresetAgentConfig, importPortablePreset, importPortablePresetRuntime, parsePortablePresetRuntimeImportRequest, saveAgentRuntimeSharedDraft } from "../services/agent-config-portability.service";
 
 const app = new Hono();
@@ -110,6 +114,60 @@ app.put("/:id/agent-config", async (c) => {
     const message = error?.message || "Invalid agent runtime draft";
     const code = message === "PRESET_REVISION_CONFLICT" || message === "AGENT_CONFIG_REVISION_CONFLICT" ? message : message === "PRESET_REVISION_REQUIRED" || message === "AGENT_CONFIG_REVISION_REQUIRED" ? message : "AGENT_CONFIG_INVALID";
     return c.json({ error: message, code }, code.endsWith("CONFLICT") ? 409 : code === "PRESET_REVISION_REQUIRED" || code === "AGENT_CONFIG_REVISION_REQUIRED" ? 428 : 400);
+  }
+});
+
+app.post("/:id/agent-runtime/repair-acknowledgement", async (c) => {
+  const userId = c.get("userId");
+  const presetId = c.req.param("id");
+  try {
+    const body = await c.req.json();
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return c.json({ error: "Request body must be an object", code: "INVALID_REQUEST" }, 400);
+    }
+    const keys = Object.keys(body);
+    if (keys.some((key) => key !== "expectedPresetRevision" && key !== "reasonCode")) {
+      return c.json({ error: "Only expectedPresetRevision and reasonCode are allowed", code: "INVALID_REQUEST" }, 400);
+    }
+    if (!Object.hasOwn(body, "expectedPresetRevision")) {
+      return c.json({ error: "expectedPresetRevision is required", code: "PRESET_REVISION_REQUIRED" }, 428);
+    }
+    if (!Object.hasOwn(body, "reasonCode")) {
+      return c.json({ error: "reasonCode is required", code: "INVALID_REQUEST" }, 400);
+    }
+    const expectedPresetRevision = body.expectedPresetRevision;
+    if (!(
+      (typeof expectedPresetRevision === "number" && Number.isSafeInteger(expectedPresetRevision) && expectedPresetRevision >= 0)
+      || (typeof expectedPresetRevision === "string" && expectedPresetRevision.length > 0 && expectedPresetRevision.length <= 512)
+    )) {
+      return c.json({ error: "expectedPresetRevision must be a revision", code: "INVALID_REQUEST" }, 400);
+    }
+    if (typeof body.reasonCode !== "string" || body.reasonCode.trim().length === 0 || body.reasonCode.length > 512) {
+      return c.json({ error: "reasonCode must be a bounded string", code: "INVALID_REQUEST" }, 400);
+    }
+    const acknowledgement = acknowledgeRuntimeRepair(
+      userId,
+      presetId,
+      expectedPresetRevision,
+      body.reasonCode,
+    );
+    return c.json(acknowledgement);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return c.json({ error: "Invalid JSON body", code: "INVALID_REQUEST" }, 400);
+    }
+    if (error instanceof RuntimeDecisionError) {
+      if (error.code === "not_found") return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
+      if (error.code === "decision_refresh_required") {
+        return c.json({
+          error: error.message,
+          code: "PRESET_REVISION_CONFLICT",
+          ...(error.details ?? {}),
+        }, 409);
+      }
+      return c.json({ error: error.message, code: error.code.toUpperCase() }, error.status as 400 | 404 | 409 | 428 | 503);
+    }
+    return c.json({ error: "Repair acknowledgement unavailable", code: "RUNTIME_REPAIR_ACKNOWLEDGEMENT_UNAVAILABLE" }, 503);
   }
 });
 

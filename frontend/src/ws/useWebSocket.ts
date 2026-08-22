@@ -15,6 +15,7 @@ import { multiplayerApi } from '@/api/multiplayer'
 import { imageGenApi } from '@/api/image-gen'
 import { generateApi } from '@/api/generate'
 import { operatorApi } from '@/api/operator'
+import { agentRunsApi } from '@/api/agent-runs'
 import { presetsApi } from '@/api/presets'
 import { toast } from '@/lib/toast'
 import i18n from '@/i18n'
@@ -70,7 +71,7 @@ import type {
   RoomPresencePayload,
   SystemSmartAlertPayload,
 } from '@/types/ws-events'
-import type { AgentRunChangedEventV2 } from '@/types/agent-runs'
+import type { AgentRunChangeEventV2 } from '@/types/agent-runs'
 import type { ConnectionProfile, Message } from '@/types/api'
 import type { ChatHeadStatus, ChatSlice, GroupChatSlice } from '@/types/store'
 import type { RoomStateView } from '@/types/multiplayer'
@@ -942,10 +943,10 @@ export function useWebSocket() {
       wsClient.on(EventType.GENERATION_AGENT_ACTIVITY, (payload: AgentActivityPayload) => {
         store.getState().reconcileAgentActivity(payload)
       }),
-      wsClient.on(EventType.AGENT_RUN_CHANGED, (payload: AgentRunChangedEventV2) => {
+      wsClient.on(EventType.AGENT_RUN_CHANGED, (payload: AgentRunChangeEventV2) => {
         const result = store.getState().reconcileAgentRunEvent(payload)
         if (result === 'gap') {
-          void recoverAgentRuns(payload.chatId)
+          void recoverAgentRuns(payload.chatId, agentRunsApi, store)
         }
       }),
 
@@ -1525,7 +1526,7 @@ export function useWebSocket() {
         if (activeChatId) {
           recoverPooledGeneration(activeChatId).catch(() => { /* best-effort */ })
           recoverAgentActivityRuns(activeChatId).catch(() => { /* best-effort */ })
-          recoverAgentRuns(activeChatId).catch(() => { /* status-only recovery is best-effort */ })
+          recoverAgentRuns(activeChatId, agentRunsApi, store).catch(() => { /* status-only recovery is best-effort */ })
         }
         store.getState().reconcileChatHeads().catch(() => { /* best-effort */ })
       }),

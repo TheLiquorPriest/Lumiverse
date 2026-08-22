@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { AgentInspectionWriterV1 } from "./agent-activity-runs.service";
 import type { WorkspaceContextProjectionV1 } from "./workspace-context-projection.service";
 import type {
   AssemblyChildDescriptorV1,
@@ -8,12 +9,33 @@ import type {
   PreparationLimitsV1,
 } from "../types/agent-preprocessing";
 import { lowerPreparationLimitsV1 } from "../types/agent-preprocessing";
+import {
+  AGENT_SYSTEM_PROMPT_MAX_BYTES,
+  CORE_AGENT_TOOL_IDS,
+} from "../types/agents";
 import type {
+  AgentRuntimePhaseCapabilityV1,
   AgentToolSnapshot,
   CoreAgentToolId,
 } from "../types/agents";
-import type { AgentToolExecutionContext } from "./agent-tools.service";
-import { AGENT_SYSTEM_PROMPT_MAX_BYTES, CORE_AGENT_TOOL_IDS } from "../types/agents";
+import type {
+  CognitionEvaluationContextV1,
+  CognitionTaskTransition,
+  LoomPromptInspectionBlockV1,
+} from "../types/agent-cognition";
+import { LOOM_POLICY_BUCKETS } from "../types/agent-cognition";
+import {
+  createAgentRuntimePhaseMachine,
+  type AgentRuntimePhaseCompileResultV1,
+  type AgentRuntimePhaseInspectionEvidenceV1,
+  type AgentRuntimePhaseCheckpointInputV1,
+  type CompiledAgentRuntimePhaseV1,
+} from "./agentic-phase-runtime.service";
+import {
+  parseCognitionEvaluationContext,
+  parseLoomPolicyBuckets,
+  parseLoomPromptInspectionV1,
+} from "./agent-cognition.service";
 import {
   evaluateOutputTokens,
   measureJsonValue,
@@ -46,12 +68,20 @@ import type {
 import {
   executeCoreAgentTool,
   getCoreAgentToolDefinitions,
+  type AgentToolExecutionContext,
 } from "./agent-tools.service";
 import {
   AssemblyPlanValidationError,
+  selectEffectiveLoomPolicyMessagesV1,
   validateAssemblyPlanV1 as validateCompilerAssemblyPlanV1,
   type AssemblyPlanV1 as CompilerAssemblyPlanV1,
+  type AssemblyProviderMessageV1 as CompilerAssemblyProviderMessageV1,
 } from "./agentic-assembly-compiler";
+import { WORK_CORTEX_MAX_RESULT_BYTES, type CortexSidecarAcceptedV1 } from "./work-cortex-sidecar.service";
+import type {
+  AgenticWorkCouncilCapability,
+  WorkCouncilExecutionResult,
+} from "./work-council.service";
 
 /** The closed host-owned tool set exposed during Agentic WORK. */
 export const AGENTIC_WORK_TOOL_NAMES = Object.freeze([
@@ -69,7 +99,6 @@ export const AGENTIC_WORK_TOOL_NAMES = Object.freeze([
   "workspace_propose_publication",
   "context_pack_list",
   "context_pack_get",
-  "agent_delegate",
   ...CORE_AGENT_TOOL_IDS,
 ] as const);
 
@@ -113,6 +142,7 @@ export type AgenticWorkErrorCode =
   | "context_budget_exhausted"
   | "tool_result_limit_exceeded"
   | "child_required_failed"
+  | "council_required_failed"
   | "child_output_limit_exceeded"
   | "child_schedule_invalid"
   | "child_executor_unavailable"
@@ -165,6 +195,8 @@ const MAX_WORK_NOTE_BYTES = 256 * 1024;
 const MAX_ROOT_ROUNDS = 256;
 const MAX_ROOT_TOOL_CALLS = 1_024;
 const MAX_ROOT_WORKSPACE_OPS = 512;
+const HOST_CORTEX_CONTEXT_PREFIX = "Host Cortex sidecar context (non-canonical;";
+const HOST_CORTEX_CONTEXT_NAME_PREFIX = "__lumiverse_host_cortex_sidecar_v1:";
 const MAX_ROOT_CONTEXT_OPS = 256;
 const MAX_ROOT_COMPLETION_ATTEMPTS = 32;
 const MAX_ROOT_UNSIGNED_BOUNDARIES = 32;
@@ -183,6 +215,7 @@ const CONTEXT_PACK_GET_TOOL = "context_pack_get" as const;
 
 const CORE_TOOL_SET = new Set<string>(CORE_AGENT_TOOL_IDS);
 const WORK_TOOL_SET = new Set<string>(AGENTIC_WORK_TOOL_NAMES);
+const WORK_DISPATCH_TOOL_SET = new Set<string>([...AGENTIC_WORK_TOOL_NAMES, AGENT_DELEGATE_TOOL]);
 
 const WORKSPACE_TOOL_BY_OPERATION: Readonly<Record<WorkspaceOperationKindV1, AgenticWorkWorkspaceToolName>> = Object.freeze({
   read_section: "workspace_read_section",
@@ -312,6 +345,10 @@ const CHILD_ASSIGNED_OPERATIONS: readonly WorkspaceOperationKindV1[] = Object.fr
   "update_assigned_progress",
   "submit_child_result",
 ]);
+const CHILD_ONLY_OPERATIONS: readonly WorkspaceOperationKindV1[] = Object.freeze([
+  "update_assigned_progress",
+  "submit_child_result",
+]);
 
 export interface AgenticWorkFrame {
   readonly kind: "root" | "child";
@@ -398,6 +435,39 @@ function snapshotDelegatableProfiles(
   return Object.freeze(snapshot);
 }
 
+function resolveDelegatableProfile(
+  profiles: readonly AgenticDelegatableProfile[],
+  profileId: string,
+): AgenticDelegatableProfile | undefined {
+  const exact = profiles.find((profile) => profile.profileId === profileId);
+  if (exact) return exact;
+  const folded = profileId.toLowerCase();
+  let match: AgenticDelegatableProfile | undefined;
+  for (const profile of profiles) {
+    if (profile.profileId.toLowerCase() !== folded) continue;
+    if (match) return undefined;
+    match = profile;
+  }
+  return match;
+}
+
+function canonicalizeDelegateProfileIds(
+  calls: readonly ToolCallResult[],
+  profiles: readonly AgenticDelegatableProfile[],
+): readonly ToolCallResult[] {
+  let canonicalized: ToolCallResult[] | undefined;
+  for (let index = 0; index < calls.length; index += 1) {
+    const call = calls[index]!;
+    if (call.name !== AGENT_DELEGATE_TOOL || !isRecord(call.args)) continue;
+    const supplied = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
+    const profile = resolveDelegatableProfile(profiles, supplied);
+    if (!profile || profile.profileId === supplied) continue;
+    canonicalized ??= [...calls];
+    canonicalized[index] = { ...call, args: { ...call.args, profile_id: profile.profileId } };
+  }
+  return canonicalized ?? calls;
+}
+
 function normalizedWorkspaceCapabilities(
   capabilities: WorkspaceOperationCapabilitiesV1 | readonly WorkspaceOperationKindV1[] | undefined,
 ): ReadonlySet<WorkspaceOperationKindV1> {
@@ -476,7 +546,10 @@ export function createAgenticRootFrame(options: AgenticRootFrameOptions): Agenti
     throw new AgenticWorkPhaseError("invalid_input", "Invalid workspace sharing policy", "workspaceSharing");
   }
   const coreToolIds = validCoreToolIds(options.coreToolIds);
-  const workspaceCapabilities = normalizedWorkspaceCapabilities(options.workspaceCapabilities);
+  const workspaceCapabilities = new Set(
+    [...normalizedWorkspaceCapabilities(options.workspaceCapabilities)]
+      .filter((operation) => !CHILD_ONLY_OPERATIONS.includes(operation)),
+  );
   const contextTools = [...new Set(options.contextTools ?? [])];
   for (const name of contextTools) {
     if (name !== CONTEXT_PACK_LIST_TOOL && name !== CONTEXT_PACK_GET_TOOL) {
@@ -566,16 +639,23 @@ const BOUNDED_STRING = { type: "string", minLength: 1, maxLength: 16_384 };
 
 const COMPLETE_TURN_DEFINITION: ToolDefinition = Object.freeze({
   name: COMPLETE_TURN_TOOL,
-  description: "Host-owned WORK boundary. Submit a bounded summary and unresolved item IDs.",
+  description: "Host-owned WORK boundary. Submit private completion evidence and unresolved item IDs; optionally guide the final RESPONSE.",
   strict: true,
   parameters: schema({
-    summary: BOUNDED_STRING,
+    summary: {
+      ...BOUNDED_STRING,
+      description: "Private host completion evidence. This text is not shown to the user and does not shape the final RESPONSE.",
+    },
     unresolvedIds: {
       type: "array",
       maxItems: MAX_COMPLETION_IDS,
       items: { type: "string", minLength: 1, maxLength: MAX_COMPLETION_ID_BYTES },
     },
-    renderGuidance: { type: "string", maxLength: 8_192 },
+    renderGuidance: {
+      type: "string",
+      maxLength: 8_192,
+      description: "Optional instructions for the tools-disabled final RESPONSE. State what user-visible information to communicate without exposing private reasoning, hidden evidence, or tool internals.",
+    },
   }, ["summary", "unresolvedIds"]),
 });
 
@@ -603,29 +683,32 @@ const CONTEXT_DEFINITIONS: Readonly<Record<AgenticWorkContextToolName, ToolDefin
   }),
 });
 
-const DELEGATE_DEFINITION: ToolDefinition = Object.freeze({
-  name: AGENT_DELEGATE_TOOL,
-  description: "Run one bounded assigned child frame with host-selected capabilities.",
-  strict: true,
-  parameters: schema({
-    profile_id: { type: "string", minLength: 1, maxLength: MAX_PROFILE_ID_BYTES },
-    task_id: { type: "string", minLength: 1, maxLength: MAX_PROFILE_ID_BYTES },
-    task: { type: "string", minLength: 1, maxLength: MAX_COMPLETION_SUMMARY_BYTES },
-    tool_ids: {
-      type: "array",
-      maxItems: CORE_AGENT_TOOL_IDS.length,
-      items: { type: "string", minLength: 1, maxLength: 64 },
-    },
-  }, ["profile_id", "task_id", "task"]),
-});
+function delegateDefinition(
+  profiles: readonly AgenticDelegatableProfile[],
+): ToolDefinition {
+  const profileIds = profiles.map((profile) => profile.profileId);
+  return {
+    name: AGENT_DELEGATE_TOOL,
+    description: `Run one bounded assigned child frame. Use one of these exact authorized profile IDs: ${profileIds.join(", ")}.`,
+    strict: true,
+    parameters: schema({
+      profile_id: { type: "string", enum: profileIds },
+      task_id: { type: "string", minLength: 1, maxLength: MAX_PROFILE_ID_BYTES },
+      task: { type: "string", minLength: 1, maxLength: MAX_COMPLETION_SUMMARY_BYTES },
+      tool_ids: {
+        type: "array",
+        maxItems: CORE_AGENT_TOOL_IDS.length,
+        uniqueItems: true,
+        items: { type: "string", enum: [...CORE_AGENT_TOOL_IDS] },
+      },
+    }, ["profile_id", "task_id", "task"]),
+  };
+}
 
 function workspaceDefinition(
   operation: WorkspaceOperationKindV1,
 ): ToolDefinition {
-  const common: Record<string, unknown> = {
-    expectedRevision: { type: "integer", minimum: 0 },
-  };
-  const properties: Record<string, unknown> = { ...common };
+  const properties: Record<string, unknown> = {};
   const required: string[] = [];
   const add = (name: string, definition: unknown, requiredField = false): void => {
     properties[name] = definition;
@@ -648,16 +731,11 @@ function workspaceDefinition(
       add("dependencyIds", { type: "array", maxItems: 64, items: { type: "string", maxLength: 256 } });
       break;
     case "update_assigned_progress":
-      add("taskId", { type: "string", minLength: 1, maxLength: 256 }, true);
-      add("state", { type: "string", enum: ["active", "blocked", "submitted"] }, true);
+      add("state", { type: "string", enum: ["pending", "active", "blocked", "cancelled", "failed"] }, true);
       add("progress", { type: "number", minimum: 0, maximum: 1 });
-      add("summary", { type: ["string", "null"], maxLength: MAX_COMPLETION_SUMMARY_BYTES });
       break;
     case "submit_child_result":
-      add("taskId", { type: "string", minLength: 1, maxLength: 256 }, true);
       add("summary", { type: "string", minLength: 1, maxLength: MAX_COMPLETION_SUMMARY_BYTES }, true);
-      add("resultDigest", { type: "string", minLength: 1, maxLength: 256 }, true);
-      add("byteCount", { type: "integer", minimum: 0, maximum: MAX_SAFE_BYTES });
       break;
     case "accept_submission":
       add("submissionId", { type: "string", minLength: 1, maxLength: 256 }, true);
@@ -667,7 +745,6 @@ function workspaceDefinition(
     case "record_decision":
     case "record_question":
       add("summary", { type: "string", minLength: 1, maxLength: MAX_COMPLETION_SUMMARY_BYTES }, true);
-      add("digest", { type: "string", maxLength: 256 });
       add("taskId", { type: ["string", "null"], maxLength: 256 });
       break;
     case "attach_artifact":
@@ -726,7 +803,7 @@ export function composeAgenticWorkToolDefinitions(
     if (definition) definitions.push(structuredClone(definition));
   }
   const profiles = snapshotDelegatableProfiles(options.delegatableProfiles);
-  if (rootFrame.allowedToolNames.includes(AGENT_DELEGATE_TOOL)) definitions.push(structuredClone(DELEGATE_DEFINITION));
+  if (rootFrame.allowedToolNames.includes(AGENT_DELEGATE_TOOL)) definitions.push(delegateDefinition(profiles));
   definitions.push(...getCoreAgentToolDefinitions(rootFrame.allowedCoreToolIds));
   const childDefinitions = new Map<string, readonly ToolDefinition[]>();
   for (const profile of profiles) {
@@ -859,6 +936,23 @@ export interface AgenticWorkspaceChildAssignmentResult {
   readonly workspaceRevision: number;
   readonly assignments: readonly { readonly taskId: string; readonly frameId: string }[];
 }
+export type AgenticWorkspacePhaseCheckpointV1 = "WORK" | "COMPLETE";
+
+export interface AgenticWorkspacePhaseEvaluationSnapshotV1 {
+  readonly workspaceRevision: number;
+  readonly taskTransitions: Readonly<Record<string, CognitionTaskTransition>>;
+}
+
+export interface AgenticWorkspacePhaseEvaluationSnapshotInputV1 {
+  readonly phase: AgenticWorkspacePhaseCheckpointV1;
+  readonly expectedRevision?: number;
+  readonly signal: AbortSignal;
+}
+
+export type AgenticWorkspacePhaseEvaluationSnapshotProviderV1 = (
+  input: AgenticWorkspacePhaseEvaluationSnapshotInputV1,
+) => AgenticWorkspacePhaseEvaluationSnapshotV1 | Promise<AgenticWorkspacePhaseEvaluationSnapshotV1>;
+
 
 export interface AgenticWorkspaceCapability {
   readonly getCompletionGates?: (
@@ -883,6 +977,8 @@ export interface AgenticWorkspaceCapability {
   readonly listOpenTasks?: (
     context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
   ) => readonly unknown[] | Promise<readonly unknown[]>;
+  /** Read the host-authenticated revision and canonical task transitions for phase predicates. */
+  readonly getPhaseEvaluationSnapshot?: AgenticWorkspacePhaseEvaluationSnapshotProviderV1;
   /** Read the deterministic projection from the exact workspace revision. */
   readonly projectContext?: (
     input: { readonly frame: AgenticWorkFrame; readonly expectedRevision?: number; readonly signal: AbortSignal },
@@ -955,10 +1051,18 @@ export interface AgenticChildExecutionContext {
   readonly workspace?: AgenticWorkspaceCapability;
 }
 
+export interface AgenticWorkUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+}
+
 export interface AgenticChildExecutionResult {
   readonly content?: string;
   readonly status?: "succeeded" | "failed" | "cancelled" | "timed_out";
   readonly errorCode?: string;
+  /** Host-settled provider usage for this child frame. */
+  readonly usage?: AgenticWorkUsage;
   readonly workspaceRevision?: number;
   /** Host-produced cognition requirements from a successful child workspace CAS. */
   readonly contextPackRequirements?: readonly CognitionContextPackRequirementV1[];
@@ -992,6 +1096,14 @@ type AgenticPhasePlan = AssemblyPlanV1 & Readonly<{
   readonly workspaceUsageMessages?: readonly AssemblyProviderMessageV1[];
   readonly completionCriteriaMessages?: readonly AssemblyProviderMessageV1[];
   readonly renderPolicyMessages?: readonly AssemblyProviderMessageV1[];
+  readonly customPhasePlan?: AgentRuntimePhaseCompileResultV1;
+  readonly loomBlocks?: readonly LoomPromptInspectionBlockV1[];
+  readonly sealedLoomPolicyMessages?: Readonly<{
+    readonly workPolicy: readonly CompilerAssemblyProviderMessageV1[];
+    readonly workspaceUsage: readonly CompilerAssemblyProviderMessageV1[];
+    readonly completionCriteria: readonly CompilerAssemblyProviderMessageV1[];
+    readonly renderPolicy: readonly CompilerAssemblyProviderMessageV1[];
+  }>;
 }>;
 
 function isPhaseMessageKey(value: string): value is AgenticPhaseMessageKey {
@@ -1023,11 +1135,22 @@ export interface AgenticWorkOptions {
   readonly executeChild?: AgenticChildExecutor;
   readonly rootFrameId: string;
   readonly rootMessages?: readonly LlmMessage[];
+  /** Optional immutable result from the host-admitted WORK Cortex sidecar. */
+  readonly cortexContext?: CortexSidecarAcceptedV1;
+  /** Separate bounded advisory capability; never part of the WORK catalog. */
+  readonly council?: AgenticWorkCouncilCapability;
+  /** Owner-only causal inspection; never exposed to the model. */
+  readonly inspection?: AgentInspectionWriterV1;
+  readonly workspaceId?: string;
   /** Optional frozen cognition policy projections supplied by the host. */
   readonly workPolicyMessages?: readonly AssemblyProviderMessageV1[];
   readonly workspaceUsageMessages?: readonly AssemblyProviderMessageV1[];
   readonly completionCriteriaMessages?: readonly AssemblyProviderMessageV1[];
   readonly renderPolicyMessages?: readonly AssemblyProviderMessageV1[];
+  /** Immutable predicate snapshot and admitted grants for canonical custom WORK phases. */
+  readonly phaseEvaluationContext?: CognitionEvaluationContextV1;
+  readonly phaseAdmittedCapabilities?: readonly AgentRuntimePhaseCapabilityV1[];
+  readonly phaseRevision?: number;
   /** Test seam. Production resolves the model tokenizer. */
   readonly countTokens?: (text: string) => number;
 }
@@ -1058,6 +1181,8 @@ export interface AgenticWorkPhaseOutcome {
   readonly materializedMessages?: readonly LlmMessage[];
   /** Root-frame-only render handoff; never public or persisted. */
   readonly renderHandoff?: AgenticWorkRenderHandoff;
+  /** Private owner-inspection evidence from the bounded Council sidecar. */
+  readonly council?: WorkCouncilExecutionResult;
   readonly workNoteBytes: number;
   readonly privateState: typeof NO_PRIVATE_OUTPUT;
 }
@@ -1546,7 +1671,9 @@ const MAX_CONTEXT_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_CONTEXT_ID_BYTES = 128;
 const MAX_CONTEXT_LABEL_BYTES = 512;
 const MAX_CONTEXT_SUMMARY_BYTES = 8 * 1024;
-const MAX_CONTEXT_DIGEST_BYTES = 128;
+const MAX_CONTEXT_DIGEST_BYTES = 256;
+/** Matches the compiler's closed context-revision string bound (256 UTF-8 bytes). */
+const MAX_CONTEXT_REVISION_BYTES = 256;
 function ensureContextIdentifier(value: unknown, path: string): string {
   const identifier = ensureBoundedString(value, MAX_CONTEXT_ID_BYTES, path);
   if (identifier.includes("\u0000")) throw new AgenticWorkPhaseError("invalid_plan", "Context identifier contains a NUL", path);
@@ -1563,7 +1690,15 @@ function contextIdentityKey(packId: string, revisionId: string, attachmentId: st
 }
 
 function ensureContextRevision(value: unknown, path: string): number | string {
-  if (typeof value === "string") return ensureContextIdentifier(value, path);
+  if (typeof value === "string") {
+    const observed = boundedBytes(value);
+    if (observed > MAX_CONTEXT_REVISION_BYTES) {
+      console.error(`[agentic] context revision ${path} is ${observed} bytes over ${MAX_CONTEXT_REVISION_BYTES}`);
+    }
+    const revision = ensureBoundedString(value, MAX_CONTEXT_REVISION_BYTES, path);
+    if (revision.includes("\u0000")) throw new AgenticWorkPhaseError("invalid_plan", "Context revision contains a NUL", path);
+    return revision;
+  }
   return ensureSafeInteger(value, path, 0);
 }
 
@@ -1673,7 +1808,8 @@ function mapCompilerPlanError(error: unknown): AgenticWorkPhaseError {
       error.code === "limit_exceeded" ? "limit_exceeded" :
       error.code === "out_of_order_result_reference" ? "child_schedule_invalid" :
       "invalid_plan";
-    return new AgenticWorkPhaseError(code, "Assembly plan validation failed");
+    const location = error.blockId ? ` (${error.blockId})` : "";
+    return new AgenticWorkPhaseError(code, `${error.message}${location}`);
   }
   return new AgenticWorkPhaseError("invalid_plan", "Assembly plan validation failed");
 }
@@ -1775,6 +1911,17 @@ function normalizeCompilerAssemblyPlan(
     workspaceUsageMessages,
     completionCriteriaMessages,
     renderPolicyMessages,
+    sealedLoomPolicyMessages: Object.freeze({
+      workPolicy: Object.freeze([...candidate.workPolicyMessages]),
+      workspaceUsage: Object.freeze([...candidate.workspaceUsageMessages]),
+      completionCriteria: Object.freeze([...candidate.completionCriteriaMessages]),
+      renderPolicy: Object.freeze([...candidate.renderPolicyMessages]),
+    }),
+    customPhasePlan: candidate.customPhasePlan,
+    loomBlocks: Object.freeze(candidate.loomBlocks.map((block) => Object.freeze({
+      source: Object.freeze({ ...block.source }),
+      content: block.content,
+    }))),
     tokenEvidence: Object.freeze(candidate.tokenEvidence),
     profileOutputLimits: Object.freeze(candidate.profileOutputLimits),
     contextPackSnapshot,
@@ -1858,6 +2005,10 @@ function selectedPolicyMessages(
   return normalizePolicyMessages(override ?? plan[key], key, limits);
 }
 
+function cortexContextMessageName(context: CortexSidecarAcceptedV1): string {
+  return `${HOST_CORTEX_CONTEXT_NAME_PREFIX}${context.receipt.id}`;
+}
+
 function materializeWorkMessages(
   plan: AgenticPhasePlan,
   results: ReadonlyMap<number, string>,
@@ -1866,17 +2017,138 @@ function materializeWorkMessages(
   const limits = lowerPreparationLimitsV1(options.trustedAssemblyLimits);
   const workPolicyMessages = selectedPolicyMessages(plan, "workPolicyMessages", options.workPolicyMessages, limits);
   const workspaceUsageMessages = selectedPolicyMessages(plan, "workspaceUsageMessages", options.workspaceUsageMessages, limits);
-  return materializeAssemblyMessages(
-    [...plan.messages, ...workPolicyMessages, ...workspaceUsageMessages],
+  const cortexMessages: readonly AssemblyProviderMessageV1[] = options.cortexContext
+    ? Object.freeze([Object.freeze({
+      role: "system" as const,
+      segments: Object.freeze([{
+        kind: "literal" as const,
+        text: `${HOST_CORTEX_CONTEXT_PREFIX} snapshot ${options.cortexContext.receipt.snapshotId}, revision ${String(options.cortexContext.receipt.revision ?? options.cortexContext.receipt.sourceRevision)}): ${jsonStringifyBounded(options.cortexContext.value, Math.min(limits.maxInputBytes, WORK_CORTEX_MAX_RESULT_BYTES))}`,
+      }]),
+    })])
+    : Object.freeze([]);
+  const materialized = materializeAssemblyMessages(
+    [...cortexMessages, ...plan.messages, ...workPolicyMessages, ...workspaceUsageMessages],
     results,
   );
+  if (options.cortexContext && materialized[0]) {
+    materialized[0] = Object.freeze({
+      ...materialized[0],
+      name: cortexContextMessageName(options.cortexContext),
+    });
+  }
+  return materialized;
+}
+function materializeCustomPhaseMessages(
+  plan: AgenticPhasePlan,
+  phase: CompiledAgentRuntimePhaseV1 | null,
+  limits: PreparationLimitsV1,
+): readonly LlmMessage[] {
+  if (!phase) return Object.freeze([]);
+  const blocks = plan.loomBlocks ?? [];
+  const result: LlmMessage[] = [];
+  let totalBytes = 0;
+  for (const source of phase.instructionRefs) {
+    const block = blocks.find((candidate) =>
+      candidate.source.blockId === source.blockId
+      && candidate.source.presetRevision === source.presetRevision
+      && candidate.source.blockRevision === source.blockRevision
+      && candidate.source.promptOrder === source.promptOrder);
+    if (!block) {
+      if (phase.required) {
+        throw new AgenticWorkPhaseError("invalid_plan", `Required custom phase instruction ${source.blockId} is unavailable`, phase.id);
+      }
+      continue;
+    }
+    totalBytes += utf8ByteLength(block.content);
+    if (totalBytes > limits.maxInputBytes) {
+      throw new AgenticWorkPhaseError("limit_exceeded", "Custom phase instructions exceed input limit", phase.id);
+    }
+    result.push(Object.freeze({ role: "system", content: block.content }));
+  }
+  return Object.freeze(result);
+}
+const PHASE_READ_WORKSPACE_OPERATIONS: readonly WorkspaceOperationKindV1[] = ["read_section", "read_page"];
+
+function phaseAllowsCapability(
+  capabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null,
+  capability: AgentRuntimePhaseCapabilityV1,
+): boolean {
+  return capabilities === null || capabilities.has(capability);
+}
+
+function narrowWorkspaceCapabilitiesForPhase(
+  capabilities: WorkspaceOperationCapabilitiesV1 | readonly WorkspaceOperationKindV1[] | undefined,
+  phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null,
+): WorkspaceOperationCapabilitiesV1 | readonly WorkspaceOperationKindV1[] | undefined {
+  if (phaseCapabilities === null || capabilities === undefined) return capabilities;
+  const allowed = Array.isArray(capabilities)
+    ? capabilities
+    : "allowed" in capabilities && Array.isArray(capabilities.allowed)
+      ? capabilities.allowed
+      : null;
+  if (allowed === null) return capabilities;
+  return Object.freeze(allowed.filter((operation) =>
+    PHASE_READ_WORKSPACE_OPERATIONS.includes(operation)
+      ? phaseCapabilities.has("workspace_read")
+      : phaseCapabilities.has("workspace_write")));
+}
+function composeAgenticWorkPhaseComposition(
+  options: AgenticWorkOptions,
+  coreToolIds: readonly CoreAgentToolId[],
+  delegatableProfiles: readonly AgenticDelegatableProfile[],
+  phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null,
+  signal: AbortSignal,
+): AgenticWorkComposition {
+  return composeAgenticWorkToolDefinitions({
+    coreToolIds: phaseAllowsCapability(phaseCapabilities, "core_retrieval")
+      ? [...new Set(coreToolIds)]
+      : [],
+    workspaceCapabilities: narrowWorkspaceCapabilitiesForPhase(options.workspaceCapabilities, phaseCapabilities),
+    contextTools: phaseAllowsCapability(phaseCapabilities, "context_retrieval")
+      ? options.contextTools ?? (options.context ? [CONTEXT_PACK_LIST_TOOL, CONTEXT_PACK_GET_TOOL] : [])
+      : [],
+    allowAgentDelegate: phaseAllowsCapability(phaseCapabilities, "delegation") && options.allowAgentDelegate,
+    delegatableProfiles: phaseAllowsCapability(phaseCapabilities, "delegation") ? delegatableProfiles : [],
+  }, signal);
+}
+
+function recordCustomPhaseEvidence(
+  writer: AgentInspectionWriterV1 | undefined,
+  evidence: AgentRuntimePhaseInspectionEvidenceV1,
+  sequence: number,
+): void {
+  writer?.record("condition", {
+    id: `phase:${evidence.phaseId}:${evidence.checkpoint}:${evidence.revision}:${sequence}`,
+    kind: "condition",
+    actor: "host",
+    recipient: "agent",
+    result: JSON.stringify(evidence),
+  }, { lifecycle: "WORK", status: evidence.status === "failed" ? "terminal" : evidence.status === "blocked" ? "waiting" : "running" });
 }
 
 function materializeCompletionCriteriaMessages(
   plan: AgenticPhasePlan,
   options: AgenticWorkOptions,
+  cognition?: CognitionRuntimeCompletionV1,
 ): readonly LlmMessage[] {
   const limits = lowerPreparationLimitsV1(options.trustedAssemblyLimits);
+  const inspection = cognition?.policySurface?.promptInspection;
+  if (inspection) {
+    if (!plan.sealedLoomPolicyMessages) {
+      throw new AgenticWorkPhaseError("invalid_plan", "Loom completion criteria are not sealed");
+    }
+    try {
+      const messages = selectEffectiveLoomPolicyMessagesV1(
+        plan.sealedLoomPolicyMessages.completionCriteria,
+        inspection,
+        "completionCriteria",
+        limits,
+      );
+      return materializeAssemblyMessages(messages, new Map());
+    } catch (error) {
+      throw mapCompilerPlanError(error);
+    }
+  }
   const messages = selectedPolicyMessages(plan, "completionCriteriaMessages", options.completionCriteriaMessages, limits);
   return materializeAssemblyMessages(messages, new Map());
 }
@@ -2003,7 +2275,10 @@ function preflightCompletionHandoff(
     if (utf8ByteLength(acceptedAck) > maxToolResultBytes) return false;
     const provisionalResults = calls.map(() => JSON.stringify(resultError("completion_freeze_failed")));
     if (providerTransientCarrier?.kind === "openai_responses") {
-      const carrier = mergeWorkProviderCarrier(providerTransientCarrier, calls, provisionalResults);
+      const carrier = appendNativeInputMessages(
+        mergeWorkProviderCarrier(providerTransientCarrier, calls, provisionalResults),
+        completionCriteria,
+      );
       if (carrier) clonePrivateValue(carrier, MAX_PROVIDER_CARRIER_BYTES, "renderHandoff.providerTransientCarrier");
       return true;
     }
@@ -2313,7 +2588,7 @@ function validateCalls(
       throw new AgenticWorkPhaseError("provider_protocol_error", "Provider returned missing or duplicate tool call IDs");
     }
     ids.add(call.call_id);
-    if (typeof call.name !== "string" || !call.name || !WORK_TOOL_SET.has(call.name) || !frame.allowedToolNames.includes(call.name)) {
+    if (typeof call.name !== "string" || !call.name || !WORK_DISPATCH_TOOL_SET.has(call.name) || !frame.allowedToolNames.includes(call.name)) {
       errors.set(index, "tool_not_allowed");
       continue;
     }
@@ -2347,6 +2622,9 @@ function validateCalls(
 
 class WorkBudgetState {
   readonly limits: NormalizedAgenticWorkBudget;
+  readonly inspection?: AgentInspectionWriterV1;
+  readonly workspaceId?: string;
+  councilResult?: WorkCouncilExecutionResult;
   providerRounds = 0;
   toolCalls = 0;
   workspaceOperations = 0;
@@ -2358,6 +2636,9 @@ class WorkBudgetState {
   toolResultBytes = 0;
   providerOutputTokens = 0;
   receiveBytes = 0;
+  providerInputTokens = 0;
+  providerSettledOutputTokens = 0;
+  providerTotalTokens = 0;
   reservedToolResultBytes = 0;
   observations = 0;
   nextObservationSequence = 0;
@@ -2365,8 +2646,14 @@ class WorkBudgetState {
   childOutputBytes = 0;
   readonly reservedChildIds = new Set<string>();
 
-  constructor(limits: NormalizedAgenticWorkBudget) {
+  constructor(
+    limits: NormalizedAgenticWorkBudget,
+    inspection?: AgentInspectionWriterV1,
+    workspaceId?: string,
+  ) {
     this.limits = limits;
+    this.inspection = inspection;
+    this.workspaceId = workspaceId;
   }
 
   reserveProviderRound(): boolean {
@@ -2408,6 +2695,40 @@ class WorkBudgetState {
     }
     this.providerOutputTokens += tokens;
     return true;
+  }
+
+  recordProviderUsage(usage: GenerationResponse["usage"], settledOutputTokens: number): boolean {
+    const inputTokens = usage?.prompt_tokens ?? 0;
+    const outputTokens = Math.max(usage?.completion_tokens ?? 0, settledOutputTokens);
+    const reportedTotalTokens = usage?.total_tokens ?? 0;
+    const totalTokens = Math.max(reportedTotalTokens, inputTokens + outputTokens);
+    return this.mergeProviderUsage({ inputTokens, outputTokens, totalTokens });
+  }
+
+  mergeProviderUsage(usage: AgenticWorkUsage): boolean {
+    if (
+      !Number.isSafeInteger(usage.inputTokens)
+      || usage.inputTokens < 0
+      || !Number.isSafeInteger(usage.outputTokens)
+      || usage.outputTokens < 0
+      || !Number.isSafeInteger(usage.totalTokens)
+      || usage.totalTokens < usage.inputTokens + usage.outputTokens
+      || this.providerInputTokens > Number.MAX_SAFE_INTEGER - usage.inputTokens
+      || this.providerSettledOutputTokens > Number.MAX_SAFE_INTEGER - usage.outputTokens
+      || this.providerTotalTokens > Number.MAX_SAFE_INTEGER - usage.totalTokens
+    ) return false;
+    this.providerInputTokens += usage.inputTokens;
+    this.providerSettledOutputTokens += usage.outputTokens;
+    this.providerTotalTokens += usage.totalTokens;
+    return true;
+  }
+
+  providerUsage(): AgenticWorkUsage {
+    return {
+      inputTokens: this.providerInputTokens,
+      outputTokens: this.providerSettledOutputTokens,
+      totalTokens: this.providerTotalTokens,
+    };
   }
   remainingReceiveBytes(limit: number): number {
     return Math.max(0, limit - this.receiveBytes);
@@ -2521,6 +2842,7 @@ interface OpenAssignableTask {
   readonly id: string;
   readonly assignable: boolean;
   readonly conflict: boolean;
+  readonly required: boolean;
 }
 
 const WORKSPACE_ASSIGNMENT_CONFLICT_CODES: Record<string, true> = {
@@ -2552,7 +2874,7 @@ function mapWorkspaceAssignmentError(error: unknown): AgenticWorkErrorCode {
 function parseOpenAssignableTask(value: unknown): OpenAssignableTask | undefined {
   if (typeof value === "string") {
     if (!value) return undefined;
-    return { id: value, assignable: true, conflict: false };
+    return { id: value, assignable: true, conflict: false, required: false };
   }
   if (!isRecord(value)) return undefined;
   const id = typeof value.id === "string" && value.id
@@ -2560,17 +2882,22 @@ function parseOpenAssignableTask(value: unknown): OpenAssignableTask | undefined
     : typeof value.taskId === "string" && value.taskId
       ? value.taskId
       : typeof value.task_id === "string" && value.task_id
-        ? value.task_id
-        : "";
   if (!id) return undefined;
   const state = typeof value.state === "string" ? value.state : undefined;
-  const assignedFrameId = value.assignedFrameId === null || value.assignedFrameId === undefined
+  const assignedFrameValue = value.assignedFrameId ?? value.assigned_frame_id;
+  const assignedFrameId = assignedFrameValue === null || assignedFrameValue === undefined
     ? null
-    : typeof value.assignedFrameId === "string"
-      ? value.assignedFrameId
+    : typeof assignedFrameValue === "string"
+      ? assignedFrameValue
       : undefined;
   const conflict = typeof assignedFrameId === "string" && assignedFrameId.length > 0;
-  return { id, assignable: state !== "submitted" && !conflict, conflict };
+  const assignableState = state === undefined || state === "pending" || state === "active";
+  return {
+    id,
+    assignable: assignableState && !conflict,
+    conflict,
+    required: value.required === true,
+  };
 }
 
 function publicWorkspaceExecuteResult(value: unknown): unknown {
@@ -2699,7 +3026,7 @@ async function executeWorkspaceTool(
   const operation = OPERATION_BY_WORKSPACE_TOOL[name];
   if (!frame.workspaceCapabilities.has(operation)) throw new AgenticWorkPhaseError("tool_not_allowed", "Workspace operation is not granted");
   const rootOnly = operation === "create_task" || operation === "accept_submission";
-  const childOnly = operation === "update_assigned_progress" || operation === "submit_child_result";
+  const childOnly = CHILD_ONLY_OPERATIONS.includes(operation);
   if (rootOnly && frame.kind !== "root") throw new AgenticWorkPhaseError("tool_not_allowed", "Only the root frame may perform this workspace operation");
   if (childOnly && frame.kind !== "child") throw new AgenticWorkPhaseError("tool_not_allowed", "Only an assigned child frame may perform this workspace operation");
   if (childOnly && !frame.assignedTaskId) throw new AgenticWorkPhaseError("tool_not_allowed", "Child frame has no assigned workspace task");
@@ -2715,6 +3042,12 @@ async function executeWorkspaceTool(
       : {}),
     actor: frame.kind,
     frameId: frame.frameId,
+    ...(operation === "submit_child_result" && typeof args.summary === "string"
+      ? {
+        resultDigest: createHash("sha256").update(args.summary, "utf8").digest("hex"),
+        byteCount: utf8ByteLength(args.summary),
+      }
+      : {}),
   };
   if (
     workspace.applyCognitionWorkspaceTransition
@@ -2727,8 +3060,8 @@ async function executeWorkspaceTool(
     const transition: CognitionRuntimeTaskTransitionInputV1["transition"] =
       operation === "create_task" ? "pending"
         : operation === "update_assigned_progress"
-          ? args.state === "submitted" ? "done" : args.state as CognitionRuntimeTaskTransitionInputV1["transition"]
-          : operation === "submit_child_result" ? "submitted" : "accepted";
+          ? args.state as CognitionRuntimeTaskTransitionInputV1["transition"]
+          : "completed";
     const cognitionResult = await abortable(Promise.resolve(workspace.applyCognitionWorkspaceTransition({
       taskId,
       transition,
@@ -2777,6 +3110,7 @@ async function executeCoreTool(
     snapshot: options.coreSnapshot,
     grant: { toolIds: frame.allowedCoreToolIds, loreScope: "active" },
     signal: frame.signal,
+    ...(options.inspection ? { inspection: options.inspection } : {}),
   };
   return await abortable(Promise.resolve(executeCoreAgentTool(toolId, args, context)), frame.signal);
 }
@@ -2857,6 +3191,257 @@ function appendUnobservedBatchCancellationObservations(
   appendUnobservedBatchFailureObservations(state, observations, calls, observationStart, code);
 }
 
+const WORKSPACE_TASK_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "workspace_create_task",
+  "workspace_update_assigned_progress",
+  "workspace_submit_child_result",
+  "workspace_accept_submission",
+]);
+
+function workInspectionErrorReason(code: AgenticWorkErrorCode | string | undefined): string | undefined {
+  if (!code) return undefined;
+  if (code === "cancelled") return "interrupted";
+  if (code === "timed_out") return "deadline";
+  if (code.includes("budget") || code.includes("limit") || code === "work_budget_exhausted") {
+    return "budget_exhausted";
+  }
+  if (code.includes("invalid") || code.includes("forged") || code.includes("protocol")) {
+    return "invalid_input";
+  }
+  if (code.includes("stale") || code.includes("revision") || code.includes("conflict")) {
+    return "stale_input";
+  }
+  if (code.includes("provider")) return "provider_failure";
+  if (code.includes("required") || code === "completion_blocked") return "required_work_failure";
+  if (code === "tool_not_allowed" || code.includes("unavailable") || code.includes("not_found")) {
+    return "unavailable";
+  }
+  return "tool_failure";
+}
+
+function recordHostToolTranscript(
+  state: WorkBudgetState,
+  call: ToolCallResult,
+  result: string,
+  code: AgenticWorkErrorCode | string | undefined,
+): void {
+  const writer = state.inspection;
+  if (
+    !writer
+    || CORE_TOOL_SET.has(call.name)
+    || call.name === CONTEXT_PACK_LIST_TOOL
+    || call.name === CONTEXT_PACK_GET_TOOL
+  ) return;
+  const roundIndex = Math.max(0, state.providerRounds - 1);
+  const requestId = `tool:work:${roundIndex}:${call.call_id}`;
+  const taskId = typeof call.args.task_id === "string"
+    ? call.args.task_id
+    : typeof call.args.assigned_task_id === "string"
+      ? call.args.assigned_task_id
+      : undefined;
+  const kind = call.name === AGENT_DELEGATE_TOOL
+    ? "delegation"
+    : call.name.startsWith("workspace_")
+      ? WORKSPACE_TASK_TOOL_NAMES.has(call.name) ? "task" : "workspace"
+      : "tool";
+  writer.record("transcript", {
+    id: requestId,
+    kind,
+    actor: "agent",
+    recipient: "host",
+    arguments: JSON.stringify(call.args),
+    correlation: {
+      toolId: call.name,
+      ...(taskId ? { taskId } : {}),
+      parentId: `provider:work:${roundIndex}`,
+    },
+  }, { lifecycle: "WORK", status: "running" });
+  writer.record("transcript", {
+    id: `${requestId}:result`,
+    kind,
+    actor: "host",
+    recipient: "agent",
+    result,
+    ...(code ? { errorReason: workInspectionErrorReason(code) } : {}),
+    correlation: {
+      toolId: call.name,
+      ...(taskId ? { taskId } : {}),
+      parentId: requestId,
+    },
+  }, { lifecycle: "WORK", status: "running" });
+}
+
+
+
+function recordWorkInspection(
+  state: WorkBudgetState,
+  status: AgenticWorkStatus,
+  observations: readonly AgenticWorkObservation[],
+  childResults: readonly AgenticChildResultMetadata[],
+  code: AgenticWorkErrorCode | undefined,
+  completion: AgenticCompletionPayload | undefined,
+  workspaceRevision: number | undefined,
+): void {
+  const writer = state.inspection;
+  if (!writer) return;
+  const inspectionStatus = status === "completed"
+    ? "waiting"
+    : status === "cancelled" || status === "timed_out"
+      ? "cancelling"
+      : "running";
+  const boundary = { lifecycle: "WORK" as const, status: inspectionStatus as "running" | "waiting" | "cancelling" };
+  writer.record("milestone", {
+    id: `work:outcome:${state.providerRounds}:${observations.length}`,
+    kind: "milestone",
+    actor: "host",
+    recipient: "owner",
+    result: JSON.stringify({
+      status,
+      ...(code ? { code } : {}),
+      providerRoundCount: state.providerRounds,
+      observationCount: observations.length,
+      childCount: childResults.length,
+      unsignedBoundaryCount: state.unsignedBoundaries,
+      workNoteBytes: state.workNoteBytes,
+    }),
+    correlation: { parentId: "root" },
+  }, boundary);
+  const taskOperations = WORKSPACE_TASK_TOOL_NAMES;
+  for (const observation of observations) {
+    const kind = taskOperations.has(observation.toolName)
+      ? "task" as const
+      : observation.toolName.startsWith("workspace_")
+        ? "workspace" as const
+        : observation.toolName === AGENT_DELEGATE_TOOL
+          ? "delegation" as const
+          : "milestone" as const;
+    if (kind === "milestone") continue;
+    writer.record("transcript", {
+      id: `work:${kind}:${observation.sequence}:${observation.callId}`,
+      kind,
+      actor: "agent",
+      recipient: "host",
+      arguments: JSON.stringify({ callId: observation.callId, toolName: observation.toolName }),
+      result: JSON.stringify({
+        status: observation.status,
+        ...(observation.code ? { code: observation.code } : {}),
+        resultBytes: observation.resultBytes,
+      }),
+      correlation: {
+        taskId: observation.callId,
+        toolId: observation.toolName,
+        parentId: "root",
+      },
+    }, boundary);
+  }
+  for (const [index, child] of childResults.entries()) {
+    writer.record("child_result", {
+      id: `work:child:${index}:${child.childId}`,
+      kind: "child_result",
+      actor: "child",
+      recipient: "host",
+      result: JSON.stringify({
+        childId: child.childId,
+        profileId: child.profileId,
+        slotIndex: child.slotIndex,
+        required: child.required,
+        status: child.status,
+        outputBytes: child.outputBytes,
+        ...(child.errorCode ? { errorCode: child.errorCode } : {}),
+      }),
+      correlation: {
+        taskId: child.childId,
+        parentId: "root",
+      },
+    }, boundary);
+  }
+  if (workspaceRevision !== undefined && state.workspaceId) {
+    writer.record("workspace", {
+      id: `workspace:work:${workspaceRevision}`,
+      workspaceId: state.workspaceId,
+      workspaceRevision,
+      relation: "linked",
+      objectKind: "objective",
+      objectId: null,
+      sourceRevision: workspaceRevision,
+      sourceDeleted: false,
+      provenanceDigest: null,
+    }, boundary);
+  }
+  const providerUsage = state.providerUsage();
+  writer.record("usage", {
+    version: 1,
+    id: `usage:work:provider:${state.providerRounds}`,
+    source: "final",
+    layer: "provider",
+    correlation: { parentId: "root" },
+    ...providerUsage,
+    toolCalls: 0,
+    childInvocations: 0,
+    canonical: true,
+  }, boundary);
+  writer.record("usage", {
+    version: 1,
+    id: `usage:work:tools:${observations.length}`,
+    source: "final",
+    layer: "tool",
+    correlation: { parentId: "root" },
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    toolCalls: state.toolCalls,
+    childInvocations: 0,
+    canonical: true,
+  }, boundary);
+  writer.record("usage", {
+    version: 1,
+    id: `usage:work:children:${childResults.length}`,
+    source: "final",
+    layer: "child",
+    correlation: { parentId: "root" },
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    toolCalls: 0,
+    childInvocations: childResults.length,
+    canonical: true,
+  }, boundary);
+  const council = state.councilResult;
+  if (council) {
+    writer.record("council", {
+      ...council.receipt,
+      ...(council.advice ? { advice: council.advice } : {}),
+    }, boundary);
+    for (const transcript of council.transcript) writer.record("transcript", transcript, boundary);
+    for (const usage of council.usageEvidence) writer.record("usage", usage, boundary);
+    for (const marker of council.markers) writer.record("marker", marker, boundary);
+    if (council.advice) {
+      writer.record("agent_exchange", {
+        id: `council:advice:${council.receipt.id}`,
+        kind: "agent_exchange",
+        actor: "council",
+        recipient: "agent",
+        content: council.advice,
+        correlation: council.receipt.correlation,
+      }, boundary);
+    }
+  }
+  if (completion) {
+    writer.record("completion", {
+      id: "work:completion",
+      kind: "completion",
+      actor: "agent",
+      recipient: "host",
+      result: JSON.stringify({
+        summary: completion.summary,
+        unresolvedIds: completion.unresolvedIds,
+        ...(completion.renderGuidance ? { renderGuidance: completion.renderGuidance } : {}),
+        workspaceRevision: workspaceRevision ?? null,
+      }),
+      correlation: { parentId: "root" },
+    }, { lifecycle: "WORK", status: "waiting" });
+  }
+}
 
 function makeOutcome(
   status: AgenticWorkStatus,
@@ -2898,6 +3483,13 @@ function makeOutcome(
       enumerable: false,
     });
   }
+  if (state.councilResult) {
+    Object.defineProperty(outcome, "council", {
+      value: state.councilResult,
+      enumerable: false,
+    });
+  }
+  recordWorkInspection(state, status, observations, childResults, code, completion, workspaceRevision);
   return Object.freeze(outcome);
 }
 function requiredChildFailure(status: string, errorCode?: string): AgenticWorkErrorCode {
@@ -2925,6 +3517,7 @@ async function executeChildSchedule(
   rootFrame: AgenticWorkFrame,
   state: WorkBudgetState,
   signal: AbortSignal,
+  phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null = null,
 ): Promise<{ results: Map<number, string>; metadata: AgenticChildResultMetadata[]; failure?: AgenticWorkErrorCode }> {
   const results = new Map<number, string>();
   const metadata: AgenticChildResultMetadata[] = [];
@@ -2977,7 +3570,9 @@ async function executeChildSchedule(
       parentFrameId: rootFrame.frameId,
       connectionId: rootFrame.connectionId,
       model: rootFrame.model,
-      coreToolIds: descriptor.toolIds as CoreAgentToolId[],
+      coreToolIds: phaseAllowsCapability(phaseCapabilities, "core_retrieval")
+        ? descriptor.toolIds as CoreAgentToolId[]
+        : [],
       signal,
     });
     let content = "";
@@ -2997,6 +3592,9 @@ async function executeChildSchedule(
         content = output.content ?? "";
         status = output.status ?? "succeeded";
         errorCode = output.errorCode;
+        if (output.usage && !state.mergeProviderUsage(output.usage)) {
+          throw new AgenticWorkPhaseError("provider_protocol_error", "Child provider usage is malformed");
+        }
       }
       if (signal.aborted) {
         return { results, metadata, failure: signalStatus(signal) };
@@ -3086,6 +3684,7 @@ export interface BoundedChildFrameOutcome {
   readonly providerRoundCount: number;
   readonly code?: AgenticWorkErrorCode;
   readonly workspaceRevision?: number;
+  readonly usage?: AgenticWorkUsage;
 }
 
 /**
@@ -3135,10 +3734,13 @@ export async function executeBoundedAgenticChildFrame(
   const observations: AgenticWorkObservation[] = [];
   let workspaceRevision: number | undefined;
   const childOutcome = (
-    outcome: Omit<BoundedChildFrameOutcome, "workspaceRevision">,
-  ): BoundedChildFrameOutcome => workspaceRevision === undefined
-    ? outcome
-    : { ...outcome, workspaceRevision };
+    outcome: Omit<BoundedChildFrameOutcome, "workspaceRevision" | "usage">,
+  ): BoundedChildFrameOutcome => {
+    const settled = { ...outcome, usage: state.providerUsage() };
+    return workspaceRevision === undefined
+      ? settled
+      : { ...settled, workspaceRevision };
+  };
   // Child definitions are host-owned and derived solely from the immutable
   // frame grant. Never expose caller-supplied definitions to the provider.
   const definitions = new Map(
@@ -3206,6 +3808,9 @@ export async function executeBoundedAgenticChildFrame(
       if (!state.reserveProviderTokens(accounting.outputTokens, maxOutputTokens)) {
         return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_output_limit_exceeded" });
       }
+      if (!state.recordProviderUsage(response.usage, accounting.outputTokens)) {
+        return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "provider_protocol_error" });
+      }
       if (typeof response.content !== "string") return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "provider_protocol_error" });
       try {
         providerTransientCarrier = mergeResponseProviderCarrier(providerTransientCarrier, assertKnownProviderCarrier(response.providerTransientCarrier));
@@ -3245,6 +3850,7 @@ export async function executeBoundedAgenticChildFrame(
       pendingBatchObservationStart = observations.length;
       const serializedResults: string[] = [];
       const resultErrors: boolean[] = [];
+      let submittedResult: string | undefined;
       for (let index = 0; index < calls.length; index += 1) {
         const call = calls[index]!;
         const errorCode = validation.errors.get(index);
@@ -3273,6 +3879,13 @@ export async function executeBoundedAgenticChildFrame(
               serialized = normalized.serialized;
               code = normalized.code as AgenticWorkErrorCode | undefined;
               status = normalized.status === "error" ? "error" : "success";
+              if (
+                status === "success"
+                && call.name === WORKSPACE_TOOL_BY_OPERATION.submit_child_result
+                && typeof call.args.summary === "string"
+              ) {
+                submittedResult = call.args.summary;
+              }
             } else {
               const toolId = call.name as CoreAgentToolId;
               if (!options.executeCore) throw new AgenticWorkPhaseError("tool_not_allowed", "Child core tool capability is unavailable");
@@ -3307,6 +3920,26 @@ export async function executeBoundedAgenticChildFrame(
         serializedResults.push(serialized);
         resultErrors.push(status === "rejected" || status === "error");
         observations.push(completionObservation(state, call, status, code, serialized));
+      }
+      if (submittedResult !== undefined) {
+        const resultBytes = boundedBytes(submittedResult);
+        let resultTokens: number;
+        try {
+          resultTokens = countTokens(submittedResult);
+        } catch {
+          return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "provider_protocol_error" });
+        }
+        const remainingOutputTokens = state.remainingOutputTokens(state.limits.maxOutputTokens);
+        if (
+          resultBytes > state.limits.maxChildOutputBytes
+          || !Number.isSafeInteger(resultTokens)
+          || resultTokens < 0
+          || !state.reserveProviderTokens(resultTokens, remainingOutputTokens)
+        ) {
+          return childOutcome({ status: "failed", content: "", observations, providerRoundCount: state.providerRounds, code: "child_output_limit_exceeded" });
+        }
+        pendingBatchCalls = undefined;
+        return childOutcome({ status: "succeeded", content: submittedResult, observations, providerRoundCount: state.providerRounds });
       }
       providerTransientCarrier = mergeWorkProviderCarrier(providerTransientCarrier, calls, serializedResults);
       if (providerTransientCarrier?.kind !== "openai_responses") {
@@ -3374,7 +4007,12 @@ function assertRequiredKeys(value: Record<string, unknown>, keys: readonly strin
 
 function validateWorkspaceProjectionRecord(value: unknown, path: string): void {
   if (!isRecord(value)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Workspace projection record is malformed", path);
-  assertRequiredKeys(value, ["kind", "id", "text", "sourceRevision"], path);
+  assertExactKeys(value, ["kind", "id", "text", "sourceRevision", "taskState"], path);
+  for (const key of ["kind", "id", "text", "sourceRevision"]) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", `Missing field: ${key}`, `${path}.${key}`);
+    }
+  }
   if (typeof value.kind !== "string" || !WORKSPACE_PROJECTION_RECORD_KINDS.has(value.kind)) {
     throw new AgenticWorkPhaseError("completion_freeze_failed", "Workspace projection record kind is invalid", `${path}.kind`);
   }
@@ -3469,6 +4107,73 @@ function validateCognitionActivationState(value: unknown, expectedWorkspaceRevis
   for (const key of ["activatedTemplateIds", "activatedContextRuleIds", "requiredTemplateIds", "requiredContextRuleIds"]) validateBoundedStringList(value[key], `${path}.${key}`);
 }
 
+function validateCognitionPolicySurface(
+  value: unknown,
+  phase: string,
+  path: string,
+): void {
+  try {
+    if (!isRecord(value)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition policy surface is malformed", path);
+    assertExactKeys(value, ["policies", "promptInspection", "responseOmission"], path);
+    if (!Object.prototype.hasOwnProperty.call(value, "policies")) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition policy surface is missing policies", `${path}.policies`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(value, "promptInspection")) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition policy surface is missing prompt inspection", `${path}.promptInspection`);
+    }
+    if (value.responseOmission !== undefined) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", "WORK cognition cannot carry Response omission evidence", `${path}.responseOmission`);
+    }
+    const policies = parseLoomPolicyBuckets(value.policies);
+    const inspection = parseLoomPromptInspectionV1(value.promptInspection, `${path}.promptInspection`);
+    const expectedCheckpoint = phase === "ASSEMBLE" || phase === "WORK" || phase === "RENDER"
+      ? phase
+      : "PREPARE_COMMIT";
+    if (inspection.surface !== "WORK" || inspection.checkpoint !== expectedCheckpoint) {
+      throw new AgenticWorkPhaseError(
+        "completion_freeze_failed",
+        "Cognition prompt inspection does not match the active WORK checkpoint",
+        `${path}.promptInspection`,
+      );
+    }
+    const expectedItems = LOOM_POLICY_BUCKETS.flatMap((bucket) =>
+      policies[bucket].map((entry) => ({ bucket, entry })));
+    if (inspection.items.length !== expectedItems.length) {
+      throw new AgenticWorkPhaseError(
+        "completion_freeze_failed",
+        "Cognition prompt inspection does not cover the frozen Loom policy",
+        `${path}.promptInspection.items`,
+      );
+    }
+    for (const [index, expected] of expectedItems.entries()) {
+      const item = inspection.items[index];
+      if (
+        !item
+        || item.entryId !== expected.entry.id
+        || item.bucket !== expected.bucket
+        || item.destination !== expected.entry.destination
+        || item.checkpoint !== expected.entry.checkpoint
+        || JSON.stringify(item.source) !== JSON.stringify(expected.entry.source)
+        || JSON.stringify(item.delivery) !== JSON.stringify(expected.entry.delivery)
+      ) {
+        throw new AgenticWorkPhaseError(
+          "completion_freeze_failed",
+          "Cognition prompt inspection provenance does not match the frozen Loom policy",
+          `${path}.promptInspection.items[${index}]`,
+        );
+      }
+    }
+  } catch (error) {
+    if (error instanceof AgenticWorkPhaseError && error.code === "completion_freeze_failed") throw error;
+    const errorPath = error instanceof AgenticWorkPhaseError ? error.path : path;
+    throw new AgenticWorkPhaseError(
+      "completion_freeze_failed",
+      error instanceof Error ? error.message : "Cognition policy surface is malformed",
+      errorPath,
+    );
+  }
+}
+
 function validateCognitionActivation(
   value: unknown,
   expectedWorkspaceRevision: number,
@@ -3478,16 +4183,31 @@ function validateCognitionActivation(
   if (!isRecord(value)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition activation is malformed", path);
   const activationKeys = ["phase", "state", "activation", "newlyActivatedContextPackRequirements", "contextPackRequirements", "promptBlocks", "sourceRevisions", "sourceDigest", "workspaceRevision"];
   const completionKeys = ["accepted", "blockers", "blockingRequiredTaskIds", "materializedTaskIds", "preCommitActivations"];
-  assertRequiredKeys(value, completion ? [...activationKeys, ...completionKeys] : activationKeys, path);
+  const requiredKeys = completion ? [...activationKeys, ...completionKeys] : activationKeys;
+  assertExactKeys(value, [...requiredKeys, "policySurface"], path);
+  for (const key of requiredKeys) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", `Missing field: ${key}`, `${path}.${key}`);
+    }
+  }
   const phases = new Set(["ASSEMBLE", "WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING", "COMMITTED", "COMMIT_FAILED", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"]);
   if (typeof value.phase !== "string" || !phases.has(value.phase)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition phase is invalid", `${path}.phase`);
   ensureSafeInteger(value.workspaceRevision, `${path}.workspaceRevision`);
   if (value.workspaceRevision !== expectedWorkspaceRevision) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition revision is not the accepted revision", `${path}.workspaceRevision`);
   validateCognitionActivationState(value.state, expectedWorkspaceRevision, `${path}.state`);
   if (!isRecord(value.activation)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition activation result is malformed", `${path}.activation`);
-  assertRequiredKeys(value.activation, ["point", "state", "newlyActivatedTemplateIds", "newlyActivatedContextRuleIds", "newlyRequiredTemplateIds", "newlyRequiredContextRuleIds"], `${path}.activation`);
+  const activationResultRequired = ["point", "state", "newlyActivatedTemplateIds", "newlyActivatedContextRuleIds", "newlyRequiredTemplateIds", "newlyRequiredContextRuleIds"] as const;
+  assertExactKeys(value.activation, [...activationResultRequired, "fixedPointIterations", "blockingRequiredTaskIds", "canComplete"], `${path}.activation`);
+  for (const key of activationResultRequired) {
+    if (!Object.prototype.hasOwnProperty.call(value.activation, key)) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", `Missing field: ${key}`, `${path}.activation.${key}`);
+    }
+  }
   if (!["initial", "phase_entry", "task_transition", "completion_fixed_point"].includes(String(value.activation.point))) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition activation point is invalid", `${path}.activation.point`);
-  validateCognitionActivationState(value.activation.state, expectedWorkspaceRevision, `${path}.activation.state`);
+  const nestedStateRevision = isRecord(value.activation.state) && typeof value.activation.state.workspaceRevision === "number"
+    ? value.activation.state.workspaceRevision
+    : expectedWorkspaceRevision;
+  validateCognitionActivationState(value.activation.state, nestedStateRevision, `${path}.activation.state`);
   for (const key of ["newlyActivatedTemplateIds", "newlyActivatedContextRuleIds", "newlyRequiredTemplateIds", "newlyRequiredContextRuleIds"]) validateBoundedStringList(value.activation[key], `${path}.activation.${key}`);
   parseContextPackRequirements(value.newlyActivatedContextPackRequirements);
   parseContextPackRequirements(value.contextPackRequirements);
@@ -3501,6 +4221,9 @@ function validateCognitionActivation(
     ensureBoundedString(ref.blockId, MAX_FRAME_ID_BYTES, `${refPath}.blockId`);
     ensureSafeInteger(ref.expectedPresetRevision, `${refPath}.expectedPresetRevision`);
     ensureSafeInteger(ref.expectedBlockRevision, `${refPath}.expectedBlockRevision`);
+  }
+  if (value.policySurface !== undefined) {
+    validateCognitionPolicySurface(value.policySurface, String(value.phase), `${path}.policySurface`);
   }
   if (!isRecord(value.sourceRevisions)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition source revisions are malformed", `${path}.sourceRevisions`);
   assertRequiredKeys(value.sourceRevisions, ["presetRevision", "blockRevisions"], `${path}.sourceRevisions`);
@@ -3517,9 +4240,13 @@ function validateCognitionActivation(
 }
 
 function validateCognitionCompletion(value: unknown, expectedWorkspaceRevision: number): CognitionRuntimeCompletionV1 {
-  const completion = cloneDescriptorSafe(value, "cognition");
+  let completion: unknown;
+  try {
+    completion = structuredClone(value);
+  } catch {
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition completion is not cloneable");
+  }
   if (!isRecord(completion)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition completion is malformed");
-  assertRequiredKeys(completion, ["phase", "state", "activation", "newlyActivatedContextPackRequirements", "contextPackRequirements", "promptBlocks", "sourceRevisions", "sourceDigest", "workspaceRevision", "accepted", "blockers", "blockingRequiredTaskIds", "materializedTaskIds", "preCommitActivations"], "cognition");
   validateCognitionActivation(completion, expectedWorkspaceRevision, "cognition", true);
   if (typeof completion.accepted !== "boolean") throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition completion acceptance is malformed");
   if (!Array.isArray(completion.blockers) || completion.blockers.length > 256) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition blockers are malformed");
@@ -3535,7 +4262,12 @@ function validateCognitionCompletion(value: unknown, expectedWorkspaceRevision: 
   validateBoundedStringList(completion.blockingRequiredTaskIds, "cognition.blockingRequiredTaskIds");
   validateBoundedStringList(completion.materializedTaskIds, "cognition.materializedTaskIds");
   if (!Array.isArray(completion.preCommitActivations) || completion.preCommitActivations.length > 256) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition pre-commit activations are malformed");
-  for (const [index, activation] of completion.preCommitActivations.entries()) validateCognitionActivation(activation, expectedWorkspaceRevision, `cognition.preCommitActivations[${index}]`);
+  for (const [index, activation] of completion.preCommitActivations.entries()) {
+    const activationRevision = isRecord(activation) && typeof activation.workspaceRevision === "number"
+      ? activation.workspaceRevision
+      : expectedWorkspaceRevision;
+    validateCognitionActivation(activation, activationRevision, `cognition.preCommitActivations[${index}]`);
+  }
   return deepFreeze(completion) as unknown as CognitionRuntimeCompletionV1;
 }
 
@@ -3547,7 +4279,12 @@ function validateCompletionFixedPoint(value: unknown): {
   readonly cognition?: CognitionRuntimeCompletionV1;
   readonly workspaceContextProjection?: WorkspaceContextProjectionV1;
 } {
-  const fixed = cloneDescriptorSafe(value, "completionFixedPoint");
+  let fixed: unknown;
+  try {
+    fixed = structuredClone(value);
+  } catch {
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Completion fixed-point result is not cloneable");
+  }
   if (!isRecord(fixed)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Completion fixed-point result is malformed");
   for (const key of ["accepted", "workspaceRevision"] as const) {
     if (!Object.prototype.hasOwnProperty.call(fixed, key)) {
@@ -3793,6 +4530,11 @@ interface CompletionHandoffPreparation {
   readonly response: GenerationResponse;
   readonly completionCriteria: readonly LlmMessage[];
   readonly maxToolResultBytes: number;
+  readonly completionCriteriaForCognition?: (
+    cognition?: CognitionRuntimeCompletionV1,
+  ) => readonly LlmMessage[];
+  /** Host-owned message identities omitted from the RENDER handoff. */
+  readonly renderExcludedMessageNames?: readonly string[];
 }
 
 interface CompletionExecutionResult {
@@ -3804,6 +4546,9 @@ interface CompletionExecutionResult {
   readonly contextPackRequirements?: readonly CognitionContextPackRequirementV1[];
   readonly preparedSerialized?: string;
   readonly preparedHandoff?: AgenticWorkRenderHandoff;
+  readonly completionCriteria?: readonly LlmMessage[];
+  /** Latest committed workspace revision, including a rejected fixed point. */
+  readonly workspaceRevision?: number;
 }
 
 function prepareAcceptedCompletionHandoff(
@@ -3812,12 +4557,24 @@ function prepareAcceptedCompletionHandoff(
   acceptance: AgenticCompletionAcceptance,
   preparation: CompletionHandoffPreparation,
 ): { readonly serialized: string; readonly providerTransientCarrier?: ProviderTransientCarrier; readonly handoff: AgenticWorkRenderHandoff } {
-  const serialized = jsonStringifyBounded(result, preparation.maxToolResultBytes);
-  const providerTransientCarrier = mergeWorkProviderCarrier(
-    preparation.providerTransientCarrier,
-    [call],
-    [serialized],
+  const excludedMessageNames = new Set(preparation.renderExcludedMessageNames ?? []);
+  const cortexContextIncluded = preparation.messages.some((message) =>
+    typeof message.name === "string" && excludedMessageNames.has(message.name),
   );
+  const renderMessages = preparation.messages.filter((message) => !(
+    typeof message.name === "string" && excludedMessageNames.has(message.name)
+  ));
+  const serialized = jsonStringifyBounded(result, preparation.maxToolResultBytes);
+  const providerTransientCarrier = cortexContextIncluded
+    ? undefined
+    : appendNativeInputMessages(
+        mergeWorkProviderCarrier(
+          preparation.providerTransientCarrier,
+          [call],
+          [serialized],
+        ),
+        preparation.completionCriteria,
+      );
   const handoffBase = {
     workspaceRevision: acceptance.workspaceRevision,
     workspaceContextProjection: acceptance.workspaceContextProjection,
@@ -3828,7 +4585,7 @@ function prepareAcceptedCompletionHandoff(
         continuationMode: "legacy",
         ...handoffBase,
         transcript: clonePrivateValue([
-          ...preparation.messages,
+          ...renderMessages,
           ...buildContinuation(
             preparation.response,
             [call],
@@ -3846,6 +4603,7 @@ async function executeCompletion(
   frame: AgenticWorkFrame,
   workspace: AgenticWorkspaceCapability | undefined,
   preparation?: CompletionHandoffPreparation,
+  expectedWorkspaceRevision?: number,
 ): Promise<CompletionExecutionResult> {
   if (frame.kind !== "root" || !frame.canComplete) return { observationStatus: "rejected", code: "completion_not_root", result: resultError("completion_not_root") };
   const parsed = parseCompleteTurnPayload(call.args);
@@ -3865,11 +4623,15 @@ async function executeCompletion(
     let preparedCandidate: ReturnType<typeof validateCompletionFixedPoint> | undefined;
     const prepareAcceptance = preparation
       ? (candidate: AgenticWorkspaceCompletionFixedPointResult): AgenticWorkspacePreparationResult => {
+        try {
         const validated = validateCompletionFixedPoint(candidate);
         if (!validated.accepted) return true;
         const workspaceContextProjection = validated.workspaceContextProjection
           ?? projectAcceptedWorkspace(workspace, frame, validated.workspaceRevision);
-        if (!workspaceContextProjection) return false;
+        if (!workspaceContextProjection) {
+          console.error("[agentic] prepareAcceptance missing workspace context projection");
+          return false;
+        }
         const preparedCandidateValue = Object.freeze({
           ...validated,
           workspaceContextProjection,
@@ -3881,10 +4643,18 @@ async function executeCompletion(
           ...(validated.cognition ? { contextPackRequirements: validated.cognition.contextPackRequirements } : {}),
         });
         const result = { status: "accepted", toolName: COMPLETE_TURN_TOOL, workspaceRevision: validated.workspaceRevision };
-        const prepared = prepareAcceptedCompletionHandoff(call, result, acceptance, preparation);
+        const prepared = prepareAcceptedCompletionHandoff(call, result, acceptance, {
+          ...preparation,
+          completionCriteria: preparation.completionCriteriaForCognition?.(validated.cognition)
+            ?? preparation.completionCriteria,
+        });
         preparedCandidate = preparedCandidateValue;
         preparedAcceptance = { acceptance, prepared };
         return Object.freeze({ acknowledged: true, bundle: preparedCandidateValue });
+        } catch (error) {
+          console.error(`[agentic] prepareAcceptance threw: ${error instanceof Error ? error.message : String(error)}`);
+          throw error;
+        }
       }
       : undefined;
     let returned: ReturnType<typeof validateCompletionFixedPoint>;
@@ -3893,11 +4663,13 @@ async function executeCompletion(
         frame,
         completion: parsed.payload,
         operationKey: call.call_id,
+        ...(expectedWorkspaceRevision === undefined ? {} : { expectedRevision: expectedWorkspaceRevision }),
         signal: frame.signal,
         ...(prepareAcceptance ? { prepareAcceptance } : {}),
       })), frame.signal);
       returned = validateCompletionFixedPoint(raw);
-    } catch {
+    } catch (error) {
+      console.error(`[agentic] complete_turn accept threw: ${error instanceof Error ? error.message : String(error)}`);
       return { observationStatus: "rejected", code: "completion_freeze_failed", result: resultError("completion_freeze_failed") };
     }
     if (!returned.accepted) {
@@ -3906,7 +4678,14 @@ async function executeCompletion(
         observationStatus: "rejected",
         code,
         result: resultError(code),
+        workspaceRevision: returned.workspaceRevision,
         ...(returned.cognition ? { contextPackRequirements: returned.cognition.contextPackRequirements } : {}),
+        ...(preparation
+          ? {
+              completionCriteria: preparation.completionCriteriaForCognition?.(returned.cognition)
+                ?? preparation.completionCriteria,
+            }
+          : {}),
       };
     }
     if (!preparedAcceptance || !preparedCandidate || !completionFixedPointMatches(preparedCandidate, returned)) {
@@ -3918,6 +4697,7 @@ async function executeCompletion(
       observationStatus: "accepted",
       result,
       acceptance,
+      workspaceRevision: returned.workspaceRevision,
       ...(returned.cognition ? { contextPackRequirements: returned.cognition.contextPackRequirements } : {}),
       preparedSerialized: preparedAcceptance.prepared.serialized,
       preparedHandoff: preparedAcceptance.prepared.handoff,
@@ -3941,7 +4721,7 @@ async function executeCompletion(
   if (preparation && workspace.preparesCompletionBeforeAcceptance !== true) {
     return { observationStatus: "rejected", code: "completion_freeze_failed", result: resultError("completion_freeze_failed") };
   }
-  const expectedRevision = gates.workspaceRevision;
+  const expectedRevision = expectedWorkspaceRevision ?? gates.workspaceRevision;
   let preparedAcceptance: {
     readonly acceptance: AgenticCompletionAcceptance;
     readonly prepared: ReturnType<typeof prepareAcceptedCompletionHandoff>;
@@ -3965,7 +4745,11 @@ async function executeCompletion(
         ...(validated.cognition ? { contextPackRequirements: validated.cognition.contextPackRequirements } : {}),
       });
       const result = { status: "accepted", toolName: COMPLETE_TURN_TOOL, workspaceRevision: validated.workspaceRevision };
-      const prepared = prepareAcceptedCompletionHandoff(call, result, acceptance, preparation);
+      const prepared = prepareAcceptedCompletionHandoff(call, result, acceptance, {
+        ...preparation,
+        completionCriteria: preparation.completionCriteriaForCognition?.(validated.cognition)
+          ?? preparation.completionCriteria,
+      });
       preparedCandidate = preparedCandidateValue;
       preparedAcceptance = { acceptance, prepared };
       return Object.freeze({ acknowledged: true, bundle: preparedCandidateValue });
@@ -3991,7 +4775,14 @@ async function executeCompletion(
       observationStatus: "rejected",
       code,
       result: resultError(code),
+      workspaceRevision: returned.workspaceRevision,
       ...(returned.cognition ? { contextPackRequirements: returned.cognition.contextPackRequirements } : {}),
+      ...(preparation
+        ? {
+            completionCriteria: preparation.completionCriteriaForCognition?.(returned.cognition)
+              ?? preparation.completionCriteria,
+          }
+        : {}),
     };
   }
   if (!preparedAcceptance || !preparedCandidate || !completionFixedPointMatches(preparedCandidate, returned)) {
@@ -4002,6 +4793,7 @@ async function executeCompletion(
   return {
     observationStatus: "accepted",
     result,
+    workspaceRevision: returned.workspaceRevision,
     acceptance,
     ...(returned.cognition ? { contextPackRequirements: returned.cognition.contextPackRequirements } : {}),
     preparedSerialized: preparedAcceptance.prepared.serialized,
@@ -4019,29 +4811,153 @@ export async function runAgenticWorkPhase(
   const deadline = makeDeadlineSignal(options.signal, options.deadlineAt);
   const signal = deadline.signal;
   const limits = normalizeAgenticWorkBudget(options.budget);
-  const state = new WorkBudgetState(limits);
+  const state = new WorkBudgetState(limits, options.inspection, options.workspaceId);
   const observations: AgenticWorkObservation[] = [];
   const childResults: AgenticChildResultMetadata[] = [];
   let pendingBatchCalls: readonly ToolCallResult[] | undefined;
   let pendingBatchObservationStart = 0;
   try {
     const plan = validateAgenticAssemblyPlan(options.plan, options.trustedAssemblyLimits);
+    const phaseMachine = plan.customPhasePlan && plan.customPhasePlan.phases.length > 0
+      ? createAgentRuntimePhaseMachine(plan.customPhasePlan, {
+        admittedCapabilities: options.phaseAdmittedCapabilities,
+      })
+      : null;
+    const phaseRevision = options.phaseRevision ?? 0;
+    const phaseBaseContext = options.phaseEvaluationContext;
+    let workspaceContextRevision: number | undefined;
+    let phaseInput: AgentRuntimePhaseCheckpointInputV1 | null = null;
+    const unavailablePhaseInput = (
+      phase: AgenticWorkspacePhaseCheckpointV1,
+    ): AgentRuntimePhaseCheckpointInputV1 | null => {
+      if (!phaseBaseContext) return null;
+      return Object.freeze({
+        revision: workspaceContextRevision ?? phaseRevision,
+        snapshotAvailable: false,
+        context: parseCognitionEvaluationContext({
+          ...phaseBaseContext,
+          phase,
+        }),
+      });
+    };
+    const readPhaseInput = async (
+      phase: AgenticWorkspacePhaseCheckpointV1,
+    ): Promise<AgentRuntimePhaseCheckpointInputV1 | null> => {
+      if (!phaseBaseContext) return null;
+      const provider = options.workspace?.getPhaseEvaluationSnapshot;
+      if (!provider) return unavailablePhaseInput(phase);
+      try {
+        const expectedRevision = workspaceContextRevision ?? phaseRevision;
+        const snapshot = await abortable(Promise.resolve(provider({
+          phase,
+          expectedRevision,
+          signal,
+        })), signal);
+        if (
+          !Number.isSafeInteger(snapshot.workspaceRevision)
+          || snapshot.workspaceRevision < 0
+          || (
+            workspaceContextRevision !== undefined
+            && snapshot.workspaceRevision < workspaceContextRevision
+          )
+        ) {
+          throw new AgenticWorkPhaseError("completion_freeze_failed", "Phase evaluation snapshot revision is stale");
+        }
+        const context = parseCognitionEvaluationContext({
+          ...phaseBaseContext,
+          phase,
+          taskTransitions: snapshot.taskTransitions,
+        });
+        workspaceContextRevision = snapshot.workspaceRevision;
+        return Object.freeze({
+          revision: snapshot.workspaceRevision,
+          context,
+        });
+      } catch (error) {
+        if (signal.aborted) throw error;
+        return unavailablePhaseInput(phase);
+      }
+    };
+    let phaseEvidenceCount = 0;
+    const recordPhaseEvidence = (): void => {
+      if (!phaseMachine) return;
+      const evidence = phaseMachine.evidence();
+      for (; phaseEvidenceCount < evidence.length; phaseEvidenceCount += 1) {
+        recordCustomPhaseEvidence(state.inspection, evidence[phaseEvidenceCount]!, phaseEvidenceCount);
+      }
+    };
+    state.inspection?.record("policy", {
+      id: "work:policy",
+      kind: "policy",
+      actor: "host",
+      recipient: "agent",
+      result: JSON.stringify({
+        workPolicyMessages: options.workPolicyMessages?.length ?? 0,
+        workspaceUsageMessages: options.workspaceUsageMessages?.length ?? 0,
+        completionCriteriaMessages: options.completionCriteriaMessages?.length ?? 0,
+        renderPolicyMessages: options.renderPolicyMessages?.length ?? 0,
+        cortex: options.cortexContext?.receipt.id ?? null,
+      }),
+    }, { lifecycle: "WORK", status: "running" });
+    if (options.cortexContext) {
+      state.inspection?.record("cortex", options.cortexContext.receipt, {
+        lifecycle: "WORK",
+        status: "running",
+      });
+    }
+    let phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null = null;
+    let phaseEntryMessages: readonly LlmMessage[] = Object.freeze([]);
+    const phaseEntryDrainLimit = Math.max(
+      1,
+      (plan.customPhasePlan?.phases ?? []).reduce((total, phase) => total + phase.repeatLimit + 1, 0) + 1,
+    );
+    const drainPhaseEntry = async (): Promise<boolean> => {
+      if (!phaseMachine) return true;
+      for (let attempt = 0; attempt < phaseEntryDrainLimit; attempt += 1) {
+        phaseInput = await readPhaseInput("WORK");
+        if (!phaseInput) return false;
+        const decision = phaseMachine.enter(phaseInput);
+        recordPhaseEvidence();
+        const machineState = phaseMachine.state();
+        if (decision.status === "entered") {
+          const currentPhase = phaseMachine.currentPhase();
+          if (!currentPhase) return false;
+          phaseCapabilities = new Set(phaseMachine.capabilities());
+          phaseEntryMessages = materializeCustomPhaseMessages(
+            plan,
+            currentPhase,
+            lowerPreparationLimitsV1(options.trustedAssemblyLimits),
+          );
+          return true;
+        }
+        if (machineState.status === "completed") {
+          phaseCapabilities = new Set();
+          phaseEntryMessages = Object.freeze([]);
+          return true;
+        }
+        if (machineState.status === "failed" || machineState.status === "blocked") return false;
+      }
+      return false;
+    };
+    if (!(await drainPhaseEntry())) {
+      return makeOutcome("failed", state, observations, childResults, "invalid_plan");
+    }
     const coreToolIds = options.coreToolIds ?? [];
     const delegatableProfiles = snapshotDelegatableProfiles(options.delegatableProfiles);
-    const composition = composeAgenticWorkToolDefinitions({
-      coreToolIds: [...new Set(coreToolIds)],
-      workspaceCapabilities: options.workspaceCapabilities,
-      contextTools: options.contextTools ?? (options.context ? [CONTEXT_PACK_LIST_TOOL, CONTEXT_PACK_GET_TOOL] : []),
-      allowAgentDelegate: options.allowAgentDelegate,
+    let composition = composeAgenticWorkPhaseComposition(
+      options,
+      coreToolIds,
       delegatableProfiles,
-    }, signal);
+      phaseCapabilities,
+      signal,
+    );
     const turnRootFrameId = ensureBoundedString(options.rootFrameId, MAX_FRAME_ID_BYTES, "rootFrameId");
     const rootModel = ensureBoundedString(options.model, MAX_PROVIDER_MODEL_BYTES, "model");
     const countTokens = await workTokenCounter(rootModel, options.countTokens);
     const rootConnectionId = options.connectionId === null
       ? null
       : ensureBoundedString(options.connectionId, MAX_FRAME_ID_BYTES, "connectionId");
-    const rootFrame = freezeFrame({
+    let rootFrame = freezeFrame({
       ...composition.rootFrame,
       frameId: turnRootFrameId,
       connectionId: rootConnectionId,
@@ -4051,23 +4967,79 @@ export async function runAgenticWorkPhase(
     if (!state.reserveChildIds([turnRootFrameId])) {
       return makeOutcome("failed", state, observations, childResults, "child_schedule_invalid");
     }
-    const schedule = await executeChildSchedule(plan, options, rootFrame, state, signal);
+    const schedule = await executeChildSchedule(plan, options, rootFrame, state, signal, phaseCapabilities);
     childResults.push(...schedule.metadata);
     if (schedule.failure) {
       const status = schedule.failure === "cancelled" ? "cancelled" : schedule.failure === "timed_out" ? "timed_out" : "failed";
       return makeOutcome(status, state, observations, childResults, schedule.failure);
     }
-    const materializedMessages: readonly LlmMessage[] = Object.freeze(
+    const baseMaterializedMessages: readonly LlmMessage[] = Object.freeze(
       (options.rootMessages
         ? clonePrivateValue(options.rootMessages, MAX_PRIVATE_TRANSCRIPT_BYTES, "rootMessages")
         : materializeWorkMessages(plan, schedule.results, options)).map((message) => deepFreeze(structuredClone(message))),
     );
+    const materializedMessages: readonly LlmMessage[] = Object.freeze([
+      ...baseMaterializedMessages,
+      ...phaseEntryMessages,
+    ]);
     const messages: LlmMessage[] = materializedMessages.map((message) => structuredClone(message));
-    const definitions = composition.rootDefinitions;
-    const definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
+    let councilAdviceMessage: LlmMessage | undefined;
+    const clearCouncilAdvice = (): void => {
+      if (councilAdviceMessage) {
+        const index = messages.indexOf(councilAdviceMessage);
+        if (index >= 0) messages.splice(index, 1);
+        councilAdviceMessage = undefined;
+      }
+      state.councilResult = undefined;
+    };
+    const invokeCouncilForCurrentPhase = async (): Promise<"ok" | "failed" | "aborted"> => {
+      const council = options.council;
+      if (!council || !phaseAllowsCapability(phaseCapabilities, "council")) {
+        clearCouncilAdvice();
+        return "ok";
+      }
+      clearCouncilAdvice();
+      let councilResult: WorkCouncilExecutionResult | undefined;
+      try {
+        councilResult = await council.invoke({
+          parentFrameId: turnRootFrameId,
+          messages: Object.freeze(messages.map((message) => structuredClone(message))),
+          signal,
+        });
+      } catch {
+        if (signal.aborted) return "aborted";
+        return council.required ? "failed" : "ok";
+      }
+      if (!councilResult) return "ok";
+      state.councilResult = councilResult;
+      if (signal.aborted) return "aborted";
+      const accepted = councilResult.receipt.state === "accepted"
+        && typeof councilResult.advice === "string"
+        && councilResult.advice.trim().length > 0;
+      if (!accepted) {
+        if (councilResult.receipt.state === "cancelled" && signal.aborted) return "aborted";
+        return council.required ? "failed" : "ok";
+      }
+      const advisory = `Host Council advisory (non-authoritative; WORK root guidance only):\n${councilResult.advice}`;
+      if (boundedBytes(advisory) > options.trustedAssemblyLimits.maxInputBytes) {
+        return council.required ? "failed" : "ok";
+      }
+      councilAdviceMessage = Object.freeze({ role: "system" as const, content: advisory });
+      messages.push(councilAdviceMessage);
+      return "ok";
+    };
+    const councilStatus = await invokeCouncilForCurrentPhase();
+    if (councilStatus === "aborted") {
+      const status = signalStatus(signal);
+      return makeOutcome(status, state, observations, childResults, status);
+    }
+    if (councilStatus === "failed") {
+      return makeOutcome("failed", state, observations, childResults, "council_required_failed");
+    }
+    let definitions = composition.rootDefinitions;
+    let definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
     let providerTransientCarrier: ProviderTransientCarrier | undefined;
     let workspaceContextMessageIndex = -1;
-    let workspaceContextRevision: number | undefined;
     let finalWorkspaceContextProjection: WorkspaceContextProjectionV1 | undefined;
     const refreshWorkspaceContext = async (): Promise<void> => {
       if (!options.workspace?.projectContext) return;
@@ -4166,19 +5138,49 @@ export async function runAgenticWorkPhase(
         console.error(`[agentic] root WORK reserve tokens failed: ${accounting.outputTokens} vs ${maxOutputTokens}`);
         return makeOutcome("failed", state, observations, childResults, "child_output_limit_exceeded");
       }
+      if (!state.recordProviderUsage(response.usage, accounting.outputTokens)) {
+        return makeOutcome("failed", state, observations, childResults, "provider_protocol_error");
+      }
       if (!accounting.privateFieldsReadable && (response.tool_calls?.length ?? 0) === 0) {
         return makeOutcome("failed", state, observations, childResults, "provider_protocol_error");
       }
       if (!response || typeof response.content !== "string" || !Array.isArray(response.tool_calls ?? [])) {
         return makeOutcome("failed", state, observations, childResults, "provider_protocol_error");
       }
+      state.inspection?.record("provider_exchange", {
+        id: `provider:work:${state.providerRounds - 1}`,
+        kind: "provider_exchange",
+        actor: "provider",
+        recipient: "agent",
+        content: response.content,
+        arguments: JSON.stringify({
+          roundIndex: state.providerRounds - 1,
+          toolCalls: (response.tool_calls ?? []).map((call) => ({
+            callId: call.call_id,
+            toolName: call.name,
+            args: call.args,
+          })),
+        }),
+        result: JSON.stringify({
+          finishReason: response.finish_reason,
+          usage: response.usage ?? null,
+        }),
+        provider: {
+          adapter: "agentic-work",
+          providerId: null,
+          modelId: options.model,
+          connectionRevision: null,
+          fingerprint: null,
+        },
+        correlation: { parentId: "root" },
+      }, { lifecycle: "WORK", status: "running" });
       try {
         providerTransientCarrier = mergeResponseProviderCarrier(providerTransientCarrier, assertKnownProviderCarrier(response.providerTransientCarrier));
       } catch (error) {
         return makeOutcome("failed", state, observations, childResults, error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error");
       }
       if (!state.appendWorkNote(response.content)) return makeOutcome("exhausted", state, observations, childResults, "work_budget_exhausted");
-      const calls = response.tool_calls ?? [];
+      const calls = canonicalizeDelegateProfileIds(response.tool_calls ?? [], delegatableProfiles);
       if (calls.length === 0) {
         if (!state.reserveUnsignedBoundary()) return makeOutcome("exhausted", state, observations, childResults, "unsigned_boundary_budget_exhausted");
         if (providerTransientCarrier?.kind === "openai_responses") {
@@ -4198,7 +5200,7 @@ export async function runAgenticWorkPhase(
         return makeOutcome("failed", state, observations, childResults, error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error");
       }
       const hasCompletion = calls.some((call) => call.name === COMPLETE_TURN_TOOL);
-      const completionCriteria = hasCompletion ? materializeCompletionCriteriaMessages(plan, options) : [];
+      let completionCriteria: readonly LlmMessage[] = [];
       if (hasCompletion && calls.length !== 1) {
         if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes)) {
           appendBoundedBatchFailureObservations(state, observations, calls, "completion_control_budget_exhausted");
@@ -4246,6 +5248,7 @@ export async function runAgenticWorkPhase(
         readonly profileId: string;
         readonly taskId: string;
         readonly task: string;
+        readonly required: boolean;
         readonly maxOutputTokens: number;
         readonly requestedToolIds: readonly CoreAgentToolId[];
         readonly workspaceCapabilities: readonly WorkspaceOperationKindV1[];
@@ -4253,16 +5256,24 @@ export async function runAgenticWorkPhase(
       for (let index = 0; index < calls.length; index += 1) {
         const call = calls[index]!;
         if (call.name !== AGENT_DELEGATE_TOOL || validation.errors.has(index) || !isRecord(call.args)) continue;
-        const profileId = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
-        const profile = delegatableProfiles.find((candidate) => candidate.profileId === profileId);
+        const suppliedProfileId = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
+        const profile = resolveDelegatableProfile(delegatableProfiles, suppliedProfileId);
+        const profileId = profile?.profileId ?? suppliedProfileId;
         const taskId = typeof call.args.task_id === "string" ? call.args.task_id : "";
         const task = typeof call.args.task === "string" ? call.args.task : "";
         const requestedToolIds = Array.isArray(call.args.tool_ids)
           ? call.args.tool_ids as CoreAgentToolId[]
           : profile?.toolIds ?? [];
         if (!profile || !taskId || !task || requestedToolIds.some((toolId) => !profile.toolIds.includes(toolId))) continue;
+        const phaseToolIds = phaseAllowsCapability(phaseCapabilities, "core_retrieval")
+          ? requestedToolIds
+          : [];
+        const phaseWorkspaceCapabilities = narrowWorkspaceCapabilitiesForPhase(
+          profile.workspaceCapabilities,
+          phaseCapabilities,
+        );
         const workspaceCapabilities = Object.freeze(
-          [...normalizedWorkspaceCapabilities(profile.workspaceCapabilities)]
+          [...normalizedWorkspaceCapabilities(phaseWorkspaceCapabilities)]
             .filter((operation) => CHILD_ASSIGNED_OPERATIONS.includes(operation)),
         );
         const hasProgress = workspaceCapabilities.includes("update_assigned_progress");
@@ -4280,11 +5291,12 @@ export async function runAgenticWorkPhase(
           profileId,
           taskId,
           task,
+          required: false,
           maxOutputTokens: Math.min(
             profile.maxOutputTokens ?? limits.maxOutputTokens,
             Math.max(1, Math.ceil(limits.maxChildOutputBytes / 4)),
           ),
-          requestedToolIds: Object.freeze([...requestedToolIds]),
+          requestedToolIds: Object.freeze([...phaseToolIds]),
           workspaceCapabilities,
         });
       }
@@ -4321,6 +5333,8 @@ export async function runAgenticWorkPhase(
               } else if (!open.assignable) {
                 assignmentRejections.set(callId, "not_found");
                 delegateCandidates.delete(callId);
+              } else {
+                delegateCandidates.set(callId, { ...candidate, required: open.required });
               }
             }
           }
@@ -4348,6 +5362,10 @@ export async function runAgenticWorkPhase(
       let acceptance: AgenticCompletionAcceptance | undefined;
       let preparedCompletionSerialized: string | undefined;
       let preparedCompletionHandoff: AgenticWorkRenderHandoff | undefined;
+      let phaseTransitioned = false;
+      let phaseTerminalPending = false;
+      let phaseCompletionFailed = false;
+      let phaseCompletionExpectedRevision: number | undefined;
       const preparedDelegates = new Map<string, {
         readonly descriptor: AssemblyChildDescriptorV1 & Readonly<{ taskId: string }>;
         readonly frame: AgenticWorkFrame;
@@ -4381,7 +5399,7 @@ export async function runAgenticWorkPhase(
           slotIndex: -1,
           maxOutputBytes: limits.maxChildOutputBytes,
           maxOutputTokens: candidate.maxOutputTokens,
-          required: false,
+          required: candidate.required,
           toolIds: candidate.requestedToolIds,
           streamActivity: false,
           sourceOffset: ordinal,
@@ -4442,10 +5460,8 @@ export async function runAgenticWorkPhase(
             return finishBatchAbort(status);
           }
           workspaceContextRevision = assignment.workspaceRevision;
-          await refreshWorkspaceContext();
-          if (signal.aborted) {
-            const status = signalStatus(signal);
-            return finishBatchAbort(status);
+          if (phaseMachine && phaseMachine.state().status === "entered") {
+            phaseInput = await readPhaseInput("WORK");
           }
         } catch (error) {
           if (!assignmentCommitted) {
@@ -4467,9 +5483,31 @@ export async function runAgenticWorkPhase(
           for (const callId of preparedDelegates.keys()) assignmentRejections.set(callId, mapped);
           preparedDelegates.clear();
         }
+        if (assignmentCommitted) {
+          try {
+            await refreshWorkspaceContext();
+          } catch (error) {
+            if (signal.aborted) {
+              const status = signalStatus(signal);
+              return finishBatchAbort(status);
+            }
+            return makeOutcome(
+              "failed",
+              state,
+              observations,
+              childResults,
+              error instanceof AgenticWorkPhaseError ? error.code : "provider_error",
+            );
+          }
+          if (signal.aborted) {
+            const status = signalStatus(signal);
+            return finishBatchAbort(status);
+          }
+        }
       }
       const serializedResults: string[] = [];
       const resultErrors: boolean[] = [];
+      let requiredDelegatedFailure: AgenticWorkErrorCode | undefined;
       for (let index = 0; index < calls.length; index += 1) {
         const call = calls[index]!;
         const validationError = validation.errors.get(index);
@@ -4486,24 +5524,97 @@ export async function runAgenticWorkPhase(
             code = "tool_result_limit_exceeded";
             result = resultError(code);
           } else {
-            const completion = await executeCompletion(
-              call,
-              rootFrame,
-              options.workspace,
-              {
-                providerTransientCarrier,
-                messages,
-                response,
-                completionCriteria,
-                maxToolResultBytes: limits.maxToolResultBytes,
-              },
-            );
+            const completionPreparation: CompletionHandoffPreparation = {
+              providerTransientCarrier,
+              messages,
+              response,
+              completionCriteria,
+              maxToolResultBytes: limits.maxToolResultBytes,
+              completionCriteriaForCognition: (cognition) =>
+                materializeCompletionCriteriaMessages(plan, options, cognition),
+              ...(options.cortexContext
+                ? { renderExcludedMessageNames: [cortexContextMessageName(options.cortexContext)] }
+                : {}),
+            };
+            let completion: CompletionExecutionResult;
+            // A custom COMPLETE checkpoint is a writable phase boundary. Do
+            // not invoke the irreversible completion CAS until the terminal
+            // exit has been evaluated against the fresh workspace snapshot.
+            if (
+              phaseMachine
+              && options.workspace
+              && phaseMachine.state().status !== "completed"
+            ) {
+              const phasePayload = parseCompleteTurnPayload(call.args);
+              if (phasePayload.payload) {
+                phaseInput = await readPhaseInput("COMPLETE");
+                if (!phaseInput) {
+                  phaseCompletionFailed = true;
+                } else {
+                  const exitDecision = phaseMachine.previewExit(phaseInput);
+                  if (exitDecision.status === "completed") {
+                    phaseCompletionExpectedRevision = phaseInput.revision;
+                    phaseTerminalPending = true;
+                  } else {
+                    const committedDecision = phaseMachine.exit(phaseInput);
+                    recordPhaseEvidence();
+                    if (committedDecision.status === "failed" || committedDecision.status === "blocked") {
+                      phaseCompletionFailed = true;
+                    } else if (!(await drainPhaseEntry())) {
+                      phaseCompletionFailed = true;
+                    } else {
+                      phaseTransitioned = true;
+                    }
+                  }
+                }
+              }
+            }
+            if (phaseCompletionFailed) {
+              completion = {
+                observationStatus: "rejected",
+                code: "invalid_plan",
+                result: resultError("invalid_plan"),
+              };
+            } else if (phaseTransitioned) {
+              const workspaceRevision = workspaceContextRevision ?? phaseInput?.revision ?? 0;
+              completion = {
+                observationStatus: "accepted",
+                result: {
+                  status: "accepted",
+                  toolName: COMPLETE_TURN_TOOL,
+                  workspaceRevision,
+                },
+              };
+            } else {
+              completion = await executeCompletion(
+                call,
+                rootFrame,
+                options.workspace,
+                completionPreparation,
+                phaseCompletionExpectedRevision,
+              );
+            }
+            if (phaseTerminalPending && completion.acceptance && phaseMachine && phaseInput) {
+              const committedDecision = phaseMachine.exit(phaseInput);
+              recordPhaseEvidence();
+              if (committedDecision.status !== "completed") {
+                throw new AgenticWorkPhaseError("completion_freeze_failed", "Terminal phase exit changed between preview and acceptance");
+              }
+              phaseTerminalPending = false;
+            }
             observationStatus = completion.observationStatus;
             code = completion.code;
             result = completion.result;
             acceptance = completion.acceptance;
             preparedCompletionSerialized = completion.preparedSerialized;
             preparedCompletionHandoff = completion.preparedHandoff;
+            completionCriteria = completion.completionCriteria ?? [];
+            if (completion.workspaceRevision !== undefined) {
+              workspaceContextRevision = completion.workspaceRevision;
+            }
+            if (!acceptance) {
+              console.error(`[agentic] complete_turn ${observationStatus}${code ? ` (${code})` : ""}`);
+            }
             // Accepted completion requirements are provisional: the coordinator
             // publishes them only after the COMMIT transaction succeeds. A
             // rejected/blocked fixed point has already committed its cognition
@@ -4515,13 +5626,15 @@ export async function runAgenticWorkPhase(
                   const status = signalStatus(signal);
                   return finishBatchAbort(status);
                 }
-              } catch {
+              } catch (error) {
                 if (signal.aborted) {
                   const status = signalStatus(signal);
                   return finishBatchAbort(status);
                 }
-                appendUnobservedBatchFailureObservations(state, observations, calls, batchObservationStart, "provider_error");
-                return makeOutcome("failed", state, observations, childResults, "provider_error");
+                // A blocked complete_turn already told the model to continue.
+                // Refresh is best-effort here: failing WORK as provider_error
+                // hides the real blocker and aborts a recoverable tool loop.
+                console.error(`[agentic] complete_turn blocked refresh failed: ${error instanceof Error ? error.message : String(error)}`);
               }
             }
             if (!acceptance && signal.aborted) {
@@ -4537,6 +5650,9 @@ export async function runAgenticWorkPhase(
               return finishBatchAbort(status);
             }
             if (workspaceResult.workspaceRevision !== undefined) workspaceContextRevision = workspaceResult.workspaceRevision;
+            if (phaseMachine && phaseMachine.state().status === "entered") {
+              phaseInput = await readPhaseInput("WORK");
+            }
             if (workspaceResult.cognitionCommitted === true && workspaceResult.contextPackRequirements && options.context?.refreshContextCapability) {
               try {
                 await abortable(Promise.resolve(options.context.refreshContextCapability(workspaceResult.contextPackRequirements)), signal);
@@ -4593,7 +5709,7 @@ export async function runAgenticWorkPhase(
           }
         } else if (call.name === AGENT_DELEGATE_TOOL) {
           const profileId = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
-          const profile = delegatableProfiles.find((candidate) => candidate.profileId === profileId);
+          const profile = resolveDelegatableProfile(delegatableProfiles, profileId);
           const task = typeof call.args.task === "string" ? call.args.task : "";
           const assignmentError = assignmentRejections.get(call.call_id);
           const prepared = preparedDelegates.get(call.call_id);
@@ -4623,6 +5739,9 @@ export async function runAgenticWorkPhase(
                 return finishBatchAbort(status);
               }
               const content = typeof delegated === "string" ? delegated : delegated.content ?? "";
+              if (typeof delegated !== "string" && delegated.usage && !state.mergeProviderUsage(delegated.usage)) {
+                throw new AgenticWorkPhaseError("provider_protocol_error", "Child provider usage is malformed");
+              }
               if (typeof delegated !== "string" && delegated.workspaceRevision !== undefined) {
                 if (
                   !Number.isSafeInteger(delegated.workspaceRevision)
@@ -4632,6 +5751,9 @@ export async function runAgenticWorkPhase(
                   throw new AgenticWorkPhaseError("tool_protocol_error", "Child workspace revision is malformed or stale");
                 }
                 workspaceContextRevision = delegated.workspaceRevision;
+                if (phaseMachine && phaseMachine.state().status === "entered") {
+                  phaseInput = await readPhaseInput("WORK");
+                }
               }
               const bytes = boundedBytes(content);
               if (
@@ -4656,7 +5778,7 @@ export async function runAgenticWorkPhase(
                 childId: prepared.descriptor.childId,
                 profileId: prepared.descriptor.profileId,
                 slotIndex: prepared.descriptor.slotIndex,
-                required: false,
+                required: prepared.descriptor.required,
                 status: childStatus,
                 outputBytes: bytes,
                 ...(failureCode ? { errorCode: failureCode } : {}),
@@ -4668,6 +5790,9 @@ export async function runAgenticWorkPhase(
                   : childStatus === "timed_out"
                     ? "timed_out"
                     : "child_required_failed";
+                if (prepared.descriptor.required) {
+                  requiredDelegatedFailure = requiredChildFailure(childStatus, failureCode);
+                }
                 result = resultError(failureCode ?? code);
               } else {
                 result = { status: "success", toolName: AGENT_DELEGATE_TOOL, data: { status: "succeeded", content } };
@@ -4689,11 +5814,14 @@ export async function runAgenticWorkPhase(
                 childId: prepared.descriptor.childId,
                 profileId: prepared.descriptor.profileId,
                 slotIndex: prepared.descriptor.slotIndex,
-                required: false,
+                required: prepared.descriptor.required,
                 status: childStatus,
                 outputBytes: 0,
                 ...(code ? { errorCode: code } : {}),
               });
+              if (prepared.descriptor.required) {
+                requiredDelegatedFailure = requiredChildFailure(childStatus, code);
+              }
             }
           }
         } else if (CORE_TOOL_SET.has(call.name)) {
@@ -4740,17 +5868,36 @@ export async function runAgenticWorkPhase(
           }
         }
         const normalizedStatus = acceptance && call.name === COMPLETE_TURN_TOOL ? "accepted" : observationStatus;
+        recordHostToolTranscript(state, call, serialized, code);
         observations.push(completionObservation(state, call, normalizedStatus, code, serialized));
+        if (phaseCompletionFailed) {
+          pendingBatchCalls = undefined;
+          return makeOutcome("failed", state, observations, childResults, "invalid_plan");
+        }
         if (resultLimitFailure) {
           appendUnobservedBatchFailureObservations(state, observations, calls, batchObservationStart, "tool_result_limit_exceeded");
           pendingBatchCalls = undefined;
           return makeOutcome("failed", state, observations, childResults, "tool_result_limit_exceeded");
+        }
+        if (requiredDelegatedFailure) {
+          appendUnobservedBatchFailureObservations(
+            state,
+            observations,
+            calls,
+            batchObservationStart,
+            requiredDelegatedFailure,
+          );
+          pendingBatchCalls = undefined;
+          return makeOutcome("failed", state, observations, childResults, requiredDelegatedFailure);
         }
         serializedResults.push(serialized);
         resultErrors.push(normalizedStatus === "rejected" || normalizedStatus === "error");
         if (acceptance) break;
       }
       if (acceptance) {
+        if (Number.isSafeInteger(acceptance.workspaceRevision) && acceptance.workspaceRevision >= 0) {
+          workspaceContextRevision = acceptance.workspaceRevision;
+        }
         if (!preparedCompletionHandoff) {
           throw new AgenticWorkPhaseError("completion_freeze_failed", "Accepted completion render handoff was not prepared before the workspace CAS");
         }
@@ -4765,6 +5912,39 @@ export async function runAgenticWorkPhase(
           materializedMessages,
           preparedCompletionHandoff,
         );
+      }
+      if (phaseTransitioned) {
+        const phaseTerminal = phaseMachine?.state().status === "completed";
+        phaseCapabilities = phaseTerminal
+          ? new Set()
+          : new Set(phaseMachine?.capabilities() ?? []);
+        composition = composeAgenticWorkPhaseComposition(
+          options,
+          coreToolIds,
+          delegatableProfiles,
+          phaseCapabilities,
+          signal,
+        );
+        rootFrame = freezeFrame({
+          ...composition.rootFrame,
+          frameId: turnRootFrameId,
+          connectionId: rootConnectionId,
+          model: rootModel,
+          signal,
+        });
+        definitions = composition.rootDefinitions;
+        definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
+        if (!phaseTerminal) {
+          messages.push(...materializeCustomPhaseMessages(plan, phaseMachine?.currentPhase() ?? null, lowerPreparationLimitsV1(options.trustedAssemblyLimits)));
+        }
+        const phaseCouncilStatus = await invokeCouncilForCurrentPhase();
+        if (phaseCouncilStatus === "aborted") {
+          const status = signalStatus(signal);
+          return makeOutcome(status, state, observations, childResults, status);
+        }
+        if (phaseCouncilStatus === "failed") {
+          return makeOutcome("failed", state, observations, childResults, "council_required_failed");
+        }
       }
       providerTransientCarrier = mergeWorkProviderCarrier(
         providerTransientCarrier,
@@ -4788,6 +5968,9 @@ export async function runAgenticWorkPhase(
     }
   } catch (error) {
     const failureCode = error instanceof AgenticWorkPhaseError ? error.code : "internal_error";
+    const detail = error instanceof Error ? error.message : String(error);
+    const path = error instanceof AgenticWorkPhaseError && error.path ? ` path=${error.path}` : "";
+    console.error(`[agentic] WORK phase threw (${failureCode}): ${detail}${path}`);
     if (pendingBatchCalls) {
       if (signal.aborted) {
         appendUnobservedBatchCancellationObservations(

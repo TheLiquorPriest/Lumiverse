@@ -6,8 +6,10 @@ import { getDb } from "../db/connection";
 import { eventBus, type BufferedEvent } from "../ws/bus";
 import { EventType } from "../ws/events";
 import {
+  persistAgentRunInspectionInTransaction,
   persistTerminalAgentActivityRunInTransaction,
   type PersistAgentActivityRunInput,
+  type PersistAgentRunInspectionInputV1,
 } from "./agent-activity-runs.service";
 import {
   AGENTIC_FINAL_RENDER_RESERVATION_COMPONENTS_V1,
@@ -16,6 +18,13 @@ import {
   type TurnCommitReceipt,
   type TurnExecutionRecord,
 } from "./turn-execution.service";
+import {
+  AGENT_PUBLIC_ERROR_CODES,
+  type AgentPublicErrorCategory,
+  type AgentPublicErrorCode,
+  type AgentRecoveryActionV2,
+} from "../types/agent-runtime";
+
 import type {
   AgentActivityNodeV2,
   AgentActivityNodeKindV2,
@@ -25,13 +34,18 @@ import type {
   AgentOmissionMarkerV2,
   AgentRunChangeEventV2,
   AgentRunChangesV2,
+  AgentRunPublicErrorV2,
   AgentRunGenerationTypeV1,
+  AgentRunPublicPhaseV2,
+  AgentRunPublicOutcomeV2,
   AgentRunPublicStatusV2,
   AgentRunPublicV2,
   AgentRunStopResponseV2,
   AgentRunStopResultV2,
   AgentRunTargetV1,
   AgentTerminalHandoffV2,
+  AgentWorkAttemptLineageV1,
+  AgentWorkTargetIdentityV1,
   AgentWorkspaceEntryPreviewV2,
   AgentWorkspaceIndexV2,
   AgentWorkspacePreviewV2,
@@ -74,12 +88,25 @@ function isExpiredAt(value: unknown, now = Date.now()): boolean {
   const expiresAt = expiryToMilliseconds(value);
   return expiresAt !== null && expiresAt <= now;
 }
+type StoredRunState =
+  | "ASSEMBLE"
+  | "WORK"
+  | "COMPLETE"
+  | "RENDER"
+  | "PREPARE_COMMIT"
+  | "COMMITTING"
+  | "COMMITTED"
+  | "COMMIT_FAILED"
+  | "EXHAUSTED"
+  | "FAILED"
+  | "CANCELLED"
+  | "TIMED_OUT";
 
-const PUBLIC_STATUSES = new Set<AgentRunPublicStatusV2>([
+const STORED_STATES = new Set<StoredRunState>([
   "ASSEMBLE", "WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING",
   "COMMITTED", "COMMIT_FAILED", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT",
 ]);
-const LIFECYCLE_STATUS_MAP: Readonly<Record<string, AgentRunPublicStatusV2>> = Object.freeze({
+const LEGACY_STATE_MAP: Readonly<Record<string, StoredRunState>> = Object.freeze({
   queued: "ASSEMBLE",
   running: "WORK",
   completed: "COMMITTED",
@@ -90,61 +117,12 @@ const LIFECYCLE_STATUS_MAP: Readonly<Record<string, AgentRunPublicStatusV2>> = O
 const GENERATION_TYPES = new Set<AgentRunGenerationTypeV1>([
   "normal", "continue", "regenerate", "swipe",
 ]);
-const TERMINAL_STATUSES = new Set<AgentRunPublicStatusV2>([
+const TERMINAL_STATES = new Set<StoredRunState>([
   "COMMITTED", "COMMIT_FAILED", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT",
 ]);
-const PUBLIC_ERROR_CODES: ReadonlySet<string> = new Set([
-  "capacity_exceeded",
-  "host_child_admission_limit_exceeded",
-  "host_tool_call_limit_exceeded",
-  "child_admission_limit_exceeded",
-  "tool_call_limit_exceeded",
-  "logical_provider_request_limit_exceeded",
-  "physical_dispatch_attempt_limit_exceeded",
-  "child_output_token_limit_exceeded",
-  "root_wall_clock_limit_exceeded",
-  "activity_event_limit_exceeded",
-  "activity_byte_limit_exceeded",
-  "lifecycle_log_record_limit_exceeded",
-  "context_limit_exceeded",
-  "initial_input_limit_exceeded",
-  "argument_limit_exceeded",
-  "result_limit_exceeded",
-  "continuation_limit_exceeded",
-  "retained_output_limit_exceeded",
-  "materialized_limit_exceeded",
-  "timeout",
-  "cancelled",
-  "provider_unavailable",
-  "provider_unsupported",
-  "provider_tool_calling_unsupported",
-  "provider_tool_continuation_unsupported",
-  "provider_tool_finalization_unsupported",
-  "provider_request_error",
-  "provider_protocol_error",
-  "provider_schema_error",
-  "invalid_task",
-  "invalid_profile",
-  "invalid_arguments",
-  "batch_rejected",
-  "unknown_tool",
-  "unauthorized",
-  "integrity_error",
-  "internal_error",
-  "decision_refresh_required",
-  "requires_response_mode",
-  "invalid_input",
-  "limit_exceeded",
-  "queue_full",
-  "worker_disabled",
-  "worker_unavailable",
-  "worker_crashed",
-  "worker_timed_out",
-  "worker_malformed",
-] as const);
-const TOO_LATE_STATUSES = new Set<AgentRunPublicStatusV2>([
-  "COMMITTING", "COMMITTED",
-]);
+
+const PUBLIC_ERROR_CODES: ReadonlySet<AgentPublicErrorCode> = new Set(AGENT_PUBLIC_ERROR_CODES);
+const TOO_LATE_STATES = new Set<StoredRunState>(["COMMITTING", "COMMITTED"]);
 const NODE_KINDS = new Set<AgentActivityNodeKindV2>(["root", "provider", "child", "tool"]);
 const NODE_ACTORS = new Set<AgentActivityNodeActorV2>(["root", "provider", "child", "tool"]);
 const NODE_STATUSES = new Set<AgentActivityNodeStatusV2>([
@@ -168,20 +146,40 @@ export interface AgentRunProjectionInputV2 {
   readonly generationType: AgentRunGenerationTypeV1;
   readonly targetMessageId?: string | null;
   readonly targetSwipeId?: number | null;
-  readonly status: AgentRunPublicStatusV2;
+  readonly attemptLineage?: Partial<AgentWorkAttemptLineageV1> | null;
+  /** Private durable state compatibility; public callers use work* fields. */
+  readonly status?: StoredRunState;
+  readonly phase?: StoredRunState;
+  readonly workPhase?: AgentRunPublicPhaseV2;
+  readonly workStatus?: AgentRunPublicStatusV2;
+  readonly workOutcome?: AgentRunPublicOutcomeV2 | null;
+  readonly reason?: unknown;
+  readonly error?: {
+    readonly code?: unknown;
+    readonly category?: unknown;
+    readonly summaryCode?: unknown;
+    readonly recoveryEligible?: unknown;
+    readonly recoveryAction?: unknown;
+    readonly target?: unknown;
+    readonly workPhase?: unknown;
+    readonly workStatus?: unknown;
+    readonly workOutcome?: unknown;
+    readonly reason?: unknown;
+    readonly omissionCount?: unknown;
+    readonly inspectionAttemptId?: unknown;
+    /** Legacy input compatibility only; never emitted in V2. */
+    readonly retryable?: unknown;
+  } | null;
   readonly revision?: number;
   readonly startedAt?: number;
   readonly updatedAt?: number;
   readonly activity?: unknown;
   readonly usage?: unknown;
-  readonly error?: { readonly code?: unknown; readonly retryable?: unknown } | null;
   readonly terminalHandoff?: Partial<AgentTerminalHandoffV2> | null;
   readonly omission?: Partial<AgentOmissionMarkerV2> | null;
   /** Optional already-redacted V1 activity input for compatibility storage. */
   readonly compatibilitySnapshot?: unknown;
-  /** Internal receipt repair may replace a stale non-committed terminal projection. */
   readonly receiptRepair?: boolean;
-  /** Startup terminalization may replace a stale terminal snapshot atomically. */
   readonly recoveryRepair?: boolean;
 }
 
@@ -274,9 +272,170 @@ interface AgentRunStopTransactionResult {
   readonly event?: BufferedEvent;
   readonly changed?: boolean;
 }
-function safePublicErrorCode(value: unknown): string | undefined {
-  return typeof value === "string" && PUBLIC_ERROR_CODES.has(value) ? value : undefined;
+function safePublicErrorCode(value: unknown): AgentPublicErrorCode | undefined {
+  if (typeof value !== "string") return undefined;
+  const canonical = value === "requires_response_mode" ? "response_mode_required" : value;
+  return PUBLIC_ERROR_CODES.has(canonical as AgentPublicErrorCode)
+    ? canonical as AgentPublicErrorCode
+    : undefined;
 }
+function publicErrorCategory(code: string): AgentPublicErrorCategory {
+  if (
+    code === "capacity_exceeded"
+    || code.startsWith("host_")
+    || code.endsWith("_admission_limit_exceeded")
+    || code.endsWith("_tool_call_limit_exceeded")
+    || code.endsWith("_dispatch_attempt_limit_exceeded")
+    || code.endsWith("_execution_limit_exceeded")
+    || code === "queue_full"
+  ) return "capacity";
+  if (
+    code.includes("limit")
+    || code.includes("budget")
+    || code.endsWith("_bytes")
+    || code.endsWith("_tokens")
+    || code === "exhausted"
+  ) return "budget";
+  if (
+    code.includes("context")
+    || code.includes("input")
+    || code.includes("argument")
+    || code.includes("result")
+    || code.includes("continuation")
+    || code.includes("retained")
+    || code.includes("materialized")
+  ) return "context";
+  if (code === "timeout" || code === "worker_timed_out") return "timeout";
+  if (code === "cancelled" || code === "stopped") return "cancelled";
+  if (code.startsWith("provider_") || code.startsWith("worker_")) return "provider";
+  if (
+    code.startsWith("invalid_")
+    || code === "batch_rejected"
+    || code === "unknown_tool"
+    || code === "target_mismatch"
+    || code === "stale_target"
+    || code === "response_mode_required"
+    || code === "decision_refresh_required"
+  ) return "validation";
+  return "internal";
+}
+
+function isRejectedErrorCode(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return [
+    "invalid_input",
+    "invalid_task",
+    "invalid_profile",
+    "invalid_arguments",
+    "batch_rejected",
+    "target_mismatch",
+    "stale_target",
+    "unknown_tool",
+  ].includes(value);
+}
+
+function defaultErrorCodeForState(state: StoredRunState, terminalCode?: unknown, reason?: unknown): string | undefined {
+  const explicit = safePublicErrorCode(terminalCode);
+  if (explicit) return explicit;
+  if (state === "CANCELLED") return "cancelled";
+  if (state === "TIMED_OUT") return "timeout";
+  if (state === "EXHAUSTED") return "limit_exceeded";
+  if (state === "COMMIT_FAILED" || state === "FAILED") {
+    return reason === "rejected" ? "invalid_input" : "internal_error";
+  }
+  return undefined;
+}
+
+function normalizeRecoveryAction(value: unknown): AgentRecoveryActionV2 | undefined {
+  return value === "retry"
+    || value === "repair"
+    || value === "reselect"
+    || value === "use_response"
+    || value === "resync"
+    || value === "none"
+    ? value
+    : undefined;
+}
+
+function recoveryForProjection(
+  explicitEligible: unknown,
+  explicitAction: unknown,
+  code: string | undefined,
+  outcome: AgentRunPublicOutcomeV2 | null,
+  reason: string | null,
+): { readonly recoveryEligible: boolean; readonly recoveryAction: AgentRecoveryActionV2 } {
+  const action = normalizeRecoveryAction(explicitAction);
+  if (action === "none") return { recoveryEligible: false, recoveryAction: "none" };
+  if (action) {
+    return {
+      recoveryEligible: explicitEligible === false ? false : true,
+      recoveryAction: explicitEligible === false ? "none" : action,
+    };
+  }
+  if (explicitEligible === false) return { recoveryEligible: false, recoveryAction: "none" };
+  if (code === "response_mode_required") {
+    return { recoveryEligible: true, recoveryAction: "use_response" };
+  }
+  if (outcome === "rejected") {
+    return {
+      recoveryEligible: true,
+      recoveryAction: code === "target_mismatch" || code === "stale_target" || code === "invalid_profile"
+        ? "reselect" : "repair",
+    };
+  }
+  if (outcome === "failed" || outcome === "exhausted" || outcome === "stopped") {
+    return { recoveryEligible: true, recoveryAction: "retry" };
+  }
+  if (reason === "needs_attention" || reason === "interrupted") {
+    return { recoveryEligible: true, recoveryAction: "repair" };
+  }
+  return { recoveryEligible: false, recoveryAction: "none" };
+}
+function buildPublicError(
+  code: string,
+  target: AgentWorkTargetIdentityV1,
+  workPhase: AgentRunPublicPhaseV2,
+  workStatus: AgentRunPublicStatusV2,
+  workOutcome: AgentRunPublicOutcomeV2 | null,
+  reason: string | null,
+  omission: AgentOmissionMarkerV2,
+  inspectionAttemptId: string | null,
+  explicitCategory?: unknown,
+  explicitSummaryCode?: unknown,
+  explicitEligible?: unknown,
+  explicitAction?: unknown,
+): AgentRunPublicErrorV2 {
+  const normalizedCode = safePublicErrorCode(code) ?? "internal_error";
+  const category = typeof explicitCategory === "string"
+    && ["capacity", "budget", "context", "integrity", "timeout", "cancelled", "provider", "validation", "internal"].includes(explicitCategory)
+    ? explicitCategory as AgentPublicErrorCategory
+    : publicErrorCategory(normalizedCode);
+  const summaryCode = typeof explicitSummaryCode === "string"
+    && /^agentRun\.errors\.[A-Za-z0-9_.:-]{1,128}$/.test(explicitSummaryCode)
+    ? explicitSummaryCode
+    : `agentRun.errors.${normalizedCode}`;
+  const recovery = recoveryForProjection(explicitEligible, explicitAction, normalizedCode, workOutcome, reason);
+  const omissionCount = Math.min(
+    MAX_SAFE_COUNTER,
+    omission.omittedNodeCount + omission.omittedEventCount,
+  );
+  return {
+    code: normalizedCode,
+    category,
+    summaryCode,
+    recoveryEligible: recovery.recoveryEligible,
+    recoveryAction: recovery.recoveryAction,
+    target,
+    workPhase,
+    workStatus,
+    workOutcome,
+    reason,
+    omissionCount,
+    inspectionAttemptId,
+  };
+}
+
+
 
 function boundedId(value: unknown, maxBytes = MAX_ID_BYTES): string | null {
   return boundedText(value, maxBytes);
@@ -306,10 +465,226 @@ function boundedBytesJson(value: unknown, maxBytes: number): string | null {
   }
 }
 
-function normalizeStatus(value: unknown): AgentRunPublicStatusV2 {
-  if (typeof value !== "string") return "FAILED";
-  if (PUBLIC_STATUSES.has(value as AgentRunPublicStatusV2)) return value as AgentRunPublicStatusV2;
-  return LIFECYCLE_STATUS_MAP[value] ?? "FAILED";
+const WORK_PHASES = new Set<AgentRunPublicPhaseV2>([
+  "ADMIT", "ASSEMBLE", "WORK", "PREPARE_COMMIT", "RENDER", "COMMIT", "TERMINAL",
+]);
+const WORK_STATUSES = new Set<AgentRunPublicStatusV2>([
+  "pending", "running", "waiting", "cancelling", "terminal",
+]);
+const WORK_OUTCOMES = new Set<AgentRunPublicOutcomeV2>([
+  "completed", "stopped", "failed", "exhausted", "rejected",
+]);
+type CanonicalTerminalCause = "stopped" | "exhausted" | "failed";
+
+function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
+  if (typeof value !== "string") return null;
+  const code = value.trim().toLowerCase();
+  if (!code) return null;
+  if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
+    return "stopped";
+  }
+  if (
+    code === "exhausted"
+    || code === "budget_exhausted"
+    || code === "budget_exceeded"
+    || code === "limit_exceeded"
+    || code === "agentic_work_exhausted"
+    || code === "root_wall_clock_limit_exceeded"
+    || code.endsWith("_limit_exceeded")
+    || code.endsWith("_budget_exhausted")
+    || code.endsWith("_budget_exceeded")
+  ) {
+    return "exhausted";
+  }
+  return "failed";
+}
+
+function terminalCodeForInput(input: AgentRunProjectionInputV2, existing?: AgentRunPublicV2): unknown {
+  if (input.error !== undefined) {
+    return input.error && typeof input.error === "object" ? input.error.code : undefined;
+  }
+  return existing?.error?.code;
+}
+
+function reasonCodeForInput(input: AgentRunProjectionInputV2, existing?: AgentRunPublicV2): unknown {
+  return input.reason === undefined ? existing?.reason : input.reason;
+}
+
+
+function normalizeStoredState(value: unknown): StoredRunState {
+  if (typeof value === "string" && STORED_STATES.has(value as StoredRunState)) {
+    return value as StoredRunState;
+  }
+  return typeof value === "string" ? LEGACY_STATE_MAP[value] ?? "FAILED" : "FAILED";
+}
+
+function storedStateFromCanonical(
+  phase: AgentRunPublicPhaseV2 | null | undefined,
+  status: AgentRunPublicStatusV2 | null | undefined,
+  outcome: AgentRunPublicOutcomeV2 | null | undefined,
+  reason: string | null | undefined,
+  terminalCode?: unknown,
+): StoredRunState {
+  if (status === "terminal" || phase === "TERMINAL" || outcome !== null && outcome !== undefined) {
+    const cause = terminalCauseForCode(terminalCode ?? reason);
+    if (outcome === "completed") return "COMMITTED";
+    if (outcome === "stopped") return cause === "failed" ? "FAILED" : "CANCELLED";
+    if (outcome === "exhausted") return cause === "failed" ? "FAILED" : "EXHAUSTED";
+    return "FAILED";
+  }
+  if (phase === "ADMIT" || phase === "ASSEMBLE") return "ASSEMBLE";
+  if (phase === "WORK") return "WORK";
+  if (phase === "PREPARE_COMMIT") return "COMPLETE";
+  if (phase === "RENDER") return "RENDER";
+  if (phase === "COMMIT") return "COMMITTING";
+  return "ASSEMBLE";
+}
+
+function normalizeInputState(
+  input: AgentRunProjectionInputV2,
+  existing?: AgentRunPublicV2,
+): StoredRunState {
+  if (input.status !== undefined) return normalizeStoredState(input.status);
+  if (input.phase !== undefined) return normalizeStoredState(input.phase);
+  const phase = input.workPhase ?? existing?.workPhase;
+  const status = input.workStatus ?? existing?.workStatus;
+  const outcome = input.workOutcome === undefined ? existing?.workOutcome : input.workOutcome;
+  const reason = boundedText(reasonCodeForInput(input, existing), MAX_ID_BYTES);
+  return storedStateFromCanonical(phase, status, outcome, reason, terminalCodeForInput(input, existing));
+}
+
+function phaseForStoredState(state: StoredRunState): AgentRunPublicPhaseV2 {
+  if (state === "ASSEMBLE") return "ASSEMBLE";
+  if (state === "WORK") return "WORK";
+  if (state === "COMPLETE" || state === "PREPARE_COMMIT") return "PREPARE_COMMIT";
+  if (state === "RENDER") return "RENDER";
+  if (state === "COMMITTING") return "COMMIT";
+  return "TERMINAL";
+}
+
+function outcomeForStoredState(state: StoredRunState, terminalCode?: unknown): AgentRunPublicOutcomeV2 | null {
+  if (state === "COMMITTED") return "completed";
+  if (state === "CANCELLED") return "stopped";
+  if (state === "FAILED" && isRejectedErrorCode(terminalCode)) return "rejected";
+  const cause = terminalCauseForCode(terminalCode);
+  if (cause && (state === "TIMED_OUT" || state === "EXHAUSTED" || state === "FAILED" || state === "COMMIT_FAILED")) {
+    return cause;
+  }
+  if (state === "EXHAUSTED") return "exhausted";
+  if (state === "FAILED" || state === "COMMIT_FAILED" || state === "TIMED_OUT") return "failed";
+  return null;
+}
+
+function statusForStoredState(
+  state: StoredRunState,
+  cancelling = false,
+  terminalCode?: unknown,
+): AgentRunPublicStatusV2 {
+  if (outcomeForStoredState(state, terminalCode) !== null) return "terminal";
+  if (cancelling) return "cancelling";
+  if (state === "ASSEMBLE") return "running";
+  if (state === "COMPLETE" || state === "PREPARE_COMMIT") return "waiting";
+  return "running";
+}
+
+function normalizeWorkPhase(value: unknown, state: StoredRunState): AgentRunPublicPhaseV2 {
+  if (typeof value === "string" && WORK_PHASES.has(value as AgentRunPublicPhaseV2)) {
+    return value as AgentRunPublicPhaseV2;
+  }
+  return phaseForStoredState(state);
+}
+
+function normalizeWorkStatus(
+  value: unknown,
+  state: StoredRunState,
+  cancelling = false,
+  terminalCode?: unknown,
+): AgentRunPublicStatusV2 {
+  if (typeof value === "string" && WORK_STATUSES.has(value as AgentRunPublicStatusV2)) {
+    return value as AgentRunPublicStatusV2;
+  }
+  return statusForStoredState(state, cancelling, terminalCode);
+}
+
+function normalizeWorkOutcome(
+  value: unknown,
+  state: StoredRunState,
+  terminalCode?: unknown,
+): AgentRunPublicOutcomeV2 | null {
+  const derived = outcomeForStoredState(state, terminalCode);
+  if (derived !== null) return derived;
+  if (value === null) return null;
+  if (typeof value === "string" && WORK_OUTCOMES.has(value as AgentRunPublicOutcomeV2)) {
+    return value as AgentRunPublicOutcomeV2;
+  }
+  return null;
+}
+
+function normalizeReason(value: unknown, state: StoredRunState, outcome: AgentRunPublicOutcomeV2 | null): string | null {
+  const reason = boundedText(value, MAX_ID_BYTES);
+  if (reason && outcome === "stopped" && terminalCauseForCode(reason) === "stopped") return "stopped";
+  if (reason) return reason;
+  if (state === "TIMED_OUT") return "timed_out";
+  if (state === "CANCELLED") return "stopped";
+  if (state === "COMMIT_FAILED") return "commit_failed";
+  if (state === "EXHAUSTED") return "exhausted";
+  if (state === "FAILED") return "failed";
+  if (outcome === "rejected") return "rejected";
+  return null;
+}
+
+function normalizeTargetIdentity(
+  value: unknown,
+  chatId: string,
+  generationType: AgentRunGenerationTypeV1,
+  messageId: string | null,
+  swipeId: number | null,
+): AgentWorkTargetIdentityV1 {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+  const sourceChatId = boundedId(source.chatId) ?? chatId;
+  const sourceGenerationType = normalizeGenerationType(source.generationType) ?? generationType;
+  const sourceMessageId = source.messageId === null ? null : boundedId(source.messageId) ?? messageId;
+  const sourceSwipeId = source.swipeId === null
+    ? null
+    : (coerceNonNegativeSafeInteger(source.swipeId) ?? swipeId ?? 0);
+  return {
+    chatId: sourceChatId,
+    generationType: sourceGenerationType,
+    messageId: sourceMessageId,
+    swipeId: sourceMessageId === null ? null : sourceSwipeId,
+  };
+}
+
+function normalizeAttemptLineage(
+  input: AgentRunProjectionInputV2,
+  chatId: string,
+  generationType: AgentRunGenerationTypeV1,
+  target: AgentRunTargetV1 | null,
+  startedAt: number,
+  existing?: AgentRunPublicV2,
+): AgentWorkAttemptLineageV1 {
+  const source = input.attemptLineage && typeof input.attemptLineage === "object"
+    ? input.attemptLineage as Record<string, unknown> : existing?.attemptLineage;
+  const targetIdentity = normalizeTargetIdentity(
+    source?.target,
+    chatId,
+    generationType,
+    target?.messageId ?? null,
+    target?.swipeId ?? null,
+  );
+  const attemptId = boundedId(source?.attemptId) ?? existing?.attemptLineage.attemptId ?? input.turnId;
+  const previousAttemptId = source?.previousAttemptId === null
+    ? null
+    : boundedId(source?.previousAttemptId) ?? existing?.attemptLineage.previousAttemptId ?? null;
+  const createdAt = boundedCounter(source?.createdAt, existing?.attemptLineage.createdAt ?? startedAt);
+  return {
+    version: 1,
+    attemptId,
+    previousAttemptId,
+    target: targetIdentity,
+    createdAt,
+  };
 }
 
 function normalizeGenerationType(value: unknown): AgentRunGenerationTypeV1 | null {
@@ -334,7 +709,7 @@ function normalizeNodeStatus(value: unknown): AgentActivityNodeStatusV2 {
   if (typeof value === "string" && NODE_STATUSES.has(value as AgentActivityNodeStatusV2)) {
     return value as AgentActivityNodeStatusV2;
   }
-  if (value === "queued") return "pending";
+  if (value === "queued" || value === "pending") return "pending";
   return "omitted";
 }
 
@@ -356,14 +731,15 @@ function normalizeNodeActor(value: unknown, kind: AgentActivityNodeKindV2): Agen
   return kind;
 }
 
-function normalizeNode(value: unknown, fallbackIndex: number, phase: AgentRunPublicStatusV2): AgentActivityNodeV2 | null {
+function normalizeNode(value: unknown, fallbackIndex: number, phase: AgentRunPublicPhaseV2): AgentActivityNodeV2 | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const source = value as Record<string, unknown>;
   const id = boundedId(source.id, MAX_NODE_ID_BYTES) ?? `omitted-${fallbackIndex}`;
   const kind = normalizeNodeKind(source.kind);
   const actor = normalizeNodeActor(source.actor, kind);
   const parentId = source.parentId === null ? null : boundedId(source.parentId, MAX_NODE_ID_BYTES);
-  const nodePhase = normalizeStatus(source.phase ?? phase);
+  const sourceState = normalizeStoredState(source.phase);
+  const nodePhase = source.phase === undefined ? phase : normalizeWorkPhase(source.phase, sourceState);
   const status = normalizeNodeStatus(source.status);
   const startedAt = boundedCounter(source.startedAt);
   const elapsedMs = boundedCounter(source.elapsedMs);
@@ -439,25 +815,39 @@ function normalizeTarget(messageId: unknown, swipeId: unknown): AgentRunTargetV1
   return { messageId: normalizedMessageId, swipeId: normalizedSwipeId };
 }
 
-function mapCompatibilityLifecycle(status: AgentRunPublicStatusV2): "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out" {
-  if (status === "ASSEMBLE") return "queued";
-  if (status === "WORK" || status === "COMPLETE" || status === "RENDER" || status === "PREPARE_COMMIT" || status === "COMMITTING") return "running";
-  if (status === "COMMITTED") return "completed";
-  if (status === "CANCELLED") return "cancelled";
-  if (status === "TIMED_OUT") return "timed_out";
+function mapCompatibilityLifecycle(run: AgentRunPublicV2): "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out" {
+  if (run.workPhase === "ADMIT" || run.workPhase === "ASSEMBLE") return "queued";
+  if (run.workStatus !== "terminal") return "running";
+  if (run.workOutcome === "completed") return "completed";
+  if (run.workOutcome === "stopped") return "cancelled";
   return "failed";
 }
 
+function storedStateForRun(run: AgentRunPublicV2): StoredRunState {
+  if (run.workStatus === "terminal") {
+    if (run.workOutcome === "completed") return "COMMITTED";
+    if (run.workOutcome === "stopped") {
+      return terminalCauseForCode(run.error?.code) === "failed" ? "FAILED" : "CANCELLED";
+    }
+    if (run.workOutcome === "exhausted") return "EXHAUSTED";
+    return "FAILED";
+  }
+  if (run.workPhase === "ADMIT" || run.workPhase === "ASSEMBLE") return "ASSEMBLE";
+  if (run.workPhase === "WORK") return "WORK";
+  if (run.workPhase === "PREPARE_COMMIT") return "COMPLETE";
+  if (run.workPhase === "RENDER") return "RENDER";
+  if (run.workPhase === "COMMIT") return "COMMITTING";
+  return "FAILED";
+}
+
 function compatibilitySnapshot(run: AgentRunPublicV2): PersistAgentActivityRunInput["snapshot"] {
-  const lifecycle = mapCompatibilityLifecycle(run.status);
+  const lifecycle = mapCompatibilityLifecycle(run);
   return {
     version: 1,
     rootId: run.runId,
     nodes: run.activity.map((node) => ({
       id: node.id,
       parentId: node.parentId,
-      kind: node.kind === "root" ? "root_turn" : node.kind === "provider" ? "provider_round" : node.kind === "child" ? "child_invocation" : "tool_attempt",
-      actor: node.actor,
       phase: lifecycle,
       status: node.status === "completed" ? "completed" : node.status === "cancelled" ? "cancelled" : node.status === "timed_out" ? "timed_out" : node.status === "failed" ? "failed" : lifecycle,
       startedAt: node.startedAt,
@@ -488,19 +878,47 @@ function normalizeRun(
   const turnId = boundedId(input.turnId);
   const generationId = boundedId(input.generationId);
   const generationType = normalizeGenerationType(input.generationType);
+  const causalCode = terminalCodeForInput(input, existing);
+  const errorSource = input.error === undefined
+    ? existing?.error ?? null
+    : input.error && typeof input.error === "object" ? input.error : null;
+  const storedState = normalizeInputState(input, existing);
   if (!userId || !chatId || !turnId || !generationId || !generationType) return null;
-  const status = normalizeStatus(input.status);
-  const target = normalizeTarget(input.targetMessageId, input.targetSwipeId);
+  const target = normalizeTarget(
+    input.targetMessageId === undefined ? existing?.target?.messageId : input.targetMessageId,
+    input.targetSwipeId === undefined ? existing?.target?.swipeId : input.targetSwipeId,
+  );
   const fallbackStartedAt = boundedCounter(input.startedAt, existing?.startedAt ?? Math.floor(Date.now() / 1000));
-  const defaultStatus: AgentActivityNodeStatusV2 = status === "COMMITTED"
+  const terminalState = outcomeForStoredState(storedState, causalCode) !== null;
+  const workPhase = normalizeWorkPhase(
+    terminalState ? undefined : input.workPhase ?? existing?.workPhase,
+    storedState,
+  );
+  const workOutcome = normalizeWorkOutcome(
+    input.workOutcome === undefined ? existing?.workOutcome : input.workOutcome,
+    storedState,
+    causalCode,
+  );
+  const workStatus = normalizeWorkStatus(
+    terminalState ? undefined : input.workStatus ?? existing?.workStatus,
+    storedState,
+    storedState === "CANCELLED" || storedState === "TIMED_OUT",
+    causalCode,
+  );
+  const reason = normalizeReason(
+    input.reason === undefined ? existing?.reason ?? errorSource?.reason : input.reason,
+    storedState,
+    workOutcome,
+  );
+  const defaultStatus: AgentActivityNodeStatusV2 = workOutcome === "completed"
     ? "completed"
-    : status === "CANCELLED"
+    : workOutcome === "stopped"
       ? "cancelled"
-      : status === "TIMED_OUT"
-        ? "timed_out"
-        : status === "COMMIT_FAILED" || status === "FAILED" || status === "EXHAUSTED"
-          ? "failed"
-          : "completed";
+      : workOutcome !== null
+        ? "failed"
+        : workStatus === "pending"
+          ? "pending"
+          : "running";
   const sourceActivity = Array.isArray(input.activity) && input.activity.length > 0
     ? input.activity
     : existing?.activity?.length
@@ -510,14 +928,14 @@ function normalizeRun(
         parentId: null,
         kind: "root",
         actor: "root",
-        phase: status,
+        phase: workPhase,
         status: defaultStatus,
         startedAt: fallbackStartedAt,
         elapsedMs: 0,
       }];
   const activity: AgentActivityNodeV2[] = [];
   for (let index = 0; index < Math.min(sourceActivity.length, MAX_NODES); index += 1) {
-    const node = normalizeNode(sourceActivity[index], index, status);
+    const node = normalizeNode(sourceActivity[index], index, workPhase);
     if (node) activity.push(node);
   }
   const normalizedOmittedNodeCount = boundedCounter(
@@ -531,31 +949,74 @@ function normalizeRun(
   };
   const startedAt = fallbackStartedAt;
   const updatedAt = boundedCounter(input.updatedAt, existing?.updatedAt ?? fallbackStartedAt);
-  const errorSource = input.error && typeof input.error === "object" ? input.error : null;
-  const errorCode = errorSource ? safePublicErrorCode(errorSource.code) : undefined;
-  const handoff = normalizeHandoff(input.terminalHandoff);
-  const mutableActivity = [...activity];
+  const errorCode = safePublicErrorCode(errorSource?.code)
+    ?? defaultErrorCodeForState(storedState, causalCode, reason);
+  const handoff = normalizeHandoff(input.terminalHandoff ?? existing?.terminalHandoff);
+  const attemptLineage = normalizeAttemptLineage(input, chatId, generationType, target, startedAt, existing);
+  const recovery = recoveryForProjection(
+    errorSource?.recoveryEligible,
+    errorSource?.recoveryAction,
+    errorCode,
+    workOutcome,
+    reason,
+  );
+  const normalizedActivity = workStatus === "terminal"
+    ? activity.map((node) => node.status === "pending" || node.status === "running"
+      ? {
+          ...node,
+          ...(node.kind === "root" ? { phase: "TERMINAL" as const } : {}),
+          status: defaultStatus,
+        }
+      : node)
+    : activity;
+  const mutableActivity = [...normalizedActivity];
   let omittedNodeCount = omission.omittedNodeCount;
-  const makeRun = (): AgentRunPublicV2 => ({
-    version: 2,
-    runId: turnId,
-    turnId,
-    generationId,
-    chatId,
-    generationType,
-    target,
-    status,
-    phase: status,
-    revision,
-    sequence,
-    startedAt,
-    updatedAt,
-    activity: mutableActivity,
-    usage: normalizeUsage(input.usage),
-    omission: { ...omission, omittedNodeCount },
-    ...(errorCode ? { error: { code: errorCode, retryable: errorSource?.retryable === true } } : {}),
-    ...(handoff ? { terminalHandoff: handoff } : {}),
-  });
+  const makeRun = (): AgentRunPublicV2 => {
+    const runOmission = { ...omission, omittedNodeCount };
+    const error = errorCode
+      ? buildPublicError(
+        errorCode,
+        attemptLineage.target,
+        workPhase,
+        workStatus,
+        workOutcome,
+        reason,
+        runOmission,
+        attemptLineage.attemptId,
+        errorSource?.category,
+        errorSource?.summaryCode,
+        errorSource?.recoveryEligible,
+        errorSource?.recoveryAction,
+      )
+      : undefined;
+    return {
+      version: 2,
+      runId: turnId,
+      turnId,
+      generationId,
+      chatId,
+      generationType,
+      target,
+      workPhase,
+      workStatus,
+      workOutcome,
+      recoveryEligible: recovery.recoveryEligible,
+      recoveryAction: recovery.recoveryAction,
+      omissionCount: Math.min(MAX_SAFE_COUNTER, runOmission.omittedNodeCount + runOmission.omittedEventCount),
+      inspectionAttemptId: attemptLineage.attemptId,
+      reason,
+      attemptLineage,
+      revision,
+      sequence,
+      startedAt,
+      updatedAt,
+      activity: mutableActivity,
+      usage: normalizeUsage(input.usage ?? existing?.usage),
+      omission: runOmission,
+      ...(error ? { error } : {}),
+      ...(handoff ? { terminalHandoff: handoff } : {}),
+    };
+  };
   let run = makeRun();
   let json = JSON.stringify(run);
   while (encoder.encode(json).byteLength > 65536 && mutableActivity.length > 0) {
@@ -580,7 +1041,13 @@ function parseStoredRun(row: StoredProjectionRow): AgentRunPublicV2 | null {
       generationType,
       targetMessageId: row.target_message_id,
       targetSwipeId: row.target_swipe_id,
-      status: normalizeStatus(row.status),
+      status: normalizeStoredState(row.status),
+      phase: normalizeStoredState(row.phase),
+      workPhase: parsed.workPhase,
+      workStatus: parsed.workStatus,
+      workOutcome: parsed.workOutcome,
+      reason: parsed.reason,
+      attemptLineage: parsed.attemptLineage,
       revision: row.revision,
       startedAt: row.started_at,
       updatedAt: row.updated_at,
@@ -617,7 +1084,13 @@ function parseStoredEvent(
       generationType,
       targetMessageId: messageId,
       targetSwipeId: swipeId,
-      status: normalizeStatus(row.status),
+      status: normalizeStoredState(row.status),
+      phase: normalizeStoredState(row.status),
+      workPhase: parsed.workPhase,
+      workStatus: parsed.workStatus,
+      workOutcome: parsed.workOutcome,
+      reason: parsed.reason,
+      attemptLineage: parsed.attemptLineage,
       revision: row.run_revision,
       startedAt: parsed.startedAt,
       updatedAt: parsed.updatedAt,
@@ -725,24 +1198,46 @@ function executionReadVisible(db: Database, row: StoredExecutionControlRow | nul
   return row === null ? !tableExists(db, "agent_turn_executions") : !isExpiredAt(row.expires_at);
 }
 
-function executionStatus(row: StoredExecutionControlRow | null): AgentRunPublicStatusV2 | null {
-  const value = row?.phase ?? row?.state;
-  return typeof value === "string" && PUBLIC_STATUSES.has(value as AgentRunPublicStatusV2)
-    ? value as AgentRunPublicStatusV2
-    : null;
+function executionTerminalCode(row: StoredExecutionControlRow | null): string | null {
+  return boundedText(row?.terminal_code ?? row?.error_code, MAX_ID_BYTES);
 }
 
-function stopTerminalError(status: AgentRunPublicStatusV2): { code: string; retryable: boolean } | null {
-  if (status === "CANCELLED") return { code: "cancelled", retryable: true };
-  if (status === "TIMED_OUT") return { code: "timeout", retryable: true };
-  if (status === "EXHAUSTED") return { code: "limit_exceeded", retryable: true };
-  if (status === "FAILED" || status === "COMMIT_FAILED") return { code: "internal_error", retryable: true };
-  return null;
+interface CanonicalExecutionProjection {
+  readonly state: StoredRunState;
+  readonly status: AgentRunPublicStatusV2;
+  readonly outcome: AgentRunPublicOutcomeV2 | null;
 }
+
+function canonicalExecutionProjection(row: StoredExecutionControlRow | null): CanonicalExecutionProjection | null {
+  if (!row) return null;
+  const rawState = typeof row.phase === "string" ? row.phase : row.state;
+  if (typeof rawState !== "string" || !STORED_STATES.has(rawState as StoredRunState)) return null;
+  const state = normalizeStoredState(rawState);
+  const terminalCode = executionTerminalCode(row);
+  return {
+    state,
+    status: statusForStoredState(state, false, terminalCode),
+    outcome: outcomeForStoredState(state, terminalCode),
+  };
+}
+
+function stopTerminalError(status: StoredRunState, terminalCode?: unknown): { code: string } | null {
+  const code = defaultErrorCodeForState(status, terminalCode);
+  return code ? { code } : null;
+}
+function terminalProjectionMatchesState(
+  run: AgentRunPublicV2,
+  state: StoredRunState,
+  terminalCode?: unknown,
+): boolean {
+  const durableOutcome = outcomeForStoredState(state, terminalCode);
+  return durableOutcome !== null && durableOutcome === run.workOutcome;
+}
+
 
 function terminalActivityNodes(
   activity: readonly AgentActivityNodeV2[],
-  status: AgentRunPublicStatusV2,
+  status: StoredRunState,
 ): readonly AgentActivityNodeV2[] {
   const terminalNodeStatus: AgentActivityNodeStatusV2 = status === "TIMED_OUT"
     ? "timed_out"
@@ -753,7 +1248,7 @@ function terminalActivityNodes(
         : "failed";
   return activity.map((node) => ({
     ...node,
-    phase: isTerminal(node.phase) ? node.phase : status,
+    phase: node.phase === "TERMINAL" ? node.phase : "TERMINAL",
     status: node.status === "pending" || node.status === "running" ? terminalNodeStatus : node.status,
   }));
 }
@@ -762,8 +1257,21 @@ function appendDurableTerminalProjection(
   db: Database,
   userId: string,
   run: AgentRunPublicV2,
-  status: AgentRunPublicStatusV2,
+  status: StoredRunState,
+  terminalCode?: unknown,
 ): AgentRunProjectionCommitResult {
+  const reason = status === "CANCELLED"
+    ? "stopped"
+    : boundedText(terminalCode, MAX_ID_BYTES)
+      ?? (status === "TIMED_OUT"
+        ? "timed_out"
+        : status === "COMMIT_FAILED"
+          ? "commit_failed"
+          : status === "EXHAUSTED"
+            ? "exhausted"
+            : status === "FAILED"
+              ? "failed"
+              : null);
   return appendAgentRunSnapshot(db, {
     userId,
     chatId: run.chatId,
@@ -773,13 +1281,80 @@ function appendDurableTerminalProjection(
     targetMessageId: run.target?.messageId ?? null,
     targetSwipeId: run.target?.swipeId ?? null,
     status,
+    workPhase: "TERMINAL",
+    workStatus: "terminal",
+    workOutcome: outcomeForStoredState(status, terminalCode),
+    reason,
+    attemptLineage: run.attemptLineage,
     revision: run.revision + 1,
     activity: terminalActivityNodes(run.activity, status),
     usage: run.usage,
     omission: run.omission,
-    error: stopTerminalError(status),
+    error: stopTerminalError(status, terminalCode),
     terminalHandoff: run.terminalHandoff ?? null,
   });
+}
+
+function persistInspectionRepairMarker(
+  db: Database,
+  input: AgentRunProjectionInputV2,
+  run: AgentRunPublicV2,
+): void {
+  if (!input.receiptRepair && !input.recoveryRepair) return;
+  const markerKind = input.receiptRepair ? "late_event" : "reordered_event";
+  const markerId = `projection:${run.runId}:${markerKind}:${run.revision}`;
+  const hostSequence = Number.isSafeInteger(run.sequence) && run.sequence >= 0 ? run.sequence : 0;
+  const marker = {
+    id: markerId,
+    kind: markerKind,
+    scope: "run",
+    correlation: {
+      turnSessionId: run.turnId,
+      runId: run.runId,
+      attemptId: run.attemptLineage.attemptId,
+      chatId: run.chatId,
+      generationId: run.generationId,
+      messageId: run.target?.messageId ?? null,
+      swipeId: run.target?.swipeId ?? null,
+      actorId: "host",
+      recipientId: null,
+      phase: run.workPhase,
+      taskId: null,
+      toolId: null,
+      parentId: null,
+      hostCorrelationId: `${run.runId}:projection`,
+      hostSequence,
+    },
+    firstSequence: hostSequence,
+    lastSequence: hostSequence,
+    recoverable: true,
+    detail: input.receiptRepair
+      ? "A durable terminal receipt repaired the projection after the original event boundary."
+      : "A startup recovery reconciled an interrupted execution after an out-of-order lifecycle boundary.",
+  };
+  const inspectionInput: PersistAgentRunInspectionInputV1 = {
+    userId: input.userId,
+    chatId: input.chatId,
+    attemptId: run.attemptLineage.attemptId,
+    previousAttemptId: run.attemptLineage.previousAttemptId,
+    runId: run.runId,
+    turnSessionId: run.turnId,
+    generationId: run.generationId,
+    generationType: run.generationType,
+    targetMessageId: run.target?.messageId ?? null,
+    targetSwipeId: run.target?.swipeId ?? null,
+    hostCorrelationId: `${run.runId}:projection`,
+    lifecycle: run.workPhase,
+    status: run.workStatus,
+    outcome: run.workOutcome,
+    reason: "reconciled",
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+    terminalAt: run.workStatus === "terminal" ? run.updatedAt : null,
+    reconciliation: "recovered",
+    markers: [marker],
+  };
+  persistAgentRunInspectionInTransaction(db, inspectionInput);
 }
 
 
@@ -860,12 +1435,14 @@ function allocateChatSequence(db: Database, userId: string, chatId: string): num
   return row.last_sequence;
 }
 
-function isTerminal(status: AgentRunPublicStatusV2): boolean {
-  return TERMINAL_STATUSES.has(status);
+function isTerminal(value: AgentRunPublicV2 | AgentRunPublicStatusV2 | StoredRunState): boolean {
+  if (typeof value === "object") return value.workStatus === "terminal";
+  if (value === "terminal") return true;
+  return STORED_STATES.has(value as StoredRunState) && TERMINAL_STATES.has(value as StoredRunState);
 }
 
 function persistCompatibilityProjection(db: Database, input: AgentRunProjectionInputV2, run: AgentRunPublicV2): void {
-  if (!isTerminal(run.status)) return;
+  if (!isTerminal(run)) return;
   const snapshot = input.compatibilitySnapshot ?? compatibilitySnapshot(run);
   persistTerminalAgentActivityRunInTransaction(db, {
     userId: input.userId,
@@ -874,7 +1451,7 @@ function persistCompatibilityProjection(db: Database, input: AgentRunProjectionI
     targetMessageId: run.target?.messageId ?? null,
     targetSwipeId: run.target?.swipeId ?? null,
     snapshot,
-    status: mapCompatibilityLifecycle(run.status),
+    status: mapCompatibilityLifecycle(run),
   });
 }
 
@@ -913,7 +1490,7 @@ function terminalOutboxIdentity(event: BufferedEvent): { userId: string; chatId:
   if (!key || !event.userId || !event.payload || typeof event.payload !== "object") return null;
   const payload = event.payload as Record<string, unknown>;
   const run = payload.run;
-  if (!run || typeof run !== "object" || !isTerminal((run as Record<string, unknown>).status as AgentRunPublicStatusV2)) return null;
+  if (!run || typeof run !== "object" || !isTerminal(run as AgentRunPublicV2)) return null;
   const chatId = typeof payload.chatId === "string" ? payload.chatId : null;
   const sequence = Number.isSafeInteger(payload.sequence) ? payload.sequence as number : null;
   if (!chatId || sequence === null || sequence < 1) return null;
@@ -1139,6 +1716,10 @@ export function repairAgentRunProjectionFromReceipt(
     startedAt: epochSeconds(execution.createdAt),
     updatedAt: timestamp,
     activity: [],
+    workPhase: "TERMINAL",
+    workStatus: "terminal",
+    workOutcome: "completed",
+    reason: null,
     terminalHandoff: {
       committed: true,
       messageId,
@@ -1201,7 +1782,11 @@ export function repairAgentRunProjectionFromInterruptedExecution(
       childInvocations: 0,
     },
     omission: existing?.omission ?? emptyOmission(),
-    error: { code: "internal_error", retryable: true },
+    workPhase: "TERMINAL",
+    workStatus: "terminal",
+    workOutcome: "failed",
+    reason: status === "COMMIT_FAILED" ? "commit_failed" : "failed",
+    error: { code: "internal_error" },
     terminalHandoff: null,
     recoveryRepair: true,
   });
@@ -1225,7 +1810,8 @@ export function publishAgentRunCommit(
   db: Database,
   input: AgentRunProjectionInputV2,
 ): AgentRunProjectionCommitResult {
-  if (!isTerminal(input.status)) {
+  const requestedState = normalizeStoredState(input.status ?? input.phase ?? input.workPhase);
+  if (input.workStatus !== "terminal" && !TERMINAL_STATES.has(requestedState)) {
     throw new Error("agent run commit hook requires a terminal status");
   }
   return writeProjection(db, input);
@@ -1243,13 +1829,12 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
   if (!assertOwnedTarget(db, input)) throw new Error("agent run projection ownership mismatch");
   const existingRow = getProjectionRow(db, input.userId, input.chatId, input.turnId);
   const existing = existingRow ? (parseStoredRun(existingRow) ?? undefined) : undefined;
-  const receiptRepairNeeded = input.receiptRepair === true && !!existing && (
-    existing.status !== "COMMITTED" || !hasDurableTerminalEvent(db, input.userId, existing)
-  );
-  const recoveryRepairNeeded = input.recoveryRepair === true && !!existing && existing.status !== input.status;
+  const receiptRepairNeeded = input.receiptRepair === true
+    && (!existing || !hasDurableTerminalEvent(db, input.userId, existing));
+  const recoveryRepairNeeded = input.recoveryRepair === true && !!existing && !isTerminal(existing);
   if (existing && (
     (input.revision !== undefined && input.revision <= existing.revision)
-    || (isTerminal(existing.status) && !receiptRepairNeeded && !recoveryRepairNeeded)
+    || (isTerminal(existing) && !receiptRepairNeeded && !recoveryRepairNeeded)
   )) {
     return {
       run: existing,
@@ -1274,6 +1859,11 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
   const sequence = allocateChatSequence(db, input.userId, input.chatId);
   const run = normalizeRun(input, sequence, revision, existing);
   if (!run) throw new Error("invalid agent run projection");
+  const storedState = input.status !== undefined
+    ? normalizeStoredState(input.status)
+    : input.phase !== undefined
+      ? normalizeStoredState(input.phase)
+      : storedStateForRun(run);
   const snapshotJson = boundedBytesJson(run, AGENTIC_FINAL_RENDER_RESERVATION_COMPONENTS_V1.projectionSnapshotBytes);
   const handoffJson = run.terminalHandoff
     ? boundedBytesJson(run.terminalHandoff, AGENTIC_FINAL_RENDER_RESERVATION_COMPONENTS_V1.projectionHandoffBytes)
@@ -1311,8 +1901,8 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     run.generationType,
     run.target?.messageId ?? null,
     run.target?.swipeId ?? null,
-    run.status,
-    run.phase,
+    storedState,
+    storedState,
     run.revision,
     run.sequence,
     run.startedAt,
@@ -1321,7 +1911,7 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     handoffJson,
     omissionJson,
   );
-  const eventKind = isTerminal(run.status) ? "terminal" : run.omission.omittedEventCount > 0 || run.omission.omittedNodeCount > 0 ? "omission" : "snapshot";
+  const eventKind = isTerminal(run) ? "terminal" : run.omission.omittedEventCount > 0 || run.omission.omittedNodeCount > 0 ? "omission" : "snapshot";
   db.query(
     `INSERT INTO agent_chat_events
       (user_id, chat_id, sequence, turn_id, generation_id, run_revision, status,
@@ -1334,13 +1924,14 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     run.turnId,
     run.generationId,
     run.revision,
-    run.status,
+    storedState,
     eventKind,
     snapshotJson,
     handoffJson,
     omissionJson,
   );
   persistCompatibilityProjection(db, input, run);
+  persistInspectionRepairMarker(db, input, run);
   const event = eventForRun(run, input.userId);
   return { run, sequence, revision, event, changed: true };
 }
@@ -1788,6 +2379,298 @@ export function getAgentRun(userId: string, turnId: string, chatId?: string): Ag
     return parseStoredRun(row);
   })();
 }
+type RetryRefusalCode =
+  | "not_found"
+  | "owner_mismatch"
+  | "chat_mismatch"
+  | "invalid_target"
+  | "stale_target"
+  | "too_late"
+  | "completed"
+  | "rejected"
+  | "ineligible"
+  | "admission_unavailable";
+
+type RetryCandidate = {
+  readonly userId: string;
+  readonly chatId: string;
+  readonly attemptId: string;
+  readonly generationId: string;
+  readonly turnId: string;
+  readonly generationType: AgentRunGenerationTypeV1;
+  readonly messageId: string | null;
+  readonly swipeId: number | null;
+  readonly previousAttemptId: string | null;
+  readonly lifecycle: string;
+  readonly status: string;
+  readonly outcome: AgentRunPublicOutcomeV2 | null;
+  readonly terminal: boolean;
+  readonly phase: string;
+};
+
+type RetryPreflight =
+  | {
+    readonly accepted: true;
+    readonly userId: string;
+    readonly chatId: string;
+    readonly previousAttemptId: string;
+    readonly generationId: string;
+    readonly turnId: string;
+    readonly generationType: AgentRunGenerationTypeV1;
+    readonly messageId: string | null;
+    readonly swipeId: number | null;
+  }
+  | {
+    readonly accepted: false;
+    readonly code: RetryRefusalCode;
+    readonly message: string;
+    readonly status: 400 | 404 | 409 | 503;
+  };
+
+type RetryRequest = {
+  readonly chatId?: string;
+  readonly generationType?: string;
+  readonly messageId?: string | null;
+  readonly swipeId?: number | null;
+};
+
+function retryRefusal(
+  code: RetryRefusalCode,
+  message: string,
+  status: 400 | 404 | 409 | 503,
+): RetryPreflight {
+  return { accepted: false, code, message, status };
+}
+
+function retryRowByIdentifier(
+  db: Database,
+  table: "agent_run_attempts" | "agent_turn_executions" | "agent_run_projections",
+  userId: string,
+  identifier: string,
+): Record<string, unknown> | null {
+  if (!tableExists(db, table)) return null;
+  const userColumn = table === "agent_run_projections" ? "user_id" : "user_id";
+  const identity = table === "agent_run_attempts"
+    ? "(attempt_id = ? OR turn_id = ? OR generation_id = ?)"
+    : table === "agent_turn_executions"
+      ? "(id = ? OR generation_id = ?)"
+      : "turn_id = ?";
+  const params = table === "agent_run_attempts"
+    ? [userId, identifier, identifier, identifier]
+    : table === "agent_turn_executions"
+      ? [userId, identifier, identifier]
+      : [userId, identifier];
+  return db.query(
+    `SELECT * FROM ${table} WHERE ${userColumn} = ? AND ${identity} LIMIT 1`,
+  ).get(...params) as Record<string, unknown> | null;
+}
+
+function retryForeignRowByIdentifier(
+  db: Database,
+  table: "agent_run_attempts" | "agent_turn_executions" | "agent_run_projections",
+  identifier: string,
+): Record<string, unknown> | null {
+  if (!tableExists(db, table)) return null;
+  const identity = table === "agent_run_attempts"
+    ? "(attempt_id = ? OR turn_id = ? OR generation_id = ?)"
+    : table === "agent_turn_executions"
+      ? "(id = ? OR generation_id = ?)"
+      : "turn_id = ?";
+  const params = table === "agent_run_attempts"
+    ? [identifier, identifier, identifier]
+    : table === "agent_turn_executions"
+      ? [identifier, identifier]
+      : [identifier];
+  return db.query(`SELECT * FROM ${table} WHERE ${identity} LIMIT 1`).get(...params) as Record<string, unknown> | null;
+}
+
+function retryString(row: Record<string, unknown>, ...keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = row[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+function retryInteger(row: Record<string, unknown>, ...keys: readonly string[]): number | null {
+  for (const key of keys) {
+    const value = row[key];
+    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+    if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+      const parsed = Number(value);
+      if (Number.isSafeInteger(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
+function retryBoolean(row: Record<string, unknown>, ...keys: readonly string[]): boolean {
+  return retryInteger(row, ...keys) === 1 || keys.some((key) => row[key] === true);
+}
+
+function retryJsonRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string") return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function retryOutcomeForExecution(row: Record<string, unknown>, phase: string): AgentRunPublicOutcomeV2 | null {
+  const explicit = retryString(row, "outcome");
+  if (explicit === "completed" || explicit === "stopped" || explicit === "failed" || explicit === "exhausted" || explicit === "rejected") {
+    return explicit;
+  }
+  if (phase === "COMMITTED") return "completed";
+  if (phase === "EXHAUSTED") return "exhausted";
+  if (phase === "CANCELLED") return "stopped";
+  if (phase === "FAILED" || phase === "COMMIT_FAILED" || phase === "TIMED_OUT") {
+    const code = (retryString(row, "terminal_code", "error_code") ?? "").toLowerCase();
+    return code === "cancelled" || code === "canceled" || code === "stopped" || code === "agentic_cancelled"
+      ? "stopped"
+      : code === "exhausted" || code === "agentic_work_exhausted" || code === "root_wall_clock_limit_exceeded"
+        || code.endsWith("_limit_exceeded") || code.endsWith("_budget_exhausted")
+        ? "exhausted"
+        : "failed";
+  }
+  return null;
+}
+
+function retryCandidateFromRow(
+  row: Record<string, unknown>,
+  source: "attempt" | "execution" | "projection",
+): RetryCandidate | null {
+  const userId = retryString(row, "user_id");
+  const chatId = retryString(row, "chat_id");
+  const turnId = retryString(row, "turn_id", "id");
+  const generationId = retryString(row, "generation_id") ?? turnId;
+  const generationType = retryString(row, "generation_type", "target_kind", "target") as AgentRunGenerationTypeV1 | null;
+  if (!userId || !chatId || !turnId || !generationId || !generationType || !GENERATION_TYPES.has(generationType)) return null;
+  const snapshot = retryJsonRecord(row.target_snapshot_json ?? row.target_snapshot);
+  const lineage = snapshot.attemptLineage && typeof snapshot.attemptLineage === "object" && !Array.isArray(snapshot.attemptLineage)
+    ? snapshot.attemptLineage as Record<string, unknown> : {};
+  const attemptId = retryString(row, "attempt_id") ?? retryString(lineage, "attemptId") ?? turnId;
+  const previousAttemptId = lineage.previousAttemptId === null
+    ? null
+    : retryString(row, "previous_attempt_id") ?? retryString(lineage, "previousAttemptId");
+  const messageId = retryString(row, "target_message_id", "message_id")
+    ?? (lineage.target && typeof lineage.target === "object" && !Array.isArray(lineage.target)
+      ? retryString(lineage.target as Record<string, unknown>, "messageId") : null);
+  const swipeId = retryInteger(row, "target_swipe_id", "swipe_id")
+    ?? (lineage.target && typeof lineage.target === "object" && !Array.isArray(lineage.target)
+      ? retryInteger(lineage.target as Record<string, unknown>, "swipeId") : null);
+  const phase = retryString(row, "phase", "state") ?? retryString(row, "lifecycle") ?? "";
+  const outcome = retryOutcomeForExecution(row, phase);
+  const status = retryString(row, "status") ?? (outcome ? "terminal" : "running");
+  const lifecycle = retryString(row, "lifecycle") ?? phase;
+  const terminal = source === "attempt"
+    ? retryBoolean(row, "terminal") || outcome !== null
+    : TERMINAL_STATES.has(phase as StoredRunState) || outcome !== null;
+  return {
+    userId,
+    chatId,
+    attemptId,
+    generationId,
+    turnId,
+    generationType,
+    messageId,
+    swipeId,
+    previousAttemptId,
+    lifecycle,
+    status,
+    outcome,
+    terminal,
+    phase,
+  };
+}
+
+/**
+ * Read-only Retry preflight. It never inserts, updates, or reserves a row.
+ * The coordinator revalidates this exact target during real admission.
+ */
+export function prepareAgentRunRetry(
+  userId: string,
+  identifier: string,
+  request: RetryRequest = {},
+): RetryPreflight {
+  const db = getDb();
+  return db.transaction((): RetryPreflight => {
+    if (!validId(userId) || !validId(identifier)) {
+      return retryRefusal("not_found", "The requested attempt was not found.", 404);
+    }
+    const sources: Array<["attempt" | "execution" | "projection", "agent_run_attempts" | "agent_turn_executions" | "agent_run_projections"]> = [
+      ["attempt", "agent_run_attempts"],
+      ["execution", "agent_turn_executions"],
+      ["projection", "agent_run_projections"],
+    ];
+    let candidate: RetryCandidate | null = null;
+    let foreign = false;
+    for (const [source, table] of sources) {
+      const row = retryRowByIdentifier(db, table, userId, identifier);
+      if (row) {
+        candidate = retryCandidateFromRow(row, source);
+        if (candidate) break;
+      }
+      if (!row && retryForeignRowByIdentifier(db, table, identifier)) foreign = true;
+    }
+    if (!candidate) {
+      return retryRefusal(foreign ? "owner_mismatch" : "not_found", foreign ? "The requested attempt belongs to another owner." : "The requested attempt was not found.", 404);
+    }
+    if (!assertOwnedChat(db, userId, candidate.chatId)) {
+      return retryRefusal("owner_mismatch", "The requested attempt is not owned by this user.", 404);
+    }
+    if (request.chatId !== undefined && request.chatId !== candidate.chatId) {
+      return retryRefusal("chat_mismatch", "Retry chat does not match the prior attempt.", 409);
+    }
+    if (request.generationType !== undefined && request.generationType !== candidate.generationType) {
+      return retryRefusal("invalid_target", "Retry generation target does not match the prior attempt.", 409);
+    }
+    if (request.messageId !== undefined && (request.messageId ?? null) !== candidate.messageId) {
+      return retryRefusal("invalid_target", "Retry message target does not match the prior attempt.", 409);
+    }
+    if (request.swipeId !== undefined && (request.swipeId ?? null) !== candidate.swipeId) {
+      return retryRefusal("invalid_target", "Retry swipe target does not match the prior attempt.", 409);
+    }
+    const targetValid = assertStoredTarget(
+      db,
+      candidate.chatId,
+      candidate.messageId,
+      candidate.swipeId,
+      candidate.generationType,
+    );
+    if (!targetValid) return retryRefusal("stale_target", "The prior generation target is no longer valid.", 409);
+    if (candidate.outcome === "completed") {
+      return retryRefusal("completed", "The prior generation completed; use Continue or Regenerate.", 409);
+    }
+    if (candidate.outcome === "rejected") {
+      return retryRefusal("rejected", "The prior generation was rejected; repair or reselect its target.", 409);
+    }
+    if (
+      candidate.phase === "COMMITTING"
+      || candidate.phase === "COMMITTED"
+      || candidate.lifecycle === "COMMIT"
+    ) {
+      return retryRefusal("too_late", "The prior generation is already at its commit gate.", 409);
+    }
+    if (!candidate.terminal || candidate.outcome === null || !["failed", "exhausted", "stopped"].includes(candidate.outcome)) {
+      return retryRefusal("ineligible", "The prior generation is not eligible for Retry.", 409);
+    }
+    return {
+      accepted: true,
+      userId: candidate.userId,
+      chatId: candidate.chatId,
+      previousAttemptId: candidate.attemptId,
+      generationId: candidate.generationId,
+      turnId: candidate.turnId,
+      generationType: candidate.generationType,
+      messageId: candidate.messageId,
+      swipeId: candidate.swipeId,
+    };
+  })();
+}
 
 export function listAgentRunChangesForChat(userId: string, chatId: string, cursorToken?: unknown): AgentRunChangesV2 | null {
   return getAgentRunChanges(userId, chatId, cursorToken);
@@ -1885,17 +2768,38 @@ function buildWorkspaceEntries(
     const rowRetention = workspacePolicy(row.retention ?? retention);
     const visibility = workspaceVisibility(row.visibility);
     if (section === "tasks") {
+      const state = row.state === "pending"
+        ? "pending"
+        : row.state === "active"
+          ? "active"
+          : row.state === "blocked"
+            ? "blocked"
+            : row.state === "completed"
+              ? "completed"
+              : row.state === "cancelled"
+                ? "cancelled"
+                : row.state === "failed"
+                  ? "failed"
+                  : undefined;
+      if (!state) continue;
       result.push({
         kind: "task", id, revision, retention: rowRetention, visibility,
         // Do not expose authored task prose. The UI receives a stable label.
         title: `Task ${id.slice(0, 8)}`,
-        state: row.state === "blocked" || row.state === "submitted" || row.state === "done" ? row.state : "active",
+        state,
         required: row.required === 1,
         assigned: typeof row.assigned_frame_id === "string" && row.assigned_frame_id.length > 0,
         dependencyCount: parseDependencies(row.dependencies_json),
       });
     } else if (section === "submissions") {
-      const state = row.state === "accepted" || row.state === "rejected" ? row.state : "proposed";
+      const state = row.state === "submitted"
+        ? "submitted"
+        : row.state === "accepted"
+          ? "accepted"
+          : row.state === "rejected"
+            ? "rejected"
+            : undefined;
+      if (!state) continue;
       result.push({
         kind: "submission", id, revision, retention: rowRetention, visibility,
         taskId: safePreviewId(row.task_id) ?? "unknown-task",
@@ -1960,7 +2864,7 @@ export function getWorkspacePreview(
   const columns = section === "tasks"
     ? "task_id AS id, state, required, assigned_frame_id, dependencies_json, revision, retention, expires_at, updated_at"
     : section === "records"
-      ? "record_id AS id, kind, revision, retention, expires_at, updated_at"
+      ? "record_id AS id, kind, revision, retention, expires_at, created_at AS updated_at"
       : section === "submissions"
         ? "submission_id AS id, task_id, child_frame_id, state, revision, retention, expires_at, updated_at"
         : "artifact_id AS id, blob_digest AS digest, mime_type, byte_count, publication_state, revision, retention, expires_at, updated_at";
@@ -2132,6 +3036,45 @@ export function registerAgentRunStopHandler(
   };
 }
 
+function stopResponseForRun(
+  run: AgentRunPublicV2,
+  status: AgentRunStopResultV2,
+  revision = run.revision,
+): AgentRunStopResponseV2 {
+  const error = run.error ?? (status === "too_late"
+    ? buildPublicError(
+      "stop_unavailable",
+      run.attemptLineage.target,
+      run.workPhase,
+      run.workStatus,
+      run.workOutcome,
+      "too_late",
+      run.omission,
+      run.attemptLineage.attemptId,
+      "internal",
+      undefined,
+      false,
+      "none",
+    )
+    : undefined);
+  return {
+    version: 2,
+    status,
+    turnId: run.turnId,
+    revision,
+    target: run.attemptLineage.target,
+    workPhase: run.workPhase,
+    workStatus: run.workStatus,
+    workOutcome: run.workOutcome,
+    reason: run.reason,
+    recoveryEligible: run.recoveryEligible,
+    recoveryAction: run.recoveryAction,
+    omissionCount: run.omissionCount,
+    inspectionAttemptId: run.inspectionAttemptId,
+    ...(error ? { error } : {}),
+  };
+}
+
 export function requestAgentRunStop(userId: string, chatId: string, turnId: string): AgentRunStopResponseV2 | null {
   if (!validId(userId) || !validId(chatId) || !validId(turnId)) return null;
   const db = getDb();
@@ -2139,19 +3082,30 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
   if (!run) return null;
 
   const initialControl = executionControlRow(db, userId, chatId, turnId);
-  const initialDurableStatus = executionStatus(initialControl);
-  if (initialControl && !initialDurableStatus) throw new AgentRunStopUnavailableError(turnId);
-  if (TOO_LATE_STATUSES.has(run.status)) {
-    if (initialDurableStatus && initialDurableStatus !== run.status) {
+  const initialDurable = canonicalExecutionProjection(initialControl);
+  if (initialControl && !initialDurable) throw new AgentRunStopUnavailableError(turnId);
+  const currentStoredState = storedStateForRun(run);
+  if (TOO_LATE_STATES.has(currentStoredState)) {
+    if (
+      initialDurable
+      && initialDurable.state !== currentStoredState
+      && !(isTerminal(run) && terminalProjectionMatchesState(run, initialDurable.state, executionTerminalCode(initialControl)))
+    ) {
       throw new AgentRunStopUnavailableError(turnId);
     }
-    return { version: 2, status: "too_late", turnId, revision: run.revision };
+
+    return stopResponseForRun(run, "too_late");
   }
-  if (isTerminal(run.status)) {
-    if (initialDurableStatus && initialDurableStatus !== run.status) {
+  if (isTerminal(run.workStatus)) {
+    if (
+      initialDurable
+      && initialDurable.state !== currentStoredState
+      && !(terminalProjectionMatchesState(run, initialDurable.state, executionTerminalCode(initialControl)))
+    ) {
       throw new AgentRunStopUnavailableError(turnId);
     }
-    return { version: 2, status: "terminal", turnId, revision: run.revision };
+
+    return stopResponseForRun(run, "terminal");
   }
 
   const handler = stopHandlers.get(projectionKey(userId, chatId, turnId));
@@ -2160,25 +3114,33 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
     if (status !== "accepted" && status !== "too_late" && status !== "terminal") {
       throw new Error("invalid Agent Run stop handler result");
     }
-    return { version: 2, status, turnId, revision: getAgentRun(userId, turnId, chatId)?.revision ?? run.revision };
+    const latestRun = getAgentRun(userId, turnId, chatId) ?? run;
+    return stopResponseForRun(latestRun, status, latestRun.revision);
   }
 
   const result = withAgentRunProjectionTransaction((transactionDb) => {
     const control = executionControlRow(transactionDb, userId, chatId, turnId);
-    const durableStatus = executionStatus(control);
-    if (!control || !durableStatus) throw new AgentRunStopUnavailableError(turnId);
+    const durable = canonicalExecutionProjection(control);
+    if (!control || !durable) throw new AgentRunStopUnavailableError(turnId);
 
     const publishTerminal = (
-      status: AgentRunPublicStatusV2,
+      status: StoredRunState,
       responseStatus: "accepted" | "terminal",
+      terminalCode?: string | null,
     ): AgentRunStopTransactionResult => {
       const latestRun = getAgentRun(userId, turnId, chatId);
       if (!latestRun) throw new AgentRunStopUnavailableError(turnId);
-      if (isTerminal(latestRun.status)) {
-        if (latestRun.status !== status) throw new AgentRunStopUnavailableError(turnId);
+      const latestStoredState = storedStateForRun(latestRun);
+      if (isTerminal(latestRun)) {
+        if (
+          latestStoredState !== status
+          && !terminalProjectionMatchesState(latestRun, status, terminalCode)
+        ) {
+          throw new AgentRunStopUnavailableError(turnId);
+        }
         return { status: "terminal", revision: latestRun.revision, changed: false };
       }
-      const projection = appendDurableTerminalProjection(transactionDb, userId, latestRun, status);
+      const projection = appendDurableTerminalProjection(transactionDb, userId, latestRun, status, terminalCode);
       return {
         status: responseStatus,
         revision: projection.revision,
@@ -2187,11 +3149,11 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
       };
     };
 
-    if (TOO_LATE_STATUSES.has(durableStatus)) {
+    if (TOO_LATE_STATES.has(durable.state)) {
       return { status: "too_late" as const, revision: run.revision };
     }
-    if (isTerminal(durableStatus)) {
-      return publishTerminal(durableStatus, "terminal");
+    if (durable.status === "terminal" || durable.outcome !== null) {
+      return publishTerminal(durable.state, "terminal", executionTerminalCode(control));
     }
 
     let durableResult: TurnCancellationResult;
@@ -2212,7 +3174,7 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
       if (!isTerminal(durableResult.execution.phase)) {
         throw new AgentRunStopUnavailableError(turnId);
       }
-      return publishTerminal(durableResult.execution.phase, "terminal");
+      return publishTerminal(durableResult.execution.phase, "terminal", durableResult.execution.terminalCode);
     }
     if (durableResult.code !== "cancelled" && durableResult.code !== "timed_out") {
       throw new AgentRunStopUnavailableError(turnId);
@@ -2220,9 +3182,10 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
     if (!isTerminal(durableResult.execution.phase)) {
       throw new AgentRunStopUnavailableError(turnId);
     }
-    return publishTerminal(durableResult.execution.phase, "accepted");
+    return publishTerminal(durableResult.execution.phase, "accepted", durableResult.execution.terminalCode);
   });
-  return { version: 2, status: result.status, turnId, revision: result.revision };
+  const latestRun = getAgentRun(userId, turnId, chatId) ?? run;
+  return stopResponseForRun(latestRun, result.status, result.revision);
 }
 
 export function __test__mintChatRunCursor(userId: string, chatId: string, lastSequence: number, now?: number): ChatRunCursorV1 {

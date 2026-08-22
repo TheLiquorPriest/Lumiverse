@@ -28,6 +28,14 @@
   line-height: 1.5;
 }
 
+.schemaVersion {
+  font-size: calc(13px * var(--lumiverse-font-scale, 1));
+  color: var(--lumiverse-text);
+  margin: 0;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
 .checkboxRow {
   display: flex;
   align-items: center;

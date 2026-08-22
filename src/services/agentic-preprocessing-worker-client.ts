@@ -218,7 +218,7 @@ function assertRenderResultBinding(
     throw new IsolatePoolError("worker_malformed", "Agentic render target metadata is not bound to the request");
   }
   const selectedSwipe = input.swipes.find((swipe) => String(swipe.swipeId) === String(input.target.swipeId));
-  const expectedSwipeRevision = selectedSwipe?.revision;
+  const expectedSwipeRevision = selectedSwipe?.slot === "append" ? undefined : selectedSwipe?.revision;
   if (canonical(metadata.expectedRevision) !== canonical(expectedSwipeRevision)) {
     throw new IsolatePoolError("worker_malformed", "Agentic render swipe revision is not bound to the request");
   }
@@ -345,11 +345,14 @@ export class PairedAssemblyAdmissionV1 {
 
 const pairedAssemblyAdmission = new PairedAssemblyAdmissionV1();
 
+// Strict preprocessing is process-isolated. A degraded Bun Worker message
+// channel can block the host event loop before its timeout callback runs; a
+// subprocess remains externally terminable without wedging generation. The
+// primary pool is reused for render after paired assembly, keeping two isolate
+// processes rather than retaining a third.
 const pool = new IsolatePoolV1<unknown, unknown>({
-  name: "agentic-preprocessing",
-  workerUrl: new URL("./agentic-preprocessing-worker.ts", import.meta.url),
+  name: "agentic-preprocessing-primary",
   subprocessCommand: defaultIsolateCommand(new URL("./agentic-preprocessing-subprocess.ts", import.meta.url)),
-  workerRequest: strictWorkerRequest,
   subprocessRequest: strictWorkerRequest,
   responseParser: parseAgenticPreprocessingResponseV1,
   maxWorkers: 1,
@@ -357,14 +360,13 @@ const pool = new IsolatePoolV1<unknown, unknown>({
   maxQueuedGlobal: HOST_PREPARATION_LIMITS_V1.maxQueuedJobsProcess,
   maxFrameBytes: HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
   defaultTimeoutMs: HOST_PREPARATION_LIMITS_V1.maxWallClockMs,
+  backend: "subprocess",
   disabled: process.env.LUMIVERSE_AGENTIC_PREPROCESSING_WORKER === "false",
 });
 
 const verifierPool = new IsolatePoolV1<unknown, unknown>({
   name: "agentic-assembly-verifier",
-  workerUrl: new URL("./agentic-preprocessing-worker.ts", import.meta.url),
   subprocessCommand: defaultIsolateCommand(new URL("./agentic-preprocessing-subprocess.ts", import.meta.url)),
-  workerRequest: strictWorkerRequest,
   subprocessRequest: strictWorkerRequest,
   responseParser: parseAgenticPreprocessingResponseV1,
   maxWorkers: 1,
@@ -372,6 +374,7 @@ const verifierPool = new IsolatePoolV1<unknown, unknown>({
   maxQueuedGlobal: HOST_PREPARATION_LIMITS_V1.maxQueuedJobsProcess,
   maxFrameBytes: HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
   defaultTimeoutMs: HOST_PREPARATION_LIMITS_V1.maxWallClockMs,
+  backend: "subprocess",
   disabled: process.env.LUMIVERSE_AGENTIC_PREPROCESSING_WORKER === "false",
 });
 function assemblySnapshotOf(input: AgenticAssemblyInputV1): GenerationAssemblySnapshotV1 {

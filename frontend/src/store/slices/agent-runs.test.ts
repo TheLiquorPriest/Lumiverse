@@ -31,8 +31,26 @@ function run(overrides: Partial<AgentRunPublicV2> = {}): AgentRunPublicV2 {
     chatId: 'chat-a',
     generationType: 'normal',
     target: null,
-    status: 'WORK',
-    phase: 'WORK',
+    workPhase: 'WORK',
+    workStatus: 'running',
+    workOutcome: null,
+    recoveryEligible: false,
+    recoveryAction: 'none',
+    omissionCount: 0,
+    inspectionAttemptId: 'attempt-a',
+    reason: null,
+    attemptLineage: {
+      version: 1,
+      attemptId: 'attempt-a',
+      previousAttemptId: null,
+      target: {
+        chatId: 'chat-a',
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+      },
+      createdAt: 1_000,
+    },
     revision: 1,
     sequence: 1,
     startedAt: 1_000,
@@ -101,12 +119,12 @@ describe('agent run projection slice', () => {
 
     const secondEpoch = useStore.getState().beginAgentRunRestore('chat-a')
     useStore.getState().applyAgentRunChanges('chat-a', secondEpoch, changes([
-      run({ revision: 1, sequence: 2, phase: 'ASSEMBLE' }),
-      run({ revision: 2, sequence: 3, phase: 'RENDER', updatedAt: 3_000 }),
+      run({ revision: 1, sequence: 2, workPhase: 'ASSEMBLE' }),
+      run({ revision: 2, sequence: 3, workPhase: 'RENDER', updatedAt: 3_000 }),
     ], { cursor: { version: 1, token: 'opaque-cursor-b' }, lastSequence: 3 }))
 
     const stored = useStore.getState().agentRunProvisionalByKey[agentRunProvisionalKey(run({ revision: 2 }))]
-    expect(stored.phase).toBe('RENDER')
+    expect(stored.workPhase).toBe('RENDER')
     expect(stored.revision).toBe(2)
     expect(useStore.getState().agentRunCursorByChat['chat-a']).toBe('opaque-cursor-b')
     expect(useStore.getState().agentRunLastSequenceByChat['chat-a']).toBe(3)
@@ -117,7 +135,7 @@ describe('agent run projection slice', () => {
       version: 2,
       chatId: 'chat-a',
       sequence: 2,
-      run: run({ revision: 2, sequence: 2, phase: 'RENDER', updatedAt: 3_000 }),
+      run: run({ revision: 2, sequence: 2, workPhase: 'RENDER', updatedAt: 3_000 }),
       omission: { omittedNodeCount: 0, omittedEventCount: 0, firstOmittedSequence: null, lastOmittedSequence: null },
     })).toBe('gap')
 
@@ -134,7 +152,7 @@ describe('agent run projection slice', () => {
     expect(useStore.getState().agentRunSyncByChat['chat-a']).toBe('stale')
 
     expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, changes([
-      run({ revision: 2, sequence: 2, phase: 'RENDER', updatedAt: 3_000 }),
+      run({ revision: 2, sequence: 2, workPhase: 'RENDER', updatedAt: 3_000 }),
     ], {
       cursor: { version: 1, token: 'cursor-consumed-2' },
       cursorSequence: 2,
@@ -206,7 +224,7 @@ describe('agent run projection slice', () => {
       version: 2,
       chatId: 'chat-a',
       sequence: 4,
-      run: run({ revision: 2, sequence: 4, phase: 'RENDER', updatedAt: 4_000 }),
+      run: run({ revision: 2, sequence: 4, workPhase: 'RENDER', updatedAt: 4_000 }),
       omission: { omittedNodeCount: 0, omittedEventCount: 1, firstOmittedSequence: 2, lastOmittedSequence: 3 },
     })
     expect(gapResult).toBe('gap')
@@ -214,7 +232,7 @@ describe('agent run projection slice', () => {
 
     const restoreEpoch = useStore.getState().beginAgentRunRestore('chat-a')
     useStore.getState().applyAgentRunChanges('chat-a', restoreEpoch, changes([
-      run({ revision: 3, sequence: 5, phase: 'COMMITTED', status: 'COMMITTED' }),
+      run({ revision: 3, sequence: 5, workPhase: 'TERMINAL', workStatus: 'terminal', workOutcome: 'completed' }),
     ], { resync: true, lastSequence: 5, cursor: { version: 1, token: 'fresh-cursor' } }))
     expect(useStore.getState().agentRunSyncByChat['chat-a']).toBe('ready')
     expect(useStore.getState().agentRunCursorByChat['chat-a']).toBe('fresh-cursor')
@@ -228,8 +246,9 @@ describe('agent run projection slice', () => {
     const terminal = run({
       revision: 2,
       sequence: 2,
-      phase: 'COMMITTED',
-      status: 'COMMITTED',
+      workPhase: 'TERMINAL',
+      workStatus: 'terminal',
+      workOutcome: 'completed',
       terminalHandoff: {
         version: 2,
         committed: true,
@@ -347,8 +366,9 @@ describe('agent run projection slice', () => {
       runId: 'run-new',
       turnId: 'turn-new',
       generationId: 'generation-new',
-      status: 'COMMITTED',
-      phase: 'COMMITTED',
+      workStatus: 'terminal',
+      workPhase: 'TERMINAL',
+      workOutcome: 'completed',
       revision: 2,
       sequence: 20,
       updatedAt: 20_000,
@@ -366,8 +386,9 @@ describe('agent run projection slice', () => {
       runId: 'run-old',
       turnId: 'turn-old',
       generationId: 'generation-old',
-      status: 'COMMITTED',
-      phase: 'COMMITTED',
+      workStatus: 'terminal',
+      workPhase: 'TERMINAL',
+      workOutcome: 'completed',
       revision: 99,
       sequence: 19,
       updatedAt: 99_000,
@@ -425,8 +446,9 @@ describe('agent run projection slice', () => {
       runId: 'run-terminal',
       turnId: 'turn-terminal',
       generationId: 'generation-terminal',
-      status: 'COMMITTED',
-      phase: 'COMMITTED',
+      workStatus: 'terminal',
+      workPhase: 'TERMINAL',
+      workOutcome: 'completed',
       revision: 3,
       sequence: 30,
       updatedAt: 30_000,
@@ -452,8 +474,9 @@ describe('agent run projection slice', () => {
       runId: 'run-cancelled',
       turnId: 'turn-cancelled',
       generationId: 'generation-cancelled',
-      status: 'CANCELLED',
-      phase: 'CANCELLED',
+      workStatus: 'terminal',
+      workPhase: 'TERMINAL',
+      workOutcome: 'stopped',
       sequence: 40,
       updatedAt: 40_000,
     })

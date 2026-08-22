@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db/connection";
+import type {
+  AgentWorkAttemptLineageV1,
+  AgentWorkOutcome,
+  AgentWorkPhase,
+  AgentWorkStatus,
+} from "../types/agent-runtime";
 import { AGENT_ACTIVITY_RUN_MAX_BYTES } from "./agent-activity-runs.service";
 import { invalidateFrameCapabilitiesForTurn } from "./turn-workspace.service";
 
@@ -145,6 +151,7 @@ export interface TurnExecutionInput {
   targetChatRevision?: number;
   targetMessageRevision?: number | null;
   /** Only stable target identity/revision fields are retained. */
+  readonly attemptLineage?: Partial<AgentWorkAttemptLineageV1> | null;
   targetSnapshot?: unknown;
   presetSnapshotId?: string | null;
   presetRevision?: number | null;
@@ -192,6 +199,11 @@ export interface TurnExecutionRecord {
   readonly worldLoreSnapshotId: string | null;
   readonly worldLoreRevision: number;
   readonly mode: "response" | "agentic";
+  readonly workPhase: AgentWorkPhase;
+  readonly workStatus: AgentWorkStatus;
+  readonly workOutcome: AgentWorkOutcome | null;
+  readonly reason: string | null;
+  readonly attemptLineage: AgentWorkAttemptLineageV1;
   readonly phase: TurnExecutionPhase;
   readonly state: TurnExecutionPhase;
   readonly runtimeEpoch: number;
@@ -717,6 +729,7 @@ function normalizeInput(input: TurnExecutionInput): {
   generationId: string;
   target: GenerationTargetRecord;
   targetSnapshot: string;
+  attemptLineage: AgentWorkAttemptLineageV1;
   mode: "response" | "agentic";
   runtimeEpoch: number;
   expiresAt: number;
@@ -735,6 +748,7 @@ function normalizeInput(input: TurnExecutionInput): {
   }
   const id = boundedId(input.id, "id") ?? randomId("turn");
   const target = normalizeTarget(input);
+  const attemptLineage = attemptLineageForTarget(input.attemptLineage, id, target, nowMs());
   const targetSnapshotValue = scrubSummary({
     ...(input.targetSnapshot && typeof input.targetSnapshot === "object" ? input.targetSnapshot as Record<string, unknown> : {}),
     branchId: target.branchId,
@@ -745,6 +759,7 @@ function normalizeInput(input: TurnExecutionInput): {
     swipeCount: target.swipeCount,
     chatGenerationRevision: target.chatGenerationRevision,
     messageGenerationRevision: target.messageGenerationRevision,
+    attemptLineage,
   });
   const targetSnapshot = scrubJson(targetSnapshotValue, MAX_TARGET_SNAPSHOT_BYTES);
   const mode = input.mode ?? "agentic";
@@ -768,6 +783,7 @@ function normalizeInput(input: TurnExecutionInput): {
     generationId: boundedId(input.generationId, "generationId") ?? id,
     target,
     targetSnapshot,
+    attemptLineage,
     mode,
     runtimeEpoch,
     expiresAt,
@@ -815,6 +831,102 @@ function rowPhase(row: Record<string, unknown>): TurnExecutionPhase {
   if (!isTurnExecutionPhase(value)) throw new TurnExecutionError("execution_schema_unavailable", "execution contains an unknown phase");
   return value;
 }
+function workPhaseForExecution(phase: TurnExecutionPhase): AgentWorkPhase {
+  if (phase === "ASSEMBLE") return "ASSEMBLE";
+  if (phase === "WORK") return "WORK";
+  if (phase === "COMPLETE") return "PREPARE_COMMIT";
+  if (phase === "RENDER") return "RENDER";
+  if (phase === "PREPARE_COMMIT") return "PREPARE_COMMIT";
+  if (phase === "COMMITTING") return "COMMIT";
+  return "TERMINAL";
+}
+
+type CanonicalTerminalCause = "stopped" | "exhausted" | "failed";
+
+function terminalCauseForExecutionCode(value: string | null): CanonicalTerminalCause | null {
+  if (!value) return null;
+  const code = value.trim().toLowerCase();
+  if (!code) return null;
+  if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
+    return "stopped";
+  }
+  if (
+    code === "exhausted"
+    || code === "budget_exhausted"
+    || code === "limit_exceeded"
+    || code === "agentic_work_exhausted"
+    || code === "root_wall_clock_limit_exceeded"
+    || code.endsWith("_limit_exceeded")
+    || code.endsWith("_budget_exhausted")
+  ) {
+    return "exhausted";
+  }
+  return "failed";
+}
+
+function workOutcomeForExecution(
+  phase: TurnExecutionPhase,
+  terminalCode: string | null,
+): AgentWorkOutcome | null {
+  if (phase === "CANCELLED") return "stopped";
+  const cause = terminalCauseForExecutionCode(terminalCode);
+  if (cause) return cause;
+  if (phase === "EXHAUSTED") return "exhausted";
+  return "failed";
+}
+
+function workStatusForExecution(
+  phase: TurnExecutionPhase,
+  cancelRequested: boolean,
+  terminalCode: string | null,
+): AgentWorkStatus {
+  if (workOutcomeForExecution(phase, terminalCode) !== null) return "terminal";
+  if (cancelRequested) return "cancelling";
+  if (phase === "COMPLETE" || phase === "PREPARE_COMMIT") return "waiting";
+  return "running";
+}
+
+function workReasonForExecution(
+  phase: TurnExecutionPhase,
+  terminalCode: string | null,
+): string | null {
+  if (!TERMINAL_PHASE_SET.has(phase) || phase === "COMMITTED") return null;
+  if (terminalCode && terminalCode.trim().length > 0) {
+    return terminalCauseForExecutionCode(terminalCode) === "stopped" ? "stopped" : terminalCode;
+  }
+  if (phase === "CANCELLED") return "stopped";
+  if (phase === "TIMED_OUT") return "timed_out";
+  if (phase === "EXHAUSTED") return "exhausted";
+  if (phase === "COMMIT_FAILED") return "commit_failed";
+  return "failed";
+}
+function attemptLineageForTarget(
+  value: unknown,
+  id: string,
+  target: GenerationTargetRecord,
+  createdAt: number,
+): AgentWorkAttemptLineageV1 {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+  const attemptId = boundedId(source.attemptId, "attemptId") ?? id;
+  const previousAttemptId = source.previousAttemptId === null
+    ? null
+    : boundedId(source.previousAttemptId, "previousAttemptId");
+  const sourceCreatedAt = boundedInteger(source.createdAt, "attemptCreatedAt");
+  return {
+    version: 1,
+    attemptId,
+    previousAttemptId,
+    target: {
+      chatId: target.chatId,
+      generationType: target.target,
+      messageId: target.messageId,
+      swipeId: target.swipeId,
+    },
+    createdAt: sourceCreatedAt ?? createdAt,
+  };
+}
+
 
 function parseReservations(value: unknown): FinalRenderReservationRecord[] {
   const parsed = parseJson(value);
@@ -896,6 +1008,18 @@ function recordFromRow(row: Record<string, unknown>): TurnExecutionRecord {
   const casRevision = rowNumber(row, "cas_revision", "revision") ?? 0;
   const phaseRevision = rowNumber(row, "phase_revision") ?? casRevision;
   const cancelRequestedAt = rowNumber(row, "cancel_requested_at");
+  const cancelRequested = cancelRequestedAt != null || rowBool(row, "cancel_requested", "cancellation_requested");
+  const createdAt = rowNumber(row, "created_at") ?? 0;
+  const updatedAt = rowNumber(row, "updated_at") ?? 0;
+  const targetSnapshot = parseJson(rowString(row, "target_snapshot_json", "target_snapshot")) ?? target;
+  const targetSnapshotObject = targetSnapshot && typeof targetSnapshot === "object" && !Array.isArray(targetSnapshot)
+    ? targetSnapshot as Record<string, unknown> : {};
+  const attemptLineage = attemptLineageForTarget(targetSnapshotObject.attemptLineage, id, target, createdAt);
+  const terminalCode = rowString(row, "terminal_code", "error_code");
+  const workPhase = workPhaseForExecution(phase);
+  const workStatus = workStatusForExecution(phase, cancelRequested, terminalCode);
+  const workOutcome = workOutcomeForExecution(phase, terminalCode);
+  const reason = workReasonForExecution(phase, terminalCode);
   const finalRenderReservations = parseReservations(rowString(row, "final_render_reservations_json"));
   const activeReservation = finalRenderReservations[finalRenderReservations.length - 1] ?? null;
   return {
@@ -911,7 +1035,7 @@ function recordFromRow(row: Record<string, unknown>): TurnExecutionRecord {
     targetSwipeCount,
     targetChatRevision,
     targetMessageRevision,
-    targetSnapshot: target,
+    targetSnapshot,
     presetSnapshotId: rowString(row, "preset_snapshot_id", "preset_id"),
     presetRevision,
     configSnapshotId: rowString(row, "config_snapshot_id", "config_id"),
@@ -921,11 +1045,16 @@ function recordFromRow(row: Record<string, unknown>): TurnExecutionRecord {
     worldLoreSnapshotId: rowString(row, "world_lore_snapshot_id", "world_snapshot_id"),
     worldLoreRevision,
     mode: rowString(row, "mode") === "response" ? "response" : "agentic",
+    workPhase,
+    workStatus,
+    workOutcome,
+    reason,
+    attemptLineage,
     phase,
     state: phase,
     runtimeEpoch,
     deadlineAt: rowNumber(row, "deadline_at", "deadline") ?? 0,
-    cancelRequested: cancelRequestedAt != null || rowBool(row, "cancel_requested", "cancellation_requested"),
+    cancelRequested,
     cancelRequestedAt,
     workspaceId: rowString(row, "workspace_id"),
     rootLedger: parseSummary(rowString(row, "root_ledger_json", "root_ledger")),
@@ -937,15 +1066,15 @@ function recordFromRow(row: Record<string, unknown>): TurnExecutionRecord {
     leaseExpiresAt: rowNumber(row, "cas_expires_at", "lease_expires_at", "lease_expires"),
     leaseGeneration: rowNumber(row, "lease_generation") ?? 0,
     commitKey,
-    terminalCode: rowString(row, "terminal_code", "error_code"),
+    terminalCode,
     finalRenderReservationKey: activeReservation?.id ?? null,
     finalRenderReservations,
     finalRenderReservationReleasedAt: TERMINAL_PHASE_SET.has(phase) && finalRenderReservations.length === 0
       ? rowNumber(row, "terminal_at")
       : null,
     terminalEventId: rowString(row, "terminal_event_id", "terminal_event_key"),
-    createdAt: rowNumber(row, "created_at") ?? 0,
-    updatedAt: rowNumber(row, "updated_at") ?? 0,
+    createdAt,
+    updatedAt,
     terminalAt: rowNumber(row, "terminal_at"),
     target,
     frozenRevisions: {
@@ -1275,7 +1404,7 @@ export function transitionTurnExecution(input: TransitionTurnExecutionInput): Tr
       return terminalizeWithCas(db, current, input.ownerToken, current.phase, expectedRevision, "CANCELLED", "cancelled", now);
     }
     if (current.deadlineAt > 0 && now >= current.deadlineAt && input.nextPhase !== "TIMED_OUT") {
-      return terminalizeWithCas(db, current, input.ownerToken, current.phase, expectedRevision, "TIMED_OUT", "timed_out", now);
+      return terminalizeWithCas(db, current, input.ownerToken, current.phase, expectedRevision, "TIMED_OUT", "root_wall_clock_limit_exceeded", now);
     }
   }
   const terminal = TERMINAL_PHASE_SET.has(input.nextPhase);
@@ -1331,7 +1460,16 @@ export function requestTurnCancellation(input: {
   const target: TerminalTurnPhase = current.deadlineAt > 0 && now >= current.deadlineAt ? "TIMED_OUT" : "CANCELLED";
   const owner = input.ownerToken ?? current.casOwner;
   if (!owner) throw new TurnExecutionError("stale_owner", "execution has no active owner", { executionId: current.id });
-  const result = terminalizeWithCas(db, current, owner, current.phase, current.casRevision, target, input.reason ?? (target === "TIMED_OUT" ? "timed_out" : "cancelled"), now);
+  const result = terminalizeWithCas(
+    db,
+    current,
+    owner,
+    current.phase,
+    current.casRevision,
+    target,
+    target === "TIMED_OUT" ? "root_wall_clock_limit_exceeded" : input.reason ?? "cancelled",
+    now,
+  );
   return { execution: result.execution, code: target === "TIMED_OUT" ? "timed_out" : "cancelled" };
 }
 
@@ -1390,7 +1528,7 @@ export function requestDormantTurnCancellation(input: {
     current.phase,
     current.casRevision,
     target,
-    input.reason ?? (target === "TIMED_OUT" ? "timed_out" : "cancelled"),
+    target === "TIMED_OUT" ? "root_wall_clock_limit_exceeded" : input.reason ?? "cancelled",
     now,
   );
   const settledCode: TurnCancellationCode = result.execution.phase === "TIMED_OUT"
@@ -1419,7 +1557,7 @@ export function expireTurnExecution(input: {
   if (current.deadlineAt > 0 && now < current.deadlineAt) {
     throw new TurnExecutionError("deadline_exceeded", "execution deadline has not elapsed", { executionId: current.id, phase: current.phase });
   }
-  const result = terminalizeWithCas(db, current, input.ownerToken, current.phase, current.casRevision, "TIMED_OUT", "timed_out", now);
+  const result = terminalizeWithCas(db, current, input.ownerToken, current.phase, current.casRevision, "TIMED_OUT", "root_wall_clock_limit_exceeded", now);
   return { execution: result.execution, code: "timed_out" };
 }
 

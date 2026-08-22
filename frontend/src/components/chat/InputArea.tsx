@@ -76,11 +76,12 @@ import {
   subscribePresetProfilePromptVariableChanges,
   updatePresetProfilePromptVariables,
 } from '@/hooks/preset-profile-prompt-variables'
-import { selectActiveAgentRunForChat } from '@/store/slices/agent-runs'
+import { selectActiveAgentRunForChat, selectLatestAgentRunForChat } from '@/store/slices/agent-runs'
 import { recoverAgentRuns } from '@/lib/agent-run-recovery'
 import {
   agentRuntimePreflightTranslationKey,
   getRuntimeSelectionSnapshot,
+  resetActiveGenerationMode,
   subscribeRuntimeSelection,
 } from '@/lib/agentRuntimeSelection'
 import {
@@ -105,6 +106,7 @@ const MOBILE_QUEUE_HOLD_PROMPT_MS = 180
 const MOBILE_QUEUE_HOLD_MS = 900
 const LIVE_GENERATION_HEAD_STATUSES = new Set(['assembling', 'council', 'waiting', 'reasoning', 'streaming'])
 const ALT_FIELD_NAMES = ['description', 'personality', 'scenario'] as const
+type ComposerStopResult = 'accepted' | 'too_late' | 'terminal'
 
 function stackVisibleRegexSelections(base: string, selections: PendingRegexSelection[]): string {
   return [base.trim(), ...selections.filter((item) => item.type === 'send').map((item) => item.content.trim())]
@@ -271,6 +273,10 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const queueModLabel = isMac ? t('input.modCmd') : t('input.modCtrl')
   const navigate = useNavigate()
   const [text, setText] = useState('')
+  const [composerStopping, setComposerStopping] = useState(false)
+  const [composerAbortInFlight, setComposerAbortInFlight] = useState(false)
+  const [composerStopResult, setComposerStopResult] = useState<ComposerStopResult | null>(null)
+  const composerStopResultRef = useRef<ComposerStopResult | null>(null)
   const [pendingRegexVisibleCount, setPendingRegexVisibleCount] = useState(0)
   const [pendingRuntimeTarget, setPendingRuntimeTarget] = useState<{
     generationType: string
@@ -284,6 +290,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     targetCharacterId: null,
   })
   const [lastImpersonateInput, setLastImpersonateInput] = useState<string>('')
+  const [retryingTurnId, setRetryingTurnId] = useState<string | null>(null)
   const [dryRunning, setDryRunning] = useState(false)
   const [resolvingMacros, setResolvingMacros] = useState(false)
   const [authorsNoteOpen, setAuthorsNoteOpen] = useState(false)
@@ -422,6 +429,8 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const setImpersonateDraftContent = useStore((s) => s.setImpersonateDraftContent)
   const streamingContent = useStore((s) => s.streamingContent)
   const streamingGenerationType = useStore((s) => s.streamingGenerationType)
+  const regeneratingMessageId = useStore((s) => s.regeneratingMessageId)
+  const streamingSwipeId = useStore((s) => s.streamingSwipeId)
   const localGenerationInChat = isStreaming && activeChatId === chatId
   const isGeneratingInChat = !!liveChatGenerationId || localGenerationInChat
   const runtimeSelection = useSyncExternalStore(
@@ -438,7 +447,30 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       runtimeSelection.oneTurnMode === 'agentic'
       || runtimeSelection.activeGenerationMode === 'agentic'
     )
+  const latestAgentRun = useStore((s) => selectLatestAgentRunForChat(s, chatId))
+  const latestAssistantMessage = messages.at(-1)
+  const exactRetryRun = useMemo(() => {
+    if (isGeneratingInChat || !latestAgentRun || !latestAssistantMessage || latestAssistantMessage.is_user) return null
+    const target = latestAgentRun.target
+    if (!target || target.messageId !== latestAssistantMessage.id || target.swipeId !== latestAssistantMessage.swipe_id) return null
+    if (latestAgentRun.workStatus !== 'terminal') return null
+    if (!latestAgentRun.recoveryEligible || latestAgentRun.recoveryAction !== 'retry') return null
+    return latestAgentRun
+  }, [isGeneratingInChat, latestAgentRun, latestAssistantMessage])
+  const canReplayAssistant = !isGeneratingInChat && !!latestAssistantMessage && !latestAssistantMessage.is_user
   const activeAgentRun = useStore((s) => selectActiveAgentRunForChat(s, chatId, generationIdForChat))
+  const composerAbortSettled = composerStopping && !composerAbortInFlight && composerStopResult !== null
+  const showStopControl = !isRoomPeer && (isGeneratingInChat || composerAbortInFlight) && !composerAbortSettled
+  useEffect(() => {
+    setComposerStopping(false)
+    setComposerAbortInFlight(false)
+    composerStopResultRef.current = null
+    setComposerStopResult(null)
+  }, [chatId])
+  const recordComposerStopResult = useCallback((result: ComposerStopResult | null) => {
+    composerStopResultRef.current = result
+    setComposerStopResult(result)
+  }, [])
   const agentRunSyncStatus = useStore((s) => s.agentRunSyncByChat[chatId])
   const canRetryExactAgentRunLookup = agentRunSyncStatus === 'error'
     || agentRunSyncStatus === 'stale'
@@ -449,6 +481,17 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     cancelPendingGeneration(chatId)
     invalidateGenerationRequest(chatId, generationIdForChat)
   }, [chatId, generationIdForChat])
+  const beginComposerAbort = useCallback(() => {
+    recordComposerStopResult(null)
+    setComposerStopping(true)
+    setComposerAbortInFlight(true)
+    cancelGenerationLocally()
+    stopStreaming()
+  }, [cancelGenerationLocally, recordComposerStopResult, stopStreaming])
+  const settleComposerAbort = useCallback(() => {
+    setComposerAbortInFlight(false)
+    if (composerStopResultRef.current === null) setComposerStopping(false)
+  }, [])
 
   useEffect(() => {
     const pending = pendingAgentStopRef.current
@@ -459,19 +502,21 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     void agentRunsApi.stop(activeAgentRun.turnId, {
       chatId,
       generationId: activeAgentRun.generationId,
+    }).then((result) => {
+      recordComposerStopResult(result.status)
     }).catch(() => {
       if (pendingAgentStopRef.current === pending && pending.stoppedTurnId === activeAgentRun.turnId) {
         pending.stoppedTurnId = null
       }
       console.error('[InputArea] Failed to stop located Agentic run:')
     })
-  }, [activeAgentRun, chatId])
+  }, [activeAgentRun, chatId, recordComposerStopResult])
 
   useEffect(() => {
     if (!waitingForExactAgentRun || activeAgentRun) return
-    void recoverAgentRuns(chatId)
+    void recoverAgentRuns(chatId, agentRunsApi, useStore)
     const timer = window.setInterval(() => {
-      void recoverAgentRuns(chatId)
+      void recoverAgentRuns(chatId, agentRunsApi, useStore)
     }, 750)
     return () => window.clearInterval(timer)
   }, [activeAgentRun, chatId, waitingForExactAgentRun])
@@ -496,7 +541,29 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     mutedCharacterIds,
   ])
   useEffect(() => {
+    if (
+      !localGenerationInChat
+      || streamingGenerationType !== 'swipe'
+      || !regeneratingMessageId
+      || streamingSwipeId === null
+    ) return
+    setPendingRuntimeTarget({
+      generationType: 'swipe',
+      messageId: regeneratingMessageId,
+      swipeId: streamingSwipeId,
+      targetCharacterId: focusedPreviewCharacterId,
+    })
+  }, [
+    focusedPreviewCharacterId,
+    localGenerationInChat,
+    regeneratingMessageId,
+    streamingGenerationType,
+    streamingSwipeId,
+  ])
+
+  useEffect(() => {
     if (isGeneratingInChat) return
+    resetActiveGenerationMode(chatId)
     setPendingRuntimeTarget((current) => (
       current.generationType === 'normal'
       && current.messageId === null
@@ -510,7 +577,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
             targetCharacterId: focusedPreviewCharacterId,
           }
     ))
-  }, [focusedPreviewCharacterId, isGeneratingInChat])
+  }, [chatId, focusedPreviewCharacterId, isGeneratingInChat])
 
   // Track whether the active character has expressions configured
   const [hasExpressions, setHasExpressions] = useState(false)
@@ -1515,29 +1582,35 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       if (e.key === 'Escape' && isGeneratingInChat && !isRoomPeer) {
         e.preventDefault()
         e.stopPropagation()
-        cancelGenerationLocally()
-        if (activeAgentRun) {
-          void agentRunsApi.stop(activeAgentRun.turnId, {
+        const knownRun = activeAgentRun
+        beginComposerAbort()
+        if (knownRun) {
+          void agentRunsApi.stop(knownRun.turnId, {
             chatId,
-            generationId: activeAgentRun.generationId,
-          }).catch(console.error)
+            generationId: knownRun.generationId,
+          }).then((result) => recordComposerStopResult(result.status))
+            .catch(console.error)
+            .finally(settleComposerAbort)
         } else {
           if (waitingForExactAgentRun) {
             pendingAgentStopRef.current = {
               generationId: generationIdForChat,
               stoppedTurnId: null,
             }
-            void recoverAgentRuns(chatId)
+            void recoverAgentRuns(chatId, agentRunsApi, useStore)
           } else {
             pendingAgentStopRef.current = null
           }
-          void generateApi.stop(generationIdForChat || undefined, chatId).catch(console.error)
-          // If in optimistic Response phase, revert locally.
-          if (localGenerationInChat && !activeGenerationId) stopStreaming()
+          void generateApi.stop(generationIdForChat || undefined, chatId)
+            .then((result) => recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status))
+            .catch(console.error)
+            .finally(settleComposerAbort)
         }
       }
     }
-  }, [activeAgentRun, canRetryExactAgentRunLookup, waitingForExactAgentRun, isGeneratingInChat, generationIdForChat, localGenerationInChat, activeGenerationId, chatId, cancelGenerationLocally, stopStreaming, isRoomPeer])
+    window.addEventListener('keydown', handleEscape)
+    return () => window.removeEventListener('keydown', handleEscape)
+  }, [activeAgentRun, waitingForExactAgentRun, isGeneratingInChat, generationIdForChat, chatId, beginComposerAbort, recordComposerStopResult, settleComposerAbort, isRoomPeer])
 
   useEffect(() => {
     if (openPopover !== 'persona') {
@@ -1917,8 +1990,10 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     contentOverride?: string,
     triggerAction?: RegexActionActivation,
   ) => {
-    if (sendingRef.current || isGeneratingInChat) return
+    if (sendingRef.current || (isGeneratingInChat && !composerAbortSettled)) return
     sendingRef.current = true
+    setComposerStopping(false)
+    setComposerAbortInFlight(false)
 
     // Multiplayer: route through the room (turn/window-gated) unless we're the
     // host in round-robin, who sends locally on their own chat.
@@ -2123,7 +2198,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     } finally {
       sendingRef.current = false
     }
-  }, [text, chatId, isGeneratingInChat, isTemporaryChat, activeProfileId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, personas, pendingAttachments, addMessage, startStreaming, beginStreaming, setStreamingError, consumeOneshotGuides, saveDraftInput, hasQueuedMessages, isGroupChat, groupCharacterIds, mutedCharacterIds, groupResponseOrder, characters, setMentionQueue, resizeTextarea, attemptRoomSend, finalizeRegexSelections, activeCharacterId, focusedPreviewCharacterId, t, te])
+  }, [text, chatId, isGeneratingInChat, composerAbortSettled, isTemporaryChat, activeProfileId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, personas, pendingAttachments, addMessage, startStreaming, beginStreaming, setStreamingError, consumeOneshotGuides, saveDraftInput, hasQueuedMessages, isGroupChat, groupCharacterIds, mutedCharacterIds, groupResponseOrder, characters, setMentionQueue, resizeTextarea, attemptRoomSend, finalizeRegexSelections, activeCharacterId, focusedPreviewCharacterId, t, te])
 
   useEffect(() => {
     const handleRegexAction = async (event: Event) => {
@@ -2546,6 +2621,39 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       }
     }
   }, [chatId, isGeneratingInChat, messages, isGroupChat, isTemporaryChat, focusedPreviewCharacterId, mpRoomId, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, retainCouncilForRegens, beginStreaming, startStreaming, startGenerationWithRecovery, setStreamingError, consumeOneshotGuides, t, te])
+  const handleRetry = useCallback(async () => {
+    const candidate = exactRetryRun
+    if (!candidate || isGeneratingInChat || retryingTurnId !== null) return
+    const current = selectLatestAgentRunForChat(useStore.getState(), chatId)
+    if (
+      !current
+      || current.turnId !== candidate.turnId
+      || current.recoveryAction !== 'retry'
+      || !current.recoveryEligible
+      || current.workStatus !== 'terminal'
+    ) return
+    setRetryingTurnId(candidate.turnId)
+    setPendingRuntimeTarget({
+      generationType: candidate.generationType,
+      messageId: candidate.target?.messageId ?? null,
+      swipeId: candidate.target?.swipeId ?? null,
+      targetCharacterId: null,
+    })
+    try {
+      const response = await agentRunsApi.retry(candidate.turnId)
+      if (!response.accepted) {
+        toast.error(t('agentRuntime.retry.rejected'))
+        return
+      }
+      await recoverAgentRuns(chatId, agentRunsApi, useStore)
+      toast.success(t('agentRuntime.retry.accepted'))
+    } catch {
+      toast.error(t('agentRuntime.retry.failed'))
+    } finally {
+      setRetryingTurnId((currentTurnId) => currentTurnId === candidate.turnId ? null : currentTurnId)
+    }
+  }, [chatId, exactRetryRun, isGeneratingInChat, retryingTurnId, t])
+
 
   const handleImpersonate = useCallback(async (mode: import('@/api/generate').ImpersonateMode) => {
     if (isGeneratingInChat) return
@@ -2623,42 +2731,81 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   }, [chatId, isGeneratingInChat, text, isTemporaryChat, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, impersonationPresetId, getActivePresetForGeneration, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, resizeTextarea, t, te])
 
   const handleStop = useCallback(async () => {
-    if (!isGeneratingInChat || isRoomPeer) return
+    if ((!isGeneratingInChat && !composerAbortInFlight) || isRoomPeer) return
     const knownRun = activeAgentRun
-    cancelGenerationLocally()
-    if (knownRun) {
-      pendingAgentStopRef.current = null
-      try {
-        await agentRunsApi.stop(knownRun.turnId, {
-          chatId,
-          generationId: knownRun.generationId,
-        })
-      } catch (err: unknown) {
-        console.error('[InputArea] Failed to stop Agentic run:', err)
-      }
-    } else {
-      if (waitingForExactAgentRun) {
-        pendingAgentStopRef.current = {
-          generationId: generationIdForChat,
-          stoppedTurnId: null,
-        }
-        void recoverAgentRuns(chatId)
-      } else {
+    beginComposerAbort()
+    try {
+      if (knownRun) {
         pendingAgentStopRef.current = null
+        try {
+          const result = await agentRunsApi.stop(knownRun.turnId, {
+            chatId,
+            generationId: knownRun.generationId,
+          })
+          recordComposerStopResult(result.status)
+        } catch (err: unknown) {
+          console.error('[InputArea] Failed to stop Agentic run:', err)
+          setComposerStopping(false)
+        }
+      } else {
+        if (waitingForExactAgentRun) {
+          pendingAgentStopRef.current = {
+            generationId: generationIdForChat,
+            stoppedTurnId: null,
+          }
+          void recoverAgentRuns(chatId, agentRunsApi, useStore)
+        } else {
+          pendingAgentStopRef.current = null
+        }
+        try {
+          // The chat id remains the backend fallback while an optimistic
+          // generation has not handed its durable id to the client.
+          const result = await generateApi.stop(generationIdForChat || undefined, chatId)
+          recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status)
+        } catch (err: unknown) {
+          console.error('[InputArea] Failed to stop:', err)
+          setComposerStopping(false)
+        }
       }
-      try {
-        // The chat id remains the backend fallback while an optimistic
-        // generation has not handed its durable id to the client.
-        await generateApi.stop(generationIdForChat || undefined, chatId)
-      } catch (err: unknown) {
-        console.error('[InputArea] Failed to stop:', err)
+    } finally {
+      settleComposerAbort()
+    }
+  }, [isGeneratingInChat, composerAbortInFlight, isRoomPeer, activeAgentRun, beginComposerAbort, recordComposerStopResult, settleComposerAbort, waitingForExactAgentRun, generationIdForChat, chatId])
+
+  const handleRetryStopLookup = useCallback(async () => {
+    if (isRoomPeer) return
+    beginComposerAbort()
+    try {
+      await recoverAgentRuns(chatId, agentRunsApi, useStore)
+      const recovered = selectActiveAgentRunForChat(
+        useStore.getState(),
+        chatId,
+        generationIdForChat,
+      )
+      if (recovered) {
+        const result = await agentRunsApi.stop(recovered.turnId, {
+          chatId,
+          generationId: recovered.generationId,
+        })
+        recordComposerStopResult(result.status)
+      } else {
+        const result = await generateApi.stop(generationIdForChat || undefined, chatId)
+        recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status)
       }
+    } catch (error) {
+      console.error('[InputArea] Failed to recover exact stop target:', error)
+      setComposerStopping(false)
+    } finally {
+      settleComposerAbort()
     }
-    // If we're in the optimistic phase (no WS events yet), revert locally.
-    if (localGenerationInChat && !activeGenerationId) {
-      stopStreaming()
-    }
-  }, [isGeneratingInChat, isRoomPeer, activeAgentRun, cancelGenerationLocally, waitingForExactAgentRun, generationIdForChat, chatId, localGenerationInChat, activeGenerationId, stopStreaming])
+  }, [
+    beginComposerAbort,
+    chatId,
+    generationIdForChat,
+    isRoomPeer,
+    recordComposerStopResult,
+    settleComposerAbort,
+  ])
 
   const queueCurrentChatDeletion = useCallback(() => {
     void chatsApi.delete(chatId).catch((err) => {
@@ -3349,47 +3496,73 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       )}
 
       <span data-spindle-mount="chat_composer_above" style={{ display: 'contents' }} />
-      {!isGeneratingInChat && (
-        <AgentRuntimeModeControl
-          chatId={chatId}
-          generationType={pendingRuntimeTarget.generationType}
-          messageId={pendingRuntimeTarget.messageId}
-          swipeId={pendingRuntimeTarget.swipeId}
-          logicalConnectionId={activeProfileId}
-          presetId={getActivePresetForGeneration()}
-          forcePresetId={shouldForceLoomRuntimePreset(
-            getActivePresetForGeneration(),
-            chatId,
-            activeCharacterId,
-            activeProfileId,
-          )}
-          personaId={isTemporaryChat ? null : activePersonaId}
-          targetCharacterId={pendingRuntimeTarget.targetCharacterId}
-          supported={
-            isAgenticGenerationType(pendingRuntimeTarget.generationType)
-            && !isGroupChat
-            && !mpRoomId
-          }
-        />
-      )}
+      <AgentRuntimeModeControl
+        chatId={chatId}
+        generationType={pendingRuntimeTarget.generationType}
+        messageId={pendingRuntimeTarget.messageId}
+        swipeId={pendingRuntimeTarget.swipeId}
+        logicalConnectionId={activeProfileId}
+        presetId={getActivePresetForGeneration()}
+        forcePresetId={shouldForceLoomRuntimePreset(
+          getActivePresetForGeneration(),
+          chatId,
+          activeCharacterId,
+          activeProfileId,
+        )}
+        personaId={isTemporaryChat ? null : activePersonaId}
+        targetCharacterId={pendingRuntimeTarget.targetCharacterId}
+        supported={
+          isAgenticGenerationType(pendingRuntimeTarget.generationType)
+          && !isGroupChat
+          && !mpRoomId
+        }
+      />
 
 
       {/* Action bar */}
       <div data-spindle-mount="chat_toolbar">
         <div className={styles.actionBar}>
-          <button type="button" className={styles.actionBtn} onClick={onNavigateHome ?? (() => navigate('/'))} title={t('input.backHome')}>
-            <Home size={14} />
+          <button
+            type="button"
+            className={styles.actionBtn}
+            onClick={onNavigateHome ?? (() => navigate('/'))}
+            title={t('input.backHome')}
+            aria-label={t('input.backHome')}
+          >
+            <Home size={14} aria-hidden="true" />
           </button>
           <span className={styles.actionDivider} />
-          {!isGeneratingInChat && (
-            <>
-              <button type="button" className={styles.actionBtn} onClick={handleRegenerate} title={t('input.regenerate')}>
-                <RotateCw size={14} />
-              </button>
-              <button type="button" className={styles.actionBtn} onClick={handleContinue} title={t('input.continue')}>
-                <CornerDownLeft size={14} />
-              </button>
-            </>
+          <button
+            type="button"
+            className={styles.actionBtn}
+            onClick={handleRegenerate}
+            title={canReplayAssistant ? t('input.regenerate') : t('agentRuntime.actionUnavailable')}
+            aria-label={t('input.regenerate')}
+            disabled={!canReplayAssistant}
+          >
+            <RotateCw size={14} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className={styles.actionBtn}
+            onClick={handleContinue}
+            title={canReplayAssistant ? t('input.continue') : t('agentRuntime.actionUnavailable')}
+            aria-label={t('input.continue')}
+            disabled={!canReplayAssistant}
+          >
+            <CornerDownLeft size={14} aria-hidden="true" />
+          </button>
+          {exactRetryRun && (
+            <button
+              type="button"
+              className={clsx(styles.actionBtn, styles.actionBtnRetry)}
+              onClick={() => void handleRetry()}
+              title={t('agentRuntime.retry.retry')}
+              aria-label={t('agentRuntime.retry.retry')}
+              disabled={retryingTurnId === exactRetryRun.turnId}
+            >
+              <RotateCw size={14} aria-hidden="true" />
+            </button>
           )}
           <button
             type="button"
@@ -4482,42 +4655,66 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
             />
           </div>
 
-          {isGeneratingInChat && !isRoomPeer ? (
+          {showStopControl ? (
             <div className={styles.sendBtnShell}>
               {activeAgentRun ? (
                 <AgentRunStopButton
                   turnId={activeAgentRun.turnId}
                   chatId={chatId}
                   generationId={activeAgentRun.generationId}
-                  onBeforeStop={cancelGenerationLocally}
-                  compact
-                  buttonClassName={clsx(styles.sendBtn, styles.sendBtnStop)}
+                  onBeforeStop={beginComposerAbort}
+                  onSettled={settleComposerAbort}
+                  onResult={(result) => recordComposerStopResult(result.status)}
                 />
               ) : waitingForExactAgentRun ? (
                 <button
                   type="button"
                   className={clsx(styles.sendBtn, styles.sendBtnStop)}
-                  title={t(canRetryExactAgentRunLookup ? 'agentRuntime.stop.retry' : 'agentRuntime.stop.locating')}
-                  aria-label={t(canRetryExactAgentRunLookup ? 'agentRuntime.stop.retry' : 'agentRuntime.stop.locating')}
-                  onClick={() => void handleStop()}
-                  data-stop-state={canRetryExactAgentRunLookup ? 'error' : 'locating'}
+                  title={composerStopping
+                    ? t('agentRuntime.stop.stopping')
+                    : t(canRetryExactAgentRunLookup ? 'agentRuntime.stop.retry' : 'agentRuntime.stop.locating')}
+                  aria-label={composerStopping
+                    ? t('agentRuntime.stop.stopping')
+                    : t(canRetryExactAgentRunLookup ? 'agentRuntime.stop.retry' : 'agentRuntime.stop.locating')}
+                  onClick={() => void (canRetryExactAgentRunLookup ? handleRetryStopLookup() : handleStop())}
+                  data-stop-state={composerStopping ? 'stopping' : canRetryExactAgentRunLookup ? 'error' : 'locating'}
                 >
-                  {canRetryExactAgentRunLookup ? <RotateCw size={16} /> : <Square size={16} />}
+                  {canRetryExactAgentRunLookup && !composerStopping ? <RotateCw size={16} /> : <Square size={16} />}
+                  <span>{composerStopping
+                    ? t('agentRuntime.stop.stopping')
+                    : t(canRetryExactAgentRunLookup ? 'agentRuntime.stop.retry' : 'agentRuntime.stop.locating')}</span>
                 </button>
               ) : (
                 <button
                   type="button"
                   className={clsx(styles.sendBtn, styles.sendBtnStop)}
                   onClick={handleStop}
-                  title={t('input.stopGeneration')}
-                  aria-label={t('input.stopGeneration')}
+                  title={composerStopping ? t('agentRuntime.stop.stopping') : t('input.stopGeneration')}
+                  aria-label={composerStopping ? t('agentRuntime.stop.stopping') : t('input.stopGeneration')}
+                  data-stop-state={composerStopping ? 'stopping' : undefined}
                 >
                   <Square size={16} />
+                  {composerStopping
+                    ? <span>{t('agentRuntime.stop.stopping')}</span>
+                    : null}
                 </button>
               )}
             </div>
           ) : (
             <div className={styles.sendBtnShell}>
+              {composerAbortSettled ? (
+                <span
+                  className={styles.abortBadge}
+                  data-stop-state={composerStopResult}
+                  role="status"
+                >
+                  {t(composerStopResult === 'accepted'
+                    ? 'agentRuntime.stop.accepted'
+                    : composerStopResult === 'too_late'
+                      ? 'agentRuntime.stop.tooLate'
+                      : 'agentRuntime.stop.terminal')}
+                </span>
+              ) : null}
               {mobileQueueHint ? (
                 <span
                   className={clsx(

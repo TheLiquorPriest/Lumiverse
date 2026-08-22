@@ -9,6 +9,11 @@ import type {
   CognitionTaskTransition,
   ContextActivationRuleV1,
   FrozenCognitionGraphV1,
+  LoomPolicyBucketsV1,
+  LoomPromptInspectionBlockV1,
+  LoomPromptInspectionContextPackV1,
+  LoomPromptInspectionV1,
+  LoomResponsePolicyOmissionV1,
   TaskTemplateV1,
 } from "./agent-cognition";
 
@@ -22,6 +27,12 @@ export const COGNITION_RUNTIME_PHASES = [
   "COMMITTED",
 ] as const;
 export type CognitionRuntimePhaseV1 = (typeof COGNITION_RUNTIME_PHASES)[number];
+/** The authored cognition ID and its turn-scoped workspace identity are distinct. */
+export interface CognitionTaskIdentityV1 {
+  readonly authoredTaskId: string;
+  readonly operationalTaskId: string;
+}
+
 
 /** Authenticated direct context selection from preset_agent_configs.config_json. */
 export interface CognitionContextPackSelectionV1 {
@@ -60,11 +71,22 @@ export interface AgentCognitionRuntimeSourceV1 {
   readonly config?: Readonly<Record<string, unknown>>;
   readonly contextPackSelections?: readonly unknown[];
   readonly contextPackCandidates?: readonly unknown[];
+  /**
+   * Omitted context rules mean all authored graph roots; an explicit empty
+   * array is the closed "select none" set used by the coordinator.
+   */
   readonly contextRules?: readonly unknown[];
   readonly taskTemplates?: readonly unknown[];
   /** Exact AgentConfigV2 task-policy roots selected for this turn. */
   readonly taskTemplateIds?: readonly unknown[];
+  /** Canonical, host-authenticated Loom policy and its sealed inspection inputs. */
+  readonly loomPolicy?: LoomPolicyBucketsV1;
+  readonly loomBlocks?: readonly LoomPromptInspectionBlockV1[];
+  readonly loomContextPacks?: readonly LoomPromptInspectionContextPackV1[];
+  /** Host-authenticated, opaque Cortex sidecar input sealed for this turn. */
+  readonly cortexSidecarSnapshot?: unknown;
 }
+
 
 /** Base predicate input frozen before the first provider/isolate dispatch. */
 export type AgentCognitionRuntimeEvaluationV1 = CognitionEvaluationContextV1;
@@ -81,6 +103,12 @@ export interface CognitionPromptBlockSelectionV1 {
   readonly refs: readonly CognitionLoomBlockRefV1[];
 }
 
+export interface CognitionRuntimePolicySurfaceV1 {
+  readonly policies: LoomPolicyBucketsV1;
+  readonly promptInspection?: LoomPromptInspectionV1;
+  readonly responseOmission?: LoomResponsePolicyOmissionV1;
+}
+
 export interface CognitionRuntimeActivationV1 {
   readonly phase: CognitionPhase;
   readonly state: CognitionActivationStateV1;
@@ -88,6 +116,7 @@ export interface CognitionRuntimeActivationV1 {
   readonly newlyActivatedContextPackRequirements: readonly CognitionContextPackRequirementV1[];
   readonly contextPackRequirements: readonly CognitionContextPackRequirementV1[];
   readonly promptBlocks: CognitionPromptBlockSelectionV1;
+  readonly policySurface?: CognitionRuntimePolicySurfaceV1;
   readonly sourceRevisions: CognitionFrozenSourceRevisionsV1;
   readonly sourceDigest: string;
   readonly workspaceRevision: number;
@@ -109,7 +138,7 @@ export interface CognitionRuntimeCompletionV1 extends CognitionRuntimeActivation
   readonly accepted: boolean;
   readonly blockers: readonly CognitionCompletionBlockerV1[];
   readonly blockingRequiredTaskIds: readonly string[];
-  /** Tasks materialized by the completion CAS, if any. */
+  /** Stable authored template IDs; workspace DB identities remain turn-scoped host data. */
   readonly materializedTaskIds: readonly string[];
   /** Private host evidence for every successful-path pre-commit phase. */
   readonly preCommitActivations: readonly CognitionRuntimeActivationV1[];
@@ -175,7 +204,10 @@ export interface AgentCognitionRuntimeV1 {
   readonly source: AgentCognitionRuntimeSourceV1;
   /** Exact authored roots whose predicates may be evaluated. */
   readonly activationRoots: CognitionActivationRootsV1;
+  readonly policySurface?: CognitionRuntimePolicySurfaceV1;
   readonly initialActivation: CognitionRuntimeActivationV1;
+  /** Adopt one committed workspace CAS that cannot change cognition predicates. */
+  readonly adoptWorkspaceMutationRevision: (workspaceRevision: number) => void;
   readonly enterPhase: (input: CognitionRuntimePhaseInputV1) => CognitionRuntimeActivationV1;
   readonly applyWorkspaceTransition: (input: CognitionRuntimeTaskTransitionInputV1) => Promise<CognitionWorkspaceMutationResultV1> | CognitionWorkspaceMutationResultV1;
   readonly acceptCompletionFixedPoint: (input: CognitionRuntimeCompletionInputV1) => Promise<CognitionRuntimeCompletionV1> | CognitionRuntimeCompletionV1;
@@ -186,6 +218,7 @@ export interface CognitionWorkspaceCommitResultV1 {
   readonly workspaceRevision: number;
   readonly state: CognitionActivationStateV1;
   readonly activation: CognitionActivationResultV1;
+  /** Turn-scoped operational task IDs returned by the workspace database. */
   readonly materializedTaskIds: readonly string[];
   readonly taskId: string;
   readonly transition: CognitionTaskTransition;
@@ -193,7 +226,9 @@ export interface CognitionWorkspaceCommitResultV1 {
 }
 
 /** Runtime result wraps the committed DB result with the private cognition view. */
-export interface CognitionWorkspaceMutationResultV1 extends CognitionWorkspaceCommitResultV1 {
+export interface CognitionWorkspaceMutationResultV1 extends Omit<CognitionWorkspaceCommitResultV1, "materializedTaskIds"> {
+  /** Stable authored template IDs; operational DB IDs never replace this field. */
+  readonly materializedTaskIds: readonly string[];
   /** Private host envelope; never serialize into model-visible workspace output. */
   readonly cognition: CognitionRuntimeActivationV1;
 }

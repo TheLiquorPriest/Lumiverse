@@ -5,6 +5,8 @@ import type { AgentConfigV2 } from "../types/agents";
 import type { AgentToolSnapshot } from "../types/agents";
 import type { WorldBook } from "../types/world-book";
 
+import type { LoomPromptInspectionV1 } from "../types/agent-cognition";
+
 export type { ProviderCapabilities, ToolContinuationMode } from "./param-schema";
 
 // --- Multi-part content types (for multimodal messages) ---
@@ -359,11 +361,18 @@ export type GenerationType = 'normal' | 'continue' | 'regenerate' | 'swipe' | 'i
 
 export type ImpersonateMode = 'prompts' | 'oneliner' | 'sovereign_hand';
 
+/** The authenticated prompt surface for one assembly; callers must provide it explicitly. */
+export type AssemblySurfaceV1 = "RESPONSE" | "WORK";
+
 export interface AssemblyContext {
   userId: string;
+  /** Pre-resolved authenticated account name used when no persona is selected. */
+  userName?: string;
   generationId: string;
   dryRun: boolean;
   chatId: string;
+  /** Host-authenticated surface; every assembly caller must set this explicitly. */
+  assemblySurface: AssemblySurfaceV1;
   connectionId?: string;
   presetId?: string;
   /** Internal transient preset used by assembly-only callers. Never persisted. */
@@ -583,6 +592,10 @@ export interface ContextClipStats {
 }
 
 export interface AssemblyResult {
+  /** Surface used to build this provider message set. */
+  assemblySurface: AssemblySurfaceV1;
+  /** Owner-only Loom policy/context inspection, including Response omissions. */
+  loomPromptInspection?: LoomPromptInspectionV1;
   messages: LlmMessage[];
   breakdown: AssemblyBreakdownEntry[];
   parameters: Record<string, any>;

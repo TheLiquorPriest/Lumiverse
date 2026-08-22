@@ -70,6 +70,18 @@ export interface ContextPackDetail {
   contextAclRevision: number
 }
 
+export interface SelectableContextPackRevision {
+  ownerId: string
+  source: 'owned' | 'shared'
+  packId: string
+  packName: string
+  packDescription: string
+  revision: number
+  digest: string
+  byteCount: number
+  tokenCount: number
+}
+
 export interface CreateContextPackInput {
   name: string
   description?: string

@@ -11,7 +11,7 @@ import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { clampErrorMessage, describeProviderError } from "../utils/provider-errors";
 import {
-  normalizeEffectiveRuntimeRequest,
+  normalizeAuthenticatedEffectiveRuntimeRequest,
   resolveEffectiveRuntime,
   RuntimeDecisionError,
   toPublicRuntimeDecision,
@@ -34,7 +34,7 @@ app.post("/effective-runtime", async (c) => {
   const userId = c.get("userId");
   try {
     const body = await c.req.json();
-    const request = normalizeEffectiveRuntimeRequest(body);
+    const request = normalizeAuthenticatedEffectiveRuntimeRequest(body);
     const decision = await resolveEffectiveRuntime(userId, request);
     return c.json(toPublicRuntimeDecision(decision));
   } catch (error) {
@@ -57,6 +57,7 @@ function chatRoute(
 ) {
   return async (c: Context) => {
     const userId = c.get("userId");
+    const sessionUser = c.get("session").user;
     const body = await c.req.json() as Record<string, unknown>;
     if (typeof body.chat_id !== "string" || body.chat_id.length === 0) {
       return c.json({ error: "chat_id is required" }, 400);
@@ -65,6 +66,7 @@ function chatRoute(
       const result = await handler({
         ...body,
         userId,
+        userName: sessionUser.name?.trim() || sessionUser.username?.trim() || undefined,
         signal: c.req.raw.signal,
         ...extras,
       } as GenerateInput);
@@ -89,6 +91,13 @@ function chatRoute(
   };
 }
 
+function stopResultPayload(result: boolean | "too_late") {
+  return {
+    stopped: result === true,
+    status: result === true ? "accepted" as const : result === "too_late" ? "too_late" as const : "not_found" as const,
+  };
+}
+
 app.post("/", chatRoute(svc.startGeneration));
 app.post("/regenerate", chatRoute(svc.startGeneration, { generation_type: "regenerate" }));
 app.post("/continue", chatRoute(svc.startGeneration, { generation_type: "continue" }));
@@ -104,28 +113,28 @@ app.post("/stop", async (c) => {
     // fall back to whatever is actually running for the chat.
     if (!stopped && body.chat_id) {
       const fallback = await svc.stopChatGenerations(userId, body.chat_id);
-      return c.json({ stopped: fallback === true });
+      return c.json(stopResultPayload(fallback));
     }
-    return c.json({ stopped: stopped === true });
+    return c.json(stopResultPayload(stopped));
   }
   // No generation id yet (optimistic phase). Prefer the chat-scoped stop so a
   // background generation in another chat isn't collateral damage.
   if (body.chat_id) {
     const stopped = await svc.stopChatGenerations(userId, body.chat_id);
-    return c.json({ stopped: stopped === true });
+    return c.json(stopResultPayload(stopped));
   }
   const stopped = await svc.stopUserGenerations(userId);
-  return c.json({ stopped: stopped === true });
+  return c.json(stopResultPayload(stopped));
 });
 
-// Legacy chat-scoped alias. Response-mode clients historically consume a
-// boolean payload; Agentic's durable too_late status remains on /agent-runs.
+// Legacy chat-scoped alias retains the boolean field and now exposes the
+// durable terminal race explicitly.
 app.post("/stop-chat/:chatId", async (c) => {
   const userId = c.get("userId");
   const chatId = c.req.param("chatId");
   if (!chatId) return c.json({ stopped: false }, 400);
   const stopped = await svc.stopChatGenerations(userId, chatId);
-  return c.json({ stopped: stopped === true });
+  return c.json(stopResultPayload(stopped));
 });
 
 // --- Generation status / recovery ---

@@ -287,6 +287,7 @@ async function assembledFixture(
   try {
     seed(db, blockContent);
     const snapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
       userId: "user-1",
       chatId: "chat-1",
       presetId: "preset-1",

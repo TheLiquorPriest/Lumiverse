@@ -110,11 +110,13 @@
 }
 
 .actionBtn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 26px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
   border: none;
   border-radius: var(--lcs-radius-xs, 6px);
   background: transparent;
@@ -126,14 +128,30 @@
   padding: 0;
 }
 
-.actionBtn:hover {
+.actionBtn:hover:not(:disabled) {
   color: var(--lumiverse-text, rgba(230, 230, 240, 0.92));
   background: var(--lumiverse-fill, rgba(255, 255, 255, 0.06));
 }
 
+.actionBtn:focus-visible {
+  outline: 2px solid var(--lumiverse-primary-050);
+  outline-offset: 2px;
+  box-shadow: var(--lumiverse-focus-ring);
+}
+
+.actionBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+
 .actionBtnActive {
   color: var(--lumiverse-text, rgba(230, 230, 240, 0.92));
   background: var(--lumiverse-fill, rgba(255, 255, 255, 0.08));
+}
+.actionBtnRetry {
+  color: var(--lumiverse-warning, #f59e0b);
+  background: color-mix(in srgb, var(--lumiverse-warning, #f59e0b) 12%, transparent);
 }
 
 /* Persistent state indicator for buttons whose feature is "armed" — e.g.
@@ -371,6 +389,10 @@
 
   .popover {
     animation: none;
+  }
+
+  .actionBtn {
+    transition: none;
   }
 }
 
@@ -878,6 +900,12 @@
   flex-shrink: 0;
 }
 
+.sendBtnShell:has([data-stop-state]),
+.sendBtnShell:has(.sendBtnStop span) {
+  width: auto;
+  min-width: 40px;
+}
+
 .sendBtn {
   display: flex;
   align-items: center;
@@ -970,6 +998,41 @@
 
 .sendBtnStop:hover {
   background: var(--lumiverse-danger-hover, #dc2626);
+}
+
+.sendBtnStop:has(span),
+.sendBtn[data-stop-state] {
+  width: auto;
+  min-width: 44px;
+  height: 40px;
+  padding: 0 12px;
+  gap: 6px;
+  overflow: visible;
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.abortBadge {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: max-content;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--lumiverse-danger, #ef4444) 88%, black 12%);
+  border: 1px solid color-mix(in srgb, var(--lumiverse-danger, #ef4444) 70%, white 12%);
+  color: #fff;
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 1.15;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 2;
 }
 
 .mobileQueueHint {
@@ -1123,7 +1186,8 @@
   }
 
   .actionBtn {
-    width: 28px;
+    width: 44px;
+    min-width: 44px;
   }
 
   :global(html[data-ios-pwa]) .container {

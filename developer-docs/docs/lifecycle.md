@@ -32,3 +32,106 @@ By default, backend runtimes start in `process` mode. See [Runtime Modes](gettin
 ## Startup Order
 
 On Lumiverse boot, all enabled extensions are started after database migrations complete. Extensions should not depend on a specific load order.
+---
+
+## WORK Engine lifecycle
+
+The WORK Engine is a strict, single-turn runtime behind the authenticated
+generation routes. A request creates one **Turn Session** and one immutable
+attempt lineage. The request is admitted only after the server resolves the
+authenticated target, runtime mode, concrete provider capability set, frozen
+input revisions, and readiness gates. A request that asks for WORK never
+silently becomes Response.
+
+### Phase, status, and outcome vocabulary
+
+The durable lifecycle is:
+
+`ADMIT` → `ASSEMBLE` → `WORK` → `PREPARE_COMMIT` → `RENDER` → `COMMIT` →
+`TERMINAL`.
+
+The status is one of `pending`, `running`, `waiting`, `cancelling`, or
+`terminal`. A terminal Turn Session has one outcome: `completed`, `stopped`,
+`failed`, `exhausted`, or `rejected`. `workPhase`, `workStatus`, and
+`workOutcome` are independent fields; a client must not infer one from another
+or from stream silence.
+
+Every public run carries `attemptLineage`:
+
+```ts
+{
+  version: 1,
+  attemptId: string,
+  previousAttemptId: string | null,
+  target: {
+    chatId: string,
+    generationType: 'normal' | 'continue' | 'regenerate' | 'swipe',
+    messageId: string | null,
+    swipeId: number | null,
+  },
+  createdAt: number,
+}
+```
+
+The `attemptId` identifies this attempt; a retry creates a new attempt whose
+`previousAttemptId` points to the inspected terminal attempt. A refused retry
+creates no attempt, projection, or terminal publication.
+
+### Request through terminal behavior
+
+1. **Request:** the authenticated client posts `/api/v1/generate` (or the
+   canonical regenerate/continue route) with `chat_id` and an explicit
+   `mode`. Omitting `mode` retains the existing Response path.
+2. **Admission:** `mode: 'agentic'` consumes the one-use effective-runtime
+   decision (or performs the same authenticated resolution when no token is
+   supplied). Target, revision, capability, isolate, publication, context,
+   and kill-switch changes fail closed.
+3. **Assembly:** the host freezes the `GenerationAssemblySnapshotV1` and
+   produces an `AssemblyPlanV1`. No provider request or workspace mutation is
+   made before the plan passes validation.
+4. **WORK:** deterministic child descriptors run in order, then the root
+   provider may use only its admitted tool/delegation capabilities. WORK
+   notes and private child material are retained only for owner inspection.
+5. **Preparation and render:** `PREPARE_COMMIT` validates typed deltas and
+   `RENDER` produces the final response with tools disabled. A tool call in
+   finalization is a protocol failure, not another delegation.
+6. **Commit or terminal:** one compare-and-set owner decides whether
+   `COMMIT` can begin. A successful commit writes the canonical message/swipe
+   and terminal receipt in one transaction. Cancellation, deadline, provider
+   failure, required-work failure, or exhaustion before that boundary produces
+   a terminal outcome without an authoritative chat write.
+
+`POST /api/v1/agent-runs/:turnId/stop` returns `accepted` only while the run
+is reversible, `too_late` after the completion boundary, or `terminal` once a
+terminal owner has settled it. The compatibility
+`POST /api/v1/generate/stop` route returns only `{ stopped: boolean }`; use the
+Agent Run Stop route when the phase distinction matters.
+
+### Inspection, recovery, and retention
+
+The authenticated owner follows a run through the Agent Run projection and
+owner inspection surfaces, not by interpreting event silence or message text.
+Inspection list/detail reads re-check the authenticated owner, chat, attempt,
+target, and stored Turn Session identity. A foreign, missing, expired, or
+no-longer-visible record is a non-disclosing `404`.
+
+Inspection is layered: summary/activity, Turn Session entries, transcript
+records, prompt evidence, Cortex/Council receipts, workspace associations,
+usage evidence, and causal error detail are separate retained projections.
+Bounded omission markers identify reconnect gaps, truncation, unavailable
+layers, withheld credentials, and recovered duplicates. Public run payloads
+remain status-only and never contain prompts, work prose, provider carriers,
+tool arguments/results, credentials, or private child content.
+
+The inspection service bounds each payload to 64 KiB, each audit record to
+128 KiB, each attempt to 4,096 records, and each list response to 64 runs.
+These are retention/read bounds, not a promise that every private event is
+available. The activity fallback is separately bounded to the newest 16
+runs per chat and 512 KiB total.
+
+Recovery is host-owned. `recoveryEligible` and `recoveryAction` are returned
+with the run/error projection; clients must not manufacture a retry or repair
+action. `POST /api/v1/agent-runs/:attemptId/retry` accepts only an empty body
+or `{}` and admits only an owner-scoped terminal attempt with a still-valid
+target and retryable outcome (`failed`, `exhausted`, or `stopped`). The `202`
+response contains the new attempt lineage only after durable admission.

@@ -7,6 +7,7 @@ import {
   appendAgentRunSnapshot,
   withAgentRunProjectionTransaction,
 } from "../services/agent-run-projection.service";
+import { persistAgentRunInspection } from "../services/agent-activity-runs.service";
 
 const OWNER = "route-owner";
 const OTHER = "route-other";
@@ -150,6 +151,213 @@ describe("authenticated Agentic run routes", () => {
 
     const conflictingAliases = await app.request(
       "http://localhost/agent-runs/status/route-invalid-turn?chatId=route-invalid-chat&chat_id=other-chat",
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(conflictingAliases.status).toBe(400);
+  });
+
+  test("derives stable workspace identity from authenticated chat scope and fences CAS writes", async () => {
+    seedChat(OWNER, "route-workspace-chat");
+    seedChat(OWNER, "route-other-chat");
+    seedChat(OTHER, "route-other-owner-chat");
+
+    const createdResponse = await app.request("http://localhost/agent-runs/workspace?chat_id=route-workspace-chat", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({
+        userId: OTHER,
+        chatId: "route-other-owner-chat",
+        workspaceId: "client-forged-workspace",
+        objective: "Stable route workspace",
+      }),
+    });
+    expect(createdResponse.status).toBe(201);
+    const created = await createdResponse.json() as { id: string; userId: string; chatId: string | null; objective: string; revision: number };
+    expect(created).toMatchObject({ userId: OWNER, chatId: "route-workspace-chat", objective: "Stable route workspace", revision: 0 });
+
+    const replayResponse = await app.request("http://localhost/agent-runs/workspace?chat_id=route-workspace-chat", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({
+        user_id: OTHER,
+        chat_id: "route-other-owner-chat",
+        workspace_id: "another-client-workspace",
+        objective: "A later turn cannot replace it",
+        authority: { kind: "host" },
+      }),
+    });
+    expect(replayResponse.status).toBe(201);
+    const replay = await replayResponse.json() as { id: string; objective: string };
+    expect(replay).toMatchObject({ id: created.id, objective: "Stable route workspace" });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM persistent_workspaces WHERE user_id = ? AND chat_id = ?").get(OWNER, "route-workspace-chat")).toEqual({ count: 1 });
+
+    const ownerRead = await app.request(`http://localhost/agent-runs/workspace/${created.id}?chat_id=route-workspace-chat`, {
+      headers: { "x-test-user": OWNER },
+    });
+    expect(ownerRead.status).toBe(200);
+    expect((await ownerRead.json()).id).toBe(created.id);
+
+    const wrongChatRead = await app.request(`http://localhost/agent-runs/workspace/${created.id}?chat_id=route-other-chat`, {
+      headers: { "x-test-user": OWNER },
+    });
+    expect(wrongChatRead.status).toBe(404);
+    const wrongOwnerRead = await app.request(`http://localhost/agent-runs/workspace/${created.id}`, {
+      headers: { "x-test-user": OTHER },
+    });
+    expect(wrongOwnerRead.status).toBe(404);
+
+    const firstWrite = await app.request(`http://localhost/agent-runs/workspace/${created.id}`, {
+      method: "PATCH",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({
+        userId: OTHER,
+        chatId: "route-other-chat",
+        workspaceId: "forged-workspace",
+        expectedRevision: 0,
+        objective: "Owner update",
+      }),
+    });
+    expect(firstWrite.status).toBe(200);
+    expect((await firstWrite.json()).revision).toBe(1);
+
+    const staleWrite = await app.request(`http://localhost/agent-runs/workspace/${created.id}`, {
+      method: "PATCH",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 0, objective: "Lost update" }),
+    });
+    expect(staleWrite.status).toBe(409);
+    expect((await staleWrite.json()).error.reason).toBe("stale_workspace_revision");
+
+    const optionalTask = await app.request(`http://localhost/agent-runs/workspace/${created.id}/tasks`, {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedRevision: 1,
+        title: "Owner optional task",
+        required: false,
+        creator: "host",
+        hostAdmitted: true,
+      }),
+    });
+    expect(optionalTask.status).toBe(201);
+    expect((await optionalTask.json())).toMatchObject({ required: false, creator: "owner", hostAdmitted: false });
+
+    const forgedRequiredTask = await app.request(`http://localhost/agent-runs/workspace/${created.id}/tasks`, {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedRevision: 2,
+        title: "Forged required task",
+        required: true,
+        creator: "host",
+        hostAdmitted: true,
+      }),
+    });
+    expect(forgedRequiredTask.status).toBe(403);
+  });
+
+  test("exposes session reads without an owner mutation route", async () => {
+    seedChat(OWNER, "route-session-chat");
+    const createdResponse = await app.request("http://localhost/agent-runs/workspace?chat_id=route-session-chat", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ objective: "Session route workspace" }),
+    });
+    const created = await createdResponse.json() as { id: string };
+
+    const sessions = await app.request(`http://localhost/agent-runs/workspace/${created.id}/sessions`, {
+      headers: { "x-test-user": OWNER },
+    });
+    expect(sessions.status).toBe(200);
+    expect(await sessions.json()).toEqual([]);
+
+    const mutation = await app.request(`http://localhost/agent-runs/workspace/${created.id}/sessions`, {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ status: "terminal", phase: "TERMINAL", outcome: "completed" }),
+    });
+    expect(mutation.status).toBe(404);
+  });
+
+  test("serves owner-scoped inspection detail and keeps malformed or foreign requests private", async () => {
+    seedChat(OWNER, "route-inspection-chat");
+    seedChat(OTHER, "route-other-inspection-chat");
+    const detail = persistAgentRunInspection({
+      userId: OWNER,
+      chatId: "route-inspection-chat",
+      attemptId: "route-inspection-attempt",
+      runId: "route-inspection-run",
+      turnSessionId: "route-inspection-turn",
+      generationId: "route-inspection-generation",
+      generationType: "normal",
+      hostCorrelationId: "route-inspection-host",
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      reason: "provider_failure",
+      transcript: [{
+        id: "route-private-transcript",
+        kind: "tool",
+        actor: "agent",
+        recipient: "tool",
+        hostSequence: 1,
+        occurredAt: 1,
+        late: false,
+        content: null,
+        arguments: "PRIVATE-ROUTE-TRANSCRIPT",
+        result: null,
+        durationMs: null,
+        correlation: { parentId: null, hostSequence: 1 },
+      }],
+      activity: [{
+        id: "route-compact-activity",
+        kind: "tool",
+        actor: "tool",
+        phase: "TERMINAL",
+        status: "terminal",
+        parentId: null,
+        label: "Completed tool",
+        toolId: null,
+        taskId: null,
+        sequence: 1,
+        startedAt: 1,
+        endedAt: 2,
+        elapsedMs: 1,
+        privatePayload: "PRIVATE-ROUTE-ACTIVITY",
+        correlation: { hostSequence: 1 },
+      }],
+    });
+    expect(detail).not.toBeNull();
+
+    const ownerResponse = await app.request(
+      "http://localhost/agent-runs/route-inspection-attempt/inspection?chatId=route-inspection-chat",
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(ownerResponse.status).toBe(200);
+    const ownerBody = await ownerResponse.json() as {
+      attempt: { attemptId: string };
+      transcript: Array<{ arguments: string | null }>;
+      activity: { milestones: Array<Record<string, unknown>> };
+    };
+    expect(ownerBody.attempt.attemptId).toBe("route-inspection-attempt");
+    expect(ownerBody.transcript[0]?.arguments).toBe("PRIVATE-ROUTE-TRANSCRIPT");
+    expect(ownerBody.activity.milestones[0]).not.toHaveProperty("privatePayload");
+    expect(JSON.stringify(ownerBody.activity)).not.toContain("PRIVATE-ROUTE");
+
+    const foreignResponse = await app.request(
+      "http://localhost/agent-runs/route-inspection-attempt/inspection?chatId=route-inspection-chat",
+      { headers: { "x-test-user": OTHER } },
+    );
+    expect(foreignResponse.status).toBe(404);
+
+    const wrongChatResponse = await app.request(
+      "http://localhost/agent-runs/route-inspection-attempt/inspection?chatId=route-other-inspection-chat",
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(wrongChatResponse.status).toBe(404);
+
+    const conflictingAliases = await app.request(
+      "http://localhost/agent-runs/route-inspection-attempt/inspection?chatId=route-inspection-chat&chat_id=route-other-inspection-chat",
       { headers: { "x-test-user": OWNER } },
     );
     expect(conflictingAliases.status).toBe(400);

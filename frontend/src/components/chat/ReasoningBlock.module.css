@@ -196,11 +196,10 @@
 .activityProfile {
   grid-area: profile;
   min-width: 0;
-  overflow: hidden;
   color: var(--lumiverse-text);
   font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .activityDetail {
@@ -209,6 +208,8 @@
   align-items: center;
   gap: 5px;
   min-width: 0;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
   color: var(--lumiverse-text-dim);
   font-size: calc(11px * var(--lumiverse-font-scale, 1));
 }
@@ -217,6 +218,7 @@
   grid-area: status;
   color: var(--lumiverse-text-muted);
   font-size: calc(11px * var(--lumiverse-font-scale, 1));
+  white-space: nowrap;
 }
 
 .activityElapsed {
@@ -225,6 +227,7 @@
   font-family: var(--lumiverse-font-mono);
   font-size: calc(10px * var(--lumiverse-font-scale, 1));
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .activityRow[data-status='succeeded'] .activityStatusIcon,
@@ -254,6 +257,7 @@
   color: var(--lumiverse-text-dim);
   font-family: var(--lumiverse-font-mono);
   font-size: calc(10px * var(--lumiverse-font-scale, 1));
+  overflow-wrap: anywhere;
   text-align: right;
 }
 
@@ -503,5 +507,18 @@
   .activityChildren {
     margin-left: 4px;
     padding-left: 9px;
+  }
+
+  .activityRow {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "icon profile elapsed"
+      ". status status"
+      ". detail detail";
+    align-items: start;
+  }
+
+  .activityUsage {
+    text-align: start;
   }
 }

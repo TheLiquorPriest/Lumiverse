@@ -6,7 +6,7 @@ import { CloseButton } from '@/components/shared/CloseButton'
 import { Button } from '@/components/shared/FormComponents'
 import { ModalShell } from '@/components/shared/ModalShell'
 import { useStore } from '@/store'
-import { generateApi, type DryRunMessage, type DryRunResponse } from '@/api/generate'
+import { generateApi, type DryRunMessage } from '@/api/generate'
 import type { BreakdownCacheEntry } from '@/types/store'
 import { findExpandedTextMatches } from '@/lib/expandedTextSearch'
 import { groupBreakdownEntries, getBlockDisplayColor } from '@/lib/prompt-breakdown'
@@ -15,7 +15,7 @@ import { translateBreakdownGroupLabel } from '@/lib/i18n/breakdownGroupLabel'
 import { getAnthropicBreakdownCacheHints, getAnthropicCacheUsageSummary } from '@/lib/anthropic-breakdown-cache'
 import { getNanoGptCacheUsageSummary } from '@/lib/nanogpt-breakdown-cache'
 import { copyTextToClipboard } from '@/lib/clipboard'
-import { dryRunToRawPromptInput, formatRawPrompt, type RawPromptView } from '@/lib/formatRawPrompt'
+import { dryRunToRawPromptInput, formatRawPrompt, type RawPromptInput, type RawPromptView } from '@/lib/formatRawPrompt'
 import { shouldForceLoomRuntimePreset } from '@/lib/loom/runtimeProfile'
 import styles from './PromptItemizerModal.module.css'
 import clsx from 'clsx'
@@ -63,15 +63,16 @@ export default function PromptItemizerModal() {
     const m = messages.find((x) => x.id === messageId) as { chat_id?: string } | undefined
     return m?.chat_id ?? activeChatId
   }, [messageId, messages, activeChatId])
+  const sourceMessage = useMemo(
+    () => messageId ? messages.find((message) => message.id === messageId) ?? null : null,
+    [messageId, messages],
+  )
   const rawTargetCharacterId = useMemo(() => {
-    const sourceMessage = messageId
-      ? messages.find((x) => x.id === messageId)
-      : null
     if (typeof sourceMessage?.extra?.character_id === 'string') {
       return sourceMessage.extra.character_id
     }
     return activeGroupCharacterId ?? activeCharacterId ?? null
-  }, [messageId, messages, activeGroupCharacterId, activeCharacterId])
+  }, [sourceMessage, activeGroupCharacterId, activeCharacterId])
 
   const [loading, setLoading] = useState(false)
   const [data, setData] = useState<BreakdownCacheEntry | null>(null)
@@ -83,7 +84,12 @@ export default function PromptItemizerModal() {
   const [copied, setCopied] = useState(false)
   const [rawLoading, setRawLoading] = useState(false)
   const [rawError, setRawError] = useState<string | null>(null)
-  const [rawData, setRawData] = useState<DryRunResponse | null>(null)
+  const [rawInput, setRawInput] = useState<RawPromptInput | null>(null)
+  useEffect(() => {
+    setRawInput(null)
+    setRawError(null)
+    setRawView('off')
+  }, [messageId])
   const [findOpen, setFindOpen] = useState(false)
   const [findQuery, setFindQuery] = useState('')
   const [matchIndex, setMatchIndex] = useState(0)
@@ -115,6 +121,8 @@ export default function PromptItemizerModal() {
           usage: res.usage,
           presetName: res.presetName,
           tokenizer_name: res.tokenizer_name,
+          assemblySurface: res.assemblySurface,
+          loomPromptInspection: res.loomPromptInspection,
         }
         cacheBreakdown(messageId, entry)
         setData(entry)
@@ -131,17 +139,40 @@ export default function PromptItemizerModal() {
     })
   }
 
-  const ensureRawData = useCallback(async (): Promise<DryRunResponse | null> => {
-    if (rawData) return rawData
+  const ensureRawInput = useCallback(async (): Promise<RawPromptInput | null> => {
+    if (rawInput) return rawInput
     if (!chatId || !messageId) {
       setRawError(t('missingChat'))
       return null
+    }
+    if (data?.messages) {
+      const generationType = typeof sourceMessage?.extra?.generation_type === 'string'
+        ? sourceMessage.extra.generation_type
+        : data.assemblySurface === 'WORK'
+          ? 'stored_work_target'
+          : 'normal'
+      const stored: RawPromptInput = {
+        messages: data.messages,
+        parameters: data.parameters,
+        model: data.model,
+        provider: data.provider,
+        assemblySurface: data.assemblySurface,
+        source: 'stored_breakdown',
+        target: {
+          generationType,
+          messageId,
+          swipeId: sourceMessage?.swipe_id ?? null,
+        },
+        loomPromptInspection: data.loomPromptInspection,
+      }
+      setRawInput(stored)
+      return stored
     }
     setRawLoading(true)
     setRawError(null)
     try {
       const presetId = getActivePresetForGeneration() || undefined
-      const res = await generateApi.dryRun({
+      const response = await generateApi.dryRun({
         chat_id: chatId,
         connection_id: activeProfileId || undefined,
         persona_id: activePersonaId || undefined,
@@ -150,39 +181,47 @@ export default function PromptItemizerModal() {
         exclude_message_id: messageId,
         target_character_id: rawTargetCharacterId || undefined,
       })
-      setRawData(res)
-      return res
-    } catch (err: any) {
-      setRawError(err?.message || t('rawFailed'))
+      const fallback = {
+        ...dryRunToRawPromptInput(response),
+        target: {
+          generationType: 'normal',
+          messageId,
+          swipeId: sourceMessage?.swipe_id ?? null,
+        },
+      } satisfies RawPromptInput
+      setRawInput(fallback)
+      return fallback
+    } catch (err: unknown) {
+      setRawError(err instanceof Error && err.message ? err.message : t('rawFailed'))
       return null
     } finally {
       setRawLoading(false)
     }
-  }, [rawData, chatId, messageId, activeProfileId, activePersonaId, activeCharacterId, getActivePresetForGeneration, rawTargetCharacterId, t])
+  }, [rawInput, chatId, messageId, data, sourceMessage, activeProfileId, activePersonaId, activeCharacterId, getActivePresetForGeneration, rawTargetCharacterId, t])
 
   const handleToggleRaw = useCallback(async () => {
     if (rawView !== 'off') {
       setRawView((v) => (v === 'text' ? 'json' : 'off'))
       return
     }
-    const res = await ensureRawData()
-    if (res) setRawView('text')
-  }, [rawView, ensureRawData])
+    const input = await ensureRawInput()
+    if (input) setRawView('text')
+  }, [rawView, ensureRawInput])
 
   const handleCopy = useCallback(async () => {
-    const res = await ensureRawData()
-    if (!res) return
+    const input = await ensureRawInput()
+    if (!input) return
     const view: RawPromptView = rawView === 'json' ? 'json' : 'text'
-    const text = formatRawPrompt(dryRunToRawPromptInput(res), view)
+    const text = formatRawPrompt(input, view)
     copyTextToClipboard(text).catch(console.error)
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
-  }, [ensureRawData, rawView])
+  }, [ensureRawInput, rawView])
 
   const rawText = useMemo(() => {
-    if (rawView === 'off' || !rawData) return ''
-    return formatRawPrompt(dryRunToRawPromptInput(rawData), rawView)
-  }, [rawView, rawData])
+    if (rawView === 'off' || !rawInput) return ''
+    return formatRawPrompt(rawInput, rawView)
+  }, [rawView, rawInput])
 
   const rawButtonLabel = rawView === 'off' ? ts('raw') : rawView === 'text' ? ts('json') : ts('visual')
 
@@ -191,6 +230,16 @@ export default function PromptItemizerModal() {
   }, [rawView])
 
   const groups = useMemo(() => (data ? groupBreakdownEntries(data.entries) : []), [data])
+  const responseOmission = data?.loomPromptInspection?.responseOmission
+  const omittedSourceBlockIds = responseOmission
+    ? [...new Set([
+        ...responseOmission.source.map((source) => source.blockId),
+        ...responseOmission.omittedPhaseInstructions.map((phase) => phase.source.blockId),
+      ])]
+    : []
+  const omittedPhaseIds = responseOmission
+    ? [...new Set(responseOmission.omittedPhaseInstructions.map((phase) => phase.phaseId))]
+    : []
   const groupLabel = useCallback((id: string, fallback: string) => translateBreakdownGroupLabel(id, t), [t])
   const sidecarGroup = groups.find((g) => g.id === 'sidecar')
   const chatHistoryGroup = data?.chatHistoryTokens != null && data.chatHistoryTokens > 0
@@ -431,11 +480,11 @@ export default function PromptItemizerModal() {
     const messageCount = selectedEntry.entry.messageCount
     if (firstMessageIndex == null || messageCount == null || messageCount <= 0) return null
 
-    const sourceMessages = data?.messages ?? rawData?.messages
+    const sourceMessages = data?.messages ?? rawInput?.messages
     if (!sourceMessages) return null
 
     return sourceMessages.slice(firstMessageIndex, firstMessageIndex + messageCount)
-  }, [selectedEntry, data?.messages, rawData?.messages])
+  }, [selectedEntry, data?.messages, rawInput?.messages])
 
   const selectedChatHistoryUsesReassembledMessages = Boolean(
     selectedEntry?.entry.type === 'chat_history' && !data?.messages && selectedChatHistoryMessages,
@@ -453,8 +502,8 @@ export default function PromptItemizerModal() {
     ) {
       return
     }
-    void ensureRawData()
-  }, [data?.messages, ensureRawData, rawError, rawLoading, rawView, selectedChatHistoryMessages, selectedEntry])
+    void ensureRawInput()
+  }, [data?.messages, ensureRawInput, rawError, rawLoading, rawView, selectedChatHistoryMessages, selectedEntry])
 
   return (
     <ModalShell
@@ -538,6 +587,44 @@ export default function PromptItemizerModal() {
 
             {!loading && data && rawView === 'off' && (
               <>
+                {responseOmission && (
+                  <section
+                    className={styles.responseOmission}
+                    role="note"
+                    aria-label={t('responseOmissionTitle')}
+                  >
+                    <strong>{t('responseOmissionTitle')}</strong>
+                    <span className={styles.responseOmissionSummary}>
+                      {t('responseOmissionSummary', {
+                        entryCount: responseOmission.omittedEntryIds.length,
+                        phaseCount: responseOmission.omittedPhaseInstructions.length,
+                      })}
+                    </span>
+                    <details className={styles.responseOmissionDetails}>
+                      <summary>{t('responseOmissionDetails')}</summary>
+                      <dl>
+                        <div>
+                          <dt>{t('responseOmissionCheckpoint')}</dt>
+                          <dd>{data.loomPromptInspection?.checkpoint}</dd>
+                        </div>
+                        <div>
+                          <dt>{t('responseOmissionEntries')}</dt>
+                          <dd>{responseOmission.omittedEntryIds.join(', ')}</dd>
+                        </div>
+                        <div>
+                          <dt>{t('responseOmissionSources')}</dt>
+                          <dd>{omittedSourceBlockIds.join(', ')}</dd>
+                        </div>
+                        {omittedPhaseIds.length > 0 && (
+                          <div>
+                            <dt>{t('responseOmissionPhases')}</dt>
+                            <dd>{omittedPhaseIds.join(', ')}</dd>
+                          </div>
+                        )}
+                      </dl>
+                    </details>
+                  </section>
+                )}
                 <StackedBar groups={summaryGroups} total={data.totalTokens} groupLabel={groupLabel} />
                 {data.chatHistoryTokens != null && data.chatHistoryTokens > 0 && (
                   <div className={styles.cacheSummary}>
@@ -669,7 +756,7 @@ export default function PromptItemizerModal() {
                 </div>
                 {rawLoading && <div className={styles.loading}>{t('reassembling')}</div>}
                 {!rawLoading && rawError && <div className={styles.empty}>{rawError}</div>}
-                {!rawLoading && !rawError && rawData && (
+                {!rawLoading && !rawError && rawInput && (
                   <pre className={styles.rawView}>
                     {findOpen ? highlightRawFindMatches(rawText) : rawText}
                   </pre>

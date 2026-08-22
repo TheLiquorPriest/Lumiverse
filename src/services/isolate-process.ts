@@ -61,18 +61,16 @@ async function writeStdin(
   stdin: NonNullable<IsolateProcessLike["stdin"]>,
   frame: Uint8Array,
 ): Promise<void> {
-  let offset = 0;
-  while (offset < frame.byteLength) {
-    const remaining = frame.subarray(offset);
-    const written = await stdin.write(remaining);
-    if (
-      !Number.isSafeInteger(written)
-      || written <= 0
-      || written > remaining.byteLength
-    ) {
-      throw new Error(`Isolate subprocess stdin wrote an invalid byte count: ${String(written)}`);
-    }
-    offset += written;
+  // Bun's FileSink owns the entire view passed to write(), even when the
+  // return value reports only the bytes flushed immediately. Retrying a
+  // suffix duplicates the queued frame and corrupts the next length prefix.
+  const flushedBytes = await stdin.write(frame);
+  if (
+    !Number.isSafeInteger(flushedBytes)
+    || flushedBytes < 0
+    || flushedBytes > frame.byteLength
+  ) {
+    throw new Error(`Isolate subprocess stdin reported an invalid flushed byte count: ${String(flushedBytes)}`);
   }
   if (stdin.flush) await stdin.flush();
 }

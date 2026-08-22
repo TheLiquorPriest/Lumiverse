@@ -10,6 +10,7 @@ import {
   ArtifactBlobStore,
   artifactDigest,
   getArtifactReconcileStatus,
+  releaseArtifactBlobReference,
   withArtifactUserDeletionFence,
   publishArtifactCommit,
   type ArtifactBlobHandle,
@@ -62,6 +63,28 @@ async function insertWorkspaceReference(input: { digest: string; byteCount: numb
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'chat_lifetime', ?)
   `).run(artifactId, WORKSPACE_ID, TURN_ID, USER_ID, CHAT_ID, input.digest, input.mimeType, input.byteCount, JSON.stringify(PROVENANCE), publicationState, NOW_SECONDS + 600);
   return artifactId;
+}
+function insertPersistentWorkspace(id: string): void {
+  db.query("INSERT INTO persistent_workspaces (workspace_id, user_id, chat_id) VALUES (?, ?, ?)").run(id, USER_ID, CHAT_ID);
+}
+
+function insertPersistentArtifactReference(digest: string, byteCount: number, mimeType: string, workspaceId: string, artifactId: string): void {
+  db.query(`
+    INSERT INTO persistent_workspace_artifacts
+      (artifact_id, workspace_id, user_id, chat_id, blob_digest, mime_type, byte_count, provenance_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, '{}')
+  `).run(artifactId, workspaceId, USER_ID, CHAT_ID, digest, mimeType, byteCount);
+}
+
+function insertPersistentArtifactPublication(digest: string, byteCount: number, workspaceId: string, publicationId: string): void {
+  const copy = JSON.stringify({ category: "artifact", id: "persistent-source", blobDigest: digest, mimeType: "application/octet-stream", byteCount, provenance: "{}" });
+  db.query(`
+    INSERT INTO persistent_workspace_publications
+      (publication_id, workspace_id, user_id, chat_id, category, source_id, source_revision,
+       source_provenance_json, source_created_at, source_updated_at, copy_json, copy_digest,
+       byte_count, published_by)
+    VALUES (?, ?, ?, ?, 'artifact', 'persistent-source', 1, '{}', ?, ?, ?, ?, ?, 'test')
+  `).run(publicationId, workspaceId, USER_ID, CHAT_ID, NOW_SECONDS, NOW_SECONDS, copy, artifactDigest(new TextEncoder().encode(copy)), byteCount);
 }
 
 function writeInput(bytes: Uint8Array, overrides: Partial<ArtifactBlobWriteInput> = {}): ArtifactBlobWriteInput {
@@ -332,6 +355,32 @@ describe("agent artifact blob store", () => {
     expect(db.query("SELECT published_reference_count FROM agent_artifact_blobs WHERE user_id = ? AND digest = ?").get(USER_ID, handle.digest)).toEqual({ published_reference_count: 1 });
     expect(db.query("SELECT receipt_id FROM agent_published_workspace_artifacts WHERE user_id = ? AND blob_digest = ?").get(USER_ID, handle.digest)).toEqual({ receipt_id: "receipt-dedup-second" });
     expect(db.query("SELECT COUNT(*) AS count FROM agent_published_workspace_artifacts WHERE user_id = ? AND blob_digest = ?").get(USER_ID, handle.digest)).toEqual({ count: 1 });
+  });
+
+  test("keeps persistent artifact publication bytes live through source deletion and releases the final copy for cleanup", async () => {
+    const bytes = new TextEncoder().encode("persistent publication bytes");
+    const handle = await store.stageArtifact(writeInput(bytes, { retention: "chat_lifetime", expiresAt: 1 }));
+    const persistentWorkspaceId = "persistent-artifact-liveness";
+    insertPersistentWorkspace(persistentWorkspaceId);
+    insertPersistentArtifactReference(handle.digest, handle.byteCount, handle.mimeType, persistentWorkspaceId, "persistent-source-artifact");
+    insertPersistentArtifactPublication(handle.digest, handle.byteCount, persistentWorkspaceId, "persistent-copy-publication");
+
+    const protectedCleanup = await store.cleanup({ now: 2 });
+    expect(protectedCleanup.skippedReferenced).toBe(1);
+    expect(await Bun.file(handle.storagePath).exists()).toBe(true);
+
+    db.query("DELETE FROM persistent_workspace_artifacts WHERE artifact_id = ?").run("persistent-source-artifact");
+    const sourceDeleted = await store.reconcile();
+    expect(sourceDeleted.retained).toBeGreaterThan(0);
+    expect(new Uint8Array(await Bun.file(handle.storagePath).arrayBuffer())).toEqual(bytes);
+
+    db.query("DELETE FROM persistent_workspace_publications WHERE publication_id = ?").run("persistent-copy-publication");
+    releaseArtifactBlobReference(db, handle.digest, USER_ID);
+    const releasedReconcile = await store.reconcile();
+    expect(releasedReconcile.removed).toBe(1);
+    expect(await Bun.file(handle.storagePath).exists()).toBe(false);
+    const releasedCleanup = await store.cleanup({ now: 2 });
+    expect(releasedCleanup.removed).toBe(0);
   });
 
   test("rejects publication when the journaled final bytes are missing", async () => {

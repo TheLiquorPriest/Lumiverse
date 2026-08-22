@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
   HOST_PREPARATION_LIMITS_V1,
   type RenderPreparationInputV1,
@@ -51,6 +52,7 @@ function makeJob(input: RenderPreparationInputV1): ActiveIsolateJob<unknown, unk
     operation: "prepare_agent_render",
     payload: input,
     requestId: "job-request",
+    deadlineAt: Date.now() + 60_000,
     resolve: () => undefined,
     reject: () => undefined,
     settled: false,
@@ -139,6 +141,31 @@ describe("agentic preprocessing worker render response validation", () => {
     await expectMalformed(() => parseAgenticPreprocessingResponseV1(makeResponse(input, "forged-wire-id", "😀"), job));
   });
 
+  test("accepts an append-swipe target without an existing revision", async () => {
+    const input: RenderPreparationInputV1 = {
+      ...makeInput(HOST_PREPARATION_LIMITS_V1.maxOutputBytes),
+      target: { kind: "swipe", messageId: "msg-1", swipeId: 1 },
+      swipes: [{
+        swipeId: "1",
+        index: 1,
+        revision: 1,
+        slot: "append",
+        content: { kind: "text", text: "" },
+      }],
+    };
+    const job = makeJob(input);
+    const response = makeResponse(input, job.requestId, "accepted");
+    const metadata = (response.result as Record<string, unknown>).chatMetadataDeltas as Array<Record<string, unknown>>;
+    metadata[0] = {
+      kind: "chat_metadata",
+      key: "message:msg-1:swipe:1",
+      operation: "set",
+      value: "accepted",
+    };
+
+    expect(await parseAgenticPreprocessingResponseV1(response, job)).toEqual(response.result);
+  });
+
   test("revalidates a 132KB regenerate request after the worker returns", async () => {
     const sourceMessages = Array.from({ length: 129 }, (_value, index) => ({
       sourceMessageId: `msg-${index}`,
@@ -183,6 +210,43 @@ describe("agentic preprocessing worker render response validation", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 });
+
+test("prepares the captured render shape in a terminable smol process", async () => {
+  const fixture = fileURLToPath(new URL(
+    "./test-fixtures/prepare-agent-render-captured-shape.fixture.ts",
+    import.meta.url,
+  ));
+  const child = Bun.spawn([process.execPath, "--smol", fixture], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  // This real deadline is the containment contract under test: fake timers
+  // cannot terminate a separate OS process whose runtime event loop is wedged.
+  const { promise: deadline, resolve: resolveDeadline } = Promise.withResolvers<"deadline">();
+  const deadlineTimer = setTimeout(() => resolveDeadline("deadline"), 5_000);
+  const outcome = await Promise.race([
+    child.exited.then(() => "exit" as const),
+    deadline,
+  ]);
+  clearTimeout(deadlineTimer);
+  if (outcome === "deadline") child.kill("SIGKILL");
+  const [stdout, stderr] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+
+  expect(outcome).toBe("exit");
+  expect(child.exitCode).toBe(0);
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout.trim())).toEqual({
+    ok: true,
+    frameBytes: 74_499,
+    revisionBytes: 61_515,
+    regexScripts: 0,
+    renderedBytes: 1_009,
+  });
+}, 10_000);
 
 function pairedPlan(requestId: string): CompilerAssemblyPlanV1 {
   const messages = [

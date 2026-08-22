@@ -21,11 +21,60 @@ import {
   saveAgentRuntimeSharedDraft,
   writePresetAgentConfigWithDb,
 } from "./agent-config-portability.service";
-import { createDisabledAgentConfigV2 } from "../types/agents";
+import { createDisabledAgentConfigV2, type AgentConfigV2, type AgentLoomPolicyV1, type AgentRuntimePolicyV1 } from "../types/agents";
+import type { LoomPolicyCheckpointV1, LoomPolicyDestinationV1, LoomPolicyEntryV1 } from "../types/agent-cognition";
 import type { WorkspaceOperationKindV1 } from "../types/turn-workspace";
 import { PresetRevisionConflictError, type PromptBlock } from "../types/preset";
 import { addPromptBlockToStash, removePromptBlockFromStash } from "./prompt-stash.service";
 import * as settingsSvc from "./settings.service";
+function emptyLoomPolicy(): AgentLoomPolicyV1 {
+  return {
+    version: 1,
+    workPolicy: [],
+    workspaceUsage: [],
+    completionCriteria: [],
+    renderPolicy: [],
+  };
+}
+
+function canonicalRuntimePolicy(
+  defaultMode: AgentRuntimePolicyV1["defaultMode"] = "response",
+  loomPolicy: AgentLoomPolicyV1 = emptyLoomPolicy(),
+): AgentRuntimePolicyV1 {
+  return {
+    version: 1,
+    authority: "loom",
+    scope: "preset",
+    defaultMode,
+    loomPolicy,
+    phases: [],
+  };
+}
+
+function loomEntry(
+  id: string,
+  blockId: string,
+  destination: LoomPolicyDestinationV1,
+  checkpoint: LoomPolicyCheckpointV1,
+  promptOrder = 0,
+): LoomPolicyEntryV1 {
+  return {
+    version: 1,
+    id,
+    source: {
+      kind: "loom_block",
+      blockId,
+      presetRevision: 0,
+      blockRevision: 1,
+      promptOrder,
+    },
+    destination,
+    checkpoint,
+    required: false,
+    visibility: "work_only",
+    delivery: { delivery: "direct" },
+  };
+}
 
 function initPresetsTestDb(): void {
   closeDatabase();
@@ -388,7 +437,6 @@ describe("presets.service — active preset recovery", () => {
       expect(created.agent_config_revision).toBe(1);
       expect(created.agent_config_review?.state).toBe("ready");
       expect(created.metadata.agentConfig).toBeUndefined();
-
       const updated = updatePreset("u1", created.id, {
         agent_config: agentConfig,
         expected_cache_revision: created.cache_revision,
@@ -437,24 +485,20 @@ describe("presets.service — active preset recovery", () => {
         dependencies: [],
         label: "Verify the rules",
       };
-      const cognitionReference = {
-        blockId: "cognition-block",
-        expectedPresetRevision: 0,
-        expectedBlockRevision: 1,
-      };
-      const cognitionConfig = {
+      const cognitionConfig: AgentConfigV2 = {
         ...agentConfig,
         profiles: [{
           ...agentConfig.profiles[0],
           connectionRef: { kind: "slot" as const, slotId: "writer" },
         }],
         connectionSlots: [{ id: "writer", label: "Writer", requiredCapabilities: ["generation" as const] }],
-        cognitionPolicy: {
-          workPolicy: [cognitionReference],
-          workspaceUsage: [cognitionReference],
-          completionCriteria: [cognitionReference],
-          renderPolicy: [cognitionReference],
-        },
+        runtimePolicy: canonicalRuntimePolicy("response", {
+          version: 1,
+          workPolicy: [loomEntry("cognition-work", "cognition-block", "root_work", "WORK")],
+          workspaceUsage: [loomEntry("cognition-workspace", "cognition-block", "root_work", "WORK")],
+          completionCriteria: [loomEntry("cognition-completion", "cognition-block", "completion_handoff", "PREPARE_COMMIT")],
+          renderPolicy: [loomEntry("cognition-render", "cognition-block", "render", "RENDER")],
+        }),
         contextPolicy: { packIds: ["direct-pack"], ruleIds: ["rule_one"] },
         taskPolicy: { templateIds: ["task_one"] },
       };
@@ -510,22 +554,29 @@ describe("presets.service — active preset recovery", () => {
         "SELECT cache_revision FROM presets WHERE user_id = ? AND id = ?",
       ).get("u1", duplicate.preset.id) as { cache_revision: number };
       const targetPresetRevision = targetPresetRow.cache_revision;
+      const sourceLoomPolicy = sourceConfig.runtimePolicy?.loomPolicy;
+      const targetLoomPolicy = targetConfig.runtimePolicy?.loomPolicy;
+      if (!sourceLoomPolicy || !targetLoomPolicy) throw new Error("expected canonical Loom policy");
       const targetReferences = [
-        ...(targetConfig.cognitionPolicy?.workPolicy ?? []),
-        ...(targetConfig.cognitionPolicy?.workspaceUsage ?? []),
-        ...(targetConfig.cognitionPolicy?.completionCriteria ?? []),
-        ...(targetConfig.cognitionPolicy?.renderPolicy ?? []),
+        ...targetLoomPolicy.workPolicy,
+        ...targetLoomPolicy.workspaceUsage,
+        ...targetLoomPolicy.completionCriteria,
+        ...targetLoomPolicy.renderPolicy,
       ];
       expect(targetReferences).toHaveLength(4);
-      expect(targetReferences.every((reference: { expectedPresetRevision: number }) => reference.expectedPresetRevision === targetPresetRevision)).toBe(true);
-      expect(targetReferences.every((reference: { expectedBlockRevision: number }) => reference.expectedBlockRevision === 1)).toBe(true);
-      expect(sourceConfig.cognitionPolicy.workPolicy[0].expectedPresetRevision).not.toBe(targetPresetRevision);
-      expect(targetConfig.cognitionPolicy).toEqual({
-        ...sourceConfig.cognitionPolicy,
-        workPolicy: [{ ...sourceConfig.cognitionPolicy.workPolicy[0], expectedPresetRevision: targetPresetRevision }],
-        workspaceUsage: [{ ...sourceConfig.cognitionPolicy.workspaceUsage[0], expectedPresetRevision: targetPresetRevision }],
-        completionCriteria: [{ ...sourceConfig.cognitionPolicy.completionCriteria[0], expectedPresetRevision: targetPresetRevision }],
-        renderPolicy: [{ ...sourceConfig.cognitionPolicy.renderPolicy[0], expectedPresetRevision: targetPresetRevision }],
+      expect(targetReferences.every((entry) => entry.source.presetRevision === targetPresetRevision)).toBe(true);
+      expect(targetReferences.every((entry) => entry.source.blockRevision === 1)).toBe(true);
+      expect(sourceLoomPolicy.workPolicy[0]?.source.presetRevision).not.toBe(targetPresetRevision);
+      const rebound = (entry: LoomPolicyEntryV1): LoomPolicyEntryV1 => ({
+        ...entry,
+        source: { ...entry.source, presetRevision: targetPresetRevision },
+      });
+      expect(targetLoomPolicy).toEqual({
+        ...sourceLoomPolicy,
+        workPolicy: sourceLoomPolicy.workPolicy.map(rebound),
+        workspaceUsage: sourceLoomPolicy.workspaceUsage.map(rebound),
+        completionCriteria: sourceLoomPolicy.completionCriteria.map(rebound),
+        renderPolicy: sourceLoomPolicy.renderPolicy.map(rebound),
       });
       expect(duplicate.agent_config.contextPolicy).toEqual({ packIds: ["direct-pack"], ruleIds: ["rule_one"] });
       expect(duplicate.agent_config.taskPolicy).toEqual({ templateIds: ["task_one"] });
@@ -651,13 +702,13 @@ describe("presets.service — active preset recovery", () => {
       expect(preset?.agent_config_review).toBeUndefined();
       expect(preset?.metadata.agentConfig).toBeUndefined();
     });
-    test("keeps malformed imported cognition in repair_required state", () => {
-      const portable = JSON.parse(encodePortableAgentConfig(agentConfig)) as Record<string, unknown>;
-      portable.cognitionPolicy = null;
+    test("normalizes malformed legacy cognition ingress into repair_required state", () => {
+      const legacyIngress = JSON.parse(encodePortableAgentConfig(agentConfig)) as Record<string, unknown>;
+      legacyIngress.cognitionPolicy = null;
       const imported = importPortablePreset("u1", {
         name: "Malformed cognition",
         provider: "loom",
-        agent_config: portable,
+        agent_config: legacyIngress,
       });
 
       expect(imported.agent_config_review).toMatchObject({
@@ -708,24 +759,22 @@ describe("presets.service — active preset recovery", () => {
       const before = getAgentRuntimeSharedDraft("u1", created.id);
       expect(before).not.toBeNull();
 
-      const reference = (blockId: string) => ({
-        blockId,
-        expectedPresetRevision: 0,
-        expectedBlockRevision: 1,
-      });
       const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
         config: {
           ...agentConfig,
-          phasePolicy: {
-            work: [reference("work-block")],
-            render: [reference("render-block")],
-          },
-          cognitionPolicy: {
-            workPolicy: [reference("cognition-work")],
-            workspaceUsage: [reference("workspace")],
-            completionCriteria: [reference("completion")],
-            renderPolicy: [reference("cognition-render")],
-          },
+          runtimePolicy: canonicalRuntimePolicy("response", {
+            version: 1,
+            workPolicy: [
+              loomEntry("work-policy", "work-block", "root_work", "WORK"),
+              loomEntry("cognition-work", "cognition-work", "root_work", "WORK"),
+            ],
+            workspaceUsage: [loomEntry("workspace-policy", "workspace", "root_work", "WORK")],
+            completionCriteria: [loomEntry("completion-policy", "completion", "completion_handoff", "PREPARE_COMMIT")],
+            renderPolicy: [
+              loomEntry("cognition-render", "cognition-render", "render", "RENDER"),
+              loomEntry("render-policy", "render-block", "render", "RENDER"),
+            ],
+          }),
         },
         slotBindings: [],
         contextPackSelections: [],
@@ -738,17 +787,17 @@ describe("presets.service — active preset recovery", () => {
       });
 
       expect(saved.editor.presetRevision).toBe(before!.presetRevision + 1);
+      const loomPolicy = saved.editor.config.runtimePolicy?.loomPolicy;
+      if (!loomPolicy) throw new Error("expected canonical Loom policy");
       const refs = [
-        ...(saved.editor.config.phasePolicy?.work ?? []),
-        ...(saved.editor.config.phasePolicy?.render ?? []),
-        ...(saved.editor.config.cognitionPolicy?.workPolicy ?? []),
-        ...(saved.editor.config.cognitionPolicy?.workspaceUsage ?? []),
-        ...(saved.editor.config.cognitionPolicy?.completionCriteria ?? []),
-        ...(saved.editor.config.cognitionPolicy?.renderPolicy ?? []),
+        ...loomPolicy.workPolicy,
+        ...loomPolicy.workspaceUsage,
+        ...loomPolicy.completionCriteria,
+        ...loomPolicy.renderPolicy,
       ];
       expect(refs).toHaveLength(6);
-      expect(refs.every((item) => item.expectedPresetRevision === saved.editor.presetRevision)).toBe(true);
-      expect(refs.every((item) => item.expectedBlockRevision === 1)).toBe(true);
+      expect(refs.every((item) => item.source.presetRevision === saved.editor.presetRevision)).toBe(true);
+      expect(refs.every((item) => item.source.blockRevision === 1)).toBe(true);
     });
 
     test("keeps direct and rule-target context pack authority separate", () => {
@@ -870,6 +919,129 @@ describe("presets.service — active preset recovery", () => {
       ]);
       expect(acknowledged.editor.config.agentsEnabled).toBe(true);
     });
+    test("keeps sticky import review until required items are acknowledged", () => {
+      for (const reasonCode of ["cognition_foreign_authority_blocked", "foreign_import"] as const) {
+        const localConfig: AgentConfigV2 = {
+          ...agentConfig,
+          allowedModes: ["response", "agentic"],
+          defaultMode: "agentic",
+          runtimePolicy: canonicalRuntimePolicy("agentic"),
+          contextPolicy: { packIds: ["honesty-pack"], ruleIds: ["context_1"] },
+        };
+        const created = createPreset("u1", {
+          name: `Imported runtime ${reasonCode}`,
+          provider: "loom",
+          agent_config: localConfig,
+        });
+        writePresetAgentConfigWithDb(getDb(), "u1", created.id, {
+          config: localConfig,
+          review: {
+            state: "review_required",
+            reasonCode,
+            unresolvedSlotIds: [],
+            staleSlotIds: [],
+            acknowledged: false,
+          },
+        });
+        const before = getAgentRuntimeSharedDraft("u1", created.id)!;
+        expect(before.review.state).toBe("review_required");
+        const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
+          config: localConfig,
+          slotBindings: [],
+          contextPackSelections: [{
+            packId: "honesty-pack",
+            revisionId: "honesty-pack@1",
+            revision: 1,
+            digest: "a".repeat(64),
+          }],
+          contextRules: [{
+            id: "context_1",
+            packId: "honesty-pack",
+            revisionId: "honesty-pack@1",
+            required: false,
+            dependencies: [],
+          }],
+          taskTemplates: [],
+          reviewAcknowledgements: [],
+          promptOrder: [],
+          expectedPresetRevision: before.presetRevision,
+          expectedConfigRevision: before.configRevision,
+        });
+        expect(saved.editor.review.state).toBe("review_required");
+        expect(saved.editor.review.reasonCode).toBe(reasonCode);
+        expect(saved.editor.review.items).toEqual([
+          expect.objectContaining({ id: `review:${reasonCode}`, acknowledged: false }),
+        ]);
+        expect(getDb().query(
+          "SELECT state, review_code FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+        ).get("u1", created.id)).toEqual({
+          state: "review_required",
+          review_code: reasonCode,
+        });
+      }
+    });
+
+    test("clears import review after an acknowledged local authorized pack save", () => {
+      const localConfig: AgentConfigV2 = {
+        ...agentConfig,
+        allowedModes: ["response", "agentic"],
+        defaultMode: "agentic",
+        runtimePolicy: canonicalRuntimePolicy("agentic"),
+        contextPolicy: { packIds: ["honesty-pack"], ruleIds: ["context_1"] },
+      };
+      const created = createPreset("u1", {
+        name: "Imported runtime",
+        provider: "loom",
+        agent_config: localConfig,
+      });
+      writePresetAgentConfigWithDb(getDb(), "u1", created.id, {
+        config: localConfig,
+        review: {
+          state: "review_required",
+          reasonCode: "cognition_foreign_authority_blocked",
+          unresolvedSlotIds: [],
+          staleSlotIds: [],
+          acknowledged: false,
+        },
+      });
+      const before = getAgentRuntimeSharedDraft("u1", created.id)!;
+      expect(before.review.state).toBe("review_required");
+      const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
+        config: localConfig,
+        slotBindings: [],
+        contextPackSelections: [{
+          packId: "honesty-pack",
+          revisionId: "honesty-pack@1",
+          revision: 1,
+          digest: "a".repeat(64),
+        }],
+        contextRules: [{
+          id: "context_1",
+          packId: "honesty-pack",
+          revisionId: "honesty-pack@1",
+          required: false,
+          dependencies: [],
+        }],
+        taskTemplates: [],
+        reviewAcknowledgements: ["review:cognition_foreign_authority_blocked"],
+        promptOrder: [],
+        expectedPresetRevision: before.presetRevision,
+        expectedConfigRevision: before.configRevision,
+      });
+      expect(saved.editor.review.state).toBe("ready");
+      expect(saved.editor.config.contextPolicy).toEqual({
+        packIds: ["honesty-pack"],
+        ruleIds: ["context_1"],
+      });
+      expect(getDb().query(
+        "SELECT state, review_code FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+      ).get("u1", created.id)).toEqual({
+        state: "ready",
+        review_code: null,
+      });
+    });
+
+
     test("marks incompatible concrete slot bindings for review instead of ready", () => {
       getDb().run(
         "INSERT INTO connection_profiles (id, user_id, name, provider, model, metadata) VALUES (?, ?, ?, ?, ?, ?)",

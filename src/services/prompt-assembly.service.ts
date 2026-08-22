@@ -4,12 +4,22 @@ import {
   type AssemblyContext,
   type AssemblyResult,
   type AssemblyBreakdownEntry,
+  type AssemblySurfaceV1,
   type GenerationType,
   type ActivatedWorldInfoEntry,
   type MemoryStats,
   type DatabankStats,
   type ContextClipStats,
 } from "../llm/types";
+import {
+  inspectLoomPromptPolicies,
+} from "./agent-cognition.service";
+import type {
+  LoomPolicyBucketsV1,
+  LoomPromptInspectionBlockV1,
+  LoomPromptInspectionContextPackV1,
+  LoomPromptInspectionV1,
+} from "../types/agent-cognition";
 import {
   resolveCounter,
   APPROXIMATE_TOKENIZER_NAME,
@@ -108,6 +118,7 @@ import {
 import { isWorldBookEntryVectorSearchReady } from "./world-book-vector-state";
 import * as imagesSvc from "./images.service";
 import * as presetProfilesSvc from "./preset-profiles.service";
+import { getPresetAgentCognitionSourceV1 } from "./agent-config-portability.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
 import { readCachedChatMemory } from "./chat-memory-cache.service";
 import { deduplicateWorldInfoEntries } from "./world-info-dedup.service";
@@ -145,13 +156,8 @@ import {
   shouldInjectEmptySendNudge,
   shouldInjectGroupNudge,
 } from "./prompt-behavior";
-import { createAgentToolSnapshot } from "./agent-tools.service";
-import type {
-  AgentLoreSource,
-  AgentOwnedLoreReader,
-  AgentSnapshotBook,
-  AgentSnapshotEntry,
-} from "../types/agents";
+import { createAgentOwnedLoreReader, createAgentToolSnapshot } from "./agent-tools.service";
+import type { AgentLoreSource } from "../types/agents";
 import {
   AgentRuntimeFailure,
   type AgentRunOutcome,
@@ -1741,6 +1747,7 @@ export function selectAgentToolChatCorpora(
   const requestedStart = messageLimitActive
     ? Math.max(0, messages.length - (options.messageLimitCount ?? 0))
     : 0;
+
   const promptMessages = messageLimitActive
     ? messages.slice(anchorStart >= 0 ? Math.min(requestedStart, anchorStart) : requestedStart)
     : messages;
@@ -1754,6 +1761,101 @@ export function selectAgentToolChatCorpora(
   return { promptMessages, snapshotMessages };
 }
 
+interface ResponseLoomPolicyAssemblyV1 {
+  readonly excludedBlockIds: ReadonlySet<string>;
+  readonly inspection?: LoomPromptInspectionV1;
+}
+
+
+function responseLoomPolicyAssembly(
+  ctx: AssemblyContext,
+  preset: Preset | null,
+  blocks: readonly PromptBlock[],
+): ResponseLoomPolicyAssemblyV1 {
+  if (ctx.assemblySurface !== "RESPONSE" || !preset?.id) {
+    return { excludedBlockIds: new Set<string>() };
+  }
+
+  const authored = getPresetAgentCognitionSourceV1(ctx.userId, preset.id);
+  if (!authored) {
+    return { excludedBlockIds: new Set<string>() };
+  }
+  const runtimePolicy = authored.config.runtimePolicy;
+  if (!runtimePolicy) {
+    return { excludedBlockIds: new Set<string>() };
+  }
+
+  const phaseInstructions = runtimePolicy.phases.flatMap((phase) =>
+    phase.instructionRefs.map((source) => ({
+      phaseId: phase.id,
+      source,
+    })),
+  );
+  const policies: LoomPolicyBucketsV1 = runtimePolicy.loomPolicy ?? {
+    version: 1,
+    workPolicy: [],
+    workspaceUsage: [],
+    completionCriteria: [],
+    renderPolicy: [],
+  };
+  const allEntries = [
+    ...policies.workPolicy,
+    ...policies.workspaceUsage,
+    ...policies.completionCriteria,
+    ...policies.renderPolicy,
+  ];
+  if (allEntries.length === 0 && phaseInstructions.length === 0) {
+    return { excludedBlockIds: new Set<string>() };
+  }
+
+  const inspectionBlocksBySource = new Map<string, LoomPromptInspectionBlockV1>();
+  for (const entry of allEntries) {
+    const block = blocks.find((candidate) => candidate.id === entry.source.blockId);
+    const source = entry.source;
+    inspectionBlocksBySource.set(
+      `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`,
+      { source, content: block?.content ?? "" },
+    );
+  }
+  const contextPacks: LoomPromptInspectionContextPackV1[] = authored.contextPackSelections.map((selection) => ({
+    contextPackId: selection.packId,
+    revisionId: selection.revisionId,
+    digest: selection.digest,
+    content: "",
+  }));
+  const inspection = inspectLoomPromptPolicies(policies, {
+    checkpoint: "ASSEMBLE",
+    surface: "RESPONSE",
+    blocks: [...inspectionBlocksBySource.values()],
+    contextPacks,
+  });
+  const responseOmission = inspection.responseOmission;
+  if (!responseOmission) {
+    throw new Error("Response Loom omission evidence is unavailable");
+  }
+  const enrichedInspection: LoomPromptInspectionV1 = {
+    ...inspection,
+    responseOmission: {
+      ...responseOmission,
+      omittedPhaseInstructions: phaseInstructions,
+    },
+  };
+  const excludedBlockIds = new Set<string>();
+  const excludedSourceKeys = new Set<string>();
+  for (const source of [
+    ...allEntries.map((entry) => entry.source),
+    ...phaseInstructions.map((instruction) => instruction.source),
+  ]) {
+    const sourceKey = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
+    if (excludedSourceKeys.has(sourceKey)) continue;
+    excludedSourceKeys.add(sourceKey);
+    excludedBlockIds.add(source.blockId);
+  }
+  return {
+    excludedBlockIds,
+    inspection: enrichedInspection,
+  };
+}
 export async function assemblePrompt(
   ctx: AssemblyContext,
 ): Promise<AssemblyResult> {
@@ -1919,12 +2021,18 @@ export async function assemblePrompt(
   const profilePromptVariables = resolvedProfile.binding
     ? resolvedProfile.binding.prompt_variables ?? {}
     : undefined;
-  const effectiveBlocks = resolvePromptBlockPlacements(
+  let effectiveBlocks = resolvePromptBlockPlacements(
     blocks,
     preset,
     profilePromptVariables,
   );
   reorderBlocksByPosition(effectiveBlocks);
+  const responseLoomPolicy = responseLoomPolicyAssembly(ctx, preset, blocks);
+  if (responseLoomPolicy.excludedBlockIds.size > 0) {
+    effectiveBlocks = effectiveBlocks.filter(
+      (block) => !responseLoomPolicy.excludedBlockIds.has(block.id),
+    );
+  }
 
   const agentConfig = preset?.agent_config;
   // Preflight only blocks that the assembly loop will actually traverse. A
@@ -2008,14 +2116,17 @@ export async function assemblePrompt(
   if (!blocks.length && !agentRuntimeOwner) {
     return await legacyAssembly(
       messages,
+      ctx.assemblySurface,
       ctx.generationType,
       character,
       persona,
       chat,
       connection,
       ctx.userId,
+      ctx.userName,
       ctx.userInput,
       ctx.signal,
+      responseLoomPolicy.inspection,
     );
   }
 
@@ -2671,6 +2782,7 @@ export async function assemblePrompt(
     generationType: ctx.generationType,
     commit: ctx.macroCommit,
     connection,
+    userName: ctx.userName,
     rejectedSwipe: ctx.rejectedSwipe,
     userInput: ctx.userInput,
     groupCharacterNames,
@@ -2824,125 +2936,9 @@ export async function assemblePrompt(
   const agentToolBookSources = agentRuntimeOwner
     ? new Map<string, AgentLoreSource>(wiSources.bookSourceMap)
     : undefined;
-  const ownedBookProjection = (book: WorldBook): AgentSnapshotBook => Object.freeze({
-    id: book.id,
-    name: book.name,
-    description: book.description ?? "",
-    folder: book.folder ?? "",
-    source: "owned",
-    active: false,
-  });
-  const ownedEntryProjection = (
-    entry: WorldBookEntry,
-    book: WorldBook | null,
-  ): AgentSnapshotEntry | null => {
-    if (!book) return null;
-    return Object.freeze({
-      id: entry.id,
-      bookId: entry.world_book_id,
-      bookName: book.name,
-      bookSource: "owned" as const,
-      comment: entry.comment,
-      keys: Object.freeze([...entry.key]),
-      secondaryKeys: Object.freeze([...entry.keysecondary]),
-      content: entry.content,
-      position: entry.position,
-      depth: entry.depth,
-      role: entry.role,
-      activated: false,
-    });
-  };
-  const ownedLoreReader: AgentOwnedLoreReader | undefined =
-    agentRuntimeOwner && allOwnedLoreRequested
-      ? {
-          listBooks: ({ limit, offset, folder, query }) => {
-            const page = worldBooksSvc.listOwnedAgentLoreBooks(ctx.userId, {
-              limit,
-              offset,
-              ...(folder !== undefined ? { folder } : {}),
-              ...(query !== undefined ? { query } : {}),
-            });
-            return {
-              data: page.data.map(ownedBookProjection),
-              total: page.total,
-              limit: page.limit,
-              offset: page.offset,
-              truncated: page.offset + page.data.length < page.total,
-            };
-          },
-          resolveBookName: (name) => {
-            const resolution = worldBooksSvc.resolveOwnedAgentLoreBookName(ctx.userId, name);
-            return {
-              candidates: resolution.candidates,
-              total: resolution.total,
-              truncated: resolution.truncated,
-            };
-          },
-          getBook: (bookId) => {
-            const book = worldBooksSvc.getOwnedAgentLoreBook(ctx.userId, bookId);
-            return book ? ownedBookProjection(book) : null;
-          },
-          listEntries: ({ bookId, limit, offset, query }) => {
-            const page = worldBooksSvc.listOwnedAgentLoreEntries(ctx.userId, {
-              bookId,
-              limit,
-              offset,
-              ...(query !== undefined ? { query } : {}),
-            });
-            const book = worldBooksSvc.getOwnedAgentLoreBook(ctx.userId, bookId);
-            const data = page.data
-              .map((entry) => ownedEntryProjection(entry, book))
-              .filter((entry): entry is AgentSnapshotEntry => entry !== null);
-            return {
-              data,
-              total: page.total,
-              limit: page.limit,
-              offset: page.offset,
-              truncated: page.offset + data.length < page.total,
-            };
-          },
-          getEntry: (entryId) => {
-            const entry = worldBooksSvc.getOwnedAgentLoreEntry(ctx.userId, entryId);
-            return entry
-              ? ownedEntryProjection(
-                  entry,
-                  worldBooksSvc.getOwnedAgentLoreBook(ctx.userId, entry.world_book_id),
-                )
-              : null;
-          },
-          searchEntries: ({ query, bookId, limit, offset }) => {
-            const page = worldBooksSvc.searchOwnedAgentLoreEntries(ctx.userId, {
-              query,
-              ...(bookId !== undefined ? { bookId } : {}),
-              limit,
-              offset,
-            });
-            const booksById = new Map<string, WorldBook | null>();
-            const data = page.data
-              .map((entry) => {
-                let book: WorldBook | null;
-                if (booksById.has(entry.world_book_id)) {
-                  book = booksById.get(entry.world_book_id) ?? null;
-                } else {
-                  book = worldBooksSvc.getOwnedAgentLoreBook(
-                    ctx.userId,
-                    entry.world_book_id,
-                  );
-                  booksById.set(entry.world_book_id, book);
-                }
-                return ownedEntryProjection(entry, book);
-              })
-              .filter((entry): entry is AgentSnapshotEntry => entry !== null);
-            return {
-              data,
-              total: page.total,
-              limit: page.limit,
-              offset: page.offset,
-              truncated: page.offset + data.length < page.total,
-            };
-          },
-        }
-      : undefined;
+  const ownedLoreReader = agentRuntimeOwner && allOwnedLoreRequested
+    ? createAgentOwnedLoreReader(ctx.userId)
+    : undefined;
   const agentToolSnapshot = agentRuntimeOwner
     ? createAgentToolSnapshot({
         rootUserId: ctx.userId,
@@ -2984,14 +2980,17 @@ export async function assemblePrompt(
   if (!blocks.length) {
     return await legacyAssembly(
       messages,
+      ctx.assemblySurface,
       ctx.generationType,
       character,
       persona,
       chat,
       connection,
       ctx.userId,
+      ctx.userName,
       ctx.userInput,
       ctx.signal,
+      responseLoomPolicy.inspection,
     );
   }
 
@@ -3013,6 +3012,7 @@ export async function assemblePrompt(
       ctx,
       macroEnv,
       reasoningVal,
+      responseLoomPolicy.inspection,
     );
   }
 
@@ -4734,6 +4734,8 @@ export async function assemblePrompt(
       ._deliberationMacroUsed,
     macroEnv,
     macroEnvSeed,
+    assemblySurface: ctx.assemblySurface,
+    loomPromptInspection: responseLoomPolicy.inspection,
   };
   } finally {
     // Release the deferred cortex warm-cache task now that the hot path is
@@ -8147,6 +8149,7 @@ async function onelinerImpersonation(
     reasoningEffort?: string;
     thinkingDisplay?: string;
   } | null,
+  loomPromptInspection?: LoomPromptInspectionV1,
 ): Promise<AssemblyResult> {
   const result: LlmMessage[] = [];
   const breakdown: AssemblyBreakdownEntry[] = [];
@@ -8311,6 +8314,8 @@ async function onelinerImpersonation(
     assistantReasoningPrefill,
     contextClipStats,
     macroEnv,
+    assemblySurface: ctx.assemblySurface,
+    loomPromptInspection,
   };
 }
 
@@ -8320,14 +8325,17 @@ async function onelinerImpersonation(
  */
 async function legacyAssembly(
   messages: Message[],
+  assemblySurface: AssemblySurfaceV1,
   generationType: GenerationType,
   character?: Character | null,
   persona?: Persona | null,
   chat?: Chat | null,
   connection?: ConnectionProfile | null,
   userId?: string,
+  userName?: string,
   userInput?: string,
   signal?: AbortSignal,
+  loomPromptInspection?: LoomPromptInspectionV1,
 ): Promise<AssemblyResult> {
   const llmMessages: LlmMessage[] = [];
   const breakdown: AssemblyBreakdownEntry[] = [];
@@ -8379,8 +8387,8 @@ async function legacyAssembly(
       messages,
       generationType,
       connection: connection ?? null,
+      userName,
       userInput,
-      groupCharacterNames: groupNames,
       groupNotMutedNames: legacyNotMuted,
       targetCharacterName: isGroup
         ? getEffectiveCharacterName(legacyFocusedChar)
@@ -8646,5 +8654,7 @@ async function legacyAssembly(
     parameters,
     macroEnv: macroEnv ?? undefined,
     macroEnvSeed: macroEnv ? cloneEnv(macroEnv) : undefined,
+    assemblySurface,
+    loomPromptInspection,
   };
 }

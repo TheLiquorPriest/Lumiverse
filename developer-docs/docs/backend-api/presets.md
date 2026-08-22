@@ -71,8 +71,84 @@ The closed authored shape is `AgentConfigV2`:
   contextPolicy?: AgentContextPolicyV1,
   taskPolicy?: AgentTaskPolicyV1,
   workspacePolicy?: { retention: 'turn_terminal' | 'chat_lifetime', sharing: 'root_only' | 'view_only' },
+  runtimePolicy?: AgentRuntimePolicyV1,
 }
 ```
+
+### Canonical Loom authoring and assembly
+
+The executable Loom authoring record is
+`AgentConfigV2.runtimePolicy`, not preset metadata or the legacy
+`cognitionPolicy`. Its current shape is:
+
+```ts
+runtimePolicy: {
+  version: 1,
+  authority: 'loom',
+  scope: 'preset',
+  defaultMode: 'response' | 'agentic',
+  loomPolicy: {
+    version: 1,
+    workPolicy: LoomPolicyEntryV1[],
+    workspaceUsage: LoomPolicyEntryV1[],
+    completionCriteria: LoomPolicyEntryV1[],
+    renderPolicy: LoomPolicyEntryV1[],
+  } | null,
+  phases: readonly AgentCustomPhaseV1[],
+}
+```
+
+Each `LoomPolicyEntryV1` is closed:
+
+```ts
+{
+  version: 1,
+  id: string,
+  source: {
+    kind: 'loom_block',
+    blockId: string,
+    presetRevision: number,
+    blockRevision: number,
+    promptOrder: number,
+  },
+  destination: 'root_work' | 'completion_handoff' | 'render',
+  checkpoint: 'ASSEMBLE' | 'WORK' | 'PREPARE_COMMIT' | 'RENDER',
+  required: boolean,
+  visibility: 'work_only',
+  delivery:
+    | { delivery: 'direct' }
+    | { delivery: 'condition_gated', condition: CognitionPredicateV1 }
+    | {
+        delivery: 'on_demand',
+        request: { contextPackId: string, revisionId: string, digest: string },
+      },
+}
+```
+
+Routing is fixed: `workPolicy` and `workspaceUsage` feed `root_work` at
+`WORK`; `completionCriteria` feeds `completion_handoff` at
+`PREPARE_COMMIT`; and `renderPolicy` feeds `render` at `RENDER`. The host
+freezes each source revision before assembly. The **Phased Instructions**
+editor is the single authoring surface for these fixed Loom policy buckets,
+custom runtime phases, and context delivery. `phasePolicy` remains a legacy
+compatibility field for imported records; it is not a second editor or
+authority. No live `cognitionPolicy`, metadata alias, or extension callback can
+replace the canonical Loom record.
+
+The authenticated assembly surface is explicit (`RESPONSE` or `WORK`) and is
+carried by the frozen snapshot and `AssemblyPlanV1`; it is never inferred from
+the presence of policy entries. Response assembly omits every
+`visibility: 'work_only'` entry. Owner inspection receives typed
+`LoomPromptInspectionV1` items and a `responseOmission` record instead of
+silently presenting WORK material as Response content.
+
+`GET /api/v1/presets/:id/agent-config`, the shared-draft save, and the
+portable runtime envelope preserve `runtimePolicy.loomPolicy` verbatim
+through their revision fences. The normalized authenticated projection is
+the only executable authority.
+
+---
+
 
 `allowedModes` is ordered, unique, always contains `response`, and
 `defaultMode` must be allowed. A profile refers to an authored preset-scoped
@@ -138,6 +214,8 @@ for normalized config:
 | `GET` | `/:id/agent-config/portable` | Returns config-only `PortableAgentConfigV1` with no local bindings or credentials. |
 | `POST` | `/agent-config/portable/import` | Creates a foreign preset/config from a config-only `PortablePresetPayload` in inert review-required state (`201`); it does not carry the Context Library graph. |
 | `POST` | `/:id/duplicate` | Same-account transactional duplicate of the preset, normalized config, authorized bindings, regex companions, and validated authored runtime envelope; Context Library rows are referenced, not cloned. |
+| `POST` | `/:id/agent-runtime/repair-acknowledgement` | Record `{ reasonCode, expectedPresetRevision }` for an authenticated owner. The revision is CAS-protected; the response is a separate `repair/review` acknowledgement and does not select a runtime mode. |
+
 | `GET` | `/agent-runtime-limits` | Returns effective process ceilings; it cannot be used to raise them. |
 
 The shared-draft save requires both preset and config revision preconditions.
@@ -150,13 +228,29 @@ provide `expected_cache_revision`; callers that include top-level
 `PUT /api/v1/presets/:id/agent-config` when changing config, slots, cognition,
 context, tasks, and blocks together.
 
-The durable per-chat mode override is separate from the preset:
-`PUT /api/v1/chats/:id/agent-mode` accepts
-`{ mode: 'response' | 'agentic' | null, expectedRevision: number }`
-(`expected_revision` is an alias). The revision precondition is required on
-every write; use `0` for the first write. A stale revision is rejected rather
-than merged. It is not included in portable config, LumiHub data, or archives.
-One-turn choices and decision tokens are likewise never persisted in a preset.
+The durable per-chat mode override is separate from the preset. `PUT
+ /api/v1/chats/:id/agent-mode` accepts exactly:
+
+```ts
+{ mode: 'response' | 'agentic', expectedRevision: number }
+```
+
+The revision precondition is required on every write; use `0` for the first
+write. A stale revision is rejected rather than merged. The response is
+`{ chatId, mode, revision, state, appliesTo: 'next_turn' }`.
+`DELETE /api/v1/chats/:id/agent-mode` accepts exactly
+`{ expectedRevision: number }` and returns the same response shape with
+`mode: null`. Both changes apply to the next Turn Session, including while
+another generation is active; they do not alter the current run.
+
+The durable override is not included in portable config, LumiHub data, or
+archives. One-turn choices and decision tokens are never persisted in a
+preset. `POST /api/v1/presets/:id/agent-runtime/repair-acknowledgement`
+accepts exactly `{ reasonCode: string, expectedPresetRevision: string |
+number }` and returns `{ presetId, presetRevision, reasonCode,
+acknowledgedAt, revision, scope: 'repair/review', state: 'acknowledged' }`.
+The acknowledgement records owner review for the preset revision; it does
+not grant a missing capability, select a mode, or bypass readiness.
 
 ### Extension boundary
 

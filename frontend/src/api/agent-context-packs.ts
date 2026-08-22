@@ -15,6 +15,7 @@ import type {
   ReplaceContextPackAclInput,
   ReviewContextPackInput,
   UpdateContextPackInput,
+  SelectableContextPackRevision,
 } from '@/types/agent-context-packs'
 import {
   ContextPackValidationError,
@@ -124,6 +125,10 @@ export const agentContextPacksApi = {
       include_review: true,
     })
     return { ...result, data: result.data.map(toPublicPack) }
+  },
+
+  async listSelectable(params?: { limit?: number }) {
+    return get<{ data: SelectableContextPackRevision[] }>(`${ROOT}/selectable`, params)
   },
 
   get(packId: string) {

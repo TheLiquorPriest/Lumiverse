@@ -443,6 +443,34 @@ function revisionEqual(expected: InputRevisionV1, current: RevisionValueV1 | Inp
   if ("kind" in current && (current.kind !== expected.kind || current.id !== expected.id)) return false;
   return expected.revision === current.revision && expected.digest === current.digest;
 }
+function revisionSetMember(set: InputRevisionSetV1, kind: InputRevisionKindV1, id?: string): InputRevisionV1 | undefined {
+  return set.revisions.find((candidate) => candidate.kind === kind && (id === undefined || candidate.id === id))
+    ?? set.revisions.find((candidate) => candidate.kind === kind);
+}
+
+function logExpectedLiveMember(entry: {
+  readonly kind: string;
+  readonly id?: string;
+  readonly expected: unknown;
+  readonly live: unknown;
+  readonly member: unknown;
+  readonly expectedDigest?: string;
+  readonly liveDigest?: string;
+  readonly memberDigest?: string;
+}): void {
+  const payload: Record<string, unknown> = {
+    kind: entry.kind,
+    id: entry.id,
+    expected: entry.expected,
+    live: entry.live,
+    member: entry.member,
+  };
+  if (typeof entry.expectedDigest === "string") payload.expectedDigest = entry.expectedDigest;
+  if (typeof entry.liveDigest === "string") payload.liveDigest = entry.liveDigest;
+  if (typeof entry.memberDigest === "string") payload.memberDigest = entry.memberDigest;
+  console.error("[agentic] expected-vs-live-vs-member", payload);
+}
+
 
 function recheckInputRevisions(input: AgenticCommitInputV1, set: InputRevisionSetV1, db: Database): void {
   if (!input.revisionReader) {
@@ -456,10 +484,22 @@ function recheckInputRevisions(input: AgenticCommitInputV1, set: InputRevisionSe
     } catch {
       current = null;
     }
-    if (!current || !revisionEqual(member, current)) mismatches.push({ kind: member.kind, id: member.id, expected: member.revision, current: current && "revision" in current ? current.revision : null });
+    const live = current && "revision" in current ? current.revision : null;
+    if (!current || !revisionEqual(member, current)) {
+      logExpectedLiveMember({
+        kind: member.kind,
+        id: member.id,
+        expected: member.revision,
+        live,
+        member: member.revision,
+        expectedDigest: typeof member.digest === "string" ? member.digest : undefined,
+        liveDigest: current && "digest" in current && typeof current.digest === "string" ? current.digest : undefined,
+        memberDigest: typeof member.digest === "string" ? member.digest : undefined,
+      });
+      mismatches.push({ kind: member.kind, id: member.id, expected: member.revision, live, member: member.revision });
+    }
   }
   if (mismatches.length > 0) {
-    console.error(`[agentic] stale input revisions: ${JSON.stringify(mismatches)}`);
     throw new AgenticCommitError("stale_input_revision", "one or more input revisions changed", { mismatches });
   }
 }
@@ -684,11 +724,29 @@ function assertExecutionBinding(db: Database, input: AgenticCommitInputV1): void
   }
   const chat = db.query("SELECT generation_revision FROM chats WHERE id = ? AND user_id = ? LIMIT 1").get(input.chatId, input.userId) as { generation_revision?: number } | null;
   if (!chat || Number(chat.generation_revision) !== input.target.chatGenerationRevision) {
+    const member = revisionSetMember(input.inputRevisions, "chat", input.chatId);
+    logExpectedLiveMember({
+      kind: "chat",
+      id: input.chatId,
+      expected: input.target.chatGenerationRevision,
+      live: chat ? Number(chat.generation_revision) : null,
+      member: member?.revision ?? null,
+      memberDigest: typeof member?.digest === "string" ? member.digest : undefined,
+    });
     throw new AgenticCommitError("stale_input_revision", "chat generation revision changed before commit");
   }
   if (input.target.messageId !== null) {
     const message = db.query("SELECT generation_revision FROM messages WHERE id = ? AND chat_id = ? LIMIT 1").get(input.target.messageId, input.chatId) as { generation_revision?: number } | null;
     if (!message || Number(message.generation_revision) !== input.target.messageGenerationRevision) {
+      const member = revisionSetMember(input.inputRevisions, "message", input.target.messageId);
+      logExpectedLiveMember({
+        kind: "message",
+        id: input.target.messageId,
+        expected: input.target.messageGenerationRevision,
+        live: message ? Number(message.generation_revision) : null,
+        member: member?.revision ?? null,
+        memberDigest: typeof member?.digest === "string" ? member.digest : undefined,
+      });
       throw new AgenticCommitError("stale_input_revision", "message generation revision changed before commit");
     }
   }
@@ -1066,16 +1124,30 @@ function assertDeltaExpectedRevision(
   if (typeof expected !== "number" && typeof expected !== "string") {
     throw new AgenticCommitError("invalid_input", "delta expected revision is malformed");
   }
-  const member = input.inputRevisions.revisions.find((candidate) =>
-    candidate.kind === kind && (id === undefined || candidate.id === id),
-  ) ?? input.inputRevisions.revisions.find((candidate) => candidate.kind === kind);
+  const member = revisionSetMember(input.inputRevisions, kind, id);
   if (!member || !input.revisionReader) {
+    logExpectedLiveMember({
+      kind,
+      id,
+      expected,
+      live: null,
+      member: member?.revision ?? null,
+      memberDigest: typeof member?.digest === "string" ? member.digest : undefined,
+    });
     throw new AgenticCommitError("stale_input_revision", "delta revision source is unavailable", { kind, id });
   }
   const sourceKey = `${member.kind}:${member.id}`;
   const cachedExpectedRevision = tracker.deltas.get(sourceKey);
   if (cachedExpectedRevision !== undefined) {
     if (cachedExpectedRevision !== String(expected)) {
+      logExpectedLiveMember({
+        kind,
+        id,
+        expected,
+        live: null,
+        member: member.revision,
+        memberDigest: typeof member.digest === "string" ? member.digest : undefined,
+      });
       throw new AgenticCommitError("stale_input_revision", "deltas for one source disagree on expected revision", { kind, id });
     }
     return;
@@ -1087,6 +1159,15 @@ function assertDeltaExpectedRevision(
     current = null;
   }
   if (!current || String(current.revision) !== String(expected)) {
+    logExpectedLiveMember({
+      kind,
+      id,
+      expected,
+      live: current && "revision" in current ? current.revision : null,
+      member: member.revision,
+      liveDigest: current && "digest" in current && typeof current.digest === "string" ? current.digest : undefined,
+      memberDigest: typeof member.digest === "string" ? member.digest : undefined,
+    });
     throw new AgenticCommitError("stale_input_revision", "delta expected revision changed", { kind, id });
   }
   tracker.deltas.set(sourceKey, String(expected));

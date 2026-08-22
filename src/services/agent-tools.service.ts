@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../llm/types";
 import type { Message } from "../types/message";
+import type { AgentInspectionWriterV1 } from "./agent-activity-runs.service";
 import type {
   AgentLoreScope,
   AgentLoreSource,
@@ -12,13 +13,14 @@ import type {
   AgentToolSnapshot,
   CoreAgentToolId,
 } from "../types/agents";
-import type { WorldBookEntry } from "../types/world-book";
+import type { WorldBook, WorldBookEntry } from "../types/world-book";
 
 import { isLoomInjectedMessageForSearch } from "./chats.service";
 import {
   isAgentLoreSearchMatch,
   rankAgentLoreSearch,
 } from "./agent-lore-relevance";
+import * as worldBooksSvc from "./world-books.service";
 const TOOL_PAGE_DEFAULT = 20;
 const TOOL_PAGE_MAX = 50;
 const TOOL_SELECTOR_MAX_BYTES = 512;
@@ -47,6 +49,122 @@ export interface AgentToolSnapshotInput {
   signal?: AbortSignal;
 }
 
+export function createAgentOwnedLoreReader(userId: string): AgentOwnedLoreReader {
+  const projectBook = (book: WorldBook): AgentSnapshotBook => Object.freeze({
+    id: book.id,
+    name: book.name,
+    description: book.description ?? "",
+    folder: book.folder ?? "",
+    source: "owned",
+    active: false,
+  });
+  const projectEntry = (
+    entry: WorldBookEntry,
+    book: WorldBook | null,
+  ): AgentSnapshotEntry | null => {
+    if (!book) return null;
+    return Object.freeze({
+      id: entry.id,
+      bookId: entry.world_book_id,
+      bookName: book.name,
+      bookSource: "owned" as const,
+      comment: entry.comment,
+      keys: Object.freeze([...entry.key]),
+      secondaryKeys: Object.freeze([...entry.keysecondary]),
+      content: entry.content,
+      position: entry.position,
+      depth: entry.depth,
+      role: entry.role,
+      activated: false,
+    });
+  };
+  return {
+    listBooks: ({ limit, offset, folder, query }) => {
+      const page = worldBooksSvc.listOwnedAgentLoreBooks(userId, {
+        limit,
+        offset,
+        ...(folder !== undefined ? { folder } : {}),
+        ...(query !== undefined ? { query } : {}),
+      });
+      return {
+        data: page.data.map(projectBook),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        truncated: page.offset + page.data.length < page.total,
+      };
+    },
+    resolveBookName: (name) => {
+      const resolution = worldBooksSvc.resolveOwnedAgentLoreBookName(userId, name);
+      return {
+        candidates: resolution.candidates,
+        total: resolution.total,
+        truncated: resolution.truncated,
+      };
+    },
+    getBook: (bookId) => {
+      const book = worldBooksSvc.getOwnedAgentLoreBook(userId, bookId);
+      return book ? projectBook(book) : null;
+    },
+    listEntries: ({ bookId, limit, offset, query }) => {
+      const page = worldBooksSvc.listOwnedAgentLoreEntries(userId, {
+        bookId,
+        limit,
+        offset,
+        ...(query !== undefined ? { query } : {}),
+      });
+      const book = worldBooksSvc.getOwnedAgentLoreBook(userId, bookId);
+      const data = page.data
+        .map((entry) => projectEntry(entry, book))
+        .filter((entry): entry is AgentSnapshotEntry => entry !== null);
+      return {
+        data,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        truncated: page.offset + data.length < page.total,
+      };
+    },
+    getEntry: (entryId) => {
+      const entry = worldBooksSvc.getOwnedAgentLoreEntry(userId, entryId);
+      return entry
+        ? projectEntry(
+            entry,
+            worldBooksSvc.getOwnedAgentLoreBook(userId, entry.world_book_id),
+          )
+        : null;
+    },
+    searchEntries: ({ query, bookId, limit, offset }) => {
+      const page = worldBooksSvc.searchOwnedAgentLoreEntries(userId, {
+        query,
+        ...(bookId !== undefined ? { bookId } : {}),
+        limit,
+        offset,
+      });
+      const booksById = new Map<string, WorldBook | null>();
+      const data = page.data
+        .map((entry) => {
+          let book: WorldBook | null;
+          if (booksById.has(entry.world_book_id)) {
+            book = booksById.get(entry.world_book_id) ?? null;
+          } else {
+            book = worldBooksSvc.getOwnedAgentLoreBook(userId, entry.world_book_id);
+            booksById.set(entry.world_book_id, book);
+          }
+          return projectEntry(entry, book);
+        })
+        .filter((entry): entry is AgentSnapshotEntry => entry !== null);
+      return {
+        data,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        truncated: page.offset + data.length < page.total,
+      };
+    },
+  };
+}
+
 export interface AgentToolGrant {
   toolIds: readonly CoreAgentToolId[];
   loreScope: AgentLoreScope;
@@ -56,6 +174,8 @@ export interface AgentToolExecutionContext {
   snapshot: AgentToolSnapshot;
   grant: AgentToolGrant;
   signal?: AbortSignal;
+  /** Owner-only causal inspection; never exposed to the model. */
+  inspection?: AgentInspectionWriterV1;
 }
 
 interface PageEnvelope<T> {
@@ -457,6 +577,141 @@ function failure(
 ): AgentToolResult {
   return { status: "error", toolName, errorCode, message, data };
 }
+type ToolInspectionWriter = {
+  readonly record: (kind: "tool" | "condition", value?: unknown, state?: unknown) => unknown;
+};
+
+const INSPECTION_SECRET_KEY = /(?:secret|credential|password|authorization|token|api[_-]?key|private[_-]?key)/i;
+
+export function safeToolInspectionValue(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "[bounded]";
+  if (typeof value === "string") return value.length > 16_384 ? `${value.slice(0, 16_384)}…` : value;
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, 128).map((item) => safeToolInspectionValue(item, depth + 1));
+  if (!isPlainRecord(value)) return "[unavailable]";
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = key.replace(/[-\s]/g, "_");
+    if (
+      INSPECTION_SECRET_KEY.test(normalized)
+      || normalized === "otheruserdata"
+      || normalized === "other_user_data"
+    ) continue;
+    result[key] = safeToolInspectionValue(item, depth + 1);
+  }
+  return result;
+}
+
+function toolInspectionJson(value: unknown): string {
+  try {
+    const json = JSON.stringify(safeToolInspectionValue(value));
+    if (typeof json !== "string") return "[unavailable]";
+    return json.length > 16_384 ? `${json.slice(0, 16_384)}…` : json;
+  } catch {
+    return "[unavailable]";
+  }
+}
+
+function inspectionRecordId(value: unknown): string | undefined {
+  if (!isPlainRecord(value) || !Array.isArray(value.transcript)) return undefined;
+  const record = value.transcript[value.transcript.length - 1];
+  return isPlainRecord(record) && typeof record.id === "string" ? record.id : undefined;
+}
+
+function recordToolInspection(
+  writer: ToolInspectionWriter | undefined,
+  value: Record<string, unknown>,
+): string | undefined {
+  if (!writer) return undefined;
+  try {
+    return inspectionRecordId(writer.record("tool", value));
+  } catch {
+    return undefined;
+  }
+}
+
+function toolInspectionErrorReason(
+  errorCode: AgentToolResult["errorCode"],
+): string | undefined {
+  if (!errorCode) return undefined;
+  if (errorCode === "cancelled") return "interrupted";
+  if (errorCode === "invalid_arguments") return "invalid_input";
+  if (errorCode === "unauthorized") return "unavailable";
+  return "tool_failure";
+}
+
+function recordToolCondition(
+  writer: ToolInspectionWriter | undefined,
+  toolId: CoreAgentToolId,
+  parentId: string | undefined,
+  result: AgentToolResult,
+): void {
+  try {
+    writer?.record("condition", {
+      ...(parentId ? { id: `${parentId}:condition` } : {}),
+      kind: "condition",
+      actor: "host",
+      recipient: "tool",
+      toolId,
+      content: `tool gate decision: ${toolId}`,
+      result: toolInspectionJson({
+        status: result.status,
+        ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+      }),
+      correlation: {
+        actorId: "host",
+        recipientId: "tool",
+        toolId,
+        ...(parentId ? { parentId } : {}),
+      },
+    });
+  } catch {
+    // Inspection persistence must not change the authorized tool result.
+  }
+}
+
+function toolInspectionResultPayload(
+  toolId: CoreAgentToolId,
+  requestId: string | undefined,
+  result: AgentToolResult,
+): Record<string, unknown> {
+  return {
+    ...(requestId ? { id: `${requestId}:result` } : {}),
+    kind: "tool",
+    actor: "tool",
+    recipient: "agent",
+    toolId,
+    content: `tool result: ${toolId}`,
+    result: toolInspectionJson(result),
+    correlation: {
+      actorId: "tool",
+      recipientId: "agent",
+      toolId,
+      ...(requestId ? { parentId: requestId } : {}),
+    },
+    ...(result.errorCode ? { errorReason: toolInspectionErrorReason(result.errorCode) } : {}),
+  };
+}
+
+function toolInspectionRequestPayload(
+  toolId: CoreAgentToolId,
+  args: unknown,
+): Record<string, unknown> {
+  return {
+    kind: "tool",
+    actor: "agent",
+    recipient: "tool",
+    toolId,
+    content: `tool request: ${toolId}`,
+    arguments: toolInspectionJson(args),
+    correlation: {
+      actorId: "agent",
+      recipientId: "tool",
+      toolId,
+    },
+  };
+}
+
 
 async function executeLoreListBooks(
   args: unknown,
@@ -845,12 +1100,21 @@ export const CORE_AGENT_TOOL_CATALOG: Readonly<Record<CoreAgentToolId, CoreAgent
   },
 });
 
+function coreCatalogEntry(toolId: unknown): CoreAgentToolCatalogEntry | undefined {
+  if (typeof toolId !== "string" || !Object.prototype.hasOwnProperty.call(CORE_AGENT_TOOL_CATALOG, toolId)) {
+    return undefined;
+  }
+  return CORE_AGENT_TOOL_CATALOG[toolId as CoreAgentToolId];
+}
+
 export function getCoreAgentToolDefinitions(
   toolIds: readonly CoreAgentToolId[],
 ): ToolDefinition[] {
-  return toolIds.map((toolId) =>
-    structuredClone(CORE_AGENT_TOOL_CATALOG[toolId].definition),
-  );
+  return toolIds.map((toolId) => {
+    const entry = coreCatalogEntry(toolId);
+    if (!entry) throw new Error("tool_not_in_catalog");
+    return structuredClone(entry.definition);
+  });
 }
 
 export async function executeCoreAgentTool(
@@ -858,34 +1122,44 @@ export async function executeCoreAgentTool(
   args: unknown,
   context: AgentToolExecutionContext,
 ): Promise<AgentToolResult> {
-  if (!context.grant.toolIds.includes(toolId)) {
-    return failure(toolId, "unauthorized", "Tool is not authorized");
+  const writer = (context as AgentToolExecutionContext & {
+    readonly inspection?: ToolInspectionWriter;
+  }).inspection;
+  const requestId = recordToolInspection(writer, toolInspectionRequestPayload(toolId, args));
+  let result: AgentToolResult;
+  const catalogEntry = coreCatalogEntry(toolId);
+  if (!catalogEntry) {
+    result = failure(toolId, "unauthorized", "Tool is not in the host catalog");
+  } else if (!context.grant.toolIds.includes(toolId)) {
+    result = failure(toolId, "unauthorized", "Tool is not authorized");
+  } else {
+    try {
+      const toolResult = await catalogEntry.execute(args, context);
+      result = Buffer.byteLength(JSON.stringify(toolResult), "utf8") > AGENT_TOOL_RESULT_MAX_BYTES
+        ? failure(toolId, "limit_exceeded", "Tool result exceeds the response limit")
+        : toolResult;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        result = failure(toolId, "cancelled", "Tool call was cancelled");
+      } else if (
+        error instanceof Error
+        && (
+          error.message === "agent_tool_limit_exceeded"
+          || ("code" in error && error.code === "agent_tool_limit_exceeded")
+        )
+      ) {
+        result = failure(toolId, "limit_exceeded", "Tool result exceeds the response limit");
+      } else if (error instanceof Error && error.message === "unauthorized") {
+        result = failure(toolId, "unauthorized", "Requested scope is not authorized");
+      } else if (error instanceof Error && error.message === "invalid_arguments") {
+        result = failure(toolId, "invalid_arguments", "Tool arguments are invalid");
+      } else {
+        result = failure(toolId, "internal_error", "Tool execution failed");
+      }
+    }
   }
-  try {
-    const result = await CORE_AGENT_TOOL_CATALOG[toolId].execute(args, context);
-    if (Buffer.byteLength(JSON.stringify(result), "utf8") > AGENT_TOOL_RESULT_MAX_BYTES) {
-      return failure(toolId, "limit_exceeded", "Tool result exceeds the response limit");
-    }
-    return result;
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      return failure(toolId, "cancelled", "Tool call was cancelled");
-    }
-    if (
-      error instanceof Error &&
-      (
-        error.message === "agent_tool_limit_exceeded" ||
-        ("code" in error && error.code === "agent_tool_limit_exceeded")
-      )
-    ) {
-      return failure(toolId, "limit_exceeded", "Tool result exceeds the response limit");
-    }
-    if (error instanceof Error && error.message === "unauthorized") {
-      return failure(toolId, "unauthorized", "Requested scope is not authorized");
-    }
-    if (error instanceof Error && error.message === "invalid_arguments") {
-      return failure(toolId, "invalid_arguments", "Tool arguments are invalid");
-    }
-    return failure(toolId, "internal_error", "Tool execution failed");
-  }
+  recordToolInspection(writer, toolInspectionResultPayload(toolId, requestId, result));
+  recordToolCondition(writer, toolId, requestId, result);
+  return result;
 }
+

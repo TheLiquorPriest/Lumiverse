@@ -31,9 +31,15 @@ const AGENT_ACTIVITY_ACTORS: Record<AgentActivityActor, true> = { main_model: tr
 const AGENT_INVOCATION_STATUSES: Record<AgentInvocationStatus, true> = {
   pending: true, running: true, succeeded: true, failed: true, cancelled: true, timed_out: true,
 }
-const AGENT_ACTIVITY_TOOL_NAMES: Record<AgentActivityToolName, true> = {
+const AGENT_ACTIVITY_TOOL_NAMES: Record<Exclude<AgentActivityToolName, 'unknown_tool'>, true> = {
   lore_list_books: true, lore_get_book: true, lore_list_entries: true, lore_get_entry: true,
   lore_search_entries: true, chat_search_history: true, agent_delegate: true,
+  context_pack_list: true, context_pack_get: true,
+  workspace_read_section: true, workspace_read_page: true, workspace_create_task: true,
+  workspace_update_progress: true, workspace_submit_result: true, workspace_accept_submission: true,
+  workspace_record_finding: true, workspace_record_decision: true, workspace_record_question: true,
+  workspace_attach_artifact: true, workspace_propose_publication: true,
+  complete_turn: true,
 }
 const AGENT_PUBLIC_ERROR_CODES: Record<AgentPublicErrorCode, true> = {
   capacity_exceeded: true, host_child_admission_limit_exceeded: true, host_tool_call_limit_exceeded: true,
@@ -60,9 +66,15 @@ const AGENT_ACTIVITY_NODE_KINDS: Record<AgentActivityNodeV1['kind'], true> = {
 const AGENT_ACTIVITY_NODE_ACTORS: Record<AgentActivityNodeV1['actor'], true> = {
   root: true, provider: true, child: true, tool: true,
 }
-const AGENT_ACTIVITY_NODE_TOOL_IDS: Record<NonNullable<AgentActivityNodeV1['toolId']>, true> = {
+const AGENT_ACTIVITY_NODE_TOOL_IDS: Record<Exclude<NonNullable<AgentActivityNodeV1['toolId']>, 'unknown_tool'>, true> = {
   lore_list_books: true, lore_get_book: true, lore_list_entries: true, lore_get_entry: true,
-  lore_search_entries: true, chat_search_history: true, agent_delegate: true, unknown_tool: true,
+  lore_search_entries: true, chat_search_history: true, agent_delegate: true,
+  context_pack_list: true, context_pack_get: true,
+  workspace_read_section: true, workspace_read_page: true, workspace_create_task: true,
+  workspace_update_progress: true, workspace_submit_result: true, workspace_accept_submission: true,
+  workspace_record_finding: true, workspace_record_decision: true, workspace_record_question: true,
+  workspace_attach_artifact: true, workspace_propose_publication: true,
+  complete_turn: true,
 }
 const AGENT_PUBLIC_ERROR_CATEGORIES: Record<string, true> = {
   capacity: true, budget: true, context: true, integrity: true, timeout: true,
@@ -91,7 +103,7 @@ function isAgentActivityActor(value: unknown): value is AgentActivityActor {
 function isAgentInvocationStatus(value: unknown): value is AgentInvocationStatus {
   return typeof value === 'string' && Object.hasOwn(AGENT_INVOCATION_STATUSES, value)
 }
-function isAgentActivityToolName(value: unknown): value is AgentActivityToolName {
+function isAgentActivityToolName(value: unknown): value is Exclude<AgentActivityToolName, 'unknown_tool'> {
   return typeof value === 'string' && Object.hasOwn(AGENT_ACTIVITY_TOOL_NAMES, value)
 }
 function isAgentPublicErrorCode(value: unknown): value is AgentPublicErrorCode {
@@ -172,13 +184,18 @@ function readAgentUsage(value: unknown): AgentActivityPayload['usage'] | null {
   const inputTokens = readNonNegativeNumber(readOwnDataProperty(value, 'inputTokens'))
   const outputTokens = readNonNegativeNumber(readOwnDataProperty(value, 'outputTokens'))
   const totalTokens = readNonNegativeNumber(readOwnDataProperty(value, 'totalTokens'))
-  const toolCalls = readNonNegativeInteger(readOwnDataProperty(value, 'toolCalls'))
-  const childInvocations = readNonNegativeInteger(readOwnDataProperty(value, 'childInvocations'))
-  if (inputTokens === null || outputTokens === null || totalTokens === null) return null
+  const rawToolCalls = readOwnDataProperty(value, 'toolCalls')
+  const rawChildInvocations = readOwnDataProperty(value, 'childInvocations')
+  const toolCalls = rawToolCalls === undefined ? undefined : readNonNegativeInteger(rawToolCalls)
+  const childInvocations = rawChildInvocations === undefined ? undefined : readNonNegativeInteger(rawChildInvocations)
+  if (
+    inputTokens === null || outputTokens === null || totalTokens === null
+    || toolCalls === null || childInvocations === null
+  ) return null
   return {
     inputTokens, outputTokens, totalTokens,
-    ...(toolCalls !== null ? { toolCalls } : {}),
-    ...(childInvocations !== null ? { childInvocations } : {}),
+    ...(toolCalls !== undefined ? { toolCalls } : {}),
+    ...(childInvocations !== undefined ? { childInvocations } : {}),
   }
 }
 
@@ -424,16 +441,14 @@ export function normalizeActivityRun(value: unknown): AgentActivityRunV1 | null 
     !isAgentActivityLifecycle(status) || rootId === null
     || sourceOmittedNodeCount === null || !usage || !Array.isArray(rawNodes)
   ) return null
-  const nodes: AgentActivityNodeV1[] = []
+  const normalizedNodes = rawNodes.map(normalizeActivityNode)
+  const nodes = normalizedNodes.filter((node): node is AgentActivityNodeV1 => node !== null)
+  if (nodes.length !== normalizedNodes.length) return null
   let omittedNodeCount = sourceOmittedNodeCount
   let nodeBytes = 0
-  for (let index = 0; index < rawNodes.length; index += 1) {
-    if (nodes.length >= AGENT_ACTIVITY_EVENT_LIMIT) {
-      omittedNodeCount += 1
-      continue
-    }
-    const node = normalizeActivityNode(rawNodes[index])
-    if (!node) {
+  const boundedNodes: AgentActivityNodeV1[] = []
+  for (const node of nodes) {
+    if (boundedNodes.length >= AGENT_ACTIVITY_EVENT_LIMIT) {
       omittedNodeCount += 1
       continue
     }
@@ -442,7 +457,7 @@ export function normalizeActivityRun(value: unknown): AgentActivityRunV1 | null 
       omittedNodeCount += 1
       continue
     }
-    nodes.push(node)
+    boundedNodes.push(node)
     nodeBytes += bytes
   }
   const rawErrors = readOwnDataProperty(snap, 'errorCounts')
@@ -471,7 +486,7 @@ export function normalizeActivityRun(value: unknown): AgentActivityRunV1 | null 
     snapshot: {
       version: 1,
       rootId,
-      nodes,
+      nodes: boundedNodes,
       omittedNodeCount,
       errorCounts,
       usage,

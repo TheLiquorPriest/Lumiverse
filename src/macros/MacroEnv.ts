@@ -24,6 +24,8 @@ export interface BuildEnvContext {
   commit?: boolean;
   connection?: ConnectionProfile | null;
   userId?: string;
+  /** Pre-resolved authenticated account name used when no persona is selected. */
+  userName?: string;
   dynamicMacros?: Record<string, string | MacroHandler | MacroDefinition>;
   /** Pre-resolved group character names (all members). Used for {{group}} macro. */
   groupCharacterNames?: string[];
@@ -60,6 +62,7 @@ export function resolvePersonaPronouns(persona: Persona | null): {
 export function buildEnv(ctx: BuildEnvContext): MacroEnv {
   const { character, persona, chat, messages, generationType, connection } = ctx;
   const focusedCharacter = ctx.focusedCharacter ?? character;
+  const resolvedUserName = persona?.name?.trim() || ctx.userName?.trim() || "User";
   const personaPronouns = resolvePersonaPronouns(persona);
   const personaAddonOutlets = buildPersonaAddonOutlets(persona);
 
@@ -86,11 +89,11 @@ export function buildEnv(ctx: BuildEnvContext): MacroEnv {
   return {
     commit: ctx.commit !== false,
     names: {
-      user: persona?.name || "User",
+      user: resolvedUserName,
       char: getEffectiveCharacterName(character),
       group: allGroupNames?.join(", ") ?? "",
       groupNotMuted: (ctx.groupNotMutedNames ?? allGroupNames)?.join(", ") ?? "",
-      notChar: persona?.name || "User",
+      notChar: resolvedUserName,
       charGroupFocused: focusedName,
       groupOthers: isGroup && allGroupNames
         ? allGroupNames.filter((n) => n !== focusedName).join(", ")

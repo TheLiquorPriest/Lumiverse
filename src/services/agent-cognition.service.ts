@@ -36,6 +36,28 @@ import {
   type FrozenCognitionGraphV1,
   type TaskTemplateV1,
   type CognitionWorkspaceCasV1,
+  LOOM_POLICY_BUCKETS,
+  LOOM_POLICY_CHECKPOINTS,
+  LOOM_POLICY_DESTINATIONS,
+  LOOM_POLICY_VERSION,
+  type LoomOnDemandRequestV1,
+  type LoomOnDemandRetrievalStatusV1,
+  type LoomPolicyBucketV1,
+  type LoomPolicyBucketsV1,
+  type LoomPolicyDeliveryV1,
+  type LoomPolicyDestinationV1,
+  type LoomPolicyEntryV1,
+  type LoomPolicySourceV1,
+  type LoomPromptInspectionItemV1,
+  type LoomPromptInspectionOutcomeV1,
+  type LoomPromptInspectionV1,
+  type LoomResponsePolicyOmissionV1,
+  type LoomPolicyCheckpointV1,
+  type LoomPolicyVisibilityV1,
+  type LoomPromptInspectionBlockV1,
+  type LoomPromptInspectionContextPackV1,
+  type LoomPromptInspectionInputV1,
+
 } from "../types/agent-cognition";
 
 const UTF8_ENCODER = new TextEncoder();
@@ -72,9 +94,9 @@ const TASK_TRANSITIONS: readonly CognitionTaskTransition[] = [
   "pending",
   "active",
   "blocked",
-  "submitted",
-  "accepted",
-  "done",
+  "completed",
+  "cancelled",
+  "failed",
 ];
 const PREDICATE_KINDS = [
   "all",
@@ -431,6 +453,251 @@ export function parseCognitionPolicyRefs(value: unknown): CognitionPolicyRefsV1 
   return parsePolicyRefsWithBudget(value, { predicateNodes: 0, listBytes: 0 });
 }
 
+export const LOOM_BUCKET_DESTINATION: Readonly<Record<LoomPolicyBucketV1, LoomPolicyDestinationV1>> = Object.freeze({
+  workPolicy: "root_work",
+  workspaceUsage: "root_work",
+  completionCriteria: "completion_handoff",
+  renderPolicy: "render",
+});
+
+export const LOOM_BUCKET_CHECKPOINT: Readonly<Record<LoomPolicyBucketV1, LoomPolicyCheckpointV1>> = Object.freeze({
+  workPolicy: "WORK",
+  workspaceUsage: "WORK",
+  completionCriteria: "PREPARE_COMMIT",
+  renderPolicy: "RENDER",
+});
+
+const LOOM_CHECKPOINT_RANK: Readonly<Record<LoomPolicyCheckpointV1, number>> = Object.freeze({
+  ASSEMBLE: 0,
+  WORK: 1,
+  PREPARE_COMMIT: 2,
+  RENDER: 3,
+});
+
+function parseLoomPolicySource(value: unknown, path: string): LoomPolicySourceV1 {
+  const object = record(value, path);
+  exactKeys(object, ["kind", "blockId", "presetRevision", "blockRevision", "promptOrder"], path);
+  ensureEnum(object.kind, ["loom_block"] as const, `${path}.kind`);
+  return {
+    kind: "loom_block",
+    blockId: ensureId(object.blockId, `${path}.blockId`),
+    presetRevision: ensureRevision(object.presetRevision, `${path}.presetRevision`),
+    blockRevision: ensureRevision(object.blockRevision, `${path}.blockRevision`),
+    promptOrder: ensureRevision(object.promptOrder, `${path}.promptOrder`),
+  };
+}
+
+function parseLoomOnDemandRequest(value: unknown, path: string): LoomOnDemandRequestV1 {
+  const object = record(value, path);
+  exactKeys(object, ["contextPackId", "revisionId", "digest"], path);
+  const digest = ensureSafeText(object.digest, `${path}.digest`, 128);
+  if (!/^[0-9a-fA-F]{64}$/.test(digest)) fail("invalid_value", `${path}.digest`, "must be a SHA-256 digest");
+  return {
+    contextPackId: ensureId(object.contextPackId, `${path}.contextPackId`),
+    revisionId: ensureId(object.revisionId, `${path}.revisionId`),
+    digest: digest.toLowerCase(),
+  };
+}
+function parseLoomPolicyDelivery(value: unknown, path: string, budget: ParseBudget): LoomPolicyDeliveryV1 {
+  const object = record(value, path);
+  const delivery = ensureEnum(object.delivery, ["direct", "condition_gated", "on_demand"] as const, `${path}.delivery`);
+  if (delivery === "direct") {
+    exactKeys(object, ["delivery"], path);
+    return { delivery: "direct" };
+  }
+  if (delivery === "condition_gated") {
+    exactKeys(object, ["delivery", "condition"], path);
+    return { delivery: "condition_gated", condition: parsePredicate(object.condition, `${path}.condition`, budget, 1) };
+  }
+  exactKeys(object, ["delivery", "request"], path);
+  return { delivery: "on_demand", request: parseLoomOnDemandRequest(object.request, `${path}.request`) };
+}
+
+function parseLoomPolicyEntry(
+  value: unknown,
+  path: string,
+  bucket: LoomPolicyBucketV1,
+  budget: ParseBudget,
+): LoomPolicyEntryV1 {
+  const object = record(value, path);
+  exactKeys(object, ["version", "id", "source", "destination", "checkpoint", "required", "visibility", "delivery"], path);
+  if (object.version !== LOOM_POLICY_VERSION) fail("invalid_value", `${path}.version`, "unsupported Loom policy version");
+  const destination = ensureEnum(object.destination, LOOM_POLICY_DESTINATIONS, `${path}.destination`);
+  if (destination !== LOOM_BUCKET_DESTINATION[bucket]) {
+    fail("invalid_value", `${path}.destination`, `destination is not valid for ${bucket}`);
+  }
+  const checkpoint = ensureEnum(object.checkpoint, LOOM_POLICY_CHECKPOINTS, `${path}.checkpoint`);
+  if (checkpoint !== LOOM_BUCKET_CHECKPOINT[bucket]) {
+    fail("invalid_value", `${path}.checkpoint`, `checkpoint is not valid for ${bucket}`);
+  }
+  ensureBoolean(object.required, `${path}.required`);
+  ensureEnum(object.visibility, ["work_only"] as const, `${path}.visibility`);
+  return {
+    version: LOOM_POLICY_VERSION,
+    id: ensureId(object.id, `${path}.id`),
+    source: parseLoomPolicySource(object.source, `${path}.source`),
+    destination,
+    checkpoint,
+    required: object.required as boolean,
+    visibility: "work_only",
+    delivery: parseLoomPolicyDelivery(object.delivery, `${path}.delivery`, budget),
+  };
+}
+
+function sortLoomPolicyEntries(entries: readonly LoomPolicyEntryV1[]): LoomPolicyEntryV1[] {
+  return [...entries].sort((left, right) =>
+    compareNumber(left.source.promptOrder, right.source.promptOrder)
+    || compareCognitionUtf8(left.source.blockId, right.source.blockId)
+    || compareCognitionUtf8(left.id, right.id));
+}
+
+export function parseLoomPolicyBuckets(value: unknown): LoomPolicyBucketsV1 {
+  const object = record(value, "policies");
+  exactKeys(object, ["version", ...LOOM_POLICY_BUCKETS], "policies");
+  if (object.version !== LOOM_POLICY_VERSION) fail("invalid_value", "policies.version", "unsupported Loom policy version");
+  const budget: ParseBudget = { predicateNodes: 0, listBytes: 0 };
+  const parsed = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [
+    bucket,
+    sortLoomPolicyEntries(
+      ensureArray(object[bucket], `policies.${bucket}`, COGNITION_MAX_BLOCK_REFS_PER_SECTION)
+        .map((entry, index) => parseLoomPolicyEntry(entry, `policies.${bucket}[${index}]`, bucket, budget)),
+    ),
+  ])) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>;
+  const ids = LOOM_POLICY_BUCKETS.flatMap((bucket) => parsed[bucket].map((entry) => entry.id));
+  assertUniqueIds(ids, "policies");
+  if (ids.length > COGNITION_MAX_BLOCK_REFS_TOTAL) fail("limit_exceeded", "policies", `entries must total at most ${COGNITION_MAX_BLOCK_REFS_TOTAL}`);
+  return deepFreeze({
+    version: LOOM_POLICY_VERSION,
+    workPolicy: parsed.workPolicy,
+    workspaceUsage: parsed.workspaceUsage,
+    completionCriteria: parsed.completionCriteria,
+    renderPolicy: parsed.renderPolicy,
+  });
+}
+
+export const parseLoomPolicyBucketsV1 = parseLoomPolicyBuckets;
+
+function loomSourceForRef(ref: CognitionLoomBlockRefV1, source: CognitionSourceSnapshotV1, path: string): LoomPolicySourceV1 {
+  const block = source.blocks.find((candidate) => candidate.blockId === ref.blockId);
+  if (!block) fail("missing_reference", `${path}.blockId`, "Loom block is missing from the source snapshot");
+  if (ref.expectedPresetRevision !== source.presetRevision) fail("revision_mismatch", `${path}.expectedPresetRevision`, "preset revision does not match the frozen source");
+  if (ref.expectedBlockRevision !== block.revision) fail("revision_mismatch", `${path}.expectedBlockRevision`, "block revision does not match the frozen source");
+  return {
+    kind: "loom_block",
+    blockId: block.blockId,
+    presetRevision: source.presetRevision,
+    blockRevision: block.revision,
+    promptOrder: block.promptOrder,
+  };
+}
+
+function policyEntriesFromRefs(
+  refs: CognitionPolicyRefsV1,
+  source: CognitionSourceSnapshotV1,
+  legacy = false,
+
+): LoomPolicyBucketsV1 {
+  const buckets = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [
+    bucket,
+    sortLoomPolicyEntries(refs[bucket].map((ref, index) => ({
+      version: LOOM_POLICY_VERSION,
+      id: `${legacy ? "legacy-" : ""}${bucket}-${ref.blockId}`,
+      source: loomSourceForRef(ref, source, `policies.${bucket}[${index}]`),
+      destination: LOOM_BUCKET_DESTINATION[bucket],
+      checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
+      required: true,
+      visibility: "work_only",
+      delivery: { delivery: "direct" },
+    } satisfies LoomPolicyEntryV1))),
+  ])) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>;
+  return {
+    version: LOOM_POLICY_VERSION,
+    workPolicy: buckets.workPolicy,
+    workspaceUsage: buckets.workspaceUsage,
+    completionCriteria: buckets.completionCriteria,
+    renderPolicy: buckets.renderPolicy,
+  };
+}
+function validateLoomPolicySources(
+  policies: LoomPolicyBucketsV1,
+  source: CognitionSourceSnapshotV1,
+): void {
+  const sourceById = new Map(source.blocks.map((block) => [block.blockId, block] as const));
+  for (const bucket of LOOM_POLICY_BUCKETS) {
+    for (const [index, entry] of policies[bucket].entries()) {
+      const block = sourceById.get(entry.source.blockId);
+      if (!block) fail("missing_reference", `policies.${bucket}[${index}].source.blockId`, "Loom block is missing from the source snapshot");
+      if (entry.source.presetRevision !== source.presetRevision || entry.source.blockRevision !== block.revision) {
+        fail("revision_mismatch", `policies.${bucket}[${index}].source`, "source revision does not match the frozen source");
+      }
+      if (entry.source.promptOrder !== block.promptOrder) {
+        fail("revision_mismatch", `policies.${bucket}[${index}].source.promptOrder`, "source Loom order does not match the frozen source");
+      }
+    }
+  }
+}
+
+
+function mergeLoomPolicyBuckets(left: LoomPolicyBucketsV1, right: LoomPolicyBucketsV1): LoomPolicyBucketsV1 {
+  const merged = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [
+    bucket,
+    sortLoomPolicyEntries([...left[bucket], ...right[bucket]]),
+  ])) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>;
+  const ids = LOOM_POLICY_BUCKETS.flatMap((bucket) => merged[bucket].map((entry) => entry.id));
+  assertUniqueIds(ids, "policies");
+  return {
+    version: LOOM_POLICY_VERSION,
+    workPolicy: merged.workPolicy,
+    workspaceUsage: merged.workspaceUsage,
+    completionCriteria: merged.completionCriteria,
+    renderPolicy: merged.renderPolicy,
+  };
+}
+
+export function normalizeLegacyLoomPolicyV1(
+  value: unknown,
+  sourceValue: unknown,
+): LoomPolicyBucketsV1 {
+  const source = parseCognitionSourceSnapshot(sourceValue);
+  const object = record(value, "config.phasePolicy");
+  exactKeys(object, ["work", "render"], "config.phasePolicy");
+  const refs = parseCognitionPolicyRefs({
+    workPolicy: object.work,
+    workspaceUsage: [],
+    completionCriteria: [],
+    renderPolicy: object.render,
+  });
+  return deepFreeze(policyEntriesFromRefs(refs, source, true));
+}
+
+export const normalizeLegacyPhasePolicyV1 = normalizeLegacyLoomPolicyV1;
+
+export function normalizeLoomPolicyBucketsV1(
+  value: unknown,
+  sourceValue: unknown,
+  legacyPhasePolicyValue?: unknown,
+): LoomPolicyBucketsV1 {
+  const source = parseCognitionSourceSnapshot(sourceValue);
+  const parsed = value === undefined || value === null
+    ? policyEntriesFromRefs({
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }, source)
+    : isPlainRecord(value) && value.version === LOOM_POLICY_VERSION
+      ? parseLoomPolicyBuckets(value)
+      : policyEntriesFromRefs(parseCognitionPolicyRefs(value), source);
+  validateLoomPolicySources(parsed, source);
+  const canonical = legacyPhasePolicyValue === undefined || legacyPhasePolicyValue === null
+    ? parsed
+    : mergeLoomPolicyBuckets(parsed, normalizeLegacyLoomPolicyV1(legacyPhasePolicyValue, source));
+  validateLoomPolicySources(canonical, source);
+  return deepFreeze(canonical);
+}
+
+export const normalizeLoomPolicyBuckets = normalizeLoomPolicyBucketsV1;
+
 function parseDependencies(value: unknown, path: string, budget: ParseBudget): string[] {
   if (value === undefined) return [];
   const values = ensureArray(value, path);
@@ -712,11 +979,6 @@ export interface AgentCognitionLoaderV1 {
   readonly selections: readonly unknown[];
 }
 
-export interface AgentCognitionPhasePolicyV1 {
-  readonly work: readonly CognitionLoomBlockRefV1[];
-  readonly render: readonly CognitionLoomBlockRefV1[];
-}
-
 export interface FrozenAgentCognitionV1 {
   readonly graph: FrozenCognitionGraphV1;
   readonly source: CognitionSourceSnapshotV1;
@@ -726,7 +988,7 @@ export interface FrozenAgentCognitionV1 {
     readonly digest: string;
     readonly required: boolean;
   }[];
-  readonly phasePolicy: AgentCognitionPhasePolicyV1;
+  readonly policyBuckets: LoomPolicyBucketsV1;
 }
 
 const EMPTY_COGNITION_POLICY: CognitionPolicyRefsV1 = Object.freeze({
@@ -756,33 +1018,23 @@ function parseAgentContextSelections(value: unknown): FrozenAgentCognitionV1["co
   return Object.freeze(selections);
 }
 
-function parseAgentPhasePolicy(value: unknown, source: CognitionSourceSnapshotV1): AgentCognitionPhasePolicyV1 {
-  if (value === undefined || value === null) return Object.freeze({ work: Object.freeze([]), render: Object.freeze([]) });
-  const object = record(value, "config.phasePolicy");
-  exactKeys(object, ["work", "render"], "config.phasePolicy");
-  const parsed = parseCognitionPolicyRefs({
-    workPolicy: object.work,
-    workspaceUsage: [],
-    completionCriteria: [],
-    renderPolicy: object.render,
-  });
-  const frozen = freezeCognitionGraph({
-    version: AGENT_COGNITION_VERSION,
-    policies: parsed,
-    templates: [],
-    contextRules: [],
-  }, source);
-  return Object.freeze({
-    work: Object.freeze([...frozen.policies.workPolicy]),
-    render: Object.freeze([...frozen.policies.renderPolicy]),
-  });
+function refsFromLoomPolicyBuckets(policies: LoomPolicyBucketsV1): CognitionPolicyRefsV1 {
+  const refs = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [
+    bucket,
+    policies[bucket].map((entry) => ({
+      blockId: entry.source.blockId,
+      expectedPresetRevision: entry.source.presetRevision,
+      expectedBlockRevision: entry.source.blockRevision,
+    })),
+  ])) as Record<LoomPolicyBucketV1, CognitionLoomBlockRefV1[]>;
+  return {
+    workPolicy: refs.workPolicy,
+    workspaceUsage: refs.workspaceUsage,
+    completionCriteria: refs.completionCriteria,
+    renderPolicy: refs.renderPolicy,
+  };
 }
 
-/**
- * Convert the authenticated normalized loader output into the sole frozen
- * cognition authority consumed by Agentic assembly/runtime. This function is
- * pure: it performs no DB/Spindle reads and never fills missing authored data.
- */
 export function freezeAgentCognitionV1(
   loader: AgentCognitionLoaderV1,
   sourceValue: unknown,
@@ -793,16 +1045,19 @@ export function freezeAgentCognitionV1(
   if (!Array.isArray(loader.selections)) fail("invalid_type", "loader.selections", "must be an array");
   const source = parseCognitionSourceSnapshot(sourceValue);
   const config = loader.config === null || loader.config === undefined ? {} : record(loader.config, "loader.config");
-  const cognitionPolicy = config.cognitionPolicy === undefined ? EMPTY_COGNITION_POLICY : parseCognitionPolicyRefs(config.cognitionPolicy);
-  const phasePolicy = parseAgentPhasePolicy(config.phasePolicy, source);
+  const runtimePolicy = isPlainRecord(config.runtimePolicy) ? config.runtimePolicy : null;
+  const authoredLoomPolicy = runtimePolicy && Object.hasOwn(runtimePolicy, "loomPolicy")
+    ? runtimePolicy.loomPolicy
+    : null;
+  const policyBuckets = normalizeLoomPolicyBucketsV1(authoredLoomPolicy ?? EMPTY_COGNITION_POLICY, source);
+  const cognitionPolicy = refsFromLoomPolicyBuckets(policyBuckets);
   const selections = parseAgentContextSelections(loader.selections);
   const hasContextPolicy = config.contextPolicy !== undefined
     && isPlainRecord(config.contextPolicy)
     && Array.isArray(config.contextPolicy.packIds)
     && config.contextPolicy.packIds.length > 0;
-  const hasCognitionPolicy = Object.values(cognitionPolicy).some((refs) => refs.length > 0);
-  const hasPhasePolicy = phasePolicy.work.length > 0 || phasePolicy.render.length > 0;
-  const hasPolicy = hasCognitionPolicy || hasContextPolicy || loader.contextRules.length > 0 || loader.taskTemplates.length > 0 || selections.length > 0 || hasPhasePolicy;
+  const hasCognitionPolicy = LOOM_POLICY_BUCKETS.some((bucket) => policyBuckets[bucket].length > 0);
+  const hasPolicy = hasCognitionPolicy || hasContextPolicy || loader.contextRules.length > 0 || loader.taskTemplates.length > 0 || selections.length > 0;
   if (!hasPolicy) return null;
   const graph = freezeCognitionGraph({
     version: AGENT_COGNITION_VERSION,
@@ -810,7 +1065,7 @@ export function freezeAgentCognitionV1(
     templates: loader.taskTemplates,
     contextRules: loader.contextRules,
   }, source);
-  return Object.freeze({ graph, source, contextPackSelections: selections, phasePolicy });
+  return Object.freeze({ graph, source, contextPackSelections: selections, policyBuckets });
 }
 
 
@@ -997,6 +1252,11 @@ function difference(after: readonly string[], before: readonly string[]): string
   const previous = new Set(before);
   return after.filter((id) => !previous.has(id));
 }
+/**
+ * Evaluate authored predicates only at an explicit, host-named checkpoint.
+ * The append-only state makes a condition sticky after activation; no ambient
+ * reevaluation can add requirements between checkpoints.
+ */
 function activateAtPointInternal(
   graph: FrozenCognitionGraphV1,
   stateValue: CognitionActivationStateV1,
@@ -1059,8 +1319,7 @@ export function activateCognitionAtPoint(
 export const activateCognition = activateCognitionAtPoint;
 
 /**
- * Run bounded activation to a fixed point before completion.  Required tasks
- * newly activated by this pass are returned as blockers until accepted/done.
+ * newly activated by this pass are returned as blockers until completed.
  */
 export function completeCognitionFixedPoint(
   graph: FrozenCognitionGraphV1,
@@ -1080,7 +1339,7 @@ export function completeCognitionFixedPoint(
   }
   const transitions = context.taskTransitions;
   const blockingRequiredTaskIds = current.state.requiredTemplateIds
-    .filter((taskId) => transitions[taskId] !== "accepted" && transitions[taskId] !== "done")
+    .filter((taskId) => transitions[taskId] !== "completed")
     .sort(compareCognitionUtf8);
   return {
     ...current,
@@ -1146,6 +1405,352 @@ export function applyCognitionTaskTransitionInCas(
 
 /** Alias used by workspace services that call the operation "transition". */
 export const transitionTaskWithCognition = applyCognitionTaskTransitionInCas;
+
+function loomPolicySourceKey(source: LoomPolicySourceV1): string {
+  return `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
+}
+
+function loomContextPackKey(request: LoomOnDemandRequestV1): string {
+  return `${request.contextPackId}\u0000${request.revisionId}\u0000${request.digest}`;
+}
+
+function loomPromptInspectionItem(
+  entry: LoomPolicyEntryV1,
+  bucket: LoomPolicyBucketV1,
+  outcome: LoomPromptInspectionOutcomeV1,
+  effectiveText: string | null,
+  retrievalStatus?: LoomOnDemandRetrievalStatusV1,
+): LoomPromptInspectionItemV1 {
+  return {
+    entryId: entry.id,
+    bucket,
+    destination: entry.destination,
+    checkpoint: entry.checkpoint,
+    source: entry.source,
+    delivery: entry.delivery,
+    effectiveText,
+    ...(retrievalStatus === undefined ? {} : { retrievalStatus }),
+    outcome,
+  };
+}
+
+function parseLoomPromptInspectionOutcome(
+  value: unknown,
+  path: string,
+): LoomPromptInspectionOutcomeV1 {
+  const object = record(value, path);
+  const status = ensureEnum(
+    object.status,
+    ["included", "skipped", "rejected", "omitted", "deduplicated"] as const,
+    `${path}.status`,
+  );
+  if (status === "included") {
+    exactKeys(object, ["status", "effectiveIndex"], path);
+    return { status, effectiveIndex: ensureRevision(object.effectiveIndex, `${path}.effectiveIndex`) };
+  }
+  if (status === "skipped") {
+    exactKeys(object, ["status", "reason"], path);
+    return {
+      status,
+      reason: ensureEnum(
+        object.reason,
+        ["checkpoint_not_reached", "condition_not_met", "on_demand_not_requested", "on_demand_unavailable"] as const,
+        `${path}.reason`,
+      ),
+    };
+  }
+  if (status === "rejected") {
+    exactKeys(object, ["status", "reason"], path);
+    return {
+      status,
+      reason: ensureEnum(
+        object.reason,
+        ["invalid_source", "stale_source", "unsupported_delivery", "unauthorized_retrieval", "required_source_unavailable"] as const,
+        `${path}.reason`,
+      ),
+    };
+  }
+  if (status === "omitted") {
+    exactKeys(object, ["status", "reason"], path);
+    return {
+      status,
+      reason: ensureEnum(
+        object.reason,
+        ["response_mode", "destination_unavailable", "not_work_surface"] as const,
+        `${path}.reason`,
+      ),
+    };
+  }
+  exactKeys(object, ["status", "keptEntryId", "destination"], path);
+  return {
+    status,
+    keptEntryId: ensureId(object.keptEntryId, `${path}.keptEntryId`),
+    destination: ensureEnum(object.destination, LOOM_POLICY_DESTINATIONS, `${path}.destination`),
+  };
+}
+
+function parseLoomResponsePolicyOmission(
+  value: unknown,
+  path: string,
+): LoomResponsePolicyOmissionV1 {
+  const object = record(value, path);
+  exactKeys(
+    object,
+    ["version", "surface", "visibility", "reason", "omittedEntryIds", "source", "omittedPhaseInstructions"],
+    path,
+  );
+  if (object.version !== LOOM_POLICY_VERSION) fail("invalid_value", `${path}.version`, "unsupported Loom policy version");
+  if (object.surface !== "RESPONSE") fail("invalid_value", `${path}.surface`, "must be RESPONSE");
+  if (object.visibility !== "work_only") fail("invalid_value", `${path}.visibility`, "must be work_only");
+  if (object.reason !== "work_only") fail("invalid_value", `${path}.reason`, "must be work_only");
+  const omittedEntryIds = ensureArray(
+    object.omittedEntryIds,
+    `${path}.omittedEntryIds`,
+    COGNITION_MAX_BLOCK_REFS_TOTAL,
+  ).map((entryId, index) => ensureId(entryId, `${path}.omittedEntryIds[${index}]`));
+  assertUniqueIds(omittedEntryIds, `${path}.omittedEntryIds`);
+  const source = ensureArray(
+    object.source,
+    `${path}.source`,
+    COGNITION_MAX_BLOCK_REFS_TOTAL,
+  ).map((entrySource, index) => parseLoomPolicySource(entrySource, `${path}.source[${index}]`));
+  if (source.length !== omittedEntryIds.length) {
+    fail("invalid_value", path, "omitted entry IDs and sources must have equal length");
+  }
+  const omittedPhaseInstructions = ensureArray(
+    object.omittedPhaseInstructions,
+    `${path}.omittedPhaseInstructions`,
+    COGNITION_MAX_SOURCE_BLOCKS,
+  ).map((instruction, index) => {
+    const instructionPath = `${path}.omittedPhaseInstructions[${index}]`;
+    const instructionObject = record(instruction, instructionPath);
+    exactKeys(instructionObject, ["phaseId", "source"], instructionPath);
+    return {
+      phaseId: ensureId(instructionObject.phaseId, `${instructionPath}.phaseId`),
+      source: parseLoomPolicySource(instructionObject.source, `${instructionPath}.source`),
+    };
+  });
+  return deepFreeze({
+    version: LOOM_POLICY_VERSION,
+    surface: "RESPONSE",
+    visibility: "work_only",
+    reason: "work_only",
+    omittedEntryIds,
+    source,
+    omittedPhaseInstructions,
+  });
+}
+
+export function parseLoomPromptInspectionV1(
+  value: unknown,
+  path = "inspection",
+): LoomPromptInspectionV1 {
+  const object = record(value, path);
+  exactKeys(object, ["version", "surface", "checkpoint", "items", "effectiveEntryIds", "responseOmission"], path);
+  if (object.version !== LOOM_POLICY_VERSION) fail("invalid_value", `${path}.version`, "unsupported Loom policy version");
+  const surface = ensureEnum(object.surface, ["WORK", "RESPONSE"] as const, `${path}.surface`);
+  const checkpoint = ensureEnum(object.checkpoint, LOOM_POLICY_CHECKPOINTS, `${path}.checkpoint`);
+  const budget: ParseBudget = { predicateNodes: 0, listBytes: 0 };
+  const items = ensureArray(
+    object.items,
+    `${path}.items`,
+    COGNITION_MAX_BLOCK_REFS_TOTAL,
+  ).map((item, index): LoomPromptInspectionItemV1 => {
+    const itemPath = `${path}.items[${index}]`;
+    const itemObject = record(item, itemPath);
+    exactKeys(
+      itemObject,
+      ["entryId", "bucket", "destination", "checkpoint", "source", "delivery", "effectiveText", "retrievalStatus", "outcome"],
+      itemPath,
+    );
+    const effectiveText = itemObject.effectiveText === null
+      ? null
+      : ensureSafeText(itemObject.effectiveText, `${itemPath}.effectiveText`);
+    const retrievalStatus = itemObject.retrievalStatus === undefined
+      ? undefined
+      : ensureEnum(
+        itemObject.retrievalStatus,
+        ["not_requested", "available", "unavailable", "stale", "unauthorized"] as const,
+        `${itemPath}.retrievalStatus`,
+      );
+    return {
+      entryId: ensureId(itemObject.entryId, `${itemPath}.entryId`),
+      bucket: ensureEnum(itemObject.bucket, LOOM_POLICY_BUCKETS, `${itemPath}.bucket`),
+      destination: ensureEnum(itemObject.destination, LOOM_POLICY_DESTINATIONS, `${itemPath}.destination`),
+      checkpoint: ensureEnum(itemObject.checkpoint, LOOM_POLICY_CHECKPOINTS, `${itemPath}.checkpoint`),
+      source: parseLoomPolicySource(itemObject.source, `${itemPath}.source`),
+      delivery: parseLoomPolicyDelivery(itemObject.delivery, `${itemPath}.delivery`, budget),
+      effectiveText,
+      ...(retrievalStatus === undefined ? {} : { retrievalStatus }),
+      outcome: parseLoomPromptInspectionOutcome(itemObject.outcome, `${itemPath}.outcome`),
+    };
+  });
+  const itemIds = items.map((item) => item.entryId);
+  assertUniqueIds(itemIds, `${path}.items`);
+  const effectiveEntryIds = ensureArray(
+    object.effectiveEntryIds,
+    `${path}.effectiveEntryIds`,
+    COGNITION_MAX_BLOCK_REFS_TOTAL,
+  ).map((entryId, index) => ensureId(entryId, `${path}.effectiveEntryIds[${index}]`));
+  assertUniqueIds(effectiveEntryIds, `${path}.effectiveEntryIds`);
+  const includedItems = items.filter((item) => item.outcome.status === "included");
+  if (includedItems.length !== effectiveEntryIds.length) {
+    fail("invalid_value", `${path}.effectiveEntryIds`, "must match included inspection items");
+  }
+  for (const item of includedItems) {
+    const effectiveIndex = item.outcome.status === "included" ? item.outcome.effectiveIndex : -1;
+    if (effectiveEntryIds[effectiveIndex] !== item.entryId) {
+      fail("invalid_value", `${path}.effectiveEntryIds`, "included item index does not match its entry ID");
+    }
+  }
+  const responseOmission = object.responseOmission === undefined
+    ? undefined
+    : parseLoomResponsePolicyOmission(object.responseOmission, `${path}.responseOmission`);
+  if (surface === "WORK" && responseOmission !== undefined) {
+    fail("invalid_value", `${path}.responseOmission`, "WORK inspection cannot carry a Response omission");
+  }
+  if (surface === "RESPONSE") {
+    if (!responseOmission) fail("invalid_value", `${path}.responseOmission`, "Response inspection requires omission evidence");
+    if (
+      responseOmission.omittedEntryIds.length !== itemIds.length
+      || responseOmission.omittedEntryIds.some((entryId, index) => entryId !== itemIds[index])
+      || items.some((item) => item.outcome.status !== "omitted")
+    ) {
+      fail("invalid_value", `${path}.responseOmission`, "Response omission evidence does not match inspection items");
+    }
+  }
+  return deepFreeze({
+    version: LOOM_POLICY_VERSION,
+    surface,
+    checkpoint,
+    items,
+    effectiveEntryIds,
+    ...(responseOmission === undefined ? {} : { responseOmission }),
+  });
+}
+
+export function inspectLoomPromptPolicies(
+  policiesValue: unknown,
+  input: LoomPromptInspectionInputV1,
+): LoomPromptInspectionV1 {
+  const policies = parseLoomPolicyBuckets(policiesValue);
+  const checkpoint = ensureEnum(input.checkpoint, LOOM_POLICY_CHECKPOINTS, "inspection.checkpoint");
+  const surface = ensureEnum(input.surface, ["WORK", "RESPONSE"], "inspection.surface");
+  const blocksBySource = new Map<string, LoomPromptInspectionBlockV1>();
+  const contextByKey = new Map<string, LoomPromptInspectionContextPackV1>();
+  if (surface === "WORK") {
+    input.blocks.forEach((block, index) => {
+      const source = parseLoomPolicySource(block.source, `inspection.blocks[${index}].source`);
+      const content = ensureSafeText(block.content, `inspection.blocks[${index}].content`);
+      const key = loomPolicySourceKey(source);
+      const prior = blocksBySource.get(key);
+      if (prior && prior.content !== content) fail("invalid_value", `inspection.blocks[${index}]`, "conflicting Loom block content");
+      blocksBySource.set(key, { source, content });
+    });
+    input.contextPacks.forEach((pack, index) => {
+      const { content: rawContent, ...requestValue } = pack;
+      const request = parseLoomOnDemandRequest(requestValue, `inspection.contextPacks[${index}]`);
+      const content = ensureSafeText(rawContent, `inspection.contextPacks[${index}].content`);
+      const key = loomContextPackKey(request);
+      const prior = contextByKey.get(key);
+      if (prior && prior.content !== content) fail("invalid_value", `inspection.contextPacks[${index}]`, "conflicting context pack content");
+      contextByKey.set(key, { ...request, content });
+    });
+  }
+  const evaluation = input.evaluation === undefined ? undefined : parseCognitionEvaluationContext(input.evaluation);
+  const items: LoomPromptInspectionItemV1[] = [];
+  const effectiveEntryIds: string[] = [];
+  const keptByDestinationAndSource = new Map<string, string>();
+  const flattened = LOOM_POLICY_BUCKETS.flatMap((bucket) => policies[bucket].map((entry) => ({ bucket, entry })));
+  for (const { bucket, entry } of flattened) {
+    if (surface === "RESPONSE") {
+      items.push(loomPromptInspectionItem(entry, bucket, { status: "omitted", reason: "response_mode" }, null));
+      continue;
+    }
+    if (LOOM_CHECKPOINT_RANK[checkpoint] < LOOM_CHECKPOINT_RANK[entry.checkpoint]) {
+      items.push(loomPromptInspectionItem(entry, bucket, { status: "skipped", reason: "checkpoint_not_reached" }, null));
+      continue;
+    }
+    const block = blocksBySource.get(loomPolicySourceKey(entry.source));
+    if (!block) {
+      items.push(loomPromptInspectionItem(entry, bucket, { status: "rejected", reason: entry.required ? "required_source_unavailable" : "stale_source" }, null));
+      continue;
+    }
+    let effectiveText = block.content;
+    let retrievalStatus: LoomOnDemandRetrievalStatusV1 | undefined;
+    if (entry.delivery.delivery === "condition_gated") {
+      if (!evaluation) {
+        items.push(loomPromptInspectionItem(entry, bucket, entry.required
+          ? { status: "rejected", reason: "required_source_unavailable" }
+          : { status: "skipped", reason: "condition_not_met" }, effectiveText));
+        continue;
+      }
+      if (!evaluateCognitionPredicate(entry.delivery.condition, evaluation)) {
+        items.push(loomPromptInspectionItem(entry, bucket, { status: "skipped", reason: "condition_not_met" }, effectiveText));
+        continue;
+      }
+    } else if (entry.delivery.delivery === "on_demand") {
+      const request = entry.delivery.request;
+      const exact = contextByKey.get(loomContextPackKey(request));
+      const sameRevision = [...contextByKey.values()].find((candidate) =>
+        candidate.contextPackId === request.contextPackId && candidate.revisionId === request.revisionId);
+      if (exact) {
+        retrievalStatus = "available";
+        effectiveText = exact.content;
+      } else if (sameRevision) {
+        retrievalStatus = "stale";
+        items.push(loomPromptInspectionItem(entry, bucket, entry.required
+          ? { status: "rejected", reason: "required_source_unavailable" }
+          : { status: "skipped", reason: "on_demand_unavailable" }, null, retrievalStatus));
+        continue;
+      } else {
+        retrievalStatus = "unavailable";
+        items.push(loomPromptInspectionItem(entry, bucket, entry.required
+          ? { status: "rejected", reason: "required_source_unavailable" }
+          : { status: "skipped", reason: "on_demand_unavailable" }, null, retrievalStatus));
+        continue;
+      }
+    }
+    const deduplicationKey = `${entry.destination}\u0000${loomPolicySourceKey(entry.source)}`;
+    const keptEntryId = keptByDestinationAndSource.get(deduplicationKey);
+    if (keptEntryId) {
+      items.push(loomPromptInspectionItem(entry, bucket, {
+        status: "deduplicated",
+        keptEntryId,
+        destination: entry.destination,
+      }, effectiveText, retrievalStatus));
+      continue;
+    }
+    keptByDestinationAndSource.set(deduplicationKey, entry.id);
+    effectiveEntryIds.push(entry.id);
+    items.push(loomPromptInspectionItem(entry, bucket, {
+      status: "included",
+      effectiveIndex: effectiveEntryIds.length - 1,
+    }, effectiveText, retrievalStatus));
+  }
+  const responseOmission: LoomResponsePolicyOmissionV1 | undefined = surface === "RESPONSE"
+    ? {
+      version: LOOM_POLICY_VERSION,
+      surface: "RESPONSE",
+      visibility: "work_only",
+      reason: "work_only",
+      omittedEntryIds: items.map((item) => item.entryId),
+      source: items.map((item) => item.source),
+      omittedPhaseInstructions: [],
+    }
+    : undefined;
+  return deepFreeze({
+    version: LOOM_POLICY_VERSION,
+    surface,
+    checkpoint,
+    items,
+    effectiveEntryIds,
+    ...(responseOmission === undefined ? {} : { responseOmission }),
+  });
+}
+
+export const inspectLoomPrompt = inspectLoomPromptPolicies;
+export const inspectLoomPromptPoliciesV1 = inspectLoomPromptPolicies;
 
 /** Expose the closed enums for route/editor validators without mutable arrays. */
 export const COGNITION_GENERATION_TYPES = Object.freeze([...GENERATION_TYPES]);

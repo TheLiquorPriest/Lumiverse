@@ -12,6 +12,7 @@ import {
   getContextPackRevision,
   importForeignContextPack,
   listContextPackCandidateMetadata,
+  listSelectableContextPackRevisions,
   readContextPackRevisionForUser,
   reviewContextPack,
   updateContextPack,
@@ -469,5 +470,67 @@ describe("context-pack ownership and attachment authority", () => {
       content: [{ id: "entry", title: "Entry", body: "Stale", tags: [] }],
     })).toThrow("current revision is 2");
     expect(getContextPack(USER_ID, created.pack.id)).toMatchObject({ latestRevision: 2 });
+  });
+
+  test("selects and assembles an exact shared revision only while use access remains active", () => {
+    const db = getDb();
+    const sharedUserId = "context-shared-selector";
+    db.query(`INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`)
+      .run(sharedUserId, "Shared selector", "shared-selector@example.test");
+    const created = createContextPack(USER_ID, {
+      name: "Shared selection",
+      content: [{ id: "shared", title: "Shared", body: "Exact shared content", tags: [] }],
+    });
+    db.query("UPDATE agent_context_packs SET visibility = 'account' WHERE user_id = ? AND id = ?")
+      .run(USER_ID, created.pack.id);
+    db.query(`INSERT INTO agent_context_pack_acls
+      (user_id, pack_id, principal_user_id, permission)
+      VALUES (?, ?, ?, 'use')`)
+      .run(USER_ID, created.pack.id, sharedUserId);
+
+    const selectable = listSelectableContextPackRevisions(sharedUserId);
+    const selected = selectable.find((revision) => revision.packId === created.pack.id);
+    expect(selected).toMatchObject({
+      ownerId: USER_ID,
+      source: "shared",
+      packId: created.pack.id,
+      revision: 1,
+    });
+    expect(selected?.digest).toHaveLength(64);
+
+    const snapshot = buildHostPrefetchedAgentContextSnapshot({
+      ownerId: sharedUserId,
+      targetScopes: [],
+      selections: [{
+        packId: created.pack.id,
+        revisionId: `${created.pack.id}@1`,
+        revision: 1,
+        digest: selected!.digest,
+        required: true,
+      }],
+    });
+    expect(snapshot.ownerId).toBe(sharedUserId);
+    expect(snapshot.candidates).toHaveLength(1);
+    expect(snapshot.candidates[0]).toMatchObject({
+      ownerId: USER_ID,
+      source: "account",
+      packId: created.pack.id,
+      revision: 1,
+      required: true,
+    });
+
+    db.query("DELETE FROM agent_context_pack_acls WHERE user_id = ? AND pack_id = ? AND principal_user_id = ?")
+      .run(USER_ID, created.pack.id, sharedUserId);
+    expect(() => buildHostPrefetchedAgentContextSnapshot({
+      ownerId: sharedUserId,
+      targetScopes: [],
+      selections: [{
+        packId: created.pack.id,
+        revisionId: `${created.pack.id}@1`,
+        revision: 1,
+        digest: selected!.digest,
+        required: true,
+      }],
+    })).toThrow("required account context pack is unavailable");
   });
 });

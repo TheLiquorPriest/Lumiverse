@@ -231,6 +231,8 @@ export interface ImportJob {
   fileSummary: Record<string, number>;
   /** Most recent error message if status === 'failed'. */
   error: string | null;
+  /** Durable public failure code from stable_error_code, when present. */
+  errorCode?: string | null;
   /** Abort controller — exposed for cancel endpoint. */
   abort: AbortController;
   ticketGate?: Promise<TicketGateValue | null>;
@@ -758,6 +760,7 @@ function hydrateDurableImportJob(row: ImportControlRow, db: Database): ImportJob
     summary,
     fileSummary,
     error: row.state === "failed" && row.stable_error ? "import failed" : null,
+    errorCode: row.stable_error_code ?? null,
     abort: new AbortController(),
     ticketGateState: "open",
     idempotencyKey: row.idempotency_key,
@@ -4938,6 +4941,7 @@ async function materializeValidatedArchive(job: ImportJob, buf: ImportBuffer): P
                 restoredPath: null,
               });
             }
+            expectedPaths.add(archivePath);
             continue;
           }
           assertArchiveFileRefBytes(ref, fileEntry, archivePath);
@@ -5507,10 +5511,10 @@ function validateLogicalFilePayload(
   const bucket = ref.bucket === "images" || ref.bucket === "thumbnails" || ref.bucket === "avatars" || ref.bucket === "theme-assets" || ref.bucket === "databank"
     ? ref.bucket
     : "artifacts";
-  const expectedMimeType = typeof row.mime_type === "string" && row.mime_type.length > 0
-    ? row.mime_type
-    : ref.bucket === "thumbnails"
-      ? "image/webp"
+  const expectedMimeType = ref.bucket === "thumbnails"
+    ? "image/webp"
+    : typeof row.mime_type === "string" && row.mime_type.length > 0
+      ? row.mime_type
       : null;
   validateSafeMediaFile(fileEntry.stagingPath, {
     filename: archivePath,
@@ -7587,7 +7591,7 @@ function mergeCanonicalImportRow(
     throw new Error(`upsert canonical row has no mutable columns: ${table}`);
   }
   const where = primaryKey.map((column) => `${ident(column)} = ?`).join(" AND ");
-  const updated = db.query(
+  db.query(
     `UPDATE ${ident(table)}
         SET ${mutableColumns.map((column) => `${ident(column)} = ?`).join(", ")}
       WHERE ${where}`,
@@ -7595,7 +7599,11 @@ function mergeCanonicalImportRow(
     ...mutableColumns.map((column) => sqlBinding(row[column])),
     ...primaryKey.map((column) => sqlBinding(existing[column])),
   );
-  if (updated.changes !== 1) throw new Error(`upsert canonical row was not updated: ${table}`);
+  const after = db.query(`SELECT * FROM ${ident(table)} WHERE ${where} LIMIT 1`)
+    .get(...primaryKey.map((column) => sqlBinding(existing[column]))) as Record<string, unknown> | null;
+  if (!after || !canonicalRowsEqual(after, row, columns)) {
+    throw new Error(`upsert canonical row was not updated: ${table}`);
+  }
   return "imported";
 }
 

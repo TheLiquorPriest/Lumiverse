@@ -4,9 +4,11 @@ import { useNavigate, useParams } from 'react-router'
 import { ArrowUp, List, ListChecks, LoaderCircle, Pencil, UserRound } from 'lucide-react'
 import { useStore } from '@/store'
 import { toast } from '@/lib/toast'
+import { agentRunsApi } from '@/api/agent-runs'
+import { generateApi } from '@/api/generate'
 import { chatsApi, messagesApi } from '@/api/chats'
 import { memoryCortexApi, type CortexIngestionStatus } from '@/api/memory-cortex'
-import { generateApi } from '@/api/generate'
+
 import { loadoutsApi } from '@/api/loadouts'
 import { recoverPooledGeneration, recoverAgentActivityRuns } from '@/lib/generation-recovery'
 import { recoverAgentRuns } from '@/lib/agent-run-recovery'
@@ -24,7 +26,7 @@ import WallpaperLayer from '@/components/shared/WallpaperLayer'
 import useSwipeKeyboard from '@/hooks/useSwipeKeyboard'
 import useEditKeyboard from '@/hooks/useEditKeyboard'
 import useIsMobile from '@/hooks/useIsMobile'
-import { AgentRunLiveRegion } from './AgentRunActivity'
+import { AgentRunLiveRegion, AgentRunProvisionalLocator } from './AgentRunActivity'
 import { chatLoreDockMode, chatTopDockMode } from '@/lib/chatSurfaceLayout'
 import { measureLayoutHeight } from '@/lib/uiScale'
 import { resolveCouncilForChat } from '@/hooks/useCouncilProfiles'
@@ -708,7 +710,7 @@ export default function ChatView() {
         // A terminal run may have no target message or the pool entry may have
         // expired before reload. Merge the authenticated status-only fallback.
         if (!cancelled) await recoverAgentActivityRuns(chatId)
-        if (!cancelled) await recoverAgentRuns(chatId)
+        if (!cancelled) await recoverAgentRuns(chatId, agentRunsApi, useStore)
 
         // Opening a chat acknowledges any terminal chat-head state globally so
         // other devices stop showing a stale completed/stopped/error badge too.
@@ -1099,6 +1101,7 @@ export default function ChatView() {
         )}
 
         <div className={styles.chatColumn} data-lumiverse-surface="chat-column">
+          <AgentRunProvisionalLocator chatId={chatId} />
           {(spindleNotice || cortexNotice) && (
             <div className={styles.noticeDock} aria-live="polite" aria-atomic="true">
               {spindleNotice && (

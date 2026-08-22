@@ -252,6 +252,18 @@ export interface ContextPackAccountCandidateMetadataSnapshot {
   readonly items: readonly ContextPackAccountCandidateMetadataResult[];
 }
 
+export interface ContextPackSelectableRevision {
+  readonly ownerId: string;
+  readonly source: "owned" | "shared";
+  readonly packId: string;
+  readonly packName: string;
+  readonly packDescription: string;
+  readonly revision: number;
+  readonly digest: string;
+  readonly byteCount: number;
+  readonly tokenCount: number;
+}
+
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -476,8 +488,9 @@ function resolveAccessiblePackOwnerId(
   userId: string,
   packId: string,
   permission: Extract<ContextPackPermission, "read" | "use">,
+  db: Database = getDb(),
 ): string | null {
-  const row = getDb().query(
+  const row = db.query(
     `SELECT p.user_id, p.visibility, p.state, a.permission
      FROM agent_context_packs p
      LEFT JOIN agent_context_pack_acls a
@@ -592,6 +605,71 @@ export function listContextPacks(userId: string, options: ContextPackListOptions
      ORDER BY updated_at DESC, id ASC LIMIT ? OFFSET ?`,
   ).all(...params, limit, offset) as ContextPackRow[];
   return rows.map(rowToPack);
+}
+
+/**
+ * Exact active revisions the caller may use directly in an Agentic preset.
+ * Management remains owner-only; this projection exposes no pack content.
+ */
+export function listSelectableContextPackRevisions(
+  userId: string,
+  limit = 256,
+  db: Database = getDb(),
+): readonly ContextPackSelectableRevision[] {
+  assertUserId(userId);
+  const boundedLimit = Math.min(256, Math.max(1, Math.trunc(limit)));
+  const rows = db.query(
+    `SELECT
+       p.user_id AS owner_id,
+       p.id AS pack_id,
+       p.name AS pack_name,
+       p.description AS pack_description,
+       r.revision,
+       r.content_digest AS digest,
+       r.byte_count,
+       r.token_count
+     FROM agent_context_packs p
+     JOIN agent_context_pack_revisions r
+       ON r.user_id = p.user_id AND r.pack_id = p.id
+     LEFT JOIN agent_context_pack_acls acl
+       ON acl.user_id = p.user_id
+      AND acl.pack_id = p.id
+      AND acl.principal_user_id = ?
+     WHERE p.state = 'active'
+       AND r.state = 'active'
+       AND (
+         p.user_id = ?
+         OR (
+           p.visibility <> 'private'
+           AND acl.permission IN ('use', 'edit')
+         )
+       )
+     ORDER BY CASE WHEN p.user_id = ? THEN 0 ELSE 1 END,
+              p.name COLLATE NOCASE ASC,
+              p.id ASC,
+              r.revision DESC
+     LIMIT ?`,
+  ).all(userId, userId, userId, boundedLimit) as Array<{
+    owner_id: string;
+    pack_id: string;
+    pack_name: string;
+    pack_description: string;
+    revision: number;
+    digest: string;
+    byte_count: number;
+    token_count: number;
+  }>;
+  return Object.freeze(rows.map((row) => Object.freeze({
+    ownerId: row.owner_id,
+    source: row.owner_id === userId ? "owned" as const : "shared" as const,
+    packId: row.pack_id,
+    packName: row.pack_name,
+    packDescription: row.pack_description,
+    revision: row.revision,
+    digest: row.digest,
+    byteCount: row.byte_count,
+    tokenCount: row.token_count,
+  })));
 }
 
 export function getContextPack(userId: string, packId: string, options: { includeInactive?: boolean } = {}): AgentContextPack | null {
@@ -1159,6 +1237,8 @@ export function readContextPackAccountAccessMetadata(
   ) {
     return null;
   }
+  const ownerId = resolveAccessiblePackOwnerId(userId, packId, "use", db);
+  if (!ownerId) return null;
   const row = db.query(
     `SELECT
        p.user_id AS owner_id,
@@ -1180,7 +1260,7 @@ export function readContextPackAccountAccessMetadata(
        AND r.revision = ?
        AND r.content_digest = ?
      LIMIT 1`,
-  ).get(userId, packId, revision, digest) as {
+  ).get(ownerId, packId, revision, digest) as {
     owner_id: string;
     pack_id: string;
     revision: number;
@@ -1214,7 +1294,7 @@ export function listContextPackAccountCandidateMetadata(
   if (!Array.isArray(selections) || selections.length > 128) {
     throw new ContextPackValidationError("selections", "too many account context selections");
   }
-  const accountRevision = getContextAccountRevision(userId, db);
+  const accountRevision = getContextAclRevision(userId, db);
   const items: ContextPackAccountCandidateMetadataResult[] = [];
   const query = db.query(
     `SELECT
@@ -1240,7 +1320,8 @@ export function listContextPackAccountCandidateMetadata(
       throw new ContextPackValidationError(`selections[${index}]`, "must be an object");
     }
     const required = selection.required !== false;
-    const row = query.get(selection.revision, userId, selection.packId) as {
+    const ownerId = resolveAccessiblePackOwnerId(userId, selection.packId, "use", db);
+    const row = ownerId === null ? null : query.get(selection.revision, ownerId, selection.packId) as {
       pack_id: string;
       pack_name: string;
       pack_description: string;
@@ -1271,7 +1352,7 @@ export function listContextPackAccountCandidateMetadata(
                 : "review_required";
         items.push({
           kind: "omission",
-          ownerId: userId,
+          ownerId: ownerId ?? userId,
           attachmentId: null,
           source: "account",
           targetId: null,
@@ -1284,7 +1365,7 @@ export function listContextPackAccountCandidateMetadata(
     }
     items.push({
       kind: "candidate",
-      ownerId: userId,
+      ownerId: ownerId!,
       attachmentId: null,
       source: "account",
       targetId: null,
@@ -1303,7 +1384,7 @@ export function listContextPackAccountCandidateMetadata(
       byteCount: row.byte_count ?? 0,
       tokenCount: row.token_count ?? 0,
       revisionState: row.revision_state!,
-      aclRevision: accountRevision,
+      aclRevision: getContextAclRevision(ownerId!, db),
       attachmentRevision: null,
     });
   });

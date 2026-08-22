@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { COUNCIL_TOOLS_DEFAULTS, SIDECAR_DEFAULTS } from "lumiverse-spindle-types";
 import {
   AgentRuntimeDecisionService,
   RuntimeDecisionTokenStore,
   normalizeEffectiveRuntimeRequest,
+  resolveLoomRuntimePolicy,
   toPublicRuntimeDecision,
   type RuntimeDecisionDependencies,
 } from "./agent-runtime-decision.service";
@@ -118,6 +120,9 @@ function makeService(options: {
   preset?: TestPreset | null;
   connections?: Record<string, FakeConnection>;
   override?: { mode: "response" | "agentic" | null; revision: number; state: "ready" | "review_required" | "repair_required" } | null;
+  presetReviewState?: "ready" | "review_required" | "repair_required";
+  presetReviewCode?: string | null;
+  presetReviewAcknowledged?: boolean;
   resolveCouncilProfile?: RuntimeDecisionDependencies["resolveCouncilProfile"];
   now?: () => number;
 } = {}) {
@@ -169,7 +174,13 @@ function makeService(options: {
           : [];
         return {
           config: authoredConfig,
-          review: { state: "ready" as const, unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false },
+          review: {
+            state: options.presetReviewState ?? "ready",
+            reasonCode: options.presetReviewCode ?? null,
+            unresolvedSlotIds: [],
+            staleSlotIds: [],
+            acknowledged: options.presetReviewAcknowledged ?? false,
+          },
           configRevision: 1,
           bindings,
         };
@@ -272,6 +283,47 @@ describe("AgentRuntimeDecisionService", () => {
     const expired = await service.consume(USER_ID, issuedExpired.runtimeDecisionToken!, request());
     expect(expired.accepted).toBe(false);
   });
+  test("consumes an authenticated one-turn decision once", async () => {
+    const service = makeService();
+    const issued = await service.resolve(USER_ID, request({
+      mode: "agentic",
+      requestEpoch: 7,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 7,
+        authenticated: true,
+      },
+    }));
+
+    const accepted = await service.consume(USER_ID, issued.runtimeDecisionToken!, request({
+      mode: "agentic",
+      requestEpoch: 7,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 7,
+        authenticated: true,
+      },
+    }));
+    expect(accepted.accepted).toBe(true);
+    expect(accepted.code).toBe("accepted");
+    expect(accepted.decision?.runtimePolicy.source).toBe("authenticated_one_turn");
+
+    const replayed = await service.consume(USER_ID, issued.runtimeDecisionToken!, request({
+      mode: "agentic",
+      requestEpoch: 7,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 7,
+        authenticated: true,
+      },
+    }));
+    expect(replayed).toEqual({
+      accepted: false,
+      code: "decision_refresh_required",
+      decision: null,
+    });
+  });
+
 
   test("rejects legacy group metadata before issuing an Agentic token", async () => {
     const decision = await makeService({
@@ -282,14 +334,35 @@ describe("AgentRuntimeDecisionService", () => {
     expect(decision.runtimeDecisionToken).toBeNull();
     expect(decision.repairCodes).toContain("agentic_target_unsupported");
   });
-
   test("rejects an active owner-scoped Council profile without metadata flags", async () => {
+    const councilSettings = {
+      councilMode: true,
+      members: [{
+        id: "member-a",
+        packId: "pack-a",
+        packName: "Pack A",
+        itemId: "item-a",
+        itemName: "Member A",
+        tools: ["test-tool"],
+        role: "test",
+        chance: 100,
+      }],
+      toolsSettings: { ...COUNCIL_TOOLS_DEFAULTS },
+    };
+    const sidecarSettings = {
+      ...SIDECAR_DEFAULTS,
+      connectionProfileId: "council-sidecar",
+    };
     const decision = await makeService({
       resolveCouncilProfile: () => ({
-        council_settings: {
-          councilMode: true,
-          members: [{ tools: [] }],
+        binding: {
+          council_settings: councilSettings,
+          sidecar_settings: sidecarSettings,
+          captured_at: 1_000,
         },
+        source: "defaults",
+        council_settings: councilSettings,
+        sidecar_settings: sidecarSettings,
       }),
     }).resolve(USER_ID, request());
 
@@ -384,6 +457,185 @@ describe("AgentRuntimeDecisionService", () => {
     ]));
   });
 
+  test("escapes Agentic for a null-mode import tombstone override", async () => {
+    const service = makeService({
+      override: { mode: null, revision: 1, state: "review_required" },
+    });
+    const decision = await service.resolve(USER_ID, request());
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.capabilityReadiness.ready).toBe(false);
+    expect(decision.repairCodes).toContain("agentic_response_escape");
+  });
+
+  test("does not escape Agentic when a chat override is missing", async () => {
+    const service = makeService({ override: null });
+    const decision = await service.resolve(USER_ID, request());
+    expect(decision.effectiveMode).toBe("agentic");
+    expect(decision.capabilityReadiness.ready).toBe(true);
+    expect(decision.repairCodes).not.toContain("agentic_response_escape");
+  });
+
+
+  test("still escapes Agentic when a review-required override still carries a mode", async () => {
+    const service = makeService({
+      override: { mode: "agentic", revision: 1, state: "review_required" },
+    });
+    const decision = await service.resolve(USER_ID, request());
+
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.capabilityReadiness.ready).toBe(false);
+    expect(decision.repairCodes).toContain("agentic_response_escape");
+  });
+  test("records one-turn provenance without persisting it over the durable chat choice", async () => {
+    const service = makeService({
+      override: { mode: "response", revision: 3, state: "ready" },
+    });
+    const oneTurn = await service.resolve(USER_ID, request({
+      mode: "agentic",
+      requestEpoch: 17,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 17,
+        authenticated: true,
+      },
+    }));
+
+    expect(oneTurn.runtimePolicy).toMatchObject({
+      authoredValue: "agentic",
+      effectiveValue: "agentic",
+      source: "authenticated_one_turn",
+      scope: "turn",
+      cap: { authority: "host" },
+      availability: { state: "available" },
+      nextTurnOnly: true,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 17,
+        authenticated: true,
+      },
+      durableChatOverride: {
+        mode: "response",
+        revision: 3,
+        state: "ready",
+      },
+    });
+
+    const nextTurn = await service.resolve(USER_ID, request({
+      mode: undefined,
+      transientSelection: null,
+      requestEpoch: 18,
+    }));
+    expect(nextTurn.runtimePolicy).toMatchObject({
+      authoredValue: "response",
+      effectiveValue: "response",
+      source: "durable_chat_override",
+      scope: "chat",
+      nextTurnOnly: true,
+      transientSelection: null,
+    });
+    expect(service.getChatAgentModeOverride(USER_ID, CHAT_ID)).toMatchObject({
+      mode: "response",
+      revision: 3,
+    });
+  });
+
+  test("keeps repair acknowledgement separate from an unavailable mode choice", () => {
+    const policy = resolveLoomRuntimePolicy({
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 21,
+        authenticated: true,
+      },
+      durableChatOverride: {
+        mode: "response",
+        revision: 2,
+        state: "ready",
+        reviewCode: null,
+        acknowledged: true,
+      },
+      presetDefault: "response",
+      presetRevision: 9,
+      presetState: "repair_required",
+      presetRepairCode: "loom_policy_invalid",
+      hostAllowedModes: ["response"],
+      hostAvailability: "unavailable",
+      hostReasonCode: "loom_policy_unavailable",
+      repairAcknowledgement: {
+        state: "acknowledged",
+        presetRevision: 9,
+        reasonCode: "loom_policy_invalid",
+        acknowledgedAt: 1234,
+      },
+    });
+
+    expect(policy).toMatchObject({
+      authoredValue: "agentic",
+      effectiveValue: "response",
+      source: "host_rejected",
+      scope: "host",
+      availability: {
+        state: "unavailable",
+        reasonCode: "loom_policy_unavailable",
+      },
+      repairAcknowledgement: {
+        state: "acknowledged",
+        presetRevision: 9,
+        reasonCode: "loom_policy_invalid",
+        acknowledgedAt: 1234,
+      },
+      nextTurnOnly: true,
+    });
+  });
+
+
+
+  test("persists repair acknowledgement independently of runtime mode", async () => {
+    const service = makeService({
+      now: () => 1_234,
+      presetReviewState: "review_required",
+      presetReviewCode: "loom_policy_repair_required",
+    });
+    getDb().run(
+      `INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`,
+      [USER_ID, "Test User", "user-a@example.test"],
+    );
+    getDb().run(
+      `INSERT INTO presets (id, name, provider, user_id, cache_revision) VALUES (?, ?, ?, ?, ?)`,
+      ["preset-default", "Default", "test", USER_ID, 3],
+    );
+    const acknowledgement = service.acknowledgeRuntimeRepair(
+      USER_ID,
+      "preset-default",
+      3,
+      "loom_policy_repair_required",
+    );
+
+    expect(acknowledgement).toEqual({
+      presetId: "preset-default",
+      presetRevision: 3,
+      reasonCode: "loom_policy_repair_required",
+      acknowledgedAt: 1_234,
+      revision: 1,
+      scope: "repair/review",
+      state: "acknowledged",
+    });
+
+    const decision = await service.resolve(USER_ID, request({
+      mode: "agentic",
+      requestEpoch: 2,
+    }));
+    expect(decision.runtimePolicy).toMatchObject({
+      authoredValue: "agentic",
+      effectiveValue: "response",
+      repairAcknowledgement: {
+        state: "acknowledged",
+        presetRevision: 3,
+        reasonCode: "loom_policy_repair_required",
+        acknowledgedAt: 1_234,
+      },
+    });
+  });
+
   test("public projection redacts credential references and trust fingerprints", async () => {
     const service = makeService();
     const decision = await service.resolve(USER_ID, request({ mode: "response" }));
@@ -419,4 +671,31 @@ describe("effective runtime request DTO", () => {
     });
     expect(() => normalizeEffectiveRuntimeRequest({ chatId: CHAT_ID, chat_id: "different" })).toThrow("chatId has conflicting aliases");
   });
+  test("rejects unauthenticated or open transient selections", () => {
+    expect(() => normalizeEffectiveRuntimeRequest({
+      chatId: CHAT_ID,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 1,
+        authenticated: false,
+      },
+    })).toThrow("transientSelection is invalid");
+    expect(() => normalizeEffectiveRuntimeRequest({
+      chatId: CHAT_ID,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 1,
+        authenticated: true,
+        persisted: true,
+      },
+    })).toThrow("transientSelection.persisted is not allowed");
+    expect(() => normalizeEffectiveRuntimeRequest({
+      chatId: CHAT_ID,
+      transientSelection: {
+        mode: "agentic",
+        authenticated: true,
+      },
+    })).toThrow("transientSelection.turnFence is required");
+  });
+
 });

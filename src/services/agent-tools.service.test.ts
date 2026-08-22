@@ -13,7 +13,9 @@ import {
   CORE_AGENT_TOOL_CATALOG,
   createAgentToolSnapshot,
   executeCoreAgentTool,
+  getCoreAgentToolDefinitions,
   renderAgentLoreText,
+  safeToolInspectionValue,
 } from "./agent-tools.service";
 import * as worldBooksSvc from "./world-books.service";
 
@@ -600,6 +602,25 @@ describe("agent core tools", () => {
     });
   });
 
+  test("removes nested credential fields from owner-visible inspection values", () => {
+    const sanitized = safeToolInspectionValue({
+      status: "success",
+      nested: {
+        apiKey: "must-not-leak",
+        authorization: "Bearer must-not-leak",
+        safe: "visible",
+        rows: [{ private_key: "must-not-leak", value: "visible-row" }],
+      },
+    });
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).toContain("visible");
+    expect(serialized).toContain("visible-row");
+    expect(serialized).not.toContain("must-not-leak");
+    expect(serialized).not.toContain("apiKey");
+    expect(serialized).not.toContain("authorization");
+    expect(serialized).not.toContain("private_key");
+  });
+
   test("every provider definition is strict and colon-free", () => {
     for (const [name, catalog] of Object.entries(CORE_AGENT_TOOL_CATALOG)) {
       expect(name).not.toContain(":");
@@ -650,5 +671,20 @@ describe("agent core tools", () => {
       status: "error",
       errorCode: "invalid_arguments",
     });
+  });
+  test("keeps delegation and external tools outside the ordinary catalog boundary", async () => {
+    const unsupported = ["agent_delegate", "council_call", "mcp_call", "spindle_tool"] as const;
+    for (const name of unsupported) {
+      expect(Object.keys(CORE_AGENT_TOOL_CATALOG)).not.toContain(name);
+      await expect(
+        executeCoreAgentTool(name as never, {}, {
+          snapshot: snapshot(),
+          grant: { toolIds: ["lore_list_books"], loreScope: "active" },
+        }),
+      ).resolves.toMatchObject({ status: "error", errorCode: "unauthorized" });
+    }
+    expect(() => getCoreAgentToolDefinitions(["agent_delegate"] as never)).toThrow(
+      "tool_not_in_catalog",
+    );
   });
 });

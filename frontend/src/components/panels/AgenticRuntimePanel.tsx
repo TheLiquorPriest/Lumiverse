@@ -11,9 +11,9 @@ import { useTranslation } from 'react-i18next'
 import {
   AlertTriangle,
   Bot,
-  Boxes,
   Check,
   ChevronDown,
+  ChevronUp,
   ClipboardCheck,
   FileStack,
   Gauge,
@@ -26,6 +26,7 @@ import {
   Wrench,
 } from 'lucide-react'
 import clsx from 'clsx'
+import type { ProviderInfo } from '@/types/api'
 import ConnectionSelect from '@/components/shared/ConnectionSelect'
 import { Toggle } from '@/components/shared/Toggle'
 import { useStore } from '@/store'
@@ -34,10 +35,14 @@ import { agentContextPacksApi } from '@/api/agent-context-packs'
 import { ApiError } from '@/api/client'
 import { unmarshalPreset } from '@/lib/loom/service'
 import type { ContextPackAttachment } from '@/types/agent-context-packs'
+import { toast } from '@/lib/toast'
 import {
   AGENTIC_CONTEXT_RULE_LIMIT,
+  AGENTIC_CUSTOM_PHASE_LIMIT,
   AGENTIC_DESCRIPTION_MAX_BYTES,
   AGENTIC_LABEL_MAX_LENGTH,
+  AGENTIC_LOOM_POLICY_BUCKET_LIMIT,
+  AGENTIC_LOOM_POLICY_LIMIT,
   AGENTIC_TASK_TEMPLATE_LIMIT,
   AGENT_INVOCATION_MIN,
   AGENT_MAX_OUTPUT_TOKENS_MAX,
@@ -53,7 +58,11 @@ import {
   createAgentPromptBlock,
   createAgentProfileV2,
   createAgenticRuntimeDraft,
-  normalizeAgentConfigForEditor,
+  createLoomPolicyEntryV1,
+  parseAgentCustomPhasesV1,
+  parseLoomPolicyBucketsV1,
+  getAgentRuntimeCustomPhases,
+  getAgentRuntimePolicyBuckets,
   getAgentResultName,
   getAgenticRuntimeRepairItems,
   isAgentContextActivationRule,
@@ -61,21 +70,28 @@ import {
   isAgentContextPolicy,
   isAgentTaskTemplate,
   isCanonicalBlockRevision,
+  normalizeAgentConfigForEditor,
   parseAgentMaxInvocationsInput,
   parseAgentMaxToolCallsInput,
   parseAgentTimeoutSecondsInput,
   removeAgentProfileMarkers,
+  requiredReviewAcknowledgements,
   rewriteAgentProfileMarkers,
   rewriteTaskTransitionReferences,
   runtimeDraftFingerprint,
+  setAgentRuntimeCustomPhases,
+  setAgentRuntimePolicyBuckets,
   validateAgenticRuntimeDraft,
 } from '@/lib/loom/agenticRuntime'
 import type {
   AgentCapability,
   AgentConfigRepairItem,
+  AgentConfigV2,
   AgentContextActivationRule,
   AgentContextPackSelection,
   AgentContextPolicyV1,
+  AgentCustomPhaseCapability,
+  AgentCustomPhaseV1,
   AgentMode,
   AgentProfileConfigV2,
   AgentTaskTemplate,
@@ -89,8 +105,14 @@ import type {
   PromptBlock,
   WorkspaceCapability,
 } from '@/lib/loom/types'
-import type { ProviderInfo } from '@/types/api'
-import { WORKSPACE_CAPABILITIES } from '@/lib/loom/types'
+import type {
+  LoomOnDemandRequestV1,
+  LoomPolicyBucketsV1,
+  LoomPolicyDeliveryV1,
+  LoomPolicyEntryV1,
+  LoomPolicySourceV1,
+} from '@/types/agent-runtime'
+import { AGENT_CUSTOM_PHASE_CAPABILITIES, WORKSPACE_CAPABILITIES } from '@/lib/loom/types'
 import styles from './AgenticRuntimePanel.module.css'
 
 const SECTION_IDS = [
@@ -98,7 +120,6 @@ const SECTION_IDS = [
   'agents',
   'tools',
   'phases',
-  'context',
   'tasks',
   'workspace',
   'repair',
@@ -109,6 +130,7 @@ const SAVE_VALIDATION_REASON_ID = 'agentic-runtime-save-validation-reason'
 
 type SectionId = (typeof SECTION_IDS)[number]
 type PolicyKey = 'workPolicy' | 'workspaceUsage' | 'completionCriteria' | 'renderPolicy'
+const RUNTIME_POLICY_KEYS = new Set(['version', 'authority', 'scope', 'defaultMode', 'loomPolicy', 'phases'])
 
 const POLICY_KEYS: readonly PolicyKey[] = [
   'workPolicy',
@@ -116,6 +138,18 @@ const POLICY_KEYS: readonly PolicyKey[] = [
   'completionCriteria',
   'renderPolicy',
 ]
+const POLICY_DESTINATIONS = {
+  workPolicy: 'root_work',
+  workspaceUsage: 'root_work',
+  completionCriteria: 'completion_handoff',
+  renderPolicy: 'render',
+} as const
+const POLICY_CHECKPOINTS = {
+  workPolicy: 'WORK',
+  workspaceUsage: 'WORK',
+  completionCriteria: 'PREPARE_COMMIT',
+  renderPolicy: 'RENDER',
+} as const
 
 const WORKSPACE_TOOL_KEYS: Record<WorkspaceCapability, string> = {
   read_section: 'workspace_read_section',
@@ -131,6 +165,8 @@ const WORKSPACE_TOOL_KEYS: Record<WorkspaceCapability, string> = {
   propose_publication: 'workspace_propose_publication',
 }
 type ContextPackOption = AgentContextPackSelection & {
+  ownerId?: string
+  selectionSource?: 'owned' | 'shared'
   scopes: ContextPackAttachment['scope'][]
   requiredScopes: ContextPackAttachment['scope'][]
   attachmentStatus?: 'available' | 'unavailable'
@@ -156,6 +192,9 @@ function contextAttachmentLabel(
   option: ContextPackOption | undefined,
   translate: (key: string) => string,
 ): string {
+  if (option?.selectionSource) {
+    return translate(`context.sources.${option.selectionSource}`)
+  }
   if (!option || option.attachmentStatus === 'unavailable' || !Array.isArray(option.requiredScopes)) {
     return translate('context.attachmentUnavailable')
   }
@@ -172,7 +211,6 @@ const SECTION_ICONS: Record<SectionId, typeof Gauge> = {
   agents: Bot,
   tools: Wrench,
   phases: FileStack,
-  context: Boxes,
   tasks: ListChecks,
   workspace: ShieldCheck,
   repair: Link2,
@@ -250,6 +288,64 @@ function repairTaskTransitionReferencesAfterRemoval<T extends { activation?: Cog
   const repaired = { ...value }
   delete repaired.activation
   return repaired
+}
+
+function rewriteRuntimePolicyTaskReferences(
+  config: AgentConfigV2,
+  previousId: string,
+  nextId: string,
+): AgentConfigV2 {
+  const rawRuntimePolicy = (config as unknown as Record<string, unknown>).runtimePolicy
+  if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
+    return config
+  }
+  const runtimePolicy = rawRuntimePolicy as Record<string, unknown>
+  try {
+    const phases = parseAgentCustomPhasesV1(runtimePolicy.phases).map((phase) => ({
+      ...phase,
+      enter: rewriteTaskTransitionReferences(phase.enter, previousId, nextId) as CognitionPredicate,
+      exit: rewriteTaskTransitionReferences(phase.exit, previousId, nextId) as CognitionPredicate,
+      ...(phase.skip === undefined
+        ? {}
+        : { skip: rewriteTaskTransitionReferences(phase.skip, previousId, nextId) as CognitionPredicate }),
+    }))
+    const loomPolicy = runtimePolicy.loomPolicy === null
+      ? null
+      : parseLoomPolicyBucketsV1(runtimePolicy.loomPolicy)
+    const rewriteBucket = (bucket: PolicyKey): LoomPolicyEntryV1[] => (
+      (loomPolicy?.[bucket] ?? []).map((entry) => entry.delivery.delivery === 'condition_gated'
+        ? {
+            ...entry,
+            delivery: {
+              ...entry.delivery,
+              condition: rewriteTaskTransitionReferences(
+                entry.delivery.condition,
+                previousId,
+                nextId,
+              ) as CognitionPredicate,
+            },
+          }
+        : entry)
+    )
+    return {
+      ...config,
+      runtimePolicy: {
+        ...runtimePolicy,
+        phases,
+        loomPolicy: loomPolicy === null
+          ? null
+          : {
+              version: 1,
+              workPolicy: rewriteBucket('workPolicy'),
+              workspaceUsage: rewriteBucket('workspaceUsage'),
+              completionCriteria: rewriteBucket('completionCriteria'),
+              renderPolicy: rewriteBucket('renderPolicy'),
+            },
+      },
+    } as unknown as AgentConfigV2
+  } catch {
+    return config
+  }
 }
 
 
@@ -588,7 +684,7 @@ function PredicateEditor({
             aria-label={t('predicate.transition')}
             onChange={(event) => onChange({ ...value, transition: event.target.value as typeof value.transition })}
           >
-            {(['pending', 'active', 'blocked', 'submitted', 'accepted', 'done'] as const).map((transition) => (
+            {(['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed'] as const).map((transition) => (
               <option key={transition} value={transition}>{t(`predicate.transitions.${transition}`)}</option>
             ))}
           </select>
@@ -685,33 +781,45 @@ function RepairRow({
   item,
   acknowledged,
   onAcknowledge,
+  onRepair,
 }: {
   item: AgentConfigRepairItem
   acknowledged: boolean
   onAcknowledge: (checked: boolean) => void
+  onRepair?: () => void
 }) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agenticRuntime' })
   const kindLabel = t(`repair.kinds.${item.kind}`, { defaultValue: t('repair.kinds.unknown') })
   const reasonLabel = t(`repair.reasons.${item.reasonCode}`, { defaultValue: t('repair.reasons.unknown') })
   const actionLabel = t(`repair.actions.${item.action.kind}`, { defaultValue: t('repair.actions.unknown') })
+  const hasRepairAction = item.action.kind === 'select_revision' && onRepair !== undefined
+  const repairActionLabel = item.id.startsWith('loom-policy:')
+    && item.reasonCode !== 'stale_policy_source'
+    ? t('repair.actions.discard')
+    : actionLabel
   return (
     <li className={styles.repairItem}>
       <AlertTriangle size={18} aria-hidden="true" />
       <span className={styles.repairCopy}>
         <strong>{kindLabel}</strong>
         <small>{reasonLabel}</small>
+        {item.label && <code className={styles.repairPath}>{item.label}</code>}
       </span>
-      {item.action.kind !== 'acknowledge' && item.kind !== 'disabled_import' && (
+      {hasRepairAction ? (
+        <button type="button" className={styles.button} onClick={() => onRepair?.()}>{repairActionLabel}</button>
+      ) : item.action.kind !== 'acknowledge' && item.kind !== 'disabled_import' ? (
         <span className={styles.actionBadge}>{actionLabel}</span>
+      ) : null}
+      {!hasRepairAction && (
+        <label className={styles.acknowledge}>
+          <input
+            type="checkbox"
+            checked={acknowledged}
+            onChange={(event) => onAcknowledge(event.target.checked)}
+          />
+          {t('repair.acknowledge')}
+        </label>
       )}
-      <label className={styles.acknowledge}>
-        <input
-          type="checkbox"
-          checked={acknowledged}
-          onChange={(event) => onAcknowledge(event.target.checked)}
-        />
-        {t('repair.acknowledge')}
-      </label>
     </li>
   )
 }
@@ -907,21 +1015,22 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const draftContextRules = Array.isArray(draft.contextRules)
     ? draft.contextRules as AgentContextActivationRule[]
     : []
-  const draftTaskTemplates = Array.isArray(draft.taskTemplates) ? draft.taskTemplates : []
-  const draftAllowedModes = Array.isArray(draftConfigRecord.allowedModes)
-    ? draftConfigRecord.allowedModes.filter((mode): mode is AgentMode => mode === 'response' || mode === 'agentic')
-    : ['response' as const]
   const draftMainToolIds = Array.isArray(draftConfigRecord.mainToolIds)
     ? draftConfigRecord.mainToolIds.filter((toolId): toolId is CoreAgentToolId => CORE_AGENT_TOOL_IDS.includes(toolId as CoreAgentToolId))
     : []
   const draftConnectionSlots = Array.isArray(draftConfigRecord.connectionSlots)
     ? draftConfigRecord.connectionSlots
     : []
-  const draftCognitionPolicy = draftConfigRecord.cognitionPolicy
-    && typeof draftConfigRecord.cognitionPolicy === 'object'
-    && !Array.isArray(draftConfigRecord.cognitionPolicy)
-    ? draftConfigRecord.cognitionPolicy as Record<string, unknown>
-    : {}
+  const draftTaskTemplates = draft.taskTemplates
+  const draftAllowedModes = draft.config.allowedModes
+  const draftLoomPolicy = useMemo(
+    () => getAgentRuntimePolicyBuckets(draft.config, promptOrder),
+    [draft.config, promptOrder],
+  )
+  const draftCustomPhases = useMemo(
+    () => getAgentRuntimeCustomPhases(draft.config),
+    [draft.config],
+  )
   const availableContextRevisionKeys = useMemo(() => {
     if (!contextAvailabilityLoaded) return undefined
     return new Set(availableContextPacks
@@ -930,12 +1039,15 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }, [availableContextPacks, contextAvailabilityLoaded])
   const presetRepairItems = useMemo(() => getAgenticRuntimeRepairItems(preset), [preset])
   const [editorReviewItems, setEditorReviewItems] = useState(presetRepairItems)
-  const reviewItems = useMemo(() => editorReviewItems.filter((item) => {
+  const projectedReviewItems = useMemo(() => editorReviewItems.filter((item) => {
     const slotId = reviewSlotId(item)
     if (slotId === null || draftSlotBindings[slotId] == null) return true
     return item.kind === 'stale_slot' ? !repairedSlotIds.has(slotId) : false
   }), [draftSlotBindings, editorReviewItems, repairedSlotIds])
-  const requiredReviewIds = useMemo(() => reviewItems.map((item) => item.id), [reviewItems])
+  const requiredReviewIds = useMemo(
+    () => requiredReviewAcknowledgements(projectedReviewItems.map((item) => item.id), draft.reviewAcknowledgements),
+    [draft.reviewAcknowledgements, projectedReviewItems],
+  )
   const validation = useMemo(() => validateAgenticRuntimeDraft(
     draft,
     promptOrder,
@@ -943,7 +1055,29 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     requiredReviewIds,
     availableContextRevisionKeys,
   ), [availableContextRevisionKeys, draft, promptOrder, preset.cacheRevision, requiredReviewIds])
-  const unacknowledgedReviewItems = reviewItems.filter((item) => !draft.reviewAcknowledgements.includes(item.id))
+  const policyRepairItems = useMemo<AgentConfigRepairItem[]>(() => {
+    const seen = new Set<string>()
+    return validation.issues
+      .filter((issue) => issue.path.startsWith('config.runtimePolicy'))
+      .filter((issue) => {
+        if (seen.has(issue.path)) return false
+        seen.add(issue.path)
+        return true
+      })
+      .map((issue) => ({
+        id: `loom-policy:${issue.path}`,
+        kind: issue.code === 'stale_policy_source' ? 'stale_block' as const : 'invalid_rule' as const,
+        label: issue.path,
+        reasonCode: issue.code,
+        action: { kind: 'select_revision' as const },
+        acknowledged: false,
+      }))
+  }, [validation.issues])
+  const reviewItems = useMemo(
+    () => [...projectedReviewItems, ...policyRepairItems],
+    [policyRepairItems, projectedReviewItems],
+  )
+  const unacknowledgedReviewItems = reviewItems.filter((item) => item.id.startsWith('loom-policy:') || !draft.reviewAcknowledgements.includes(item.id))
   const selectedProfile = draftProfiles[selectedProfileIndex] ?? null
   const taskTemplateIds = draftTaskTemplates.flatMap((template) => isAgentTaskTemplate(template) ? [template.id] : [])
   const maxInvocationsInvalid = Number.isNaN(parseAgentMaxInvocationsInput(maxInvocationsInput))
@@ -1061,52 +1195,21 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       setIsHydrated(true)
       setSaveState('idle')
     })
-    void agentContextPacksApi.list().then(async ({ data }) => {
-      const details = await Promise.all(data
-        .filter((pack) => pack.state === 'active')
-        .map((pack) => agentContextPacksApi.get(pack.id)))
+    void agentContextPacksApi.listSelectable().then(({ data }) => {
       if (!active) return
-      const available = details.flatMap(({ pack, revisions, attachments }) => revisions
-        .filter((revision) => revision.state === 'active')
-        .flatMap((revision): ContextPackOption[] => {
-          const matching = (Array.isArray(attachments) ? attachments : []).filter((candidate) => (
-            candidate.packId === pack.id
-            && candidate.revision === revision.revision
-            && candidate.scope === 'preset'
-            && candidate.targetId === preset.id
-          ))
-          const attached = matching.filter((candidate) => candidate.state === 'active')
-          if (attached.length === 0) return []
-          const malformedAttachment = attached.some((candidate) => (
-            !isContextPackScope(candidate.scope) || typeof candidate.required !== 'boolean'
-          ))
-          if (malformedAttachment) {
-            return [{
-              packId: pack.id,
-              revisionId: contextPackRevisionId(pack.id, revision.revision),
-              revision: revision.revision,
-              label: pack.name,
-              revisionLabel: t('context.revisionLabel', { revision: revision.revision }),
-              digest: revision.contentDigest,
-              scopes: [],
-              requiredScopes: [],
-              attachmentStatus: 'unavailable' as const,
-            }]
-          }
-          const scopes = [...new Set(attached.map((candidate) => candidate.scope))]
-          const requiredScopes = [...new Set(attached.filter((candidate) => candidate.required).map((candidate) => candidate.scope))]
-          return [{
-            packId: pack.id,
-            revisionId: contextPackRevisionId(pack.id, revision.revision),
-            revision: revision.revision,
-            label: pack.name,
-            revisionLabel: t('context.revisionLabel', { revision: revision.revision }),
-            digest: revision.contentDigest,
-            scopes,
-            requiredScopes,
-            attachmentStatus: 'available' as const,
-          }]
-        }))
+      const available: ContextPackOption[] = data.map((candidate) => ({
+        ownerId: candidate.ownerId,
+        selectionSource: candidate.source,
+        packId: candidate.packId,
+        revisionId: contextPackRevisionId(candidate.packId, candidate.revision),
+        revision: candidate.revision,
+        label: candidate.packName,
+        revisionLabel: t('context.revisionLabel', { revision: candidate.revision }),
+        digest: candidate.digest,
+        scopes: [],
+        requiredScopes: [],
+        attachmentStatus: 'available',
+      }))
       const currentSelections = Array.isArray(draftRef.current.contextPackSelections)
         ? draftRef.current.contextPackSelections as AgentContextPackSelection[]
         : []
@@ -1149,7 +1252,34 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }
 
   const updateConfig = (updater: (current: AgenticRuntimeSaveDraft['config']) => AgenticRuntimeSaveDraft['config']) => {
-    updateDraft((current) => ({ ...current, config: updater(current.config) }))
+    updateDraft((current) => {
+      const nextConfig = updater(current.config)
+      const rawRuntimePolicy = (nextConfig as unknown as Record<string, unknown>).runtimePolicy
+      if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
+        return { ...current, config: nextConfig }
+      }
+      const runtimePolicy = rawRuntimePolicy as Record<string, unknown>
+      try {
+        if (Object.keys(runtimePolicy).some((key) => !RUNTIME_POLICY_KEYS.has(key))
+          || runtimePolicy.version !== 1
+          || runtimePolicy.authority !== 'loom'
+          || runtimePolicy.scope !== 'preset'
+          || runtimePolicy.defaultMode !== current.config.defaultMode) {
+          return { ...current, config: nextConfig }
+        }
+        parseAgentCustomPhasesV1(runtimePolicy.phases)
+        if (runtimePolicy.loomPolicy !== null) parseLoomPolicyBucketsV1(runtimePolicy.loomPolicy)
+        return {
+          ...current,
+          config: {
+            ...nextConfig,
+            runtimePolicy: { ...runtimePolicy, defaultMode: nextConfig.defaultMode },
+          } as AgentConfigV2,
+        }
+      } catch {
+        return { ...current, config: nextConfig }
+      }
+    })
   }
 
   const updateProfile = (updater: (profile: AgentProfileConfigV2) => AgentProfileConfigV2) => {
@@ -1197,39 +1327,348 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     })
   }
 
-  const togglePolicyBlock = (policyKey: PolicyKey, block: PromptBlock, checked: boolean) => {
+  const updatePolicyEntry = (
+    policyKey: PolicyKey,
+    blockId: string,
+    updater: (entry: LoomPolicyEntryV1) => LoomPolicyEntryV1,
+  ) => {
     updateConfig((config) => {
-      const rawPolicy: unknown = config.cognitionPolicy
-      const policy = rawPolicy && typeof rawPolicy === 'object' && !Array.isArray(rawPolicy)
-        ? rawPolicy as AgenticRuntimeSaveDraft['config']['cognitionPolicy']
-        : {
-            workPolicy: [],
-            workspaceUsage: [],
-            completionCriteria: [],
-            renderPolicy: [],
-          }
-      const currentRefs = Array.isArray(policy?.[policyKey]) ? policy[policyKey] : []
-      if (checked) {
-        if (currentRefs.some((ref) => ref.blockId === block.id)) return config
-        const expectedBlockRevision = block.revision === undefined ? 1 : block.revision
-        if (!isCanonicalBlockRevision(expectedBlockRevision)) return config
-        return {
-          ...config,
-          cognitionPolicy: { ...policy, [policyKey]: [...currentRefs, {
-            blockId: block.id,
-            expectedPresetRevision: preset.cacheRevision ?? 0,
-            expectedBlockRevision,
-          }] },
-        }
-      }
-      return {
-        ...config,
-        cognitionPolicy: { ...policy, [policyKey]: currentRefs.filter((ref) => ref.blockId !== block.id) },
-      }
+      const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
+      const entries = buckets[policyKey]
+      const index = entries.findIndex((entry) => entry.source.blockId === blockId)
+      if (index < 0) return config
+      const nextEntries = entries.map((entry, entryIndex) => (
+        entryIndex === index ? updater(entry) : entry
+      ))
+      return setAgentRuntimePolicyBuckets(config, {
+        ...buckets,
+        [policyKey]: nextEntries,
+      })
     })
   }
+
+  const togglePolicyBlock = (policyKey: PolicyKey, block: PromptBlock, checked: boolean) => {
+    updateConfig((config) => {
+      const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
+      const currentEntries = buckets[policyKey]
+      const existing = currentEntries.find((entry) => entry.source.blockId === block.id)
+      const totalEntries = POLICY_KEYS.reduce((total, bucket) => total + buckets[bucket].length, 0)
+      if (checked) {
+        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
+        if (promptIndex < 0) return config
+        const entry = createLoomPolicyEntryV1(
+          policyKey,
+          block,
+          preset.cacheRevision ?? 0,
+          promptIndex,
+          existing,
+        )
+        if (existing) {
+          return setAgentRuntimePolicyBuckets(config, {
+            ...buckets,
+            [policyKey]: currentEntries.map((candidate) => candidate.id === existing.id ? entry : candidate),
+          })
+        }
+        if (currentEntries.length >= AGENTIC_LOOM_POLICY_BUCKET_LIMIT) {
+          toast.error(t('limits.policyBucket'))
+          return config
+        }
+        if (totalEntries >= AGENTIC_LOOM_POLICY_LIMIT) {
+          toast.error(t('limits.policyTotal'))
+          return config
+        }
+        return setAgentRuntimePolicyBuckets(config, {
+          ...buckets,
+          [policyKey]: [...currentEntries, entry],
+        })
+      }
+      return setAgentRuntimePolicyBuckets(config, {
+        ...buckets,
+        [policyKey]: currentEntries.filter((entry) => entry.source.blockId !== block.id),
+      })
+    })
+  }
+  const repairLoomPolicy = () => {
+    updateConfig((config) => {
+      const rawRuntimePolicy: unknown = config.runtimePolicy
+      let currentPhases: readonly AgentCustomPhaseV1[] = []
+      if (rawRuntimePolicy === undefined) {
+        currentPhases = getAgentRuntimeCustomPhases(config)
+      } else {
+        if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
+          return config
+        }
+        if (!('version' in rawRuntimePolicy)
+          || !('authority' in rawRuntimePolicy)
+          || !('scope' in rawRuntimePolicy)
+          || !('defaultMode' in rawRuntimePolicy)
+          || !('loomPolicy' in rawRuntimePolicy)
+          || !('phases' in rawRuntimePolicy)) return config
+        if (
+          Object.keys(rawRuntimePolicy).some((key) => !RUNTIME_POLICY_KEYS.has(key))
+          || rawRuntimePolicy.version !== 1
+          || rawRuntimePolicy.authority !== 'loom'
+          || rawRuntimePolicy.scope !== 'preset'
+          || rawRuntimePolicy.defaultMode !== config.defaultMode
+        ) return config
+        try {
+          if (rawRuntimePolicy.loomPolicy !== null) {
+            parseLoomPolicyBucketsV1(rawRuntimePolicy.loomPolicy)
+          }
+          currentPhases = parseAgentCustomPhasesV1(rawRuntimePolicy.phases)
+        } catch {
+          return config
+        }
+      }
+      const repairSource = (source: LoomPolicySourceV1): LoomPolicySourceV1 => {
+        const block = promptOrder.find((candidate) => candidate.id === source.blockId)
+        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === source.blockId)
+        if (!block || block.marker === 'category' || promptIndex < 0) return source
+        return {
+          ...source,
+          presetRevision: preset.cacheRevision ?? 0,
+          blockRevision: block.revision === undefined ? 1 : isCanonicalBlockRevision(block.revision) ? block.revision : source.blockRevision,
+          promptOrder: promptIndex,
+        }
+      }
+      const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
+      const repairBucket = (bucket: PolicyKey): LoomPolicyEntryV1[] => buckets[bucket].map((entry) => {
+        const block = promptOrder.find((candidate) => candidate.id === entry.source.blockId)
+        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === entry.source.blockId)
+        return block && block.marker !== 'category' && promptIndex >= 0
+          && (block.revision === undefined || isCanonicalBlockRevision(block.revision))
+          ? createLoomPolicyEntryV1(bucket, block, preset.cacheRevision ?? 0, promptIndex, entry)
+          : entry
+      })
+      const repaired: LoomPolicyBucketsV1 = {
+        version: buckets.version,
+        workPolicy: repairBucket('workPolicy'),
+        workspaceUsage: repairBucket('workspaceUsage'),
+        completionCriteria: repairBucket('completionCriteria'),
+        renderPolicy: repairBucket('renderPolicy'),
+      }
+      const repairedPhases = currentPhases.map((phase) => ({
+        ...phase,
+        instructionRefs: phase.instructionRefs.map(repairSource),
+      }))
+      const repairedConfig = setAgentRuntimePolicyBuckets(config, repaired)
+      return setAgentRuntimeCustomPhases(repairedConfig, repairedPhases)
+    })
+  }
+  const resolveRuntimePolicyRepair = (item: AgentConfigRepairItem) => {
+    if (item.reasonCode === 'stale_policy_source') {
+      repairLoomPolicy()
+      return
+    }
+    const path = item.label ?? ''
+    updateConfig((config) => {
+      const emptyBuckets: LoomPolicyBucketsV1 = {
+        version: 1,
+        workPolicy: [],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      }
+      const rawRuntimePolicy = (config as unknown as Record<string, unknown>).runtimePolicy
+      if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
+        const withBuckets = setAgentRuntimePolicyBuckets(config, emptyBuckets)
+        return setAgentRuntimeCustomPhases(withBuckets, [])
+      }
+      const runtimePolicy = rawRuntimePolicy as Record<string, unknown>
+
+      const phaseMatch = /^config\.runtimePolicy\.phases\.(\d+)/.exec(path)
+      if (phaseMatch && Array.isArray(runtimePolicy.phases)) {
+        const nextPhases = runtimePolicy.phases.slice()
+        nextPhases.splice(Number(phaseMatch[1]), 1)
+        return {
+          ...config,
+          runtimePolicy: { ...runtimePolicy, phases: nextPhases },
+        } as unknown as AgentConfigV2
+      }
+
+      const entryMatch = /^config\.runtimePolicy\.loomPolicy\.(workPolicy|workspaceUsage|completionCriteria|renderPolicy)\.(\d+)/.exec(path)
+      if (entryMatch
+        && typeof runtimePolicy.loomPolicy === 'object'
+        && runtimePolicy.loomPolicy !== null
+        && !Array.isArray(runtimePolicy.loomPolicy)) {
+        const bucket = entryMatch[1] as PolicyKey
+        const rawLoomPolicy = runtimePolicy.loomPolicy as Record<string, unknown>
+        const rawEntries = rawLoomPolicy[bucket]
+        if (Array.isArray(rawEntries)) {
+          const nextEntries = rawEntries.slice()
+          nextEntries.splice(Number(entryMatch[2]), 1)
+          return {
+            ...config,
+            runtimePolicy: {
+              ...runtimePolicy,
+              loomPolicy: {
+                ...rawLoomPolicy,
+                [bucket]: nextEntries,
+              },
+            },
+          } as unknown as AgentConfigV2
+        }
+      }
+
+      if (path.startsWith('config.runtimePolicy.loomPolicy')) {
+        return {
+          ...config,
+          runtimePolicy: { ...runtimePolicy, loomPolicy: emptyBuckets },
+        } as unknown as AgentConfigV2
+      }
+      if (path.startsWith('config.runtimePolicy.phases')) {
+        return {
+          ...config,
+          runtimePolicy: { ...runtimePolicy, phases: [] },
+        } as unknown as AgentConfigV2
+      }
+      const withBuckets = setAgentRuntimePolicyBuckets(config, emptyBuckets)
+      return setAgentRuntimeCustomPhases(withBuckets, [])
+    })
+  }
+  const updateCustomPhases = (
+    updater: (phases: AgentCustomPhaseV1[]) => AgentCustomPhaseV1[],
+  ) => {
+    updateConfig((config) => {
+      const canonicalConfig = setAgentRuntimePolicyBuckets(
+        config,
+        getAgentRuntimePolicyBuckets(config, promptOrder),
+      )
+      const currentPhases = [...getAgentRuntimeCustomPhases(canonicalConfig)]
+      return setAgentRuntimeCustomPhases(canonicalConfig, updater(currentPhases))
+    })
+  }
+  const addCustomPhase = () => {
+    if (!isHydrated) return
+    if (draftCustomPhases.length >= AGENTIC_CUSTOM_PHASE_LIMIT) {
+      toast.error(t('limits.customPhases'))
+      return
+    }
+    const usedIds = new Set(draftCustomPhases.map((phase) => phase.id))
+    let phaseNumber = 1
+    while (usedIds.has(`phase_${phaseNumber}`)) phaseNumber += 1
+    const id = `phase_${phaseNumber}`
+    const phase: AgentCustomPhaseV1 = {
+      version: 1,
+      id,
+      label: t('customPhases.defaultLabel', { number: phaseNumber }),
+      instructionRefs: [],
+      required: true,
+      enter: { kind: 'phase', value: 'WORK' },
+      exit: { kind: 'phase', value: 'COMPLETE' },
+      capabilityRequests: [],
+      repeatLimit: 0,
+      nextPhaseIds: [],
+    }
+    updateCustomPhases((phases) => [...phases, phase])
+  }
+  const updateCustomPhase = (
+    index: number,
+    updater: (phase: AgentCustomPhaseV1) => AgentCustomPhaseV1,
+  ) => {
+    updateCustomPhases((phases) => phases.map((phase, phaseIndex) => (
+      phaseIndex === index ? updater(phase) : phase
+    )))
+  }
+  const renameCustomPhase = (index: number, id: string) => {
+    updateCustomPhases((phases) => {
+      const previousId = phases[index]?.id
+      if (!previousId || previousId === id) {
+        return phases.map((phase, phaseIndex) => phaseIndex === index ? { ...phase, id } : phase)
+      }
+      return phases.map((phase, phaseIndex) => ({
+        ...phase,
+        ...(phaseIndex === index ? { id } : {}),
+        nextPhaseIds: phase.nextPhaseIds.map((phaseId) => phaseId === previousId ? id : phaseId),
+      }))
+    })
+  }
+  const removeCustomPhase = (index: number) => {
+    updateCustomPhases((phases) => {
+      const removedId = phases[index]?.id
+      if (!removedId) return phases
+      return phases
+        .filter((_phase, phaseIndex) => phaseIndex !== index)
+        .map((phase) => ({
+          ...phase,
+          nextPhaseIds: phase.nextPhaseIds.filter((phaseId) => phaseId !== removedId),
+        }))
+    })
+  }
+  const moveCustomPhase = (index: number, direction: -1 | 1) => {
+    updateCustomPhases((phases) => {
+      const targetIndex = index + direction
+      if (targetIndex < 0 || targetIndex >= phases.length) return phases
+      const next = [...phases]
+      const [moved] = next.splice(index, 1)
+      next.splice(targetIndex, 0, moved)
+      return next.map((phase, phaseIndex) => {
+        const nextPhaseId = next[phaseIndex + 1]?.id
+        return {
+          ...phase,
+          nextPhaseIds: phase.nextPhaseIds.filter((phaseId) => phaseId === phase.id || phaseId === nextPhaseId),
+        }
+      })
+    })
+  }
+  const toggleCustomPhaseInstruction = (
+    phaseIndex: number,
+    block: PromptBlock,
+    checked: boolean,
+  ) => {
+    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
+    if (promptIndex < 0) return
+    if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
+      toast.error(t('limits.invalidBlockRevision'))
+      return
+    }
+    const source: LoomPolicySourceV1 = {
+      kind: 'loom_block',
+      blockId: block.id,
+      presetRevision: preset.cacheRevision ?? 0,
+      blockRevision: block.revision ?? 1,
+      promptOrder: promptIndex,
+    }
+    updateCustomPhase(phaseIndex, (phase) => ({
+      ...phase,
+      instructionRefs: checked
+        ? [
+            ...phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+            source,
+          ]
+        : phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+    }))
+  }
+  const toggleCustomPhaseCapability = (
+    phaseIndex: number,
+    capability: AgentCustomPhaseCapability,
+    checked: boolean,
+  ) => {
+    updateCustomPhase(phaseIndex, (phase) => ({
+      ...phase,
+      capabilityRequests: checked
+        ? [...phase.capabilityRequests, capability]
+        : phase.capabilityRequests.filter((candidate) => candidate !== capability),
+    }))
+  }
+  const toggleCustomPhaseTransition = (
+    phaseIndex: number,
+    phaseId: string,
+    checked: boolean,
+  ) => {
+    updateCustomPhase(phaseIndex, (phase) => ({
+      ...phase,
+      nextPhaseIds: checked
+        ? [...phase.nextPhaseIds.filter((candidate) => candidate !== phaseId), phaseId]
+        : phase.nextPhaseIds.filter((candidate) => candidate !== phaseId),
+    }))
+  }
   const addTaskTemplate = () => {
-    if (!isHydrated || draftTaskTemplates.length >= AGENTIC_TASK_TEMPLATE_LIMIT) return
+    if (!isHydrated) return
+    if (draftTaskTemplates.length >= AGENTIC_TASK_TEMPLATE_LIMIT) {
+      toast.error(t('limits.tasks'))
+      return
+    }
     const usedIds = new Set(draftTaskTemplates
       .filter((template) => isAgentTaskTemplate(template))
       .map((template) => template.id))
@@ -1294,21 +1733,24 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
             : rule
         ))
         : current.contextRules
-      const taskPolicy = current.config.taskPolicy
+      const runtimeConfig = renamed
+        ? rewriteRuntimePolicyTaskReferences(current.config, previousId, nextId)
+        : current.config
+      const taskPolicy = runtimeConfig.taskPolicy
       return {
         ...current,
         taskTemplates: nextTemplates,
         contextRules: nextRules,
         config: renamed && taskPolicy && Array.isArray(taskPolicy.templateIds)
           ? {
-              ...current.config,
+              ...runtimeConfig,
               taskPolicy: {
                 templateIds: taskPolicy.templateIds.map((templateId) => (
                   templateId === previousId ? nextId : templateId
                 )),
               },
             }
-          : current.config,
+          : runtimeConfig,
       }
     })
   }
@@ -1399,7 +1841,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const addContextRule = () => {
     if (!isHydrated) return
     const selection = draftContextPackSelections.find((candidate) => isAgentContextPackSelection(candidate))
-    if (!selection || draftContextRules.length >= AGENTIC_CONTEXT_RULE_LIMIT) return
+    if (!selection) return
+    if (draftContextRules.length >= AGENTIC_CONTEXT_RULE_LIMIT) {
+      toast.error(t('limits.contextRules'))
+      return
+    }
     const usedIds = new Set(draftContextRules
       .filter((candidate) => isAgentContextActivationRule(candidate))
       .map((candidate) => candidate.id))
@@ -1483,7 +1929,18 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       && candidate.revisionId === selection.revisionId
     ))
     if (selected) return
-    const { scopes: _scopes, requiredScopes: _requiredScopes, attachmentStatus: _attachmentStatus, ...authoredSelection } = selection
+    if (draftContextPackSelections.length >= AGENTIC_CONTEXT_RULE_LIMIT) {
+      toast.error(t('limits.contextSelections'))
+      return
+    }
+    const {
+      ownerId: _ownerId,
+      selectionSource: _selectionSource,
+      scopes: _scopes,
+      requiredScopes: _requiredScopes,
+      attachmentStatus: _attachmentStatus,
+      ...authoredSelection
+    } = selection
     updateDraft((current) => syncContextReferences(
       current,
       [...(Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : []), authoredSelection],
@@ -1598,6 +2055,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const handleSave = async () => {
     if (!canSave || saveInFlightRef.current) return
     const submittedDraft = structuredClone(draft)
+    submittedDraft.reviewAcknowledgements = submittedDraft.reviewAcknowledgements.filter((id) => requiredReviewIds.includes(id))
     const submittedPromptOrder = structuredClone(promptOrder)
     const submittedPresetRevision = observedPresetRevisionRef.current
     const submittedFingerprint = `${runtimeDraftFingerprint(submittedDraft)}\n${JSON.stringify(submittedPromptOrder)}`
@@ -1873,41 +2331,562 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       </fieldset>
     </>
   )
-
-  const renderPhases = () => (
-    <>
-      <SectionHeader title={t('sections.phases.title')} description={t('sections.phases.description')} />
-      {POLICY_KEYS.map((policyKey) => (
-        <details className={styles.disclosure} key={policyKey} open={policyKey === 'workPolicy'}>
-          <summary><span>{t(`phases.${policyKey}.title`)}</span><small>{t(`phases.${policyKey}.description`)}</small><ChevronDown size={18} aria-hidden="true" /></summary>
-          <div className={styles.optionList}>
-            {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
-              const policyRefs = Array.isArray(draftCognitionPolicy[policyKey])
-                ? draftCognitionPolicy[policyKey] as Array<{ blockId: string; expectedPresetRevision: number; expectedBlockRevision: number }>
-                : []
-              const ref = policyRefs.find((candidate) => candidate.blockId === block.id)
-              const blockRevision = isCanonicalBlockRevision(block.revision) ? block.revision : 1
-              const stale = ref && (ref.expectedPresetRevision !== (preset.cacheRevision ?? 0) || ref.expectedBlockRevision !== blockRevision)
-              return (
-                <label key={block.id} className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)}>
-                  <input type="checkbox" checked={Boolean(ref)} onChange={(event) => togglePolicyBlock(policyKey, block, event.target.checked)} />
-                  <span><strong>{block.name}</strong><small>{stale ? t('phases.stale') : t('phases.revision', { revision: blockRevision })}</small></span>
+  const renderCustomPhases = () => (
+    <section className={styles.editorStack} aria-labelledby="agentic-custom-phases-title">
+      <div className={styles.sectionHeader}>
+        <div>
+          <h3 id="agentic-custom-phases-title">{t('customPhases.title')}</h3>
+          <p>{t('customPhases.description')}</p>
+        </div>
+        <button
+          type="button"
+          className={styles.button}
+          onClick={addCustomPhase}
+          disabled={!isHydrated || draftCustomPhases.length >= AGENTIC_CUSTOM_PHASE_LIMIT}
+        >
+          <Plus size={16} aria-hidden="true" /> {t('customPhases.add')}
+        </button>
+      </div>
+      {draftCustomPhases.length === 0 && <p className={styles.empty}>{t('customPhases.empty')}</p>}
+      {draftCustomPhases.map((phase, phaseIndex) => {
+        const nextPhase = draftCustomPhases[phaseIndex + 1]
+        const selectedBlockIds = new Set(phase.instructionRefs.map((source) => source.blockId))
+        const transitionTargets = [...new Set([
+          phase.id,
+          ...(nextPhase ? [nextPhase.id] : []),
+          ...phase.nextPhaseIds.filter((phaseId) => phaseId !== phase.id && phaseId !== nextPhase?.id),
+        ])]
+        return (
+          <details className={styles.disclosure} key={`${phase.id}-${phaseIndex}`} open={phaseIndex === 0}>
+            <summary>
+              <span>{phase.label || phase.id}</span>
+              <small>{t('customPhases.summary', { number: phaseIndex + 1, id: phase.id })}</small>
+              <ChevronDown size={18} aria-hidden="true" />
+            </summary>
+            <div className={styles.editorStack}>
+              <div className={styles.readOnlyHeader}>
+                <div>
+                  <strong>{t('customPhases.order', { number: phaseIndex + 1 })}</strong>
+                  <small>{t('customPhases.orderHint')}</small>
+                </div>
+                <div className={styles.inlineFields}>
+                  <button
+                    type="button"
+                    className={styles.iconButton}
+                    disabled={phaseIndex === 0}
+                    onClick={() => moveCustomPhase(phaseIndex, -1)}
+                    aria-label={t('customPhases.moveUp', { label: phase.label || phase.id })}
+                  >
+                    <ChevronUp size={16} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className={styles.iconButton}
+                    disabled={phaseIndex === draftCustomPhases.length - 1}
+                    onClick={() => moveCustomPhase(phaseIndex, 1)}
+                    aria-label={t('customPhases.moveDown', { label: phase.label || phase.id })}
+                  >
+                    <ChevronDown size={16} aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+              <div className={styles.formGrid}>
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>{t('customPhases.id')}</span>
+                  <input
+                    className={styles.input}
+                    value={phase.id}
+                    maxLength={64}
+                    pattern="[a-z][a-z0-9_]{0,63}"
+                    aria-label={t('customPhases.idFor', { label: phase.label || phase.id })}
+                    onChange={(event) => renameCustomPhase(phaseIndex, event.target.value)}
+                  />
                 </label>
-              )
-            })}
-          </div>
-        </details>
-      ))}
-    </>
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>{t('customPhases.label')}</span>
+                  <input
+                    className={styles.input}
+                    value={phase.label}
+                    maxLength={AGENTIC_LABEL_MAX_LENGTH}
+                    aria-label={t('customPhases.labelFor', { id: phase.id })}
+                    onChange={(event) => updateCustomPhase(phaseIndex, (current) => ({ ...current, label: event.target.value }))}
+                  />
+                </label>
+                <label className={styles.settingRow}>
+                  <span><strong>{t('customPhases.required')}</strong><small>{t('customPhases.requiredHint')}</small></span>
+                  <input
+                    type="checkbox"
+                    checked={phase.required}
+                    aria-label={t('customPhases.requiredFor', { label: phase.label || phase.id })}
+                    onChange={(event) => updateCustomPhase(phaseIndex, (current) => ({ ...current, required: event.target.checked }))}
+                  />
+                </label>
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>{t('customPhases.repeatLimit')}</span>
+                  <input
+                    type="number"
+                    className={styles.input}
+                    min={0}
+                    max={4}
+                    step={1}
+                    value={phase.repeatLimit}
+                    aria-label={t('customPhases.repeatLimitFor', { label: phase.label || phase.id })}
+                    onChange={(event) => {
+                      const value = Number.parseInt(event.target.value, 10)
+                      updateCustomPhase(phaseIndex, (current) => ({
+                        ...current,
+                        repeatLimit: Number.isSafeInteger(value) ? Math.min(4, Math.max(0, value)) : 0,
+                      }))
+                    }}
+                  />
+                  <small>{t('customPhases.repeatLimitHint')}</small>
+                </label>
+              </div>
+              <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.instructions')}</legend>
+                <p className={styles.muted}>{t('customPhases.instructionsHint')}</p>
+                <div className={styles.optionList}>
+                  {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
+                    const source = phase.instructionRefs.find((candidate) => candidate.blockId === block.id)
+                    const blockRevision = isCanonicalBlockRevision(block.revision) ? block.revision : 1
+                    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
+                    const stale = source !== undefined && (
+                      source.presetRevision !== (preset.cacheRevision ?? 0)
+                      || source.blockRevision !== blockRevision
+                      || source.promptOrder !== promptIndex
+                    )
+                    return (
+                      <label className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)} key={`${phase.id}-instruction-${block.id}`}>
+                        <input
+                          type="checkbox"
+                          checked={selectedBlockIds.has(block.id)}
+                          onChange={(event) => toggleCustomPhaseInstruction(phaseIndex, block, event.target.checked)}
+                        />
+                        <span>
+                          <strong>{block.name}</strong>
+                          <small>{source ? t('phases.sourceRevision', {
+                            presetRevision: source.presetRevision,
+                            blockRevision: source.blockRevision,
+                            promptOrder: source.promptOrder,
+                          }) : t('customPhases.notSelected')}</small>
+                          {stale && <small>{t('phases.stale')}</small>}
+                        </span>
+                      </label>
+                    )
+                  })}
+                  {phase.instructionRefs
+                    .filter((source) => !promptOrder.some((block) => block.id === source.blockId))
+                    .map((source) => (
+                      <div className={styles.listChoiceInvalid} key={`${phase.id}-unknown-${source.blockId}`}>
+                        <span>
+                          <strong>{source.blockId}</strong>
+                          <small>{t('customPhases.unavailableInstruction', { id: source.blockId })}</small>
+                          <small>{t('phases.sourceRevision', {
+                            presetRevision: source.presetRevision,
+                            blockRevision: source.blockRevision,
+                            promptOrder: source.promptOrder,
+                          })}</small>
+                        </span>
+                        <button
+                          type="button"
+                          className={styles.iconButton}
+                          onClick={() => updateCustomPhase(phaseIndex, (current) => ({
+                            ...current,
+                            instructionRefs: current.instructionRefs.filter((candidate) => candidate !== source),
+                          }))}
+                          aria-label={t('customPhases.removeInstruction', { id: source.blockId })}
+                        >
+                          <Trash2 size={16} aria-hidden="true" />
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              </fieldset>
+              <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.enter')}</legend>
+                <p className={styles.muted}>{t('customPhases.enterHint')}</p>
+                <PredicateEditor value={phase.enter} taskTemplateIds={taskTemplateIds} onChange={(enter) => updateCustomPhase(phaseIndex, (current) => ({ ...current, enter }))} />
+              </fieldset>
+              <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.exit')}</legend>
+                <p className={styles.muted}>{t('customPhases.exitHint')}</p>
+                <PredicateEditor value={phase.exit} taskTemplateIds={taskTemplateIds} onChange={(exit) => updateCustomPhase(phaseIndex, (current) => ({ ...current, exit }))} />
+              </fieldset>
+              <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.skip')}</legend>
+                <label className={styles.settingRow}>
+                  <span><strong>{t('customPhases.skipEnabled')}</strong><small>{t('customPhases.skipHint')}</small></span>
+                  <input
+                    type="checkbox"
+                    checked={phase.skip !== undefined}
+                    aria-label={t('customPhases.skipFor', { label: phase.label || phase.id })}
+                    onChange={(event) => updateCustomPhase(phaseIndex, (current) => {
+                      if (!event.target.checked) {
+                        const next = { ...current }
+                        delete next.skip
+                        return next
+                      }
+                      return { ...current, skip: current.skip ?? makePredicate('phase') }
+                    })}
+                  />
+                </label>
+                {phase.skip && <PredicateEditor value={phase.skip} taskTemplateIds={taskTemplateIds} onChange={(skip) => updateCustomPhase(phaseIndex, (current) => ({ ...current, skip }))} />}
+              </fieldset>
+              <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.capabilities')}</legend>
+                <p className={styles.muted}>{t('customPhases.capabilitiesHint')}</p>
+                <div className={styles.toolGrid}>
+                  {AGENT_CUSTOM_PHASE_CAPABILITIES.map((capability) => (
+                    <label className={clsx(styles.choiceCard, phase.capabilityRequests.includes(capability) && styles.choiceCardSelected)} key={`${phase.id}-capability-${capability}`}>
+                      <input
+                        type="checkbox"
+                        checked={phase.capabilityRequests.includes(capability)}
+                        onChange={(event) => toggleCustomPhaseCapability(phaseIndex, capability, event.target.checked)}
+                      />
+                      <span><strong>{t(`customPhases.capabilitiesList.${capability}`)}</strong></span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+              <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.transitions')}</legend>
+                <p className={styles.muted}>{t('customPhases.transitionsHint')}</p>
+                <div className={styles.readOnlyHeader}>
+                  <div>
+                    <strong>{phase.nextPhaseIds.length === 0
+                      ? t('customPhases.transitionAutomatic')
+                      : t('customPhases.transitionExplicit')}</strong>
+                    <small>{phase.nextPhaseIds.length === 0
+                      ? t('customPhases.transitionAutomaticHint')
+                      : t('customPhases.transitionExplicitHint')}</small>
+                  </div>
+                  <button
+                    type="button"
+                    className={styles.button}
+                    disabled={phase.nextPhaseIds.length === 0 && !nextPhase && phase.repeatLimit === 0}
+                    onClick={() => updateCustomPhase(phaseIndex, (current) => ({
+                      ...current,
+                      nextPhaseIds: current.nextPhaseIds.length === 0
+                        ? nextPhase
+                          ? [nextPhase.id]
+                          : current.repeatLimit > 0
+                            ? [current.id]
+                            : []
+                        : [],
+                    }))}
+                  >
+                    {phase.nextPhaseIds.length === 0
+                      ? t('customPhases.useExplicitTransitions')
+                      : t('customPhases.useAutomaticTransition')}
+                  </button>
+                </div>
+                {phase.nextPhaseIds.length === 0 ? (
+                  <p className={styles.muted}>
+                    {nextPhase
+                      ? t('customPhases.transitionAutomaticNext', { label: nextPhase.label || nextPhase.id })
+                      : t('customPhases.transitionAutomaticTerminal')}
+                  </p>
+                ) : (
+                  <div className={styles.optionList}>
+                    {transitionTargets.map((target) => (
+                      <label className={styles.listChoice} key={`${phase.id}-transition-${target}`}>
+                        <input
+                          type="checkbox"
+                          checked={phase.nextPhaseIds.includes(target)}
+                          disabled={target === phase.id && phase.repeatLimit === 0 && !phase.nextPhaseIds.includes(target)}
+                          onChange={(event) => toggleCustomPhaseTransition(phaseIndex, target, event.target.checked)}
+                        />
+                        <span>
+                          <strong>
+                            {target === phase.id
+                              ? t('customPhases.repeatTarget')
+                              : target === nextPhase?.id
+                                ? t('customPhases.nextTarget', { label: nextPhase.label || nextPhase.id })
+                                : t('customPhases.invalidTarget', { id: target })}
+                          </strong>
+                          <small>{target}</small>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </fieldset>
+              <button type="button" className={styles.dangerButton} onClick={() => removeCustomPhase(phaseIndex)}>
+                <Trash2 size={16} aria-hidden="true" /> {t('customPhases.remove')}
+              </button>
+            </div>
+          </details>
+        )
+      })}
+    </section>
   )
+
+
+  const renderPhases = () => {
+    const responseOmissionEntries = POLICY_KEYS.flatMap((policyKey) => (
+      draftLoomPolicy[policyKey].map((entry) => ({ policyKey, entry }))
+    ))
+    const responseOmissionContext = [
+      ...draftContextPackSelections
+        .filter(isAgentContextPackSelection)
+        .map((selection) => ({
+          id: selection.packId,
+          revisionId: selection.revisionId,
+          label: selection.label ?? selection.packId,
+        })),
+      ...draftContextRules
+        .filter(isAgentContextActivationRule)
+        .map((rule) => ({
+          id: rule.id,
+          revisionId: rule.revisionId,
+          label: rule.packId,
+        })),
+    ]
+    const responseOmissionPhaseInstructions = draftCustomPhases.flatMap((phase) => (
+      phase.instructionRefs.map((source) => ({ phase, source }))
+    ))
+    return (
+      <>
+        <SectionHeader title={t('sections.phases.title')} description={t('sections.phases.description')} />
+        {(responseOmissionEntries.length > 0 || responseOmissionContext.length > 0 || responseOmissionPhaseInstructions.length > 0) && (
+          <div className={styles.notice} role="status">
+            <AlertTriangle size={20} aria-hidden="true" />
+            <div>
+              <strong>{t('phases.responseOmissionTitle')}</strong>
+              <p>{t('phases.responseOmissionHint')}</p>
+              <ul className={styles.selectionList}>
+                {responseOmissionEntries.map(({ policyKey, entry }) => (
+                  <li key={`response-omission-${entry.id}`}>
+                    <span>
+                      <strong>{entry.source.blockId}</strong>
+                      <small>{t('phases.responseOmissionRoute', {
+                        destination: t(`phases.destinations.${entry.destination}`),
+                        checkpoint: t(`phases.checkpoints.${entry.checkpoint}`),
+                      })}</small>
+                      <small>{t('phases.responseOmissionEntry', { id: entry.id })}</small>
+                    </span>
+                  </li>
+                ))}
+                {responseOmissionPhaseInstructions.map(({ phase, source }) => (
+                  <li key={`response-omission-phase-${phase.id}-${source.blockId}`}>
+                    <span>
+                      <strong>{phase.label || phase.id}</strong>
+                      <small>{t('phases.responseOmissionPhaseInstruction', {
+                        blockId: source.blockId,
+                        blockRevision: source.blockRevision,
+                      })}</small>
+                    </span>
+                  </li>
+                ))}
+                {responseOmissionContext.map((context) => (
+                  <li key={`response-omission-context-${context.id}-${context.revisionId}`}>
+                    <span>
+                      <strong>{context.label}</strong>
+                      <small>{t('phases.responseOmissionContext', { id: context.id, revisionId: context.revisionId })}</small>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+        {renderCustomPhases()}
+        {POLICY_KEYS.map((policyKey) => {
+          const entries = draftLoomPolicy[policyKey]
+          const policyDestination = POLICY_DESTINATIONS[policyKey]
+          const policyCheckpoint = POLICY_CHECKPOINTS[policyKey]
+          return (
+            <details className={styles.disclosure} key={policyKey} open={policyKey === 'workPolicy'}>
+              <summary><span>{t(`phases.${policyKey}.title`)}</span><small>{t(`phases.${policyKey}.description`)}</small><ChevronDown size={18} aria-hidden="true" /></summary>
+              <div className={styles.editorStack}>
+                <div className={styles.readOnlyHeader}>
+                  <div>
+                    <strong>{t('phases.routing')}</strong>
+                    <small>{t('phases.routingHint')}</small>
+                  </div>
+                  <span>{t('phases.routingValue', {
+                    destination: t(`phases.destinations.${policyDestination}`),
+                    checkpoint: t(`phases.checkpoints.${policyCheckpoint}`),
+                  })}</span>
+                </div>
+                <div className={styles.optionList}>
+                  {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
+                    const entry = entries.find((candidate) => candidate.source.blockId === block.id)
+                    const blockRevision = isCanonicalBlockRevision(block.revision) ? block.revision : 1
+                    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
+                    const stale = entry !== undefined && (
+                      entry.source.presetRevision !== (preset.cacheRevision ?? 0)
+                      || entry.source.blockRevision !== blockRevision
+                      || entry.source.promptOrder !== promptIndex
+                    )
+                    const delivery = entry?.delivery
+                    const request = delivery?.delivery === 'on_demand' ? delivery.request : null
+                    const requestKey = request ? `${request.contextPackId}\u0000${request.revisionId}\u0000${request.digest}` : ''
+                    const selectedRequestKeys = new Set(draftContextPackSelections
+                      .filter(isAgentContextPackSelection)
+                      .map((selection) => `${selection.packId}\u0000${selection.revisionId}\u0000${selection.digest}`))
+                    const availableRequests = availableContextPacks.filter((option) => (
+                      option.attachmentStatus === 'available'
+                      && selectedRequestKeys.has(`${option.packId}\u0000${option.revisionId}\u0000${option.digest}`)
+                    ))
+                    return (
+                      <div key={`${policyKey}-${block.id}`} className={styles.editorStack}>
+                        <label className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)}>
+                          <input type="checkbox" checked={entry !== undefined} onChange={(event) => togglePolicyBlock(policyKey, block, event.target.checked)} />
+                          <span>
+                            <strong>{block.name}</strong>
+                            <small>{entry ? t('phases.sourceRevision', {
+                              presetRevision: entry.source.presetRevision,
+                              blockRevision: entry.source.blockRevision,
+                              promptOrder: entry.source.promptOrder,
+                            }) : t('phases.notSelected')}</small>
+                            {stale && <small>{t('phases.stale')}</small>}
+                          </span>
+                        </label>
+                        {entry && (
+                          <div className={styles.editorStack}>
+                            <div className={styles.readOnlyHeader}>
+                              <div>
+                                <strong>{t('phases.source')}</strong>
+                                <small>{entry.source.blockId}</small>
+                              </div>
+                              <code className={styles.code}>{entry.id}</code>
+                            </div>
+                            <div className={styles.formGrid}>
+                              <label className={styles.settingRow}>
+                                <span><strong>{t('phases.required')}</strong><small>{t('phases.requiredHint')}</small></span>
+                                <input
+                                  type="checkbox"
+                                  checked={entry.required}
+                                  aria-label={t('phases.requiredFor', { name: block.name })}
+                                  onChange={(event) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, required: event.target.checked }))}
+                                />
+                              </label>
+                              <label className={styles.field}>
+                                <span className={styles.fieldLabel}>{t('phases.delivery')}</span>
+                                <select
+                                  className={styles.select}
+                                  value={delivery?.delivery ?? 'direct'}
+                                  aria-label={t('phases.deliveryFor', { name: block.name })}
+                                  onChange={(event) => {
+                                    const nextDelivery = event.target.value as LoomPolicyDeliveryV1['delivery']
+                                    updatePolicyEntry(policyKey, block.id, (current) => {
+                                      if (nextDelivery === 'direct') return { ...current, delivery: { delivery: 'direct' } }
+                                      if (nextDelivery === 'condition_gated') {
+                                        const condition = current.delivery.delivery === 'condition_gated'
+                                          ? current.delivery.condition
+                                          : makePredicate('phase')
+                                        return { ...current, delivery: { delivery: 'condition_gated', condition } }
+                                      }
+                                      const nextOption = availableRequests[0]
+                                      const nextRequest: LoomOnDemandRequestV1 | undefined = current.delivery.delivery === 'on_demand'
+                                        ? current.delivery.request
+                                        : nextOption
+                                          ? {
+                                              contextPackId: nextOption.packId,
+                                              revisionId: nextOption.revisionId,
+                                              digest: nextOption.digest,
+                                            }
+                                          : undefined
+                                      return nextRequest
+                                        ? { ...current, delivery: { delivery: 'on_demand', request: nextRequest } }
+                                        : current
+                                    })
+                                  }}
+                                >
+                                  <option value="direct">{t('phases.deliveryDirect')}</option>
+                                  <option value="condition_gated">{t('phases.deliveryConditionGated')}</option>
+                                  <option value="on_demand" disabled={availableRequests.length === 0 && delivery?.delivery !== 'on_demand'}>{t('phases.deliveryOnDemand')}</option>
+                                </select>
+                              </label>
+                            </div>
+                            {delivery?.delivery === 'condition_gated' && (
+                              <PredicateEditor
+                                value={delivery.condition}
+                                taskTemplateIds={taskTemplateIds}
+                                onChange={(condition) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, delivery: { delivery: 'condition_gated', condition } }))}
+                              />
+                            )}
+                            {delivery?.delivery === 'on_demand' && (
+                              <fieldset className={styles.fieldset}>
+                                <legend className={styles.fieldLabel}>{t('phases.onDemandRequest')}</legend>
+                                <label className={styles.field}>
+                                  <span className={styles.fieldLabel}>{t('phases.contextRevision')}</span>
+                                  <select
+                                    className={styles.select}
+                                    value={requestKey}
+                                    aria-label={t('phases.contextRevision')}
+                                    onChange={(event) => {
+                                      const nextOption = availableRequests.find((option) => (
+                                        `${option.packId}\u0000${option.revisionId}\u0000${option.digest}` === event.target.value
+                                      ))
+                                      if (!nextOption) return
+                                      updatePolicyEntry(policyKey, block.id, (current) => ({
+                                        ...current,
+                                        delivery: {
+                                          delivery: 'on_demand',
+                                          request: {
+                                            contextPackId: nextOption.packId,
+                                            revisionId: nextOption.revisionId,
+                                            digest: nextOption.digest,
+                                          },
+                                        },
+                                      }))
+                                    }}
+                                  >
+                                    {request && !availableRequests.some((option) => (
+                                      option.packId === request.contextPackId
+                                      && option.revisionId === request.revisionId
+                                      && option.digest === request.digest
+                                    )) && (
+                                      <option value={requestKey}>{t('phases.unavailableRevision', { revisionId: request.revisionId })}</option>
+                                    )}
+                                    {availableRequests.map((option) => (
+                                      <option key={`${option.packId}\u0000${option.revisionId}\u0000${option.digest}`} value={`${option.packId}\u0000${option.revisionId}\u0000${option.digest}`}>
+                                        {option.label ?? option.packId} · {option.revisionLabel ?? option.revisionId}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <small>{t('phases.onDemandDigest', { digest: request?.digest ?? '' })}</small>
+                              </fieldset>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            </details>
+          )
+        })}
+        {renderContext()}
+      </>
+    )
+  }
 
   const renderContext = () => {
     const invalidSelectionCount = draft.contextPackSelections.filter((selection) => !isAgentContextPackSelection(selection)).length
     const invalidRuleCount = draft.contextRules.filter((rule) => !isAgentContextActivationRule(rule)).length
     const policyQuarantined = !isContextPolicySynchronized(draft)
+    const policyNeedsRepair = validation.issues.some((issue) => issue.path.startsWith('config.runtimePolicy'))
+    const onDemandEntries = POLICY_KEYS.flatMap((policyKey) => (
+      draftLoomPolicy[policyKey]
+        .filter((entry) => entry.delivery.delivery === 'on_demand')
+        .map((entry) => ({ policyKey, entry }))
+    ))
     return (
-      <>
-        <SectionHeader title={t('sections.context.title')} description={t('sections.context.description')} />
+      <section className={styles.editorStack} aria-labelledby="agentic-phased-context-title">
+        <div className={styles.sectionHeader}>
+          <div>
+            <h3 id="agentic-phased-context-title">{t('phases.context.title')}</h3>
+            <p>{t('phases.context.description')}</p>
+          </div>
+        </div>
+        <p className={styles.muted}>
+          {t('phases.context.lifecycleHint')} {t('phases.context.orderingHint')} {t('phases.context.conditionHint')}
+        </p>
         {(policyQuarantined || invalidSelectionCount > 0 || invalidRuleCount > 0) && (
           <div className={styles.notice} role="alert">
             <AlertTriangle size={20} aria-hidden="true" />
@@ -1922,12 +2901,34 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
             </div>
           </div>
         )}
+        {policyNeedsRepair && (
+          <div className={styles.notice} role="alert">
+            <AlertTriangle size={20} aria-hidden="true" />
+            <div>
+              <strong>{t('context.policyRepairTitle')}</strong>
+              <p>{t('context.policyRepairHint')}</p>
+              {policyRepairItems.length > 0 && (
+                <button
+                  type="button"
+                  className={styles.button}
+                  onClick={() => {
+                    const [item] = policyRepairItems
+                    if (item) resolveRuntimePolicyRepair(item)
+                  }}
+                >
+                  <Wrench size={16} aria-hidden="true" /> {t('context.repairPolicy')}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
         <label className={styles.field}>
           <span className={styles.fieldLabel}>{t('context.addPack')}</span>
           <select
             className={styles.select}
             defaultValue=""
             aria-label={t('context.addPack')}
+            disabled={draft.contextPackSelections.length >= AGENTIC_CONTEXT_RULE_LIMIT}
             onChange={(event) => { addContextPack(event.target.value); event.target.value = '' }}
           >
             <option value="">{t('context.choosePack')}</option>
@@ -1937,7 +2938,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                 value={`${selection.packId}\u0000${selection.revisionId}`}
                 disabled={selection.attachmentStatus !== 'available'}
               >
-                {selection.label ?? selection.packId} · {t('context.revisionLabel', { revision: selection.revision })}
+                {selection.label ?? selection.packId} · {t('context.revisionLabel', { revision: selection.revision })} · {selection.selectionSource ? t(`context.sources.${selection.selectionSource}`) : t('context.attachmentUnavailable')}
               </option>
             ))}
           </select>
@@ -1966,14 +2967,24 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
               && rule.packId === selection.packId
               && rule.revisionId === selection.revisionId
             ))
+            const onDemandReferences = onDemandEntries.flatMap(({ policyKey, entry }) => {
+              if (entry.delivery.delivery !== 'on_demand'
+                || entry.delivery.request.contextPackId !== selection.packId
+                || entry.delivery.request.revisionId !== selection.revisionId
+                || entry.delivery.request.digest !== selection.digest) return []
+              const entryIndex = draftLoomPolicy[policyKey].findIndex((candidate) => candidate.id === entry.id)
+              return [`config.runtimePolicy.loomPolicy.${policyKey}.${entryIndex}.delivery.request`]
+            })
+            const usedByOnDemand = onDemandReferences.length > 0
             const scopeLabel = contextScopeLabel(option?.scopes, t)
             const attachmentLabel = contextAttachmentLabel(option, t)
             return (
               <li key={`${selection.packId}\u0000${selection.revisionId}`}>
                 <span>
                   <strong>{selection.label ?? selection.packId}</strong>
-                  <small>{t('context.revisionLabel', { revision: selection.revision })} · {selection.digest.slice(0, 12)}</small>
+                  <small>{t('context.revisionLabel', { revision: selection.revision })} · {t('context.digest', { digest: selection.digest })}</small>
                   <small>{t('context.scopeLabel')}: {scopeLabel} · {attachmentLabel}</small>
+                  {onDemandReferences.map((path) => <code className={styles.repairPath} key={path}>{path}</code>)}
                 </span>
                 <label className={styles.settingRow}>
                   <span>
@@ -1990,8 +3001,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                 <button
                   type="button"
                   className={styles.iconButton}
-                  disabled={usedByRule}
-                  title={usedByRule ? t('context.removePackInUse') : undefined}
+                  disabled={usedByRule || usedByOnDemand}
+                  title={usedByRule
+                    ? t('context.removePackInUse')
+                    : usedByOnDemand
+                      ? t('context.removePackOnDemandInUse')
+                      : undefined}
                   onClick={() => updateDraft((current) => syncContextReferences(
                     current,
                     current.contextPackSelections.filter((candidate) => candidate !== selection),
@@ -2005,6 +3020,27 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
             )
           })}
         </ul>
+        {onDemandEntries.length > 0 && (
+          <fieldset className={styles.fieldset}>
+            <legend className={styles.fieldLabel}>{t('context.onDemandTitle')}</legend>
+            <p className={styles.muted}>{t('context.onDemandHint')}</p>
+            <ul className={styles.selectionList}>
+              {onDemandEntries.map(({ policyKey, entry }) => {
+                const request = entry.delivery.delivery === 'on_demand' ? entry.delivery.request : null
+                if (!request) return null
+                return (
+                  <li key={`on-demand-${entry.id}`}>
+                    <span>
+                      <strong>{entry.source.blockId}</strong>
+                      <small>{t(`phases.${policyKey}.title`)} · {request.revisionId}</small>
+                      <small>{t('context.onDemandDigest', { digest: request.digest })}</small>
+                    </span>
+                  </li>
+                )
+              })}
+            </ul>
+          </fieldset>
+        )}
         <div className={styles.sectionActions}>
           <button
             type="button"
@@ -2105,7 +3141,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
             </details>
           )
         })}
-      </>
+      </section>
     )
   }
 
@@ -2195,6 +3231,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                   ? [...new Set([...current.reviewAcknowledgements, item.id])]
                   : current.reviewAcknowledgements.filter((id) => id !== item.id),
               }))}
+              onRepair={item.id.startsWith('loom-policy:') ? () => resolveRuntimePolicyRepair(item) : undefined}
             />
           ))}
         </ul>
@@ -2210,7 +3247,6 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     agents: renderAgents,
     tools: renderTools,
     phases: renderPhases,
-    context: renderContext,
     tasks: renderTasks,
     workspace: renderWorkspace,
     repair: renderRepair,
@@ -2219,7 +3255,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const firstIssue = validation.issues[0]
   const validationStatus = validation.issues.length === 0
     ? null
-    : validation.issues.map((issue) => `${t(`validation.${issue.code}`)} (${issue.path})`).join(' ')
+    : validation.issues.map((issue) => `${t(`validation.${issue.code}`, { defaultValue: t('validation.invalid_config') })} (${issue.path})`).join(' ')
   return (
     <div className={styles.panel}>
       <header className={styles.hero}>
