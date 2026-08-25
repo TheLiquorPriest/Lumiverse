@@ -4863,6 +4863,80 @@ describe("Agentic WORK phase", () => {
     const collaborateDispatch = dispatches.find((dispatch, index) => index > 0 && dispatch.tools.includes("agent_delegate"));
     expect(collaborateDispatch?.tools).toEqual(expect.arrayContaining(["complete_turn", "agent_delegate"]));
   });
+  test("fails WORK as invalid_plan when complete_turn phase evaluation is unavailable", async () => {
+    let dispatches = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      dispatches += 1;
+      return response("", [complete("unavailable-complete")]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("live-phase", ["workspace_write"], {
+            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            nextPhaseIds: ["next-phase"],
+          }),
+          customPhase("next-phase", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async ({ phase, expectedRevision }) => {
+          if (phase === "COMPLETE") throw new Error("phase snapshot unavailable");
+          return phaseSnapshot(expectedRevision ?? 0);
+        },
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+    }));
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("invalid_plan");
+    expect(dispatches).toBe(1);
+    expect(result.observations.find((item) => item.callId === "unavailable-complete")).toMatchObject({
+      status: "rejected",
+      code: "invalid_plan",
+    });
+  });
+
+  test("fails WORK as invalid_plan when complete_turn would take an illegal phase advance", async () => {
+    const oneRef = phaseRef("one-phase", 0);
+    const twoRef = phaseRef("two-phase", 1);
+    let dispatches = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      dispatches += 1;
+      return response("", [complete("illegal-advance")]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("one-phase", ["workspace_write"], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [oneRef],
+            nextPhaseIds: ["missing-phase"],
+          }),
+          customPhase("two-phase", [], {
+            instructionRefs: [twoRef],
+          }),
+        ]),
+        loomBlocks: [
+          phaseBlock(oneRef, "ONE_PHASE_INSTRUCTION"),
+          phaseBlock(twoRef, "TWO_PHASE_INSTRUCTION"),
+        ],
+      }),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async ({ expectedRevision }) => phaseSnapshot(expectedRevision ?? 0),
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+    }));
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("invalid_plan");
+    expect(dispatches).toBe(1);
+    expect(result.observations.find((item) => item.callId === "illegal-advance")).toMatchObject({
+      status: "rejected",
+      code: "invalid_plan",
+    });
+  });
+
 
   test("reconciles a durably committed assignment after the adapter rejects a post-commit timeout", async () => {
     const controller = new AbortController();

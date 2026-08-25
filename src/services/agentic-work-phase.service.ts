@@ -34,7 +34,9 @@ import {
 import {
   createAgentRuntimePhaseMachine,
   type AgentRuntimePhaseCompileResultV1,
+  type AgentRuntimePhaseDecisionV1,
   type AgentRuntimePhaseInspectionEvidenceV1,
+  type AgentRuntimePhaseMachineStatusV1,
   type AgentRuntimePhaseCheckpointInputV1,
   type CompiledAgentRuntimePhaseV1,
 } from "./agentic-phase-runtime.service";
@@ -2084,6 +2086,16 @@ function composeAgenticWorkPhaseComposition(
     delegatableProfiles: phaseAllowsCapability(phaseCapabilities, "delegation") ? delegatableProfiles : [],
   }, signal);
 }
+function isRecoverableUnsatisfiedLivePhaseExit(
+  decision: AgentRuntimePhaseDecisionV1,
+  machineStatus: AgentRuntimePhaseMachineStatusV1,
+): boolean {
+  return decision.checkpoint === "exit"
+    && decision.status === "blocked"
+    && decision.condition === "false"
+    && machineStatus === "entered";
+}
+
 
 function recordCustomPhaseEvidence(
   writer: AgentInspectionWriterV1 | undefined,
@@ -6174,19 +6186,13 @@ export async function runAgenticWorkPhase(
             if (phasePayload.payload) {
               phaseInput = await readPhaseInput("COMPLETE");
               if (!phaseInput) {
-                completion = {
-                  observationStatus: "rejected",
-                  code: "completion_freeze_failed",
-                  result: resultError("completion_freeze_failed"),
-                };
+                phaseCompletionFailed = true;
               } else {
                 const exitDecision = phaseMachine.previewExit(phaseInput);
                 if (exitDecision.status === "completed") {
                   phaseCompletionExpectedRevision = phaseInput.revision;
                   phaseTerminalPending = true;
-                } else if (exitDecision.status === "failed" || exitDecision.status === "blocked") {
-                  // Live unsatisfied exit (including no self-loop). Preview
-                  // restores entered state. Reject recoverably and keep WORK open.
+                } else if (isRecoverableUnsatisfiedLivePhaseExit(exitDecision, phaseMachine.state().status)) {
                   completion = {
                     observationStatus: "rejected",
                     code: "completion_blocked",
@@ -6195,12 +6201,14 @@ export async function runAgenticWorkPhase(
                 } else {
                   const committedDecision = phaseMachine.exit(phaseInput);
                   recordPhaseEvidence();
-                  if (committedDecision.status === "failed" || committedDecision.status === "blocked") {
+                  if (isRecoverableUnsatisfiedLivePhaseExit(committedDecision, phaseMachine.state().status)) {
                     completion = {
                       observationStatus: "rejected",
                       code: "completion_blocked",
                       result: resultError("completion_blocked"),
                     };
+                  } else if (committedDecision.status === "failed" || committedDecision.status === "blocked") {
+                    phaseCompletionFailed = true;
                   } else if (!(await drainPhaseEntry())) {
                     phaseCompletionFailed = true;
                   } else {

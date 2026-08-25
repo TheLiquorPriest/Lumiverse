@@ -312,6 +312,48 @@ describe("canonical custom Phased Instructions machine", () => {
     expect(machine.state()).toMatchObject({ status: "ready", phaseId: "collaborate" });
   });
 
+  test("fails a required exit closed when the host snapshot is absent", () => {
+    const compiled = compile([
+      phase({
+        id: "exercise",
+        nextPhaseIds: ["collaborate"],
+        instructionRefs: [sourceRef("exercise")],
+      }),
+      phase({ id: "collaborate", instructionRefs: [sourceRef("collaborate")] }),
+    ], [sourceRef("exercise"), sourceRef("collaborate")]);
+    const machine = createAgentRuntimePhaseMachine(compiled);
+    expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
+    expect(machine.exit({
+      revision: 2,
+      snapshotAvailable: false,
+      context: context(),
+    })).toMatchObject({
+      status: "failed",
+      condition: "invalid",
+      reason: expect.stringMatching(/failed closed/i),
+    });
+    expect(machine.state().status).toBe("failed");
+  });
+
+  test("fails closed when exit would take an illegal phase advance", () => {
+    const compiled = compile([
+      phase({
+        id: "one",
+        nextPhaseIds: ["missing"],
+        instructionRefs: [sourceRef("one")],
+      }),
+      phase({ id: "two", instructionRefs: [sourceRef("two")] }),
+    ], [sourceRef("one"), sourceRef("two")]);
+    const machine = createAgentRuntimePhaseMachine(compiled);
+    expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
+    expect(machine.exit({ revision: 1, context: context() })).toMatchObject({
+      status: "failed",
+      reason: expect.stringMatching(/arbitrary phase transition/i),
+    });
+    expect(machine.state().status).toBe("failed");
+  });
+
+
 
   test("fails required invalid evaluation closed and keeps optional false skips visible", () => {
     const required = compile([
