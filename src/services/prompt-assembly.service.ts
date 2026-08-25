@@ -1389,7 +1389,7 @@ interface ResolvedPromptVariableValues {
   readonly selectionsByBlock: Record<string, Record<string, string[]>>;
 }
 
-function collectResolvedPromptVariableValues(
+export function collectResolvedPromptVariableValues(
   blocks: readonly Pick<PromptBlock, "id" | "enabled" | "variables">[],
   stored: unknown,
   profileValues?: PromptVariableValues,

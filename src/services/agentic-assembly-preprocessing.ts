@@ -238,6 +238,26 @@ export function setSnapshotBlockMacroContext(
   snapshot: GenerationAssemblySnapshotV1,
   block: SnapshotBlockV1,
 ): void {
+  const effective = snapshot.variables.effective;
+  if (effective) {
+    const blockValues = effective.byBlock[block.id] ?? {};
+    const blockDefaults = effective.defaultsByBlock[block.id] ?? {};
+    const blockSelections = effective.selectionsByBlock[block.id] ?? {};
+    env.variables.local = new Map(Object.entries(effective.values).map(([key, value]) => [key, String(value)]));
+    for (const [name, value] of Object.entries(blockValues)) {
+      env.variables.local.set(name, String(value));
+    }
+    env.promptBlock = { id: block.id, role: block.role, position: block.position, depth: block.depth };
+    env.extra.promptVariables = { ...effective.values };
+    env.extra.promptVariableDefaults = { ...effective.defaults };
+    env.extra.promptVariableSelections = Object.fromEntries(
+      Object.entries(effective.selections).map(([name, ids]) => [name, [...ids]]),
+    );
+    env.extra.promptVariablesByBlock = { ...effective.byBlock, [block.id]: blockValues };
+    env.extra.promptVariableDefaultsByBlock = { ...effective.defaultsByBlock, [block.id]: blockDefaults };
+    env.extra.promptVariableSelectionsByBlock = { ...effective.selectionsByBlock, [block.id]: blockSelections };
+    return;
+  }
   const rawValues = record(snapshot.variables.preset)[block.id];
   const values = scalarMap(rawValues);
   const defaults: Record<string, string | number> = {};

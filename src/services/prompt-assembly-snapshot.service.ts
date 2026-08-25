@@ -27,8 +27,9 @@ import { canonicalRuntimeCapabilityDigest } from "./agent-runtime-decision.servi
 import {
   applyProfileToBlocks,
   normalizeCategoryBlockStates,
-  resolveProfile,
+  resolveProfileWithDb,
 } from "./preset-profiles.service";
+import { collectResolvedPromptVariableValues } from "./prompt-assembly.service";
 import type {
   CognitionSourceSnapshotV1,
   FrozenCognitionGraphV1,
@@ -197,10 +198,21 @@ export interface SnapshotParticipantV1 {
   readonly availabilityRevision: string;
 }
 
+export interface SnapshotPromptVariableProjectionV1 {
+  readonly values: Readonly<Record<string, string | number>>;
+  readonly defaults: Readonly<Record<string, string | number>>;
+  readonly byBlock: Readonly<Record<string, Readonly<Record<string, string | number>>>>;
+  readonly defaultsByBlock: Readonly<Record<string, Readonly<Record<string, string | number>>>>;
+  readonly selections: Readonly<Record<string, readonly string[]>>;
+  readonly selectionsByBlock: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+}
+
 export interface SnapshotVariableStateV1 {
   readonly preset: Readonly<PromptVariableValues>;
   /** Resolved profile overlay; null when no binding. Absent only on legacy fixtures. */
   readonly profile?: Readonly<PromptVariableValues> | null;
+  /** Coerced effective {{var}} / cognition projection. Absent only on legacy fixtures. */
+  readonly effective?: SnapshotPromptVariableProjectionV1;
   readonly chat: Readonly<Record<string, unknown>>;
   readonly settings: Readonly<Record<string, unknown>>;
   readonly revision: string;
@@ -1735,9 +1747,10 @@ export function buildGenerationAssemblySnapshot(
       ? rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE id = ? AND user_id = ? LIMIT 1", personaId, input.userId)
       : rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE user_id = ? AND is_default = 1 ORDER BY id LIMIT 1", input.userId);
     const persona = normalizePersona(personaRow, limits);
-    const profileBinding = isNoPresetChatMetadata(metadata)
-      ? null
-      : resolveProfile(
+    const resolvedProfile = isNoPresetChatMetadata(metadata)
+      ? { preset_id: effectivePresetId, binding: null, source: "none" as const, source_id: null }
+      : resolveProfileWithDb(
+          db,
           input.userId,
           effectivePresetId,
           chat.id,
@@ -1751,12 +1764,13 @@ export function buildGenerationAssemblySnapshot(
                 : input.connectionId ?? null,
             personaId: typeof persona?.id === "string" ? persona.id : input.personaId ?? null,
           },
-        ).binding;
-    if (profileBinding && profileBinding.preset_id !== effectivePresetId) {
-      const boundRow = rowFor<RawRow>(db, "SELECT id, name, provider, engine, parameters, prompt_order, metadata, prompts, updated_at, cache_revision FROM presets WHERE id = ? AND user_id = ? LIMIT 1", profileBinding.preset_id, input.userId);
+        );
+    const profileBinding = resolvedProfile.binding;
+    if (resolvedProfile.preset_id && resolvedProfile.preset_id !== effectivePresetId) {
+      const boundRow = rowFor<RawRow>(db, "SELECT id, name, provider, engine, parameters, prompt_order, metadata, prompts, updated_at, cache_revision FROM presets WHERE id = ? AND user_id = ? LIMIT 1", resolvedProfile.preset_id, input.userId);
       if (!boundRow) throw new SnapshotInputError("preset not found");
       preset = normalizePreset(boundRow, limits);
-      effectivePresetId = profileBinding.preset_id;
+      effectivePresetId = resolvedProfile.preset_id;
     }
     blocks = withEffectiveProfileBlocks(preset?.blocks ?? [], profileBinding);
     const settingsValues: Record<string, unknown> = {};
@@ -1788,10 +1802,38 @@ export function buildGenerationAssemblySnapshot(
     const profileVariables = profileBinding
       ? freezePromptVariableValues(profileBinding.prompt_variables ?? {})
       : null;
-    const variableIdentity = { preset: presetVariables, profile: profileVariables, chat: chatVariables, settings: settingsIdentity };
+    const collected = collectResolvedPromptVariableValues(
+      blocks,
+      presetVariables,
+      profileBinding ? profileBinding.prompt_variables ?? {} : undefined,
+    );
+    const effective = deepFreeze({
+      values: collected.values,
+      defaults: collected.defaults,
+      byBlock: collected.byBlock,
+      defaultsByBlock: collected.defaultsByBlock,
+      selections: collected.selections,
+      selectionsByBlock: collected.selectionsByBlock,
+    } satisfies SnapshotPromptVariableProjectionV1);
+    const variableIdentity = {
+      preset: presetVariables,
+      profile: profileVariables,
+      effective,
+      binding: {
+        source: resolvedProfile.source,
+        sourceId: resolvedProfile.source_id,
+        presetId: resolvedProfile.preset_id,
+        blockStates: profileBinding?.block_states ?? null,
+        linkedToDefaults: profileBinding?.linked_to_defaults === true,
+      },
+      blockEnabled: Object.fromEntries(blocks.map((block) => [block.id, block.enabled])),
+      chat: chatVariables,
+      settings: settingsIdentity,
+    };
     const variables = deepFreeze({
       preset: presetVariables,
       profile: profileVariables,
+      effective,
       chat: chatVariables,
       settings,
       revision: digest(variableIdentity),

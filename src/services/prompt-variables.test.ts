@@ -5,7 +5,7 @@ import { initMacros } from "../macros";
 import type { MacroEnv } from "../macros/types";
 import type { Preset, PromptBlock, PromptVariableDef } from "../types/preset";
 import { withPromptBlockContext } from "../macros/MacroEnv";
-import { coercePromptVariable, resolvePromptBlockPlacements, resolvePromptVariables, resolveCognitionPresetVariables } from "./prompt-assembly.service";
+import { coercePromptVariable, resolvePromptBlockPlacements, resolvePromptVariables, resolveCognitionPresetVariables, collectResolvedPromptVariableValues } from "./prompt-assembly.service";
 import { evaluateCognitionPredicate } from "./agent-cognition.service";
 import type { CognitionEvaluationContextV1 } from "../types/agent-cognition";
 
@@ -670,5 +670,27 @@ describe("resolveCognitionPresetVariables", () => {
       fn_require_child: 0,
       fn_collaboration: 0,
     });
+  });
+
+  test("one collect path yields identical cognition and strict {{var}} values", () => {
+    const collaboration = blockWithSwitch("collab-block", "fn_collaboration", 1);
+    const requireChild = blockWithSwitch("child-block", "fn_require_child", 0);
+    const stored = {
+      "collab-block": { fn_collaboration: 0 },
+      "child-block": { fn_require_child: 0 },
+    };
+    const profile = {
+      "child-block": { fn_require_child: 1 },
+    };
+    const blocks = [{ ...collaboration, enabled: false }, requireChild];
+    const collected = collectResolvedPromptVariableValues(blocks, stored, profile);
+    const cognition = resolveCognitionPresetVariables(blocks, stored, profile);
+    expect(cognition).toEqual(collected.values);
+    expect(collected.values).toEqual({ fn_require_child: 1 });
+    expect(collected.byBlock["child-block"]?.fn_require_child).toBe(1);
+    expect(collected.byBlock["collab-block"]).toBeUndefined();
+    expect(collected.defaults["fn_require_child"]).toBe(0);
+    expect(evaluateCognitionPredicate(requireChildActivation, workContext(cognition))).toBe(true);
+    expect(evaluateCognitionPredicate(collaborationSkip, workContext(cognition))).toBe(false);
   });
 });
