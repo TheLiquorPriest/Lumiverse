@@ -30,6 +30,7 @@ import {
   resolveProfileWithDb,
 } from "./preset-profiles.service";
 import { collectResolvedPromptVariableValues } from "./prompt-assembly.service";
+import { compareUtf8 } from "../utils/utf8-order";
 import type {
   CognitionSourceSnapshotV1,
   FrozenCognitionGraphV1,

@@ -5,6 +5,7 @@ import {
   SnapshotLimitError,
   type GenerationAssemblySnapshotV1,
 } from "./prompt-assembly-snapshot.service";
+import { compareUtf8 } from "../utils/utf8-order";
 import {
   AssemblyPlanValidationError,
   compileAgentAssemblyPlan,
@@ -323,6 +324,41 @@ describe("GenerationAssemblySnapshotV1", () => {
     expect(lasting.blocks.find((block) => block.id === "producer")?.enabled).toBe(false);
     expect(lasting.variables.effective?.values.fn_require_child).toBe(1);
     expect(lasting.variables.revision).not.toBe(temporary.variables.revision);
+    db.close();
+  });
+
+  test("attached World Books complete snapshot preflight with UTF-8 book scan order", () => {
+    const db = schema();
+    seed(db);
+    db.query("INSERT INTO world_books VALUES (?, ?, ?, ?, ?, ?)").run("wb-b", "user-1", "Later lore", "", "{}", 2);
+    db.query("INSERT INTO world_books VALUES (?, ?, ?, ?, ?, ?)").run("wb-a", "user-1", "Earlier lore", "", "{}", 2);
+    db.query("INSERT INTO world_book_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      "entry-b", "wb-b", JSON.stringify(["b"]), "[]", "b", "B", 0, 4, "system", 1, 0, 0, 0, 0, 0, "not_enabled", 1, 1,
+    );
+    db.query("INSERT INTO world_book_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      "entry-a", "wb-a", JSON.stringify(["a"]), "[]", "a", "A", 0, 4, "system", 1, 0, 0, 0, 0, 0, "not_enabled", 1, 1,
+    );
+    db.query("UPDATE characters SET extensions = ? WHERE id = ?").run(JSON.stringify({ world_book_ids: ["wb-b"] }), "char-1");
+    db.query("UPDATE chats SET metadata = ? WHERE id = ?").run(JSON.stringify({ chat_world_book_ids: ["wb-a"] }), "chat-1");
+    db.query("UPDATE settings SET value = ? WHERE key = ? AND user_id = ?").run(JSON.stringify([]), "globalWorldBooks", "user-1");
+    const snapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      connectionId: "connection-1",
+      agentConfig: config(),
+      db,
+    });
+    const attachedBookIds = ["wb-b", "wb-a"];
+    const utf8BookIds = [...attachedBookIds].sort(compareUtf8);
+    expect(utf8BookIds).toEqual(["wb-a", "wb-b"]);
+    expect(snapshot.worldInfo.books.map((book) => book.id)).toEqual(attachedBookIds);
+    expect(snapshot.worldInfo.entries.map((entry) => entry.bookId)).toEqual(utf8BookIds);
+    expect(snapshot.worldInfo.entries.map((entry) => entry.id)).toEqual(["entry-a", "entry-b"]);
+    expect(snapshot.inputRevisionSet.worldLore.length).toBeGreaterThan(0);
+    expect(snapshot.inputRevisionSet.readiness).toHaveLength(1);
+    expect(snapshot.inputRevisionSet.digest.length).toBeGreaterThan(0);
     db.close();
   });
 
