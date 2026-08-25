@@ -677,8 +677,9 @@ class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
     if (exited === "false") {
       if (this.repeatCount < phase.repeatLimit) {
         if (phase.nextPhaseIds.length > 0 && !phase.nextPhaseIds.includes(phase.id)) {
-          const decision = this.decision("failed", exited, input, phase, "phase cannot repeat", "exit");
-          this.status = phase.required ? "failed" : "blocked";
+          // No self-loop: do not claim a repeat and do not fail the machine.
+          // The exit predicate is unsatisfied; remain entered so WORK can continue.
+          const decision = this.decision("blocked", exited, input, phase, "exit condition not met", "exit");
           this.record(decision, phase);
           return decision;
         }

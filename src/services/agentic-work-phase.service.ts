@@ -6161,7 +6161,7 @@ export async function runAgenticWorkPhase(
           code = validationError;
           result = resultError(validationError);
         } else if (call.name === COMPLETE_TURN_TOOL) {
-          let completion: CompletionExecutionResult;
+          let completion: CompletionExecutionResult | undefined;
           // A custom COMPLETE checkpoint is a writable phase boundary. Do
           // not invoke the irreversible completion CAS until the terminal
           // exit has been evaluated against the fresh workspace snapshot.
@@ -6174,17 +6174,33 @@ export async function runAgenticWorkPhase(
             if (phasePayload.payload) {
               phaseInput = await readPhaseInput("COMPLETE");
               if (!phaseInput) {
-                phaseCompletionFailed = true;
+                completion = {
+                  observationStatus: "rejected",
+                  code: "completion_freeze_failed",
+                  result: resultError("completion_freeze_failed"),
+                };
               } else {
                 const exitDecision = phaseMachine.previewExit(phaseInput);
                 if (exitDecision.status === "completed") {
                   phaseCompletionExpectedRevision = phaseInput.revision;
                   phaseTerminalPending = true;
+                } else if (exitDecision.status === "failed" || exitDecision.status === "blocked") {
+                  // Live unsatisfied exit (including no self-loop). Preview
+                  // restores entered state. Reject recoverably and keep WORK open.
+                  completion = {
+                    observationStatus: "rejected",
+                    code: "completion_blocked",
+                    result: resultError("completion_blocked"),
+                  };
                 } else {
                   const committedDecision = phaseMachine.exit(phaseInput);
                   recordPhaseEvidence();
                   if (committedDecision.status === "failed" || committedDecision.status === "blocked") {
-                    phaseCompletionFailed = true;
+                    completion = {
+                      observationStatus: "rejected",
+                      code: "completion_blocked",
+                      result: resultError("completion_blocked"),
+                    };
                   } else if (!(await drainPhaseEntry())) {
                     phaseCompletionFailed = true;
                   } else {
@@ -6194,38 +6210,40 @@ export async function runAgenticWorkPhase(
               }
             }
           }
-          if (pendingRequiredDelegatedFailure) {
-            completion = {
-              observationStatus: "rejected",
-              code: pendingRequiredDelegatedFailure,
-              result: resultError(pendingRequiredDelegatedFailure),
-            };
-          } else if (phaseCompletionFailed) {
-            completion = {
-              observationStatus: "rejected",
-              code: "invalid_plan",
-              result: resultError("invalid_plan"),
-            };
-          } else if (phaseTransitioned) {
-            const workspaceRevision = workspaceContextRevision ?? phaseInput?.revision ?? 0;
-            const nextPhase = phaseMachine?.currentPhase() ?? null;
-            completion = {
-              observationStatus: "success",
-              result: {
-                status: "phase_advanced",
-                toolName: COMPLETE_TURN_TOOL,
-                workspaceRevision,
-                phaseId: nextPhase?.id ?? null,
-              },
-            };
-          } else {
-            completion = await executeCompletion(
-              call,
-              rootFrame,
-              options.workspace,
-              (cognition) => materializeCompletionCriteriaMessages(plan, options, cognition),
-              phaseCompletionExpectedRevision,
-            );
+          if (completion === undefined) {
+            if (pendingRequiredDelegatedFailure) {
+              completion = {
+                observationStatus: "rejected",
+                code: pendingRequiredDelegatedFailure,
+                result: resultError(pendingRequiredDelegatedFailure),
+              };
+            } else if (phaseCompletionFailed) {
+              completion = {
+                observationStatus: "rejected",
+                code: "invalid_plan",
+                result: resultError("invalid_plan"),
+              };
+            } else if (phaseTransitioned) {
+              const workspaceRevision = workspaceContextRevision ?? phaseInput?.revision ?? 0;
+              const nextPhase = phaseMachine?.currentPhase() ?? null;
+              completion = {
+                observationStatus: "success",
+                result: {
+                  status: "phase_advanced",
+                  toolName: COMPLETE_TURN_TOOL,
+                  workspaceRevision,
+                  phaseId: nextPhase?.id ?? null,
+                },
+              };
+            } else {
+              completion = await executeCompletion(
+                call,
+                rootFrame,
+                options.workspace,
+                (cognition) => materializeCompletionCriteriaMessages(plan, options, cognition),
+                phaseCompletionExpectedRevision,
+              );
+            }
           }
           if (phaseTerminalPending && completion.acceptance && phaseMachine && phaseInput) {
             const committedDecision = phaseMachine.exit(phaseInput);

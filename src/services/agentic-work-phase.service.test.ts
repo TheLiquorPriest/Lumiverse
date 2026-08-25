@@ -4783,6 +4783,87 @@ describe("Agentic WORK phase", () => {
       }),
     ]));
   });
+  test("rejects an early complete_turn on an unsatisfied live phase exit and continues until the task settles", async () => {
+    const exerciseRef = phaseRef("exercise-phase", 0);
+    const collaborateRef = phaseRef("collaborate-phase", 1);
+    const workspaceRevision = { value: 4 };
+    const taskTransitions: Record<string, CognitionTaskTransition> = {};
+    const dispatches: Array<{ readonly tools: readonly string[] }> = [];
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ tools }) => {
+      dispatchCount += 1;
+      dispatches.push({ tools: tools.map((tool) => tool.name) });
+      if (dispatchCount === 1) {
+        return response("", [complete("early-complete")]);
+      }
+      if (dispatchCount === 2) {
+        return response("", [call("workspace_accept_submission", "settle-evidence", {
+          submissionId: "submission-1",
+          taskId: "fn_evidence",
+        })]);
+      }
+      return response("", [complete(`after-settle-${dispatchCount}`)]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("exercise-phase", ["workspace_write"], {
+            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            repeatLimit: 2,
+            instructionRefs: [exerciseRef],
+            nextPhaseIds: ["collaborate-phase"],
+          }),
+          customPhase("collaborate-phase", ["delegation"], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [collaborateRef],
+          }),
+        ]),
+        loomBlocks: [
+          phaseBlock(exerciseRef, "EXERCISE_PHASE_INSTRUCTION"),
+          phaseBlock(collaborateRef, "COLLABORATE_PHASE_INSTRUCTION"),
+        ],
+      }),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(workspaceRevision.value, taskTransitions),
+        applyCognitionWorkspaceTransition: async ({ taskId, transition }) => {
+          expect(taskId).toBe("fn_evidence");
+          expect(transition).toBe("completed");
+          taskTransitions[taskId] = transition;
+          workspaceRevision.value += 1;
+          return {
+            result: { accepted: true },
+            cognition: { workspaceRevision: workspaceRevision.value },
+          };
+        },
+        freezeForCompletion: async ({ expectedRevision }) => ({
+          accepted: true,
+          workspaceRevision: expectedRevision ?? workspaceRevision.value,
+        }),
+      }),
+      workspaceCapabilities: ["accept_submission"],
+      phaseEvaluationContext: phaseContext(),
+      phaseAdmittedCapabilities: ["workspace_write", "delegation"],
+      phaseRevision: 4,
+      delegatableProfiles: [{
+        profileId: "fn_required_retriever",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["submit_child_result"],
+      }],
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(result.code).toBeUndefined();
+    expect(result.observations.find((item) => item.callId === "early-complete")).toMatchObject({
+      status: "rejected",
+      code: "completion_blocked",
+    });
+    expect(dispatchCount).toBeGreaterThanOrEqual(3);
+    expect(dispatches[0]?.tools).toEqual(expect.arrayContaining(["complete_turn"]));
+    expect(dispatches[0]?.tools).not.toContain("agent_delegate");
+    expect(dispatches[1]?.tools).not.toContain("agent_delegate");
+    const collaborateDispatch = dispatches.find((dispatch, index) => index > 0 && dispatch.tools.includes("agent_delegate"));
+    expect(collaborateDispatch?.tools).toEqual(expect.arrayContaining(["complete_turn", "agent_delegate"]));
+  });
+
   test("reconciles a durably committed assignment after the adapter rejects a post-commit timeout", async () => {
     const controller = new AbortController();
     let durable = false;

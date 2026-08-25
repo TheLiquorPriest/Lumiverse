@@ -279,6 +279,40 @@ describe("canonical custom Phased Instructions machine", () => {
     expect(orderedMachine.state().status).toBe("completed");
   });
 
+  test("keeps an unsatisfied exit entered when the next phase is not a self-loop", () => {
+    const compiled = compile([
+      phase({
+        id: "exercise",
+        exit: { kind: "task_transition", taskId: "evidence", transition: "completed" },
+        repeatLimit: 2,
+        nextPhaseIds: ["collaborate"],
+        instructionRefs: [sourceRef("exercise")],
+      }),
+      phase({
+        id: "collaborate",
+        instructionRefs: [sourceRef("collaborate")],
+      }),
+    ], [sourceRef("exercise"), sourceRef("collaborate")]);
+    const machine = createAgentRuntimePhaseMachine(compiled);
+    expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
+    expect(machine.exit({
+      revision: 1,
+      context: context({ taskTransitions: { evidence: "active" } }),
+    })).toMatchObject({
+      status: "blocked",
+      condition: "false",
+      reason: "exit condition not met",
+      phaseId: "exercise",
+    });
+    expect(machine.state()).toMatchObject({ status: "entered", phaseId: "exercise", repeatCount: 0 });
+    expect(machine.exit({
+      revision: 2,
+      context: context({ taskTransitions: { evidence: "completed" } }),
+    })).toMatchObject({ status: "advanced", phaseId: "exercise" });
+    expect(machine.state()).toMatchObject({ status: "ready", phaseId: "collaborate" });
+  });
+
+
   test("fails required invalid evaluation closed and keeps optional false skips visible", () => {
     const required = compile([
       phase({ id: "required", instructionRefs: [sourceRef("required")] }),
