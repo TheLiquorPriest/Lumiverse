@@ -3185,6 +3185,7 @@ function inspectionReason(value: unknown): AgentInspectionReasonV1 {
   if (reason.includes("provider")) return "provider_failure";
   if (reason.includes("tool")) return "tool_failure";
   if (reason.includes("budget") || reason.includes("exhaust")) return "budget_exhausted";
+  if (reason === "decision_refresh_required" || reason.includes("decision_refresh")) return "stale_input";
   if (reason.includes("revision") || reason.includes("stale")) return "stale_input";
   if (reason === "none" || reason.length === 0) return "none";
   if (reason === "reconciled") return "reconciled";
@@ -3688,6 +3689,11 @@ function coordinatorTerminalPublicationState(
   };
 }
 
+function preservedDecisionRefreshCode(errorCode: unknown): "decision_refresh_required" | undefined {
+  return errorCode === "decision_refresh_required" ? "decision_refresh_required" : undefined;
+}
+
+
 
 function buildDependencies(): AgenticGenerationDependencies {
   const cognitionRuntimes = new Map<string, AgentCognitionRuntimeV1>();
@@ -3983,9 +3989,10 @@ function buildDependencies(): AgenticGenerationDependencies {
       ownerToken: created.ownerToken,
       expectedPhase: current.phase,
       nextPhase,
-      reason: event.status === "rejected"
-        ? "invalid_input"
-        : event.errorCode ?? "terminal_publication_failed",
+      reason: preservedDecisionRefreshCode(event.errorCode)
+        ?? (event.status === "rejected"
+          ? "invalid_input"
+          : event.errorCode ?? "terminal_publication_failed"),
       ignoreCancellation: true,
     }).execution;
   };
@@ -3996,7 +4003,14 @@ function buildDependencies(): AgenticGenerationDependencies {
   };
   const consume = async (input: AgenticGenerationInput, target: AgenticTargetSnapshot, token: string): Promise<AgenticRuntimeDecision> => {
     const result = await consumeRuntimeDecisionToken(input.userId, token, runtimeRequest(input, target));
-    if (!result.accepted || !result.decision) throw new Error("decision_refresh_required");
+    if (!result.accepted || !result.decision) {
+      const mismatch = result.mismatch ? `: ${result.mismatch}` : "";
+      throw new AgenticGenerationError(
+        "decision_refresh_required",
+        `decision_refresh_required${mismatch}`,
+        { phase: "ASSEMBLE", retryable: true },
+      );
+    }
     return mapDecision(result.decision);
   };
   return {
@@ -5690,6 +5704,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       // publishTerminal only after persistent-session and inspection
       // reconciliation succeeds.
       if (event.phase === "COMMITTED") return;
+      if (!getTurnExecution(event.executionId, event.userId)) return;
       const binding = bindings.get(event.executionId);
       const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
       const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
@@ -5778,11 +5793,12 @@ function buildDependencies(): AgenticGenerationDependencies {
         reason: terminalReason,
         ...(event.errorCode || status === "COMMIT_FAILED" ? {
           error: {
-            code: terminalOutcome === "rejected"
-              ? "invalid_input"
-              : event.errorCode ?? "agentic_commit_failed",
+            code: preservedDecisionRefreshCode(event.errorCode)
+              ?? (terminalOutcome === "rejected"
+                ? "invalid_input"
+                : event.errorCode ?? "agentic_commit_failed"),
             recoveryAction: "resync",
-            reason: terminalReason,
+            reason: event.errorMessage ?? terminalReason,
             workPhase: "TERMINAL",
             workStatus: "terminal",
             workOutcome: terminalOutcome,
@@ -5813,6 +5829,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             phase: terminalState.phase,
             workOutcome: terminalOutcome,
             errorCode: event.errorCode ?? null,
+            errorMessage: event.errorMessage ?? null,
             receiptId: receiptForProjection?.receiptId ?? null,
           }),
           errorReason: inspectionReasonValue,
@@ -5897,9 +5914,10 @@ function buildDependencies(): AgenticGenerationDependencies {
         ? "cancelled"
         : terminalOutcome === "exhausted"
           ? "limit_exceeded"
-          : terminalOutcome === "rejected"
-            ? "invalid_input"
-            : "internal_error";
+          : preservedDecisionRefreshCode(event.errorCode)
+            ?? (terminalOutcome === "rejected"
+              ? "invalid_input"
+              : "internal_error");
       const terminalStatus = terminalState.status;
       const terminalPhase = terminalState.phase;
       const terminalMessageId = event.receipt?.messageId ?? durableReceipt?.messageId ?? null;

@@ -2458,7 +2458,8 @@ function terminalInspectionReasonForExecution(
   if (execution.phase === "CANCELLED") return code === "deadline" || code === "timed_out" ? "deadline" : "user_stop";
   if (execution.phase === "TIMED_OUT") return "deadline";
   if (execution.phase === "EXHAUSTED") return "budget_exhausted";
-  if (code === "invalid_input" || code === "decision_refresh_required" || code === "agentic_runtime_unavailable") {
+  if (code === "decision_refresh_required") return "stale_input";
+  if (code === "invalid_input" || code === "agentic_runtime_unavailable") {
     return "invalid_input";
   }
   if (code.includes("provider")) return "provider_failure";
@@ -2550,6 +2551,7 @@ function terminalProjectionReasonForExecution(
   if (code === "terminal_publication_failed" || code === "projection_unavailable") {
     return "projection_unavailable";
   }
+  if (code === "decision_refresh_required") return "stale_input";
   if (outcome === "rejected" && inspectionReason === "needs_attention") return "invalid_input";
   if (execution.phase === "COMMIT_FAILED"
     && (code === "commit_failed" || code === "failed" || code === "interrupted" || code === "process_interrupted")) {
@@ -2569,6 +2571,7 @@ function terminalProjectionErrorCodeForExecution(
   outcome: AgentInspectionOutcomeV1 = terminalRecoveryOutcome(execution),
 ): string | null {
   const code = execution.terminalCode?.trim().toLowerCase() ?? "";
+  if (code === "decision_refresh_required") return "decision_refresh_required";
   if (inspectionReason === "needs_attention" || code === "terminal_publication_failed") {
     return outcome === "stopped"
       ? "cancelled"

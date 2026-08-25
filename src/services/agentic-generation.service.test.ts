@@ -3,6 +3,7 @@ import {
   runAgenticGeneration,
   requestAgenticGenerationCancellation,
   requestAgenticChatCancellation,
+  AgenticGenerationError,
   type AgenticGenerationDependencies,
   type AgenticGenerationInput,
   type AgenticTargetSnapshot,
@@ -454,7 +455,6 @@ describe("agentic generation orchestration", () => {
     }
   });
 
-
   test("refused retry admission does not publish a phantom attempt", async () => {
     const { retryAgenticGeneration } = await import("./agentic-generation.service");
     const events: string[] = [];
@@ -469,5 +469,49 @@ describe("agentic generation orchestration", () => {
       .rejects.toThrow("agentic_target_unsupported");
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(events).not.toContain("terminal");
+  });
+
+  test("pre-execution decision_refresh_required skips FAILED phase publish and keeps the typed code", async () => {
+    const calls: string[] = [];
+    const terminals: Array<{ errorCode?: string; errorMessage?: string; status: string }> = [];
+    const started = await runAgenticGeneration(input({ runtimeDecisionToken: "tok" }), dependencies(calls, {
+      consumeRuntimeToken: async () => {
+        throw new AgenticGenerationError(
+          "decision_refresh_required",
+          "decision_refresh_required: input_revision_digest",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      },
+      createExecution: () => {
+        calls.push("create");
+        return { id: "never" };
+      },
+      publishPhase: () => {
+        calls.push("phase");
+        throw new Error("FOREIGN KEY constraint failed");
+      },
+      publishTerminal: (event) => {
+        terminals.push({
+          errorCode: event.errorCode,
+          errorMessage: event.errorMessage,
+          status: event.status,
+        });
+        calls.push(`terminal:${event.status}`);
+      },
+    }));
+    const result = await settle(started.generationId) as {
+      status: string;
+      errorCode: string;
+      errorMessage?: string;
+    };
+    expect(result.status).toBe("rejected");
+    expect(result.errorCode).toBe("decision_refresh_required");
+    expect(result.errorMessage).toBe("decision_refresh_required: input_revision_digest");
+    expect(terminals).toEqual([{
+      errorCode: "decision_refresh_required",
+      errorMessage: "decision_refresh_required: input_revision_digest",
+      status: "rejected",
+    }]);
+    expect(calls).toEqual(["terminal:rejected", "cleanup"]);
   });
 });

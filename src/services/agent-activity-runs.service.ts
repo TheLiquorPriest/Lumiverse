@@ -2682,7 +2682,9 @@ function normalizeInspectionCapGate(value: unknown): AgentInspectionCapGateV1 | 
 function inspectionDefaultErrorCode(row: InspectionAttemptRow): AgentPublicErrorCode {
   if (row.outcome === "stopped") return "cancelled";
   if (row.outcome === "exhausted") return "limit_exceeded";
-  if (row.outcome === "rejected") return "invalid_input";
+  if (row.outcome === "rejected") {
+    return row.reason === "stale_input" ? "decision_refresh_required" : "invalid_input";
+  }
   if (row.reason === "provider_failure") return "provider_request_error";
   if (row.reason === "tool_failure") return "internal_error";
   return "internal_error";

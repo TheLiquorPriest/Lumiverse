@@ -30,6 +30,7 @@ import type {
   LoomRuntimePolicyV1,
   RuntimeDecisionBindingV1,
   RuntimeDecisionInternalV1,
+  RuntimeDecisionRefreshMismatchV1,
   RuntimeDecisionTokenConsumptionV1,
   RuntimeRevision,
   SafeConnectionProjectionV1,
@@ -1389,6 +1390,51 @@ function ensureDependencies(overrides: Partial<RuntimeDecisionDependencies> | un
   return dependencies;
 }
 
+function consumeRefreshRejection(
+  mismatch?: RuntimeDecisionRefreshMismatchV1,
+): RuntimeDecisionTokenConsumptionV1 {
+  return mismatch
+    ? { accepted: false, code: "decision_refresh_required", decision: null, mismatch }
+    : { accepted: false, code: "decision_refresh_required", decision: null };
+}
+
+function consumeBindingMismatch(
+  current: RuntimeDecisionBindingV1,
+  expected: RuntimeDecisionBindingV1,
+  currentPolicy: unknown,
+  storedPolicy: unknown,
+  currentRoot: FrozenConcreteConnectionV1 | null | undefined,
+  storedRoot: FrozenConcreteConnectionV1 | null | undefined,
+): RuntimeDecisionRefreshMismatchV1 | null {
+  const fields = [
+    ["userId", "user_id"],
+    ["chatId", "chat_id"],
+    ["targetDigest", "target_digest"],
+    ["requestEpoch", "request_epoch"],
+    ["turnFence", "turn_fence"],
+    ["logicalConnectionId", "logical_connection_id"],
+    ["concreteConnectionId", "concrete_connection_id"],
+    ["provider", "provider"],
+    ["model", "model"],
+    ["fingerprint", "fingerprint"],
+    ["capabilityDigest", "capability_digest"],
+    ["candidateRevision", "candidate_revision"],
+    ["credentialRevision", "credential_revision"],
+    ["endpointRevision", "endpoint_revision"],
+    ["presetId", "preset_id"],
+    ["configRevision", "config_revision"],
+    ["bindingRevision", "binding_revision"],
+    ["inputRevisionDigest", "input_revision_digest"],
+    ["readinessDigest", "readiness_digest"],
+  ] as const;
+  for (const [key, mismatch] of fields) {
+    if (current[key] !== expected[key]) return mismatch;
+  }
+  if (stableStringify(currentPolicy) !== stableStringify(storedPolicy)) return "runtime_policy";
+  if (!sameFrozenConnection(currentRoot, storedRoot)) return "root_connection";
+  return null;
+}
+
 export class AgentRuntimeDecisionService {
   readonly tokenStore: RuntimeDecisionTokenStore;
   private readonly now: () => number;
@@ -1953,12 +1999,12 @@ export class AgentRuntimeDecisionService {
 
   async consume(userId: string, token: string, request: EffectiveRuntimeRequestV1): Promise<RuntimeDecisionTokenConsumptionV1> {
     const stored = this.tokenStore.consume(userId, token);
-    if (!stored) return { accepted: false, code: "decision_refresh_required", decision: null };
+    if (!stored) return consumeRefreshRejection();
     let normalizedRequest: EffectiveRuntimeRequestV1;
     try {
       normalizedRequest = normalizeEffectiveRuntimeRequest(request);
     } catch {
-      return { accepted: false, code: "decision_refresh_required", decision: null };
+      return consumeRefreshRejection();
     }
     request = normalizedRequest;
     const storedRequest = stored.request;
@@ -1977,7 +2023,7 @@ export class AgentRuntimeDecisionService {
       || incomingBinding.turnFence !== stored.decision.binding.turnFence
       || incomingBinding.requestEpoch !== stored.decision.binding.requestEpoch
       || hashCanonical(normalizedStored) !== stored.decision.binding.targetDigest) {
-      return { accepted: false, code: "decision_refresh_required", decision: null };
+      return consumeRefreshRejection();
     }
 
     const expected = stored.decision.binding;
@@ -1990,7 +2036,7 @@ export class AgentRuntimeDecisionService {
       requestEpoch: expected.requestEpoch,
       logicalConnectionId: expected.logicalConnectionId,
       presetId: expected.presetId,
-      forcePresetId: expected.presetId !== null,
+      forcePresetId: storedRequest.forcePresetId === true,
       transientSelection: stored.decision.runtimePolicy?.transientSelection ?? storedRequest.transientSelection ?? null,
       mode: "agentic",
     };
@@ -2008,39 +2054,25 @@ export class AgentRuntimeDecisionService {
       },
     );
     if (current.effectiveMode !== "agentic" || !current.internal.rootConnection) {
-      return { accepted: false, code: "decision_refresh_required", decision: null };
+      return consumeRefreshRejection("effective_mode");
     }
     const currentBinding = current.internal.binding;
-    if (currentBinding.userId !== expected.userId
-      || currentBinding.chatId !== expected.chatId
-      || currentBinding.targetDigest !== expected.targetDigest
-      || currentBinding.requestEpoch !== expected.requestEpoch
-      || currentBinding.turnFence !== expected.turnFence
-      || currentBinding.logicalConnectionId !== expected.logicalConnectionId
-      || currentBinding.concreteConnectionId !== expected.concreteConnectionId
-      || currentBinding.provider !== expected.provider
-      || currentBinding.model !== expected.model
-      || currentBinding.fingerprint !== expected.fingerprint
-      || currentBinding.capabilityDigest !== expected.capabilityDigest
-      || currentBinding.candidateRevision !== expected.candidateRevision
-      || currentBinding.credentialRevision !== expected.credentialRevision
-      || currentBinding.endpointRevision !== expected.endpointRevision
-      || currentBinding.presetId !== expected.presetId
-      || currentBinding.configRevision !== expected.configRevision
-      || currentBinding.bindingRevision !== expected.bindingRevision
-      || currentBinding.inputRevisionDigest !== expected.inputRevisionDigest
-      || currentBinding.readinessDigest !== expected.readinessDigest
-      || stableStringify(current.internal.runtimePolicy) !== stableStringify(stored.decision.runtimePolicy)
-      || !sameFrozenConnection(current.internal.rootConnection, storedRoot)) {
-      return { accepted: false, code: "decision_refresh_required", decision: null };
-    }
+    const bindingMismatch = consumeBindingMismatch(
+      currentBinding,
+      expected,
+      current.internal.runtimePolicy,
+      stored.decision.runtimePolicy,
+      current.internal.rootConnection,
+      storedRoot,
+    );
+    if (bindingMismatch) return consumeRefreshRejection(bindingMismatch);
     const expectedChildren = stored.decision.childConnections;
     const currentChildren = current.internal.childConnections;
     const expectedChildIds = Object.keys(expectedChildren);
     const currentChildIds = Object.keys(currentChildren);
     if (expectedChildIds.length !== currentChildIds.length
       || expectedChildIds.some((profileId) => !sameFrozenConnection(expectedChildren[profileId], currentChildren[profileId]))) {
-      return { accepted: false, code: "decision_refresh_required", decision: null };
+      return consumeRefreshRejection("child_connections");
     }
     return { accepted: true, code: "accepted", decision: current };
   }

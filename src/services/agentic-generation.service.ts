@@ -679,11 +679,11 @@ async function transition(
     }
     active.phase = next;
   }
-  if (deps.publishPhase) {
+  if (deps.publishPhase && active.execution) {
     const target = targetFor(active);
     const canonical = canonicalFor(active, next, "streaming");
     await deps.publishPhase({
-      executionId: active.execution?.id ?? active.generationId,
+      executionId: active.execution.id,
       userId: active.input.userId,
       chatId: active.input.chatId,
       phase: next,
@@ -1225,7 +1225,7 @@ async function runAgenticGenerationInternal(
                 ? "commit_failed"
                 : "failed",
       );
-      if (!joined) finalCode = "agentic_internal_error";
+      if (!joined && finalCode !== "decision_refresh_required") finalCode = "agentic_internal_error";
       return {
         generationId: active.execution?.id ?? active.generationId,
         status: finalStatus,
@@ -1285,7 +1285,7 @@ async function runAgenticGenerationInternal(
               ? "commit_failed"
               : "failed",
     );
-    if (!joined) finalCode = "agentic_internal_error";
+    if (!joined && finalCode !== "decision_refresh_required") finalCode = "agentic_internal_error";
     let publishedStatus: AgenticTerminalStatus = finalStatus;
     let publishedPhase: AgenticPhase = terminalPhase;
     let publishedCode: AgenticFailureCode | string | undefined = finalCode;
@@ -1294,7 +1294,9 @@ async function runAgenticGenerationInternal(
         deps,
         active,
         terminalPhase,
-        finalStatus === "rejected" ? "invalid_input" : finalCode,
+        finalCode === "decision_refresh_required"
+          ? finalCode
+          : finalStatus === "rejected" ? "invalid_input" : finalCode,
       );
     } catch (transitionError) {
       const durableAfterTransition = await readDurablePhase(deps, active);
@@ -1311,7 +1313,9 @@ async function runAgenticGenerationInternal(
         publishedCode = winner.errorCode;
       } else {
         if (durableAfterTransition) active.phase = durableAfterTransition;
-        publishedCode = asErrorCode(transitionError);
+        if (finalCode !== "decision_refresh_required") {
+          publishedCode = asErrorCode(transitionError);
+        }
       }
     }
     return {

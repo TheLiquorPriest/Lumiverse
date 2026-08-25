@@ -373,10 +373,37 @@ export interface EffectiveRuntimeDecisionV1 extends EffectiveRuntimePublicRespon
   internal: RuntimeDecisionInternalV1;
 }
 
+export type RuntimeDecisionRefreshMismatchV1 =
+  | "effective_mode"
+  | "root_connection"
+  | "user_id"
+  | "chat_id"
+  | "target_digest"
+  | "request_epoch"
+  | "turn_fence"
+  | "logical_connection_id"
+  | "concrete_connection_id"
+  | "provider"
+  | "model"
+  | "fingerprint"
+  | "capability_digest"
+  | "candidate_revision"
+  | "credential_revision"
+  | "endpoint_revision"
+  | "preset_id"
+  | "config_revision"
+  | "binding_revision"
+  | "input_revision_digest"
+  | "readiness_digest"
+  | "runtime_policy"
+  | "child_connections";
+
 export interface RuntimeDecisionTokenConsumptionV1 {
   accepted: boolean;
   code: "accepted" | "decision_refresh_required";
   decision: EffectiveRuntimeDecisionV1 | null;
+  /** Present only when a live re-resolve disagrees with the issued binding. */
+  mismatch?: RuntimeDecisionRefreshMismatchV1;
 }
 
 export interface ChatAgentModeWriteV1 {

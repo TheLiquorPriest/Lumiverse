@@ -1213,7 +1213,11 @@ describe("production agentic coordinator installation", () => {
         target,
         issued.runtimeDecisionToken!,
         new AbortController().signal,
-      )).rejects.toThrow("decision_refresh_required");
+      )).rejects.toMatchObject({
+        name: "AgenticGenerationError",
+        code: "decision_refresh_required",
+        message: "decision_refresh_required: config_revision",
+      });
     } finally {
       getDb().query("UPDATE preset_agent_configs SET config_revision = ? WHERE user_id = ? AND preset_id = ?").run(ADMITTED_CONFIG_REVISION, USER_ID, AGENTIC_PRESET_ID);
     }
@@ -1241,7 +1245,11 @@ describe("production agentic coordinator installation", () => {
         target,
         issued.runtimeDecisionToken!,
         new AbortController().signal,
-      )).rejects.toThrow("decision_refresh_required");
+      )).rejects.toMatchObject({
+        name: "AgenticGenerationError",
+        code: "decision_refresh_required",
+        message: "decision_refresh_required: binding_revision",
+      });
     } finally {
       getDb().query("UPDATE preset_agent_configs SET binding_revision = ? WHERE user_id = ? AND preset_id = ?").run(ADMITTED_BINDING_REVISION, USER_ID, AGENTIC_PRESET_ID);
     }

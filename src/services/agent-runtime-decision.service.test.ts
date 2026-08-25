@@ -125,6 +125,8 @@ function makeService(options: {
   presetReviewAcknowledged?: boolean;
   resolveCouncilProfile?: RuntimeDecisionDependencies["resolveCouncilProfile"];
   getReadinessVector?: RuntimeDecisionDependencies["getReadinessVector"];
+  getInputRevisions?: RuntimeDecisionDependencies["getInputRevisions"];
+  now?: () => number;
 } = {}) {
   const chat = {
     id: CHAT_ID,
@@ -187,6 +189,8 @@ function makeService(options: {
       },
       resolveProfile: () => ({ preset_id: preset?.id ?? null, source: "chat", binding: null }),
       ...(options.resolveCouncilProfile ? { resolveCouncilProfile: options.resolveCouncilProfile } : {}),
+      ...(options.getInputRevisions ? { getInputRevisions: options.getInputRevisions } : {}),
+      ...(options.getReadinessVector ? { getReadinessVector: options.getReadinessVector } : {}),
       resolvePersona: () => ({ id: "persona-a" }),
       resolveConcreteConnection: async (_userId, logicalId) => logicalId ? connections[logicalId] ?? null : null,
       getChatAgentModeOverride: () => override,
@@ -303,7 +307,12 @@ describe("AgentRuntimeDecisionService", () => {
     const issuedAgain = await service.resolve(USER_ID, request());
     connections.root = connection("root", { candidateRevision: "changed" });
     const stale = await service.consume(USER_ID, issuedAgain.runtimeDecisionToken!, request());
-    expect(stale).toEqual({ accepted: false, code: "decision_refresh_required", decision: null });
+    expect(stale).toEqual({
+      accepted: false,
+      code: "decision_refresh_required",
+      decision: null,
+      mismatch: "candidate_revision",
+    });
 
     connections.root = connection("root");
     const issuedCapability = await service.resolve(USER_ID, request());
@@ -312,7 +321,12 @@ describe("AgentRuntimeDecisionService", () => {
       capabilities: { ...admittedCapabilities, adapterRevision: "changed" },
     });
     const staleCapability = await service.consume(USER_ID, issuedCapability.runtimeDecisionToken!, request());
-    expect(staleCapability).toEqual({ accepted: false, code: "decision_refresh_required", decision: null });
+    expect(staleCapability).toEqual({
+      accepted: false,
+      code: "decision_refresh_required",
+      decision: null,
+      mismatch: "capability_digest",
+    });
 
     connections.root = connection("root");
     const issuedExpired = await service.resolve(USER_ID, request());
@@ -705,6 +719,41 @@ describe("AgentRuntimeDecisionService", () => {
     expect(serialized).not.toContain("secret-root");
     expect(serialized).not.toContain("domain-a");
     expect((publicProjection as unknown as Record<string, unknown>).internal).toBeUndefined();
+  });
+
+
+  test("unforced and forced preset forcePresetId survive same-call consume", async () => {
+    const service = makeService({
+      getInputRevisions: (_userId, request) => ({
+        ...fullRevisions,
+        macro: request.forcePresetId === true ? 99 : 17,
+      }),
+    });
+    const unforcedIssued = await service.resolve(USER_ID, request({ forcePresetId: false }));
+    const unforced = await service.consume(USER_ID, unforcedIssued.runtimeDecisionToken!, request({ forcePresetId: false }));
+    expect(unforced.accepted).toBe(true);
+    expect(unforced.code).toBe("accepted");
+
+    const forcedIssued = await service.resolve(USER_ID, request({ forcePresetId: true }));
+    const forced = await service.consume(USER_ID, forcedIssued.runtimeDecisionToken!, request({ forcePresetId: true }));
+    expect(forced.accepted).toBe(true);
+    expect(forced.code).toBe("accepted");
+  });
+
+  test("live input revision digest drift returns the exact mismatch", async () => {
+    let chatRevision: number = 2;
+    const service = makeService({
+      getInputRevisions: () => ({ ...fullRevisions, chat: chatRevision }),
+    });
+    const issued = await service.resolve(USER_ID, request());
+    chatRevision = 99;
+    const consumed = await service.consume(USER_ID, issued.runtimeDecisionToken!, request());
+    expect(consumed).toEqual({
+      accepted: false,
+      code: "decision_refresh_required",
+      decision: null,
+      mismatch: "input_revision_digest",
+    });
   });
 });
 
