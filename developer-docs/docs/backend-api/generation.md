@@ -342,9 +342,8 @@ child connection must have the same trust-domain fingerprint. The required
 capability set is `generation`, `streaming`, `tool_calling`,
 `native_tool_continuation`, and `tools_disabled_finalization`; a missing
 capability, unresolved/stale slot, changed target, incomplete revision set,
-invalid cognition/context authorization, unavailable isolate/publication
-health, or kill switch prevents Agentic admission and exposes the Response
-escape.
+invalid cognition, unavailable isolate/publication health, or kill switch
+prevents Agentic admission and exposes the Response escape.
 
 The decision token is opaque, bound to the authenticated user, chat/target,
 request epoch, concrete candidate and revisions, config/bindings, input
@@ -362,11 +361,14 @@ preprocessing isolate. It contains the selected preset and ordered blocks,
 target chat/messages/swipes, persona/character/group facts, prompt-variable
 state, active regex rows, deterministic world/lore books, entries and state,
 settings used by macros/token accounting, concrete connection identity,
-normalized V2 config, frozen context-pack candidates/attachments/ACL, immutable
+normalized V2 config, frozen Loom/task cognition policy, immutable
 tool/participant availability, preparation limits, and a closed
-`InputRevisionSetV1`. `extensionData` and `ambientSpindleData` are explicitly
-`null`; no database handle, callback, extension registry, or live Spindle
-registry crosses the boundary.
+`InputRevisionSetV1`. Native World Info and Databank assembly remains outside
+Loom: those systems resolve their live attached objects through their existing
+activation, placement, automatic retrieval, and explicit `#slug` paths.
+`extensionData` and `ambientSpindleData` are explicitly `null`; no database
+handle, callback, extension registry, or live Spindle registry crosses the
+boundary.
 
 The strict worker protocol has only two operations:
 `compile_agent_assembly` and `prepare_agent_render`. `AssemblyPlanV1` returns
@@ -398,17 +400,19 @@ with independent `workStatus` and `workOutcome` fields. The coordinator names
 are internal execution states, not public phase values: `COMPLETE` projects as
 `PREPARE_COMMIT`; `COMMITTING`/`PREPARE_COMMIT` project as `COMMIT`;
 `COMMITTED` projects as terminal `completed`; and `COMMIT_FAILED` projects as
-terminal `failed`. Internal `CANCELLED`, `TIMED_OUT`, and `EXHAUSTED` states
-project as terminal `stopped`, `failed`, and `exhausted` outcomes respectively.
+terminal `failed`. Internal `CANCELLED` projects as terminal `stopped`;
+`TIMED_OUT` (including `root_wall_clock_limit_exceeded`) projects as terminal
+`failed`; and `EXHAUSTED` projects as terminal `exhausted` only for a
+host-enforced budget or limit exhaustion.
 
 | Phase | Contract |
 |---|---|
 | `ASSEMBLE` | Freeze the snapshot, validate the effective decision, compile `AssemblyPlanV1` in two independently supervised terminable isolates, and compare their plans. No generation mutation or child execution occurs. |
-| `WORK` | First reserve and execute the deterministic child descriptors in traversal order, substituting each bounded result once; then run the root provider loop with bounded in-memory provider work notes. The allowlist is `complete_turn`, workspace reads (`workspace_read_section`, `workspace_read_page`), workspace mutations (`workspace_create_task` (root-only), `workspace_update_assigned_progress` (child-only), `workspace_submit_child_result` (child-only), `workspace_accept_submission` (root-only), `workspace_record_finding`, `workspace_record_decision`, `workspace_record_question`, `workspace_attach_artifact`, `workspace_propose_publication`), `context_pack_list`, `context_pack_get`, `agent_delegate`, and the six core retrieval tools: `lore_list_books`, `lore_get_book`, `lore_list_entries`, `lore_get_entry`, `lore_search_entries`, and `chat_search_history`. Extension, MCP, Council, and generic Spindle tools are absent. |
+| `WORK` | First reserve and execute the deterministic child descriptors in traversal order, substituting each bounded result once; then run the root provider loop with bounded in-memory provider work notes. The allowlist is `complete_turn`, workspace reads (`workspace_read_section`, `workspace_read_page`), workspace mutations (`workspace_create_task` (root-only), `workspace_update_assigned_progress` (child-only), `workspace_submit_child_result` (child-only), `workspace_accept_submission` (root-only), `workspace_record_finding`, `workspace_record_decision`, `workspace_record_question`, `workspace_attach_artifact`, `workspace_propose_publication`), `agent_delegate`, and the six core retrieval tools: `lore_list_books`, `lore_get_book`, `lore_list_entries`, `lore_get_entry`, `lore_search_entries`, and `chat_search_history`. |
 | `COMPLETE` | The post-acceptance boundary after WORK's sole-call `complete_turn`: required tasks, actions, submissions, and calls are settled, and the workspace is frozen for finalization. Tool-free boundaries are re-prompted in WORK while budget remains; exhaustion enters `EXHAUSTED` with no render or commit. |
-| `RENDER` | Use the same frozen root connection and model with `tools: []`, `toolMode: "finalization"`, and one final-render reservation. Native continuation may reuse only that frame's opaque adapter carrier; legacy continuation uses only the private frame transcript. A returned tool call is a protocol failure and is never executed. |
+| `RENDER` | Use the same frozen root connection and model with `tools: []`, `toolMode: "finalization"`, and one final-render reservation. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance cross from private WORK; raw retrieval and work notes do not. Native continuation may reuse only that frame’s opaque adapter carrier; legacy continuation uses only the private frame transcript. A returned tool call is a protocol failure and is never executed. |
 | `PREPARE_COMMIT` | Send frozen render content plus pure snapshotted inputs to `prepare_agent_render` in the strict isolate. It performs bounded reasoning-tag cleanup, response transforms, formatting healing, source-message/macro preparation, target/swipe reconciliation, and usage calculation, returning typed deltas only. |
-| `COMMITTING` | Recompute every `InputRevisionSetV1` member and context ACL gate. A single CAS owns this boundary; cancellation/deadline can win before it, while Stop after it is `too_late`. |
+| `COMMITTING` | Recompute every `InputRevisionSetV1` member. A single CAS owns this boundary; cancellation/deadline can win before it, while Stop after it is `too_late`. |
 | `COMMITTED` | One synchronous SQLite transaction writes the message/swipe/extras, authorized macro/source/chat/world-info/regex deltas, artifact references, terminal handoff, projection, and idempotent receipt. Duplicate commit returns the existing receipt. |
 Unknown phase transitions fail closed. A reversible-phase provider/protocol
 failure, cancellation, or deadline enters `FAILED`, `CANCELLED`, or
@@ -433,12 +437,8 @@ The request `AbortSignal` is connected to the Agentic owner. Exact root
 `POST /api/v1/agent-runs/:turnId/stop` is projection-gated: it accepts a
 reversible `ASSEMBLE` or `WORK` run and returns `too_late` from `COMPLETE`,
 `RENDER`, `PREPARE_COMMIT`, or `COMMITTING` onward. The existing
-`/api/v1/generate/stop` generation- or chat-scoped route uses the
-same Agentic owner but currently serializes its boolean compatibility result:
-an accepted cancellation returns `{ stopped: true }`; a terminal or
-`COMMITTING`/later cancellation that cannot be accepted returns
-`{ stopped: false }` (and a generation-id race may try the supplied chat
-fallback). Use the exact Agent Run Stop route when the `too_late` distinction
+`/api/v1/generate/stop` generation- or chat-scoped route uses the same
+Agentic owner and returns `{ stopped: boolean, status: "accepted" | "too_late" | "not_found" }`; a generation-id race may try the supplied chat fallback. Use the exact Agent Run Stop route when the `too_late` distinction
 is required. A stop or deadline that wins before `COMMITTING` leaves no
 authoritative generation write.
 Startup runs `reconcileStartupState()` before `Bun.serve`: imports, artifact
@@ -450,6 +450,14 @@ available. The startup stage records stable failure outcomes rather than
 dispatching providers or publishing events. Readiness additionally requires the
 operational rollback switch below to be `auto`: the readiness vector carries
 `killSwitchState` and adds the `kill_switch_off` reason whenever it is not.
+The startup vector contains only those server-owned components that can be
+settled before a request selects a provider, preset binding, context snapshot,
+or input revision set. Provider capabilities, configuration/binding validity,
+context ACL authorization, and input-revision completeness are therefore
+request-admission checks: the effective-runtime decision validates the exact
+frozen request before issuing a dispatchable Agentic decision. A healthy
+startup vector never substitutes for those per-request checks.
+
 
 Agentic turns join the standard generation compatibility stream without
 exposing private work:
@@ -489,10 +497,9 @@ carries `killSwitchState: "off"` and the `kill_switch_off` reason, and
 Agentic request still fails closed instead of downgrading silently.
 
 Rollback is therefore a restart with the variable removed or set to `off`. It
-changes no schema and deletes no data: preset `AgentConfigV2`, context packs,
-cognition state, and existing Agent Run projections are retained and become live
-again when the switch returns to `auto`. Schema rollback is the separate,
-narrower boundary in
+changes no schema and deletes no data: preset `AgentConfigV2`, cognition state,
+and existing Agent Run projections are retained and become live again when the
+switch returns to `auto`. Schema rollback is the separate, narrower boundary in
 [Storage > Pre-bundle SQLite backup and downgrade boundary](storage.md#pre-bundle-sqlite-backup-and-downgrade-boundary).
 
 ### Implementation anchors
@@ -600,7 +607,7 @@ available explicit escape reported by preflight, not permission for an
 Agentic request to downgrade. The caller must submit `mode: 'response'` for
 that escape.
 
-### Explicit assembly surface and Loom delivery
+### Explicit assembly surface and Loom policy
 
 Prompt assembly has one required host-authenticated surface:
 `AssemblySurfaceV1 = 'RESPONSE' | 'WORK'`. The frozen
@@ -612,41 +619,41 @@ not run this assembly contract.
 The canonical authored policy is
 `AgentConfigV2.runtimePolicy.loomPolicy`, a `LoomPolicyBucketsV1` with
 exactly `workPolicy`, `workspaceUsage`, `completionCriteria`, and
-`renderPolicy` arrays. Every entry carries source provenance
+`renderPolicy` arrays. Loom owns only existing prompt blocks plus
+**Phased Instructions**; it does not create a second context authority. Every
+entry carries source provenance
 `{ kind: 'loom_block', blockId, presetRevision, blockRevision, promptOrder }`,
 one fixed `destination` (`root_work`, `completion_handoff`, or `render`),
 one fixed `checkpoint` (`ASSEMBLE`, `WORK`, `PREPARE_COMMIT`, or `RENDER`),
-`required`, `visibility: 'work_only'`, and one delivery:
-`{ delivery: 'direct' }`,
-`{ delivery: 'condition_gated', condition }`, or
-`{ delivery: 'on_demand', request: { contextPackId, revisionId, digest } }`.
+`required`, `visibility: 'work_only'`, and an optional typed `condition`.
+Conditions evaluate fail-closed only against the immutable snapshot at the
+owning checkpoint and remain fixed for that checkpoint.
 
 Routing is not configurable at runtime: `workPolicy` and `workspaceUsage`
-route to `root_work`/`WORK`, `completionCriteria` routes to
-`completion_handoff`/`PREPARE_COMMIT`, and `renderPolicy` routes to
-`render`/`RENDER`. The plan retains the canonical `loomPolicy` beside its
-materialized message arrays and source blocks. Response assembly excludes
-all `work_only` entries and exposes a typed `responseOmission`; no WORK
-policy, private work note, or child result is copied into a Response.
+route to `root_work`/`WORK` (root **WORK** / **WORK**), `completionCriteria`
+routes to `completion_handoff`/`PREPARE_COMMIT`, and `renderPolicy` routes to
+`render`/`RENDER` (tools-disabled **RENDER** / **RENDER**). The plan retains
+the canonical `loomPolicy` beside its materialized message arrays and source
+blocks. Custom phases are bounded and current-phase-only: later phase
+instructions are not materialized early. Each phase may declare explicit
+`childInstructionSubsets`; a child receives only its admitted subset, never
+the root phase instructions or another child’s subset.
 
-The owner inspection projection uses `LoomPromptInspectionV1`:
-`{ version, surface, checkpoint, items, effectiveEntryIds,
-responseOmission? }`. Each item identifies its bucket, destination,
-checkpoint, source, delivery, optional effective text/retrieval status, and a
-typed outcome: `included`, `skipped`, `rejected`, `omitted`, or
-`deduplicated`. This is provenance/inspection data, not authority to edit the
-preset.
+Response assembly excludes all `work_only` entries and exposes a typed
+`responseOmission`; no WORK policy, private work note, or WORK child result
+is copied into a Response. This omission is narrow: established Response
+assembly preserves the conversation and ordinary native World Book and
+Databank retrieval, while [Context Filters](../../../user-docs/docs/presets/context-filters.md) and unrelated native Loom content [packs](../../../user-docs/docs/packs/index.md) remain outside Loom.
+The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are
+not supported.
 
-The outcome reasons are closed. `skipped` uses
-`checkpoint_not_reached | condition_not_met | on_demand_not_requested |
-on_demand_unavailable`; `rejected` uses
-`invalid_source | stale_source | unsupported_delivery |
-unauthorized_retrieval | required_source_unavailable`; `omitted` uses
-`response_mode | destination_unavailable | not_work_surface`; and
-`deduplicated` carries `keptEntryId` and the retained destination.
-`included` carries `effectiveIndex`; on-demand entries may also carry
-`retrievalStatus: not_requested | available | unavailable | stale |
-unauthorized`.
+The unified owner inspection projection combines `LoomPromptInspectionV1` with prompt evidence. It explains routes and order, roles, conditions, exact source identities and revisions, hashes when recorded, one effective copy for each destination-level overlap while retaining every role/reason/overlap outcome, omissions, custom-phase and explicit child-subset receipts, accepted WORK-to-RENDER crossings, and tools/delegation. If a layer is unavailable or not recorded, inspection marks it unavailable; it is never inferred.
+
+The Loom inspection shape is `{ version, surface, checkpoint, items, effectiveEntryIds, responseOmission? }`; the public wire fields remain `inspection` and `responseOmission`. Each item identifies its bucket, destination, checkpoint, exact Loom source, optional typed condition and checkpoint result, requiredness, effective text, and a typed outcome: `included`, `skipped`, `rejected`, `omitted`, or `deduplicated`. On a Response surface, every omitted item carries the `response_mode` outcome and `responseOmission` explains the `work_only` boundary. This is inspection evidence, not authority to edit the preset.
+
+The outcome reasons are closed. `skipped` uses `checkpoint_not_reached | condition_not_met | stale_source`; `rejected` uses `invalid_source | stale_source | required_source_unavailable`; `omitted` uses `response_mode | destination_unavailable | not_work_surface`; and `deduplicated` carries `keptEntryId` and the retained destination. `included` carries `effectiveIndex`.
+
+World Books and Databank content is not a Loom inspection entry or pinned external source. Their native evidence reports the source identity and content hash actually used when available; Loom does not own, pin, or repair it.
 
 ### WORK tools, delegation, and receipts
 
@@ -655,26 +662,35 @@ The strict WORK catalog is closed:
 `complete_turn`;
 `workspace_read_section`, `workspace_read_page`,
 `workspace_create_task`, `workspace_update_assigned_progress`,
-`workspace_submit_child_result`, `workspace_accept_submission`,
+`workspace_submit_child_result`, `workspace_submit_root_result`,
+`workspace_accept_submission`,
 `workspace_record_finding`, `workspace_record_decision`,
 `workspace_record_question`, `workspace_attach_artifact`,
 `workspace_propose_publication`;
-`context_pack_list`, `context_pack_get`; and
+
 `lore_list_books`, `lore_get_book`, `lore_list_entries`, `lore_get_entry`,
 `lore_search_entries`, `chat_search_history`.
 
-`agent_delegate` is not an ordinary catalog entry. It is a separate
-root-only dispatch capability. Its closed arguments are
+`agent_delegate` is a root-only dispatch capability. Its closed arguments are
 `profile_id`, `task_id`, `task`, and optional narrowed `tool_ids`. Admission
 checks the reviewed profile, open task inventory, exact assignment
 acknowledgement, depth-one frame limit, and child output bounds. Root frames
 alone may call `complete_turn` (with bounded `summary`, `unresolvedIds`, and
-optional `renderGuidance`); children cannot complete or delegate.
+optional `renderGuidance`).
 
-Root-only workspace operations are `workspace_create_task` and
-`workspace_accept_submission`. A child may use only the read, assigned-progress,
-and assigned-submission operations granted to its frame; all other workspace
-operations require an explicit host grant.
+Root-only workspace operations are `workspace_create_task`,
+`workspace_submit_root_result`, and `workspace_accept_submission`. A root
+provider may submit a bounded result only for its own unassigned task;
+assigned child tasks remain child-confined. A child may use only the read,
+assigned-progress, and assigned-submission operations granted to its frame; all
+other workspace operations require an explicit host grant.
+
+When a dynamically assigned child fails, is cancelled, or times out, the host
+settles that exact task/frame pair as `failed` or `cancelled` before exposing
+the next root checkpoint. Optional failures remain nonblocking. A required
+failure is retained as the original terminal code while configured recovery
+phases may record findings/decisions and complete; only after the bounded
+recovery path exits or exhausts does WORK return the required failure.
 
 Children receive only granted core tools and host-assigned workspace
 operations. Workspace tool calls carry host-authenticated actor/frame
@@ -789,7 +805,9 @@ scope and revision CAS; body-supplied owner, chat, actor, or publication
 authority is never trusted. It can outlive a Turn Session or detach from a
 deleted chat. Publication stores an independent bounded copy with source
 digest/provenance; it is not a canonical chat message and does not grant
-WORK authority.
+WORK authority. The retained-session route is bounded end-to-end with the
+shared `limit`/`offset` pagination contract (`limit` default `50`, maximum
+`1000`) and returns `{ data, total, limit, offset }`.
 
 ## Reasoning / extended thinking
 

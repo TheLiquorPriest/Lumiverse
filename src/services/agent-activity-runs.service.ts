@@ -28,10 +28,8 @@ import type {
   CognitionPredicateV1,
   CognitionScalar,
   CognitionValue,
-  LoomOnDemandRetrievalStatusV1,
   LoomPolicyBucketV1,
   LoomPolicyCheckpointV1,
-  LoomPolicyDeliveryV1,
   LoomPolicyDestinationV1,
   LoomPolicySourceV1,
   LoomPromptInspectionItemV1,
@@ -66,7 +64,10 @@ import type {
   AgentInspectionUsageLayerV1,
   AgentInspectionUsageProjectionV1,
   AgentInspectionUsageV1,
+  AgentPromptDatabankSourceV1,
   AgentPromptEvidenceV1,
+  AgentPromptNativeProvenanceV1,
+  AgentRenderCrossingV1,
   AgentRunGenerationTypeV1,
   AgentRunInspectionDetailV1,
   AgentRunInspectionListV1,
@@ -76,6 +77,8 @@ import type {
   AgentTurnSessionEntryV1,
   AgentWorkspaceAssociationV1,
 } from "../types/agent-run-projection";
+
+import { compareUtf8 } from "../utils/utf8-order";
 
 type InspectionObject = Record<string, unknown>;
 
@@ -89,10 +92,76 @@ const MAX_NODES_PER_SNAPSHOT = 128;
 const MAX_ERROR_CODES = 64;
 const MAX_COUNTER = Number.MAX_SAFE_INTEGER;
 const encoder = new TextEncoder();
+export const AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES = 1024;
+
+const AGENT_RUN_INSPECTION_CURSOR_PREFIX = "v1.";
+
+interface AgentRunInspectionCursor {
+  readonly updatedAt: number;
+  readonly attemptId: string;
+}
+
+function encodeAgentRunInspectionCursor(updatedAt: number, attemptId: string): string {
+  return `${AGENT_RUN_INSPECTION_CURSOR_PREFIX}${Buffer.from(
+    JSON.stringify({ v: 1, t: updatedAt, i: attemptId }),
+    "utf8",
+  ).toString("base64url")}`;
+}
+
+function decodeAgentRunInspectionCursor(value: unknown): AgentRunInspectionCursor | null {
+  if (
+    typeof value !== "string"
+    || value.length === 0
+    || encoder.encode(value).byteLength > AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES
+    || !value.startsWith(AGENT_RUN_INSPECTION_CURSOR_PREFIX)
+  ) {
+    return null;
+  }
+  const encoded = value.slice(AGENT_RUN_INSPECTION_CURSOR_PREFIX.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(encoded)) return null;
+  let decoded: string;
+  try {
+    const bytes = Buffer.from(encoded, "base64url");
+    decoded = bytes.toString("utf8");
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== encoded) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    const updatedAt = record.t;
+    const attemptId = record.i;
+    if (
+      record.v !== 1
+      || typeof updatedAt !== "number"
+      || !Number.isSafeInteger(updatedAt)
+      || updatedAt < -1
+      || typeof attemptId !== "string"
+      || attemptId.length === 0
+      || encoder.encode(attemptId).byteLength > MAX_ID_BYTES
+    ) {
+      return null;
+    }
+    return { updatedAt, attemptId };
+  } catch {
+    return null;
+  }
+}
+
+export function isValidAgentRunInspectionCursor(value: string): boolean {
+  return decodeAgentRunInspectionCursor(value) !== null;
+}
+
 
 const LIFECYCLES = new Set<AgentActivityLifecycle>([
   "queued", "running", "completed", "failed", "cancelled", "timed_out",
 ]);
+export function __test__mintAgentRunInspectionCursor(updatedAt: number, attemptId: string): string {
+  return encodeAgentRunInspectionCursor(updatedAt, attemptId);
+}
+
 const NODE_KINDS = new Set<AgentActivityNodeKind>([
   "root_turn", "provider_round", "child_invocation", "tool_attempt",
 ]);
@@ -288,13 +357,25 @@ export function persistTerminalAgentActivityRunInTransaction(
   if (!prepared) return null;
   const serialized = serializeRun(prepared);
   if (!serialized) return null;
+  const existing = db.query(
+    `SELECT id, generation_id, chat_id, target_message_id, target_swipe_id, snapshot_json, byte_size
+       FROM agent_activity_runs
+      WHERE user_id = ? AND chat_id = ? AND generation_id = ?
+      LIMIT 1`,
+  ).get(input.userId, input.chatId, prepared.generationId) as AgentActivityRunRow | null;
+  if (existing) {
+    const existingRun = decodeRow(existing);
+    const same = existingRun !== null
+      && existing.target_message_id === serialized.run.targetMessageId
+      && existing.target_swipe_id === serialized.run.targetSwipeId
+      && JSON.stringify(existingRun) === JSON.stringify(serialized.run);
+    if (!same) throw new Error("agent activity replay identity conflict");
+    return existingRun;
+  }
   db.query(
     `INSERT INTO agent_activity_runs
       (user_id, chat_id, generation_id, target_message_id, target_swipe_id, snapshot_json, byte_size)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(user_id, chat_id, generation_id) DO UPDATE SET
-      target_message_id = excluded.target_message_id, target_swipe_id = excluded.target_swipe_id,
-      snapshot_json = excluded.snapshot_json, byte_size = excluded.byte_size, created_at = unixepoch()`,
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.userId,
     input.chatId,
@@ -358,6 +439,22 @@ const INSPECTION_PHASES = new Set([
 ]);
 const INSPECTION_STATUSES = new Set(["pending", "running", "waiting", "cancelling", "terminal"]);
 const INSPECTION_OUTCOMES = new Set(["completed", "stopped", "failed", "exhausted", "rejected"]);
+const INSPECTION_PHASE_RANK: Readonly<Record<string, number>> = {
+  ADMIT: 0,
+  ASSEMBLE: 1,
+  WORK: 2,
+  PREPARE_COMMIT: 3,
+  RENDER: 4,
+  COMMIT: 5,
+  TERMINAL: 6,
+};
+const INSPECTION_STATUS_RANK: Readonly<Record<string, number>> = {
+  pending: 0,
+  running: 1,
+  waiting: 2,
+  cancelling: 3,
+  terminal: 4,
+};
 const INSPECTION_REASONS = new Set([
   "none", "user_stop", "deadline", "provider_failure", "tool_failure", "required_work_failure",
   "budget_exhausted", "invalid_input", "stale_input", "unavailable", "needs_attention",
@@ -394,9 +491,9 @@ function normalizeInspectionGenerationType(value: unknown): AgentRunGenerationTy
 }
 
 const SECRET_KEYS = new Set([
-  "apikey", "access_token", "accesstoken", "refresh_token", "refreshtoken", "id_token",
-  "idtoken", "authorization", "cookie", "password", "secret", "client_secret",
-  "clientsecret", "private_key", "privatekey", "credential", "credentials",
+  "apikey", "accesstoken", "refreshtoken", "idtoken", "authorization", "cookie",
+  "password", "secret", "clientsecret", "privatekey", "credential", "credentials",
+  "encryptionkey",
 ]);
 const inspectionEncoder = new TextEncoder();
 type InspectionRecordKind =
@@ -529,6 +626,136 @@ interface InspectionAttemptRow {
   readonly created_at: number;
 }
 
+const MAX_WORKSPACE_ID_BYTES = 128;
+
+function sortedInspectionValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => sortedInspectionValue(item));
+  if (!value || typeof value !== "object") return value;
+  const object = inspectionObject(value);
+  return Object.fromEntries(
+    Object.keys(object)
+      .sort(compareUtf8)
+      .map((key) => [key, sortedInspectionValue(object[key])]),
+  );
+}
+
+const AUDIT_VOLATILE_KEYS: Readonly<Record<string, true>> = {
+  late: true,
+  reordered: true,
+  sequence: true,
+  hostSequence: true,
+  occurredAt: true,
+  firstSequence: true,
+  lastSequence: true,
+};
+
+function auditComparisonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => auditComparisonValue(item));
+  if (!value || typeof value !== "object") return value;
+  const object = inspectionObject(value);
+  return Object.fromEntries(
+    Object.keys(object)
+      .filter((key) => AUDIT_VOLATILE_KEYS[key] !== true)
+      .sort(compareUtf8)
+      .map((key) => [key, auditComparisonValue(object[key])]),
+  );
+}
+
+function canonicalInspectionJson(value: unknown): string {
+  try {
+    return JSON.stringify(sortedInspectionValue(value)) ?? "{}";
+  } catch {
+    return "{}";
+  }
+}
+
+function canonicalAuditComparisonJson(value: unknown): string {
+  try {
+    return JSON.stringify(auditComparisonValue(value)) ?? "{}";
+  } catch {
+    return "{}";
+  }
+}
+
+interface ExistingAuditRecordRow {
+  readonly record_id: string;
+  readonly user_id: string;
+  readonly chat_id: string;
+  readonly attempt_id: string;
+  readonly record_kind: string;
+  readonly event_id: string | null;
+  readonly host_sequence: number;
+  readonly occurred_at: number;
+  readonly late: number;
+  readonly payload_json: string;
+  readonly dedupe_key: string | null;
+}
+/** Tracks durable rows already present plus one reserved slot for a truthful truncation marker. */
+interface InspectionRecordBudget {
+  remaining: number;
+  truncationReserved: boolean;
+  omitted: boolean;
+}
+
+class InspectionRecordCapacityError extends Error {
+  constructor() {
+    super("inspection record budget exhausted");
+    this.name = "InspectionRecordCapacityError";
+  }
+}
+
+function createInspectionRecordBudget(db: Database, row: InspectionAttemptRow): InspectionRecordBudget {
+  const stored = db.query(
+    `SELECT COUNT(*) AS count
+       FROM agent_run_audit_records
+      WHERE user_id = ? AND attempt_id = ?`,
+  ).get(row.user_id, row.attempt_id) as { count: number };
+  const free = Math.max(0, AGENT_RUN_INSPECTION_MAX_RECORDS - Math.max(0, stored.count));
+  return {
+    remaining: Math.max(0, free - (free > 0 ? 1 : 0)),
+    truncationReserved: free > 0,
+    omitted: false,
+  };
+}
+
+function reserveInspectionRecordCapacity(
+  budget: InspectionRecordBudget | undefined,
+  useTruncationReservation: boolean,
+): void {
+  if (!budget) return;
+  if (useTruncationReservation && budget.truncationReserved) {
+    budget.truncationReserved = false;
+    return;
+  }
+  if (budget.remaining <= 0) throw new InspectionRecordCapacityError();
+  budget.remaining -= 1;
+}
+
+
+function loadExistingAuditRecord(
+  db: Database,
+  row: InspectionAttemptRow,
+  kind: InspectionRecordKind,
+  id: string,
+  recordId: string,
+): ExistingAuditRecordRow | null {
+  const byDedupe = db.query(
+    `SELECT record_id, user_id, chat_id, attempt_id, record_kind, event_id,
+            host_sequence, occurred_at, late, payload_json, dedupe_key
+       FROM agent_run_audit_records
+      WHERE user_id = ? AND attempt_id = ? AND record_kind = ? AND dedupe_key = ?
+      LIMIT 1`,
+  ).get(row.user_id, row.attempt_id, kind, id) as ExistingAuditRecordRow | null;
+  if (byDedupe) return byDedupe;
+  return db.query(
+    `SELECT record_id, user_id, chat_id, attempt_id, record_kind, event_id,
+            host_sequence, occurred_at, late, payload_json, dedupe_key
+       FROM agent_run_audit_records
+      WHERE record_id = ?
+      LIMIT 1`,
+  ).get(recordId) as ExistingAuditRecordRow | null;
+}
+
 function boundedInspectionString(value: unknown, maxBytes = MAX_ID_BYTES): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
   return inspectionEncoder.encode(value).byteLength <= maxBytes ? value : null;
@@ -556,23 +783,18 @@ function sanitizeInspectionValue(value: unknown, depth = 0): unknown {
   if (Array.isArray(value)) return value.slice(0, 256).map((item) => sanitizeInspectionValue(item, depth + 1));
   const result: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(inspectionObject(value))) {
-    const normalized = key.toLowerCase().replace(/[-\s]/g, "_");
+    const normalized = key.toLowerCase().replace(/[-_\s]/g, "");
     if (SECRET_KEYS.has(normalized) || normalized.includes("credential") || normalized.includes("secret")) continue;
-    if (normalized === "otheruserdata" || normalized === "other_user_data") continue;
+    if (normalized === "otheruserdata") continue;
     result[key] = sanitizeInspectionValue(item, depth + 1);
   }
   return result;
 }
 
 function boundedInspectionJson(value: unknown, maxBytes: number): string {
-  let json: string;
-  try {
-    json = JSON.stringify(sanitizeInspectionValue(value)) ?? "{}";
-  } catch {
-    json = "{}";
-  }
+  const json = canonicalInspectionJson(sanitizeInspectionValue(value));
   if (inspectionEncoder.encode(json).byteLength <= maxBytes) return json;
-  return JSON.stringify({ omitted: true, marker: "truncated" });
+  return canonicalInspectionJson({ omitted: true, marker: "truncated" });
 }
 
 function normalizeInspectionPhase(value: unknown): AgentInspectionLifecycleV1 {
@@ -740,7 +962,9 @@ function auditRecord(
   late = false,
   postTerminal = false,
   emitMarkers = true,
-): void {
+  budget?: InspectionRecordBudget,
+  useTruncationReservation = false,
+): InspectionObject {
   const source = inspectionObject(sanitizeInspectionValue(value));
   const hasExplicitSequence = source.sequence !== undefined
     || source.hostSequence !== undefined
@@ -753,32 +977,94 @@ function auditRecord(
   const reordered = source.reordered === true
     || (hasExplicitSequence && previous?.max_sequence != null && sequence < previous.max_sequence);
   const recordLate = late || postTerminal || source.late === true;
-  const payload = source;
-  payload.version = 1;
-  payload.correlation = inspectionCorrelation(row, payload.correlation, sequence);
-  if (recordLate) payload.late = true;
-  if (reordered) payload.reordered = true;
-  const json = boundedInspectionJson(payload, AGENT_RUN_INSPECTION_MAX_RECORD_BYTES);
-  db.query(
-    `INSERT OR IGNORE INTO agent_run_audit_records
-      (record_id, user_id, chat_id, attempt_id, record_kind, event_id, host_sequence,
-       occurred_at, late, payload_json, byte_size, dedupe_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    `${row.user_id}:${row.attempt_id}:${kind}:${id}`,
-    row.user_id,
-    row.chat_id,
-    row.attempt_id,
-    kind,
-    id,
-    sequence,
-    occurredAt,
-    recordLate ? 1 : 0,
-    json,
-    inspectionEncoder.encode(json).byteLength,
-    id,
-  );
-  if (!emitMarkers) return;
+  const candidate: InspectionObject = {
+    ...source,
+    version: 1,
+    correlation: inspectionCorrelation(row, source.correlation, sequence),
+  };
+  let payload: InspectionObject;
+  if (kind === "workspace") {
+    const normalized = normalizeInspectionWorkspace(row, candidate);
+    if (!normalized) throw new Error("invalid workspace association");
+    payload = inspectionObject(normalized);
+  } else {
+    payload = candidate;
+    if (recordLate) payload.late = true;
+    if (reordered) payload.reordered = true;
+  }
+  const json = kind === "workspace"
+    ? canonicalInspectionJson(payload)
+    : boundedInspectionJson(payload, AGENT_RUN_INSPECTION_MAX_RECORD_BYTES);
+  let persistedPayload: InspectionObject;
+  try {
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid bounded audit payload");
+    persistedPayload = parsed as InspectionObject;
+  } catch {
+    throw new Error("invalid bounded audit payload");
+  }
+  const recordId = `${row.user_id}:${row.attempt_id}:${kind}:${id}`;
+  const existing = loadExistingAuditRecord(db, row, kind, id, recordId);
+  if (existing) {
+    if (
+      existing.record_id !== recordId
+      || existing.user_id !== row.user_id
+      || existing.chat_id !== row.chat_id
+      || existing.attempt_id !== row.attempt_id
+      || existing.record_kind !== kind
+      || existing.event_id !== id
+      || existing.dedupe_key !== id
+    ) {
+      throw new Error("audit record identity conflict");
+    }
+    let existingPayload: InspectionObject;
+    try {
+      const parsed = JSON.parse(existing.payload_json);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid audit payload");
+      existingPayload = parsed as InspectionObject;
+    } catch {
+      throw new Error("invalid existing audit payload");
+    }
+    if (kind === "workspace") {
+      const currentWorkspace = normalizeInspectionWorkspace(row, payload);
+      const persistedWorkspace = normalizeInspectionWorkspace(row, persistedPayload);
+      const existingWorkspace = normalizeInspectionWorkspace(row, existingPayload);
+      if (
+        !currentWorkspace
+        || !persistedWorkspace
+        || !existingWorkspace
+        || !workspaceAssociationReplayMatches(persistedWorkspace, existingWorkspace)
+      ) {
+        throw new Error("audit record payload conflict");
+      }
+    } else if (
+      canonicalAuditComparisonJson(existingPayload) !== canonicalAuditComparisonJson(persistedPayload)
+    ) {
+      throw new Error("audit record payload conflict");
+    }
+  } else {
+    reserveInspectionRecordCapacity(budget, useTruncationReservation);
+    db.query(
+      `INSERT INTO agent_run_audit_records
+        (record_id, user_id, chat_id, attempt_id, record_kind, event_id, host_sequence,
+         occurred_at, late, payload_json, byte_size, dedupe_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      recordId,
+      row.user_id,
+      row.chat_id,
+      row.attempt_id,
+      kind,
+      id,
+      sequence,
+      occurredAt,
+      recordLate ? 1 : 0,
+      json,
+      inspectionEncoder.encode(json).byteLength,
+      id,
+    );
+  }
+  if (!emitMarkers) return payload;
 
   const markerValues: Array<{
     kind: "late_event" | "reordered_event";
@@ -797,28 +1083,184 @@ function auditRecord(
     });
   }
   for (const marker of markerValues) {
-    auditRecord(
-      db,
-      row,
-      "marker",
-      `${kind}:${id}:${marker.kind}`,
-      {
-        id: `${kind}:${id}:${marker.kind}`,
-        kind: marker.kind,
-        scope: INSPECTION_MARKER_SCOPES[kind],
-        correlation: payload.correlation,
-        firstSequence: sequence,
-        lastSequence: sequence,
-        recoverable: true,
-        detail: marker.detail,
-      },
-      sequence,
-      occurredAt,
-      recordLate,
-      false,
-      false,
-    );
+    try {
+      auditRecord(
+        db,
+        row,
+        "marker",
+        `${kind}:${id}:${marker.kind}`,
+        {
+          id: `${kind}:${id}:${marker.kind}`,
+          kind: marker.kind,
+          scope: INSPECTION_MARKER_SCOPES[kind],
+          correlation: payload.correlation,
+          firstSequence: sequence,
+          lastSequence: sequence,
+          recoverable: true,
+          detail: marker.detail,
+        },
+        sequence,
+        occurredAt,
+        recordLate,
+        false,
+        false,
+        budget,
+      );
+    } catch (error) {
+      if (!(error instanceof InspectionRecordCapacityError) || !budget) throw error;
+      budget.omitted = true;
+    }
   }
+  return payload;
+}
+
+function workspaceAssociationReplayMatches(
+  current: AgentWorkspaceAssociationV1,
+  accepted: AgentWorkspaceAssociationV1,
+): boolean {
+  return current.version === accepted.version
+    && current.id === accepted.id
+    && current.workspaceId === accepted.workspaceId
+    && current.workspaceRevision === accepted.workspaceRevision
+    && current.relation === accepted.relation
+    && current.objectKind === accepted.objectKind
+    && current.objectId === accepted.objectId
+    && current.sourceRevision === accepted.sourceRevision
+    && current.sourceDeleted === accepted.sourceDeleted
+    && current.provenanceDigest === accepted.provenanceDigest
+    && current.correlation.turnSessionId === accepted.correlation.turnSessionId
+    && current.correlation.runId === accepted.correlation.runId
+    && current.correlation.attemptId === accepted.correlation.attemptId
+    && current.correlation.chatId === accepted.correlation.chatId
+    && current.correlation.generationId === accepted.correlation.generationId
+    && current.correlation.messageId === accepted.correlation.messageId
+    && current.correlation.swipeId === accepted.correlation.swipeId
+    && current.correlation.actorId === accepted.correlation.actorId
+    && current.correlation.recipientId === accepted.correlation.recipientId
+    && current.correlation.phase === accepted.correlation.phase
+    && current.correlation.taskId === accepted.correlation.taskId
+    && current.correlation.toolId === accepted.correlation.toolId
+    && current.correlation.parentId === accepted.correlation.parentId
+    && current.correlation.hostCorrelationId === accepted.correlation.hostCorrelationId;
+}
+
+function persistWorkspaceAssociationProjection(
+  db: Database,
+  row: InspectionAttemptRow,
+  id: string,
+  currentPayload: InspectionObject,
+): void {
+  const associationTable = db.query(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_run_workspace_associations' LIMIT 1",
+  ).get() !== null;
+  const workspaceTable = db.query(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'persistent_workspaces' LIMIT 1",
+  ).get() !== null;
+  if (!associationTable || !workspaceTable) {
+    throw new Error("workspace association schema unavailable");
+  }
+  const current = normalizeInspectionWorkspace(row, currentPayload);
+  if (!current || current.id !== id) throw new Error("invalid workspace association");
+  const persistentWorkspace = db.query(
+    `SELECT workspace_id, chat_id, revision
+       FROM persistent_workspaces
+      WHERE workspace_id = ? AND user_id = ?
+      LIMIT 1`,
+  ).get(current.workspaceId, row.user_id) as {
+    workspace_id: string;
+    chat_id: string | null;
+    revision: number;
+  } | null;
+  if (!persistentWorkspace) {
+    throw new Error("workspace association workspace is not owned");
+  }
+  const audit = db.query(
+    `SELECT payload_json
+       FROM agent_run_audit_records
+      WHERE user_id = ? AND attempt_id = ? AND record_kind = 'workspace' AND dedupe_key = ?
+      LIMIT 1`,
+  ).get(row.user_id, row.attempt_id, id) as { payload_json: string } | null;
+  if (!audit) throw new Error("workspace association audit record missing");
+  let acceptedPayload: InspectionObject;
+  try {
+    const parsed = JSON.parse(audit.payload_json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid audit payload");
+    acceptedPayload = parsed as InspectionObject;
+  } catch {
+    throw new Error("invalid workspace association audit payload");
+  }
+  const accepted = normalizeInspectionWorkspace(row, acceptedPayload);
+  if (!accepted || accepted.id !== id) throw new Error("invalid accepted workspace association");
+  if (!workspaceAssociationReplayMatches(current, accepted)) {
+    throw new Error("workspace association identity conflict");
+  }
+  const existing = db.query(
+    `SELECT association_id, user_id, chat_id, attempt_id, workspace_id, workspace_revision,
+            relation, object_kind, object_id, source_revision, source_deleted,
+            provenance_digest, host_sequence
+       FROM agent_run_workspace_associations
+      WHERE association_id = ?
+      LIMIT 1`,
+  ).get(accepted.id) as {
+    association_id: string;
+    user_id: string;
+    chat_id: string;
+    attempt_id: string;
+    workspace_id: string;
+    workspace_revision: number;
+    relation: string;
+    object_kind: string;
+    object_id: string | null;
+    source_revision: number | null;
+    source_deleted: number;
+    provenance_digest: string | null;
+    host_sequence: number;
+  } | null;
+  if (existing) {
+    const matches = existing.user_id === row.user_id
+      && existing.chat_id === row.chat_id
+      && existing.attempt_id === row.attempt_id
+      && existing.workspace_id === accepted.workspaceId
+      && existing.workspace_revision === accepted.workspaceRevision
+      && existing.relation === accepted.relation
+      && existing.object_kind === accepted.objectKind
+      && existing.object_id === accepted.objectId
+      && existing.source_revision === accepted.sourceRevision
+      && existing.source_deleted === (accepted.sourceDeleted ? 1 : 0)
+      && existing.provenance_digest === accepted.provenanceDigest;
+    if (!matches) {
+      throw new Error("workspace association identity conflict");
+    }
+    return;
+  }
+  if (
+    persistentWorkspace.chat_id === null
+    || persistentWorkspace.chat_id !== row.chat_id
+    || persistentWorkspace.revision !== current.workspaceRevision
+  ) {
+    throw new Error("workspace association workspace boundary conflict");
+  }
+  db.query(
+    `INSERT INTO agent_run_workspace_associations
+      (association_id, user_id, chat_id, attempt_id, workspace_id, workspace_revision,
+       relation, object_kind, object_id, source_revision, source_deleted,
+       provenance_digest, host_sequence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    accepted.id,
+    row.user_id,
+    row.chat_id,
+    row.attempt_id,
+    accepted.workspaceId,
+    accepted.workspaceRevision,
+    accepted.relation,
+    accepted.objectKind,
+    accepted.objectId,
+    accepted.sourceRevision,
+    accepted.sourceDeleted ? 1 : 0,
+    accepted.provenanceDigest,
+    accepted.correlation.hostSequence,
+  );
 }
 
 
@@ -839,46 +1281,171 @@ function persistInspectionRecords(
     ["workspace", input.workspaceAssociations],
     ["activity", input.activity],
   ];
+  const budget = createInspectionRecordBudget(db, row);
+  let omitted = budget.omitted;
   for (const [kind, values] of groups) {
-    for (const [index, value] of (values ?? []).slice(0, AGENT_RUN_INSPECTION_MAX_RECORDS).entries()) {
+    for (const [index, value] of (values ?? []).entries()) {
       const source = inspectionObject(value);
       const id = boundedInspectionString(source.id) ?? `${row.updated_at}:${kind}:${index}`;
       const requestedSequence = source.sequence
         ?? source.hostSequence
         ?? (kind === "marker" ? source.firstSequence ?? source.lastSequence : undefined);
+      let acceptedPayload: InspectionObject | null = null;
+      try {
+        acceptedPayload = auditRecord(
+          db,
+          row,
+          kind,
+          id,
+          value,
+          boundedInspectionInteger(requestedSequence, index + 1),
+          boundedInspectionInteger(source.occurredAt, row.updated_at),
+          source.late === true,
+          postTerminal,
+          true,
+          budget,
+        );
+      } catch (error) {
+        if (!(error instanceof InspectionRecordCapacityError)) throw error;
+        omitted = true;
+      }
+      if (kind === "workspace" && acceptedPayload) {
+        persistWorkspaceAssociationProjection(db, row, id, acceptedPayload);
+      }
+    }
+  }
+  omitted ||= budget.omitted;
+  if (input.stop != null) {
+    try {
       auditRecord(
         db,
         row,
-        kind,
-        id,
-        value,
-        boundedInspectionInteger(requestedSequence, index + 1),
-        boundedInspectionInteger(source.occurredAt, row.updated_at),
-        source.late === true,
+        "stop",
+        `stop:${row.updated_at}`,
+        input.stop,
+        0,
+        row.updated_at,
+        false,
         postTerminal,
+        true,
+        budget,
       );
+    } catch (error) {
+      if (!(error instanceof InspectionRecordCapacityError)) throw error;
+      omitted = true;
     }
   }
-  if (input.stop != null) {
-    auditRecord(db, row, "stop", `stop:${row.updated_at}`, input.stop, 0, row.updated_at, false, postTerminal);
+  omitted ||= budget.omitted;
+  if (!omitted) return;
+
+  const id = "inspection-record-budget";
+  try {
+    auditRecord(
+      db,
+      row,
+      "marker",
+      id,
+      {
+        id,
+        kind: "truncated",
+        scope: "run",
+        correlation: inspectionCorrelation(row, {}, 0),
+        firstSequence: null,
+        lastSequence: null,
+        recoverable: true,
+        detail: "Inspection record budget exhausted; additional records omitted.",
+      },
+      0,
+      row.updated_at,
+      false,
+      postTerminal,
+      false,
+      budget,
+      true,
+    );
+  } catch (error) {
+    if (!(error instanceof InspectionRecordCapacityError)) throw error;
   }
 }
 
 
-function auditRows(db: Database, row: InspectionAttemptRow, kind: InspectionRecordKind): InspectionObject[] {
+interface AuditRowsProjection {
+  readonly records: readonly InspectionObject[];
+  readonly unavailableMarkers: readonly AgentInspectionMarkerV1[];
+  readonly invalidCount: number;
+  readonly selectedCount: number;
+  readonly omittedCount: number;
+}
+
+const AUDIT_ROW_MARKER_SCOPES: Readonly<Partial<Record<InspectionRecordKind, AgentInspectionMarkerV1["scope"]>>> = {
+  transcript: "transcript",
+  turn_session: "turn_session",
+  activity: "activity",
+  marker: "run",
+  usage: "usage",
+  prompt: "prompt",
+  cortex: "cortex",
+  council: "council",
+  workspace: "workspace",
+  stop: "run",
+  recovery: "run",
+};
+
+function auditRows(
+  db: Database,
+  row: InspectionAttemptRow,
+  kind: InspectionRecordKind,
+  limit = AGENT_RUN_INSPECTION_MAX_RECORDS,
+): AuditRowsProjection {
+  const totalRow = db.query(
+    `SELECT COUNT(*) AS count FROM agent_run_audit_records
+      WHERE user_id = ? AND chat_id = ? AND attempt_id = ? AND record_kind = ?`,
+  ).get(row.user_id, row.chat_id, row.attempt_id, kind) as { count: number };
+  const selectedLimit = Math.max(0, Math.min(limit, AGENT_RUN_INSPECTION_MAX_RECORDS));
   const rows = db.query(
     `SELECT payload_json FROM agent_run_audit_records
       WHERE user_id = ? AND chat_id = ? AND attempt_id = ? AND record_kind = ?
       ORDER BY host_sequence, record_id LIMIT ?`,
-  ).all(row.user_id, row.chat_id, row.attempt_id, kind, AGENT_RUN_INSPECTION_MAX_RECORDS) as Array<{ payload_json: string }>;
-  return rows.flatMap((item) => {
+  ).all(row.user_id, row.chat_id, row.attempt_id, kind, selectedLimit) as Array<{ payload_json: string }>;
+  const scope = AUDIT_ROW_MARKER_SCOPES[kind] ?? "run";
+  const records: InspectionObject[] = [];
+  const unavailableMarkers: AgentInspectionMarkerV1[] = [];
+  let invalidCount = 0;
+  for (const [index, item] of rows.entries()) {
     try {
       const value = JSON.parse(item.payload_json);
-      return value && typeof value === "object" && !Array.isArray(value) ? [value as InspectionObject] : [];
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid audit payload");
+      records.push(value as InspectionObject);
     } catch {
-      return [];
+      invalidCount += 1;
+      unavailableMarkers.push(unavailableInspectionMarker(
+        row,
+        `${row.attempt_id}:${scope}:corrupt:${index}`,
+        scope,
+        {},
+        `${scope} record unavailable: malformed or corrupt payload.`,
+      ));
     }
-  });
+  }
+  const omittedCount = Math.max(0, totalRow.count - rows.length);
+  if (omittedCount > 0) {
+    invalidCount += omittedCount;
+    unavailableMarkers.push(unavailableInspectionMarker(
+      row,
+      `${row.attempt_id}:${scope}:truncated`,
+      scope,
+      {},
+      `${scope} records truncated: additional records omitted.`,
+    ));
+  }
+  return {
+    records,
+    unavailableMarkers,
+    invalidCount,
+    selectedCount: rows.length,
+    omittedCount,
+  };
+
 }
 
 const INSPECTION_RECORD_KINDS: ReadonlySet<string> = new Set([
@@ -949,7 +1516,8 @@ function hasInspectionCorrelation(row: InspectionAttemptRow, value: unknown): bo
 }
 
 function nullableInspectionText(value: unknown, maxBytes: number): string | null | undefined {
-  if (value === undefined || value === null) return null;
+  if (value === undefined) return undefined;
+  if (value === null) return null;
   if (typeof value !== "string" || inspectionEncoder.encode(value).byteLength > maxBytes) return undefined;
   return value;
 }
@@ -1015,6 +1583,10 @@ function parseInspectionMarker(
 }
 
 
+function isSafeInspectionInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function normalizeInspectionUsage(
   row: InspectionAttemptRow,
   value: InspectionObject,
@@ -1049,9 +1621,9 @@ function normalizeInspectionUsage(
     canonical: value.canonical,
   };
 }
-
-function isSafeInspectionInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+function normalizeCortexRevision(value: unknown): AgentCortexReceiptV1["sourceRevision"] | null {
+  if (isSafeInspectionInteger(value)) return value;
+  return boundedInspectionString(value, 256);
 }
 
 function validReceiptState(value: unknown): value is AgentCortexReceiptV1["state"] {
@@ -1066,10 +1638,6 @@ function validInspectionReason(value: unknown): value is AgentInspectionReasonV1
   return value === null || isInspectionReason(value);
 }
 
-function normalizeCortexRevision(value: unknown): AgentCortexReceiptV1["sourceRevision"] | null {
-  if (isSafeInspectionInteger(value)) return value;
-  return boundedInspectionString(value, 256);
-}
 
 function normalizeCortexReceipt(
   row: InspectionAttemptRow,
@@ -1149,13 +1717,13 @@ function normalizeCouncilReceipt(
   row: InspectionAttemptRow,
   value: InspectionObject,
 ): AgentCouncilReceiptV1 | null {
+  const startedAt = isSafeInspectionInteger(value.startedAt) ? value.startedAt : null;
   if (
     value.version !== 1
     || !boundedInspectionString(value.id)
     || !boundedInspectionString(value.requestId)
     || value.checkpoint !== "WORK"
-    || typeof value.required !== "boolean"
-    || !isSafeInspectionInteger(value.startedAt)
+    || (value.required !== true && value.required !== false)
     || !(value.completedAt === null || isSafeInspectionInteger(value.completedAt))
     || !validReceiptState(value.state)
     || !isSafeInspectionInteger(value.memberCount)
@@ -1163,6 +1731,7 @@ function normalizeCouncilReceipt(
     || !hasInspectionCorrelation(row, value.correlation)
     || !validInspectionReason(value.reason)
     || value.canonical !== false
+    || startedAt === null
   ) return null;
   return {
     version: 1,
@@ -1170,7 +1739,7 @@ function normalizeCouncilReceipt(
     requestId: value.requestId as string,
     checkpoint: "WORK",
     required: value.required,
-    startedAt: value.startedAt,
+    startedAt,
     completedAt: value.completedAt,
     state: value.state,
     memberCount: value.memberCount,
@@ -1203,9 +1772,7 @@ function normalizeInspectionTranscript(
     || !isSafeInspectionInteger(value.occurredAt)
     || !(value.durationMs === null || isSafeInspectionInteger(value.durationMs))
     || typeof value.late !== "boolean"
-    || content === undefined
-    || argumentsText === undefined
-    || result === undefined
+    || (content === undefined || argumentsText === undefined || result === undefined)
     || (value.errorReason !== undefined && !validInspectionReason(value.errorReason))
     || (provider !== null && (
       !boundedInspectionString(provider.adapter, 128)
@@ -1291,9 +1858,6 @@ const LOOM_DESTINATION_VALUES: ReadonlySet<string> = new Set([
 ]);
 const LOOM_CHECKPOINT_VALUES: ReadonlySet<string> = new Set([
   "ASSEMBLE", "WORK", "PREPARE_COMMIT", "RENDER",
-]);
-const LOOM_RETRIEVAL_VALUES: ReadonlySet<string> = new Set([
-  "not_requested", "available", "unavailable", "stale", "unauthorized",
 ]);
 const LOOM_SURFACE_VALUES: ReadonlySet<string> = new Set(["WORK", "RESPONSE"]);
 const LOOM_PREDICATE_PHASES: ReadonlySet<string> = new Set([
@@ -1422,50 +1986,25 @@ function normalizeLoomSource(value: unknown): LoomPolicySourceV1 | null {
   };
 }
 
-function normalizeLoomDelivery(value: unknown): LoomPolicyDeliveryV1 | null {
-  const source = inspectionObject(value);
-  if (source.delivery === "direct") return { delivery: "direct" };
-  if (source.delivery === "condition_gated") {
-    const condition = normalizeLoomPredicate(source.condition);
-    return condition === null ? null : { delivery: "condition_gated", condition };
-  }
-  if (source.delivery === "on_demand") {
-    const request = inspectionObject(source.request);
-    if (
-      boundedInspectionString(request.contextPackId) === null
-      || boundedInspectionString(request.revisionId) === null
-      || boundedInspectionString(request.digest, 256) === null
-    ) return null;
-    return {
-      delivery: "on_demand",
-      request: {
-        contextPackId: request.contextPackId as string,
-        revisionId: request.revisionId as string,
-        digest: request.digest as string,
-      },
-    };
-  }
-  return null;
-}
 
 function normalizeLoomOutcome(value: unknown): LoomPromptInspectionOutcomeV1 | null {
   const source = inspectionObject(value);
   if (typeof source.status !== "string" || !LOOM_OUTCOME_STATUSES.has(source.status)) return null;
   if (source.status === "included") {
-    return isSafeInspectionInteger(source.effectiveIndex)
-      ? { status: "included", effectiveIndex: source.effectiveIndex }
+    return isSafeInspectionInteger(source.effectiveIndex) && source.reason === "selected"
+      ? { status: "included", effectiveIndex: source.effectiveIndex, reason: "selected" }
       : null;
   }
   if (source.status === "skipped") {
     return typeof source.reason === "string"
-      && ["checkpoint_not_reached", "condition_not_met", "on_demand_not_requested", "on_demand_unavailable"].includes(source.reason)
-      ? { status: "skipped", reason: source.reason as "checkpoint_not_reached" | "condition_not_met" | "on_demand_not_requested" | "on_demand_unavailable" }
+      && ["checkpoint_not_reached", "condition_not_met", "stale_source"].includes(source.reason)
+      ? { status: "skipped", reason: source.reason as "checkpoint_not_reached" | "condition_not_met" | "stale_source" }
       : null;
   }
   if (source.status === "rejected") {
     return typeof source.reason === "string"
-      && ["invalid_source", "stale_source", "unsupported_delivery", "unauthorized_retrieval", "required_source_unavailable"].includes(source.reason)
-      ? { status: "rejected", reason: source.reason as "invalid_source" | "stale_source" | "unsupported_delivery" | "unauthorized_retrieval" | "required_source_unavailable" }
+      && ["invalid_source", "stale_source", "required_source_unavailable"].includes(source.reason)
+      ? { status: "rejected", reason: source.reason as "invalid_source" | "stale_source" | "required_source_unavailable" }
       : null;
   }
   if (source.status === "omitted") {
@@ -1475,10 +2014,12 @@ function normalizeLoomOutcome(value: unknown): LoomPromptInspectionOutcomeV1 | n
       : null;
   }
   return boundedInspectionString(source.keptEntryId) !== null
+    && source.reason === "destination_overlap"
     && typeof source.destination === "string"
     && LOOM_DESTINATION_VALUES.has(source.destination)
     ? {
       status: "deduplicated",
+      reason: "destination_overlap",
       keptEntryId: source.keptEntryId as string,
       destination: source.destination as LoomPolicyDestinationV1,
     }
@@ -1488,9 +2029,15 @@ function normalizeLoomOutcome(value: unknown): LoomPromptInspectionOutcomeV1 | n
 function normalizeLoomItem(value: unknown): LoomPromptInspectionItemV1 | null {
   const source = inspectionObject(value);
   const normalizedSource = normalizeLoomSource(source.source);
-  const delivery = normalizeLoomDelivery(source.delivery);
+  const condition = source.condition === undefined
+    ? undefined
+    : normalizeLoomPredicate(source.condition);
   const outcome = normalizeLoomOutcome(source.outcome);
-  const retrievalStatus = source.retrievalStatus;
+  const required = source.required === undefined ? false : source.required;
+  const conditionResult = source.conditionResult;
+  const ordinaryPromptSuppressed = source.ordinaryPromptSuppressed === undefined
+    ? true
+    : source.ordinaryPromptSuppressed;
   if (
     boundedInspectionString(source.entryId) === null
     || typeof source.bucket !== "string"
@@ -1500,12 +2047,15 @@ function normalizeLoomItem(value: unknown): LoomPromptInspectionItemV1 | null {
     || typeof source.checkpoint !== "string"
     || !LOOM_CHECKPOINT_VALUES.has(source.checkpoint)
     || normalizedSource === null
-    || delivery === null
+    || (source.condition !== undefined && condition === null)
     || !(source.effectiveText === null
       || (typeof source.effectiveText === "string"
         && inspectionEncoder.encode(source.effectiveText).byteLength <= AGENT_RUN_INSPECTION_MAX_PAYLOAD_BYTES))
-    || (retrievalStatus !== undefined
-      && (typeof retrievalStatus !== "string" || !LOOM_RETRIEVAL_VALUES.has(retrievalStatus)))
+    || typeof required !== "boolean"
+    || (conditionResult !== undefined
+      && (typeof conditionResult !== "string"
+        || !["true", "false", "not_evaluated", "invalid", "not_applicable"].includes(conditionResult)))
+    || typeof ordinaryPromptSuppressed !== "boolean"
     || outcome === null
   ) return null;
   return {
@@ -1514,11 +2064,13 @@ function normalizeLoomItem(value: unknown): LoomPromptInspectionItemV1 | null {
     destination: source.destination as LoomPolicyDestinationV1,
     checkpoint: source.checkpoint as LoomPolicyCheckpointV1,
     source: normalizedSource,
-    delivery,
+    ...(condition == null ? {} : { condition }),
     effectiveText: source.effectiveText as string | null,
-    ...(retrievalStatus === undefined
+    required,
+    ...(conditionResult === undefined
       ? {}
-      : { retrievalStatus: retrievalStatus as LoomOnDemandRetrievalStatusV1 }),
+      : { conditionResult: conditionResult as LoomPromptInspectionItemV1["conditionResult"] }),
+    ordinaryPromptSuppressed,
     outcome,
   };
 }
@@ -1527,6 +2079,8 @@ function normalizeLoomResponseOmission(value: unknown): LoomResponsePolicyOmissi
   const source = inspectionObject(value);
   const maxPhaseInstructions =
     AGENT_RUNTIME_MAX_CUSTOM_PHASES * AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS;
+  const reviewReason = source.reviewReason == null ? undefined : boundedInspectionString(source.reviewReason);
+  if (reviewReason === null) return null;
   if (
     source.version !== 1
     || source.surface !== "RESPONSE"
@@ -1550,15 +2104,16 @@ function normalizeLoomResponseOmission(value: unknown): LoomResponsePolicyOmissi
   for (const item of source.omittedPhaseInstructions) {
     const phaseInstruction = inspectionObject(item);
     const phaseId = boundedInspectionString(phaseInstruction.phaseId);
+    const profileId = phaseInstruction.profileId == null ? undefined : boundedInspectionString(phaseInstruction.profileId);
     const normalized = normalizeLoomSource(phaseInstruction.source);
-    if (phaseId === null || normalized === null) return null;
-    omittedPhaseInstructions.push({ phaseId, source: normalized });
+    if (phaseId === null || normalized === null || profileId === null) return null;
+    omittedPhaseInstructions.push({ phaseId, source: normalized, ...(profileId === undefined ? {} : { profileId }) });
   }
-  return {
-    version: 1,
+  return { version: 1,
     surface: "RESPONSE",
     visibility: "work_only",
     reason: "work_only",
+    ...(reviewReason === undefined ? {} : { reviewReason }),
     omittedEntryIds: source.omittedEntryIds.map((item) => boundedInspectionString(item) as string),
     source: normalizedSource,
     omittedPhaseInstructions,
@@ -1599,18 +2154,104 @@ function normalizeLoomInspection(value: unknown): LoomPromptInspectionV1 | null 
   };
 }
 
+function normalizePromptRevision(value: unknown): string | number | null {
+  if (isSafeInspectionInteger(value)) return value;
+  return typeof value === "string" ? boundedInspectionString(value, 256) : null;
+}
+
+function normalizeSha256(value: unknown): string | null {
+  return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value) && boundedInspectionString(value, 64) !== null
+    ? value
+    : null;
+}
+
+function normalizePromptDatabankSource(value: unknown): AgentPromptDatabankSourceV1 | null {
+  const source = inspectionObject(value);
+  const kind = source.kind === "automatic" || source.kind === "mention" ? source.kind : null;
+  const databankId = boundedInspectionString(source.databankId);
+  const documentId = boundedInspectionString(source.documentId);
+  const documentName = boundedInspectionString(source.documentName, 1024);
+  const chunkId = source.chunkId === null ? null : boundedInspectionString(source.chunkId);
+  const documentContentHash = source.documentContentHash === null ? null : normalizeSha256(source.documentContentHash);
+  const contentHash = normalizeSha256(source.contentHash);
+  if (!kind || !databankId || !documentId || !documentName
+    || (source.chunkId !== null && !chunkId)
+    || (source.documentContentHash !== null && !documentContentHash)
+    || !contentHash) return null;
+  return { kind, databankId, documentId, documentName, chunkId, documentContentHash, contentHash };
+}
+
+function normalizePromptNativeProvenance(value: unknown): AgentPromptNativeProvenanceV1 | null {
+  if (value === undefined || value === null) return null;
+  const source = inspectionObject(value);
+  if (source.kind === "world_info") {
+    const sourceId = boundedInspectionString(source.sourceId);
+    const sourceRevision = normalizePromptRevision(source.sourceRevision);
+    if (!sourceId || sourceRevision === null || !isSafeInspectionInteger(source.sourceIndex)) return null;
+    return { kind: "world_info", sourceId, sourceRevision, sourceIndex: source.sourceIndex };
+  }
+  if (source.kind === "databank") {
+    const sourceRevision = boundedInspectionString(source.sourceRevision, 256);
+    if (!sourceRevision || !Array.isArray(source.sources) || source.sources.length > 256) return null;
+    const sources: AgentPromptDatabankSourceV1[] = [];
+    for (const item of source.sources) {
+      const normalized = normalizePromptDatabankSource(item);
+      if (!normalized) return null;
+      sources.push(normalized);
+    }
+    return { kind: "databank", sourceRevision, sources };
+  }
+  return null;
+}
+
+function normalizeRenderCrossing(row: InspectionAttemptRow, value: unknown, fallbackCorrelation?: unknown): AgentRenderCrossingV1 | null {
+  const source = inspectionObject(value);
+  const kind = source.kind === "accepted_finding" || source.kind === "accepted_submission" || source.kind === "completion_guidance"
+    ? source.kind
+    : null;
+  const sourceRevision = source.sourceRevision === null ? null : isSafeInspectionInteger(source.sourceRevision) ? source.sourceRevision : undefined;
+  const content = source.content === null ? null : typeof source.content === "string" && inspectionEncoder.encode(source.content).byteLength <= AGENT_RUN_INSPECTION_MAX_PAYLOAD_BYTES
+    ? source.content
+    : undefined;
+  const contentDigest = normalizeSha256(source.contentDigest);
+  const correlation = hasInspectionCorrelation(row, source.correlation) ? source.correlation : fallbackCorrelation;
+  if (source.version !== 1 || !boundedInspectionString(source.id) || !kind || !boundedInspectionString(source.sourceId)
+    || sourceRevision === undefined || content === undefined || !contentDigest || !hasInspectionCorrelation(row, correlation)) return null;
+  return {
+    version: 1,
+    id: source.id as string,
+    kind,
+    sourceId: source.sourceId as string,
+    sourceRevision,
+    contentDigest,
+    content,
+    correlation: inspectionCorrelation(row, correlation),
+  };
+}
+
+interface NormalizedInspectionPrompt extends AgentPromptEvidenceV1 {
+  readonly renderCrossing?: AgentRenderCrossingV1;
+}
+
 function normalizeInspectionPrompt(
   row: InspectionAttemptRow,
   value: InspectionObject,
-): AgentPromptEvidenceV1 | null {
+): NormalizedInspectionPrompt | null {
   const loomInspection = value.loomInspection === undefined || value.loomInspection === null
     ? null
     : normalizeLoomInspection(value.loomInspection);
+  const nativeProvenance = value.nativeProvenance === undefined || value.nativeProvenance === null
+    ? null
+    : normalizePromptNativeProvenance(value.nativeProvenance);
+  const renderCrossing = value.renderCrossing === undefined || value.renderCrossing === null
+    ? undefined
+    : normalizeRenderCrossing(row, value.renderCrossing, value.correlation) ?? undefined;
+  const sourceRevision = normalizePromptRevision(value.sourceRevision);
   if (
     value.version !== 1
     || !boundedInspectionString(value.id)
     || !boundedInspectionString(value.sourceId)
-    || !isSafeInspectionInteger(value.sourceRevision)
+    || sourceRevision === null
     || typeof value.destination !== "string"
     || !PROMPT_DESTINATIONS.has(value.destination)
     || typeof value.role !== "string"
@@ -1623,13 +2264,15 @@ function normalizeInspectionPrompt(
     || !(value.omissionReason === null
       || (typeof value.omissionReason === "string"
         && inspectionEncoder.encode(value.omissionReason).byteLength <= 2048))
+    || (value.nativeProvenance !== undefined && value.nativeProvenance !== null && nativeProvenance === null)
     || (value.loomInspection !== undefined && value.loomInspection !== null && loomInspection === null)
+    || (value.renderCrossing !== undefined && value.renderCrossing !== null && renderCrossing === undefined)
   ) return null;
   return {
     version: 1,
     id: value.id as string,
     sourceId: value.sourceId as string,
-    sourceRevision: value.sourceRevision,
+    sourceRevision,
     destination: value.destination as AgentPromptEvidenceV1["destination"],
     role: value.role as AgentPromptEvidenceV1["role"],
     correlation: inspectionCorrelation(row, value.correlation),
@@ -1637,7 +2280,9 @@ function normalizeInspectionPrompt(
     content: value.content as string,
     contentDigest: value.contentDigest as string,
     omissionReason: value.omissionReason as string | null,
+    nativeProvenance,
     loomInspection,
+    ...(renderCrossing === undefined ? {} : { renderCrossing }),
   };
 }
 
@@ -1645,10 +2290,12 @@ function normalizeInspectionWorkspace(
   row: InspectionAttemptRow,
   value: InspectionObject,
 ): AgentWorkspaceAssociationV1 | null {
+  const sourceDeleted = value.sourceDeleted;
+  if (typeof sourceDeleted !== "boolean") return null;
   if (
     value.version !== 1
     || !boundedInspectionString(value.id)
-    || !boundedInspectionString(value.workspaceId)
+    || !boundedInspectionString(value.workspaceId, MAX_WORKSPACE_ID_BYTES)
     || !isSafeInspectionInteger(value.workspaceRevision)
     || typeof value.relation !== "string"
     || !WORKSPACE_RELATIONS.has(value.relation)
@@ -1656,8 +2303,14 @@ function normalizeInspectionWorkspace(
     || !WORKSPACE_OBJECT_KINDS.has(value.objectKind)
     || !(value.objectId === null || boundedInspectionString(value.objectId) !== null)
     || !(value.sourceRevision === null || isSafeInspectionInteger(value.sourceRevision))
-    || typeof value.sourceDeleted !== "boolean"
-    || !(value.provenanceDigest === null || boundedInspectionString(value.provenanceDigest, 256) !== null)
+    || !(
+      value.provenanceDigest === null
+      || (
+        typeof value.provenanceDigest === "string"
+        && value.provenanceDigest.length === 64
+        && boundedInspectionString(value.provenanceDigest, 64) !== null
+      )
+    )
     || !hasInspectionCorrelation(row, value.correlation)
   ) return null;
   return {
@@ -1669,7 +2322,7 @@ function normalizeInspectionWorkspace(
     objectKind: value.objectKind as AgentWorkspaceAssociationV1["objectKind"],
     objectId: value.objectId as string | null,
     sourceRevision: value.sourceRevision as number | null,
-    sourceDeleted: value.sourceDeleted,
+    sourceDeleted,
     provenanceDigest: value.provenanceDigest as string | null,
     correlation: inspectionCorrelation(row, value.correlation),
   };
@@ -1725,100 +2378,155 @@ function normalizeInspectionActivity(
   };
 }
 
+interface ActivityProjectionResult {
+  readonly records: readonly AgentActivityMilestoneV1[];
+  readonly unavailableMarkers: readonly AgentInspectionMarkerV1[];
+  readonly invalidCount: number;
+}
+
 function projectAgentRunActivity(
   db: Database,
   row: InspectionAttemptRow,
-): readonly AgentActivityMilestoneV1[] {
+): ActivityProjectionResult {
   const projection = db.query(
     `SELECT snapshot_json
        FROM agent_run_projections
       WHERE user_id = ? AND chat_id = ? AND turn_id = ?
       LIMIT 1`,
   ).get(row.user_id, row.chat_id, row.turn_id) as { snapshot_json: string } | null;
-  if (!projection) return [];
+  if (!projection) return { records: [], unavailableMarkers: [], invalidCount: 0 };
+  const unavailableMarkers: AgentInspectionMarkerV1[] = [];
+  let invalidCount = 0;
+  const markUnavailable = (id: string, detail: string): void => {
+    invalidCount += 1;
+    unavailableMarkers.push(unavailableInspectionMarker(row, id, "activity", {}, detail));
+  };
+  let value: unknown;
   try {
-    const value = JSON.parse(projection.snapshot_json);
-    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-    const source = value as InspectionObject;
-    if (
-      source.version !== 2
-      || source.runId !== row.run_id
-      || source.turnId !== row.turn_id
-      || source.generationId !== row.generation_id
-      || source.chatId !== row.chat_id
-      || source.inspectionAttemptId !== row.attempt_id
-      || !Array.isArray(source.activity)
-    ) return [];
-    return source.activity.slice(0, MAX_NODES_PER_SNAPSHOT).flatMap((value, index): AgentActivityMilestoneV1[] => {
-      const node = inspectionObject(value);
-      const id = boundedInspectionString(node.id, 224);
-      const parentId = node.parentId === null ? null : boundedInspectionString(node.parentId, 224);
-      const kind: "root" | "provider" | "child" | "tool" | null =
-        typeof node.kind === "string" && ["root", "provider", "child", "tool"].includes(node.kind)
-          ? node.kind as "root" | "provider" | "child" | "tool"
-          : null;
-      const phase = typeof node.phase === "string" && INSPECTION_PHASES.has(node.phase)
-        ? node.phase as AgentInspectionLifecycleV1
-        : null;
-      const publicStatus = typeof node.status === "string"
-        && ["pending", "running", "completed", "failed", "cancelled", "timed_out", "omitted"].includes(node.status)
-        ? node.status
-        : null;
-      const startedAt = isSafeInspectionInteger(node.startedAt) ? node.startedAt : null;
-      const elapsedMs = isSafeInspectionInteger(node.elapsedMs) ? node.elapsedMs : null;
-      if (
-        !id
-        || (node.parentId !== null && !parentId)
-        || !kind
-        || !phase
-        || !publicStatus
-        || startedAt === null
-        || elapsedMs === null
-      ) return [];
-      const actor: AgentActivityMilestoneV1["actor"] = kind === "root" ? "agent" : kind;
-      const toolId = node.toolId === undefined ? null : boundedInspectionString(node.toolId, 128);
-      const profileId = node.profileId === undefined ? null : boundedInspectionString(node.profileId, 128);
-      if ((node.toolId !== undefined && !toolId) || (node.profileId !== undefined && !profileId)) return [];
-      const status: AgentActivityMilestoneV1["status"] = publicStatus === "pending" || publicStatus === "running"
-        ? publicStatus
-        : publicStatus === "omitted"
-          ? "omitted"
-          : "terminal";
-      const endedAt = status === "pending" || status === "running"
-        ? null
-        : startedAt <= Number.MAX_SAFE_INTEGER - elapsedMs
-          ? startedAt + elapsedMs
-          : Number.MAX_SAFE_INTEGER;
-      const label = toolId ?? profileId ?? kind;
-      const hostSequence = index + 1;
-      return [{
-        version: 1,
-        id: `projection:${id}`,
-        parentId: parentId ? `projection:${parentId}` : null,
-        kind,
-        actor,
-        phase,
-        status,
-        label,
-        toolId,
-        taskId: null,
-        sequence: hostSequence,
-        startedAt,
-        endedAt,
-        elapsedMs,
-        usage: null,
-        correlation: inspectionCorrelation(row, {
-          actorId: actor,
-          phase,
-          toolId,
-          parentId: parentId ? `projection:${parentId}` : null,
-          hostSequence,
-        }, hostSequence),
-      }];
-    });
+    value = JSON.parse(projection.snapshot_json);
   } catch {
-    return [];
+    markUnavailable(
+      `${row.attempt_id}:activity:projection-corrupt`,
+      "activity projection unavailable: malformed or corrupt snapshot.",
+    );
+    return { records: [], unavailableMarkers, invalidCount };
   }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    markUnavailable(
+      `${row.attempt_id}:activity:projection-invalid`,
+      "activity projection unavailable: malformed or legacy snapshot.",
+    );
+    return { records: [], unavailableMarkers, invalidCount };
+  }
+  const source = value as InspectionObject;
+  if (
+    source.version !== 2
+    || source.runId !== row.run_id
+    || source.turnId !== row.turn_id
+    || source.generationId !== row.generation_id
+    || source.chatId !== row.chat_id
+    || source.inspectionAttemptId !== row.attempt_id
+    || !Array.isArray(source.activity)
+  ) {
+    markUnavailable(
+      `${row.attempt_id}:activity:projection-mismatch`,
+      "activity projection unavailable: identity or shape mismatch.",
+    );
+    return { records: [], unavailableMarkers, invalidCount };
+  }
+  const values = source.activity;
+  const boundedValues = values.slice(0, MAX_NODES_PER_SNAPSHOT);
+  if (values.length > boundedValues.length) {
+    invalidCount += values.length - boundedValues.length;
+    unavailableMarkers.push(unavailableInspectionMarker(
+      row,
+      `${row.attempt_id}:activity:projection-truncated`,
+      "activity",
+      {},
+      "activity projection truncated: additional nodes omitted.",
+    ));
+  }
+  const records: AgentActivityMilestoneV1[] = [];
+  for (const [index, value] of boundedValues.entries()) {
+    const node = inspectionObject(value);
+    const id = boundedInspectionString(node.id, 224);
+    const parentId = node.parentId === null ? null : boundedInspectionString(node.parentId, 224);
+    const kind: "root" | "provider" | "child" | "tool" | null =
+      typeof node.kind === "string" && ["root", "provider", "child", "tool"].includes(node.kind)
+        ? node.kind as "root" | "provider" | "child" | "tool"
+        : null;
+    const phase = typeof node.phase === "string" && INSPECTION_PHASES.has(node.phase)
+      ? node.phase as AgentInspectionLifecycleV1
+      : null;
+    const publicStatus = typeof node.status === "string"
+      && ["pending", "running", "completed", "failed", "cancelled", "timed_out", "omitted"].includes(node.status)
+      ? node.status
+      : null;
+    const startedAt = isSafeInspectionInteger(node.startedAt) ? node.startedAt : null;
+    const elapsedMs = isSafeInspectionInteger(node.elapsedMs) ? node.elapsedMs : null;
+    if (
+      !id
+      || (node.parentId !== null && !parentId)
+      || !kind
+      || !phase
+      || !publicStatus
+      || startedAt === null
+      || elapsedMs === null
+    ) {
+      markUnavailable(
+        `${row.attempt_id}:activity:projection-invalid:${index}`,
+        "activity record unavailable: malformed or legacy node.",
+      );
+      continue;
+    }
+    const actor: AgentActivityMilestoneV1["actor"] = kind === "root" ? "agent" : kind;
+    const toolId = node.toolId === undefined ? null : boundedInspectionString(node.toolId, 128);
+    const profileId = node.profileId === undefined ? null : boundedInspectionString(node.profileId, 128);
+    if ((node.toolId !== undefined && !toolId) || (node.profileId !== undefined && !profileId)) {
+      markUnavailable(
+        `${row.attempt_id}:activity:projection-invalid:${index}`,
+        "activity record unavailable: malformed or legacy node identity.",
+      );
+      continue;
+    }
+    const status: AgentActivityMilestoneV1["status"] = publicStatus === "pending" || publicStatus === "running"
+      ? publicStatus
+      : publicStatus === "omitted"
+        ? "omitted"
+        : "terminal";
+    const endedAt = status === "pending" || status === "running"
+      ? null
+      : startedAt <= Number.MAX_SAFE_INTEGER - elapsedMs
+        ? startedAt + elapsedMs
+        : Number.MAX_SAFE_INTEGER;
+    const label = toolId ?? profileId ?? kind;
+    const hostSequence = index + 1;
+    records.push({
+      version: 1,
+      id: `projection:${id}`,
+      parentId: parentId ? `projection:${parentId}` : null,
+      kind,
+      actor,
+      phase,
+      status,
+      label,
+      toolId,
+      taskId: null,
+      sequence: hostSequence,
+      startedAt,
+      endedAt,
+      elapsedMs,
+      usage: null,
+      correlation: inspectionCorrelation(row, {
+        actorId: actor,
+        phase,
+        toolId,
+        parentId: parentId ? `projection:${parentId}` : null,
+        hostSequence,
+      }, hostSequence),
+    });
+  }
+  return { records, unavailableMarkers, invalidCount };
 }
 
 
@@ -1850,16 +2558,24 @@ interface InspectionRecordProjection<T> {
   readonly invalidCount: number;
 }
 
+interface InspectionProjectionBudget {
+  remaining: number;
+}
+
 function projectInspectionRecords<T>(
   db: Database,
   row: InspectionAttemptRow,
   kind: InspectionRecordKind,
   scope: AgentInspectionMarkerV1["scope"],
   parser: (row: InspectionAttemptRow, value: InspectionObject) => T | null,
+  budget: InspectionProjectionBudget,
 ): InspectionRecordProjection<T> {
+  const audit = auditRows(db, row, kind, budget.remaining);
+  budget.remaining = Math.max(0, budget.remaining - audit.selectedCount);
   const records: T[] = [];
-  const unavailableMarkers: AgentInspectionMarkerV1[] = [];
-  for (const [index, value] of auditRows(db, row, kind).entries()) {
+  const unavailableMarkers: AgentInspectionMarkerV1[] = [...audit.unavailableMarkers];
+  let invalidCount = audit.invalidCount;
+  for (const [index, value] of audit.records.entries()) {
     const record = parser(row, value);
     if (record !== null) {
       records.push(record);
@@ -1872,8 +2588,9 @@ function projectInspectionRecords<T>(
       value,
       `${scope} record unavailable: malformed or legacy payload.`,
     ));
+    invalidCount += 1;
   }
-  return { records, unavailableMarkers, invalidCount: unavailableMarkers.length };
+  return { records, unavailableMarkers, invalidCount };
 }
 
 function usageProjection(
@@ -1976,7 +2693,7 @@ function normalizeInspectionError(
   row: InspectionAttemptRow,
   markerCount: number,
 ): AgentInspectionErrorDetailV1 | null {
-  const transcriptFailure = auditRows(db, row, "transcript").find((value) =>
+  const transcriptFailure = auditRows(db, row, "transcript").records.find((value) =>
     value.kind === "failure" || value.kind === "terminal");
   let receipt: InspectionObject = {};
   if (row.terminal_receipt_json) {
@@ -2103,6 +2820,7 @@ interface InspectionSections {
   readonly usageEvidence: readonly AgentInspectionUsageV1[];
   readonly usage: AgentInspectionUsageProjectionV1;
   readonly promptEvidence: readonly AgentPromptEvidenceV1[];
+  readonly renderCrossings: readonly AgentRenderCrossingV1[];
   readonly cortexReceipts: readonly AgentCortexReceiptV1[];
   readonly councilReceipts: readonly AgentCouncilReceiptV1[];
   readonly workspaceAssociations: readonly AgentWorkspaceAssociationV1[];
@@ -2113,19 +2831,23 @@ interface InspectionSections {
 }
 
 function projectInspectionSections(db: Database, row: InspectionAttemptRow): InspectionSections {
-  const markerProjection = projectInspectionRecords(db, row, "marker", "run", parseInspectionMarker);
-  const transcriptProjection = projectInspectionRecords(db, row, "transcript", "transcript", normalizeInspectionTranscript);
-  const turnSessionProjection = projectInspectionRecords(db, row, "turn_session", "turn_session", normalizeInspectionTurnSession);
-  const usageRecordsProjection = projectInspectionRecords(db, row, "usage", "usage", normalizeInspectionUsage);
-  const promptProjection = projectInspectionRecords(db, row, "prompt", "prompt", normalizeInspectionPrompt);
-  const cortexProjection = projectInspectionRecords(db, row, "cortex", "cortex", normalizeCortexReceipt);
-  const councilProjection = projectInspectionRecords(db, row, "council", "council", normalizeCouncilReceipt);
-  const workspaceProjection = projectInspectionRecords(db, row, "workspace", "workspace", normalizeInspectionWorkspace);
-  const activityProjection = projectInspectionRecords(db, row, "activity", "activity", normalizeInspectionActivity);
+  const budget: InspectionProjectionBudget = {
+    remaining: AGENT_RUN_INSPECTION_MAX_RECORDS,
+  };
+  const markerProjection = projectInspectionRecords(db, row, "marker", "run", parseInspectionMarker, budget);
+  const transcriptProjection = projectInspectionRecords(db, row, "transcript", "transcript", normalizeInspectionTranscript, budget);
+  const turnSessionProjection = projectInspectionRecords(db, row, "turn_session", "turn_session", normalizeInspectionTurnSession, budget);
+  const usageRecordsProjection = projectInspectionRecords(db, row, "usage", "usage", normalizeInspectionUsage, budget);
+  const promptProjection = projectInspectionRecords(db, row, "prompt", "prompt", normalizeInspectionPrompt, budget);
+  const cortexProjection = projectInspectionRecords(db, row, "cortex", "cortex", normalizeCortexReceipt, budget);
+  const councilProjection = projectInspectionRecords(db, row, "council", "council", normalizeCouncilReceipt, budget);
+  const workspaceProjection = projectInspectionRecords(db, row, "workspace", "workspace", normalizeInspectionWorkspace, budget);
+  const activityProjection = projectInspectionRecords(db, row, "activity", "activity", normalizeInspectionActivity, budget);
+  const projectedActivity = projectAgentRunActivity(db, row);
   const activity = activityProjection.records.length > 0
     ? activityProjection.records
-    : projectAgentRunActivity(db, row);
-  const unavailableMarkers = [
+    : projectedActivity.records;
+  const unavailableMarkers: AgentInspectionMarkerV1[] = [
     ...markerProjection.unavailableMarkers,
     ...transcriptProjection.unavailableMarkers,
     ...turnSessionProjection.unavailableMarkers,
@@ -2135,10 +2857,14 @@ function projectInspectionSections(db: Database, row: InspectionAttemptRow): Ins
     ...councilProjection.unavailableMarkers,
     ...workspaceProjection.unavailableMarkers,
     ...activityProjection.unavailableMarkers,
+    ...projectedActivity.unavailableMarkers,
   ];
   const validUsage = usageRecordsProjection.records;
   const duplicateUsageCount = validUsage.filter((item) => item.source === "recovered_duplicate").length;
-  const stopValues = auditRows(db, row, "stop");
+  const stopAudit = auditRows(db, row, "stop", budget.remaining);
+  budget.remaining = Math.max(0, budget.remaining - stopAudit.selectedCount);
+  unavailableMarkers.push(...stopAudit.unavailableMarkers);
+  const stopValues = stopAudit.records;
   let stop: AgentRunInspectionStopV1 | null = null;
   if (stopValues.length > 0) {
     stop = normalizeInspectionStop(row, stopValues[0]);
@@ -2162,7 +2888,8 @@ function projectInspectionSections(db: Database, row: InspectionAttemptRow): Ins
     turnSession: turnSessionProjection.records,
     usageEvidence: validUsage,
     usage: usageProjection(row, validUsage, usageRecordsProjection.invalidCount + duplicateUsageCount),
-    promptEvidence: promptProjection.records,
+    promptEvidence: promptProjection.records.map(({ renderCrossing: _renderCrossing, ...prompt }) => prompt),
+    renderCrossings: promptProjection.records.flatMap(({ renderCrossing }) => renderCrossing === undefined ? [] : [renderCrossing]),
     cortexReceipts: cortexProjection.records,
     councilReceipts: councilProjection.records,
     workspaceAssociations: workspaceProjection.records,
@@ -2200,6 +2927,9 @@ function summaryFromRow(db: Database, row: InspectionAttemptRow): AgentRunInspec
   return {
     version: 1,
     attempt,
+    runId: row.run_id,
+    turnSessionId: row.turn_id,
+    generationId: row.generation_id,
     hostCorrelationId: row.host_correlation_id,
     lifecycle: normalizeInspectionPhase(row.lifecycle),
     status: normalizeInspectionStatus(row.status),
@@ -2230,6 +2960,7 @@ function detailFromRow(db: Database, row: InspectionAttemptRow): AgentRunInspect
     usage: sections.usage,
     error: sections.error,
     promptEvidence: sections.promptEvidence,
+    renderCrossings: sections.renderCrossings,
     cortexReceipts: sections.cortexReceipts,
     councilReceipts: sections.councilReceipts,
     workspaceAssociations: sections.workspaceAssociations,
@@ -2289,6 +3020,11 @@ export function persistAgentRunInspectionInTransaction(
   const storedStatus = outcome ? "terminal" : status;
   const terminal = outcome !== null || storedStatus === "terminal";
   const storedLifecycle = terminal ? "TERMINAL" : lifecycle;
+  if (
+    (storedLifecycle === "TERMINAL" && outcome === null)
+    || (storedLifecycle !== "TERMINAL" && outcome !== null)
+  ) return null;
+  const requestedUpdatedAt = boundedInspectionInteger(input.updatedAt, now);
   const terminalAt = terminal ? boundedInspectionInteger(input.terminalAt, now) : null;
   const reconciliation = normalizeInspectionReconciliation(input.reconciliation);
   const terminalReceiptJson = input.terminalReceipt == null
@@ -2305,6 +3041,11 @@ export function persistAgentRunInspectionInTransaction(
       || existing.host_correlation_id !== hostCorrelationId
       || !inspectionTargetMatches(existing, targetMessageId, targetSwipeId)
       || (input.previousAttemptId !== undefined && previousAttemptId !== existing.previous_attempt_id)
+    ) return null;
+    if (
+      (INSPECTION_PHASE_RANK[storedLifecycle] ?? -1) < (INSPECTION_PHASE_RANK[existing.lifecycle] ?? -1)
+      || (INSPECTION_STATUS_RANK[storedStatus] ?? -1) < (INSPECTION_STATUS_RANK[existing.status] ?? -1)
+      || requestedUpdatedAt < existing.updated_at
     ) return null;
     if (
       existing.terminal === 1
@@ -2342,7 +3083,7 @@ export function persistAgentRunInspectionInTransaction(
       turnSessionId, generationId, generationType, targetMessageId ?? null,
       targetSwipeId ?? null, storedLifecycle, storedStatus,
       outcome, normalizeInspectionReason(input.reason), terminal ? 1 : 0,
-      boundedInspectionInteger(input.startedAt, now), boundedInspectionInteger(input.updatedAt, now),
+      boundedInspectionInteger(input.startedAt, now), requestedUpdatedAt,
       terminalAt, hostCorrelationId, reconciliation, terminalReceiptJson,
     );
   } else if (!existing.terminal) {
@@ -2355,7 +3096,7 @@ export function persistAgentRunInspectionInTransaction(
     ).run(
       storedLifecycle, storedStatus, outcome,
       normalizeInspectionReason(input.reason), terminal ? 1 : 0,
-      boundedInspectionInteger(input.updatedAt, now),
+      requestedUpdatedAt,
       terminalAt, reconciliation, terminalReceiptJson, userId, attemptId,
     );
   }
@@ -2632,6 +3373,9 @@ function deletedInspectionSummary(row: AgentInspectionSourceDeletionV1): AgentRu
   return {
     version: 1,
     attempt,
+    runId: row.runId,
+    turnSessionId: row.turnId,
+    generationId: row.generationId,
     hostCorrelationId: row.hostCorrelationId,
     lifecycle: row.lifecycle,
     status: row.status,
@@ -2717,6 +3461,7 @@ function deletedInspectionDetail(row: AgentInspectionSourceDeletionV1): AgentRun
       omissionCount: markers.length,
     },
     promptEvidence: [],
+    renderCrossings: [],
     cortexReceipts: [],
     councilReceipts: [],
     workspaceAssociations: row.workspaceAssociations,
@@ -2748,6 +3493,24 @@ export function getAgentRunInspection(
   }
 }
 
+export function getAgentRunInspectionForTarget(
+  userId: string,
+  chatId: string,
+  messageId: string,
+  swipeId: number,
+): AgentRunInspectionDetailV1 | null {
+  if (!ownsChatForActivity(userId, chatId) || !Number.isSafeInteger(swipeId) || swipeId < 0) return null;
+  try {
+    const db = getDb();
+    const row = db.query(
+      "SELECT attempt_id FROM agent_run_attempts WHERE user_id = ? AND chat_id = ? AND target_message_id = ? AND target_swipe_id = ? ORDER BY terminal DESC, COALESCE(updated_at, 0) DESC, attempt_id DESC LIMIT 1",
+    ).get(userId, chatId, messageId, swipeId) as { attempt_id?: unknown } | null;
+    if (typeof row?.attempt_id !== "string") return null;
+    return getAgentRunInspection(userId, row.attempt_id, chatId);
+  } catch {
+    return null;
+  }
+}
 export function listAgentRunInspections(
   userId: string,
   chatId: string,
@@ -2758,7 +3521,14 @@ export function listAgentRunInspections(
   const boundedLimit = Number.isSafeInteger(limit) && limit >= 1
     ? Math.min(limit, AGENT_RUN_INSPECTION_MAX_LIST)
     : AGENT_RUN_INSPECTION_MAX_LIST;
-  const offset = cursor && /^[0-9]+$/.test(cursor) ? Math.min(Number(cursor), 100000) : 0;
+  const inspectionCursor = cursor === undefined ? undefined : decodeAgentRunInspectionCursor(cursor);
+  if (cursor !== undefined && inspectionCursor === null) return null;
+  const cursorPredicate = inspectionCursor
+    ? "(sort_updated_at < ? OR (sort_updated_at = ? AND attempt_id < ?))"
+    : "";
+  const cursorParams = inspectionCursor
+    ? [inspectionCursor.updatedAt, inspectionCursor.updatedAt, inspectionCursor.attemptId]
+    : [];
   try {
     const db = getDb();
     return db.transaction(() => {
@@ -2768,10 +3538,10 @@ export function listAgentRunInspections(
       const keys = hasDeleted
         ? db.query(
           `WITH candidates AS (
-             SELECT attempt_id, updated_at, 0 AS source_deleted
+             SELECT attempt_id, COALESCE(updated_at, -1) AS sort_updated_at, 0 AS source_deleted
                FROM agent_run_attempts WHERE user_id = ? AND chat_id = ?
              UNION ALL
-             SELECT deleted.attempt_id, deleted.updated_at, 1 AS source_deleted
+             SELECT deleted.attempt_id, COALESCE(deleted.updated_at, -1) AS sort_updated_at, 1 AS source_deleted
                FROM agent_run_source_deletions AS deleted
               WHERE deleted.user_id = ? AND deleted.chat_id = ?
                 AND NOT EXISTS (
@@ -2779,21 +3549,31 @@ export function listAgentRunInspections(
                    WHERE live.user_id = deleted.user_id AND live.attempt_id = deleted.attempt_id
                 )
            )
-           SELECT attempt_id, source_deleted FROM candidates
-            ORDER BY updated_at DESC, attempt_id DESC LIMIT ? OFFSET ?`,
-        ).all(userId, chatId, userId, chatId, boundedLimit + 1, offset) as Array<{
+           SELECT attempt_id, source_deleted, sort_updated_at
+             FROM candidates
+            ${inspectionCursor ? `WHERE ${cursorPredicate}` : ""}
+            ORDER BY sort_updated_at DESC, attempt_id DESC
+            LIMIT ?`,
+        ).all(userId, chatId, userId, chatId, ...cursorParams, boundedLimit + 1) as Array<{
           attempt_id: string;
           source_deleted: number;
+          sort_updated_at: number;
         }>
         : db.query(
-          `SELECT attempt_id, 0 AS source_deleted
-             FROM agent_run_attempts WHERE user_id = ? AND chat_id = ?
-            ORDER BY updated_at DESC, attempt_id DESC LIMIT ? OFFSET ?`,
-        ).all(userId, chatId, boundedLimit + 1, offset) as Array<{
+          `SELECT attempt_id, 0 AS source_deleted,
+                  COALESCE(updated_at, -1) AS sort_updated_at
+             FROM agent_run_attempts
+            WHERE user_id = ? AND chat_id = ?
+            ${inspectionCursor ? `AND ${cursorPredicate}` : ""}
+            ORDER BY sort_updated_at DESC, attempt_id DESC
+            LIMIT ?`,
+        ).all(userId, chatId, ...cursorParams, boundedLimit + 1) as Array<{
           attempt_id: string;
           source_deleted: number;
+          sort_updated_at: number;
         }>;
-      const runs = keys.slice(0, boundedLimit).flatMap((key): AgentRunInspectionSummaryV1[] => {
+      const pageKeys = keys.slice(0, boundedLimit);
+      const runs = pageKeys.flatMap((key): AgentRunInspectionSummaryV1[] => {
         if (key.source_deleted === 1) {
           const deleted = loadAgentInspectionSourceDeletionFromDb(db, {
             userId,
@@ -2805,11 +3585,14 @@ export function listAgentRunInspections(
         const live = loadInspectionAttempt(db, userId, key.attempt_id, chatId);
         return live ? [summaryFromRow(db, live)] : [];
       });
+      const lastPageKey = pageKeys.at(-1);
       return {
         version: 1 as const,
         chatId,
         runs,
-        nextCursor: keys.length > boundedLimit ? String(offset + boundedLimit) : null,
+        nextCursor: keys.length > boundedLimit && lastPageKey
+          ? encodeAgentRunInspectionCursor(lastPageKey.sort_updated_at, lastPageKey.attempt_id)
+          : null,
         omission: null,
       };
     })();

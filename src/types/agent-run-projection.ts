@@ -610,6 +610,43 @@ export interface AgentInspectionErrorDetailV1 {
 }
 
 
+export type AgentPromptRevisionV1 = string | number;
+
+export interface AgentPromptDatabankSourceV1 {
+  readonly kind: "automatic" | "mention";
+  readonly databankId: string;
+  readonly documentId: string;
+  readonly documentName: string;
+  readonly chunkId: string | null;
+  readonly documentContentHash: string | null;
+  readonly contentHash: string;
+}
+
+export type AgentPromptNativeProvenanceV1 =
+  | {
+    readonly kind: "world_info";
+    readonly sourceId: string;
+    readonly sourceRevision: AgentPromptRevisionV1;
+    readonly sourceIndex: number;
+  }
+  | {
+    readonly kind: "databank";
+    readonly sourceRevision: string;
+    readonly sources: readonly AgentPromptDatabankSourceV1[];
+  };
+
+export type AgentRenderCrossingKindV1 = "accepted_finding" | "accepted_submission" | "completion_guidance";
+
+export interface AgentRenderCrossingV1 {
+  readonly version: 1;
+  readonly id: string;
+  readonly kind: AgentRenderCrossingKindV1;
+  readonly sourceId: string;
+  readonly sourceRevision: number | null;
+  readonly contentDigest: string;
+  readonly content: string | null;
+  readonly correlation: AgentInspectionCorrelationV1;
+}
 export type AgentPromptEvidenceDestinationV1 =
   | "root_work"
   | "child_work"
@@ -622,7 +659,7 @@ export interface AgentPromptEvidenceV1 {
   readonly version: 1;
   readonly id: string;
   readonly sourceId: string;
-  readonly sourceRevision: number;
+  readonly sourceRevision: AgentPromptRevisionV1;
   readonly destination: AgentPromptEvidenceDestinationV1;
   readonly role: "system" | "user" | "assistant" | "tool" | "context" | "policy";
   readonly correlation: AgentInspectionCorrelationV1;
@@ -630,6 +667,7 @@ export interface AgentPromptEvidenceV1 {
   readonly content: string;
   readonly contentDigest: string;
   readonly omissionReason: string | null;
+  readonly nativeProvenance: AgentPromptNativeProvenanceV1 | null;
   readonly loomInspection: LoomPromptInspectionV1 | null;
 }
 
@@ -762,6 +800,9 @@ export interface AgentActivityTreeV1 {
 export interface AgentRunInspectionSummaryV1 {
   readonly version: 1;
   readonly attempt: AgentInspectionAttemptLineageV1;
+  readonly runId: string;
+  readonly turnSessionId: string;
+  readonly generationId: string;
   readonly hostCorrelationId: string;
   readonly lifecycle: AgentInspectionLifecycleV1;
   readonly status: AgentInspectionStatusV1;
@@ -803,6 +844,7 @@ export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 
   readonly usage: AgentInspectionUsageProjectionV1;
   readonly error: AgentInspectionErrorDetailV1 | null;
   readonly promptEvidence: readonly AgentPromptEvidenceV1[];
+  readonly renderCrossings: readonly AgentRenderCrossingV1[];
   readonly cortexReceipts: readonly AgentCortexReceiptV1[];
   readonly councilReceipts: readonly AgentCouncilReceiptV1[];
   readonly workspaceAssociations: readonly AgentWorkspaceAssociationV1[];

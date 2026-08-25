@@ -482,7 +482,10 @@ function isBaselineDriftAlreadyApplied(db: Database, file: string): boolean {
 // implicit DELETE that fires ON DELETE CASCADE into every child table.
 // PRAGMA foreign_keys is a no-op inside a transaction, so the runner flips
 // it around the transaction instead of the .sql file doing it itself.
-const FOREIGN_KEYS_OFF_MIGRATIONS = new Set(["078_chats_character_id_nullable.sql"]);
+const FOREIGN_KEYS_OFF_MIGRATIONS: Record<string, true> = {
+  "078_chats_character_id_nullable.sql": true,
+  "121_persistent_workspace_session_detach.sql": true,
+};
 
 function applyMigrationWithForeignKeysOff(db: Database, file: string, sql: string): void {
   db.run("PRAGMA foreign_keys = OFF");
@@ -595,7 +598,7 @@ export async function runMigrations(db: Database, migrationsDir?: string): Promi
     const sql = await Bun.file(join(dir, file)).text();
     console.log(`Applying migration: ${file}`);
 
-    if (FOREIGN_KEYS_OFF_MIGRATIONS.has(file)) {
+    if (FOREIGN_KEYS_OFF_MIGRATIONS[file]) {
       applyMigrationWithForeignKeysOff(db, file, sql);
       continue;
     }

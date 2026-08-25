@@ -70,6 +70,9 @@ import type {
   RoomTurnSkippedPayload,
   RoomPresencePayload,
   SystemSmartAlertPayload,
+  DatabankChangedPayload,
+  DatabankDeletedPayload,
+  DatabankDocumentStatusPayload,
 } from '@/types/ws-events'
 import type { AgentRunChangeEventV2 } from '@/types/agent-runs'
 import type { ConnectionProfile, Message } from '@/types/api'
@@ -869,7 +872,8 @@ export function useWebSocket() {
           characterId: state.mpChatId === payload.chatId && !state.mpIsHost ? undefined : payload.characterId,
           avatarUrl: state.mpChatId === payload.chatId ? state.mpCharacterAvatar : null,
           status: 'assembling',
-          model: '',
+          model: payload.model ?? '',
+          ...(payload.provider ? { provider: payload.provider } : {}),
           startedAt: Date.now(),
           subtitle: state.mpChatId === payload.chatId ? 'Generating reply' : undefined,
         })
@@ -935,6 +939,7 @@ export function useWebSocket() {
         state.updateChatHead(payload.generationId, {
           status: 'waiting',
           ...(payload.model ? { model: payload.model } : {}),
+          ...(payload.provider ? { provider: payload.provider } : {}),
           ...(payload.characterName ? { characterName: payload.characterName } : {}),
           ...(payload.characterId ? { characterId: payload.characterId } : {}),
         })
@@ -953,6 +958,29 @@ export function useWebSocket() {
 
       wsClient.on(EventType.GENERATION_PHASE_CHANGED, (payload: GenerationPhaseChangedPayload) => {
         const state = store.getState()
+        if (payload.agentLifecycle) {
+          state.setGenerationProviderMetadata({
+            ...(payload.provider ? { provider: payload.provider } : {}),
+            ...(payload.connectionLabel ? { connectionLabel: payload.connectionLabel } : {}),
+            ...(payload.model ? { model: payload.model } : {}),
+          })
+          if (payload.generationId) {
+            const status = payload.agentLifecycle === 'error'
+              ? 'error'
+              : payload.agentLifecycle === 'cancelled'
+                ? 'stopped'
+                : 'waiting'
+            state.updateChatHead(payload.generationId, {
+              status,
+              ...(payload.agentOperation ? { agentOperation: payload.agentOperation } : {}),
+              agentLifecycle: payload.agentLifecycle,
+              ...(payload.provider ? { provider: payload.provider } : {}),
+              ...(payload.connectionLabel ? { connectionLabel: payload.connectionLabel } : {}),
+              ...(payload.model ? { model: payload.model } : {}),
+            })
+          }
+          return
+        }
         if (payload.generationId) {
           const head = state.chatHeads.find((h) => h.generationId === payload.generationId)
           if (head && head.status !== payload.phase) {
@@ -1507,6 +1535,9 @@ export function useWebSocket() {
           // waiting up to 30s for the next scheduled ping.
           wsClient.forcePing()
           syncExtensions(true)
+          // Native Databanks are panel-owned and fetched through their existing
+          // API path; invalidate once auth is confirmed on every reconnect.
+          store.getState().markDatabanksStale()
         }
 
         // Re-sync settings on every WS (re)connect. Covers two cases:
@@ -1539,6 +1570,23 @@ export function useWebSocket() {
         if (reload) {
           store.getState().loadSettings()
         }
+      }),
+
+      // Native Databank changes invalidate the existing panel/store hydration
+      // path. The panel owns the API fetch so no second cache is introduced.
+      wsClient.on(EventType.DATABANK_CHANGED, (payload: DatabankChangedPayload) => {
+        if (!payload?.databankId) return
+        store.getState().markDatabanksStale()
+      }),
+      wsClient.on(EventType.DATABANK_DELETED, (payload: DatabankDeletedPayload) => {
+        if (!payload?.databankId) return
+        const state = store.getState()
+        state.removeDatabank(payload.databankId)
+        state.markDatabanksStale()
+      }),
+      wsClient.on(EventType.DATABANK_DOCUMENT_STATUS, (payload: DatabankDocumentStatusPayload) => {
+        if (!payload?.databankId || !payload?.documentId) return
+        store.getState().markDatabanksStale()
       }),
 
       wsClient.on(EventType.CHARACTER_CREATED, (payload: { id: string; character?: import('@/types/api').Character }) => {
@@ -2309,7 +2357,14 @@ export function useWebSocket() {
     const chatHeadReconcile = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return
       const heads = store.getState().chatHeads
-      if (!heads.some((h) => h.status === 'assembling' || h.status === 'council' || h.status === 'council_failed' || h.status === 'reasoning' || h.status === 'streaming')) return
+      if (!heads.some((head) =>
+        head.status === 'assembling'
+        || head.status === 'council'
+        || head.status === 'council_failed'
+        || head.status === 'waiting'
+        || head.status === 'reasoning'
+        || head.status === 'streaming'
+      )) return
       store.getState().reconcileChatHeads().catch(() => { /* best-effort */ })
     }, 4000)
 

@@ -40,13 +40,17 @@ import {
   detectSupportedParamsFromProviders,
   getAvailableMacros,
   exportToSTPreset,
+  createEmptyPortableAgenticRuntimeEnvelope,
   createPortableLoomExportPayload,
   extractPortableAgenticRuntimeEnvelope,
-  stripPortableRegexOwnership,
+  getPortablePresetErrorCode,
+  hasLegacyPortableAgenticRuntimeGraph,
+  PortablePresetError,
   shouldRollbackImportedPreset,
   toPortableAgentConfigV1,
   sanitizeLumiHubSealedBlocksForExport,
   normalizeCategoryBlockState,
+  stripPortableRegexOwnership,
   toggleBlockWithCategoryRules,
   toggleCategoryWithChildren,
   coerceImportedLoomPreset,
@@ -55,6 +59,7 @@ import {
   pruneOrphanPromptVariables,
   validatePromptVariableSchema,
 } from '@/lib/loom/service'
+import { prepareAgentConfigForRuntimeSave } from '@/lib/loom/agenticRuntime'
 import { mergePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
 
 type LoomPrivateBlockFields = Pick<
@@ -79,6 +84,41 @@ function portableSnapshotKey(value: unknown): string {
   return JSON.stringify(value) ?? ''
 }
 
+type PortableRegexSource = readonly Record<string, unknown>[]
+
+function readPortableRegexSource(
+  sourceRecord: Record<string, unknown> | null,
+): PortableRegexSource | null {
+  const extensions = Object.hasOwn(sourceRecord ?? {}, 'extensions')
+    ? sourceRecord?.extensions
+    : undefined
+  if (extensions !== undefined && !isObjectRecord(extensions)) {
+    throw new PortablePresetError('AGENT_RUNTIME_PORTABLE_REGEX_INVALID')
+  }
+
+  const extensionRecord = isObjectRecord(extensions) ? extensions : null
+  const extensionHasSnake = extensionRecord !== null && Object.hasOwn(extensionRecord, 'regex_scripts')
+  const extensionHasCamel = extensionRecord !== null && Object.hasOwn(extensionRecord, 'regexScripts')
+  const rootHasSnake = sourceRecord !== null && Object.hasOwn(sourceRecord, 'regex_scripts')
+  const rootHasCamel = sourceRecord !== null && Object.hasOwn(sourceRecord, 'regexScripts')
+  const sourceCount = Number(extensionHasSnake) + Number(extensionHasCamel) + Number(rootHasSnake) + Number(rootHasCamel)
+  if (sourceCount > 1) {
+    throw new PortablePresetError('AGENT_RUNTIME_PORTABLE_REGEX_INVALID')
+  }
+  if (sourceCount === 0) return null
+
+  const raw = extensionHasSnake
+    ? extensionRecord?.regex_scripts
+    : extensionHasCamel
+      ? extensionRecord?.regexScripts
+      : rootHasSnake
+        ? sourceRecord?.regex_scripts
+        : sourceRecord?.regexScripts
+  if (!Array.isArray(raw) || !raw.every(isObjectRecord)) {
+    throw new PortablePresetError('AGENT_RUNTIME_PORTABLE_REGEX_INVALID')
+  }
+  return raw as PortableRegexSource
+}
 
 function normalizeAgentSlotBindings(value: unknown): Record<string, string | null> {
   if (Array.isArray(value)) {
@@ -136,6 +176,12 @@ type LoomBuilderDependencies = {
   presetsApi?: typeof presetsApi
   saveCoordinator?: PresetSaveCoordinator
   flushPresetForGeneration?: typeof defaultFlushPresetForGeneration
+}
+
+interface AgenticRuntimeSaveIdentity {
+  presetId: string
+  presetRevision: number
+  configRevision: number
 }
 
 export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
@@ -289,6 +335,31 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       console.warn('[LoomBuilder] Failed to refresh registry:', err)
     }
   }, [presetApi, setLoomRegistry])
+
+  const reloadActivePreset = useCallback(async (): Promise<LoomPreset> => {
+    const presetId = activePresetRef.current?.id ?? activeLoomPresetId
+    if (!presetId || useStore.getState().activeLoomPresetId !== presetId) {
+      throw new Error('No active preset')
+    }
+    const hydration = presetSaveCoordinator.beginHydration(presetId, 'agentic-runtime-conflict')
+    try {
+      const reloaded = presetSaveCoordinator.hydrate(
+        unmarshalPreset(await presetApi.get(presetId)),
+        hydration,
+      )
+      if (useStore.getState().activeLoomPresetId !== reloaded.id) {
+        throw new Error('No active preset')
+      }
+      activePresetRef.current = reloaded
+      setActivePreset(reloaded)
+      setError(null)
+      await refreshRegistry()
+      return reloaded
+    } catch (error) {
+      presetSaveCoordinator.cancelHydration(hydration)
+      throw error
+    }
+  }, [activeLoomPresetId, presetApi, presetSaveCoordinator, refreshRegistry])
 
   // Load registry on mount. The registry is kept in the store across panel
   // open/close cycles, and every mutation path below (create/delete/rename/
@@ -477,7 +548,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
   const saveAgenticRuntime = useCallback(async (
     draft: AgenticRuntimeSaveDraft,
     promptOrder: PromptBlock[],
-    expectedPresetRevision?: number,
+    expectedIdentity: AgenticRuntimeSaveIdentity,
   ): Promise<SaveAgenticRuntimeEditorResult> => {
     const current = activePresetRef.current
     if (!current || useStore.getState().activeLoomPresetId !== current.id) {
@@ -485,23 +556,26 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     }
     await presetSaveCoordinator.flush(current.id)
     const flushed = presetSaveCoordinator.getDraft(current.id) ?? activePresetRef.current ?? current
-    if (useStore.getState().activeLoomPresetId !== flushed.id) throw new Error('No active preset')
+    if (
+      useStore.getState().activeLoomPresetId !== flushed.id
+      || expectedIdentity.presetId !== flushed.id
+    ) {
+      throw new Error('No active preset')
+    }
     activePresetRef.current = flushed
     setActivePreset(flushed)
     const normalizedBlocks = normalizeCategoryBlockState(promptOrder)
-    if (
-      expectedPresetRevision !== undefined
-      && (flushed.cacheRevision ?? 0) !== expectedPresetRevision
-      && JSON.stringify(normalizedBlocks) !== JSON.stringify(flushed.blocks)
-    ) {
-      throw new ApiError(409, 'Conflict', { code: 'PRESET_REVISION_CONFLICT' })
-    }
     validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: flushed.blocks })
-    const editorProjection = await agenticRuntimeApi.getEditor(flushed.id)
+    const preparedConfig = prepareAgentConfigForRuntimeSave(
+      draft.config,
+      normalizedBlocks,
+      expectedIdentity.presetRevision,
+    )
     const result = await agenticRuntimeApi.saveEditor(flushed.id, {
       ...draft,
-      expectedPresetRevision: flushed.cacheRevision ?? 0,
-      expectedConfigRevision: editorProjection.configRevision,
+      config: preparedConfig,
+      expectedPresetRevision: expectedIdentity.presetRevision,
+      expectedConfigRevision: expectedIdentity.configRevision,
       promptOrder: normalizedBlocks,
     })
     const refreshed = presetSaveCoordinator.hydrate(unmarshalPreset(result.preset))
@@ -510,7 +584,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     setActivePreset(refreshed)
     await refreshRegistry()
     return result
-  }, [refreshRegistry])
+  }, [presetSaveCoordinator, refreshRegistry])
 
   const saveLoomValue = useCallback(async (
     blocks: PromptBlock[],
@@ -822,30 +896,25 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       throw err
     }
   }, [])
-
   const persistImportedPreset = useCallback(async (payload: unknown, fileName?: string) => {
     const selection = beginActiveLoomPresetSelection()
     let importedPresetId: string | null = null
     let portableImportCommitted = false
+    let hydrationWarning = false
     setIsLoading(true)
     try {
       const fallbackName = fileName?.replace(/\.json$/i, '') || 'Imported Preset'
       const payloadRecord = isObjectRecord(payload) ? payload : null
       const agentRuntime = extractPortableAgenticRuntimeEnvelope(payload)
-      portableImportCommitted = agentRuntime !== null
       const sourceRecord = payloadRecord?.type === 'lumiverse_preset'
         && isObjectRecord(payloadRecord.preset)
         ? payloadRecord.preset
         : payloadRecord
-      const extensions = sourceRecord && isObjectRecord(sourceRecord.extensions)
-        ? sourceRecord.extensions
-        : null
-      const embeddedRegex = Array.isArray(extensions?.regex_scripts)
-        ? extensions.regex_scripts
-        : sourceRecord && Array.isArray(sourceRecord.regex_scripts)
-          ? sourceRecord.regex_scripts
-          : null
+      const embeddedRegex = readPortableRegexSource(sourceRecord)
       const loom = coerceImportedLoomPreset(payload, fallbackName)
+      if (agentRuntime === null && hasLegacyPortableAgenticRuntimeGraph(loom)) {
+        throw new PortablePresetError('AGENT_RUNTIME_PORTABLE_INVALID')
+      }
       const presetInput = marshalPreset(loom)
       const portablePresetInput = embeddedRegex === null
         ? presetInput
@@ -856,8 +925,22 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       const legacyPortableConfig = agentRuntime === null && loom.agentConfig
         ? toPortableAgentConfigV1(loom.agentConfig)
         : null
-      let created = agentRuntime
-        ? (await presetApi.importPortable({ preset: portablePresetInput, agentRuntime })).preset
+      // Sealed prompt descriptors have no local content to persist. Even
+      // without an authored runtime envelope, send them through the
+      // transactional portable-import endpoint so the server resolves and
+      // verifies every sealed block before writing the preset row.
+      const sealedImportRuntime = agentRuntime === null
+        && legacyPortableConfig === null
+        && loom.portableSealedPreset !== undefined
+        && loom.portableSealedPreset !== null
+        ? createEmptyPortableAgenticRuntimeEnvelope()
+        : null
+      const portableImportRuntime = agentRuntime ?? sealedImportRuntime
+      let created = portableImportRuntime
+        ? (await presetApi.importPortable({
+            preset: portablePresetInput,
+            agentRuntime: portableImportRuntime,
+          })).preset
         : legacyPortableConfig
           ? (await presetApi.importPortableAgentConfig({
               ...portablePresetInput,
@@ -865,43 +948,44 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
             })).preset
           : await presetApi.create(portablePresetInput)
       importedPresetId = created.id
+      portableImportCommitted = portableImportRuntime !== null || legacyPortableConfig !== null
 
       if (agentRuntime) {
-        const editor = await agenticRuntimeApi.getEditor(created.id)
-        created = {
-          ...created,
-          agent_config: editor.config,
-          agent_config_review: editor.review,
-          agent_context_pack_selections: editor.contextPackSelections.map((selection) => ({
-            ...selection,
-            label: typeof selection.label === 'string' && selection.label.length > 0
-              ? selection.label
-              : selection.packId,
-            revisionLabel: typeof selection.revisionLabel === 'string' && selection.revisionLabel.length > 0
-              ? selection.revisionLabel
-              : String(selection.revision),
-          })),
-          agent_context_rules: editor.contextRules,
-          agent_task_templates: editor.taskTemplates,
+        try {
+          const editor = await agenticRuntimeApi.getEditor(created.id)
+          created = {
+            ...created,
+            agent_config: editor.config,
+            agent_config_review: editor.review,
+            agent_task_templates: editor.taskTemplates,
+          }
+        } catch {
+          hydrationWarning = true
         }
-
       }
 
       const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
-      await refreshRegistry()
+      try {
+        await refreshRegistry()
+      } catch {
+        hydrationWarning = true
+      }
       if (!(await selection.transition(created.id))) {
-        throw new Error('Imported preset selection was superseded')
+        return newLoom
       }
       activePresetRef.current = newLoom
       setActivePreset(newLoom)
-
-
+      if (hydrationWarning) {
+        toast.warning(i18n.t('panels.loomBuilder.toast.importHydrationWarning'), {
+          title: i18n.t('panels.loomBuilder.toast.presetImportTitle'),
+        })
+      }
       return newLoom
     } catch (err: unknown) {
       // Portable import is one backend transaction that also owns newly
-      // imported context-pack copies. Never delete that preset after the
+      // imported sealed runtime material. Never delete that preset after the
       // transaction has committed; a navigation/editor hydration failure must
-      // preserve the completed import and its canonical context data.
+      // preserve the completed import and its canonical runtime data.
       if (shouldRollbackImportedPreset(importedPresetId, portableImportCommitted)) {
         try {
           await presetApi.delete(importedPresetId)
@@ -910,7 +994,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
         }
       }
       selection.cancel()
-      setError(err instanceof Error ? err.message : String(err))
+      setError(getPortablePresetErrorCode(err))
       throw err
     } finally {
       setIsLoading(false)
@@ -936,8 +1020,8 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
   }, [persistImportedPreset])
 
   // Export internal JSON. The runtime envelope is fetched from the server
-  // after all pending Loom saves settle, so prompt revisions and runtime
-  // cognition/context snapshots cannot drift across the export boundary.
+  // after all pending Loom saves settle, so prompt revisions and task metadata
+  // cannot drift across the export boundary.
   const exportInternal = useCallback(async () => {
     const current = activePresetRef.current ?? activePreset
     if (!current) return null
@@ -958,7 +1042,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       const regexStable = portableSnapshotKey(regexBeforePortable) === portableSnapshotKey(regexAfterPortable)
       if (!presetStable || !envelopeStable || !regexStable) {
         if (attempt + 1 < maxAttempts) continue
-        throw new Error('Portable export changed while it was being read; please retry.')
+        throw new PortablePresetError('PORTABLE_EXPORT_UNSTABLE')
       }
       const exportPreset = createPortableLoomExportPayload(unmarshalPreset(persistedAfter), envelopeAfter)
       if (regexAfterPortable.length === 0) return exportPreset
@@ -1064,6 +1148,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     duplicatePreset,
     renamePreset,
     refreshRegistry,
+    reloadActivePreset,
 
     // Block manipulation
     addBlock,

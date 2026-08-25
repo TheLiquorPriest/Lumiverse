@@ -6,7 +6,7 @@ import type { Preset, CreatePresetInput, UpdatePresetInput, PromptBlock, PromptB
 import { PresetRevisionConflictError } from "../types/preset";
 import type { AgentConfigV2 } from "../types/agents";
 import { parseAgentConfigV2 } from "../types/agents";
-import { getPresetAgentConfig, importPortablePresetRegexScriptsWithDb, preparePresetAgentConfigForWrite, scrubPresetMetadata, writePresetAgentConfigWithDb } from "./agent-config-portability.service";
+import { getPresetAgentConfig, importPortablePresetRegexScriptsWithDb, preparePresetAgentConfigForWrite, quarantineAgentConfigForPromptEditWithDb, scrubPresetMetadata, writePresetAgentConfigWithDb } from "./agent-config-portability.service";
 import { assertAgentConfigWithinHostLimits } from "./agent-runtime-limits";
 import { toPublicConnection } from "./connections.service";
 import type { ConnectionProfile } from "../types/connection-profile";
@@ -212,7 +212,7 @@ export function reconcileActiveLoomPreset(userId: string): string | null {
     ? setting.value
     : null;
 
-  if (selectedId && getPreset(userId, selectedId)) return selectedId;
+  if (selectedId && getPreset(userId, selectedId)?.provider === "loom") return selectedId;
   if (!selectedId) return null;
 
   const replacement = getDb()
@@ -394,6 +394,12 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
   if (input.expected_cache_revision !== undefined && input.expected_cache_revision !== (existing.cache_revision ?? 0)) {
     throw new PresetRevisionConflictError(id, input.expected_cache_revision, existing.cache_revision ?? 0);
   }
+  if (
+    submittedConfig !== undefined
+    && (!Number.isSafeInteger(input.expected_config_revision) || (input.expected_config_revision as number) < 0)
+  ) {
+    throw new Error("AGENT_CONFIG_REVISION_REQUIRED");
+  }
   const preparedConfig = submittedConfig === undefined ? undefined : preparePresetAgentConfigForWrite(submittedConfig);
 
   // A stashed block has global content/configuration but local visibility and
@@ -414,6 +420,8 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
     changedStashIds = reconciliation.changedStashIds;
     commitStashReconciliation = reconciliation.commit;
   }
+  const promptOrderChanged = reconciledPromptOrder !== undefined
+    && JSON.stringify(reconciledPromptOrder) !== JSON.stringify(existing.prompt_order ?? []);
 
   const fields: string[] = [];
   const values: any[] = [];
@@ -486,6 +494,15 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
         expectedConfigRevision: (input as UpdatePresetInput & { expected_config_revision?: number }).expected_config_revision,
       },
       preparedConfig,
+    );
+  }
+  if (promptOrderChanged && reconciledPromptOrder !== undefined && hasNormalizedAgentConfigTable()) {
+    quarantineAgentConfigForPromptEditWithDb(
+      db,
+      userId,
+      id,
+      (existing.cache_revision ?? 0) + 1,
+      reconciledPromptOrder,
     );
   }
   if (Object.hasOwn(input as object, "regex_scripts")) {

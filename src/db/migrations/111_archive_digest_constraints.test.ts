@@ -5,7 +5,6 @@ import { join } from "node:path";
 const baselineSql = await Bun.file(join(import.meta.dir, "..", "baseline.sql")).text();
 const importSql = await Bun.file(join(import.meta.dir, "104_user_data_import_integrity.sql")).text();
 const workspaceSql = await Bun.file(join(import.meta.dir, "106_agent_turn_workspace.sql")).text();
-const contextSql = await Bun.file(join(import.meta.dir, "107_agent_context_packs.sql")).text();
 const integritySql = await Bun.file(join(import.meta.dir, "111_archive_digest_constraints.sql")).text();
 
 function createDatabase(): Database {
@@ -13,7 +12,6 @@ function createDatabase(): Database {
   db.run(baselineSql);
   db.run(importSql);
   db.run(workspaceSql);
-  db.run(contextSql);
   db.run(integritySql);
   db.run("PRAGMA foreign_keys = ON");
   db.query("INSERT INTO \"user\" (id, name, email) VALUES (?, ?, ?)").run("u1", "Test", "u1@example.test");
@@ -81,15 +79,5 @@ describe("111 archive digest constraints", () => {
       "/tmp/final",
       "A".repeat(64),
     )).toThrow();
-    db.query(
-      `INSERT INTO agent_context_packs
-       (user_id,id,name,latest_revision)
-       VALUES (?, ?, ?, 0)`,
-    ).run("u1", "pack-1", "Pack");
-    expect(() => db.query(
-      `INSERT INTO agent_context_pack_revisions
-       (user_id,pack_id,revision,content_json,content_digest,token_count,byte_count,created_by)
-       VALUES (?, ?, 1, '[]', ?, 0, 2, ?)`,
-    ).run("u1", "pack-1", "A".repeat(64), "u1")).toThrow();
   });
 });

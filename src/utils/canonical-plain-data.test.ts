@@ -35,6 +35,21 @@ describe("canonical plain-data walk bounds", () => {
     expect(encodeCanonicalPlainData({ a: 1, z: 2 })).toBe(encodeCanonicalPlainData({ z: 2, a: 1 }));
   });
 
+  test("orders non-ASCII keys by raw UTF-8 bytes", () => {
+    expect(encodeCanonicalPlainData({ "é": 2, z: 1 })).toBe("{\"z\":1,\"é\":2}");
+  });
+
+  test("distinguishes lone surrogate and replacement-character keys", () => {
+    const loneSurrogate = "\uD800";
+    const replacementCharacter = "\uFFFD";
+    const first = { [loneSurrogate]: 1, [replacementCharacter]: 2 };
+    const second = { [replacementCharacter]: 2, [loneSurrogate]: 1 };
+
+    const encoded = encodeCanonicalPlainData(first);
+    expect(encoded).toBe(encodeCanonicalPlainData(second));
+    expect(encoded).toBe("{\"\\ud800\":1,\"�\":2}");
+  });
+
   test("aborts a diamond DAG at cap plus one node instead of expanding it", () => {
     const started = Date.now();
     expectLimit(() => validateCanonicalPlainData(diamondDag(40), { maxNodes: 100 }), "nodes");

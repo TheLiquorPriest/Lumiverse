@@ -223,6 +223,211 @@ function renderRecord(record: WorkspaceContextProjectionRecordV1): string {
   const state = record.taskState === undefined ? "" : ` state=${JSON.stringify(record.taskState)}`;
   return `${record.kind} ${JSON.stringify(record.id)}${state}: ${JSON.stringify(record.text)}\n`;
 }
+
+export type WorkspaceContextProjectionSurfaceV1 = "work" | "render";
+export interface WorkspaceContextProjectionValidationOptionsV1 {
+  readonly surface: WorkspaceContextProjectionSurfaceV1;
+  readonly expectedRevision?: number;
+  readonly maxUtf8Bytes: number;
+}
+
+const WORKSPACE_CONTEXT_PROJECTION_MAX_RECORDS = WORKSPACE_CONTEXT_SNAPSHOT_MAX_ROWS * 8;
+const MANDATORY_WORKSPACE_CONTEXT_KINDS = new Set<WorkspaceContextProjectionRecordV1["kind"]>([
+  "objective",
+  "constraint",
+  "required_task",
+  "accepted_decision",
+  "unresolved_question",
+]);
+const OPTIONAL_WORKSPACE_CONTEXT_KINDS = new Set<WorkspaceContextRecordClass>(
+  WORKSPACE_CONTEXT_RECORD_CLASSES,
+);
+const RENDER_WORKSPACE_CONTEXT_KINDS = new Set<WorkspaceContextRecordClass>([
+  "accepted_submission",
+  "finding",
+]);
+
+function projectionObject(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function exactProjectionKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  label: string,
+): void {
+  const keys = Object.keys(value);
+  if (keys.length !== allowed.length || keys.some((key) => !allowed.includes(key))) {
+    throw new TypeError(`${label} contains unknown or missing fields.`);
+  }
+}
+
+function validateProjectionRecord(
+  value: unknown,
+  allowedKinds: ReadonlySet<WorkspaceContextProjectionRecordV1["kind"]>,
+  label: string,
+): WorkspaceContextProjectionRecordV1 {
+  const record = projectionObject(value, label);
+  const allowedKeys = record.taskState === undefined
+    ? ["kind", "id", "text", "sourceRevision"]
+    : ["kind", "id", "text", "sourceRevision", "taskState"];
+  exactProjectionKeys(record, allowedKeys, label);
+  if (
+    typeof record.kind !== "string"
+    || !allowedKinds.has(record.kind as WorkspaceContextProjectionRecordV1["kind"])
+    || typeof record.id !== "string"
+    || record.id.length === 0
+    || typeof record.text !== "string"
+    || !Number.isSafeInteger(record.sourceRevision)
+    || (record.sourceRevision as number) < 0
+    || (record.taskState !== undefined && (
+      record.kind !== "required_task"
+      || typeof record.taskState !== "string"
+    ))
+  ) {
+    throw new TypeError(`${label} is malformed.`);
+  }
+  return frozenRecord({
+    kind: record.kind as WorkspaceContextProjectionRecordV1["kind"],
+    id: record.id,
+    text: record.text,
+    sourceRevision: record.sourceRevision as number,
+    ...(record.taskState === undefined ? {} : { taskState: record.taskState as string }),
+  });
+}
+
+function validateProjectionOmission(
+  value: unknown,
+  expectedClass: WorkspaceContextRecordClass,
+  label: string,
+): WorkspaceContextOmissionIndexV1 {
+  const omission = projectionObject(value, label);
+  exactProjectionKeys(omission, ["class", "omittedCount", "firstOmittedCursor"], label);
+  if (
+    omission.class !== expectedClass
+    || !Number.isSafeInteger(omission.omittedCount)
+    || (omission.omittedCount as number) < 0
+    || (
+      omission.firstOmittedCursor !== null
+      && (
+        typeof omission.firstOmittedCursor !== "string"
+        || omission.firstOmittedCursor.length === 0
+        || utf8ByteLength(omission.firstOmittedCursor) > 512
+      )
+    )
+  ) {
+    throw new TypeError(`${label} is malformed.`);
+  }
+  return Object.freeze({
+    class: expectedClass,
+    omittedCount: omission.omittedCount as number,
+    firstOmittedCursor: omission.firstOmittedCursor as string | null,
+  });
+}
+
+/**
+ * Validate and clone an injected projection before it can become provider
+ * input. The literal must be the exact deterministic rendering of the
+ * admitted records; callers cannot smuggle a second private prompt carrier.
+ */
+export function validateWorkspaceContextProjectionV1(
+  value: unknown,
+  options: WorkspaceContextProjectionValidationOptionsV1,
+): WorkspaceContextProjectionV1 {
+  if (
+    !Number.isSafeInteger(options.maxUtf8Bytes)
+    || options.maxUtf8Bytes < 0
+    || (
+      options.expectedRevision !== undefined
+      && (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 0)
+    )
+  ) {
+    throw new TypeError("Workspace projection validation limits are invalid.");
+  }
+  const projection = projectionObject(value, "workspace projection");
+  exactProjectionKeys(
+    projection,
+    ["version", "sourceWorkspaceRevision", "mandatory", "optional", "omissions", "literal", "utf8Bytes"],
+    "workspace projection",
+  );
+  if (
+    projection.version !== 1
+    || !Number.isSafeInteger(projection.sourceWorkspaceRevision)
+    || (projection.sourceWorkspaceRevision as number) < 0
+    || (
+      options.expectedRevision !== undefined
+      && projection.sourceWorkspaceRevision !== options.expectedRevision
+    )
+    || !Array.isArray(projection.mandatory)
+    || !Array.isArray(projection.optional)
+    || !Array.isArray(projection.omissions)
+    || typeof projection.literal !== "string"
+    || !Number.isSafeInteger(projection.utf8Bytes)
+  ) {
+    throw new TypeError("Workspace projection envelope is malformed.");
+  }
+  if (
+    projection.mandatory.length > WORKSPACE_CONTEXT_PROJECTION_MAX_RECORDS
+    || projection.optional.length > WORKSPACE_CONTEXT_PROJECTION_MAX_RECORDS
+    || projection.mandatory.length + projection.optional.length > WORKSPACE_CONTEXT_PROJECTION_MAX_RECORDS
+  ) {
+    throw new TypeError("Workspace projection contains too many records.");
+  }
+  if (options.surface === "render" && projection.mandatory.length !== 0) {
+    throw new TypeError("RENDER workspace projection cannot contain mandatory WORK records.");
+  }
+  const mandatory = projection.mandatory.map((record, index) =>
+    validateProjectionRecord(record, MANDATORY_WORKSPACE_CONTEXT_KINDS, `mandatory[${index}]`));
+  const optionalKinds = options.surface === "render"
+    ? RENDER_WORKSPACE_CONTEXT_KINDS
+    : OPTIONAL_WORKSPACE_CONTEXT_KINDS;
+  const optional = projection.optional.map((record, index) =>
+    validateProjectionRecord(record, optionalKinds, `optional[${index}]`));
+  for (let index = 1; index < mandatory.length; index += 1) {
+    if (compareMandatory(mandatory[index - 1]!, mandatory[index]!) > 0) {
+      throw new TypeError("Workspace mandatory records are not canonically ordered.");
+    }
+  }
+  for (let index = 1; index < optional.length; index += 1) {
+    const left = optional[index - 1]!;
+    const right = optional[index]!;
+    if (compareOptional(
+      { ...left, class: left.kind as WorkspaceContextRecordClass },
+      { ...right, class: right.kind as WorkspaceContextRecordClass },
+    ) > 0) {
+      throw new TypeError("Workspace optional records are not canonically ordered.");
+    }
+  }
+  const expectedOmissionClasses = options.surface === "render"
+    ? ["accepted_submission", "finding"] as const
+    : WORKSPACE_CONTEXT_RECORD_CLASSES;
+  if (projection.omissions.length !== expectedOmissionClasses.length) {
+    throw new TypeError("Workspace omission index is incomplete.");
+  }
+  const omissions = projection.omissions.map((entry, index) =>
+    validateProjectionOmission(entry, expectedOmissionClasses[index]!, `omissions[${index}]`));
+  const literal = [...mandatory, ...optional].map(renderRecord).join("");
+  const literalBytes = utf8ByteLength(literal);
+  if (
+    projection.literal !== literal
+    || projection.utf8Bytes !== literalBytes
+    || literalBytes > options.maxUtf8Bytes
+  ) {
+    throw new TypeError("Workspace projection literal or byte count is invalid.");
+  }
+  return Object.freeze({
+    version: 1,
+    sourceWorkspaceRevision: projection.sourceWorkspaceRevision as number,
+    mandatory: Object.freeze(mandatory),
+    optional: Object.freeze(optional),
+    omissions: Object.freeze(omissions),
+    literal,
+    utf8Bytes: literalBytes,
+  });
+}
 function compareMandatory(
   left: WorkspaceContextProjectionRecordV1,
   right: WorkspaceContextProjectionRecordV1,
@@ -439,6 +644,39 @@ export function buildWorkspaceContextProjectionV1(
     mandatory: Object.freeze(mandatory),
     optional: Object.freeze(optional),
     omissions: Object.freeze(WORKSPACE_CONTEXT_RECORD_CLASSES.map((recordClass) => omission(recordClass, omitted.get(recordClass)!))),
+    literal,
+    utf8Bytes: utf8ByteLength(literal),
+  });
+}
+
+const RENDER_WORKSPACE_CONTEXT_CLASSES: ReadonlySet<WorkspaceContextRecordClass> = new Set([
+  "accepted_submission",
+  "finding",
+]);
+
+/**
+ * Narrow a validated WORK projection to the only workspace material permitted
+ * to cross into tools-disabled RENDER. Completion summary/guidance travels in
+ * the separate host-accepted completion handoff.
+ */
+export function projectRenderWorkspaceContextV1(
+  projection: WorkspaceContextProjectionV1,
+): WorkspaceContextProjectionV1 {
+  const optional = projection.optional
+    .filter((record) =>
+      record.kind === "accepted_submission"
+      || record.kind === "finding")
+    .map(frozenRecord);
+  const omissions = projection.omissions
+    .filter((entry) => RENDER_WORKSPACE_CONTEXT_CLASSES.has(entry.class))
+    .map((entry) => Object.freeze({ ...entry }));
+  const literal = optional.map(renderRecord).join("");
+  return Object.freeze({
+    version: 1,
+    sourceWorkspaceRevision: projection.sourceWorkspaceRevision,
+    mandatory: Object.freeze([]),
+    optional: Object.freeze(optional),
+    omissions: Object.freeze(omissions),
     literal,
     utf8Bytes: utf8ByteLength(literal),
   });

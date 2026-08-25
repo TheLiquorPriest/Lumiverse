@@ -437,6 +437,13 @@
   gap: 6px;
 }
 
+.editorFieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
 .label {
   font-size: calc(11px * var(--lumiverse-font-scale, 1));
   font-weight: 600;
@@ -1011,10 +1018,21 @@
   font-size: calc(12px * var(--lumiverse-font-scale, 1));
   margin: 0 4px;
   transition: background var(--lumiverse-transition-fast);
+  width: auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
 }
 
 .macroItem:hover {
   background: var(--lumiverse-fill-subtle, rgba(255, 255, 255, 0.05));
+}
+
+.macroItem:focus-visible {
+  outline: 2px solid var(--lumiverse-primary);
+  outline-offset: -2px;
 }
 
 .macroSyntax {
@@ -1521,8 +1539,24 @@
   transition: background var(--lumiverse-transition-fast);
 }
 
-.contextMeter:hover {
+.contextMeterButton {
+  width: 100%;
+  border-top: 0;
+  border-right: 0;
+  border-left: 0;
+  background: transparent;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.contextMeterButton:hover {
   background: var(--lumiverse-fill-subtle);
+}
+
+.contextMeterButton:focus-visible {
+  outline: 2px solid var(--lumiverse-primary);
+  outline-offset: -2px;
 }
 
 .contextBar {

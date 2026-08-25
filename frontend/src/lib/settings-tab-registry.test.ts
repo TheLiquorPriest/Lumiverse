@@ -24,23 +24,19 @@ mock.module('@/i18n', () => {
 })
 mock.module('@/store', () => ({ useStore: () => undefined }))
 const { SETTINGS_TABS, settingsRegistryToCommands } = await import('./settings-tab-registry')
-const settingsEntries = SETTINGS_TABS.filter((entry) => entry.id === 'agentRuntime' || entry.id === 'contextLibrary')
+const settingsEntries = SETTINGS_TABS.filter((entry) => entry.id === 'agentRuntime')
 
 afterAll(() => {
   mock.restore()
 })
 
 describe('settings command palette localization', () => {
-  test('uses translated Agent Runtime and Context Library labels and descriptions', () => {
+  test('uses translated Agent Runtime labels and descriptions', () => {
     const commands = settingsRegistryToCommands(settingsEntries)
     const agentRuntime = commands.find((command) => command.id === 'settings-agentRuntime')
-    const contextLibrary = commands.find((command) => command.id === 'settings-contextLibrary')
 
     expect(agentRuntime?.label).toBe(frSettings.tabs.agentRuntime.tabName)
     expect(agentRuntime?.description).toBe(frSettings.tabs.agentRuntime.tabDescription)
-    expect(contextLibrary?.label).toBe(frSettings.tabs.contextLibrary.tabName)
-    expect(contextLibrary?.description).toBe(frSettings.tabs.contextLibrary.tabDescription)
     expect(agentRuntime?.label).not.toBe('Agent Runtime')
-    expect(contextLibrary?.description).not.toBe('Manage versioned context packs and their attachments')
   })
 })

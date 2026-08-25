@@ -19,7 +19,7 @@ import * as embeddingsSvc from "../embeddings.service";
 import * as settingsSvc from "../settings.service";
 import { getDatabank } from "./databank-crud.service";
 import { abortDatabankProcessing } from "./vectorization.service";
-import { invalidateDatabankCache } from "./retrieval-cache.service";
+import { invalidateDatabankCaches } from "./retrieval-cache.service";
 import type { Databank, DatabankDocumentRow } from "./types";
 import {
   computeUserDataSourceDigest,
@@ -52,8 +52,8 @@ export async function fuseDatabanks(
     const source = getDatabank(userId, sourceId);
     if (!source) throw new FuseError("not_found", "Source databank not found");
 
-    invalidateDatabankCache(userId, targetId);
-    invalidateDatabankCache(userId, sourceId);
+    invalidateDatabankCaches(userId, targetId);
+    invalidateDatabankCaches(userId, sourceId);
 
     const db = getDb();
     const now = Math.floor(Date.now() / 1000);

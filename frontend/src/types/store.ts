@@ -1,6 +1,6 @@
 import type { Message, Character, Persona, Preset, ConnectionProfile, ProviderInfo, RecentChat, GroupedRecentChat, PaginatedResult, Pack, PackWithItems, LumiaItem, LoomItem, ImageGenConnectionProfile, ImageGenProviderInfo } from './api'
 import type { WeaverSession, WeaverStage, WeaverExtraction, WeaverSpineSlot, WeaverSynthesisGroup, WeaverBookRole, WeaverBuildType, WeaverNarrationMode, WeaverPersonaRegister, WeaverPersonaPlan, PersonaDraft, CreateWeaverSessionInput, WeaverCommittedFact, WeaverGap, WeaverInterviewQuestion, WeaverInterviewState, WeaverResponseKind, WeaverCandidate, WeaverBible, UpdateWeaverBibleInput, WeaverFieldDef, WeaverField, WeaverFinalizeResult, WeaverFinalizeInput, WeaverStartChatResult } from '@/api/weaver'
-import type { AgentActivityGeneration } from '@/types/ws-events'
+import type { AgentActivityGeneration, AgenticProviderLifecycle, AgenticProviderOperation } from '@/types/ws-events'
 import type { AgentActivityRunV1, AgentPublicErrorV1, LoomPromptInspectionV1 } from '@/types/agent-runtime'
 import type {
   AgentPersistentWorkspaceArtifactV1,
@@ -21,19 +21,6 @@ import type {
   AgentWorkspaceSectionV2,
   AgentWorkspaceViewStateV2,
 } from './agent-runs'
-import type {
-  AttachContextPackInput,
-  ContextPackAttachment,
-  ContextPackDetail,
-  AgentContextPack,
-  ContextPackUiErrorCode,
-  CreateContextPackInput,
-  CreateContextPackRevisionInput,
-  DuplicateContextPackInput,
-  ReplaceContextPackAclInput,
-  ReviewContextPackInput,
-  UpdateContextPackInput,
-} from './agent-context-packs'
 import type {
   UserDataFailure,
   UserDataJob,
@@ -62,6 +49,15 @@ export interface ChatSlice {
   streamingReasoningDuration: number | null
   streamingReasoningStartedAt: number | null
   streamingError: string | null
+  lastGenerationTerminalStatus: 'completed' | 'stopped' | 'error' | null
+  lastGenerationProvider: string | null
+  lastGenerationConnectionLabel: string | null
+  lastGenerationModel: string | null
+  setGenerationProviderMetadata: (metadata: {
+    provider?: string | null
+    connectionLabel?: string | null
+    model?: string | null
+  }) => void
   activeGenerationId: string | null
   /** Live activity is keyed by generation + target message + swipe. */
   agentActivityByGeneration: Record<string, AgentActivityGeneration>
@@ -163,9 +159,17 @@ export interface AgentPersistentWorkspaceCollectionStateV1<T> {
   items: T[]
   error: string | null
 }
+export interface AgentPersistentWorkspaceSessionPageStateV1 {
+  total: number
+  limit: number
+  offset: number
+  nextOffset: number
+}
+
 
 export interface AgentPersistentWorkspaceCollectionsStateV1 {
   sessions: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceTurnSessionV1>
+  sessionsPage: AgentPersistentWorkspaceSessionPageStateV1
   tasks: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceTaskV1>
   records: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceRecordV1>
   artifacts: AgentPersistentWorkspaceCollectionStateV1<AgentPersistentWorkspaceArtifactV1>
@@ -180,6 +184,13 @@ export interface AgentRunRetryStateV1 {
 }
 
 // ---- Agent Run Projection Slice ----
+export interface AgentRunResyncDescriptorV1 {
+  snapshotSequence: number
+  totalRuns: number
+  nextOffset: number
+  identities: Record<string, true>
+}
+
 export interface AgentRunsSlice {
   agentRunProvisionalByKey: Record<string, AgentRunPublicV2>
   agentRunTerminalByTarget: Record<string, AgentRunPublicV2>
@@ -187,6 +198,7 @@ export interface AgentRunsSlice {
   agentRunLastSequenceByChat: Record<string, number>
   agentRunCursorSequenceByChat: Record<string, number>
   agentRunResyncOffsetByChat: Record<string, number>
+  agentRunResyncDescriptorByChat: Record<string, AgentRunResyncDescriptorV1>
   agentRunSyncByChat: Record<string, AgentRunSyncStatus>
   agentRunOmittedEventsByChat: Record<string, number>
   agentRunRequestEpochByChat: Record<string, number>
@@ -249,6 +261,8 @@ export interface AgentRunsSlice {
     collection: AgentPersistentWorkspaceCollectionV1,
     requestEpoch: number,
     payload: unknown,
+    append?: boolean,
+    expectedOffset?: number,
   ) => boolean
   failPersistentWorkspaceCollection: (
     workspaceId: string,
@@ -483,6 +497,9 @@ export interface UISlice {
   // Transient highlight target for navigation feedback (e.g. greeting switch)
   highlightedMessageId: string | null
   setHighlightedMessageId: (id: string | null) => void
+  // Session-only expansion state for height-collapsed assistant messages.
+  expandedLongMessageKeys: string[]
+  setLongMessageExpanded: (chatId: string, messageId: string, expanded: boolean) => void
 }
 
 // ---- OOC Style Type ----
@@ -817,6 +834,8 @@ export interface LorebookEditorSettings {
 }
 
 // ---- Settings Slice ----
+export type LongMessageCollapsePreset = 'compact' | 'comfortable' | 'tall' | 'custom'
+
 export interface SettingsSlice {
   settingsLoaded: boolean
   /** Full persisted settings loaded; startup settings intentionally set only `settingsLoaded`. */
@@ -830,6 +849,10 @@ export interface SettingsSlice {
   personasPerPage: number
   messagesPerPage: number
   chatSheldDisplayMode: 'minimal' | 'immersive' | 'bubble'
+  longMessageCollapseEnabled: boolean
+  longMessageCollapsePreset: LongMessageCollapsePreset
+  longMessageCollapseCustomHeight: number
+  longMessageCollapseDepth: number
   minimalUseFullAvatar: boolean
   bubbleUserAlign: 'left' | 'right'
   bubbleDisableHover: boolean
@@ -901,6 +924,11 @@ export interface SettingsSlice {
   characterTabDisplaySettings: CharacterTabDisplaySettings
   portraitDockSettings: PortraitDockSettings
   lorebookEditorSettings: LorebookEditorSettings
+  showEmbeddingFallbackUi: boolean
+  showCortexSecondaryUi: boolean
+  showEditAndSend: boolean
+  enableToolbarIconReorder: boolean
+  productivityTabPosition: string
   hydrateStartupSettings: (settings: StartupSettings) => void
   setVoiceSettings: (partial: Partial<VoiceSettings>) => void
   setWallpaper: (settings: Partial<WallpaperSettings>) => void
@@ -1920,6 +1948,10 @@ export interface ChatHeadEntry {
   avatarUrl: string | null
   status: ChatHeadStatus
   model: string
+  provider?: string
+  connectionLabel?: string
+  agentOperation?: AgenticProviderOperation
+  agentLifecycle?: AgenticProviderLifecycle
   startedAt: number
   attentionCleared?: boolean
   subtitle?: string
@@ -1971,6 +2003,7 @@ export interface DatabankSlice {
   selectedDatabankId: string | null
   databankScopeFilter: 'global' | 'character' | 'chat'
   databankScopeCharacterId: string | null
+  databankRevision: number
   setDatabanks: (banks: import('@/api/databank').Databank[]) => void
   addDatabank: (bank: import('@/api/databank').Databank) => void
   updateDatabank: (id: string, updates: Partial<import('@/api/databank').Databank>) => void
@@ -1978,6 +2011,7 @@ export interface DatabankSlice {
   setSelectedDatabankId: (id: string | null) => void
   setDatabankScopeFilter: (scope: 'global' | 'character' | 'chat') => void
   setDatabankScopeCharacterId: (id: string | null) => void
+  markDatabanksStale: () => void
   setDatabankDocuments: (docs: import('@/api/databank').DatabankDocument[]) => void
   addDatabankDocument: (doc: import('@/api/databank').DatabankDocument) => void
   updateDatabankDocument: (id: string, updates: Partial<import('@/api/databank').DatabankDocument>) => void
@@ -2081,52 +2115,6 @@ export interface WeaverSlice {
   startWeaverChat: (sessionId: string) => Promise<WeaverStartChatResult>
 }
 
-// ---- Agent Context Packs Slice ----
-export interface AgentContextPacksSlice {
-  contextPacks: AgentContextPack[]
-  selectedContextPackId: string | null
-  selectedContextPack: ContextPackDetail | null
-  contextPackAclRevision: number
-  contextPacksLoading: boolean
-  contextPackDetailLoading: boolean
-  contextPackBusyAction: string | null
-  contextPackError: ContextPackUiErrorCode | null
-  loadContextPacks: () => Promise<void>
-  selectContextPack: (packId: string | null) => Promise<void>
-  createContextPack: (input: CreateContextPackInput) => Promise<ContextPackDetail | null>
-  updateContextPack: (
-    packId: string,
-    input: UpdateContextPackInput,
-  ) => Promise<ContextPackDetail | null>
-  deleteContextPack: (packId: string, expectedRevision: number) => Promise<boolean>
-  createContextPackRevision: (
-    packId: string,
-    input: CreateContextPackRevisionInput,
-  ) => Promise<ContextPackDetail | null>
-  attachContextPack: (
-    packId: string,
-    input: AttachContextPackInput,
-  ) => Promise<ContextPackDetail | null>
-  detachContextPack: (
-    packId: string,
-    attachment: ContextPackAttachment,
-    expectedContextAclRevision: number,
-  ) => Promise<ContextPackDetail | null>
-  replaceContextPackAcl: (
-    packId: string,
-    input: ReplaceContextPackAclInput,
-  ) => Promise<ContextPackDetail | null>
-  reviewContextPack: (
-    packId: string,
-    input: ReviewContextPackInput,
-  ) => Promise<ContextPackDetail | null>
-  duplicateContextPack: (
-    packId: string,
-    input: DuplicateContextPackInput,
-  ) => Promise<ContextPackDetail | null>
-  importContextPack: (snapshot: unknown) => Promise<ContextPackDetail | null>
-  clearContextPackError: () => void
-}
 
 // ---- User-data portability slice ----
 export type UserDataJobAction = 'upload' | 'ticket' | 'skip-ticket' | 'cancel'
@@ -2181,6 +2169,5 @@ export type AppStore = ChatSlice &
   DatabankSlice &
   ConnectionSlice &
   ContainersSlice &
-  AgentContextPacksSlice &
   AgentRunsSlice &
   UserDataSlice

@@ -1,4 +1,4 @@
-import { canonicalizeAgenticReadinessVectorV1, hashAgenticReadinessVectorV1 } from "./agent-cognition-integrity.service";
+import { compareUtf8 } from "../utils/utf8-order";
 import { createHash, randomBytes } from "node:crypto";
 import { getDb } from "../db/connection";
 import * as chatsSvc from "./chats.service";
@@ -6,7 +6,6 @@ import * as connectionsSvc from "./connections.service";
 import * as personasSvc from "./personas.service";
 import * as presetProfilesSvc from "./preset-profiles.service";
 import * as presetsSvc from "./presets.service";
-import * as settingsSvc from "./settings.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
 import type { ResolvedCouncilProfile } from "../types/council-profile";
 import type {
@@ -46,8 +45,17 @@ import {
   AGENT_RUNTIME_DECISION_VERSION,
   isAgentRuntimeMode,
 } from "../types/agent-runtime-decision";
-import type { AgentRuntimePolicyV1 } from "../types/agents";
-import { parseAgentConfigV2 } from "../types/agents";
+import type { AgentConfigV2, AgentRuntimePolicyV1 } from "../types/agents";
+import type { LoomPromptInspectionBlockV1, LoomPromptInspectionV1, LoomResponsePolicyOmissionV1 } from "../types/agent-cognition";
+import { parseAgentConfigV2, parseAgentRuntimePolicyV1 } from "../types/agents";
+import { LOOM_POLICY_VERSION } from "../types/agent-cognition";
+import { inspectLoomPromptPolicies } from "./agent-cognition.service";
+import { listPromptBlocks } from "./presets.service";
+import {
+  canonicalizeAgenticReadinessVectorV1,
+  hashAgenticReadinessVectorV1,
+} from "./agent-cognition-integrity.service";
+import { getPresetAgentResponseCognitionSourceV1 } from "./agent-config-portability.service";
 import { validateAgentConfigForExecution } from "./agent-runtime-limits";
 const INPUT_REVISION_KEYS: readonly (keyof InputRevisionSetV1)[] = [
   "target",
@@ -68,8 +76,6 @@ const INPUT_REVISION_KEYS: readonly (keyof InputRevisionSetV1)[] = [
   "settings",
   "macro",
   "regex",
-  "context",
-  "acl",
   "cognition",
   "readiness",
 ];
@@ -402,6 +408,7 @@ export interface RuntimeDecisionDependencies {
       configRevision: RuntimeRevision | null;
       bindingRevision: RuntimeRevision | null;
       inputRevisionDigest: string;
+      inputRevisionsComplete: boolean;
       rootConnection?: FrozenConcreteConnectionV1 | null;
       childConnections?: Readonly<Record<string, FrozenConcreteConnectionV1>>;
       target?: GenerationTargetV1;
@@ -453,11 +460,18 @@ function hashCanonical(value: unknown): string {
   return createHash("sha256").update(stableStringify(value), "utf8").digest("hex");
 }
 
+/** Canonical digest used to bind provider capability semantics to a turn. */
+export function canonicalRuntimeCapabilityDigest(
+  capabilities: Readonly<Record<string, unknown>>,
+): string {
+  return hashCanonical(capabilities);
+}
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(",")}]`;
   const entries = Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareUtf8(left, right))
     .map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`);
   return `{${entries.join(",")}}`;
 }
@@ -474,8 +488,15 @@ function safeString(value: unknown, fallback: string | null = null): string | nu
 }
 
 function safeRevision(value: unknown): RuntimeRevision | null {
-  if (typeof value === "string" && value.length <= SAFE_STRING_MAX) return value;
-  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "string") {
+    if (value.length === 0 || value.length > SAFE_STRING_MAX) return null;
+    if (/^[+-]?\d+$/.test(value)) {
+      const numeric = Number(value);
+      if (!Number.isSafeInteger(numeric) || numeric < 0) return null;
+    }
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
   return null;
 }
 
@@ -500,8 +521,30 @@ function normalizeRequirements(value: unknown): AgentRuntimeCapabilityRequiremen
     const requirement = item as AgentRuntimeCapabilityRequirement;
     if (!requirements.includes(requirement)) requirements.push(requirement);
   }
-  return requirements.sort((left, right) => left.localeCompare(right));
+  return requirements.sort(compareUtf8);
 }
+const HOST_REASON_MASKS: ReadonlySet<string> = new Set([
+  "loom_policy_unavailable",
+  "agentic_response_escape",
+]);
+
+function isRuntimeRepairCode(value: string): value is AgentRuntimeRepairCode {
+  return (AGENT_RUNTIME_REPAIR_CODES as readonly string[]).includes(value);
+}
+
+function firstConcreteHostReason(
+  readinessReasons: readonly string[],
+  repairCodes: readonly string[],
+): AgentRuntimeRepairCode {
+  for (const reason of readinessReasons) {
+    if (isRuntimeRepairCode(reason) && !HOST_REASON_MASKS.has(reason)) return reason;
+  }
+  for (const code of repairCodes) {
+    if (isRuntimeRepairCode(code) && !HOST_REASON_MASKS.has(code)) return code;
+  }
+  return "agentic_readiness_unavailable";
+}
+
 export interface LoomRuntimePolicyResolutionInputV1 {
   transientSelection?: LoomRuntimePolicyTransientSelectionV1 | null;
   durableChatOverride?: LoomRuntimePolicyDurableChatOverrideV1 | null;
@@ -582,7 +625,7 @@ export function resolveLoomRuntimePolicy(
     scope = "host";
     availability = {
       state: hostAvailability,
-      reasonCode: input.hostReasonCode ?? "loom_policy_unavailable",
+      reasonCode: input.hostReasonCode ?? "agentic_readiness_unavailable",
     };
   } else if (!allowedModes.includes(authoredValue)) {
     effectiveValue = "response";
@@ -590,7 +633,7 @@ export function resolveLoomRuntimePolicy(
     scope = "host";
     availability = {
       state: "denied",
-      reasonCode: input.hostReasonCode ?? "loom_policy_unavailable",
+      reasonCode: input.hostReasonCode ?? "agentic_mode_not_allowed",
     };
   }
   const repairAcknowledgement = input.repairAcknowledgement ?? {
@@ -636,10 +679,19 @@ type RuntimeConcreteConnection = FrozenConcreteConnectionV1 & { presetId?: strin
 
 function normalizeConcreteConnection(raw: unknown, logicalId: string | null): RuntimeConcreteConnection | null {
   if (!isRecord(raw)) return null;
-  const capabilities = isRecord(raw.capabilities) ? { ...raw.capabilities } : {};
+  const readRevision = (names: readonly string[], path: string): RuntimeRevision | null => {
+    const field = readAliasedField(raw, names, path);
+    if (!field.present || field.value === undefined || field.value === null) return null;
+    const revision = safeRevision(field.value);
+    if (revision === null) {
+      throw new RuntimeDecisionError("invalid_request", `${path} must be a non-negative safe integer revision`, 400);
+    }
+    return revision;
+  };
+  const capabilities = freezePolicy(isRecord(raw.capabilities) ? { ...raw.capabilities } : {});
   const concreteId = safeString(raw.concreteId ?? raw.concrete_id ?? raw.id, null);
   const normalizedLogicalId = safeString(raw.logicalId ?? raw.logical_id, logicalId);
-  return {
+  return Object.freeze({
     logicalId: normalizedLogicalId,
     concreteId,
     label: safeString(raw.label ?? raw.name, null),
@@ -647,14 +699,15 @@ function normalizeConcreteConnection(raw: unknown, logicalId: string | null): Ru
     provider: safeString(raw.provider, null),
     model: safeString(raw.model, null),
     effectiveEndpoint: safeString(raw.endpoint ?? raw.effectiveEndpoint ?? raw.apiUrl ?? raw.api_url, null),
-    endpointRevision: safeRevision(raw.endpointRevision ?? raw.endpoint_revision),
+    endpointRevision: readRevision(["endpointRevision", "endpoint_revision"], "connection.endpointRevision"),
     credentialSecretRef: safeString(raw.credentialSecretRef ?? raw.credential_secret_ref, null),
-    credentialRevision: safeRevision(raw.credentialRevision ?? raw.credential_revision),
-    candidateRevision: safeRevision(raw.candidateRevision ?? raw.candidate_revision),
-    revision: safeRevision(raw.revision ?? raw.updatedAt ?? raw.updated_at),
+    credentialRevision: readRevision(["credentialRevision", "credential_revision"], "connection.credentialRevision"),
+    candidateRevision: readRevision(["candidateRevision", "candidate_revision"], "connection.candidateRevision"),
+    revision: readRevision(["revision", "updatedAt", "updated_at"], "connection.revision"),
     fingerprint: safeString(raw.fingerprint, null),
+    capabilityDigest: canonicalRuntimeCapabilityDigest(capabilities),
     capabilities,
-  };
+  });
 }
 function sameFrozenConnection(left: FrozenConcreteConnectionV1 | null | undefined, right: FrozenConcreteConnectionV1 | null | undefined): boolean {
   if (!left || !right) return left === right;
@@ -669,7 +722,8 @@ function sameFrozenConnection(left: FrozenConcreteConnectionV1 | null | undefine
     && String(left.credentialSecretRef) === String(right.credentialSecretRef)
     && String(left.credentialRevision) === String(right.credentialRevision)
     && String(left.candidateRevision) === String(right.candidateRevision)
-    && String(left.fingerprint) === String(right.fingerprint);
+    && String(left.fingerprint) === String(right.fingerprint)
+    && left.capabilityDigest === right.capabilityDigest;
 }
 
 function capabilityIsPresent(capabilities: Readonly<Record<string, unknown>>, requirement: AgentRuntimeCapabilityRequirement): boolean {
@@ -721,12 +775,30 @@ function mapCapabilityFailure(requirement: AgentRuntimeCapabilityRequirement): A
 }
 
 function normalizeInputRevisions(value: Partial<InputRevisionSetV1> | null | undefined): { complete: boolean; normalized: Record<string, unknown>; digest: string } {
+  if (value !== null && value !== undefined && !isRecord(value)) {
+    throw new RuntimeDecisionError("invalid_request", "inputRevisions must be an object or null", 400);
+  }
   const source = isRecord(value) ? value : {};
   const normalized: Record<string, unknown> = {};
   let complete = true;
   for (const key of INPUT_REVISION_KEYS) {
-    if (!Object.hasOwn(source, key) || source[key] === undefined) complete = false;
-    normalized[key] = source[key] ?? null;
+    if (!Object.hasOwn(source, key)) {
+      complete = false;
+      normalized[key] = null;
+      continue;
+    }
+    if (source[key] === undefined) {
+      throw new RuntimeDecisionError("invalid_request", `inputRevisions.${key} must be a revision`, 400);
+    }
+    if (source[key] === null) {
+      normalized[key] = null;
+      continue;
+    }
+    const revision = safeRevision(source[key]);
+    if (revision === null) {
+      throw new RuntimeDecisionError("invalid_request", `inputRevisions.${key} must be a non-negative safe integer revision`, 400);
+    }
+    normalized[key] = revision;
   }
   return { complete, normalized, digest: hashCanonical(normalized) };
 }
@@ -753,7 +825,6 @@ function defaultReadinessVector(inputRevisionDigest: string, configRevision: Run
     targetRevision: DEFAULT_REVISION,
     inputRevisionDigest,
     cognitionRevision: DEFAULT_READINESS_EPOCH,
-    contextAclRevision: DEFAULT_READINESS_EPOCH,
     killSwitchState: "auto",
     ready: true,
     reasons: [],
@@ -767,26 +838,64 @@ function normalizeReadinessVector(
   bindingRevision: RuntimeRevision | null,
 ): AgenticReadinessVectorV1 {
   const defaults = defaultReadinessVector(inputRevisionDigest, configRevision, bindingRevision);
-  if (!isRecord(raw)) return defaults;
-  const state = raw.killSwitchState === "off" || raw.killSwitchState === "on" || raw.killSwitchState === "auto"
-    ? raw.killSwitchState
-    : defaults.killSwitchState;
-  const reasons = Array.isArray(raw.reasons)
-    ? raw.reasons.filter((reason): reason is string => typeof reason === "string" && reason.length <= SAFE_STRING_MAX)
-    : defaults.reasons;
-  return {
-    ...defaults,
-    ...Object.fromEntries(Object.keys(defaults).map((key) => {
-      const value = raw[key as keyof AgenticReadinessVectorV1];
-      return [key, value === undefined ? defaults[key as keyof AgenticReadinessVectorV1] : value];
-    })),
-    killSwitchState: state,
-    reasons,
-    inputRevisionDigest,
-    configRevision: safeRevision(raw.configRevision) ?? configRevision ?? DEFAULT_REVISION,
-    bindingRevision: safeRevision(raw.bindingRevision) ?? bindingRevision ?? DEFAULT_REVISION,
-    ready: raw.ready !== false && state !== "on",
-  };
+  if (raw === null || raw === undefined) return defaults;
+  if (!isRecord(raw)) {
+    throw new RuntimeDecisionError("invalid_request", "readinessVector must be an object or null", 400);
+  }
+  const result = { ...defaults };
+  const revisionKeys = [
+    "schemaEpoch",
+    "runtimeEpoch",
+    "reconciliationEpoch",
+    "archiveRegistryVersion",
+    "isolateHealthEpoch",
+    "publicationStoreHealthEpoch",
+    "providerCapabilityRevision",
+    "configRevision",
+    "bindingRevision",
+    "concreteConnectionRevision",
+    "targetRevision",
+    "cognitionRevision",
+  ] as const;
+  for (const key of revisionKeys) {
+    if (!Object.hasOwn(raw, key)) continue;
+    const revision = safeRevision(raw[key]);
+    if (revision === null) {
+      throw new RuntimeDecisionError("invalid_request", `readinessVector.${key} must be a non-negative safe integer revision`, 400);
+    }
+    (result as unknown as Record<string, unknown>)[key] = revision;
+  }
+  if (Object.hasOwn(raw, "inputRevisionDigest")) {
+    if (typeof raw.inputRevisionDigest !== "string"
+      || raw.inputRevisionDigest.length === 0
+      || raw.inputRevisionDigest.length > SAFE_STRING_MAX) {
+      throw new RuntimeDecisionError("invalid_request", "readinessVector.inputRevisionDigest must be a bounded string", 400);
+    }
+  }
+  if (Object.hasOwn(raw, "killSwitchState")
+    && raw.killSwitchState !== "off"
+    && raw.killSwitchState !== "on"
+    && raw.killSwitchState !== "auto") {
+    throw new RuntimeDecisionError("invalid_request", "readinessVector.killSwitchState is invalid", 400);
+  }
+  const state = raw.killSwitchState ?? defaults.killSwitchState;
+  if (Object.hasOwn(raw, "ready") && typeof raw.ready !== "boolean") {
+    throw new RuntimeDecisionError("invalid_request", "readinessVector.ready must be boolean", 400);
+  }
+  let reasons = defaults.reasons;
+  if (Object.hasOwn(raw, "reasons")) {
+    if (!Array.isArray(raw.reasons)
+      || raw.reasons.length > 64
+      || raw.reasons.some((reason) => typeof reason !== "string" || reason.length === 0 || reason.length > 256)) {
+      throw new RuntimeDecisionError("invalid_request", "readinessVector.reasons is invalid", 400);
+    }
+    reasons = raw.reasons.slice();
+  }
+  result.killSwitchState = state;
+  result.reasons = reasons;
+  result.inputRevisionDigest = inputRevisionDigest;
+  result.ready = raw.ready !== false && state !== "on";
+  return result;
 }
 
 function normalizeConfig(
@@ -797,7 +906,20 @@ function normalizeConfig(
   reviewCode: string | null = null,
   reviewAcknowledged = false,
 ): AgentConfigView | null {
-  let config: ReturnType<typeof parseAgentConfigV2>;
+  const hasRuntimePolicy = isRecord(raw) && Object.hasOwn(raw, "runtimePolicy");
+  if (hasRuntimePolicy) {
+    try {
+      parseAgentRuntimePolicyV1(raw.runtimePolicy);
+    } catch {
+      throw new RuntimeDecisionError(
+        "runtime_policy_invalid",
+        "runtimePolicy is invalid.",
+        400,
+        "loom_policy_invalid",
+      );
+    }
+  }
+  let config: AgentConfigV2;
   try {
     config = parseAgentConfigV2(raw);
   } catch {
@@ -891,6 +1013,7 @@ function buildBinding(
     provider: root?.provider ?? null,
     model: root?.model ?? null,
     fingerprint: root?.fingerprint ?? null,
+    capabilityDigest: root?.capabilityDigest ?? null,
     candidateRevision: root?.candidateRevision ?? null,
     credentialRevision: root?.credentialRevision ?? null,
     endpointRevision: root?.endpointRevision ?? null,
@@ -901,6 +1024,98 @@ function buildBinding(
     readinessDigest: context.readinessDigest,
   };
 }
+function publicLoomInspection(
+  userId: string,
+  presetId: string | null,
+  presetRevision: RuntimeRevision | null,
+  config: AgentConfigView | null,
+  effectiveMode: AgentRuntimeMode,
+): {
+  readonly inspection: LoomPromptInspectionV1;
+  readonly responseOmission: LoomResponsePolicyOmissionV1 | null;
+} {
+  const surface = effectiveMode === "response" ? "RESPONSE" as const : "WORK" as const;
+  const responseSource = surface === "RESPONSE" && presetId ? getPresetAgentResponseCognitionSourceV1(userId, presetId) : null;
+  const inspectionConfig = surface === "RESPONSE" ? responseSource?.config ?? null : config;
+  const reviewReason = responseSource?.reviewReason
+    ?? (responseSource ? responseSource.sourceKind + "_cognition_source" : "response_surface");
+  const omittedPhaseInstructions = Object.freeze((inspectionConfig?.runtimePolicy?.phases ?? []).flatMap((phase) => [
+    ...phase.instructionRefs.map((source) => Object.freeze({ phaseId: phase.id, source })),
+    ...phase.childInstructionSubsets.flatMap((subset) => subset.instructionRefs.map((source) => Object.freeze({ phaseId: phase.id, profileId: subset.profileId, source }))),
+  ]));
+  const policy = inspectionConfig?.runtimePolicy?.loomPolicy;
+  const blocks: LoomPromptInspectionBlockV1[] = [];
+  if (policy && presetId && presetRevision !== null && surface === "WORK") {
+    const currentBlocks = listPromptBlocks(userId, presetId) ?? [];
+    const seenSources = new Set<string>();
+    for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
+      for (const entry of policy[bucket]) {
+        const source = entry.source;
+        const sourceKey = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
+        if (seenSources.has(sourceKey)) continue;
+        seenSources.add(sourceKey);
+        const block = currentBlocks.find((candidate) => candidate.id === source.blockId);
+        if (
+          !block
+          || currentBlocks.indexOf(block) !== source.promptOrder
+          || source.presetRevision !== presetRevision
+        ) continue;
+        const blockValue: unknown = block;
+        const blockRevisionValue = isRecord(blockValue) ? blockValue.revision : undefined;
+        if (
+          typeof blockRevisionValue !== "number"
+          || !Number.isSafeInteger(blockRevisionValue)
+          || blockRevisionValue < 0
+          || blockRevisionValue !== source.blockRevision
+          || typeof block.content !== "string"
+        ) continue;
+        blocks.push({ source, content: block.content });
+      }
+    }
+  }
+  const baseInspection = policy
+    ? inspectLoomPromptPolicies(policy, {
+      checkpoint: "ASSEMBLE",
+      surface,
+      blocks,
+    })
+    : {
+      version: LOOM_POLICY_VERSION,
+      surface,
+      checkpoint: "ASSEMBLE" as const,
+      items: [],
+      effectiveEntryIds: [],
+      ...(surface === "RESPONSE"
+        ? {
+          responseOmission: {
+            version: LOOM_POLICY_VERSION,
+            surface: "RESPONSE" as const,
+            visibility: "work_only" as const,
+            reason: "work_only" as const,
+            ...(reviewReason === null ? {} : { reviewReason }),
+            omittedEntryIds: [],
+            source: [],
+            omittedPhaseInstructions,
+          },
+        }
+        : {}),
+    };
+  const inspection = surface === "RESPONSE" && baseInspection.responseOmission
+    ? Object.freeze({
+      ...baseInspection,
+      responseOmission: Object.freeze({
+        ...baseInspection.responseOmission,
+        ...(reviewReason === null ? {} : { reviewReason }),
+        omittedPhaseInstructions,
+      }),
+    })
+    : baseInspection;
+  return {
+    inspection,
+    responseOmission: inspection.responseOmission ?? null,
+  };
+}
+
 function safePublicResponse(decision: EffectiveRuntimeDecisionV1): EffectiveRuntimePublicResponseV1 {
   const { internal: _internal, ...publicPart } = decision;
   return publicPart;
@@ -1305,10 +1520,11 @@ export class AgentRuntimeDecisionService {
       frozenChildConnections?: Readonly<Record<string, FrozenConcreteConnectionV1>>;
     } = {},
   ): Promise<EffectiveRuntimeDecisionV1> {
-    this.dependencyUseStarted = true;
     if (!userId || !request || !request.chatId) {
       throw new RuntimeDecisionError("invalid_request", "chatId is required", 400);
     }
+    request = normalizeEffectiveRuntimeRequest(request);
+    this.dependencyUseStarted = true;
     const chat = this.dependencies.getChat(userId, request.chatId);
     if (!chat || chat.id !== request.chatId) throw new RuntimeDecisionError("not_found", "Not found", 404);
 
@@ -1364,8 +1580,7 @@ export class AgentRuntimeDecisionService {
     let config: AgentConfigView | null = null;
     let rawConfig: unknown = null;
     let configSnapshot: unknown = null;
-    const activePresetSetting = settingsSvc.getSetting(userId, "activeLoomPresetId");
-    const activePresetId = typeof activePresetSetting?.value === "string" ? activePresetSetting.value : null;
+    const activePresetId = presetsSvc.reconcileActiveLoomPreset(userId);
     const rootPresetId = rootConnection && "presetId" in rootConnection && typeof rootConnection.presetId === "string"
       ? rootConnection.presetId
       : null;
@@ -1558,6 +1773,7 @@ export class AgentRuntimeDecisionService {
       configRevision: config?.revision ?? null,
       bindingRevision: config?.bindingRevision ?? null,
       inputRevisionDigest: revisions.digest,
+      inputRevisionsComplete: revisions.complete,
       rootConnection,
       childConnections,
       target,
@@ -1596,8 +1812,8 @@ export class AgentRuntimeDecisionService {
     const capabilityReadiness = {
       ready: capabilityReady,
       sameDomain,
-      required: [...new Set(requiredCapabilities)].sort((left, right) => left.localeCompare(right)),
-      missing: missingCapabilities.sort((left, right) => left.localeCompare(right)),
+      required: [...new Set(requiredCapabilities)].sort(compareUtf8),
+      missing: missingCapabilities.sort(compareUtf8),
       repairCodes: [...new Set(uniqueRepairCodes)],
     };
     const effectiveMode: AgentRuntimeMode = capabilityReady ? "agentic" : "response";
@@ -1612,8 +1828,9 @@ export class AgentRuntimeDecisionService {
         : config?.state === "review_required"
           ? "loom_policy_repair_required"
           : null,
-      hostAllowedModes: capabilityReady ? configAllowedModes : ["response"],
-      hostReasonCode: capabilityReady ? null : "loom_policy_unavailable",
+      hostAllowedModes: configAllowedModes,
+      hostAvailability: capabilityReady ? "available" : "unavailable",
+      hostReasonCode: capabilityReady ? null : firstConcreteHostReason(readinessVector.reasons, uniqueRepairCodes),
       repairAcknowledgement: initialRuntimePolicy.repairAcknowledgement,
     });
     if (runtimePolicy.availability.reasonCode && !uniqueRepairCodes.includes(runtimePolicy.availability.reasonCode)) {
@@ -1684,11 +1901,20 @@ export class AgentRuntimeDecisionService {
       }
     }
 
+    const publicInspection = publicLoomInspection(
+      userId,
+      preset?.id ?? null,
+      presetRevision,
+      config,
+      context.effectiveMode,
+    );
     const decision: EffectiveRuntimeDecisionV1 = {
       version: AGENT_RUNTIME_DECISION_VERSION,
       chatId: chat.id,
       target,
       connection: publicConnection(rootConnection),
+      inspection: publicInspection.inspection,
+      responseOmission: publicInspection.responseOmission,
       runtimePolicy: context.runtimePolicy,
       preset: {
         id: preset?.id ?? null,
@@ -1721,6 +1947,13 @@ export class AgentRuntimeDecisionService {
   async consume(userId: string, token: string, request: EffectiveRuntimeRequestV1): Promise<RuntimeDecisionTokenConsumptionV1> {
     const stored = this.tokenStore.consume(userId, token);
     if (!stored) return { accepted: false, code: "decision_refresh_required", decision: null };
+    let normalizedRequest: EffectiveRuntimeRequestV1;
+    try {
+      normalizedRequest = normalizeEffectiveRuntimeRequest(request);
+    } catch {
+      return { accepted: false, code: "decision_refresh_required", decision: null };
+    }
+    request = normalizedRequest;
     const storedRequest = stored.request;
     const normalizedIncoming = normalizeTarget(request).target;
     const normalizedStored = normalizeTarget(storedRequest).target;
@@ -1754,9 +1987,13 @@ export class AgentRuntimeDecisionService {
       transientSelection: stored.decision.runtimePolicy?.transientSelection ?? storedRequest.transientSelection ?? null,
       mode: "agentic",
     };
+    const readinessVector = request.readinessVector ?? storedRequest.readinessVector;
+    const currentRequestForResolve = readinessVector === undefined
+      ? currentRequest
+      : { ...currentRequest, readinessVector };
     const current = await this.resolve(
       userId,
-      { ...currentRequest, readinessVector: request.readinessVector ?? storedRequest.readinessVector },
+      currentRequestForResolve,
       {
         issueToken: false,
         frozenRootConnection: storedRoot,
@@ -1777,6 +2014,7 @@ export class AgentRuntimeDecisionService {
       || currentBinding.provider !== expected.provider
       || currentBinding.model !== expected.model
       || currentBinding.fingerprint !== expected.fingerprint
+      || currentBinding.capabilityDigest !== expected.capabilityDigest
       || currentBinding.candidateRevision !== expected.candidateRevision
       || currentBinding.credentialRevision !== expected.credentialRevision
       || currentBinding.endpointRevision !== expected.endpointRevision
@@ -1941,17 +2179,25 @@ function parseStrictRevision(value: unknown, path: string, nullable = true): Run
     throw new RuntimeDecisionError("invalid_request", `${path} must be a revision`, 400);
   }
   if (typeof value === "number") {
-    if (!Number.isSafeInteger(value)) throw new RuntimeDecisionError("invalid_request", `${path} must be a safe integer revision`, 400);
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RuntimeDecisionError("invalid_request", `${path} must be a non-negative safe integer revision`, 400);
+    }
     return value;
   }
   if (typeof value === "string") {
     if (value.length === 0 || value.length > SAFE_STRING_MAX) throw new RuntimeDecisionError("invalid_request", `${path} must be a bounded revision`, 400);
+    if (/^[+-]?\d+$/.test(value)) {
+      const numeric = Number(value);
+      if (!Number.isSafeInteger(numeric) || numeric < 0) {
+        throw new RuntimeDecisionError("invalid_request", `${path} must be a non-negative safe integer revision`, 400);
+      }
+    }
     return value;
   }
   throw new RuntimeDecisionError("invalid_request", `${path} must be a revision`, 400);
 }
 function parseStrictTransientSelection(value: unknown, path: string): LoomRuntimePolicyTransientSelectionV1 | null | undefined {
-  if (value === undefined) return undefined;
+  if (value === undefined) throw new RuntimeDecisionError("invalid_request", `${path} is required`, 400);
   if (value === null) return null;
   if (!isRecord(value)) throw new RuntimeDecisionError("runtime_policy_invalid", `${path} must be an object`, 400, "loom_policy_invalid");
   assertClosedObject(value, ["mode", "turnFence", "authenticated"], path);
@@ -1976,7 +2222,7 @@ function parseStrictSwipe(value: unknown, path: string): number | null {
 }
 
 function parseStrictPartialInputRevisions(value: unknown, path: string): Partial<InputRevisionSetV1> | null | undefined {
-  if (value === undefined) return undefined;
+  if (value === undefined) throw new RuntimeDecisionError("invalid_request", `${path} is required`, 400);
   if (value === null) return null;
   if (!isRecord(value)) throw new RuntimeDecisionError("invalid_request", `${path} must be an object`, 400);
   assertClosedObject(value, INPUT_REVISION_KEYS, path);
@@ -2002,14 +2248,13 @@ const READINESS_KEYS = [
   "targetRevision",
   "inputRevisionDigest",
   "cognitionRevision",
-  "contextAclRevision",
   "killSwitchState",
   "ready",
   "reasons",
 ] as const;
 
 function parseStrictReadinessVector(value: unknown, path: string): Partial<AgenticReadinessVectorV1> | null | undefined {
-  if (value === undefined) return undefined;
+  if (value === undefined) throw new RuntimeDecisionError("invalid_request", `${path} is required`, 400);
   if (value === null) return null;
   if (!isRecord(value)) throw new RuntimeDecisionError("invalid_request", `${path} must be an object`, 400);
   assertClosedObject(value, READINESS_KEYS, path);
@@ -2071,7 +2316,9 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
   if (parsedMode !== undefined && !isAgentRuntimeMode(parsedMode)) {
     throw new RuntimeDecisionError("invalid_request", "mode must be 'response' or 'agentic'", 400);
   }
-  const parsedTransientSelection = parseStrictTransientSelection(transient.value, "transientSelection");
+  const parsedTransientSelection = transient.present
+    ? parseStrictTransientSelection(transient.value, "transientSelection")
+    : undefined;
   const parsedForcePreset = forcePreset.present
     ? (typeof forcePreset.value === "boolean"
       ? forcePreset.value
@@ -2109,20 +2356,36 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
       revision: targetRevision.present ? parseStrictRevision(targetRevision.value, "target.revision") as RuntimeRevision | null : null,
     };
   }
+  const parsedInputRevisions = inputRevisions.present
+    ? parseStrictPartialInputRevisions(inputRevisions.value, "inputRevisions")
+    : undefined;
+  const parsedReadiness = readiness.present
+    ? parseStrictReadinessVector(readiness.value, "readinessVector")
+    : undefined;
   return {
     chatId,
-    logicalConnectionId: logicalConnection.present ? parseStrictString(logicalConnection.value, "logicalConnectionId") as string | null : undefined,
-    presetId: preset.present ? parseStrictString(preset.value, "presetId") as string | null : undefined,
-    forcePresetId: parsedForcePreset,
-    personaId: persona.present ? parseStrictString(persona.value, "personaId") as string | null : undefined,
-    targetCharacterId: targetCharacter.present ? parseStrictString(targetCharacter.value, "targetCharacterId") as string | null : undefined,
-    generationType: generationType as EffectiveRuntimeRequestV1["generationType"],
+    ...(logicalConnection.present
+      ? { logicalConnectionId: parseStrictString(logicalConnection.value, "logicalConnectionId") as string | null }
+      : {}),
+    ...(preset.present
+      ? { presetId: parseStrictString(preset.value, "presetId") as string | null }
+      : {}),
+    ...(forcePreset.present ? { forcePresetId: parsedForcePreset } : {}),
+    ...(persona.present
+      ? { personaId: parseStrictString(persona.value, "personaId") as string | null }
+      : {}),
+    ...(targetCharacter.present
+      ? { targetCharacterId: parseStrictString(targetCharacter.value, "targetCharacterId") as string | null }
+      : {}),
+    ...(generation.present ? { generationType: generationType as EffectiveRuntimeRequestV1["generationType"] } : {}),
     target,
-    mode: parsedMode as AgentRuntimeMode | undefined,
-    transientSelection: parsedTransientSelection,
-    requestEpoch: requestEpoch.present ? parseStrictRevision(requestEpoch.value, "requestEpoch", false) as RuntimeRevision : undefined,
-    inputRevisions: parseStrictPartialInputRevisions(inputRevisions.value, "inputRevisions"),
-    readinessVector: parseStrictReadinessVector(readiness.value, "readinessVector"),
+    ...(mode.present ? { mode: parsedMode as AgentRuntimeMode } : {}),
+    ...(transient.present ? { transientSelection: parsedTransientSelection } : {}),
+    ...(requestEpoch.present
+      ? { requestEpoch: parseStrictRevision(requestEpoch.value, "requestEpoch", false) as RuntimeRevision }
+      : {}),
+    ...(inputRevisions.present ? { inputRevisions: parsedInputRevisions } : {}),
+    ...(readiness.present ? { readinessVector: parsedReadiness } : {}),
   };
 }
 export function normalizeAuthenticatedEffectiveRuntimeRequest(raw: unknown): EffectiveRuntimeRequestV1 {

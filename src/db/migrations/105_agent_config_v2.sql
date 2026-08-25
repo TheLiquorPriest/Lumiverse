@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS preset_agent_configs (
   main_lore_scope TEXT NOT NULL DEFAULT 'active' CHECK (main_lore_scope IN ('active', 'all_owned')),
   phase_policy_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(phase_policy_json)),
   cognition_policy_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(cognition_policy_json)),
-  context_policy_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(context_policy_json)),
   task_policy_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(task_policy_json)),
   workspace_policy_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(workspace_policy_json)),
   state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'review_required', 'repair_required')),

@@ -10,6 +10,7 @@ import type {
   FinalRenderReservationV1,
   TurnExecutionStateV1,
 } from "./turn-execution";
+import type { PaginatedResult } from "./pagination";
 
 /** Workspace records are retained owner-visible summaries, never raw work data. */
 export type WorkspaceRetentionV1 = "operational" | "turn_terminal" | "chat_lifetime";
@@ -68,6 +69,7 @@ export const WORKSPACE_OPERATIONS = [
   "create_task",
   "update_assigned_progress",
   "submit_child_result",
+  "submit_root_result",
   "accept_submission",
   "record_finding",
   "record_decision",
@@ -360,7 +362,7 @@ export interface PersistentWorkspaceTurnSessionV1 {
   readonly id: string;
   readonly workspaceId: string;
   readonly userId: string;
-  readonly chatId: string;
+  readonly chatId: string | null;
   readonly turnId: string;
   readonly attemptId: string;
   readonly executionId: string | null;
@@ -373,6 +375,7 @@ export interface PersistentWorkspaceTurnSessionV1 {
   readonly terminalAt: number | null;
 }
 export type PersistentWorkspaceTurnSession = PersistentWorkspaceTurnSessionV1;
+export type PersistentWorkspaceTurnSessionPageV1 = PaginatedResult<PersistentWorkspaceTurnSessionV1>;
 
 declare const persistentWorkspaceHostAuthorityBrand: unique symbol;
 
@@ -394,7 +397,7 @@ export interface PersistentWorkspaceTaskV1 {
   readonly workspaceId: string;
   readonly turnSessionId: string | null;
   readonly userId: string;
-  readonly chatId: string;
+  readonly chatId: string | null;
   readonly title: string;
   readonly objective: string;
   readonly state: WorkspaceTaskStateV1;
@@ -477,6 +480,8 @@ export interface PersistentWorkspacePublicationProvenanceV1 {
   readonly workspaceId: string;
   readonly turnSessionId: string | null;
   readonly attemptId: string | null;
+  /** Exact execution identity from the selected source Turn Session, when present. */
+  readonly executionId: string | null;
   /** Digest of the exact operational source revision captured by publication. */
   readonly sourceDigest: string;
   /** Source chat/message/swipe identities are provenance only and may be tombstoned. */

@@ -63,24 +63,61 @@ const { createRoot } = await import('react-dom/client')
 mock.restore()
 const mountedRoots = new Set<Root>()
 
-async function renderStopButton(terminal = false): Promise<{ host: HTMLDivElement; root: Root }> {
+type RenderStopButtonOptions = {
+  turnId?: string
+  chatId?: string
+  generationId?: string
+  terminal?: boolean
+  onBeforeStop?: () => void
+  onResult?: (result: AgentRunStopResultV2) => void
+  onSettled?: () => void
+}
+
+async function renderStopButton(
+  options: RenderStopButtonOptions | boolean = {},
+): Promise<{ host: HTMLDivElement; root: Root; render(nextOptions?: RenderStopButtonOptions): Promise<void> }> {
+  const initialOptions = typeof options === 'boolean' ? { terminal: options } : options
+  let props: {
+    turnId: string
+    chatId: string
+    generationId: string
+    terminal: boolean
+    onBeforeStop?: () => void
+    onResult?: (result: AgentRunStopResultV2) => void
+    onSettled?: () => void
+  } = {
+    turnId: initialOptions.turnId ?? 'turn-1',
+    chatId: initialOptions.chatId ?? 'chat-1',
+    generationId: initialOptions.generationId ?? 'generation-1',
+    terminal: initialOptions.terminal ?? false,
+    onBeforeStop: initialOptions.onBeforeStop,
+    onResult: initialOptions.onResult,
+    onSettled: initialOptions.onSettled,
+  }
   const host = document.createElement('div')
   document.body.appendChild(host)
   const root = createRoot(host)
   mountedRoots.add(root)
-  await act(async () => {
-    root.render(
-      <actualReactI18next.I18nextProvider i18n={testI18n}>
-        <AgentRunStopButton
-          turnId="turn-1"
-          chatId="chat-1"
-          generationId="generation-1"
-          terminal={terminal}
-        />
-      </actualReactI18next.I18nextProvider>,
-    )
-  })
-  return { host, root }
+  const render = async (nextOptions: RenderStopButtonOptions = {}): Promise<void> => {
+    props = {
+      turnId: nextOptions.turnId ?? props.turnId,
+      chatId: nextOptions.chatId ?? props.chatId,
+      generationId: nextOptions.generationId ?? props.generationId,
+      terminal: nextOptions.terminal === undefined ? props.terminal : nextOptions.terminal,
+      onBeforeStop: nextOptions.onBeforeStop === undefined ? props.onBeforeStop : nextOptions.onBeforeStop,
+      onResult: nextOptions.onResult === undefined ? props.onResult : nextOptions.onResult,
+      onSettled: nextOptions.onSettled === undefined ? props.onSettled : nextOptions.onSettled,
+    }
+    await act(async () => {
+      root.render(
+        <actualReactI18next.I18nextProvider i18n={testI18n}>
+          <AgentRunStopButton {...props} />
+        </actualReactI18next.I18nextProvider>,
+      )
+    })
+  }
+  await render()
+  return { host, root, render }
 }
 
 async function settle(): Promise<void> {
@@ -146,6 +183,180 @@ describe('AgentRunStopButton', () => {
     })
     expect(button.disabled).toBeTrue()
     expect(button.dataset.stopState).toBe('stopping')
+  })
+
+  test('enables the replacement generation while the previous stop is pending', async () => {
+    const { host, render } = await renderStopButton()
+    const oldButton = host.querySelector('button')!
+    await act(async () => oldButton.click())
+
+    await render({ generationId: 'generation-2' })
+    const newButton = host.querySelector('button')!
+    expect(newButton.disabled).toBeFalse()
+    expect(newButton.dataset.stopState).toBe('idle')
+
+    await act(async () => newButton.click())
+    expect(stopCalls).toEqual([
+      { turnId: 'turn-1', input: { chatId: 'chat-1', generationId: 'generation-1' } },
+      { turnId: 'turn-1', input: { chatId: 'chat-1', generationId: 'generation-2' } },
+    ])
+  })
+
+  test('keeps request ownership when only the terminal view changes', async () => {
+    let settledCount = 0
+    const { host, render } = await renderStopButton({
+      onSettled: () => { settledCount += 1 },
+    })
+    const button = host.querySelector('button')!
+    await act(async () => button.click())
+
+    await render({ terminal: true })
+    expect(button.dataset.stopState).toBe('terminal')
+    expect(button.disabled).toBeTrue()
+    await act(async () => {
+      pendingStops[0].resolve({
+        version: 2,
+        status: 'accepted',
+        turnId: 'turn-1',
+        revision: 2,
+        target: { chatId: 'chat-1', generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'WORK',
+        workStatus: 'cancelling',
+        workOutcome: null,
+        reason: null,
+        recoveryEligible: false,
+        recoveryAction: 'none',
+        omissionCount: 0,
+        inspectionAttemptId: 'inspection-terminal',
+      })
+      await settle()
+    })
+
+    expect(settledCount).toBe(1)
+    await render({ terminal: false })
+    expect(button.dataset.stopState).toBe('stopping')
+    expect(button.disabled).toBeTrue()
+    expect(stopCalls).toHaveLength(1)
+  })
+
+  test('ignores a stale success from the previous generation', async () => {
+    const resultCalls: AgentRunStopResultV2[] = []
+    let settledCount = 0
+    const { host, render } = await renderStopButton({
+      onResult: result => resultCalls.push(result),
+      onSettled: () => { settledCount += 1 },
+    })
+    await act(async () => host.querySelector('button')!.click())
+    await render({ generationId: 'generation-2' })
+    const newButton = host.querySelector('button')!
+    await act(async () => newButton.click())
+
+    await act(async () => {
+      pendingStops[0].resolve({
+        version: 2,
+        status: 'accepted',
+        turnId: 'turn-1',
+        revision: 2,
+        target: { chatId: 'chat-1', generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'WORK',
+        workStatus: 'cancelling',
+        workOutcome: null,
+        reason: null,
+        recoveryEligible: false,
+        recoveryAction: 'none',
+        omissionCount: 0,
+        inspectionAttemptId: 'inspection-old',
+      })
+      await settle()
+    })
+
+    expect(resultCalls).toHaveLength(0)
+    expect(settledCount).toBe(0)
+    await act(async () => {
+      pendingStops[1].resolve({
+        version: 2,
+        status: 'accepted',
+        turnId: 'turn-1',
+        revision: 3,
+        target: { chatId: 'chat-1', generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'WORK',
+        workStatus: 'cancelling',
+        workOutcome: null,
+        reason: null,
+        recoveryEligible: false,
+        recoveryAction: 'none',
+        omissionCount: 0,
+        inspectionAttemptId: 'inspection-new',
+      })
+      await settle()
+    })
+
+    expect(resultCalls.map(result => result.inspectionAttemptId)).toEqual(['inspection-new'])
+    expect(settledCount).toBe(1)
+    expect(newButton.dataset.stopState).toBe('stopping')
+    expect(newButton.disabled).toBeTrue()
+  })
+
+  test('ignores a stale rejection from the previous generation', async () => {
+    let settledCount = 0
+    const { host, render } = await renderStopButton({
+      onSettled: () => { settledCount += 1 },
+    })
+    await act(async () => host.querySelector('button')!.click())
+    await render({ generationId: 'generation-2' })
+    const newButton = host.querySelector('button')!
+    await act(async () => newButton.click())
+
+    await act(async () => {
+      pendingStops[0].reject(new Error('old network failure'))
+      await settle()
+    })
+
+    expect(settledCount).toBe(0)
+    expect(newButton.dataset.stopState).toBe('stopping')
+    expect(newButton.disabled).toBeTrue()
+    await act(async () => {
+      pendingStops[1].reject(new Error('new network failure'))
+      await settle()
+    })
+
+    expect(settledCount).toBe(1)
+    expect(newButton.dataset.stopState).toBe('error')
+    expect(newButton.disabled).toBeFalse()
+  })
+
+  test('ignores a pending settlement after unmount', async () => {
+    const resultCalls: AgentRunStopResultV2[] = []
+    let settledCount = 0
+    const { host, root } = await renderStopButton({
+      onResult: result => resultCalls.push(result),
+      onSettled: () => { settledCount += 1 },
+    })
+    await act(async () => host.querySelector('button')!.click())
+    await act(async () => root.unmount())
+    mountedRoots.delete(root)
+
+    await act(async () => {
+      pendingStops[0].resolve({
+        version: 2,
+        status: 'accepted',
+        turnId: 'turn-1',
+        revision: 2,
+        target: { chatId: 'chat-1', generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'WORK',
+        workStatus: 'cancelling',
+        workOutcome: null,
+        reason: null,
+        recoveryEligible: false,
+        recoveryAction: 'none',
+        omissionCount: 0,
+        inspectionAttemptId: 'inspection-unmounted',
+      })
+      await settle()
+    })
+
+    expect(resultCalls).toHaveLength(0)
+    expect(settledCount).toBe(0)
   })
 
   test('enables a retry after request failure', async () => {

@@ -5,8 +5,14 @@ import {
   parseLegacyAgentConfigV1,
   parseAgentConfigV2,
   parseAgentRuntimePolicyV1,
+  parsePortableAgentConfigV1,
 } from "./agents";
-import type { LoomPolicySourceV1 } from "./agent-cognition";
+import {
+  COGNITION_MAX_LIST_BYTES,
+  COGNITION_MAX_LIST_ITEMS,
+  COGNITION_MAX_PREDICATE_DEPTH,
+  type LoomPolicySourceV1,
+} from "./agent-cognition";
 
 function profile(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -89,6 +95,11 @@ function v2Config(overrides: Record<string, unknown> = {}): Record<string, unkno
     connectionSlots: [],
     ...overrides,
   };
+}
+
+function portableConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const { version: _version, ...authored } = v2Config();
+  return { portableVersion: 1, ...authored, ...overrides };
 }
 
 describe("agentConfig parser", () => {
@@ -181,6 +192,54 @@ describe("agentConfig parser", () => {
         expect(() => parseLegacyAgentConfigV1(config({ [field]: value }))).toThrow();
       }
     }
+  });
+});
+
+describe("portable legacy cognition repair carrier", () => {
+  test("preserves bounded JSON without projecting it into runtime policy", () => {
+    const cognitionPolicy = {
+      legacy: ["repair", { enabled: false }],
+      scalar: "é",
+    };
+    const parsed = parsePortableAgentConfigV1(portableConfig({ cognitionPolicy }));
+    expect(parsed.cognitionPolicy).toBe(cognitionPolicy);
+    expect(parsed.runtimePolicy).toBeUndefined();
+  });
+
+  test("rejects canonical runtime coexistence and non-JSON or unbounded values", () => {
+    expect(() => parsePortableAgentConfigV1(portableConfig({
+      runtimePolicy: runtimePolicy(),
+      cognitionPolicy: {},
+    }))).toThrow("cannot accompany runtimePolicy");
+
+    for (const cognitionPolicy of [
+      undefined,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Symbol("unsupported"),
+      BigInt(1),
+      () => true,
+      new Date(),
+    ]) {
+      expect(() => parsePortableAgentConfigV1(portableConfig({ cognitionPolicy }))).toThrow();
+    }
+
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    expect(() => parsePortableAgentConfigV1(portableConfig({ cognitionPolicy: cycle }))).toThrow("cycle");
+
+    const sparse = new Array(1);
+    expect(() => parsePortableAgentConfigV1(portableConfig({ cognitionPolicy: sparse }))).toThrow();
+
+    let nested: unknown = "leaf";
+    for (let index = 0; index <= COGNITION_MAX_PREDICATE_DEPTH; index += 1) nested = { nested };
+    expect(() => parsePortableAgentConfigV1(portableConfig({ cognitionPolicy: nested }))).toThrow("levels deep");
+    expect(() => parsePortableAgentConfigV1(portableConfig({
+      cognitionPolicy: Array.from({ length: COGNITION_MAX_LIST_ITEMS + 1 }, () => null),
+    }))).toThrow("at most");
+    expect(() => parsePortableAgentConfigV1(portableConfig({
+      cognitionPolicy: "x".repeat(COGNITION_MAX_LIST_BYTES),
+    }))).toThrow("JSON");
   });
 });
 
@@ -319,6 +378,45 @@ describe("canonical custom Phased Instructions policy parser", () => {
     expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
       phases: [customPhase({ instructionRefs: overLimit })],
     }))).toThrow(/64|instruction|limit/i);
+  });
+  test("enforces the aggregate source block bound across Loom policy and custom phases", () => {
+    const loomBlockId = "loom-policy-source";
+    const loomPolicy = {
+      version: 1,
+      workPolicy: [{
+        version: 1,
+        id: "policy-source",
+        source: loomSource(loomBlockId),
+        destination: "root_work",
+        checkpoint: "WORK",
+        required: true,
+        visibility: "work_only",
+      }],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    };
+    const phaseDefinitions = (includeExtraSource: boolean) => Array.from({ length: 64 }, (_, phaseIndex) =>
+      customPhase({
+        id: `phase_${phaseIndex}`,
+        label: `Phase ${phaseIndex}`,
+        instructionRefs: Array.from(
+          { length: includeExtraSource && phaseIndex === 0 ? 9 : 8 },
+          (_, refIndex) => loomSource(
+            phaseIndex === 0 && refIndex === 0 ? loomBlockId : `phase-${phaseIndex}-${refIndex}`,
+            refIndex,
+            refIndex + 1,
+          ),
+        ),
+      }));
+    expect(parseAgentRuntimePolicyV1(runtimePolicy({
+      loomPolicy,
+      phases: phaseDefinitions(false),
+    })).phases).toHaveLength(64);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      loomPolicy,
+      phases: phaseDefinitions(true),
+    }))).toThrow(/512|source|limit/i);
   });
 
 

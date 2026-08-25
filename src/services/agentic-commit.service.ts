@@ -1,3 +1,4 @@
+import { compareUtf8 } from "../utils/utf8-order";
 import { createHash } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { getDb } from "../db/connection";
@@ -234,8 +235,6 @@ const REQUIRED_INPUT_REVISION_KINDS: readonly InputRevisionKindV1[] = Object.fre
   "slot_binding",
   "settings",
   "macro_variables",
-  "context_pack",
-  "context_acl",
   "cognition_policy",
   "runtime_epoch",
   "readiness",
@@ -255,12 +254,10 @@ const KNOWN_INPUT_REVISION_KINDS = new Set<InputRevisionKindV1>([
   "character",
   "group",
   "world_lore",
+  "databank",
   "settings",
   "macro_variables",
   "regex",
-  "context_pack",
-  "context_attachment",
-  "context_acl",
   "cognition_policy",
   "runtime_epoch",
   "readiness",
@@ -316,7 +313,7 @@ function stableValue(value: unknown, seen = new Set<object>()): unknown {
     return array;
   }
   const result: JsonObject = {};
-  for (const key of Object.keys(value).sort()) {
+  for (const key of Object.keys(value).sort(compareUtf8)) {
     if (PRIVATE_KEY.test(key)) throw new AgenticCommitError("invalid_input", `private field is not commitable: ${key}`);
     result[key] = stableValue((value as JsonObject)[key], seen);
   }
@@ -1515,8 +1512,8 @@ function projectionInput(
       ? undefined
       : { omittedNodeCount: input.activityOmittedNodeCount },
     status: "COMMITTED",
-    targetMessageId: messageId,
-    targetSwipeId: swipeId,
+    targetMessageId: input.target.messageId,
+    targetSwipeId: input.target.swipeId,
     usage: projectionUsage,
     terminalHandoff: {
       version: 2,

@@ -1,4 +1,4 @@
-import { effectiveRuntimeApi } from '@/api/effective-runtime'
+import { effectiveRuntimeApi, normalizeEffectiveRuntimeResponse } from '@/api/effective-runtime'
 import type {
   AgentRuntimeMode,
   AgentRuntimeRepairCategory,
@@ -61,6 +61,27 @@ export interface RuntimePreparationOptions {
    */
   forceResponse?: boolean
 }
+const TARGET_OPTIONAL_KEYS = ['messageId', 'swipeId', 'branchId', 'targetCharacterId', 'revision'] as const
+
+function targetIdentity(target: GenerationTargetV1): Record<string, unknown> {
+  const result: Record<string, unknown> = { generationType: target.generationType }
+  for (const key of TARGET_OPTIONAL_KEYS) {
+    if (Object.hasOwn(target, key)) result[key] = target[key]
+  }
+  return result
+}
+
+function sameTargetIdentity(left: GenerationTargetV1, right: GenerationTargetV1): boolean {
+  if (left.generationType !== right.generationType) return false
+  for (const key of TARGET_OPTIONAL_KEYS) {
+    const leftPresent = Object.hasOwn(left, key)
+    const rightPresent = Object.hasOwn(right, key)
+    if (leftPresent !== rightPresent) return false
+    if (leftPresent && left[key] !== right[key]) return false
+  }
+  return true
+}
+
 
 function throwIfRuntimeAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return
@@ -107,25 +128,18 @@ export function createRuntimeScopeFingerprint(
   input: RuntimeScopeInput,
   decision?: EffectiveRuntimePublicResponseV1 | EffectiveRuntimeDisplayV1 | null,
 ): string {
-  const localTarget = {
+  const localTarget: Record<string, unknown> = {
     generationType: input.generationType ?? null,
-    messageId: input.messageId ?? null,
-    swipeId: input.swipeId ?? null,
-    branchId: input.branchId ?? null,
-    targetCharacterId: input.targetCharacterId ?? null,
   }
+  if (input.messageId !== undefined) localTarget.messageId = input.messageId
+  if (input.swipeId !== undefined) localTarget.swipeId = input.swipeId
+  if (input.branchId !== undefined) localTarget.branchId = input.branchId
+  if (input.targetCharacterId !== undefined) localTarget.targetCharacterId = input.targetCharacterId
   const publicIdentity = decision
     ? {
         version: decision.version,
         chatId: decision.chatId,
-        target: {
-          generationType: decision.target.generationType,
-          messageId: decision.target.messageId ?? null,
-          swipeId: decision.target.swipeId ?? null,
-          branchId: decision.target.branchId ?? null,
-          targetCharacterId: decision.target.targetCharacterId ?? null,
-          revision: decision.target.revision ?? null,
-        },
+        target: targetIdentity(decision.target),
         connection: {
           id: decision.connection.id,
           revision: decision.connection.revision,
@@ -143,11 +157,14 @@ export function createRuntimeScopeFingerprint(
         defaultMode: decision.defaultMode,
         requestedMode: decision.requestedMode,
         effectiveMode: decision.effectiveMode,
+        runtimePolicy: decision.runtimePolicy,
         chatOverride: decision.chatOverride
           ? {
               mode: decision.chatOverride.mode,
               revision: decision.chatOverride.revision,
               state: decision.chatOverride.state,
+              reviewCode: decision.chatOverride.reviewCode ?? null,
+              acknowledged: decision.chatOverride.acknowledged ?? null,
             }
           : null,
         capabilityReadiness: {
@@ -204,11 +221,13 @@ const EMPTY_SELECTION: RuntimeSelectionSnapshot = {
 const snapshots = new Map<string, RuntimeSelectionSnapshot>()
 const listeners = new Map<string, Set<() => void>>()
 const requestEpochs = new Map<string, number>()
+const displayEpochs = new Map<string, number>()
 const pendingRequestEpochs = new Map<string, Set<number>>()
 
 const decisionTokens = new Map<string, {
   token: string
   requestEpoch: number
+  epochKind: 'dispatch' | 'display'
   expiresAt: number
   target: GenerationTargetV1
   scopeFingerprint: string
@@ -235,6 +254,7 @@ export function getRuntimeSelectionSnapshot(chatId: string): RuntimeSelectionSna
 
 export function invalidateRuntimeDecision(chatId: string): void {
   decisionTokens.delete(chatId)
+  nextRuntimeDisplayEpoch(chatId)
   const current = getRuntimeSelectionSnapshot(chatId)
   // An admitted generation owns its mode until it settles. Invalidation still
   // fences an unresolved preflight, but never changes the epoch of the active
@@ -318,6 +338,15 @@ export function nextRuntimeRequestEpoch(chatId: string): number {
 export function isCurrentRuntimeRequest(chatId: string, requestEpoch: number): boolean {
   return requestEpochs.get(chatId) === requestEpoch
 }
+export function nextRuntimeDisplayEpoch(chatId: string): number {
+  const next = (displayEpochs.get(chatId) ?? 0) + 1
+  displayEpochs.set(chatId, next)
+  return next
+}
+
+export function isCurrentRuntimeDisplayRequest(chatId: string, requestEpoch: number): boolean {
+  return displayEpochs.get(chatId) === requestEpoch
+}
 
 function takeRuntimeDecisionToken(
   chatId: string,
@@ -328,50 +357,52 @@ function takeRuntimeDecisionToken(
   if (!cached) return null
   decisionTokens.delete(chatId)
   if (cached.expiresAt <= Date.now()) return null
-  if (!isCurrentRuntimeRequest(chatId, cached.requestEpoch)) return null
+  const current = cached.epochKind === 'display'
+    ? isCurrentRuntimeDisplayRequest(chatId, cached.requestEpoch)
+    : isCurrentRuntimeRequest(chatId, cached.requestEpoch)
+  if (!current) return null
   if (cached.scopeFingerprint !== scopeFingerprint) return null
-  if (cached.target.generationType !== target.generationType) return null
-  if ((cached.target.messageId ?? null) !== (target.messageId ?? null)) return null
-  if ((cached.target.swipeId ?? null) !== (target.swipeId ?? null)) return null
-  if ((cached.target.branchId ?? null) !== (target.branchId ?? null)) return null
-  if ((cached.target.targetCharacterId ?? null) !== (target.targetCharacterId ?? null)) return null
+  if (!sameTargetIdentity(cached.target, target)) return null
   return { token: cached.token, requestEpoch: cached.requestEpoch }
 }
 
 export function publishRuntimeDecision(
-  response: EffectiveRuntimePublicResponseV1,
+  response: unknown,
   requestEpoch: number,
   scopeFingerprint?: string,
+  epochKind: 'dispatch' | 'display' = 'dispatch',
 ): void {
-  const current = getRuntimeSelectionSnapshot(response.chatId)
-  const display = redactRuntimeDecision(response)
+  const normalized = normalizeEffectiveRuntimeResponse(response)
+  const current = getRuntimeSelectionSnapshot(normalized.chatId)
+  const display = redactRuntimeDecision(normalized)
   const resolvedScopeFingerprint = scopeFingerprint ?? createRuntimeScopeFingerprint({
-    chatId: response.chatId,
-    generationType: response.target.generationType,
-    messageId: response.target.messageId,
-    swipeId: response.target.swipeId,
-    branchId: response.target.branchId,
-    targetCharacterId: response.target.targetCharacterId,
+    chatId: normalized.chatId,
+    generationType: normalized.target.generationType,
+    messageId: normalized.target.messageId,
+    swipeId: normalized.target.swipeId,
+    branchId: normalized.target.branchId,
+    targetCharacterId: normalized.target.targetCharacterId,
   }, display)
-  if (response.runtimeDecisionToken && response.runtimeDecisionExpiresAt) {
-    decisionTokens.set(response.chatId, {
-      token: response.runtimeDecisionToken,
+  if (normalized.runtimeDecisionToken !== null && normalized.runtimeDecisionExpiresAt !== null) {
+    decisionTokens.set(normalized.chatId, {
+      token: normalized.runtimeDecisionToken,
       requestEpoch,
-      expiresAt: response.runtimeDecisionExpiresAt,
-      target: response.target,
+      epochKind,
+      expiresAt: normalized.runtimeDecisionExpiresAt,
+      target: normalized.target,
       scopeFingerprint: resolvedScopeFingerprint,
     })
   } else {
-    decisionTokens.delete(response.chatId)
+    decisionTokens.delete(normalized.chatId)
   }
-  publish(response.chatId, {
+  publish(normalized.chatId, {
     ...current,
-    effectiveMode: response.effectiveMode,
-    agenticReady: response.capabilityReadiness.ready
-      && response.agentsEnabled
-      && response.allowedModes.includes('response')
-      && response.allowedModes.includes('agentic'),
-    generationType: response.target.generationType,
+    effectiveMode: normalized.effectiveMode,
+    agenticReady: normalized.capabilityReadiness.ready
+      && normalized.agentsEnabled
+      && normalized.allowedModes.includes('response')
+      && normalized.allowedModes.includes('agentic'),
+    generationType: normalized.target.generationType,
     decision: display,
     scopeFingerprint: resolvedScopeFingerprint,
   })
@@ -521,7 +552,9 @@ function targetFromGenerationRequest(request: RuntimeGenerationRequest): Generat
     generationType,
     messageId: request.message_id ?? null,
     swipeId: request.swipe_id ?? null,
+    branchId: null,
     targetCharacterId: request.target_character_id ?? null,
+    revision: null,
   }
 }
 
@@ -545,18 +578,6 @@ function effectiveRuntimeRequest(
   }
 }
 
-function decisionMatchesRequest(
-  decision: EffectiveRuntimePublicResponseV1,
-  request: RuntimeGenerationRequest,
-  target: GenerationTargetV1,
-): boolean {
-  return decision.chatId === request.chat_id
-    && decision.target.generationType === target.generationType
-    && (decision.target.messageId ?? null) === (target.messageId ?? null)
-    && (decision.target.swipeId ?? null) === (target.swipeId ?? null)
-    && (decision.target.branchId ?? null) === (target.branchId ?? null)
-    && (decision.target.targetCharacterId ?? null) === (target.targetCharacterId ?? null)
-}
 function responseGenerationRequest<T extends RuntimeGenerationRequest>(
   request: T,
   forceMode = false,
@@ -632,6 +653,7 @@ export async function prepareAgentRuntimeRequest<T extends RuntimeGenerationRequ
     generationType: target.generationType,
     messageId: target.messageId,
     swipeId: target.swipeId,
+    branchId: target.branchId,
     targetCharacterId: target.targetCharacterId,
     logicalConnectionId: request.connection_id,
     presetId: request.preset_id,
@@ -680,12 +702,16 @@ export async function prepareAgentRuntimeRequest<T extends RuntimeGenerationRequ
   addPendingRequestEpoch(request.chat_id, requestEpoch)
   let decision: EffectiveRuntimePublicResponseV1
   try {
-    decision = await effectiveRuntimeApi.resolve(effectiveRuntimeRequest(
+    const payload = await effectiveRuntimeApi.resolve(effectiveRuntimeRequest(
       request,
       target,
       explicitMode ?? request.mode,
       requestEpoch,
     ), options.signal ? { signal: options.signal } : undefined)
+    decision = normalizeEffectiveRuntimeResponse(payload, {
+      chatId: request.chat_id,
+      target,
+    })
   } finally {
     removePendingRequestEpoch(request.chat_id, requestEpoch)
   }
@@ -695,7 +721,6 @@ export async function prepareAgentRuntimeRequest<T extends RuntimeGenerationRequ
   if (
     !isCurrentRuntimeRequest(request.chat_id, requestEpoch)
     || currentSelection.oneTurnMode !== explicitMode
-    || !decisionMatchesRequest(decision, request, target)
   ) {
     throw new AgentRuntimePreflightError('decision_refresh_required', ['decision_refresh_required'])
   }
@@ -703,6 +728,7 @@ export async function prepareAgentRuntimeRequest<T extends RuntimeGenerationRequ
     chatId: request.chat_id,
     generationType: target.generationType,
     messageId: target.messageId,
+    branchId: target.branchId,
     swipeId: target.swipeId,
     targetCharacterId: target.targetCharacterId,
     logicalConnectionId: request.connection_id,
@@ -741,6 +767,7 @@ export function resetAgentRuntimeSelectionForTests(): void {
   snapshots.clear()
   listeners.clear()
   requestEpochs.clear()
+  displayEpochs.clear()
   pendingRequestEpochs.clear()
   decisionTokens.clear()
 }

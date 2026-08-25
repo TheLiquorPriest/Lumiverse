@@ -8,7 +8,7 @@ import { eventBus } from "../../ws/bus";
 import { EventType } from "../../ws/events";
 import * as filesSvc from "../files.service";
 import { withUserDataMutation, withUserDataMutationSync } from "../user-data/snapshot";
-import { invalidateDatabankCache } from "./retrieval-cache.service";
+import { invalidateDatabankCaches } from "./retrieval-cache.service";
 import {
   type Databank,
   type DatabankDocument,
@@ -25,6 +25,12 @@ import {
   nameToSlug,
 } from "./types";
 import type { PaginationParams, PaginatedResult } from "../../types/pagination";
+
+function emitDocumentChanged(userId: string, documentId: string, databankId: string): void {
+  const databank = getDatabank(userId, databankId);
+  if (!databank) return;
+  eventBus.emit(EventType.DATABANK_CHANGED, { databankId, databank, documentId }, userId);
+}
 
 // ─── Banks ────────────────────────────────────────────────────
 
@@ -114,7 +120,7 @@ export function updateDatabank(userId: string, id: string, input: UpdateDatabank
 
   const bank = getDatabank(userId, id);
   if (bank) {
-    invalidateDatabankCache(userId, id);
+    invalidateDatabankCaches(userId, id);
     eventBus.emit(EventType.DATABANK_CHANGED, { databankId: bank.id, databank: bank }, userId);
   }
   return bank;
@@ -135,7 +141,7 @@ export async function deleteDatabank(userId: string, id: string): Promise<boolea
     }
     const result = db.run("DELETE FROM databanks WHERE id = ? AND user_id = ?", [id, userId]);
     if (result.changes === 0) return false;
-    invalidateDatabankCache(userId, id);
+    invalidateDatabankCaches(userId, id);
     eventBus.emit(EventType.DATABANK_DELETED, { databankId: id }, userId);
     return true;
   });
@@ -198,7 +204,8 @@ export function createDocument(
   );
 
   const document = getDocument(userId, id)!;
-  invalidateDatabankCache(userId, databankId);
+  invalidateDatabankCaches(userId, databankId);
+  emitDocumentChanged(userId, document.id, document.databankId);
   return document;
   });
 }
@@ -248,7 +255,10 @@ export function renameDocument(userId: string, id: string, newName: string): Dat
     [newName, slug, now, id, userId],
   );
   const document = getDocument(userId, id);
-  if (document) invalidateDatabankCache(userId, document.databankId);
+  if (document) {
+    invalidateDatabankCaches(userId, document.databankId);
+    emitDocumentChanged(userId, document.id, document.databankId);
+  }
   return document;
   });
 }
@@ -260,12 +270,44 @@ export function getDocument(userId: string, id: string): DatabankDocument | null
   return row ? rowToDocument(row) : null;
 }
 
-export function getDocumentBySlug(userId: string, slug: string): DatabankDocument | null {
+/**
+ * Look up a document only when it belongs to the requested parent databank
+ * owned by this user. A missing parent and a wrong-parent document are both
+ * intentionally indistinguishable from a missing document.
+ */
+export function getDocumentInDatabank(
+  userId: string,
+  databankId: string,
+  documentId: string,
+): DatabankDocument | null {
   const row = getDb()
-    .query("SELECT * FROM databank_documents WHERE user_id = ? AND slug = ? AND status = 'ready' LIMIT 1")
-    .get(userId, slug) as DatabankDocumentRow | null;
+    .query(
+      `SELECT dd.*
+       FROM databank_documents dd
+       JOIN databanks d ON d.id = dd.databank_id
+       WHERE dd.id = ? AND dd.databank_id = ? AND dd.user_id = ? AND d.user_id = ?`,
+    )
+    .get(documentId, databankId, userId, userId) as DatabankDocumentRow | null;
   return row ? rowToDocument(row) : null;
 }
+
+export function getDocumentBySlug(
+  userId: string,
+  slug: string,
+  databankIds?: string[],
+): DatabankDocument | null {
+  const params: string[] = [userId, slug];
+  let sql = "SELECT * FROM databank_documents WHERE user_id = ? AND slug = ? AND status = 'ready'";
+  if (databankIds && databankIds.length > 0) {
+    sql += ` AND databank_id IN (${databankIds.map(() => "?").join(",")})`;
+    params.push(...databankIds);
+  }
+  sql += " ORDER BY updated_at DESC, id ASC LIMIT 1";
+  const row = getDb().query(sql).get(...params) as DatabankDocumentRow | null;
+  return row ? rowToDocument(row) : null;
+}
+
+
 
 export function searchDocumentsBySlug(
   userId: string,
@@ -335,7 +377,7 @@ export async function deleteDocument(userId: string, docId: string): Promise<boo
     }
     const result = db.run("DELETE FROM databank_documents WHERE id = ? AND user_id = ?", [docId, userId]);
     if (result.changes === 0) return false;
-    invalidateDatabankCache(userId, doc.databankId);
+    invalidateDatabankCaches(userId, doc.databankId);
     eventBus.emit(EventType.DATABANK_DOCUMENT_STATUS, {
       documentId: docId,
       databankId: doc.databankId,
@@ -366,7 +408,10 @@ export function updateDocumentFile(
      WHERE id = ? AND user_id = ?`,
     [filePath, mimeType, fileSize, contentHash, now, docId, userId],
   );
-  if (document) invalidateDatabankCache(userId, document.databankId);
+  if (document) {
+    invalidateDatabankCaches(userId, document.databankId);
+    emitDocumentChanged(userId, document.id, document.databankId);
+  }
   });
 }
 
@@ -395,7 +440,7 @@ export function updateDocumentStatus(
 
   params.push(docId);
   getDb().run(`UPDATE databank_documents SET ${sets.join(", ")} WHERE id = ?`, params);
-  if (document) invalidateDatabankCache(document.user_id, document.databank_id);
+  if (document) invalidateDatabankCaches(document.user_id, document.databank_id);
   });
 }
 
@@ -430,6 +475,9 @@ export function insertChunks(chunks: Array<{
       }
     });
     tx();
+    for (const databankId of new Set(chunks.map((chunk) => chunk.databankId))) {
+      invalidateDatabankCaches(userId, databankId);
+    }
   });
 }
 
@@ -453,9 +501,10 @@ export function updateChunkVectorization(chunkIds: string[], vectorModel: string
   if (chunkIds.length === 0) return;
   const db = getDb();
   const placeholders = chunkIds.map(() => "?").join(",");
-  const owner = db.query(
-    `SELECT user_id FROM databank_chunks WHERE id IN (${placeholders}) LIMIT 1`,
-  ).get(...chunkIds) as { user_id: string } | null;
+  const owners = db.query(
+    `SELECT DISTINCT user_id, databank_id FROM databank_chunks WHERE id IN (${placeholders})`,
+  ).all(...chunkIds) as Array<{ user_id: string; databank_id: string }>;
+  const owner = owners[0];
   if (!owner) return;
   withUserDataMutationSync(owner.user_id, () => {
     const now = Math.floor(Date.now() / 1000);
@@ -463,16 +512,22 @@ export function updateChunkVectorization(chunkIds: string[], vectorModel: string
       `UPDATE databank_chunks SET vectorized_at = ?, vector_model = ? WHERE id IN (${placeholders})`,
       [now, vectorModel, ...chunkIds],
     );
+    for (const databankId of new Set(
+      owners.filter((row) => row.user_id === owner.user_id).map((row) => row.databank_id),
+    )) {
+      invalidateDatabankCaches(owner.user_id, databankId);
+    }
   });
 }
 
 export function deleteChunksForDocument(docId: string): void {
   const owner = getDb()
-    .query("SELECT user_id FROM databank_chunks WHERE document_id = ? LIMIT 1")
-    .get(docId) as { user_id: string } | null;
+    .query("SELECT user_id, databank_id FROM databank_chunks WHERE document_id = ? LIMIT 1")
+    .get(docId) as { user_id: string; databank_id: string } | null;
   if (!owner) return;
   withUserDataMutationSync(owner.user_id, () => {
     getDb().run("DELETE FROM databank_chunks WHERE document_id = ?", [docId]);
+    invalidateDatabankCaches(owner.user_id, owner.databank_id);
   });
 }
 

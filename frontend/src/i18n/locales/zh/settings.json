@@ -27,11 +27,6 @@
       "shortName": "智能体运行时",
       "tabName": "智能体运行时",
       "tabDescription": "查看运行时默认值、保留策略和主机上限"
-    },
-    "contextLibrary": {
-      "shortName": "上下文库",
-      "tabName": "上下文库",
-      "tabDescription": "管理版本化上下文包及其附件"
     }
   },
   "account": {
@@ -48,6 +43,21 @@
     "saving": "保存中…"
   },
   "display": {
+    "longMessages": {
+      "title": "长消息",
+      "helper": "将较长的消息限制在舒适的高度，直到你将其展开。",
+      "enabled": "折叠较长的消息",
+      "enabledHint": "适用于所有聊天显示模式，包括回复生成期间。",
+      "height": "折叠高度",
+      "depth": "从此深度开始折叠",
+      "depthHint": "深度 0 是最新消息。位于此深度或更早的长消息可以折叠。",
+      "compact": "紧凑",
+      "comfortable": "舒适",
+      "tall": "较高",
+      "custom": "自定义",
+      "customHeight": "自定义高度（PX）",
+      "customHeightHint": "选择“自定义”时，折叠长消息的最大高度。"
+    },
     "modalWidth": {
       "title": "弹窗宽度",
       "helper": "限制所有弹窗的最大宽度，影响设置、编辑器及其他浮层面板。",
@@ -1515,189 +1525,6 @@
         "toolExecutionsPerUser": "每用户工具执行数",
         "toolExecutionsProcess": "每进程工具执行数"
       }
-    }
-  },
-  "contextLibrary": {
-    "eyebrow": "账户上下文",
-    "title": "上下文库",
-    "description": "创建不可变的版本化上下文包，并将经审核的修订版附加到预设、聊天或世界书。",
-    "copySuffix": "副本",
-    "packs": "上下文包",
-    "packList": "上下文包",
-    "loading": "正在加载上下文包…",
-    "loadingDetail": "正在加载上下文包详情…",
-    "loadingTargets": "正在加载自有目标…",
-    "targetLoadError": "无法加载您拥有的附加目标。",
-    "targetsLoaded": "已加载您拥有的附加目标。",
-    "noTargetsAvailable": "此范围没有可用的自有目标。",
-    "selectTarget": "选择一个自有目标",
-    "selectPack": "选择要查看的上下文包。",
-    "emptyTitle": "创建第一个上下文包",
-    "emptyDescription": "添加稳定的参考资料，然后在需要的位置附加不可变修订版。",
-    "noDescription": "无描述",
-    "noAttachments": "无附件",
-    "privateOnly": "尚未授予其他账户访问权限。",
-    "unavailableTarget": "目标不可用",
-    "exportComplete": "便携快照已导出。",
-    "exporting": "正在导出便携快照…",
-    "importing": "正在导入便携快照…",
-    "importComplete": "已导入“{{name}}”。请先审核，再附加或启用。",
-    "importFileLabel": "选择要导入的上下文包 JSON 快照",
-    "versionNumber": "修订版 {{number}}",
-    "byteCount": "{{count}} 字节",
-    "versionHistoryCaption": "不可变上下文包修订历史",
-    "versionImmutableHelp": "已发布的修订版无法编辑。请创建新修订版以更改内容。",
-    "immutable": "不可变",
-    "previewTitle": "修订版 {{number}} 预览",
-    "contentHelp": "条目按顺序存储为原样上下文。ID 在此修订版中必须唯一。",
-    "entryNumber": "条目 {{number}}",
-    "addEntry": "添加条目",
-    "removeEntry": "移除条目 {{number}}",
-    "tagsHelp": "用逗号分隔标签。",
-    "requiredAttachment": "将此附件视为 Agentic 预检的必需项",
-    "attachmentsDescription": "附件会将一个确切的不可变修订版绑定到一个自有目标。",
-    "accessDescription": "服务器会为每项操作重新验证可见性和 ACL 授权。",
-    "accessList": "账户访问列表",
-    "accessFor": "{{name}} 的访问权限",
-    "addAccess": "添加访问权限",
-    "removeAccess": "移除 {{name}} 的访问权限",
-    "aclServerAuthority": "服务器会验证主体、所有权、当前 ACL 修订版和所请求的权限。",
-    "reviewTitle": "需要身份验证审核",
-    "reviewDescription": "此上下文包已禁用。请检查其内容并明确接受后再在本地使用。",
-    "repairDescription": "此上下文包需修复后才能审核或附加。",
-    "reviewAcknowledgement": "我已审核此上下文包及其可见性、内容和访问授权，并希望将其激活。",
-    "preserveAttachments": "复制当前已授权的附件",
-    "deleteTitle": "删除上下文包",
-    "deleteDescription": "删除此上下文包及其自有修订版和附件。",
-    "deleteWarning": "删除“{{name}}”？此操作无法撤销。",
-    "detachFrom": "从 {{name}} 分离",
-    "status": {
-      "active": "就绪",
-      "disabled": "已禁用",
-      "review_required": "需要审核",
-      "repair_required": "需要修复"
-    },
-    "source": {
-      "local": "本地",
-      "portable_import": "便携导入",
-      "archive_restore": "归档恢复",
-      "same_account_duplicate": "同账户副本"
-    },
-    "visibility": {
-      "private": "私有",
-      "account": "账户内",
-      "restricted": "受限",
-      "help": "所有 ACL 和目标操作均以服务器判定为准。"
-    },
-    "scopes": {
-      "preset": "预设",
-      "chat": "聊天",
-      "world_book": "世界书"
-    },
-    "acl": {
-      "read": "读取",
-      "use": "使用",
-      "edit": "编辑"
-    },
-    "attachmentState": {
-      "active": "已启用",
-      "disabled": "已禁用",
-      "review_required": "需要审核",
-      "repair_required": "需要修复"
-    },
-    "sections": {
-      "versions": "版本历史",
-      "attachments": "附件",
-      "access": "可见性和访问权限"
-    },
-    "fields": {
-      "name": "名称",
-      "description": "描述",
-      "visibility": "可见性",
-      "content": "修订版内容",
-      "entryId": "条目 ID",
-      "entryTitle": "条目标题",
-      "tags": "标签",
-      "body": "正文",
-      "scope": "附件范围",
-      "target": "目标",
-      "version": "修订版",
-      "account": "账户用户 ID",
-      "access": "权限",
-      "source": "来源",
-      "updated": "更新时间"
-    },
-    "columns": {
-      "version": "修订版",
-      "state": "状态",
-      "size": "大小",
-      "created": "创建时间",
-      "actions": "操作"
-    },
-    "actions": {
-      "create": "创建上下文包",
-      "import": "导入快照",
-      "cancel": "取消",
-      "refresh": "刷新",
-      "reviewLatest": "查看最新版本",
-      "retryTargets": "重试目标加载",
-      "edit": "编辑详情",
-      "duplicate": "复制",
-      "export": "导出所选修订版",
-      "review": "审核并激活",
-      "newVersion": "新建修订版",
-      "preview": "预览",
-      "attach": "附加修订版",
-      "manageAccess": "管理访问权限",
-      "delete": "删除"
-    },
-    "dialogs": {
-      "create": {
-        "title": "创建上下文包",
-        "description": "创建本地上下文包及其首个不可变修订版。",
-        "confirm": "创建上下文包"
-      },
-      "edit": {
-        "title": "编辑上下文包详情",
-        "description": "更新元数据，但不更改不可变修订版的内容。",
-        "confirm": "保存详情"
-      },
-      "revision": {
-        "title": "创建修订版",
-        "description": "基于最新内容发布新的不可变修订版。",
-        "confirm": "创建修订版"
-      },
-      "attach": {
-        "title": "附加修订版",
-        "description": "将一个确切的修订版绑定到一个自有预设、聊天或世界书。",
-        "confirm": "附加"
-      },
-      "acl": {
-        "title": "管理访问权限",
-        "description": "请求明确的账户权限。服务器会重新验证每个主体。",
-        "confirm": "保存访问权限"
-      },
-      "review": {
-        "title": "审核导入的上下文包",
-        "description": "激活必须是明确且经过身份验证的操作，导入本身绝不会自动激活。",
-        "confirm": "激活上下文包"
-      },
-      "duplicate": {
-        "title": "复制上下文包",
-        "description": "创建包含不可变修订历史的同账户私有副本。",
-        "confirm": "复制"
-      },
-      "delete": {
-        "title": "删除上下文包",
-        "description": "从账户中移除此上下文包。",
-        "confirm": "删除上下文包"
-      }
-    },
-    "errors": {
-      "not_found": "此上下文包不可用，或您已无权访问。",
-      "revision_conflict": "此上下文包已在其他会话中更改。当前显示服务器上的最新版本；请先查看再重试此更改。",
-      "validation_failed": "服务器拒绝了此次上下文包更改。请检查各字段后重试。",
-      "unavailable": "上下文库暂时不可用。"
     }
   }
 }

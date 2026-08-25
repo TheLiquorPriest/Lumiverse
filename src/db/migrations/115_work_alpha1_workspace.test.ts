@@ -281,7 +281,7 @@ describe("115 persistent workspace migration", () => {
 
     const publication = db.query(
       `SELECT publication_id, workspace_id, user_id, chat_id, category, source_id,
-              copy_json, copy_digest, published_by
+              source_provenance_json, copy_json, copy_digest, published_by
          FROM persistent_workspace_publications
         WHERE publication_id = ?`,
     ).get("published-106") as Record<string, unknown>;
@@ -294,6 +294,13 @@ describe("115 persistent workspace migration", () => {
       source_id: "artifact-106",
       copy_digest: PUBLISHED_DIGEST,
       published_by: "migration:106",
+    });
+    expect(JSON.parse(String(publication.source_provenance_json))).toMatchObject({
+      workspaceId: "workspace-106",
+      turnSessionId: "workspace-106",
+      attemptId: "execution-106",
+      executionId: "execution-106",
+      sourceChatId: "chat-1",
     });
     const persistentTables = [
       "persistent_workspaces",
@@ -321,7 +328,7 @@ describe("115 persistent workspace migration", () => {
       (foreignKey) => foreignKey.table === "chats"
         && foreignKey.from === "chat_id"
         && foreignKey.to === "id"
-        && foreignKey.on_delete === "CASCADE",
+        && foreignKey.on_delete === "SET NULL",
     )).toBe(true);
     for (const table of [
       "persistent_workspace_tasks",
@@ -341,12 +348,41 @@ describe("115 persistent workspace migration", () => {
       mimeType: "text/plain",
       byteCount: 18,
     });
+    const attachedArtifact = db.query(
+      `SELECT artifact_id, workspace_id, user_id, chat_id, blob_digest, mime_type, byte_count, provenance_json
+         FROM persistent_workspace_artifacts
+        WHERE artifact_id = ?`,
+    ).get("persistent-artifact-106") as Record<string, unknown>;
+    expect(attachedArtifact).toMatchObject({
+      artifact_id: "persistent-artifact-106",
+      workspace_id: "workspace-106",
+      user_id: "u1",
+      chat_id: "chat-1",
+      blob_digest: BLOB_DIGEST,
+      mime_type: "text/plain",
+      byte_count: 18,
+    });
+    expect(JSON.parse(String(attachedArtifact.provenance_json))).toEqual({
+      sourceChatId: "chat-1",
+      sourceMessageId: "message-1",
+      sourceSwipeId: 0,
+    });
     db.query("UPDATE agent_turn_executions SET target_message_id = NULL, target_swipe_id = NULL WHERE id = ?").run("execution-106");
     db.query("DELETE FROM agent_workspace_artifacts WHERE artifact_id = ?").run("artifact-106");
     db.query("DELETE FROM messages WHERE id = ?").run("message-1");
     db.query("DELETE FROM chats WHERE id = ?").run("chat-1");
     expect(db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    const detachedPublication = db.query(
+      "SELECT chat_id, source_provenance_json FROM persistent_workspace_publications WHERE publication_id = ?",
+    ).get("published-106") as { chat_id: string | null; source_provenance_json: string };
+    expect(detachedPublication.chat_id).toBeNull();
+    expect(JSON.parse(detachedPublication.source_provenance_json)).toMatchObject({
+      turnSessionId: "workspace-106",
+      attemptId: "execution-106",
+      executionId: "execution-106",
+      sourceChatId: "chat-1",
+    });
 
     const durableArtifact = db.query(
       `SELECT artifact_id, workspace_id, user_id, chat_id, blob_digest, mime_type, byte_count, provenance_json
@@ -357,7 +393,7 @@ describe("115 persistent workspace migration", () => {
       artifact_id: "persistent-artifact-106",
       workspace_id: "workspace-106",
       user_id: "u1",
-      chat_id: "chat-1",
+      chat_id: null,
       blob_digest: BLOB_DIGEST,
       mime_type: "text/plain",
       byte_count: 18,
@@ -372,5 +408,170 @@ describe("115 persistent workspace migration", () => {
     expect(db.query("SELECT COUNT(*) AS count FROM persistent_workspace_submissions WHERE submission_id = ?").get("persistent-submission-106")).toEqual({ count: 1 });
     expect(db.query("SELECT COUNT(*) AS count FROM persistent_workspace_publications WHERE publication_id = ?").get("published-106")).toEqual({ count: 1 });
     expect(db.query("SELECT chat_id FROM persistent_workspaces WHERE workspace_id = ?").get("workspace-106")).toEqual({ chat_id: null });
+  });
+  test("backfills canonical session outcomes from execution phases and codes", () => {
+    const cases = [
+      { state: "COMMITTED", code: "committed", status: "terminal", outcome: "completed" },
+      { state: "CANCELLED", code: "agentic_cancelled", status: "terminal", outcome: "stopped" },
+      { state: "TIMED_OUT", code: "root_wall_clock_limit_exceeded", status: "terminal", outcome: "failed" },
+      { state: "EXHAUSTED", code: "agentic_work_exhausted", status: "terminal", outcome: "exhausted" },
+      { state: "FAILED", code: "root_wall_clock_limit_exceeded", status: "terminal", outcome: "failed" },
+      { state: "WORK", code: null, status: "running", outcome: null },
+    ] as const;
+
+    for (const expected of cases) {
+      const candidate = createPopulated106Database();
+      try {
+        candidate.query(
+          "UPDATE agent_turn_executions SET state = ?, terminal_code = ?, terminal_at = ? WHERE id = ?",
+        ).run(expected.state, expected.code, expected.state === "WORK" ? null : 300, "execution-106");
+        candidate.run(migration115Sql);
+        expect(candidate.query(
+          "SELECT status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+        ).get("workspace-106")).toEqual({
+          status: expected.status,
+          outcome: expected.outcome,
+        });
+      } finally {
+        candidate.close();
+      }
+    }
+  });
+
+  test("exact rerun is idempotent after persistent workspace backfill", () => {
+    db.run(migration115Sql);
+    const snapshot = {
+      persistentWorkspaces: db.query(
+        "SELECT * FROM persistent_workspaces ORDER BY workspace_id",
+      ).all(),
+      persistentSessions: db.query(
+        "SELECT * FROM persistent_workspace_turn_sessions ORDER BY turn_session_id",
+      ).all(),
+      persistentPublications: db.query(
+        "SELECT * FROM persistent_workspace_publications ORDER BY publication_id",
+      ).all(),
+      operationalTasks: db.query(
+        "SELECT * FROM agent_workspace_tasks ORDER BY task_id",
+      ).all(),
+      operationalRecords: db.query(
+        "SELECT * FROM agent_workspace_records ORDER BY record_id",
+      ).all(),
+      operationalSubmissions: db.query(
+        "SELECT * FROM agent_workspace_submissions ORDER BY submission_id",
+      ).all(),
+      operationalArtifacts: db.query(
+        "SELECT * FROM agent_workspace_artifacts ORDER BY artifact_id",
+      ).all(),
+    };
+
+    db.run(migration115Sql);
+
+    expect({
+      persistentWorkspaces: db.query(
+        "SELECT * FROM persistent_workspaces ORDER BY workspace_id",
+      ).all(),
+      persistentSessions: db.query(
+        "SELECT * FROM persistent_workspace_turn_sessions ORDER BY turn_session_id",
+      ).all(),
+      persistentPublications: db.query(
+        "SELECT * FROM persistent_workspace_publications ORDER BY publication_id",
+      ).all(),
+      operationalTasks: db.query(
+        "SELECT * FROM agent_workspace_tasks ORDER BY task_id",
+      ).all(),
+      operationalRecords: db.query(
+        "SELECT * FROM agent_workspace_records ORDER BY record_id",
+      ).all(),
+      operationalSubmissions: db.query(
+        "SELECT * FROM agent_workspace_submissions ORDER BY submission_id",
+      ).all(),
+      operationalArtifacts: db.query(
+        "SELECT * FROM agent_workspace_artifacts ORDER BY artifact_id",
+      ).all(),
+    }).toEqual(snapshot);
+  });
+
+  test("aborts immutable persistent workspace collisions before backfill", () => {
+    const collisions = [
+      { userId: "u1", chatId: "chat-1", objective: "mismatched objective" },
+      { userId: "u2", chatId: "chat-1", objective: "legacy objective" },
+      { userId: "u1", chatId: "chat-2", objective: "legacy objective" },
+    ] as const;
+
+    for (const collision of collisions) {
+      const collisionDb = createPopulated106Database();
+      try {
+        if (collision.userId !== "u1") {
+          collisionDb.query(
+            `INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`,
+          ).run(collision.userId, "Other", "u2@example.test");
+        }
+        if (collision.chatId !== "chat-1") {
+          collisionDb.query(
+            "INSERT INTO chats (id, user_id, character_id) VALUES (?, ?, ?)",
+          ).run(collision.chatId, "u1", "character-1");
+        }
+        expect(collisionDb.query(
+          `SELECT old.workspace_id, old.user_id, old.chat_id, old.objective
+             FROM agent_turn_workspaces AS old
+            WHERE old.workspace_id = (
+              SELECT MIN(candidate.workspace_id)
+                FROM agent_turn_workspaces AS candidate
+               WHERE candidate.user_id = old.user_id
+                 AND candidate.chat_id = old.chat_id
+            )`,
+        ).get()).toEqual({
+          workspace_id: "workspace-106",
+          user_id: "u1",
+          chat_id: "chat-1",
+          objective: "legacy objective",
+        });
+        collisionDb.query(
+          `INSERT INTO persistent_workspaces (workspace_id, user_id, chat_id, objective)
+           VALUES (?, ?, ?, ?)`,
+        ).run("workspace-106", collision.userId, collision.chatId, collision.objective);
+
+        const before = {
+          persistentWorkspaces: collisionDb.query(
+            "SELECT * FROM persistent_workspaces ORDER BY workspace_id",
+          ).all(),
+          persistentSessions: collisionDb.query(
+            "SELECT * FROM persistent_workspace_turn_sessions ORDER BY turn_session_id",
+          ).all(),
+          persistentPublications: collisionDb.query(
+            "SELECT * FROM persistent_workspace_publications ORDER BY publication_id",
+          ).all(),
+          taskState: collisionDb.query(
+            "SELECT state FROM agent_workspace_tasks WHERE task_id = ?",
+          ).get("task-106"),
+          submissionState: collisionDb.query(
+            "SELECT state FROM agent_workspace_submissions WHERE submission_id = ?",
+          ).get("submission-106"),
+        };
+
+        expect(() => collisionDb.run(migration115Sql)).toThrow(
+          /no such index: persistent_workspace_migration_collision_guard/,
+        );
+        expect({
+          persistentWorkspaces: collisionDb.query(
+            "SELECT * FROM persistent_workspaces ORDER BY workspace_id",
+          ).all(),
+          persistentSessions: collisionDb.query(
+            "SELECT * FROM persistent_workspace_turn_sessions ORDER BY turn_session_id",
+          ).all(),
+          persistentPublications: collisionDb.query(
+            "SELECT * FROM persistent_workspace_publications ORDER BY publication_id",
+          ).all(),
+          taskState: collisionDb.query(
+            "SELECT state FROM agent_workspace_tasks WHERE task_id = ?",
+          ).get("task-106"),
+          submissionState: collisionDb.query(
+            "SELECT state FROM agent_workspace_submissions WHERE submission_id = ?",
+          ).get("submission-106"),
+        }).toEqual(before);
+      } finally {
+        collisionDb.close();
+      }
+    }
   });
 });

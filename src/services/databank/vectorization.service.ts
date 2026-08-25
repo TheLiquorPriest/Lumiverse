@@ -11,6 +11,7 @@ import * as crud from "./databank-crud.service";
 import { parseDocument } from "./document-parser.service";
 import { chunkDocument } from "./document-chunker.service";
 import { loadDatabankSettings } from "./databank-settings.service";
+import { invalidateDatabankCaches } from "./retrieval-cache.service";
 import type { DatabankDocument } from "./types";
 
 class DocumentProcessingAbortedError extends Error {
@@ -272,6 +273,7 @@ export async function deleteDocumentVectors(userId: string, docId: string): Prom
   if (chunks.length === 0) return;
   const chunkIds = chunks.map((c) => c.id);
   await embeddingsSvc.deleteDatabankChunksByIds(userId, chunkIds);
+  invalidateDatabankCaches(userId, chunks[0]!.databankId);
 }
 
 /**

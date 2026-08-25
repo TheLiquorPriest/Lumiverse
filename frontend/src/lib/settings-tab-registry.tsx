@@ -3,8 +3,7 @@ import {
   Sliders, MessageSquare, Users, PanelRight,
   Compass, Reply, HardDrive, Puzzle, Database, Hash, Activity,
   Globe, Bell, Import, Brain, Terminal, Volume2, Plug, Search, UserRound,
-  PackageOpen, KeyRound, Bot, Library,
-  Keyboard,
+  PackageOpen, KeyRound, Bot, Keyboard,
 } from 'lucide-react'
 import { useStore } from '@/store'
 import { joinExtensionSettingsTabs } from '@/lib/spindle/settings-tab-bridge'
@@ -72,8 +71,9 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
     tabName: 'Display & Layout',
     tabDescription: 'Panel width, sidebar position, and layout options',
     tabIcon: PanelRight,
-    keywords: ['display', 'layout', 'sidebar', 'drawer', 'width', 'panel', 'position', 'modal', 'chat heads'],
+    keywords: ['display', 'layout', 'sidebar', 'drawer', 'width', 'panel', 'position', 'modal', 'chat heads', 'long messages', 'read more'],
     sections: [
+      { key: 'longMessages', titleKey: 'display.longMessages.title', titleFallback: 'Long Messages', keywords: ['long messages', 'assistant messages', 'collapse', 'read more', 'show less', 'message height'] },
       { key: 'modalWidth', titleKey: 'display.modalWidth.title', titleFallback: 'Modal Width', keywords: ['modal width', 'width', 'max width', 'full', 'comfortable', 'compact', 'custom'] },
       { key: 'drawer', titleKey: 'display.drawer.title', titleFallback: 'Drawer', keywords: ['drawer', 'sidebar', 'side', 'panel width', 'tab position', 'tab size', 'tab labels'] },
       { key: 'toast', titleKey: 'display.toast.title', titleFallback: 'Notifications', keywords: ['toast', 'toast position', 'popup position', 'alert position'] },
@@ -192,20 +192,6 @@ export const SETTINGS_TABS: SettingsTabEntry[] = [
       { key: 'defaults', titleKey: 'agentRuntimeSettings.defaults.title', titleFallback: 'Mode precedence', keywords: ['mode', 'response', 'agentic', 'default', 'override'] },
       { key: 'retention', titleKey: 'agentRuntimeSettings.retention.title', titleFallback: 'Workspace retention', keywords: ['workspace', 'retention', 'terminal', 'published', 'artifacts'] },
       { key: 'limits', titleKey: 'agentRuntimeSettings.limits.title', titleFallback: 'Host ceilings', keywords: ['limits', 'ceilings', 'isolate', 'resource', 'capacity'] },
-    ],
-    component: INLINE_SENTINEL,
-  },
-  {
-    id: 'contextLibrary',
-    shortName: 'Context Library',
-    tabName: 'Context Library',
-    tabDescription: 'Manage versioned context packs and their attachments',
-    tabIcon: Library,
-    keywords: ['context', 'library', 'packs', 'versions', 'attachments', 'acl', 'portable'],
-    sections: [
-      { key: 'versions', titleKey: 'contextLibrary.sections.versions', titleFallback: 'Version history', keywords: ['versions', 'immutable', 'history', 'content'] },
-      { key: 'attachments', titleKey: 'contextLibrary.sections.attachments', titleFallback: 'Attachments', keywords: ['attach', 'preset', 'chat', 'world book'] },
-      { key: 'access', titleKey: 'contextLibrary.sections.access', titleFallback: 'Access', keywords: ['visibility', 'access', 'acl', 'review'] },
     ],
     component: INLINE_SENTINEL,
   },

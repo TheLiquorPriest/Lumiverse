@@ -59,6 +59,10 @@ export interface WorkCouncilExecutionResult {
 
 export interface AgenticWorkCouncilCapability {
   readonly required: boolean;
+  /** Frozen provider identity used only for public lifecycle projection. */
+  readonly provider?: string | null;
+  readonly connectionLabel?: string | null;
+  readonly model?: string | null;
   readonly invoke: (input: AgenticWorkCouncilInvocation) => Promise<WorkCouncilExecutionResult>;
 }
 
@@ -415,6 +419,9 @@ export function createWorkCouncilCapability(
   const frozen = freezeAdmission(admission);
   return Object.freeze({
     required: frozen.required,
+    provider: frozen.connection?.provider ?? null,
+    connectionLabel: frozen.connection?.concreteId ?? null,
+    model: frozen.connection?.model ?? null,
     invoke: (input: AgenticWorkCouncilInvocation) => executeWorkCouncil(frozen, input),
   });
 }

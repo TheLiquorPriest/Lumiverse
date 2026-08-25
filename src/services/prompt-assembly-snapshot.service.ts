@@ -6,18 +6,6 @@ import { getDb } from "../db/connection";
 import type { Chat } from "../types/chat";
 import type { Message } from "../types/message";
 import type { PromptBlock, PromptVariableValues } from "../types/preset";
-import {
-  ContextPackSnapshotAccessError,
-  buildHostPrefetchedAgentContextSnapshot,
-  freezeContextPackCandidateSnapshot,
-} from "./agent-context-tools.service";
-import type {
-  ContextPackCandidateSnapshotV1,
-  ContextPackCandidateV1,
-  ContextPackInputRevisionV1,
-  ContextPackSnapshotScopeV1,
-  ContextPackAccountCandidateSelectionV1,
-} from "./agent-context-tools.service";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
 import type { InputRevisionKindV1, InputRevisionSetV1, PreparationLimitsV1 } from "../types/agent-preprocessing";
 import { parseAgentConfigV2 } from "../types/agents";
@@ -28,15 +16,15 @@ import {
   encodeCanonicalPlainData,
   freezeCanonicalPlainData,
 } from "../utils/canonical-plain-data";
-import type { AgentContextPolicyV1 } from "../types/agents";
 import {
   freezeCognitionGraph,
   normalizeLoomPolicyBucketsV1,
   parseCognitionSourceSnapshot,
 } from "./agent-cognition.service";
+import { compareUtf8 } from "../utils/utf8-order";
+import { canonicalRuntimeCapabilityDigest } from "./agent-runtime-decision.service";
 import type {
   CognitionSourceSnapshotV1,
-  ContextActivationRuleV1,
   FrozenCognitionGraphV1,
   LoomPolicyBucketsV1,
 } from "../types/agent-cognition";
@@ -78,13 +66,6 @@ const FALLBACK_LIMITS = Object.freeze({
   queuedJobsProcess: 32,
 });
 
-export interface SnapshotContextPackSelectionV1 {
-  readonly packId: string;
-  readonly revisionId?: string;
-  readonly revision?: number;
-  readonly digest?: string;
-  readonly required?: boolean;
-}
 
 /** Inputs captured immediately before the strict assembly isolate is entered. */
 export interface GenerationAssemblySnapshotInputV1 {
@@ -102,16 +83,9 @@ export interface GenerationAssemblySnapshotInputV1 {
   readonly targetSwipeId?: number | null;
   readonly excludeMessageId?: string | null;
   readonly continueMessageId?: string | null;
-  /** Candidate snapshot accepted only with the explicit host_prefetched marker. */
-  readonly contextPackSnapshot?: ContextPackCandidateSnapshotV1;
-  /**
-   * Runtime-only provenance for a supplied candidate snapshot. Untrusted
-   * callers force a fresh account-service read instead of freezing their data.
-   */
-  readonly contextPackSnapshotSource?: "host_prefetched" | "untrusted";
-  /** Authenticated selections whose revision/digest requirements must be frozen. */
-  readonly contextPackSelections?: readonly SnapshotContextPackSelectionV1[];
   readonly userInput?: string;
+  /** Live native Databank material resolved before the strict isolate. */
+  readonly databank?: SnapshotDatabankV1;
   readonly toolIds?: readonly string[];
   /** Authenticated normalized-config revision captured by runtime admission. */
   readonly configRevision?: number | string | null;
@@ -164,11 +138,10 @@ export interface InputRevisionSetV1Local extends InputRevisionSetV1 {
   readonly credential: readonly SnapshotRevisionV1[];
   readonly participants: readonly SnapshotRevisionV1[];
   readonly worldLore: readonly SnapshotRevisionV1[];
+  readonly databank: readonly SnapshotRevisionV1[];
   readonly settings: readonly SnapshotRevisionV1[];
   readonly variables: readonly SnapshotRevisionV1[];
   readonly regex: readonly SnapshotRevisionV1[];
-  readonly context: readonly SnapshotRevisionV1[];
-  readonly acl: readonly SnapshotRevisionV1[];
   readonly cognition: readonly SnapshotRevisionV1[];
   readonly readiness: readonly SnapshotRevisionV1[];
 }
@@ -309,30 +282,67 @@ export interface SnapshotWorldInfoV1 {
   readonly state: Readonly<Record<string, unknown>>;
 }
 
-export interface SnapshotContextPackPolicySelectionV1 {
-  readonly packId: string;
-  readonly revisionId: string;
-  readonly revision: number;
-  readonly digest: string;
-  readonly required: boolean;
+export interface SnapshotDatabankChunkV1 {
+  readonly chunkId: string;
+  readonly documentId: string;
+  readonly databankId: string;
+  readonly documentName: string;
+  readonly content: string;
+  readonly score: number | null;
+  /** Hash of the source document at retrieval time, when still available. */
+  readonly documentContentHash: string | null;
+  /** Hash of the exact bounded chunk bytes delivered to WORK. */
+  readonly contentHash: string;
 }
 
-export interface SnapshotContextPacksV1 {
+export interface SnapshotDatabankMentionV1 {
+  readonly slug: string;
+  readonly documentId: string;
+  readonly databankId: string;
+  readonly documentName: string;
+  readonly content: string;
+  readonly truncated: boolean;
+  readonly documentContentHash: string | null;
+  /** Hash of the exact bounded mention bytes delivered to WORK. */
+  readonly contentHash: string;
+}
+
+export interface SnapshotDatabankProvenanceV1 {
+  readonly kind: "automatic" | "mention";
+  readonly databankId: string;
+  readonly documentId: string;
+  readonly documentName: string;
+  readonly chunkId: string | null;
+  readonly documentContentHash: string | null;
+  /** Hash of the exact bounded native content delivered to WORK. */
+  readonly contentHash: string;
+}
+
+/**
+ * Native Databank is a frozen observational projection. It carries the active
+ * scope, bounded retrieval bytes, source hashes, and participating-document
+ * revisions; it is never a Loom policy.
+ */
+export interface SnapshotDatabankV1 {
+  readonly enabled: boolean;
+  readonly activeBankIds: readonly string[];
+  readonly automaticChunks: readonly SnapshotDatabankChunkV1[];
+  readonly automaticFormatted: string;
+  readonly mentions: readonly SnapshotDatabankMentionV1[];
+  /** Current user text after valid native mentions are stripped, before macro resolution. */
+  readonly strippedUserInput: string;
+  /** Bounded native mention appendix; always appended after macro resolution. */
+  readonly mentionAppendix: string;
+  readonly provenance: readonly SnapshotDatabankProvenanceV1[];
+}
+
+export interface SnapshotAgentCognitionV1 {
   readonly schema: "present";
-  readonly contextAclRevision: number | string;
-  readonly candidates: readonly ContextPackCandidateV1[];
-  /** Explicit policy selections consumed by cognition runtime; never DB-derived. */
-  readonly contextPackSelections: readonly SnapshotContextPackPolicySelectionV1[];
-  readonly candidateInputRevisions: readonly ContextPackInputRevisionV1[];
-  readonly attachments: readonly Readonly<Record<string, unknown>>[];
-  readonly acl: readonly Readonly<Record<string, unknown>>[];
   /** Canonical versioned Loom buckets sealed to this source snapshot. */
   readonly loomPolicy?: LoomPolicyBucketsV1;
   /** Source-checked cognition graph and Loom source snapshot frozen for this turn. */
   readonly cognitionGraph: FrozenCognitionGraphV1 | null;
   readonly cognitionSource: CognitionSourceSnapshotV1 | null;
-  /** Frozen canonical context activation rules selected by AgentContextPolicyV1. */
-  readonly contextRules: readonly ContextActivationRuleV1[];
   readonly revision: string;
 }
 export interface SnapshotAvailabilityV1 {
@@ -361,8 +371,9 @@ export interface GenerationAssemblySnapshotV1 {
   readonly variables: SnapshotVariableStateV1;
   readonly regexScripts: readonly SnapshotRegexScriptV1[];
   readonly worldInfo: SnapshotWorldInfoV1;
-  readonly contextPacks: SnapshotContextPacksV1;
-  readonly contextPackSnapshot: ContextPackCandidateSnapshotV1;
+  /** Native Databank observation; absent only on legacy hand-built fixtures. */
+  readonly databank?: SnapshotDatabankV1;
+  readonly agentCognition: SnapshotAgentCognitionV1;
   readonly availability: SnapshotAvailabilityV1;
   readonly connection: Readonly<Record<string, unknown>> | null;
   /** Normalized V2 config captured by authenticated runtime admission. */
@@ -664,6 +675,27 @@ export function liveMessageInputRevision(messageId: string, generationRevision: 
   };
 }
 
+/** Databank fence identity covers each native document admitted to the frozen prompt. */
+export function liveDatabankDocumentInputRevision(
+  documentId: string,
+  databankId: unknown,
+  documentName: unknown,
+  documentContentHash: unknown,
+  documentStatus: unknown,
+): { revision: string; digest: string } {
+  const identity = {
+    id: documentId,
+    databankId: typeof databankId === "string" ? databankId : "",
+    documentName: typeof documentName === "string" ? documentName : "",
+    documentContentHash: typeof documentContentHash === "string" && documentContentHash.length > 0
+      ? documentContentHash
+      : null,
+    documentStatus: typeof documentStatus === "string" ? documentStatus : "",
+  };
+  const valueDigest = digest(identity);
+  return { revision: valueDigest, digest: valueDigest };
+}
+
 /** Connection fence identity is candidateRevision, never rematerialized capabilities/label/updated_at. */
 export function liveConnectionInputRevision(connectionId: string, candidateRevision: unknown): { revision: string; digest: string } {
   const revisionValue = String(candidateRevision ?? "");
@@ -779,6 +811,120 @@ function safeArrayOfStrings(value: unknown, label: string, maxBytes: number): st
   }
   return output;
 }
+function nativeContentHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function normalizeDatabank(
+  value: unknown,
+  fallbackUserInput: string,
+  limits: Limits,
+): SnapshotDatabankV1 {
+  const source = value === undefined || value === null
+    ? {}
+    : value && typeof value === "object" && !Array.isArray(value)
+      ? value as RawRow
+      : (() => { throw new SnapshotInputError("invalid Databank projection"); })();
+  const maxItems = limits.promptBlocks * 16;
+  const text = (raw: unknown, label: string, max = limits.maxOperationBytes): string => {
+    if (typeof raw !== "string") throw new SnapshotInputError(`invalid ${label}`);
+    return assertString(raw, label, max);
+  };
+  const nullableText = (raw: unknown, label: string, max = 256): string | null => {
+    if (raw === null || raw === undefined) return null;
+    return text(raw, label, max);
+  };
+  const bankIds = Array.isArray(source.activeBankIds)
+    ? source.activeBankIds.map((entry, index) => text(entry, `databank.activeBankIds[${index}]`, 256))
+    : [];
+  if (bankIds.length > maxItems) throw new SnapshotLimitError("Databank bank limit exceeded");
+  const automaticChunks: SnapshotDatabankChunkV1[] = [];
+  const mentionRows: SnapshotDatabankMentionV1[] = [];
+  let nativeBytes = 0;
+  const rawChunks = source.automaticChunks === undefined ? [] : arrayValue(source.automaticChunks, "databank.automaticChunks", limits.maxInputBytes);
+  if (rawChunks.length > maxItems) throw new SnapshotLimitError("Databank automatic chunk limit exceeded");
+  for (const [index, raw] of rawChunks.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new SnapshotInputError(`invalid databank chunk ${index}`);
+    const row = raw as RawRow;
+    const content = text(row.content, `databank.automaticChunks[${index}].content`);
+    const chunk: SnapshotDatabankChunkV1 = {
+      chunkId: text(row.chunkId, `databank.automaticChunks[${index}].chunkId`, 256),
+      documentId: text(row.documentId, `databank.automaticChunks[${index}].documentId`, 256),
+      databankId: text(row.databankId, `databank.automaticChunks[${index}].databankId`, 256),
+      documentName: text(row.documentName, `databank.automaticChunks[${index}].documentName`, limits.maxOperationBytes),
+      content,
+      score: row.score === null || row.score === undefined ? null : rowNumber(row, "score", NaN),
+      documentContentHash: nullableText(row.documentContentHash, `databank.automaticChunks[${index}].documentContentHash`),
+      contentHash: nativeContentHash(content),
+    };
+    if (chunk.score !== null && !Number.isFinite(chunk.score)) throw new SnapshotInputError(`invalid databank chunk score ${index}`);
+    nativeBytes += utf8Bytes(content);
+    if (nativeBytes > limits.maxInputBytes) throw new SnapshotLimitError("Databank content limit exceeded");
+    automaticChunks.push(chunk);
+  }
+  const rawMentions = source.mentions === undefined ? [] : arrayValue(source.mentions, "databank.mentions", limits.maxInputBytes);
+  if (rawMentions.length > maxItems) throw new SnapshotLimitError("Databank mention limit exceeded");
+  for (const [index, raw] of rawMentions.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new SnapshotInputError(`invalid databank mention ${index}`);
+    const row = raw as RawRow;
+    const content = text(row.content, `databank.mentions[${index}].content`);
+    const mention: SnapshotDatabankMentionV1 = {
+      slug: text(row.slug, `databank.mentions[${index}].slug`, 256),
+      documentId: text(row.documentId, `databank.mentions[${index}].documentId`, 256),
+      databankId: text(row.databankId, `databank.mentions[${index}].databankId`, 256),
+      documentName: text(row.documentName, `databank.mentions[${index}].documentName`, limits.maxOperationBytes),
+      content,
+      truncated: row.truncated === true,
+      documentContentHash: nullableText(row.documentContentHash, `databank.mentions[${index}].documentContentHash`),
+      contentHash: nativeContentHash(content),
+    };
+    nativeBytes += utf8Bytes(content);
+    if (nativeBytes > limits.maxInputBytes) throw new SnapshotLimitError("Databank content limit exceeded");
+    mentionRows.push(mention);
+  }
+  const automaticFormatted = source.automaticFormatted === undefined
+    ? ""
+    : text(source.automaticFormatted, "databank.automaticFormatted", limits.maxInputBytes);
+  const strippedUserInput = source.strippedUserInput === undefined
+    ? fallbackUserInput
+    : text(source.strippedUserInput, "databank.strippedUserInput", limits.maxInputBytes);
+  const mentionAppendix = source.mentionAppendix === undefined
+    ? ""
+    : text(source.mentionAppendix, "databank.mentionAppendix", limits.maxInputBytes);
+  nativeBytes += utf8Bytes(automaticFormatted) + utf8Bytes(strippedUserInput) + utf8Bytes(mentionAppendix);
+  if (nativeBytes > limits.maxInputBytes) throw new SnapshotLimitError("Databank projection limit exceeded");
+  const provenance: SnapshotDatabankProvenanceV1[] = [
+    ...automaticChunks.map((chunk) => ({
+      kind: "automatic" as const,
+      databankId: chunk.databankId,
+      documentId: chunk.documentId,
+      documentName: chunk.documentName,
+      chunkId: chunk.chunkId,
+      documentContentHash: chunk.documentContentHash,
+      contentHash: chunk.contentHash,
+    })),
+    ...mentionRows.map((mention) => ({
+      kind: "mention" as const,
+      databankId: mention.databankId,
+      documentId: mention.documentId,
+      documentName: mention.documentName,
+      chunkId: null,
+      documentContentHash: mention.documentContentHash,
+      contentHash: mention.contentHash,
+    })),
+  ];
+  return deepFreeze({
+    enabled: source.enabled === true,
+    activeBankIds: Object.freeze([...new Set(bankIds)]),
+    automaticChunks: Object.freeze(automaticChunks),
+    automaticFormatted,
+    mentions: Object.freeze(mentionRows),
+    strippedUserInput,
+    mentionAppendix,
+    provenance: Object.freeze(provenance),
+  }, limits.maxInputBytes);
+}
+
 
 function normalizePromptBlock(raw: unknown, order: number, maxBytes: number): SnapshotBlockV1 {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new SnapshotInputError("invalid prompt block");
@@ -1071,7 +1217,7 @@ function normalizeWorld(
     throw new SnapshotInputError("world_book_entries schema is incomplete");
   }
   const entryQuery = `SELECT ${selectColumns.join(", ")} FROM world_book_entries WHERE world_book_id = ? ORDER BY ${orderColumns.join(", ")} LIMIT 1 OFFSET ?`;
-  for (const bookId of books.map((book) => book.id).sort()) {
+  for (const bookId of books.map((book) => book.id).sort(compareUtf8)) {
     let entryOffset = 0;
     while (scannedEntries <= maxEntries) {
       const row = rowFor<RawRow>(db, entryQuery, bookId, entryOffset);
@@ -1229,14 +1375,15 @@ function getConnection(
     }
     const allowed = new Set([
       "logicalId", "concreteId", "label", "provider", "model", "effectiveEndpoint",
-      "endpointRevision", "credentialRevision", "candidateRevision", "revision", "capabilities",
+      "endpointRevision", "credentialRevision", "candidateRevision", "revision",
+      "capabilityDigest", "capabilities",
     ]);
     const hasLogicalIdentity = typeof concrete.logicalId === "string" && concrete.logicalId.trim().length > 0;
     const hasConcreteIdentity = typeof concrete.concreteId === "string" && concrete.concreteId.trim().length > 0;
     if (!hasLogicalIdentity && !hasConcreteIdentity) {
       throw new SnapshotInputError("concrete connection identity is required");
     }
-    for (const key of ["candidateRevision", "endpointRevision", "credentialRevision"]) {
+    for (const key of ["candidateRevision", "endpointRevision", "credentialRevision", "capabilityDigest"]) {
       if (!Object.hasOwn(concrete, key)) throw new SnapshotInputError(`missing connection ${key}`);
     }
     const revisionKeys = new Set(["endpointRevision", "credentialRevision", "candidateRevision", "revision"]);
@@ -1247,6 +1394,20 @@ function getConnection(
       else if (typeof value === "number" || typeof value === "boolean" || value === null) safe[key] = value;
       else if (isClosedData(value) && boundedClosedDataBytes(value, limits.inputBytes) <= limits.inputBytes) safe[key] = cloneClosedData(value);
       else throw new SnapshotInputError(`invalid connection field: ${key}`);
+    }
+    const capabilityDigest = safe.capabilityDigest;
+    const capabilities = safe.capabilities;
+    if (
+      typeof capabilityDigest !== "string"
+      || !/^[0-9a-f]{64}$/.test(capabilityDigest)
+      || capabilities === null
+      || typeof capabilities !== "object"
+      || Array.isArray(capabilities)
+      || canonicalRuntimeCapabilityDigest(
+        capabilities as Readonly<Record<string, unknown>>,
+      ) !== capabilityDigest
+    ) {
+      throw new SnapshotInputError("connection capability digest mismatch");
     }
   }
   if (row) {
@@ -1285,11 +1446,10 @@ function revisionSet(groups: SnapshotRevisionV1[][]): InputRevisionSetV1Local {
     credential: domain("credential"),
     participants: domain("persona").concat(domain("character"), domain("group")),
     worldLore: domain("world_lore"),
+    databank: domain("databank"),
     settings: domain("settings"),
     variables: domain("macro_variables"),
     regex: domain("regex"),
-    context: domain("context_pack").concat(domain("context_attachment")),
-    acl: domain("context_acl"),
     cognition: domain("cognition_policy"),
     readiness: domain("readiness"),
     digest: digest(entries),
@@ -1391,173 +1551,6 @@ function assertRequest(input: GenerationAssemblySnapshotInputV1): void {
   if (input.targetSwipeId !== undefined && input.targetSwipeId !== null && (!Number.isSafeInteger(input.targetSwipeId) || input.targetSwipeId < 0)) {
     throw new SnapshotInputError("invalid target swipe");
   }
-  if (input.contextPackSnapshotSource !== undefined
-    && input.contextPackSnapshotSource !== "host_prefetched"
-    && input.contextPackSnapshotSource !== "untrusted") {
-    throw new SnapshotInputError("invalid context snapshot source");
-  }
-}
-
-const MAX_CONTEXT_PACK_SELECTIONS = 256;
-
-interface NormalizedContextPackSelectionV1 {
-  readonly packId: string;
-  readonly revisionId?: string;
-  readonly revision?: number;
-  readonly digest?: string;
-  readonly required: boolean;
-}
-
-interface FrozenContextPolicyV1 {
-  readonly selections: readonly NormalizedContextPackSelectionV1[];
-  readonly accountSelections: readonly NormalizedContextPackSelectionV1[];
-  readonly rules: readonly ContextActivationRuleV1[];
-  readonly cognitionGraph: FrozenCognitionGraphV1 | null;
-  readonly cognitionSource: CognitionSourceSnapshotV1 | null;
-  readonly hasPolicy: boolean;
-}
-
-function canonicalContextRevisionNumber(packId: string, revisionId: string): number | undefined {
-  const prefix = `${packId}@`;
-  if (!revisionId.startsWith(prefix)) return undefined;
-  const suffix = revisionId.slice(prefix.length);
-  const revision = Number(suffix);
-  return Number.isSafeInteger(revision) && revision >= 1 && String(revision) === suffix ? revision : undefined;
-}
-
-function isCanonicalContextRevisionId(packId: string, revisionId: string): boolean {
-  return canonicalContextRevisionNumber(packId, revisionId) !== undefined;
-}
-function parseContextPackSelection(
-  value: unknown,
-  path: string,
-  defaultRequired: boolean,
-  exact: boolean,
-): NormalizedContextPackSelectionV1 {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new SnapshotInputError(`invalid ${path}`);
-  }
-  const row = value as Record<string, unknown>;
-  if (exact) {
-    for (const key of Object.keys(row)) {
-      if (
-        key !== "packId"
-        && key !== "revisionId"
-        && key !== "revision"
-        && key !== "digest"
-        && key !== "label"
-        && key !== "revisionLabel"
-        && key !== "required"
-      ) {
-        throw new SnapshotInputError(`invalid ${path}`);
-      }
-    }
-  }
-  const packId = assertId(row.packId, `${path}.packId`);
-  const revisionId = row.revisionId === undefined || row.revisionId === null
-    ? undefined
-    : assertId(row.revisionId, `${path}.revisionId`);
-  const selectedRevision = row.revision === undefined || row.revision === null
-    ? undefined
-    : row.revision;
-  if (selectedRevision !== undefined && (
-    typeof selectedRevision !== "number"
-    || !Number.isSafeInteger(selectedRevision)
-    || selectedRevision < 1
-  )) {
-    throw new SnapshotInputError(`invalid ${path}.revision`);
-  }
-  const normalizedRevision = selectedRevision as number | undefined;
-  const selectedDigest = row.digest === undefined || row.digest === null
-    ? undefined
-    : assertString(row.digest, `${path}.digest`, 4096, false);
-  const required = row.required === undefined ? defaultRequired : row.required;
-  if (typeof required !== "boolean") {
-    throw new SnapshotInputError(`invalid ${path}.required`);
-  }
-  const canonicalRevision = revisionId === undefined
-    ? undefined
-    : canonicalContextRevisionNumber(packId, revisionId);
-  if (exact && (
-    revisionId === undefined
-    || selectedDigest === undefined
-    || canonicalRevision === undefined
-    || (normalizedRevision !== undefined && revisionId !== `${packId}@${normalizedRevision}`)
-  )) {
-    throw new SnapshotInputError(`invalid ${path}: exact canonical revision and digest are required`);
-  }
-  const effectiveRevision = normalizedRevision ?? canonicalRevision;
-  return Object.freeze({
-    packId,
-    ...(revisionId === undefined ? {} : { revisionId }),
-    ...(effectiveRevision === undefined ? {} : { revision: effectiveRevision }),
-    ...(selectedDigest === undefined ? {} : { digest: selectedDigest }),
-    required,
-  });
-}
-
-function contextPackSelections(
-  input: GenerationAssemblySnapshotInputV1,
-  exact: boolean,
-): readonly NormalizedContextPackSelectionV1[] {
-  const selections: NormalizedContextPackSelectionV1[] = [];
-  const suppliedSelections = input.contextPackSelections;
-  if (suppliedSelections !== undefined && !Array.isArray(suppliedSelections)) {
-    throw new SnapshotInputError("invalid contextPackSelections");
-  }
-  for (let index = 0; index < (suppliedSelections?.length ?? 0); index++) {
-    if (selections.length >= MAX_CONTEXT_PACK_SELECTIONS) {
-      throw new SnapshotLimitError("context pack selection limit exceeded");
-    }
-    selections.push(parseContextPackSelection(
-      suppliedSelections?.[index],
-      `contextPackSelections[${index}]`,
-      true,
-      exact,
-    ));
-  }
-  return Object.freeze(selections);
-}
-
-
-function sameContextSelection(
-  left: NormalizedContextPackSelectionV1,
-  right: NormalizedContextPackSelectionV1,
-): boolean {
-  return canonical({
-    packId: left.packId,
-    revisionId: left.revisionId,
-    revision: left.revision,
-    digest: left.digest,
-  }) === canonical({
-    packId: right.packId,
-    revisionId: right.revisionId,
-    revision: right.revision,
-    digest: right.digest,
-  });
-}
-
-function selectionKey(selection: NormalizedContextPackSelectionV1): string {
-  return selection.packId;
-}
-
-function deduplicateContextSelections(
-  values: readonly NormalizedContextPackSelectionV1[],
-  label: string,
-): readonly NormalizedContextPackSelectionV1[] {
-  const byPack = new Map<string, NormalizedContextPackSelectionV1>();
-  for (const value of values) {
-    const previous = byPack.get(selectionKey(value));
-    if (previous && !sameContextSelection(previous, value)) {
-      throw new SnapshotInputError(`${label} contains conflicting references for ${value.packId}`);
-    }
-    if (!previous) {
-      byPack.set(selectionKey(value), value);
-    } else if (previous.required !== value.required) {
-      byPack.set(selectionKey(value), Object.freeze({ ...previous, required: previous.required || value.required }));
-    }
-  }
-  return Object.freeze([...byPack.values()].sort((left, right) => left.packId.localeCompare(right.packId)));
 }
 
 function freezeExplicitCognition(
@@ -1579,7 +1572,6 @@ function freezeExplicitCognition(
       version: graph.version,
       policies: graph.policies,
       templates: graph.templates,
-      contextRules: graph.contextRules,
     };
     const frozen = freezeCognitionGraph(baseGraph, source);
     if (canonical(frozen) !== canonical(graphValue)) {
@@ -1594,88 +1586,6 @@ function freezeExplicitCognition(
     throw new SnapshotInputError("invalid cognition graph/source");
   }
 }
-
-function resolveContextPolicy(
-  input: GenerationAssemblySnapshotInputV1,
-  normalizedAgentConfig: unknown,
-): FrozenContextPolicyV1 {
-  const cognition = freezeExplicitCognition(input);
-  const rawPolicy = normalizedAgentConfig && typeof normalizedAgentConfig === "object" && !Array.isArray(normalizedAgentConfig)
-    ? (normalizedAgentConfig as Record<string, unknown>).contextPolicy
-    : undefined;
-  const hasPolicy = rawPolicy !== undefined && rawPolicy !== null;
-  if (!hasPolicy) {
-    const selections = contextPackSelections(input, cognition?.graph.contextRules.length ? true : false);
-    return {
-      selections,
-      accountSelections: selections,
-      rules: Object.freeze([]),
-      cognitionGraph: cognition?.graph ?? null,
-      cognitionSource: cognition?.source ?? null,
-      hasPolicy: false,
-    };
-  }
-  const policy = rawPolicy as AgentContextPolicyV1;
-  const requiresGraph = policy.ruleIds.length > 0;
-  if (requiresGraph && !cognition) {
-    throw new ContextPackSnapshotAccessError("cognition graph/source is required by context policy");
-  }
-  const selections = contextPackSelections(input, true);
-  const rulesById = new Map((cognition?.graph.contextRules ?? []).map((rule) => [rule.id, rule] as const));
-  const rules: ContextActivationRuleV1[] = [];
-  for (const ruleId of policy.ruleIds) {
-    const rule = rulesById.get(ruleId);
-    if (!rule) {
-      throw new ContextPackSnapshotAccessError(`required context activation rule is unavailable: ${ruleId}`);
-    }
-    if (!isCanonicalContextRevisionId(rule.packId, rule.revisionId)) {
-      throw new SnapshotInputError(`contextRules.${rule.id}.revisionId is not canonical`);
-    }
-    rules.push(rule);
-  }
-  rules.sort((left, right) => left.id.localeCompare(right.id));
-  const rulePackIds = new Set(rules.map((rule) => rule.packId));
-  const authorizedPackIds = new Set([...policy.packIds, ...rulePackIds]);
-  for (const selection of selections) {
-    if (!authorizedPackIds.has(selection.packId)) {
-      throw new SnapshotInputError(`contextPackSelections is not authorized by contextPolicy: ${selection.packId}`);
-    }
-  }
-  const selectionByPack = new Map<string, NormalizedContextPackSelectionV1>();
-  for (const selection of selections) {
-    const previous = selectionByPack.get(selection.packId);
-    if (previous && !sameContextSelection(previous, selection)) {
-      throw new SnapshotInputError(`contextPackSelections contains conflicting references for ${selection.packId}`);
-    }
-    if (!previous) selectionByPack.set(selection.packId, selection);
-  }
-  const directSelections: NormalizedContextPackSelectionV1[] = [];
-  for (const packId of policy.packIds) {
-    const selection = selectionByPack.get(packId);
-    if (!selection) {
-      throw new ContextPackSnapshotAccessError(`required context pack selection is unavailable: ${packId}`);
-    }
-    directSelections.push(selection);
-  }
-  const ruleSelections = rules.map((rule) => {
-    const selection = selectionByPack.get(rule.packId);
-    if (!selection || selection.revisionId !== rule.revisionId || selection.digest === undefined) {
-      throw new ContextPackSnapshotAccessError(`context rule revision identity is unavailable: ${rule.id}`);
-    }
-    // Rule requiredness remains in the frozen graph and is activated only by
-    // cognition transitions; it is not an initial direct-pack requirement.
-    return Object.freeze({ ...selection });
-  });
-  const selected = deduplicateContextSelections([...directSelections, ...ruleSelections], "context policy");
-  return {
-    selections: selected,
-    accountSelections: Object.freeze(directSelections),
-    rules: Object.freeze(rules),
-    cognitionGraph: cognition?.graph ?? null,
-    cognitionSource: cognition?.source ?? null,
-    hasPolicy: true,
-  };
-}
 const EMPTY_LOOM_POLICY_BUCKETS: LoomPolicyBucketsV1 = Object.freeze({
   version: 1,
   workPolicy: Object.freeze([]),
@@ -1686,10 +1596,10 @@ const EMPTY_LOOM_POLICY_BUCKETS: LoomPolicyBucketsV1 = Object.freeze({
 
 function resolveLoomPolicyBuckets(
   input: GenerationAssemblySnapshotInputV1,
-  policy: FrozenContextPolicyV1,
+  cognition: { readonly graph: FrozenCognitionGraphV1; readonly source: CognitionSourceSnapshotV1 } | null,
   normalizedAgentConfig: unknown,
 ): LoomPolicyBucketsV1 {
-  if (!policy.cognitionSource) {
+  if (!cognition) {
     if (input.loomPolicy !== undefined) {
       throw new SnapshotInputError("Loom policy buckets require a cognition source");
     }
@@ -1702,230 +1612,29 @@ function resolveLoomPolicyBuckets(
     ? input.loomPolicy
     : (config.runtimePolicy as Record<string, unknown> | undefined)?.loomPolicy;
   try {
-    return normalizeLoomPolicyBucketsV1(value, policy.cognitionSource);
+    return normalizeLoomPolicyBucketsV1(value, cognition.source);
   } catch {
     throw new SnapshotInputError("invalid Loom policy buckets");
   }
 }
 
-function candidateMatchesSelection(
-  candidate: ContextPackCandidateV1,
-  selection: NormalizedContextPackSelectionV1,
-): boolean {
-  return candidate.packId === selection.packId
-    && (selection.revisionId === undefined || candidate.revisionId === selection.revisionId)
-    && (selection.revision === undefined || candidate.revision === selection.revision)
-    && (selection.digest === undefined || candidate.digest === selection.digest);
-}
-function contextCandidateIdentity(candidate: ContextPackCandidateV1): Readonly<Record<string, unknown>> {
-  return {
-    ownerId: candidate.ownerId,
-    packId: candidate.packId,
-    revisionId: candidate.revisionId,
-    revision: candidate.revision,
-    digest: candidate.digest,
-    source: candidate.source,
-    targetId: candidate.targetId,
-    attachmentId: candidate.attachmentId,
-    attachmentRevision: candidate.attachmentRevision,
-    aclRevision: candidate.aclRevision,
-    required: candidate.required,
-    order: candidate.order,
-  };
-}
-
-function assertHostPrefetchedSnapshotMatches(
-  supplied: ContextPackCandidateSnapshotV1,
-  canonicalSnapshot: ContextPackCandidateSnapshotV1,
-): void {
-  let normalizedSupplied: ContextPackCandidateSnapshotV1;
-  try {
-    normalizedSupplied = freezeContextPackCandidateSnapshot({
-      ownerId: supplied.ownerId,
-      contextAclRevision: supplied.contextAclRevision,
-      candidates: supplied.candidates,
-    });
-  } catch {
-    throw new ContextPackSnapshotAccessError("context candidate identity mismatch");
-  }
-  if (
-    supplied.version !== 1
-    || supplied.ownerId !== canonicalSnapshot.ownerId
-    || supplied.contextAclRevision !== canonicalSnapshot.contextAclRevision
-    || !Array.isArray(supplied.candidateInputRevisions)
-    || canonical(supplied.candidateInputRevisions) !== canonical(canonicalSnapshot.candidateInputRevisions)
-    || canonical(normalizedSupplied.candidates.map(contextCandidateIdentity))
-      !== canonical(canonicalSnapshot.candidates.map(contextCandidateIdentity))
-  ) {
-    throw new ContextPackSnapshotAccessError("context candidate identity mismatch");
-  }
-}
-
-function assertContextPackSelectionAvailability(
-  policy: FrozenContextPolicyV1,
-  frozen: ContextPackCandidateSnapshotV1,
-): void {
-  for (const selection of policy.selections) {
-    const matches = frozen.candidates.some((candidate) => candidateMatchesSelection(candidate, selection));
-    if (selection.required && !matches) {
-      throw new ContextPackSnapshotAccessError(
-        `required context pack selection is unavailable: ${selection.packId}`,
-      );
-    }
-  }
-}
-
-function applyContextPackPolicy(
-  frozen: ContextPackCandidateSnapshotV1,
-  policy: FrozenContextPolicyV1,
-): ContextPackCandidateSnapshotV1 {
-  if (!policy.hasPolicy) return frozen;
-  const policyByPack = new Map<string, readonly NormalizedContextPackSelectionV1[]>();
-  for (const selection of policy.selections) {
-    const current = policyByPack.get(selection.packId) ?? [];
-    policyByPack.set(selection.packId, [...current, selection]);
-  }
-  const candidates = frozen.candidates
-    .filter((candidate) => {
-      const selections = policyByPack.get(candidate.packId);
-      // All target-attached candidates remain in the frozen initial set.
-      // Account candidates are admitted only when directly/rule selected.
-      return candidate.source !== "account"
-        || !selections
-        || selections.some((selection) => candidateMatchesSelection(candidate, selection));
-    })
-    .map((candidate) => Object.freeze({ ...candidate }));
-  return freezeContextPackCandidateSnapshot({
-    ownerId: frozen.ownerId,
-    contextAclRevision: frozen.contextAclRevision,
-    candidates,
-  });
-}
-
-function buildContextPackSnapshot(
+function buildAgentCognition(
   input: GenerationAssemblySnapshotInputV1,
-  presetId: string | null,
-  chatId: string,
-  worldInfo: SnapshotWorldInfoV1,
-  db: Database,
   normalizedAgentConfig: unknown,
-): SnapshotContextPacksV1 {
-  const scopes: ContextPackSnapshotScopeV1[] = [
-    { scope: "chat", targetId: chatId },
-    ...(presetId ? [{ scope: "preset", targetId: presetId } satisfies ContextPackSnapshotScopeV1] : []),
-    ...worldInfo.books.map((book) => ({ scope: "world_book", targetId: book.id }) satisfies ContextPackSnapshotScopeV1),
-  ];
-  const policy = resolveContextPolicy(input, normalizedAgentConfig);
-  const loomPolicy = resolveLoomPolicyBuckets(input, policy, normalizedAgentConfig);
-  const allowedScopeTargets = new Set(scopes.map((scope) => `${scope.scope}\u0000${scope.targetId}`));
-  const supplied = input.contextPackSnapshotSource === "host_prefetched"
-    ? input.contextPackSnapshot
-    : undefined;
-  if ((policy.hasPolicy || policy.cognitionGraph !== null) && input.contextPackSnapshotSource !== "host_prefetched") {
-    throw new ContextPackSnapshotAccessError("authenticated context candidate snapshot is required");
-  }
-  const hostSelections: ContextPackAccountCandidateSelectionV1[] = policy.selections
-    .filter((selection) => (
-      typeof selection.revisionId === "string"
-      && typeof selection.digest === "string"
-      && Number.isSafeInteger(selection.revision)
-    ))
-    .map((selection, order) => ({
-      packId: selection.packId,
-      revisionId: selection.revisionId!,
-      revision: selection.revision!,
-      digest: selection.digest!,
-      ...(selection.required === undefined ? {} : { required: selection.required }),
-      order,
-    }));
-
-  const canonicalHostSnapshot = buildHostPrefetchedAgentContextSnapshot({
-    ownerId: input.userId,
-    targetScopes: scopes,
-    selections: hostSelections,
-    db,
-  });
-  if (supplied) {
-    if (supplied.ownerId !== input.userId) {
-      throw new SnapshotInputError("context candidate owner mismatch");
-    }
-    for (const candidate of supplied.candidates) {
-      if (candidate.source === "account") {
-        if (candidate.targetId !== null || candidate.attachmentId !== null || candidate.attachmentRevision !== null) {
-          throw new SnapshotInputError("account context candidate cannot have an attachment");
-        }
-      } else if (!allowedScopeTargets.has(`${candidate.source}\u0000${candidate.targetId}`)) {
-        throw new SnapshotInputError("context candidate scope mismatch");
-      }
-    }
-    assertHostPrefetchedSnapshotMatches(supplied, canonicalHostSnapshot);
-  }
-  const attached = canonicalHostSnapshot;
-  const frozen = applyContextPackPolicy(attached, policy);
-  assertContextPackSelectionAvailability(policy, frozen);
-  const candidates = Object.freeze(frozen.candidates.map((candidate) => Object.freeze({ ...candidate })));
-  const candidateInputRevisions = Object.freeze(
-    frozen.candidateInputRevisions.map((revision) => Object.freeze({ ...revision })),
-  );
-  const attachments = Object.freeze(candidates.map((candidate) => Object.freeze({
-    ownerId: candidate.ownerId,
-    attachmentId: candidate.attachmentId,
-    packId: candidate.packId,
-    revisionId: candidate.revisionId,
-    source: candidate.source,
-    targetId: candidate.targetId,
-    required: candidate.required,
-    revision: candidate.revision,
-  })));
-  const contextPackSelectionsByKey = new Map<string, SnapshotContextPackPolicySelectionV1>();
-  for (const selection of policy.accountSelections) {
-    if (selection.revisionId === undefined || selection.digest === undefined) continue;
-    const revision = selection.revision ?? canonicalContextRevisionNumber(selection.packId, selection.revisionId);
-    if (revision === undefined) continue;
-    const key = `${selection.packId}\u0000${selection.revisionId}`;
-    contextPackSelectionsByKey.set(key, Object.freeze({
-      packId: selection.packId,
-      revisionId: selection.revisionId,
-      revision,
-      digest: selection.digest,
-      required: selection.required,
-    }));
-  }
-  const contextPackSelections = Object.freeze([...contextPackSelectionsByKey.values()]
-    .sort((left, right) => left.packId.localeCompare(right.packId) || left.revision - right.revision));
-  const acl = Object.freeze([...new Map(candidates.map((candidate) => [
-    `${candidate.ownerId}:${candidate.packId}`,
-    Object.freeze({
-      ownerId: candidate.ownerId,
-      packId: candidate.packId,
-      aclRevision: candidate.aclRevision,
-      contextAclRevision: frozen.contextAclRevision,
-    }),
-  ])).values()]);
+): SnapshotAgentCognitionV1 {
+  const cognition = freezeExplicitCognition(input);
+  const loomPolicy = resolveLoomPolicyBuckets(input, cognition, normalizedAgentConfig);
+  const cognitionGraph = cognition?.graph ?? null;
+  const cognitionSource = cognition?.source ?? null;
   return deepFreeze({
     schema: "present" as const,
-    contextAclRevision: frozen.contextAclRevision,
-    candidates,
-    contextPackSelections,
-    candidateInputRevisions,
-    attachments,
-    acl,
     loomPolicy,
-    cognitionGraph: policy.cognitionGraph,
-    cognitionSource: policy.cognitionSource,
-    contextRules: policy.rules,
-    revision: digest({
-      ownerId: frozen.ownerId,
-      contextAclRevision: frozen.contextAclRevision,
-      candidates,
-      contextPackSelections,
-      candidateInputRevisions,
-      loomPolicy,
-      cognitionSource: policy.cognitionSource,
-      contextRules: policy.rules,
-    }),
+    cognitionGraph,
+    cognitionSource,
+    revision: digest({ loomPolicy, cognitionGraph, cognitionSource }),
   });
 }
+
 
 /**
  * Read all inputs under one SQLite read transaction. No extension/Spindle
@@ -2049,6 +1758,7 @@ export function buildGenerationAssemblySnapshot(
       excludedMessageId: input.excludeMessageId ?? null,
       userInput: assertString(input.userInput ?? "", "user input", limits.inputBytes),
     } satisfies SnapshotTargetV1);
+    const databank = normalizeDatabank(input.databank, target.userInput, limits);
     const participantIds = [
       persona?.id,
       character.id,
@@ -2063,17 +1773,10 @@ export function buildGenerationAssemblySnapshot(
       revision: digest({ participantIds, tools }),
     } satisfies SnapshotAvailabilityV1);
     const normalizedAgentConfig = normalizeAgentConfig(input.agentConfig, limits.inputBytes);
-    const contextInput = normalizedAgentConfig === input.agentConfig
-      ? input
-      : { ...input, agentConfig: normalizedAgentConfig };
-    const contextPacks = buildContextPackSnapshot(contextInput, effectivePresetId, chat.id, worldInfo, db, normalizedAgentConfig);
-    const contextPackSnapshot = deepFreeze({
-      version: 1 as const,
-      ownerId: input.userId,
-      contextAclRevision: contextPacks.contextAclRevision,
-      candidates: contextPacks.candidates,
-      candidateInputRevisions: contextPacks.candidateInputRevisions,
-    } satisfies ContextPackCandidateSnapshotV1);
+    const agentCognition = buildAgentCognition(
+      normalizedAgentConfig === input.agentConfig ? input : { ...input, agentConfig: normalizedAgentConfig },
+      normalizedAgentConfig,
+    );
     const targetRevision = revision("target", `${chat.id}:${target.messageId ?? "none"}:${target.swipeId ?? "none"}`, {
       generationType: target.generationType,
       messageId: target.messageId,
@@ -2116,24 +1819,30 @@ export function buildGenerationAssemblySnapshot(
       ...worldInfo.entries.map((entry) => revision("world_lore", entry.id, entry, entry.revision)),
       revision("world_lore", chat.id, worldInfo.state, digest(worldInfo.state)),
     ];
+    const databankRevisions: SnapshotRevisionV1[] = [];
+    const seenDatabankDocuments = new Set<string>();
+    for (const source of databank.provenance) {
+      if (seenDatabankDocuments.has(source.documentId)) continue;
+      seenDatabankDocuments.add(source.documentId);
+      const live = liveDatabankDocumentInputRevision(
+        source.documentId,
+        source.databankId,
+        source.documentName,
+        source.documentContentHash,
+        "ready",
+      );
+      databankRevisions.push(Object.freeze({
+        kind: "databank",
+        domain: "databank",
+        id: source.documentId,
+        revision: live.revision,
+        digest: live.digest,
+      }));
+    }
     const settingsRevision = [revision("settings", input.userId, settingsIdentity, digest(settingsIdentity))];
     const variableRevision = [revision("macro_variables", `${chat.id}:${preset?.id ?? "none"}`, variableIdentity, variables.revision)];
     const regexRevisions = regexScripts.map((script) => revision("regex", script.id, script, script.revision));
-    const contextRevision = [
-      revision("context_pack", `${input.userId}:context-packs`, contextPacks, contextPacks.revision),
-      ...contextPacks.candidateInputRevisions.map((candidate) =>
-        revision("context_pack", `${candidate.packId}:${candidate.revisionId}:${candidate.attachmentId ?? "account"}`, candidate, candidate.revision)),
-    ];
-    const contextAttachmentRevision = contextPacks.candidateInputRevisions
-      .filter((candidate) => candidate.attachmentId !== null && candidate.attachmentRevision !== null)
-      .map((candidate) =>
-        revision("context_attachment", candidate.attachmentId as string, candidate, candidate.attachmentRevision as string));
-    const aclRevision = [
-      revision("context_acl", `${input.userId}:context-acl`, contextPacks.acl, contextPacks.revision),
-      ...contextPacks.candidateInputRevisions.map((candidate) =>
-        revision("context_acl", `${candidate.packId}:${candidate.attachmentId ?? "account"}`, candidate, candidate.aclRevision)),
-    ];
-    const cognitionRevisionValue = { agentConfig: normalizedAgentConfig ?? {}, contextRules: contextPacks.contextRules };
+    const cognitionRevisionValue = { agentConfig: normalizedAgentConfig ?? {}, agentCognition };
     const cognitionRevision = [revision("cognition_policy", preset?.id ?? "none", cognitionRevisionValue, digest(cognitionRevisionValue))];
     const readinessRevision = [revision("readiness", `${input.userId}:${chat.id}`, availability, availability.revision)];
     const runtimeEpochRevision = [revision("runtime_epoch", `${input.userId}:${chat.id}`, { generationId: input.generationId ?? "", snapshotVersion: 1 }, digest({ generationId: input.generationId ?? "", snapshotVersion: 1 }))];
@@ -2149,12 +1858,10 @@ export function buildGenerationAssemblySnapshot(
       credentialRevision,
       participantRevisions,
       worldRevisions,
+      databankRevisions,
       settingsRevision,
       variableRevision,
       regexRevisions,
-      contextRevision,
-      contextAttachmentRevision,
-      aclRevision,
       cognitionRevision,
       readinessRevision,
       runtimeEpochRevision,
@@ -2179,8 +1886,8 @@ export function buildGenerationAssemblySnapshot(
       variables,
       regexScripts: Object.freeze(regexScripts),
       worldInfo,
-      contextPacks,
-      contextPackSnapshot,
+      databank,
+      agentCognition,
       availability,
       connection,
       agentConfig: normalizedAgentConfig,
@@ -2203,11 +1910,9 @@ export function isGenerationAssemblySnapshotV1(value: unknown): value is Generat
     && typeof candidate.userId === "string"
     && (candidate.assemblySurface === "RESPONSE" || candidate.assemblySurface === "WORK")
     && typeof candidate.chatId === "string"
-    && candidate.contextPackSnapshot?.version === 1
-    && candidate.contextPackSnapshot.ownerId === candidate.userId
-    && Array.isArray(candidate.contextPackSnapshot.candidates)
-    && Array.isArray(candidate.contextPackSnapshot.candidateInputRevisions)
-    && Array.isArray(candidate.contextPacks?.contextRules)
+    && candidate.agentCognition?.schema === "present"
+    && candidate.agentCognition.cognitionGraph !== undefined
+    && candidate.agentCognition.cognitionSource !== undefined
     && candidate.availability?.extensionsExcluded === true
     && candidate.availability?.ambientSpindleExcluded === true
     && candidate.extensionData === null

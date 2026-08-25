@@ -3,6 +3,7 @@ import { effectiveRuntimeApi } from '@/api/effective-runtime'
 import type {
   EffectiveRuntimePublicResponseV1,
   EffectiveRuntimeRequestV1,
+  LoomRuntimePolicyV1,
 } from '@/types/effective-runtime'
 import { repairCategoryForCode } from '@/types/effective-runtime'
 import * as runtime from './agentRuntimeSelection'
@@ -16,13 +17,44 @@ resolveSpy.mockImplementation((request) => {
   resolveCalls.push(request)
   return resolveRuntime(request)
 })
+const runtimePolicy: LoomRuntimePolicyV1 = {
+  version: 1,
+  authoredValue: 'agentic',
+  effectiveValue: 'agentic',
+  source: 'reviewed_preset_default',
+  scope: 'preset',
+  cap: { authority: 'host', allowedModes: ['response', 'agentic'], reasonCode: null },
+  availability: { state: 'available', reasonCode: null },
+  presetRevision: 1,
+  transientSelection: null,
+  durableChatOverride: null,
+  repairAcknowledgement: {
+    state: 'not_required',
+    presetRevision: 1,
+    reasonCode: null,
+    acknowledgedAt: null,
+  },
+  nextTurnOnly: true,
+}
 
 
 function decision(
   request: EffectiveRuntimeRequestV1,
   overrides: Partial<EffectiveRuntimePublicResponseV1> = {},
 ): EffectiveRuntimePublicResponseV1 {
-  const generationType = request.target?.generationType ?? 'normal'
+  const requestedMode = overrides.requestedMode ?? runtimePolicy.authoredValue
+  const effectiveMode = overrides.effectiveMode ?? runtimePolicy.effectiveValue
+  const responsePolicy = overrides.runtimePolicy ?? {
+    ...runtimePolicy,
+    authoredValue: requestedMode,
+    effectiveValue: effectiveMode,
+  }
+  const runtimeDecisionToken = overrides.runtimeDecisionToken === undefined
+    ? 'one-use-token'
+    : overrides.runtimeDecisionToken
+  const runtimeDecisionExpiresAt = overrides.runtimeDecisionExpiresAt === undefined
+    ? (runtimeDecisionToken === null ? null : Date.now() + 60_000)
+    : overrides.runtimeDecisionExpiresAt
   return {
     version: 1,
     chatId: request.chatId,
@@ -37,12 +69,21 @@ function decision(
       credentialRevision: 1,
       candidateRevision: 1,
     },
+    inspection: {
+      version: 1,
+      surface: 'WORK',
+      checkpoint: 'WORK',
+      items: [],
+      effectiveEntryIds: [],
+    },
+    responseOmission: null,
     preset: { id: 'preset-1', label: 'Preset', revision: 1, source: 'chat' },
     agentsEnabled: true,
     allowedModes: ['response', 'agentic'],
     defaultMode: 'response',
-    requestedMode: request.mode ?? 'response',
-    effectiveMode: 'agentic',
+    requestedMode,
+    effectiveMode,
+    runtimePolicy: responsePolicy,
     chatOverride: null,
     capabilityReadiness: {
       ready: true,
@@ -53,8 +94,8 @@ function decision(
       responseEscape: 'available',
     },
     repairCodes: [],
-    runtimeDecisionToken: 'one-use-token',
-    runtimeDecisionExpiresAt: Date.now() + 60_000,
+    runtimeDecisionToken,
+    runtimeDecisionExpiresAt,
     ...overrides,
   }
 }
@@ -77,12 +118,37 @@ describe('agent runtime generation preparation', () => {
     expect(prepared.request).toBe(request)
     expect(resolveCalls).toHaveLength(0)
   })
+  test('does not publish a foreign response into the accepted runtime selection', async () => {
+    runtime.setOneTurnRuntimeMode('chat-1', 'agentic')
+    resolveRuntime = async (request) => ({
+      ...decision(request),
+      chatId: 'chat-foreign',
+    })
+
+    await expect(runtime.prepareAgentRuntimeRequest({
+      chat_id: 'chat-1',
+      generation_type: 'normal',
+    })).rejects.toMatchObject({ code: 'malformed_response' })
+
+    const snapshot = runtime.getRuntimeSelectionSnapshot('chat-1')
+    expect(snapshot.decision).toBeNull()
+    expect(snapshot.effectiveMode).toBeNull()
+    expect(snapshot.activeGenerationMode).toBeNull()
+    expect(snapshot.oneTurnMode).toBe('agentic')
+  })
 
   test('uses the unexpired display preflight token once for a durable Agentic decision', async () => {
     const request: EffectiveRuntimeRequestV1 = {
       chatId: 'chat-1',
       generationType: 'normal',
-      target: { generationType: 'normal' },
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
+      },
       requestEpoch: 1,
     }
     runtime.nextRuntimeRequestEpoch('chat-1')
@@ -165,6 +231,9 @@ describe('agent runtime generation preparation', () => {
         generationType: 'swipe',
         messageId: 'message-1',
         swipeId: 2,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
       },
       requestEpoch: 1,
     }), 1)
@@ -205,7 +274,14 @@ describe('agent runtime generation preparation', () => {
     runtime.publishRuntimeDecision(decision({
       chatId: 'chat-1',
       generationType: 'normal',
-      target: { generationType: 'normal', messageId: null, swipeId: null },
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
+      },
       requestEpoch: 1,
     }), 1)
 
@@ -235,7 +311,14 @@ describe('agent runtime generation preparation', () => {
     runtime.publishRuntimeDecision(decision({
       chatId: 'chat-1',
       generationType: 'normal',
-      target: { generationType: 'normal', messageId: null, swipeId: null },
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
+      },
       requestEpoch: 1,
     }, {
       effectiveMode: 'response',
@@ -261,7 +344,14 @@ describe('agent runtime generation preparation', () => {
     const authorityRequest: EffectiveRuntimeRequestV1 = {
       chatId: 'chat-1',
       generationType: 'normal',
-      target: { generationType: 'normal' },
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
+      },
       requestEpoch: 1,
     }
     runtime.nextRuntimeRequestEpoch('chat-1')
@@ -291,6 +381,9 @@ describe('agent runtime generation preparation', () => {
         generationType: 'swipe',
         messageId: 'message-1',
         swipeId: 1,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
       },
     })
     runtime.setOneTurnRuntimeMode('chat-1', 'agentic')
@@ -300,7 +393,7 @@ describe('agent runtime generation preparation', () => {
       generation_type: 'swipe',
       message_id: 'message-1',
       swipe_id: 2,
-    })).rejects.toMatchObject({ code: 'decision_refresh_required' })
+    })).rejects.toMatchObject({ code: 'malformed_response' })
 
     expect(resolveCalls[0].target?.swipeId).toBe(2)
   })
@@ -369,6 +462,35 @@ describe('agent runtime generation preparation', () => {
     deferred[1].resolve(decision(resolveCalls[1]))
     await second
   })
+  test('passive display refresh does not supersede a fresh Send preflight', async () => {
+    const deferred: Array<{
+      promise: Promise<EffectiveRuntimePublicResponseV1>
+      resolve(value: EffectiveRuntimePublicResponseV1): void
+    }> = []
+    resolveRuntime = () => {
+      const pending = Promise.withResolvers<EffectiveRuntimePublicResponseV1>()
+      deferred.push(pending)
+      return pending.promise
+    }
+    runtime.setOneTurnRuntimeMode('chat-1', 'agentic')
+
+    const send = runtime.prepareAgentRuntimeRequest({
+      chat_id: 'chat-1',
+      generation_type: 'normal',
+    }, { forceRuntimeRefresh: true })
+    expect(resolveCalls[0]?.requestEpoch).toBe(1)
+
+    const displayEpoch = runtime.nextRuntimeDisplayEpoch('chat-1')
+    const displayRequest = { ...resolveCalls[0], requestEpoch: displayEpoch }
+    const display = effectiveRuntimeApi.resolve(displayRequest)
+    expect(resolveCalls[1]?.requestEpoch).toBe(displayEpoch)
+
+    deferred[0].resolve(decision(resolveCalls[0]))
+    await send
+
+    deferred[1].resolve(decision(displayRequest))
+    await display
+  })
 
   test('rejects a slow preflight when the user switches to Response', async () => {
     const deferred: Array<{
@@ -401,7 +523,7 @@ describe('agent runtime generation preparation', () => {
       chat_id: 'chat-1',
       generation_type: 'swipe',
       message_id: 'message-1',
-    })).rejects.toMatchObject({ code: 'decision_refresh_required' })
+    })).rejects.toMatchObject({ code: 'malformed_response' })
     expect(runtime.getRuntimeSelectionSnapshot('chat-1').oneTurnMode).toBe('agentic')
   })
 
@@ -453,7 +575,14 @@ describe('agent runtime generation preparation', () => {
         personaId: 'persona-1',
         targetCharacterId: 'character-1',
         generationType: 'normal',
-        target: { generationType: 'normal', targetCharacterId: 'character-1' },
+        target: {
+          generationType: 'normal',
+          messageId: null,
+          swipeId: null,
+          branchId: null,
+          targetCharacterId: 'character-1',
+          revision: null,
+        },
         requestEpoch: 1,
       }
       runtime.nextRuntimeRequestEpoch('chat-1')
@@ -461,8 +590,9 @@ describe('agent runtime generation preparation', () => {
       runtime.publishRuntimeDecision(projected, 1, runtime.createRuntimeScopeFingerprint({
         chatId: request.chat_id,
         generationType: request.generation_type,
-        messageId: request.message_id,
-        swipeId: request.swipe_id,
+        messageId: null,
+        swipeId: null,
+        branchId: null,
         targetCharacterId: request.target_character_id,
         logicalConnectionId: request.connection_id,
         presetId: request.preset_id,
@@ -496,7 +626,14 @@ describe('agent runtime generation preparation', () => {
       personaId: 'persona-1',
       targetCharacterId: 'character-1',
       generationType: 'normal',
-      target: { generationType: 'normal', targetCharacterId: 'character-1' },
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: 'character-1',
+        revision: null,
+      },
       requestEpoch: 1,
     }
     runtime.nextRuntimeRequestEpoch('chat-1')
@@ -504,8 +641,9 @@ describe('agent runtime generation preparation', () => {
     runtime.publishRuntimeDecision(projected, 1, runtime.createRuntimeScopeFingerprint({
       chatId: request.chat_id,
       generationType: request.generation_type,
-      messageId: request.message_id,
-      swipeId: request.swipe_id,
+      messageId: null,
+      swipeId: null,
+      branchId: null,
       targetCharacterId: request.target_character_id,
       logicalConnectionId: request.connection_id,
       presetId: request.preset_id,
@@ -530,7 +668,14 @@ describe('agent runtime generation preparation', () => {
     const authorityRequest: EffectiveRuntimeRequestV1 = {
       chatId: 'chat-1',
       generationType: 'normal',
-      target: { generationType: 'normal' },
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
+      },
       requestEpoch: 1,
     }
     runtime.nextRuntimeRequestEpoch('chat-1')
@@ -574,6 +719,20 @@ describe('agent runtime generation preparation', () => {
     expect(runtime.agentRuntimeErrorTranslationKey(
       new runtime.AgentRuntimePreflightError('agentic_unsupported_surface', ['agentic_generation_type_unsupported']),
     )).toBe('agentRuntime.errors.agentic_unsupported_surface')
+  })
+
+  test('covers shared generation-path runtime, preflight, and unknown mappings', () => {
+    expect(runtime.agentRuntimeErrorTranslationKey({ body: { code: 'AGENTIC_PROVIDER_FAILURE' } }))
+      .toBe('agentRuntime.errors.agentic_provider_failure')
+    expect(runtime.agentRuntimeErrorTranslationKey({ body: { code: 'AGENTIC_SLOT_UNRESOLVED' } }))
+      .toBe('agentRuntime.repair.slot')
+    const preflight = new runtime.AgentRuntimePreflightError('agentic_unavailable', [])
+    expect(runtime.agentRuntimeErrorTranslationKey(preflight))
+      .toBe('agentRuntime.preflight.unavailable')
+    expect(runtime.agentRuntimePreflightTranslationKey(preflight))
+      .toBe('agentRuntime.preflight.unavailable')
+    expect(runtime.agentRuntimeErrorTranslationKey({ body: { code: 'NEW_RUNTIME_FAILURE' }, message: 'raw provider text' }))
+      .toBeNull()
   })
 
   test('maps stable readiness failures to actionable repair categories', () => {

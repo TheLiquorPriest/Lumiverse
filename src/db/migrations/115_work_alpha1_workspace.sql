@@ -172,6 +172,36 @@ CREATE INDEX IF NOT EXISTS idx_persistent_workspace_publications_source ON persi
 
 CREATE TRIGGER IF NOT EXISTS trg_persistent_workspace_publications_immutable_update
 BEFORE UPDATE ON persistent_workspace_publications
+WHEN NOT (
+  NEW.publication_id IS OLD.publication_id
+  AND NEW.workspace_id IS OLD.workspace_id
+  AND NEW.user_id IS OLD.user_id
+  AND NEW.category IS OLD.category
+  AND NEW.source_id IS OLD.source_id
+  AND NEW.source_revision IS OLD.source_revision
+  AND NEW.source_created_at IS OLD.source_created_at
+  AND NEW.source_updated_at IS OLD.source_updated_at
+  AND NEW.copy_json IS OLD.copy_json
+  AND NEW.copy_digest IS OLD.copy_digest
+  AND NEW.byte_count IS OLD.byte_count
+  AND NEW.published_at IS OLD.published_at
+  AND NEW.published_by IS OLD.published_by
+  AND NEW.revision IS OLD.revision
+  AND (
+    (
+      OLD.chat_id IS NOT NULL
+      AND NEW.chat_id IS NULL
+      AND NEW.source_provenance_json IS OLD.source_provenance_json
+      AND NEW.source_deleted_at IS OLD.source_deleted_at
+    )
+    OR (
+      NEW.chat_id IS OLD.chat_id
+      AND OLD.source_deleted_at IS NULL
+      AND NEW.source_deleted_at IS NOT NULL
+      AND NEW.source_provenance_json IS NOT OLD.source_provenance_json
+    )
+  )
+)
 BEGIN
   SELECT RAISE(ABORT, 'persistent workspace publications are immutable');
 END;
@@ -185,23 +215,94 @@ BEGIN
    WHERE workspace_id = NEW.workspace_id;
 END;
 
-INSERT OR IGNORE INTO persistent_workspaces (
-  workspace_id, user_id, chat_id, objective, metadata_json, progress_json, state, revision,
-  quota_tasks, quota_records, quota_submissions, quota_artifacts, quota_publications, quota_bytes,
-  created_at, updated_at
+-- Stage the exact deterministic legacy projection before any backfill.
+-- Bun swallows an intermediate constraint error, so the failed unique-index
+-- build is immediately followed by a missing-index assertion that propagates
+-- before any persistent workspace/session/publication backfill.
+DROP TABLE IF EXISTS temp.persistent_workspace_migration_projection;
+DROP TABLE IF EXISTS temp.persistent_workspace_migration_collision;
+DROP TABLE IF EXISTS temp.persistent_workspace_migration_guard;
+CREATE TEMP TABLE persistent_workspace_migration_projection (
+  workspace_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  state TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  quota_tasks INTEGER NOT NULL,
+  quota_records INTEGER NOT NULL,
+  quota_submissions INTEGER NOT NULL,
+  quota_artifacts INTEGER NOT NULL,
+  quota_publications INTEGER NOT NULL,
+  quota_bytes INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO persistent_workspace_migration_projection (
+  workspace_id, user_id, chat_id, objective, state, revision,
+  quota_tasks, quota_records, quota_submissions, quota_artifacts, quota_publications,
+  quota_bytes, created_at, updated_at
 )
-SELECT old.workspace_id, old.user_id, old.chat_id, old.objective, '{}', '{}',
+SELECT old.workspace_id, old.user_id, old.chat_id, old.objective,
        CASE old.state WHEN 'active' THEN 'active' ELSE 'archived' END,
-       old.revision, old.quota_tasks, old.quota_records, old.quota_submissions, old.quota_artifacts,
-       512, old.quota_bytes, old.created_at, old.updated_at
+       old.revision, old.quota_tasks, old.quota_records, old.quota_submissions,
+       old.quota_artifacts, 512, old.quota_bytes, old.created_at, old.updated_at
   FROM agent_turn_workspaces AS old
  WHERE old.workspace_id = (
    SELECT MIN(candidate.workspace_id)
      FROM agent_turn_workspaces AS candidate
-    WHERE candidate.user_id = old.user_id AND candidate.chat_id = old.chat_id
+    WHERE candidate.user_id = old.user_id
+      AND candidate.chat_id = old.chat_id
  );
+CREATE TEMP TABLE persistent_workspace_migration_guard (
+  valid INTEGER PRIMARY KEY CHECK(valid = 1)
+);
+INSERT INTO persistent_workspace_migration_guard (valid)
+SELECT 1
+  FROM temp.persistent_workspace_migration_projection
+ LIMIT 1;
+CREATE TEMP TABLE persistent_workspace_migration_collision (
+  collision INTEGER
+);
+INSERT INTO persistent_workspace_migration_collision (collision)
+SELECT 1
+  FROM temp.persistent_workspace_migration_projection AS projection
+  JOIN persistent_workspaces AS existing
+    ON existing.workspace_id = projection.workspace_id
+ WHERE NOT (
+   existing.user_id IS projection.user_id
+   AND existing.chat_id IS projection.chat_id
+   AND existing.objective IS projection.objective
+ )
+ LIMIT 1;
+INSERT INTO persistent_workspace_migration_collision (collision)
+SELECT collision
+  FROM persistent_workspace_migration_collision;
+CREATE UNIQUE INDEX persistent_workspace_migration_collision_guard
+  ON persistent_workspace_migration_collision(collision);
+DROP INDEX persistent_workspace_migration_collision_guard;
+DROP TABLE temp.persistent_workspace_migration_collision;
+DROP TABLE temp.persistent_workspace_migration_guard;
+INSERT INTO persistent_workspaces (
+  workspace_id, user_id, chat_id, objective, metadata_json, progress_json, state, revision,
+  quota_tasks, quota_records, quota_submissions, quota_artifacts, quota_publications, quota_bytes,
+  created_at, updated_at
+)
+SELECT projection.workspace_id, projection.user_id, projection.chat_id, projection.objective, '{}', '{}',
+       projection.state, projection.revision, projection.quota_tasks, projection.quota_records,
+       projection.quota_submissions, projection.quota_artifacts, projection.quota_publications,
+       projection.quota_bytes, projection.created_at, projection.updated_at
+  FROM temp.persistent_workspace_migration_projection AS projection
+ WHERE NOT EXISTS (
+   SELECT 1 FROM persistent_workspaces AS existing
+    WHERE existing.workspace_id = projection.workspace_id
+      AND existing.user_id = projection.user_id
+      AND existing.chat_id IS projection.chat_id
+      AND existing.objective IS projection.objective
+ );
+DROP TABLE temp.persistent_workspace_migration_projection;
 
-INSERT OR IGNORE INTO persistent_workspace_turn_sessions (
+INSERT INTO persistent_workspace_turn_sessions (
   turn_session_id, workspace_id, user_id, chat_id, turn_id, attempt_id, execution_id,
   phase, status, outcome, reason, revision, created_at, updated_at, terminal_at
 )
@@ -224,18 +325,21 @@ SELECT old.workspace_id, stable.workspace_id, old.user_id, old.chat_id, old.turn
        END,
        CASE
          WHEN execution.state = 'COMMITTED' THEN 'completed'
-         WHEN execution.state IN ('COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+         WHEN execution.state = 'CANCELLED' THEN 'stopped'
+         WHEN execution.state = 'TIMED_OUT' THEN 'failed'
+         WHEN execution.state = 'EXHAUSTED' THEN 'exhausted'
+         WHEN execution.state IN ('COMMIT_FAILED', 'FAILED')
            AND lower(COALESCE(execution.terminal_code, '')) IN ('cancelled', 'canceled', 'stopped', 'user_stop', 'accepted_cancellation', 'agentic_cancelled')
            THEN 'stopped'
-         WHEN execution.state IN ('COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+         WHEN execution.state IN ('COMMIT_FAILED', 'FAILED')
+           AND lower(COALESCE(execution.terminal_code, '')) <> 'root_wall_clock_limit_exceeded'
            AND (
-             lower(COALESCE(execution.terminal_code, '')) IN ('exhausted', 'budget_exhausted', 'budget_exceeded', 'limit_exceeded', 'agentic_work_exhausted', 'root_wall_clock_limit_exceeded')
+             lower(COALESCE(execution.terminal_code, '')) IN ('exhausted', 'budget_exhausted', 'budget_exceeded', 'limit_exceeded', 'agentic_work_exhausted')
              OR lower(COALESCE(execution.terminal_code, '')) LIKE '%_limit_exceeded'
              OR lower(COALESCE(execution.terminal_code, '')) LIKE '%_budget_exhausted'
              OR lower(COALESCE(execution.terminal_code, '')) LIKE '%_budget_exceeded'
            ) THEN 'exhausted'
-         WHEN execution.state = 'EXHAUSTED' THEN 'exhausted'
-         WHEN execution.state IN ('CANCELLED', 'TIMED_OUT', 'FAILED', 'COMMIT_FAILED') THEN 'failed'
+         WHEN execution.state IN ('COMMIT_FAILED', 'FAILED') THEN 'failed'
          ELSE NULL
        END,
        CASE
@@ -255,22 +359,67 @@ SELECT old.workspace_id, stable.workspace_id, old.user_id, old.chat_id, old.turn
    AND execution.user_id = old.user_id
    AND execution.chat_id = old.chat_id
   JOIN persistent_workspaces AS stable
-    ON stable.user_id = old.user_id AND stable.chat_id = old.chat_id;
+    ON stable.user_id = old.user_id AND stable.chat_id = old.chat_id
+ WHERE NOT EXISTS (
+   SELECT 1 FROM persistent_workspace_turn_sessions AS existing
+    WHERE existing.turn_session_id = old.workspace_id
+      AND existing.workspace_id = stable.workspace_id
+      AND existing.user_id = old.user_id
+      AND existing.chat_id IS old.chat_id
+      AND existing.turn_id = old.turn_id
+      AND existing.attempt_id = execution.id
+      AND existing.execution_id IS execution.id
+ );
 
 
-INSERT OR IGNORE INTO persistent_workspace_publications (
+INSERT INTO persistent_workspace_publications (
   publication_id, workspace_id, user_id, chat_id, category, source_id, source_revision,
   source_provenance_json, source_created_at, source_updated_at, source_deleted_at, copy_json,
   copy_digest, byte_count, published_at, published_by, revision
 )
 SELECT old.published_artifact_id, stable.workspace_id, old.user_id, old.chat_id, 'artifact', old.source_artifact_id, 1,
-       json_object('workspaceId', stable.workspace_id, 'turnSessionId', NULL, 'attemptId', NULL, 'creator', 'migration:106', 'capturedAt', old.created_at),
+       json_object(
+         'workspaceId', stable.workspace_id,
+         'turnSessionId', session.turn_session_id,
+         'attemptId', session.attempt_id,
+         'executionId', session.execution_id,
+         'sourceChatId', old.chat_id,
+         'creator', 'migration:106',
+         'capturedAt', old.created_at
+       ),
        old.created_at, old.created_at, NULL,
        json_object('category', 'artifact', 'id', old.source_artifact_id, 'blobDigest', old.blob_digest, 'mimeType', old.mime_type, 'byteCount', old.byte_count, 'provenance', 'migration:106'),
        old.digest, old.byte_count, old.created_at, 'migration:106', 1
   FROM agent_published_workspace_artifacts AS old
   JOIN persistent_workspaces AS stable
-    ON stable.user_id = old.user_id AND stable.chat_id = old.chat_id;
+    ON stable.user_id = old.user_id AND stable.chat_id = old.chat_id
+  LEFT JOIN agent_workspace_artifacts AS source
+    ON source.artifact_id = old.source_artifact_id
+   AND source.user_id = old.user_id
+   AND source.chat_id = old.chat_id
+  LEFT JOIN persistent_workspace_turn_sessions AS session
+    ON session.turn_session_id = source.workspace_id
+   AND session.workspace_id = stable.workspace_id
+   AND session.user_id = old.user_id
+ WHERE NOT EXISTS (
+   SELECT 1 FROM persistent_workspace_publications AS existing
+    WHERE existing.publication_id = old.published_artifact_id
+      AND existing.workspace_id = stable.workspace_id
+      AND existing.user_id = old.user_id
+      AND existing.chat_id IS old.chat_id
+      AND existing.category = 'artifact'
+      AND existing.source_id = old.source_artifact_id
+      AND existing.source_revision = 1
+      AND existing.source_provenance_json IS json_object(
+        'workspaceId', stable.workspace_id,
+        'turnSessionId', session.turn_session_id,
+        'attemptId', session.attempt_id,
+        'executionId', session.execution_id,
+        'sourceChatId', old.chat_id,
+        'creator', 'migration:106',
+        'capturedAt', old.created_at
+      )
+ );
 
 UPDATE persistent_workspaces AS workspace
    SET task_count = (SELECT COUNT(*) FROM persistent_workspace_tasks WHERE workspace_id = workspace.workspace_id),

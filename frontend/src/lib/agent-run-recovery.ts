@@ -18,6 +18,8 @@ const MAX_RUN_RECOVERY_PAGES = 64
 export interface AgentRunRecoveryApi {
   inspection: typeof agentRunsApi.inspection
   retry: typeof agentRunsApi.retry
+  persistentWorkspace: typeof agentRunsApi.persistentWorkspace
+  persistentWorkspaceById: typeof agentRunsApi.persistentWorkspaceById
   persistentWorkspaceSessions: typeof agentRunsApi.persistentWorkspaceSessions
   persistentWorkspaceTasks: typeof agentRunsApi.persistentWorkspaceTasks
   persistentWorkspaceRecords: typeof agentRunsApi.persistentWorkspaceRecords
@@ -72,8 +74,8 @@ function inspectionFailureAvailability(error: unknown): 'missing' | 'deleted' | 
   }
   return 'unavailable'
 }
-function persistentWorkspaceScope(chatId: string, workspaceId?: string | null): string {
-  return workspaceId ? `id:${workspaceId}` : `chat:${chatId}`
+function persistentWorkspaceScope(chatId: string | null | undefined, workspaceId?: string | null): string {
+  return workspaceId ? `id:${workspaceId}` : `chat:${chatId ?? ''}`
 }
 function requestErrorMessage(error: unknown): string | null {
   return error instanceof Error && error.message ? error.message : null
@@ -104,7 +106,12 @@ export function recoverAgentRuns(
     for (let page = 0; page < MAX_RUN_RECOVERY_PAGES; page += 1) {
       const payload = await api.changes(chatId, cursor)
       const applied = store.getState().applyAgentRunChanges(chatId, requestEpoch, payload)
-      if (!applied) return
+      if (!applied) {
+        // A malformed or out-of-scope response must not leave the chat in
+        // `restoring`; the epoch guard in the store preserves any newer retry.
+        store.getState().failAgentRunRestore(chatId, requestEpoch)
+        return
+      }
       const current = store.getState()
       const incompleteResync = payload.resync
         && payload.resyncPage?.complete === false
@@ -205,7 +212,7 @@ export function retryAgentRunInspection(
 }
 
 export function loadPersistentWorkspace(
-  chatId: string,
+  chatId: string | null | undefined,
   api: AgentRunPersistentWorkspaceApi,
   store: AgentRunRecoveryStore,
   workspaceId?: string | null,
@@ -217,8 +224,8 @@ export function loadPersistentWorkspace(
   if (existing) return existing
   const requestEpoch = store.getState().beginPersistentWorkspaceRequest(scope)
   const request = (workspaceId
-    ? api.persistentWorkspaceById(workspaceId, chatId || undefined)
-    : api.persistentWorkspace(chatId)
+    ? api.persistentWorkspaceById(workspaceId)
+    : api.persistentWorkspace(chatId!)
   )
     .then((payload) => {
       store.getState().applyPersistentWorkspace(scope, requestEpoch, payload)

@@ -11,8 +11,11 @@ import {
 } from "../services/agent-run-projection.service";
 import {
   getAgentRunInspection,
+  isValidAgentRunInspectionCursor,
   listAgentRunInspections,
 } from "../services/agent-activity-runs.service";
+import { parsePagination } from "../services/pagination";
+import type { PaginationParams } from "../types/pagination";
 import { AgenticGenerationError, retryAgenticGeneration } from "../services/agentic-generation.service";
 import {
   createPersistentWorkspaceTask,
@@ -28,6 +31,7 @@ import {
   listPersistentWorkspaceSubmissions,
   listPersistentWorkspaceTasks,
   listPersistentWorkspaceTurnSessions,
+  PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET,
   publishPersistentWorkspaceSelection,
   TurnWorkspaceError,
 } from "../services/turn-workspace.service";
@@ -244,6 +248,21 @@ function persistentError(c: Context, error: unknown): Response {
   }
   return routeError(c, 400, "invalid_request", "workspace_request_failed");
 }
+function persistentSessionPagination(c: Context): PaginationParams | null {
+  const rawOffset = c.req.query("offset");
+  if (rawOffset === undefined) return parsePagination(c.req.query("limit"), undefined);
+  const offset = Number(rawOffset);
+  if (
+    rawOffset === ""
+    || !Number.isSafeInteger(offset)
+    || offset < 0
+    || offset > PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET
+  ) {
+    return null;
+  }
+  return { ...parsePagination(c.req.query("limit"), undefined), offset };
+}
+
 
 function routeRevision(c: Context, body?: PersistentRouteBody): number | null {
   const query = c.req.query("revision") ?? c.req.query("expectedRevision");
@@ -371,7 +390,9 @@ app.get("/workspace/:workspaceId/sessions", (c) => {
   const workspace = routeWorkspace(c);
   if (workspace instanceof Response) return workspace;
   try {
-    return c.json(listPersistentWorkspaceTurnSessions(workspaceReadContext(c, workspace)));
+    const pagination = persistentSessionPagination(c);
+    if (pagination === null) return routeError(c, 400, "invalid_request", "invalid_workspace_sessions_page");
+    return c.json(listPersistentWorkspaceTurnSessions(workspaceReadContext(c, workspace), pagination));
   } catch (error) {
     return persistentError(c, error);
   }
@@ -530,7 +551,7 @@ function inspectionLimit(c: Context): number | undefined | null {
 function inspectionCursor(c: Context): string | undefined | null {
   const raw = c.req.query("cursor");
   if (raw === undefined || raw === "") return raw === undefined ? undefined : null;
-  return /^[0-9]+$/.test(raw) ? raw : null;
+  return isValidAgentRunInspectionCursor(raw) ? raw : null;
 }
 
 function inspectionList(c: Context, chatId: string | undefined): Response {

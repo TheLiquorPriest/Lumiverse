@@ -1,6 +1,6 @@
 -- Corrective integrity gates for archive, workspace, and publication digest ledgers.
 --
--- Migrations 104, 106, and 107 are already present in deployed databases, so
+-- Migrations 104 and 106 are already present in deployed databases, so
 -- their permissive historical GLOB checks cannot be rewritten in place. These
 -- triggers provide the same fail-closed invariant for existing schemas while
 -- keeping old rows untouched: every SHA-256 value is exactly 64 lowercase
@@ -247,22 +247,3 @@ BEGIN
   SELECT RAISE(ABORT, 'digest must be 64 lowercase hexadecimal characters');
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_agent_context_pack_revisions_content_digest_insert
-BEFORE INSERT ON agent_context_pack_revisions
-WHEN typeof(NEW.content_digest) <> 'text'
-  OR length(NEW.content_digest) <> 64
-  OR lower(NEW.content_digest) <> NEW.content_digest
-  OR NEW.content_digest GLOB '*[^0-9a-f]*'
-BEGIN
-  SELECT RAISE(ABORT, 'content_digest must be 64 lowercase hexadecimal characters');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_agent_context_pack_revisions_content_digest_update
-BEFORE UPDATE OF content_digest ON agent_context_pack_revisions
-WHEN typeof(NEW.content_digest) <> 'text'
-  OR length(NEW.content_digest) <> 64
-  OR lower(NEW.content_digest) <> NEW.content_digest
-  OR NEW.content_digest GLOB '*[^0-9a-f]*'
-BEGIN
-  SELECT RAISE(ABORT, 'content_digest must be 64 lowercase hexadecimal characters');
-END;

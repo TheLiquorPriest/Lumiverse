@@ -229,8 +229,25 @@ const MockVariablesEditor = ({
 )
 mock.module('./PromptVariablesEditor', () => ({ VariablesEditor: MockVariablesEditor }))
 mock.module('@/components/shared/ConfirmationModal', () => ({
-  default: ({ isOpen, title }: { isOpen: boolean; title?: string }) => (
-    isOpen ? createElement('div', { 'data-testid': 'confirmation-modal' }, title) : null
+  default: ({
+    isOpen,
+    title,
+    onConfirm,
+  }: {
+    isOpen: boolean
+    title?: string
+    onConfirm?: () => void
+  }) => (
+    isOpen ? createElement(
+      'div',
+      { 'data-testid': 'confirmation-modal' },
+      title,
+      onConfirm ? createElement('button', {
+        type: 'button',
+        'data-testid': 'confirmation-confirm',
+        onClick: onConfirm,
+      }, 'confirm') : null,
+    ) : null
   ),
 }))
 mock.module('@/components/shared/NumberStepper', () => ({ default: NullComponent }))
@@ -238,7 +255,13 @@ mock.module('@/components/shared/PanelFadeIn', () => ({
   default: ({ children }: { children?: ReactNode }) => children ?? null,
 }))
 mock.module('@/components/shared/Toggle', () => ({ Toggle: MockToggle }))
-mock.module('@/lib/toast', () => ({ toast: {} }))
+mock.module('@/lib/toast', () => ({
+  toast: {
+    error: (message: string) => {
+      toastRequests.push({ type: 'error', message })
+    },
+  },
+}))
 mock.module('@/components/spindle/SpindlePresetEditorTabContent', () => ({ default: NullComponent }))
 mock.module('@/components/spindle/SpindlePresetEditorToolbarItem', () => ({ default: NullComponent }))
 mock.module('./AgenticRuntimePanel', () => ({ default: MockAgenticRuntimePanel }))
@@ -783,6 +806,39 @@ describe('controlled Loom editor trust boundary', () => {
 
     expect(draftInput.value).toBe('Dirty draft')
     expect(agentPanelMountCount).toBe(1)
+    unmountRoot(root)
+  })
+  test('keeps legacy export confirmation open and reports sealed export failures', () => {
+    configureMainLoomState()
+    let exportCalls = 0
+    Object.assign(mainLoomState, {
+      exportLegacy: () => {
+        exportCalls += 1
+        throw new Error('LUMIHUB_SEALED_DESCRIPTOR_INCOMPLETE')
+      },
+    })
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    flushSync(() => root.render(createElement(LoomBuilder, { compact: true })))
+    mountedRoots.add(root)
+
+    const menuButton = container.querySelector<HTMLButtonElement>('button[title="preset.moreOptions"]')
+    expect(menuButton).not.toBeNull()
+    flushSync(() => menuButton!.click())
+    const exportButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent === 'preset.exportLegacy')
+    expect(exportButton).toBeDefined()
+    flushSync(() => exportButton!.click())
+    expect(container.querySelector('[data-testid="confirmation-modal"]')).not.toBeNull()
+
+    flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="confirmation-confirm"]')!.click())
+    expect(exportCalls).toBe(1)
+    expect(container.querySelector('[data-testid="confirmation-modal"]')).not.toBeNull()
+    expect(toastRequests.at(-1)).toEqual({
+      type: 'error',
+      message: 'toast.portableErrors.LUMIHUB_SEALED_DESCRIPTOR_INCOMPLETE',
+    })
     unmountRoot(root)
   })
 

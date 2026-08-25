@@ -308,4 +308,46 @@ describe("canonical custom Phased Instructions machine", () => {
       expect.objectContaining({ checkpoint: "skip", condition: "false" }),
     ]));
   });
+
+  test("fails closed when the host snapshot is absent and keeps that result sticky", () => {
+    const required = compile([
+      phase({ id: "required", instructionRefs: [sourceRef("required")] }),
+    ], [sourceRef("required")]);
+    const requiredMachine = createAgentRuntimePhaseMachine(required);
+    expect(requiredMachine.enter({
+      revision: 1,
+      snapshotAvailable: false,
+      context: context(),
+    })).toMatchObject({
+      status: "failed",
+      condition: "invalid",
+      reason: expect.stringMatching(/failed closed/i),
+    });
+    expect(requiredMachine.enter({
+      revision: 1,
+      context: context(),
+    })).toMatchObject({ status: "noop", condition: "omitted" });
+    expect(requiredMachine.state().status).toBe("failed");
+
+    const optional = compile([
+      phase({
+        id: "optional",
+        required: false,
+        instructionRefs: [sourceRef("optional")],
+      }),
+    ], [sourceRef("optional")]);
+    const optionalMachine = createAgentRuntimePhaseMachine(optional);
+    expect(optionalMachine.enter({
+      revision: 4,
+      snapshotAvailable: false,
+      context: context(),
+    })).toMatchObject({
+      status: "completed",
+      condition: "invalid",
+    });
+    expect(optionalMachine.evidence()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: "skipped", condition: "invalid", required: false }),
+    ]));
+    expect(optionalMachine.state().status).toBe("completed");
+  });
 });

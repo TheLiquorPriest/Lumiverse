@@ -56,6 +56,9 @@ export interface PersistentWorkspacePublicationDeleteInput {
 export interface PersistentWorkspaceInspectorProps {
   workspace: AgentPersistentWorkspaceV1 | null
   sessions?: readonly AgentPersistentWorkspaceTurnSessionV1[]
+  sessionsTotal?: number
+  sessionsHasMore?: boolean
+  sessionsLoadingMore?: boolean
   tasks?: readonly AgentPersistentWorkspaceTaskV1[]
   records?: readonly AgentPersistentWorkspaceRecordV1[]
   submissions?: readonly AgentPersistentWorkspaceSubmissionV1[]
@@ -70,6 +73,7 @@ export interface PersistentWorkspaceInspectorProps {
   onDeletePublication: (input: PersistentWorkspacePublicationDeleteInput) => void | Promise<void>
   onDeleteWorkspace: (expectedRevision: number) => void | Promise<void>
   onOpenTurnSession?: (session: AgentPersistentWorkspaceTurnSessionV1) => void
+  onLoadMoreSessions?: () => void | Promise<void>
   className?: string
 }
 
@@ -92,9 +96,11 @@ function isRevisionConflict(error: unknown): boolean {
   return statusConflict || errorCode(error) === 'stale_revision' || errorCode(error) === 'task_assignment_conflict'
 }
 
+const MAX_DATE_SECONDS = 8_640_000_000_000_000 / 1_000
+
 function dateLabel(seconds: number | null | undefined): string {
-  if (!seconds) return '—'
-  const date = new Date(seconds * 1000)
+  if (typeof seconds !== 'number' || !Number.isSafeInteger(seconds) || seconds < 0 || seconds > MAX_DATE_SECONDS) return '—'
+  const date = new Date(seconds * 1_000)
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
 }
 
@@ -158,10 +164,12 @@ function RevisionMeta({ revision, updatedAt }: { revision: number; updatedAt: nu
     </div>
   )
 }
-
 export function PersistentWorkspaceInspector({
   workspace,
   sessions = [],
+  sessionsTotal = sessions.length,
+  sessionsHasMore = sessionsTotal > sessions.length,
+  sessionsLoadingMore = false,
   tasks = [],
   records = [],
   submissions = [],
@@ -176,6 +184,7 @@ export function PersistentWorkspaceInspector({
   onDeletePublication,
   onDeleteWorkspace,
   onOpenTurnSession,
+  onLoadMoreSessions,
   className,
 }: PersistentWorkspaceInspectorProps) {
   const { t } = useTranslation('chat')
@@ -235,7 +244,7 @@ export function PersistentWorkspaceInspector({
     const options: Array<{ value: string; label: string; category: WorkspacePublicationCategory; revision?: number; digest?: string }> = []
     if (workspace) options.push({ value: workspace.id, label: t('persistentWorkspace.objectiveSource'), category: 'objective', revision: workspace.revision })
     for (const task of tasks) options.push({ value: task.id, label: `${t('persistentWorkspace.taskSource')}: ${task.title}`, category: 'task', revision: task.revision })
-    for (const record of records) options.push({ value: record.id, label: `${t('persistentWorkspace.recordSource')}: ${record.content.summary}`, category: 'finding', revision: record.revision })
+    for (const record of records) if (record.kind === 'finding') options.push({ value: record.id, label: `${t('persistentWorkspace.recordSource')}: ${record.content.summary}`, category: 'finding', revision: record.revision })
     for (const artifact of artifacts) options.push({ value: artifact.id, label: `${t('persistentWorkspace.artifactSource')}: ${artifact.mimeType}`, category: 'artifact', revision: artifact.revision, digest: artifact.blobDigest })
     return options
   }, [artifacts, records, t, tasks, workspace])
@@ -366,7 +375,7 @@ export function PersistentWorkspaceInspector({
   const detached = workspace.chatId === null
   const archived = workspace.state === 'archived'
   const sourceDeleted = detached || archived
-  const canEdit = !archived
+  const canEdit = !archived && !detached
   const selectedPublication = publishOptions.find((option) => option.value === publicationSourceId)
   const selectedSourceLabel = selectedPublication?.label ?? t('persistentWorkspace.selectSource')
 
@@ -500,14 +509,14 @@ export function PersistentWorkspaceInspector({
             </section>
 
             <section className={styles.card}>
-              <SectionHeading icon={<Link2 aria-hidden="true" />} title={t('persistentWorkspace.turnSessions')} count={sessions.length} open={openSections.sessions} onToggle={() => toggleSection('sessions')} id="persistent-workspace-sessions" />
+              <SectionHeading icon={<Link2 aria-hidden="true" />} title={t('persistentWorkspace.turnSessions')} count={sessionsTotal} open={openSections.sessions} onToggle={() => toggleSection('sessions')} id="persistent-workspace-sessions" />
               {openSections.sessions ? (
                 <div id="persistent-workspace-sessions" className={styles.cardBody}>
-                  {sessions.length === 0 ? <p className={styles.emptyInline}>{t('persistentWorkspace.noTurnSessions')}</p> : (
+                  {sessions.length === 0 && sessionsTotal === 0 ? <p className={styles.emptyInline}>{t('persistentWorkspace.noTurnSessions')}</p> : (
                     <ul className={styles.sessionList}>
                       {sessions.map((session) => (
                         <li key={session.id} className={styles.sessionRow}>
-                          <div><strong>{displayId(session.turnId)}</strong><span>{t('persistentWorkspace.sessionAttempt', { id: displayId(session.attemptId) })}</span></div>
+                          <div><strong>{displayId(session.turnId)}</strong><span>{t('persistentWorkspace.sessionAttempt', { id: displayId(session.attemptId) })}</span><span>{session.chatId ? t('persistentWorkspace.sourceChat', { id: displayId(session.chatId) }) : t('persistentWorkspace.sourceChatDeleted')}</span></div>
                           <div className={styles.entryBadges}><StateBadge tone={session.outcome === 'completed' ? 'success' : session.outcome ? 'warning' : 'neutral'}>{t(`persistentWorkspace.sessionStatus.${session.status}`)}</StateBadge><span>{t(`persistentWorkspace.sessionPhase.${session.phase}`)}</span></div>
                           {session.outcome ? <span className={styles.sessionOutcome}>{t(`persistentWorkspace.sessionOutcome.${session.outcome}`)}</span> : null}
                           {onOpenTurnSession ? <Button type="button" variant="ghost" size="sm" onClick={() => onOpenTurnSession(session)} icon={<ChevronRight aria-hidden="true" />}>{t('persistentWorkspace.inspectTurnSession')}</Button> : null}
@@ -515,6 +524,12 @@ export function PersistentWorkspaceInspector({
                       ))}
                     </ul>
                   )}
+                  {sessionsHasMore ? (
+                    <div className={styles.formActions}>
+                      <span className={styles.fieldMeta} role="status">{t('persistentWorkspace.sessionsShowing', { shown: sessions.length, total: sessionsTotal })}</span>
+                      {onLoadMoreSessions ? <Button type="button" variant="secondary" onClick={() => void onLoadMoreSessions()} loading={sessionsLoadingMore} disabled={sessionsLoadingMore}>{t('persistentWorkspace.sessionsShowMore')}</Button> : null}
+                    </div>
+                  ) : null}
                   <p className={styles.boundaryHint}>{t('persistentWorkspace.turnSessionBoundary')}</p>
                 </div>
               ) : null}
@@ -557,7 +572,7 @@ export function PersistentWorkspaceInspector({
                             {task.dependencyIds.length > 0 ? <span>{t('persistentWorkspace.dependencies', { count: task.dependencyIds.length })}</span> : null}
                           </div>
                           <div className={styles.entryProgress}><span>{task.progress.summary || t('persistentWorkspace.noProgress')}</span><span>{percentValue(task.progress.percent)}%</span></div>
-                          <div className={styles.entryFooter}><span>{t('persistentWorkspace.revision', { revision: task.revision })}</span><span>{t('persistentWorkspace.createdAt', { date: dateLabel(task.createdAt) })}</span><span>{t('persistentWorkspace.creator', { creator: t(`persistentWorkspace.creators.${task.creator}`) })}</span></div>
+                          <div className={styles.entryFooter}><span>{t('persistentWorkspace.revision', { revision: task.revision })}</span><span>{t('persistentWorkspace.createdAt', { date: dateLabel(task.createdAt) })}</span><span>{t('persistentWorkspace.creator', { creator: t(`persistentWorkspace.creators.${task.creator}`) })}</span><span>{task.chatId ? t('persistentWorkspace.sourceChat', { id: displayId(task.chatId) }) : t('persistentWorkspace.sourceChatDeleted')}</span></div>
                         </li>
                       ))}
                     </ul>

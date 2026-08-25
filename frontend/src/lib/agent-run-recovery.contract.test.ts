@@ -11,6 +11,7 @@ import type { AgentRunsSlice, AppStore } from '@/types/store'
 import { createAgentRunsSlice } from '@/store/slices/agent-runs'
 import {
   loadAgentRunInspection,
+  loadPersistentWorkspace,
   loadPersistentWorkspaceCollection,
   retryAgentRunInspection,
 } from './agent-run-recovery'
@@ -30,6 +31,10 @@ const useStore = create<TestStore>()((set, get, api) => ({
 let inspectionImpl: (attemptId: string, chatId?: string) => Promise<AgentRunInspectionDetailV1>
 let retryImpl: (attemptId: string) => Promise<AgentRunInspectionRetryResponseV1>
 let submissionsImpl: (workspaceId: string) => Promise<AgentPersistentWorkspaceSubmissionV1[]>
+let persistentWorkspaceImpl: typeof agentRunsApi.persistentWorkspace
+let persistentWorkspaceByIdImpl: typeof agentRunsApi.persistentWorkspaceById
+let persistentWorkspaceRequests: string[] = []
+let persistentWorkspaceByIdRequests: Array<{ workspaceId: string; chatId?: string | null }> = []
 let inspectionRequests: Array<{ attemptId: string; chatId?: string }> = []
 const recoveryApi: AgentRunRecoveryApi = {
   ...agentRunsApi,
@@ -38,6 +43,14 @@ const recoveryApi: AgentRunRecoveryApi = {
     return inspectionImpl(attemptId, chatId)
   },
   retry: (attemptId) => retryImpl(attemptId),
+  persistentWorkspace: (chatId) => {
+    persistentWorkspaceRequests.push(chatId)
+    return persistentWorkspaceImpl(chatId)
+  },
+  persistentWorkspaceById: (workspaceId, chatId) => {
+    persistentWorkspaceByIdRequests.push({ workspaceId, chatId })
+    return persistentWorkspaceByIdImpl(workspaceId, chatId)
+  },
   persistentWorkspaceSubmissions: (workspaceId) => submissionsImpl(workspaceId),
 }
 
@@ -95,7 +108,14 @@ beforeEach(() => {
   }
   retryImpl = async () => retryResponse()
   submissionsImpl = async () => []
-  inspectionRequests = []
+  persistentWorkspaceImpl = async () => {
+    throw new Error('persistent workspace implementation not configured')
+  }
+  persistentWorkspaceByIdImpl = async () => {
+    throw new Error('persistent workspace by ID implementation not configured')
+  }
+  persistentWorkspaceRequests = []
+  persistentWorkspaceByIdRequests = []
   useStore.setState({
     activeChatId: 'chat-a',
     agentRunInspectionByAttemptId: {},
@@ -132,12 +152,20 @@ describe('public owner inspection recovery', () => {
   })
 
   test('passes the exact attempt and chat IDs without local aliases', async () => {
+    const requests: Array<{ attemptId: string; chatId?: string }> = []
+    const scopedApi: AgentRunRecoveryApi = {
+      ...recoveryApi,
+      inspection: (attemptId, chatId) => {
+        requests.push({ attemptId, chatId })
+        return inspectionImpl(attemptId, chatId)
+      },
+    }
     inspectionImpl = async () => {
       throw new ApiError(404, 'missing')
     }
 
-    await loadAgentRunInspection('chat-a', 'attempt/client alias', recoveryApi, recoveryStore)
-    expect(inspectionRequests).toEqual([{
+    await loadAgentRunInspection('chat-a', 'attempt/client alias', scopedApi, recoveryStore)
+    expect(requests).toEqual([{
       attemptId: 'attempt/client alias',
       chatId: 'chat-a',
     }])
@@ -188,4 +216,26 @@ describe('public Persistent Workspace recovery', () => {
       error: null,
     })
   })
+  test('uses the stable workspace ID after source deletion despite a retained chat ID', async () => {
+    persistentWorkspaceByIdImpl = async () => {
+      throw new ApiError(404, 'detached workspace missing')
+    }
+
+    await loadPersistentWorkspace('chat-deleted', recoveryApi, recoveryStore, 'workspace-a')
+
+    expect(persistentWorkspaceRequests).toEqual([])
+    expect(persistentWorkspaceByIdRequests).toEqual([{
+      workspaceId: 'workspace-a',
+      chatId: undefined,
+    }])
+    expect(useStore.getState().agentPersistentWorkspaceRequestEpochByKey).toEqual({
+      'id:workspace-a': 1,
+    })
+    expect(useStore.getState().agentPersistentWorkspaceById['workspace-a']).toMatchObject({
+      status: 'error',
+      availability: 'missing',
+      workspace: null,
+    })
+  })
+
 })

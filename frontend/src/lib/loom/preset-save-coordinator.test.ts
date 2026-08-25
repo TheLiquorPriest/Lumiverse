@@ -26,12 +26,14 @@ function rawPreset(overrides: Partial<Preset> = {}): Preset {
     created_at: 1,
     updated_at: 2,
     ...overrides,
+    engine: overrides.engine ?? 'classic',
   }
 }
 
 function persistedFromUpdate(presetId: string, input: UpdatePresetInput): Preset {
   return rawPreset({
     id: presetId,
+    engine: input.engine ?? 'classic',
     name: input.name ?? 'Coordinator test',
     parameters: input.parameters ?? {},
     prompt_order: input.prompt_order ?? [],

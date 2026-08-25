@@ -5,6 +5,7 @@ import type { AgentConfigV2 } from "../types/agents";
 import type { AgentToolSnapshot } from "../types/agents";
 import type { WorldBook } from "../types/world-book";
 
+import type { PrecomputedWorldInfoVectorEntries } from "../services/prompt-assembly.service";
 import type { LoomPromptInspectionV1 } from "../types/agent-cognition";
 
 export type { ProviderCapabilities, ToolContinuationMode } from "./param-schema";
@@ -414,9 +415,10 @@ export interface AssemblyContext {
   councilNamedResults?: Record<string, string>;
   /** Prior retained council deliberations formatted as a historical baseline block. */
   councilHistoricalDeliberationBlock?: string;
-  /** Pre-computed vector-activated world info entries from the generation pipeline.
-   *  When provided, assembly reuses these instead of re-running vector retrieval. */
-  precomputedVectorEntries?: import("../services/prompt-assembly.service").VectorActivatedEntry[];
+  /** Pre-computed vector-activated World Info from the generation pipeline.
+   *  Assembly reuses it only when its immutable source fingerprint matches the
+   *  current native World Info snapshot. */
+  precomputedVectorEntries?: PrecomputedWorldInfoVectorEntries;
   /** User-provided feedback text for regeneration guidance. */
   regenFeedback?: string;
   /** Where to inject regen feedback: 'system' (last system msg) or 'user' (last user msg). */

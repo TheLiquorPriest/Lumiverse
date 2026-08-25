@@ -52,6 +52,18 @@ describe('preset editor draft adapter', () => {
     expect(next.blocks[0]?.placementBinding).toEqual(block.placementBinding)
   })
 
+  test('projects agent-runtime block revisions out of the public draft and restores them on save', () => {
+    const current = createNewLoomPreset('Agent-runtime revision source')
+    current.blocks[0] = { ...current.blocks[0]!, revision: 3 }
+
+    const draft = toPresetEditorDraft(current)
+
+    expect(Object.hasOwn(draft.blocks[0]!, 'revision')).toBe(false)
+
+    const next = applyPresetEditorDraft(current, draft)
+    expect(next.blocks[0]?.revision).toBe(3)
+  })
+
   test('accepts published drafts without promptVariables and reconciles current values', () => {
     const current = createNewLoomPreset('Published-shape source')
     const block = current.blocks[0]!

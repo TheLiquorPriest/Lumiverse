@@ -30,8 +30,18 @@ import {
   initDatabase,
 } from "../src/db/connection";
 import { runMigrations } from "../src/db/migrate";
+import { env } from "../src/env";
+import { initIdentity } from "../src/crypto/init";
 import { buildExportStream } from "../src/services/user-data/export.service";
-import { verifyArchiveFast, verifyArchive } from "../src/services/user-data/import.service";
+import {
+  __test__ as importTest,
+  getJob,
+  startImport,
+  verifyArchiveFast,
+  verifyArchive,
+  type ImportJob,
+} from "../src/services/user-data/import.service";
+import { ARCHIVE_REGISTRY_VERSION } from "../src/services/user-data/table-registry";
 import {
   ARCHIVE_SCHEMA_VERSION,
   NDJSON_FORMAT_VERSION,
@@ -77,6 +87,29 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   return out;
 }
 
+function readArchiveNdjson(bytes: Uint8Array, archivePath: string): Record<string, any>[] {
+  const entries = unzipSync(bytes);
+  const encoded = entries[archivePath];
+  if (!encoded) throw new Error(`archive is missing ${archivePath}`);
+  return strFromU8(encoded)
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
+}
+
+function insertPreset(
+  id: string,
+  promptOrder: unknown[],
+  metadata: Record<string, unknown> = {},
+): void {
+  getDb()
+    .query(
+      "INSERT INTO presets " +
+        "(id, name, provider, parameters, prompt_order, metadata, prompts, user_id, engine, created_at, updated_at) " +
+        "VALUES (?, ?, 'loom', '{}', ?, ?, '{}', ?, 'loom', 0, 0)",
+    )
+    .run(id, id, JSON.stringify(promptOrder), JSON.stringify(metadata), USER_ID);
+}
 function isValidZip(bytes: Uint8Array): boolean {
   // Every ZIP (incl. ZIP64) starts with the local file header signature
   // "PK\x03\x04" at byte 0.
@@ -88,6 +121,34 @@ function isValidZip(bytes: Uint8Array): boolean {
     bytes[3] === 0x04
   );
 }
+const SOURCE_USER_ID = "export-roundtrip-source";
+
+function insertPresetForUser(
+  userId: string,
+  id: string,
+  promptOrder: unknown[],
+  metadata: Record<string, unknown> = {},
+): void {
+  getDb()
+    .query(
+      "INSERT INTO presets " +
+        "(id, name, provider, parameters, prompt_order, metadata, prompts, user_id, engine, created_at, updated_at) " +
+        "VALUES (?, ?, 'loom', '{}', ?, ?, '{}', ?, 'loom', 0, 0)",
+    )
+    .run(id, id, JSON.stringify(promptOrder), JSON.stringify(metadata), userId);
+}
+
+async function waitForImportTerminal(jobId: string): Promise<ImportJob> {
+  const job = getJob(jobId);
+  if (!job) throw new Error(`import job ${jobId} was not found`);
+  await job.completion;
+  const terminal = getJob(jobId) ?? job;
+  if (!["complete", "failed", "cancelled"].includes(terminal.status)) {
+    throw new Error(`import job ${jobId} did not reach a terminal state`);
+  }
+  return terminal;
+}
+
 
 function hasEocd(bytes: Uint8Array): boolean {
   // End-of-central-directory record signature: "PK\x05\x06".
@@ -155,6 +216,319 @@ describe("user-data export ZIP64 round-trip", () => {
     expect(manifest.ndjsonMaxRecordBytes).toBe(NDJSON_MAX_RECORD_BYTES);
     expect(manifest.archiveId).toMatch(/^[0-9a-f-]{36}$/i);
   });
+  test("redacts materialized sealed preset blocks into canonical portable descriptors", async () => {
+    const secret = "ARCHIVE_SEALED_SECRET_distinctive_bytes_7b2f";
+    const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+    const ordinaryBlock = {
+      id: "ordinary-block",
+      content: "ordinary prompt content",
+      role: "system",
+      enabled: true,
+    };
+    const sealedBlock = {
+      id: "sealed-block",
+      content: secret,
+      role: "system",
+      enabled: true,
+      sealed: true,
+      sealedKey: "dialogue.frame",
+      sealedSource: "lumihub",
+      sealedOriginPresetId: "hub-preset-7",
+      sealedOriginVersion: "v3",
+      sealedSha256: digest,
+    };
+    insertPreset("sealed-export", [ordinaryBlock, sealedBlock], {
+      _lumiverse_lumihub_id: "hub-preset-7",
+      _lumiverse_preset_version: "v3",
+      _lumiverse_sealed_preset: {
+        version: "v3",
+        blocks: [{ key: "dialogue.frame", sha256: digest, materializedContent: secret }],
+      },
+    });
+
+    const bytes = await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }));
+    const rows = readArchiveNdjson(bytes, "database/presets.ndjson");
+    const exported = rows.find((row) => row.id === "sealed-export");
+    expect(exported).toBeDefined();
+    const exportedBlocks = JSON.parse(exported!.prompt_order);
+    const exportedMetadata = JSON.parse(exported!.metadata);
+    expect(exportedBlocks[0]).toEqual(ordinaryBlock);
+    expect(exportedBlocks[1]).toMatchObject({
+      ...sealedBlock,
+      content: "{{presetBlock::dialogue.frame}}",
+      sealed: true,
+      sealedKey: "dialogue.frame",
+      sealedSource: "lumihub",
+      sealedOriginPresetId: "hub-preset-7",
+      sealedOriginVersion: "v3",
+      sealedSha256: digest,
+    });
+    expect(exportedMetadata.portableSealedPreset).toEqual({
+      hubPresetId: "hub-preset-7",
+      hubPresetVersion: "v3",
+      blocks: [{ key: "dialogue.frame", sha256: digest }],
+    });
+    expect(exportedMetadata._lumiverse_sealed_preset).toEqual({
+      version: "v3",
+      blocks: [{ key: "dialogue.frame", sha256: digest }],
+    });
+
+    const archiveText = Object.values(unzipSync(bytes))
+      .map((entry) => strFromU8(entry))
+      .join("\n");
+    expect(archiveText).not.toContain(secret);
+  });
+
+  test("fails closed when a descriptor-listed materialized block loses its markers", async () => {
+    const secretA = "ARCHIVE_SEALED_SECRET_A_distinctive_bytes";
+    const secretB = "ARCHIVE_SEALED_SECRET_B_distinctive_bytes";
+    const digestA = createHash("sha256").update(secretA, "utf8").digest("hex");
+    const digestB = createHash("sha256").update(secretB, "utf8").digest("hex");
+    insertPreset("partially-marked-sealed-export", [
+      {
+        id: "sealed-a",
+        content: secretA,
+        sealed: true,
+        sealedKey: "dialogue.a",
+        sealedSource: "lumihub",
+        sealedOriginPresetId: "hub-preset-7",
+        sealedOriginVersion: "v3",
+        sealedSha256: digestA,
+      },
+      {
+        id: "sealed-b",
+        content: secretB,
+      },
+    ], {
+      portableSealedPreset: {
+        hubPresetId: "hub-preset-7",
+        hubPresetVersion: "v3",
+        blocks: [
+          { key: "dialogue.a", sha256: digestA },
+          { key: "dialogue.b", sha256: digestB },
+        ],
+      },
+    });
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/unredacted|descriptor/i);
+  });
+
+  test("preserves ordinary LumiHub presets with an explicit null sealed manifest", async () => {
+    const ordinaryBlock = {
+      id: "ordinary-lumihub-block",
+      content: "ordinary LumiHub preset content",
+      role: "system",
+      enabled: true,
+    };
+    const metadata = {
+      _lumiverse_lumihub_id: "hub-preset-ordinary",
+      _lumiverse_preset_version: "v1",
+      _lumiverse_sealed_preset: null,
+    };
+    insertPreset("ordinary-lumihub-export", [ordinaryBlock], metadata);
+
+    const bytes = await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }));
+    const rows = readArchiveNdjson(bytes, "database/presets.ndjson");
+    const exported = rows.find((row) => row.id === "ordinary-lumihub-export");
+    expect(exported).toBeDefined();
+    expect(JSON.parse(exported!.prompt_order)).toEqual([ordinaryBlock]);
+    expect(JSON.parse(exported!.metadata)).toEqual(metadata);
+  });
+
+  test("fails closed when sealed prompt_order data is not an array", async () => {
+    getDb()
+      .query(
+        "INSERT INTO presets " +
+          "(id, name, provider, parameters, prompt_order, metadata, prompts, user_id, engine, created_at, updated_at) " +
+          "VALUES (?, ?, 'loom', '{}', ?, '{}', '{}', ?, 'loom', 0, 0)",
+      )
+      .run(
+        "non-array-sealed-export",
+        "non-array-sealed-export",
+        JSON.stringify({ content: "ARCHIVE_NON_ARRAY_SEALED_SECRET", sealed: true }),
+        USER_ID,
+      );
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/prompt_order must be an array/i);
+  });
+
+  test("retains a concrete legacy manifest version across equivalent candidates", async () => {
+    const secret = "ARCHIVE_LEGACY_VERSION_SECRET";
+    const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+    insertPreset("legacy-version-merge-export", [{
+      id: "sealed-block",
+      content: secret,
+      sealed: true,
+      sealedKey: "dialogue.versioned",
+      sealedSource: "lumihub",
+      sealedOriginPresetId: "hub-preset-versioned",
+      sealedSha256: digest,
+    }], {
+      _lumiverse_lumihub_id: "hub-preset-versioned",
+      _lumiverse_sealed_preset: {
+        version: "v2",
+        blocks: [{ key: "dialogue.versioned", sha256: digest }],
+      },
+      sealedPreset: {
+        version: null,
+        blocks: [{ key: "dialogue.versioned", sha256: digest }],
+      },
+    });
+
+    const rows = readArchiveNdjson(await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    })), "database/presets.ndjson");
+    const exported = rows.find((row) => row.id === "legacy-version-merge-export");
+    expect(exported).toBeDefined();
+    expect(JSON.parse(exported!.metadata)._lumiverse_preset_version).toBe("v2");
+  });
+
+  test("fails closed for invalid sealed block keys", async () => {
+    const secret = "ARCHIVE_INVALID_SEALED_KEY_SECRET";
+    const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+    insertPreset("invalid-sealed-key-export", [{
+      id: "sealed-block",
+      content: secret,
+      sealed: true,
+      sealedKey: "private}",
+      sealedSource: "lumihub",
+      sealedOriginPresetId: "hub-preset-invalid-key",
+      sealedOriginVersion: "v1",
+      sealedSha256: digest,
+    }], {
+      portableSealedPreset: {
+        hubPresetId: "hub-preset-invalid-key",
+        hubPresetVersion: "v1",
+        blocks: [{ key: "private}", sha256: digest }],
+      },
+    });
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/invalid block key/i);
+  });
+  test("fails closed for malformed sealed flag values", async () => {
+    insertPreset("malformed-sealed-flag-export", [{
+      id: "sealed-block",
+      content: "ARCHIVE_MALFORMED_SEALED_FLAG_SECRET",
+      sealed: null,
+    }]);
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/sealed preset block|manifest key/i);
+  });
+
+  test("fails closed for malformed LumiHub source markers", async () => {
+    insertPreset("malformed-sealed-source-export", [{
+      id: "sealed-block",
+      content: "ARCHIVE_MALFORMED_SEALED_SOURCE_SECRET",
+      sealedSource: "Lumihub",
+    }]);
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/sealed preset block|manifest key/i);
+  });
+
+  test("preserves ordinary LumiHub presets with an empty legacy sealed manifest", async () => {
+    const ordinaryBlock = {
+      id: "ordinary-empty-manifest-block",
+      content: "ordinary LumiHub preset content",
+      role: "system",
+      enabled: true,
+    };
+    const metadata = {
+      _lumiverse_lumihub_id: "hub-preset-empty",
+      _lumiverse_preset_version: "v1",
+      _lumiverse_sealed_preset: { version: "v1", blocks: [] },
+    };
+    insertPreset("ordinary-empty-manifest-export", [ordinaryBlock], metadata);
+
+    const rows = readArchiveNdjson(await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    })), "database/presets.ndjson");
+    const exported = rows.find((row) => row.id === "ordinary-empty-manifest-export");
+    expect(exported).toBeDefined();
+    expect(JSON.parse(exported!.prompt_order)).toEqual([ordinaryBlock]);
+    expect(JSON.parse(exported!.metadata)).toEqual(metadata);
+  });
+
+  test("fails closed when sealed prompt block keys are duplicated", async () => {
+    const secret = "ARCHIVE_DUPLICATE_SEALED_KEY_SECRET";
+    const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+    const block = (id: string) => ({
+      id,
+      content: secret,
+      sealed: true,
+      sealedKey: "dialogue.duplicate",
+      sealedSource: "lumihub",
+      sealedOriginPresetId: "hub-preset-duplicate",
+      sealedOriginVersion: "v1",
+      sealedSha256: digest,
+    });
+    insertPreset("duplicate-sealed-key-export", [block("sealed-a"), block("sealed-b")], {
+      portableSealedPreset: {
+        hubPresetId: "hub-preset-duplicate",
+        hubPresetVersion: "v1",
+        blocks: [{ key: "dialogue.duplicate", sha256: digest }],
+      },
+    });
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/duplicate prompt block key/i);
+  });
+  test("fails closed on malformed sealed metadata before archive completion", async () => {
+    const secret = "ARCHIVE_MALFORMED_SEALED_SECRET_distinctive_bytes";
+    insertPreset("malformed-sealed-export", [{
+      id: "sealed-block",
+      content: secret,
+      sealed: true,
+      sealedKey: "dialogue.frame",
+      sealedSource: "lumihub",
+    }], {
+      portableSealedPreset: {
+        hubPresetId: "hub-preset-7",
+        hubPresetVersion: "v3",
+        blocks: [{ key: "dialogue.frame", sha256: "not-a-digest" }],
+      },
+    });
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow(/SHA-256|digest/i);
+  });
   test("V3 manifest is last and authenticates every emitted entry", async () => {
     const bytes = await readAll(
       buildExportStream({
@@ -206,7 +580,7 @@ describe("user-data export ZIP64 round-trip", () => {
       embeddingConfig: { provider: null, model: null, dimension: null },
       embeddingIdentity: "test-embedding",
       vectorStatus: "rebuild_required",
-      registryVersion: 2,
+      registryVersion: ARCHIVE_REGISTRY_VERSION,
       snapshotId: "snapshot-test",
       counts: {},
       missingFiles: [],
@@ -303,7 +677,7 @@ describe("user-data export ZIP64 round-trip", () => {
       ndjsonMaxRecordBytes: NDJSON_MAX_RECORD_BYTES,
       counts: {},
       missingFiles: [],
-      registryVersion: 2,
+      registryVersion: ARCHIVE_REGISTRY_VERSION,
       snapshotId: "snapshot",
       entries: [],
       fileAliases: [],
@@ -327,7 +701,7 @@ describe("user-data export ZIP64 round-trip", () => {
       embeddingConfig: { provider: null, model: null, dimension: null },
       embeddingIdentity: "embedding",
       vectorStatus: "rebuild_required",
-      registryVersion: 2,
+      registryVersion: ARCHIVE_REGISTRY_VERSION,
       snapshotId: "snapshot",
       counts: {},
       missingFiles: [],
@@ -367,7 +741,7 @@ describe("user-data export ZIP64 round-trip", () => {
       embeddingConfig: { provider: null, model: null, dimension: null },
       embeddingIdentity: "test-embedding",
       vectorStatus: "rebuild_required",
-      registryVersion: 2,
+      registryVersion: ARCHIVE_REGISTRY_VERSION,
       snapshotId: "snapshot-test",
       counts: {},
       missingFiles: ["optional-image"],
@@ -633,4 +1007,397 @@ describe("user-data export ZIP64 round-trip", () => {
     },
     120_000,
   );
+  test("restores descriptor-only sealed presets before committing archive rows", async () => {
+    const originalDataDir = env.dataDir;
+    env.dataDir = workDir;
+    let resolvedUserId: string | null = null;
+    let resolvedDescriptor: unknown = null;
+    try {
+      await initIdentity();
+      getDb()
+        .query(
+          "INSERT INTO \"user\" (id, name, email, emailVerified, createdAt, updatedAt) " +
+            "VALUES (?, ?, ?, 1, ?, ?)",
+        )
+        .run(SOURCE_USER_ID, "Source User", "source@example.com", 0, 0);
+
+      const secret = "ARCHIVE_RESTORE_SEALED_SECRET_distinctive_bytes";
+      const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+      const ordinaryBlock = {
+        id: "ordinary-restore-block",
+        content: "ordinary restore content",
+        role: "system",
+        enabled: true,
+      };
+      const ordinaryMetadata = { ordinaryCarrier: "preserve-me", revision: 4 };
+      insertPresetForUser(
+        SOURCE_USER_ID,
+        "ordinary-restore",
+        [ordinaryBlock],
+        ordinaryMetadata,
+      );
+      insertPresetForUser(
+        SOURCE_USER_ID,
+        "sealed-restore",
+        [{
+          id: "sealed-restore-block",
+          content: secret,
+          role: "system",
+          enabled: true,
+          sealed: true,
+          sealedKey: "dialogue.frame",
+          sealedSource: "lumihub",
+          sealedOriginPresetId: "hub-preset-restore",
+          sealedOriginVersion: "v3",
+          sealedSha256: digest,
+        }],
+        {
+          _lumiverse_lumihub_id: "hub-preset-restore",
+          _lumiverse_preset_version: "v3",
+          _lumiverse_sealed_preset: {
+            version: "v3",
+            blocks: [{ key: "dialogue.frame", sha256: digest, materializedContent: secret }],
+          },
+          compatibility: {
+            lumiverse: {
+              sealedPreset: {
+                version: "v3",
+                blocks: [{ key: "dialogue.frame", sha256: digest }],
+              },
+            },
+          },
+        },
+      );
+
+
+      importTest.setPortableSealedPresetResolverOverride(async (userId, descriptor) => {
+        resolvedUserId = userId;
+        resolvedDescriptor = descriptor;
+        return { "dialogue.frame": secret };
+      });
+      const bytes = await readAll(buildExportStream({
+        userId: SOURCE_USER_ID,
+        includeVectors: false,
+        producerVersion: "test",
+      }));
+      const archiveText = Object.values(unzipSync(bytes))
+        .map((entry) => strFromU8(entry))
+        .join("\n");
+      expect(archiveText).not.toContain(secret);
+
+      const archivePath = join(workDir, "sealed-restore.lvbak");
+      writeFileSync(archivePath, bytes);
+      const started = await startImport({
+        userId: USER_ID,
+        archivePath,
+        jobId: crypto.randomUUID(),
+      });
+      const finished = await waitForImportTerminal(started.jobId);
+      expect(finished.status).toBe("complete");
+
+      const sealedRow = getDb()
+        .query("SELECT prompt_order, metadata FROM presets WHERE user_id = ? AND id = ?")
+        .get(USER_ID, "sealed-restore") as { prompt_order: string; metadata: string } | null;
+      expect(sealedRow).not.toBeNull();
+      const sealedBlocks = JSON.parse(sealedRow!.prompt_order) as Array<Record<string, unknown>>;
+      const sealedMetadata = JSON.parse(sealedRow!.metadata) as Record<string, unknown>;
+      expect(sealedBlocks[0]).toMatchObject({
+        id: "sealed-restore-block",
+        content: secret,
+        sealed: true,
+        sealedKey: "dialogue.frame",
+        sealedSource: "lumihub",
+        sealedOriginPresetId: "hub-preset-restore",
+        sealedOriginVersion: "v3",
+        sealedSha256: digest,
+      });
+      expect(sealedMetadata.portableSealedPreset).toEqual({
+        hubPresetId: "hub-preset-restore",
+        hubPresetVersion: "v3",
+        blocks: [{ key: "dialogue.frame", sha256: digest }],
+      });
+      expect(sealedMetadata._lumiverse_sealed_preset).toEqual({
+        version: "v3",
+        blocks: [{ key: "dialogue.frame", sha256: digest }],
+      });
+      expect((sealedMetadata.compatibility as Record<string, any>).lumiverse.sealedPreset).toEqual({
+        version: "v3",
+        blocks: [{ key: "dialogue.frame", sha256: digest }],
+      });
+      expect(JSON.stringify(sealedMetadata)).not.toContain("materializedContent");
+
+      const ordinaryRow = getDb()
+        .query("SELECT prompt_order, metadata FROM presets WHERE user_id = ? AND id = ?")
+        .get(USER_ID, "ordinary-restore") as { prompt_order: string; metadata: string } | null;
+      expect(ordinaryRow).not.toBeNull();
+      expect(JSON.parse(ordinaryRow!.prompt_order)).toEqual([ordinaryBlock]);
+      expect(JSON.parse(ordinaryRow!.metadata)).toEqual(ordinaryMetadata);
+      expect(resolvedUserId).toBe(USER_ID);
+      expect(resolvedDescriptor).toEqual({
+        hubPresetId: "hub-preset-restore",
+        hubPresetVersion: "v3",
+        blocks: [{ key: "dialogue.frame", sha256: digest }],
+      });
+    } finally {
+      importTest.setPortableSealedPresetResolverOverride(null);
+      env.dataDir = originalDataDir;
+    }
+  });
+
+  test("rejects sealed archive failures without apply-phase mutations", async () => {
+    const originalDataDir = env.dataDir;
+    env.dataDir = workDir;
+    let providerMode: "unresolved" | "digest" | "failure" = "unresolved";
+    let resolverCalls = 0;
+    let resolverUserId: string | null = null;
+    let resolverDescriptor: unknown = null;
+    try {
+      await initIdentity();
+      getDb()
+        .query(
+          "INSERT INTO \"user\" (id, name, email, emailVerified, createdAt, updatedAt) " +
+            "VALUES (?, ?, ?, 1, ?, ?)",
+        )
+        .run(SOURCE_USER_ID, "Source User", "source@example.com", 0, 0);
+      insertPreset(
+        "restore-sentinel",
+        [{ id: "sentinel", content: "must survive", role: "system", enabled: true }],
+        { sentinel: "unchanged" },
+      );
+
+      const secret = "ARCHIVE_FAILURE_SEALED_SECRET_distinctive_bytes";
+      const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+      insertPresetForUser(
+        SOURCE_USER_ID,
+        "sealed-failure",
+        [{
+          id: "sealed-failure-block",
+          content: secret,
+          role: "system",
+          enabled: true,
+          sealed: true,
+          sealedKey: "dialogue.frame",
+          sealedSource: "lumihub",
+          sealedOriginPresetId: "hub-preset-failure",
+          sealedOriginVersion: "v3",
+          sealedSha256: digest,
+        }],
+        {
+          _lumiverse_lumihub_id: "hub-preset-failure",
+          _lumiverse_preset_version: "v3",
+          _lumiverse_sealed_preset: {
+            version: "v3",
+            blocks: [{ key: "dialogue.frame", sha256: digest, materializedContent: secret }],
+          },
+          compatibility: {
+            lumiverse: {
+              sealedPreset: {
+                version: "v3",
+                blocks: [{ key: "dialogue.frame", sha256: digest }],
+              },
+            },
+          },
+        },
+      );
+      const sourceBytes = await readAll(buildExportStream({
+        userId: SOURCE_USER_ID,
+        includeVectors: false,
+        producerVersion: "test",
+      }));
+      const sourceEntries = unzipSync(sourceBytes);
+      const legacyManifestBytes = sourceEntries["manifest.json"];
+      if (!legacyManifestBytes) throw new Error("source manifest is missing");
+      const legacyManifest = JSON.parse(strFromU8(legacyManifestBytes)) as Record<string, unknown>;
+      legacyManifest.schemaVersion = 1;
+      delete legacyManifest.ndjsonFormatVersion;
+      delete legacyManifest.ndjsonMaxRecordBytes;
+      delete legacyManifest.entries;
+      delete legacyManifest.vectorSourceDigest;
+      delete legacyManifest.vectorProjectionEpoch;
+      delete legacyManifest.registryVersion;
+      delete legacyManifest.snapshotId;
+      delete legacyManifest.fileAliases;
+      delete legacyManifest.byteCounts;
+      delete legacyManifest.missingOptionalFiles;
+      delete legacyManifest.vectorStatus;
+      delete legacyManifest.embeddingIdentity;
+      sourceEntries["manifest.json"] = strToU8(JSON.stringify(legacyManifest));
+      const sourceRows = readArchiveNdjson(sourceBytes, "database/presets.ndjson");
+
+      const cases: Array<{
+        name: string;
+        mode: "unresolved" | "digest" | "failure";
+        resolver: boolean;
+        mutate: (row: Record<string, any>) => void;
+      }> = [
+        {
+          name: "missing descriptor",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            row.metadata = JSON.stringify({
+              _lumiverse_lumihub_id: "hub-preset-failure",
+              _lumiverse_preset_version: "v3",
+            });
+          },
+        },
+        {
+          name: "escaped sealed marker with wrong root shape",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            row.prompt_order = "{\"\\u0073ealed\":true,\"content\":\"\\u007b\\u007bpresetBlock::dialogue.frame\\u007d\\u007d\"}";
+            row.metadata = "{}";
+          },
+        },
+        {
+          name: "empty sealed placeholder key",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            row.prompt_order = JSON.stringify([{
+              id: "empty-placeholder",
+              content: "{{presetBlock::   }}",
+            }]);
+            row.metadata = "{}";
+          },
+        },
+        {
+          name: "malformed descriptor",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            const metadata = JSON.parse(row.metadata) as Record<string, unknown>;
+            metadata.portableSealedPreset = {
+              hubPresetId: "hub-preset-failure",
+              hubPresetVersion: "v3",
+              blocks: [],
+            };
+            row.metadata = JSON.stringify(metadata);
+          },
+        },
+        {
+          name: "marker-only extra sealed block",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            const blocks = JSON.parse(row.prompt_order) as unknown[];
+            blocks.push({
+              id: "extra-marker-only",
+              content: "unresolved extra content",
+              sealedSha256: digest,
+            });
+            row.prompt_order = JSON.stringify(blocks);
+          },
+        },
+        {
+          name: "contradictory legacy manifest",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            const metadata = JSON.parse(row.metadata) as Record<string, any>;
+            metadata._lumiverse_sealed_preset.version = "v9";
+            row.metadata = JSON.stringify(metadata);
+          },
+        },
+        {
+          name: "contradictory compatibility manifest",
+          mode: "unresolved",
+          resolver: false,
+          mutate: (row) => {
+            const metadata = JSON.parse(row.metadata) as Record<string, any>;
+            metadata.compatibility.lumiverse.sealedPreset.version = "v8";
+            row.metadata = JSON.stringify(metadata);
+          },
+        },
+        {
+          name: "unresolved block",
+          mode: "unresolved",
+          resolver: true,
+          mutate: () => {},
+        },
+        {
+          name: "digest mismatch",
+          mode: "digest",
+          resolver: true,
+          mutate: () => {},
+        },
+        {
+          name: "provider failure",
+          mode: "failure",
+          resolver: true,
+          mutate: () => {},
+        },
+        {
+          name: "link unavailable",
+          mode: "unresolved",
+          resolver: false,
+          mutate: () => {},
+        },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        providerMode = testCase.mode;
+        const callsBefore = resolverCalls;
+        if (testCase.resolver) {
+          importTest.setPortableSealedPresetResolverOverride(async (userId, descriptor) => {
+            resolverCalls++;
+            resolverUserId = userId;
+            resolverDescriptor = descriptor;
+            if (providerMode === "failure") throw new Error("provider unavailable");
+            if (providerMode === "unresolved") return {};
+            return { "dialogue.frame": "wrong sealed content" };
+          });
+        } else {
+          importTest.setPortableSealedPresetResolverOverride(null);
+        }
+        const entries = { ...sourceEntries };
+        const rows = sourceRows.map((row) => ({ ...row }));
+        const sealedRow = rows.find((row) => row.id === "sealed-failure");
+        if (!sealedRow) throw new Error("sealed failure fixture row is missing");
+        testCase.mutate(sealedRow);
+        entries["database/presets.ndjson"] = strToU8(
+          `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+        );
+        const archivePath = join(workDir, `sealed-failure-${index}.lvbak`);
+        writeFileSync(archivePath, zipSync(entries));
+
+        const started = await startImport({
+          userId: USER_ID,
+          archivePath,
+          jobId: crypto.randomUUID(),
+        });
+        const finished = await waitForImportTerminal(started.jobId);
+        expect(resolverCalls).toBe(callsBefore + (testCase.resolver ? 1 : 0));
+        if (testCase.resolver) {
+          expect(resolverUserId).toBe(USER_ID);
+          expect(resolverDescriptor).toEqual({
+            hubPresetId: "hub-preset-failure",
+            hubPresetVersion: "v3",
+            blocks: [{ key: "dialogue.frame", sha256: digest }],
+          });
+        }
+        expect(finished.status).toBe("failed");
+        const sentinel = getDb()
+          .query("SELECT prompt_order, metadata FROM presets WHERE user_id = ? AND id = ?")
+          .get(USER_ID, "restore-sentinel") as { prompt_order: string; metadata: string } | null;
+        expect(sentinel).toEqual({
+          prompt_order: JSON.stringify([{
+            id: "sentinel",
+            content: "must survive",
+            role: "system",
+            enabled: true,
+          }]),
+          metadata: JSON.stringify({ sentinel: "unchanged" }),
+        });
+        const count = getDb()
+          .query("SELECT COUNT(*) AS count FROM presets WHERE user_id = ?")
+          .get(USER_ID) as { count: number };
+        expect(count.count).toBe(1);
+      }
+    } finally {
+      importTest.setPortableSealedPresetResolverOverride(null);
+      env.dataDir = originalDataDir;
+    }
+  });
 });

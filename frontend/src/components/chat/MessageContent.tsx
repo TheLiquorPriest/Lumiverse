@@ -1,5 +1,6 @@
 import { useMemo, useRef, useLayoutEffect, useState, useEffect, useCallback, useSyncExternalStore, useDeferredValue } from 'react'
 import { useTranslation } from 'react-i18next'
+import { ChevronDown } from 'lucide-react'
 import { marked } from 'marked'
 import { highlightCode } from '@/lib/codeHighlight'
 import { processMarkdownInHtmlIsland } from './htmlIslandMarkdown'
@@ -29,6 +30,12 @@ import {
 import { useStore } from '@/store'
 import i18n from '@/i18n'
 import { useDisplayRegex } from '@/hooks/useDisplayRegex'
+import {
+  getLongMessageCollapseHeight,
+  isLongMessageCollapseEligible,
+  isLongMessageOverflowing,
+  longMessageExpansionKey,
+} from '@/lib/longMessageCollapse'
 import {
   REGEX_SELECTIONS_CHANGED_EVENT,
   dispatchRegexAction,
@@ -1533,10 +1540,41 @@ export default function MessageContent({
   const blocks = useMemo(() => parseOOC(renderContent), [renderContent])
   const oocEnabled = useStore((s) => s.oocEnabled)
   const lumiaOOCStyle = useStore((s) => s.lumiaOOCStyle)
+  const longMessageCollapseEnabled = useStore((s) => s.longMessageCollapseEnabled)
+  const longMessageCollapsePreset = useStore((s) => s.longMessageCollapsePreset)
+  const longMessageCollapseCustomHeight = useStore((s) => s.longMessageCollapseCustomHeight)
+  const longMessageCollapseDepth = useStore((s) => s.longMessageCollapseDepth)
+  const expansionKey = chatId && messageId ? longMessageExpansionKey(chatId, messageId) : null
+  const longMessageExpanded = useStore((s) => (
+    expansionKey ? s.expandedLongMessageKeys.includes(expansionKey) : false
+  ))
+  const setLongMessageExpanded = useStore((s) => s.setLongMessageExpanded)
+  const longMessageEligible = isLongMessageCollapseEligible({
+    enabled: longMessageCollapseEnabled,
+    isUser,
+    depth,
+    collapseDepth: longMessageCollapseDepth,
+    chatId,
+    messageId,
+  })
+  const longMessageMaxHeight = getLongMessageCollapseHeight(
+    longMessageCollapsePreset,
+    longMessageCollapseCustomHeight,
+  )
   const containerRef = useRef<HTMLDivElement>(null)
+  const contentBodyRef = useRef<HTMLDivElement>(null)
   const prevTextLenRef = useRef(0)
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const [regexSelectionVersion, setRegexSelectionVersion] = useState(0)
+  const [longMessageOverflowing, setLongMessageOverflowing] = useState(false)
+
+  const measureLongMessageOverflow = useCallback(() => {
+    const body = contentBodyRef.current
+    const next = longMessageEligible
+      && !!body
+      && isLongMessageOverflowing(Math.max(body.scrollHeight, body.offsetHeight), longMessageMaxHeight)
+    setLongMessageOverflowing((current) => current === next ? current : next)
+  }, [longMessageEligible, longMessageMaxHeight])
 
   useEffect(() => {
     const refresh = () => setRegexSelectionVersion((version) => version + 1)
@@ -1867,6 +1905,7 @@ export default function MessageContent({
       pendingRaf = window.requestAnimationFrame(() => {
         pendingRaf = 0
         if (cancelled) return
+        measureLongMessageOverflow()
         notifyMessageContentLayout(container)
       })
     }
@@ -1876,17 +1915,18 @@ export default function MessageContent({
       scheduleLayoutNotify()
     }
 
-    // MutationObserver and ResizeObserver are only needed while the message
-    // content is actively changing (streaming). For finalized messages they
-    // fire on incidental DOM mutations (hover states, lazy image decode
-    // attribute flips, etc.) and cascade into measureElement calls that are
-    // pure overhead during scroll.
+    // Streaming content needs both observers because tokens and injected
+    // widgets can mutate the subtree. Finalized eligible messages still need
+    // a ResizeObserver so width, font, and image reflows can reveal overflow
+    // after the initial measurement.
     let mutationObserver: MutationObserver | null = null
     let observer: ResizeObserver | null = null
-    if (isStreaming) {
+    if (isStreaming || longMessageEligible) {
       observer = new ResizeObserver(scheduleLayoutNotify)
-      observer.observe(container)
+      observer.observe(contentBodyRef.current ?? container)
+    }
 
+    if (isStreaming) {
       mutationObserver = new MutationObserver(scheduleLayoutNotify)
       mutationObserver.observe(container, { childList: true, subtree: true, attributes: true, characterData: true })
     }
@@ -1915,37 +1955,37 @@ export default function MessageContent({
     // layout events already notify MessageList via scheduleLayoutNotify(), so
     // re-creating observers on every renderContent change is unnecessary and
     // causes observer churn during fast streaming.
-  }, [isStreaming])
+  }, [isStreaming, measureLongMessageOverflow])
 
   // While streaming, ratchet the content container's min-height upward so that
   // transient DOM shrinkage (unclosed tags snapping shut, image placeholders
   // collapsing, etc.) cannot make the virtualized row height oscillate. The
   // lock is applied directly to the DOM to avoid React re-render thrash.
   useLayoutEffect(() => {
-    const container = containerRef.current
-    if (!container) return
+    const contentBody = contentBodyRef.current
+    if (!contentBody) return
 
     if (!isStreaming) {
-      container.style.minHeight = ''
+      contentBody.style.minHeight = ''
       return
     }
 
     // offsetHeight is zoom-invariant under Lumiverse's body-level CSS zoom,
     // whereas getBoundingClientRect() would return scaled pixels and the lock
     // would be applied twice.
-    let maxHeight = container.offsetHeight
-    container.style.minHeight = `${maxHeight}px`
+    let maxHeight = contentBody.offsetHeight
+    contentBody.style.minHeight = `${maxHeight}px`
 
     const updateMinHeight = () => {
-      const h = container.offsetHeight
+      const h = contentBody.offsetHeight
       if (h > maxHeight) {
         maxHeight = h
-        container.style.minHeight = `${h}px`
+        contentBody.style.minHeight = `${h}px`
       }
     }
 
     const observer = new ResizeObserver(updateMinHeight)
-    observer.observe(container)
+    observer.observe(contentBody)
 
     return () => observer.disconnect()
   }, [isStreaming])
@@ -2020,6 +2060,23 @@ export default function MessageContent({
 
     return elements
   }, [blocks, oocEnabled, lumiaOOCStyle, isStreaming])
+
+  useLayoutEffect(() => {
+    measureLongMessageOverflow()
+  }, [measureLongMessageOverflow, renderContent, renderedBlocks])
+
+  const handleLongMessageToggle = useCallback(() => {
+    if (!chatId || !messageId) return
+    const container = containerRef.current
+    dispatchCollapsibleToggleLayoutEvent(container)
+    setLongMessageExpanded(chatId, messageId, !longMessageExpanded)
+    window.requestAnimationFrame(() => {
+      const current = containerRef.current
+      if (!current) return
+      measureLongMessageOverflow()
+      dispatchMessageContentLayout(current)
+    })
+  }, [chatId, longMessageExpanded, measureLongMessageOverflow, messageId, setLongMessageExpanded])
 
   // Highlight rendered text nodes instead of rewriting the source Markdown or
   // sanitized HTML. This preserves formatting, display regexes, OOC layouts,
@@ -2105,8 +2162,37 @@ export default function MessageContent({
         ref={containerRef}
         className={clsx(styles.content, isUser ? styles.contentUser : styles.contentChar)}
       >
-        {renderedBlocks}
-        <SpindleMessageWidgets messageId={messageId} />
+        <div
+          id={longMessageEligible ? `long-message-body-${messageId}` : undefined}
+          className={clsx(
+            styles.longMessageViewport,
+            longMessageEligible && !longMessageExpanded && styles.longMessageViewportConstrained,
+            longMessageEligible && !longMessageExpanded && longMessageOverflowing && styles.longMessageViewportOverflowing,
+          )}
+          style={longMessageEligible && !longMessageExpanded ? { maxHeight: longMessageMaxHeight } : undefined}
+        >
+          <div ref={contentBodyRef} className={styles.longMessageBody}>
+            {renderedBlocks}
+            <SpindleMessageWidgets messageId={messageId} />
+          </div>
+        </div>
+        {longMessageEligible && longMessageOverflowing && (
+          <button
+            type="button"
+            className={clsx(styles.longMessageToggle, longMessageExpanded && styles.longMessageToggleExpanded)}
+            onClick={handleLongMessageToggle}
+            aria-expanded={longMessageExpanded}
+            aria-controls={`long-message-body-${messageId}`}
+            data-long-message-toggle="true"
+          >
+            <span className={styles.longMessageTogglePill}>
+              <span>{longMessageExpanded ? t('messageContent.showLess') : t('messageContent.readMore')}</span>
+              <span className={styles.longMessageToggleIconFrame} aria-hidden="true">
+                <ChevronDown className={styles.longMessageToggleIcon} size={13} strokeWidth={2.4} />
+              </span>
+            </span>
+          </button>
+        )}
       </div>
       <ImageLightbox src={lightboxSrc} onClose={handleLightboxClose} />
     </>

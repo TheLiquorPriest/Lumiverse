@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { getDb } from "../db/connection";
+import { compareUtf8 } from "../utils/utf8-order";
 import {
   PERSISTENT_WORKSPACE_RECORD_KINDS,
   PERSISTENT_WORKSPACE_TERMINAL_OUTCOMES,
@@ -37,10 +38,13 @@ import {
   type PersistentWorkspaceTask,
   type PersistentWorkspaceTaskPublicationCopyV1,
   type PersistentWorkspaceTurnSession,
+  type PersistentWorkspaceTurnSessionPageV1,
   type PersistentWorkspaceUsageV1,
   type PublishPersistentWorkspaceSelectionInputV1,
   type UpdatePersistentWorkspaceTurnSessionInputV1,
 } from "../types/turn-workspace";
+import type { PaginationParams } from "../types/pagination";
+import { MAX_LIMIT } from "../types/pagination";
 import {
   WORKSPACE_OPERATIONS,
   WORKSPACE_RECORD_KINDS,
@@ -63,6 +67,7 @@ import { utf8ByteLength } from "./agent-runtime-accounting";
 import { ArtifactBlobError, assertArtifactAttachable, assertArtifactBlobAvailable, publishArtifactCommit, releaseArtifactBlobReference, retainArtifactBlobReference, withArtifactDeletionFence } from "./agent-artifact-blobs.service";
 import {
   COGNITION_MAX_TASK_TRANSITIONS,
+  deriveCognitionOperationalTaskId,
   type CognitionActivationStateV1,
   type CognitionTaskTransition,
   type TaskTemplateV1,
@@ -92,6 +97,7 @@ export const PERSISTENT_WORKSPACE_MAX_RECORDS = 1_024;
 export const PERSISTENT_WORKSPACE_MAX_SUBMISSIONS = 1_024;
 export const PERSISTENT_WORKSPACE_MAX_ARTIFACTS = 256;
 export const PERSISTENT_WORKSPACE_MAX_PUBLICATIONS = 512;
+export const PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET = 100_000;
 export const PERSISTENT_WORKSPACE_MAX_BYTES = 4 * 1024 * 1024;
 
 export const WORKSPACE_ID_MAX_BYTES = 128;
@@ -273,8 +279,25 @@ export interface SubmitWorkspaceChildResultInputV1 extends WorkspaceFrameContext
   readonly retention?: WorkspaceRetentionV1;
   readonly ttlSeconds?: number;
 }
+interface SubmitWorkspaceRootResultInputV1 extends WorkspaceFrameContextV1 {
+  readonly taskId: string;
+  readonly summary: string;
+  readonly state: "completed" | "failed";
+  readonly retention?: WorkspaceRetentionV1;
+  readonly ttlSeconds?: number;
+}
 
-export interface AcceptWorkspaceSubmissionInputV1 extends WorkspaceFrameContextV1 { readonly submissionId: string; }
+interface SettleWorkspaceChildTaskInputV1 extends WorkspaceFrameContextV1 {
+  readonly taskId: string;
+  readonly assignedFrameId: string;
+  readonly state: "cancelled" | "failed";
+}
+
+
+export interface AcceptWorkspaceSubmissionInputV1 extends WorkspaceFrameContextV1 {
+  readonly submissionId: string;
+  readonly taskId: string;
+}
 
 export interface RecordWorkspaceRecordInputV1 extends WorkspaceFrameContextV1 {
   readonly kind: WorkspaceRecordKindV1;
@@ -396,7 +419,7 @@ function idValue(value: unknown, path: string): string {
   return id;
 }
 function cognitionTemplateTaskId(row: WorkspaceRow, templateId: string): string {
-  return idValue(`${row.turnId}:${templateId}`, "cognition.taskId");
+  return idValue(deriveCognitionOperationalTaskId(row.turnId, templateId), "cognition.taskId");
 }
 function cognitionTemplateTransitionId(row: WorkspaceRow, candidate: Record<string, unknown>): string {
   const taskId = rowString(candidate, ["task_id"]);
@@ -642,13 +665,71 @@ export function validateSubmitWorkspaceChildResultInput(value: unknown): SubmitW
   if (!DIGEST.test(resultDigest)) fail("invalid_input", "resultDigest must be SHA-256");
   return Object.freeze({ ...parsed, taskId: idValue(value.taskId, "taskId"), summary: stringValue(value.summary, "summary", WORKSPACE_SUBMISSION_SUMMARY_MAX_BYTES), resultDigest, byteCount: integer(value.byteCount ?? 0, "byteCount", 0, WORKSPACE_MAX_BYTES), retention: policy?.retention, ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS) });
 }
+/**
+ * Root-owned completion is a separate operation from child submission. It
+ * creates an already-accepted submission so required-task completion gates
+ * retain one canonical submission invariant.
+ */
+export function validateSubmitWorkspaceRootResultInput(value: unknown): SubmitWorkspaceRootResultInputV1 {
+  const parsed = contextValue(value);
+  if (!isRecord(value)) fail("invalid_input", "root result input must be an object");
+  assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "taskId", "summary", "state", "retention", "ttlSeconds"], "rootResult");
+  if (parsed.actor !== "root" && parsed.actor !== "host") fail("forbidden", "only root/host may submit root results");
+  if (value.state !== "completed" && value.state !== "failed") fail("invalid_state", "root result state must be completed or failed");
+  const policy = value.retention === undefined ? undefined : retentionValue(value.retention, value.ttlSeconds);
+  return Object.freeze({
+    ...parsed,
+    taskId: idValue(value.taskId, "taskId"),
+    summary: stringValue(value.summary, "summary", WORKSPACE_SUBMISSION_SUMMARY_MAX_BYTES),
+    state: value.state,
+    retention: policy?.retention,
+    ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS),
+  });
+}
+
+function validateSettleWorkspaceChildTaskInput(value: unknown): SettleWorkspaceChildTaskInputV1 {
+  const parsed = contextValue(value);
+  if (!isRecord(value)) fail("invalid_input", "child settlement input must be an object");
+  assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "taskId", "assignedFrameId", "state"], "childSettlement");
+  if (parsed.actor !== "host") fail("forbidden", "only the host may settle child failures");
+  if (typeof value.state !== "string" || (value.state !== "failed" && value.state !== "cancelled")) {
+    fail("invalid_state", "child settlement state must be failed or cancelled");
+  }
+  return Object.freeze({
+    ...parsed,
+    taskId: idValue(value.taskId, "taskId"),
+    assignedFrameId: idValue(value.assignedFrameId, "assignedFrameId"),
+    state: value.state,
+  });
+}
+
 export function validateAcceptWorkspaceSubmissionInput(value: unknown): AcceptWorkspaceSubmissionInputV1 {
   const parsed = contextValue(value);
   if (!isRecord(value)) fail("invalid_input", "submission acceptance input must be an object");
-  assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "submissionId"], "acceptSubmission");
-  return Object.freeze({ ...parsed, submissionId: idValue(value.submissionId, "submissionId") });
+  assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "submissionId", "taskId"], "acceptSubmission");
+  return Object.freeze({
+    ...parsed,
+    submissionId: idValue(value.submissionId, "submissionId"),
+    taskId: idValue(value.taskId, "taskId"),
+  });
 }
 function summaryDigest(summary: string): string { return createHash("sha256").update(summary, "utf8").digest("hex"); }
+function rootResultMatches(
+  task: WorkspaceTaskV1,
+  submission: WorkspaceSubmissionV1 | undefined,
+  input: SubmitWorkspaceRootResultInputV1,
+): boolean {
+  if (input.state === "failed") {
+    return task.state === "failed" && submission === undefined && task.summary === input.summary;
+  }
+  if (!submission || submission.state !== "accepted") return false;
+  return task.state === "completed"
+    && task.summary === input.summary
+    && submission.summary === input.summary
+    && submission.resultDigest === summaryDigest(input.summary)
+    && submission.byteCount === utf8ByteLength(input.summary);
+}
+
 export function validateRecordWorkspaceRecordInput(value: unknown): RecordWorkspaceRecordInputV1 {
   const parsed = contextValue(value);
   if (!isRecord(value)) fail("invalid_input", "record input must be an object");
@@ -706,6 +787,11 @@ function insertRow(database: Database, table: string, values: Record<string, unk
   for (const key of required) if (available.has(key) && !selected.some(([name]) => name === key)) fail("schema_unavailable", `${table}.${key} was not supplied`);
   if (!selected.length) fail("schema_unavailable", `${table} has no writable columns`);
   database.query(`INSERT INTO ${quoteIdentifier(table)} (${selected.map(([key]) => quoteIdentifier(key)).join(", ")}) VALUES (${selected.map(() => "?").join(", ")})`).run(...selected.map(([, value]) => sqlValue(value)));
+}
+function isPersistentTaskIdentifierConflict(error: unknown): boolean {
+  const message = String(error);
+  return /unique constraint failed/i.test(message)
+    && /persistent_workspace_tasks\.(?:task_id|workspace_id)/i.test(message);
 }
 function updateRow(database: Database, table: string, values: Record<string, unknown>, where: Record<string, unknown>): number {
   const available = tableColumns(database, table);
@@ -937,11 +1023,12 @@ function serializedTaskFootprintV1(title: string, objective: string, dependencie
 }
 
 function taskFootprintFromRow(raw: Record<string, unknown>): number {
-  return serializedTaskFootprintV1(
+  const base = serializedTaskFootprintV1(
     rowString(raw, ["title"]),
     rowString(raw, ["description", "title"]),
     jsonArray(raw.dependencies_json),
   );
+  return base + (rowString(raw, ["state"]) === "failed" ? utf8ByteLength(rowString(raw, ["summary"])) : 0);
 }
 
 /**
@@ -1010,6 +1097,48 @@ function taskById(row: WorkspaceRow, taskId: string): WorkspaceTaskV1 {
   if (!found) fail("not_found", "task was not found");
   return taskFromRow(found);
 }
+function taskOperationKey(row: WorkspaceRow, taskId: string): string | null {
+  const found = listWorkspaceRows("agent_workspace_tasks", row)
+    .find((candidate) => rowString(candidate, ["task_id"]) === taskId);
+  return found ? rowNullableString(found, ["cas_owner"]) : null;
+}
+function rootResultPolicyIdentity(input: Pick<SubmitWorkspaceRootResultInputV1, "retention" | "ttlSeconds">): number {
+  const retentionCode = input.retention === undefined
+    ? 0
+    : input.retention === "operational"
+      ? 1
+      : input.retention === "turn_terminal"
+        ? 2
+        : 3;
+  return retentionCode * (WORKSPACE_MAX_TERMINAL_TTL_SECONDS + 1) + (input.ttlSeconds ?? 0);
+}
+function taskRootResultPolicyIdentity(row: WorkspaceRow, taskId: string): number | null {
+  const found = listWorkspaceRows("agent_workspace_tasks", row)
+    .find((candidate) => rowString(candidate, ["task_id"]) === taskId);
+  if (!found || !Number.isSafeInteger(found.cas_expires_at)) return null;
+  return found.cas_expires_at as number;
+}
+function rootCognitionResultMatches(
+  row: WorkspaceRow,
+  task: WorkspaceTaskV1,
+  submission: WorkspaceSubmissionV1 | undefined,
+  input: SubmitWorkspaceRootResultInputV1,
+): boolean {
+  if (
+    task.state !== input.state
+    || task.summary !== input.summary
+    || taskRootResultPolicyIdentity(row, task.id) !== rootResultPolicyIdentity(input)
+  ) return false;
+  if (input.state === "failed") return submission === undefined;
+  if (!submission || submission.state !== "accepted") return false;
+  return submission.childFrameId === (input.frameId ?? "root")
+    && submission.summary === input.summary
+    && submission.resultDigest === summaryDigest(input.summary)
+    && submission.byteCount === utf8ByteLength(input.summary)
+    && submission.retention === (input.retention ?? row.retention);
+}
+
+
 function recordFromRow(raw: Record<string, unknown>): WorkspaceRecordV1 {
   const kind = rowString(raw, ["kind"]) as WorkspaceRecordKindV1;
   if (!KINDS.has(kind)) fail("invalid_input", "record kind is invalid");
@@ -1029,6 +1158,23 @@ function submissionById(row: WorkspaceRow, id: string): WorkspaceSubmissionV1 {
   const found = listWorkspaceRows("agent_workspace_submissions", row).find((candidate) => rowString(candidate, ["submission_id"]) === id);
   if (!found) fail("not_found", "submission was not found");
   return submissionFromRow(found);
+}
+function submissionTaskForAcceptance(
+  row: WorkspaceRow,
+  input: AcceptWorkspaceSubmissionInputV1,
+  submission: WorkspaceSubmissionV1,
+): WorkspaceTaskV1 {
+  if (submission.taskId !== input.taskId) {
+    fail("invalid_input", "submission does not belong to the authenticated task");
+  }
+  const task = taskById(row, input.taskId);
+  if (task.state !== "completed") {
+    fail("invalid_state", "submission task must be completed before acceptance");
+  }
+  if (!task.assignedFrameId || task.assignedFrameId !== submission.childFrameId) {
+    fail("invalid_input", "submission child frame does not match the task assignment");
+  }
+  return task;
 }
 function artifactFromRow(raw: Record<string, unknown>): WorkspaceArtifactReferenceV1 {
   const state = rowString(raw, ["publication_state"], "attached") as WorkspaceArtifactReferenceV1["publicationState"];
@@ -1340,9 +1486,22 @@ export function updateWorkspaceTaskProgress(raw: unknown): WorkspaceTaskV1 {
   requireCapability(input, "update_assigned_progress", raw);
   const task = taskById(row, input.taskId);
   assertAssignedChild(input, task);
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    fail("task_assignment_conflict", "terminal task cannot receive progress updates");
+  }
   mutateWorkspace(row, () => {
-    if (updateRow(getDb(), "agent_workspace_tasks", { state: input.state, progress: input.progress, revision: task.revision + 1, updated_at: Math.floor(Date.now() / 1000) }, { task_id: task.id, workspace_id: row.workspaceId, turn_id: row.turnId, user_id: row.userId, chat_id: row.chatId, revision: task.revision }) !== 1) fail("stale_revision", "task revision is stale");
-    casWorkspace(row, { updated_at: Math.floor(Date.now() / 1000) });
+    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
+    if (!current) fail("stale_revision", "workspace revision changed before task progress");
+    const currentTask = taskById(current, task.id);
+    assertAssignedChild(input, currentTask);
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      fail("task_assignment_conflict", "terminal task cannot receive progress updates");
+    }
+    if (current.revision !== row.revision) fail("stale_revision", "workspace revision changed before task progress");
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
+    const now = Math.floor(Date.now() / 1000);
+    if (updateRow(getDb(), "agent_workspace_tasks", { state: input.state, progress: input.progress, revision: currentTask.revision + 1, updated_at: now }, { task_id: currentTask.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: currentTask.revision }) !== 1) fail("stale_revision", "task revision is stale");
+    casWorkspace(current, { updated_at: now });
   });
   return taskById(row, task.id);
 }
@@ -1352,6 +1511,15 @@ export function submitWorkspaceChildResult(raw: unknown): WorkspaceTaskV1 {
   requireCapability(input, "submit_child_result", raw);
   const task = taskById(row, input.taskId);
   assertAssignedChild(input, task);
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    if (
+      task.state === "completed"
+      && listWorkspaceRows("agent_workspace_submissions", row).some((candidate) => rowString(candidate, ["task_id"]) === task.id)
+    ) {
+      fail("submission_rejected", "task already has a submitted result");
+    }
+    fail("task_assignment_conflict", "terminal task cannot receive a child result");
+  }
   const submissionBytes = input.byteCount + utf8ByteLength(input.summary);
   const submissionId = crypto.randomUUID();
   mutateWorkspace(row, () => {
@@ -1359,8 +1527,14 @@ export function submitWorkspaceChildResult(raw: unknown): WorkspaceTaskV1 {
     const currentTask = taskById(current, task.id);
     if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
     assertAssignedChild(input, currentTask);
-    if (currentTask.state === "completed" && listWorkspaceRows("agent_workspace_submissions", current).some((candidate) => rowString(candidate, ["task_id"]) === currentTask.id)) {
-      fail("submission_rejected", "task already has a submitted result");
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      if (
+        currentTask.state === "completed"
+        && listWorkspaceRows("agent_workspace_submissions", current).some((candidate) => rowString(candidate, ["task_id"]) === currentTask.id)
+      ) {
+        fail("submission_rejected", "task already has a submitted result");
+      }
+      fail("task_assignment_conflict", "terminal task cannot receive a child result");
     }
     const usage = currentWorkspaceUsage(getDb(), current);
     if (usage.submissionCount >= current.quota.maxSubmissions || usage.byteCount + submissionBytes > current.quota.maxBytes) {
@@ -1412,18 +1586,216 @@ export function submitWorkspaceChildResult(raw: unknown): WorkspaceTaskV1 {
   });
   return taskById(row, task.id);
 }
+/**
+ * Root-owned task settlement. Completed results create an already-accepted
+ * submission; failed results mark the unassigned root task failed without a
+ * submission so recovery phases can observe the truthful terminal state.
+ */
+export function submitWorkspaceRootResult(raw: unknown): WorkspaceTaskV1 {
+  const input = validateSubmitWorkspaceRootResultInput(raw);
+  const row = requireWritable(input);
+  requireCapability(input, "submit_root_result", raw);
+  const task = taskById(row, input.taskId);
+  if (task.assignedFrameId !== null) {
+    fail("child_confinement", "root may not settle a child-assigned task");
+  }
+  const existingSubmission = listWorkspaceRows("agent_workspace_submissions", row)
+    .find((candidate) => rowString(candidate, ["task_id"]) === task.id);
+
+  if (
+    rootResultMatches(
+      task,
+      existingSubmission ? submissionFromRow(existingSubmission) : undefined,
+      input,
+    )
+  ) {
+    return task;
+  }
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    fail("task_assignment_conflict", "terminal task cannot receive a different root result");
+  }
+
+  if (existingSubmission) {
+    fail("submission_rejected", "task already has a submitted result");
+  }
+  const submissionBytes = input.state === "completed" ? utf8ByteLength(input.summary) : 0;
+  const submissionId = input.state === "completed" ? crypto.randomUUID() : undefined;
+  mutateWorkspace(row, () => {
+    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
+    if (!current) fail("stale_revision", "workspace revision changed before mutation");
+    const currentTask = taskById(current, task.id);
+    const currentSubmission = listWorkspaceRows("agent_workspace_submissions", current)
+      .find((candidate) => rowString(candidate, ["task_id"]) === currentTask.id);
+    if (currentTask.assignedFrameId !== null) {
+      fail("child_confinement", "root may not settle a child-assigned task");
+    }
+    if (
+      rootResultMatches(
+        currentTask,
+        currentSubmission ? submissionFromRow(currentSubmission) : undefined,
+        input,
+      )
+    ) return;
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      fail("task_assignment_conflict", "terminal task cannot receive a different root result");
+    }
+    if (currentSubmission) fail("submission_rejected", "task already has a submitted result");
+    if (current.revision !== row.revision) fail("stale_revision", "workspace revision changed before mutation");
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
+
+    const now = Math.floor(Date.now() / 1000);
+    if (input.state === "failed") {
+      const usage = currentWorkspaceUsage(getDb(), current);
+      const summaryBytes = utf8ByteLength(input.summary);
+      if (usage.byteCount + summaryBytes > current.quota.maxBytes) {
+        fail("quota_exceeded", "workspace byte quota exceeded");
+      }
+      if (updateRow(getDb(), "agent_workspace_tasks", {
+        state: "failed",
+        summary: input.summary,
+        revision: currentTask.revision + 1,
+        updated_at: now,
+      }, {
+        task_id: currentTask.id,
+        workspace_id: current.workspaceId,
+        turn_id: current.turnId,
+        user_id: current.userId,
+        chat_id: current.chatId,
+        revision: currentTask.revision,
+      }) !== 1) fail("stale_revision", "task revision is stale");
+      casWorkspace(current, {
+        task_count: usage.taskCount,
+        record_count: usage.recordCount,
+        submission_count: usage.submissionCount,
+        artifact_count: usage.artifactCount,
+        byte_count: usage.byteCount + summaryBytes,
+        updated_at: now,
+      });
+      return;
+    }
+    const usage = currentWorkspaceUsage(getDb(), current);
+    if (usage.submissionCount >= current.quota.maxSubmissions || usage.byteCount + submissionBytes > current.quota.maxBytes) {
+      fail("quota_exceeded", "submission quota exceeded");
+    }
+    const policy = input.retention === undefined
+      ? { retention: current.retention, expiresAt: current.expiresAt }
+      : retentionValue(input.retention, input.ttlSeconds, now);
+    insertRow(getDb(), "agent_workspace_submissions", {
+      submission_id: submissionId!,
+      task_id: currentTask.id,
+      workspace_id: current.workspaceId,
+      turn_id: current.turnId,
+      user_id: current.userId,
+      chat_id: current.chatId,
+      // The schema predates root submissions; this field records the
+      // authenticated root frame and is never treated as child authority.
+      child_frame_id: input.frameId ?? "root",
+      state: "accepted",
+      summary: input.summary,
+      result_digest: summaryDigest(input.summary),
+      byte_count: submissionBytes,
+      revision: 0,
+      retention: policy.retention,
+      expires_at: policy.expiresAt,
+      created_at: now,
+      updated_at: now,
+    }, ["submission_id", "task_id", "workspace_id", "turn_id", "user_id", "chat_id", "child_frame_id", "state", "summary", "result_digest", "byte_count", "retention", "expires_at"]);
+    if (updateRow(getDb(), "agent_workspace_tasks", {
+      state: "completed",
+      progress: 1,
+      summary: input.summary,
+      revision: currentTask.revision + 1,
+      updated_at: now,
+    }, {
+      task_id: currentTask.id,
+      workspace_id: current.workspaceId,
+      turn_id: current.turnId,
+      user_id: current.userId,
+      chat_id: current.chatId,
+      revision: currentTask.revision,
+    }) !== 1) fail("stale_revision", "task revision is stale");
+    casWorkspace(current, {
+      task_count: usage.taskCount,
+      record_count: usage.recordCount,
+      submission_count: usage.submissionCount + 1,
+      artifact_count: usage.artifactCount,
+      byte_count: usage.byteCount + submissionBytes,
+      updated_at: now,
+    });
+  });
+  return taskById(row, task.id);
+}
+
+/** Host-only, assignment-bound settlement for child cancellation/failure. */
+export function settleWorkspaceChildTask(raw: unknown): WorkspaceTaskV1 {
+  const input = validateSettleWorkspaceChildTaskInput(raw);
+  const row = requireWritable(input);
+  requireCapability(input, "update_assigned_progress", raw);
+  const task = taskById(row, input.taskId);
+  if (task.assignedFrameId !== input.assignedFrameId) {
+    fail("child_confinement", "child settlement does not match the assigned frame");
+  }
+  if (task.state === input.state) {
+    if (taskOperationKey(row, task.id) !== null) {
+      fail("task_assignment_conflict", "cognition settlement requires its committed operation key");
+    }
+    return task;
+  }
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    fail("task_assignment_conflict", "terminal task cannot be downgraded by child settlement");
+  }
+  mutateWorkspace(row, () => {
+    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
+    if (!current) fail("stale_revision", "workspace revision changed before child settlement");
+    const currentTask = taskById(current, task.id);
+    if (currentTask.assignedFrameId !== input.assignedFrameId) {
+      fail("child_confinement", "child settlement does not match the assigned frame");
+    }
+    if (currentTask.state === input.state) {
+      if (taskOperationKey(current, currentTask.id) !== null) {
+        fail("task_assignment_conflict", "cognition settlement requires its committed operation key");
+      }
+      return;
+    }
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      fail("task_assignment_conflict", "terminal task cannot be downgraded by child settlement");
+    }
+    if (current.revision !== row.revision) fail("stale_revision", "workspace revision changed before child settlement");
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
+    const now = Math.floor(Date.now() / 1000);
+    if (updateRow(getDb(), "agent_workspace_tasks", {
+      state: input.state,
+      revision: currentTask.revision + 1,
+      updated_at: now,
+    }, {
+      task_id: currentTask.id,
+      workspace_id: current.workspaceId,
+      turn_id: current.turnId,
+      user_id: current.userId,
+      chat_id: current.chatId,
+      revision: currentTask.revision,
+    }) !== 1) fail("stale_revision", "task revision is stale");
+    casWorkspace(current, { updated_at: now });
+  });
+  return taskById(row, task.id);
+}
+
 export function acceptWorkspaceSubmission(raw: unknown): WorkspaceSubmissionV1 {
   const input = validateAcceptWorkspaceSubmissionInput(raw);
   const row = requireWritable(input);
   if (input.actor !== "host" && input.actor !== "root") fail("forbidden", "only host/root accept submissions");
   const submission = submissionById(row, input.submissionId);
+  submissionTaskForAcceptance(row, input, submission);
   if (submission.state === "accepted") return submission;
   if (submission.state === "rejected") fail("submission_rejected", "rejected submissions cannot be accepted");
   mutateWorkspace(row, () => {
-    if (updateRow(getDb(), "agent_workspace_submissions", { state: "accepted", revision: submission.revision + 1, updated_at: Math.floor(Date.now() / 1000) }, { submission_id: submission.id, workspace_id: row.workspaceId, turn_id: row.turnId, user_id: row.userId, chat_id: row.chatId, revision: submission.revision }) !== 1) fail("stale_revision", "submission revision is stale");
-    const task = taskById(row, submission.taskId);
-    if (updateRow(getDb(), "agent_workspace_tasks", { summary: submission.summary, revision: task.revision + 1, updated_at: Math.floor(Date.now() / 1000) }, { task_id: task.id, workspace_id: row.workspaceId, turn_id: row.turnId, user_id: row.userId, chat_id: row.chatId, revision: task.revision }) !== 1) fail("stale_revision", "task revision is stale");
-    casWorkspace(row, { updated_at: Math.floor(Date.now() / 1000) });
+    const current = currentWorkspaceForMutation(row);
+    const currentSubmission = submissionById(current, input.submissionId);
+    const currentTask = submissionTaskForAcceptance(current, input, currentSubmission);
+    const now = Math.floor(Date.now() / 1000);
+    if (updateRow(getDb(), "agent_workspace_submissions", { state: "accepted", revision: currentSubmission.revision + 1, updated_at: now }, { submission_id: currentSubmission.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: currentSubmission.revision }) !== 1) fail("stale_revision", "submission revision is stale");
+    if (updateRow(getDb(), "agent_workspace_tasks", { summary: currentSubmission.summary, revision: currentTask.revision + 1, updated_at: now }, { task_id: currentTask.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: currentTask.revision }) !== 1) fail("stale_revision", "task revision is stale");
+    casWorkspace(current, { updated_at: now });
   });
   return submissionById(row, input.submissionId);
 }
@@ -1435,9 +1807,10 @@ export function recordWorkspaceRecord(raw: unknown): WorkspaceRecordV1 {
   const recordId = crypto.randomUUID();
   mutateWorkspace(row, () => {
     const current = currentWorkspaceForMutation(row);
+    const linkedTask = input.taskId ? taskById(current, input.taskId) : undefined;
     if (input.actor === "child") {
-      if (!input.taskId) fail("child_confinement", "child records must name an assigned task");
-      assertAssignedChild(input, taskById(current, input.taskId));
+      if (!linkedTask) fail("child_confinement", "child records must name an assigned task");
+      assertAssignedChild(input, linkedTask);
     }
     const usage = currentWorkspaceUsage(getDb(), current);
     if (usage.recordCount >= current.quota.maxRecords || usage.byteCount + byteCount > current.quota.maxBytes) {
@@ -2137,7 +2510,6 @@ function planCognitionCompletion(
       activation: update.activation,
       accepted,
       blockingRequiredTaskIds,
-      blockingContextRequirements: update.blockingContextRequirements,
       materializedTaskIds: materialization.ids,
     }),
   });
@@ -2274,28 +2646,38 @@ export function updateWorkspaceTaskProgressWithCognition(
   requireCapability(input, "update_assigned_progress", raw);
   const task = taskById(row, input.taskId);
   assertAssignedChild(input, task);
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    fail("task_assignment_conflict", "terminal task cannot receive progress updates");
+  }
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
   database.transaction(() => {
     const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition transition");
+    if (!current) fail("stale_revision", "workspace revision changed before cognition transition");
+    const currentTask = taskById(current, task.id);
+    assertAssignedChild(input, currentTask);
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      fail("task_assignment_conflict", "terminal task cannot receive progress updates");
+    }
+    if (current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition transition");
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
     const now = Math.floor(Date.now() / 1000);
     const update = cognitionActivationUpdate(current, factory);
-    if (update.taskId !== task.id) fail("invalid_input", "cognition transition task does not match persisted task");
+    if (update.taskId !== currentTask.id) fail("invalid_input", "cognition transition task does not match persisted task");
     requireCognitionWorkspaceUpdate(current, update);
     const nextTaskState = cognitionTaskState(update.transition);
     if (updateRow(database, "agent_workspace_tasks", {
       state: nextTaskState,
-      progress: input.progress ?? task.progress,
-      revision: task.revision + 1,
+      progress: input.progress ?? currentTask.progress,
+      revision: currentTask.revision + 1,
       updated_at: now,
     }, {
-      task_id: task.id,
+      task_id: currentTask.id,
       workspace_id: current.workspaceId,
       turn_id: current.turnId,
       user_id: current.userId,
       chat_id: current.chatId,
-      revision: task.revision,
+      revision: currentTask.revision,
     }) !== 1) fail("stale_revision", "task revision changed before cognition transition");
     const committed = cognitionUpdateValues(current, update, now);
     result = Object.freeze({
@@ -2321,17 +2703,37 @@ export function submitWorkspaceChildResultWithCognition(
   requireCapability(input, "submit_child_result", raw);
   const task = taskById(row, input.taskId);
   assertAssignedChild(input, task);
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    if (
+      task.state === "completed"
+      && listWorkspaceRows("agent_workspace_submissions", row).some((candidate) => rowString(candidate, ["task_id"]) === task.id)
+    ) {
+      fail("submission_rejected", "task already has a submitted result");
+    }
+    fail("task_assignment_conflict", "terminal task cannot receive a child result");
+  }
   const submissionBytes = input.byteCount + utf8ByteLength(input.summary);
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
   database.transaction(() => {
     const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
     if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition submission");
+    const currentTask = taskById(current, task.id);
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
+    assertAssignedChild(input, currentTask);
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      if (
+        currentTask.state === "completed"
+        && listWorkspaceRows("agent_workspace_submissions", current).some((candidate) => rowString(candidate, ["task_id"]) === currentTask.id)
+      ) {
+        fail("submission_rejected", "task already has a submitted result");
+      }
+      fail("task_assignment_conflict", "terminal task cannot receive a child result");
+    }
     const usage = currentWorkspaceUsage(database, current);
     if (usage.submissionCount >= current.quota.maxSubmissions || usage.byteCount + submissionBytes > current.quota.maxBytes) {
       fail("quota_exceeded", "submission quota exceeded");
     }
-    if (task.state === "completed" && listWorkspaceRows("agent_workspace_submissions", current).some((candidate) => rowString(candidate, ["task_id"]) === task.id)) fail("submission_rejected", "task already has a submitted result");
     const now = Math.floor(Date.now() / 1000);
     const policy = input.retention === undefined ? { retention: current.retention, expiresAt: current.expiresAt } : retentionValue(input.retention, input.ttlSeconds, now);
     insertRow(database, "agent_workspace_submissions", {
@@ -2362,6 +2764,285 @@ export function submitWorkspaceChildResultWithCognition(
   if (!result) fail("stale_revision", "cognition submission transaction did not commit");
   return result;
 }
+export function submitWorkspaceRootResultWithCognition(
+  raw: unknown,
+  factory: CognitionWorkspaceActivationFactoryV1,
+): CognitionWorkspaceCommitResultV1 {
+  const input = validateSubmitWorkspaceRootResultInput(raw);
+  const row = requireWritable(input);
+  requireCapability(input, "submit_root_result", raw);
+  const task = taskById(row, input.taskId);
+  if (task.assignedFrameId !== null) fail("child_confinement", "root may not settle a child-assigned task");
+  const existingSubmission = listWorkspaceRows("agent_workspace_submissions", row)
+    .find((candidate) => rowString(candidate, ["task_id"]) === task.id);
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    if (!rootCognitionResultMatches(row, task, existingSubmission ? submissionFromRow(existingSubmission) : undefined, input)) {
+      fail("task_assignment_conflict", "terminal task cannot receive a different root result");
+    }
+    const update = cognitionActivationUpdate(row, factory);
+    if (update.taskId !== task.id) fail("invalid_input", "cognition root replay task does not match persisted task");
+    if (update.transition !== input.state) fail("invalid_state", "cognition root replay transition does not match persisted task");
+    if (
+      typeof update.operationKey !== "string"
+      || update.operationKey.length === 0
+      || taskOperationKey(row, task.id) !== update.operationKey
+    ) {
+      fail("task_assignment_conflict", "terminal cognition root operation key does not match the committed result");
+    }
+    requireCognitionWorkspaceUpdate(row, update);
+    return Object.freeze({
+      workspaceRevision: row.revision,
+      state: factory.state,
+      activation: update.activation,
+      materializedTaskIds: Object.freeze([]),
+      taskId: update.taskId,
+      transition: update.transition,
+      operationKey: update.operationKey,
+    });
+  }
+  const submissionBytes = input.state === "completed" ? utf8ByteLength(input.summary) : 0;
+  const database = getDb();
+  let result: CognitionWorkspaceCommitResultV1 | undefined;
+  database.transaction(() => {
+    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
+    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition root result");
+    const currentTask = taskById(current, task.id);
+    if (currentTask.assignedFrameId !== null) fail("child_confinement", "root may not settle a child-assigned task");
+    const currentSubmission = listWorkspaceRows("agent_workspace_submissions", current)
+      .find((candidate) => rowString(candidate, ["task_id"]) === currentTask.id);
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      if (!rootCognitionResultMatches(current, currentTask, currentSubmission ? submissionFromRow(currentSubmission) : undefined, input)) {
+        fail("task_assignment_conflict", "terminal task cannot receive a different root result");
+      }
+      const replay = cognitionActivationUpdate(current, factory);
+      if (replay.taskId !== currentTask.id) fail("invalid_input", "cognition root replay task does not match persisted task");
+      if (replay.transition !== input.state) fail("invalid_state", "cognition root replay transition does not match persisted task");
+      if (
+        typeof replay.operationKey !== "string"
+        || replay.operationKey.length === 0
+        || taskOperationKey(current, currentTask.id) !== replay.operationKey
+      ) {
+        fail("task_assignment_conflict", "terminal cognition root operation key does not match the committed result");
+      }
+      requireCognitionWorkspaceUpdate(current, replay);
+      result = Object.freeze({
+        workspaceRevision: current.revision,
+        state: factory.state,
+        activation: replay.activation,
+        materializedTaskIds: Object.freeze([]),
+        taskId: replay.taskId,
+        transition: replay.transition,
+        operationKey: replay.operationKey,
+      });
+      return;
+    }
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
+    if (currentSubmission) fail("submission_rejected", "task already has a submitted result");
+    const update = cognitionActivationUpdate(current, factory);
+    if (update.taskId !== currentTask.id) fail("invalid_input", "cognition root result task does not match persisted task");
+    if (update.transition !== input.state) fail("invalid_state", "cognition root result transition does not match requested state");
+    if (typeof update.operationKey !== "string" || update.operationKey.length === 0) {
+      fail("invalid_input", "cognition root result operation key is required");
+    }
+    requireCognitionWorkspaceUpdate(current, update);
+    const previousOperationKey = taskOperationKey(current, currentTask.id);
+    if (previousOperationKey !== null && previousOperationKey !== update.operationKey) {
+      fail("task_assignment_conflict", "cognition root operation identity is already committed");
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (input.state === "failed") {
+      const usage = currentWorkspaceUsage(database, current);
+      const summaryBytes = utf8ByteLength(input.summary);
+      if (usage.byteCount + summaryBytes > current.quota.maxBytes) {
+        fail("quota_exceeded", "workspace byte quota exceeded");
+      }
+      if (updateRow(database, "agent_workspace_tasks", {
+        state: "failed",
+        summary: input.summary,
+        cas_owner: update.operationKey,
+        cas_expires_at: rootResultPolicyIdentity(input),
+        revision: currentTask.revision + 1,
+        updated_at: now,
+      }, {
+        task_id: currentTask.id,
+        workspace_id: current.workspaceId,
+        turn_id: current.turnId,
+        user_id: current.userId,
+        chat_id: current.chatId,
+        revision: currentTask.revision,
+      }) !== 1) fail("stale_revision", "task revision changed before cognition root result");
+    } else {
+      const usage = currentWorkspaceUsage(database, current);
+      if (usage.submissionCount >= current.quota.maxSubmissions || usage.byteCount + submissionBytes > current.quota.maxBytes) {
+        fail("quota_exceeded", "submission quota exceeded");
+      }
+      const policy = input.retention === undefined ? { retention: current.retention, expiresAt: current.expiresAt } : retentionValue(input.retention, input.ttlSeconds, now);
+      insertRow(database, "agent_workspace_submissions", {
+        submission_id: crypto.randomUUID(),
+        task_id: currentTask.id,
+        workspace_id: current.workspaceId,
+        turn_id: current.turnId,
+        user_id: current.userId,
+        chat_id: current.chatId,
+        child_frame_id: input.frameId ?? "root",
+        state: "accepted",
+        summary: input.summary,
+        result_digest: summaryDigest(input.summary),
+        byte_count: submissionBytes,
+        revision: 0,
+        retention: policy.retention,
+        expires_at: policy.expiresAt,
+        created_at: now,
+        updated_at: now,
+      }, ["submission_id", "task_id", "workspace_id", "turn_id", "user_id", "chat_id", "child_frame_id", "state", "summary", "result_digest", "byte_count", "retention", "expires_at"]);
+      if (updateRow(database, "agent_workspace_tasks", {
+        state: "completed",
+        progress: 1,
+        summary: input.summary,
+        cas_owner: update.operationKey,
+        cas_expires_at: rootResultPolicyIdentity(input),
+        revision: currentTask.revision + 1,
+        updated_at: now,
+      }, {
+        task_id: currentTask.id,
+        workspace_id: current.workspaceId,
+        turn_id: current.turnId,
+        user_id: current.userId,
+        chat_id: current.chatId,
+        revision: currentTask.revision,
+      }) !== 1) fail("stale_revision", "task revision changed before cognition root result");
+    }
+    const committed = cognitionUpdateValues(current, update, now);
+    result = Object.freeze({
+      workspaceRevision: committed.revision,
+      state: committed.state,
+      activation: update.activation,
+      materializedTaskIds: committed.materializedTaskIds,
+      taskId: update.taskId,
+      transition: update.transition,
+      operationKey: update.operationKey,
+    });
+  })();
+  if (!result) fail("stale_revision", "cognition root result transaction did not commit");
+  return result;
+}
+
+export function settleWorkspaceChildTaskWithCognition(
+  raw: unknown,
+  factory: CognitionWorkspaceActivationFactoryV1,
+): CognitionWorkspaceCommitResultV1 {
+  const input = validateSettleWorkspaceChildTaskInput(raw);
+  const row = requireWritable(input);
+  requireCapability(input, "update_assigned_progress", raw);
+  const task = taskById(row, input.taskId);
+  if (task.assignedFrameId !== input.assignedFrameId) {
+    fail("child_confinement", "child settlement does not match the assigned frame");
+  }
+  if (task.state === "completed" || task.state === "cancelled" || task.state === "failed") {
+    if (task.state !== input.state) {
+      fail("task_assignment_conflict", "terminal task cannot be downgraded by child settlement");
+    }
+    const update = cognitionActivationUpdate(row, factory);
+    if (update.taskId !== task.id) fail("invalid_input", "cognition child settlement task does not match persisted task");
+    if (update.transition !== input.state) fail("invalid_state", "cognition child settlement transition does not match persisted task");
+    if (
+      typeof update.operationKey !== "string"
+      || update.operationKey.length === 0
+      || taskOperationKey(row, task.id) !== update.operationKey
+    ) {
+      fail("task_assignment_conflict", "terminal task settlement operation key does not match the committed settlement");
+    }
+    requireCognitionWorkspaceUpdate(row, update);
+    return Object.freeze({
+      workspaceRevision: row.revision,
+      state: factory.state,
+      activation: update.activation,
+      materializedTaskIds: Object.freeze([]),
+      taskId: update.taskId,
+      transition: update.transition,
+      operationKey: update.operationKey,
+    });
+  }
+
+  const database = getDb();
+  let result: CognitionWorkspaceCommitResultV1 | undefined;
+  database.transaction(() => {
+    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
+    if (!current) fail("stale_revision", "workspace revision changed before child settlement");
+    const currentTask = taskById(current, task.id);
+    if (currentTask.assignedFrameId !== input.assignedFrameId) fail("child_confinement", "child settlement does not match the assigned frame");
+    if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
+      if (currentTask.state !== input.state) {
+        fail("task_assignment_conflict", "terminal task cannot be downgraded by child settlement");
+      }
+      const update = cognitionActivationUpdate(current, factory);
+      if (update.taskId !== currentTask.id) fail("invalid_input", "cognition child settlement task does not match persisted task");
+      if (update.transition !== input.state) fail("invalid_state", "cognition child settlement transition does not match persisted task");
+      if (
+        typeof update.operationKey !== "string"
+        || update.operationKey.length === 0
+        || taskOperationKey(current, currentTask.id) !== update.operationKey
+      ) {
+        fail("task_assignment_conflict", "terminal task settlement operation key does not match the committed settlement");
+      }
+      requireCognitionWorkspaceUpdate(current, update);
+      result = Object.freeze({
+        workspaceRevision: current.revision,
+        state: factory.state,
+        activation: update.activation,
+        materializedTaskIds: Object.freeze([]),
+        taskId: update.taskId,
+        transition: update.transition,
+        operationKey: update.operationKey,
+      });
+      return;
+    }
+    if (current.revision !== row.revision) fail("stale_revision", "workspace revision changed before child settlement");
+    if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
+    const update = cognitionActivationUpdate(current, factory);
+    if (update.taskId !== currentTask.id) fail("invalid_input", "cognition child settlement task does not match persisted task");
+    if (typeof update.operationKey !== "string" || update.operationKey.length === 0) {
+      fail("invalid_input", "cognition child settlement operation key is required");
+    }
+    if (update.transition !== input.state) fail("invalid_state", "cognition child settlement transition does not match persisted task");
+    requireCognitionWorkspaceUpdate(current, update);
+    const now = Math.floor(Date.now() / 1000);
+    // Workspace task CAS ownership is otherwise unused by this service. Keep
+    // the committed cognition settlement key in the durable task row so a
+    // later service call cannot accept a new key from terminal state alone.
+    const previousOperationKey = taskOperationKey(current, currentTask.id);
+    if (previousOperationKey !== null && previousOperationKey !== update.operationKey) {
+      fail("task_assignment_conflict", "task settlement operation identity is already committed");
+    }
+    if (updateRow(database, "agent_workspace_tasks", {
+      state: input.state,
+      cas_owner: update.operationKey,
+      revision: currentTask.revision + 1,
+      updated_at: now,
+    }, {
+      task_id: currentTask.id,
+      workspace_id: current.workspaceId,
+      turn_id: current.turnId,
+      user_id: current.userId,
+      chat_id: current.chatId,
+      revision: currentTask.revision,
+    }) !== 1) fail("stale_revision", "task revision changed before child settlement");
+    const committed = cognitionUpdateValues(current, update, now);
+    result = Object.freeze({
+      workspaceRevision: committed.revision,
+      state: committed.state,
+      activation: update.activation,
+      materializedTaskIds: committed.materializedTaskIds,
+      taskId: update.taskId,
+      transition: update.transition,
+      operationKey: update.operationKey,
+    });
+  })();
+  if (!result) fail("stale_revision", "cognition child settlement transaction did not commit");
+  return result;
+}
+
+
 
 export function acceptWorkspaceSubmissionWithCognition(
   raw: unknown,
@@ -2371,18 +3052,20 @@ export function acceptWorkspaceSubmissionWithCognition(
   const row = requireWritable(input);
   if (input.actor !== "host" && input.actor !== "root") fail("forbidden", "only host/root accept submissions");
   const submission = submissionById(row, input.submissionId);
+  submissionTaskForAcceptance(row, input, submission);
   if (submission.state === "rejected") fail("submission_rejected", "rejected submissions cannot be accepted");
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
   database.transaction(() => {
     const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
     if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition acceptance");
+    const currentSubmission = submissionById(current, input.submissionId);
+    const currentTask = submissionTaskForAcceptance(current, input, currentSubmission);
     const now = Math.floor(Date.now() / 1000);
-    if (submission.state !== "accepted" && updateRow(database, "agent_workspace_submissions", { state: "accepted", revision: submission.revision + 1, updated_at: now }, { submission_id: submission.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: submission.revision }) !== 1) fail("stale_revision", "submission revision changed before cognition acceptance");
-    const task = taskById(current, submission.taskId);
-    if (submission.state !== "accepted" && updateRow(database, "agent_workspace_tasks", { summary: submission.summary, revision: task.revision + 1, updated_at: now }, { task_id: task.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: task.revision }) !== 1) fail("stale_revision", "task revision changed before cognition acceptance");
+    if (currentSubmission.state !== "accepted" && updateRow(database, "agent_workspace_submissions", { state: "accepted", revision: currentSubmission.revision + 1, updated_at: now }, { submission_id: currentSubmission.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: currentSubmission.revision }) !== 1) fail("stale_revision", "submission revision changed before cognition acceptance");
+    if (currentSubmission.state !== "accepted" && updateRow(database, "agent_workspace_tasks", { summary: currentSubmission.summary, revision: currentTask.revision + 1, updated_at: now }, { task_id: currentTask.id, workspace_id: current.workspaceId, turn_id: current.turnId, user_id: current.userId, chat_id: current.chatId, revision: currentTask.revision }) !== 1) fail("stale_revision", "task revision changed before cognition acceptance");
     const update = cognitionActivationUpdate(current, factory);
-    if (update.taskId !== submission.taskId) fail("invalid_input", "cognition acceptance task does not match persisted submission task");
+    if (update.taskId !== currentSubmission.taskId) fail("invalid_input", "cognition acceptance task does not match persisted submission task");
     requireCognitionWorkspaceUpdate(current, update);
     const committed = cognitionUpdateValues(current, update, now);
     result = Object.freeze({ workspaceRevision: committed.revision, state: committed.state, activation: update.activation, materializedTaskIds: committed.materializedTaskIds, taskId: update.taskId, transition: update.transition, ...(update.operationKey ? { operationKey: update.operationKey } : {}) });
@@ -2401,7 +3084,6 @@ function completionCandidateMatches(
       && JSON.stringify(expected.state) === JSON.stringify(actual.state)
       && JSON.stringify(expected.activation) === JSON.stringify(actual.activation)
       && JSON.stringify(expected.blockingRequiredTaskIds) === JSON.stringify(actual.blockingRequiredTaskIds)
-      && JSON.stringify(expected.blockingContextRequirements) === JSON.stringify(actual.blockingContextRequirements)
       && JSON.stringify(expected.materializedTaskIds) === JSON.stringify(actual.materializedTaskIds);
   } catch {
     return false;
@@ -2660,7 +3342,7 @@ function validateCreatePersistentTurnSession(value: unknown): CreatePersistentWo
     turnSessionId: value.turnSessionId === undefined ? undefined : idValue(value.turnSessionId, "turnSession.turnSessionId"),
     turnId: idValue(value.turnId, "turnSession.turnId"),
     attemptId: idValue(value.attemptId, "turnSession.attemptId"),
-    executionId: value.executionId === undefined || value.executionId === null ? null : idValue(value.executionId, "turnSession.executionId"),
+    executionId: value.executionId === undefined ? undefined : value.executionId === null ? null : idValue(value.executionId, "turnSession.executionId"),
     expectedRevision: value.expectedRevision === undefined ? undefined : integer(value.expectedRevision, "turnSession.expectedRevision", 0, Number.MAX_SAFE_INTEGER),
   });
 }
@@ -2768,16 +3450,11 @@ function validateDeletePersistentWorkspace(value: unknown): DeletePersistentWork
 function persistentRows(table: string, workspace: PersistentWorkspaceRow): Array<Record<string, unknown>> {
   const database = getDb();
   if (!tableExists(database, table)) persistentFail("schema_unavailable", `${table} is unavailable`);
-  const filterByChat = table !== "persistent_workspace_publications";
-  const chatPredicate = !filterByChat ? "" : workspace.chatId === null ? " AND chat_id IS NULL" : " AND chat_id = ?";
-  const params = !filterByChat
-    ? [workspace.id, workspace.userId]
-    : workspace.chatId === null ? [workspace.id, workspace.userId] : [workspace.id, workspace.userId, workspace.chatId];
   return database.query(
     `SELECT * FROM ${quoteIdentifier(table)}
-      WHERE workspace_id = ? AND user_id = ?${chatPredicate}
+      WHERE workspace_id = ? AND user_id = ?
       ORDER BY created_at ASC, rowid ASC`,
-  ).all(...params) as Array<Record<string, unknown>>;
+  ).all(workspace.id, workspace.userId) as Array<Record<string, unknown>>;
 }
 
 function persistentWorkspaceFromRow(raw: Record<string, unknown>): PersistentWorkspaceRow {
@@ -2839,31 +3516,29 @@ function persistentWorkspaceSnapshot(workspace: PersistentWorkspaceRow): Persist
 
 function persistentWorkspaceUsage(workspace: PersistentWorkspaceRow): PersistentWorkspaceUsageV1 {
   const database = getDb();
-  const count = (table: string): number => {
-    if (!tableExists(database, table)) return 0;
-    const filterByChat = table !== "persistent_workspace_publications";
-    const chatPredicate = !filterByChat ? "" : workspace.chatId === null ? " AND chat_id IS NULL" : " AND chat_id = ?";
-    const params = !filterByChat
-      ? [workspace.id, workspace.userId]
-      : workspace.chatId === null ? [workspace.id, workspace.userId] : [workspace.id, workspace.userId, workspace.chatId];
+  const requiredTables = [
+    "persistent_workspace_tasks",
+    "persistent_workspace_records",
+    "persistent_workspace_submissions",
+    "persistent_workspace_artifacts",
+    "persistent_workspace_publications",
+  ] as const;
+  for (const table of requiredTables) {
+    if (!tableExists(database, table)) persistentFail("schema_unavailable", `${table} is unavailable`);
+  }
+  const count = (table: (typeof requiredTables)[number]): number => {
     const row = database.query(
       `SELECT COUNT(*) AS count FROM ${quoteIdentifier(table)}
-        WHERE workspace_id = ? AND user_id = ?${chatPredicate}`,
-    ).get(...params) as Record<string, unknown> | null;
+        WHERE workspace_id = ? AND user_id = ?`,
+    ).get(workspace.id, workspace.userId) as Record<string, unknown> | null;
     return rowNumber(row ?? {}, ["count"]);
   };
-  const bytes = (table: string, columns: readonly string[]): number => {
-    if (!tableExists(database, table)) return 0;
+  const bytes = (table: (typeof requiredTables)[number], columns: readonly string[]): number => {
     const expression = columns.map((column) => `COALESCE(${quoteIdentifier(column)}, 0)`).join(" + ");
-    const filterByChat = table !== "persistent_workspace_publications";
-    const chatPredicate = !filterByChat ? "" : workspace.chatId === null ? " AND chat_id IS NULL" : " AND chat_id = ?";
-    const params = !filterByChat
-      ? [workspace.id, workspace.userId]
-      : workspace.chatId === null ? [workspace.id, workspace.userId] : [workspace.id, workspace.userId, workspace.chatId];
     const row = database.query(
       `SELECT COALESCE(SUM(${expression}), 0) AS bytes FROM ${quoteIdentifier(table)}
-        WHERE workspace_id = ? AND user_id = ?${chatPredicate}`,
-    ).get(...params) as Record<string, unknown> | null;
+        WHERE workspace_id = ? AND user_id = ?`,
+    ).get(workspace.id, workspace.userId) as Record<string, unknown> | null;
     return rowNumber(row ?? {}, ["bytes"]);
   };
   return Object.freeze({
@@ -2879,16 +3554,11 @@ function persistentWorkspaceUsage(workspace: PersistentWorkspaceRow): Persistent
       + bytes("persistent_workspace_publications", ["byte_count"]),
   });
 }
-
 function persistentRefreshedWorkspace(workspace: PersistentWorkspaceRow): PersistentWorkspaceRow {
   const database = getDb();
-  const raw = workspace.chatId === null
-    ? database.query(
-      "SELECT * FROM persistent_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id IS NULL",
-    ).get(workspace.id, workspace.userId) as Record<string, unknown> | null
-    : database.query(
-      "SELECT * FROM persistent_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id = ?",
-    ).get(workspace.id, workspace.userId, workspace.chatId) as Record<string, unknown> | null;
+  const raw = database.query(
+    "SELECT * FROM persistent_workspaces WHERE workspace_id = ? AND user_id = ?",
+  ).get(workspace.id, workspace.userId) as Record<string, unknown> | null;
   if (!raw) persistentFail("not_found", "persistent workspace was not found");
   const current = persistentWorkspaceFromRow(raw);
   const usage = persistentWorkspaceUsage(current);
@@ -2917,7 +3587,9 @@ function persistentAttemptMatches(
   turnId: string,
   attemptId: string,
 ): boolean {
-  if (!tableExists(database, "agent_run_attempts")) return true;
+  if (!tableExists(database, "agent_run_attempts")) {
+    persistentFail("schema_unavailable", "turn attempt schema is unavailable");
+  }
   return database.query(
     `SELECT 1 AS present
        FROM agent_run_attempts
@@ -3049,6 +3721,32 @@ function persistentCommitWorkspace(workspace: PersistentWorkspaceRow, values: Re
   if (changed !== 1) persistentFail("stale_revision", "persistent workspace changed during mutation");
   return workspace.revision + 1;
 }
+function persistentDependencyIdentifier(value: unknown, path: string): string {
+  if (typeof value !== "string" || value.length === 0 || utf8ByteLength(value) > PERSISTENT_WORKSPACE_ID_MAX_BYTES || !SAFE_ID.test(value)) {
+    persistentFail("invalid_state", `${path} is not a bounded dependency identifier`);
+  }
+  return value;
+}
+
+function persistentDependencyIds(value: unknown, path: string): readonly string[] {
+  if (typeof value !== "string" || value.length === 0) {
+    persistentFail("invalid_state", `${path} must be a persisted JSON dependency array`);
+  }
+  const parsed = persistentParsedJson<unknown>(value, path, []);
+  if (!Array.isArray(parsed) || parsed.length > PERSISTENT_WORKSPACE_MAX_DEPENDENCIES) {
+    persistentFail("invalid_state", `${path} must be a bounded dependency array`);
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  parsed.forEach((entry, index) => {
+    const id = persistentDependencyIdentifier(entry, `${path}[${index}]`);
+    if (seen.has(id)) persistentFail("invalid_state", `${path} contains duplicate identifiers`);
+    seen.add(id);
+    result.push(id);
+  });
+  return Object.freeze(result);
+}
+
 
 function persistentTaskFromRow(raw: Record<string, unknown>): PersistentWorkspaceTask {
   const state = rowString(raw, ["state"], "pending") as WorkspaceTaskStateV1;
@@ -3057,18 +3755,19 @@ function persistentTaskFromRow(raw: Record<string, unknown>): PersistentWorkspac
   const progress = persistentProgress(persistentParsedJson(raw.progress_json, "task.progress", {}), "task.progress", false, now);
   const creator = rowString(raw, ["creator"], "owner");
   if (creator !== "host" && creator !== "owner") persistentFail("invalid_state", "persistent task creator is invalid");
+  const dependencyIds = persistentDependencyIds(raw.dependency_ids_json, "task.dependencies");
   return deepFreeze({
     version: 1,
     id: rowString(raw, ["task_id"]),
     workspaceId: rowString(raw, ["workspace_id"]),
     turnSessionId: rowNullableString(raw, ["turn_session_id"]),
     userId: rowString(raw, ["user_id"]),
-    chatId: rowString(raw, ["chat_id"]),
+    chatId: rowNullableString(raw, ["chat_id"]),
     title: rowString(raw, ["title"]),
     objective: rowString(raw, ["objective"]),
     state,
     required: rowNumber(raw, ["required"]) === 1,
-    dependencyIds: Object.freeze(jsonArray(raw.dependency_ids_json)),
+    dependencyIds,
     creator,
     hostAdmitted: rowNumber(raw, ["host_admitted"]) === 1,
     progress,
@@ -3088,6 +3787,9 @@ function materializePersistentWorkspaceTask(
   const taskId = input.id ?? crypto.randomUUID();
   idValue(taskId, "task.id");
   const database = getDb();
+  if (database.query("SELECT 1 AS present FROM persistent_workspace_tasks WHERE task_id = ? LIMIT 1").get(taskId)) {
+    persistentFail("duplicate_id", "persistent task identifier is already in use");
+  }
   const turnSessionId = input.turnSessionId ?? null;
   const dependencyIds = input.dependencyIds ?? [];
   if (turnSessionId !== null) {
@@ -3096,36 +3798,42 @@ function materializePersistentWorkspaceTask(
     ).get(turnSessionId, workspace.id, workspace.userId, workspace.chatId);
     if (!session) persistentFail("not_found", "task turn session was not found");
   }
-  if (database.query("SELECT 1 AS present FROM persistent_workspace_tasks WHERE task_id = ? AND workspace_id = ? LIMIT 1").get(taskId, workspace.id)) persistentFail("duplicate_id", "persistent task identifier is already in use");
   persistentAssertDependencies(workspace, taskId, dependencyIds);
   const usage = persistentWorkspaceUsage(workspace);
   const progress = persistentProgress(undefined, "task.progress", false, Math.floor(Date.now() / 1000));
   const byteCount = utf8ByteLength(input.title) + utf8ByteLength(input.objective) + utf8ByteLength(JSON.stringify(dependencyIds)) + utf8ByteLength(JSON.stringify(progress));
   if (usage.taskCount >= workspace.quota.maxTasks || usage.byteCount + byteCount > workspace.quota.maxBytes) persistentFail("quota_exceeded", "persistent workspace task quota exceeded");
   const now = Math.floor(Date.now() / 1000);
-  database.transaction(() => {
-    insertRow(database, "persistent_workspace_tasks", {
-      task_id: taskId,
-      workspace_id: workspace.id,
-      turn_session_id: turnSessionId,
-      user_id: workspace.userId,
-      chat_id: workspace.chatId,
-      title: input.title,
-      objective: input.objective,
-      state: input.state,
-      required: input.required ? 1 : 0,
-      dependency_ids_json: JSON.stringify(dependencyIds),
-      creator,
-      host_admitted: hostAdmitted ? 1 : 0,
-      progress_json: JSON.stringify(progress),
-      summary: "",
-      byte_count: byteCount,
-      revision: 0,
-      created_at: now,
-      updated_at: now,
-    }, ["task_id", "workspace_id", "user_id", "chat_id", "title", "objective", "state", "dependency_ids_json", "creator", "host_admitted", "progress_json", "revision"]);
-    persistentCommitWorkspace(workspace, {}, now);
-  })();
+  try {
+    database.transaction(() => {
+      insertRow(database, "persistent_workspace_tasks", {
+        task_id: taskId,
+        workspace_id: workspace.id,
+        turn_session_id: turnSessionId,
+        user_id: workspace.userId,
+        chat_id: workspace.chatId,
+        title: input.title,
+        objective: input.objective,
+        state: input.state,
+        required: input.required ? 1 : 0,
+        dependency_ids_json: JSON.stringify(dependencyIds),
+        creator,
+        host_admitted: hostAdmitted ? 1 : 0,
+        progress_json: JSON.stringify(progress),
+        summary: "",
+        byte_count: byteCount,
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+      }, ["task_id", "workspace_id", "user_id", "chat_id", "title", "objective", "state", "dependency_ids_json", "creator", "host_admitted", "progress_json", "revision"]);
+      persistentCommitWorkspace(workspace, {}, now);
+    })();
+  } catch (error) {
+    if (isPersistentTaskIdentifierConflict(error)) {
+      persistentFail("duplicate_id", "persistent task identifier is already in use");
+    }
+    throw error;
+  }
   const refreshed = persistentRefreshedWorkspace(workspace);
   return persistentTaskById(refreshed, taskId);
 }
@@ -3153,7 +3861,9 @@ export function createPersistentWorkspaceHostTask(
 
 export function listPersistentWorkspaceTasks(raw: unknown): readonly PersistentWorkspaceTask[] {
   const workspace = requirePersistentWorkspace(persistentContext(raw, "persistentTasks"));
-  return Object.freeze(persistentRows("persistent_workspace_tasks", workspace).map(persistentTaskFromRow));
+  const rows = persistentRows("persistent_workspace_tasks", workspace);
+  persistentDependencyGraph(rows);
+  return Object.freeze(rows.map(persistentTaskFromRow));
 }
 
 function mergePersistentMetadata(current: PersistentWorkspaceMetadataV1, patch: unknown): PersistentWorkspaceMetadataV1 {
@@ -3301,7 +4011,7 @@ function persistentSessionFromRow(raw: Record<string, unknown>): PersistentWorks
     id: rowString(raw, ["turn_session_id"]),
     workspaceId: rowString(raw, ["workspace_id"]),
     userId: rowString(raw, ["user_id"]),
-    chatId: rowString(raw, ["chat_id"]),
+    chatId: rowNullableString(raw, ["chat_id"]),
     turnId: rowString(raw, ["turn_id"]),
     attemptId: rowString(raw, ["attempt_id"]),
     executionId: rowNullableString(raw, ["execution_id"]),
@@ -3344,12 +4054,36 @@ function createPersistentWorkspaceTurnSession(raw: unknown): PersistentWorkspace
     expectedRevision,
   });
   const database = getDb();
-  const existing = database.query(
+  const existingByTurn = database.query(
     `SELECT * FROM persistent_workspace_turn_sessions
-      WHERE workspace_id = ? AND user_id = ? AND chat_id = ? AND turn_id = ? AND attempt_id = ?
+      WHERE user_id = ? AND turn_id = ? AND attempt_id = ?
       LIMIT 1`,
-  ).get(workspace.id, workspace.userId, workspace.chatId, input.turnId, input.attemptId) as Record<string, unknown> | null;
-  if (existing) return persistentSessionFromRow(existing);
+  ).get(workspace.userId, input.turnId, input.attemptId) as Record<string, unknown> | null;
+  const existingBySessionId = input.turnSessionId === undefined
+    ? null
+    : database.query(
+      `SELECT * FROM persistent_workspace_turn_sessions
+        WHERE turn_session_id = ?
+        LIMIT 1`,
+    ).get(input.turnSessionId) as Record<string, unknown> | null;
+  const existingCandidates = [existingByTurn, existingBySessionId].filter(
+    (candidate): candidate is Record<string, unknown> => candidate !== null,
+  );
+  if (existingCandidates.length > 0) {
+    const matches = existingCandidates.every((candidate) => (
+      input.turnSessionId !== undefined
+      && input.executionId !== undefined
+      && rowString(candidate, ["turn_session_id"]) === input.turnSessionId
+      && rowString(candidate, ["workspace_id"]) === workspace.id
+      && rowString(candidate, ["user_id"]) === workspace.userId
+      && rowNullableString(candidate, ["chat_id"]) === workspace.chatId
+      && rowString(candidate, ["turn_id"]) === input.turnId
+      && rowString(candidate, ["attempt_id"]) === input.attemptId
+      && rowNullableString(candidate, ["execution_id"]) === input.executionId
+    ));
+    if (!matches) persistentFail("task_assignment_conflict", "turn session identity conflicts with an existing session");
+    return persistentSessionFromRow(existingByTurn ?? existingBySessionId!);
+  }
   if (!persistentAttemptMatches(database, workspace.userId, input.chatId, input.turnId, input.attemptId)) {
     persistentFail("not_found", "turn attempt was not found for this owner and chat");
   }
@@ -3363,7 +4097,7 @@ function createPersistentWorkspaceTurnSession(raw: unknown): PersistentWorkspace
       chat_id: workspace.chatId,
       turn_id: input.turnId,
       attempt_id: input.attemptId,
-      execution_id: input.executionId,
+      execution_id: input.executionId ?? null,
       phase: "ADMIT",
       status: "pending",
       outcome: null,
@@ -3392,9 +4126,8 @@ export function createPersistentWorkspaceHostTurnSession(
 }
 
 /**
- * Host-only turn-session transition. Owner-facing routes must not be able to
- * mutate the private session audit; only the runtime holding the opaque host
- * authority may advance it.
+ * Host-only turn-session transition. This owner/workspace/session CAS remains
+ * usable after source-chat deletion; owner-facing routes have no access to it.
  */
 export function updatePersistentWorkspaceHostTurnSession(
   authorityRaw: unknown,
@@ -3508,45 +4241,78 @@ export function getPersistentWorkspaceForChat(raw: unknown): PersistentWorkspace
 }
 
 
-export function listPersistentWorkspaceTurnSessions(raw: unknown): readonly PersistentWorkspaceTurnSession[] {
-  const context = persistentContext(raw, "persistentTurnSessions");
-  const workspace = requirePersistentWorkspace(context);
-  const chatPredicate = workspace.chatId === null ? "chat_id IS NULL" : "chat_id = ?";
-  const values = workspace.chatId === null
-    ? [workspace.id, workspace.userId]
-    : [workspace.id, workspace.userId, workspace.chatId];
-  const rows = getDb().query(
-    `SELECT * FROM persistent_workspace_turn_sessions
-      WHERE workspace_id = ? AND user_id = ? AND ${chatPredicate}
-      ORDER BY created_at ASC, rowid ASC`,
-  ).all(...values) as Array<Record<string, unknown>>;
-  return Object.freeze(rows.map(persistentSessionFromRow));
+function validatePersistentWorkspaceTurnSessionPagination(pagination: PaginationParams): PaginationParams {
+  if (
+    !Number.isSafeInteger(pagination.limit)
+    || pagination.limit < 1
+    || pagination.limit > MAX_LIMIT
+    || !Number.isSafeInteger(pagination.offset)
+    || pagination.offset < 0
+    || pagination.offset > PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET
+  ) {
+    persistentFail("invalid_input", "persistent turn session pagination is invalid");
+  }
+  return pagination;
 }
 
-function validatePersistentSessionUpdate(value: unknown): UpdatePersistentWorkspaceTurnSessionInputV1 {
-  const context = persistentContext(value, "persistentTurnSessionUpdate");
+export function listPersistentWorkspaceTurnSessions(
+  raw: unknown,
+  pagination: PaginationParams,
+): PersistentWorkspaceTurnSessionPageV1 {
+  const boundedPagination = validatePersistentWorkspaceTurnSessionPagination(pagination);
+  const context = persistentContext(raw, "persistentTurnSessions");
+  const workspace = requirePersistentWorkspace(context);
+  const database = getDb();
+  const rows = database.query(
+    `SELECT * FROM persistent_workspace_turn_sessions
+      WHERE workspace_id = ? AND user_id = ?
+      ORDER BY created_at ASC, rowid ASC
+      LIMIT ? OFFSET ?`,
+  ).all(workspace.id, workspace.userId, boundedPagination.limit, boundedPagination.offset) as Array<Record<string, unknown>>;
+  const count = database.query(
+    `SELECT COUNT(*) AS count
+       FROM persistent_workspace_turn_sessions
+      WHERE workspace_id = ? AND user_id = ?`,
+  ).get(workspace.id, workspace.userId) as { count: number } | null;
+  return Object.freeze({
+    data: rows.map(persistentSessionFromRow),
+    total: count?.count ?? 0,
+    limit: boundedPagination.limit,
+    offset: boundedPagination.offset,
+  });
+}
+
+type PersistentWorkspaceHostTurnSessionUpdateV1 = Omit<UpdatePersistentWorkspaceTurnSessionInputV1, "chatId">;
+
+function validatePersistentSessionUpdate(value: unknown): PersistentWorkspaceHostTurnSessionUpdateV1 {
   if (!isRecord(value)) persistentFail("invalid_input", "turn session update must be an object");
-  persistentAllowed(value, ["userId", "chatId", "workspaceId", "expectedRevision", "turnSessionId", "phase", "status", "outcome"], "persistentTurnSessionUpdate");
+  persistentAllowed(value, ["userId", "workspaceId", "expectedRevision", "turnSessionId", "phase", "status", "outcome"], "persistentTurnSessionUpdate");
   if (value.phase !== undefined && (typeof value.phase !== "string" || !(PERSISTENT_WORKSPACE_TURN_PHASES as readonly string[]).includes(value.phase))) persistentFail("invalid_input", "turn session phase is invalid");
   if (value.status !== undefined && (typeof value.status !== "string" || !(PERSISTENT_WORKSPACE_TURN_STATUSES as readonly string[]).includes(value.status))) persistentFail("invalid_input", "turn session status is invalid");
   if (value.outcome !== undefined && value.outcome !== null && (typeof value.outcome !== "string" || !(PERSISTENT_WORKSPACE_TERMINAL_OUTCOMES as readonly string[]).includes(value.outcome))) persistentFail("invalid_input", "turn session outcome is invalid");
   return Object.freeze({
-    ...context,
+    userId: idValue(value.userId, "persistentTurnSessionUpdate.userId"),
+    workspaceId: idValue(value.workspaceId, "persistentTurnSessionUpdate.workspaceId"),
+    expectedRevision: integer(value.expectedRevision, "persistentTurnSessionUpdate.expectedRevision", 0, Number.MAX_SAFE_INTEGER),
     turnSessionId: idValue(value.turnSessionId, "turnSessionId"),
-    phase: value.phase as UpdatePersistentWorkspaceTurnSessionInputV1["phase"],
-    status: value.status as UpdatePersistentWorkspaceTurnSessionInputV1["status"],
-    outcome: value.outcome as UpdatePersistentWorkspaceTurnSessionInputV1["outcome"],
+    phase: value.phase as PersistentWorkspaceHostTurnSessionUpdateV1["phase"],
+    status: value.status as PersistentWorkspaceHostTurnSessionUpdateV1["status"],
+    outcome: value.outcome as PersistentWorkspaceHostTurnSessionUpdateV1["outcome"],
   });
 }
 
 function updatePersistentWorkspaceTurnSession(raw: unknown): PersistentWorkspaceTurnSession {
   const input = validatePersistentSessionUpdate(raw);
-  const workspace = persistentWritableWorkspace(input);
   const database = getDb();
+  const workspaceRaw = database.query(
+    "SELECT * FROM persistent_workspaces WHERE workspace_id = ? AND user_id = ? LIMIT 1",
+  ).get(input.workspaceId, input.userId) as Record<string, unknown> | null;
+  if (!workspaceRaw) persistentFail("not_found", "persistent workspace was not found");
+  const workspace = persistentRefreshedWorkspace(persistentWorkspaceFromRow(workspaceRaw));
   const current = database.query(
     `SELECT * FROM persistent_workspace_turn_sessions
-      WHERE turn_session_id = ? AND workspace_id = ? AND user_id = ? AND chat_id = ? LIMIT 1`,
-  ).get(input.turnSessionId, workspace.id, workspace.userId, workspace.chatId) as Record<string, unknown> | null;
+      WHERE turn_session_id = ? AND workspace_id = ? AND user_id = ? LIMIT 1`,
+  ).get(input.turnSessionId, workspace.id, workspace.userId) as Record<string, unknown> | null;
   if (!current) persistentFail("not_found", "turn session was not found");
   const session = persistentSessionFromRow(current);
   const phaseOrder = new Map<string, number>(PERSISTENT_WORKSPACE_TURN_PHASES.map((phase, index) => [phase, index]));
@@ -3560,27 +4326,41 @@ function updatePersistentWorkspaceTurnSession(raw: unknown): PersistentWorkspace
     }
     return session;
   }
+  if (workspace.revision !== input.expectedRevision) {
+    persistentFail("stale_revision", "persistent workspace revision is stale", { expected: input.expectedRevision, actual: workspace.revision });
+  }
   if (status === "terminal" && phase !== "TERMINAL") persistentFail("invalid_state", "terminal status requires TERMINAL phase");
   if (phase === "TERMINAL" && status !== "terminal") persistentFail("invalid_state", "TERMINAL phase requires terminal status");
   if (phase === "TERMINAL" && !outcome) persistentFail("invalid_state", "TERMINAL phase requires an outcome");
   if (phase !== "TERMINAL" && outcome) persistentFail("invalid_state", "nonterminal session cannot have an outcome");
   const now = Math.floor(Date.now() / 1000);
-  const changed = updateRow(database, "persistent_workspace_turn_sessions", {
+  const changed = database.query(
+    `UPDATE persistent_workspace_turn_sessions
+        SET phase = ?, status = ?, outcome = ?, revision = ?, updated_at = ?, terminal_at = ?
+      WHERE turn_session_id = ? AND workspace_id = ? AND user_id = ? AND revision = ?
+        AND EXISTS (
+          SELECT 1 FROM persistent_workspaces
+           WHERE workspace_id = ? AND user_id = ? AND revision = ?
+        )`,
+  ).run(
     phase,
     status,
     outcome,
-    revision: session.revision + 1,
-    updated_at: now,
-    terminal_at: phase === "TERMINAL" ? now : null,
-  }, {
-    turn_session_id: session.id,
-    workspace_id: workspace.id,
-    user_id: workspace.userId,
-    chat_id: workspace.chatId,
-    revision: session.revision,
-  });
+    session.revision + 1,
+    now,
+    phase === "TERMINAL" ? now : null,
+    session.id,
+    workspace.id,
+    workspace.userId,
+    session.revision,
+    workspace.id,
+    workspace.userId,
+    input.expectedRevision,
+  ).changes;
   if (changed !== 1) persistentFail("stale_revision", "turn session revision is stale");
-  const next = database.query("SELECT * FROM persistent_workspace_turn_sessions WHERE turn_session_id = ? AND workspace_id = ? AND user_id = ? AND chat_id = ?").get(session.id, workspace.id, workspace.userId, workspace.chatId) as Record<string, unknown> | null;
+  const next = database.query(
+    "SELECT * FROM persistent_workspace_turn_sessions WHERE turn_session_id = ? AND workspace_id = ? AND user_id = ? LIMIT 1",
+  ).get(session.id, workspace.id, workspace.userId) as Record<string, unknown> | null;
   if (!next) persistentFail("not_found", "turn session disappeared");
   return persistentSessionFromRow(next);
 }
@@ -3588,16 +4368,25 @@ function updatePersistentWorkspaceTurnSession(raw: unknown): PersistentWorkspace
 function persistentTaskById(workspace: PersistentWorkspaceRow, taskId: string): PersistentWorkspaceTask {
   const row = getDb().query(
     `SELECT * FROM persistent_workspace_tasks
-      WHERE task_id = ? AND workspace_id = ? AND user_id = ? AND chat_id = ? LIMIT 1`,
-  ).get(taskId, workspace.id, workspace.userId, workspace.chatId) as Record<string, unknown> | null;
+      WHERE task_id = ? AND workspace_id = ? AND user_id = ? LIMIT 1`,
+  ).get(taskId, workspace.id, workspace.userId) as Record<string, unknown> | null;
   if (!row) persistentFail("not_found", "persistent task was not found");
   return persistentTaskFromRow(row);
 }
 
-function persistentAssertDependencies(workspace: PersistentWorkspaceRow, taskId: string, dependencyIds: readonly string[]): void {
-  const rows = persistentRows("persistent_workspace_tasks", workspace);
+function persistentDependencyGraph(rows: readonly Record<string, unknown>[]): Map<string, readonly string[]> {
   const graph = new Map<string, readonly string[]>();
-  rows.forEach((row) => graph.set(rowString(row, ["task_id"]), jsonArray(row.dependencies_json)));
+  rows.forEach((row) => graph.set(rowString(row, ["task_id"]), persistentDependencyIds(row.dependency_ids_json, "task.dependencies")));
+  for (const [taskId, dependencies] of graph) {
+    for (const dependency of dependencies) {
+      if (!graph.has(dependency)) persistentFail("invalid_state", `task ${taskId} references missing dependency ${dependency}`);
+    }
+  }
+  return graph;
+}
+
+function persistentAssertDependencies(workspace: PersistentWorkspaceRow, taskId: string, dependencyIds: readonly string[]): void {
+  const graph = persistentDependencyGraph(persistentRows("persistent_workspace_tasks", workspace));
   graph.set(taskId, dependencyIds);
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -3619,24 +4408,26 @@ export function getPersistentWorkspaceDependencyClosure(raw: unknown): readonly 
   const workspace = requirePersistentWorkspace(persistentContext(raw, "dependencyClosure"));
   if (!Array.isArray(raw.rootTaskIds) || raw.rootTaskIds.length === 0 || raw.rootTaskIds.length > PERSISTENT_WORKSPACE_MAX_TASKS) persistentFail("invalid_input", "rootTaskIds must be a bounded non-empty array");
   const rows = persistentRows("persistent_workspace_tasks", workspace);
+  const graph = persistentDependencyGraph(rows);
   const byId = new Map(rows.map((row) => [rowString(row, ["task_id"]), row] as const));
   const ordered: string[] = [];
   const visited = new Set<string>();
   const visit = (id: string): void => {
-    idValue(id, "rootTaskIds");
     if (visited.has(id)) return;
     const row = byId.get(id);
     if (!row) persistentFail("not_found", `task ${id} was not found`);
     visited.add(id);
-    for (const dependency of jsonArray(row.dependencies_json).sort()) visit(dependency);
+    const dependencies = [...(graph.get(id) ?? [])];
+    dependencies.sort(compareUtf8);
+    for (const dependency of dependencies) visit(dependency);
     ordered.push(id);
   };
   for (const root of raw.rootTaskIds) {
-    if (typeof root !== "string") persistentFail("invalid_input", "rootTaskIds contains a non-string identifier");
-    visit(root);
+    visit(persistentDependencyIdentifier(root, "rootTaskIds"));
   }
   return Object.freeze(ordered.map((id) => persistentTaskFromRow(byId.get(id)!)));
 }
+
  
 type PersistentPublicationSelectionV1 = {
   readonly copy: PersistentWorkspacePublicationCopyV1;
@@ -3647,6 +4438,7 @@ type PersistentPublicationSelectionV1 = {
   readonly sourceUpdatedAt: number;
   readonly sourceTurnSessionId: string;
   readonly sourceAttemptId: string;
+  readonly sourceExecutionId: string | null;
   readonly sourceChatId: string | null;
   readonly sourceMessageId: string | null;
   readonly sourceSwipeId: number | null;
@@ -3657,6 +4449,7 @@ type PersistentPublicationSessionV1 = {
   readonly userId: string;
   readonly turnId: string;
   readonly attemptId: string;
+  readonly executionId: string | null;
   readonly chatId: string | null;
 };
 
@@ -3698,29 +4491,30 @@ function publicationSessionForTurn(
   if (!tableExists(database, "persistent_workspace_turn_sessions")) {
     persistentFail("schema_unavailable", "persistent turn-session schema is unavailable");
   }
-  const sourceChatId = workspace.chatId || input.chatId;
+  const sourceChatId = workspace.chatId ?? input.chatId;
   const rows = database.query(
     `SELECT * FROM persistent_workspace_turn_sessions
       WHERE workspace_id = ? AND user_id = ? AND turn_id = ?
-        AND (chat_id = ? OR chat_id IS NULL)
-      ORDER BY CASE WHEN chat_id = ? THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
-  ).all(workspace.id, workspace.userId, turnId, sourceChatId, sourceChatId) as Array<Record<string, unknown>>;
+      ORDER BY CASE WHEN chat_id IS ? THEN 0 ELSE 1 END, created_at ASC, rowid ASC`,
+  ).all(workspace.id, workspace.userId, turnId, sourceChatId) as Array<Record<string, unknown>>;
   const candidateRows = executionId === undefined
     ? rows
     : rows.filter((row) => rowString(row, ["execution_id"]) === executionId);
   if (candidateRows.length === 0) persistentFail("not_found", "source turn session was not found for this workspace");
-  const exactRows = candidateRows.filter((row) => rowString(row, ["chat_id"]) === sourceChatId);
-  const selected = exactRows.length === 1 ? exactRows[0] : exactRows.length > 1 ? null : candidateRows[0];
+  const exactRows = candidateRows.filter((row) => rowNullableString(row, ["chat_id"]) === sourceChatId);
+  const selected = exactRows.length === 1 ? exactRows[0] : exactRows.length > 1 ? null : candidateRows.length === 1 ? candidateRows[0] : null;
   if (!selected) persistentFail("invalid_state", "source turn session association is ambiguous");
   const id = idValue(rowString(selected, ["turn_session_id"]), "publication.turnSessionId");
   const attemptId = idValue(rowString(selected, ["attempt_id"]), "publication.attemptId");
   const associatedTurnId = idValue(rowString(selected, ["turn_id"]), "publication.turnId");
   if (associatedTurnId !== turnId) persistentFail("not_found", "source turn session does not match the selected source");
   const chatId = rowNullableString(selected, ["chat_id"]);
-  if (chatId !== null && chatId !== sourceChatId) persistentFail("forbidden", "source turn session chat does not match the owner chat");
-  return Object.freeze({ id, userId: workspace.userId, turnId: associatedTurnId, attemptId, chatId });
+  if (sourceChatId !== null && chatId !== null && chatId !== sourceChatId) {
+    persistentFail("forbidden", "source turn session chat does not match the owner chat");
+  }
+  const associatedExecutionId = rowNullableString(selected, ["execution_id"]);
+  return Object.freeze({ id, userId: workspace.userId, turnId: associatedTurnId, attemptId, executionId: associatedExecutionId, chatId });
 }
-
 function publicationSourceExecutionLinks(
   session: PersistentPublicationSessionV1,
   sourceChatId: string | null,
@@ -3732,35 +4526,24 @@ function publicationSourceExecutionLinks(
     row = database.query(
       `SELECT target_message_id, target_swipe_id
          FROM agent_run_attempts
-        WHERE user_id = ? AND attempt_id = ?
-          AND (chat_id = ? OR chat_id IS NULL)
+        WHERE user_id = ? AND attempt_id = ? AND turn_id = ? AND chat_id IS ?
         LIMIT 1`,
-    ).get(session.userId, session.attemptId, chatId) as Record<string, unknown> | null;
-    if (!row) {
-      row = database.query(
-        `SELECT target_message_id, target_swipe_id
-           FROM agent_run_attempts
-          WHERE user_id = ? AND turn_id = ?
-            AND (chat_id = ? OR chat_id IS NULL)
-          ORDER BY updated_at DESC, created_at DESC
-          LIMIT 1`,
-      ).get(session.userId, session.turnId, chatId) as Record<string, unknown> | null;
-    }
+    ).get(session.userId, session.attemptId, session.turnId, chatId) as Record<string, unknown> | null;
   }
-  if (!row && tableExists(database, "agent_turn_executions")) {
+  if (!row && session.executionId !== null && session.executionId === session.turnId && tableExists(database, "agent_turn_executions")) {
     row = database.query(
       `SELECT target_message_id, target_swipe_id
          FROM agent_turn_executions
-        WHERE id = ? AND user_id = ?
-          AND (chat_id = ? OR chat_id IS NULL)
+        WHERE id = ? AND user_id = ? AND chat_id IS ?
         LIMIT 1`,
-    ).get(session.turnId, session.userId, chatId) as Record<string, unknown> | null;
+    ).get(session.executionId, session.userId, chatId) as Record<string, unknown> | null;
   }
   return {
     messageId: rowNullableString(row ?? {}, ["target_message_id"]),
     swipeId: nullableRowNumber(row ?? {}, ["target_swipe_id"]),
   };
 }
+
 
 function operationalSourceRevisionTimestamp(table: string): string {
   switch (table) {
@@ -3865,6 +4648,7 @@ function persistentPublicationCopy(
       sourceUpdatedAt: integer(rowNumber(source, ["updated_at"]), "publication.objective.updatedAt", 0, Number.MAX_SAFE_INTEGER),
       sourceTurnSessionId: session.id,
       sourceAttemptId: session.attemptId,
+      sourceExecutionId: session.executionId,
       sourceChatId,
       sourceMessageId: links.messageId,
       sourceSwipeId: links.swipeId,
@@ -3901,6 +4685,7 @@ function persistentPublicationCopy(
       sourceUpdatedAt,
       sourceTurnSessionId: session.id,
       sourceAttemptId: session.attemptId,
+      sourceExecutionId: session.executionId,
       sourceChatId,
       sourceMessageId: links.messageId,
       sourceSwipeId: links.swipeId,
@@ -3934,6 +4719,7 @@ function persistentPublicationCopy(
       sourceUpdatedAt: integer(rowNumber(source, ["created_at", "updated_at"]), "publication.finding.updatedAt", 0, Number.MAX_SAFE_INTEGER),
       sourceTurnSessionId: session.id,
       sourceAttemptId: session.attemptId,
+      sourceExecutionId: session.executionId,
       sourceChatId,
       sourceMessageId: links.messageId,
       sourceSwipeId: links.swipeId,
@@ -3967,6 +4753,7 @@ function persistentPublicationCopy(
     sourceUpdatedAt: integer(rowNumber(source, ["updated_at"]), "publication.artifact.updatedAt", 0, Number.MAX_SAFE_INTEGER),
     sourceTurnSessionId: session.id,
     sourceAttemptId: session.attemptId,
+    sourceExecutionId: session.executionId,
     sourceChatId,
     sourceMessageId: links.messageId,
     sourceSwipeId: links.swipeId,
@@ -3980,7 +4767,11 @@ function persistentSourceExists(workspace: PersistentWorkspaceRow, category: str
   const workspaceId = idValue(workspace.id, "publication.workspaceId");
   const sourceIdValue = idValue(sourceId, "publication.sourceId");
   const sourceChatId = idValue(provenance.sourceChatId, "publication.sourceChatId");
-  if (provenance.sourceMessageId !== null && tableExists(database, "messages")) {
+  if (!tableExists(database, "persistent_workspace_turn_sessions")) {
+    persistentFail("schema_unavailable", "persistent turn-session schema is unavailable");
+  }
+  if (provenance.sourceMessageId !== null) {
+    if (!tableExists(database, "messages")) persistentFail("schema_unavailable", "message schema is unavailable");
     const sourceMessage = database.query(
       "SELECT swipes FROM messages WHERE id = ? AND chat_id = ? LIMIT 1",
     ).get(provenance.sourceMessageId, sourceChatId) as Record<string, unknown> | null;
@@ -3999,13 +4790,14 @@ function persistentSourceExists(workspace: PersistentWorkspaceRow, category: str
   const sourceTurnId = idValue(rowString(session, ["turn_id"]), "publication.sourceTurnId");
   const scope = [ownerId, sourceChatId, sourceTurnId] as const;
   if (category === "objective") {
-    if (!tableExists(database, "agent_turn_workspaces")) return false;
+    if (!tableExists(database, "agent_turn_workspaces")) persistentFail("schema_unavailable", "turn workspace schema is unavailable");
     return database.query(
       "SELECT 1 FROM agent_turn_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id = ? AND turn_id = ? LIMIT 1",
     ).get(sourceIdValue, ...scope) !== null;
   }
   const table = category === "task" ? "agent_workspace_tasks" : category === "finding" ? "agent_workspace_records" : category === "artifact" ? "agent_workspace_artifacts" : "";
-  if (!table || !tableExists(database, table)) return false;
+  if (!table) persistentFail("invalid_state", "publication category is invalid");
+  if (!tableExists(database, table)) persistentFail("schema_unavailable", `${table} schema is unavailable`);
   const idColumn = category === "task" ? "task_id" : category === "finding" ? "record_id" : "artifact_id";
   const kind = category === "finding" ? " AND kind = 'finding'" : "";
   return database.query(
@@ -4014,6 +4806,36 @@ function persistentSourceExists(workspace: PersistentWorkspaceRow, category: str
       LIMIT 1`,
   ).get(sourceIdValue, ...scope) !== null;
 }
+function persistPublicationSourceDeletion(
+  raw: Record<string, unknown>,
+  workspace: PersistentWorkspaceRow,
+  provenance: PersistentWorkspacePublicationProvenanceV1,
+  sourceDeletedAt: number,
+): Record<string, unknown> {
+  const database = getDb();
+  const publicationId = rowString(raw, ["publication_id"]);
+  const sourceProvenanceJson = rowString(raw, ["source_provenance_json"]);
+  const stampedProvenance = Object.freeze({ ...provenance, sourceDeletedAt });
+  const stampedProvenanceJson = persistentJson(stampedProvenance, "publication.provenance", PERSISTENT_WORKSPACE_PROVENANCE_MAX_BYTES);
+  database.transaction(() => {
+    database.query(
+      `UPDATE persistent_workspace_publications
+          SET source_deleted_at = ?, source_provenance_json = ?
+        WHERE publication_id = ? AND workspace_id = ? AND user_id = ?
+          AND source_deleted_at IS NULL
+          AND source_provenance_json = ?`,
+    ).run(sourceDeletedAt, stampedProvenanceJson, publicationId, workspace.id, workspace.userId, sourceProvenanceJson);
+  })();
+  const refreshed = database.query(
+    "SELECT * FROM persistent_workspace_publications WHERE publication_id = ? AND workspace_id = ? AND user_id = ? LIMIT 1",
+  ).get(publicationId, workspace.id, workspace.userId) as Record<string, unknown> | null;
+  if (!refreshed) persistentFail("not_found", "persistent publication disappeared while recording source deletion");
+  if (refreshed.source_deleted_at === null || refreshed.source_deleted_at === undefined) {
+    persistentFail("stale_revision", "persistent publication source deletion marker was not persisted");
+  }
+  return refreshed;
+}
+
 
 function persistentPublicationFromRow(raw: Record<string, unknown>, workspace: PersistentWorkspaceRow): PersistentWorkspacePublication {
   const category = rowString(raw, ["category"]) as PersistentWorkspacePublication["category"];
@@ -4029,6 +4851,7 @@ function persistentPublicationFromRow(raw: Record<string, unknown>, workspace: P
     workspaceId: typeof provenanceValue.workspaceId === "string" ? provenanceValue.workspaceId : workspace.id,
     turnSessionId: typeof provenanceValue.turnSessionId === "string" ? provenanceValue.turnSessionId : null,
     attemptId: typeof provenanceValue.attemptId === "string" ? provenanceValue.attemptId : null,
+    executionId: typeof provenanceValue.executionId === "string" ? provenanceValue.executionId : null,
     sourceDigest,
     sourceChatId: typeof provenanceValue.sourceChatId === "string" ? provenanceValue.sourceChatId : rowNullableString(raw, ["chat_id"]),
     sourceMessageId: typeof provenanceValue.sourceMessageId === "string" ? provenanceValue.sourceMessageId : null,
@@ -4041,7 +4864,11 @@ function persistentPublicationFromRow(raw: Record<string, unknown>, workspace: P
   const recordedSourceDeletedAt = raw.source_deleted_at === null || raw.source_deleted_at === undefined
     ? null
     : rowNumber(raw, ["source_deleted_at"]);
-  const sourceDeletedAt = recordedSourceDeletedAt ?? provenance.sourceDeletedAt ?? (present ? null : Math.floor(Date.now() / 1000));
+  if (!present && recordedSourceDeletedAt === null && provenance.sourceDeletedAt === null) {
+    const stamped = persistPublicationSourceDeletion(raw, workspace, provenance, Math.floor(Date.now() / 1000));
+    return persistentPublicationFromRow(stamped, workspace);
+  }
+  const sourceDeletedAt = recordedSourceDeletedAt ?? provenance.sourceDeletedAt ?? null;
   const safeProvenance = sourceDeletedAt === provenance.sourceDeletedAt
     ? provenance
     : Object.freeze({ ...provenance, sourceDeletedAt });
@@ -4081,6 +4908,58 @@ function assertIdempotentPublicationDigest(input: PublishPersistentWorkspaceSele
   const copy = persistentParsedJson<PersistentWorkspacePublicationCopyV1>(row.copy_json, "publication.copy", {} as PersistentWorkspacePublicationCopyV1);
   if (input.sourceDigest !== publicationSourceDigest(row, copy)) persistentFail("stale_revision", "publication source digest is stale");
 }
+
+
+function persistentPublicationSelectionFromRow(raw: Record<string, unknown>): PersistentPublicationSelectionV1 {
+  const copy = persistentParsedJson<PersistentWorkspacePublicationCopyV1>(raw.copy_json, "publication.copy", {} as PersistentWorkspacePublicationCopyV1);
+  if (!isRecord(copy) || !(WORKSPACE_PUBLICATION_CATEGORIES as readonly string[]).includes(copy.category)) {
+    persistentFail("invalid_state", "publication copy category is invalid");
+  }
+  persistentJson(copy, "publication.copy", PERSISTENT_WORKSPACE_COPY_MAX_BYTES);
+  const provenance = persistentParsedJson<Record<string, unknown>>(raw.source_provenance_json, "publication.provenance", {});
+  const sourceExecutionId = provenance.executionId === null || provenance.executionId === undefined
+    ? null
+    : idValue(provenance.executionId, "publication.provenance.executionId");
+  const sourceSwipeId = provenance.sourceSwipeId === null || provenance.sourceSwipeId === undefined
+    ? null
+    : integer(provenance.sourceSwipeId, "publication.provenance.sourceSwipeId", 0, Number.MAX_SAFE_INTEGER);
+  return {
+    sourceId: idValue(rowString(raw, ["source_id"]), "publication.sourceId"),
+    copy,
+    sourceRevision: integer(rowNumber(raw, ["source_revision"], -1), "publication.sourceRevision", 0, Number.MAX_SAFE_INTEGER),
+    sourceDigest: publicationSourceDigest(raw, copy),
+    sourceCreatedAt: integer(rowNumber(raw, ["source_created_at"], -1), "publication.sourceCreatedAt", 0, Number.MAX_SAFE_INTEGER),
+    sourceUpdatedAt: integer(rowNumber(raw, ["source_updated_at"], -1), "publication.sourceUpdatedAt", 0, Number.MAX_SAFE_INTEGER),
+    sourceTurnSessionId: idValue(provenance.turnSessionId, "publication.provenance.turnSessionId"),
+    sourceAttemptId: idValue(provenance.attemptId, "publication.provenance.attemptId"),
+    sourceExecutionId,
+    sourceChatId: typeof provenance.sourceChatId === "string" ? provenance.sourceChatId : rowNullableString(raw, ["chat_id"]),
+    sourceMessageId: typeof provenance.sourceMessageId === "string" ? provenance.sourceMessageId : null,
+    sourceSwipeId,
+  };
+}
+
+function assertPublicationRowMatchesSelection(
+  selection: PersistentPublicationSelectionV1,
+  row: Record<string, unknown>,
+): void {
+  assertPublicationSelectionCurrent(selection, persistentPublicationSelectionFromRow(row));
+}
+
+function persistentPublicationSelectionDigest(selection: PersistentPublicationSelectionV1): string {
+  return publicationDigest(selection, "publication.selection");
+}
+
+function assertPublicationSelectionCurrent(
+  expected: PersistentPublicationSelectionV1,
+  actual: PersistentPublicationSelectionV1,
+  expectedDigest = persistentPublicationSelectionDigest(expected),
+): void {
+  if (persistentPublicationSelectionDigest(actual) !== expectedDigest) {
+    persistentFail("stale_revision", "publication source changed during publication");
+  }
+}
+
 function persistentArtifactPublicationDigest(row: Record<string, unknown>): string | null {
   if (rowString(row, ["category"]) !== "artifact") return null;
   const copy = persistentParsedJson<PersistentWorkspacePublicationCopyV1>(row.copy_json, "publication.copy", {} as PersistentWorkspacePublicationCopyV1);
@@ -4193,22 +5072,29 @@ export function publishPersistentWorkspaceSelection(
   const context = persistentContext(input, "persistentPublication");
   const workspace = persistentWritableWorkspace(context, "deferred");
   const canonicalSourceId = input.sourceId;
-  let existing = input.sourceRevision === undefined ? null : persistentPublicationRowsForSource(workspace, input.category, canonicalSourceId, input.sourceRevision)[0] ?? null;
-  if (!existing && input.sourceRevision === undefined) {
-    const candidates = persistentPublicationRowsForSource(workspace, input.category, canonicalSourceId);
-    if (candidates.length === 1) existing = candidates[0];
-  }
-  if (existing) {
+  // An omitted revision means "publish the current operational source", not
+  // "replay whichever immutable copy happens to exist for this source ID".
+  // Resolve that source before consulting idempotency so an update cannot be
+  // mistaken for an already-published historical revision.
+  const resolvedSelection = input.sourceRevision === undefined
+    ? persistentPublicationCopy(workspace, input)
+    : null;
+  const resolvedSourceRevision = resolvedSelection?.sourceRevision ?? input.sourceRevision;
+  const existing = resolvedSourceRevision === undefined
+    ? null
+    : persistentPublicationRowsForSource(workspace, input.category, canonicalSourceId, resolvedSourceRevision)[0] ?? null;
+  if (existing && !resolvedSelection) {
     assertIdempotentPublicationDigest(input, existing);
     return persistentPublicationFromRow(existing, persistentRefreshedWorkspace(workspace));
   }
-  if (workspace.revision !== input.expectedRevision) persistentFail("stale_revision", "persistent workspace revision is stale", { expected: input.expectedRevision, actual: workspace.revision });
-  const selected = persistentPublicationCopy(workspace, input);
+  if (!existing && workspace.revision !== input.expectedRevision) persistentFail("stale_revision", "persistent workspace revision is stale", { expected: input.expectedRevision, actual: workspace.revision });
+  const selected = resolvedSelection ?? persistentPublicationCopy(workspace, input);
   const copyJson = persistentJson(selected.copy, "publication.copy", PERSISTENT_WORKSPACE_COPY_MAX_BYTES);
   const provenance: PersistentWorkspacePublicationProvenanceV1 = Object.freeze({
     workspaceId: workspace.id,
     turnSessionId: selected.sourceTurnSessionId,
     attemptId: selected.sourceAttemptId,
+    executionId: selected.sourceExecutionId,
     sourceDigest: selected.sourceDigest,
     sourceChatId: selected.sourceChatId,
     sourceMessageId: selected.sourceMessageId,
@@ -4219,23 +5105,32 @@ export function publishPersistentWorkspaceSelection(
   });
   const provenanceJson = persistentJson(provenance, "publication.provenance", PERSISTENT_WORKSPACE_PROVENANCE_MAX_BYTES);
   const publicationBytes = utf8ByteLength(copyJson) + utf8ByteLength(provenanceJson);
-  const usage = persistentWorkspaceUsage(workspace);
-  if (usage.publicationCount >= workspace.quota.maxPublications || usage.byteCount + publicationBytes > workspace.quota.maxBytes) persistentFail("quota_exceeded", "persistent workspace publication quota exceeded");
   const copyDigest = createHash("sha256").update(copyJson, "utf8").digest("hex");
   const publicationId = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
   let concurrent: Record<string, unknown> | null = null;
   const database = getDb();
   const artifactCopy = selected.copy.category === "artifact" ? selected.copy : undefined;
+  const selectedDigest = persistentPublicationSelectionDigest(selected);
   const commitPublication = (): void => {
     database.transaction(() => {
       concurrent = persistentPublicationRowsForSource(workspace, input.category, selected.sourceId, selected.sourceRevision)[0] ?? null;
-      if (concurrent) return;
       const current = findPersistentPublicationWorkspace(context);
-      if (!current || current.revision !== input.expectedRevision) persistentFail("stale_revision", "persistent workspace changed during publication");
+      if (!current) persistentFail("stale_revision", "persistent workspace changed during publication");
+      if (resolvedSelection || !concurrent) {
+        const currentSelection = persistentPublicationCopy(current, input);
+        assertPublicationSelectionCurrent(selected, currentSelection, selectedDigest);
+      }
+      if (concurrent) {
+        assertPublicationRowMatchesSelection(selected, concurrent);
+        return;
+      }
+      if (current.revision !== input.expectedRevision) persistentFail("stale_revision", "persistent workspace changed during publication");
+      const usage = persistentWorkspaceUsage(current);
+      if (usage.publicationCount >= current.quota.maxPublications || usage.byteCount + publicationBytes > current.quota.maxBytes) persistentFail("quota_exceeded", "persistent workspace publication quota exceeded");
       if (artifactCopy) {
         assertArtifactBlobAvailable(database, {
-          userId: workspace.userId,
+          userId: current.userId,
           digest: artifactCopy.blobDigest,
           byteCount: artifactCopy.byteCount,
           mimeType: artifactCopy.mimeType,
@@ -4243,9 +5138,9 @@ export function publishPersistentWorkspaceSelection(
       }
       insertRow(database, "persistent_workspace_publications", {
         publication_id: publicationId,
-        workspace_id: workspace.id,
-        user_id: workspace.userId,
-        chat_id: workspace.chatId,
+        workspace_id: current.id,
+        user_id: current.userId,
+        chat_id: current.chatId,
         category: input.category,
         source_id: selected.sourceId,
         source_revision: selected.sourceRevision,
@@ -4260,8 +5155,10 @@ export function publishPersistentWorkspaceSelection(
         published_by: publishedBy,
         revision: 1,
       }, ["publication_id", "workspace_id", "user_id", "chat_id", "category", "source_id", "source_revision", "source_provenance_json", "source_created_at", "source_updated_at", "copy_json", "copy_digest", "byte_count", "published_at", "published_by", "revision"]);
-      if (artifactCopy) retainArtifactBlobReference(database, artifactCopy.blobDigest, workspace.userId);
-      persistentCommitWorkspace(workspace, {}, now);
+      const committedSelection = persistentPublicationCopy(current, input);
+      assertPublicationSelectionCurrent(selected, committedSelection, selectedDigest);
+      if (artifactCopy) retainArtifactBlobReference(database, artifactCopy.blobDigest, current.userId);
+      persistentCommitWorkspace(current, {}, now);
     })();
   };
   if (artifactCopy) {
@@ -4270,6 +5167,7 @@ export function publishPersistentWorkspaceSelection(
     commitPublication();
   }
   if (concurrent) {
+    assertPublicationRowMatchesSelection(selected, concurrent);
     assertIdempotentPublicationDigest(input, concurrent);
     return persistentPublicationFromRow(concurrent, persistentRefreshedWorkspace(workspace));
   }

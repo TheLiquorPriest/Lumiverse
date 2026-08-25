@@ -24,8 +24,9 @@ import {
   SlidersHorizontal,
   User,
 } from 'lucide-react'
-import { getCharacterAvatarThumbUrl } from '@/lib/avatarUrls'
+import { useTranslation } from 'react-i18next'
 import { isMobileViewportOrDevice, shouldHideQuickToolbarWhenOverlaid } from '@/lib/uiProductivityDefaults'
+import { getCharacterAvatarThumbUrl } from '@/lib/avatarUrls'
 import { useLorebookWorkspaceOverlayOpen } from '@/lib/lorebookWorkspaceVisibility'
 import { usePersistentRect, type DragMode } from '@/hooks/usePersistentRect'
 import {
@@ -95,6 +96,7 @@ function useToolbarIsMobile(): boolean {
 }
 
 export function QuickToolbar() {
+  const { t } = useTranslation('chat')
   const {
     settings,
     updateSettings,
@@ -563,7 +565,8 @@ export function QuickToolbar() {
     const Icon = action.icon
     const context = cardContext[action.id]
     const closable = action.surface.kind !== 'command'
-    const active = closable && isSurfaceActive(action.surface, uiState)
+    const active = action.active ?? (closable && isSurfaceActive(action.surface, uiState))
+    const disabled = Boolean(action.disabled)
     const hasProfilePortrait = action.id === 'profile' && showProfilePortrait
     return (
       <button
@@ -573,12 +576,13 @@ export function QuickToolbar() {
         } : undefined}
         type="button"
         className={clsx(styles.card, active && styles.cardActive, hasProfilePortrait && styles.cardProfile)}
-        onClick={measuring ? undefined : action.run}
+        onClick={measuring || disabled ? undefined : action.run}
+        disabled={disabled}
         aria-hidden={measuring || undefined}
-        aria-pressed={measuring ? undefined : closable ? active : undefined}
+        aria-pressed={measuring ? undefined : active}
         tabIndex={measuring ? -1 : undefined}
         aria-label={action.label}
-        title={context ? `${action.label} â€” ${context}` : action.label}
+        title={context ? t('quickToolbar.actionWithContext', { label: action.label, context }) : action.label}
       >
         <span className={clsx(styles.cardIcon, hasProfilePortrait && styles.cardIconPortrait)}>
           {hasProfilePortrait ? (
@@ -599,7 +603,6 @@ export function QuickToolbar() {
       </button>
     )
   }
-
   const customizeButton = (
     <button
       ref={customizeButtonRef}
@@ -612,14 +615,14 @@ export function QuickToolbar() {
         (customizing || modalOpen) && styles.itemActive,
       )}
       onClick={openCustomizer}
-      title="Customize toolbar"
-      aria-label="Customize toolbar"
+      title={t('quickToolbar.customize')}
+      aria-label={t('quickToolbar.customize')}
       aria-expanded={customizing}
     >
       {anchored
         ? <SlidersHorizontal size={renderedIconSize} aria-hidden="true" />
         : <MoreHorizontal size={renderedIconSize} aria-hidden="true" />}
-      {labelVisible && !anchored && <span className={styles.itemLabel}>More</span>}
+      {labelVisible && !anchored && <span className={styles.itemLabel}>{t('quickToolbar.more')}</span>}
     </button>
   )
 
@@ -649,8 +652,8 @@ export function QuickToolbar() {
           type="button"
           className={clsx(styles.dragHandle, vertical && styles.dragHandleVertical)}
           onPointerDown={(event) => beginDrag('move', event)}
-          title="Move quick toolbar"
-          aria-label="Move quick toolbar"
+          title={t('quickToolbar.move')}
+          aria-label={t('quickToolbar.move')}
         >
           {vertical ? <GripVertical size={gripGlyph} /> : <GripHorizontal size={gripGlyph} />}
         </button>
@@ -664,7 +667,7 @@ export function QuickToolbar() {
           // every density rule is written `.cardStrip[data-density='compact'] …`.
           data-density={v2Density}
           data-fit={fitReady ? 'ready' : 'pending'}
-          aria-label="Quick access toolbar"
+          aria-label={t('quickToolbar.quickAccess')}
           style={toolbarStyle}
         >
           <div className={styles.cardScroller}>
@@ -681,8 +684,8 @@ export function QuickToolbar() {
               type="button"
               className={clsx(styles.item, styles.cardStripSettings, styles.overflowButton, overflowOpen && styles.itemActive)}
               onClick={() => setOverflowOpen((open) => !open)}
-              title={`Show ${overflowActionIds.length} more toolbar actions`}
-              aria-label={`Show ${overflowActionIds.length} more toolbar actions`}
+              title={t('quickToolbar.showMore', { count: overflowActionIds.length })}
+              aria-label={t('quickToolbar.showMore', { count: overflowActionIds.length })}
               aria-controls="quick-toolbar-overflow"
               aria-expanded={overflowOpen}
             >
@@ -702,20 +705,22 @@ export function QuickToolbar() {
             // never left unstyled (A-M4).
             freePosition && styles.toolbarFree,
           )}
-          aria-label="Quick access toolbar"
+          aria-label={t('quickToolbar.quickAccess')}
           style={toolbarStyle}
         >
           {actions.map((action) => {
             const Icon = action.icon
             const closable = action.surface.kind !== 'command'
-            const active = closable && isSurfaceActive(action.surface, uiState)
+            const active = action.active ?? (closable && isSurfaceActive(action.surface, uiState))
+            const disabled = Boolean(action.disabled)
             return (
               <button
                 key={action.id}
                 type="button"
                 className={clsx(styles.item, active && styles.itemActive)}
-                onClick={action.run}
-                aria-pressed={closable ? active : undefined}
+                onClick={disabled ? undefined : action.run}
+                disabled={disabled}
+                aria-pressed={active}
                 title={action.label}
                 aria-label={action.label}
               >
@@ -760,7 +765,7 @@ export function QuickToolbar() {
           }}
         >
           <div className={styles.overflowHeader}>
-            <strong id="quick-toolbar-overflow-title">Hidden actions</strong>
+            <strong id="quick-toolbar-overflow-title">{t('quickToolbar.hiddenActions')}</strong>
             <span>{overflowActionIds.length}</span>
           </div>
           <label className={styles.overflowSearch}>
@@ -769,8 +774,8 @@ export function QuickToolbar() {
               ref={overflowSearchRef}
               value={overflowQuery}
               onChange={(event) => setOverflowQuery(event.target.value)}
-              placeholder="Search actions"
-              aria-label="Search hidden toolbar actions"
+              placeholder={t('quickToolbar.searchActions')}
+              aria-label={t('quickToolbar.searchHiddenActions')}
             />
           </label>
           <div className={styles.overflowList}>
@@ -781,20 +786,31 @@ export function QuickToolbar() {
               const context = cardContext[action.id]
               return (
                 <div className={styles.overflowRow} key={id}>
-                  <button type="button" className={styles.overflowAction} onClick={() => { action.run(); setOverflowOpen(false) }} title={context ? `${action.label} â€” ${context}` : action.label}>
+                  <button
+                    type="button"
+                    className={styles.overflowAction}
+                    onClick={() => {
+                      if (action.disabled) return
+                      action.run()
+                      setOverflowOpen(false)
+                    }}
+                    disabled={action.disabled}
+                    title={context ? t('quickToolbar.actionWithContext', { label: action.label, context }) : action.label}
+                    aria-label={action.label}
+                  >
                     <Icon size={16} aria-hidden="true" />
                     <span>
                       <strong>{action.label}</strong>
                       {context && <small>{context}</small>}
                     </span>
                   </button>
-                  <button type="button" className={styles.overflowPin} onClick={() => pinOverflowAction(id)} title={`Pin ${action.label} to the toolbar`} aria-label={`Pin ${action.label} to the toolbar`}>
+                  <button type="button" className={styles.overflowPin} onClick={() => pinOverflowAction(id)} title={t('quickToolbar.pinAction', { label: action.label })} aria-label={t('quickToolbar.pinAction', { label: action.label })}>
                     <Pin size={14} aria-hidden="true" />
                   </button>
                 </div>
               )
             })}
-            {filteredOverflowIds.length === 0 && <p className={styles.overflowEmpty}>No actions match that search.</p>}
+            {filteredOverflowIds.length === 0 && <p className={styles.overflowEmpty}>{t('quickToolbar.noActionsMatch')}</p>}
           </div>
         </div>,
         document.body,
@@ -813,26 +829,26 @@ export function QuickToolbar() {
             '--quick-toolbar-caret': `${placement.caret}px`,
           } as CSSProperties}
           role="dialog"
-          aria-label="Customize toolbar"
+          aria-label={t('quickToolbar.customize')}
         >
           <div className={styles.customizerBody}>
             <div className={styles.customizerHeader}>
-              <strong>Toolbar</strong>
+              <strong>{t('quickToolbar.toolbar')}</strong>
               <button
                 type="button"
                 onClick={() => {
                   setCustomizing(false)
                   setModalOpen(true)
                 }}
-                title="Open the full customizer"
-                aria-label="Open the full customizer"
+                title={t('quickToolbar.openFullCustomizer')}
+                aria-label={t('quickToolbar.openFullCustomizer')}
               >
                 <Maximize2 size={13} />
               </button>
             </div>
 
             <label>
-              <span>Icon size</span>
+              <span>{t('quickToolbar.iconSize')}</span>
               <output>{iconSize}px</output>
               <input
                 type="range"
@@ -847,7 +863,7 @@ export function QuickToolbar() {
               />
             </label>
             <label>
-              <span>Label size</span>
+              <span>{t('quickToolbar.labelSize')}</span>
               <output>{labelTextSize}px</output>
               <input
                 type="range"
@@ -862,7 +878,7 @@ export function QuickToolbar() {
               />
             </label>
             <label className={styles.toggleRow}>
-              <span>Show labels</span>
+              <span>{t('quickToolbar.showLabels')}</span>
               <input
                 type="checkbox"
                 checked={labelVisible}
@@ -874,7 +890,7 @@ export function QuickToolbar() {
               />
             </label>
             <label>
-              <span>Opacity</span>
+              <span>{t('quickToolbar.opacity')}</span>
               <output>{Math.round(settings.opacity * 100)}%</output>
               <input
                 type="range"
@@ -887,7 +903,7 @@ export function QuickToolbar() {
             {freePosition && (
               <>
                 <label className={styles.toggleRow}>
-                  <span>Snap to edge</span>
+                  <span>{t('quickToolbar.snapToEdge')}</span>
                   <input
                     type="checkbox"
                     checked={settings.snapToEdge}
@@ -895,7 +911,7 @@ export function QuickToolbar() {
                   />
                 </label>
                 <label className={styles.toggleRow}>
-                  <span>Resize handles</span>
+                  <span>{t('quickToolbar.resizeHandles')}</span>
                   <input
                     type="checkbox"
                     checked={settings.resizeHandlesEnabled !== false}
@@ -903,7 +919,7 @@ export function QuickToolbar() {
                   />
                 </label>
                 <fieldset>
-                  <legend>Orientation</legend>
+                  <legend>{t('quickToolbar.orientation')}</legend>
                   <div className={styles.segmented}>
                     {(['horizontal', 'vertical'] as const).map((option) => (
                       <button
@@ -912,13 +928,13 @@ export function QuickToolbar() {
                         className={settings.orientation === option ? styles.segmentActive : undefined}
                         onClick={() => updateSettings({ orientation: option })}
                       >
-                        {option === 'horizontal' ? 'Horizontal' : 'Vertical'}
+                        {option === 'horizontal' ? t('quickToolbar.horizontal') : t('quickToolbar.vertical')}
                       </button>
                     ))}
                   </div>
                 </fieldset>
                 <label>
-                  <span>Scale</span>
+                  <span>{t('quickToolbar.scale')}</span>
                   <output>{Math.round(settings.scale * 100)}%</output>
                   <input
                     type="range"
@@ -929,7 +945,7 @@ export function QuickToolbar() {
                   />
                 </label>
                 <label>
-                  <span>Rotation</span>
+                  <span>{t('quickToolbar.rotation')}</span>
                   <output>{settings.rotationDeg}°</output>
                   <input
                     type="range"
@@ -942,7 +958,7 @@ export function QuickToolbar() {
               </>
             )}
             <fieldset>
-              <legend>Enabled icons</legend>
+              <legend>{t('quickToolbar.enabledIcons')}</legend>
               {/* Chrome cloned from the app's other search fields; the input
                   carries no class and is styled as `.searchField input`. */}
               <label className={styles.searchField}>
@@ -950,8 +966,8 @@ export function QuickToolbar() {
                 <input
                   value={iconQuery}
                   onChange={(event) => setIconQuery(event.target.value)}
-                  placeholder="Search icons..."
-                  aria-label="Search icons"
+                  placeholder={t('quickToolbar.searchIcons')}
+                  aria-label={t('quickToolbar.searchIconsAria')}
                 />
               </label>
               <div className={styles.actionList}>
@@ -973,7 +989,7 @@ export function QuickToolbar() {
                         type="button"
                         disabled={!canMoveWithinFiltered(orderedIds, filteredEnabledIds, id, -1)}
                         onClick={() => moveActionWithin(id, -1, filteredEnabledIds)}
-                        aria-label={`Move ${action.label} up`}
+                        aria-label={t('quickToolbar.moveActionUp', { label: action.label })}
                       >
                         <ChevronUp size={14} />
                       </button>
@@ -981,7 +997,7 @@ export function QuickToolbar() {
                         type="button"
                         disabled={!canMoveWithinFiltered(orderedIds, filteredEnabledIds, id, 1)}
                         onClick={() => moveActionWithin(id, 1, filteredEnabledIds)}
-                        aria-label={`Move ${action.label} down`}
+                        aria-label={t('quickToolbar.moveActionDown', { label: action.label })}
                       >
                         <ChevronDown size={14} />
                       </button>
@@ -989,13 +1005,13 @@ export function QuickToolbar() {
                   )
                 })}
                 {filteredCatalogIds.length === 0 && (
-                  <p className={styles.actionEmpty}>No icons match that search.</p>
+                  <p className={styles.actionEmpty}>{t('quickToolbar.noIconsMatch')}</p>
                 )}
               </div>
             </fieldset>
             <button type="button" className={styles.resetButton} onClick={resetCurrentVariant}>
               <RotateCcw size={14} />
-              Reset current variant
+              {t('quickToolbar.resetVariant')}
             </button>
           </div>
         </div>,
@@ -1012,7 +1028,7 @@ export function QuickToolbar() {
           key={handle}
           type="button"
           className={clsx(styles.resizeHandle, RESIZE_HANDLE_CLASS[handle])}
-          aria-label={`Resize toolbar ${handle}`}
+          aria-label={t('quickToolbar.resize', { handle })}
           onPointerDown={(event) => beginDrag(handle, event)}
         />
       ))}
@@ -1030,8 +1046,8 @@ export function QuickToolbar() {
       data-component="QuickToolbar"
       className={styles.modalRestoreHandle}
       onClick={() => setRestoredOverModal(true)}
-      title="Show the quick toolbar"
-      aria-label="Show the quick toolbar"
+      title={t('quickToolbar.showToolbar')}
+      aria-label={t('quickToolbar.showToolbar')}
     >
       <SlidersHorizontal size={14} aria-hidden="true" />
     </button>

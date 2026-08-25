@@ -37,6 +37,8 @@ export interface CreatePresetInput {
 export type UpdatePresetInput = Partial<CreatePresetInput> & {
   /** Transport-only optimistic concurrency precondition; never persisted. */
   expected_cache_revision?: number;
+  /** Required when an ordinary update submits agent_config. */
+  expected_config_revision?: number;
 };
 
 export class PresetRevisionConflictError extends Error {

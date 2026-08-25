@@ -31,11 +31,13 @@ import { chatLoreDockMode, chatTopDockMode } from '@/lib/chatSurfaceLayout'
 import { measureLayoutHeight } from '@/lib/uiScale'
 import { resolveCouncilForChat } from '@/hooks/useCouncilProfiles'
 import MessageList from './MessageList'
+import StreamingIndicator from './StreamingIndicator'
 import MessageSelectBar from './MessageSelectBar'
 import InputArea from './InputArea'
 import ChatFindBar, { type ChatFindNavigationTarget } from './ChatFindBar'
 import ScrollToBottom from './ScrollToBottom'
 import MessageNavigator from './MessageNavigator'
+import { registerChatDockerActionOwners } from './chatDockerActionCatalog'
 import CouncilPill from './CouncilPill'
 import PortraitPanel from './PortraitPanel'
 import ExpressionDisplay from './expressions/ExpressionDisplay'
@@ -222,6 +224,14 @@ export default function ChatView() {
   const messages = useStore((s) => s.messages)
   const isStreaming = useStore((s) => s.isStreaming)
   const activeChatId = useStore((s) => s.activeChatId)
+  const streamingError = useStore((s) => s.streamingError)
+  const lastGenerationTerminalStatus = useStore((s) => s.lastGenerationTerminalStatus)
+  const showTerminalGenerationStatus = !isStreaming && (
+    Boolean(streamingError)
+    || lastGenerationTerminalStatus === 'completed'
+    || lastGenerationTerminalStatus === 'stopped'
+    || lastGenerationTerminalStatus === 'error'
+  )
   const messageEditDraft = useStore((s) => s.messageEditDraft)
   const resumeMessageEdit = useStore((s) => s.resumeMessageEdit)
   const totalChatLength = useStore((s) => s.totalChatLength)
@@ -308,6 +318,16 @@ export default function ChatView() {
       setLoadingOldestMessage(false)
     }
   }, [chatId, loadingOldestMessage])
+
+  const openMessageNavigator = useCallback(() => {
+    setMessageNavigatorOpen(true)
+  }, [])
+
+  useEffect(() => registerChatDockerActionOwners({
+    navigateToOldestMessage,
+    navigateToOldestMessageLoading: loadingOldestMessage,
+    openMessageNavigator,
+  }), [loadingOldestMessage, navigateToOldestMessage, openMessageNavigator])
 
   const returnToEditedMessage = useCallback(() => {
     if (!chatId || !messageEditDraft || messageEditDraft.chatId !== chatId) return
@@ -1169,7 +1189,7 @@ export default function ChatView() {
                 <button
                   type="button"
                   className={styles.toolbarBtn}
-                  onClick={() => setMessageNavigatorOpen(true)}
+                  onClick={openMessageNavigator}
                   title={t('messageNavigator.open')}
                   aria-label={t('messageNavigator.open')}
                 >
@@ -1214,6 +1234,7 @@ export default function ChatView() {
             <CouncilPill />
             {messageSelectMode && <MessageSelectBar chatId={chatId} />}
             <div data-spindle-mount="chat_bottom_dock" data-dock-request="strip" />
+            {isStreaming || showTerminalGenerationStatus ? <StreamingIndicator /> : null}
             <InputArea chatId={chatId} onNavigateHome={handleNavigateHome} onOpenChatFind={openChatFind} />
           </div>
         </div>

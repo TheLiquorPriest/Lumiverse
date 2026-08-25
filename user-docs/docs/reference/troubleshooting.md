@@ -107,9 +107,9 @@ Dry Run can inspect ordinary prompt assembly, but it never runs an Agentic child
 
 Open the **Agentic run** strip under the assistant response and inspect the status-only **Activity Tree**. The public tree may show the phase, bounded usage, child/tool counts, omissions, and a safe terminal reason, but never private prompts, child prose, arguments, retrieval data, results, reasoning, or credentials.
 
-- **Budget exhausted** means the host reached a bounded work, provider, tool, context, workspace, or activity limit. Reduce the number of profiles, grants, context attachments, or task policy, then retry; or select Response.
+- **Budget exhausted** means the host reached a bounded work, provider, tool, workspace, or activity limit. Reduce the number of profiles, grants, or task policy, then retry; or select Response.
 - **Timed out** means the bounded turn deadline expired. Retry once after checking the provider connection; if it repeats, choose Response or reduce the authored work.
-- **Failed** can indicate a provider, protocol, readiness, revision, context, or commit problem. Follow any repair category, refresh the exact preset/context revisions, and retry. If the same run fails again, use Response and keep the activity status when contacting an administrator.
+- **Failed** can indicate a provider, protocol, readiness, Loom revision, or commit problem. Follow any repair category, refresh the exact preset and Loom block revisions, and retry. If the same run fails again, use Response and keep the activity status when contacting an administrator.
 
 Agentic does not retry by silently switching modes, and a failed turn does not make private work notes or provider payloads available for debugging.
 
@@ -125,31 +125,35 @@ For an Agentic run, use Stop in the **Agent activity** inspector for the exact r
 
 ---
 
-## Context Library and cognition issues
+### Response omits Agentic-only Phased Instructions
 
-### A context pack is unavailable or asks for review
+This is expected when the turn uses **Response**. Loom owns only existing prompt blocks plus **Phased Instructions**; its four fixed policy buckets, bounded current-phase-only custom phases, explicit child subsets, and typed checkpoint conditions are WORK/Agentic-only. The established Response pipeline preserves the conversation and ordinary native World Book activation and Databank automatic or explicit `#slug` retrieval.
 
-Open **Settings → Context Library**. A pack imported from another account or source is private, unattached, and **Review required**. A user-data archive restore may retain attachment rows, but restored packs and attachments remain quarantined until local review. Inspect content, visibility, and access list, acknowledge the review, and choose **Review and activate** before using a pack.
+Open the exact owner inspection for the turn. Unified owner inspection explains routes and order, conditions, exact source identities and preset/block revisions, hashes when recorded, one effective copy for destination-level overlaps while retaining every role/reason/overlap outcome, omissions, custom-phase and child-subset receipts, accepted crossings, and tools/delegation. Its `inspection` records each omitted entry with its exact Loom source (bucket, destination/checkpoint, block ID, preset revision, block revision, prompt order, and condition outcome), and `responseOmission` visibly explains the `work_only` omission. If evidence is unavailable, inspection says so; it is never inferred. Do not use Response text as proof that a WORK/Agentic-only Loom instruction was included.
 
-An attachment marked required is part of Agentic preflight. If it is missing, revoked, or changed, Agentic stops before completion rather than silently using different context. An optional denied read is omitted without disclosing whether inaccessible content exists. For a foreign-imported pack, create a new active revision after review because the imported revision remains review-required; for a restored attachment, verify its exact reviewed revision and ACL. Then start a new Agentic turn.
+---
 
-### “This pack changed in another session. Refresh before trying again.”
+## Cognition, Loom, and native-context issues
 
-The Context Library uses revision preconditions and an account ACL revision. Refresh the pack detail, select the current immutable revision, and retry the action. If you changed visibility or access, re-open **Agentic Runtime → Phased Instructions**, repair the stale context selection or rule, choose the current reviewed revision, and save the shared draft.
-
-Changing an ACL, attachment, or revision invalidates outstanding Agentic readiness. A turn that has already consumed a context revision rechecks it before commit; it fails closed instead of committing with changed or unauthorized bytes.
-
-### A cognition rule, task, or Loom block needs repair
+### A task, condition, or Loom block needs repair
 
 Open **Loom Builder → Agentic Runtime** and inspect **Phased Instructions**, **Dynamic Tasks**, and **Portability & Repair**:
 
 - reselect the current revision for a stale Loom block;
-- restore or remove a missing context-pack revision after reviewing it in Context Library;
 - repair duplicate or cyclic task dependencies;
-- keep predicate conditions within the displayed depth/size limits; and
+- keep predicate conditions within the displayed depth/size limits;
+- confirm a custom phase uses only its current-phase instructions and that every child subset is explicit; and
 - ensure every required imported review item is acknowledged before enabling agents.
 
-The editor and import path validate cognition references and keep invalid policy in repair state. A valid frozen graph is evaluated on workspace creation (the ASSEMBLE activation), at each later entered runtime phase (**WORK**, **RENDER**, **PREPARE_COMMIT**, **COMMITTING**, or **COMMITTED**), after each named task or child-submission transition, and in the bounded completion fixed point. The completion fixed point is an internal evaluation, not a separate public phase entry. If a newly activated required task or context requirement blocks completion, satisfy it and retry; tasks created by the root may also be required, while child frames cannot create tasks. Invalid cognition keeps Response available and never silently drops a required rule or context input.
+The editor and import path validate cognition references and keep invalid policy in repair state. Conditions are typed, evaluate fail-closed at their owning checkpoint against that checkpoint’s immutable snapshot, and remain fixed for that checkpoint. A valid frozen graph is evaluated on workspace creation (the ASSEMBLE activation), at each later entered runtime phase (**WORK**, **RENDER**, **PREPARE_COMMIT**, **COMMITTING**, or **COMMITTED**), after each named task or child-submission transition, and in the bounded completion fixed point. The completion fixed point is an internal evaluation, not a separate public phase entry. If a newly activated required task blocks completion, satisfy it and retry; tasks created by the root may also be required, while child frames cannot create tasks. Invalid cognition keeps Response available and never silently drops a required rule.
+
+### World Info or Databank content changed
+
+World Books (the native World Info system) and Databanks use their live native objects outside Loom. Check World Book attachment, lore entry activation/placement, editing and access, Databank attachment, document readiness, editing and access, and enabled state. Explicit `#slug` retrieval works through the normal chat composer. [Context Filters](../presets/context-filters.md) and unrelated native Loom content [packs](../packs/index.md) remain supported outside Loom. Loom does not copy these objects, pin their revisions, provide a separate context picker, or repair native sources.
+
+The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are not supported and are not a fallback for native context or Loom. Do not treat their old names as a context source, picker, pin, or repair path.
+
+If private material retrieved during WORK does not appear verbatim in the final response, that is expected: tools-disabled **RENDER** receives only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance in the completion handoff. Raw private retrieval does not cross automatically.
 
 ---
 

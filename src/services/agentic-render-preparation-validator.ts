@@ -446,16 +446,14 @@ function validateRevisionSet(value: unknown, path: string): void {
         return [...byKind("persona"), ...byKind("character"), ...byKind("group")];
       case "worldLore":
         return byKind("world_lore");
+      case "databank":
+        return byKind("databank");
       case "settings":
         return byKind("settings");
       case "variables":
         return byKind("macro_variables");
       case "regex":
         return byKind("regex");
-      case "context":
-        return [...byKind("context_pack"), ...byKind("context_attachment")];
-      case "acl":
-        return byKind("context_acl");
       case "cognition":
         return byKind("cognition_policy");
       case "readiness":

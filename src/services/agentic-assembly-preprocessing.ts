@@ -128,13 +128,16 @@ function toPersona(value: Readonly<Record<string, unknown>> | null): Record<stri
 }
 
 function toMessage(value: SnapshotMessageV1): Record<string, unknown> {
+  const selectedSwipe = Number.isSafeInteger(value.swipe_id)
+    ? value.swipes[value.swipe_id]
+    : undefined;
   return {
     id: value.id,
     chat_id: value.chat_id,
     index_in_chat: value.index_in_chat,
     is_user: value.is_user,
     name: value.name,
-    content: value.content,
+    content: typeof selectedSwipe === "string" ? selectedSwipe : value.content,
     send_date: value.send_date,
     swipe_id: value.swipe_id,
     swipes: [...value.swipes],
@@ -160,6 +163,7 @@ export function buildSnapshotMacroEnv(snapshot: GenerationAssemblySnapshotV1): M
     updated_at: snapshot.chat.updated_at,
   };
   const messages = snapshot.messages.map(toMessage);
+  const databank = snapshot.databank;
   const context: BuildEnvContext = {
     character: character as unknown as BuildEnvContext["character"],
     focusedCharacter: character as unknown as BuildEnvContext["character"],
@@ -173,12 +177,29 @@ export function buildSnapshotMacroEnv(snapshot: GenerationAssemblySnapshotV1): M
     groupCharacterNames: group.map((member) => stringValue(member.name, "Character")),
     groupNotMutedNames: group.map((member) => stringValue(member.name, "Character")),
     targetCharacterName: stringValue(character.name, "Assistant"),
-    userInput: snapshot.target.userInput,
+    userInput: databank?.strippedUserInput ?? snapshot.target.userInput,
     dynamicMacros: {},
   };
   const env = buildEnv(context);
   env.commit = false;
   env.dynamicMacros = {};
+  env.extra.databank = {
+    chunks: (databank?.automaticChunks ?? []).map((chunk) => ({
+      content: chunk.content,
+      score: chunk.score ?? 0,
+      documentName: chunk.documentName,
+      metadata: {
+        chunkId: chunk.chunkId,
+        documentId: chunk.documentId,
+        databankId: chunk.databankId,
+        contentHash: chunk.contentHash,
+        documentContentHash: chunk.documentContentHash,
+      },
+    })),
+    formatted: databank?.automaticFormatted ?? "",
+    count: databank?.automaticChunks.length ?? 0,
+    enabled: databank?.enabled ?? false,
+  };
   const metadata = record(snapshot.chat.metadata);
   const macroVariables = record(metadata.macro_variables);
   const globalValues = scalarMap(record(macroVariables).global);

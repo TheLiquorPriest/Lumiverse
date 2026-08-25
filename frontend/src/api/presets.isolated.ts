@@ -66,9 +66,6 @@ describe('presetsApi.getAgentRuntimeLimits', () => {
     const envelope = {
       version: 1,
       agentConfig: null,
-      contextPacks: [],
-      contextSelections: [],
-      contextRules: [],
       taskTemplates: [],
     } satisfies PortableAgenticRuntimeEnvelopeV1
     get.mockResolvedValueOnce(envelope)
@@ -81,15 +78,13 @@ describe('presetsApi.getAgentRuntimeLimits', () => {
     const envelope = {
       version: 1,
       agentConfig: null,
-      contextPacks: [],
-      contextSelections: [],
-      contextRules: [],
       taskTemplates: [],
     } satisfies PortableAgenticRuntimeEnvelopeV1
     const input = {
       preset: {
         name: 'Imported',
         provider: 'loom',
+        engine: 'classic',
         regex_scripts: [{
           name: 'Portable regex',
           find_regex: 'foo',
@@ -103,6 +98,7 @@ describe('presetsApi.getAgentRuntimeLimits', () => {
         id: 'imported-1',
         name: 'Imported',
         provider: 'loom',
+        engine: 'classic',
         parameters: {},
         prompt_order: [],
         prompts: {},
@@ -119,13 +115,10 @@ describe('presetsApi.getAgentRuntimeLimits', () => {
   test('surfaces an atomic embedded-regex import failure', async () => {
     const failure = new Error('AGENT_RUNTIME_PORTABLE_REGEX_INVALID:skipped=1')
     const input = {
-      preset: { name: 'Rejected', provider: 'loom' },
+      preset: { name: 'Rejected', provider: 'loom', engine: 'classic' },
       agentRuntime: {
         version: 1,
         agentConfig: null,
-        contextPacks: [],
-        contextSelections: [],
-        contextRules: [],
         taskTemplates: [],
       } satisfies PortableAgenticRuntimeEnvelopeV1,
     }
@@ -140,6 +133,7 @@ describe('presetsApi.getAgentRuntimeLimits', () => {
         id: 'copy-1',
         name: 'Copy',
         provider: 'loom',
+        engine: 'classic',
         parameters: {},
         prompt_order: [],
         prompts: {},

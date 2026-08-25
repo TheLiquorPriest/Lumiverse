@@ -392,6 +392,515 @@ function scrubPresetMetadataForExport(value: unknown): unknown {
   const scrubbed = scrubPresetMetadata(parsed);
   return wasString ? JSON.stringify(scrubbed) : scrubbed;
 }
+const SEALED_PRESET_METADATA_KEY = "_lumiverse_sealed_preset";
+const PORTABLE_SEALED_PRESET_METADATA_KEY = "portableSealedPreset";
+const SEALED_PRESET_ID_METADATA_KEY = "_lumiverse_lumihub_id";
+const SEALED_PRESET_VERSION_METADATA_KEY = "_lumiverse_preset_version";
+const SEALED_PRESET_PLACEHOLDER_RE = /^\{\{(?:presetBlock|pblock)::([^}]+)\}\}$/;
+
+type CanonicalSealedManifest = {
+  version: string | null;
+  blocks: Array<{ key: string; sha256: string }>;
+};
+type PortableSealedPresetDescriptor = {
+  hubPresetId: string;
+  hubPresetVersion: string;
+  blocks: Array<{ key: string; sha256: string }>;
+};
+
+interface SealedPromptBlockDescriptor {
+  key: string;
+  hubPresetId: string;
+  version: string;
+  sha256: string;
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function readJsonColumn(value: unknown, column: string): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`presets.${column} is not valid JSON`);
+  }
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readSealedBlockKey(value: unknown, label: string): string | null {
+  const key = readNonEmptyString(value);
+  if (key && !/^[A-Za-z0-9._:-]+$/.test(key)) {
+    throw new Error(`sealed preset ${label} contains an invalid block key`);
+  }
+  return key;
+}
+
+function readSha256(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/i.test(value.trim())) {
+    throw new Error(`sealed preset ${label} must be a 64-character hexadecimal SHA-256 digest`);
+  }
+  return value.trim().toLowerCase();
+}
+
+function readManifestBlocks(
+  value: unknown,
+  label: string,
+  allowEmpty = false,
+): Array<{ key: string; sha256: string }> {
+  if (!Array.isArray(value) || value.length > 200 || (!allowEmpty && value.length === 0)) {
+    throw new Error(`sealed preset ${label}.blocks must be ${allowEmpty ? "an" : "a non-empty"} array`);
+  }
+  const blocks: Array<{ key: string; sha256: string }> = [];
+  const byKey = new Map<string, string>();
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      throw new Error(`sealed preset ${label}.blocks entries must be objects`);
+    }
+    const key = readSealedBlockKey(entry.key, `${label}.key`);
+    if (!key) throw new Error(`sealed preset ${label} contains a block without a key`);
+    const sha256 = readSha256(entry.sha256, `${label}.${key}`);
+    if (!sha256) throw new Error(`sealed preset ${label}.${key} is missing its digest`);
+    if (byKey.has(key)) {
+      if (byKey.get(key) !== sha256) {
+        throw new Error(`sealed preset ${label} contains conflicting digests for ${key}`);
+      }
+      throw new Error(`sealed preset ${label} contains duplicate block key ${key}`);
+    }
+    byKey.set(key, sha256);
+    blocks.push({ key, sha256 });
+  }
+  return blocks;
+}
+
+function readSealedManifest(value: unknown, label: string): CanonicalSealedManifest {
+  if (!isRecord(value)) {
+    throw new Error(`sealed preset ${label} must be an object`);
+  }
+  if (
+    value.version !== undefined
+    && value.version !== null
+    && (typeof value.version !== "string" || !value.version.trim())
+  ) {
+    throw new Error(`sealed preset ${label}.version must be a non-empty string when present`);
+  }
+  return {
+    version: readNonEmptyString(value.version),
+    blocks: readManifestBlocks(value.blocks, label, true),
+  };
+}
+
+function readPortableSealedPresetDescriptor(
+  value: unknown,
+  label: string,
+): PortableSealedPresetDescriptor {
+  if (!isRecord(value)) {
+    throw new Error(`sealed preset ${label} must be an object`);
+  }
+  const hubPresetId = readNonEmptyString(value.hubPresetId);
+  if (!hubPresetId) throw new Error(`sealed preset ${label}.hubPresetId is required`);
+  const hubPresetVersion = readNonEmptyString(value.hubPresetVersion);
+  if (!hubPresetVersion) throw new Error(`sealed preset ${label}.hubPresetVersion is required`);
+  return {
+    hubPresetId,
+    hubPresetVersion,
+    blocks: readManifestBlocks(value.blocks, label),
+  };
+}
+
+function sealedManifestEqual(
+  left: CanonicalSealedManifest,
+  right: CanonicalSealedManifest,
+): boolean {
+  if (left.version && right.version && left.version !== right.version) return false;
+  const normalize = (manifest: CanonicalSealedManifest) =>
+    manifest.blocks.map((block) => `${block.key}:${block.sha256}`).sort();
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
+}
+
+function portableDescriptorEqual(
+  left: PortableSealedPresetDescriptor,
+  right: PortableSealedPresetDescriptor,
+): boolean {
+  if (left.hubPresetId !== right.hubPresetId || left.hubPresetVersion !== right.hubPresetVersion) {
+    return false;
+  }
+  const normalize = (descriptor: PortableSealedPresetDescriptor) =>
+    descriptor.blocks.map((block) => `${block.key}:${block.sha256}`).sort();
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
+}
+
+function extractSealedPlaceholder(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = value.trim().match(SEALED_PRESET_PLACEHOLDER_RE);
+  return match?.[1]?.trim() || null;
+}
+
+function hasSealedBlockMarker(block: Record<string, any>): boolean {
+  return (Object.hasOwn(block, "sealed") && block.sealed !== false)
+    || Object.hasOwn(block, "sealedSource")
+    || Object.hasOwn(block, "sealedKey")
+    || Object.hasOwn(block, "sealedOriginPresetId")
+    || Object.hasOwn(block, "sealedOriginVersion")
+    || Object.hasOwn(block, "sealedSha256")
+    || extractSealedPlaceholder(block.content) !== null;
+}
+
+function metadataSealedDescriptorCandidates(metadata: Record<string, any>): Array<{
+  label: string;
+  value: unknown;
+  portable: boolean;
+}> {
+  const candidates: Array<{ label: string; value: unknown; portable: boolean }> = [];
+  if (Object.hasOwn(metadata, PORTABLE_SEALED_PRESET_METADATA_KEY)) {
+    candidates.push({
+      label: PORTABLE_SEALED_PRESET_METADATA_KEY,
+      value: metadata[PORTABLE_SEALED_PRESET_METADATA_KEY],
+      portable: true,
+    });
+  }
+  // Installer-created ordinary LumiHub presets persist this legacy field as
+  // null when they have no private blocks. Treat that explicit absence as
+  // “no descriptor”, while still rejecting any non-null malformed manifest.
+  if (Object.hasOwn(metadata, SEALED_PRESET_METADATA_KEY)
+    && metadata[SEALED_PRESET_METADATA_KEY] != null) {
+    candidates.push({ label: SEALED_PRESET_METADATA_KEY, value: metadata[SEALED_PRESET_METADATA_KEY], portable: false });
+  }
+  if (Object.hasOwn(metadata, "sealedPreset") && metadata.sealedPreset != null) {
+    candidates.push({ label: "sealedPreset", value: metadata.sealedPreset, portable: false });
+  }
+  const compatibility = isRecord(metadata.compatibility) ? metadata.compatibility : null;
+  const lumiverse = compatibility && isRecord(compatibility.lumiverse)
+    ? compatibility.lumiverse
+    : null;
+  if (lumiverse && Object.hasOwn(lumiverse, "sealedPreset") && lumiverse.sealedPreset != null) {
+    candidates.push({
+      label: "compatibility.lumiverse.sealedPreset",
+      value: lumiverse.sealedPreset,
+      portable: false,
+    });
+  }
+  return candidates;
+}
+
+function getMetadataHubPresetId(metadata: Record<string, any>): string | null {
+  if (!Object.hasOwn(metadata, SEALED_PRESET_ID_METADATA_KEY)) return null;
+  const value = metadata[SEALED_PRESET_ID_METADATA_KEY];
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`sealed preset metadata ${SEALED_PRESET_ID_METADATA_KEY} is required`);
+  }
+  return value.trim();
+}
+
+function getMetadataPresetVersion(metadata: Record<string, any>): string | null {
+  if (!Object.hasOwn(metadata, SEALED_PRESET_VERSION_METADATA_KEY)) return null;
+  const value = metadata[SEALED_PRESET_VERSION_METADATA_KEY];
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`sealed preset metadata ${SEALED_PRESET_VERSION_METADATA_KEY} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+function canonicalizeSealedPresetRow(raw: Record<string, any>): Record<string, any> {
+  const promptOrder = readJsonColumn(raw.prompt_order, "prompt_order");
+  const metadataValue = readJsonColumn(raw.metadata, "metadata");
+  if (!Array.isArray(promptOrder)) {
+    throw new Error("presets.prompt_order must be an array when it contains sealed blocks");
+  }
+  if (!isRecord(metadataValue)) {
+    throw new Error("presets.metadata must be an object when prompt_order contains sealed blocks");
+  }
+  const metadata = metadataValue;
+  const candidates = metadataSealedDescriptorCandidates(metadata);
+  let portableDescriptor: PortableSealedPresetDescriptor | null = null;
+  let manifest: CanonicalSealedManifest | null = null;
+  for (const candidate of candidates) {
+    if (candidate.portable) {
+      const next = readPortableSealedPresetDescriptor(candidate.value, candidate.label);
+      if (portableDescriptor && !portableDescriptorEqual(portableDescriptor, next)) {
+        throw new Error("sealed preset metadata contains inconsistent portable descriptors");
+      }
+      portableDescriptor = next;
+      continue;
+    }
+    const next = readSealedManifest(candidate.value, candidate.label);
+    if (manifest && !sealedManifestEqual(manifest, next)) {
+      throw new Error("sealed preset metadata contains inconsistent manifests");
+    }
+    if (!manifest) {
+      manifest = next;
+    } else if (!manifest.version && next.version) {
+      manifest = { ...manifest, version: next.version };
+    }
+  }
+
+  const metadataHubPresetId = getMetadataHubPresetId(metadata);
+  const metadataVersion = getMetadataPresetVersion(metadata);
+  if (portableDescriptor && metadataHubPresetId && portableDescriptor.hubPresetId !== metadataHubPresetId) {
+    throw new Error("sealed preset metadata contains conflicting Hub preset ids");
+  }
+  if (portableDescriptor && metadataVersion && portableDescriptor.hubPresetVersion !== metadataVersion) {
+    throw new Error("sealed preset metadata contains conflicting preset versions");
+  }
+  if (portableDescriptor && manifest) {
+    const portableManifest: CanonicalSealedManifest = {
+      version: portableDescriptor.hubPresetVersion,
+      blocks: portableDescriptor.blocks,
+    };
+    if (!sealedManifestEqual(portableManifest, manifest)) {
+      throw new Error("sealed preset metadata contains inconsistent manifests");
+    }
+  }
+  if (manifest && metadataVersion && manifest.version && manifest.version !== metadataVersion) {
+    throw new Error("sealed preset metadata contains conflicting preset versions");
+  }
+
+  const manifestByKey = new Map<string, string>(
+    (portableDescriptor?.blocks ?? manifest?.blocks ?? []).map((block) => [block.key, block.sha256]),
+  );
+  const declaredManifestKeys = new Set(manifestByKey.keys());
+  const redactedKeys = new Set<string>();
+  const descriptors: SealedPromptBlockDescriptor[] = [];
+  const redactedBlocks = promptOrder.map((rawBlock) => {
+    if (!isRecord(rawBlock)) return rawBlock;
+    const placeholderKey = readSealedBlockKey(
+      extractSealedPlaceholder(rawBlock.content),
+      "prompt block placeholder",
+    );
+    const sealedKey = readSealedBlockKey(rawBlock.sealedKey, "prompt block sealedKey");
+    const key = sealedKey ?? placeholderKey;
+    const hasMarker = hasSealedBlockMarker(rawBlock)
+      || (key !== null && manifestByKey.has(key));
+    if (!hasMarker) return rawBlock;
+    if (Object.hasOwn(rawBlock, "sealed") && rawBlock.sealed !== true) {
+      throw new Error(`sealed preset block ${key ?? "<unknown>"} has an invalid sealed flag`);
+    }
+    if (Object.hasOwn(rawBlock, "sealedSource") && rawBlock.sealedSource !== "lumihub") {
+      throw new Error(`sealed preset block ${key ?? "<unknown>"} has an invalid sealed source`);
+    }
+    if (
+      Object.hasOwn(rawBlock, "sealedOriginPresetId")
+      && !readNonEmptyString(rawBlock.sealedOriginPresetId)
+    ) {
+      throw new Error(`sealed preset block ${key ?? "<unknown>"} has an invalid Hub preset id`);
+    }
+    if (
+      Object.hasOwn(rawBlock, "sealedOriginVersion")
+      && !readNonEmptyString(rawBlock.sealedOriginVersion)
+    ) {
+      throw new Error(`sealed preset block ${key ?? "<unknown>"} has an invalid preset version`);
+    }
+    if (Object.hasOwn(rawBlock, "sealedSha256") && !readSha256(rawBlock.sealedSha256, `${key ?? "<unknown>"}.sealedSha256`)) {
+      throw new Error(`sealed preset block ${key ?? "<unknown>"} has an invalid digest`);
+    }
+    if (!key) {
+      throw new Error("sealed preset block is missing its manifest key");
+    }
+    if (sealedKey && placeholderKey && sealedKey !== placeholderKey) {
+      throw new Error(`sealed preset block ${key} has a conflicting placeholder key`);
+    }
+
+    const blockHubPresetId = readNonEmptyString(rawBlock.sealedOriginPresetId);
+    const hubPresetId = blockHubPresetId
+      ?? portableDescriptor?.hubPresetId
+      ?? metadataHubPresetId;
+    if (!hubPresetId) {
+      throw new Error(`sealed preset block ${key} is missing its Hub preset id`);
+    }
+    if (blockHubPresetId && metadataHubPresetId && blockHubPresetId !== metadataHubPresetId) {
+      throw new Error(`sealed preset block ${key} has a conflicting Hub preset id`);
+    }
+    if (blockHubPresetId && portableDescriptor && blockHubPresetId !== portableDescriptor.hubPresetId) {
+      throw new Error(`sealed preset block ${key} has a conflicting Hub preset id`);
+    }
+
+    const blockVersion = readNonEmptyString(rawBlock.sealedOriginVersion);
+    const version = blockVersion
+      ?? portableDescriptor?.hubPresetVersion
+      ?? metadataVersion
+      ?? manifest?.version
+      ?? null;
+    if (!version) {
+      throw new Error(`sealed preset block ${key} is missing its preset version`);
+    }
+    if (blockVersion && metadataVersion && blockVersion !== metadataVersion) {
+      throw new Error(`sealed preset block ${key} has a conflicting preset version`);
+    }
+    if (blockVersion && portableDescriptor && blockVersion !== portableDescriptor.hubPresetVersion) {
+      throw new Error(`sealed preset block ${key} has a conflicting preset version`);
+    }
+    if (manifest && manifest.version && manifest.version !== version) {
+      throw new Error(`sealed preset block ${key} has a conflicting manifest version`);
+    }
+
+    const blockSha256 = readSha256(rawBlock.sealedSha256, `${key}.sealedSha256`);
+    const manifestSha256 = manifestByKey.get(key);
+    const sha256 = blockSha256 ?? manifestSha256;
+    if (!sha256) {
+      throw new Error(`sealed preset block ${key} is missing its manifest digest`);
+    }
+    if (blockSha256 && manifestSha256 && blockSha256 !== manifestSha256) {
+      throw new Error(`sealed preset block ${key} has a conflicting manifest digest`);
+    }
+    if (redactedKeys.has(key)) {
+      throw new Error(`sealed preset contains duplicate prompt block key: ${key}`);
+    }
+    const descriptor = { key, hubPresetId, version, sha256 };
+    descriptors.push(descriptor);
+    redactedKeys.add(key);
+    manifestByKey.set(key, sha256);
+
+    return {
+      ...rawBlock,
+      content: `{{presetBlock::${key}}}`,
+      sealed: true,
+      sealedKey: key,
+      sealedSource: "lumihub",
+      sealedOriginPresetId: hubPresetId,
+      sealedOriginVersion: version,
+      sealedSha256: sha256,
+    };
+  });
+
+  const hasSealedMetadata = candidates.length > 0;
+  if (descriptors.length === 0 && !hasSealedMetadata) {
+    return raw;
+  }
+  if (descriptors.length === 0 && !portableDescriptor && !manifest) {
+    throw new Error("sealed preset metadata is missing its descriptor");
+  }
+  if (hasSealedMetadata && manifestByKey.size === 0) {
+    if (!portableDescriptor && manifest && manifest.blocks.length === 0 && descriptors.length === 0) {
+      return raw;
+    }
+    throw new Error("sealed preset metadata contains no manifest blocks");
+  }
+
+  // A valid descriptor is authoritative even if a block's flags were lost.
+  // If it names blocks but none can be identified, fail closed instead of
+  // exporting a potentially materialized prompt as an ordinary block.
+  if ((portableDescriptor || manifest) && descriptors.length === 0) {
+    throw new Error("sealed preset descriptor has no matching prompt blocks");
+  }
+  const missingDescriptorKeys = [...declaredManifestKeys].filter((key) => !redactedKeys.has(key));
+  if (missingDescriptorKeys.length > 0) {
+    throw new Error(
+      `sealed preset descriptor has unredacted prompt blocks: ${missingDescriptorKeys.join(", ")}`,
+    );
+  }
+
+  const descriptorHubIds = new Set(descriptors.map((descriptor) => descriptor.hubPresetId));
+  if (portableDescriptor) descriptorHubIds.add(portableDescriptor.hubPresetId);
+  if (metadataHubPresetId) descriptorHubIds.add(metadataHubPresetId);
+  if (descriptorHubIds.size !== 1) {
+    throw new Error("sealed preset metadata contains conflicting Hub preset ids");
+  }
+  const descriptorVersions = new Set(descriptors.map((descriptor) => descriptor.version));
+  if (portableDescriptor) descriptorVersions.add(portableDescriptor.hubPresetVersion);
+  if (metadataVersion) descriptorVersions.add(metadataVersion);
+  if (manifest?.version) descriptorVersions.add(manifest.version);
+  if (descriptorVersions.size !== 1) {
+    throw new Error("sealed preset metadata contains conflicting preset versions");
+  }
+
+  const canonicalHubPresetId = [...descriptorHubIds][0]!;
+  const canonicalVersion = [...descriptorVersions][0]!;
+  const canonicalBlocks = [...manifestByKey.entries()].map(([key, sha256]) => ({ key, sha256 }));
+  if (canonicalBlocks.length === 0) {
+    throw new Error("sealed preset metadata contains no manifest blocks");
+  }
+  const canonicalManifest: CanonicalSealedManifest = {
+    version: canonicalVersion,
+    blocks: canonicalBlocks,
+  };
+  const canonicalPortableDescriptor: PortableSealedPresetDescriptor = {
+    hubPresetId: canonicalHubPresetId,
+    hubPresetVersion: canonicalVersion,
+    blocks: canonicalBlocks,
+  };
+
+  const canonicalMetadata: Record<string, any> = {
+    ...metadata,
+    [SEALED_PRESET_ID_METADATA_KEY]: canonicalHubPresetId,
+    [SEALED_PRESET_VERSION_METADATA_KEY]: canonicalVersion,
+    [SEALED_PRESET_METADATA_KEY]: canonicalManifest,
+    [PORTABLE_SEALED_PRESET_METADATA_KEY]: canonicalPortableDescriptor,
+  };
+  if (Object.hasOwn(canonicalMetadata, "sealedPreset")) {
+    canonicalMetadata.sealedPreset = canonicalManifest;
+  }
+  const compatibility = isRecord(canonicalMetadata.compatibility)
+    ? canonicalMetadata.compatibility
+    : null;
+  const lumiverse = compatibility && isRecord(compatibility.lumiverse)
+    ? compatibility.lumiverse
+    : null;
+  if (lumiverse && Object.hasOwn(lumiverse, "sealedPreset")) {
+    canonicalMetadata.compatibility = {
+      ...compatibility,
+      lumiverse: { ...lumiverse, sealedPreset: canonicalManifest },
+    };
+  }
+
+  return {
+    ...raw,
+    prompt_order: JSON.stringify(redactedBlocks),
+    metadata: JSON.stringify(canonicalMetadata),
+  };
+}
+
+function serializePresetRowForExport(raw: Record<string, any>): Record<string, any> {
+  let promptOrder: unknown;
+  try {
+    promptOrder = readJsonColumn(raw.prompt_order, "prompt_order");
+  } catch (err) {
+    const metadataText = typeof raw.metadata === "string" ? raw.metadata : "";
+    const promptOrderText = typeof raw.prompt_order === "string" ? raw.prompt_order : "";
+    if (
+      !/(?:portableSealedPreset|_lumiverse_sealed_preset|sealedPreset)/i.test(metadataText)
+      && !/(?:sealed|lumihub|presetBlock|pblock)/i.test(promptOrderText)
+    ) {
+      return raw;
+    }
+    throw err;
+  }
+  const metadataText = typeof raw.metadata === "string" ? raw.metadata : "";
+  const metadata = typeof raw.metadata === "string" ? (() => {
+    try {
+      return JSON.parse(raw.metadata);
+    } catch {
+      return null;
+    }
+  })() : raw.metadata;
+  const isOrdinaryLegacyManifest = (value: unknown): boolean =>
+    value == null
+    || (isRecord(value) && Array.isArray(value.blocks) && value.blocks.length === 0);
+  const hasMetadataSealedHint = isRecord(metadata)
+    && (
+      Object.hasOwn(metadata, PORTABLE_SEALED_PRESET_METADATA_KEY)
+      || (Object.hasOwn(metadata, SEALED_PRESET_METADATA_KEY)
+        && !isOrdinaryLegacyManifest(metadata[SEALED_PRESET_METADATA_KEY]))
+      || (Object.hasOwn(metadata, "sealedPreset")
+        && !isOrdinaryLegacyManifest(metadata.sealedPreset))
+      || (isRecord(metadata.compatibility)
+        && isRecord(metadata.compatibility.lumiverse)
+        && Object.hasOwn(metadata.compatibility.lumiverse, "sealedPreset")
+        && !isOrdinaryLegacyManifest(metadata.compatibility.lumiverse.sealedPreset))
+    );
+  const hasTextMetadataSealedHint = !isRecord(metadata)
+    && /(?:portableSealedPreset|_lumiverse_sealed_preset|sealedPreset)/i.test(metadataText);
+  const hasBlockSealedHint = (Array.isArray(promptOrder)
+    && promptOrder.some((block) => isRecord(block) && hasSealedBlockMarker(block)))
+    || (isRecord(promptOrder) && hasSealedBlockMarker(promptOrder));
+  if (!hasMetadataSealedHint && !hasTextMetadataSealedHint && !hasBlockSealedHint) return raw;
+  return canonicalizeSealedPresetRow(raw);
+}
 
 function ownerKey(spec: any, row: Record<string, unknown>): string {
   return encodeArchiveOwnerKey(spec, row);
@@ -1509,9 +2018,13 @@ async function runExport(
       for (const raw of statement.iterate(...built.params) as Iterable<Record<string, unknown>>) {
         if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
         if (table === "settings" && isSecretSettingKey(String(raw.key ?? ""))) continue;
-        const exportRow = table === "presets" && Object.hasOwn(raw, "metadata")
-          ? { ...raw, metadata: scrubPresetMetadataForExport(raw.metadata) }
-          : raw;
+        let exportRow: Record<string, unknown> = raw;
+        if (table === "presets") {
+          const serialized = serializePresetRowForExport(raw);
+          exportRow = Object.hasOwn(serialized, "metadata")
+            ? { ...serialized, metadata: scrubPresetMetadataForExport(serialized.metadata) }
+            : serialized;
+        }
         if (rowsOut >= MAX_ARCHIVE_ROWS_PER_TABLE || totalRows >= MAX_ARCHIVE_TOTAL_ROWS) {
           throw new Error(`archive row count exceeds cap: ${table}`);
         }

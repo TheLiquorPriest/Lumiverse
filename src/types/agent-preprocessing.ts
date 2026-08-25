@@ -5,7 +5,6 @@
  * dependencies.
  */
 
-import type { ContextPackCandidateSnapshotV1 } from "../services/agent-context-tools.service";
 export type PreparationFailureCode =
   | "invalid_input"
   | "limit_exceeded"
@@ -500,12 +499,10 @@ export const INPUT_REVISION_KINDS_V1 = Object.freeze([
   "character",
   "group",
   "world_lore",
+  "databank",
   "settings",
   "macro_variables",
   "regex",
-  "context_pack",
-  "context_attachment",
-  "context_acl",
   "cognition_policy",
   "runtime_epoch",
   "readiness",
@@ -532,11 +529,10 @@ export const INPUT_REVISION_SET_PROJECTION_KEYS_V1 = Object.freeze([
   "credential",
   "participants",
   "worldLore",
+  "databank",
   "settings",
   "variables",
   "regex",
-  "context",
-  "acl",
   "cognition",
   "readiness",
 ] as const);
@@ -634,13 +630,29 @@ export interface AssemblyResultSlotSegmentV1 {
 
 export type AssemblyMessageSegmentV1 = AssemblyLiteralSegmentV1 | AssemblyResultSlotSegmentV1;
 
-export type AssemblyMessageSourceKindV1 = "block" | "history" | "world_info" | "cognition";
+export type AssemblyMessageSourceKindV1 = "block" | "history" | "world_info" | "cognition" | "databank";
+
+export interface AssemblyDatabankMessageSourceV1 {
+  readonly kind: "automatic" | "mention";
+  readonly databankId: string;
+  readonly documentId: string;
+  readonly documentName: string;
+  readonly chunkId: string | null;
+  readonly documentContentHash: string | null;
+  readonly contentHash: string;
+}
+
+export interface AssemblyDatabankMessageProvenanceV1 {
+  readonly kind: "automatic" | "mention";
+  readonly sources: readonly AssemblyDatabankMessageSourceV1[];
+}
 
 export interface AssemblyMessageProvenanceV1 {
   readonly kind: AssemblyMessageSourceKindV1;
   readonly sourceId: string;
   readonly sourceRevision: string;
   readonly sourceIndex: number;
+  readonly databank?: AssemblyDatabankMessageProvenanceV1;
 }
 
 export interface AssemblyProviderMessageV1 {
@@ -700,7 +712,6 @@ export interface AssemblyPlanV1 extends PreparationProtocolEnvelopeV1 {
   /** Per-profile provider ceilings sealed by ASSEMBLE for later dynamic delegation. */
   readonly profileOutputLimits: readonly AssemblyProfileOutputLimitV1[];
   readonly inputRevisions: InputRevisionSetV1;
-  readonly contextPackSnapshot: ContextPackCandidateSnapshotV1;
   /**
    * Phase-owned literal policy messages are kept out of `messages`. The host
    * selects exactly one set for WORK/RENDER; each set is source-sealed and

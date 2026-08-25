@@ -1,6 +1,6 @@
 import type { CognitionWorkspaceActivationFactoryV1 } from "../types/agent-cognition-runtime";
 import type { WorkspaceArtifactReferenceV1, WorkspaceOperationCapabilitiesV1 } from "../types/turn-workspace";
-import type { CognitionActivationResultV1, CognitionTaskTransition } from "../types/agent-cognition";
+import { deriveCognitionOperationalTaskId, type CognitionActivationResultV1, type CognitionTaskTransition, type TaskTemplateV1 } from "../types/agent-cognition";
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -16,6 +16,7 @@ import {
   WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS,
   WORKSPACE_MAX_TASK_ASSIGNMENTS,
   WORKSPACE_OBJECTIVE_MAX_BYTES,
+  PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET,
   TurnWorkspaceError,
   assignChildTasks,
   attachWorkspaceArtifactReference,
@@ -26,6 +27,7 @@ import {
   createPersistentWorkspaceHostTurnSession,
   createTurnWorkspace,
   createWorkspaceTask,
+  createWorkspaceTaskWithCognition,
   deletePersistentWorkspace,
   deletePersistentWorkspacePublication,
   ensurePersistentWorkspaceForChat,
@@ -38,14 +40,24 @@ import {
   getPersistentWorkspaceForChat,
   getTurnWorkspace,
   getWorkspaceCompletionGatesV1,
+  listPersistentWorkspaceArtifacts,
   listPersistentWorkspacePublications,
+  listPersistentWorkspaceRecords,
+  listPersistentWorkspaceSubmissions,
+  listPersistentWorkspaceTasks,
+  listPersistentWorkspaceTurnSessions,
   previewWorkspaceForCompletionV1,
   proposeWorkspacePublication,
   publishPersistentWorkspaceSelection,
   publishWorkspaceArtifact,
   recordWorkspaceRecord,
   readTurnWorkspaceSection,
+  settleWorkspaceChildTask,
+  settleWorkspaceChildTaskWithCognition,
   submitWorkspaceChildResult,
+  submitWorkspaceChildResultWithCognition,
+  submitWorkspaceRootResult,
+  submitWorkspaceRootResultWithCognition,
   updatePersistentWorkspaceHostTurnSession,
   updateWorkspaceTaskProgress,
   updateWorkspaceTaskProgressWithCognition,
@@ -74,6 +86,8 @@ async function applySchema(): Promise<void> {
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text());
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "106_agent_turn_workspace.sql")).text());
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "115_work_alpha1_workspace.sql")).text());
+  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "120_cognition_task_provenance.sql")).text());
+  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "122_persistent_workspace_chat_detach.sql")).text());
 }
 
 function seed(): void {
@@ -164,9 +178,14 @@ function insertTurnAttempt(turnId: string, options: TurnAttemptOptions = {}): vo
     );
 }
 
-
+function workspaceTurnId(workspaceId: string): string {
+  const row = getDb().query(
+    "SELECT turn_id FROM agent_turn_workspaces WHERE user_id = ? AND workspace_id = ?",
+  ).get(USER, workspaceId) as { turn_id: string } | null;
+  return row?.turn_id ?? TURN;
+}
 function rootContext(workspaceId: string, revision: number) {
-  return { userId: USER, chatId: CHAT, turnId: TURN, workspaceId, actor: "root" as const, expectedRevision: revision };
+  return { userId: USER, chatId: CHAT, turnId: workspaceTurnId(workspaceId), workspaceId, actor: "root" as const, expectedRevision: revision };
 }
 function hostContext(workspaceId: string, revision: number) {
   return { ...rootContext(workspaceId, revision), actor: "host" as const };
@@ -178,15 +197,16 @@ const childCapabilities = {
   maxOperations: 32,
 };
 function childContext(workspaceId: string, revision: number, frameId = "child-frame") {
+  const turnId = workspaceTurnId(workspaceId);
   freezeFrameCapabilities({
     userId: USER,
     chatId: CHAT,
-    turnId: TURN,
+    turnId,
     workspaceId,
     frameId,
     capabilities: childCapabilities,
   });
-  return { userId: USER, chatId: CHAT, turnId: TURN, workspaceId, actor: "child" as const, frameId, expectedRevision: revision };
+  return { userId: USER, chatId: CHAT, turnId, workspaceId, actor: "child" as const, frameId, expectedRevision: revision };
 }
 
 function boundedChildContext(
@@ -195,15 +215,16 @@ function boundedChildContext(
   frameId: string,
   capabilities: WorkspaceOperationCapabilitiesV1,
 ) {
+  const turnId = workspaceTurnId(workspaceId);
   freezeFrameCapabilities({
     userId: USER,
     chatId: CHAT,
-    turnId: TURN,
+    turnId,
     workspaceId,
     frameId,
     capabilities,
   });
-  return { userId: USER, chatId: CHAT, turnId: TURN, workspaceId, actor: "child" as const, frameId, expectedRevision: revision };
+  return { userId: USER, chatId: CHAT, turnId, workspaceId, actor: "child" as const, frameId, expectedRevision: revision };
 }
 function workspace(id = "workspace-1", turnId = TURN, objective = "Keep the objective immutable") {
   return createTurnWorkspace({
@@ -218,6 +239,11 @@ function workspace(id = "workspace-1", turnId = TURN, objective = "Keep the obje
     quota: { maxTasks: 8, maxRecords: 8, maxSubmissions: 8, maxArtifacts: 4, maxBytes: 2048 },
     capabilities: { revision: 1, allowed: ["read_section", "read_page", "create_task", "update_assigned_progress", "submit_child_result", "record_finding", "record_decision", "record_question", "attach_artifact", "propose_publication"], maxOperationBytes: 131072, maxOperations: 128 },
   });
+}
+function isolatedWorkspace(id: string) {
+  const turnId = `turn-${id}`;
+  insertTurnExecution(turnId, `generation-${id}`, `commit-${id}`);
+  return workspace(id, turnId);
 }
 function otherWorkspace(id = "workspace-other") {
   return createTurnWorkspace({
@@ -306,34 +332,38 @@ function expectWorkspaceError(code: WorkspaceErrorCode, callback: () => unknown)
   }
   throw new Error(`expected workspace error ${code}`);
 }
-function cognitionProgressFactory(taskId: string, transition: CognitionTaskTransition, workspaceRevision: number): CognitionWorkspaceActivationFactoryV1 {
+function cognitionProgressFactory(
+  taskId: string,
+  transition: CognitionTaskTransition,
+  workspaceRevision: number,
+  materializeTemplates: readonly TaskTemplateV1[] = [],
+  operationKey?: string,
+): CognitionWorkspaceActivationFactoryV1 {
   const state = Object.freeze({
     version: 1 as const,
     workspaceRevision,
     activatedTemplateIds: [] as readonly string[],
-    activatedContextRuleIds: [] as readonly string[],
     requiredTemplateIds: [] as readonly string[],
-    requiredContextRuleIds: [] as readonly string[],
   });
   const activation: CognitionActivationResultV1 = Object.freeze({
     point: "task_transition",
     state,
     newlyActivatedTemplateIds: [],
-    newlyActivatedContextRuleIds: [],
     newlyRequiredTemplateIds: [],
-    newlyRequiredContextRuleIds: [],
   });
   return {
     state,
     update: (current) => ({
       taskId,
       transition,
+      ...(operationKey ? { operationKey } : {}),
       state: Object.freeze({ ...current, workspaceRevision: current.workspaceRevision + 1 }),
       activation: Object.freeze({ ...activation, state: current }),
-      materializeTemplates: [],
+      materializeTemplates,
     }),
   };
 }
+
 
 beforeEach(async () => {
   closeDatabase();
@@ -723,6 +753,18 @@ describe("turn workspace validators and CAS operations", () => {
     expect(getTurnWorkspace(rootContext(created.id, 2)).usage.byteCount)
       .toBe(taskRow.byte_count + summaryBytes);
   });
+
+  test("rejects a root record linked to a nonexistent task before persistence", () => {
+    const created = workspace("record-missing-task");
+    expectWorkspaceError("not_found", () => recordWorkspaceRecord({
+      ...rootContext(created.id, created.revision),
+      kind: "finding",
+      summary: "bounded finding",
+      digest: "e".repeat(64),
+      taskId: "missing-task",
+    }));
+    expect(getTurnWorkspace(rootContext(created.id, created.revision)).usage.recordCount).toBe(0);
+  });
   test("submission and artifact admissions rebuild stale workspace byte counters", () => {
     const created = workspace("submission-artifact-current-accounting");
     const task = createWorkspaceTask({
@@ -858,6 +900,703 @@ describe("turn workspace validators and CAS operations", () => {
     expectWorkspaceError("invalid_input", () => createTurnWorkspace({ userId: USER, chatId: CHAT, turnId: TURN, workspaceId: "ttl-too-large", objective: "x", constraints: [], retention: "operational", ttlSeconds: WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS + 1, capabilities: { revision: 1, allowed: [], maxOperationBytes: 1, maxOperations: 1 } }));
   });
 
+  test("lets the root settle its own task while denying child root authority", () => {
+    const created = createTurnWorkspace({
+      userId: USER,
+      chatId: CHAT,
+      turnId: TURN,
+      workspaceId: "root-result-boundary",
+      objective: "Root result boundary",
+      constraints: [],
+      retention: "operational",
+      ttlSeconds: 100,
+      quota: { maxTasks: 4, maxRecords: 4, maxSubmissions: 4, maxArtifacts: 2, maxBytes: 1024 },
+      capabilities: {
+        revision: 1,
+        allowed: ["create_task", "submit_child_result", "submit_root_result"],
+        maxOperationBytes: 64 * 1024,
+        maxOperations: 32,
+      },
+    });
+    const task = createWorkspaceTask({
+      ...hostContext(created.id, created.revision),
+      taskId: "root-result-task",
+      title: "Root-owned required task",
+      required: true,
+    });
+    const completed = submitWorkspaceRootResult({
+      ...rootContext(created.id, created.revision + 1),
+      taskId: task.id,
+      summary: "Root provider completed its assigned task",
+      state: "completed",
+    });
+    expect(completed.state).toBe("completed");
+    const replay = submitWorkspaceRootResult({
+      ...rootContext(created.id, created.revision + 2),
+      taskId: task.id,
+      summary: "Root provider completed its assigned task",
+      state: "completed",
+    });
+    expect(replay).toEqual(completed);
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResult({
+      ...rootContext(created.id, created.revision + 2),
+      taskId: task.id,
+      summary: "A different root result",
+      state: "completed",
+    }));
+    expectWorkspaceError("forbidden", () => submitWorkspaceRootResult({
+      ...childContext(created.id, created.revision + 2),
+      taskId: task.id,
+      summary: "Child must not submit a root result",
+      state: "completed",
+    }));
+  });
+  test("lets the root fail an unassigned task without creating a submission", () => {
+    const created = createTurnWorkspace({
+      userId: USER,
+      chatId: CHAT,
+      turnId: TURN,
+      workspaceId: "root-failure-boundary",
+      objective: "Root failure boundary",
+      constraints: [],
+      retention: "operational",
+      ttlSeconds: 100,
+      quota: { maxTasks: 4, maxRecords: 4, maxSubmissions: 4, maxArtifacts: 2, maxBytes: 1024 },
+      capabilities: {
+        revision: 1,
+        allowed: ["create_task", "submit_root_result"],
+        maxOperationBytes: 64 * 1024,
+        maxOperations: 32,
+      },
+    });
+    const task = createWorkspaceTask({
+      ...hostContext(created.id, created.revision),
+      taskId: "root-failure-task",
+      title: "Root-owned failed task",
+      required: true,
+    });
+    const failed = submitWorkspaceRootResult({
+      ...rootContext(created.id, created.revision + 1),
+      taskId: task.id,
+      summary: "Root provider could not complete the task",
+      state: "failed",
+    });
+    expect(failed.state).toBe("failed");
+    const failedGates = getWorkspaceCompletionGatesV1(rootContext(created.id, created.revision + 2));
+    expect(failedGates).toMatchObject({
+      accepted: false,
+      openRequiredTaskIds: [task.id],
+      pendingSubmissionCount: 0,
+    });
+    expect(freezeWorkspaceForCompletionV1(rootContext(created.id, created.revision + 2))).toEqual({
+      workspaceRevision: created.revision + 2,
+      accepted: false,
+    });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE task_id = ?").get(task.id)).toEqual({ count: 0 });
+    const replay = submitWorkspaceRootResult({
+      ...rootContext(created.id, created.revision + 2),
+      taskId: task.id,
+      summary: "Root provider could not complete the task",
+      state: "failed",
+    });
+    expect(replay.state).toBe("failed");
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResult({
+      ...rootContext(created.id, created.revision + 2),
+      taskId: task.id,
+      summary: "A different root failure summary",
+      state: "failed",
+    }));
+
+  });
+  test("accounts failed root summaries at exact and over maxBytes caps", () => {
+    const normal = isolatedWorkspace("failed-summary-normal");
+    const normalTask = createWorkspaceTask({
+      ...hostContext(normal.id, normal.revision),
+      taskId: "failed-summary-normal-task",
+      title: "Normal failed task",
+    });
+    const normalBefore = getTurnWorkspace(rootContext(normal.id, normal.revision + 1)).usage.byteCount;
+    const normalSummary = "normal failure summary";
+    const normalSummaryBytes = new TextEncoder().encode(normalSummary).byteLength;
+    getDb().query("UPDATE agent_turn_workspaces SET quota_bytes = ? WHERE workspace_id = ?")
+      .run(normalBefore + normalSummaryBytes, normal.id);
+    const normalFailed = submitWorkspaceRootResult({
+      ...rootContext(normal.id, normal.revision + 1),
+      taskId: normalTask.id,
+      summary: normalSummary,
+      state: "failed",
+    });
+    expect(normalFailed.state).toBe("failed");
+    expect(getTurnWorkspace(rootContext(normal.id, normal.revision + 2)).usage.byteCount)
+      .toBe(normalBefore + normalSummaryBytes);
+    expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE workspace_id = ?").get(normal.id))
+      .toEqual({ count: 0 });
+
+    const normalOver = isolatedWorkspace("failed-summary-normal-over");
+    const normalOverTask = createWorkspaceTask({
+      ...hostContext(normalOver.id, normalOver.revision),
+      taskId: "failed-summary-normal-over-task",
+      title: "Normal over-cap failed task",
+    });
+    const normalOverBefore = getTurnWorkspace(rootContext(normalOver.id, normalOver.revision + 1)).usage.byteCount;
+    getDb().query("UPDATE agent_turn_workspaces SET quota_bytes = ? WHERE workspace_id = ?")
+      .run(normalOverBefore + normalSummaryBytes - 1, normalOver.id);
+    expectWorkspaceError("quota_exceeded", () => submitWorkspaceRootResult({
+      ...rootContext(normalOver.id, normalOver.revision + 1),
+      taskId: normalOverTask.id,
+      summary: normalSummary,
+      state: "failed",
+    }));
+    expect(getTurnWorkspace(rootContext(normalOver.id, normalOver.revision + 1)).usage.byteCount)
+      .toBe(normalOverBefore);
+    expect(getDb().query("SELECT state, revision FROM agent_workspace_tasks WHERE task_id = ?").get(normalOverTask.id))
+      .toEqual({ state: "active", revision: 0 });
+
+    const cognition = isolatedWorkspace("failed-summary-cognition");
+    const cognitionTask = createWorkspaceTask({
+      ...hostContext(cognition.id, cognition.revision),
+      taskId: "failed-summary-cognition-task",
+      title: "Cognition failed task",
+    });
+    const cognitionBefore = getTurnWorkspace(rootContext(cognition.id, cognition.revision + 1)).usage.byteCount;
+    const cognitionSummary = "cognition failure summary";
+    const cognitionSummaryBytes = new TextEncoder().encode(cognitionSummary).byteLength;
+    getDb().query("UPDATE agent_turn_workspaces SET quota_bytes = ? WHERE workspace_id = ?")
+      .run(cognitionBefore + cognitionSummaryBytes, cognition.id);
+    const cognitionFailed = submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(cognition.id, cognition.revision + 1),
+        taskId: cognitionTask.id,
+        summary: cognitionSummary,
+        state: "failed",
+      },
+      cognitionProgressFactory(cognitionTask.id, "failed", cognition.revision + 1, [], "failed-summary-cognition"),
+    );
+    expect(cognitionFailed.state.workspaceRevision).toBe(cognition.revision + 2);
+    expect(getTurnWorkspace(rootContext(cognition.id, cognition.revision + 2)).usage.byteCount)
+      .toBe(cognitionBefore + cognitionSummaryBytes);
+    expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE workspace_id = ?").get(cognition.id))
+      .toEqual({ count: 0 });
+
+    const cognitionOver = isolatedWorkspace("failed-summary-cognition-over");
+    const cognitionOverTask = createWorkspaceTask({
+      ...hostContext(cognitionOver.id, cognitionOver.revision),
+      taskId: "failed-summary-cognition-over-task",
+      title: "Cognition over-cap failed task",
+    });
+    const cognitionOverBefore = getTurnWorkspace(rootContext(cognitionOver.id, cognitionOver.revision + 1)).usage.byteCount;
+    getDb().query("UPDATE agent_turn_workspaces SET quota_bytes = ? WHERE workspace_id = ?")
+      .run(cognitionOverBefore + cognitionSummaryBytes - 1, cognitionOver.id);
+    expectWorkspaceError("quota_exceeded", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(cognitionOver.id, cognitionOver.revision + 1),
+        taskId: cognitionOverTask.id,
+        summary: cognitionSummary,
+        state: "failed",
+      },
+      cognitionProgressFactory(cognitionOverTask.id, "failed", cognitionOver.revision + 1, [], "failed-summary-cognition-over"),
+    ));
+    expect(getTurnWorkspace(rootContext(cognitionOver.id, cognitionOver.revision + 1)).usage.byteCount)
+      .toBe(cognitionOverBefore);
+    expect(getDb().query("SELECT state, revision FROM agent_workspace_tasks WHERE task_id = ?").get(cognitionOverTask.id))
+      .toEqual({ state: "active", revision: 0 });
+  });
+  test("replays cognition root results from durable terminal identity", () => {
+    const completed = isolatedWorkspace("cognition-root-replay-completed");
+    const completedTask = createWorkspaceTask({
+      ...hostContext(completed.id, completed.revision),
+      taskId: "cognition-root-replay-completed-task",
+      title: "Cognition completed task",
+    });
+    const completedSummary = "Cognition root completed";
+    const completedOperationKey = "cognition-root-completed-operation";
+    const completedFirst = submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(completed.id, completed.revision + 1),
+        taskId: completedTask.id,
+        summary: completedSummary,
+        state: "completed",
+      },
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 1, [], completedOperationKey),
+    );
+    const completedReplay = submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(completed.id, completed.revision + 2),
+        taskId: completedTask.id,
+        summary: completedSummary,
+        state: "completed",
+      },
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedOperationKey),
+    );
+    expect(completedReplay.workspaceRevision).toBe(completedFirst.workspaceRevision);
+    expect(completedReplay.state.workspaceRevision).toBe(completedFirst.state.workspaceRevision);
+    expect(completedReplay.taskId).toBe(completedFirst.taskId);
+    expect(completedReplay.transition).toBe(completedFirst.transition);
+    expect(completedReplay.operationKey).toBe(completedOperationKey);
+    expect(getDb().query("SELECT revision FROM agent_turn_workspaces WHERE workspace_id = ?").get(completed.id))
+      .toEqual({ revision: completed.revision + 2 });
+    expect(getDb().query("SELECT revision, cas_owner FROM agent_workspace_tasks WHERE task_id = ?").get(completedTask.id))
+      .toEqual({ revision: 1, cas_owner: completedOperationKey });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE task_id = ?").get(completedTask.id))
+      .toEqual({ count: 1 });
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(completed.id, completed.revision + 2),
+        taskId: completedTask.id,
+        summary: "Different cognition root result",
+        state: "completed",
+      },
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedOperationKey),
+    ));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(completed.id, completed.revision + 2),
+        taskId: completedTask.id,
+        summary: completedSummary,
+        state: "completed",
+        retention: "turn_terminal",
+        ttlSeconds: 10,
+      },
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedOperationKey),
+    ));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(completed.id, completed.revision + 2),
+        taskId: completedTask.id,
+        summary: completedSummary,
+        state: "completed",
+      },
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], "different-cognition-root-operation"),
+    ));
+
+    const failed = isolatedWorkspace("cognition-root-replay-failed");
+    const failedTask = createWorkspaceTask({
+      ...hostContext(failed.id, failed.revision),
+      taskId: "cognition-root-replay-failed-task",
+      title: "Cognition failed task",
+    });
+    const failedSummary = "Cognition root failed";
+    const failedOperationKey = "cognition-root-failed-operation";
+    const failedFirst = submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(failed.id, failed.revision + 1),
+        taskId: failedTask.id,
+        summary: failedSummary,
+        state: "failed",
+      },
+      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 1, [], failedOperationKey),
+    );
+    const failedReplay = submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(failed.id, failed.revision + 2),
+        taskId: failedTask.id,
+        summary: failedSummary,
+        state: "failed",
+      },
+      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 2, [], failedOperationKey),
+    );
+    expect(failedReplay.workspaceRevision).toBe(failedFirst.workspaceRevision);
+    expect(failedReplay.state.workspaceRevision).toBe(failedFirst.state.workspaceRevision);
+    expect(failedReplay.operationKey).toBe(failedOperationKey);
+    expect(getDb().query("SELECT revision FROM agent_turn_workspaces WHERE workspace_id = ?").get(failed.id))
+      .toEqual({ revision: failed.revision + 2 });
+    expect(getDb().query("SELECT revision, cas_owner FROM agent_workspace_tasks WHERE task_id = ?").get(failedTask.id))
+      .toEqual({ revision: 1, cas_owner: failedOperationKey });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE task_id = ?").get(failedTask.id))
+      .toEqual({ count: 0 });
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(failed.id, failed.revision + 2),
+        taskId: failedTask.id,
+        summary: failedSummary,
+        state: "failed",
+        retention: "turn_terminal",
+        ttlSeconds: 10,
+      },
+      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 2, [], failedOperationKey),
+    ));
+  });
+
+  test("cognition root settlement requires the requested terminal transition", () => {
+    const failed = isolatedWorkspace("cognition-root-transition-failed");
+    const failedTask = createWorkspaceTask({
+      ...hostContext(failed.id, failed.revision),
+      taskId: "cognition-root-transition-failed-task",
+      title: "Cognition root failed task",
+    });
+    expectWorkspaceError("invalid_state", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(failed.id, failed.revision + 1),
+        taskId: failedTask.id,
+        summary: "Failed root result",
+        state: "failed",
+      },
+      cognitionProgressFactory(failedTask.id, "completed", failed.revision + 1),
+    ));
+    expect(getDb().query("SELECT state, revision FROM agent_workspace_tasks WHERE task_id = ?").get(failedTask.id))
+      .toEqual({ state: "active", revision: 0 });
+
+    const completed = isolatedWorkspace("cognition-root-transition-completed");
+    const completedTask = createWorkspaceTask({
+      ...hostContext(completed.id, completed.revision),
+      taskId: "cognition-root-transition-completed-task",
+      title: "Cognition root completed task",
+    });
+    expectWorkspaceError("invalid_state", () => submitWorkspaceRootResultWithCognition(
+      {
+        ...rootContext(completed.id, completed.revision + 1),
+        taskId: completedTask.id,
+        summary: "Completed root result",
+        state: "completed",
+      },
+      cognitionProgressFactory(completedTask.id, "failed", completed.revision + 1),
+    ));
+    expect(getDb().query("SELECT state, revision FROM agent_workspace_tasks WHERE task_id = ?").get(completedTask.id))
+      .toEqual({ state: "active", revision: 0 });
+    expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE task_id = ?").get(completedTask.id))
+      .toEqual({ count: 0 });
+  });
+  test("bounds cognition operational task IDs for the admitted turn limit", () => {
+    const ambiguousLeft = deriveCognitionOperationalTaskId("a:b", "c");
+    const ambiguousRight = deriveCognitionOperationalTaskId("a", "b:c");
+    expect(ambiguousLeft).not.toBe(ambiguousRight);
+    expect(new TextEncoder().encode(ambiguousLeft).byteLength).toBeLessThanOrEqual(128);
+    expect(new TextEncoder().encode(ambiguousRight).byteLength).toBeLessThanOrEqual(128);
+    const maxTurnId = "t".repeat(128);
+    insertTurnExecution(maxTurnId, "long-turn-generation", "long-turn-commit");
+    const created = workspace("cognition-long-turn", maxTurnId);
+    const templates: readonly TaskTemplateV1[] = [
+      { id: "template-a", required: false },
+      { id: "template-b", required: false },
+    ];
+    const result = createWorkspaceTaskWithCognition(
+      {
+        userId: USER,
+        chatId: CHAT,
+        turnId: maxTurnId,
+        workspaceId: created.id,
+        actor: "root",
+        expectedRevision: created.revision,
+        taskId: "long-turn-root-task",
+        title: "Long turn root task",
+        dependencyIds: [],
+        assignedFrameId: null,
+      },
+      cognitionProgressFactory("long-turn-root-task", "active", created.revision, templates),
+    );
+    expect(result.materializedTaskIds).toHaveLength(templates.length);
+    expect(new Set(result.materializedTaskIds).size).toBe(templates.length);
+    for (const taskId of result.materializedTaskIds) {
+      expect(new TextEncoder().encode(taskId).byteLength).toBeLessThanOrEqual(128);
+      expect(taskId).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+    }
+    const rows = getDb().query(
+      "SELECT task_id, cognition_template_id FROM agent_workspace_tasks WHERE workspace_id = ? AND cognition_template_id IS NOT NULL ORDER BY cognition_template_id",
+    ).all(created.id) as Array<{ task_id: string; cognition_template_id: string }>;
+    expect(new Set(rows.map((row) => row.task_id))).toEqual(new Set(result.materializedTaskIds));
+    expect(rows.map((row) => row.cognition_template_id)).toEqual(["template-a", "template-b"]);
+    expect(rows.map((row) => row.task_id)).toEqual([...result.materializedTaskIds]);
+    expectWorkspaceError("quota_exceeded", () => createTurnWorkspace({
+      userId: USER,
+      chatId: CHAT,
+      turnId: `${maxTurnId}x`,
+      workspaceId: "cognition-too-long-turn",
+      objective: "Too long",
+      constraints: [],
+      retention: "chat_lifetime",
+      capabilities: { revision: 1, allowed: [], maxOperationBytes: 1, maxOperations: 1 },
+    }));
+  });
+  test("settles an assigned child failure only for the exact frame", () => {
+    const created = workspace("child-settlement-boundary");
+    const task = createWorkspaceTask({
+      ...hostContext(created.id, created.revision),
+      taskId: "child-settlement-task",
+      title: "Assigned child task",
+      assignedFrameId: "child-settlement-frame",
+    });
+    const failed = settleWorkspaceChildTask({
+      ...hostContext(created.id, created.revision + 1),
+      taskId: task.id,
+      assignedFrameId: "child-settlement-frame",
+      state: "failed",
+    });
+    expect(failed.state).toBe("failed");
+    const replay = settleWorkspaceChildTask({
+      ...hostContext(created.id, created.revision + 2),
+      taskId: task.id,
+      assignedFrameId: "child-settlement-frame",
+      state: "failed",
+    });
+    expect(replay.state).toBe("failed");
+    expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTask({
+      ...hostContext(created.id, created.revision + 2),
+      taskId: task.id,
+      assignedFrameId: "child-settlement-frame",
+      state: "cancelled",
+    }));
+    expectWorkspaceError("child_confinement", () => settleWorkspaceChildTask({
+      ...hostContext(created.id, created.revision + 2),
+      taskId: task.id,
+      assignedFrameId: "other-frame",
+      state: "failed",
+    }));
+  });
+  test("cognition child settlement replays only the exact committed operation", () => {
+    const created = workspace("cognition-child-settlement");
+    const task = createWorkspaceTask({
+      ...hostContext(created.id, created.revision),
+      taskId: "cognition-child-settlement-task",
+      title: "Cognition child task",
+      assignedFrameId: "cognition-child-settlement-frame",
+    });
+    const operationKey = "child-settlement-operation";
+    const failed = settleWorkspaceChildTaskWithCognition(
+      {
+        ...hostContext(created.id, created.revision + 1),
+        taskId: task.id,
+        assignedFrameId: "cognition-child-settlement-frame",
+        state: "failed",
+      },
+      cognitionProgressFactory(task.id, "failed", created.revision + 1, [], operationKey),
+    );
+    expect(failed.workspaceRevision).toBe(created.revision + 2);
+    expect(failed.operationKey).toBe(operationKey);
+    expect(getDb().query("SELECT cas_owner FROM agent_workspace_tasks WHERE task_id = ?").get(task.id))
+      .toEqual({ cas_owner: operationKey });
+    expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTask({
+      ...hostContext(created.id, created.revision + 2),
+      taskId: task.id,
+      assignedFrameId: "cognition-child-settlement-frame",
+      state: "failed",
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgress({
+      ...childContext(created.id, created.revision + 2, "cognition-child-settlement-frame"),
+      taskId: task.id,
+      state: "active",
+      progress: 0.4,
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgressWithCognition(
+      {
+        ...childContext(created.id, created.revision + 2, "cognition-child-settlement-frame"),
+        taskId: task.id,
+        state: "active",
+        progress: 0.4,
+      },
+      cognitionProgressFactory(task.id, "active", created.revision + 2),
+    ));
+    const replay = settleWorkspaceChildTaskWithCognition(
+      {
+        ...hostContext(created.id, created.revision + 2),
+        taskId: task.id,
+        assignedFrameId: "cognition-child-settlement-frame",
+        state: "failed",
+      },
+      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], operationKey),
+    );
+    expect(replay.workspaceRevision).toBe(created.revision + 2);
+    expect(replay.state.workspaceRevision).toBe(created.revision + 2);
+    expect(replay.operationKey).toBe(operationKey);
+    expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTaskWithCognition(
+      {
+        ...hostContext(created.id, created.revision + 2),
+        taskId: task.id,
+        assignedFrameId: "cognition-child-settlement-frame",
+        state: "failed",
+      },
+      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], "different-settlement-operation"),
+    ));
+    expectWorkspaceError("child_confinement", () => settleWorkspaceChildTaskWithCognition(
+      {
+        ...hostContext(created.id, created.revision + 2),
+        taskId: task.id,
+        assignedFrameId: "different-settlement-frame",
+        state: "failed",
+      },
+      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], operationKey),
+    ));
+    expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTaskWithCognition(
+      {
+        ...hostContext(created.id, created.revision + 2),
+        taskId: task.id,
+        assignedFrameId: "cognition-child-settlement-frame",
+        state: "cancelled",
+      },
+      cognitionProgressFactory(task.id, "cancelled", created.revision + 2, [], operationKey),
+    ));
+  });
+  test("normal and cognition child results cannot resurrect terminal host settlements", () => {
+    const normalFailed = isolatedWorkspace("child-result-after-failure");
+    const normalFailedTask = createWorkspaceTask({
+      ...hostContext(normalFailed.id, normalFailed.revision),
+      taskId: "child-result-after-failure-task",
+      title: "Failed child task",
+      assignedFrameId: "child-result-after-failure-frame",
+    });
+    settleWorkspaceChildTask({
+      ...hostContext(normalFailed.id, normalFailed.revision + 1),
+      taskId: normalFailedTask.id,
+      assignedFrameId: "child-result-after-failure-frame",
+      state: "failed",
+    });
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgress({
+      ...childContext(normalFailed.id, normalFailed.revision + 2, "child-result-after-failure-frame"),
+      taskId: normalFailedTask.id,
+      state: "active",
+      progress: 0.4,
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResult({
+      ...childContext(normalFailed.id, normalFailed.revision + 2, "child-result-after-failure-frame"),
+      taskId: normalFailedTask.id,
+      summary: "late child result",
+      resultDigest: "a".repeat(64),
+      byteCount: 1,
+    }));
+
+    const normalCancelled = isolatedWorkspace("child-result-after-cancellation");
+    const normalCancelledTask = createWorkspaceTask({
+      ...hostContext(normalCancelled.id, normalCancelled.revision),
+      taskId: "child-result-after-cancellation-task",
+      title: "Cancelled child task",
+      assignedFrameId: "child-result-after-cancellation-frame",
+    });
+    settleWorkspaceChildTask({
+      ...hostContext(normalCancelled.id, normalCancelled.revision + 1),
+      taskId: normalCancelledTask.id,
+      assignedFrameId: "child-result-after-cancellation-frame",
+      state: "cancelled",
+    });
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgress({
+      ...childContext(normalCancelled.id, normalCancelled.revision + 2, "child-result-after-cancellation-frame"),
+      taskId: normalCancelledTask.id,
+      state: "active",
+      progress: 0.4,
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResult({
+      ...childContext(normalCancelled.id, normalCancelled.revision + 2, "child-result-after-cancellation-frame"),
+      taskId: normalCancelledTask.id,
+      summary: "late cancelled result",
+      resultDigest: "b".repeat(64),
+      byteCount: 1,
+    }));
+    const normalCompleted = isolatedWorkspace("child-result-after-completion");
+    const normalCompletedTask = createWorkspaceTask({
+      ...hostContext(normalCompleted.id, normalCompleted.revision),
+      taskId: "child-result-after-completion-task",
+      title: "Completed child task",
+      assignedFrameId: "child-result-after-completion-frame",
+    });
+    getDb().query("UPDATE agent_workspace_tasks SET state = 'completed', progress = 1, revision = 1 WHERE task_id = ? AND workspace_id = ?")
+      .run(normalCompletedTask.id, normalCompleted.id);
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgress({
+      ...childContext(normalCompleted.id, normalCompleted.revision + 1, "child-result-after-completion-frame"),
+      taskId: normalCompletedTask.id,
+      state: "active",
+      progress: 0.4,
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResult({
+      ...childContext(normalCompleted.id, normalCompleted.revision + 1, "child-result-after-completion-frame"),
+      taskId: normalCompletedTask.id,
+      summary: "late completed child result",
+      resultDigest: "e".repeat(64),
+      byteCount: 1,
+    }));
+
+
+    const cognitionFailed = isolatedWorkspace("cognition-result-after-failure");
+    const cognitionFailedTask = createWorkspaceTask({
+      ...hostContext(cognitionFailed.id, cognitionFailed.revision),
+      taskId: "cognition-result-after-failure-task",
+      title: "Cognition failed child task",
+      assignedFrameId: "cognition-result-after-failure-frame",
+    });
+    settleWorkspaceChildTask({
+      ...hostContext(cognitionFailed.id, cognitionFailed.revision + 1),
+      taskId: cognitionFailedTask.id,
+      assignedFrameId: "cognition-result-after-failure-frame",
+      state: "failed",
+    });
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgressWithCognition(
+      {
+        ...childContext(cognitionFailed.id, cognitionFailed.revision + 2, "cognition-result-after-failure-frame"),
+        taskId: cognitionFailedTask.id,
+        state: "active",
+        progress: 0.4,
+      },
+      cognitionProgressFactory(cognitionFailedTask.id, "active", cognitionFailed.revision + 2),
+    ));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResultWithCognition(
+      {
+        ...childContext(cognitionFailed.id, cognitionFailed.revision + 2, "cognition-result-after-failure-frame"),
+        taskId: cognitionFailedTask.id,
+        summary: "late cognition result",
+        resultDigest: "c".repeat(64),
+        byteCount: 1,
+      },
+      cognitionProgressFactory(cognitionFailedTask.id, "completed", cognitionFailed.revision + 2),
+    ));
+
+    const cognitionCancelled = isolatedWorkspace("cognition-result-after-cancellation");
+    const cognitionCancelledTask = createWorkspaceTask({
+      ...hostContext(cognitionCancelled.id, cognitionCancelled.revision),
+      taskId: "cognition-result-after-cancellation-task",
+      title: "Cognition cancelled child task",
+      assignedFrameId: "cognition-result-after-cancellation-frame",
+    });
+    settleWorkspaceChildTask({
+      ...hostContext(cognitionCancelled.id, cognitionCancelled.revision + 1),
+      taskId: cognitionCancelledTask.id,
+      assignedFrameId: "cognition-result-after-cancellation-frame",
+      state: "cancelled",
+    });
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgressWithCognition(
+      {
+        ...childContext(cognitionCancelled.id, cognitionCancelled.revision + 2, "cognition-result-after-cancellation-frame"),
+        taskId: cognitionCancelledTask.id,
+        state: "active",
+        progress: 0.4,
+      },
+      cognitionProgressFactory(cognitionCancelledTask.id, "active", cognitionCancelled.revision + 2),
+    ));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResultWithCognition(
+      {
+        ...childContext(cognitionCancelled.id, cognitionCancelled.revision + 2, "cognition-result-after-cancellation-frame"),
+        taskId: cognitionCancelledTask.id,
+        summary: "late cognition cancelled result",
+        resultDigest: "d".repeat(64),
+        byteCount: 1,
+      },
+      cognitionProgressFactory(cognitionCancelledTask.id, "completed", cognitionCancelled.revision + 2),
+    ));
+    const cognitionCompleted = isolatedWorkspace("cognition-result-after-completion");
+    const cognitionCompletedTask = createWorkspaceTask({
+      ...hostContext(cognitionCompleted.id, cognitionCompleted.revision),
+      taskId: "cognition-result-after-completion-task",
+      title: "Cognition completed child task",
+      assignedFrameId: "cognition-result-after-completion-frame",
+    });
+    getDb().query("UPDATE agent_workspace_tasks SET state = 'completed', progress = 1, revision = 1 WHERE task_id = ? AND workspace_id = ?")
+      .run(cognitionCompletedTask.id, cognitionCompleted.id);
+    expectWorkspaceError("task_assignment_conflict", () => updateWorkspaceTaskProgressWithCognition(
+      {
+        ...childContext(cognitionCompleted.id, cognitionCompleted.revision + 1, "cognition-result-after-completion-frame"),
+        taskId: cognitionCompletedTask.id,
+        state: "active",
+        progress: 0.4,
+      },
+      cognitionProgressFactory(cognitionCompletedTask.id, "active", cognitionCompleted.revision + 1),
+    ));
+    expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResultWithCognition(
+      {
+        ...childContext(cognitionCompleted.id, cognitionCompleted.revision + 1, "cognition-result-after-completion-frame"),
+        taskId: cognitionCompletedTask.id,
+        summary: "late cognition completed result",
+        resultDigest: "f".repeat(64),
+        byteCount: 1,
+      },
+      cognitionProgressFactory(cognitionCompletedTask.id, "completed", cognitionCompleted.revision + 1),
+    ));
+  });
   test("accepts a child submission, freezes atomically, and rejects later writes", () => {
     const created = workspace();
     const task = createWorkspaceTask({ ...rootContext(created.id, 0), taskId: "required-task", title: "Child task", assignedFrameId: "child-frame" });
@@ -1224,7 +1963,7 @@ describe("turn workspace validators and CAS operations", () => {
 
 
   test("publishes an exact operational task revision", () => {
-    const fixture = persistentFixture("publication-task");
+    const fixture = persistentFixture("publication-task", { attemptId: "publication-task-attempt", executionId: "publication-task-execution" });
     insertOperationalTask(fixture.persistent.id);
     const publication = publishPersistentWorkspaceSelection(
       persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "task", "publication-task", 4),
@@ -1233,6 +1972,11 @@ describe("turn workspace validators and CAS operations", () => {
     expect(publication.sourceCreatedAt).toBe(10);
     expect(publication.sourceUpdatedAt).toBe(20);
     expect(publication.sourceDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(publication.sourceProvenance).toMatchObject({
+      turnSessionId: fixture.session.id,
+      attemptId: "publication-task-attempt",
+      executionId: "publication-task-execution",
+    });
   });
 
   test("publishes an exact operational finding revision and excludes submission-shaped content", () => {
@@ -1278,6 +2022,24 @@ describe("turn workspace validators and CAS operations", () => {
     const second = publishPersistentWorkspaceSelection(input);
     expect(second.id).toBe(first.id);
     expect(getDb().query("SELECT published_reference_count FROM agent_artifact_blobs WHERE user_id = ? AND digest = ?").get(USER, BLOB_DIGEST)).toEqual({ published_reference_count: 1 });
+  });
+  test("rejects omitted-revision replay when an immutable copy diverges from the source selection", async () => {
+    const fixture = persistentFixture("publication-copy-replay-fence");
+    const sourceId = "publication-copy-replay-fence-source";
+    insertOperationalArtifact(fixture.persistent.id, sourceId);
+    const first = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "artifact", sourceId, 5),
+    );
+    const corruptedCopy = JSON.stringify({ ...first.copy, mimeType: "application/stale" });
+    const corruptedDigest = createHash("sha256").update(corruptedCopy, "utf8").digest("hex");
+    getDb().run("DROP TRIGGER trg_persistent_workspace_publications_immutable_update");
+    getDb().query(
+      "UPDATE persistent_workspace_publications SET copy_json = ?, copy_digest = ? WHERE publication_id = ?",
+    ).run(corruptedCopy, corruptedDigest, first.id);
+    getDb().run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "122_persistent_workspace_chat_detach.sql")).text());
+    expectWorkspaceError("stale_revision", () => publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, first.revision, "artifact", sourceId),
+    ));
   });
   test("deletes an artifact publication without deleting its retained blob bytes", () => {
     const fixture = persistentFixture("publication-artifact-delete");
@@ -1375,6 +2137,86 @@ describe("turn workspace validators and CAS operations", () => {
       persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "task", "publication-idempotent-task", 4),
     ));
   });
+  test("resolves omitted source revisions against the current source before replay", () => {
+    const fixture = persistentFixture("publication-current-source-replay");
+    const sourceId = "publication-current-source-task";
+    insertOperationalTask(fixture.persistent.id, sourceId);
+
+    const first = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "task", sourceId),
+    );
+    expect(first.sourceRevision).toBe(4);
+    expect(first.copy).toMatchObject({ category: "task", summary: "Task summary" });
+
+    getDb().query(
+      "UPDATE agent_workspace_tasks SET revision = ?, summary = ?, updated_at = ? WHERE task_id = ?",
+    ).run(5, "Updated task summary", 30, sourceId);
+    const second = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, first.revision, "task", sourceId),
+    );
+    expect(second.id).not.toBe(first.id);
+    expect(second.sourceRevision).toBe(5);
+    expect(second.copy).toMatchObject({ category: "task", summary: "Updated task summary" });
+    expect(second.sourceDigest).not.toBe(first.sourceDigest);
+    const workspaceAfterSecond = getPersistentWorkspaceById({
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+    });
+    expect(workspaceAfterSecond.revision).toBe(2);
+
+    getDb().query("UPDATE agent_workspace_tasks SET summary = ? WHERE task_id = ?").run("Mutated without revision", sourceId);
+    expectWorkspaceError("stale_revision", () => publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, workspaceAfterSecond.revision, "task", sourceId),
+    ));
+
+    const deleted = deletePersistentWorkspacePublication({
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: workspaceAfterSecond.revision,
+      publicationId: second.id,
+    });
+    expect(deleted.revision).toBe(workspaceAfterSecond.revision + 1);
+    const remaining = listPersistentWorkspacePublications({
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: deleted.revision,
+    });
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]?.id).toBe(first.id);
+    expect(remaining[0]?.sourceRevision).toBe(4);
+
+  });
+  test("rolls back when a source mutates during publication commit", () => {
+    const fixture = persistentFixture("publication-source-commit-race");
+    const sourceId = "publication-source-commit-race-task";
+    insertOperationalTask(fixture.persistent.id, sourceId);
+    getDb().run(`CREATE TRIGGER publication_source_commit_race
+      BEFORE INSERT ON persistent_workspace_publications
+      BEGIN
+        UPDATE agent_workspace_tasks
+           SET summary = 'Mutated during publication commit'
+         WHERE task_id = 'publication-source-commit-race-task';
+      END`);
+    try {
+      expectWorkspaceError("stale_revision", () => publishPersistentWorkspaceSelection(
+        persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "task", sourceId),
+      ));
+    } finally {
+      getDb().run("DROP TRIGGER publication_source_commit_race");
+    }
+    expect(getDb().query(
+      "SELECT revision, summary FROM agent_workspace_tasks WHERE task_id = ?",
+    ).get(sourceId)).toEqual({ revision: 4, summary: "Task summary" });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM persistent_workspace_publications WHERE workspace_id = ?",
+    ).get(fixture.persistent.id)).toEqual({ count: 0 });
+    expect(getPersistentWorkspaceById({
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+    }).revision).toBe(0);
+  });
 
   test("keeps owner ad-hoc tasks optional and requires opaque host authority for admission", () => {
     const fixture = persistentFixture("persistent-task-authority");
@@ -1422,6 +2264,36 @@ describe("turn workspace validators and CAS operations", () => {
     expect(admitted).toMatchObject({ required: true, creator: "host", hostAdmitted: true });
   });
 
+  test("maps cross-workspace persistent task ID collisions to duplicate_id", () => {
+    const first = persistentFixture("persistent-global-task-id-first");
+    otherWorkspace("persistent-global-task-id-operational-second");
+    const second = createPersistentWorkspace({
+      userId: USER,
+      chatId: OTHER_CHAT,
+      workspaceId: "persistent-global-task-id-second",
+      objective: "persistent placeholder",
+    });
+    const authority = createPersistentWorkspaceHostAuthority();
+    createPersistentWorkspaceHostTask(authority, {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: first.persistent.id,
+      expectedRevision: first.persistent.revision,
+      id: "persistent-global-task-id",
+      title: "First workspace task",
+      required: true,
+    });
+    expectWorkspaceError("duplicate_id", () => createPersistentWorkspaceHostTask(authority, {
+      userId: USER,
+      chatId: OTHER_CHAT,
+      workspaceId: second.id,
+      expectedRevision: second.revision,
+      id: "persistent-global-task-id",
+      title: "Second workspace task",
+      required: true,
+    }));
+  });
+
   test("derives publication attribution from the authenticated actor", () => {
     const fixture = persistentFixture("publication-attribution");
     insertOperationalFinding(fixture.persistent.id, "publication-owner-finding", "Owner finding");
@@ -1461,6 +2333,164 @@ describe("turn workspace validators and CAS operations", () => {
     expect(hostPublication.sourceProvenance.creator).toBe("host");
   });
 
+  test("reads detached child inventory and usage by immutable workspace owner identity", () => {
+    const fixture = persistentFixture("persistent-detached-inventory");
+    const task = createPersistentWorkspaceHostTask(createPersistentWorkspaceHostAuthority(), {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: fixture.persistent.revision,
+      id: "detached-inventory-task",
+      title: "Detached inventory task",
+      required: true,
+    });
+    const current = getPersistentWorkspaceById({ userId: USER, workspaceId: fixture.persistent.id });
+    const expectedByteCount = current.usage.byteCount + 27;
+    getDb().query(`INSERT INTO persistent_workspace_records
+      (record_id, workspace_id, turn_session_id, user_id, chat_id, kind, content_json,
+       summary, task_id, byte_count, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'finding', ?, ?, ?, 11, 1, 11, 11)`)
+      .run("detached-inventory-record", fixture.persistent.id, fixture.session.id, USER, CHAT, JSON.stringify({ summary: "Detached finding", evidenceIds: [], provenance: null }), "Detached finding", task.id);
+    getDb().query(`INSERT INTO persistent_workspace_submissions
+      (submission_id, workspace_id, turn_session_id, task_id, user_id, chat_id, state,
+       summary, result_digest, byte_count, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?, ?, 13, 1, 12, 12)`)
+      .run("detached-inventory-submission", fixture.persistent.id, fixture.session.id, task.id, USER, CHAT, "Detached submission", "a".repeat(64));
+    getDb().query(`INSERT INTO persistent_workspace_artifacts
+      (artifact_id, workspace_id, turn_session_id, user_id, chat_id, blob_digest, mime_type,
+       byte_count, provenance_json, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'text/plain', 3, '{}', 1, 13, 13)`)
+      .run("detached-inventory-artifact", fixture.persistent.id, fixture.session.id, USER, CHAT, BLOB_DIGEST);
+    const preDetachRevision = current.revision;
+    getDb().query("DELETE FROM chats WHERE id = ?").run(CHAT);
+    expect(getDb().query(
+      "SELECT chat_id FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+    ).get(fixture.session.id)).toEqual({ chat_id: null });
+    expectWorkspaceError("stale_revision", () => createPersistentWorkspaceTask({
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: preDetachRevision,
+    }, { title: "Detached owner write" }));
+
+    const context = {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: preDetachRevision + 1,
+    };
+    const detached = getPersistentWorkspace(context);
+    expect(detached.revision).toBe(preDetachRevision + 1);
+    expect(detached).toMatchObject({
+      id: fixture.persistent.id,
+      chatId: null,
+      state: "archived",
+      usage: { taskCount: 1, recordCount: 1, submissionCount: 1, artifactCount: 1, byteCount: expectedByteCount },
+    });
+    const tasks = listPersistentWorkspaceTasks(context);
+    const records = listPersistentWorkspaceRecords(context);
+    const submissions = listPersistentWorkspaceSubmissions(context);
+    const artifacts = listPersistentWorkspaceArtifacts(context);
+    expect(tasks).toHaveLength(1);
+    expect(records).toHaveLength(1);
+    expect(submissions).toHaveLength(1);
+    expect(artifacts).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({ chatId: null });
+    expect(records[0]).toMatchObject({ chatId: null });
+    expect(submissions[0]).toMatchObject({ chatId: null });
+    expect(artifacts[0]).toMatchObject({ chatId: null });
+    const sessions = listPersistentWorkspaceTurnSessions(context, { limit: 50, offset: 0 });
+    expect(sessions).toMatchObject({ total: 1, limit: 50, offset: 0 });
+    expect(sessions.data).toHaveLength(1);
+    expect(sessions.data[0]).toMatchObject({ id: fixture.session.id, chatId: null, attemptId: fixture.session.attemptId });
+  });
+
+  test("leaves publication target links absent when its exact attempt is deleted despite a retry", () => {
+    const exactMessageId = "publication-exact-attempt-message";
+    const retryMessageId = "publication-retry-attempt-message";
+    getDb().query(
+      "INSERT INTO messages (id, chat_id, index_in_chat, content, swipe_id, swipes) VALUES (?, ?, 0, ?, 0, ?)",
+    ).run(exactMessageId, CHAT, "Exact attempt source", JSON.stringify(["Exact attempt swipe"]));
+    getDb().query(
+      "INSERT INTO messages (id, chat_id, index_in_chat, content, swipe_id, swipes) VALUES (?, ?, 1, ?, 0, ?)",
+    ).run(retryMessageId, CHAT, "Retry attempt source", JSON.stringify(["Retry attempt swipe"]));
+    const fixture = persistentFixture("publication-exact-attempt-deleted", {
+      attemptId: "publication-exact-attempt",
+      targetMessageId: exactMessageId,
+      targetSwipeId: 0,
+    });
+    insertTurnAttempt(TURN, {
+      attemptId: "publication-retry-attempt",
+      previousAttemptId: "publication-exact-attempt",
+      runId: "publication-retry-run",
+      generationId: "publication-retry-generation",
+      targetMessageId: retryMessageId,
+      targetSwipeId: 0,
+    });
+    // The self-FK's ON DELETE SET NULL applies to both columns; detach the
+    // retry first because user_id is NOT NULL.
+    expect(getDb().query(
+      "UPDATE agent_run_attempts SET previous_attempt_id = NULL WHERE user_id = ? AND attempt_id = ?",
+    ).run(USER, "publication-retry-attempt").changes).toBe(1);
+    expect(getDb().query(
+      "DELETE FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).run(USER, "publication-exact-attempt").changes).toBe(1);
+    insertOperationalArtifact(fixture.persistent.id, "publication-exact-attempt-artifact");
+
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "artifact", "publication-exact-attempt-artifact", 5),
+    );
+    expect(publication.sourceProvenance).toMatchObject({
+      attemptId: "publication-exact-attempt",
+      sourceMessageId: null,
+      sourceSwipeId: null,
+    });
+  });
+  test("uses the exact stored execution links rather than a retry when its attempt is deleted", () => {
+    const exactMessageId = "publication-execution-exact-message";
+    const retryMessageId = "publication-execution-retry-message";
+    getDb().query(
+      "INSERT INTO messages (id, chat_id, index_in_chat, content, swipe_id, swipes) VALUES (?, ?, 0, ?, 0, ?)",
+    ).run(exactMessageId, CHAT, "Exact execution source", JSON.stringify(["Exact execution swipe"]));
+    getDb().query(
+      "INSERT INTO messages (id, chat_id, index_in_chat, content, swipe_id, swipes) VALUES (?, ?, 1, ?, 0, ?)",
+    ).run(retryMessageId, CHAT, "Retry execution source", JSON.stringify(["Retry execution swipe"]));
+    const fixture = persistentFixture("publication-execution-exact", {
+      attemptId: "publication-execution-attempt",
+      targetMessageId: exactMessageId,
+      targetSwipeId: 0,
+    });
+    insertTurnAttempt(TURN, {
+      attemptId: "publication-execution-retry",
+      previousAttemptId: "publication-execution-attempt",
+      runId: "publication-execution-retry-run",
+      generationId: "publication-execution-retry-generation",
+      targetMessageId: retryMessageId,
+      targetSwipeId: 0,
+    });
+    getDb().query(
+      "UPDATE agent_turn_executions SET target_message_id = ?, target_swipe_id = 0 WHERE id = ?",
+    ).run(exactMessageId, TURN);
+    // Avoid the composite self-FK's invalid attempt to null the retry's
+    // NOT NULL user_id while removing the exact attempt.
+    expect(getDb().query(
+      "UPDATE agent_run_attempts SET previous_attempt_id = NULL WHERE user_id = ? AND attempt_id = ?",
+    ).run(USER, "publication-execution-retry").changes).toBe(1);
+    expect(getDb().query(
+      "DELETE FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).run(USER, "publication-execution-attempt").changes).toBe(1);
+    insertOperationalArtifact(fixture.persistent.id, "publication-execution-exact-artifact");
+
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "artifact", "publication-execution-exact-artifact", 5),
+    );
+    expect(publication.sourceProvenance).toMatchObject({
+      attemptId: "publication-execution-attempt",
+      sourceMessageId: exactMessageId,
+      sourceSwipeId: 0,
+    });
+  });
+
   test("reads an immutable publication after deleting its source message, swipe, source, and chat", () => {
     const sourceMessageId = "publication-deletion-message";
     getDb().query(
@@ -1492,7 +2522,7 @@ describe("turn workspace validators and CAS operations", () => {
       userId: USER,
       chatId: CHAT,
       workspaceId: fixture.persistent.id,
-      expectedRevision: 1,
+      expectedRevision: 2,
     });
     expect(listed).toHaveLength(1);
     expect(listed[0]?.id).toBe(publication.id);
@@ -1505,11 +2535,23 @@ describe("turn workspace validators and CAS operations", () => {
       sourceSwipeId: 0,
       sourceDeletedAt: listed[0]?.sourceDeletedAt,
     });
+    const persistedProvenance = getDb().query(
+      "SELECT source_deleted_at, source_provenance_json FROM persistent_workspace_publications WHERE publication_id = ?",
+    ).get(publication.id) as { source_deleted_at: number | null; source_provenance_json: string };
+    expect(persistedProvenance.source_deleted_at).toBe(listed[0]?.sourceDeletedAt);
+    expect(JSON.parse(persistedProvenance.source_provenance_json).sourceDeletedAt).toBe(listed[0]?.sourceDeletedAt);
+    const reread = listPersistentWorkspacePublications({
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: 2,
+    });
+    expect(reread).toEqual(listed);
     expect(getPersistentWorkspace({
       userId: USER,
       chatId: CHAT,
       workspaceId: fixture.persistent.id,
-      expectedRevision: 1,
+      expectedRevision: 2,
     })).toMatchObject({ id: fixture.persistent.id, chatId: null, state: "archived" });
     expectWorkspaceError("not_found", () => createPersistentWorkspaceHostTurnSession(createPersistentWorkspaceHostAuthority(), {
       userId: USER,
@@ -1518,7 +2560,7 @@ describe("turn workspace validators and CAS operations", () => {
       turnSessionId: "detached-session",
       turnId: TURN,
       attemptId: TURN,
-      expectedRevision: 1,
+      expectedRevision: 2,
     }));
     expect(getDb().query(
       "SELECT published_reference_count, storage_path FROM agent_artifact_blobs WHERE user_id = ? AND digest = ?",
@@ -1576,39 +2618,339 @@ describe("turn workspace validators and CAS operations", () => {
     }));
   });
 
-  test("terminal turn sessions are monotonic, immutable, and idempotent", () => {
-    const fixture = persistentFixture("persistent-terminal-session");
+  test("fails closed when the turn-attempt schema is unavailable", () => {
+    const fixture = persistentFixture("persistent-attempt-schema-unavailable");
     const authority = createPersistentWorkspaceHostAuthority();
-    const running = updatePersistentWorkspaceHostTurnSession(authority, {
+    getDb().run("ALTER TABLE agent_run_attempts RENAME TO agent_run_attempts_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => createPersistentWorkspaceHostTurnSession(authority, {
+        userId: USER,
+        chatId: CHAT,
+        workspaceId: fixture.persistent.id,
+        turnSessionId: "missing-attempt-session",
+        turnId: "missing-attempt-turn",
+        attemptId: "missing-attempt-id",
+        expectedRevision: fixture.persistent.revision,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE agent_run_attempts_missing RENAME TO agent_run_attempts");
+    }
+  });
+
+  test("fails closed when a persistent workspace child schema is unavailable", () => {
+    const fixture = persistentFixture("persistent-usage-schema-unavailable");
+    getDb().run("ALTER TABLE persistent_workspace_tasks RENAME TO persistent_workspace_tasks_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => getPersistentWorkspaceById({
+        userId: USER,
+        workspaceId: fixture.persistent.id,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE persistent_workspace_tasks_missing RENAME TO persistent_workspace_tasks");
+    }
+  });
+
+  test("rejects persistent session replay aliases and bounds pagination offsets", () => {
+    const fixture = persistentFixture("persistent-session-replay-conflict");
+    const authority = createPersistentWorkspaceHostAuthority();
+    const base = {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      turnSessionId: fixture.session.id,
+      turnId: fixture.session.turnId,
+      attemptId: fixture.session.attemptId,
+      executionId: fixture.session.executionId,
+      expectedRevision: fixture.persistent.revision,
+    };
+    expect(createPersistentWorkspaceHostTurnSession(authority, base)).toEqual(fixture.session);
+    expectWorkspaceError("task_assignment_conflict", () => createPersistentWorkspaceHostTurnSession(authority, {
+      ...base,
+      turnSessionId: "persistent-session-replay-alias",
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => createPersistentWorkspaceHostTurnSession(authority, {
+      ...base,
+      executionId: "persistent-session-replay-execution-alias",
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => createPersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      turnId: fixture.session.turnId,
+      attemptId: fixture.session.attemptId,
+      executionId: fixture.session.executionId,
+      expectedRevision: fixture.persistent.revision,
+    }));
+    expectWorkspaceError("task_assignment_conflict", () => createPersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      turnSessionId: fixture.session.id,
+      turnId: fixture.session.turnId,
+      attemptId: fixture.session.attemptId,
+      expectedRevision: fixture.persistent.revision,
+    }));
+
+    insertTurnExecution(TURN_A, "persistent-session-replay-generation", "persistent-session-replay-commit");
+    insertTurnAttempt(TURN_A);
+    expectWorkspaceError("task_assignment_conflict", () => createPersistentWorkspaceHostTurnSession(authority, {
+      ...base,
+      turnId: TURN_A,
+      attemptId: TURN_A,
+      executionId: TURN_A,
+    }));
+
+    const context = {
       userId: USER,
       chatId: CHAT,
       workspaceId: fixture.persistent.id,
       expectedRevision: fixture.persistent.revision,
-      turnSessionId: fixture.session.id,
-      phase: "WORK",
-      status: "running",
+    };
+    expectWorkspaceError("invalid_input", () => listPersistentWorkspaceTurnSessions(context, {
+      limit: 1,
+      offset: -1,
+    }));
+    expectWorkspaceError("invalid_input", () => listPersistentWorkspaceTurnSessions(context, {
+      limit: 1,
+      offset: Number.MAX_SAFE_INTEGER + 1,
+    }));
+    expectWorkspaceError("invalid_input", () => listPersistentWorkspaceTurnSessions(context, {
+      limit: 1,
+      offset: PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET + 1,
+    }));
+    expect(listPersistentWorkspaceTurnSessions(context, {
+      limit: 1,
+      offset: PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET,
+    })).toMatchObject({
+      total: 1,
+      limit: 1,
+      offset: PERSISTENT_WORKSPACE_MAX_SESSION_OFFSET,
     });
-    expect(running).toMatchObject({ phase: "WORK", status: "running", outcome: null, revision: 1, terminalAt: null });
+  });
 
+  test("replays an immutable terminal session after an unrelated workspace revision", () => {
+    const fixture = persistentFixture("persistent-terminal-replay-revision");
+    const authority = createPersistentWorkspaceHostAuthority();
+    const expectedRevision = fixture.persistent.revision;
     const terminal = updatePersistentWorkspaceHostTurnSession(authority, {
       userId: USER,
-      chatId: CHAT,
       workspaceId: fixture.persistent.id,
-      expectedRevision: fixture.persistent.revision,
+      expectedRevision,
       turnSessionId: fixture.session.id,
       phase: "TERMINAL",
       status: "terminal",
       outcome: "completed",
     });
-    expect(terminal).toMatchObject({ phase: "TERMINAL", status: "terminal", outcome: "completed", revision: 2 });
+    const unrelated = createPersistentWorkspaceTask({
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision,
+    }, {
+      id: "terminal-replay-unrelated-task",
+      title: "Unrelated revision task",
+      objective: "Advance the workspace revision without touching the session",
+    });
+    expect(unrelated.id).toBe("terminal-replay-unrelated-task");
+    expect(getPersistentWorkspaceById({
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+    }).revision).toBe(expectedRevision + 1);
+    expect(updatePersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+      expectedRevision,
+      turnSessionId: fixture.session.id,
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "completed",
+    })).toEqual(terminal);
+    expectWorkspaceError("invalid_state", () => updatePersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+      expectedRevision,
+      turnSessionId: fixture.session.id,
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+    }));
+  });
+
+  test("rejects malformed persisted dependency JSON instead of treating it as an empty graph", () => {
+    const fixture = persistentFixture("persistent-corrupt-dependencies");
+    const task = createPersistentWorkspaceHostTask(createPersistentWorkspaceHostAuthority(), {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: fixture.persistent.revision,
+      id: "corrupt-dependency-task",
+      title: "Corrupt dependency task",
+    });
+    const context = {
+      userId: USER,
+      chatId: CHAT,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: fixture.persistent.revision + 1,
+    };
+    getDb().query(
+      "UPDATE persistent_workspace_tasks SET dependency_ids_json = ? WHERE task_id = ?",
+    ).run('{"not":"an-array"}', task.id);
+    expectWorkspaceError("invalid_state", () => listPersistentWorkspaceTasks(context));
+    getDb().query(
+      "UPDATE persistent_workspace_tasks SET dependency_ids_json = ? WHERE task_id = ?",
+    ).run('["missing-dependency"]', task.id);
+    expectWorkspaceError("invalid_state", () => listPersistentWorkspaceTasks(context));
+  });
+
+  test("fails closed when a task publication source schema is unavailable", () => {
+    const fixture = persistentFixture("persistent-task-source-schema-unavailable");
+    const sourceId = "missing-task-source";
+    insertOperationalTask(fixture.persistent.id, sourceId);
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "task", sourceId, 4),
+    );
+    getDb().run("ALTER TABLE agent_workspace_tasks RENAME TO agent_workspace_tasks_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => listPersistentWorkspacePublications({
+        userId: USER,
+        chatId: CHAT,
+        workspaceId: fixture.persistent.id,
+        expectedRevision: publication.revision,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE agent_workspace_tasks_missing RENAME TO agent_workspace_tasks");
+    }
+  });
+
+  test("fails closed when a finding publication source schema is unavailable", () => {
+    const fixture = persistentFixture("persistent-finding-source-schema-unavailable");
+    const sourceId = "missing-finding-source";
+    insertOperationalFinding(fixture.persistent.id, sourceId);
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "finding", sourceId, 3),
+    );
+    getDb().run("ALTER TABLE agent_workspace_records RENAME TO agent_workspace_records_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => listPersistentWorkspacePublications({
+        userId: USER,
+        chatId: CHAT,
+        workspaceId: fixture.persistent.id,
+        expectedRevision: publication.revision,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE agent_workspace_records_missing RENAME TO agent_workspace_records");
+    }
+  });
+
+  test("fails closed when an objective publication source schema is unavailable", () => {
+    const fixture = persistentFixture("persistent-objective-source-schema-unavailable");
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "objective", fixture.persistent.id, 0),
+    );
+    getDb().run("ALTER TABLE agent_turn_workspaces RENAME TO agent_turn_workspaces_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => listPersistentWorkspacePublications({
+        userId: USER,
+        chatId: CHAT,
+        workspaceId: fixture.persistent.id,
+        expectedRevision: publication.revision,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE agent_turn_workspaces_missing RENAME TO agent_turn_workspaces");
+    }
+  });
+
+  test("fails closed when an artifact publication source schema is unavailable", () => {
+    const fixture = persistentFixture("persistent-artifact-source-schema-unavailable");
+    const sourceId = "missing-artifact-source";
+    insertOperationalArtifact(fixture.persistent.id, sourceId);
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "artifact", sourceId, 5),
+    );
+    getDb().run("ALTER TABLE agent_workspace_artifacts RENAME TO agent_workspace_artifacts_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => listPersistentWorkspacePublications({
+        userId: USER,
+        chatId: CHAT,
+        workspaceId: fixture.persistent.id,
+        expectedRevision: publication.revision,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE agent_workspace_artifacts_missing RENAME TO agent_workspace_artifacts");
+    }
+  });
+
+  test("fails closed when a publication source message schema is unavailable", () => {
+    const sourceMessageId = "persistent-source-message-schema-unavailable";
+    getDb().query(
+      "INSERT INTO messages (id, chat_id, index_in_chat, content, swipe_id, swipes) VALUES (?, ?, 0, ?, 0, ?)",
+    ).run(sourceMessageId, CHAT, "Source message", JSON.stringify(["Source swipe"]));
+    const fixture = persistentFixture("persistent-message-source-schema-unavailable", {
+      targetMessageId: sourceMessageId,
+      targetSwipeId: 0,
+    });
+    const sourceId = "message-source-artifact";
+    insertOperationalArtifact(fixture.persistent.id, sourceId);
+    const publication = publishPersistentWorkspaceSelection(
+      persistentPublicationInput(fixture.persistent.id, fixture.persistent.revision, "artifact", sourceId, 5),
+    );
+    getDb().run("ALTER TABLE messages RENAME TO messages_missing");
+    try {
+      expectWorkspaceError("schema_unavailable", () => listPersistentWorkspacePublications({
+        userId: USER,
+        chatId: CHAT,
+        workspaceId: fixture.persistent.id,
+        expectedRevision: publication.revision,
+      }));
+    } finally {
+      getDb().run("ALTER TABLE messages_missing RENAME TO messages");
+    }
+  });
+
+  test("terminal turn sessions are monotonic, immutable, and idempotent", () => {
+    const fixture = persistentFixture("persistent-terminal-session");
+    const authority = createPersistentWorkspaceHostAuthority();
+    getDb().query("DELETE FROM chats WHERE id = ?").run(CHAT);
+    const detached = getPersistentWorkspaceById({
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+    });
+    expect(detached.revision).toBeGreaterThan(fixture.persistent.revision);
+    expectWorkspaceError("stale_revision", () => updatePersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: fixture.persistent.revision,
+      turnSessionId: fixture.session.id,
+      phase: "WORK",
+      status: "running",
+    }));
+    const running = updatePersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: detached.revision,
+      turnSessionId: fixture.session.id,
+      phase: "WORK",
+      status: "running",
+    });
+    expect(running).toMatchObject({ phase: "WORK", status: "running", outcome: null, revision: fixture.session.revision + 1, terminalAt: null });
+
+    const terminal = updatePersistentWorkspaceHostTurnSession(authority, {
+      userId: USER,
+      workspaceId: fixture.persistent.id,
+      expectedRevision: detached.revision,
+      turnSessionId: fixture.session.id,
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "completed",
+    });
+    expect(terminal).toMatchObject({ phase: "TERMINAL", status: "terminal", outcome: "completed", revision: running.revision + 1 });
     expect(terminal.terminalAt).toEqual(expect.any(Number));
     expect(Object.isFrozen(terminal)).toBe(true);
 
     const replay = updatePersistentWorkspaceHostTurnSession(authority, {
       userId: USER,
-      chatId: CHAT,
       workspaceId: fixture.persistent.id,
-      expectedRevision: fixture.persistent.revision,
+      expectedRevision: detached.revision,
       turnSessionId: fixture.session.id,
       phase: "TERMINAL",
       status: "terminal",
@@ -1617,9 +2959,8 @@ describe("turn workspace validators and CAS operations", () => {
     expect(replay).toEqual(terminal);
     expectWorkspaceError("invalid_state", () => updatePersistentWorkspaceHostTurnSession(authority, {
       userId: USER,
-      chatId: CHAT,
       workspaceId: fixture.persistent.id,
-      expectedRevision: fixture.persistent.revision,
+      expectedRevision: detached.revision,
       turnSessionId: fixture.session.id,
       phase: "TERMINAL",
       status: "terminal",
@@ -1627,9 +2968,8 @@ describe("turn workspace validators and CAS operations", () => {
     }));
     expectWorkspaceError("invalid_state", () => updatePersistentWorkspaceHostTurnSession(authority, {
       userId: USER,
-      chatId: CHAT,
       workspaceId: fixture.persistent.id,
-      expectedRevision: fixture.persistent.revision,
+      expectedRevision: detached.revision,
       turnSessionId: fixture.session.id,
       phase: "WORK",
       status: "running",
@@ -1640,7 +2980,7 @@ describe("turn workspace validators and CAS operations", () => {
       phase: "TERMINAL",
       status: "terminal",
       outcome: "completed",
-      revision: 2,
+      revision: terminal.revision,
     });
   });
 

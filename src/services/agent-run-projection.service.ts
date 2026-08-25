@@ -64,9 +64,11 @@ const MAX_TOOL_BYTES = 128;
 const MAX_NODES = 128;
 const MAX_EVENTS = 128;
 const MAX_RUNS = 16;
+const MAX_RESYNC_RUNS = 256;
 const MAX_WORKSPACE_ENTRIES = 64;
 const MAX_CURSOR_BYTES = 2048;
 const CURSOR_TTL_SECONDS = 5 * 60;
+const RESYNC_SNAPSHOT_TTL_SECONDS = CURSOR_TTL_SECONDS;
 const MAX_SAFE_COUNTER = Number.MAX_SAFE_INTEGER;
 const MAX_RECONCILIATION_ROWS = 256;
 const TERMINAL_STATUS_SQL = "'COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT'";
@@ -87,6 +89,23 @@ function expiryToMilliseconds(value: unknown): number | null {
 function isExpiredAt(value: unknown, now = Date.now()): boolean {
   const expiresAt = expiryToMilliseconds(value);
   return expiresAt !== null && expiresAt <= now;
+}
+
+function executionVisibilitySql(alias: string): string {
+  return `(
+    ${alias}.expires_at IS NULL
+    OR typeof(${alias}.expires_at) NOT IN ('integer', 'real')
+    OR ${alias}.expires_at != CAST(${alias}.expires_at AS INTEGER)
+    OR ${alias}.expires_at <= 0
+    OR CASE
+      WHEN ${alias}.expires_at < ${SWIPE_EXPIRY_THRESHOLD} THEN ${alias}.expires_at * 1000
+      ELSE ${alias}.expires_at
+    END > ?
+  )`;
+}
+
+function isSafeResyncCursorNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 type StoredRunState =
   | "ASSEMBLE"
@@ -177,11 +196,25 @@ export interface AgentRunProjectionInputV2 {
   readonly usage?: unknown;
   readonly terminalHandoff?: Partial<AgentTerminalHandoffV2> | null;
   readonly omission?: Partial<AgentOmissionMarkerV2> | null;
+  /** Durable commit receipt identity used to authenticate receipt-owned repair. */
+  readonly receiptId?: string;
   /** Optional already-redacted V1 activity input for compatibility storage. */
   readonly compatibilitySnapshot?: unknown;
   readonly receiptRepair?: boolean;
   readonly recoveryRepair?: boolean;
+  /** Write a terminal public projection without inspecting/rewriting an already-exact inspection. */
+  readonly preserveTerminalInspection?: boolean;
 }
+export interface AgentRunReceiptRepairOptions {
+  readonly reason?: string | null;
+  readonly error?: AgentRunProjectionInputV2["error"];
+  /**
+   * Explicit startup-recovery authority for redacting a historical target
+   * that no longer exists in the message's durable swipe set.
+   */
+  readonly historicalTargetRedaction?: true;
+}
+
 
 export interface AgentRunProjectionCommitResult {
   readonly run: AgentRunPublicV2;
@@ -228,6 +261,10 @@ interface CursorClaims {
   readonly e: number;
   /** Full-resync run-page offset. Presence keeps the token in resync mode. */
   readonly p?: number;
+  /** Owner/chat-scoped persisted full-resync snapshot. */
+  readonly r?: string;
+  /** Stable member ordinal already consumed from the snapshot. */
+  readonly q?: number;
 }
 
 export interface AgentRunStopContextV1 {
@@ -483,13 +520,13 @@ function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
   if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
     return "stopped";
   }
+  if (code === "root_wall_clock_limit_exceeded") return "failed";
   if (
     code === "exhausted"
     || code === "budget_exhausted"
     || code === "budget_exceeded"
     || code === "limit_exceeded"
     || code === "agentic_work_exhausted"
-    || code === "root_wall_clock_limit_exceeded"
     || code.endsWith("_limit_exceeded")
     || code.endsWith("_budget_exhausted")
     || code.endsWith("_budget_exceeded")
@@ -565,12 +602,12 @@ function phaseForStoredState(state: StoredRunState): AgentRunPublicPhaseV2 {
 function outcomeForStoredState(state: StoredRunState, terminalCode?: unknown): AgentRunPublicOutcomeV2 | null {
   if (state === "COMMITTED") return "completed";
   if (state === "CANCELLED") return "stopped";
+  if (state === "EXHAUSTED") return "exhausted";
   if (state === "FAILED" && isRejectedErrorCode(terminalCode)) return "rejected";
   const cause = terminalCauseForCode(terminalCode);
-  if (cause && (state === "TIMED_OUT" || state === "EXHAUSTED" || state === "FAILED" || state === "COMMIT_FAILED")) {
+  if (cause && (state === "TIMED_OUT" || state === "FAILED" || state === "COMMIT_FAILED")) {
     return cause;
   }
-  if (state === "EXHAUSTED") return "exhausted";
   if (state === "FAILED" || state === "COMMIT_FAILED" || state === "TIMED_OUT") return "failed";
   return null;
 }
@@ -884,7 +921,7 @@ function normalizeRun(
     : input.error && typeof input.error === "object" ? input.error : null;
   const storedState = normalizeInputState(input, existing);
   if (!userId || !chatId || !turnId || !generationId || !generationType) return null;
-  const target = normalizeTarget(
+  const candidateTarget = normalizeTarget(
     input.targetMessageId === undefined ? existing?.target?.messageId : input.targetMessageId,
     input.targetSwipeId === undefined ? existing?.target?.swipeId : input.targetSwipeId,
   );
@@ -952,7 +989,8 @@ function normalizeRun(
   const errorCode = safePublicErrorCode(errorSource?.code)
     ?? defaultErrorCodeForState(storedState, causalCode, reason);
   const handoff = normalizeHandoff(input.terminalHandoff ?? existing?.terminalHandoff);
-  const attemptLineage = normalizeAttemptLineage(input, chatId, generationType, target, startedAt, existing);
+  const attemptLineage = normalizeAttemptLineage(input, chatId, generationType, candidateTarget, startedAt, existing);
+  const target = normalizeTarget(attemptLineage.target.messageId, attemptLineage.target.swipeId);
   const recovery = recoveryForProjection(
     errorSource?.recoveryEligible,
     errorSource?.recoveryAction,
@@ -1028,6 +1066,14 @@ function normalizeRun(
   return encoder.encode(json).byteLength <= 65536 ? run : null;
 }
 
+function parseStoredTerminalHandoff(
+  serialized: string | null,
+  snapshotFallback: AgentRunProjectionInputV2["terminalHandoff"],
+): AgentRunProjectionInputV2["terminalHandoff"] {
+  if (serialized === null) return snapshotFallback;
+  return JSON.parse(serialized) as AgentRunProjectionInputV2["terminalHandoff"];
+}
+
 function parseStoredRun(row: StoredProjectionRow): AgentRunPublicV2 | null {
   try {
     const parsed = JSON.parse(row.snapshot_json) as AgentRunPublicV2;
@@ -1054,7 +1100,7 @@ function parseStoredRun(row: StoredProjectionRow): AgentRunPublicV2 | null {
       activity: parsed.activity,
       usage: parsed.usage,
       error: parsed.error,
-      terminalHandoff: parsed.terminalHandoff,
+      terminalHandoff: parseStoredTerminalHandoff(row.terminal_handoff_json, parsed.terminalHandoff),
       omission: JSON.parse(row.omission_json),
     }, row.sequence, row.revision);
     return safe;
@@ -1097,7 +1143,7 @@ function parseStoredEvent(
       activity: parsed.activity,
       usage: parsed.usage,
       error: parsed.error,
-      terminalHandoff: parsed.terminalHandoff,
+      terminalHandoff: parseStoredTerminalHandoff(row.terminal_handoff_json, parsed.terminalHandoff),
       omission: JSON.parse(row.omission_json),
     }, row.sequence, row.run_revision);
     if (!run) return null;
@@ -1295,6 +1341,46 @@ function appendDurableTerminalProjection(
   });
 }
 
+function historicalInspectionTargetIsAudited(
+  db: Database,
+  userId: string,
+  chatId: string,
+  attemptId: string,
+  targetMessageId: string | null,
+  targetSwipeId: number | null,
+): boolean {
+  if (targetMessageId === null || !tableExists(db, "agent_run_audit_records")) return false;
+  try {
+    const rows = db.query(
+      `SELECT payload_json
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND chat_id = ? AND attempt_id = ?
+        ORDER BY host_sequence, record_id
+        LIMIT 512`,
+    ).all(userId, chatId, attemptId) as Array<{ payload_json?: unknown }>;
+    for (const row of rows) {
+      let payload: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(String(row.payload_json ?? "{}")) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+        payload = parsed as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const correlation = payload.correlation;
+      if (!correlation || typeof correlation !== "object" || Array.isArray(correlation)) continue;
+      const candidate = correlation as Record<string, unknown>;
+      if (
+        candidate.messageId === targetMessageId
+        && candidate.swipeId === targetSwipeId
+      ) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 function persistInspectionRepairMarker(
   db: Database,
   input: AgentRunProjectionInputV2,
@@ -1302,7 +1388,15 @@ function persistInspectionRepairMarker(
 ): void {
   if (!input.receiptRepair && !input.recoveryRepair) return;
   const markerKind = input.receiptRepair ? "late_event" : "reordered_event";
-  const markerId = `projection:${run.runId}:${markerKind}:${run.revision}`;
+  const markerId = `projection:${run.runId}:${markerKind}`;
+  const receiptTargetMessageId = input.receiptRepair
+    ? input.targetMessageId ?? null
+    : run.target?.messageId ?? null;
+  const receiptTargetSwipeId = receiptTargetMessageId === null
+    ? null
+    : input.receiptRepair
+      ? input.targetSwipeId ?? 0
+      : run.target?.swipeId ?? 0;
   const hostSequence = Number.isSafeInteger(run.sequence) && run.sequence >= 0 ? run.sequence : 0;
   const marker = {
     id: markerId,
@@ -1314,8 +1408,8 @@ function persistInspectionRepairMarker(
       attemptId: run.attemptLineage.attemptId,
       chatId: run.chatId,
       generationId: run.generationId,
-      messageId: run.target?.messageId ?? null,
-      swipeId: run.target?.swipeId ?? null,
+      messageId: receiptTargetMessageId,
+      swipeId: receiptTargetSwipeId,
       actorId: "host",
       recipientId: null,
       phase: run.workPhase,
@@ -1329,32 +1423,303 @@ function persistInspectionRepairMarker(
     lastSequence: hostSequence,
     recoverable: true,
     detail: input.receiptRepair
-      ? "A durable terminal receipt repaired the projection after the original event boundary."
+      ? "A durable terminal receipt reconciled the projection and inspection after the original event boundary."
       : "A startup recovery reconciled an interrupted execution after an out-of-order lifecycle boundary.",
   };
-  const inspectionInput: PersistAgentRunInspectionInputV1 = {
-    userId: input.userId,
-    chatId: input.chatId,
-    attemptId: run.attemptLineage.attemptId,
-    previousAttemptId: run.attemptLineage.previousAttemptId,
-    runId: run.runId,
-    turnSessionId: run.turnId,
-    generationId: run.generationId,
-    generationType: run.generationType,
-    targetMessageId: run.target?.messageId ?? null,
-    targetSwipeId: run.target?.swipeId ?? null,
-    hostCorrelationId: `${run.runId}:projection`,
-    lifecycle: run.workPhase,
-    status: run.workStatus,
-    outcome: run.workOutcome,
-    reason: "reconciled",
-    startedAt: run.startedAt,
-    updatedAt: run.updatedAt,
-    terminalAt: run.workStatus === "terminal" ? run.updatedAt : null,
-    reconciliation: "recovered",
-    markers: [marker],
-  };
-  persistAgentRunInspectionInTransaction(db, inspectionInput);
+  const existingInspection = tableExists(db, "agent_run_attempts")
+    ? db.query(
+      `SELECT user_id, chat_id, attempt_id, previous_attempt_id, run_id, turn_id,
+              generation_id, generation_type, target_message_id, target_swipe_id,
+              lifecycle, status, outcome, reason, started_at, updated_at, terminal_at,
+              terminal, host_correlation_id, reconciliation_state, terminal_receipt_json
+         FROM agent_run_attempts
+        WHERE user_id = ? AND attempt_id = ?
+        LIMIT 1`,
+    ).get(input.userId, run.attemptLineage.attemptId) as {
+      user_id: string;
+      chat_id: string;
+      attempt_id: string;
+      previous_attempt_id: string | null;
+      run_id: string;
+      turn_id: string;
+      generation_id: string;
+      generation_type: string;
+      target_message_id: string | null;
+      target_swipe_id: number | null;
+      lifecycle: string;
+      status: string;
+      outcome: string | null;
+      reason: string;
+      started_at: number;
+      updated_at: number;
+      terminal_at: number | null;
+      terminal: number;
+      host_correlation_id: string;
+      reconciliation_state: string;
+      terminal_receipt_json: string | null;
+    } | null
+    : null;
+  const receiptRepairAuthority = input.receiptRepair === true
+    && validId(input.receiptId)
+    && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "COMMITTED"
+    && run.workPhase === "TERMINAL"
+    && run.workStatus === "terminal"
+    && run.workOutcome === "completed"
+    && run.terminalHandoff?.committed === true;
+  const failedTerminalInspectionRow = existingInspection !== null
+    && existingInspection.terminal === 1
+    && existingInspection.lifecycle === "TERMINAL"
+    && existingInspection.status === "terminal"
+    && existingInspection.outcome === "failed"
+    ? existingInspection
+    : null;
+  const failedTerminalInspection = failedTerminalInspectionRow !== null;
+  const historicalTargetConflictAuthorized = receiptRepairAuthority
+    && existingInspection !== null
+    && (existingInspection.reconciliation_state === "authoritative"
+      || existingInspection.reconciliation_state === "recovered")
+    && historicalInspectionTargetIsAudited(
+      db,
+      existingInspection.user_id,
+      existingInspection.chat_id,
+      existingInspection.attempt_id,
+      existingInspection.target_message_id,
+      existingInspection.target_swipe_id,
+    );
+  const receiptIdentityConflict = receiptRepairAuthority
+    && existingInspection !== null
+    && (
+      existingInspection.chat_id !== input.chatId
+      || existingInspection.run_id !== run.runId
+      || existingInspection.turn_id !== run.turnId
+      || existingInspection.generation_id !== run.generationId
+      || existingInspection.generation_type !== run.generationType
+      || existingInspection.attempt_id !== run.attemptLineage.attemptId
+      || existingInspection.previous_attempt_id !== run.attemptLineage.previousAttemptId
+      || (
+        !historicalTargetConflictAuthorized
+        && (
+          existingInspection.target_message_id !== null
+            && existingInspection.target_message_id !== receiptTargetMessageId
+          || existingInspection.target_swipe_id !== null
+            && existingInspection.target_swipe_id !== receiptTargetSwipeId
+        )
+      )
+    );
+  let terminalReceiptIdentityConflict = false;
+  if (receiptRepairAuthority && existingInspection?.terminal_receipt_json) {
+    try {
+      const parsed = JSON.parse(existingInspection.terminal_receipt_json) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        terminalReceiptIdentityConflict = true;
+      } else {
+        const source = parsed as Record<string, unknown>;
+        const storedReceiptId = source.receiptId;
+        if (storedReceiptId !== undefined
+          && storedReceiptId !== null
+          && (!validId(storedReceiptId) || storedReceiptId !== input.receiptId)) {
+          terminalReceiptIdentityConflict = true;
+        }
+        const nestedTarget = source.target && typeof source.target === "object" && !Array.isArray(source.target)
+          ? source.target as Record<string, unknown>
+          : null;
+        const legacyReceipt = validId(storedReceiptId);
+        const emptyPlaceholder = (value: unknown): boolean => Boolean(
+          value
+          && typeof value === "object"
+          && !Array.isArray(value)
+          && Object.keys(value).length === 0,
+        );
+        const storedMessageId = source.messageId ?? nestedTarget?.messageId;
+        const storedSwipeId = source.swipeId ?? nestedTarget?.swipeId;
+        const messageIdAbsent = storedMessageId === undefined
+          || storedMessageId === null
+          || legacyReceipt && emptyPlaceholder(storedMessageId);
+        const swipeIdAbsent = storedSwipeId === undefined
+          || storedSwipeId === null
+          || legacyReceipt && emptyPlaceholder(storedSwipeId);
+        if (!messageIdAbsent
+          && (typeof storedMessageId !== "string" || storedMessageId !== receiptTargetMessageId)) {
+          terminalReceiptIdentityConflict = true;
+        }
+        if (!swipeIdAbsent
+          && (!Number.isSafeInteger(storedSwipeId) || storedSwipeId !== receiptTargetSwipeId)) {
+          terminalReceiptIdentityConflict = true;
+        }
+      }
+    } catch {
+      terminalReceiptIdentityConflict = true;
+    }
+  }
+  if (terminalReceiptIdentityConflict) {
+    throw new Error("agent run inspection repair conflicts with receipt identity");
+  }
+  if (receiptIdentityConflict) {
+    throw new Error("agent run inspection repair conflicts with receipt identity");
+  }
+  if (existingInspection?.terminal === 1
+    && (!receiptRepairAuthority || !failedTerminalInspection)
+    && (
+      existingInspection.lifecycle !== run.workPhase
+      || existingInspection.status !== run.workStatus
+      || existingInspection.outcome !== run.workOutcome
+    )) {
+    throw new Error("agent run inspection repair conflicts with terminal inspection");
+  }
+  const markerAlreadyPersisted = existingInspection !== null
+    && tableExists(db, "agent_run_audit_records")
+    && Boolean(db.query(
+      `SELECT 1
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'marker' AND event_id = ?
+        LIMIT 1`,
+    ).get(input.userId, existingInspection.attempt_id, markerId));
+  const inspectionInput: PersistAgentRunInspectionInputV1 = failedTerminalInspectionRow && receiptRepairAuthority
+    ? {
+        userId: failedTerminalInspectionRow.user_id,
+        chatId: failedTerminalInspectionRow.chat_id,
+        attemptId: failedTerminalInspectionRow.attempt_id,
+        previousAttemptId: failedTerminalInspectionRow.previous_attempt_id,
+        runId: failedTerminalInspectionRow.run_id,
+        turnSessionId: failedTerminalInspectionRow.turn_id,
+        generationId: failedTerminalInspectionRow.generation_id,
+        generationType: failedTerminalInspectionRow.generation_type as PersistAgentRunInspectionInputV1["generationType"],
+        targetMessageId: failedTerminalInspectionRow.target_message_id,
+        targetSwipeId: failedTerminalInspectionRow.target_swipe_id,
+        hostCorrelationId: failedTerminalInspectionRow.host_correlation_id,
+        lifecycle: "TERMINAL",
+        status: "terminal",
+        outcome: "failed",
+        reason: failedTerminalInspectionRow.reason as PersistAgentRunInspectionInputV1["reason"],
+        startedAt: failedTerminalInspectionRow.started_at,
+        updatedAt: failedTerminalInspectionRow.updated_at,
+        terminalAt: failedTerminalInspectionRow.terminal_at,
+        reconciliation: "recovered",
+        ...(markerAlreadyPersisted ? {} : { markers: [marker] }),
+      }
+    : existingInspection
+      ? {
+          userId: existingInspection.user_id,
+          chatId: existingInspection.chat_id,
+          attemptId: existingInspection.attempt_id,
+          previousAttemptId: existingInspection.previous_attempt_id,
+          runId: existingInspection.run_id,
+          turnSessionId: existingInspection.turn_id,
+          generationId: existingInspection.generation_id,
+          generationType: existingInspection.generation_type as PersistAgentRunInspectionInputV1["generationType"],
+          targetMessageId: existingInspection.target_message_id,
+          targetSwipeId: existingInspection.target_swipe_id,
+          hostCorrelationId: existingInspection.host_correlation_id,
+          lifecycle: run.workPhase,
+          status: run.workStatus,
+          outcome: run.workOutcome,
+          reason: "reconciled",
+          startedAt: existingInspection.started_at,
+          updatedAt: Math.max(existingInspection.updated_at, run.updatedAt),
+          terminalAt: existingInspection.terminal_at === null
+            ? (run.workStatus === "terminal" ? run.updatedAt : null)
+            : Math.max(existingInspection.terminal_at, run.updatedAt),
+          reconciliation: "recovered",
+          ...(markerAlreadyPersisted ? {} : { markers: [marker] }),
+        }
+      : {
+          userId: input.userId,
+          chatId: input.chatId,
+          attemptId: run.attemptLineage.attemptId,
+          previousAttemptId: run.attemptLineage.previousAttemptId,
+          runId: run.runId,
+          turnSessionId: run.turnId,
+          generationId: run.generationId,
+          generationType: run.generationType,
+          targetMessageId: receiptTargetMessageId,
+          targetSwipeId: receiptTargetSwipeId,
+          hostCorrelationId: `${run.runId}:projection`,
+          lifecycle: run.workPhase,
+          status: run.workStatus,
+          outcome: run.workOutcome,
+          reason: "reconciled",
+          startedAt: run.startedAt,
+          updatedAt: run.updatedAt,
+          terminalAt: run.workStatus === "terminal" ? run.updatedAt : null,
+          reconciliation: "recovered",
+          ...(markerAlreadyPersisted ? {} : { markers: [marker] }),
+        };
+  const persisted = persistAgentRunInspectionInTransaction(db, inspectionInput);
+  if (!persisted) throw new Error("agent run inspection repair projection unavailable");
+  if (failedTerminalInspectionRow && receiptRepairAuthority) {
+    let priorReceiptEvidence: Record<string, unknown> = {};
+    if (failedTerminalInspectionRow.terminal_receipt_json) {
+      try {
+        const parsed = JSON.parse(failedTerminalInspectionRow.terminal_receipt_json) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          priorReceiptEvidence = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Receipt identity validation above rejects malformed persisted evidence.
+      }
+    }
+    const messageRevision = input.terminalHandoff?.messageRevision ?? run.terminalHandoff?.messageRevision ?? null;
+    const swipeRevision = input.terminalHandoff?.swipeRevision ?? run.terminalHandoff?.swipeRevision ?? null;
+    const terminalReceiptJson = boundedBytesJson({
+      ...priorReceiptEvidence,
+      receiptId: input.receiptId,
+      messageId: receiptTargetMessageId,
+      swipeId: receiptTargetSwipeId,
+      messageRevision,
+      swipeRevision,
+      error: priorReceiptEvidence.error ?? input.error ?? run.error ?? null,
+    }, 16384)
+      ?? boundedBytesJson({
+        receiptId: input.receiptId,
+        messageId: receiptTargetMessageId,
+        swipeId: receiptTargetSwipeId,
+        messageRevision,
+        swipeRevision,
+        error: input.error ?? run.error ?? null,
+      }, 16384)
+      ?? boundedBytesJson({
+        receiptId: input.receiptId,
+        messageId: receiptTargetMessageId,
+        swipeId: receiptTargetSwipeId,
+      }, 16384);
+    const updatedAt = Math.max(failedTerminalInspectionRow.updated_at, run.updatedAt);
+    const terminalAt = Math.max(failedTerminalInspectionRow.terminal_at ?? 0, updatedAt);
+    const repaired = db.query(
+      `UPDATE agent_run_attempts
+          SET target_message_id = ?, target_swipe_id = ?,
+              lifecycle = 'TERMINAL', status = 'terminal', outcome = 'completed',
+              reason = 'reconciled', terminal = 1, updated_at = ?, terminal_at = ?,
+              reconciliation_state = 'recovered',
+              terminal_receipt_json = COALESCE(?, terminal_receipt_json)
+        WHERE user_id = ? AND attempt_id = ?
+          AND chat_id = ? AND run_id = ? AND turn_id = ?
+          AND generation_id = ? AND generation_type = ?
+          AND terminal = 1 AND lifecycle = 'TERMINAL'
+          AND status = 'terminal' AND outcome = 'failed'
+          AND ((target_message_id = ?) OR (target_message_id IS NULL AND ? IS NULL))
+          AND ((target_swipe_id = ?) OR (target_swipe_id IS NULL AND ? IS NULL))`,
+    ).run(
+      receiptTargetMessageId,
+      receiptTargetSwipeId,
+      updatedAt,
+      terminalAt,
+      terminalReceiptJson,
+      input.userId,
+      failedTerminalInspectionRow.attempt_id,
+      input.chatId,
+      run.runId,
+      run.turnId,
+      run.generationId,
+      run.generationType,
+      failedTerminalInspectionRow.target_message_id,
+      failedTerminalInspectionRow.target_message_id,
+      failedTerminalInspectionRow.target_swipe_id,
+      failedTerminalInspectionRow.target_swipe_id,
+    );
+    if (repaired.changes !== 1) {
+      throw new Error("agent run inspection receipt repair lost terminal authority");
+    }
+  }
 }
 
 
@@ -1443,16 +1808,66 @@ function isTerminal(value: AgentRunPublicV2 | AgentRunPublicStatusV2 | StoredRun
 
 function persistCompatibilityProjection(db: Database, input: AgentRunProjectionInputV2, run: AgentRunPublicV2): void {
   if (!isTerminal(run)) return;
+  const compatibilityTarget = run.terminalHandoff?.committed === true
+    ? normalizeTarget(run.terminalHandoff.messageId, run.terminalHandoff.swipeId)
+    : run.target;
+  const targetMessageId = compatibilityTarget?.messageId ?? null;
+  const targetSwipeId = compatibilityTarget?.swipeId ?? null;
   const snapshot = input.compatibilitySnapshot ?? compatibilitySnapshot(run);
-  persistTerminalAgentActivityRunInTransaction(db, {
-    userId: input.userId,
-    chatId: input.chatId,
-    generationId: input.generationId,
-    targetMessageId: run.target?.messageId ?? null,
-    targetSwipeId: run.target?.swipeId ?? null,
-    snapshot,
-    status: mapCompatibilityLifecycle(run),
-  });
+  const lifecycle = mapCompatibilityLifecycle(run);
+  if (input.receiptRepair === true && run.workOutcome === "completed" && tableExists(db, "agent_activity_runs")) {
+    const existing = db.query(
+      `SELECT target_message_id, target_swipe_id, snapshot_json
+         FROM agent_activity_runs
+        WHERE user_id = ? AND chat_id = ? AND generation_id = ?
+        LIMIT 1`,
+    ).get(input.userId, input.chatId, input.generationId) as {
+      target_message_id?: unknown;
+      target_swipe_id?: unknown;
+      snapshot_json?: unknown;
+    } | null;
+    let existingLifecycle: string | null = null;
+    if (typeof existing?.snapshot_json === "string") {
+      try {
+        const parsed = JSON.parse(existing.snapshot_json) as { snapshot?: { status?: unknown } };
+        existingLifecycle = typeof parsed.snapshot?.status === "string" ? parsed.snapshot.status : null;
+      } catch {
+        // A malformed compatibility row is stale repair evidence.
+      }
+    }
+    if (existingLifecycle === "failed"
+      && (existingLifecycle !== lifecycle
+        || existing?.target_message_id !== targetMessageId
+        || (existing?.target_swipe_id ?? null) !== targetSwipeId)) {
+      db.query(
+        `DELETE FROM agent_activity_runs
+          WHERE user_id = ? AND chat_id = ? AND generation_id = ?`,
+      ).run(input.userId, input.chatId, input.generationId);
+    }
+  }
+  try {
+    const persisted = persistTerminalAgentActivityRunInTransaction(db, {
+      userId: input.userId,
+      chatId: input.chatId,
+      generationId: input.generationId,
+      targetMessageId,
+      targetSwipeId,
+      snapshot,
+      status: lifecycle,
+    });
+    if (!persisted) throw new Error("agent activity compatibility projection unavailable");
+  } catch (error) {
+    if (
+      (
+        input.receiptRepair === true
+        || input.recoveryRepair === true
+        || input.preserveTerminalInspection === true
+      )
+      && error instanceof Error
+      && error.message === "agent activity replay identity conflict"
+    ) return;
+    throw error;
+  }
 }
 
 function eventForRun(run: AgentRunPublicV2, userId?: string): BufferedEvent {
@@ -1495,6 +1910,11 @@ function terminalOutboxIdentity(event: BufferedEvent): { userId: string; chatId:
   const sequence = Number.isSafeInteger(payload.sequence) ? payload.sequence as number : null;
   if (!chatId || sequence === null || sequence < 1) return null;
   return { userId: event.userId, chatId, sequence };
+}
+function terminalProjectionEvent(event: BufferedEvent): boolean {
+  if (event.event !== AGENT_RUN_CHANGED || !event.payload || typeof event.payload !== "object") return false;
+  const run = (event.payload as Record<string, unknown>).run;
+  return !!run && typeof run === "object" && !Array.isArray(run) && isTerminal(run as AgentRunPublicV2);
 }
 
 function hasTerminalOutboxDeliveryColumns(db: Database): boolean {
@@ -1587,7 +2007,7 @@ function markTerminalOutboxDelivered(
   token: string,
   db: Database,
 ): boolean {
-  if (!hasTerminalOutboxDeliveryColumns(db)) return true;
+  if (!hasTerminalOutboxDeliveryColumns(db)) return false;
   const result = db.query(
     `UPDATE agent_chat_events
         SET delivery_state = 'delivered',
@@ -1634,8 +2054,9 @@ function rememberEmittedEventKey(key: string): void {
 export function emitAgentRunProjectionEvent(event: BufferedEvent, db: Database = getDb()): boolean {
   const key = emittedEventKey(event);
   if (key && emittedAgentRunEventKeys.has(key)) return false;
+  const terminalEvent = terminalProjectionEvent(event);
   const claim = claimTerminalOutboxEvent(event, db);
-  if (claim === false) return false;
+  if (terminalEvent && !claim) return false;
   let accepted = false;
   try {
     accepted = eventBus.emit(event.event, event.payload, event.userId, event.options);
@@ -1654,6 +2075,357 @@ export function emitAgentRunProjectionEvent(event: BufferedEvent, db: Database =
 function epochSeconds(value: number): number {
   if (!Number.isSafeInteger(value) || value <= 0) return Math.floor(Date.now() / 1000);
   return value >= 100_000_000_000 ? Math.floor(value / 1000) : value;
+}
+
+
+function repairFailedProjectionFromReceipt(
+  db: Database,
+  execution: Pick<
+    TurnExecutionRecord,
+    | "id"
+    | "userId"
+    | "chatId"
+    | "generationId"
+    | "targetKind"
+    | "targetMessageId"
+    | "targetSwipeId"
+  >,
+  receipt: Pick<TurnCommitReceipt, "id" | "messageId" | "swipeId">,
+  existing: AgentRunPublicV2,
+  options: AgentRunReceiptRepairOptions = {},
+): AgentRunProjectionCommitResult {
+  if (!validId(receipt.id)) {
+    throw new Error("agent run receipt identity is unavailable");
+  }
+  const messageId = receipt.messageId ?? execution.targetMessageId;
+  const swipeId = messageId === null
+    ? null
+    : receipt.swipeId ?? execution.targetSwipeId ?? 0;
+  const historicalTargetRedaction = options.historicalTargetRedaction === true
+    && messageId === null
+    && execution.targetMessageId === null;
+  if (messageId !== null && !assertStoredTarget(db, execution.chatId, messageId, swipeId, execution.targetKind)) {
+    throw new Error("agent run receipt target is unavailable");
+  }
+
+  if (existing.generationId !== execution.generationId) {
+    throw new Error("agent run receipt generation identity conflicts with failed projection");
+  }
+  if (existing.generationType !== execution.targetKind) {
+    throw new Error("agent run receipt generation type conflicts with failed projection");
+  }
+  const existingTargetMessageId = existing.target?.messageId ?? null;
+  const existingTargetSwipeId = existing.target?.swipeId ?? null;
+  if (!historicalTargetRedaction && existingTargetMessageId !== null && existingTargetMessageId !== messageId) {
+    throw new Error("agent run receipt target conflicts with failed projection");
+  }
+  if (!historicalTargetRedaction && existingTargetSwipeId !== null && existingTargetSwipeId !== swipeId) {
+    throw new Error("agent run receipt swipe conflicts with failed projection");
+  }
+  const priorHandoff = existing.terminalHandoff;
+  if (priorHandoff?.committed === true) {
+    throw new Error("agent run failed projection has a committed handoff");
+  }
+  if (!historicalTargetRedaction
+    && priorHandoff?.messageId !== undefined
+    && priorHandoff.messageId !== null
+    && priorHandoff.messageId !== messageId) {
+    throw new Error("agent run receipt target conflicts with failed handoff");
+  }
+  if (!historicalTargetRedaction
+    && priorHandoff?.swipeId !== undefined
+    && priorHandoff.swipeId !== null
+    && priorHandoff.swipeId !== swipeId) {
+    throw new Error("agent run receipt swipe conflicts with failed handoff");
+  }
+  const priorErrorTarget = existing.error?.target;
+  if (!historicalTargetRedaction
+    && priorErrorTarget?.messageId !== null
+    && priorErrorTarget?.messageId !== undefined
+    && priorErrorTarget.messageId !== messageId) {
+    throw new Error("agent run receipt target conflicts with failed error evidence");
+  }
+  if (!historicalTargetRedaction
+    && priorErrorTarget?.swipeId !== null
+    && priorErrorTarget?.swipeId !== undefined
+    && priorErrorTarget.swipeId !== swipeId) {
+    throw new Error("agent run receipt swipe conflicts with failed error evidence");
+  }
+
+  const priorLineageTarget = existing.attemptLineage.target;
+  if (priorLineageTarget.chatId !== existing.chatId
+    || priorLineageTarget.generationType !== existing.generationType) {
+    throw new Error("agent run receipt lineage identity conflicts with failed projection");
+  }
+  if (!historicalTargetRedaction
+    && priorLineageTarget.messageId !== null
+    && priorLineageTarget.messageId !== messageId) {
+    throw new Error("agent run receipt lineage target conflicts with failed projection");
+  }
+  if (!historicalTargetRedaction
+    && priorLineageTarget.swipeId !== null
+    && priorLineageTarget.swipeId !== swipeId) {
+    throw new Error("agent run receipt lineage swipe conflicts with failed projection");
+  }
+
+  const targetIdentity = {
+    chatId: existing.chatId,
+    generationType: existing.generationType,
+    messageId,
+    swipeId,
+  };
+  const committedRevision = messageId !== null && tableExists(db, "messages")
+    ? (() => {
+        const row = db.query(
+          "SELECT generation_revision FROM messages WHERE id = ? AND chat_id = ? LIMIT 1",
+        ).get(messageId, execution.chatId) as { generation_revision?: unknown } | null;
+        const value = Number(row?.generation_revision);
+        return Number.isSafeInteger(value) && value >= 0 ? value : null;
+      })()
+    : null;
+  const messageRevision = messageId === null
+    ? null
+    : committedRevision ?? priorHandoff?.messageRevision ?? 0;
+  const swipeRevision = swipeId === null ? null : messageRevision;
+  const repairReason = options.reason ?? "reconciliation_required";
+  const reconciliationError = {
+    ...(options.error ?? existing.error ?? {
+      code: "projection_unavailable",
+      recoveryEligible: true,
+      recoveryAction: "resync" as const,
+    }),
+    target: targetIdentity,
+    workPhase: "TERMINAL" as const,
+    workStatus: "terminal" as const,
+    workOutcome: "completed" as const,
+    reason: repairReason,
+  };
+  return publishAgentRunCommit(db, {
+    userId: execution.userId,
+    chatId: execution.chatId,
+    turnId: execution.id,
+    generationId: existing.generationId,
+    generationType: execution.targetKind,
+    targetMessageId: messageId,
+    targetSwipeId: swipeId,
+    attemptLineage: {
+      ...existing.attemptLineage,
+      target: targetIdentity,
+    },
+    status: "COMMITTED",
+    phase: "COMMITTED",
+    workPhase: "TERMINAL",
+    workStatus: "terminal",
+    workOutcome: "completed",
+    reason: repairReason,
+    error: reconciliationError,
+    startedAt: existing.startedAt,
+    updatedAt: existing.updatedAt,
+    activity: existing.activity,
+    usage: existing.usage,
+    omission: existing.omission,
+    terminalHandoff: {
+      version: 2,
+      committed: true,
+      messageId,
+      swipeId,
+      messageRevision,
+      swipeRevision,
+    },
+    receiptId: receipt.id,
+    receiptRepair: true,
+  });
+}
+
+function isRepairableCommitFailure(
+  row: StoredProjectionRow,
+  run: AgentRunPublicV2 | null,
+): run is AgentRunPublicV2 {
+  return row.status === "COMMIT_FAILED"
+    && row.phase === "COMMIT_FAILED"
+    && run?.workStatus === "terminal"
+    && run.workOutcome === "failed";
+}
+
+function repairExistingReceiptProjection(
+  db: Database,
+  execution: Pick<
+    TurnExecutionRecord,
+    | "id"
+    | "userId"
+    | "chatId"
+    | "generationId"
+    | "targetKind"
+    | "targetMessageId"
+    | "targetSwipeId"
+  >,
+  receipt: Pick<TurnCommitReceipt, "id" | "messageId" | "swipeId">,
+  options: AgentRunReceiptRepairOptions = {},
+): AgentRunProjectionCommitResult | null {
+  if (!validId(receipt.id)) {
+    throw new Error("agent run receipt identity is unavailable");
+  }
+  const projectionRow = getProjectionRow(db, execution.userId, execution.chatId, execution.id);
+  if (!projectionRow) return null;
+  const existing = parseStoredRun(projectionRow);
+  if (projectionRow.status === "COMMITTED") {
+    if (projectionRow.phase !== "COMMITTED") {
+      throw new Error("agent run receipt repair conflicts with terminal projection");
+    }
+    if (!existing) {
+      throw new Error("agent run receipt repair projection unavailable");
+    }
+    const messageId = receipt.messageId ?? execution.targetMessageId;
+    const swipeId = messageId === null
+      ? null
+      : receipt.swipeId ?? execution.targetSwipeId ?? 0;
+    const historicalTargetRedaction = options.historicalTargetRedaction === true
+      && messageId === null
+      && execution.targetMessageId === null;
+    if (messageId !== null && !assertStoredTarget(db, execution.chatId, messageId, swipeId, execution.targetKind)) {
+      throw new Error("agent run receipt target is unavailable");
+    }
+    if (
+      existing.chatId !== execution.chatId
+      || existing.runId !== execution.id
+      || existing.turnId !== execution.id
+      || existing.generationId !== execution.generationId
+      || existing.generationType !== execution.targetKind
+    ) {
+      throw new Error("agent run receipt identity conflicts with terminal projection");
+    }
+    const existingTargetMessageId = existing.target?.messageId ?? null;
+    const existingTargetSwipeId = existing.target?.swipeId ?? null;
+    if (!historicalTargetRedaction && existingTargetMessageId !== null && existingTargetMessageId !== messageId) {
+      throw new Error("agent run receipt target conflicts with terminal projection");
+    }
+    if (!historicalTargetRedaction && existingTargetSwipeId !== null && existingTargetSwipeId !== swipeId) {
+      throw new Error("agent run receipt swipe conflicts with terminal projection");
+    }
+    const priorHandoff = existing.terminalHandoff;
+    if (!historicalTargetRedaction
+      && priorHandoff?.messageId !== undefined
+      && priorHandoff.messageId !== null
+      && priorHandoff.messageId !== messageId) {
+      throw new Error("agent run receipt target conflicts with committed handoff");
+    }
+    if (!historicalTargetRedaction
+      && priorHandoff?.swipeId !== undefined
+      && priorHandoff.swipeId !== null
+      && priorHandoff.swipeId !== swipeId) {
+      throw new Error("agent run receipt swipe conflicts with committed handoff");
+    }
+    const priorErrorTarget = existing.error?.target;
+    if (!historicalTargetRedaction
+      && priorErrorTarget?.messageId !== null
+      && priorErrorTarget?.messageId !== undefined
+      && priorErrorTarget.messageId !== messageId) {
+      throw new Error("agent run receipt target conflicts with committed error evidence");
+    }
+    if (!historicalTargetRedaction
+      && priorErrorTarget?.swipeId !== null
+      && priorErrorTarget?.swipeId !== undefined
+      && priorErrorTarget.swipeId !== swipeId) {
+      throw new Error("agent run receipt swipe conflicts with committed error evidence");
+    }
+    const priorLineageTarget = existing.attemptLineage.target;
+    if (priorLineageTarget.chatId !== existing.chatId
+      || priorLineageTarget.generationType !== existing.generationType) {
+      throw new Error("agent run receipt lineage identity conflicts with terminal projection");
+    }
+    if (!historicalTargetRedaction
+      && priorLineageTarget.messageId !== null
+      && priorLineageTarget.messageId !== messageId) {
+      throw new Error("agent run receipt lineage target conflicts with terminal projection");
+    }
+    if (!historicalTargetRedaction
+      && priorLineageTarget.swipeId !== null
+      && priorLineageTarget.swipeId !== swipeId) {
+      throw new Error("agent run receipt lineage swipe conflicts with terminal projection");
+    }
+    const targetIdentity = {
+      chatId: existing.chatId,
+      generationType: existing.generationType,
+      messageId,
+      swipeId,
+    };
+    const projectionTargetRepairNeeded = historicalTargetRedaction
+      ? priorHandoff?.committed !== true
+        || existingTargetMessageId !== null
+        || existingTargetSwipeId !== null
+        || priorHandoff?.messageId != null
+        || priorHandoff?.swipeId != null
+        || priorLineageTarget.messageId !== null
+        || priorLineageTarget.swipeId !== null
+        || priorErrorTarget?.messageId != null
+        || priorErrorTarget?.swipeId != null
+      : priorHandoff?.committed !== true
+        || (messageId !== null
+          && (
+            existingTargetMessageId === null
+            || priorHandoff?.messageId == null
+            || priorLineageTarget.messageId === null
+            || (existing.error != null && priorErrorTarget?.messageId == null)
+          ))
+        || (swipeId !== null
+          && (
+            existingTargetSwipeId === null
+            || priorHandoff?.swipeId == null
+            || priorLineageTarget.swipeId === null
+            || (existing.error != null && priorErrorTarget?.swipeId == null)
+          ));
+    const durableTerminalEvent = hasDurableTerminalEvent(db, execution.userId, existing);
+    return publishAgentRunCommit(db, {
+      userId: execution.userId,
+      chatId: execution.chatId,
+      turnId: execution.id,
+      generationId: execution.generationId,
+      generationType: execution.targetKind,
+      targetMessageId: messageId,
+      targetSwipeId: swipeId,
+      attemptLineage: {
+        ...existing.attemptLineage,
+        target: targetIdentity,
+      },
+      status: "COMMITTED",
+      phase: "COMMITTED",
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "completed",
+      reason: options.reason ?? existing.reason,
+      ...(options.error !== undefined
+        ? { error: options.error }
+        : existing.error ? { error: existing.error } : {}),
+      revision: durableTerminalEvent && !projectionTargetRepairNeeded
+        ? projectionRow.revision
+        : projectionRow.revision + 1,
+      startedAt: existing.startedAt,
+      updatedAt: existing.updatedAt,
+      activity: existing.activity,
+      usage: existing.usage,
+      omission: existing.omission,
+      terminalHandoff: {
+        version: 2,
+        committed: true,
+        messageId,
+        swipeId,
+        messageRevision: priorHandoff?.messageRevision ?? null,
+        swipeRevision: priorHandoff?.swipeRevision ?? null,
+      },
+      receiptId: receipt.id,
+      receiptRepair: true,
+    });
+  }
+  if (projectionRow.status !== "COMMIT_FAILED") {
+    if (projectionRow.phase === "COMMIT_FAILED" || existing?.workStatus === "terminal") {
+      throw new Error("agent run receipt repair conflicts with terminal projection");
+    }
+    return null;
+  }
+  if (!isRepairableCommitFailure(projectionRow, existing)) {
+    throw new Error("agent run receipt repair conflicts with terminal projection");
+  }
+  return repairFailedProjectionFromReceipt(db, execution, receipt, existing, options);
 }
 
 /**
@@ -1679,11 +2451,17 @@ export function repairAgentRunProjectionFromReceipt(
     | "createdAt"
     | "updatedAt"
   >,
-  receipt: Pick<TurnCommitReceipt, "messageId" | "swipeId" | "createdAt">,
+  receipt: Pick<TurnCommitReceipt, "id" | "messageId" | "swipeId" | "createdAt">,
+  options: AgentRunReceiptRepairOptions = {},
 ): AgentRunProjectionCommitResult {
+  if (!validId(receipt.id)) {
+    throw new Error("agent run receipt identity is unavailable");
+  }
   if (!tableExists(db, "agent_run_projections") || !tableExists(db, "agent_chat_events")) {
     throw new Error("agent run projection schema is unavailable");
   }
+  const existingFailure = repairExistingReceiptProjection(db, execution, receipt, options);
+  if (existingFailure) return existingFailure;
   const messageId = receipt.messageId ?? execution.targetMessageId;
   const swipeId = messageId === null
     ? null
@@ -1719,14 +2497,17 @@ export function repairAgentRunProjectionFromReceipt(
     workPhase: "TERMINAL",
     workStatus: "terminal",
     workOutcome: "completed",
-    reason: null,
+    reason: options.reason ?? null,
+    ...(options.error ? { error: options.error } : {}),
     terminalHandoff: {
+      version: 2,
       committed: true,
       messageId,
       swipeId,
       messageRevision,
       swipeRevision,
     },
+    receiptId: receipt.id,
     receiptRepair: true,
   });
 }
@@ -1826,16 +2607,72 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
   const input: AgentRunProjectionInputV2 = targetSwipeId === rawInput.targetSwipeId
     ? rawInput
     : { ...rawInput, targetSwipeId: targetSwipeId ?? null };
+  if (rawInput.receiptRepair === true && !validId(rawInput.receiptId)) {
+    throw new Error("agent run receipt identity is unavailable");
+  }
   if (!assertOwnedTarget(db, input)) throw new Error("agent run projection ownership mismatch");
   const existingRow = getProjectionRow(db, input.userId, input.chatId, input.turnId);
   const existing = existingRow ? (parseStoredRun(existingRow) ?? undefined) : undefined;
-  const receiptRepairNeeded = input.receiptRepair === true
-    && (!existing || !hasDurableTerminalEvent(db, input.userId, existing));
-  const recoveryRepairNeeded = input.recoveryRepair === true && !!existing && !isTerminal(existing);
+  const receiptRepairRequested = input.receiptRepair === true;
+  const receiptFailureRepair = receiptRepairRequested
+    && existingRow?.status === "COMMIT_FAILED"
+    && existingRow.phase === "COMMIT_FAILED"
+    && existing?.workStatus === "terminal"
+    && existing?.workOutcome === "failed"
+    && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "COMMITTED"
+    && input.workStatus === "terminal"
+    && input.workOutcome === "completed"
+    && input.terminalHandoff?.committed === true;
+  const receiptEventRepair = receiptRepairRequested
+    && (!existing
+      || existingRow?.status === "COMMITTED" && !hasDurableTerminalEvent(db, input.userId, existing));
+  const receiptRepairNeeded = receiptFailureRepair || receiptEventRepair;
+  const receiptInspectionRepairNeeded = receiptRepairRequested
+    && existingRow?.status === "COMMITTED"
+    && existing?.workPhase === "TERMINAL"
+    && existing.workStatus === "terminal"
+    && existing.workOutcome === "completed"
+    && existing.terminalHandoff?.committed === true
+    && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "COMMITTED"
+    && input.workStatus === "terminal"
+    && input.workOutcome === "completed"
+    && input.terminalHandoff?.committed === true
+    && tableExists(db, "agent_run_attempts")
+    && Boolean(db.query(
+      `SELECT 1
+         FROM agent_run_attempts
+        WHERE user_id = ? AND attempt_id = ?
+          AND terminal = 1 AND lifecycle = 'TERMINAL'
+          AND status = 'terminal' AND outcome = 'failed'
+        LIMIT 1`,
+    ).get(input.userId, existing.attemptLineage.attemptId));
+  const rawSnapshotOutcome = (() => {
+    try {
+      const parsed = JSON.parse(String(existingRow?.snapshot_json ?? "null"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !("workOutcome" in parsed)) {
+        return undefined;
+      }
+      return parsed.workOutcome;
+    } catch {
+      return undefined;
+    }
+  })();
+  const exhaustedSnapshotRepair = input.recoveryRepair === true
+    && existingRow?.status === "EXHAUSTED"
+    && existingRow.phase === "EXHAUSTED"
+    && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "EXHAUSTED"
+    && input.workOutcome === "exhausted"
+    && rawSnapshotOutcome !== "exhausted";
+  const recoveryRepairNeeded = input.recoveryRepair === true && !!existing && (
+    !isTerminal(existing) || exhaustedSnapshotRepair
+  );
   if (existing && (
     (input.revision !== undefined && input.revision <= existing.revision)
     || (isTerminal(existing) && !receiptRepairNeeded && !recoveryRepairNeeded)
   )) {
+    if (receiptInspectionRepairNeeded) {
+      persistInspectionRepairMarker(db, input, existing);
+    }
     return {
       run: existing,
       sequence: existing.sequence,
@@ -1931,7 +2768,7 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     omissionJson,
   );
   persistCompatibilityProjection(db, input, run);
-  persistInspectionRepairMarker(db, input, run);
+  if (input.preserveTerminalInspection !== true) persistInspectionRepairMarker(db, input, run);
   const event = eventForRun(run, input.userId);
   return { run, sequence, revision, event, changed: true };
 }
@@ -1977,7 +2814,11 @@ function drainPendingAgentRunEvents(
   userId: string | undefined,
   options: { readonly maxRows?: number },
 ): AgentRunEventReplayResult {
-  if (!tableExists(db, "agent_chat_events") || !tableExists(db, "agent_run_projections")) {
+  if (
+    !tableExists(db, "agent_chat_events")
+    || !tableExists(db, "agent_run_projections")
+    || !hasTerminalOutboxDeliveryColumns(db)
+  ) {
     return { inspected: 0, emitted: 0, skipped: 0 };
   }
   if (userId !== undefined && !validId(userId)) {
@@ -2070,22 +2911,32 @@ function mintCursor(
   lastSequence: number,
   now = Math.floor(Date.now() / 1000),
   resyncOffset?: number,
+  resyncSnapshotId?: string,
+  resyncOrdinal?: number,
+  resyncExpiresAt?: number,
 ): ChatRunCursorV1 {
   // No signing key means no cursor: minting an unsigned or statically signed
   // token would hand the caller a forgeable watermark.
   const key = cursorKey();
   if (!key) throw new Error("agent run cursor signing key is unavailable");
+  const expiresAt = resyncExpiresAt === undefined
+    ? now + CURSOR_TTL_SECONDS
+    : Math.min(now + CURSOR_TTL_SECONDS, resyncExpiresAt);
   const claims: CursorClaims = {
     v: 1,
     u: userId,
     c: chatId,
     s: lastSequence,
-    e: now + CURSOR_TTL_SECONDS,
+    e: expiresAt,
     ...(resyncOffset === undefined ? {} : { p: resyncOffset }),
+    ...(resyncSnapshotId === undefined ? {} : { r: resyncSnapshotId }),
+    ...(resyncOrdinal === undefined ? {} : { q: resyncOrdinal }),
   };
   const signingInput = `v1.${encodeCursorPayload(claims)}`;
   return { version: 1, token: `${signingInput}.${signCursor(signingInput, key)}` };
 }
+
+
 
 function invalidCursorClaims(): CursorClaims {
   return { v: 1, u: "", c: "", s: 0, e: 0 };
@@ -2116,15 +2967,31 @@ function decodeCursor(token: unknown): { claims: CursorClaims; reason: "ok" | "e
       || typeof claims.s !== "number"
       || typeof claims.e !== "number"
       || claims.p !== undefined && typeof claims.p !== "number"
+      || claims.r !== undefined && typeof claims.r !== "string"
+      || claims.q !== undefined && typeof claims.q !== "number"
     ) {
       throw new Error("invalid cursor claims");
     }
     if (
-      !Number.isSafeInteger(claims.s) || claims.s < 0
+      !isSafeResyncCursorNumber(claims.s)
       || !Number.isSafeInteger(claims.e)
-      || claims.p !== undefined && (!Number.isSafeInteger(claims.p) || claims.p < 0)
+      || claims.p !== undefined && !isSafeResyncCursorNumber(claims.p)
+      || claims.q !== undefined && !isSafeResyncCursorNumber(claims.q)
+      || claims.r !== undefined && !validId(claims.r)
     ) {
       throw new Error("invalid cursor bounds");
+    }
+    if (claims.p !== undefined && claims.r === undefined) {
+      throw new Error("paged cursor is missing its snapshot identity");
+    }
+    if (claims.p !== undefined && claims.q === undefined) {
+      throw new Error("paged cursor is missing its snapshot continuation");
+    }
+    if (
+      claims.p === undefined && (claims.r !== undefined || claims.q !== undefined)
+      || claims.p !== undefined && claims.q !== undefined && claims.p !== claims.q + 1
+    ) {
+      throw new Error("paged cursor has an invalid snapshot continuation");
     }
     return {
       claims: claims as CursorClaims,
@@ -2154,18 +3021,20 @@ function sequenceBounds(db: Database, userId: string, chatId: string): { last: n
   const sequence = db.query(
     "SELECT last_sequence FROM agent_chat_event_sequences WHERE user_id = ? AND chat_id = ?",
   ).get(userId, chatId) as { last_sequence: number } | null;
-  const first = tableExists(db, "agent_turn_executions")
-    ? db.query(
-      `SELECT MIN(e.sequence) AS first_sequence
-         FROM agent_chat_events e
-         JOIN agent_turn_executions t
-           ON t.user_id = e.user_id AND t.id = e.turn_id AND t.chat_id = e.chat_id
-        WHERE e.user_id = ? AND e.chat_id = ?
-          AND CASE WHEN t.expires_at < 100000000000 THEN t.expires_at * 1000 ELSE t.expires_at END > ?`,
-    ).get(userId, chatId, Date.now()) as { first_sequence: number | null } | null
-    : db.query(
-      "SELECT MIN(sequence) AS first_sequence FROM agent_chat_events WHERE user_id = ? AND chat_id = ?",
-    ).get(userId, chatId) as { first_sequence: number | null } | null;
+  const first = tableExists(db, "agent_chat_events")
+    ? tableExists(db, "agent_turn_executions")
+      ? db.query(
+        `SELECT MIN(e.sequence) AS first_sequence
+           FROM agent_chat_events e
+           JOIN agent_turn_executions t
+             ON t.user_id = e.user_id AND t.id = e.turn_id AND t.chat_id = e.chat_id
+          WHERE e.user_id = ? AND e.chat_id = ?
+            AND ${executionVisibilitySql("t")}`,
+      ).get(userId, chatId, Date.now()) as { first_sequence: number | null } | null
+      : db.query(
+        "SELECT MIN(sequence) AS first_sequence FROM agent_chat_events WHERE user_id = ? AND chat_id = ?",
+      ).get(userId, chatId) as { first_sequence: number | null } | null
+    : null;
   return { last: sequence?.last_sequence ?? 0, first: first?.first_sequence ?? null };
 }
 
@@ -2179,13 +3048,68 @@ function listCurrentRuns(
   userId: string,
   chatId: string,
   snapshotSequence: number,
-  offset = 0,
+  snapshotAt: number,
+  pageLimit = MAX_RUNS,
 ): CurrentRunsPage {
-  const safeOffset = Math.max(0, Math.min(MAX_SAFE_COUNTER, Math.floor(offset)));
-  const nowMilliseconds = Date.now();
   const withExecution = tableExists(db, "agent_turn_executions");
-  const rows = withExecution
-    ? db.query(
+  const withHistoricalEvents = tableExists(db, "agent_chat_events");
+  const sortExpression = `CASE
+    WHEN json_valid(e.snapshot_json) = 1
+      THEN COALESCE(CAST(json_extract(e.snapshot_json, '$.updatedAt') AS INTEGER), 0)
+    ELSE 0
+  END`;
+
+  if (withHistoricalEvents) {
+    const historicalCte = `WITH latest AS (
+         SELECT user_id, chat_id, turn_id, MAX(sequence) AS sequence
+           FROM agent_chat_events
+          WHERE user_id = ? AND chat_id = ? AND sequence <= ?
+          GROUP BY user_id, chat_id, turn_id
+       ),
+       visible AS (
+         SELECT e.user_id, e.chat_id, e.sequence, e.turn_id, e.run_revision,
+                e.status, e.snapshot_json, e.terminal_handoff_json, e.omission_json,
+                ${sortExpression} AS sort_updated_at
+           FROM latest l
+           JOIN agent_chat_events e
+             ON e.user_id = l.user_id AND e.chat_id = l.chat_id
+            AND e.turn_id = l.turn_id AND e.sequence = l.sequence
+           ${withExecution ? `JOIN agent_turn_executions t
+             ON t.user_id = e.user_id AND t.id = e.turn_id AND t.chat_id = e.chat_id` : ""}
+          WHERE 1 = 1
+            ${withExecution ? `AND ${executionVisibilitySql("t")}` : ""}
+       )`;
+    const pageParameters: Array<string | number> = [userId, chatId, snapshotSequence];
+    if (withExecution) pageParameters.push(snapshotAt);
+    pageParameters.push(pageLimit);
+    const rows = db.query(
+      `${historicalCte}
+       SELECT *
+         FROM visible
+        ORDER BY sort_updated_at DESC, turn_id DESC
+        LIMIT ?`,
+    ).all(...pageParameters) as Array<
+      StoredEventRow & { user_id: string; chat_id: string; sort_updated_at: number }
+    >;
+    const runs = rows.map((row) => {
+      const parsed = parseStoredEvent(db, userId, row, chatId);
+      if (!parsed) throw new Error("agent run resync encountered malformed historical projection");
+      return parsed.run;
+    });
+    const totalRuns = Number((db.query(
+      `${historicalCte}
+       SELECT COUNT(*) AS total
+         FROM visible`,
+    ).get(
+      ...([userId, chatId, snapshotSequence, ...(withExecution ? [snapshotAt] : [])] as Array<string | number>),
+    ) as { total?: unknown } | null)?.total ?? 0);
+    const normalizedTotal = Number.isSafeInteger(totalRuns) && totalRuns >= 0 ? totalRuns : runs.length;
+    return { runs, totalRuns: normalizedTotal };
+  }
+
+  let rows: StoredProjectionRow[];
+  if (withExecution) {
+    rows = db.query(
       `SELECT p.user_id, p.chat_id, p.turn_id, p.generation_id, p.generation_type,
               p.target_message_id, p.target_swipe_id, p.status, p.phase, p.revision,
               p.sequence, p.started_at, p.updated_at, p.snapshot_json,
@@ -2194,23 +3118,29 @@ function listCurrentRuns(
          JOIN agent_turn_executions t
            ON t.user_id = p.user_id AND t.id = p.turn_id AND t.chat_id = p.chat_id
         WHERE p.user_id = ? AND p.chat_id = ? AND p.sequence <= ?
-          AND CASE WHEN t.expires_at < 100000000000 THEN t.expires_at * 1000 ELSE t.expires_at END > ?
+          AND ${executionVisibilitySql("t")}
         ORDER BY p.updated_at DESC, p.turn_id DESC
-        LIMIT ? OFFSET ?`,
-    ).all(userId, chatId, snapshotSequence, nowMilliseconds, MAX_RUNS, safeOffset) as StoredProjectionRow[]
-    : db.query(
+        LIMIT ?`,
+    ).all(userId, chatId, snapshotSequence, snapshotAt, pageLimit) as StoredProjectionRow[];
+  } else {
+    rows = db.query(
       `SELECT user_id, chat_id, turn_id, generation_id, generation_type, target_message_id,
               target_swipe_id, status, phase, revision, sequence, started_at, updated_at,
               snapshot_json, terminal_handoff_json, omission_json
          FROM agent_run_projections
         WHERE user_id = ? AND chat_id = ? AND sequence <= ?
         ORDER BY updated_at DESC, turn_id DESC
-        LIMIT ? OFFSET ?`,
-    ).all(userId, chatId, snapshotSequence, MAX_RUNS, safeOffset) as StoredProjectionRow[];
-  const runs = rows
-    .filter((row) => assertStoredTarget(db, row.chat_id, row.target_message_id, row.target_swipe_id, row.generation_type))
-    .map(parseStoredRun)
-    .filter((run): run is AgentRunPublicV2 => run !== null);
+        LIMIT ?`,
+    ).all(userId, chatId, snapshotSequence, pageLimit) as StoredProjectionRow[];
+  }
+  const runs = rows.map((row) => {
+    if (!assertStoredTarget(db, row.chat_id, row.target_message_id, row.target_swipe_id, row.generation_type)) {
+      throw new Error("agent run resync encountered an invalid projection target");
+    }
+    const parsed = parseStoredRun(row);
+    if (!parsed) throw new Error("agent run resync encountered malformed projection");
+    return parsed;
+  });
   const totalRuns = withExecution
     ? Number((db.query(
       `SELECT COUNT(*) AS total
@@ -2218,14 +3148,264 @@ function listCurrentRuns(
          JOIN agent_turn_executions t
            ON t.user_id = p.user_id AND t.id = p.turn_id AND t.chat_id = p.chat_id
         WHERE p.user_id = ? AND p.chat_id = ? AND p.sequence <= ?
-          AND CASE WHEN t.expires_at < 100000000000 THEN t.expires_at * 1000 ELSE t.expires_at END > ?`,
-    ).get(userId, chatId, snapshotSequence, nowMilliseconds) as { total?: unknown } | null)?.total ?? 0)
+          AND ${executionVisibilitySql("t")}`,
+    ).get(userId, chatId, snapshotSequence, snapshotAt) as { total?: unknown } | null)?.total ?? 0)
     : Number((db.query(
       "SELECT COUNT(*) AS total FROM agent_run_projections WHERE user_id = ? AND chat_id = ? AND sequence <= ?",
     ).get(userId, chatId, snapshotSequence) as { total?: unknown } | null)?.total ?? 0);
+  const normalizedTotal = Number.isSafeInteger(totalRuns) && totalRuns >= 0 ? totalRuns : runs.length;
+  return { runs, totalRuns: normalizedTotal };
+}
+interface ResyncSnapshotMetadata {
+  readonly snapshotId: string;
+  readonly snapshotSequence: number;
+  readonly totalRuns: number;
+  readonly expiresAt: number;
+}
+
+interface ResyncSnapshotMemberRow {
+  readonly ordinal: number;
+  readonly turn_id: string;
+  readonly updated_at: number;
+  readonly run_json: string;
+}
+
+interface ResyncSnapshotPage {
+  readonly runs: AgentRunPublicV2[];
+  readonly totalRuns: number;
+  readonly expiresAt: number;
+  readonly lastOrdinal?: number;
+}
+
+function cleanupResyncSnapshots(db: Database, userId: string, chatId: string, nowSeconds: number): void {
+  if (
+    !tableExists(db, "agent_run_resync_snapshots")
+    || !tableExists(db, "agent_run_resync_snapshot_members")
+  ) return;
+  db.query(
+    `DELETE FROM agent_run_resync_snapshot_members
+      WHERE snapshot_id IN (
+        SELECT snapshot_id
+          FROM agent_run_resync_snapshots
+         WHERE user_id = ? AND chat_id = ? AND expires_at <= ?
+      )`,
+  ).run(userId, chatId, nowSeconds);
+  db.query(
+    "DELETE FROM agent_run_resync_snapshots WHERE user_id = ? AND chat_id = ? AND expires_at <= ?",
+  ).run(userId, chatId, nowSeconds);
+}
+
+
+function parseResyncSnapshotRun(
+  row: ResyncSnapshotMemberRow,
+  userId: string,
+  chatId: string,
+  snapshotSequence: number,
+): AgentRunPublicV2 | null {
+  try {
+    const parsed = JSON.parse(row.run_json) as Partial<AgentRunPublicV2>;
+    const generationType = normalizeGenerationType(parsed.generationType);
+    if (
+      parsed.version !== 2
+      || parsed.chatId !== chatId
+      || parsed.runId !== parsed.turnId
+      || parsed.turnId !== row.turn_id
+      || !validId(parsed.runId)
+      || !validId(parsed.turnId)
+      || !validId(parsed.generationId)
+      || !generationType
+      || typeof parsed.workPhase !== "string"
+      || !WORK_PHASES.has(parsed.workPhase as AgentRunPublicPhaseV2)
+      || typeof parsed.workStatus !== "string"
+      || !WORK_STATUSES.has(parsed.workStatus as AgentRunPublicStatusV2)
+      || parsed.workOutcome !== null
+      && (typeof parsed.workOutcome !== "string"
+        || !WORK_OUTCOMES.has(parsed.workOutcome as AgentRunPublicOutcomeV2))
+      || !Number.isSafeInteger(parsed.sequence)
+      || parsed.sequence < 1
+      || parsed.sequence > snapshotSequence
+      || !Number.isSafeInteger(parsed.revision)
+      || parsed.revision < 1
+      || !Number.isSafeInteger(parsed.startedAt)
+      || parsed.startedAt < 0
+      || !Number.isSafeInteger(parsed.updatedAt)
+      || parsed.updatedAt < 0
+      || parsed.updatedAt !== row.updated_at
+    ) return null;
+    const candidate = parsed as AgentRunPublicV2;
+    const storedState = storedStateForRun(candidate);
+    const canonical = normalizeRun({
+      userId,
+      chatId,
+      turnId: candidate.turnId,
+      generationId: candidate.generationId,
+      generationType,
+      targetMessageId: candidate.target?.messageId ?? null,
+      targetSwipeId: candidate.target?.swipeId ?? null,
+      status: storedState,
+      phase: storedState,
+      workPhase: candidate.workPhase,
+      workStatus: candidate.workStatus,
+      workOutcome: candidate.workOutcome,
+      reason: candidate.reason,
+      attemptLineage: candidate.attemptLineage,
+      revision: candidate.revision,
+      startedAt: candidate.startedAt,
+      updatedAt: candidate.updatedAt,
+      activity: candidate.activity,
+      usage: candidate.usage,
+      error: candidate.error ?? null,
+      terminalHandoff: candidate.terminalHandoff ?? null,
+      omission: candidate.omission,
+    }, candidate.sequence, candidate.revision);
+    if (!canonical || JSON.stringify(canonical) !== JSON.stringify(candidate)) return null;
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+function materializeResyncSnapshot(
+  db: Database,
+  userId: string,
+  chatId: string,
+  snapshotSequence: number,
+  snapshotAt: number,
+): ResyncSnapshotMetadata {
+  if (
+    !tableExists(db, "agent_run_resync_snapshots")
+    || !tableExists(db, "agent_run_resync_snapshot_members")
+  ) {
+    throw new Error("agent run resync snapshot schema is unavailable");
+  }
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  cleanupResyncSnapshots(db, userId, chatId, nowSeconds);
+  const source = listCurrentRuns(db, userId, chatId, snapshotSequence, snapshotAt, MAX_RESYNC_RUNS + 1);
+  if (source.totalRuns > MAX_RESYNC_RUNS || source.runs.length > MAX_RESYNC_RUNS) {
+    throw new Error("agent run resync membership exceeds the retained snapshot bound");
+  }
+  const snapshotId = randomUUID();
+  const expiresAt = nowSeconds + RESYNC_SNAPSHOT_TTL_SECONDS;
+  db.query(
+    `INSERT INTO agent_run_resync_snapshots
+      (snapshot_id, user_id, chat_id, snapshot_sequence, snapshot_at, total_runs, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(snapshotId, userId, chatId, snapshotSequence, snapshotAt, source.runs.length, expiresAt);
+  const insertMember = db.query(
+    `INSERT INTO agent_run_resync_snapshot_members
+      (snapshot_id, user_id, ordinal, turn_id, updated_at, run_json)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  source.runs.forEach((run, ordinal) => {
+    const runJson = JSON.stringify(run);
+    if (encoder.encode(runJson).byteLength > 65536) {
+      throw new Error("agent run resync snapshot member exceeds storage bounds");
+    }
+    insertMember.run(snapshotId, userId, ordinal, run.turnId, run.updatedAt, runJson);
+  });
+  return { snapshotId, snapshotSequence, totalRuns: source.runs.length, expiresAt };
+}
+
+function readResyncSnapshotPage(
+  db: Database,
+  userId: string,
+  chatId: string,
+  snapshotId: string,
+  snapshotSequence: number,
+  afterOrdinal = -1,
+): ResyncSnapshotPage {
+  if (
+    !tableExists(db, "agent_run_resync_snapshots")
+    || !tableExists(db, "agent_run_resync_snapshot_members")
+  ) {
+    throw new Error("agent run resync snapshot schema is unavailable");
+  }
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  cleanupResyncSnapshots(db, userId, chatId, nowSeconds);
+  const metadata = db.query(
+    `SELECT snapshot_sequence, total_runs, expires_at
+       FROM agent_run_resync_snapshots
+      WHERE snapshot_id = ? AND user_id = ? AND chat_id = ? AND expires_at > ?
+      LIMIT 1`,
+  ).get(snapshotId, userId, chatId, nowSeconds) as {
+    snapshot_sequence: number;
+    total_runs: number;
+    expires_at: number;
+  } | null;
+  if (
+    !metadata
+    || metadata.snapshot_sequence !== snapshotSequence
+    || !Number.isSafeInteger(metadata.snapshot_sequence)
+    || metadata.snapshot_sequence < 0
+    || !Number.isSafeInteger(metadata.total_runs)
+    || metadata.total_runs < 0
+    || metadata.total_runs > MAX_RESYNC_RUNS
+    || !Number.isSafeInteger(metadata.expires_at)
+    || metadata.expires_at <= nowSeconds
+  ) {
+    throw new Error("agent run resync snapshot is unavailable");
+  }
+  const membership = db.query(
+    `SELECT COUNT(*) AS member_count,
+            SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) AS owned_member_count,
+            MIN(ordinal) AS first_ordinal,
+            MAX(ordinal) AS last_ordinal
+       FROM agent_run_resync_snapshot_members
+      WHERE snapshot_id = ?`,
+  ).get(userId, snapshotId) as {
+    member_count?: unknown;
+    owned_member_count?: unknown;
+    first_ordinal?: unknown;
+    last_ordinal?: unknown;
+  } | null;
+  const memberCount = Number(membership?.member_count ?? Number.NaN);
+  const ownedMemberCount = Number(membership?.owned_member_count ?? 0);
+  const exactMembership = Number.isSafeInteger(memberCount)
+    && Number.isSafeInteger(ownedMemberCount)
+    && ownedMemberCount === memberCount
+    && memberCount === metadata.total_runs
+    && (
+      metadata.total_runs === 0
+        ? membership?.first_ordinal === null && membership?.last_ordinal === null
+        : membership?.first_ordinal === 0
+          && membership?.last_ordinal === metadata.total_runs - 1
+    );
+  if (!exactMembership) {
+    throw new Error("agent run resync snapshot membership is incomplete");
+  }
+  if (
+    !Number.isSafeInteger(afterOrdinal)
+    || afterOrdinal < -1
+    || afterOrdinal !== -1 && afterOrdinal >= metadata.total_runs - 1
+  ) {
+    throw new Error("agent run resync snapshot continuation is out of range");
+  }
+  const rows = db.query(
+    `SELECT ordinal, turn_id, updated_at, run_json
+       FROM agent_run_resync_snapshot_members
+      WHERE snapshot_id = ? AND user_id = ? AND ordinal > ?
+      ORDER BY ordinal ASC
+      LIMIT ?`,
+  ).all(snapshotId, userId, afterOrdinal, MAX_RUNS) as ResyncSnapshotMemberRow[];
+  for (let index = 0; index < rows.length; index += 1) {
+    if (rows[index]!.ordinal !== afterOrdinal + index + 1) {
+      throw new Error("agent run resync snapshot membership has a discontinuous ordinal");
+    }
+  }
+  const runs = rows.map((row) => {
+    const run = parseResyncSnapshotRun(row, userId, chatId, snapshotSequence);
+    if (!run) throw new Error("agent run resync snapshot contains malformed membership");
+    return run;
+  });
+  if (afterOrdinal + runs.length + 1 < metadata.total_runs && runs.length < MAX_RUNS) {
+    throw new Error("agent run resync snapshot membership is incomplete");
+  }
+  const lastOrdinal = rows.at(-1)?.ordinal;
   return {
     runs,
-    totalRuns: Number.isSafeInteger(totalRuns) && totalRuns >= 0 ? totalRuns : runs.length,
+    totalRuns: metadata.total_runs,
+    expiresAt: metadata.expires_at,
+    ...(lastOrdinal === undefined ? {} : { lastOrdinal }),
   };
 }
 
@@ -2233,6 +3413,7 @@ export function getAgentRunChanges(userId: string, chatId: string, cursorToken?:
   const db = getDb();
   return db.transaction(() => {
     if (!validId(userId) || !validId(chatId) || !assertOwnedChat(db, userId, chatId)) return null;
+    cleanupResyncSnapshots(db, userId, chatId, Math.floor(Date.now() / 1000));
     const decoded = decodeCursor(cursorToken);
     const bounds = sequenceBounds(db, userId, chatId);
     const cursorMatches = decoded.reason === "ok"
@@ -2262,15 +3443,39 @@ export function getAgentRunChanges(userId: string, chatId: string, cursorToken?:
     const events: AgentRunChangeEventV2[] = [];
 
     if (resync) {
-      // A paged resync keeps the event watermark from its first page. Events
-      // that arrive while pages are fetched are deliberately left for the
-      // first ordinary delta after the final page, so no live event can be
-      // hidden behind a page token.
+      // A paged resync keeps the event watermark and reads an owner-scoped,
+      // persisted membership snapshot. Updates, expiry, deletion, and
+      // malformed source rows therefore cannot shift a later page.
       const snapshotSequence = pagedResync ? Math.min(cursorSequence, bounds.last) : bounds.last;
-      const page = listCurrentRuns(db, userId, chatId, snapshotSequence, resyncOffset);
+      const snapshot = pagedResync
+        ? {
+            snapshotId: decoded.claims.r!,
+            snapshotSequence,
+            totalRuns: 0,
+            expiresAt: 0,
+          }
+        : materializeResyncSnapshot(db, userId, chatId, snapshotSequence, Date.now());
+      const afterOrdinal = pagedResync ? decoded.claims.q ?? -1 : -1;
+      const page = pagedResync
+        ? readResyncSnapshotPage(db, userId, chatId, snapshot.snapshotId, snapshotSequence, afterOrdinal)
+        : readResyncSnapshotPage(db, userId, chatId, snapshot.snapshotId, snapshotSequence);
       const complete = resyncOffset + page.runs.length >= page.totalRuns;
-      const nextOffset = complete ? undefined : resyncOffset + MAX_RUNS;
-      const nextCursor = mintCursor(userId, chatId, snapshotSequence, undefined, nextOffset);
+      if (!complete && page.runs.length === 0) {
+        throw new Error("agent run resync cannot advance its stable snapshot boundary");
+      }
+      const nextOffset = complete ? undefined : resyncOffset + page.runs.length;
+      const nextCursor = complete
+        ? mintCursor(userId, chatId, snapshotSequence)
+        : mintCursor(
+          userId,
+          chatId,
+          snapshotSequence,
+          undefined,
+          nextOffset,
+          snapshot.snapshotId,
+          page.lastOrdinal,
+          page.expiresAt,
+        );
       return {
         version: 2 as const,
         chatId,
@@ -2304,7 +3509,7 @@ export function getAgentRunChanges(userId: string, chatId: string, cursorToken?:
              JOIN agent_turn_executions t
                ON t.user_id = e.user_id AND t.id = e.turn_id AND t.chat_id = e.chat_id
             WHERE e.user_id = ? AND e.chat_id = ? AND e.sequence > ?
-              AND CASE WHEN t.expires_at < 100000000000 THEN t.expires_at * 1000 ELSE t.expires_at END > ?
+              AND ${executionVisibilitySql("t")}
             ORDER BY e.sequence ASC
             LIMIT ?`,
         ).all(userId, chatId, cursorSequence, Date.now(), MAX_EVENTS) as StoredEventRow[]
@@ -2925,6 +4130,8 @@ export function reconcileAgentRunProjections(
   let removedWorkspaces = 0;
   let preservedChatLifetimeEntries = 0;
   let failures = 0;
+  let pendingProjections = false;
+  let pendingWorkspaces = false;
 
   if (tableExists(db, "agent_run_projections") && tableExists(db, "agent_turn_executions")) {
     const candidates = db.query(
@@ -2932,9 +4139,15 @@ export function reconcileAgentRunProjections(
          FROM agent_run_projections p
          JOIN agent_turn_executions e
            ON e.user_id = p.user_id AND e.id = p.turn_id AND e.chat_id = p.chat_id
+        WHERE typeof(e.expires_at) = 'integer'
+          AND e.expires_at > 0
+          AND CASE
+            WHEN e.expires_at < ${SWIPE_EXPIRY_THRESHOLD} THEN e.expires_at * 1000
+            ELSE e.expires_at
+          END <= ?
         ORDER BY p.updated_at ASC, p.turn_id ASC
         LIMIT ?`,
-    ).all(maxRows) as Array<{ user_id: string; turn_id: string; expires_at: number | null }>;
+    ).all(nowMilliseconds, maxRows) as Array<{ user_id: string; turn_id: string; expires_at: number | null }>;
     inspectedProjections = candidates.length;
     for (const candidate of candidates) {
       if (!isExpiredAt(candidate.expires_at, nowMilliseconds)) continue;
@@ -2954,13 +4167,27 @@ export function reconcileAgentRunProjections(
         failures += 1;
       }
     }
+    pendingProjections = Boolean(db.query(
+      `SELECT 1
+         FROM agent_run_projections p
+         JOIN agent_turn_executions e
+           ON e.user_id = p.user_id AND e.id = p.turn_id AND e.chat_id = p.chat_id
+        WHERE typeof(e.expires_at) = 'integer'
+          AND e.expires_at > 0
+          AND CASE
+            WHEN e.expires_at < ${SWIPE_EXPIRY_THRESHOLD} THEN e.expires_at * 1000
+            ELSE e.expires_at
+          END <= ?
+        LIMIT 1`,
+    ).get(nowMilliseconds));
   }
 
   if (tableExists(db, "agent_turn_workspaces")) {
     const workspaces = db.query(
       `SELECT workspace_id, user_id
          FROM agent_turn_workspaces
-        WHERE retention = 'turn_terminal' AND expires_at > 0 AND expires_at <= ?
+        WHERE state <> 'expired'
+          AND retention = 'turn_terminal' AND expires_at > 0 AND expires_at <= ?
         ORDER BY expires_at ASC, workspace_id ASC
         LIMIT ?`,
     ).all(nowSeconds, maxRows) as Array<{ workspace_id: string; user_id: string }>;
@@ -3007,6 +4234,13 @@ export function reconcileAgentRunProjections(
         failures += 1;
       }
     }
+    pendingWorkspaces = Boolean(db.query(
+      `SELECT 1
+         FROM agent_turn_workspaces
+        WHERE state <> 'expired'
+          AND retention = 'turn_terminal' AND expires_at > 0 AND expires_at <= ?
+        LIMIT 1`,
+    ).get(nowSeconds));
   }
 
   return {
@@ -3016,7 +4250,7 @@ export function reconcileAgentRunProjections(
     removedWorkspaces,
     preservedChatLifetimeEntries,
     failures,
-    healthy: failures === 0,
+    healthy: failures === 0 && !pendingProjections && !pendingWorkspaces,
   };
 }
 

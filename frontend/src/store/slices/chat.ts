@@ -34,9 +34,8 @@ const AGENT_INVOCATION_STATUSES: Record<AgentInvocationStatus, true> = {
 const AGENT_ACTIVITY_TOOL_NAMES: Record<Exclude<AgentActivityToolName, 'unknown_tool'>, true> = {
   lore_list_books: true, lore_get_book: true, lore_list_entries: true, lore_get_entry: true,
   lore_search_entries: true, chat_search_history: true, agent_delegate: true,
-  context_pack_list: true, context_pack_get: true,
   workspace_read_section: true, workspace_read_page: true, workspace_create_task: true,
-  workspace_update_progress: true, workspace_submit_result: true, workspace_accept_submission: true,
+  workspace_update_progress: true, workspace_submit_result: true, workspace_submit_root_result: true, workspace_accept_submission: true,
   workspace_record_finding: true, workspace_record_decision: true, workspace_record_question: true,
   workspace_attach_artifact: true, workspace_propose_publication: true,
   complete_turn: true,
@@ -69,9 +68,8 @@ const AGENT_ACTIVITY_NODE_ACTORS: Record<AgentActivityNodeV1['actor'], true> = {
 const AGENT_ACTIVITY_NODE_TOOL_IDS: Record<Exclude<NonNullable<AgentActivityNodeV1['toolId']>, 'unknown_tool'>, true> = {
   lore_list_books: true, lore_get_book: true, lore_list_entries: true, lore_get_entry: true,
   lore_search_entries: true, chat_search_history: true, agent_delegate: true,
-  context_pack_list: true, context_pack_get: true,
   workspace_read_section: true, workspace_read_page: true, workspace_create_task: true,
-  workspace_update_progress: true, workspace_submit_result: true, workspace_accept_submission: true,
+  workspace_update_progress: true, workspace_submit_result: true, workspace_submit_root_result: true, workspace_accept_submission: true,
   workspace_record_finding: true, workspace_record_decision: true, workspace_record_question: true,
   workspace_attach_artifact: true, workspace_propose_publication: true,
   complete_turn: true,
@@ -728,6 +726,10 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
     streamingReasoningDuration: null,
     streamingReasoningStartedAt: null,
     streamingError: null,
+    lastGenerationTerminalStatus: null,
+    lastGenerationProvider: null,
+    lastGenerationConnectionLabel: null,
+    lastGenerationModel: null,
     activeGenerationId: null,
     agentActivityByGeneration: {},
     agentActivityRunsByGeneration: {},
@@ -742,6 +744,11 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
     landingRecentChats: null,
 
     setLandingRecentChats: (result) => set({ landingRecentChats: result }),
+    setGenerationProviderMetadata: (metadata) => set((state) => ({
+      lastGenerationProvider: metadata.provider === undefined ? state.lastGenerationProvider : metadata.provider,
+      lastGenerationConnectionLabel: metadata.connectionLabel === undefined ? state.lastGenerationConnectionLabel : metadata.connectionLabel,
+      lastGenerationModel: metadata.model === undefined ? state.lastGenerationModel : metadata.model,
+    })),
 
     setActiveChat: (chatId, characterId = null) => {
       endedGenerationIds.clear()
@@ -758,6 +765,10 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
         streamingContent: '',
         streamingReasoning: '',
         streamingError: null,
+        lastGenerationTerminalStatus: null,
+        lastGenerationProvider: null,
+        lastGenerationConnectionLabel: null,
+        lastGenerationModel: null,
         activeGenerationId: null,
         agentActivityByGeneration: {},
         agentActivityRunsByGeneration: {},
@@ -914,7 +925,6 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
           nextTotalChatLength = current.totalChatLength + 1
         }
       }
-
       set({
         messages: nextMessages,
         totalChatLength: nextTotalChatLength,
@@ -923,6 +933,10 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
         streamingReasoning: '',
         streamingReasoningDuration: null,
         streamingError: null,
+        lastGenerationTerminalStatus: null,
+        lastGenerationProvider: null,
+        lastGenerationConnectionLabel: null,
+        lastGenerationModel: null,
         activeGenerationId: null,
         agentActivityByGeneration: {},
         regeneratingMessageId: nextRegeneratingMessageId,
@@ -979,7 +993,6 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
           nextTotalChatLength = current.totalChatLength + 1
         }
       }
-
       set({
         messages: nextMessages,
         totalChatLength: nextTotalChatLength,
@@ -988,6 +1001,10 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
         streamingReasoning: '',
         streamingReasoningDuration: null,
         streamingError: null,
+        lastGenerationTerminalStatus: null,
+        lastGenerationProvider: null,
+        lastGenerationConnectionLabel: null,
+        lastGenerationModel: null,
         activeGenerationId: generationId,
         agentActivityByGeneration: retainAgentActivityGeneration(current.agentActivityByGeneration, generationId),
         regeneratingMessageId: nextRegeneratingMessageId,
@@ -1110,6 +1127,7 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
         streamingReasoningDuration: null,
         streamingReasoningStartedAt: null,
         streamingError: null,
+        lastGenerationTerminalStatus: 'completed',
         activeGenerationId: null,
         agentActivityByGeneration: {},
         regeneratingMessageId: null,
@@ -1141,6 +1159,7 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
           streamingReasoningDuration: null,
           streamingReasoningStartedAt: null,
           streamingError: null,
+          lastGenerationTerminalStatus: 'stopped',
           activeGenerationId: null,
           agentActivityByGeneration: {},
           regeneratingMessageId: null,
@@ -1167,6 +1186,7 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
               }
             : {}),
           streamingError: error,
+          lastGenerationTerminalStatus: 'error',
           isStreaming: false,
           streamingContent: '',
           streamingReasoning: '',

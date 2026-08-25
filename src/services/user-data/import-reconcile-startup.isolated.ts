@@ -13,6 +13,7 @@ import {
   isOwnedImportStagingPath,
   pruneTerminalImportJobs,
   reconcileUserDataImports,
+  MAX_IMPORT_STARTUP_RECONCILIATION_ROWS,
   releaseImportUpload,
   reserveImportUpload,
   startImport,
@@ -1105,6 +1106,175 @@ describe("durable import startup recovery", () => {
       "SELECT projection_pending, staging_path FROM user_data_imports WHERE job_id = ?",
     ).get(jobId)).toEqual({ projection_pending: 0, staging_path: "" });
   });
+  test("settles owned staging and does not rescan it on the next pass", async () => {
+    const jobId = "owned-staging-interrupted";
+    const stagingPath = join(workDir, "imports", "reconcile-user", jobId, "staging");
+    const archivePath = join(dirname(stagingPath), "archive.lvbak");
+    await mkdir(stagingPath, { recursive: true });
+    await writeFile(join(stagingPath, "sentinel"), "owned staging");
+    await writeFile(archivePath, "owned archive");
+    const now = Math.floor(Date.now() / 1000);
+    getDb().query(
+      `INSERT INTO user_data_imports
+        (job_id,user_id,archive_id,idempotency_key,archive_digest,manifest_json,
+         staging_path,staging_db_path,state,lease_owner,lease_expires_at,
+         lease_generation,created_at,updated_at)
+       VALUES (?, ?, ?, ?, ?, '{}', ?, ?, 'validating', ?, ?, 0, ?, ?)`,
+    ).run(
+      jobId,
+      "reconcile-user",
+      "archive-owned-staging",
+      "idempotency-owned-staging",
+      "d".repeat(64),
+      stagingPath,
+      join(stagingPath, "staging.sqlite"),
+      "old-owner",
+      now - 1,
+      now - 10,
+      now - 10,
+    );
+
+    const first = await reconcileUserDataImports();
+    expect(first.recovered).toBe(1);
+    expect(first.complete).toBe(true);
+    expect(first.healthy).toBe(true);
+    expect(getDb().query(
+      "SELECT state, staging_path, staging_db_path FROM user_data_imports WHERE job_id = ?",
+    ).get(jobId)).toEqual({ state: "failed", staging_path: "", staging_db_path: "" });
+    expect(await Bun.file(stagingPath).exists()).toBe(false);
+    expect(await Bun.file(archivePath).exists()).toBe(false);
+
+    const second = await reconcileUserDataImports();
+    expect(second.inspected).toBe(0);
+    expect(second.complete).toBe(true);
+    expect(second.healthy).toBe(true);
+  });
+
+  test("bounds import-control rows and reports continuation across passes", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const insertUser = getDb().query(
+      `INSERT INTO "user" (id, name, email, emailVerified, createdAt, updatedAt)
+       VALUES (?, ?, ?, 1, ?, ?)`,
+    );
+    const insertImport = getDb().query(
+      `INSERT INTO user_data_imports
+        (job_id,user_id,archive_id,idempotency_key,archive_digest,manifest_json,
+         staging_path,staging_db_path,state,lease_owner,lease_expires_at,
+         lease_generation,created_at,updated_at)
+       VALUES (?, ?, ?, ?, ?, '{}', '', '', 'validating', ?, ?, 0, ?, ?)`,
+    );
+    const total = MAX_IMPORT_STARTUP_RECONCILIATION_ROWS + 1;
+    for (let index = 0; index < total; index++) {
+      const suffix = String(index).padStart(3, "0");
+      const userId = `bounded-user-${suffix}`;
+      const jobId = `bounded-job-${suffix}`;
+      insertUser.run(userId, `Bounded User ${suffix}`, `${userId}@example.com`, now, now);
+      insertImport.run(
+        jobId,
+        userId,
+        `archive-${jobId}`,
+        `idempotency-${jobId}`,
+        "a".repeat(64),
+        `owner-${jobId}`,
+        now - 1,
+        now - 1,
+        now - 1,
+      );
+    }
+
+    const first = await reconcileUserDataImports();
+    expect(first.inspected).toBe(MAX_IMPORT_STARTUP_RECONCILIATION_ROWS);
+    expect(first.complete).toBe(false);
+    expect(first.healthy).toBe(false);
+    expect(first.recovered).toBe(MAX_IMPORT_STARTUP_RECONCILIATION_ROWS);
+
+    const second = await reconcileUserDataImports();
+    expect(second.inspected).toBe(1);
+    expect(second.complete).toBe(true);
+    expect(second.healthy).toBe(true);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM user_data_imports WHERE state NOT IN ('committed', 'failed', 'cancelled')",
+    ).get()).toEqual({ count: 0 });
+  });
+
+  test("does not inspect settled terminal history without cleanup work", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const insertUser = getDb().query(
+      `INSERT INTO "user" (id, name, email, emailVerified, createdAt, updatedAt)
+       VALUES (?, ?, ?, 1, ?, ?)`,
+    );
+    const insertImport = getDb().query(
+      `INSERT INTO user_data_imports
+        (job_id,user_id,archive_id,idempotency_key,archive_digest,manifest_json,
+         staging_path,staging_db_path,state,lease_owner,lease_expires_at,
+         lease_generation,created_at,updated_at,finished_at)
+       VALUES (?, ?, ?, ?, ?, '{}', '', '', ?, NULL, NULL, 0, ?, ?, ?)`,
+    );
+    for (let index = 0; index < MAX_IMPORT_STARTUP_RECONCILIATION_ROWS + 8; index++) {
+      const suffix = String(index).padStart(3, "0");
+      const userId = `history-user-${suffix}`;
+      const jobId = `history-job-${suffix}`;
+      const state = index % 2 === 0 ? "failed" : "cancelled";
+      insertUser.run(userId, `History User ${suffix}`, `${userId}@example.com`, now, now);
+      insertImport.run(
+        jobId,
+        userId,
+        `archive-${jobId}`,
+        `idempotency-${jobId}`,
+        "b".repeat(64),
+        state,
+        now - 10,
+        now - 10,
+        now - 10,
+      );
+    }
+    insertUser.run("parked-history-user", "Parked History User", "parked-history-user@example.com", now, now);
+    insertImport.run(
+      "parked-history-job",
+      "parked-history-user",
+      "archive-parked-history",
+      "idempotency-parked-history",
+      "c".repeat(64),
+      "awaiting_ticket",
+      now,
+      now,
+      now,
+    );
+
+
+    const result = await reconcileUserDataImports();
+    expect(result.inspected).toBe(0);
+    expect(result.recovered).toBe(0);
+    expect(result.deferred).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(result.complete).toBe(true);
+    expect(result.healthy).toBe(true);
+  });
+
+  test("reports a deferred journal row and converges on a later pass", async () => {
+    const fixture = await createExpiredFileJournal("deferred-journal", "tampered");
+    getDb().query("UPDATE user_data_imports SET state = 'failed' WHERE job_id = ?")
+      .run("deferred-journal");
+
+    const first = await reconcileUserDataImports();
+    expect(first.deferred).toBe(1);
+    expect(first.complete).toBe(false);
+    expect(first.healthy).toBe(false);
+    expect(getDb().query(
+      "SELECT install_state, stable_error_code FROM user_data_import_files f JOIN user_data_imports i USING (job_id) WHERE f.job_id = ?",
+    ).get("deferred-journal")).toEqual({ install_state: "pending", stable_error_code: "manual_recovery_required" });
+
+    await rm(fixture.finalPath, { force: true });
+    const second = await reconcileUserDataImports();
+    expect(second.deferred).toBe(0);
+    expect(second.failed).toBe(0);
+    expect(second.complete).toBe(true);
+    expect(second.healthy).toBe(true);
+    expect(getDb().query(
+      "SELECT install_state, staging_path FROM user_data_import_files f JOIN user_data_imports i USING (job_id) WHERE f.job_id = ?",
+    ).get("deferred-journal")).toEqual({ install_state: "removed", staging_path: "" });
+  });
+
   test("waits for an unexpired restart lease before taking over", async () => {
     const jobId = "restart-before-expiry";
     const now = Math.floor(Date.now() / 1000);

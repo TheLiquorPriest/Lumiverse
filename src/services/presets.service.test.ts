@@ -6,6 +6,7 @@ import {
   getPreset,
   getPresetCacheRevision,
   getPresetRegistrySignature,
+  normalizePromptBlocks,
   reconcileActiveLoomPreset,
   updatePreset,
   validateAgentConfigForExecution,
@@ -15,15 +16,13 @@ import {
   duplicatePresetWithAgentConfig,
   encodePortableAgentConfig,
   getAgentRuntimeSharedDraft,
-  getPresetAgentCognitionSourceV1,
   importPortablePresetRuntime,
   importPortablePreset,
   saveAgentRuntimeSharedDraft,
   writePresetAgentConfigWithDb,
 } from "./agent-config-portability.service";
-import { createDisabledAgentConfigV2, type AgentConfigV2, type AgentLoomPolicyV1, type AgentRuntimePolicyV1 } from "../types/agents";
+import { createDisabledAgentConfigV2, type AgentChildWorkspaceCapabilityV1, type AgentConfigV2, type AgentLoomPolicyV1, type AgentRuntimePolicyV1 } from "../types/agents";
 import type { LoomPolicyCheckpointV1, LoomPolicyDestinationV1, LoomPolicyEntryV1 } from "../types/agent-cognition";
-import type { WorkspaceOperationKindV1 } from "../types/turn-workspace";
 import { PresetRevisionConflictError, type PromptBlock } from "../types/preset";
 import { addPromptBlockToStash, removePromptBlockFromStash } from "./prompt-stash.service";
 import * as settingsSvc from "./settings.service";
@@ -57,6 +56,7 @@ function loomEntry(
   destination: LoomPolicyDestinationV1,
   checkpoint: LoomPolicyCheckpointV1,
   promptOrder = 0,
+  condition?: LoomPolicyEntryV1["condition"],
 ): LoomPolicyEntryV1 {
   return {
     version: 1,
@@ -72,7 +72,7 @@ function loomEntry(
     checkpoint,
     required: false,
     visibility: "work_only",
-    delivery: { delivery: "direct" },
+    ...(condition === undefined ? {} : { condition }),
   };
 }
 
@@ -130,21 +130,6 @@ function initPresetsTestDb(): void {
     user_id TEXT NOT NULL,
     PRIMARY KEY (key, user_id)
   )`);
-  getDb().run(`CREATE TABLE agent_preset_context_pack_attachments (
-    user_id TEXT NOT NULL,
-    attachment_id TEXT NOT NULL,
-    preset_id TEXT NOT NULL,
-    pack_id TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision >= 1),
-    position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0 AND position <= 1024),
-    required INTEGER NOT NULL DEFAULT 0 CHECK (required IN (0, 1)),
-    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'disabled', 'review_required', 'repair_required')),
-    provenance_json TEXT NOT NULL DEFAULT '{}' CHECK (length(provenance_json) <= 16384),
-    created_at INTEGER NOT NULL DEFAULT 0,
-    updated_at INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (user_id, attachment_id),
-    UNIQUE (user_id, preset_id, pack_id, revision)
-  )`);
 
   getDb().run(`CREATE TABLE preset_agent_configs (
     user_id TEXT NOT NULL,
@@ -159,7 +144,6 @@ function initPresetsTestDb(): void {
     main_lore_scope TEXT NOT NULL DEFAULT 'active',
     phase_policy_json TEXT NOT NULL DEFAULT '{}',
     cognition_policy_json TEXT NOT NULL DEFAULT '{}',
-    context_policy_json TEXT NOT NULL DEFAULT '{}',
     task_policy_json TEXT NOT NULL DEFAULT '{}',
     workspace_policy_json TEXT NOT NULL DEFAULT '{}',
     state TEXT NOT NULL DEFAULT 'ready',
@@ -448,7 +432,7 @@ describe("presets.service — active preset recovery", () => {
     });
 
     test("persists workspace capability grants through portable projection and duplicate", () => {
-      const workspaceCapabilities: WorkspaceOperationKindV1[] = ["read_section", "update_assigned_progress", "submit_child_result"];
+      const workspaceCapabilities: AgentChildWorkspaceCapabilityV1[] = ["read_section", "update_assigned_progress", "submit_child_result"];
       const config = {
         ...agentConfig,
         profiles: [{ ...agentConfig.profiles[0], workspaceCapabilities }],
@@ -472,13 +456,6 @@ describe("presets.service — active preset recovery", () => {
     });
 
     test("duplicates the validated authored cognition envelope with normalized state and regex companions", () => {
-      const rule = {
-        id: "rule_one",
-        packId: "rule-pack",
-        revisionId: "rule-pack@2",
-        required: true,
-        dependencies: [],
-      };
       const task = {
         id: "task_one",
         required: true,
@@ -499,13 +476,13 @@ describe("presets.service — active preset recovery", () => {
           completionCriteria: [loomEntry("cognition-completion", "cognition-block", "completion_handoff", "PREPARE_COMMIT")],
           renderPolicy: [loomEntry("cognition-render", "cognition-block", "render", "RENDER")],
         }),
-        contextPolicy: { packIds: ["direct-pack"], ruleIds: ["rule_one"] },
         taskPolicy: { templateIds: ["task_one"] },
       };
+      const cognitionPromptOrder = normalizePromptBlocks([{ id: "cognition-block" } as PromptBlock]);
       const created = createPreset("u1", {
         name: "Cognition source",
         provider: "loom",
-        prompt_order: [{ id: "cognition-block" }],
+        prompt_order: cognitionPromptOrder,
         agent_config: cognitionConfig,
       });
       getDb().run(
@@ -516,22 +493,8 @@ describe("presets.service — active preset recovery", () => {
       saveAgentRuntimeSharedDraft("u1", created.id, {
         config: cognitionConfig,
         slotBindings: [{ slotId: "writer", connectionId: null }],
-        contextPackSelections: [{
-          packId: "direct-pack",
-          revisionId: "direct-pack@1",
-          revision: 1,
-          digest: "a".repeat(64),
-          label: "Direct rules",
-        }, {
-          packId: "rule-pack",
-          revisionId: "rule-pack@2",
-          revision: 2,
-          digest: "b".repeat(64),
-          label: "Rule context",
-        }],
-        contextRules: [rule],
         taskTemplates: [task],
-        promptOrder: [{ id: "cognition-block" }],
+        promptOrder: cognitionPromptOrder,
         reviewAcknowledgements: ["slot:writer"],
         expectedPresetRevision: before.presetRevision,
         expectedConfigRevision: before.configRevision,
@@ -578,7 +541,6 @@ describe("presets.service — active preset recovery", () => {
         completionCriteria: sourceLoomPolicy.completionCriteria.map(rebound),
         renderPolicy: sourceLoomPolicy.renderPolicy.map(rebound),
       });
-      expect(duplicate.agent_config.contextPolicy).toEqual({ packIds: ["direct-pack"], ruleIds: ["rule_one"] });
       expect(duplicate.agent_config.taskPolicy).toEqual({ templateIds: ["task_one"] });
       expect(getDb().query(
         "SELECT COUNT(*) AS count FROM regex_scripts WHERE user_id = ? AND preset_id = ?",
@@ -730,9 +692,6 @@ describe("presets.service — active preset recovery", () => {
         agentRuntime: {
           version: 1,
           agentConfig: null,
-          contextPacks: [],
-          contextSelections: [],
-          contextRules: [],
           taskTemplates: [],
         },
         existingPresetId: "runtime-only",
@@ -777,8 +736,6 @@ describe("presets.service — active preset recovery", () => {
           }),
         },
         slotBindings: [],
-        contextPackSelections: [],
-        contextRules: [],
         taskTemplates: [],
         reviewAcknowledgements: [],
         promptOrder: [{ id: "new-block" }],
@@ -800,74 +757,6 @@ describe("presets.service — active preset recovery", () => {
       expect(refs.every((item) => item.source.blockRevision === 1)).toBe(true);
     });
 
-    test("keeps direct and rule-target context pack authority separate", () => {
-      const rule = {
-        id: "rule_one",
-        packId: "rule-pack",
-        revisionId: "rule-pack@2",
-        required: true,
-        dependencies: [],
-      };
-      const config = {
-        ...agentConfig,
-        contextPolicy: { packIds: ["direct-pack"], ruleIds: ["rule_one"] },
-      };
-      const created = createPreset("u1", { name: "Mixed context", provider: "loom", agent_config: config });
-      const before = getAgentRuntimeSharedDraft("u1", created.id)!;
-      const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
-        config,
-        slotBindings: [],
-        contextPackSelections: [
-          { packId: "direct-pack", revisionId: "direct-pack@1", revision: 1, digest: "a".repeat(64) },
-          { packId: "rule-pack", revisionId: "rule-pack@2", revision: 2, digest: "b".repeat(64) },
-        ],
-        contextRules: [rule],
-        taskTemplates: [],
-        reviewAcknowledgements: [],
-        promptOrder: [],
-        expectedPresetRevision: before.presetRevision,
-        expectedConfigRevision: before.configRevision,
-      });
-
-      expect(saved.editor.config.contextPolicy).toEqual({ packIds: ["direct-pack"], ruleIds: ["rule_one"] });
-      expect(getPresetAgentCognitionSourceV1("u1", created.id)?.contextPackSelections.map((selection) => selection.packId)).toEqual(["direct-pack", "rule-pack"]);
-      expect(getPresetAgentCognitionSourceV1("u1", created.id)?.contextRules).toEqual([rule]);
-      expect(decodePortableAgentConfig(encodePortableAgentConfig(saved.editor.config)).contextPolicy).toEqual({
-        packIds: ["direct-pack"],
-        ruleIds: ["rule_one"],
-      });
-    });
-
-    test("allows a rule-only context pack without direct attachment authority", () => {
-      const rule = {
-        id: "rule_only",
-        packId: "rule-only-pack",
-        revisionId: "rule-only-pack@1",
-        required: false,
-        dependencies: [],
-      };
-      const config = {
-        ...agentConfig,
-        contextPolicy: { packIds: [], ruleIds: ["rule_only"] },
-      };
-      const created = createPreset("u1", { name: "Rule-only context", provider: "loom", agent_config: config });
-      const before = getAgentRuntimeSharedDraft("u1", created.id)!;
-      const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
-        config,
-        slotBindings: [],
-        contextPackSelections: [{ packId: "rule-only-pack", revisionId: "rule-only-pack@1", revision: 1, digest: "c".repeat(64) }],
-        contextRules: [rule],
-        taskTemplates: [],
-        reviewAcknowledgements: [],
-        promptOrder: [],
-        expectedPresetRevision: before.presetRevision,
-        expectedConfigRevision: before.configRevision,
-      });
-
-      expect(saved.editor.config.contextPolicy).toEqual({ packIds: [], ruleIds: ["rule_only"] });
-      expect(getPresetAgentCognitionSourceV1("u1", created.id)?.contextPackSelections.map((selection) => selection.packId)).toEqual(["rule-only-pack"]);
-      expect(getPresetAgentCognitionSourceV1("u1", created.id)?.contextRules).toEqual([rule]);
-    });
 
 
 
@@ -889,8 +778,6 @@ describe("presets.service — active preset recovery", () => {
       const partial = saveAgentRuntimeSharedDraft("u1", created.id, {
         config: slotConfig,
         slotBindings: [{ slotId: "writer", connectionId: null }],
-        contextPackSelections: [],
-        contextRules: [],
         taskTemplates: [],
         reviewAcknowledgements: [],
         promptOrder: [],
@@ -905,8 +792,6 @@ describe("presets.service — active preset recovery", () => {
       const acknowledged = saveAgentRuntimeSharedDraft("u1", created.id, {
         config: slotConfig,
         slotBindings: [{ slotId: "writer", connectionId: null }],
-        contextPackSelections: [],
-        contextRules: [],
         taskTemplates: [],
         reviewAcknowledgements: ["slot:writer"],
         promptOrder: [],
@@ -926,7 +811,6 @@ describe("presets.service — active preset recovery", () => {
           allowedModes: ["response", "agentic"],
           defaultMode: "agentic",
           runtimePolicy: canonicalRuntimePolicy("agentic"),
-          contextPolicy: { packIds: ["honesty-pack"], ruleIds: ["context_1"] },
         };
         const created = createPreset("u1", {
           name: `Imported runtime ${reasonCode}`,
@@ -948,19 +832,6 @@ describe("presets.service — active preset recovery", () => {
         const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
           config: localConfig,
           slotBindings: [],
-          contextPackSelections: [{
-            packId: "honesty-pack",
-            revisionId: "honesty-pack@1",
-            revision: 1,
-            digest: "a".repeat(64),
-          }],
-          contextRules: [{
-            id: "context_1",
-            packId: "honesty-pack",
-            revisionId: "honesty-pack@1",
-            required: false,
-            dependencies: [],
-          }],
           taskTemplates: [],
           reviewAcknowledgements: [],
           promptOrder: [],
@@ -987,7 +858,6 @@ describe("presets.service — active preset recovery", () => {
         allowedModes: ["response", "agentic"],
         defaultMode: "agentic",
         runtimePolicy: canonicalRuntimePolicy("agentic"),
-        contextPolicy: { packIds: ["honesty-pack"], ruleIds: ["context_1"] },
       };
       const created = createPreset("u1", {
         name: "Imported runtime",
@@ -1009,19 +879,6 @@ describe("presets.service — active preset recovery", () => {
       const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
         config: localConfig,
         slotBindings: [],
-        contextPackSelections: [{
-          packId: "honesty-pack",
-          revisionId: "honesty-pack@1",
-          revision: 1,
-          digest: "a".repeat(64),
-        }],
-        contextRules: [{
-          id: "context_1",
-          packId: "honesty-pack",
-          revisionId: "honesty-pack@1",
-          required: false,
-          dependencies: [],
-        }],
         taskTemplates: [],
         reviewAcknowledgements: ["review:cognition_foreign_authority_blocked"],
         promptOrder: [],
@@ -1029,10 +886,6 @@ describe("presets.service — active preset recovery", () => {
         expectedConfigRevision: before.configRevision,
       });
       expect(saved.editor.review.state).toBe("ready");
-      expect(saved.editor.config.contextPolicy).toEqual({
-        packIds: ["honesty-pack"],
-        ruleIds: ["context_1"],
-      });
       expect(getDb().query(
         "SELECT state, review_code FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
       ).get("u1", created.id)).toEqual({
@@ -1068,8 +921,6 @@ describe("presets.service — active preset recovery", () => {
       const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
         config: slotConfig,
         slotBindings: [{ slotId: "writer", connectionId: "pollinations-no-tools" }],
-        contextPackSelections: [],
-        contextRules: [],
         taskTemplates: [],
         reviewAcknowledgements: [],
         promptOrder: [],
@@ -1107,8 +958,6 @@ describe("presets.service — active preset recovery", () => {
       expect(() => saveAgentRuntimeSharedDraft("u1", created.id, {
         config: agentConfig,
         slotBindings: [],
-        contextPackSelections: [],
-        contextRules: [],
         taskTemplates: [],
         reviewAcknowledgements: ["review:unknown"],
         promptOrder: [{ id: "after" }],
@@ -1161,8 +1010,6 @@ describe("presets.service — active preset recovery", () => {
       const saved = saveAgentRuntimeSharedDraft("u1", created.id, {
         config: { ...createDisabledAgentConfigV2(), agentsEnabled: true, allowedModes: ["response", "agentic"], defaultMode: "response" },
         slotBindings: [],
-        contextPackSelections: [],
-        contextRules: [],
         taskTemplates: [],
         reviewAcknowledgements: [],
         promptOrder: created.prompt_order ?? [],

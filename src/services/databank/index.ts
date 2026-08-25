@@ -15,6 +15,7 @@ export {
   createDocument,
   listDocuments,
   getDocument,
+  getDocumentInDatabank,
   ensureChatDatabank,
   renameDocument,
   getDocumentBySlug,

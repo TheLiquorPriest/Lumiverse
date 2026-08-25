@@ -485,14 +485,38 @@ export interface AgentInspectionUsageLayerV1 {
   canonical: boolean
 }
 
-export type AgentPromptEvidenceDestinationV1 = 'root_work' | 'child_work' | 'completion' | 'render' | 'council' | 'cortex'
+export type AgentPromptEvidenceDestinationV1 = 'root_work' | 'child_work' | 'completion_handoff' | 'render' | 'council' | 'cortex'
 export type AgentPromptEvidenceRoleV1 = 'system' | 'user' | 'assistant' | 'tool' | 'context' | 'policy'
 
+export type AgentPromptRevisionV1 = string | number
+export interface AgentPromptDatabankSourceV1 {
+  kind: 'automatic' | 'mention'
+  databankId: string
+  documentId: string
+  documentName: string
+  chunkId: string | null
+  documentContentHash: string | null
+  contentHash: string
+}
+export type AgentPromptNativeProvenanceV1 =
+  | { kind: 'world_info'; sourceId: string; sourceRevision: AgentPromptRevisionV1; sourceIndex: number }
+  | { kind: 'databank'; sourceRevision: string; sources: AgentPromptDatabankSourceV1[] }
+export type AgentRenderCrossingKindV1 = 'accepted_finding' | 'accepted_submission' | 'completion_guidance'
+export interface AgentRenderCrossingV1 {
+  version: 1
+  id: string
+  kind: AgentRenderCrossingKindV1
+  sourceId: string
+  sourceRevision: number | null
+  contentDigest: string
+  content: string | null
+  correlation: AgentInspectionCorrelationV1
+}
 export interface AgentPromptEvidenceV1 {
   version: 1
   id: string
   sourceId: string
-  sourceRevision: number
+  sourceRevision: AgentPromptRevisionV1
   destination: AgentPromptEvidenceDestinationV1
   role: AgentPromptEvidenceRoleV1
   correlation: AgentInspectionCorrelationV1
@@ -500,6 +524,7 @@ export interface AgentPromptEvidenceV1 {
   content: string
   contentDigest: string
   omissionReason: string | null
+  nativeProvenance: AgentPromptNativeProvenanceV1 | null
   loomInspection: LoomPromptInspectionV1 | null
 }
 
@@ -620,6 +645,9 @@ export interface AgentActivityTreeV1 {
 export interface AgentRunInspectionSummaryV1 {
   version: 1
   attempt: AgentInspectionAttemptLineageV1
+  runId: string
+  turnSessionId: string
+  generationId: string
   hostCorrelationId: string
   lifecycle: AgentInspectionLifecycleV1
   status: AgentInspectionStatusV1
@@ -693,6 +721,7 @@ export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 
   usage: AgentInspectionUsageProjectionV1
   error: AgentInspectionErrorDetailV1 | null
   promptEvidence: AgentPromptEvidenceV1[]
+  renderCrossings: AgentRenderCrossingV1[]
   cortexReceipts: AgentCortexReceiptV1[]
   councilReceipts: AgentCouncilReceiptV1[]
   workspaceAssociations: AgentWorkspaceAssociationV1[]
@@ -798,7 +827,7 @@ export interface AgentPersistentWorkspaceTurnSessionV1 {
   id: string
   workspaceId: string
   userId: string
-  chatId: string
+  chatId: string | null
   turnId: string
   attemptId: string
   executionId: string | null
@@ -810,6 +839,12 @@ export interface AgentPersistentWorkspaceTurnSessionV1 {
   updatedAt: number
   terminalAt: number | null
 }
+export interface AgentPersistentWorkspaceTurnSessionPageV1 {
+  data: AgentPersistentWorkspaceTurnSessionV1[]
+  total: number
+  limit: number
+  offset: number
+}
 
 export type AgentPersistentWorkspaceTaskCreatorV1 = 'host' | 'owner'
 export type AgentWorkspaceTaskStateV1 = 'pending' | 'active' | 'blocked' | 'completed' | 'cancelled' | 'failed'
@@ -820,7 +855,7 @@ export interface AgentPersistentWorkspaceTaskV1 {
   workspaceId: string
   turnSessionId: string | null
   userId: string
-  chatId: string
+  chatId: string | null
   title: string
   objective: string
   state: AgentWorkspaceTaskStateV1
@@ -892,6 +927,7 @@ export interface AgentPersistentWorkspacePublicationProvenanceV1 {
   workspaceId: string
   turnSessionId: string | null
   attemptId: string | null
+  executionId: string | null
   sourceDigest: string
   sourceChatId: string | null
   sourceMessageId: string | null

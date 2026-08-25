@@ -6,11 +6,15 @@ import type {
 } from "./agentic-work-phase.service";
 import type { AssemblyMessageSegmentV1, AssemblyPlanV1 } from "./agentic-assembly-compiler";
 import { compileAgentRuntimePhases, type AgentRuntimePhaseCompileResultV1 } from "./agentic-phase-runtime.service";
+import type {
+  GenerationAssemblySnapshotV1,
+  InputRevisionSetV1Local,
+} from "./prompt-assembly-snapshot.service";
 import type { WorkCouncilExecutionResult } from "./work-council.service";
 import type { CognitionEvaluationContextV1, CognitionTaskTransition } from "../types/agent-cognition";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
-import { AGENT_SYSTEM_PROMPT_MAX_BYTES } from "../types/agents";
-import type { AgentCustomPhaseV1, AgentRuntimePhaseCapabilityV1 } from "../types/agents";
+import { AGENT_SYSTEM_PROMPT_MAX_BYTES, createDisabledAgentConfigV2 } from "../types/agents";
+import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import type { GenerationResponse, LlmMessage, ProviderTransientCarrier, ToolCallResult } from "../llm/types";
 import {
   AGENTIC_WORK_TOOL_NAMES,
@@ -62,16 +66,15 @@ function plan(overrides: (Partial<AssemblyPlanV1> & Record<string, unknown>) = {
     credential: [],
     participants: [],
     worldLore: [],
+    databank: [],
     settings: [],
     variables: [],
     regex: [],
-    context: [],
-    acl: [],
     cognition: [],
     readiness: [],
     digest: "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   };
-  return {
+  const candidate = {
     version: 1,
     assemblySurface: "WORK",
     operation: "compile_agent_assembly",
@@ -93,13 +96,6 @@ function plan(overrides: (Partial<AssemblyPlanV1> & Record<string, unknown>) = {
       token: { snapshotId: "snapshot-1", inputBytes: 4, providerMessageCount: 1 },
       inputRevisionDigest: "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     },
-    contextPackSnapshot: {
-      version: 1,
-      ownerId: "user-1",
-      contextAclRevision: 1,
-      candidates: [],
-      candidateInputRevisions: [],
-    },
     inputRevisions,
     inputRevisionSet: inputRevisions,
     deltas: [],
@@ -119,50 +115,175 @@ function plan(overrides: (Partial<AssemblyPlanV1> & Record<string, unknown>) = {
     loomBlocks: [],
     ...overrides,
   } as AssemblyPlanV1;
+  const snapshotId = snapshotForPlan(candidate).snapshotId;
+  return {
+    ...candidate,
+    snapshotId,
+    privateEvidence: {
+      ...candidate.privateEvidence,
+      token: {
+        ...candidate.privateEvidence.token,
+        snapshotId,
+      },
+    },
+  };
+}
+function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV1 {
+  const inputRevisionSet = candidate.inputRevisionSet as InputRevisionSetV1Local;
+  const phases = (candidate.customPhasePlan?.phases ?? []).map((phase) => ({
+    version: phase.version,
+    id: phase.id,
+    label: phase.label,
+    instructionRefs: phase.instructionRefs,
+    required: phase.required,
+    enter: phase.enter,
+    exit: phase.exit,
+    ...(phase.skip === undefined ? {} : { skip: phase.skip }),
+    capabilityRequests: phase.capabilityRequests,
+    repeatLimit: phase.repeatLimit,
+    nextPhaseIds: phase.nextPhaseIds,
+  }));
+  const snapshotBlocks = (candidate.loomBlocks ?? []).map((block) => ({
+    id: block.source.blockId,
+    name: block.source.blockId,
+    content: block.content,
+    role: "system" as const,
+    enabled: true,
+    position: "post_history" as const,
+    depth: 0,
+    marker: null,
+    sealed: false,
+    isLocked: false,
+    color: null,
+    injectionTrigger: [],
+    group: null,
+    order: block.source.promptOrder,
+    revision: String(block.source.blockRevision),
+  }));
+  const cognitionSource = snapshotBlocks.length > 0
+    ? {
+      presetRevision: snapshotBlocks[0]?.revision === undefined ? 1 : Number(snapshotBlocks[0].revision),
+      blocks: snapshotBlocks.map((block) => ({
+        blockId: block.id,
+        revision: Number(block.revision),
+        promptOrder: block.order,
+      })),
+    }
+    : null;
+  const runtimePolicy = phases.length > 0
+    ? {
+      version: 1 as const,
+      authority: "loom" as const,
+      scope: "preset" as const,
+      defaultMode: "response" as const,
+      loomPolicy: null,
+      phases,
+    }
+    : undefined;
+  const baseConfig = createDisabledAgentConfigV2();
+  const agentConfig = runtimePolicy === undefined
+    ? null
+    : { ...baseConfig, runtimePolicy };
+  const messages = candidate.messages
+    .filter((message) => message.provenance.kind === "history")
+    .map((message, index) => {
+      const content = message.segments
+        .map((segment) => segment.kind === "literal" ? segment.text : "")
+        .join("");
+      return {
+        id: message.provenance.sourceId,
+        chat_id: "chat-1",
+        index_in_chat: index,
+        is_user: message.role === "user",
+        name: "",
+        content,
+        send_date: 0,
+        swipe_id: 0,
+        swipes: [content],
+        swipe_dates: [0],
+        extra: {},
+        parent_message_id: null,
+        branch_id: null,
+        created_at: 0,
+        revision: message.provenance.sourceRevision,
+      };
+    });
+  const snapshot = {
+    version: 1,
+    assemblySurface: "WORK" as const,
+    snapshotId: "",
+    userId: "user-1",
+    generationId: candidate.requestId,
+    chatId: "chat-1",
+    target: {
+      generationType: "normal",
+      messageId: null,
+      swipeId: null,
+      continueMessageId: null,
+      excludedMessageId: null,
+      userInput: "",
+    },
+    chat: {
+      id: "chat-1",
+      character_id: null,
+      name: "Test",
+      created_at: 0,
+      updated_at: 0,
+      metadata: {},
+      revision: "1",
+    },
+    messages,
+    preset: null,
+    blocks: snapshotBlocks,
+    participants: {
+      persona: null,
+      character: { id: "character-1" },
+      group: [],
+      availabilityRevision: "1",
+    },
+    variables: {
+      preset: {},
+      chat: {},
+      settings: {},
+      revision: "1",
+    },
+    regexScripts: [],
+    worldInfo: {
+      books: [],
+      entries: [],
+      candidates: [],
+      state: {},
+    },
+    agentCognition: {
+      schema: "present",
+      cognitionGraph: null,
+      cognitionSource,
+      revision: "1",
+      loomPolicy: candidate.loomPolicy,
+    },
+    availability: {
+      participantIds: [],
+      toolIds: [],
+      extensionsExcluded: true,
+      ambientSpindleExcluded: true,
+      revision: "1",
+    },
+    connection: null,
+    agentConfig,
+    limits: candidate.limits,
+    inputRevisionSet,
+    revisions: inputRevisionSet,
+    extensionData: null,
+    ambientSpindleData: null,
+  };
+  const { snapshotId: _snapshotId, inputRevisionSet: _inputRevisionSet, revisions: _revisions, ...base } = snapshot;
+  const snapshotId = createHash("sha256")
+    .update(encodeCanonicalPlainData({ base, revisions: snapshot.revisions }), "utf8")
+    .digest("hex");
+  return { ...snapshot, snapshotId } as GenerationAssemblySnapshotV1;
 }
 
-function contextSnapshot(
-  label = "Context",
-  summary = "",
-): AssemblyPlanV1["contextPackSnapshot"] {
-  const candidate = {
-    ownerId: "user-1",
-    packId: "pack-1",
-    revisionId: "revision-1",
-    revision: 1,
-    digest: "a".repeat(64),
-    label,
-    summary,
-    source: "preset" as const,
-    targetId: "preset-1",
-    attachmentId: "attachment-1",
-    attachmentRevision: 1,
-    aclRevision: 1,
-    byteCount: 0,
-    tokenCount: 0,
-    required: false,
-    order: 0,
-  };
-  return {
-    version: 1,
-    ownerId: "user-1",
-    contextAclRevision: 1,
-    candidates: [candidate],
-    candidateInputRevisions: [{
-      kind: "context_pack" as const,
-      ownerId: "user-1",
-      packId: "pack-1",
-      revisionId: "revision-1",
-      revision: 1,
-      digest: "a".repeat(64),
-      source: "preset" as const,
-      targetId: "preset-1",
-      attachmentId: "attachment-1",
-      attachmentRevision: 1,
-      aclRevision: 1,
-    }],
-  };
-}
+
 type AssemblyMessageFixture = AssemblyPlanV1["messages"][number];
 type AssemblyResultSlotFixture = AssemblyPlanV1["resultSlots"][number];
 
@@ -198,17 +319,28 @@ function baseOptions(
   dispatch: AgenticWorkOptions["dispatch"],
   overrides: Partial<AgenticWorkOptions> = {},
 ): AgenticWorkOptions {
+  const authoredPlan = overrides.plan ?? plan();
+  const snapshot = overrides.snapshot ?? snapshotForPlan(authoredPlan);
+  const source = snapshot.agentCognition.cognitionSource;
+  const selectedPlan: AssemblyPlanV1 = {
+    ...authoredPlan,
+    customPhasePlan: compileAgentRuntimePhases(
+      authoredPlan.customPhasePlan.phases,
+      source === null ? undefined : { source },
+    ),
+  };
   return {
-    plan: plan(),
     trustedAssemblyLimits: HOST_PREPARATION_LIMITS_V1,
     connectionId: "concrete-connection",
     model: "frozen-model",
     countTokens: TEST_COUNT_TOKENS,
-    dispatch,
     coreToolIds: ["chat_search_history"],
     rootFrameId: "test-root",
     signal: new AbortController().signal,
     ...overrides,
+    dispatch,
+    plan: selectedPlan,
+    snapshot,
   };
 }
 function preparedFixedPoint(result: AgenticWorkspaceCompletionFixedPointResult): AgenticWorkspaceCompletionFixedPointResult {
@@ -332,9 +464,16 @@ function customPhase(
   capabilityRequests: readonly AgentRuntimePhaseCapabilityV1[],
   overrides: Partial<AgentCustomPhaseV1> = {},
 ): AgentCustomPhaseV1 {
+  const normalizedId = id.replace(/-/g, "_");
+  const normalizedOverrides = overrides.nextPhaseIds === undefined
+    ? overrides
+    : {
+      ...overrides,
+      nextPhaseIds: overrides.nextPhaseIds.map((nextPhaseId) => nextPhaseId.replace(/-/g, "_")),
+    };
   return {
     version: 1,
-    id,
+    id: normalizedId,
     label: id,
     instructionRefs: [],
     required: true,
@@ -343,7 +482,7 @@ function customPhase(
     capabilityRequests,
     repeatLimit: 0,
     nextPhaseIds: [],
-    ...overrides,
+    ...normalizedOverrides,
   };
 }
 
@@ -937,46 +1076,6 @@ describe("Agentic WORK phase", () => {
     expect(providerMessages[1]).toContain("CORE_RESULT");
   });
 
-  test("routes only frozen context-pack list/get arguments to the injected capability and returns bounded observations", async () => {
-    const seen: Array<{ name: string; args: Record<string, unknown> }> = [];
-    const providerMessages: string[] = [];
-    let round = 0;
-    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
-      round += 1;
-      providerMessages.push(JSON.stringify(messages));
-      if (round === 1) return response("", [call("context_pack_list", "packs-1", { limit: 4, offset: 0 })]);
-      if (round === 2) return response("", [call("context_pack_get", "packs-2", {
-        pack_id: "pack-1",
-        revision_id: "revision-1",
-        revision: 1,
-        limit: 2,
-        offset: 0,
-      })]);
-      return response("", [complete("context-complete")]);
-    }, {
-      contextTools: ["context_pack_list", "context_pack_get"],
-      context: {
-        list: async (args) => {
-          seen.push({ name: "context_pack_list", args });
-          return { status: "success", toolName: "context_pack_list", data: { marker: "LIST_RESULT" } };
-        },
-        get: async (args) => {
-          seen.push({ name: "context_pack_get", args });
-          return { status: "success", toolName: "context_pack_get", data: { marker: "GET_RESULT" } };
-        },
-      },
-      workspace: workspace(),
-      workspaceCapabilities: [],
-    }));
-
-    expect(result.status).toBe("completed");
-    expect(seen).toEqual([
-      { name: "context_pack_list", args: { limit: 4, offset: 0 } },
-      { name: "context_pack_get", args: { pack_id: "pack-1", revision_id: "revision-1", revision: 1, limit: 2, offset: 0 } },
-    ]);
-    expect(providerMessages[1]).toContain("LIST_RESULT");
-    expect(providerMessages[2]).toContain("GET_RESULT");
-  });
 
   test("rejects forged, mixed, and premature completion without freezing", async () => {
     let round = 0;
@@ -1266,136 +1365,87 @@ describe("Agentic WORK phase", () => {
     expect(result.observations).toEqual([]);
   });
 
-  test("observes remaining calls when workspace context refresh fails", async () => {
-    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
-      call("workspace_create_task", "workspace-1", { taskId: "task-1", title: "Task", objective: "Exercise cognition refresh" }),
-      call("chat_search_history", "core-1", { query: "history" }),
-    ]), {
-      workspace: workspace({
-        applyCognitionWorkspaceTransition: async () => ({
-          result: { ok: true },
-          cognition: { contextPackRequirements: [] },
-        }),
-      }),
-      workspaceCapabilities: ["create_task"],
-      context: {
-        list: async () => ({ status: "success", toolName: "context_pack_list", data: [] }),
-        get: async () => ({ status: "success", toolName: "context_pack_get", data: {} }),
-        refreshContextCapability: async () => {
-          throw new Error("context refresh failed");
-        },
+  test("namespaces cognition operation keys by frame while preserving provider call IDs", async () => {
+    const cognitionCalls: Array<{
+      readonly frameId: string;
+      readonly operation: string;
+      readonly operationKey: string;
+    }> = [];
+    const workspaceCapability = workspace({
+      applyCognitionWorkspaceTransition: async ({ operation, operationKey, workspace: context }) => {
+        cognitionCalls.push({
+          frameId: String(context.frameId),
+          operation,
+          operationKey: operationKey ?? "",
+        });
+        const workspaceRevision = cognitionCalls.length;
+        return {
+          result: { workspaceRevision },
+          cognition: { workspaceRevision },
+        };
       },
-    }));
-
-    expect(result.status).toBe("failed");
-    expect(result.code).toBe("provider_error");
-    expect(result.observations.map((observation) => observation.callId)).toEqual(["workspace-1", "core-1"]);
-  });
-  test("publishes host cognition context requirements after a successful task-transition CAS", async () => {
-    const requirement = {
-      ruleId: "rule-1",
-      source: "rule" as const,
-      packId: "pack-1",
-      revisionId: "revision-1",
-      digest: "a".repeat(64),
-      required: true,
-    };
-    const refreshed: unknown[] = [];
-    let round = 0;
-    const result = await runAgenticWorkPhase(baseOptions(async () => {
-      round += 1;
-      return round === 1
-        ? response("", [call("workspace_create_task", "workspace-transition", { taskId: "task-1", title: "Task", objective: "Exercise cognition refresh" })])
-        : response("", [complete("transition-complete")]);
+    });
+    let rootRound = 0;
+    const root = await runAgenticWorkPhase(baseOptions(async () => {
+      rootRound += 1;
+      return rootRound === 1
+        ? response("", [call("workspace_create_task", "call_1", {
+          taskId: "root-task",
+          title: "Root task",
+          objective: "Exercise frame-scoped cognition operation identity.",
+        })])
+        : response("", [complete("root-complete")]);
     }, {
-      workspace: workspace({
-        applyCognitionWorkspaceTransition: async () => ({
-          result: { ok: true },
-          cognition: { contextPackRequirements: [requirement] },
-        }),
-      }),
+      workspace: workspaceCapability,
       workspaceCapabilities: ["create_task"],
-      context: {
-        list: async () => ({ status: "success", toolName: "context_pack_list", data: [] }),
-        get: async () => ({ status: "success", toolName: "context_pack_get", data: {} }),
-        refreshContextCapability: (requirements) => {
-          refreshed.push(requirements);
-        },
-      },
     }));
+    expect(root.status).toBe("completed");
+    expect(root.observations.map((observation) => observation.callId)).toContain("call_1");
 
-    expect(result.status).toBe("completed");
-    expect(refreshed).toEqual([[requirement]]);
-  });
-  test("does not publish accepted completion context requirements before commit", async () => {
-    const requirement = {
-      ruleId: "rule-accepted",
-      source: "rule" as const,
-      packId: "pack-accepted",
-      revisionId: "revision-accepted",
-      digest: "b".repeat(64),
-      required: true,
-    };
-    const state = {
-      version: 1 as const,
-      workspaceRevision: 4,
-      activatedTemplateIds: [] as readonly string[],
-      activatedContextRuleIds: [] as readonly string[],
-      requiredTemplateIds: [] as readonly string[],
-      requiredContextRuleIds: [] as readonly string[],
-    };
-    const cognition = {
-      phase: "COMPLETE" as const,
-      state,
-      activation: {
-        point: "completion_fixed_point" as const,
-        state,
-        newlyActivatedTemplateIds: [],
-        newlyActivatedContextRuleIds: [],
-        newlyRequiredTemplateIds: [],
-        newlyRequiredContextRuleIds: [],
-      },
-      newlyActivatedContextPackRequirements: [],
-      contextPackRequirements: [requirement],
-      promptBlocks: { phase: "COMPLETE" as const, refs: [] },
-      sourceRevisions: { presetRevision: 1, blockRevisions: [] },
-      sourceDigest: "c".repeat(64),
-      workspaceRevision: 4,
-      accepted: true,
-      blockers: [],
-      blockingRequiredTaskIds: [],
-      materializedTaskIds: [],
-      preCommitActivations: [],
-    };
-    const refreshed: unknown[] = [];
-    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("accepted-context")]), {
-      workspace: workspace({
-        acceptCompletionFixedPoint: async () => ({
-          accepted: true,
-          workspaceRevision: 4,
-          cognition,
-          workspaceContextProjection: {
-            version: 1,
-            sourceWorkspaceRevision: 4,
-            mandatory: [],
-            optional: [],
-            omissions: [],
-            literal: "",
-            utf8Bytes: 0,
-          },
-        }),
-      }),
-      context: {
-        list: async () => ({ status: "success", toolName: "context_pack_list", data: [] }),
-        get: async () => ({ status: "success", toolName: "context_pack_get", data: {} }),
-        refreshContextCapability: (requirements) => {
-          refreshed.push(requirements);
+    const runChild = async (frameId: string, taskId: string): Promise<BoundedChildFrameOutcome> => {
+      const frame = createAgenticChildFrame({
+        frameId,
+        parentFrameId: "test-root",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        workspaceSharing: "root_only",
+        workspaceCapabilities: ["update_assigned_progress"],
+        taskId,
+        signal: new AbortController().signal,
+      });
+      let childRound = 0;
+      return executeBoundedAgenticChildFrame({
+        frame,
+        task: `Complete ${taskId}.`,
+        systemPrompt: "Use the assigned workspace tool.",
+        workspace: workspaceCapability,
+        dispatch: async () => {
+          childRound += 1;
+          return childRound === 1
+            ? response("", [call("workspace_update_assigned_progress", "call_1", { state: "active" })])
+            : response(`result-${taskId}`);
         },
-      },
-    }));
+      });
+    };
+    const firstChild = await runChild("child-one", "child-task-one");
+    const secondChild = await runChild("child-two", "child-task-two");
+    expect(firstChild.status).toBe("succeeded");
+    expect(secondChild.status).toBe("succeeded");
+    expect(firstChild.observations.map((observation) => observation.callId)).toEqual(["call_1"]);
+    expect(secondChild.observations.map((observation) => observation.callId)).toEqual(["call_1"]);
 
-    expect(result.status).toBe("completed");
-    expect(refreshed).toEqual([]);
+    expect(cognitionCalls.map(({ frameId, operation }) => ({ frameId, operation }))).toEqual([
+      { frameId: "test-root", operation: "create_task" },
+      { frameId: "child-one", operation: "update_assigned_progress" },
+      { frameId: "child-two", operation: "update_assigned_progress" },
+    ]);
+    expect(cognitionCalls.map(({ operationKey }) => operationKey)).toEqual([
+      'agentic-work:cognition:{"frameId":"test-root","operation":"create_task","providerCallId":"call_1"}',
+      'agentic-work:cognition:{"frameId":"child-one","operation":"update_assigned_progress","providerCallId":"call_1"}',
+      'agentic-work:cognition:{"frameId":"child-two","operation":"update_assigned_progress","providerCallId":"call_1"}',
+    ]);
+    expect(new Set(cognitionCalls.map(({ operationKey }) => operationKey)).size).toBe(3);
   });
 
   test("runs deterministic child descriptors in traversal order and substitutes bounded results once", async () => {
@@ -1463,7 +1513,7 @@ describe("Agentic WORK phase", () => {
       plan: childPlan,
       executeChild: async ({ descriptor, frame }) => {
         order.push(`${descriptor.childId}:${frame.connectionId}:${frame.model}:${frame.canComplete}`);
-        return descriptor.childId === "child-a" ? "A-RESULT" : "B-RESULT";
+        return { content: descriptor.childId === "child-a" ? "A-RESULT" : "B-RESULT", status: "succeeded" };
       },
       workspace: workspace(),
       workspaceCapabilities: [],
@@ -1650,6 +1700,98 @@ describe("Agentic WORK phase", () => {
     expect(visibleTools).not.toContain("agent_delegate");
   });
 
+  test("exposes and dispatches an authored child record_question grant", async () => {
+    const frame = createAgenticChildFrame({
+      frameId: "question-child-granted",
+      parentFrameId: "root",
+      connectionId: "concrete-connection",
+      model: "frozen-model",
+      coreToolIds: [],
+      workspaceCapabilities: ["record_question"],
+      taskId: "task-question",
+      signal: new AbortController().signal,
+    });
+    const root = composeAgenticWorkToolDefinitions({
+      coreToolIds: [],
+      workspaceCapabilities: ["record_question"],
+    });
+    expect(root.rootDefinitions.map((definition) => definition.name)).toContain("workspace_record_question");
+
+    let dispatches = 0;
+    let visibleTools: readonly string[] = [];
+    let executedOperation: string | undefined;
+    let executedArgs: Record<string, unknown> | undefined;
+    const result = await executeBoundedAgenticChildFrame({
+      frame,
+      task: "record the open question",
+      systemPrompt: "system",
+      dispatch: async ({ tools }) => {
+        dispatches += 1;
+        visibleTools = tools.map((definition) => definition.name);
+        return dispatches === 1
+          ? response("", [call("workspace_record_question", "record-question", { summary: "Need source evidence." })])
+          : response("done");
+      },
+      workspace: {
+        execute: async (operation, args) => {
+          executedOperation = operation;
+          executedArgs = args;
+          return { result: { accepted: true, workspaceRevision: 1 } };
+        },
+      },
+    });
+
+    expect(visibleTools).toContain("workspace_record_question");
+    expect(executedOperation).toBe("record_question");
+    expect(executedArgs).toMatchObject({
+      summary: "Need source evidence.",
+      taskId: "task-question",
+      actor: "child",
+      frameId: "question-child-granted",
+    });
+    expect(result).toMatchObject({
+      status: "succeeded",
+      content: "done",
+      workspaceRevision: 1,
+    });
+  });
+
+  test("denies record_question when a child grant is absent", async () => {
+    const frame = createAgenticChildFrame({
+      frameId: "question-child-denied",
+      parentFrameId: "root",
+      connectionId: "concrete-connection",
+      model: "frozen-model",
+      coreToolIds: [],
+      signal: new AbortController().signal,
+    });
+    let dispatches = 0;
+    let visibleTools: readonly string[] = [];
+    const result = await executeBoundedAgenticChildFrame({
+      frame,
+      task: "do not record an ungranted question",
+      systemPrompt: "system",
+      dispatch: async ({ tools }) => {
+        dispatches += 1;
+        visibleTools = tools.map((definition) => definition.name);
+        return dispatches === 1
+          ? response("", [call("workspace_record_question", "record-question-denied", { summary: "Should be rejected." })])
+          : response("done");
+      },
+    });
+
+    expect(visibleTools).not.toContain("workspace_record_question");
+    expect(result).toMatchObject({ status: "succeeded", content: "done" });
+    expect(result.observations).toEqual([
+      expect.objectContaining({
+        callId: "record-question-denied",
+        toolName: "workspace_record_question",
+        status: "rejected",
+        code: "tool_not_allowed",
+      }),
+    ]);
+  });
+
   test("places profile instructions after immutable host guidance in one system message", async () => {
     const frame = createAgenticChildFrame({
       frameId: "child-profile",
@@ -1724,67 +1866,6 @@ describe("Agentic WORK phase", () => {
     expect(dispatchCalls).toBe(0);
   });
 
-  test("accepts and bounds the frozen context pack snapshot without exposing it to the provider", async () => {
-    const snapshot = contextSnapshot("t".repeat(512), "d".repeat(8 * 1024));
-    const parsed = validateAgenticAssemblyPlan(plan({ contextPackSnapshot: snapshot }), HOST_PREPARATION_LIMITS_V1);
-    expect(parsed.contextPackSnapshot.candidates[0]?.label).toHaveLength(512);
-    expect(parsed.contextPackSnapshot.candidates[0]?.summary).toHaveLength(8 * 1024);
-
-    let providerMessages = "";
-    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
-      providerMessages = JSON.stringify(messages);
-      return response("", [complete("context-hidden")]);
-    }, {
-      plan: plan({ contextPackSnapshot: contextSnapshot("PRIVATE_CONTEXT_LABEL", "PRIVATE_CONTEXT_DESCRIPTION") }),
-      workspace: workspace(),
-      workspaceCapabilities: [],
-    }));
-    expect(result.status).toBe("completed");
-    expect(providerMessages).not.toContain("PRIVATE_CONTEXT_LABEL");
-    expect(providerMessages).not.toContain("PRIVATE_CONTEXT_DESCRIPTION");
-  });
-
-  test("rejects context pack label and description bytes above their independent caps", () => {
-    expect(() => validateAgenticAssemblyPlan(plan({
-      contextPackSnapshot: contextSnapshot("t".repeat(513), ""),
-    }), HOST_PREPARATION_LIMITS_V1)).toThrow();
-    expect(() => validateAgenticAssemblyPlan(plan({
-      contextPackSnapshot: contextSnapshot("title", "d".repeat(8 * 1024 + 1)),
-    }), HOST_PREPARATION_LIMITS_V1)).toThrow();
-  });
-
-  test("accepts compiler-legal JSON attachment revision identity under 256 bytes", () => {
-    const attachmentRevision = JSON.stringify([
-      "05577228-5311-4e03-8fab-754a63ea6bbb",
-      "ef3fe3b3-a1bc-4bff-b3a9-bc669034cde0",
-      1,
-      "chat",
-      "5136f8cd-3b41-4227-8793-ef51283a052b",
-      "bcf9c2ff-e03e-428e-b6e6-8d1bda85db21",
-      1787158127,
-      0,
-      0,
-      "active",
-    ]);
-    const revisionBytes = new TextEncoder().encode(attachmentRevision).length;
-    expect(revisionBytes).toBeGreaterThan(128);
-    expect(revisionBytes).toBeLessThanOrEqual(256);
-    const snapshot = contextSnapshot();
-    const withRevision = {
-      ...snapshot,
-      candidates: [{ ...snapshot.candidates[0]!, attachmentRevision }],
-      candidateInputRevisions: [{ ...snapshot.candidateInputRevisions[0]!, attachmentRevision }],
-    };
-    const parsed = validateAgenticAssemblyPlan(plan({ contextPackSnapshot: withRevision }), HOST_PREPARATION_LIMITS_V1);
-    expect(parsed.contextPackSnapshot.candidates[0]?.attachmentRevision).toBe(attachmentRevision);
-    expect(() => validateAgenticAssemblyPlan(plan({
-      contextPackSnapshot: {
-        ...withRevision,
-        candidates: [{ ...withRevision.candidates[0]!, attachmentRevision: "x".repeat(257) }],
-        candidateInputRevisions: [{ ...withRevision.candidateInputRevisions[0]!, attachmentRevision: "x".repeat(257) }],
-      },
-    }), HOST_PREPARATION_LIMITS_V1)).toThrow(/invalid context candidate/i);
-  });
 
 
   test("rejects an assembly plan that widens the trusted frozen limits", () => {
@@ -1838,7 +1919,7 @@ describe("Agentic WORK phase", () => {
       executeChild: async ({ frame, workspace: childWorkspace }) => {
         childFrames.push(frame.frameId);
         childWorkspaces.push(childWorkspace);
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
     }));
     expect(result.status).toBe("completed");
@@ -1885,7 +1966,7 @@ describe("Agentic WORK phase", () => {
       executeChild: async ({ descriptor, definitions }) => {
         childProfiles.push(descriptor.profileId);
         childToolNames.push(definitions.map((definition) => definition.name));
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
       inspection: {
         record: (kind, value) => {
@@ -1954,7 +2035,7 @@ describe("Agentic WORK phase", () => {
         }],
         executeChild: async ({ descriptor }) => {
           assignedChildIds.push(descriptor.childId);
-          return "child-result";
+          return { content: "child-result", status: "succeeded" };
         },
       }));
     };
@@ -2028,7 +2109,7 @@ describe("Agentic WORK phase", () => {
         }],
         executeChild: async ({ frame }) => {
           childFrames.push(frame.frameId);
-          return "child-result";
+        return { content: "child-result", status: "succeeded" };
         },
       }));
     };
@@ -2067,7 +2148,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         children += 1;
-        return "unexpected";
+        return { content: "unexpected", status: "succeeded" };
       },
     }));
 
@@ -2111,7 +2192,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         children += 1;
-        return "unexpected";
+        return { content: "unexpected", status: "succeeded" };
       },
     }));
 
@@ -2152,7 +2233,7 @@ describe("Agentic WORK phase", () => {
         }],
         executeChild: async () => {
           childCalls += 1;
-          return "unexpected";
+          return { content: "unexpected", status: "succeeded" };
         },
       }));
 
@@ -2205,7 +2286,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async ({ descriptor }) => {
         childTasks.push(descriptor.taskId ?? "");
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
     }));
 
@@ -2272,7 +2353,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         childCalls += 1;
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
     }));
 
@@ -2289,11 +2370,12 @@ describe("Agentic WORK phase", () => {
     expect(result.observations.every((item) => item.code !== "tool_not_allowed")).toBe(true);
   });
 
-  test("fails the turn after assigned children if workspace context refresh throws", async () => {
+  test("fails the turn after assigned children if workspace projection refresh throws", async () => {
     const assigned: string[] = [];
     let assignCalls = 0;
     let childCalls = 0;
     let projectionCalls = 0;
+    let settleCalls = 0;
     let providerRounds = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       providerRounds += 1;
@@ -2316,6 +2398,13 @@ describe("Agentic WORK phase", () => {
             workspaceRevision: 2,
             assignments,
           };
+        },
+        settleAssignedTask: async ({ taskId, state, signal }) => {
+          settleCalls += 1;
+          expect(taskId).toBe("task-1");
+          expect(state).toBe("failed");
+          expect(signal.aborted).toBe(false);
+          return { accepted: true, workspaceRevision: 3 };
         },
         projectContext: ({ expectedRevision }) => {
           projectionCalls += 1;
@@ -2340,7 +2429,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         childCalls += 1;
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
     }));
 
@@ -2351,6 +2440,7 @@ describe("Agentic WORK phase", () => {
     expect(childCalls).toBe(0);
     expect(providerRounds).toBe(1);
     expect(projectionCalls).toBe(2);
+    expect(settleCalls).toBe(1);
     expect(result.observations.find((item) => item.callId === "refresh-fail-delegate")).toBeUndefined();
   });
 
@@ -2397,7 +2487,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async ({ descriptor }) => {
         childTasks.push(descriptor.taskId ?? "");
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
     }));
 
@@ -2473,7 +2563,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async ({ descriptor }) => {
         childTasks.push(descriptor.taskId ?? "");
-        return "child-result";
+        return { content: "child-result", status: "succeeded" };
       },
     }));
 
@@ -2532,7 +2622,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         childCalls += 1;
-        return "unexpected";
+        return { content: "unexpected", status: "succeeded" };
       },
     }));
 
@@ -2868,7 +2958,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         childCalls += 1;
-        return "unexpected";
+        return { content: "unexpected", status: "succeeded" };
       },
     }));
     await started;
@@ -3254,7 +3344,13 @@ describe("Agentic WORK phase", () => {
     const recordFinding = composition.rootDefinitions.find((definition) => definition.name === "workspace_record_finding");
     expect(recordFinding?.parameters).toMatchObject({
       required: ["summary"],
-      properties: { summary: { type: "string" } },
+      properties: {
+        summary: { type: "string" },
+        taskId: {
+          type: ["string", "null"],
+          description: expect.stringContaining("Existing workspace task ID"),
+        },
+      },
     });
     expect(JSON.stringify(recordFinding?.parameters)).not.toContain("\"digest\"");
     expect(composition.childDefinitions.get("writer")?.map((definition) => definition.name)).toEqual([
@@ -3292,6 +3388,32 @@ describe("Agentic WORK phase", () => {
       callId: "recursive",
       status: "rejected",
       code: "tool_not_allowed",
+    });
+  });
+
+  test("preserves stable workspace failures instead of masking them as internal errors", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return round === 1
+        ? response("", [call("workspace_record_finding", "missing-record-task", {
+          summary: "bounded finding",
+          taskId: "missing-task",
+        })])
+        : response("", [complete()]);
+    }, {
+      workspaceCapabilities: ["record_finding"],
+      workspace: workspace({
+        execute: async () => {
+          throw Object.assign(new Error("task was not found"), { code: "not_found" });
+        },
+      }),
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(result.observations.find((item) => item.callId === "missing-record-task")).toMatchObject({
+      status: "error",
+      code: "not_found",
     });
   });
   test("rejects dynamic delegation grants wider than the host profile", async () => {
@@ -3358,7 +3480,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         children += 1;
-        return "unexpected";
+        return { content: "unexpected", status: "succeeded" };
       },
     }));
     expect(result.status).toBe("completed");
@@ -3379,6 +3501,8 @@ describe("Agentic WORK phase", () => {
       let assignmentFrameId = "";
       let childTaskId = "";
       let childAssignedTaskId = "";
+      const settlements: Array<{ readonly taskId: string; readonly frameId: string; readonly state: "cancelled" | "failed" }> = [];
+      const settlementKeys: string[] = [];
       const result = await runAgenticWorkPhase(baseOptions(async () => {
         round += 1;
         if (round === 1) {
@@ -3409,6 +3533,12 @@ describe("Agentic WORK phase", () => {
               assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
             };
           },
+          settleAssignedTask: async ({ taskId, frameId, state, operationKey, signal }) => {
+            settlements.push({ taskId, frameId, state });
+            settlementKeys.push(operationKey);
+            expect(signal.aborted).toBe(false);
+            return { accepted: true, workspaceRevision: 8 };
+          },
           freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
         }),
         delegatableProfiles: [{
@@ -3431,6 +3561,14 @@ describe("Agentic WORK phase", () => {
       expect(childTaskId).toBe(scenario.taskId);
       expect(childAssignedTaskId).toBe(scenario.taskId);
       expect(assignmentFrameId).toBeTruthy();
+      expect(settlements).toEqual([{
+        taskId: scenario.taskId,
+        frameId: assignmentFrameId,
+        state: "failed",
+      }]);
+      expect(settlementKeys).toEqual([
+        `agentic-work:settle-assigned-task:${JSON.stringify({ taskId: scenario.taskId, frameId: assignmentFrameId })}`,
+      ]);
       expect(result.childResults).toMatchObject([{
         required: scenario.required,
         status: "failed",
@@ -3452,6 +3590,596 @@ describe("Agentic WORK phase", () => {
         expect(round).toBe(2);
       }
     }
+  });
+  test("rejects legacy string child results for optional and required assigned tasks", async () => {
+    for (const scenario of [
+      { label: "required", rootFrameId: "turn-legacy-required", taskId: "turn-legacy-required:child", required: true },
+      { label: "optional", rootFrameId: "turn-legacy-optional", taskId: "turn-legacy-optional:child", required: false },
+    ] as const) {
+      let round = 0;
+      let assignedFrameId = "";
+      let settlementCalls = 0;
+      const result = await runAgenticWorkPhase(baseOptions(async () => {
+        round += 1;
+        return round === 1
+          ? response("", [call("agent_delegate", `${scenario.label}-legacy`, {
+            profile_id: "writer",
+            task_id: scenario.taskId,
+            task: "return a structured result",
+          })])
+          : response("", [complete(`${scenario.label}-legacy-complete`)]);
+      }, {
+        rootFrameId: scenario.rootFrameId,
+        workspace: workspace({
+          listOpenTasks: async () => [{
+            id: scenario.taskId,
+            state: "pending",
+            required: scenario.required,
+            assignedFrameId: assignedFrameId || null,
+          }],
+          assignChildTasks: async ({ assignments }) => {
+            const assignment = assignments[0];
+            if (!assignment) throw new Error("missing assignment");
+            assignedFrameId = assignment.frameId;
+            return { accepted: true, workspaceRevision: 1, assignments };
+          },
+          settleAssignedTask: async ({ frameId, state }) => {
+            expect(frameId).toBe(assignedFrameId);
+            expect(state).toBe("failed");
+            settlementCalls += 1;
+            return { accepted: true, workspaceRevision: 2 };
+          },
+        }),
+        delegatableProfiles: [{
+          profileId: "writer",
+          toolIds: ["chat_search_history"],
+          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+        }],
+        executeChild: async () => JSON.parse('"legacy-string"'),
+      }));
+
+      expect(settlementCalls).toBe(1);
+      expect(result.childResults).toMatchObject([{
+        required: scenario.required,
+        status: "failed",
+        errorCode: "provider_protocol_error",
+        outputBytes: 0,
+      }]);
+      if (scenario.required) {
+        expect(result).toMatchObject({ status: "failed", code: "provider_protocol_error" });
+      } else {
+        expect(result).toMatchObject({ status: "completed" });
+      }
+    }
+  });
+
+  test("downgrades provider success when the exact assigned task is failed or cancelled", async () => {
+    for (const terminalState of ["failed", "cancelled"] as const) {
+      const taskId = `mismatched-${terminalState}-task`;
+      let round = 0;
+      let assignedFrameId = "";
+      let settlementState = "";
+      const result = await runAgenticWorkPhase(baseOptions(async () => {
+        round += 1;
+        return round === 1
+          ? response("", [call("agent_delegate", `mismatched-${terminalState}`, {
+            profile_id: "writer",
+            task_id: taskId,
+            task: "submit the child result",
+          })])
+          : response("", [complete(`mismatched-${terminalState}-complete`)]);
+      }, {
+        rootFrameId: `turn-mismatched-${terminalState}`,
+        workspace: workspace({
+          listOpenTasks: async () => [{
+            id: taskId,
+            state: assignedFrameId ? terminalState : "pending",
+            required: true,
+            assignedFrameId: assignedFrameId || null,
+          }],
+          assignChildTasks: async ({ assignments }) => {
+            const assignment = assignments[0];
+            if (!assignment) throw new Error("missing assignment");
+            assignedFrameId = assignment.frameId;
+            return { accepted: true, workspaceRevision: 1, assignments };
+          },
+          settleAssignedTask: async ({ frameId, state }) => {
+            expect(frameId).toBe(assignedFrameId);
+            settlementState = state;
+            return { accepted: true, workspaceRevision: 2 };
+          },
+        }),
+        delegatableProfiles: [{
+          profileId: "writer",
+          toolIds: ["chat_search_history"],
+          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+        }],
+        executeChild: async () => ({
+          status: "succeeded",
+          content: "provider claimed completion",
+        }),
+      }));
+
+      expect(settlementState).toBe("failed");
+      expect(result).toMatchObject({ status: "failed", code: "child_required_failed" });
+      expect(result.childResults).toMatchObject([{
+        required: true,
+        status: "failed",
+        errorCode: "child_required_failed",
+        outputBytes: 0,
+      }]);
+    }
+  });
+
+  test("retries a transient child settlement failure and accepts the durable retry", async () => {
+    const taskId = "settlement-retry-task";
+    let round = 0;
+    let assignedFrameId = "";
+    let settlementCalls = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return round === 1
+        ? response("", [call("agent_delegate", "settlement-retry", {
+          profile_id: "writer",
+          task_id: taskId,
+          task: "retry settlement",
+        })])
+        : response("", [complete("settlement-retry-complete")]);
+    }, {
+      rootFrameId: "turn-settlement-retry",
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: taskId,
+          state: "pending",
+          required: false,
+          assignedFrameId: assignedFrameId || null,
+        }],
+        assignChildTasks: async ({ assignments }) => {
+          const assignment = assignments[0];
+          if (!assignment) throw new Error("missing assignment");
+          assignedFrameId = assignment.frameId;
+          return { accepted: true, workspaceRevision: 1, assignments };
+        },
+        settleAssignedTask: async ({ frameId, state }) => {
+          expect(frameId).toBe(assignedFrameId);
+          expect(state).toBe("failed");
+          settlementCalls += 1;
+          if (settlementCalls === 1) {
+            throw Object.assign(new Error("transient settlement failure"), { code: "stale_revision" });
+          }
+          return { accepted: true, workspaceRevision: 2 };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "provider_error",
+      }),
+    }));
+
+    expect(settlementCalls).toBe(2);
+    expect(result).toMatchObject({ status: "completed" });
+    expect(result.childResults).toMatchObject([{
+      status: "failed",
+      errorCode: "provider_error",
+      outputBytes: 0,
+    }]);
+  });
+
+  test("bounds parent cancellation when child assignment ignores the abort signal", async () => {
+    const controller = new AbortController();
+    let assignmentStarted!: () => void;
+    const started = new Promise<void>((resolve) => { assignmentStarted = resolve; });
+    const run = runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "ignored-assignment-abort", {
+        profile_id: "writer",
+        task_id: "ignored-assignment-abort-task",
+        task: "ignore cancellation",
+      }),
+    ]), {
+      signal: controller.signal,
+      deadlineAt: Date.now() + 250,
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: "ignored-assignment-abort-task",
+          state: "pending",
+          required: true,
+          assignedFrameId: null,
+        }],
+        assignChildTasks: async () => {
+          assignmentStarted();
+          await new Promise<void>(() => {});
+          return { accepted: true, workspaceRevision: 1, assignments: [] };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({ content: "", status: "succeeded" }),
+    }));
+    await started;
+    controller.abort(new DOMException("cancel", "AbortError"));
+    const result = await run;
+    expect(result).toMatchObject({ status: "cancelled", code: "cancelled" });
+  });
+
+  test("surfaces delegated settlement failure after abort with an independent signal", async () => {
+    const controller = new AbortController();
+    const settlementFailure = new Error("durable settlement rejected");
+    let assignedTaskId = "";
+    let assignedFrameId = "";
+    let settlementCalls = 0;
+    const settlementAbortedAtInvocation: boolean[] = [];
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "abort-settlement-delegate", {
+        profile_id: "writer",
+        task_id: "abort-settlement-task",
+        task: "abort this assigned child",
+      }),
+    ]), {
+      rootFrameId: "turn-abort-settlement",
+      signal: controller.signal,
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: "abort-settlement-task",
+          state: "pending",
+          required: true,
+          assignedFrameId: null,
+        }],
+        assignChildTasks: async ({ assignments }) => {
+          const assignment = assignments[0];
+          if (!assignment) throw new Error("missing assignment");
+          assignedTaskId = assignment.taskId;
+          assignedFrameId = assignment.frameId;
+          return {
+            accepted: true,
+            workspaceRevision: 7,
+            assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
+          };
+        },
+        settleAssignedTask: async ({ taskId, frameId, state, signal }) => {
+          settlementCalls += 1;
+          expect(taskId).toBe(assignedTaskId);
+          expect(frameId).toBe(assignedFrameId);
+          settlementAbortedAtInvocation.push(signal.aborted);
+          expect(signal.aborted).toBe(false);
+          throw settlementFailure;
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async ({ frame, descriptor }) => {
+        expect(frame.assignedTaskId).toBe("abort-settlement-task");
+        expect(descriptor.taskId).toBe("abort-settlement-task");
+        controller.abort(new DOMException("run abort", "AbortError"));
+        throw controller.signal.reason;
+      },
+    }));
+
+    expect(assignedTaskId).toBe("abort-settlement-task");
+    expect(assignedFrameId).toBeTruthy();
+    expect(settlementCalls).toBe(1);
+    expect(settlementAbortedAtInvocation).toEqual([false]);
+    expect(result).toMatchObject({
+
+      status: "failed",
+      code: "internal_error",
+    });
+    expect(result.status).not.toBe("cancelled");
+  });
+  test("attempts every assigned cleanup after the first settlement rejects", async () => {
+    const controller = new AbortController();
+    const settlements: Array<{ readonly taskId: string; readonly frameId: string; readonly state: string; readonly aborted: boolean }> = [];
+    let childCalls = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "cleanup-first", {
+        profile_id: "writer",
+        task_id: "cleanup-task-1",
+        task: "first child",
+      }),
+      call("agent_delegate", "cleanup-second", {
+        profile_id: "writer",
+        task_id: "cleanup-task-2",
+        task: "second child",
+      }),
+    ]), {
+      signal: controller.signal,
+      rootFrameId: "turn-cleanup-all",
+      workspace: workspace({
+        listOpenTasks: async () => [
+          { id: "cleanup-task-1", state: "pending", required: true, assignedFrameId: null },
+          { id: "cleanup-task-2", state: "pending", required: true, assignedFrameId: null },
+        ],
+        assignChildTasks: async ({ assignments }) => ({
+          accepted: true,
+          workspaceRevision: 1,
+          assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
+        }),
+        settleAssignedTask: async ({ taskId, frameId, state, signal }) => {
+          settlements.push({ taskId, frameId, state, aborted: signal.aborted });
+          if (taskId === "cleanup-task-1") throw new Error("first cleanup failed");
+          return { accepted: true, workspaceRevision: 2 };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async ({ descriptor }) => {
+        childCalls += 1;
+        if (descriptor.taskId === "cleanup-task-1") {
+          controller.abort(new DOMException("cancel", "AbortError"));
+          throw controller.signal.reason;
+        }
+        return { content: "unexpected", status: "succeeded" };
+      },
+    }));
+    expect(childCalls).toBe(1);
+    expect(settlements).toHaveLength(2);
+    expect(settlements.every(({ aborted }) => !aborted)).toBe(true);
+    expect(settlements.map(({ taskId }) => taskId)).toEqual([
+      "cleanup-task-1",
+      "cleanup-task-2",
+    ]);
+    expect(result).toMatchObject({ status: "failed", code: "internal_error" });
+  });
+
+  test("settles a required delegated failure before running recovery and returns the original failure", async () => {
+    const normalInstruction = phaseRef("delegation-failure-phase", 0);
+    const recoveryInstruction = phaseRef("delegation-recovery-phase", 1);
+    const transitions: Record<string, CognitionTaskTransition> = {};
+    const settlementFrames: string[] = [];
+    let completionCalls = 0;
+    let workspaceRevision = 4;
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ tools }) => {
+      dispatchCount += 1;
+      expect(tools.map((tool) => tool.name)).toContain("complete_turn");
+      if (dispatchCount === 1) {
+        return response("", [call("agent_delegate", "required-recovery-delegate", {
+          profile_id: "writer",
+          task_id: "required-recovery-task",
+          task: "required child",
+        })]);
+      }
+      return response("", [complete(`required-recovery-complete-${dispatchCount}`)]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("delegation-failure-phase", ["delegation", "workspace_write"], {
+            exit: { kind: "task_transition", taskId: "required-recovery-task", transition: "failed" },
+            nextPhaseIds: ["delegation-recovery-phase"],
+            instructionRefs: [normalInstruction],
+          }),
+          customPhase("delegation-recovery-phase", [], {
+            enter: { kind: "task_transition", taskId: "required-recovery-task", transition: "failed" },
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [recoveryInstruction],
+          }),
+        ]),
+        loomBlocks: [
+          phaseBlock(normalInstruction, "DELEGATION_FAILURE_INSTRUCTION"),
+          phaseBlock(recoveryInstruction, "DELEGATION_RECOVERY_INSTRUCTION"),
+        ],
+      }),
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: "required-recovery-task",
+          state: "pending",
+          required: true,
+          assignedFrameId: null,
+        }],
+        assignChildTasks: async ({ assignments }) => ({
+          accepted: true,
+          workspaceRevision,
+          assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
+        }),
+        settleAssignedTask: async ({ taskId, frameId, state }) => {
+          settlementFrames.push(frameId);
+          transitions[taskId] = state;
+          workspaceRevision += 1;
+          return { accepted: true, workspaceRevision };
+        },
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(workspaceRevision, transitions),
+        getCompletionGates: async () => ({
+          workspaceRevision,
+          requiredOpenTasks: 1,
+          canComplete: false,
+        }),
+        freezeForCompletion: async ({ expectedRevision }) => {
+          completionCalls += 1;
+          return {
+            accepted: false,
+            workspaceRevision: expectedRevision ?? workspaceRevision,
+            code: "completion_blocked",
+          };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "provider_error",
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+      phaseAdmittedCapabilities: ["delegation", "workspace_write"],
+    }));
+    expect(settlementFrames).toHaveLength(1);
+    expect(transitions["required-recovery-task"]).toBe("failed");
+    expect(dispatchCount).toBe(3);
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("child_required_failed");
+    expect(completionCalls).toBe(0);
+    expect(result.observations.find((observation) => (
+      observation.callId === "required-recovery-complete-2"
+    ))?.status).not.toBe("accepted");
+    expect(result.observations.find((observation) => (
+      observation.callId === "required-recovery-complete-3"
+    ))?.status).not.toBe("accepted");
+  });
+  test("keeps required child causal failure authoritative over later cancellation or timeout", async () => {
+    for (const scenario of [
+      { label: "cancelled", signalReason: "cancelled" },
+      { label: "timed_out", signalReason: "timed_out" },
+    ] as const) {
+      const controller = new AbortController();
+      const instruction = phaseRef(`required-${scenario.label}-instruction`);
+      const taskId = `required-${scenario.label}-task`;
+      let dispatchCount = 0;
+      const result = await runAgenticWorkPhase(baseOptions(async () => {
+        dispatchCount += 1;
+        if (dispatchCount === 1) {
+          return response("", [call("agent_delegate", `required-${scenario.label}-delegate`, {
+            profile_id: "writer",
+            task_id: taskId,
+            task: "required child",
+          })]);
+        }
+        controller.abort(scenario.signalReason);
+        throw controller.signal.reason;
+      }, {
+        rootFrameId: `turn-required-${scenario.label}-precedence`,
+        signal: controller.signal,
+        plan: plan({
+          customPhasePlan: compileAgentRuntimePhases([
+            customPhase(`required-${scenario.label}-phase`, ["delegation", "workspace_write"], {
+              exit: { kind: "phase", value: "COMPLETE" },
+              instructionRefs: [instruction],
+            }),
+          ]),
+          loomBlocks: [phaseBlock(instruction, "Required child precedence test.")],
+        }),
+        workspace: workspace({
+          listOpenTasks: async () => [{
+            id: taskId,
+            state: "pending",
+            required: true,
+            assignedFrameId: null,
+          }],
+          assignChildTasks: async ({ assignments }) => ({
+            accepted: true,
+            workspaceRevision: 1,
+            assignments: assignments.map(({ taskId: assignedTaskId, frameId }) => ({ taskId: assignedTaskId, frameId })),
+          }),
+          getPhaseEvaluationSnapshot: async () => phaseSnapshot(1),
+          settleAssignedTask: async ({ taskId: settledTaskId, state }) => {
+            expect(settledTaskId).toBe(taskId);
+            expect(state).toBe("failed");
+            return { accepted: true, workspaceRevision: 2 };
+          },
+        }),
+        delegatableProfiles: [{
+          profileId: "writer",
+          toolIds: ["chat_search_history"],
+          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+        }],
+        executeChild: async () => ({
+          status: "failed",
+          content: "",
+          errorCode: "provider_error",
+        }),
+        phaseEvaluationContext: phaseContext(),
+        phaseRevision: 4,
+        phaseAdmittedCapabilities: ["delegation", "workspace_write"],
+      }));
+      expect(dispatchCount).toBe(2);
+      expect(result).toMatchObject({ status: "failed", code: "provider_error" });
+    }
+  });
+  test("preserves a required delegated failure when recovery exhausts provider rounds", async () => {
+    const normalInstruction = phaseRef("delegation-budget-failure-phase", 0);
+    const recoveryInstruction = phaseRef("delegation-budget-recovery-phase", 1);
+    const transitions: Record<string, CognitionTaskTransition> = {};
+    let workspaceRevision = 4;
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      dispatchCount += 1;
+      if (dispatchCount === 1) {
+        return response("", [call("agent_delegate", "required-budget-delegate", {
+          profile_id: "writer",
+          task_id: "required-budget-task",
+          task: "required child",
+        })]);
+      }
+      return response("recovery remains in progress");
+    }, {
+      budget: { maxProviderRounds: 2 },
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("delegation-budget-failure-phase", ["delegation", "workspace_write"], {
+            exit: { kind: "task_transition", taskId: "required-budget-task", transition: "failed" },
+            nextPhaseIds: ["delegation-budget-recovery-phase"],
+            instructionRefs: [normalInstruction],
+          }),
+          customPhase("delegation-budget-recovery-phase", [], {
+            enter: { kind: "task_transition", taskId: "required-budget-task", transition: "failed" },
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [recoveryInstruction],
+          }),
+        ]),
+        loomBlocks: [
+          phaseBlock(normalInstruction, "DELEGATION_BUDGET_FAILURE_INSTRUCTION"),
+          phaseBlock(recoveryInstruction, "DELEGATION_BUDGET_RECOVERY_INSTRUCTION"),
+        ],
+      }),
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: "required-budget-task",
+          state: "pending",
+          required: true,
+          assignedFrameId: null,
+        }],
+        assignChildTasks: async ({ assignments }) => ({
+          accepted: true,
+          workspaceRevision,
+          assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
+        }),
+        settleAssignedTask: async ({ taskId, state }) => {
+          transitions[taskId] = state;
+          workspaceRevision += 1;
+          return { accepted: true, workspaceRevision };
+        },
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(workspaceRevision, transitions),
+        getCompletionGates: async () => ({
+          workspaceRevision,
+          requiredOpenTasks: 1,
+          canComplete: false,
+        }),
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "provider_error",
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+      phaseAdmittedCapabilities: ["delegation", "workspace_write"],
+    }));
+    expect(dispatchCount).toBe(2);
+    expect(transitions["required-budget-task"]).toBe("failed");
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("child_required_failed");
   });
   test("does not resolve an authored task alias against a scoped operational inventory", async () => {
     let round = 0;
@@ -3491,7 +4219,7 @@ describe("Agentic WORK phase", () => {
       }],
       executeChild: async () => {
         children += 1;
-        return "unexpected";
+        return { content: "unexpected", status: "succeeded" };
       },
     }));
     expect(result.status).toBe("completed");
@@ -3502,6 +4230,33 @@ describe("Agentic WORK phase", () => {
       code: "not_found",
     });
   });
+  test("reports the rejected required phase entry condition", async () => {
+    let dispatches = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      dispatches += 1;
+      return response("", [complete("unexpected")]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("assemble-only", [], {
+            enter: { kind: "phase", value: "ASSEMBLE" },
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async ({ expectedRevision }) => phaseSnapshot(expectedRevision ?? 0),
+      }),
+      phaseEvaluationContext: phaseContext(),
+    }));
+
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("invalid_plan");
+    expect(result.errorMessage).toBe(
+      "required phase condition not met path=customPhasePlan.phases[0].enter",
+    );
+    expect(dispatches).toBe(0);
+  });
+
   test("drains skipped phases before exposing next phase material and grants", async () => {
     const skippedRef = phaseRef("skipped-first", 0);
     const enteredRef = phaseRef("entered-second", 1);
@@ -3614,6 +4369,52 @@ describe("Agentic WORK phase", () => {
     expect(requests[0]?.tools).not.toContain("agent_delegate");
   });
 
+  test("cancels a stalled Council before root provider dispatch", async () => {
+    const controller = new AbortController();
+    let councilStarted!: () => void;
+    const started = new Promise<void>((resolve) => { councilStarted = resolve; });
+    const stalledCouncil = new Promise<WorkCouncilExecutionResult>(() => {});
+    const progressEvents: Array<{ operation: string; lifecycle: string; provider: string | null; connectionLabel: string | null; model: string }> = [];
+    let councilCalls = 0;
+    let rootDispatches = 0;
+    const run = runAgenticWorkPhase(baseOptions(async () => {
+      rootDispatches += 1;
+      return response("", [complete("unexpected-root-dispatch")]);
+    }, {
+      signal: controller.signal,
+      phaseAdmittedCapabilities: ["council"],
+      onProgress: ({ provider }) => {
+        if (provider) progressEvents.push(provider);
+      },
+      council: {
+        required: true,
+        provider: "Deepseek",
+        connectionLabel: "council-connection",
+        model: "deepseek-v4-flash",
+        invoke: async () => {
+          councilCalls += 1;
+          councilStarted();
+          return stalledCouncil;
+        },
+      },
+    }));
+    await started;
+    controller.abort(new DOMException("stop", "AbortError"));
+    const result = await run;
+    expect(result).toMatchObject({ status: "cancelled", code: "cancelled" });
+    expect(councilCalls).toBe(1);
+    expect(rootDispatches).toBe(0);
+    expect(progressEvents.map(({ operation, lifecycle }) => operation + ":" + lifecycle)).toEqual([
+      "council:started",
+      "council:waiting",
+      "council:cancelled",
+    ]);
+    expect(progressEvents[0]).toMatchObject({
+      provider: "Deepseek",
+      connectionLabel: "council-connection",
+      model: "deepseek-v4-flash",
+    });
+  });
   test("invokes Council once per entered checkpoint and clears it before later phases", async () => {
     const firstRef = phaseRef("council-phase-one", 0);
     const secondRef = phaseRef("council-phase-two", 1);
@@ -3772,14 +4573,14 @@ describe("Agentic WORK phase", () => {
       .filter((entry): entry is Record<string, unknown> => entry !== null);
     expect(evidence).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        phaseId: "editor-default-phase",
+        phaseId: "editor_default_phase",
         checkpoint: "entry",
         revision: 4,
         condition: "true",
         status: "entered",
       }),
       expect.objectContaining({
-        phaseId: "editor-default-phase",
+        phaseId: "editor_default_phase",
         checkpoint: "exit",
         revision: 4,
         condition: "true",
@@ -3854,10 +4655,7 @@ describe("Agentic WORK phase", () => {
           workspaceRevision.value += 1;
           return {
             result: { accepted: true },
-            cognition: {
-              workspaceRevision: workspaceRevision.value,
-              contextPackRequirements: [],
-            },
+            cognition: { workspaceRevision: workspaceRevision.value },
           };
         },
         freezeForCompletion: async ({ expectedRevision }) => ({
@@ -3882,12 +4680,31 @@ describe("Agentic WORK phase", () => {
     expect(result.status).toBe("completed");
     expect(transitionCalls).toBe(1);
     expect(dispatches).toHaveLength(4);
-    expect(dispatches[0]?.messages).toContain("LIVE_TASK_PHASE_INSTRUCTION");
+    const messageSequences = dispatches.map(({ messages }) => JSON.parse(messages) as readonly LlmMessage[]);
+    const phaseInstructions = (messages: readonly LlmMessage[]): string[] => messages
+      .filter((message) => message.role === "system" && typeof message.content === "string")
+      .map((message) => message.content as string)
+      .filter((content) => content.includes("_INSTRUCTION"));
+    expect(messageSequences[0]).toHaveLength(2);
+    expect(phaseInstructions(messageSequences[0]!)).toEqual(["LIVE_TASK_PHASE_INSTRUCTION"]);
     expect(dispatches[0]?.tools).toEqual(["complete_turn", "workspace_accept_submission"]);
+    expect(phaseInstructions(messageSequences[1]!)).toEqual(["LIVE_TASK_PHASE_INSTRUCTION"]);
     expect(dispatches[1]?.tools).toEqual(["complete_turn", "workspace_accept_submission"]);
-    expect(dispatches[2]?.messages).toContain("LIVE_TASK_PHASE_INSTRUCTION");
-    expect(dispatches[3]?.messages).toContain("AFTER_LIVE_TASK_INSTRUCTION");
+    expect(phaseInstructions(messageSequences[2]!)).toEqual(["LIVE_TASK_PHASE_INSTRUCTION"]);
+    expect(phaseInstructions(messageSequences[3]!)).toEqual(["AFTER_LIVE_TASK_INSTRUCTION"]);
     expect(dispatches[3]?.tools).toEqual(["complete_turn", "workspace_read_section"]);
+    const transitionAssistantIndex = messageSequences[3]!.findIndex((message) =>
+      message.role === "assistant"
+      && Array.isArray(message.content)
+      && message.content.some((part) => part.type === "tool_use" && part.id === "live-task-complete-3"),
+    );
+    const transitionResultIndex = transitionAssistantIndex + 1;
+    const nextPhaseInstructionIndex = messageSequences[3]!.findIndex((message) =>
+      message.role === "system"
+      && message.content === "AFTER_LIVE_TASK_INSTRUCTION");
+    expect(transitionAssistantIndex).toBeGreaterThanOrEqual(0);
+    expect(messageSequences[3]?.[transitionResultIndex]?.role).toBe("user");
+    expect(nextPhaseInstructionIndex).toBe(transitionResultIndex + 1);
     expect(snapshots).toEqual([
       {
         phase: "WORK",
@@ -3937,33 +4754,639 @@ describe("Agentic WORK phase", () => {
       .filter((entry): entry is Record<string, unknown> => entry !== null);
     expect(evidence).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        phaseId: "live-task-phase",
+        phaseId: "live_task_phase",
         checkpoint: "exit",
         revision: 4,
         condition: "false",
         status: "repeated",
       }),
       expect.objectContaining({
-        phaseId: "live-task-phase",
+        phaseId: "live_task_phase",
         checkpoint: "exit",
         revision: 5,
         condition: "true",
         status: "advanced",
       }),
       expect.objectContaining({
-        phaseId: "after-live-task",
+        phaseId: "after_live_task",
         checkpoint: "entry",
         revision: 5,
         condition: "true",
         status: "entered",
       }),
       expect.objectContaining({
-        phaseId: "after-live-task",
+        phaseId: "after_live_task",
         checkpoint: "exit",
         revision: 5,
         condition: "true",
         status: "completed",
       }),
     ]));
+  });
+  test("reconciles a durably committed assignment after the adapter rejects a post-commit timeout", async () => {
+    const controller = new AbortController();
+    let durable = false;
+    let assigned: { readonly taskId: string; readonly frameId: string } | undefined;
+    let childCalls = 0;
+    const readAbortedAtInvocation: boolean[] = [];
+    const settlements: Array<{ readonly taskId: string; readonly frameId: string; readonly state: string; readonly aborted: boolean }> = [];
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "post-commit-timeout", {
+        profile_id: "writer",
+        task_id: "post-commit-task",
+        task: "reconcile this committed task",
+      }),
+    ]), {
+      rootFrameId: "turn-post-commit-timeout",
+      signal: controller.signal,
+      workspace: workspace({
+        execute: async (operation, _args, context) => {
+          expect(operation).toBe("read_section");
+          readAbortedAtInvocation.push(context.signal.aborted);
+          return {
+            result: {
+              workspace: { revision: durable ? 7 : 0 },
+              items: [{
+                id: "post-commit-task",
+                state: "pending",
+                assignedFrameId: durable ? assigned?.frameId ?? null : null,
+              }],
+              total: 1,
+            },
+          };
+        },
+        assignChildTasks: async ({ assignments }) => {
+          assigned = assignments[0];
+          if (!assigned) throw new Error("missing assignment");
+          durable = true;
+          controller.abort(new Error("timed_out"));
+          throw new Error("adapter observed timeout after durable commit");
+        },
+        settleAssignedTask: async ({ taskId, frameId, state, signal }) => {
+          settlements.push({ taskId, frameId, state, aborted: signal.aborted });
+          return { accepted: true, workspaceRevision: 8 };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => {
+        childCalls += 1;
+        return { content: "unexpected", status: "succeeded" };
+      },
+    }));
+
+    expect(durable).toBe(true);
+    expect(assigned).toMatchObject({ taskId: "post-commit-task" });
+    expect(childCalls).toBe(0);
+    expect(readAbortedAtInvocation.length).toBeGreaterThanOrEqual(2);
+    expect(readAbortedAtInvocation.at(-1)).toBe(false);
+    expect(settlements).toEqual([{
+      taskId: "post-commit-task",
+      frameId: assigned!.frameId,
+      state: "failed",
+      aborted: false,
+    }]);
+    expect(result).toMatchObject({ status: "timed_out", code: "timed_out" });
+  });
+
+  test("does not settle a terminal-success sibling during timeout cleanup", async () => {
+    const controller = new AbortController();
+    const assignments: Array<{ readonly taskId: string; readonly frameId: string }> = [];
+    const settlements: Array<{ readonly taskId: string; readonly frameId: string; readonly state: string; readonly aborted: boolean }> = [];
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "completed-sibling", {
+        profile_id: "writer",
+        task_id: "completed-sibling-task",
+        task: "already completed sibling",
+      }),
+      call("agent_delegate", "timed-out-child", {
+        profile_id: "writer",
+        task_id: "timed-out-task",
+        task: "child that times out",
+      }),
+    ]), {
+      rootFrameId: "turn-timeout-cleanup-conflict",
+      signal: controller.signal,
+      workspace: workspace({
+        listOpenTasks: async () => [
+          { id: "completed-sibling-task", state: "pending", assignedFrameId: null },
+          { id: "timed-out-task", state: "pending", assignedFrameId: null },
+        ],
+        execute: async () => ({
+          result: {
+            workspace: { revision: 2 },
+            items: [
+              {
+                id: "completed-sibling-task",
+                state: "completed",
+                assignedFrameId: assignments.find(({ taskId }) => taskId === "completed-sibling-task")?.frameId ?? null,
+              },
+              {
+                id: "timed-out-task",
+                state: "active",
+                assignedFrameId: assignments.find(({ taskId }) => taskId === "timed-out-task")?.frameId ?? null,
+              },
+            ],
+            total: 2,
+          },
+        }),
+        assignChildTasks: async ({ assignments: requested }) => {
+          assignments.push(...requested);
+          return {
+            accepted: true,
+            workspaceRevision: 1,
+            assignments: requested.map(({ taskId, frameId }) => ({ taskId, frameId })),
+          };
+        },
+        settleAssignedTask: async ({ taskId, frameId, state, signal }) => {
+          settlements.push({ taskId, frameId, state, aborted: signal.aborted });
+          if (taskId === "completed-sibling-task") {
+            throw Object.assign(new Error("completed sibling task_assignment_conflict"), { code: "task_assignment_conflict" });
+          }
+          throw new Error("timed-out settlement rejected");
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async ({ descriptor }) => {
+        if (descriptor.taskId === "completed-sibling-task") {
+          return { status: "succeeded", content: "already submitted", workspaceRevision: 2 };
+        }
+        controller.abort(new Error("timed_out"));
+        throw controller.signal.reason;
+      },
+    }));
+
+    const timedOutAssignment = assignments.find(({ taskId }) => taskId === "timed-out-task");
+    if (!timedOutAssignment) throw new Error("timed-out assignment was not recorded");
+    expect(assignments).toHaveLength(2);
+    expect(settlements).toEqual([{
+      taskId: "timed-out-task",
+      frameId: timedOutAssignment.frameId,
+      state: "failed",
+      aborted: false,
+    }]);
+    expect(settlements.every(({ aborted }) => !aborted)).toBe(true);
+    expect(result).toMatchObject({
+      status: "timed_out",
+      code: "timed_out",
+      errorMessage: expect.stringContaining("Child task settlement failed"),
+    });
+  });
+  test("fails a provider success that omits the canonical child submission", async () => {
+    const taskId = "missing-submission-task";
+    let assignedFrameId = "";
+    const settlements: Array<{ readonly taskId: string; readonly frameId: string; readonly state: string }> = [];
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "missing-submission", {
+        profile_id: "writer",
+        task_id: taskId,
+        task: "submit the child result",
+      }),
+    ]), {
+      rootFrameId: "turn-missing-submission",
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: taskId,
+          state: "active",
+          required: true,
+          assignedFrameId: null,
+        }],
+        execute: async (operation) => {
+          expect(operation).toBe("read_section");
+          return {
+            result: {
+              workspace: { revision: 1 },
+              items: [{
+                id: taskId,
+                state: "active",
+                required: true,
+                assignedFrameId,
+              }],
+              total: 1,
+            },
+          };
+        },
+        assignChildTasks: async ({ assignments }) => {
+          const assignment = assignments[0];
+          if (!assignment) throw new Error("missing assignment");
+          assignedFrameId = assignment.frameId;
+          return { accepted: true, workspaceRevision: 1, assignments };
+        },
+        settleAssignedTask: async ({ taskId: settledTaskId, frameId, state }) => {
+          settlements.push({ taskId: settledTaskId, frameId, state });
+          return { accepted: true, workspaceRevision: 2 };
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "succeeded",
+        content: "provider claimed success without submission",
+      }),
+    }));
+
+    expect(result).toMatchObject({ status: "failed", code: "child_required_failed" });
+    expect(result.childResults).toMatchObject([{
+      required: true,
+      status: "failed",
+      errorCode: "child_required_failed",
+      outputBytes: 0,
+    }]);
+    expect(settlements).toEqual([{
+      taskId,
+      frameId: assignedFrameId,
+      state: "failed",
+    }]);
+  });
+
+  test("reconciles a durable assignment after a non-abort post-commit adapter throw", async () => {
+    const taskId = "post-commit-throw-task";
+    let durable = false;
+    let assigned: { readonly taskId: string; readonly frameId: string } | undefined;
+    let readCount = 0;
+    let round = 0;
+    const settlements: string[] = [];
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return round === 1
+        ? response("", [call("agent_delegate", "post-commit-throw", {
+          profile_id: "writer",
+          task_id: taskId,
+          task: "reconcile this assignment",
+        })])
+        : response("", [complete("post-commit-throw-complete")]);
+    }, {
+      rootFrameId: "turn-post-commit-throw",
+      workspace: workspace({
+        execute: async (operation) => {
+          expect(operation).toBe("read_section");
+          readCount += 1;
+          return {
+            result: {
+              workspace: { revision: durable ? 6 : 0 },
+              items: [{
+                id: taskId,
+                state: "pending",
+                assignedFrameId: durable ? assigned?.frameId ?? null : null,
+              }],
+              total: 1,
+            },
+          };
+        },
+        assignChildTasks: async ({ assignments }) => {
+          assigned = assignments[0];
+          if (!assigned) throw new Error("missing assignment");
+          durable = true;
+          throw new Error("adapter threw after durable commit");
+        },
+        settleAssignedTask: async ({ taskId: settledTaskId, frameId, state }) => {
+          settlements.push(`${settledTaskId}:${frameId}:${state}`);
+          return { accepted: true, workspaceRevision: 7 };
+        },
+        freezeForCompletion: async ({ expectedRevision }) => ({
+          accepted: true,
+          workspaceRevision: expectedRevision ?? 7,
+        }),
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "provider_error",
+      }),
+    }));
+
+    expect(durable).toBe(true);
+    expect(assigned).toMatchObject({ taskId });
+    expect(readCount).toBeGreaterThanOrEqual(2);
+    expect(round).toBe(2);
+    expect(settlements).toEqual([`${taskId}:${assigned!.frameId}:failed`]);
+    expect(result.status).toBe("completed");
+  });
+  test("reconciles durably committed assignments spanning task pages at one revision", async () => {
+    const taskIds = ["paged-task-one", "paged-task-two"] as const;
+    const assigned: Array<{ readonly taskId: string; readonly frameId: string }> = [];
+    const pageReads: number[] = [];
+    let durable = false;
+    let round = 0;
+    let childCalls = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return round === 1
+        ? response("", [
+          call("agent_delegate", "paged-one", {
+            profile_id: "writer",
+            task_id: taskIds[0],
+            task: "first paged child",
+          }),
+          call("agent_delegate", "paged-two", {
+            profile_id: "writer",
+            task_id: taskIds[1],
+            task: "second paged child",
+          }),
+        ])
+        : response("", [complete("paged-recovery-complete")]);
+    }, {
+      rootFrameId: "turn-paged-recovery",
+      workspace: workspace({
+        execute: async (operation, args) => {
+          expect(operation === "read_section" || operation === "read_page").toBe(true);
+          const page = typeof args.page === "number" ? args.page : 0;
+          pageReads.push(page);
+          const frameFor = (taskId: string): string | null => durable
+            ? assigned.find((entry) => entry.taskId === taskId)?.frameId ?? null
+            : null;
+          const items = page === 0
+            ? [
+              { id: taskIds[0], state: "pending", assignedFrameId: frameFor(taskIds[0]) },
+              ...Array.from({ length: 99 }, (_, index) => ({
+                id: `paged-filler-${index}`,
+                state: "pending",
+                assignedFrameId: null,
+              })),
+            ]
+            : [{
+              id: taskIds[1],
+              state: "pending",
+              assignedFrameId: frameFor(taskIds[1]),
+            }];
+          return {
+            result: {
+              workspace: { revision: durable ? 6 : 0 },
+              items,
+              total: 200,
+            },
+          };
+        },
+        assignChildTasks: async ({ assignments }) => {
+          assigned.splice(0, assigned.length, ...assignments);
+          durable = true;
+          throw new Error("adapter threw after paged durable commit");
+        },
+        settleAssignedTask: async () => ({ accepted: true, workspaceRevision: 8 }),
+        freezeForCompletion: async ({ expectedRevision }) => ({
+          accepted: true,
+          workspaceRevision: expectedRevision ?? 8,
+        }),
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => {
+        childCalls += 1;
+        return { status: "failed", content: "", errorCode: "provider_error" };
+      },
+    }));
+
+    expect(durable).toBe(true);
+    expect(assigned).toHaveLength(2);
+    expect(pageReads).toContain(1);
+    expect(childCalls).toBe(2);
+    expect(result).toMatchObject({ status: "completed" });
+  });
+
+  test("rejects paginated assignment recovery when workspace revisions drift", async () => {
+    const taskIds = ["drift-task-one", "drift-task-two"] as const;
+    const assigned: Array<{ readonly taskId: string; readonly frameId: string }> = [];
+    const pageReads: number[] = [];
+    let durable = false;
+    let round = 0;
+    let childCalls = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return round === 1
+        ? response("", [
+          call("agent_delegate", "drift-one", {
+            profile_id: "writer",
+            task_id: taskIds[0],
+            task: "first drift child",
+          }),
+          call("agent_delegate", "drift-two", {
+            profile_id: "writer",
+            task_id: taskIds[1],
+            task: "second drift child",
+          }),
+        ])
+        : response("", [complete("drift-recovery-complete")]);
+    }, {
+      rootFrameId: "turn-paged-revision-drift",
+      workspace: workspace({
+        execute: async (operation, args) => {
+          expect(operation === "read_section" || operation === "read_page").toBe(true);
+          const page = typeof args.page === "number" ? args.page : 0;
+          pageReads.push(page);
+          const frameFor = (taskId: string): string | null => durable
+            ? assigned.find((entry) => entry.taskId === taskId)?.frameId ?? null
+            : null;
+          const items = page === 0
+            ? [
+              { id: taskIds[0], state: "pending", assignedFrameId: frameFor(taskIds[0]) },
+              ...Array.from({ length: 99 }, (_, index) => ({
+                id: `drift-filler-${index}`,
+                state: "pending",
+                assignedFrameId: null,
+              })),
+            ]
+            : [{
+              id: taskIds[1],
+              state: "pending",
+              assignedFrameId: frameFor(taskIds[1]),
+            }];
+          return {
+            result: {
+              workspace: { revision: durable ? (page === 0 ? 6 : 7) : 0 },
+              items,
+              total: 200,
+            },
+          };
+        },
+        assignChildTasks: async ({ assignments }) => {
+          assigned.splice(0, assigned.length, ...assignments);
+          durable = true;
+          throw new Error("adapter threw after paged revision drift");
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => {
+        childCalls += 1;
+        return { status: "failed", content: "", errorCode: "provider_error" };
+      },
+    }));
+
+    expect(durable).toBe(true);
+    expect(assigned).toHaveLength(2);
+    expect(pageReads).toContain(1);
+    expect(childCalls).toBe(0);
+    expect(result).toMatchObject({ status: "completed" });
+    expect(result.observations.find((item) => item.callId === "drift-one")).toMatchObject({
+      status: "error",
+      code: "internal_error",
+    });
+  });
+
+
+  test("accepts an exact terminal settlement replay without advancing the workspace revision", async () => {
+    const taskId = "terminal-replay-task";
+    let assignedFrameId = "";
+    const settlementRevisions: number[] = [];
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return round === 1
+        ? response("", [call("agent_delegate", "terminal-replay", {
+          profile_id: "writer",
+          task_id: taskId,
+          task: "settle this task",
+        })])
+        : response("", [complete("terminal-replay-complete")]);
+    }, {
+      rootFrameId: "turn-terminal-replay",
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: taskId,
+          state: "pending",
+          required: false,
+          assignedFrameId: null,
+        }],
+        assignChildTasks: async ({ assignments }) => {
+          const assignment = assignments[0];
+          if (!assignment) throw new Error("missing assignment");
+          assignedFrameId = assignment.frameId;
+          return { accepted: true, workspaceRevision: 9, assignments };
+        },
+        settleAssignedTask: async ({ frameId, state }) => {
+          expect(frameId).toBe(assignedFrameId);
+          expect(state).toBe("failed");
+          settlementRevisions.push(9);
+          return { accepted: true, workspaceRevision: 9 };
+        },
+        freezeForCompletion: async ({ expectedRevision }) => ({
+          accepted: true,
+          workspaceRevision: expectedRevision ?? 9,
+        }),
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "provider_error",
+      }),
+    }));
+
+    expect(result).toMatchObject({ status: "completed", workspaceRevision: 9 });
+    expect(settlementRevisions).toEqual([9]);
+  });
+
+  test("rejects a conflicting terminal settlement instead of retrying it", async () => {
+    const taskId = "terminal-conflict-task";
+    let assignedFrameId = "";
+    let durableState: "pending" | "cancelled" = "pending";
+    let settlementCalls = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "terminal-conflict", {
+        profile_id: "writer",
+        task_id: taskId,
+        task: "settle this task",
+      }),
+    ]), {
+      rootFrameId: "turn-terminal-conflict",
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: taskId,
+          state: durableState,
+          required: false,
+          assignedFrameId: assignedFrameId || null,
+        }],
+        assignChildTasks: async ({ assignments }) => {
+          const assignment = assignments[0];
+          if (!assignment) throw new Error("missing assignment");
+          assignedFrameId = assignment.frameId;
+          return { accepted: true, workspaceRevision: 10, assignments };
+        },
+        settleAssignedTask: async ({ frameId }) => {
+          settlementCalls += 1;
+          expect(frameId).toBe(assignedFrameId);
+          durableState = "cancelled";
+          throw Object.assign(new Error("terminal state conflict"), { code: "task_assignment_conflict" });
+        },
+      }),
+      delegatableProfiles: [{
+        profileId: "writer",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "provider_error",
+      }),
+    }));
+
+    expect(result).toMatchObject({ status: "failed", code: "conflict" });
+    expect(settlementCalls).toBe(1);
+  });
+
+  test("records stable globally unique workspace associations for each execution", async () => {
+    const associations: Array<Record<string, unknown>> = [];
+    const run = async (executionId: string) => runAgenticWorkPhase(baseOptions(async () =>
+      response("", [complete(`complete-${executionId}`)]), {
+      rootFrameId: executionId,
+      workspaceId: "persistent-workspace-id",
+      workspaceAssociationRevision: 12,
+      workspace: workspace({
+        freezeForCompletion: async ({ expectedRevision }) => ({
+          accepted: true,
+          workspaceRevision: expectedRevision ?? 12,
+        }),
+      }),
+      inspection: {
+        record: (kind, value) => {
+          if (kind === "workspace" && value && typeof value === "object") {
+            associations.push(value as Record<string, unknown>);
+          }
+          return {} as never;
+        },
+      },
+    }));
+
+    const results = await Promise.all([run("execution-a"), run("execution-b")]);
+    expect(results.every(({ status }) => status === "completed")).toBe(true);
+    expect(associations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "workspace:work:execution-a:12",
+        workspaceId: "persistent-workspace-id",
+        workspaceRevision: 12,
+      }),
+      expect.objectContaining({
+        id: "workspace:work:execution-b:12",
+        workspaceId: "persistent-workspace-id",
+        workspaceRevision: 12,
+      }),
+    ]));
+    expect(new Set(associations.map(({ id }) => id)).size).toBe(2);
   });
 });

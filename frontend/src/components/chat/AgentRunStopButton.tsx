@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useLayoutEffect, useRef, useState } from 'react'
 import { RotateCcw, Square } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { agentRunsApi } from '@/api/agent-runs'
@@ -17,35 +17,100 @@ export interface UseAgentRunStopOptions {
   onSettled?: () => void
 }
 
+type AgentRunStopStateEntry = {
+  key: string
+  state: AgentRunStopState
+}
+
+type PendingStopRequest = {
+  key: string
+  token: number
+}
+
+function makeStopRequestKey({
+  turnId,
+  chatId,
+  generationId,
+}: Pick<UseAgentRunStopOptions, 'turnId' | 'chatId' | 'generationId'>): string {
+  // Structured serialization keeps absent IDs distinct from empty IDs.
+  return JSON.stringify([turnId, chatId ?? null, generationId ?? null])
+}
+
 export function useAgentRunStop(options: UseAgentRunStopOptions) {
   const { turnId, chatId, generationId, terminal = false, onBeforeStop, onResult, onSettled } = options
-  const [state, setState] = useState<AgentRunStopState>(terminal ? 'terminal' : 'idle')
-  const pendingRef = useRef(false)
+  const requestKey = makeStopRequestKey({ turnId, chatId, generationId })
+  const initialState: AgentRunStopState = 'idle'
+  const requestKeyRef = useRef(requestKey)
+  const requestTokenRef = useRef(0)
+  const pendingRef = useRef<PendingStopRequest | null>(null)
+  const [stateEntry, setStateEntry] = useState<AgentRunStopStateEntry>(() => ({
+    key: requestKey,
+    state: initialState,
+  }))
 
-  useEffect(() => {
-    pendingRef.current = false
-    setState(terminal ? 'terminal' : 'idle')
-  }, [terminal, turnId])
+  useLayoutEffect(() => {
+    if (requestKeyRef.current !== requestKey) {
+      requestKeyRef.current = requestKey
+      requestTokenRef.current += 1
+      pendingRef.current = null
+    }
+    setStateEntry(previous => previous.key === requestKey
+      ? previous
+      : { key: requestKey, state: initialState })
+  }, [requestKey])
+
+  useLayoutEffect(() => () => {
+    requestTokenRef.current += 1
+    pendingRef.current = null
+  }, [])
+
+  const state = terminal
+    ? 'terminal'
+    : stateEntry.key === requestKey
+      ? stateEntry.state
+      : initialState
 
   const stop = useCallback(async () => {
-    if (pendingRef.current || state === 'stopping' || state === 'too_late' || state === 'terminal') return
-    pendingRef.current = true
-    setState('stopping')
+    if (requestKeyRef.current !== requestKey) return
+    const pending = pendingRef.current
+    if (
+      (pending?.key === requestKey)
+      || state === 'stopping'
+      || state === 'too_late'
+      || state === 'terminal'
+    ) {
+      return
+    }
+
+    const token = requestTokenRef.current + 1
+    requestTokenRef.current = token
+    pendingRef.current = { key: requestKey, token }
+    setStateEntry({ key: requestKey, state: 'stopping' })
     onBeforeStop?.()
+
+    const isCurrentRequest = () => (
+      requestKeyRef.current === requestKey
+      && requestTokenRef.current === token
+    )
+
     try {
       const result = await agentRunsApi.stop(turnId, { chatId, generationId })
+      if (!isCurrentRequest()) return
       if (result.turnId !== turnId) {
         throw new Error('agent_run_stop_target_mismatch')
       }
-      setState(result.status === 'accepted' ? 'stopping' : result.status)
+      setStateEntry({ key: requestKey, state: result.status === 'accepted' ? 'stopping' : result.status })
       onResult?.(result)
     } catch {
-      setState('error')
-      pendingRef.current = false
+      if (!isCurrentRequest()) return
+      setStateEntry({ key: requestKey, state: 'error' })
+      pendingRef.current = null
     } finally {
-      onSettled?.()
+      if (isCurrentRequest()) {
+        onSettled?.()
+      }
     }
-  }, [chatId, generationId, onBeforeStop, onResult, onSettled, state, turnId])
+  }, [chatId, generationId, onBeforeStop, onResult, onSettled, requestKey, state, turnId])
 
   return {
     state,

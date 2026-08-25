@@ -15,9 +15,9 @@ import {
   inspectLoomPromptPolicies,
 } from "./agent-cognition.service";
 import type {
+  CognitionValue,
   LoomPolicyBucketsV1,
   LoomPromptInspectionBlockV1,
-  LoomPromptInspectionContextPackV1,
   LoomPromptInspectionV1,
 } from "../types/agent-cognition";
 import {
@@ -54,7 +54,8 @@ import {
   initMacros,
   withPromptBlockContext,
 } from "../macros";
-import type { MacroEnv } from "../macros";
+import type { AstNode, MacroEnv } from "../macros";
+import { parse as parseMacroTemplate } from "../macros/MacroParser";
 import { createExpansionBudget, type ExpansionBudgetV1 } from "../types/agent-preprocessing";
 import {
   activateWorldInfo,
@@ -118,7 +119,7 @@ import {
 import { isWorldBookEntryVectorSearchReady } from "./world-book-vector-state";
 import * as imagesSvc from "./images.service";
 import * as presetProfilesSvc from "./preset-profiles.service";
-import { getPresetAgentCognitionSourceV1 } from "./agent-config-portability.service";
+import { getPresetAgentResponseCognitionSourceV1 } from "./agent-config-portability.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
 import { readCachedChatMemory } from "./chat-memory-cache.service";
 import { deduplicateWorldInfoEntries } from "./world-info-dedup.service";
@@ -175,6 +176,55 @@ export type {
   VectorRetrievalTraceStage,
   VectorScoreBreakdown,
 } from "./world-info-vector-ranking";
+export interface PrecomputedWorldInfoVectorEntries {
+  readonly sourceFingerprint: string;
+  readonly entries: readonly VectorActivatedEntry[];
+}
+
+/**
+ * Fingerprint the complete native World Info source snapshot used for vector
+ * activation. Keep the source arrays in their existing order: order is part of
+ * the native budget/merge semantics, while the entry serialization is stable
+ * across object-key ordering.
+ */
+export function buildWorldInfoVectorSourceFingerprint(
+  entries: readonly WorldBookEntry[],
+  worldBookIds: readonly string[] = [],
+): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(`worldBooks:${worldBookIds.length};`);
+  for (const worldBookId of worldBookIds) {
+    hasher.update(stableVectorWiCacheValue(worldBookId));
+  }
+  hasher.update(`entries:${entries.length};`);
+  for (const entry of entries) {
+    hasher.update(stableVectorWiCacheValue(entry));
+  }
+  return hasher.digest("hex");
+}
+
+function astContainsDatabankRetrievalMacro(nodes: readonly AstNode[]): boolean {
+  for (const node of nodes) {
+    if (node.type !== "macro" && node.type !== "scoped_macro") continue;
+    if (registry.getMacro(node.name)?.handlesDatabankRetrieval === true) {
+      return true;
+    }
+    if (
+      node.args.some((argument) => astContainsDatabankRetrievalMacro(argument)) ||
+      (node.type === "scoped_macro" &&
+        astContainsDatabankRetrievalMacro(node.body))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function contentUsesDatabankRetrievalMacro(content: string): boolean {
+  if (!content.includes("{{")) return false;
+  return astContainsDatabankRetrievalMacro(parseMacroTemplate(content));
+}
+
 
 // ---------------------------------------------------------------------------
 // Chat history and World Info identity markers
@@ -1303,6 +1353,107 @@ function resolveStoredPromptVariableValues(
   return merged;
 }
 
+function isPromptVariableLeaf(value: unknown): value is PromptVariableValue {
+  if (typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/**
+ * metadata.promptVariables is block-scoped: Record<blockId, Record<varName, leaf>>.
+ * Drop non-object buckets and nested non-scalar leaves. Finite numbers, strings,
+ * and string[] survive; objects, booleans, and mixed arrays are ignored.
+ */
+function asStoredPromptVariableBuckets(
+  value: unknown,
+): Record<string, Record<string, PromptVariableValue>> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const buckets: Record<string, Record<string, PromptVariableValue>> = {};
+  for (const [blockId, bucket] of Object.entries(value as Record<string, unknown>)) {
+    if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) continue;
+    const leaves: Record<string, PromptVariableValue> = {};
+    for (const [name, leaf] of Object.entries(bucket as Record<string, unknown>)) {
+      if (isPromptVariableLeaf(leaf)) leaves[name] = leaf;
+    }
+    buckets[blockId] = leaves;
+  }
+  return buckets;
+}
+
+interface ResolvedPromptVariableValues {
+  readonly values: Record<string, string | number>;
+  readonly defaults: Record<string, string | number>;
+  readonly byBlock: Record<string, Record<string, string | number>>;
+  readonly defaultsByBlock: Record<string, Record<string, string | number>>;
+  readonly selections: Record<string, string[]>;
+  readonly selectionsByBlock: Record<string, Record<string, string[]>>;
+}
+
+function collectResolvedPromptVariableValues(
+  blocks: readonly Pick<PromptBlock, "id" | "enabled" | "variables">[],
+  stored: unknown,
+  profileValues?: PromptVariableValues,
+): ResolvedPromptVariableValues {
+  const presetValues = asStoredPromptVariableBuckets(stored);
+  const merged = resolveStoredPromptVariableValues(presetValues, profileValues);
+  const values: Record<string, string | number> = {};
+  const defaults: Record<string, string | number> = {};
+  const byBlock: Record<string, Record<string, string | number>> = {};
+  const defaultsByBlock: Record<string, Record<string, string | number>> = {};
+  const selections: Record<string, string[]> = {};
+  const selectionsByBlock: Record<string, Record<string, string[]>> = {};
+
+  for (const block of blocks) {
+    if (!block.enabled || !block.variables?.length) continue;
+    const bucket = merged[block.id] ?? {};
+    const perBlock: Record<string, string | number> = {};
+    const perBlockDefaults: Record<string, string | number> = {};
+    const perBlockSelections: Record<string, string[]> = {};
+    for (const def of block.variables) {
+      if (!def?.name) continue;
+      const override = Object.prototype.hasOwnProperty.call(bucket, def.name)
+        ? bucket[def.name]
+        : undefined;
+      const resolved = coercePromptVariable(def, override);
+      perBlock[def.name] = resolved.rendered;
+      values[def.name] = resolved.rendered;
+      const defaultValue = coercePromptVariable(def, undefined).rendered;
+      perBlockDefaults[def.name] = defaultValue;
+      defaults[def.name] = defaultValue;
+      if (def.type === "multiselect") {
+        perBlockSelections[def.name] = resolved.selectedIds;
+        selections[def.name] = resolved.selectedIds;
+      }
+    }
+    if (Object.keys(perBlock).length) {
+      byBlock[block.id] = perBlock;
+      defaultsByBlock[block.id] = perBlockDefaults;
+    }
+    if (Object.keys(perBlockSelections).length) {
+      selectionsByBlock[block.id] = perBlockSelections;
+    }
+  }
+  return { values, defaults, byBlock, defaultsByBlock, selections, selectionsByBlock };
+}
+
+/**
+ * Flatten block-scoped metadata.promptVariables into the cognition predicate
+ * namespace. Same policy as resolvePromptVariables: disabled blocks are out of
+ * play; last enabled prompt_order block wins on a name collision.
+ */
+export function resolveCognitionPresetVariables(
+  blocks: readonly Pick<PromptBlock, "id" | "enabled" | "variables">[],
+  stored: unknown,
+  profileValues?: PromptVariableValues,
+): Readonly<Record<string, CognitionValue>> {
+  const collected = collectResolvedPromptVariableValues(blocks, stored, profileValues);
+  const output: Record<string, CognitionValue> = {};
+  for (const [name, value] of Object.entries(collected.values)) {
+    output[name] = value;
+  }
+  return Object.freeze(output);
+}
+
 /**
  * Resolve one preset block within its own placement context. This deliberately
  * wraps the existing single macro evaluation rather than scheduling a second
@@ -1405,56 +1556,18 @@ export function resolvePromptVariables(
   preset: Preset | null,
   profileValues?: PromptVariableValues,
 ): void {
-  const presetValues = (preset?.metadata?.promptVariables ?? {}) as Record<
-    string,
-    Record<string, PromptVariableValue>
-  >;
-  const stored = resolveStoredPromptVariableValues(presetValues, profileValues);
+  const collected = collectResolvedPromptVariableValues(
+    blocks,
+    preset?.metadata?.promptVariables,
+    profileValues,
+  );
 
-  const values: Record<string, string | number> = {};
-  const defaults: Record<string, string | number> = {};
-  const byBlock: Record<string, Record<string, string | number>> = {};
-  const defaultsByBlock: Record<string, Record<string, string | number>> = {};
-  const selections: Record<string, string[]> = {};
-  const selectionsByBlock: Record<string, Record<string, string[]>> = {};
-
-  for (const block of blocks) {
-    if (!block.enabled || !block.variables?.length) continue;
-    const bucket = stored[block.id] ?? {};
-    const perBlock: Record<string, string | number> = {};
-    const perBlockDefaults: Record<string, string | number> = {};
-    const perBlockSelections: Record<string, string[]> = {};
-    for (const def of block.variables) {
-      if (!def?.name) continue;
-      const override = Object.prototype.hasOwnProperty.call(bucket, def.name)
-        ? bucket[def.name]
-        : undefined;
-      const resolved = coercePromptVariable(def, override);
-      perBlock[def.name] = resolved.rendered;
-      values[def.name] = resolved.rendered;
-      const defaultValue = coercePromptVariable(def, undefined).rendered;
-      perBlockDefaults[def.name] = defaultValue;
-      defaults[def.name] = defaultValue;
-      if (def.type === "multiselect") {
-        perBlockSelections[def.name] = resolved.selectedIds;
-        selections[def.name] = resolved.selectedIds;
-      }
-    }
-    if (Object.keys(perBlock).length) {
-      byBlock[block.id] = perBlock;
-      defaultsByBlock[block.id] = perBlockDefaults;
-    }
-    if (Object.keys(perBlockSelections).length) {
-      selectionsByBlock[block.id] = perBlockSelections;
-    }
-  }
-
-  env.extra.promptVariables = values;
-  env.extra.promptVariablesByBlock = byBlock;
-  env.extra.promptVariableDefaults = defaults;
-  env.extra.promptVariableDefaultsByBlock = defaultsByBlock;
-  env.extra.promptVariableSelections = selections;
-  env.extra.promptVariableSelectionsByBlock = selectionsByBlock;
+  env.extra.promptVariables = collected.values;
+  env.extra.promptVariablesByBlock = collected.byBlock;
+  env.extra.promptVariableDefaults = collected.defaults;
+  env.extra.promptVariableDefaultsByBlock = collected.defaultsByBlock;
+  env.extra.promptVariableSelections = collected.selections;
+  env.extra.promptVariableSelectionsByBlock = collected.selectionsByBlock;
 
   // Seed the local-variables Map so {{getvar::name}} resolves to the same
   // value as {{var::name}} outside a defining block. While a block renders,
@@ -1464,7 +1577,7 @@ export function resolvePromptVariables(
   //
   // Local variables are transient per assembly, so this is the only seed source
   // for preset variables; nothing is rehydrated from chat state.
-  for (const [name, value] of Object.entries(values)) {
+  for (const [name, value] of Object.entries(collected.values)) {
     env.variables.local.set(name, String(value));
   }
 }
@@ -1775,22 +1888,20 @@ function responseLoomPolicyAssembly(
   if (ctx.assemblySurface !== "RESPONSE" || !preset?.id) {
     return { excludedBlockIds: new Set<string>() };
   }
-
-  const authored = getPresetAgentCognitionSourceV1(ctx.userId, preset.id);
+  const authored = getPresetAgentResponseCognitionSourceV1(ctx.userId, preset.id);
   if (!authored) {
     return { excludedBlockIds: new Set<string>() };
   }
+  const excludedBlockIds = new Set<string>(authored.conservativeExcludedBlockIds);
   const runtimePolicy = authored.config.runtimePolicy;
   if (!runtimePolicy) {
-    return { excludedBlockIds: new Set<string>() };
+    return { excludedBlockIds };
   }
 
-  const phaseInstructions = runtimePolicy.phases.flatMap((phase) =>
-    phase.instructionRefs.map((source) => ({
-      phaseId: phase.id,
-      source,
-    })),
-  );
+  const phaseInstructions = runtimePolicy.phases.flatMap((phase) => [
+    ...phase.instructionRefs.map((source) => ({ phaseId: phase.id, source })),
+    ...phase.childInstructionSubsets.flatMap((subset) => subset.instructionRefs.map((source) => ({ phaseId: phase.id, profileId: subset.profileId, source }))),
+  ]);
   const policies: LoomPolicyBucketsV1 = runtimePolicy.loomPolicy ?? {
     version: 1,
     workPolicy: [],
@@ -1805,42 +1916,42 @@ function responseLoomPolicyAssembly(
     ...policies.renderPolicy,
   ];
   if (allEntries.length === 0 && phaseInstructions.length === 0) {
-    return { excludedBlockIds: new Set<string>() };
+    return { excludedBlockIds };
   }
 
   const inspectionBlocksBySource = new Map<string, LoomPromptInspectionBlockV1>();
-  for (const entry of allEntries) {
-    const block = blocks.find((candidate) => candidate.id === entry.source.blockId);
-    const source = entry.source;
+  const referencedSources = [
+    ...allEntries.map((entry) => entry.source),
+    ...phaseInstructions.map((instruction) => instruction.source),
+  ];
+  for (const source of referencedSources) {
+    const block = blocks[source.promptOrder];
+    const blockRevision = block && Number((block as PromptBlock & { revision?: unknown }).revision ?? 1);
+    if (!block || block.id !== source.blockId || !Number.isSafeInteger(blockRevision) || blockRevision !== source.blockRevision) continue;
     inspectionBlocksBySource.set(
-      `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`,
-      { source, content: block?.content ?? "" },
+      source.blockId + "\u0000" + source.presetRevision + "\u0000" + source.blockRevision + "\u0000" + source.promptOrder,
+      { source, content: block.content },
     );
   }
-  const contextPacks: LoomPromptInspectionContextPackV1[] = authored.contextPackSelections.map((selection) => ({
-    contextPackId: selection.packId,
-    revisionId: selection.revisionId,
-    digest: selection.digest,
-    content: "",
-  }));
   const inspection = inspectLoomPromptPolicies(policies, {
     checkpoint: "ASSEMBLE",
     surface: "RESPONSE",
     blocks: [...inspectionBlocksBySource.values()],
-    contextPacks,
   });
   const responseOmission = inspection.responseOmission;
   if (!responseOmission) {
     throw new Error("Response Loom omission evidence is unavailable");
   }
+  const omissionReviewReason = authored.reviewReason
+    ?? (authored.sourceKind === "normalized" ? "response_surface" : authored.sourceKind + "_cognition_source");
   const enrichedInspection: LoomPromptInspectionV1 = {
     ...inspection,
     responseOmission: {
       ...responseOmission,
+      reviewReason: omissionReviewReason,
       omittedPhaseInstructions: phaseInstructions,
     },
   };
-  const excludedBlockIds = new Set<string>();
   const excludedSourceKeys = new Set<string>();
   for (const source of [
     ...allEntries.map((entry) => entry.source),
@@ -1849,6 +1960,9 @@ function responseLoomPolicyAssembly(
     const sourceKey = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
     if (excludedSourceKeys.has(sourceKey)) continue;
     excludedSourceKeys.add(sourceKey);
+    // Exclude by authored block identity even when its revision is stale or
+    // unavailable in the live prompt list. Ordinary Response must never execute
+    // a referenced quarantined/stale Loom source by accident.
     excludedBlockIds.add(source.blockId);
   }
   return {
@@ -2523,12 +2637,21 @@ export async function assemblePrompt(
   const nativeWorldInfoEntryIds = new Set(
     intercepted.map((entry) => entry.id),
   );
+  const precomputedVectorEntries = ctx.precomputedVectorEntries;
+  const precomputedVectorSourceMatches =
+    precomputedVectorEntries !== undefined &&
+    precomputedVectorEntries.sourceFingerprint ===
+      buildWorldInfoVectorSourceFingerprint(
+        wiEntries,
+        wiSources.worldBookIds,
+      );
   let vectorActivated =
-    ctx.precomputedVectorEntries &&
-      !hasCaptureRequests &&
-      vectorViewsEquivalent
+    precomputedVectorEntries &&
+    precomputedVectorSourceMatches &&
+    !hasCaptureRequests &&
+    vectorViewsEquivalent
       ? projectVectorActivatedEntries(
-          ctx.precomputedVectorEntries.filter((item) =>
+          precomputedVectorEntries.entries.filter((item) =>
             nativeWorldInfoEntryIds.has(item.entry.id),
           ),
           intercepted,
@@ -3199,9 +3322,13 @@ export async function assemblePrompt(
     (b) => b.enabled && b.content && /\{\{memories(\b|::|\}\})/.test(b.content),
   );
 
-  // Detect if any enabled block uses the {{databank}} macro
+  // Suppress the native fallback whenever a canonical Databank retrieval macro
+  // (including its registry aliases and syntax flags) is present.
   const macroHandlesDatabank = effectiveBlocks.some(
-    (b) => b.enabled && b.content && /\{\{databank(\b|::|\}\})/.test(b.content),
+    (b) =>
+      b.enabled &&
+      typeof b.content === "string" &&
+      contentUsesDatabankRetrievalMacro(b.content),
   );
 
   // ---- Resolve #mentions in user messages ----

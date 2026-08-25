@@ -43,8 +43,6 @@ const testRevisionMembers = [
   { kind: "slot_binding" as const, id: "slot-1", revision: 1, digest: "d" },
   { kind: "settings" as const, id: "settings-1", revision: 1, digest: "e" },
   { kind: "macro_variables" as const, id: "macro-1", revision: 1, digest: "f" },
-  { kind: "context_pack" as const, id: "pack-1", revision: 1, digest: "g" },
-  { kind: "context_acl" as const, id: "acl-1", revision: 1, digest: "h" },
   { kind: "regex" as const, id: "regex-1", revision: 1, digest: "regex-digest" },
   { kind: "world_lore" as const, id: "entry-1", revision: 1, digest: "world-digest" },
   { kind: "cognition_policy" as const, id: "cognition-1", revision: 1, digest: "i" },
@@ -221,6 +219,22 @@ describe("agentic commit transaction", () => {
     expect(db.query("SELECT receipt_id FROM agent_published_workspace_artifacts WHERE chat_id = ?").get("chat-1")).toEqual({ receipt_id: receipt.receipt_id });
     expect(db.query("SELECT published_reference_count AS count FROM agent_artifact_blobs WHERE digest = ?").get(artifactDigest)).toEqual({ count: 1 });
   });
+  test("canonicalizes Unicode message metadata by raw UTF-8 bytes", () => {
+    db = createDatabase();
+    const result = commitAgenticTurnV1({
+      ...input(db, AGENTIC_COMMIT_DEPENDENCIES_V1, false),
+      message: {
+        extra: {
+          "𐀀": 1,
+          "\uE000": 2,
+        },
+      },
+    });
+    expect(result.status).toBe("committed");
+    const row = db.query("SELECT extra FROM messages WHERE chat_id = ?").get("chat-1") as { extra: string };
+    const keys = Object.keys(JSON.parse(row.extra) as Record<string, unknown>);
+    expect(keys.slice(-2)).toEqual(["\uE000", "𐀀"]);
+  });
   test("projects host activity tool and child counts without inventing them", () => {
     db = createDatabase();
     const result = commitAgenticTurnV1({
@@ -388,9 +402,6 @@ describe("agentic commit transaction", () => {
       { kind: "settings", id: "settings-1", revision: 1, digest: "o" },
       { kind: "macro_variables", id: "macro-1", revision: 1, digest: "p" },
       { kind: "regex", id: "regex-1", revision: 1, digest: "q" },
-      { kind: "context_pack", id: "pack-1", revision: 1, digest: "r" },
-      { kind: "context_attachment", id: "attachment-1", revision: 1, digest: "s" },
-      { kind: "context_acl", id: "acl-1", revision: 1, digest: "t" },
       { kind: "cognition_policy", id: "cognition-1", revision: 1, digest: "u" },
       { kind: "runtime_epoch", id: "runtime-1", revision: 1, digest: "v" },
       { kind: "readiness", id: "readiness-1", revision: 1, digest: "w" },

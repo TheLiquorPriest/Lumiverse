@@ -82,6 +82,8 @@ export interface MacroDefinition {
   strictArgs?: boolean;
   delayArgResolution?: boolean;
   aliases?: string[];
+  /** True when this macro supplies native Databank retrieval context. */
+  handlesDatabankRetrieval?: boolean;
   /** When true, extension macros cannot overwrite this definition */
   builtIn?: boolean;
   /** When true, the handler's return value is guaranteed to never contain

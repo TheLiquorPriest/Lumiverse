@@ -6,6 +6,10 @@ import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
 import { env } from "../env";
 import {
+  getAgentRunInspection,
+  persistAgentRunInspection,
+} from "./agent-activity-runs.service";
+import {
   AgentRunStopUnavailableError,
   __test__mintChatRunCursor,
   __test__decodeChatRunCursor,
@@ -17,6 +21,7 @@ import {
   reconcileAgentRunProjections,
   registerAgentRunStopHandler,
   drainPendingAgentRunEventsForUser,
+  emitAgentRunProjectionEvent,
   repairAgentRunProjectionFromInterruptedExecution,
   repairAgentRunProjectionFromReceipt,
   requestAgentRunStop,
@@ -24,6 +29,7 @@ import {
 } from "./agent-run-projection.service";
 import {
   reconcileAgentTurns,
+  registerAgentTurnReceiptRepair,
   registerAgentTurnTerminalRecovery,
 } from "./turn-execution.service";
 
@@ -338,6 +344,51 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       remove();
     }
   });
+  test("fails closed when terminal outbox delivery columns are not migrated", () => {
+    const partialTable = "chat-partial-outbox";
+    getDb().run("DROP TABLE agent_chat_events");
+    getDb().run(
+      `CREATE TABLE agent_chat_events (
+        user_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        turn_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        run_revision INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        event_kind TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        terminal_handoff_json TEXT,
+        omission_json TEXT
+      )`,
+    );
+    const event = {
+      event: AGENT_RUN_CHANGED,
+      userId: OWNER,
+      payload: {
+        version: 2,
+        chatId: partialTable,
+        sequence: 1,
+        run: { workStatus: "terminal" },
+      },
+    } as unknown as Parameters<typeof emitAgentRunProjectionEvent>[0];
+    expect(emitAgentRunProjectionEvent(event, getDb())).toBe(false);
+    const malformedTerminal = {
+      ...event,
+      userId: "",
+      payload: {
+        ...event.payload,
+        chatId: "",
+        sequence: 0,
+      },
+    } as unknown as Parameters<typeof emitAgentRunProjectionEvent>[0];
+    expect(emitAgentRunProjectionEvent(malformedTerminal, getDb())).toBe(false);
+    expect(drainPendingAgentRunEventsForUser(OWNER, getDb())).toEqual({
+      inspected: 0,
+      emitted: 0,
+      skipped: 0,
+    });
+  });
   test("drains terminal outbox rows across bounded batches", () => {
     seedChat(OWNER, "chat-replay-batch");
     const rowCount = 257;
@@ -383,7 +434,7 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       createdAt: 1,
       updatedAt: 2,
     };
-    const receipt = { messageId: "message-repair", swipeId: 1, createdAt: 3 };
+    const receipt = { id: "receipt-repair", messageId: "message-repair", swipeId: 1, createdAt: 3 };
     const repaired = getDb().transaction(() => repairAgentRunProjectionFromReceipt(
       getDb(),
       execution,
@@ -428,6 +479,507 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       receipt,
     ))();
     expect(repeated.changed).toBe(false);
+  });
+  test("startup receipt repair upgrades COMMIT_FAILED projection_unavailable to COMMITTED", () => {
+    const chatId = "chat-commit-failure-recovery";
+    const turnId = "turn-commit-failure-recovery";
+    const messageId = "message-commit-failure-recovery";
+    const workspaceId = "workspace-commit-failure-recovery";
+    seedChat(OWNER, chatId);
+    seedRun(OWNER, chatId, turnId, turnId, "COMMITTED");
+    getDb().query(
+      `INSERT INTO messages
+        (id, chat_id, index_in_chat, is_user, name, content, swipes, generation_revision)
+       VALUES (?, ?, 0, 0, 'assistant', 'committed', ?, 7)`,
+    ).run(messageId, chatId, JSON.stringify(["committed"]));
+    getDb().query(
+      `INSERT INTO agent_turn_workspaces
+        (workspace_id, turn_id, execution_id, user_id, chat_id, objective,
+         constraints_json, state, operation_caps_json, field_caps_json, retention,
+         expires_at, quota_tasks, quota_records, quota_submissions, quota_artifacts,
+         quota_bytes)
+       VALUES (?, ?, ?, ?, ?, '', '{}', 'frozen', '{}', '{}', 'turn_terminal',
+               9999999999, 0, 0, 0, 0, 1024)`,
+    ).run(workspaceId, turnId, turnId, OWNER, chatId);
+    getDb().query(
+      "UPDATE agent_turn_executions SET workspace_id = ? WHERE id = ?",
+    ).run(workspaceId, turnId);
+    getDb().query(
+      `INSERT INTO agent_turn_commit_receipts
+        (receipt_id, turn_id, execution_id, workspace_id, user_id, chat_id,
+         commit_key, idempotency_key, state, summary_digest, summary_json,
+         message_id, swipe_id, committed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?, '{}', ?, 0, 3)`,
+    ).run(
+      "receipt-commit-failure-recovery",
+      turnId,
+      turnId,
+      workspaceId,
+      OWNER,
+      chatId,
+      `commit-${turnId}`,
+      `commit-${turnId}`,
+      "0".repeat(64),
+      messageId,
+    );
+    const failedInspection = persistAgentRunInspection({
+      userId: OWNER,
+      chatId,
+      attemptId: turnId,
+      previousAttemptId: null,
+      runId: turnId,
+      turnSessionId: turnId,
+      generationId: turnId,
+      generationType: "normal",
+      targetMessageId: messageId,
+      targetSwipeId: 0,
+      hostCorrelationId: `agentic:${turnId}:${turnId}`,
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      reason: "unavailable",
+      startedAt: 1,
+      updatedAt: 2,
+      terminalAt: 2,
+      terminalReceipt: {
+        receiptId: "receipt-commit-failure-recovery",
+        messageId: undefined,
+        swipeId: undefined,
+        summary: { source: "coordinator-test" },
+        error: { code: "projection_unavailable" },
+      },
+      markers: [{
+        id: "failed-terminal-evidence",
+        kind: "recovered_duplicate",
+        scope: "run",
+        firstSequence: 1,
+        lastSequence: 1,
+        recoverable: true,
+        detail: "original failed terminal evidence",
+      }],
+    });
+    const failedReceiptRow = getDb().query(
+      "SELECT terminal_receipt_json FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).get(OWNER, turnId) as { terminal_receipt_json?: string | null } | null;
+    expect(JSON.parse(failedReceiptRow?.terminal_receipt_json ?? "{}")).toMatchObject({
+      receiptId: "receipt-commit-failure-recovery",
+      messageId: {},
+      swipeId: {},
+    });
+    expect(failedInspection).toMatchObject({
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      activity: { reconciliation: "authoritative" },
+    });
+    const failedAudit = getDb().query(
+      `SELECT payload_json
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND event_id = ?
+        LIMIT 1`,
+    ).get(OWNER, turnId, "failed-terminal-evidence") as { payload_json: string } | null;
+    expect(failedAudit?.payload_json).toContain("original failed terminal evidence");
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, chatId, turnId),
+      status: "COMMIT_FAILED",
+      error: {
+        code: "projection_unavailable",
+        recoveryEligible: true,
+        recoveryAction: "resync",
+      },
+      terminalHandoff: {
+        version: 2,
+        committed: false,
+        messageId: null,
+        swipeId: null,
+        messageRevision: null,
+        swipeRevision: null,
+      },
+    }));
+    const before = getAgentRun(OWNER, turnId, chatId);
+    expect(before).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      error: {
+        code: "projection_unavailable",
+        recoveryEligible: true,
+        recoveryAction: "resync",
+      },
+      terminalHandoff: {
+        committed: false,
+        messageId: null,
+        swipeId: null,
+      },
+    });
+    expect(getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_chat_events
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND generation_id = ?`,
+    ).get(OWNER, chatId, turnId, turnId)).toEqual({ count: 1 });
+
+    registerAgentTurnReceiptRepair((execution, receipt) => {
+      repairAgentRunProjectionFromReceipt(getDb(), execution, receipt);
+    });
+    try {
+      reconcileAgentTurns(getDb());
+      const recovered = getAgentRun(OWNER, turnId, chatId);
+      if (!recovered) {
+        throw new Error("Expected recovered agent run projection");
+      }
+      expect(recovered).toMatchObject({
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: "completed",
+        attemptLineage: {
+          target: {
+            chatId,
+            generationType: "normal",
+            messageId,
+            swipeId: 0,
+          },
+        },
+        error: {
+          code: "projection_unavailable",
+          recoveryEligible: true,
+          recoveryAction: "resync",
+          target: {
+            chatId,
+            generationType: "normal",
+            messageId,
+            swipeId: 0,
+          },
+        },
+        target: { messageId, swipeId: 0 },
+        terminalHandoff: {
+          committed: true,
+          messageId,
+          swipeId: 0,
+          messageRevision: 7,
+          swipeRevision: 7,
+        },
+      });
+      expect(getDb().query(
+        "SELECT target_message_id, target_swipe_id FROM agent_activity_runs WHERE generation_id = ?",
+      ).get(turnId)).toEqual({ target_message_id: messageId, target_swipe_id: 0 });
+      const activitySnapshotRow = getDb().query(
+        "SELECT snapshot_json FROM agent_activity_runs WHERE generation_id = ?",
+      ).get(turnId) as { snapshot_json: string };
+      expect(JSON.parse(activitySnapshotRow.snapshot_json)).toMatchObject({ snapshot: { status: "completed" } });
+      expect(getDb().query(
+        "SELECT COUNT(*) AS count FROM messages WHERE id = ? AND chat_id = ?",
+      ).get(messageId, chatId)).toEqual({ count: 1 });
+      const repairedEvents = getDb().query(
+        `SELECT sequence, status, run_revision, event_kind, snapshot_json
+           FROM agent_chat_events
+          WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND generation_id = ?
+          ORDER BY sequence ASC`,
+      ).all(OWNER, chatId, turnId, turnId) as Array<{
+        sequence: number;
+        status: string;
+        run_revision: number;
+        event_kind: string;
+        snapshot_json: string;
+      }>;
+      expect(repairedEvents).toHaveLength(2);
+      expect(repairedEvents.map(({ status, event_kind }) => [status, event_kind])).toEqual([
+        ["COMMIT_FAILED", "terminal"],
+        ["COMMITTED", "terminal"],
+      ]);
+      const latestEvent = repairedEvents[repairedEvents.length - 1];
+      expect(latestEvent?.run_revision).toBe(recovered.revision);
+      expect(JSON.parse(latestEvent?.snapshot_json ?? "{}")).toMatchObject({
+        workOutcome: "completed",
+        terminalHandoff: {
+          committed: true,
+          messageId,
+          swipeId: 0,
+          messageRevision: 7,
+          swipeRevision: 7,
+        },
+      });
+      const repairedInspection = getAgentRunInspection(OWNER, turnId, chatId);
+      expect(repairedInspection).toMatchObject({
+        lifecycle: "TERMINAL",
+        status: "terminal",
+        outcome: "completed",
+        reason: "reconciled",
+        target: { messageId, swipeId: 0 },
+        committedTarget: { messageId, swipeId: 0 },
+        activity: { reconciliation: "recovered" },
+      });
+      expect(repairedInspection?.markers).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: "late_event",
+          detail: expect.stringContaining("reconciled"),
+        }),
+      ]));
+      expect(getDb().query(
+        `SELECT lifecycle, status, outcome, reason, terminal, reconciliation_state
+           FROM agent_run_attempts
+          WHERE user_id = ? AND attempt_id = ?`,
+      ).get(OWNER, turnId)).toEqual({
+        lifecycle: "TERMINAL",
+        status: "terminal",
+        outcome: "completed",
+        reason: "reconciled",
+        terminal: 1,
+        reconciliation_state: "recovered",
+      });
+      const repairedReceipt = getDb().query(
+        "SELECT terminal_receipt_json FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+      ).get(OWNER, turnId) as { terminal_receipt_json?: string | null } | null;
+      expect(repairedReceipt?.terminal_receipt_json).toContain("projection_unavailable");
+      const firstAuditRow = getDb().query(
+        `SELECT COUNT(*) AS count
+           FROM agent_run_audit_records
+          WHERE user_id = ? AND attempt_id = ?`,
+      ).get(OWNER, turnId) as { count?: unknown } | null;
+      const firstAuditCount = Number(firstAuditRow?.count ?? 0);
+      expect(firstAuditCount).toBeGreaterThan(0);
+      expect(getDb().query(
+        `SELECT COUNT(*) AS count
+           FROM agent_run_audit_records
+          WHERE user_id = ? AND attempt_id = ? AND event_id = ?`,
+      ).get(OWNER, turnId, "failed-terminal-evidence")).toEqual({ count: 1 });
+      expect(getDb().query(
+        `SELECT COUNT(*) AS count
+           FROM agent_run_audit_records
+          WHERE user_id = ? AND attempt_id = ? AND event_id = ?`,
+      ).get(OWNER, turnId, `projection:${turnId}:late_event`)).toEqual({ count: 1 });
+      const firstRevision = recovered?.revision;
+
+      reconcileAgentTurns(getDb());
+      const replayed = getAgentRun(OWNER, turnId, chatId);
+      expect(replayed?.revision).toBe(firstRevision);
+      expect(replayed).toMatchObject({
+        workOutcome: "completed",
+        error: { code: "projection_unavailable" },
+        terminalHandoff: { committed: true, messageId, swipeId: 0 },
+      });
+      expect(getDb().query(
+        "SELECT COUNT(*) AS count FROM messages WHERE id = ? AND chat_id = ?",
+      ).get(messageId, chatId)).toEqual({ count: 1 });
+      expect(getDb().query(
+        `SELECT COUNT(*) AS count
+           FROM agent_chat_events
+          WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND generation_id = ?`,
+      ).get(OWNER, chatId, turnId, turnId)).toEqual({ count: 2 });
+      const replayInspection = getAgentRunInspection(OWNER, turnId, chatId);
+      expect(replayInspection?.outcome).toBe("completed");
+      expect(replayInspection?.markers).toEqual(repairedInspection?.markers);
+      const secondAuditRow = getDb().query(
+        `SELECT COUNT(*) AS count
+           FROM agent_run_audit_records
+          WHERE user_id = ? AND attempt_id = ?`,
+      ).get(OWNER, turnId) as { count?: unknown } | null;
+      expect(Number(secondAuditRow?.count ?? 0)).toBe(firstAuditCount);
+      expect(getDb().query(
+        `SELECT COUNT(*) AS count
+           FROM agent_run_audit_records
+          WHERE user_id = ? AND attempt_id = ? AND event_id = ?`,
+      ).get(OWNER, turnId, `projection:${turnId}:late_event`)).toEqual({ count: 1 });
+    } finally {
+      registerAgentTurnReceiptRepair(null);
+    }
+  });
+  test("leaves a COMMIT_FAILED projection untouched for mismatched receipt target or receipt identity", () => {
+    const chatId = "chat-commit-failure-receipt-mismatch";
+    const turnId = "turn-commit-failure-receipt-mismatch";
+    const messageId = "message-commit-failure-receipt-mismatch";
+    const otherMessageId = "message-commit-failure-receipt-other";
+    seedChat(OWNER, chatId);
+    seedRun(OWNER, chatId, turnId, turnId, "COMMITTED");
+    getDb().query(
+      `INSERT INTO messages
+        (id, chat_id, index_in_chat, is_user, name, content, swipes, generation_revision)
+       VALUES (?, ?, 0, 0, 'assistant', 'committed', ?, 4)`,
+    ).run(messageId, chatId, JSON.stringify(["committed"]));
+    getDb().query(
+      `INSERT INTO messages
+        (id, chat_id, index_in_chat, is_user, name, content, swipes, generation_revision)
+       VALUES (?, ?, 1, 0, 'assistant', 'other', ?, 4)`,
+    ).run(otherMessageId, chatId, JSON.stringify(["other"]));
+    const failedInspection = persistAgentRunInspection({
+      userId: OWNER,
+      chatId,
+      attemptId: turnId,
+      runId: turnId,
+      turnSessionId: turnId,
+      generationId: turnId,
+      generationType: "swipe",
+      targetMessageId: messageId,
+      targetSwipeId: 0,
+      hostCorrelationId: `agentic:${turnId}:${turnId}`,
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      reason: "unavailable",
+      startedAt: 1,
+      updatedAt: 2,
+      terminalAt: 2,
+      terminalReceipt: {
+        receiptId: `stored:${turnId}`,
+        messageId: undefined,
+        swipeId: undefined,
+        summary: { source: "mismatch-test" },
+        error: { code: "projection_unavailable" },
+      },
+      markers: [{
+        id: "failed-terminal-evidence",
+        kind: "recovered_duplicate",
+        scope: "run",
+        firstSequence: 1,
+        lastSequence: 1,
+        recoverable: true,
+        detail: "original failed terminal evidence",
+      }],
+    });
+    expect(failedInspection?.outcome).toBe("failed");
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, chatId, turnId),
+      generationType: "swipe",
+      targetMessageId: messageId,
+      targetSwipeId: 0,
+      status: "COMMIT_FAILED",
+      error: {
+        code: "projection_unavailable",
+        recoveryEligible: true,
+        recoveryAction: "resync",
+      },
+      terminalHandoff: {
+        version: 2,
+        committed: false,
+        messageId,
+        swipeId: 0,
+        messageRevision: null,
+        swipeRevision: null,
+      },
+    }));
+    const execution = {
+      id: turnId,
+      userId: OWNER,
+      generationId: turnId,
+      targetKind: "swipe" as const,
+      chatId,
+      targetMessageId: messageId,
+      targetSwipeId: 0,
+      targetMessageRevision: 4,
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const beforeProjection = getDb().query(
+      `SELECT status, phase, revision, sequence, target_message_id, target_swipe_id,
+              snapshot_json, terminal_handoff_json
+         FROM agent_run_projections
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ?`,
+    ).get(OWNER, chatId, turnId);
+    const beforeEvents = getDb().query(
+      `SELECT sequence, status, run_revision, event_kind, snapshot_json,
+              terminal_handoff_json
+         FROM agent_chat_events
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ?
+        ORDER BY sequence ASC`,
+    ).all(OWNER, chatId, turnId);
+    const beforeInspection = getDb().query(
+      `SELECT lifecycle, status, outcome, reason, terminal, reconciliation_state,
+              terminal_receipt_json
+         FROM agent_run_attempts
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, turnId);
+    const beforeAuditCountRow = getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, turnId) as { count?: unknown } | null;
+    const beforeAuditCount = Number(beforeAuditCountRow?.count ?? 0);
+    expect(() => getDb().transaction(() => repairAgentRunProjectionFromReceipt(
+      getDb(),
+      execution,
+      { id: `requested:${turnId}`, messageId: otherMessageId, swipeId: 0, createdAt: 3 },
+    ))()).toThrow("target conflicts with failed projection");
+    expect(getDb().query(
+      `SELECT status, phase, revision, sequence, target_message_id, target_swipe_id,
+              snapshot_json, terminal_handoff_json
+         FROM agent_run_projections
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ?`,
+    ).get(OWNER, chatId, turnId)).toEqual(beforeProjection);
+    expect(getDb().query(
+      `SELECT sequence, status, run_revision, event_kind, snapshot_json,
+              terminal_handoff_json
+         FROM agent_chat_events
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ?
+        ORDER BY sequence ASC`,
+    ).all(OWNER, chatId, turnId)).toEqual(beforeEvents);
+    expect(getDb().query(
+      `SELECT lifecycle, status, outcome, reason, terminal, reconciliation_state,
+              terminal_receipt_json
+         FROM agent_run_attempts
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, turnId)).toEqual(beforeInspection);
+    const afterAuditCountRow = getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, turnId) as { count?: unknown } | null;
+    expect(Number(afterAuditCountRow?.count ?? 0)).toBe(beforeAuditCount);
+    expect(() => getDb().transaction(() => repairAgentRunProjectionFromReceipt(
+      getDb(),
+      execution,
+      { id: `requested:${turnId}`, messageId, swipeId: 0, createdAt: 3 },
+    ))()).toThrow("agent run inspection repair conflicts with receipt identity");
+    expect(getDb().query(
+      `SELECT status, phase, revision, sequence, target_message_id, target_swipe_id,
+              snapshot_json, terminal_handoff_json
+         FROM agent_run_projections
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ?`,
+    ).get(OWNER, chatId, turnId)).toEqual(beforeProjection);
+    expect(getDb().query(
+      `SELECT sequence, status, run_revision, event_kind, snapshot_json,
+              terminal_handoff_json
+         FROM agent_chat_events
+        WHERE user_id = ? AND chat_id = ? AND turn_id = ?
+        ORDER BY sequence ASC`,
+    ).all(OWNER, chatId, turnId)).toEqual(beforeEvents);
+    expect(getDb().query(
+      `SELECT lifecycle, status, outcome, reason, terminal, reconciliation_state,
+              terminal_receipt_json
+         FROM agent_run_attempts
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, turnId)).toEqual(beforeInspection);
+    const secondAfterAuditCountRow = getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, turnId) as { count?: unknown } | null;
+    expect(Number(secondAfterAuditCountRow?.count ?? 0)).toBe(beforeAuditCount);
+  });
+  test("rolls back receipt repair when its required inspection marker is unavailable", () => {
+    const chatId = "chat-inspection-repair-fail";
+    const turnId = "turn-inspection-repair-fail";
+    seedChat(OWNER, chatId);
+    seedRun(OWNER, chatId, turnId);
+    getDb().query(
+      `INSERT INTO agent_run_source_deletions
+        (user_id, attempt_id, chat_id, source_kind, created_at, source_deleted_at)
+       VALUES (?, ?, ?, 'chat', 1, 1)`,
+    ).run(OWNER, turnId, chatId);
+
+    expect(() => withAgentRunProjectionTransaction((db) => publishAgentRunCommit(db, {
+      ...baseInput(OWNER, chatId, turnId),
+      status: "COMMITTED",
+      receiptId: "receipt-inspection-repair-fail",
+      receiptRepair: true,
+    }))).toThrow("agent run inspection repair projection unavailable");
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_projections WHERE turn_id = ?",
+    ).get(turnId)).toEqual({ count: 0 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?",
+    ).get(turnId)).toEqual({ count: 0 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_activity_runs WHERE generation_id = ?",
+    ).get(turnId)).toEqual({ count: 0 });
   });
 
 
@@ -513,6 +1065,16 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(first?.lastSequence).toBe(first?.cursorSequence);
     expect(__test__decodeChatRunCursor(first!.cursor.token).claims.s).toBe(first!.lastSequence);
 
+    const snapshotMembers = Array.from({ length: 17 }, (_, index) => `turn-resync-page-${index}`);
+    const updatedTurnId = first!.runs[0]!.turnId;
+    const updatedRevision = first!.runs[0]!.revision + 1;
+    const updatedAt = first!.runs[0]!.updatedAt + 1;
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-resync-pages", updatedTurnId),
+      revision: updatedRevision,
+      updatedAt,
+    }));
+
     const second = getAgentRunChanges(OWNER, "chat-resync-pages", first!.cursor.token);
     expect(second?.resync).toBe(true);
     expect(second?.runs).toHaveLength(1);
@@ -523,8 +1085,280 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       complete: true,
       omittedRuns: 0,
     });
+    const snapshotIds = [...first!.runs, ...second!.runs].map((run) => run.turnId);
+    expect(snapshotIds).toHaveLength(snapshotMembers.length);
+    expect(new Set(snapshotIds).size).toBe(snapshotMembers.length);
+    expect(snapshotIds).toEqual(expect.arrayContaining(snapshotMembers));
+
+    const delta = getAgentRunChanges(OWNER, "chat-resync-pages", second!.cursor.token);
+    expect(delta?.resync).toBe(false);
+    expect(delta?.events).toHaveLength(1);
+    expect(delta?.events[0]).toMatchObject({
+      sequence: expect.any(Number),
+      run: {
+        turnId: updatedTurnId,
+        revision: updatedRevision,
+        updatedAt,
+      },
+    });
+    expect(delta!.events[0]!.sequence).toBeGreaterThan(first!.cursorSequence);
+  });
+  test("freezes resync membership across expiry and projection deletion", () => {
+    seedChat(OWNER, "chat-resync-retention");
+    for (let index = 0; index < 17; index += 1) {
+      const turnId = `turn-resync-retention-${index}`;
+      seedRun(OWNER, "chat-resync-retention", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-retention", turnId),
+        revision: 1,
+      }));
+    }
+
+    const first = getAgentRunChanges(OWNER, "chat-resync-retention");
+    expect(first?.resyncPage?.complete).toBe(false);
+    const snapshotSequence = first!.resyncPage!.snapshotSequence;
+    const snapshotId = __test__decodeChatRunCursor(first!.cursor.token).claims.r;
+    expect(snapshotId).toEqual(expect.any(String));
+    const expiredTurnId = first!.runs[0]!.turnId;
+    const deletedTurnId = first!.runs[1]!.turnId;
+    getDb().query("UPDATE agent_turn_executions SET expires_at = 1 WHERE user_id = ? AND id = ?")
+      .run(OWNER, expiredTurnId);
+    getDb().query("DELETE FROM agent_run_projections WHERE user_id = ? AND chat_id = ? AND turn_id = ?")
+      .run(OWNER, "chat-resync-retention", deletedTurnId);
+
+    const second = getAgentRunChanges(OWNER, "chat-resync-retention", first!.cursor.token);
+    expect(second?.resyncPage).toMatchObject({
+      offset: 16,
+      totalRuns: 17,
+      snapshotSequence,
+      complete: true,
+    });
+    expect(second?.cursorSequence).toBe(first!.cursorSequence);
+    expect(second?.lastSequence).toBe(first!.lastSequence);
+    const snapshotIds = [...first!.runs, ...second!.runs].map((run) => run.turnId);
+    expect(snapshotIds).toHaveLength(17);
+    expect(new Set(snapshotIds).size).toBe(17);
+    expect(snapshotIds).toEqual(expect.arrayContaining(
+      Array.from({ length: 17 }, (_, index) => `turn-resync-retention-${index}`),
+    ));
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_resync_snapshots WHERE snapshot_id = ?",
+    ).get(snapshotId!)).toEqual({ count: 1 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_resync_snapshot_members WHERE snapshot_id = ?",
+    ).get(snapshotId!)).toEqual({ count: 17 });
+    getDb().query(
+      "UPDATE agent_run_resync_snapshots SET expires_at = 1 WHERE snapshot_id = ?",
+    ).run(snapshotId!);
+    getAgentRunChanges(OWNER, "chat-resync-retention", second!.cursor.token);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_resync_snapshots WHERE snapshot_id = ?",
+    ).get(snapshotId!)).toEqual({ count: 0 });
   });
 
+  test("keeps null, zero, negative, and malformed expiry rows visible in resync", () => {
+    seedChat(OWNER, "chat-resync-expiry-values");
+    const turnIds = [
+      "turn-resync-expiry-null",
+      "turn-resync-expiry-zero",
+      "turn-resync-expiry-negative",
+      "turn-resync-expiry-malformed",
+    ];
+    for (const turnId of turnIds) {
+      seedRun(OWNER, "chat-resync-expiry-values", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-expiry-values", turnId),
+        revision: 1,
+      }));
+    }
+    getDb().query("UPDATE agent_turn_executions SET expires_at = NULL WHERE id = ?")
+      .run(turnIds[0]!);
+    getDb().query("UPDATE agent_turn_executions SET expires_at = 0 WHERE id = ?")
+      .run(turnIds[1]!);
+    getDb().query("UPDATE agent_turn_executions SET expires_at = -1 WHERE id = ?")
+      .run(turnIds[2]!);
+    getDb().query("UPDATE agent_turn_executions SET expires_at = ? WHERE id = ?")
+      .run("malformed", turnIds[3]!);
+
+    const result = getAgentRunChanges(OWNER, "chat-resync-expiry-values");
+    expect(result?.runs).toHaveLength(turnIds.length);
+    expect(result?.runs.map((run) => run.turnId)).toEqual(expect.arrayContaining(turnIds));
+  });
+
+  test("uses the historical event set when the execution table is absent", () => {
+    seedChat(OWNER, "chat-resync-legacy");
+    for (let index = 0; index < 17; index += 1) {
+      const turnId = `turn-resync-legacy-${index}`;
+      seedRun(OWNER, "chat-resync-legacy", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-legacy", turnId),
+        revision: 1,
+      }));
+    }
+    getDb().run("PRAGMA foreign_keys = OFF");
+    getDb().run("DROP TABLE agent_turn_executions");
+
+    const first = getAgentRunChanges(OWNER, "chat-resync-legacy");
+    expect(first?.runs).toHaveLength(16);
+    const updatedTurnId = first!.runs[0]!.turnId;
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-resync-legacy", updatedTurnId),
+      revision: 2,
+      updatedAt: first!.runs[0]!.updatedAt + 1,
+    }));
+    const second = getAgentRunChanges(OWNER, "chat-resync-legacy", first!.cursor.token);
+    expect(second?.runs).toHaveLength(1);
+    expect(new Set([...first!.runs, ...second!.runs].map((run) => run.turnId)).size).toBe(17);
+  });
+
+  test("fails the resync before issuing a cursor when a historical snapshot is malformed", () => {
+    seedChat(OWNER, "chat-resync-malformed");
+    seedRun(OWNER, "chat-resync-malformed", "turn-resync-malformed");
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-resync-malformed", "turn-resync-malformed"),
+      revision: 1,
+    }));
+    getDb().query(
+      "UPDATE agent_chat_events SET snapshot_json = ? WHERE user_id = ? AND chat_id = ? AND turn_id = ?",
+    ).run("{", OWNER, "chat-resync-malformed", "turn-resync-malformed");
+    expect(() => getAgentRunChanges(OWNER, "chat-resync-malformed")).toThrow(
+      "agent run resync encountered malformed historical projection",
+    );
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_resync_snapshots WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, "chat-resync-malformed")).toEqual({ count: 0 });
+  });
+
+
+
+  test("replays an immutable resync page after response loss", () => {
+    seedChat(OWNER, "chat-resync-replay");
+    for (let index = 0; index < 33; index += 1) {
+      const turnId = `turn-resync-replay-${index}`;
+      seedRun(OWNER, "chat-resync-replay", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-replay", turnId),
+        revision: 1,
+      }));
+    }
+
+    const first = getAgentRunChanges(OWNER, "chat-resync-replay");
+    expect(first?.resyncPage).toMatchObject({ offset: 0, returnedRuns: 16, complete: false });
+    const firstClaims = __test__decodeChatRunCursor(first!.cursor.token).claims;
+    const snapshotExpiry = getDb().query(
+      "SELECT expires_at FROM agent_run_resync_snapshots WHERE snapshot_id = ?",
+    ).get(firstClaims.r!) as { expires_at: number };
+    expect(firstClaims.e).toBeLessThanOrEqual(snapshotExpiry.expires_at);
+    const second = getAgentRunChanges(OWNER, "chat-resync-replay", first!.cursor.token);
+    expect(second?.resyncPage).toMatchObject({ offset: 16, returnedRuns: 16, complete: false });
+    const secondClaims = __test__decodeChatRunCursor(second!.cursor.token).claims;
+    expect(secondClaims.e).toBeLessThanOrEqual(snapshotExpiry.expires_at);
+
+    const retry = getAgentRunChanges(OWNER, "chat-resync-replay", first!.cursor.token);
+    expect(retry?.resyncPage).toEqual(second?.resyncPage);
+    expect(retry?.runs).toEqual(second?.runs);
+    expect(retry?.cursorSequence).toBe(second?.cursorSequence);
+    expect(retry?.lastSequence).toBe(second?.lastSequence);
+    expect(retry?.tailSequence).toBe(second?.tailSequence);
+    expect(retry?.hasMore).toBe(second?.hasMore);
+    expect(retry?.events).toEqual(second?.events);
+    expect(retry?.omission).toEqual(second?.omission);
+
+    const third = getAgentRunChanges(OWNER, "chat-resync-replay", second!.cursor.token);
+    expect(third?.resyncPage).toMatchObject({
+      offset: 32,
+      returnedRuns: 1,
+      totalRuns: 33,
+      complete: true,
+    });
+    const finalRetry = getAgentRunChanges(OWNER, "chat-resync-replay", second!.cursor.token);
+    expect(finalRetry?.resyncPage).toEqual(third?.resyncPage);
+    expect(finalRetry?.runs).toEqual(third?.runs);
+  });
+
+  test("fails closed when a persisted resync member is malformed", () => {
+    seedChat(OWNER, "chat-resync-member-malformed");
+    for (let index = 0; index < 17; index += 1) {
+      const turnId = `turn-resync-member-malformed-${index}`;
+      seedRun(OWNER, "chat-resync-member-malformed", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-member-malformed", turnId),
+        revision: 1,
+      }));
+    }
+
+    const first = getAgentRunChanges(OWNER, "chat-resync-member-malformed");
+    const snapshotId = __test__decodeChatRunCursor(first!.cursor.token).claims.r;
+    expect(snapshotId).toEqual(expect.any(String));
+    const storedMember = getDb().query(
+      "SELECT run_json FROM agent_run_resync_snapshot_members WHERE snapshot_id = ? AND ordinal = ?",
+    ).get(snapshotId!, 16) as { run_json: string };
+    const malformed = JSON.parse(storedMember.run_json) as {
+      activity?: Array<Record<string, unknown>>;
+    };
+    malformed.activity![0]!.phase = "INVALID_PHASE";
+    getDb().query(
+      "UPDATE agent_run_resync_snapshot_members SET run_json = ? WHERE snapshot_id = ? AND ordinal = ?",
+    ).run(JSON.stringify(malformed), snapshotId!, 16);
+    expect(() => getAgentRunChanges(
+      OWNER,
+      "chat-resync-member-malformed",
+      first!.cursor.token,
+    )).toThrow("agent run resync snapshot contains malformed membership");
+  });
+  test("fails closed when persisted resync membership bounds or ownership drift", () => {
+    seedChat(OWNER, "chat-resync-membership-drift");
+    for (let index = 0; index < 17; index += 1) {
+      const turnId = `turn-resync-membership-drift-${index}`;
+      seedRun(OWNER, "chat-resync-membership-drift", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-membership-drift", turnId),
+        revision: 1,
+      }));
+    }
+
+    const first = getAgentRunChanges(OWNER, "chat-resync-membership-drift");
+    const snapshotId = __test__decodeChatRunCursor(first!.cursor.token).claims.r;
+    expect(snapshotId).toEqual(expect.any(String));
+    getDb().query(
+      "UPDATE agent_run_resync_snapshots SET total_runs = ? WHERE snapshot_id = ?",
+    ).run(16, snapshotId!);
+    expect(() => getAgentRunChanges(
+      OWNER,
+      "chat-resync-membership-drift",
+      first!.cursor.token,
+    )).toThrow("agent run resync snapshot membership is incomplete");
+    getDb().query(
+      "UPDATE agent_run_resync_snapshots SET total_runs = ? WHERE snapshot_id = ?",
+    ).run(17, snapshotId!);
+    getDb().query(
+      "UPDATE agent_run_resync_snapshot_members SET user_id = ? WHERE snapshot_id = ? AND ordinal = ?",
+    ).run(OTHER, snapshotId!, 16);
+    expect(() => getAgentRunChanges(
+      OWNER,
+      "chat-resync-membership-drift",
+      first!.cursor.token,
+    )).toThrow("agent run resync snapshot membership is incomplete");
+  });
+
+  test("rejects a full resync whose membership exceeds the retained bound", () => {
+    seedChat(OWNER, "chat-resync-bound");
+    for (let index = 0; index < 257; index += 1) {
+      const turnId = `turn-resync-bound-${index}`;
+      seedRun(OWNER, "chat-resync-bound", turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, "chat-resync-bound", turnId),
+        revision: 1,
+      }));
+    }
+
+    expect(() => getAgentRunChanges(OWNER, "chat-resync-bound")).toThrow(
+      "agent run resync membership exceeds the retained snapshot bound",
+    );
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_resync_snapshots WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, "chat-resync-bound")).toEqual({ count: 0 });
+  });
 
   test("startup terminalization atomically repairs FAILED and COMMIT_FAILED projections and outbox rows", () => {
     seedChat(OWNER, "chat-recovery-terminal");
@@ -614,6 +1448,44 @@ describe("AgentRunPublicV2 projection and cursor", () => {
       },
     });
   });
+  test("keeps root wall-clock deadline failures failed without changing true budget exhaustion", () => {
+    seedChat(OWNER, "chat-terminal-causes");
+    seedRun(OWNER, "chat-terminal-causes", "turn-root-deadline");
+    const rootDeadline = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-terminal-causes", "turn-root-deadline"),
+      status: undefined,
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      reason: "root_wall_clock_limit_exceeded",
+      error: { code: "root_wall_clock_limit_exceeded" },
+    }));
+    expect(rootDeadline.run).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      reason: "root_wall_clock_limit_exceeded",
+      error: { code: "root_wall_clock_limit_exceeded" },
+    });
+
+    seedRun(OWNER, "chat-terminal-causes", "turn-budget-exhausted");
+    const budgetExhausted = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, "chat-terminal-causes", "turn-budget-exhausted"),
+      status: undefined,
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "exhausted",
+      reason: "agentic_work_exhausted",
+      error: { code: "agentic_work_exhausted" },
+    }));
+    expect(budgetExhausted.run).toMatchObject({
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "exhausted",
+      reason: "agentic_work_exhausted",
+      error: { code: "limit_exceeded" },
+    });
+  });
 
   test("keeps target association owner-scoped and atomically writes terminal handoff plus compatibility activity", () => {
     seedChat(OWNER, "chat-terminal");
@@ -645,6 +1517,24 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(encoded).not.toContain("private work prose");
     expect(encoded).not.toContain("private args");
     expect(encoded).not.toContain("private result");
+  });
+  test("rolls back terminal projection when compatibility activity storage is unavailable", () => {
+    const chatId = "chat-compatibility-storage-fail";
+    const turnId = "turn-compatibility-storage-fail";
+    seedChat(OWNER, chatId);
+    seedRun(OWNER, chatId, turnId);
+    getDb().run("DROP TABLE agent_activity_runs");
+
+    expect(() => withAgentRunProjectionTransaction((db) => publishAgentRunCommit(db, {
+      ...baseInput(OWNER, chatId, turnId),
+      status: "COMMITTED",
+    }))).toThrow();
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_projections WHERE turn_id = ?",
+    ).get(turnId)).toEqual({ count: 0 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?",
+    ).get(turnId)).toEqual({ count: 0 });
   });
 
   test("cancels ownerless WORK durably before publishing the terminal projection", () => {
@@ -1039,7 +1929,114 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(result.removedProjections).toBe(1);
     expect(result.removedWorkspaces).toBe(0);
     expect(result.preservedChatLifetimeEntries).toBe(1);
+    expect(result.healthy).toBe(true);
     expect(getDb().query("SELECT state FROM agent_turn_workspaces WHERE workspace_id = 'workspace-expiry'").get()).toEqual({ state: "expired" });
     expect(getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_tasks WHERE task_id = 'task-chat-life'").get()).toEqual({ count: 1 });
+  });
+  test("filters expired projections before applying the bounded cleanup cap", () => {
+    const chatId = "chat-expiry-overflow";
+    const expiredTurnId = "turn-expiry-overflow";
+    const retainedCount = 256 + 1;
+    seedChat(OWNER, chatId);
+
+    getDb().transaction(() => {
+      for (let index = 0; index < retainedCount; index += 1) {
+        const turnId = `turn-expiry-retained-${index}`;
+        seedRun(OWNER, chatId, turnId);
+        appendAgentRunSnapshot(getDb(), baseInput(OWNER, chatId, turnId));
+        getDb().query(
+          "UPDATE agent_run_projections SET updated_at = ? WHERE user_id = ? AND turn_id = ?",
+        ).run(index + 1, OWNER, turnId);
+      }
+
+      seedRun(OWNER, chatId, expiredTurnId, expiredTurnId, "CANCELLED");
+      appendAgentRunSnapshot(getDb(), {
+        ...baseInput(OWNER, chatId, expiredTurnId),
+        status: "CANCELLED",
+      });
+      getDb().query(
+        "UPDATE agent_run_projections SET updated_at = ? WHERE user_id = ? AND turn_id = ?",
+      ).run(retainedCount + 1, OWNER, expiredTurnId);
+      getDb().query("UPDATE agent_turn_executions SET expires_at = 1 WHERE id = ?")
+        .run(expiredTurnId);
+    })();
+
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: retainedCount + 1 });
+
+    const result = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
+    expect(result.inspectedProjections).toBe(1);
+    expect(result.removedProjections).toBe(1);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_projections WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: retainedCount });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: retainedCount });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+    ).get(OWNER, expiredTurnId)).toEqual({ count: 0 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ?",
+    ).get(OWNER, expiredTurnId)).toEqual({ count: 0 });
+    getDb().query(
+      "UPDATE agent_turn_executions SET expires_at = 1 WHERE user_id = ? AND chat_id = ?",
+    ).run(OWNER, chatId);
+    const bounded = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
+    expect(bounded.inspectedProjections).toBe(256);
+    expect(bounded.removedProjections).toBe(256);
+    expect(bounded.healthy).toBe(false);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_projections WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: 1 });
+
+    const converged = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
+    expect(converged.inspectedProjections).toBe(1);
+    expect(converged.removedProjections).toBe(1);
+    expect(converged.healthy).toBe(true);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_projections WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: 0 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: 0 });
+  });
+  test("reports bounded workspace cleanup overflow until a follow-up pass converges", () => {
+    const chatId = "chat-workspace-expiry-overflow";
+    const workspaceCount = 256 + 1;
+    seedChat(OWNER, chatId);
+
+    getDb().transaction(() => {
+      for (let index = 0; index < workspaceCount; index += 1) {
+        const turnId = `turn-workspace-expiry-${index}`;
+        const workspaceId = `workspace-expiry-${index}`;
+        seedRun(OWNER, chatId, turnId);
+        getDb().query(
+          `INSERT INTO agent_turn_workspaces
+            (workspace_id, turn_id, execution_id, user_id, chat_id, objective, constraints_json,
+             state, revision, operation_caps_json, field_caps_json, retention, expires_at,
+             quota_tasks, quota_records, quota_submissions, quota_artifacts, quota_bytes)
+           VALUES (?, ?, ?, ?, ?, 'private', '{}', 'active', 1, '{}', '{}', 'turn_terminal',
+                   1, 10, 10, 10, 10, 100000)`,
+        ).run(workspaceId, turnId, turnId, OWNER, chatId);
+      }
+    })();
+
+    const bounded = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
+    expect(bounded.inspectedWorkspaces).toBe(256);
+    expect(bounded.removedWorkspaces).toBe(256);
+    expect(bounded.healthy).toBe(false);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_turn_workspaces WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: 1 });
+
+    const converged = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
+    expect(converged.inspectedWorkspaces).toBe(1);
+    expect(converged.removedWorkspaces).toBe(1);
+    expect(converged.healthy).toBe(true);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_turn_workspaces WHERE user_id = ? AND chat_id = ?",
+    ).get(OWNER, chatId)).toEqual({ count: 0 });
   });
 });

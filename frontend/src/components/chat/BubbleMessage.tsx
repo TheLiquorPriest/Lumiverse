@@ -5,6 +5,7 @@ import MessageContent from './MessageContent'
 import ReasoningBlock from './ReasoningBlock'
 import MessageAttachments from './MessageAttachments'
 import { useStore } from '@/store'
+import { selectAgentRunForTarget } from '@/store/slices/agent-runs'
 import { useCallback, useMemo } from 'react'
 import type { Message } from '@/types/api'
 import type { MessageOverrideProps } from '@/lib/componentOverrides'
@@ -32,9 +33,20 @@ export default function BubbleMessage({ message, chatId, depth = 0, isSelectMode
   } = useMessageCard(message, chatId)
 
   const openModal = useStore((s) => s.openModal)
+  const inspectionRun = useStore((state) => (
+    typeof message.swipe_id === 'number'
+      ? selectAgentRunForTarget(state, chatId, message.id, message.swipe_id)
+      : undefined
+  ))
   const handlePromptBreakdown = useCallback(() => {
-    openModal('promptItemizer', { messageId: message.id })
-  }, [openModal, message.id])
+    openModal('promptItemizer', {
+      messageId: message.id,
+      chatId,
+      ...(inspectionRun?.inspectionAttemptId
+        ? { inspectionAttemptId: inspectionRun.inspectionAttemptId }
+        : {}),
+    })
+  }, [openModal, message.id, chatId, inspectionRun?.inspectionAttemptId])
 
   const userLeft = isUser && bubbleUserAlign === 'left'
 

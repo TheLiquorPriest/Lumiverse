@@ -7,7 +7,10 @@ import {
   appendAgentRunSnapshot,
   withAgentRunProjectionTransaction,
 } from "../services/agent-run-projection.service";
-import { persistAgentRunInspection } from "../services/agent-activity-runs.service";
+import {
+  AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES,
+  persistAgentRunInspection,
+} from "../services/agent-activity-runs.service";
 
 const OWNER = "route-owner";
 const OTHER = "route-other";
@@ -265,11 +268,26 @@ describe("authenticated Agentic run routes", () => {
     });
     const created = await createdResponse.json() as { id: string };
 
-    const sessions = await app.request(`http://localhost/agent-runs/workspace/${created.id}/sessions`, {
+    const sessions = await app.request(`http://localhost/agent-runs/workspace/${created.id}/sessions?limit=1&offset=0`, {
       headers: { "x-test-user": OWNER },
     });
     expect(sessions.status).toBe(200);
-    expect(await sessions.json()).toEqual([]);
+    expect(await sessions.json()).toEqual({ data: [], total: 0, limit: 1, offset: 0 });
+    for (const offset of ["-1", "100001", "9007199254740992", "12junk"]) {
+      const invalidPage = await app.request(
+        `http://localhost/agent-runs/workspace/${created.id}/sessions?limit=1&offset=${offset}`,
+        { headers: { "x-test-user": OWNER } },
+      );
+      expect(invalidPage.status).toBe(400);
+      expect((await invalidPage.json()).error.reason).toBe("invalid_workspace_sessions_page");
+    }
+    const boundary = await app.request(
+      `http://localhost/agent-runs/workspace/${created.id}/sessions?limit=1&offset=100000`,
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(boundary.status).toBe(200);
+    expect(await boundary.json()).toEqual({ data: [], total: 0, limit: 1, offset: 100000 });
+
 
     const mutation = await app.request(`http://localhost/agent-runs/workspace/${created.id}/sessions`, {
       method: "POST",
@@ -335,11 +353,17 @@ describe("authenticated Agentic run routes", () => {
     );
     expect(ownerResponse.status).toBe(200);
     const ownerBody = await ownerResponse.json() as {
+      runId: string;
+      turnSessionId: string;
+      generationId: string;
       attempt: { attemptId: string };
       transcript: Array<{ arguments: string | null }>;
       activity: { milestones: Array<Record<string, unknown>> };
     };
     expect(ownerBody.attempt.attemptId).toBe("route-inspection-attempt");
+    expect(ownerBody.runId).toBe("route-inspection-run");
+    expect(ownerBody.turnSessionId).toBe("route-inspection-turn");
+    expect(ownerBody.generationId).toBe("route-inspection-generation");
     expect(ownerBody.transcript[0]?.arguments).toBe("PRIVATE-ROUTE-TRANSCRIPT");
     expect(ownerBody.activity.milestones[0]).not.toHaveProperty("privatePayload");
     expect(JSON.stringify(ownerBody.activity)).not.toContain("PRIVATE-ROUTE");
@@ -361,5 +385,74 @@ describe("authenticated Agentic run routes", () => {
       { headers: { "x-test-user": OWNER } },
     );
     expect(conflictingAliases.status).toBe(400);
+  });
+  test("serves inspection pages through emitted keyset cursors and rejects legacy or oversized cursors", async () => {
+    seedChat(OWNER, "route-inspection-pagination-chat");
+    for (const attemptId of ["route-page-01", "route-page-02", "route-page-03"]) {
+      expect(persistAgentRunInspection({
+        userId: OWNER,
+        chatId: "route-inspection-pagination-chat",
+        attemptId,
+        runId: `${attemptId}-run`,
+        turnSessionId: `${attemptId}-turn`,
+        generationId: `${attemptId}-generation`,
+        generationType: "normal",
+        hostCorrelationId: `${attemptId}-host`,
+        lifecycle: "TERMINAL",
+        status: "terminal",
+        outcome: "completed",
+        reason: "none",
+        updatedAt: 1,
+        terminalAt: 1,
+      })).not.toBeNull();
+    }
+
+    const first = await app.request(
+      "http://localhost/agent-runs/inspection?chatId=route-inspection-pagination-chat&limit=1",
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(first.status).toBe(200);
+    const firstBody = await first.json() as {
+      runs: Array<{ attempt: { attemptId: string } }>;
+      nextCursor: string | null;
+    };
+    expect(firstBody.runs.map((run) => run.attempt.attemptId)).toEqual(["route-page-03"]);
+    expect(firstBody.nextCursor).toEqual(expect.any(String));
+
+    const second = await app.request(
+      `http://localhost/agent-runs/inspection?chatId=route-inspection-pagination-chat&limit=1&cursor=${encodeURIComponent(firstBody.nextCursor!)}`,
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(second.status).toBe(200);
+    const secondBody = await second.json() as {
+      runs: Array<{ attempt: { attemptId: string } }>;
+      nextCursor: string | null;
+    };
+    expect(secondBody.runs.map((run) => run.attempt.attemptId)).toEqual(["route-page-02"]);
+    expect(secondBody.nextCursor).toEqual(expect.any(String));
+
+    const third = await app.request(
+      `http://localhost/agent-runs/inspection?chatId=route-inspection-pagination-chat&limit=1&cursor=${encodeURIComponent(secondBody.nextCursor!)}`,
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(third.status).toBe(200);
+    const thirdBody = await third.json() as {
+      runs: Array<{ attempt: { attemptId: string } }>;
+      nextCursor: string | null;
+    };
+    expect(thirdBody.runs.map((run) => run.attempt.attemptId)).toEqual(["route-page-01"]);
+    expect(thirdBody.nextCursor).toBeNull();
+
+    const legacy = await app.request(
+      "http://localhost/agent-runs/inspection?chatId=route-inspection-pagination-chat&limit=1&cursor=100000",
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(legacy.status).toBe(400);
+
+    const oversized = await app.request(
+      `http://localhost/agent-runs/inspection?chatId=route-inspection-pagination-chat&limit=1&cursor=${encodeURIComponent(`v1.${"a".repeat(AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES)}`)}`,
+      { headers: { "x-test-user": OWNER } },
+    );
+    expect(oversized.status).toBe(400);
   });
 });

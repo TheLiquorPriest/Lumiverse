@@ -474,6 +474,7 @@ export function applyPresetEditorDraft(
     id: current.id,
     name: (draftName as string).trim(),
     provider: 'loom',
+    engine: current.engine,
     parameters: structuredClone(draftParameters),
     prompt_order: blocks,
     prompts: structuredClone(draftPrompts),

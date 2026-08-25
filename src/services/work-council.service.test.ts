@@ -204,7 +204,6 @@ describe("WORK Council adapter boundaries", () => {
       "agent_delegate",
       "agent_execute",
       "workspace_write",
-      "context_pack_write",
       "render",
       "render_turn",
       "prepare_commit",

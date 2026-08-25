@@ -143,11 +143,14 @@ The response is the closed `EffectiveRuntimePublicResponseV1` projection:
 
 The public projection contains safe labels and revisions only. The internal
 candidate contains the normalized endpoint, credential reference, and
-trust-domain fingerprint and is never serialized. Readiness requires
-generation, streaming, tool calling, native tool continuation, tools-disabled
-finalization, complete input revisions, same-domain root/child connections,
-valid slots/context/cognition, healthy terminable preprocessing, healthy
-publication storage, and the current readiness vector.
+trust-domain fingerprint and is never serialized. The effective-runtime
+decision performs request-local admission for generation, streaming, tool
+calling, native tool continuation, tools-disabled finalization, complete input
+revisions, same-domain root/child connections, valid slots/context/cognition,
+healthy terminable preprocessing, healthy publication storage, and the current
+startup readiness vector. Startup does not claim provider, preset-binding,
+context-ACL, or input-revision readiness before the request supplies those
+authorities.
 
 The effective mode has explicit precedence:
 authenticated one-turn selection, ready durable chat override, reviewed
@@ -206,31 +209,54 @@ version for authored V2 data, not executable V1 configuration. It carries
 authored slot IDs and policy but never local connection IDs, credentials,
 bindings, grants, or one-turn authority.
 
+The ordinary `PUT /api/v1/presets/:id` route always requires
+`expected_cache_revision`. If the body includes top-level `agent_config`, it
+additionally requires snake_case `expected_config_revision`; an ordinary update
+without `agent_config` does not require that config precondition. A stale
+Agentic-config write returns HTTP `409 AGENT_CONFIG_REVISION_CONFLICT` with the
+canonical snake_case fields
+`{ preset_id, expected_config_revision, actual_config_revision, preset,
+agent_config_revision, agent_config, agent_config_review, cache_revision }`.
+The dedicated `/agent-config` route below remains camelCase
+(`expectedPresetRevision`, `expectedConfigRevision`) and its config-conflict
+projection includes
+`{ expectedConfigRevision, actualConfigRevision, preset, editor, configRevision }`.
+
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/v1/presets/:id/agent-config` | Return the shared V2 editor object directly (not a `{ preset, editor }` wrapper): `presetId`, `presetRevision`, `configRevision`, `config`, `review`, `slotBindings`, context/task selections, `hostCeilings`, and `reviewAcknowledgements`. Missing/foreign presets return `404`. |
-| `PUT` | `/api/v1/presets/:id/agent-config` | Atomically save `config`, `slotBindings`, `contextPackSelections`, `contextRules`, `taskTemplates`, `reviewAcknowledgements`, `promptOrder`, `expectedPresetRevision`, and `expectedConfigRevision`. Unknown or malformed bodies return `400`; a missing revision precondition returns `428`. |
-| `GET` | `/api/v1/presets/:id/agent-runtime/portable` | Return the complete `PortablePresetRuntimeEnvelopeV1`: portable config, Context Pack snapshots/selections, context rules, and task templates, without local bindings or credentials. |
-| `POST` | `/api/v1/presets/import-portable` | Accept `{ preset: PortablePresetPayload, agentRuntime: PortablePresetRuntimeEnvelopeV1 }` and atomically import the complete preset/runtime/context graph as disabled, response-only, and review-required. |
+| `GET` | `/api/v1/presets/:id/agent-config` | Return the shared V2 editor object directly (not a `{ preset, editor }` wrapper): `presetId`, `presetRevision`, `configRevision`, `config`, `review`, `slotBindings`, `taskTemplates`, `hostCeilings`, and `reviewAcknowledgements`. Missing/foreign presets return `404`. |
+| `PUT` | `/api/v1/presets/:id/agent-config` | Atomically save `config`, `slotBindings`, `taskTemplates`, `reviewAcknowledgements`, `promptOrder`, `expectedPresetRevision`, and `expectedConfigRevision`. Unknown or malformed bodies return `400`; a missing revision precondition returns `428`; success returns canonical `{ preset, editor }` state with refreshed preset/config revisions. |
+| `GET` | `/api/v1/presets/:id/agent-runtime/portable` | Return the complete `PortablePresetRuntimeEnvelopeV1`: portable config and task templates, without local bindings or credentials. |
+| `POST` | `/api/v1/presets/import-portable` | Accept `{ preset: PortablePresetPayload, agentRuntime: PortablePresetRuntimeEnvelopeV1 }` and atomically import the complete preset/runtime graph as disabled, response-only, and review-required. |
 | `GET` | `/api/v1/presets/:id/agent-config/portable` | Return config-only `PortableAgentConfigV1` without local bindings or credentials. |
 | `POST` | `/api/v1/presets/agent-config/portable/import` | Accept a config-only `PortablePresetPayload`; create a foreign preset/config as disabled, response-only, and review-required until local slot review. |
-| `POST` | `/api/v1/presets/:id/duplicate` | Same-account transactional duplicate of preset, normalized config, authorized bindings, regex companions, and the validated authored runtime envelope; Context Library rows are referenced, not cloned. |
+| `POST` | `/api/v1/presets/:id/duplicate` | Same-account transactional duplicate of preset, normalized config, authorized bindings, regex companions, task templates, and review acknowledgements. |
 | `POST` | `/api/v1/presets/:id/agent-runtime/repair-acknowledgement` | Record a revision-fenced owner review `{ reasonCode, expectedPresetRevision }`; returns the persisted acknowledgement and never grants mode/capability authority. |
 | `GET` | `/api/v1/presets/agent-runtime-limits` | Read immutable effective host ceilings. |
 
 The `PUT /api/v1/presets/:id/agent-config` body is closed: unknown keys and
-malformed values are rejected with `400`, and omitting either revision
-precondition is rejected with `428`. Stale preconditions are conflicts, not
-merges. The duplicate operation is the frontend/editor path; callers must not
-marshal a Loom preset locally when duplicating because that omits normalized
-Agentic state and authored cognition selections.
+malformed values are rejected with `400`, and omitting
+`expectedPresetRevision` returns `428 PRESET_REVISION_REQUIRED` while omitting
+`expectedConfigRevision` returns `428 AGENT_CONFIG_REVISION_REQUIRED`. Stale
+preconditions are HTTP `409`, not merges: `PRESET_REVISION_CONFLICT` for a
+stale preset revision and `AGENT_CONFIG_REVISION_CONFLICT` for a stale config
+revision. A successful save returns the canonical `{ preset, editor }`
+projection; replace local draft state with it. After a conflict, refresh the
+canonical editor and intentionally reapply the preserved draft. The duplicate
+operation is the frontend/editor path; callers must not marshal a Loom preset
+locally when duplicating because that omits normalized Agentic state and
+authored task templates.
 
-`AgentConfigV2.runtimePolicy.loomPolicy` is the canonical four-bucket Loom
-authoring record (`workPolicy`, `workspaceUsage`, `completionCriteria`,
-`renderPolicy`). Its source revisions, fixed destinations/checkpoints,
-delivery policy, and `visibility: 'work_only'` are preserved by the config
-and portable routes. Response assembly omits WORK-only entries; owner
-inspection reports typed Loom outcomes and Response omission provenance.
+`AgentConfigV2.runtimePolicy.loomPolicy` is the canonical four-bucket Loom authoring record (`workPolicy`, `workspaceUsage`, `completionCriteria`, `renderPolicy`). Loom owns only existing prompt blocks plus **Phased Instructions**; it is not a second context authority.
+
+The fixed routes are `workPolicy` and `workspaceUsage` → root **WORK** / **WORK**, `completionCriteria` → completion handoff / **PREPARE_COMMIT**, and `renderPolicy` → tools-disabled **RENDER** / **RENDER**. Source revisions, fixed destinations/checkpoints, typed conditions, and `visibility: 'work_only'` are preserved by the config and portable routes. Conditions evaluate fail-closed at their owning checkpoint against its immutable snapshot and remain fixed for that checkpoint.
+
+`runtimePolicy.phases` is bounded and current-phase-only; later phase instructions are not materialized early. Each custom phase can declare explicit `childInstructionSubsets`, and each child receives only its named admitted subset.
+
+Response assembly omits WORK/Agentic-only Loom entries but otherwise keeps the established Response contract, preserving the conversation and ordinary native World Book and Databank assembly. Owner inspection reports route/order, roles, conditions, source identity/revision and hashes when recorded, destination-level deduplication (one effective copy with every role/reason/overlap retained), omissions, custom-phase/child-subset receipts, accepted crossings, and tools/delegation. Unavailable evidence is marked unavailable, never inferred, through stable `inspection` and `responseOmission` fields.
+
+Native World Books own lore activation, placement, attachment, editing, and access. Databanks own document attachment, editing, access, semantic retrieval, and explicit `#slug` retrieval; both remain outside Loom and use live native objects. [Context Filters](../../user-docs/docs/presets/context-filters.md) and unrelated native Loom content [packs](../../user-docs/docs/packs/index.md) remain supported. The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are not supported.
+Those native paths remain authoritative for ordinary Response assembly.
 
 `GET /api/v1/presets/agent-runtime-limits` returns the immutable
 `AgentRuntimeHostLimits` object with exactly these numeric fields:
@@ -353,19 +379,24 @@ output.
 |---|---|---|
 | `GET` | `/api/v1/agent-runs/changes/:chatId` | Return cursor delta/full-resync `AgentRunChangesV2`. |
 | `GET` | `/api/v1/agent-runs/status/:turnId` | Return exact `AgentRunPublicV2` by Turn Session ID. |
-| `GET` | `/api/v1/agent-runs/inspection?chatId=...` | Return owner-scoped `AgentRunInspectionListV1`; `limit` is 1–64 and `cursor` is a decimal offset. |
+| `GET` | `/api/v1/agent-runs/inspection?chatId=...` | Return owner-scoped `AgentRunInspectionListV1`; `limit` is 1–64. |
 | `GET` | `/api/v1/agent-runs/:attemptId/inspection` | Return owner-scoped `AgentRunInspectionDetailV1`. |
 | `POST` | `/api/v1/agent-runs/:attemptId/retry` | Admit a strict retry; body must be empty or `{}`. |
 | `GET` | `/api/v1/agent-runs/:turnId/workspace` | Return the redacted Turn Session workspace index. |
 | `GET` | `/api/v1/agent-runs/:turnId/workspace/:section` | Return one redacted page for `objective`, `tasks`, `records`, `submissions`, or `artifacts`. |
 | `POST` | `/api/v1/agent-runs/:turnId/stop` | Request exact root Stop and return `accepted`, `too_late`, or `terminal`. |
 
-Send the opaque, versioned integrity-protected cursor as `?cursor=...` or
-`x-agent-run-cursor`. The server binds it to the authenticated owner/chat and
-the last strictly increasing chat event sequence. `revision` is monotonic
-run state, not a chat cursor. An expired cursor returns one bounded
-full-resync snapshot and a fresh cursor; clients must not infer failure from
-missing events or silence. Exact status, inspection, and workspace reads
+Changes/full-resync endpoints accept the opaque, versioned integrity-protected
+chat cursor as `?cursor=...` or `x-agent-run-cursor`. The server binds it to
+the authenticated owner/chat and the last strictly increasing chat event
+sequence. Inspection pagination uses a separate opaque, versioned base64url
+sort-key cursor in the `cursor` query parameter only (`?cursor=...`); it is
+not a decimal offset, integrity-protected, or bound to chat event sequence,
+and it carries the inspection list's descending `updated_at`/attempt-ID sort
+key. `revision` is monotonic run state, not a chat cursor. An expired cursor
+returns one bounded full-resync snapshot and a fresh cursor; clients must not
+infer failure from missing events or silence.
+Exact status, inspection, and workspace reads
 recheck owner, chat, attempt/turn, target-message/swipe ownership, and
 visibility. Missing, foreign, expired, or no-longer-retained data is the
 same non-disclosing `404`.
@@ -456,7 +487,7 @@ whose chat does not match the requested chat is the same non-disclosing `404`.
 | `GET` | `/api/v1/agent-runs/workspace?chatId=...` | Read the persistent workspace attached to the authenticated owner's chat. |
 | `POST` | `/api/v1/agent-runs/workspace?chatId=...` | Create or ensure the persistent workspace for the authenticated owner/chat (`201`). |
 | `GET` | `/api/v1/agent-runs/workspace/:workspaceId` | Read one owner-scoped workspace; an optional `chatId` query verifies its live attachment. |
-| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/sessions` | List retained Turn Session associations. |
+| `GET` | `/api/v1/agent-runs/workspace/:workspaceId/sessions?limit=&offset=` | Read one bounded page of retained Turn Session associations. |
 | `GET` | `/api/v1/agent-runs/workspace/:workspaceId/tasks` | List persistent tasks. |
 | `GET` | `/api/v1/agent-runs/workspace/:workspaceId/records` | List findings, decisions, and questions. |
 | `GET` | `/api/v1/agent-runs/workspace/:workspaceId/artifacts` | List attached artifact metadata. |
@@ -467,6 +498,13 @@ whose chat does not match the requested chat is the same non-disclosing `404`.
 | `POST` | `/api/v1/agent-runs/workspace/:workspaceId/publications` | Publish an owner-selected workspace item with `expectedRevision` (`201`). |
 | `DELETE` | `/api/v1/agent-runs/workspace/:workspaceId/publications/:publicationId` | Delete a publication copy with `expectedRevision`. |
 | `DELETE` | `/api/v1/agent-runs/workspace/:workspaceId` | Delete the workspace with `expectedRevision`. |
+
+The sessions route follows the standard `limit`/`offset` pagination contract:
+`limit` defaults to `50` and is clamped to `1..1000`; `offset` defaults to
+`0` and must be non-negative. The response is `{ data, total, limit, offset }`,
+where `data` contains only that bounded page. Clients must advance `offset`
+using the returned `limit` (or the number of received rows) rather than
+assuming the first page is complete.
 
 The owner mutation bodies use these closed shapes (server-owned identity and
 authority fields are not client inputs):
@@ -548,99 +586,6 @@ bounded copy with source digest and provenance (including the originating
 workspace/Turn Session/attempt and message/swipe identity when available).
 Publication copies are noncanonical: they do not become chat messages, do not
 rewrite source workspace records, and do not confer WORK authority.
-
-## Context Library API
-
-Context packs are account-owned, immutable-revision data with optional
-attachments to a `preset`, `chat`, or `world_book` target. There is no project
-scope. CRUD, attachment, ACL, export, and duplicate operations are
-owner-scoped: the authenticated owner is derived from the session, and
-non-owner or cross-owner access returns the same non-disclosing `404 Not found`.
-Agentic context retrieval additionally rechecks the frozen candidate's ACL.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/v1/context-packs` | List packs; query `include_disabled`, `include_review`, `limit`, `offset`. Returns `{ data, contextAclRevision }`. |
-| `POST` | `/api/v1/context-packs` | Create `{ name, description?, visibility?, content, provenance? }`; returns `{ pack, revision }` (`201`). |
-| `POST` | `/api/v1/context-packs/import` | Import an exact `PortableContextPackSnapshotV1`; returns `{ pack, revision, attached: false, reviewRequired: true }` (`201`). |
-| `GET` | `/api/v1/context-packs/:packId` | Return `{ pack, revisions }`. |
-| `PUT` | `/api/v1/context-packs/:packId` | Update with `{ name?, description?, visibility?, state?, expectedRevision }`; returns `{ pack, contextAclRevision }`. |
-| `DELETE` | `/api/v1/context-packs/:packId` | Delete with required `?expected_revision=...`; returns `{ success, contextAclRevision }`. |
-| `GET` | `/api/v1/context-packs/:packId/revisions` | List immutable revisions in `{ data }`; `include_inactive=true` is optional. |
-| `POST` | `/api/v1/context-packs/:packId/revisions` | Create `{ content, expectedRevision?, provenance? }`; returns the revision (`201`). |
-| `GET` | `/api/v1/context-packs/:packId/revisions/:revision` | Read one exact revision. |
-| `GET` | `/api/v1/context-packs/:packId/acl` | Read ACL entries in `{ data }`. |
-| `PUT` | `/api/v1/context-packs/:packId/acl` | Set `{ entries, expectedContextAclRevision }`; returns `{ data, contextAclRevision }`. |
-| `POST` | `/api/v1/context-packs/:packId/review` | Set `{ state: 'active' | 'disabled', acknowledge: true, expectedRevision }`; returns `{ pack, contextAclRevision }`. |
-| `GET` | `/api/v1/context-packs/:packId/attachments` | List attachments in `{ data }`; filter by `scope` and `target_id`. |
-| `POST` | `/api/v1/context-packs/:packId/attachments` | Attach `{ scope: 'preset' | 'chat' | 'world_book', targetId, revision, position?, required?, provenance?, expectedContextAclRevision? }`; returns `{ attachment, contextAclRevision }` (`201`). |
-| `DELETE` | `/api/v1/context-packs/:packId/attachments/:attachmentId` | Delete with required `scope` and `?expected_revision=...`; returns `{ success, contextAclRevision }`. |
-| `GET` | `/api/v1/context-packs/:packId/export` | Export one selected immutable revision as `PortableContextPackSnapshotV1`; optional `?revision=...`. |
-| `POST` | `/api/v1/context-packs/:packId/duplicate` | Duplicate with `{ name?, description?, preserveAttachments?, selectedAttachments? }`; returns `{ pack, revisions, attachments }` (`201`). |
-
-`content` is an array of `ContextPackEntryV1` records
-`{ id, title, body, tags }`. It is capped at 256 entries, 4 MiB total UTF-8
-bytes, 128 bytes per ID, 256 bytes per title, 256 KiB per body, 32 tags per
-entry, and 64 bytes per tag. Pack names are capped at 200 bytes,
-descriptions at 8 KiB, and serialized provenance at 16 KiB. `provenance` is
-the closed `{ kind: 'local' | 'portable_import' | 'archive_restore' |
-'same_account_duplicate', sourceDigest?, sourcePackId?, archiveId? }`
-shape; unknown keys are invalid.
-
-ACL `entries` are `{ principalUserId, permission }` records, where permission
-is `read | use | edit`; the authenticated owner remains the authority and
-ACL writes are revision-CAS protected. Portable snapshots contain one selected
-immutable revision and its content digest/counts, never ACLs or live
-attachments.
-
-`visibility` is `private | account | restricted`; pack/revision/attachment
-`state` is `active | disabled | review_required | repair_required`. ACL
-entries use `permission: 'read' | 'use' | 'edit'`. `review` accepts only
-`active` or `disabled` with `acknowledge: true`; `expectedRevision` is
-required for update/review, while attachment and ACL writes use the account
-`expectedContextAclRevision` CAS. Revision/delete operations use their stated
-`expectedRevision`/`expected_revision` precondition. Unknown or malformed
-body/query values are `400` (`CONTEXT_PACK_INVALID`); missing/hidden owner
-data is the non-disclosing `404`; stale pack or ACL revisions are `409` with
-`CONTEXT_PACK_REVISION_CONFLICT` or `CONTEXT_PACK_ACL_REVISION_CONFLICT` and
-the expected/actual revision fields.
-
-Revision content is bounded and content-addressed by `contentDigest`,
-`byteCount`, and `tokenCount`; revisions are immutable. ACL/revision/attachment
-changes increment `contextAclRevision` and invalidate outstanding Agentic
-decisions. During Agentic WORK, the reserved `context_pack_list` returns only
-bounded metadata from the ASSEMBLE-frozen candidate set, and
-`context_pack_get` requires an exact pack/revision and rechecks ACL before and
-after reading bounded literal pages. A required access race fails the turn
-closed; an optional denial returns one correlated non-disclosing observation.
-Neither tool can run macros, mutate ACLs, or widen the candidate set.
-
-The reserved Agentic WORK tools use closed envelopes (not REST request bodies):
-
-```ts
-context_pack_list({ limit?: number, offset?: number })
-// success: { status: 'success', toolName: 'context_pack_list',
-//   data: { candidates, total, limit, offset, truncated } }
-
-context_pack_get({
-  pack_id: string, revision_id: string, revision: number,
-  limit?: number, offset?: number,
-})
-// success: { status: 'success', toolName: 'context_pack_get',
-//   data: { packId, revisionId, revision, digest, records,
-//           total, limit, offset, truncated } }
-```
-
-`context_pack_list` defaults to `limit: 20` and caps it at 32; `get` defaults
-to 16 and caps it at 16. Both use a non-negative bounded `offset`, reject
-unknown keys, and return `{ status: 'error', toolName, errorCode, message? }`
-for `invalid_arguments`, `context_pack_not_found`,
-`context_access_denied`, `context_access_invalidated`,
-`context_pack_limit_exceeded`, `cancelled`, or `internal_error`. The frozen
-candidate sources are account, preset, chat, and `world_book`; WORK cannot
-widen them. A required candidate access/revision invalidation fails closed;
-an optional denial or invalidation returns one correlated
-`context_pack_not_found` observation without disclosing why.
 
 ## Standard generation compatibility events
 
@@ -727,8 +672,7 @@ curl -X DELETE http://localhost:7860/api/v1/spindle/${EXTENSION_ID}
 ## Implementation anchors
 
 - `src/app.ts`: authenticated route mounting for `/api/v1/generate`,
-  `/api/v1/chats`, `/api/v1/presets`, `/api/v1/agent-runs`, and
-  `/api/v1/context-packs`.
+  `/api/v1/chats`, `/api/v1/presets`, and `/api/v1/agent-runs`.
 - `src/routes/generate.routes.ts` and
   `src/services/agent-runtime-decision.service.ts`: effective-runtime
   normalization, generation body, mode errors, and stop compatibility.
@@ -736,10 +680,6 @@ curl -X DELETE http://localhost:7860/api/v1/spindle/${EXTENSION_ID}
   `src/services/agent-run-projection.service.ts`, and
   `src/types/agent-run-projection.ts`: opaque chat cursors, redacted run DTOs,
   view-only workspace pages, and exact root Stop.
-- `src/routes/agent-context-packs.routes.ts`,
-  `src/services/agent-context-packs.service.ts`, and
-  `src/types/agent-context-packs.ts`: owner-scoped Context Library,
-  immutable revisions, ACL revisions, portable snapshots, and conflict codes.
 - `src/ws/events.ts` and
   `src/services/agentic-generation-coordinator.service.ts`: standard
   compatibility event names and post-commit message handoff.

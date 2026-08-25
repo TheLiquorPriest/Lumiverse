@@ -6,7 +6,10 @@ import type {
 } from "../llm/types";
 import { GENERATION_TARGETS } from "../types/turn-execution";
 import type { FinalRenderReservationV1, GenerationTargetV1 } from "../types/turn-execution";
-import type { WorkspaceContextProjectionV1 } from "./workspace-context-projection.service";
+import {
+  validateWorkspaceContextProjectionV1,
+  type WorkspaceContextProjectionV1,
+} from "./workspace-context-projection.service";
 import type { ResolvedConcreteConnectionV1 } from "./connections.service";
 import { finalRenderActivityChunkLimitV1 } from "./turn-execution.service";
 import {
@@ -73,20 +76,17 @@ export interface AgenticRenderPhaseInputV1 {
   readonly signal?: AbortSignal;
 }
 
-/** Host-owned finalization request. `tools` is intentionally a literal empty tuple. */
+/** Host-owned finalization request. No WORK or policy metadata crosses this provider seam. */
 export interface AgenticRenderProviderRequestV1 {
   readonly connection: ResolvedConcreteConnectionV1;
   readonly model: string;
   readonly messages: readonly LlmMessage[];
-  readonly acceptedWorkspace: AgenticAcceptedWorkspaceProjectionV1;
-  readonly renderPolicy: AgenticFrozenRenderPolicyV1;
   readonly tools: readonly [];
   readonly toolMode: "finalization";
   readonly stream: true;
   readonly maxOutputTokens?: number;
   readonly receiveLimitBytes: number;
   readonly parameters?: Readonly<Record<string, unknown>>;
-  readonly providerTransientCarrier?: ProviderTransientCarrier;
   readonly signal: AbortSignal;
 }
 export type AgenticRenderProviderStreamV1 = AsyncIterable<StreamChunk>;
@@ -283,6 +283,15 @@ function snapshotStreamChunk(value: unknown): StreamChunk {
     fail("render_protocol_error");
   }
 }
+function isRenderNoProgressChunk(chunk: StreamChunk, token: string): boolean {
+  if (token.length > 0) return false;
+  if (typeof chunk.reasoning === "string" && chunk.reasoning.length > 0) return false;
+  if (typeof chunk.finish_reason === "string" && chunk.finish_reason.length > 0) return false;
+  if ((chunk.thinking_blocks?.length ?? 0) > 0) return false;
+  if ((chunk.reasoning_details?.length ?? 0) > 0) return false;
+  return true;
+}
+
 
 
 function safeUsage(value: unknown): AgenticRenderUsageV1 | undefined {
@@ -321,21 +330,44 @@ function targetKey(target: GenerationTargetV1): string {
     target.messageGenerationRevision,
   ]);
 }
-function cloneMessages(messages: readonly LlmMessage[]): LlmMessage[] {
+const MAX_RENDER_POLICY_MESSAGES = 16_384;
+const MAX_RENDER_MESSAGE_BYTES = 2 * 1024 * 1024;
+
+function validateRenderPolicyMessages(messages: unknown): asserts messages is readonly LlmMessage[] {
+  if (!Array.isArray(messages) || messages.length > MAX_RENDER_POLICY_MESSAGES) fail("invalid_input");
+  for (const message of messages) {
+    if (!isRecord(message) || Array.isArray(message)) fail("invalid_input");
+    const keys = Object.keys(message);
+    if (
+      keys.some((key) => key !== "role" && key !== "content" && key !== "name")
+      || (message.role !== "system" && message.role !== "user" && message.role !== "assistant")
+      || typeof message.content !== "string"
+      || utf8ByteLength(message.content) > MAX_RENDER_MESSAGE_BYTES
+      || (
+        message.name !== undefined
+        && (
+          typeof message.name !== "string"
+          || message.name.length === 0
+          || utf8ByteLength(message.name) > 256
+        )
+      )
+    ) {
+      fail("invalid_input");
+    }
+  }
+}
+
+function cloneMessages(messages: readonly LlmMessage[]): readonly LlmMessage[] {
   try {
-    return messages.map((message) => structuredClone(message));
+    return Object.freeze(messages.map((message) => Object.freeze(structuredClone(message))));
   } catch {
     fail("invalid_input");
   }
 }
 
-function serializedContextBytes(input: AgenticRenderPhaseInputV1, messages: readonly LlmMessage[]): number {
+function serializedContextBytes(messages: readonly LlmMessage[]): number {
   try {
-    const serialized = JSON.stringify({
-      messages,
-      acceptedWorkspace: input.acceptedWorkspace,
-      renderPolicy: input.renderPolicy,
-    });
+    const serialized = JSON.stringify({ messages });
     if (typeof serialized !== "string") fail("invalid_input");
     return utf8ByteLength(serialized);
   } catch (error) {
@@ -344,20 +376,20 @@ function serializedContextBytes(input: AgenticRenderPhaseInputV1, messages: read
   }
 }
 
-function validateInput(input: AgenticRenderPhaseInputV1): void {
+function validateInput(input: AgenticRenderPhaseInputV1): WorkspaceContextProjectionV1 {
   if (!input || typeof input !== "object") fail("invalid_input");
   if (typeof input.turnId !== "string" || input.turnId.length === 0 || utf8ByteLength(input.turnId) > 256) {
     fail("invalid_input");
   }
   const target = input.target;
   if (
-    !target ||
-    typeof target !== "object" ||
-    Array.isArray(target) ||
-    !GENERATION_TARGETS.includes(target.target) ||
-    typeof target.chatId !== "string" ||
-    target.chatId.length === 0 ||
-    utf8ByteLength(target.chatId) > 256
+    !target
+    || typeof target !== "object"
+    || Array.isArray(target)
+    || !GENERATION_TARGETS.includes(target.target)
+    || typeof target.chatId !== "string"
+    || target.chatId.length === 0
+    || utf8ByteLength(target.chatId) > 256
   ) {
     fail("invalid_input");
   }
@@ -365,28 +397,6 @@ function validateInput(input: AgenticRenderPhaseInputV1): void {
   if (typeof input.connection.model !== "string" || input.connection.model.length === 0) fail("invalid_input");
   if (input.connection.capabilities?.toolsDisabledFinalization !== true) {
     fail("render_tool_finalization_unsupported");
-  }
-  if (!input.acceptedWorkspace || typeof input.acceptedWorkspace !== "object") fail("invalid_input");
-  if (!Number.isSafeInteger(input.acceptedWorkspace.revision) || input.acceptedWorkspace.revision < 0) {
-    fail("invalid_input");
-  }
-  const projection = input.acceptedWorkspace.workspaceContextProjection;
-  if (
-    !projection
-    || projection.version !== 1
-    || projection.sourceWorkspaceRevision !== input.acceptedWorkspace.revision
-    || typeof projection.literal !== "string"
-    || !Number.isSafeInteger(projection.utf8Bytes)
-    || projection.utf8Bytes !== utf8ByteLength(projection.literal)
-  ) {
-    fail("invalid_input");
-  }
-  if (!input.renderPolicy || typeof input.renderPolicy !== "object") fail("invalid_input");
-  if (!Number.isSafeInteger(input.renderPolicy.revision) || input.renderPolicy.revision < 0) fail("invalid_input");
-  if (!Array.isArray(input.renderPolicy.messages)) fail("invalid_input");
-  if (input.renderPolicy.maxOutputTokens !== undefined &&
-      (!Number.isSafeInteger(input.renderPolicy.maxOutputTokens) || input.renderPolicy.maxOutputTokens <= 0)) {
-    fail("invalid_input");
   }
   const budget = input.reservedBudgets;
   if (!budget || typeof budget !== "object") fail("invalid_input");
@@ -406,6 +416,40 @@ function validateInput(input: AgenticRenderPhaseInputV1): void {
   if (!Number.isSafeInteger(budget.deadlineAt) || budget.deadlineAt <= 0) {
     fail("render_budget_exceeded");
   }
+  if (!input.acceptedWorkspace || typeof input.acceptedWorkspace !== "object") fail("invalid_input");
+  if (!Number.isSafeInteger(input.acceptedWorkspace.revision) || input.acceptedWorkspace.revision < 0) {
+    fail("invalid_input");
+  }
+  let projection: WorkspaceContextProjectionV1;
+  try {
+    projection = validateWorkspaceContextProjectionV1(
+      input.acceptedWorkspace.workspaceContextProjection,
+      {
+        surface: "render",
+        expectedRevision: input.acceptedWorkspace.revision,
+        maxUtf8Bytes: budget.contextBytes,
+      },
+    );
+  } catch {
+    fail("invalid_input");
+  }
+  if (!input.renderPolicy || typeof input.renderPolicy !== "object") fail("invalid_input");
+  if (!Number.isSafeInteger(input.renderPolicy.revision) || input.renderPolicy.revision < 0) fail("invalid_input");
+  validateRenderPolicyMessages(input.renderPolicy.messages);
+  if (input.renderPolicy.maxOutputTokens !== undefined &&
+      (!Number.isSafeInteger(input.renderPolicy.maxOutputTokens) || input.renderPolicy.maxOutputTokens <= 0)) {
+    fail("invalid_input");
+  }
+  if (
+    input.renderPolicy.parameters !== undefined
+    && (
+      !isRecord(input.renderPolicy.parameters)
+      || Array.isArray(input.renderPolicy.parameters)
+      || measuredProviderBytes(input.renderPolicy.parameters) > budget.contextBytes
+    )
+  ) {
+    fail("invalid_input");
+  }
   if (input.framePrivate?.providerTransientCarrier !== undefined && !validRenderCarrier(input.framePrivate.providerTransientCarrier)) {
     fail("render_protocol_error");
   }
@@ -414,6 +458,7 @@ function validateInput(input: AgenticRenderPhaseInputV1): void {
       !Array.isArray(input.framePrivate.transcript)) {
     fail("invalid_input");
   }
+  return projection;
 }
 
 function abortErrorCode(
@@ -514,8 +559,9 @@ export async function runAgenticRenderPhaseV1(
   deps: AgenticRenderPhaseDepsV1,
 ): Promise<AgenticRenderResultV1> {
   const frameBeforeValidation = input?.framePrivate;
+  let validatedProjection: WorkspaceContextProjectionV1;
   try {
-    validateInput(input);
+    validatedProjection = validateInput(input);
     if (!deps || typeof deps.dispatch !== "function") fail("invalid_input");
   } catch (error) {
     destroyFramePrivate(frameBeforeValidation);
@@ -547,22 +593,25 @@ export async function runAgenticRenderPhaseV1(
       fail("render_deadline_exceeded");
     }
     const baseMessages = cloneMessages(input.renderPolicy.messages);
-    const projectionLiteral = input.acceptedWorkspace.workspaceContextProjection.literal;
-    const messages = projectionLiteral.length === 0
-      ? baseMessages
-      : [{
-          role: "system" as const,
-          content: `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\n${projectionLiteral}`,
-        }, ...baseMessages];
-    const contextBytes = serializedContextBytes(input, messages);
+    const projectionLiteral = validatedProjection.literal;
+    const acceptedWorkspaceMessage = projectionLiteral.length === 0
+      ? `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\nNo host-accepted findings or task submissions were published for this completion.`
+      : `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\n${projectionLiteral}`;
+    const messages = Object.freeze([Object.freeze({
+      role: "system" as const,
+      content: acceptedWorkspaceMessage,
+    }), ...baseMessages]);
+    validateRenderPolicyMessages(messages);
+    const contextBytes = serializedContextBytes(messages);
     if (contextBytes > input.reservedBudgets.contextBytes) fail("render_context_limit_exceeded");
+    const parameters = input.renderPolicy.parameters === undefined
+      ? undefined
+      : Object.freeze(structuredClone(input.renderPolicy.parameters));
 
     const request: AgenticRenderProviderRequestV1 = {
       connection: input.connection,
       model: input.connection.model,
       messages,
-      acceptedWorkspace: input.acceptedWorkspace,
-      renderPolicy: input.renderPolicy,
       tools: [],
       toolMode: "finalization",
       stream: true,
@@ -570,7 +619,7 @@ export async function runAgenticRenderPhaseV1(
       ...(input.renderPolicy.maxOutputTokens !== undefined
         ? { maxOutputTokens: input.renderPolicy.maxOutputTokens }
         : {}),
-      ...(input.renderPolicy.parameters ? { parameters: input.renderPolicy.parameters } : {}),
+      ...(parameters ? { parameters } : {}),
       signal,
     };
 
@@ -617,6 +666,10 @@ export async function runAgenticRenderPhaseV1(
           fail("render_protocol_error");
         }
         const token = typeof chunk.token === "string" ? chunk.token : "";
+        if (isRenderNoProgressChunk(chunk, token)) {
+          activityEvents += 1;
+          if (activityEvents > activityChunkLimit) fail("render_activity_limit_exceeded");
+        }
         const tokenBytes = utf8ByteLength(token);
         const reasoningBytes = chunk.reasoning === undefined ? 0 : utf8ByteLength(chunk.reasoning);
         const payloadBytes = providerChunkPayloadBytes(chunk);
@@ -689,6 +742,15 @@ export async function runAgenticRenderPhaseV1(
 
     assertRenderDeadline(now, input.reservedBudgets.deadlineAt, input.signal, deadlineController.signal);
     const text = outputParts.join("");
+    if (text.trim().length === 0) {
+      const outputBudgetExhausted = finishReason === "length"
+        || (
+          input.renderPolicy.maxOutputTokens !== undefined
+          && usage !== undefined
+          && usage.completionTokens >= input.renderPolicy.maxOutputTokens
+        );
+      fail(outputBudgetExhausted ? "render_output_limit_exceeded" : "render_protocol_error");
+    }
     if (input.renderPolicy.maxOutputTokens !== undefined) {
       settleRenderOutputTokens(
         providerUsage,

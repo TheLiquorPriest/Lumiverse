@@ -196,13 +196,6 @@ function schema(): Database {
   db.run("CREATE TABLE regex_scripts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, find_regex TEXT NOT NULL, replace_string TEXT NOT NULL, actions TEXT NOT NULL, flags TEXT NOT NULL, placement TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT, target TEXT NOT NULL, trim_strings TEXT NOT NULL, disabled INTEGER NOT NULL, sort_order INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   db.run("CREATE TABLE world_books (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, metadata TEXT NOT NULL, updated_at INTEGER NOT NULL)");
   db.run("CREATE TABLE world_book_entries (id TEXT PRIMARY KEY, world_book_id TEXT NOT NULL, key TEXT NOT NULL, keysecondary TEXT NOT NULL, content TEXT NOT NULL, comment TEXT NOT NULL, position INTEGER NOT NULL, depth INTEGER NOT NULL, role TEXT, order_value INTEGER NOT NULL, disabled INTEGER NOT NULL, constant INTEGER NOT NULL, sticky INTEGER NOT NULL, cooldown INTEGER NOT NULL, delay INTEGER NOT NULL, vector_index_status TEXT NOT NULL, updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_account_state (user_id TEXT PRIMARY KEY, context_acl_revision INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_packs (user_id TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, visibility TEXT NOT NULL, state TEXT NOT NULL, latest_revision INTEGER NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_pack_revisions (user_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_digest TEXT NOT NULL, token_count INTEGER NOT NULL, byte_count INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL)");
-  db.run("CREATE TABLE agent_context_pack_acls (user_id TEXT NOT NULL, pack_id TEXT NOT NULL, principal_user_id TEXT NOT NULL, permission TEXT NOT NULL)");
-  db.run("CREATE TABLE agent_preset_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, preset_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_chat_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, chat_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_world_book_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, world_book_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   return db;
 }
 
@@ -260,7 +253,6 @@ function seed(db: Database, blockContent = CALLBACK_BAIT_BLOCK): void {
     "regex-1", "user-1", "safe", "foo", "bar", "[]", "gi", JSON.stringify(["user_input", "ai_output"]),
     "global", null, JSON.stringify(["prompt"]), "[]", 0, 0, 1, 1,
   );
-  db.query("INSERT INTO agent_context_account_state VALUES (?, ?, ?)").run("user-1", 3, 1);
 }
 
 function agentConfig(): Record<string, unknown> {
@@ -275,8 +267,20 @@ function agentConfig(): Record<string, unknown> {
     mainLoreScope: "active",
     profiles: [],
     connectionSlots: [],
-    phasePolicy: { work: [], render: [] },
-    cognitionPolicy: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
+    runtimePolicy: {
+      version: 1,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: "agentic",
+      loomPolicy: {
+        version: 1,
+        workPolicy: [],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      },
+      phases: [],
+    },
   };
 }
 

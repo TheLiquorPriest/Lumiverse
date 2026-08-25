@@ -63,11 +63,23 @@ export function beginGenerationRequest(chatId: string, previousGenerationId?: st
 export function invalidateGenerationRequest(chatId: string, generationId?: string | null): number {
   if (!chatId) return 0
   const authority = getGenerationAuthority(chatId)
-  const current = generationId ?? authority.currentGenerationId
-  if (current) {
-    rememberGenerationId(authority.retiredGenerationIds, current)
-    rememberGenerationId(authority.terminalGenerationIds, current)
+  const suppliedGenerationId = generationId ?? null
+
+  // A late response belongs to the generation it names. Retire that
+  // generation so a pending start cannot resurrect it, but never revoke the
+  // authority that has since moved on to a newer generation.
+  if (suppliedGenerationId) {
+    rememberGenerationId(authority.retiredGenerationIds, suppliedGenerationId)
+    rememberGenerationId(authority.terminalGenerationIds, suppliedGenerationId)
+    if (authority.currentGenerationId !== suppliedGenerationId) return authority.epoch
+  } else if (authority.currentGenerationId) {
+    rememberGenerationId(authority.retiredGenerationIds, authority.currentGenerationId)
+    rememberGenerationId(authority.terminalGenerationIds, authority.currentGenerationId)
   }
+
+  // Clearing the current authority and advancing its epoch are a single
+  // current-generation transition. Repeating an invalidation after the
+  // authority has moved on is therefore a no-op for the epoch.
   authority.currentGenerationId = null
   authority.epoch += 1
   return authority.epoch
@@ -317,7 +329,10 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
         : genStatus.content
     }
 
+    // An inactive pool may no longer retain the retired generation ID. The
+    // captured authority epoch still fences this response against a newer run.
     const sameGeneration =
+      genStatus.generationId == null ||
       (!latest.activeGenerationId && !request.generationId) ||
       latest.activeGenerationId === genStatus.generationId ||
       (!!request.generationId && request.generationId === genStatus.generationId)

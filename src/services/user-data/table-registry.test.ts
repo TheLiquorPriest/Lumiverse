@@ -14,12 +14,16 @@ import {
 } from "../../types/media-limits";
 import {
   ARCHIVE_TABLE_REGISTRY,
+  ARCHIVE_REGISTRY_VERSION,
   SECRET_SETTING_KEY_PATTERNS,
   getArchiveTableSpec,
   isSecretSettingKey,
 } from "./table-registry";
 
 describe("agent turn archive classification", () => {
+  test("pins the current archive registry contract version", () => {
+    expect(ARCHIVE_REGISTRY_VERSION).toBe(3);
+  });
   test("keeps operational turn rows out and makes publication rows self-contained", () => {
     const operational = [
       "agent_turn_executions",
@@ -74,12 +78,21 @@ describe("agent turn archive classification", () => {
     );
 
     expect(ARCHIVE_TABLE_REGISTRY.filter((spec) => spec.table.startsWith("agent_")).length).toBeGreaterThanOrEqual(10);
-    expect(getArchiveTableSpec("agent_context_account_state")?.kind).toBe("operational");
   });
-  test("treats revision number as the only revision-row uniqueness key", () => {
-    const revisions = getArchiveTableSpec("agent_context_pack_revisions");
-    expect(revisions?.primaryKey).toEqual(["user_id", "pack_id", "revision"]);
-    expect(revisions?.uniqueKeys).toEqual([["user_id", "pack_id", "revision"]]);
+
+  test("allows only the lazy embedding cache to be absent from a healthy schema", () => {
+    expect(
+      ARCHIVE_TABLE_REGISTRY
+        .filter((spec) => spec.schemaOptional)
+        .map((spec) => spec.table),
+    ).toEqual(["embedding_cache"]);
+    for (const obsoleteTable of [
+      "edit_and_send_requests",
+      "generation_outbox",
+      "image_processing_queue",
+    ]) {
+      expect(getArchiveTableSpec(obsoleteTable)).toBeUndefined();
+    }
   });
 });
 

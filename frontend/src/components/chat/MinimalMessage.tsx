@@ -6,6 +6,7 @@ import MessageContent from './MessageContent'
 import ReasoningBlock from './ReasoningBlock'
 import MessageAttachments from './MessageAttachments'
 import { useStore } from '@/store'
+import { selectAgentRunForTarget } from '@/store/slices/agent-runs'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import type { Message } from '@/types/api'
 import type { MessageOverrideProps } from '@/lib/componentOverrides'
@@ -32,9 +33,20 @@ export default function MinimalMessage({ message, chatId, depth = 0, isSelectMod
 
   const openModal = useStore((s) => s.openModal)
   const displayAvatarUrl = minimalUseFullAvatar && fullAvatarUrl ? fullAvatarUrl : avatarUrl
+  const inspectionRun = useStore((state) => (
+    typeof message.swipe_id === 'number'
+      ? selectAgentRunForTarget(state, chatId, message.id, message.swipe_id)
+      : undefined
+  ))
   const handlePromptBreakdown = useCallback(() => {
-    openModal('promptItemizer', { messageId: message.id })
-  }, [openModal, message.id])
+    openModal('promptItemizer', {
+      messageId: message.id,
+      chatId,
+      ...(inspectionRun?.inspectionAttemptId
+        ? { inspectionAttemptId: inspectionRun.inspectionAttemptId }
+        : {}),
+    })
+  }, [openModal, message.id, chatId, inspectionRun?.inspectionAttemptId])
 
   // ── Build the flattened override props contract ──
   const overrideProps: MessageOverrideProps = useMemo(() => ({

@@ -8,6 +8,7 @@
  */
 
 import type { ResolvedCouncilProfile } from "./council-profile";
+import type { LoomPromptInspectionV1, LoomResponsePolicyOmissionV1 } from "./agent-cognition";
 
 export const AGENT_RUNTIME_DECISION_VERSION = 1 as const;
 export const AGENT_RUNTIME_DECISION_TOKEN_TTL_MS = 60_000;
@@ -133,6 +134,14 @@ export const AGENT_RUNTIME_REPAIR_CODES = [
   "agentic_input_revisions_incomplete",
   "agentic_readiness_unavailable",
   "agentic_kill_switch",
+  "schema_unavailable",
+  "reconciliation_required",
+  "archive_registry_unavailable",
+  "isolate_unavailable",
+  "publication_store_unavailable",
+  "provider_capability_unavailable",
+  "input_revisions_incomplete",
+  "kill_switch_off",
   "cognition_invalid",
   "cognition_repair_required",
   "cognition_missing_block_revision",
@@ -189,8 +198,6 @@ export interface InputRevisionSetV1 {
   settings: RuntimeRevision | null;
   macro: RuntimeRevision | null;
   regex: RuntimeRevision | null;
-  context: RuntimeRevision | null;
-  acl: RuntimeRevision | null;
   cognition: RuntimeRevision | null;
   readiness: RuntimeRevision | null;
 }
@@ -216,7 +223,6 @@ export interface AgenticReadinessVectorV1 {
   targetRevision: RuntimeRevision;
   inputRevisionDigest: string;
   cognitionRevision: RuntimeRevision;
-  contextAclRevision: RuntimeRevision;
   killSwitchState: "off" | "auto" | "on";
   ready: boolean;
   reasons: readonly string[];
@@ -286,6 +292,10 @@ export interface EffectiveRuntimePublicResponseV1 {
   requestedMode: AgentRuntimeMode;
   effectiveMode: AgentRuntimeMode;
   runtimePolicy: LoomRuntimePolicyV1;
+  /** Authenticated preflight projection of the frozen Loom surface. */
+  inspection: LoomPromptInspectionV1;
+  /** Response omission is a separate top-level field for effective-runtime consumers. */
+  responseOmission: LoomResponsePolicyOmissionV1 | null;
   chatOverride: ChatAgentModeOverrideV1 | null;
   capabilityReadiness: CapabilityReadinessV1;
   repairCodes: readonly AgentRuntimeRepairCode[];
@@ -308,6 +318,12 @@ export interface FrozenConcreteConnectionV1 {
   candidateRevision: RuntimeRevision | null;
   revision: RuntimeRevision | null;
   fingerprint: string | null;
+  /**
+   * Digest of the canonical, normalized capability object admitted with this
+   * candidate. It prevents an adapter capability mutation from reusing a
+   * token whose endpoint and credential revisions are otherwise unchanged.
+   */
+  capabilityDigest: string;
   capabilities: Readonly<Record<string, unknown>>;
 }
 
@@ -322,6 +338,7 @@ export interface RuntimeDecisionBindingV1 {
   provider: string | null;
   model: string | null;
   fingerprint: string | null;
+  capabilityDigest: string | null;
   candidateRevision: RuntimeRevision | null;
   credentialRevision: RuntimeRevision | null;
   endpointRevision: RuntimeRevision | null;
@@ -349,6 +366,7 @@ export interface RuntimeDecisionInternalV1 {
   issuedAt: number;
   expiresAt: number;
 }
+
 
 export interface EffectiveRuntimeDecisionV1 extends EffectiveRuntimePublicResponseV1 {
   /** Internal-only frozen fields. Routes must call `toPublicRuntimeDecision`. */

@@ -13,7 +13,7 @@ import {
 } from "../../types/media-limits";
 
 /** Bumped whenever the archive ownership/graph contract changes. */
-export const ARCHIVE_REGISTRY_VERSION = 2 as const;
+export const ARCHIVE_REGISTRY_VERSION = 3 as const;
 
 export type ArchiveTableKind = "canonical" | "derived" | "operational" | "forbidden";
 
@@ -99,6 +99,8 @@ export interface ArchiveTableSpecV2 {
   /** What authority-bearing state does on foreign restore. */
   authorityReset: "preserve" | "disabled" | "review_required" | "rebuild" | "discard" | "never_import";
   fileRefs: readonly ArchiveFileRefV2[];
+  /** True only for a lazily created runtime table that may be absent on a healthy fresh install. */
+  schemaOptional?: boolean;
   /** Explicit predicate retained for SQL collectors and purge. */
   extraWhere?: string;
   /** Optional LanceDB projection associated with this canonical/derived table. */
@@ -195,6 +197,7 @@ const operational = (
   primaryKey: readonly string[],
   uniqueKeys: readonly (readonly string[])[] = [],
   parentEdges: readonly ArchiveParentEdgeV2[] = [],
+  schemaOptional = false,
 ): ArchiveTableSpecV2 => ({
   table,
   kind: "operational",
@@ -205,6 +208,7 @@ const operational = (
   mergePolicy: "discard",
   authorityReset: "discard",
   fileRefs: [],
+  ...(schemaOptional ? { schemaOptional: true } : {}),
 });
 
 const forbidden = (
@@ -474,88 +478,6 @@ const registry: ArchiveTableSpecV2[] = [
     })],
     authorityReset: "preserve",
   }),
-  operational(
-    "agent_context_account_state",
-    direct("user_id"),
-    ["user_id"],
-    [["user_id"]],
-    [parent("user_id", "user", false)],
-  ),
-  canonical({
-    table: "agent_context_packs",
-    owner: direct("user_id"),
-    primaryKey: ["user_id", "id"],
-    uniqueKeys: [["user_id", "id"]],
-    parentEdges: [parent("user_id", "user", false)],
-    authorityReset: "review_required",
-  }),
-  canonical({
-    table: "agent_context_pack_revisions",
-    owner: direct("user_id"),
-    primaryKey: ["user_id", "pack_id", "revision"],
-    uniqueKeys: [["user_id", "pack_id", "revision"]],
-    parentEdges: [
-      compositeParent(["user_id", "pack_id"], "agent_context_packs", ["user_id", "id"], false),
-      parent("user_id", "user", false),
-    ],
-    authorityReset: "review_required",
-  }),
-  canonical({
-    table: "agent_context_pack_acls",
-    owner: direct("user_id"),
-    primaryKey: ["user_id", "pack_id", "principal_user_id"],
-    uniqueKeys: [["user_id", "pack_id", "principal_user_id"]],
-    parentEdges: [
-      compositeParent(["user_id", "pack_id"], "agent_context_packs", ["user_id", "id"], false),
-      parent("principal_user_id", "user", false),
-    ],
-    authorityReset: "review_required",
-  }),
-  canonical({
-    table: "agent_preset_context_pack_attachments",
-    owner: direct("user_id"),
-    primaryKey: ["user_id", "attachment_id"],
-    uniqueKeys: [
-      ["user_id", "attachment_id"],
-      ["user_id", "preset_id", "pack_id", "revision"],
-    ],
-    parentEdges: [
-      compositeParent(["user_id", "preset_id"], "presets", ["user_id", "id"], false),
-      compositeParent(["user_id", "pack_id", "revision"], "agent_context_pack_revisions", ["user_id", "pack_id", "revision"], false),
-      compositeParent(["user_id", "pack_id"], "agent_context_packs", ["user_id", "id"], false),
-    ],
-    authorityReset: "review_required",
-  }),
-  canonical({
-    table: "agent_chat_context_pack_attachments",
-    owner: direct("user_id"),
-    primaryKey: ["user_id", "attachment_id"],
-    uniqueKeys: [
-      ["user_id", "attachment_id"],
-      ["user_id", "chat_id", "pack_id", "revision"],
-    ],
-    parentEdges: [
-      compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false),
-      compositeParent(["user_id", "pack_id", "revision"], "agent_context_pack_revisions", ["user_id", "pack_id", "revision"], false),
-      compositeParent(["user_id", "pack_id"], "agent_context_packs", ["user_id", "id"], false),
-    ],
-    authorityReset: "review_required",
-  }),
-  canonical({
-    table: "agent_world_book_context_pack_attachments",
-    owner: direct("user_id"),
-    primaryKey: ["user_id", "attachment_id"],
-    uniqueKeys: [
-      ["user_id", "attachment_id"],
-      ["user_id", "world_book_id", "pack_id", "revision"],
-    ],
-    parentEdges: [
-      compositeParent(["user_id", "world_book_id"], "world_books", ["user_id", "id"], false),
-      compositeParent(["user_id", "pack_id", "revision"], "agent_context_pack_revisions", ["user_id", "pack_id", "revision"], false),
-      compositeParent(["user_id", "pack_id"], "agent_context_packs", ["user_id", "id"], false),
-    ],
-    authorityReset: "review_required",
-  }),
 
   // Turn/workspace/blob state is operational and is never restored from an
   // account archive. Only the explicit chat-owned publication references above
@@ -695,6 +617,34 @@ const registry: ArchiveTableSpecV2[] = [
       compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false),
       compositeParent(["user_id", "turn_id"], "agent_run_projections", ["user_id", "turn_id"], false),
     ],
+  ),
+  operational(
+    "agent_run_resync_snapshots",
+    direct("user_id"),
+    ["snapshot_id"],
+    [["snapshot_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false),
+    ],
+  ),
+  operational(
+    "agent_run_resync_snapshot_members",
+    direct("user_id"),
+    ["snapshot_id", "ordinal"],
+    [["snapshot_id", "ordinal"], ["snapshot_id", "turn_id"]],
+    [
+      parent("user_id", "user", false),
+      parent("snapshot_id", "agent_run_resync_snapshots", false, false, "snapshot_id"),
+    ],
+  ),
+  operational(
+    "embedding_cache",
+    { kind: "none" },
+    ["cache_key"],
+    [["cache_key"]],
+    [],
+    true,
   ),
   // Alpha 1 Persistent Workspace and inspection state is host-owned runtime
   // state. Archive/restore semantics remain deliberately undefined, so these
@@ -977,6 +927,15 @@ export const ARCHIVE_CANONICAL_TABLES: readonly ArchiveTableSpecV2[] = Object.fr
 
 const byTable = new Map(registry.map((spec) => [spec.table, spec] as const));
 
+// These tables were removed from the archive contract by AR-008. Existing
+// databases may retain their empty/legacy schemas; they are no longer archive
+// input and must not prevent the surviving registry from reconciling.
+const ARCHIVE_RETIRED_TABLES = new Set([
+  "edit_and_send_requests",
+  "generation_outbox",
+  "image_processing_queue",
+]);
+
 export function getArchiveTableSpec(table: string): ArchiveTableSpecV2 | undefined {
   return byTable.get(table);
 }
@@ -1159,8 +1118,13 @@ export function assertArchiveRegistryCoverage(db: Database): void {
   const actual = new Set(
     (db.query("SELECT name FROM sqlite_schema WHERE type = 'table'").all() as { name: string }[]).map((row) => row.name),
   );
-  const unclassified = [...actual].filter((name) => !byTable.has(name) && !name.startsWith("sqlite_"));
+  const unclassified = [...actual].filter((name) => (
+      !byTable.has(name)
+      && !ARCHIVE_RETIRED_TABLES.has(name)
+      && !name.startsWith("sqlite_")
+    ));
   const absent = registry
+    .filter((spec) => !spec.schemaOptional)
     .map((spec) => spec.table)
     .filter((table) => !actual.has(table));
   if (unclassified.length || absent.length) {

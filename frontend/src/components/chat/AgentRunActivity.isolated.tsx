@@ -10,7 +10,9 @@ import type { AppStore } from '@/types/store'
 import type { AgentRunPublicErrorV2, AgentRunPublicV2 } from '@/types/agent-runs'
 import type { StoreApi } from 'zustand'
 
+const workspaceRequests: string[] = []
 const workspaceSectionRequests: Array<{ turnId: string; section: string; revision?: number }> = []
+let invalidWorkspaceIndexResponse = false
 let failWorkspaceSection = false
 let deferWorkspaceSection = false
 const pendingWorkspaceSections: Array<() => void> = []
@@ -19,7 +21,14 @@ mock.module('@/api/agent-runs', () => ({
   agentRunsApi: {
     changes: async () => { throw new Error('unused_changes') },
     status: async () => { throw new Error('unused_status') },
-    workspace: async () => { throw new Error('unused_workspace') },
+    workspace: async (turnId: string) => {
+      workspaceRequests.push(turnId)
+      if (invalidWorkspaceIndexResponse) {
+        invalidWorkspaceIndexResponse = false
+        return { version: 2, turnId, workspaceRevision: 7, sections: 'invalid', omitted: 0 }
+      }
+      throw new Error('unused_workspace')
+    },
     workspaceSection: async (
       turnId: string,
       section: string,
@@ -209,7 +218,9 @@ beforeAll(async () => {
 })
 
 beforeEach(() => {
+  workspaceRequests.length = 0
   workspaceSectionRequests.length = 0
+  invalidWorkspaceIndexResponse = false
   failWorkspaceSection = false
   deferWorkspaceSection = false
   pendingWorkspaceSections.length = 0
@@ -398,9 +409,29 @@ describe('AgentRunActivity', () => {
     })
     await renderActivity()
     await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
+    const alerts = document.querySelectorAll<HTMLElement>('[role="alert"]')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]?.textContent).toBe('Model request failed.')
+    expect(document.querySelectorAll('[aria-live="polite"][aria-atomic="true"]')).toHaveLength(1)
     expect(document.body.textContent).toContain('Model request failed.')
     expect(document.body.textContent).not.toContain('provider_private')
     expect(document.body.textContent).not.toContain('secret prompt')
+
+    await act(async () => {
+      useStore.setState({
+        agentRunTerminalByTarget: {
+          'chat-public:message-public:1': {
+            ...run,
+            error: publicError({
+              code: 'invalid_input',
+              summaryCode: 'invalid_input',
+            }),
+          },
+        },
+      })
+      await Promise.resolve()
+    })
+    expect(document.querySelector<HTMLElement>('[role="alert"]')?.textContent).toBe('The input was invalid.')
 
     await act(async () => {
       useStore.setState({
@@ -418,6 +449,8 @@ describe('AgentRunActivity', () => {
     })
     expect(document.body.textContent).toContain('The run ended with a safe server error.')
     expect(document.body.textContent).not.toContain('future_private_prompt')
+    expect(document.querySelectorAll<HTMLElement>('[role="alert"]')).toHaveLength(1)
+    expect(document.querySelector<HTMLElement>('[role="alert"]')?.textContent).toBe('The run ended with a safe server error.')
 
     const malformedErrorRun = JSON.parse(JSON.stringify({ ...run, error: 42 }))
     await act(async () => {
@@ -429,6 +462,68 @@ describe('AgentRunActivity', () => {
       await Promise.resolve()
     })
     expect(document.body.textContent).toContain('The run ended with a safe server error.')
+    expect(document.querySelectorAll<HTMLElement>('[role="alert"]')).toHaveLength(1)
+    expect(document.querySelector<HTMLElement>('[role="alert"]')?.textContent).toBe('The run ended with a safe server error.')
+  })
+  test('promotes a disconnected two-node cycle to a visible activity root', async () => {
+    const run = terminalRun()
+    run.activity = [
+      { ...run.activity[0], id: 'cycle-a', parentId: 'cycle-b' },
+      { ...run.activity[1], id: 'cycle-b', parentId: 'cycle-a' },
+    ]
+    useStore.setState({
+      agentRunTerminalByTarget: {
+        'chat-public:message-public:1': run,
+      },
+    })
+    await renderActivity()
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
+
+    const tree = document.querySelector<HTMLElement>('[aria-label="Agent and tool chronology"]')
+    expect(tree).not.toBeNull()
+    expect(tree?.querySelectorAll('li')).toHaveLength(2)
+    expect(tree?.textContent).toContain('Root agent')
+    expect(tree?.textContent).toContain('Search lore')
+  })
+
+  test('keeps a self-parented activity node visible once', async () => {
+    const run = terminalRun()
+    run.activity = [{ ...run.activity[0], id: 'self-cycle', parentId: 'self-cycle' }]
+    useStore.setState({
+      agentRunTerminalByTarget: {
+        'chat-public:message-public:1': run,
+      },
+    })
+    await renderActivity()
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
+
+    const tree = document.querySelector<HTMLElement>('[aria-label="Agent and tool chronology"]')
+    expect(tree).not.toBeNull()
+    expect(tree?.querySelectorAll('li')).toHaveLength(1)
+    expect(tree?.textContent).toContain('Root agent')
+  })
+
+  test('promotes a deeper disconnected cycle without duplicating its nodes', async () => {
+    const run = terminalRun()
+    run.activity = [
+      { ...run.activity[0], id: 'cycle-a', parentId: 'cycle-b' },
+      { ...run.activity[1], id: 'cycle-b', parentId: 'cycle-c' },
+      { ...run.activity[0], id: 'cycle-c', parentId: 'cycle-a', kind: 'provider', actor: 'provider' },
+    ]
+    useStore.setState({
+      agentRunTerminalByTarget: {
+        'chat-public:message-public:1': run,
+      },
+    })
+    await renderActivity()
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
+
+    const tree = document.querySelector<HTMLElement>('[aria-label="Agent and tool chronology"]')
+    expect(tree).not.toBeNull()
+    expect(tree?.querySelectorAll('li')).toHaveLength(3)
+    expect(tree?.textContent).toContain('Root agent')
+    expect(tree?.textContent).toContain('Search lore')
+    expect(tree?.textContent).toContain('Model round')
   })
 
   test('mounts one atomic polite run live region and no elapsed-time announcement', async () => {
@@ -516,6 +611,33 @@ describe('AgentRunActivity', () => {
       await Promise.resolve()
     })
     expect(document.querySelector('[aria-haspopup="dialog"]')).not.toBeNull()
+  })
+  test('terminalizes a malformed workspace index without refetching on rerender', async () => {
+    invalidWorkspaceIndexResponse = true
+    const workspace = useStore.getState().agentWorkspaceByTurn['turn-public']!
+    useStore.setState({
+      agentWorkspaceByTurn: {
+        ...useStore.getState().agentWorkspaceByTurn,
+        'turn-public': { ...workspace, status: 'idle', index: null, sections: {}, error: false },
+      },
+    })
+    await renderActivity()
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
+    await act(async () => findAgentRunTab('workspace')?.click())
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(workspaceRequests).toEqual(['turn-public'])
+    expect(useStore.getState().agentWorkspaceByTurn['turn-public']).toMatchObject({ status: 'error', error: true })
+    expect(document.body.textContent).toContain('The workspace could not be loaded.')
+
+    await act(async () => {
+      useStore.setState({ agentRunOmittedEventsByChat: { 'chat-public': 1 } })
+      await Promise.resolve()
+    })
+    expect(workspaceRequests).toHaveLength(1)
   })
   test('reloads an expanded section after a newer workspace index revision', async () => {
     await renderActivity()

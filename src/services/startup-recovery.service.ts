@@ -1,5 +1,7 @@
 import type { Database } from "bun:sqlite";
 import {
+  DEFAULT_ARTIFACT_BLOB_LIMITS,
+  hasPendingArtifactReconcileGlobal,
   reconcileAgentArtifactBlobs,
   type ArtifactReconcileResult,
 } from "./agent-artifact-blobs.service";
@@ -13,7 +15,7 @@ import {
 } from "./agentic-preprocessing-worker-client";
 import { shutdownPromptAssemblyWorkerPool } from "./prompt-assembly-worker-client";
 import { reconcileStaleExportStaging, type ExportStagingReconcileResult } from "./user-data/export.service";
-import { reconcileUserDataImports } from "./user-data/import.service";
+import { reconcileUserDataImports, type ImportRecoveryResult } from "./user-data/import.service";
 import { reconcilePurgeCleanupIntents } from "./user-data/purge.service";
 import { installAgenticGenerationCoordinator } from "./agentic-generation-coordinator.service";
 import {
@@ -60,12 +62,8 @@ export interface StartupRecoveryStages {
 
 export interface StartupRecoveryResult {
   readonly runtimeEpoch: number;
-  /**
-   * Import recovery does not currently expose counts. Keep this field as
-   * `void` for existing startup consumers; `stages.imports` carries its
-   * fail-closed outcome.
-   */
-  readonly imports: void;
+  /** Bounded import reconciliation result; `complete` and `healthy` gate startup readiness. */
+  readonly imports: ImportRecoveryResult;
   /**
    * These existing result shapes are retained for startup telemetry. A
    * failed stage returns an all-zero conservative sentinel and its
@@ -79,12 +77,22 @@ export interface StartupRecoveryResult {
   readonly isolate: IsolateHealthSnapshotV1;
   readonly readiness: AgenticReadinessVectorV1;
 }
+
+export interface StartupArtifactContinuationTimer {
+  readonly cancel: () => void;
+}
+
+export type StartupArtifactContinuationScheduler = (
+  task: () => Promise<void>,
+  delayMs: number,
+) => StartupArtifactContinuationTimer;
+
 export interface StartupRecoveryDependencies {
   readonly startAgentRuntimeEpoch?: () => number;
-  readonly reconcileUserDataImports?: () => void | Promise<void>;
+  readonly reconcileUserDataImports?: () => ImportRecoveryResult | Promise<ImportRecoveryResult>;
   readonly reconcileExportStaging?: () => ExportStagingReconcileResult;
   readonly reconcilePurgeCleanupIntents?: () => void;
-  readonly reconcileAgentArtifactBlobs?: (options: { readonly db: Database }) => Promise<ArtifactReconcileResult>;
+  readonly reconcileAgentArtifactBlobs?: (options: { readonly db: Database; readonly maxRows?: number }) => Promise<ArtifactReconcileResult>;
   readonly reconcileAgentTurns?: (db: Database) => ReconcileAgentTurnsResult;
   readonly reconcileAgentRunProjections?: (db: Database) => AgentRunProjectionReconcileResult;
   readonly probeIsolateBackendsAtStartup?: () => Promise<IsolateHealthSnapshotV1>;
@@ -92,20 +100,122 @@ export interface StartupRecoveryDependencies {
     patch: Partial<Record<"schema" | "reconciliation" | "archiveRegistry" | "isolateTermination" | "publicationStore", boolean>>,
   ) => AgenticReadinessVectorV1;
   readonly installAgenticGenerationCoordinator?: () => void;
+  readonly scheduleArtifactReconcileContinuation?: StartupArtifactContinuationScheduler;
 }
+
+const defaultScheduleArtifactReconcileContinuation: StartupArtifactContinuationScheduler = (task, delayMs) => {
+  const timer = setTimeout(() => {
+    void task().catch(() => {
+      // The continuation owns its retry decision and keeps readiness closed.
+    });
+  }, delayMs);
+  timer.unref?.();
+  return { cancel: () => clearTimeout(timer) };
+};
 
 const defaultDependencies: Required<StartupRecoveryDependencies> = {
   startAgentRuntimeEpoch,
   reconcileUserDataImports,
   reconcileExportStaging: reconcileStaleExportStaging,
   reconcilePurgeCleanupIntents,
+
   reconcileAgentArtifactBlobs,
   reconcileAgentTurns,
   reconcileAgentRunProjections,
   probeIsolateBackendsAtStartup,
   setAgenticRuntimeReadiness,
   installAgenticGenerationCoordinator,
+  scheduleArtifactReconcileContinuation: defaultScheduleArtifactReconcileContinuation,
 };
+const ARTIFACT_CONTINUATION_INITIAL_DELAY_MS = 25;
+const ARTIFACT_CONTINUATION_MAX_DELAY_MS = 30_000;
+
+let artifactContinuationTimer: StartupArtifactContinuationTimer | undefined;
+let artifactContinuationGeneration = 0;
+let artifactContinuationRunning = false;
+
+function cancelArtifactReconcileContinuation(): void {
+  artifactContinuationGeneration++;
+  const timer = artifactContinuationTimer;
+  artifactContinuationTimer = undefined;
+  timer?.cancel();
+}
+
+function scheduleArtifactReconcileContinuation(
+  db: Database,
+  deps: Required<StartupRecoveryDependencies>,
+  readiness: {
+    readonly schema: boolean;
+    readonly archiveRegistry: boolean;
+    readonly reconciliation: boolean;
+    readonly publicationStore: boolean;
+    readonly isolateTermination: boolean;
+  },
+): void {
+  artifactContinuationGeneration++;
+  const generation = artifactContinuationGeneration;
+  artifactContinuationTimer?.cancel();
+  artifactContinuationTimer = undefined;
+  let delayMs = ARTIFACT_CONTINUATION_INITIAL_DELAY_MS;
+  let converged = false;
+
+  const reopenReadiness = (): boolean => {
+    if (generation !== artifactContinuationGeneration) return false;
+    try {
+      deps.setAgenticRuntimeReadiness(readiness);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const scheduleNext = (): void => {
+    if (generation !== artifactContinuationGeneration || artifactContinuationTimer) return;
+    const nextDelayMs = delayMs;
+    delayMs = Math.min(ARTIFACT_CONTINUATION_MAX_DELAY_MS, delayMs * 2);
+    let timer!: StartupArtifactContinuationTimer;
+    const task = async (): Promise<void> => {
+      if (artifactContinuationTimer === timer) artifactContinuationTimer = undefined;
+      if (generation !== artifactContinuationGeneration) return;
+      if (converged) {
+        if (!reopenReadiness()) scheduleNext();
+        return;
+      }
+      if (artifactContinuationRunning) {
+        scheduleNext();
+        return;
+      }
+      artifactContinuationRunning = true;
+      try {
+        let result: ArtifactReconcileResult;
+        try {
+          result = await deps.reconcileAgentArtifactBlobs({
+            db,
+            maxRows: DEFAULT_ARTIFACT_BLOB_LIMITS.maxCleanupRows,
+          });
+        } catch {
+          scheduleNext();
+          return;
+        }
+        if (generation !== artifactContinuationGeneration) return;
+        if (result.pendingGlobal === true) {
+          scheduleNext();
+          return;
+        }
+        if (result.healthy === true) {
+          converged = true;
+          if (!reopenReadiness()) scheduleNext();
+        }
+      } finally {
+        artifactContinuationRunning = false;
+      }
+    };
+    timer = deps.scheduleArtifactReconcileContinuation(task, nextDelayMs);
+    artifactContinuationTimer = timer;
+  };
+
+  scheduleNext();
+}
 
 function completedStage(): StartupStageOutcome {
   return { ok: true, status: "completed", errorCode: null };
@@ -121,6 +231,17 @@ function failedStage(errorCode: StartupStageFailureCode = "stage_failed"): Start
  */
 function logStageFailure(stage: StartupRecoveryStage, errorCode: StartupStageFailureCode): void {
   console.error(`[startup] ${stage} recovery failed (${errorCode})`);
+}
+
+function emptyImportRecoveryResult(): ImportRecoveryResult {
+  return {
+    inspected: 0,
+    recovered: 0,
+    deferred: 0,
+    failed: 0,
+    complete: false,
+    healthy: false,
+  };
 }
 
 function emptyArtifactReconcileResult(): ArtifactReconcileResult {
@@ -145,6 +266,7 @@ function emptyTurnReconcileResult(runtimeEpoch: number): ReconcileAgentTurnsResu
     projectionRepairs: 0,
     alreadyTerminal: 0,
     releasedReservations: 0,
+    complete: true,
   };
 }
 
@@ -180,10 +302,6 @@ function failClosedReadiness(runtimeEpoch: number): AgenticReadinessVectorV1 {
     archiveRegistry: false,
     isolateTermination: false,
     publicationStore: false,
-    providerCapabilities: false,
-    configBinding: false,
-    contextAcl: false,
-    inputRevisions: false,
     runtimeEpoch,
     reason: "startup_readiness_unavailable",
     digest: "startup_readiness_unavailable",
@@ -198,15 +316,12 @@ function closeReadinessForAgenticFailure(): void {
       archiveRegistry: false,
       isolateTermination: false,
       publicationStore: false,
-      providerCapabilities: false,
-      configBinding: false,
-      contextAcl: false,
-      inputRevisions: false,
     });
   } catch {
     // The typed fail-closed return remains authoritative for this startup call.
   }
 }
+
 /**
  * Install the production terminal recovery hook before the turn stage. The
  * handler writes only the redacted public projection and event outbox inside
@@ -220,13 +335,36 @@ function installProductionTerminalRecovery(db: Database): void {
 }
 
 /**
+ * A commit receipt can move an execution to COMMITTED before the persistent
+ * host session has completed its own CAS. Defer the projection repair until
+ * that session is terminal so a staged COMMITTING projection cannot become
+ * public success out of order.
+ */
+function hasNonterminalPersistentSession(db: Database, executionId: string): boolean {
+  try {
+    const row = db.query(
+      `SELECT 1
+         FROM persistent_workspace_turn_sessions
+        WHERE execution_id = ?
+          AND (phase <> 'TERMINAL' OR status <> 'terminal')
+        LIMIT 1`,
+    ).get(executionId) as { 1?: number } | null;
+    return row !== null;
+  } catch {
+    // A missing/old schema has no persistent session to order.
+    return false;
+  }
+}
+
+/**
  * Install the production receipt repairer before the turn stage. The handler
  * is projection-only and is invoked from reconcileAgentTurns inside its
  * caller-owned SQLite transaction; it cannot dispatch generation side effects.
  */
 function installProductionReceiptRepairer(db: Database): void {
-  registerAgentTurnReceiptRepair((execution, receipt) => {
-    repairAgentRunProjectionFromReceipt(db, execution, receipt);
+  registerAgentTurnReceiptRepair((execution, receipt, options) => {
+    if (hasNonterminalPersistentSession(db, execution.id)) return;
+    repairAgentRunProjectionFromReceipt(db, execution, receipt, options);
   });
 }
 /**
@@ -240,6 +378,7 @@ export async function reconcileStartupState(
   db: Database,
   dependencies: StartupRecoveryDependencies = {},
 ): Promise<StartupRecoveryResult> {
+  cancelArtifactReconcileContinuation();
   const deps = { ...defaultDependencies, ...dependencies };
   const runtimeEpoch = deps.startAgentRuntimeEpoch();
 
@@ -248,8 +387,9 @@ export async function reconcileStartupState(
   // must settle each authority before the next authority examines it. Every
   // recovery stage is isolated so a failed authority cannot prevent Response
   // startup or the later safe recovery/probe stages.
-  let imports: void = undefined;
+  let imports: ImportRecoveryResult = emptyImportRecoveryResult();
   let importsReady = false;
+  let importFailureCode: StartupStageFailureCode = "stage_failed";
   let exportStagingReady = false;
   try {
     deps.reconcileExportStaging();
@@ -258,22 +398,29 @@ export async function reconcileStartupState(
     logStageFailure("imports", "stage_failed");
   }
   try {
-    imports = await deps.reconcileUserDataImports();
-    importsReady = exportStagingReady;
-    if (!importsReady) logStageFailure("imports", "stage_failed");
+    const importRecovery = await deps.reconcileUserDataImports();
+    imports = importRecovery;
+    importsReady = exportStagingReady && importRecovery.complete && importRecovery.healthy;
+    if (!importRecovery.complete || !importRecovery.healthy) importFailureCode = "unhealthy";
+    if (!importsReady) logStageFailure("imports", importFailureCode);
   } catch {
-    logStageFailure("imports", "stage_failed");
+    logStageFailure("imports", importFailureCode);
   }
 
   let artifacts = emptyArtifactReconcileResult();
   let artifactsReady = false;
+  let artifactContinuationPending = false;
   let artifactFailureCode: StartupStageFailureCode = "stage_failed";
   try {
     deps.reconcilePurgeCleanupIntents();
-    artifacts = await deps.reconcileAgentArtifactBlobs({ db });
-    // A user skipped behind its lifecycle fence leaves durable journal rows
+    artifacts = await deps.reconcileAgentArtifactBlobs({
+      db,
+      maxRows: DEFAULT_ARTIFACT_BLOB_LIMITS.maxCleanupRows,
+    });
+    // A lifecycle fence or bounded global page leaves durable journal rows
     // unreconciled: readiness stays false until a retry converges.
     if (artifacts.healthy === false) {
+      artifactContinuationPending = artifacts.pendingGlobal === true || hasPendingArtifactReconcileGlobal(db);
       artifactFailureCode = "unhealthy";
       logStageFailure("artifacts", artifactFailureCode);
     } else {
@@ -289,7 +436,7 @@ export async function reconcileStartupState(
     installProductionTerminalRecovery(db);
     installProductionReceiptRepairer(db);
     turns = deps.reconcileAgentTurns(db);
-    turnsReady = true;
+    turnsReady = turns.complete !== false;
   } catch {
     logStageFailure("turns", "stage_failed");
   } finally {
@@ -365,8 +512,21 @@ export async function reconcileStartupState(
     isolateOutcome = failedStage("unhealthy");
   }
 
+  if (artifactContinuationPending && readinessOutcome.ok && coordinatorOutcome.ok) {
+    try {
+      scheduleArtifactReconcileContinuation(db, deps, {
+        schema: true,
+        archiveRegistry: importsReady,
+        reconciliation: importsReady && turnsReady && projectionsReady,
+        publicationStore: true,
+        isolateTermination: isolateReady,
+      });
+    } catch {
+      logStageFailure("artifacts", "stage_failed");
+    }
+  }
   const stages: StartupRecoveryStages = {
-    imports: importsReady ? completedStage() : failedStage(),
+    imports: importsReady ? completedStage() : failedStage(importFailureCode),
     artifacts: artifactsReady ? completedStage() : failedStage(artifactFailureCode),
     turns: turnsReady ? completedStage() : failedStage(),
     projections: projectionsReady ? completedStage() : failedStage(projectionFailureCode),
@@ -406,6 +566,7 @@ const defaultShutdownDependencies: Required<StartupIsolateShutdownDependencies> 
 export async function shutdownIsolatePools(
   dependencies: StartupIsolateShutdownDependencies = {},
 ): Promise<void> {
+  cancelArtifactReconcileContinuation();
   const deps = { ...defaultShutdownDependencies, ...dependencies };
   await Promise.allSettled([
     deps.shutdownPromptAssemblyWorkerPool(),

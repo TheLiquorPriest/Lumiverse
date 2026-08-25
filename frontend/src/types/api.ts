@@ -1,9 +1,8 @@
 import type {
   AgentConfigReview,
   AgentConfigV2,
-  AgentContextActivationRule,
-  AgentContextPackSelection,
   AgentTaskTemplate,
+  PortableSealedPresetDescriptorV1,
 } from '@/lib/loom/types'
 
 // ---- Character ----
@@ -789,11 +788,11 @@ export interface DeletePersonaFolderResponse {
   count: number;
 }
 
-// ---- Preset ----
 export interface Preset {
   id: string;
   name: string;
   provider: string;
+  engine: string;
   parameters: Record<string, any>;
   prompt_order: any[];
   prompts: Record<string, any>;
@@ -802,8 +801,6 @@ export interface Preset {
   agent_config_revision?: number;
   agent_config_review?: AgentConfigReview | null;
   agent_slot_bindings?: Record<string, string | null>;
-  agent_context_pack_selections?: AgentContextPackSelection[];
-  agent_context_rules?: AgentContextActivationRule[];
   agent_task_templates?: AgentTaskTemplate[];
   created_at: number;
   updated_at: number;
@@ -814,10 +811,14 @@ export interface Preset {
 export interface CreatePresetInput {
   name: string;
   provider: string;
+  /** Engine identifier. Omitted only for legacy create callers; imports preserve it. */
+  engine?: string;
   parameters?: Record<string, any>;
   prompt_order?: any[];
   prompts?: Record<string, any>;
   metadata?: Record<string, any>;
+  /** Trusted sealed-source descriptor used only by portable import. */
+  sealed_preset?: PortableSealedPresetDescriptorV1;
   /** Import-only preset-bound regex companions; never persisted in the preset row. */
   regex_scripts?: readonly Record<string, unknown>[];
 }

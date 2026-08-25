@@ -283,7 +283,6 @@ function pairedPlan(requestId: string): CompilerAssemblyPlanV1 {
     tokenEvidence: [],
     inputRevisions: revisions,
     inputRevisionSet: revisions,
-    contextPackSnapshot: { revision: 1, candidates: [] },
     workPolicyMessages: [],
     workspaceUsageMessages: [],
     completionCriteriaMessages: [],

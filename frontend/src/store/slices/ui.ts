@@ -1,6 +1,7 @@
 import type { StateCreator } from 'zustand'
 import type { UISlice } from '@/types/store'
 import { CUSTOM_CSS_DOCK_DEFAULT_SIZE } from '@/lib/custom-css-dock'
+import { longMessageExpansionKey } from '@/lib/longMessageCollapse'
 
 let toastCounter = 0
 let settingsScrollCounter = 0
@@ -144,4 +145,17 @@ export const createUISlice: StateCreator<UISlice> = (set) => ({
 
   highlightedMessageId: null,
   setHighlightedMessageId: (id) => set({ highlightedMessageId: id }),
+
+  expandedLongMessageKeys: [],
+  setLongMessageExpanded: (chatId, messageId, expanded) =>
+    set((state) => {
+      const key = longMessageExpansionKey(chatId, messageId)
+      const alreadyExpanded = state.expandedLongMessageKeys.includes(key)
+      if (alreadyExpanded === expanded) return state
+      return {
+        expandedLongMessageKeys: expanded
+          ? [...state.expandedLongMessageKeys, key]
+          : state.expandedLongMessageKeys.filter((entry) => entry !== key),
+      }
+    }),
 })

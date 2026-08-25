@@ -33,11 +33,13 @@ import {
   injectReasoningParams,
   collectVectorActivatedWorldInfo,
   mergeActivatedWorldInfoEntries,
+  buildWorldInfoVectorSourceFingerprint,
   getSourceMessageId,
   isChatHistoryMessage,
   resolveContinuePostfix,
   shouldPreserveDisplayReasoningDelimiters,
   type VectorActivatedEntry,
+  type PrecomputedWorldInfoVectorEntries,
   clipToContextBudget,
   resolvePromptBlockPlacements,
   reorderBlocksByPosition,
@@ -2255,13 +2257,7 @@ function resolveConnection(userId: string, connectionId?: string) {
 }
 
 function resolveActivePresetId(userId: string): string | undefined {
-  const activePresetSetting = settingsSvc.getSetting(
-    userId,
-    "activeLoomPresetId",
-  );
-  return typeof activePresetSetting?.value === "string"
-    ? activePresetSetting.value
-    : undefined;
+  return presetsSvc.reconcileActiveLoomPreset(userId) ?? undefined;
 }
 
 type ReasoningSettingsSnapshot = {
@@ -2808,7 +2804,7 @@ async function runPromptPipeline(opts: {
   councilNamedResults?: Record<string, string>;
   councilDeliberationBlock?: string;
   councilHistoricalDeliberationBlock?: string;
-  precomputedVectorEntries?: VectorActivatedEntry[];
+  precomputedVectorEntries?: PrecomputedWorldInfoVectorEntries;
   regenFeedback?: string;
   regenFeedbackPosition?: "system" | "user";
   signal?: AbortSignal;
@@ -3893,7 +3889,7 @@ async function startResponseGeneration(
           | undefined;
         let inlineToolSafeNames: Map<string, string> | undefined;
         let inlineMembersByPrefix: Map<string, CouncilMember> | undefined;
-        let precomputedVectorEntries: VectorActivatedEntry[] | undefined;
+        let precomputedVectorEntries: PrecomputedWorldInfoVectorEntries | undefined;
 
         // Council is active when enabled with members. Tools run if any member has tools assigned.
         const councilActive =
@@ -4113,7 +4109,13 @@ async function startResponseGeneration(
               ).activatedEntries;
 
               // Cache for assembly to reuse
-              precomputedVectorEntries = vectorActivated;
+              precomputedVectorEntries = Object.freeze({
+                sourceFingerprint: buildWorldInfoVectorSourceFingerprint(
+                  wiEntries,
+                  wiBookIds,
+                ),
+                entries: Object.freeze(vectorActivated),
+              });
 
               console.debug(
                 "[generate] Council enrichment: char=%s, persona=%s, messages=%d, wi=%d/%d, vector=%d",

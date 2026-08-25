@@ -15,4 +15,7 @@ export type {
   SpindleToastPayload,
   SpindleThemeOverridesPayload,
   WallpaperUploadProgressPayload,
+  DatabankChangedPayload,
+  DatabankDeletedPayload,
+  DatabankDocumentStatusPayload,
 } from '@/types/ws-events'

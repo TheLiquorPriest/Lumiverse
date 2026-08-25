@@ -7,32 +7,18 @@ import {
   type AgenticGenerationInput,
   type AgenticTargetSnapshot,
 } from "./agentic-generation.service";
-import {
-  createAccountContextPackReader,
-  createContextToolCapability,
-  ContextPackInputRevisionTracker,
-} from "./agent-context-tools.service";
-import { createCognitionContextInvalidationSink } from "./agent-cognition-integrity.service";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
 import type { AssemblyPlanV1 } from "./agentic-assembly-compiler";
 import type { GenerationAssemblySnapshotV1, InputRevisionSetV1Local } from "./prompt-assembly-snapshot.service";
-import type { ContextPackCandidateSnapshotV1 } from "./agent-context-tools.service";
 
 const TEST_REVISIONS: InputRevisionSetV1Local = Object.freeze({
   version: 1, revisions: [], digest: "test-revisions", entries: [],
   target: [], chat: [], messages: [], preset: [], blocks: [], config: [], slotBinding: [],
   connection: [], endpoint: [], credential: [], participants: [], worldLore: [], settings: [],
-  variables: [], regex: [], context: [], acl: [], cognition: [], readiness: [],
-});
-const TEST_CONTEXT_SNAPSHOT: ContextPackCandidateSnapshotV1 = Object.freeze({
-  version: 1,
-  ownerId: "user-1",
-  contextAclRevision: 1,
-  candidates: [],
-  candidateInputRevisions: [],
+  variables: [], regex: [], cognition: [], readiness: [],
 });
 
-function snapshotFixture(target: AgenticTargetSnapshot, contextPackSnapshot = TEST_CONTEXT_SNAPSHOT): GenerationAssemblySnapshotV1 {
+function snapshotFixture(target: AgenticTargetSnapshot): GenerationAssemblySnapshotV1 {
   return {
     version: 1,
     assemblySurface: "WORK",
@@ -56,12 +42,9 @@ function snapshotFixture(target: AgenticTargetSnapshot, contextPackSnapshot = TE
     variables: { preset: {}, chat: {}, settings: {}, revision: "1" },
     regexScripts: [],
     worldInfo: { books: [], entries: [], candidates: [], state: {} },
-    contextPacks: {
-      schema: "present", contextAclRevision: 1, candidates: [], contextPackSelections: [],
-      candidateInputRevisions: [], attachments: [], acl: [], cognitionGraph: null, cognitionSource: null,
-      contextRules: [], revision: "1",
+    agentCognition: {
+      schema: "present", cognitionGraph: null, cognitionSource: null, revision: "1",
     },
-    contextPackSnapshot,
     availability: { participantIds: [], toolIds: [], extensionsExcluded: true, ambientSpindleExcluded: true, revision: "1" },
     connection: null,
     agentConfig: null,
@@ -95,7 +78,6 @@ function planFixture(snapshot: GenerationAssemblySnapshotV1): AssemblyPlanV1 {
     deltas: [],
     inputRevisions: snapshot.inputRevisionSet,
     inputRevisionSet: snapshot.inputRevisionSet,
-    contextPackSnapshot: snapshot.contextPackSnapshot,
     workPolicyMessages: [],
     customPhasePlan: { status: "ready", phases: [], issues: [], omittedPhaseIds: [] },
     workspaceUsageMessages: [],
@@ -107,27 +89,6 @@ function planFixture(snapshot: GenerationAssemblySnapshotV1): AssemblyPlanV1 {
   };
 }
 
-function contextRuntimeFixture(snapshot: GenerationAssemblySnapshotV1) {
-  const contextSnapshot = snapshot.contextPackSnapshot;
-  const reader = createAccountContextPackReader();
-  const tracker = new ContextPackInputRevisionTracker();
-  const invalidationSink = createCognitionContextInvalidationSink();
-  const capability = createContextToolCapability(contextSnapshot, reader, {
-    activeCandidates: {
-      contextPackRequirements: [],
-      newlyActivatedContextPackRequirements: [],
-    },
-    revisionTracker: tracker,
-    invalidationSink,
-  });
-  return {
-    snapshot: contextSnapshot,
-    reader,
-    tracker,
-    capability,
-    recheckAtCommit: async () => ({ allowed: true as const }),
-  };
-}
 
 function input(overrides: Partial<AgenticGenerationInput> = {}): AgenticGenerationInput {
   return {
@@ -149,7 +110,6 @@ function dependencies(log: string[], overrides: Partial<AgenticGenerationDepende
     render: async () => ({ content: "rendered" }),
     prepareRender: async ({ render }) => ({ content: render.content }),
     commit: async () => ({ receiptId: "receipt-1" }),
-    createContextRuntime: contextRuntimeFixture,
     transitionExecution: (_execution, _from, to) => { log.push(to); },
     publishTerminal: (event) => { log.push(`terminal:${event.status}`); },
     cleanup: () => { log.push("cleanup"); },
@@ -331,107 +291,169 @@ describe("agentic generation orchestration", () => {
     const result = await settle(started.generationId) as { status: string };
     expect(result.status).toBe("completed");
   });
-  test("accepted Stop during commit context recheck aborts before durable commit", async () => {
-    let markContextEntered!: () => void;
-    const contextEntered = new Promise<void>((resolve) => { markContextEntered = resolve; });
-    let releaseContext!: () => void;
-    const contextGate = new Promise<void>((resolve) => { releaseContext = resolve; });
-    let commitCalls = 0;
-    let workSignal!: AbortSignal;
-    const started = await runAgenticGeneration(input(), dependencies([], {
-      createContextRuntime: (snapshot) => {
-        const contextSnapshot = snapshot.contextPackSnapshot ?? TEST_CONTEXT_SNAPSHOT;
-        const reader = createAccountContextPackReader();
-        const tracker = new ContextPackInputRevisionTracker();
-        const invalidationSink = createCognitionContextInvalidationSink();
-        const capability = createContextToolCapability(contextSnapshot, reader, {
-          revisionTracker: tracker,
-          invalidationSink,
-        });
-        return {
-          snapshot: contextSnapshot,
-          reader,
-          tracker,
-          capability,
-          recheckAtCommit: async () => {
-            markContextEntered();
-            await contextGate;
-            return { allowed: true as const };
-          },
-        };
-      },
-      runWork: async ({ signal }) => {
-        workSignal = signal;
-        return { status: "completed", summary: "done", workspace: {} };
-      },
-      requestCancellation: (_execution, reason) => {
-        expect(reason).toBe("stopped");
-        expect(workSignal.aborted).toBe(false);
-        return true;
-      },
+  test("preserves a committed turn when post-commit reconciliation throws", async () => {
+    const log: string[] = [];
+    const started = await runAgenticGeneration(input(), dependencies(log, {
+      createExecution: ({ executionId }) => ({ id: executionId, deadlineAt: Date.now() + 100 }),
       commit: async () => {
-        commitCalls += 1;
-        return { receiptId: "should-not-commit" };
+        throw new Error("agentic_commit_failed");
+      },
+      readExecutionPhase: () => "COMMITTED",
+      publishTerminal: (event) => {
+        log.push(`terminal:${event.status}:${event.phase}`);
       },
     }));
-    await contextEntered;
-    expect(await requestAgenticGenerationCancellation("user-1", started.generationId)).toBe(true);
-    expect(workSignal.aborted).toBe(true);
-    releaseContext();
-    const result = await settle(started.generationId) as { status: string };
-    expect(result.status).toBe("cancelled");
-    expect(commitCalls).toBe(0);
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      errorCode?: string;
+      retryable?: boolean;
+    };
+    expect(result).toMatchObject({
+      status: "completed",
+      phase: "COMMITTED",
+    });
+    expect(result.errorCode).toBeUndefined();
+    expect(result.retryable).toBeUndefined();
+    expect(log).toContain("terminal:completed:COMMITTED");
   });
-  test("default context runtime does not expose frozen candidates without an active cognition view", async () => {
-    let observed: unknown;
-    const futureCandidate = {
-      ownerId: "user-1",
-      packId: "future-pack",
-      revisionId: "future-pack@1",
-      revision: 1,
-      digest: "future-digest",
-      label: "Future rule pack",
-      source: "account" as const,
-      targetId: null,
-      attachmentId: null,
-      attachmentRevision: null,
-      aclRevision: 1,
-      byteCount: 32,
-      tokenCount: 8,
-      required: false,
-      order: 0,
-    };
-    const contextPackSnapshot = {
-      version: 1 as const,
-      ownerId: "user-1",
-      contextAclRevision: 1,
-      candidates: [futureCandidate],
-      candidateInputRevisions: [{
-        kind: "context_pack" as const,
-        ownerId: "user-1",
-        packId: "future-pack",
-        revisionId: "future-pack@1",
-        revision: 1,
-        digest: "future-digest",
-        source: "account" as const,
-        targetId: null,
-        attachmentId: null,
-        attachmentRevision: null,
-        aclRevision: 1,
-      }],
-    };
+
+  test("recomputes the terminal result from a durable CAS winner", async () => {
+    let transitionAttempted = false;
     const started = await runAgenticGeneration(input(), dependencies([], {
-      createContextRuntime: undefined,
-      buildAssemblySnapshot: async (_input, _decision, target) => snapshotFixture(target, contextPackSnapshot),
-      runWork: async ({ contextRuntime }) => {
-        observed = await contextRuntime?.capability.list({});
-        return { status: "completed", summary: "done", workspace: {} };
+      runWork: async () => ({ status: "failed", errorCode: "child_provider_error" }),
+      readExecutionPhase: () => transitionAttempted ? "TIMED_OUT" : "WORK",
+      transitionExecution: (_execution, _from, next) => {
+        if (next === "FAILED") {
+          transitionAttempted = true;
+          throw new Error("execution_cas_lost");
+        }
       },
     }));
-    await settle(started.generationId);
-    expect(observed).toMatchObject({ status: "success", toolName: "context_pack_list" });
-    expect((observed as { data: { candidates: readonly unknown[] } }).data.candidates).toHaveLength(0);
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      workOutcome: string;
+      errorCode?: string;
+    };
+    expect(result).toMatchObject({
+      status: "timed_out",
+      phase: "TIMED_OUT",
+      workOutcome: "failed",
+      errorCode: "agentic_timed_out",
+    });
   });
+  test("bounds terminal child joining at the execution deadline", async () => {
+    const log: string[] = [];
+    const started = await runAgenticGeneration(input(), dependencies(log, {
+      createExecution: ({ executionId }) => ({ id: executionId, deadlineAt: Date.now() + 15 }),
+      runWork: async () => ({ status: "failed", errorCode: "child_provider_error" }),
+      cancelAndJoinChildren: () => new Promise<void>(() => undefined),
+    }));
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      errorCode?: string;
+    };
+    expect(result).toMatchObject({
+      status: "failed",
+      phase: "FAILED",
+      errorCode: "agentic_internal_error",
+    });
+    expect(log).toContain("cleanup");
+  });
+
+  test("terminal projection failure surfaces retryable projection_unavailable", async () => {
+    const terminalEvents: string[] = [];
+    const started = await runAgenticGeneration(input(), dependencies([], {
+      publishTerminal: () => {
+        throw new Error("projection schema failure");
+      },
+      terminalPublicationFailed: (event) => {
+        terminalEvents.push(`${event.status}:${event.phase}:${event.errorCode}:${event.retryable}`);
+      },
+    }));
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      errorCode?: string;
+      retryable?: boolean;
+    };
+    expect(result).toMatchObject({
+      status: "completed",
+      phase: "COMMITTED",
+      reason: "reconciliation_required",
+      errorCode: "projection_unavailable",
+      retryable: true,
+    });
+    expect(terminalEvents).toEqual(["completed:COMMITTED:projection_unavailable:true"]);
+  });
+  test("terminal publication failure preserves a timed-out result with retryable projection error", async () => {
+    const terminalEvents: string[] = [];
+    const started = await runAgenticGeneration(input(), dependencies([], {
+      readExecutionPhase: () => "TIMED_OUT",
+      runWork: async () => ({ status: "timed_out", errorCode: "agentic_timed_out" }),
+      publishTerminal: () => {
+        throw new Error("projection schema failure");
+      },
+      terminalPublicationFailed: (event) => {
+        terminalEvents.push(`${event.status}:${event.phase}:${event.workOutcome}:${event.errorCode}:${event.retryable}`);
+      },
+    }));
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      workOutcome: string;
+      errorCode?: string;
+      retryable?: boolean;
+    };
+    expect(result).toMatchObject({
+      status: "timed_out",
+      phase: "TIMED_OUT",
+      workOutcome: "failed",
+      errorCode: "projection_unavailable",
+      retryable: true,
+    });
+    expect(terminalEvents).toEqual(["timed_out:TIMED_OUT:failed:projection_unavailable:true"]);
+  });
+
+  test("terminal publication failure preserves stopped and exhausted durable truth", async () => {
+    const cases = [
+      { status: "cancelled", phase: "CANCELLED", code: "agentic_cancelled", outcome: "stopped" },
+      { status: "exhausted", phase: "EXHAUSTED", code: "agentic_work_exhausted", outcome: "exhausted" },
+    ] as const;
+    for (const terminalCase of cases) {
+      const terminalEvents: string[] = [];
+      const started = await runAgenticGeneration(input(), dependencies([], {
+        readExecutionPhase: () => terminalCase.phase,
+        runWork: async () => ({ status: terminalCase.status, errorCode: terminalCase.code }),
+        publishTerminal: () => {
+          throw new Error("projection schema failure");
+        },
+        terminalPublicationFailed: (event) => {
+          terminalEvents.push(`${event.status}:${event.phase}:${event.workOutcome}:${event.errorCode}:${event.retryable}`);
+        },
+      }));
+      const result = await settle(started.generationId) as {
+        status: string;
+        phase: string;
+        workOutcome: string;
+        errorCode?: string;
+        retryable?: boolean;
+      };
+      expect(result).toMatchObject({
+        status: terminalCase.status,
+        phase: terminalCase.phase,
+        workOutcome: terminalCase.outcome,
+        errorCode: "projection_unavailable",
+        retryable: true,
+      });
+      expect(terminalEvents).toEqual([
+        `${terminalCase.status}:${terminalCase.phase}:${terminalCase.outcome}:projection_unavailable:true`,
+      ]);
+    }
+  });
+
 
   test("refused retry admission does not publish a phantom attempt", async () => {
     const { retryAgenticGeneration } = await import("./agentic-generation.service");

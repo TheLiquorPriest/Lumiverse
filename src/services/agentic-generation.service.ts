@@ -1,17 +1,3 @@
-import {
-  ContextPackInputRevisionTracker,
-  ContextPackToolBudget,
-  createAccountContextPackReader,
-  createContextToolCapability,
-  recheckContextPackInputRevisionsAtCommit,
-  type ContextGateDecisionV1,
-  type ContextPackCandidateSnapshotV1,
-  type ContextPackReaderV1,
-  type ContextPackRevisionTracker,
-  type ContextPackToolBudgetV1,
-  type ContextToolCapability,
-} from "./agent-context-tools.service";
-import { createCognitionContextInvalidationSink } from "./agent-cognition-integrity.service";
 import type { GenerationType, GenerationParameters, LlmMessage } from "../llm/types";
 import type { GenerationAssemblySnapshotV1 } from "./prompt-assembly-snapshot.service";
 import type { AssemblyPlanV1 } from "./agentic-assembly-compiler";
@@ -154,15 +140,6 @@ export interface AgenticRuntimeDecision {
   [key: string]: unknown;
 }
 
-export interface AgenticContextRuntimeV1 {
-  readonly snapshot: ContextPackCandidateSnapshotV1;
-  readonly reader: ContextPackReaderV1;
-  readonly tracker: ContextPackRevisionTracker;
-  readonly capability: ContextToolCapability;
-  /** One aggregate budget shared by every capability refresh in this turn. */
-  readonly budget?: ContextPackToolBudgetV1;
-  readonly recheckAtCommit: (signal?: AbortSignal) => Promise<ContextGateDecisionV1>;
-}
 
 export type AgenticAssemblySnapshot = GenerationAssemblySnapshotV1;
 export type AgenticAssemblyPlan = AssemblyPlanV1;
@@ -221,7 +198,8 @@ export interface AgenticExecutionHandle {
   commitKey?: string;
   phase?: AgenticPhase;
   signal?: AbortSignal;
-  /** The durable target binding, including normalized swipe identity. */
+  /** The host deadline also bounds terminal child-join reconciliation. */
+  deadlineAt?: number;
   target?: AgenticTargetSnapshot;
 }
 
@@ -256,6 +234,7 @@ export interface AgenticGenerationDependencies {
     execution: AgenticExecutionHandle,
     expected: AgenticPhase,
     next: AgenticPhase,
+    terminalReason?: string,
   ) => Promise<AgenticExecutionHandle | void> | AgenticExecutionHandle | void;
   /** Read the durable phase when commit/terminal recovery races a CAS. */
   readExecutionPhase?: (
@@ -305,14 +284,6 @@ export interface AgenticGenerationDependencies {
     signal: AbortSignal,
     executionId: string,
   ) => Promise<{ snapshot: AgenticAssemblySnapshot; plan: AgenticAssemblyPlan }>;
-  /** Build exactly one frozen context capability from the ASSEMBLE candidates. */
-  createContextRuntime?: (
-    snapshot: AgenticAssemblySnapshot,
-    input: AgenticGenerationInput,
-    decision: AgenticRuntimeDecision,
-    signal: AbortSignal,
-    executionId: string,
-  ) => Promise<AgenticContextRuntimeV1> | AgenticContextRuntimeV1;
   runWork?: (options: {
     execution: AgenticExecutionHandle;
     input: AgenticGenerationInput;
@@ -320,7 +291,6 @@ export interface AgenticGenerationDependencies {
     snapshot: AgenticAssemblySnapshot;
     plan: AgenticAssemblyPlan;
     signal: AbortSignal;
-    contextRuntime?: AgenticContextRuntimeV1;
   }) => Promise<AgenticWorkOutcome>;
   render?: (options: {
     execution: AgenticExecutionHandle;
@@ -351,7 +321,6 @@ export interface AgenticGenerationDependencies {
     render: AgenticRenderOutcome;
     prepared: AgenticPrepareOutcome;
     signal: AbortSignal;
-    contextRuntime?: AgenticContextRuntimeV1;
   }) => Promise<AgenticCommitReceipt>;
   publishPhase?: (event: {
     executionId: string;
@@ -380,6 +349,7 @@ export interface AgenticGenerationDependencies {
     receipt?: AgenticCommitReceipt;
     errorCode?: AgenticFailureCode | string;
     errorMessage?: string;
+    retryable?: boolean;
   }) => Promise<void> | void;
   /**
    * Projection/terminal reconciliation invoked when publication fails after
@@ -401,6 +371,7 @@ export interface AgenticGenerationDependencies {
       target: AgenticTargetSnapshot;
       receipt?: AgenticCommitReceipt;
       errorCode?: AgenticFailureCode | string;
+      retryable?: boolean;
     },
     error: unknown,
   ) => Promise<void> | void;
@@ -427,6 +398,7 @@ export interface AgenticGenerationResult {
   readonly attemptLineage: AgentWorkAttemptLineageV1;
   receipt?: AgenticCommitReceipt;
   errorCode?: AgenticFailureCode | string;
+  retryable?: boolean;
   errorMessage?: string;
   responseModeAvailable: true;
 }
@@ -441,7 +413,6 @@ type ActiveAgenticGeneration = {
   dependencies: AgenticGenerationDependencies;
   controller: AbortController;
   execution?: AgenticExecutionHandle;
-  contextRuntime?: AgenticContextRuntimeV1;
   completion: Promise<AgenticGenerationResult>;
   resolve: (result: AgenticGenerationResult) => void;
   /** Resolves only after the durable execution row is admitted. */
@@ -482,43 +453,6 @@ function resolveDependencies(
   return dependencies ?? configuredAgenticDependencies ?? {};
 }
 
-function createDefaultContextRuntime(
-  snapshot: AgenticAssemblySnapshot,
-): AgenticContextRuntimeV1 | undefined {
-  const contextSnapshot = snapshot.contextPackSnapshot;
-  if (!contextSnapshot) return undefined;
-  const reader = createAccountContextPackReader();
-  const tracker = new ContextPackInputRevisionTracker();
-  const invalidationSink = createCognitionContextInvalidationSink();
-  const budget = new ContextPackToolBudget();
-  // A frozen candidate set may include future cognition-rule packs. Until the
-  // authenticated cognition bridge supplies an active view, expose none.
-  const capability = createContextToolCapability(contextSnapshot, reader, {
-    budget,
-    activeCandidates: {
-      contextPackRequirements: [],
-      newlyActivatedContextPackRequirements: [],
-    },
-    revisionTracker: tracker,
-    invalidationSink,
-  });
-  return Object.freeze({
-    snapshot: contextSnapshot,
-    reader,
-    tracker,
-    budget,
-    capability,
-    recheckAtCommit: (signal?: AbortSignal) =>
-      recheckContextPackInputRevisionsAtCommit(
-        contextSnapshot,
-        reader,
-        tracker,
-        invalidationSink,
-        signal,
-        capability.operationGate,
-      ),
-  });
-}
 
 function targetFromInput(input: AgenticGenerationInput): AgenticTargetSnapshot {
   const generationType = input.generationType;
@@ -707,13 +641,21 @@ async function transition(
   deps: AgenticGenerationDependencies,
   active: ActiveAgenticGeneration,
   next: AgenticPhase,
+  terminalReason?: string,
 ): Promise<void> {
   const previous = active.phase;
   if (previous !== next) {
     // A durable CAS is the authority. Do not move the in-memory marker ahead
     // of it: a failed transition must leave the catch path on the real phase.
     if (active.execution && deps.transitionExecution) {
-      const transitioned = await deps.transitionExecution(active.execution, previous, next);
+      let transitioned: AgenticExecutionHandle | void;
+      try {
+        transitioned = await deps.transitionExecution(active.execution, previous, next, terminalReason);
+      } catch (error) {
+        const durablePhase = await readDurablePhase(deps, active);
+        if (durablePhase) active.phase = durablePhase;
+        throw error;
+      }
       const returnedPhase = transitioned && typeof transitioned === "object"
         ? transitioned.phase
         : undefined;
@@ -831,14 +773,24 @@ function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
   if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
     return "stopped";
   }
+  if ([
+    "timed_out",
+    "timeout",
+    "deadline_exceeded",
+    "agentic_timed_out",
+    "root_wall_clock_limit_exceeded",
+  ].includes(code)) {
+    return "failed";
+  }
   if (
     code === "exhausted"
     || code === "budget_exhausted"
+    || code === "budget_exceeded"
     || code === "limit_exceeded"
     || code === "agentic_work_exhausted"
-    || code === "root_wall_clock_limit_exceeded"
     || code.endsWith("_limit_exceeded")
     || code.endsWith("_budget_exhausted")
+    || code.endsWith("_budget_exceeded")
   ) {
     return "exhausted";
   }
@@ -864,13 +816,13 @@ function workOutcomeForStatus(
 ): AgentWorkOutcome | null {
   if (status === "completed") return "completed";
   if (status === "rejected") return "rejected";
+  if (status === "timed_out") return "failed";
+  if (status === "exhausted") return "exhausted";
+  if (status === "cancelled") return "stopped";
   const cause = terminalCauseForCode(errorCode);
   if (cause === "stopped") return active.cancellationRequested ? "stopped" : "failed";
   if (cause === "exhausted") return "exhausted";
   if (cause === "failed") return "failed";
-  if (status === "cancelled") return active.cancellationRequested ? "stopped" : "failed";
-  if (status === "timed_out") return hostDeadlineExceeded(active, status, errorCode) ? "exhausted" : "failed";
-  if (status === "exhausted") return "exhausted";
   if (status === "failed") return "failed";
   return null;
 }
@@ -890,6 +842,59 @@ function workReasonForStatus(
   if (outcome === "rejected") return "rejected";
   return "failed";
 }
+type AgenticTerminalPhase =
+  | "COMMITTED"
+  | "COMMIT_FAILED"
+  | "EXHAUSTED"
+  | "FAILED"
+  | "CANCELLED"
+  | "TIMED_OUT";
+
+type DurableTerminalResult = {
+  readonly status: AgenticTerminalStatus;
+  readonly phase: AgenticTerminalPhase;
+  readonly errorCode?: AgenticFailureCode | string;
+};
+
+function isTerminalAgenticPhase(phase: AgenticPhase): phase is AgenticTerminalPhase {
+  return phase === "COMMITTED"
+    || phase === "COMMIT_FAILED"
+    || phase === "EXHAUSTED"
+    || phase === "FAILED"
+    || phase === "CANCELLED"
+    || phase === "TIMED_OUT";
+}
+
+function durableTerminalResultForPhase(
+  active: ActiveAgenticGeneration,
+  phase: AgenticTerminalPhase,
+  fallbackStatus: AgenticTerminalStatus,
+  fallbackCode: AgenticFailureCode | string | undefined,
+): DurableTerminalResult {
+  if (phase === "COMMITTED") return { status: "completed", phase };
+  if (phase === "CANCELLED") return { status: "cancelled", phase, errorCode: "agentic_cancelled" };
+  if (phase === "TIMED_OUT") {
+    return {
+      status: "timed_out",
+      phase,
+      errorCode: hostDeadlineExceeded(active, "timed_out", fallbackCode)
+        ? "root_wall_clock_limit_exceeded"
+        : "agentic_timed_out",
+    };
+  }
+  if (phase === "EXHAUSTED") return { status: "exhausted", phase, errorCode: "agentic_work_exhausted" };
+  if (phase === "COMMIT_FAILED") return { status: "failed", phase, errorCode: "agentic_commit_failed" };
+  if (phase === "FAILED") {
+    const staleTerminalCode = fallbackStatus === "failed"
+      && fallbackCode
+      && !["agentic_cancelled", "agentic_timed_out", "agentic_work_exhausted"].includes(fallbackCode)
+      ? fallbackCode
+      : "agentic_internal_error";
+    return { status: "failed", phase, errorCode: staleTerminalCode };
+  }
+  return { status: "failed", phase, errorCode: "agentic_internal_error" };
+}
+
 
 function canonicalFor(
   active: ActiveAgenticGeneration,
@@ -897,7 +902,9 @@ function canonicalFor(
   status: "streaming" | AgenticTerminalStatus,
   errorCode?: string,
 ): Pick<AgenticGenerationResult, "workPhase" | "workStatus" | "workOutcome" | "reason" | "attemptLineage"> {
-  const outcome = workOutcomeForStatus(active, status, errorCode);
+  const outcome = phase === "COMMITTED"
+    ? "completed"
+    : workOutcomeForStatus(active, status, errorCode);
   const terminal = outcome !== null;
   return {
     workPhase: workPhaseForAgentic(phase, terminal),
@@ -944,8 +951,24 @@ async function cancelAndJoinChildrenBeforeTerminal(
   }
   if (!active.execution || !deps.cancelAndJoinChildren) return true;
   try {
-    await deps.cancelAndJoinChildren(active.execution, reason);
-    return true;
+    const joining = Promise.resolve(deps.cancelAndJoinChildren(active.execution, reason));
+    const deadlineAt = active.execution.deadlineAt;
+    if (deadlineAt === undefined) {
+      await joining;
+      return true;
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        joining,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("agentic_child_join_timeout")), Math.max(0, deadlineAt - Date.now()));
+        }),
+      ]);
+      return true;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   } catch {
     // The durable terminal CAS still wins, but surface a stable internal error
     // instead of pretending that every child reservation was joined.
@@ -1043,9 +1066,6 @@ async function runAgenticGenerationInternal(
       throw new AgenticGenerationError("agentic_preflight_failed", "Agentic assembly did not produce a plan.", { phase: "ASSEMBLE" });
     }
     assertNotAborted(signal, "ASSEMBLE");
-    active.contextRuntime = deps.createContextRuntime
-      ? await deps.createContextRuntime(snapshot, input, decision, signal, executionId)
-      : createDefaultContextRuntime(snapshot);
 
     await transition(deps, active, "WORK");
     if (!deps.runWork) {
@@ -1057,7 +1077,6 @@ async function runAgenticGenerationInternal(
       decision,
       snapshot,
       plan,
-      contextRuntime: active.contextRuntime,
       signal,
     });
     if (work.status === "cancelled") throw new AgenticGenerationError("agentic_cancelled", "Agentic generation cancelled.", { phase: "WORK" });
@@ -1115,20 +1134,6 @@ async function runAgenticGenerationInternal(
     if (!deps.commit) {
       throw new AgenticGenerationError("agentic_runtime_unavailable", "Agentic commit authority is unavailable.", { phase: "PREPARE_COMMIT", retryable: true });
     }
-    if (active.contextRuntime) {
-      const contextDecision = await active.contextRuntime.recheckAtCommit(signal);
-      if (!contextDecision.allowed) {
-        throw new AgenticGenerationError(
-          contextDecision.errorCode === "cancelled"
-            ? "agentic_cancelled"
-            : "agentic_revision_conflict",
-          contextDecision.errorCode === "cancelled"
-            ? "Agentic context access was cancelled."
-            : "Agentic context changed before commit.",
-          { phase: "PREPARE_COMMIT", retryable: true },
-        );
-      }
-    }
     assertNotAborted(signal, "PREPARE_COMMIT");
     receipt = await deps.commit({
       execution: active.execution ?? { id: input.chatId, signal },
@@ -1139,7 +1144,6 @@ async function runAgenticGenerationInternal(
       work,
       render,
       prepared,
-      contextRuntime: active.contextRuntime,
       signal,
     });
     if (!receipt?.receiptId) {
@@ -1185,7 +1189,7 @@ async function runAgenticGenerationInternal(
         : durableErrorCode;
       const hostTimeout = durablePhase === "TIMED_OUT"
         && hostDeadlineExceeded(active, "timed_out", durableErrorCode);
-      const acceptedCancellation = durablePhase === "CANCELLED" && active.cancellationRequested;
+      const acceptedCancellation = durablePhase === "CANCELLED";
       const rejectedBeforeWork = durablePhase === "FAILED"
         && phase === "ASSEMBLE"
         && durableFailureCode !== "agentic_cancelled"
@@ -1282,22 +1286,40 @@ async function runAgenticGenerationInternal(
               : "failed",
     );
     if (!joined) finalCode = "agentic_internal_error";
+    let publishedStatus: AgenticTerminalStatus = finalStatus;
+    let publishedPhase: AgenticPhase = terminalPhase;
+    let publishedCode: AgenticFailureCode | string | undefined = finalCode;
     try {
-      await transition(deps, active, terminalPhase);
+      await transition(
+        deps,
+        active,
+        terminalPhase,
+        finalStatus === "rejected" ? "invalid_input" : finalCode,
+      );
     } catch (transitionError) {
       const durableAfterTransition = await readDurablePhase(deps, active);
-      if (durableAfterTransition) {
-        active.phase = durableAfterTransition;
+      const transitionPhase = transitionError instanceof AgenticGenerationError
+        ? transitionError.phase
+        : undefined;
+      const winnerPhase = [durableAfterTransition, transitionPhase]
+        .find((candidate): candidate is AgenticTerminalPhase => candidate !== undefined && isTerminalAgenticPhase(candidate));
+      if (winnerPhase) {
+        active.phase = winnerPhase;
+        const winner = durableTerminalResultForPhase(active, winnerPhase, finalStatus, finalCode);
+        publishedStatus = winner.status;
+        publishedPhase = winner.phase;
+        publishedCode = winner.errorCode;
       } else {
-        finalCode = asErrorCode(transitionError);
+        if (durableAfterTransition) active.phase = durableAfterTransition;
+        publishedCode = asErrorCode(transitionError);
       }
     }
     return {
       generationId: active.execution?.id ?? active.generationId,
-      status: finalStatus,
+      status: publishedStatus,
       mode: "agentic",
-      phase: terminalPhase,
-      errorCode: finalCode,
+      phase: publishedPhase,
+      errorCode: publishedCode,
       errorMessage: wrapped.message,
       responseModeAvailable: true,
     };
@@ -1434,23 +1456,53 @@ export async function runAgenticGeneration(
       ...(projected.receipt ? { receipt: projected.receipt } : {}),
       ...(projected.errorCode ? { errorCode: projected.errorCode } : {}),
       ...(projected.errorMessage ? { errorMessage: projected.errorMessage } : {}),
+      ...(projected.retryable ? { retryable: true } : {}),
     };
     const suppressPhantomRetryPublication = active.attemptLineage.previousAttemptId !== null && !active.execution;
     if (!suppressPhantomRetryPublication) {
       try {
         if (resolvedDeps.publishTerminal) await resolvedDeps.publishTerminal(terminalEvent);
       } catch (error) {
-        // Keep the durable result observable, but make publication failure an
-        // explicit reconciliation event instead of silently discarding it.
+        // Once the commit receipt and execution are durable, publication is a
+        // recoverable projection concern. Never turn that chat success into a
+        // COMMIT_FAILED result while the receipt remains authoritative.
+        const committedBoundary = projected.status === "completed" && projected.phase === "COMMITTED";
+        const publicationErrorCode = "projection_unavailable";
         try {
-          await resolvedDeps.terminalPublicationFailed?.(terminalEvent, error);
+          await resolvedDeps.terminalPublicationFailed?.({
+            ...terminalEvent,
+            ...(committedBoundary ? { reason: "reconciliation_required" } : {}),
+            errorCode: publicationErrorCode,
+            retryable: true,
+          }, error);
         } catch (reconciliationError) {
           console.error("[agentic] terminal reconciliation failed", reconciliationError);
         }
-        if (!resolvedDeps.terminalPublicationFailed) {
+        if (committedBoundary) {
           projected = {
             ...projected,
-            errorCode: asErrorCode(error),
+            status: "completed",
+            phase: "COMMITTED",
+            reason: "reconciliation_required",
+            errorCode: publicationErrorCode,
+            retryable: true,
+            errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : projected.errorMessage,
+          };
+        } else {
+          // Projection failure must not rewrite a durable terminal decision.
+          // The terminal event already carries the authoritative phase/status/
+          // outcome; only the projection error is new and retryable.
+          projected = {
+            ...projected,
+            status: terminalEvent.status,
+            phase: terminalEvent.phase,
+            workPhase: terminalEvent.workPhase,
+            workStatus: terminalEvent.workStatus,
+            workOutcome: terminalEvent.workOutcome,
+            reason: terminalEvent.reason,
+            errorCode: publicationErrorCode,
+            retryable: true,
+            errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : projected.errorMessage,
           };
         }
       }

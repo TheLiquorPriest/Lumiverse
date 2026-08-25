@@ -98,13 +98,12 @@ import {
   type LegacyAgentConfigV1,
 } from "../../types/agents";
 import {
-  AGENT_CONTEXT_PACK_MAX_TOTAL_BYTES,
-  estimateContextPackTokens,
-  hashContextPackContent,
-  normalizeContextPackContent,
-  serializeContextPackContent,
-  utf8Bytes,
-} from "../../types/agent-context-packs";
+  materializePortableSealedPresetImport,
+  parsePortableSealedPresetDescriptor,
+  parseSealedPresetManifest,
+  type PortableSealedPresetDescriptor,
+  type PortableSealedPresetResolver,
+} from "../../lumihub/sealed-presets";
 import {
   prepareForeignAgentConfig,
   scrubPresetMetadata,
@@ -157,6 +156,8 @@ const COPY_HEARTBEAT_BYTES = 1024 * 1024;
 const IMPORT_FILE_OPERATION_DEADLINE_MS = IMPORT_LEASE_SECONDS * 1_000;
 /** Bound startup waiting for a non-expired lease before readiness fails closed. */
 export const IMPORT_STARTUP_RECONCILIATION_DEADLINE_MS = 5_000;
+/** Maximum import-control rows inspected by one startup reconciliation pass. */
+export const MAX_IMPORT_STARTUP_RECONCILIATION_ROWS = 64;
 const MAX_GLOBAL_IMPORTS = 1;
 const MAX_SECRET_ENTRIES = MAX_ARCHIVE_SECRET_ENTRIES;
 const MAX_SECRET_BYTES = MAX_ARCHIVE_SECRET_BYTES;
@@ -277,6 +278,17 @@ type ImportControlState =
   | "cancelled"
   | "cancelling"
   | "cleanup_pending";
+
+export interface ImportRecoveryResult {
+  readonly inspected: number;
+  readonly recovered: number;
+  readonly deferred: number;
+  readonly failed: number;
+  /** False when another bounded pass is required to settle durable work. */
+  readonly complete: boolean;
+  /** False when work was deferred, failed, or remains beyond this pass. */
+  readonly healthy: boolean;
+}
 
 interface ImportControlRow {
   job_id: string;
@@ -2935,6 +2947,7 @@ let filesystemCapacityHook: FilesystemCapacityHook | null = null;
 let stagingFootprintHook: StagingFootprintHook | null = null;
 type TicketZeroizationHook = (smk: Uint8Array) => void;
 let ticketZeroizationHook: TicketZeroizationHook | null = null;
+let portableSealedPresetResolverOverride: PortableSealedPresetResolver | null = null;
 const zeroizedTicketValues = new WeakSet<object>();
 
 function zeroizeTicketValue(value: TicketGateValue | null | undefined): void {
@@ -3622,45 +3635,6 @@ function normalizeRepairCodedRegexRow(
   normalized.disabled = 1;
 }
 
-function validateContextPackRevisionAccounting(
-  table: string,
-  normalized: Record<string, unknown>,
-): void {
-  if (table !== "agent_context_pack_revisions") return;
-  const serializedContent = normalized.content_json;
-  if (typeof serializedContent !== "string") {
-    throw new Error("context pack revision content_json is malformed");
-  }
-  if (Buffer.byteLength(serializedContent, "utf8") > AGENT_CONTEXT_PACK_MAX_TOTAL_BYTES) {
-    throw new Error("context pack revision content exceeds the UTF-8 byte cap");
-  }
-  let parsedContent: unknown;
-  try {
-    parsedContent = JSON.parse(serializedContent);
-  } catch {
-    throw new Error("context pack revision content_json is not valid JSON");
-  }
-  const content = normalizeContextPackContent(parsedContent);
-  const canonicalContent = serializeContextPackContent(content);
-  if (serializedContent !== canonicalContent) {
-    throw new Error("context pack revision content_json is not canonical");
-  }
-  const expectedDigest = hashContextPackContent(canonicalContent);
-  const expectedBytes = utf8Bytes(canonicalContent);
-  const expectedTokens = estimateContextPackTokens(canonicalContent);
-  if (expectedBytes > AGENT_CONTEXT_PACK_MAX_TOTAL_BYTES) {
-    throw new Error("context pack revision content exceeds the UTF-8 byte cap");
-  }
-  if (normalized.content_digest !== expectedDigest) {
-    throw new Error("context pack revision content digest does not match content");
-  }
-  if (normalized.byte_count !== expectedBytes) {
-    throw new Error("context pack revision byte count does not match UTF-8 content");
-  }
-  if (normalized.token_count !== expectedTokens) {
-    throw new Error("context pack revision token count does not match content");
-  }
-}
 function registryOwner(spec: unknown): any {
   return spec && typeof spec === "object" ? (spec as any).owner : null;
 }
@@ -4206,6 +4180,469 @@ function checkImportBudget(signal?: AbortSignal, deadlineAt?: number): void {
     throw new Error("import validation deadline exceeded");
   }
 }
+const SEALED_PRESET_PLACEHOLDER_RE = /^\{\{(?:presetBlock|pblock)::([^}]+)\}\}$/;
+const SEALED_PRESET_PLACEHOLDER_ENVELOPE_RE = /^\{\{(?:presetBlock|pblock)::[^}]*\}\}$/;
+const SEALED_PRESET_METADATA_HINT_RE = /(?:portableSealedPreset|_lumiverse_sealed_preset|sealedPreset)/;
+const SEALED_PRESET_PROMPT_HINT_RE = /(?:"sealed"\s*:|"sealedSource"\s*:|"sealedKey"\s*:|"sealedOriginPresetId"\s*:|"sealedOriginVersion"\s*:|"sealedSha256"\s*:|presetBlock|pblock)/;
+const SEALED_PRESET_BLOCK_MARKER_KEYS = [
+  "sealed",
+  "sealedKey",
+  "sealedSource",
+  "sealedOriginPresetId",
+  "sealedOriginVersion",
+  "sealedSha256",
+] as const;
+
+function sealedPresetImportError(message: string): Error {
+  return new Error(`sealed preset ${message}`);
+}
+
+function isSealedPresetPlaceholder(value: unknown): boolean {
+  return typeof value === "string"
+    && SEALED_PRESET_PLACEHOLDER_ENVELOPE_RE.test(value.trim());
+}
+
+function sealedPresetPlaceholder(value: unknown): string | null {
+  if (!isSealedPresetPlaceholder(value)) return null;
+  const match = value.trim().match(SEALED_PRESET_PLACEHOLDER_RE);
+  return match?.[1]?.trim() || null;
+}
+
+function hasSealedPresetBlockMarker(block: Record<string, unknown>): boolean {
+  return block.sealed === true
+    || block.sealed === 1
+    || block.sealed === "true"
+    || block.sealedSource === "lumihub"
+    || SEALED_PRESET_BLOCK_MARKER_KEYS.some((key) => Object.hasOwn(block, key))
+    || isSealedPresetPlaceholder(block.content);
+}
+function isCanonicalSealedPresetBlock(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return value.sealed === true
+    || value.sealedSource === "lumihub"
+    || Object.hasOwn(value, "sealedSource")
+    || (Object.hasOwn(value, "sealed") && value.sealed !== false)
+    || sealedPresetPlaceholder(value.content) !== null;
+}
+function hasSealedPresetMetadataCarrier(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (
+    Object.hasOwn(value, "portableSealedPreset")
+    || Object.hasOwn(value, "_lumiverse_sealed_preset")
+    || Object.hasOwn(value, "sealedPreset")
+  ) {
+    return true;
+  }
+  const compatibility = isRecord(value.compatibility) && isRecord(value.compatibility.lumiverse)
+    ? value.compatibility.lumiverse
+    : null;
+  return compatibility !== null && Object.hasOwn(compatibility, "sealedPreset");
+}
+
+function descriptorBlocksEqual(
+  left: PortableSealedPresetDescriptor,
+  right: PortableSealedPresetDescriptor,
+): boolean {
+  if (left.hubPresetId !== right.hubPresetId || left.hubPresetVersion !== right.hubPresetVersion) return false;
+  if (left.blocks.length !== right.blocks.length) return false;
+  const rightByKey = new Map(right.blocks.map((block) => [block.key, block.sha256]));
+  return left.blocks.every((block) => rightByKey.get(block.key) === block.sha256);
+}
+
+function readSealedMetadataText(
+  metadata: Record<string, unknown>,
+  key: string,
+  allowNull: boolean,
+): string | null {
+  if (!Object.hasOwn(metadata, key)) return null;
+  const raw = metadata[key];
+  if (allowNull && (raw === null || raw === undefined)) return null;
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw sealedPresetImportError(`metadata ${key} must be a non-empty string`);
+  }
+  return raw.trim();
+}
+
+function collectSealedBlockText(
+  promptOrder: readonly unknown[],
+  key: "sealedOriginPresetId" | "sealedOriginVersion",
+  allowNull: boolean,
+): Set<string> {
+  const values = new Set<string>();
+  for (const value of promptOrder) {
+    if (!isRecord(value) || !Object.hasOwn(value, key)) continue;
+    const raw = value[key];
+    if (allowNull && (raw === null || raw === undefined)) continue;
+    if (typeof raw !== "string" || !raw.trim()) {
+      throw sealedPresetImportError(`block ${key} must be a non-empty string`);
+    }
+    values.add(raw.trim());
+  }
+  return values;
+}
+
+type SealedPresetLinkedCarrier = {
+  stashId: string;
+  sealed: boolean;
+  key: string | null;
+  hubPresetId: string | null;
+  hubPresetVersion: string | null;
+  sha256: string | null;
+};
+
+type SealedPresetDescriptorPlan = {
+  promptOrder: unknown[];
+  metadata: Record<string, unknown>;
+  linkedStashCarriers: SealedPresetLinkedCarrier[];
+};
+
+function readLinkedCarrierString(
+  block: Record<string, unknown>,
+  key: "sealedKey" | "sealedOriginPresetId" | "sealedOriginVersion" | "sealedSha256",
+  required: boolean,
+): string | null {
+  if (!Object.hasOwn(block, key)) {
+    if (required) throw sealedPresetImportError(`linked stash block is missing ${key}`);
+    return null;
+  }
+  const raw = block[key];
+  if (typeof raw !== "string" || !raw.trim()) {
+    throw sealedPresetImportError(`linked stash block ${key} must be a non-empty string`);
+  }
+  const value = raw.trim();
+  if (key === "sealedSha256" && !/^[a-f0-9]{64}$/i.test(value)) {
+    throw sealedPresetImportError("linked stash block sealedSha256 must be a SHA-256 digest");
+  }
+  return key === "sealedSha256" ? value.toLowerCase() : value;
+}
+
+function collectSealedPresetLinkedCarriers(
+  promptOrder: readonly unknown[],
+): SealedPresetLinkedCarrier[] {
+  const carriers: SealedPresetLinkedCarrier[] = [];
+  for (const value of promptOrder) {
+    if (!isRecord(value) || !Object.hasOwn(value, "stashId")) continue;
+    if (value.stashId === null || value.stashId === undefined) continue;
+    if (typeof value.stashId !== "string" || !value.stashId.trim()) {
+      throw sealedPresetImportError("preset linked stashId must be a non-empty string");
+    }
+    const stashId = value.stashId.trim();
+    if (!isCanonicalSealedPresetBlock(value)) {
+      carriers.push({
+        stashId,
+        sealed: false,
+        key: null,
+        hubPresetId: null,
+        hubPresetVersion: null,
+        sha256: null,
+      });
+      continue;
+    }
+    const placeholderKey = sealedPresetPlaceholder(value.content);
+    if (isSealedPresetPlaceholder(value.content) && !placeholderKey) {
+      throw sealedPresetImportError("linked stash block has an empty placeholder key");
+    }
+    const sealedKey = readLinkedCarrierString(value, "sealedKey", false);
+    if (sealedKey && placeholderKey && sealedKey !== placeholderKey) {
+      throw sealedPresetImportError("linked stash block key conflicts with its placeholder");
+    }
+    const key = sealedKey ?? placeholderKey;
+    if (!key) throw sealedPresetImportError("linked stash block is missing its key");
+    carriers.push({
+      stashId,
+      sealed: true,
+      key,
+      hubPresetId: readLinkedCarrierString(value, "sealedOriginPresetId", true),
+      hubPresetVersion: readLinkedCarrierString(value, "sealedOriginVersion", true),
+      sha256: readLinkedCarrierString(value, "sealedSha256", true),
+    });
+  }
+  return carriers;
+}
+
+function linkedStashCarriersEqual(
+  left: SealedPresetLinkedCarrier,
+  right: SealedPresetLinkedCarrier,
+): boolean {
+  return left.stashId === right.stashId
+    && left.sealed === right.sealed
+    && left.key === right.key
+    && left.hubPresetId === right.hubPresetId
+    && left.hubPresetVersion === right.hubPresetVersion
+    && left.sha256 === right.sha256;
+}
+
+function promptValueHasSealedHint(value: unknown): boolean {
+  if (isRecord(value)) return hasSealedPresetBlockMarker(value);
+  if (isSealedPresetPlaceholder(value)) return true;
+  return Array.isArray(value) && value.some((entry) => (
+    (isRecord(entry) && hasSealedPresetBlockMarker(entry))
+    || isSealedPresetPlaceholder(entry)
+  ));
+}
+
+
+function parsePresetJsonColumnSafely(value: unknown, column: string): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw sealedPresetImportError(`${column} is not valid JSON`);
+  }
+}
+
+/**
+ * Convert all legacy sealed metadata carriers to the canonical portable
+ * descriptor shape before invoking the shared LumiHub materializer. This
+ * routine only handles carrier discovery and consistency; descriptor shape,
+ * key, digest, and block materialization validation remain canonical-helper
+ * responsibilities.
+ */
+async function prepareSealedPresetRow(
+  job: ImportJob,
+  row: Record<string, unknown>,
+): Promise<SealedPresetDescriptorPlan | null> {
+  const rawPromptOrder = row.prompt_order;
+  const rawMetadata = row.metadata;
+  const promptHint = typeof rawPromptOrder === "string" && SEALED_PRESET_PROMPT_HINT_RE.test(rawPromptOrder);
+  const metadataHint = typeof rawMetadata === "string" && SEALED_PRESET_METADATA_HINT_RE.test(rawMetadata);
+
+  let promptOrder: unknown = undefined;
+  let metadata: unknown = undefined;
+  let promptParseError: unknown = null;
+  let metadataParseError: unknown = null;
+  try {
+    promptOrder = parsePresetJsonColumnSafely(rawPromptOrder, "prompt_order");
+  } catch (error) {
+    promptParseError = error;
+  }
+  try {
+    metadata = parsePresetJsonColumnSafely(rawMetadata, "metadata");
+  } catch (error) {
+    metadataParseError = error;
+  }
+  const parsedPromptHint = promptParseError === null && promptValueHasSealedHint(promptOrder);
+  const parsedMetadataHint = metadataParseError === null && hasSealedPresetMetadataCarrier(metadata);
+  if (promptParseError !== null || metadataParseError !== null) {
+    if (promptHint || metadataHint || parsedPromptHint || parsedMetadataHint) {
+      throw promptParseError ?? metadataParseError;
+    }
+    return null;
+  }
+  if (!Array.isArray(promptOrder)) {
+    if (promptHint || metadataHint || parsedPromptHint || parsedMetadataHint) {
+      throw sealedPresetImportError("prompt_order must be an array");
+    }
+    return null;
+  }
+  if (!isRecord(metadata)) {
+    if (promptHint || metadataHint || parsedPromptHint || parsedMetadataHint) {
+      throw sealedPresetImportError("metadata must be an object");
+    }
+    return null;
+  }
+
+  const hasBlockMarkers = promptOrder.some((value) => (
+    (isRecord(value) && hasSealedPresetBlockMarker(value))
+    || isSealedPresetPlaceholder(value)
+  ));
+  const hasIgnoredSealedMarkers = promptOrder.some((value) => (
+    isRecord(value)
+      ? hasSealedPresetBlockMarker(value) && !isCanonicalSealedPresetBlock(value)
+      : isSealedPresetPlaceholder(value)
+  ));
+  if (hasIgnoredSealedMarkers) {
+    throw sealedPresetImportError("prompt_order contains an invalid sealed marker");
+  }
+  const hasPortableCarrier = Object.hasOwn(metadata, "portableSealedPreset");
+  const legacyManifestValues: unknown[] = [];
+  if (Object.hasOwn(metadata, "_lumiverse_sealed_preset") && metadata._lumiverse_sealed_preset !== null) {
+    legacyManifestValues.push(metadata._lumiverse_sealed_preset);
+  }
+  if (Object.hasOwn(metadata, "sealedPreset") && metadata.sealedPreset !== null) {
+    legacyManifestValues.push(metadata.sealedPreset);
+  }
+  const compatibility = isRecord(metadata.compatibility) && isRecord(metadata.compatibility.lumiverse)
+    ? metadata.compatibility.lumiverse
+    : null;
+  if (compatibility && Object.hasOwn(compatibility, "sealedPreset") && compatibility.sealedPreset !== null) {
+    legacyManifestValues.push(compatibility.sealedPreset);
+  }
+  const hasExplicitNullLegacyManifest = (
+    (Object.hasOwn(metadata, "_lumiverse_sealed_preset") && metadata._lumiverse_sealed_preset === null)
+    || (Object.hasOwn(metadata, "sealedPreset") && metadata.sealedPreset === null)
+    || (compatibility !== null && Object.hasOwn(compatibility, "sealedPreset") && compatibility.sealedPreset === null)
+  );
+  if (hasExplicitNullLegacyManifest && (hasPortableCarrier || hasBlockMarkers)) {
+    throw sealedPresetImportError("metadata contains an explicit null legacy manifest");
+  }
+  const hasDescriptorCarrier = hasPortableCarrier || legacyManifestValues.length > 0;
+  if (!hasBlockMarkers && !hasDescriptorCarrier) return null;
+
+  const portableCandidates: PortableSealedPresetDescriptor[] = [];
+  if (hasPortableCarrier) {
+    portableCandidates.push(parsePortableSealedPresetDescriptor(metadata.portableSealedPreset));
+  }
+  const legacyCandidates = legacyManifestValues.map((value) => ({
+    manifest: parseSealedPresetManifest(value),
+  }));
+  const firstPortable = portableCandidates[0] ?? null;
+  const firstLegacy = legacyCandidates[0]?.manifest ?? null;
+  if (
+    !hasBlockMarkers
+    && !hasPortableCarrier
+    && legacyCandidates.length > 0
+    && legacyCandidates.every(({ manifest }) => manifest.blocks.length === 0)
+  ) {
+    // An empty legacy manifest is ordinary metadata emitted by older exports.
+    return null;
+  }
+  for (const candidate of portableCandidates.slice(1)) {
+    if (!descriptorBlocksEqual(firstPortable!, candidate)) {
+      throw sealedPresetImportError("metadata contains conflicting portable descriptors");
+    }
+  }
+  for (const candidate of legacyCandidates.slice(1)) {
+    if (
+      firstLegacy
+      && (
+        (firstLegacy.version !== null && candidate.manifest.version !== null && firstLegacy.version !== candidate.manifest.version)
+        || firstLegacy.blocks.length !== candidate.manifest.blocks.length
+        || firstLegacy.blocks.some((block) => candidate.manifest.blocks.find(
+          (other) => other.key === block.key && other.sha256 === block.sha256,
+        ) === undefined)
+      )
+    ) {
+      throw sealedPresetImportError("metadata contains conflicting sealed manifests");
+    }
+  }
+  const legacyVersions = new Set(
+    legacyCandidates
+      .map(({ manifest }) => manifest.version)
+      .filter((version): version is string => typeof version === "string"),
+  );
+  if (legacyVersions.size > 1) {
+    throw sealedPresetImportError("metadata contains conflicting sealed manifest versions");
+  }
+
+  const metadataHubPresetId = readSealedMetadataText(metadata, "_lumiverse_lumihub_id", false);
+  const metadataVersion = readSealedMetadataText(metadata, "_lumiverse_preset_version", true);
+  const blockHubPresetIds = collectSealedBlockText(promptOrder, "sealedOriginPresetId", false);
+  const blockVersions = collectSealedBlockText(promptOrder, "sealedOriginVersion", true);
+  const manifestVersion = [...legacyVersions][0] ?? null;
+  const hubPresetId = firstPortable?.hubPresetId
+    ?? metadataHubPresetId
+    ?? [...blockHubPresetIds][0]
+    ?? null;
+  const hubPresetVersion = firstPortable?.hubPresetVersion
+    ?? metadataVersion
+    ?? manifestVersion
+    ?? [...blockVersions][0]
+    ?? null;
+  if (!hubPresetId || !hubPresetVersion) {
+    throw sealedPresetImportError("descriptor is missing its Hub preset identity or version");
+  }
+  if (
+    (metadataHubPresetId && metadataHubPresetId !== hubPresetId)
+    || (metadataVersion && metadataVersion !== hubPresetVersion)
+    || [...blockHubPresetIds].some((value) => value !== hubPresetId)
+    || [...blockVersions].some((value) => value !== hubPresetVersion)
+    || (manifestVersion && manifestVersion !== hubPresetVersion)
+  ) {
+    throw sealedPresetImportError("metadata and block origins are inconsistent");
+  }
+
+  const legacyBlocks = Array.isArray(firstLegacy?.blocks)
+    ? firstLegacy.blocks.map((block) => ({
+      key: block.key as string,
+      sha256: block.sha256 as string,
+    }))
+    : [];
+  const descriptorBlocks = firstPortable?.blocks ?? legacyBlocks;
+  if (descriptorBlocks.length === 0) {
+    throw sealedPresetImportError("descriptor has no blocks");
+  }
+  const descriptor = parsePortableSealedPresetDescriptor({
+    hubPresetId,
+    hubPresetVersion,
+    blocks: descriptorBlocks,
+  });
+  if (firstPortable && !descriptorBlocksEqual(firstPortable, descriptor)) {
+    throw sealedPresetImportError("portable descriptor normalization changed its value");
+  }
+  if (firstLegacy) {
+    const normalizedLegacy = parsePortableSealedPresetDescriptor({
+      hubPresetId,
+      hubPresetVersion,
+      blocks: legacyBlocks,
+    });
+    if (!descriptorBlocksEqual(descriptor, normalizedLegacy)) {
+      throw sealedPresetImportError("portable descriptor and legacy manifest are inconsistent");
+    }
+  }
+  if (!hasBlockMarkers) {
+    // A descriptor without a corresponding sealed block must never silently
+    // become ordinary prompt content; the canonical helper reports the same
+    // incomplete-descriptor failure after this preflight returns.
+    throw sealedPresetImportError("descriptor has no matching sealed prompt blocks");
+  }
+
+  const canonicalMetadata: Record<string, unknown> = {
+    ...metadata,
+    portableSealedPreset: descriptor,
+  };
+  const materialized = await materializePortableSealedPresetImport(
+    job.userId,
+    {
+      prompt_order: promptOrder,
+      metadata: canonicalMetadata,
+    },
+    portableSealedPresetResolverOverride ?? undefined,
+  );
+  if (!Array.isArray(materialized.prompt_order) || !isRecord(materialized.metadata)) {
+    throw sealedPresetImportError("materializer returned an invalid preset");
+  }
+  return {
+    promptOrder: materialized.prompt_order,
+    metadata: materialized.metadata,
+    linkedStashCarriers: collectSealedPresetLinkedCarriers(materialized.prompt_order),
+  };
+}
+
+/**
+ * Resolve every staged sealed preset before file journals or the relational
+ * apply transaction can mutate the live database. Rows are updated only in
+ * the private staging database; a later row failure therefore leaves the
+ * destination untouched.
+ */
+async function prepareStagedSealedPresets(job: ImportJob, stage: StagedArchive): Promise<void> {
+  if (!sqliteTableExists(stage.db, "presets")) return;
+  const deadlineAt = validationDeadlineForJob(job);
+  const state = createValidationYieldState();
+  for (const row of stage.db.query("SELECT id, prompt_order, metadata FROM presets").iterate() as Iterable<Record<string, unknown>>) {
+    await yieldValidationBatch(
+      job.abort.signal,
+      deadlineAt,
+      job,
+      state,
+      checkedValidationBytes(row.prompt_order) + checkedValidationBytes(row.metadata),
+    );
+    const prepared = await prepareSealedPresetRow(job, row);
+    checkImportBudget(job.abort.signal, deadlineAt);
+    if (!prepared) continue;
+    if (typeof row.id !== "string" || row.id.length === 0) {
+      throw sealedPresetImportError("preset row id is malformed");
+    }
+    const promptOrder = JSON.stringify(prepared.promptOrder);
+    const metadata = JSON.stringify(prepared.metadata);
+    if (promptOrder === row.prompt_order && metadata === row.metadata) continue;
+    const updated = stage.db.query(
+      "UPDATE presets SET prompt_order = ?, metadata = ? WHERE id = ?",
+    ).run(promptOrder, metadata, row.id);
+    if (updated.changes !== 1) throw new Error("staged sealed preset row was not updated");
+  }
+}
+
 
 
 export type FileHashHeartbeat = () => void;
@@ -4690,29 +5127,6 @@ async function validateStagedOwners(
   }
 }
  
-/**
- * Foreign context principals are not portable authority. Drop those grants
- * before parent-edge validation; the destination owner is restored implicitly
- * and the imported owner grant is intentionally not materialized.
- */
-function quarantineForeignContextAclRows(
-  stage: Database,
-  stagedTables: Set<string>,
-  sourceOwner: string | null,
-): void {
-  if (!sourceOwner) return;
-  for (const table of stagedTables) {
-    if (!/context.*acl/i.test(table)) continue;
-    const columns = new Set(
-      (stage.query(`PRAGMA table_info(${ident(table)})`).all() as Array<{ name: string }>).map((column) => column.name),
-    );
-    if (!columns.has("principal_user_id")) continue;
-    stage.query(
-      `DELETE FROM ${ident(table)}
-        WHERE principal_user_id IS NOT NULL AND principal_user_id <> ?`,
-    ).run(sourceOwner);
-  }
-}
 
 
 async function materializeValidatedArchive(job: ImportJob, buf: ImportBuffer): Promise<StagedArchive> {
@@ -4801,7 +5215,6 @@ async function materializeValidatedArchive(job: ImportJob, buf: ImportBuffer): P
         normalized,
         new Set(columns.map((column) => column.name)),
       );
-      validateContextPackRevisionAccounting(entry.table, normalized);
       if (entry.table === "settings" && typeof normalized.key === "string" && isSecretSettingKey(normalized.key)) {
         throw new Error(`secret setting key is not allowed: ${normalized.key}`);
       }
@@ -4821,7 +5234,6 @@ async function materializeValidatedArchive(job: ImportJob, buf: ImportBuffer): P
     rowCounts[entry.table] = tableRows;
   }
   await validateStagedOwners(stage, stagedTables, sourceOwner, job.abort.signal, validationDeadlineAt, job);
-  quarantineForeignContextAclRows(stage, stagedTables, sourceOwner);
 
 
   const files: BufferedBinaryEntry[] = [];
@@ -6253,7 +6665,6 @@ function authorityResetRow(
   table: string,
   row: Record<string, any>,
   spec: unknown,
-  foreignRestore = true,
 ): Record<string, any> {
   const out = { ...row };
   const reset = spec && typeof spec === "object" ? (spec as any).authorityReset : null;
@@ -6261,8 +6672,7 @@ function authorityResetRow(
   const resetKind = typeof reset === "string" ? reset : null;
   const forceReview = resetKind === "review_required"
     || /^preset_agent_/i.test(table)
-    || /^chat_agent_/i.test(table)
-    || (foreignRestore && /^agent_context_/i.test(table));
+    || /^chat_agent_/i.test(table);
   if (/^images$/i.test(table)) {
     // Public image-generation access is server authority, never portable
     // archive data. Clear both the explicit marker and the legacy filename
@@ -6305,7 +6715,7 @@ function authorityResetRow(
     if (Object.hasOwn(out, "review_acknowledged")) out.review_acknowledged = 0;
   }
   if (forceReview && Object.hasOwn(out, "review_code")) out.review_code = "foreign_import";
-  if (forceReview && !/^agent_context_/i.test(table)) {
+  if (forceReview) {
     // Imported authority must remain inert, but its revision must stay writable.
     // A foreign MAX_SAFE_INTEGER revision would make the first local repair
     // overflow the schema check before the user can acknowledge it.
@@ -6334,7 +6744,6 @@ function authorityResetRow(
     if (Object.hasOwn(out, "state")) out.state = "review_required";
     if (Object.hasOwn(out, "review_code")) out.review_code = "foreign_import";
   }
-  if (/context.*acl/i.test(table) && Object.hasOwn(out, "principal_user_id")) out.principal_user_id = row.user_id;
   if (/^extensions$/i.test(table) && Object.hasOwn(out, "enabled")) out.enabled = 0;
   if (/^world_book_entries$/i.test(table)) {
     const vectorized = out.vectorized === true || out.vectorized === 1;
@@ -6392,171 +6801,19 @@ function collectImportedLegacyAgentConfigs(stage: StagedArchive): ImportedLegacy
   }
   return collected;
 }
-interface ContextPackImportRemap {
-  foreign: boolean;
-  packIds: ReadonlyMap<string, string>;
-  revisions: ReadonlyMap<string, number>;
-  latest: ReadonlyMap<string, number>;
-}
-
-function stagedSourceOwner(stage: StagedArchive): string | null {
-  const row = stage.db.query("SELECT value FROM __import_meta WHERE key = 'source_owner'").get() as { value?: unknown } | null;
-  if (!row || row.value === undefined || row.value === "") return null;
-  if (typeof row.value !== "string") throw new Error("staged archive source owner is malformed");
-  return row.value;
-}
-
-function contextRevisionKey(packId: string, revision: number): string {
-  return `${packId}\u0000${revision}`;
-}
-
-function deterministicContextPackId(
-  sourcePackId: string,
-  archiveId: string,
-  userId: string,
-  db: Database,
-  used: Set<string>,
-): string {
-  const digest = createHash("sha256").update(`context-pack\u0000${archiveId}\u0000${sourcePackId}`).digest("hex");
-  for (let suffix = 0; suffix < 1_024; suffix++) {
-    const candidate = suffix === 0
-      ? `ctx-${digest.slice(0, 48)}`
-      : `ctx-${digest.slice(0, 40)}-${suffix}`;
-    if (used.has(candidate)) continue;
-    if (db.query("SELECT 1 FROM agent_context_packs WHERE user_id = ? AND id = ? LIMIT 1").get(userId, candidate)) continue;
-    used.add(candidate);
-    return candidate;
-  }
-  throw new Error("context pack identity remap exceeds collision cap");
-}
-
-function buildContextPackImportRemap(
-  stage: StagedArchive,
-  db: Database,
-  job: ImportJob,
-): ContextPackImportRemap {
-  const sourceOwner = stagedSourceOwner(stage);
-  const foreign = sourceOwner !== null && sourceOwner !== job.userId;
-  const packIds = new Map<string, string>();
-  const revisions = new Map<string, number>();
-  const latest = new Map<string, number>();
-  if (!foreign || !sqliteTableExists(stage.db, "agent_context_packs")) {
-    return { foreign, packIds, revisions, latest };
-  }
-  const used = new Set<string>();
-  const packRows = stage.db.query(
-    "SELECT id, latest_revision FROM agent_context_packs ORDER BY id ASC",
-  ).all() as Array<{ id?: unknown; latest_revision?: unknown }>;
-  for (const row of packRows) {
-    if (typeof row.id !== "string" || row.id.length === 0 || !Number.isSafeInteger(row.latest_revision) || Number(row.latest_revision) < 1) {
-      throw new Error("context pack identity or latest revision is malformed");
-    }
-    packIds.set(row.id, deterministicContextPackId(row.id, job.archiveId, job.userId, db, used));
-  }
-  if (!sqliteTableExists(stage.db, "agent_context_pack_revisions")) {
-    throw new Error("context pack revisions are missing from archive");
-  }
-  const revisionRows = stage.db.query(
-    "SELECT pack_id, revision FROM agent_context_pack_revisions ORDER BY pack_id ASC, revision ASC",
-  ).all() as Array<{ pack_id?: unknown; revision?: unknown }>;
-  const grouped = new Map<string, number[]>();
-  for (const row of revisionRows) {
-    if (
-      typeof row.pack_id !== "string"
-      || !packIds.has(row.pack_id)
-      || !Number.isSafeInteger(row.revision)
-      || Number(row.revision) < 1
-    ) {
-      throw new Error("context pack revision identity is malformed");
-    }
-    const revisionsForPack = grouped.get(row.pack_id) ?? [];
-    revisionsForPack.push(Number(row.revision));
-    grouped.set(row.pack_id, revisionsForPack);
-  }
-  for (const [sourcePackId, revisionsForPack] of grouped) {
-    let nextRevision = 1;
-    for (const sourceRevision of revisionsForPack) {
-      revisions.set(contextRevisionKey(sourcePackId, sourceRevision), nextRevision++);
-    }
-    const sourceLatest = packRows.find((row) => row.id === sourcePackId)?.latest_revision;
-    if (!Number.isSafeInteger(sourceLatest) || !revisions.has(contextRevisionKey(sourcePackId, Number(sourceLatest)))) {
-      throw new Error(`context pack latest revision is missing: ${sourcePackId}`);
-    }
-    latest.set(sourcePackId, revisionsForPack.length);
-  }
-  for (const row of packRows) {
-    if (!latest.has(row.id as string)) throw new Error(`context pack has no revisions: ${String(row.id)}`);
-  }
-  return { foreign, packIds, revisions, latest };
-}
-
-function rewriteContextPackImportRow(
-  table: string,
-  row: Record<string, any>,
-  spec: unknown,
-  userId: string,
-  remap: ContextPackImportRemap,
-): Record<string, any> {
-  const out = rewriteOwner(table, row, spec, userId, remap.foreign);
-  if (!remap.foreign) return out;
-  if (table === "agent_context_packs") {
-    const mapped = remap.packIds.get(String(row.id));
-    const mappedLatest = remap.latest.get(String(row.id));
-    if (!mapped || !mappedLatest) throw new Error(`context pack remap is missing: ${String(row.id)}`);
-    out.id = mapped;
-    out.latest_revision = mappedLatest;
-    out.state = "review_required";
-  } else if (table === "agent_context_pack_revisions") {
-    const mappedPack = remap.packIds.get(String(row.pack_id));
-    const mappedRevision = Number.isSafeInteger(row.revision)
-      ? remap.revisions.get(contextRevisionKey(String(row.pack_id), Number(row.revision)))
-      : undefined;
-    if (!mappedPack || !mappedRevision) throw new Error("context pack revision remap is missing");
-    out.pack_id = mappedPack;
-    out.revision = mappedRevision;
-    out.state = "review_required";
-  } else if (table === "agent_context_pack_acls") {
-    const mappedPack = remap.packIds.get(String(row.pack_id));
-    if (!mappedPack) throw new Error("context pack ACL remap is missing");
-    out.pack_id = mappedPack;
-    out.principal_user_id = userId;
-    out.state = "review_required";
-  } else if (
-    table === "agent_preset_context_pack_attachments"
-    || table === "agent_chat_context_pack_attachments"
-    || table === "agent_world_book_context_pack_attachments"
-  ) {
-    const mappedPack = remap.packIds.get(String(row.pack_id));
-    const mappedRevision = Number.isSafeInteger(row.revision)
-      ? remap.revisions.get(contextRevisionKey(String(row.pack_id), Number(row.revision)))
-      : undefined;
-    if (!mappedPack || !mappedRevision) throw new Error("context pack attachment remap is missing");
-    out.pack_id = mappedPack;
-    out.revision = mappedRevision;
-    out.state = "review_required";
-  }
-  return out;
-}
 
 function rewriteOwner(
   table: string,
   row: Record<string, any>,
   spec: unknown,
   userId: string,
-  foreignRestore = true,
 ): Record<string, any> {
-  const out = authorityResetRow(table, row, spec, foreignRestore);
-  if (!foreignRestore && /context.*pack/i.test(table)) {
-    for (const column of ["state", "review_state", "review_code", "review_acknowledged"]) {
-      if (Object.hasOwn(row, column)) out[column] = row[column];
-    }
-  }
+  const out = authorityResetRow(table, row, spec);
   if (/^presets$/i.test(table) && typeof out.metadata === "string") {
     out.metadata = stripImportedLegacyPresetMetadataV1(out.metadata);
   }
   const owner = registryOwner(spec);
   if (owner?.kind === "direct" && typeof owner.column === "string" && Object.hasOwn(out, owner.column)) out[owner.column] = userId;
-  if (/context.*acl/i.test(table) && Object.hasOwn(out, "principal_user_id")) out.principal_user_id = userId;
   if (Object.hasOwn(out, "installed_by_user_id")) out.installed_by_user_id = userId;
   if (Object.hasOwn(out, "user_id")) out.user_id = userId;
   return out;
@@ -7748,7 +8005,6 @@ async function applyStagedArchive(job: ImportJob, stage: StagedArchive, ticketRe
   if (job.abort.signal.aborted) throw job.abort.signal.reason ?? new Error("import cancelled");
   const db = getDb();
   assertTicketUsableBeforeSecretPreparation(job, stage, ticketResult);
-  const contextRemap = buildContextPackImportRemap(stage, db, job);
   const progressSummary = requireImportProgressSummary(job.summary);
   let preparedSecrets: PreparedSecret[];
   try {
@@ -7798,15 +8054,10 @@ async function applyStagedArchive(job: ImportJob, stage: StagedArchive, ticketRe
       const columns = getTableColumnsFrom(db, table).map((column) => column.name);
       const insert = db.prepare(`INSERT INTO ${ident(table)} (${columns.map(ident).join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
       for (const raw of stage.db.query(`SELECT * FROM ${ident(table)}`).iterate() as Iterable<Record<string, any>>) {
-        const row = rewriteContextPackImportRow(table, raw, spec, job.userId, contextRemap);
+        const row = rewriteOwner(table, raw, spec, job.userId);
         let imported = false;
         let skipped = false;
-        if (/context.*acl/i.test(table) && row.principal_user_id === job.userId) {
-          // Owner access is implicit. Foreign principals are reset to the
-          // destination owner during import and must be omitted rather than
-          // colliding with one another or manufacturing an owner grant.
-          skipped = true;
-        } else if (table === "settings") {
+        if (table === "settings") {
           const value = typeof row.value === "string" ? row.value : JSON.stringify(row.value);
           const existing = db.query("SELECT value FROM settings WHERE key = ? AND user_id = ?").get(row.key, job.userId) as { value: string } | null;
           if (!existing) {
@@ -8251,6 +8502,7 @@ async function runImportJob(job: ImportJob): Promise<void> {
     stage = await materializeValidatedArchive(job, buf);
     job.stagingDbPath = stage.dbPath;
     job.archiveSecretKeys = stage.secretIndex;
+    await prepareStagedSealedPresets(job, stage);
     transitionImport(job, "ready", ["validating"]);
 
 
@@ -8391,173 +8643,348 @@ async function runImportJob(job: ImportJob): Promise<void> {
  * only fenced, identity-matching files created by the job and never writes
  * canonical rows.
  */
-export async function reconcileUserDataImports(): Promise<void> {
+export async function reconcileUserDataImports(): Promise<ImportRecoveryResult> {
   const db = getDb();
-  // One immutable budget bounds all startup hashing and gives recovery a
-  // deterministic fence instead of blocking the event loop indefinitely.
-  const recoveryDeadlineAt = Date.now() + IMPORT_FILE_OPERATION_DEADLINE_MS;
-  assertArchiveRegistryCoverage(db);
   const startupDeadlineAt = Date.now() + IMPORT_STARTUP_RECONCILIATION_DEADLINE_MS;
-  while (true) {
-    const rows = db.query(
-      `SELECT * FROM user_data_imports
-        WHERE state <> 'committed'
-           OR staging_path <> ''
-           OR EXISTS (
-              SELECT 1 FROM user_data_import_files f
-               WHERE f.job_id = user_data_imports.job_id
-                 AND f.install_state IN ('pending','created')
-           )
-           OR projection_pending = 1
-        ORDER BY created_at`,
-    ).all() as ImportControlRow[];
-    let earliestLeaseExpiry: number | null = null;
-    for (const row of rows) {
-      const liveJob = JOBS.get(row.job_id);
-      if (
-        liveJob
-        && (liveJob.status === "running" || liveJob.status === "queued" || liveJob.status === "awaiting_ticket")
-      ) continue;
-    const receipt = db.query("SELECT summary_json FROM user_data_import_receipts WHERE job_id = ?").get(row.job_id) as { summary_json: string } | null;
-    if (receipt) {
-      // Receipt replay is projection/cleanup-only: canonical rows are never
-      // reopened. Rebuild bounded derived work before settling file journals.
-      reconcileDerivedVectorProjection(row.job_id, row.user_id, receipt.summary_json);
-      const updatedReceipt = db.query("SELECT summary_json FROM user_data_import_receipts WHERE job_id = ?").get(row.job_id) as { summary_json: string } | null;
-      const recoveredSummary = updatedReceipt?.summary_json || receipt.summary_json;
-      const recoveredProjection = parseReceiptSummaryForProjection(recoveredSummary);
-      const recoveredVectors = recoveredProjection?.vectors;
-      const recoveredPendingValue = recoveredVectors
-        && typeof recoveredVectors === "object"
-        ? (recoveredVectors as Record<string, unknown>).projectionPending
-        : undefined;
-      const projectionPending = typeof recoveredPendingValue === "boolean"
-        ? (recoveredPendingValue ? 1 : 0)
-        : row.projection_pending;
-      db.query("UPDATE user_data_imports SET state = 'committed', summary_json = ?, projection_pending = ?, updated_at = ?, finished_at = COALESCE(finished_at, ?) WHERE job_id = ?")
-        .run(recoveredSummary, projectionPending, nowSeconds(), nowSeconds(), row.job_id);
-      const journalsSettled = await settleCommittedFileJournals(row.job_id, db, recoveryDeadlineAt);
-      const stagingRemoved = journalsSettled && cleanupOwnedImportArchive(row);
-      if (stagingRemoved) {
-        db.query("UPDATE user_data_imports SET staging_path = '', staging_db_path = '', updated_at = ? WHERE job_id = ?")
-          .run(nowSeconds(), row.job_id);
-      } else {
-        markImportManualRecovery(db, row);
-      }
-      continue;
-    }
-    if (row.state === "failed" || row.state === "cancelled") {
-      if (row.lease_owner) {
-        try {
-          await rollbackCreatedFiles(row.job_id, {
-            leaseOwner: row.lease_owner,
-            leaseGeneration: row.lease_generation,
-          });
-        } catch {}
-      }
-      const stagingRemoved = !hasUnsettledFileJournal(row.job_id, db) && cleanupOwnedImportArchive(row);
-      if (stagingRemoved) {
-        db.query("UPDATE user_data_imports SET staging_path = '', staging_db_path = '', updated_at = ? WHERE job_id = ?")
-          .run(nowSeconds(), row.job_id);
-      } else {
-        markImportManualRecovery(db, row);
-      }
-      continue;
-    }
-    if (row.state === "awaiting_ticket" && row.lease_owner === null && row.lease_expires_at === null) {
-      // A parked ticket gate is intentionally ownerless and has no live
-      // process to recover. Leave it durable until the ticket POST reacquires
-      // a fence and rebuilds the in-memory continuation.
-      continue;
-    }
-    const now = nowSeconds();
-    if (row.lease_expires_at !== null && row.lease_expires_at > now) {
-      earliestLeaseExpiry = earliestLeaseExpiry === null
-        ? row.lease_expires_at
-        : Math.min(earliestLeaseExpiry, row.lease_expires_at);
-      continue;
-    }
-    const takeoverOwner = `reconcile:${crypto.randomUUID()}`;
-    const takeover = db.query(
-      `UPDATE user_data_imports
-          SET lease_owner = ?, lease_generation = lease_generation + 1,
-              lease_expires_at = ?, updated_at = ?
-        WHERE job_id = ? AND lease_generation = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-          AND state NOT IN ('committed','failed','cancelled')`,
-    ).run(takeoverOwner, now + IMPORT_LEASE_SECONDS, now, row.job_id, row.lease_generation, now);
-    if (takeover.changes !== 1) continue;
-    const recoveryJob = {
-      jobId: row.job_id,
-      userId: row.user_id,
-      leaseOwner: takeoverOwner,
-      leaseGeneration: row.lease_generation + 1,
-    } as ImportJob;
-    let rollbackSettled = true;
-    try {
-      await rollbackCreatedFiles(
-        recoveryJob.jobId,
-        {
-          leaseOwner: recoveryJob.leaseOwner,
-          leaseGeneration: recoveryJob.leaseGeneration,
-        },
-        undefined,
-        recoveryDeadlineAt,
+  // File hashing/copying must share the startup deadline. The previous
+  // per-row lease-sized budget allowed a single journal to hold readiness open
+  // for minutes even though the pass itself was intended to be bounded.
+  const recoveryDeadlineAt = startupDeadlineAt;
+  assertArchiveRegistryCoverage(db);
+
+  const result = {
+    inspected: 0,
+    recovered: 0,
+    deferred: 0,
+    failed: 0,
+  };
+  const selectionNow = nowSeconds();
+  const eligible = `
+    (
+      (
+        state NOT IN ('committed', 'failed', 'cancelled')
+        AND NOT (
+          state = 'awaiting_ticket'
+          AND lease_owner IS NULL
+          AND lease_expires_at IS NULL
+        )
+      )
+      OR staging_path <> ''
+      OR staging_db_path <> ''
+      OR projection_pending = 1
+      OR EXISTS (
+        SELECT 1
+          FROM user_data_import_files f
+         WHERE f.job_id = user_data_imports.job_id
+           AND f.install_state IN ('pending', 'created')
+      )
+    )
+  `;
+  const rows = db.query(
+    `SELECT job_id, user_id, archive_id, idempotency_key, archive_digest,
+            manifest_json, staging_path, staging_db_path, state, lease_owner,
+            lease_expires_at, lease_generation, projection_pending, created_at,
+            updated_at, started_at, finished_at, stable_error_code, stable_error,
+            summary_json
+       FROM user_data_imports
+      WHERE ${eligible}
+      ORDER BY CASE
+        WHEN lease_expires_at IS NOT NULL AND lease_expires_at > ? THEN 1
+        ELSE 0
+      END, CASE
+        WHEN EXISTS (
+          SELECT 1
+            FROM user_data_import_files f
+           WHERE f.job_id = user_data_imports.job_id
+             AND f.install_state IN ('pending', 'created')
+        ) THEN 0
+        WHEN staging_path <> '' OR staging_db_path <> '' OR projection_pending = 1 THEN 1
+        ELSE 2
+      END, job_id ASC
+      LIMIT ?`,
+  ).all(selectionNow, MAX_IMPORT_STARTUP_RECONCILIATION_ROWS + 1) as ImportControlRow[];
+  const rowsToInspect = Math.min(rows.length, MAX_IMPORT_STARTUP_RECONCILIATION_ROWS);
+  const hasContinuation = rows.length > rowsToInspect;
+
+  const deferRemaining = (count: number): void => {
+    result.deferred += Math.max(0, count);
+  };
+  const sleepUntilLeaseExpiry = async (
+    row: ImportControlRow,
+  ): Promise<ImportControlRow | null> => {
+    let current = row;
+    while (current.lease_expires_at !== null && current.lease_expires_at > nowSeconds()) {
+      const remainingMs = startupDeadlineAt - Date.now();
+      if (remainingMs <= 0) return null;
+      const waitMs = Math.min(
+        remainingMs,
+        Math.max(1, current.lease_expires_at * 1_000 - Date.now()),
       );
-    } catch {
-      rollbackSettled = false;
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+      if (Date.now() >= startupDeadlineAt) return null;
+      const refreshed = readImportControl(current.job_id, db);
+      if (!refreshed) return null;
+      current = refreshed;
     }
-    const journalsRemain = (() => {
-      try {
-        return hasUnsettledFileJournal(recoveryJob.jobId, db);
-      } catch {
-        return true;
-      }
-    })();
-    const cleanupState = row.state === "cleanup_pending" || row.state === "cancelling";
-    const stagingNeeded = Boolean(row.staging_path || row.staging_db_path);
-    const stagingRemoved = !journalsRemain
-      && (!stagingNeeded || cleanupOwnedImportArchive(row));
-    if (cleanupState) {
-      if (!rollbackSettled || journalsRemain || !stagingRemoved) {
-        db.query(
-          `UPDATE user_data_imports
-              SET state = 'cleanup_pending', stable_error_code = 'cleanup_pending',
-                  stable_error = 'import cancellation cleanup is pending',
-                  lease_expires_at = ?, updated_at = ?, finished_at = NULL
-            WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?
-              AND state IN ('cancelling','cleanup_pending')`,
-        ).run(nowSeconds() + IMPORT_LEASE_SECONDS, nowSeconds(), row.job_id, takeoverOwner, row.lease_generation + 1);
-      } else {
-        db.query(
-          `UPDATE user_data_imports
-              SET state = 'cancelled', stable_error_code = 'cancelled',
-                  stable_error = 'import cancelled by user',
-                  staging_path = '', staging_db_path = '', updated_at = ?, finished_at = ?
-            WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?
-              AND state IN ('cancelling','cleanup_pending')`,
-        ).run(nowSeconds(), nowSeconds(), row.job_id, takeoverOwner, row.lease_generation + 1);
-      }
+    return current;
+  };
+
+  for (let rowIndex = 0; rowIndex < rowsToInspect; rowIndex++) {
+    result.inspected++;
+    if (Date.now() >= startupDeadlineAt) {
+      deferRemaining(rowsToInspect - rowIndex);
+      break;
+    }
+    let row = rows[rowIndex]!;
+    const liveJob = JOBS.get(row.job_id);
+    if (
+      liveJob
+      && (
+        liveJob.status === "running"
+        || liveJob.status === "queued"
+        || liveJob.status === "awaiting_ticket"
+      )
+    ) {
+      result.deferred++;
       continue;
     }
-    db.query(
-      `UPDATE user_data_imports SET state = 'failed', stable_error_code = 'process_interrupted',
-          stable_error = 'import process interrupted before relational commit', updated_at = ?, finished_at = ?
-        WHERE job_id = ? AND lease_owner = ? AND lease_generation = ? AND state NOT IN ('committed','cancelled')`,
-    ).run(nowSeconds(), nowSeconds(), row.job_id, takeoverOwner, row.lease_generation + 1);
-    if (!stagingRemoved) markImportManualRecovery(db, row);
-  }
-    if (earliestLeaseExpiry === null) return;
-    const remainingMs = startupDeadlineAt - Date.now();
-    if (remainingMs <= 0) throw new Error("import startup reconciliation deadline exceeded");
-    const waitMs = Math.min(
-      remainingMs,
-      Math.max(1, earliestLeaseExpiry * 1_000 - Date.now()),
-    );
-    await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
-    if (Date.now() >= startupDeadlineAt) {
-      throw new Error("import startup reconciliation deadline exceeded");
+    try {
+      const receipt = db.query(
+        "SELECT summary_json FROM user_data_import_receipts WHERE job_id = ?",
+      ).get(row.job_id) as { summary_json: string } | null;
+      if (receipt) {
+        // Receipt replay is projection/cleanup-only: canonical rows are never
+        // reopened. Rebuild bounded derived work before settling file journals.
+        reconcileDerivedVectorProjection(row.job_id, row.user_id, receipt.summary_json);
+        const updatedReceipt = db.query(
+          "SELECT summary_json FROM user_data_import_receipts WHERE job_id = ?",
+        ).get(row.job_id) as { summary_json: string } | null;
+        const recoveredSummary = updatedReceipt?.summary_json || receipt.summary_json;
+        const recoveredProjection = parseReceiptSummaryForProjection(recoveredSummary);
+        const recoveredVectors = recoveredProjection?.vectors;
+        const recoveredPendingValue = recoveredVectors
+          && typeof recoveredVectors === "object"
+          ? (recoveredVectors as Record<string, unknown>).projectionPending
+          : undefined;
+        const projectionPending = typeof recoveredPendingValue === "boolean"
+          ? (recoveredPendingValue ? 1 : 0)
+          : row.projection_pending;
+        db.query(
+          `UPDATE user_data_imports
+              SET state = 'committed', summary_json = ?, projection_pending = ?,
+                  updated_at = ?, finished_at = COALESCE(finished_at, ?)
+            WHERE job_id = ?`,
+        ).run(
+          recoveredSummary,
+          projectionPending,
+          nowSeconds(),
+          nowSeconds(),
+          row.job_id,
+        );
+        const journalsSettled = await settleCommittedFileJournals(
+          row.job_id,
+          db,
+          recoveryDeadlineAt,
+        );
+        const stagingRemoved = journalsSettled && cleanupOwnedImportArchive(row);
+        if (stagingRemoved) {
+          db.query(
+            "UPDATE user_data_imports SET staging_path = '', staging_db_path = '', updated_at = ? WHERE job_id = ?",
+          ).run(nowSeconds(), row.job_id);
+        } else {
+          markImportManualRecovery(db, row);
+        }
+        if (projectionPending !== 0 || !journalsSettled || !stagingRemoved) {
+          result.deferred++;
+        } else {
+          result.recovered++;
+        }
+        continue;
+      }
+      if (row.state === "failed" || row.state === "cancelled") {
+        if (row.lease_owner) {
+          try {
+            await rollbackCreatedFiles(row.job_id, {
+              leaseOwner: row.lease_owner,
+              leaseGeneration: row.lease_generation,
+            }, undefined, recoveryDeadlineAt);
+          } catch {}
+        }
+        const journalsRemain = hasUnsettledFileJournal(row.job_id, db);
+        const stagingRemoved = !journalsRemain && cleanupOwnedImportArchive(row);
+        if (stagingRemoved) {
+          db.query(
+            "UPDATE user_data_imports SET staging_path = '', staging_db_path = '', updated_at = ? WHERE job_id = ?",
+          ).run(nowSeconds(), row.job_id);
+          result.recovered++;
+        } else {
+          markImportManualRecovery(db, row);
+          result.deferred++;
+        }
+        continue;
+      }
+      if (row.state === "awaiting_ticket" && row.lease_owner === null && row.lease_expires_at === null) {
+        // A parked ticket gate is intentionally ownerless and has no live
+        // process to recover. Leave it durable until the ticket POST reacquires
+        // a fence and rebuilds the in-memory continuation.
+        result.deferred++;
+        continue;
+      }
+      if (row.lease_expires_at !== null && row.lease_expires_at > nowSeconds()) {
+        const refreshed = await sleepUntilLeaseExpiry(row);
+        if (!refreshed) {
+          result.deferred++;
+          continue;
+        }
+        row = refreshed;
+        if (
+          row.lease_expires_at !== null
+          && row.lease_expires_at > nowSeconds()
+        ) {
+          result.deferred++;
+          continue;
+        }
+      }
+      if (Date.now() >= startupDeadlineAt) {
+        result.deferred++;
+        continue;
+      }
+      const now = nowSeconds();
+      const takeoverOwner = `reconcile:${crypto.randomUUID()}`;
+      const takeover = db.query(
+        `UPDATE user_data_imports
+            SET lease_owner = ?, lease_generation = lease_generation + 1,
+                lease_expires_at = ?, updated_at = ?
+          WHERE job_id = ? AND lease_generation = ?
+            AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            AND state NOT IN ('committed','failed','cancelled')`,
+      ).run(
+        takeoverOwner,
+        now + IMPORT_LEASE_SECONDS,
+        now,
+        row.job_id,
+        row.lease_generation,
+        now,
+      );
+      if (takeover.changes !== 1) {
+        result.deferred++;
+        continue;
+      }
+      const recoveryJob = {
+        jobId: row.job_id,
+        userId: row.user_id,
+        leaseOwner: takeoverOwner,
+        leaseGeneration: row.lease_generation + 1,
+      } as ImportJob;
+      let rollbackSettled = true;
+      try {
+        await rollbackCreatedFiles(
+          recoveryJob.jobId,
+          {
+            leaseOwner: recoveryJob.leaseOwner,
+            leaseGeneration: recoveryJob.leaseGeneration,
+          },
+          undefined,
+          recoveryDeadlineAt,
+        );
+      } catch {
+        rollbackSettled = false;
+      }
+      const journalsRemain = (() => {
+        try {
+          return hasUnsettledFileJournal(recoveryJob.jobId, db);
+        } catch {
+          return true;
+        }
+      })();
+      const cleanupState = row.state === "cleanup_pending" || row.state === "cancelling";
+      const stagingNeeded = Boolean(row.staging_path || row.staging_db_path);
+      const stagingRemoved = !journalsRemain
+        && (!stagingNeeded || cleanupOwnedImportArchive(row));
+      if (cleanupState) {
+        if (!rollbackSettled || journalsRemain || !stagingRemoved) {
+          db.query(
+            `UPDATE user_data_imports
+                SET state = 'cleanup_pending', stable_error_code = 'cleanup_pending',
+                    stable_error = 'import cancellation cleanup is pending',
+                    lease_expires_at = ?, updated_at = ?, finished_at = NULL
+              WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?
+                AND state IN ('cancelling','cleanup_pending')`,
+          ).run(
+            nowSeconds() + IMPORT_LEASE_SECONDS,
+            nowSeconds(),
+            row.job_id,
+            takeoverOwner,
+            row.lease_generation + 1,
+          );
+          result.deferred++;
+        } else {
+          db.query(
+            `UPDATE user_data_imports
+                SET state = 'cancelled', stable_error_code = 'cancelled',
+                    stable_error = 'import cancelled by user',
+                    staging_path = '', staging_db_path = '',
+                    updated_at = ?, finished_at = ?
+              WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?
+                AND state IN ('cancelling','cleanup_pending')`,
+          ).run(
+            nowSeconds(),
+            nowSeconds(),
+            row.job_id,
+            takeoverOwner,
+            row.lease_generation + 1,
+          );
+          result.recovered++;
+        }
+        continue;
+      }
+      db.query(
+        `UPDATE user_data_imports
+            SET state = 'failed', stable_error_code = 'process_interrupted',
+                stable_error = 'import process interrupted before relational commit',
+                staging_path = CASE WHEN ? = 1 THEN '' ELSE staging_path END,
+                staging_db_path = CASE WHEN ? = 1 THEN '' ELSE staging_db_path END,
+                updated_at = ?, finished_at = ?
+          WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?
+            AND state NOT IN ('committed','cancelled')`,
+      ).run(
+        stagingRemoved ? 1 : 0,
+        stagingRemoved ? 1 : 0,
+        nowSeconds(),
+        nowSeconds(),
+        row.job_id,
+        takeoverOwner,
+        row.lease_generation + 1,
+      );
+      if (!stagingRemoved) {
+        markImportManualRecovery(db, row);
+        result.deferred++;
+      } else {
+        result.recovered++;
+      }
+    } catch {
+      result.failed++;
+      // A failed recovery attempt must not strand a fresh live lease. Keep the
+      // durable row eligible for the next bounded pass and preserve any staged
+      // evidence for retry/manual recovery.
+      try {
+        db.query(
+          `UPDATE user_data_imports
+              SET lease_expires_at = ?, updated_at = ?
+            WHERE job_id = ? AND lease_owner LIKE 'reconcile:%'`,
+        ).run(nowSeconds() - 1, nowSeconds(), row.job_id);
+      } catch {}
     }
   }
+
+  const complete = !hasContinuation
+    && result.deferred === 0
+    && result.failed === 0;
+  return {
+    ...result,
+    complete,
+    healthy: complete,
+  };
 }
 function validateManifestEntriesForTest(
   manifest: ArchiveManifest,
@@ -8600,6 +9027,11 @@ function setStagingFootprintHook(hook: StagingFootprintHook | null): void {
 function setTicketZeroizationHook(hook: TicketZeroizationHook | null): void {
   ticketZeroizationHook = hook;
 }
+function setPortableSealedPresetResolverOverride(
+  resolver: PortableSealedPresetResolver | null,
+): void {
+  portableSealedPresetResolverOverride = resolver;
+}
 
 export const __test__ = {
   authorityResetRow,
@@ -8627,6 +9059,7 @@ export const __test__ = {
   assertLiveCommitDiskCapacity,
   setFilesystemCapacityHook,
   setTicketZeroizationHook,
+  setPortableSealedPresetResolverOverride,
   setStagingFootprintHook,
   validateVectorArchiveRowShape,
   validateVectorArchiveIdentity,
@@ -8641,9 +9074,5 @@ export const __test__ = {
   maxVectorRowsPerTable: MAX_ROWS_PER_TABLE,
   maxSqlReal: MAX_SQL_REAL,
   maxSqlBlobBytes: MAX_SQL_BLOB_BYTES,
-  validateContextPackRevisionAccounting,
-  deterministicContextPackId,
-  buildContextPackImportRemap,
-  rewriteContextPackImportRow,
   mergeCanonicalImportRow,
 };

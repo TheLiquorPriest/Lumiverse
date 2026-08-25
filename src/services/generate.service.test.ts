@@ -1370,7 +1370,6 @@ describe.serial("root generation usage accounting", () => {
                       checkpoint: "WORK",
                       required: false,
                       visibility: "work_only",
-                      delivery: { delivery: "direct" },
                     }],
                     workspaceUsage: [],
                     completionCriteria: [],

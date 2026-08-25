@@ -34,7 +34,6 @@ import { createDatabankSlice } from './slices/databank'
 import { createConnectionSlice } from './slices/connection'
 import { createWeaverSlice } from './slices/weaver'
 import { createContainersSlice } from './slices/containers'
-import { createAgentContextPacksSlice } from './slices/agent-context-packs'
 import { createAgentRunsSlice } from './slices/agent-runs'
 import { createUserDataSlice } from './slices/user-data'
 import { registerUserScopedResetStore } from './user-scoped-reset'
@@ -77,7 +76,6 @@ export const useStore = create<AppStore>()((...a) => ({
   ...createConnectionSlice(...a),
   ...createWeaverSlice(...a),
   ...createContainersSlice(...a),
-  ...createAgentContextPacksSlice(...a),
   ...createUserDataSlice(...a),
   ...createAgentRunsSlice(...a),
 }))

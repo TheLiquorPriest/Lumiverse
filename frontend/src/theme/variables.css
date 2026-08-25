@@ -128,7 +128,6 @@
   --lumiverse-agent-run-sheet-width: 560px;
   --lumiverse-z-agent-run: 10005;
   --lumiverse-focus-ring: 0 0 0 3px var(--lumiverse-primary-020);
-  --lumiverse-z-context-library: 10006;
 
   /* Type scale */
   --lumiverse-type-xs: calc(11px * var(--lumiverse-font-scale, 1));

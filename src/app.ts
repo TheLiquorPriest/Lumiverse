@@ -65,7 +65,6 @@ import { bootstrapRoutes } from "./routes/bootstrap.routes";
 import { userDataRoutes } from "./routes/user-data.routes";
 import { streamDeckIntegrationRoutes, streamDeckManagementRoutes } from "./routes/stream-deck.routes";
 import { agentRunsRoutes } from "./routes/agent-runs.routes";
-import { agentContextPacksRoutes } from "./routes/agent-context-packs.routes";
 import { wsHandler } from "./ws/handler";
 import { issueTicket } from "./ws/tickets";
 import { rateLimit } from "./middleware/rate-limit";
@@ -523,7 +522,6 @@ app.route("/api/v1/global-addons", globalAddonsRoutes);
 app.route("/api/v1/bootstrap", bootstrapRoutes);
 app.route("/api/v1/user-data", userDataRoutes);
 app.route("/api/v1/agent-runs", agentRunsRoutes);
-app.route("/api/v1/context-packs", agentContextPacksRoutes);
 app.route("/api/v1/stream-deck", streamDeckManagementRoutes);
 
 // Issue single-use WS tickets (behind auth middleware)

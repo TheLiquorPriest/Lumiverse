@@ -105,8 +105,23 @@ See the [Macros guide](../customization/macros.md) for a complete reference.
 
 Lumiverse has two explicit generation modes:
 
-- **Response** uses the established generation pipeline. It remains the compatibility path for ordinary prompts, Council, multiplayer, extensions, and any turn that does not opt into the closed Agentic runtime. Configured child prompt blocks and core Agents & Tools behavior can still run in Response mode.
+- **Response** uses the established generation pipeline. It remains the compatibility path for ordinary prompts, Council, multiplayer, extensions, and any turn that does not opt into the closed Agentic runtime. Configured child prompt blocks and core Agents & Tools behavior can still run in Response mode; this does not include Loom Phased Instructions.
 - **Agentic** is a strict, opt-in single-turn runtime. It freezes the target, concrete provider choice, prompt inputs, capabilities, context, and readiness inputs before work begins, then runs a bounded `ASSEMBLE → WORK → COMPLETE → RENDER → PREPARE_COMMIT` flow. It does not silently become Response if a gate changes. If you explicitly choose Agentic and preflight fails, choose **Use Response** and start a new Response turn.
+
+### Loom Phased Instructions and native context ownership
+
+**Loom Phased Instructions** is a WORK/Agentic-only surface. Loom owns only existing prompt blocks plus these Phased Instructions; it is not a second context library. Its four fixed policy buckets route existing Loom blocks only through host-controlled checkpoints:
+
+| Bucket | Fixed destination / checkpoint |
+|--------|-------------------------------|
+| **Work policy** | Root **WORK** / **WORK** |
+| **Workspace usage** | Root **WORK** / **WORK** |
+| **Completion criteria** | Completion handoff / **PREPARE_COMMIT** |
+| **Render policy** | Tools-disabled **RENDER** / **RENDER** |
+
+Conditions are typed, evaluate fail-closed only at the owning checkpoint against that checkpoint’s immutable snapshot, and remain fixed for that checkpoint. Bounded custom phases are current-phase-only: later phase instructions are not preloaded. Each phase may declare explicit instruction subsets for named child profiles; a child receives only its admitted subset, never the root phase instructions or another child’s subset. Response omits these agentic-only instructions while retaining the ordinary generation pipeline.
+
+World Books (the native World Info system) and Databanks remain live native context systems outside Loom. World Books own lore activation, placement, attachment, editing, and access. Databanks own attached documents, attachment, editing, access, automatic semantic retrieval, and explicit `#slug` retrieval. Both use their live native objects; Loom neither copies, pins, or repairs their revisions. [Context Filters](context-filters.md) and unrelated native Loom content [packs](../packs/index.md) remain supported outside Loom.
 
 ### Choosing a mode
 
@@ -130,7 +145,7 @@ Agentic supports only these generation targets:
 
 The target must be a single-character, non-multiplayer surface. Group chats, active multiplayer rooms, Council or Council-tool rounds, impersonate, quiet, raw/batch Spindle generation, and other generation surfaces are not supported by Agentic and should use Response. If a Council or group surface nevertheless shows a mode selector, choose **Response** rather than attempting Agentic. An executable agent intrinsic in Dry Run is rejected with **Agent intrinsics cannot execute during Dry Run** rather than executing provider work.
 
-Agentic also has a deliberately closed tool boundary. It can use only the host-owned core retrieval tools selected in the preset, context-pack tools for the frozen authorized candidates, workspace controls, `agent_delegate` where a profile grants it, and the host-owned `complete_turn` boundary. Extension callbacks/macros/tools, MCP callbacks/tools, Council callbacks/tools, hooks, cross-domain egress grants, alternate render profiles, and future tool catalogs are Response-only and are not Agentic features.
+Agentic also has a deliberately closed tool boundary. It can use only the host-owned core retrieval tools selected in the preset, workspace controls, `agent_delegate` where a profile grants it, and the host-owned `complete_turn` boundary. Extension callbacks/macros/tools, MCP callbacks/tools, Council callbacks/tools, hooks, cross-domain egress grants, alternate render profiles, and future tool catalogs are Response-only and are not Agentic features.
 
 ### Configure the Agentic Runtime tab
 
@@ -140,9 +155,9 @@ Open the preset in Loom Builder and select **Agentic Runtime**. The tab is a sha
 2. In **Agents**, add child profiles with a stable lowercase ID, display name, a literal system prompt, a portable connection slot or **Use main connection**, allowed core tools, lore scope, delegation permission, required/optional failure policy, activity setting, output limit, and timeout.
 3. In **Core Tools & Dependencies**, choose the main model's core retrieval grants and lore scope, and set `Maximum child-agent invocations` and `Maximum tool calls`. Both default to `64`, require a whole number of at least `1`, and remain subject to read-only host ceilings.
 4. Use **Create prompt block with this agent** to add a directly authored `user` block in prompt order. A child block runs once in the order of the enabled blocks; a named result may be consumed only after its producer.
-5. In **Phased Instructions**, select existing Loom blocks for **Work policy**, **Workspace usage**, **Completion criteria**, and **Render policy**; define ordered custom phases with instruction references, requiredness, enter/exit/skip conditions, repeat limits, adjacent transitions, and capability requests; then configure authorized context-pack revisions and their direct, condition-gated, or on-demand delivery. The phase list is evaluated in authored order from **ASSEMBLE** through its declared transitions. References keep the expected preset, block, and context revisions; changing a referenced block or revision requires selecting the current revision. Agentic does not create a second free-form prompt system.
-6. In **Dynamic Tasks**, define bounded task templates, dependencies, requiredness, and activation predicates. The frozen graph is evaluated on workspace creation (the ASSEMBLE activation), at each later entered runtime phase (**WORK**, **RENDER**, **PREPARE_COMMIT**, **COMMITTING**, or **COMMITTED**), after each named task or submission transition, and in the bounded completion fixed point. The completion fixed point is an internal evaluation, not a separate public phase entry. Dependency closures are activated in stable order; newly activated required tasks or context requirements can block completion. Tasks created by the root may also be marked required; child frames cannot create tasks.
-7. In **Workspace Retention & Sharing**, choose the view-only workspace retention and sharing policy. **Portability & Repair** lists unresolved or stale slots, imported review items, invalid cognition or context references, stale block revisions, and provider capability mismatches. The current runtime behavior for workspace retention and visibility is described below.
+5. In **Phased Instructions** (the WORK/Agentic-only policy surface), select existing Loom blocks for **Work policy**, **Workspace usage**, **Completion criteria**, and **Render policy**; define bounded ordered custom phases with instruction references, explicit per-child instruction subsets, requiredness, enter/exit/skip conditions, repeat limits, adjacent transitions, and capability requests. Only the current phase’s instructions are materialized. The phase list is evaluated in authored order from **ASSEMBLE** through its declared transitions. References keep the expected preset and block revisions; changing a referenced block requires selecting the current revision. Agentic does not create a second free-form prompt or context system.
+6. In **Dynamic Tasks**, define bounded task templates, dependencies, requiredness, and activation predicates. The frozen graph is evaluated on workspace creation (the ASSEMBLE activation), at each later entered runtime phase (**WORK**, **RENDER**, **PREPARE_COMMIT**, **COMMITTING**, or **COMMITTED**), after each named task or submission transition, and in the bounded completion fixed point. The completion fixed point is an internal evaluation, not a separate public phase entry. Dependency closures are activated in stable order; newly activated required tasks can block completion. Tasks created by the root may also be marked required; child frames cannot create tasks.
+7. In **Workspace Retention & Sharing**, choose the view-only workspace retention and sharing policy. **Portability & Repair** lists unresolved or stale slots, imported review items, invalid cognition or task references, stale Loom block revisions, and provider capability mismatches. The current runtime behavior for workspace retention and visibility is described below.
 8. Acknowledge every imported review item, repair the listed issues, and save. A dirty draft or a revision conflict must be resolved before changing, importing, or exporting the preset.
 
 Profile IDs and named results use lowercase letters, digits, and underscores, starting with a letter. `as=`, `tools=`, and `stream` are optional intrinsic options; a `tools=` list can narrow a profile's grants but cannot widen them. A profile's literal system prompt is not a place for preset macro expansion. Child timeout is edited in whole seconds with a minimum of 5 seconds. Cancelling the root turn stops active child work.
@@ -159,11 +174,11 @@ The authored `maxInvocations` limit controls child-agent admissions and `maxTool
 
 The ordinary Response Agents & Tools loop remains bounded: provider responses are validated, a complete tool batch runs in provider order, and each call receives one correlated result. Required child failures stop that Response generation; optional failures bind an empty result so later references stay deterministic. Child output is untrusted derived data and cannot supply a role, delimiter, or instruction authority over the preset, system, or user.
 
-### Deterministic cognition and context policy
+### Deterministic cognition and Loom policy
 
 Deterministic cognition is authored policy rather than a hidden second prompt. A predicate can inspect only the generation type, current phase, typed preset variables, immutable participant facts, snapshotted tool availability, or a named task transition. It cannot run macros, regular expressions, JavaScript, time, randomness, database queries, or callbacks.
 
-The frozen graph is validated before Agentic work and evaluated on workspace creation (the ASSEMBLE activation), at each later entered runtime phase (**WORK**, **RENDER**, **PREPARE_COMMIT**, **COMMITTING**, or **COMMITTED**), after each named task or child-submission transition, and in the bounded completion fixed point. The completion fixed point is an internal evaluation, not a separate public phase entry. Activation is append-only and includes dependency closures in stable order. Newly activated required tasks or context requirements block completion until they are satisfied. Tasks created by the root may also be marked required; child frames cannot create tasks. Invalid predicates, cycles, missing templates, deleted attachments, or changed Loom revisions keep Response available and make Agentic require repair.
+The frozen graph is validated before Agentic work and evaluated on workspace creation (the ASSEMBLE activation), at each later entered runtime phase (**WORK**, **RENDER**, **PREPARE_COMMIT**, **COMMITTING**, or **COMMITTED**), after each named task or child-submission transition, and in the bounded completion fixed point. The completion fixed point is an internal evaluation, not a separate public phase entry. Activation is append-only and includes dependency closures in stable order. Newly activated required tasks block completion until they are satisfied. Tasks created by the root may also be marked required; child frames cannot create tasks. Invalid predicates, cycles, missing templates, or changed Loom revisions fail closed rather than silently changing behavior.
 
 The four authored policy groups are:
 
@@ -172,13 +187,18 @@ The four authored policy groups are:
 - **Completion criteria** — authored completion requirements; and
 - **Render policy** — references intended for the final tools-disabled render.
 
-The host freezes a candidate set of reviewed context-pack revisions during assembly. During WORK, `context_pack_list` returns bounded metadata from that set and `context_pack_get` reads bounded literal pages only after an ownership/ACL check. Context bytes are not macro- or regex-processed. A required attachment that is unavailable, revoked, or changed blocks the turn; an optional denied read produces one bounded non-disclosing omission. The host rechecks every consumed revision and ACL before commit.
+Each bucket references existing Loom blocks by exact preset and block revision. An optional typed declarative condition gates a block only at its fixed host checkpoint, using that checkpoint's immutable snapshot. The result remains sticky until the next relevant checkpoint or an explicit revision. Required invalid, stale, or unavailable inputs fail closed; optional false or unavailable inputs are visibly skipped with provenance.
+
+World Books and Databank content never enters this revision-pinning contract. Their native attachment, access, editing, activation, placement, automatic retrieval, and explicit `#slug` behavior remains authoritative and follows live updates. Loom has no external-context storage, picker, tool, delivery policy, or repair path for these native sources.
+
+Private WORK retrieval does not automatically cross into tools-disabled **RENDER**. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance in the completion handoff may cross that boundary.
 
 ### Public activity, workspace, and artifacts
 
 After an Agentic response or swipe, the message can show an **Agentic run** strip. Open it for **Agent activity**, with an **Activity Tree** and a sibling **Workspace** tab. The tree can show safe phase chronology, root/provider/child/tool labels, status, elapsed duration, bounded token/tool/child counts, continuation mode, omissions, and a localized terminal reason. On reconnect it keeps the last known tree while the connection recovers; it does not infer failure from silence.
 
 The public projection is status-only. It never exposes prompts, work prose, child results, tool arguments or retrieval data, provider messages, credentials, raw reasoning, continuation carriers, or a retained private transcript. Agentic work notes and reasoning are private to the turn and are discarded at settlement.
+For a Response turn, unified owner inspection remains the evidence surface for this boundary. It explains routes and order, conditions, exact source identities and preset/block revisions, hashes when recorded, one effective copy for each destination-level overlap plus every retained role/reason/overlap outcome, omissions, custom-phase and child-subset receipts, accepted crossings, and tools/delegation. If evidence is unavailable, inspection says so; it is never inferred.
 
 The Workspace tab is separate from activity and is **view-only**. It may show bounded redacted sections for the objective (counts only), tasks, findings/decisions/questions, submissions, and artifact metadata. Task entries use generated labels such as `Task <id prefix>`; artifact entries can cover attached, proposed, or published artifacts and use generated labels such as `Artifact <id prefix>`, with MIME type, byte count, digest prefix, publication state, retention marker, and owner visibility. Authored task or artifact names/titles and private child content are not exposed; the UI does not turn the workspace into an editable document. No per-child destructive controls exist.
 
@@ -207,17 +227,15 @@ The host-owned core catalog contains:
 
 ### Imports, quarantine, and repair
 
-Preset files and LumiHub presets preserve authored Agentic settings but import them **disabled** and **review required**. Foreign-imported context packs are private, unattached, and review-required. A user-data archive restore may retain attachment rows, but restored packs and attachments remain quarantined until local review. This is a safety quarantine, not an execution consent. Before using Agentic locally:
+Preset files and LumiHub presets preserve authored Agentic settings but import them **disabled** and **review required**. This is a safety quarantine, not an execution consent. Before using Agentic locally:
 
 1. open **Agentic Runtime → Portability & Repair**;
 2. map every required connection slot to an authenticated local connection, or choose **Use main connection** where appropriate;
 3. inspect and acknowledge each imported review item;
-4. choose current Loom block revisions and repair missing or invalid cognition/context/task references;
-5. open **Settings → Context Library** to review imported packs, any restored attachments, their visibility, ACLs, and exact revisions;
-6. for a foreign-imported pack, create a new active revision after review because its imported revision remains review-required; verify that each restored attachment references an exact reviewed revision; and
-7. save the complete draft, then resolve the effective runtime again.
+4. choose current Loom block revisions and repair missing or invalid cognition/task references; and
+5. save the complete draft, then resolve the effective runtime again.
 
-Foreign imports never copy credentials, local connection bindings, one-turn choices, or local activation consent. Their authored tool grants remain inert until review. Same-account duplication preserves the currently authorized preset slot bindings, normalized configuration, regex companions, and authored cognition/context/task envelope; it references the existing account-owned context revisions rather than cloning them. Duplication still does not make a one-turn Agentic choice durable.
+Foreign imports never copy credentials, local connection bindings, one-turn choices, or local activation consent. Their authored tool grants remain inert until review. Same-account duplication preserves the currently authorized preset slot bindings, normalized configuration, regex companions, and authored cognition/task envelope. Duplication still does not make a one-turn Agentic choice durable.
 
 For the complete macro syntax and ordinary block placement, see [Macros](../customization/macros.md), [Prompt Blocks](prompt-blocks.md), and [Execution Order](execution-order.md). If a mode or repair message persists, follow [Agentic troubleshooting](../reference/troubleshooting.md).
 
@@ -225,7 +243,7 @@ For the complete macro syntax and ordinary block placement, see [Macros](../cust
 
 ## Response fallback
 
-When Agentic is unavailable, unsupported for the surface, or not selected, choose **Response** explicitly in **Next turn** or **Use Response** in the repair banner. Response remains available even when an Agentic slot, provider, isolate, context, cognition, or readiness check needs repair; Agentic never silently turns a failed request into a Response turn.
+When Agentic is unavailable, unsupported for the surface, or not selected, choose **Response** explicitly in **Next turn** or **Use Response** in the repair banner. Response remains available even when an Agentic slot, provider, isolate, cognition, or readiness check needs repair; Agentic never silently turns a failed request into a Response turn. Selecting Response omits only WORK/Agentic-only Loom Phased Instructions. Ordinary native World Info and Databank behavior remains available through the established Response pipeline.
 
 If no preset is linked to your connection, or the preset has no blocks, the Response path uses legacy assembly: it maps visible chat history into messages and may include character/persona context, legacy dialogue examples, and memory handling. Preset block features such as ordered world info and Author's Note are not applied.
 

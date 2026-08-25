@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { effectiveRuntimeApi } from '@/api/effective-runtime'
+import {
+  effectiveRuntimeApi,
+  normalizeChatAgentModeWriteResponse,
+  normalizeEffectiveRuntimeResponse,
+  EffectiveRuntimeProtocolError,
+} from '@/api/effective-runtime'
 import {
   createRuntimeScopeFingerprint,
   getRuntimeSelectionSnapshot,
-  isCurrentRuntimeRequest,
-  nextRuntimeRequestEpoch,
+  invalidateRuntimeDecision,
+  isCurrentRuntimeDisplayRequest,
+  nextRuntimeDisplayEpoch,
   publishRuntimeDecision,
   redactRuntimeDecision,
   setOneTurnRuntimeMode,
@@ -47,6 +53,8 @@ export interface UseEffectiveRuntimeOptions {
 
 export interface EffectiveRuntimeState {
   decision: EffectiveRuntimeDisplayV1 | null
+  inspection: EffectiveRuntimeDisplayV1['inspection'] | null
+  responseOmission: EffectiveRuntimeDisplayV1['responseOmission']
   mode: AgentRuntimeMode
   oneTurnMode: AgentRuntimeMode | null
   pendingOneTurnMode?: AgentRuntimeMode | null
@@ -80,11 +88,13 @@ interface RuntimeResolutionResult {
 
 
 function sameTarget(left: GenerationTargetV1, right: GenerationTargetV1): boolean {
-  return left.generationType === right.generationType
-    && (left.messageId ?? null) === (right.messageId ?? null)
-    && (left.swipeId ?? null) === (right.swipeId ?? null)
-    && (left.branchId ?? null) === (right.branchId ?? null)
-    && (left.targetCharacterId ?? null) === (right.targetCharacterId ?? null)
+  if (left.generationType !== right.generationType) return false
+  const optionalKeys = ['messageId', 'swipeId', 'branchId', 'targetCharacterId', 'revision'] as const
+  return optionalKeys.every((key) => {
+    const leftPresent = Object.hasOwn(left, key)
+    const rightPresent = Object.hasOwn(right, key)
+    return leftPresent === rightPresent && (!leftPresent || left[key] === right[key])
+  })
 }
 
 
@@ -143,13 +153,13 @@ export function acceptEffectiveRuntimeResponse(
   chatId: string,
   requestEpoch: number,
   target: GenerationTargetV1,
-  response: EffectiveRuntimePublicResponseV1,
+  response: unknown,
   scopeFingerprint?: string,
 ): EffectiveRuntimeDisplayV1 | null {
-  if (!isCurrentRuntimeRequest(chatId, requestEpoch)) return null
-  if (response.chatId !== chatId || !sameTarget(response.target, target)) return null
-  publishRuntimeDecision(response, requestEpoch, scopeFingerprint)
-  return redactRuntimeDecision(response)
+  const normalized = normalizeEffectiveRuntimeResponse(response, { chatId, target })
+  if (!isCurrentRuntimeDisplayRequest(chatId, requestEpoch)) return null
+  publishRuntimeDecision(normalized, requestEpoch, scopeFingerprint, 'display')
+  return redactRuntimeDecision(normalized)
 }
 
 export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): EffectiveRuntimeState {
@@ -169,7 +179,14 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
   } = options
   const target = useMemo<GenerationTargetV1 | null>(() => (
     supported && isAgenticGenerationType(generationType)
-      ? { generationType, messageId, swipeId, branchId, targetCharacterId }
+      ? {
+          generationType,
+          messageId,
+          swipeId,
+          branchId,
+          targetCharacterId,
+          revision: null,
+        }
       : null
   ), [branchId, generationType, messageId, supported, swipeId, targetCharacterId])
   const scopeFingerprint = useMemo(() => createRuntimeScopeFingerprint({
@@ -207,6 +224,7 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
       revision: scopeRef.current.revision + 1,
     }
   }
+  const previousScopeFingerprintRef = useRef(scopeFingerprint)
   const mountedRef = useRef(false)
   const pendingWritesRef = useRef(new Map<string, PendingRuntimeWrite>())
   const savedChatModeRevisions = useRef(new Map<string, number>())
@@ -238,15 +256,18 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
   }, [wakePendingWrites])
 
   useEffect(() => {
-    wakePendingWrites()
-    setSavingOverride(false)
-    setError(null)
-    // Do not let a previous preset/connection/persona/target decision remain
-    // visible for the new authority scope while its replacement resolves.
-    setDecision(null)
-    setDecisionChatId(null)
-    setDecisionScopeFingerprint(null)
-  }, [scopeFingerprint, wakePendingWrites])
+  const scopeChanged = previousScopeFingerprintRef.current !== scopeFingerprint
+  previousScopeFingerprintRef.current = scopeFingerprint
+  if (scopeChanged) invalidateRuntimeDecision(chatId)
+  wakePendingWrites()
+  setSavingOverride(false)
+  setError(null)
+  // Do not let a previous preset/connection/persona/target decision remain
+  // visible for the new authority scope while its replacement resolves.
+  setDecision(null)
+  setDecisionChatId(null)
+  setDecisionScopeFingerprint(null)
+  }, [chatId, scopeFingerprint, wakePendingWrites])
 
   const resolve = useCallback(async (
     signal?: AbortSignal,
@@ -271,7 +292,7 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
       setError(null)
       return { published: true, retry: false }
     }
-    const requestEpoch = nextRuntimeRequestEpoch(expectedChatId)
+    const requestEpoch = nextRuntimeDisplayEpoch(expectedChatId)
     const request: EffectiveRuntimeRequestV1 = {
       chatId: expectedChatId,
       connectionId: logicalConnectionId,
@@ -290,9 +311,13 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
       if (!isCurrentScope() || !isCurrentReconciliation()) {
         return { published: false, retry: false }
       }
-      if (!isCurrentRuntimeRequest(expectedChatId, requestEpoch)) {
+      if (!isCurrentRuntimeDisplayRequest(expectedChatId, requestEpoch)) {
         return { published: false, retry: true }
       }
+      const normalized = normalizeEffectiveRuntimeResponse(response, {
+        chatId: expectedChatId,
+        target: expectedTarget,
+      })
       const acceptedScopeFingerprint = createRuntimeScopeFingerprint({
         chatId: expectedChatId,
         generationType: expectedTarget.generationType,
@@ -305,12 +330,12 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
         forcePresetId,
         personaId,
         supported,
-      }, response)
+      }, normalized)
       const accepted = acceptEffectiveRuntimeResponse(
         expectedChatId,
         requestEpoch,
         expectedTarget,
-        response,
+        normalized,
         acceptedScopeFingerprint,
       )
       if (!accepted) return { published: false, retry: false }
@@ -322,19 +347,21 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
       if (signal?.aborted || !isCurrentScope() || !isCurrentReconciliation()) {
         return { published: false, retry: false }
       }
-      if (!isCurrentRuntimeRequest(expectedChatId, requestEpoch)) {
+      if (!isCurrentRuntimeDisplayRequest(expectedChatId, requestEpoch)) {
         return { published: false, retry: true }
       }
       setError(cause instanceof Error ? cause : new Error('effective_runtime_failed'))
-      setDecision(null)
-      setDecisionChatId(null)
-      setDecisionScopeFingerprint(null)
+      if (!(cause instanceof EffectiveRuntimeProtocolError)) {
+        setDecision(null)
+        setDecisionChatId(null)
+        setDecisionScopeFingerprint(null)
+      }
       return { published: false, retry: false }
     } finally {
       if (
         isCurrentScope()
         && isCurrentReconciliation()
-        && isCurrentRuntimeRequest(expectedChatId, requestEpoch)
+        && isCurrentRuntimeDisplayRequest(expectedChatId, requestEpoch)
       ) setLoading(false)
     }
   }, [
@@ -549,10 +576,13 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     setSavingOverride(true)
     setError(null)
     try {
-      const response = await dependencies.setChatMode(expectedChatId, {
-        mode,
-        expectedRevision,
-      })
+      const response = normalizeChatAgentModeWriteResponse(
+        await dependencies.setChatMode(expectedChatId, {
+          mode,
+          expectedRevision,
+        }),
+        expectedChatId,
+      )
       if (Number.isSafeInteger(response.revision)) {
         const previousRevision = savedChatModeRevisions.current.get(expectedChatId)
         if (previousRevision === undefined || previousRevision < response.revision) {
@@ -588,9 +618,6 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     && projectedDecision.agentsEnabled
     && projectedDecision.allowedModes.includes('response')
     && projectedDecision.allowedModes.includes('agentic')
-    && projectedDecision.capabilityReadiness.ready
-    && projectedDecision.capabilityReadiness.missing.length === 0
-    && repairCategories.length === 0
   const resetChatOverride = useCallback(async () => {
     const reset = dependencies.resetChatMode
     if (!reset) {
@@ -619,7 +646,10 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     setSavingOverride(true)
     setError(null)
     try {
-      const response = await reset(expectedChatId, expectedRevision)
+      const response = normalizeChatAgentModeWriteResponse(
+        await reset(expectedChatId, expectedRevision),
+        expectedChatId,
+      )
       if (Number.isSafeInteger(response.revision)) {
         const previousRevision = savedChatModeRevisions.current.get(expectedChatId)
         if (previousRevision === undefined || previousRevision < response.revision) {
@@ -675,6 +705,8 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
 
   return {
     decision: projectedDecision,
+    inspection: projectedDecision?.inspection ?? null,
+    responseOmission: projectedDecision?.responseOmission ?? null,
     mode,
     oneTurnMode: selection.oneTurnMode,
     pendingOneTurnMode: selection.pendingOneTurnMode,

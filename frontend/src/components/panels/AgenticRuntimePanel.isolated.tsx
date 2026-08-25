@@ -10,6 +10,7 @@ import type {
   AgentConfigV2,
   AgenticRuntimeSaveDraft,
   AgentRuntimePolicyV1,
+  CognitionPredicate,
   LoomPreset,
   PromptBlock,
 } from '@/lib/loom/types'
@@ -67,8 +68,6 @@ const hostCeilings = {
   toolExecutionsPerUser: 32,
   toolExecutionsProcess: 128,
 }
-let editorContextSelections: unknown[] = []
-let editorContextRules: unknown[] = []
 let editorTaskTemplates: unknown[] = []
 let editorReviewAcknowledgements: string[] = []
 let editorPresetRevision = 8
@@ -76,6 +75,10 @@ let editorConfigRevision = 4
 let editorConfig: AgentConfigV2 | null = null
 let editorReview: LoomPreset['agentConfigReview'] = null
 let editorGetError: Error | null = null
+let editorProjectionInvalid = false
+let editorGetGate: Promise<void> | null = null
+
+
 
 mock.module('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: () => undefined },
@@ -150,39 +153,20 @@ mock.module('./AgenticRuntimePanel.module.css', () => ({
 mock.module('@/api/agentic-runtime', () => ({
   agenticRuntimeApi: {
     getEditor: async (presetId: string) => {
+      if (editorGetGate) await editorGetGate
       if (editorGetError) throw editorGetError
       return {
         presetId,
-        config: editorConfig ?? agentConfig(),
+        config: editorProjectionInvalid ? null : editorConfig ?? agentConfig(),
         review: editorReview,
         presetRevision: editorPresetRevision,
         configRevision: editorConfigRevision,
-        contextPackSelections: editorContextSelections,
-        contextRules: editorContextRules,
         taskTemplates: editorTaskTemplates,
         reviewAcknowledgements: editorReviewAcknowledgements,
         slotBindings: {},
         hostCeilings,
       }
     },
-  },
-}))
-mock.module('@/api/agent-context-packs', () => ({
-  classifyContextPackError: () => 'unavailable',
-  agentContextPacksApi: {
-    listSelectable: async () => ({
-      data: [{
-        ownerId: 'user-1',
-        source: 'owned',
-        packId: 'pack-1',
-        packName: 'World rules',
-        packDescription: '',
-        revision: 3,
-        digest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        byteCount: 128,
-        tokenCount: 32,
-      }],
-    }),
   },
 }))
 const {
@@ -192,7 +176,10 @@ const {
   DEFAULT_PROMPT_BEHAVIOR,
   DEFAULT_SAMPLER_OVERRIDES,
 } = await import('@/lib/loom/constants')
-const { createDefaultAgentConfigV2 } = await import('@/lib/loom/agenticRuntime')
+const {
+  createDefaultAgentConfigV2,
+  prepareAgentConfigForRuntimeSave,
+} = await import('@/lib/loom/agenticRuntime')
 const { marshalPreset } = await import('@/lib/loom/service')
 const { ApiError } = await import('@/api/client')
 
@@ -236,6 +223,7 @@ function customPhase(
     id,
     label: id,
     instructionRefs: [],
+    childInstructionSubsets: [],
     required: true,
     enter: { kind: 'phase', value: 'WORK' },
     exit: { kind: 'phase', value: 'COMPLETE' },
@@ -246,7 +234,7 @@ function customPhase(
   }
 }
 
-function workPolicyEntry(delivery: LoomPolicyEntryV1['delivery']): LoomPolicyEntryV1 {
+function workPolicyEntry(condition?: CognitionPredicate): LoomPolicyEntryV1 {
   return {
     version: 1,
     id: 'work-policy-entry',
@@ -255,7 +243,7 @@ function workPolicyEntry(delivery: LoomPolicyEntryV1['delivery']): LoomPolicyEnt
     checkpoint: 'WORK',
     required: true,
     visibility: 'work_only',
-    delivery,
+    ...(condition === undefined ? {} : { condition }),
   }
 }
 
@@ -303,6 +291,7 @@ function preset(reviewItems: AgentConfigRepairItem[] = []): LoomPreset {
   return {
     id: 'preset-1',
     name: 'Preset',
+    engine: 'classic',
     description: '',
     coverUrl: null,
     presetVersion: null,
@@ -324,8 +313,6 @@ function preset(reviewItems: AgentConfigRepairItem[] = []): LoomPreset {
       items: reviewItems,
     },
     agentSlotBindings: {},
-    agentContextPackSelections: [],
-    agentContextRules: [],
     agentTaskTemplates: [],
     blocks: [promptBlock()],
     source: null,
@@ -346,6 +333,7 @@ function wirePreset(loom: LoomPreset): Preset {
     id: loom.id,
     name: input.name,
     provider: input.provider,
+    engine: loom.engine,
     parameters: input.parameters ?? {},
     prompt_order: input.prompt_order ?? [],
     prompts: input.prompts ?? {},
@@ -354,8 +342,6 @@ function wirePreset(loom: LoomPreset): Preset {
     agent_config_revision: loom.agentConfigRevision,
     agent_config_review: loom.agentConfigReview,
     agent_slot_bindings: loom.agentSlotBindings,
-    agent_context_pack_selections: loom.agentContextPackSelections,
-    agent_context_rules: loom.agentContextRules,
     agent_task_templates: loom.agentTaskTemplates,
     created_at: loom.createdAt,
     updated_at: loom.updatedAt,
@@ -370,12 +356,15 @@ function saveResult(
 ): SaveAgenticRuntimeEditorResult {
   const committed: LoomPreset = {
     ...base,
+    cacheRevision: (base.cacheRevision ?? 0) + 1,
     blocks: structuredClone(promptOrder),
-    agentConfig: structuredClone(draft.config),
+    agentConfig: structuredClone(prepareAgentConfigForRuntimeSave(
+      draft.config,
+      promptOrder,
+      base.cacheRevision ?? 0,
+    )),
     agentConfigRevision: base.agentConfigRevision + 1,
     agentSlotBindings: { ...draft.slotBindings },
-    agentContextPackSelections: structuredClone(draft.contextPackSelections),
-    agentContextRules: structuredClone(draft.contextRules),
     agentTaskTemplates: structuredClone(draft.taskTemplates),
   }
   return {
@@ -387,8 +376,6 @@ function saveResult(
       config: committed.agentConfig,
       review: committed.agentConfigReview,
       slotBindings: committed.agentSlotBindings,
-      contextPackSelections: committed.agentContextPackSelections,
-      contextRules: committed.agentContextRules,
       taskTemplates: committed.agentTaskTemplates,
       reviewAcknowledgements: [...draft.reviewAcknowledgements],
       hostCeilings,
@@ -399,7 +386,12 @@ function saveResult(
 
 function renderPanel(options: {
   value?: LoomPreset
-  onSave?: (draft: AgenticRuntimeSaveDraft, promptOrder: PromptBlock[], expectedPresetRevision?: number) => Promise<SaveAgenticRuntimeEditorResult>
+  onSave?: (
+    draft: AgenticRuntimeSaveDraft,
+    promptOrder: PromptBlock[],
+    expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
+  ) => Promise<SaveAgenticRuntimeEditorResult>
+  onReload?: () => Promise<unknown>
   onDirtyChange?: (dirty: boolean) => void
 } = {}) {
   const container = document.createElement('div')
@@ -412,6 +404,7 @@ function renderPanel(options: {
     preset: value,
     onSave: options.onSave ?? (async (draft, promptOrder) => saveResult(value, draft, promptOrder)),
     onDirtyChange: options.onDirtyChange ?? (() => {}),
+    onReload: options.onReload ?? (async () => undefined),
   })))
   mountedRoots.add(root)
   return { container, root }
@@ -456,15 +449,16 @@ function unmountRoot(root: Root): void {
 afterEach(() => {
   for (const root of [...mountedRoots]) unmountRoot(root)
   document.body.replaceChildren()
-  editorContextSelections = []
-  editorContextRules = []
   editorTaskTemplates = []
   editorReviewAcknowledgements = []
   editorPresetRevision = 8
   editorConfigRevision = 4
   editorConfig = null
   editorReview = null
+  editorProjectionInvalid = false
   editorGetError = null
+  editorGetGate = null
+
 })
 
 afterAll(() => {
@@ -475,12 +469,25 @@ afterAll(() => {
 })
 
 describe('Agentic Runtime shared editor', () => {
+  test('keeps native World Info and Databank visibly outside Loom ownership', async () => {
+    const { container } = renderPanel()
+    await settle()
+
+    const notice = container.querySelector<HTMLElement>('[role="note"]')
+    expect(notice).not.toBeNull()
+    expect(notice!.textContent).toContain('nativeContextNotice')
+  })
+
   test('keeps one dirty draft across sections and submits config with prompt blocks once', async () => {
-    const saves: Array<{ draft: AgenticRuntimeSaveDraft; promptOrder: PromptBlock[]; expectedRevision?: number }> = []
+    const saves: Array<{
+      draft: AgenticRuntimeSaveDraft
+      promptOrder: PromptBlock[]
+      expectedIdentity: { presetId: string; presetRevision: number; configRevision: number }
+    }> = []
     const dirtyStates: boolean[] = []
     const { container } = renderPanel({
-      onSave: async (savedDraft, promptOrder, expectedRevision) => {
-        saves.push({ draft: savedDraft, promptOrder, expectedRevision })
+      onSave: async (savedDraft, promptOrder, expectedIdentity) => {
+        saves.push({ draft: savedDraft, promptOrder, expectedIdentity })
         return saveResult(preset(), savedDraft, promptOrder)
       },
       onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
@@ -501,13 +508,17 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => button(container, 'save.action').click())
     await settle()
     expect(saves).toHaveLength(1)
-    expect(saves[0]?.expectedRevision).toBe(8)
+    expect(saves[0]?.expectedIdentity).toEqual({
+      presetId: 'preset-1',
+      presetRevision: 8,
+      configRevision: 4,
+    })
     expect(saves[0]?.draft.config.profiles[0]?.name).toBe('Evidence analyst')
     expect(saves[0]?.draft.config.profiles[0]?.toolIds).toEqual(['lore_search_entries'])
     expect(saves[0]?.promptOrder.map((item) => item.id)).toEqual(['policy-block'])
     expect(dirtyStates.at(-1)).toBe(false)
   })
-  test('does not let edits overwrite a save that is already in flight', async () => {
+  test('fences draft and numeric edits while a save is already in flight', async () => {
     const submitted: AgenticRuntimeSaveDraft[] = []
     let release!: () => void
     const blocked = new Promise<void>((resolve) => { release = resolve })
@@ -525,12 +536,20 @@ describe('Agentic Runtime shared editor', () => {
     changeInput(name, 'Evidence analyst')
     flushSync(() => button(container, 'save.action').click())
     await settle()
+    expect(name.disabled).toBe(true)
     changeInput(name, 'Overwritten while saving')
+    flushSync(() => button(container, 'sections.tools.nav').click())
+    const maxInvocations = container.querySelector<HTMLInputElement>('#agents-max-invocations')!
+    expect(maxInvocations.disabled).toBe(true)
+    changeInput(maxInvocations, '72')
     expect(submitted).toHaveLength(1)
     expect(submitted[0]?.config.profiles[0]?.name).toBe('Evidence analyst')
+    expect(submitted[0]?.config.maxInvocations).toBe(64)
     release()
     await settle()
-    expect(container.querySelector<HTMLInputElement>('input[value="Researcher"]')).not.toBeNull()
+    expect(maxInvocations.value).toBe('64')
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    expect(name.value).toBe('Evidence analyst')
   })
 
 
@@ -563,6 +582,7 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => root.render(createElement(AgenticRuntimePanel, {
       preset: refreshed,
       onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
+      onReload: async () => undefined,
       onDirtyChange: () => {},
     })))
     await settle()
@@ -571,26 +591,47 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).toContain('save.conflict')
   })
 
-  test('keeps one Phased Instructions surface for phase and context authoring', async () => {
-    const { container } = renderPanel()
+  test('keeps four fixed Loom buckets with optional typed conditions', async () => {
+    const value = preset()
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
     await settle()
     const tabs = [...container.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
     const panel = container.querySelector<HTMLElement>('#agentic-runtime-panel')
     expect(tabs).toHaveLength(7)
-    expect(tabs.some((tab) => tab.textContent?.includes('sections.context.nav'))).toBe(false)
     expect(panel).not.toBeNull()
     for (const tab of tabs) {
       expect(tab.getAttribute('aria-controls')).toBe('agentic-runtime-panel')
     }
-    // The profile rail lives in the Agents section; the panel opens on Activation.
     flushSync(() => button(container, 'sections.agents.nav').click())
-    const profileList = container.querySelector<HTMLElement>('[role="list"]')
-    expect(profileList?.querySelectorAll('[role="listitem"]').length).toBe(1)
+    expect(container.querySelector<HTMLElement>('[role="list"]')?.querySelectorAll('[role="listitem"]').length).toBe(1)
     const toolsTab = tabs.find((tab) => tab.textContent?.includes('sections.tools.nav'))!
     flushSync(() => toolsTab.click())
     expect(panel?.getAttribute('aria-labelledby')).toBe(toolsTab.id)
     flushSync(() => button(container, 'sections.phases.nav').click())
-    expect(container.querySelector('select[aria-label="context.addPack"]')).not.toBeNull()
+    for (const policyKey of ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy']) {
+      expect(container.textContent).toContain(`phases.${policyKey}.title`)
+    }
+    const blockToggle = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+      .find((input) => input.closest('label')?.textContent?.includes('Work policy'))
+    expect(blockToggle).not.toBeNull()
+    flushSync(() => blockToggle!.click())
+    const conditionToggle = container.querySelector<HTMLInputElement>('input[aria-label="phases.conditionFor"]')
+    expect(conditionToggle).not.toBeNull()
+    expect(conditionToggle!.checked).toBe(false)
+    flushSync(() => conditionToggle!.click())
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves[0]?.config.runtimePolicy?.loomPolicy.workPolicy[0]?.condition).toEqual({
+      kind: 'phase',
+      value: 'WORK',
+    })
   })
 
   test('removes deleted profile markers before save', async () => {
@@ -620,6 +661,34 @@ describe('Agentic Runtime shared editor', () => {
     expect(saves[0]?.[0]?.content).toBe('Task text')
     expect(saves[0]?.[0]?.content).not.toContain('{{agent::')
     expect(saves[0]?.[0]?.content).not.toContain('{{/agent}}')
+  })
+
+  test('canonicalizes workspace capabilities regardless of selection order', async () => {
+    const value = preset()
+    value.agentConfig!.profiles[0]!.workspaceCapabilities = []
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    const capability = (key: string) => [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+      .find((input) => input.closest('label')?.textContent?.includes(`agentRun.tools.${key}`))
+    const readPage = capability('workspace_read_page')
+    const readSection = capability('workspace_read_section')
+    expect(readPage).not.toBeNull()
+    expect(readSection).not.toBeNull()
+    flushSync(() => readPage!.click())
+    flushSync(() => readSection!.click())
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.config.profiles[0]?.workspaceCapabilities).toEqual(['read_section', 'read_page'])
   })
 
 
@@ -680,148 +749,6 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.querySelectorAll('input[type="checkbox"]')).toHaveLength(0)
     expect(button(container, 'save.action').disabled).toBe(false)
   })
-  test('edits canonical context references for an owned exact revision and saves policy fields', async () => {
-    const saves: AgenticRuntimeSaveDraft[] = []
-    const { container } = renderPanel({
-      onSave: async (draft, promptOrder) => {
-        saves.push(draft)
-        return saveResult(preset(), draft, promptOrder)
-      },
-    })
-    await settle()
-    flushSync(() => button(container, 'sections.phases.nav').click())
-    const packSelect = container.querySelector<HTMLSelectElement>('select[aria-label="context.addPack"]')
-    expect(packSelect).not.toBeNull()
-    changeSelect(packSelect!, 'pack-1\u0000pack-1@3')
-    await settle()
-    expect(container.textContent).toContain('context.scopeLabel')
-    expect(container.textContent).toContain('context.sources.owned')
-    expect(container.textContent).not.toContain('context.attachmentUnavailable')
-    const direct = container.querySelector<HTMLInputElement>('input[aria-label="context.alwaysIncludeFor"]')
-    expect(direct).not.toBeNull()
-    flushSync(() => direct!.click())
-    flushSync(() => button(container, 'context.addRule').click())
-    const required = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
-      .find((input) => input.parentElement?.textContent?.includes('context.required'))
-    expect(required).not.toBeNull()
-    flushSync(() => required!.click())
-    flushSync(() => button(container, 'save.action').click())
-    await settle()
-    expect(saves).toHaveLength(1)
-    expect(saves[0]?.config.contextPolicy).toEqual({ ruleIds: ['context_1'], packIds: ['pack-1'] })
-    expect(saves[0]?.contextRules[0]).toMatchObject({ packId: 'pack-1', revisionId: 'pack-1@3', required: true })
-  })
-  test('rewrites context-rule dependencies when a rule ID changes', async () => {
-    const value = preset()
-    value.agentContextPackSelections = [{
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
-      revision: 3,
-      label: 'World rules',
-      digest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      revisionLabel: 'Revision 3',
-    }]
-    value.agentContextRules = [{
-      id: 'context_1',
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
-      required: false,
-      dependencies: [],
-    }, {
-      id: 'context_2',
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
-      required: false,
-      dependencies: ['context_1'],
-    }]
-    value.agentConfig!.contextPolicy = { ruleIds: ['context_1', 'context_2'], packIds: [] }
-    editorContextSelections = structuredClone(value.agentContextPackSelections)
-    editorContextRules = structuredClone(value.agentContextRules)
-    const saves: AgenticRuntimeSaveDraft[] = []
-    const { container } = renderPanel({
-      value,
-      onSave: async (draft, promptOrder) => {
-        saves.push(structuredClone(draft))
-        return saveResult(value, draft, promptOrder)
-      },
-    })
-    await settle()
-    flushSync(() => button(container, 'sections.phases.nav').click())
-    expect(container.textContent).toContain('context.revisionLabel')
-    expect(container.textContent).not.toContain('Revision 3')
-    const ruleIds = [...container.querySelectorAll<HTMLInputElement>('input[aria-label="context.ruleId"]')]
-    expect(ruleIds).toHaveLength(2)
-    changeInput(ruleIds[0]!, 'context_renamed')
-    const dependencyInputs = [...container.querySelectorAll<HTMLInputElement>('input[aria-label^="context.dependency"]')]
-    expect(dependencyInputs).toHaveLength(2)
-    expect(dependencyInputs.some((input) => input.checked)).toBe(true)
-    flushSync(() => button(container, 'save.action').click())
-    await settle()
-    expect(saves[0]?.config.contextPolicy).toEqual({
-      ruleIds: ['context_renamed', 'context_2'],
-      packIds: [],
-    })
-    const direct = container.querySelector<HTMLInputElement>('input[aria-label="context.alwaysIncludeFor"]')
-    expect(direct).not.toBeNull()
-    flushSync(() => direct!.click())
-    flushSync(() => button(container, 'save.action').click())
-    await settle()
-    expect(saves[1]?.config.contextPolicy).toEqual({
-      ruleIds: ['context_renamed', 'context_2'],
-      packIds: ['pack-1'],
-    })
-  })
-  test('resets an edited context policy to its last committed draft', async () => {
-    const { container } = renderPanel()
-    await settle()
-    flushSync(() => button(container, 'sections.phases.nav').click())
-    const packSelect = container.querySelector<HTMLSelectElement>('select[aria-label="context.addPack"]')!
-    changeSelect(packSelect, 'pack-1\u0000pack-1@3')
-    await settle()
-    flushSync(() => button(container, 'context.addRule').click())
-    expect(button(container, 'save.action').disabled).toBe(false)
-
-    flushSync(() => button(container, 'save.reset').click())
-
-    expect(container.querySelectorAll('input[aria-label="context.ruleId"]')).toHaveLength(0)
-    expect(container.querySelectorAll('li')).toHaveLength(0)
-    expect(button(container, 'save.action').disabled).toBe(true)
-    expect(button(container, 'save.reset').disabled).toBe(true)
-  })
-
-  test('quarantines a mismatched imported policy instead of normalizing it on render', async () => {
-    const value = preset()
-    value.agentConfig!.contextPolicy = { ruleIds: ['missing-rule'], packIds: ['missing-pack'] }
-    const { container } = renderPanel({ value })
-    await settle()
-    flushSync(() => button(container, 'sections.phases.nav').click())
-
-    expect(container.textContent).toContain('context.quarantineTitle')
-    expect(button(container, 'save.action').disabled).toBe(true)
-    expect(container.textContent).toContain('context.repairPolicy')
-  })
-
-
-  test('quarantines malformed imported context values until explicitly discarded', async () => {
-    editorContextSelections = [{
-      packId: 'pack-1',
-      revisionId: 'pack-1@bad',
-      revision: 0,
-      label: 'Imported',
-      revisionLabel: 'bad',
-      digest: 'bad',
-    }]
-    const { container } = renderPanel()
-    await settle()
-    flushSync(() => button(container, 'sections.phases.nav').click())
-    expect(container.textContent).toContain('context.quarantineTitle')
-    expect(button(container, 'save.action').disabled).toBe(true)
-    const discard = container.querySelector<HTMLButtonElement>('[aria-label="context.discardQuarantined"]')
-    expect(discard).not.toBeNull()
-    flushSync(() => discard!.click())
-    expect(container.textContent).not.toContain('context.quarantineTitle')
-    expect(button(container, 'save.action').disabled).toBe(false)
-  })
   test('repairs task-transition predicates when deleting a task template', async () => {
     const removedTask = { id: 'remove_me', required: true, activation: { kind: 'phase' as const, value: 'WORK' as const } }
     const keeperTask = {
@@ -835,28 +762,53 @@ describe('Agentic Runtime shared editor', () => {
         ],
       },
     }
-    editorTaskTemplates = [removedTask, keeperTask]
-    editorContextSelections = [{
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
-      revision: 3,
-      label: 'World rules',
-      revisionLabel: 'Revision 3',
-      digest: 'a'.repeat(64),
-    }]
-    editorContextRules = [{
-      id: 'context_rule',
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
+    const emptyAnyTask = {
+      id: 'empty_any',
       required: false,
       activation: {
-        kind: 'not' as const,
-        child: { kind: 'task_transition' as const, taskId: 'remove_me', transition: 'active' as const },
+        kind: 'any' as const,
+        children: [{ kind: 'task_transition' as const, taskId: 'remove_me', transition: 'failed' as const }],
       },
-    }]
+    }
+    const emptyAllTask = {
+      id: 'empty_all',
+      required: false,
+      activation: {
+        kind: 'all' as const,
+        children: [{ kind: 'task_transition' as const, taskId: 'remove_me', transition: 'failed' as const }],
+      },
+    }
+    editorTaskTemplates = [removedTask, keeperTask, emptyAnyTask, emptyAllTask]
+    const runtimeTaskPhase = customPhase('phase_task_refs', {
+      enter: {
+        kind: 'all',
+        children: [
+          { kind: 'task_transition', taskId: 'remove_me', transition: 'active' },
+          { kind: 'task_transition', taskId: 'keeper', transition: 'active' },
+        ],
+      },
+      exit: {
+        kind: 'any',
+        children: [{ kind: 'task_transition', taskId: 'remove_me', transition: 'failed' }],
+      },
+      skip: {
+        kind: 'all',
+        children: [
+          { kind: 'task_transition', taskId: 'remove_me', transition: 'active' },
+          { kind: 'task_transition', taskId: 'keeper', transition: 'completed' },
+        ],
+      },
+    })
+    const runtimeTaskPolicyEntry = workPolicyEntry({
+      kind: 'all',
+      children: [
+        { kind: 'task_transition', taskId: 'remove_me', transition: 'active' },
+        { kind: 'task_transition', taskId: 'keeper', transition: 'completed' },
+      ],
+    })
     const value = preset()
-    value.agentConfig!.taskPolicy = { templateIds: ['remove_me', 'keeper'] }
-    value.agentConfig!.contextPolicy = { ruleIds: ['context_rule'], packIds: [] }
+    value.agentConfig!.runtimePolicy = runtimePolicy([runtimeTaskPhase], [runtimeTaskPolicyEntry])
+    value.agentConfig!.taskPolicy = { templateIds: ['remove_me', 'keeper', 'empty_any', 'empty_all'] }
     const saves: AgenticRuntimeSaveDraft[] = []
     const { container } = renderPanel({
       value,
@@ -869,24 +821,259 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => button(container, 'sections.tasks.nav').click())
     const removeButtons = [...container.querySelectorAll<HTMLButtonElement>('button')]
       .filter((candidate) => candidate.textContent?.includes('tasks.remove'))
-    expect(removeButtons).toHaveLength(2)
+    expect(removeButtons).toHaveLength(4)
     flushSync(() => removeButtons[0]!.click())
     expect(button(container, 'save.action').disabled).toBe(false)
     flushSync(() => button(container, 'save.action').click())
     await settle()
 
     expect(saves).toHaveLength(1)
-    expect(saves[0]?.taskTemplates).toEqual([{
-      id: 'keeper',
-      required: true,
-      activation: { kind: 'phase', value: 'WORK' },
-    }])
-    expect(saves[0]?.contextRules[0]?.activation).toBeUndefined()
+    expect(saves[0]?.taskTemplates).toEqual([
+      {
+        id: 'keeper',
+        required: true,
+        activation: { kind: 'all', children: [{ kind: 'phase', value: 'WORK' }] },
+      },
+      {
+        id: 'empty_any',
+        required: false,
+        activation: { kind: 'any', children: [] },
+      },
+      {
+        id: 'empty_all',
+        required: false,
+        activation: { kind: 'all', children: [] },
+      },
+    ])
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.enter).toEqual({
+      kind: 'all',
+      children: [{ kind: 'task_transition', taskId: 'keeper', transition: 'active' }],
+    })
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.exit).toEqual({
+      kind: 'any',
+      children: [],
+    })
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.skip).toEqual({
+      kind: 'all',
+      children: [{ kind: 'task_transition', taskId: 'keeper', transition: 'completed' }],
+    })
+    expect(saves[0]?.config.runtimePolicy?.loomPolicy?.workPolicy[0]?.condition).toEqual({
+      kind: 'all',
+      children: [{ kind: 'task_transition', taskId: 'keeper', transition: 'completed' }],
+    })
   })
-  test('quarantines malformed imported task templates until explicitly discarded', async () => {
-    editorTaskTemplates = [{ id: 'bad-task', required: true }]
+  test('removes a third enter-condition child and persists the original pair', async () => {
+    const originalEnter = {
+      kind: 'all' as const,
+      children: [
+        { kind: 'generation_type' as const, value: 'normal' as const },
+        { kind: 'phase' as const, value: 'WORK' as const },
+      ],
+    }
+    const contaminatedEnter = {
+      ...originalEnter,
+      children: [
+        ...originalEnter.children,
+        { kind: 'preset_variable' as const, name: 'variable', operator: 'present' as const },
+      ],
+    }
     const value = preset()
-    value.agentConfig!.taskPolicy = { templateIds: ['bad-task'] }
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('snapshot_exact_inputs', {
+        label: 'Snapshot exact inputs',
+        enter: contaminatedEnter,
+      }),
+    ])
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container, root } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.phases.nav').click())
+
+    const enterFieldset = [...container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.enter'
+    ))
+    expect(enterFieldset).not.toBeNull()
+    const childRows = [...enterFieldset!.querySelectorAll<HTMLElement>('.predicateChild')]
+    expect(childRows).toHaveLength(3)
+    const thirdRemove = childRows[2]!.querySelector<HTMLButtonElement>('[aria-label="predicate.remove"]')
+    expect(thirdRemove).not.toBeNull()
+    expect(thirdRemove!.disabled).toBe(false)
+    flushSync(() => thirdRemove!.click())
+
+    expect(enterFieldset!.querySelectorAll('.predicateChild')).toHaveLength(2)
+    expect(button(container, 'save.action').disabled).toBe(false)
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.enter).toEqual(originalEnter)
+
+    const reloaded = structuredClone(value)
+    reloaded.agentConfig = structuredClone(saves[0]!.config)
+    reloaded.cacheRevision = (value.cacheRevision ?? 0) + 1
+    reloaded.agentConfigRevision = value.agentConfigRevision + 1
+    unmountRoot(root)
+    const remounted = renderPanel({ value: reloaded })
+    await settle()
+    flushSync(() => button(remounted.container, 'sections.phases.nav').click())
+    const reloadedEnter = [...remounted.container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.enter'
+    ))
+    expect(reloadedEnter?.querySelectorAll('.predicateChild')).toHaveLength(2)
+    expect(button(remounted.container, 'save.action').disabled).toBe(true)
+  })
+  test('disables predicate remove until the editor hydrates', async () => {
+    const { promise, resolve } = Promise.withResolvers<void>()
+    editorGetGate = promise
+    const originalEnter = {
+      kind: 'all' as const,
+      children: [
+        { kind: 'generation_type' as const, value: 'normal' as const },
+        { kind: 'phase' as const, value: 'WORK' as const },
+      ],
+    }
+    const value = preset()
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('snapshot_exact_inputs', {
+        label: 'Snapshot exact inputs',
+        enter: {
+          ...originalEnter,
+          children: [
+            ...originalEnter.children,
+            { kind: 'preset_variable' as const, name: 'variable', operator: 'present' as const },
+          ],
+        },
+      }),
+    ])
+    const { container } = renderPanel({ value })
+    expect(container.textContent).toContain('load.loading')
+    expect(container.querySelector('[aria-label="predicate.remove"]')).toBeNull()
+    expect(button(container, 'save.action').disabled).toBe(true)
+
+    resolve()
+    await settle()
+    expect(container.textContent).toContain('save.saved')
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    const enterFieldset = [...container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.enter'
+    ))
+    expect(enterFieldset).not.toBeNull()
+    const childRows = [...enterFieldset!.querySelectorAll<HTMLElement>('.predicateChild')]
+    expect(childRows).toHaveLength(3)
+    const thirdRemove = childRows[2]!.querySelector<HTMLButtonElement>('[aria-label="predicate.remove"]')
+    expect(thirdRemove).not.toBeNull()
+    expect(thirdRemove!.disabled).toBe(false)
+    flushSync(() => thirdRemove!.click())
+    expect(enterFieldset!.querySelectorAll('.predicateChild')).toHaveLength(2)
+    expect(button(container, 'save.action').disabled).toBe(false)
+  })
+  test('recovers a post-save stale shell so the third enter child can be removed', async () => {
+    const originalEnter = {
+      kind: 'all' as const,
+      children: [
+        { kind: 'generation_type' as const, value: 'normal' as const },
+        { kind: 'phase' as const, value: 'WORK' as const },
+      ],
+    }
+    const value = preset()
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('snapshot_exact_inputs', {
+        label: 'Snapshot exact inputs',
+        enter: originalEnter,
+      }),
+    ])
+    const saves: AgenticRuntimeSaveDraft[] = []
+    let latestResult: SaveAgenticRuntimeEditorResult | null = null
+    const { container, root } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        latestResult = saveResult(value, draft, promptOrder)
+        return latestResult
+      },
+      onReload: async () => {
+        const committed = latestResult
+        if (!committed) return
+        editorPresetRevision = committed.editor.presetRevision
+        editorConfigRevision = committed.editor.configRevision
+        editorConfig = structuredClone(committed.editor.config)
+        const refreshed = structuredClone(value)
+        refreshed.agentConfig = structuredClone(committed.editor.config)
+        refreshed.cacheRevision = committed.editor.presetRevision
+        refreshed.agentConfigRevision = committed.editor.configRevision
+        flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+          preset: refreshed,
+          onSave: async (draft, promptOrder) => {
+            saves.push(structuredClone(draft))
+            latestResult = saveResult(refreshed, draft, promptOrder)
+            return latestResult
+          },
+          onReload: async () => undefined,
+          onDirtyChange: () => {},
+        })))
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    const enterFieldset = () => [...container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.enter'
+    ))
+    flushSync(() => {
+      const add = [...enterFieldset()!.querySelectorAll('button')].find((candidate) => (
+        candidate.textContent?.includes('predicate.add')
+      ))
+      add!.click()
+    })
+    const addedRows = [...enterFieldset()!.querySelectorAll<HTMLElement>('.predicateChild')]
+    expect(addedRows).toHaveLength(3)
+    const thirdKind = addedRows[2]!.querySelector<HTMLSelectElement>('select')
+    expect(thirdKind).not.toBeNull()
+    changeSelect(thirdKind!, 'preset_variable')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    expect(saves).toHaveLength(1)
+    expect(container.textContent).toContain('load.loading')
+    expect(container.textContent).toContain('save.reloadLatest')
+    const lockedRows = [...enterFieldset()!.querySelectorAll<HTMLElement>('.predicateChild')]
+    expect(lockedRows).toHaveLength(3)
+    const lockedRemove = lockedRows[2]!.querySelector<HTMLButtonElement>('[aria-label="predicate.remove"]')
+    expect(lockedRemove).not.toBeNull()
+    expect(lockedRemove!.disabled).toBe(true)
+    expect(button(container, 'save.action').disabled).toBe(true)
+
+    flushSync(() => button(container, 'save.reloadLatest').click())
+    await settle()
+    expect(container.textContent).not.toContain('save.reloadLatest')
+    const recoveredRows = [...enterFieldset()!.querySelectorAll<HTMLElement>('.predicateChild')]
+    expect(recoveredRows).toHaveLength(3)
+    const recoveredRemove = recoveredRows[2]!.querySelector<HTMLButtonElement>('[aria-label="predicate.remove"]')
+    expect(recoveredRemove).not.toBeNull()
+    expect(recoveredRemove!.disabled).toBe(false)
+    flushSync(() => recoveredRemove!.click())
+    expect(enterFieldset()!.querySelectorAll('.predicateChild')).toHaveLength(2)
+    expect(button(container, 'save.action').disabled).toBe(false)
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves).toHaveLength(2)
+    expect(saves[1]?.config.runtimePolicy?.phases[0]?.enter).toEqual(originalEnter)
+  })
+
+
+
+  test('quarantines malformed imported task templates until explicitly discarded', async () => {
+    editorTaskTemplates = [{
+      id: 'bad_task',
+      required: true,
+      activation: { kind: 'invalid' },
+    }]
+    const value = preset()
+    value.agentConfig!.taskPolicy = { templateIds: ['bad_task'] }
     const { container } = renderPanel({ value })
     await settle()
     flushSync(() => button(container, 'sections.tasks.nav').click())
@@ -898,6 +1085,65 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).not.toContain('tasks.quarantined')
     expect(button(container, 'save.action').disabled).toBe(false)
   })
+  test('repairs runtime task predicates when discarding a quarantined task template', async () => {
+    editorTaskTemplates = [
+      { id: 'bad_task', required: true, activation: { kind: 'invalid' } },
+      { id: 'keeper', required: true, activation: { kind: 'phase', value: 'WORK' } },
+    ]
+    const value = preset()
+    value.agentConfig!.taskPolicy = { templateIds: ['bad_task', 'keeper'] }
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('phase_quarantine', {
+        enter: {
+          kind: 'all',
+          children: [
+            { kind: 'task_transition', taskId: 'bad_task', transition: 'active' },
+            { kind: 'task_transition', taskId: 'keeper', transition: 'active' },
+          ],
+        },
+      }),
+    ], [
+      workPolicyEntry({
+        kind: 'any',
+        children: [{ kind: 'task_transition', taskId: 'bad_task', transition: 'failed' }],
+      }),
+    ])
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.tasks.nav').click())
+    const discard = container.querySelector<HTMLButtonElement>('[aria-label="tasks.discardQuarantined"]')
+    expect(discard).not.toBeNull()
+    await act(async () => {
+      discard!.click()
+    })
+    await settle()
+    await act(async () => {
+      button(container, 'save.action').click()
+    })
+    await settle()
+
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.taskTemplates).toEqual([
+      { id: 'keeper', required: true, activation: { kind: 'phase', value: 'WORK' } },
+    ])
+    expect(saves[0]?.config.taskPolicy).toEqual({ templateIds: ['keeper'] })
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.enter).toEqual({
+      kind: 'all',
+      children: [{ kind: 'task_transition', taskId: 'keeper', transition: 'active' }],
+    })
+    expect(saves[0]?.config.runtimePolicy?.loomPolicy?.workPolicy[0]?.condition).toEqual({
+      kind: 'any',
+      children: [],
+    })
+  })
+
   test('clears an empty quarantined task id from policy references', async () => {
     editorTaskTemplates = [{ id: '', required: true }]
     const value = preset()
@@ -910,26 +1156,11 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => discard!.click())
     expect(button(container, 'save.action').disabled).toBe(false)
   })
-  test('shows unavailable pack metadata without implying current access', async () => {
-    editorContextSelections = [{
-      packId: 'pack-2',
-      revisionId: 'pack-2@3',
-      revision: 3,
-      label: 'Unavailable rules',
-      digest: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-      revisionLabel: 'Revision 3',
-    }]
-    const { container } = renderPanel()
-    await settle()
-    flushSync(() => button(container, 'sections.phases.nav').click())
-    expect(container.textContent).toContain('context.scopeUnavailable')
-    expect(container.textContent).toContain('context.attachmentUnavailable')
-    expect(container.textContent).not.toContain('context.scopes.unknown_scope')
-  })
 
   test('hydrates committed revision and policy values from the atomic save response', async () => {
     const committed = structuredClone(preset())
     committed.agentConfig!.profiles[0]!.name = 'Committed analyst'
+    committed.cacheRevision = (committed.cacheRevision ?? 0) + 1
     committed.agentConfigRevision = 5
     const response: SaveAgenticRuntimeEditorResult = {
       preset: wirePreset(committed),
@@ -940,8 +1171,6 @@ describe('Agentic Runtime shared editor', () => {
         config: committed.agentConfig,
         review: committed.agentConfigReview,
         slotBindings: committed.agentSlotBindings,
-        contextPackSelections: committed.agentContextPackSelections,
-        contextRules: committed.agentContextRules,
         taskTemplates: committed.agentTaskTemplates,
         reviewAcknowledgements: [],
         hostCeilings,
@@ -975,7 +1204,7 @@ describe('Agentic Runtime shared editor', () => {
 
   test('surfaces stale canonical Loom sources and never enables a partial save', async () => {
     const value = preset()
-    const staleEntry = workPolicyEntry({ delivery: 'direct' })
+    const staleEntry = workPolicyEntry()
     value.agentConfig!.runtimePolicy = runtimePolicy([], [{
       ...staleEntry,
       source: {
@@ -1075,7 +1304,7 @@ describe('Agentic Runtime shared editor', () => {
     expect(saves[0]?.config.runtimePolicy?.phases).toEqual([])
   })
 
-  test('rewrites custom-phase and Loom delivery task references when a task ID changes', async () => {
+  test('rewrites custom-phase and Loom policy task references when a task ID changes', async () => {
     const value = preset()
     const task = {
       id: 'old_task',
@@ -1091,8 +1320,9 @@ describe('Agentic Runtime shared editor', () => {
       }),
     ], [
       workPolicyEntry({
-        delivery: 'condition_gated',
-        condition: { kind: 'task_transition', taskId: task.id, transition: 'completed' },
+        kind: 'task_transition',
+        taskId: task.id,
+        transition: 'completed',
       }),
     ])
     editorTaskTemplates = [structuredClone(task)]
@@ -1117,49 +1347,13 @@ describe('Agentic Runtime shared editor', () => {
       taskId: 'renamed_task',
       transition: 'active',
     })
-    expect(saves[0]?.config.runtimePolicy?.loomPolicy?.workPolicy[0]?.delivery).toEqual({
-      delivery: 'condition_gated',
-      condition: {
-        kind: 'task_transition',
-        taskId: 'renamed_task',
-        transition: 'completed',
-      },
+    expect(saves[0]?.config.runtimePolicy?.loomPolicy?.workPolicy[0]?.condition).toEqual({
+      kind: 'task_transition',
+      taskId: 'renamed_task',
+      transition: 'completed',
     })
   })
 
-  test('blocks context removal while an exact on-demand delivery references it', async () => {
-    const selection = {
-      packId: 'pack-1',
-      revisionId: 'pack-1@3',
-      revision: 3,
-      label: 'World rules',
-      revisionLabel: 'Revision 3',
-      digest: 'a'.repeat(64),
-    }
-    const value = preset()
-    value.agentContextPackSelections = [selection]
-    value.agentConfig!.contextPolicy = { ruleIds: [], packIds: [selection.packId] }
-    value.agentConfig!.runtimePolicy = runtimePolicy([], [
-      workPolicyEntry({
-        delivery: 'on_demand',
-        request: {
-          contextPackId: selection.packId,
-          revisionId: selection.revisionId,
-          digest: selection.digest,
-        },
-      }),
-    ])
-    editorContextSelections = [structuredClone(selection)]
-    const { container } = renderPanel({ value })
-    await settle()
-
-    flushSync(() => button(container, 'sections.phases.nav').click())
-    const remove = container.querySelector<HTMLButtonElement>('[aria-label="context.removePack"]')
-    expect(remove).not.toBeNull()
-    expect(remove!.disabled).toBe(true)
-    expect(remove!.title).toBe('context.removePackOnDemandInUse')
-    expect(container.textContent).toContain('config.runtimePolicy.loomPolicy.workPolicy.0.delivery.request')
-  })
 
   test('shows automatic phase transitions and custom instructions in Response omission', async () => {
     const value = preset()
@@ -1243,7 +1437,7 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).not.toContain('validation.invalid_modes')
   })
 
-  test('lets a new preset enable agents when the editor projection is missing', async () => {
+  test('keeps the intentional local fallback for a missing editor projection', async () => {
     editorGetError = new ApiError(404, 'Not Found')
     const value = preset()
     value.agentConfig = null
@@ -1254,20 +1448,161 @@ describe('Agentic Runtime shared editor', () => {
     const enable = container.querySelector<HTMLButtonElement>('[aria-label="activation.enable"]')
     expect(enable).not.toBeNull()
     expect(enable!.disabled).toBe(false)
+    expect(container.textContent).not.toContain('load.error')
+    expect(container.textContent).toContain('save.saved')
     flushSync(() => enable!.click())
     expect(enable!.getAttribute('aria-checked')).toBe('true')
     expect(container.textContent).not.toContain('validation.invalid_config')
   })
 
-  test('does not treat a failed editor load as a dormant writable draft', async () => {
+  test('fails closed with a visible retry for a clean editor load failure', async () => {
     editorGetError = new ApiError(500, 'Internal Server Error')
     const value = preset()
     const { container } = renderPanel({ value })
     await settle()
+    expect(container.textContent).toContain('load.error')
+    expect(container.textContent).toContain('load.retry')
+    expect(container.textContent).not.toContain('save.saved')
+    expect(container.querySelector('[role="tab"]')).toBeNull()
+    expect(container.querySelector<HTMLInputElement>('input[value="Researcher"]')).toBeNull()
+    expect(button(container, 'save.action').disabled).toBe(true)
+  })
+
+  test('preserves dirty conflict semantics while showing a non-404 load failure', async () => {
+    const value = preset()
+    const dirtyStates: boolean[] = []
+    const { container, root } = renderPanel({
+      value,
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    const name = container.querySelector<HTMLInputElement>('input[value="Researcher"]')!
+    changeInput(name, 'Unsaved analyst')
+    expect(dirtyStates.at(-1)).toBe(true)
+
+    editorGetError = new ApiError(500, 'Internal Server Error')
+    const refreshed = { ...value, cacheRevision: (value.cacheRevision ?? 0) + 1 }
+    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+      preset: refreshed,
+      onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
+      onReload: async () => undefined,
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+    })))
+    await settle()
+
+    expect(container.textContent).toContain('load.error')
+    expect(container.textContent).toContain('save.conflict')
+    expect(container.querySelector<HTMLInputElement>('input[value="Unsaved analyst"]')).toBeNull()
+    expect(button(container, 'save.action').disabled).toBe(true)
+    expect(dirtyStates.at(-1)).toBe(true)
+  })
+
+  test('retries a failed editor load and restores the hydrated save state', async () => {
+    editorGetError = new ApiError(500, 'Internal Server Error')
+    const value = preset()
+    const { container } = renderPanel({ value })
+    await settle()
+    expect(container.textContent).toContain('load.error')
+
+    editorGetError = null
+    flushSync(() => button(container, 'load.retry').click())
+    await settle()
+
+    expect(container.querySelector('[role="tab"]')).not.toBeNull()
+    expect(container.textContent).not.toContain('load.error')
+    expect(container.textContent).toContain('save.saved')
     const enable = container.querySelector<HTMLButtonElement>('[aria-label="activation.enable"]')
     expect(enable).not.toBeNull()
-    flushSync(() => enable!.click())
-    expect(enable!.getAttribute('aria-checked')).toBe('false')
+    expect(enable!.disabled).toBe(false)
+  })
+
+  test('fails closed when the editor projection is structurally invalid', async () => {
+    editorProjectionInvalid = true
+    const value = preset()
+    const { container } = renderPanel({ value })
+    await settle()
+
+    expect(container.textContent).toContain('load.error')
+    expect(container.textContent).toContain('load.retry')
+    expect(container.textContent).not.toContain('save.saved')
+    expect(container.querySelector('[role="tab"]')).toBeNull()
+    expect(button(container, 'save.action').disabled).toBe(true)
+  })
+
+  test('keeps a dirty 404 fallback in conflict until reset or retry', async () => {
+    const value = preset()
+    const dirtyStates: boolean[] = []
+    const { container, root } = renderPanel({
+      value,
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    const name = container.querySelector<HTMLInputElement>('input[value="Researcher"]')!
+    changeInput(name, 'Unsaved analyst')
+
+    editorGetError = new ApiError(404, 'Not Found')
+    const refreshed = { ...value, cacheRevision: (value.cacheRevision ?? 0) + 1 }
+    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+      preset: refreshed,
+      onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
+      onReload: async () => undefined,
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+    })))
+    await settle()
+
+    expect(container.textContent).not.toContain('load.error')
+    expect(container.textContent).toContain('save.conflict')
+    expect(container.textContent).toContain('load.retry')
+    expect(container.querySelector('[role="tab"]')).toBeNull()
+    expect(button(container, 'save.reset').disabled).toBe(false)
+
+    flushSync(() => button(container, 'save.reset').click())
+    expect(container.querySelector('[role="tab"]')).not.toBeNull()
+    expect(container.textContent).toContain('save.saved')
+    expect(dirtyStates.at(-1)).toBe(false)
+  })
+
+  test('hides the previous hydrated editor immediately when the preset changes', async () => {
+    const value = preset()
+    const { container, root } = renderPanel({ value })
+    await settle()
+    expect(container.textContent).toContain('save.saved')
+
+    editorGetError = new ApiError(500, 'Internal Server Error')
+    const refreshed = { ...value, id: `${value.id}-next` }
+    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+      preset: refreshed,
+      onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
+      onReload: async () => undefined,
+      onDirtyChange: () => {},
+    })))
+
+    expect(container.querySelector('[role="tab"]')).toBeNull()
+    expect(container.textContent).not.toContain('save.saved')
+    expect(button(container, 'save.action').disabled).toBe(true)
+    await settle()
+    expect(container.textContent).toContain('load.error')
+  })
+
+  test('retains a revision conflict after retrying into a mismatched projection', async () => {
+    editorGetError = new ApiError(500, 'Internal Server Error')
+    const value = preset()
+    const { container } = renderPanel({ value })
+    await settle()
+    expect(container.textContent).toContain('load.error')
+
+    editorGetError = null
+    editorPresetRevision = (value.cacheRevision ?? 0) + 1
+    editorConfigRevision = (value.agentConfigRevision ?? 0) + 1
+    flushSync(() => button(container, 'load.retry').click())
+    await settle()
+
+    expect(container.querySelector('[role="tab"]')).not.toBeNull()
+    expect(container.textContent).not.toContain('load.error')
+    expect(container.textContent).toContain('save.conflict')
+    expect(button(container, 'save.action').disabled).toBe(true)
   })
 
   test('shows actual runtime ceilings as information and exposes no control that can raise them', async () => {

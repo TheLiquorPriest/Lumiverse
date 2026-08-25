@@ -6,11 +6,13 @@ import {
   liveConnectionInputRevision,
   liveCredentialInputRevision,
   liveEndpointInputRevision,
+  liveSettingsInputRevision,
   SnapshotInputError,
   SnapshotLimitError,
   type GenerationAssemblySnapshotInputV1,
   type GenerationAssemblySnapshotV1,
 } from "./prompt-assembly-snapshot.service";
+import { canonicalRuntimeCapabilityDigest } from "./agent-runtime-decision.service";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
@@ -36,13 +38,6 @@ function schema(): Database {
   db.run("CREATE TABLE regex_scripts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, find_regex TEXT NOT NULL, replace_string TEXT NOT NULL, actions TEXT NOT NULL, flags TEXT NOT NULL, placement TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT, target TEXT NOT NULL, trim_strings TEXT NOT NULL, disabled INTEGER NOT NULL, sort_order INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   db.run("CREATE TABLE world_books (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, metadata TEXT NOT NULL, updated_at INTEGER NOT NULL)");
   db.run("CREATE TABLE world_book_entries (id TEXT PRIMARY KEY, world_book_id TEXT NOT NULL, order_value INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_account_state (user_id TEXT PRIMARY KEY, context_acl_revision INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_packs (user_id TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, visibility TEXT NOT NULL, state TEXT NOT NULL, latest_revision INTEGER NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_pack_revisions (user_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_digest TEXT NOT NULL, token_count INTEGER NOT NULL, byte_count INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL)");
-  db.run("CREATE TABLE agent_context_pack_acls (user_id TEXT NOT NULL, pack_id TEXT NOT NULL, principal_user_id TEXT NOT NULL, permission TEXT NOT NULL)");
-  db.run("CREATE TABLE agent_preset_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, preset_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_chat_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, chat_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_world_book_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, world_book_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   return db;
 }
 
@@ -85,6 +80,7 @@ const concrete = Object.freeze({
   endpointRevision: "endpoint-22",
   credentialRevision: "credential-33",
   candidateRevision: "candidate-11",
+  capabilityDigest: canonicalRuntimeCapabilityDigest({}),
   capabilities: {},
 });
 
@@ -104,7 +100,6 @@ function input(db: Database, overrides: Partial<GenerationAssemblySnapshotInputV
     concreteConnection: concrete,
     configRevision: 41,
     bindingRevision: 73,
-    contextPackSnapshotSource: "host_prefetched",
     agentConfig: config(),
     db,
     ...overrides,
@@ -159,13 +154,23 @@ describe("authenticated assembly snapshot revisions", () => {
     });
   });
 
-  test("rematerialized capabilities, label, or URL do not change connection fence identity", () => {
+  test("uses raw UTF-8 ordering for production settings digests", () => {
+    const actual = liveSettingsInputRevision({
+      globalWorldBooks: { "é": 2, z: 1 },
+    }, "preset-1");
+    const expected = createHash("sha256")
+      .update("{\"globalWorldBooks\":{\"z\":1,\"é\":2}}")
+      .digest("hex");
+    expect(actual).toEqual({ revision: expected, digest: expected });
+  });
+
+  test("rematerialized label or URL do not change connection fence identity when capabilities stay admitted", () => {
     const baseline = snapshot();
     const rematerialized = snapshot({
       concreteConnection: {
         ...concrete,
         label: "Rematerialized provider",
-        capabilities: { tools: true, vision: true },
+        capabilities: concrete.capabilities,
         effectiveEndpoint: "https://rematerialized.example/v1",
         provider: "anthropic",
         model: "other-model",
@@ -214,9 +219,19 @@ describe("authenticated assembly snapshot revisions", () => {
     expect(snapshot({ configRevision: "config-hash" }).inputRevisionSet.config[0]!.revision).toBe("config-hash");
   });
 
-  test("requires concrete identity and revision-field presence, while allowing null revision values", () => {
+  test("requires concrete identity, revision fields, and an exact capability digest", () => {
     const { candidateRevision: _candidateRevision, ...missingCandidateRevision } = concrete;
     expect(() => snapshot({ concreteConnection: missingCandidateRevision })).toThrow(SnapshotInputError);
+    const { capabilityDigest: _capabilityDigest, ...missingCapabilityDigest } = concrete;
+    expect(() => snapshot({ concreteConnection: missingCapabilityDigest })).toThrow(SnapshotInputError);
+    expect(() => snapshot({
+      concreteConnection: {
+        ...concrete,
+        capabilityDigest: "0".repeat(64),
+      },
+    })).toThrow(SnapshotInputError);
+  });
+  test("allows nullable connection revisions while retaining the capability digest", () => {
     const nullable = snapshot({
       concreteConnection: {
         ...concrete,

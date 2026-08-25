@@ -12,7 +12,13 @@ import type {
   LoomPolicyBucketsV1,
   LoomPolicySourceV1,
 } from "./agent-cognition";
-import { LOOM_POLICY_VERSION } from "./agent-cognition";
+import {
+  COGNITION_MAX_LIST_BYTES,
+  COGNITION_MAX_LIST_ITEMS,
+  COGNITION_MAX_PREDICATE_DEPTH,
+  COGNITION_MAX_SOURCE_BLOCKS,
+  LOOM_POLICY_VERSION,
+} from "./agent-cognition";
 import {
   LOOM_BUCKET_CHECKPOINT,
   LOOM_BUCKET_DESTINATION,
@@ -20,7 +26,6 @@ import {
   parseLoomPolicyBuckets,
 } from "../services/agent-cognition.service";
 import type { WorkspaceOperationKindV1 } from "./turn-workspace";
-import { WORKSPACE_OPERATIONS } from "./turn-workspace";
 
 
 export const LEGACY_AGENT_CONFIG_V1_VERSION = 1 as const;
@@ -36,6 +41,15 @@ export const AGENT_INVOCATION_DEFAULT = 64;
 export const AGENT_INVOCATION_MIN = 1;
 export const AGENT_TOOL_CALL_DEFAULT = 64;
 export const AGENT_TOOL_CALL_MIN = 1;
+/** Workspace operations that a child profile may be granted, in canonical order. */
+export const AGENT_CHILD_WORKSPACE_CAPABILITIES = [
+  "read_section",
+  "read_page",
+  "update_assigned_progress",
+  "submit_child_result",
+  "record_question",
+] as const satisfies readonly WorkspaceOperationKindV1[];
+export type AgentChildWorkspaceCapabilityV1 = (typeof AGENT_CHILD_WORKSPACE_CAPABILITIES)[number];
 /** The six host-owned retrieval tools available to the main model and children. */
 export type CoreAgentToolId =
   | "lore_list_books"
@@ -112,7 +126,6 @@ export type AgentLoomPolicyV1 = LoomPolicyBucketsV1;
 
 export const AGENT_RUNTIME_PHASE_CAPABILITIES = [
   "core_retrieval",
-  "context_retrieval",
   "workspace_read",
   "workspace_write",
   "delegation",
@@ -125,12 +138,23 @@ export type AgentRuntimePhaseCapabilityV1 = (typeof AGENT_RUNTIME_PHASE_CAPABILI
 export const AGENT_RUNTIME_MAX_CUSTOM_PHASES = 64 as const;
 export const AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS = 64 as const;
 
+/** Ordered child-profile subset of a phase's exact Loom instruction sources. */
+export interface AgentChildInstructionSubsetV1 {
+  readonly profileId: string;
+  readonly instructionRefs: readonly LoomPolicySourceV1[];
+}
+
 /** Ordered preset-authored phase with closed runtime capabilities and transitions. */
 export interface AgentCustomPhaseV1 {
   version: typeof AGENT_RUNTIME_POLICY_VERSION;
   id: string;
   label: string;
   instructionRefs: readonly LoomPolicySourceV1[];
+  /**
+   * Per-profile Loom instruction subsets. The subset is never inherited by
+   * the root frame; absent legacy data normalizes to an empty list.
+   */
+  childInstructionSubsets: readonly AgentChildInstructionSubsetV1[];
   required: boolean;
   enter: CognitionPredicateV1;
   exit: CognitionPredicateV1;
@@ -204,11 +228,6 @@ interface LegacyAgentCognitionPolicyV1 {
   renderPolicy: AgentPromptBlockRefV1[];
 }
 
-export interface AgentContextPolicyV1 {
-  ruleIds: string[];
-  packIds: string[];
-}
-
 export interface AgentTaskPolicyV1 {
   templateIds: string[];
 }
@@ -224,12 +243,8 @@ export interface AgentProfileConfigV2 {
   systemPrompt: string;
   connectionRef: AgentConnectionRef;
   toolIds: CoreAgentToolId[];
-  /**
-   * Explicit child workspace grants. The parser always materializes this as
-   * a canonical ordered array; the optional type keeps legacy in-memory callers
-   * source-compatible until they cross the V2 ingress boundary.
-   */
-  workspaceCapabilities?: WorkspaceOperationKindV1[];
+  /** Explicit child workspace grants in the canonical child-only order. */
+  workspaceCapabilities?: AgentChildWorkspaceCapabilityV1[];
   loreScope: AgentLoreScope;
   allowMainDelegation: boolean;
   failurePolicy: AgentFailurePolicy;
@@ -249,7 +264,6 @@ export interface AgentConfigV2 {
   mainLoreScope: AgentLoreScope;
   profiles: AgentProfileConfigV2[];
   connectionSlots: AgentConnectionSlotV1[];
-  contextPolicy?: AgentContextPolicyV1;
   taskPolicy?: AgentTaskPolicyV1;
   workspacePolicy?: AgentWorkspacePolicyV1;
   runtimePolicy?: AgentRuntimePolicyV1;
@@ -266,11 +280,13 @@ export interface PortableAgentConfigV1 {
   mainLoreScope: AgentLoreScope;
   profiles: AgentProfileConfigV2[];
   connectionSlots: AgentConnectionSlotV1[];
-  contextPolicy?: AgentContextPolicyV1;
   taskPolicy?: AgentTaskPolicyV1;
   workspacePolicy?: AgentWorkspacePolicyV1;
   runtimePolicy?: AgentRuntimePolicyV1;
+  /** Bounded JSON repair payload only; never part of AgentConfigV2 authority. */
+  cognitionPolicy?: unknown;
 }
+
 
 export type AgentConfigStateV1 = "ready" | "review_required" | "repair_required";
 
@@ -510,6 +526,129 @@ export class AgentConfigValidationError extends Error {
     this.name = "AgentConfigValidationError";
     this.path = path;
   }
+}
+interface PortableLegacyJsonFrame {
+  value: unknown;
+  path: string;
+  depth: number;
+  exit?: boolean;
+}
+
+/**
+ * Legacy cognition is a repair carrier, not a runtime policy. Keep its public
+ * portable parser strict enough that arbitrary host objects cannot cross the
+ * wire, while returning the original JSON value unchanged for round-tripping.
+ */
+function validatePortableLegacyCognitionPolicy(value: unknown): unknown {
+  const rootPath = "portableAgentConfig.cognitionPolicy";
+  const active = new WeakSet<object>();
+  const stack: PortableLegacyJsonFrame[] = [{ value, path: rootPath, depth: 0 }];
+  let listBytes = 0;
+
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    const current = frame.value;
+    if (frame.exit) {
+      const exiting = frame.value;
+      if (typeof exiting !== "object" || exiting === null) {
+        throw new AgentConfigValidationError(frame.path, "internal JSON traversal error");
+      }
+      active.delete(exiting);
+      continue;
+    }
+    if (frame.depth > COGNITION_MAX_PREDICATE_DEPTH) {
+      throw new AgentConfigValidationError(frame.path, `must be at most ${COGNITION_MAX_PREDICATE_DEPTH} levels deep`);
+    }
+    if (current === null || typeof current === "boolean") continue;
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) throw new AgentConfigValidationError(frame.path, "must be a finite JSON number");
+      continue;
+    }
+    if (typeof current === "string") {
+      listBytes += UTF8_ENCODER.encode(current).byteLength;
+      if (listBytes > COGNITION_MAX_LIST_BYTES) {
+        throw new AgentConfigValidationError(frame.path, `strings must total at most ${COGNITION_MAX_LIST_BYTES} UTF-8 bytes`);
+      }
+      continue;
+    }
+    if (typeof current !== "object") {
+      throw new AgentConfigValidationError(frame.path, "must be a JSON value");
+    }
+    if (active.has(current)) {
+      throw new AgentConfigValidationError(frame.path, "must not contain a cycle");
+    }
+    active.add(current);
+    stack.push({ value: current, path: frame.path, depth: frame.depth, exit: true });
+
+    if (Array.isArray(current)) {
+      if (Object.getPrototypeOf(current) !== Array.prototype) {
+        throw new AgentConfigValidationError(frame.path, "must be a JSON array");
+      }
+      if (current.length > COGNITION_MAX_LIST_ITEMS) {
+        throw new AgentConfigValidationError(frame.path, `must contain at most ${COGNITION_MAX_LIST_ITEMS} items`);
+      }
+      for (const key of Reflect.ownKeys(current)) {
+        if (typeof key !== "string") {
+          throw new AgentConfigValidationError(frame.path, "must not contain symbol keys");
+        }
+        if (key === "length") {
+          const descriptor = Object.getOwnPropertyDescriptor(current, key);
+          if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+            throw new AgentConfigValidationError(`${frame.path}.length`, "must be a data property");
+          }
+          continue;
+        }
+        if (!/^(?:0|[1-9]\d*)$/.test(key)) {
+          throw new AgentConfigValidationError(`${frame.path}.${key}`, "arrays must contain only indexed values");
+        }
+        const index = Number(key);
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!Number.isSafeInteger(index) || index >= current.length || !descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+          throw new AgentConfigValidationError(`${frame.path}[${key}]`, "must be a present data property");
+        }
+      }
+      for (let index = current.length - 1; index >= 0; index -= 1) {
+        stack.push({ value: current[index], path: `${frame.path}[${index}]`, depth: frame.depth + 1 });
+      }
+      continue;
+    }
+
+    const prototype = Object.getPrototypeOf(current);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new AgentConfigValidationError(frame.path, "must be a plain JSON object");
+    }
+    const keys = Reflect.ownKeys(current);
+    if (keys.length > COGNITION_MAX_LIST_ITEMS) {
+      throw new AgentConfigValidationError(frame.path, `must contain at most ${COGNITION_MAX_LIST_ITEMS} fields`);
+    }
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index]!;
+      if (typeof key !== "string") {
+        throw new AgentConfigValidationError(frame.path, "must not contain symbol keys");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+        throw new AgentConfigValidationError(`${frame.path}.${key}`, "must be an enumerable data property");
+      }
+      listBytes += UTF8_ENCODER.encode(key).byteLength;
+      if (listBytes > COGNITION_MAX_LIST_BYTES) {
+        throw new AgentConfigValidationError(`${frame.path}.${key}`, `strings must total at most ${COGNITION_MAX_LIST_BYTES} UTF-8 bytes`);
+      }
+      stack.push({ value: descriptor.value, path: `${frame.path}.${key}`, depth: frame.depth + 1 });
+    }
+  }
+
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new AgentConfigValidationError(rootPath, "must be JSON-serializable");
+  }
+  if (serialized === undefined) throw new AgentConfigValidationError(rootPath, "must be JSON-serializable");
+  if (UTF8_ENCODER.encode(serialized).byteLength > COGNITION_MAX_LIST_BYTES) {
+    throw new AgentConfigValidationError(rootPath, `JSON must be at most ${COGNITION_MAX_LIST_BYTES} UTF-8 bytes`);
+  }
+  return value;
 }
 
 type PlainRecord = Record<string, unknown>;
@@ -802,12 +941,12 @@ function requireWorkspaceCapabilities(
   value: unknown,
   path: string,
   optional = false,
-): WorkspaceOperationKindV1[] {
+): AgentChildWorkspaceCapabilityV1[] {
   if (value === undefined && optional) return [];
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     throw new AgentConfigValidationError(path, "must be an array");
   }
-  const result: WorkspaceOperationKindV1[] = [];
+  const result: AgentChildWorkspaceCapabilityV1[] = [];
   let previousIndex = -1;
   for (let index = 0; index < value.length; index += 1) {
     if (!Object.hasOwn(value, String(index))) {
@@ -815,16 +954,16 @@ function requireWorkspaceCapabilities(
     }
     const operation = value[index];
     const operationIndex = typeof operation === "string"
-      ? WORKSPACE_OPERATIONS.indexOf(operation as WorkspaceOperationKindV1)
+      ? AGENT_CHILD_WORKSPACE_CAPABILITIES.indexOf(operation as AgentChildWorkspaceCapabilityV1)
       : -1;
     if (operationIndex < 0) {
-      throw new AgentConfigValidationError(`${path}[${index}]`, "unknown workspace operation");
+      throw new AgentConfigValidationError(`${path}[${index}]`, "workspace operation is not allowed for child profiles");
     }
     if (operationIndex <= previousIndex) {
       throw new AgentConfigValidationError(`${path}[${index}]`, "workspace capabilities must be sorted and unique");
     }
     previousIndex = operationIndex;
-    result.push(operation as WorkspaceOperationKindV1);
+    result.push(operation as AgentChildWorkspaceCapabilityV1);
   }
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string" || (key !== "length" && !/^\d+$/.test(key))) {
@@ -847,19 +986,6 @@ function requireIdList(value: unknown, path: string): string[] {
     if (!Object.hasOwn(value, String(index))) throw new AgentConfigValidationError(`${path}[${index}]`, "must be present");
     const id = requireString(value[index], `${path}[${index}]`, 64);
     if (!AGENT_POLICY_ID_PATTERN.test(id) || seen.has(id)) throw new AgentConfigValidationError(`${path}[${index}]`, "must be a unique policy id");
-    seen.add(id); result.push(id);
-  }
-  return result;
-}
-function requireContextPackIdList(value: unknown, path: string): string[] {
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) throw new AgentConfigValidationError(path, "must be an array");
-  const result: string[] = []; const seen = new Set<string>();
-  for (let index = 0; index < value.length; index += 1) {
-    if (!Object.hasOwn(value, String(index))) throw new AgentConfigValidationError(`${path}[${index}]`, "must be present");
-    const id = requireString(value[index], `${path}[${index}]`, 256);
-    if (!id || id.trim() !== id || /[\u0000-\u0020\u007f]/.test(id) || id.includes("{{") || id.includes("}}") || seen.has(id)) {
-      throw new AgentConfigValidationError(`${path}[${index}]`, "must be a unique bounded context-pack id");
-    }
     seen.add(id); result.push(id);
   }
   return result;
@@ -914,6 +1040,62 @@ function parseLoomInstructionRefs(value: unknown, path: string): LoomPolicySourc
   }
   return refs;
 }
+function loomInstructionSourceKey(ref: LoomPolicySourceV1): string {
+  return `${ref.kind}\u0000${ref.blockId}\u0000${ref.presetRevision}\u0000${ref.blockRevision}\u0000${ref.promptOrder}`;
+}
+
+function parseChildInstructionSubsets(
+  value: unknown,
+  path: string,
+  phaseInstructionRefs: readonly LoomPolicySourceV1[],
+  profileIds?: ReadonlySet<string>,
+): AgentChildInstructionSubsetV1[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new AgentConfigValidationError(path, "must be an array");
+  }
+  if (value.length > AGENT_CONFIG_MAX_PROFILES) {
+    throw new AgentConfigValidationError(path, `must contain at most ${AGENT_CONFIG_MAX_PROFILES} profile subsets`);
+  }
+  const rootSources = new Set(phaseInstructionRefs.map(loomInstructionSourceKey));
+  const subsets: AgentChildInstructionSubsetV1[] = [];
+  const profileIdsSeen = new Set<string>();
+  let aggregateRefs = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const subsetPath = `${path}[${index}]`;
+    const subset = ownDataEntries(value[index], subsetPath);
+    exactKeys(subset, ["profileId", "instructionRefs"], subsetPath);
+    const profileId = requireString(subset.profileId, `${subsetPath}.profileId`, 64);
+    if (!AGENT_PROFILE_ID_PATTERN.test(profileId)) {
+      throw new AgentConfigValidationError(`${subsetPath}.profileId`, "must match [a-z][a-z0-9_]{0,63}");
+    }
+    if (profileIds !== undefined && !profileIds.has(profileId)) {
+      throw new AgentConfigValidationError(`${subsetPath}.profileId`, "must name an authored profile");
+    }
+    if (profileIdsSeen.has(profileId)) {
+      throw new AgentConfigValidationError(`${subsetPath}.profileId`, "duplicate child instruction subset profile id");
+    }
+    profileIdsSeen.add(profileId);
+    const instructionRefs = parseLoomInstructionRefs(subset.instructionRefs, `${subsetPath}.instructionRefs`);
+    aggregateRefs += instructionRefs.length;
+    if (aggregateRefs > AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS) {
+      throw new AgentConfigValidationError(
+        `${subsetPath}.instructionRefs`,
+        `child instruction subset references must contain at most ${AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS} aggregate entries`,
+      );
+    }
+    for (const [refIndex, ref] of instructionRefs.entries()) {
+      if (!rootSources.has(loomInstructionSourceKey(ref))) {
+        throw new AgentConfigValidationError(
+          `${subsetPath}.instructionRefs[${refIndex}]`,
+          "must exactly match a source in the phase instructionRefs",
+        );
+      }
+    }
+    subsets.push({ profileId, instructionRefs });
+  }
+  return subsets;
+}
+
 
 function parsePhasePredicate(value: unknown, path: string): CognitionPredicateV1 {
   try {
@@ -943,7 +1125,7 @@ function parsePhaseCapabilities(value: unknown, path: string): AgentRuntimePhase
   return capabilities;
 }
 
-function parseCustomPhases(value: unknown, path: string): AgentCustomPhaseV1[] {
+function parseCustomPhases(value: unknown, path: string, profileIds?: ReadonlySet<string>): AgentCustomPhaseV1[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     throw new AgentConfigValidationError(path, "must be an array");
   }
@@ -957,9 +1139,9 @@ function parseCustomPhases(value: unknown, path: string): AgentCustomPhaseV1[] {
     const phase = ownDataEntries(value[index], phasePath);
     exactKeys(
       phase,
-      ["version", "id", "label", "instructionRefs", "required", "enter", "exit", "skip", "capabilityRequests", "repeatLimit", "nextPhaseIds"],
+      ["version", "id", "label", "instructionRefs", "childInstructionSubsets", "required", "enter", "exit", "skip", "capabilityRequests", "repeatLimit", "nextPhaseIds"],
       phasePath,
-      ["skip"],
+      ["skip", "childInstructionSubsets"],
     );
     if (phase.version !== AGENT_RUNTIME_POLICY_VERSION) {
       throw new AgentConfigValidationError(`${phasePath}.version`, "must be version 1");
@@ -969,11 +1151,18 @@ function parseCustomPhases(value: unknown, path: string): AgentCustomPhaseV1[] {
       throw new AgentConfigValidationError(`${phasePath}.id`, "must be a unique lowercase phase id");
     }
     phaseIds.add(id);
+    const instructionRefs = parseLoomInstructionRefs(phase.instructionRefs, `${phasePath}.instructionRefs`);
     const parsed: AgentCustomPhaseV1 = {
       version: AGENT_RUNTIME_POLICY_VERSION,
       id,
       label: requireString(phase.label, `${phasePath}.label`, AGENT_SLOT_LABEL_MAX_LENGTH),
-      instructionRefs: parseLoomInstructionRefs(phase.instructionRefs, `${phasePath}.instructionRefs`),
+      instructionRefs,
+      childInstructionSubsets: parseChildInstructionSubsets(
+        Object.hasOwn(phase, "childInstructionSubsets") ? phase.childInstructionSubsets : [],
+        `${phasePath}.childInstructionSubsets`,
+        instructionRefs,
+        profileIds,
+      ),
       required: requireBoolean(phase.required, `${phasePath}.required`),
       enter: parsePhasePredicate(phase.enter, `${phasePath}.enter`),
       exit: parsePhasePredicate(phase.exit, `${phasePath}.exit`),
@@ -1017,74 +1206,13 @@ function parseLegacyCognitionPolicy(value: unknown, path: string): LegacyAgentCo
   };
 }
 
-/** Translate a stored plain-reference policy once at the V2 ingress boundary. */
-function canonicalizeLegacyCognitionPolicy(policy: LegacyAgentCognitionPolicyV1): AgentLoomPolicyV1 {
-  const entries = (bucket: keyof LegacyAgentCognitionPolicyV1): LoomPolicyBucketsV1[typeof bucket] => policy[bucket].map((ref, index) => ({
-    version: LOOM_POLICY_VERSION,
-    id: `legacy-${bucket}-${ref.blockId}`,
-    source: {
-      kind: "loom_block",
-      blockId: ref.blockId,
-      presetRevision: ref.expectedPresetRevision,
-      blockRevision: ref.expectedBlockRevision,
-      promptOrder: index,
-    },
-    destination: LOOM_BUCKET_DESTINATION[bucket],
-    checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
-    required: true,
-    visibility: "work_only",
-    delivery: { delivery: "direct" },
-  }));
-  return {
-    version: LOOM_POLICY_VERSION,
-    workPolicy: entries("workPolicy"),
-    workspaceUsage: entries("workspaceUsage"),
-    completionCriteria: entries("completionCriteria"),
-    renderPolicy: entries("renderPolicy"),
-  };
-}
-
-function canonicalizeLegacyPhasePolicy(policy: LegacyAgentPhasePolicyV1): AgentLoomPolicyV1 {
-  const entries = (bucket: "workPolicy" | "renderPolicy", refs: readonly AgentPromptBlockRefV1[]): readonly LoomPolicyBucketsV1[typeof bucket][number][] => refs.map((ref, index) => ({
-    version: LOOM_POLICY_VERSION,
-    id: `legacy-phase-${bucket}-${ref.blockId}`,
-    source: {
-      kind: "loom_block",
-      blockId: ref.blockId,
-      presetRevision: ref.expectedPresetRevision,
-      blockRevision: ref.expectedBlockRevision,
-      promptOrder: index,
-    },
-    destination: LOOM_BUCKET_DESTINATION[bucket],
-    checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
-    required: true,
-    visibility: "work_only",
-    delivery: { delivery: "direct" },
-  }));
-  return {
-    version: LOOM_POLICY_VERSION,
-    workPolicy: entries("workPolicy", policy.work),
-    workspaceUsage: [],
-    completionCriteria: [],
-    renderPolicy: entries("renderPolicy", policy.render),
-  };
-}
-
-function mergeCanonicalLoomPolicies(left: AgentLoomPolicyV1, right: AgentLoomPolicyV1): AgentLoomPolicyV1 {
-  const buckets = {
-    workPolicy: [...left.workPolicy, ...right.workPolicy],
-    workspaceUsage: [...left.workspaceUsage, ...right.workspaceUsage],
-    completionCriteria: [...left.completionCriteria, ...right.completionCriteria],
-    renderPolicy: [...left.renderPolicy, ...right.renderPolicy],
-  };
-  const ids = new Set<string>();
-  for (const bucket of AGENT_LOOM_POLICY_BUCKETS) {
-    for (const entry of buckets[bucket]) {
-      if (ids.has(entry.id)) throw new AgentConfigValidationError("agentConfig.runtimePolicy.loomPolicy", "duplicate canonical policy entry id");
-      ids.add(entry.id);
-    }
+function parseCanonicalLoomPolicy(value: unknown, path: string): AgentLoomPolicyV1 {
+  try {
+    return parseLoomPolicyBuckets(value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid Loom policy";
+    throw new AgentConfigValidationError(path, message);
   }
-  return { version: LOOM_POLICY_VERSION, ...buckets };
 }
 
 function parseCanonicalLoomPolicy(value: unknown, path: string): AgentLoomPolicyV1 {
@@ -1096,7 +1224,7 @@ function parseCanonicalLoomPolicy(value: unknown, path: string): AgentLoomPolicy
   }
 }
 
-function parseRuntimePolicy(value: unknown, path: string): AgentRuntimePolicyV1 {
+function parseRuntimePolicy(value: unknown, path: string, profileIds?: ReadonlySet<string>): AgentRuntimePolicyV1 {
   const policy = ownDataEntries(value, path);
   exactKeys(policy, ["version", "authority", "scope", "defaultMode", "loomPolicy", "phases"], path, ["phases"]);
   if (policy.version !== AGENT_RUNTIME_POLICY_VERSION) {
@@ -1111,15 +1239,30 @@ function parseRuntimePolicy(value: unknown, path: string): AgentRuntimePolicyV1 
   if (policy.defaultMode !== "response" && policy.defaultMode !== "agentic") {
     throw new AgentConfigValidationError(`${path}.defaultMode`, "must be response or agentic");
   }
+  const loomPolicy = policy.loomPolicy === null
+    ? null
+    : parseCanonicalLoomPolicy(policy.loomPolicy, `${path}.loomPolicy`);
+  const phases = Object.hasOwn(policy, "phases") ? parseCustomPhases(policy.phases, `${path}.phases`, profileIds) : [];
+  const sourceBlockIds = new Set<string>();
+  for (const bucket of AGENT_LOOM_POLICY_BUCKETS) {
+    for (const entry of loomPolicy?.[bucket] ?? []) sourceBlockIds.add(entry.source.blockId);
+  }
+  for (const phase of phases) {
+    for (const source of phase.instructionRefs) sourceBlockIds.add(source.blockId);
+  }
+  if (sourceBlockIds.size > COGNITION_MAX_SOURCE_BLOCKS) {
+    throw new AgentConfigValidationError(
+      path,
+      `source block references must contain at most ${COGNITION_MAX_SOURCE_BLOCKS} distinct block IDs`,
+    );
+  }
   return {
     version: AGENT_RUNTIME_POLICY_VERSION,
     authority: "loom",
     scope: "preset",
     defaultMode: policy.defaultMode,
-    loomPolicy: policy.loomPolicy === null
-      ? null
-      : parseCanonicalLoomPolicy(policy.loomPolicy, `${path}.loomPolicy`),
-    phases: Object.hasOwn(policy, "phases") ? parseCustomPhases(policy.phases, `${path}.phases`) : [],
+    loomPolicy,
+    phases,
   };
 }
 export function parseAgentRuntimePolicyV1(raw: unknown): AgentRuntimePolicyV1 {
@@ -1127,10 +1270,6 @@ export function parseAgentRuntimePolicyV1(raw: unknown): AgentRuntimePolicyV1 {
 }
 
 
-function parseContextPolicy(value: unknown, path: string): AgentContextPolicyV1 {
-  const policy = ownDataEntries(value, path); exactKeys(policy, ["ruleIds", "packIds"], path);
-  return { ruleIds: requireIdList(policy.ruleIds, `${path}.ruleIds`), packIds: requireContextPackIdList(policy.packIds, `${path}.packIds`) };
-}
 
 function parseTaskPolicy(value: unknown, path: string): AgentTaskPolicyV1 {
   const policy = ownDataEntries(value, path); exactKeys(policy, ["templateIds"], path);
@@ -1171,7 +1310,6 @@ function parseAgentProfileV2(value: unknown, path: string): AgentProfileConfigV2
     true,
   );
   const loreScope = requireScope(profile.loreScope, `${path}.loreScope`);
-  requireLoreScopeCombination(loreScope, toolIds, `${path}.loreScope`);
   if (profile.failurePolicy !== "required" && profile.failurePolicy !== "optional") throw new AgentConfigValidationError(`${path}.failurePolicy`, "must be required or optional");
   return {
     id, name, systemPrompt,
@@ -1186,7 +1324,7 @@ function parseAgentProfileV2(value: unknown, path: string): AgentProfileConfigV2
 }
 
 function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfigV2 {
-  exactKeys(config, ["version", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], path, ["phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
+  exactKeys(config, ["version", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], path, ["phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
   const agentsEnabled = requireBoolean(config.agentsEnabled, `${path}.agentsEnabled`);
   const allowedModes = requireModeList(config.allowedModes, `${path}.allowedModes`);
   if (config.defaultMode !== "response" && config.defaultMode !== "agentic") throw new AgentConfigValidationError(`${path}.defaultMode`, "must be response or agentic");
@@ -1221,7 +1359,6 @@ function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfi
     maxToolCalls: Object.hasOwn(config, "maxToolCalls") ? requireAgentLimit(config.maxToolCalls, `${path}.maxToolCalls`, AGENT_TOOL_CALL_MIN) : AGENT_TOOL_CALL_DEFAULT,
     mainToolIds, mainLoreScope, profiles, connectionSlots,
   };
-  if (Object.hasOwn(config, "contextPolicy")) parsed.contextPolicy = parseContextPolicy(config.contextPolicy, `${path}.contextPolicy`);
   if (Object.hasOwn(config, "taskPolicy")) parsed.taskPolicy = parseTaskPolicy(config.taskPolicy, `${path}.taskPolicy`);
   if (Object.hasOwn(config, "workspacePolicy")) parsed.workspacePolicy = parseWorkspacePolicy(config.workspacePolicy, `${path}.workspacePolicy`);
   const hasLegacyPhase = Object.hasOwn(config, "phasePolicy");
@@ -1235,27 +1372,12 @@ function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfi
   if (Object.hasOwn(config, "runtimePolicy")) {
     if (hasLegacyCognition) throw new AgentConfigValidationError(`${path}.cognitionPolicy`, "legacy cognitionPolicy cannot accompany runtimePolicy");
     if (hasLegacyPhase) throw new AgentConfigValidationError(`${path}.phasePolicy`, "legacy phasePolicy cannot accompany runtimePolicy");
-    parsed.runtimePolicy = parseRuntimePolicy(config.runtimePolicy, `${path}.runtimePolicy`);
+    parsed.runtimePolicy = parseRuntimePolicy(config.runtimePolicy, `${path}.runtimePolicy`, profileIds);
   } else if (legacyCognition !== undefined || legacyPhase !== undefined) {
-    const cognitionPolicy = legacyCognition === undefined
-      ? {
-        version: LOOM_POLICY_VERSION,
-        workPolicy: [],
-        workspaceUsage: [],
-        completionCriteria: [],
-        renderPolicy: [],
-      } satisfies AgentLoomPolicyV1
-      : canonicalizeLegacyCognitionPolicy(legacyCognition);
-    parsed.runtimePolicy = {
-      version: AGENT_RUNTIME_POLICY_VERSION,
-      authority: "loom",
-      scope: "preset",
-      defaultMode: config.defaultMode,
-      loomPolicy: legacyPhase === undefined
-        ? cognitionPolicy
-        : mergeCanonicalLoomPolicies(cognitionPolicy, canonicalizeLegacyPhasePolicy(legacyPhase)),
-      phases: [],
-    };
+    throw new AgentConfigValidationError(
+      hasLegacyPhase ? `${path}.phasePolicy` : `${path}.cognitionPolicy`,
+      "legacy Loom policy requires explicit repair with current Loom source order",
+    );
   }
   return parsed;
 }
@@ -1271,12 +1393,22 @@ export function createDisabledAgentConfigV2(): AgentConfigV2 {
 
 export function parsePortableAgentConfigV1(raw: unknown): PortableAgentConfigV1 {
   const portable = ownDataEntries(raw, "portableAgentConfig");
-  exactKeys(portable, ["portableVersion", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], "portableAgentConfig", ["phasePolicy", "cognitionPolicy", "contextPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
+  exactKeys(portable, ["portableVersion", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], "portableAgentConfig", ["phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
   if (portable.portableVersion !== PORTABLE_AGENT_CONFIG_VERSION) throw new AgentConfigValidationError("portableAgentConfig.portableVersion", "must be version 1");
-  const { portableVersion: _portableVersion, ...authoredFields } = portable;
+  const hasLegacyCognition = Object.hasOwn(portable, "cognitionPolicy");
+  if (hasLegacyCognition && Object.hasOwn(portable, "runtimePolicy")) {
+    throw new AgentConfigValidationError("portableAgentConfig.cognitionPolicy", "legacy cognitionPolicy cannot accompany runtimePolicy");
+  }
+  const legacyCognition = hasLegacyCognition
+    ? validatePortableLegacyCognitionPolicy(portable.cognitionPolicy)
+    : undefined;
+  const { portableVersion: _portableVersion, cognitionPolicy: _legacyCognition, ...authoredFields } = portable;
   const v2 = parseAgentConfigV2Object({ ...authoredFields, version: AGENT_CONFIG_V2_VERSION }, "portableAgentConfig");
+  if (hasLegacyCognition && v2.runtimePolicy !== undefined) {
+    throw new AgentConfigValidationError("portableAgentConfig.cognitionPolicy", "legacy cognitionPolicy cannot accompany runtimePolicy");
+  }
   const { version: _version, ...authored } = v2;
-  return { portableVersion: PORTABLE_AGENT_CONFIG_VERSION, ...authored };
+  return { portableVersion: PORTABLE_AGENT_CONFIG_VERSION, ...authored, ...(hasLegacyCognition ? { cognitionPolicy: legacyCognition } : {}) };
 }
 
 export function toPortableAgentConfigV1(config: AgentConfigV2): PortableAgentConfigV1 {

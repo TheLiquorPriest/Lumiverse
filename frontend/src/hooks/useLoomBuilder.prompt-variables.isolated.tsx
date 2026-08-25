@@ -48,6 +48,7 @@ const persistedPreset: Preset = {
   id: presetId,
   name: 'Prompt variable regression',
   provider: 'loom',
+  engine: 'classic',
   parameters: {},
   prompt_order: [chatBlock],
   prompts: {},
@@ -65,16 +66,123 @@ const registryItem: PresetRegistryItem = {
   block_count: 1,
   updated_at: 1,
 }
+const sealedDescriptor = {
+  hubPresetId: 'hub-preset',
+  hubPresetVersion: '7',
+  blocks: [{ key: 'private-system', sha256: 'a'.repeat(64) }],
+}
+const descriptorOnlyImportPayload = {
+  name: 'Descriptor-only sealed import',
+  engine: 'classic',
+  blocks: [{
+    ...chatBlock,
+    id: 'private-system',
+    name: 'Private system',
+    content: '{{presetBlock::private-system}}',
+    variables: [],
+    sealed: true,
+    sealedSource: 'lumihub' as const,
+    sealedKey: 'private-system',
+  }],
+  portableSealedPreset: sealedDescriptor,
+}
+const importedSealedPreset: Preset = {
+  ...structuredClone(persistedPreset),
+  id: 'imported-sealed',
+  name: descriptorOnlyImportPayload.name,
+  prompt_order: descriptorOnlyImportPayload.blocks,
+  metadata: { portableSealedPreset: sealedDescriptor },
+  cache_revision: 0,
+}
+const legacyGraphImportPayload = {
+  name: 'Legacy graph import',
+  engine: 'classic',
+  blocks: [{ ...chatBlock, variables: [] }],
+  agentConfig: { profiles: [] },
+  agentTaskTemplates: [{ id: 'legacy-task', required: true, label: 'Legacy task' }],
+}
+const plainImportPayload = {
+  name: 'Plain import',
+  engine: 'classic',
+  blocks: [{ ...chatBlock, variables: [] }],
+}
+const sealedBlockWithoutDescriptorImportPayload = {
+  ...plainImportPayload,
+  blocks: [{
+    ...plainImportPayload.blocks[0],
+    id: 'private-system',
+    name: 'Private system',
+    content: 'secret sealed text',
+    sealed: true,
+    sealedKey: 'private-system',
+  }],
+}
+const lumihubBlockWithMalformedDescriptorImportPayload = {
+  ...plainImportPayload,
+  blocks: [{
+    ...plainImportPayload.blocks[0],
+    id: 'private-system',
+    name: 'Private system',
+    content: 'secret sealed text',
+    sealedSource: 'lumihub' as const,
+    sealedKey: 'private-system',
+  }],
+  portableSealedPreset: {
+    ...sealedDescriptor,
+    blocks: [{ key: 'private-system', sha256: 'not-a-digest' }],
+  },
+}
+const descriptorWithStrippedSealedFlagsImportPayload = {
+  ...plainImportPayload,
+  blocks: [{
+    ...plainImportPayload.blocks[0],
+    id: 'private-system',
+    name: 'Private system',
+    content: 'plaintext that must not escape',
+    sealedKey: 'private-system',
+  }],
+  portableSealedPreset: sealedDescriptor,
+}
+const descriptorWithExtraKeyImportPayload = {
+  ...descriptorOnlyImportPayload,
+  portableSealedPreset: {
+    ...sealedDescriptor,
+    blocks: [
+      ...sealedDescriptor.blocks,
+      { key: 'extra-key', sha256: 'b'.repeat(64) },
+    ],
+  },
+}
+const descriptorWithDifferentKeyImportPayload = {
+  ...descriptorOnlyImportPayload,
+  portableSealedPreset: {
+    ...sealedDescriptor,
+    blocks: [{ key: 'different-key', sha256: 'a'.repeat(64) }],
+  },
+}
+
+const validPortableRegex = [{ name: 'Portable regex', find_regex: 'x', replace_string: 'y' }]
+const dualRegexImportPayload = {
+  ...plainImportPayload,
+  extensions: { regex_scripts: validPortableRegex },
+  regex_scripts: validPortableRegex,
+}
+const malformedRegexImportPayload = {
+  ...plainImportPayload,
+  extensions: { regex_scripts: 'not-an-array' },
+}
+
 
 const events: string[] = []
 const duplicateCalls: Array<{ id: string; name?: string }> = []
 const updateCalls: Array<{ id: string; input: UpdatePresetInput }> = []
+const createCalls: unknown[] = []
+const portableImportCalls: unknown[] = []
 let resolvePersist: (() => void) | null = null
 let pendingPersist: Promise<void> | null = null
 let holdRegistryRefresh = false
 let resolveRegistryRefresh: (() => void) | null = null
 let pendingRegistryRefresh: Promise<void> | null = null
-
 const storeState = {
   activeLoomPresetId: presetId,
   loomRegistry: { [presetId]: { name: persistedPreset.name, blockCount: 1, updatedAt: 1, isDefault: false } },
@@ -105,6 +213,7 @@ const presetsApiMock = {
       ...structuredClone(persistedPreset),
       ...input,
       id,
+      engine: input.engine ?? persistedPreset.engine,
       parameters: input.parameters ?? persistedPreset.parameters,
       prompt_order: input.prompt_order ?? persistedPreset.prompt_order,
       prompts: input.prompts ?? persistedPreset.prompts,
@@ -112,6 +221,17 @@ const presetsApiMock = {
       updated_at: 2,
       cache_revision: 2,
     }
+  },
+  create: async (input: unknown): Promise<Preset> => {
+    createCalls.push(structuredClone(input))
+    throw new Error('ordinary preset create must not be called for sealed imports')
+  },
+  importPortable: async (input: unknown): Promise<{ preset: Preset }> => {
+    portableImportCalls.push(structuredClone(input))
+    return { preset: structuredClone(importedSealedPreset) }
+  },
+  importPortableAgentConfig: async (): Promise<{ preset: Preset }> => {
+    throw new Error('legacy portable config import is not expected for this fixture')
   },
   duplicate: async (id: string, name?: string): Promise<PresetDuplicateResult> => {
     duplicateCalls.push({ id, name })
@@ -196,6 +316,7 @@ interface LoomBuilderTestSurface {
       patch: Partial<Pick<PromptBlock, 'sealed' | 'sealedKey' | 'sealedSource' | 'sealedOriginPresetId' | 'sealedOriginVersion' | 'sealedSha256'>>
     },
   ): Promise<void>
+  importFromFile(payload: unknown, fileName?: string): Promise<unknown>
 }
 
 let hookSurface: LoomBuilderTestSurface
@@ -252,6 +373,8 @@ afterEach(async () => {
   events.length = 0
   updateCalls.length = 0
   duplicateCalls.length = 0
+  createCalls.length = 0
+  portableImportCalls.length = 0
   document.body.replaceChildren()
 })
 
@@ -315,6 +438,104 @@ describe('useLoomBuilder prompt-variable structure persistence', () => {
       host.remove()
     }
   })
+  test('routes descriptor-only sealed Loom imports through transactional portable import', async () => {
+    const { host, root } = await renderHook()
+    try {
+      let imported!: unknown
+      await act(async () => {
+        imported = await hookSurface.importFromFile(descriptorOnlyImportPayload, 'sealed.json')
+      })
+
+      expect(imported).toMatchObject({ id: 'imported-sealed' })
+      expect(createCalls).toHaveLength(0)
+      expect(portableImportCalls).toHaveLength(1)
+      expect(portableImportCalls[0]).toMatchObject({
+        preset: {
+          prompt_order: [{ content: '{{presetBlock::private-system}}', sealed: true, sealedSource: 'lumihub' }],
+          metadata: { portableSealedPreset: sealedDescriptor },
+        },
+        agentRuntime: {
+          version: 1,
+          agentConfig: null,
+          taskTemplates: [],
+        },
+      })
+    } finally {
+      unmountRoot(root)
+      host.remove()
+    }
+  })
+  test('rejects sealed descriptor mismatches before any persistence', async () => {
+    const { host, root } = await renderHook()
+    try {
+      for (const payload of [
+        sealedBlockWithoutDescriptorImportPayload,
+        lumihubBlockWithMalformedDescriptorImportPayload,
+        descriptorWithStrippedSealedFlagsImportPayload,
+        descriptorWithExtraKeyImportPayload,
+        descriptorWithDifferentKeyImportPayload,
+      ]) {
+        let failure: unknown
+        await act(async () => {
+          try {
+            await hookSurface.importFromFile(payload, 'sealed-invalid.json')
+          } catch (error) {
+            failure = error
+          }
+        })
+        expect(failure).toMatchObject({ code: 'LUMIHUB_SEALED_DESCRIPTOR_INCOMPLETE' })
+      }
+      expect(createCalls).toHaveLength(0)
+      expect(portableImportCalls).toHaveLength(0)
+    } finally {
+      unmountRoot(root)
+      host.remove()
+    }
+  })
+
+  test('rejects legacy task graphs before partial agent-config import or persistence', async () => {
+    const { host, root } = await renderHook()
+    try {
+      let failure: unknown
+      await act(async () => {
+        try {
+          await hookSurface.importFromFile(legacyGraphImportPayload, 'legacy-graph.json')
+        } catch (error) {
+          failure = error
+        }
+      })
+      expect(failure).toMatchObject({ code: 'AGENT_RUNTIME_PORTABLE_INVALID' })
+      expect(createCalls).toHaveLength(0)
+      expect(portableImportCalls).toHaveLength(0)
+    } finally {
+      unmountRoot(root)
+      host.remove()
+    }
+  })
+
+  test('rejects ambiguous or malformed regex sources before any persistence', async () => {
+    const { host, root } = await renderHook()
+    try {
+      for (const payload of [dualRegexImportPayload, malformedRegexImportPayload]) {
+        let failure: unknown
+        await act(async () => {
+          try {
+            await hookSurface.importFromFile(payload, 'regex.json')
+          } catch (error) {
+            failure = error
+          }
+        })
+        expect(failure).toMatchObject({ code: 'AGENT_RUNTIME_PORTABLE_REGEX_INVALID' })
+      }
+      expect(createCalls).toHaveLength(0)
+      expect(portableImportCalls).toHaveLength(0)
+    } finally {
+      unmountRoot(root)
+      host.remove()
+    }
+  })
+
+
 
   test('repairs a legacy duplicate-name schema atomically and rejects a newly duplicate proposal', async () => {
     const { host, root } = await renderHook()
@@ -556,10 +777,6 @@ describe('useLoomBuilder prompt-variable structure persistence', () => {
         variables: [firstVariable],
         sealed: true,
         sealedKey: 'first-key',
-        sealedSource: 'lumihub',
-        sealedOriginPresetId: 'first-origin',
-        sealedOriginVersion: 'v1',
-        sealedSha256: 'first-sha',
       },
       {
         ...chatBlock,
@@ -568,10 +785,6 @@ describe('useLoomBuilder prompt-variable structure persistence', () => {
         variables: [firstVariable],
         sealed: true,
         sealedKey: 'unique-key',
-        sealedSource: 'lumihub',
-        sealedOriginPresetId: 'unique-origin',
-        sealedOriginVersion: 'v1',
-        sealedSha256: 'unique-sha',
       },
       {
         ...chatBlock,
@@ -580,10 +793,6 @@ describe('useLoomBuilder prompt-variable structure persistence', () => {
         variables: [firstVariable],
         sealed: true,
         sealedKey: 'second-key',
-        sealedSource: 'lumihub',
-        sealedOriginPresetId: 'second-origin',
-        sealedOriginVersion: 'v2',
-        sealedSha256: 'second-sha',
       },
     ]
     persistedPreset.metadata = {

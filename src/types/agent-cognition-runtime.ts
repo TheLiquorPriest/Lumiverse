@@ -7,11 +7,9 @@ import type {
   CognitionLoomBlockRefV1,
   CognitionPhase,
   CognitionTaskTransition,
-  ContextActivationRuleV1,
   FrozenCognitionGraphV1,
   LoomPolicyBucketsV1,
   LoomPromptInspectionBlockV1,
-  LoomPromptInspectionContextPackV1,
   LoomPromptInspectionV1,
   LoomResponsePolicyOmissionV1,
   TaskTemplateV1,
@@ -27,66 +25,28 @@ export const COGNITION_RUNTIME_PHASES = [
   "COMMITTED",
 ] as const;
 export type CognitionRuntimePhaseV1 = (typeof COGNITION_RUNTIME_PHASES)[number];
+
 /** The authored cognition ID and its turn-scoped workspace identity are distinct. */
 export interface CognitionTaskIdentityV1 {
   readonly authoredTaskId: string;
   readonly operationalTaskId: string;
 }
 
-
-/** Authenticated direct context selection from preset_agent_configs.config_json. */
-export interface CognitionContextPackSelectionV1 {
-  readonly packId: string;
-  readonly revisionId: string;
-  readonly digest: string;
-  readonly required: boolean;
-}
-
-/** Frozen candidate identity supplied by the authenticated context snapshot. */
-export interface CognitionContextPackCandidateV1 {
-  readonly packId: string;
-  readonly revisionId: string;
-  readonly digest: string;
-  /** Frozen attachment origin; account candidates remain inactive until selected/rule-activated. */
-  readonly source?: "account" | "preset" | "chat" | "world_book";
-  /** Attachment requiredness is independent of context-rule requiredness. */
-  readonly required?: boolean;
-}
-
-/** One exact pack/revision requirement emitted by cognition activation. */
-export interface CognitionContextPackRequirementV1 {
-  readonly ruleId: string | null;
-  readonly source: "attachment" | "rule" | "direct";
-  readonly packId: string;
-  readonly revisionId: string;
-  readonly digest: string | null;
-  readonly required: boolean;
-}
-
-/** Immutable source input for one turn; callers must obtain it from authenticated config/snapshot state. */
+/** Immutable source input for one turn. */
 export interface AgentCognitionRuntimeSourceV1 {
   /** Frozen graph may be supplied directly by a strict loader or derived from config below. */
   readonly graph?: unknown;
   readonly source: unknown;
   readonly config?: Readonly<Record<string, unknown>>;
-  readonly contextPackSelections?: readonly unknown[];
-  readonly contextPackCandidates?: readonly unknown[];
-  /**
-   * Omitted context rules mean all authored graph roots; an explicit empty
-   * array is the closed "select none" set used by the coordinator.
-   */
-  readonly contextRules?: readonly unknown[];
   readonly taskTemplates?: readonly unknown[];
   /** Exact AgentConfigV2 task-policy roots selected for this turn. */
   readonly taskTemplateIds?: readonly unknown[];
   /** Canonical, host-authenticated Loom policy and its sealed inspection inputs. */
   readonly loomPolicy?: LoomPolicyBucketsV1;
   readonly loomBlocks?: readonly LoomPromptInspectionBlockV1[];
-  readonly loomContextPacks?: readonly LoomPromptInspectionContextPackV1[];
   /** Host-authenticated, opaque Cortex sidecar input sealed for this turn. */
   readonly cortexSidecarSnapshot?: unknown;
 }
-
 
 /** Base predicate input frozen before the first provider/isolate dispatch. */
 export type AgentCognitionRuntimeEvaluationV1 = CognitionEvaluationContextV1;
@@ -94,7 +54,7 @@ export interface CreateAgentCognitionRuntimeInputV1 {
   readonly source: AgentCognitionRuntimeSourceV1;
   readonly evaluation: AgentCognitionRuntimeEvaluationV1;
   readonly workspaceRevision: number;
-  /** Authenticated host/root workspace context; initial ASSEMBLE activation always commits through its CAS. */
+  /** Authenticated host/root workspace context; initial ASSEMBLE activation commits through its CAS. */
   readonly workspace: Record<string, unknown>;
 }
 
@@ -113,8 +73,6 @@ export interface CognitionRuntimeActivationV1 {
   readonly phase: CognitionPhase;
   readonly state: CognitionActivationStateV1;
   readonly activation: CognitionActivationResultV1;
-  readonly newlyActivatedContextPackRequirements: readonly CognitionContextPackRequirementV1[];
-  readonly contextPackRequirements: readonly CognitionContextPackRequirementV1[];
   readonly promptBlocks: CognitionPromptBlockSelectionV1;
   readonly policySurface?: CognitionRuntimePolicySurfaceV1;
   readonly sourceRevisions: CognitionFrozenSourceRevisionsV1;
@@ -123,10 +81,8 @@ export interface CognitionRuntimeActivationV1 {
 }
 
 export interface CognitionCompletionBlockerV1 {
-  readonly kind: "task" | "context";
+  readonly kind: "task";
   readonly id: string;
-  readonly packId?: string;
-  readonly revisionId?: string;
 }
 export interface CognitionRuntimePreparedAcceptanceV1 {
   /** Complete candidate acknowledged inside the workspace acceptance transaction. */
@@ -142,10 +98,7 @@ export interface CognitionRuntimeCompletionV1 extends CognitionRuntimeActivation
   readonly materializedTaskIds: readonly string[];
   /** Private host evidence for every successful-path pre-commit phase. */
   readonly preCommitActivations: readonly CognitionRuntimeActivationV1[];
-  /**
-   * The exact bundle acknowledged by the workspace CAS. It is returned only
-   * through the in-process runtime bridge and is never persisted.
-   */
+  /** Exact private handoff acknowledged by the workspace CAS. */
   readonly preparedAcceptance?: CognitionRuntimePreparedAcceptanceV1;
 }
 
@@ -163,7 +116,6 @@ export interface CognitionWorkspaceCompletionUpdateV1 {
   readonly activation: CognitionActivationResultV1;
   readonly accepted: boolean;
   readonly blockingRequiredTaskIds: readonly string[];
-  readonly blockingContextRequirements: readonly CognitionContextPackRequirementV1[];
   readonly materializeTemplates: readonly TaskTemplateV1[];
 }
 export interface CognitionWorkspaceActivationFactoryV1 {
@@ -189,7 +141,6 @@ export interface CognitionWorkspaceCompletionResultV1 {
   readonly activation: CognitionActivationResultV1;
   readonly accepted: boolean;
   readonly blockingRequiredTaskIds: readonly string[];
-  readonly blockingContextRequirements: readonly CognitionContextPackRequirementV1[];
   readonly materializedTaskIds: readonly string[];
   /** Exact private bundle acknowledged before the workspace CAS updateRow. */
   readonly preparedAcceptance?: {
@@ -240,8 +191,14 @@ export interface CognitionRuntimeTaskTransitionInputV1 {
   /** Transport-only cancellation fence; never enters fingerprints or persisted state. */
   readonly signal?: AbortSignal;
   readonly workspace: Record<string, unknown>;
-  /** The authenticated workspace mutation kind, not model-authored text. */
-  readonly operation: "create_task" | "update_assigned_progress" | "submit_child_result" | "accept_submission";
+  /** Authenticated workspace mutation operation. */
+  readonly operation:
+    | "create_task"
+    | "update_assigned_progress"
+    | "submit_child_result"
+    | "submit_root_result"
+    | "settle_child_failure"
+    | "accept_submission";
 }
 
 export interface CognitionWorkspacePhaseResultV1 {
@@ -262,11 +219,7 @@ export interface CognitionRuntimeCompletionInputV1 {
   /** Transport-only cancellation fence; never enters fingerprints or persisted state. */
   readonly signal?: AbortSignal;
   readonly workspace: Record<string, unknown>;
-  /**
-   * Synchronously build and acknowledge all fallible handoff data inside the
-   * workspace transaction, after materialization and before the acceptance CAS.
-   * Returning a thenable is invalid: SQLite transactions must not span awaits.
-   */
+  /** Build and acknowledge fallible handoff data inside the workspace transaction. */
   readonly prepareAcceptance?: (
     result: CognitionRuntimeCompletionV1,
   ) => CognitionRuntimePreparedAcceptanceV1;
@@ -279,9 +232,6 @@ export interface CognitionRuntimeCompletionInputV1 {
 
 export type CognitionRuntimeErrorCode =
   | "invalid_source"
-  | "context_required_unavailable"
-  | "context_revision_mismatch"
-  | "context_digest_mismatch"
   | "workspace_cas_conflict"
   | "idempotency_conflict"
   | "completion_blocked";
@@ -299,12 +249,7 @@ export class AgentCognitionRuntimeError extends Error {
 }
 
 /** Narrow source projection for authenticated preset config accessors. */
-export interface AuthenticatedAgentCognitionSourceV1 extends AgentCognitionRuntimeSourceV1 {
-  readonly contextPackSelections: readonly unknown[];
-}
-
-/** Keep the authored rule shape visible to consumers without opening the AST. */
-export type FrozenCognitionContextRuleV1 = ContextActivationRuleV1;
+export type AuthenticatedAgentCognitionSourceV1 = AgentCognitionRuntimeSourceV1;
 
 /** Phase-to-policy mapping is closed and deterministic. */
 export function cognitionPolicyPhase(phase: CognitionRuntimePhaseV1): CognitionPhase {

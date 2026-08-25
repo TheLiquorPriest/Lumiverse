@@ -3,7 +3,7 @@ import { JSDOM } from 'jsdom'
 import { act } from 'react'
 import type { Root } from 'react-dom/client'
 import type { EffectiveRuntimeState } from '@/hooks/useEffectiveRuntime'
-
+import type { LoomRuntimePolicyV1 } from '@/types/effective-runtime'
 const selectCalls: string[] = []
 const overrideCalls: Array<string | null> = []
 
@@ -28,6 +28,25 @@ const readyDecision: NonNullable<EffectiveRuntimeState['decision']> = {
   defaultMode: 'response',
   requestedMode: 'response',
   effectiveMode: 'response',
+  runtimePolicy: {
+    version: 1,
+    authoredValue: 'response',
+    effectiveValue: 'response',
+    source: 'reviewed_preset_default',
+    scope: 'preset',
+    cap: { authority: 'host', allowedModes: ['response', 'agentic'], reasonCode: null },
+    availability: { state: 'available', reasonCode: null },
+    presetRevision: 1,
+    transientSelection: null,
+    durableChatOverride: null,
+    repairAcknowledgement: {
+      state: 'not_required',
+      presetRevision: 1,
+      reasonCode: null,
+      acknowledgedAt: null,
+    },
+    nextTurnOnly: true,
+  } satisfies LoomRuntimePolicyV1,
   chatOverride: null,
   capabilityReadiness: {
     ready: true,
@@ -38,6 +57,35 @@ const readyDecision: NonNullable<EffectiveRuntimeState['decision']> = {
     responseEscape: 'available',
   },
   repairCodes: [],
+}
+
+function policyFor(
+  changes: Partial<LoomRuntimePolicyV1> = {},
+): LoomRuntimePolicyV1 {
+  const base = readyDecision.runtimePolicy
+  return {
+    ...base,
+    ...changes,
+    cap: { ...base.cap, ...(changes.cap ?? {}) },
+    availability: { ...base.availability, ...(changes.availability ?? {}) },
+    repairAcknowledgement: {
+      ...base.repairAcknowledgement,
+      ...(changes.repairAcknowledgement ?? {}),
+    },
+  }
+}
+
+function decisionFor(
+  runtimePolicy: LoomRuntimePolicyV1,
+  chatOverride = readyDecision.chatOverride,
+): NonNullable<EffectiveRuntimeState['decision']> {
+  return {
+    ...readyDecision,
+    requestedMode: runtimePolicy.authoredValue,
+    effectiveMode: runtimePolicy.effectiveValue,
+    runtimePolicy,
+    chatOverride,
+  }
 }
 
 let hookState: EffectiveRuntimeState
@@ -112,13 +160,13 @@ function baseState(overrides: Partial<EffectiveRuntimeState> = {}): EffectiveRun
   }
 }
 
-async function renderControl(): Promise<{ host: HTMLDivElement; root: Root }> {
+async function renderControl(chatId = 'chat-1'): Promise<{ host: HTMLDivElement; root: Root }> {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const root = createRoot(host)
   mountedRoots.add(root)
   await act(async () => {
-    root.render(<AgentRuntimeModeControl chatId="chat-1" generationType="normal" />)
+    root.render(<AgentRuntimeModeControl chatId={chatId} generationType="normal" />)
   })
   return { host, root }
 }
@@ -258,6 +306,11 @@ describe('AgentRuntimeModeControl', () => {
 
   test('keeps next-turn selection available but locks durable chat policy while WORK is active', async () => {
     hookState = baseState({
+      decision: decisionFor(policyFor({
+        source: 'authenticated_one_turn',
+        scope: 'turn',
+        transientSelection: { mode: 'response', turnFence: 2, authenticated: true },
+      })),
       activeGenerationMode: 'agentic',
       pendingOneTurnMode: 'response',
       canResetChatOverride: true,
@@ -310,5 +363,360 @@ describe('AgentRuntimeModeControl', () => {
     await act(async () => response?.click())
     expect(refreshCalls).toEqual(['refresh'])
     expect(selectCalls).toEqual(['response'])
+  })
+
+  test('renders canonical source and scope labels without inferring preset authority', async () => {
+    const cases = [
+      {
+        source: 'reviewed_preset_default' as const,
+        scope: 'preset' as const,
+        sourceKey: 'sourceReviewedPresetDefault',
+        scopeKey: 'scopePreset',
+        authoredValue: 'response' as const,
+        effectiveValue: 'response' as const,
+      },
+      {
+        source: 'durable_chat_override' as const,
+        scope: 'chat' as const,
+        sourceKey: 'sourceDurableChatOverride',
+        scopeKey: 'scopeChat',
+        authoredValue: 'agentic' as const,
+        effectiveValue: 'agentic' as const,
+        durableChatOverride: {
+          mode: 'agentic' as const,
+          revision: 4,
+          state: 'ready' as const,
+          reviewCode: null,
+          acknowledged: true,
+        },
+      },
+      {
+        source: 'response_fallback' as const,
+        scope: 'fallback' as const,
+        sourceKey: 'sourceResponseFallback',
+        scopeKey: 'scopeFallback',
+        authoredValue: 'response' as const,
+        effectiveValue: 'response' as const,
+      },
+      {
+        source: 'host_cap' as const,
+        scope: 'host' as const,
+        sourceKey: 'sourceHostCap',
+        scopeKey: 'scopeHost',
+        authoredValue: 'agentic' as const,
+        effectiveValue: 'response' as const,
+        cap: { authority: 'host' as const, allowedModes: ['response' as const], reasonCode: 'agentic_mode_not_allowed' as const },
+        availability: { state: 'denied' as const, reasonCode: 'agentic_mode_not_allowed' as const },
+      },
+      {
+        source: 'host_rejected' as const,
+        scope: 'host' as const,
+        sourceKey: 'sourceHostRejected',
+        scopeKey: 'scopeHost',
+        authoredValue: 'agentic' as const,
+        effectiveValue: 'response' as const,
+        cap: { authority: 'host' as const, allowedModes: ['response' as const], reasonCode: 'loom_policy_unavailable' as const },
+        availability: { state: 'unavailable' as const, reasonCode: 'loom_policy_unavailable' as const },
+      },
+      {
+        source: 'authenticated_one_turn' as const,
+        scope: 'turn' as const,
+        sourceKey: 'sourceAuthenticatedOneTurn',
+        scopeKey: 'scopeTurn',
+        authoredValue: 'agentic' as const,
+        effectiveValue: 'agentic' as const,
+        transientSelection: { mode: 'agentic' as const, turnFence: 8, authenticated: true as const },
+      },
+    ]
+
+    for (const entry of cases) {
+      hookState = baseState({
+        decision: decisionFor(policyFor(entry), {
+          mode: 'agentic',
+          revision: 6,
+          state: 'ready',
+          reviewCode: null,
+          acknowledged: true,
+        }),
+      })
+      const { host } = await renderControl()
+      expect(host.textContent).toContain(`agentRuntime.provenance.${entry.sourceKey}`)
+      expect(host.textContent).toContain(`agentRuntime.provenance.${entry.scopeKey}`)
+      expect(host.textContent).not.toContain('agentRuntime.provenance.sourcePreset')
+      expect(host.textContent).not.toContain('agentRuntime.provenance.authorityPreset')
+    }
+  })
+
+  test('shows availability, cap, reason, and repair acknowledgement truth', async () => {
+    hookState = baseState({
+      decision: decisionFor(policyFor({
+        source: 'host_rejected',
+        scope: 'host',
+        authoredValue: 'agentic',
+        effectiveValue: 'response',
+        cap: {
+          authority: 'host',
+          allowedModes: ['response'],
+          reasonCode: 'loom_policy_invalid',
+        },
+        availability: {
+          state: 'invalid',
+          reasonCode: 'loom_policy_invalid',
+        },
+        repairAcknowledgement: {
+          state: 'required',
+          presetRevision: 9,
+          reasonCode: 'foreign_import',
+          acknowledgedAt: null,
+        },
+      })),
+    })
+    const { host } = await renderControl()
+    expect(host.textContent).toContain('agentRuntime.provenance.availabilityInvalid')
+    expect(host.textContent).toContain('agentRuntime.provenance.capReasonCode')
+    expect(host.textContent).toContain('agentRuntime.provenance.availabilityReasonCode')
+    expect(host.textContent).toContain('agentRuntime.provenance.repairAcknowledgementRequired')
+    expect(host.textContent).toContain('loom_policy_invalid')
+    expect(host.textContent).toContain('foreign_import')
+  })
+
+  test('keeps a pending badge only when the canonical transient policy agrees', async () => {
+    hookState = baseState({
+      pendingOneTurnMode: 'agentic',
+    })
+    const { host } = await renderControl()
+    expect(host.textContent).not.toContain('agentRuntime.nextTurnQueued')
+
+    hookState = baseState({
+      decision: decisionFor(policyFor({
+        source: 'authenticated_one_turn',
+        scope: 'turn',
+        authoredValue: 'agentic',
+        effectiveValue: 'agentic',
+        transientSelection: { mode: 'agentic', turnFence: 10, authenticated: true },
+      })),
+      pendingOneTurnMode: 'agentic',
+    })
+    const agreed = await renderControl()
+    expect(agreed.host.textContent).toContain('agentRuntime.nextTurnQueued')
+  })
+
+  test('shows a failed save and retries the exact mode without changing accepted state', async () => {
+    let attempts = 0
+    hookState = baseState({
+      async saveChatOverride(mode) {
+        overrideCalls.push(mode)
+        attempts += 1
+        if (attempts === 1) throw new Error('save failed')
+      },
+    })
+    const { host } = await renderControl()
+    const save = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChatMode'))
+    await act(async () => {
+      save?.click()
+      await Promise.resolve()
+    })
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('agentRuntime.overrideError.action')
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('agentRuntime.overrideError.retry')
+    expect(hookState.decision).toBe(readyDecision)
+    expect(hookState.mode).toBe('response')
+
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.overrideError.retry'))
+    await act(async () => {
+      retry?.click()
+      await Promise.resolve()
+    })
+    expect(overrideCalls).toEqual(['response', 'response'])
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(hookState.decision).toBe(readyDecision)
+    expect(hookState.mode).toBe('response')
+  })
+
+  test('shows a failed reset and retries the exact reset without changing accepted state', async () => {
+    let attempts = 0
+    const chatOverride = {
+      mode: 'agentic' as const,
+      revision: 4,
+      state: 'ready' as const,
+      reviewCode: null,
+      acknowledged: true,
+    }
+    hookState = baseState({
+      decision: decisionFor(policyFor({
+        source: 'durable_chat_override',
+        scope: 'chat',
+        authoredValue: 'agentic',
+        effectiveValue: 'agentic',
+        durableChatOverride: chatOverride,
+      }), chatOverride),
+      canResetChatOverride: true,
+      async resetChatOverride() {
+        attempts += 1
+        if (attempts === 1) throw new Error('reset failed')
+      },
+    })
+    const acceptedDecision = hookState.decision
+    const { host } = await renderControl()
+    const reset = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.resetToPreset'))
+    await act(async () => {
+      reset?.click()
+      await Promise.resolve()
+    })
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('agentRuntime.overrideError.action')
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('agentRuntime.overrideError.retry')
+    expect(hookState.decision).toBe(acceptedDecision)
+
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.overrideError.retry'))
+    await act(async () => {
+      retry?.click()
+      await Promise.resolve()
+    })
+    expect(attempts).toBe(2)
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(hookState.decision?.runtimePolicy.source).toBe('durable_chat_override')
+  })
+
+  test('prevents duplicate durable writes while a save is in flight', async () => {
+    let resolveWrite!: () => void
+    const pendingWrite = new Promise<void>((resolve) => {
+      resolveWrite = resolve
+    })
+    hookState = baseState({
+      async saveChatOverride(mode) {
+        overrideCalls.push(mode)
+        await pendingWrite
+      },
+    })
+    const { host } = await renderControl()
+    const save = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChat'))
+    await act(async () => {
+      save?.click()
+      await Promise.resolve()
+    })
+    expect(overrideCalls).toEqual(['response'])
+    expect(save?.disabled).toBeTrue()
+    await act(async () => {
+      resolveWrite()
+      await pendingWrite
+    })
+    expect(overrideCalls).toEqual(['response'])
+    expect(hookState.decision).toBe(readyDecision)
+  })
+  test('keeps durable retry attached when radio changes during deferred save', async () => {
+    let rejectFirst!: (error: Error) => void
+    let attempts = 0
+    const pendingSave = new Promise<void>((_, reject) => {
+      rejectFirst = reject
+    })
+    hookState = baseState({
+      async saveChatOverride(mode) {
+        overrideCalls.push(mode)
+        attempts += 1
+        if (attempts === 1) await pendingSave
+      },
+    })
+    const { host } = await renderControl()
+    const save = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChat'))
+    await act(async () => {
+      save?.click()
+      await Promise.resolve()
+    })
+    await act(async () => {
+      host.querySelector<HTMLInputElement>('input[value="agentic"]')?.click()
+      await Promise.resolve()
+    })
+    expect(overrideCalls).toEqual(['response'])
+
+    await act(async () => {
+      rejectFirst(new Error('save failed'))
+      await Promise.resolve()
+    })
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('agentRuntime.overrideError.retry')
+
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.overrideError.retry'))
+    await act(async () => {
+      retry?.click()
+      await Promise.resolve()
+    })
+    expect(overrideCalls).toEqual(['response', 'response'])
+  })
+
+  test('clears durable action state and ignores late completion after chat changes', async () => {
+    let resetCalls = 0
+    let rejectSave!: (error: Error) => void
+    const pendingSave = new Promise<void>((_, reject) => {
+      rejectSave = reject
+    })
+    hookState = baseState({
+      async saveChatOverride(mode) {
+        overrideCalls.push(mode)
+        await pendingSave
+      },
+    })
+    const { host, root } = await renderControl('chat-1')
+    const save = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChat'))
+    await act(async () => {
+      save?.click()
+      await Promise.resolve()
+    })
+
+    hookState = baseState()
+    await act(async () => {
+      root.render(<AgentRuntimeModeControl chatId="chat-2" generationType="normal" />)
+      await Promise.resolve()
+    })
+    expect(host.textContent).toBe('')
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+
+    const chatOverride = {
+      mode: 'agentic' as const,
+      revision: 4,
+      state: 'ready' as const,
+      reviewCode: null,
+      acknowledged: true,
+    }
+    const nextChatDecision = {
+      ...decisionFor(policyFor({
+        source: 'durable_chat_override',
+        scope: 'chat',
+        authoredValue: 'agentic',
+        effectiveValue: 'agentic',
+        durableChatOverride: chatOverride,
+      }), chatOverride),
+      chatId: 'chat-2',
+    }
+    hookState = baseState({
+      decision: nextChatDecision,
+      canResetChatOverride: true,
+      async resetChatOverride() {
+        resetCalls += 1
+      },
+    })
+    await act(async () => {
+      root.render(<AgentRuntimeModeControl chatId="chat-2" generationType="normal" />)
+      await Promise.resolve()
+    })
+    expect(host.textContent).toContain('agentRuntime.provenance.sourceDurableChatOverride')
+    const newChatSave = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useForChat'))
+    expect(newChatSave?.disabled).toBeFalse()
+    await act(async () => {
+      newChatSave?.click()
+      await Promise.resolve()
+    })
+    expect(overrideCalls).toEqual(['response', 'agentic'])
+    const newChatReset = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.resetToPreset'))
+    expect(newChatReset?.disabled).toBeFalse()
+    await act(async () => {
+      newChatReset?.click()
+      await Promise.resolve()
+    })
+    expect(overrideCalls).toEqual(['response', 'agentic'])
+
+    await act(async () => {
+      rejectSave(new Error('late save failed'))
+      await Promise.resolve()
+    })
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(overrideCalls).toEqual(['response', 'response'])
   })
 })

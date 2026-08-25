@@ -27,32 +27,6 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 describe("foreign authority reset", () => {
-  test("keeps context-pack content and revision identity while requiring review", () => {
-    const spec = getArchiveTableSpec("agent_context_pack_revisions");
-    expect(spec?.authorityReset).toBe("review_required");
-    const reset = __test__.authorityResetRow(
-      "agent_context_pack_revisions",
-      {
-        user_id: "foreign-user",
-        pack_id: "pack-1",
-        revision: 7,
-        content_json: '[{"text":"authored"}]',
-        content_digest: "digest-7",
-        state: "active",
-        review_acknowledged: 1,
-        review_code: null,
-      },
-      spec,
-    );
-    expect(reset).toMatchObject({
-      revision: 7,
-      content_json: '[{"text":"authored"}]',
-      content_digest: "digest-7",
-      state: "review_required",
-      review_acknowledged: 0,
-      review_code: "foreign_import",
-    });
-  });
 
   test("rebases only chat-mode authority counters and leaves the override inert", () => {
     const spec = getArchiveTableSpec("chat_agent_mode_overrides");

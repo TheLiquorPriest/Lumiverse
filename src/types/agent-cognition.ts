@@ -1,15 +1,47 @@
 /**
  * Closed, deterministic authored cognition contracts.
  *
- * Cognition is deliberately a data-only language.  The parser in
+ * Cognition is deliberately a data-only language. The parser in
  * `agent-cognition.service.ts` is the only authority for values entering a
  * runtime turn: it does not evaluate JavaScript, regular expressions, macros,
  * callbacks, clocks, randomness, or database lookups.
  */
 
+import { createHash } from "node:crypto";
+
+export const COGNITION_OPERATIONAL_TASK_ID_MAX_BYTES = 128;
+const COGNITION_OPERATIONAL_TASK_ID_ENCODER = new TextEncoder();
+const COGNITION_OPERATIONAL_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const COGNITION_HASHED_TASK_ID_PATTERN = /^cognition:[0-9a-f]{64}$/;
+
+/**
+ * Derive the bounded operational identity used by both the cognition runtime
+ * and workspace persistence. Short safe identities stay readable; every
+ * other admitted source pair receives a full-digest identity.
+ */
+export function deriveCognitionOperationalTaskId(turnId: string, authoredTaskId: string): string {
+  const scoped = `${turnId}:${authoredTaskId}`;
+  const scopedBytes = COGNITION_OPERATIONAL_TASK_ID_ENCODER.encode(scoped).byteLength;
+  if (
+    scopedBytes <= COGNITION_OPERATIONAL_TASK_ID_MAX_BYTES
+    && COGNITION_OPERATIONAL_TASK_ID_PATTERN.test(scoped)
+    && !turnId.includes(":")
+    && !authoredTaskId.includes(":")
+    && !COGNITION_HASHED_TASK_ID_PATTERN.test(scoped)
+  ) {
+    return scoped;
+  }
+  return `cognition:${createHash("sha256")
+    .update("cognition-operational-task\0", "utf8")
+    .update(turnId, "utf8")
+    .update("\0", "utf8")
+    .update(authoredTaskId, "utf8")
+    .digest("hex")}`;
+}
+
 export const AGENT_COGNITION_VERSION = 1 as const;
 
-/** Hard host ceilings.  Authored data may never raise these values. */
+/** Hard host ceilings. Authored data may never raise these values. */
 export const COGNITION_MAX_PREDICATE_DEPTH = 16;
 export const COGNITION_MAX_PREDICATE_NODES = 256;
 export const COGNITION_MAX_STRING_BYTES = 4 * 1024;
@@ -17,7 +49,6 @@ export const COGNITION_MAX_LIST_BYTES = 64 * 1024;
 export const COGNITION_MAX_LIST_ITEMS = 256;
 export const COGNITION_MAX_TASK_TEMPLATES = 256;
 export const COGNITION_MAX_TASK_TRANSITIONS = 256;
-export const COGNITION_MAX_CONTEXT_RULES = 256;
 export const COGNITION_MAX_BLOCK_REFS_PER_SECTION = 64;
 export const COGNITION_MAX_BLOCK_REFS_TOTAL = 128;
 export const COGNITION_MAX_ID_BYTES = 256;
@@ -71,7 +102,7 @@ export interface CognitionLoomBlockRefV1 {
 }
 
 /**
- * The four authored phase sections.  Arrays retain the selected references;
+ * The four authored phase sections. Arrays retain selected references;
  * `freezeCognitionGraph` orders them by the source preset's prompt_order.
  */
 export interface CognitionPolicyRefsV1 {
@@ -115,23 +146,7 @@ export interface LoomPolicySourceV1 {
   readonly promptOrder: number;
 }
 
-export interface LoomOnDemandRequestV1 {
-  readonly contextPackId: string;
-  readonly revisionId: string;
-  readonly digest: string;
-}
-
-export type LoomPolicyDeliveryV1 =
-  | { readonly delivery: "direct" }
-  | {
-      readonly delivery: "condition_gated";
-      readonly condition: CognitionPredicateV1;
-    }
-  | {
-      readonly delivery: "on_demand";
-      readonly request: LoomOnDemandRequestV1;
-    };
-
+/** A typed gate evaluated only at the entry's named Loom checkpoint. */
 export interface LoomPolicyEntryV1 {
   readonly version: typeof LOOM_POLICY_VERSION;
   readonly id: string;
@@ -140,7 +155,7 @@ export interface LoomPolicyEntryV1 {
   readonly checkpoint: LoomPolicyCheckpointV1;
   readonly required: boolean;
   readonly visibility: LoomPolicyVisibilityV1;
-  readonly delivery: LoomPolicyDeliveryV1;
+  readonly condition?: CognitionPredicateV1;
 }
 
 export interface LoomPolicyBucketsV1 {
@@ -151,31 +166,22 @@ export interface LoomPolicyBucketsV1 {
   readonly renderPolicy: readonly LoomPolicyEntryV1[];
 }
 
-export type LoomOnDemandRetrievalStatusV1 =
-  | "not_requested"
-  | "available"
-  | "unavailable"
-  | "stale"
-  | "unauthorized";
+export type LoomPolicyConditionResultV1 =
+  | "true"
+  | "false"
+  | "not_evaluated"
+  | "invalid"
+  | "not_applicable";
 
 export type LoomPromptInspectionOutcomeV1 =
-  | { readonly status: "included"; readonly effectiveIndex: number }
+  | { readonly status: "included"; readonly effectiveIndex: number; readonly reason: "selected" }
   | {
       readonly status: "skipped";
-      readonly reason:
-        | "checkpoint_not_reached"
-        | "condition_not_met"
-        | "on_demand_not_requested"
-        | "on_demand_unavailable";
+      readonly reason: "checkpoint_not_reached" | "condition_not_met" | "stale_source";
     }
   | {
       readonly status: "rejected";
-      readonly reason:
-        | "invalid_source"
-        | "stale_source"
-        | "unsupported_delivery"
-        | "unauthorized_retrieval"
-        | "required_source_unavailable";
+      readonly reason: "invalid_source" | "stale_source" | "required_source_unavailable";
     }
   | {
       readonly status: "omitted";
@@ -183,6 +189,7 @@ export type LoomPromptInspectionOutcomeV1 =
     }
   | {
       readonly status: "deduplicated";
+      readonly reason: "destination_overlap";
       readonly keptEntryId: string;
       readonly destination: LoomPolicyDestinationV1;
     };
@@ -193,9 +200,12 @@ export interface LoomPromptInspectionItemV1 {
   readonly destination: LoomPolicyDestinationV1;
   readonly checkpoint: LoomPolicyCheckpointV1;
   readonly source: LoomPolicySourceV1;
-  readonly delivery: LoomPolicyDeliveryV1;
+  readonly condition?: CognitionPredicateV1;
+  readonly conditionResult?: LoomPolicyConditionResultV1;
   readonly effectiveText: string | null;
-  readonly retrievalStatus?: LoomOnDemandRetrievalStatusV1;
+  readonly required: boolean;
+  /** The source block was removed from ordinary prompt assembly and routed only through Loom. */
+  readonly ordinaryPromptSuppressed: boolean;
   readonly outcome: LoomPromptInspectionOutcomeV1;
 }
 
@@ -211,6 +221,8 @@ export interface LoomPromptInspectionV1 {
 export interface LoomResponsePolicyPhaseInstructionV1 {
   readonly phaseId: string;
   readonly source: LoomPolicySourceV1;
+  /** Present only when this source belongs to a child-profile subset. */
+  readonly profileId?: string;
 }
 
 export interface LoomResponsePolicyOmissionV1 {
@@ -218,6 +230,8 @@ export interface LoomResponsePolicyOmissionV1 {
   readonly surface: "RESPONSE";
   readonly visibility: LoomPolicyVisibilityV1;
   readonly reason: "work_only";
+  /** Why the authored source was recovered or withheld from runtime execution. */
+  readonly reviewReason?: string;
   /** Bucket entry IDs only; phase instruction refs live in omittedPhaseInstructions. */
   readonly omittedEntryIds: readonly string[];
   /** Bucket entry sources only; phase instruction refs live in omittedPhaseInstructions. */
@@ -225,23 +239,15 @@ export interface LoomResponsePolicyOmissionV1 {
   /** Every authored custom-phase association, preserving duplicate source use by phase. */
   readonly omittedPhaseInstructions: readonly LoomResponsePolicyPhaseInstructionV1[];
 }
-
-
 export interface LoomPromptInspectionBlockV1 {
   readonly source: LoomPolicySourceV1;
   readonly content: string;
 }
-
-export interface LoomPromptInspectionContextPackV1 extends LoomOnDemandRequestV1 {
-  readonly content: string;
-}
-
 export interface LoomPromptInspectionInputV1 {
   readonly checkpoint: LoomPolicyCheckpointV1;
   readonly surface: "WORK" | "RESPONSE";
   readonly evaluation?: CognitionEvaluationContextV1;
   readonly blocks: readonly LoomPromptInspectionBlockV1[];
-  readonly contextPacks: readonly LoomPromptInspectionContextPackV1[];
 }
 
 /** Alias used by AgentConfig V2 projections. */
@@ -314,22 +320,11 @@ export interface TaskTemplateV1 {
   readonly description?: string;
 }
 
-/** A rule selecting a versioned account context pack for a turn. */
-export interface ContextActivationRuleV1 {
-  readonly id: string;
-  readonly packId: string;
-  readonly revisionId: string;
-  readonly required: boolean;
-  readonly dependencies?: readonly string[];
-  readonly activation?: CognitionPredicateV1;
-}
-
 /** Closed authored cognition graph before source revisions are resolved. */
 export interface CognitionGraphV1 {
   readonly version: typeof AGENT_COGNITION_VERSION;
   readonly policies: CognitionPolicyRefsV1;
   readonly templates: readonly TaskTemplateV1[];
-  readonly contextRules: readonly ContextActivationRuleV1[];
 }
 
 /** Read-only source used to resolve expected Loom revisions without a DB call. */
@@ -356,14 +351,12 @@ export interface CognitionFrozenSourceRevisionsV1 {
 export interface FrozenCognitionGraphV1 extends CognitionGraphV1 {
   readonly sourceRevisions: CognitionFrozenSourceRevisionsV1;
   readonly templateDependencyClosure: Readonly<Record<string, readonly string[]>>;
-  readonly contextDependencyClosure: Readonly<Record<string, readonly string[]>>;
   readonly requiredTemplateClosure: readonly string[];
-  readonly requiredContextClosure: readonly string[];
 }
-/** Exact authored roots whose predicates may be evaluated for one turn. */
+
+/** Exact authored task roots whose predicates may be evaluated for one turn. */
 export interface CognitionActivationRootsV1 {
   readonly templateIds: readonly string[];
-  readonly contextRuleIds: readonly string[];
 }
 
 /** Immutable values available to the pure predicate evaluator. */
@@ -387,18 +380,14 @@ export interface CognitionActivationStateV1 {
   readonly version: typeof AGENT_COGNITION_VERSION;
   readonly workspaceRevision: number;
   readonly activatedTemplateIds: readonly string[];
-  readonly activatedContextRuleIds: readonly string[];
   readonly requiredTemplateIds: readonly string[];
-  readonly requiredContextRuleIds: readonly string[];
 }
 
 export interface CognitionActivationResultV1 {
   readonly point: CognitionActivationPointV1;
   readonly state: CognitionActivationStateV1;
   readonly newlyActivatedTemplateIds: readonly string[];
-  readonly newlyActivatedContextRuleIds: readonly string[];
   readonly newlyRequiredTemplateIds: readonly string[];
-  readonly newlyRequiredContextRuleIds: readonly string[];
 }
 
 export interface CognitionCompletionResultV1 extends CognitionActivationResultV1 {
@@ -415,9 +404,8 @@ export interface CognitionTaskTransitionResultV1 {
 }
 
 /**
- * The only integration seam for a task transition.  The callback is supplied
- * by the workspace service and must run inside its single revision CAS; the
- * cognition evaluator itself never accepts callbacks.
+ * The only integration seam for a task transition. The callback is supplied
+ * by the workspace service and must run inside its single revision CAS.
  */
 export interface CognitionWorkspaceCasV1 {
   commit(

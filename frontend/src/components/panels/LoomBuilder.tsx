@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect, useDeferredValue, type ReactNode, Fragment } from 'react'
+import { useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect, useDeferredValue, useId, type ReactNode, Fragment } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 
@@ -70,7 +70,13 @@ import { useLoomBuilder } from '@/hooks/useLoomBuilder'
 import { presetsApi, type StashedPromptBlock } from '@/api/presets'
 import { usePresetProfiles } from '@/hooks/usePresetProfiles'
 import { getEffectivePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
-import { computeGroups, createBlock, createMarkerBlock, resolvePromptBlockPlacements } from '@/lib/loom/service'
+import {
+  computeGroups,
+  createBlock,
+  createMarkerBlock,
+  getPortablePresetErrorCode,
+  resolvePromptBlockPlacements,
+} from '@/lib/loom/service'
 import { sanitizeCharacterTagTrigger, splitCharacterTagTriggerInput } from '@/lib/loom/characterTagTrigger'
 import {
   PROMPT_TEMPLATES,
@@ -609,6 +615,7 @@ export function BlockEditor({
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
   const { injectionTriggerTypes, injectionTriggerLabel } = useLoomOptionLabels()
+  const fieldIdPrefix = useId()
   const isInstalledLumiHubSealed = trustedHostFeatures && block.sealedSource === 'lumihub'
   const [name, setName] = useState(block.name)
   const [role, setRole] = useState<PromptBlock['role']>(block.role || 'system')
@@ -737,14 +744,14 @@ export function BlockEditor({
         <div className={s.form}>
           {validationError && <div role="alert" className={s.jsonError}>{validationError}</div>}
           <div className={s.formGroup}>
-            <label className={s.label}>{t('blockEditor.name')}</label>
-            <input className={s.input} value={name} onChange={e => setName(e.target.value)} placeholder={t('blockEditor.namePlaceholder')} />
+            <label className={s.label} htmlFor={`${fieldIdPrefix}-name`}>{t('blockEditor.name')}</label>
+            <input id={`${fieldIdPrefix}-name`} className={s.input} value={name} onChange={e => setName(e.target.value)} placeholder={t('blockEditor.namePlaceholder')} />
           </div>
 
           <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
             <div className={s.formGroup} style={{ flex: 1, minWidth: '120px' }}>
-              <label className={s.label}>{t('blockEditor.role')}</label>
-              <select className={s.select} value={role} onChange={e => setRole(e.target.value as PromptBlock['role'])}>
+              <label className={s.label} htmlFor={`${fieldIdPrefix}-role`}>{t('blockEditor.role')}</label>
+              <select id={`${fieldIdPrefix}-role`} className={s.select} value={role} onChange={e => setRole(e.target.value as PromptBlock['role'])}>
                 {position !== 'post_history' && <option value="system">{t('blockEditor.roles.system')}</option>}
                 <option value="user">{t('blockEditor.roles.user')}</option>
                 <option value="assistant">{t('blockEditor.roles.assistant')}</option>
@@ -754,8 +761,8 @@ export function BlockEditor({
             </div>
             {role !== 'user_append' && role !== 'assistant_append' && (
               <div className={s.formGroup} style={{ flex: 1, minWidth: '140px' }}>
-                <label className={s.label}>{t('blockEditor.position')}</label>
-                <select className={s.select} value={position} onChange={e => handlePositionChange(e.target.value)}>
+                <label className={s.label} htmlFor={`${fieldIdPrefix}-position`}>{t('blockEditor.position')}</label>
+                <select id={`${fieldIdPrefix}-position`} className={s.select} value={position} onChange={e => handlePositionChange(e.target.value)}>
                   <option value="pre_history">{t('blockEditor.positions.pre_history')}</option>
                   <option value="post_history">{t('blockEditor.positions.post_history')}</option>
                   <option value="in_history">{t('blockEditor.positions.in_history')}</option>
@@ -764,8 +771,8 @@ export function BlockEditor({
             )}
             {(position === 'in_history' || role === 'user_append' || role === 'assistant_append') && (
               <div className={s.formGroup} style={{ width: '100px' }}>
-                <label className={s.label}>{t('blockEditor.depth')}</label>
-                <NumberStepper value={depth} min={0} onChange={(v) => setDepth(v ?? 0)} />
+                <label className={s.label} htmlFor={`${fieldIdPrefix}-depth`}>{t('blockEditor.depth')}</label>
+                <NumberStepper inputId={`${fieldIdPrefix}-depth`} value={depth} min={0} onChange={(v) => setDepth(v ?? 0)} />
               </div>
             )}
             {(role === 'user_append' || role === 'assistant_append') && (
@@ -777,7 +784,7 @@ export function BlockEditor({
 
           <div className={s.formGroup}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <label className={s.label}>{t('blockEditor.content')}</label>
+              <label className={s.label} htmlFor={`${fieldIdPrefix}-content`}>{t('blockEditor.content')}</label>
               <div style={{ display: 'flex', gap: '4px' }}>
                 <button className={clsx(s.btn, s.btnSmall)} onClick={() => { if (!showMacros) refreshMacros?.(); setShowMacros(!showMacros) }} type="button">
                   <Hash size={12} /> {showMacros ? t('blockEditor.hideMacros') : t('blockEditor.insertMacro')}
@@ -792,23 +799,23 @@ export function BlockEditor({
                 <div className={s.macroSearch}>
                   <div className={s.macroSearchInner}>
                     <Search size={12} style={{ color: 'var(--lumiverse-text-dim)', flexShrink: 0 }} />
-                    <input className={s.macroSearchInput} placeholder={t('blockEditor.searchMacros')} value={macroSearch} onChange={e => setMacroSearch(e.target.value)} />
+                    <input className={s.macroSearchInput} aria-label={t('blockEditor.searchMacros')} placeholder={t('blockEditor.searchMacros')} value={macroSearch} onChange={e => setMacroSearch(e.target.value)} />
                   </div>
                 </div>
-                {filteredMacros.map(group => (
-                  <div key={group.category} className={s.macroGroup}>
-                    <div className={s.macroGroupTitle}>{group.category}</div>
+                {filteredMacros.map((group, groupIndex) => (
+                  <div key={group.category} className={s.macroGroup} aria-labelledby={`${fieldIdPrefix}-macro-group-${groupIndex}`}>
+                    <div id={`${fieldIdPrefix}-macro-group-${groupIndex}`} className={s.macroGroupTitle}>{group.category}</div>
                     {group.macros.map(macro => (
-                      <div key={macro.syntax} className={s.macroItem} onClick={() => insertMacro(macro.syntax)}>
+                      <button type="button" key={macro.syntax} className={s.macroItem} onClick={() => insertMacro(macro.syntax)}>
                         <span className={s.macroSyntax}>{macro.syntax}</span>
                         <span className={s.macroDesc}>{macro.description}</span>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 ))}
               </div>
             )}
-            <textarea ref={textareaRef} className={s.textarea} value={content} onChange={e => setContent(e.target.value)} placeholder={t('blockEditor.contentPlaceholder')} />
+            <textarea id={`${fieldIdPrefix}-content`} ref={textareaRef} className={s.textarea} value={content} onChange={e => setContent(e.target.value)} placeholder={t('blockEditor.contentPlaceholder')} />
             {trustedHostFeatures && (
               <TrustedMacroPreviewControls
                 blockId={block.id}
@@ -850,8 +857,9 @@ export function BlockEditor({
                 <div className={s.sealedBlockBody}>
                   <p className={s.sealedBlockText}>{t(isInstalledLumiHubSealed ? 'blockEditor.sealedBlockInstalledHint' : 'blockEditor.sealedBlockHint')}</p>
                   <div className={s.formGroup}>
-                    <label className={s.label}>{t('blockEditor.sealedBlockKey')}</label>
+                    <label className={s.label} htmlFor={`${fieldIdPrefix}-sealed-key`}>{t('blockEditor.sealedBlockKey')}</label>
                     <input
+                      id={`${fieldIdPrefix}-sealed-key`}
                       className={s.input}
                       value={sealedKey}
                       onChange={e => setSealedKey(filterSealedBlockKeyInput(e.target.value))}
@@ -877,8 +885,9 @@ export function BlockEditor({
 
           {block.marker === 'category' && (
             <div className={s.formGroup}>
-              <label className={s.label}>{t('blockEditor.categoryMode')}</label>
+              <label className={s.label} htmlFor={`${fieldIdPrefix}-category-mode`}>{t('blockEditor.categoryMode')}</label>
               <select
+                id={`${fieldIdPrefix}-category-mode`}
                 className={s.select}
                 value={categoryMode || ''}
                 onChange={e => setCategoryMode((e.target.value || null) as PromptBlock['categoryMode'])}
@@ -893,8 +902,8 @@ export function BlockEditor({
             </div>
           )}
 
-          <div className={s.formGroup}>
-            <label className={s.label}>{t('blockEditor.injectionTriggers')}</label>
+          <fieldset className={clsx(s.formGroup, s.editorFieldset)}>
+            <legend className={s.label}>{t('blockEditor.injectionTriggers')}</legend>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
               {injectionTriggerTypes.map(trigger => (
                 <label key={trigger.value} className={clsx(s.triggerLabel, injectionTrigger.includes(trigger.value) ? s.triggerLabelActive : s.triggerLabelInactive)}>
@@ -908,10 +917,10 @@ export function BlockEditor({
                 ? t('blockEditor.triggersNone')
                 : t('blockEditor.triggersActive', { list: injectionTrigger.map(injectionTriggerLabel).join(', ') })}
             </span>
-          </div>
+          </fieldset>
 
           <div className={s.formGroup}>
-            <label className={s.label}>{t('blockEditor.characterTagTrigger')}</label>
+            <label className={s.label} htmlFor={`${fieldIdPrefix}-character-tags`}>{t('blockEditor.characterTagTrigger')}</label>
             <div className={s.tagTriggerField}>
               {characterTagTrigger.map((tag) => (
                 <span key={tag} className={s.tagTriggerChip}>
@@ -920,14 +929,16 @@ export function BlockEditor({
                     type="button"
                     className={s.tagTriggerChipRemove}
                     onClick={() => removeCharacterTagTrigger(tag)}
+                    aria-label={`${tc('actions.delete')}: ${tag}`}
                     title={tc('actions.delete')}
                   >
-                    <X size={10} />
+                    <X size={10} aria-hidden="true" />
                   </button>
                 </span>
               ))}
               <div className={s.tagTriggerDraftRow}>
                 <input
+                  id={`${fieldIdPrefix}-character-tags`}
                   className={s.tagTriggerDraftInput}
                   value={characterTagDraft}
                   onChange={(e) => setCharacterTagDraft(e.target.value)}
@@ -944,8 +955,9 @@ export function BlockEditor({
                   className={s.tagTriggerDraftAdd}
                   onClick={commitCharacterTagDraft}
                   disabled={!characterTagDraft.trim()}
+                  aria-label={`${tc('actions.add')}: ${t('blockEditor.characterTagTrigger')}`}
                 >
-                  <Plus size={12} />
+                  <Plus size={12} aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -1780,13 +1792,14 @@ function ContextMeter() {
   const pct = max > 0 ? ((total / max) * 100).toFixed(1) : null
 
   return (
-    <div
-      className={s.contextMeter}
-      style={{ cursor: 'pointer' }}
+    <button
+      type="button"
+      className={clsx(s.contextMeter, s.contextMeterButton)}
       onClick={() => openModal('promptItemizer', { messageId })}
       title={t('context.breakdownTitle')}
+      aria-label={`${t('context.breakdownTitle')}: ${total.toLocaleString()}${max > 0 ? ` / ${max.toLocaleString()} (${pct}%)` : ` ${t('tokens')}`}`}
     >
-      <div className={s.contextBar}>
+      <div className={s.contextBar} aria-hidden="true">
         {groups.map((g) => {
           const segPct = total > 0 ? (g.tokens / total) * 100 : 0
           if (segPct < 1) return null
@@ -1802,7 +1815,7 @@ function ContextMeter() {
       <span className={s.contextLabel}>
         {total.toLocaleString()}{max > 0 ? ` / ${max.toLocaleString()} (${pct}%)` : t('tokens')}
       </span>
-    </div>
+    </button>
   )
 }
 
@@ -1833,6 +1846,7 @@ export default function LoomBuilder({
     selectPreset,
     saveBlocks,
     saveAgenticRuntime,
+    reloadActivePreset,
     deletePreset,
     duplicatePreset,
     renamePreset,
@@ -2020,6 +2034,19 @@ export default function LoomBuilder({
   useEffect(() => { activePresetEditorTabRef.current = activePresetEditorTab }, [activePresetEditorTab])
   useEffect(() => { updatePresetDraftRef.current = updatePresetDraft }, [updatePresetDraft])
   useEffect(() => { flushPresetDraftRef.current = flushPresetDraft }, [flushPresetDraft])
+  const presetEditorBridgeFailureLoggedRef = useRef(false)
+  const safeToPresetEditorDraft = useCallback((preset: LoomPreset) => {
+    try {
+      return toPresetEditorDraft(preset)
+    } catch (error) {
+      if (!presetEditorBridgeFailureLoggedRef.current) {
+        presetEditorBridgeFailureLoggedRef.current = true
+        console.error('[Loom] Preset editor bridge unavailable', error)
+      }
+      return null
+    }
+  }, [])
+
 
   useEffect(() => {
     setPresetEditorController({
@@ -2033,20 +2060,31 @@ export default function LoomBuilder({
             preset: null,
           }
         }
+        const draft = safeToPresetEditorDraft(preset)
+        if (!draft) {
+          return {
+            open: false,
+            presetId: null,
+            activeTabId: activePresetEditorTabRef.current,
+            preset: null,
+          }
+        }
         return {
           open: true,
           presetId: preset.id,
           activeTabId: activePresetEditorTabRef.current,
-          preset: toPresetEditorDraft(preset),
+          preset: draft,
         }
       },
       setActiveTab: (tabId) => {
         editorTabChangeRef.current(tabId)
       },
       updatePreset: (mutator, immediate) => {
-        updatePresetDraftRef.current((current) => (
-          applyPresetEditorDraft(current, mutator(toPresetEditorDraft(current)))
-        ), immediate)
+        updatePresetDraftRef.current((current) => {
+          const draft = safeToPresetEditorDraft(current)
+          if (!draft) return current
+          return applyPresetEditorDraft(current, mutator(draft))
+        }, immediate)
       },
       flush: () => flushPresetDraftRef.current(),
     })
@@ -2063,13 +2101,23 @@ export default function LoomBuilder({
       }, {})
       return
     }
+    const draft = safeToPresetEditorDraft(activePreset)
+    if (!draft) {
+      syncPresetEditorState({
+        open: false,
+        presetId: null,
+        activeTabId: activePresetEditorTab,
+        preset: null,
+      }, {})
+      return
+    }
     syncPresetEditorState({
       open: true,
       presetId: activePreset.id,
       activeTabId: activePresetEditorTab,
-      preset: toPresetEditorDraft(activePreset),
+      preset: draft,
     }, activePreset.promptVariables)
-  }, [activePreset, activePresetEditorTab, activePresetId])
+  }, [activePreset, activePresetEditorTab, activePresetId, safeToPresetEditorDraft])
 
   useEffect(() => {
     if (activePresetEditorTab === 'preset') return
@@ -2522,9 +2570,9 @@ export default function LoomBuilder({
   }, [blockPresetChangeForDirtyAgenticRuntime, createPreset])
 
   const handleRenamePreset = useCallback(async (newName: string) => {
-    if (!activePresetId) return
+    if (blockPresetChangeForDirtyAgenticRuntime() || !activePresetId) return
     await renamePreset(activePresetId, newName)
-  }, [activePresetId, renamePreset])
+  }, [activePresetId, blockPresetChangeForDirtyAgenticRuntime, renamePreset])
 
   const handleDuplicatePreset = useCallback(async () => {
     if (blockPresetChangeForDirtyAgenticRuntime() || !activePreset || !activePresetId) return
@@ -2554,8 +2602,11 @@ export default function LoomBuilder({
       a.download = `${data.name || 'loom-preset'}.json`
       a.click()
       URL.revokeObjectURL(url)
-    } catch (err: any) {
-      toast.error(err.body?.error || err.message || lb('toast.exportFailed'))
+    } catch (err: unknown) {
+      const code = getPortablePresetErrorCode(err)
+      toast.error(lb(`toast.portableErrors.${code}`), {
+        title: lb('toast.presetImportTitle'),
+      })
     }
   }, [blockPresetChangeForDirtyAgenticRuntime, exportInternal, lb])
 
@@ -2566,17 +2617,25 @@ export default function LoomBuilder({
 
   const handleExportLegacy = useCallback(() => {
     if (blockPresetChangeForDirtyAgenticRuntime()) return
-    const data = exportLegacy()
-    if (!data) return
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${(data as any).name || 'preset'}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-    setShowLegacyExportConfirm(false)
-  }, [blockPresetChangeForDirtyAgenticRuntime, exportLegacy])
+    try {
+      const data = exportLegacy()
+      if (!data) return
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const dataRecord = data as Record<string, unknown>
+      a.download = `${typeof dataRecord.name === 'string' ? dataRecord.name : 'preset'}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      setShowLegacyExportConfirm(false)
+    } catch (err: unknown) {
+      const code = getPortablePresetErrorCode(err)
+      toast.error(lb(`toast.portableErrors.${code}`), {
+        title: lb('toast.presetImportTitle'),
+      })
+    }
+  }, [blockPresetChangeForDirtyAgenticRuntime, exportLegacy, lb])
 
   const handleImport = useCallback((type: string) => {
     if (blockPresetChangeForDirtyAgenticRuntime()) return
@@ -2599,11 +2658,14 @@ export default function LoomBuilder({
       } else {
         await importFromFile(json, file.name)
       }
-    } catch (err) {
-      console.error('[LoomBuilder] Import failed:', err)
+    } catch (err: unknown) {
+      const code = getPortablePresetErrorCode(err)
+      toast.error(lb(`toast.portableErrors.${code}`), {
+        title: lb('toast.presetImportTitle'),
+      })
     }
     e.target.value = ''
-  }, [blockPresetChangeForDirtyAgenticRuntime, importFromFile, importFromST])
+  }, [blockPresetChangeForDirtyAgenticRuntime, importFromFile, importFromST, lb])
 
   const presetEditorToolbar = presetEditorToolbarItems.some((item) => item.visible) ? (
     <div className={s.extensionToolbar}>
@@ -2837,6 +2899,7 @@ export default function LoomBuilder({
             key={activePreset.id}
             preset={activePreset}
             onSave={saveAgenticRuntime}
+            onReload={reloadActivePreset}
             onDirtyChange={setAgenticRuntimeDirty}
           />
         )}

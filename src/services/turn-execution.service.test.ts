@@ -12,6 +12,7 @@ import {
   isAllowedTurnExecutionTransition,
   reconcileAgentTurns,
   registerAgentTurnReceiptRepair,
+  TURN_EXECUTION_RECONCILIATION,
   registerAgentTurnTerminalRecovery,
   requestDormantTurnCancellation,
   requestTurnCancellation,
@@ -228,6 +229,66 @@ describe("control races and terminal ownership", () => {
     const timeoutResult = transition(db, "deadline", timedOut.ownerToken, "ASSEMBLE", "WORK");
     expect(timeoutResult.execution.state).toBe("TIMED_OUT");
   });
+  test("explicit timeout cancellation remains TIMED_OUT before the local deadline elapses", () => {
+    const created = newExecution(db, "explicit-timeout", Date.now() + 60_000);
+    const result = requestTurnCancellation({
+      db,
+      executionId: "explicit-timeout",
+      ownerToken: created.ownerToken,
+      reason: "timed_out",
+      now: Date.now(),
+    });
+    expect(result.code).toBe("timed_out");
+    expect(result.execution.phase).toBe("TIMED_OUT");
+    expect(result.execution.workOutcome).toBe("failed");
+  });
+
+  test("projects active and terminal phases with canonical status/outcome pairs", () => {
+    const active = newExecution(db, "projection-active");
+    expect(active.execution.workStatus).toBe("running");
+    expect(active.execution.workOutcome).toBeNull();
+    transition(db, "projection-active", active.ownerToken, "ASSEMBLE", "WORK");
+    const waiting = transition(db, "projection-active", active.ownerToken, "WORK", "COMPLETE");
+    expect(waiting.execution.workStatus).toBe("waiting");
+    expect(waiting.execution.workOutcome).toBeNull();
+
+    const timedOut = newExecution(db, "projection-timeout", 10);
+    const timeoutResult = transition(db, "projection-timeout", timedOut.ownerToken, "ASSEMBLE", "WORK");
+    expect(timeoutResult.execution.phase).toBe("TIMED_OUT");
+    expect(timeoutResult.execution.workOutcome).toBe("failed");
+
+    const exhausted = newExecution(db, "projection-exhausted");
+    transition(db, "projection-exhausted", exhausted.ownerToken, "ASSEMBLE", "WORK");
+    const exhaustedResult = transitionTurnExecution({
+      db,
+      executionId: "projection-exhausted",
+      ownerToken: exhausted.ownerToken,
+      expectedPhase: "WORK",
+      nextPhase: "EXHAUSTED",
+      reason: "agentic_work_exhausted",
+    });
+    expect(exhaustedResult.execution.workOutcome).toBe("exhausted");
+
+    const committed = newExecution(db, "projection-committed");
+    transition(db, "projection-committed", committed.ownerToken, "ASSEMBLE", "WORK");
+    transition(db, "projection-committed", committed.ownerToken, "WORK", "COMPLETE");
+    transition(db, "projection-committed", committed.ownerToken, "COMPLETE", "RENDER");
+    transition(db, "projection-committed", committed.ownerToken, "RENDER", "PREPARE_COMMIT");
+    const committing = beginTurnCommit({
+      db,
+      executionId: "projection-committed",
+      ownerToken: committed.ownerToken,
+    });
+    expect(committing.execution.workStatus).toBe("running");
+    expect(committing.execution.workOutcome).toBeNull();
+    const completed = finalizeTurnCommit({
+      db,
+      executionId: "projection-committed",
+      ownerToken: committed.ownerToken,
+    });
+    expect(completed.execution.workStatus).toBe("terminal");
+    expect(completed.execution.workOutcome).toBe("completed");
+  });
 
   test("dormant cancellation uses the durable ownerless CAS for reversible, late, terminal, and active rows", () => {
     const dormant = newExecution(db, "dormant");
@@ -363,6 +424,7 @@ describe("receipt commit and startup recovery", () => {
   test("a statement failure rolls back the receipt and settles COMMIT_FAILED", () => {
     const created = newExecution(db, "statement-failure");
     moveToCommit(db, "statement-failure", created.ownerToken);
+
     db.run(`CREATE TRIGGER fail_receipt BEFORE INSERT ON agent_turn_commit_receipts BEGIN SELECT RAISE(ABORT, 'injected statement failure'); END`);
     expect(() => finalizeTurnCommit({ db, executionId: "statement-failure", ownerToken: created.ownerToken })).toThrow();
     const state = db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("statement-failure") as { state: string };
@@ -381,6 +443,127 @@ describe("receipt commit and startup recovery", () => {
     expect(recovered.committedFromReceipt).toBe(1);
     expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("receipt-crash") as { state: string }).state).toBe("COMMITTED");
     expect(reconcileAgentTurns(db).committedFromReceipt).toBe(0);
+  });
+  test("accepts canonical historical terminal outcome without runner work", () => {
+    const created = newExecution(db, "legacy-terminal-outcome")
+    transition(db, created.execution.id, created.ownerToken, "ASSEMBLE", "FAILED")
+    db.run(`
+      CREATE TABLE agent_run_attempts (
+        user_id TEXT NOT NULL, chat_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+        run_id TEXT NOT NULL, turn_id TEXT NOT NULL, generation_id TEXT NOT NULL,
+        generation_type TEXT NOT NULL, target_message_id TEXT, target_swipe_id INTEGER,
+        status TEXT NOT NULL, outcome TEXT, reason TEXT NOT NULL, terminal INTEGER NOT NULL,
+        started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, terminal_at INTEGER,
+        host_correlation_id TEXT NOT NULL, reconciliation_state TEXT NOT NULL
+      )
+    `)
+    db.run(`
+      CREATE TABLE agent_run_projections (
+        user_id TEXT, chat_id TEXT, turn_id TEXT, generation_id TEXT, generation_type TEXT,
+        target_message_id TEXT, target_swipe_id INTEGER, status TEXT, phase TEXT,
+        sequence INTEGER, revision INTEGER, snapshot_json TEXT, started_at INTEGER, updated_at INTEGER,
+        terminal_handoff_json TEXT, omission_json TEXT
+      )
+    `)
+    db.query(`INSERT INTO agent_run_projections (
+      user_id, chat_id, turn_id, generation_id, generation_type,
+      target_message_id, target_swipe_id, status, phase, sequence, revision,
+      snapshot_json, started_at, updated_at, terminal_handoff_json, omission_json
+    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`)
+      .run(
+        "u1", "c1", created.execution.id, created.execution.generationId, "normal",
+        "FAILED", "FAILED", 0, 0,
+        JSON.stringify({
+          workPhase: "TERMINAL",
+          workStatus: "terminal",
+          workOutcome: "rejected",
+          reason: "invalid_input",
+          error: { code: "invalid_input" },
+        }),
+        Date.now(), Date.now(),
+      )
+    db.run(`
+      CREATE TABLE agent_chat_events (
+        user_id TEXT, chat_id TEXT, turn_id TEXT, sequence INTEGER,
+        run_revision INTEGER, event_kind TEXT, started_at INTEGER, updated_at INTEGER
+      )
+    `)
+    db.run(`
+      CREATE TABLE agent_run_audit_records (
+        record_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, chat_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL, event_id TEXT, host_sequence INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+      )
+    `)
+    db.run("CREATE TABLE chats (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)")
+    db.query("INSERT INTO chats (id, user_id, started_at, updated_at) VALUES (?, ?, ?, ?)").run("c1", "u1", Date.now(), Date.now())
+    db.query(`INSERT INTO agent_run_attempts (
+      user_id, chat_id, attempt_id, run_id, turn_id, generation_id, generation_type,
+      target_message_id, target_swipe_id, status, outcome, reason, terminal,
+      started_at, updated_at, terminal_at, host_correlation_id, reconciliation_state
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 1, ?, ?, ?, ?, ?)`)
+      .run(
+        "u1", "c1", created.execution.id, created.execution.generationId, created.execution.id,
+        created.execution.generationId, "normal", "terminal", "rejected", "needs_attention",
+        Date.now(), Date.now(), Date.now(), `agentic:${created.execution.id}`, "authoritative",
+      )
+    db.query(`INSERT INTO agent_run_audit_records (
+      record_id, user_id, chat_id, attempt_id, event_id, host_sequence, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        "audit-legacy-terminal-outcome", "u1", "c1", created.execution.id,
+        `terminal:failure:${created.execution.id}`, 1, JSON.stringify({
+          correlation: { attemptId: created.execution.id, messageId: null, swipeId: null },
+          result: { status: "rejected", phase: "FAILED", errorCode: "agentic_preflight_failed" },
+          errorReason: "needs_attention",
+        }),
+      )
+    let runnerCalls = 0
+    registerAgentTurnTerminalRecovery(() => { runnerCalls++ })
+    try {
+      const recovered = reconcileAgentTurns(db)
+      expect(recovered.complete).toBe(true)
+      expect(recovered.alreadyTerminal).toBe(1)
+      expect(recovered.projectionRepairs).toBe(0)
+      expect(runnerCalls).toBe(0)
+    } finally {
+      registerAgentTurnTerminalRecovery(null)
+    }
+  })
+  test("receipt repair failure remains incomplete and converges on retry", () => {
+    const created = newExecution(db, "receipt-repair-failure");
+    moveToCommit(db, "receipt-repair-failure", created.ownerToken);
+    db.query(`INSERT INTO agent_turn_commit_receipts
+      (receipt_id, turn_id, execution_id, workspace_id, user_id, chat_id, commit_key, idempotency_key, state, summary_digest, summary_json, committed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?, ?, ?)`)
+      .run(
+        "receipt-repair-failure-receipt",
+        "receipt-repair-failure",
+        "receipt-repair-failure",
+        "ws1",
+        "u1",
+        "c1",
+        created.commitKey,
+        created.commitKey,
+        "0".repeat(64),
+        "{}",
+        Date.now(),
+      );
+    registerAgentTurnReceiptRepair(() => {
+      throw new Error("injected receipt repair failure");
+    });
+    try {
+      const blocked = reconcileAgentTurns(db);
+      expect(blocked.complete).toBe(false);
+      expect(blocked.committedFromReceipt).toBe(0);
+      expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("receipt-repair-failure") as { state: string }).state).toBe("COMMITTING");
+    } finally {
+      registerAgentTurnReceiptRepair(null);
+    }
+    const recovered = reconcileAgentTurns(db);
+    expect(recovered.complete).toBe(true);
+    expect(recovered.committedFromReceipt).toBe(1);
+    expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("receipt-repair-failure") as { state: string }).state).toBe("COMMITTED");
   });
 
   test("expires interrupted turns without invoking provider or projection callbacks", async () => {
@@ -410,6 +593,99 @@ describe("receipt commit and startup recovery", () => {
     const second = reconcileAgentTurns(db);
     expect(second.commitFailedWithoutReceipt).toBe(0);
   });
+  test("scans only candidates and drains large recoverable history in keyset pages", () => {
+    for (let index = 0; index < 300; index += 1) {
+      const historical = newExecution(db, `historical-terminal-${index}`);
+      transition(db, historical.execution.id, historical.ownerToken, "ASSEMBLE", "FAILED");
+    }
+    for (let index = 0; index < 300; index += 1) {
+      newExecution(db, `recoverable-${index}`);
+    }
+    const candidateCount = (db.query(
+      "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE state IN ('ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING')",
+    ).get() as { count: number }).count;
+    expect(candidateCount).toBe(300);
+
+    const recovered = reconcileAgentTurns(db);
+    expect(recovered.inspected).toBe(300);
+    expect(recovered.failedInterrupted).toBe(300);
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE state IN ('ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING')",
+    ).get() as { count: number }).count).toBe(0);
+  });
+  test("stops before an expensive row when the recovery deadline expires", () => {
+    const first = newExecution(db, "slow-turn-a");
+    const second = newExecution(db, "slow-turn-b");
+    db.query("UPDATE agent_turn_executions SET created_at = ?, updated_at = ? WHERE id = ?").run(100, 100, first.execution.id);
+    db.query("UPDATE agent_turn_executions SET created_at = ?, updated_at = ? WHERE id = ?").run(200, 200, second.execution.id);
+    const clockValues = [1_000, 1_000, 1_000, 6_000];
+    let clockIndex = 0;
+    __testing.setReconciliationClock(() => clockValues[Math.min(clockIndex++, clockValues.length - 1)]!);
+    try {
+      const blocked = reconcileAgentTurns(db);
+      expect(blocked.complete).toBe(false);
+      expect(blocked.failedInterrupted).toBe(1);
+      expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get(first.execution.id) as { state: string }).state).toBe("FAILED");
+      expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get(second.execution.id) as { state: string }).state).toBe("ASSEMBLE");
+      __testing.setReconciliationClock(null);
+      const recovered = reconcileAgentTurns(db);
+      expect(recovered.complete).toBe(true);
+      expect(recovered.failedInterrupted).toBe(1);
+      expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get(second.execution.id) as { state: string }).state).toBe("FAILED");
+    } finally {
+      __testing.setReconciliationClock(null);
+    }
+  });
+  test("caps the startup scan while prioritizing receipt-backed commit recovery", () => {
+    db.run(`
+      CREATE TABLE agent_run_projections (
+        user_id TEXT,
+        chat_id TEXT,
+        turn_id TEXT,
+        status TEXT,
+        sequence INTEGER,
+        revision INTEGER
+      )
+    `);
+    db.run(`
+      CREATE TABLE agent_chat_events (
+        user_id TEXT,
+        chat_id TEXT,
+        turn_id TEXT,
+        sequence INTEGER,
+        run_revision INTEGER,
+        event_kind TEXT
+      )
+    `);
+    const prioritized = newExecution(db, "priority-receipt");
+    moveToCommit(db, prioritized.execution.id, prioritized.ownerToken);
+    db.query(`INSERT INTO agent_turn_commit_receipts
+      (receipt_id, turn_id, execution_id, workspace_id, user_id, chat_id, commit_key, idempotency_key, state, summary_digest, summary_json, committed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?, ?, ?)`)
+      .run(
+        "priority-receipt-row",
+        prioritized.execution.id,
+        prioritized.execution.id,
+        "ws1",
+        "u1",
+        "c1",
+        prioritized.execution.commitKey,
+        prioritized.execution.commitKey,
+        "0".repeat(64),
+        "{}",
+        Date.now(),
+      );
+    for (let index = 0; index < TURN_EXECUTION_RECONCILIATION.maxRows + 1; index += 1) {
+      newExecution(db, `bounded-recoverable-${index}`);
+    }
+
+    const recovered = reconcileAgentTurns(db);
+    expect(recovered.complete).toBe(false);
+    expect(recovered.inspected).toBeLessThanOrEqual(TURN_EXECUTION_RECONCILIATION.maxRows);
+    expect(recovered.committedFromReceipt).toBe(1);
+    expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("priority-receipt") as { state: string }).state).toBe("COMMITTED");
+  });
+
 });
 
 describe("dormant runtime kill switch", () => {

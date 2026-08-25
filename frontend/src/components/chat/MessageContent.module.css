@@ -13,6 +13,134 @@
 
 .contentChar {}
 
+.longMessageViewport {
+  position: relative;
+}
+
+.longMessageViewportConstrained {
+  overflow: hidden;
+}
+
+.longMessageViewportOverflowing {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - 82px),
+    rgba(0, 0, 0, 0.88) calc(100% - 64px),
+    rgba(0, 0, 0, 0.46) calc(100% - 38px),
+    rgba(0, 0, 0, 0.1) calc(100% - 16px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - 82px),
+    rgba(0, 0, 0, 0.88) calc(100% - 64px),
+    rgba(0, 0, 0, 0.46) calc(100% - 38px),
+    rgba(0, 0, 0, 0.1) calc(100% - 16px),
+    transparent 100%
+  );
+}
+
+.longMessageBody {
+  display: flow-root;
+  min-width: 0;
+}
+
+.longMessageToggle {
+  display: block;
+  width: max-content;
+  max-width: calc(100% - 24px);
+  margin: 5px auto 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--lumiverse-text-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: calc(11px * var(--lumiverse-font-scale, 1));
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: 0.01em;
+}
+
+.longMessageToggle:not(.longMessageToggleExpanded) {
+  position: absolute;
+  z-index: 2;
+  left: 50%;
+  bottom: -25px;
+  margin: 0;
+  transform: translateX(-50%);
+}
+
+.longMessageTogglePill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 2px 3px 2px 9px;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: 9px;
+  background: var(--lumiverse-fill-heavy);
+  transition:
+    transform var(--lumiverse-transition-fast),
+    border-color var(--lumiverse-transition-fast),
+    background var(--lumiverse-transition-fast),
+    color var(--lumiverse-transition-fast);
+}
+
+.longMessageToggleIconFrame {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  transition: background var(--lumiverse-transition-fast), color var(--lumiverse-transition-fast);
+}
+
+.longMessageToggleIcon {
+  flex: none;
+  transition: transform var(--lumiverse-transition-fast);
+}
+
+.longMessageToggleExpanded .longMessageToggleIcon {
+  transform: rotate(180deg);
+}
+
+.longMessageToggle:hover .longMessageTogglePill {
+  border-color: var(--lumiverse-border-hover);
+  background: var(--lumiverse-fill-heavy);
+  color: var(--lumiverse-text);
+}
+
+.longMessageToggle:hover .longMessageToggleIconFrame {
+  background: var(--lumiverse-fill-subtle);
+}
+
+.longMessageToggle:active .longMessageTogglePill {
+  transform: translateY(0) scale(0.98);
+}
+
+.longMessageToggle:focus-visible {
+  outline: none;
+}
+
+.longMessageToggle:focus-visible .longMessageTogglePill {
+  outline: 2px solid var(--lumiverse-primary);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .longMessageTogglePill,
+  .longMessageToggleIconFrame,
+  .longMessageToggleIcon {
+    transition: none;
+  }
+}
+
 .findMatch {
   padding: 0 1px;
   border-radius: 2px;

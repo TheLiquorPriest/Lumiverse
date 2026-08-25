@@ -8,10 +8,16 @@ import {
   AGENT_ACTIVITY_CHAT_MAX_BYTES,
   AGENT_ACTIVITY_RUN_MAX_BYTES,
   AGENT_ACTIVITY_RUN_MAX_COUNT,
+  AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES,
+  AGENT_RUN_INSPECTION_MAX_RECORD_BYTES,
+  AGENT_RUN_INSPECTION_MAX_PAYLOAD_BYTES,
+  AGENT_RUN_INSPECTION_MAX_RECORDS,
+  __test__mintAgentRunInspectionCursor,
   __test__serializeAgentActivityRun,
   createAgentInspectionWriter,
   getAgentRunInspection,
   listAgentActivityRuns,
+  listAgentRunInspections,
   ownsChatForActivity,
   persistAgentRunInspection,
   persistTerminalAgentActivityRun,
@@ -20,7 +26,8 @@ import { runMigrations } from "../db/migrate";
 import type { AgentActivitySnapshotV1 } from "../types/agent-runtime";
 import type { PersistAgentRunInspectionInputV1 } from "./agent-activity-runs.service";
 
-import { createChat, createMessage, deleteMessage, deleteSwipe } from "./chats.service";
+import { createChat, createMessage, deleteChat, deleteMessage, deleteSwipe } from "./chats.service";
+import { ensurePersistentWorkspaceForChat, getPersistentWorkspaceById } from "./turn-workspace.service";
 
 const OWNER = "activity-owner";
 const OTHER = "activity-other";
@@ -127,6 +134,98 @@ describe("agent activity fallback persistence", () => {
     expect(listAgentActivityRuns(OWNER, chat.id).map((run) => run.generationId)).toEqual([
       "stop-generation", "setup-generation", "regen-generation",
     ]);
+  });
+
+  test("keeps identical generation replays idempotent and rejects semantic conflicts", () => {
+    const chat = createChat(OWNER, { name: "activity-replay-boundary" });
+    const first = persistTerminalAgentActivityRun({
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "replay-generation",
+      snapshot: snapshot("completed"),
+      status: "completed",
+    });
+    const storedFirst = getDb().query(
+      "SELECT snapshot_json, created_at FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "replay-generation") as { snapshot_json: string; created_at: number };
+    const replay = persistTerminalAgentActivityRun({
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "replay-generation",
+      snapshot: snapshot("completed"),
+      status: "completed",
+    });
+    const storedReplay = getDb().query(
+      "SELECT snapshot_json, created_at FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "replay-generation") as { snapshot_json: string; created_at: number };
+    expect(replay).toEqual(first);
+    expect(storedReplay).toEqual(storedFirst);
+
+    expect(persistTerminalAgentActivityRun({
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "replay-generation",
+      snapshot: snapshot("failed"),
+      status: "failed",
+    })).toBeNull();
+    expect(getDb().query(
+      "SELECT snapshot_json, created_at FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "replay-generation")).toEqual(storedFirst);
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "replay-generation")).toEqual({ count: 1 });
+  });
+
+  test("compares oversized terminal replays against the bounded serialized run", () => {
+    const chat = createChat(OWNER, { name: "activity-oversized-replay" });
+    const oversizedSnapshot = (rootId: string) => snapshot("completed", {
+      rootId,
+      nodes: Array.from({ length: 128 }, (_, index) => ({
+        id: `oversized-node-${index}-${"x".repeat(240)}`,
+        parentId: null,
+        kind: "root_turn",
+        actor: "root",
+        phase: "completed",
+        status: "completed",
+        startedAt: index,
+        elapsedMs: index + 1,
+      })),
+    });
+    const first = persistTerminalAgentActivityRun({
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "oversized-replay-generation",
+      snapshot: oversizedSnapshot("oversized-root"),
+      status: "completed",
+    });
+    expect(first).not.toBeNull();
+    expect(first!.snapshot.nodes.length).toBeLessThan(128);
+    const storedFirst = getDb().query(
+      "SELECT snapshot_json, created_at FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "oversized-replay-generation") as { snapshot_json: string; created_at: number };
+
+    const replay = persistTerminalAgentActivityRun({
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "oversized-replay-generation",
+      snapshot: oversizedSnapshot("oversized-root"),
+      status: "completed",
+    });
+    expect(replay).toEqual(first);
+    expect(getDb().query(
+      "SELECT snapshot_json, created_at FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "oversized-replay-generation")).toEqual(storedFirst);
+
+    expect(persistTerminalAgentActivityRun({
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "oversized-replay-generation",
+      snapshot: oversizedSnapshot("conflicting-root"),
+      status: "completed",
+    })).toBeNull();
+    expect(getDb().query(
+      "SELECT snapshot_json, created_at FROM agent_activity_runs WHERE user_id = ? AND chat_id = ? AND generation_id = ?",
+    ).get(OWNER, chat.id, "oversized-replay-generation")).toEqual(storedFirst);
   });
 
   test("drops prose, arguments, results, carriers, and unknown fields before storing", () => {
@@ -312,6 +411,41 @@ describe("agent run inspection terminal persistence", () => {
     expect(detail?.markers.some((marker) => marker.scope === "transcript")).toBe(false);
   });
 
+  test("redacts secret keys across casing and separator variants", () => {
+    const chat = createChat(OWNER, { name: "inspection-secret-key-boundary" });
+    const secretValues = [
+      "api-key-sentinel",
+      "api_key-sentinel",
+      "api key sentinel",
+      "access-token-sentinel",
+      "client-secret-sentinel",
+      "auth-secret-sentinel",
+      "encryption-key-sentinel",
+    ];
+    const detail = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "secret-key-boundary-attempt",
+      runId: "secret-key-boundary-run",
+      turnSessionId: "secret-key-boundary-turn",
+      transcript: [{
+        id: "secret-key-boundary-record",
+        kind: "tool",
+        actor: "tool",
+        API_KEY: secretValues[0],
+        api_key: secretValues[1],
+        "api-key": secretValues[2],
+        "Access Token": secretValues[3],
+        CLIENT_SECRET: secretValues[4],
+        Auth_Secret: secretValues[5],
+        encryption_key: secretValues[6],
+      }],
+    }));
+
+    expect(detail).not.toBeNull();
+    const encoded = JSON.stringify(detail);
+    for (const secretValue of secretValues) expect(encoded).not.toContain(secretValue);
+  });
+
+
   test("exposes a committed normal response separately from its input target", () => {
     const chat = createChat(OWNER, { name: "inspection-committed-target" });
     const writer = createAgentInspectionWriter({
@@ -481,7 +615,11 @@ describe("agent run inspection terminal persistence", () => {
         hostSequence: 4,
         late: true,
         content: "late evidence",
+        arguments: null,
+        result: null,
         durationMs: null,
+        provider: null,
+        errorReason: null,
       }],
     }));
 
@@ -494,7 +632,64 @@ describe("agent run inspection terminal persistence", () => {
     expect(late?.markers.map((marker) => marker.kind)).toContain("late_event");
   });
 
-  test("deduplicates duplicate late records and their markers", () => {
+  test("compares oversized audit replays against their bounded persisted payload", () => {
+    const chat = createChat(OWNER, { name: "inspection-oversized-replay" });
+    const oversizedContent = "A".repeat(AGENT_RUN_INSPECTION_MAX_PAYLOAD_BYTES + 2048);
+    const record = (content: string) => ({
+      id: "oversized-audit-record",
+      kind: "tool",
+      actor: "tool",
+      recipient: "agent",
+      occurredAt: 10,
+      hostSequence: 1,
+      late: false,
+      content,
+      arguments: null,
+      result: null,
+      durationMs: null,
+      provider: null,
+      errorReason: null,
+    });
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      updatedAt: 100,
+      transcript: [record(oversizedContent)],
+    }))).not.toBeNull();
+    const storedFirst = getDb().query(
+      `SELECT payload_json, byte_size
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'transcript'`,
+    ).get(OWNER, "inspection-attempt") as { payload_json: string; byte_size: number };
+    const storedPayload: unknown = JSON.parse(storedFirst.payload_json);
+    const storedContentLength = storedPayload
+      && typeof storedPayload === "object"
+      && "content" in storedPayload
+      && typeof storedPayload.content === "string"
+      ? storedPayload.content.length
+      : 0;
+    expect(storedContentLength).toBeLessThan(oversizedContent.length);
+
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      updatedAt: 200,
+      transcript: [{ ...record(oversizedContent), occurredAt: 20, hostSequence: 4 }],
+    }))).not.toBeNull();
+    expect(getDb().query(
+      `SELECT payload_json, byte_size
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'transcript'`,
+    ).get(OWNER, "inspection-attempt")).toEqual(storedFirst);
+
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      updatedAt: 300,
+      transcript: [record(`B${oversizedContent.slice(1)}`)],
+    }))).toBeNull();
+    expect(getDb().query(
+      `SELECT payload_json, byte_size
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'transcript'`,
+    ).get(OWNER, "inspection-attempt")).toEqual(storedFirst);
+  });
+
+  test("rejects conflicting semantic duplicate late records while tolerating generated ordering metadata", () => {
     const chat = createChat(OWNER, { name: "inspection" });
     persistAgentRunInspection(inspectionInput(chat.id, { updatedAt: 100, terminalAt: 100 }));
     const lateRecord = {
@@ -506,12 +701,19 @@ describe("agent run inspection terminal persistence", () => {
       hostSequence: 2,
       late: true,
       content: "first payload",
+      arguments: null,
+      result: null,
       durationMs: null,
+      provider: null,
+      errorReason: null,
     };
     persistAgentRunInspection(inspectionInput(chat.id, { transcript: [lateRecord] }));
-    persistAgentRunInspection(inspectionInput(chat.id, {
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      transcript: [{ ...lateRecord, occurredAt: 190, hostSequence: 4 }],
+    }))).not.toBeNull();
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
       transcript: [{ ...lateRecord, content: "duplicate payload" }],
-    }));
+    }))).toBeNull();
 
     expect(getDb().query(
       "SELECT COUNT(*) AS count FROM agent_run_audit_records WHERE user_id = ? AND attempt_id = ? AND record_kind = ?",
@@ -520,6 +722,35 @@ describe("agent run inspection terminal persistence", () => {
     expect(inspection?.transcript).toHaveLength(1);
     expect(inspection?.markers.filter((marker) => marker.kind === "late_event")).toHaveLength(1);
   });
+  test("canonicalizes non-ASCII audit replays with UTF-8 key ordering", () => {
+    const chat = createChat(OWNER, { name: "inspection-utf8-order" });
+    const supplementaryKey = "😀";
+    const bmpKey = "\uE000";
+    const record = (supplementaryFirst: boolean) => ({
+      id: "utf8-order-record",
+      kind: "tool",
+      actor: "tool",
+      recipient: "agent",
+      content: "stable payload",
+      ...(supplementaryFirst
+        ? { [supplementaryKey]: "supplementary", [bmpKey]: "bmp" }
+        : { [bmpKey]: "bmp", [supplementaryKey]: "supplementary" }),
+    });
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      transcript: [record(true)],
+    }))).not.toBeNull();
+    const stored = getDb().query(
+      `SELECT payload_json
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'transcript'`,
+    ).get(OWNER, "inspection-attempt") as { payload_json: string };
+    const storedKeys = Object.keys(JSON.parse(stored.payload_json) as Record<string, unknown>);
+    expect(storedKeys.indexOf(bmpKey)).toBeLessThan(storedKeys.indexOf(supplementaryKey));
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      transcript: [{ ...record(false), occurredAt: 17, hostSequence: 3 }],
+    }))).not.toBeNull();
+  });
+
 
   test("rejects an immutable identity mismatch without adding evidence", () => {
     const chat = createChat(OWNER, { name: "inspection" });
@@ -548,6 +779,50 @@ describe("agent run inspection terminal persistence", () => {
     expect(inspection?.outcome).toBe("completed");
     expect(inspection?.transcript).toHaveLength(0);
   });
+
+  test("rejects stale phase, status, and timestamp replays", () => {
+    const chat = createChat(OWNER, { name: "inspection-monotonic" });
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      lifecycle: "WORK",
+      status: "running",
+      outcome: null,
+      updatedAt: 200,
+    }))).not.toBeNull();
+
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      lifecycle: "ADMIT",
+      status: "pending",
+      outcome: null,
+      updatedAt: 100,
+      transcript: [{ id: "stale-phase", kind: "tool", actor: "tool" }],
+    }))).toBeNull();
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      lifecycle: "WORK",
+      status: "pending",
+      outcome: null,
+      updatedAt: 199,
+      transcript: [{ id: "stale-status", kind: "tool", actor: "tool" }],
+    }))).toBeNull();
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      lifecycle: "WORK",
+      status: "waiting",
+      outcome: null,
+      updatedAt: 210,
+    }))).not.toBeNull();
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      lifecycle: "WORK",
+      status: "waiting",
+      outcome: null,
+      updatedAt: 209,
+      transcript: [{ id: "stale-time", kind: "tool", actor: "tool" }],
+    }))).toBeNull();
+
+    const inspection = getAgentRunInspection(OWNER, "inspection-attempt", chat.id);
+    expect(inspection?.lifecycle).toBe("WORK");
+    expect(inspection?.status).toBe("waiting");
+    expect(inspection?.updatedAt).toBe(210);
+    expect(inspection?.transcript).toHaveLength(0);
+  });
   test("projects complete owner detail with causal lineage while keeping private evidence out of compact activity", () => {
     const chat = createChat(OWNER, { name: "inspection-rich" });
     const target = createMessage(
@@ -555,6 +830,12 @@ describe("agent run inspection terminal persistence", () => {
       { is_user: false, name: "Assistant", content: "stable target" },
       OWNER,
     );
+    const persistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: chat.id,
+      workspaceId: "workspace-1",
+      objective: "Rich inspection workspace",
+    });
     const correlation = {
       turnSessionId: "rich-turn",
       runId: "rich-run",
@@ -670,8 +951,8 @@ describe("agent run inspection terminal persistence", () => {
         attemptId: "rich-attempt",
         checkpoint: "WORK",
         snapshotId: "snapshot-1",
-        sourceRevision: "source-revision-1",
-        revision: "revision-1",
+        sourceRevision: 7,
+        revision: 9,
         scope: { chatId: chat.id, targetMessageId: target.id, targetSwipeId: 0 },
         required: true,
         startedAt: 13,
@@ -702,20 +983,23 @@ describe("agent run inspection terminal persistence", () => {
       workspaceAssociations: [{
         version: 1,
         id: "publication-1",
-        workspaceId: "workspace-1",
-        workspaceRevision: 8,
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
         relation: "published",
         objectKind: "publication",
         objectId: "publication-1",
-        sourceRevision: 7,
+        sourceRevision: persistent.revision,
         sourceDeleted: true,
-        provenanceDigest: "publication-provenance",
+        provenanceDigest: "a".repeat(64),
         correlation: { ...correlation, actorId: "host", recipientId: "owner", hostSequence: 7 },
       }],
     }));
 
     expect(detail).not.toBeNull();
     expect(detail).toMatchObject({
+      runId: "rich-run",
+      turnSessionId: "rich-turn",
+      generationId: "rich-generation",
       attempt: {
         attemptId: "rich-attempt",
         target: {
@@ -741,6 +1025,10 @@ describe("agent run inspection terminal persistence", () => {
       content: "PRIVATE-PROMPT-PAYLOAD",
     });
     expect(detail!.cortexReceipts[0]!.resultDigest).toBe("cortex-digest");
+    expect(detail!.cortexReceipts[0]).toEqual(expect.objectContaining({
+      sourceRevision: 7,
+      revision: 9,
+    }));
     expect(detail!.councilReceipts[0]!.memberCount).toBe(3);
     expect(detail!.workspaceAssociations[0]!.sourceDeleted).toBe(true);
     expect(detail!.activity.milestones).toHaveLength(1);
@@ -817,7 +1105,11 @@ describe("agent run inspection terminal persistence", () => {
         hostSequence: 1,
         late: true,
         content: "late evidence",
+        arguments: null,
+        result: null,
         durationMs: null,
+        provider: null,
+        errorReason: null,
         correlation: { parentId: "recovery-marker", hostSequence: 1 },
       }],
     }));
@@ -940,6 +1232,646 @@ describe("agent run inspection terminal persistence", () => {
       generationId: "invalid-generation",
       lifecycle: "NOT_A_PHASE" as never,
     }))).toBeNull();
+  });
+
+  test("marks malformed durable audit and activity projection payloads unavailable", () => {
+    const chat = createChat(OWNER, { name: "inspection-corrupt-projections" });
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "corrupt-projection-attempt",
+      runId: "corrupt-projection-run",
+      turnSessionId: "corrupt-projection-turn",
+      generationId: "corrupt-projection-generation",
+    }))).not.toBeNull();
+    const db = getDb();
+    db.query(
+      `INSERT INTO agent_run_audit_records
+        (record_id, user_id, chat_id, attempt_id, record_kind, event_id, causal_parent_id,
+         host_sequence, occurred_at, late, payload_json, byte_size, dedupe_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "corrupt-transcript-record",
+      OWNER,
+      chat.id,
+      "corrupt-projection-attempt",
+      "transcript",
+      "corrupt-transcript",
+      null,
+      1,
+      1,
+      0,
+      "{malformed",
+      11,
+      "corrupt-transcript",
+    );
+    db.run("PRAGMA foreign_keys = OFF");
+    db.query(
+      `INSERT INTO agent_run_projections
+        (user_id, chat_id, turn_id, generation_id, generation_type, status, phase,
+         revision, sequence, started_at, updated_at, snapshot_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      OWNER,
+      chat.id,
+      "corrupt-projection-turn",
+      "corrupt-projection-generation",
+      "normal",
+      "WORK",
+      "WORK",
+      1,
+      1,
+      1,
+      1,
+      "{malformed",
+    );
+    db.run("PRAGMA foreign_keys = ON");
+
+    const detail = getAgentRunInspection(OWNER, "corrupt-projection-attempt", chat.id);
+    expect(detail).not.toBeNull();
+    expect(detail!.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "unavailable", scope: "transcript" }),
+      expect.objectContaining({ kind: "unavailable", scope: "activity" }),
+    ]));
+    expect(detail!.sectionAvailability).toEqual(expect.arrayContaining([
+      expect.objectContaining({ section: "transcript", state: "unavailable" }),
+      expect.objectContaining({ section: "activity", state: "unavailable" }),
+    ]));
+  });
+
+  test("bounds all persisted inspection groups under one total budget with a truncation marker", () => {
+    const chat = createChat(OWNER, { name: "inspection-total-budget" });
+    const detail = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "total-budget-attempt",
+      runId: "total-budget-run",
+      turnSessionId: "total-budget-turn",
+      generationId: "total-budget-generation",
+      transcript: Array.from({ length: AGENT_RUN_INSPECTION_MAX_RECORDS + 2 }, (_, index) => ({
+        id: `total-budget-${index}`,
+        kind: "tool",
+        actor: "tool",
+      })),
+      activity: Array.from({ length: 2 }, (_, index) => ({
+        id: `total-budget-activity-${index}`,
+        kind: "tool",
+        actor: "tool",
+      })),
+    }));
+    expect(detail).not.toBeNull();
+    const stored = getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).get(OWNER, "total-budget-attempt") as { count: number };
+    expect(stored.count).toBeLessThanOrEqual(AGENT_RUN_INSPECTION_MAX_RECORDS);
+    expect(detail!.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "truncated", scope: "run" }),
+    ]));
+  });
+
+  test("keeps repeated late and reordered evidence within the durable per-attempt cap", () => {
+    const chat = createChat(OWNER, { name: "inspection-marker-budget" });
+    const baseCount = AGENT_RUN_INSPECTION_MAX_RECORDS - 4;
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "marker-budget-attempt",
+      runId: "marker-budget-run",
+      turnSessionId: "marker-budget-turn",
+      generationId: "marker-budget-generation",
+      updatedAt: 100,
+      transcript: Array.from({ length: baseCount }, (_, index) => ({
+        id: `marker-budget-base-${index}`,
+        kind: "tool",
+        actor: "tool",
+      })),
+    }))).not.toBeNull();
+
+    const lateReordered = Array.from({ length: 4 }, (_, index) => ({
+      id: `marker-budget-late-${index}`,
+      kind: "tool",
+      actor: "tool",
+      recipient: "agent",
+      occurredAt: 50 + index,
+      hostSequence: 1,
+      late: true,
+      content: `late-${index}`,
+      arguments: null,
+      result: null,
+      durationMs: null,
+      provider: null,
+      errorReason: null,
+    }));
+    const firstLate = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "marker-budget-attempt",
+      runId: "marker-budget-run",
+      turnSessionId: "marker-budget-turn",
+      generationId: "marker-budget-generation",
+      updatedAt: 200,
+      transcript: lateReordered,
+    }));
+    const replayLate = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "marker-budget-attempt",
+      runId: "marker-budget-run",
+      turnSessionId: "marker-budget-turn",
+      generationId: "marker-budget-generation",
+      updatedAt: 300,
+      transcript: lateReordered,
+    }));
+    expect(firstLate).not.toBeNull();
+    expect(replayLate).not.toBeNull();
+    expect(firstLate!.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "late_event", scope: "transcript" }),
+      expect.objectContaining({ kind: "reordered_event", scope: "transcript" }),
+      expect.objectContaining({ kind: "truncated", scope: "run" }),
+    ]));
+    expect(replayLate!.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "truncated", scope: "run" }),
+    ]));
+
+    const stored = getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND chat_id = ? AND attempt_id = ?`,
+    ).get(OWNER, chat.id, "marker-budget-attempt") as { count: number };
+    expect(stored.count).toBe(AGENT_RUN_INSPECTION_MAX_RECORDS);
+  });
+
+  test("rejects foreign, nonexistent, and ephemeral workspace identifiers before projection", () => {
+    const chat = createChat(OWNER, { name: "inspection-workspace-boundary" });
+    const foreignChat = createChat(OTHER, { name: "inspection-workspace-boundary-foreign" });
+    const foreign = ensurePersistentWorkspaceForChat({
+      userId: OTHER,
+      chatId: foreignChat.id,
+      workspaceId: "foreign-stable-workspace",
+      objective: "Foreign workspace",
+    });
+    const association = (attemptId: string, workspaceId: string) => ({
+      version: 1,
+      id: `${attemptId}-association`,
+      workspaceId,
+      workspaceRevision: 1,
+      relation: "linked" as const,
+      objectKind: "objective" as const,
+      objectId: null,
+      sourceRevision: 1,
+      sourceDeleted: false,
+      provenanceDigest: null,
+    });
+    for (const [attemptId, workspaceId] of [
+      ["foreign-attempt", foreign.id],
+      ["missing-attempt", "missing-stable-workspace"],
+      ["ephemeral-attempt", "workspace:ephemeral-run"],
+    ] as const) {
+      expect(persistAgentRunInspection(inspectionInput(chat.id, {
+        attemptId,
+        runId: `${attemptId}-run`,
+        turnSessionId: `${attemptId}-turn`,
+        generationId: `${attemptId}-generation`,
+        workspaceAssociations: [association(attemptId, workspaceId)],
+      }))).toBeNull();
+    }
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_workspace_associations WHERE user_id = ?",
+    ).get(OWNER)).toEqual({ count: 0 });
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM agent_run_audit_records WHERE user_id = ? AND record_kind = 'workspace'",
+    ).get(OWNER)).toEqual({ count: 0 });
+  });
+
+  test("requires the run chat and exact persistent workspace revision for new associations", () => {
+    const chat = createChat(OWNER, { name: "inspection-workspace-chat-boundary" });
+    const otherChat = createChat(OWNER, { name: "inspection-workspace-chat-boundary-other" });
+    const persistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: chat.id,
+      workspaceId: "chat-boundary-workspace",
+      objective: "Chat-boundary workspace",
+    });
+    const association = (attemptId: string, workspaceRevision: number) => ({
+      version: 1,
+      id: `${attemptId}-association`,
+      workspaceId: persistent.id,
+      workspaceRevision,
+      relation: "linked" as const,
+      objectKind: "objective" as const,
+      objectId: null,
+      sourceRevision: persistent.revision,
+      sourceDeleted: false,
+      provenanceDigest: null,
+    });
+
+    expect(persistAgentRunInspection(inspectionInput(otherChat.id, {
+      attemptId: "cross-chat-workspace-attempt",
+      runId: "cross-chat-workspace-run",
+      turnSessionId: "cross-chat-workspace-turn",
+      generationId: "cross-chat-workspace-generation",
+      workspaceAssociations: [association("cross-chat-workspace", persistent.revision)],
+    }))).toBeNull();
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "future-revision-workspace-attempt",
+      runId: "future-revision-workspace-run",
+      turnSessionId: "future-revision-workspace-turn",
+      generationId: "future-revision-workspace-generation",
+      workspaceAssociations: [association("future-revision-workspace", persistent.revision + 1)],
+    }))).toBeNull();
+
+    const valid = association("detached-replay-workspace", persistent.revision);
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "detached-replay-attempt",
+      runId: "detached-replay-run",
+      turnSessionId: "detached-replay-turn",
+      generationId: "detached-replay-generation",
+      workspaceAssociations: [valid],
+    }))).not.toBeNull();
+    getDb().query("UPDATE persistent_workspaces SET chat_id = NULL WHERE workspace_id = ?").run(persistent.id);
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "detached-new-attempt",
+      runId: "detached-new-run",
+      turnSessionId: "detached-new-turn",
+      generationId: "detached-new-generation",
+      workspaceAssociations: [association("detached-new", persistent.revision)],
+    }))).toBeNull();
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "detached-replay-attempt",
+      runId: "detached-replay-run",
+      turnSessionId: "detached-replay-turn",
+      generationId: "detached-replay-generation",
+      workspaceAssociations: [valid],
+    }))).not.toBeNull();
+  });
+
+  test("stores only the bounded normalized workspace payload", () => {
+    const chat = createChat(OWNER, { name: "inspection-workspace-bounded" });
+    const persistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: chat.id,
+      workspaceId: "bounded-stable-workspace",
+      objective: "Bounded workspace",
+    });
+    const result = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "bounded-workspace-attempt",
+      runId: "bounded-workspace-run",
+      turnSessionId: "bounded-workspace-turn",
+      generationId: "bounded-workspace-generation",
+      workspaceAssociations: [{
+        version: 1,
+        id: "bounded-workspace-association",
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
+        relation: "linked",
+        objectKind: "objective",
+        objectId: null,
+        sourceRevision: persistent.revision,
+        sourceDeleted: false,
+        provenanceDigest: null,
+        unknownPayload: "x".repeat(AGENT_RUN_INSPECTION_MAX_PAYLOAD_BYTES * 4),
+      }],
+    }));
+    expect(result).not.toBeNull();
+    const stored = getDb().query(
+      `SELECT payload_json, byte_size
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'workspace'`,
+    ).get(OWNER, "bounded-workspace-attempt") as { payload_json: string; byte_size: number };
+    expect(stored.byte_size).toBeLessThanOrEqual(AGENT_RUN_INSPECTION_MAX_RECORD_BYTES);
+    expect(JSON.parse(stored.payload_json)).not.toHaveProperty("unknownPayload");
+  });
+
+  test("keeps same workspace replay idempotent, rejects changed payloads, and isolates attempt IDs", () => {
+    const chat = createChat(OWNER, { name: "inspection-workspace-replay" });
+    const persistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: chat.id,
+      workspaceId: "replay-stable-workspace",
+      objective: "Replay workspace",
+    });
+    const secondChat = createChat(OWNER, { name: "inspection-workspace-replay-second" });
+    const secondPersistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: secondChat.id,
+      workspaceId: "replay-stable-workspace-second",
+      objective: "Replay workspace second",
+    });
+    const association = {
+      version: 1 as const,
+      id: "replay-association-a",
+      workspaceId: persistent.id,
+      workspaceRevision: persistent.revision,
+      relation: "linked" as const,
+      objectKind: "objective" as const,
+      objectId: null,
+      sourceRevision: persistent.revision,
+      sourceDeleted: false,
+      provenanceDigest: null,
+    };
+    const first = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "replay-attempt-a",
+      runId: "replay-run-a",
+      turnSessionId: "replay-turn-a",
+      generationId: "replay-generation-a",
+      workspaceAssociations: [association],
+    }));
+    const replay = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "replay-attempt-a",
+      runId: "replay-run-a",
+      turnSessionId: "replay-turn-a",
+      generationId: "replay-generation-a",
+      workspaceAssociations: [association],
+    }));
+    const conflict = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "replay-attempt-a",
+      runId: "replay-run-a",
+      turnSessionId: "replay-turn-a",
+      generationId: "replay-generation-a",
+      workspaceAssociations: [{ ...association, objectId: "changed-object" }],
+    }));
+    const secondWriter = createAgentInspectionWriter({
+      userId: OWNER,
+      chatId: secondChat.id,
+      attemptId: "replay-attempt-b",
+      runId: "replay-run-b",
+      turnSessionId: "replay-turn-b",
+      generationId: "replay-generation-b",
+      generationType: "normal",
+      hostCorrelationId: "inspection-host-second",
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "completed",
+    });
+    const secondAttempt = secondWriter.record("workspace", {
+      ...association,
+      id: "replay-association-b",
+      workspaceId: secondPersistent.id,
+      workspaceRevision: secondPersistent.revision,
+      sourceRevision: secondPersistent.revision,
+    });
+    expect(first).not.toBeNull();
+    expect(replay).not.toBeNull();
+    expect(conflict).toBeNull();
+    expect(secondAttempt).not.toBeNull();
+    expect(getDb().query(
+      "SELECT association_id, attempt_id FROM agent_run_workspace_associations WHERE user_id = ? ORDER BY association_id",
+    ).all(OWNER)).toEqual([
+      { association_id: "replay-association-a", attempt_id: "replay-attempt-a" },
+      { association_id: "replay-association-b", attempt_id: "replay-attempt-b" },
+    ]);
+  });
+
+  test("projects workspace associations durably and retains the stable workspace after chat deletion", () => {
+    const chat = createChat(OWNER, { name: "inspection-workspace-association" });
+    const persistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: chat.id,
+      workspaceId: "persistent-workspace-uuid",
+      objective: "Durable workspace",
+    });
+    const writer = createAgentInspectionWriter({
+      userId: OWNER,
+      chatId: chat.id,
+      attemptId: "workspace-association-attempt",
+      runId: "workspace-association-run",
+      turnSessionId: "workspace-association-turn",
+      generationId: "workspace-association-generation",
+      generationType: "normal",
+      hostCorrelationId: "workspace-association-host",
+      lifecycle: "ASSEMBLE",
+      status: "running",
+    });
+    const association = {
+      version: 1,
+      id: "workspace-association",
+      workspaceId: persistent.id,
+      workspaceRevision: persistent.revision,
+      relation: "linked",
+      objectKind: "objective",
+      objectId: null,
+      sourceRevision: persistent.revision,
+      sourceDeleted: false,
+      provenanceDigest: null,
+      correlation: { actorId: "host", recipientId: "owner" },
+    };
+
+    const first = writer.record("workspace", association);
+    const replay = writer.record("workspace", association);
+    expect(first).not.toBeNull();
+    expect(replay).not.toBeNull();
+    expect(first?.workspaceAssociations).toEqual([
+      expect.objectContaining({
+        id: association.id,
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
+        relation: "linked",
+        objectKind: "objective",
+        objectId: null,
+        sourceRevision: persistent.revision,
+        sourceDeleted: false,
+        provenanceDigest: null,
+        correlation: expect.objectContaining({
+          hostSequence: 1,
+          actorId: "host",
+          recipientId: "owner",
+        }),
+      }),
+    ]);
+    expect(getDb().query(
+      `SELECT association_id, user_id, chat_id, attempt_id, workspace_id, workspace_revision,
+              relation, object_kind, object_id, source_revision, source_deleted,
+              provenance_digest, host_sequence
+         FROM agent_run_workspace_associations
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).all(OWNER, "workspace-association-attempt")).toEqual([{
+      association_id: association.id,
+      user_id: OWNER,
+      chat_id: chat.id,
+      attempt_id: "workspace-association-attempt",
+      workspace_id: persistent.id,
+      workspace_revision: persistent.revision,
+      relation: "linked",
+      object_kind: "objective",
+      object_id: null,
+      source_revision: persistent.revision,
+      source_deleted: 0,
+      provenance_digest: null,
+      host_sequence: 1,
+    }]);
+    expect(getDb().query(
+      `SELECT COUNT(*) AS count
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND attempt_id = ? AND record_kind = 'workspace'`,
+    ).get(OWNER, "workspace-association-attempt")).toEqual({ count: 1 });
+
+    const otherChat = createChat(OTHER, { name: "inspection-workspace-association-other" });
+    const otherPersistent = ensurePersistentWorkspaceForChat({
+      userId: OTHER,
+      chatId: otherChat.id,
+      workspaceId: "persistent-workspace-other",
+      objective: "Other durable workspace",
+    });
+    const otherWriter = createAgentInspectionWriter({
+      userId: OTHER,
+      chatId: otherChat.id,
+      attemptId: "workspace-association-other-attempt",
+      runId: "workspace-association-other-run",
+      turnSessionId: "workspace-association-other-turn",
+      generationId: "workspace-association-other-generation",
+      generationType: "normal",
+      hostCorrelationId: "workspace-association-other-host",
+      lifecycle: "ASSEMBLE",
+      status: "running",
+    });
+    expect(otherWriter.record("workspace", {
+      ...association,
+      workspaceId: otherPersistent.id,
+      workspaceRevision: otherPersistent.revision,
+      sourceRevision: otherPersistent.revision,
+    })).toBeNull();
+    const otherAssociation = {
+      ...association,
+      id: "workspace-association-other",
+      workspaceId: otherPersistent.id,
+      workspaceRevision: otherPersistent.revision,
+      sourceRevision: otherPersistent.revision,
+    };
+    expect(otherWriter.record("workspace", otherAssociation)).not.toBeNull();
+    expect(getDb().query(
+      `SELECT user_id, attempt_id, workspace_id, source_deleted, host_sequence
+         FROM agent_run_workspace_associations
+        ORDER BY user_id, attempt_id`,
+    ).all()).toEqual([
+      {
+        user_id: OTHER,
+        attempt_id: "workspace-association-other-attempt",
+        workspace_id: otherPersistent.id,
+        source_deleted: 0,
+        host_sequence: 2,
+      },
+      {
+        user_id: OWNER,
+        attempt_id: "workspace-association-attempt",
+        workspace_id: persistent.id,
+        source_deleted: 0,
+        host_sequence: 1,
+      },
+    ]);
+
+    expect(deleteChat(OWNER, chat.id)).toBe(true);
+    expect(getAgentRunInspection(OTHER, "workspace-association-attempt", chat.id)).toBeNull();
+    const deleted = getAgentRunInspection(OWNER, "workspace-association-attempt", chat.id);
+    expect(deleted?.workspaceAssociations).toEqual([
+      expect.objectContaining({
+        id: association.id,
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
+        relation: "linked",
+        objectKind: "objective",
+        objectId: null,
+        sourceRevision: persistent.revision,
+        sourceDeleted: true,
+        provenanceDigest: null,
+        correlation: expect.objectContaining({
+          hostSequence: 1,
+          attemptId: "workspace-association-attempt",
+          chatId: chat.id,
+        }),
+      }),
+    ]);
+    expect(getDb().query(
+      `SELECT association_id, workspace_id, workspace_revision, source_deleted, host_sequence
+         FROM agent_run_source_deletion_workspace
+        WHERE user_id = ? AND attempt_id = ?`,
+    ).all(OWNER, "workspace-association-attempt")).toEqual([{
+      association_id: association.id,
+      workspace_id: persistent.id,
+      workspace_revision: persistent.revision,
+      source_deleted: 1,
+      host_sequence: 1,
+    }]);
+    expect(getPersistentWorkspaceById({
+      userId: OWNER,
+      workspaceId: persistent.id,
+    }).id).toBe(persistent.id);
+    expect(getAgentRunInspection(OTHER, "workspace-association-other-attempt", otherChat.id)?.workspaceAssociations).toEqual([
+      expect.objectContaining({
+        id: otherAssociation.id,
+        workspaceId: otherPersistent.id,
+        sourceDeleted: false,
+        correlation: expect.objectContaining({ hostSequence: 2 }),
+      }),
+    ]);
+    expect(getPersistentWorkspaceById({
+      userId: OTHER,
+      workspaceId: otherPersistent.id,
+    }).id).toBe(otherPersistent.id);
+  });
+
+  test("retains each linked, work, and published association once by ID after source deletion", () => {
+    const chat = createChat(OWNER, { name: "inspection-workspace-retention-cardinality" });
+    const persistent = ensurePersistentWorkspaceForChat({
+      userId: OWNER,
+      chatId: chat.id,
+      workspaceId: "retention-cardinality-workspace",
+      objective: "Retention cardinality workspace",
+    });
+    const associations = [
+      {
+        version: 1,
+        id: "retained-linked-objective",
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
+        relation: "linked",
+        objectKind: "objective",
+        objectId: null,
+        sourceRevision: persistent.revision,
+        sourceDeleted: false,
+        provenanceDigest: null,
+      },
+      {
+        version: 1,
+        id: "retained-work-task",
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
+        relation: "linked",
+        objectKind: "task",
+        objectId: "task-retained",
+        sourceRevision: persistent.revision,
+        sourceDeleted: false,
+        provenanceDigest: null,
+      },
+      {
+        version: 1,
+        id: "retained-published-publication",
+        workspaceId: persistent.id,
+        workspaceRevision: persistent.revision,
+        relation: "published",
+        objectKind: "publication",
+        objectId: "publication-retained",
+        sourceRevision: persistent.revision,
+        sourceDeleted: false,
+        provenanceDigest: "b".repeat(64),
+      },
+    ];
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "retention-cardinality-attempt",
+      runId: "retention-cardinality-run",
+      turnSessionId: "retention-cardinality-turn",
+      generationId: "retention-cardinality-generation",
+      workspaceAssociations: associations,
+    }))).not.toBeNull();
+    expect(deleteChat(OWNER, chat.id)).toBe(true);
+    const deleted = getAgentRunInspection(OWNER, "retention-cardinality-attempt", chat.id);
+    const retainedRows = getDb().query(
+      `SELECT association_id, relation, object_kind, source_deleted
+         FROM agent_run_source_deletion_workspace
+        WHERE user_id = ? AND attempt_id = ?
+        ORDER BY association_id`,
+    ).all(OWNER, "retention-cardinality-attempt");
+    expect(retainedRows).toEqual([
+      { association_id: "retained-linked-objective", relation: "linked", object_kind: "objective", source_deleted: 1 },
+      { association_id: "retained-published-publication", relation: "published", object_kind: "publication", source_deleted: 1 },
+      { association_id: "retained-work-task", relation: "linked", object_kind: "task", source_deleted: 1 },
+    ]);
+    expect(deleted?.workspaceAssociations.map(({ id }) => id).sort()).toEqual([
+      "retained-linked-objective",
+      "retained-published-publication",
+      "retained-work-task",
+    ]);
   });
 
   test("scrubs source-private evidence through owner deletion while retaining durable publication copies", () => {
@@ -1195,6 +2127,67 @@ describe("agent run inspection terminal persistence", () => {
       }),
     ]));
     expect(JSON.stringify(detail!.usage)).not.toContain("root-recovered");
+  });
+});
+
+describe("agent run inspection keyset pagination", () => {
+  test("continues past the former offset clamp and emits strictly advancing terminal cursors", () => {
+    const chat = createChat(OWNER, { name: "inspection-pagination-boundary" });
+    getDb().query(`
+      WITH digits(d) AS (
+        VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+      ),
+      numbers(value) AS (
+        SELECT d0.d * 10000 + d1.d * 1000 + d2.d * 100 + d3.d * 10 + d4.d
+          FROM digits AS d0
+          CROSS JOIN digits AS d1
+          CROSS JOIN digits AS d2
+          CROSS JOIN digits AS d3
+          CROSS JOIN digits AS d4
+        UNION ALL SELECT 100000
+        UNION ALL SELECT 100001
+      )
+      INSERT INTO agent_run_attempts (
+        user_id, chat_id, attempt_id, run_id, turn_id, generation_id,
+        generation_type, lifecycle, status, outcome, reason, terminal,
+        started_at, updated_at, terminal_at, host_correlation_id,
+        reconciliation_state, terminal_receipt_json, version
+      )
+      SELECT ?, ?, printf('boundary-%06d', value), printf('boundary-run-%06d', value),
+        printf('boundary-turn-%06d', value), printf('boundary-generation-%06d', value),
+        'normal', 'TERMINAL', 'terminal', 'completed', 'none', 1,
+        1, 1, 1, printf('boundary-host-%06d', value),
+        'authoritative', NULL, 1
+      FROM numbers
+    `).run(OWNER, chat.id);
+
+    const beforeClamp = listAgentRunInspections(
+      OWNER,
+      chat.id,
+      1,
+      __test__mintAgentRunInspectionCursor(1, "boundary-000002"),
+    );
+    expect(beforeClamp?.runs.map((run) => run.attempt.attemptId)).toEqual(["boundary-000001"]);
+    expect(beforeClamp?.nextCursor).not.toBeNull();
+    expect(beforeClamp?.nextCursor).not.toBe(__test__mintAgentRunInspectionCursor(1, "boundary-000002"));
+
+    const after = listAgentRunInspections(OWNER, chat.id, 1, beforeClamp!.nextCursor!);
+    expect(after?.runs.map((run) => run.attempt.attemptId)).toEqual(["boundary-000000"]);
+    expect(after?.nextCursor).toBeNull();
+
+    const atClamp = listAgentRunInspections(
+      OWNER,
+      chat.id,
+      1,
+      __test__mintAgentRunInspectionCursor(1, "boundary-000001"),
+    );
+    expect(atClamp?.runs.map((run) => run.attempt.attemptId)).toEqual(["boundary-000000"]);
+    expect(atClamp?.nextCursor).toBeNull();
+    expect(listAgentRunInspections(OWNER, chat.id, 1, "100000")).toBeNull();
+    expect(listAgentRunInspections(OWNER, chat.id, 1, "v1.invalid")).toBeNull();
+
+    const oversized = `v1.${"a".repeat(AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES)}`;
+    expect(listAgentRunInspections(OWNER, chat.id, 1, oversized)).toBeNull();
   });
 });
 

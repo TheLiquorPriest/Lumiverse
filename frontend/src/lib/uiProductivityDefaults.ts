@@ -55,6 +55,17 @@ export function isMobileViewportOrDevice(): boolean {
   return window.matchMedia?.('(pointer: coarse)').matches || window.innerWidth <= 600
 }
 
+export async function acknowledgeConnectionProfileSelection(options: {
+  profileId: string
+  setActiveProfile: (id: string | null, reason?: 'user_selection') => void
+  acknowledgeActive?: (request: { id: string | null; reason: 'user_selection' }) => void | Promise<void>
+  closePopover: () => void
+}): Promise<void> {
+  options.setActiveProfile(options.profileId, 'user_selection')
+  await options.acknowledgeActive?.({ id: options.profileId, reason: 'user_selection' })
+  options.closePopover()
+}
+
 export const DEFAULT_CHARACTER_DISPLAY_SETTINGS: CharacterDisplaySettings = {
   thumbnailWidth: 170,
   thumbnailHeight: 226,
@@ -67,7 +78,9 @@ export const DEFAULT_CHARACTER_DISPLAY_SETTINGS: CharacterDisplaySettings = {
   defaultFilter: 'characters',
 }
 
-export const DEFAULT_QUICK_TOOLBAR_SETTINGS: QuickToolbarSettings = {
+export const DEFAULT_QUICK_TOOLBAR_SETTINGS: QuickToolbarSettings & {
+  v2ViewportGeometryVersion: number
+} = {
   enabled: true,
   variant: 'v1-free',
   visibleTabIds: [
@@ -121,6 +134,8 @@ export const DEFAULT_QUICK_TOOLBAR_SETTINGS: QuickToolbarSettings = {
   // The confirmed two-line card design, so an existing row backfilled with this
   // default looks exactly as it did before the setting existed.
   v2Density: 'comfortable',
+  // V2 floating geometry is chat-column-relative and is reset once during hydration.
+  v2ViewportGeometryVersion: 2,
 }
 
 export const DEFAULT_CONNECTIONS_PICKER_SETTINGS: ConnectionsPickerSettings = {
@@ -316,12 +331,34 @@ export const PRODUCTIVITY_DEFAULTS = freezeDeep({
   characterTabDisplaySettings: DEFAULT_CHARACTER_TAB_DISPLAY_SETTINGS,
   portraitDockSettings: DEFAULT_PORTRAIT_DOCK_SETTINGS,
   lorebookEditorSettings: DEFAULT_LOREBOOK_EDITOR_SETTINGS,
+  showEmbeddingFallbackUi: true,
+  showCortexSecondaryUi: true,
+  showEditAndSend: true,
+  enableToolbarIconReorder: true,
+  showComposerCustomizeGear: true,
+  productivityTabPosition: 'after-display',
 })
 
 export function migrateProductivitySetting(key: string, value: unknown): unknown {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value
   const row = { ...(value as Record<string, unknown>) }
-  if (key === 'quickToolbarSettings' && row.variant === 'v3-adaptive') row.variant = 'v1-free'
+  if (key === 'quickToolbarSettings') {
+    if (row.variant === 'v3-adaptive') row.variant = 'v1-free'
+    // V2 floating rows written before the viewport-rail fix commonly contain
+    // the old centered chat-column rectangle (for example x=554, width=763).
+    // Preserve the user's position, but release the stale width so the current
+    // fit code can measure the real viewport. The marker makes this one-shot.
+    const rect = row.rect
+    if (
+      row.variant === 'v2-settings-adjacent'
+      && row.v2ViewportGeometryVersion !== 2
+      && rect && typeof rect === 'object' && !Array.isArray(rect)
+      && Number((rect as Record<string, unknown>).width) > 0
+    ) {
+      row.rect = { ...(rect as Record<string, unknown>), width: 0, height: 0 }
+      row.v2ViewportGeometryVersion = 2
+    }
+  }
   if (key === 'loreIndicatorSettings') {
     row.entryTypeAppearance = normalizeLoreIndicatorEntryTypeAppearance(row.entryTypeAppearance)
   }

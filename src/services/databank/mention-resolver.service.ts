@@ -8,15 +8,21 @@
  *   4. Run the expensive content fetch + vector search ONLY for the last user
  *      message's slugs (the only ones that contribute to the appendix)
  *
- * Heavy resolution results are cached for 5 minutes keyed by
- * (userId, chatId, sortedSlugs, queryContext) so regens/swipes that re-trigger
- * assembly with the same trailing context hit the cache instead of re-embedding.
+ * Heavy resolution results are cached for 5 minutes by user/chat, sorted
+ * document identities, and query context so unchanged regens/swipes reuse work
+ * while document or scope changes cannot return stale content.
  */
 
 import * as crud from "./databank-crud.service";
 import * as embeddingsSvc from "../embeddings.service";
 import { resolveActiveDatabankIds } from "./scope-resolver.service";
 import type { DatabankDocument, ResolvedMention } from "./types";
+import {
+  clearResolveCache as clearResolveCacheStore,
+  getResolveCache,
+  getResolveCacheVersion,
+  setResolveCache,
+} from "./mention-resolve-cache.service";
 
 /** Regex matching #slug in user messages. Slug = lowercase alphanumeric + hyphens. */
 const MENTION_PATTERN = /(?:^|\s)#([a-z0-9][a-z0-9-]*)/gi;
@@ -89,7 +95,7 @@ export function lookupSlugsInScope(
   const activeBankSet = new Set(activeBankIds);
 
   for (const slug of slugArr) {
-    const doc = crud.getDocumentBySlug(userId, slug);
+    const doc = crud.getDocumentBySlug(userId, slug, activeBankIds);
     if (!doc) continue;
     if (!activeBankSet.has(doc.databankId)) continue;
     validSlugs.add(slug);
@@ -100,31 +106,33 @@ export function lookupSlugsInScope(
 
 // ─── Heavy Resolution (async, cached) ─────────────────────────
 
-const RESOLVE_CACHE_TTL_MS = 5 * 60 * 1000;
-
-interface CachedResolve {
-  result: ResolvedMention[];
-  cachedAt: number;
-}
-
-const resolveCache = new Map<string, CachedResolve>();
-
 function resolveCacheKey(
   userId: string,
   chatId: string,
   slugs: Iterable<string>,
+  docs: Map<string, DatabankDocument>,
   queryContext: string,
 ): string {
-  const sorted = Array.from(slugs).sort().join(",");
-  return `${userId}:${chatId}:${Bun.hash(sorted).toString(36)}:${Bun.hash(queryContext).toString(36)}`;
+  const identities = Array.from(slugs)
+    .sort()
+    .map((slug) => {
+      const doc = docs.get(slug);
+      return [
+        slug,
+        doc?.id ?? "",
+        doc?.databankId ?? "",
+        doc?.name ?? "",
+        doc?.contentHash ?? "",
+        doc?.status ?? "",
+        doc?.updatedAt ?? 0,
+      ];
+    });
+  return `${userId}:${chatId}:${Bun.hash(JSON.stringify(identities)).toString(36)}:${Bun.hash(queryContext).toString(36)}`;
 }
 
 /** Drop cached resolutions for a user+chat (e.g. after a doc update). */
 export function clearResolveCache(userId: string, chatId: string): void {
-  const prefix = `${userId}:${chatId}:`;
-  for (const key of resolveCache.keys()) {
-    if (key.startsWith(prefix)) resolveCache.delete(key);
-  }
+  clearResolveCacheStore(userId, chatId);
 }
 
 /**
@@ -134,8 +142,8 @@ export function clearResolveCache(userId: string, chatId: string): void {
  *    to the document's chunks; falls back to the first ~3000 chars if no
  *    chunks return.
  *
- * Cached for 5 min by (userId, chatId, slug-set, queryContext) so regens/swipes
- * skip the embedding + LanceDB round trip when nothing material has changed.
+ * Cached for 5 min by user/chat, document identities, and query context so
+ * regens/swipes skip embedding and LanceDB work only while inputs are unchanged.
  */
 export async function resolveSlugContent(
   userId: string,
@@ -148,13 +156,12 @@ export async function resolveSlugContent(
   const slugArr = Array.from(slugs).filter((s) => docs.has(s));
   if (slugArr.length === 0) return [];
 
-  const key = resolveCacheKey(userId, chatId, slugArr, queryContext);
-  const cached = resolveCache.get(key);
-  if (cached && Date.now() - cached.cachedAt <= RESOLVE_CACHE_TTL_MS) {
-    return cached.result;
+  const key = resolveCacheKey(userId, chatId, slugArr, docs, queryContext);
+  const cacheVersion = getResolveCacheVersion(userId, chatId);
+  const cached = getResolveCache(key);
+  if (cached) {
+    return cached;
   }
-  if (cached) resolveCache.delete(key);
-
   const resolved: ResolvedMention[] = [];
   // Embedded lazily on the first large-doc miss, then reused for the rest of
   // the batch — every large-doc search in a single call uses the same
@@ -205,8 +212,8 @@ export async function resolveSlugContent(
           : fullText.slice(0, 3000);
       } catch {
         content = fullText.slice(0, 3000);
-      }
     }
+  }
 
     resolved.push({
       slug,
@@ -217,7 +224,7 @@ export async function resolveSlugContent(
   }
 
   if (!signal?.aborted) {
-    resolveCache.set(key, { result: resolved, cachedAt: Date.now() });
+    setResolveCache(key, resolved, userId, chatId, cacheVersion);
   }
   return resolved;
 }

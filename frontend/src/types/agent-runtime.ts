@@ -130,9 +130,8 @@ export type AgentActivityContinuationMode = 'ordinary' | 'finalization' | 'none'
 export type AgentActivityToolId =
   | 'lore_list_books' | 'lore_get_book' | 'lore_list_entries' | 'lore_get_entry'
   | 'lore_search_entries' | 'chat_search_history' | 'agent_delegate'
-  | 'context_pack_list' | 'context_pack_get'
   | 'workspace_read_section' | 'workspace_read_page' | 'workspace_create_task'
-  | 'workspace_update_progress' | 'workspace_submit_result' | 'workspace_accept_submission'
+  | 'workspace_update_progress' | 'workspace_submit_result' | 'workspace_submit_root_result' | 'workspace_accept_submission'
   | 'workspace_record_finding' | 'workspace_record_decision' | 'workspace_record_question'
   | 'workspace_attach_artifact' | 'workspace_propose_publication'
   | 'complete_turn' | 'unknown_tool'
@@ -212,16 +211,6 @@ export interface LoomPolicySourceV1 {
   readonly promptOrder: number
 }
 
-export interface LoomOnDemandRequestV1 {
-  readonly contextPackId: string
-  readonly revisionId: string
-  readonly digest: string
-}
-
-export type LoomPolicyDeliveryV1 =
-  | { readonly delivery: 'direct' }
-  | { readonly delivery: 'condition_gated'; readonly condition: CognitionPredicate }
-  | { readonly delivery: 'on_demand'; readonly request: LoomOnDemandRequestV1 }
 
 export interface LoomPolicyEntryV1 {
   readonly version: typeof LOOM_POLICY_VERSION
@@ -231,7 +220,7 @@ export interface LoomPolicyEntryV1 {
   readonly checkpoint: LoomPolicyCheckpointV1
   readonly required: boolean
   readonly visibility: LoomPolicyVisibilityV1
-  readonly delivery: LoomPolicyDeliveryV1
+  readonly condition?: CognitionPredicate
 }
 
 export interface LoomPolicyBucketsV1 {
@@ -242,31 +231,15 @@ export interface LoomPolicyBucketsV1 {
   readonly renderPolicy: readonly LoomPolicyEntryV1[]
 }
 
-export type LoomOnDemandRetrievalStatusV1 =
-  | 'not_requested'
-  | 'available'
-  | 'unavailable'
-  | 'stale'
-  | 'unauthorized'
-
 export type LoomPromptInspectionOutcomeV1 =
-  | { readonly status: 'included'; readonly effectiveIndex: number }
+  | { readonly status: 'included'; readonly effectiveIndex: number; readonly reason: 'selected' }
   | {
       readonly status: 'skipped'
-      readonly reason:
-        | 'checkpoint_not_reached'
-        | 'condition_not_met'
-        | 'on_demand_not_requested'
-        | 'on_demand_unavailable'
+      readonly reason: 'checkpoint_not_reached' | 'condition_not_met' | 'stale_source'
     }
   | {
       readonly status: 'rejected'
-      readonly reason:
-        | 'invalid_source'
-        | 'stale_source'
-        | 'unsupported_delivery'
-        | 'unauthorized_retrieval'
-        | 'required_source_unavailable'
+      readonly reason: 'invalid_source' | 'stale_source' | 'required_source_unavailable'
     }
   | {
       readonly status: 'omitted'
@@ -274,6 +247,7 @@ export type LoomPromptInspectionOutcomeV1 =
     }
   | {
       readonly status: 'deduplicated'
+      readonly reason: 'destination_overlap'
       readonly keptEntryId: string
       readonly destination: LoomPolicyDestinationV1
     }
@@ -284,15 +258,18 @@ export interface LoomPromptInspectionItemV1 {
   readonly destination: LoomPolicyDestinationV1
   readonly checkpoint: LoomPolicyCheckpointV1
   readonly source: LoomPolicySourceV1
-  readonly delivery: LoomPolicyDeliveryV1
+  readonly condition?: CognitionPredicate
+  readonly conditionResult?: 'true' | 'false' | 'not_evaluated' | 'invalid' | 'not_applicable'
   readonly effectiveText: string | null
-  readonly retrievalStatus?: LoomOnDemandRetrievalStatusV1
+  readonly required: boolean
+  readonly ordinaryPromptSuppressed: boolean
   readonly outcome: LoomPromptInspectionOutcomeV1
 }
 
 export interface LoomResponsePolicyPhaseInstructionV1 {
   readonly phaseId: string
   readonly source: LoomPolicySourceV1
+  readonly profileId?: string
 }
 
 export interface LoomResponsePolicyOmissionV1 {
@@ -303,6 +280,7 @@ export interface LoomResponsePolicyOmissionV1 {
   readonly omittedEntryIds: readonly string[]
   readonly source: readonly LoomPolicySourceV1[]
   readonly omittedPhaseInstructions: readonly LoomResponsePolicyPhaseInstructionV1[]
+  readonly reviewReason?: string
 }
 
 export interface LoomPromptInspectionV1 {
@@ -318,9 +296,6 @@ export interface LoomPromptInspectionBlockV1 {
   readonly content: string
 }
 
-export interface LoomPromptInspectionContextPackV1 extends LoomOnDemandRequestV1 {
-  readonly content: string
-}
 
 export interface LoomPromptEvaluationV1 {
   readonly generationType: 'normal' | 'continue' | 'regenerate' | 'swipe'
@@ -336,7 +311,6 @@ export interface LoomPromptInspectionInputV1 {
   readonly surface: 'WORK' | 'RESPONSE'
   readonly evaluation?: LoomPromptEvaluationV1
   readonly blocks: readonly LoomPromptInspectionBlockV1[]
-  readonly contextPacks: readonly LoomPromptInspectionContextPackV1[]
 }
 
 export interface CognitionRuntimePolicySurfaceV1 {

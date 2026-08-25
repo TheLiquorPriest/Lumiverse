@@ -5,6 +5,7 @@ import type {
   LoomPreset,
   PromptBlock,
 } from './types'
+import type { LoomPolicyEntryV1 } from '@/types/agent-runtime'
 import {
   DEFAULT_ADVANCED_SETTINGS,
   DEFAULT_COMPLETION_SETTINGS,
@@ -13,21 +14,25 @@ import {
   DEFAULT_SAMPLER_OVERRIDES,
 } from './constants'
 import {
-  AGENTIC_CONTEXT_RULE_LIMIT,
+  AGENT_MAX_OUTPUT_TOKENS_MAX,
   AGENTIC_PREDICATE_MAX_DEPTH,
   AGENTIC_PREDICATE_MAX_NODES,
+  AGENTIC_PREDICATE_MAX_STRING_BYTES,
   AGENTIC_TASK_TEMPLATE_LIMIT,
-  AGENT_MAX_OUTPUT_TOKENS_MAX,
+  AGENT_PROFILE_NAME_MAX_LENGTH,
   AGENT_SYSTEM_PROMPT_MAX_BYTES,
   AGENT_TIMEOUT_MS_MIN,
   createAgenticRuntimeDraft,
   createDefaultAgentConfigV2,
+  createAgentProfileV2,
   createLoomPolicyEntryV1,
   getAgenticRuntimeRepairItems,
   getAgentRuntimePolicyBuckets,
+  inspectLoomPromptPoliciesV1,
   normalizeAgentConfigForEditor,
   normalizeLoomPolicyBucketsV1,
   parseAgentCustomPhasesV1,
+  parseAgentRuntimePolicyV1,
   parseLoomPolicyBucketsV1,
   requiredReviewAcknowledgements,
   setAgentRuntimeCustomPhases,
@@ -53,8 +58,6 @@ const block = (revision = 3): PromptBlock => ({
 const draft = (): AgenticRuntimeSaveDraft => ({
   config: createDefaultAgentConfigV2(),
   slotBindings: {},
-  contextPackSelections: [],
-  contextRules: [],
   taskTemplates: [],
   reviewAcknowledgements: [],
 })
@@ -62,6 +65,7 @@ const draft = (): AgenticRuntimeSaveDraft => ({
 const presetWithMetadata = (metadata: LoomPassthroughMetadata): LoomPreset => ({
   id: 'preset-1',
   name: 'Preset',
+  engine: 'classic',
   description: '',
   coverUrl: null,
   presetVersion: null,
@@ -75,8 +79,6 @@ const presetWithMetadata = (metadata: LoomPassthroughMetadata): LoomPreset => ({
   agentConfigRevision: 0,
   agentConfigReview: null,
   agentSlotBindings: {},
-  agentContextPackSelections: [],
-  agentContextRules: [],
   agentTaskTemplates: [],
   blocks: [block()],
   source: null,
@@ -147,48 +149,37 @@ describe('Agentic Runtime shared draft validation', () => {
     })
   })
 
-  test('rejects missing context snapshots and cyclic task dependencies as one draft', () => {
+  test('rejects cyclic task dependencies', () => {
     const candidate = draft()
-    candidate.contextRules = [{
-      id: 'required-rules',
-      packId: 'rules',
-      revisionId: 'rules@4',
-      required: true,
-      activation: { kind: 'phase', value: 'WORK' },
-    }]
     candidate.taskTemplates = [
       { id: 'first', required: true, dependencies: ['second'], activation: { kind: 'phase', value: 'WORK' } },
       { id: 'second', required: true, dependencies: ['first'], activation: { kind: 'phase', value: 'WORK' } },
     ]
-
     const result = validateAgenticRuntimeDraft(candidate, [], 0)
-    expect(result.issues.some((issue) => issue.code === 'missing_context_pack_revision')).toBe(true)
     expect(result.issues.some((issue) => issue.code === 'cyclic_task_dependency')).toBe(true)
   })
-
+ 
   test('requires every imported review item before saving or activation', () => {
     const candidate = draft()
-    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a', 'pack:b']).issues)
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a']).issues)
       .toContainEqual({ code: 'review_acknowledgement_required', path: 'reviewAcknowledgements' })
     candidate.config.agentsEnabled = true
     candidate.config.allowedModes = ['response', 'agentic']
-    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a', 'pack:b']).issues)
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a']).issues)
       .toContainEqual({ code: 'review_acknowledgement_required', path: 'reviewAcknowledgements' })
-
-    candidate.reviewAcknowledgements = ['slot:a', 'pack:b']
-    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a', 'pack:b']).valid).toBe(true)
-
-    candidate.reviewAcknowledgements = ['slot:a', 'pack:b', 'review:cognition_foreign_authority_blocked']
-    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a', 'pack:b']).valid).toBe(true)
+    candidate.reviewAcknowledgements = ['slot:a']
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a']).valid).toBe(true)
+    candidate.reviewAcknowledgements = ['slot:a', 'review:cognition_foreign_authority_blocked']
+    expect(validateAgenticRuntimeDraft(candidate, [], 0, ['slot:a']).valid).toBe(true)
     expect(validateAgenticRuntimeDraft(candidate, [], 0, []).valid).toBe(true)
-    expect(requiredReviewAcknowledgements(['slot:a', 'pack:b'], candidate.reviewAcknowledgements))
-      .toEqual(['slot:a', 'pack:b', 'review:cognition_foreign_authority_blocked'])
-    expect(requiredReviewAcknowledgements(['slot:a', 'pack:b', 'review:foreign_import'], ['review:cognition_foreign_authority_blocked']))
-      .toEqual(['slot:a', 'pack:b', 'review:foreign_import'])
+    expect(requiredReviewAcknowledgements(['slot:a'], candidate.reviewAcknowledgements))
+      .toEqual(['slot:a', 'review:cognition_foreign_authority_blocked'])
+    expect(requiredReviewAcknowledgements(['slot:a', 'review:foreign_import'], ['review:cognition_foreign_authority_blocked']))
+      .toEqual(['slot:a', 'review:foreign_import'])
     expect(validateAgenticRuntimeDraft(candidate, [], 0, ['review:cognition_foreign_authority_blocked']).valid).toBe(true)
     candidate.reviewAcknowledgements = []
     expect(validateAgenticRuntimeDraft(candidate, [], 0, ['review:cognition_foreign_authority_blocked']).valid).toBe(false)
-
+ 
     const imported = presetWithMetadata({})
     imported.agentConfigReview = {
       state: 'review_required',
@@ -208,26 +199,10 @@ describe('Agentic Runtime shared draft validation', () => {
       'slot:writer',
       'review:foreign_import',
     ])
-
   })
-
-  test('accepts one internally consistent draft containing phase, context, and task policy', () => {
+ 
+  test('accepts one internally consistent draft containing phase and task policy', () => {
     const candidate = draft()
-    candidate.contextPackSelections = [{
-      packId: 'world-rules',
-      revisionId: 'world-rules@7',
-      revision: 7,
-      label: 'World rules',
-      revisionLabel: '7',
-      digest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    }]
-    candidate.contextRules = [{
-      id: 'activate_rules',
-      packId: 'world-rules',
-      revisionId: 'world-rules@7',
-      required: true,
-      activation: { kind: 'phase', value: 'WORK' },
-    }]
     candidate.taskTemplates = [{
       id: 'verify_rules',
       label: 'Verify rules',
@@ -245,11 +220,10 @@ describe('Agentic Runtime shared draft validation', () => {
       completionCriteria: [],
       renderPolicy: [],
     }
-    candidate.config.contextPolicy = { ruleIds: ['activate_rules'], packIds: ['world-rules'] }
     candidate.config.taskPolicy = { templateIds: ['verify_rules'] }
-
     expect(validateAgenticRuntimeDraft(candidate, [block(3)], 8)).toEqual({ valid: true, issues: [] })
   })
+
   test('accepts every closed leaf predicate variant without false invalidation', () => {
     const candidate = draft()
     candidate.taskTemplates = [{
@@ -278,14 +252,13 @@ describe('Agentic Runtime shared draft validation', () => {
       .toContainEqual({ code: 'invalid_task_template', path: 'taskTemplates.0' })
   })
 
-  test('matches backend cognition ceilings at the exact predicate, task, and rule boundaries', () => {
+  test('matches backend cognition ceilings at exact predicate and task boundaries', () => {
     expect({
       depth: AGENTIC_PREDICATE_MAX_DEPTH,
       nodes: AGENTIC_PREDICATE_MAX_NODES,
       tasks: AGENTIC_TASK_TEMPLATE_LIMIT,
-      rules: AGENTIC_CONTEXT_RULE_LIMIT,
-    }).toEqual({ depth: 16, nodes: 256, tasks: 256, rules: 256 })
-
+    }).toEqual({ depth: 16, nodes: 256, tasks: 256 })
+ 
     const nodeBoundary = draft()
     nodeBoundary.taskTemplates = [{
       id: 'node_boundary',
@@ -301,7 +274,18 @@ describe('Agentic Runtime shared draft validation', () => {
     if (boundaryActivation?.kind !== 'all') throw new Error('Expected all predicate')
     boundaryActivation.children.push({ kind: 'phase', value: 'WORK' })
     expect(validateAgenticRuntimeDraft(nodeBoundary, [], 0).issues.some((issue) => issue.code === 'predicate_limit_exceeded')).toBe(true)
-
+    type BinaryPredicate =
+      | { kind: 'phase'; value: 'WORK' }
+      | { kind: 'all'; children: BinaryPredicate[] }
+    const binaryPredicate = (depth: number): BinaryPredicate => depth === 0
+      ? { kind: 'phase', value: 'WORK' }
+      : { kind: 'all', children: [binaryPredicate(depth - 1), binaryPredicate(depth - 1)] }
+    const farOverWidth = draft()
+    farOverWidth.taskTemplates = [{ id: 'far_over_width', required: true, activation: binaryPredicate(9) }]
+    farOverWidth.config.taskPolicy = { templateIds: ['far_over_width'] }
+    expect(validateAgenticRuntimeDraft(farOverWidth, [], 0).issues)
+      .toContainEqual({ code: 'predicate_limit_exceeded', path: 'taskTemplates.0.activation' })
+ 
     const taskBoundary = draft()
     taskBoundary.taskTemplates = Array.from({ length: AGENTIC_TASK_TEMPLATE_LIMIT }, (_value, index) => ({
       id: `task_${index}`,
@@ -313,91 +297,37 @@ describe('Agentic Runtime shared draft validation', () => {
     taskBoundary.config.taskPolicy.templateIds.push('task_overflow')
     expect(validateAgenticRuntimeDraft(taskBoundary, [], 0).issues)
       .toContainEqual({ code: 'invalid_task_template', path: 'taskTemplates' })
-
-    const ruleBoundary = draft()
-    ruleBoundary.contextPackSelections = Array.from({ length: AGENTIC_CONTEXT_RULE_LIMIT }, (_value, index) => ({
-      packId: `pack_${index}`,
-      revisionId: `pack_${index}@1`,
-      revision: 1,
-      label: `Pack ${index}`,
-      revisionLabel: '1',
-      digest: 'a'.repeat(64),
-    }))
-    ruleBoundary.contextRules = ruleBoundary.contextPackSelections.map((selection, index) => ({
-      id: `rule_${index}`,
-      packId: selection.packId,
-      revisionId: selection.revisionId,
-      required: false,
-    }))
-    ruleBoundary.config.contextPolicy = {
-      ruleIds: ruleBoundary.contextRules.map((rule) => rule.id),
-      packIds: [],
-    }
-    expect(validateAgenticRuntimeDraft(ruleBoundary, [], 0).valid).toBe(true)
-    ruleBoundary.contextPackSelections.push({
-      packId: 'pack_overflow',
-      revisionId: 'pack_overflow@1',
-      revision: 1,
-      label: 'Overflow',
-      revisionLabel: '1',
-      digest: 'b'.repeat(64),
-    })
-    ruleBoundary.contextRules.push({
-      id: 'rule_overflow',
-      packId: 'pack_overflow',
-      revisionId: 'pack_overflow@1',
-      required: false,
-    })
-    ruleBoundary.config.contextPolicy.ruleIds.push('rule_overflow')
-    expect(validateAgenticRuntimeDraft(ruleBoundary, [], 0).issues)
-      .toContainEqual({ code: 'invalid_context_rule', path: 'contextRules' })
   })
-
-  test('quarantines malformed context digest and duplicate pack revisions', () => {
-    const candidate = draft()
-    candidate.contextPackSelections = [{
-      packId: 'rules',
-      revisionId: 'rules@4',
-      revision: 4,
-      label: 'Rules',
-      revisionLabel: '4',
-      digest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    }, {
-      packId: 'rules',
-      revisionId: 'rules@5',
-      revision: 5,
-      label: 'Rules',
-      revisionLabel: '5',
-      digest: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-    }, {
-      packId: 'other',
-      revisionId: 'other@1',
-      revision: 1,
-      label: 'Other',
-      revisionLabel: '1',
-      digest: 'not-a-digest',
+  test('classifies per-string predicate ceiling failures', () => {
+    const longStringCandidate = draft()
+    longStringCandidate.taskTemplates = [{
+      id: 'long_string',
+      required: true,
+      activation: {
+        kind: 'participant_fact',
+        name: 'fact',
+        operator: 'includes',
+        value: 'x'.repeat(AGENTIC_PREDICATE_MAX_STRING_BYTES + 1),
+      },
     }]
-    const result = validateAgenticRuntimeDraft(candidate, [], 0)
-    expect(result.issues).toContainEqual({ code: 'invalid_context_selection', path: 'contextPackSelections.1' })
-    expect(result.issues).toContainEqual({ code: 'invalid_context_selection', path: 'contextPackSelections.2' })
-  })
-  test('quarantines a selected pack that is neither direct nor rule referenced', () => {
-    const candidate = draft()
-    candidate.contextPackSelections = [{
-      packId: 'orphan',
-      revisionId: 'orphan@1',
-      revision: 1,
-      label: 'Orphan',
-      revisionLabel: 'Revision 1',
-      digest: 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+    longStringCandidate.config.taskPolicy = { templateIds: ['long_string'] }
+    expect(validateAgenticRuntimeDraft(longStringCandidate, [], 0).issues)
+      .toContainEqual({ code: 'predicate_limit_exceeded', path: 'taskTemplates.0.activation' })
+ 
+    const longIdCandidate = draft()
+    longIdCandidate.taskTemplates = [{
+      id: 'long_id',
+      required: true,
+      activation: {
+        kind: 'preset_variable',
+        name: 'n'.repeat(257),
+        operator: 'present',
+      },
     }]
-    const result = validateAgenticRuntimeDraft(candidate, [], 0)
-    expect(result.issues).toContainEqual({
-      code: 'context_policy_reference',
-      path: 'contextPackSelections.orphan',
-    })
+    longIdCandidate.config.taskPolicy = { templateIds: ['long_id'] }
+    expect(validateAgenticRuntimeDraft(longIdCandidate, [], 0).issues)
+      .toContainEqual({ code: 'predicate_limit_exceeded', path: 'taskTemplates.0.activation' })
   })
-
   test('enforces profile ceilings in the shared validator', () => {
     const candidate = draft()
     candidate.config.profiles = [{
@@ -485,7 +415,7 @@ describe('Agentic Runtime shared draft validation', () => {
       .toContainEqual({ code: 'invalid_profile', path: 'config.profiles.0' })
   })
 
-  test('requires task policy IDs to be the closed set of declared templates', () => {
+  test('requires task policy IDs to reference declared templates without filling omitted selections', () => {
     const candidate = draft()
     candidate.taskTemplates = [{ id: 'task_1', required: false }]
     candidate.config.taskPolicy = { templateIds: ['missing'] }
@@ -495,9 +425,12 @@ describe('Agentic Runtime shared draft validation', () => {
     candidate.config.taskPolicy = { templateIds: ['task_1', 'task_1'] }
     expect(validateAgenticRuntimeDraft(candidate, [], 0).issues)
       .toContainEqual({ code: 'invalid_task_policy', path: 'config.taskPolicy.templateIds.1' })
+
     candidate.config.taskPolicy = { templateIds: [] }
+    expect(validateAgenticRuntimeDraft(candidate, [], 0).valid).toBe(true)
+    delete candidate.config.taskPolicy
     expect(validateAgenticRuntimeDraft(candidate, [], 0).issues)
-      .toContainEqual({ code: 'invalid_task_policy', path: 'taskTemplates.task_1' })
+      .toContainEqual({ code: 'invalid_task_policy', path: 'config.taskPolicy' })
   })
 
   test('accepts a dormant backend config that omits optional policies', () => {
@@ -527,6 +460,75 @@ describe('Agentic Runtime shared draft validation', () => {
     expect(normalizeAgentConfigForEditor(sparse).taskPolicy).toEqual({ templateIds: [] })
   })
 })
+  test('quarantines malformed imported profiles and connection slots without fabricating runnable rows', () => {
+    const agentConfig = {
+      ...createDefaultAgentConfigV2(),
+      profiles: [{ id: 'hostile', name: 'Hostile' }] as never[],
+      connectionSlots: [{ id: 'hostile-slot', label: 'Hostile slot' }] as never[],
+    }
+    const hydrated = createAgenticRuntimeDraft({
+      ...presetWithMetadata({}),
+      agentConfig: agentConfig as never,
+      blocks: [],
+    })
+
+    expect(hydrated.config.profiles).toEqual([])
+    expect(hydrated.config.connectionSlots).toEqual([])
+    expect(hydrated.quarantinedProfiles).toEqual([{
+      id: 'invalid_profile:0',
+      index: 0,
+      reasonCode: 'invalid_profile',
+    }])
+    expect(hydrated.quarantinedConnectionSlots).toEqual([{
+      id: 'invalid_slot:0',
+      index: 0,
+      reasonCode: 'invalid_slot',
+    }])
+    expect(validateAgenticRuntimeDraft(hydrated, [], 0).issues).toEqual(expect.arrayContaining([
+      { code: 'invalid_profile', path: 'config.profiles.quarantine' },
+      { code: 'invalid_slot', path: 'config.connectionSlots.quarantine' },
+    ]))
+  })
+
+  test('uses code-point limits for profile names and connection-slot labels', () => {
+    const acceptedConfig = createDefaultAgentConfigV2()
+    const acceptedProfile = createAgentProfileV2('Agent', [])
+    acceptedProfile.name = '😀'.repeat(AGENT_PROFILE_NAME_MAX_LENGTH)
+    acceptedConfig.profiles = [acceptedProfile]
+    acceptedConfig.connectionSlots = [{
+      id: 'writer',
+      label: '😀'.repeat(AGENT_PROFILE_NAME_MAX_LENGTH),
+      requiredCapabilities: [],
+    }]
+    const accepted = createAgenticRuntimeDraft({
+      ...presetWithMetadata({}),
+      agentConfig: acceptedConfig,
+      blocks: [],
+    })
+    expect(accepted.config.profiles).toHaveLength(1)
+    expect(accepted.config.connectionSlots).toHaveLength(1)
+    expect(accepted.quarantinedProfiles).toEqual([])
+    expect(accepted.quarantinedConnectionSlots).toEqual([])
+
+    const rejectedConfig = createDefaultAgentConfigV2()
+    const rejectedProfile = createAgentProfileV2('Agent', [])
+    rejectedProfile.name = '😀'.repeat(AGENT_PROFILE_NAME_MAX_LENGTH + 1)
+    rejectedConfig.profiles = [rejectedProfile]
+    rejectedConfig.connectionSlots = [{
+      id: 'writer',
+      label: '😀'.repeat(AGENT_PROFILE_NAME_MAX_LENGTH + 1),
+      requiredCapabilities: [],
+    }]
+    const rejected = createAgenticRuntimeDraft({
+      ...presetWithMetadata({}),
+      agentConfig: rejectedConfig,
+      blocks: [],
+    })
+    expect(rejected.config.profiles).toEqual([])
+    expect(rejected.config.connectionSlots).toEqual([])
+    expect(rejected.quarantinedProfiles).toHaveLength(1)
+    expect(rejected.quarantinedConnectionSlots).toHaveLength(1)
+  })
 describe('Canonical Loom policy and custom phase contracts', () => {
   const buckets = ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'] as const
   const destinations = {
@@ -552,35 +554,26 @@ describe('Canonical Loom policy and custom phase contracts', () => {
 
   const policyEntry = (
     bucket: (typeof buckets)[number],
-    delivery: Record<string, unknown> = { delivery: 'direct' },
-  ) => ({
+    condition?: LoomPolicyEntryV1['condition'],
+  ): LoomPolicyEntryV1 => ({
     version: 1,
     id: `${bucket}-entry`,
     source: source(),
     destination: destinations[bucket],
     checkpoint: checkpoints[bucket],
     required: true,
-    visibility: 'work_only' as const,
-    delivery,
+    visibility: 'work_only',
+    ...(condition === undefined ? {} : { condition }),
   })
-
+ 
   const policyDocument = () => ({
     version: 1,
-    workPolicy: [policyEntry('workPolicy', { delivery: 'direct' })],
-    workspaceUsage: [policyEntry('workspaceUsage', {
-      delivery: 'condition_gated',
-      condition: { kind: 'phase', value: 'WORK' },
-    })],
-    completionCriteria: [policyEntry('completionCriteria', {
-      delivery: 'on_demand',
-      request: {
-        contextPackId: 'workspace-rules',
-        revisionId: 'workspace-rules@3',
-        digest: 'A'.repeat(64),
-      },
-    })],
-    renderPolicy: [policyEntry('renderPolicy', { delivery: 'direct' })],
+    workPolicy: [policyEntry('workPolicy')],
+    workspaceUsage: [policyEntry('workspaceUsage', { kind: 'phase', value: 'WORK' })],
+    completionCriteria: [policyEntry('completionCriteria', { kind: 'phase', value: 'COMPLETE' })],
+    renderPolicy: [policyEntry('renderPolicy')],
   })
+
 
   const phase = (
     id: string,
@@ -604,9 +597,8 @@ describe('Canonical Loom policy and custom phase contracts', () => {
     return value
   }
 
-  test('parses the four fixed buckets and all closed delivery forms', () => {
+  test('parses the four fixed buckets and typed conditions', () => {
     const parsed = parseLoomPolicyBucketsV1(policyDocument())
-
     expect(Object.keys(parsed)).toEqual([
       'version',
       'workPolicy',
@@ -614,23 +606,47 @@ describe('Canonical Loom policy and custom phase contracts', () => {
       'completionCriteria',
       'renderPolicy',
     ])
-    expect(parsed.workPolicy[0]!.delivery).toEqual({ delivery: 'direct' })
-    expect(parsed.workspaceUsage[0]!.delivery).toEqual({
-      delivery: 'condition_gated',
-      condition: { kind: 'phase', value: 'WORK' },
-    })
-    expect(parsed.completionCriteria[0]!.delivery).toEqual({
-      delivery: 'on_demand',
-      request: {
-        contextPackId: 'workspace-rules',
-        revisionId: 'workspace-rules@3',
-        digest: 'a'.repeat(64),
-      },
-    })
-    expect(parsed.renderPolicy[0]!.delivery).toEqual({ delivery: 'direct' })
+    expect(parsed.workPolicy[0]).not.toHaveProperty('condition')
+    expect(parsed.workspaceUsage[0]!.condition).toEqual({ kind: 'phase', value: 'WORK' })
+    expect(parsed.completionCriteria[0]!.condition).toEqual({ kind: 'phase', value: 'COMPLETE' })
+    expect(parsed.renderPolicy[0]).not.toHaveProperty('condition')
     expect(Object.isFrozen(parsed)).toBe(true)
     expect(Object.isFrozen(parsed.workPolicy)).toBe(true)
   })
+  test('surfaces custom-phase and Loom predicate budget failures at draft paths', () => {
+    type BinaryPredicate =
+      | { kind: 'phase'; value: 'WORK' }
+      | { kind: 'all'; children: BinaryPredicate[] }
+    const binaryPredicate = (depth: number): BinaryPredicate => depth === 0
+      ? { kind: 'phase', value: 'WORK' }
+      : { kind: 'all', children: [binaryPredicate(depth - 1), binaryPredicate(depth - 1)] }
+
+    const phaseCandidate = draft()
+    phaseCandidate.config.runtimePolicy!.phases = [{
+      ...phase('phase_one', 0, []),
+      enter: binaryPredicate(9),
+    }] as never
+    expect(validateAgenticRuntimeDraft(phaseCandidate, [block(3)], 8).issues)
+      .toContainEqual({ code: 'predicate_limit_exceeded', path: 'config.runtimePolicy.phases.0.enter' })
+
+    const loomCandidate = draft()
+    loomCandidate.config.runtimePolicy!.loomPolicy = {
+      version: 1,
+      workPolicy: [policyEntry('workPolicy', {
+        kind: 'all',
+        children: Array.from({ length: AGENTIC_PREDICATE_MAX_NODES }, () => ({ kind: 'phase' as const, value: 'WORK' as const })),
+      })],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+    expect(validateAgenticRuntimeDraft(loomCandidate, [block(3)], 8).issues)
+      .toContainEqual({
+        code: 'predicate_limit_exceeded',
+        path: 'config.runtimePolicy.loomPolicy.workPolicy.0.condition',
+      })
+  })
+
 
   test('constructor output obeys fixed routing and canonical source provenance', () => {
     for (const bucket of buckets) {
@@ -647,10 +663,103 @@ describe('Canonical Loom policy and custom phase contracts', () => {
       expect(entry.source).toEqual(source())
       expect(entry.destination).toBe(destinations[bucket])
       expect(entry.checkpoint).toBe(checkpoints[bucket])
-      expect(entry.visibility).toBe('work_only')
-      expect(entry.delivery).toEqual({ delivery: 'direct' })
     }
   })
+  test('parses canonical runtime policies with optional phases through the shared parser', () => {
+    const parsed = parseAgentRuntimePolicyV1({
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'agentic',
+      loomPolicy: policyDocument(),
+    })
+    expect(parsed.phases).toEqual([])
+    expect(parsed.loomPolicy).toEqual(parseLoomPolicyBucketsV1(policyDocument()))
+    expect(() => parseAgentRuntimePolicyV1({
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'agentic',
+      loomPolicy: policyDocument(),
+      unexpected: true,
+    })).toThrow(/unknown key/)
+  })
+
+  test('uses raw UTF-8 ordering for equal prompt-order Loom policy ties', () => {
+    const entry = (id: string, blockId: string) => ({
+      version: 1 as const,
+      id,
+      source: source(blockId, 0),
+      destination: 'root_work' as const,
+      checkpoint: 'WORK' as const,
+      required: true,
+      visibility: 'work_only' as const,
+    })
+    const parsed = parseLoomPolicyBucketsV1({
+      version: 1,
+      workPolicy: [entry('entry-accent', 'é'), entry('entry-latin', 'z')],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    })
+    expect(parsed.workPolicy.map((policy) => policy.source.blockId)).toEqual(['z', 'é'])
+  })
+
+  test('evaluates scalar includes and array-valued in predicates with backend semantics', () => {
+    const predicates = [
+      {
+        id: 'string-includes',
+        blockId: 'string-fact',
+        condition: { kind: 'participant_fact', name: 'tags', operator: 'includes', value: 'blue' },
+      },
+      {
+        id: 'array-in',
+        blockId: 'array-fact',
+        condition: { kind: 'participant_fact', name: 'states', operator: 'in', values: ['selected'] },
+      },
+    ]
+    const policies = {
+      version: 1,
+      workPolicy: predicates.map(({ id, blockId, condition }) => ({
+        version: 1,
+        id,
+        source: source(blockId, 0),
+        destination: 'root_work',
+        checkpoint: 'WORK',
+        required: true,
+        visibility: 'work_only',
+        condition,
+      })),
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+    const inspection = inspectLoomPromptPoliciesV1(policies, {
+      checkpoint: 'WORK',
+      surface: 'WORK',
+      evaluation: {
+        generationType: 'normal',
+        phase: 'WORK',
+        presetVariables: {},
+        participantFacts: {
+          tags: ['blue'],
+          states: ['selected', 'other'],
+        },
+        availableTools: [],
+        taskTransitions: {},
+      },
+      blocks: predicates.map(({ blockId }) => ({
+        source: source(blockId, 0),
+        content: blockId,
+      })),
+    })
+
+    expect(inspection.items).toHaveLength(predicates.length)
+    expect(inspection.items.map((item) => item.outcome.status)).toEqual(
+      predicates.map(() => 'included'),
+    )
+  })
+
 
   test('rejects aliases, fifth buckets, and malformed exact references', () => {
     const valid = policyDocument()
@@ -667,8 +776,8 @@ describe('Canonical Loom policy and custom phase contracts', () => {
     expect(() => parseLoomPolicyBucketsV1({ ...valid, fifthBucket: [] })).toThrow(/unknown key/)
     expect(() => parseLoomPolicyBucketsV1({
       ...valid,
-      renderPolicy: [{ ...valid.renderPolicy[0], delivery: { delivery: 'conditional' } }],
-    })).toThrow(/unsupported delivery/)
+      renderPolicy: [{ ...valid.renderPolicy[0], unexpected: true }],
+    })).toThrow(/unknown key/)
   })
 
   test('rejects sparse policy, phase, predicate, and malformed revision inputs', () => {
@@ -681,24 +790,68 @@ describe('Canonical Loom policy and custom phase contracts', () => {
 
     const sparsePredicate = policyDocument()
     sparsePredicate.workspaceUsage = [policyEntry('workspaceUsage', {
-      delivery: 'condition_gated',
-      condition: { kind: 'all', children: new Array(1) },
+      kind: 'all',
+      children: new Array(1),
     })]
     expect(() => parseLoomPolicyBucketsV1(sparsePredicate)).toThrow(/invalid predicate/)
 
-    expect(() => createLoomPolicyEntryV1(
+    for (const revision of [0, Number.MAX_SAFE_INTEGER]) {
+      const entry = createLoomPolicyEntryV1(
+        'workPolicy',
+        { ...block(3), revision },
+        8,
+        0,
+      )
+      expect(entry.source.blockRevision).toBe(revision)
+    }
+    const missingRevision = createLoomPolicyEntryV1(
       'workPolicy',
-      { ...block(3), revision: 0 },
+      { ...block(3), revision: undefined },
       8,
       0,
-    )).toThrow(/positive safe integer/)
+    )
+    expect(missingRevision.source.blockRevision).toBe(1)
+    expect(() => createLoomPolicyEntryV1(
+      'workPolicy',
+      { ...block(3), revision: -1 },
+      8,
+      0,
+    )).toThrow(/non-negative safe integer/)
     expect(() => parseLoomPolicyBucketsV1({
       ...policyDocument(),
       workPolicy: [{
         ...policyDocument().workPolicy[0],
-        source: { ...source(), blockRevision: 0 },
+        source: { ...source(), blockRevision: -1 },
       }],
-    })).toThrow(/positive safe integer/)
+    })).toThrow(/non-negative safe integer/)
+    expect(parseLoomPolicyBucketsV1({
+      ...policyDocument(),
+      workPolicy: [{
+        ...policyDocument().workPolicy[0],
+        source: { ...source(), presetRevision: 0, blockRevision: 0 },
+      }],
+    }).workPolicy[0]!.source).toMatchObject({ presetRevision: 0, blockRevision: 0 })
+  })
+
+  test('uses backend Unicode label bounds and permits empty predicate groups', () => {
+    for (const label of ['', '😀'.repeat(80), 'a'.repeat(80)]) {
+      const parsed = parseAgentCustomPhasesV1([{
+        ...phase('labelled', 0, [], false),
+        label,
+      }])
+      expect(parsed[0]!.label).toBe(label)
+    }
+    expect(() => parseAgentCustomPhasesV1([{
+      ...phase('labelled', 0, [], false),
+      label: '😀'.repeat(81),
+    }])).toThrow(/characters/)
+    const parsed = parseAgentCustomPhasesV1([{
+      ...phase('empty_predicates', 0, [], false),
+      enter: { kind: 'all', children: [] },
+      exit: { kind: 'any', children: [] },
+    }])
+    expect(parsed[0]!.enter).toEqual({ kind: 'all', children: [] })
+    expect(parsed[0]!.exit).toEqual({ kind: 'any', children: [] })
   })
 
   test('parses canonical custom phases with optional skip and repeat boundaries', () => {
@@ -717,6 +870,7 @@ describe('Canonical Loom policy and custom phase contracts', () => {
       'id',
       'label',
       'instructionRefs',
+      'childInstructionSubsets',
       'required',
       'enter',
       'exit',
@@ -739,7 +893,7 @@ describe('Canonical Loom policy and custom phase contracts', () => {
 
     expect(() => parseAgentCustomPhasesV1([{
       ...canonical,
-      instructionRefs: [source(), source()],
+      instructionRefs: [source(), { ...source(), blockRevision: 2 }],
     }])).toThrow(/duplicate instruction reference/)
     expect(() => parseAgentCustomPhasesV1([{
       ...canonical,
@@ -823,13 +977,11 @@ describe('Canonical Loom policy and custom phase contracts', () => {
       id: 'legacy-workPolicy-policy-block',
       destination: 'root_work',
       checkpoint: 'WORK',
-      delivery: { delivery: 'direct' },
     })
     expect(normalized.renderPolicy[0]).toMatchObject({
       id: 'legacy-renderPolicy-policy-block',
       destination: 'render',
       checkpoint: 'RENDER',
-      delivery: { delivery: 'direct' },
     })
     expect(normalized.workspaceUsage).toEqual([])
     expect(normalized.completionCriteria).toEqual([])

@@ -5,6 +5,7 @@ import {
   agentRunProvisionalKey,
   agentRunTerminalTargetKey,
   createAgentRunsSlice,
+  normalizeAgentRunChangesV2,
   normalizeAgentRunPublicV2,
   selectActiveAgentRunForChat,
   selectAgentRunForTarget,
@@ -103,7 +104,7 @@ beforeEach(() => {
     agentRunLastSequenceByChat: {},
     agentRunCursorSequenceByChat: {},
     agentRunResyncOffsetByChat: {},
-    agentRunSyncByChat: {},
+    agentRunResyncDescriptorByChat: {},
     agentRunOmittedEventsByChat: {},
     agentRunRequestEpochByChat: {},
     agentWorkspaceByTurn: {},
@@ -111,7 +112,27 @@ beforeEach(() => {
   })
 })
 
+
 describe('agent run projection slice', () => {
+  test('rejects public runs whose attempt lineage does not bind to the run identity', () => {
+    expect(normalizeAgentRunPublicV2(run({
+      inspectionAttemptId: 'attempt-other',
+      attemptLineage: { ...run().attemptLineage, attemptId: 'attempt-a' },
+    }))).toBeNull()
+    expect(normalizeAgentRunPublicV2(run({
+      attemptLineage: {
+        ...run().attemptLineage,
+        target: { ...run().attemptLineage.target, chatId: 'chat-b' },
+      },
+    }))).toBeNull()
+    expect(normalizeAgentRunPublicV2(run({
+      target: { messageId: 'message-a', swipeId: 0 },
+      attemptLineage: {
+        ...run().attemptLineage,
+        target: { ...run().attemptLineage.target, messageId: 'message-b', swipeId: 0 },
+      },
+    }))).toBeNull()
+  })
   test('accepts only increasing run revisions and advances one opaque cursor per chat', () => {
     const state = useStore.getState()
     const firstEpoch = state.beginAgentRunRestore('chat-a')
@@ -169,10 +190,13 @@ describe('agent run projection slice', () => {
       runId: `run-${index}`,
       turnId: `turn-${index}`,
       generationId: `generation-${index}`,
+      inspectionAttemptId: `attempt-${index}`,
+      attemptLineage: { ...run().attemptLineage, attemptId: `attempt-${index}` },
       sequence: index + 1,
     }))
     expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, changes(firstPage, {
       resync: true,
+      hasMore: true,
       cursor: { version: 1, token: 'resync-page-1' },
       cursorSequence: 20,
       lastSequence: 20,
@@ -212,6 +236,66 @@ describe('agent run projection slice', () => {
     expect(useStore.getState().agentRunSyncByChat['chat-a']).toBe('ready')
   })
 
+  test('rejects skipped, replayed, and malformed resync pages without losing accepted rows', () => {
+    const epoch = useStore.getState().beginAgentRunRestore('chat-a')
+    const firstPage = Array.from({ length: 16 }, (_, index) => run({
+      runId: `run-${index}`,
+      turnId: `turn-${index}`,
+      generationId: `generation-${index}`,
+      inspectionAttemptId: `attempt-${index}`,
+      attemptLineage: { ...run().attemptLineage, attemptId: `attempt-${index}` },
+      sequence: index + 1,
+    }))
+    const firstPayload = changes(firstPage, {
+      resync: true,
+      hasMore: true,
+      cursorSequence: 2,
+      lastSequence: 2,
+      tailSequence: 2,
+      resyncPage: { offset: 0, returnedRuns: 16, totalRuns: 18, snapshotSequence: 2, complete: false, omittedRuns: 2 },
+    })
+    expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, firstPayload)).toBe(true)
+    const accepted = selectActiveAgentRunForChat(useStore.getState(), 'chat-a')
+    const acceptedCursor = useStore.getState().agentRunCursorByChat['chat-a']
+
+    const skippedPage = changes([run({
+      runId: 'run-skipped',
+      turnId: 'turn-skipped',
+      generationId: 'generation-skipped',
+      inspectionAttemptId: 'attempt-skipped',
+      attemptLineage: { ...run().attemptLineage, attemptId: 'attempt-skipped' },
+      sequence: 17,
+    })], {
+      resync: true,
+      cursorSequence: 2,
+      lastSequence: 2,
+      tailSequence: 2,
+      resyncPage: { offset: 17, returnedRuns: 1, totalRuns: 18, snapshotSequence: 2, complete: true, omittedRuns: 0 },
+    })
+    expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, firstPayload)).toBe(false)
+    expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, skippedPage)).toBe(false)
+    expect(selectActiveAgentRunForChat(useStore.getState(), 'chat-a')).toEqual(accepted)
+    expect(useStore.getState().agentRunCursorByChat['chat-a']).toBe(acceptedCursor)
+
+    expect(normalizeAgentRunChangesV2({
+      ...firstPayload,
+      resyncPage: { ...firstPayload.resyncPage, returnedRuns: 2 },
+    })).toBeNull()
+    expect(normalizeAgentRunChangesV2({
+      ...firstPayload,
+      resyncPage: { ...firstPayload.resyncPage, returnedRuns: 17, totalRuns: 17, omittedRuns: 0, complete: true },
+      hasMore: false,
+    })).toBeNull()
+    expect(normalizeAgentRunChangesV2({
+      ...firstPayload,
+      resyncPage: { ...firstPayload.resyncPage, complete: true },
+    })).toBeNull()
+    expect(normalizeAgentRunChangesV2({
+      ...firstPayload,
+      hasMore: false,
+    })).toBeNull()
+  })
+
 
   test('freezes the last tree on reconnect, reports sequence gaps, and replaces it on full resync', () => {
     const epoch = useStore.getState().beginAgentRunRestore('chat-a')
@@ -233,7 +317,12 @@ describe('agent run projection slice', () => {
     const restoreEpoch = useStore.getState().beginAgentRunRestore('chat-a')
     useStore.getState().applyAgentRunChanges('chat-a', restoreEpoch, changes([
       run({ revision: 3, sequence: 5, workPhase: 'TERMINAL', workStatus: 'terminal', workOutcome: 'completed' }),
-    ], { resync: true, lastSequence: 5, cursor: { version: 1, token: 'fresh-cursor' } }))
+    ], {
+      resync: true,
+      lastSequence: 5,
+      cursor: { version: 1, token: 'fresh-cursor' },
+      resyncPage: { offset: 0, returnedRuns: 1, totalRuns: 1, snapshotSequence: 5, complete: true, omittedRuns: 0 },
+    }))
     expect(useStore.getState().agentRunSyncByChat['chat-a']).toBe('ready')
     expect(useStore.getState().agentRunCursorByChat['chat-a']).toBe('fresh-cursor')
   })
@@ -281,6 +370,20 @@ describe('agent run projection slice', () => {
     expect(Object.keys(useStore.getState().agentRunProvisionalByKey)).toHaveLength(0)
   })
 
+  test('terminalizes malformed restore snapshots without deleting an accepted run', () => {
+    const firstEpoch = useStore.getState().beginAgentRunRestore('chat-a')
+    expect(useStore.getState().applyAgentRunChanges('chat-a', firstEpoch, changes([run()]))).toBe(true)
+
+    const secondEpoch = useStore.getState().beginAgentRunRestore('chat-a')
+    expect(useStore.getState().applyAgentRunChanges('chat-a', secondEpoch, {
+      version: 2,
+      chatId: 'chat-a',
+    })).toBe(false)
+
+    const state = useStore.getState()
+    expect(state.agentRunSyncByChat['chat-a']).toBe('error')
+    expect(selectActiveAgentRunForChat(state, 'chat-a')).toMatchObject({ runId: 'run-a', turnId: 'turn-a' })
+  })
   test('normalizes a closed projection and drops private or generic payload fields', () => {
     const normalized = normalizeAgentRunPublicV2({
       ...run(),
@@ -301,6 +404,19 @@ describe('agent run projection slice', () => {
     expect(serialized).not.toContain('metadata')
     expect(serialized).not.toContain('arguments')
     expect(serialized).not.toContain('result')
+  })
+  test('projects unknown provider tools through the safe public catalog', () => {
+    const unknown = normalizeAgentRunPublicV2({
+      ...run(),
+      activity: [{ ...run().activity[0], toolId: 'future_provider_tool' }],
+    })
+    expect(unknown?.activity[0]?.toolId).toBe('unknown_tool')
+
+    const explicit = normalizeAgentRunPublicV2({
+      ...run(),
+      activity: [{ ...run().activity[0], toolId: 'unknown_tool' }],
+    })
+    expect(explicit?.activity[0]?.toolId).toBe('unknown_tool')
   })
 
   test('fetches workspace state separately and rejects an older workspace revision', () => {
@@ -361,6 +477,64 @@ describe('agent run projection slice', () => {
     expect(useStore.getState().agentWorkspaceByTurn['turn-a'].status).toBe('idle')
     expect(useStore.getState().agentWorkspaceByTurn['turn-a'].index?.workspaceRevision).toBe(4)
   })
+  test('terminalizes malformed workspace snapshots without dropping newer accepted state', () => {
+    const indexEpoch = useStore.getState().beginAgentWorkspaceRequest('chat-a', 'turn-a')
+    expect(useStore.getState().applyAgentWorkspaceIndex('chat-a', 'turn-a', indexEpoch, {
+      version: 2,
+      turnId: 'turn-a',
+      workspaceRevision: 4,
+      sections: [{ section: 'tasks', count: 1, revision: 4, retention: 'turn_terminal', visibility: 'owner' }],
+      omitted: 0,
+    })).toBe(true)
+    const sectionEpoch = useStore.getState().beginAgentWorkspaceRequest('chat-a', 'turn-a', 'tasks')
+    expect(useStore.getState().applyAgentWorkspaceSection('chat-a', 'turn-a', 'tasks', sectionEpoch, {
+      version: 2,
+      turnId: 'turn-a',
+      section: 'tasks',
+      workspaceRevision: 4,
+      entries: [],
+      nextPage: null,
+      omitted: 0,
+    }, false)).toBe(true)
+
+    const invalidIndexEpoch = useStore.getState().beginAgentWorkspaceRequest('chat-a', 'turn-a')
+    expect(useStore.getState().applyAgentWorkspaceIndex('chat-a', 'turn-a', invalidIndexEpoch, {
+      version: 2,
+      turnId: 'turn-a',
+      workspaceRevision: 5,
+      sections: 'invalid',
+      omitted: 0,
+    })).toBe(false)
+    expect(useStore.getState().agentWorkspaceByTurn['turn-a']).toMatchObject({
+      status: 'error',
+      error: true,
+      index: { workspaceRevision: 4 },
+    })
+
+    const retryIndexEpoch = useStore.getState().beginAgentWorkspaceRequest('chat-a', 'turn-a')
+    expect(useStore.getState().applyAgentWorkspaceIndex('chat-a', 'turn-a', retryIndexEpoch, {
+      version: 2,
+      turnId: 'turn-a',
+      workspaceRevision: 4,
+      sections: [{ section: 'tasks', count: 1, revision: 4, retention: 'turn_terminal', visibility: 'owner' }],
+      omitted: 0,
+    })).toBe(true)
+    const invalidSectionEpoch = useStore.getState().beginAgentWorkspaceRequest('chat-a', 'turn-a', 'tasks')
+    expect(useStore.getState().applyAgentWorkspaceSection('chat-a', 'turn-a', 'tasks', invalidSectionEpoch, {
+      version: 2,
+      turnId: 'turn-a',
+      section: 'tasks',
+      workspaceRevision: 4,
+      entries: 'invalid',
+      nextPage: null,
+      omitted: 0,
+    }, false)).toBe(false)
+    expect(useStore.getState().agentWorkspaceByTurn['turn-a'].sections.tasks).toMatchObject({
+      loadingMore: false,
+      error: true,
+      preview: { workspaceRevision: 4, entries: [] },
+    })
+  })
   test('rejects an older different-turn terminal from replacing a newer target projection', () => {
     const newer = run({
       runId: 'run-new',
@@ -373,6 +547,10 @@ describe('agent run projection slice', () => {
       sequence: 20,
       updatedAt: 20_000,
       target: { messageId: 'message-target', swipeId: 1 },
+      attemptLineage: {
+        ...run().attemptLineage,
+        target: { chatId: 'chat-a', generationType: 'normal', messageId: 'message-target', swipeId: 1 },
+      },
       terminalHandoff: {
         version: 2,
         committed: true,
@@ -383,6 +561,20 @@ describe('agent run projection slice', () => {
       },
     })
     const stale = run({
+      runId: 'run-old',
+      turnId: 'turn-old',
+      generationId: 'generation-old',
+      workStatus: 'terminal',
+      workPhase: 'TERMINAL',
+      workOutcome: 'completed',
+      revision: 99,
+      sequence: 19,
+      updatedAt: 99_000,
+      target: { messageId: 'message-target', swipeId: 1 },
+      attemptLineage: {
+        ...run().attemptLineage,
+        target: { chatId: 'chat-a', generationType: 'normal', messageId: 'message-target', swipeId: 1 },
+      },
       runId: 'run-old',
       turnId: 'turn-old',
       generationId: 'generation-old',
@@ -432,6 +624,7 @@ describe('agent run projection slice', () => {
       resync: true,
       lastSequence: 8,
       cursor: { version: 1, token: 'cursor-old' },
+      resyncPage: { offset: 0, returnedRuns: 1, totalRuns: 1, snapshotSequence: 8, complete: true, omittedRuns: 0 },
     })
     expect(useStore.getState().applyAgentRunChanges('chat-a', restoreEpoch, payload)).toBe(true)
     expect(useStore.getState().applyAgentRunChanges('chat-a', restoreEpoch, payload)).toBe(true)

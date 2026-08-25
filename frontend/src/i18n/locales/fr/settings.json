@@ -111,11 +111,6 @@
       "shortName": "Exécution des agents",
       "tabName": "Exécution des agents",
       "tabDescription": "Consultez les valeurs par défaut, la conservation et les plafonds de l’hôte"
-    },
-    "contextLibrary": {
-      "shortName": "Bibliothèque de contexte",
-      "tabName": "Bibliothèque de contexte",
-      "tabDescription": "Gérez les packs de contexte versionnés et leurs pièces jointes"
     }
   },
   "account": {
@@ -132,6 +127,21 @@
     "saving": "Enregistrement..."
   },
   "display": {
+    "longMessages": {
+      "title": "Messages longs",
+      "helper": "Limitez la hauteur des messages longs jusqu’à leur développement.",
+      "enabled": "Réduire les messages longs",
+      "enabledHint": "S’applique à tous les modes d’affichage, y compris pendant la génération d’une réponse.",
+      "height": "HAUTEUR RÉDUITE",
+      "depth": "RÉDUIRE À PARTIR DE LA PROFONDEUR",
+      "depthHint": "La profondeur 0 correspond au message le plus récent. Les messages longs à cette profondeur ou plus anciens peuvent être réduits.",
+      "compact": "Compacte",
+      "comfortable": "Confortable",
+      "tall": "Haute",
+      "custom": "Personnalisé",
+      "customHeight": "HAUTEUR PERSONNALISÉE (PX)",
+      "customHeightHint": "Hauteur maximale des messages longs réduits lorsque Personnalisé est sélectionné."
+    },
     "modalWidth": {
       "title": "Largeur modale",
       "helper": "Contraindre la largeur maximale de toutes les boîtes de dialogue modales. Affecte les paramètres, les éditeurs et autres panneaux contextuels.",
@@ -1599,189 +1609,6 @@
         "toolExecutionsPerUser": "Exécutions d’outils par utilisateur",
         "toolExecutionsProcess": "Exécutions d’outils par processus"
       }
-    }
-  },
-  "contextLibrary": {
-    "eyebrow": "Contexte du compte",
-    "title": "Bibliothèque de contexte",
-    "description": "Créez des packs de contexte immuables et versionnés, puis joignez les révisions validées à des préréglages, chats ou livres d’univers.",
-    "copySuffix": "copie",
-    "packs": "Packs",
-    "packList": "Packs de contexte",
-    "loading": "Chargement des packs de contexte…",
-    "loadingDetail": "Chargement des détails du pack…",
-    "loadingTargets": "Chargement des cibles détenues…",
-    "targetLoadError": "Impossible de charger les cibles de rattachement qui vous appartiennent.",
-    "targetsLoaded": "Cibles de rattachement chargées.",
-    "noTargetsAvailable": "Aucune cible détenue n’est disponible pour cette portée.",
-    "selectTarget": "Sélectionnez une cible détenue",
-    "selectPack": "Sélectionnez un pack de contexte à consulter.",
-    "emptyTitle": "Créez votre premier pack de contexte",
-    "emptyDescription": "Ajoutez des références stables, puis joignez une révision immuable là où elle est nécessaire.",
-    "noDescription": "Aucune description",
-    "noAttachments": "Aucune pièce jointe",
-    "privateOnly": "Aucun accès supplémentaire au compte n’a été accordé.",
-    "unavailableTarget": "Cible indisponible",
-    "exportComplete": "Instantané portable exporté.",
-    "exporting": "Exportation de l’instantané portable…",
-    "importing": "Importation de l’instantané portable…",
-    "importComplete": "« {{name}} » a été importé. Vérifiez-le avant de l’attacher ou de l’activer.",
-    "importFileLabel": "Choisir un instantané JSON de pack de contexte à importer",
-    "versionNumber": "Révision {{number}}",
-    "byteCount": "{{count}} octets",
-    "versionHistoryCaption": "Historique des révisions immuables du pack de contexte",
-    "versionImmutableHelp": "Les révisions publiées ne peuvent pas être modifiées. Créez-en une nouvelle pour modifier le contenu.",
-    "immutable": "Immuable",
-    "previewTitle": "Aperçu de la révision {{number}}",
-    "contentHelp": "Les entrées sont stockées dans l’ordre comme contexte littéral. Les identifiants doivent être uniques dans cette révision.",
-    "entryNumber": "Entrée {{number}}",
-    "addEntry": "Ajouter une entrée",
-    "removeEntry": "Supprimer l’entrée {{number}}",
-    "tagsHelp": "Séparez les étiquettes par des virgules.",
-    "requiredAttachment": "Considérer cette pièce jointe comme requise pour le contrôle préalable Agentic",
-    "attachmentsDescription": "Les pièces jointes associent une révision immuable précise à une cible détenue.",
-    "accessDescription": "La visibilité et les autorisations d’accès sont revalidées par le serveur à chaque opération.",
-    "accessList": "Liste d’accès au compte",
-    "accessFor": "Accès pour {{name}}",
-    "addAccess": "Ajouter un accès",
-    "removeAccess": "Supprimer l’accès de {{name}}",
-    "aclServerAuthority": "Le serveur vérifie l’identité, la propriété, la révision actuelle des autorisations et la permission demandée.",
-    "reviewTitle": "Validation authentifiée requise",
-    "reviewDescription": "Ce pack est désactivé jusqu’à ce que vous examiniez son contenu et l’acceptiez explicitement pour un usage local.",
-    "repairDescription": "Ce pack doit être réparé avant de pouvoir être validé ou joint.",
-    "reviewAcknowledgement": "J’ai examiné ce pack, sa visibilité, son contenu et ses autorisations d’accès, et je souhaite l’activer.",
-    "preserveAttachments": "Dupliquer les pièces jointes actuellement autorisées",
-    "deleteTitle": "Supprimer le pack de contexte",
-    "deleteDescription": "Supprimez ce pack ainsi que les révisions et pièces jointes qu’il détient.",
-    "deleteWarning": "Supprimer « {{name}} » ? Cette action est irréversible.",
-    "detachFrom": "Détacher de {{name}}",
-    "status": {
-      "active": "Prêt",
-      "disabled": "Désactivé",
-      "review_required": "Validation requise",
-      "repair_required": "Réparation requise"
-    },
-    "source": {
-      "local": "Local",
-      "portable_import": "Importation portable",
-      "archive_restore": "Restauration d’archive",
-      "same_account_duplicate": "Copie du même compte"
-    },
-    "visibility": {
-      "private": "Privé",
-      "account": "Compte",
-      "restricted": "Restreint",
-      "help": "Le serveur reste l’autorité pour chaque autorisation et opération sur une cible."
-    },
-    "scopes": {
-      "preset": "Préréglage",
-      "chat": "Chat",
-      "world_book": "Livre d’univers"
-    },
-    "acl": {
-      "read": "Lecture",
-      "use": "Utilisation",
-      "edit": "Modification"
-    },
-    "attachmentState": {
-      "active": "Active",
-      "disabled": "Désactivée",
-      "review_required": "Validation requise",
-      "repair_required": "Réparation requise"
-    },
-    "sections": {
-      "versions": "Historique des versions",
-      "attachments": "Pièces jointes",
-      "access": "Visibilité et accès"
-    },
-    "fields": {
-      "name": "Nom",
-      "description": "Description",
-      "visibility": "Visibilité",
-      "content": "Contenu de la révision",
-      "entryId": "Identifiant de l’entrée",
-      "entryTitle": "Titre de l’entrée",
-      "tags": "Étiquettes",
-      "body": "Corps",
-      "scope": "Portée de la pièce jointe",
-      "target": "Cible",
-      "version": "Révision",
-      "account": "Identifiant utilisateur du compte",
-      "access": "Permission",
-      "source": "Source",
-      "updated": "Mis à jour"
-    },
-    "columns": {
-      "version": "Révision",
-      "state": "État",
-      "size": "Taille",
-      "created": "Créée le",
-      "actions": "Actions"
-    },
-    "actions": {
-      "create": "Créer un pack",
-      "import": "Importer l’instantané",
-      "cancel": "Annuler",
-      "refresh": "Actualiser",
-      "reviewLatest": "Vérifier la dernière version",
-      "retryTargets": "Réessayer le chargement",
-      "edit": "Modifier les détails",
-      "duplicate": "Dupliquer",
-      "export": "Exporter la révision sélectionnée",
-      "review": "Valider et activer",
-      "newVersion": "Nouvelle révision",
-      "preview": "Aperçu",
-      "attach": "Joindre la révision",
-      "manageAccess": "Gérer les accès",
-      "delete": "Supprimer"
-    },
-    "dialogs": {
-      "create": {
-        "title": "Créer un pack de contexte",
-        "description": "Créez un pack local et sa première révision immuable.",
-        "confirm": "Créer le pack"
-      },
-      "edit": {
-        "title": "Modifier les détails du pack",
-        "description": "Mettez à jour les métadonnées sans modifier le contenu immuable de la révision.",
-        "confirm": "Enregistrer les détails"
-      },
-      "revision": {
-        "title": "Créer une révision",
-        "description": "Reprenez le contenu le plus récent et publiez une nouvelle révision immuable.",
-        "confirm": "Créer la révision"
-      },
-      "attach": {
-        "title": "Joindre une révision",
-        "description": "Associez une révision précise à un préréglage, chat ou livre d’univers détenu.",
-        "confirm": "Joindre"
-      },
-      "acl": {
-        "title": "Gérer les accès",
-        "description": "Demandez des permissions explicites sur le compte. Le serveur revalide chaque identité.",
-        "confirm": "Enregistrer les accès"
-      },
-      "review": {
-        "title": "Valider le pack importé",
-        "description": "L’activation est une action authentifiée explicite et ne découle jamais de la seule importation.",
-        "confirm": "Activer le pack"
-      },
-      "duplicate": {
-        "title": "Dupliquer le pack",
-        "description": "Créez une copie privée sur le même compte, avec un historique de révisions immuable.",
-        "confirm": "Dupliquer"
-      },
-      "delete": {
-        "title": "Supprimer le pack",
-        "description": "Supprimez ce pack de contexte du compte.",
-        "confirm": "Supprimer le pack"
-      }
-    },
-    "errors": {
-      "not_found": "Ce pack de contexte est indisponible ou vous n’y avez plus accès.",
-      "revision_conflict": "Ce pack a été modifié dans une autre session. La dernière version du serveur est affichée ; vérifiez-la avant de réessayer la modification.",
-      "validation_failed": "Le serveur a refusé cette modification du pack de contexte. Vérifiez les champs et réessayez.",
-      "unavailable": "La bibliothèque de contexte est temporairement indisponible."
     }
   }
 }

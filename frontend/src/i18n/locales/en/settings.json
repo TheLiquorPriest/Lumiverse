@@ -93,11 +93,6 @@
       "tabName": "Agent Runtime",
       "tabDescription": "Review runtime defaults, retention, and host-owned ceilings"
     },
-    "contextLibrary": {
-      "shortName": "Context Library",
-      "tabName": "Context Library",
-      "tabDescription": "Manage versioned context packs and their attachments"
-    },
     "diagnostics": {
       "shortName": "Diagnostics",
       "tabName": "Diagnostics",
@@ -138,6 +133,21 @@
     "saving": "Saving..."
   },
   "display": {
+    "longMessages": {
+      "title": "Long Messages",
+      "helper": "Limit long messages to a comfortable height until you expand them.",
+      "enabled": "Collapse long messages",
+      "enabledHint": "Applies in every chat display mode, including while a reply is generating.",
+      "height": "COLLAPSED HEIGHT",
+      "depth": "COLLAPSE AT DEPTH",
+      "depthHint": "Depth 0 is the newest message. Long messages at this depth or older can collapse.",
+      "compact": "Compact",
+      "comfortable": "Comfortable",
+      "tall": "Tall",
+      "custom": "Custom",
+      "customHeight": "CUSTOM HEIGHT (PX)",
+      "customHeightHint": "Maximum height for collapsed long messages when Custom is selected."
+    },
     "modalWidth": {
       "title": "Modal Width",
       "helper": "Constrain the maximum width of all modal dialogs. Affects settings, editors, and other popover panels.",
@@ -1660,189 +1670,6 @@
         "toolExecutionsPerUser": "Tool executions per user",
         "toolExecutionsProcess": "Tool executions per process"
       }
-    }
-  },
-  "contextLibrary": {
-    "eyebrow": "Account context",
-    "title": "Context Library",
-    "description": "Create immutable, versioned context packs and attach reviewed revisions to presets, chats, or world books.",
-    "copySuffix": "copy",
-    "packs": "Packs",
-    "packList": "Context packs",
-    "loading": "Loading context packs…",
-    "loadingDetail": "Loading pack details…",
-    "loadingTargets": "Loading owned targets…",
-    "targetLoadError": "Owned attachment targets could not be loaded.",
-    "targetsLoaded": "Owned attachment targets loaded.",
-    "noTargetsAvailable": "No owned targets are available for this scope.",
-    "selectTarget": "Select an owned target",
-    "selectPack": "Select a context pack to inspect it.",
-    "emptyTitle": "Build your first context pack",
-    "emptyDescription": "Add stable reference material, then attach an immutable revision where it is needed.",
-    "noDescription": "No description",
-    "noAttachments": "No attachments",
-    "privateOnly": "No additional account access has been granted.",
-    "unavailableTarget": "Unavailable target",
-    "exportComplete": "Portable snapshot exported.",
-    "exporting": "Exporting portable snapshot…",
-    "importing": "Importing portable snapshot…",
-    "importComplete": "Imported “{{name}}”. Review it before attaching or enabling it.",
-    "importFileLabel": "Choose a context pack JSON snapshot to import",
-    "versionNumber": "Revision {{number}}",
-    "byteCount": "{{count}} bytes",
-    "versionHistoryCaption": "Immutable context pack revision history",
-    "versionImmutableHelp": "Published revisions cannot be edited. Create a new revision to change content.",
-    "immutable": "Immutable",
-    "previewTitle": "Revision {{number}} preview",
-    "contentHelp": "Entries are stored in order as literal context. IDs must be unique within this revision.",
-    "entryNumber": "Entry {{number}}",
-    "addEntry": "Add entry",
-    "removeEntry": "Remove entry {{number}}",
-    "tagsHelp": "Separate tags with commas.",
-    "requiredAttachment": "Treat this attachment as required for Agentic preflight",
-    "attachmentsDescription": "Attachments bind an exact immutable revision to one owned target.",
-    "accessDescription": "Visibility and ACL grants are revalidated by the server for every operation.",
-    "accessList": "Account access list",
-    "accessFor": "Access for {{name}}",
-    "addAccess": "Add access",
-    "removeAccess": "Remove access for {{name}}",
-    "aclServerAuthority": "The server verifies the principal, ownership, current ACL revision, and requested permission.",
-    "reviewTitle": "Authenticated review required",
-    "reviewDescription": "This pack is disabled until you inspect its contents and explicitly accept it for local use.",
-    "repairDescription": "This pack needs repair before it can be reviewed or attached.",
-    "reviewAcknowledgement": "I reviewed this pack, its visibility, content, and access grants, and want to activate it.",
-    "preserveAttachments": "Duplicate currently authorized attachments",
-    "deleteTitle": "Delete context pack",
-    "deleteDescription": "Delete this pack and its owned revisions and attachments.",
-    "deleteWarning": "Delete “{{name}}”? This cannot be undone.",
-    "detachFrom": "Detach from {{name}}",
-    "status": {
-      "active": "Ready",
-      "disabled": "Disabled",
-      "review_required": "Review required",
-      "repair_required": "Repair required"
-    },
-    "source": {
-      "local": "Local",
-      "portable_import": "Portable import",
-      "archive_restore": "Archive restore",
-      "same_account_duplicate": "Same-account duplicate"
-    },
-    "visibility": {
-      "private": "Private",
-      "account": "Account",
-      "restricted": "Restricted",
-      "help": "The server remains authoritative for every ACL and target operation."
-    },
-    "scopes": {
-      "preset": "Preset",
-      "chat": "Chat",
-      "world_book": "World book"
-    },
-    "acl": {
-      "read": "Read",
-      "use": "Use",
-      "edit": "Edit"
-    },
-    "attachmentState": {
-      "active": "Active",
-      "disabled": "Disabled",
-      "review_required": "Review required",
-      "repair_required": "Repair required"
-    },
-    "sections": {
-      "versions": "Version history",
-      "attachments": "Attachments",
-      "access": "Visibility and access"
-    },
-    "fields": {
-      "name": "Name",
-      "description": "Description",
-      "visibility": "Visibility",
-      "content": "Revision content",
-      "entryId": "Entry ID",
-      "entryTitle": "Entry title",
-      "tags": "Tags",
-      "body": "Body",
-      "scope": "Attachment scope",
-      "target": "Target",
-      "version": "Revision",
-      "account": "Account user ID",
-      "access": "Permission",
-      "source": "Source",
-      "updated": "Updated"
-    },
-    "columns": {
-      "version": "Revision",
-      "state": "State",
-      "size": "Size",
-      "created": "Created",
-      "actions": "Actions"
-    },
-    "actions": {
-      "create": "Create pack",
-      "import": "Import snapshot",
-      "cancel": "Cancel",
-      "refresh": "Refresh",
-      "reviewLatest": "Review latest",
-      "retryTargets": "Retry target load",
-      "edit": "Edit details",
-      "duplicate": "Duplicate",
-      "export": "Export selected revision",
-      "review": "Review and activate",
-      "newVersion": "New revision",
-      "preview": "Preview",
-      "attach": "Attach revision",
-      "manageAccess": "Manage access",
-      "delete": "Delete"
-    },
-    "dialogs": {
-      "create": {
-        "title": "Create context pack",
-        "description": "Create a local pack and its first immutable revision.",
-        "confirm": "Create pack"
-      },
-      "edit": {
-        "title": "Edit pack details",
-        "description": "Update metadata without changing immutable revision content.",
-        "confirm": "Save details"
-      },
-      "revision": {
-        "title": "Create revision",
-        "description": "Start from the latest content and publish a new immutable revision.",
-        "confirm": "Create revision"
-      },
-      "attach": {
-        "title": "Attach revision",
-        "description": "Bind an exact revision to one owned preset, chat, or world book.",
-        "confirm": "Attach"
-      },
-      "acl": {
-        "title": "Manage access",
-        "description": "Request explicit account permissions. The server revalidates every principal.",
-        "confirm": "Save access"
-      },
-      "review": {
-        "title": "Review imported pack",
-        "description": "Activation is an explicit authenticated action and never follows from import alone.",
-        "confirm": "Activate pack"
-      },
-      "duplicate": {
-        "title": "Duplicate pack",
-        "description": "Create a private same-account copy with immutable revision history.",
-        "confirm": "Duplicate"
-      },
-      "delete": {
-        "title": "Delete pack",
-        "description": "Remove this context pack from the account.",
-        "confirm": "Delete pack"
-      }
-    },
-    "errors": {
-      "not_found": "This context pack is unavailable or you no longer have access.",
-      "revision_conflict": "This pack changed in another session. The latest server version is shown; review it before trying the change again.",
-      "validation_failed": "The server rejected this context pack change. Review the fields and try again.",
-      "unavailable": "The Context Library is temporarily unavailable."
     }
   }
 }

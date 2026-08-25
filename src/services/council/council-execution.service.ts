@@ -235,7 +235,6 @@ function isInheritedWorkTool(name: string): boolean {
     || name === "publish"
     || name === "publication"
     || name.startsWith("workspace_")
-    || name.startsWith("context_pack_")
     || name.startsWith("agent_");
 }
 

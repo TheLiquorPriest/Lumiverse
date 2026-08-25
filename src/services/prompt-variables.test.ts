@@ -5,7 +5,9 @@ import { initMacros } from "../macros";
 import type { MacroEnv } from "../macros/types";
 import type { Preset, PromptBlock, PromptVariableDef } from "../types/preset";
 import { withPromptBlockContext } from "../macros/MacroEnv";
-import { coercePromptVariable, resolvePromptBlockPlacements, resolvePromptVariables } from "./prompt-assembly.service";
+import { coercePromptVariable, resolvePromptBlockPlacements, resolvePromptVariables, resolveCognitionPresetVariables } from "./prompt-assembly.service";
+import { evaluateCognitionPredicate } from "./agent-cognition.service";
+import type { CognitionEvaluationContextV1 } from "../types/agent-cognition";
 
 // ---------------------------------------------------------------------------
 // Minimal env factory — only the fields {{var}} touches matter here.
@@ -510,5 +512,123 @@ describe("resolvePromptVariables", () => {
 
     expect(rendered).toBe("runtime/runtime");
     expect(await ev("{{var::tone}}/{{.tone}}", env)).toBe("preset instance/preset instance");
+  });
+});
+
+function switchDef(name: string, defaultValue: 0 | 1): PromptVariableDef {
+  return { id: name, name, label: name, type: "switch", defaultValue };
+}
+
+function blockWithSwitch(id: string, name: string, defaultValue: 0 | 1, enabled = true): PromptBlock {
+  return {
+    id,
+    name: id,
+    content: "",
+    role: "system",
+    enabled,
+    position: "pre_history",
+    depth: 0,
+    marker: null,
+    isLocked: false,
+    color: null,
+    injectionTrigger: [],
+    group: null,
+    variables: [switchDef(name, defaultValue)],
+  };
+}
+
+function workContext(presetVariables: Readonly<Record<string, string | number | boolean | readonly string[]>>): CognitionEvaluationContextV1 {
+  return {
+    generationType: "normal",
+    phase: "WORK",
+    presetVariables,
+    participantFacts: {},
+    availableTools: [],
+    taskTransitions: {},
+  };
+}
+
+describe("resolveCognitionPresetVariables", () => {
+  const collaborationSkip = {
+    kind: "preset_variable" as const,
+    name: "fn_collaboration",
+    operator: "equals" as const,
+    value: 0,
+  };
+  const requireChildActivation = {
+    kind: "all" as const,
+    children: [
+      { kind: "phase" as const, value: "WORK" as const },
+      {
+        kind: "preset_variable" as const,
+        name: "fn_require_child",
+        operator: "equals" as const,
+        value: 1,
+      },
+    ],
+  };
+
+  test("flattens block-scoped fn_collaboration=0 so the collaborate skip predicate is true", () => {
+    const blocks = [blockWithSwitch("a81dc164-6cfc-5215-b4f5-13c861ce7ab9", "fn_collaboration", 1)];
+    const stored = {
+      "a81dc164-6cfc-5215-b4f5-13c861ce7ab9": { fn_collaboration: 0 },
+    };
+    const presetVariables = resolveCognitionPresetVariables(blocks, stored);
+    expect(presetVariables).toEqual({ fn_collaboration: 0 });
+    expect(evaluateCognitionPredicate(collaborationSkip, workContext(presetVariables))).toBe(true);
+  });
+
+  test("does not treat nested metadata.promptVariables as absent fn_* keys", () => {
+    const nestedOnly = {
+      "a81dc164-6cfc-5215-b4f5-13c861ce7ab9": { fn_collaboration: 0, fn_require_child: 1 },
+    };
+    expect(Object.keys(nestedOnly).some((key) => key.startsWith("fn_"))).toBe(false);
+    const scenario = {
+      id: "a81dc164-6cfc-5215-b4f5-13c861ce7ab9",
+      name: "Scenario control",
+      content: "",
+      role: "system" as const,
+      enabled: true,
+      position: "pre_history" as const,
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      group: null,
+      variables: [switchDef("fn_collaboration", 1), switchDef("fn_require_child", 0)],
+    };
+    const presetVariables = resolveCognitionPresetVariables([scenario], nestedOnly);
+    expect(presetVariables.fn_collaboration).toBe(0);
+    expect(presetVariables.fn_require_child).toBe(1);
+    expect(evaluateCognitionPredicate(requireChildActivation, workContext(presetVariables))).toBe(true);
+  });
+
+  test("last enabled prompt_order block wins on duplicate variable names", () => {
+    const first = blockWithSwitch("block-a", "fn_collaboration", 1);
+    const later = blockWithSwitch("block-b", "fn_collaboration", 1);
+    const stored = {
+      "block-a": { fn_collaboration: 0 },
+      "block-b": { fn_collaboration: 1 },
+    };
+    expect(resolveCognitionPresetVariables([first, later], stored)).toEqual({ fn_collaboration: 1 });
+    expect(resolveCognitionPresetVariables([later, first], stored)).toEqual({ fn_collaboration: 0 });
+  });
+
+  test("skips disabled blocks and ignores nested non-scalar leaves", () => {
+    const disabled = blockWithSwitch("disabled-block", "fn_collaboration", 1, false);
+    const enabled = blockWithSwitch("enabled-block", "fn_require_child", 0);
+    const stored = {
+      "disabled-block": { fn_collaboration: 0 },
+      "enabled-block": {
+        fn_require_child: 1,
+        nested: { ignored: true },
+        mixed: [1, "x"],
+      },
+    };
+    const presetVariables = resolveCognitionPresetVariables([disabled, enabled], stored);
+    expect(presetVariables).toEqual({ fn_require_child: 1 });
+    expect(evaluateCognitionPredicate(collaborationSkip, workContext(presetVariables))).toBe(false);
+    expect(evaluateCognitionPredicate(requireChildActivation, workContext(presetVariables))).toBe(true);
   });
 });

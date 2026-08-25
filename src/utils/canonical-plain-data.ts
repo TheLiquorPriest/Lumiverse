@@ -3,6 +3,7 @@
  * boundary. This module has no service, database, provider, or callback
  * dependencies and is safe to import from an isolate entrypoint.
  */
+import { compareUtf8 } from "./utf8-order";
 
 const UTF8_ENCODER = new TextEncoder();
 
@@ -85,6 +86,17 @@ function failure(
 
 function bytes(value: string): number {
   return UTF8_ENCODER.encode(value).byteLength;
+}
+function compareCanonicalKey(left: string, right: string): number {
+  const utf8Order = compareUtf8(left, right);
+  if (utf8Order !== 0 || left === right) return utf8Order;
+
+  // TextEncoder replaces lone UTF-16 surrogates with U+FFFD. Compare the
+  // escaped JSON code units to keep those keys distinct and insertion-order
+  // independent without changing normal UTF-8 ordering.
+  const leftEscaped = JSON.stringify(left);
+  const rightEscaped = JSON.stringify(right);
+  return leftEscaped < rightEscaped ? -1 : 1;
 }
 
 function primitive(value: unknown): string {
@@ -215,7 +227,7 @@ function inspectObject(
     // fields are omitted, while undefined array elements become null.
     if (descriptor.value !== undefined) entries.push({ key, value: descriptor.value });
   }
-  entries.sort((left, right) => left.key.localeCompare(right.key));
+  entries.sort((left, right) => compareCanonicalKey(left.key, right.key));
   return { array: false, keys: entries.map((entry) => entry.key), values: entries.map((entry) => entry.value) };
 }
 

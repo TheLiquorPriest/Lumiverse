@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import * as ts from 'typescript'
 import en from '@/i18n/locales/en/chat.json'
 import fr from '@/i18n/locales/fr/chat.json'
 import it from '@/i18n/locales/it/chat.json'
@@ -6,47 +9,81 @@ import ja from '@/i18n/locales/ja/chat.json'
 import zh from '@/i18n/locales/zh/chat.json'
 import zhTW from '@/i18n/locales/zh-TW/chat.json'
 
-import type { AgentPublicErrorCode } from '@/types/agent-runtime'
+import { WORKSPACE_CAPABILITIES } from '@/lib/loom/types'
+import type { AgentPromptEvidenceDestinationV1 } from '@/types/agent-runs'
 
-const PUBLIC_ERROR_CODES = [
-  'capacity_exceeded',
-  'host_child_admission_limit_exceeded',
-  'host_tool_call_limit_exceeded',
-  'child_admission_limit_exceeded',
-  'tool_call_limit_exceeded',
-  'logical_provider_request_limit_exceeded',
-  'physical_dispatch_attempt_limit_exceeded',
-  'child_output_token_limit_exceeded',
-  'root_wall_clock_limit_exceeded',
-  'activity_event_limit_exceeded',
-  'activity_byte_limit_exceeded',
-  'lifecycle_log_record_limit_exceeded',
-  'context_limit_exceeded',
-  'initial_input_limit_exceeded',
-  'argument_limit_exceeded',
-  'result_limit_exceeded',
-  'continuation_limit_exceeded',
-  'retained_output_limit_exceeded',
-  'materialized_limit_exceeded',
-  'timeout',
-  'cancelled',
-  'provider_unavailable',
-  'provider_unsupported',
-  'provider_tool_calling_unsupported',
-  'provider_tool_continuation_unsupported',
-  'provider_tool_finalization_unsupported',
-  'provider_request_error',
-  'provider_protocol_error',
-  'provider_schema_error',
-  'invalid_task',
-  'invalid_profile',
-  'invalid_arguments',
-  'batch_rejected',
-  'unknown_tool',
-  'unauthorized',
-  'integrity_error',
-  'internal_error',
-] as const satisfies readonly AgentPublicErrorCode[]
+const activitySource = readFileSync(resolve(import.meta.dir, 'AgentRunActivity.tsx'), 'utf8')
+const backendSource = readFileSync(resolve(import.meta.dir, '../../../../src/types/agent-runtime.ts'), 'utf8')
+
+function publicErrorCodesFromActivitySource(source: string): string[] {
+  const sourceFile = ts.createSourceFile(
+    'AgentRunActivity.tsx',
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
+  )
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== 'AGENT_PUBLIC_ERROR_LABEL_KEYS') continue
+      const initializer = declaration.initializer
+      const objectLiteral =
+        initializer && ts.isAsExpression(initializer) ? initializer.expression : initializer
+      if (!objectLiteral || !ts.isObjectLiteralExpression(objectLiteral)) {
+        throw new Error('AgentRunActivity public error allowlist is not an object')
+      }
+      return objectLiteral.properties.map((property) => {
+        if (!ts.isPropertyAssignment(property)) {
+          throw new Error('AgentRunActivity public error allowlist contains a non-property member')
+        }
+        const name = property.name
+        if (!ts.isIdentifier(name) && !ts.isStringLiteral(name)) {
+          throw new Error('AgentRunActivity public error allowlist contains an invalid property name')
+        }
+        return name.text
+      })
+    }
+  }
+  throw new Error('AgentRunActivity public error allowlist not found')
+}
+
+function publicErrorCodesFromBackendSource(source: string): string[] {
+  const sourceFile = ts.createSourceFile(
+    'agent-runtime.ts',
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  )
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== 'AGENT_PUBLIC_ERROR_CODES') continue
+      let initializer = declaration.initializer
+      while (
+        initializer
+        && (ts.isAsExpression(initializer) || ts.isSatisfiesExpression(initializer) || ts.isParenthesizedExpression(initializer))
+      ) {
+        initializer = initializer.expression
+      }
+      if (!initializer || !ts.isArrayLiteralExpression(initializer)) {
+        throw new Error('Backend public error code list is not an array')
+      }
+      return initializer.elements.map((element) => {
+        if (!ts.isStringLiteral(element)) {
+          throw new Error('Backend public error code list contains a non-string member')
+        }
+        return element.text
+      })
+    }
+  }
+  throw new Error('Backend public error code list not found')
+}
+
+const BACKEND_PUBLIC_ERROR_CODES = publicErrorCodesFromBackendSource(backendSource)
+
+const PUBLIC_ERROR_CODES = publicErrorCodesFromActivitySource(activitySource)
 
 const WORKSPACE_CAPABILITY_TOOL_IDS = [
   'workspace_read_section',
@@ -54,6 +91,7 @@ const WORKSPACE_CAPABILITY_TOOL_IDS = [
   'workspace_create_task',
   'workspace_update_progress',
   'workspace_submit_result',
+  'workspace_submit_root_result',
   'workspace_accept_submission',
   'workspace_record_finding',
   'workspace_record_decision',
@@ -70,6 +108,15 @@ const DURATION_LABEL_KEYS = [
   'hoursMinutes',
 ] as const
 
+const PROMPT_EVIDENCE_DESTINATIONS = [
+  'root_work',
+  'child_work',
+  'completion_handoff',
+  'render',
+  'council',
+  'cortex',
+] as const satisfies readonly AgentPromptEvidenceDestinationV1[]
+
 function leafPaths(value: unknown, prefix = ''): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return [prefix]
   return Object.entries(value)
@@ -80,18 +127,32 @@ function leafPaths(value: unknown, prefix = ''): string[] {
 describe('AgentRunActivity locale coverage', () => {
   test('keeps the complete Agentic activity and workspace key set in all six locales', () => {
     const expected = leafPaths(en.agentRun)
+    const expectedActivity = leafPaths(en.agentActivity)
+    expect(PUBLIC_ERROR_CODES.length).toBeGreaterThan(0)
+    expect(PUBLIC_ERROR_CODES).toEqual(BACKEND_PUBLIC_ERROR_CODES)
     const expectedErrorKeys = Object.keys(en.agentRun.errors).sort()
-    for (const key of ['unknown', ...PUBLIC_ERROR_CODES]) {
+    for (const key of ['unknown', ...BACKEND_PUBLIC_ERROR_CODES]) {
       expect(expectedErrorKeys).toContain(key)
     }
     const locales = [en, fr, it, ja, zh, zhTW]
     for (const locale of locales) {
+      expect(leafPaths(locale.agentActivity)).toEqual(expectedActivity)
+      const rootResultLabel = locale.agentActivity.tools.workspace_submit_root_result
+      expect(rootResultLabel, 'workspace_submit_root_result legacy activity label').toBeString()
+      expect(rootResultLabel.trim()).not.toBe('')
       expect(leafPaths(locale.agentRun)).toEqual(expected)
       const errors = locale.agentRun.errors as Record<string, unknown>
+      expect(errors.invalid_input).not.toBe(errors.unknown)
       expect(Object.keys(errors).sort()).toEqual(expectedErrorKeys)
       for (const key of expectedErrorKeys) {
         const label = errors[key]
         expect(label).toBeString()
+        if (typeof label === 'string') expect(label.trim()).not.toBe('')
+      }
+      const ownerValues = locale.ownerInspection.values as Record<string, unknown>
+      for (const destination of PROMPT_EVIDENCE_DESTINATIONS) {
+        const label = ownerValues[destination]
+        expect(label, `${destination} owner inspection label`).toBeString()
         if (typeof label === 'string') expect(label.trim()).not.toBe('')
       }
       for (const toolId of WORKSPACE_CAPABILITY_TOOL_IDS) {
@@ -134,5 +195,15 @@ describe('AgentRunActivity locale coverage', () => {
         if (typeof label === 'string') expect(label.trim()).not.toBe('')
       }
     }
+  })
+
+  test('keeps root-only workspace operations out of child profile grants', () => {
+    expect(WORKSPACE_CAPABILITIES).toEqual([
+      'read_section',
+      'read_page',
+      'update_assigned_progress',
+      'submit_child_result',
+      'record_question',
+    ])
   })
 })

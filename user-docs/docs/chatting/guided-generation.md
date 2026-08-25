@@ -65,6 +65,42 @@ You can have multiple guides active simultaneously — they stack.
 
 ---
 
+## Runtime modes and Loom proof
+
+Guides are prompt fragments; enabling a guide does not grant Agentic tools or change the runtime mode. The composer makes the two modes explicit:
+
+- **Response** uses ordinary prompt assembly and remains the compatibility path.
+- **Agentic** runs the host-controlled WORK pipeline for the selected turn.
+
+Choose the mode deliberately for the next turn. An Agentic request never silently becomes Response; if Agentic is unavailable or needs repair, choose **Use Response** intentionally or repair the named configuration.
+
+### Loom Phased Instructions
+
+When Agentic is selected, reusable instructions are authored in the preset's **Agentic Runtime** panel under **Phased Instructions**. Loom owns only existing prompt blocks plus these Phased Instructions; it does not create a second context source. Existing Loom blocks are selected into four fixed policy buckets:
+
+| Bucket | Fixed destination / checkpoint |
+|--------|-------------------------------|
+| **Work policy** | Root **WORK** / **WORK** |
+| **Workspace usage** | Root **WORK** / **WORK** |
+| **Completion criteria** | Completion handoff / **PREPARE_COMMIT** |
+| **Render policy** | Tools-disabled **RENDER** / **RENDER** |
+
+These buckets route Loom blocks through host-controlled checkpoints; no bucket reaches ordinary **Response**, and they do not create a second prompt or context authority. For each selected block, confirm the exact source block ID, preset revision, block revision, prompt order, required setting, and fixed destination/checkpoint. Conditions are typed, evaluate fail-closed only at the owning checkpoint against that checkpoint's immutable snapshot, and remain fixed for that checkpoint; a condition cannot choose a destination or native source.
+
+Bounded custom phases are current-phase-only: the host materializes instructions for the phase that is active and does not preload later phases. A phase may declare explicit instruction subsets for named child profiles; a child receives only its admitted subset, never the root phase instructions or another child's subset. Enter, exit, skip, repeat, and transition behavior remains bounded and visible in inspection.
+
+Required invalid, stale, or unavailable Loom references fail closed. Repair reselects the named block and confirms its exact preset and block revisions; it never silently substitutes another block or a newer revision. If the named source cannot be repaired, discard the stale selection and choose a live block explicitly.
+
+### Inspecting guided-run proof
+
+Open the exact owner inspection for the run's activity item when you need proof. Unified owner inspection explains routes and order, conditions, source identities and exact preset/block revisions, hashes when recorded, every deduplication overlap and reason, omissions, custom-phase and explicit child-subset receipts, accepted crossings, and tools/delegation. Its `inspection` record identifies each selected or omitted Loom entry by bucket, destination/checkpoint, source block ID, exact preset and block revisions, prompt order, required setting, condition result, and inclusion, omission, rejection, or deduplication reason. For a Response turn, `responseOmission` records the omitted WORK/Agentic-only sources and the `work_only` reason. If evidence is unavailable, inspection says that it is unavailable; it is never inferred. Use these records—not the generated Response text—as evidence that a Loom instruction was included or omitted.
+
+World Books (the native World Info system) and Databanks remain live native prompt sources outside Loom. World Books own lore activation, placement, attachment, editing, and access. Databanks own attached documents, attachment, editing, access, automatic semantic retrieval, and explicit `#slug` retrieval. Loom does not select, attach, copy, revise, pin, authorize, deliver, or repair either source. [Context Filters](../presets/context-filters.md) and unrelated native Loom content [packs](../packs/index.md) remain supported outside Loom. If owner inspection reports native source identity or a content hash, that is observational evidence of what the native system used, not a Loom-owned revision pin. Ordinary Response preserves the conversation plus ordinary native World Book and Databank behavior; only agentic-only Loom Phased Instructions and private WORK are omitted.
+
+The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are not supported and do not participate in Loom or native prompt assembly. Do not treat their old names as a context source, picker, pin, or repair path.
+
+Private WORK retrieval does not automatically cross into tools-disabled **RENDER**. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance in the completion handoff may cross that boundary.
+
 ## Tips
 
 !!! tip "Use guides for recurring instructions"

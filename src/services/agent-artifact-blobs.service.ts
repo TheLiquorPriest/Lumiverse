@@ -188,9 +188,11 @@ export interface ArtifactReconcileResult {
   readonly bytesRemoved: number;
   /** Users whose durable journal rows were skipped behind a lifecycle fence. */
   readonly pendingUsers?: number;
-  /** True only when all inspected rows were reconciled and no bounded retry overflow exists. */
+  /** True only when no user retry or bounded global continuation remains. */
   readonly healthy?: boolean;
   readonly pendingOverflow?: boolean;
+  /** True while a bounded global pass has durable continuation work. */
+  readonly pendingGlobal?: boolean;
 }
 
 export interface ArtifactCleanupResult {
@@ -269,6 +271,15 @@ const MAX_PENDING_RECONCILE_USERS = 256;
 type PendingArtifactReconcile = { attempts: number; lastAttemptAt: number };
 const pendingArtifactReconciles = new Map<string, PendingArtifactReconcile>();
 let pendingArtifactReconcileOverflow = false;
+/**
+ * The journal rows themselves are the durable continuation record for a
+ * bounded global pass. This process-local latch/cursor is bound to the active
+ * database authority and keeps readiness closed until a later global pass
+ * observes that no eligible rows remain beyond its cap.
+ */
+let pendingArtifactReconcileGlobal = false;
+let pendingArtifactReconcileGlobalCursor: string | undefined;
+let pendingArtifactReconcileGlobalDb: Database | undefined;
 let artifactReconcileRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let artifactReconcileRetryStore: ArtifactBlobStore | undefined;
 
@@ -302,6 +313,7 @@ function scheduleArtifactReconcileRetry(userId: string): void {
 export interface ArtifactReconcileStatus {
   readonly pendingUsers: number;
   readonly pendingOverflow: boolean;
+  readonly pendingGlobal: boolean;
   readonly healthy: boolean;
 }
 
@@ -309,8 +321,14 @@ export function getArtifactReconcileStatus(): ArtifactReconcileStatus {
   return {
     pendingUsers: pendingArtifactReconciles.size,
     pendingOverflow: pendingArtifactReconcileOverflow,
-    healthy: pendingArtifactReconciles.size === 0 && !pendingArtifactReconcileOverflow,
+    pendingGlobal: pendingArtifactReconcileGlobal,
+    healthy: pendingArtifactReconciles.size === 0 && !pendingArtifactReconcileOverflow && !pendingArtifactReconcileGlobal,
   };
+}
+
+/** Return whether the active database still owns a bounded global continuation. */
+export function hasPendingArtifactReconcileGlobal(db?: Database): boolean {
+  return pendingArtifactReconcileGlobal && (db === undefined || pendingArtifactReconcileGlobalDb === db);
 }
 
 function userLifecycleState(userId: string): ArtifactUserLifecycleFenceState {
@@ -1176,6 +1194,11 @@ export class ArtifactBlobStore {
 
   async reconcile(options: { readonly assertFence?: () => void; readonly maxRows?: number; readonly userId?: string } = {}): Promise<ArtifactReconcileResult> {
     const db = this.db;
+    if (!options.userId && pendingArtifactReconcileGlobalDb !== db) {
+      pendingArtifactReconcileGlobalDb = db;
+      pendingArtifactReconcileGlobal = false;
+      pendingArtifactReconcileGlobalCursor = undefined;
+    }
     const columns = requireTable(db, "agent_artifact_blob_journal");
     const digestColumn = pickColumn(columns, ["blob_digest", "digest", "artifact_digest"], "agent_artifact_blob_journal");
     const userColumn = pickColumn(columns, ["user_id", "owner_id"], "agent_artifact_blob_journal");
@@ -1188,22 +1211,58 @@ export class ArtifactBlobStore {
     const stateColumn = pickColumn(columns, ["state", "install_state"], "agent_artifact_blob_journal");
     const observedColumn = pickColumn(columns, ["observed_identity", "final_identity", "identity"], "agent_artifact_blob_journal");
     const bytesColumn = pickColumn(columns, ["byte_count", "bytes"], "agent_artifact_blob_journal");
-    const maxRows = options.maxRows ?? this.limits.maxCleanupRows;
-    const userFilter = options.userId ? ` WHERE ${q(userColumn)} = ?` : "";
+    const configuredMaxRows = options.maxRows ?? this.limits.maxCleanupRows;
+    const maxRows = Number.isFinite(configuredMaxRows) ? Math.max(0, Math.floor(configuredMaxRows)) : this.limits.maxCleanupRows;
+    const scanPredicates: string[] = [];
+    const scanParams: SQLQueryBindings[] = [];
+    if (options.userId) {
+      scanPredicates.push(`${q(userColumn)} = ?`);
+      scanParams.push(options.userId);
+    } else if (pendingArtifactReconcileGlobalCursor !== undefined) {
+      scanPredicates.push(`${q(idColumn)} > ?`);
+      scanParams.push(pendingArtifactReconcileGlobalCursor);
+    }
+    const scanWhere = scanPredicates.length > 0 ? ` WHERE ${scanPredicates.join(" AND ")}` : "";
     const rows = db.query(
-      `SELECT ${selectAlias(columns, [idColumn], "id", "agent_artifact_blob_journal")}, ${selectAlias(columns, [digestColumn], "digest", "agent_artifact_blob_journal")}, ${selectAlias(columns, [userColumn], "user_id", "agent_artifact_blob_journal")}, ${selectAlias(columns, [turnColumn], "turn_id", "agent_artifact_blob_journal")}, ${selectAlias(columns, [tokenColumn], "creator_token", "agent_artifact_blob_journal")}, ${selectAlias(columns, [fenceColumn], "fence", "agent_artifact_blob_journal")}, ${selectAlias(columns, [stagedColumn], "staged_path", "agent_artifact_blob_journal")}, ${selectAlias(columns, [finalColumn], "final_path", "agent_artifact_blob_journal")}, ${selectAlias(columns, [stateColumn], "state", "agent_artifact_blob_journal")}, ${selectAlias(columns, [observedColumn], "observed_identity", "agent_artifact_blob_journal")}, ${selectAlias(columns, [bytesColumn], "byte_count", "agent_artifact_blob_journal")} FROM agent_artifact_blob_journal${userFilter} ORDER BY ${q(idColumn)} LIMIT ?`,
-    ).all(...(options.userId ? [options.userId, maxRows] : [maxRows])) as SqlRow[];
+      `SELECT ${selectAlias(columns, [idColumn], "id", "agent_artifact_blob_journal")}, ${selectAlias(columns, [digestColumn], "digest", "agent_artifact_blob_journal")}, ${selectAlias(columns, [userColumn], "user_id", "agent_artifact_blob_journal")}, ${selectAlias(columns, [turnColumn], "turn_id", "agent_artifact_blob_journal")}, ${selectAlias(columns, [tokenColumn], "creator_token", "agent_artifact_blob_journal")}, ${selectAlias(columns, [fenceColumn], "fence", "agent_artifact_blob_journal")}, ${selectAlias(columns, [stagedColumn], "staged_path", "agent_artifact_blob_journal")}, ${selectAlias(columns, [finalColumn], "final_path", "agent_artifact_blob_journal")}, ${selectAlias(columns, [stateColumn], "state", "agent_artifact_blob_journal")}, ${selectAlias(columns, [observedColumn], "observed_identity", "agent_artifact_blob_journal")}, ${selectAlias(columns, [bytesColumn], "byte_count", "agent_artifact_blob_journal")} FROM agent_artifact_blob_journal${scanWhere} ORDER BY ${q(idColumn)} LIMIT ?`,
+    ).all(...scanParams, maxRows + 1) as SqlRow[];
+    const rowsToInspect = Math.min(rows.length, maxRows);
+    const hasRowsBeyondCap = rows.length > rowsToInspect;
+    const continuationPredicates: string[] = [];
+    const continuationParams: SQLQueryBindings[] = [];
+    if (hasRowsBeyondCap && rowsToInspect > 0) {
+      continuationPredicates.push(`${q(idColumn)} > ?`);
+      continuationParams.push(String(rows[rowsToInspect - 1]?.id));
+    }
+    if (options.userId) {
+      continuationPredicates.push(`${q(userColumn)} = ?`);
+      continuationParams.push(options.userId);
+    }
+    const continuationWhere = continuationPredicates.length > 0 ? ` WHERE ${continuationPredicates.join(" AND ")}` : "";
+    const hasContinuation = hasRowsBeyondCap && db.query(
+      `SELECT 1 AS present FROM agent_artifact_blob_journal${continuationWhere} LIMIT 1`,
+    ).get(...continuationParams) !== null;
     let removed = 0;
     let retained = 0;
     let stale = 0;
     let quarantined = 0;
     let bytesRemoved = 0;
     const busyUsers = new Set<string>();
-    for (const raw of rows) {
+    let globalScanDeferred = false;
+    let inspected = 0;
+    const deferGlobalScan = (): boolean => {
+      if (options.userId) return false;
+      globalScanDeferred = true;
+      return true;
+    };
+    for (let rowIndex = 0; rowIndex < rowsToInspect; rowIndex++) {
+      const raw = rows[rowIndex]!;
+      inspected++;
       try {
         options.assertFence?.();
       } catch {
         stale++;
+        if (deferGlobalScan()) break;
         continue;
       }
       const row: JournalRow = {
@@ -1217,6 +1276,7 @@ export class ArtifactBlobStore {
           if (isArtifactLifecycleBusy(error)) {
             busyUsers.add(row.userId);
             markArtifactReconcilePending(row.userId);
+            if (deferGlobalScan()) break;
             continue;
           }
           throw error;
@@ -1237,6 +1297,7 @@ export class ArtifactBlobStore {
         if (isArtifactLifecycleBusy(error)) {
           busyUsers.add(row.userId);
           markArtifactReconcilePending(row.userId);
+          if (deferGlobalScan()) break;
           continue;
         }
         throw error;
@@ -1275,6 +1336,7 @@ export class ArtifactBlobStore {
         if (row.state !== "installed" || marker.deleting) {
           if (!currentFence()) {
             retained++;
+            if (deferGlobalScan()) break;
             continue;
           }
           this.updateJournal(row, "installed", { ...marker, after: identityString(protectedFinal), deleting: false });
@@ -1295,11 +1357,13 @@ export class ArtifactBlobStore {
       if (canRemoveFinal && digestMatches && marker.after === identityString(final!)) {
         if (!currentFence()) {
           retained++;
+          if (deferGlobalScan()) break;
           continue;
         }
         const deletionAlreadyClaimed = marker.deleting && marker.createdByUs && marker.before === null && marker.after === identityString(final!);
         if (!deletionAlreadyClaimed && !this.claimJournalForRemoval(row)) {
           retained++;
+          if (deferGlobalScan()) break;
           if (!(await this.removeOwnedPath(row.userId, row.stagedPath))) quarantined++;
           continue;
         }
@@ -1308,19 +1372,23 @@ export class ArtifactBlobStore {
         if (!claimedFinal || identityString(claimedFinal) !== identityString(final!)) {
           retained++;
           quarantined++;
+          if (deferGlobalScan()) break;
           continue;
         }
         if (!currentFence()) {
           retained++;
+          if (deferGlobalScan()) break;
           continue;
         }
         if (!(await this.removeOwnedPath(row.userId, row.finalPath))) {
           retained++;
           quarantined++;
+          if (deferGlobalScan()) break;
           continue;
         }
         if (!currentFence()) {
           retained++;
+          if (deferGlobalScan()) break;
           continue;
         }
         removed++;
@@ -1335,24 +1403,34 @@ export class ArtifactBlobStore {
       }
       if (!journalClaimed) {
         const deletionAlreadyClaimed = marker.deleting && marker.createdByUs && marker.before === null && marker.after !== null;
-        if (!deletionAlreadyClaimed && (!currentFence() || !this.claimJournalForRemoval(row))) {
+        if (!deletionAlreadyClaimed && !currentFence()) {
           retained++;
           quarantined++;
+          if (deferGlobalScan()) break;
+          continue;
+        }
+        if (!deletionAlreadyClaimed && !this.claimJournalForRemoval(row)) {
+          retained++;
+          quarantined++;
+          if (deferGlobalScan()) break;
           continue;
         }
         journalClaimed = true;
       }
       if (!currentFence()) {
         retained++;
+        if (deferGlobalScan()) break;
         continue;
       }
       if (!(await this.removeOwnedPath(row.userId, row.stagedPath))) {
         retained++;
         quarantined++;
+        if (deferGlobalScan()) break;
         continue;
       }
       if (!currentFence()) {
         retained++;
+        if (deferGlobalScan()) break;
         continue;
       }
       this.updateJournal(row, "removed", { ...marker, deleting: false, after: final ? identityString(final) : marker.after });
@@ -1363,11 +1441,24 @@ export class ArtifactBlobStore {
     }
     if (options.userId && !busyUsers.has(options.userId)) {
       const remaining = db.query(`SELECT COUNT(*) AS count FROM agent_artifact_blob_journal WHERE ${q(userColumn)} = ?`).get(options.userId) as { count?: number } | null;
-      if (Number(remaining?.count ?? 0) <= rows.length) pendingArtifactReconciles.delete(options.userId);
+      if (Number(remaining?.count ?? 0) <= rowsToInspect) pendingArtifactReconciles.delete(options.userId);
+    }
+    if (!options.userId) {
+      if (globalScanDeferred) {
+        pendingArtifactReconcileGlobal = true;
+      } else if (hasContinuation && rowsToInspect > 0) {
+        pendingArtifactReconcileGlobal = true;
+        pendingArtifactReconcileGlobalCursor = String(rows[rowsToInspect - 1]!.id);
+      } else if (!hasContinuation) {
+        pendingArtifactReconcileGlobal = false;
+        pendingArtifactReconcileGlobalCursor = undefined;
+      } else {
+        pendingArtifactReconcileGlobal = true;
+      }
     }
     const pending = getArtifactReconcileStatus();
     return {
-      inspected: rows.length,
+      inspected,
       retained,
       removed,
       stale,
@@ -1375,6 +1466,7 @@ export class ArtifactBlobStore {
       bytesRemoved,
       pendingUsers: pending.pendingUsers,
       pendingOverflow: pending.pendingOverflow,
+      pendingGlobal: pending.pendingGlobal,
       healthy: pending.healthy,
     };
   }

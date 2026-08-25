@@ -317,13 +317,12 @@ export type AgentActivityActor = "root" | "provider" | "child" | "tool";
 export type AgentActivityToolId =
   | CoreAgentToolId
   | "agent_delegate"
-  | "context_pack_list"
-  | "context_pack_get"
   | "workspace_read_section"
   | "workspace_read_page"
   | "workspace_create_task"
   | "workspace_update_progress"
   | "workspace_submit_result"
+  | "workspace_submit_root_result"
   | "workspace_accept_submission"
   | "workspace_record_finding"
   | "workspace_record_decision"
@@ -341,13 +340,12 @@ export const PUBLIC_ACTIVITY_TOOL_IDS = [
   "lore_search_entries",
   "chat_search_history",
   "agent_delegate",
-  "context_pack_list",
-  "context_pack_get",
   "workspace_read_section",
   "workspace_read_page",
   "workspace_create_task",
   "workspace_update_progress",
   "workspace_submit_result",
+  "workspace_submit_root_result",
   "workspace_accept_submission",
   "workspace_record_finding",
   "workspace_record_decision",
@@ -366,6 +364,7 @@ const PUBLIC_ACTIVITY_TOOL_ID_LOOKUP: Record<string, true> = Object.fromEntries(
 export function publicActivityToolId(name: unknown): AgentActivityToolId {
   if (name === "workspace_update_assigned_progress") return "workspace_update_progress";
   if (name === "workspace_submit_child_result") return "workspace_submit_result";
+  if (name === "workspace_submit_root_result") return "workspace_submit_root_result";
   if (typeof name === "string" && PUBLIC_ACTIVITY_TOOL_ID_LOOKUP[name] === true) {
     return name as AgentActivityToolId;
   }

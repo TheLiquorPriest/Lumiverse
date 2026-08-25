@@ -15,26 +15,31 @@ import { createAgenticChildFrame, createAgenticRootFrame, executeBoundedAgenticC
 import { compileAgentRuntimePhases } from "./agentic-phase-runtime.service";
 import { createAgentCognitionRuntime } from "./agent-cognition-runtime.service";
 import { evaluateCognitionPredicate } from "./agent-cognition.service";
-import { setAgenticRuntimeReadiness, startAgentRuntimeEpoch, calculateFinalRenderReservationEnvelopeV1, reserveFinalRender, TurnExecutionError } from "./turn-execution.service";
 import {
-  attachContextPack,
-  createContextPack,
-  deleteContextPack,
-  deleteContextPackAttachment,
-} from "./agent-context-packs.service";
-import { getAgentRuntimeSharedDraft } from "./agent-config-portability.service";
+  setAgenticRuntimeReadiness,
+  startAgentRuntimeEpoch,
+  calculateFinalRenderReservationEnvelopeV1,
+  createTurnExecution,
+  finalizeTurnCommit,
+  reconcileAgentTurns,
+  reserveFinalRender,
+  transitionTurnExecution,
+  TurnExecutionError,
+} from "./turn-execution.service";
 import {
   AGENT_RUNTIME_DECISION_SERVICE,
   resolveEffectiveRuntime,
 } from "./agent-runtime-decision.service";
 import { getIsolateHealthEpoch, probeIsolateBackendsAtStartup } from "./isolate-pool";
 import { AGENT_RUNTIME_ADMISSION_MANAGER } from "./agent-runtime-admission";
-import { getPoolEntry } from "./generation-pool.service";
+import { createPoolEntry, getPoolEntry, removePoolEntry } from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { waitForAgenticGeneration } from "./agentic-generation.service";
 import { startGeneration } from "./generate.service";
 import * as breakdownSvc from "./breakdown.service";
+import { getAgentRunInspection } from "./agent-activity-runs.service";
+import { deleteChat } from "./chats.service";
 
 import {
   __testing,
@@ -64,10 +69,6 @@ function markAgenticRuntimeReady(): void {
     archiveRegistry: true,
     publicationStore: true,
     isolateTermination: true,
-    providerCapabilities: true,
-    configBinding: true,
-    contextAcl: true,
-    inputRevisions: true,
   });
 }
 let scriptedWorkRound = 0;
@@ -465,11 +466,11 @@ function seed(): void {
     `INSERT INTO preset_agent_configs
       (user_id, preset_id, version, agents_enabled, allowed_modes, default_mode,
        max_invocations, max_tool_calls, main_tool_ids, main_lore_scope,
-       phase_policy_json, cognition_policy_json, context_policy_json, task_policy_json,
+       phase_policy_json, cognition_policy_json, task_policy_json,
        workspace_policy_json, state, review_acknowledged, config_revision, binding_revision,
        created_at, updated_at)
       VALUES (?, ?, 2, 1, ?, 'agentic', 8, 8, ?, 'active',
-        '{}', '{}', '{}', '{}', '{}', 'ready', 1, ?, ?, ?, ?)`,
+        '{}', '{}', '{}', '{}', 'ready', 1, ?, ?, ?, ?)`,
   ).run(
     USER_ID,
     AGENTIC_PRESET_ID,
@@ -505,6 +506,40 @@ function seedTargetMessage(id: string, chatId: string, revision: number): void {
     "INSERT INTO messages (id, chat_id, index_in_chat, is_user, name, content, send_date, swipe_id, swipes, swipe_dates, extra, created_at, generation_revision) VALUES (?, ?, 0, 0, ?, ?, ?, 0, ?, ?, '{}', ?, ?)",
   ).run(id, chatId, "Coordinator", "target", now, JSON.stringify(["target"]), JSON.stringify([now]), now, revision);
 }
+function seedCommittedExecution(id: string, chatId = AGENTIC_CHAT_ID): void {
+  const created = createTurnExecution({
+    id,
+    userId: USER_ID,
+    chatId,
+    generationId: id,
+    target: { kind: "normal" },
+    mode: "agentic",
+    runtimeEpoch: 1,
+    deadlineAt: Date.now() + 60_000,
+    workspaceId: `workspace:${id}`,
+    rootLedger: {},
+    frameCapabilities: {},
+  });
+  let current = created.execution;
+  for (const nextPhase of ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING"] as const) {
+    current = transitionTurnExecution({
+      executionId: id,
+      ownerToken: created.ownerToken,
+      expectedPhase: current.phase,
+      nextPhase,
+      ignoreCancellation: true,
+    }).execution;
+  }
+  finalizeTurnCommit({
+    executionId: id,
+    ownerToken: created.ownerToken,
+    receiptId: `receipt:${id}`,
+    messageId: null,
+    swipeId: null,
+    summary: { source: "coordinator-test" },
+  });
+}
+
 
 beforeAll(async () => {
   closeDatabase();
@@ -527,25 +562,223 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     expect(true).toBe(true);
   });
-  test("accepts an exact shared context candidate with frozen owner ACL authority", () => {
-    expect(__testing.contextPackReadiness({
-      schema: "present",
-      candidates: [{
-        ownerId: "shared-pack-owner",
-        revisionId: "shared-pack@1",
-        digest: "a".repeat(64),
-        aclRevision: 7,
-      }],
-    })).toEqual({ ready: true, reason: null });
-    expect(__testing.contextPackReadiness({
-      schema: "present",
-      candidates: [{
-        ownerId: "",
-        revisionId: "shared-pack@1",
-        digest: "a".repeat(64),
-        aclRevision: 7,
-      }],
-    })).toEqual({ ready: false, reason: "cognition_authorization_stale" });
+  test("bounds persistent recovery while prioritizing receipt-backed committed sessions", () => {
+    const db = getDb();
+    const workspaceId = "workspace:persistent-recovery-budget";
+    const priorityExecutionId = "persistent-recovery-priority-execution";
+    const now = Date.now();
+    const maxRows = __testing.persistentRecoveryLimits.maxRows;
+    db.query(
+      "INSERT INTO persistent_workspaces (workspace_id, user_id, chat_id, objective) VALUES (?, ?, ?, ?)",
+    ).run(workspaceId, USER_ID, AGENTIC_CHAT_ID, "bounded recovery");
+    seedCommittedExecution(priorityExecutionId);
+    const insertSession = db.query(`
+      INSERT INTO persistent_workspace_turn_sessions (
+        turn_session_id, workspace_id, user_id, chat_id, turn_id, attempt_id,
+        execution_id, phase, status, outcome, reason, revision, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertSession.run(
+      "persistent-recovery-priority-session",
+      workspaceId,
+      USER_ID,
+      AGENTIC_CHAT_ID,
+      priorityExecutionId,
+      priorityExecutionId,
+      priorityExecutionId,
+      "WORK",
+      "running",
+      null,
+      "none",
+      0,
+      now,
+      now,
+    );
+    for (let index = 0; index < maxRows + 1; index += 1) {
+      const id = `persistent-recovery-overflow-${index}`;
+      insertSession.run(
+        id,
+        workspaceId,
+        USER_ID,
+        AGENTIC_CHAT_ID,
+        `persistent-recovery-turn-${index}`,
+        `persistent-recovery-attempt-${index}`,
+        null,
+        "WORK",
+        "running",
+        null,
+        "none",
+        0,
+        now,
+        now,
+      );
+    }
+    try {
+      const recovery = __testing.reconcilePersistentWorkspaceSessions();
+      expect(recovery.complete).toBe(false);
+      expect(recovery.inspected).toBeLessThanOrEqual(maxRows);
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+      ).get("persistent-recovery-priority-session")).toEqual({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "completed",
+      });
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM persistent_workspace_turn_sessions WHERE workspace_id = ? AND status <> 'terminal'",
+      ).get(workspaceId) as { count: number }).count).toBeGreaterThan(0);
+    } finally {
+      db.query("DELETE FROM persistent_workspace_turn_sessions WHERE workspace_id = ?").run(workspaceId);
+      db.query("DELETE FROM persistent_workspaces WHERE workspace_id = ?").run(workspaceId);
+      db.query("DELETE FROM agent_turn_commit_receipts WHERE execution_id = ?").run(priorityExecutionId);
+      db.query("DELETE FROM agent_turn_executions WHERE id = ?").run(priorityExecutionId);
+      db.query("DELETE FROM agent_turn_workspaces WHERE turn_id = ?").run(priorityExecutionId);
+    }
+  });
+
+  test("fails coordinator installation closed when persistent recovery is incomplete", () => {
+    const db = getDb();
+    __testing.resetInstallation();
+    db.run("ALTER TABLE agent_turn_commit_receipts RENAME TO agent_turn_commit_receipts_unavailable");
+    try {
+      expect(() => installAgenticGenerationCoordinator()).toThrow("persistent session recovery incomplete");
+    } finally {
+      db.run("ALTER TABLE agent_turn_commit_receipts_unavailable RENAME TO agent_turn_commit_receipts");
+      __testing.resetInstallation();
+      installAgenticGenerationCoordinator();
+    }
+  });
+  test("marks persistent recovery incomplete when receipt projection repair fails", () => {
+    const db = getDb();
+    const workspaceId = "workspace:persistent-recovery-projection-failure";
+    const executionId = "persistent-recovery-projection-failure-execution";
+    const sessionId = "persistent-recovery-projection-failure-session";
+    const now = Date.now();
+    db.query(
+      "INSERT INTO persistent_workspaces (workspace_id, user_id, chat_id, objective) VALUES (?, ?, ?, ?)",
+    ).run(workspaceId, USER_ID, AGENTIC_CHAT_ID, "projection failure");
+    seedCommittedExecution(executionId);
+    db.query(`
+      INSERT INTO persistent_workspace_turn_sessions (
+        turn_session_id, workspace_id, user_id, chat_id, turn_id, attempt_id,
+        execution_id, phase, status, outcome, reason, revision, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'WORK', 'running', NULL, 'none', 0, ?, ?)
+    `).run(
+      sessionId,
+      workspaceId,
+      USER_ID,
+      AGENTIC_CHAT_ID,
+      executionId,
+      executionId,
+      executionId,
+      now,
+      now,
+    );
+    db.run(`
+      CREATE TRIGGER persistent_recovery_projection_failure_insert
+      BEFORE INSERT ON agent_run_projections
+      BEGIN
+        SELECT RAISE(ABORT, 'injected persistent receipt projection failure');
+      END
+    `);
+    db.run(`
+      CREATE TRIGGER persistent_recovery_projection_failure_update
+      BEFORE UPDATE ON agent_run_projections
+      BEGIN
+        SELECT RAISE(ABORT, 'injected persistent receipt projection failure');
+      END
+    `);
+    try {
+      const recovery = __testing.reconcilePersistentWorkspaceSessions();
+      expect(recovery.complete).toBe(false);
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+      ).get(sessionId)).toEqual({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "completed",
+      });
+    } finally {
+      db.run("DROP TRIGGER persistent_recovery_projection_failure_insert");
+      db.run("DROP TRIGGER persistent_recovery_projection_failure_update");
+      db.query("DELETE FROM persistent_workspace_turn_sessions WHERE workspace_id = ?").run(workspaceId);
+      db.query("DELETE FROM persistent_workspaces WHERE workspace_id = ?").run(workspaceId);
+      db.query("DELETE FROM agent_turn_commit_receipts WHERE execution_id = ?").run(executionId);
+      db.query("DELETE FROM agent_turn_executions WHERE id = ?").run(executionId);
+      db.query("DELETE FROM agent_turn_workspaces WHERE turn_id = ?").run(executionId);
+    }
+  });
+  test("stops before an expensive persistent session when the recovery deadline expires", () => {
+    const db = getDb();
+    const workspaceId = "workspace:persistent-recovery-slow-clock";
+    const firstSessionId = "persistent-recovery-slow-a";
+    const secondSessionId = "persistent-recovery-slow-b";
+    db.query(
+      "INSERT INTO persistent_workspaces (workspace_id, user_id, chat_id, objective) VALUES (?, ?, ?, ?)",
+    ).run(workspaceId, USER_ID, AGENTIC_CHAT_ID, "slow recovery");
+    const insertSession = db.query(`
+      INSERT INTO persistent_workspace_turn_sessions (
+        turn_session_id, workspace_id, user_id, chat_id, turn_id, attempt_id,
+        execution_id, phase, status, outcome, reason, revision, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'WORK', 'running', NULL, 'none', 0, ?, ?)
+    `);
+    insertSession.run(
+      firstSessionId,
+      workspaceId,
+      USER_ID,
+      AGENTIC_CHAT_ID,
+      "persistent-recovery-slow-turn-a",
+      "persistent-recovery-slow-attempt-a",
+      100,
+      100,
+    );
+    insertSession.run(
+      secondSessionId,
+      workspaceId,
+      USER_ID,
+      AGENTIC_CHAT_ID,
+      "persistent-recovery-slow-turn-b",
+      "persistent-recovery-slow-attempt-b",
+      200,
+      200,
+    );
+    const clockValues = [1_000, 1_000, 1_000, 6_000];
+    let clockIndex = 0;
+    __testing.setPersistentRecoveryClock(() => clockValues[Math.min(clockIndex++, clockValues.length - 1)]!);
+    try {
+      const blocked = __testing.reconcilePersistentWorkspaceSessions();
+      expect(blocked.complete).toBe(false);
+      expect(blocked.recovered).toBe(1);
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+      ).get(firstSessionId)).toEqual({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "failed",
+      });
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+      ).get(secondSessionId)).toEqual({
+        phase: "WORK",
+        status: "running",
+        outcome: null,
+      });
+      __testing.setPersistentRecoveryClock(null);
+      const recovered = __testing.reconcilePersistentWorkspaceSessions();
+      expect(recovered.complete).toBe(true);
+      expect(recovered.recovered).toBe(1);
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
+      ).get(secondSessionId)).toEqual({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "failed",
+      });
+    } finally {
+      __testing.setPersistentRecoveryClock(null);
+      db.query("DELETE FROM persistent_workspace_turn_sessions WHERE workspace_id = ?").run(workspaceId);
+      db.query("DELETE FROM persistent_workspaces WHERE workspace_id = ?").run(workspaceId);
+    }
   });
   test("authenticates the root caller before assigning child tasks", async () => {
     markAgenticRuntimeReady();
@@ -678,6 +911,57 @@ describe("production agentic coordinator installation", () => {
         "SELECT assigned_frame_id FROM agent_workspace_tasks WHERE turn_id = ? AND task_id = ?",
       ).get(execution.id, "task-auth") as { assigned_frame_id: string | null } | null;
       expect(persisted).toEqual({ assigned_frame_id: "valid-child-frame" });
+      const createdRoot = await workspace.execute?.(
+        "create_task",
+        {
+          taskId: "root-result-auth",
+          title: "Root result task",
+          objective: "Verify root-only completion.",
+          required: false,
+          dependencyIds: [],
+        },
+        { actor: "root", frame: rootFrame, operation: "create_task", signal: rootSignal },
+      );
+      expect(createdRoot).toMatchObject({
+        result: expect.objectContaining({ id: "root-result-auth" }),
+      });
+      const rootResultChild = createAgenticChildFrame({
+        frameId: "root-result-child",
+        parentFrameId: execution.id,
+        connectionId: null,
+        model: "",
+        coreToolIds: [],
+        taskId: "root-result-auth",
+        workspaceCapabilities: ["submit_child_result"],
+        signal: rootSignal,
+      });
+      await expect(workspace.execute?.(
+        "submit_root_result",
+        { taskId: "root-result-auth", summary: "Child cannot complete a root task.", state: "completed" },
+        { actor: "child", frame: rootResultChild, operation: "submit_root_result", signal: rootSignal },
+      )).rejects.toThrow();
+      const rootResult = await workspace.execute?.(
+        "submit_root_result",
+        { taskId: "root-result-auth", summary: "Root completed its own task.", state: "completed" },
+        { actor: "root", frame: rootFrame, operation: "submit_root_result", signal: rootSignal },
+      );
+      expect(rootResult).toMatchObject({
+        result: expect.objectContaining({ id: "root-result-auth" }),
+      });
+      expect(getDb().query(
+        "SELECT state, assigned_frame_id FROM agent_workspace_tasks WHERE turn_id = ? AND task_id = ?",
+      ).get(execution.id, "root-result-auth")).toEqual({ state: "completed", assigned_frame_id: null });
+      const settled = await workspace.settleAssignedTask?.({
+        taskId: "task-auth",
+        frameId: "valid-child-frame",
+        state: "failed",
+        operationKey: "coordinator-test-settlement",
+        signal: rootSignal,
+      });
+      expect(settled?.accepted).toBe(true);
+      expect(getDb().query(
+        "SELECT state, assigned_frame_id FROM agent_workspace_tasks WHERE turn_id = ? AND task_id = ?",
+      ).get(execution.id, "task-auth")).toEqual({ state: "failed", assigned_frame_id: "valid-child-frame" });
     } finally {
       deps.cleanup?.({ execution } as never);
     }
@@ -761,14 +1045,11 @@ describe("production agentic coordinator installation", () => {
     expect(JSON.stringify(decision.internal.binding)).not.toContain("startup-");
   });
 
-  test("production readiness digest tracks the frozen cognition and context-ACL revisions", async () => {
+  test("production readiness digest tracks the frozen cognition revision", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
     installAgenticGenerationCoordinator();
     const db = getDb();
-    const now = Date.now();
-    db.query("INSERT OR IGNORE INTO agent_context_account_state (user_id, context_acl_revision, updated_at) VALUES (?, ?, ?)")
-      .run(USER_ID, 40, now);
     const baseRequest = {
       chatId: AGENTIC_CHAT_ID,
       logicalConnectionId: CONNECTION_ID,
@@ -781,24 +1062,15 @@ describe("production agentic coordinator installation", () => {
       const first = await resolveEffectiveRuntime(USER_ID, { ...baseRequest, requestEpoch: 101 });
       expect(first.effectiveMode).toBe("agentic");
       expect(first.internal.readinessVector.ready).toBe(true);
-      expect(first.internal.readinessVector.contextAclRevision).toBe(40);
       expect(String(first.internal.readinessVector.cognitionRevision).length).toBeGreaterThan(0);
+      const firstCognitionRevision = first.internal.readinessVector.cognitionRevision;
       const firstDigest = first.internal.binding.readinessDigest;
 
-      // A context-ACL revision change must change the readiness digest and the
-      // vector revision it came from.
-      db.query("UPDATE agent_context_account_state SET context_acl_revision = 41 WHERE user_id = ?").run(USER_ID);
-      const second = await resolveEffectiveRuntime(USER_ID, { ...baseRequest, requestEpoch: 102 });
-      expect(second.internal.readinessVector.contextAclRevision).toBe(41);
-      expect(second.internal.binding.readinessDigest).not.toBe(firstDigest);
-
-      // An authored config change reaches the frozen cognition revision and
-      // must change the digest again, independently of the ACL probe above.
       db.query("UPDATE preset_agent_configs SET max_invocations = max_invocations + 1 WHERE user_id = ? AND preset_id = ?")
         .run(USER_ID, AGENTIC_PRESET_ID);
-      const third = await resolveEffectiveRuntime(USER_ID, { ...baseRequest, requestEpoch: 103 });
-      expect(third.internal.readinessVector.cognitionRevision).not.toBe(first.internal.readinessVector.cognitionRevision);
-      expect(third.internal.binding.readinessDigest).not.toBe(second.internal.binding.readinessDigest);
+      const second = await resolveEffectiveRuntime(USER_ID, { ...baseRequest, requestEpoch: 102 });
+      expect(second.internal.readinessVector.cognitionRevision).not.toBe(firstCognitionRevision);
+      expect(second.internal.binding.readinessDigest).not.toBe(firstDigest);
     } finally {
       db.query("UPDATE preset_agent_configs SET max_invocations = 8 WHERE user_id = ? AND preset_id = ?")
         .run(USER_ID, AGENTIC_PRESET_ID);
@@ -819,11 +1091,11 @@ describe("production agentic coordinator installation", () => {
       `INSERT OR IGNORE INTO preset_agent_configs
         (user_id, preset_id, version, agents_enabled, allowed_modes, default_mode,
          max_invocations, max_tool_calls, main_tool_ids, main_lore_scope,
-         phase_policy_json, cognition_policy_json, context_policy_json, task_policy_json,
+         phase_policy_json, cognition_policy_json, task_policy_json,
          workspace_policy_json, state, review_code, review_acknowledged, config_revision, binding_revision,
          created_at, updated_at)
         VALUES (?, ?, 2, 1, ?, 'agentic', 8, 8, ?, 'active',
-          '{}', '{}', '{}', '{}', '{}', 'repair_required', 'cognition_invalid', 0, 1, 1, ?, ?)`,
+          '{}', '{}', '{}', '{}', 'repair_required', 'cognition_invalid', 0, 1, 1, ?, ?)`,
     ).run(
       USER_ID,
       repairPresetId,
@@ -998,21 +1270,7 @@ describe("production agentic coordinator installation", () => {
     expect(snapshot.agentConfig).toBeNull();
     expect(Array.isArray(snapshot.availability.toolIds)).toBe(true);
   });
-  test("production assembly keeps context inactive when cognition is absent", async () => {
-    const db = getDb();
-    const now = Date.now();
-    const digest = "b".repeat(64);
-    db.query("INSERT OR IGNORE INTO agent_context_account_state (user_id, context_acl_revision, updated_at) VALUES (?, 1, ?)")
-      .run(USER_ID, now);
-    db.query(
-      "INSERT OR IGNORE INTO agent_context_packs (user_id, id, name, description, visibility, state, latest_revision, provenance_json, created_at, updated_at) VALUES (?, ?, ?, '', 'private', 'active', 1, '{}', ?, ?)",
-    ).run(USER_ID, "pack-coordinator", "Coordinator Context", now, now);
-    db.query(
-      "INSERT OR IGNORE INTO agent_context_pack_revisions (user_id, pack_id, revision, content_json, content_digest, token_count, byte_count, state, provenance_json, created_at, created_by) VALUES (?, ?, 1, ?, ?, 2, ?, 'active', '{}', ?, ?)",
-    ).run(USER_ID, "pack-coordinator", JSON.stringify({ records: [{ id: "record-1", text: "frozen context" }] }), digest, "frozen context".length, now, USER_ID);
-    db.query(
-      "INSERT OR IGNORE INTO agent_preset_context_pack_attachments (user_id, attachment_id, preset_id, pack_id, revision, position, required, state, provenance_json, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 0, 0, 'active', '{}', ?, ?)",
-    ).run(USER_ID, "attachment-coordinator", PRESET_ID, "pack-coordinator", now, now);
+  test("production assembly keeps cognition inactive when no Loom source is authored", async () => {
     const deps = __testing.buildDependencies();
     const input = {
       userId: USER_ID,
@@ -1025,25 +1283,14 @@ describe("production agentic coordinator installation", () => {
     const target = { generationType: "normal" as const };
     const signal = new AbortController().signal;
     const decision = await deps.resolveRuntime!(input, target, signal);
-    const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, "test-context");
+    const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, "test-cognition");
     expect(snapshot.agentConfig).toBeNull();
-    expect(snapshot.contextPacks.cognitionGraph).toBeNull();
-    expect(snapshot.contextPacks.cognitionSource).toBeNull();
-    expect(snapshot.contextPacks.contextPackSelections).toHaveLength(0);
-    expect(snapshot.contextPacks.contextRules).toHaveLength(0);
-    expect(snapshot.contextPackSnapshot.candidates).toEqual([
-      expect.objectContaining({
-        packId: "pack-coordinator",
-        source: "preset",
-        targetId: PRESET_ID,
-        required: false,
-      }),
-    ]);
-    expect(Object.isFrozen(snapshot.contextPackSnapshot)).toBe(true);
-    expect(Object.isFrozen(snapshot.contextPackSnapshot.candidates[0])).toBe(true);
-    const runtime = await deps.createContextRuntime!(snapshot, input, decision, signal, "test-context");
-    const listed = await runtime.capability.list({});
-    expect(listed).toMatchObject({ status: "success", data: { candidates: [], total: 0 } });
+    expect(snapshot.agentCognition).toMatchObject({
+      schema: "present",
+      cognitionGraph: null,
+      cognitionSource: null,
+    });
+    expect(snapshot.agentCognition.revision).toEqual(expect.any(String));
   });
 
   test("execution takes one root permit, joins the pool, and releases on cleanup", async () => {
@@ -1075,6 +1322,29 @@ describe("production agentic coordinator installation", () => {
     try {
       expect(AGENT_RUNTIME_ADMISSION_MANAGER.snapshot().rootsByUser[USER_ID] ?? 0).toBe(before + 1);
       expect(getPoolEntry("exec-normal-1")).toBeDefined();
+      const persistentWorkspace = getDb().query(
+        "SELECT workspace_id, revision FROM persistent_workspaces WHERE user_id = ? AND chat_id = ?",
+      ).get(USER_ID, AGENTIC_CHAT_ID) as { workspace_id: string; revision: number } | null;
+      const linkedInspection = getAgentRunInspection(USER_ID, execution.id, AGENTIC_CHAT_ID);
+      const linkedAssociation = linkedInspection?.workspaceAssociations.find(({ relation }) => relation === "linked");
+      expect(persistentWorkspace).not.toBeNull();
+      expect(linkedAssociation).toMatchObject({
+        id: "workspace:linked:exec-normal-1",
+        version: 1,
+        workspaceId: persistentWorkspace?.workspace_id,
+        workspaceRevision: persistentWorkspace?.revision,
+        relation: "linked",
+        objectKind: "objective",
+        objectId: null,
+        sourceRevision: persistentWorkspace?.revision,
+        sourceDeleted: false,
+        provenanceDigest: null,
+      });
+      const runtimeWorkspace = getDb().query(
+        "SELECT workspace_id FROM agent_turn_workspaces WHERE turn_id = ? AND user_id = ? AND chat_id = ?",
+      ).get(execution.id, USER_ID, AGENTIC_CHAT_ID) as { workspace_id: string } | null;
+      expect(runtimeWorkspace).toEqual({ workspace_id: `workspace:${execution.id}` });
+      expect(linkedAssociation?.workspaceId).not.toBe(runtimeWorkspace?.workspace_id);
       await firstStarted.promise;
       expect(started.length).toBe(1);
     } finally {
@@ -1084,6 +1354,219 @@ describe("production agentic coordinator installation", () => {
     expect(AGENT_RUNTIME_ADMISSION_MANAGER.snapshot().rootsByUser[USER_ID] ?? 0).toBe(before);
   });
 
+  test("terminalizes the host-owned persistent session after its source chat is deleted", async () => {
+    const db = getDb();
+    const chatId = `chat-coordinator-detached-${Date.now()}`;
+    const now = Date.now();
+    db.query(
+      "INSERT INTO chats (id, user_id, character_id, name, created_at, updated_at, metadata, generation_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(chatId, USER_ID, "character-coordinator", "Detached Coordinator Chat", now, now, "{}", ADMITTED_TARGET_REVISION);
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(
+      { userId: USER_ID, chatId, connectionId: CONNECTION_ID, presetId: AGENTIC_PRESET_ID, generationType: "normal", userInput: USER_INPUT },
+      target,
+      signal,
+    );
+    const executionId = `exec-persistent-detached-${Date.now()}`;
+    const execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId,
+      target,
+      decision,
+      signal,
+    });
+    try {
+      db.run("PRAGMA foreign_keys = ON");
+      try {
+        expect(deleteChat(USER_ID, chatId)).toBe(true);
+      } finally {
+        db.run("PRAGMA foreign_keys = OFF");
+      }
+      deps.cleanup!({
+        execution,
+        phase: "CANCELLED",
+        status: "cancelled",
+      } as never);
+      const session = db.query(
+        "SELECT chat_id, phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+      ).get(USER_ID, executionId) as {
+        chat_id: string | null;
+        phase: string;
+        status: string;
+        outcome: string | null;
+      } | null;
+      expect(session).toEqual({
+        chat_id: null,
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "stopped",
+      });
+    } finally {
+      deps.cleanup!({
+        execution,
+        phase: "CANCELLED",
+        status: "cancelled",
+      } as never);
+    }
+  });
+  test("restart recovery terminalizes a persistent session after transient cleanup CAS failure", async () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const decision = await deps.resolveRuntime!(
+      { userId: USER_ID, chatId: AGENTIC_CHAT_ID, connectionId: CONNECTION_ID, presetId: AGENTIC_PRESET_ID, generationType: "normal", userInput: USER_INPUT },
+      target,
+      new AbortController().signal,
+    );
+    const executionId = `exec-persistent-recovery-${Date.now()}`;
+    const gate = `agentic_terminal_recovery_gate_${Date.now()}`;
+    const trigger = `agentic_terminal_recovery_trigger_${Date.now()}`;
+    const execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      signal: new AbortController().signal,
+    });
+    db.run(`CREATE TABLE ${gate} (blocked INTEGER NOT NULL CHECK (blocked IN (0, 1)))`);
+    db.query(`INSERT INTO ${gate} (blocked) VALUES (?)`).run(1);
+    db.run(`
+      CREATE TRIGGER ${trigger}
+      BEFORE UPDATE ON persistent_workspace_turn_sessions
+      WHEN (SELECT blocked FROM ${gate} LIMIT 1) = 1
+      BEGIN
+        SELECT RAISE(ABORT, 'transient persistent session failure');
+      END
+    `);
+    try {
+      deps.cleanup!({ execution, phase: "FAILED", status: "failed" } as never);
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
+      ).get(executionId, USER_ID)).toMatchObject({
+        phase: "ADMIT",
+        status: "pending",
+        outcome: null,
+      });
+      db.query(`UPDATE ${gate} SET blocked = 0`).run();
+      __testing.resetInstallation();
+      installAgenticGenerationCoordinator();
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
+      ).get(executionId, USER_ID)).toMatchObject({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "failed",
+      });
+    } finally {
+      db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
+      db.run(`DROP TABLE IF EXISTS ${gate}`);
+    }
+  });
+
+
+  test("terminalizes the persistent admission session when workspace creation fails", async () => {
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(
+      { userId: USER_ID, chatId: AGENTIC_CHAT_ID, connectionId: CONNECTION_ID, presetId: AGENTIC_PRESET_ID, generationType: "normal", userInput: USER_INPUT },
+      target,
+      signal,
+    );
+    const executionId = `exec-persistent-admission-failure-${Date.now()}`;
+    getDb().run(`
+      CREATE TRIGGER reject_agentic_workspace_admission
+      BEFORE INSERT ON agent_turn_workspaces
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace admission rejected');
+      END
+    `);
+    try {
+      await expect(deps.createExecution!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal,
+      })).rejects.toThrow();
+    } finally {
+      getDb().run("DROP TRIGGER reject_agentic_workspace_admission");
+    }
+    const session = getDb().query(
+      "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ? AND chat_id = ?",
+    ).get(executionId, USER_ID, AGENTIC_CHAT_ID) as {
+      phase: string;
+      status: string;
+      outcome: string | null;
+      revision: number;
+    } | null;
+    expect(session).toMatchObject({
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      revision: 1,
+    });
+    const inspection = getAgentRunInspection(USER_ID, executionId, AGENTIC_CHAT_ID);
+    expect(inspection?.workspaceAssociations).toHaveLength(1);
+    expect(inspection?.workspaceAssociations[0]).toMatchObject({
+      id: `workspace:linked:${executionId}`,
+      relation: "linked",
+    });
+  });
+  test("records a failed persistent session when admission is aborted by a timeout", async () => {
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const controller = new AbortController();
+    controller.abort(new DOMException("Agentic root deadline", "TimeoutError"));
+    const decision = await deps.resolveRuntime!(
+      { userId: USER_ID, chatId: AGENTIC_CHAT_ID, connectionId: CONNECTION_ID, presetId: AGENTIC_PRESET_ID, generationType: "normal", userInput: USER_INPUT },
+      target,
+      controller.signal,
+    );
+    const executionId = `exec-persistent-admission-timeout-${Date.now()}`;
+    getDb().run(`
+      CREATE TRIGGER reject_agentic_timeout_workspace_admission
+      BEFORE INSERT ON agent_turn_workspaces
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace admission rejected after timeout');
+      END
+    `);
+    try {
+      await expect(deps.createExecution!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal: controller.signal,
+      })).rejects.toThrow();
+    } finally {
+      getDb().run("DROP TRIGGER reject_agentic_timeout_workspace_admission");
+    }
+    const session = getDb().query(
+      "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
+    ).get(executionId, USER_ID) as {
+      phase: string;
+      status: string;
+      outcome: string | null;
+      revision: number;
+    } | null;
+    expect(session).toMatchObject({
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      revision: 1,
+    });
+  });
   test("admission reserves the exact final render envelope and keeps the RENDER re-reservation exclusive", async () => {
     const deps = __testing.buildDependencies();
     markAgenticRuntimeReady();
@@ -1329,6 +1812,48 @@ describe("production agentic coordinator installation", () => {
     ).get(USER_ID, started.generationId) as { reason: string; terminal_receipt_json: string | null } | null;
     expect(inspection?.reason).toBe("none");
     expect(JSON.parse(inspection?.terminal_receipt_json ?? "{}").messageId).toBe(messageId);
+    const persistentWorkspace = db.query(
+      "SELECT workspace_id, revision FROM persistent_workspaces WHERE user_id = ? AND chat_id = ?",
+    ).get(USER_ID, AGENTIC_CHAT_ID) as { workspace_id: string; revision: number } | null;
+    const workspaceInspection = getAgentRunInspection(USER_ID, started.generationId, AGENTIC_CHAT_ID);
+    const workspaceAssociations = (workspaceInspection?.workspaceAssociations ?? []).map((association) => ({
+      id: association.id,
+      relation: association.relation,
+      workspaceId: association.workspaceId,
+      workspaceRevision: association.workspaceRevision,
+    }));
+    expect(persistentWorkspace).not.toBeNull();
+    expect(workspaceAssociations).toHaveLength(3);
+    const linkedAssociation = workspaceAssociations.find(({ id }) => id === `workspace:linked:${started.generationId}`);
+    const publicationAssociation = workspaceAssociations.find(({ id }) => id === `workspace:publication:${started.generationId}`);
+    expect(linkedAssociation).toMatchObject({
+      id: `workspace:linked:${started.generationId}`,
+      relation: "linked",
+      workspaceId: persistentWorkspace?.workspace_id,
+    });
+    expect(publicationAssociation).toMatchObject({
+      id: `workspace:publication:${started.generationId}`,
+      relation: "published",
+      workspaceId: persistentWorkspace?.workspace_id,
+      workspaceRevision: persistentWorkspace?.revision,
+    });
+    const runtimeWorkspace = db.query(
+      "SELECT workspace_id, revision FROM agent_turn_workspaces WHERE turn_id = ? AND user_id = ? AND chat_id = ?",
+    ).get(started.generationId, USER_ID, AGENTIC_CHAT_ID) as { workspace_id: string; revision: number } | null;
+    expect(runtimeWorkspace).not.toBeNull();
+    const workAssociation = workspaceAssociations.find(({ id }) =>
+      id === `workspace:work:${started.generationId}:${persistentWorkspace?.revision}`,
+    );
+    expect(workAssociation).toMatchObject({
+      id: `workspace:work:${started.generationId}:${persistentWorkspace?.revision}`,
+      relation: "linked",
+      workspaceId: persistentWorkspace?.workspace_id,
+      workspaceRevision: persistentWorkspace?.revision,
+    });
+    expect(workspaceAssociations.every(({ workspaceId }) =>
+      workspaceId === persistentWorkspace?.workspace_id
+      && workspaceId !== `workspace:${started.generationId}`,
+    )).toBe(true);
 
     let responseGenerationId = "";
     let responseRequestActive = true;
@@ -1377,7 +1902,225 @@ describe("production agentic coordinator installation", () => {
       unsubscribeResponse();
     }
   });
-  test("WORK provider delivery uses resolved direct policy and omits false or unavailable entries", async () => {
+  test("freezes custom phase instruction sources and rejects ambiguous prompt block IDs", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    await probeIsolateBackendsAtStartup();
+    startAgentRuntimeEpoch();
+    installAgenticGenerationCoordinator();
+
+    const db = getDb();
+    const originalPreset = db.query(
+      "SELECT prompt_order, cache_revision FROM presets WHERE id = ? AND user_id = ?",
+    ).get(AGENTIC_PRESET_ID, USER_ID) as { prompt_order: string; cache_revision: number };
+    const originalConfig = db.query(
+      "SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, AGENTIC_PRESET_ID) as { config_json: string };
+    const presetRevision = 73;
+    const phaseSource = {
+      kind: "loom_block" as const,
+      blockId: "__proto__",
+      presetRevision,
+      blockRevision: 1,
+      promptOrder: 0,
+    };
+    const phaseDefinitions: AgentCustomPhaseV1[] = [{
+      version: 1,
+      id: "snapshot_source",
+      label: "Snapshot phase",
+      instructionRefs: [phaseSource],
+      required: true,
+      enter: { kind: "phase", value: "WORK" },
+      exit: { kind: "phase", value: "COMPLETE" },
+      capabilityRequests: [],
+      repeatLimit: 0,
+      nextPhaseIds: [],
+    }];
+    const missingPhaseSource = compileAgentRuntimePhases(phaseDefinitions, {
+      source: {
+        presetRevision,
+        blocks: [],
+      },
+    });
+    expect(missingPhaseSource).toMatchObject({
+      status: "failed",
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          code: "stale_source",
+          phaseId: "snapshot_source",
+          phaseIndex: 0,
+          required: true,
+          source: "revision",
+          detail: "source block __proto__ revision or order is stale",
+        }),
+      ]),
+    });
+    const runtimePolicy = {
+      version: 1,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: "agentic",
+      loomPolicy: null,
+      phases: phaseDefinitions,
+    };
+    const blocks = [{
+      id: phaseSource.blockId,
+      name: "Snapshot phase",
+      content: "Snapshot phase instructions.",
+      role: "system",
+      enabled: true,
+      position: "pre_history",
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      revision: phaseSource.blockRevision,
+    }];
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const executionId = `exec-phase-source-${Date.now()}`;
+    try {
+      db.query(
+        "UPDATE presets SET prompt_order = ?, cache_revision = ? WHERE id = ? AND user_id = ?",
+      ).run(JSON.stringify(blocks), presetRevision, AGENTIC_PRESET_ID, USER_ID);
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({ config: { runtimePolicy } }), USER_ID, AGENTIC_PRESET_ID);
+
+      const deps = __testing.buildDependencies();
+      const decision = await deps.resolveRuntime!(input, target, signal);
+      const ambiguousBlocks = [{
+        ...blocks[0],
+        content: "Ambiguous duplicate phase instructions.",
+        revision: phaseSource.blockRevision + 1,
+      }, blocks[0]];
+      db.query(
+        "UPDATE presets SET prompt_order = ? WHERE id = ? AND user_id = ?",
+      ).run(JSON.stringify(ambiguousBlocks), AGENTIC_PRESET_ID, USER_ID);
+      await expect(
+        deps.buildAssemblySnapshot!(input, decision, target, signal, executionId),
+      ).rejects.toThrow("cognition block identity is ambiguous: __proto__");
+      db.query(
+        "UPDATE presets SET prompt_order = ? WHERE id = ? AND user_id = ?",
+      ).run(JSON.stringify(blocks), AGENTIC_PRESET_ID, USER_ID);
+      const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, executionId);
+      expect(snapshot.agentCognition.cognitionSource?.blocks).toEqual([
+        { blockId: phaseSource.blockId, revision: 1, promptOrder: 0 },
+      ]);
+
+      const plan = await deps.compileAssemblyPlan!(snapshot, input, decision, signal, executionId);
+      expect(plan.customPhasePlan).toMatchObject({
+        status: "ready",
+        phases: [expect.objectContaining({
+          id: "snapshot_source",
+          sourceStatus: "verified",
+          sourceIdentity: [{
+            blockId: phaseSource.blockId,
+            presetRevision,
+            blockRevision: phaseSource.blockRevision,
+            promptOrder: phaseSource.promptOrder,
+          }],
+        })],
+      });
+      const staleSource = { ...phaseSource, blockRevision: phaseSource.blockRevision + 1 };
+      const optionalPhaseDefinitions: AgentCustomPhaseV1[] = [
+        {
+          ...phaseDefinitions[0]!,
+          id: "optional_stale",
+          label: "Optional stale",
+          required: false,
+          instructionRefs: [staleSource],
+        },
+        {
+          ...phaseDefinitions[0]!,
+          id: "optional_missing",
+          label: "Optional missing",
+          required: false,
+          instructionRefs: [{ ...staleSource, blockId: "missing-phase-block" }],
+        },
+      ];
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({
+        config: {
+          runtimePolicy: {
+            ...runtimePolicy,
+            phases: optionalPhaseDefinitions,
+          },
+        },
+      }), USER_ID, AGENTIC_PRESET_ID);
+      const optionalDecision = await deps.resolveRuntime!(input, target, signal);
+      const optionalSnapshot = await deps.buildAssemblySnapshot!(input, optionalDecision, target, signal, `${executionId}-optional`);
+      expect(optionalSnapshot.agentCognition.cognitionSource?.blocks).toEqual([]);
+      const optionalPlan = compileAgentRuntimePhases(optionalPhaseDefinitions, {
+        source: optionalSnapshot.agentCognition.cognitionSource,
+      });
+      expect(optionalPlan).toMatchObject({
+        status: "repair_required",
+        issues: expect.arrayContaining([
+          expect.objectContaining({ code: "optional_phase_omitted", phaseId: "optional_stale", required: false }),
+          expect.objectContaining({ code: "optional_phase_omitted", phaseId: "optional_missing", required: false }),
+        ]),
+      });
+
+      const requiredPhaseDefinitions: AgentCustomPhaseV1[] = [
+        {
+          ...phaseDefinitions[0]!,
+          id: "required_stale",
+          label: "Required stale",
+          required: true,
+          instructionRefs: [staleSource],
+        },
+        {
+          ...phaseDefinitions[0]!,
+          id: "required_missing",
+          label: "Required missing",
+          required: true,
+          instructionRefs: [{ ...staleSource, blockId: "missing-required-phase-block" }],
+        },
+      ];
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({
+        config: {
+          runtimePolicy: {
+            ...runtimePolicy,
+            phases: requiredPhaseDefinitions,
+          },
+        },
+      }), USER_ID, AGENTIC_PRESET_ID);
+      const requiredDecision = await deps.resolveRuntime!(input, target, signal);
+      const requiredSnapshot = await deps.buildAssemblySnapshot!(input, requiredDecision, target, signal, `${executionId}-required`);
+      expect(requiredSnapshot.agentCognition.cognitionSource?.blocks).toEqual([]);
+      const requiredPlan = compileAgentRuntimePhases(requiredPhaseDefinitions, {
+        source: requiredSnapshot.agentCognition.cognitionSource,
+      });
+      expect(requiredPlan).toMatchObject({
+        status: "failed",
+        issues: expect.arrayContaining([
+          expect.objectContaining({ code: "stale_source", phaseId: "required_stale", required: true }),
+          expect.objectContaining({ code: "stale_source", phaseId: "required_missing", required: true }),
+        ]),
+      });
+    } finally {
+      db.query(
+        "UPDATE presets SET prompt_order = ?, cache_revision = ? WHERE id = ? AND user_id = ?",
+      ).run(originalPreset.prompt_order, originalPreset.cache_revision, AGENTIC_PRESET_ID, USER_ID);
+      db.query(
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(originalConfig.config_json, USER_ID, AGENTIC_PRESET_ID);
+    }
+  });
+  test("WORK and RENDER deliver resolved direct Loom policy and omit false conditions", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
     await probeIsolateBackendsAtStartup();
@@ -1391,26 +2134,8 @@ describe("production agentic coordinator installation", () => {
       "SELECT prompt_order, cache_revision FROM presets WHERE id = ? AND user_id = ?",
     ).get(AGENTIC_PRESET_ID, USER_ID) as { prompt_order: string; cache_revision: number };
     const originalConfig = db.query(
-      "SELECT config_json, context_policy_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
-    ).get(USER_ID, AGENTIC_PRESET_ID) as { config_json: string; context_policy_json: string };
-    const availableContextText = "Available Loom context from the authenticated pack.";
-    const availableContext = createContextPack(USER_ID, {
-      name: "Available Loom Context",
-      content: [{
-        id: "loom-record",
-        title: "Authenticated context",
-        body: availableContextText,
-        tags: [],
-      }],
-    });
-    const availableAttachment = attachContextPack(USER_ID, availableContext.pack.id, {
-      scope: "preset",
-      targetId: AGENTIC_PRESET_ID,
-      revision: availableContext.revision.revision,
-      position: 0,
-      required: false,
-    });
-    if (!availableAttachment) throw new Error("available Loom context attachment was not created");
+      "SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, AGENTIC_PRESET_ID) as { config_json: string };
     const presetRevision = 73;
     const rawPolicyText = "Effective policy for {{char}}.";
     const resolvedPolicyText = "Effective policy for Coordinator Character.";
@@ -1429,14 +2154,6 @@ describe("production agentic coordinator installation", () => {
       blockRevision: 1,
       promptOrder: 1,
     };
-    const onDemandSentinel = "UNAVAILABLE_ON_DEMAND_SOURCE_MUST_NOT_REACH_PROVIDER";
-    const onDemandSource = {
-      kind: "loom_block" as const,
-      blockId: "on-demand-policy",
-      presetRevision,
-      blockRevision: 1,
-      promptOrder: 2,
-    };
     const rawRenderPolicyText = "Render policy for {{char}}.";
     const resolvedRenderPolicyText = "Render policy for Coordinator Character.";
     const renderSource = {
@@ -1444,7 +2161,7 @@ describe("production agentic coordinator installation", () => {
       blockId: "render-macro-policy",
       presetRevision,
       blockRevision: 1,
-      promptOrder: 3,
+      promptOrder: 2,
     };
     const renderConditionSentinel = "RENDER_CONDITION_FALSE_MUST_NOT_REACH_PROVIDER";
     const renderConditionSource = {
@@ -1452,15 +2169,7 @@ describe("production agentic coordinator installation", () => {
       blockId: "render-condition-policy",
       presetRevision,
       blockRevision: 1,
-      promptOrder: 4,
-    };
-    const renderOnDemandSentinel = "RENDER_UNAVAILABLE_ON_DEMAND_MUST_NOT_REACH_PROVIDER";
-    const renderOnDemandSource = {
-      kind: "loom_block" as const,
-      blockId: "render-on-demand-policy",
-      presetRevision,
-      blockRevision: 1,
-      promptOrder: 5,
+      promptOrder: 3,
     };
     const runtimePolicy = {
       version: 1,
@@ -1477,7 +2186,6 @@ describe("production agentic coordinator installation", () => {
           checkpoint: "WORK",
           required: true,
           visibility: "work_only",
-          delivery: { delivery: "direct" },
         }, {
           version: 1,
           id: "condition-policy-entry",
@@ -1486,30 +2194,11 @@ describe("production agentic coordinator installation", () => {
           checkpoint: "WORK",
           required: false,
           visibility: "work_only",
-          delivery: {
-            delivery: "condition_gated",
-            condition: {
-              kind: "preset_variable",
-              name: "gate",
-              operator: "equals",
-              value: "open",
-            },
-          },
-        }, {
-          version: 1,
-          id: "on-demand-policy-entry",
-          source: onDemandSource,
-          destination: "root_work",
-          checkpoint: "WORK",
-          required: true,
-          visibility: "work_only",
-          delivery: {
-            delivery: "on_demand",
-            request: {
-              contextPackId: availableContext.pack.id,
-              revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
-              digest: availableContext.revision.contentDigest,
-            },
+          condition: {
+            kind: "preset_variable",
+            name: "gate",
+            operator: "equals",
+            value: "open",
           },
         }],
         workspaceUsage: [],
@@ -1522,7 +2211,6 @@ describe("production agentic coordinator installation", () => {
           checkpoint: "RENDER",
           required: true,
           visibility: "work_only",
-          delivery: { delivery: "direct" },
         }, {
           version: 1,
           id: "render-condition-policy-entry",
@@ -1531,30 +2219,11 @@ describe("production agentic coordinator installation", () => {
           checkpoint: "RENDER",
           required: false,
           visibility: "work_only",
-          delivery: {
-            delivery: "condition_gated",
-            condition: {
-              kind: "preset_variable",
-              name: "gate",
-              operator: "equals",
-              value: "open",
-            },
-          },
-        }, {
-          version: 1,
-          id: "render-on-demand-policy-entry",
-          source: renderOnDemandSource,
-          destination: "render",
-          checkpoint: "RENDER",
-          required: false,
-          visibility: "work_only",
-          delivery: {
-            delivery: "on_demand",
-            request: {
-              contextPackId: "unavailable-render-pack",
-              revisionId: "unavailable-render-pack@1",
-              digest: "e".repeat(64),
-            },
+          condition: {
+            kind: "preset_variable",
+            name: "gate",
+            operator: "equals",
+            value: "open",
           },
         }],
       },
@@ -1593,14 +2262,6 @@ describe("production agentic coordinator installation", () => {
         position: "pre_history",
         revision: conditionSource.blockRevision,
       }, {
-        id: onDemandSource.blockId,
-        name: "Unavailable on-demand policy",
-        content: onDemandSentinel,
-        role: "system",
-        enabled: true,
-        position: "pre_history",
-        revision: onDemandSource.blockRevision,
-      }, {
         id: renderSource.blockId,
         name: "Render macro policy",
         content: rawRenderPolicyText,
@@ -1616,54 +2277,16 @@ describe("production agentic coordinator installation", () => {
         enabled: true,
         position: "pre_history",
         revision: renderConditionSource.blockRevision,
-      }, {
-        id: renderOnDemandSource.blockId,
-        name: "Render on-demand policy",
-        content: renderOnDemandSentinel,
-        role: "system",
-        enabled: true,
-        position: "pre_history",
-        revision: renderOnDemandSource.blockRevision,
       }]), presetRevision, AGENTIC_PRESET_ID, USER_ID);
       db.query(
-        "UPDATE preset_agent_configs SET config_json = ?, context_policy_json = ? WHERE user_id = ? AND preset_id = ?",
-      ).run(JSON.stringify({
-        config: { runtimePolicy },
-        contextPackSelections: [{
-          packId: availableContext.pack.id,
-          revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
-          revision: availableContext.revision.revision,
-          digest: availableContext.revision.contentDigest,
-          label: "Available Loom Context",
-        }],
-      }), JSON.stringify({
-        packIds: [availableContext.pack.id],
-        ruleIds: [],
-      }), USER_ID, AGENTIC_PRESET_ID);
-      expect(getAgentRuntimeSharedDraft(USER_ID, AGENTIC_PRESET_ID)).toMatchObject({
-        config: {
-          contextPolicy: { packIds: [availableContext.pack.id], ruleIds: [] },
-        },
-        contextPackSelections: [{
-          packId: availableContext.pack.id,
-          revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
-          revision: availableContext.revision.revision,
-          digest: availableContext.revision.contentDigest,
-        }],
-      });
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(JSON.stringify({ config: { runtimePolicy } }), USER_ID, AGENTIC_PRESET_ID);
 
       const decision = await deps.resolveRuntime!(input, target, signal);
       const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, executionId);
       const plan = await deps.compileAssemblyPlan!(snapshot, input, decision, signal, executionId);
-      const contextRuntime = await deps.createContextRuntime!(snapshot, input, decision, signal, executionId);
       expect(snapshot.blocks.find((block) => block.id === source.blockId)?.content).toBe(rawPolicyText);
       expect(plan.loomBlocks.find((block) => block.source.blockId === source.blockId)?.content).toBe(resolvedPolicyText);
-      expect(snapshot.contextPackSnapshot.candidates).toContainEqual(expect.objectContaining({
-        packId: availableContext.pack.id,
-        revisionId: `${availableContext.pack.id}@${availableContext.revision.revision}`,
-        digest: availableContext.revision.contentDigest,
-        source: "preset",
-      }));
 
       const execution = await deps.createExecution!({
         executionId,
@@ -1681,7 +2304,6 @@ describe("production agentic coordinator installation", () => {
           snapshot,
           plan,
           signal,
-          contextRuntime,
         });
         expect(work).toMatchObject({ status: "completed" });
         const ordinaryRequests = providerRequests.filter((request) => request.toolMode === "ordinary");
@@ -1689,10 +2311,7 @@ describe("production agentic coordinator installation", () => {
         expect(ordinaryPayload).toContain(resolvedPolicyText);
         expect(ordinaryPayload).not.toContain(rawPolicyText);
         expect(ordinaryPayload).not.toContain(conditionSentinel);
-        expect(ordinaryPayload).not.toContain(onDemandSentinel);
-        for (const request of ordinaryRequests) {
-          expect(JSON.stringify(request.messages).split(availableContextText)).toHaveLength(2);
-        }
+
         const render = await deps.render!({
           execution,
           input,
@@ -1708,9 +2327,7 @@ describe("production agentic coordinator installation", () => {
         expect(finalizationPayload).toContain(resolvedRenderPolicyText);
         expect(finalizationPayload).not.toContain(rawRenderPolicyText);
         expect(finalizationPayload).not.toContain(renderConditionSentinel);
-        expect(finalizationPayload).not.toContain(renderOnDemandSentinel);
         expect(finalizationRequests).toHaveLength(1);
-        expect(JSON.stringify(finalizationRequests[0]?.messages).split(availableContextText)).toHaveLength(2);
       } finally {
         deps.cleanup!({ execution } as never);
       }
@@ -1719,10 +2336,8 @@ describe("production agentic coordinator installation", () => {
         "UPDATE presets SET prompt_order = ?, cache_revision = ? WHERE id = ? AND user_id = ?",
       ).run(originalPreset.prompt_order, originalPreset.cache_revision, AGENTIC_PRESET_ID, USER_ID);
       db.query(
-        "UPDATE preset_agent_configs SET config_json = ?, context_policy_json = ? WHERE user_id = ? AND preset_id = ?",
-      ).run(originalConfig.config_json, originalConfig.context_policy_json, USER_ID, AGENTIC_PRESET_ID);
-      deleteContextPackAttachment(USER_ID, "preset", availableAttachment.attachmentId);
-      deleteContextPack(USER_ID, availableContext.pack.id, availableContext.revision.revision);
+        "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
+      ).run(originalConfig.config_json, USER_ID, AGENTIC_PRESET_ID);
       scriptedWorkRound = 0;
       providerRequests.length = 0;
     }
@@ -1790,7 +2405,7 @@ describe("production agentic coordinator installation", () => {
       providerRequests.length = 0;
     }
   });
-  test("production work adapter persists the delegated task and child frame assignment", async () => {
+  test("production work adapter preserves exact delegated child workspace grants", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
     await probeIsolateBackendsAtStartup();
@@ -1827,13 +2442,19 @@ describe("production agentic coordinator installation", () => {
       ...snapshot,
       agentConfig: {
         ...config,
-        profiles: config.profiles.map((profile) => profile.id === "delegate" || profile.id === "delegate_alt"
+        profiles: config.profiles.map((profile) => profile.id === "delegate"
           ? {
             ...profile,
             workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
             maxOutputTokens: 1024,
           }
-          : profile),
+          : profile.id === "delegate_alt"
+            ? {
+              ...profile,
+              workspaceCapabilities: [],
+              maxOutputTokens: 1024,
+            }
+            : profile),
       },
     } as typeof snapshot;
     const execution = await deps.createExecution!({
@@ -1864,6 +2485,12 @@ describe("production agentic coordinator installation", () => {
         && request.messages[0].content.includes("Assigned workspace task ID: task-delegate."),
       );
       expect(childRequest).toBeDefined();
+      expect(childRequest?.tools
+        ?.filter((tool) => tool.name.startsWith("workspace_"))
+        .map((tool) => tool.name)).toEqual([
+        "workspace_update_assigned_progress",
+        "workspace_submit_child_result",
+      ]);
       expect(childRequest?.parameters?.max_tokens).toBe(512);
       const workspace = getDb().query(
         "SELECT revision FROM agent_turn_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id = ? AND turn_id = ?",
@@ -1895,6 +2522,43 @@ describe("production agentic coordinator installation", () => {
         "SELECT child_frame_id FROM agent_workspace_submissions WHERE turn_id = ? AND task_id = ?",
       ).get(execution.id, "task-delegate") as { child_frame_id: string } | null;
       expect(submission).toEqual({ child_frame_id: expectedChildFrameId });
+      scriptedTaskCreated = false;
+      delegateIssued = false;
+      scriptedAcceptanceIssued = false;
+      scriptedChildSubmitted = false;
+      scriptedDelegateProfileId = "delegate_alt";
+      scriptedWorkRound = 0;
+      providerRequests.length = 0;
+      const emptyExecution = await deps.createExecution!({
+        executionId: `exec-delegate-empty-${Date.now()}`,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal,
+      });
+      try {
+        const emptyWork = await deps.runWork!({
+          execution: emptyExecution,
+          input,
+          decision,
+          snapshot: assignmentSnapshot,
+          plan,
+          signal,
+        });
+        expect(emptyWork).toMatchObject({
+          status: "failed",
+          errorCode: "child_schedule_invalid",
+        });
+        const emptyChildRequest = providerRequests.find((request) =>
+          request.toolMode === "ordinary"
+          && typeof request.messages[0]?.content === "string"
+          && request.messages[0].content.includes("Assigned workspace task ID: task-delegate."),
+        );
+        expect(emptyChildRequest).toBeUndefined();
+      } finally {
+        deps.cleanup!({ execution: emptyExecution } as never);
+      }
     } finally {
       deps.cleanup!({ execution } as never);
       scriptedDelegate = false;
@@ -1903,6 +2567,7 @@ describe("production agentic coordinator installation", () => {
       scriptedAcceptSubmission = false;
       scriptedAcceptanceIssued = false;
       scriptedChildSubmitted = false;
+      scriptedWorkRound = 0;
       scriptedDelegateProfileId = "delegate";
     }
   });
@@ -2121,6 +2786,394 @@ describe("production agentic coordinator installation", () => {
     expect(failedPayload.phase).toBe("WORK");
   });
 
+  test("terminal inspection and projection are emitted before GENERATION_ENDED", async () => {
+    const deps = __testing.buildDependencies();
+    const executionId = `exec-terminal-order-${Date.now()}`;
+    seedCommittedExecution(executionId);
+    const order: string[] = [];
+    const settled = Promise.withResolvers<void>();
+    const maybeSettled = (): void => {
+      if (order.length === 3) settled.resolve();
+    };
+    const removeProjection = eventBus.onInternal(EventType.AGENT_RUN_CHANGED, (event) => {
+      const payload = event.payload as { readonly run?: { readonly turnId?: unknown } } | undefined;
+      if (payload?.run?.turnId === executionId) {
+        const inspection = getDb().query(
+          "SELECT outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+        ).get(USER_ID, executionId) as { outcome: string | null } | null;
+        if (inspection?.outcome === "completed") order.push("inspection");
+        order.push("projection");
+        maybeSettled();
+      }
+    });
+    const removeTerminal = eventBus.on(EventType.GENERATION_ENDED, (event) => {
+      const payload = event.payload as { readonly generationId?: unknown } | undefined;
+      if (payload?.generationId === executionId) {
+        order.push("terminal");
+        maybeSettled();
+      }
+    });
+    try {
+      deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "completed",
+        phase: "COMMITTED",
+        target: { generationType: "normal" },
+      });
+      await settled.promise;
+    } finally {
+      removeProjection();
+      removeTerminal();
+    }
+    expect(order).toEqual(["inspection", "projection", "terminal"]);
+  });
+  test("terminal publication failure preserves a durable committed receipt", () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    const executionId = `exec-terminal-reconcile-${Date.now()}`;
+    const trigger = `agentic_projection_failure_${Date.now()}`;
+    seedCommittedExecution(executionId);
+    db.run(`
+      CREATE TRIGGER ${trigger}
+      BEFORE INSERT ON agent_run_projections
+      BEGIN
+        SELECT RAISE(ABORT, 'projection write unavailable');
+      END
+    `);
+    const event = {
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      status: "completed" as const,
+      phase: "COMMITTED" as const,
+      target: { generationType: "normal" as const },
+    };
+    try {
+      expect(() => deps.publishTerminal!(event)).toThrow();
+    } finally {
+      db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    deps.terminalPublicationFailed!(event, new Error("projection write unavailable"));
+    const projection = db.query(
+      "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+    ).get(USER_ID, executionId) as { status: string; snapshot_json: string } | null;
+    expect(projection?.status).toBe("COMMITTED");
+    expect(JSON.parse(projection?.snapshot_json ?? "{}")).toMatchObject({
+      error: {
+        code: "projection_unavailable",
+        recoveryAction: "resync",
+      },
+    });
+    expect(db.query(
+      "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).get(USER_ID, executionId)).toMatchObject({
+      status: "terminal",
+      outcome: "completed",
+    });
+  });
+
+  test("terminal publication failure preserves each original terminal status and pool route", () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    const cases = [
+      { status: "completed", phase: "COMMIT_FAILED", projectionStatus: "COMMIT_FAILED", outcome: "failed", poolStatus: "error" },
+      { status: "cancelled", phase: "CANCELLED", projectionStatus: "CANCELLED", outcome: "stopped", poolStatus: "stopped" },
+      { status: "timed_out", phase: "TIMED_OUT", projectionStatus: "TIMED_OUT", outcome: "failed", poolStatus: "error" },
+      { status: "exhausted", phase: "EXHAUSTED", projectionStatus: "EXHAUSTED", outcome: "exhausted", poolStatus: "error" },
+      { status: "rejected", phase: "FAILED", projectionStatus: "FAILED", outcome: "rejected", poolStatus: "error" },
+      { status: "failed", phase: "FAILED", projectionStatus: "FAILED", outcome: "failed", poolStatus: "error" },
+    ] as const;
+
+    for (const terminalCase of cases) {
+      const executionId = `exec-terminal-reconcile-${terminalCase.status}-${Date.now()}`;
+      createPoolEntry({
+        generationId: executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        generationType: "normal",
+        characterName: "",
+        model: "",
+      });
+      try {
+        deps.terminalPublicationFailed!({
+          executionId,
+          userId: USER_ID,
+          chatId: AGENTIC_CHAT_ID,
+          status: terminalCase.status,
+          phase: terminalCase.phase,
+          target: { generationType: "normal" },
+        }, new Error("projection write unavailable"));
+        expect(db.query(
+          "SELECT state FROM agent_turn_executions WHERE user_id = ? AND id = ?",
+        ).get(USER_ID, executionId)).toEqual({
+          state: terminalCase.projectionStatus,
+        });
+        const projection = db.query(
+          "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+        ).get(USER_ID, executionId) as { status: string; snapshot_json: string } | null;
+        expect(projection?.status).toBe(terminalCase.projectionStatus);
+        expect(JSON.parse(projection?.snapshot_json ?? "{}")).toMatchObject({
+          workPhase: "TERMINAL",
+          workStatus: "terminal",
+          workOutcome: terminalCase.outcome,
+        });
+        expect(db.query(
+          "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+        ).get(USER_ID, executionId)).toMatchObject({
+          status: "terminal",
+          outcome: terminalCase.outcome,
+        });
+        expect(getPoolEntry(executionId)?.status).toBe(terminalCase.poolStatus);
+      } finally {
+        removePoolEntry(executionId);
+      }
+    }
+  });
+
+  test("startup reconstructs every noncommitted terminal projection after inspection or projection loss", () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    const terminalCases = [
+      { suffix: "commit-failed", status: "completed", eventPhase: "COMMITTED", projectionStatus: "COMMIT_FAILED", outcome: "failed" },
+      { suffix: "cancelled", status: "cancelled", eventPhase: "CANCELLED", projectionStatus: "CANCELLED", outcome: "stopped" },
+      { suffix: "timed-out", status: "timed_out", eventPhase: "TIMED_OUT", projectionStatus: "TIMED_OUT", outcome: "failed" },
+      { suffix: "exhausted", status: "exhausted", eventPhase: "EXHAUSTED", projectionStatus: "EXHAUSTED", outcome: "exhausted" },
+      { suffix: "rejected", status: "rejected", eventPhase: "FAILED", projectionStatus: "FAILED", outcome: "rejected", errorCode: "invalid_input" },
+      { suffix: "failed", status: "failed", eventPhase: "FAILED", projectionStatus: "FAILED", outcome: "failed", errorCode: "provider_request_error" },
+    ] as const;
+    const recoveryModes = ["inspection", "projection"] as const;
+    let sequence = 0;
+
+    for (const recoveryMode of recoveryModes) {
+      for (const terminalCase of terminalCases) {
+        const executionId = `exec-terminal-startup-${recoveryMode}-${terminalCase.suffix}-${Date.now()}-${sequence++}`;
+        const trigger = `agentic_terminal_startup_${recoveryMode}_${sequence}`;
+        const event = {
+          executionId,
+          userId: USER_ID,
+          chatId: AGENTIC_CHAT_ID,
+          status: terminalCase.status,
+          phase: terminalCase.eventPhase,
+          target: { generationType: "normal" as const },
+          ...(terminalCase.errorCode ? { errorCode: terminalCase.errorCode } : {}),
+        } as const;
+        if (recoveryMode === "inspection") {
+          db.run(`
+            CREATE TRIGGER ${trigger}
+            BEFORE INSERT ON agent_run_attempts
+            BEGIN
+              SELECT RAISE(ABORT, 'terminal inspection unavailable');
+            END
+          `);
+        } else {
+          db.run(`
+            CREATE TRIGGER ${trigger}
+            BEFORE INSERT ON agent_run_projections
+            BEGIN
+              SELECT RAISE(ABORT, 'terminal projection unavailable');
+            END
+          `);
+        }
+        try {
+          try {
+            deps.publishTerminal!(event);
+          } catch {
+            // The failure callback below records the durable terminal outcome
+            // while the selected private/public write remains unavailable.
+          }
+          deps.terminalPublicationFailed!(event, new Error(`${recoveryMode} recovery loss`));
+        } finally {
+          db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
+        }
+
+        expect(db.query(
+          "SELECT status FROM agent_run_projections WHERE user_id = ? AND chat_id = ? AND turn_id = ?",
+        ).get(USER_ID, AGENTIC_CHAT_ID, executionId)).toBeNull();
+        const first = reconcileAgentTurns(db);
+        expect(first.complete).toBe(true);
+        expect(db.query(
+          "SELECT state FROM agent_turn_executions WHERE user_id = ? AND id = ?",
+        ).get(USER_ID, executionId)).toEqual({ state: terminalCase.projectionStatus });
+        const projection = db.query(
+          "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND chat_id = ? AND turn_id = ?",
+        ).get(USER_ID, AGENTIC_CHAT_ID, executionId) as { status: string; snapshot_json: string } | null;
+        expect(projection?.status).toBe(terminalCase.projectionStatus);
+        expect(JSON.parse(projection?.snapshot_json ?? "{}")).toMatchObject({
+          workPhase: "TERMINAL",
+          workStatus: "terminal",
+          workOutcome: terminalCase.outcome,
+        });
+        const inspection = getAgentRunInspection(USER_ID, executionId, AGENTIC_CHAT_ID);
+        expect(inspection).toMatchObject({
+          terminal: true,
+          outcome: terminalCase.outcome,
+        });
+        const eventCount = (db.query(
+          "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+        ).get(USER_ID, AGENTIC_CHAT_ID, executionId) as { count: number }).count;
+        const snapshot = projection?.snapshot_json;
+        const second = reconcileAgentTurns(db);
+        expect(second.complete).toBe(true);
+        const replayedProjection = db.query(
+          "SELECT snapshot_json FROM agent_run_projections WHERE user_id = ? AND chat_id = ? AND turn_id = ?",
+        ).get(USER_ID, AGENTIC_CHAT_ID, executionId) as { snapshot_json: string } | null;
+        expect(replayedProjection?.snapshot_json).toBe(snapshot);
+        expect((db.query(
+          "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+        ).get(USER_ID, AGENTIC_CHAT_ID, executionId) as { count: number }).count).toBe(eventCount);
+      }
+    }
+  });
+
+  test("terminal inspection persistence failure defers session and projection recovery", async () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(
+      {
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        connectionId: CONNECTION_ID,
+        presetId: AGENTIC_PRESET_ID,
+        generationType: "normal",
+        userInput: USER_INPUT,
+      },
+      target,
+      signal,
+    );
+    const executionId = `exec-terminal-inspection-failure-${Date.now()}`;
+    const execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      signal,
+    });
+    const ownerToken = execution.ownerToken;
+    const initialPhase = execution.phase;
+    if (ownerToken === undefined || initialPhase === undefined) {
+      throw new Error("coordinator test execution did not return durable ownership");
+    }
+    let currentPhase = initialPhase;
+    for (const nextPhase of ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING"] as const) {
+      currentPhase = transitionTurnExecution({
+        executionId,
+        ownerToken,
+        expectedPhase: currentPhase,
+        nextPhase,
+        ignoreCancellation: true,
+      }).execution.phase;
+    }
+    finalizeTurnCommit({
+      executionId,
+      ownerToken,
+      receiptId: `receipt:${executionId}`,
+      messageId: null,
+      swipeId: null,
+      summary: { source: "coordinator-test" },
+    });
+    const trigger = `agentic_terminal_inspection_failure_${Date.now()}`;
+    const event = {
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      status: "completed" as const,
+      phase: "COMMITTED" as const,
+      target: { generationType: "normal" as const },
+    };
+    db.run(`
+      CREATE TRIGGER ${trigger}
+      BEFORE UPDATE ON agent_run_attempts
+      WHEN NEW.outcome = 'completed'
+      BEGIN
+        SELECT RAISE(ABORT, 'terminal inspection unavailable');
+      END
+    `);
+    try {
+      expect(() => deps.publishTerminal!(event)).toThrow();
+      deps.terminalPublicationFailed!(event, new Error("terminal inspection unavailable"));
+      expect(db.query(
+        "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+      ).get(USER_ID, executionId)).toBeNull();
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({
+        phase: "ADMIT",
+        status: "pending",
+        outcome: null,
+      });
+      expect(db.query(
+        "SELECT state FROM agent_turn_executions WHERE user_id = ? AND id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({ state: "COMMITTED" });
+      expect(db.query(
+        "SELECT receipt_id FROM agent_turn_commit_receipts WHERE user_id = ? AND execution_id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({ receipt_id: `receipt:${executionId}` });
+    } finally {
+      db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
+      deps.cleanup!({
+        execution,
+        phase: "COMMITTED",
+        status: "completed",
+      } as never);
+    }
+    expect(db.query(
+      "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+    ).get(USER_ID, executionId)).toMatchObject({
+      phase: "ADMIT",
+      status: "pending",
+      outcome: null,
+    });
+  });
+
+  test("failed terminal projection reconciliation leaves a durable failed inspection without success", () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    const executionId = `exec-terminal-reconcile-failure-${Date.now()}`;
+    const trigger = `agentic_projection_failure_${Date.now()}`;
+    const ended: string[] = [];
+    const removeEnded = eventBus.on(EventType.GENERATION_ENDED, (event) => {
+      const payload = event.payload as { readonly generationId?: unknown } | undefined;
+      if (payload?.generationId === executionId) ended.push(executionId);
+    });
+    db.run(`
+      CREATE TRIGGER ${trigger}
+      BEFORE INSERT ON agent_run_projections
+      BEGIN
+        SELECT RAISE(ABORT, 'projection write unavailable');
+      END
+    `);
+    const event = {
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      status: "completed" as const,
+      phase: "COMMITTED" as const,
+      target: { generationType: "normal" as const },
+    };
+    try {
+      expect(() => deps.publishTerminal!(event)).toThrow();
+      deps.terminalPublicationFailed!(event, new Error("projection write unavailable"));
+      expect(db.query(
+        "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+      ).get(USER_ID, executionId)).toBeNull();
+      expect(db.query(
+        "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({
+        status: "terminal",
+        outcome: "failed",
+      });
+      expect(ended).toEqual([]);
+    } finally {
+      db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
+      removeEnded();
+    }
+  });
+
   test("admission returns the exact retry attempt lineage", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
@@ -2306,6 +3359,71 @@ const RENDER_NARRATIVE_FACT_MESSAGE = [
   "World (London): Fog-bound streets above a shuttered map shop.",
 ].join("\n");
 
+describe("agentic render crossings", () => {
+  test("records only accepted handoff identities and explicit render guidance", () => {
+    const records: unknown[] = [];
+    const writer = {
+      record: (_kind: string, value?: unknown) => {
+        records.push(value);
+        return null;
+      },
+    } as unknown as Parameters<typeof __testing.recordRenderCrossings>[0];
+    __testing.recordRenderCrossings(writer, {
+      renderGuidance: "Tell the user the accepted result.",
+      workspaceContextProjection: {
+        version: 1,
+        sourceWorkspaceRevision: 9,
+        mandatory: [
+          { kind: "objective", id: "objective-1", text: "private objective", sourceRevision: 1 },
+          { kind: "finding", id: "finding-7", text: "accepted finding", sourceRevision: 4 },
+        ],
+        optional: [
+          { kind: "accepted_submission", id: "submission-2", text: "accepted submission", sourceRevision: 5 },
+          { kind: "optional_task", id: "task-3", text: "private task", sourceRevision: 6 },
+        ],
+        omissions: [],
+        literal: "",
+        utf8Bytes: 0,
+      },
+    }, "generation-1");
+    expect(records).toHaveLength(3);
+    expect(records).toEqual([
+      expect.objectContaining({
+        sourceId: "finding-7",
+        sourceRevision: 4,
+        destination: "render",
+        renderCrossing: expect.objectContaining({
+          kind: "accepted_finding",
+          sourceId: "finding-7",
+          sourceRevision: 4,
+          content: "accepted finding",
+        }),
+      }),
+      expect.objectContaining({
+        sourceId: "submission-2",
+        sourceRevision: 5,
+        renderCrossing: expect.objectContaining({
+          kind: "accepted_submission",
+          sourceId: "submission-2",
+          sourceRevision: 5,
+          content: "accepted submission",
+        }),
+      }),
+      expect.objectContaining({
+        sourceId: "completion-guidance:generation-1",
+        sourceRevision: 0,
+        renderCrossing: expect.objectContaining({
+          kind: "completion_guidance",
+          sourceRevision: null,
+          content: "Tell the user the accepted result.",
+        }),
+      }),
+    ]);
+    expect(JSON.stringify(records)).not.toContain("private objective");
+    expect(JSON.stringify(records)).not.toContain("private task");
+  });
+});
+
 describe("agentic terminal inspection", () => {
   test("does not misclassify a completed turn's internal reason as needs attention", () => {
     expect(__testing.terminalInspectionReason("completed", "commit_finished", null)).toBe("none");
@@ -2441,11 +3559,11 @@ describe("agentic commit revision reader fence", () => {
       `INSERT INTO preset_agent_configs
         (user_id, preset_id, version, agents_enabled, allowed_modes, default_mode,
          max_invocations, max_tool_calls, main_tool_ids, main_lore_scope,
-         phase_policy_json, cognition_policy_json, context_policy_json, task_policy_json,
+         phase_policy_json, cognition_policy_json, task_policy_json,
          workspace_policy_json, state, review_acknowledged, config_revision, binding_revision,
          created_at, updated_at)
         VALUES (?, ?, 2, 1, ?, 'agentic', 8, 8, ?, 'active',
-          '{}', '{}', '{}', '{}', '{}', 'ready', 1, 1, 1, ?, ?)`,
+          '{}', '{}', '{}', '{}', 'ready', 1, 1, 1, ?, ?)`,
     ).run(USER_ID, presetId, JSON.stringify(["response", "agentic"]), JSON.stringify(["chat_search_history"]), now, now);
     db.query(
       "INSERT INTO world_books (id, user_id, name, description, folder, metadata, created_at, updated_at) VALUES (?, ?, ?, '', '', '{}', ?, ?)",
@@ -2491,6 +3609,78 @@ describe("agentic commit revision reader fence", () => {
 
 
 describe("coordinator cognition transition snapshot seam", () => {
+  test("acknowledges nested cognition settlement results and preserves committed requirements", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    installAgenticGenerationCoordinator();
+    const deps = __testing.buildDependencies();
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(input, target, signal);
+    const execution = await deps.createExecution!({
+      executionId: `exec-cognition-settlement-${Date.now()}`,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      signal,
+    });
+    const executionSignal = execution.signal;
+    if (!executionSignal) throw new Error("Cognition settlement execution signal was not installed");
+    const seenTransitions: Array<{ readonly operation: string; readonly operationKey?: string; readonly actor?: unknown }> = [];
+    const cognitionRuntime = {
+      applyWorkspaceTransition: (transition: {
+        readonly operation: string;
+        readonly operationKey?: string;
+        readonly workspace: Record<string, unknown>;
+      }) => {
+        seenTransitions.push({
+          operation: transition.operation,
+          operationKey: transition.operationKey,
+          actor: transition.workspace.actor,
+        });
+        return {
+          workspaceRevision: 1,
+          taskId: "settlement-task",
+          transition: "failed" as const,
+          materializedTaskIds: [],
+        };
+      },
+    } as unknown as Parameters<typeof __testing.makeWorkspace>[2];
+    try {
+      const workspace = __testing.makeWorkspace(execution, {
+        revision: 1,
+        allowed: WORKSPACE_OPERATIONS,
+        maxOperationBytes: 131_072,
+        maxOperations: 128,
+      }, cognitionRuntime);
+      const settle = workspace.settleAssignedTask;
+      if (!settle) throw new Error("Coordinator settlement capability is unavailable");
+      const result = await settle({
+        taskId: "settlement-task",
+        frameId: "settlement-child",
+        state: "failed",
+        operationKey: "raw-settlement-call",
+        signal: executionSignal,
+      });
+      expect(result).toMatchObject({ accepted: true, workspaceRevision: 1 });
+      expect(seenTransitions).toEqual([{
+        operation: "settle_child_failure",
+        operationKey: "raw-settlement-call",
+        actor: "host",
+      }]);
+    } finally {
+      deps.cleanup?.({ execution } as never);
+    }
+  });
   test("projects a completed materialized authored task through the real phase snapshot capability", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
@@ -2575,11 +3765,8 @@ describe("coordinator cognition transition snapshot seam", () => {
               dependencies: [],
               activation: { kind: "phase", value: "WORK" },
             }],
-            contextRules: [],
           },
           source: { presetRevision: 1, blocks: [] },
-          contextPackSelections: [],
-          contextPackCandidates: [],
         },
         evaluation: {
           generationType: "normal",
@@ -2592,7 +3779,6 @@ describe("coordinator cognition transition snapshot seam", () => {
         workspaceRevision: initialRevision,
         workspace: workspaceContext(initialRevision),
       });
-      runtimeExecution.workspaceRevision = cognition.initialActivation.workspaceRevision;
       const workActivation = cognition.enterPhase({
         phase: "WORK",
         workspace: workspaceContext(runtimeExecution.workspaceRevision),

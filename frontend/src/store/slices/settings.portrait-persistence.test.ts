@@ -214,3 +214,37 @@ describe('portrait dock persistence', () => {
     expect(puts).toBe(1)
   })
 })
+
+describe('long message collapse settings', () => {
+  test('defaults to disabled with the comfortable height preset', () => {
+    const initial = store()
+    expect(initial.longMessageCollapseEnabled).toBe(false)
+    expect(initial.longMessageCollapsePreset).toBe('comfortable')
+    expect(initial.longMessageCollapseCustomHeight).toBe(500)
+    expect(initial.longMessageCollapseDepth).toBe(0)
+  })
+
+  test('persists and restores the enable flag and height preset', async () => {
+    const rows = new Map<string, unknown>()
+    database(rows)
+    const first = store()
+
+    first.setSetting('longMessageCollapseEnabled', true)
+    first.setSetting('longMessageCollapsePreset', 'custom')
+    first.setSetting('longMessageCollapseCustomHeight', 347)
+    first.setSetting('longMessageCollapseDepth', 6)
+    await flushSettingsNow()
+
+    expect(rows.get('longMessageCollapseEnabled')).toBe(true)
+    expect(rows.get('longMessageCollapsePreset')).toBe('custom')
+    expect(rows.get('longMessageCollapseCustomHeight')).toBe(347)
+    expect(rows.get('longMessageCollapseDepth')).toBe(6)
+
+    const restored = store()
+    await restored.loadSettings()
+    expect(restored.longMessageCollapseEnabled).toBe(true)
+    expect(restored.longMessageCollapsePreset).toBe('custom')
+    expect(restored.longMessageCollapseCustomHeight).toBe(347)
+    expect(restored.longMessageCollapseDepth).toBe(6)
+  })
+})

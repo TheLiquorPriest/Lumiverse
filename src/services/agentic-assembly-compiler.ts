@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { AssemblySurfaceV1 } from "../llm/types";
 
 import { preflightAgentIntrinsics, AgentIntrinsicValidationError } from "./agent-intrinsics.service";
+import { registry as macroRegistry } from "../macros/MacroRegistry";
 import {
   activateSnapshotWorldInfo,
   agentMarkersPresent,
@@ -36,6 +37,7 @@ import {
 import type {
   AssemblyActivationEvidenceV1,
   AssemblyChildDescriptorV1 as SharedAssemblyChildDescriptorV1,
+  AssemblyDatabankMessageProvenanceV1,
   AssemblyProfileOutputLimitV1,
   AssemblyLiteralSegmentV1 as SharedAssemblyLiteralSegmentV1,
   AssemblyMessageProvenanceV1 as SharedAssemblyMessageProvenanceV1,
@@ -50,23 +52,27 @@ import type {
 } from "../types/agent-preprocessing";
 import type {
   CognitionLoomBlockRefV1,
-  LoomPolicyBucketsV1,
+  CognitionSourceSnapshotV1,
   LoomPolicyBucketV1,
-  LoomPolicyDeliveryV1,
+  LoomPolicyBucketsV1,
+  LoomPolicyEntryV1,
+  LoomPolicySourceV1,
   LoomPromptInspectionBlockV1,
   LoomPromptInspectionV1,
 } from "../types/agent-cognition";
 import {
+  LOOM_BUCKET_DESTINATION,
   normalizeLoomPolicyBucketsV1,
   parseLoomPolicyBuckets,
   parseLoomPromptInspectionV1,
 } from "./agent-cognition.service";
-import type { ContextPackCandidateSnapshotV1 } from "./agent-context-tools.service";
 import type {
   GenerationAssemblySnapshotV1,
   SnapshotBlockV1,
+  SnapshotDatabankProvenanceV1,
   SnapshotMessageV1,
 } from "./prompt-assembly-snapshot.service";
+import { compareUtf8 } from "../utils/utf8-order";
 const RESULT_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const OPEN_PREFIX = "{{agent::";
 const CLOSE_TAG = "{{/agent}}";
@@ -126,7 +132,7 @@ export interface AssemblyLoomMessageProvenanceV1 {
   readonly destination: "root_work" | "completion_handoff" | "render";
   readonly checkpoint: "ASSEMBLE" | "WORK" | "PREPARE_COMMIT" | "RENDER";
   readonly source: LoomPolicyBucketsV1["workPolicy"][number]["source"];
-  readonly delivery: LoomPolicyDeliveryV1;
+  readonly condition?: LoomPolicyBucketsV1["workPolicy"][number]["condition"];
   readonly effectiveText: string;
 }
 export type AssemblyMessageProvenanceV1 = SharedAssemblyMessageProvenanceV1 & {
@@ -169,7 +175,7 @@ export interface AssemblySealV1 {
 
 export interface AssemblyCognitionEvidenceV1 {
   readonly kind: "cognition_phase";
-  readonly phase: "WORK" | "RENDER";
+  readonly phase: "WORK" | "PREPARE_COMMIT" | "RENDER";
   readonly section: "workPolicy" | "workspaceUsage" | "completionCriteria" | "renderPolicy";
   readonly blockId: string;
   readonly expectedPresetRevision: number;
@@ -204,7 +210,6 @@ export type AssemblyPlanV1 = SharedAssemblyPlanV1 & {
   readonly privateEvidence: AssemblyPrivateEvidenceV1;
   readonly deferredDeltas: readonly Readonly<Record<string, unknown>>[];
   readonly inputRevisionSet: InputRevisionSetV1;
-  readonly contextPackSnapshot: ContextPackCandidateSnapshotV1;
   /** Canonical ordered custom WORK phase plan; never part of the four Loom buckets. */
   readonly customPhasePlan: AgentRuntimePhaseCompileResultV1;
   readonly workPolicyMessages: readonly AssemblyProviderMessageV1[];
@@ -325,7 +330,7 @@ function shaDigest(value: unknown): string {
 const SNAPSHOT_KEYS = new Set([
   "version", "snapshotId", "assemblySurface", "userId", "generationId", "chatId", "target", "chat",
   "messages", "preset", "blocks", "participants", "variables", "regexScripts",
-  "worldInfo", "contextPacks", "contextPackSnapshot", "availability", "connection",
+  "worldInfo", "databank", "agentCognition", "availability", "connection",
   "agentConfig", "limits", "inputRevisionSet", "revisions", "extensionData",
   "ambientSpindleData",
 ]);
@@ -370,6 +375,78 @@ function validateNestedSnapshotRecords(candidate: Record<string, unknown>, limit
   if (!["normal", "continue", "regenerate", "swipe"].includes(String(target.generationType))) fail("target generation type");
   for (const key of ["messageId", "continueMessageId", "excludedMessageId"]) optionalText(target[key], `target.${key}`);
   if (typeof target.userInput !== "string" || bytes(target.userInput) > limits.maxInputBytes) fail("target.userInput");
+  const databank = candidate.databank;
+  if (databank !== undefined) {
+    const databankRecord = record(databank, "databank");
+    closed(databankRecord, [
+      "enabled", "activeBankIds", "automaticChunks", "automaticFormatted",
+      "mentions", "strippedUserInput", "mentionAppendix", "provenance",
+    ], "databank");
+    if (typeof databankRecord.enabled !== "boolean") fail("databank.enabled");
+    if (
+      !Array.isArray(databankRecord.activeBankIds)
+      || databankRecord.activeBankIds.length > limits.maxPromptBlocks * 16
+      || databankRecord.activeBankIds.some((id) => typeof id !== "string" || id.length === 0 || bytes(id) > 256)
+    ) fail("databank.activeBankIds");
+    if (typeof databankRecord.automaticFormatted !== "string" || bytes(databankRecord.automaticFormatted) > limits.maxInputBytes) {
+      fail("databank.automaticFormatted");
+    }
+    if (typeof databankRecord.strippedUserInput !== "string" || bytes(databankRecord.strippedUserInput) > limits.maxInputBytes) {
+      fail("databank.strippedUserInput");
+    }
+    if (typeof databankRecord.mentionAppendix !== "string" || bytes(databankRecord.mentionAppendix) > limits.maxInputBytes) {
+      fail("databank.mentionAppendix");
+    }
+    const automaticChunks = databankRecord.automaticChunks;
+    if (!Array.isArray(automaticChunks) || automaticChunks.length > limits.maxPromptBlocks * 16) fail("databank.automaticChunks");
+    for (const [index, raw] of (automaticChunks as readonly unknown[]).entries()) {
+      const chunk = record(raw, `databank.automaticChunks[${index}]`);
+      closed(chunk, [
+        "chunkId", "documentId", "databankId", "documentName", "content", "score",
+        "documentContentHash", "contentHash",
+      ], `databank.automaticChunks[${index}]`);
+      text(chunk.chunkId, `databank.automaticChunks[${index}].chunkId`);
+      text(chunk.documentId, `databank.automaticChunks[${index}].documentId`);
+      text(chunk.databankId, `databank.automaticChunks[${index}].databankId`);
+      if (typeof chunk.documentName !== "string" || bytes(chunk.documentName) > limits.maxOperationBytes) fail(`databank.automaticChunks[${index}].documentName`);
+      if (typeof chunk.content !== "string" || bytes(chunk.content) > limits.maxOperationBytes) fail(`databank.automaticChunks[${index}].content`);
+      if (chunk.score !== null && (typeof chunk.score !== "number" || !Number.isFinite(chunk.score))) fail(`databank.automaticChunks[${index}].score`);
+      if (chunk.documentContentHash !== null && (!/^[a-f0-9]{64}$/.test(String(chunk.documentContentHash)))) fail(`databank.automaticChunks[${index}].documentContentHash`);
+      if (!/^[a-f0-9]{64}$/.test(String(chunk.contentHash))) fail(`databank.automaticChunks[${index}].contentHash`);
+    }
+    const mentions = databankRecord.mentions;
+    if (!Array.isArray(mentions) || mentions.length > limits.maxPromptBlocks * 16) fail("databank.mentions");
+    for (const [index, raw] of (mentions as readonly unknown[]).entries()) {
+      const mention = record(raw, `databank.mentions[${index}]`);
+      closed(mention, [
+        "slug", "documentId", "databankId", "documentName", "content", "truncated",
+        "documentContentHash", "contentHash",
+      ], `databank.mentions[${index}]`);
+      text(mention.slug, `databank.mentions[${index}].slug`);
+      text(mention.documentId, `databank.mentions[${index}].documentId`);
+      text(mention.databankId, `databank.mentions[${index}].databankId`);
+      if (typeof mention.documentName !== "string" || bytes(mention.documentName) > limits.maxOperationBytes) fail(`databank.mentions[${index}].documentName`);
+      if (typeof mention.content !== "string" || bytes(mention.content) > limits.maxOperationBytes) fail(`databank.mentions[${index}].content`);
+      if (typeof mention.truncated !== "boolean") fail(`databank.mentions[${index}].truncated`);
+      if (mention.documentContentHash !== null && (!/^[a-f0-9]{64}$/.test(String(mention.documentContentHash)))) fail(`databank.mentions[${index}].documentContentHash`);
+      if (!/^[a-f0-9]{64}$/.test(String(mention.contentHash))) fail(`databank.mentions[${index}].contentHash`);
+    }
+    const provenance = databankRecord.provenance;
+    if (!Array.isArray(provenance) || provenance.length > limits.maxPromptBlocks * 32) fail("databank.provenance");
+    const automaticSources: unknown[] = [];
+    const mentionSources: unknown[] = [];
+    for (const entry of provenance as readonly unknown[]) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) fail("databank.provenance");
+      const kind = (entry as Record<string, unknown>).kind;
+      if (kind === "automatic") automaticSources.push(entry);
+      else if (kind === "mention") mentionSources.push(entry);
+      else fail("databank.provenance");
+    }
+    if (
+      !isValidDatabankMessageProvenance({ kind: "automatic", sources: automaticSources })
+      || !isValidDatabankMessageProvenance({ kind: "mention", sources: mentionSources })
+    ) fail("databank.provenance");
+  }
 
   const chat = record(candidate.chat, "chat");
   closed(chat, ["id", "character_id", "name", "metadata", "created_at", "updated_at", "revision"], "chat");
@@ -449,6 +526,9 @@ function validateSnapshotIdentity(snapshot: unknown): asserts snapshot is Genera
   // numbers without recursion.
   canonical(snapshot, HOST_PREPARATION_LIMITS_V1.maxInputBytes + HOST_PREPARATION_LIMITS_V1.maxOutputBytes);
   const candidate = snapshot as Record<string, unknown>;
+  if (Object.keys(candidate).some((key) => !SNAPSHOT_KEYS.has(key))) {
+    throw new AssemblyPlanValidationError("invalid_input", "Assembly snapshot contains an unknown field");
+  }
   if (candidate.assemblySurface === "RESPONSE") {
     throw new AssemblyPlanValidationError("invalid_input", "Strict agent assembly requires the WORK surface");
   }
@@ -585,6 +665,16 @@ interface SnapshotPreprocessingResult {
   readonly deltas: readonly PreparationDeltaV1[];
   readonly macroEvidence: readonly Readonly<Record<string, unknown>>[];
   readonly regexEvidence: readonly Readonly<Record<string, unknown>>[];
+}
+function snapshotUsesDatabankRetrievalMacro(blocks: readonly SnapshotBlockV1[]): boolean {
+  for (const block of blocks) {
+    if (!block.enabled || !block.content.includes("{{")) continue;
+    for (const match of block.content.matchAll(/\{\{\s*([A-Za-z][A-Za-z0-9_-]*)/g)) {
+      const definition = macroRegistry.getMacro(match[1]!);
+      if (definition?.handlesDatabankRetrieval === true) return true;
+    }
+  }
+  return false;
 }
 
 type AssemblyRole = AssemblyProviderMessageV1["role"];
@@ -825,13 +915,33 @@ async function preprocessSnapshot(
     blocks.push(frozen({ ...block, content }));
   }
   env.promptBlock = undefined;
-  const history: ReturnType<typeof messageForHistory>[] = [];
-  for (const message of snapshot.messages.filter((candidate) => candidate.id !== snapshot.target.excludedMessageId)) {
+  const history: AssemblyProviderMessageV1[] = [];
+  const historyCandidates = snapshot.messages.filter(
+    (candidate) => candidate.id !== snapshot.target.excludedMessageId,
+  );
+  const currentUserIndex = historyCandidates.findLastIndex((candidate) => candidate.is_user);
+  for (const [candidateIndex, message] of historyCandidates.entries()) {
     const sourceIndex = history.length;
-    const raw = typeof message.content === "string" ? message.content : "";
+    const selectedSwipe = Number.isSafeInteger(message.swipe_id)
+      ? message.swipes[message.swipe_id]
+      : undefined;
+    const sourceContent = typeof selectedSwipe === "string"
+      ? selectedSwipe
+      : message.content;
+    const useNativeMentionInput =
+      candidateIndex === currentUserIndex
+      && (snapshot.databank?.mentions.length ?? 0) > 0;
+    const macroInput = useNativeMentionInput
+      ? snapshot.databank!.strippedUserInput
+      : sourceContent;
     const placement = message.is_user ? "user_input" : "ai_output";
-    const content = await resolveText(raw, placement, null, -1);
-    if (content !== raw) appendSourceMessageDelta(message, content);
+    const resolved = await resolveText(macroInput, placement, null, -1);
+    const content = useNativeMentionInput
+      ? `${resolved}${snapshot.databank!.mentionAppendix}`
+      : resolved;
+    if (!useNativeMentionInput && content !== sourceContent) {
+      appendSourceMessageDelta(message, content);
+    }
     history.push(messageForHistory({ ...message, content }, snapshot.limits.maxOperationBytes, sourceIndex));
   }
   // Source deltas follow frozen history order, independent of regex-action
@@ -922,69 +1032,145 @@ function cognitionPhaseRefs(
   parsedConfig?: AgentConfigV2,
   customPhasePlan?: AgentRuntimePhaseCompileResultV1,
 ): CognitionPhaseRefsV1 {
-  const contextCognition = snapshot.contextPacks;
-  const source = contextCognition.cognitionSource;
+  const source = snapshot.agentCognition.cognitionSource;
   const loomPolicy = loomPolicyForSnapshot(snapshot, parsedConfig);
-  const refsForBucket = (bucket: LoomPolicyBucketV1): CognitionLoomBlockRefV1[] =>
-    loomPolicy[bucket].map((entry) => ({
-      blockId: entry.source.blockId,
-      expectedPresetRevision: entry.source.presetRevision,
-      expectedBlockRevision: entry.source.blockRevision,
-    }));
+  const sourceBlocks = new Map(source?.blocks.map((block) => [block.blockId, block] as const) ?? []);
+  const snapshotBlocks = new Map(snapshot.blocks.map((block) => [block.id, block] as const));
+  const destPins = new Map<string, string>();
+  for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
+    for (const entry of loomPolicy[bucket]) {
+      const destKey = `${LOOM_BUCKET_DESTINATION[bucket]}\u0000${entry.source.blockId}`;
+      const pin = `${entry.source.presetRevision}\u0000${entry.source.blockRevision}\u0000${entry.source.promptOrder}`;
+      const previous = destPins.get(destKey);
+      if (previous !== undefined && previous !== pin) {
+        throw new AssemblyPlanValidationError(
+          "invalid_input",
+          `${bucket}.${entry.id} conflicts with another ${LOOM_BUCKET_DESTINATION[bucket]} pin for ${entry.source.blockId}`,
+        );
+      }
+      destPins.set(destKey, pin);
+    }
+  }
+  const refsForBucket = (bucket: LoomPolicyBucketV1): CognitionLoomBlockRefV1[] => {
+    const refs: CognitionLoomBlockRefV1[] = [];
+    for (const entry of loomPolicy[bucket]) {
+      const sourceBlock = sourceBlocks.get(entry.source.blockId);
+      const snapshotBlock = snapshotBlocks.get(entry.source.blockId);
+      const exact = source !== null
+        && source !== undefined
+        && sourceBlock !== undefined
+        && snapshotBlock !== undefined
+        && source.presetRevision === entry.source.presetRevision
+        && sourceBlock.revision === entry.source.blockRevision
+        && sourceBlock.promptOrder === entry.source.promptOrder
+        && String(snapshotBlock.revision) === String(sourceBlock.revision);
+      if (!exact) {
+        if (entry.required) {
+          throw new AssemblyPlanValidationError(
+            "invalid_input",
+            `${bucket}.${entry.id} is not bound to the frozen Loom block revision`,
+          );
+        }
+        continue;
+      }
+      refs.push({
+        blockId: entry.source.blockId,
+        expectedPresetRevision: entry.source.presetRevision,
+        expectedBlockRevision: entry.source.blockRevision,
+      });
+    }
+    return refs;
+  };
   const workPolicy = refsForBucket("workPolicy");
   const workspaceUsage = refsForBucket("workspaceUsage");
   const completionCriteria = refsForBucket("completionCriteria");
   const renderPolicy = refsForBucket("renderPolicy");
-  const customInstructions: CognitionLoomBlockRefV1[] = (customPhasePlan?.phases ?? []).flatMap((phase) =>
-    phase.instructionRefs.map((ref) => ({
-      blockId: ref.blockId,
-      expectedPresetRevision: ref.presetRevision,
-      expectedBlockRevision: ref.blockRevision,
-    })),
-  );
+  const customInstructions: CognitionLoomBlockRefV1[] = [];
+  for (const phase of customPhasePlan?.phases ?? []) {
+    const phaseSources = [
+      ...phase.instructionRefs,
+      ...phase.childInstructionSubsets.flatMap((subset) => subset.instructionRefs),
+    ];
+    for (const ref of phaseSources) {
+      const sourceBlock = sourceBlocks.get(ref.blockId);
+      const snapshotBlock = snapshotBlocks.get(ref.blockId);
+      if (
+        !source
+        || !sourceBlock
+        || !snapshotBlock
+        || source.presetRevision !== ref.presetRevision
+        || sourceBlock.revision !== ref.blockRevision
+        || sourceBlock.promptOrder !== ref.promptOrder
+        || String(snapshotBlock.revision) !== String(sourceBlock.revision)
+      ) {
+        throw new AssemblyPlanValidationError(
+          "invalid_input",
+          `customPhases.${phase.id}.${ref.blockId} is not bound to the frozen Loom block revision`,
+        );
+      }
+      customInstructions.push({
+        blockId: ref.blockId,
+        expectedPresetRevision: ref.presetRevision,
+        expectedBlockRevision: ref.blockRevision,
+      });
+    }
+  }
   const all = [...workPolicy, ...workspaceUsage, ...completionCriteria, ...renderPolicy, ...customInstructions];
   if (all.length === 0) {
     return { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [], excludedBlockIds: new Set() };
   }
-  if (!source) throw new AssemblyPlanValidationError("invalid_input", "Cognition source is required for Loom policy blocks");
-  const sourceBlocks = new Map(source.blocks.map((block) => [block.blockId, block] as const));
-  const snapshotBlocks = new Map(snapshot.blocks.map((block) => [block.id, block] as const));
-  const normalize = (refs: readonly CognitionLoomBlockRefV1[], path: string): CognitionLoomBlockRefV1[] => {
+  const normalize = (
+    refs: readonly CognitionLoomBlockRefV1[],
+    path: string,
+  ): CognitionLoomBlockRefV1[] => {
     const seen = new Map<string, CognitionLoomBlockRefV1>();
     for (const ref of refs) {
       const previous = seen.get(ref.blockId);
-      if (previous && (previous.expectedPresetRevision !== ref.expectedPresetRevision || previous.expectedBlockRevision !== ref.expectedBlockRevision)) {
+      if (previous && (
+        previous.expectedPresetRevision !== ref.expectedPresetRevision
+        || previous.expectedBlockRevision !== ref.expectedBlockRevision
+      )) {
         throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} has conflicting source revisions`);
       }
       const sourceBlock = sourceBlocks.get(ref.blockId);
       const snapshotBlock = snapshotBlocks.get(ref.blockId);
-      if (!sourceBlock || !snapshotBlock) throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} is not in the frozen source`);
-      if (source.presetRevision !== ref.expectedPresetRevision || sourceBlock.revision !== ref.expectedBlockRevision) {
-        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} source revision mismatch`);
+      if (!source || !sourceBlock || !snapshotBlock) {
+        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} is not in the frozen source`);
       }
-      if (String(snapshotBlock.revision) !== String(sourceBlock.revision)) {
-        const sourceIsAuthoringDefault = String(sourceBlock.revision) === "1";
-        const snapshotIsContentDigest = typeof snapshotBlock.revision === "string"
-          && /^[a-f0-9]{64}$/i.test(snapshotBlock.revision);
-        if (!(sourceIsAuthoringDefault && snapshotIsContentDigest)) {
-          throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} snapshot block revision mismatch`);
-        }
+      if (
+        source.presetRevision !== ref.expectedPresetRevision
+        || sourceBlock.revision !== ref.expectedBlockRevision
+        || String(snapshotBlock.revision) !== String(sourceBlock.revision)
+      ) {
+        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} source revision mismatch`);
       }
       seen.set(ref.blockId, ref);
     }
     return [...seen.values()].sort((left, right) => {
       const leftOrder = sourceBlocks.get(left.blockId)?.promptOrder ?? 0;
       const rightOrder = sourceBlocks.get(right.blockId)?.promptOrder ?? 0;
-      return leftOrder - rightOrder || left.blockId.localeCompare(right.blockId);
+      return leftOrder - rightOrder || compareUtf8(left.blockId, right.blockId);
     });
   };
   const normalizedWork = normalize(workPolicy, "workPolicy");
   const normalizedUsage = normalize(workspaceUsage, "workspaceUsage");
   const normalizedCompletion = normalize(completionCriteria, "completionCriteria");
   const normalizedRender = normalize(renderPolicy, "renderPolicy");
-  normalize(customInstructions, "customPhases");
-  const excludedBlockIds = new Set(all.map((ref) => ref.blockId));
-  return { workPolicy: normalizedWork, workspaceUsage: normalizedUsage, completionCriteria: normalizedCompletion, renderPolicy: normalizedRender, excludedBlockIds };
+  const normalizedCustom = normalize(customInstructions, "customPhases");
+  const excludedBlockIds = new Set([
+    ...normalizedWork,
+    ...normalizedUsage,
+    ...normalizedCompletion,
+    ...normalizedRender,
+    ...normalizedCustom,
+  ].map((ref) => ref.blockId));
+  return {
+    workPolicy: normalizedWork,
+    workspaceUsage: normalizedUsage,
+    completionCriteria: normalizedCompletion,
+    renderPolicy: normalizedRender,
+    excludedBlockIds,
+  };
 }
 const EMPTY_LOOM_POLICY: LoomPolicyBucketsV1 = Object.freeze({
   version: 1,
@@ -998,9 +1184,9 @@ function loomPolicyForSnapshot(
   snapshot: GenerationAssemblySnapshotV1,
   parsedConfig: AgentConfigV2 | undefined,
 ): LoomPolicyBucketsV1 {
-  const contextPolicy = snapshot.contextPacks.loomPolicy;
-  if (contextPolicy) return contextPolicy;
-  const source = snapshot.contextPacks.cognitionSource;
+  const snapshotPolicy = snapshot.agentCognition.loomPolicy;
+  if (snapshotPolicy) return snapshotPolicy;
+  const source = snapshot.agentCognition.cognitionSource;
   if (!source) return EMPTY_LOOM_POLICY;
   const config = parsedConfig as unknown as Record<string, unknown> | undefined;
   const runtimePolicy = config?.runtimePolicy;
@@ -1014,26 +1200,43 @@ function loomPolicyForSnapshot(
 function loomBlocksForPolicy(
   policy: LoomPolicyBucketsV1,
   blocks: readonly SnapshotBlockV1[],
+  cognitionSource: CognitionSourceSnapshotV1 | null,
   customPhasePlan?: AgentRuntimePhaseCompileResultV1,
 ): readonly LoomPromptInspectionBlockV1[] {
   const byId = new Map(blocks.map((block) => [block.id, block] as const));
+  const sourceById = new Map(cognitionSource?.blocks.map((block) => [block.blockId, block] as const) ?? []);
+  const exactBlock = (source: LoomPolicySourceV1): SnapshotBlockV1 | null => {
+    if (!cognitionSource || cognitionSource.presetRevision !== source.presetRevision) return null;
+    const frozenSource = sourceById.get(source.blockId);
+    const block = byId.get(source.blockId);
+    if (!frozenSource
+      || !block
+      || frozenSource.revision !== source.blockRevision
+      || frozenSource.promptOrder !== source.promptOrder
+      || String(block.revision) !== String(frozenSource.revision)) return null;
+    return block;
+  };
   const seen = new Set<string>();
   const result: LoomPromptInspectionBlockV1[] = [];
   for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
     for (const entry of policy[bucket]) {
       const key = `${entry.source.blockId}\u0000${entry.source.presetRevision}\u0000${entry.source.blockRevision}\u0000${entry.source.promptOrder}`;
       if (seen.has(key)) continue;
-      const block = byId.get(entry.source.blockId);
+      const block = exactBlock(entry.source);
       if (!block) continue;
       seen.add(key);
       result.push(Object.freeze({ source: entry.source, content: block.content }));
     }
   }
   for (const phase of customPhasePlan?.phases ?? []) {
-    for (const source of phase.instructionRefs) {
+    const phaseSources = [
+      ...phase.instructionRefs,
+      ...phase.childInstructionSubsets.flatMap((subset) => subset.instructionRefs),
+    ];
+    for (const source of phaseSources) {
       const key = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
       if (seen.has(key)) continue;
-      const block = byId.get(source.blockId);
+      const block = exactBlock(source);
       if (!block) continue;
       seen.add(key);
       result.push(Object.freeze({ source, content: block.content }));
@@ -1206,10 +1409,11 @@ function phasePolicyMessages(
   policy: LoomPolicyBucketsV1,
 ): readonly AssemblyProviderMessageV1[] {
   const byId = new Map(blocks.map((block, index) => [block.id, { block, index }] as const));
-  const policyBySource = new Map(policy[bucket].map((entry) => [
-    `${entry.source.blockId}\u0000${entry.source.presetRevision}\u0000${entry.source.blockRevision}`,
-    entry,
-  ] as const));
+  const policyBySource = new Map<string, LoomPolicyEntryV1>();
+  for (const entry of policy[bucket]) {
+    const key = `${entry.source.blockId}\u0000${entry.source.presetRevision}\u0000${entry.source.blockRevision}`;
+    if (!policyBySource.has(key)) policyBySource.set(key, entry);
+  }
   const messages: AssemblyProviderMessageV1[] = [];
   for (const [order, ref] of refs.entries()) {
     const entry = byId.get(ref.blockId);
@@ -1233,7 +1437,7 @@ function phasePolicyMessages(
           destination: sourceEntry.destination,
           checkpoint: sourceEntry.checkpoint,
           source: sourceEntry.source,
-          delivery: sourceEntry.delivery,
+          ...(sourceEntry.condition === undefined ? {} : { condition: sourceEntry.condition }),
           effectiveText: entry.block.content,
         },
       },
@@ -1262,8 +1466,8 @@ export function selectEffectiveLoomPolicyMessagesV1(
     throw new AssemblyPlanValidationError("invalid_input", "Provider policy selection requires a WORK inspection");
   }
   const bucketItems = inspection.items.filter((item) => item.bucket === bucket);
-  if (messages.length !== bucketItems.length) {
-    throw new AssemblyPlanValidationError("invalid_input", `Loom ${bucket} messages do not cover the inspected policy`);
+  if (messages.length > bucketItems.length) {
+    throw new AssemblyPlanValidationError("invalid_input", `Loom ${bucket} messages exceed the inspected policy`);
   }
   const itemById = new Map(bucketItems.map((item) => [item.entryId, item] as const));
   const messageById = new Map<string, AssemblyProviderMessageV1>();
@@ -1278,7 +1482,7 @@ export function selectEffectiveLoomPolicyMessagesV1(
       || loom.destination !== item.destination
       || loom.checkpoint !== item.checkpoint
       || canonical(loom.source) !== canonical(item.source)
-      || canonical(loom.delivery) !== canonical(item.delivery)
+      || canonical(loom.condition) !== canonical(item.condition)
     ) {
       throw new AssemblyPlanValidationError("invalid_input", `Loom ${bucket} message provenance does not match inspection`);
     }
@@ -1333,12 +1537,12 @@ export function selectEffectiveLoomPolicyMessagesV1(
 
 function cognitionPhaseActivationEvidence(
   snapshot: GenerationAssemblySnapshotV1,
-  phase: "WORK" | "RENDER",
+  phase: AssemblyCognitionEvidenceV1["phase"],
   section: "workPolicy" | "workspaceUsage" | "completionCriteria" | "renderPolicy",
   refs: readonly CognitionLoomBlockRefV1[],
   messages: readonly AssemblyProviderMessageV1[],
 ): readonly AssemblyCognitionEvidenceV1[] {
-  const source = snapshot.contextPacks.cognitionSource;
+  const source = snapshot.agentCognition.cognitionSource;
   if (!source) return frozen([]);
   const sourceById = new Map(source.blocks.map((block) => [block.blockId, block] as const));
   const messageById = new Map(messages.map((message) => [message.blockId, message] as const));
@@ -1366,17 +1570,23 @@ function cognitionPhaseActivationEvidence(
     });
   }));
 }
-
 function messageProvenance(
   kind: AssemblyMessageSourceKindV1,
   sourceId: string,
   sourceRevision: string,
   sourceIndex: number,
+  databank?: AssemblyDatabankMessageProvenanceV1,
 ): AssemblyMessageProvenanceV1 {
   if (sourceId.length === 0 || sourceRevision.length === 0 || !Number.isSafeInteger(sourceIndex) || sourceIndex < 0) {
     throw new AssemblyPlanValidationError("invalid_input", "Assembly message provenance is invalid");
   }
-  return frozen({ kind, sourceId, sourceRevision, sourceIndex });
+  return frozen({
+    kind,
+    sourceId,
+    sourceRevision,
+    sourceIndex,
+    ...(databank ? { databank: frozen({ kind: databank.kind, sources: frozen([...databank.sources]) }) } : {}),
+  });
 }
 
 function messageForBlock(
@@ -1428,6 +1638,41 @@ function messageForWorldInfo(
     provenance: messageProvenance("world_info", sourceId, sourceRevision, sourceIndex),
   });
 }
+function messageForDatabank(
+  snapshot: GenerationAssemblySnapshotV1,
+  sourceIndex: number,
+): AssemblyProviderMessageV1 | null {
+  const databank = snapshot.databank;
+  if (!databank?.enabled) return null;
+  const content = databank?.automaticFormatted ?? "";
+  const sources = (databank?.provenance ?? [])
+    .filter((entry): entry is SnapshotDatabankProvenanceV1 => entry.kind === "automatic")
+    .map((entry) => ({
+      kind: entry.kind,
+      databankId: entry.databankId,
+      documentId: entry.documentId,
+      documentName: entry.documentName,
+      chunkId: entry.chunkId,
+      documentContentHash: entry.documentContentHash,
+      contentHash: entry.contentHash,
+    }));
+  if (content.length === 0 || sources.length === 0) return null;
+  const sourceRevision = digest({ contentHash: digest(content), sources });
+  const textBytes = bytes(content);
+  if (textBytes > snapshot.limits.maxOperationBytes) {
+    throw new AssemblyPlanValidationError("limit_exceeded", "Databank content exceeds operation limit");
+  }
+  const databankProvenance: AssemblyDatabankMessageProvenanceV1 = {
+    kind: "automatic",
+    sources: frozen(sources),
+  };
+  return frozen({
+    role: "system",
+    segments: frozen([frozen({ kind: "literal", text: content, bytes: textBytes })]),
+    contentKind: "segments",
+    provenance: messageProvenance("databank", `databank:${sourceRevision}`, sourceRevision, sourceIndex, databankProvenance),
+  });
+}
 
 
 function normalizeInput(
@@ -1477,7 +1722,8 @@ export async function compileAgentAssemblyPlan(
   // V1 fields are import-only and never become executable worker authority.
   const parsedConfig = parserConfig(configFor(snapshot, agentConfig));
   const customPhasePlan = compileAgentRuntimePhases(parsedConfig?.runtimePolicy?.phases ?? [], {
-    source: snapshot.contextPacks.cognitionSource,
+    source: snapshot.agentCognition.cognitionSource,
+    profileIds: parsedConfig?.profiles.map((profile) => profile.id),
   });
   if (customPhasePlan.status === "failed") {
     throw new AssemblyPlanValidationError("invalid_input", "Required custom WORK phase could not be compiled");
@@ -1485,8 +1731,9 @@ export async function compileAgentAssemblyPlan(
   const loomPolicy = loomPolicyForSnapshot(snapshot, parsedConfig);
   const phaseRefs = cognitionPhaseRefs(snapshot, parsedConfig, customPhasePlan);
   const preparation = await preprocessSnapshot(snapshot, phaseRefs.excludedBlockIds);
+  const macroHandlesDatabank = snapshotUsesDatabankRetrievalMacro(preparation.blocks);
   const parsed = parseBlocks(snapshot, parsedConfig, preparation.blocks, phaseRefs.excludedBlockIds);
-  const loomBlocks = loomBlocksForPolicy(loomPolicy, preparation.blocks, customPhasePlan);
+  const loomBlocks = loomBlocksForPolicy(loomPolicy, preparation.blocks, snapshot.agentCognition.cognitionSource, customPhasePlan);
   const producerByName = new Map<string, { block: SnapshotBlockV1; blockIndex: number; child: ParsedChild }>();
   for (const item of parsed) {
     const name = item.child?.resultName;
@@ -1597,9 +1844,13 @@ export async function compileAgentAssemblyPlan(
     const insertionIndex = Math.max(0, Math.min(historyMessages.length, historyMessages.length - depth));
     historyWithDepth.splice(insertionIndex, 0, entry.message);
   }
+  const automaticDatabankMessage = macroHandlesDatabank
+    ? null
+    : messageForDatabank(snapshot, preparation.worldBefore.length + preHistoryMessages.length);
   const providerMessages: AssemblyProviderMessageV1[] = [
     ...preparation.worldBefore,
     ...preHistoryMessages,
+    ...(automaticDatabankMessage ? [automaticDatabankMessage] : []),
     ...historyWithDepth,
     ...postHistoryMessages,
     ...preparation.worldAfter,
@@ -1650,7 +1901,7 @@ export async function compileAgentAssemblyPlan(
   const cognitionEvidence = frozen([
     ...cognitionPhaseActivationEvidence(snapshot, "WORK", "workPolicy", phaseRefs.workPolicy, workPolicyMessages),
     ...cognitionPhaseActivationEvidence(snapshot, "WORK", "workspaceUsage", phaseRefs.workspaceUsage, workspaceUsageMessages),
-    ...cognitionPhaseActivationEvidence(snapshot, "WORK", "completionCriteria", phaseRefs.completionCriteria, completionCriteriaMessages),
+    ...cognitionPhaseActivationEvidence(snapshot, "PREPARE_COMMIT", "completionCriteria", phaseRefs.completionCriteria, completionCriteriaMessages),
     ...cognitionPhaseActivationEvidence(snapshot, "RENDER", "renderPolicy", phaseRefs.renderPolicy, renderPolicyMessages),
   ]);
   const privateEvidence: AssemblyPrivateEvidenceV1 = frozen({
@@ -1710,7 +1961,6 @@ export async function compileAgentAssemblyPlan(
     privateEvidence,
     deferredDeltas: frozen(preparation.deltas),
     snapshotId: snapshot.snapshotId,
-    contextPackSnapshot: snapshot.contextPackSnapshot,
   });
   validateAssemblyPlanV1(plan, snapshot.limits);
   return plan;
@@ -1721,15 +1971,46 @@ export async function compileAgentAssemblyPlan(
  * intentionally stricter than TypeScript structural typing because the plan
  * is untrusted bytes at this boundary.
  */
+function isValidDatabankMessageProvenance(value: unknown): value is AssemblyDatabankMessageProvenanceV1 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["kind", "sources"].includes(key))) return false;
+  if (record.kind !== "automatic" && record.kind !== "mention") return false;
+  if (!Array.isArray(record.sources) || record.sources.length > HOST_PREPARATION_LIMITS_V1.maxPromptBlocks * 16) return false;
+  for (const source of record.sources) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+    const entry = source as Record<string, unknown>;
+    if (
+      Object.keys(entry).some((key) => !["kind", "databankId", "documentId", "documentName", "chunkId", "documentContentHash", "contentHash"].includes(key))
+      || entry.kind !== record.kind
+      || typeof entry.databankId !== "string"
+      || entry.databankId.length === 0
+      || bytes(entry.databankId) > 256
+      || typeof entry.documentId !== "string"
+      || entry.documentId.length === 0
+      || bytes(entry.documentId) > 256
+      || typeof entry.documentName !== "string"
+      || entry.documentName.length === 0
+      || bytes(entry.documentName) > 256
+      || (entry.chunkId !== null && (typeof entry.chunkId !== "string" || bytes(entry.chunkId) > 256))
+      || (entry.documentContentHash !== null && (typeof entry.documentContentHash !== "string" || !/^[a-f0-9]{64}$/.test(entry.documentContentHash)))
+      || typeof entry.contentHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(entry.contentHash)
+    ) return false;
+  }
+  return true;
+}
+
 function isValidAssemblyMessageProvenance(value: unknown): value is AssemblyMessageProvenanceV1 {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
-  if (Object.keys(candidate).some((key) => !["kind", "sourceId", "sourceRevision", "sourceIndex", "loom"].includes(key))) return false;
+  if (Object.keys(candidate).some((key) => !["kind", "sourceId", "sourceRevision", "sourceIndex", "loom", "databank"].includes(key))) return false;
   if (
     (candidate.kind !== "block"
       && candidate.kind !== "history"
       && candidate.kind !== "world_info"
-      && candidate.kind !== "cognition")
+      && candidate.kind !== "cognition"
+      && candidate.kind !== "databank")
     || typeof candidate.sourceId !== "string"
     || candidate.sourceId.length === 0
     || bytes(candidate.sourceId) > 256
@@ -1739,13 +2020,16 @@ function isValidAssemblyMessageProvenance(value: unknown): value is AssemblyMess
     || !Number.isSafeInteger(candidate.sourceIndex)
     || (candidate.sourceIndex as number) < 0
   ) return false;
+  const databank = candidate.databank;
+  if (candidate.kind === "databank" && !isValidDatabankMessageProvenance(databank)) return false;
+  if (candidate.kind !== "databank" && databank !== undefined) return false;
   const loom = candidate.loom;
   if (loom === undefined) return true;
   if (!loom || typeof loom !== "object" || Array.isArray(loom)) return false;
   const record = loom as Record<string, unknown>;
-  if (Object.keys(record).some((key) => !["entryId", "bucket", "destination", "checkpoint", "source", "delivery", "effectiveText"].includes(key))) return false;
+  if (Object.keys(record).some((key) => !["entryId", "bucket", "destination", "checkpoint", "source", "condition", "effectiveText"].includes(key))) return false;
   const source = record.source;
-  const delivery = record.delivery;
+  const condition = record.condition;
   if (
     typeof record.entryId !== "string"
     || record.entryId.length === 0
@@ -1755,7 +2039,7 @@ function isValidAssemblyMessageProvenance(value: unknown): value is AssemblyMess
     || typeof record.effectiveText !== "string"
     || bytes(record.effectiveText) > HOST_PREPARATION_LIMITS_V1.maxOperationBytes
     || !source || typeof source !== "object" || Array.isArray(source)
-    || !delivery || typeof delivery !== "object" || Array.isArray(delivery)
+    || (condition !== undefined && (!condition || typeof condition !== "object" || Array.isArray(condition)))
   ) return false;
   const sourceRecord = source as Record<string, unknown>;
   if (
@@ -1768,10 +2052,14 @@ function isValidAssemblyMessageProvenance(value: unknown): value is AssemblyMess
     || !Number.isSafeInteger(sourceRecord.promptOrder)
     || (sourceRecord.promptOrder as number) < 0
   ) return false;
-  const deliveryRecord = delivery as Record<string, unknown>;
-  return deliveryRecord.delivery === "direct"
-    || (deliveryRecord.delivery === "condition_gated" && !!deliveryRecord.condition)
-    || (deliveryRecord.delivery === "on_demand" && !!deliveryRecord.request);
+  if (condition !== undefined) {
+    try {
+      canonical(condition, HOST_PREPARATION_LIMITS_V1.maxOperationBytes);
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function validateAssemblyPlanV1(plan: unknown, trustedLimits: PreparationLimitsV1): asserts plan is AssemblyPlanV1 {
@@ -1785,7 +2073,7 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
     "workPolicyMessages", "workspaceUsageMessages", "completionCriteriaMessages", "renderPolicyMessages",
     "loomPolicy", "loomBlocks",
     "children", "childDescriptors", "resultSlots", "activationEvidence", "tokenEvidence",
-    "profileOutputLimits", "inputRevisions", "inputRevisionSet", "contextPackSnapshot", "deltas", "deferredDeltas",
+    "profileOutputLimits", "inputRevisions", "inputRevisionSet", "deltas", "deferredDeltas",
     "seals", "privateEvidence", "snapshotId",
   ]);
   if (
@@ -1832,7 +2120,6 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
     || typeof candidate.limits !== "object"
     || !candidate.inputRevisions
     || !candidate.inputRevisionSet
-    || !candidate.contextPackSnapshot
     || typeof candidate.privateEvidence !== "object"
   ) {
     throw new AssemblyPlanValidationError("invalid_input", "Assembly plan is not closed");
@@ -2003,7 +2290,7 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
     if (
       Object.keys(record).some((key) => !cognitionEvidenceKeys.has(key))
       || record.kind !== "cognition_phase"
-      || (record.phase !== "WORK" && record.phase !== "RENDER")
+      || (record.phase !== "WORK" && record.phase !== "PREPARE_COMMIT" && record.phase !== "RENDER")
       || (record.section !== "workPolicy" && record.section !== "workspaceUsage" && record.section !== "completionCriteria" && record.section !== "renderPolicy")
       || typeof record.blockId !== "string"
       || record.blockId.length === 0
@@ -2128,7 +2415,7 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
     const revisionCollectionKeys = [
       "revisions", "entries", "target", "chat", "messages", "preset", "blocks", "config",
       "slotBinding", "connection", "endpoint", "credential", "participants", "worldLore",
-      "settings", "variables", "regex", "context", "acl", "cognition", "readiness",
+      "databank", "settings", "variables", "regex", "cognition", "readiness",
     ] as const;
     const allowedRevisionKeys = new Set(["version", "digest", ...revisionCollectionKeys]);
     const revisionKeys = new Set(["kind", "domain", "id", "revision", "digest"]);
@@ -2176,108 +2463,6 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
     || privateToken.snapshotId !== candidate.snapshotId
   ) {
     throw new AssemblyPlanValidationError("invalid_input", "Private evidence is not bound to the assembly plan");
-  }
-  const contextSnapshot = candidate.contextPackSnapshot;
-  const contextKeys = new Set(["version", "ownerId", "contextAclRevision", "candidates", "candidateInputRevisions"]);
-  const contextCandidateKeys = new Set([
-    "ownerId", "packId", "revisionId", "revision", "digest", "label", "summary", "source",
-    "targetId", "attachmentId", "attachmentRevision", "aclRevision", "byteCount", "tokenCount", "required", "order",
-  ]);
-  const contextRevisionKeys = new Set([
-    "kind", "ownerId", "packId", "revisionId", "revision", "digest", "source",
-    "targetId", "attachmentId", "attachmentRevision", "aclRevision",
-  ]);
-  const isContextRevision = (value: unknown): boolean =>
-    typeof value === "number"
-      ? Number.isSafeInteger(value) && value >= 0
-      : typeof value === "string" && value.length > 0 && bytes(value) <= 256;
-  if (
-    !contextSnapshot
-    || typeof contextSnapshot !== "object"
-    || Array.isArray(contextSnapshot)
-    || Object.keys(contextSnapshot).some((key) => !contextKeys.has(key))
-    || contextSnapshot.version !== 1
-    || typeof contextSnapshot.ownerId !== "string"
-    || contextSnapshot.ownerId.length === 0
-    || bytes(contextSnapshot.ownerId) > 256
-    || !isContextRevision(contextSnapshot.contextAclRevision)
-    || !Array.isArray(contextSnapshot.candidates)
-    || !Array.isArray(contextSnapshot.candidateInputRevisions)
-    || contextSnapshot.candidates.length > HOST_PREPARATION_LIMITS_V1.maxPromptBlocks
-    || contextSnapshot.candidateInputRevisions.length !== contextSnapshot.candidates.length
-  ) {
-    throw new AssemblyPlanValidationError("invalid_input", "Invalid context candidate snapshot");
-  }
-  for (const candidateEntry of contextSnapshot.candidates) {
-    const entry = candidateEntry as Record<string, unknown>;
-    if (
-      !candidateEntry
-      || typeof candidateEntry !== "object"
-      || Array.isArray(candidateEntry)
-      || Object.keys(entry).some((key) => !contextCandidateKeys.has(key))
-      || typeof entry.ownerId !== "string"
-      || entry.ownerId !== contextSnapshot.ownerId
-      || typeof entry.packId !== "string"
-      || entry.packId.length === 0
-      || bytes(entry.packId) > 256
-      || typeof entry.revisionId !== "string"
-      || entry.revisionId.length === 0
-      || bytes(entry.revisionId) > 256
-      || !Number.isSafeInteger(entry.revision)
-      || (entry.revision as number) < 0
-      || typeof entry.digest !== "string"
-      || entry.digest.length === 0
-      || bytes(entry.digest) > 256
-      || typeof entry.label !== "string"
-      || bytes(entry.label) > limits.maxOperationBytes
-      || !["account", "preset", "chat", "world_book"].includes(String(entry.source))
-      || (entry.targetId !== null && (typeof entry.targetId !== "string" || bytes(entry.targetId) > 256))
-      || (entry.attachmentId !== null && (typeof entry.attachmentId !== "string" || bytes(entry.attachmentId) > 256))
-      || (entry.attachmentRevision !== null && !isContextRevision(entry.attachmentRevision))
-      || !isContextRevision(entry.aclRevision)
-      || !Number.isSafeInteger(entry.byteCount)
-      || (entry.byteCount as number) < 0
-      || (entry.byteCount as number) > limits.maxOperationBytes
-      || !Number.isSafeInteger(entry.tokenCount)
-      || (entry.tokenCount as number) < 0
-      || (entry.tokenCount as number) > limits.maxOperationBytes
-      || typeof entry.required !== "boolean"
-      || !Number.isSafeInteger(entry.order)
-      || (entry.order as number) < 0
-    ) {
-      throw new AssemblyPlanValidationError("invalid_input", "Invalid context candidate");
-    }
-  }
-  for (const revisionEntry of contextSnapshot.candidateInputRevisions) {
-    const entry = revisionEntry as Record<string, unknown>;
-    if (
-      !revisionEntry
-      || typeof revisionEntry !== "object"
-      || Array.isArray(revisionEntry)
-      || Object.keys(entry).some((key) => !contextRevisionKeys.has(key))
-      || entry.kind !== "context_pack"
-      || typeof entry.ownerId !== "string"
-      || entry.ownerId !== contextSnapshot.ownerId
-      || typeof entry.packId !== "string"
-      || entry.packId.length === 0
-      || bytes(entry.packId) > 256
-      || typeof entry.revisionId !== "string"
-      || entry.revisionId.length === 0
-      || bytes(entry.revisionId) > 256
-      || !Number.isSafeInteger(entry.revision)
-      || (entry.revision as number) < 0
-      || typeof entry.digest !== "string"
-      || entry.digest.length === 0
-      || bytes(entry.digest) > 256
-      || !["account", "preset", "chat", "world_book"].includes(String(entry.source))
-      || (entry.targetId !== null && (typeof entry.targetId !== "string" || bytes(entry.targetId) > 256))
-      || (entry.attachmentId !== null && (typeof entry.attachmentId !== "string" || bytes(entry.attachmentId) > 256))
-      || (entry.attachmentRevision !== null && !isContextRevision(entry.attachmentRevision))
-      || !isContextRevision(entry.aclRevision)
-    ) {
-      throw new AssemblyPlanValidationError("invalid_input", "Invalid context candidate revision");
-
-    }
   }
   if (
     candidate.childDescriptors.length > limits.maxPromptBlocks
@@ -2626,13 +2811,12 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
   for (const [collectionIndex, collection] of phaseMessageCollections.entries()) {
     if (collection.length > limits.maxPromptBlocks * 16) throw new AssemblyPlanValidationError("limit_exceeded", "Cognition policy message limit exceeded");
     for (const message of collection) {
-      phaseMessageCount += 1;
       if (
         !message
         || typeof message !== "object"
         || Array.isArray(message)
         || Object.keys(message).some((key) => !messageKeys.has(key))
-      || !isValidAssemblyMessageProvenance(message.provenance)
+        || !isValidAssemblyMessageProvenance(message.provenance)
         || message.contentKind !== "segments"
         || !Array.isArray(message.segments)
         || (message.name !== undefined && (typeof message.name !== "string" || bytes(message.name) > 256))
@@ -2641,7 +2825,6 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
         || bytes(message.blockId) > 256
         || !Number.isSafeInteger(message.blockIndex)
         || message.blockIndex < 0
-        || phaseBlockIds.has(message.blockId)
       ) {
         throw new AssemblyPlanValidationError("invalid_input", "Invalid cognition policy message envelope");
       }
@@ -2652,7 +2835,6 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
       if (totalSegments > maxSegmentsTotal) {
         throw new AssemblyPlanValidationError("limit_exceeded", "Assembly total segment limit exceeded");
       }
-      phaseBlockIds.add(message.blockId);
       const loom = message.provenance.loom;
       const bucket = phaseBuckets[collectionIndex];
       const policyEntry = loom && bucket !== undefined
@@ -2665,10 +2847,15 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
         || loom.destination !== policyEntry.destination
         || loom.checkpoint !== policyEntry.checkpoint
         || canonical(loom.source) !== canonical(policyEntry.source)
-        || canonical(loom.delivery) !== canonical(policyEntry.delivery)
+        || canonical(loom.condition) !== canonical(policyEntry.condition)
       ) {
         throw new AssemblyPlanValidationError("invalid_input", "Cognition Loom provenance is not source-bound");
       }
+      const phaseEntryKey = `${loom.destination}\u0000${loom.entryId}`;
+      if (phaseBlockIds.has(phaseEntryKey)) {
+        throw new AssemblyPlanValidationError("invalid_input", "Duplicate cognition policy provenance");
+      }
+      phaseBlockIds.add(phaseEntryKey);
       for (const segment of message.segments) {
         if (
           !segment
@@ -2687,8 +2874,9 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
         }
         phaseLiteralBytes += segment.bytes;
       }
-      }
+      phaseMessageCount += 1;
     }
+  }
   if (candidate.providerMessages.length + phaseMessageCount > maxPlanMessages) {
     throw new AssemblyPlanValidationError("limit_exceeded", "Provider and cognition policy message limit exceeded");
   }
@@ -2720,7 +2908,7 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
   for (const [section, phase, collection] of [
     ["workPolicy", "WORK", candidate.workPolicyMessages],
     ["workspaceUsage", "WORK", candidate.workspaceUsageMessages],
-    ["completionCriteria", "WORK", candidate.completionCriteriaMessages],
+    ["completionCriteria", "PREPARE_COMMIT", candidate.completionCriteriaMessages],
     ["renderPolicy", "RENDER", candidate.renderPolicyMessages],
   ] as const) {
     for (let order = 0; order < collection.length; order++) {
@@ -2797,7 +2985,6 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
     || canonical(plan.limits) !== canonical(snapshot.limits)
     || canonical(plan.inputRevisionSet) !== canonical(snapshot.inputRevisionSet)
     || canonical(plan.inputRevisions) !== canonical(snapshot.inputRevisionSet)
-    || canonical(plan.contextPackSnapshot) !== canonical(snapshot.contextPackSnapshot)
   ) {
     throw new AssemblyPlanValidationError("invalid_input", "Assembly plan is not bound to the requested snapshot");
   }
@@ -2825,6 +3012,12 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   }
   if (canonical(plan.customPhasePlan) !== canonical(expectedPlan.customPhasePlan)) {
     throw new AssemblyPlanValidationError("invalid_input", "Custom phase plan is not an exact frozen source projection");
+  }
+  if (canonical(plan.loomPolicy) !== canonical(expectedPlan.loomPolicy)) {
+    throw new AssemblyPlanValidationError("invalid_input", "Loom policy is not an exact frozen source projection");
+  }
+  if (canonical(plan.loomBlocks) !== canonical(expectedPlan.loomBlocks)) {
+    throw new AssemblyPlanValidationError("invalid_input", "Loom prompt blocks are not exact frozen source projections");
   }
   const config = parserConfig(configFor(snapshot, undefined));
   const phaseRefs = cognitionPhaseRefs(snapshot, config, expectedPlan.customPhasePlan);
@@ -3092,7 +3285,7 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   const policySections = [
     ["workPolicy", "WORK", phaseRefs.workPolicy, plan.workPolicyMessages],
     ["workspaceUsage", "WORK", phaseRefs.workspaceUsage, plan.workspaceUsageMessages],
-    ["completionCriteria", "WORK", phaseRefs.completionCriteria, plan.completionCriteriaMessages],
+    ["completionCriteria", "PREPARE_COMMIT", phaseRefs.completionCriteria, plan.completionCriteriaMessages],
     ["renderPolicy", "RENDER", phaseRefs.renderPolicy, plan.renderPolicyMessages],
   ] as const;
   const expectedCognition: Array<Record<string, unknown>> = [];
@@ -3100,7 +3293,7 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
     if (messages.length !== refs.length) throw new AssemblyPlanValidationError("invalid_input", "Cognition policy message count changed");
     for (let order = 0; order < refs.length; order += 1) {
       const ref = refs[order]!;
-      const source = snapshot.contextPacks.cognitionSource;
+      const source = snapshot.agentCognition.cognitionSource;
       const sourceBlock = source?.blocks.find((block) => block.blockId === ref.blockId);
       const message = messages[order]!;
       if (

@@ -38,7 +38,7 @@ import { settingsApi } from '@/api/settings'
 import { notificationSoundsApi } from '@/api/notification-sounds'
 import { unlockNotificationAudio } from '@/lib/notificationAudio'
 import { webSearchApi, type WebSearchSettingsInput, type WebSearchTestResponse } from '@/api/web-search'
-import type { DrawerSettings, GuidedGeneration, QuickReplySet } from '@/types/store'
+import type { DrawerSettings, GuidedGeneration, LongMessageCollapsePreset, QuickReplySet } from '@/types/store'
 import type { EmbeddingConfig, ChatMemorySettings } from '@/types/api'
 import type { WorldBookVectorPresetMode, WorldBookVectorSettings } from '@/types/world-book-vector-settings'
 import AccountSettings from '@/components/settings/AccountSettings'
@@ -55,7 +55,6 @@ import McpServerSettings from '@/components/settings/mcp-servers/McpServerSettin
 import DataPortability from '@/components/settings/DataPortability'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 import AgentRuntimeSettings from '@/components/settings/AgentRuntimeSettings'
-import ContextLibrarySettings from '@/components/settings/ContextLibrarySettings'
 import CollapsibleSection from '@/components/shared/CollapsibleSection'
 import ModelCombobox from '@/components/panels/connection-manager/ModelCombobox'
 import { getVisibleSettingsTabs, sectionAnchorId, SETTINGS_TABS } from '@/lib/settings-tab-registry'
@@ -281,8 +280,6 @@ function SettingsView({ view }: { view: string }) {
       coreContent = <MemoryCortexSettings />; break
     case 'agentRuntime':
       coreContent = <AgentRuntimeSettings />; break
-    case 'contextLibrary':
-      coreContent = <ContextLibrarySettings />; break
     case 'notifications':
       coreContent = <NotificationSettings />; break
     case 'voice':
@@ -343,6 +340,10 @@ function DisplaySettings() {
   const drawerSettings = useStore((s) => s.drawerSettings)
   const modalWidthMode = useStore((s) => s.modalWidthMode)
   const modalMaxWidth = useStore((s) => s.modalMaxWidth)
+  const longMessageCollapseEnabled = useStore((s) => s.longMessageCollapseEnabled)
+  const longMessageCollapsePreset = useStore((s) => s.longMessageCollapsePreset)
+  const longMessageCollapseCustomHeight = useStore((s) => s.longMessageCollapseCustomHeight)
+  const longMessageCollapseDepth = useStore((s) => s.longMessageCollapseDepth)
   const landingPageChatsDisplayed = useStore((s) => s.landingPageChatsDisplayed)
   const landingPageLayoutMode = useStore((s) => s.landingPageLayoutMode)
   const landingPageGalleryWidth = useStore((s) => s.landingPageGalleryWidth)
@@ -366,7 +367,73 @@ function DisplaySettings() {
     <div className={styles.settingsSection}>
       <LanguageSwitcher />
 
-      <h3 id={sectionAnchorId('display', 'modalWidth')} className={styles.sectionTitle} style={{ marginTop: 16 }}>{t('display.modalWidth.title')}</h3>
+      <h3 id={sectionAnchorId('display', 'longMessages')} className={styles.sectionTitle} style={{ marginTop: 16 }}>{t('display.longMessages.title')}</h3>
+      <p className={styles.helperText}>
+        {t('display.longMessages.helper')}
+      </p>
+
+      <Toggle.Checkbox
+        checked={longMessageCollapseEnabled}
+        onChange={(checked) => setSetting('longMessageCollapseEnabled', checked)}
+        label={t('display.longMessages.enabled')}
+        hint={t('display.longMessages.enabledHint')}
+      />
+
+      {longMessageCollapseEnabled && (
+        <>
+          <div className={styles.field}>
+            <label className={styles.fieldLabel}>{t('display.longMessages.height')}</label>
+            <div className={styles.segmented}>
+              {(['compact', 'comfortable', 'tall', 'custom'] as LongMessageCollapsePreset[]).map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  className={clsx(styles.segmentedBtn, longMessageCollapsePreset === preset && styles.segmentedBtnActive)}
+                  onClick={() => setSetting('longMessageCollapsePreset', preset)}
+                >
+                  {t(`display.longMessages.${preset}`)}
+                </button>
+              ))}
+            </div>
+          </div>
+          {longMessageCollapsePreset === 'custom' && (
+            <div className={styles.field}>
+              <label className={styles.fieldLabel}>{t('display.longMessages.customHeight')}</label>
+              <div className={styles.rangeRow}>
+                <input
+                  type="range"
+                  className={styles.rangeSlider}
+                  min={100}
+                  max={4000}
+                  step={1}
+                  value={longMessageCollapseCustomHeight}
+                  aria-label={t('display.longMessages.customHeight')}
+                  onChange={(event) => setSetting(
+                    'longMessageCollapseCustomHeight',
+                    Number(event.currentTarget.value),
+                  )}
+                />
+                <span className={styles.rangeValue}>{longMessageCollapseCustomHeight}px</span>
+              </div>
+              <span className={styles.helperText}>{t('display.longMessages.customHeightHint')}</span>
+            </div>
+          )}
+          <div className={styles.field}>
+            <label className={styles.fieldLabel}>{t('display.longMessages.depth')}</label>
+            <NumericInput
+              className={styles.numberInput}
+              min={0}
+              max={500}
+              value={longMessageCollapseDepth}
+              integer
+              onChange={(value) => setSetting('longMessageCollapseDepth', Math.max(0, value ?? 0))}
+            />
+            <span className={styles.helperText}>{t('display.longMessages.depthHint')}</span>
+          </div>
+        </>
+      )}
+
+      <h3 id={sectionAnchorId('display', 'modalWidth')} className={styles.sectionTitle} style={{ marginTop: 12 }}>{t('display.modalWidth.title')}</h3>
       <p className={styles.helperText}>
         {t('display.modalWidth.helper')}
       </p>

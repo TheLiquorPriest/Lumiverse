@@ -69,7 +69,6 @@ function initInstallerTestDb(): void {
       main_lore_scope TEXT NOT NULL,
       phase_policy_json TEXT NOT NULL,
       cognition_policy_json TEXT NOT NULL,
-      context_policy_json TEXT NOT NULL,
       task_policy_json TEXT NOT NULL,
       workspace_policy_json TEXT NOT NULL,
       state TEXT NOT NULL,
@@ -145,6 +144,27 @@ function installPayload(
     },
   };
 }
+function canonicalPromptBlock(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: "block-1",
+    name: "Block 1",
+    content: "ordinary content",
+    role: "system",
+    enabled: true,
+    position: "pre_history",
+    depth: 0,
+    marker: null,
+    color: null,
+    isLocked: false,
+    injectionTrigger: [],
+    ...overrides,
+  };
+}
+
+function presetCount(userId = USER_ID): number {
+  const row = getDb().query("SELECT COUNT(*) AS count FROM presets WHERE user_id = ?").get(userId) as { count: number };
+  return row.count;
+}
 
 function portableRuntimeEnvelope(): Record<string, unknown> {
   return {
@@ -161,9 +181,6 @@ function portableRuntimeEnvelope(): Record<string, unknown> {
       profiles: [],
       connectionSlots: [],
     },
-    contextPacks: [],
-    contextSelections: [],
-    contextRules: [],
     taskTemplates: [],
   };
 }
@@ -453,6 +470,13 @@ describe("LumiHub preset installer metadata", () => {
           id: "category-old",
           name: "Old category",
           content: "",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          color: null,
+          isLocked: false,
+          injectionTrigger: [],
           marker: "category",
           categoryMode: "checkbox",
         },
@@ -460,6 +484,14 @@ describe("LumiHub preset installer metadata", () => {
           id: "block-1",
           name: "Original prompt",
           content: "Original content",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          marker: null,
+          color: null,
+          isLocked: false,
+          injectionTrigger: [],
           group: "category-old",
           variables: [
             { id: "var-text", name: "instruction", label: "Instruction", type: "text", defaultValue: "Default" },
@@ -530,12 +562,27 @@ describe("LumiHub preset installer metadata", () => {
           id: "category-new",
           name: "Adjusted category",
           content: "",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          color: null,
+          isLocked: false,
+          injectionTrigger: [],
           marker: "category",
           categoryMode: "radio",
         },
         {
           id: "block-1",
           name: "Updated prompt",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          marker: null,
+          color: null,
+          isLocked: false,
+          injectionTrigger: [],
           content: "Updated content",
           group: "category-new",
           variables: [
@@ -571,6 +618,14 @@ describe("LumiHub preset installer metadata", () => {
           id: "block-2",
           name: "New prompt",
           content: "New block content",
+          role: "system",
+          enabled: true,
+          position: "pre_history",
+          depth: 0,
+          marker: null,
+          color: null,
+          isLocked: false,
+          injectionTrigger: [],
           group: "category-new",
           variables: [
             { id: "var-new", name: "newVariable", label: "New", type: "text", defaultValue: "new" },
@@ -680,8 +735,23 @@ describe("LumiHub preset installer metadata", () => {
     const digest = createHash("sha256").update(secret, "utf8").digest("hex");
     const payload = installPayload("hub-sealed", {
       name: "Sealed preset",
-      blocks: [{ id: "private", name: "Private", content: "{{presetBlock::dialogue.frame}}" }],
+      blocks: [canonicalPromptBlock({
+        id: "private",
+        name: "Private",
+        content: "{{presetBlock::dialogue.frame}}",
+        sealed: true,
+        sealedKey: "dialogue.frame",
+        sealedSource: "lumihub",
+        sealedOriginPresetId: "hub-sealed",
+        sealedOriginVersion: "1.0.0",
+        sealedSha256: digest,
+      })],
     });
+    payload.presetData.preset.portableSealedPreset = {
+      hubPresetId: "hub-sealed",
+      hubPresetVersion: "1.0.0",
+      blocks: [{ key: "dialogue.frame", sha256: digest }],
+    };
     payload.sealedPreset = undefined;
     payload.presetData.compatibility = {
       lumiverse: {
@@ -711,7 +781,222 @@ describe("LumiHub preset installer metadata", () => {
       sealedSource: "lumihub",
       sealedSha256: digest,
     })]);
+    expect(saved?.metadata.portableSealedPreset).toEqual({
+      hubPresetId: "hub-sealed",
+      hubPresetVersion: "1.0.0",
+      blocks: [{ key: "dialogue.frame", sha256: digest }],
+    });
   });
+  test("rejects sealed bypasses and preserves create/update rows", async () => {
+    const secret = "private content";
+    const digest = createHash("sha256").update(secret, "utf8").digest("hex");
+    const exactBlock = canonicalPromptBlock({
+      content: "{{presetBlock::private}}",
+      sealed: true,
+      sealedKey: "private",
+      sealedSource: "lumihub",
+      sealedSha256: digest,
+    });
+
+    const failures: Array<{
+      label: string;
+      block: Record<string, unknown>;
+      malformedManifest?: boolean;
+      portableDescriptor?: unknown;
+      nestedPortableDescriptor?: unknown;
+      dependencies?: InstallPresetDependencies;
+    }> = [
+      {
+        label: "sealed-plaintext",
+        block: canonicalPromptBlock({ content: secret, sealed: true }),
+      },
+      {
+        label: "sealed-source-plaintext",
+        block: canonicalPromptBlock({ content: secret, sealedSource: "lumihub" }),
+      },
+      {
+        label: "malformed-placeholder-key",
+        block: canonicalPromptBlock({
+          content: "{{presetBlock::private}}",
+          sealed: true,
+          sealedKey: "foreign",
+          sealedSource: "lumihub",
+        }),
+      },
+      {
+        label: "foreign-sealed-source",
+        block: canonicalPromptBlock({
+          content: "{{presetBlock::private}}",
+          sealed: true,
+          sealedSource: "foreign",
+        }),
+      },
+      {
+        label: "foreign-sealed-origin",
+        block: canonicalPromptBlock({
+          content: "{{presetBlock::private}}",
+          sealed: true,
+          sealedKey: "private",
+          sealedSource: "lumihub",
+          sealedOriginPresetId: "foreign-preset",
+        }),
+      },
+      {
+        label: "malformed-descriptor",
+        block: exactBlock,
+        malformedManifest: true,
+      },
+      {
+        label: "portable-descriptor-id-mismatch",
+        block: exactBlock,
+        portableDescriptor: {
+          hubPresetId: "foreign-preset",
+          hubPresetVersion: "1.0.0",
+          blocks: [{ key: "private", sha256: digest }],
+        },
+      },
+      {
+        label: "malformed-portable-descriptor",
+        block: exactBlock,
+        portableDescriptor: {
+          hubPresetId: "hub-sealed-case",
+          hubPresetVersion: "1.0.0",
+          blocks: [{ key: "private", sha256: digest }],
+          extra: true,
+        },
+      },
+      {
+        label: "contradictory-descriptor-carriers",
+        block: exactBlock,
+        portableDescriptor: {
+          hubPresetId: "hub-sealed-case",
+          hubPresetVersion: "1.0.0",
+          blocks: [{ key: "private", sha256: digest }],
+        },
+        nestedPortableDescriptor: {
+          hubPresetId: "foreign-preset",
+          hubPresetVersion: "1.0.0",
+          blocks: [{ key: "private", sha256: digest }],
+        },
+      },
+      {
+        label: "resolver-digest-mismatch",
+        block: exactBlock,
+        dependencies: {
+          resolveSealedBlocks: async () => ({ private: "tampered content" }),
+        },
+      },
+    ];
+
+    const makePayload = (presetId: string, failure: (typeof failures)[number]): InstallPresetPayload => {
+      const payload = installPayload(presetId, {
+        name: `Failure ${failure.label}`,
+        blocks: [failure.block],
+      });
+      payload.presetSlug = `creator/${presetId}`;
+      payload.sealedPreset = failure.malformedManifest
+        ? { version: "1.0.0", blocks: [{ key: "private", sha256: "invalid" }] }
+        : { version: "1.0.0", blocks: [{ key: "private", sha256: digest }] };
+      if (failure.portableDescriptor !== undefined) {
+        payload.presetData.preset.portableSealedPreset = failure.portableDescriptor;
+      }
+      if (failure.nestedPortableDescriptor !== undefined) {
+        payload.presetData.preset.metadata = {
+          portableSealedPreset: failure.nestedPortableDescriptor,
+        };
+      }
+      return payload;
+    };
+
+    for (const [index, failure] of failures.entries()) {
+      const existingId = `hub-sealed-update-${index}`;
+      const seedPayload = installPayload(existingId, {
+        name: "Stable preset",
+        blocks: [],
+      });
+      seedPayload.presetSlug = `creator/${existingId}`;
+      const seeded = await installPreset(`seed-${failure.label}`, seedPayload);
+      expect(seeded.success).toBe(true);
+      const before = getPreset(USER_ID, seeded.presetId!)!;
+      const expectedCount = index + 1;
+
+      const created = await installPreset(
+        `create-${failure.label}`,
+        makePayload(`hub-sealed-create-${index}`, failure),
+        USER_ID,
+        failure.dependencies,
+      );
+      expect(created.success).toBe(false);
+      expect(presetCount()).toBe(expectedCount);
+
+      const updated = await installPreset(
+        `update-${failure.label}`,
+        makePayload(existingId, failure),
+        USER_ID,
+        failure.dependencies,
+      );
+      expect(updated.success).toBe(false);
+      expect(getPreset(USER_ID, before.id)).toEqual(before);
+      expect(presetCount()).toBe(expectedCount);
+    }
+  });
+  test("rejects duplicate, empty, and malformed unsealed prompt blocks before mutation", async () => {
+    const failures: Array<{ label: string; blocks: Record<string, unknown>[] }> = [
+      {
+        label: "duplicate",
+        blocks: [
+          canonicalPromptBlock({ id: "duplicate" }),
+          canonicalPromptBlock({ id: "duplicate", name: "Duplicate copy" }),
+        ],
+      },
+      {
+        label: "empty",
+        blocks: [canonicalPromptBlock({ id: "" })],
+      },
+      {
+        label: "malformed",
+        blocks: [canonicalPromptBlock({ unexpected: true })],
+      },
+    ];
+
+    for (const [index, failure] of failures.entries()) {
+      const existingId = `hub-unsealed-update-${index}`;
+      const seedPayload = installPayload(existingId, {
+        name: "Stable preset",
+        blocks: [],
+      });
+      seedPayload.presetSlug = `creator/${existingId}`;
+      const seeded = await installPreset(`seed-unsealed-${failure.label}`, seedPayload);
+      expect(seeded.success).toBe(true);
+      const before = getPreset(USER_ID, seeded.presetId!)!;
+      const expectedCount = index + 1;
+
+      const makePayload = (presetId: string): InstallPresetPayload => {
+        const payload = installPayload(presetId, {
+          name: `Malformed ${failure.label}`,
+          blocks: failure.blocks,
+        });
+        payload.presetSlug = `creator/${presetId}`;
+        return payload;
+      };
+
+      const created = await installPreset(
+        `create-unsealed-${failure.label}`,
+        makePayload(`hub-unsealed-create-${index}`),
+      );
+      expect(created.success).toBe(false);
+      expect(presetCount()).toBe(expectedCount);
+
+      const updated = await installPreset(
+        `update-unsealed-${failure.label}`,
+        makePayload(existingId),
+      );
+      expect(updated.success).toBe(false);
+      expect(getPreset(USER_ID, before.id)).toEqual(before);
+      expect(presetCount()).toBe(expectedCount);
+    }
+  });
+
 
   test("fails closed instead of saving an unresolved sealed placeholder", async () => {
     const payload = installPayload("hub-broken-sealed", {

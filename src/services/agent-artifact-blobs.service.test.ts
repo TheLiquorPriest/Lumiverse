@@ -579,8 +579,69 @@ describe("agent artifact blob store", () => {
     expect(getArtifactReconcileStatus().pendingUsers).toBe(0);
     expect(await Bun.file(handle.storagePath).exists()).toBe(false);
   });
+  test("keeps global reconciliation unhealthy when a bounded pass leaves durable rows", async () => {
+    const maxRows = 128;
+    for (let index = 0; index <= maxRows; index++) {
+      await store.stageArtifact(writeInput(new TextEncoder().encode(`bounded global ${index}`)));
+    }
+
+    const first = await store.reconcile({ maxRows });
+    expect(first.inspected).toBe(maxRows);
+    expect(first.removed).toBe(maxRows);
+    expect(first.pendingUsers).toBe(0);
+    expect(first.pendingOverflow).toBe(false);
+    expect(first.healthy).toBe(false);
+    expect(getArtifactReconcileStatus().healthy).toBe(false);
+
+    const second = await store.reconcile({ maxRows });
+    expect(second.inspected).toBe(1);
+    expect(second.removed).toBe(1);
+    expect(second.healthy).toBe(true);
+    expect(getArtifactReconcileStatus().healthy).toBe(true);
+  });
+  test("advances global reconciliation past a retained bounded page", async () => {
+    const maxRows = 128;
+    for (let index = 0; index <= maxRows; index++) {
+      const handle = await store.stageArtifact(writeInput(new TextEncoder().encode(`bounded retained ${index}`)));
+      await insertWorkspaceReference(handle);
+    }
+
+    const first = await store.reconcile({ maxRows });
+    expect(first.inspected).toBe(maxRows);
+    expect(first.retained).toBe(maxRows);
+    expect(first.pendingUsers).toBe(0);
+    expect(first.healthy).toBe(false);
+
+    const second = await store.reconcile({ maxRows });
+    expect(second.inspected).toBe(1);
+    expect(second.retained).toBe(1);
+    expect(second.healthy).toBe(true);
+    expect(getArtifactReconcileStatus().healthy).toBe(true);
+  });
 
 
+  test("resets global continuation when the database authority is replaced", async () => {
+    const maxRows = 128;
+    for (let index = 0; index <= maxRows; index++) {
+      await store.stageArtifact(writeInput(new TextEncoder().encode(`authority replacement ${index}`)));
+    }
+    const first = await store.reconcile({ maxRows });
+    expect(first.healthy).toBe(false);
+
+    const replacementDb = new Database(":memory:");
+    const replacementRoot = await mkdtemp(join(tmpdir(), "lumiverse-agent-artifacts-replacement-"));
+    try {
+      await runMigrations(replacementDb);
+      const replacementStore = new ArtifactBlobStore({ db: replacementDb, rootDir: replacementRoot, now: () => NOW_MS });
+      const replacement = await replacementStore.reconcile({ maxRows });
+      expect(replacement.inspected).toBe(0);
+      expect(replacement.healthy).toBe(true);
+      expect(getArtifactReconcileStatus().healthy).toBe(true);
+    } finally {
+      replacementDb.close();
+      await rm(replacementRoot, { recursive: true, force: true });
+    }
+  });
   test("enforces MIME and per-artifact byte caps before allocating filesystem state", async () => {
     const bounded = new ArtifactBlobStore({ db, rootDir, now: () => NOW_MS, limits: { maxArtifactBytes: 2 } });
     await expect(bounded.stageArtifact(writeInput(new Uint8Array([1, 2, 3])))).rejects.toMatchObject({ code: "artifact_size_limit_exceeded" });

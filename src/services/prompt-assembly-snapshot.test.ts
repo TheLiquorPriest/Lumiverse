@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { hashContextPackContent } from "../types/agent-context-packs";
 import {
   buildGenerationAssemblySnapshot,
   SnapshotLimitError,
@@ -22,10 +21,6 @@ import {
 import { parseAgenticPreprocessingResponseV1 } from "./agentic-preprocessing-worker-client";
 import type { ActiveIsolateJob } from "./isolate-pool";
 import { freezeCognitionGraph } from "./agent-cognition.service";
-import {
-  ContextPackSnapshotAccessError,
-  freezeContextPackCandidateSnapshot,
-} from "./agent-context-tools.service";
 import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 
 function schema(): Database {
@@ -40,13 +35,6 @@ function schema(): Database {
   db.run("CREATE TABLE regex_scripts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, find_regex TEXT NOT NULL, replace_string TEXT NOT NULL, actions TEXT NOT NULL, flags TEXT NOT NULL, placement TEXT NOT NULL, scope TEXT NOT NULL, scope_id TEXT, target TEXT NOT NULL, trim_strings TEXT NOT NULL, disabled INTEGER NOT NULL, sort_order INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   db.run("CREATE TABLE world_books (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, metadata TEXT NOT NULL, updated_at INTEGER NOT NULL)");
   db.run("CREATE TABLE world_book_entries (id TEXT PRIMARY KEY, world_book_id TEXT NOT NULL, key TEXT NOT NULL, keysecondary TEXT NOT NULL, content TEXT NOT NULL, comment TEXT NOT NULL, position INTEGER NOT NULL, depth INTEGER NOT NULL, role TEXT, order_value INTEGER NOT NULL, disabled INTEGER NOT NULL, constant INTEGER NOT NULL, sticky INTEGER NOT NULL, cooldown INTEGER NOT NULL, delay INTEGER NOT NULL, vector_index_status TEXT NOT NULL, updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_account_state (user_id TEXT PRIMARY KEY, context_acl_revision INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_packs (user_id TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL, visibility TEXT NOT NULL, state TEXT NOT NULL, latest_revision INTEGER NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_context_pack_revisions (user_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_digest TEXT NOT NULL, token_count INTEGER NOT NULL, byte_count INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, created_by TEXT NOT NULL)");
-  db.run("CREATE TABLE agent_context_pack_acls (user_id TEXT NOT NULL, pack_id TEXT NOT NULL, principal_user_id TEXT NOT NULL, permission TEXT NOT NULL)");
-  db.run("CREATE TABLE agent_preset_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, preset_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_chat_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, chat_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
-  db.run("CREATE TABLE agent_world_book_context_pack_attachments (user_id TEXT NOT NULL, attachment_id TEXT NOT NULL, world_book_id TEXT NOT NULL, pack_id TEXT NOT NULL, revision INTEGER NOT NULL, position INTEGER NOT NULL, required INTEGER NOT NULL, state TEXT NOT NULL, provenance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
   return db;
 }
 
@@ -87,72 +75,6 @@ function nestedData(depth: number): Record<string, unknown> {
   for (let index = 0; index < depth; index += 1) value = { next: value };
   return value;
 }
-function contextSnapshot() {
-  return freezeContextPackCandidateSnapshot({
-    ownerId: "user-1",
-    contextAclRevision: 3,
-    candidates: [
-      {
-        ownerId: "user-1",
-        packId: "pack-z",
-        revisionId: "pack-z@2",
-        revision: 2,
-        digest: "digest-z",
-        label: "Zeta",
-        summary: "z",
-        source: "chat",
-        targetId: "chat-1",
-        attachmentId: "attachment-z",
-        attachmentRevision: JSON.stringify(["user-1", "pack-z", 2, "chat", "chat-1", "attachment-z", 1, 2, 0, "active"]),
-        aclRevision: 3,
-        byteCount: 8,
-        tokenCount: 2,
-        required: false,
-        order: 2000,
-      },
-      {
-        ownerId: "user-1",
-        packId: "pack-a",
-        revisionId: "pack-a@1",
-        revision: 1,
-        digest: "digest-a",
-        label: "Alpha",
-        summary: "a",
-        source: "preset",
-        targetId: "preset-1",
-        attachmentId: "attachment-a",
-        attachmentRevision: JSON.stringify(["user-1", "pack-a", 1, "preset", "preset-1", "attachment-a", 1, 1, 1, "active"]),
-        aclRevision: 3,
-        byteCount: 4,
-        tokenCount: 1,
-        required: true,
-        order: 1001,
-      },
-    ],
-  });
-}
-function cognitionGraph(
-  ruleRequired = true,
-  packId = "pack-a",
-  ruleId = "rule_a",
-  revisionId = "pack-a@1",
-) {
-  return freezeCognitionGraph({
-    version: 1,
-    policies: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
-    templates: [],
-    contextRules: [{
-      id: ruleId,
-      packId,
-      revisionId,
-      required: ruleRequired,
-    }],
-  }, cognitionSource());
-}
-
-function cognitionSource() {
-  return { presetRevision: 7, blocks: [] };
-}
 
 function seed(db: Database): void {
   const blocks = [
@@ -172,56 +94,14 @@ function seed(db: Database): void {
   db.query("INSERT INTO world_book_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run("entry-2", "book-2", JSON.stringify(["two"]), "[]", "two", "Two", 0, 4, "system", 1, 0, 1, 0, 0, 0, "not_enabled", 1, 1);
   db.query("INSERT INTO regex_scripts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run("regex-1", "user-1", "safe", "foo", "bar", "[]", "gi", JSON.stringify(["ai_output"]), "global", null, JSON.stringify(["prompt"]), "[]", 0, 0, 1, 1);
   db.query("INSERT INTO regex_scripts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run("regex-invalid", "user-1", "invalid", "[", "", "[]", "gi", JSON.stringify(["ai_output"]), "global", null, JSON.stringify(["prompt"]), "[]", 0, 1, 1, 1);
-  db.query("INSERT INTO agent_context_account_state VALUES (?, ?, ?)").run("user-1", 3, 1);
-  const contextPacks = [
-    ["pack-a", "Alpha", "a", "private", "active", 1, "digest-a", 1, 4],
-    ["pack-z", "Zeta", "z", "private", "active", 2, "digest-z", 2, 8],
-    ["pack-account", "Account", "account", "private", "active", 1, "digest-account", 1, 4],
-    ["pack-rule", "Rule", "rule", "private", "active", 2, "digest-rule", 2, 8],
-  ] as const;
-  for (const [packId, name, description, visibility, state, latestRevision, digest, tokenCount, byteCount] of contextPacks) {
-    db.query("INSERT INTO agent_context_packs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-      "user-1", packId, name, description, visibility, state, latestRevision, JSON.stringify({ kind: "local" }), 1, 1,
-    );
-    db.query("INSERT INTO agent_context_pack_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-      "user-1", packId, latestRevision, "[]", digest, tokenCount, byteCount, "active", JSON.stringify({ kind: "local" }), 1, "user-1",
-    );
-  }
-  db.query("INSERT INTO agent_context_pack_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-    "user-1", "pack-z", 1, "[]", "digest-z-old", 1, 4, "active", JSON.stringify({ kind: "local" }), 1, "user-1",
-  );
-  db.query("INSERT INTO agent_context_pack_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-    "user-1", "pack-rule", 1, "[]", "digest-rule-old", 1, 4, "active", JSON.stringify({ kind: "local" }), 1, "user-1",
-  );
-  db.query("INSERT INTO agent_preset_context_pack_attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-    "user-1", "attachment-a", "preset-1", "pack-a", 1, 1, 1, "active", JSON.stringify({ kind: "local" }), 1, 1,
-  );
-  db.query("INSERT INTO agent_chat_context_pack_attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
-    "user-1", "attachment-z", "chat-1", "pack-z", 2, 2, 0, "active", JSON.stringify({ kind: "local" }), 1, 1,
-  );
-}
 
-function seedCanonicalContextDb(db: Database): void {
-  db.run("DELETE FROM agent_preset_context_pack_attachments");
-  db.run("DELETE FROM agent_chat_context_pack_attachments");
-  db.run("DELETE FROM agent_world_book_context_pack_attachments");
-  db.run("DELETE FROM agent_context_pack_acls");
-  db.run("DELETE FROM agent_context_pack_revisions");
-  db.run("DELETE FROM agent_context_packs");
-  db.run("DELETE FROM agent_context_account_state");
-  const serialized = "[]";
-  const digest = hashContextPackContent(serialized);
-  db.query("INSERT INTO agent_context_account_state VALUES (?, ?, ?)").run("user-1", 11, 1);
-  db.query("INSERT INTO agent_context_packs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run("user-1", "pack-db", "Database Pack", "", "private", "active", 1, JSON.stringify({ kind: "local" }), 1, 1);
-  db.query("INSERT INTO agent_context_pack_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run("user-1", "pack-db", 1, serialized, digest, 0, 2, "active", JSON.stringify({ kind: "local" }), 1, "user-1");
-  db.query("INSERT INTO agent_preset_context_pack_attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run("user-1", "attachment-db", "preset-1", "pack-db", 1, 0, 1, "active", JSON.stringify({ kind: "local" }), 1, 1);
-}
 
+}
 describe("GenerationAssemblySnapshotV1", () => {
   test("captures one bounded view, complete revisions, deterministic lore, and no extension data", async () => {
     const db = schema();
     seed(db);
-    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", connectionId: "connection-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", connectionId: "connection-1", agentConfig: config(), db });
     expect(snapshot.assemblySurface).toBe("WORK");
     db.query("UPDATE messages SET content = ? WHERE id = ?").run("changed after snapshot", "message-1");
     expect(snapshot.messages[0]?.content).toBe("hello");
@@ -229,9 +109,21 @@ describe("GenerationAssemblySnapshotV1", () => {
     expect(snapshot.regexScripts.map((script) => script.id)).toEqual(["regex-1"]);
     expect(snapshot.extensionData).toBeNull();
     expect(snapshot.ambientSpindleData).toBeNull();
+    expect(snapshot.agentCognition).toMatchObject({
+      schema: "present",
+      loomPolicy: {
+        version: 1,
+        workPolicy: [],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      },
+      cognitionGraph: null,
+      cognitionSource: null,
+    });
     expect(snapshot.inputRevisionSet.entries.map((item) => item.kind)).toEqual(expect.arrayContaining([
       "target", "chat", "message", "preset", "preset_block", "config", "slot_binding", "connection", "endpoint", "credential",
-      "persona", "character", "world_lore", "settings", "macro_variables", "regex", "context_pack", "context_attachment", "context_acl", "cognition_policy", "runtime_epoch", "readiness",
+      "persona", "character", "world_lore", "settings", "macro_variables", "regex", "cognition_policy", "runtime_epoch", "readiness",
     ]));
     db.close();
   });
@@ -239,291 +131,7 @@ describe("GenerationAssemblySnapshotV1", () => {
   test("lowers test caps and rejects oversized input before strict preparation", async () => {
     const db = schema();
     seed(db);
-    expect(() => buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db, limits: { inputBytes: 2 } })).toThrow(SnapshotLimitError);
-    db.close();
-  });
-  test("sorts frozen context candidates and rejects duplicate revisions", async () => {
-    const frozen = contextSnapshot();
-    expect(frozen.candidates.map((candidate) => candidate.packId)).toEqual(["pack-a", "pack-z"]);
-    expect(frozen.candidateInputRevisions.map((revision) => revision.packId)).toEqual(["pack-a", "pack-z"]);
-    expect(() => freezeContextPackCandidateSnapshot({
-      ownerId: "user-1",
-      contextAclRevision: 3,
-      candidates: [...frozen.candidates, frozen.candidates[0]!],
-    })).toThrow("duplicate context candidate");
-  });
-  test("rejects forged context scope and stale candidate identity", async () => {
-    const db = schema();
-    seed(db);
-    const original = contextSnapshot();
-    const forgedScope = {
-      ...original,
-      candidates: [
-        { ...original.candidates[0]!, targetId: "other-chat" },
-        original.candidates[1]!,
-      ],
-    };
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      contextPackSnapshot: forgedScope,
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    })).toThrow(/scope mismatch/i);
-    const staleIdentity = {
-      ...original,
-      candidateInputRevisions: original.candidateInputRevisions.map((revision, index) =>
-        index === 0 ? { ...revision, digest: "stale-digest" } : revision),
-    };
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      contextPackSnapshot: staleIdentity,
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    })).toThrow(/identity mismatch/i);
-    seedCanonicalContextDb(db);
-    const rebuilt: GenerationAssemblySnapshotV1 = buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      contextPackSnapshot: forgedScope,
-      db,
-    });
-    expect(rebuilt?.contextPackSnapshot.candidates.map((candidate) => ({
-      packId: candidate.packId,
-      source: candidate.source,
-      targetId: candidate.targetId,
-    }))).toEqual([{ packId: "pack-db", source: "preset", targetId: "preset-1" }]);
-    db.close();
-  });
-  test("fails required selected context packs while allowing optional omissions", async () => {
-    const db = schema();
-    seed(db);
-    const empty = freezeContextPackCandidateSnapshot({
-      ownerId: "user-1",
-      contextAclRevision: 3,
-      candidates: [],
-    });
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      agentConfig: { ...config(), contextPolicy: { ruleIds: [], packIds: ["pack_required"] } },
-      contextPackSnapshot: empty,
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    })).toThrow(ContextPackSnapshotAccessError);
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      contextPackSelections: [{ packId: "pack-optional", required: false }],
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    })).not.toThrow();
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      contextPackSelections: [{
-        packId: "pack-a",
-        revisionId: "pack-a@1",
-        revision: 1,
-        digest: "stale-digest",
-        required: true,
-      }],
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    })).toThrow(ContextPackSnapshotAccessError);
-    db.close();
-  });
-  test("freezes canonical context policy selections, source graph, and permitted candidate order", async () => {
-    const db = schema();
-    seed(db);
-    const snapshot = buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      agentConfig: { ...config(), contextPolicy: { ruleIds: ["rule_a"], packIds: ["pack-a"] } },
-      cognitionGraph: cognitionGraph(),
-      cognitionSource: cognitionSource(),
-      contextPackSelections: [{
-        packId: "pack-a",
-        revisionId: "pack-a@1",
-        revision: 1,
-        digest: "digest-a",
-        required: true,
-      }],
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    });
-    expect(snapshot.contextPacks.candidates.map((candidate) => candidate.packId)).toEqual(["pack-a", "pack-z"]);
-    expect(snapshot.contextPacks.contextPackSelections).toEqual([{
-      packId: "pack-a",
-      revisionId: "pack-a@1",
-      revision: 1,
-      digest: "digest-a",
-      required: true,
-    }]);
-    expect(snapshot.contextPacks.contextRules.map((rule) => rule.id)).toEqual(["rule_a"]);
-    expect(snapshot.contextPacks.cognitionGraph?.contextRules[0]?.revisionId).toBe("pack-a@1");
-    expect(snapshot.contextPacks.cognitionSource).toEqual(cognitionSource());
-    db.close();
-  });
-
-  test("retains optional target attachments while separating direct and inactive rule account requirements", async () => {
-    const db = schema();
-    seed(db);
-    const attached = contextSnapshot();
-    const directAccount = {
-      ...attached.candidates[0]!,
-      packId: "pack-account",
-      revisionId: "pack-account@1",
-      revision: 1,
-      digest: "digest-account",
-      source: "account" as const,
-      targetId: null,
-      attachmentId: null,
-      attachmentRevision: null,
-      order: 0,
-      required: false,
-    };
-    const ruleAccount = {
-      ...attached.candidates[1]!,
-      packId: "pack-rule",
-      revisionId: "pack-rule@2",
-      revision: 2,
-      digest: "digest-rule",
-      source: "account" as const,
-      targetId: null,
-      attachmentId: null,
-      order: 1,
-      attachmentRevision: null,
-      required: false,
-    };
-    const candidates = freezeContextPackCandidateSnapshot({
-      ownerId: "user-1",
-      contextAclRevision: 3,
-      candidates: [...attached.candidates, directAccount, ruleAccount],
-    });
-    const snapshot = buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      agentConfig: { ...config(), contextPolicy: { ruleIds: ["rule_rule"], packIds: ["pack-account"] } },
-      cognitionGraph: cognitionGraph(true, "pack-rule", "rule_rule", "pack-rule@2"),
-      cognitionSource: cognitionSource(),
-      contextPackSelections: [
-        { packId: "pack-account", revisionId: "pack-account@1", revision: 1, digest: "digest-account", required: false },
-        { packId: "pack-rule", revisionId: "pack-rule@2", revision: 2, digest: "digest-rule", required: false },
-      ],
-      contextPackSnapshot: candidates,
-      contextPackSnapshotSource: "host_prefetched",
-      db,
-    });
-    expect(snapshot.contextPacks.candidates.map((candidate) => candidate.packId)).toEqual([
-      "pack-a", "pack-z", "pack-account", "pack-rule",
-    ]);
-    expect(snapshot.contextPacks.candidates.find((candidate) => candidate.packId === "pack-a")?.required).toBe(true);
-    expect(snapshot.contextPacks.candidates.find((candidate) => candidate.packId === "pack-rule")?.required).toBe(false);
-    expect(snapshot.contextPacks.contextRules[0]?.required).toBe(true);
-    expect(snapshot.contextPacks.contextPackSelections).toEqual([
-      { packId: "pack-account", revisionId: "pack-account@1", revision: 1, digest: "digest-account", required: false },
-    ]);
-    db.close();
-  });
-
-  test("requires authenticated graph/source and host-prefetched candidates for policy", async () => {
-    const db = schema();
-    seed(db);
-    const base = {
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      agentConfig: { ...config(), contextPolicy: { ruleIds: [], packIds: ["pack-a"] } },
-      contextPackSelections: [{
-        packId: "pack-a",
-        revisionId: "pack-a@1",
-        revision: 1,
-        digest: "digest-a",
-        required: true,
-      }],
-      db,
-    };
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      ...base,
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: undefined,
-    })).toThrow(ContextPackSnapshotAccessError);
-    expect(() => buildGenerationAssemblySnapshot({
-      assemblySurface: "WORK",
-      ...base,
-      cognitionGraph: cognitionGraph(),
-      cognitionSource: { ...cognitionSource(), presetRevision: 8 },
-    })).toThrow(/cognition graph source revision mismatch/i);
-    db.close();
-  });
-
-  test("accepts account candidates with nullable attachment fields and rejects policy revision mismatches", async () => {
-    const db = schema();
-    seed(db);
-    const accountCandidate = freezeContextPackCandidateSnapshot({
-      ownerId: "user-1",
-      contextAclRevision: 3,
-      candidates: [
-        ...contextSnapshot().candidates,
-        {
-          ...contextSnapshot().candidates[1]!,
-          packId: "pack-account",
-          revisionId: "pack-account@1",
-          revision: 1,
-          digest: "digest-account",
-          targetId: null,
-          attachmentId: null,
-          attachmentRevision: null,
-          order: 0,
-          source: "account",
-          required: true,
-        },
-      ],
-    });
-    const input = {
-      assemblySurface: "WORK" as const,
-      userId: "user-1",
-      chatId: "chat-1",
-      presetId: "preset-1",
-      agentConfig: { ...config(), contextPolicy: { ruleIds: [], packIds: ["pack-account"] } },
-      contextPackSelections: [{
-        packId: "pack-account",
-        revisionId: "pack-account@1",
-        revision: 1,
-        digest: "digest-account",
-        required: true,
-      }],
-      contextPackSnapshot: accountCandidate,
-      contextPackSnapshotSource: "host_prefetched" as const,
-      db,
-    };
-    expect(buildGenerationAssemblySnapshot(input).contextPacks.candidates.find((candidate) => candidate.packId === "pack-account")?.attachmentId).toBeNull();
-    expect(() => buildGenerationAssemblySnapshot({
-      ...input,
-      contextPackSelections: [{ ...input.contextPackSelections[0], digest: "wrong" }],
-    })).toThrow(ContextPackSnapshotAccessError);
+    expect(() => buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db, limits: { inputBytes: 2 } })).toThrow(SnapshotLimitError);
     db.close();
   });
 
@@ -537,8 +145,6 @@ async function compiledAssemblyPlan(): Promise<AssemblyPlanV1> {
     chatId: "chat-1",
     presetId: "preset-1",
     agentConfig: config(),
-    contextPackSnapshot: contextSnapshot(),
-    contextPackSnapshotSource: "host_prefetched",
     db,
   });
   const plan = await compileAgentAssemblyPlan(snapshot);
@@ -554,8 +160,6 @@ async function compiledAssemblyFixture(): Promise<{ snapshot: GenerationAssembly
     chatId: "chat-1",
     presetId: "preset-1",
     agentConfig: config(),
-    contextPackSnapshot: contextSnapshot(),
-    contextPackSnapshotSource: "host_prefetched",
     db,
   });
   const plan = await compileAgentAssemblyPlan(snapshot);
@@ -577,7 +181,6 @@ function policyEntry(blockId: string, blockIndex = 0): AssemblyPlanV1["loomPolic
     checkpoint: "WORK",
     required: false,
     visibility: "work_only",
-    delivery: { delivery: "direct" },
   };
 }
 function withWorkPolicyEntries(
@@ -619,7 +222,6 @@ function policyMessage(blockId: string, blockIndex = 0): AssemblyPlanV1["workPol
         destination: entry.destination,
         checkpoint: entry.checkpoint,
         source: entry.source,
-        delivery: entry.delivery,
         effectiveText: text,
       },
     },
@@ -637,8 +239,6 @@ describe("strict assembly input boundaries", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     await expect(compileAgentAssemblyPlan({
@@ -698,8 +298,6 @@ describe("strict assembly input boundaries", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     })).toThrow(/requires_response_mode.*repair/i);
     db.close();
@@ -709,7 +307,14 @@ describe("strict assembly plan", () => {
   test("orders children, emits direct slots, and substitutes child output once as literal bytes", async () => {
     const db = schema();
     seed(db);
-    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const snapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      agentConfig: config(),
+      db,
+    });
     const plan = await compileAgentAssemblyPlan(snapshot);
     expect(plan.assemblySurface).toBe("WORK");
     const wireSnapshot = JSON.parse(JSON.stringify(snapshot)) as GenerationAssemblySnapshotV1;
@@ -722,6 +327,76 @@ describe("strict assembly plan", () => {
     expect(segments.some((segment) => segment.kind === "literal" && segment.text === "{{regex_should_not_run}}" && segment.text.includes("{{"))).toBe(true);
     db.close();
   });
+  test("orders equal-prompt-order Loom blocks by raw UTF-8 bytes", async () => {
+    const db = schema();
+    seed(db);
+    const firstId = "z-block";
+    const secondId = "é-block";
+    const sourceBlocks = [firstId, secondId].map((blockId) => ({
+      blockId,
+      revision: 1,
+      promptOrder: 0,
+    }));
+    const promptBlocks = [firstId, secondId].map((id) => ({
+      id,
+      name: id,
+      content: `policy-${id}`,
+      role: "user",
+      enabled: true,
+      position: "pre_history",
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      group: null,
+    }));
+    db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(promptBlocks), "preset-1");
+    const cognitionSource = { presetRevision: 7, blocks: sourceBlocks };
+    const cognitionGraph = freezeCognitionGraph({
+      version: 1,
+      policies: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
+      templates: [],
+    }, cognitionSource);
+    const policyEntry = (blockId: string) => ({
+      version: 1 as const,
+      id: `policy-${blockId}`,
+      source: {
+        kind: "loom_block" as const,
+        blockId,
+        presetRevision: 7,
+        blockRevision: 1,
+        promptOrder: 0,
+      },
+      destination: "root_work" as const,
+      checkpoint: "WORK" as const,
+      required: false,
+      visibility: "work_only" as const,
+    });
+    const loomPolicy = {
+      version: 1 as const,
+      workPolicy: [policyEntry(firstId), policyEntry(secondId)],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    };
+    const snapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      agentConfig: config(),
+      cognitionGraph,
+      cognitionSource,
+      loomPolicy,
+      db,
+    });
+    const plan = await compileAgentAssemblyPlan(snapshot);
+    expect(plan.workPolicyMessages.map((message) =>
+      message.segments.map((segment) => segment.kind === "literal" ? segment.text : "").join(""),
+    )).toEqual([`policy-${firstId}`, `policy-${secondId}`]);
+    db.close();
+  });
   test("rejects a Response snapshot at the strict compiler boundary", async () => {
     const db = schema();
     seed(db);
@@ -731,8 +406,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     await expect(compileAgentAssemblyPlan({
@@ -744,12 +417,12 @@ describe("strict assembly plan", () => {
   test("places in-history blocks at their frozen depth between history boundaries", async () => {
     const db = schema();
     seed(db);
-    const initial = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const initial = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
     const producer = initial.blocks.find((block) => block.id === "producer")!;
     const consumer = initial.blocks.find((block) => block.id === "consumer")!;
     const inHistory = { ...producer, id: "in-history", name: "In history", content: "Between history", position: "in_history" as const, depth: 0 };
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify([producer, inHistory, consumer]), "preset-1");
-    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
     const plan = await compileAgentAssemblyPlan(snapshot);
     expect(plan.providerMessages.map((message) => message.blockId ?? "history")).toEqual(["history", "producer", "history", "in-history", "consumer"]);
     db.close();
@@ -758,7 +431,7 @@ describe("strict assembly plan", () => {
   test("rejects transformed, recursive, and out-of-order result references", async () => {
     const db = schema();
     seed(db);
-    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
     const transformed = {
       ...snapshot,
       blocks: snapshot.blocks.map((block) => block.id === "consumer"
@@ -768,13 +441,13 @@ describe("strict assembly plan", () => {
     await expect(compileAgentAssemblyPlan(transformed)).rejects.toThrow(AssemblyPlanValidationError);
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify([...snapshot.blocks].reverse()), "preset-1");
 
-    const reversed = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const reversed = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
     await expect(compileAgentAssemblyPlan(reversed)).rejects.toThrow(/forward|precede|order/i);
     const recursiveBlocks = snapshot.blocks.map((block) => block.id === "producer"
       ? { ...block, content: "{{agent::writer::as=facts}}{{agentResult::facts}}{{/agent}}" }
       : block);
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(recursiveBlocks), "preset-1");
-    const recursive = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), contextPackSnapshot: contextSnapshot(), contextPackSnapshotSource: "host_prefetched", db });
+    const recursive = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
     await expect(compileAgentAssemblyPlan(recursive)).rejects.toThrow(/recursive|result reference|nested_intrinsic/i);
     db.close();
   });
@@ -817,8 +490,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     const escapedBlocks = snapshot.blocks.map((block) => block.id === "consumer"
@@ -831,8 +502,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     await expect(compileAgentAssemblyPlan(escapedSnapshot)).rejects.toThrow(/generated|result reference|agent marker/i);
@@ -851,8 +520,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     await expect(compileAgentAssemblyPlan(snapshot)).rejects.toThrow(/generated_result_reference|generated.*result marker/i);
@@ -871,8 +538,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     const plan = await compileAgentAssemblyPlan(snapshot);
@@ -899,8 +564,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     const plan = await compileAgentAssemblyPlan(snapshot);
@@ -927,8 +590,6 @@ describe("strict assembly plan", () => {
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: config(),
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     const plan = await compileAgentAssemblyPlan(snapshot);
@@ -1031,11 +692,16 @@ describe("strict assembly plan", () => {
       checkpoint,
       required: false,
       visibility: "work_only" as const,
-      delivery: { delivery: "direct" as const },
     });
+    const canonicalWorkPolicy = policyEntryFor("workPolicy", "policy-work", "root_work", "WORK", existing.length);
+    const staleOptionalWorkPolicy = {
+      ...canonicalWorkPolicy,
+      id: "zzz-stale-workPolicy",
+      source: { ...canonicalWorkPolicy.source, promptOrder: existing.length + 100 },
+    };
     const cognitionPolicy = {
       version: 1 as const,
-      workPolicy: [policyEntryFor("workPolicy", "policy-work", "root_work", "WORK", existing.length)],
+      workPolicy: [canonicalWorkPolicy, staleOptionalWorkPolicy],
       workspaceUsage: [policyEntryFor("workspaceUsage", "policy-usage", "root_work", "WORK", existing.length + 1)],
       completionCriteria: [policyEntryFor("completionCriteria", "policy-complete", "completion_handoff", "PREPARE_COMMIT", existing.length + 2)],
       renderPolicy: [policyEntryFor("renderPolicy", "policy-render", "render", "RENDER", existing.length + 3)],
@@ -1044,7 +710,6 @@ describe("strict assembly plan", () => {
       version: 1,
       policies: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
       templates: [],
-      contextRules: [],
     }, source);
     const canonicalConfig = { ...config() };
     delete canonicalConfig.phasePolicy;
@@ -1066,8 +731,6 @@ describe("strict assembly plan", () => {
       },
       cognitionGraph: graph,
       cognitionSource: source,
-      contextPackSnapshot: contextSnapshot(),
-      contextPackSnapshotSource: "host_prefetched",
       db,
     });
     expect(snapshot.blocks.filter((block) => block.id.startsWith("policy-")).map((block) => block.revision)).toEqual(["1", "1", "1", "1"]);
@@ -1098,13 +761,18 @@ describe("strict assembly plan", () => {
         checkpoint: "RENDER",
       }],
     });
+    expect(plan.loomPolicy.workPolicy).toHaveLength(2);
     expect(plan.loomBlocks.map((block) => block.source.blockId)).toEqual([
       "policy-work",
       "policy-usage",
       "policy-complete",
       "policy-render",
     ]);
+    expect(plan.loomBlocks.filter((block) => block.source.blockId === "policy-work")).toHaveLength(1);
     expect(plan.workPolicyMessages).toHaveLength(1);
+    expect(plan.workPolicyMessages[0]?.provenance).toMatchObject({
+      loom: { entryId: canonicalWorkPolicy.id, source: canonicalWorkPolicy.source },
+    });
     expect(plan.workspaceUsageMessages).toHaveLength(1);
     expect(plan.completionCriteriaMessages).toHaveLength(1);
     expect(plan.renderPolicyMessages).toHaveLength(1);
@@ -1115,6 +783,20 @@ describe("strict assembly plan", () => {
       sourceRevision: "1",
       sourceIndex: 0,
     });
+    expect(plan.privateEvidence.cognition.filter((entry) => entry.section === "completionCriteria")).toEqual([
+      expect.objectContaining({ phase: "PREPARE_COMMIT" }),
+    ]);
+    const forgedCompletionPhase = {
+      ...plan,
+      privateEvidence: {
+        ...plan.privateEvidence,
+        cognition: plan.privateEvidence.cognition.map((entry) => entry.section === "completionCriteria"
+          ? { ...entry, phase: "WORK" as const }
+          : entry),
+      },
+    };
+    expect(() => validateAssemblyPlanV1(forgedCompletionPhase, plan.limits)).toThrow(/Cognition evidence/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(forgedCompletionPhase, snapshot)).rejects.toThrow(/Cognition policy source binding/i);
     expect(() => validateAssemblyPlanV1(plan, plan.limits)).not.toThrow();
     await expect(validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).resolves.toBeUndefined();
     db.close();

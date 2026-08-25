@@ -2,13 +2,24 @@ import type { StateCreator } from 'zustand'
 import type {
   AgentPersistentWorkspaceCollectionV1,
   AgentPersistentWorkspaceCollectionsStateV1,
+  AgentRunResyncDescriptorV1,
   AppStore,
   AgentRunsSlice,
 } from '@/types/store'
 import type {
-  AgentActivityMilestoneV1,
+  AgentInspectionRecordActorV1,
+  AgentInspectionRecordKindV1,
+  AgentInspectionTranscriptRecordV1,
+  AgentPromptDatabankSourceV1,
+  AgentPromptEvidenceV1,
+  AgentPromptNativeProvenanceV1,
+  AgentRenderCrossingV1,
+  AgentTurnSessionEntryV1,
+  AgentWorkspaceAssociationV1,
+  AgentInspectionProviderIdentityV1,
   AgentActivityNodeStatusV2,
   AgentActivityNodeV2,
+  AgentActivityMilestoneV1,
   AgentActivityTreeV1,
   AgentCortexReceiptV1,
   AgentCouncilReceiptV1,
@@ -36,6 +47,7 @@ import type {
   AgentPersistentWorkspaceStateV1,
   AgentPersistentWorkspaceSubmissionV1,
   AgentPersistentWorkspaceTaskV1,
+  AgentPersistentWorkspaceTurnSessionPageV1,
   AgentPersistentWorkspaceTurnSessionV1,
   AgentPersistentWorkspaceV1,
   AgentRunChangeEventV2,
@@ -54,6 +66,7 @@ import type {
   AgentRunRecoveryActionV2,
   AgentRunResyncPageV1,
   AgentRunStatusV2,
+  AgentRunStopResultV2,
   AgentRunTargetV2,
   AgentRunUsageV2,
   AgentWorkspaceEntryPreviewV2,
@@ -66,7 +79,17 @@ import type {
   AgentWorkAttemptLineageV1,
   AgentWorkTargetIdentityV1,
 } from '@/types/agent-runs'
+import {
+  AGENTIC_PREDICATE_MAX_DEPTH,
+  AGENTIC_PREDICATE_MAX_LIST_BYTES,
+  AGENTIC_PREDICATE_MAX_LIST_ITEMS,
+  AGENTIC_PREDICATE_MAX_NODES,
+  AGENTIC_PREDICATE_MAX_STRING_BYTES,
+  LOOM_RESPONSE_OMISSION_MAX_PHASE_INSTRUCTIONS,
+} from '@/lib/loom/agenticRuntime'
 import { isUnknownRecord } from '@/lib/type-guards'
+import type { CognitionPredicate } from '@/lib/loom/types'
+import type { LoomPromptInspectionItemV1, LoomPromptInspectionV1 } from '@/types/agent-runtime'
 
 const RUN_PHASES: Record<AgentRunPhaseV2, true> = {
   ADMIT: true,
@@ -150,19 +173,19 @@ const SAFE_TOOL_IDS: Record<string, true> = {
   lore_search_entries: true,
   chat_search_history: true,
   agent_delegate: true,
-  context_pack_list: true,
-  context_pack_get: true,
   workspace_read_section: true,
   workspace_read_page: true,
   workspace_create_task: true,
   workspace_update_progress: true,
   workspace_submit_result: true,
+  workspace_submit_root_result: true,
   workspace_accept_submission: true,
   workspace_record_finding: true,
   workspace_record_decision: true,
   workspace_record_question: true,
   workspace_attach_artifact: true,
   workspace_propose_publication: true,
+  unknown_tool: true,
   complete_turn: true,
 }
 const PUBLIC_ERROR_CODES = new Set<string>([
@@ -202,14 +225,40 @@ const MAX_WORKSPACE_ENTRIES = 256
 const MAX_ID_LENGTH = 256
 const MAX_LABEL_LENGTH = 160
 const MAX_CURSOR_LENGTH = 2_048
+const MAX_WORKSPACE_COLLECTION_ITEMS = 256
+const MAX_WORKSPACE_TEXT_LENGTH = 64 * 1024
+const MAX_WORKSPACE_STRING_ARRAY_ITEMS = 256
 const MAX_INSPECTION_RECORDS = 4_096
+const MAX_RESYNC_RUNS_PER_PAGE = 16
+const MAX_INSPECTION_LIST_RUNS = 64
+const MAX_DATE_MILLISECONDS = 8_640_000_000_000_000
+const MAX_DATE_SECONDS = Math.floor(MAX_DATE_MILLISECONDS / 1_000)
+const UTF8_ENCODER = new TextEncoder()
 
 function boundedString(value: unknown, maxLength = MAX_ID_LENGTH): string | null {
-  return typeof value === 'string' && value.length > 0 && value.length <= maxLength ? value : null
+  return typeof value === 'string' && value.length > 0 && UTF8_ENCODER.encode(value).byteLength <= maxLength ? value : null
 }
 
 function nonNegativeInteger(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+function dateTimestamp(value: unknown): number | null {
+  const normalized = nonNegativeInteger(value)
+  return normalized !== null && normalized <= MAX_DATE_MILLISECONDS ? normalized : null
+}
+function dateSeconds(value: unknown): number | null {
+  const normalized = nonNegativeInteger(value)
+  return normalized !== null && normalized <= MAX_DATE_SECONDS ? normalized : null
+}
+function nullableDateTimestamp(value: unknown): number | null | undefined {
+  if (value === null) return null
+  if (value === undefined) return undefined
+  return dateTimestamp(value) ?? undefined
+}
+function isIndexedArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false
+  for (let index = 0; index < value.length; index += 1) if (!Object.hasOwn(value, String(index))) return false
+  return true
 }
 
 function isRunPhase(value: unknown): value is AgentRunPhaseV2 {
@@ -340,11 +389,105 @@ const ACTIVITY_RECONCILIATIONS: Record<AgentActivityTreeV1['reconciliation'], tr
   recovered: true,
   stale: true,
 }
-function nullableBoundedString(value: unknown): string | null | undefined {
-  return value === undefined ? undefined : value === null ? null : boundedString(value)
+function nullableBoundedString(value: unknown, maxLength = MAX_ID_LENGTH): string | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  const normalized = boundedString(value, maxLength)
+  return normalized === null ? undefined : normalized
 }
 function nullableNonNegativeInteger(value: unknown): number | null | undefined {
-  return value === undefined ? undefined : value === null ? null : nonNegativeInteger(value)
+  if (value === undefined) return undefined
+  if (value === null) return null
+  const normalized = nonNegativeInteger(value)
+  return normalized === null ? undefined : normalized
+}
+const TRANSCRIPT_KINDS: Record<AgentInspectionRecordKindV1, true> = {
+  prompt: true,
+  provider_exchange: true,
+  agent_exchange: true,
+  delegation: true,
+  child_result: true,
+  tool: true,
+  condition: true,
+  checkpoint: true,
+  task: true,
+  workspace: true,
+  hook: true,
+  usage: true,
+  failure: true,
+  terminal: true,
+  stop: true,
+  recovery: true,
+  milestone: true,
+}
+const TRANSCRIPT_ACTORS: Record<AgentInspectionRecordActorV1, true> = {
+  host: true,
+  owner: true,
+  provider: true,
+  agent: true,
+  child: true,
+  tool: true,
+  cortex: true,
+  council: true,
+}
+const TURN_SESSION_KINDS: Record<AgentTurnSessionEntryV1['kind'], true> = {
+  target: true,
+  input: true,
+  policy: true,
+  condition: true,
+  hook: true,
+  cancellation: true,
+  completion: true,
+  commit: true,
+  terminal: true,
+  retry: true,
+  recovery: true,
+}
+const PROMPT_DESTINATIONS: Record<AgentPromptEvidenceV1['destination'], true> = {
+  root_work: true,
+  child_work: true,
+  completion_handoff: true,
+  render: true,
+  council: true,
+  cortex: true,
+}
+const PROMPT_ROLES: Record<AgentPromptEvidenceV1['role'], true> = {
+  system: true,
+  user: true,
+  assistant: true,
+  tool: true,
+  context: true,
+  policy: true,
+}
+const CORTEX_STATES: Record<AgentCortexReceiptV1['state'], true> = {
+  accepted: true,
+  omitted: true,
+  failed: true,
+  cancelled: true,
+}
+const CORTEX_OMISSION_REASONS: Record<NonNullable<AgentCortexReceiptV1['omission']>['reason'], true> = {
+  stale: true,
+  unauthorized: true,
+  unavailable: true,
+  cancelled: true,
+  failed: true,
+  limit_exceeded: true,
+  snapshot_mismatch: true,
+}
+const WORKSPACE_ASSOCIATION_KINDS: Record<AgentWorkspaceAssociationV1['objectKind'], true> = {
+  objective: true,
+  task: true,
+  finding: true,
+  decision: true,
+  question: true,
+  submission: true,
+  artifact: true,
+  publication: true,
+}
+const WORKSPACE_ASSOCIATION_RELATIONS: Record<AgentWorkspaceAssociationV1['relation'], true> = {
+  linked: true,
+  published: true,
+  omitted: true,
 }
 function isOwn<T extends string>(values: Record<T, true>, value: unknown): value is T {
   return typeof value === 'string' && Object.hasOwn(values, value)
@@ -394,8 +537,8 @@ function normalizeActivityMilestone(value: unknown): AgentActivityMilestoneV1 | 
   const toolId = nullableBoundedString(value.toolId)
   const taskId = nullableBoundedString(value.taskId)
   const sequence = nonNegativeInteger(value.sequence)
-  const startedAt = nonNegativeInteger(value.startedAt)
-  const endedAt = nullableNonNegativeInteger(value.endedAt)
+  const startedAt = dateTimestamp(value.startedAt)
+  const endedAt = nullableDateTimestamp(value.endedAt)
   const elapsedMs = nullableNonNegativeInteger(value.elapsedMs)
   const usage = value.usage === null ? null : normalizeInspectionUsageEvidence(value.usage)
   const correlation = normalizeInspectionCorrelation(value.correlation)
@@ -403,16 +546,16 @@ function normalizeActivityMilestone(value: unknown): AgentActivityMilestoneV1 | 
   return { version: 1, id, parentId, kind, actor, phase, status, label, toolId, taskId, sequence, startedAt, endedAt, elapsedMs, usage, correlation }
 }
 function normalizeActivityTree(value: unknown): AgentActivityTreeV1 | null {
-  if (!isUnknownRecord(value) || value.version !== 1 || !Array.isArray(value.milestones) || !Array.isArray(value.markers)) return null
+  if (!isUnknownRecord(value) || value.version !== 1 || !isIndexedArray(value.milestones) || !isIndexedArray(value.markers)) return null
   const attempt = normalizeAttempt(value.attempt)
   const lifecycle = isInspectionLifecycle(value.lifecycle) ? value.lifecycle : null
   const status = isRunStatus(value.status) ? value.status : null
   const outcome = value.outcome === null ? null : isRunOutcome(value.outcome) ? value.outcome : undefined
   const reason = isInspectionReason(value.reason) ? value.reason : null
   const revision = nonNegativeInteger(value.revision)
-  const startedAt = nonNegativeInteger(value.startedAt)
-  const updatedAt = nonNegativeInteger(value.updatedAt)
-  const terminalAt = nullableNonNegativeInteger(value.terminalAt)
+  const startedAt = dateTimestamp(value.startedAt)
+  const updatedAt = dateTimestamp(value.updatedAt)
+  const terminalAt = nullableDateTimestamp(value.terminalAt)
   const target = normalizeTarget(value.target)
   const usage = normalizeUsage(value.usage)
   const reconciliation = isOwn(ACTIVITY_RECONCILIATIONS, value.reconciliation) ? value.reconciliation : null
@@ -476,7 +619,8 @@ function normalizeWorkTarget(value: unknown): AgentWorkTargetIdentityV1 | null {
   const generationType = isGenerationType(value.generationType) ? value.generationType : null
   const messageId = value.messageId === null ? null : boundedString(value.messageId)
   const swipeId = value.swipeId === null ? null : nonNegativeInteger(value.swipeId)
-  if (!chatId || !generationType || messageId === null && value.messageId !== null || swipeId === null && value.swipeId !== null) return null
+  if (!chatId || !generationType || messageId === null && value.messageId !== null || swipeId === null && value.swipeId !== null
+    || messageId === null && swipeId !== null) return null
   return { chatId, generationType, messageId, swipeId }
 }
 
@@ -485,9 +629,44 @@ function normalizeAttempt(value: unknown): AgentWorkAttemptLineageV1 | null {
   const attemptId = boundedString(value.attemptId)
   const previousAttemptId = value.previousAttemptId === null ? null : boundedString(value.previousAttemptId)
   const target = normalizeWorkTarget(value.target)
-  const createdAt = nonNegativeInteger(value.createdAt)
+  const createdAt = dateTimestamp(value.createdAt)
   if (!attemptId || !target || createdAt === null || previousAttemptId === null && value.previousAttemptId !== null) return null
   return { version: 1, attemptId, previousAttemptId, target, createdAt }
+}
+function sameWorkTarget(left: AgentWorkTargetIdentityV1, right: AgentWorkTargetIdentityV1): boolean {
+  return left.chatId === right.chatId
+    && left.generationType === right.generationType
+    && left.messageId === right.messageId
+    && left.swipeId === right.swipeId
+}
+function sameActivityTarget(left: AgentRunTargetV2, right: AgentWorkTargetIdentityV1): boolean {
+  return (left?.messageId ?? null) === right.messageId
+    && (left?.swipeId ?? null) === (right.swipeId ?? null)
+}
+function sameSummaryTarget(left: AgentRunTargetV2 | null, right: AgentWorkTargetIdentityV1): boolean {
+  if (right.messageId === null) return left === null
+  return left !== null
+    && left.messageId === right.messageId
+    && left.swipeId === (right.swipeId ?? 0)
+}
+function sameAttemptIdentity(left: AgentWorkAttemptLineageV1, right: AgentWorkAttemptLineageV1): boolean {
+  return left.attemptId === right.attemptId
+    && left.previousAttemptId === right.previousAttemptId
+    && left.createdAt === right.createdAt
+    && sameWorkTarget(left.target, right.target)
+}
+function sameInspectionCorrelationIdentity(
+  correlation: AgentInspectionCorrelationV1,
+  summary: AgentRunInspectionSummaryV1,
+): boolean {
+  return correlation.attemptId === summary.attempt.attemptId
+    && correlation.chatId === summary.attempt.target.chatId
+    && correlation.turnSessionId === summary.turnSessionId
+    && correlation.runId === summary.runId
+    && correlation.generationId === summary.generationId
+    && correlation.hostCorrelationId === summary.hostCorrelationId
+    && correlation.messageId === summary.attempt.target.messageId
+    && correlation.swipeId === summary.attempt.target.swipeId
 }
 
 function normalizeError(value: unknown): AgentRunPublicErrorV2 | undefined {
@@ -565,8 +744,8 @@ function normalizeInspectionErrorDetail(value: unknown): AgentInspectionErrorDet
 function normalizeInspectionStop(value: unknown): AgentRunInspectionStopV1 | null {
   if (!isUnknownRecord(value) || value.version !== 1) return null
   const state = isOwn(INSPECTION_STOP_STATES, value.state) ? value.state : null
-  const requestedAt = nonNegativeInteger(value.requestedAt)
-  const receiptAt = nullableNonNegativeInteger(value.receiptAt)
+  const requestedAt = dateTimestamp(value.requestedAt)
+  const receiptAt = nullableDateTimestamp(value.receiptAt)
   const correlation = normalizeInspectionCorrelation(value.correlation)
   const reason = isInspectionReason(value.reason) ? value.reason : null
   if (!state || requestedAt === null || receiptAt === undefined || !correlation || !reason) return null
@@ -580,13 +759,13 @@ function normalizeActivityNode(value: unknown): AgentActivityNodeV2 | null {
   const actor = typeof value.actor === 'string' && Object.hasOwn(NODE_KINDS, value.actor) ? value.actor as AgentActivityNodeV2['actor'] : null
   const phase = isRunPhase(value.phase) ? value.phase : null
   const status = typeof value.status === 'string' && Object.hasOwn(NODE_STATUSES, value.status) ? value.status as AgentActivityNodeStatusV2 : null
-  const startedAt = nonNegativeInteger(value.startedAt)
+  const startedAt = dateTimestamp(value.startedAt)
   const elapsedMs = nonNegativeInteger(value.elapsedMs)
   const profileId = value.profileId === undefined ? undefined : boundedString(value.profileId, 128)
   const toolId = value.toolId === undefined
     ? undefined
-    : typeof value.toolId === 'string' && Object.hasOwn(SAFE_TOOL_IDS, value.toolId)
-      ? value.toolId
+    : typeof value.toolId === 'string'
+      ? Object.hasOwn(SAFE_TOOL_IDS, value.toolId) ? value.toolId : 'unknown_tool'
       : null
   const roundIndex = value.roundIndex === undefined ? undefined : nonNegativeInteger(value.roundIndex)
   const continuationMode = value.continuationMode === undefined
@@ -621,6 +800,69 @@ function normalizeHandoff(value: unknown): AgentRunPublicV2['terminalHandoff'] {
   if (messageId === null && value.messageId !== null || swipeId === null && value.swipeId !== null || messageRevision === null && value.messageRevision !== null || swipeRevision === null && value.swipeRevision !== null) return undefined
   return { version: 2, committed: value.committed, messageId, swipeId, messageRevision, swipeRevision }
 }
+export function normalizeAgentRunStopResultV2(
+  value: unknown,
+  expectedTurnId?: string,
+  expectedChatId?: string,
+  expectedGenerationId?: string,
+): AgentRunStopResultV2 | null {
+  if (!isUnknownRecord(value) || value.version !== 2) return null
+  const status = value.status === 'accepted' || value.status === 'too_late' || value.status === 'terminal' ? value.status : null
+  const turnId = boundedString(value.turnId)
+  const revision = nonNegativeInteger(value.revision)
+  const target = normalizeWorkTarget(value.target)
+  const reason = value.reason === undefined ? undefined : value.reason === null ? null : boundedString(value.reason, MAX_LABEL_LENGTH)
+  const recoveryAction = isRecoveryAction(value.recoveryAction) ? value.recoveryAction : null
+  const workPhase = isRunPhase(value.workPhase) ? value.workPhase : null
+  const workStatus = isRunStatus(value.workStatus) ? value.workStatus : null
+  const workOutcome = value.workOutcome === null ? null : isRunOutcome(value.workOutcome) ? value.workOutcome : undefined
+  const omissionCount = nonNegativeInteger(value.omissionCount)
+  const inspectionAttemptId = boundedString(value.inspectionAttemptId)
+  const error = value.error === undefined ? undefined : normalizeError(value.error)
+  const responseGenerationId = value.generationId === undefined ? undefined : boundedString(value.generationId)
+  const statusCoherent = status !== 'terminal'
+    || workPhase === 'TERMINAL' && workStatus === 'terminal' && workOutcome !== null
+  const errorCoherent = error === undefined || (
+    error.target !== null
+    && target !== null
+    && sameWorkTarget(error.target, target)
+    && error.workPhase === workPhase
+    && error.workStatus === workStatus
+    && error.workOutcome === workOutcome
+    && error.reason === reason
+    && error.recoveryEligible === value.recoveryEligible
+    && error.recoveryAction === recoveryAction
+    && error.omissionCount === omissionCount
+    && error.inspectionAttemptId === inspectionAttemptId
+  )
+  if (
+    !status || !turnId || revision === null || !target || !workPhase || !workStatus || workOutcome === undefined
+    || reason === undefined || typeof value.recoveryEligible !== 'boolean' || !recoveryAction
+    || omissionCount === null || !inspectionAttemptId || !statusCoherent
+    || value.error !== undefined && !error
+    || responseGenerationId === null
+    || expectedTurnId !== undefined && turnId !== expectedTurnId
+    || expectedChatId !== undefined && target.chatId !== expectedChatId
+    || expectedGenerationId !== undefined && (responseGenerationId === undefined || responseGenerationId !== expectedGenerationId)
+    || !errorCoherent
+  ) return null
+  return {
+    version: 2,
+    status,
+    turnId,
+    revision,
+    target,
+    workPhase,
+    workStatus,
+    workOutcome,
+    reason,
+    recoveryEligible: value.recoveryEligible,
+    recoveryAction,
+    omissionCount,
+    inspectionAttemptId,
+    ...(error ? { error } : {}),
+  }
+}
 
 export function normalizeAgentRunPublicV2(value: unknown): AgentRunPublicV2 | null {
   if (!isUnknownRecord(value) || value.version !== 2) return null
@@ -635,8 +877,8 @@ export function normalizeAgentRunPublicV2(value: unknown): AgentRunPublicV2 | nu
   const workOutcome = value.workOutcome === null ? null : isRunOutcome(value.workOutcome) ? value.workOutcome : undefined
   const revision = nonNegativeInteger(value.revision)
   const sequence = nonNegativeInteger(value.sequence)
-  const startedAt = nonNegativeInteger(value.startedAt)
-  const updatedAt = nonNegativeInteger(value.updatedAt)
+  const startedAt = dateTimestamp(value.startedAt)
+  const updatedAt = dateTimestamp(value.updatedAt)
   const omissionCount = nonNegativeInteger(value.omissionCount)
   const inspectionAttemptId = boundedString(value.inspectionAttemptId)
   const attemptLineage = normalizeAttempt(value.attemptLineage)
@@ -647,8 +889,13 @@ export function normalizeAgentRunPublicV2(value: unknown): AgentRunPublicV2 | nu
   if (
     !runId || !turnId || !generationId || !chatId || !generationType || target === undefined || !workPhase || !workStatus
     || workOutcome === undefined || revision === null || sequence === null || startedAt === null || updatedAt === null || omissionCount === null
-    || !inspectionAttemptId || !attemptLineage || !usage || !omission || !Array.isArray(value.activity)
+    || !inspectionAttemptId || !attemptLineage || !usage || !omission || !isIndexedArray(value.activity)
     || typeof value.recoveryEligible !== 'boolean' || !recoveryAction || reason === undefined
+    || attemptLineage.attemptId !== inspectionAttemptId
+    || attemptLineage.target.chatId !== chatId
+    || attemptLineage.target.generationType !== generationType
+    || attemptLineage.target.messageId !== (target?.messageId ?? null)
+    || attemptLineage.target.swipeId !== (target?.swipeId ?? null)
   ) return null
   const normalizedActivity = value.activity.map(normalizeActivityNode)
   const activity = normalizedActivity.filter((node): node is AgentActivityNodeV2 => node !== null)
@@ -698,6 +945,27 @@ export function normalizeAgentRunChangeEventV2(value: unknown): AgentRunChangeEv
   return { version: 2, chatId, sequence, run, omission }
 }
 
+function resyncRunIdentityKeys(run: AgentRunPublicV2): readonly string[] {
+  return [`run:${run.runId}`, `turn:${run.turnId}`, `attempt:${run.inspectionAttemptId}`]
+}
+function hasDuplicateResyncRunIdentities(runs: readonly AgentRunPublicV2[]): boolean {
+  const seen = new Set<string>()
+  for (const run of runs) {
+    for (const key of resyncRunIdentityKeys(run)) {
+      if (seen.has(key)) return true
+      seen.add(key)
+    }
+  }
+  return false
+}
+function resyncRunIdentityRecord(runs: readonly AgentRunPublicV2[]): Record<string, true> {
+  const identities: Record<string, true> = {}
+  for (const run of runs) {
+    for (const key of resyncRunIdentityKeys(run)) identities[key] = true
+  }
+  return identities
+}
+
 function normalizeResyncPage(value: unknown): AgentRunResyncPageV1 | undefined {
   if (!isUnknownRecord(value)) return undefined
   const offset = nonNegativeInteger(value.offset)
@@ -705,7 +973,19 @@ function normalizeResyncPage(value: unknown): AgentRunResyncPageV1 | undefined {
   const totalRuns = nonNegativeInteger(value.totalRuns)
   const snapshotSequence = nonNegativeInteger(value.snapshotSequence)
   const omittedRuns = nonNegativeInteger(value.omittedRuns)
-  if (offset === null || returnedRuns === null || totalRuns === null || snapshotSequence === null || omittedRuns === null || typeof value.complete !== 'boolean' || returnedRuns > 16 || omittedRuns !== Math.max(0, totalRuns - offset - returnedRuns)) return undefined
+  if (
+    offset === null
+    || returnedRuns === null
+    || totalRuns === null
+    || snapshotSequence === null
+    || omittedRuns === null
+    || typeof value.complete !== 'boolean'
+    || returnedRuns > MAX_RESYNC_RUNS_PER_PAGE
+    || offset > totalRuns
+    || returnedRuns > totalRuns - offset
+    || omittedRuns !== totalRuns - offset - returnedRuns
+    || value.complete !== (omittedRuns === 0)
+  ) return undefined
   return { offset, returnedRuns, totalRuns, snapshotSequence, complete: value.complete, omittedRuns }
 }
 
@@ -718,11 +998,35 @@ export function normalizeAgentRunChangesV2(value: unknown): AgentRunChangesV2 | 
   const tailSequence = nonNegativeInteger(value.tailSequence)
   const omission = normalizeOmission(value.omission)
   const resyncPage = value.resyncPage === undefined ? undefined : normalizeResyncPage(value.resyncPage)
-  if (!chatId || !token || lastSequence === null || cursorSequence === null || tailSequence === null || lastSequence !== cursorSequence || tailSequence < lastSequence || typeof value.hasMore !== 'boolean' || typeof value.resync !== 'boolean' || value.resyncPage !== undefined && !resyncPage || !Array.isArray(value.runs) || !Array.isArray(value.events) || !omission) return null
+  if (
+    !chatId
+    || !token
+    || lastSequence === null
+    || cursorSequence === null
+    || tailSequence === null
+    || lastSequence !== cursorSequence
+    || tailSequence < lastSequence
+    || typeof value.hasMore !== 'boolean'
+    || typeof value.resync !== 'boolean'
+    || value.resync !== (resyncPage !== undefined)
+    || value.resyncPage !== undefined && !resyncPage
+    || !isIndexedArray(value.runs)
+    || !isIndexedArray(value.events)
+    || !omission
+  ) return null
   const runs = value.runs.map(normalizeAgentRunPublicV2).filter((run): run is AgentRunPublicV2 => run !== null)
   const events = value.events.map(normalizeAgentRunChangeEventV2).filter((event): event is AgentRunChangeEventV2 => event !== null)
   if (runs.length !== value.runs.length || events.length !== value.events.length) return null
   if (runs.some((run) => run.chatId !== chatId) || events.some((event) => event.chatId !== chatId)) return null
+  if (resyncPage !== undefined && (
+    events.length !== 0
+    || hasDuplicateResyncRunIdentities(runs)
+    || resyncPage.snapshotSequence !== cursorSequence
+    || resyncPage.snapshotSequence > tailSequence
+    || resyncPage.returnedRuns !== runs.length
+    || resyncPage.complete === false && resyncPage.returnedRuns !== Math.min(MAX_RESYNC_RUNS_PER_PAGE, resyncPage.totalRuns - resyncPage.offset)
+    || value.hasMore !== (!resyncPage.complete || resyncPage.snapshotSequence < tailSequence)
+  )) return null
   return { version: 2, chatId, cursor: { version: 1, token }, cursorSequence, lastSequence, tailSequence, hasMore: value.hasMore, resync: value.resync, ...(resyncPage ? { resyncPage } : {}), runs, events, omission }
 }
 
@@ -895,6 +1199,9 @@ function normalizeInspectionRetry(value: unknown): AgentRunInspectionRetryV1 | n
 function normalizeInspectionSummary(value: unknown): AgentRunInspectionSummaryV1 | null {
   if (!isUnknownRecord(value) || value.version !== 1 || !isUnknownRecord(value.attempt) || !isUnknownRecord(value.activity)) return null
   const attempt = normalizeAttempt(value.attempt)
+  const runId = boundedString(value.runId)
+  const turnSessionId = boundedString(value.turnSessionId)
+  const generationId = boundedString(value.generationId)
   const lifecycle = isInspectionLifecycle(value.lifecycle) ? value.lifecycle : null
   const status = isRunStatus(value.status) ? value.status : null
   const outcome = value.outcome === null ? null : isRunOutcome(value.outcome) ? value.outcome : undefined
@@ -903,16 +1210,21 @@ function normalizeInspectionSummary(value: unknown): AgentRunInspectionSummaryV1
   const committedTarget = normalizeTarget(value.committedTarget)
   const hostCorrelationId = boundedString(value.hostCorrelationId)
   const revision = nonNegativeInteger(value.revision)
-  const startedAt = nonNegativeInteger(value.startedAt)
-  const updatedAt = nonNegativeInteger(value.updatedAt)
-  const terminalAt = nullableNonNegativeInteger(value.terminalAt)
+  const startedAt = dateTimestamp(value.startedAt)
+  const updatedAt = dateTimestamp(value.updatedAt)
+  const terminalAt = nullableDateTimestamp(value.terminalAt)
   const markerCount = nonNegativeInteger(value.markerCount)
   const transcriptCount = nonNegativeInteger(value.transcriptCount)
   const activity = normalizeActivityTree(value.activity)
-  if (!attempt || !lifecycle || !status || outcome === undefined || !reason || target === undefined || committedTarget === undefined || !hostCorrelationId || revision === null || startedAt === null || updatedAt === null || terminalAt === undefined || markerCount === null || transcriptCount === null || typeof value.terminal !== 'boolean' || !activity) return null
+  if (!attempt || !runId || !turnSessionId || !generationId || !lifecycle || !status || outcome === undefined || !reason || target === undefined || committedTarget === undefined || !hostCorrelationId || revision === null || startedAt === null || updatedAt === null || terminalAt === undefined || markerCount === null || transcriptCount === null || typeof value.terminal !== 'boolean' || !activity
+    || !sameAttemptIdentity(attempt, activity.attempt)
+    || !sameSummaryTarget(target, attempt.target)) return null
   return {
     version: 1,
     attempt,
+    runId,
+    turnSessionId,
+    generationId,
     hostCorrelationId,
     lifecycle,
     status,
@@ -931,29 +1243,553 @@ function normalizeInspectionSummary(value: unknown): AgentRunInspectionSummaryV1
   }
 }
 
-export function normalizeAgentRunInspectionDetailV1(value: unknown): AgentRunInspectionDetailV1 | null {
-  if (!isUnknownRecord(value) || !Array.isArray(value.transcript) || !Array.isArray(value.turnSession) || !Array.isArray(value.markers) || !Array.isArray(value.usageEvidence) || !Array.isArray(value.promptEvidence) || !Array.isArray(value.cortexReceipts) || !Array.isArray(value.councilReceipts) || !Array.isArray(value.workspaceAssociations) || !Array.isArray(value.sectionAvailability)) return null
+function boundedText(value: unknown, maxLength = 64 * 1024): string | null {
+  return typeof value === 'string' && UTF8_ENCODER.encode(value).byteLength <= maxLength ? value : null
+}
+function nullableBoundedText(value: unknown, maxLength = 64 * 1024): string | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  const normalized = boundedText(value, maxLength)
+  return normalized === null ? undefined : normalized
+}
+function normalizeTranscriptProvider(value: unknown): AgentInspectionProviderIdentityV1 | null {
+  if (value === null || value === undefined) return null
+  if (!isUnknownRecord(value)) return null
+  const adapter = boundedString(value.adapter, 128)
+  const providerId = nullableBoundedString(value.providerId, 128)
+  const modelId = nullableBoundedString(value.modelId, 256)
+  const connectionRevision = value.connectionRevision === null
+    ? null
+    : typeof value.connectionRevision === 'number' && Number.isSafeInteger(value.connectionRevision) && value.connectionRevision >= 0
+      ? value.connectionRevision
+      : typeof value.connectionRevision === 'string' ? boundedString(value.connectionRevision, 256) : undefined
+  const fingerprint = nullableBoundedString(value.fingerprint, 256)
+  if (!adapter || providerId === undefined || modelId === undefined || connectionRevision === undefined || fingerprint === undefined) return null
+  return { adapter, providerId, modelId, connectionRevision, fingerprint }
+}
+function normalizeInspectionTranscriptRecord(value: unknown): AgentInspectionTranscriptRecordV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1) return null
+  const id = boundedString(value.id)
+  const kind = isOwn(TRANSCRIPT_KINDS, value.kind) ? value.kind : null
+  const actor = isOwn(TRANSCRIPT_ACTORS, value.actor) ? value.actor : null
+  const recipient = value.recipient === null ? null : isOwn(TRANSCRIPT_ACTORS, value.recipient) ? value.recipient : undefined
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  const occurredAt = dateTimestamp(value.occurredAt)
+  const durationMs = nullableNonNegativeInteger(value.durationMs)
+  const content = nullableBoundedText(value.content)
+  const args = nullableBoundedText(value.arguments)
+  const result = nullableBoundedText(value.result)
+  const provider = normalizeTranscriptProvider(value.provider)
+  const errorReason = value.errorReason === undefined || value.errorReason === null
+    ? null
+    : isInspectionReason(value.errorReason) ? value.errorReason : undefined
+  if (!id || !kind || !actor || recipient === undefined || !correlation || occurredAt === null || durationMs === undefined
+    || content === undefined || args === undefined || result === undefined
+    || value.provider !== undefined && value.provider !== null && !provider
+    || errorReason === undefined || typeof value.late !== 'boolean') return null
+  return { version: 1, id, kind, actor, recipient, correlation, occurredAt, durationMs, late: value.late, content, arguments: args, result, provider, errorReason }
+}
+function normalizeTurnSessionEntry(value: unknown): AgentTurnSessionEntryV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1) return null
+  const id = boundedString(value.id)
+  const kind = isOwn(TURN_SESSION_KINDS, value.kind) ? value.kind : null
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  const occurredAt = dateTimestamp(value.occurredAt)
+  const detail = boundedText(value.detail, 2_048)
+  const rawIds = isIndexedArray(value.transcriptRecordIds) ? value.transcriptRecordIds : null
+  const ids = rawIds && rawIds.length <= MAX_INSPECTION_RECORDS
+    ? rawIds.map((id) => boundedString(id)).filter((id): id is string => id !== null)
+    : null
+  if (!id || !kind || !correlation || occurredAt === null || detail === null || !rawIds || !ids) return null
+  if (ids.length !== rawIds.length) return null
+  return { version: 1, id, kind, correlation, occurredAt, detail, transcriptRecordIds: ids }
+}
+function normalizeLoomSource(value: unknown): LoomPromptInspectionItemV1['source'] | null {
+  if (!isUnknownRecord(value) || value.kind !== 'loom_block') return null
+  const blockId = boundedString(value.blockId, 256)
+  const presetRevision = nonNegativeInteger(value.presetRevision)
+  const blockRevision = nonNegativeInteger(value.blockRevision)
+  const promptOrder = nonNegativeInteger(value.promptOrder)
+  if (!blockId || presetRevision === null || blockRevision === null || promptOrder === null) return null
+  return { kind: 'loom_block', blockId, presetRevision, blockRevision, promptOrder }
+}
+function inspectionExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value)
+  return actual.length === keys.length && keys.every((key) => Object.hasOwn(value, key))
+}
+function normalizePredicateScalar(value: unknown): string | number | boolean | null {
+  if (typeof value === 'string') return boundedString(value, AGENTIC_PREDICATE_MAX_STRING_BYTES)
+  if (typeof value === 'boolean') return value
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+function accountPredicateListBytes(budget: { listBytes: number }, value: string): boolean {
+  budget.listBytes += UTF8_ENCODER.encode(value).byteLength
+  return budget.listBytes <= AGENTIC_PREDICATE_MAX_LIST_BYTES
+}
+function normalizePredicateValue(
+  value: unknown,
+  budget: { listBytes: number },
+): string | number | boolean | string[] | null {
+  const scalar = normalizePredicateScalar(value)
+  if (scalar !== null) return scalar
+  if (!isIndexedArray(value) || value.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS) return null
+  const strings: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return null
+    const normalized = normalizePredicateScalar(item)
+    if (typeof normalized !== 'string' || !accountPredicateListBytes(budget, normalized)) return null
+    strings.push(normalized)
+  }
+  return strings
+}
+function normalizeInspectionPredicate(
+  value: unknown,
+  depth = 1,
+  budget: { nodes: number; listBytes: number } = { nodes: 0, listBytes: 0 },
+): CognitionPredicate | null {
+  if (!isUnknownRecord(value)
+    || depth > AGENTIC_PREDICATE_MAX_DEPTH
+    || budget.nodes >= AGENTIC_PREDICATE_MAX_NODES
+    || typeof value.kind !== 'string') return null
+  budget.nodes += 1
+  if (value.kind === 'all' || value.kind === 'any') {
+    if (!inspectionExactKeys(value, ['kind', 'children'])
+      || !isIndexedArray(value.children)
+      || value.children.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS) return null
+    const children = value.children.map((child) => normalizeInspectionPredicate(child, depth + 1, budget))
+    return children.every((child): child is CognitionPredicate => child !== null)
+      ? { kind: value.kind as 'all' | 'any', children }
+      : null
+  }
+  if (value.kind === 'not') {
+    if (!inspectionExactKeys(value, ['kind', 'child'])) return null
+    const child = normalizeInspectionPredicate(value.child, depth + 1, budget)
+    return child ? { kind: 'not', child } : null
+  }
+  if (value.kind === 'generation_type') {
+    return inspectionExactKeys(value, ['kind', 'value'])
+      && ['normal', 'continue', 'regenerate', 'swipe'].includes(String(value.value))
+      ? { kind: 'generation_type', value: value.value as 'normal' | 'continue' | 'regenerate' | 'swipe' }
+      : null
+  }
+  if (value.kind === 'phase') {
+    const phases = ['ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING', 'COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT']
+    return inspectionExactKeys(value, ['kind', 'value']) && phases.includes(String(value.value))
+      ? { kind: 'phase', value: value.value as never }
+      : null
+  }
+  if (value.kind === 'tool_available') {
+    const toolId = boundedString(value.toolId, 128)
+    return inspectionExactKeys(value, ['kind', 'toolId', 'available']) && toolId && typeof value.available === 'boolean'
+      ? { kind: 'tool_available', toolId, available: value.available }
+      : null
+  }
+  if (value.kind === 'task_transition') {
+    const taskId = boundedString(value.taskId)
+    const transitions = ['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed']
+    return inspectionExactKeys(value, ['kind', 'taskId', 'transition']) && taskId && transitions.includes(String(value.transition))
+      ? { kind: 'task_transition', taskId, transition: value.transition as never }
+      : null
+  }
+  if (value.kind !== 'preset_variable' && value.kind !== 'participant_fact') return null
+  const name = boundedString(value.name)
+  if (!name || typeof value.operator !== 'string') return null
+  if (value.operator === 'equals' && inspectionExactKeys(value, ['kind', 'name', 'operator', 'value'])) {
+    const predicateValue = normalizePredicateValue(value.value, budget)
+    return predicateValue === null
+      ? null
+      : { kind: value.kind as 'preset_variable' | 'participant_fact', name, operator: 'equals', value: predicateValue }
+  }
+  if (value.operator === 'in'
+    && inspectionExactKeys(value, ['kind', 'name', 'operator', 'values'])
+    && isIndexedArray(value.values)
+    && value.values.length > 0
+    && value.values.length <= AGENTIC_PREDICATE_MAX_LIST_ITEMS) {
+    const values: Array<string | number | boolean> = []
+    for (const item of value.values) {
+      const normalized = normalizePredicateScalar(item)
+      if (normalized === null
+        || typeof normalized === 'string' && !accountPredicateListBytes(budget, normalized)) return null
+      values.push(normalized)
+    }
+    return { kind: value.kind as 'preset_variable' | 'participant_fact', name, operator: 'in', values }
+  }
+  if (value.operator === 'includes' && inspectionExactKeys(value, ['kind', 'name', 'operator', 'value'])) {
+    const predicateValue = normalizePredicateScalar(value.value)
+    if (predicateValue === null
+      || typeof predicateValue === 'string' && !accountPredicateListBytes(budget, predicateValue)) return null
+    return { kind: value.kind as 'preset_variable' | 'participant_fact', name, operator: 'includes', value: predicateValue }
+  }
+  return value.operator === 'present' && inspectionExactKeys(value, ['kind', 'name', 'operator'])
+    ? { kind: value.kind as 'preset_variable' | 'participant_fact', name, operator: 'present' }
+    : null
+}
+function normalizeLoomOutcome(value: unknown): LoomPromptInspectionItemV1['outcome'] | null {
+  if (!isUnknownRecord(value) || typeof value.status !== 'string') return null
+  if (value.status === 'included' && nonNegativeInteger(value.effectiveIndex) !== null && value.reason === 'selected') {
+    return { status: 'included', effectiveIndex: value.effectiveIndex as number, reason: 'selected' }
+  }
+  if (value.status === 'skipped' && ['checkpoint_not_reached', 'condition_not_met', 'stale_source'].includes(String(value.reason))) {
+    return { status: 'skipped', reason: value.reason as never }
+  }
+  if (value.status === 'rejected' && ['invalid_source', 'stale_source', 'required_source_unavailable'].includes(String(value.reason))) {
+    return { status: 'rejected', reason: value.reason as never }
+  }
+  if (value.status === 'omitted' && ['response_mode', 'destination_unavailable', 'not_work_surface'].includes(String(value.reason))) {
+    return { status: 'omitted', reason: value.reason as never }
+  }
+  if (value.status === 'deduplicated') {
+    const keptEntryId = boundedString(value.keptEntryId)
+    const destination = ['root_work', 'completion_handoff', 'render'].includes(String(value.destination))
+      ? value.destination as LoomPromptInspectionItemV1['destination']
+      : null
+    return keptEntryId && destination && value.reason === 'destination_overlap'
+      ? { status: 'deduplicated', reason: 'destination_overlap', keptEntryId, destination }
+      : null
+  }
+  return null
+}
+function normalizeLoomInspectionItem(value: unknown): LoomPromptInspectionItemV1 | null {
+  if (!isUnknownRecord(value)) return null
+  const entryId = boundedString(value.entryId)
+  const bucket = ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'].includes(String(value.bucket))
+    ? value.bucket as LoomPromptInspectionItemV1['bucket']
+    : null
+  const destination = ['root_work', 'completion_handoff', 'render'].includes(String(value.destination))
+    ? value.destination as LoomPromptInspectionItemV1['destination']
+    : null
+  const checkpoint = ['ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER'].includes(String(value.checkpoint))
+    ? value.checkpoint as LoomPromptInspectionItemV1['checkpoint']
+    : null
+  const source = normalizeLoomSource(value.source)
+  const condition = value.condition === undefined
+    ? undefined
+    : normalizeInspectionPredicate(value.condition)
+  const conditionResult = value.conditionResult === undefined
+    ? undefined
+    : ['true', 'false', 'not_evaluated', 'invalid', 'not_applicable'].includes(String(value.conditionResult))
+      ? value.conditionResult as LoomPromptInspectionItemV1['conditionResult']
+      : null
+  const effectiveText = value.effectiveText === null ? null : boundedText(value.effectiveText)
+  const outcome = normalizeLoomOutcome(value.outcome)
+  if (!entryId || !bucket || !destination || !checkpoint || !source
+    || condition === null
+    || conditionResult === null
+    || effectiveText === null && value.effectiveText !== null
+    || typeof value.required !== 'boolean'
+    || typeof value.ordinaryPromptSuppressed !== 'boolean'
+    || !outcome) return null
+  return {
+    entryId,
+    bucket,
+    destination,
+    checkpoint,
+    source,
+    ...(condition === undefined ? {} : { condition }),
+    ...(conditionResult === undefined ? {} : { conditionResult }),
+    effectiveText,
+    required: value.required,
+    ordinaryPromptSuppressed: value.ordinaryPromptSuppressed,
+    outcome,
+  }
+}
+function normalizeLoomResponseOmission(value: unknown): NonNullable<LoomPromptInspectionV1['responseOmission']> | null | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!isUnknownRecord(value) || value.version !== 1 || value.surface !== 'RESPONSE' || value.visibility !== 'work_only' || value.reason !== 'work_only'
+    || !isIndexedArray(value.omittedEntryIds) || value.omittedEntryIds.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS
+    || !isIndexedArray(value.source) || value.source.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS
+    || !isIndexedArray(value.omittedPhaseInstructions) || value.omittedPhaseInstructions.length > LOOM_RESPONSE_OMISSION_MAX_PHASE_INSTRUCTIONS) return null
+  const allowedKeys: Record<string, true> = {
+    version: true, surface: true, visibility: true, reason: true,
+    omittedEntryIds: true, source: true, omittedPhaseInstructions: true, reviewReason: true,
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys[key]) return null
+  }
+  for (const key of ['version', 'surface', 'visibility', 'reason', 'omittedEntryIds', 'source', 'omittedPhaseInstructions']) {
+    if (!Object.hasOwn(value, key)) return null
+  }
+  const omittedEntryIds = value.omittedEntryIds.map((id) => boundedString(id))
+  const source = value.source.map(normalizeLoomSource)
+  const omittedPhaseInstructions = value.omittedPhaseInstructions.map((item) => {
+    if (!isUnknownRecord(item)) return null
+    const instructionKeys: Record<string, true> = { phaseId: true, source: true, profileId: true }
+    for (const key of Object.keys(item)) {
+      if (!instructionKeys[key]) return null
+    }
+    if (!Object.hasOwn(item, 'phaseId') || !Object.hasOwn(item, 'source')) return null
+    const phaseId = boundedString(item.phaseId)
+    const phaseSource = normalizeLoomSource(item.source)
+    if (!phaseId || !phaseSource || !/^[a-z][a-z0-9_]{0,63}$/.test(phaseId)) return null
+    if (!Object.hasOwn(item, 'profileId')) return { phaseId, source: phaseSource }
+    const profileId = boundedString(item.profileId)
+    if (!profileId || !/^[a-z][a-z0-9_]{0,63}$/.test(profileId)) return null
+    return { phaseId, source: phaseSource, profileId }
+  })
+  if (omittedEntryIds.some((id) => id === null) || source.some((item) => item === null) || omittedPhaseInstructions.some((item) => item === null)) return null
+  const reviewReason = Object.hasOwn(value, 'reviewReason') ? boundedString(value.reviewReason) : undefined
+  if (Object.hasOwn(value, 'reviewReason') && reviewReason === null) return null
+  return {
+    version: 1,
+    surface: 'RESPONSE',
+    visibility: 'work_only',
+    reason: 'work_only',
+    omittedEntryIds: omittedEntryIds as string[],
+    source: source as NonNullable<LoomPromptInspectionV1['responseOmission']>['source'],
+    omittedPhaseInstructions: omittedPhaseInstructions as NonNullable<LoomPromptInspectionV1['responseOmission']>['omittedPhaseInstructions'],
+    ...(reviewReason === undefined ? {} : { reviewReason }),
+  }
+}
+function normalizeLoomInspection(value: unknown): LoomPromptInspectionV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1 || !['WORK', 'RESPONSE'].includes(String(value.surface))
+    || !['ASSEMBLE', 'WORK', 'PREPARE_COMMIT', 'RENDER'].includes(String(value.checkpoint))
+    || !isIndexedArray(value.items) || value.items.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS
+    || !isIndexedArray(value.effectiveEntryIds) || value.effectiveEntryIds.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS) return null
+  const items = value.items.map(normalizeLoomInspectionItem)
+  const effectiveEntryIds = value.effectiveEntryIds.map((id) => boundedString(id)).filter((id): id is string => id !== null)
+  const responseOmission = normalizeLoomResponseOmission(value.responseOmission)
+  if (items.some((item) => item === null) || effectiveEntryIds.length !== value.effectiveEntryIds.length
+    || responseOmission === null) return null
+  return {
+    version: 1,
+    surface: value.surface as LoomPromptInspectionV1['surface'],
+    checkpoint: value.checkpoint as LoomPromptInspectionV1['checkpoint'],
+    items: items as LoomPromptInspectionV1['items'],
+    effectiveEntryIds,
+    ...(responseOmission === undefined ? {} : { responseOmission }),
+  }
+}
+function normalizePromptRevision(value: unknown): string | number | null {
+  if (typeof value === 'string') return boundedString(value)
+  return nonNegativeInteger(value)
+}
+function normalizeSha256(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null
+}
+function normalizePromptDatabankSource(value: unknown): AgentPromptDatabankSourceV1 | null {
+  if (!isUnknownRecord(value) || !inspectionExactKeys(value, ['kind', 'databankId', 'documentId', 'documentName', 'chunkId', 'documentContentHash', 'contentHash'])) return null
+  const kind = value.kind === 'automatic' || value.kind === 'mention' ? value.kind : null
+  const databankId = boundedString(value.databankId)
+  const documentId = boundedString(value.documentId)
+  const documentName = boundedString(value.documentName)
+  const chunkId = value.chunkId === null ? null : boundedString(value.chunkId)
+  const documentContentHash = value.documentContentHash === null ? null : normalizeSha256(value.documentContentHash)
+  const contentHash = normalizeSha256(value.contentHash)
+  if (!kind || !databankId || !documentId || !documentName || chunkId === null && value.chunkId !== null
+    || documentContentHash === null && value.documentContentHash !== null || !contentHash) return null
+  return { kind, databankId, documentId, documentName, chunkId, documentContentHash, contentHash }
+}
+function normalizePromptNativeProvenance(value: unknown): AgentPromptNativeProvenanceV1 | null {
+  if (!isUnknownRecord(value)) return null
+  if (value.kind === 'world_info') {
+    if (!inspectionExactKeys(value, ['kind', 'sourceId', 'sourceRevision', 'sourceIndex'])) return null
+    const sourceId = boundedString(value.sourceId)
+    const sourceRevision = normalizePromptRevision(value.sourceRevision)
+    const sourceIndex = nonNegativeInteger(value.sourceIndex)
+    return sourceId && sourceRevision !== null && sourceIndex !== null
+      ? { kind: 'world_info', sourceId, sourceRevision, sourceIndex }
+      : null
+  }
+  if (value.kind === 'databank') {
+    if (!inspectionExactKeys(value, ['kind', 'sourceRevision', 'sources']) || !isIndexedArray(value.sources)
+      || value.sources.length > MAX_INSPECTION_RECORDS) return null
+    const sourceRevision = boundedString(value.sourceRevision)
+    const sources = value.sources.map(normalizePromptDatabankSource)
+    if (!sourceRevision || sources.some((source) => source === null)) return null
+    return { kind: 'databank', sourceRevision, sources: sources as AgentPromptDatabankSourceV1[] }
+  }
+  return null
+}
+function normalizeRenderCrossing(value: unknown): AgentRenderCrossingV1 | null {
+  if (!isUnknownRecord(value) || !inspectionExactKeys(value, ['version', 'id', 'kind', 'sourceId', 'sourceRevision', 'contentDigest', 'content', 'correlation']) || value.version !== 1) return null
+  const id = boundedString(value.id)
+  const kind = value.kind === 'accepted_finding' || value.kind === 'accepted_submission' || value.kind === 'completion_guidance' ? value.kind : null
+  const sourceId = boundedString(value.sourceId)
+  const sourceRevision = value.sourceRevision === null ? null : nonNegativeInteger(value.sourceRevision)
+  const contentDigest = normalizeSha256(value.contentDigest)
+  const content = value.content === null ? null : boundedText(value.content)
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  if (!id || !kind || !sourceId || sourceRevision === null && value.sourceRevision !== null || !contentDigest
+    || content === null && value.content !== null || !correlation) return null
+  return { version: 1, id, kind, sourceId, sourceRevision, contentDigest, content, correlation }
+}
+function normalizePromptEvidence(value: unknown): AgentPromptEvidenceV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1) return null
+  const id = boundedString(value.id)
+  const sourceId = boundedString(value.sourceId)
+  const sourceRevision = normalizePromptRevision(value.sourceRevision)
+  const destination = isOwn(PROMPT_DESTINATIONS, value.destination) ? value.destination : null
+  const role = isOwn(PROMPT_ROLES, value.role) ? value.role : null
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  const content = boundedText(value.content)
+  const contentDigest = normalizeSha256(value.contentDigest)
+  const omissionReason = nullableBoundedText(value.omissionReason, 2_048)
+  const nativeProvenance = value.nativeProvenance === null ? null : normalizePromptNativeProvenance(value.nativeProvenance)
+  const loomInspection = value.loomInspection === null ? null : normalizeLoomInspection(value.loomInspection)
+  if (!id || !sourceId || sourceRevision === null || !destination || !role || !correlation || typeof value.included !== 'boolean'
+    || content === null || !contentDigest || omissionReason === undefined || !Object.hasOwn(value, 'nativeProvenance') || !Object.hasOwn(value, 'loomInspection')
+    || value.nativeProvenance !== null && nativeProvenance === null || value.loomInspection !== null && loomInspection === null) return null
+  return { version: 1, id, sourceId, sourceRevision, destination, role, correlation, included: value.included, content, contentDigest, omissionReason, nativeProvenance, loomInspection }
+}
+function normalizeCortexReceipt(value: unknown): AgentCortexReceiptV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1 || value.checkpoint !== 'WORK' || value.canonical !== false) return null
+  const id = boundedString(value.id)
+  const requestId = boundedString(value.requestId)
+  const attemptId = boundedString(value.attemptId)
+  const snapshotId = boundedString(value.snapshotId)
+  const sourceRevision = typeof value.sourceRevision === 'string' ? boundedString(value.sourceRevision) : nonNegativeInteger(value.sourceRevision)
+  const revision = typeof value.revision === 'string' ? boundedString(value.revision) : nonNegativeInteger(value.revision)
+  const scope = isUnknownRecord(value.scope) ? value.scope : null
+  const scopeChatId = scope ? boundedString(scope.chatId) : null
+  const targetMessageId = scope === null ? undefined : nullableBoundedString(scope.targetMessageId)
+  const targetSwipeId = scope === null ? undefined : nullableNonNegativeInteger(scope.targetSwipeId)
+  const required = typeof value.required === 'boolean' ? value.required : null
+  const startedAt = dateTimestamp(value.startedAt)
+  const completedAt = nullableDateTimestamp(value.completedAt)
+  const state = isOwn(CORTEX_STATES, value.state) ? value.state : null
+  const resultDigest = value.resultDigest === null ? null : boundedString(value.resultDigest, 256)
+  const resultCount = nonNegativeInteger(value.resultCount)
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  const reason = value.reason === null ? null : isInspectionReason(value.reason) ? value.reason : undefined
+  const omission = (() => {
+    const rawOmission = value.omission
+    if (rawOmission === null) return null
+    if (!isUnknownRecord(rawOmission)) return undefined
+    const omissionReason = isOwn(CORTEX_OMISSION_REASONS, rawOmission.reason) ? rawOmission.reason : null
+    const omissionRequired = typeof rawOmission.required === 'boolean' ? rawOmission.required : null
+    const omissionDetail = rawOmission.detail === null ? null : boundedText(rawOmission.detail, 2_048)
+    if (!omissionReason || omissionRequired === null || omissionDetail === null && rawOmission.detail !== null) return undefined
+    return { reason: omissionReason, required: omissionRequired, detail: omissionDetail }
+  })()
+  if (!id || !requestId || !attemptId || !snapshotId || sourceRevision === null || revision === null || !scopeChatId
+    || targetMessageId === undefined || targetSwipeId === undefined || required === null || startedAt === null || completedAt === undefined
+    || !state || resultDigest === null && value.resultDigest !== null || resultCount === null || !correlation || reason === undefined || omission === undefined) return null
+  return { version: 1, id, requestId, attemptId, checkpoint: 'WORK', snapshotId, sourceRevision, revision, scope: { chatId: scopeChatId, targetMessageId, targetSwipeId }, required, startedAt, completedAt, state, resultDigest, resultCount, correlation, reason, omission, canonical: false }
+}
+function normalizeCouncilReceipt(value: unknown): AgentCouncilReceiptV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1 || value.checkpoint !== 'WORK' || value.canonical !== false) return null
+  const id = boundedString(value.id)
+  const requestId = boundedString(value.requestId)
+  const startedAt = dateTimestamp(value.startedAt)
+  const completedAt = nullableDateTimestamp(value.completedAt)
+  const state = isOwn(CORTEX_STATES, value.state) ? value.state : null
+  const memberCount = nonNegativeInteger(value.memberCount)
+  const resultDigest = value.resultDigest === null ? null : boundedString(value.resultDigest, 256)
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  const reason = value.reason === null ? null : isInspectionReason(value.reason) ? value.reason : undefined
+  const required = typeof value.required === 'boolean' ? value.required : null
+  if (!id || !requestId || startedAt === null || completedAt === undefined || !state || memberCount === null
+    || resultDigest === null && value.resultDigest !== null || !correlation || reason === undefined || required === null) return null
+  return { version: 1, id, requestId, checkpoint: 'WORK', required, startedAt, completedAt, state, memberCount, resultDigest, correlation, reason, canonical: false }
+}
+function normalizeWorkspaceAssociation(value: unknown): AgentWorkspaceAssociationV1 | null {
+  if (!isUnknownRecord(value) || value.version !== 1) return null
+  const id = boundedString(value.id)
+  const workspaceId = boundedString(value.workspaceId)
+  const workspaceRevision = nonNegativeInteger(value.workspaceRevision)
+  const relation = isOwn(WORKSPACE_ASSOCIATION_RELATIONS, value.relation) ? value.relation : null
+  const objectKind = isOwn(WORKSPACE_ASSOCIATION_KINDS, value.objectKind) ? value.objectKind : null
+  const objectId = nullableBoundedString(value.objectId)
+  const sourceRevision = nullableNonNegativeInteger(value.sourceRevision)
+  const provenanceDigest = value.provenanceDigest === null
+    ? null
+    : typeof value.provenanceDigest === 'string' && value.provenanceDigest.length === 64 && UTF8_ENCODER.encode(value.provenanceDigest).byteLength === 64
+      ? value.provenanceDigest
+      : undefined
+  const correlation = normalizeInspectionCorrelation(value.correlation)
+  if (!id || !workspaceId || workspaceRevision === null || !relation || !objectKind || objectId === undefined
+    || sourceRevision === undefined || typeof value.sourceDeleted !== 'boolean' || provenanceDigest === undefined || !correlation) return null
+  return { version: 1, id, workspaceId, workspaceRevision, relation, objectKind, objectId, sourceRevision, sourceDeleted: value.sourceDeleted, provenanceDigest, correlation }
+}
+
+function normalizeStrictInspectionArray<T>(value: unknown, normalize: (item: unknown) => T | null): T[] | null {
+  if (!isIndexedArray(value) || value.length > MAX_INSPECTION_RECORDS) return null
+  const normalized: T[] = []
+  for (const item of value) {
+    const result = normalize(item)
+    if (result === null) return null
+    normalized.push(result)
+  }
+  return normalized
+}
+
+export function normalizeAgentRunInspectionDetailV1(value: unknown, expectedAttemptId?: string, expectedChatId?: string): AgentRunInspectionDetailV1 | null {
+  if (!isUnknownRecord(value)
+    || !isIndexedArray(value.transcript)
+    || !isIndexedArray(value.turnSession)
+    || !isIndexedArray(value.markers)
+    || !isIndexedArray(value.usageEvidence)
+    || !isIndexedArray(value.promptEvidence)
+    || !isIndexedArray(value.renderCrossings)
+    || !isIndexedArray(value.cortexReceipts)
+    || !isIndexedArray(value.councilReceipts)
+    || !isIndexedArray(value.workspaceAssociations)
+    || !isIndexedArray(value.sectionAvailability)) return null
   const summary = normalizeInspectionSummary(value)
   const usage = normalizeInspectionUsageProjection(value.usage)
   const retry = normalizeInspectionRetry(value.retry)
   const error = value.error === null ? null : normalizeInspectionErrorDetail(value.error)
-  const markers = value.markers.slice(0, MAX_INSPECTION_RECORDS).map(normalizeInspectionMarker)
-  const usageEvidence = value.usageEvidence.slice(0, MAX_INSPECTION_RECORDS).map(normalizeInspectionUsageEvidence)
+  const transcript = normalizeStrictInspectionArray(value.transcript, normalizeInspectionTranscriptRecord)
+  const turnSession = normalizeStrictInspectionArray(value.turnSession, normalizeTurnSessionEntry)
+  const markers = normalizeStrictInspectionArray(value.markers, normalizeInspectionMarker)
+  const usageEvidence = normalizeStrictInspectionArray(value.usageEvidence, normalizeInspectionUsageEvidence)
+  const promptEvidence = normalizeStrictInspectionArray(value.promptEvidence, normalizePromptEvidence)
+  const renderCrossings = normalizeStrictInspectionArray(value.renderCrossings, normalizeRenderCrossing)
+  const cortexReceipts = normalizeStrictInspectionArray(value.cortexReceipts, normalizeCortexReceipt)
+  const councilReceipts = normalizeStrictInspectionArray(value.councilReceipts, normalizeCouncilReceipt)
+  const workspaceAssociations = normalizeStrictInspectionArray(value.workspaceAssociations, normalizeWorkspaceAssociation)
   const stop = value.stop === null ? null : normalizeInspectionStop(value.stop)
   const sectionAvailability = inspectionAvailability(value.sectionAvailability)
-  if (!summary || !usage || !retry || !sectionAvailability || value.error !== null && !error || markers.some((item) => item === null) || usageEvidence.some((item) => item === null) || value.stop !== null && !stop) return null
+  if (!summary || !usage || !retry || !sectionAvailability
+    || expectedAttemptId !== undefined && summary.attempt.attemptId !== expectedAttemptId
+    || expectedChatId !== undefined && summary.attempt.target.chatId !== expectedChatId
+    || value.error !== null && !error
+    || !transcript || !turnSession || !markers || !usageEvidence || !promptEvidence || !renderCrossings || !cortexReceipts || !councilReceipts || !workspaceAssociations
+    || value.stop !== null && !stop
+    || usage.inspectionAttemptId !== summary.attempt.attemptId
+    || retry.linkedAttemptId !== null && retry.linkedAttemptId !== summary.attempt.attemptId
+    || error !== null && (error.inspectionAttemptId !== summary.attempt.attemptId || !sameWorkTarget(error.target, summary.attempt.target))
+    || !sameActivityTarget(summary.activity.target, summary.attempt.target)) return null
+  const correlations: AgentInspectionCorrelationV1[] = []
+  const addCorrelation = (correlation: AgentInspectionCorrelationV1 | null) => {
+    if (correlation) correlations.push(correlation)
+  }
+  transcript.forEach((item) => addCorrelation(item.correlation))
+  turnSession.forEach((item) => addCorrelation(item.correlation))
+  markers.forEach((item) => addCorrelation(item.correlation))
+  usageEvidence.forEach((item) => addCorrelation(item.correlation))
+  promptEvidence.forEach((item) => addCorrelation(item.correlation))
+  renderCrossings.forEach((item) => addCorrelation(item.correlation))
+  let invalidCortexScope = false
+  cortexReceipts.forEach((item) => {
+    if (item.attemptId !== summary.attempt.attemptId
+      || item.scope.chatId !== summary.attempt.target.chatId
+      || item.scope.targetMessageId !== summary.attempt.target.messageId
+      || item.scope.targetSwipeId !== summary.attempt.target.swipeId) invalidCortexScope = true
+    addCorrelation(item.correlation)
+  })
+  councilReceipts.forEach((item) => addCorrelation(item.correlation))
+  workspaceAssociations.forEach((item) => addCorrelation(item.correlation))
+  summary.activity.milestones.forEach((item) => {
+    addCorrelation(item.correlation)
+    addCorrelation(item.usage?.correlation ?? null)
+  })
+  summary.activity.markers.forEach((item) => addCorrelation(item.correlation))
+  usage.layers.forEach((item) => addCorrelation(item.correlation))
+  if (invalidCortexScope || correlations.some((correlation) => !sameInspectionCorrelationIdentity(correlation, summary))) return null
   return {
     ...summary,
-    transcript: value.transcript.slice(0, MAX_INSPECTION_RECORDS) as AgentRunInspectionDetailV1['transcript'],
-    turnSession: value.turnSession.slice(0, MAX_INSPECTION_RECORDS) as AgentRunInspectionDetailV1['turnSession'],
-    markers: markers.filter((item): item is AgentInspectionMarkerV1 => item !== null),
-    usageEvidence: usageEvidence.filter((item): item is AgentInspectionUsageV1 => item !== null),
+    transcript,
+    turnSession,
+    markers,
+    usageEvidence,
     usage,
     error,
-    promptEvidence: value.promptEvidence.slice(0, MAX_INSPECTION_RECORDS) as AgentRunInspectionDetailV1['promptEvidence'],
-    cortexReceipts: value.cortexReceipts.slice(0, MAX_INSPECTION_RECORDS) as AgentCortexReceiptV1[],
-    councilReceipts: value.councilReceipts.slice(0, MAX_INSPECTION_RECORDS) as AgentCouncilReceiptV1[],
-    workspaceAssociations: value.workspaceAssociations.slice(0, MAX_INSPECTION_RECORDS) as AgentRunInspectionDetailV1['workspaceAssociations'],
+    promptEvidence,
+    renderCrossings,
+    cortexReceipts,
+    councilReceipts,
+    workspaceAssociations,
     stop,
     retry,
     sectionAvailability,
@@ -979,14 +1815,19 @@ export function normalizeAgentRunInspectionRetryResponseV1(value: unknown): Agen
 }
 
 export function normalizeAgentRunInspectionListV1(value: unknown): AgentRunInspectionListV1 | null {
-  if (!isUnknownRecord(value) || value.version !== 1 || !Array.isArray(value.runs)) return null
+  if (!isUnknownRecord(value) || value.version !== 1 || !isIndexedArray(value.runs) || value.runs.length > MAX_INSPECTION_LIST_RUNS) return null
   const chatId = boundedString(value.chatId)
   if (!chatId) return null
   const nextCursor = value.nextCursor === null ? null : boundedString(value.nextCursor, MAX_CURSOR_LENGTH)
   if (nextCursor === null && value.nextCursor !== null) return null
-  const runs = value.runs.slice(0, 64).map(normalizeInspectionSummary).filter((run): run is AgentRunInspectionSummaryV1 => run !== null)
   const omission = value.omission === null ? null : normalizeInspectionMarker(value.omission)
-  if (value.omission !== null && !omission) return null
+  const runs: AgentRunInspectionSummaryV1[] = []
+  for (const raw of value.runs) {
+    const run = normalizeInspectionSummary(raw)
+    if (!run || run.attempt.target.chatId !== chatId) return null
+    runs.push(run)
+  }
+  if (value.omission !== null && !omission || omission !== null && omission.correlation !== null && omission.correlation.chatId !== chatId) return null
   return { version: 1, chatId, runs, nextCursor, omission }
 }
 
@@ -1063,27 +1904,48 @@ function withoutChat<T extends AgentRunPublicV2>(values: Record<string, T>, chat
   return Object.fromEntries(Object.entries(values).filter(([, run]) => run.chatId !== chatId))
 }
 function workspaceRequestKey(turnId: string, section?: AgentWorkspaceSectionV2): string { return `${turnId}:${section ?? 'index'}` }
-function emptyWorkspaceSectionPreview(turnId: string, section: AgentWorkspaceSectionV2, workspaceRevision: number): AgentWorkspaceSectionPreviewV2 {
-  return { version: 2, turnId, section, workspaceRevision, entries: [], nextPage: null, omitted: 0 }
+function emptyWorkspaceSectionPreview(
+  turnId: string,
+  section: AgentWorkspaceSectionV2,
+  workspaceRevision: number,
+): AgentWorkspaceSectionPreviewV2 {
+  return {
+    version: 2,
+    turnId,
+    section,
+    workspaceRevision,
+    entries: [],
+    nextPage: null,
+    omitted: 0,
+  }
 }
-function normalizePersistentWorkspace(value: unknown): AgentPersistentWorkspaceV1 | null {
+export function normalizePersistentWorkspace(
+  value: unknown,
+  expectedWorkspaceId?: string,
+  expectedChatId?: string | null,
+): AgentPersistentWorkspaceV1 | null {
   if (!isUnknownRecord(value) || value.version !== 1) return null
   const id = boundedString(value.id)
   const userId = boundedString(value.userId)
   const chatId = value.chatId === null ? null : boundedString(value.chatId)
-  const objective = typeof value.objective === 'string' ? value.objective : null
+  const objective = isText(value.objective) ? value.objective : null
   const revision = nonNegativeInteger(value.revision)
-  const createdAt = nonNegativeInteger(value.createdAt)
-  const updatedAt = nonNegativeInteger(value.updatedAt)
-  if (!id || !userId || chatId === undefined || objective === null || revision === null || createdAt === null || updatedAt === null || !isUnknownRecord(value.metadata) || !isUnknownRecord(value.progress) || !isUnknownRecord(value.quota) || !isUnknownRecord(value.usage)) return null
+  const createdAt = dateSeconds(value.createdAt)
+  const updatedAt = dateSeconds(value.updatedAt)
+  if (!id || !userId || chatId === null && value.chatId !== null || objective === null || revision === null || createdAt === null || updatedAt === null
+    || !isUnknownRecord(value.metadata) || !isUnknownRecord(value.progress) || !isUnknownRecord(value.quota) || !isUnknownRecord(value.usage)
+    || expectedWorkspaceId !== undefined && id !== expectedWorkspaceId
+    || expectedChatId !== undefined && chatId !== expectedChatId) return null
   const metadata = value.metadata
-  const labels = Array.isArray(metadata.labels) && metadata.labels.every((label) => typeof label === 'string') ? metadata.labels : null
+  const labels = isStringArray(metadata.labels) ? metadata.labels : null
   const progressState = ['not_started', 'in_progress', 'blocked', 'completed'].includes(String(value.progress.state))
   const percent = typeof value.progress.percent === 'number' && Number.isFinite(value.progress.percent) && value.progress.percent >= 0 && value.progress.percent <= 100 ? value.progress.percent : null
-  const progressUpdatedAt = nonNegativeInteger(value.progress.updatedAt)
+  const progressUpdatedAt = dateSeconds(value.progress.updatedAt)
   const quotaValues = ['maxTasks', 'maxRecords', 'maxSubmissions', 'maxArtifacts', 'maxPublications', 'maxBytes'].map((key) => nonNegativeInteger(value.quota[key]))
   const usageValues = ['taskCount', 'recordCount', 'submissionCount', 'artifactCount', 'publicationCount', 'byteCount'].map((key) => nonNegativeInteger(value.usage[key]))
-  if (typeof metadata.title !== 'string' || typeof metadata.summary !== 'string' || !labels || typeof metadata.ownerNote !== 'string' || !progressState || percent === null || typeof value.progress.summary !== 'string' || progressUpdatedAt === null || !['active', 'archived'].includes(String(value.state)) || quotaValues.some((item) => item === null) || usageValues.some((item) => item === null)) return null
+  if (!isText(metadata.title) || !isText(metadata.summary) || !labels || !isText(metadata.ownerNote) || !progressState || percent === null
+    || !isText(value.progress.summary) || progressUpdatedAt === null || !['active', 'archived'].includes(String(value.state))
+    || quotaValues.some((item) => item === null) || usageValues.some((item) => item === null)) return null
   return {
     version: 1,
     id,
@@ -1112,10 +1974,16 @@ type PersistentWorkspaceCollectionItemMapV1 = {
 type PersistentWorkspaceCollectionArrayMapV1 = {
   [Collection in AgentPersistentWorkspaceCollectionV1]: PersistentWorkspaceCollectionItemMapV1[Collection][]
 }
-function isText(value: unknown): value is string { return typeof value === 'string' }
+function isText(value: unknown): value is string { return typeof value === 'string' && UTF8_ENCODER.encode(value).byteLength <= MAX_WORKSPACE_TEXT_LENGTH }
 function isNullableText(value: unknown): value is string | null { return value === null || isText(value) }
-function isStringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every(isText) }
+function isNullableBoundedIdentifier(value: unknown): value is string | null {
+  return value === null || boundedString(value) !== null
+}
+function isStringArray(value: unknown): value is string[] {
+  return isIndexedArray(value) && value.length <= MAX_WORKSPACE_STRING_ARRAY_ITEMS && value.every((item) => boundedString(item, MAX_WORKSPACE_TEXT_LENGTH) !== null)
+}
 function isNullableNonNegativeInteger(value: unknown): boolean { return value === null || nonNegativeInteger(value) !== null }
+function isNullableDateSeconds(value: unknown): boolean { return value === null || dateSeconds(value) !== null }
 function isPersistentWorkspaceProgressShape(value: unknown): boolean {
   if (!isUnknownRecord(value)) return false
   return ['not_started', 'in_progress', 'blocked', 'completed'].includes(String(value.state))
@@ -1124,7 +1992,7 @@ function isPersistentWorkspaceProgressShape(value: unknown): boolean {
     && value.percent >= 0
     && value.percent <= 100
     && isText(value.summary)
-    && nonNegativeInteger(value.updatedAt) !== null
+    && dateSeconds(value.updatedAt) !== null
 }
 function isPersistentWorkspaceMetadataShape(value: unknown): boolean {
   if (!isUnknownRecord(value)) return false
@@ -1145,31 +2013,62 @@ function isPersistentWorkspacePublicationCopyShape(value: unknown): boolean {
       && isPersistentWorkspaceProgressShape(value.progress)
       && isText(value.summary)
   }
-  if (value.category === 'finding') return isPersistentWorkspaceRecordContentShape(value.content) && isNullableText(value.taskId)
+  if (value.category === 'finding') return isPersistentWorkspaceRecordContentShape(value.content) && isNullableBoundedIdentifier(value.taskId)
   if (value.category === 'objective') return isText(value.objective) && isPersistentWorkspaceMetadataShape(value.metadata)
   if (value.category === 'artifact') return isText(value.blobDigest) && isText(value.mimeType) && nonNegativeInteger(value.byteCount) !== null && isText(value.provenance)
   return false
 }
 function hasPersistentWorkspaceCollectionShape(collection: AgentPersistentWorkspaceCollectionV1, item: Record<string, unknown>): boolean {
-  const common = boundedString(item.workspaceId)
+  const identity = boundedString(item.workspaceId)
     && boundedString(item.userId)
-    && isNullableText(item.chatId)
+    && isNullableBoundedIdentifier(item.chatId)
     && nonNegativeInteger(item.revision) !== null
-    && nonNegativeInteger(item.createdAt) !== null
-    && nonNegativeInteger(item.updatedAt) !== null
+  if (!identity) return false
+  if (collection === 'publications') {
+    return (item.category === 'task' || item.category === 'finding' || item.category === 'objective' || item.category === 'artifact')
+      && boundedString(item.sourceId)
+      && nonNegativeInteger(item.sourceRevision) !== null
+      && isText(item.sourceDigest)
+      && isUnknownRecord(item.sourceProvenance)
+      && boundedString(item.sourceProvenance.workspaceId)
+      && isNullableBoundedIdentifier(item.sourceProvenance.turnSessionId)
+      && isNullableBoundedIdentifier(item.sourceProvenance.attemptId)
+      && isNullableBoundedIdentifier(item.sourceProvenance.executionId)
+      && isText(item.sourceProvenance.sourceDigest)
+      && isNullableBoundedIdentifier(item.sourceProvenance.sourceChatId)
+      && isNullableBoundedIdentifier(item.sourceProvenance.sourceMessageId)
+      && isNullableNonNegativeInteger(item.sourceProvenance.sourceSwipeId)
+      && isNullableDateSeconds(item.sourceProvenance.sourceDeletedAt)
+      && isText(item.sourceProvenance.creator)
+      && dateSeconds(item.sourceProvenance.capturedAt) !== null
+      && dateSeconds(item.sourceCreatedAt) !== null
+      && dateSeconds(item.sourceUpdatedAt) !== null
+      && isNullableDateSeconds(item.sourceDeletedAt)
+      && (item.sourceStatus === 'present' || item.sourceStatus === 'deleted')
+      && isUnknownRecord(item.copy)
+      && item.copy.category === item.category
+      && isPersistentWorkspacePublicationCopyShape(item.copy)
+      && isText(item.copyDigest)
+      && dateSeconds(item.publishedAt) !== null
+      && isText(item.publishedBy)
+      && item.revision === 1
+  }
+  const common = identity
+    && dateSeconds(item.createdAt) !== null
+    && dateSeconds(item.updatedAt) !== null
   if (!common) return false
   if (collection === 'sessions') {
-    return boundedString(item.chatId)
+    return isNullableBoundedIdentifier(item.chatId)
       && boundedString(item.turnId)
       && boundedString(item.attemptId)
-      && isNullableText(item.executionId)
+      && isNullableBoundedIdentifier(item.executionId)
       && isRunPhase(item.phase)
       && isRunStatus(item.status)
       && (item.outcome === null || isRunOutcome(item.outcome))
-      && isNullableNonNegativeInteger(item.terminalAt)
+      && isNullableDateSeconds(item.terminalAt)
   }
   if (collection === 'tasks') {
-    return isNullableText(item.turnSessionId)
+    return isNullableBoundedIdentifier(item.turnSessionId)
       && isText(item.title)
       && isText(item.objective)
       && ['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed'].includes(String(item.state))
@@ -1181,73 +2080,79 @@ function hasPersistentWorkspaceCollectionShape(collection: AgentPersistentWorksp
       && isText(item.summary)
   }
   if (collection === 'records') {
-    return isNullableText(item.turnSessionId)
-      && (item.chatId === null || boundedString(item.chatId) !== null)
+    return isNullableBoundedIdentifier(item.turnSessionId)
+      && isNullableBoundedIdentifier(item.chatId)
       && (item.kind === 'finding' || item.kind === 'decision' || item.kind === 'question')
       && isPersistentWorkspaceRecordContentShape(item.content)
-      && isNullableText(item.taskId)
+      && isNullableBoundedIdentifier(item.taskId)
   }
   if (collection === 'submissions') {
-    return isNullableText(item.turnSessionId)
+    return isNullableBoundedIdentifier(item.turnSessionId)
       && boundedString(item.taskId)
-      && (item.chatId === null || boundedString(item.chatId) !== null)
+      && isNullableBoundedIdentifier(item.chatId)
       && (item.state === 'submitted' || item.state === 'accepted' || item.state === 'rejected')
       && isText(item.summary)
       && isText(item.resultDigest)
   }
   if (collection === 'artifacts') {
-    return isNullableText(item.turnSessionId)
-      && (item.chatId === null || boundedString(item.chatId) !== null)
+    return isNullableBoundedIdentifier(item.turnSessionId)
+      && isNullableBoundedIdentifier(item.chatId)
       && isText(item.blobDigest)
       && isText(item.mimeType)
       && nonNegativeInteger(item.byteCount) !== null
       && isText(item.provenance)
   }
-  return (item.category === 'task' || item.category === 'finding' || item.category === 'objective' || item.category === 'artifact')
-    && boundedString(item.sourceId)
-    && nonNegativeInteger(item.sourceRevision) !== null
-    && isText(item.sourceDigest)
-    && isUnknownRecord(item.sourceProvenance)
-    && boundedString(item.sourceProvenance.workspaceId)
-    && isNullableText(item.sourceProvenance.turnSessionId)
-    && isNullableText(item.sourceProvenance.attemptId)
-    && isText(item.sourceProvenance.sourceDigest)
-    && isNullableText(item.sourceProvenance.sourceChatId)
-    && isNullableText(item.sourceProvenance.sourceMessageId)
-    && isNullableNonNegativeInteger(item.sourceProvenance.sourceSwipeId)
-    && isNullableNonNegativeInteger(item.sourceProvenance.sourceDeletedAt)
-    && isText(item.sourceProvenance.creator)
-    && nonNegativeInteger(item.sourceProvenance.capturedAt) !== null
-    && nonNegativeInteger(item.sourceCreatedAt) !== null
-    && nonNegativeInteger(item.sourceUpdatedAt) !== null
-    && isNullableNonNegativeInteger(item.sourceDeletedAt)
-    && (item.sourceStatus === 'present' || item.sourceStatus === 'deleted')
-    && isUnknownRecord(item.copy)
-    && item.copy.category === item.category
-    && isPersistentWorkspacePublicationCopyShape(item.copy)
-    && isText(item.copyDigest)
-    && nonNegativeInteger(item.publishedAt) !== null
-    && isText(item.publishedBy)
-    && item.revision === 1
+  return false
 }
 function isRunOutcome(value: unknown): value is AgentRunOutcomeV2 {
   return typeof value === 'string' && Object.hasOwn(RUN_OUTCOMES, value)
 }
-function normalizePersistentWorkspaceCollection<C extends AgentPersistentWorkspaceCollectionV1>(
+export function normalizePersistentWorkspaceCollection<C extends AgentPersistentWorkspaceCollectionV1>(
   collection: C,
   value: unknown,
+  expectedWorkspaceId?: string,
 ): PersistentWorkspaceCollectionArrayMapV1[C] | null {
-  if (!Array.isArray(value)) return null
+  if (!isIndexedArray(value) || value.length > MAX_WORKSPACE_COLLECTION_ITEMS) return null
   const items: unknown[] = []
   for (const item of value) {
-    if (!isUnknownRecord(item) || item.version !== 1 || !boundedString(item.id) || !hasPersistentWorkspaceCollectionShape(collection, item)) return null
+    if (!isUnknownRecord(item) || item.version !== 1 || !boundedString(item.id) || !hasPersistentWorkspaceCollectionShape(collection, item)
+      || expectedWorkspaceId !== undefined && item.workspaceId !== expectedWorkspaceId) return null
     items.push(item)
   }
   return items as PersistentWorkspaceCollectionArrayMapV1[C]
 }
+export function normalizePersistentWorkspaceTurnSessionPage(
+  value: unknown,
+  expectedWorkspaceId?: string,
+  expectedOffset?: number,
+): AgentPersistentWorkspaceTurnSessionPageV1 | null {
+  if (!isUnknownRecord(value)
+    || !isIndexedArray(value.data)
+    || value.data.length > MAX_WORKSPACE_COLLECTION_ITEMS) return null
+  const total = nonNegativeInteger(value.total)
+  const limit = nonNegativeInteger(value.limit)
+  const offset = nonNegativeInteger(value.offset)
+  if (total === null || limit === null || limit < 1 || limit > 1_000 || offset === null
+    || expectedOffset !== undefined && (nonNegativeInteger(expectedOffset) === null || offset !== expectedOffset)
+    || offset > total
+    || value.data.length > total - offset
+    || value.data.length > limit
+    || value.data.length !== Math.min(limit, total - offset)) return null
+  const items: unknown[] = []
+  const seenIds = new Set<string>()
+  for (const item of value.data) {
+    const id = isUnknownRecord(item) ? boundedString(item.id) : null
+    if (!isUnknownRecord(item) || item.version !== 1 || !id || seenIds.has(id) || !hasPersistentWorkspaceCollectionShape('sessions', item)
+      || expectedWorkspaceId !== undefined && item.workspaceId !== expectedWorkspaceId) return null
+    seenIds.add(id)
+    items.push(item)
+  }
+  return { data: items as AgentPersistentWorkspaceTurnSessionV1[], total, limit, offset }
+}
 function emptyPersistentWorkspaceCollections(): AgentPersistentWorkspaceCollectionsStateV1 {
   return {
     sessions: { status: 'idle', items: [], error: null },
+    sessionsPage: { total: 0, limit: 0, offset: 0, nextOffset: 0 },
     tasks: { status: 'idle', items: [], error: null },
     records: { status: 'idle', items: [], error: null },
     artifacts: { status: 'idle', items: [], error: null },
@@ -1275,6 +2180,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
   agentRunLastSequenceByChat: {},
   agentRunCursorSequenceByChat: {},
   agentRunResyncOffsetByChat: {},
+  agentRunResyncDescriptorByChat: {},
   agentRunSyncByChat: {},
   agentRunOmittedEventsByChat: {},
   agentRunRequestEpochByChat: {},
@@ -1292,24 +2198,84 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
 
   beginAgentRunRestore: (chatId) => {
     const epoch = (get().agentRunRequestEpochByChat[chatId] ?? 0) + 1
-    set((state) => ({ agentRunRequestEpochByChat: { ...state.agentRunRequestEpochByChat, [chatId]: epoch }, agentRunSyncByChat: { ...state.agentRunSyncByChat, [chatId]: 'restoring' } }))
+    set((state) => {
+      const offsets = { ...state.agentRunResyncOffsetByChat }
+      const descriptors = { ...state.agentRunResyncDescriptorByChat }
+      delete offsets[chatId]
+      delete descriptors[chatId]
+      return {
+        agentRunRequestEpochByChat: { ...state.agentRunRequestEpochByChat, [chatId]: epoch },
+        agentRunResyncOffsetByChat: offsets,
+        agentRunResyncDescriptorByChat: descriptors,
+        agentRunSyncByChat: { ...state.agentRunSyncByChat, [chatId]: 'restoring' },
+      }
+    })
     return epoch
   },
   applyAgentRunChanges: (chatId, requestEpoch, payload) => {
     const normalized = normalizeAgentRunChangesV2(payload)
     const state = get()
-    if (!normalized || normalized.chatId !== chatId || state.activeChatId !== chatId || state.agentRunRequestEpochByChat[chatId] !== requestEpoch) return false
+    const requestIsCurrent = state.agentRunRequestEpochByChat[chatId] === requestEpoch
+    const reject = () => {
+      if (!requestIsCurrent || state.activeChatId !== chatId) return
+      set((current) => {
+        if (current.agentRunRequestEpochByChat[chatId] !== requestEpoch || current.activeChatId !== chatId) return {}
+        const offsets = { ...current.agentRunResyncOffsetByChat }
+        const descriptors = { ...current.agentRunResyncDescriptorByChat }
+        delete offsets[chatId]
+        delete descriptors[chatId]
+        return {
+          agentRunResyncOffsetByChat: offsets,
+          agentRunResyncDescriptorByChat: descriptors,
+          agentRunSyncByChat: { ...current.agentRunSyncByChat, [chatId]: 'error' },
+        }
+      })
+    }
+    if (!normalized || normalized.chatId !== chatId) {
+      reject()
+      return false
+    }
+    if (state.activeChatId !== chatId || !requestIsCurrent) return false
+    const descriptor = state.agentRunResyncDescriptorByChat[chatId]
+    const page = normalized.resyncPage
+    const incomingOffset = page?.offset
+    const incomingKeys = normalized.resync
+      ? normalized.runs.flatMap((run) => resyncRunIdentityKeys(run))
+      : []
+    const incomingIdentitySet = new Set(incomingKeys)
+    const duplicateInPage = incomingIdentitySet.size !== incomingKeys.length
+    const overlapsAcceptedPage = descriptor !== undefined
+      && incomingKeys.some((key) => descriptor.identities[key] === true)
+    const previousCursorSequence = state.agentRunCursorSequenceByChat[chatId]
+    const invalidContinuation = normalized.resync
+      ? page === undefined
+        || incomingOffset !== (descriptor?.nextOffset ?? 0)
+        || descriptor !== undefined && (
+          page.snapshotSequence !== descriptor.snapshotSequence
+          || page.totalRuns !== descriptor.totalRuns
+          || normalized.cursorSequence !== descriptor.snapshotSequence
+        )
+        || previousCursorSequence !== undefined && normalized.cursorSequence < previousCursorSequence
+        || duplicateInPage
+        || overlapsAcceptedPage
+      : descriptor !== undefined
+    if (invalidContinuation) {
+      reject()
+      return false
+    }
     set((current) => {
       const consumed = current.agentRunCursorSequenceByChat[chatId] ?? 0
       const incoming = normalized.cursorSequence
       const responseIsOlder = incoming < consumed
-      const previousOffset = current.agentRunResyncOffsetByChat[chatId]
       const incomingOffset = normalized.resyncPage?.offset ?? 0
-      const pageIsOlder = normalized.resync && previousOffset !== undefined && incomingOffset < previousOffset
-      const cursorShouldAdvance = !responseIsOlder && !pageIsOlder && (current.agentRunCursorByChat[chatId] === undefined || incoming >= consumed || normalized.resync && (previousOffset === undefined || incomingOffset >= previousOffset))
+      const cursorShouldAdvance = !responseIsOlder && (
+        current.agentRunCursorByChat[chatId] === undefined
+        || incoming >= consumed
+        || normalized.resync && (descriptor === undefined || incomingOffset >= (descriptor?.nextOffset ?? 0))
+      )
       let provisional = { ...current.agentRunProvisionalByKey }
       let terminal = { ...current.agentRunTerminalByTarget }
-      if (normalized.resync && incomingOffset === 0 && !pageIsOlder) {
+      if (normalized.resync && incomingOffset === 0) {
         const preserved = [...Object.values(provisional), ...Object.values(terminal)].filter((run) => run.chatId === chatId && run.sequence >= incoming)
         provisional = withoutChat(provisional, chatId)
         terminal = withoutChat(terminal, chatId)
@@ -1320,10 +2286,25 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
       const nextConsumed = cursorShouldAdvance ? incoming : consumed
       const nextPublic = Math.max(current.agentRunLastSequenceByChat[chatId] ?? 0, normalized.lastSequence, ...normalized.events.map((event) => event.sequence))
       const incompleteResync = normalized.resync && normalized.resyncPage?.complete === false
-      const nextSync = responseIsOlder || pageIsOlder || normalized.hasMore || incompleteResync || nextConsumed < nextPublic ? 'stale' : 'ready'
+      const nextSync = responseIsOlder || normalized.hasMore || incompleteResync || nextConsumed < nextPublic ? 'stale' : 'ready'
       const nextOffsets = { ...current.agentRunResyncOffsetByChat }
-      if (incompleteResync && cursorShouldAdvance) nextOffsets[chatId] = incomingOffset
-      else if (!incompleteResync) delete nextOffsets[chatId]
+      const nextDescriptors = { ...current.agentRunResyncDescriptorByChat }
+      if (incompleteResync && cursorShouldAdvance) {
+        const nextPage = normalized.resyncPage!
+        nextOffsets[chatId] = nextPage.offset + normalized.runs.length
+        nextDescriptors[chatId] = {
+          snapshotSequence: nextPage.snapshotSequence,
+          totalRuns: nextPage.totalRuns,
+          nextOffset: nextPage.offset + normalized.runs.length,
+          identities: {
+            ...(descriptor?.identities ?? {}),
+            ...resyncRunIdentityRecord(normalized.runs),
+          },
+        }
+      } else {
+        delete nextOffsets[chatId]
+        delete nextDescriptors[chatId]
+      }
       return {
         agentRunProvisionalByKey: provisional,
         agentRunTerminalByTarget: terminal,
@@ -1331,6 +2312,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
         agentRunLastSequenceByChat: { ...current.agentRunLastSequenceByChat, [chatId]: nextPublic },
         agentRunCursorSequenceByChat: cursorShouldAdvance ? { ...current.agentRunCursorSequenceByChat, [chatId]: incoming } : current.agentRunCursorSequenceByChat,
         agentRunResyncOffsetByChat: nextOffsets,
+        agentRunResyncDescriptorByChat: nextDescriptors,
         agentRunSyncByChat: { ...current.agentRunSyncByChat, [chatId]: nextSync },
         agentRunOmittedEventsByChat: { ...current.agentRunOmittedEventsByChat, [chatId]: Math.max(current.agentRunOmittedEventsByChat[chatId] ?? 0, normalized.omission.omittedEventCount) },
       }
@@ -1339,7 +2321,17 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
   },
   failAgentRunRestore: (chatId, requestEpoch) => {
     if (get().agentRunRequestEpochByChat[chatId] !== requestEpoch) return
-    set((state) => ({ agentRunSyncByChat: { ...state.agentRunSyncByChat, [chatId]: 'error' } }))
+    set((state) => {
+      const offsets = { ...state.agentRunResyncOffsetByChat }
+      const descriptors = { ...state.agentRunResyncDescriptorByChat }
+      delete offsets[chatId]
+      delete descriptors[chatId]
+      return {
+        agentRunResyncOffsetByChat: offsets,
+        agentRunResyncDescriptorByChat: descriptors,
+        agentRunSyncByChat: { ...state.agentRunSyncByChat, [chatId]: 'error' },
+      }
+    })
   },
   reconcileAgentRunEvent: (payload) => {
     const event = normalizeAgentRunChangeEventV2(payload)
@@ -1383,10 +2375,11 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
     const sequence = { ...state.agentRunLastSequenceByChat }
     const cursorSequence = { ...state.agentRunCursorSequenceByChat }
     const resyncOffset = { ...state.agentRunResyncOffsetByChat }
+    const resyncDescriptor = { ...state.agentRunResyncDescriptorByChat }
     const sync = { ...state.agentRunSyncByChat }
     const omitted = { ...state.agentRunOmittedEventsByChat }
-    delete cursor[chatId]; delete sequence[chatId]; delete cursorSequence[chatId]; delete resyncOffset[chatId]; delete sync[chatId]; delete omitted[chatId]
-    return { agentRunProvisionalByKey: withoutChat(state.agentRunProvisionalByKey, chatId), agentRunTerminalByTarget: withoutChat(state.agentRunTerminalByTarget, chatId), agentRunCursorByChat: cursor, agentRunLastSequenceByChat: sequence, agentRunCursorSequenceByChat: cursorSequence, agentRunResyncOffsetByChat: resyncOffset, agentRunSyncByChat: sync, agentRunOmittedEventsByChat: omitted }
+    delete cursor[chatId]; delete sequence[chatId]; delete cursorSequence[chatId]; delete resyncOffset[chatId]; delete resyncDescriptor[chatId]; delete sync[chatId]; delete omitted[chatId]
+    return { agentRunProvisionalByKey: withoutChat(state.agentRunProvisionalByKey, chatId), agentRunTerminalByTarget: withoutChat(state.agentRunTerminalByTarget, chatId), agentRunCursorByChat: cursor, agentRunLastSequenceByChat: sequence, agentRunCursorSequenceByChat: cursorSequence, agentRunResyncOffsetByChat: resyncOffset, agentRunResyncDescriptorByChat: resyncDescriptor, agentRunSyncByChat: sync, agentRunOmittedEventsByChat: omitted }
   }),
 
   beginAgentRunInspection: (chatId, attemptId) => {
@@ -1396,7 +2389,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
     return epoch
   },
   applyAgentRunInspection: (chatId, attemptId, requestEpoch, payload) => {
-    const detail = normalizeAgentRunInspectionDetailV1(payload)
+    const detail = normalizeAgentRunInspectionDetailV1(payload, attemptId, chatId)
     const key = `${chatId}:${attemptId}`
     if (!detail || detail.attempt.attemptId !== attemptId || detail.attempt.target.chatId !== chatId || get().agentRunInspectionRequestEpochByKey[key] !== requestEpoch) return false
     const availability = detail.activity.reconciliation === 'recovered' ? 'recovered' : detail.terminal ? 'terminal' : 'live'
@@ -1455,16 +2448,26 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
     const state = get()
     const index = normalizeAgentWorkspaceIndexV2(payload)
     if (state.agentWorkspaceRequestEpochByKey[key] !== requestEpoch) return false
-    const resetPendingRequest = () => {
+    const settleRejectedRequest = (terminalError: boolean, fallbackStatus: 'idle' | 'ready' = 'idle') => {
       set((current) => {
         if (current.agentWorkspaceRequestEpochByKey[key] !== requestEpoch) return {}
         const previous = current.agentWorkspaceByTurn[turnId]
         if (!previous || previous.chatId !== chatId) return {}
-        return { agentWorkspaceByTurn: { ...current.agentWorkspaceByTurn, [turnId]: { ...previous, status: 'idle', error: false } } }
+        return {
+          agentWorkspaceByTurn: {
+            ...current.agentWorkspaceByTurn,
+            [turnId]: {
+              ...previous,
+              status: terminalError ? 'error' : fallbackStatus,
+              error: terminalError,
+            },
+          },
+        }
       })
     }
-    if (!index || index.turnId !== turnId || state.activeChatId !== chatId) {
-      resetPendingRequest()
+    const invalidSnapshot = !index || index.turnId !== turnId
+    if (invalidSnapshot || state.activeChatId !== chatId) {
+      settleRejectedRequest(invalidSnapshot)
       return false
     }
     let accepted = true
@@ -1473,11 +2476,29 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
       if (previous?.index && previous.index.workspaceRevision > index.workspaceRevision) {
         accepted = false
         if (previous.chatId !== chatId) return {}
-        return { agentWorkspaceByTurn: { ...current.agentWorkspaceByTurn, [turnId]: { ...previous, status: 'idle', error: false } } }
+        return {
+          agentWorkspaceByTurn: {
+            ...current.agentWorkspaceByTurn,
+            [turnId]: {
+              ...previous,
+              status: previous.index ? 'ready' : 'idle',
+              error: false,
+            },
+          },
+        }
       }
       const sections: NonNullable<typeof previous>['sections'] = {}
-      for (const section of ['objective', 'tasks', 'records', 'submissions', 'artifacts'] as const) if (previous?.sections[section] && previous.sections[section]!.preview.workspaceRevision >= index.workspaceRevision) sections[section] = previous.sections[section]!
-      return { agentWorkspaceByTurn: { ...current.agentWorkspaceByTurn, [turnId]: { chatId, turnId, status: 'ready', index, sections, error: false } } }
+      for (const section of ['objective', 'tasks', 'records', 'submissions', 'artifacts'] as const) {
+        if (previous?.sections[section] && previous.sections[section]!.preview.workspaceRevision >= index.workspaceRevision) {
+          sections[section] = previous.sections[section]!
+        }
+      }
+      return {
+        agentWorkspaceByTurn: {
+          ...current.agentWorkspaceByTurn,
+          [turnId]: { chatId, turnId, status: 'ready', index, sections, error: false },
+        },
+      }
     })
     return accepted
   },
@@ -1485,14 +2506,25 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
     const key = workspaceRequestKey(turnId, section)
     const state = get()
     const preview = normalizeAgentWorkspaceSectionV2(payload)
-    const settleSectionRequest = () => {
+    const settleSectionRequest = (terminalError = true) => {
       set((current) => {
         if (current.agentWorkspaceRequestEpochByKey[key] !== requestEpoch) return {}
         const previous = current.agentWorkspaceByTurn[turnId]
         if (!previous || previous.chatId !== chatId) return {}
         const currentSection = previous.sections[section]
         if (!currentSection) return {}
-        return { agentWorkspaceByTurn: { ...current.agentWorkspaceByTurn, [turnId]: { ...previous, sections: { ...previous.sections, [section]: { ...currentSection, loadingMore: false, error: false } } } } }
+        return {
+          agentWorkspaceByTurn: {
+            ...current.agentWorkspaceByTurn,
+            [turnId]: {
+              ...previous,
+              sections: {
+                ...previous.sections,
+                [section]: { ...currentSection, loadingMore: false, error: terminalError },
+              },
+            },
+          },
+        }
       })
     }
     if (state.agentWorkspaceRequestEpochByKey[key] !== requestEpoch) return false
@@ -1513,7 +2545,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
         if (!previous || previous.chatId !== chatId) return {}
         const sectionState = previous.sections[section]
         return sectionState
-          ? { agentWorkspaceByTurn: { ...current.agentWorkspaceByTurn, [turnId]: { ...previous, sections: { ...previous.sections, [section]: { ...sectionState, loadingMore: false, error: false } } } } }
+          ? { agentWorkspaceByTurn: { ...current.agentWorkspaceByTurn, [turnId]: { ...previous, sections: { ...previous.sections, [section]: { ...sectionState, loadingMore: false, error: true } } } } }
           : {}
       }
       let nextPreview = preview
@@ -1544,9 +2576,22 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
     return epoch
   },
   applyPersistentWorkspace: (scope, requestEpoch, payload) => {
-    const workspace = normalizePersistentWorkspace(payload)
-    if (!workspace || get().agentPersistentWorkspaceRequestEpochByKey[scope] !== requestEpoch) return false
-    const current = get().agentPersistentWorkspaceById[workspace.id]
+    const state = get()
+    if (state.agentPersistentWorkspaceRequestEpochByKey[scope] !== requestEpoch) return false
+    const workspace = normalizePersistentWorkspace(
+      payload,
+      scope.startsWith('id:') ? scope.slice('id:'.length) : undefined,
+      scope.startsWith('chat:') ? scope.slice('chat:'.length) : undefined,
+    )
+    if (!workspace) {
+      state.failPersistentWorkspaceRequest(scope, requestEpoch, 'unavailable', 'Invalid persistent workspace response')
+      return false
+    }
+    const scopeCurrent = scope.startsWith('chat:')
+      ? state.agentPersistentWorkspaceByChat[scope.slice('chat:'.length)]
+      : state.agentPersistentWorkspaceById[workspace.id]
+    if (scopeCurrent?.workspace && scopeCurrent.workspace.revision > workspace.revision) return false
+    const current = state.agentPersistentWorkspaceById[workspace.id]
     if (current?.workspace && current.workspace.revision > workspace.revision) return false
     set((state) => ({
       agentPersistentWorkspaceById: {
@@ -1616,16 +2661,58 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
     })
     return epoch
   },
-  applyPersistentWorkspaceCollection: (workspaceId, collection, requestEpoch, payload) => {
+  applyPersistentWorkspaceCollection: (workspaceId, collection, requestEpoch, payload, append = false, expectedOffset) => {
     const key = `${workspaceId}:${collection}`
-    const items = normalizePersistentWorkspaceCollection(collection, payload)
-    if (!items || get().agentPersistentWorkspaceRequestEpochByKey[key] !== requestEpoch) return false
-    set((state) => {
-      const current = state.agentPersistentWorkspaceCollectionsById[workspaceId] ?? emptyPersistentWorkspaceCollections()
+    const state = get()
+    if (state.agentPersistentWorkspaceRequestEpochByKey[key] !== requestEpoch) return false
+    const storedWorkspace = state.agentPersistentWorkspaceById[workspaceId]?.workspace
+    const expectedChatId = storedWorkspace?.chatId
+    const chatMismatch = (items: readonly { chatId: string | null }[]) => expectedChatId === undefined
+      ? items.length > 0
+      : items.some((item) => item.chatId !== expectedChatId)
+    if (collection === 'sessions') {
+      const page = normalizePersistentWorkspaceTurnSessionPage(payload, workspaceId, expectedOffset)
+      const currentCollections = state.agentPersistentWorkspaceCollectionsById[workspaceId] ?? emptyPersistentWorkspaceCollections()
+      const previousPage = currentCollections.sessionsPage
+      const pageChatMismatch = page !== null && chatMismatch(page.data)
+      const nonAdvancingPage = append && (page === null
+        || page.offset <= previousPage.offset
+        || page.offset !== previousPage.nextOffset)
+      const metadataDrift = append && page !== null
+        && (page.total !== previousPage.total || page.limit !== previousPage.limit)
+      const existingIds = new Set(currentCollections.sessions.items.map((item) => item.id))
+      const duplicateAcceptedId = append && page !== null && page.data.some((item) => existingIds.has(item.id))
+      if (!page || pageChatMismatch || nonAdvancingPage || metadataDrift || duplicateAcceptedId) {
+        state.failPersistentWorkspaceCollection(workspaceId, collection, requestEpoch, 'Invalid persistent workspace sessions response')
+        return false
+      }
+      set((current) => {
+        const collections = current.agentPersistentWorkspaceCollectionsById[workspaceId] ?? emptyPersistentWorkspaceCollections()
+        const items = append ? [...collections.sessions.items, ...page.data] : page.data
+        return {
+          agentPersistentWorkspaceCollectionsById: {
+            ...current.agentPersistentWorkspaceCollectionsById,
+            [workspaceId]: {
+              ...collections,
+              sessions: { status: 'ready', items, error: null },
+              sessionsPage: { total: page.total, limit: page.limit, offset: page.offset, nextOffset: page.offset + page.data.length },
+            },
+          },
+        }
+      })
+      return true
+    }
+    const items = normalizePersistentWorkspaceCollection(collection, payload, workspaceId)
+    if (!items || chatMismatch(items)) {
+      state.failPersistentWorkspaceCollection(workspaceId, collection, requestEpoch, 'Invalid persistent workspace collection response')
+      return false
+    }
+    set((current) => {
+      const collections = current.agentPersistentWorkspaceCollectionsById[workspaceId] ?? emptyPersistentWorkspaceCollections()
       return {
         agentPersistentWorkspaceCollectionsById: {
-          ...state.agentPersistentWorkspaceCollectionsById,
-          [workspaceId]: readyPersistentWorkspaceCollections(current, collection, items),
+          ...current.agentPersistentWorkspaceCollectionsById,
+          [workspaceId]: readyPersistentWorkspaceCollections(collections, collection, items),
         },
       }
     })

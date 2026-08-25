@@ -25,6 +25,7 @@ import {
   selectLatestAgentRunForChat,
 } from '@/store/slices/agent-runs'
 import { loadAgentWorkspace, loadAgentWorkspaceSection } from '@/lib/agent-run-recovery'
+import { formatAgentRuntimeProgress } from '@/lib/agentRuntimeProgress'
 import AgentRunStopButton from './AgentRunStopButton'
 import OwnerRunInspector from './OwnerRunInspector'
 import type {
@@ -69,6 +70,7 @@ const AGENT_PUBLIC_ERROR_LABEL_KEYS = {
   provider_schema_error: 'agentRun.errors.provider_schema_error',
   invalid_task: 'agentRun.errors.invalid_task',
   invalid_profile: 'agentRun.errors.invalid_profile',
+  invalid_input: 'agentRun.errors.invalid_input',
   invalid_arguments: 'agentRun.errors.invalid_arguments',
   batch_rejected: 'agentRun.errors.batch_rejected',
   unknown_tool: 'agentRun.errors.unknown_tool',
@@ -249,8 +251,8 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
   const panelIdPrefix = `agent-run-${run.runId}`
   const now = useRunClock(!isTerminalRun(run) && !hidden)
   const { roots, childrenByParent, nodesById } = useMemo(() => {
-    const byId: Record<string, AgentActivityNodeV2> = {}
-    const children: Record<string, string[]> = {}
+    const byId: Record<string, AgentActivityNodeV2> = Object.create(null)
+    const children: Record<string, string[]> = Object.create(null)
     for (const node of run.activity) byId[node.id] = node
     const rootNodes: AgentActivityNodeV2[] = []
     for (const node of run.activity) {
@@ -260,6 +262,24 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
         rootNodes.push(node)
       }
     }
+
+    const visited = new Set<string>()
+    const markReachable = (nodeId: string, ancestors: ReadonlySet<string> = new Set()) => {
+      if (visited.has(nodeId) || ancestors.has(nodeId)) return
+      const node = byId[nodeId]
+      if (!node) return
+      visited.add(nodeId)
+      const nextAncestors = new Set(ancestors)
+      nextAncestors.add(nodeId)
+      for (const childId of children[nodeId] ?? []) markReachable(childId, nextAncestors)
+    }
+    for (const node of rootNodes) markReachable(node.id)
+    for (const node of run.activity) {
+      if (visited.has(node.id)) continue
+      rootNodes.push(node)
+      markReachable(node.id)
+    }
+
     return { roots: rootNodes, childrenByParent: children, nodesById: byId }
   }, [run.activity])
   const runStatus = t(`agentRun.status.${run.workStatus}`)
@@ -325,7 +345,7 @@ function ActivityTree({ run, syncStatus, omittedEvents, hidden }: {
       ) : null}
 
       {run.error ? (
-        <div className={styles.errorNotice}>
+        <div className={styles.errorNotice} role="alert">
           <CircleX aria-hidden="true" />
           <span>{t(publicErrorTranslationKey(run.error.code))}</span>
         </div>
@@ -397,7 +417,7 @@ function WorkspaceTab({ chatId, turnId, runId, hidden }: { chatId: string; turnI
 
   useEffect(() => {
     if (hidden) return
-    if (!workspace || workspace.status === 'idle' || workspace.status === 'loading') {
+    if (!workspace || workspace.status === 'loading' || (workspace.status === 'idle' && !workspace.error)) {
       void loadAgentWorkspace(chatId, turnId, agentRunsApi, useStore)
     }
   }, [chatId, turnId, hidden, workspace?.status])
@@ -804,6 +824,10 @@ export function AgentRunProvisionalLocator({ chatId }: { chatId: string }) {
   const [ownerOpen, setOwnerOpen] = useState(false)
   const [ownerTarget, setOwnerTarget] = useState<{ attemptId: string | null | undefined; chatId: string } | null>(null)
   const run = useStore((state) => selectProvisionalRunForChat(state, chatId))
+  const providerOperation = useStore((state) => {
+    const head = state.chatHeads.find((candidate) => candidate.generationId === state.activeGenerationId && candidate.chatId === chatId)
+    return formatAgentRuntimeProgress(head?.agentOperation, head?.agentLifecycle, t)
+  })
   const openInspector = useCallback(() => {
     if (!run) return
     setOpen(false)
@@ -849,7 +873,7 @@ export function AgentRunProvisionalLocator({ chatId }: { chatId: string }) {
         </span>
         <span className={styles.stripText}>
           <strong>{t('agentRun.provisionalLocator')}</strong>
-          <span>{t('agentRun.targetPending')} · {t(`agentRun.phase.${run.workPhase}`)} · {status}{outcome ? ` · ${outcome}` : ''}</span>
+          <span>{providerOperation ?? t('agentRun.targetPending')} · {t(`agentRun.phase.${run.workPhase}`)} · {status}{outcome ? ` · ${outcome}` : ''}</span>
         </span>
         <ChevronRight aria-hidden="true" />
       </button>

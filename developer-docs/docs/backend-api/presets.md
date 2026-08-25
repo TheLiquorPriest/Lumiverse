@@ -51,6 +51,7 @@ The closed authored shape is `AgentConfigV2`:
       | { kind: 'inherit_main' }
       | { kind: 'slot', slotId: string },
     toolIds: CoreAgentToolId[],
+    workspaceCapabilities: AgentChildWorkspaceCapabilityV1[],
     loreScope: AgentLoreScope,
     allowMainDelegation: boolean,
     failurePolicy: 'required' | 'optional',
@@ -68,12 +69,38 @@ The closed authored shape is `AgentConfigV2`:
   }],
   phasePolicy?: { work: AgentPromptBlockRefV1[], render: AgentPromptBlockRefV1[] },
   cognitionPolicy?: AgentCognitionPolicyV1,
-  contextPolicy?: AgentContextPolicyV1,
   taskPolicy?: AgentTaskPolicyV1,
   workspacePolicy?: { retention: 'turn_terminal' | 'chat_lifetime', sharing: 'root_only' | 'view_only' },
   runtimePolicy?: AgentRuntimePolicyV1,
 }
 ```
+
+`profiles[].workspaceCapabilities` is an optional, closed
+`AgentChildWorkspaceCapabilityV1[]` child grant. The normalized projection
+emits values in this canonical sorted order:
+
+```ts
+[
+  'read_section',
+  'read_page',
+  'update_assigned_progress',
+  'submit_child_result',
+  'record_question',
+]
+```
+
+Values must be unique and already in this order. Unknown, duplicate, or
+out-of-order values are rejected or quarantined; they are never silently
+reordered or widened.
+
+These grants authorize child frames only. A child may receive the five
+operations above, subject to host admission, frame, phase, and budget limits.
+Operations outside this vocabulary—including `create_task`,
+`submit_root_result`, `accept_submission`, `record_finding`, `record_decision`,
+`attach_artifact`, and `propose_publication`—remain root/host authority and
+cannot be granted through a child profile. Profile-authored grants cannot
+widen root capabilities, completion authority, or publication authority.
+
 
 ### Canonical Loom authoring and assembly
 
@@ -115,32 +142,30 @@ Each `LoomPolicyEntryV1` is closed:
   checkpoint: 'ASSEMBLE' | 'WORK' | 'PREPARE_COMMIT' | 'RENDER',
   required: boolean,
   visibility: 'work_only',
-  delivery:
-    | { delivery: 'direct' }
-    | { delivery: 'condition_gated', condition: CognitionPredicateV1 }
-    | {
-        delivery: 'on_demand',
-        request: { contextPackId: string, revisionId: string, digest: string },
-      },
+  condition?: CognitionPredicateV1,
 }
 ```
 
-Routing is fixed: `workPolicy` and `workspaceUsage` feed `root_work` at
-`WORK`; `completionCriteria` feeds `completion_handoff` at
-`PREPARE_COMMIT`; and `renderPolicy` feeds `render` at `RENDER`. The host
-freezes each source revision before assembly. The **Phased Instructions**
-editor is the single authoring surface for these fixed Loom policy buckets,
-custom runtime phases, and context delivery. `phasePolicy` remains a legacy
-compatibility field for imported records; it is not a second editor or
-authority. No live `cognitionPolicy`, metadata alias, or extension callback can
-replace the canonical Loom record.
+Routing is fixed: `workPolicy` and `workspaceUsage` feed `root_work` at `WORK` (root **WORK** / **WORK**); `completionCriteria` feeds `completion_handoff` at `PREPARE_COMMIT`; and `renderPolicy` feeds `render` at `RENDER` (tools-disabled **RENDER** / **RENDER**). The host freezes each Loom source revision before assembly. Conditions are typed, evaluate fail-closed at their owning checkpoint against that checkpoint’s immutable snapshot, and remain fixed for that checkpoint.
+
+The **Phased Instructions** editor is the single WORK/Agentic-only authoring surface for these fixed Loom policy buckets, bounded custom runtime phases, and typed conditions. Loom owns only existing prompt blocks plus Phased Instructions; it does not create a second context authority. `runtimePolicy.phases` is bounded and current-phase-only: later phase instructions are not materialized early. Each phase can carry explicit `childInstructionSubsets`; a child receives only its named admitted subset, never the root phase instructions or another child’s subset.
+
+`phasePolicy` remains a legacy compatibility field for imported records; it is not a second editor or authority. No live `cognitionPolicy`, metadata alias, or extension callback can replace the canonical Loom record.
+
+World Books (the native World Info system) and Databanks remain outside this policy and revision contract. World Books own native lore activation, placement, attachment, editing, and access. Databanks own attached documents, attachment, editing, access, automatic semantic retrieval, and explicit `#slug` retrieval. Their live native objects remain authoritative. Loom never copies that content, stores an external revision, pins it, or repairs it. [Context Filters](../../../user-docs/docs/presets/context-filters.md) and unrelated native Loom content [packs](../../../user-docs/docs/packs/index.md) remain supported outside Loom.
+
+The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are not supported and do not participate in this policy or revision contract.
 
 The authenticated assembly surface is explicit (`RESPONSE` or `WORK`) and is
 carried by the frozen snapshot and `AssemblyPlanV1`; it is never inferred from
 the presence of policy entries. Response assembly omits every
 `visibility: 'work_only'` entry. Owner inspection receives typed
 `LoomPromptInspectionV1` items and a `responseOmission` record instead of
-silently presenting WORK material as Response content.
+silently presenting WORK material as Response content. This omission does not
+disable established Response assembly, including native World Info and
+Databank behavior.
+
+The inspection source is exact: Loom entries retain `blockId`, `presetRevision`, `blockRevision`, `promptOrder`, optional typed condition, checkpoint result, route, and inclusion outcome. Unified owner inspection combines this Loom record with prompt evidence for role, destination/order, source identity and content hashes when recorded, every destination-level deduplication overlap and reason, omissions, custom-phase and explicit child-subset receipts, accepted WORK-to-RENDER crossings, and tools/delegation. An unavailable evidence layer is marked unavailable and is never inferred. The `inspection` and `responseOmission` wire names are stable and must not be replaced by a latest revision or compatibility alias. Ordinary Response preserves the conversation and native World Book/Databank assembly while omitting only WORK/Agentic-only Loom material.
 
 `GET /api/v1/presets/:id/agent-config`, the shared-draft save, and the
 portable runtime envelope preserve `runtimePolicy.loomPolicy` verbatim
@@ -184,22 +209,22 @@ Version-1 migration is deliberately Response-only:
 Loom/LumiHub imports have two explicit paths. If the exported object (or its
 embedded `preset`) contains `agentRuntime`, the installer strictly parses the
 `PortablePresetRuntimeEnvelopeV1` before writing and atomically imports the
-preset, normalized config, portable Context Pack snapshots, selections, rules,
-and task templates. This complete-runtime path preserves authored policy but
-imports it disabled, Response-only, and review-required; it cannot grant
-activation or local bindings. If no envelope is present, the explicit legacy
-import path strictly parses `metadata.agentConfig`, migrates it to a portable
-V2 payload, and sends it through the same transactional importer. Legacy
-authored settings remain preserved but disabled, Response-only, and
-review-required. In both paths metadata is not executable runtime authority;
-normalized authenticated config routes remain the runtime source.
+preset, normalized config, and task templates. This complete-runtime path
+preserves authored policy but imports it disabled, Response-only, and
+review-required; it cannot grant activation or local bindings. If no envelope
+is present, the explicit legacy import path strictly parses
+`metadata.agentConfig`, migrates it to a portable V2 payload, and sends it
+through the same transactional importer. Legacy authored settings remain
+preserved but disabled, Response-only, and review-required. In both paths
+metadata is not executable runtime authority; normalized authenticated config
+routes remain the runtime source.
 
 Same-account duplicate copies the preset, normalized config, authorized slot
-bindings, regex companions, and the validated authored runtime envelope
-(`contextPackSelections`, `contextRules`, `taskTemplates`, and
-`reviewAcknowledgements`). It does not clone the Context Library graph; the
-copied same-account references continue to point at the already-authorized
-pack revisions. Foreign import never copies local bindings.
+bindings, regex companions, task templates, and review acknowledgements.
+Foreign import never copies local bindings. Neither path copies or owns native
+World Info or Databank content; those systems retain their existing attachment
+and live-resolution behavior.
+
 ### Authenticated config and portability routes
 
 These routes are mounted under `/api/v1/presets` and are the server authority
@@ -207,26 +232,41 @@ for normalized config:
 
 | Method | Endpoint | Contract |
 |---|---|---|
-| `GET` | `/:id/agent-config` | Returns the editor object directly (not a `{ preset, editor }` wrapper): `presetId`, `presetRevision`, `configRevision`, `config: AgentConfigV2`, `review`, `slotBindings`, `contextPackSelections`, `contextRules`, `taskTemplates`, `hostCeilings`, and `reviewAcknowledgements`. Missing/foreign presets return `404`. |
-| `PUT` | `/:id/agent-config` | Atomically saves the closed body keys `config`, `slotBindings`, `contextPackSelections`, `contextRules`, `taskTemplates`, `reviewAcknowledgements`, `promptOrder`, `expectedPresetRevision`, and `expectedConfigRevision`; unknown or malformed bodies return `400`, while a missing revision precondition returns `428`. |
-| `GET` | `/:id/agent-runtime/portable` | Returns the complete `PortablePresetRuntimeEnvelopeV1`: portable config, Context Pack snapshots/selections, context rules, and task templates. It contains no local bindings or credentials. |
-| `POST` | `/import-portable` | Accepts `{ preset: PortablePresetPayload, agentRuntime: PortablePresetRuntimeEnvelopeV1 }` and atomically imports the complete preset/runtime/context graph in disabled, Response-only, review-required state (`201`). |
+| `GET` | `/:id/agent-config` | Returns the editor object directly (not a `{ preset, editor }` wrapper): `presetId`, `presetRevision`, `configRevision`, `config: AgentConfigV2`, `review`, `slotBindings`, `taskTemplates`, `hostCeilings`, and `reviewAcknowledgements`. Missing/foreign presets return `404`. |
+| `PUT` | `/:id/agent-config` | Atomically saves the closed body keys `config`, `slotBindings`, `taskTemplates`, `reviewAcknowledgements`, `promptOrder`, `expectedPresetRevision`, and `expectedConfigRevision`; unknown or malformed bodies return `400`, while a missing revision precondition returns `428`. |
+| `GET` | `/:id/agent-runtime/portable` | Returns the complete `PortablePresetRuntimeEnvelopeV1`: portable config and task templates. It contains no local bindings or credentials. |
+| `POST` | `/import-portable` | Accepts `{ preset: PortablePresetPayload, agentRuntime: PortablePresetRuntimeEnvelopeV1 }` and atomically imports the complete preset/runtime graph in disabled, Response-only, review-required state (`201`). |
 | `GET` | `/:id/agent-config/portable` | Returns config-only `PortableAgentConfigV1` with no local bindings or credentials. |
-| `POST` | `/agent-config/portable/import` | Creates a foreign preset/config from a config-only `PortablePresetPayload` in inert review-required state (`201`); it does not carry the Context Library graph. |
-| `POST` | `/:id/duplicate` | Same-account transactional duplicate of the preset, normalized config, authorized bindings, regex companions, and validated authored runtime envelope; Context Library rows are referenced, not cloned. |
+| `POST` | `/agent-config/portable/import` | Creates a foreign preset/config from a config-only `PortablePresetPayload` in inert review-required state (`201`). |
+| `POST` | `/:id/duplicate` | Same-account transactional duplicate of the preset, normalized config, authorized bindings, regex companions, task templates, and review acknowledgements. |
 | `POST` | `/:id/agent-runtime/repair-acknowledgement` | Record `{ reasonCode, expectedPresetRevision }` for an authenticated owner. The revision is CAS-protected; the response is a separate `repair/review` acknowledgement and does not select a runtime mode. |
 
 | `GET` | `/agent-runtime-limits` | Returns effective process ceilings; it cannot be used to raise them. |
 
 The shared-draft save requires both preset and config revision preconditions.
 It updates prompt order and normalized config in one transaction and rejects
-unknown or malformed bodies with `400`. Omitting either
-`expectedPresetRevision` or `expectedConfigRevision` returns `428`; stale
-preconditions return the route's conflict response. A preset update must
-provide `expected_cache_revision`; callers that include top-level
-`agent_config` are still normalized through the same server authority. Use
-`PUT /api/v1/presets/:id/agent-config` when changing config, slots, cognition,
-context, tasks, and blocks together.
+unknown or malformed bodies with `400`. Omitting
+`expectedPresetRevision` returns `428 PRESET_REVISION_REQUIRED`; omitting
+`expectedConfigRevision` returns `428 AGENT_CONFIG_REVISION_REQUIRED`.
+Stale preconditions are never merged: a stale preset revision returns HTTP
+`409 PRESET_REVISION_CONFLICT`, while a stale config revision returns HTTP
+`409 AGENT_CONFIG_REVISION_CONFLICT`. On success the route returns the
+canonical saved `{ preset, editor }` state with refreshed `presetRevision`
+and `configRevision`; replace the local draft with that state. A caller that
+receives a conflict must refresh the canonical editor and intentionally
+reapply its preserved draft.
+
+The separate ordinary `PUT /api/v1/presets/:id` route always requires
+`expected_cache_revision`. When the body includes top-level `agent_config`, it
+additionally requires snake_case `expected_config_revision`; an ordinary update
+without `agent_config` does not require that config precondition. This is
+distinct from the dedicated `/agent-config` route above, whose preconditions
+are camelCase. A stale ordinary Agentic-config write returns HTTP
+`409 AGENT_CONFIG_REVISION_CONFLICT` with the canonical snake_case fields
+`{ preset_id, expected_config_revision, actual_config_revision, preset,
+agent_config_revision, agent_config, agent_config_review, cache_revision }`.
+Use `PUT /api/v1/presets/:id/agent-config` when changing config, slots,
+cognition, context, tasks, and blocks together.
 
 The durable per-chat mode override is separate from the preset. `PUT
  /api/v1/chats/:id/agent-mode` accepts exactly:
@@ -304,7 +344,7 @@ const deleted = await spindle.presets.delete(newPreset.id)
 | `list(options?)` | `Promise<{ data: UserPresetDTO[], total: number }>` | List presets. Options: `{ limit?, offset? }`. Defaults: limit 50, max 200. |
 | `get(presetId)` | `Promise<UserPresetDTO \| null>` | Get a preset by ID. Returns `null` if not found. |
 | `create(input)` | `Promise<UserPresetDTO>` | Create a new preset. `name` and `provider` are required. |
-| `update(presetId, input)` | `Promise<UserPresetDTO>` | Update a preset. `expected_cache_revision` is required; pass the `cache_revision` from the read/create response. |
+| `update(presetId, input)` | `Promise<UserPresetDTO>` | Update a preset. `expected_cache_revision` is always required; when top-level `agent_config` is present, snake_case `expected_config_revision` is additionally required. On success the canonical saved DTO (including its refreshed `cache_revision`) is returned. A stale cache write is HTTP `409 PRESET_REVISION_CONFLICT`; a stale Agentic-config write is HTTP `409 AGENT_CONFIG_REVISION_CONFLICT` with the canonical conflict fields documented below. Refresh the canonical state and intentionally reapply the draft rather than merging or overwriting. |
 | `delete(presetId)` | `Promise<boolean>` | Delete a preset. Returns `true` if deleted. |
 
 ## UserPresetDTO
@@ -345,10 +385,22 @@ bindings; extension CRUD cannot grant or resolve Agentic execution.
 
 ## UserPresetUpdateDTO
 
-`expected_cache_revision` is required and must be the `cache_revision` returned by
-the most recent `get`, `list`, `create`, or successful `update` response. All
-other fields from `UserPresetCreateDTO` are optional, including `name` and
-`provider`.
+`expected_cache_revision` is always required and must be the
+`cache_revision` returned by the most recent `get`, `list`, `create`, or
+successful `update` response. A missing precondition is HTTP
+`428 PRESET_REVISION_REQUIRED`. When top-level `agent_config` is present,
+snake_case `expected_config_revision` is additionally required; an ordinary
+update without `agent_config` does not require it. Its missing precondition is
+HTTP `428 AGENT_CONFIG_REVISION_REQUIRED`. A stale config precondition is HTTP
+`409 AGENT_CONFIG_REVISION_CONFLICT` with canonical
+`{ preset_id, expected_config_revision, actual_config_revision, preset,
+agent_config_revision, agent_config, agent_config_review, cache_revision }`;
+no update is applied.
+A stale cache precondition is HTTP
+`409 PRESET_REVISION_CONFLICT` with the expected and actual cache revisions;
+no update is applied. Use the returned canonical state (or refresh it) before
+preparing the next write. All other fields from `UserPresetCreateDTO` are
+optional, including `name` and `provider`.
 
 !!! note "Prompt variable cleanup"
     When `prompt_order` or `metadata` is updated, Lumiverse prunes stale `metadata.promptVariables` entries that no longer correspond to a variable definition on a block. This matches the built-in preset editor behavior.

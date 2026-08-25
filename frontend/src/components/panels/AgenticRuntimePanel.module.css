@@ -210,6 +210,19 @@
   flex: 0 0 auto;
   color: var(--lumiverse-warning);
 }
+.loadError {
+  border-color: var(--lumiverse-danger-050);
+  background: var(--lumiverse-danger-015);
+}
+
+.loadError > svg {
+  color: var(--lumiverse-danger);
+}
+
+.loadError button {
+  margin-top: var(--runtime-space-3);
+}
+
 
 .notice > div,
 .boundaryNotice > div {
@@ -397,6 +410,77 @@
   flex-direction: column;
   gap: var(--runtime-space-2);
 }
+.sourceChoiceRow {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--runtime-space-2);
+}
+
+.sourceChoiceRow > .listChoice {
+  min-width: 0;
+}
+
+.sourceChoiceRow > .button,
+.sourceChoiceStatic > .button {
+  flex: none;
+  align-self: center;
+}
+
+.sourceChoiceStatic {
+  cursor: default;
+}
+
+.childSubsetList {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--runtime-space-3);
+}
+
+.childSubsetCard {
+  display: flex;
+  min-width: 0;
+  padding: var(--runtime-space-3);
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  flex-direction: column;
+  gap: var(--runtime-space-2);
+  background: var(--lumiverse-fill-subtle);
+}
+
+.childSubsetHeader {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--runtime-space-3);
+}
+
+.childSubsetHeader > div {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--runtime-space-1);
+}
+
+.childSubsetHeader strong {
+  color: var(--lumiverse-text);
+  font-size: var(--runtime-text-sm);
+}
+
+.childSubsetHeader small {
+  color: var(--lumiverse-text-muted);
+  font-size: var(--runtime-text-xs);
+  line-height: 1.45;
+}
+
+.childSubsetCard > .optionList {
+  padding-top: var(--runtime-space-1);
+}
+
 
 .editorStack {
   gap: var(--runtime-space-4);
@@ -801,11 +885,6 @@
 }
 
 
-.selectionList li > .settingRow {
-  flex: 0 1 auto;
-  padding-block: 0;
-  border-block-end: 0;
-}
 
 .repairItem > svg {
   flex: 0 0 auto;
@@ -948,6 +1027,20 @@
   .primaryButton {
     width: 100%;
   }
+  .sourceChoiceRow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sourceChoiceRow > .button,
+  .sourceChoiceStatic > .button {
+    width: 100%;
+  }
+
+  .sourceChoiceStatic {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
 
   .inlineFields,
   .predicateValueControls {
@@ -966,10 +1059,6 @@
     text-align: center;
   }
 
-  .selectionList li > .settingRow {
-    width: 100%;
-    flex-basis: 100%;
-  }
 
   .disclosure summary {
     grid-template-columns: minmax(0, 1fr) auto;

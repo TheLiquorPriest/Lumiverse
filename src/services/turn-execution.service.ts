@@ -1,13 +1,27 @@
 import { createHash } from "node:crypto";
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db/connection";
-import type {
-  AgentWorkAttemptLineageV1,
-  AgentWorkOutcome,
-  AgentWorkPhase,
-  AgentWorkStatus,
+import {
+  AGENT_PUBLIC_ERROR_CODES,
+  type AgentWorkAttemptLineageV1,
+  type AgentWorkOutcome,
+  type AgentWorkPhase,
+  type AgentWorkStatus,
 } from "../types/agent-runtime";
-import { AGENT_ACTIVITY_RUN_MAX_BYTES } from "./agent-activity-runs.service";
+import type {
+  AgentInspectionOutcomeV1,
+  AgentInspectionReasonV1,
+} from "../types/agent-run-projection";
+import {
+  AGENT_ACTIVITY_RUN_MAX_BYTES,
+  persistAgentRunInspectionInTransaction,
+  type PersistAgentRunInspectionInputV1,
+} from "./agent-activity-runs.service";
+import {
+  appendAgentRunSnapshot,
+  type AgentRunProjectionInputV2,
+  type AgentRunReceiptRepairOptions,
+} from "./agent-run-projection.service";
 import { invalidateFrameCapabilitiesForTurn } from "./turn-workspace.service";
 
 /**
@@ -59,11 +73,11 @@ export const REVERSIBLE_TURN_PHASES = [
  * terminal policy by inventing a new event string.
  */
 export const TURN_EXECUTION_TRANSITIONS: Readonly<Record<TurnExecutionPhase, readonly TurnExecutionPhase[]>> = Object.freeze({
-  ASSEMBLE: ["WORK", "FAILED", "CANCELLED", "TIMED_OUT"],
+  ASSEMBLE: ["WORK", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"],
   WORK: ["COMPLETE", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"],
-  COMPLETE: ["RENDER", "FAILED", "CANCELLED", "TIMED_OUT"],
-  RENDER: ["PREPARE_COMMIT", "FAILED", "CANCELLED", "TIMED_OUT"],
-  PREPARE_COMMIT: ["COMMITTING", "FAILED", "CANCELLED", "TIMED_OUT"],
+  COMPLETE: ["RENDER", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"],
+  RENDER: ["PREPARE_COMMIT", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"],
+  PREPARE_COMMIT: ["COMMITTING", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"],
   COMMITTING: ["COMMITTED", "COMMIT_FAILED"],
   COMMITTED: [],
   COMMIT_FAILED: [],
@@ -373,6 +387,8 @@ export interface ReconcileAgentTurnsResult {
   readonly projectionRepairs: number;
   readonly alreadyTerminal: number;
   readonly releasedReservations: number;
+  /** False when the fixed startup scan budget deferred candidates. */
+  readonly complete?: boolean;
 }
 const MAX_TARGET_SNAPSHOT_BYTES = 8 * 1024;
 const MAX_RESERVATION_BYTES = 256 * 1024 * 1024;
@@ -481,22 +497,50 @@ export function calculateFinalRenderReservationEnvelopeV1(input: {
   });
 }
 
-/** Convert the persisted event envelope back to the provider chunk allowance. */
+/** Convert the persisted event envelope back to the no-progress stream bound. */
 export function finalRenderActivityChunkLimitV1(activityEvents: number): number {
   if (!Number.isSafeInteger(activityEvents) || activityEvents < AGENTIC_FINAL_RENDER_RESERVATION_COMPONENTS_V1.terminalProjectionEvents) {
     return -1;
   }
   return activityEvents - AGENTIC_FINAL_RENDER_RESERVATION_COMPONENTS_V1.terminalProjectionEvents;
 }
+
+/**
+ * Size the RENDER no-progress stream bound from the host activityEvents
+ * ceiling. One event is reserved for the terminal projection so the
+ * persisted envelope's activityEvents equals the host budget. Visible
+ * tokens remain bounded by outputBytes, tokens, and deadline — not this
+ * count. The reservation lives on the execution row and is not charged
+ * against the WORK activity_events ledger.
+ */
+export function finalRenderActivityChunksFromHostLimitsV1(activityEvents: number): number {
+  const chunks = finalRenderActivityChunkLimitV1(activityEvents);
+  if (chunks < 0) {
+    throw new RangeError("final render host activity event budget is invalid");
+  }
+  return chunks;
+}
 const MAX_LEASE_MS = 5 * 60 * 1000;
 const DEFAULT_LEASE_MS = 30 * 1000;
+const AGENT_TURN_RECONCILIATION_PAGE_SIZE = 256;
+const AGENT_TURN_RECONCILIATION_MAX_ROWS = 2048;
+const AGENT_TURN_RECONCILIATION_MAX_MS = 5_000;
 const TERMINAL_PHASE_SET = new Set<TurnExecutionPhase>(TERMINAL_TURN_PHASES);
 const REVERSIBLE_PHASE_SET = new Set<TurnExecutionPhase>(REVERSIBLE_TURN_PHASES);
 
-let receiptRepairHandler: ((execution: TurnExecutionRecord, receipt: TurnCommitReceipt) => void | Promise<void>) | null = null;
+let receiptRepairHandler: ((
+  execution: TurnExecutionRecord,
+  receipt: TurnCommitReceipt,
+  options?: Pick<AgentRunReceiptRepairOptions, "historicalTargetRedaction">,
+) => void | Promise<void>) | null = null;
+let reconciliationClock: () => number = Date.now;
 
 function nowMs(): number {
   return Date.now();
+}
+
+function reconciliationNowMs(): number {
+  return reconciliationClock();
 }
 
 function randomId(prefix: string): string {
@@ -841,7 +885,7 @@ function workPhaseForExecution(phase: TurnExecutionPhase): AgentWorkPhase {
   return "TERMINAL";
 }
 
-type CanonicalTerminalCause = "stopped" | "exhausted" | "failed";
+type CanonicalTerminalCause = "stopped" | "exhausted" | "failed" | "rejected";
 
 function terminalCauseForExecutionCode(value: string | null): CanonicalTerminalCause | null {
   if (!value) return null;
@@ -850,16 +894,34 @@ function terminalCauseForExecutionCode(value: string | null): CanonicalTerminalC
   if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
     return "stopped";
   }
+  if ([
+    "timed_out",
+    "timeout",
+    "deadline_exceeded",
+    "agentic_timed_out",
+    "root_wall_clock_limit_exceeded",
+  ].includes(code)) {
+    return "failed";
+  }
   if (
     code === "exhausted"
     || code === "budget_exhausted"
+    || code === "budget_exceeded"
     || code === "limit_exceeded"
     || code === "agentic_work_exhausted"
-    || code === "root_wall_clock_limit_exceeded"
     || code.endsWith("_limit_exceeded")
     || code.endsWith("_budget_exhausted")
+    || code.endsWith("_budget_exceeded")
   ) {
     return "exhausted";
+  }
+  if ([
+    "rejected",
+    "invalid_input",
+    "decision_refresh_required",
+    "agentic_runtime_unavailable",
+  ].includes(code)) {
+    return "rejected";
   }
   return "failed";
 }
@@ -868,11 +930,12 @@ function workOutcomeForExecution(
   phase: TurnExecutionPhase,
   terminalCode: string | null,
 ): AgentWorkOutcome | null {
+  if (phase === "COMMITTED") return "completed";
   if (phase === "CANCELLED") return "stopped";
-  const cause = terminalCauseForExecutionCode(terminalCode);
-  if (cause) return cause;
+  if (phase === "TIMED_OUT") return "failed";
   if (phase === "EXHAUSTED") return "exhausted";
-  return "failed";
+  if (phase !== "COMMIT_FAILED" && phase !== "FAILED") return null;
+  return terminalCauseForExecutionCode(terminalCode) ?? "failed";
 }
 
 function workStatusForExecution(
@@ -1324,6 +1387,24 @@ export function getTurnExecution(
     throw error;
   }
 }
+/**
+ * Read the durable commit receipt without changing execution state.
+ *
+ * Recovery callers use the receipt as the commit boundary, but the execution
+ * phase remains authoritative until the receipt repair transaction has
+ * completed. Keeping this lookup read-only lets startup order those two
+ * repairs explicitly.
+ */
+export function getTurnCommitReceipt(
+  executionId: string,
+  userId?: string,
+  db: Database = getDb(),
+): TurnCommitReceipt | null {
+  const execution = getTurnExecution(executionId, userId, db);
+  if (!execution) return null;
+  const row = rawReceipt(db, execution);
+  return row ? receiptFromRow(row, execution) : null;
+}
 
 export function claimTurnExecution(
   input: ClaimTurnExecutionInput,
@@ -1457,7 +1538,9 @@ export function requestTurnCancellation(input: {
   if (TERMINAL_PHASE_SET.has(current.phase)) return { execution: current, code: "already_terminal" };
   if (input.ownerToken) ensureOwner(current, input.ownerToken);
   const now = input.now ?? nowMs();
-  const target: TerminalTurnPhase = current.deadlineAt > 0 && now >= current.deadlineAt ? "TIMED_OUT" : "CANCELLED";
+  const target: TerminalTurnPhase = input.reason === "timed_out"
+    ? "TIMED_OUT"
+    : current.deadlineAt > 0 && now >= current.deadlineAt ? "TIMED_OUT" : "CANCELLED";
   const owner = input.ownerToken ?? current.casOwner;
   if (!owner) throw new TurnExecutionError("stale_owner", "execution has no active owner", { executionId: current.id });
   const result = terminalizeWithCas(
@@ -1714,15 +1797,36 @@ function assertReceiptTarget(
   }
 }
 
-function receiptFromRow(row: Record<string, unknown>, execution: TurnExecutionRecord): TurnCommitReceipt {
+function historicalReceiptTargetAuthorized(
+  db: Database,
+  execution: TurnExecutionRecord,
+): boolean {
+  if (execution.phase !== "COMMITTED") return false;
+  const row = db.query(
+    `SELECT *
+       FROM agent_run_attempts
+      WHERE user_id = ? AND attempt_id = ?
+      LIMIT 1`,
+  ).get(execution.userId, execution.attemptLineage.attemptId) as Record<string, unknown> | null;
+  if (!row || !inspectionCoreIdentityMatches(row, execution)) return false;
+  const reconciliationState = rowString(row, "reconciliation_state");
+  if (reconciliationState !== "authoritative" && reconciliationState !== "recovered") return false;
+  return terminalAuditEvidence(db, execution, row).targetMatches;
+}
+
+function receiptFromRow(
+  row: Record<string, unknown>,
+  execution: TurnExecutionRecord,
+  options?: { readonly allowHistoricalTarget?: boolean; readonly db?: Database },
+): TurnCommitReceipt {
   const id = rowString(row, "id", "receipt_id") ?? `${execution.id}:${execution.commitKey}`;
   const executionId = rowString(row, "execution_id", "turn_id") ?? execution.id;
   const userId = rowString(row, "user_id") ?? execution.userId;
   const chatId = rowString(row, "chat_id") ?? execution.chatId;
   const commitKey = rowString(row, "commit_key") ?? execution.commitKey;
   const workspaceId = rowString(row, "workspace_id") ?? execution.workspaceId;
-  const messageId = rowString(row, "message_id") ?? execution.targetMessageId;
-  const swipeId = rowNumber(row, "swipe_id") ?? execution.targetSwipeId;
+  let messageId = rowString(row, "message_id") ?? execution.targetMessageId;
+  let swipeId = rowNumber(row, "swipe_id") ?? execution.targetSwipeId;
   if (
     executionId !== execution.id
     || userId !== execution.userId
@@ -1731,7 +1835,20 @@ function receiptFromRow(row: Record<string, unknown>, execution: TurnExecutionRe
   ) {
     throw new TurnExecutionError("invalid_execution_input", "receipt authority does not match the immutable execution owner", { executionId: execution.id, phase: execution.phase });
   }
-  assertReceiptTarget(execution, workspaceId, messageId, swipeId);
+  const targetValid = options?.db
+    ? storedRecoveryTargetIsValid(options.db, execution.chatId, messageId, swipeId)
+    : true;
+  if (
+    options?.allowHistoricalTarget === true
+    && options.db
+    && !targetValid
+    && historicalReceiptTargetAuthorized(options.db, execution)
+  ) {
+    messageId = null;
+    swipeId = null;
+  } else {
+    assertReceiptTarget(execution, workspaceId, messageId, swipeId);
+  }
   return {
     id,
     executionId,
@@ -1744,6 +1861,36 @@ function receiptFromRow(row: Record<string, unknown>, execution: TurnExecutionRe
     artifactRefCount: rowNumber(row, "artifact_ref_count") ?? 0,
     summary: parseSummary(rowString(row, "summary_json", "summary")),
     createdAt: rowNumber(row, "created_at", "committed_at") ?? 0,
+  };
+}
+function normalizedReceiptExecution(
+  db: Database,
+  execution: TurnExecutionRecord,
+  receipt: TurnCommitReceipt,
+): TurnExecutionRecord {
+  if (execution.targetMessageId === receipt.messageId && execution.targetSwipeId === receipt.swipeId) {
+    return execution;
+  }
+  const attemptRow = db.query(
+    `SELECT target_message_id, target_swipe_id
+       FROM agent_run_attempts
+      WHERE user_id = ? AND attempt_id = ?
+      LIMIT 1`,
+  ).get(execution.userId, execution.attemptLineage.attemptId) as Record<string, unknown> | null;
+  const lineageTargetMessageId = attemptRow ? rowString(attemptRow, "target_message_id") : receipt.messageId;
+  const lineageTargetSwipeId = attemptRow ? rowNumber(attemptRow, "target_swipe_id") : receipt.swipeId;
+  return {
+    ...execution,
+    targetMessageId: receipt.messageId,
+    targetSwipeId: receipt.swipeId,
+    attemptLineage: {
+      ...execution.attemptLineage,
+      target: {
+        ...execution.attemptLineage.target,
+        messageId: lineageTargetMessageId,
+        swipeId: lineageTargetMessageId === null ? null : lineageTargetSwipeId,
+      },
+    },
   };
 }
 
@@ -1820,7 +1967,11 @@ export function registerAgentTurnTerminalRecovery(
 
 /** Register only a projection/handoff repairer. It must not dispatch providers or replay side effects. */
 export function registerAgentTurnReceiptRepair(
-  handler: ((execution: TurnExecutionRecord, receipt: TurnCommitReceipt) => void | Promise<void>) | null,
+  handler: ((
+    execution: TurnExecutionRecord,
+    receipt: TurnCommitReceipt,
+    options?: Pick<AgentRunReceiptRepairOptions, "historicalTargetRedaction">,
+  ) => void | Promise<void>) | null,
 ): void {
   receiptRepairHandler = handler;
 }
@@ -2018,17 +2169,6 @@ const SERVER_READINESS_COMPONENTS = [
   "archiveRegistry",
   "isolateTermination",
   "publicationStore",
-  "providerCapabilities",
-  "configBinding",
-  "contextAcl",
-  "inputRevisions",
-] as const;
-const STATIC_READINESS_COMPONENTS = [
-  "schema",
-  "reconciliation",
-  "archiveRegistry",
-  "isolateTermination",
-  "publicationStore",
 ] as const;
 type ServerReadinessComponent = (typeof SERVER_READINESS_COMPONENTS)[number];
 
@@ -2038,14 +2178,12 @@ export interface AgenticReadinessVectorV1 {
   readonly archiveRegistry: boolean;
   readonly isolateTermination: boolean;
   readonly publicationStore: boolean;
-  readonly providerCapabilities: boolean;
-  readonly configBinding: boolean;
-  readonly contextAcl: boolean;
-  readonly inputRevisions: boolean;
   readonly runtimeEpoch: number;
   readonly reason: string | null;
   readonly digest: string;
 }
+
+
 
 export interface AgenticRuntimeStatus {
   readonly mode: "off" | "auto";
@@ -2061,10 +2199,6 @@ let readiness: Omit<AgenticReadinessVectorV1, "digest" | "reason"> = {
   archiveRegistry: false,
   isolateTermination: false,
   publicationStore: false,
-  providerCapabilities: false,
-  configBinding: false,
-  contextAcl: false,
-  inputRevisions: false,
   runtimeEpoch,
 };
 
@@ -2076,11 +2210,13 @@ function readinessDigest(value: Omit<AgenticReadinessVectorV1, "digest" | "reaso
 }
 
 function readinessReason(value: Omit<AgenticReadinessVectorV1, "digest" | "reason">): string | null {
-  for (const component of STATIC_READINESS_COMPONENTS) {
+  for (const component of SERVER_READINESS_COMPONENTS) {
     if (!value[component]) return `${component}_unavailable`;
   }
   return null;
 }
+
+
 
 export function getRuntimeEpoch(): number {
   return runtimeEpoch;
@@ -2158,12 +2294,11 @@ export const __testing = {
       archiveRegistry: false,
       isolateTermination: false,
       publicationStore: false,
-      providerCapabilities: false,
-      configBinding: false,
-      contextAcl: false,
-      inputRevisions: false,
       runtimeEpoch,
     };
+  },
+  setReconciliationClock(clock?: (() => number) | null): void {
+    reconciliationClock = clock ?? Date.now;
   },
 };
 
@@ -2229,40 +2364,1081 @@ function projectionNeedsReceiptRepair(db: Database, execution: TurnExecutionReco
   return row?.status !== "COMMITTED" || Number(row?.terminal_event_present ?? 0) !== 1;
 }
 
+const NONCOMMITTED_TERMINAL_PHASES: readonly TerminalTurnPhase[] = [
+  "COMMIT_FAILED",
+  "EXHAUSTED",
+  "FAILED",
+  "CANCELLED",
+  "TIMED_OUT",
+];
+
+function isNoncommittedTerminalPhase(phase: TurnExecutionPhase): phase is TerminalTurnPhase {
+  return (NONCOMMITTED_TERMINAL_PHASES as readonly TurnExecutionPhase[]).includes(phase);
+}
+
+function publishedTerminalAuthority(
+  db: Database,
+  execution: TurnExecutionRecord,
+): { readonly phase: TerminalTurnPhase; readonly reason: string } | null {
+  if (!terminalRecoveryTablesAvailable(db)) return null;
+  const inspection = db.query(
+    `SELECT outcome, terminal, reconciliation_state, chat_id, turn_id, generation_id
+       FROM agent_run_attempts
+      WHERE user_id = ? AND attempt_id = ?
+      LIMIT 1`,
+  ).get(execution.userId, execution.attemptLineage.attemptId) as Record<string, unknown> | null;
+  if (
+    !inspection
+    || rowNumber(inspection, "terminal") !== 1
+    || rowString(inspection, "reconciliation_state") !== "authoritative"
+    || rowString(inspection, "chat_id") !== execution.chatId
+    || rowString(inspection, "turn_id") !== execution.id
+    || rowString(inspection, "generation_id") !== execution.generationId
+  ) {
+    return null;
+  }
+  const outcome = rowString(inspection, "outcome");
+  let phase: TerminalTurnPhase;
+  let reason: string;
+  if (outcome === "exhausted") {
+    phase = "EXHAUSTED";
+    reason = "exhausted";
+  } else if (outcome === "stopped") {
+    phase = "CANCELLED";
+    reason = "cancelled";
+  } else {
+    return null;
+  }
+  const projection = db.query(
+    `SELECT status, phase, chat_id, generation_id
+       FROM agent_run_projections
+      WHERE user_id = ? AND turn_id = ?
+      LIMIT 1`,
+  ).get(execution.userId, execution.id) as Record<string, unknown> | null;
+  if (
+    !projection
+    || rowString(projection, "chat_id") !== execution.chatId
+    || rowString(projection, "generation_id") !== execution.generationId
+  ) {
+    return null;
+  }
+  if (rowString(projection, "status", "phase") !== phase) return null;
+  return { phase, reason };
+}
+
+function adoptPublishedTerminalAuthority(
+  db: Database,
+  current: TurnExecutionRecord,
+  ownerToken: string | null,
+  now: number,
+): TurnExecutionRecord | null {
+  const authority = publishedTerminalAuthority(db, current);
+  if (!authority) return null;
+  if (current.phase === authority.phase) return current;
+  const fromInterruptedFailure = current.phase === "FAILED" && current.terminalCode === "process_interrupted";
+  const fromReversible = REVERSIBLE_PHASE_SET.has(current.phase);
+  if (!fromInterruptedFailure && !fromReversible) return null;
+  return terminalizeWithCas(
+    db,
+    current,
+    ownerToken,
+    current.phase,
+    current.casRevision,
+    authority.phase,
+    authority.reason,
+    now,
+  ).execution;
+}
+
+function terminalInspectionReasonForExecution(
+  execution: TurnExecutionRecord,
+): AgentInspectionReasonV1 {
+  const code = execution.terminalCode?.trim().toLowerCase() ?? "";
+  if (code === "terminal_publication_failed" || code === "projection_unavailable") return "needs_attention";
+  if (execution.phase === "CANCELLED") return code === "deadline" || code === "timed_out" ? "deadline" : "user_stop";
+  if (execution.phase === "TIMED_OUT") return "deadline";
+  if (execution.phase === "EXHAUSTED") return "budget_exhausted";
+  if (code === "invalid_input" || code === "decision_refresh_required" || code === "agentic_runtime_unavailable") {
+    return "invalid_input";
+  }
+  if (code.includes("provider")) return "provider_failure";
+  if (code.includes("tool")) return "tool_failure";
+  if (code.includes("required_work")) return "required_work_failure";
+  if (code.includes("budget") || code.includes("limit") || code === "exhausted") return "budget_exhausted";
+  if (code === "interrupted" || code === "process_interrupted") return "interrupted";
+  if (code.length > 0) return "needs_attention";
+  return "unknown";
+}
+function terminalRecoveryOutcome(execution: TurnExecutionRecord): AgentInspectionOutcomeV1 {
+  const outcome = execution.workOutcome;
+  if (
+    outcome === "completed"
+    || outcome === "stopped"
+    || outcome === "failed"
+    || outcome === "exhausted"
+    || outcome === "rejected"
+  ) return outcome;
+  throw new TurnExecutionError("execution_schema_unavailable", "terminal execution outcome is unavailable", {
+    executionId: execution.id,
+    phase: execution.phase,
+  });
+}
+
+
+const INSPECTION_RECOVERY_REASONS: ReadonlySet<string> = new Set([
+  "none",
+  "user_stop",
+  "deadline",
+  "provider_failure",
+  "tool_failure",
+  "required_work_failure",
+  "budget_exhausted",
+  "invalid_input",
+  "stale_input",
+  "unavailable",
+  "needs_attention",
+  "interrupted",
+  "retry_requested",
+  "reconciled",
+  "unknown",
+]);
+
+function isInspectionRecoveryReason(value: string | null): value is AgentInspectionReasonV1 {
+  return value !== null && INSPECTION_RECOVERY_REASONS.has(value);
+}
+const HISTORICAL_INSPECTION_REASON_ALIASES_V1: Readonly<Record<string, true>> = Object.freeze({
+  failed: true,
+  process_interrupted: true,
+  stopped: true,
+  cancelled: true,
+  exhausted: true,
+  stale_input_revision: true,
+});
+
+function normalizedHistoricalInspectionReason(
+  execution: TurnExecutionRecord,
+  value: string | null,
+  historicalState: boolean,
+): AgentInspectionReasonV1 | null {
+  if (isInspectionRecoveryReason(value)) return value;
+  if (!historicalState || value === null || !HISTORICAL_INSPECTION_REASON_ALIASES_V1[value]) return null;
+  switch (value) {
+    case "failed":
+      return terminalInspectionReasonForExecution(execution);
+    case "process_interrupted":
+      return "interrupted";
+    case "stopped":
+    case "cancelled":
+      return execution.phase === "CANCELLED" ? "user_stop" : null;
+    case "exhausted":
+      return execution.phase === "EXHAUSTED" ? "budget_exhausted" : null;
+    case "stale_input_revision":
+      return execution.phase === "COMMIT_FAILED" ? "stale_input" : null;
+    default:
+      return null;
+  }
+}
+
+const AGENT_PUBLIC_ERROR_CODES_SET: ReadonlySet<string> = new Set(AGENT_PUBLIC_ERROR_CODES);
+
+function terminalProjectionReasonForExecution(
+  execution: TurnExecutionRecord,
+  inspectionReason: AgentInspectionReasonV1,
+  outcome: AgentInspectionOutcomeV1 = terminalRecoveryOutcome(execution),
+): string {
+  const code = execution.terminalCode?.trim().toLowerCase() ?? "";
+  if (code === "terminal_publication_failed" || code === "projection_unavailable") {
+    return "projection_unavailable";
+  }
+  if (outcome === "rejected" && inspectionReason === "needs_attention") return "invalid_input";
+  if (execution.phase === "COMMIT_FAILED"
+    && (code === "commit_failed" || code === "failed" || code === "interrupted" || code === "process_interrupted")) {
+    return "commit_failed";
+  }
+  if (code === "interrupted" || code === "process_interrupted") return "failed";
+  if (code === "failed") return "failed";
+  if (execution.phase === "CANCELLED" || outcome === "stopped") return "stopped";
+  if (execution.phase === "TIMED_OUT") return "deadline";
+  if (execution.phase === "EXHAUSTED" || outcome === "exhausted") return "budget_exhausted";
+  return inspectionReason;
+}
+
+function terminalProjectionErrorCodeForExecution(
+  execution: TurnExecutionRecord,
+  inspectionReason: AgentInspectionReasonV1,
+  outcome: AgentInspectionOutcomeV1 = terminalRecoveryOutcome(execution),
+): string | null {
+  const code = execution.terminalCode?.trim().toLowerCase() ?? "";
+  if (inspectionReason === "needs_attention" || code === "terminal_publication_failed") {
+    return outcome === "stopped"
+      ? "cancelled"
+      : outcome === "exhausted"
+        ? "limit_exceeded"
+        : outcome === "rejected"
+          ? "invalid_input"
+          : "internal_error";
+  }
+  if (code === "interrupted" || code === "process_interrupted") return "internal_error";
+  if (code && AGENT_PUBLIC_ERROR_CODES_SET.has(code)) return code;
+  if (execution.phase === "COMMIT_FAILED") return "internal_error";
+  return null;
+}
+
+function terminalRecoveryReason(
+  execution: TurnExecutionRecord,
+  inspectionReason: AgentInspectionReasonV1,
+  outcome: AgentInspectionOutcomeV1 = terminalRecoveryOutcome(execution),
+): string {
+  return terminalProjectionReasonForExecution(execution, inspectionReason, outcome).slice(0, 128);
+}
+
+interface TerminalRecoveryTarget {
+  readonly messageId: string | null;
+  readonly swipeId: number | null;
+}
+
+interface TerminalAuditEvidence {
+  readonly targetMatches: boolean;
+  readonly auditedTarget: TerminalRecoveryTarget | null;
+  readonly quarantineEvidence: boolean;
+  readonly terminalOutcome: AgentInspectionOutcomeV1 | null;
+  readonly terminalReason: string | null;
+}
+
+interface TerminalInspectionResolution {
+  readonly outcome: AgentInspectionOutcomeV1;
+  readonly inspectionReason: AgentInspectionReasonV1;
+  readonly projectionReason: string;
+  readonly projectionTarget: TerminalRecoveryTarget;
+  readonly inspectionTarget: TerminalRecoveryTarget;
+  readonly attemptLineage: AgentWorkAttemptLineageV1;
+  readonly hostCorrelationId: string;
+  readonly previousAttemptId: string | null;
+  readonly inspectionExact: boolean;
+  readonly inspectionRow: Record<string, unknown> | null;
+  readonly historicalRepair: boolean;
+  readonly explicitUnrecoverable: boolean;
+}
+
+function isTerminalInspectionOutcome(value: string | null): value is AgentInspectionOutcomeV1 {
+  return value === "stopped" || value === "failed" || value === "exhausted" || value === "rejected";
+}
+function normalizeHistoricalTerminalOutcome(value: unknown): AgentInspectionOutcomeV1 | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return isTerminalInspectionOutcome(normalized) ? normalized : null;
+}
+
+function sameRecoveryTarget(left: TerminalRecoveryTarget, right: TerminalRecoveryTarget): boolean {
+  return left.messageId === right.messageId && left.swipeId === right.swipeId;
+}
+
+function parseRecoverySwipes(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function storedRecoveryTargetIsValid(
+  db: Database,
+  chatId: string,
+  messageId: string | null,
+  swipeId: number | null,
+): boolean {
+  if (messageId === null) return swipeId === null;
+  if (!messageId) return false;
+  try {
+    const row = db.query(
+      "SELECT swipes FROM messages WHERE id = ? AND chat_id = ? LIMIT 1",
+    ).get(messageId, chatId) as { swipes?: unknown } | null;
+    if (!row) return false;
+    if (swipeId === null) return true;
+    if (!Number.isSafeInteger(swipeId) || swipeId < 0) return false;
+    const swipes = parseRecoverySwipes(row.swipes);
+    if (!swipes) return false;
+    return swipeId < swipes.length;
+  } catch {
+    return false;
+  }
+}
+
+
+function auditNullableId(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function auditNullableSwipe(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function terminalAuditEvidence(
+  db: Database,
+  execution: TurnExecutionRecord,
+  row: Record<string, unknown>,
+  candidates: readonly TerminalRecoveryTarget[] = [],
+): TerminalAuditEvidence {
+  if (!hasTable(db, "agent_run_audit_records")) {
+    return {
+      targetMatches: false,
+      auditedTarget: null,
+      quarantineEvidence: false,
+      terminalOutcome: null,
+      terminalReason: null,
+    };
+  }
+  const expectedMessageId = rowString(row, "target_message_id");
+  const expectedSwipeId = rowNumber(row, "target_swipe_id");
+  let targetMatches = false;
+  let auditedTarget: TerminalRecoveryTarget | null = null;
+  let ambiguousTarget = false;
+  let quarantineEvidence = false;
+  let terminalOutcome: AgentInspectionOutcomeV1 | null = null;
+  let terminalReason: string | null = null;
+  let rows: Array<{ event_id?: unknown; payload_json?: unknown }> = [];
+  try {
+    rows = db.query(
+      `SELECT event_id, payload_json
+         FROM agent_run_audit_records
+        WHERE user_id = ? AND chat_id = ? AND attempt_id = ?
+        ORDER BY host_sequence, record_id
+        LIMIT 512`,
+    ).all(execution.userId, execution.chatId, rowString(row, "attempt_id") ?? execution.id) as Array<{
+      event_id?: unknown;
+      payload_json?: unknown;
+    }>;
+  } catch {
+    return { targetMatches, auditedTarget, quarantineEvidence, terminalOutcome, terminalReason };
+  }
+  for (const auditRow of rows) {
+    let payload: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(String(auditRow.payload_json ?? "{}")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      payload = parsed as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const detail = typeof payload.detail === "string" ? payload.detail : "";
+    if (detail.includes("unrecoverable_target")) quarantineEvidence = true;
+    const correlation = payload.correlation;
+    if (!correlation || typeof correlation !== "object" || Array.isArray(correlation)) continue;
+    const c = correlation as Record<string, unknown>;
+    const messageId = auditNullableId(c.messageId);
+    const swipeId = auditNullableSwipe(c.swipeId);
+    if (messageId === undefined || swipeId === undefined) continue;
+    if (messageId === expectedMessageId && swipeId === expectedSwipeId) targetMatches = true;
+    for (const candidate of candidates) {
+      if (!sameRecoveryTarget(candidate, { messageId, swipeId })) continue;
+      if (auditedTarget && !sameRecoveryTarget(auditedTarget, candidate)) ambiguousTarget = true;
+      else auditedTarget = candidate;
+    }
+    const eventId = String(auditRow.event_id ?? "");
+    if (!eventId.startsWith("terminal:") && payload.kind !== "terminal") continue;
+    let result: Record<string, unknown> = {};
+    const rawResult = payload.result;
+    if (rawResult && typeof rawResult === "object" && !Array.isArray(rawResult)) {
+      result = rawResult as Record<string, unknown>;
+    } else if (typeof rawResult === "string") {
+      try {
+        const parsedResult = JSON.parse(rawResult) as unknown;
+        if (parsedResult && typeof parsedResult === "object" && !Array.isArray(parsedResult)) {
+          result = parsedResult as Record<string, unknown>;
+        }
+      } catch {
+        // A malformed historical terminal payload is not audit evidence.
+      }
+    }
+    const outcome = normalizeHistoricalTerminalOutcome(
+      typeof result.workOutcome === "string"
+        ? result.workOutcome
+        : typeof result.outcome === "string" ? result.outcome : null,
+    );
+    const status = normalizeHistoricalTerminalOutcome(
+      typeof result.status === "string"
+        ? result.status
+        : typeof payload.status === "string" ? payload.status : null,
+    );
+    if (outcome !== null) terminalOutcome = outcome;
+    else if (status !== null) terminalOutcome = status;
+    const reason = typeof payload.errorReason === "string"
+      ? payload.errorReason
+      : typeof result.reason === "string" ? result.reason : null;
+    if (reason) terminalReason = reason;
+  }
+  return {
+    targetMatches,
+    auditedTarget: ambiguousTarget ? null : auditedTarget,
+    quarantineEvidence,
+    terminalOutcome,
+    terminalReason,
+  };
+}
+
+function inspectionCoreIdentityMatches(
+  row: Record<string, unknown>,
+  execution: TurnExecutionRecord,
+): boolean {
+  return rowString(row, "user_id") === execution.userId
+    && rowString(row, "chat_id") === execution.chatId
+    && rowString(row, "run_id") === execution.generationId
+    && rowString(row, "turn_id") === execution.id
+    && rowString(row, "generation_id") === execution.generationId
+    && rowString(row, "generation_type") === execution.targetKind
+    && rowString(row, "target_message_id") === execution.targetMessageId;
+}
+
+function inspectionTargetFromRow(
+  row: Record<string, unknown> | null,
+  execution: TurnExecutionRecord,
+  fallback: TerminalRecoveryTarget,
+): TerminalRecoveryTarget {
+  return row
+    ? {
+        messageId: rowString(row, "target_message_id"),
+        swipeId: rowNumber(row, "target_swipe_id"),
+      }
+    : {
+        messageId: fallback.messageId ?? execution.targetMessageId,
+        swipeId: fallback.swipeId ?? execution.targetSwipeId,
+      };
+}
+
+function attemptLineageForRecovery(
+  row: Record<string, unknown> | null,
+  execution: TurnExecutionRecord,
+  target: TerminalRecoveryTarget,
+): AgentWorkAttemptLineageV1 {
+  const generationTypeValue = row ? rowString(row, "generation_type") : null;
+  const attemptId = row ? rowString(row, "attempt_id") : null;
+  const chatId = row ? rowString(row, "chat_id") : null;
+  const createdAt = row ? rowNumber(row, "started_at") : null;
+  return {
+    version: 1,
+    attemptId: attemptId ?? execution.attemptLineage.attemptId,
+    previousAttemptId: row
+      ? rowString(row, "previous_attempt_id")
+      : execution.attemptLineage.previousAttemptId ?? null,
+    target: {
+      chatId: chatId ?? execution.chatId,
+      generationType: generationTypeValue && isGenerationTarget(generationTypeValue)
+        ? generationTypeValue
+        : execution.targetKind,
+      messageId: target.messageId,
+      swipeId: target.messageId === null ? null : target.swipeId,
+    },
+    createdAt: createdAt ?? execution.attemptLineage.createdAt,
+  };
+}
+
+function resolveTerminalInspection(
+  db: Database,
+  row: Record<string, unknown> | null,
+  execution: TurnExecutionRecord,
+): TerminalInspectionResolution {
+  const executionOutcome = terminalRecoveryOutcome(execution);
+  const executionInspectionReason = terminalInspectionReasonForExecution(execution);
+  const executionTarget: TerminalRecoveryTarget = {
+    messageId: execution.targetMessageId,
+    swipeId: execution.targetSwipeId,
+  };
+  const executionTargetValid = storedRecoveryTargetIsValid(
+    db,
+    execution.chatId,
+    executionTarget.messageId,
+    executionTarget.swipeId,
+  );
+  const projectionTargetIfValid = executionTargetValid ? executionTarget : { messageId: null, swipeId: null };
+  if (!row) {
+    if (!executionTargetValid) {
+      throw new TurnExecutionError("invalid_execution_input", "historical terminal target has no durable audit authority", {
+        executionId: execution.id,
+        phase: execution.phase,
+      });
+    }
+    return {
+      outcome: executionOutcome,
+      inspectionReason: executionInspectionReason,
+      projectionReason: terminalRecoveryReason(execution, executionInspectionReason, executionOutcome),
+      projectionTarget: projectionTargetIfValid,
+      inspectionTarget: projectionTargetIfValid,
+      attemptLineage: attemptLineageForRecovery(null, execution, projectionTargetIfValid),
+      hostCorrelationId: `agentic:${execution.id}:${execution.attemptLineage.attemptId}`,
+      previousAttemptId: execution.attemptLineage.previousAttemptId ?? null,
+      inspectionExact: false,
+      inspectionRow: null,
+      historicalRepair: false,
+      explicitUnrecoverable: false,
+    };
+  }
+  if (!inspectionCoreIdentityMatches(row, execution)) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal inspection identity does not match the execution", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+  const inspectionTarget = inspectionTargetFromRow(row, execution, executionTarget);
+  const targetMismatch = !sameRecoveryTarget(inspectionTarget, executionTarget);
+  const rowTerminal = rowNumber(row, "terminal") === 1;
+  const rowOutcome = normalizeHistoricalTerminalOutcome(rowString(row, "outcome"));
+  const rowReason = rowString(row, "reason");
+  const outcomeMismatch = rowTerminal && rowOutcome !== null && rowOutcome !== executionOutcome;
+  const historicalState = rowString(row, "reconciliation_state") === "authoritative"
+    || rowString(row, "reconciliation_state") === "recovered";
+  const requiresAudit = !executionTargetValid || targetMismatch || outcomeMismatch;
+  const evidence = requiresAudit
+    ? terminalAuditEvidence(db, execution, row, [executionTarget, inspectionTarget])
+    : null;
+  let projectionTarget = projectionTargetIfValid;
+  if (
+    !executionTargetValid
+    && evidence?.auditedTarget
+    && storedRecoveryTargetIsValid(
+      db,
+      execution.chatId,
+      evidence.auditedTarget.messageId,
+      evidence.auditedTarget.swipeId,
+    )
+  ) {
+    projectionTarget = evidence.auditedTarget;
+  }
+  const targetRedacted = !sameRecoveryTarget(projectionTarget, executionTarget);
+  const auditedTarget = !targetRedacted && !targetMismatch
+    || Boolean(
+      evidence?.auditedTarget
+      && (
+        sameRecoveryTarget(evidence.auditedTarget, executionTarget)
+        || sameRecoveryTarget(evidence.auditedTarget, inspectionTarget)
+      ),
+    );
+  const canQuarantine = !executionTargetValid
+    && historicalState
+    && rowString(row, "reconciliation_state") === "recovered"
+    && rowTerminal
+    && !storedRecoveryTargetIsValid(
+      db,
+      execution.chatId,
+      inspectionTarget.messageId,
+      inspectionTarget.swipeId,
+    )
+    && !evidence?.auditedTarget;
+  const explicitUnrecoverable = canQuarantine || Boolean(evidence?.quarantineEvidence);
+  const auditedOutcome = !outcomeMismatch
+    || Boolean(
+      (evidence?.terminalOutcome === rowOutcome || evidence?.terminalOutcome === executionOutcome)
+      && (evidence?.terminalReason === null || evidence?.terminalReason === rowReason),
+    );
+  if (
+    requiresAudit && !historicalState
+    || targetRedacted && !auditedTarget && !explicitUnrecoverable
+    || targetMismatch && !auditedTarget && !explicitUnrecoverable
+    || outcomeMismatch && !auditedOutcome
+  ) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal inspection contradiction is not durably audited", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+  const normalizedReason = rowTerminal
+    ? normalizedHistoricalInspectionReason(execution, rowReason, historicalState)
+    : null;
+  if (rowTerminal && (
+    rowString(row, "status") !== "terminal"
+    || rowOutcome === null
+    || normalizedReason === null
+  )) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal inspection outcome is immutable", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+  const useStoredOutcome = rowTerminal && rowOutcome !== null
+    && (
+      !outcomeMismatch
+      || evidence?.terminalOutcome === rowOutcome
+      || rowString(row, "reconciliation_state") === "authoritative"
+    );
+  const outcome = useStoredOutcome ? rowOutcome : executionOutcome;
+  const inspectionReason = useStoredOutcome
+    && normalizedReason !== null
+    && normalizedReason !== "none"
+    ? normalizedReason
+    : executionInspectionReason;
+  const historicalRepair = targetRedacted || targetMismatch || outcomeMismatch || !rowTerminal;
+  const inspectionExact = rowTerminal
+    && historicalState
+    && (
+      rowString(row, "reconciliation_state") === "authoritative"
+      || auditedOutcome && (!explicitUnrecoverable || Boolean(evidence?.quarantineEvidence))
+    );
+  return {
+    outcome,
+    inspectionReason,
+    projectionReason: explicitUnrecoverable
+      ? "projection_unavailable"
+      : terminalRecoveryReason(execution, inspectionReason, outcome),
+    projectionTarget,
+    inspectionTarget,
+    attemptLineage: attemptLineageForRecovery(
+      row,
+      execution,
+      explicitUnrecoverable ? { messageId: null, swipeId: null } : inspectionTarget,
+    ),
+    hostCorrelationId: rowString(row, "host_correlation_id")
+      ?? `agentic:${execution.id}:${execution.attemptLineage.attemptId}`,
+    previousAttemptId: rowString(row, "previous_attempt_id"),
+    inspectionExact,
+    inspectionRow: row,
+    historicalRepair,
+    explicitUnrecoverable,
+  };
+}
+
+function terminalProjectionMatches(
+  db: Database,
+  execution: TurnExecutionRecord,
+  outcome: AgentInspectionOutcomeV1,
+  reason: string,
+  errorCode: string | null,
+  target: TerminalRecoveryTarget,
+): boolean {
+  const row = db.query(
+    `SELECT user_id, chat_id, turn_id, generation_id, generation_type,
+            target_message_id, target_swipe_id, status, phase, snapshot_json
+       FROM agent_run_projections
+      WHERE user_id = ? AND turn_id = ?
+      LIMIT 1`,
+  ).get(execution.userId, execution.id) as Record<string, unknown> | null;
+  if (!row) return false;
+  const parsed = (() => {
+    try {
+      const value = JSON.parse(String(row.snapshot_json ?? "{}"));
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null;
+    } catch {
+      throw new TurnExecutionError("execution_schema_unavailable", "terminal projection snapshot is malformed", {
+        executionId: execution.id,
+        phase: execution.phase,
+      });
+    }
+  })();
+  if (!parsed) {
+    throw new TurnExecutionError("execution_schema_unavailable", "terminal projection snapshot is unavailable", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+  const storedStatus = rowString(row, "status", "phase");
+  if (
+    rowString(row, "user_id") !== execution.userId
+    || rowString(row, "chat_id") !== execution.chatId
+    || rowString(row, "turn_id") !== execution.id
+    || rowString(row, "generation_id") !== execution.generationId
+    || rowString(row, "generation_type") !== execution.targetKind
+  ) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal projection identity does not match the canonical projection", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+  const storedTargetMessageId = rowString(row, "target_message_id");
+  if (
+    storedTargetMessageId !== null
+    && target.messageId !== null
+    && storedTargetMessageId !== target.messageId
+  ) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal projection identity does not match the canonical projection", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+
+  const storedTerminal = TERMINAL_PHASE_SET.has(storedStatus as TurnExecutionPhase);
+  if (!storedTerminal) return false;
+  const parsedError = parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error)
+    ? parsed.error as Record<string, unknown>
+    : null;
+  const storedOutcome = parsed.workOutcome;
+  const storedReason = typeof parsed.reason === "string" ? parsed.reason : null;
+  const storedErrorCode = parsedError && typeof parsedError.code === "string" ? parsedError.code : null;
+  // Identity plus terminal outcome is the immutable authority. A later
+  // recovery pass may re-derive reason/error labels; those must not rewrite
+  // an already-terminal projection or fail the whole startup scan.
+  if (storedStatus === execution.phase && storedOutcome === outcome) return true;
+  if (
+    storedStatus === execution.phase
+    && storedStatus === "EXHAUSTED"
+    && outcome === "exhausted"
+  ) {
+    return false;
+  }
+  throw new TurnExecutionError(
+    "invalid_execution_input",
+    `terminal projection outcome is immutable: stored ${String(storedOutcome)}/${storedStatus}/${storedReason ?? "none"}/${storedErrorCode ?? "none"}/${rowString(row, "target_message_id") ?? "none"} expected ${outcome}/${execution.phase}/${reason}/${errorCode ?? "none"}/${target.messageId ?? "none"}`,
+    { executionId: execution.id, phase: execution.phase },
+  );
+}
+
+
+function persistRecoveredTerminalInspection(
+  db: Database,
+  execution: TurnExecutionRecord,
+  resolution: TerminalInspectionResolution,
+): void {
+  const row = resolution.inspectionRow;
+  const rowAttemptId = row ? rowString(row, "attempt_id") : null;
+  const rowUserId = row ? rowString(row, "user_id") : null;
+  const rowChatId = row ? rowString(row, "chat_id") : null;
+  const rowRunId = row ? rowString(row, "run_id") : null;
+  const rowTurnId = row ? rowString(row, "turn_id") : null;
+  const rowGenerationId = row ? rowString(row, "generation_id") : null;
+  const rowStartedAt = row ? rowNumber(row, "started_at") : null;
+  const rowUpdatedAt = row ? rowNumber(row, "updated_at") : null;
+  const rowTerminalAt = row ? rowNumber(row, "terminal_at") : null;
+  const attemptId = rowAttemptId ?? execution.attemptLineage.attemptId;
+  const inspectionTarget = resolution.inspectionTarget;
+  const updatedAt = Math.max(
+    rowUpdatedAt ?? 0,
+    execution.terminalAt ?? execution.updatedAt,
+  );
+  const terminalAt = Math.max(
+    rowTerminalAt ?? 0,
+    execution.terminalAt ?? execution.updatedAt,
+  );
+  const input: PersistAgentRunInspectionInputV1 = {
+    userId: rowUserId ?? execution.userId,
+    chatId: rowChatId ?? execution.chatId,
+    attemptId,
+    previousAttemptId: resolution.previousAttemptId,
+    runId: rowRunId ?? execution.generationId,
+    turnSessionId: rowTurnId ?? execution.id,
+    generationId: rowGenerationId ?? execution.generationId,
+    generationType: execution.targetKind,
+    targetMessageId: inspectionTarget.messageId,
+    targetSwipeId: inspectionTarget.swipeId,
+    hostCorrelationId: resolution.hostCorrelationId,
+    lifecycle: "TERMINAL",
+    status: "terminal",
+    outcome: resolution.outcome,
+    reason: resolution.inspectionReason,
+    startedAt: rowStartedAt ?? execution.createdAt,
+    updatedAt,
+    terminalAt,
+    reconciliation: "recovered",
+    markers: [{
+      id: `recovery:terminal:${execution.id}`,
+      kind: "recovery",
+      scope: "run",
+      terminal: true,
+      outcome: resolution.outcome,
+      reason: resolution.inspectionReason,
+      detail: JSON.stringify({
+        source: "startup_terminal_recovery",
+        phase: execution.phase,
+        status: execution.phase,
+        errorCode: execution.terminalCode,
+        executionOutcome: execution.workOutcome,
+        inspectionOutcome: resolution.outcome,
+        inspectionTarget,
+        projectionTarget: resolution.projectionTarget,
+        ...(resolution.explicitUnrecoverable ? {
+          quarantine: "unrecoverable_target",
+          quarantineReason: "historical terminal target is invalid without an audited replacement",
+        } : {}),
+      }),
+      correlation: {
+        parentId: "root",
+        messageId: inspectionTarget.messageId,
+        swipeId: inspectionTarget.swipeId,
+      },
+    }],
+  };
+  if (!persistAgentRunInspectionInTransaction(db, input)) {
+    throw new TurnExecutionError("execution_schema_unavailable", "terminal inspection recovery did not persist", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+}
+
+function appendRecoveredTerminalProjection(
+  db: Database,
+  execution: TurnExecutionRecord,
+  resolution: TerminalInspectionResolution,
+  rewriteInspection: boolean,
+): void {
+  const errorCode = resolution.explicitUnrecoverable
+    ? "internal_error"
+    : terminalProjectionErrorCodeForExecution(
+      execution,
+      resolution.inspectionReason,
+      resolution.outcome,
+    );
+  const target = resolution.projectionTarget;
+  const projection: AgentRunProjectionInputV2 = {
+    userId: execution.userId,
+    chatId: execution.chatId,
+    turnId: execution.id,
+    generationId: execution.generationId,
+    generationType: execution.targetKind,
+    targetMessageId: target.messageId,
+    targetSwipeId: target.swipeId,
+    attemptLineage: resolution.attemptLineage,
+    status: execution.phase,
+    workPhase: "TERMINAL",
+    workStatus: "terminal",
+    workOutcome: resolution.outcome,
+    reason: resolution.projectionReason,
+    ...(errorCode ? {
+      error: {
+        code: errorCode,
+        recoveryEligible: true,
+        recoveryAction: "resync",
+        reason: resolution.projectionReason,
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: resolution.outcome,
+      },
+    } : {}),
+    startedAt: execution.createdAt,
+    updatedAt: execution.updatedAt,
+    activity: [],
+    terminalHandoff: target.messageId === null ? null : {
+      version: 2,
+      committed: false,
+      messageId: target.messageId,
+      swipeId: target.swipeId,
+      messageRevision: null,
+      swipeRevision: null,
+    },
+    ...(rewriteInspection || execution.phase === "EXHAUSTED" ? { recoveryRepair: true as const } : { preserveTerminalInspection: true as const }),
+  };
+  appendAgentRunSnapshot(db, projection);
+}
+
+
+function terminalRecoveryTablesAvailable(db: Database): boolean {
+  return hasTable(db, "agent_run_attempts")
+    && hasTable(db, "agent_run_projections")
+    && hasTable(db, "agent_chat_events");
+}
+
+function reconcileTerminalExecutionProjection(
+  db: Database,
+  execution: TurnExecutionRecord,
+): boolean {
+  if (!isNoncommittedTerminalPhase(execution.phase)) return false;
+  if (!terminalRecoveryTablesAvailable(db)) return false;
+  const attempt = execution.attemptLineage;
+  const inspectionRow = db.query(
+    `SELECT *
+       FROM agent_run_attempts
+      WHERE user_id = ? AND attempt_id = ?
+      LIMIT 1`,
+  ).get(execution.userId, attempt.attemptId) as Record<string, unknown> | null;
+  const resolution = resolveTerminalInspection(db, inspectionRow, execution);
+  const errorCode = terminalProjectionErrorCodeForExecution(
+    execution,
+    resolution.inspectionReason,
+    resolution.outcome,
+  );
+  const projectionExact = terminalProjectionMatches(
+    db,
+    execution,
+    resolution.outcome,
+    resolution.projectionReason,
+    errorCode,
+    resolution.projectionTarget,
+  );
+  if (resolution.inspectionExact && projectionExact) return false;
+  db.transaction(() => {
+    const latest = requireExecution(db, execution.id).execution;
+    if (latest.phase !== execution.phase || latest.casRevision !== execution.casRevision) {
+      throw new TurnExecutionError("stale_execution", "terminal execution changed during recovery", {
+        executionId: execution.id,
+        phase: execution.phase,
+      });
+    }
+    if (!resolution.inspectionExact) persistRecoveredTerminalInspection(db, latest, resolution);
+    if (!projectionExact) appendRecoveredTerminalProjection(db, latest, resolution, !resolution.inspectionExact);
+  })();
+  return true;
+}
+
 /**
  * Invoke only the registered durable projection repairer. Production
  * registration is synchronous and runs inside the caller-owned transaction;
  * legacy asynchronous test handlers are detached without allowing a rejected
  * promise to become an unhandled startup failure.
  */
-function invokeReceiptRepair(execution: TurnExecutionRecord, receipt: TurnCommitReceipt): void {
+function invokeReceiptRepair(
+  execution: TurnExecutionRecord,
+  receipt: TurnCommitReceipt,
+  options?: Pick<AgentRunReceiptRepairOptions, "historicalTargetRedaction">,
+): void {
   if (!receiptRepairHandler) return;
-  const pending = receiptRepairHandler(execution, receipt);
+  const pending = receiptRepairHandler(execution, receipt, options);
   if (pending) void pending.catch(() => {});
 }
 
 /**
- * Startup reconciliation is deliberately receipt-only. It never invokes a
- * provider, renderer, tool, workspace mutator, or generation callback.
+ * Build a keyset-paginated candidate scan. Every noncommitted terminal row is
+ * a durable recovery authority until its private inspection and public
+ * projection are both present; COMMITTED rows remain receipt-repaired only.
+ */
+function reconciliationCandidateQuery(db: Database): {
+  readonly sql: string;
+  readonly phaseValues: readonly TurnExecutionPhase[];
+  readonly orderColumn: string;
+  readonly idColumn: string;
+} | null {
+  const executionColumns = tableColumns(db, "agent_turn_executions");
+  const phaseColumn = firstColumn(executionColumns, "phase", "state");
+  const orderColumn = firstColumn(executionColumns, "created_at", "updated_at");
+  const idColumn = firstColumn(executionColumns, "id", "execution_id");
+  if (!phaseColumn || !orderColumn || !idColumn) return null;
+
+  const phase = `e.${quoteColumn(phaseColumn)}`;
+  const orderedAt = `COALESCE(e.${quoteColumn(orderColumn)}, 0)`;
+  const id = `e.${quoteColumn(idColumn)}`;
+  const phaseValues = [...REVERSIBLE_TURN_PHASES, "COMMITTING"] as const;
+  const terminalRecoveryAvailable = terminalRecoveryTablesAvailable(db);
+  const terminalRepairPhases = terminalRecoveryAvailable
+    ? NONCOMMITTED_TERMINAL_PHASES.map((value) => `'${value}'`).join(", ")
+    : "";
+  const candidatePredicates = [
+    terminalRecoveryAvailable
+      ? `(${phase} IN (${phaseValues.map(() => "?").join(", ")}) OR ${phase} IN (${terminalRepairPhases}))`
+      : `${phase} IN (${phaseValues.map(() => "?").join(", ")})`,
+  ];
+  const priorityPredicates: string[] = [];
+
+  if (hasTable(db, "agent_run_projections")
+    && hasTable(db, "agent_chat_events")
+    && hasTable(db, "agent_turn_commit_receipts")) {
+    const receiptColumns = tableColumns(db, "agent_turn_commit_receipts");
+    const receiptMatches: string[] = [];
+    for (const keyColumn of ["execution_id", "turn_id"] as const) {
+      if (receiptColumns.has(keyColumn)) {
+        receiptMatches.push(`r.${quoteColumn(keyColumn)} = ${id}`);
+      }
+    }
+    if (receiptColumns.has("commit_key") && executionColumns.has("commit_key")) {
+      receiptMatches.push(`r.${quoteColumn("commit_key")} = e.${quoteColumn("commit_key")}`);
+    }
+    if (receiptMatches.length > 0) {
+      const receiptExists = `
+        EXISTS (
+          SELECT 1
+            FROM agent_turn_commit_receipts AS r
+           WHERE ${receiptMatches.join(" OR ")}
+        )`;
+      const projectionNeedsRepair = `
+        NOT EXISTS (
+          SELECT 1
+            FROM agent_run_projections AS p
+           WHERE p.user_id = e.user_id
+             AND p.chat_id = e.chat_id
+             AND p.turn_id = ${id}
+        )
+        OR EXISTS (
+          SELECT 1
+            FROM agent_run_projections AS p
+           WHERE p.user_id = e.user_id
+             AND p.chat_id = e.chat_id
+             AND p.turn_id = ${id}
+             AND (
+               COALESCE(p.status, '') <> 'COMMITTED'
+               OR NOT EXISTS (
+                 SELECT 1
+                   FROM agent_chat_events AS event
+                  WHERE event.user_id = p.user_id
+                    AND event.chat_id = p.chat_id
+                    AND event.turn_id = p.turn_id
+                    AND event.sequence = p.sequence
+                    AND event.run_revision = p.revision
+                    AND event.event_kind = 'terminal'
+               )
+             )
+        )`;
+      const committedRepair = `(
+        ${phase} = 'COMMITTED'
+        AND ${receiptExists}
+        AND (${projectionNeedsRepair})
+      )`;
+      candidatePredicates.push(committedRepair);
+      priorityPredicates.push(`(${phase} = 'COMMITTING' AND ${receiptExists})`);
+      priorityPredicates.push(committedRepair);
+    }
+  }
+
+  const priority = priorityPredicates.length > 0
+    ? `(CASE WHEN ${priorityPredicates.join(" OR ")} THEN 0 ELSE 1 END)`
+    : "CAST(1 AS INTEGER)";
+  return {
+    sql: `
+      SELECT e.*,
+             ${priority} AS __reconciliation_priority,
+             ${orderedAt} AS __reconciliation_ordered_at,
+             ${id} AS __reconciliation_id
+        FROM ${quoteColumn("agent_turn_executions")} AS e
+       WHERE (${candidatePredicates.join(" OR ")})
+         AND ${orderedAt} <= ?
+         AND (
+           ${priority} > ?
+           OR (${priority} = ? AND (
+             ${orderedAt} > ?
+             OR (${orderedAt} = ? AND ${id} > ?)
+           ))
+         )
+       ORDER BY ${priority} ASC, ${orderedAt} ASC, ${id} ASC
+       LIMIT ?
+    `,
+    phaseValues,
+    orderColumn,
+    idColumn,
+  };
+}
+function reconciliationFailureCode(error: unknown): string {
+  if (error instanceof TurnExecutionError) return error.code
+  if (error instanceof Error && error.name.length > 0) return error.name
+  return "unknown"
+}
+
+type TurnReconciliationFailure = {
+  readonly phase: TurnExecutionPhase | "scan"
+  readonly code: string
+  readonly message: string | null
+  count: number
+}
+
+/**
+ * Startup reconciliation is bounded and receipt-free for every noncommitted
+ * terminal row. It never invokes a provider, renderer, tool, workspace mutator,
+ * or generation callback; committed rows remain receipt-repaired only.
  */
 export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurnsResult {
-  if (!hasTable(db, "agent_turn_executions")) {
-    return {
-      runtimeEpoch,
-      inspected: 0,
-      claimed: 0,
-      failedInterrupted: 0,
-      committedFromReceipt: 0,
-      commitFailedWithoutReceipt: 0,
-      projectionRepairs: 0,
-      alreadyTerminal: 0,
-      releasedReservations: 0,
-    };
-  }
-  const rows = db.query(`SELECT * FROM ${quoteColumn("agent_turn_executions")}`).all() as Array<Record<string, unknown>>;
-  const result = {
+  const result: {
+    runtimeEpoch: number;
+    inspected: number;
+    claimed: number;
+    failedInterrupted: number;
+    committedFromReceipt: number;
+    commitFailedWithoutReceipt: number;
+    projectionRepairs: number;
+    alreadyTerminal: number;
+    releasedReservations: number;
+    complete: boolean;
+  } = {
     runtimeEpoch,
-    inspected: rows.length,
+    inspected: 0,
     claimed: 0,
     failedInterrupted: 0,
     committedFromReceipt: 0,
@@ -2270,111 +3446,292 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
     projectionRepairs: 0,
     alreadyTerminal: 0,
     releasedReservations: 0,
+    complete: true,
   };
-  const now = nowMs();
-  for (const raw of rows) {
-    let current: TurnExecutionRecord;
-    try { current = recordFromRow(raw); } catch { continue; }
-    if (TERMINAL_PHASE_SET.has(current.phase)) {
-      result.alreadyTerminal++;
-      // A process can crash after the receipt/phase transaction but before its
-      // projection or websocket handoff is visible. Repair only from the
-      // receipt; never re-enter generation or commit side effects.
-      if (current.phase === "COMMITTED" && receiptRepairHandler) {
-        const receiptRaw = rawReceipt(db, current);
-        if (receiptRaw) {
-          const receipt = receiptFromRow(receiptRaw, current);
-          const needsRepair = projectionNeedsReceiptRepair(db, current);
-          try {
-            db.transaction(() => {
-              const latest = requireExecution(db, current.id).execution;
-              invokeReceiptRepair(latest, receipt);
-            })();
-            if (needsRepair && !projectionNeedsReceiptRepair(db, current)) {
-              result.projectionRepairs++;
+  const failures = new Map<string, TurnReconciliationFailure & { executionIds: string[] }>()
+  const noteFailure = (phase: TurnExecutionPhase | "scan", error: unknown, executionId?: string): void => {
+    const code = reconciliationFailureCode(error)
+    const message = error instanceof Error && error.message.length > 0
+      ? error.message.replace(/\s+/g, " ").slice(0, 256)
+      : null
+    const key = phase + ":" + code + ":" + (message ?? "")
+    const current = failures.get(key)
+    if (current) {
+      current.count += 1
+      if (executionId && current.executionIds.length < 3) current.executionIds.push(executionId)
+      return
+    }
+    failures.set(key, { phase, code, message, count: 1, executionIds: executionId ? [executionId] : [] })
+  }
+  const finish = (): ReconcileAgentTurnsResult => {
+    if (failures.size > 0) {
+      console.error("[Agentic] Turn reconciliation incomplete", {
+        failures: [...failures.values()],
+      })
+    }
+    return result
+  }
+  if (!hasTable(db, "agent_turn_executions")) return result;
+  const scan = reconciliationCandidateQuery(db);
+  if (!scan) return result;
+
+  // Freeze the upper bound from the durable population rather than the wall
+  // clock. Rapid inserts can legitimately carry timestamps just ahead of the
+  // clock observed at the start of this pass.
+  const scanStartedAt = reconciliationNowMs();
+  const scanUpperBound = (() => {
+    try {
+      const row = db.query(
+        `SELECT MAX(COALESCE(${quoteColumn(scan.orderColumn)}, 0)) AS max_ordered_at
+           FROM ${quoteColumn("agent_turn_executions")}`,
+      ).get() as Record<string, unknown> | null;
+      return (row ? rowNumber(row, "max_ordered_at") : null) ?? scanStartedAt;
+    } catch {
+      return scanStartedAt;
+    }
+  })();
+  const scanDeadline = scanStartedAt + AGENT_TURN_RECONCILIATION_MAX_MS;
+  const now = scanStartedAt;
+  let remainingRows = AGENT_TURN_RECONCILIATION_MAX_ROWS;
+  let cursorPriority = -1;
+  let cursorUpdatedAt = 0;
+  let cursorId = "";
+  for (;;) {
+    if (remainingRows <= 0 || reconciliationNowMs() >= scanDeadline) {
+      result.complete = false;
+      noteFailure("scan", new Error("scan_limit"));
+      break;
+    }
+    const pageLimit = Math.min(AGENT_TURN_RECONCILIATION_PAGE_SIZE, remainingRows);
+    const rows = db.query(scan.sql).all(
+      ...scan.phaseValues,
+      scanUpperBound,
+      cursorPriority,
+      cursorPriority,
+      cursorUpdatedAt,
+      cursorUpdatedAt,
+      cursorId,
+      pageLimit,
+    ) as Array<Record<string, unknown>>;
+    if (rows.length === 0) break;
+    remainingRows -= rows.length;
+    result.inspected += rows.length;
+    for (const raw of rows) {
+      if (reconciliationNowMs() >= scanDeadline) {
+        noteFailure("scan", new Error("scan_deadline"))
+        return finish()
+      }
+      let current: TurnExecutionRecord;
+      try {
+        current = recordFromRow(raw);
+      } catch (error) {
+        result.complete = false
+        noteFailure("scan", error)
+        continue
+      }
+      if (TERMINAL_PHASE_SET.has(current.phase)) {
+        result.alreadyTerminal++;
+        if (current.phase === "COMMITTED" && receiptRepairHandler) {
+          const receiptRaw = rawReceipt(db, current);
+          if (receiptRaw) {
+            const receipt = receiptFromRow(receiptRaw, current, {
+              allowHistoricalTarget: true,
+              db,
+            });
+            const historicalTargetRedaction = current.targetMessageId !== receipt.messageId
+              || current.targetSwipeId !== receipt.swipeId;
+            const needsRepair = projectionNeedsReceiptRepair(db, current);
+            try {
+              db.transaction(() => {
+                const latest = requireExecution(db, current.id).execution;
+                invokeReceiptRepair(
+                  normalizedReceiptExecution(db, latest, receipt),
+                  receipt,
+                  historicalTargetRedaction ? { historicalTargetRedaction: true } : undefined,
+                );
+              })();
+              if (needsRepair && !projectionNeedsReceiptRepair(db, current)) {
+                result.projectionRepairs++;
+              }
+            } catch (error) {
+              result.complete = false
+              noteFailure(current.phase, error, current.id)
+              // Receipt-backed repair remains pending for the next startup
+              // epoch. The committed phase and receipt stay authoritative.
             }
-          } catch {
-            // Projection repair remains pending for the next startup epoch.
+          }
+        } else if (isNoncommittedTerminalPhase(current.phase)) {
+          try {
+            if (terminalRecoveryTablesAvailable(db)) {
+              const adopted = adoptPublishedTerminalAuthority(db, current, current.casOwner, now);
+              const execution = adopted ?? current;
+              if (reconcileTerminalExecutionProjection(db, execution)) result.projectionRepairs++;
+            } else {
+              invokeTerminalRecovery(current, current.phase === "COMMIT_FAILED" ? "COMMIT_FAILED" : "FAILED");
+            }
+          } catch (error) {
+            result.complete = false
+            noteFailure(current.phase, error, current.id)
+            // The terminal execution row is the durable repair authority. A
+            // failed inspection/projection transaction remains queryable for
+            // the next bounded startup pass.
           }
         }
+        continue;
       }
-      continue;
-    }
-    const ownerToken = randomId("reconcile");
-    const claimed = claimForReconciliation(db, current, ownerToken, now);
-    if (!claimed) continue;
-    result.claimed++;
-    if (REVERSIBLE_PHASE_SET.has(claimed.phase)) {
-      try {
-        let outcome: TransitionTurnExecutionResult | undefined;
-        db.transaction(() => {
-          const transition = terminalizeWithCas(
-            db,
-            claimed,
-            ownerToken,
-            claimed.phase,
-            claimed.casRevision,
-            "FAILED",
-            "process_interrupted",
-            now,
-          );
-          if (transition.terminalEventEmitted) invokeTerminalRecovery(transition.execution, "FAILED");
-          outcome = transition;
-        })();
-        if (outcome?.terminalEventEmitted) result.failedInterrupted++;
-        if (claimed.finalRenderReservationKey) result.releasedReservations++;
-      } catch {
-        // A concurrent owner or projection repair failure rolls back the
-        // terminal CAS; the next epoch will inspect the durable row.
+      const ownerToken = randomId("reconcile");
+      const claimed = claimForReconciliation(db, current, ownerToken, now);
+      if (!claimed) {
+        result.complete = false;
+        noteFailure(current.phase, new Error("claim_failed"), current.id);
+        continue;
       }
-      continue;
-    }
-    if (claimed.phase !== "COMMITTING") continue;
-    const receiptRaw = rawReceipt(db, claimed);
-    if (receiptRaw) {
-      const receipt = receiptFromRow(receiptRaw, claimed);
-      const needsRepair = projectionNeedsReceiptRepair(db, claimed);
-      try {
-        db.transaction(() => {
-          const latest = requireExecution(db, claimed.id).execution;
-          const repaired = repairCommittedFromReceipt(db, latest, receipt, ownerToken, now, false);
-          invokeReceiptRepair(repaired, receipt);
-        })();
-        result.committedFromReceipt++;
-        if (needsRepair && !projectionNeedsReceiptRepair(db, claimed)) {
-          result.projectionRepairs++;
+      result.claimed++;
+      if (REVERSIBLE_PHASE_SET.has(claimed.phase)) {
+        try {
+          const adopted = adoptPublishedTerminalAuthority(db, claimed, ownerToken, now);
+          if (adopted) {
+            try {
+              if (terminalRecoveryTablesAvailable(db)) {
+                if (reconcileTerminalExecutionProjection(db, adopted)) result.projectionRepairs++;
+              }
+            } catch (error) {
+              result.complete = false
+              noteFailure(claimed.phase, error, claimed.id)
+            }
+            if (claimed.finalRenderReservationKey) result.releasedReservations++;
+            continue;
+          }
+          let outcome: TransitionTurnExecutionResult | undefined;
+          db.transaction(() => {
+            outcome = terminalizeWithCas(
+              db,
+              claimed,
+              ownerToken,
+              claimed.phase,
+              claimed.casRevision,
+              "FAILED",
+              "process_interrupted",
+              now,
+            );
+          })();
+          if (outcome?.terminalEventEmitted) {
+            try {
+              if (terminalRecoveryTablesAvailable(db)) {
+                // Keep the registered projection-only repairer in the loop
+                // before the richer inspection+projection transaction. This
+                // preserves the existing public repair contract; the built-in
+                // pass then supplies the durable private inspection boundary.
+                invokeTerminalRecovery(outcome.execution, "FAILED");
+                if (reconcileTerminalExecutionProjection(db, outcome.execution)) result.projectionRepairs++;
+              } else {
+                invokeTerminalRecovery(outcome.execution, "FAILED");
+              }
+            } catch (error) {
+              result.complete = false
+              noteFailure(claimed.phase, error, claimed.id)
+            }
+            result.failedInterrupted++;
+          }
+          if (claimed.finalRenderReservationKey) result.releasedReservations++;
+        } catch (error) {
+          result.complete = false
+          noteFailure(claimed.phase, error, claimed.id)
+          // A concurrent owner or terminal projection failure leaves the
+          // durable row for the next epoch without replaying work.
         }
-        if (claimed.finalRenderReservationKey) result.releasedReservations++;
-      } catch {
-        // Keep the receipt and COMMITTING row for a later lease epoch. Do not
-        // mark COMMIT_FAILED merely because a derived projection is delayed.
+        continue;
       }
-    } else {
-      try {
-        let outcome: TransitionTurnExecutionResult | undefined;
-        db.transaction(() => {
-          const transition = terminalizeWithCas(
-            db,
-            claimed,
-            ownerToken,
-            claimed.phase,
-            claimed.casRevision,
-            "COMMIT_FAILED",
-            "process_interrupted",
-            now,
-          );
-          if (transition.terminalEventEmitted) invokeTerminalRecovery(transition.execution, "COMMIT_FAILED");
-          outcome = transition;
-        })();
-        if (outcome?.terminalEventEmitted) result.commitFailedWithoutReceipt++;
-        if (claimed.finalRenderReservationKey) result.releasedReservations++;
-      } catch {
-        // Another owner or projection repair failure rolls back the CAS; the
-        // next epoch will inspect the durable row without replaying work.
+      if (claimed.phase !== "COMMITTING") {
+        result.complete = false;
+        noteFailure(claimed.phase, new Error("unsupported_phase"), claimed.id);
+        continue;
       }
+      const receiptRaw = rawReceipt(db, claimed);
+      if (receiptRaw) {
+        const receipt = receiptFromRow(receiptRaw, claimed);
+        const needsRepair = projectionNeedsReceiptRepair(db, claimed);
+        try {
+          db.transaction(() => {
+            const latest = requireExecution(db, claimed.id).execution;
+            const repaired = repairCommittedFromReceipt(db, latest, receipt, ownerToken, now, false);
+            invokeReceiptRepair(repaired, receipt);
+          })();
+          result.committedFromReceipt++;
+          if (needsRepair && !projectionNeedsReceiptRepair(db, claimed)) {
+            result.projectionRepairs++;
+          }
+          if (claimed.finalRenderReservationKey) result.releasedReservations++;
+        } catch (error) {
+          result.complete = false
+          noteFailure(claimed.phase, error, claimed.id)
+          // Keep the receipt and COMMITTING row for a later lease epoch. Do not
+          // mark COMMIT_FAILED merely because a derived projection is delayed.
+        }
+      } else {
+        try {
+          let outcome: TransitionTurnExecutionResult | undefined;
+          db.transaction(() => {
+            outcome = terminalizeWithCas(
+              db,
+              claimed,
+              ownerToken,
+              claimed.phase,
+              claimed.casRevision,
+              "COMMIT_FAILED",
+              "process_interrupted",
+              now,
+            );
+          })();
+          if (outcome?.terminalEventEmitted) {
+            try {
+              if (terminalRecoveryTablesAvailable(db)) {
+                invokeTerminalRecovery(outcome.execution, "COMMIT_FAILED");
+                if (reconcileTerminalExecutionProjection(db, outcome.execution)) result.projectionRepairs++;
+              } else {
+                invokeTerminalRecovery(outcome.execution, "COMMIT_FAILED");
+              }
+            } catch (error) {
+              result.complete = false
+              noteFailure(claimed.phase, error, claimed.id)
+            }
+            result.commitFailedWithoutReceipt++;
+          }
+          if (claimed.finalRenderReservationKey) result.releasedReservations++;
+        } catch (error) {
+          result.complete = false
+          noteFailure(claimed.phase, error, claimed.id)
+          // Another owner or terminal projection failure leaves the durable
+          // row for the next epoch without replaying work.
+        }
+      }
+    }
+    const lastRow = rows[rows.length - 1]!;
+    const nextPriority = rowNumber(lastRow, "__reconciliation_priority") ?? cursorPriority;
+    const nextUpdatedAt = rowNumber(lastRow, "__reconciliation_ordered_at", scan.orderColumn) ?? cursorUpdatedAt;
+    const nextId = rowString(lastRow, "__reconciliation_id", scan.idColumn)
+      ?? rowString(lastRow, "id", "execution_id")
+      ?? cursorId;
+    if (nextPriority < cursorPriority
+      || nextPriority === cursorPriority && (
+        nextUpdatedAt < cursorUpdatedAt
+        || nextUpdatedAt === cursorUpdatedAt && nextId <= cursorId
+      )) {
+      result.complete = false;
+      noteFailure("scan", new Error("cursor_stalled"));
+      break;
+    }
+    cursorPriority = nextPriority;
+    cursorUpdatedAt = nextUpdatedAt;
+    cursorId = nextId;
+    if (rows.length < pageLimit) break;
+    if (remainingRows <= 0 || reconciliationNowMs() >= scanDeadline) {
+      result.complete = false;
+      noteFailure("scan", new Error("scan_limit"));
+      break;
     }
   }
-  return result;
+  return finish()
 }
 
 export const reconcileTurnExecutions = reconcileAgentTurns;
@@ -2386,4 +3743,7 @@ export const TURN_EXECUTION_RECONCILIATION = Object.freeze({
   providerReplay: false,
   renderReplay: false,
   sideEffectReplay: false,
+  pageSize: AGENT_TURN_RECONCILIATION_PAGE_SIZE,
+  maxRows: AGENT_TURN_RECONCILIATION_MAX_ROWS,
+  maxDurationMs: AGENT_TURN_RECONCILIATION_MAX_MS,
 });

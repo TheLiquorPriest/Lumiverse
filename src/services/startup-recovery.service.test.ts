@@ -8,6 +8,11 @@ import {
   type StartupRecoveryDependencies,
 } from "./startup-recovery.service";
 import type { AgenticReadinessVectorV1 } from "./turn-execution.service";
+import {
+  __testing as runtimeReadinessTesting,
+  getAgenticReadiness,
+  setAgenticRuntimeReadiness,
+} from "./turn-execution.service";
 import type { IsolateHealthSnapshotV1 } from "./isolate-pool";
 
 const dbs: Database[] = [];
@@ -23,14 +28,20 @@ function readiness(overrides: Partial<AgenticReadinessVectorV1> = {}): AgenticRe
     archiveRegistry: true,
     isolateTermination: false,
     publicationStore: true,
-    providerCapabilities: false,
-    configBinding: false,
-    contextAcl: false,
-    inputRevisions: false,
     runtimeEpoch: 17,
     reason: "isolateTermination_unavailable",
     digest: "digest",
     ...overrides,
+  };
+}
+function healthyImportRecovery() {
+  return {
+    inspected: 0,
+    recovered: 0,
+    deferred: 0,
+    failed: 0,
+    complete: true,
+    healthy: true,
   };
 }
 
@@ -65,7 +76,7 @@ function healthyRecoveryDependencies(
 ): StartupRecoveryDependencies {
   return {
     startAgentRuntimeEpoch: () => 18,
-    reconcileUserDataImports: () => {},
+    reconcileUserDataImports: () => healthyImportRecovery(),
     reconcileAgentArtifactBlobs: async () => ({
       inspected: 0,
       retained: 0,
@@ -143,6 +154,7 @@ describe("startup recovery sequencing", () => {
       },
       reconcileUserDataImports: () => {
         calls.push("imports");
+        return healthyImportRecovery();
       },
       reconcilePurgeCleanupIntents: () => {
         calls.push("purge-intents");
@@ -175,6 +187,7 @@ describe("startup recovery sequencing", () => {
 
     expect(calls).toEqual(["epoch", "imports", "purge-intents", "artifacts", "turns", "projections", "probe", "readiness", "install"]);
     expect(result.runtimeEpoch).toBe(17);
+    expect(result.imports).toEqual(healthyImportRecovery());
     expect(result.artifacts).toEqual(artifactResult);
     expect(result.turns).toEqual(turnResult);
     expect(result.readiness).toMatchObject({
@@ -203,6 +216,57 @@ describe("startup recovery sequencing", () => {
     });
     expect(summarizeIsolateHealth(result.isolate)).toBe("worker unavailable");
   });
+  test("recomputes static readiness after startup import recovery and preserves unresolved denial", async () => {
+    const db = new Database(":memory:");
+    dbs.push(db);
+    runtimeReadinessTesting.resetReadiness();
+    let importAttempts = 0;
+    const dependencies = healthyRecoveryDependencies({
+      reconcileUserDataImports: () => {
+        importAttempts += 1;
+        return importAttempts === 1
+          ? { ...healthyImportRecovery(), complete: false, healthy: false }
+          : healthyImportRecovery();
+      },
+      setAgenticRuntimeReadiness,
+    });
+
+    try {
+      const denied = await reconcileStartupState(db, dependencies);
+      expect(denied.readiness.archiveRegistry).toBe(false);
+      expect(denied.readiness.reconciliation).toBe(false);
+      expect(denied.readiness.reason).toBe("reconciliation_unavailable");
+
+      const recovered = await reconcileStartupState(db, dependencies);
+      expect(recovered.imports).toEqual(healthyImportRecovery());
+      expect(recovered.readiness.archiveRegistry).toBe(true);
+      expect(recovered.readiness.reconciliation).toBe(true);
+      expect(recovered.readiness.reason).toBeNull();
+      expect(getAgenticReadiness()).toMatchObject(recovered.readiness);
+
+      const unresolved = await reconcileStartupState(db, {
+        ...dependencies,
+        reconcileUserDataImports: () => healthyImportRecovery(),
+        reconcileAgentTurns: () => ({
+          runtimeEpoch: 18,
+          inspected: 0,
+          claimed: 0,
+          failedInterrupted: 0,
+          committedFromReceipt: 0,
+          commitFailedWithoutReceipt: 0,
+          projectionRepairs: 0,
+          alreadyTerminal: 0,
+          releasedReservations: 0,
+          complete: false,
+        }),
+      });
+      expect(unresolved.readiness.archiveRegistry).toBe(true);
+      expect(unresolved.readiness.reconciliation).toBe(false);
+      expect(unresolved.readiness.reason).toBe("reconciliation_unavailable");
+    } finally {
+      runtimeReadinessTesting.resetReadiness();
+    }
+  });
   test("runs export staging reconciliation before imports and fails closed on scan errors", async () => {
     const db = new Database(":memory:");
     dbs.push(db);
@@ -215,6 +279,7 @@ describe("startup recovery sequencing", () => {
       },
       reconcileUserDataImports: () => {
         calls.push("imports");
+        return healthyImportRecovery();
       },
       setAgenticRuntimeReadiness: (patch) => {
         readinessPatch = patch;
@@ -233,7 +298,7 @@ describe("startup recovery sequencing", () => {
     dbs.push(db);
     const result = await reconcileStartupState(db, {
       startAgentRuntimeEpoch: () => 18,
-      reconcileUserDataImports: () => {},
+      reconcileUserDataImports: () => healthyImportRecovery(),
       reconcileAgentArtifactBlobs: async () => ({ inspected: 0, retained: 0, removed: 0, stale: 0, quarantined: 0, bytesRemoved: 0 }),
       reconcileAgentTurns: () => ({
         runtimeEpoch: 18,
@@ -272,7 +337,7 @@ describe("startup recovery sequencing", () => {
     try {
       const result = await reconcileStartupState(db, {
         startAgentRuntimeEpoch: () => 18,
-        reconcileUserDataImports: () => {},
+        reconcileUserDataImports: () => healthyImportRecovery(),
         reconcileAgentArtifactBlobs: async () => ({
           inspected: 0,
           retained: 0,
@@ -334,6 +399,99 @@ describe("startup recovery sequencing", () => {
     expect(captured.result.readiness.publicationStore).toBe(false);
     expect(captured.result.readiness.reconciliation).toBe(false);
   });
+  test("retries bounded global artifact continuation and reopens complete readiness", async () => {
+    const db = new Database(":memory:");
+    dbs.push(db);
+    let attempts = 0;
+    const scheduled: Array<{ readonly task: () => Promise<void>; readonly delayMs: number; canceled: boolean }> = [];
+    const readinessPatches: Array<Partial<Record<"schema" | "reconciliation" | "archiveRegistry" | "isolateTermination" | "publicationStore", boolean>>> = [];
+    const result = await reconcileStartupState(db, healthyRecoveryDependencies({
+      reconcileAgentArtifactBlobs: async () => {
+        attempts++;
+        return attempts === 1
+          ? { inspected: 128, retained: 128, removed: 0, stale: 0, quarantined: 0, bytesRemoved: 0, pendingGlobal: true, healthy: false }
+          : { inspected: 1, retained: 0, removed: 1, stale: 0, quarantined: 0, bytesRemoved: 0, pendingGlobal: false, healthy: true };
+      },
+      setAgenticRuntimeReadiness: (patch) => {
+        readinessPatches.push(patch);
+        return readiness(patch);
+      },
+      scheduleArtifactReconcileContinuation: (task, delayMs) => {
+        const entry = { task, delayMs, canceled: false };
+        scheduled.push(entry);
+        return { cancel: () => { entry.canceled = true; } };
+      },
+    }));
+    expect(result.readiness.publicationStore).toBe(false);
+    expect(result.readiness.reconciliation).toBe(false);
+    expect(attempts).toBe(1);
+    const first = scheduled.shift();
+    if (!first) throw new Error("artifact continuation was not scheduled");
+    expect(first.delayMs).toBe(25);
+    await first.task();
+    expect(attempts).toBe(2);
+    expect(scheduled).toHaveLength(0);
+    expect(readinessPatches).toHaveLength(2);
+    expect(readinessPatches[1]).toEqual({
+      schema: true,
+      archiveRegistry: true,
+      reconciliation: true,
+      publicationStore: true,
+      isolateTermination: true,
+    });
+  });
+  test("cancels artifact continuation on startup shutdown", async () => {
+    const db = new Database(":memory:");
+    dbs.push(db);
+    const scheduled: Array<{ readonly task: () => Promise<void>; canceled: boolean }> = [];
+    let attempts = 0;
+    await reconcileStartupState(db, healthyRecoveryDependencies({
+      reconcileAgentArtifactBlobs: async () => {
+        attempts++;
+        return { inspected: 128, retained: 128, removed: 0, stale: 0, quarantined: 0, bytesRemoved: 0, pendingGlobal: true, healthy: false };
+      },
+      scheduleArtifactReconcileContinuation: (task) => {
+        const entry = { task, canceled: false };
+        scheduled.push(entry);
+        return { cancel: () => { entry.canceled = true; } };
+      },
+    }));
+    const first = scheduled[0];
+    if (!first) throw new Error("artifact continuation was not scheduled");
+    await shutdownIsolatePools({
+      shutdownPromptAssemblyWorkerPool: async () => {},
+      shutdownAgenticPreprocessingPool: async () => {},
+      shutdownRegexIsolatePool: async () => {},
+    });
+    expect(first.canceled).toBe(true);
+    await first.task();
+    expect(attempts).toBe(1);
+  });
+  test("keeps reconciliation readiness closed when turn recovery defers candidates", async () => {
+    const db = new Database(":memory:");
+    dbs.push(db);
+    const turnsResult = {
+      runtimeEpoch: 18,
+      inspected: 12,
+      claimed: 5,
+      failedInterrupted: 2,
+      committedFromReceipt: 1,
+      commitFailedWithoutReceipt: 0,
+      projectionRepairs: 1,
+      alreadyTerminal: 4,
+      releasedReservations: 2,
+      complete: false,
+    } as const;
+    const result = await reconcileStartupState(db, healthyRecoveryDependencies({
+      reconcileAgentTurns: () => turnsResult,
+    }));
+
+    expect(result.turns).toEqual(turnsResult);
+    expect(result.stages.turns).toEqual({ ok: false, status: "failed", errorCode: "stage_failed" });
+    expect(result.readiness.reconciliation).toBe(false);
+    expect(result.stages.coordinator).toEqual({ ok: true, status: "completed", errorCode: null });
+  });
+
 
   test("marks isolate recovery unhealthy when readiness closes isolate termination", async () => {
     const db = new Database(":memory:");
@@ -386,6 +544,7 @@ describe("startup recovery sequencing", () => {
       },
       reconcileUserDataImports: () => {
         calls.push("imports");
+        return healthyImportRecovery();
       },
       reconcileAgentArtifactBlobs: async () => {
         calls.push("artifacts");
@@ -481,6 +640,7 @@ describe("startup recovery sequencing", () => {
         },
         reconcileUserDataImports: () => {
           fail("imports");
+          return healthyImportRecovery();
         },
         reconcileAgentArtifactBlobs: async () => {
           fail("artifacts");
@@ -582,6 +742,7 @@ describe("startup recovery sequencing", () => {
           projectionRepairs: 0,
           alreadyTerminal: 0,
           releasedReservations: 0,
+          complete: true,
         });
       }
       if (failedStage === "projections") {

@@ -1,4 +1,5 @@
 import type { DatabankRetrievalResult } from "./types";
+import { clearResolveCacheForUser } from "./mention-resolve-cache.service";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -69,6 +70,16 @@ export function invalidateDatabankCache(userId: string, databankId: string): voi
       resultCache.delete(key);
     }
   }
+}
+
+/**
+ * Invalidate every native Databank cache after a bank/document mutation.
+ * Mention results are keyed by user/chat rather than bank, so clear all of
+ * that user's mention resolutions while the retrieval cache stays bank-scoped.
+ */
+export function invalidateDatabankCaches(userId: string, databankId: string): void {
+  invalidateDatabankCache(userId, databankId);
+  clearResolveCacheForUser(userId);
 }
 
 /** Test-only reset for keeping module-global cache state isolated. */

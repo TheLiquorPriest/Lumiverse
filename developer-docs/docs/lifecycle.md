@@ -55,6 +55,13 @@ The status is one of `pending`, `running`, `waiting`, `cancelling`, or
 `failed`, `exhausted`, or `rejected`. `workPhase`, `workStatus`, and
 `workOutcome` are independent fields; a client must not infer one from another
 or from stream silence.
+For every nonterminal execution phase, `workOutcome` is `null`; the status
+remains phase-specific (`pending`, `running`, `waiting`, or `cancelling`).
+`COMMITTED` is the only successful terminal boundary and projects to
+`completed`. `CANCELLED` projects to `stopped`, `TIMED_OUT` (including
+`root_wall_clock_limit_exceeded`) projects to `failed`, and `EXHAUSTED`
+projects to `exhausted` only for a host-enforced budget or limit exhaustion.
+
 
 Every public run carries `attemptLineage`:
 
@@ -104,7 +111,7 @@ creates no attempt, projection, or terminal publication.
 `POST /api/v1/agent-runs/:turnId/stop` returns `accepted` only while the run
 is reversible, `too_late` after the completion boundary, or `terminal` once a
 terminal owner has settled it. The compatibility
-`POST /api/v1/generate/stop` route returns only `{ stopped: boolean }`; use the
+`POST /api/v1/generate/stop` route returns `{ stopped: boolean, status: "accepted" | "too_late" | "not_found" }`; use the
 Agent Run Stop route when the phase distinction matters.
 
 ### Inspection, recovery, and retention
@@ -135,3 +142,11 @@ action. `POST /api/v1/agent-runs/:attemptId/retry` accepts only an empty body
 or `{}` and admits only an owner-scoped terminal attempt with a still-valid
 target and retryable outcome (`failed`, `exhausted`, or `stopped`). The `202`
 response contains the new attempt lineage only after durable admission.
+
+### Context ownership and prompt handoff
+
+World Books and Databanks remain native, live context systems outside Loom. World Books own lore activation, placement, attachment, editing, and access; Databanks own document attachment, editing, access, semantic retrieval, and explicit `#slug` retrieval. [Context Filters](../../user-docs/docs/presets/context-filters.md) and unrelated native Loom content [packs](../../user-docs/docs/packs/index.md) remain supported. Loom does not copy, pin, or repair these objects.
+
+Loom owns only existing prompt blocks plus **Phased Instructions**. Fixed buckets route work policy and workspace usage to root **WORK** / **WORK**, completion criteria to completion handoff / **PREPARE_COMMIT**, and render policy to tools-disabled **RENDER** / **RENDER**. Conditions fail closed at their owning checkpoint against its immutable snapshot and remain fixed. Custom phases are bounded and current-phase-only with explicit per-child instruction subsets.
+
+Unified owner inspection explains route/order, roles, conditions, source identities and revisions/hashes when recorded, destination-level deduplication, omissions, custom-phase/child-subset receipts, accepted WORK-to-RENDER crossings, and tools/delegation. Unavailable evidence is marked unavailable and never inferred. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance cross private WORK; ordinary Response preserves the conversation and native World Book/Databank assembly while omitting private WORK. The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are unsupported.

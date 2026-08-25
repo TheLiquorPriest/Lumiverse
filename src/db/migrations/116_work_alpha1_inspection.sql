@@ -270,18 +270,21 @@ SELECT
   END,
   CASE
     WHEN execution.state = 'COMMITTED' THEN 'completed'
-    WHEN execution.state IN ('COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+    WHEN execution.state = 'CANCELLED' THEN 'stopped'
+    WHEN execution.state = 'TIMED_OUT' THEN 'failed'
+    WHEN execution.state = 'EXHAUSTED' THEN 'exhausted'
+    WHEN execution.state IN ('COMMIT_FAILED', 'FAILED')
       AND lower(COALESCE(execution.terminal_code, '')) IN ('cancelled', 'canceled', 'stopped', 'user_stop', 'accepted_cancellation', 'agentic_cancelled')
       THEN 'stopped'
-    WHEN execution.state IN ('COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT')
+    WHEN execution.state IN ('COMMIT_FAILED', 'FAILED')
+      AND lower(COALESCE(execution.terminal_code, '')) <> 'root_wall_clock_limit_exceeded'
       AND (
-        lower(COALESCE(execution.terminal_code, '')) IN ('exhausted', 'budget_exhausted', 'budget_exceeded', 'limit_exceeded', 'agentic_work_exhausted', 'root_wall_clock_limit_exceeded')
+        lower(COALESCE(execution.terminal_code, '')) IN ('exhausted', 'budget_exhausted', 'budget_exceeded', 'limit_exceeded', 'agentic_work_exhausted')
         OR lower(COALESCE(execution.terminal_code, '')) LIKE '%_limit_exceeded'
         OR lower(COALESCE(execution.terminal_code, '')) LIKE '%_budget_exhausted'
         OR lower(COALESCE(execution.terminal_code, '')) LIKE '%_budget_exceeded'
       ) THEN 'exhausted'
-    WHEN execution.state = 'EXHAUSTED' THEN 'exhausted'
-    WHEN execution.state IN ('CANCELLED', 'TIMED_OUT', 'FAILED', 'COMMIT_FAILED') THEN 'failed'
+    WHEN execution.state IN ('COMMIT_FAILED', 'FAILED') THEN 'failed'
     ELSE NULL
   END,
   CASE

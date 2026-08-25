@@ -11,12 +11,45 @@ import {
   acknowledgeRuntimeRepair,
   RuntimeDecisionError,
 } from "../services/agent-runtime-decision.service";
-import { duplicatePresetWithAgentConfig, encodePortableAgentConfig, getAgentRuntimeSharedDraft, getPortablePresetRuntimeEnvelope, getPresetAgentConfig, importPortablePreset, importPortablePresetRuntime, parsePortablePresetRuntimeImportRequest, saveAgentRuntimeSharedDraft } from "../services/agent-config-portability.service";
+import { AgentConfigRevisionConflictError, duplicatePresetWithAgentConfig, encodePortableAgentConfig, getAgentRuntimeSharedDraft, getPortablePresetRuntimeEnvelope, getPresetAgentConfig, importPortablePreset, importPortablePresetRuntime, parsePortablePresetPayload, parsePortablePresetRuntimeImportRequest, saveAgentRuntimeSharedDraft } from "../services/agent-config-portability.service";
+import { materializePortableSealedPresetImport, PortableSealedPresetError } from "../lumihub/sealed-presets";
 
 const app = new Hono();
 
 function userEtagScope(userId: string): string {
   return createHash("sha256").update(userId).digest("base64url");
+}
+const PORTABLE_PUBLIC_ERROR_CODES: Record<string, true> = {
+  AGENT_RUNTIME_PORTABLE_INVALID: true,
+  AGENT_RUNTIME_PORTABLE_STALE: true,
+  AGENT_RUNTIME_PORTABLE_CONTRADICTORY: true,
+  AGENT_RUNTIME_PORTABLE_REGEX_INVALID: true,
+  AGENT_RUNTIME_PORTABLE_PRESET_INVALID: true,
+  AGENT_RUNTIME_PORTABLE_CONFIG_REFERENCE_INVALID: true,
+  AGENT_RUNTIME_PORTABLE_COGNITION_INVALID: true,
+  PORTABLE_PRESET_INVALID: true,
+  PORTABLE_PROMPT_BLOCK_INVALID: true,
+  PORTABLE_EXPORT_UNSTABLE: true,
+  LUMIHUB_SEALED_DESCRIPTOR_INCOMPLETE: true,
+  LUMIHUB_LINK_UNAVAILABLE: true,
+  LUMIHUB_SEALED_RESOLUTION_FAILED: true,
+  LUMIHUB_SEALED_DIGEST_MISMATCH: true,
+  PRESET_REVISION_CONFLICT: true,
+  PRESET_REVISION_REQUIRED: true,
+  AGENT_CONFIG_REVISION_CONFLICT: true,
+  AGENT_CONFIG_REVISION_REQUIRED: true,
+};
+
+function portablePublicErrorCode(error: unknown, fallback: string): string {
+  if (error instanceof PortableSealedPresetError) return error.code;
+  const record = error && typeof error === "object" ? error as Record<string, unknown> : null;
+  const body = record?.body && typeof record.body === "object" ? record.body as Record<string, unknown> : null;
+  const candidate = typeof body?.code === "string"
+    ? body.code
+    : typeof record?.code === "string"
+      ? record.code
+      : error instanceof Error ? error.message.match(/^[A-Z][A-Z0-9_]+/)?.[0] : undefined;
+  return candidate && PORTABLE_PUBLIC_ERROR_CODES[candidate] ? candidate : fallback;
 }
 
 app.get("/", (c) => {
@@ -103,16 +136,38 @@ app.put("/:id/agent-config", async (c) => {
   try {
     const body = await c.req.json();
     if (typeof body !== "object" || body === null || Array.isArray(body)) throw new Error("AGENT_RUNTIME_DRAFT_INVALID");
-    const allowedKeys = new Set(["config", "slotBindings", "contextPackSelections", "contextRules", "taskTemplates", "reviewAcknowledgements", "promptOrder", "expectedPresetRevision", "expectedConfigRevision"]);
-    for (const key of Object.keys(body)) if (!allowedKeys.has(key)) throw new Error("AGENT_RUNTIME_DRAFT_UNKNOWN_FIELD");
-    for (const key of allowedKeys) if (!Object.hasOwn(body, key)) throw new Error("AGENT_RUNTIME_DRAFT_MISSING_FIELD");
+    const allowedKeys: Record<string, true> = { config: true, slotBindings: true, taskTemplates: true, reviewAcknowledgements: true, promptOrder: true, expectedPresetRevision: true, expectedConfigRevision: true };
+    for (const key of Object.keys(body)) if (!allowedKeys[key]) throw new Error("AGENT_RUNTIME_DRAFT_UNKNOWN_FIELD");
+    for (const key of Object.keys(allowedKeys)) if (!Object.hasOwn(body, key)) throw new Error("AGENT_RUNTIME_DRAFT_MISSING_FIELD");
     const result = saveAgentRuntimeSharedDraft(c.get("userId"), c.req.param("id"), {
-      config: body.config, slotBindings: body.slotBindings, contextPackSelections: body.contextPackSelections, contextRules: body.contextRules, taskTemplates: body.taskTemplates, reviewAcknowledgements: body.reviewAcknowledgements, promptOrder: body.promptOrder, expectedPresetRevision: body.expectedPresetRevision, expectedConfigRevision: body.expectedConfigRevision,
+      config: body.config, slotBindings: body.slotBindings, taskTemplates: body.taskTemplates, reviewAcknowledgements: body.reviewAcknowledgements, promptOrder: body.promptOrder, expectedPresetRevision: body.expectedPresetRevision, expectedConfigRevision: body.expectedConfigRevision,
     });
     return c.json(result);
   } catch (error: any) {
     const message = error?.message || "Invalid agent runtime draft";
-    const code = message === "PRESET_REVISION_CONFLICT" || message === "AGENT_CONFIG_REVISION_CONFLICT" ? message : message === "PRESET_REVISION_REQUIRED" || message === "AGENT_CONFIG_REVISION_REQUIRED" ? message : "AGENT_CONFIG_INVALID";
+    const errorCode = typeof error?.code === "string" ? error.code : undefined;
+    const code = errorCode === "PRESET_REVISION_CONFLICT" || errorCode === "AGENT_CONFIG_REVISION_CONFLICT"
+      ? errorCode
+      : message === "PRESET_REVISION_CONFLICT" || message === "AGENT_CONFIG_REVISION_CONFLICT"
+        ? message
+        : message === "PRESET_REVISION_REQUIRED" || message === "AGENT_CONFIG_REVISION_REQUIRED"
+          ? message
+          : "AGENT_CONFIG_INVALID";
+    if (error instanceof AgentConfigRevisionConflictError) {
+      const presetId = c.req.param("id");
+      const canonicalPreset = svc.getPreset(c.get("userId"), presetId);
+      const canonicalEditor = getAgentRuntimeSharedDraft(c.get("userId"), presetId);
+      return c.json({
+        error: message,
+        code,
+        preset_id: presetId,
+        expectedConfigRevision: error.expectedConfigRevision,
+        actualConfigRevision: error.actualConfigRevision,
+        preset: canonicalPreset,
+        editor: canonicalEditor,
+        configRevision: canonicalEditor?.configRevision ?? error.actualConfigRevision,
+      }, 409);
+    }
     return c.json({ error: message, code }, code.endsWith("CONFLICT") ? 409 : code === "PRESET_REVISION_REQUIRED" || code === "AGENT_CONFIG_REVISION_REQUIRED" ? 428 : 400);
   }
 });
@@ -177,31 +232,28 @@ app.get("/:id/agent-runtime/portable", (c) => {
     if (!envelope) return c.json({ error: "Not found" }, 404);
     return c.json(envelope);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Portable Agent Runtime requires repair";
-    return c.json({ error: message, code: "AGENT_RUNTIME_PORTABLE_INVALID" }, 400);
+    const code = portablePublicErrorCode(error, "AGENT_RUNTIME_PORTABLE_INVALID")
+    return c.json({ error: code, code }, 400);
   }
 });
 app.post("/import-portable", async (c) => {
   try {
     const body = await c.req.json();
     const parsed = parsePortablePresetRuntimeImportRequest(body);
-    const result = importPortablePresetRuntime(c.get("userId"), parsed);
+    const materializedPreset = await materializePortableSealedPresetImport(c.get("userId"), parsed.preset);
+    const result = importPortablePresetRuntime(c.get("userId"), {
+      ...parsed,
+      preset: materializedPreset,
+    });
     return c.json(result, 201);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Invalid portable preset runtime";
-    const code = message.startsWith("AGENT_RUNTIME_PORTABLE_REGEX_INVALID")
-      ? "AGENT_RUNTIME_PORTABLE_REGEX_INVALID"
-      : message === "PRESET_REVISION_CONFLICT"
-        ? "PRESET_REVISION_CONFLICT"
-        : message === "PRESET_REVISION_REQUIRED"
-          ? "PRESET_REVISION_REQUIRED"
-          : "AGENT_RUNTIME_PORTABLE_INVALID";
+    const code = portablePublicErrorCode(error, "AGENT_RUNTIME_PORTABLE_INVALID");
     const status = code === "PRESET_REVISION_CONFLICT"
       ? 409
       : code === "PRESET_REVISION_REQUIRED"
         ? 428
         : 400;
-    return c.json({ error: message, code }, status);
+    return c.json({ error: code, code }, status);
   }
 });
 
@@ -214,13 +266,12 @@ app.get("/:id/agent-config/portable", (c) => {
 app.post("/agent-config/portable/import", async (c) => {
   try {
     const body = await c.req.json();
-    return c.json(importPortablePreset(c.get("userId"), body), 201);
+    const boundedPreset = parsePortablePresetPayload(body);
+    const materialized = await materializePortableSealedPresetImport(c.get("userId"), boundedPreset);
+    return c.json(importPortablePreset(c.get("userId"), materialized), 201);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Invalid portable preset";
-    const code = typeof message === "string" && message.startsWith("AGENT_RUNTIME_PORTABLE_REGEX_INVALID")
-      ? "AGENT_RUNTIME_PORTABLE_REGEX_INVALID"
-      : "PORTABLE_PRESET_INVALID";
-    return c.json({ error: message, code }, 400);
+    const code = portablePublicErrorCode(error, "PORTABLE_PRESET_INVALID");
+    return c.json({ error: code, code }, 400);
   }
 });
 
@@ -268,6 +319,20 @@ app.put("/:id", async (c) => {
       code: "PRESET_REVISION_REQUIRED",
     }, 428);
   }
+  if (
+    Object.hasOwn(body, "agent_config")
+    && body.agent_config !== undefined
+    && (
+      typeof body.expected_config_revision !== "number"
+      || !Number.isSafeInteger(body.expected_config_revision)
+      || body.expected_config_revision < 0
+    )
+  ) {
+    return c.json({
+      error: "expected_config_revision is required when agent_config is submitted",
+      code: "AGENT_CONFIG_REVISION_REQUIRED",
+    }, 428);
+  }
   try {
     const preset = svc.updatePreset(userId, c.req.param("id"), body);
     if (!preset) return c.json({ error: "Not found" }, 404);
@@ -280,6 +345,24 @@ app.put("/:id", async (c) => {
         expected_cache_revision: err.expectedCacheRevision,
         actual_cache_revision: err.actualCacheRevision,
       }, 409);
+    }
+    if (err instanceof AgentConfigRevisionConflictError) {
+      const canonical = svc.getPreset(userId, c.req.param("id"));
+      return c.json({
+        error: err.message,
+        code: err.code,
+        preset_id: err.presetId,
+        expected_config_revision: err.expectedConfigRevision,
+        actual_config_revision: err.actualConfigRevision,
+        preset: canonical,
+        agent_config_revision: canonical?.agent_config_revision ?? err.actualConfigRevision,
+        agent_config: canonical?.agent_config ?? null,
+        agent_config_review: canonical?.agent_config_review ?? null,
+        cache_revision: canonical?.cache_revision ?? null,
+      }, 409);
+    }
+    if (err instanceof Error && err.message === "AGENT_CONFIG_REVISION_REQUIRED") {
+      return c.json({ error: err.message, code: "AGENT_CONFIG_REVISION_REQUIRED" }, 428);
     }
     if (err instanceof AgentConfigValidationError) {
       return c.json({ error: err.message, code: err.code, path: err.path }, 400);

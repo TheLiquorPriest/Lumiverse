@@ -111,11 +111,6 @@
       "shortName": "エージェントランタイム",
       "tabName": "エージェントランタイム",
       "tabDescription": "ランタイムのデフォルト、保持設定、ホスト管理の上限を確認"
-    },
-    "contextLibrary": {
-      "shortName": "コンテキストライブラリ",
-      "tabName": "コンテキストライブラリ",
-      "tabDescription": "バージョン管理されたコンテキストパックと添付を管理"
     }
   },
   "account": {
@@ -132,6 +127,21 @@
     "saving": "保存..."
   },
   "display": {
+    "longMessages": {
+      "title": "長いメッセージ",
+      "helper": "長いメッセージを、展開するまで読みやすい高さに制限します。",
+      "enabled": "長いメッセージを折りたたむ",
+      "enabledHint": "返信の生成中を含む、すべてのチャット表示モードに適用されます。",
+      "height": "折りたたみ時の高さ",
+      "depth": "折りたたみ開始深度",
+      "depthHint": "深度 0 が最新のメッセージです。この深度以降の長いメッセージを折りたためます。",
+      "compact": "コンパクト",
+      "comfortable": "標準",
+      "tall": "高め",
+      "custom": "カスタム",
+      "customHeight": "カスタムの高さ (PX)",
+      "customHeightHint": "カスタム選択時の、折りたたまれた長いメッセージの最大高さです。"
+    },
     "modalWidth": {
       "title": "モーダル幅",
       "helper": "すべてのモーダル ダイアログの最大幅を制限します。設定、エディタ、その他のポップオーバー パネルに影響します。",
@@ -1599,189 +1609,6 @@
         "toolExecutionsPerUser": "ユーザーごとのツール実行数",
         "toolExecutionsProcess": "プロセス全体のツール実行数"
       }
-    }
-  },
-  "contextLibrary": {
-    "eyebrow": "アカウントコンテキスト",
-    "title": "コンテキストライブラリ",
-    "description": "不変でバージョン管理されたコンテキストパックを作成し、確認済みリビジョンをプリセット、チャット、ワールドブックに添付します。",
-    "copySuffix": "コピー",
-    "packs": "パック",
-    "packList": "コンテキストパック",
-    "loading": "コンテキストパックを読み込み中…",
-    "loadingDetail": "パックの詳細を読み込み中…",
-    "loadingTargets": "所有対象を読み込み中…",
-    "targetLoadError": "所有する添付先を読み込めませんでした。",
-    "targetsLoaded": "所有する添付先を読み込みました。",
-    "noTargetsAvailable": "このスコープで利用できる所有対象はありません。",
-    "selectTarget": "所有対象を選択",
-    "selectPack": "確認するコンテキストパックを選択してください。",
-    "emptyTitle": "最初のコンテキストパックを作成",
-    "emptyDescription": "安定した参照資料を追加し、必要な場所に不変のリビジョンを添付します。",
-    "noDescription": "説明なし",
-    "noAttachments": "添付なし",
-    "privateOnly": "追加のアカウントアクセスは許可されていません。",
-    "unavailableTarget": "利用できない対象",
-    "exportComplete": "ポータブルスナップショットをエクスポートしました。",
-    "exporting": "ポータブルスナップショットをエクスポート中…",
-    "importing": "ポータブルスナップショットをインポート中…",
-    "importComplete": "「{{name}}」をインポートしました。添付または有効化する前に確認してください。",
-    "importFileLabel": "インポートするコンテキストパックのJSONスナップショットを選択",
-    "versionNumber": "リビジョン{{number}}",
-    "byteCount": "{{count}}バイト",
-    "versionHistoryCaption": "コンテキストパックの不変なリビジョン履歴",
-    "versionImmutableHelp": "公開済みのリビジョンは編集できません。内容を変更するには新しいリビジョンを作成してください。",
-    "immutable": "不変",
-    "previewTitle": "リビジョン{{number}}のプレビュー",
-    "contentHelp": "エントリはリテラルコンテキストとして順番に保存されます。このリビジョン内でIDが重複しないようにしてください。",
-    "entryNumber": "エントリ{{number}}",
-    "addEntry": "エントリを追加",
-    "removeEntry": "エントリ{{number}}を削除",
-    "tagsHelp": "タグはカンマで区切ってください。",
-    "requiredAttachment": "この添付をAgenticの事前チェックで必須として扱う",
-    "attachmentsDescription": "添付では、正確な不変リビジョンを1つの所有対象に関連付けます。",
-    "accessDescription": "可視性とACL許可は、操作のたびにサーバーで再検証されます。",
-    "accessList": "アカウントアクセスリスト",
-    "accessFor": "{{name}}のアクセス権",
-    "addAccess": "アクセス権を追加",
-    "removeAccess": "{{name}}のアクセス権を削除",
-    "aclServerAuthority": "サーバーがプリンシパル、所有権、現在のACLリビジョン、要求された権限を検証します。",
-    "reviewTitle": "認証済みの確認が必要です",
-    "reviewDescription": "内容を確認し、ローカルでの使用を明示的に承認するまで、このパックは無効です。",
-    "repairDescription": "このパックは、確認または添付する前に修復が必要です。",
-    "reviewAcknowledgement": "このパックの可視性、内容、アクセス許可を確認し、有効化することに同意します。",
-    "preserveAttachments": "現在許可されている添付を複製",
-    "deleteTitle": "コンテキストパックを削除",
-    "deleteDescription": "このパックと、所有するリビジョンおよび添付を削除します。",
-    "deleteWarning": "「{{name}}」を削除しますか？この操作は取り消せません。",
-    "detachFrom": "{{name}}から切り離す",
-    "status": {
-      "active": "準備完了",
-      "disabled": "無効",
-      "review_required": "確認が必要",
-      "repair_required": "修復が必要"
-    },
-    "source": {
-      "local": "ローカル",
-      "portable_import": "ポータブルインポート",
-      "archive_restore": "アーカイブから復元",
-      "same_account_duplicate": "同一アカウント内の複製"
-    },
-    "visibility": {
-      "private": "非公開",
-      "account": "アカウント",
-      "restricted": "制限付き",
-      "help": "すべてのACLおよび対象操作について、サーバーが最終的な権限を持ちます。"
-    },
-    "scopes": {
-      "preset": "プリセット",
-      "chat": "チャット",
-      "world_book": "ワールドブック"
-    },
-    "acl": {
-      "read": "読み取り",
-      "use": "使用",
-      "edit": "編集"
-    },
-    "attachmentState": {
-      "active": "有効",
-      "disabled": "無効",
-      "review_required": "確認が必要",
-      "repair_required": "修復が必要"
-    },
-    "sections": {
-      "versions": "リビジョン履歴",
-      "attachments": "添付",
-      "access": "可視性とアクセス"
-    },
-    "fields": {
-      "name": "名前",
-      "description": "説明",
-      "visibility": "可視性",
-      "content": "リビジョン内容",
-      "entryId": "エントリID",
-      "entryTitle": "エントリタイトル",
-      "tags": "タグ",
-      "body": "本文",
-      "scope": "添付範囲",
-      "target": "対象",
-      "version": "リビジョン",
-      "account": "アカウントユーザーID",
-      "access": "権限",
-      "source": "ソース",
-      "updated": "更新日時"
-    },
-    "columns": {
-      "version": "リビジョン",
-      "state": "状態",
-      "size": "サイズ",
-      "created": "作成日時",
-      "actions": "操作"
-    },
-    "actions": {
-      "create": "パックを作成",
-      "import": "スナップショットをインポート",
-      "cancel": "キャンセル",
-      "refresh": "更新",
-      "reviewLatest": "最新バージョンを確認",
-      "retryTargets": "対象の読み込みを再試行",
-      "edit": "詳細を編集",
-      "duplicate": "複製",
-      "export": "選択したリビジョンをエクスポート",
-      "review": "確認して有効化",
-      "newVersion": "新しいリビジョン",
-      "preview": "プレビュー",
-      "attach": "リビジョンを添付",
-      "manageAccess": "アクセスを管理",
-      "delete": "削除"
-    },
-    "dialogs": {
-      "create": {
-        "title": "コンテキストパックを作成",
-        "description": "ローカルパックと最初の不変リビジョンを作成します。",
-        "confirm": "パックを作成"
-      },
-      "edit": {
-        "title": "パックの詳細を編集",
-        "description": "不変のリビジョン内容を変更せずにメタデータを更新します。",
-        "confirm": "詳細を保存"
-      },
-      "revision": {
-        "title": "リビジョンを作成",
-        "description": "最新の内容を基に、新しい不変リビジョンを公開します。",
-        "confirm": "リビジョンを作成"
-      },
-      "attach": {
-        "title": "リビジョンを添付",
-        "description": "正確なリビジョンを、所有するプリセット、チャット、ワールドブックのいずれか1つに関連付けます。",
-        "confirm": "添付"
-      },
-      "acl": {
-        "title": "アクセスを管理",
-        "description": "明示的なアカウント権限を要求します。サーバーが各プリンシパルを再検証します。",
-        "confirm": "アクセス権を保存"
-      },
-      "review": {
-        "title": "インポートしたパックを確認",
-        "description": "有効化には明示的な認証済み操作が必要で、インポートだけで有効になることはありません。",
-        "confirm": "パックを有効化"
-      },
-      "duplicate": {
-        "title": "パックを複製",
-        "description": "不変のリビジョン履歴を含む、同一アカウント内の非公開コピーを作成します。",
-        "confirm": "複製"
-      },
-      "delete": {
-        "title": "パックを削除",
-        "description": "このコンテキストパックをアカウントから削除します。",
-        "confirm": "パックを削除"
-      }
-    },
-    "errors": {
-      "not_found": "このコンテキストパックは利用できないか、アクセス権がありません。",
-      "revision_conflict": "このパックは別のセッションで変更されました。サーバーの最新バージョンが表示されています。変更を再試行する前に確認してください。",
-      "validation_failed": "コンテキストパックの変更がサーバーに拒否されました。項目を確認して再試行してください。",
-      "unavailable": "コンテキストライブラリは一時的に利用できません。"
     }
   }
 }

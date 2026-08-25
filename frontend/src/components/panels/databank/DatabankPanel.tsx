@@ -72,6 +72,9 @@ export default function DatabankPanel() {
   const activeChatId = useStore((s) => s.activeChatId)
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const characters = useStore((s) => s.characters)
+  // Monotonic store signal raised by the singleton WS dispatcher whenever a
+  // native Databank mutation or authenticated reconnect requires fresh data.
+  const databankRevision = useStore((s) => s.databankRevision)
 
   const [docSearch, setDocSearch] = useState('')
   const [dragging, setDragging] = useState(false)
@@ -223,7 +226,7 @@ export default function DatabankPanel() {
   useEffect(() => {
     void loadBanks()
     return () => { banksRequestRef.current += 1 }
-  }, [loadBanks])
+  }, [loadBanks, databankRevision])
 
   // A selected bank belongs to the scope/context in which it was chosen. Clear
   // it before rendering a different scope so stale documents and actions from
@@ -256,7 +259,7 @@ export default function DatabankPanel() {
   useEffect(() => {
     void loadDocs()
     return () => { docsRequestRef.current += 1 }
-  }, [loadDocs])
+  }, [loadDocs, databankRevision])
 
   // ── Poll for document status updates ──
   useEffect(() => {

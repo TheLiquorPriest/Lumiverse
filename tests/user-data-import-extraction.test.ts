@@ -32,24 +32,13 @@ import {
   startImport,
   submitTicket,
 } from "../src/services/user-data/import.service";
-import {
-  attachContextPack,
-  listContextPackCandidates,
-  readContextPackRevisionForUser,
-  reviewContextPack,
-} from "../src/services/agent-context-packs.service";
+import { ARCHIVE_REGISTRY_VERSION } from "../src/services/user-data/table-registry";
 import { createTicket, encryptSecret, TICKET_MAX_AGE_SECONDS } from "../src/services/user-data/secret-ticket.service";
 import {
   MAX_ARCHIVE_FILE_BYTES,
   NDJSON_MAX_RECORD_BYTES,
   type ArchiveManifest,
 } from "../src/services/user-data/manifest";
-import {
-  estimateContextPackTokens,
-  hashContextPackContent,
-  serializeContextPackContent,
-  utf8Bytes,
-} from "../src/types/agent-context-packs";
 
 const USER_ID = "bounded-import-user";
 
@@ -290,7 +279,7 @@ describe("user-data import bounded extraction", () => {
       schemaVersion: 3,
       embeddingIdentity: "test-embedding",
       vectorStatus: "rebuild_required",
-      registryVersion: 2,
+      registryVersion: ARCHIVE_REGISTRY_VERSION,
       snapshotId: "snapshot-test",
       fileAliases: [],
       byteCounts: {},
@@ -405,162 +394,6 @@ describe("user-data import bounded extraction", () => {
     db.close();
   });
 
-  test("validates canonical context revision digest, UTF-8 bytes, and tokens before apply", () => {
-    const content = [{ id: "entry", title: "Title", body: "Café", tags: ["tag"] }];
-    const serialized = serializeContextPackContent(content);
-    const valid = {
-      content_json: serialized,
-      content_digest: hashContextPackContent(serialized),
-      byte_count: utf8Bytes(serialized),
-      token_count: estimateContextPackTokens(serialized),
-    };
-    expect(() => importTest.validateContextPackRevisionAccounting("agent_context_pack_revisions", valid)).not.toThrow();
-    expect(() => importTest.validateContextPackRevisionAccounting(
-      "agent_context_pack_revisions",
-      { ...valid, content_digest: "0".repeat(64) },
-    )).toThrow(/digest/);
-    expect(() => importTest.validateContextPackRevisionAccounting(
-      "agent_context_pack_revisions",
-      { ...valid, byte_count: valid.byte_count + 1 },
-    )).toThrow(/byte count/);
-    expect(() => importTest.validateContextPackRevisionAccounting(
-      "agent_context_pack_revisions",
-      { ...valid, token_count: valid.token_count + 1 },
-    )).toThrow(/token count/);
-    const nonCanonical = JSON.stringify([{ body: "Café", id: "entry", tags: ["tag"], title: "Title" }]);
-    expect(() => importTest.validateContextPackRevisionAccounting(
-      "agent_context_pack_revisions",
-      { ...valid, content_json: nonCanonical },
-    )).toThrow(/canonical/);
-  });
-  test("remaps foreign context IDs and revisions with MAX_SAFE_INTEGER and local collisions", () => {
-    const live = new Database(":memory:");
-    live.run("CREATE TABLE agent_context_packs (id TEXT NOT NULL, user_id TEXT NOT NULL)");
-    live.run("CREATE TABLE agent_context_pack_revisions (pack_id TEXT NOT NULL, revision INTEGER NOT NULL)");
-    const stageDb = new Database(":memory:");
-    stageDb.run("CREATE TABLE __import_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-    stageDb.run("INSERT INTO __import_meta (key, value) VALUES ('source_owner', 'foreign-user')");
-    stageDb.run("CREATE TABLE agent_context_packs (id TEXT NOT NULL, user_id TEXT NOT NULL, latest_revision INTEGER)");
-    stageDb.run("CREATE TABLE agent_context_pack_revisions (pack_id TEXT NOT NULL, revision INTEGER NOT NULL)");
-    stageDb.run("CREATE TABLE agent_preset_context_pack_attachments (pack_id TEXT, revision INTEGER, user_id TEXT, state TEXT)");
-    const stage = { db: stageDb } as any;
-    const job = { archiveId: "archive-remap", userId: USER_ID } as any;
-    const used = new Set<string>();
-    const firstId = importTest.deterministicContextPackId(
-      "foreign-pack",
-      "archive-remap",
-      USER_ID,
-      live,
-      used,
-    );
-    live.query("INSERT INTO agent_context_packs (id, user_id) VALUES (?, ?)").run(firstId, USER_ID);
-    stageDb.query("INSERT INTO agent_context_packs (id, user_id, latest_revision) VALUES (?, ?, ?)")
-      .run("foreign-pack", "foreign-user", Number.MAX_SAFE_INTEGER);
-    stageDb.query("INSERT INTO agent_context_pack_revisions (pack_id, revision) VALUES (?, ?)")
-      .run("foreign-pack", Number.MAX_SAFE_INTEGER);
-    const remap = importTest.buildContextPackImportRemap(stage, live, job);
-    expect(remap.packIds.get("foreign-pack")).toMatch(/-1$/);
-    const contextSpec = { owner: { kind: "direct", column: "user_id" } };
-    const rewrittenPack = importTest.rewriteContextPackImportRow(
-      "agent_context_packs",
-      { id: "foreign-pack", user_id: "foreign-user", latest_revision: Number.MAX_SAFE_INTEGER },
-      contextSpec,
-      USER_ID,
-      remap,
-    );
-    expect(rewrittenPack).toMatchObject({
-      id: remap.packIds.get("foreign-pack"),
-      user_id: USER_ID,
-      latest_revision: 1,
-      state: "review_required",
-    });
-    const rewrittenRevision = importTest.rewriteContextPackImportRow(
-      "agent_context_pack_revisions",
-      { pack_id: "foreign-pack", revision: Number.MAX_SAFE_INTEGER },
-      contextSpec,
-      USER_ID,
-      remap,
-    );
-    expect(rewrittenRevision).toMatchObject({
-      pack_id: remap.packIds.get("foreign-pack"),
-      revision: 1,
-      state: "review_required",
-    });
-    const rewrittenAttachment = importTest.rewriteContextPackImportRow(
-      "agent_preset_context_pack_attachments",
-      { pack_id: "foreign-pack", revision: Number.MAX_SAFE_INTEGER, user_id: "foreign-user", state: "active" },
-      contextSpec,
-      USER_ID,
-      remap,
-    );
-    expect(rewrittenAttachment).toMatchObject({
-      pack_id: remap.packIds.get("foreign-pack"),
-      revision: 1,
-      user_id: USER_ID,
-      state: "review_required",
-    });
-    stageDb.close();
-    live.close();
-  });
-  test("keeps foreign review-required context attachments invisible until owner review and reattach", () => {
-    const db = getDb();
-    const packId = "review-required-pack";
-    const presetId = "review-required-preset";
-    const attachmentId = "foreign-review-attachment";
-    const serialized = serializeContextPackContent([{ id: "entry", title: "", body: "review body", tags: [] }]);
-    const provenance = JSON.stringify({ kind: "archive_restore", archiveId: "foreign-archive" });
-    const now = 1;
-    db.query("INSERT INTO presets (id, name, provider, user_id) VALUES (?, ?, ?, ?)")
-      .run(presetId, "Review target", "test", USER_ID);
-    db.query(
-      `INSERT INTO agent_context_packs
-       (user_id, id, name, description, visibility, state, latest_revision, provenance_json, created_at, updated_at)
-       VALUES (?, ?, ?, '', 'private', 'review_required', 1, ?, ?, ?)`,
-    ).run(USER_ID, packId, "Imported review pack", provenance, now, now);
-    db.query(
-      `INSERT INTO agent_context_pack_revisions
-       (user_id, pack_id, revision, content_json, content_digest, token_count, byte_count, state, provenance_json, created_at, created_by)
-       VALUES (?, ?, 1, ?, ?, ?, ?, 'review_required', ?, ?, ?)`,
-    ).run(
-      USER_ID,
-      packId,
-      serialized,
-      hashContextPackContent(serialized),
-      estimateContextPackTokens(serialized),
-      utf8Bytes(serialized),
-      provenance,
-      now,
-      USER_ID,
-    );
-    db.query(
-      `INSERT INTO agent_preset_context_pack_attachments
-       (user_id, attachment_id, preset_id, pack_id, revision, position, required, state, provenance_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 1, 0, 1, 'review_required', ?, ?, ?)`,
-    ).run(USER_ID, attachmentId, presetId, packId, provenance, now, now);
-
-    expect(readContextPackRevisionForUser(USER_ID, packId, 1)).toBeNull();
-    expect(listContextPackCandidates(USER_ID, "preset", presetId)).toEqual([]);
-
-    const reviewed = reviewContextPack(USER_ID, packId, {
-      state: "active",
-      acknowledge: true,
-      expectedRevision: 1,
-    });
-    expect(reviewed).toMatchObject({ id: packId, state: "active", latestRevision: 2 });
-    expect(readContextPackRevisionForUser(USER_ID, packId, 1)).toBeNull();
-    expect(db.query(
-      "SELECT state, revision FROM agent_preset_context_pack_attachments WHERE user_id = ? AND attachment_id = ?",
-    ).get(USER_ID, attachmentId)).toEqual({ state: "review_required", revision: 1 });
-
-    const reattached = attachContextPack(USER_ID, packId, {
-      scope: "preset",
-      targetId: presetId,
-      revision: 2,
-      required: true,
-    });
-    expect(reattached).toMatchObject({ scope: "preset", targetId: presetId, packId, revision: 2, state: "active" });
-    expect(listContextPackCandidates(USER_ID, "preset", presetId).map((candidate) => candidate.revision.revision)).toEqual([2]);
-  });
   test("round-trips an audio_files row and blob through export and import", async () => {
     const audioId = "22222222-2222-2222-2222-222222222222";
     const filename = `${audioId}.mp3`;
@@ -1598,6 +1431,27 @@ describe("user-data import bounded extraction", () => {
         .get("legacy_large_setting", USER_ID),
     ).toEqual({ length: value.length });
   });
+  test("rejects a V3 manifest with a stale archive registry version", async () => {
+    const binaryJournalPath = join(workDir, "stale-registry.ndjson");
+    writeFileSync(binaryJournalPath, "");
+    await expect(
+      importTest.validateManifestEntries(
+        {
+          ...manifest(),
+          schemaVersion: 3,
+          embeddingIdentity: "test-embedding",
+          vectorStatus: "rebuild_required",
+          registryVersion: 2,
+          snapshotId: "snapshot-stale-registry",
+          fileAliases: [],
+          missingOptionalFiles: [],
+          byteCounts: {},
+          entries: [],
+        },
+        { entries: [], binaryJournalPath },
+      ),
+    ).rejects.toThrow("archive registry version is not supported");
+  });
   test("rejects a V3 manifest that omits an empty canonical table payload", async () => {
     const binaryJournalPath = join(workDir, "empty-binary-journal.ndjson");
     writeFileSync(binaryJournalPath, "");
@@ -1606,7 +1460,7 @@ describe("user-data import bounded extraction", () => {
       schemaVersion: 3,
       embeddingIdentity: "test-embedding",
       vectorStatus: "rebuild_required",
-      registryVersion: 2,
+      registryVersion: ARCHIVE_REGISTRY_VERSION,
       snapshotId: "snapshot-empty-canonical",
       fileAliases: [],
       byteCounts: {},
@@ -1642,7 +1496,7 @@ describe("user-data import bounded extraction", () => {
           schemaVersion: 3,
           embeddingIdentity: "test-embedding",
           vectorStatus: "rebuild_required",
-          registryVersion: 2,
+          registryVersion: ARCHIVE_REGISTRY_VERSION,
           snapshotId: "snapshot-required",
           counts: { settings: 1 },
           fileAliases: [],
@@ -1660,7 +1514,7 @@ describe("user-data import bounded extraction", () => {
           schemaVersion: 3,
           embeddingIdentity: "test-embedding",
           vectorStatus: "rebuild_required",
-          registryVersion: 2,
+          registryVersion: ARCHIVE_REGISTRY_VERSION,
           snapshotId: "snapshot-row-count",
           counts: { settings: 2 },
           fileAliases: [],
@@ -1685,7 +1539,7 @@ describe("user-data import bounded extraction", () => {
           schemaVersion: 3,
           embeddingIdentity: "test-embedding",
           vectorStatus: "rebuild_required",
-          registryVersion: 2,
+          registryVersion: ARCHIVE_REGISTRY_VERSION,
           snapshotId: "snapshot-cap",
           counts: { settings: 0 },
           fileAliases: [],

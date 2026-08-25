@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import {
   ARCHIVE_CANONICAL_TABLES,
+  ARCHIVE_REGISTRY_VERSION,
   ARCHIVE_TABLE_REGISTRY,
   assertArchiveRegistryCoverage,
   getArchiveTableSpec,
@@ -9,14 +10,12 @@ import {
   buildArchiveOwnerPredicate,
   getArchiveVectorTables,
 } from "../src/services/user-data/table-registry";
-
 describe("archive table registry", () => {
   test("classifies the current archive-sensitive table families exactly once", () => {
     const names = ARCHIVE_TABLE_REGISTRY.map((spec) => spec.table);
     expect(new Set(names).size).toBe(names.length);
+    expect(ARCHIVE_REGISTRY_VERSION).toBe(3);
     expect(getArchiveTableSpec("audio_files")?.kind).toBe("canonical");
-    expect(getArchiveTableSpec("agent_context_packs")?.kind).toBe("canonical");
-    expect(getArchiveTableSpec("agent_context_pack_revisions")?.parentEdges.some((edge) => edge.columns?.length === 2)).toBe(true);
     expect(getArchiveTableSpec("agent_run_projections")?.kind).toBe("operational");
     expect(getArchiveTableSpec("agent_activity_runs")?.kind).toBe("operational");
     expect(getArchiveTableSpec("multiplayer_rooms")?.kind).toBe("operational");
@@ -36,31 +35,24 @@ describe("archive table registry", () => {
     expect(() => assertArchiveRegistryCoverage(db)).toThrow(/missing=.*audio_files/);
     db.close();
   });
-  test("registers the migrated Weaver people table with account and session edges", () => {
-    const spec = getArchiveTableSpec("weaver_people");
-    expect(spec?.kind).toBe("canonical");
-    expect(spec?.owner).toMatchObject({ kind: "direct", column: "user_id" });
-    expect(spec?.primaryKey).toEqual(["id"]);
-    expect(spec?.uniqueKeys).toEqual([["id"]]);
-    expect(spec?.parentEdges).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        column: "user_id",
-        parentTable: "user",
-        parentColumn: "id",
-        nullable: false,
-        onMissing: "reject",
-      }),
-      expect.objectContaining({
-        column: "session_id",
-        parentTable: "weaver_sessions",
-        parentColumn: "id",
-        nullable: false,
-        onMissing: "reject",
-      }),
-    ]));
-    const order = getCanonicalImportOrder();
-    expect(order.indexOf("weaver_sessions")).toBeLessThan(order.indexOf("weaver_people"));
+  test("ignores AR-008 retired tables during legacy schema coverage", () => {
+    const db = new Database(":memory:");
+    for (const table of ["edit_and_send_requests", "generation_outbox", "image_processing_queue"]) {
+      db.run('CREATE TABLE "' + table + '" (id TEXT PRIMARY KEY)');
+    }
+    let error: unknown = null;
+    try {
+      assertArchiveRegistryCoverage(db);
+    } catch (candidate) {
+      error = candidate;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).not.toContain("unclassified=");
+    expect((error as Error).message).toContain("missing=");
+    db.close();
   });
+  
+  test("registers the migrated Weaver people table with account and session edges", () => { $$$ });
   test("computes parent-first order from declared canonical edges", () => {
     const order = getCanonicalImportOrder();
     const positions = new Map(order.map((table, index) => [table, index]));

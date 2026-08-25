@@ -98,7 +98,7 @@ beforeEach(() => {
     agentRunLastSequenceByChat: {},
     agentRunCursorSequenceByChat: {},
     agentRunResyncOffsetByChat: {},
-    agentRunSyncByChat: {},
+    agentRunResyncDescriptorByChat: {},
     agentRunOmittedEventsByChat: {},
     agentRunRequestEpochByChat: {},
     agentWorkspaceByTurn: {},
@@ -226,6 +226,21 @@ describe('exact agent run recovery', () => {
     expect(selectActiveAgentRunForChat(useStore.getState(), 'chat-a')?.turnId).toBe('turn-a')
   })
 
+  test('terminalizes a malformed restore payload while retaining the accepted run', async () => {
+    await recoverAgentRuns('chat-a')
+    const retained = selectActiveAgentRunForChat(useStore.getState(), 'chat-a')
+    changesImpl = async () => ({ version: 2, chatId: 'chat-a' } as unknown as AgentRunChangesV2)
+
+    await recoverAgentRuns('chat-a')
+
+    const state = useStore.getState()
+    expect(state.agentRunSyncByChat['chat-a']).toBe('error')
+    expect(selectActiveAgentRunForChat(state, 'chat-a')).toMatchObject({
+      runId: retained?.runId,
+      turnId: retained?.turnId,
+      generationId: retained?.generationId,
+    })
+  })
   test('exposes a failed lookup and permits a later recovery retry', async () => {
     changesImpl = async () => { throw new Error('offline') }
     await recoverAgentRuns('chat-a')

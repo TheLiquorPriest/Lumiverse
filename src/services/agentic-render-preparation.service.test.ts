@@ -710,51 +710,6 @@ describe("strict render request validation bounds", () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
-  test("accepts compiler-legal JSON attachment revision identity under 256 bytes", () => {
-    const attachmentRevision = JSON.stringify([
-      "05577228-5311-4e03-8fab-754a63ea6bbb",
-      "ef3fe3b3-a1bc-4bff-b3a9-bc669034cde0",
-      1,
-      "chat",
-      "5136f8cd-3b41-4227-8793-ef51283a052b",
-      "bcf9c2ff-e03e-428e-b6e6-8d1bda85db21",
-      1787158127,
-      0,
-      0,
-      "active",
-    ]);
-    const revisionBytes = new TextEncoder().encode(attachmentRevision).length;
-    expect(revisionBytes).toBeGreaterThan(128);
-    expect(revisionBytes).toBeLessThanOrEqual(256);
-    const validated = validateRenderPreparationInputV1(makeInput({
-      inputRevisions: {
-        version: 1,
-        revisions: [{
-          kind: "context_attachment",
-          id: "bcf9c2ff-e03e-428e-b6e6-8d1bda85db21",
-          revision: attachmentRevision,
-          digest: "a".repeat(64),
-        }],
-        digest: "frozen-inputs",
-      },
-    }));
-    expect(validated.inputRevisions.revisions[0]?.revision).toBe(attachmentRevision);
-    expectPreparationFailure(
-      () => validateRenderPreparationInputV1(makeInput({
-        inputRevisions: {
-          version: 1,
-          revisions: [{
-            kind: "context_attachment",
-            id: "bcf9c2ff-e03e-428e-b6e6-8d1bda85db21",
-            revision: "x".repeat(257),
-            digest: "a".repeat(64),
-          }],
-          digest: "frozen-inputs",
-        },
-      })),
-      "limit_exceeded",
-    );
-  });
 
 
   test("aborts a diamond DAG at the node cap instead of hanging", () => {

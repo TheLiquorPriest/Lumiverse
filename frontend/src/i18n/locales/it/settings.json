@@ -27,11 +27,6 @@
       "shortName": "Runtime Agentic",
       "tabName": "Runtime Agentic",
       "tabDescription": "Controlla valori predefiniti, conservazione e limiti imposti dall'host"
-    },
-    "contextLibrary": {
-      "shortName": "Libreria contesti",
-      "tabName": "Libreria contesti",
-      "tabDescription": "Gestisci pacchetti di contesto con versioni e relativi allegati"
     }
   },
   "account": {
@@ -48,6 +43,21 @@
     "saving": "Salvataggio..."
   },
   "display": {
+    "longMessages": {
+      "title": "Messaggi lunghi",
+      "helper": "Limita i messaggi lunghi a un’altezza comoda finché non vengono espansi.",
+      "enabled": "Comprimi i messaggi lunghi",
+      "enabledHint": "Si applica a tutte le modalità di chat, anche durante la generazione di una risposta.",
+      "height": "ALTEZZA COMPRESSA",
+      "depth": "COMPRIMI DALLA PROFONDITÀ",
+      "depthHint": "La profondità 0 è il messaggio più recente. I messaggi lunghi a questa profondità o più vecchi possono essere compressi.",
+      "compact": "Compatta",
+      "comfortable": "Comoda",
+      "tall": "Alta",
+      "custom": "Personalizzata",
+      "customHeight": "ALTEZZA PERSONALIZZATA (PX)",
+      "customHeightHint": "Altezza massima dei messaggi lunghi compressi quando è selezionata Personalizzata."
+    },
     "modalWidth": {
       "title": "Larghezza modale",
       "helper": "Vincola la larghezza massima di tutte le finestre di dialogo modali. Influisce su impostazioni, editor e altri pannelli popover.",
@@ -1515,189 +1525,6 @@
         "toolExecutionsPerUser": "Esecuzioni strumenti per utente",
         "toolExecutionsProcess": "Esecuzioni strumenti per processo"
       }
-    }
-  },
-  "contextLibrary": {
-    "eyebrow": "Contesto account",
-    "title": "Libreria contesti",
-    "description": "Crea pacchetti di contesto immutabili e versionati e collega le revisioni approvate a preset, chat o libri del mondo.",
-    "copySuffix": "copia",
-    "packs": "Pacchetti",
-    "packList": "Pacchetti di contesto",
-    "loading": "Caricamento pacchetti di contesto…",
-    "loadingDetail": "Caricamento dettagli del pacchetto…",
-    "loadingTargets": "Caricamento destinazioni di proprietà…",
-    "targetLoadError": "Impossibile caricare le destinazioni di collegamento di tua proprietà.",
-    "targetsLoaded": "Destinazioni di collegamento caricate.",
-    "noTargetsAvailable": "Nessuna destinazione di proprietà è disponibile per questo ambito.",
-    "selectTarget": "Seleziona una destinazione di proprietà",
-    "selectPack": "Seleziona un pacchetto di contesto per esaminarlo.",
-    "emptyTitle": "Crea il tuo primo pacchetto di contesto",
-    "emptyDescription": "Aggiungi materiale di riferimento stabile, quindi collega una revisione immutabile dove serve.",
-    "noDescription": "Nessuna descrizione",
-    "noAttachments": "Nessun allegato",
-    "privateOnly": "Non è stato concesso alcun accesso aggiuntivo all'account.",
-    "unavailableTarget": "Destinazione non disponibile",
-    "exportComplete": "Snapshot portabile esportato.",
-    "exporting": "Esportazione dello snapshot portabile…",
-    "importing": "Importazione dello snapshot portabile…",
-    "importComplete": "“{{name}}” è stato importato. Esaminalo prima di collegarlo o attivarlo.",
-    "importFileLabel": "Scegli uno snapshot JSON di un pacchetto di contesto da importare",
-    "versionNumber": "Revisione {{number}}",
-    "byteCount": "{{count}} byte",
-    "versionHistoryCaption": "Cronologia immutabile delle revisioni del pacchetto di contesto",
-    "versionImmutableHelp": "Le revisioni pubblicate non possono essere modificate. Crea una nuova revisione per cambiare il contenuto.",
-    "immutable": "Immutabile",
-    "previewTitle": "Anteprima revisione {{number}}",
-    "contentHelp": "Le voci vengono memorizzate in ordine come contesto letterale. Gli ID devono essere univoci nella revisione.",
-    "entryNumber": "Voce {{number}}",
-    "addEntry": "Aggiungi voce",
-    "removeEntry": "Rimuovi voce {{number}}",
-    "tagsHelp": "Separa i tag con virgole.",
-    "requiredAttachment": "Considera questo allegato obbligatorio per il controllo preliminare Agentic",
-    "attachmentsDescription": "Gli allegati associano una revisione immutabile esatta a una destinazione di proprietà.",
-    "accessDescription": "Visibilità e autorizzazioni ACL vengono riconvalidate dal server per ogni operazione.",
-    "accessList": "Elenco accessi dell'account",
-    "accessFor": "Accesso per {{name}}",
-    "addAccess": "Aggiungi accesso",
-    "removeAccess": "Rimuovi accesso per {{name}}",
-    "aclServerAuthority": "Il server verifica identità, proprietà, revisione ACL corrente e autorizzazione richiesta.",
-    "reviewTitle": "Revisione autenticata obbligatoria",
-    "reviewDescription": "Questo pacchetto resta disabilitato finché non ne esamini il contenuto e ne accetti esplicitamente l'uso locale.",
-    "repairDescription": "Questo pacchetto deve essere riparato prima di poter essere esaminato o collegato.",
-    "reviewAcknowledgement": "Ho esaminato questo pacchetto, la sua visibilità, il contenuto e le autorizzazioni di accesso e desidero attivarlo.",
-    "preserveAttachments": "Duplica gli allegati attualmente autorizzati",
-    "deleteTitle": "Elimina pacchetto di contesto",
-    "deleteDescription": "Elimina questo pacchetto e le revisioni e gli allegati di sua proprietà.",
-    "deleteWarning": "Eliminare “{{name}}”? L'azione è irreversibile.",
-    "detachFrom": "Scollega da {{name}}",
-    "status": {
-      "active": "Pronto",
-      "disabled": "Disabilitato",
-      "review_required": "Revisione obbligatoria",
-      "repair_required": "Riparazione obbligatoria"
-    },
-    "source": {
-      "local": "Locale",
-      "portable_import": "Importazione portabile",
-      "archive_restore": "Ripristino da archivio",
-      "same_account_duplicate": "Duplicato nello stesso account"
-    },
-    "visibility": {
-      "private": "Privata",
-      "account": "Account",
-      "restricted": "Limitata",
-      "help": "Il server resta l'autorità per ogni operazione su ACL e destinazioni."
-    },
-    "scopes": {
-      "preset": "Preset",
-      "chat": "Chat",
-      "world_book": "Libro del mondo"
-    },
-    "acl": {
-      "read": "Lettura",
-      "use": "Uso",
-      "edit": "Modifica"
-    },
-    "attachmentState": {
-      "active": "Attivo",
-      "disabled": "Disabilitato",
-      "review_required": "Revisione obbligatoria",
-      "repair_required": "Riparazione obbligatoria"
-    },
-    "sections": {
-      "versions": "Cronologia versioni",
-      "attachments": "Allegati",
-      "access": "Visibilità e accesso"
-    },
-    "fields": {
-      "name": "Nome",
-      "description": "Descrizione",
-      "visibility": "Visibilità",
-      "content": "Contenuto revisione",
-      "entryId": "ID voce",
-      "entryTitle": "Titolo voce",
-      "tags": "Tag",
-      "body": "Corpo",
-      "scope": "Ambito allegato",
-      "target": "Destinazione",
-      "version": "Revisione",
-      "account": "ID utente account",
-      "access": "Autorizzazione",
-      "source": "Origine",
-      "updated": "Aggiornato"
-    },
-    "columns": {
-      "version": "Revisione",
-      "state": "Stato",
-      "size": "Dimensione",
-      "created": "Creazione",
-      "actions": "Azioni"
-    },
-    "actions": {
-      "create": "Crea pacchetto",
-      "import": "Importa snapshot",
-      "cancel": "Annulla",
-      "refresh": "Aggiorna",
-      "reviewLatest": "Rivedi la versione più recente",
-      "retryTargets": "Riprova il caricamento",
-      "edit": "Modifica dettagli",
-      "duplicate": "Duplica",
-      "export": "Esporta revisione selezionata",
-      "review": "Esamina e attiva",
-      "newVersion": "Nuova revisione",
-      "preview": "Anteprima",
-      "attach": "Collega revisione",
-      "manageAccess": "Gestisci accesso",
-      "delete": "Elimina"
-    },
-    "dialogs": {
-      "create": {
-        "title": "Crea pacchetto di contesto",
-        "description": "Crea un pacchetto locale e la sua prima revisione immutabile.",
-        "confirm": "Crea pacchetto"
-      },
-      "edit": {
-        "title": "Modifica dettagli pacchetto",
-        "description": "Aggiorna i metadati senza modificare il contenuto immutabile della revisione.",
-        "confirm": "Salva dettagli"
-      },
-      "revision": {
-        "title": "Crea revisione",
-        "description": "Parti dal contenuto più recente e pubblica una nuova revisione immutabile.",
-        "confirm": "Crea revisione"
-      },
-      "attach": {
-        "title": "Collega revisione",
-        "description": "Associa una revisione esatta a un preset, una chat o un libro del mondo di proprietà.",
-        "confirm": "Collega"
-      },
-      "acl": {
-        "title": "Gestisci accesso",
-        "description": "Richiedi autorizzazioni esplicite per l'account. Il server riconvalida ogni identità.",
-        "confirm": "Salva accesso"
-      },
-      "review": {
-        "title": "Esamina pacchetto importato",
-        "description": "L'attivazione è un'azione autenticata esplicita e non deriva mai dalla sola importazione.",
-        "confirm": "Attiva pacchetto"
-      },
-      "duplicate": {
-        "title": "Duplica pacchetto",
-        "description": "Crea una copia privata nello stesso account con cronologia immutabile delle revisioni.",
-        "confirm": "Duplica"
-      },
-      "delete": {
-        "title": "Elimina pacchetto",
-        "description": "Rimuovi questo pacchetto di contesto dall'account.",
-        "confirm": "Elimina pacchetto"
-      }
-    },
-    "errors": {
-      "not_found": "Questo pacchetto di contesto non è disponibile o non hai più accesso.",
-      "revision_conflict": "Questo pacchetto è stato modificato in un'altra sessione. È mostrata la versione più recente del server; esaminala prima di riprovare la modifica.",
-      "validation_failed": "Il server ha rifiutato la modifica al pacchetto di contesto. Controlla i campi e riprova.",
-      "unavailable": "La Libreria contesti non è temporaneamente disponibile."
     }
   }
 }

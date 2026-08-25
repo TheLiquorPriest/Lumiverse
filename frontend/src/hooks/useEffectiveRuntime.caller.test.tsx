@@ -8,14 +8,34 @@ import type {
   ChatAgentModeWriteV1,
   EffectiveRuntimePublicResponseV1,
   GenerationTargetV1,
+  LoomRuntimePolicyV1,
 } from '@/types/effective-runtime'
-
 const target: GenerationTargetV1 = {
   generationType: 'normal',
   messageId: null,
   swipeId: null,
   branchId: null,
   targetCharacterId: null,
+  revision: null,
+}
+const runtimePolicy: LoomRuntimePolicyV1 = {
+  version: 1,
+  authoredValue: 'response',
+  effectiveValue: 'response',
+  source: 'response_fallback',
+  scope: 'fallback',
+  cap: { authority: 'host', allowedModes: ['response'], reasonCode: null },
+  availability: { state: 'available', reasonCode: null },
+  presetRevision: null,
+  transientSelection: null,
+  durableChatOverride: null,
+  repairAcknowledgement: {
+    state: 'not_required',
+    presetRevision: null,
+    reasonCode: null,
+    acknowledgedAt: null,
+  },
+  nextTurnOnly: true,
 }
 
 function response(chatId: string, revision: number | null): EffectiveRuntimePublicResponseV1 {
@@ -39,6 +59,7 @@ function response(chatId: string, revision: number | null): EffectiveRuntimePubl
     defaultMode: 'response',
     requestedMode: 'response',
     effectiveMode: 'response',
+    runtimePolicy,
     chatOverride: revision === null ? null : { mode: 'agentic', revision, state: 'ready' },
     capabilityReadiness: {
       ready: true,

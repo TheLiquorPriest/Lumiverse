@@ -20,6 +20,7 @@ function rawPreset(metadata: Record<string, unknown>, overrides: Partial<Preset>
     created_at: 1,
     updated_at: 2,
     ...overrides,
+    engine: overrides.engine ?? 'classic',
   }
 }
 

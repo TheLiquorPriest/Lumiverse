@@ -233,6 +233,8 @@ app.patch("/:id/documents/:docId", async (c) => {
   if (!name || typeof name !== "string") {
     return c.json({ error: "name is required" }, 400);
   }
+  const parentDoc = databank.getDocumentInDatabank(userId, c.req.param("id"), docId);
+  if (!parentDoc) return c.json({ error: "Not found" }, 404);
   const doc = databank.renameDocument(userId, docId, name.trim());
   if (!doc) return c.json({ error: "Not found" }, 404);
   return c.json(doc);
@@ -241,7 +243,7 @@ app.patch("/:id/documents/:docId", async (c) => {
 // GET /:id/documents/:docId — Get document details
 app.get("/:id/documents/:docId", (c) => {
   const userId = c.get("userId");
-  const doc = databank.getDocument(userId, c.req.param("docId"));
+  const doc = databank.getDocumentInDatabank(userId, c.req.param("id"), c.req.param("docId"));
   if (!doc) return c.json({ error: "Not found" }, 404);
   return c.json(doc);
 });
@@ -249,7 +251,9 @@ app.get("/:id/documents/:docId", (c) => {
 // GET /:id/documents/:docId/content — Get parsed document content
 app.get("/:id/documents/:docId/content", (c) => {
   const userId = c.get("userId");
-  const content = databank.getDocumentContent(userId, c.req.param("docId"));
+  const doc = databank.getDocumentInDatabank(userId, c.req.param("id"), c.req.param("docId"));
+  if (!doc) return c.json({ error: "Not found or not yet processed" }, 404);
+  const content = databank.getDocumentContent(userId, doc.id);
   if (content === null) return c.json({ error: "Not found or not yet processed" }, 404);
   return c.json({ content });
 });
@@ -258,6 +262,8 @@ app.get("/:id/documents/:docId/content", (c) => {
 app.delete("/:id/documents/:docId", async (c) => {
   const userId = c.get("userId");
   const docId = c.req.param("docId");
+  const doc = databank.getDocumentInDatabank(userId, c.req.param("id"), docId);
+  if (!doc) return c.json({ error: "Not found" }, 404);
 
   databank.abortDocumentProcessing(docId);
 
@@ -273,8 +279,7 @@ app.delete("/:id/documents/:docId", async (c) => {
 app.put("/:id/documents/:docId/content", async (c) => {
   const userId = c.get("userId");
   const docId = c.req.param("docId");
-
-  const doc = databank.getDocument(userId, docId);
+  const doc = databank.getDocumentInDatabank(userId, c.req.param("id"), docId);
   if (!doc) return c.json({ error: "Not found" }, 404);
 
   const body = await c.req.json().catch(() => ({}));
@@ -314,7 +319,7 @@ app.post("/:id/documents/:docId/reprocess", async (c) => {
   const userId = c.get("userId");
   const docId = c.req.param("docId");
 
-  const doc = databank.getDocument(userId, docId);
+  const doc = databank.getDocumentInDatabank(userId, c.req.param("id"), docId);
   if (!doc) return c.json({ error: "Not found" }, 404);
 
   // Delete old vectors
@@ -409,9 +414,20 @@ app.post("/mentions/resolve", async (c) => {
   const body = await c.req.json();
   const { slug, chatId, characterId, maxTokens } = body;
 
-  if (!slug) return c.json({ error: "slug is required" }, 400);
+  const requestedSlug = typeof slug === "string" ? slug.toLowerCase() : "";
+  if (!requestedSlug) return c.json({ error: "slug is required" }, 400);
 
-  const doc = databank.getDocumentBySlug(userId, slug);
+  const activeChatId = typeof chatId === "string" ? chatId : "";
+  const characterIds = Array.isArray(characterId)
+    ? characterId.filter((id): id is string => typeof id === "string")
+    : typeof characterId === "string" && characterId ? [characterId] : [];
+  const { docs } = databank.lookupSlugsInScope(
+    userId,
+    [requestedSlug],
+    activeChatId,
+    characterIds,
+  );
+  const doc = docs.get(requestedSlug);
   if (!doc) return c.json({ error: "Document not found" }, 404);
 
   const content = databank.getFullDocumentText(userId, doc.id);

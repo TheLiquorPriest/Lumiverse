@@ -986,11 +986,26 @@ app.post("/:id/entries/bulk", async (c) => {
   }
 });
 
+app.get("/:id/entries/:eid", (c) => {
+  const userId = c.get("userId");
+  const bookId = c.req.param("id");
+  const book = svc.getWorldBook(userId, bookId);
+  if (!book) return c.json({ error: "World book not found" }, 404);
+  const entry = svc.getEntry(userId, c.req.param("eid"));
+  if (!entry || entry.world_book_id !== book.id) return c.json({ error: "Not found" }, 404);
+  return c.json(entry);
+});
+
 app.put("/:id/entries/:eid", async (c) => {
   const userId = c.get("userId");
+  const bookId = c.req.param("id");
+  const book = svc.getWorldBook(userId, bookId);
+  if (!book) return c.json({ error: "World book not found" }, 404);
+  const existing = svc.getEntry(userId, c.req.param("eid"));
+  if (!existing || existing.world_book_id !== book.id) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json();
   try {
-    const entry = svc.updateEntry(userId, c.req.param("eid"), body);
+    const entry = svc.updateEntry(userId, existing.id, body);
     if (!entry) return c.json({ error: "Not found" }, 404);
     return c.json(entry);
   } catch (error) {
@@ -1053,7 +1068,12 @@ app.patch("/:id/entries/:eid/extensions/:namespace", async (c) => {
 
 app.delete("/:id/entries/:eid", async (c) => {
   const userId = c.get("userId");
-  if (!(await svc.deleteEntry(userId, c.req.param("eid")))) return c.json({ error: "Not found" }, 404);
+  const bookId = c.req.param("id");
+  const book = svc.getWorldBook(userId, bookId);
+  if (!book) return c.json({ error: "World book not found" }, 404);
+  const entry = svc.getEntry(userId, c.req.param("eid"));
+  if (!entry || entry.world_book_id !== book.id) return c.json({ error: "Not found" }, 404);
+  if (!(await svc.deleteEntry(userId, entry.id))) return c.json({ error: "Not found" }, 404);
   return c.json({ success: true });
 });
 

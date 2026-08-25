@@ -188,8 +188,8 @@ describe('useQuickToolbarActions detached host root', () => {
     expect(quickToolbarInputActionIcon(half)).toBe(Columns2)
     expect(quickToolbarInputActionIcon(enhanced)).toBe(Maximize2)
     expect(quickToolbarInputActionIcon(connectionsPicker)).toBe(Waypoints)
-    expect(quickToolbarInputActionLabel({ ...half, label: 'Open half editor' })).toBe('Half-Screen Lorebook Editor')
-    expect(quickToolbarInputActionLabel({ ...enhanced, label: 'Open enhanced workspace' })).toBe('Full-Screen Lorebook Editor')
+    expect(quickToolbarInputActionLabel({ ...half, label: 'Open half editor' })).toBe('quickToolbar.halfScreenLorebook')
+    expect(quickToolbarInputActionLabel({ ...enhanced, label: 'Open enhanced workspace' })).toBe('quickToolbar.fullScreenLorebook')
   })
 
   test('offers the Connections Picker action and invokes its extension handler', async () => {

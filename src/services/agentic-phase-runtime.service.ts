@@ -1,4 +1,5 @@
 import type {
+  AgentChildInstructionSubsetV1,
   AgentCustomPhaseV1,
   AgentRuntimePhaseCapabilityV1,
 } from "../types/agents";
@@ -47,12 +48,18 @@ export interface AgentRuntimePhaseSourceIdentityV1 {
   readonly blockRevision: number;
   readonly promptOrder: number;
 }
+export interface AgentRuntimePhaseChildInstructionSubsetIdentityV1 {
+  readonly profileId: string;
+  readonly sourceIdentity: readonly AgentRuntimePhaseSourceIdentityV1[];
+}
+
 
 /** A phase after host validation, retaining the exact authored source refs. */
 export interface CompiledAgentRuntimePhaseV1 extends AgentCustomPhaseV1 {
   readonly index: number;
   readonly sourceStatus: "verified" | "unverified";
   readonly sourceIdentity: readonly AgentRuntimePhaseSourceIdentityV1[];
+  readonly childInstructionSubsetIdentity: readonly AgentRuntimePhaseChildInstructionSubsetIdentityV1[];
 }
 
 export interface AgentRuntimePhaseCompileResultV1 {
@@ -65,6 +72,8 @@ export interface AgentRuntimePhaseCompileResultV1 {
 export interface CompileAgentRuntimePhasesOptionsV1 {
   /** Frozen source snapshot captured at admission. Omit only for source-independent tests. */
   readonly source?: CognitionSourceSnapshotV1 | null;
+  /** Authored profile IDs used to close child subset assignments at admission. */
+  readonly profileIds?: readonly string[];
 }
 
 /**
@@ -131,10 +140,51 @@ function issue(
   };
 }
 
+function sourceKey(ref: LoomPolicySourceV1): string {
+  return `${ref.kind}\u0000${ref.blockId}\u0000${ref.presetRevision}\u0000${ref.blockRevision}\u0000${ref.promptOrder}`;
+}
+
+function validateSourceRef(
+  ref: unknown,
+  path: string,
+  source: CognitionSourceSnapshotV1 | null | undefined,
+): { readonly code: "invalid_source" | "stale_source"; readonly detail: string; readonly source: "authoring" | "revision" } | null {
+  if (
+    !ref || typeof ref !== "object" || Array.isArray(ref)
+    || (ref as Record<string, unknown>).kind !== "loom_block"
+    || typeof (ref as Record<string, unknown>).blockId !== "string"
+    || ((ref as Record<string, unknown>).blockId as string).length === 0
+    || !isSafeRevision((ref as Record<string, unknown>).presetRevision)
+    || !isSafeRevision((ref as Record<string, unknown>).blockRevision)
+    || !isSafeRevision((ref as Record<string, unknown>).promptOrder)
+  ) {
+    return { code: "invalid_source", detail: `${path} contains an invalid source`, source: "authoring" };
+  }
+  const sourceRef = ref as LoomPolicySourceV1;
+  if (source === undefined || source === null) return null;
+  if (sourceRef.presetRevision !== source.presetRevision) {
+    return {
+      code: "stale_source",
+      detail: `${path} preset revision ${sourceRef.presetRevision} is not ${source.presetRevision}`,
+      source: "revision",
+    };
+  }
+  const block = source.blocks.find((candidate) => candidate.blockId === sourceRef.blockId);
+  if (!block || block.revision !== sourceRef.blockRevision || block.promptOrder !== sourceRef.promptOrder) {
+    return {
+      code: "stale_source",
+      detail: "source block " + sourceRef.blockId + " revision or order is stale",
+      source: "revision",
+    };
+  }
+  return null;
+}
+
 function validateSourceRefs(
   phase: AgentCustomPhaseV1,
   phaseIndex: number,
   source: CognitionSourceSnapshotV1 | null | undefined,
+  profileIds?: readonly string[],
 ): AgentRuntimePhaseCompileIssueV1 | null {
   const refs = phase.instructionRefs;
   if (!Array.isArray(refs)) {
@@ -144,22 +194,64 @@ function validateSourceRefs(
     return issue("invalid_source", phase, phaseIndex, `instructionRefs must contain at most ${AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS} entries`, "authoring");
   }
   const seen = new Set<string>();
-  for (const ref of refs) {
+  for (const [index, ref] of refs.entries()) {
+    const invalid = validateSourceRef(ref, `instructionRefs[${index}]`, source);
+    if (invalid !== null || seen.has((ref as LoomPolicySourceV1)?.blockId)) {
+      return issue(
+        invalid?.code ?? "invalid_source",
+        phase,
+        phaseIndex,
+        invalid?.detail ?? "instructionRefs contains an invalid or duplicate source",
+        invalid?.source ?? "authoring",
+      );
+    }
+    seen.add((ref as LoomPolicySourceV1).blockId);
+  }
+  const subsets = phase.childInstructionSubsets === undefined ? [] : phase.childInstructionSubsets;
+  if (!Array.isArray(subsets)) {
+    return issue("invalid_source", phase, phaseIndex, "childInstructionSubsets must be an array", "authoring");
+  }
+  const rootSources = new Set(refs.map((ref) => sourceKey(ref)));
+  const assignedProfiles = new Set<string>();
+  const knownProfiles = profileIds === undefined ? null : new Set(profileIds);
+  let aggregateRefs = 0;
+  for (const [subsetIndex, subset] of subsets.entries()) {
     if (
-      !ref || ref.kind !== "loom_block" || typeof ref.blockId !== "string" || ref.blockId.length === 0
-      || !isSafeRevision(ref.presetRevision) || !isSafeRevision(ref.blockRevision)
-      || !isSafeRevision(ref.promptOrder) || seen.has(ref.blockId)
+      !subset || typeof subset !== "object" || Array.isArray(subset)
+      || typeof (subset as AgentChildInstructionSubsetV1).profileId !== "string"
+      || (subset as AgentChildInstructionSubsetV1).profileId.length === 0
     ) {
-      return issue("invalid_source", phase, phaseIndex, "instructionRefs contains an invalid or duplicate source", "authoring");
+      return issue("invalid_source", phase, phaseIndex, `childInstructionSubsets[${subsetIndex}] has an invalid profile`, "authoring");
     }
-    seen.add(ref.blockId);
-    if (source === undefined || source === null) continue;
-    if (ref.presetRevision !== source.presetRevision) {
-      return issue("stale_source", phase, phaseIndex, `source preset revision ${ref.presetRevision} is not ${source.presetRevision}`, "revision");
+    const profileId = (subset as AgentChildInstructionSubsetV1).profileId;
+    if (assignedProfiles.has(profileId)) {
+      return issue("invalid_source", phase, phaseIndex, `childInstructionSubsets profile ${profileId} is duplicated`, "authoring");
     }
-    const block = source.blocks.find((candidate) => candidate.blockId === ref.blockId);
-    if (!block || block.revision !== ref.blockRevision || block.promptOrder !== ref.promptOrder) {
-      return issue("stale_source", phase, phaseIndex, `source block ${ref.blockId} revision or order is stale`, "revision");
+    if (knownProfiles !== null && !knownProfiles.has(profileId)) {
+      return issue("invalid_source", phase, phaseIndex, `childInstructionSubsets profile ${profileId} is unknown`, "authoring");
+    }
+    assignedProfiles.add(profileId);
+    const subsetRefs = (subset as AgentChildInstructionSubsetV1).instructionRefs;
+    if (!Array.isArray(subsetRefs) || subsetRefs.length > AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS) {
+      return issue("invalid_source", phase, phaseIndex, `childInstructionSubsets[${subsetIndex}].instructionRefs exceeds the phase source limit`, "authoring");
+    }
+    aggregateRefs += subsetRefs.length;
+    if (aggregateRefs > AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS) {
+      return issue("invalid_source", phase, phaseIndex, `childInstructionSubsets exceed ${AGENT_RUNTIME_MAX_PHASE_INSTRUCTION_REFS} aggregate source references`, "authoring");
+    }
+    const subsetSeen = new Set<string>();
+    for (const [refIndex, ref] of subsetRefs.entries()) {
+      const invalid = validateSourceRef(ref, `childInstructionSubsets[${subsetIndex}].instructionRefs[${refIndex}]`, source);
+      const key = invalid === null && ref && typeof ref === "object" && !Array.isArray(ref)
+        ? sourceKey(ref as LoomPolicySourceV1)
+        : "";
+      if (invalid !== null) {
+        return issue(invalid.code, phase, phaseIndex, invalid.detail, invalid.source);
+      }
+      if (!rootSources.has(key) || subsetSeen.has(key)) {
+        return issue("invalid_source", phase, phaseIndex, `childInstructionSubsets[${subsetIndex}] contains an out-of-phase or duplicate source`, "authoring");
+      }
+      subsetSeen.add(key);
     }
   }
   return null;
@@ -243,7 +335,7 @@ export function compileAgentRuntimePhases(
     } else if (!Number.isSafeInteger(phase.repeatLimit) || phase.repeatLimit < 0 || phase.repeatLimit > 4) {
       phaseIssue = issue("invalid_phase", phase, index, "repeatLimit must be an integer from 0 through 4", "authoring");
     } else {
-      phaseIssue = validateSourceRefs(phase, index, options.source);
+      phaseIssue = validateSourceRefs(phase, index, options.source, options.profileIds);
       if (phaseIssue === null) {
         const enter = parsePhasePredicate(phase.enter, phase, index, "enter");
         const exit = parsePhasePredicate(phase.exit, phase, index, "exit");
@@ -298,17 +390,26 @@ export function compileAgentRuntimePhases(
     const parsedEnter = parseCognitionPredicate(phase.enter);
     const parsedExit = parseCognitionPredicate(phase.exit);
     const parsedSkip = phase.skip === undefined ? undefined : parseCognitionPredicate(phase.skip);
+    const childInstructionSubsets = phase.childInstructionSubsets ?? [];
     const normalized: CompiledAgentRuntimePhaseV1 = {
       ...phase,
       enter: parsedEnter,
       exit: parsedExit,
       ...(parsedSkip === undefined ? {} : { skip: parsedSkip }),
       instructionRefs: Object.freeze(phase.instructionRefs.map((ref) => ({ ...ref }))),
+      childInstructionSubsets: Object.freeze(childInstructionSubsets.map((subset) => Object.freeze({
+        profileId: subset.profileId,
+        instructionRefs: Object.freeze(subset.instructionRefs.map((ref) => ({ ...ref }))),
+      }))),
       capabilityRequests: Object.freeze([...phase.capabilityRequests]),
       nextPhaseIds: Object.freeze([...phase.nextPhaseIds]),
       index: compiled.length,
       sourceStatus: candidate.sourceStatus,
       sourceIdentity: Object.freeze(phase.instructionRefs.map(sourceIdentity)),
+      childInstructionSubsetIdentity: Object.freeze(childInstructionSubsets.map((subset) => Object.freeze({
+        profileId: subset.profileId,
+        sourceIdentity: Object.freeze(subset.instructionRefs.map(sourceIdentity)),
+      }))),
     };
     compiled.push(Object.freeze(normalized));
   }
@@ -386,6 +487,7 @@ export interface AgentRuntimePhaseInspectionEvidenceV1 {
   readonly reason: string | null;
   readonly sourceStatus: "verified" | "unverified";
   readonly sourceIdentity: readonly AgentRuntimePhaseSourceIdentityV1[];
+  readonly childInstructionSubsetIdentity: readonly AgentRuntimePhaseChildInstructionSubsetIdentityV1[];
   readonly requestedCapabilities: readonly AgentRuntimePhaseCapabilityV1[];
   readonly admittedCapabilities: readonly AgentRuntimePhaseCapabilityV1[];
 }
@@ -482,6 +584,10 @@ class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
   evidence(): readonly AgentRuntimePhaseInspectionEvidenceV1[] {
     return Object.freeze(this.inspection.map((entry) => ({
       ...entry,
+      childInstructionSubsetIdentity: Object.freeze(entry.childInstructionSubsetIdentity.map((subset) => Object.freeze({
+        profileId: subset.profileId,
+        sourceIdentity: Object.freeze(subset.sourceIdentity.map((source) => ({ ...source }))),
+      }))),
       sourceIdentity: Object.freeze(entry.sourceIdentity.map((source) => ({ ...source }))),
       requestedCapabilities: Object.freeze([...entry.requestedCapabilities]),
       admittedCapabilities: Object.freeze([...entry.admittedCapabilities]),
@@ -719,6 +825,10 @@ class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
       revision: decision.revision,
       condition: decision.condition,
       required: phase.required,
+      childInstructionSubsetIdentity: Object.freeze(phase.childInstructionSubsetIdentity.map((subset) => Object.freeze({
+        profileId: subset.profileId,
+        sourceIdentity: Object.freeze(subset.sourceIdentity.map((source) => ({ ...source }))),
+      }))),
       repeatCount: decision.repeatCount,
       status: decision.status,
       reason: decision.reason,

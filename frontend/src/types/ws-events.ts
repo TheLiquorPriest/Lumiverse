@@ -1,6 +1,7 @@
 import type { AgentActivitySnapshotV1, AgentPublicErrorV1, AgentActivityContinuationMode, AgentPublicErrorCode, AgentActivityToolName } from './agent-runtime'
 import type { AgentUsage } from './api'
 import type { RoomParticipant, RoomStateView, PersonaSnapshot } from '@/types/multiplayer'
+import type { Databank, DatabankDocument } from '@/api/databank'
 
 export enum EventType {
   CONNECTED = 'CONNECTED',
@@ -172,6 +173,11 @@ export enum EventType {
   MCP_SERVER_ERROR = 'MCP_SERVER_ERROR',
   MCP_SERVER_CHANGED = 'MCP_SERVER_CHANGED',
 
+  // Databank
+  DATABANK_CHANGED = 'DATABANK_CHANGED',
+  DATABANK_DELETED = 'DATABANK_DELETED',
+  DATABANK_DOCUMENT_STATUS = 'DATABANK_DOCUMENT_STATUS',
+
   // Loom summary auto-summarization
   SUMMARIZATION_STARTED = 'SUMMARIZATION_STARTED',
   SUMMARIZATION_PROGRESS = 'SUMMARIZATION_PROGRESS',
@@ -331,6 +337,8 @@ export interface ContextClipStats {
 export interface GenerationStartedPayload {
   generationId: string
   chatId: string
+  model?: string
+  provider?: string
   targetMessageId?: string
   /** Swipe index the generation streams into (for swipe-gated streaming display). */
   targetSwipeId?: number
@@ -351,12 +359,21 @@ export interface GenerationStartedPayload {
 
 export interface GenerationInProgressPayload extends GenerationStartedPayload {
   model?: string
+  provider?: string
 }
+
+export type AgenticProviderLifecycle = 'started' | 'waiting' | 'completed' | 'error' | 'cancelled'
+export type AgenticProviderOperation = 'council' | 'root_dispatch'
 
 export interface GenerationPhaseChangedPayload {
   generationId: string
   chatId: string
   phase: 'reasoning' | 'streaming'
+  agentOperation?: AgenticProviderOperation
+  agentLifecycle?: AgenticProviderLifecycle
+  provider?: string | null
+  connectionLabel?: string | null
+  model?: string | null
 }
 export type AgentInvocationStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out'
 export type AgentActivityPhase = 'queued' | 'started' | 'tool_call' | 'completed' | 'failed' | 'cancelled' | 'timed_out'
@@ -720,6 +737,24 @@ export interface WorldBookEntryChangedPayload {
 export interface WorldBookEntryDeletedPayload {
   id: string
   worldBookId: string
+}
+
+// ---- Databanks (native panel live-sync) ----
+/** Emitted when a databank is created or its metadata/availability changes. */
+export interface DatabankChangedPayload {
+  databankId: string
+  databank: Databank
+}
+export interface DatabankDeletedPayload {
+  databankId: string
+}
+/** Emitted when a document is created, deleted, or changes processing status. */
+export interface DatabankDocumentStatusPayload {
+  documentId: string
+  databankId: string
+  status: DatabankDocument['status'] | 'deleted'
+  totalChunks?: number
+  error?: string
 }
 
 // ---- Council Tool Failure ----

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { COUNCIL_TOOLS_DEFAULTS, SIDECAR_DEFAULTS } from "lumiverse-spindle-types";
 import {
@@ -16,6 +17,7 @@ import type {
   FrozenConcreteConnectionV1,
   InputRevisionSetV1,
 } from "../types/agent-runtime-decision";
+import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 
 type FakeConnection = FrozenConcreteConnectionV1 & { presetId?: string | null };
 
@@ -40,8 +42,6 @@ const fullRevisions: InputRevisionSetV1 = {
   settings: 16,
   macro: 17,
   regex: 18,
-  context: 19,
-  acl: 20,
   cognition: 21,
   readiness: 22,
 };
@@ -59,6 +59,7 @@ function connection(id: string, overrides: Partial<FakeConnection> = {}): FakeCo
     candidateRevision: `candidate-${id}`,
     revision: `revision-${id}`,
     fingerprint: "domain-a",
+    capabilityDigest: "capability-placeholder",
     capabilities: {
       streaming: true,
       toolCalling: true,
@@ -107,7 +108,6 @@ function readiness(overrides: Partial<AgenticReadinessVectorV1> = {}): AgenticRe
     targetRevision: 1,
     inputRevisionDigest: "snapshot",
     cognitionRevision: 1,
-    contextAclRevision: 1,
     killSwitchState: "auto",
     ready: true,
     reasons: [],
@@ -124,7 +124,7 @@ function makeService(options: {
   presetReviewCode?: string | null;
   presetReviewAcknowledged?: boolean;
   resolveCouncilProfile?: RuntimeDecisionDependencies["resolveCouncilProfile"];
-  now?: () => number;
+  getReadinessVector?: RuntimeDecisionDependencies["getReadinessVector"];
 } = {}) {
   const chat = {
     id: CHAT_ID,
@@ -258,6 +258,33 @@ describe("AgentRuntimeDecisionService", () => {
     expect(profileCalls).toBe(0);
     expect(service).toBeDefined();
   });
+  test("rejects malformed-present runtime policies at decision admission", async () => {
+    const invalidPolicies: unknown[] = [null, 1, "invalid", []];
+    for (const runtimePolicy of invalidPolicies) {
+      const service = makeService({
+        preset: {
+          id: "preset-default",
+          name: "Default",
+          agent_config: {
+            version: 2,
+            agentsEnabled: true,
+            allowedModes: ["response", "agentic"],
+            defaultMode: "response",
+            maxInvocations: 8,
+            maxToolCalls: 8,
+            mainToolIds: [],
+            mainLoreScope: "active",
+            profiles: [],
+            connectionSlots: [],
+            runtimePolicy,
+          },
+        },
+      });
+      await expect(service.resolve(USER_ID, request())).rejects.toMatchObject({
+        code: "runtime_policy_invalid",
+      });
+    }
+  });
 
   test("issues an opaque token and rejects mismatch, replay, expiry, and revision races", async () => {
     let now = 1_000;
@@ -278,10 +305,43 @@ describe("AgentRuntimeDecisionService", () => {
     const stale = await service.consume(USER_ID, issuedAgain.runtimeDecisionToken!, request());
     expect(stale).toEqual({ accepted: false, code: "decision_refresh_required", decision: null });
 
+    connections.root = connection("root");
+    const issuedCapability = await service.resolve(USER_ID, request());
+    const admittedCapabilities = connections.root.capabilities;
+    connections.root = connection("root", {
+      capabilities: { ...admittedCapabilities, adapterRevision: "changed" },
+    });
+    const staleCapability = await service.consume(USER_ID, issuedCapability.runtimeDecisionToken!, request());
+    expect(staleCapability).toEqual({ accepted: false, code: "decision_refresh_required", decision: null });
+
+    connections.root = connection("root");
     const issuedExpired = await service.resolve(USER_ID, request());
     now = 61_001;
     const expired = await service.consume(USER_ID, issuedExpired.runtimeDecisionToken!, request());
     expect(expired.accepted).toBe(false);
+  });
+  test("consumes a token when readiness is absent from both requests", async () => {
+    const service = makeService();
+    const issueRequest = request();
+    delete issueRequest.readinessVector;
+    const issued = await service.resolve(USER_ID, issueRequest);
+    const consumeRequest = request();
+    delete consumeRequest.readinessVector;
+    const consumed = await service.consume(USER_ID, issued.runtimeDecisionToken!, consumeRequest);
+    expect(consumed.accepted).toBe(true);
+    expect(consumed.code).toBe("accepted");
+  });
+
+  test("uses canonical ordering for the runtime decision input digest", async () => {
+    const inputRevisions = { ...fullRevisions };
+    const expectedNormalized = Object.fromEntries(
+      Object.entries(inputRevisions).map(([key, value]) => [key, value]),
+    );
+    const expectedDigest = createHash("sha256")
+      .update(encodeCanonicalPlainData(expectedNormalized), "utf8")
+      .digest("hex");
+    const decision = await makeService().resolve(USER_ID, request({ inputRevisions }));
+    expect(decision.internal.binding.inputRevisionDigest).toBe(expectedDigest);
   });
   test("consumes an authenticated one-turn decision once", async () => {
     const service = makeService();
@@ -520,11 +580,12 @@ describe("AgentRuntimeDecisionService", () => {
       },
     });
 
-    const nextTurn = await service.resolve(USER_ID, request({
-      mode: undefined,
+    const nextTurnRequest = request({
       transientSelection: null,
       requestEpoch: 18,
-    }));
+    });
+    delete nextTurnRequest.mode;
+    const nextTurn = await service.resolve(USER_ID, nextTurnRequest);
     expect(nextTurn.runtimePolicy).toMatchObject({
       authoredValue: "response",
       effectiveValue: "response",
@@ -652,6 +713,39 @@ describe("effective runtime request DTO", () => {
     expect(() => normalizeEffectiveRuntimeRequest({ chatId: CHAT_ID, unexpected: true })).toThrow("request.unexpected is not allowed");
     expect(() => normalizeEffectiveRuntimeRequest({ chatId: CHAT_ID, target: { generationType: "normal", extra: true } })).toThrow("target.extra is not allowed");
     expect(() => normalizeEffectiveRuntimeRequest({ chatId: CHAT_ID, inputRevisions: { chat: {} } })).toThrow("inputRevisions.chat must be a revision");
+  });
+  test("rejects negative, unsafe, and malformed revision metadata", () => {
+    const invalidRequests: unknown[] = [
+      { chatId: CHAT_ID, requestEpoch: -1 },
+      { chatId: CHAT_ID, requestEpoch: Number.MAX_SAFE_INTEGER + 1 },
+      { chatId: CHAT_ID, requestEpoch: true },
+      { chatId: CHAT_ID, requestEpoch: "-1" },
+      { chatId: CHAT_ID, target: { generationType: "normal", revision: -1 } },
+      { chatId: CHAT_ID, inputRevisions: { chat: -1 } },
+      { chatId: CHAT_ID, inputRevisions: { chat: true } },
+      { chatId: CHAT_ID, readinessVector: { runtimeEpoch: -1 } },
+      { chatId: CHAT_ID, readinessVector: { runtimeEpoch: {} } },
+    ];
+    for (const invalid of invalidRequests) {
+      expect(() => normalizeEffectiveRuntimeRequest(invalid)).toThrow();
+    }
+  });
+  test("preserves absent optional fields when normalizing an already normalized request", () => {
+    const absent = normalizeEffectiveRuntimeRequest({ chatId: CHAT_ID, requestEpoch: 1 });
+    expect(Object.hasOwn(absent, "personaId")).toBe(false);
+    expect(Object.hasOwn(absent, "mode")).toBe(false);
+    expect(() => normalizeEffectiveRuntimeRequest(absent)).not.toThrow();
+
+    const oneTurn = normalizeEffectiveRuntimeRequest({
+      chatId: CHAT_ID,
+      transientSelection: {
+        mode: "agentic",
+        turnFence: 1,
+        authenticated: true,
+      },
+    });
+    expect(Object.hasOwn(oneTurn, "mode")).toBe(false);
+    expect(() => normalizeEffectiveRuntimeRequest(oneTurn)).not.toThrow();
   });
 
   test("accepts the documented aliases only when they agree and preserves a closed target", () => {

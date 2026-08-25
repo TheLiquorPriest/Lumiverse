@@ -20,6 +20,7 @@ import {
   Link2,
   ListChecks,
   Plus,
+  RefreshCw,
   Save,
   ShieldCheck,
   Trash2,
@@ -31,18 +32,21 @@ import ConnectionSelect from '@/components/shared/ConnectionSelect'
 import { Toggle } from '@/components/shared/Toggle'
 import { useStore } from '@/store'
 import { agenticRuntimeApi } from '@/api/agentic-runtime'
-import { agentContextPacksApi } from '@/api/agent-context-packs'
 import { ApiError } from '@/api/client'
 import { unmarshalPreset } from '@/lib/loom/service'
-import type { ContextPackAttachment } from '@/types/agent-context-packs'
 import { toast } from '@/lib/toast'
 import {
-  AGENTIC_CONTEXT_RULE_LIMIT,
   AGENTIC_CUSTOM_PHASE_LIMIT,
   AGENTIC_DESCRIPTION_MAX_BYTES,
   AGENTIC_LABEL_MAX_LENGTH,
   AGENTIC_LOOM_POLICY_BUCKET_LIMIT,
   AGENTIC_LOOM_POLICY_LIMIT,
+  AGENTIC_PREDICATE_MAX_DEPTH,
+  AGENTIC_PREDICATE_MAX_ID_BYTES,
+  AGENTIC_PREDICATE_MAX_LIST_BYTES,
+  AGENTIC_PREDICATE_MAX_LIST_ITEMS,
+  AGENTIC_PREDICATE_MAX_NODES,
+  AGENTIC_PREDICATE_MAX_STRING_BYTES,
   AGENTIC_TASK_TEMPLATE_LIMIT,
   AGENT_INVOCATION_MIN,
   AGENT_MAX_OUTPUT_TOKENS_MAX,
@@ -54,20 +58,18 @@ import {
   AGENT_TOOL_CALL_MIN,
   CORE_AGENT_TOOL_IDS,
   agentTimeoutMsToSeconds,
-  contextPackRevisionId,
   createAgentPromptBlock,
   createAgentProfileV2,
   createAgenticRuntimeDraft,
   createLoomPolicyEntryV1,
   parseAgentCustomPhasesV1,
+  parseAgentRuntimePolicyV1,
   parseLoomPolicyBucketsV1,
+  getAgenticRuntimeRepairItems,
+  getAgentConfigQuarantine,
   getAgentRuntimeCustomPhases,
   getAgentRuntimePolicyBuckets,
   getAgentResultName,
-  getAgenticRuntimeRepairItems,
-  isAgentContextActivationRule,
-  isAgentContextPackSelection,
-  isAgentContextPolicy,
   isAgentTaskTemplate,
   isCanonicalBlockRevision,
   normalizeAgentConfigForEditor,
@@ -87,9 +89,6 @@ import type {
   AgentCapability,
   AgentConfigRepairItem,
   AgentConfigV2,
-  AgentContextActivationRule,
-  AgentContextPackSelection,
-  AgentContextPolicyV1,
   AgentCustomPhaseCapability,
   AgentCustomPhaseV1,
   AgentMode,
@@ -106,9 +105,7 @@ import type {
   WorkspaceCapability,
 } from '@/lib/loom/types'
 import type {
-  LoomOnDemandRequestV1,
   LoomPolicyBucketsV1,
-  LoomPolicyDeliveryV1,
   LoomPolicyEntryV1,
   LoomPolicySourceV1,
 } from '@/types/agent-runtime'
@@ -154,56 +151,9 @@ const POLICY_CHECKPOINTS = {
 const WORKSPACE_TOOL_KEYS: Record<WorkspaceCapability, string> = {
   read_section: 'workspace_read_section',
   read_page: 'workspace_read_page',
-  create_task: 'workspace_create_task',
   update_assigned_progress: 'workspace_update_progress',
   submit_child_result: 'workspace_submit_result',
-  accept_submission: 'workspace_accept_submission',
-  record_finding: 'workspace_record_finding',
-  record_decision: 'workspace_record_decision',
   record_question: 'workspace_record_question',
-  attach_artifact: 'workspace_attach_artifact',
-  propose_publication: 'workspace_propose_publication',
-}
-type ContextPackOption = AgentContextPackSelection & {
-  ownerId?: string
-  selectionSource?: 'owned' | 'shared'
-  scopes: ContextPackAttachment['scope'][]
-  requiredScopes: ContextPackAttachment['scope'][]
-  attachmentStatus?: 'available' | 'unavailable'
-}
-
-const CONTEXT_PACK_SCOPES = ['preset', 'chat', 'world_book'] as const
-type ContextPackScope = (typeof CONTEXT_PACK_SCOPES)[number]
-function isContextPackScope(value: unknown): value is ContextPackScope {
-  return typeof value === 'string' && CONTEXT_PACK_SCOPES.includes(value as ContextPackScope)
-}
-function contextScopeLabel(
-  scopes: readonly unknown[] | undefined,
-  translate: (key: string) => string,
-): string {
-  if (!Array.isArray(scopes)) return translate('context.scopeUnavailable')
-  const knownScopes = scopes.filter(isContextPackScope)
-  return knownScopes.length > 0
-    ? knownScopes.map((scope) => translate(`context.scopes.${scope}`)).join(', ')
-    : translate('context.scopeUnavailable')
-}
-
-function contextAttachmentLabel(
-  option: ContextPackOption | undefined,
-  translate: (key: string) => string,
-): string {
-  if (option?.selectionSource) {
-    return translate(`context.sources.${option.selectionSource}`)
-  }
-  if (!option || option.attachmentStatus === 'unavailable' || !Array.isArray(option.requiredScopes)) {
-    return translate('context.attachmentUnavailable')
-  }
-  if (option.requiredScopes.some((scope) => !isContextPackScope(scope))) {
-    return translate('context.attachmentUnavailable')
-  }
-  return option.requiredScopes.length > 0
-    ? translate('context.attachmentRequired')
-    : translate('context.attachmentOptional')
 }
 
 const SECTION_ICONS: Record<SectionId, typeof Gauge> = {
@@ -227,11 +177,69 @@ const PREDICATE_KINDS: readonly CognitionPredicate['kind'][] = [
   'tool_available',
   'task_transition',
 ]
+
+const PREDICATE_ID_ENCODER = new TextEncoder()
+
+function isEditablePredicateId(value: string): boolean {
+  if (value.length === 0
+    || value.includes('{{')
+    || value.includes('}}')
+    || PREDICATE_ID_ENCODER.encode(value).byteLength > AGENTIC_PREDICATE_MAX_ID_BYTES) {
+    return false
+  }
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0
+    if (codePoint <= 0x20 || codePoint === 0x7f) return false
+  }
+  return true
+}
+
+function isEditablePredicateText(value: string): boolean {
+  if (value.includes('{{')
+    || value.includes('}}')
+    || PREDICATE_ID_ENCODER.encode(value).byteLength > AGENTIC_PREDICATE_MAX_STRING_BYTES) {
+    return false
+  }
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0
+    if (codePoint === 0 || codePoint < 0x20 && codePoint !== 0x09 && codePoint !== 0x0a && codePoint !== 0x0d) {
+      return false
+    }
+  }
+  return true
+}
+
+function isEditablePredicateValue(value: CognitionValue): boolean {
+  if (typeof value === 'string') return isEditablePredicateText(value)
+  if (!Array.isArray(value)) return true
+  if (value.length > AGENTIC_PREDICATE_MAX_LIST_ITEMS) return false
+  let totalBytes = 0
+  for (const entry of value) {
+    if (!isEditablePredicateText(entry)) return false
+    totalBytes += PREDICATE_ID_ENCODER.encode(entry).byteLength
+  }
+  return totalBytes <= AGENTIC_PREDICATE_MAX_LIST_BYTES
+}
+
+
 interface AgenticRuntimePanelProps {
   preset: LoomPreset
-  onSave: (draft: AgenticRuntimeSaveDraft, promptOrder: PromptBlock[], expectedPresetRevision?: number) => Promise<SaveAgenticRuntimeEditorResult>
+  onSave: (
+    draft: AgenticRuntimeSaveDraft,
+    promptOrder: PromptBlock[],
+    expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
+  ) => Promise<SaveAgenticRuntimeEditorResult>
+  onReload: () => Promise<unknown>
   onDirtyChange: (dirty: boolean) => void
 }
+type PanelRepairItem = Omit<AgentConfigRepairItem, 'kind' | 'action'> & {
+  kind: AgentConfigRepairItem['kind'] | 'invalid_rule'
+  action: AgentConfigRepairItem['action'] | {
+    kind: 'select_revision' | 'discard'
+    ref?: string
+  }
+}
+
 
 function makePredicate(kind: CognitionPredicate['kind']): CognitionPredicate {
   switch (kind) {
@@ -268,8 +276,7 @@ function removeTaskTransitionReference(
     const children = value.children
       .map((child) => removeTaskTransitionReference(child, removedTaskId))
       .filter((child): child is CognitionPredicate => child !== null)
-    if (children.length === 0) return null
-    return children.length === 1 ? children[0] : { ...value, children }
+    return { ...value, children }
   }
   if (value.kind === 'not') {
     const child = removeTaskTransitionReference(value.child, removedTaskId)
@@ -277,6 +284,100 @@ function removeTaskTransitionReference(
   }
   return value
 }
+type RawTaskTransitionRepair = {
+  value: unknown
+  changed: boolean
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function removeRawTaskTransitionReference(
+  value: unknown,
+  removedTaskId: string,
+): RawTaskTransitionRepair {
+  if (!isObjectRecord(value)) return { value, changed: false }
+  if (value.kind === 'task_transition') {
+    return value.taskId === removedTaskId
+      ? { value: null, changed: true }
+      : { value, changed: false }
+  }
+  if (value.kind === 'all' || value.kind === 'any') {
+    if (!Array.isArray(value.children)) return { value, changed: false }
+    let changed = false
+    const children: unknown[] = []
+    for (const child of value.children) {
+      const repaired = removeRawTaskTransitionReference(child, removedTaskId)
+      changed ||= repaired.changed
+      if (repaired.value !== null || !repaired.changed) children.push(repaired.value)
+    }
+    return changed
+      ? { value: { ...value, children }, changed: true }
+      : { value, changed: false }
+  }
+  if (value.kind === 'not') {
+    const repaired = removeRawTaskTransitionReference(value.child, removedTaskId)
+    if (!repaired.changed) return { value, changed: false }
+    return repaired.value === null
+      ? { value: null, changed: true }
+      : { value: { ...value, child: repaired.value }, changed: true }
+  }
+  return { value, changed: false }
+}
+
+function repairMalformedRuntimePolicyTaskReferences(
+  rawRuntimePolicy: NonNullable<AgentConfigV2['runtimePolicy']>,
+  removedTaskId: string,
+): NonNullable<AgentConfigV2['runtimePolicy']> {
+  const repaired = structuredClone(rawRuntimePolicy)
+  if (!isObjectRecord(repaired)) return repaired
+  const repairedRecord = repaired
+  const pruneRequired = (value: unknown): unknown => {
+    const repairedPredicate = removeRawTaskTransitionReference(value, removedTaskId)
+    return repairedPredicate.changed && repairedPredicate.value === null
+      ? { kind: 'all', children: [] }
+      : repairedPredicate.value
+  }
+  const phasesKey: string = 'phases'
+  const rawPhases = repairedRecord[phasesKey]
+  if (Array.isArray(rawPhases)) {
+    repairedRecord[phasesKey] = rawPhases.map((phase) => {
+      if (!isObjectRecord(phase)) return phase
+      const nextPhase = { ...phase }
+      if (Object.hasOwn(phase, 'enter')) nextPhase.enter = pruneRequired(phase.enter)
+      if (Object.hasOwn(phase, 'exit')) nextPhase.exit = pruneRequired(phase.exit)
+      if (Object.hasOwn(phase, 'skip')) {
+        const skip = removeRawTaskTransitionReference(phase.skip, removedTaskId)
+        if (skip.changed && skip.value === null) delete nextPhase.skip
+        else nextPhase.skip = skip.value
+      }
+      return nextPhase
+    })
+  }
+  const loomPolicyKey: string = 'loomPolicy'
+  const rawLoomPolicy = repairedRecord[loomPolicyKey]
+  if (isObjectRecord(rawLoomPolicy)) {
+    const nextLoomPolicy = { ...rawLoomPolicy }
+    for (const bucket of POLICY_KEYS) {
+      if (!Object.hasOwn(rawLoomPolicy, bucket)) continue
+      const rawBucket = rawLoomPolicy[bucket]
+      if (!Array.isArray(rawBucket)) continue
+      nextLoomPolicy[bucket] = rawBucket.map((entry) => {
+        if (!isObjectRecord(entry) || !Object.hasOwn(entry, 'condition')) return entry
+        const condition = removeRawTaskTransitionReference(entry.condition, removedTaskId)
+        if (!condition.changed) return entry
+        const nextEntry = { ...entry }
+        if (condition.value === null) delete nextEntry.condition
+        else nextEntry.condition = condition.value
+        return nextEntry
+      })
+    }
+    repairedRecord[loomPolicyKey] = nextLoomPolicy
+  }
+  return repaired
+}
+
 
 function repairTaskTransitionReferencesAfterRemoval<T extends { activation?: CognitionPredicate }>(
   value: T,
@@ -288,6 +389,64 @@ function repairTaskTransitionReferencesAfterRemoval<T extends { activation?: Cog
   const repaired = { ...value }
   delete repaired.activation
   return repaired
+}
+
+function repairRuntimePolicyTaskReferencesAfterRemoval(
+  config: AgentConfigV2,
+  removedTaskId: string,
+): AgentConfigV2 {
+  const rawRuntimePolicy = config.runtimePolicy
+  if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
+    return config
+  }
+  try {
+    const runtimePolicy = parseAgentRuntimePolicyV1(rawRuntimePolicy)
+    const phases = runtimePolicy.phases.map((phase) => {
+      const enter = removeTaskTransitionReference(phase.enter, removedTaskId)
+        ?? ({ kind: 'all', children: [] } as CognitionPredicate)
+      const exit = removeTaskTransitionReference(phase.exit, removedTaskId)
+        ?? ({ kind: 'all', children: [] } as CognitionPredicate)
+      const skip = phase.skip === undefined
+        ? {}
+        : (() => {
+            const next = removeTaskTransitionReference(phase.skip, removedTaskId)
+            return next ? { skip: next } : {}
+          })()
+      return { ...phase, enter, exit, ...skip }
+    })
+    const loomPolicy = runtimePolicy.loomPolicy === null
+      ? null
+      : {
+          version: 1,
+          ...runtimePolicy.loomPolicy,
+          ...Object.fromEntries(POLICY_KEYS.map((bucket) => [
+            bucket,
+            runtimePolicy.loomPolicy?.[bucket].map((entry) => {
+              if (entry.condition === undefined) return entry
+              const condition = removeTaskTransitionReference(entry.condition, removedTaskId)
+              if (condition) return { ...entry, condition }
+              const { condition: _condition, ...withoutCondition } = entry
+              return withoutCondition
+            }),
+          ])),
+        } as LoomPolicyBucketsV1
+    return {
+      ...config,
+      runtimePolicy: {
+        ...runtimePolicy,
+        phases,
+        loomPolicy,
+      },
+    }
+  } catch {
+    return {
+      ...config,
+      runtimePolicy: repairMalformedRuntimePolicyTaskReferences(
+        rawRuntimePolicy,
+        removedTaskId,
+      ),
+    }
+  }
 }
 
 function rewriteRuntimePolicyTaskReferences(
@@ -313,19 +472,16 @@ function rewriteRuntimePolicyTaskReferences(
       ? null
       : parseLoomPolicyBucketsV1(runtimePolicy.loomPolicy)
     const rewriteBucket = (bucket: PolicyKey): LoomPolicyEntryV1[] => (
-      (loomPolicy?.[bucket] ?? []).map((entry) => entry.delivery.delivery === 'condition_gated'
-        ? {
+      (loomPolicy?.[bucket] ?? []).map((entry) => entry.condition === undefined
+        ? entry
+        : {
             ...entry,
-            delivery: {
-              ...entry.delivery,
-              condition: rewriteTaskTransitionReferences(
-                entry.delivery.condition,
-                previousId,
-                nextId,
-              ) as CognitionPredicate,
-            },
-          }
-        : entry)
+            condition: rewriteTaskTransitionReferences(
+              entry.condition,
+              previousId,
+              nextId,
+            ) as CognitionPredicate,
+          })
     )
     return {
       ...config,
@@ -347,6 +503,40 @@ function rewriteRuntimePolicyTaskReferences(
     return config
   }
 }
+function updateRuntimePolicyChildProfileAssignments(
+  config: AgentConfigV2,
+  previousProfileId: string,
+  nextProfileId: string | null,
+): AgentConfigV2 {
+  const rawRuntimePolicy = (config as unknown as Record<string, unknown>).runtimePolicy
+  if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
+    return config
+  }
+  try {
+    const runtimePolicy = parseAgentRuntimePolicyV1(rawRuntimePolicy)
+    const phases = runtimePolicy.phases.map((phase) => ({
+      ...phase,
+      childInstructionSubsets: nextProfileId === null
+        ? phase.childInstructionSubsets.filter((subset) => subset.profileId !== previousProfileId)
+        : phase.childInstructionSubsets.map((subset) => (
+            subset.profileId === previousProfileId
+              ? { ...subset, profileId: nextProfileId }
+              : subset
+          )),
+    }))
+    return {
+      ...config,
+      runtimePolicy: {
+        ...runtimePolicy,
+        phases,
+      },
+    }
+  } catch {
+    // Preserve malformed imported policy for the existing repair surface.
+    return config
+  }
+}
+
 
 
 type PredicateScalarType = 'string' | 'number' | 'boolean'
@@ -356,10 +546,12 @@ function PredicateValueEditor({
   value,
   onChange,
   allowStringList = false,
+  disabled = false,
 }: {
   value: CognitionValue
   onChange: (value: CognitionValue) => void
   allowStringList?: boolean
+  disabled?: boolean
 }) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agenticRuntime' })
   const valueType: PredicateValueType = Array.isArray(value)
@@ -372,6 +564,7 @@ function PredicateValueEditor({
         <select
           className={styles.select}
           value={valueType}
+          disabled={disabled}
           aria-label={t('predicate.valueType')}
           onChange={(event) => {
             const type = event.target.value as PredicateValueType
@@ -396,6 +589,7 @@ function PredicateValueEditor({
           <select
             className={styles.select}
             value={value === true ? 'true' : 'false'}
+            disabled={disabled}
             aria-label={t('predicate.value')}
             onChange={(event) => onChange(event.target.value === 'true')}
           >
@@ -408,6 +602,7 @@ function PredicateValueEditor({
             type="number"
             step="any"
             value={value as number}
+            disabled={disabled}
             aria-label={t('predicate.value')}
             onChange={(event) => {
               const next = event.target.valueAsNumber
@@ -418,10 +613,14 @@ function PredicateValueEditor({
           <input
             className={styles.input}
             value={Array.isArray(value) ? value.join(', ') : value as string}
+            disabled={disabled}
             aria-label={t('predicate.value')}
-            onChange={(event) => onChange(Array.isArray(value)
-              ? event.target.value.split(',').map((entry) => entry.trim())
-              : event.target.value)}
+            onChange={(event) => {
+              const next = Array.isArray(value)
+                ? event.target.value.split(',').map((entry) => entry.trim())
+                : event.target.value
+              if (isEditablePredicateValue(next)) onChange(next)
+            }}
           />
         )}
       </label>
@@ -432,27 +631,35 @@ function PredicateValueEditor({
 function PredicateScalarListEditor({
   values,
   onChange,
+  disabled = false,
 }: {
   values: CognitionScalar[]
   onChange: (values: CognitionScalar[]) => void
+  disabled?: boolean
 }) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agenticRuntime' })
   return (
-    <fieldset className={styles.predicateValueList}>
+    <fieldset className={styles.predicateValueList} disabled={disabled}>
       <legend className={styles.fieldLabel}>{t('predicate.values')}</legend>
       {values.map((entry, index) => (
         <div className={styles.predicateValueRow} key={index}>
           <PredicateValueEditor
             value={entry}
+            disabled={disabled}
             onChange={(next) => {
-              if (Array.isArray(next)) return
+              if (Array.isArray(next)
+                || values.some((candidate, candidateIndex) => (
+                  candidateIndex !== index
+                  && typeof candidate === typeof next
+                  && candidate === next
+                ))) return
               onChange(values.map((candidate, candidateIndex) => candidateIndex === index ? next : candidate))
             }}
           />
           <button
             type="button"
             className={styles.iconButton}
-            disabled={values.length === 1}
+            disabled={disabled || values.length === 1}
             onClick={() => onChange(values.filter((_candidate, candidateIndex) => candidateIndex !== index))}
             aria-label={t('predicate.removeValue', { number: index + 1 })}
           >
@@ -460,7 +667,20 @@ function PredicateScalarListEditor({
           </button>
         </div>
       ))}
-      <button type="button" className={styles.button} onClick={() => onChange([...values, ''])}>
+      <button
+        type="button"
+        className={styles.button}
+        disabled={disabled || values.length >= AGENTIC_PREDICATE_MAX_LIST_ITEMS}
+        onClick={() => {
+          let suffix = values.length + 1
+          let candidate = `value_${suffix}`
+          while (values.some((value) => value === candidate)) {
+            suffix += 1
+            candidate = `value_${suffix}`
+          }
+          onChange([...values, candidate])
+        }}
+      >
         <Plus size={16} aria-hidden="true" />
         {t('predicate.addValue')}
       </button>
@@ -479,14 +699,20 @@ function PredicateEditor({
   onChange,
   taskTemplateIds,
   depth = 0,
+  disabled = false,
 }: {
   value: CognitionPredicate
   onChange: (value: CognitionPredicate) => void
   taskTemplateIds: readonly string[]
   depth?: number
+  disabled?: boolean
 }) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agenticRuntime' })
-  const updateKind = (kind: CognitionPredicate['kind']) => onChange(makePredicate(kind))
+  const updateKind = (kind: CognitionPredicate['kind']) => {
+    if (depth >= AGENTIC_PREDICATE_MAX_DEPTH - 1
+      && (kind === 'all' || kind === 'any' || kind === 'not')) return
+    onChange(makePredicate(kind))
+  }
   return (
     <div className={clsx(styles.predicate, depth > 0 && styles.predicateNested)}>
       <label className={styles.field}>
@@ -494,6 +720,7 @@ function PredicateEditor({
         <select
           className={styles.select}
           value={value.kind}
+          disabled={disabled}
           onChange={(event) => updateKind(event.target.value as CognitionPredicate['kind'])}
         >
           {PREDICATE_KINDS.map((kind) => (
@@ -509,6 +736,7 @@ function PredicateEditor({
                 value={predicate}
                 taskTemplateIds={taskTemplateIds}
                 depth={depth + 1}
+                disabled={disabled}
                 onChange={(next) => onChange({
                   ...value,
                   children: value.children.map((candidate, candidateIndex) => (
@@ -519,7 +747,7 @@ function PredicateEditor({
               <button
                 type="button"
                 className={styles.iconButton}
-                disabled={value.children.length === 1}
+                disabled={disabled || value.children.length === 1}
                 onClick={() => onChange({
                   ...value,
                   children: value.children.filter((_candidate, candidateIndex) => candidateIndex !== index),
@@ -533,6 +761,7 @@ function PredicateEditor({
           <button
             type="button"
             className={styles.button}
+            disabled={disabled || value.children.length >= AGENTIC_PREDICATE_MAX_NODES - 1}
             onClick={() => onChange({
               ...value,
               children: [...value.children, { kind: 'phase', value: 'WORK' }],
@@ -548,6 +777,7 @@ function PredicateEditor({
           value={value.child}
           taskTemplateIds={taskTemplateIds}
           depth={depth + 1}
+          disabled={disabled}
           onChange={(child) => onChange({ ...value, child })}
         />
       )}
@@ -555,8 +785,8 @@ function PredicateEditor({
         <select
           className={styles.select}
           value={value.value}
+          disabled={disabled}
           aria-label={t('predicate.generationType')}
-          onChange={(event) => onChange({ ...value, value: event.target.value as typeof value.value })}
         >
           {(['normal', 'continue', 'regenerate', 'swipe'] as const).map((generationType) => (
             <option key={generationType} value={generationType}>{t(`generationTypes.${generationType}`)}</option>
@@ -567,8 +797,8 @@ function PredicateEditor({
         <select
           className={styles.select}
           value={value.value}
+          disabled={disabled}
           aria-label={t('predicate.phase')}
-          onChange={(event) => onChange({ ...value, value: event.target.value as typeof value.value })}
         >
           {(['ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING', 'COMMITTED',
             'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT'] as const).map((phase) => (
@@ -585,7 +815,13 @@ function PredicateEditor({
             <input
               className={styles.input}
               value={value.name}
-              onChange={(event) => onChange({ ...value, name: event.target.value })}
+              maxLength={AGENTIC_PREDICATE_MAX_ID_BYTES}
+              disabled={disabled}
+              onChange={(event) => {
+                if (isEditablePredicateId(event.target.value)) {
+                  onChange({ ...value, name: event.target.value })
+                }
+              }}
               aria-label={value.kind === 'preset_variable' ? t('predicate.variableKey') : t('predicate.factKey')}
             />
           </label>
@@ -594,17 +830,23 @@ function PredicateEditor({
             <select
               className={styles.select}
               value={value.operator}
+              disabled={disabled}
               aria-label={t('predicate.operator')}
               onChange={(event) => {
                 const operator = event.target.value as typeof value.operator
                 if (operator === 'present') {
                   onChange({ kind: value.kind, name: value.name, operator })
                 } else if (operator === 'in') {
-                  const values: CognitionScalar[] = 'values' in value && value.values.length > 0
+                  const candidates: CognitionScalar[] = 'values' in value && value.values.length > 0
                     ? [...value.values]
                     : 'value' in value
                       ? isCognitionScalar(value.value) ? [value.value] : value.value
                       : ['']
+                  const values = candidates.filter((candidate, candidateIndex) => (
+                    candidates.findIndex((entry) => (
+                      typeof entry === typeof candidate && entry === candidate
+                    )) === candidateIndex
+                  ))
                   onChange({ kind: value.kind, name: value.name, operator, values })
                 } else {
                   const candidateValue: CognitionValue = 'value' in value
@@ -635,12 +877,14 @@ function PredicateEditor({
           {value.operator === 'in' ? (
             <PredicateScalarListEditor
               values={value.values}
+              disabled={disabled}
               onChange={(values) => onChange({ ...value, values })}
             />
           ) : value.operator !== 'present' ? (
             <PredicateValueEditor
               value={value.value}
               allowStringList={value.operator === 'equals'}
+              disabled={disabled}
               onChange={(next) => {
                 if (value.operator === 'includes' && Array.isArray(next)) return
                 onChange({ ...value, value: next } as CognitionPredicate)
@@ -654,13 +898,14 @@ function PredicateEditor({
           <select
             className={styles.select}
             value={value.toolId}
+            disabled={disabled}
             aria-label={t('predicate.tool')}
             onChange={(event) => onChange({ ...value, toolId: event.target.value })}
           >
             {CORE_AGENT_TOOL_IDS.map((toolId) => <option key={toolId} value={toolId}>{toolId}</option>)}
           </select>
           <label className={styles.inlineCheckbox}>
-            <input type="checkbox" checked={value.available} onChange={(event) => onChange({ ...value, available: event.target.checked })} />
+            <input type="checkbox" checked={value.available} disabled={disabled} onChange={(event) => onChange({ ...value, available: event.target.checked })} />
             {t('predicate.available')}
           </label>
         </div>
@@ -670,8 +915,11 @@ function PredicateEditor({
           <select
             className={styles.select}
             value={value.taskId}
+            disabled={disabled}
             aria-label={t('predicate.task')}
-            onChange={(event) => onChange({ ...value, taskId: event.target.value })}
+            onChange={(event) => {
+              if (event.target.value) onChange({ ...value, taskId: event.target.value })
+            }}
           >
             <option value="">{t('predicate.chooseTask')}</option>
             {taskTemplateIds.map((templateId) => (
@@ -681,8 +929,8 @@ function PredicateEditor({
           <select
             className={styles.select}
             value={value.transition}
+            disabled={disabled}
             aria-label={t('predicate.transition')}
-            onChange={(event) => onChange({ ...value, transition: event.target.value as typeof value.transition })}
           >
             {(['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed'] as const).map((transition) => (
               <option key={transition} value={transition}>{t(`predicate.transitions.${transition}`)}</option>
@@ -698,14 +946,16 @@ function ToolChecklist({
   selected,
   onChange,
   legend,
+  disabled = false,
 }: {
   selected: readonly CoreAgentToolId[]
   onChange: (toolIds: CoreAgentToolId[]) => void
   legend: string
+  disabled?: boolean
 }) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agentsTools' })
   return (
-    <fieldset className={styles.fieldset}>
+    <fieldset className={styles.fieldset} disabled={disabled}>
       <legend className={styles.fieldLabel}>{legend}</legend>
       <div className={styles.toolGrid}>
         {CORE_AGENT_TOOL_IDS.map((toolId) => {
@@ -715,6 +965,7 @@ function ToolChecklist({
               <input
                 type="checkbox"
                 checked={checked}
+                disabled={disabled}
                 onChange={() => onChange(checked
                   ? selected.filter((selectedId) => selectedId !== toolId)
                   : [...selected, toolId])}
@@ -736,15 +987,17 @@ function WorkspaceCapabilityChecklist({
   onChange,
   legend,
   hint,
+  disabled = false,
 }: {
   selected: readonly WorkspaceCapability[]
   onChange: (capabilities: WorkspaceCapability[]) => void
   legend: string
   hint: string
+  disabled?: boolean
 }) {
   const { t: chatT } = useTranslation('chat')
   return (
-    <fieldset className={styles.fieldset}>
+    <fieldset className={styles.fieldset} disabled={disabled}>
       <legend className={styles.fieldLabel}>{legend}</legend>
       <p className={styles.muted}>{hint}</p>
       <div className={styles.toolGrid}>
@@ -755,9 +1008,13 @@ function WorkspaceCapabilityChecklist({
               <input
                 type="checkbox"
                 checked={checked}
-                onChange={() => onChange(checked
-                  ? selected.filter((selectedCapability) => selectedCapability !== capability)
-                  : [...selected, capability])}
+                disabled={disabled}
+                onChange={() => {
+                  const next = new Set(selected)
+                  if (checked) next.delete(capability)
+                  else next.add(capability)
+                  onChange(WORKSPACE_CAPABILITIES.filter((candidate) => next.has(candidate)))
+                }}
               />
               <span><strong>{chatT(`agentRun.tools.${WORKSPACE_TOOL_KEYS[capability]}`)}</strong></span>
             </label>
@@ -783,7 +1040,7 @@ function RepairRow({
   onAcknowledge,
   onRepair,
 }: {
-  item: AgentConfigRepairItem
+  item: PanelRepairItem
   acknowledged: boolean
   onAcknowledge: (checked: boolean) => void
   onRepair?: () => void
@@ -810,44 +1067,16 @@ function RepairRow({
       ) : item.action.kind !== 'acknowledge' && item.kind !== 'disabled_import' ? (
         <span className={styles.actionBadge}>{actionLabel}</span>
       ) : null}
-      {!hasRepairAction && (
-        <label className={styles.acknowledge}>
-          <input
-            type="checkbox"
-            checked={acknowledged}
-            onChange={(event) => onAcknowledge(event.target.checked)}
-          />
-          {t('repair.acknowledge')}
-        </label>
-      )}
+      <label className={styles.acknowledge}>
+        <input
+          type="checkbox"
+          checked={acknowledged}
+          onChange={(event) => onAcknowledge(event.target.checked)}
+        />
+        {t('repair.acknowledge')}
+      </label>
     </li>
   )
-}
-function contextReferenceIds(
-  contextPackSelections: readonly AgentContextPackSelection[],
-  contextRules: readonly AgentContextActivationRule[],
-  policy?: AgentContextPolicyV1 | null,
-): { ruleIds: string[]; packIds: string[] } {
-  const validSelections = contextPackSelections.filter((selection) => isAgentContextPackSelection(selection))
-  const validRules = contextRules.filter((rule) => isAgentContextActivationRule(rule))
-  const selectedPackIds = new Set(validSelections.map((selection) => selection.packId))
-  const directPackIds: string[] = policy && isAgentContextPolicy(policy)
-    ? policy.packIds.filter((packId) => selectedPackIds.has(packId))
-    : []
-  return {
-    ruleIds: validRules.map((rule) => rule.id),
-    packIds: [...new Set(directPackIds)],
-  }
-}
-
-function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) return false
-  const leftSet = new Set(left)
-  const rightSet = new Set(right)
-  return leftSet.size === left.length
-    && rightSet.size === right.length
-    && left.length === right.length
-    && [...leftSet].every((value) => rightSet.has(value))
 }
 
 function providerSupportsAgentCapability(
@@ -885,45 +1114,6 @@ function providerSupportsAgentCapabilities(
   return requiredCapabilities.every((capability) => providerSupportsAgentCapability(provider, capability))
 }
 
-function isContextPolicySynchronized(current: AgenticRuntimeSaveDraft): boolean {
-  const policy = current.config.contextPolicy
-  if (!isAgentContextPolicy(policy)) return false
-  const expected = contextReferenceIds(current.contextPackSelections, current.contextRules, policy)
-  return sameStringSet(policy.ruleIds, expected.ruleIds)
-    && sameStringSet(policy.packIds, expected.packIds)
-}
-
-function rebuildContextReferences(
-  current: AgenticRuntimeSaveDraft,
-  contextPackSelections: AgentContextPackSelection[],
-  contextRules: AgentContextActivationRule[],
-): AgenticRuntimeSaveDraft {
-  const { ruleIds, packIds } = contextReferenceIds(
-    contextPackSelections,
-    contextRules,
-    current.config.contextPolicy,
-  )
-  return {
-    ...current,
-    contextPackSelections,
-    contextRules,
-    config: {
-      ...current.config,
-      contextPolicy: { ruleIds, packIds },
-    },
-  }
-}
-
-function syncContextReferences(
-  current: AgenticRuntimeSaveDraft,
-  contextPackSelections: AgentContextPackSelection[],
-  contextRules: AgentContextActivationRule[],
-): AgenticRuntimeSaveDraft {
-  if (!isContextPolicySynchronized(current)) {
-    return { ...current, contextPackSelections, contextRules }
-  }
-  return rebuildContextReferences(current, contextPackSelections, contextRules)
-}
 
 function reviewSlotId(item: AgentConfigRepairItem): string | null {
   const prefix = item.kind === 'unresolved_slot'
@@ -933,36 +1123,82 @@ function reviewSlotId(item: AgentConfigRepairItem): string | null {
       : null
   return prefix && item.id.startsWith(prefix) ? item.id.slice(prefix.length) : null
 }
+function revisePromptBlockContent(block: PromptBlock, content: string): PromptBlock {
+  if (content === block.content) return block
+  const currentRevision = block.revision ?? 1
+  if (!isCanonicalBlockRevision(currentRevision)
+    || currentRevision === Number.MAX_SAFE_INTEGER) {
+    return block
+  }
+  return { ...block, content, revision: currentRevision + 1 }
+}
+
 function hydrateDraftFromEditor(
   current: AgenticRuntimeSaveDraft,
   editor: AgenticRuntimeEditorProjection,
+  sourceBlocks: readonly PromptBlock[],
 ): AgenticRuntimeSaveDraft {
-  const rawConfig = editor.config && typeof editor.config === 'object' && !Array.isArray(editor.config)
+  const hasConfigProjection = editor.config !== null
+    && typeof editor.config === 'object'
+    && !Array.isArray(editor.config)
+  const rawConfig = hasConfigProjection
     ? structuredClone(editor.config) as AgenticRuntimeSaveDraft['config']
     : current.config
   const slotBindings = editor.slotBindings && typeof editor.slotBindings === 'object' && !Array.isArray(editor.slotBindings)
     ? { ...editor.slotBindings }
     : current.slotBindings
+  const quarantine = getAgentConfigQuarantine(rawConfig)
   return {
-    config: normalizeAgentConfigForEditor(rawConfig),
+    config: normalizeAgentConfigForEditor(rawConfig, sourceBlocks),
     slotBindings,
-    contextPackSelections: editor.contextPackSelections === undefined
-      ? current.contextPackSelections
-      : structuredClone(editor.contextPackSelections as unknown as AgenticRuntimeSaveDraft['contextPackSelections']),
-    contextRules: editor.contextRules === undefined
-      ? current.contextRules
-      : structuredClone(editor.contextRules as unknown as AgenticRuntimeSaveDraft['contextRules']),
     taskTemplates: editor.taskTemplates === undefined
       ? current.taskTemplates
       : structuredClone(editor.taskTemplates as unknown as AgenticRuntimeSaveDraft['taskTemplates']),
     reviewAcknowledgements: Array.isArray(editor.reviewAcknowledgements)
       ? [...editor.reviewAcknowledgements]
       : current.reviewAcknowledgements,
+    quarantinedProfiles: hasConfigProjection ? quarantine.profiles : current.quarantinedProfiles,
+    quarantinedConnectionSlots: hasConfigProjection
+      ? quarantine.connectionSlots
+      : current.quarantinedConnectionSlots,
   }
+}
+type EditorIdentity = {
+  presetId: string
+  presetRevision: number
+  configRevision: number
+}
+
+function editorIdentityMatchesParent(
+  identity: EditorIdentity | null,
+  presetId: string,
+  presetRevision: number,
+  configRevision: number,
+): boolean {
+  return identity !== null
+    && identity.presetId === presetId
+    && identity.presetRevision === presetRevision
+    && identity.configRevision === configRevision
+}
+
+function editorIdentityConverged(
+  identity: EditorIdentity | null,
+  presetId: string,
+  presetRevision: number,
+  configRevision: number,
+  returned: EditorIdentity | null,
+): boolean {
+  if (editorIdentityMatchesParent(identity, presetId, presetRevision, configRevision)) return true
+  if (!identity || !returned) return false
+  if (identity.presetId !== returned.presetId
+    || identity.presetRevision !== returned.presetRevision
+    || identity.configRevision !== returned.configRevision
+    || returned.presetId !== presetId) return false
+  return presetRevision <= returned.presetRevision && configRevision <= returned.configRevision
 }
 
 
-export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: AgenticRuntimePanelProps) {
+export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyChange }: AgenticRuntimePanelProps) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agenticRuntime' })
   const { t: agentsT } = useTranslation('panels', { keyPrefix: 'loomBuilder.agentsTools' })
   const providers = useStore((state) => state.providers)
@@ -976,18 +1212,26 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const saveInFlightRef = useRef(false)
   const committedDraftRef = useRef<AgenticRuntimeSaveDraft>(structuredClone(initialDraft))
   const committedPromptOrderRef = useRef<PromptBlock[]>(structuredClone(preset.blocks))
+  const observedPresetIdRef = useRef(preset.id)
+
   const observedPresetRevisionRef = useRef(preset.cacheRevision ?? 0)
   const observedConfigRevisionRef = useRef(preset.agentConfigRevision ?? 0)
+  const hydratedIdentityRef = useRef<EditorIdentity | null>(null)
+  const lastReturnedIdentityRef = useRef<EditorIdentity | null>(null)
+  const isHydratedRef = useRef(false)
   const pendingExternalDraftRef = useRef<AgenticRuntimeSaveDraft | null>(null)
   const pendingExternalPromptOrderRef = useRef<PromptBlock[] | null>(null)
   const [isHydrated, setIsHydrated] = useState(false)
-  const [contextAvailabilityLoaded, setContextAvailabilityLoaded] = useState(false)
+  isHydratedRef.current = isHydrated
+  const [editorLoadAttempt, setEditorLoadAttempt] = useState(0)
+  const [editorLoadError, setEditorLoadError] = useState(false)
   const [activeSection, setActiveSection] = useState<SectionId>('activation')
   const [repairedSlotIds, setRepairedSlotIds] = useState<Set<string>>(() => new Set())
   const [selectedProfileIndex, setSelectedProfileIndex] = useState(0)
   const [hostCeilings, setHostCeilings] = useState<AgenticRuntimeHostCeilings | null>(null)
-  const [availableContextPacks, setAvailableContextPacks] = useState<ContextPackOption[]>([])
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'conflict' | 'error'>('idle')
+  const [conflictRecoveryState, setConflictRecoveryState] = useState<'idle' | 'loading' | 'error'>('idle')
+  const [loomRevisionRestagePending, setLoomRevisionRestagePending] = useState(false)
   const [maxInvocationsInput, setMaxInvocationsInput] = useState(String(initialDraft.config.maxInvocations))
   const [maxToolCallsInput, setMaxToolCallsInput] = useState(String(initialDraft.config.maxToolCalls))
   const tabRefs = useRef(new Map<SectionId, HTMLButtonElement>())
@@ -997,7 +1241,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const [savedFingerprint, setSavedFingerprint] = useState(
     () => `${runtimeDraftFingerprint(initialDraft)}\n${JSON.stringify(preset.blocks)}`,
   )
-  const dirty = combinedFingerprint !== savedFingerprint
+  const dirty = combinedFingerprint !== savedFingerprint || loomRevisionRestagePending
   const dirtyRef = useRef(false)
   dirtyRef.current = dirty
   const draftConfigRecord = draft.config && typeof draft.config === 'object'
@@ -1009,12 +1253,6 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const draftSlotBindings = draft.slotBindings && typeof draft.slotBindings === 'object'
     ? draft.slotBindings
     : {}
-  const draftContextPackSelections = Array.isArray(draft.contextPackSelections)
-    ? draft.contextPackSelections as AgentContextPackSelection[]
-    : []
-  const draftContextRules = Array.isArray(draft.contextRules)
-    ? draft.contextRules as AgentContextActivationRule[]
-    : []
   const draftMainToolIds = Array.isArray(draftConfigRecord.mainToolIds)
     ? draftConfigRecord.mainToolIds.filter((toolId): toolId is CoreAgentToolId => CORE_AGENT_TOOL_IDS.includes(toolId as CoreAgentToolId))
     : []
@@ -1031,12 +1269,6 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     () => getAgentRuntimeCustomPhases(draft.config),
     [draft.config],
   )
-  const availableContextRevisionKeys = useMemo(() => {
-    if (!contextAvailabilityLoaded) return undefined
-    return new Set(availableContextPacks
-      .filter((option) => option.attachmentStatus === 'available')
-      .map((option) => `${option.packId}\u0000${option.revisionId}`))
-  }, [availableContextPacks, contextAvailabilityLoaded])
   const presetRepairItems = useMemo(() => getAgenticRuntimeRepairItems(preset), [preset])
   const [editorReviewItems, setEditorReviewItems] = useState(presetRepairItems)
   const projectedReviewItems = useMemo(() => editorReviewItems.filter((item) => {
@@ -1053,12 +1285,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     promptOrder,
     preset.cacheRevision ?? 0,
     requiredReviewIds,
-    availableContextRevisionKeys,
-  ), [availableContextRevisionKeys, draft, promptOrder, preset.cacheRevision, requiredReviewIds])
-  const policyRepairItems = useMemo<AgentConfigRepairItem[]>(() => {
+  ), [draft, promptOrder, preset.cacheRevision, requiredReviewIds])
+  const policyRepairItems = useMemo<PanelRepairItem[]>(() => {
     const seen = new Set<string>()
     return validation.issues
-      .filter((issue) => issue.path.startsWith('config.runtimePolicy'))
+      .filter((issue) => /^config\.(?:runtimePolicy|cognitionPolicy|phasePolicy)(?:\.|$)/.test(issue.path))
       .filter((issue) => {
         if (seen.has(issue.path)) return false
         seen.add(issue.path)
@@ -1082,13 +1313,33 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const taskTemplateIds = draftTaskTemplates.flatMap((template) => isAgentTaskTemplate(template) ? [template.id] : [])
   const maxInvocationsInvalid = Number.isNaN(parseAgentMaxInvocationsInput(maxInvocationsInput))
   const maxToolCallsInvalid = Number.isNaN(parseAgentMaxToolCallsInput(maxToolCallsInput))
-  const canSave = isHydrated
+  const hydratedIdentity = hydratedIdentityRef.current
+  const hasHydratedEditor = isHydrated && hydratedIdentity?.presetId === preset.id
+  const isHydratedForCurrentPreset = hasHydratedEditor
+    && editorIdentityConverged(
+      hydratedIdentity,
+      preset.id,
+      preset.cacheRevision ?? 0,
+      preset.agentConfigRevision ?? 0,
+      lastReturnedIdentityRef.current,
+    )
+  const hasPendingExternalSnapshot = pendingExternalDraftRef.current !== null
+    && pendingExternalPromptOrderRef.current !== null
+  const canSave = isHydratedForCurrentPreset
     && dirty
     && saveState !== 'saving'
     && saveState !== 'conflict'
     && validation.valid
     && !maxInvocationsInvalid
     && !maxToolCallsInvalid
+  const canReset = dirty
+    && saveState !== 'saving'
+    && (isHydratedForCurrentPreset
+      || !editorLoadError && saveState === 'conflict' && hasPendingExternalSnapshot)
+  const draftControlsLocked = !isHydratedForCurrentPreset || saveState === 'saving'
+
+
+
 
   useEffect(() => {
     onDirtyChange(dirty)
@@ -1099,22 +1350,47 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     let active = true
     const currentPresetRevision = preset.cacheRevision ?? 0
     const currentConfigRevision = preset.agentConfigRevision ?? 0
-    const revisionChanged = observedPresetRevisionRef.current !== currentPresetRevision
+    const revisionChanged = observedPresetIdRef.current !== preset.id
+      || observedPresetRevisionRef.current !== currentPresetRevision
       || observedConfigRevisionRef.current !== currentConfigRevision
+
     if (saveInFlightRef.current) {
+      observedPresetIdRef.current = preset.id
       observedPresetRevisionRef.current = currentPresetRevision
       observedConfigRevisionRef.current = currentConfigRevision
       return
     }
+    if (
+      !dirtyRef.current
+      && isHydratedRef.current
+      && editorIdentityConverged(
+        hydratedIdentityRef.current,
+        preset.id,
+        currentPresetRevision,
+        currentConfigRevision,
+        lastReturnedIdentityRef.current,
+      )
+    ) {
+      observedPresetIdRef.current = preset.id
+      observedPresetRevisionRef.current = currentPresetRevision
+      observedConfigRevisionRef.current = currentConfigRevision
+      return
+    }
+
+    observedPresetIdRef.current = preset.id
+    observedPresetRevisionRef.current = currentPresetRevision
+    observedConfigRevisionRef.current = currentConfigRevision
+    hydratedIdentityRef.current = null
+    lastReturnedIdentityRef.current = null
+    pendingExternalDraftRef.current = null
+    pendingExternalPromptOrderRef.current = null
+    setHostCeilings(null)
     setIsHydrated(false)
-    setContextAvailabilityLoaded(false)
+    setEditorLoadError(false)
     if (dirtyRef.current && revisionChanged) {
       pendingExternalPromptOrderRef.current = structuredClone(preset.blocks)
       setSaveState('conflict')
     }
-    observedPresetRevisionRef.current = currentPresetRevision
-    observedConfigRevisionRef.current = currentConfigRevision
-    setAvailableContextPacks([])
     void agenticRuntimeApi.getEditor(preset.id).then((projection) => {
       if (!active) return
       const authoritative = projection.presetId === preset.id
@@ -1132,30 +1408,45 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
         agentConfigReview: projection.review,
       })
       if (dirtyRef.current) {
-        const externalDraft = hydrateDraftFromEditor(draftRef.current, projection)
+        const externalDraft = hydrateDraftFromEditor(draftRef.current, projection, preset.blocks)
         pendingExternalDraftRef.current = externalDraft
         pendingExternalPromptOrderRef.current = structuredClone(preset.blocks)
         setHostCeilings(projection.hostCeilings)
         setEditorReviewItems(projectedReviewItems)
         setIsHydrated(authoritative)
+        if (authoritative) {
+          hydratedIdentityRef.current = {
+            presetId: projection.presetId,
+            presetRevision: projection.presetRevision,
+            configRevision: projection.configRevision,
+          }
+          setEditorLoadError(false)
+        } else {
+          hydratedIdentityRef.current = null
+          setEditorLoadError(true)
+        }
         if (revisionChanged || revisionMismatch || !authoritative) setSaveState('conflict')
         return
       }
       if (!authoritative) {
-        pendingExternalDraftRef.current = hydrateDraftFromEditor(draftRef.current, projection)
+        hydratedIdentityRef.current = null
+        pendingExternalDraftRef.current = hydrateDraftFromEditor(draftRef.current, projection, preset.blocks)
         pendingExternalPromptOrderRef.current = structuredClone(preset.blocks)
         setHostCeilings(projection.hostCeilings)
         setEditorReviewItems(projectedReviewItems)
-        setSaveState('conflict')
+        setIsHydrated(false)
+        setEditorLoadError(true)
+        setSaveState('error')
         return
       }
-      const hydrated = hydrateDraftFromEditor(draftRef.current, projection)
+      const hydrated = hydrateDraftFromEditor(draftRef.current, projection, preset.blocks)
       const nextPromptOrder = structuredClone(preset.blocks)
       committedDraftRef.current = structuredClone(hydrated)
       committedPromptOrderRef.current = nextPromptOrder
       pendingExternalDraftRef.current = null
       pendingExternalPromptOrderRef.current = null
       setRepairedSlotIds(new Set())
+      setLoomRevisionRestagePending(false)
       setHostCeilings(projection.hostCeilings)
       setEditorReviewItems(projectedReviewItems)
       setDraft(hydrated)
@@ -1163,18 +1454,32 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       setMaxInvocationsInput(String(hydrated.config.maxInvocations))
       setMaxToolCallsInput(String(hydrated.config.maxToolCalls))
       setSavedFingerprint(`${runtimeDraftFingerprint(hydrated)}\n${JSON.stringify(nextPromptOrder)}`)
+      hydratedIdentityRef.current = {
+        presetId: projection.presetId,
+        presetRevision: projection.presetRevision,
+        configRevision: projection.configRevision,
+      }
       setIsHydrated(true)
-      if (!revisionMismatch) setSaveState('idle')
+      setEditorLoadError(false)
+      setSaveState(revisionMismatch ? 'conflict' : 'idle')
     }).catch((error: unknown) => {
       if (!active) return
       const missingProjection = error instanceof ApiError && error.status === 404
       if (!missingProjection) {
+        hydratedIdentityRef.current = null
         setIsHydrated(false)
-        if (dirtyRef.current) setSaveState('conflict')
+        setEditorLoadError(true)
+        setSaveState(dirtyRef.current ? 'conflict' : 'error')
         return
       }
       if (dirtyRef.current) {
+        const localFallback = createAgenticRuntimeDraft(preset)
+        pendingExternalDraftRef.current = localFallback
+        pendingExternalPromptOrderRef.current = structuredClone(preset.blocks)
+        hydratedIdentityRef.current = null
         setIsHydrated(false)
+        setEditorLoadError(false)
+        setEditorReviewItems(getAgenticRuntimeRepairItems(preset))
         setSaveState('conflict')
         return
       }
@@ -1186,67 +1491,50 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       pendingExternalPromptOrderRef.current = null
       observedConfigRevisionRef.current = preset.agentConfigRevision ?? 0
       setRepairedSlotIds(new Set())
+      setLoomRevisionRestagePending(false)
       setEditorReviewItems(getAgenticRuntimeRepairItems(preset))
       setDraft(local)
       setPromptOrder(nextPromptOrder)
       setMaxInvocationsInput(String(local.config.maxInvocations))
       setMaxToolCallsInput(String(local.config.maxToolCalls))
       setSavedFingerprint(`${runtimeDraftFingerprint(local)}\n${JSON.stringify(nextPromptOrder)}`)
+      hydratedIdentityRef.current = {
+        presetId: preset.id,
+        presetRevision: currentPresetRevision,
+        configRevision: currentConfigRevision,
+      }
       setIsHydrated(true)
+      setEditorLoadError(false)
       setSaveState('idle')
-    })
-    void agentContextPacksApi.listSelectable().then(({ data }) => {
-      if (!active) return
-      const available: ContextPackOption[] = data.map((candidate) => ({
-        ownerId: candidate.ownerId,
-        selectionSource: candidate.source,
-        packId: candidate.packId,
-        revisionId: contextPackRevisionId(candidate.packId, candidate.revision),
-        revision: candidate.revision,
-        label: candidate.packName,
-        revisionLabel: t('context.revisionLabel', { revision: candidate.revision }),
-        digest: candidate.digest,
-        scopes: [],
-        requiredScopes: [],
-        attachmentStatus: 'available',
-      }))
-      const currentSelections = Array.isArray(draftRef.current.contextPackSelections)
-        ? draftRef.current.contextPackSelections as AgentContextPackSelection[]
-        : []
-      const availableKeys = new Set(available.map((option) => `${option.packId}\u0000${option.revisionId}`))
-      const unavailable = currentSelections
-        .filter((selection) => isAgentContextPackSelection(selection)
-          && !availableKeys.has(`${selection.packId}\u0000${selection.revisionId}`))
-        .map((selection) => ({
-          ...selection,
-          scopes: [],
-          requiredScopes: [],
-          attachmentStatus: 'unavailable' as const,
-        }))
-      setAvailableContextPacks([...available, ...unavailable])
-      setContextAvailabilityLoaded(true)
-    }).catch(() => {
-      if (!active) return
-      const currentSelections = Array.isArray(draftRef.current.contextPackSelections)
-        ? draftRef.current.contextPackSelections as AgentContextPackSelection[]
-        : []
-      setAvailableContextPacks(currentSelections
-        .filter(isAgentContextPackSelection)
-        .map((selection) => ({
-          ...selection,
-          scopes: [],
-          requiredScopes: [],
-          attachmentStatus: 'unavailable' as const,
-        })))
-      setContextAvailabilityLoaded(true)
     })
     return () => {
       active = false
     }
-  }, [preset.id, preset.cacheRevision, preset.agentConfigRevision])
+  }, [editorLoadAttempt, preset.id, preset.cacheRevision, preset.agentConfigRevision])
+
+  const retryEditorLoad = () => {
+    if (saveInFlightRef.current) return
+    setEditorLoadError(false)
+    setIsHydrated(false)
+    setEditorLoadAttempt((current) => current + 1)
+  }
+
+  const reloadLatestForReview = async () => {
+    if (saveInFlightRef.current || conflictRecoveryState === 'loading') return
+    setConflictRecoveryState('loading')
+    try {
+      await onReload()
+      setLoomRevisionRestagePending(false)
+      lastReturnedIdentityRef.current = null
+      setEditorLoadError(false)
+      setEditorLoadAttempt((current) => current + 1)
+    } catch {
+      setConflictRecoveryState('error')
+    }
+  }
 
   const updateDraft = (updater: (current: AgenticRuntimeSaveDraft) => AgenticRuntimeSaveDraft) => {
-    if (!isHydrated || saveInFlightRef.current) return
+    if (!isHydratedForCurrentPreset || saveInFlightRef.current) return
     setDraft(updater)
     setSaveState((current) => current === 'conflict' ? current : 'idle')
   }
@@ -1283,21 +1571,26 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }
 
   const updateProfile = (updater: (profile: AgentProfileConfigV2) => AgentProfileConfigV2) => {
-    if (!isHydrated || !selectedProfile) return
+    if (!isHydratedForCurrentPreset || !selectedProfile || saveInFlightRef.current) return
     const previousId = selectedProfile.id
     const updatedProfile = updater(selectedProfile)
     const nextId = updatedProfile.id
-    updateConfig((config) => ({
-      ...config,
-      profiles: Array.isArray(config.profiles)
-        ? config.profiles.map((profile, index) => index === selectedProfileIndex ? updatedProfile : profile)
-        : [updatedProfile],
-    }))
+    updateConfig((config) => {
+      const nextConfig = {
+        ...config,
+        profiles: Array.isArray(config.profiles)
+          ? config.profiles.map((profile, index) => index === selectedProfileIndex ? updatedProfile : profile)
+          : [updatedProfile],
+      }
+      return previousId === nextId
+        ? nextConfig
+        : updateRuntimePolicyChildProfileAssignments(nextConfig, previousId, nextId)
+    })
     if (previousId !== nextId) {
       setPromptOrder((current) => current.map((block) => {
         if (typeof block.content !== 'string') return block
         const content = rewriteAgentProfileMarkers(block.content, previousId, nextId)
-        return content === block.content ? block : { ...block, content: content as string }
+        return revisePromptBlockContent(block, content)
       }))
     }
   }
@@ -1316,7 +1609,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }
 
   const setAllowedMode = (mode: AgentMode, checked: boolean) => {
-    if (!isHydrated || mode === 'response' || !draft.config.agentsEnabled) return
+    if (!isHydratedForCurrentPreset || mode === 'response' || !draft.config.agentsEnabled) return
     updateConfig((config) => {
       const allowedModes: AgentMode[] = checked ? ['response', 'agentic'] : ['response']
       return {
@@ -1348,6 +1641,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }
 
   const togglePolicyBlock = (policyKey: PolicyKey, block: PromptBlock, checked: boolean) => {
+    if (checked && block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
+      toast.error(t('limits.invalidBlockRevision'))
+      return
+    }
     updateConfig((config) => {
       const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
       const currentEntries = buckets[policyKey]
@@ -1388,79 +1685,112 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       })
     })
   }
-  const repairLoomPolicy = () => {
-    updateConfig((config) => {
-      const rawRuntimePolicy: unknown = config.runtimePolicy
-      let currentPhases: readonly AgentCustomPhaseV1[] = []
-      if (rawRuntimePolicy === undefined) {
-        currentPhases = getAgentRuntimeCustomPhases(config)
-      } else {
-        if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
-          return config
-        }
-        if (!('version' in rawRuntimePolicy)
-          || !('authority' in rawRuntimePolicy)
-          || !('scope' in rawRuntimePolicy)
-          || !('defaultMode' in rawRuntimePolicy)
-          || !('loomPolicy' in rawRuntimePolicy)
-          || !('phases' in rawRuntimePolicy)) return config
-        if (
-          Object.keys(rawRuntimePolicy).some((key) => !RUNTIME_POLICY_KEYS.has(key))
-          || rawRuntimePolicy.version !== 1
-          || rawRuntimePolicy.authority !== 'loom'
-          || rawRuntimePolicy.scope !== 'preset'
-          || rawRuntimePolicy.defaultMode !== config.defaultMode
-        ) return config
-        try {
-          if (rawRuntimePolicy.loomPolicy !== null) {
-            parseLoomPolicyBucketsV1(rawRuntimePolicy.loomPolicy)
-          }
-          currentPhases = parseAgentCustomPhasesV1(rawRuntimePolicy.phases)
-        } catch {
-          return config
-        }
-      }
-      const repairSource = (source: LoomPolicySourceV1): LoomPolicySourceV1 => {
-        const block = promptOrder.find((candidate) => candidate.id === source.blockId)
-        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === source.blockId)
-        if (!block || block.marker === 'category' || promptIndex < 0) return source
-        return {
-          ...source,
-          presetRevision: preset.cacheRevision ?? 0,
-          blockRevision: block.revision === undefined ? 1 : isCanonicalBlockRevision(block.revision) ? block.revision : source.blockRevision,
-          promptOrder: promptIndex,
-        }
-      }
-      const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
-      const repairBucket = (bucket: PolicyKey): LoomPolicyEntryV1[] => buckets[bucket].map((entry) => {
-        const block = promptOrder.find((candidate) => candidate.id === entry.source.blockId)
-        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === entry.source.blockId)
-        return block && block.marker !== 'category' && promptIndex >= 0
-          && (block.revision === undefined || isCanonicalBlockRevision(block.revision))
-          ? createLoomPolicyEntryV1(bucket, block, preset.cacheRevision ?? 0, promptIndex, entry)
-          : entry
-      })
-      const repaired: LoomPolicyBucketsV1 = {
-        version: buckets.version,
-        workPolicy: repairBucket('workPolicy'),
-        workspaceUsage: repairBucket('workspaceUsage'),
-        completionCriteria: repairBucket('completionCriteria'),
-        renderPolicy: repairBucket('renderPolicy'),
-      }
-      const repairedPhases = currentPhases.map((phase) => ({
-        ...phase,
-        instructionRefs: phase.instructionRefs.map(repairSource),
-      }))
-      const repairedConfig = setAgentRuntimePolicyBuckets(config, repaired)
-      return setAgentRuntimeCustomPhases(repairedConfig, repairedPhases)
-    })
-  }
-  const resolveRuntimePolicyRepair = (item: AgentConfigRepairItem) => {
-    if (item.reasonCode === 'stale_policy_source') {
-      repairLoomPolicy()
-      return
+  const currentLoomSourceForBlock = (blockId: string): LoomPolicySourceV1 | null => {
+    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === blockId)
+    if (promptIndex < 0) return null
+    const block = promptOrder[promptIndex]
+    if (!block || block.marker === 'category'
+      || block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
+      return null
     }
+    return {
+      kind: 'loom_block',
+      blockId,
+      presetRevision: preset.cacheRevision ?? 0,
+      blockRevision: block.revision ?? 1,
+      promptOrder: promptIndex,
+    }
+  }
+  const stageCurrentLoomRevisions = () => {
+    if (!isHydratedForCurrentPreset || saveInFlightRef.current || saveState === 'conflict') return
+    const currentPresetRevision = preset.cacheRevision ?? 0
+    updateConfig((config) => {
+      const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
+      const restageEntry = (policyKey: PolicyKey, entry: LoomPolicyEntryV1): LoomPolicyEntryV1 => {
+        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === entry.source.blockId)
+        const block = promptOrder[promptIndex]
+        if (promptIndex < 0 || !block || block.marker === 'category') return entry
+        if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) return entry
+        return createLoomPolicyEntryV1(policyKey, block, currentPresetRevision, promptIndex, entry)
+      }
+      const restagedBuckets: LoomPolicyBucketsV1 = {
+        version: 1,
+        workPolicy: buckets.workPolicy.map((entry) => restageEntry('workPolicy', entry)),
+        workspaceUsage: buckets.workspaceUsage.map((entry) => restageEntry('workspaceUsage', entry)),
+        completionCriteria: buckets.completionCriteria.map((entry) => restageEntry('completionCriteria', entry)),
+        renderPolicy: buckets.renderPolicy.map((entry) => restageEntry('renderPolicy', entry)),
+      }
+      const withBuckets = setAgentRuntimePolicyBuckets(config, restagedBuckets)
+      const restagedPhases = getAgentRuntimeCustomPhases(withBuckets).map((phase) => ({
+        ...phase,
+        instructionRefs: phase.instructionRefs.map((source) => currentLoomSourceForBlock(source.blockId) ?? source),
+        childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
+          ...subset,
+          instructionRefs: subset.instructionRefs.map((source) => currentLoomSourceForBlock(source.blockId) ?? source),
+        })),
+      }))
+      return setAgentRuntimeCustomPhases(withBuckets, restagedPhases)
+    })
+    setLoomRevisionRestagePending(true)
+    setSaveState((current) => current === 'conflict' ? current : 'idle')
+  }
+  const resolveRuntimePolicyRepair = (item: PanelRepairItem) => {
     const path = item.label ?? ''
+    if (item.reasonCode === 'stale_policy_source') {
+      const entryMatch = /^config\.runtimePolicy\.loomPolicy\.(workPolicy|workspaceUsage|completionCriteria|renderPolicy)\.(\d+)\.source$/.exec(path)
+      if (entryMatch) {
+        const bucket = entryMatch[1] as PolicyKey
+        const entry = draftLoomPolicy[bucket][Number(entryMatch[2])]
+        const promptIndex = entry === undefined
+          ? -1
+          : promptOrder.findIndex((candidate) => candidate.id === entry.source.blockId)
+        const block = promptOrder[promptIndex]
+        if (entry && block && block.marker !== 'category' && (
+          block.revision === undefined || isCanonicalBlockRevision(block.revision)
+        )) {
+          updatePolicyEntry(bucket, entry.source.blockId, (current) => (
+            createLoomPolicyEntryV1(
+              bucket,
+              block,
+              preset.cacheRevision ?? 0,
+              promptIndex,
+              current,
+            )
+          ))
+          return
+        }
+      }
+      const phaseSourceMatch = /^config\.runtimePolicy\.phases\.(\d+)\.instructionRefs\.(\d+)$/.exec(path)
+      if (phaseSourceMatch) {
+        const phaseIndex = Number(phaseSourceMatch[1])
+        const sourceIndex = Number(phaseSourceMatch[2])
+        const source = draftCustomPhases[phaseIndex]?.instructionRefs[sourceIndex]
+        const replacement = source === undefined ? null : currentLoomSourceForBlock(source.blockId)
+        if (source && replacement) {
+          updateConfig((config) => {
+            const phases = getAgentRuntimeCustomPhases(config)
+            const currentPhase = phases[phaseIndex]
+            if (!currentPhase) return config
+            const nextPhases = phases.map((phase, index) => index === phaseIndex
+              ? {
+                  ...phase,
+                  instructionRefs: phase.instructionRefs.map((candidate) => (
+                    candidate.blockId === source.blockId ? replacement : candidate
+                  )),
+                  childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
+                    ...subset,
+                    instructionRefs: subset.instructionRefs.map((candidate) => (
+                      candidate.blockId === source.blockId ? replacement : candidate
+                    )),
+                  })),
+                }
+              : phase)
+            return setAgentRuntimeCustomPhases(config, nextPhases)
+          })
+          return
+        }
+      }
+    }
     updateConfig((config) => {
       const emptyBuckets: LoomPolicyBucketsV1 = {
         version: 1,
@@ -1469,12 +1799,83 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
         completionCriteria: [],
         renderPolicy: [],
       }
+      if (/^config\.(?:cognitionPolicy|phasePolicy)(?:\.|$)/.test(path)) {
+        const canonicalBuckets = getAgentRuntimePolicyBuckets(config, promptOrder)
+        const canonicalPhases = getAgentRuntimeCustomPhases(config)
+        const withBuckets = setAgentRuntimePolicyBuckets(config, canonicalBuckets)
+        return setAgentRuntimeCustomPhases(withBuckets, canonicalPhases)
+      }
       const rawRuntimePolicy = (config as unknown as Record<string, unknown>).runtimePolicy
       if (typeof rawRuntimePolicy !== 'object' || rawRuntimePolicy === null || Array.isArray(rawRuntimePolicy)) {
         const withBuckets = setAgentRuntimePolicyBuckets(config, emptyBuckets)
         return setAgentRuntimeCustomPhases(withBuckets, [])
       }
       const runtimePolicy = rawRuntimePolicy as Record<string, unknown>
+      const subsetMatch = /^config\.runtimePolicy\.phases\.(\d+)\.childInstructionSubsets\.(\d+)(?:\.instructionRefs\.(\d+))?/.exec(path)
+      if (subsetMatch && Array.isArray(runtimePolicy.phases)) {
+        const phaseIndex = Number(subsetMatch[1])
+        const subsetIndex = Number(subsetMatch[2])
+        const instructionIndex = subsetMatch[3] === undefined ? null : Number(subsetMatch[3])
+        const nextPhases = runtimePolicy.phases.slice()
+        const rawPhase = nextPhases[phaseIndex]
+        if (isObjectRecord(rawPhase) && Array.isArray(rawPhase.childInstructionSubsets)) {
+          const nextSubsets = rawPhase.childInstructionSubsets.slice()
+          if (isObjectRecord(nextSubsets[subsetIndex])) {
+            if (instructionIndex === null) {
+              nextSubsets.splice(subsetIndex, 1)
+            } else if (Array.isArray(nextSubsets[subsetIndex].instructionRefs)) {
+              const nextRefs = nextSubsets[subsetIndex].instructionRefs.slice()
+              nextRefs.splice(instructionIndex, 1)
+              nextSubsets[subsetIndex] = {
+                ...nextSubsets[subsetIndex],
+                instructionRefs: nextRefs,
+              }
+            }
+            nextPhases[phaseIndex] = { ...rawPhase, childInstructionSubsets: nextSubsets }
+            return {
+              ...config,
+              runtimePolicy: { ...runtimePolicy, phases: nextPhases },
+            } as unknown as AgentConfigV2
+          }
+        }
+      }
+
+      const instructionMatch = /^config\.runtimePolicy\.phases\.(\d+)\.instructionRefs\.(\d+)/.exec(path)
+      if (instructionMatch && Array.isArray(runtimePolicy.phases)) {
+        const phaseIndex = Number(instructionMatch[1])
+        const instructionIndex = Number(instructionMatch[2])
+        const nextPhases = runtimePolicy.phases.slice()
+        const rawPhase = nextPhases[phaseIndex]
+        if (isObjectRecord(rawPhase) && Array.isArray(rawPhase.instructionRefs)) {
+          const removedSource = rawPhase.instructionRefs[instructionIndex]
+          const removedBlockId = isObjectRecord(removedSource) && typeof removedSource.blockId === 'string'
+            ? removedSource.blockId
+            : null
+          const nextRefs = rawPhase.instructionRefs.slice()
+          nextRefs.splice(instructionIndex, 1)
+          const nextSubsets = Array.isArray(rawPhase.childInstructionSubsets)
+            ? rawPhase.childInstructionSubsets.map((subset) => (
+                isObjectRecord(subset) && Array.isArray(subset.instructionRefs) && removedBlockId !== null
+                  ? {
+                      ...subset,
+                      instructionRefs: subset.instructionRefs.filter((source) => (
+                        !isObjectRecord(source) || source.blockId !== removedBlockId
+                      )),
+                    }
+                  : subset
+              ))
+            : rawPhase.childInstructionSubsets
+          nextPhases[phaseIndex] = {
+            ...rawPhase,
+            instructionRefs: nextRefs,
+            childInstructionSubsets: nextSubsets,
+          }
+          return {
+            ...config,
+            runtimePolicy: { ...runtimePolicy, phases: nextPhases },
+          } as unknown as AgentConfigV2
+        }
+      }
 
       const phaseMatch = /^config\.runtimePolicy\.phases\.(\d+)/.exec(path)
       if (phaseMatch && Array.isArray(runtimePolicy.phases)) {
@@ -1539,7 +1940,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     })
   }
   const addCustomPhase = () => {
-    if (!isHydrated) return
+    if (!isHydratedForCurrentPreset) return
     if (draftCustomPhases.length >= AGENTIC_CUSTOM_PHASE_LIMIT) {
       toast.error(t('limits.customPhases'))
       return
@@ -1553,6 +1954,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       id,
       label: t('customPhases.defaultLabel', { number: phaseNumber }),
       instructionRefs: [],
+      childInstructionSubsets: [],
       required: true,
       enter: { kind: 'phase', value: 'WORK' },
       exit: { kind: 'phase', value: 'COMPLETE' },
@@ -1572,6 +1974,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   }
   const renameCustomPhase = (index: number, id: string) => {
     updateCustomPhases((phases) => {
+      if (phases.some((phase, phaseIndex) => phaseIndex !== index && phase.id === id)) return phases
       const previousId = phases[index]?.id
       if (!previousId || previousId === id) {
         return phases.map((phase, phaseIndex) => phaseIndex === index ? { ...phase, id } : phase)
@@ -1616,28 +2019,99 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     block: PromptBlock,
     checked: boolean,
   ) => {
-    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
-    if (promptIndex < 0) return
-    if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
-      toast.error(t('limits.invalidBlockRevision'))
+    if (!checked) {
+      updateCustomPhase(phaseIndex, (phase) => ({
+        ...phase,
+        instructionRefs: phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+        childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
+          ...subset,
+          instructionRefs: subset.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+        })),
+      }))
       return
     }
-    const source: LoomPolicySourceV1 = {
-      kind: 'loom_block',
-      blockId: block.id,
-      presetRevision: preset.cacheRevision ?? 0,
-      blockRevision: block.revision ?? 1,
-      promptOrder: promptIndex,
+    const source = currentLoomSourceForBlock(block.id)
+    if (!source) {
+      if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
+        toast.error(t('limits.invalidBlockRevision'))
+      }
+      return
     }
     updateCustomPhase(phaseIndex, (phase) => ({
       ...phase,
-      instructionRefs: checked
+      instructionRefs: [
+        ...phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+        source,
+      ],
+      childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
+        ...subset,
+        instructionRefs: subset.instructionRefs.map((candidate) => (
+          candidate.blockId === block.id ? source : candidate
+        )),
+      })),
+    }))
+  }
+
+  const toggleCustomPhaseChildSubset = (
+    phaseIndex: number,
+    profileId: string,
+    source: LoomPolicySourceV1,
+    checked: boolean,
+  ) => {
+    updateCustomPhase(phaseIndex, (phase) => {
+      const existingIndex = phase.childInstructionSubsets.findIndex((subset) => subset.profileId === profileId)
+      if (existingIndex < 0) {
+        return checked
+          ? {
+              ...phase,
+              childInstructionSubsets: [
+                ...phase.childInstructionSubsets,
+                { profileId, instructionRefs: [source] },
+              ],
+            }
+          : phase
+      }
+      const existing = phase.childInstructionSubsets[existingIndex]!
+      const instructionRefs = checked
         ? [
-            ...phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+            ...existing.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId),
             source,
           ]
-        : phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
-    }))
+        : existing.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId)
+      return {
+        ...phase,
+        childInstructionSubsets: phase.childInstructionSubsets.map((subset, subsetIndex) => (
+          subsetIndex === existingIndex ? { ...subset, instructionRefs } : subset
+        )),
+      }
+    })
+  }
+
+  const toggleCustomPhaseChildSubsetAssignment = (
+    phaseIndex: number,
+    profileId: string,
+    assigned: boolean,
+  ) => {
+    updateCustomPhase(phaseIndex, (phase) => {
+      const existing = phase.childInstructionSubsets.some((subset) => subset.profileId === profileId)
+      if (assigned) {
+        return existing
+          ? phase
+          : {
+              ...phase,
+              childInstructionSubsets: [
+                ...phase.childInstructionSubsets,
+                { profileId, instructionRefs: [] },
+              ],
+            }
+      }
+      return existing
+        ? {
+            ...phase,
+            childInstructionSubsets: phase.childInstructionSubsets.filter((subset) => subset.profileId !== profileId),
+          }
+        : phase
+    })
   }
   const toggleCustomPhaseCapability = (
     phaseIndex: number,
@@ -1664,7 +2138,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
     }))
   }
   const addTaskTemplate = () => {
-    if (!isHydrated) return
+    if (!isHydratedForCurrentPreset) return
     if (draftTaskTemplates.length >= AGENTIC_TASK_TEMPLATE_LIMIT) {
       toast.error(t('limits.tasks'))
       return
@@ -1726,13 +2200,6 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
             : template
         ))
         : updated
-      const nextRules = renamed && Array.isArray(current.contextRules)
-        ? current.contextRules.map((rule) => (
-          isAgentContextActivationRule(rule) && rule.activation
-            ? { ...rule, activation: rewriteTaskTransitionReferences(rule.activation, previousId, nextId) as AgentContextActivationRule['activation'] }
-            : rule
-        ))
-        : current.contextRules
       const runtimeConfig = renamed
         ? rewriteRuntimePolicyTaskReferences(current.config, previousId, nextId)
         : current.config
@@ -1740,7 +2207,6 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       return {
         ...current,
         taskTemplates: nextTemplates,
-        contextRules: nextRules,
         config: renamed && taskPolicy && Array.isArray(taskPolicy.templateIds)
           ? {
               ...runtimeConfig,
@@ -1771,22 +2237,15 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
             }, removing.id)
           })
         : current.taskTemplates
-      const nextRules = Array.isArray(current.contextRules)
-        ? current.contextRules.map((rule) => (
-          isAgentContextActivationRule(rule)
-            ? repairTaskTransitionReferencesAfterRemoval(rule, removing.id)
-            : rule
-        ))
-        : current.contextRules
+      const runtimeConfig = repairRuntimePolicyTaskReferencesAfterRemoval(current.config, removing.id)
       return {
         ...current,
         taskTemplates: nextTemplates,
-        contextRules: nextRules,
         config: {
-          ...current.config,
+          ...runtimeConfig,
           taskPolicy: {
-            templateIds: current.config.taskPolicy && Array.isArray(current.config.taskPolicy.templateIds)
-              ? current.config.taskPolicy.templateIds.filter((id) => id !== removing.id)
+            templateIds: runtimeConfig.taskPolicy && Array.isArray(runtimeConfig.taskPolicy.templateIds)
+              ? runtimeConfig.taskPolicy.templateIds.filter((id) => id !== removing.id)
               : [],
           },
         },
@@ -1813,220 +2272,42 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
               ? repairTaskTransitionReferencesAfterRemoval(template, removingId)
               : template
           ))
-      const nextRules = removingId === null || !Array.isArray(current.contextRules)
-        ? current.contextRules
-        : current.contextRules.map((rule) => (
-          isAgentContextActivationRule(rule)
-            ? repairTaskTransitionReferencesAfterRemoval(rule, removingId)
-            : rule
-        ))
+      const runtimeConfig = removingId === null
+        ? current.config
+        : repairRuntimePolicyTaskReferencesAfterRemoval(current.config, removingId)
       return {
         ...current,
         taskTemplates: nextTemplates,
-        contextRules: nextRules,
         config: removingId !== null
           ? {
-              ...current.config,
+              ...runtimeConfig,
               taskPolicy: {
-                templateIds: current.config.taskPolicy && Array.isArray(current.config.taskPolicy.templateIds)
-                  ? current.config.taskPolicy.templateIds.filter((id) => id !== removingId)
+                templateIds: runtimeConfig.taskPolicy && Array.isArray(runtimeConfig.taskPolicy.templateIds)
+                  ? runtimeConfig.taskPolicy.templateIds.filter((id) => id !== removingId)
                   : [],
               },
             }
-          : current.config,
+          : runtimeConfig,
       }
     })
   }
 
-  const addContextRule = () => {
-    if (!isHydrated) return
-    const selection = draftContextPackSelections.find((candidate) => isAgentContextPackSelection(candidate))
-    if (!selection) return
-    if (draftContextRules.length >= AGENTIC_CONTEXT_RULE_LIMIT) {
-      toast.error(t('limits.contextRules'))
-      return
-    }
-    const usedIds = new Set(draftContextRules
-      .filter((candidate) => isAgentContextActivationRule(candidate))
-      .map((candidate) => candidate.id))
-    let id = `context_${draftContextRules.length + 1}`
-    for (let suffix = 2; usedIds.has(id); suffix += 1) id = `context_${draftContextRules.length + 1}_${suffix}`
-    const rule: AgentContextActivationRule = {
-      id,
-      packId: selection.packId,
-      revisionId: selection.revisionId,
-      required: false,
-      dependencies: [],
-      activation: { kind: 'phase', value: 'WORK' },
-    }
-    updateDraft((current) => syncContextReferences(
-      current,
-      Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : [],
-      Array.isArray(current.contextRules) ? [...(current.contextRules as AgentContextActivationRule[]), rule] : [rule],
-    ))
+  const discardQuarantinedProfile = (id: string) => {
+    updateDraft((current) => ({
+      ...current,
+      quarantinedProfiles: (current.quarantinedProfiles ?? []).filter((item) => item.id !== id),
+    }))
   }
-  const updateContextRule = (index: number, updater: (rule: AgentContextActivationRule) => AgentContextActivationRule) => {
-    updateDraft((current) => {
-      if (!Array.isArray(current.contextRules)) return current
-      const previous = current.contextRules[index]
-      const previousId = previous && isAgentContextActivationRule(previous) ? previous.id : null
-      const updated = current.contextRules.map((rule, ruleIndex) => (
-        ruleIndex === index && isAgentContextActivationRule(rule) ? updater(rule) : rule
-      ))
-      const next = updated[index]
-      const nextId = next && isAgentContextActivationRule(next) ? next.id : previousId
-      const nextRules = previousId && nextId && previousId !== nextId
-        ? updated.map((rule) => (
-          isAgentContextActivationRule(rule)
-            ? {
-                ...rule,
-                dependencies: (rule.dependencies ?? []).map((dependencyId) => dependencyId === previousId ? nextId : dependencyId),
-                activation: rule.activation
-                  ? rewriteTaskTransitionReferences(rule.activation, previousId, nextId) as AgentContextActivationRule['activation']
-                  : rule.activation,
-              }
-            : rule
-        ))
-        : updated
-      return syncContextReferences(
-        current,
-        Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : [],
-        nextRules as AgentContextActivationRule[],
-      )
-    })
+  const discardQuarantinedConnectionSlot = (id: string) => {
+    updateDraft((current) => ({
+      ...current,
+      quarantinedConnectionSlots: (current.quarantinedConnectionSlots ?? []).filter((item) => item.id !== id),
+    }))
   }
 
-  const removeContextRule = (index: number) => {
-    updateDraft((current) => {
-      if (!Array.isArray(current.contextRules)) return current
-      const removing = current.contextRules[index]
-      const removingId = removing && isAgentContextActivationRule(removing) ? removing.id : null
-      const nextRules = current.contextRules
-        .filter((_rule, ruleIndex) => ruleIndex !== index)
-        .map((rule) => (
-          removingId && isAgentContextActivationRule(rule)
-            ? { ...rule, dependencies: (rule.dependencies ?? []).filter((dependencyId) => dependencyId !== removingId) }
-            : rule
-        ))
-      if (!isContextPolicySynchronized(current)) {
-        return { ...current, contextRules: nextRules }
-      }
-      return rebuildContextReferences(
-        current,
-        Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : [],
-        nextRules as AgentContextActivationRule[],
-      )
-    })
-  }
-  const addContextPack = (selectionKey: string) => {
-    const selection = availableContextPacks.find((candidate) => (
-      `${candidate.packId}\u0000${candidate.revisionId}` === selectionKey
-    ))
-    if (!selection || selection.attachmentStatus !== 'available') return
-    const selected = draftContextPackSelections.some((candidate) => (
-      isAgentContextPackSelection(candidate)
-      && candidate.packId === selection.packId
-      && candidate.revisionId === selection.revisionId
-    ))
-    if (selected) return
-    if (draftContextPackSelections.length >= AGENTIC_CONTEXT_RULE_LIMIT) {
-      toast.error(t('limits.contextSelections'))
-      return
-    }
-    const {
-      ownerId: _ownerId,
-      selectionSource: _selectionSource,
-      scopes: _scopes,
-      requiredScopes: _requiredScopes,
-      attachmentStatus: _attachmentStatus,
-      ...authoredSelection
-    } = selection
-    updateDraft((current) => syncContextReferences(
-      current,
-      [...(Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : []), authoredSelection],
-      Array.isArray(current.contextRules) ? current.contextRules as AgentContextActivationRule[] : [],
-    ))
-  }
-  const setContextPackDirect = (packId: string, direct: boolean) => {
-    updateDraft((current) => {
-      const policy = current.config.contextPolicy
-      if (!isAgentContextPolicy(policy) || !isContextPolicySynchronized(current)) return current
-      const selections = Array.isArray(current.contextPackSelections)
-        ? current.contextPackSelections as AgentContextPackSelection[]
-        : []
-      const selected = selections.some((selection) => (
-        isAgentContextPackSelection(selection) && selection.packId === packId
-      ))
-      if (!selected) return current
-      const packIds = policy.packIds.filter((candidate) => candidate !== packId)
-      if (direct) packIds.push(packId)
-      return {
-        ...current,
-        config: {
-          ...current.config,
-          contextPolicy: { ...policy, packIds: [...new Set(packIds)] },
-        },
-      }
-    })
-  }
-
-  const repairContextPolicy = () => {
-    updateDraft((current) => {
-      const { ruleIds, packIds } = contextReferenceIds(
-        Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : [],
-        Array.isArray(current.contextRules) ? current.contextRules as AgentContextActivationRule[] : [],
-        current.config.contextPolicy,
-      )
-      return {
-        ...current,
-        config: {
-          ...current.config,
-          contextPolicy: { ruleIds, packIds },
-        },
-      }
-    })
-  }
-
-  const discardContextSelection = (index: number) => {
-    updateDraft((current) => {
-      if (!Array.isArray(current.contextPackSelections)) return current
-      const nextSelections = current.contextPackSelections.filter((_selection, selectionIndex) => selectionIndex !== index)
-      if (!isContextPolicySynchronized(current)) {
-        return { ...current, contextPackSelections: nextSelections }
-      }
-      return rebuildContextReferences(
-        current,
-        nextSelections as AgentContextPackSelection[],
-        Array.isArray(current.contextRules) ? current.contextRules as AgentContextActivationRule[] : [],
-      )
-    })
-  }
-
-  const discardContextRule = (index: number) => {
-    updateDraft((current) => {
-      if (!Array.isArray(current.contextRules)) return current
-      const removing = current.contextRules[index]
-      const removingId = removing && isAgentContextActivationRule(removing) ? removing.id : null
-      const nextRules = current.contextRules
-        .filter((_rule, ruleIndex) => ruleIndex !== index)
-        .map((rule) => (
-          removingId && isAgentContextActivationRule(rule)
-            ? { ...rule, dependencies: (rule.dependencies ?? []).filter((dependencyId) => dependencyId !== removingId) }
-            : rule
-        ))
-      if (!isContextPolicySynchronized(current)) {
-        return { ...current, contextRules: nextRules }
-      }
-      return rebuildContextReferences(
-        current,
-        Array.isArray(current.contextPackSelections) ? current.contextPackSelections as AgentContextPackSelection[] : [],
-        nextRules as AgentContextActivationRule[],
-      )
-    })
-  }
 
   const updateSlotBinding = (slotId: string, connectionId: string) => {
-    if (!isHydrated || saveInFlightRef.current) return
+    if (!isHydratedForCurrentPreset || saveInFlightRef.current) return
     const committedBindings = committedDraftRef.current.slotBindings
     const committedConnectionId = committedBindings && typeof committedBindings === 'object'
       ? committedBindings[slotId] ?? null
@@ -2054,23 +2335,37 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
 
   const handleSave = async () => {
     if (!canSave || saveInFlightRef.current) return
+    const submittedIdentity = hydratedIdentityRef.current
+    if (!submittedIdentity || submittedIdentity.presetId !== preset.id) return
     const submittedDraft = structuredClone(draft)
     submittedDraft.reviewAcknowledgements = submittedDraft.reviewAcknowledgements.filter((id) => requiredReviewIds.includes(id))
     const submittedPromptOrder = structuredClone(promptOrder)
-    const submittedPresetRevision = observedPresetRevisionRef.current
     const submittedFingerprint = `${runtimeDraftFingerprint(submittedDraft)}\n${JSON.stringify(submittedPromptOrder)}`
     saveInFlightRef.current = true
     setSaveState('saving')
     try {
-      const result = await onSave(submittedDraft, submittedPromptOrder, submittedPresetRevision)
-      const liveFingerprint = `${runtimeDraftFingerprint(draftRef.current)}\n${JSON.stringify(promptOrderRef.current)}`
+      const result = await onSave(submittedDraft, submittedPromptOrder, { ...submittedIdentity })
+      setLoomRevisionRestagePending(false)
+      lastReturnedIdentityRef.current = {
+        presetId: result.editor.presetId,
+        presetRevision: result.editor.presetRevision,
+        configRevision: result.editor.configRevision,
+      }
+      hydratedIdentityRef.current = lastReturnedIdentityRef.current
+      observedPresetIdRef.current = result.editor.presetId
+      observedPresetRevisionRef.current = result.editor.presetRevision
+      observedConfigRevisionRef.current = result.editor.configRevision
+      isHydratedRef.current = true
+      const liveDraft = structuredClone(draftRef.current)
+      liveDraft.reviewAcknowledgements = liveDraft.reviewAcknowledgements.filter((id) => requiredReviewIds.includes(id))
+      const liveFingerprint = `${runtimeDraftFingerprint(liveDraft)}\n${JSON.stringify(promptOrderRef.current)}`
       if (liveFingerprint !== submittedFingerprint) {
         setSaveState('idle')
         return
       }
-      const hydrated = hydrateDraftFromEditor(submittedDraft, result.editor)
       const committedPreset = unmarshalPreset(result.preset)
       const committedPromptOrder = committedPreset.blocks
+      const hydrated = hydrateDraftFromEditor(submittedDraft, result.editor, committedPromptOrder)
       committedDraftRef.current = structuredClone(hydrated)
       committedPromptOrderRef.current = structuredClone(committedPromptOrder)
       pendingExternalDraftRef.current = null
@@ -2086,35 +2381,67 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       setMaxInvocationsInput(String(hydrated.config.maxInvocations))
       setMaxToolCallsInput(String(hydrated.config.maxToolCalls))
       setSavedFingerprint(`${runtimeDraftFingerprint(hydrated)}\n${JSON.stringify(committedPromptOrder)}`)
+      hydratedIdentityRef.current = {
+        presetId: result.editor.presetId,
+        presetRevision: result.editor.presetRevision,
+        configRevision: result.editor.configRevision,
+      }
+      observedPresetIdRef.current = result.editor.presetId
+      observedPresetRevisionRef.current = result.editor.presetRevision
+      observedConfigRevisionRef.current = result.editor.configRevision
+      setIsHydrated(true)
+      setConflictRecoveryState('idle')
       setSaveState('saved')
     } catch (error) {
-      setSaveState(error instanceof ApiError && error.status === 409 ? 'conflict' : 'error')
+      const conflict = error instanceof ApiError && error.status === 409
+      if (conflict) setConflictRecoveryState('idle')
+      setSaveState(conflict ? 'conflict' : 'error')
     } finally {
       saveInFlightRef.current = false
     }
   }
   const resetDraft = () => {
-    if (saveInFlightRef.current) return
+    if (!canReset || saveInFlightRef.current) return
     const pendingExternalDraft = pendingExternalDraftRef.current
     const pendingExternalPromptOrder = pendingExternalPromptOrderRef.current
     const externalSnapshotIncomplete = pendingExternalPromptOrder !== null && pendingExternalDraft === null
     const restoredDraft = structuredClone(pendingExternalDraft ?? committedDraftRef.current)
     const restoredPromptOrder = structuredClone(pendingExternalPromptOrder ?? committedPromptOrderRef.current)
+    const acceptsCurrentFallback = hydratedIdentityRef.current === null
+      && pendingExternalDraft !== null
+      && pendingExternalPromptOrder !== null
+      && !editorLoadError
+    const restoredIdentityMatchesCurrent = acceptsCurrentFallback
+      || hydratedIdentityRef.current?.presetId === preset.id
+        && hydratedIdentityRef.current.presetRevision === (preset.cacheRevision ?? 0)
+        && hydratedIdentityRef.current.configRevision === (preset.agentConfigRevision ?? 0)
     pendingExternalDraftRef.current = null
     pendingExternalPromptOrderRef.current = null
     committedDraftRef.current = structuredClone(restoredDraft)
     committedPromptOrderRef.current = structuredClone(restoredPromptOrder)
     setRepairedSlotIds(new Set())
+    setLoomRevisionRestagePending(false)
+    lastReturnedIdentityRef.current = null
     setDraft(restoredDraft)
     setPromptOrder(restoredPromptOrder)
     setMaxInvocationsInput(String(restoredDraft.config.maxInvocations))
     setMaxToolCallsInput(String(restoredDraft.config.maxToolCalls))
     setSavedFingerprint(`${runtimeDraftFingerprint(restoredDraft)}\n${JSON.stringify(restoredPromptOrder)}`)
-    setSaveState(externalSnapshotIncomplete ? 'conflict' : 'idle')
+    if (acceptsCurrentFallback) {
+      hydratedIdentityRef.current = {
+        presetId: preset.id,
+        presetRevision: preset.cacheRevision ?? 0,
+        configRevision: preset.agentConfigRevision ?? 0,
+      }
+      setIsHydrated(true)
+    }
+    setConflictRecoveryState('idle')
+    setSaveState(externalSnapshotIncomplete || !restoredIdentityMatchesCurrent ? 'conflict' : 'idle')
   }
 
   const stageAgentBlock = () => {
-    if (!selectedProfile || saveInFlightRef.current) return
+    if (!isHydratedForCurrentPreset || !selectedProfile || saveInFlightRef.current) return
+
     const block = createAgentPromptBlock(
       selectedProfile,
       agentsT('syntax.taskPlaceholder'),
@@ -2184,12 +2511,22 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const renderAgents = () => (
     <>
       <SectionHeader title={t('sections.agents.title')} description={t('sections.agents.description')} />
+      {(draft.quarantinedProfiles ?? []).map((item) => (
+        <div className={styles.notice} role="alert" key={item.id}>
+          <AlertTriangle size={18} aria-hidden="true" />
+          <div><strong>{t('tasks.quarantined')}</strong><p>{t('tasks.quarantinedHint')}</p></div>
+          <button type="button" className={styles.iconButton} onClick={() => discardQuarantinedProfile(item.id)} aria-label={t('tasks.discardQuarantined')}>
+            <Trash2 size={16} aria-hidden="true" />
+          </button>
+        </div>
+      ))}
       <div className={styles.sectionActions}>
         <button
           type="button"
           className={styles.button}
-          disabled={draft.config.profiles.length >= AGENT_PROFILE_LIMIT}
+          disabled={draft.config.profiles.length >= AGENT_PROFILE_LIMIT || draftControlsLocked}
           onClick={() => {
+            if (saveInFlightRef.current) return
             const profile = createAgentProfileV2(
               agentsT('profiles.defaultName', { number: draft.config.profiles.length + 1 }),
               draft.config.profiles.map((candidate) => candidate.id),
@@ -2220,15 +2557,16 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
           <div className={styles.editorStack}>
             <div className={styles.formGrid}>
               <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('profiles.name')}</span>
-                <input className={styles.input} value={selectedProfile.name} maxLength={AGENT_PROFILE_NAME_MAX_LENGTH} onChange={(event) => updateProfile((profile) => ({ ...profile, name: event.target.value }))} />
+                <input className={styles.input} disabled={draftControlsLocked} value={selectedProfile.name} maxLength={AGENT_PROFILE_NAME_MAX_LENGTH} onChange={(event) => updateProfile((profile) => ({ ...profile, name: event.target.value }))} />
               </label>
               <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('profiles.id')}</span>
-                <input className={styles.input} value={selectedProfile.id} onChange={(event) => updateProfile((profile) => ({ ...profile, id: event.target.value }))} />
+                <input className={styles.input} disabled={draftControlsLocked} value={selectedProfile.id} onChange={(event) => updateProfile((profile) => ({ ...profile, id: event.target.value }))} />
               </label>
             </div>
             <label className={styles.field}><span className={styles.fieldLabel}>{t('agents.connectionRef')}</span>
               <select
                 className={styles.select}
+                disabled={draftControlsLocked}
                 value={selectedProfile.connectionRef.kind === 'slot' ? selectedProfile.connectionRef.slotId : ''}
                 onChange={(event) => updateProfile((profile) => ({
                   ...profile,
@@ -2240,54 +2578,60 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
               </select>
             </label>
             <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('profiles.systemPrompt')}</span>
-              <textarea className={styles.textarea} value={selectedProfile.systemPrompt} maxLength={AGENT_SYSTEM_PROMPT_MAX_BYTES} onChange={(event) => updateProfile((profile) => ({ ...profile, systemPrompt: event.target.value }))} />
+              <textarea className={styles.textarea} disabled={draftControlsLocked} value={selectedProfile.systemPrompt} maxLength={AGENT_SYSTEM_PROMPT_MAX_BYTES} onChange={(event) => updateProfile((profile) => ({ ...profile, systemPrompt: event.target.value }))} />
             </label>
-            <ToolChecklist selected={selectedProfile.toolIds} onChange={(toolIds) => updateProfile((profile) => ({ ...profile, toolIds }))} legend={agentsT('profiles.tools')} />
+            <ToolChecklist selected={selectedProfile.toolIds} disabled={draftControlsLocked} onChange={(toolIds) => updateProfile((profile) => ({ ...profile, toolIds }))} legend={agentsT('profiles.tools')} />
             <WorkspaceCapabilityChecklist
               selected={selectedProfile.workspaceCapabilities ?? []}
+              disabled={draftControlsLocked}
               onChange={(workspaceCapabilities) => updateProfile((profile) => ({ ...profile, workspaceCapabilities }))}
               legend={agentsT('profiles.workspaceCapabilities')}
               hint={agentsT('profiles.workspaceCapabilitiesHint')}
             />
             <div className={styles.settingRow}>
               <div><strong>{agentsT('profiles.delegation')}</strong><small>{agentsT('profiles.delegationHint')}</small></div>
-              <Toggle.Switch checked={selectedProfile.allowMainDelegation} onChange={(allowMainDelegation) => updateProfile((profile) => ({ ...profile, allowMainDelegation }))} aria-label={agentsT('profiles.delegation')} />
+              <Toggle.Switch disabled={draftControlsLocked} checked={selectedProfile.allowMainDelegation} onChange={(allowMainDelegation) => updateProfile((profile) => ({ ...profile, allowMainDelegation }))} aria-label={agentsT('profiles.delegation')} />
             </div>
             <div className={styles.settingRow}>
               <div><strong>{agentsT('profiles.activity')}</strong><small>{agentsT('profiles.activityHint')}</small></div>
-              <Toggle.Switch checked={selectedProfile.streamActivity} onChange={(streamActivity) => updateProfile((profile) => ({ ...profile, streamActivity }))} aria-label={agentsT('profiles.activity')} />
+              <Toggle.Switch disabled={draftControlsLocked} checked={selectedProfile.streamActivity} onChange={(streamActivity) => updateProfile((profile) => ({ ...profile, streamActivity }))} aria-label={agentsT('profiles.activity')} />
             </div>
             <div className={styles.formGrid}>
               <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('profiles.failurePolicy')}</span>
-                <select className={styles.select} value={selectedProfile.failurePolicy} onChange={(event) => updateProfile((profile) => ({ ...profile, failurePolicy: event.target.value === 'optional' ? 'optional' : 'required' }))}>
+                <select className={styles.select} disabled={draftControlsLocked} value={selectedProfile.failurePolicy} onChange={(event) => updateProfile((profile) => ({ ...profile, failurePolicy: event.target.value === 'optional' ? 'optional' : 'required' }))}>
                   <option value="required">{agentsT('profiles.failureRequired')}</option><option value="optional">{agentsT('profiles.failureOptional')}</option>
                 </select>
               </label>
               <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('profiles.maxOutputTokens')}</span>
-                <input type="number" className={styles.input} min={AGENT_MAX_OUTPUT_TOKENS_MIN} max={AGENT_MAX_OUTPUT_TOKENS_MAX} step={1} value={selectedProfile.maxOutputTokens} onChange={(event) => updateProfile((profile) => ({ ...profile, maxOutputTokens: Number(event.target.value) }))} />
+                <input type="number" className={styles.input} disabled={draftControlsLocked} min={AGENT_MAX_OUTPUT_TOKENS_MIN} max={AGENT_MAX_OUTPUT_TOKENS_MAX} step={1} value={selectedProfile.maxOutputTokens} onChange={(event) => updateProfile((profile) => ({ ...profile, maxOutputTokens: Number(event.target.value) }))} />
               </label>
               <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('profiles.timeout')}</span>
-                <input type="number" className={styles.input} min={agentTimeoutMsToSeconds(AGENT_TIMEOUT_MS_MIN)} step={1} value={agentTimeoutMsToSeconds(selectedProfile.timeoutMs)} onChange={(event) => updateProfile((profile) => ({ ...profile, timeoutMs: parseAgentTimeoutSecondsInput(event.target.value) }))} />
+                <input type="number" className={styles.input} disabled={draftControlsLocked} min={agentTimeoutMsToSeconds(AGENT_TIMEOUT_MS_MIN)} step={1} value={agentTimeoutMsToSeconds(selectedProfile.timeoutMs)} onChange={(event) => updateProfile((profile) => ({ ...profile, timeoutMs: parseAgentTimeoutSecondsInput(event.target.value) }))} />
               </label>
             </div>
             <div className={styles.sectionActions}>
-              <button type="button" className={styles.button} onClick={stageAgentBlock}>
+              <button type="button" className={styles.button} disabled={draftControlsLocked} onClick={stageAgentBlock}>
                 <Plus size={16} aria-hidden="true" /> {agentsT('syntax.createBlock')}
               </button>
               <code className={styles.code}>{`{{agent::${selectedProfile.id}::as=${getAgentResultName(selectedProfile.id)}}}`}</code>
               <button
                 type="button"
                 className={styles.dangerButton}
+                disabled={draftControlsLocked}
                 onClick={() => {
+                  if (!isHydratedForCurrentPreset || saveInFlightRef.current) return
                   const removedProfileId = selectedProfile.id
-                  updateConfig((config) => ({
-                    ...config,
-                    profiles: config.profiles.filter((_profile, index) => index !== selectedProfileIndex),
-                  }))
+                  updateConfig((config) => {
+                    const nextConfig = {
+                      ...config,
+                      profiles: config.profiles.filter((_profile, index) => index !== selectedProfileIndex),
+                    }
+                    return updateRuntimePolicyChildProfileAssignments(nextConfig, removedProfileId, null)
+                  })
                   setPromptOrder((current) => current.map((block) => {
                     if (typeof block.content !== 'string') return block
                     const content = removeAgentProfileMarkers(block.content, removedProfileId)
-                    return content === block.content ? block : { ...block, content: content as string }
+                    return revisePromptBlockContent(block, content)
                   }))
                   setSelectedProfileIndex((index) => Math.max(0, index - 1))
                 }}
@@ -2304,15 +2648,18 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
       <SectionHeader title={t('sections.tools.title')} description={t('sections.tools.description')} />
       <div className={styles.formGrid}>
         <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('maxInvocations.label')}</span>
-          <input id="agents-max-invocations" type="number" className={styles.input} min={AGENT_INVOCATION_MIN} step={1} value={maxInvocationsInput} aria-invalid={maxInvocationsInvalid} onChange={(event) => {
+          <input id="agents-max-invocations" type="number" className={styles.input} min={AGENT_INVOCATION_MIN} step={1} value={maxInvocationsInput} aria-invalid={maxInvocationsInvalid} disabled={draftControlsLocked} onChange={(event) => {
+            if (!isHydratedForCurrentPreset || saveInFlightRef.current) return
             setMaxInvocationsInput(event.target.value)
             const maxInvocations = parseAgentMaxInvocationsInput(event.target.value)
             if (!Number.isNaN(maxInvocations)) updateConfig((config) => ({ ...config, maxInvocations }))
           }} />
+
           <FieldError>{maxInvocationsInvalid ? agentsT('maxInvocations.error') : undefined}</FieldError>
         </label>
         <label className={styles.field}><span className={styles.fieldLabel}>{agentsT('maxToolCalls.label')}</span>
-          <input id="agents-max-tool-calls" type="number" className={styles.input} min={AGENT_TOOL_CALL_MIN} step={1} value={maxToolCallsInput} aria-invalid={maxToolCallsInvalid} onChange={(event) => {
+          <input id="agents-max-tool-calls" type="number" className={styles.input} min={AGENT_TOOL_CALL_MIN} step={1} value={maxToolCallsInput} aria-invalid={maxToolCallsInvalid} disabled={draftControlsLocked} onChange={(event) => {
+            if (!isHydratedForCurrentPreset || saveInFlightRef.current) return
             setMaxToolCallsInput(event.target.value)
             const maxToolCalls = parseAgentMaxToolCallsInput(event.target.value)
             if (!Number.isNaN(maxToolCalls)) updateConfig((config) => ({ ...config, maxToolCalls }))
@@ -2320,11 +2667,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
           <FieldError>{maxToolCallsInvalid ? agentsT('maxToolCalls.error') : undefined}</FieldError>
         </label>
       </div>
-      <ToolChecklist selected={draft.config.mainToolIds} onChange={(mainToolIds) => updateConfig((config) => ({ ...config, mainToolIds }))} legend={agentsT('tools.legend')} />
+      <ToolChecklist selected={draft.config.mainToolIds} disabled={draftControlsLocked} onChange={(mainToolIds) => updateConfig((config) => ({ ...config, mainToolIds }))} legend={agentsT('tools.legend')} />
       <fieldset className={styles.fieldset}><legend className={styles.fieldLabel}>{agentsT('scope.label')}</legend>
         <div className={styles.segmented}>{(['active', 'all_owned'] as const).map((scope) => (
           <label key={scope} className={clsx(styles.segmentedOption, draft.config.mainLoreScope === scope && styles.segmentedSelected)}>
-            <input type="radio" name="main-lore-scope" checked={draft.config.mainLoreScope === scope} onChange={() => updateConfig((config) => ({ ...config, mainLoreScope: scope }))} />
+            <input type="radio" disabled={draftControlsLocked} name="main-lore-scope" checked={draft.config.mainLoreScope === scope} onChange={() => updateConfig((config) => ({ ...config, mainLoreScope: scope }))} />
             {agentsT(`scope.${scope}`)}
           </label>
         ))}</div>
@@ -2342,7 +2689,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
           type="button"
           className={styles.button}
           onClick={addCustomPhase}
-          disabled={!isHydrated || draftCustomPhases.length >= AGENTIC_CUSTOM_PHASE_LIMIT}
+          disabled={draftControlsLocked || draftCustomPhases.length >= AGENTIC_CUSTOM_PHASE_LIMIT}
         >
           <Plus size={16} aria-hidden="true" /> {t('customPhases.add')}
         </button>
@@ -2395,11 +2742,17 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                   <span className={styles.fieldLabel}>{t('customPhases.id')}</span>
                   <input
                     className={styles.input}
+                    disabled={draftControlsLocked}
                     value={phase.id}
                     maxLength={64}
                     pattern="[a-z][a-z0-9_]{0,63}"
+                    required
                     aria-label={t('customPhases.idFor', { label: phase.label || phase.id })}
-                    onChange={(event) => renameCustomPhase(phaseIndex, event.target.value)}
+                    onChange={(event) => {
+                      if (event.currentTarget.validity.valid && isEditablePredicateId(event.target.value)) {
+                        renameCustomPhase(phaseIndex, event.target.value)
+                      }
+                    }}
                   />
                 </label>
                 <label className={styles.field}>
@@ -2433,9 +2786,13 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                     aria-label={t('customPhases.repeatLimitFor', { label: phase.label || phase.id })}
                     onChange={(event) => {
                       const value = Number.parseInt(event.target.value, 10)
+                      const repeatLimit = Number.isSafeInteger(value) ? Math.min(4, Math.max(0, value)) : 0
                       updateCustomPhase(phaseIndex, (current) => ({
                         ...current,
-                        repeatLimit: Number.isSafeInteger(value) ? Math.min(4, Math.max(0, value)) : 0,
+                        repeatLimit,
+                        nextPhaseIds: repeatLimit === 0
+                          ? current.nextPhaseIds.filter((phaseId) => phaseId !== current.id)
+                          : current.nextPhaseIds,
                       }))
                     }}
                   />
@@ -2448,36 +2805,60 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                 <div className={styles.optionList}>
                   {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
                     const source = phase.instructionRefs.find((candidate) => candidate.blockId === block.id)
-                    const blockRevision = isCanonicalBlockRevision(block.revision) ? block.revision : 1
+                    const blockRevision = block.revision === undefined
+                      ? 1
+                      : isCanonicalBlockRevision(block.revision) ? block.revision : null
                     const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
-                    const stale = source !== undefined && (
-                      source.presetRevision !== (preset.cacheRevision ?? 0)
+                    const needsRepair = source !== undefined && (
+                      blockRevision === null
+                      || source.presetRevision !== (preset.cacheRevision ?? 0)
                       || source.blockRevision !== blockRevision
                       || source.promptOrder !== promptIndex
                     )
                     return (
-                      <label className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)} key={`${phase.id}-instruction-${block.id}`}>
-                        <input
-                          type="checkbox"
-                          checked={selectedBlockIds.has(block.id)}
-                          onChange={(event) => toggleCustomPhaseInstruction(phaseIndex, block, event.target.checked)}
-                        />
-                        <span>
-                          <strong>{block.name}</strong>
-                          <small>{source ? t('phases.sourceRevision', {
-                            presetRevision: source.presetRevision,
-                            blockRevision: source.blockRevision,
-                            promptOrder: source.promptOrder,
-                          }) : t('customPhases.notSelected')}</small>
-                          {stale && <small>{t('phases.stale')}</small>}
-                        </span>
-                      </label>
+                      <div className={styles.sourceChoiceRow} key={`${phase.id}-instruction-${block.id}`}>
+                        <label className={clsx(
+                          styles.listChoice,
+                          (needsRepair || blockRevision === null) && styles.listChoiceInvalid,
+                        )}>
+                          <input
+                            type="checkbox"
+                            checked={selectedBlockIds.has(block.id)}
+                            disabled={blockRevision === null && source === undefined}
+                            aria-invalid={needsRepair || blockRevision === null}
+                            onChange={(event) => toggleCustomPhaseInstruction(phaseIndex, block, event.target.checked)}
+                          />
+                          <span>
+                            <strong>{block.name}</strong>
+                            <small>{block.id}</small>
+                            <small>{source ? t('phases.sourceRevision', {
+                              presetRevision: source.presetRevision,
+                              blockRevision: source.blockRevision,
+                              promptOrder: source.promptOrder,
+                            }) : t('customPhases.notSelected')}</small>
+                            {needsRepair && <small role="alert">{t('phases.stale')}</small>}
+                            {blockRevision === null && <small role="alert">{t('limits.invalidBlockRevision')}</small>}
+                          </span>
+                        </label>
+                        {source && needsRepair && blockRevision !== null && (
+                          <button
+                            type="button"
+                            className={styles.button}
+                            onClick={() => toggleCustomPhaseInstruction(phaseIndex, block, true)}
+                          >
+                            <RefreshCw size={16} aria-hidden="true" />
+                            {t('repair.actions.select_revision')}
+                          </button>
+                        )}
+                      </div>
                     )
                   })}
                   {phase.instructionRefs
-                    .filter((source) => !promptOrder.some((block) => block.id === source.blockId))
+                    .filter((source) => !promptOrder.some((block) => (
+                      block.id === source.blockId && block.marker !== 'category'
+                    )))
                     .map((source) => (
-                      <div className={styles.listChoiceInvalid} key={`${phase.id}-unknown-${source.blockId}`}>
+                      <div role="alert" className={clsx(styles.listChoice, styles.listChoiceInvalid, styles.sourceChoiceStatic)} key={`${phase.id}-unknown-${source.blockId}`}>
                         <span>
                           <strong>{source.blockId}</strong>
                           <small>{t('customPhases.unavailableInstruction', { id: source.blockId })}</small>
@@ -2492,7 +2873,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                           className={styles.iconButton}
                           onClick={() => updateCustomPhase(phaseIndex, (current) => ({
                             ...current,
-                            instructionRefs: current.instructionRefs.filter((candidate) => candidate !== source),
+                            instructionRefs: current.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId),
+                            childInstructionSubsets: current.childInstructionSubsets.map((subset) => ({
+                              ...subset,
+                              instructionRefs: subset.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId),
+                            })),
                           }))}
                           aria-label={t('customPhases.removeInstruction', { id: source.blockId })}
                         >
@@ -2503,14 +2888,163 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                 </div>
               </fieldset>
               <fieldset className={styles.fieldset}>
+                <legend className={styles.fieldLabel}>{t('customPhases.childInstructionSubsets')}</legend>
+                <p className={styles.muted}>{t('customPhases.childInstructionSubsetsHint')}</p>
+                {draftProfiles.length === 0 ? (
+                  <p className={styles.empty}>{t('customPhases.childInstructionSubsetsNoProfiles')}</p>
+                ) : (
+                  <div className={styles.childSubsetList}>
+                    {draftProfiles.map((profile) => {
+                      const subsetIndex = phase.childInstructionSubsets.findIndex((subset) => subset.profileId === profile.id)
+                      const subset = subsetIndex < 0 ? undefined : phase.childInstructionSubsets[subsetIndex]
+                      const assignedBlockIds = new Set(subset?.instructionRefs.map((source) => source.blockId) ?? [])
+                      const subsetHasRepair = subsetIndex >= 0 && validation.issues.some((issue) => (
+                        issue.path.startsWith(
+                          `config.runtimePolicy.phases.${phaseIndex}.childInstructionSubsets.${subsetIndex}`,
+                        )
+                      ))
+                      return (
+                        <div
+                          className={clsx(styles.childSubsetCard, subsetHasRepair && styles.listChoiceInvalid)}
+                          key={`${phase.id}-child-subset-${profile.id}`}
+                        >
+                          <div className={styles.childSubsetHeader}>
+                            <div>
+                              <strong>{profile.name || profile.id}</strong>
+                              <small>{t('customPhases.childSubsetProfileId', { id: profile.id })}</small>
+                            </div>
+                            <label className={styles.inlineCheckbox}>
+                              <input
+                                type="checkbox"
+                                checked={subset !== undefined}
+                                disabled={draftControlsLocked}
+                                aria-label={t('customPhases.childSubsetAssignFor', { id: profile.id })}
+                                onChange={(event) => toggleCustomPhaseChildSubsetAssignment(
+                                  phaseIndex,
+                                  profile.id,
+                                  event.target.checked,
+                                )}
+                              />
+                              {t('customPhases.childSubsetAssign')}
+                            </label>
+                          </div>
+                          <p className={styles.muted}>
+                            {subset === undefined
+                              ? t('customPhases.childSubsetUnassigned')
+                              : subset.instructionRefs.length === 0
+                                ? t('customPhases.childSubsetEmpty')
+                                : t('customPhases.childSubsetCount', { count: subset.instructionRefs.length })}
+                          </p>
+                          {subsetHasRepair && (
+                            <p className={styles.fieldError} role="alert">{t('customPhases.childSubsetRepair')}</p>
+                          )}
+                          <div className={styles.optionList}>
+                            {phase.instructionRefs.map((source) => {
+                              const block = promptOrder.find((candidate) => candidate.id === source.blockId)
+                              const promptIndex = block === undefined
+                                ? -1
+                                : promptOrder.findIndex((candidate) => candidate.id === source.blockId)
+                              const blockRevision = block === undefined
+                                ? null
+                                : block.revision === undefined
+                                  ? 1
+                                  : isCanonicalBlockRevision(block.revision) ? block.revision : null
+                              const stale = block === undefined
+                                || block.marker === 'category'
+                                || source.presetRevision !== (preset.cacheRevision ?? 0)
+                                || source.blockRevision !== blockRevision
+                                || source.promptOrder !== promptIndex
+                              return (
+                                <label
+                                  className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)}
+                                  key={`${phase.id}-${profile.id}-child-instruction-${source.blockId}`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={assignedBlockIds.has(source.blockId)}
+                                    aria-invalid={stale}
+                                    disabled={subset === undefined || draftControlsLocked}
+                                    onChange={(event) => toggleCustomPhaseChildSubset(
+                                      phaseIndex,
+                                      profile.id,
+                                      source,
+                                      event.target.checked,
+                                    )}
+                                  />
+                                  <span>
+                                    <strong>{block?.name ?? source.blockId}</strong>
+                                    <small>{source.blockId}</small>
+                                    <small>{t('phases.sourceRevision', {
+                                      presetRevision: source.presetRevision,
+                                      blockRevision: source.blockRevision,
+                                      promptOrder: source.promptOrder,
+                                    })}</small>
+                                    {stale && <small>{t('customPhases.childSubsetRepair')}</small>}
+                                  </span>
+                                </label>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )
+                    })}
+                    {phase.childInstructionSubsets.map((subset, subsetIndex) => {
+                      if (draftProfiles.some((profile) => profile.id === subset.profileId)) return null
+                      return (
+                        <div
+                          className={clsx(styles.childSubsetCard, styles.listChoiceInvalid)}
+                          key={`${phase.id}-orphan-child-subset-${subset.profileId}-${subsetIndex}`}
+                        >
+                          <div className={styles.childSubsetHeader}>
+                            <div>
+                              <strong>{t('customPhases.childSubsetUnknownProfile', { id: subset.profileId })}</strong>
+                              <small>{t('customPhases.childSubsetRepair')}</small>
+                            </div>
+                            <button
+                              type="button"
+                              className={styles.iconButton}
+                              disabled={draftControlsLocked}
+                              onClick={() => updateCustomPhase(phaseIndex, (current) => ({
+                                ...current,
+                                childInstructionSubsets: current.childInstructionSubsets.filter(
+                                  (_candidate, candidateIndex) => candidateIndex !== subsetIndex,
+                                ),
+                              }))}
+                              aria-label={t('customPhases.childSubsetRemove', { id: subset.profileId })}
+                            >
+                              <Trash2 size={16} aria-hidden="true" />
+                            </button>
+                          </div>
+                          <p className={styles.fieldError} role="alert">{t('customPhases.childSubsetRepair')}</p>
+                          <div className={styles.optionList}>
+                            {subset.instructionRefs.map((source) => (
+                              <div className={styles.listChoiceInvalid} key={`${phase.id}-orphan-${subset.profileId}-${source.blockId}`}>
+                                <span>
+                                  <strong>{source.blockId}</strong>
+                                  <small>{t('phases.sourceRevision', {
+                                    presetRevision: source.presetRevision,
+                                    blockRevision: source.blockRevision,
+                                    promptOrder: source.promptOrder,
+                                  })}</small>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </fieldset>
+              <fieldset className={styles.fieldset}>
                 <legend className={styles.fieldLabel}>{t('customPhases.enter')}</legend>
                 <p className={styles.muted}>{t('customPhases.enterHint')}</p>
-                <PredicateEditor value={phase.enter} taskTemplateIds={taskTemplateIds} onChange={(enter) => updateCustomPhase(phaseIndex, (current) => ({ ...current, enter }))} />
+                <PredicateEditor value={phase.enter} taskTemplateIds={taskTemplateIds} disabled={draftControlsLocked} onChange={(enter) => updateCustomPhase(phaseIndex, (current) => ({ ...current, enter }))} />
               </fieldset>
               <fieldset className={styles.fieldset}>
                 <legend className={styles.fieldLabel}>{t('customPhases.exit')}</legend>
                 <p className={styles.muted}>{t('customPhases.exitHint')}</p>
-                <PredicateEditor value={phase.exit} taskTemplateIds={taskTemplateIds} onChange={(exit) => updateCustomPhase(phaseIndex, (current) => ({ ...current, exit }))} />
+                <PredicateEditor value={phase.exit} taskTemplateIds={taskTemplateIds} disabled={draftControlsLocked} onChange={(exit) => updateCustomPhase(phaseIndex, (current) => ({ ...current, exit }))} />
               </fieldset>
               <fieldset className={styles.fieldset}>
                 <legend className={styles.fieldLabel}>{t('customPhases.skip')}</legend>
@@ -2519,6 +3053,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                   <input
                     type="checkbox"
                     checked={phase.skip !== undefined}
+                    disabled={draftControlsLocked}
                     aria-label={t('customPhases.skipFor', { label: phase.label || phase.id })}
                     onChange={(event) => updateCustomPhase(phaseIndex, (current) => {
                       if (!event.target.checked) {
@@ -2530,7 +3065,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                     })}
                   />
                 </label>
-                {phase.skip && <PredicateEditor value={phase.skip} taskTemplateIds={taskTemplateIds} onChange={(skip) => updateCustomPhase(phaseIndex, (current) => ({ ...current, skip }))} />}
+                {phase.skip && <PredicateEditor value={phase.skip} taskTemplateIds={taskTemplateIds} disabled={draftControlsLocked} onChange={(skip) => updateCustomPhase(phaseIndex, (current) => ({ ...current, skip }))} />}
               </fieldset>
               <fieldset className={styles.fieldset}>
                 <legend className={styles.fieldLabel}>{t('customPhases.capabilities')}</legend>
@@ -2624,38 +3159,20 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
 
   const renderPhases = () => {
     const responseOmissionEntries = POLICY_KEYS.flatMap((policyKey) => (
-      draftLoomPolicy[policyKey].map((entry) => ({ policyKey, entry }))
+      draftLoomPolicy[policyKey]
     ))
-    const responseOmissionContext = [
-      ...draftContextPackSelections
-        .filter(isAgentContextPackSelection)
-        .map((selection) => ({
-          id: selection.packId,
-          revisionId: selection.revisionId,
-          label: selection.label ?? selection.packId,
-        })),
-      ...draftContextRules
-        .filter(isAgentContextActivationRule)
-        .map((rule) => ({
-          id: rule.id,
-          revisionId: rule.revisionId,
-          label: rule.packId,
-        })),
-    ]
-    const responseOmissionPhaseInstructions = draftCustomPhases.flatMap((phase) => (
-      phase.instructionRefs.map((source) => ({ phase, source }))
-    ))
+    const responseOmissionPhases = draftCustomPhases
     return (
       <>
         <SectionHeader title={t('sections.phases.title')} description={t('sections.phases.description')} />
-        {(responseOmissionEntries.length > 0 || responseOmissionContext.length > 0 || responseOmissionPhaseInstructions.length > 0) && (
+        {(responseOmissionEntries.length > 0 || responseOmissionPhases.length > 0) && (
           <div className={styles.notice} role="status">
             <AlertTriangle size={20} aria-hidden="true" />
             <div>
               <strong>{t('phases.responseOmissionTitle')}</strong>
               <p>{t('phases.responseOmissionHint')}</p>
               <ul className={styles.selectionList}>
-                {responseOmissionEntries.map(({ policyKey, entry }) => (
+                {responseOmissionEntries.map((entry) => (
                   <li key={`response-omission-${entry.id}`}>
                     <span>
                       <strong>{entry.source.blockId}</strong>
@@ -2664,25 +3181,33 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                         checkpoint: t(`phases.checkpoints.${entry.checkpoint}`),
                       })}</small>
                       <small>{t('phases.responseOmissionEntry', { id: entry.id })}</small>
-                    </span>
-                  </li>
-                ))}
-                {responseOmissionPhaseInstructions.map(({ phase, source }) => (
-                  <li key={`response-omission-phase-${phase.id}-${source.blockId}`}>
-                    <span>
-                      <strong>{phase.label || phase.id}</strong>
-                      <small>{t('phases.responseOmissionPhaseInstruction', {
-                        blockId: source.blockId,
-                        blockRevision: source.blockRevision,
+                      <small>{t('phases.sourceRevision', {
+                        presetRevision: entry.source.presetRevision,
+                        blockRevision: entry.source.blockRevision,
+                        promptOrder: entry.source.promptOrder,
                       })}</small>
                     </span>
                   </li>
                 ))}
-                {responseOmissionContext.map((context) => (
-                  <li key={`response-omission-context-${context.id}-${context.revisionId}`}>
+                {responseOmissionPhases.map((phase, phaseIndex) => (
+                  <li key={`response-omission-phase-${phase.id}-${phaseIndex}`}>
                     <span>
-                      <strong>{context.label}</strong>
-                      <small>{t('phases.responseOmissionContext', { id: context.id, revisionId: context.revisionId })}</small>
+                      <strong>{phase.label || phase.id}</strong>
+                      <small>{t('customPhases.summary', { number: phaseIndex + 1, id: phase.id })}</small>
+                      {phase.instructionRefs.map((source) => (
+                        <small key={`response-omission-phase-${phase.id}-${source.blockId}`}>
+                          {t('phases.responseOmissionPhaseInstruction', {
+                            blockId: source.blockId,
+                            blockRevision: source.blockRevision,
+                          })}
+                          {' · '}
+                          {t('phases.sourceRevision', {
+                            presetRevision: source.presetRevision,
+                            blockRevision: source.blockRevision,
+                            promptOrder: source.promptOrder,
+                          })}
+                        </small>
+                      ))}
                     </span>
                   </li>
                 ))}
@@ -2712,37 +3237,53 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                 <div className={styles.optionList}>
                   {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
                     const entry = entries.find((candidate) => candidate.source.blockId === block.id)
-                    const blockRevision = isCanonicalBlockRevision(block.revision) ? block.revision : 1
+                    const blockRevision = block.revision === undefined
+                      ? 1
+                      : isCanonicalBlockRevision(block.revision) ? block.revision : null
                     const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
-                    const stale = entry !== undefined && (
-                      entry.source.presetRevision !== (preset.cacheRevision ?? 0)
+                    const needsRepair = entry !== undefined && (
+                      blockRevision === null
+                      || entry.source.presetRevision !== (preset.cacheRevision ?? 0)
                       || entry.source.blockRevision !== blockRevision
                       || entry.source.promptOrder !== promptIndex
                     )
-                    const delivery = entry?.delivery
-                    const request = delivery?.delivery === 'on_demand' ? delivery.request : null
-                    const requestKey = request ? `${request.contextPackId}\u0000${request.revisionId}\u0000${request.digest}` : ''
-                    const selectedRequestKeys = new Set(draftContextPackSelections
-                      .filter(isAgentContextPackSelection)
-                      .map((selection) => `${selection.packId}\u0000${selection.revisionId}\u0000${selection.digest}`))
-                    const availableRequests = availableContextPacks.filter((option) => (
-                      option.attachmentStatus === 'available'
-                      && selectedRequestKeys.has(`${option.packId}\u0000${option.revisionId}\u0000${option.digest}`)
-                    ))
                     return (
                       <div key={`${policyKey}-${block.id}`} className={styles.editorStack}>
-                        <label className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)}>
-                          <input type="checkbox" checked={entry !== undefined} onChange={(event) => togglePolicyBlock(policyKey, block, event.target.checked)} />
-                          <span>
-                            <strong>{block.name}</strong>
-                            <small>{entry ? t('phases.sourceRevision', {
-                              presetRevision: entry.source.presetRevision,
-                              blockRevision: entry.source.blockRevision,
-                              promptOrder: entry.source.promptOrder,
-                            }) : t('phases.notSelected')}</small>
-                            {stale && <small>{t('phases.stale')}</small>}
-                          </span>
-                        </label>
+                        <div className={styles.sourceChoiceRow}>
+                          <label className={clsx(
+                            styles.listChoice,
+                            (needsRepair || blockRevision === null) && styles.listChoiceInvalid,
+                          )}>
+                            <input
+                              type="checkbox"
+                              checked={entry !== undefined}
+                              disabled={blockRevision === null && entry === undefined}
+                              aria-invalid={needsRepair || blockRevision === null}
+                              onChange={(event) => togglePolicyBlock(policyKey, block, event.target.checked)}
+                            />
+                            <span>
+                              <strong>{block.name}</strong>
+                              <small>{block.id}</small>
+                              <small>{entry ? t('phases.sourceRevision', {
+                                presetRevision: entry.source.presetRevision,
+                                blockRevision: entry.source.blockRevision,
+                                promptOrder: entry.source.promptOrder,
+                              }) : t('phases.notSelected')}</small>
+                              {needsRepair && <small role="alert">{t('phases.stale')}</small>}
+                              {blockRevision === null && <small role="alert">{t('limits.invalidBlockRevision')}</small>}
+                            </span>
+                          </label>
+                          {entry && needsRepair && blockRevision !== null && (
+                            <button
+                              type="button"
+                              className={styles.button}
+                              onClick={() => togglePolicyBlock(policyKey, block, true)}
+                            >
+                              <RefreshCw size={16} aria-hidden="true" />
+                              {t('repair.actions.select_revision')}
+                            </button>
+                          )}
+                        </div>
                         {entry && (
                           <div className={styles.editorStack}>
                             <div className={styles.readOnlyHeader}>
@@ -2762,388 +3303,83 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                                   onChange={(event) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, required: event.target.checked }))}
                                 />
                               </label>
-                              <label className={styles.field}>
-                                <span className={styles.fieldLabel}>{t('phases.delivery')}</span>
-                                <select
-                                  className={styles.select}
-                                  value={delivery?.delivery ?? 'direct'}
-                                  aria-label={t('phases.deliveryFor', { name: block.name })}
-                                  onChange={(event) => {
-                                    const nextDelivery = event.target.value as LoomPolicyDeliveryV1['delivery']
-                                    updatePolicyEntry(policyKey, block.id, (current) => {
-                                      if (nextDelivery === 'direct') return { ...current, delivery: { delivery: 'direct' } }
-                                      if (nextDelivery === 'condition_gated') {
-                                        const condition = current.delivery.delivery === 'condition_gated'
-                                          ? current.delivery.condition
-                                          : makePredicate('phase')
-                                        return { ...current, delivery: { delivery: 'condition_gated', condition } }
+                              <label className={styles.settingRow}>
+                                <span><strong>{t('phases.condition')}</strong><small>{t('phases.conditionHint')}</small></span>
+                                <input
+                                  type="checkbox"
+                                  checked={entry.condition !== undefined}
+                                  aria-label={t('phases.conditionFor', { name: block.name })}
+                                  onChange={(event) => updatePolicyEntry(policyKey, block.id, (current) => {
+                                    if (event.target.checked) {
+                                      return {
+                                        ...current,
+                                        condition: current.condition ?? { kind: 'phase', value: policyCheckpoint },
                                       }
-                                      const nextOption = availableRequests[0]
-                                      const nextRequest: LoomOnDemandRequestV1 | undefined = current.delivery.delivery === 'on_demand'
-                                        ? current.delivery.request
-                                        : nextOption
-                                          ? {
-                                              contextPackId: nextOption.packId,
-                                              revisionId: nextOption.revisionId,
-                                              digest: nextOption.digest,
-                                            }
-                                          : undefined
-                                      return nextRequest
-                                        ? { ...current, delivery: { delivery: 'on_demand', request: nextRequest } }
-                                        : current
-                                    })
-                                  }}
-                                >
-                                  <option value="direct">{t('phases.deliveryDirect')}</option>
-                                  <option value="condition_gated">{t('phases.deliveryConditionGated')}</option>
-                                  <option value="on_demand" disabled={availableRequests.length === 0 && delivery?.delivery !== 'on_demand'}>{t('phases.deliveryOnDemand')}</option>
-                                </select>
+                                    }
+                                    const { condition: _condition, ...withoutCondition } = current
+                                    return withoutCondition
+                                  })}
+                                />
                               </label>
                             </div>
-                            {delivery?.delivery === 'condition_gated' && (
+                            {entry.condition !== undefined && (
                               <PredicateEditor
-                                value={delivery.condition}
+                                value={entry.condition}
                                 taskTemplateIds={taskTemplateIds}
-                                onChange={(condition) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, delivery: { delivery: 'condition_gated', condition } }))}
+                                disabled={draftControlsLocked}
+                                onChange={(condition) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, condition }))}
                               />
-                            )}
-                            {delivery?.delivery === 'on_demand' && (
-                              <fieldset className={styles.fieldset}>
-                                <legend className={styles.fieldLabel}>{t('phases.onDemandRequest')}</legend>
-                                <label className={styles.field}>
-                                  <span className={styles.fieldLabel}>{t('phases.contextRevision')}</span>
-                                  <select
-                                    className={styles.select}
-                                    value={requestKey}
-                                    aria-label={t('phases.contextRevision')}
-                                    onChange={(event) => {
-                                      const nextOption = availableRequests.find((option) => (
-                                        `${option.packId}\u0000${option.revisionId}\u0000${option.digest}` === event.target.value
-                                      ))
-                                      if (!nextOption) return
-                                      updatePolicyEntry(policyKey, block.id, (current) => ({
-                                        ...current,
-                                        delivery: {
-                                          delivery: 'on_demand',
-                                          request: {
-                                            contextPackId: nextOption.packId,
-                                            revisionId: nextOption.revisionId,
-                                            digest: nextOption.digest,
-                                          },
-                                        },
-                                      }))
-                                    }}
-                                  >
-                                    {request && !availableRequests.some((option) => (
-                                      option.packId === request.contextPackId
-                                      && option.revisionId === request.revisionId
-                                      && option.digest === request.digest
-                                    )) && (
-                                      <option value={requestKey}>{t('phases.unavailableRevision', { revisionId: request.revisionId })}</option>
-                                    )}
-                                    {availableRequests.map((option) => (
-                                      <option key={`${option.packId}\u0000${option.revisionId}\u0000${option.digest}`} value={`${option.packId}\u0000${option.revisionId}\u0000${option.digest}`}>
-                                        {option.label ?? option.packId} · {option.revisionLabel ?? option.revisionId}
-                                      </option>
-                                    ))}
-                                  </select>
-                                </label>
-                                <small>{t('phases.onDemandDigest', { digest: request?.digest ?? '' })}</small>
-                              </fieldset>
                             )}
                           </div>
                         )}
                       </div>
                     )
                   })}
+                  {entries
+                    .filter((entry) => !promptOrder.some((block) => (
+                      block.id === entry.source.blockId && block.marker !== 'category'
+                    )))
+                    .map((entry) => (
+                      <div
+                        role="alert"
+                        className={clsx(styles.listChoice, styles.listChoiceInvalid, styles.sourceChoiceStatic)}
+                        key={`${policyKey}-unknown-${entry.id}`}
+                      >
+                        <span>
+                          <strong>{entry.source.blockId}</strong>
+                          <small>{t('customPhases.unavailableInstruction', { id: entry.source.blockId })}</small>
+                          <small>{t('phases.sourceRevision', {
+                            presetRevision: entry.source.presetRevision,
+                            blockRevision: entry.source.blockRevision,
+                            promptOrder: entry.source.promptOrder,
+                          })}</small>
+                          <small>{entry.id}</small>
+                        </span>
+                        <button
+                          type="button"
+                          className={styles.button}
+                          onClick={() => updateConfig((config) => {
+                            const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
+                            return setAgentRuntimePolicyBuckets(config, {
+                              ...buckets,
+                              [policyKey]: buckets[policyKey].filter((candidate) => candidate.id !== entry.id),
+                            })
+                          })}
+                        >
+                          <Trash2 size={16} aria-hidden="true" />
+                          {t('repair.actions.discard')}
+                        </button>
+                      </div>
+                    ))}
                 </div>
               </div>
             </details>
           )
         })}
-        {renderContext()}
       </>
     )
   }
 
-  const renderContext = () => {
-    const invalidSelectionCount = draft.contextPackSelections.filter((selection) => !isAgentContextPackSelection(selection)).length
-    const invalidRuleCount = draft.contextRules.filter((rule) => !isAgentContextActivationRule(rule)).length
-    const policyQuarantined = !isContextPolicySynchronized(draft)
-    const policyNeedsRepair = validation.issues.some((issue) => issue.path.startsWith('config.runtimePolicy'))
-    const onDemandEntries = POLICY_KEYS.flatMap((policyKey) => (
-      draftLoomPolicy[policyKey]
-        .filter((entry) => entry.delivery.delivery === 'on_demand')
-        .map((entry) => ({ policyKey, entry }))
-    ))
-    return (
-      <section className={styles.editorStack} aria-labelledby="agentic-phased-context-title">
-        <div className={styles.sectionHeader}>
-          <div>
-            <h3 id="agentic-phased-context-title">{t('phases.context.title')}</h3>
-            <p>{t('phases.context.description')}</p>
-          </div>
-        </div>
-        <p className={styles.muted}>
-          {t('phases.context.lifecycleHint')} {t('phases.context.orderingHint')} {t('phases.context.conditionHint')}
-        </p>
-        {(policyQuarantined || invalidSelectionCount > 0 || invalidRuleCount > 0) && (
-          <div className={styles.notice} role="alert">
-            <AlertTriangle size={20} aria-hidden="true" />
-            <div>
-              <strong>{t('context.quarantineTitle')}</strong>
-              <p>{t('context.quarantineHint')}</p>
-              {policyQuarantined && (
-                <button type="button" className={styles.button} onClick={repairContextPolicy}>
-                  <Wrench size={16} aria-hidden="true" /> {t('context.repairPolicy')}
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-        {policyNeedsRepair && (
-          <div className={styles.notice} role="alert">
-            <AlertTriangle size={20} aria-hidden="true" />
-            <div>
-              <strong>{t('context.policyRepairTitle')}</strong>
-              <p>{t('context.policyRepairHint')}</p>
-              {policyRepairItems.length > 0 && (
-                <button
-                  type="button"
-                  className={styles.button}
-                  onClick={() => {
-                    const [item] = policyRepairItems
-                    if (item) resolveRuntimePolicyRepair(item)
-                  }}
-                >
-                  <Wrench size={16} aria-hidden="true" /> {t('context.repairPolicy')}
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-        <label className={styles.field}>
-          <span className={styles.fieldLabel}>{t('context.addPack')}</span>
-          <select
-            className={styles.select}
-            defaultValue=""
-            aria-label={t('context.addPack')}
-            disabled={draft.contextPackSelections.length >= AGENTIC_CONTEXT_RULE_LIMIT}
-            onChange={(event) => { addContextPack(event.target.value); event.target.value = '' }}
-          >
-            <option value="">{t('context.choosePack')}</option>
-            {availableContextPacks.map((selection) => (
-              <option
-                key={`${selection.packId}\u0000${selection.revisionId}`}
-                value={`${selection.packId}\u0000${selection.revisionId}`}
-                disabled={selection.attachmentStatus !== 'available'}
-              >
-                {selection.label ?? selection.packId} · {t('context.revisionLabel', { revision: selection.revision })} · {selection.selectionSource ? t(`context.sources.${selection.selectionSource}`) : t('context.attachmentUnavailable')}
-              </option>
-            ))}
-          </select>
-        </label>
-        <ul className={styles.selectionList}>
-          {draft.contextPackSelections.map((selection, index) => {
-            if (!isAgentContextPackSelection(selection)) {
-              return (
-                <li key={`quarantined-selection-${index}`}>
-                  <AlertTriangle size={18} aria-hidden="true" />
-                  <span>
-                    <strong>{t('context.quarantinedSelection')}</strong>
-                    <small>{t('context.quarantinedSelectionHint')}</small>
-                  </span>
-                  <button type="button" className={styles.iconButton} onClick={() => discardContextSelection(index)} aria-label={t('context.discardQuarantined')}>
-                    <Trash2 size={16} aria-hidden="true" />
-                  </button>
-                </li>
-              )
-            }
-            const option = availableContextPacks.find((candidate) => (
-              candidate.packId === selection.packId && candidate.revisionId === selection.revisionId
-            ))
-            const usedByRule = draft.contextRules.some((rule) => (
-              isAgentContextActivationRule(rule)
-              && rule.packId === selection.packId
-              && rule.revisionId === selection.revisionId
-            ))
-            const onDemandReferences = onDemandEntries.flatMap(({ policyKey, entry }) => {
-              if (entry.delivery.delivery !== 'on_demand'
-                || entry.delivery.request.contextPackId !== selection.packId
-                || entry.delivery.request.revisionId !== selection.revisionId
-                || entry.delivery.request.digest !== selection.digest) return []
-              const entryIndex = draftLoomPolicy[policyKey].findIndex((candidate) => candidate.id === entry.id)
-              return [`config.runtimePolicy.loomPolicy.${policyKey}.${entryIndex}.delivery.request`]
-            })
-            const usedByOnDemand = onDemandReferences.length > 0
-            const scopeLabel = contextScopeLabel(option?.scopes, t)
-            const attachmentLabel = contextAttachmentLabel(option, t)
-            return (
-              <li key={`${selection.packId}\u0000${selection.revisionId}`}>
-                <span>
-                  <strong>{selection.label ?? selection.packId}</strong>
-                  <small>{t('context.revisionLabel', { revision: selection.revision })} · {t('context.digest', { digest: selection.digest })}</small>
-                  <small>{t('context.scopeLabel')}: {scopeLabel} · {attachmentLabel}</small>
-                  {onDemandReferences.map((path) => <code className={styles.repairPath} key={path}>{path}</code>)}
-                </span>
-                <label className={styles.settingRow}>
-                  <span>
-                    <strong>{t('context.alwaysInclude')}</strong>
-                    <small>{t('context.alwaysIncludeHint')}</small>
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={draft.config.contextPolicy?.packIds.includes(selection.packId) ?? false}
-                    aria-label={t('context.alwaysIncludeFor', { name: selection.label ?? selection.packId })}
-                    onChange={(event) => setContextPackDirect(selection.packId, event.target.checked)}
-                  />
-                </label>
-                <button
-                  type="button"
-                  className={styles.iconButton}
-                  disabled={usedByRule || usedByOnDemand}
-                  title={usedByRule
-                    ? t('context.removePackInUse')
-                    : usedByOnDemand
-                      ? t('context.removePackOnDemandInUse')
-                      : undefined}
-                  onClick={() => updateDraft((current) => syncContextReferences(
-                    current,
-                    current.contextPackSelections.filter((candidate) => candidate !== selection),
-                    current.contextRules,
-                  ))}
-                  aria-label={t('context.removePack', { name: selection.label ?? selection.packId })}
-                >
-                  <Trash2 size={16} aria-hidden="true" />
-                </button>
-              </li>
-            )
-          })}
-        </ul>
-        {onDemandEntries.length > 0 && (
-          <fieldset className={styles.fieldset}>
-            <legend className={styles.fieldLabel}>{t('context.onDemandTitle')}</legend>
-            <p className={styles.muted}>{t('context.onDemandHint')}</p>
-            <ul className={styles.selectionList}>
-              {onDemandEntries.map(({ policyKey, entry }) => {
-                const request = entry.delivery.delivery === 'on_demand' ? entry.delivery.request : null
-                if (!request) return null
-                return (
-                  <li key={`on-demand-${entry.id}`}>
-                    <span>
-                      <strong>{entry.source.blockId}</strong>
-                      <small>{t(`phases.${policyKey}.title`)} · {request.revisionId}</small>
-                      <small>{t('context.onDemandDigest', { digest: request.digest })}</small>
-                    </span>
-                  </li>
-                )
-              })}
-            </ul>
-          </fieldset>
-        )}
-        <div className={styles.sectionActions}>
-          <button
-            type="button"
-            className={styles.button}
-            disabled={draft.contextPackSelections.filter((selection) => isAgentContextPackSelection(selection)).length === 0
-              || draft.contextRules.length >= AGENTIC_CONTEXT_RULE_LIMIT}
-            onClick={addContextRule}
-          >
-            <Plus size={16} aria-hidden="true" /> {t('context.addRule')}
-          </button>
-        </div>
-        {draft.contextRules.map((rule, index) => {
-          if (!isAgentContextActivationRule(rule)) {
-            return (
-              <div className={styles.notice} role="alert" key={`quarantined-rule-${index}`}>
-                <AlertTriangle size={18} aria-hidden="true" />
-                <div><strong>{t('context.quarantinedRule')}</strong><p>{t('context.quarantinedRuleHint')}</p></div>
-                <button type="button" className={styles.iconButton} onClick={() => discardContextRule(index)} aria-label={t('context.discardQuarantined')}>
-                  <Trash2 size={16} aria-hidden="true" />
-                </button>
-              </div>
-            )
-          }
-          const pack = draft.contextPackSelections.find((selection) => (
-            isAgentContextPackSelection(selection)
-            && selection.packId === rule.packId
-            && selection.revisionId === rule.revisionId
-          ))
-          const option = availableContextPacks.find((candidate) => (
-            candidate.packId === rule.packId && candidate.revisionId === rule.revisionId
-          ))
-          const referenceKey = `${rule.packId}\u0000${rule.revisionId}`
-          return (
-            <details className={styles.disclosure} key={`${rule.id}-${index}`}>
-              <summary><span>{pack?.label ?? rule.id}</span><small>{rule.id} · {rule.revisionId}</small><ChevronDown size={18} aria-hidden="true" /></summary>
-              <div className={styles.editorStack}>
-                <label className={styles.field}>
-                  <span className={styles.fieldLabel}>{t('context.ruleId')}</span>
-                  <input className={styles.input} value={rule.id} aria-label={t('context.ruleId')} onChange={(event) => updateContextRule(index, (current) => ({ ...current, id: event.target.value }))} />
-                </label>
-                <label className={styles.field}>
-                  <span className={styles.fieldLabel}>{t('context.ruleReference')}</span>
-                  <select
-                    className={styles.select}
-                    value={referenceKey}
-                    aria-label={t('context.ruleReference')}
-                    onChange={(event) => {
-                      const next = availableContextPacks.find((candidate) => `${candidate.packId}\u0000${candidate.revisionId}` === event.target.value)
-                      if (!next || next.attachmentStatus !== 'available') return
-                      updateContextRule(index, (current) => ({ ...current, packId: next.packId, revisionId: next.revisionId }))
-                    }}
-                  >
-                    {!option && <option value={referenceKey}>{t('context.unavailableReference', { id: rule.revisionId })}</option>}
-                    {availableContextPacks.map((candidate) => (
-                      <option
-                        key={`${candidate.packId}\u0000${candidate.revisionId}`}
-                        value={`${candidate.packId}\u0000${candidate.revisionId}`}
-                        disabled={candidate.attachmentStatus !== 'available'}
-                      >
-                        {candidate.label} · {t('context.revisionLabel', { revision: candidate.revision })}
-                      </option>
-                    ))}
-                  </select>
-                  <small>{t('context.referenceHint')}</small>
-                </label>
-                <div className={styles.readOnlyHeader}>
-                  <div><strong>{t('context.scopeLabel')}</strong><small>{contextScopeLabel(option?.scopes, t)}</small></div>
-                  <span>{contextAttachmentLabel(option, t)}</span>
-                </div>
-                <label className={styles.settingRow}>
-                  <span><strong>{t('context.required')}</strong><small>{t('context.requiredHint')}</small></span>
-                  <input type="checkbox" checked={rule.required} aria-label={t('context.required')} onChange={(event) => updateContextRule(index, (current) => ({ ...current, required: event.target.checked }))} />
-                </label>
-                <fieldset className={styles.fieldset}>
-                  <legend className={styles.fieldLabel}>{t('context.dependencies')}</legend>
-                  <div className={styles.optionList}>
-                    {draft.contextRules.filter((candidate) => isAgentContextActivationRule(candidate) && candidate.id !== rule.id).map((candidate) => (
-                      <label className={styles.listChoice} key={candidate.id}>
-                        <input
-                          type="checkbox"
-                          checked={(rule.dependencies ?? []).includes(candidate.id)}
-                          aria-label={t('context.dependency', { name: candidate.id })}
-                          onChange={(event) => updateContextRule(index, (current) => ({
-                            ...current,
-                            dependencies: event.target.checked
-                              ? [...new Set([...(current.dependencies ?? []), candidate.id])]
-                              : (current.dependencies ?? []).filter((id) => id !== candidate.id),
-                          }))}
-                        />
-                        <span><strong>{candidate.id}</strong><small>{candidate.revisionId}</small></span>
-                      </label>
-                    ))}
-                  </div>
-                </fieldset>
-                <PredicateEditor value={rule.activation ?? { kind: 'phase', value: 'WORK' }} taskTemplateIds={taskTemplateIds} onChange={(activation) => updateContextRule(index, (current) => ({ ...current, activation }))} />
-                <button type="button" className={styles.dangerButton} onClick={() => removeContextRule(index)}><Trash2 size={16} aria-hidden="true" /> {t('context.removeRule')}</button>
-              </div>
-            </details>
-          )
-        })}
-      </section>
-    )
-  }
 
   const renderTasks = () => (
     <>
@@ -3165,11 +3401,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
           <details className={styles.disclosure} key={`${template.id}-${index}`}>
             <summary><span>{template.label || template.id}</span><small>{template.required ? t('tasks.required') : t('tasks.optional')}</small><ChevronDown size={18} aria-hidden="true" /></summary>
             <div className={styles.editorStack}>
-              <div className={styles.formGrid}><label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.id')}</span><input className={styles.input} value={template.id} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, id: event.target.value }))} /></label><label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.label')}</span><input className={styles.input} value={template.label ?? ''} maxLength={AGENTIC_LABEL_MAX_LENGTH} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, label: event.target.value }))} /></label></div>
+              <div className={styles.formGrid}><label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.id')}</span><input className={styles.input} disabled={draftControlsLocked} value={template.id} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, id: event.target.value }))} /></label><label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.label')}</span><input className={styles.input} value={template.label ?? ''} maxLength={AGENTIC_LABEL_MAX_LENGTH} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, label: event.target.value }))} /></label></div>
               <label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.description')}</span><textarea className={styles.textarea} value={template.description ?? ''} maxLength={AGENTIC_DESCRIPTION_MAX_BYTES} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, description: event.target.value }))} /></label>
               <label className={styles.settingRow}><span><strong>{t('tasks.required')}</strong><small>{t('tasks.requiredHint')}</small></span><input type="checkbox" checked={template.required} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, required: event.target.checked }))} /></label>
               <fieldset className={styles.fieldset}><legend className={styles.fieldLabel}>{t('tasks.dependencies')}</legend><div className={styles.optionList}>{draft.taskTemplates.filter((_candidate, candidateIndex) => candidateIndex !== index).filter(isAgentTaskTemplate).map((candidate) => <label className={styles.listChoice} key={candidate.id}><input type="checkbox" checked={(template.dependencies ?? []).includes(candidate.id)} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, dependencies: event.target.checked ? [...(current.dependencies ?? []), candidate.id] : (current.dependencies ?? []).filter((id) => id !== candidate.id) }))} /><span><strong>{candidate.label || candidate.id}</strong><small>{candidate.id}</small></span></label>)}</div></fieldset>
-              <PredicateEditor value={template.activation ?? { kind: 'phase', value: 'WORK' }} taskTemplateIds={taskTemplateIds} onChange={(activation) => updateTaskTemplate(index, (current) => ({ ...current, activation }))} />
+              <PredicateEditor value={template.activation ?? { kind: 'phase', value: 'WORK' }} taskTemplateIds={taskTemplateIds} disabled={draftControlsLocked} onChange={(activation) => updateTaskTemplate(index, (current) => ({ ...current, activation }))} />
               <button type="button" className={styles.dangerButton} onClick={() => removeTaskTemplate(index)}><Trash2 size={16} aria-hidden="true" /> {t('tasks.remove')}</button>
             </div>
           </details>
@@ -3191,6 +3427,15 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const renderRepair = () => (
     <>
       <SectionHeader title={t('sections.repair.title')} description={t('sections.repair.description')} />
+      {(draft.quarantinedConnectionSlots ?? []).map((item) => (
+        <div className={styles.notice} role="alert" key={item.id}>
+          <AlertTriangle size={18} aria-hidden="true" />
+          <div><strong>{t('tasks.quarantined')}</strong><p>{t('tasks.quarantinedHint')}</p></div>
+          <button type="button" className={styles.iconButton} onClick={() => discardQuarantinedConnectionSlot(item.id)} aria-label={t('tasks.discardQuarantined')}>
+            <Trash2 size={16} aria-hidden="true" />
+          </button>
+        </div>
+      ))}
       {draft.config.connectionSlots.length > 0 && (
         <div className={styles.editorStack}>
           {draft.config.connectionSlots.map((slot) => (
@@ -3231,13 +3476,32 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
                   ? [...new Set([...current.reviewAcknowledgements, item.id])]
                   : current.reviewAcknowledgements.filter((id) => id !== item.id),
               }))}
-              onRepair={item.id.startsWith('loom-policy:') ? () => resolveRuntimePolicyRepair(item) : undefined}
+              onRepair={item.id.startsWith('loom-policy:')
+                ? () => resolveRuntimePolicyRepair(item)
+                : undefined}
             />
           ))}
         </ul>
-      ) : (
+      ) : draft.config.agentsEnabled && isHydratedForCurrentPreset ? null : (
         <div className={styles.successNotice}><Check size={18} aria-hidden="true" /><span>{t('repair.ready')}</span></div>
       )}
+      {draft.config.agentsEnabled && isHydratedForCurrentPreset ? (
+        <div className={styles.notice} role="status">
+          <RefreshCw size={18} aria-hidden="true" />
+          <div>
+            <p>{loomRevisionRestagePending ? t('repair.selectCurrentLoomRevisionsPending') : t('repair.selectCurrentLoomRevisionsHint')}</p>
+            <button
+              type="button"
+              className={styles.button}
+              onClick={stageCurrentLoomRevisions}
+              disabled={draftControlsLocked || saveState === 'conflict'}
+            >
+              <RefreshCw size={16} aria-hidden="true" />
+              {t('repair.selectCurrentLoomRevisions')}
+            </button>
+          </div>
+        </div>
+      ) : null}
       <div className={styles.boundaryNotice}><ClipboardCheck size={18} aria-hidden="true" /><p>{t('repair.boundary')}</p></div>
     </>
   )
@@ -3256,25 +3520,134 @@ export default function AgenticRuntimePanel({ preset, onSave, onDirtyChange }: A
   const validationStatus = validation.issues.length === 0
     ? null
     : validation.issues.map((issue) => `${t(`validation.${issue.code}`, { defaultValue: t('validation.invalid_config') })} (${issue.path})`).join(' ')
+  const runtimeStatus = editorLoadError
+    ? t('load.error')
+    : !isHydratedForCurrentPreset
+      ? t('load.loading')
+      : draft.config.agentsEnabled
+        ? t('status.enabled')
+        : t('status.disabled')
+  const saveStatus = editorLoadError
+    ? t('load.error')
+    : !isHydratedForCurrentPreset
+      ? saveState === 'conflict'
+        ? t('save.conflict')
+        : t('load.loading')
+      : saveState === 'saving'
+        ? t('save.saving')
+        : saveState === 'conflict'
+          ? t('save.conflict')
+          : saveState === 'error'
+            ? t('save.error')
+            : validationStatus
+              ? validationStatus
+              : dirty
+                ? t('save.unsaved')
+                : t('save.saved')
   return (
     <div className={styles.panel}>
       <header className={styles.hero}>
         <div><p className={styles.eyebrow}>{t('eyebrow')}</p><h2>{t('title')}</h2><p>{t('description')}</p></div>
-        <span className={clsx(styles.statusBadge, draft.config.agentsEnabled && styles.statusBadgeEnabled)}>{draft.config.agentsEnabled ? t('status.enabled') : t('status.disabled')}</span>
+        <span className={clsx(styles.statusBadge, isHydratedForCurrentPreset && draft.config.agentsEnabled && styles.statusBadgeEnabled)}>{runtimeStatus}</span>
       </header>
+      <div className={styles.boundaryNotice} role="note">
+        <ShieldCheck size={18} aria-hidden="true" />
+        <p>{t('nativeContextNotice')}</p>
+      </div>
+      {hasHydratedEditor && saveState === 'conflict' && (
+        <div className={styles.notice} role="alert">
+          <AlertTriangle size={20} aria-hidden="true" />
+          <div>
+            <strong>{t('save.conflict')}</strong>
+            <p>{hasPendingExternalSnapshot ? t('save.latestReady') : t('save.conflictHint')}</p>
+            {conflictRecoveryState === 'error' && <p>{t('save.reloadError')}</p>}
+            {!hasPendingExternalSnapshot && (
+              <button type="button" className={styles.button} onClick={() => { void reloadLatestForReview() }} disabled={conflictRecoveryState === 'loading'}>
+                <RefreshCw size={16} aria-hidden="true" />
+                {conflictRecoveryState === 'loading' ? t('save.reloadingLatest') : t('save.reloadLatest')}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {editorLoadError ? (
+        <div className={clsx(styles.notice, styles.loadError)} role="alert">
+          <AlertTriangle size={20} aria-hidden="true" />
+          <div>
+            <strong>{t('load.error')}</strong>
+            {saveState === 'conflict' && <p>{t('save.conflictHint')}</p>}
+            {conflictRecoveryState === 'error' && <p>{t('save.reloadError')}</p>}
+            <button
+              type="button"
+              className={styles.button}
+              onClick={saveState === 'conflict' ? () => { void reloadLatestForReview() } : retryEditorLoad}
+              disabled={saveState === 'saving' || conflictRecoveryState === 'loading'}
+            >
+              <RefreshCw size={16} aria-hidden="true" />
+              {saveState === 'conflict'
+                ? conflictRecoveryState === 'loading' ? t('save.reloadingLatest') : t('save.reloadLatest')
+                : t('load.retry')}
+            </button>
+          </div>
+        </div>
+      ) : !hasHydratedEditor && saveState === 'conflict' ? (
+        <div className={styles.notice} role="alert">
+          <AlertTriangle size={20} aria-hidden="true" />
+          <div>
+            <strong>{t('save.conflict')}</strong>
+            <p>{t('save.conflictHint')}</p>
+            {conflictRecoveryState === 'error' && <p>{t('save.reloadError')}</p>}
+            <button type="button" className={styles.button} onClick={retryEditorLoad} disabled={saveState === 'saving'}>
+              <RefreshCw size={16} aria-hidden="true" />
+              {t('load.retry')}
+            </button>
+            <button type="button" className={styles.button} onClick={() => { void reloadLatestForReview() }} disabled={conflictRecoveryState === 'loading'}>
+              <RefreshCw size={16} aria-hidden="true" />
+              {conflictRecoveryState === 'loading' ? t('save.reloadingLatest') : t('save.reloadLatest')}
+            </button>
+          </div>
+        </div>
+      ) : !hasHydratedEditor ? (
+        <div className={styles.notice} role="status">
+          <span>{t('load.loading')}</span>
+        </div>
+      ) : (
       <div className={styles.shell}>
+        {!isHydratedForCurrentPreset && (
+          <div className={styles.notice} role="status">
+            <RefreshCw size={20} aria-hidden="true" />
+            <div>
+              <strong>{t('load.loading')}</strong>
+              {conflictRecoveryState === 'error' && <p>{t('save.reloadError')}</p>}
+              <button
+                type="button"
+                className={styles.button}
+                onClick={() => { void reloadLatestForReview() }}
+                disabled={conflictRecoveryState === 'loading' || saveState === 'saving'}
+              >
+                <RefreshCw size={16} aria-hidden="true" />
+                {conflictRecoveryState === 'loading' ? t('save.reloadingLatest') : t('save.reloadLatest')}
+              </button>
+            </div>
+          </div>
+        )}
         <nav className={styles.sectionNav} role="tablist" aria-label={t('navigation.ariaLabel')} aria-orientation="vertical">
           {SECTION_IDS.map((sectionId, index) => {
             const Icon = SECTION_ICONS[sectionId]
             return <button key={sectionId} ref={(element) => { if (element) tabRefs.current.set(sectionId, element); else tabRefs.current.delete(sectionId) }} type="button" role="tab" id={`agentic-runtime-tab-${sectionId}`} aria-controls="agentic-runtime-panel" aria-selected={activeSection === sectionId} tabIndex={activeSection === sectionId ? 0 : -1} className={clsx(styles.sectionTab, activeSection === sectionId && styles.sectionTabActive)} onClick={() => setActiveSection(sectionId)} onKeyDown={(event) => handleSectionKeyDown(event, index)}><Icon size={18} aria-hidden="true" /><span>{t(`sections.${sectionId}.nav`)}</span>{sectionId === 'repair' && unacknowledgedReviewItems.length > 0 && <span className={styles.countBadge}>{unacknowledgedReviewItems.length}</span>}</button>
           })}
         </nav>
-        <section className={styles.sectionPanel} role="tabpanel" id="agentic-runtime-panel" aria-labelledby={`agentic-runtime-tab-${activeSection}`} tabIndex={0}>{sectionContent[activeSection]()}</section>
+        <section className={styles.sectionPanel} role="tabpanel" id="agentic-runtime-panel" aria-labelledby={`agentic-runtime-tab-${activeSection}`} tabIndex={0}>
+          <fieldset disabled={draftControlsLocked} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+            {sectionContent[activeSection]()}
+          </fieldset>
+        </section>
       </div>
-      <div className={styles.liveRegion} aria-live="polite" aria-atomic="true">{saveState === 'saved' ? t('save.saved') : saveState === 'conflict' ? t('save.conflict') : saveState === 'error' ? t('save.error') : ''}</div>
+      )}
+      <div className={styles.liveRegion} aria-live="polite" aria-atomic="true">{saveStatus}</div>
       <footer className={styles.saveBar}>
-        <span id={SAVE_VALIDATION_REASON_ID} className={clsx(styles.saveStatus, (firstIssue || saveState === 'conflict' || saveState === 'error') && styles.saveStatusError)}>{saveState === 'saving' ? t('save.saving') : saveState === 'conflict' ? t('save.conflict') : saveState === 'error' ? t('save.error') : validationStatus ? validationStatus : dirty ? t('save.unsaved') : t('save.saved')}</span>
-        <button type="button" className={styles.button} disabled={!dirty || saveState === 'saving'} onClick={resetDraft}>{t('save.reset')}</button>
+        <span id={SAVE_VALIDATION_REASON_ID} className={clsx(styles.saveStatus, (editorLoadError || firstIssue || saveState === 'conflict' || saveState === 'error') && styles.saveStatusError)}>{saveStatus}</span>
+        <button type="button" className={styles.button} disabled={!canReset} onClick={resetDraft}>{saveState === 'conflict' && hasPendingExternalSnapshot && hasHydratedEditor ? t('save.reviewLatest') : t('save.reset')}</button>
         <button type="button" className={styles.primaryButton} disabled={!canSave} aria-describedby={SAVE_VALIDATION_REASON_ID} onClick={() => { void handleSave() }}><Save size={17} aria-hidden="true" />{saveState === 'saving' ? t('save.saving') : t('save.action')}</button>
       </footer>
     </div>

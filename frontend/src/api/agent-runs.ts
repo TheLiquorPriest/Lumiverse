@@ -3,41 +3,75 @@ import {
   normalizeAgentRunInspectionDetailV1,
   normalizeAgentRunInspectionListV1,
   normalizeAgentRunInspectionRetryResponseV1,
+  normalizeAgentRunStopResultV2,
+  normalizePersistentWorkspace,
+  normalizePersistentWorkspaceCollection,
+  normalizePersistentWorkspaceTurnSessionPage,
 } from '@/store/slices/agent-runs'
+import type { AgentPersistentWorkspaceCollectionV1 } from '@/types/store'
 import type {
-  AgentPersistentWorkspaceArtifactV1,
   AgentPersistentWorkspaceCreateInputV1,
   AgentPersistentWorkspaceDeletionResultV1,
   AgentPersistentWorkspaceEditInputV1,
   AgentPersistentWorkspacePublicationInputV1,
-  AgentPersistentWorkspacePublicationV1,
-  AgentPersistentWorkspaceRecordV1,
   AgentPersistentWorkspaceTaskInputV1,
-  AgentPersistentWorkspaceTaskV1,
-  AgentPersistentWorkspaceSubmissionV1,
-  AgentPersistentWorkspaceTurnSessionV1,
+  AgentPersistentWorkspaceTurnSessionPageV1,
   AgentPersistentWorkspaceV1,
   AgentRunChangesV2,
   AgentRunInspectionDetailV1,
   AgentRunInspectionListV1,
   AgentRunInspectionRetryResponseV1,
   AgentRunPublicV2,
-  AgentRunStopResultV2,
   AgentWorkspaceIndexPublicV2,
   AgentWorkspaceSectionPreviewV2,
   AgentWorkspaceSectionV2,
 } from '@/types/agent-runs'
 
-function requireInspectionDetail(payload: unknown): AgentRunInspectionDetailV1 {
-  const detail = normalizeAgentRunInspectionDetailV1(payload)
+
+function requireInspectionDetail(payload: unknown, expectedAttemptId?: string, expectedChatId?: string): AgentRunInspectionDetailV1 {
+  const detail = normalizeAgentRunInspectionDetailV1(payload, expectedAttemptId, expectedChatId)
   if (!detail) throw new Error('Invalid owner inspection response')
   return detail
 }
 
-function requireInspectionList(payload: unknown): AgentRunInspectionListV1 {
+function requireInspectionList(payload: unknown, expectedChatId?: string): AgentRunInspectionListV1 {
   const list = normalizeAgentRunInspectionListV1(payload)
-  if (!list) throw new Error('Invalid owner inspection list response')
+  if (!list || expectedChatId !== undefined && list.chatId !== expectedChatId) throw new Error('Invalid owner inspection list response')
   return list
+}
+
+function requirePersistentWorkspace(payload: unknown, expectedWorkspaceId?: string, expectedChatId?: string | null): AgentPersistentWorkspaceV1 {
+  const workspace = normalizePersistentWorkspace(payload, expectedWorkspaceId, expectedChatId)
+  if (!workspace) throw new Error('Invalid persistent workspace response')
+  return workspace
+}
+
+function requirePersistentWorkspaceCollection<C extends AgentPersistentWorkspaceCollectionV1>(
+  collection: C,
+  workspaceId: string,
+  payload: unknown,
+) {
+  const items = normalizePersistentWorkspaceCollection(collection, payload, workspaceId)
+  if (!items) throw new Error(`Invalid persistent workspace ${collection} response`)
+  return items
+}
+function requirePersistentWorkspaceSessionsPage(
+  workspaceId: string,
+  payload: unknown,
+  expectedOffset?: number,
+): AgentPersistentWorkspaceTurnSessionPageV1 {
+  const page = normalizePersistentWorkspaceTurnSessionPage(payload, workspaceId, expectedOffset)
+  if (!page) throw new Error('Invalid persistent workspace sessions response')
+  return page
+}
+
+function requirePersistentWorkspaceItem<C extends AgentPersistentWorkspaceCollectionV1>(
+  collection: C,
+  workspaceId: string,
+  payload: unknown,
+) {
+  const items = requirePersistentWorkspaceCollection(collection, workspaceId, [payload])
+  return items[0]!
 }
 
 function requireInspectionRetry(payload: unknown): AgentRunInspectionRetryResponseV1 {
@@ -57,7 +91,7 @@ export const agentRunsApi = {
   },
   async listInspection(chatId: string, params?: { limit?: number; cursor?: string | null }) {
     const payload = await get<unknown>(`${base}/inspection`, { chatId, ...params })
-    return requireInspectionList(payload)
+    return requireInspectionList(payload, chatId)
   },
 
   async inspection(attemptId: string, chatId?: string) {
@@ -65,7 +99,7 @@ export const agentRunsApi = {
       `${base}/${encodeURIComponent(attemptId)}/inspection`,
       chatId ? { chatId } : undefined,
     )
-    return requireInspectionDetail(payload)
+    return requireInspectionDetail(payload, attemptId, chatId)
   },
 
   async retry(attemptId: string) {
@@ -76,29 +110,33 @@ export const agentRunsApi = {
   workspace(turnId: string) {
     return get<AgentWorkspaceIndexPublicV2>(`${base}/${turnId}/workspace`)
   },
-  persistentWorkspace(chatId: string) {
-    return get<AgentPersistentWorkspaceV1>(`${base}/workspace`, { chatId })
+  async persistentWorkspace(chatId: string) {
+    const payload = await get<unknown>(`${base}/workspace`, { chatId })
+    return requirePersistentWorkspace(payload, undefined, chatId)
   },
 
-  createPersistentWorkspace(
+  async createPersistentWorkspace(
     chatId: string,
     input: Omit<AgentPersistentWorkspaceCreateInputV1, 'chatId'>,
   ) {
-    return post<AgentPersistentWorkspaceV1>(`${base}/workspace?chatId=${encodeURIComponent(chatId)}`, input)
+    const payload = await post<unknown>(`${base}/workspace?chatId=${encodeURIComponent(chatId)}`, input)
+    return requirePersistentWorkspace(payload, undefined, chatId)
   },
 
-  persistentWorkspaceById(workspaceId: string, chatId?: string | null) {
-    return get<AgentPersistentWorkspaceV1>(
+  async persistentWorkspaceById(workspaceId: string, chatId?: string | null) {
+    const payload = await get<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}`,
-      chatId ? { chatId } : undefined,
+      chatId === undefined || chatId === null ? undefined : { chatId },
     )
+    return requirePersistentWorkspace(payload, workspaceId, chatId)
   },
 
-  editPersistentWorkspace(workspaceId: string, input: AgentPersistentWorkspaceEditInputV1) {
-    return patch<AgentPersistentWorkspaceV1>(
+  async editPersistentWorkspace(workspaceId: string, input: AgentPersistentWorkspaceEditInputV1) {
+    const payload = await patch<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}`,
       input,
     )
+    return requirePersistentWorkspace(payload, workspaceId)
   },
 
   deletePersistentWorkspace(workspaceId: string, expectedRevision: number) {
@@ -107,54 +145,62 @@ export const agentRunsApi = {
     )
   },
 
-  persistentWorkspaceSessions(workspaceId: string) {
-    return get<AgentPersistentWorkspaceTurnSessionV1[]>(
-      `${base}/workspace/${encodeURIComponent(workspaceId)}/sessions`,
-    )
+  async persistentWorkspaceSessions(workspaceId: string, params?: { limit?: number; offset?: number }) {
+    const path = `${base}/workspace/${encodeURIComponent(workspaceId)}/sessions`
+    const payload = params === undefined
+      ? await get<unknown>(path)
+      : await get<unknown>(path, params)
+    return requirePersistentWorkspaceSessionsPage(workspaceId, payload, params?.offset)
   },
-  persistentWorkspaceSubmissions(workspaceId: string) {
-    return get<AgentPersistentWorkspaceSubmissionV1[]>(
+  async persistentWorkspaceSubmissions(workspaceId: string) {
+    const payload = await get<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/submissions`,
     )
+    return requirePersistentWorkspaceCollection('submissions', workspaceId, payload)
   },
 
-  persistentWorkspaceTasks(workspaceId: string) {
-    return get<AgentPersistentWorkspaceTaskV1[]>(
+  async persistentWorkspaceTasks(workspaceId: string) {
+    const payload = await get<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/tasks`,
     )
+    return requirePersistentWorkspaceCollection('tasks', workspaceId, payload)
   },
 
-  createPersistentWorkspaceTask(workspaceId: string, input: AgentPersistentWorkspaceTaskInputV1) {
-    return post<AgentPersistentWorkspaceTaskV1>(
+  async createPersistentWorkspaceTask(workspaceId: string, input: AgentPersistentWorkspaceTaskInputV1) {
+    const payload = await post<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/tasks`,
       input,
     )
+    return requirePersistentWorkspaceItem('tasks', workspaceId, payload)
   },
 
-  persistentWorkspaceRecords(workspaceId: string) {
-    return get<AgentPersistentWorkspaceRecordV1[]>(
+  async persistentWorkspaceRecords(workspaceId: string) {
+    const payload = await get<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/records`,
     )
+    return requirePersistentWorkspaceCollection('records', workspaceId, payload)
   },
 
-  persistentWorkspaceArtifacts(workspaceId: string) {
-    return get<AgentPersistentWorkspaceArtifactV1[]>(
+  async persistentWorkspaceArtifacts(workspaceId: string) {
+    const payload = await get<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/artifacts`,
     )
+    return requirePersistentWorkspaceCollection('artifacts', workspaceId, payload)
   },
 
-
-  persistentWorkspacePublications(workspaceId: string) {
-    return get<AgentPersistentWorkspacePublicationV1[]>(
+  async persistentWorkspacePublications(workspaceId: string) {
+    const payload = await get<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/publications`,
     )
+    return requirePersistentWorkspaceCollection('publications', workspaceId, payload)
   },
 
-  publishPersistentWorkspace(workspaceId: string, input: AgentPersistentWorkspacePublicationInputV1) {
-    return post<AgentPersistentWorkspacePublicationV1>(
+  async publishPersistentWorkspace(workspaceId: string, input: AgentPersistentWorkspacePublicationInputV1) {
+    const payload = await post<unknown>(
       `${base}/workspace/${encodeURIComponent(workspaceId)}/publications`,
       input,
     )
+    return requirePersistentWorkspaceItem('publications', workspaceId, payload)
   },
 
   deletePersistentWorkspacePublication(
@@ -178,8 +224,10 @@ export const agentRunsApi = {
       page || revision !== undefined ? { ...(page ? { page } : {}), ...(revision !== undefined ? { revision } : {}) } : undefined,
     )
   },
-
-  stop(turnId: string, input?: { generationId?: string; chatId?: string }) {
-    return post<AgentRunStopResultV2>(`${base}/${turnId}/stop`, input ?? {})
+  async stop(turnId: string, input?: { generationId?: string; chatId?: string }) {
+    const payload = await post<unknown>(`${base}/${turnId}/stop`, input ?? {})
+    const result = normalizeAgentRunStopResultV2(payload, turnId, input?.chatId, input?.generationId)
+    if (!result) throw new Error('Invalid agent run stop response')
+    return result
   },
 }
