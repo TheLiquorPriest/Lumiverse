@@ -4901,22 +4901,27 @@ describe("Agentic WORK phase", () => {
   test("fails WORK as invalid_plan when complete_turn would take an illegal phase advance", async () => {
     const oneRef = phaseRef("one-phase", 0);
     const twoRef = phaseRef("two-phase", 1);
+    const compiled = compileAgentRuntimePhases([
+      customPhase("one-phase", ["workspace_write"], {
+        exit: { kind: "phase", value: "COMPLETE" },
+        repeatLimit: 1,
+        instructionRefs: [oneRef],
+        nextPhaseIds: ["one-phase"],
+      }),
+      customPhase("two-phase", [], {
+        instructionRefs: [twoRef],
+      }),
+    ]);
+    expect(compiled.status).toBe("ready");
+    expect(compiled.phases.map((entry) => entry.id)).toEqual(["one_phase", "two_phase"]);
+    expect(compiled.phases[0]?.nextPhaseIds).toEqual(["one_phase"]);
     let dispatches = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       dispatches += 1;
       return response("", [complete("illegal-advance")]);
     }, {
       plan: plan({
-        customPhasePlan: compileAgentRuntimePhases([
-          customPhase("one-phase", ["workspace_write"], {
-            exit: { kind: "phase", value: "COMPLETE" },
-            instructionRefs: [oneRef],
-            nextPhaseIds: ["missing-phase"],
-          }),
-          customPhase("two-phase", [], {
-            instructionRefs: [twoRef],
-          }),
-        ]),
+        customPhasePlan: compiled,
         loomBlocks: [
           phaseBlock(oneRef, "ONE_PHASE_INSTRUCTION"),
           phaseBlock(twoRef, "TWO_PHASE_INSTRUCTION"),

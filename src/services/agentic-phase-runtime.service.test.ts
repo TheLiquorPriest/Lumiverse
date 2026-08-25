@@ -339,15 +339,20 @@ describe("canonical custom Phased Instructions machine", () => {
     const compiled = compile([
       phase({
         id: "one",
-        nextPhaseIds: ["missing"],
+        repeatLimit: 1,
+        nextPhaseIds: ["one"],
         instructionRefs: [sourceRef("one")],
       }),
       phase({ id: "two", instructionRefs: [sourceRef("two")] }),
     ], [sourceRef("one"), sourceRef("two")]);
+    expect(compiled.status).toBe("ready");
+    expect(compiled.phases.map((entry) => entry.id)).toEqual(["one", "two"]);
+    expect(compiled.phases[0]?.nextPhaseIds).toEqual(["one"]);
     const machine = createAgentRuntimePhaseMachine(compiled);
     expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
     expect(machine.exit({ revision: 1, context: context() })).toMatchObject({
       status: "failed",
+      condition: "true",
       reason: expect.stringMatching(/arbitrary phase transition/i),
     });
     expect(machine.state().status).toBe("failed");
