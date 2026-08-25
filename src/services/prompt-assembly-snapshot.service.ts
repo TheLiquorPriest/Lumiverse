@@ -4,8 +4,10 @@ import { createHash } from "node:crypto";
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db/connection";
 import type { Chat } from "../types/chat";
+import { isNoPresetChatMetadata } from "../types/chat";
 import type { Message } from "../types/message";
 import type { PromptBlock, PromptVariableValues } from "../types/preset";
+import type { PresetProfileBinding } from "../types/preset-profile";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
 import type { InputRevisionKindV1, InputRevisionSetV1, PreparationLimitsV1 } from "../types/agent-preprocessing";
 import { parseAgentConfigV2 } from "../types/agents";
@@ -21,8 +23,12 @@ import {
   normalizeLoomPolicyBucketsV1,
   parseCognitionSourceSnapshot,
 } from "./agent-cognition.service";
-import { compareUtf8 } from "../utils/utf8-order";
 import { canonicalRuntimeCapabilityDigest } from "./agent-runtime-decision.service";
+import {
+  applyProfileToBlocks,
+  normalizeCategoryBlockStates,
+  resolveProfile,
+} from "./preset-profiles.service";
 import type {
   CognitionSourceSnapshotV1,
   FrozenCognitionGraphV1,
@@ -193,6 +199,8 @@ export interface SnapshotParticipantV1 {
 
 export interface SnapshotVariableStateV1 {
   readonly preset: Readonly<PromptVariableValues>;
+  /** Resolved profile overlay; null when no binding. Absent only on legacy fixtures. */
+  readonly profile?: Readonly<PromptVariableValues> | null;
   readonly chat: Readonly<Record<string, unknown>>;
   readonly settings: Readonly<Record<string, unknown>>;
   readonly revision: string;
@@ -1618,6 +1626,21 @@ function resolveLoomPolicyBuckets(
   }
 }
 
+function freezePromptVariableValues(value: unknown): PromptVariableValues {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return deepFreeze({});
+  return deepFreeze({ ...(value as PromptVariableValues) });
+}
+
+function withEffectiveProfileBlocks(
+  blocks: readonly SnapshotBlockV1[],
+  binding: PresetProfileBinding | null,
+): readonly SnapshotBlockV1[] {
+  const next = blocks.map((block) => ({ ...block }));
+  if (binding) applyProfileToBlocks(next as PromptBlock[], binding);
+  normalizeCategoryBlockStates(next as PromptBlock[]);
+  return Object.freeze(next.map((block) => deepFreeze(block)));
+}
+
 function buildAgentCognition(
   input: GenerationAssemblySnapshotInputV1,
   normalizedAgentConfig: unknown,
@@ -1678,13 +1701,13 @@ export function buildGenerationAssemblySnapshot(
     const metadata = chat.metadata;
     const selectedPresetId = input.presetId ?? (typeof input.connectionId === "string" ? null : null);
     const connection = getConnection(db, input.userId, input.connectionId, selectedPresetId, input.concreteConnection, limits);
-    const effectivePresetId = selectedPresetId ?? (typeof connection?.preset_id === "string" ? connection.preset_id : null);
+    let effectivePresetId = selectedPresetId ?? (typeof connection?.preset_id === "string" ? connection.preset_id : null);
     const presetRow = effectivePresetId
       ? rowFor<RawRow>(db, "SELECT id, name, provider, engine, parameters, prompt_order, metadata, prompts, updated_at, cache_revision FROM presets WHERE id = ? AND user_id = ? LIMIT 1", effectivePresetId, input.userId)
       : null;
     if (effectivePresetId && !presetRow) throw new SnapshotInputError("preset not found");
-    const preset = presetRow ? normalizePreset(presetRow, limits) : null;
-    const blocks = preset?.blocks ?? [];
+    let preset = presetRow ? normalizePreset(presetRow, limits) : null;
+    let blocks = preset?.blocks ?? [];
     const characterId = input.targetCharacterId ?? chat.character_id;
     const characterRow = characterId
       ? rowFor<RawRow>(db, "SELECT id, name, description, personality, scenario, first_mes, mes_example, system_prompt, post_history_instructions, extensions, updated_at FROM characters WHERE id = ? AND user_id = ? LIMIT 1", characterId, input.userId)
@@ -1712,6 +1735,30 @@ export function buildGenerationAssemblySnapshot(
       ? rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE id = ? AND user_id = ? LIMIT 1", personaId, input.userId)
       : rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE user_id = ? AND is_default = 1 ORDER BY id LIMIT 1", input.userId);
     const persona = normalizePersona(personaRow, limits);
+    const profileBinding = isNoPresetChatMetadata(metadata)
+      ? null
+      : resolveProfile(
+          input.userId,
+          effectivePresetId,
+          chat.id,
+          typeof characterId === "string" ? characterId : null,
+          {
+            isGroup: metadata.group === true,
+            connectionId: typeof connection?.id === "string"
+              ? connection.id
+              : typeof connection?.logicalId === "string"
+                ? connection.logicalId
+                : input.connectionId ?? null,
+            personaId: typeof persona?.id === "string" ? persona.id : input.personaId ?? null,
+          },
+        ).binding;
+    if (profileBinding && profileBinding.preset_id !== effectivePresetId) {
+      const boundRow = rowFor<RawRow>(db, "SELECT id, name, provider, engine, parameters, prompt_order, metadata, prompts, updated_at, cache_revision FROM presets WHERE id = ? AND user_id = ? LIMIT 1", profileBinding.preset_id, input.userId);
+      if (!boundRow) throw new SnapshotInputError("preset not found");
+      preset = normalizePreset(boundRow, limits);
+      effectivePresetId = profileBinding.preset_id;
+    }
+    blocks = withEffectiveProfileBlocks(preset?.blocks ?? [], profileBinding);
     const settingsValues: Record<string, unknown> = {};
     let settingsOffset = 0;
     let settingsBytes = 0;
@@ -1737,12 +1784,14 @@ export function buildGenerationAssemblySnapshot(
     const chatVariables = metadata.chat_variables && typeof metadata.chat_variables === "object" && !Array.isArray(metadata.chat_variables)
       ? deepFreeze({ ...(metadata.chat_variables as Record<string, unknown>) })
       : deepFreeze({});
-    const presetVariables = preset?.metadata.promptVariables && typeof preset.metadata.promptVariables === "object" && !Array.isArray(preset.metadata.promptVariables)
-      ? deepFreeze({ ...(preset.metadata.promptVariables as PromptVariableValues) })
-      : deepFreeze({});
-    const variableIdentity = { preset: presetVariables, chat: chatVariables, settings: settingsIdentity };
+    const presetVariables = freezePromptVariableValues(preset?.metadata.promptVariables);
+    const profileVariables = profileBinding
+      ? freezePromptVariableValues(profileBinding.prompt_variables ?? {})
+      : null;
+    const variableIdentity = { preset: presetVariables, profile: profileVariables, chat: chatVariables, settings: settingsIdentity };
     const variables = deepFreeze({
       preset: presetVariables,
+      profile: profileVariables,
       chat: chatVariables,
       settings,
       revision: digest(variableIdentity),

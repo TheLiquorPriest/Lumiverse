@@ -631,4 +631,44 @@ describe("resolveCognitionPresetVariables", () => {
     expect(evaluateCognitionPredicate(collaborationSkip, workContext(presetVariables))).toBe(false);
     expect(evaluateCognitionPredicate(requireChildActivation, workContext(presetVariables))).toBe(true);
   });
+
+  test("bound profile overrides fn_require_child and drops a disabled block", () => {
+    const collaboration = blockWithSwitch("collab-block", "fn_collaboration", 1);
+    const requireChild = blockWithSwitch("child-block", "fn_require_child", 0);
+    const stored = {
+      "collab-block": { fn_collaboration: 0 },
+      "child-block": { fn_require_child: 0 },
+    };
+    const profile = {
+      "child-block": { fn_require_child: 1 },
+    };
+    const blocks = [{ ...collaboration, enabled: false }, requireChild];
+    const presetVariables = resolveCognitionPresetVariables(blocks, stored, profile);
+    expect(presetVariables).toEqual({ fn_require_child: 1 });
+    expect(evaluateCognitionPredicate(collaborationSkip, workContext(presetVariables))).toBe(false);
+    expect(evaluateCognitionPredicate(requireChildActivation, workContext(presetVariables))).toBe(true);
+  });
+
+  test("profile overlay inherits missing keys and loses to a later enabled block", () => {
+    const first = {
+      ...blockWithSwitch("block-a", "fn_require_child", 0),
+      variables: [switchDef("fn_require_child", 0), switchDef("fn_collaboration", 1)],
+    };
+    const later = blockWithSwitch("block-b", "fn_require_child", 0);
+    const stored = {
+      "block-a": { fn_require_child: 0, fn_collaboration: 0 },
+      "block-b": { fn_require_child: 0 },
+    };
+    const profile = {
+      "block-a": { fn_require_child: 1 },
+    };
+    expect(resolveCognitionPresetVariables([first], stored, profile)).toEqual({
+      fn_require_child: 1,
+      fn_collaboration: 0,
+    });
+    expect(resolveCognitionPresetVariables([first, later], stored, profile)).toEqual({
+      fn_require_child: 0,
+      fn_collaboration: 0,
+    });
+  });
 });

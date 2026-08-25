@@ -2885,7 +2885,11 @@ function installDecisionAuthorities(): void {
 function cognitionPresetVariables(
   snapshot: RuntimeSnapshot,
 ): Readonly<Record<string, CognitionValue>> {
-  return resolveCognitionPresetVariables(snapshot.blocks, snapshot.variables.preset);
+  return resolveCognitionPresetVariables(
+    snapshot.blocks,
+    snapshot.variables.preset,
+    snapshot.variables.profile ?? undefined,
+  );
 }
 
 function cognitionWorkspaceContext(

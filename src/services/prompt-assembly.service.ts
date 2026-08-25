@@ -1439,7 +1439,8 @@ function collectResolvedPromptVariableValues(
 /**
  * Flatten block-scoped metadata.promptVariables into the cognition predicate
  * namespace. Same policy as resolvePromptVariables: disabled blocks are out of
- * play; last enabled prompt_order block wins on a name collision.
+ * play; a bound profile overlay wins per key; last enabled prompt_order block
+ * wins on a name collision.
  */
 export function resolveCognitionPresetVariables(
   blocks: readonly Pick<PromptBlock, "id" | "enabled" | "variables">[],
