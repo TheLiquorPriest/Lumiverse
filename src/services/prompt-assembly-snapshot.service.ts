@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db/connection";
 import type { Chat } from "../types/chat";
-import { isNoPresetChatMetadata } from "../types/chat";
+import { isNoPresetChatMetadata, isTemporaryChatMetadata } from "../types/chat";
 import type { Message } from "../types/message";
 import type { PromptBlock, PromptVariableValues } from "../types/preset";
 import type { PresetProfileBinding } from "../types/preset-profile";
@@ -84,6 +84,8 @@ export interface GenerationAssemblySnapshotInputV1 {
   readonly generationType?: "normal" | "continue" | "regenerate" | "swipe";
   readonly connectionId?: string | null;
   readonly presetId?: string | null;
+  /** When true with presetId, skip profile resolution exactly as ordinary assemble. */
+  readonly forcePresetId?: boolean;
   readonly personaId?: string | null;
   readonly targetCharacterId?: string | null;
   readonly targetMessageId?: string | null;
@@ -1742,13 +1744,25 @@ export function buildGenerationAssemblySnapshot(
         if (row) group.push(normalizeParticipant(row, limits));
       }
     }
-    const personaId = input.personaId ?? (typeof metadata.persona_id === "string" ? metadata.persona_id : null);
-    const personaRow = personaId
-      ? rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE id = ? AND user_id = ? LIMIT 1", personaId, input.userId)
-      : rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE user_id = ? AND is_default = 1 ORDER BY id LIMIT 1", input.userId);
+    const isTemporaryChat = isTemporaryChatMetadata(metadata);
+    const forcePresetId = input.forcePresetId === true && typeof input.presetId === "string" && input.presetId.length > 0;
+    const skipProfileBinding = forcePresetId || isNoPresetChatMetadata(metadata);
+    const personaId = isTemporaryChat
+      ? null
+      : input.personaId ?? (typeof metadata.persona_id === "string" ? metadata.persona_id : null);
+    const personaRow = isTemporaryChat
+      ? null
+      : personaId
+        ? rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE id = ? AND user_id = ? LIMIT 1", personaId, input.userId)
+        : rowFor<RawRow>(db, "SELECT id, name, title, description, subjective_pronoun, objective_pronoun, possessive_pronoun, reflexive_pronoun, possessive_pronoun_standalone, attached_world_book_id, is_narrator, updated_at FROM personas WHERE user_id = ? AND is_default = 1 ORDER BY id LIMIT 1", input.userId);
     const persona = normalizePersona(personaRow, limits);
-    const resolvedProfile = isNoPresetChatMetadata(metadata)
-      ? { preset_id: effectivePresetId, binding: null, source: "none" as const, source_id: null }
+    const resolvedProfile = skipProfileBinding
+      ? {
+          preset_id: forcePresetId ? input.presetId ?? null : effectivePresetId,
+          binding: null,
+          source: "none" as const,
+          source_id: null,
+        }
       : resolveProfileWithDb(
           db,
           input.userId,
@@ -1762,11 +1776,13 @@ export function buildGenerationAssemblySnapshot(
               : typeof connection?.logicalId === "string"
                 ? connection.logicalId
                 : input.connectionId ?? null,
-            personaId: typeof persona?.id === "string" ? persona.id : input.personaId ?? null,
+            personaId: isTemporaryChat
+              ? null
+              : typeof persona?.id === "string" ? persona.id : input.personaId ?? null,
           },
         );
     const profileBinding = resolvedProfile.binding;
-    if (resolvedProfile.preset_id && resolvedProfile.preset_id !== effectivePresetId) {
+    if (!skipProfileBinding && resolvedProfile.preset_id && resolvedProfile.preset_id !== effectivePresetId) {
       const boundRow = rowFor<RawRow>(db, "SELECT id, name, provider, engine, parameters, prompt_order, metadata, prompts, updated_at, cache_revision FROM presets WHERE id = ? AND user_id = ? LIMIT 1", resolvedProfile.preset_id, input.userId);
       if (!boundRow) throw new SnapshotInputError("preset not found");
       preset = normalizePreset(boundRow, limits);
@@ -1825,6 +1841,9 @@ export function buildGenerationAssemblySnapshot(
         presetId: resolvedProfile.preset_id,
         blockStates: profileBinding?.block_states ?? null,
         linkedToDefaults: profileBinding?.linked_to_defaults === true,
+        skipProfileBinding,
+        forcePresetId,
+        temporaryChat: isTemporaryChat,
       },
       blockEnabled: Object.fromEntries(blocks.map((block) => [block.id, block.enabled])),
       chat: chatVariables,

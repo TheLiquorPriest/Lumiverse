@@ -49,6 +49,7 @@ import type { AgentConfigV2, AgentRuntimePolicyV1 } from "../types/agents";
 import type { LoomPromptInspectionBlockV1, LoomPromptInspectionV1, LoomResponsePolicyOmissionV1 } from "../types/agent-cognition";
 import { parseAgentConfigV2, parseAgentRuntimePolicyV1 } from "../types/agents";
 import { LOOM_POLICY_VERSION } from "../types/agent-cognition";
+import { isTemporaryChatMetadata } from "../types/chat";
 import { inspectLoomPromptPolicies } from "./agent-cognition.service";
 import { listPromptBlocks } from "./presets.service";
 import {
@@ -1598,7 +1599,13 @@ export class AgentRuntimeDecisionService {
         requestedPresetId,
         chat.id,
         targetCharacterId,
-        { isGroup, connectionId: rootConnection?.logicalId, personaId: request.personaId ?? this.dependencies.resolvePersona(userId, request.personaId)?.id ?? null },
+        {
+          isGroup,
+          connectionId: rootConnection?.logicalId,
+          personaId: isTemporaryChatMetadata(isRecord(chat.metadata) ? chat.metadata : null)
+            ? null
+            : request.personaId ?? this.dependencies.resolvePersona(userId, request.personaId)?.id ?? null,
+        },
       );
       if (resolved.preset_id) {
         preset = this.dependencies.getPreset(userId, resolved.preset_id);

@@ -220,6 +220,112 @@ describe("GenerationAssemblySnapshotV1", () => {
     db.close();
   });
 
+  test("forcePresetId ignores an active chat binding on initial snapshot and rebuild", () => {
+    const db = schema();
+    seed(db);
+    const blocks = [
+      { id: "producer", name: "Producer", content: "p", role: "user", enabled: true, position: "pre_history", depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null, variables: [{ id: "fn_require_child", name: "fn_require_child", label: "Required child", type: "switch", defaultValue: 0 }] },
+      { id: "consumer", name: "Consumer", content: "c", role: "user", enabled: true, position: "post_history", depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null },
+    ];
+    db.query("UPDATE presets SET prompt_order = ?, metadata = ? WHERE id = ?").run(
+      JSON.stringify(blocks),
+      JSON.stringify({ promptVariables: { producer: { fn_require_child: 0 } } }),
+      "preset-1",
+    );
+    db.query("INSERT INTO settings VALUES (?, ?, ?, ?)").run(
+      "presetProfile:chat:chat-1",
+      JSON.stringify({ preset_id: "preset-1", block_states: { producer: false, consumer: true }, captured_at: 1 }),
+      "user-1",
+      1,
+    );
+    db.query("INSERT INTO settings VALUES (?, ?, ?, ?)").run(
+      "presetProfileVariables:chat:chat-1",
+      JSON.stringify({ producer: { fn_require_child: 1 } }),
+      "user-1",
+      1,
+    );
+    const snapshotInput = {
+      assemblySurface: "WORK" as const,
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      forcePresetId: true,
+      connectionId: "connection-1",
+      agentConfig: config(),
+      db,
+    };
+    const bound = buildGenerationAssemblySnapshot({ ...snapshotInput, forcePresetId: false });
+    expect(bound.blocks.find((block) => block.id === "producer")?.enabled).toBe(false);
+    expect(bound.variables.effective?.values.fn_require_child).toBe(1);
+    const initial = buildGenerationAssemblySnapshot(snapshotInput);
+    const rebuilt = buildGenerationAssemblySnapshot({ ...snapshotInput, db });
+    expect(initial.blocks.find((block) => block.id === "producer")?.enabled).toBe(true);
+    expect(rebuilt.blocks.find((block) => block.id === "producer")?.enabled).toBe(true);
+    expect(initial.variables.profile).toBeNull();
+    expect(rebuilt.variables.profile).toBeNull();
+    expect(initial.variables.effective?.values.fn_require_child).toBe(0);
+    expect(rebuilt.variables.effective?.values.fn_require_child).toBe(0);
+    expect(initial.variables.revision).not.toBe(bound.variables.revision);
+    expect(rebuilt.snapshotId).toBe(initial.snapshotId);
+    db.close();
+  });
+
+  test("temporary chats ignore persona and default bindings; non-temporary chats keep them", () => {
+    const db = schema();
+    seed(db);
+    const blocks = [
+      { id: "producer", name: "Producer", content: "p", role: "user", enabled: true, position: "pre_history", depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null, variables: [{ id: "fn_require_child", name: "fn_require_child", label: "Required child", type: "switch", defaultValue: 0 }] },
+      { id: "consumer", name: "Consumer", content: "c", role: "user", enabled: true, position: "post_history", depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null },
+    ];
+    db.query("UPDATE presets SET prompt_order = ?, metadata = ? WHERE id = ?").run(
+      JSON.stringify(blocks),
+      JSON.stringify({ promptVariables: { producer: { fn_require_child: 0 } } }),
+      "preset-1",
+    );
+    db.query("INSERT INTO settings VALUES (?, ?, ?, ?)").run(
+      "presetProfile:persona:persona-1",
+      JSON.stringify({ preset_id: "preset-1", block_states: { producer: false, consumer: true }, captured_at: 1 }),
+      "user-1",
+      1,
+    );
+    db.query("INSERT INTO settings VALUES (?, ?, ?, ?)").run(
+      "presetProfileVariables:persona:persona-1",
+      JSON.stringify({ producer: { fn_require_child: 1 } }),
+      "user-1",
+      1,
+    );
+    db.query("UPDATE chats SET metadata = ? WHERE id = ?").run(JSON.stringify({ temporary: true }), "chat-1");
+    const temporary = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      connectionId: "connection-1",
+      personaId: "persona-1",
+      agentConfig: config(),
+      db,
+    });
+    expect(temporary.participants.persona).toBeNull();
+    expect(temporary.blocks.find((block) => block.id === "producer")?.enabled).toBe(true);
+    expect(temporary.variables.profile).toBeNull();
+    expect(temporary.variables.effective?.values.fn_require_child).toBe(0);
+    db.query("UPDATE chats SET metadata = ? WHERE id = ?").run("{}", "chat-1");
+    const lasting = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      connectionId: "connection-1",
+      agentConfig: config(),
+      db,
+    });
+    expect(lasting.participants.persona).not.toBeNull();
+    expect(lasting.blocks.find((block) => block.id === "producer")?.enabled).toBe(false);
+    expect(lasting.variables.effective?.values.fn_require_child).toBe(1);
+    expect(lasting.variables.revision).not.toBe(temporary.variables.revision);
+    db.close();
+  });
+
 });
 async function compiledAssemblyPlan(): Promise<AssemblyPlanV1> {
   const db = schema();
