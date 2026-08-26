@@ -143,6 +143,10 @@ export default function DatabankPanel() {
     const next = mutationGateRef.current.publish(token, null)
     if (next !== undefined) setError(next)
   }, [])
+  const beginLocalDeselect = useCallback(() => {
+    committedContextResetRef.current = true
+  }, [])
+
 
 
 
@@ -176,13 +180,14 @@ export default function DatabankPanel() {
   const flushPendingContextReset = useCallback(() => {
     if (!pendingContextResetRef.current) return
     pendingContextResetRef.current = false
-    committedContextResetRef.current = true
+    beginLocalDeselect()
     docsRequestRef.current += 1
     contentRequestRef.current += 1
     setSelectedDatabankId(null)
     setDatabankDocuments([])
     clearMutationErrorIfCurrent(mintMutation())
-  }, [setSelectedDatabankId, setDatabankDocuments, mintMutation, clearMutationErrorIfCurrent])
+  }, [beginLocalDeselect, setSelectedDatabankId, setDatabankDocuments, mintMutation, clearMutationErrorIfCurrent])
+
 
   const settlePendingContextReset = useCallback(() => {
     pendingContextResetRef.current = false
@@ -358,14 +363,15 @@ export default function DatabankPanel() {
       return
     }
     pendingContextResetRef.current = false
-    committedContextResetRef.current = true
+    beginLocalDeselect()
     docsRequestRef.current += 1
     contentRequestRef.current += 1
     setSelectedDatabankId(null)
     setDatabankDocuments([])
     closeDocEditor()
     clearMutationErrorIfCurrent(mintMutation())
-  }, [databankScopeFilter, activeCharacterId, activeChatId, setSelectedDatabankId, setDatabankDocuments, closeDocEditor, mintMutation, clearMutationErrorIfCurrent])
+  }, [databankScopeFilter, activeCharacterId, activeChatId, setSelectedDatabankId, setDatabankDocuments, closeDocEditor, beginLocalDeselect, mintMutation, clearMutationErrorIfCurrent])
+
 
   // DATABANK_DELETED removes the bank and nulls selection. That is not
   // user-clean navigation, which closes the editor in the same turn.
@@ -495,13 +501,15 @@ export default function DatabankPanel() {
     const started = mintMutation()
     try {
       await databankApi.delete(selectedDatabankId)
+      beginLocalDeselect()
       removeDatabank(selectedDatabankId)
       setSelectedDatabankId(null)
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
       reportMutationError(started, e.message)
     }
-  }, [selectedDatabankId, removeDatabank, setSelectedDatabankId, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, beginLocalDeselect, removeDatabank, setSelectedDatabankId, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
+
 
   // ── Update bank details ──
   const handleBankUpdate = useCallback(async (field: 'name' | 'description', value: string) => {
@@ -1077,7 +1085,16 @@ export default function DatabankPanel() {
         <select
           className={styles.bankSelect}
           value={selectedDatabankId || ''}
-          onChange={(e) => setSelectedDatabankId(e.target.value || null)}
+          onChange={(e) => {
+            const next = e.target.value || null
+            if (!next) {
+              beginLocalDeselect()
+              setSelectedDatabankId(null)
+              clearMutationErrorIfCurrent(mintMutation())
+              return
+            }
+            setSelectedDatabankId(next)
+          }}
         >
           <option value="">{t('databankPanel.selectDatabank')}</option>
           {databanks.map((b) => (

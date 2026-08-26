@@ -71,5 +71,30 @@ describe('DatabankPanel mutation error wiring', () => {
     expect(noBank).not.toMatch(/mintMutation\(\)[\s\S]*holdingRemoteRemoval/)
   })
 
+  test('local delete and empty selector never publish remoteDatabankRemoved', () => {
+    const del = sliceBetween('const handleDeleteBank = useCallback(', '\n  // ── Update bank details')
+    expect(del).toContain('beginLocalDeselect()')
+    expect(del.indexOf('beginLocalDeselect()')).toBeLessThan(del.indexOf('removeDatabank(selectedDatabankId)'))
+    expect(del).toContain('clearMutationErrorIfCurrent(started)')
+    expect(del).not.toContain('remoteDatabankRemoved')
+
+    const select = sliceBetween('{/* Bank selector bar */}', '<option value="">{t(\'databankPanel.selectDatabank\')}</option>')
+    expect(select).toContain('if (!next)')
+    expect(select).toContain('beginLocalDeselect()')
+    expect(select).toContain('clearMutationErrorIfCurrent(mintMutation())')
+    expect(select).not.toContain('remoteDatabankRemoved')
+
+    const remote = sliceBetween(
+      'DATABANK_DELETED removes the bank and nulls selection.',
+      'const loadDocs = useCallback(',
+    )
+    expect(remote).toContain('if (committedContextResetRef.current)')
+    expect(remote).toContain("reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')")
+    expect(remote.indexOf('if (committedContextResetRef.current)')).toBeLessThan(
+      remote.indexOf("reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')"),
+    )
+  })
+
+
 
 })
