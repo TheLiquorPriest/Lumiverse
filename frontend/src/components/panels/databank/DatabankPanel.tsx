@@ -60,6 +60,41 @@ function scopeLabel(scope: string, t: (key: string) => string): string {
   return scope
 }
 
+function DocumentNameInput({
+  name,
+  onRename,
+  renameTitle,
+}: {
+  name: string
+  onRename: (next: string) => void
+  renameTitle: string
+}) {
+  const [focused, setFocused] = useState(false)
+  const [draft, setDraft] = useState(name)
+  const focusedNameRef = useRef(name)
+  return (
+    <input
+      className={styles.docNameInput}
+      value={focused ? draft : name}
+      onClick={(e) => e.stopPropagation()}
+      onFocus={() => {
+        focusedNameRef.current = name
+        setDraft(name)
+        setFocused(true)
+      }}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => {
+        setFocused(false)
+        const val = draft.trim()
+        if (val && val !== focusedNameRef.current) onRename(val)
+      }}
+      onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+      title={renameTitle}
+    />
+  )
+}
+
+
 export default function DatabankPanel() {
   const { t } = useTranslation('panels')
   const {
@@ -260,6 +295,13 @@ export default function DatabankPanel() {
     void loadDocs()
     return () => { docsRequestRef.current += 1 }
   }, [loadDocs, databankRevision])
+
+  useEffect(() => {
+    if (!editingDocId) return
+    const live = databankDocuments.find((doc) => doc.id === editingDocId)
+    if (live) setEditingName(live.name)
+  }, [databankDocuments, editingDocId])
+
 
   // ── Poll for document status updates ──
   useEffect(() => {
@@ -1070,16 +1112,10 @@ export default function DatabankPanel() {
             >
               <FileText size={16} className={styles.docIcon} />
               <div className={styles.docInfo}>
-                <input
-                  className={styles.docNameInput}
-                  defaultValue={doc.name}
-                  onClick={(e) => e.stopPropagation()}
-                  onBlur={(e) => {
-                    const val = e.target.value.trim()
-                    if (val && val !== doc.name) handleRenameDoc(doc.id, val)
-                  }}
-                  onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-                  title={t('databankPanel.clickToRename')}
+                <DocumentNameInput
+                  name={doc.name}
+                  onRename={(next) => { void handleRenameDoc(doc.id, next) }}
+                  renameTitle={t('databankPanel.clickToRename')}
                 />
                 <div className={styles.docMeta}>
                   {formatFileSize(doc.fileSize)}
