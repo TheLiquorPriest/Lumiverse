@@ -391,7 +391,7 @@ function renderPanel(options: {
     promptOrder: PromptBlock[],
     expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
   ) => Promise<SaveAgenticRuntimeEditorResult>
-  onReload?: () => Promise<unknown>
+  onReload?: () => Promise<SaveAgenticRuntimeEditorResult | void>
   onDirtyChange?: (dirty: boolean) => void
 } = {}) {
   const container = document.createElement('div')
@@ -1789,30 +1789,30 @@ describe('Agentic Runtime shared editor', () => {
     expect(button(container, 'save.action').disabled).toBe(true)
   })
 
-  test('keeps genuine external revision mismatch in conflict after reset', async () => {
+  test('keeps a genuine 409 conflict after local Reset draft', async () => {
     const value = preset()
-    const { container, root } = renderPanel({ value })
+    const { container } = renderPanel({
+      value,
+      onSave: async () => {
+        throw new ApiError(409, 'Conflict')
+      },
+    })
     await settle()
     flushSync(() => button(container, 'sections.agents.nav').click())
     changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
-
-    const refreshed = { ...value, cacheRevision: 9, agentConfigRevision: 5 }
-    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
-      preset: refreshed,
-      onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
-      onReload: async () => undefined,
-      onDirtyChange: () => {},
-    })))
+    flushSync(() => button(container, 'save.action').click())
     await settle()
     expect(container.textContent).toContain('save.conflict')
-    expect(button(container, 'save.reviewLatest').disabled).toBe(false)
-    flushSync(() => button(container, 'save.reviewLatest').click())
-    expect(container.textContent).toContain('save.conflict')
-    expect(button(container, 'save.action').disabled).toBe(true)
 
+    expect(button(container, 'save.reset').disabled).toBe(false)
+    flushSync(() => button(container, 'save.reset').click())
+    expect(container.textContent).toContain('save.conflict')
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(button(container, 'save.action').disabled).toBe(true)
+    expect(container.querySelector('input[value="Researcher"]')).not.toBeNull()
   })
 
-  test('reload latest settles and clears conflict when identities already converge', async () => {
+  test('no-op Reload latest after 409 stays in conflict', async () => {
     const value = preset()
     const { container } = renderPanel({
       value,
@@ -1831,9 +1831,56 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => button(container, 'save.reloadLatest').click())
     await settle()
     expect(container.textContent).not.toContain('save.reloadingLatest')
-    expect(container.textContent).not.toContain('save.conflict')
-    expect(container.textContent).toContain('save.unsaved')
+    expect(container.textContent).toContain('save.conflict')
     expect(container.querySelector('input[value="Unsaved analyst"]')).not.toBeNull()
+  })
+
+  test('Reload latest hydrates and clears conflict from a fresh higher server identity', async () => {
+    const value = preset()
+    const { container } = renderPanel({
+      value,
+      onSave: async () => {
+        throw new ApiError(409, 'Conflict')
+      },
+      onReload: async () => {
+        const latest = {
+          ...value,
+          cacheRevision: 9,
+          agentConfigRevision: 5,
+        }
+        editorPresetRevision = 9
+        editorConfigRevision = 5
+        editorConfig = structuredClone(latest.agentConfig)
+        return {
+          preset: wirePreset(latest),
+          editor: {
+            presetId: latest.id,
+            presetRevision: 9,
+            configRevision: 5,
+            config: latest.agentConfig,
+            review: latest.agentConfigReview,
+            slotBindings: {},
+            taskTemplates: [],
+            reviewAcknowledgements: [],
+            hostCeilings,
+          },
+        }
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(container.textContent).toContain('save.conflict')
+
+    flushSync(() => button(container, 'save.reloadLatest').click())
+    await settle()
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(container.textContent).not.toContain('save.conflict')
+    expect(container.textContent).toContain('save.saved')
+    expect(container.querySelector('input[value="Unsaved analyst"]')).toBeNull()
+    expect(container.querySelector('input[value="Researcher"]')).not.toBeNull()
   })
 
   test('failed reload latest leaves an actionable error and stays in conflict', async () => {
@@ -1863,13 +1910,13 @@ describe('Agentic Runtime shared editor', () => {
 
   test('stale reload completion cannot overwrite a newer preset editor', async () => {
     const value = preset()
-    let releaseReload: (() => void) | undefined
+    let releaseReload: ((snapshot: SaveAgenticRuntimeEditorResult) => void) | undefined
     const { container, root } = renderPanel({
       value,
       onSave: async () => {
         throw new ApiError(409, 'Conflict')
       },
-      onReload: () => new Promise<void>((resolve) => {
+      onReload: () => new Promise<SaveAgenticRuntimeEditorResult>((resolve) => {
         releaseReload = resolve
       }),
     })
@@ -1893,13 +1940,27 @@ describe('Agentic Runtime shared editor', () => {
     })))
     await settle()
     expect(container.textContent).not.toContain('save.reloadingLatest')
-    releaseReload?.()
+    releaseReload?.({
+      preset: wirePreset({ ...value, cacheRevision: 9, agentConfigRevision: 5 }),
+      editor: {
+        presetId: value.id,
+        presetRevision: 9,
+        configRevision: 5,
+        config: value.agentConfig,
+        review: value.agentConfigReview,
+        slotBindings: {},
+        taskTemplates: [],
+        reviewAcknowledgements: [],
+        hostCeilings,
+      },
+    })
     await settle()
 
     expect(container.textContent).not.toContain('save.reloadingLatest')
     expect(container.textContent).not.toContain('save.reloadError')
     expect(container.querySelector('input[value="Unsaved analyst"]')).not.toBeNull()
   })
+
 
 
 })

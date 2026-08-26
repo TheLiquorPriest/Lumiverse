@@ -229,7 +229,7 @@ interface AgenticRuntimePanelProps {
     promptOrder: PromptBlock[],
     expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
   ) => Promise<SaveAgenticRuntimeEditorResult>
-  onReload: () => Promise<unknown>
+  onReload: () => Promise<SaveAgenticRuntimeEditorResult | AgenticRuntimeEditorProjection | void>
   onDirtyChange: (dirty: boolean) => void
 }
 type PanelRepairItem = Omit<AgentConfigRepairItem, 'kind' | 'action'> & {
@@ -1200,6 +1200,74 @@ function editorIdentityConverged(
   return presetRevision <= returned.presetRevision && configRevision <= returned.configRevision
 }
 
+type GenuineConflictSource = 'save_conflict' | 'external_hydration' | 'load_failure'
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function readReloadedEditorProjection(value: unknown): AgenticRuntimeEditorProjection | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (typeof record.presetId !== 'string' || record.presetId.length === 0) return null
+  if (!isNonNegativeSafeInteger(record.presetRevision) || !isNonNegativeSafeInteger(record.configRevision)) return null
+  if (record.config === null || typeof record.config !== 'object' || Array.isArray(record.config)) return null
+  return {
+    presetId: record.presetId,
+    presetRevision: record.presetRevision,
+    configRevision: record.configRevision,
+    config: record.config as AgenticRuntimeEditorProjection['config'],
+    review: (record.review ?? null) as AgenticRuntimeEditorProjection['review'],
+    slotBindings: record.slotBindings && typeof record.slotBindings === 'object' && !Array.isArray(record.slotBindings)
+      ? record.slotBindings as AgenticRuntimeEditorProjection['slotBindings']
+      : {},
+    taskTemplates: Array.isArray(record.taskTemplates)
+      ? record.taskTemplates as AgenticRuntimeEditorProjection['taskTemplates']
+      : [],
+    reviewAcknowledgements: Array.isArray(record.reviewAcknowledgements)
+      ? record.reviewAcknowledgements as string[]
+      : [],
+    hostCeilings: record.hostCeilings && typeof record.hostCeilings === 'object' && !Array.isArray(record.hostCeilings)
+      ? record.hostCeilings as AgenticRuntimeHostCeilings
+      : {
+          childAdmissions: 0,
+          aggregateToolCalls: 0,
+          logicalProviderRequests: 0,
+          physicalDispatchAttempts: 0,
+          childOutputTokens: 0,
+          rootWallClockMs: 0,
+          activityEvents: 0,
+          activityBytes: 0,
+          lifecycleLogRecords: 0,
+          activeRootsPerUser: 0,
+          activeRootsProcess: 0,
+          providerDispatchesPerUser: 0,
+          providerDispatchesProcess: 0,
+          toolExecutionsPerUser: 0,
+          toolExecutionsProcess: 0,
+        },
+  }
+}
+
+function readReloadedEditorSnapshot(value: unknown): {
+  editor: AgenticRuntimeEditorProjection
+  promptOrder: PromptBlock[] | null
+} | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const editor = readReloadedEditorProjection(record.editor !== undefined ? record.editor : record)
+  if (!editor) return null
+  if (record.preset && typeof record.preset === 'object' && !Array.isArray(record.preset)) {
+    try {
+      return { editor, promptOrder: unmarshalPreset(record.preset as Parameters<typeof unmarshalPreset>[0]).blocks }
+    } catch {
+      return { editor, promptOrder: null }
+    }
+  }
+  return { editor, promptOrder: null }
+}
+
+
 
 export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyChange }: AgenticRuntimePanelProps) {
   const { t } = useTranslation('panels', { keyPrefix: 'loomBuilder.agenticRuntime' })
@@ -1224,6 +1292,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   const isHydratedRef = useRef(false)
   const pendingExternalDraftRef = useRef<AgenticRuntimeSaveDraft | null>(null)
   const pendingExternalPromptOrderRef = useRef<PromptBlock[] | null>(null)
+  const conflictSourceRef = useRef<GenuineConflictSource | null>(null)
   const conflictReloadGenerationRef = useRef(0)
   const currentPresetIdentityRef = useRef<EditorIdentity>({
     presetId: preset.id,
@@ -1408,6 +1477,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     setEditorLoadError(false)
     if (dirtyRef.current && revisionChanged) {
       pendingExternalPromptOrderRef.current = structuredClone(preset.blocks)
+      conflictSourceRef.current = 'external_hydration'
       setSaveState('conflict')
     }
     void agenticRuntimeApi.getEditor(preset.id).then((projection) => {
@@ -1444,7 +1514,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
           hydratedIdentityRef.current = null
           setEditorLoadError(true)
         }
-        if (revisionChanged || revisionMismatch || !authoritative) setSaveState('conflict')
+        if (revisionChanged || revisionMismatch || !authoritative) {
+          conflictSourceRef.current = 'external_hydration'
+          setSaveState('conflict')
+        }
         return
       }
       if (!authoritative) {
@@ -1480,7 +1553,13 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       }
       setIsHydrated(true)
       setEditorLoadError(false)
-      setSaveState(revisionMismatch ? 'conflict' : 'idle')
+      if (revisionMismatch) {
+        conflictSourceRef.current = 'external_hydration'
+        setSaveState('conflict')
+      } else {
+        conflictSourceRef.current = null
+        setSaveState('idle')
+      }
     }).catch((error: unknown) => {
       if (!active) return
       const missingProjection = error instanceof ApiError && error.status === 404
@@ -1488,7 +1567,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         hydratedIdentityRef.current = null
         setIsHydrated(false)
         setEditorLoadError(true)
-        setSaveState(dirtyRef.current ? 'conflict' : 'error')
+        if (dirtyRef.current) {
+          conflictSourceRef.current = 'load_failure'
+          setSaveState('conflict')
+        } else {
+          setSaveState('error')
+        }
         return
       }
       if (dirtyRef.current) {
@@ -1499,6 +1583,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         setIsHydrated(false)
         setEditorLoadError(false)
         setEditorReviewItems(getAgenticRuntimeRepairItems(preset))
+        conflictSourceRef.current = 'load_failure'
         setSaveState('conflict')
         return
       }
@@ -1524,6 +1609,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       }
       setIsHydrated(true)
       setEditorLoadError(false)
+      conflictSourceRef.current = null
       setSaveState('idle')
     })
     return () => {
@@ -1545,28 +1631,53 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     const targetPresetId = preset.id
     setConflictRecoveryState('loading')
     try {
-      await onReload()
+      const reloaded = await onReload()
       if (generation !== conflictReloadGenerationRef.current) return
-      const current = currentPresetIdentityRef.current
-      if (current.presetId !== targetPresetId) {
+      if (currentPresetIdentityRef.current.presetId !== targetPresetId) {
         setConflictRecoveryState('idle')
         return
       }
+      const snapshot = readReloadedEditorSnapshot(reloaded)
+      if (!snapshot || snapshot.editor.presetId !== targetPresetId) {
+        setConflictRecoveryState('idle')
+        return
+      }
+      const projection = snapshot.editor
+      const nextPromptOrder = snapshot.promptOrder ?? structuredClone(committedPromptOrderRef.current)
+      const hydrated = hydrateDraftFromEditor(draftRef.current, projection, nextPromptOrder)
+      committedDraftRef.current = structuredClone(hydrated)
+      committedPromptOrderRef.current = structuredClone(nextPromptOrder)
+      pendingExternalDraftRef.current = null
+      pendingExternalPromptOrderRef.current = null
+      lastReturnedIdentityRef.current = {
+        presetId: projection.presetId,
+        presetRevision: projection.presetRevision,
+        configRevision: projection.configRevision,
+      }
+      hydratedIdentityRef.current = lastReturnedIdentityRef.current
+      observedPresetIdRef.current = projection.presetId
+      observedPresetRevisionRef.current = projection.presetRevision
+      observedConfigRevisionRef.current = projection.configRevision
+      isHydratedRef.current = true
+      conflictSourceRef.current = null
+      setRepairedSlotIds(new Set())
       setLoomRevisionRestagePending(false)
+      setHostCeilings(projection.hostCeilings)
+      setEditorReviewItems(getAgenticRuntimeRepairItems({
+        ...preset,
+        agentConfig: projection.config ?? preset.agentConfig,
+        agentConfigReview: projection.review ?? preset.agentConfigReview,
+        cacheRevision: projection.presetRevision,
+        agentConfigRevision: projection.configRevision,
+      }))
+      setDraft(hydrated)
+      setPromptOrder(structuredClone(nextPromptOrder))
+      setMaxInvocationsInput(String(hydrated.config.maxInvocations))
+      setMaxToolCallsInput(String(hydrated.config.maxToolCalls))
+      setSavedFingerprint(`${runtimeDraftFingerprint(hydrated)}\n${JSON.stringify(nextPromptOrder)}`)
+      setIsHydrated(true)
       setEditorLoadError(false)
-      const converged = editorIdentityConverged(
-        hydratedIdentityRef.current,
-        current.presetId,
-        current.presetRevision,
-        current.configRevision,
-        lastReturnedIdentityRef.current,
-      )
-      if (converged) {
-        setSaveState('idle')
-        setConflictRecoveryState('idle')
-        return
-      }
-      setEditorLoadAttempt((attempt) => attempt + 1)
+      setSaveState('idle')
       setConflictRecoveryState('idle')
     } catch {
       if (generation !== conflictReloadGenerationRef.current) return
@@ -2405,6 +2516,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       liveDraft.reviewAcknowledgements = liveDraft.reviewAcknowledgements.filter((id) => requiredReviewIds.includes(id))
       const liveFingerprint = `${runtimeDraftFingerprint(liveDraft)}\n${JSON.stringify(promptOrderRef.current)}`
       if (liveFingerprint !== submittedFingerprint) {
+        conflictSourceRef.current = null
         setSaveState('idle')
         return
       }
@@ -2436,10 +2548,14 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       observedConfigRevisionRef.current = result.editor.configRevision
       setIsHydrated(true)
       setConflictRecoveryState('idle')
+      conflictSourceRef.current = null
       setSaveState('saved')
     } catch (error) {
       const conflict = error instanceof ApiError && error.status === 409
-      if (conflict) setConflictRecoveryState('idle')
+      if (conflict) {
+        conflictSourceRef.current = 'save_conflict'
+        setConflictRecoveryState('idle')
+      }
       setSaveState(conflict ? 'conflict' : 'error')
     } finally {
       saveInFlightRef.current = false
@@ -2487,10 +2603,16 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     }
     setConflictRecoveryState('idle')
     if (restoringLocalCommitted) {
-      setSaveState('idle')
+      setSaveState(conflictSourceRef.current ? 'conflict' : 'idle')
       return
     }
-    setSaveState(externalSnapshotIncomplete || !restoredIdentityMatchesCurrent ? 'conflict' : 'idle')
+    if (externalSnapshotIncomplete || !restoredIdentityMatchesCurrent) {
+      if (!conflictSourceRef.current) conflictSourceRef.current = 'external_hydration'
+      setSaveState('conflict')
+      return
+    }
+    conflictSourceRef.current = null
+    setSaveState('idle')
   }
 
   const stageAgentBlock = () => {

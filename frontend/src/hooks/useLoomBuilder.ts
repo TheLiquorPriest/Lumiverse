@@ -336,14 +336,15 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     }
   }, [presetApi, setLoomRegistry])
 
-  const reloadActivePreset = useCallback(async (): Promise<LoomPreset> => {
+  const reloadActivePreset = useCallback(async (): Promise<SaveAgenticRuntimeEditorResult> => {
     const presetId = activePresetRef.current?.id ?? activeLoomPresetId
     if (!presetId || useStore.getState().activeLoomPresetId !== presetId) {
       throw new Error('No active preset')
     }
     const hydration = presetSaveCoordinator.beginHydration(presetId, 'agentic-runtime-conflict')
+    let reloaded: LoomPreset
     try {
-      const reloaded = presetSaveCoordinator.hydrate(
+      reloaded = presetSaveCoordinator.hydrate(
         unmarshalPreset(await presetApi.get(presetId)),
         hydration,
       )
@@ -354,11 +355,15 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       setActivePreset(reloaded)
       setError(null)
       await refreshRegistry()
-      return reloaded
     } catch (error) {
       presetSaveCoordinator.cancelHydration(hydration)
       throw error
     }
+    const editor = await agenticRuntimeApi.getEditor(presetId)
+    if (useStore.getState().activeLoomPresetId !== presetId) {
+      throw new Error('No active preset')
+    }
+    return { preset: marshalPreset(reloaded), editor }
   }, [activeLoomPresetId, presetApi, presetSaveCoordinator, refreshRegistry])
 
   // Load registry on mount. The registry is kept in the store across panel
