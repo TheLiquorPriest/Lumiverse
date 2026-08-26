@@ -39,6 +39,9 @@ import { buildInlineToolContinuation } from "./inline-tool-continuation";
 import * as presetsSvc from "./presets.service";
 import { writePresetAgentConfig } from "./agent-config-portability.service";
 import * as worldBooksSvc from "./world-books.service";
+import { assemblePrompt } from "./prompt-assembly.service";
+import * as databankSvc from "./databank";
+import * as embeddingsSvc from "./embeddings.service";
 const TEST_CONNECTION: ResolvedConcreteConnectionV1 = {
   logicalId: "child-connection",
   concreteId: "child-connection",
@@ -249,6 +252,45 @@ describe("agent generation accounting and dispatch recognition", () => {
     ]);
   });
 
+  test("starts each Deepseek-compatible continuation with an empty carrier", () => {
+    const firstGeneration = __test__.mergeProviderTransientCarrier(
+      undefined,
+      {
+        kind: "openai_responses",
+        items: [{
+          type: "function_call",
+          id: "historical-call-item",
+          call_id: "historical-call",
+          name: "lookup",
+          arguments: "{}",
+        }],
+      },
+      [{
+        type: "function_call_output",
+        call_id: "historical-call",
+        output: "historical result",
+      }],
+    );
+    const nextGeneration = __test__.mergeProviderTransientCarrier(
+      undefined,
+      {
+        kind: "openai_responses",
+        items: [{
+          type: "function_call",
+          id: "current-call-item",
+          call_id: "current-call",
+          name: "lookup",
+          arguments: "{}",
+        }],
+      },
+      [],
+    );
+
+    expect(firstGeneration.items).toHaveLength(2);
+    expect(nextGeneration.items).toEqual([
+      expect.objectContaining({ call_id: "current-call" }),
+    ]);
+  });
   test("rejects malformed Responses carrier discriminants", () => {
     expect(() => __test__.mergeProviderTransientCarrier(
       undefined,
@@ -1295,20 +1337,20 @@ describe.serial("root generation usage accounting", () => {
           injectionTrigger: [],
           group: null,
         },
-        {
+        ...(scenario === "response_loom" ? [] : [{
           id: "history",
           name: "Chat History",
           content: "",
-          role: "user",
+          role: "user" as const,
           enabled: true,
-          position: "in_history",
+          position: "in_history" as const,
           depth: 0,
           marker: "chat_history",
           isLocked: false,
           color: null,
           injectionTrigger: [],
           group: null,
-        },
+        }]),
         ...(scenario === "response_loom" ? [{
           id: "work-policy",
           name: "Work policy",
@@ -1354,11 +1396,11 @@ describe.serial("root generation usage accounting", () => {
               loomPolicy: scenario === "response_loom"
                 ? {
                     version: 1,
-                    workPolicy: [{
-                      version: 1,
-                      id: "work-only-entry",
+                    workPolicy: Array.from({ length: 5 }, (_, index) => ({
+                      version: 1 as const,
+                      id: `work-only-entry-${index + 1}`,
                       source: {
-                        kind: "loom_block",
+                        kind: "loom_block" as const,
                         blockId: "work-policy",
                         presetRevision: preset.cache_revision ?? 1,
                         blockRevision: 1,
@@ -1366,11 +1408,11 @@ describe.serial("root generation usage accounting", () => {
                           (block) => block?.id === "work-policy",
                         ),
                       },
-                      destination: "root_work",
-                      checkpoint: "WORK",
+                      destination: "root_work" as const,
+                      checkpoint: "WORK" as const,
                       required: false,
-                      visibility: "work_only",
-                    }],
+                      visibility: "work_only" as const,
+                    })),
                     workspaceUsage: [],
                     completionCriteria: [],
                     renderPolicy: [],
@@ -1383,12 +1425,12 @@ describe.serial("root generation usage accounting", () => {
                     renderPolicy: [],
                   },
               phases: scenario === "response_phase_loom"
-                ? [{
-                    version: 1,
-                    id: "phase_only",
-                    label: "Phase only",
+                ? Array.from({ length: 6 }, (_, index) => ({
+                    version: 1 as const,
+                    id: `phase_only_${index + 1}`,
+                    label: `Phase only ${index + 1}`,
                     instructionRefs: [{
-                      kind: "loom_block",
+                      kind: "loom_block" as const,
                       blockId: "phase-policy",
                       presetRevision: preset.cache_revision ?? 1,
                       blockRevision: 1,
@@ -1397,12 +1439,12 @@ describe.serial("root generation usage accounting", () => {
                       ),
                     }],
                     required: false,
-                    enter: { kind: "generation_type", value: "normal" },
-                    exit: { kind: "phase", value: "WORK" },
+                    enter: { kind: "generation_type" as const, value: "normal" },
+                    exit: { kind: "phase" as const, value: "WORK" },
                     capabilityRequests: [],
                     repeatLimit: 0,
                     nextPhaseIds: [],
-                  }]
+                  }))
                 : [],
             },
           }
@@ -1438,15 +1480,43 @@ describe.serial("root generation usage accounting", () => {
           temporary: true,
           chat_world_book_ids: [worldBook.id],
           active_world_info_entry_ids: [worldEntry.id],
+          authors_note: {
+            content: "NATIVE-WI-RESPONSE: preserve the exact current request.",
+            role: "system",
+            position: 1,
+            depth: 0,
+          },
         },
       });
+    }
+    if (scenario === "response_loom") {
+      chatsSvc.createMessage(
+        chat.id,
+        {
+          is_user: true,
+          name: "User",
+          content: "Prior public request.",
+        },
+        userId,
+      );
+      chatsSvc.createMessage(
+        chat.id,
+        {
+          is_user: false,
+          name: "Assistant",
+          content: "Prior public reply.",
+        },
+        userId,
+      );
     }
     chatsSvc.createMessage(
       chat.id,
       {
         is_user: true,
         name: "User",
-        content: "Delegate this.",
+        content: scenario === "response_loom"
+          ? "RESPONSE-SOURCE-ROW: answer this exact request."
+          : "Delegate this.",
       },
       userId,
     );
@@ -1471,6 +1541,46 @@ describe.serial("root generation usage accounting", () => {
   }
   test("keeps ordinary Response context and emits typed Loom omission evidence", async () => {
     const fixture = await createFixture("response_loom");
+    const globalDatabank = databankSvc.createDatabank(fixture.userId, {
+      name: "Response global",
+      scope: "global",
+    });
+    const chatDatabank = databankSvc.createDatabank(fixture.userId, {
+      name: "Response chat",
+      scope: "chat",
+      scopeId: fixture.chat.id,
+    });
+    let searchedDatabankIds: string[] = [];
+    const embeddingSpy = spyOn(embeddingsSvc, "getEmbeddingConfig").mockResolvedValue({
+      enabled: true,
+      provider: "openai",
+      api_url: "https://unused.test",
+      model: "unused",
+      dimensions: null,
+      send_dimensions: false,
+      retrieval_top_k: 4,
+      hybrid_weight_mode: "balanced",
+      preferred_context_size: 512,
+      batch_size: 8,
+      similarity_threshold: 0,
+      rerank_cutoff: 0,
+      vectorize_world_books: false,
+      vectorize_chat_messages: false,
+      vectorize_chat_documents: false,
+      chat_memory_mode: "balanced",
+      request_timeout: 1,
+      has_api_key: true,
+    });
+    const searchSpy = spyOn(databankSvc, "searchDatabanks").mockImplementation(
+      async (_userId, _chatId, databankIds) => {
+        searchedDatabankIds = [...databankIds];
+        return {
+          chunks: [],
+          formatted: "AUTOMATIC-GLOBAL-DATABANK\nAUTOMATIC-CHAT-DATABANK",
+          count: 2,
+        };
+      },
+    );
     try {
       const dryRun = await dryRunGeneration({
         userId: fixture.userId,
@@ -1491,7 +1601,10 @@ describe.serial("root generation usage accounting", () => {
           surface: "RESPONSE",
           visibility: "work_only",
           reason: "work_only",
-          omittedEntryIds: ["work-only-entry"],
+          omittedEntryIds: Array.from(
+            { length: 5 },
+            (_, index) => `work-only-entry-${index + 1}`,
+          ),
           source: [expect.objectContaining({
             blockId: "work-policy",
           })],
@@ -1500,7 +1613,7 @@ describe.serial("root generation usage accounting", () => {
       expect(dryRun.loomPromptInspection?.items).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
-            entryId: "work-only-entry",
+            entryId: "work-only-entry-1",
             source: expect.objectContaining({
               blockId: "work-policy",
               presetRevision: expect.any(Number),
@@ -1530,7 +1643,10 @@ describe.serial("root generation usage accounting", () => {
             surface: "RESPONSE",
             visibility: "work_only",
             reason: "work_only",
-            omittedEntryIds: ["work-only-entry"],
+            omittedEntryIds: Array.from(
+              { length: 5 },
+              (_, index) => `work-only-entry-${index + 1}`,
+            ),
           },
         },
       });
@@ -1546,11 +1662,59 @@ describe.serial("root generation usage accounting", () => {
       expect(requestText).toContain(
         "World context for Usage Owner: blue lantern.",
       );
+      expect(requestText).toContain("Prior public request.");
+      expect(requestText).toContain("Prior public reply.");
+      expect(requestText).toContain(
+        "RESPONSE-SOURCE-ROW: answer this exact request.",
+      );
+      expect(requestText).toContain(
+        "NATIVE-WI-RESPONSE: preserve the exact current request.",
+      );
+      expect(requestText).toContain("AUTOMATIC-GLOBAL-DATABANK");
+      expect(requestText).toContain("AUTOMATIC-CHAT-DATABANK");
+      expect(searchedDatabankIds).toEqual(
+        expect.arrayContaining([globalDatabank.id, chatDatabank.id]),
+      );
+      expect(requestText).not.toContain("Write the next reply only as");
+      expect(
+        fixture.preset.prompt_order.some(
+          (block) => block.marker === "chat_history",
+        ),
+      ).toBe(false);
       expect(requestText).not.toContain("Internal work-only policy.");
+      expect(
+        fixture.provider.rootRequests[0]?.tools?.map((tool) => tool.name),
+      ).toContain("agent_delegate");
     } finally {
+      embeddingSpy.mockRestore();
+      searchSpy.mockRestore();
       await cleanupFixture(fixture.chat.id);
     }
   }, 15_000);
+  test("fails closed before provider dispatch when a Response source row is missing", async () => {
+    const fixture = await createFixture("response_loom");
+    try {
+      await expect(
+        assemblePrompt({
+          userId: fixture.userId,
+          userName: fixture.userName,
+          generationId: crypto.randomUUID(),
+          dryRun: true,
+          chatId: fixture.chat.id,
+          assemblySurface: "RESPONSE",
+          presetId: fixture.preset.id,
+          forcePresetId: true,
+          generationType: "normal",
+          sourceUserMessageIds: ["missing-source-user-row"],
+        }),
+      ).rejects.toThrow(
+        "The persisted user turn changed before Response prompt assembly",
+      );
+      expect(fixture.provider.rootRequests).toHaveLength(0);
+    } finally {
+      await cleanupFixture(fixture.chat.id);
+    }
+  });
   test("omits phase-only Loom instructions while retaining ordinary Response context", async () => {
     const fixture = await createFixture("response_phase_loom");
     try {
@@ -1586,10 +1750,10 @@ describe.serial("root generation usage accounting", () => {
           reason: "work_only",
           omittedEntryIds: [],
           source: [],
-          omittedPhaseInstructions: [{
-            phaseId: "phase_only",
+          omittedPhaseInstructions: Array.from({ length: 6 }, (_, index) => ({
+            phaseId: `phase_only_${index + 1}`,
             source: phaseSource,
-          }],
+          })),
         },
       });
 
@@ -1613,10 +1777,10 @@ describe.serial("root generation usage accounting", () => {
             reason: "work_only",
             omittedEntryIds: [],
             source: [],
-            omittedPhaseInstructions: [{
-              phaseId: "phase_only",
+            omittedPhaseInstructions: Array.from({ length: 6 }, (_, index) => ({
+              phaseId: `phase_only_${index + 1}`,
               source: phaseSource,
-            }],
+            })),
           },
         },
       });
@@ -1633,6 +1797,7 @@ describe.serial("root generation usage accounting", () => {
         "World context for Usage Owner: blue lantern.",
       );
       expect(requestText).not.toContain("Internal phase-only policy.");
+      expect(requestText.match(/Delegate this\./g)).toHaveLength(1);
     } finally {
       await cleanupFixture(fixture.chat.id);
     }

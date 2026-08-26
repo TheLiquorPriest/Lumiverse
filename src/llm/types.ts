@@ -399,6 +399,8 @@ export interface AssemblyContext {
   impersonateInput?: string;
   /** Exact input-bar draft snapshot captured when this generation started. */
   userInput?: string;
+  /** Persisted user rows that started this normal generation. Identity only. */
+  sourceUserMessageIds?: readonly string[];
   /** For regenerate: exclude this message from chat history (it has a blank swipe). */
   excludeMessageId?: string;
   /** For regenerate/swipe: content of the active target swipe before it was replaced. */

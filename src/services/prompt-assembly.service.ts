@@ -1877,8 +1877,24 @@ export function selectAgentToolChatCorpora(
 
 interface ResponseLoomPolicyAssemblyV1 {
   readonly excludedBlockIds: ReadonlySet<string>;
+  readonly normalizedLoomResponse: boolean;
   readonly inspection?: LoomPromptInspectionV1;
 }
+
+const RESPONSE_STRUCTURAL_CHAT_HISTORY_BLOCK: Readonly<PromptBlock> = {
+  id: "host:response:structural-chat-history:v1",
+  name: "Response Chat History",
+  content: "",
+  role: "system",
+  enabled: true,
+  position: "in_history",
+  depth: 0,
+  marker: "chat_history",
+  isLocked: true,
+  color: null,
+  injectionTrigger: [],
+  group: null,
+};
 
 
 function responseLoomPolicyAssembly(
@@ -1887,16 +1903,17 @@ function responseLoomPolicyAssembly(
   blocks: readonly PromptBlock[],
 ): ResponseLoomPolicyAssemblyV1 {
   if (ctx.assemblySurface !== "RESPONSE" || !preset?.id) {
-    return { excludedBlockIds: new Set<string>() };
+    return { excludedBlockIds: new Set<string>(), normalizedLoomResponse: false };
   }
   const authored = getPresetAgentResponseCognitionSourceV1(ctx.userId, preset.id);
   if (!authored) {
-    return { excludedBlockIds: new Set<string>() };
+    return { excludedBlockIds: new Set<string>(), normalizedLoomResponse: false };
   }
   const excludedBlockIds = new Set<string>(authored.conservativeExcludedBlockIds);
+  const normalizedLoomResponse = authored.sourceKind === "normalized";
   const runtimePolicy = authored.config.runtimePolicy;
   if (!runtimePolicy) {
-    return { excludedBlockIds };
+    return { excludedBlockIds, normalizedLoomResponse };
   }
 
   const phaseInstructions = runtimePolicy.phases.flatMap((phase) => [
@@ -1917,7 +1934,7 @@ function responseLoomPolicyAssembly(
     ...policies.renderPolicy,
   ];
   if (allEntries.length === 0 && phaseInstructions.length === 0) {
-    return { excludedBlockIds };
+    return { excludedBlockIds, normalizedLoomResponse };
   }
 
   const inspectionBlocksBySource = new Map<string, LoomPromptInspectionBlockV1>();
@@ -1968,8 +1985,38 @@ function responseLoomPolicyAssembly(
   }
   return {
     excludedBlockIds,
+    normalizedLoomResponse,
     inspection: enrichedInspection,
   };
+}
+
+function assertResponseSourceUserMessages(
+  ctx: AssemblyContext,
+  messages: readonly Message[],
+): void {
+  const sourceIds = ctx.sourceUserMessageIds;
+  if (
+    ctx.assemblySurface !== "RESPONSE" ||
+    ctx.generationType !== "normal" ||
+    !sourceIds?.length
+  ) {
+    return;
+  }
+
+  const missingIds = new Set(sourceIds);
+  for (const message of messages) {
+    if (!missingIds.has(message.id)) continue;
+    if (!message.is_user || message.extra?.hidden === true) break;
+    missingIds.delete(message.id);
+  }
+  if (missingIds.size === 0) return;
+
+  const error = new Error(
+    "The persisted user turn changed before Response prompt assembly",
+  );
+  error.name = "ResponseSourceMessageUnavailableError";
+  (error as Error & { code: "invalid_input" }).code = "invalid_input";
+  throw error;
 }
 export async function assemblePrompt(
   ctx: AssemblyContext,
@@ -2016,6 +2063,7 @@ export async function assemblePrompt(
   const messages = ctx.excludeMessageId
     ? allMessages.filter((m) => m.id !== ctx.excludeMessageId)
     : allMessages;
+  assertResponseSourceUserMessages(ctx, messages);
   const contextAnchorMessageId =
     typeof chat.metadata?.context_history_anchor_message_id === "string"
       ? chat.metadata.context_history_anchor_message_id
@@ -2141,7 +2189,6 @@ export async function assemblePrompt(
     preset,
     profilePromptVariables,
   );
-  reorderBlocksByPosition(effectiveBlocks);
   const responseLoomPolicy = responseLoomPolicyAssembly(ctx, preset, blocks);
   if (responseLoomPolicy.excludedBlockIds.size > 0) {
     effectiveBlocks = effectiveBlocks.filter(
@@ -2157,6 +2204,34 @@ export async function assemblePrompt(
     character,
     chat,
   );
+  if (
+    responseLoomPolicy.normalizedLoomResponse &&
+    responseLoomPolicy.excludedBlockIds.size > 0 &&
+    !effectiveBlocks.some(
+      (block) =>
+        block.marker === "chat_history" &&
+        block.enabled === true &&
+        !(
+          block.injectionTrigger?.length &&
+          !block.injectionTrigger.includes(ctx.generationType)
+        ) &&
+        promptBlockMatchesCharacterTags(
+          block.characterTagTrigger,
+          agentTraversalCharacter.tags,
+        ),
+    )
+  ) {
+    const structuralHistoryBlock = { ...RESPONSE_STRUCTURAL_CHAT_HISTORY_BLOCK };
+    const firstAuthoredHistoryIndex = effectiveBlocks.findIndex(
+      (block) => block.marker === "chat_history",
+    );
+    if (firstAuthoredHistoryIndex >= 0) {
+      effectiveBlocks.splice(firstAuthoredHistoryIndex, 0, structuralHistoryBlock);
+    } else {
+      effectiveBlocks.push(structuralHistoryBlock);
+    }
+  }
+  reorderBlocksByPosition(effectiveBlocks);
   const agentSkipsBlockTraversal =
     ctx.generationType === "impersonate" &&
     ctx.impersonateMode === "oneliner";
@@ -4475,6 +4550,7 @@ export async function assemblePrompt(
       generationType: ctx.generationType,
       targetCharacterId: ctx.targetCharacterId,
       messages,
+      sourceUserMessageIds: ctx.sourceUserMessageIds,
     })
   ) {
     const nudge = promptBehavior.emptySendNudge;

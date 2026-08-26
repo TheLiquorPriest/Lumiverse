@@ -2795,6 +2795,7 @@ async function runPromptPipeline(opts: {
   impersonateMode?: ImpersonateMode;
   impersonateInput?: string;
   userInput?: string;
+  sourceUserMessageIds?: readonly string[];
   inputMessages?: LlmMessage[];
   inputParameters?: GenerationParameters;
   excludeMessageId?: string;
@@ -2892,6 +2893,7 @@ async function runPromptPipeline(opts: {
       impersonateMode: opts.impersonateMode,
       impersonateInput: opts.impersonateInput,
       userInput: opts.userInput,
+      sourceUserMessageIds: opts.sourceUserMessageIds,
       continueMessageId: opts.continueMessageId,
       continuePostfix: opts.continuePostfix,
       targetCharacterId: opts.targetCharacterId,
@@ -4535,6 +4537,7 @@ async function startResponseGeneration(
             impersonateInput:
               genType === "impersonate" ? input.impersonate_input : undefined,
             userInput: input.user_input,
+            sourceUserMessageIds: lifecycle.sourceUserMessageIds,
             inputMessages: input.messages,
             inputParameters: input.parameters,
             excludeMessageId,

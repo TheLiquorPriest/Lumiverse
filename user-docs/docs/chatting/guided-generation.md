@@ -74,6 +74,14 @@ Guides are prompt fragments; enabling a guide does not grant Agentic tools or ch
 
 Choose the mode deliberately for the next turn. An Agentic request never silently becomes Response; if Agentic is unavailable or needs repair, choose **Use Response** intentionally or repair the named configuration.
 
+When Loom omits WORK-only blocks from **Response**, Lumiverse still preserves
+the exact current user turn, ordinary public chat history, native writing
+instructions, and attached World Book and Databank context. If the preset has
+no active Chat History block after that omission, the host supplies a temporary
+structural history position for that generation only; it does not alter or save
+the preset. A true empty send can still use the preset's Empty Send nudge, but a
+send with a persisted user turn does not receive that nudge.
+
 ### Loom Phased Instructions
 
 When Agentic is selected, reusable instructions are authored in the preset's **Agentic Runtime** panel under **Phased Instructions**. Loom owns only existing prompt blocks plus these Phased Instructions; it does not create a second context source. Existing Loom blocks are selected into four fixed policy buckets:

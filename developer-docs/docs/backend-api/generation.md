@@ -157,6 +157,17 @@ provider helpers: they do not assemble a preset and do not execute
 preset-owned intrinsics. With no executable Response-mode configuration,
 ordinary generation and existing Council continuation behavior are unchanged.
 
+Normalized Loom omission removes only the WORK-owned policy and phase source
+blocks from Response. If that leaves no active authored `chat_history` marker,
+assembly inserts one ephemeral host-owned structural marker, then runs the same
+native history, World Info, Author's Note, and automatic Databank paths. The
+marker is never persisted or exported and does not replace an active authored
+marker. Normal generations carry the exact persisted source-user row IDs into
+assembly; a nonempty source set must resolve to visible user rows or assembly
+fails before provider dispatch. Those IDs are identity only. The empty-send
+nudge is admitted only when the source set is empty, so a real current user turn
+cannot be replaced by a stale nudge.
+
 ### Child runtime
 
 An enabled directly-authored intrinsic executes serially at its prompt-block
