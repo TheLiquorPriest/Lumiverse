@@ -2829,9 +2829,11 @@ function installDecisionAuthorities(): void {
       );
       // The input authority reports completeness separately from its digest:
       // a digest of placeholder nulls must never make an incomplete request
-      // appear admissible.
-      const inputReady = context.inputRevisionsComplete
-        && context.inputRevisionDigest.length > 0;
+      // appear admissible. Incomplete Agentic input revisions never reject
+      // ordinary Response eligibility.
+      const agenticInputRequired = context.requestedMode === "agentic";
+      const inputReady = !agenticInputRequired
+        || (context.inputRevisionsComplete && context.inputRevisionDigest.length > 0);
       const staticReady = status.schema
         && status.reconciliation
         && status.archiveRegistry
@@ -2848,7 +2850,7 @@ function installDecisionAuthorities(): void {
       if (!status.isolateTermination) reasons.push("isolate_unavailable");
       if (!status.publicationStore) reasons.push("publication_store_unavailable");
       if (!providerReady) reasons.push("provider_capability_unavailable");
-      if (!inputReady) reasons.push("input_revisions_incomplete");
+      if (agenticInputRequired && !inputReady) reasons.push("input_revisions_incomplete");
       if (getAgenticRuntimeMode() !== "auto") reasons.push("kill_switch_off");
       if (!ready) {
         console.error("[Agentic] Effective runtime readiness denied", {

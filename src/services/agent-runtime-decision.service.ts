@@ -411,6 +411,7 @@ export interface RuntimeDecisionDependencies {
       bindingRevision: RuntimeRevision | null;
       inputRevisionDigest: string;
       inputRevisionsComplete: boolean;
+      requestedMode: AgentRuntimeMode;
       rootConnection?: FrozenConcreteConnectionV1 | null;
       childConnections?: Readonly<Record<string, FrozenConcreteConnectionV1>>;
       target?: GenerationTargetV1;
@@ -1821,12 +1822,12 @@ export class AgentRuntimeDecisionService {
       }
     }
     if (!revisions.complete && normalizedRequestedMode === "agentic") repairCodes.push("agentic_input_revisions_incomplete");
-
     const readinessFromDependency = this.dependencies.getReadinessVector?.(userId, request, {
       configRevision: config?.revision ?? null,
       bindingRevision: config?.bindingRevision ?? null,
       inputRevisionDigest: revisions.digest,
       inputRevisionsComplete: revisions.complete,
+      requestedMode: normalizedRequestedMode,
       rootConnection,
       childConnections,
       target,
@@ -1870,6 +1871,7 @@ export class AgentRuntimeDecisionService {
       repairCodes: [...new Set(uniqueRepairCodes)],
     };
     const effectiveMode: AgentRuntimeMode = capabilityReady ? "agentic" : "response";
+    const agenticHostDenied = normalizedRequestedMode === "agentic" && !capabilityReady;
     const runtimePolicy = resolveLoomRuntimePolicy({
       transientSelection,
       durableChatOverride,
@@ -1882,8 +1884,8 @@ export class AgentRuntimeDecisionService {
           ? "loom_policy_repair_required"
           : null,
       hostAllowedModes: configAllowedModes,
-      hostAvailability: capabilityReady ? "available" : "unavailable",
-      hostReasonCode: capabilityReady ? null : firstConcreteHostReason(readinessVector.reasons, uniqueRepairCodes),
+      hostAvailability: agenticHostDenied ? "unavailable" : "available",
+      hostReasonCode: agenticHostDenied ? firstConcreteHostReason(readinessVector.reasons, uniqueRepairCodes) : null,
       repairAcknowledgement: initialRuntimePolicy.repairAcknowledgement,
     });
     if (runtimePolicy.availability.reasonCode && !uniqueRepairCodes.includes(runtimePolicy.availability.reasonCode)) {
@@ -1982,7 +1984,8 @@ export class AgentRuntimeDecisionService {
       effectiveMode: context.effectiveMode,
       chatOverride,
       capabilityReadiness: {
-        ready: context.capabilityReadiness.ready && context.effectiveMode === "agentic",
+        ready: normalizedRequestedMode === "response"
+          || (context.capabilityReadiness.ready && context.effectiveMode === "agentic"),
         sameDomain: context.capabilityReadiness.sameDomain,
         required: context.capabilityReadiness.required,
         missing: context.capabilityReadiness.missing,

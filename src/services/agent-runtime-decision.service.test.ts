@@ -614,6 +614,62 @@ describe("AgentRuntimeDecisionService", () => {
     });
   });
 
+  test("durable Response stays available when Agentic input revisions are incomplete", async () => {
+    const service = makeService({
+      override: { mode: "response", revision: 3, state: "ready" },
+      getInputRevisions: () => null,
+      getReadinessVector: (_userId, _request, context) => ({
+        ready: false,
+        reasons: context.requestedMode === "agentic" ? ["input_revisions_incomplete"] : ["input_revisions_incomplete"],
+        inputRevisionDigest: "",
+      }),
+    });
+    const responseRequest = request({
+      transientSelection: null,
+      requestEpoch: 28,
+      inputRevisions: {},
+    });
+    delete responseRequest.mode;
+    const decision = await service.resolve(USER_ID, responseRequest);
+    expect(decision.requestedMode).toBe("response");
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.runtimePolicy).toMatchObject({
+      authoredValue: "response",
+      effectiveValue: "response",
+      source: "durable_chat_override",
+      scope: "chat",
+      availability: { state: "available", reasonCode: null },
+    });
+    expect(decision.capabilityReadiness.ready).toBe(true);
+    expect(decision.repairCodes).not.toContain("input_revisions_incomplete");
+    expect(decision.repairCodes).not.toContain("agentic_input_revisions_incomplete");
+  });
+
+  test("Agentic stays host-rejected when input revisions are incomplete", async () => {
+    const service = makeService({
+      getInputRevisions: () => null,
+      getReadinessVector: () => ({
+        ready: false,
+        reasons: ["input_revisions_incomplete"],
+        inputRevisionDigest: "",
+      }),
+    });
+    const decision = await service.resolve(USER_ID, request({ mode: "agentic", inputRevisions: {} }));
+    expect(decision.requestedMode).toBe("agentic");
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.runtimePolicy.source).toBe("host_rejected");
+    expect(decision.runtimePolicy.availability).toMatchObject({
+      state: "unavailable",
+      reasonCode: "input_revisions_incomplete",
+    });
+    expect(decision.capabilityReadiness.ready).toBe(false);
+    expect(decision.repairCodes).toEqual(expect.arrayContaining([
+      "agentic_input_revisions_incomplete",
+      "input_revisions_incomplete",
+    ]));
+  });
+
+
   test("keeps repair acknowledgement separate from an unavailable mode choice", () => {
     const policy = resolveLoomRuntimePolicy({
       transientSelection: {
