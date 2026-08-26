@@ -22,11 +22,13 @@ describe('DatabankPanel mutation error wiring', () => {
   test('rename reports failure without writing the attempted title', () => {
     const body = sliceBetween('const handleRenameDoc = useCallback(', '\n  // ── Drag and drop')
     expect(body).toContain('const started = mintMutation()')
-    expect(body).toContain("t('databankPanel.renameDocFailed')")
-    expect(body).toContain('reportMutationError(started,')
+    expect(body).toContain("reportMutationError(started, t('databankPanel.renameDocFailed'))")
+    expect(body).not.toContain('e?.body?.error')
+    expect(body).not.toContain('e?.message')
     expect(body).not.toContain('/* ignore */')
     expect(body).not.toContain('updateDatabankDocument(docId, { name: newName')
   })
+
 
   test('committed scope reset mints null; Keep Editing does not', () => {
     const reset = sliceBetween(
@@ -60,27 +62,29 @@ describe('DatabankPanel mutation error wiring', () => {
       'const loadDocs = useCallback(',
     )
     expect(remote).toContain("reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')")
-    expect(remote).toContain('committedContextResetRef.current')
+    expect(remote).toContain('classifyNullTransition(previous)')
     expect(remote).toContain('lastSelectedBankIdRef.current')
+    expect(remote).not.toContain('committedContextResetRef')
 
     const body = sliceBetween('const loadDocs = useCallback(', '\n  useEffect(() => {\n    void loadDocs()')
     expect(body).toContain('if (mutationGateRef.current.holdingRemoteRemoval()) return')
     expect(body).toContain("reportMutationError(started, t('databankPanel.remoteDocumentRemoved'), 'remote-removal')")
-    const noBank = body.slice(body.indexOf('if (!selectedDatabankId)'), body.indexOf('if (mutationGateRef.current.holdingRemoteRemoval()) {'))
+    const noBank = body.slice(body.indexOf('if (!selectedDatabankId)'), body.indexOf('const switchedBank'))
     expect(noBank).toContain('if (mutationGateRef.current.holdingRemoteRemoval()) return')
-    expect(noBank).not.toMatch(/mintMutation\(\)[\s\S]*holdingRemoteRemoval/)
+    expect(noBank).not.toContain('mintMutation()')
   })
 
   test('local delete and empty selector never publish remoteDatabankRemoved', () => {
     const del = sliceBetween('const handleDeleteBank = useCallback(', '\n  // ── Update bank details')
-    expect(del).toContain('beginLocalDeselect()')
-    expect(del.indexOf('beginLocalDeselect()')).toBeLessThan(del.indexOf('removeDatabank(selectedDatabankId)'))
+    expect(del).toContain('beginLocalDeselect(selectedDatabankId)')
+    expect(del.indexOf('beginLocalDeselect(selectedDatabankId)')).toBeLessThan(del.indexOf('removeDatabank(selectedDatabankId)'))
     expect(del).toContain('clearMutationErrorIfCurrent(started)')
     expect(del).not.toContain('remoteDatabankRemoved')
 
     const select = sliceBetween('{/* Bank selector bar */}', '<option value="">{t(\'databankPanel.selectDatabank\')}</option>')
     expect(select).toContain('if (!next)')
-    expect(select).toContain('beginLocalDeselect()')
+    expect(select).toContain('beginLocalDeselect(selectedDatabankId)')
+    expect(select).toContain('localDeselectRef.current.clear()')
     expect(select).toContain('clearMutationErrorIfCurrent(mintMutation())')
     expect(select).not.toContain('remoteDatabankRemoved')
 
@@ -88,12 +92,20 @@ describe('DatabankPanel mutation error wiring', () => {
       'DATABANK_DELETED removes the bank and nulls selection.',
       'const loadDocs = useCallback(',
     )
-    expect(remote).toContain('if (committedContextResetRef.current)')
+    expect(remote).toContain("classifyNullTransition(previous) === 'local'")
     expect(remote).toContain("reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')")
-    expect(remote.indexOf('if (committedContextResetRef.current)')).toBeLessThan(
+    expect(remote.indexOf("classifyNullTransition(previous) === 'local'")).toBeLessThan(
       remote.indexOf("reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')"),
     )
   })
+
+  test('delete document reports localized copy not API body', () => {
+    const body = sliceBetween('const handleDeleteDoc = useCallback(', '\n  const handleReprocessDoc')
+    expect(body).toContain("reportMutationError(started, t('databankPanel.deleteDocFailed'))")
+    expect(body).not.toContain('e?.body?.error')
+    expect(body).not.toContain('e?.message')
+  })
+
 
 
 

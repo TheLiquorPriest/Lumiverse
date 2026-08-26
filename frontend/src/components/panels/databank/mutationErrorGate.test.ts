@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { createMutationErrorGate } from './mutationErrorGate'
+import { createLocalDeselectLedger, createMutationErrorGate } from './mutationErrorGate'
 
 describe('Databank mutation error gate', () => {
   test('mints a new identity for every mutation', () => {
@@ -75,5 +75,24 @@ describe('Databank mutation error gate', () => {
     expect(gate.holdingRemoteRemoval()).toBe(false)
   })
 
+  test('local deselect is one-shot and cannot swallow a later remote null', () => {
+    const ledger = createLocalDeselectLedger()
+    ledger.begin('bank-a')
+    expect(ledger.classifyNullTransition('bank-a')).toBe('local')
+    expect(ledger.pending()).toBeNull()
+    expect(ledger.classifyNullTransition('bank-a')).toBe('remote')
 
+    ledger.begin('bank-a')
+    expect(ledger.classifyNullTransition('bank-c')).toBe('remote')
+    expect(ledger.pending()).toBeNull()
+
+    ledger.begin(null)
+    expect(ledger.classifyNullTransition('bank-a')).toBe('remote')
+
+    ledger.begin('bank-a')
+    ledger.clear()
+    expect(ledger.classifyNullTransition('bank-a')).toBe('remote')
+  })
 })
+
+

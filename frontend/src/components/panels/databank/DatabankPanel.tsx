@@ -16,7 +16,7 @@ import {
   getContextDatabankBindings,
   isAutomaticallyActiveForContext,
 } from './databankActivation'
-import { createMutationErrorGate } from './mutationErrorGate'
+import { createLocalDeselectLedger, createMutationErrorGate } from './mutationErrorGate'
 import styles from './DatabankPanel.module.css'
 
 type Scope = 'global' | 'character' | 'chat'
@@ -125,10 +125,11 @@ export default function DatabankPanel() {
   const editingDirtyRef = useRef(false)
   const selectedDatabankIdRef = useRef<string | null>(null)
   const pendingContextResetRef = useRef(false)
-  const committedContextResetRef = useRef(false)
   const lastSelectedBankIdRef = useRef<string | null>(null)
+  const lastLoadedBankIdRef = useRef<string | null>(null)
   const docsRequestRef = useRef(0)
   const mutationGateRef = useRef(createMutationErrorGate())
+  const localDeselectRef = useRef(createLocalDeselectLedger())
 
   const mintMutation = useCallback(() => mutationGateRef.current.mint(), [])
   const reportMutationError = useCallback((
@@ -143,9 +144,10 @@ export default function DatabankPanel() {
     const next = mutationGateRef.current.publish(token, null)
     if (next !== undefined) setError(next)
   }, [])
-  const beginLocalDeselect = useCallback(() => {
-    committedContextResetRef.current = true
+  const beginLocalDeselect = useCallback((fromId: string | null) => {
+    localDeselectRef.current.begin(fromId)
   }, [])
+
 
 
 
@@ -180,7 +182,7 @@ export default function DatabankPanel() {
   const flushPendingContextReset = useCallback(() => {
     if (!pendingContextResetRef.current) return
     pendingContextResetRef.current = false
-    beginLocalDeselect()
+    beginLocalDeselect(selectedDatabankIdRef.current)
     docsRequestRef.current += 1
     contentRequestRef.current += 1
     setSelectedDatabankId(null)
@@ -198,8 +200,8 @@ export default function DatabankPanel() {
 
 
 
-  const loadEditorContent = useCallback(async (docId: string, bankId: string) => {
-    const started = mintMutation()
+  const loadEditorContent = useCallback(async (docId: string, bankId: string, ownsPanelBanner = false) => {
+    const started = ownsPanelBanner ? mintMutation() : null
     const requestId = ++contentRequestRef.current
     try {
       const result = await databankApi.getDocumentContent(bankId, docId)
@@ -207,7 +209,7 @@ export default function DatabankPanel() {
       if (editingDocIdRef.current !== docId) return
       if (editingDirtyRef.current) return
       setEditingContent(result.content ?? '')
-      clearMutationErrorIfCurrent(started)
+      if (started !== null) clearMutationErrorIfCurrent(started)
     } catch (e: unknown) {
       if (requestId !== contentRequestRef.current) return
       if (editingDocIdRef.current !== docId) return
@@ -215,6 +217,7 @@ export default function DatabankPanel() {
       setEditorError(err.body?.error || err.message || t('databankPanel.loadDocFailed'))
     }
   }, [mintMutation, clearMutationErrorIfCurrent, t])
+
 
 
 
@@ -363,7 +366,7 @@ export default function DatabankPanel() {
       return
     }
     pendingContextResetRef.current = false
-    beginLocalDeselect()
+    beginLocalDeselect(selectedDatabankIdRef.current)
     docsRequestRef.current += 1
     contentRequestRef.current += 1
     setSelectedDatabankId(null)
@@ -379,10 +382,7 @@ export default function DatabankPanel() {
     const previous = lastSelectedBankIdRef.current
     lastSelectedBankIdRef.current = selectedDatabankId
     if (selectedDatabankId || !previous) return
-    if (committedContextResetRef.current) {
-      committedContextResetRef.current = false
-      return
-    }
+    if (localDeselectRef.current.classifyNullTransition(previous) === 'local') return
     docsRequestRef.current += 1
     closeDocEditor()
     reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')
@@ -391,12 +391,14 @@ export default function DatabankPanel() {
   // ── Load documents when bank selection changes ──
   const loadDocs = useCallback(async () => {
     if (!selectedDatabankId) {
+      lastLoadedBankIdRef.current = null
       setDatabankDocuments([])
       if (mutationGateRef.current.holdingRemoteRemoval()) return
-      clearMutationErrorIfCurrent(mintMutation())
       return
     }
-    if (mutationGateRef.current.holdingRemoteRemoval()) {
+    const switchedBank = lastLoadedBankIdRef.current !== selectedDatabankId
+    lastLoadedBankIdRef.current = selectedDatabankId
+    if (mutationGateRef.current.holdingRemoteRemoval() && !switchedBank) {
       const requestId = ++docsRequestRef.current
       try {
         const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
@@ -429,6 +431,7 @@ export default function DatabankPanel() {
 
 
 
+
   useEffect(() => {
     void loadDocs()
     return () => { docsRequestRef.current += 1 }
@@ -455,12 +458,9 @@ export default function DatabankPanel() {
     const hasProcessing = databankDocuments.some((d) => d.status === 'pending' || d.status === 'processing')
     if (hasProcessing && selectedDatabankId) {
       pollRef.current = setInterval(async () => {
-        const holdRemote = mutationGateRef.current.holdingRemoteRemoval()
-        const started = holdRemote ? null : mintMutation()
         try {
           const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
           setDatabankDocuments(result.data)
-          if (started !== null) clearMutationErrorIfCurrent(started)
           const stillProcessing = result.data.some((d) => d.status === 'pending' || d.status === 'processing')
           if (!stillProcessing && pollRef.current) {
             clearInterval(pollRef.current)
@@ -472,7 +472,8 @@ export default function DatabankPanel() {
     return () => {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
     }
-  }, [databankDocuments, selectedDatabankId, setDatabankDocuments, mintMutation, clearMutationErrorIfCurrent])
+  }, [databankDocuments, selectedDatabankId, setDatabankDocuments])
+
 
   // ── Create bank ──
   const handleCreate = useCallback(async () => {
@@ -501,7 +502,7 @@ export default function DatabankPanel() {
     const started = mintMutation()
     try {
       await databankApi.delete(selectedDatabankId)
-      beginLocalDeselect()
+      beginLocalDeselect(selectedDatabankId)
       removeDatabank(selectedDatabankId)
       setSelectedDatabankId(null)
       clearMutationErrorIfCurrent(started)
@@ -509,6 +510,7 @@ export default function DatabankPanel() {
       reportMutationError(started, e.message)
     }
   }, [selectedDatabankId, beginLocalDeselect, removeDatabank, setSelectedDatabankId, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
+
 
 
   // ── Update bank details ──
@@ -568,8 +570,8 @@ export default function DatabankPanel() {
       await databankApi.deleteDocument(selectedDatabankId, docId)
       removeDatabankDocument(docId)
       clearMutationErrorIfCurrent(started)
-    } catch (e: any) {
-      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.deleteDocFailed'))
+    } catch {
+      reportMutationError(started, t('databankPanel.deleteDocFailed'))
     }
   }, [selectedDatabankId, removeDatabankDocument, mintMutation, clearMutationErrorIfCurrent, reportMutationError, t])
 
@@ -675,7 +677,7 @@ export default function DatabankPanel() {
     setEditorError(null)
     setEditorLoading(true)
     try {
-      await loadEditorContent(doc.id, selectedDatabankId)
+      await loadEditorContent(doc.id, selectedDatabankId, true)
     } finally {
       if (editingDocIdRef.current === doc.id) setEditorLoading(false)
     }
@@ -728,8 +730,8 @@ export default function DatabankPanel() {
       const updated = await databankApi.renameDocument(selectedDatabankId, docId, newName.trim())
       updateDatabankDocument(docId, { name: updated.name, slug: updated.slug })
       clearMutationErrorIfCurrent(started)
-    } catch (e: any) {
-      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.renameDocFailed'))
+    } catch {
+      reportMutationError(started, t('databankPanel.renameDocFailed'))
     }
   }, [selectedDatabankId, updateDatabankDocument, mintMutation, clearMutationErrorIfCurrent, reportMutationError, t])
 
@@ -1088,13 +1090,16 @@ export default function DatabankPanel() {
           onChange={(e) => {
             const next = e.target.value || null
             if (!next) {
-              beginLocalDeselect()
+              beginLocalDeselect(selectedDatabankId)
               setSelectedDatabankId(null)
               clearMutationErrorIfCurrent(mintMutation())
               return
             }
+            localDeselectRef.current.clear()
+            clearMutationErrorIfCurrent(mintMutation())
             setSelectedDatabankId(next)
           }}
+
         >
           <option value="">{t('databankPanel.selectDatabank')}</option>
           {databanks.map((b) => (

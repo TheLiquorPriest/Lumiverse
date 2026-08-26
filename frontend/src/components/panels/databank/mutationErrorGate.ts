@@ -22,3 +22,23 @@ export function createMutationErrorGate() {
     },
   }
 }
+
+export function createLocalDeselectLedger() {
+  let pendingFrom: string | null = null
+  return {
+    begin(fromId: string | null) {
+      pendingFrom = fromId
+    },
+    classifyNullTransition(previousId: string): 'local' | 'remote' {
+      const local = pendingFrom !== null && pendingFrom === previousId
+      pendingFrom = null
+      return local ? 'local' : 'remote'
+    },
+    clear() {
+      pendingFrom = null
+    },
+    pending() {
+      return pendingFrom
+    },
+  }
+}
