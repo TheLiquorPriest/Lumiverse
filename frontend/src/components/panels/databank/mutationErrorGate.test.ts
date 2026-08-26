@@ -48,4 +48,13 @@ describe('Databank mutation error gate', () => {
     expect(gate.publish(failedDelete, null)).toBeUndefined()
     expect(gate.publish(create, null)).toBeNull()
   })
+
+  test('a committed reset token invalidates in-flight prior reports', () => {
+    const gate = createMutationErrorGate()
+    const prior = gate.mint()
+    const reset = gate.mint()
+    expect(gate.publish(reset, null)).toBeNull()
+    expect(gate.publish(prior, 'prior-scope failure')).toBeUndefined()
+  })
+
 })

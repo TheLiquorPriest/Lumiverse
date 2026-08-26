@@ -170,14 +170,17 @@ export default function DatabankPanel() {
     if (!pendingContextResetRef.current) return
     pendingContextResetRef.current = false
     docsRequestRef.current += 1
+    contentRequestRef.current += 1
     setSelectedDatabankId(null)
     setDatabankDocuments([])
-  }, [setSelectedDatabankId, setDatabankDocuments])
+    clearMutationErrorIfCurrent(mintMutation())
+  }, [setSelectedDatabankId, setDatabankDocuments, mintMutation, clearMutationErrorIfCurrent])
 
   const settlePendingContextReset = useCallback(() => {
     pendingContextResetRef.current = false
     setDiscardConfirmOpen(false)
   }, [])
+
 
 
 
@@ -351,7 +354,9 @@ export default function DatabankPanel() {
     setSelectedDatabankId(null)
     setDatabankDocuments([])
     closeDocEditor()
-  }, [databankScopeFilter, activeCharacterId, activeChatId, setSelectedDatabankId, setDatabankDocuments, closeDocEditor])
+    clearMutationErrorIfCurrent(mintMutation())
+  }, [databankScopeFilter, activeCharacterId, activeChatId, setSelectedDatabankId, setDatabankDocuments, closeDocEditor, mintMutation, clearMutationErrorIfCurrent])
+
 
   // DATABANK_DELETED removes the bank and nulls selection. That is not
   // user-clean navigation, which closes the editor in the same turn.
@@ -370,9 +375,11 @@ export default function DatabankPanel() {
   // ── Load documents when bank selection changes ──
   const loadDocs = useCallback(async () => {
     const started = mintMutation()
+
     const requestId = ++docsRequestRef.current
     if (!selectedDatabankId) {
       setDatabankDocuments([])
+      if (!editingDocIdRef.current) clearMutationErrorIfCurrent(started)
       return
     }
     try {

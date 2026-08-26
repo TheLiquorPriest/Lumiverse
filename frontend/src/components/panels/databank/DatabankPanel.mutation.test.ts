@@ -27,4 +27,37 @@ describe('DatabankPanel mutation error wiring', () => {
     expect(body).not.toContain('/* ignore */')
     expect(body).not.toContain('updateDatabankDocument(docId, { name: newName')
   })
+
+  test('committed scope reset mints null; Keep Editing does not', () => {
+    const reset = sliceBetween(
+      'A selected bank belongs to the scope/context in which it was chosen.',
+      'DATABANK_DELETED removes the bank',
+    )
+    expect(reset).toContain('pendingContextResetRef.current = true')
+    expect(reset).toContain('setDiscardConfirmOpen(true)')
+    expect(reset).toContain('return')
+    expect(reset).toContain('clearMutationErrorIfCurrent(mintMutation())')
+
+    const dirtyBranch = reset.slice(
+      reset.indexOf('if (editingDirtyRef.current && editingDocIdRef.current)'),
+      reset.indexOf('pendingContextResetRef.current = false'),
+    )
+    expect(dirtyBranch).not.toContain('mintMutation()')
+    expect(dirtyBranch).not.toContain('clearMutationErrorIfCurrent')
+
+    const flush = sliceBetween('const flushPendingContextReset = useCallback(', 'const settlePendingContextReset')
+    expect(flush).toContain('clearMutationErrorIfCurrent(mintMutation())')
+
+    const keep = sliceBetween('const settlePendingContextReset = useCallback(', 'const loadEditorContent')
+    expect(keep).not.toContain('mintMutation')
+    expect(keep).not.toContain('clearMutationErrorIfCurrent')
+    expect(keep).toContain('pendingContextResetRef.current = false')
+  })
+
+  test('loadDocs with no bank after committed reset clears a stale banner', () => {
+    const body = sliceBetween('const loadDocs = useCallback(', '\n  useEffect(() => {\n    void loadDocs()')
+    expect(body).toContain('if (!selectedDatabankId)')
+    expect(body).toContain('if (!editingDocIdRef.current) clearMutationErrorIfCurrent(started)')
+  })
+
 })
