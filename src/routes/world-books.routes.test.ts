@@ -322,5 +322,44 @@ describe("world-book entry parent containment", () => {
     expect(rightDelete.status).toBe(200);
     expect(svc.getEntry(USER_ID, entry.id)).toBeNull();
   });
+
+  test("stale expected parent after bulk move stays 404 without mutating B", async () => {
+    const bookA = svc.createWorldBook(USER_ID, { name: "Parent A" });
+    const bookB = svc.createWorldBook(USER_ID, { name: "Parent B" });
+    const entry = svc.createEntry(USER_ID, bookA.id, { comment: "move-me", content: "original" })!;
+    const headers = { "content-type": "application/json", "x-test-user": USER_ID };
+
+    const moved = await app.request(`http://localhost/world-books/${bookA.id}/entries/bulk`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        action: "move",
+        entry_ids: [entry.id],
+        target_book_id: bookB.id,
+      }),
+    });
+    expect(moved.status).toBe(200);
+    expect(svc.getEntry(USER_ID, entry.id)?.world_book_id).toBe(bookB.id);
+
+    const stalePut = await app.request(`http://localhost/world-books/${bookA.id}/entries/${entry.id}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ content: "from-stale-a", expected_revision: entry.revision + 1 }),
+    });
+    expect(stalePut.status).toBe(404);
+    expect(await stalePut.json()).toEqual({ error: "Not found" });
+
+    const staleDelete = await app.request(`http://localhost/world-books/${bookA.id}/entries/${entry.id}`, {
+      method: "DELETE",
+      headers: { "x-test-user": USER_ID },
+    });
+    expect(staleDelete.status).toBe(404);
+    expect(await staleDelete.json()).toEqual({ error: "Not found" });
+
+    const live = svc.getEntry(USER_ID, entry.id);
+    expect(live?.world_book_id).toBe(bookB.id);
+    expect(live?.content).toBe("original");
+  });
+
 });
 

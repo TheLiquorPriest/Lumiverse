@@ -1025,9 +1025,12 @@ export default function WorldBookEntriesSection({
       }
     }).catch((error) => {
       const classified = recordMutationIssue(operationIds, error, retry, bookId, generation)
-      if (!classified) liveRefetchRef.current()
+      if (!classified) {
+        toast.error(t('entryMutationFailed'))
+        liveRefetchRef.current()
+      }
     })
-  }, [recordMutationIssue])
+  }, [recordMutationIssue, t])
 
   const acceptServerConflict = useCallback((entryId: string) => {
     const conflict = entryConflicts[entryId]

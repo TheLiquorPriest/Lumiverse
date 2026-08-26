@@ -1405,6 +1405,7 @@
     "chatAttachmentSaveFailed": "无法保存此聊天的世界书附件。",
     "entrySaveFailed": "无法保存此世界书条目。",
     "entryDeleteFailed": "无法删除此世界书条目。",
+    "entryMutationFailed": "无法更新此世界书条目。",
     "activationSettings": "激活设置",
     "selectBook": "选择世界书…",
     "selectWorldBookAria": "选择世界书",

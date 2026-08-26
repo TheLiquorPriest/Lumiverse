@@ -203,7 +203,7 @@ describe("WI marker fields — persistence round trip", () => {
       wi_marker_side: "before",
     });
 
-    const updated = updateEntry(USER_ID, created!.id, { wi_marker: null, wi_marker_side: null });
+    const updated = updateEntry(USER_ID, book.id, created!.id, { wi_marker: null, wi_marker_side: null });
     expect(updated!.wi_marker).toBeNull();
     expect(updated!.wi_marker_side).toBeNull();
 
@@ -220,7 +220,7 @@ describe("WI marker fields — persistence round trip", () => {
       wi_marker_side: "before",
     });
 
-    const updated = updateEntry(USER_ID, created!.id, {
+    const updated = updateEntry(USER_ID, book.id, created!.id, {
       wi_marker: "scenario",
       wi_marker_side: "after",
     });
@@ -236,7 +236,7 @@ describe("WI marker fields — persistence round trip", () => {
       wi_marker_side: "before",
     });
 
-    const updated = updateEntry(USER_ID, created!.id, { wi_marker_side: "after" });
+    const updated = updateEntry(USER_ID, book.id, created!.id, { wi_marker_side: "after" });
     expect(updated!.wi_marker).toBe("char_description");
     expect(updated!.wi_marker_side).toBe("after");
   });

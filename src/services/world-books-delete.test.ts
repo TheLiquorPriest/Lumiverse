@@ -155,7 +155,7 @@ describe("world-book source-first deletion", () => {
     insertBook("book-1", "user");
     insertEntry("entry-1", "book-1");
     vectors = [{ userId: "user", ownerId: "book-1", sourceId: "entry-1" }];
-    await expect(worldBooksSvc.deleteEntry("user", "entry-1")).rejects.toThrow("vector cleanup failed");
+    await expect(worldBooksSvc.deleteEntry("user", "book-1", "entry-1")).rejects.toThrow("vector cleanup failed");
     expect(rowExists("world_book_entries", "entry-1")).toBe(false);
     expect(vectors).toHaveLength(1);
   });
@@ -186,7 +186,7 @@ describe("world-book source-first deletion", () => {
     insertEntry("entry-1", "book-1");
     vectors = [{ userId: "user", ownerId: "book-1", sourceId: "entry-1" }];
 
-    expect(await worldBooksSvc.deleteEntry("user", "entry-1")).toBe(true);
+    expect(await worldBooksSvc.deleteEntry("user", "book-1", "entry-1")).toBe(true);
     expect(sourceVisibleDuringCleanup).toBe(false);
     expect(rowExists("world_book_entries", "entry-1")).toBe(false);
     expect(vectors).toEqual([]);
@@ -200,7 +200,7 @@ describe("world-book source-first deletion", () => {
       getDb().query("UPDATE world_book_entries SET revision = 2 WHERE id = ?").run("entry-1");
     };
 
-    await expect(worldBooksSvc.deleteEntry("user", "entry-1", 1)).rejects.toThrow();
+    await expect(worldBooksSvc.deleteEntry("user", "book-1", "entry-1", 1)).rejects.toThrow();
     expect(rowExists("world_book_entries", "entry-1")).toBe(true);
     expect(vectors).toEqual([{ userId: "user", ownerId: "book-1", sourceId: "entry-1" }]);
   });

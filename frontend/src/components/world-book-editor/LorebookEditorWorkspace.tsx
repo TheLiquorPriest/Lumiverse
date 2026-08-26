@@ -15,8 +15,10 @@ import {
   X,
 } from 'lucide-react'
 import clsx from 'clsx'
+import { useTranslation } from 'react-i18next'
 import { ApiError } from '@/api/client'
 import { worldBooksApi } from '@/api/world-books'
+import { toast } from '@/lib/toast'
 import {
   backfillEntryMetadata,
   buildEntryGridTemplate,
@@ -97,6 +99,7 @@ export default function LorebookEditorWorkspace({
   fullscreen = false,
   onToggleFullscreen,
 }: LorebookEditorWorkspaceProps) {
+  const { t } = useTranslation('panels', { keyPrefix: 'worldBookPanel' })
   const { settings, updateSettings } = useLorebookEditorLayoutSettings()
   const [books, setBooks] = useState<WorldBook[]>([])
   const [entries, setEntries] = useState<WorldBookEntry[]>([])
@@ -488,12 +491,13 @@ export default function LorebookEditorWorkspace({
           return
         }
         pendingDrafts.current[entryId] = { ...draft, ...pendingDrafts.current[entryId] }
-        throw error
+        toast.error(t('entrySaveFailed'))
       }
     })
     saveQueues.current[entryId] = next.catch(() => {})
     return next
-  }, [applyConflict, commitEntries, selectedBookId])
+  }, [applyConflict, commitEntries, selectedBookId, t])
+
 
   const debouncedSaveEntry = useCallback((entryId: string, updates: Partial<WorldBookEntry>) => {
     pendingDrafts.current[entryId] = { ...pendingDrafts.current[entryId], ...updates }
@@ -542,9 +546,11 @@ export default function LorebookEditorWorkspace({
         applyConflict(payload, drafts)
         return
       }
-      throw error
+      toast.error(input.action === 'delete' ? t('entryDeleteFailed') : t('entryMutationFailed'))
+      await loadEntries(selectedBookId)
     }
-  }, [applyConflict, loadEntries, selectedBookId])
+  }, [applyConflict, loadEntries, selectedBookId, t])
+
 
   const bulkForm = useMemo<BulkFieldForm>(() => ({
     priority: bulkPriority,

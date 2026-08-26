@@ -1301,8 +1301,9 @@ export class WorkerHostContentApi {
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
       this.enforceScopedUser(resolvedUserId);
-
-      const entry = worldBooksSvc.updateEntry(resolvedUserId, entryId, input || {});
+      const existing = worldBooksSvc.getEntry(resolvedUserId, entryId);
+      if (!existing) throw new Error("World book entry not found");
+      const entry = worldBooksSvc.updateEntry(resolvedUserId, existing.world_book_id, entryId, input || {});
       if (!entry) throw new Error("World book entry not found");
       this.postToWorker({ type: "response", requestId, result: this.toWorldBookEntryDTO(entry) });
     } catch (err: any) {
@@ -1318,8 +1319,9 @@ export class WorkerHostContentApi {
       const resolvedUserId = this.resolveEffectiveUserId(userId);
       if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
       this.enforceScopedUser(resolvedUserId);
-
-      const deleted = await worldBooksSvc.deleteEntry(resolvedUserId, entryId);
+      const existing = worldBooksSvc.getEntry(resolvedUserId, entryId);
+      if (!existing) throw new Error("World book entry not found");
+      const deleted = await worldBooksSvc.deleteEntry(resolvedUserId, existing.world_book_id, entryId);
       this.postToWorker({ type: "response", requestId, result: deleted });
     } catch (err: any) {
       this.postToWorker({ type: "response", requestId, error: err.message });
@@ -1437,10 +1439,13 @@ export class WorkerHostContentApi {
       const input = { ...this.asBatchRecord(args.input ?? {}, "input") };
       const expected = expectedRevisions?.[entryId];
       if (expected !== undefined && input.expected_revision === undefined) input.expected_revision = expected;
+      const existing = worldBooksSvc.getEntry(userId, entryId);
+      if (!existing) throw new Error("World book entry not found");
       const entry = worldBooksSvc.updateEntry(
         userId,
+        existing.world_book_id,
         entryId,
-        input as unknown as Parameters<typeof worldBooksSvc.updateEntry>[2],
+        input as unknown as Parameters<typeof worldBooksSvc.updateEntry>[3],
       );
       if (!entry) throw new Error("World book entry not found");
       return this.toBatchJson(this.toWorldBookEntryDTO(entry));

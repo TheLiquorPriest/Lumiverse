@@ -1022,7 +1022,7 @@ app.put("/:id/entries/:eid", async (c) => {
   const body = await c.req.json();
   try {
     const entry = containedEntry(
-      svc.updateEntry(userId, existing.id, entryMutationBody(body) as UpdateWorldBookEntryInput),
+      svc.updateEntry(userId, book.id, existing.id, entryMutationBody(body) as UpdateWorldBookEntryInput),
       book.id,
     );
     if (!entry) return c.json({ error: "Not found" }, 404);
@@ -1093,9 +1093,24 @@ app.delete("/:id/entries/:eid", async (c) => {
   if (!book) return c.json({ error: "World book not found" }, 404);
   const entry = containedEntry(svc.getEntry(userId, c.req.param("eid")), book.id);
   if (!entry) return c.json({ error: "Not found" }, 404);
-  if (!(await svc.deleteEntry(userId, entry.id))) return c.json({ error: "Not found" }, 404);
-  return c.json({ success: true });
+  try {
+    const rawExpected = c.req.query("expected_revision");
+    const expectedRevision = rawExpected === undefined ? undefined : Number(rawExpected);
+    if (!(await svc.deleteEntry(userId, book.id, entry.id, expectedRevision))) {
+      return c.json({ error: "Not found" }, 404);
+    }
+    return c.json({ success: true });
+  } catch (error) {
+    if (error instanceof svc.WorldBookEntryConflictError) {
+      return c.json(error.payload, 409);
+    }
+    if (error instanceof svc.WorldBookEntryRevisionInvalidError) {
+      return c.json({ error: error.code, code: error.code, field: error.field }, 428);
+    }
+    throw error;
+  }
 });
+
 
 
 export { app as worldBooksRoutes };

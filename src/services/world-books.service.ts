@@ -2295,11 +2295,16 @@ export function createEntry(
   });
 }
 
-export function updateEntry(userId: string, id: string, input: UpdateWorldBookEntryInput): WorldBookEntry | null {
+export function updateEntry(
+  userId: string,
+  worldBookId: string,
+  id: string,
+  input: UpdateWorldBookEntryInput,
+): WorldBookEntry | null {
   return withUserDataMutationSync(userId, () => {
   const expectedRevision = readExpectedRevision(input);
   const existing = getEntry(userId, id);
-  if (!existing) return null;
+  if (!existing || existing.world_book_id !== worldBookId) return null;
   input = omitClientEntryIdentity(input);
 
   const fields: string[] = [];
@@ -2364,12 +2369,11 @@ export function updateEntry(userId: string, id: string, input: UpdateWorldBookEn
   values.push(now);
 
   const where = ["id = ?", "world_book_id = ?"];
-  values.push(id, existing.world_book_id);
+  values.push(id, worldBookId);
   if (expectedRevision !== undefined) {
     where.push("revision = ?");
     values.push(expectedRevision);
   }
-
 
   const changes = getDb()
     .query(`UPDATE world_book_entries SET ${fields.join(", ")} WHERE ${where.join(" AND ")}`)
@@ -2377,15 +2381,16 @@ export function updateEntry(userId: string, id: string, input: UpdateWorldBookEn
     .changes;
   if (changes === 0) {
     const current = getEntry(userId, id);
-    if (!current) return null;
+    if (!current || current.world_book_id !== worldBookId) return null;
     if (expectedRevision !== undefined) {
       throwEntryRevisionConflict(id, expectedRevision, current);
     }
     return null;
   }
 
-  touchWorldBook(existing.world_book_id, now);
-  const updated = getEntry(userId, id)!;
+  touchWorldBook(worldBookId, now);
+  const updated = getEntry(userId, id);
+  if (!updated || updated.world_book_id !== worldBookId) return null;
   if (!updated.vectorized) {
     deleteWorldBookVectorsAndMaybeRequeue(userId, updated, false);
   } else if (shouldResetVectorIndex(input)) {
@@ -2400,6 +2405,7 @@ export function updateEntry(userId: string, id: string, input: UpdateWorldBookEn
 
 export async function deleteEntry(
   userId: string,
+  worldBookId: string,
   id: string,
   expectedRevision?: number,
 ): Promise<boolean> {
@@ -2408,9 +2414,8 @@ export async function deleteEntry(
     expectedRevision,
     expectedRevision !== undefined,
   );
-  // Verify the entry belongs to a world book owned by this user
   const entry = getEntry(userId, id);
-  if (!entry) return false;
+  if (!entry || entry.world_book_id !== worldBookId) return false;
   assertEntryExpectedRevision(entry, parsedExpectedRevision);
 
   const deleted = await embeddingsSvc.deleteWorldBookEntryEmbeddingsBeforeSourceDelete(
@@ -2420,26 +2425,25 @@ export async function deleteEntry(
       const result = parsedExpectedRevision !== undefined
         ? getDb()
           .query("DELETE FROM world_book_entries WHERE id = ? AND world_book_id = ? AND revision = ?")
-          .run(id, entry.world_book_id, parsedExpectedRevision)
+          .run(id, worldBookId, parsedExpectedRevision)
         : getDb()
           .query("DELETE FROM world_book_entries WHERE id = ? AND world_book_id = ?")
-          .run(id, entry.world_book_id);
+          .run(id, worldBookId);
       const removed = result.changes > 0;
       if (!removed) {
+        const current = getEntry(userId, id);
+        if (!current || current.world_book_id !== worldBookId) return false;
         if (parsedExpectedRevision !== undefined) {
-          const current = getEntry(userId, id);
-          if (current) {
-            throwEntryRevisionConflict(id, parsedExpectedRevision, current);
-          }
+          throwEntryRevisionConflict(id, parsedExpectedRevision, current);
         }
         return false;
       }
-      touchWorldBook(entry.world_book_id);
+      touchWorldBook(worldBookId);
       return true;
     },
   );
   if (deleted) {
-    eventBus.emit(EventType.WORLD_BOOK_ENTRY_DELETED, { id, worldBookId: entry.world_book_id }, userId);
+    eventBus.emit(EventType.WORLD_BOOK_ENTRY_DELETED, { id, worldBookId }, userId);
   }
   return deleted;
   });

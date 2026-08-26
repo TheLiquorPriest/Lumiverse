@@ -1405,6 +1405,7 @@
     "chatAttachmentSaveFailed": "Impossible d'enregistrer les livres du monde de ce chat.",
     "entrySaveFailed": "Impossible d'enregistrer cette entrée du livre du monde.",
     "entryDeleteFailed": "Impossible de supprimer cette entrée du livre du monde.",
+    "entryMutationFailed": "Impossible de modifier cette entrée du livre du monde.",
     "activationSettings": "Paramètres d'activation",
     "selectBook": "Sélectionner un livre…",
     "selectWorldBookAria": "Sélectionner le monde book",

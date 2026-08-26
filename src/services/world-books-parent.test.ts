@@ -16,8 +16,10 @@ mock.module("./vectorization-queue.service", () => ({
 }));
 
 const {
+  bulkOperateEntries,
   createEntry,
   createWorldBook,
+  deleteEntry,
   getEntry,
   listEntries,
   updateEntry,
@@ -45,11 +47,11 @@ describe("world-book entry parent identity", () => {
 
     expect(entry.world_book_id).toBe(bookA.id);
 
-    const updated = updateEntry(OWNER_ID, entry.id, {
+    const updated = updateEntry(OWNER_ID, bookA.id, entry.id, {
       content: "next",
       world_book_id: bookB.id,
       expected_revision: entry.revision,
-    } as Parameters<typeof updateEntry>[2] & { world_book_id: string });
+    } as Parameters<typeof updateEntry>[3] & { world_book_id: string });
 
     expect(updated?.world_book_id).toBe(bookA.id);
     expect(updated?.content).toBe("next");
@@ -57,4 +59,25 @@ describe("world-book entry parent identity", () => {
     expect(listEntries(OWNER_ID, bookA.id).map((row) => row.id)).toEqual([entry.id]);
     expect(listEntries(OWNER_ID, bookB.id)).toEqual([]);
   });
+
+  test("stale expected parent does not mutate an entry after bulk move", async () => {
+    const bookA = createWorldBook(OWNER_ID, { name: "A" });
+    const bookB = createWorldBook(OWNER_ID, { name: "B" });
+    const entry = createEntry(OWNER_ID, bookA.id, { comment: "move-me", content: "body" })!;
+
+    await bulkOperateEntries(OWNER_ID, bookA.id, {
+      action: "move",
+      entry_ids: [entry.id],
+      target_book_id: bookB.id,
+    });
+
+    expect(updateEntry(OWNER_ID, bookA.id, entry.id, { content: "stale-write" })).toBeNull();
+    expect(await deleteEntry(OWNER_ID, bookA.id, entry.id)).toBe(false);
+    const live = getEntry(OWNER_ID, entry.id);
+    expect(live?.world_book_id).toBe(bookB.id);
+    expect(live?.content).toBe("body");
+    expect(listEntries(OWNER_ID, bookA.id)).toEqual([]);
+    expect(listEntries(OWNER_ID, bookB.id).map((row) => row.id)).toEqual([entry.id]);
+  });
+
 });

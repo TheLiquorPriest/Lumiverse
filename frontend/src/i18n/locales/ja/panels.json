@@ -1405,6 +1405,7 @@
     "chatAttachmentSaveFailed": "このチャットのワールドブックの添付を保存できませんでした。",
     "entrySaveFailed": "このワールドブックのエントリを保存できませんでした。",
     "entryDeleteFailed": "このワールドブックのエントリを削除できませんでした。",
+    "entryMutationFailed": "このワールドブックのエントリを更新できませんでした。",
     "activationSettings": "アクティベーション設定",
     "selectBook": "本を選択してください…",
     "selectWorldBookAria": "ワールド ブックを選択",

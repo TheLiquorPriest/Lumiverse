@@ -1568,6 +1568,7 @@
     "chatAttachmentSaveFailed": "Couldn't save this chat's world book attachments.",
     "entrySaveFailed": "Couldn't save this world book entry.",
     "entryDeleteFailed": "Couldn't delete this world book entry.",
+    "entryMutationFailed": "Couldn't update this world book entry.",
     "activationSettings": "Activation Settings",
     "selectBook": "Select a book…",
     "selectWorldBookAria": "Select world book",
