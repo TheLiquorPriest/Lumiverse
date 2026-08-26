@@ -529,8 +529,8 @@ export default function LorebookEditorWorkspace({
     await saveEntry(entryId, conflict.draft)
   }, [commitEntries, conflicts, saveEntry, selectedBookId])
 
-  const runBulk = useCallback(async (input: BulkMutationInput) => {
-    if (!selectedBookId) return
+  const runBulk = useCallback(async (input: BulkMutationInput): Promise<boolean> => {
+    if (!selectedBookId) return false
     const ids = input.entry_ids
     const drafts = Object.fromEntries(ids.map((id) => [id, pendingDrafts.current[id] ?? {}]))
     try {
@@ -540,16 +540,19 @@ export default function LorebookEditorWorkspace({
       } as WorldBookEntryBulkActionInput)
       await loadEntries(selectedBookId)
       setSavedAt(Date.now())
+      return true
     } catch (error) {
       const payload = conflictPayload(error)
       if (payload) {
         applyConflict(payload, drafts)
-        return
+        return false
       }
       toast.error(input.action === 'delete' ? t('entryDeleteFailed') : t('entryMutationFailed'))
       await loadEntries(selectedBookId)
+      return false
     }
   }, [applyConflict, loadEntries, selectedBookId, t])
+
 
 
   const bulkForm = useMemo<BulkFieldForm>(() => ({
@@ -597,9 +600,10 @@ export default function LorebookEditorWorkspace({
 
   const deleteSelected = useCallback(async () => {
     if (selectedIds.length === 0) return
-    await runBulk({ action: 'delete', entry_ids: selectedIds })
-    setSelectedIds([])
+    const deleted = await runBulk({ action: 'delete', entry_ids: selectedIds })
+    if (deleted) setSelectedIds([])
   }, [runBulk, selectedIds])
+
 
   const toggleEntrySelection = (entryId: string) => {
     setSelectedIds((current) => current.includes(entryId)
