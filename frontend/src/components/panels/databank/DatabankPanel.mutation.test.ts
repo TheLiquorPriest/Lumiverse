@@ -54,10 +54,22 @@ describe('DatabankPanel mutation error wiring', () => {
     expect(keep).toContain('pendingContextResetRef.current = false')
   })
 
-  test('loadDocs with no bank after committed reset clears a stale banner', () => {
+  test('remote bank delete publishes current removal and follow-on loadDocs does not mint or clear', () => {
+    const remote = sliceBetween(
+      'DATABANK_DELETED removes the bank and nulls selection.',
+      'const loadDocs = useCallback(',
+    )
+    expect(remote).toContain("reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')")
+    expect(remote).toContain('committedContextResetRef.current')
+    expect(remote).toContain('lastSelectedBankIdRef.current')
+
     const body = sliceBetween('const loadDocs = useCallback(', '\n  useEffect(() => {\n    void loadDocs()')
-    expect(body).toContain('if (!selectedDatabankId)')
-    expect(body).toContain('if (!editingDocIdRef.current) clearMutationErrorIfCurrent(started)')
+    expect(body).toContain('if (mutationGateRef.current.holdingRemoteRemoval()) return')
+    expect(body).toContain("reportMutationError(started, t('databankPanel.remoteDocumentRemoved'), 'remote-removal')")
+    const noBank = body.slice(body.indexOf('if (!selectedDatabankId)'), body.indexOf('if (mutationGateRef.current.holdingRemoteRemoval()) {'))
+    expect(noBank).toContain('if (mutationGateRef.current.holdingRemoteRemoval()) return')
+    expect(noBank).not.toMatch(/mintMutation\(\)[\s\S]*holdingRemoteRemoval/)
   })
+
 
 })

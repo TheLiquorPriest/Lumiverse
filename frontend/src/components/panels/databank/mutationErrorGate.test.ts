@@ -57,4 +57,23 @@ describe('Databank mutation error gate', () => {
     expect(gate.publish(prior, 'prior-scope failure')).toBeUndefined()
   })
 
+  test('remote-removal stays held until a later current clear', () => {
+    const gate = createMutationErrorGate()
+    const removed = gate.mint()
+    expect(gate.publish(removed, 'This databank was removed.', 'remote-removal')).toBe('This databank was removed.')
+    expect(gate.holdingRemoteRemoval()).toBe(true)
+    expect(gate.publish(removed, null)).toBeNull()
+    expect(gate.holdingRemoteRemoval()).toBe(false)
+
+    const again = gate.mint()
+    expect(gate.publish(again, 'This document was removed.', 'remote-removal')).toBe('This document was removed.')
+    expect(gate.holdingRemoteRemoval()).toBe(true)
+    const later = gate.mint()
+    expect(gate.publish(again, null)).toBeUndefined()
+    expect(gate.holdingRemoteRemoval()).toBe(true)
+    expect(gate.publish(later, null)).toBeNull()
+    expect(gate.holdingRemoteRemoval()).toBe(false)
+  })
+
+
 })

@@ -125,18 +125,25 @@ export default function DatabankPanel() {
   const editingDirtyRef = useRef(false)
   const selectedDatabankIdRef = useRef<string | null>(null)
   const pendingContextResetRef = useRef(false)
+  const committedContextResetRef = useRef(false)
+  const lastSelectedBankIdRef = useRef<string | null>(null)
   const docsRequestRef = useRef(0)
   const mutationGateRef = useRef(createMutationErrorGate())
 
   const mintMutation = useCallback(() => mutationGateRef.current.mint(), [])
-  const reportMutationError = useCallback((token: number, message: string) => {
-    const next = mutationGateRef.current.publish(token, message)
+  const reportMutationError = useCallback((
+    token: number,
+    message: string,
+    source: 'mutation' | 'remote-removal' = 'mutation',
+  ) => {
+    const next = mutationGateRef.current.publish(token, message, source)
     if (next !== undefined) setError(next)
   }, [])
   const clearMutationErrorIfCurrent = useCallback((token: number) => {
     const next = mutationGateRef.current.publish(token, null)
     if (next !== undefined) setError(next)
   }, [])
+
 
 
 
@@ -169,6 +176,7 @@ export default function DatabankPanel() {
   const flushPendingContextReset = useCallback(() => {
     if (!pendingContextResetRef.current) return
     pendingContextResetRef.current = false
+    committedContextResetRef.current = true
     docsRequestRef.current += 1
     contentRequestRef.current += 1
     setSelectedDatabankId(null)
@@ -180,6 +188,7 @@ export default function DatabankPanel() {
     pendingContextResetRef.current = false
     setDiscardConfirmOpen(false)
   }, [])
+
 
 
 
@@ -349,6 +358,7 @@ export default function DatabankPanel() {
       return
     }
     pendingContextResetRef.current = false
+    committedContextResetRef.current = true
     docsRequestRef.current += 1
     contentRequestRef.current += 1
     setSelectedDatabankId(null)
@@ -357,31 +367,42 @@ export default function DatabankPanel() {
     clearMutationErrorIfCurrent(mintMutation())
   }, [databankScopeFilter, activeCharacterId, activeChatId, setSelectedDatabankId, setDatabankDocuments, closeDocEditor, mintMutation, clearMutationErrorIfCurrent])
 
-
   // DATABANK_DELETED removes the bank and nulls selection. That is not
   // user-clean navigation, which closes the editor in the same turn.
   useEffect(() => {
-    if (!editingDocId || selectedDatabankId) return
+    const previous = lastSelectedBankIdRef.current
+    lastSelectedBankIdRef.current = selectedDatabankId
+    if (selectedDatabankId || !previous) return
+    if (committedContextResetRef.current) {
+      committedContextResetRef.current = false
+      return
+    }
     docsRequestRef.current += 1
     closeDocEditor()
-    reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'))
-  }, [editingDocId, selectedDatabankId, closeDocEditor, mintMutation, reportMutationError, t])
-
-
-
-
-
+    reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'), 'remote-removal')
+  }, [selectedDatabankId, closeDocEditor, mintMutation, reportMutationError, t])
 
   // ── Load documents when bank selection changes ──
   const loadDocs = useCallback(async () => {
-    const started = mintMutation()
-
-    const requestId = ++docsRequestRef.current
     if (!selectedDatabankId) {
       setDatabankDocuments([])
-      if (!editingDocIdRef.current) clearMutationErrorIfCurrent(started)
+      if (mutationGateRef.current.holdingRemoteRemoval()) return
+      clearMutationErrorIfCurrent(mintMutation())
       return
     }
+    if (mutationGateRef.current.holdingRemoteRemoval()) {
+      const requestId = ++docsRequestRef.current
+      try {
+        const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
+        if (requestId !== docsRequestRef.current) return
+        setDatabankDocuments(result.data)
+      } catch {
+        if (requestId === docsRequestRef.current && !editingDocIdRef.current) setDatabankDocuments([])
+      }
+      return
+    }
+    const started = mintMutation()
+    const requestId = ++docsRequestRef.current
     try {
       const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
       if (requestId !== docsRequestRef.current) return
@@ -390,7 +411,7 @@ export default function DatabankPanel() {
       const openId = editingDocIdRef.current
       if (listComplete && openId && !result.data.some((doc) => doc.id === openId)) {
         closeDocEditor()
-        reportMutationError(started, t('databankPanel.remoteDocumentRemoved'))
+        reportMutationError(started, t('databankPanel.remoteDocumentRemoved'), 'remote-removal')
         return
       }
       clearMutationErrorIfCurrent(started)
@@ -398,6 +419,7 @@ export default function DatabankPanel() {
       if (requestId === docsRequestRef.current && !editingDocIdRef.current) setDatabankDocuments([])
     }
   }, [selectedDatabankId, setDatabankDocuments, closeDocEditor, mintMutation, clearMutationErrorIfCurrent, reportMutationError, t])
+
 
 
 
@@ -427,11 +449,12 @@ export default function DatabankPanel() {
     const hasProcessing = databankDocuments.some((d) => d.status === 'pending' || d.status === 'processing')
     if (hasProcessing && selectedDatabankId) {
       pollRef.current = setInterval(async () => {
-        const started = mintMutation()
+        const holdRemote = mutationGateRef.current.holdingRemoteRemoval()
+        const started = holdRemote ? null : mintMutation()
         try {
           const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
           setDatabankDocuments(result.data)
-          clearMutationErrorIfCurrent(started)
+          if (started !== null) clearMutationErrorIfCurrent(started)
           const stillProcessing = result.data.some((d) => d.status === 'pending' || d.status === 'processing')
           if (!stillProcessing && pollRef.current) {
             clearInterval(pollRef.current)
