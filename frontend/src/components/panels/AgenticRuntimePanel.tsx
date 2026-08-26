@@ -1224,6 +1224,17 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   const isHydratedRef = useRef(false)
   const pendingExternalDraftRef = useRef<AgenticRuntimeSaveDraft | null>(null)
   const pendingExternalPromptOrderRef = useRef<PromptBlock[] | null>(null)
+  const conflictReloadGenerationRef = useRef(0)
+  const currentPresetIdentityRef = useRef<EditorIdentity>({
+    presetId: preset.id,
+    presetRevision: preset.cacheRevision ?? 0,
+    configRevision: preset.agentConfigRevision ?? 0,
+  })
+  currentPresetIdentityRef.current = {
+    presetId: preset.id,
+    presetRevision: preset.cacheRevision ?? 0,
+    configRevision: preset.agentConfigRevision ?? 0,
+  }
   const [isHydrated, setIsHydrated] = useState(false)
   isHydratedRef.current = isHydrated
   const [editorLoadAttempt, setEditorLoadAttempt] = useState(0)
@@ -1349,6 +1360,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   }, [dirty, onDirtyChange])
 
   useEffect(() => () => onDirtyChange(false), [onDirtyChange])
+  useEffect(() => {
+    conflictReloadGenerationRef.current += 1
+    setConflictRecoveryState('idle')
+  }, [preset.id])
+
   useEffect(() => {
     let active = true
     const currentPresetRevision = preset.cacheRevision ?? 0
@@ -1524,14 +1540,40 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
 
   const reloadLatestForReview = async () => {
     if (saveInFlightRef.current || conflictRecoveryState === 'loading') return
+    const generation = conflictReloadGenerationRef.current + 1
+    conflictReloadGenerationRef.current = generation
+    const targetPresetId = preset.id
     setConflictRecoveryState('loading')
     try {
       await onReload()
+      if (generation !== conflictReloadGenerationRef.current) return
+      const current = currentPresetIdentityRef.current
+      if (current.presetId !== targetPresetId) {
+        setConflictRecoveryState('idle')
+        return
+      }
       setLoomRevisionRestagePending(false)
-      lastReturnedIdentityRef.current = null
       setEditorLoadError(false)
-      setEditorLoadAttempt((current) => current + 1)
+      const converged = editorIdentityConverged(
+        hydratedIdentityRef.current,
+        current.presetId,
+        current.presetRevision,
+        current.configRevision,
+        lastReturnedIdentityRef.current,
+      )
+      if (converged) {
+        setSaveState('idle')
+        setConflictRecoveryState('idle')
+        return
+      }
+      setEditorLoadAttempt((attempt) => attempt + 1)
+      setConflictRecoveryState('idle')
     } catch {
+      if (generation !== conflictReloadGenerationRef.current) return
+      if (currentPresetIdentityRef.current.presetId !== targetPresetId) {
+        setConflictRecoveryState('idle')
+        return
+      }
       setConflictRecoveryState('error')
     }
   }
@@ -2408,6 +2450,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     const pendingExternalDraft = pendingExternalDraftRef.current
     const pendingExternalPromptOrder = pendingExternalPromptOrderRef.current
     const externalSnapshotIncomplete = pendingExternalPromptOrder !== null && pendingExternalDraft === null
+    const restoringLocalCommitted = pendingExternalDraft === null && pendingExternalPromptOrder === null
     const restoredDraft = structuredClone(pendingExternalDraft ?? committedDraftRef.current)
     const restoredPromptOrder = structuredClone(pendingExternalPromptOrder ?? committedPromptOrderRef.current)
     const acceptsCurrentFallback = hydratedIdentityRef.current === null
@@ -2415,16 +2458,20 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       && pendingExternalPromptOrder !== null
       && !editorLoadError
     const restoredIdentityMatchesCurrent = acceptsCurrentFallback
-      || hydratedIdentityRef.current?.presetId === preset.id
-        && hydratedIdentityRef.current.presetRevision === (preset.cacheRevision ?? 0)
-        && hydratedIdentityRef.current.configRevision === (preset.agentConfigRevision ?? 0)
+      || editorIdentityConverged(
+        hydratedIdentityRef.current,
+        preset.id,
+        preset.cacheRevision ?? 0,
+        preset.agentConfigRevision ?? 0,
+        lastReturnedIdentityRef.current,
+      )
     pendingExternalDraftRef.current = null
     pendingExternalPromptOrderRef.current = null
     committedDraftRef.current = structuredClone(restoredDraft)
     committedPromptOrderRef.current = structuredClone(restoredPromptOrder)
     setRepairedSlotIds(new Set())
     setLoomRevisionRestagePending(false)
-    lastReturnedIdentityRef.current = null
+    if (!restoringLocalCommitted) lastReturnedIdentityRef.current = null
     setDraft(restoredDraft)
     setPromptOrder(restoredPromptOrder)
     setMaxInvocationsInput(String(restoredDraft.config.maxInvocations))
@@ -2439,6 +2486,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       setIsHydrated(true)
     }
     setConflictRecoveryState('idle')
+    if (restoringLocalCommitted) {
+      setSaveState('idle')
+      return
+    }
     setSaveState(externalSnapshotIncomplete || !restoredIdentityMatchesCurrent ? 'conflict' : 'idle')
   }
 

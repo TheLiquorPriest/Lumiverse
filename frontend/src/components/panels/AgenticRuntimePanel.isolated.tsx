@@ -1038,18 +1038,8 @@ describe('Agentic Runtime shared editor', () => {
     await settle()
 
     expect(saves).toHaveLength(1)
-    expect(container.textContent).toContain('load.loading')
-    expect(container.textContent).toContain('save.reloadLatest')
-    const lockedRows = [...enterFieldset()!.querySelectorAll<HTMLElement>('.predicateChild')]
-    expect(lockedRows).toHaveLength(3)
-    const lockedRemove = lockedRows[2]!.querySelector<HTMLButtonElement>('[aria-label="predicate.remove"]')
-    expect(lockedRemove).not.toBeNull()
-    expect(lockedRemove!.disabled).toBe(true)
-    expect(button(container, 'save.action').disabled).toBe(true)
-
-    flushSync(() => button(container, 'save.reloadLatest').click())
-    await settle()
-    expect(container.textContent).not.toContain('save.reloadLatest')
+    expect(container.textContent).toContain('save.saved')
+    expect(container.textContent).not.toContain('load.loading')
     const recoveredRows = [...enterFieldset()!.querySelectorAll<HTMLElement>('.predicateChild')]
     expect(recoveredRows).toHaveLength(3)
     const recoveredRemove = recoveredRows[2]!.querySelector<HTMLButtonElement>('[aria-label="predicate.remove"]')
@@ -1062,6 +1052,7 @@ describe('Agentic Runtime shared editor', () => {
     await settle()
     expect(saves).toHaveLength(2)
     expect(saves[1]?.config.runtimePolicy?.phases[0]?.enter).toEqual(originalEnter)
+
   })
 
 
@@ -1771,5 +1762,144 @@ describe('Agentic Runtime shared editor', () => {
       ],
     })
   })
+
+  test('resets local post-save edits without synthesizing an external conflict', async () => {
+    const value = preset()
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => saveResult(value, draft, promptOrder),
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Saved analyst')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(container.querySelector('input[value="Saved analyst"]')).not.toBeNull()
+
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Saved analyst"]')!, 'Unsaved analyst')
+    expect(container.textContent).toContain('save.unsaved')
+    expect(button(container, 'save.reset').disabled).toBe(false)
+    flushSync(() => button(container, 'save.reset').click())
+
+    expect(container.textContent).not.toContain('save.conflict')
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(container.textContent).toContain('save.saved')
+    expect(container.querySelector('input[value="Saved analyst"]')).not.toBeNull()
+    expect(container.querySelector('input[value="Unsaved analyst"]')).toBeNull()
+    expect(button(container, 'save.action').disabled).toBe(true)
+  })
+
+  test('keeps genuine external revision mismatch in conflict after reset', async () => {
+    const value = preset()
+    const { container, root } = renderPanel({ value })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
+
+    const refreshed = { ...value, cacheRevision: 9, agentConfigRevision: 5 }
+    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+      preset: refreshed,
+      onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
+      onReload: async () => undefined,
+      onDirtyChange: () => {},
+    })))
+    await settle()
+    expect(container.textContent).toContain('save.conflict')
+    expect(button(container, 'save.reviewLatest').disabled).toBe(false)
+    flushSync(() => button(container, 'save.reviewLatest').click())
+    expect(container.textContent).toContain('save.conflict')
+    expect(button(container, 'save.action').disabled).toBe(true)
+
+  })
+
+  test('reload latest settles and clears conflict when identities already converge', async () => {
+    const value = preset()
+    const { container } = renderPanel({
+      value,
+      onSave: async () => {
+        throw new ApiError(409, 'Conflict')
+      },
+      onReload: async () => undefined,
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(container.textContent).toContain('save.conflict')
+
+    flushSync(() => button(container, 'save.reloadLatest').click())
+    await settle()
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(container.textContent).not.toContain('save.conflict')
+    expect(container.textContent).toContain('save.unsaved')
+    expect(container.querySelector('input[value="Unsaved analyst"]')).not.toBeNull()
+  })
+
+  test('failed reload latest leaves an actionable error and stays in conflict', async () => {
+    const value = preset()
+    const { container } = renderPanel({
+      value,
+      onSave: async () => {
+        throw new ApiError(409, 'Conflict')
+      },
+      onReload: async () => {
+        throw new Error('canonical reload failed')
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    flushSync(() => button(container, 'save.reloadLatest').click())
+    await settle()
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(container.textContent).toContain('save.reloadError')
+    expect(container.textContent).toContain('save.conflict')
+    expect(container.querySelector('input[value="Unsaved analyst"]')).not.toBeNull()
+  })
+
+  test('stale reload completion cannot overwrite a newer preset editor', async () => {
+    const value = preset()
+    let releaseReload: (() => void) | undefined
+    const { container, root } = renderPanel({
+      value,
+      onSave: async () => {
+        throw new ApiError(409, 'Conflict')
+      },
+      onReload: () => new Promise<void>((resolve) => {
+        releaseReload = resolve
+      }),
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    flushSync(() => button(container, 'save.reloadLatest').click())
+    expect(container.textContent).toContain('save.reloadingLatest')
+
+    const next = { ...preset(), id: 'preset-2', name: 'Other preset' }
+    editorPresetRevision = 8
+    editorConfigRevision = 4
+    editorConfig = structuredClone(next.agentConfig)
+    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+      preset: next,
+      onSave: async (draft, promptOrder) => saveResult(next, draft, promptOrder),
+      onReload: async () => undefined,
+      onDirtyChange: () => {},
+    })))
+    await settle()
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    releaseReload?.()
+    await settle()
+
+    expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(container.textContent).not.toContain('save.reloadError')
+    expect(container.querySelector('input[value="Unsaved analyst"]')).not.toBeNull()
+  })
+
 
 })
