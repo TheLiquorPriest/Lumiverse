@@ -5866,7 +5866,7 @@ describe("Agentic WORK phase", () => {
           taskId: "fn_evidence",
         })]);
       }
-      return response("", [complete("after-settle")]);
+      return response("", [complete(`after-settle-${dispatchCount}`)]);
     }, {
       plan: plan({
         customPhasePlan: compileAgentRuntimePhases([
@@ -5932,7 +5932,11 @@ describe("Agentic WORK phase", () => {
       status: "rejected",
       code: "completion_blocked",
     });
-    expect(result.observations.find((item) => item.callId === "after-settle")?.status).toBe("accepted");
+    const afterSettle = result.observations.filter((item) => item.callId.startsWith("after-settle-"));
+    expect(afterSettle).toEqual([
+      expect.objectContaining({ callId: "after-settle-3", toolName: "complete_turn", status: "success" }),
+      expect.objectContaining({ callId: "after-settle-4", toolName: "complete_turn", status: "accepted" }),
+    ]);
   });
 
   test("preserves listRequiredOpenTasks string ids when getCompletionGates is absent", async () => {
