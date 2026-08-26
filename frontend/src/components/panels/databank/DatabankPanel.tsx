@@ -16,6 +16,7 @@ import {
   getContextDatabankBindings,
   isAutomaticallyActiveForContext,
 } from './databankActivation'
+import { createMutationErrorGate } from './mutationErrorGate'
 import styles from './DatabankPanel.module.css'
 
 type Scope = 'global' | 'character' | 'chat'
@@ -125,18 +126,18 @@ export default function DatabankPanel() {
   const selectedDatabankIdRef = useRef<string | null>(null)
   const pendingContextResetRef = useRef(false)
   const docsRequestRef = useRef(0)
-  const mutationEpochRef = useRef(0)
+  const mutationGateRef = useRef(createMutationErrorGate())
 
-  const beginMutation = useCallback(() => mutationEpochRef.current, [])
-  const reportMutationError = useCallback((message: string) => {
-    mutationEpochRef.current += 1
-    setError(message)
+  const mintMutation = useCallback(() => mutationGateRef.current.mint(), [])
+  const reportMutationError = useCallback((token: number, message: string) => {
+    const next = mutationGateRef.current.publish(token, message)
+    if (next !== undefined) setError(next)
   }, [])
-  const clearMutationErrorIfCurrent = useCallback((started: number) => {
-    if (started !== mutationEpochRef.current) return
-    mutationEpochRef.current += 1
-    setError(null)
+  const clearMutationErrorIfCurrent = useCallback((token: number) => {
+    const next = mutationGateRef.current.publish(token, null)
+    if (next !== undefined) setError(next)
   }, [])
+
 
 
   // ── Document editor ──
@@ -181,7 +182,7 @@ export default function DatabankPanel() {
 
 
   const loadEditorContent = useCallback(async (docId: string, bankId: string) => {
-    const started = beginMutation()
+    const started = mintMutation()
     const requestId = ++contentRequestRef.current
     try {
       const result = await databankApi.getDocumentContent(bankId, docId)
@@ -196,7 +197,7 @@ export default function DatabankPanel() {
       const err = e as { body?: { error?: string }; message?: string }
       setEditorError(err.body?.error || err.message || t('databankPanel.loadDocFailed'))
     }
-  }, [beginMutation, clearMutationErrorIfCurrent, t])
+  }, [mintMutation, clearMutationErrorIfCurrent, t])
 
 
 
@@ -358,8 +359,9 @@ export default function DatabankPanel() {
     if (!editingDocId || selectedDatabankId) return
     docsRequestRef.current += 1
     closeDocEditor()
-    reportMutationError(t('databankPanel.remoteDatabankRemoved'))
-  }, [editingDocId, selectedDatabankId, closeDocEditor, reportMutationError, t])
+    reportMutationError(mintMutation(), t('databankPanel.remoteDatabankRemoved'))
+  }, [editingDocId, selectedDatabankId, closeDocEditor, mintMutation, reportMutationError, t])
+
 
 
 
@@ -367,7 +369,7 @@ export default function DatabankPanel() {
 
   // ── Load documents when bank selection changes ──
   const loadDocs = useCallback(async () => {
-    const started = beginMutation()
+    const started = mintMutation()
     const requestId = ++docsRequestRef.current
     if (!selectedDatabankId) {
       setDatabankDocuments([])
@@ -381,14 +383,14 @@ export default function DatabankPanel() {
       const openId = editingDocIdRef.current
       if (listComplete && openId && !result.data.some((doc) => doc.id === openId)) {
         closeDocEditor()
-        reportMutationError(t('databankPanel.remoteDocumentRemoved'))
+        reportMutationError(started, t('databankPanel.remoteDocumentRemoved'))
         return
       }
       clearMutationErrorIfCurrent(started)
     } catch {
       if (requestId === docsRequestRef.current && !editingDocIdRef.current) setDatabankDocuments([])
     }
-  }, [selectedDatabankId, setDatabankDocuments, closeDocEditor, beginMutation, clearMutationErrorIfCurrent, reportMutationError, t])
+  }, [selectedDatabankId, setDatabankDocuments, closeDocEditor, mintMutation, clearMutationErrorIfCurrent, reportMutationError, t])
 
 
 
@@ -418,7 +420,7 @@ export default function DatabankPanel() {
     const hasProcessing = databankDocuments.some((d) => d.status === 'pending' || d.status === 'processing')
     if (hasProcessing && selectedDatabankId) {
       pollRef.current = setInterval(async () => {
-        const started = beginMutation()
+        const started = mintMutation()
         try {
           const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
           setDatabankDocuments(result.data)
@@ -434,10 +436,11 @@ export default function DatabankPanel() {
     return () => {
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
     }
-  }, [databankDocuments, selectedDatabankId, setDatabankDocuments, beginMutation, clearMutationErrorIfCurrent])
+  }, [databankDocuments, selectedDatabankId, setDatabankDocuments, mintMutation, clearMutationErrorIfCurrent])
 
   // ── Create bank ──
   const handleCreate = useCallback(async () => {
+    const started = mintMutation()
     try {
       const scopeId = databankScopeFilter === 'character' ? activeCharacterId
         : databankScopeFilter === 'chat' ? activeChatId
@@ -449,24 +452,26 @@ export default function DatabankPanel() {
       })
       addDatabank(bank)
       setSelectedDatabankId(bank.id)
+      clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      setError(e.message)
+      reportMutationError(started, e.message)
     }
-  }, [databankScopeFilter, activeCharacterId, activeChatId, addDatabank, setSelectedDatabankId, t])
+  }, [databankScopeFilter, activeCharacterId, activeChatId, addDatabank, setSelectedDatabankId, t, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
+
 
   // ── Delete bank ──
   const handleDeleteBank = useCallback(async () => {
     if (!selectedDatabankId) return
-    const started = beginMutation()
+    const started = mintMutation()
     try {
       await databankApi.delete(selectedDatabankId)
       removeDatabank(selectedDatabankId)
       setSelectedDatabankId(null)
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e.message)
+      reportMutationError(started, e.message)
     }
-  }, [selectedDatabankId, removeDatabank, setSelectedDatabankId, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, removeDatabank, setSelectedDatabankId, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
   // ── Update bank details ──
   const handleBankUpdate = useCallback(async (field: 'name' | 'description', value: string) => {
@@ -480,7 +485,7 @@ export default function DatabankPanel() {
 
   const handleBankEnabledChange = useCallback(async (enabled: boolean) => {
     if (!selectedDatabankId) return
-    const started = beginMutation()
+    const started = mintMutation()
     setBankEnabledSaving(true)
     try {
       const updated = await databankApi.update(selectedDatabankId, { enabled })
@@ -488,11 +493,11 @@ export default function DatabankPanel() {
       setAllBanks((current) => current.map((bank) => bank.id === updated.id ? updated : bank))
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e?.body?.error || e?.message || t('databankPanel.enabledUpdateFailed'))
+      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.enabledUpdateFailed'))
     } finally {
       setBankEnabledSaving(false)
     }
-  }, [selectedDatabankId, updateBankStore, t, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, updateBankStore, t, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
   const handleDatabankSettingsUpdate = useCallback((patch: Partial<DatabankSettings>) => {
     databankSettingsDirtyRef.current = true
@@ -502,7 +507,7 @@ export default function DatabankPanel() {
   // ── Upload files ──
   const handleFiles = useCallback(async (files: FileList | File[]) => {
     if (!selectedDatabankId) return
-    const started = beginMutation()
+    const started = mintMutation()
     setLoading(true)
     try {
       for (const file of Array.from(files)) {
@@ -511,43 +516,43 @@ export default function DatabankPanel() {
       }
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e.message)
+      reportMutationError(started, e.message)
     } finally {
       setLoading(false)
     }
-  }, [selectedDatabankId, addDatabankDocument, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, addDatabankDocument, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
   // ── Delete document ──
   const handleDeleteDoc = useCallback(async (docId: string) => {
     if (!selectedDatabankId) return
-    const started = beginMutation()
+    const started = mintMutation()
     try {
       await databankApi.deleteDocument(selectedDatabankId, docId)
       removeDatabankDocument(docId)
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e?.body?.error || e?.message || t('databankPanel.deleteDocFailed'))
+      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.deleteDocFailed'))
     }
-  }, [selectedDatabankId, removeDatabankDocument, beginMutation, clearMutationErrorIfCurrent, reportMutationError, t])
+  }, [selectedDatabankId, removeDatabankDocument, mintMutation, clearMutationErrorIfCurrent, reportMutationError, t])
 
   const handleReprocessDoc = useCallback(async (docId: string) => {
     if (!selectedDatabankId) return
-    const started = beginMutation()
+    const started = mintMutation()
     try {
       updateDatabankDocument(docId, { status: 'pending', errorMessage: null })
       await databankApi.reprocessDocument(selectedDatabankId, docId)
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e?.body?.error || e?.message || t('databankPanel.reprocessDocFailed'))
+      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.reprocessDocFailed'))
       await loadDocs()
     }
-  }, [selectedDatabankId, updateDatabankDocument, loadDocs, t, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, updateDatabankDocument, loadDocs, t, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
 
   const handleReprocessAll = useCallback(async () => {
     const docsToReprocess = databankDocuments.filter((doc) => doc.status !== 'pending' && doc.status !== 'processing')
     if (!selectedDatabankId || docsToReprocess.length === 0) return
-    const started = beginMutation()
+    const started = mintMutation()
     setReprocessingAll(true)
     try {
       const docIds = docsToReprocess.map((doc) => doc.id)
@@ -557,12 +562,12 @@ export default function DatabankPanel() {
       }
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e?.body?.error || e?.message || t('databankPanel.reprocessAllFailed'))
+      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.reprocessAllFailed'))
       await loadDocs()
     } finally {
       setReprocessingAll(false)
     }
-  }, [selectedDatabankId, databankDocuments, updateDatabankDocument, loadDocs, t, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, databankDocuments, updateDatabankDocument, loadDocs, t, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
   // ── Fuse ──
   const [fusePickerOpen, setFusePickerOpen] = useState(false)
@@ -578,7 +583,7 @@ export default function DatabankPanel() {
 
   const confirmFuse = useCallback(async () => {
     if (!selectedDatabankId || !pendingFuse) return
-    const started = beginMutation()
+    const started = mintMutation()
     setFuseStatus(null)
     setFusing(true)
     try {
@@ -595,11 +600,11 @@ export default function DatabankPanel() {
       setPendingFuse(null)
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e?.body?.error || e?.message || t('databankPanel.fuseFailed'))
+      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.fuseFailed'))
     } finally {
       setFusing(false)
     }
-  }, [selectedDatabankId, pendingFuse, removeDatabank, updateBankStore, loadDocs, t, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, pendingFuse, removeDatabank, updateBankStore, loadDocs, t, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
   // ── Scrape URL ──
   const [scrapeUrl, setScrapeUrl] = useState('')
@@ -607,7 +612,7 @@ export default function DatabankPanel() {
 
   const handleScrape = useCallback(async () => {
     if (!selectedDatabankId || !scrapeUrl.trim()) return
-    const started = beginMutation()
+    const started = mintMutation()
     setScraping(true)
     try {
       const doc = await databankApi.scrapeUrl(selectedDatabankId, scrapeUrl.trim())
@@ -615,11 +620,11 @@ export default function DatabankPanel() {
       setScrapeUrl('')
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e.body?.error || e.message || t('databankPanel.scrapeFailed'))
+      reportMutationError(started, e.body?.error || e.message || t('databankPanel.scrapeFailed'))
     } finally {
       setScraping(false)
     }
-  }, [selectedDatabankId, scrapeUrl, addDatabankDocument, t, beginMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [selectedDatabankId, scrapeUrl, addDatabankDocument, t, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
 
   const handleOpenDocEditor = useCallback(async (doc: DatabankDocument) => {
     if (!selectedDatabankId) return
@@ -649,7 +654,7 @@ export default function DatabankPanel() {
 
   const handleSaveDocEditor = useCallback(async () => {
     if (!selectedDatabankId || !editingDocId) return
-    const started = beginMutation()
+    const started = mintMutation()
     setEditorError(null)
     setEditorSaving(true)
     try {
@@ -674,21 +679,21 @@ export default function DatabankPanel() {
     } finally {
       setEditorSaving(false)
     }
-  }, [selectedDatabankId, editingDocId, editingContent, updateDatabankDocument, t, closeDocEditor, flushPendingContextReset, beginMutation, clearMutationErrorIfCurrent])
+  }, [selectedDatabankId, editingDocId, editingContent, updateDatabankDocument, t, closeDocEditor, flushPendingContextReset, mintMutation, clearMutationErrorIfCurrent])
 
 
   // ── Rename document ──
   const handleRenameDoc = useCallback(async (docId: string, newName: string) => {
     if (!selectedDatabankId || !newName.trim()) return
-    const started = beginMutation()
+    const started = mintMutation()
     try {
       const updated = await databankApi.renameDocument(selectedDatabankId, docId, newName.trim())
       updateDatabankDocument(docId, { name: updated.name, slug: updated.slug })
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
-      reportMutationError(e?.body?.error || e?.message || t('databankPanel.renameDocFailed'))
+      reportMutationError(started, e?.body?.error || e?.message || t('databankPanel.renameDocFailed'))
     }
-  }, [selectedDatabankId, updateDatabankDocument, beginMutation, clearMutationErrorIfCurrent, reportMutationError, t])
+  }, [selectedDatabankId, updateDatabankDocument, mintMutation, clearMutationErrorIfCurrent, reportMutationError, t])
 
 
 
