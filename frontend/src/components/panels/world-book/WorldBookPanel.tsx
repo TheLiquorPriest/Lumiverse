@@ -510,9 +510,10 @@ export default function WorldBookPanel() {
           const state = useStore.getState()
           if (state.activeChatId !== chatId || state.activeChatMetadata !== optimisticMetadata) return
           state.setActiveChatMetadata(previousMetadata)
+          toast.error(t('worldBookPanel.chatAttachmentSaveFailed'))
         })
     },
-    [activeChatId, setActiveChatMetadata],
+    [activeChatId, setActiveChatMetadata, t],
   )
 
   const handleChatBooksChange = useCallback(

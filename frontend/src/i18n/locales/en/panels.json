@@ -1565,6 +1565,7 @@
     "openChatToAdd": "Open a chat to add chat-scoped world books",
     "removeFromChat": "Remove from this chat",
     "noChatActive": "No world books active for this chat",
+    "chatAttachmentSaveFailed": "Couldn't save this chat's world book attachments.",
     "activationSettings": "Activation Settings",
     "selectBook": "Select a book…",
     "selectWorldBookAria": "Select world book",

@@ -1401,6 +1401,7 @@
     "openChatToAdd": "Apri una chat per aggiungere worldbook limitati alla chat",
     "removeFromChat": "Rimuovi da questa chat",
     "noChatActive": "Nessun worldbook attivo per questa chat",
+    "chatAttachmentSaveFailed": "Impossibile salvare i worldbook di questa chat.",
     "activationSettings": "Impostazioni attivazione",
     "selectBook": "Seleziona un libro...",
     "selectWorldBookAria": "Seleziona worldbook",

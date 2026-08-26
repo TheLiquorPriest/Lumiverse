@@ -1402,6 +1402,7 @@
     "openChatToAdd": "Ouvrir un chat pour ajouter des livres du monde à l'échelle du chat",
     "removeFromChat": "Supprimer de ce chat",
     "noChatActive": "Aucun livre du monde actif pour ce chat",
+    "chatAttachmentSaveFailed": "Impossible d'enregistrer les livres du monde de ce chat.",
     "activationSettings": "Paramètres d'activation",
     "selectBook": "Sélectionner un livre…",
     "selectWorldBookAria": "Sélectionner le monde book",

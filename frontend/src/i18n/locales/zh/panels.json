@@ -1402,6 +1402,7 @@
     "openChatToAdd": "打开聊天以添加聊天范围的世界书",
     "removeFromChat": "从当前聊天移除",
     "noChatActive": "当前聊天没有激活的世界书",
+    "chatAttachmentSaveFailed": "无法保存此聊天的世界书附件。",
     "activationSettings": "激活设置",
     "selectBook": "选择世界书…",
     "selectWorldBookAria": "选择世界书",
