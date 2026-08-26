@@ -498,18 +498,25 @@ export default function DatabankPanel() {
 
   // ── Delete bank ──
   const handleDeleteBank = useCallback(async () => {
-    if (!selectedDatabankId) return
+    const deletedId = selectedDatabankIdRef.current
+    if (!deletedId) return
     const started = mintMutation()
     try {
-      await databankApi.delete(selectedDatabankId)
-      beginLocalDeselect(selectedDatabankId)
-      removeDatabank(selectedDatabankId)
-      setSelectedDatabankId(null)
+      await databankApi.delete(deletedId)
+      const stillSelected = selectedDatabankIdRef.current === deletedId
+      removeDatabank(deletedId)
+      if (stillSelected) {
+        beginLocalDeselect(deletedId)
+        setSelectedDatabankId(null)
+      } else {
+        localDeselectRef.current.clear()
+      }
       clearMutationErrorIfCurrent(started)
     } catch (e: any) {
       reportMutationError(started, e.message)
     }
-  }, [selectedDatabankId, beginLocalDeselect, removeDatabank, setSelectedDatabankId, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
+  }, [beginLocalDeselect, removeDatabank, setSelectedDatabankId, mintMutation, clearMutationErrorIfCurrent, reportMutationError])
+
 
 
 
