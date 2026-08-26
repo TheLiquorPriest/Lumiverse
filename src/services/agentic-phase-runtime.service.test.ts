@@ -312,6 +312,95 @@ describe("canonical custom Phased Instructions machine", () => {
     expect(machine.state()).toMatchObject({ status: "ready", phaseId: "collaborate" });
   });
 
+  test("keeps optional repeatLimit 0 unsatisfied exits entered when skip is false", () => {
+    const compiled = compile([
+      phase({
+        id: "collaborate",
+        required: false,
+        repeatLimit: 0,
+        skip: { kind: "preset_variable", name: "fn_collaboration", operator: "equals", value: 0 },
+        exit: { kind: "task_transition", taskId: "fn_collaboration", transition: "completed" },
+        nextPhaseIds: ["settle"],
+        instructionRefs: [sourceRef("collaborate")],
+      }),
+      phase({ id: "settle", instructionRefs: [sourceRef("settle")] }),
+    ], [sourceRef("collaborate"), sourceRef("settle")]);
+    const machine = createAgentRuntimePhaseMachine(compiled);
+    expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
+    expect(machine.exit({
+      revision: 1,
+      context: context({ taskTransitions: { fn_collaboration: "active" } }),
+    })).toMatchObject({
+      status: "blocked",
+      condition: "false",
+      reason: "exit condition not met",
+      phaseId: "collaborate",
+    });
+    expect(machine.state()).toMatchObject({ status: "entered", phaseId: "collaborate", repeatCount: 0 });
+    expect(machine.exit({
+      revision: 2,
+      context: context({ taskTransitions: { fn_collaboration: "completed" } }),
+    })).toMatchObject({ status: "advanced", phaseId: "collaborate" });
+    expect(machine.state()).toMatchObject({ status: "ready", phaseId: "settle" });
+  });
+
+  test("keeps required repeatLimit 0 unsatisfied exits entered", () => {
+    const compiled = compile([
+      phase({
+        id: "settle",
+        required: true,
+        repeatLimit: 0,
+        exit: { kind: "task_transition", taskId: "fn_settlement", transition: "completed" },
+        nextPhaseIds: [],
+        instructionRefs: [sourceRef("settle")],
+      }),
+    ], [sourceRef("settle")]);
+    const machine = createAgentRuntimePhaseMachine(compiled);
+    expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
+    expect(machine.exit({
+      revision: 1,
+      context: context({ taskTransitions: { fn_settlement: "active" } }),
+    })).toMatchObject({
+      status: "blocked",
+      condition: "false",
+      reason: "exit condition not met",
+    });
+    expect(machine.state()).toMatchObject({ status: "entered", phaseId: "settle" });
+    expect(machine.exit({
+      revision: 2,
+      context: context({ taskTransitions: { fn_settlement: "completed" } }),
+    })).toMatchObject({ status: "completed", phaseId: "settle" });
+  });
+
+  test("skips an optional phase only when its skip predicate is true", () => {
+    const compiled = compile([
+      phase({
+        id: "collaborate",
+        required: false,
+        repeatLimit: 0,
+        skip: { kind: "preset_variable", name: "fn_collaboration", operator: "equals", value: 0 },
+        nextPhaseIds: ["settle"],
+        instructionRefs: [sourceRef("collaborate")],
+      }),
+      phase({ id: "settle", instructionRefs: [sourceRef("settle")] }),
+    ], [sourceRef("collaborate"), sourceRef("settle")]);
+    const skipped = createAgentRuntimePhaseMachine(compiled);
+    expect(skipped.enter({
+      revision: 1,
+      context: context({ presetVariables: { fn_collaboration: 0 } }),
+    })).toMatchObject({ status: "advanced", reason: "advanced to settle" });
+    expect(skipped.state()).toMatchObject({ status: "ready", phaseId: "settle" });
+    expect(skipped.evidence()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ checkpoint: "skip", status: "skipped", condition: "true" }),
+    ]));
+
+    const held = createAgentRuntimePhaseMachine(compiled);
+    expect(held.enter({
+      revision: 1,
+      context: context({ presetVariables: { fn_collaboration: 1 } }),
+    })).toMatchObject({ status: "entered", phaseId: "collaborate" });
+  });
+
   test("fails a required exit closed when the host snapshot is absent", () => {
     const compiled = compile([
       phase({

@@ -675,29 +675,31 @@ class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
       return this.advanceAfter(decision, phase, input);
     }
     if (exited === "false") {
-      if (this.repeatCount < phase.repeatLimit) {
-        if (phase.nextPhaseIds.length > 0 && !phase.nextPhaseIds.includes(phase.id)) {
-          // No self-loop: do not claim a repeat and do not fail the machine.
-          // The exit predicate is unsatisfied; remain entered so WORK can continue.
-          const decision = this.decision("blocked", exited, input, phase, "exit condition not met", "exit");
-          this.record(decision, phase);
-          return decision;
-        }
+      const hasSelfLoop = phase.nextPhaseIds.includes(phase.id);
+      if (hasSelfLoop && this.repeatCount < phase.repeatLimit) {
         this.repeatCount += 1;
         this.status = "ready";
         const decision = this.decision("repeated", exited, input, phase, "phase repeats within authored limit", "exit");
         this.record(decision, phase);
         return decision;
       }
-      if (phase.required) {
-        const decision = this.decision("failed", exited, input, phase, "required phase failed closed at repeat limit", "exit");
-        this.status = "failed";
+      if (hasSelfLoop) {
+        if (phase.required) {
+          const decision = this.decision("failed", exited, input, phase, "required phase failed closed at repeat limit", "exit");
+          this.status = "failed";
+          this.record(decision, phase);
+          return decision;
+        }
+        const decision = this.decision("skipped", exited, input, phase, "optional phase omitted at repeat limit", "exit");
         this.record(decision, phase);
-        return decision;
+        return this.advanceAfter(decision, phase, input);
       }
-      const decision = this.decision("skipped", exited, input, phase, "optional phase omitted at repeat limit", "exit");
+      // complete_turn is a boundary request. A valid unsatisfied live exit
+      // with no authored self-loop stays entered regardless of repeatLimit
+      // or required/optional. Skip applies only when skip is true.
+      const decision = this.decision("blocked", exited, input, phase, "exit condition not met", "exit");
       this.record(decision, phase);
-      return this.advanceAfter(decision, phase, input);
+      return decision;
     }
 
     const decision = this.decision("advanced", exited, input, phase, null, "exit");
