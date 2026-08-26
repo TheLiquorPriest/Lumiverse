@@ -24,6 +24,7 @@ import type {
 } from "../types/agents";
 import type {
   CognitionEvaluationContextV1,
+  CognitionPredicateV1,
   CognitionTaskTransition,
   LoomPromptInspectionBlockV1,
   LoomPromptInspectionV1,
@@ -67,6 +68,7 @@ import type {
 import type {
   WorkspaceOperationCapabilitiesV1,
   WorkspaceOperationKindV1,
+  WorkspaceTaskAcceptanceV1,
 } from "../types/turn-workspace";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
 import { WORKSPACE_ID_MAX_BYTES } from "./turn-workspace.service";
@@ -993,6 +995,9 @@ export interface AgenticWorkspaceCapability {
   readonly listRequiredOpenTasks?: (
     context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
   ) => readonly unknown[] | Promise<readonly unknown[]>;
+  readonly listTaskAcceptance?: (
+    context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
+  ) => readonly WorkspaceTaskAcceptanceV1[] | Promise<readonly WorkspaceTaskAcceptanceV1[]>;
   readonly getUnacceptedSubmissions?: (
     context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
   ) => readonly unknown[] | Promise<readonly unknown[]>;
@@ -2369,7 +2374,7 @@ async function recoverableCompletionBlockedResultFor(
     try {
       const gates = await readCompletionGates(workspace, frame);
       const fromGates = sanitizeOpenRequiredTaskIds(gates.openRequiredTaskIds);
-      if (fromGates.length > 0) openRequiredTaskIds = fromGates;
+      openRequiredTaskIds = sanitizeOpenRequiredTaskIds([...fromGates, ...extraTaskIds]);
     } catch {
       // Gates are optional on this reject; never execute workspace reads.
     }
@@ -2380,6 +2385,56 @@ async function recoverableCompletionBlockedResultFor(
     openRequiredTaskIds,
   );
 }
+
+function collectPredicateTaskIds(
+  predicate: CognitionPredicateV1,
+  into: Set<string> = new Set(),
+): Set<string> {
+  switch (predicate.kind) {
+    case "all":
+    case "any":
+      for (const child of predicate.children) collectPredicateTaskIds(child, into);
+      break;
+    case "not":
+      collectPredicateTaskIds(predicate.child, into);
+      break;
+    case "task_transition":
+      into.add(predicate.taskId);
+      break;
+    default:
+      break;
+  }
+  return into;
+}
+
+function resolveTaskAcceptance(
+  ref: string,
+  rows: readonly WorkspaceTaskAcceptanceV1[],
+): WorkspaceTaskAcceptanceV1 | undefined {
+  const byTemplate = rows.find((row) => row.templateId === ref);
+  if (byTemplate) return byTemplate;
+  return rows.find((row) => row.id === ref);
+}
+
+function unsatisfiedRequiredGatingIds(
+  refs: ReadonlySet<string>,
+  rows: readonly WorkspaceTaskAcceptanceV1[],
+): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    const row = resolveTaskAcceptance(ref, rows);
+    if (!row || !row.required || row.completionAccepted) continue;
+    const id = row.templateId ?? row.id;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+type FailedRootSettlementGuard = (taskId: string) => Promise<Record<string, unknown> | null>;
+
 
 
 function buildContinuation(
@@ -3376,6 +3431,7 @@ async function executeWorkspaceTool(
   args: Record<string, unknown>,
   frame: AgenticWorkFrame,
   operationKey: string,
+  failedRootGuard?: FailedRootSettlementGuard,
 ): Promise<ParsedWorkspaceResultV1> {
   const operation = OPERATION_BY_WORKSPACE_TOOL[name];
   if (!frame.workspaceCapabilities.has(operation)) throw new AgenticWorkPhaseError("tool_not_allowed", "Workspace operation is not granted");
@@ -3403,6 +3459,12 @@ async function executeWorkspaceTool(
       }
       : {}),
   };
+  if (operation === "submit_root_result" && args.state === "failed" && failedRootGuard) {
+    const taskId = typeof authenticatedArgs.taskId === "string" ? authenticatedArgs.taskId : "";
+    const blocked = await failedRootGuard(taskId);
+    if (blocked) return { result: blocked };
+  }
+
   if (
     workspace.applyCognitionWorkspaceTransition
     && (operation === "create_task"
@@ -5446,6 +5508,46 @@ export async function runAgenticWorkPhase(
       model: rootModel,
       signal,
     });
+    const readTaskAcceptance = async (): Promise<readonly WorkspaceTaskAcceptanceV1[]> => {
+      if (!options.workspace?.listTaskAcceptance) return [];
+      try {
+        const rows = await abortable(
+          Promise.resolve(options.workspace.listTaskAcceptance({ frame: rootFrame, signal })),
+          signal,
+        );
+        return Array.isArray(rows) ? rows : [];
+      } catch (error) {
+        if (signal.aborted) throw error;
+        return [];
+      }
+    };
+    const livePhaseUnsatisfiedGatingIds = async (): Promise<string[]> => {
+      if (!phaseMachine || phaseMachine.state().status !== "entered") return [];
+      const phase = phaseMachine.currentPhase();
+      if (!phase) return [];
+      const refs = collectPredicateTaskIds(phase.exit);
+      if (refs.size === 0) return [];
+      return unsatisfiedRequiredGatingIds(refs, await readTaskAcceptance());
+    };
+    const rejectFailedRootSettlement: FailedRootSettlementGuard = async (taskId) => {
+      if (!phaseMachine || phaseMachine.state().status !== "entered") return null;
+      const phase = phaseMachine.currentPhase();
+      if (!phase) return null;
+      const refs = collectPredicateTaskIds(phase.exit);
+      if (refs.size === 0) return null;
+      const rows = await readTaskAcceptance();
+      const row = rows.find((item) => item.id === taskId || item.templateId === taskId);
+      if (!row || !row.required || row.state !== "active") return null;
+      const referenced = (row.templateId !== null && refs.has(row.templateId)) || refs.has(row.id);
+      if (!referenced) return null;
+      return recoverableCompletionBlockedResultFor(
+        options.workspace,
+        rootFrame,
+        phase.id,
+        unsatisfiedRequiredGatingIds(refs, rows),
+      );
+    };
+
     if (!state.reserveChildIds([turnRootFrameId])) {
       return makeOutcome("failed", state, observations, childResults, "child_schedule_invalid");
     }
@@ -6407,20 +6509,30 @@ export async function runAgenticWorkPhase(
               if (!phaseInput) {
                 phaseCompletionFailed = true;
               } else {
+                const gatingUnsatisfied = await livePhaseUnsatisfiedGatingIds();
+                const entered = phaseMachine.state().status === "entered";
+                const blockedExit: CompletionExecutionResult = {
+                  observationStatus: "rejected",
+                  code: "completion_blocked",
+                  result: await recoverableCompletionBlockedResultFor(
+                    options.workspace,
+                    rootFrame,
+                    phaseMachine.currentPhase()?.id ?? null,
+                    gatingUnsatisfied,
+                  ),
+                };
                 const exitDecision = phaseMachine.previewExit(phaseInput);
                 if (exitDecision.status === "completed") {
-                  phaseCompletionExpectedRevision = phaseInput.revision;
-                  phaseTerminalPending = true;
+                  if (gatingUnsatisfied.length > 0 && entered) {
+                    completion = blockedExit;
+                  } else {
+                    phaseCompletionExpectedRevision = phaseInput.revision;
+                    phaseTerminalPending = true;
+                  }
                 } else if (isRecoverableUnsatisfiedLivePhaseExit(exitDecision, phaseMachine.state().status)) {
-                  completion = {
-                    observationStatus: "rejected",
-                    code: "completion_blocked",
-                    result: await recoverableCompletionBlockedResultFor(
-                      options.workspace,
-                      rootFrame,
-                      phaseMachine.currentPhase()?.id ?? null,
-                    ),
-                  };
+                  completion = blockedExit;
+                } else if (gatingUnsatisfied.length > 0 && entered) {
+                  completion = blockedExit;
                 } else {
                   const committedDecision = phaseMachine.exit(phaseInput);
                   recordPhaseEvidence();
@@ -6432,6 +6544,7 @@ export async function runAgenticWorkPhase(
                         options.workspace,
                         rootFrame,
                         phaseMachine.currentPhase()?.id ?? null,
+                        gatingUnsatisfied,
                       ),
                     };
                   } else if (committedDecision.status === "failed" || committedDecision.status === "blocked") {
@@ -6504,7 +6617,7 @@ export async function runAgenticWorkPhase(
           }
         } else if (call.name.startsWith("workspace_")) {
           try {
-            const workspaceResult = await executeWorkspaceTool(options.workspace, call.name as AgenticWorkWorkspaceToolName, call.args, rootFrame, call.call_id);
+            const workspaceResult = await executeWorkspaceTool(options.workspace, call.name as AgenticWorkWorkspaceToolName, call.args, rootFrame, call.call_id, rejectFailedRootSettlement);
             if (signal.aborted) {
               const status = signalStatus(signal);
               return finishBatchAbort(status);

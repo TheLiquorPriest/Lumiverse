@@ -124,6 +124,7 @@ import {
   getWorkspaceCompletionGatesV1,
   type WorkspaceCompletionGatesV1,
   listWorkspaceTaskTransitionsV1,
+  listWorkspaceTaskAcceptanceV1,
   readTurnWorkspaceSection,
   freezeWorkspaceForCompletionV1,
   createWorkspaceTask,
@@ -2481,6 +2482,8 @@ function makeWorkspace(
       const gates = getWorkspaceCompletionGatesV1(context(frame));
       return gates.openRequiredTaskIds;
     },
+    listTaskAcceptance: ({ frame }) => listWorkspaceTaskAcceptanceV1(context(frame)),
+
     getUnacceptedSubmissions: ({ frame }) => {
       const gates = getWorkspaceCompletionGatesV1(context(frame));
       return Array.from({ length: gates.pendingSubmissionCount }, () => ({}));

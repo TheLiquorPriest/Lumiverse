@@ -155,6 +155,16 @@ export interface WorkspaceTaskV1 {
 }
 export type WorkspaceTask = WorkspaceTaskV1;
 
+/** Host-authenticated task acceptance used to overlay authored phase-exit predicates. */
+export interface WorkspaceTaskAcceptanceV1 {
+  readonly id: string;
+  readonly templateId: string | null;
+  readonly required: boolean;
+  readonly state: WorkspaceTaskStateV1;
+  readonly completionAccepted: boolean;
+}
+
+
 export interface WorkspaceRecordV1 {
   readonly id: string;
   readonly workspaceId: string;

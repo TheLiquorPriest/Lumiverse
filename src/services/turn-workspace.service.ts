@@ -61,6 +61,7 @@ import {
   type WorkspaceSubmissionV1,
   type WorkspaceTaskStateV1,
   type WorkspaceTaskV1,
+  type WorkspaceTaskAcceptanceV1,
   type WorkspaceUsageV1,
 } from "../types/turn-workspace";
 import { utf8ByteLength } from "./agent-runtime-accounting";
@@ -2121,6 +2122,28 @@ export function listWorkspaceTaskTransitionsV1(raw: unknown): WorkspaceTaskTrans
     taskTransitions,
   });
 }
+
+export function listWorkspaceTaskAcceptanceV1(raw: unknown): readonly WorkspaceTaskAcceptanceV1[] {
+  const input = contextValue(raw, true);
+  const row = requireWorkspace(input);
+  const taskRows = listWorkspaceRows("agent_workspace_tasks", row);
+  const submissions = listWorkspaceRows("agent_workspace_submissions", row).map(submissionFromRow);
+  return Object.freeze(taskRows.map((candidate) => {
+    const task = taskFromRow(candidate);
+    const rawTemplateId = candidate.cognition_template_id;
+    const templateId = rawTemplateId === undefined || rawTemplateId === null
+      ? null
+      : cognitionTemplateTransitionId(row, candidate);
+    return Object.freeze({
+      id: task.id,
+      templateId,
+      required: task.required,
+      state: task.state,
+      completionAccepted: taskCompletionAccepted(task, submissions),
+    });
+  }));
+}
+
 function planWorkspaceCompletion(
   row: WorkspaceRow,
   tasks: readonly WorkspaceTaskV1[],
