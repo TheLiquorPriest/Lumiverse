@@ -77,8 +77,9 @@ describe('DatabankPanel mutation error wiring', () => {
   test('local delete and empty selector never publish remoteDatabankRemoved', () => {
     const del = sliceBetween('const handleDeleteBank = useCallback(', '\n  // ── Update bank details')
     expect(del).toContain('beginLocalDeselect(deletedId)')
-    expect(del.indexOf('beginLocalDeselect(deletedId)')).toBeLessThan(del.indexOf('setSelectedDatabankId(null)'))
+    expect(del.indexOf('beginLocalDeselect(deletedId)')).toBeLessThan(del.indexOf('removeDatabank(deletedId)'))
     expect(del).toContain('clearMutationErrorIfCurrent(started)')
+    expect(del).not.toContain('setSelectedDatabankId(null)')
     expect(del).not.toContain('remoteDatabankRemoved')
 
     const select = sliceBetween('{/* Bank selector bar */}', '<option value="">{t(\'databankPanel.selectDatabank\')}</option>')
@@ -102,19 +103,15 @@ describe('DatabankPanel mutation error wiring', () => {
   test('deferred local delete preserves a later other-bank selection', () => {
     const del = sliceBetween('const handleDeleteBank = useCallback(', '\n  // ── Update bank details')
     expect(del).toContain('const deletedId = selectedDatabankIdRef.current')
-    expect(del.indexOf('await databankApi.delete(deletedId)')).toBeGreaterThan(del.indexOf('const deletedId = selectedDatabankIdRef.current'))
     expect(del).toContain('const stillSelected = selectedDatabankIdRef.current === deletedId')
     expect(del.indexOf('await databankApi.delete(deletedId)')).toBeLessThan(del.indexOf('const stillSelected'))
-    expect(del).toContain('if (stillSelected)')
-    expect(del).toContain('beginLocalDeselect(deletedId)')
-    expect(del).toContain('setSelectedDatabankId(null)')
-    expect(del).toContain('localDeselectRef.current.clear()')
-    expect(del.indexOf('if (stillSelected)')).toBeLessThan(del.indexOf('setSelectedDatabankId(null)'))
-    expect(del.indexOf('} else {')).toBeLessThan(del.indexOf('localDeselectRef.current.clear()'))
+    expect(del.indexOf('if (stillSelected) beginLocalDeselect(deletedId)')).toBeLessThan(del.indexOf('removeDatabank(deletedId)'))
+    expect(del.indexOf('localDeselectRef.current.clear()')).toBeLessThan(del.indexOf('removeDatabank(deletedId)'))
+    expect(del).not.toContain('setSelectedDatabankId(null)')
     expect(del).not.toContain('remoteDatabankRemoved')
     expect(del).not.toContain('await databankApi.delete(selectedDatabankId)')
-
   })
+
 
 
   test('delete document reports localized copy not API body', () => {

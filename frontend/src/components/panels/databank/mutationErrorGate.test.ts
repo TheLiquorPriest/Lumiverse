@@ -93,6 +93,25 @@ describe('Databank mutation error gate', () => {
     ledger.clear()
     expect(ledger.classifyNullTransition('bank-a')).toBe('remote')
   })
+
+  test('store-null effect is local only when ledger is armed first', () => {
+    const sameBank = createLocalDeselectLedger()
+    const deletedId = 'bank-a'
+    sameBank.begin(deletedId)
+    expect(sameBank.classifyNullTransition(deletedId)).toBe('local')
+    expect(sameBank.pending()).toBeNull()
+
+    const armedTooLate = createLocalDeselectLedger()
+    expect(armedTooLate.classifyNullTransition(deletedId)).toBe('remote')
+    armedTooLate.begin(deletedId)
+    expect(armedTooLate.pending()).toBe(deletedId)
+
+    const otherBank = createLocalDeselectLedger()
+    otherBank.clear()
+    expect(otherBank.pending()).toBeNull()
+  })
 })
+
+
 
 
