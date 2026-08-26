@@ -1234,6 +1234,89 @@ describe("agent run inspection terminal persistence", () => {
     }))).toBeNull();
   });
 
+  test("preserves child_required_failed and child_output_limit_exceeded instead of internal_error", () => {
+    const chat = createChat(OWNER, { name: "inspection-child-codes" });
+    const required = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "child-required-attempt",
+      runId: "child-required-run",
+      turnSessionId: "child-required-turn",
+      generationId: "child-required-generation",
+      outcome: "failed",
+      reason: "required_work_failure",
+      terminalReceipt: {
+        error: {
+          code: "child_required_failed",
+        },
+      },
+    }));
+    expect(required!.error).toMatchObject({
+      code: "child_required_failed",
+      category: "validation",
+      summaryCode: "agentRun.errors.child_required_failed",
+      reason: "required_work_failure",
+      workOutcome: "failed",
+    });
+
+    const protocol = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "protocol-attempt",
+      runId: "protocol-run",
+      turnSessionId: "protocol-turn",
+      generationId: "protocol-generation",
+      outcome: "failed",
+      reason: "failed",
+      terminalReceipt: {
+        error: {
+          code: "agentic_protocol_failure",
+          category: "internal",
+        },
+      },
+    }));
+    expect(protocol!.error).toMatchObject({
+      code: "agentic_protocol_failure",
+      category: "validation",
+      summaryCode: "agentRun.errors.agentic_protocol_failure",
+    });
+
+    const limit = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "child-limit-attempt",
+      runId: "child-limit-run",
+      turnSessionId: "child-limit-turn",
+      generationId: "child-limit-generation",
+      outcome: "failed",
+      reason: "budget_exhausted",
+      terminalReceipt: {
+        error: {
+          code: "child_output_limit_exceeded",
+        },
+      },
+    }));
+    expect(limit!.error).toMatchObject({
+      code: "child_output_limit_exceeded",
+      category: "budget",
+      summaryCode: "agentRun.errors.child_output_limit_exceeded",
+      reason: "budget_exhausted",
+    });
+
+    const unknown = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "unknown-attempt",
+      runId: "unknown-run",
+      turnSessionId: "unknown-turn",
+      generationId: "unknown-generation",
+      outcome: "failed",
+      reason: "failed",
+      terminalReceipt: {
+        error: {
+          code: "not_a_public_code",
+        },
+      },
+    }));
+    expect(unknown!.error).toMatchObject({
+      code: "internal_error",
+      category: "internal",
+      summaryCode: "agentRun.errors.internal_error",
+    });
+  });
+
   test("marks malformed durable audit and activity projection payloads unavailable", () => {
     const chat = createChat(OWNER, { name: "inspection-corrupt-projections" });
     expect(persistAgentRunInspection(inspectionInput(chat.id, {

@@ -169,7 +169,10 @@ export type AgentPublicErrorCode =
   | "worker_unavailable"
   | "worker_crashed"
   | "worker_timed_out"
-  | "worker_malformed";
+  | "worker_malformed"
+  | "child_required_failed"
+  | "child_output_limit_exceeded"
+  | "agentic_protocol_failure";
 /** Runtime values for the closed public error-code taxonomy. */
 export const AGENT_PUBLIC_ERROR_CODES = [
   "capacity_exceeded",
@@ -230,6 +233,9 @@ export const AGENT_PUBLIC_ERROR_CODES = [
   "worker_crashed",
   "worker_timed_out",
   "worker_malformed",
+  "child_required_failed",
+  "child_output_limit_exceeded",
+  "agentic_protocol_failure",
 ] as const satisfies readonly AgentPublicErrorCode[];
 
 

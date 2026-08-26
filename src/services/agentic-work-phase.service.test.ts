@@ -5822,11 +5822,12 @@ describe("Agentic WORK phase", () => {
       systemPrompt: "bounded system prompt",
       budget: { maxChildRounds: 3, maxOutputTokens: 8, maxUnsignedBoundaries: 1 },
       dispatch: async () => ({
-        content: "",
+        content: "ok",
         finish_reason: "length",
         usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
       }),
     });
+    expect(child.status).toBe("succeeded");
     expect(child.code).not.toBe("child_output_limit_exceeded");
     expect(child.code).not.toBe("root_output_limit_exceeded");
   });
@@ -6020,6 +6021,222 @@ describe("Agentic WORK phase", () => {
     expect(results.some((entry) => entry.includes("openRequiredTaskIds"))).toBe(false);
     expect(results.some((entry) => entry.includes("currentPhaseId"))).toBe(false);
     expect(results.some((entry) => entry.includes("admittedToolNames"))).toBe(false);
+  });
+
+  test("maps workspace semantic rejects to stable recoverable codes and keeps valid neighbors", async () => {
+    const payloads: Record<string, unknown>[] = [];
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+      dispatchCount += 1;
+      if (dispatchCount > 1) {
+        for (const message of messages) {
+          if (!Array.isArray(message.content)) continue;
+          for (const part of message.content) {
+            if (part.type !== "tool_result" || typeof part.content !== "string") continue;
+            try {
+              payloads.push(JSON.parse(part.content) as Record<string, unknown>);
+            } catch {
+              // ignore non-JSON
+            }
+          }
+        }
+      }
+      if (dispatchCount === 1) {
+        return response("", [call("workspace_read_section", "read-baseline", { section: "baseline" })]);
+      }
+      if (dispatchCount === 2) {
+        return response("", [call("workspace_read_section", "read-objective", { section: "objective" })]);
+      }
+      if (dispatchCount === 3) {
+        return response("", [call("workspace_create_task", "create-owned", { taskId: "fn_required_child", title: "Owned" })]);
+      }
+      if (dispatchCount === 4) {
+        return response("", [call("workspace_create_task", "create-new", { title: "Optional neighbor" })]);
+      }
+      if (dispatchCount === 5) {
+        return response("", [call("workspace_submit_root_result", "submit-child-owned", {
+          taskId: "turn:fn_required_child",
+          state: "failed",
+        })]);
+      }
+      if (dispatchCount === 6) {
+        return response("", [call("workspace_read_section", "read-unknown-template", { section: "tasks" })]);
+      }
+      return response("", [complete("workspace-semantics-complete")]);
+    }, {
+      workspace: workspace({
+        execute: async (operation, args) => {
+          if (operation === "read_section" && args.section === "baseline") {
+            throw Object.assign(new Error("section is invalid"), { code: "invalid_input" });
+          }
+          if (operation === "create_task" && args.taskId === "fn_required_child") {
+            throw Object.assign(new Error("workspace task identifier is reserved by frozen cognition templates"), { code: "invalid_source" });
+          }
+          if (operation === "submit_root_result") {
+            throw Object.assign(new Error("root may not settle a child-assigned task"), { code: "child_confinement" });
+          }
+          if (operation === "read_section" && args.section === "tasks") {
+            throw Object.assign(new Error("taskId is not a stable identifier"), { code: "invalid_id" });
+          }
+          return { result: { ok: true, operation, section: args.section ?? null } };
+        },
+      }),
+      workspaceCapabilities: ["read_section", "create_task", "submit_root_result"],
+      budget: { maxProviderRounds: 8, maxUnsignedBoundaries: 4 },
+    }));
+    expect(result.status).toBe("completed");
+    expect(result.code).toBeUndefined();
+    expect(payloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({ errorCode: "invalid_input", message: "section is invalid" }),
+      expect.objectContaining({ errorCode: "conflict", message: "workspace task identifier is reserved by frozen cognition templates" }),
+      expect.objectContaining({ errorCode: "conflict", message: "root may not settle a child-assigned task" }),
+      expect.objectContaining({ errorCode: "invalid_input", message: "taskId is not a stable identifier" }),
+    ]));
+    expect(payloads.some((payload) => payload.errorCode === "internal_error")).toBe(false);
+    expect(result.observations.find((item) => item.callId === "read-objective")?.status).toBe("success");
+    expect(result.observations.find((item) => item.callId === "create-new")?.status).toBe("success");
+  });
+
+  test("keeps unknown workspace exceptions internal without failing WORK", async () => {
+    const payloads: Record<string, unknown>[] = [];
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+      dispatchCount += 1;
+      if (dispatchCount > 1) {
+        for (const message of messages) {
+          if (!Array.isArray(message.content)) continue;
+          for (const part of message.content) {
+            if (part.type !== "tool_result" || typeof part.content !== "string") continue;
+            try {
+              payloads.push(JSON.parse(part.content) as Record<string, unknown>);
+            } catch {
+              // ignore non-JSON
+            }
+          }
+        }
+      }
+      if (dispatchCount === 1) {
+        return response("", [call("workspace_read_section", "read-boom", { section: "objective" })]);
+      }
+      return response("", [complete("after-unknown")]);
+    }, {
+      workspace: workspace({
+        execute: async () => {
+          throw new Error("sqlite exploded");
+        },
+      }),
+      workspaceCapabilities: ["read_section"],
+    }));
+    expect(result.status).toBe("completed");
+    expect(payloads[0]).toMatchObject({ errorCode: "internal_error", message: "Tool call rejected" });
+    expect(JSON.stringify(payloads[0])).not.toContain("sqlite exploded");
+  });
+
+  test("fails child length with zero published bytes immediately at the authored cap", async () => {
+    let rounds = 0;
+    const child = await executeBoundedAgenticChildFrame({
+      frame: createAgenticChildFrame({
+        frameId: "child-length-empty",
+        parentFrameId: "root",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        signal: new AbortController().signal,
+      }),
+      task: "bounded task",
+      systemPrompt: "bounded system prompt",
+      budget: { maxChildRounds: 3, maxOutputTokens: 384, maxUnsignedBoundaries: 2 },
+      dispatch: async ({ maxOutputTokens }) => {
+        rounds += 1;
+        expect(maxOutputTokens).toBe(384);
+        return {
+          content: "",
+          finish_reason: "length",
+          reasoning: "x".repeat(64),
+          usage: { prompt_tokens: 1, completion_tokens: 384, total_tokens: 385 },
+        };
+      },
+    });
+    expect(rounds).toBe(1);
+    expect(child.status).toBe("failed");
+    expect(child.code).toBe("child_output_limit_exceeded");
+    expect(child.errorMessage).toContain("maxOutputTokens=384");
+    expect(child.errorMessage).toContain("finish_reason=length");
+  });
+
+  test("retries one non-length empty child publish then keeps child_required_failed", async () => {
+    let rounds = 0;
+    const child = await executeBoundedAgenticChildFrame({
+      frame: createAgenticChildFrame({
+        frameId: "child-empty-stop",
+        parentFrameId: "root",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        signal: new AbortController().signal,
+      }),
+      task: "bounded task",
+      systemPrompt: "bounded system prompt",
+      budget: { maxChildRounds: 3, maxOutputTokens: 384 },
+      dispatch: async () => {
+        rounds += 1;
+        return { content: "", finish_reason: "stop" };
+      },
+    });
+    expect(rounds).toBe(2);
+    expect(child.status).toBe("failed");
+    expect(child.code).toBe("child_required_failed");
+  });
+
+  test("propagates child_output_limit_exceeded through required agent_delegate and WORK terminal", async () => {
+    const taskId = "fn_required_child";
+    let assignedFrameId = "";
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      return response("", [call("agent_delegate", "delegate-length", {
+        profile_id: "fn_required_retriever",
+        task_id: taskId,
+        task: "retrieve",
+      })]);
+    }, {
+      workspace: workspace({
+        listOpenTasks: async () => [{
+          id: taskId,
+          state: "active",
+          required: true,
+          assignedFrameId: assignedFrameId || null,
+        }],
+        assignChildTasks: async ({ assignments }) => {
+          const assignment = assignments[0];
+          if (!assignment) throw new Error("missing assignment");
+          assignedFrameId = assignment.frameId;
+          return { accepted: true, workspaceRevision: 1, assignments };
+        },
+        settleAssignedTask: async () => ({ accepted: true, workspaceRevision: 2 }),
+      }),
+      delegatableProfiles: [{
+        profileId: "fn_required_retriever",
+        toolIds: ["chat_search_history"],
+        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+        maxOutputTokens: 384,
+      }],
+      executeChild: async () => ({
+        status: "failed",
+        content: "",
+        errorCode: "child_output_limit_exceeded",
+        errorMessage: "Child published 0 bytes at finish_reason=length with maxOutputTokens=384",
+      }),
+    }));
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("child_output_limit_exceeded");
+    expect(result.childResults).toMatchObject([{
+      required: true,
+      status: "failed",
+      errorCode: "child_output_limit_exceeded",
+    }]);
+    expect(result.observations.find((item) => item.callId === "delegate-length")).toMatchObject({
+      status: "error",
+      code: "child_output_limit_exceeded",
+    });
   });
 
 });

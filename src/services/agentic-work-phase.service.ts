@@ -1082,6 +1082,7 @@ export interface AgenticChildExecutionResult {
   readonly content?: string;
   readonly status?: "succeeded" | "failed" | "cancelled" | "timed_out";
   readonly errorCode?: string;
+  readonly errorMessage?: string;
   /** Host-settled provider usage for this child frame. */
   readonly usage?: AgenticWorkUsage;
   readonly workspaceRevision?: number;
@@ -2988,11 +2989,31 @@ const TERMINAL_WORKSPACE_TASK_STATES: Record<string, true> = {
   failed: true,
 };
 
-const WORKSPACE_ASSIGNMENT_CONFLICT_CODES: Record<string, true> = {
-  conflict: true,
-  task_assignment_conflict: true,
-  stale_revision: true,
-  duplicate_id: true,
+const WORKSPACE_SEMANTIC_ERROR_CODES: Record<string, AgenticWorkErrorCode> = {
+  invalid_input: "invalid_input",
+  invalid_id: "invalid_input",
+  invalid_state: "invalid_input",
+  invalid_retention: "invalid_input",
+  schema_unavailable: "invalid_input",
+  dependency_cycle: "invalid_input",
+  submission_rejected: "invalid_input",
+  not_found: "not_found",
+  conflict: "conflict",
+  task_assignment_conflict: "conflict",
+  stale_revision: "conflict",
+  duplicate_id: "conflict",
+  child_confinement: "conflict",
+  workspace_frozen: "conflict",
+  workspace_cas_conflict: "conflict",
+  idempotency_conflict: "conflict",
+  invalid_source: "conflict",
+  forbidden: "tool_not_allowed",
+  capability_denied: "tool_not_allowed",
+  quota_exceeded: "workspace_budget_exhausted",
+  workspace_budget_exhausted: "workspace_budget_exhausted",
+  cancelled: "cancelled",
+  timed_out: "timed_out",
+  completion_preparation_failed: "completion_freeze_failed",
 };
 
 function workspaceErrorCode(error: unknown): string | undefined {
@@ -3003,15 +3024,23 @@ function workspaceErrorCode(error: unknown): string | undefined {
 
 function mapWorkspaceAssignmentError(error: unknown): AgenticWorkErrorCode {
   const code = workspaceErrorCode(error);
-  if (code === "not_found") return "not_found";
-  if (code !== undefined && WORKSPACE_ASSIGNMENT_CONFLICT_CODES[code]) return "conflict";
-  if (code === "quota_exceeded" || code === "workspace_budget_exhausted") return "workspace_budget_exhausted";
-  if (code === "cancelled" || code === "timed_out") return code;
+  if (code !== undefined && Object.hasOwn(WORKSPACE_SEMANTIC_ERROR_CODES, code)) {
+    return WORKSPACE_SEMANTIC_ERROR_CODES[code]!;
+  }
   if (error instanceof AgenticWorkPhaseError) return error.code;
-  const message = error instanceof Error ? error.message : String(error);
-  if (/(?:^|\b)not found(?:\b|$)/i.test(message)) return "not_found";
-  if (/\b(?:conflict|already assigned|stale)\b/i.test(message)) return "conflict";
   return "internal_error";
+}
+
+function workspaceToolErrorResult(error: unknown): { code: AgenticWorkErrorCode; result: Record<string, unknown> } {
+  const code = mapWorkspaceAssignmentError(error);
+  const rawMessage = error instanceof Error ? error.message : "";
+  const message = code === "internal_error"
+    || typeof rawMessage !== "string"
+    || rawMessage.length === 0
+    || boundedBytes(rawMessage) > MAX_COMPLETION_SUMMARY_BYTES
+    ? "Tool call rejected"
+    : rawMessage;
+  return { code, result: resultError(code, message) };
 }
 
 function parseOpenAssignableTask(value: unknown): OpenAssignableTask | undefined {
@@ -4156,6 +4185,7 @@ export interface BoundedChildFrameOutcome {
   readonly observations: readonly AgenticWorkObservation[];
   readonly providerRoundCount: number;
   readonly code?: AgenticWorkErrorCode;
+  readonly errorMessage?: string;
   readonly workspaceRevision?: number;
   readonly usage?: AgenticWorkUsage;
 }
@@ -4351,6 +4381,17 @@ export async function executeBoundedAgenticChildFrame(
         if (nextOutputBytes === 0) {
           const reasoningBytes = typeof response.reasoning === "string" ? utf8ByteLength(response.reasoning) : 0;
           console.error(`[agentic] child published 0 bytes finish=${response.finish_reason} reasoningBytes=${reasoningBytes} retry=${emptyPublishRetries}`);
+          if (response.finish_reason === "length") {
+            const errorMessage = `Child published 0 bytes at finish_reason=length with maxOutputTokens=${maxOutputTokens}`;
+            return childOutcome({
+              status: "failed",
+              content: "",
+              observations,
+              providerRoundCount: state.providerRounds,
+              code: "child_output_limit_exceeded",
+              errorMessage,
+            });
+          }
           if (emptyPublishRetries < 1) {
             emptyPublishRetries += 1;
             const nudge: LlmMessage = { role: "user", content: "Your previous reply had no published content. Publish the assigned task result now as plain text." };
@@ -4426,8 +4467,9 @@ export async function executeBoundedAgenticChildFrame(
               throw options.frame.signal.reason ?? new DOMException("Aborted", "AbortError");
             }
             status = "error";
-            code = error instanceof AgenticWorkPhaseError ? error.code : "internal_error";
-            serialized = JSON.stringify(resultError(code));
+            const mapped = workspaceToolErrorResult(error);
+            code = mapped.code;
+            serialized = JSON.stringify(mapped.result);
           }
         }
         let resultBytes: number;
@@ -6446,9 +6488,6 @@ export async function runAgenticWorkPhase(
           if (completion.workspaceRevision !== undefined) {
             workspaceContextRevision = completion.workspaceRevision;
           }
-          if (!acceptance) {
-            console.error(`[agentic] complete_turn ${observationStatus}${code ? ` (${code})` : ""}`);
-          }
           // A rejected/blocked fixed point has already committed its cognition CAS.
           if (!acceptance && signal.aborted) {
             const status = signalStatus(signal);
@@ -6475,8 +6514,9 @@ export async function runAgenticWorkPhase(
               return finishBatchAbort(status);
             }
             observationStatus = "error";
-            code = mapWorkspaceAssignmentError(error);
-            result = resultError(code);
+            const mapped = workspaceToolErrorResult(error);
+            code = mapped.code;
+            result = mapped.result;
           }
         } else if (call.name === AGENT_DELEGATE_TOOL) {
           const profileId = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
@@ -6622,7 +6662,14 @@ export async function runAgenticWorkPhase(
                   const cleanupFailure = await settleAssignedFrames("failed");
                   throw cleanupFailure ?? error;
                 }
-                result = resultError(failureCode ?? code);
+                const childMessage = typeof delegatedRecord.errorMessage === "string"
+                  && delegatedRecord.errorMessage.length > 0
+                  && boundedBytes(delegatedRecord.errorMessage) <= MAX_COMPLETION_SUMMARY_BYTES
+                  ? delegatedRecord.errorMessage
+                  : undefined;
+                result = childMessage
+                  ? resultError(failureCode ?? code, childMessage)
+                  : resultError(failureCode ?? code);
               } else {
                 if (
                   prepared.descriptor.required

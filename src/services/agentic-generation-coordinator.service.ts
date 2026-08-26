@@ -5093,6 +5093,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             content: result.content,
             status: result.status,
             ...(result.code ? { errorCode: result.code } : {}),
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
             ...(result.workspaceRevision !== undefined ? { workspaceRevision: result.workspaceRevision } : {}),
           };

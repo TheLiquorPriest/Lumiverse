@@ -1653,7 +1653,9 @@ function terminalErrorCategory(code: AgentPublicErrorCode): AgentPublicErrorCate
     code === "invalid_arguments" ||
     code === "batch_rejected" ||
     code === "unknown_tool" ||
-    code === "unauthorized"
+    code === "unauthorized" ||
+    code === "child_required_failed" ||
+    code === "agentic_protocol_failure"
   ) return "validation";
   if (code === "integrity_error") return "integrity";
   return "internal";

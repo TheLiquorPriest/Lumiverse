@@ -353,6 +353,8 @@ function publicErrorCategory(code: string): AgentPublicErrorCategory {
     || code === "stale_target"
     || code === "response_mode_required"
     || code === "decision_refresh_required"
+    || code === "child_required_failed"
+    || code === "agentic_protocol_failure"
   ) return "validation";
   return "internal";
 }

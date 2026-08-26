@@ -2572,6 +2572,8 @@ function terminalProjectionErrorCodeForExecution(
 ): string | null {
   const code = execution.terminalCode?.trim().toLowerCase() ?? "";
   if (code === "decision_refresh_required") return "decision_refresh_required";
+  if (code === "agentic_work_exhausted") return "limit_exceeded";
+  if (code && AGENT_PUBLIC_ERROR_CODES_SET.has(code)) return code;
   if (inspectionReason === "needs_attention" || code === "terminal_publication_failed") {
     return outcome === "stopped"
       ? "cancelled"
@@ -2582,7 +2584,6 @@ function terminalProjectionErrorCodeForExecution(
           : "internal_error";
   }
   if (code === "interrupted" || code === "process_interrupted") return "internal_error";
-  if (code && AGENT_PUBLIC_ERROR_CODES_SET.has(code)) return code;
   if (execution.phase === "COMMIT_FAILED") return "internal_error";
   return null;
 }

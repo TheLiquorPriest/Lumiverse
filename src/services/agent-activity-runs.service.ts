@@ -16,6 +16,7 @@ import type {
   AgentPublicErrorCode,
 } from "../types/agent-runtime";
 import {
+  AGENT_PUBLIC_ERROR_CODES,
   PUBLIC_ACTIVITY_TOOL_IDS,
 } from "../types/agent-runtime";
 import {
@@ -166,25 +167,7 @@ const NODE_KINDS = new Set<AgentActivityNodeKind>([
   "root_turn", "provider_round", "child_invocation", "tool_attempt",
 ]);
 const TOOL_IDS = new Set<AgentActivityToolId>(PUBLIC_ACTIVITY_TOOL_IDS);
-const ERROR_CODES = new Set<AgentPublicErrorCode>([
-  "capacity_exceeded", "host_child_admission_limit_exceeded", "host_tool_call_limit_exceeded",
-  "child_admission_limit_exceeded", "tool_call_limit_exceeded", "logical_provider_request_limit_exceeded",
-  "physical_dispatch_attempt_limit_exceeded", "child_output_token_limit_exceeded", "root_wall_clock_limit_exceeded",
-  "activity_event_limit_exceeded", "activity_byte_limit_exceeded", "lifecycle_log_record_limit_exceeded",
-  "context_limit_exceeded", "initial_input_limit_exceeded", "argument_limit_exceeded", "result_limit_exceeded",
-  "continuation_limit_exceeded", "retained_output_limit_exceeded", "materialized_limit_exceeded", "timeout",
-  "cancelled", "provider_unavailable", "provider_unsupported", "provider_request_error",
-  "provider_tool_calling_unsupported", "provider_tool_continuation_unsupported",
-  "provider_tool_finalization_unsupported",
-  "provider_protocol_error", "provider_schema_error", "invalid_task", "invalid_profile",
-  "invalid_input", "invalid_arguments", "batch_rejected", "unknown_tool", "unauthorized",
-  "integrity_error", "not_found", "invalid_request", "projection_unavailable",
-  "inspection_unavailable", "workspace_unavailable", "stop_unavailable", "retry_unavailable",
-  "target_mismatch", "stale_target", "resync_required", "recovery_unavailable",
-  "response_mode_required", "decision_refresh_required", "limit_exceeded", "queue_full",
-  "worker_disabled", "worker_unavailable", "worker_crashed", "worker_timed_out",
-  "worker_malformed", "internal_error",
-]);
+const ERROR_CODES = new Set<AgentPublicErrorCode>(AGENT_PUBLIC_ERROR_CODES);
 
 export interface PersistAgentActivityRunInput {
   readonly userId: string;
@@ -2678,6 +2661,23 @@ function normalizeInspectionCapGate(value: unknown): AgentInspectionCapGateV1 | 
     source: normalizeInspectionSource(source.source),
   };
 }
+function publicInspectionErrorCode(value: unknown): AgentPublicErrorCode | null {
+  return typeof value === "string" && ERROR_CODES.has(value as AgentPublicErrorCode)
+    ? value as AgentPublicErrorCode
+    : null;
+}
+
+function inspectionErrorCategory(code: AgentPublicErrorCode): AgentPublicErrorCategory {
+  if (code.includes("limit") || code.includes("budget") || code === "exhausted") return "budget";
+  if (code === "child_required_failed" || code === "agentic_protocol_failure") return "validation";
+  if (code.startsWith("provider_") || code.startsWith("worker_")) return "provider";
+  if (code.startsWith("invalid_") || code === "batch_rejected" || code === "unknown_tool") return "validation";
+  if (code === "timeout" || code === "worker_timed_out") return "timeout";
+  if (code === "cancelled") return "cancelled";
+  if (code === "integrity_error") return "integrity";
+  if (code === "internal_error") return "internal";
+  return "internal";
+}
 
 function inspectionDefaultErrorCode(row: InspectionAttemptRow): AgentPublicErrorCode {
   if (row.outcome === "stopped") return "cancelled";
@@ -2686,6 +2686,8 @@ function inspectionDefaultErrorCode(row: InspectionAttemptRow): AgentPublicError
     return row.reason === "stale_input" ? "decision_refresh_required" : "invalid_input";
   }
   if (row.reason === "provider_failure") return "provider_request_error";
+  if (row.reason === "required_work_failure") return "child_required_failed";
+  if (row.reason === "budget_exhausted") return "limit_exceeded";
   if (row.reason === "tool_failure") return "internal_error";
   return "internal_error";
 }
@@ -2706,21 +2708,19 @@ function normalizeInspectionError(
     }
   }
   const source = inspectionObject(receipt.error ?? receipt);
+  const explicitCode = publicInspectionErrorCode(source.code);
   const hasError = transcriptFailure !== undefined
     || (row.outcome !== null && row.outcome !== "completed")
-    || (typeof source.code === "string" && ERROR_CODES.has(source.code as AgentPublicErrorCode));
+    || explicitCode !== null;
   if (!hasError) return null;
-  const explicitCode = typeof source.code === "string" && ERROR_CODES.has(source.code as AgentPublicErrorCode)
-    ? source.code as AgentPublicErrorCode
-    : null;
   const code = explicitCode ?? inspectionDefaultErrorCode(row);
-  const explicitCausalCode = typeof source.causalCode === "string"
-    && ERROR_CODES.has(source.causalCode as AgentPublicErrorCode)
-    ? source.causalCode as AgentPublicErrorCode
-    : null;
-  const category = typeof source.category === "string" && PUBLIC_ERROR_CATEGORIES.has(source.category)
+  const explicitCausalCode = publicInspectionErrorCode(source.causalCode);
+  const derivedCategory = inspectionErrorCategory(code);
+  const category = typeof source.category === "string"
+    && PUBLIC_ERROR_CATEGORIES.has(source.category)
+    && source.category !== "internal"
     ? source.category as AgentPublicErrorCategory
-    : "internal";
+    : derivedCategory;
   const summaryCode = typeof source.summaryCode === "string"
     && /^agentRun\.errors\.[A-Za-z0-9_.:-]{1,128}$/.test(source.summaryCode)
     ? source.summaryCode
