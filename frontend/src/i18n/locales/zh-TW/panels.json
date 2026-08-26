@@ -2818,7 +2818,9 @@
     "fuseFailed": "合併數據庫失敗",
     "scrapeFailed": "抓取 URL 失敗",
     "loadDocFailed": "加載文檔內容失敗",
-    "saveDocFailed": "保存文檔失敗"
+    "saveDocFailed": "保存文檔失敗",
+    "remoteDocumentRemoved": "該文件已被刪除。",
+    "remoteDatabankRemoved": "該資料庫已被刪除。"
   },
   "creatorWorkshop": {
     "shared": {

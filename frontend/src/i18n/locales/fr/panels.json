@@ -2818,7 +2818,9 @@
     "fuseFailed": "Échec de la fusion des banques de données",
     "scrapeFailed": "Échec de la récupération de l'URL",
     "loadDocFailed": "Échec du chargement du document content",
-    "saveDocFailed": "Échec de l'enregistrement du document"
+    "saveDocFailed": "Échec de l'enregistrement du document",
+    "remoteDocumentRemoved": "Ce document a été supprimé.",
+    "remoteDatabankRemoved": "Cette banque de données a été supprimée."
   },
   "creatorWorkshop": {
     "shared": {

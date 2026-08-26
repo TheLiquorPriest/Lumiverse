@@ -3076,7 +3076,9 @@
     "fuseFailed": "Failed to fuse databanks",
     "scrapeFailed": "Failed to scrape URL",
     "loadDocFailed": "Failed to load document content",
-    "saveDocFailed": "Failed to save document"
+    "saveDocFailed": "Failed to save document",
+    "remoteDocumentRemoved": "This document was removed.",
+    "remoteDatabankRemoved": "This databank was removed."
   },
   "creatorWorkshop": {
     "shared": {

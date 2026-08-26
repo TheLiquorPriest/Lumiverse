@@ -2826,7 +2826,9 @@
     "fuseFailed": "Errore nell'unione degli archivi dati",
     "scrapeFailed": "Errore nello scraping dell'URL",
     "loadDocFailed": "Errore nel caricamento del contenuto del documento",
-    "saveDocFailed": "Errore nel salvataggio del documento"
+    "saveDocFailed": "Errore nel salvataggio del documento",
+    "remoteDocumentRemoved": "Questo documento è stato rimosso.",
+    "remoteDatabankRemoved": "Questo archivio dati è stato rimosso."
   },
   "creatorWorkshop": {
     "shared": {

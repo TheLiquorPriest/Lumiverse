@@ -2818,7 +2818,9 @@
     "fuseFailed": "合并数据库失败",
     "scrapeFailed": "抓取 URL 失败",
     "loadDocFailed": "加载文档内容失败",
-    "saveDocFailed": "保存文档失败"
+    "saveDocFailed": "保存文档失败",
+    "remoteDocumentRemoved": "该文档已被删除。",
+    "remoteDatabankRemoved": "该资料库已被删除。"
   },
   "creatorWorkshop": {
     "shared": {

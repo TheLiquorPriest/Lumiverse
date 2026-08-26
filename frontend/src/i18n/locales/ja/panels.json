@@ -2818,7 +2818,9 @@
     "fuseFailed": "データバンクの融合に失敗しました",
     "scrapeFailed": "URLのスクレイピングに失敗しました",
     "loadDocFailed": "ドキュメント コンテンツのロードに失敗しました",
-    "saveDocFailed": "ドキュメントの保存に失敗しました"
+    "saveDocFailed": "ドキュメントの保存に失敗しました",
+    "remoteDocumentRemoved": "このドキュメントは削除されました。",
+    "remoteDatabankRemoved": "このデータバンクは削除されました。"
   },
   "creatorWorkshop": {
     "shared": {
