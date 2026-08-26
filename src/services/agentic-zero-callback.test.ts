@@ -374,6 +374,7 @@ function zeroCallbackWorkspace(): AgenticWorkspaceCapability {
   return {
     preparesCompletionBeforeAcceptance: true,
     getCompletionGates: async () => ({}),
+    listTaskAcceptance: async () => [],
     freezeForCompletion: async (input) => {
       const candidate = {
         accepted: true as const,
@@ -393,7 +394,7 @@ function zeroCallbackWorkspace(): AgenticWorkspaceCapability {
         ? candidate
         : { accepted: false, code: "completion_freeze_failed" as const };
     },
-  } as AgenticWorkspaceCapability;
+  };
 }
 
 function workOptions(

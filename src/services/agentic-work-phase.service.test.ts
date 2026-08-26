@@ -384,6 +384,7 @@ function workspace(
 ): AgenticWorkspaceCapability {
   const base: AgenticWorkspaceCapability = {
     getCompletionGates: async () => ({}),
+    listTaskAcceptance: async () => [],
     freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 4 }),
     ...overrides,
   };
@@ -2907,6 +2908,7 @@ describe("Agentic WORK phase", () => {
         };
         const capability: AgenticWorkspaceCapability = {
           getCompletionGates: async () => ({}),
+          listTaskAcceptance: async () => [],
           preparesCompletionBeforeAcceptance: true,
           ...(api === "accept"
             ? { acceptCompletionFixedPoint: completeApi }
@@ -6184,7 +6186,13 @@ describe("Agentic WORK phase", () => {
           kind: "all" as const,
           children: [
             { kind: "preset_variable" as const, name: "child_active", operator: "equals" as const, value: 1 },
-            { kind: "task_transition" as const, taskId: "fn_required_child", transition: "completed" as const },
+            {
+              kind: "any" as const,
+              children: [
+                { kind: "task_transition" as const, taskId: "fn_required_child", transition: "completed" as const },
+                { kind: "task_transition" as const, taskId: "fn_required_child", transition: "failed" as const },
+              ],
+            },
           ],
         },
         { kind: "preset_variable" as const, name: "child_active", operator: "equals" as const, value: 0 },
@@ -6223,7 +6231,7 @@ describe("Agentic WORK phase", () => {
       plan: nestedPlan,
       workspace: workspace({
         listTaskAcceptance: async () => [childTask],
-        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4),
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4, { fn_required_child: "failed" }),
         freezeForCompletion: async ({ expectedRevision }) => ({
           accepted: true,
           workspaceRevision: expectedRevision ?? 4,
@@ -6268,7 +6276,7 @@ describe("Agentic WORK phase", () => {
           canComplete: false,
         }),
         listTaskAcceptance: async () => [childTask],
-        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4),
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4, { fn_required_child: "failed" }),
         freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 4 }),
       }),
       phaseEvaluationContext: phaseContext({ child_active: 1 as unknown as boolean }),
@@ -6284,6 +6292,7 @@ describe("Agentic WORK phase", () => {
     expect(blockedPayloads[0]).toMatchObject({
       errorCode: "completion_blocked",
       currentPhaseId: "nested_phase",
+      openRequiredTaskIds: ["fn_required_child"],
     });
   });
 
@@ -6382,12 +6391,22 @@ describe("Agentic WORK phase", () => {
     expect(results.some((entry) => entry.includes("currentPhaseId"))).toBe(false);
   });
 
-  test("fails closed when task acceptance capability is missing on a valid true exit", async () => {
-    const outcome = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("acceptance-missing")]), {
+  test("fails fatal invalid_plan when a true exit depends on nested not(task_transition)", async () => {
+    const results: string[] = [];
+    const outcome = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("negated-required")]), {
       plan: plan({
         customPhasePlan: compileAgentRuntimePhases([
           customPhase("live-phase", ["workspace_write"], {
-            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            exit: {
+              kind: "all",
+              children: [
+                {
+                  kind: "not",
+                  child: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+                },
+                { kind: "generation_type", value: "normal" },
+              ],
+            },
             nextPhaseIds: ["next-phase"],
           }),
           customPhase("next-phase", [], {
@@ -6396,18 +6415,148 @@ describe("Agentic WORK phase", () => {
         ]),
       }),
       workspace: workspace({
-        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4, { fn_evidence: "completed" }),
+        listTaskAcceptance: async () => [{
+          id: "turn:fn_evidence",
+          templateId: "fn_evidence",
+          required: true,
+          state: "active",
+          completionAccepted: false,
+        }],
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4, { fn_evidence: "failed" }),
       }),
       phaseEvaluationContext: phaseContext(),
       phaseRevision: 4,
+      inspection: {
+        record: (_kind, value) => {
+          if (value && typeof value === "object" && "result" in value && typeof value.result === "string") {
+            results.push(value.result);
+          }
+          return null;
+        },
+      },
     }));
     expect(outcome.status).toBe("failed");
     expect(outcome.code).toBe("invalid_plan");
-    expect(outcome.observations.find((item) => item.callId === "acceptance-missing")).toMatchObject({
-      status: "rejected",
-      code: "invalid_plan",
+    expect(results.some((entry) => entry.includes("invalid_plan"))).toBe(true);
+    expect(results.some((entry) => entry.includes("completion_blocked"))).toBe(false);
+    expect(results.some((entry) => entry.includes("openRequiredTaskIds"))).toBe(false);
+  });
+
+  test("does not block unrelated failed root settlement when phase evidence is unavailable", async () => {
+    const mutations: string[] = [];
+    let snapshotReads = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      return response("", [call("workspace_submit_root_result", "unrelated-fail", {
+        taskId: "other_task",
+        state: "failed",
+        summary: "unrelated failure",
+      })]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("gating-phase", ["workspace_write"], {
+            exit: {
+              kind: "any",
+              children: [
+                { kind: "task_transition", taskId: "fn_gating", transition: "completed" },
+                { kind: "task_transition", taskId: "fn_gating", transition: "failed" },
+              ],
+            },
+            nextPhaseIds: [],
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        listTaskAcceptance: async () => [{
+          id: "other_task",
+          templateId: "other_task",
+          required: true,
+          state: "active",
+          completionAccepted: false,
+        }],
+        getPhaseEvaluationSnapshot: async () => {
+          snapshotReads += 1;
+          if (snapshotReads > 1) throw new Error("phase snapshot unavailable");
+          return phaseSnapshot(4);
+        },
+        applyCognitionWorkspaceTransition: async ({ taskId, transition }) => {
+          mutations.push(`${taskId}:${transition}`);
+          return {
+            result: { accepted: true },
+            cognition: { workspaceRevision: 5 },
+          };
+        },
+      }),
+      workspaceCapabilities: ["submit_root_result"],
+      phaseEvaluationContext: phaseContext(),
+      phaseAdmittedCapabilities: ["workspace_write"],
+      phaseRevision: 4,
+      budget: { maxProviderRounds: 1, maxUnsignedBoundaries: 1 },
+    }));
+    expect(mutations).toEqual(["other_task:failed"]);
+    expect(result.observations.find((item) => item.callId === "unrelated-fail")).toMatchObject({
+      status: "success",
     });
   });
+
+  test("rejects referenced failed root settlement when phase evidence is unavailable", async () => {
+    const mutations: string[] = [];
+    let snapshotReads = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      return response("", [call("workspace_submit_root_result", "referenced-fail", {
+        taskId: "fn_gating",
+        state: "failed",
+        summary: "gating failure",
+      })]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("gating-phase", ["workspace_write"], {
+            exit: {
+              kind: "any",
+              children: [
+                { kind: "task_transition", taskId: "fn_gating", transition: "completed" },
+                { kind: "task_transition", taskId: "fn_gating", transition: "failed" },
+              ],
+            },
+            nextPhaseIds: [],
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        listTaskAcceptance: async () => [{
+          id: "turn:fn_gating",
+          templateId: "fn_gating",
+          required: true,
+          state: "active",
+          completionAccepted: false,
+        }],
+        getPhaseEvaluationSnapshot: async () => {
+          snapshotReads += 1;
+          if (snapshotReads > 1) throw new Error("phase snapshot unavailable");
+          return phaseSnapshot(4, { fn_gating: "failed" });
+        },
+        applyCognitionWorkspaceTransition: async ({ taskId, transition }) => {
+          mutations.push(`${taskId}:${transition}`);
+          return {
+            result: { accepted: true },
+            cognition: { workspaceRevision: 5 },
+          };
+        },
+      }),
+      workspaceCapabilities: ["submit_root_result"],
+      phaseEvaluationContext: phaseContext(),
+      phaseAdmittedCapabilities: ["workspace_write"],
+      phaseRevision: 4,
+      budget: { maxProviderRounds: 1, maxUnsignedBoundaries: 1 },
+    }));
+    expect(mutations).toEqual([]);
+    expect(result.observations.find((item) => item.callId === "referenced-fail")).toMatchObject({
+      status: "error",
+      code: "completion_blocked",
+    });
+  });
+
 
 
 

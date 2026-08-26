@@ -996,7 +996,7 @@ export interface AgenticWorkspaceCapability {
   readonly listRequiredOpenTasks?: (
     context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
   ) => readonly unknown[] | Promise<readonly unknown[]>;
-  readonly listTaskAcceptance?: (
+  readonly listTaskAcceptance: (
     context: { readonly frame: AgenticWorkFrame; readonly signal: AbortSignal },
   ) => readonly WorkspaceTaskAcceptanceV1[] | Promise<readonly WorkspaceTaskAcceptanceV1[]>;
   readonly getUnacceptedSubmissions?: (
@@ -2388,7 +2388,8 @@ async function recoverableCompletionBlockedResultFor(
 }
 interface ExitWitnessResult {
   readonly satisfied: boolean;
-  readonly refs: readonly string[];
+  readonly positiveRefs: readonly string[];
+  readonly negativeRefs: readonly string[];
   readonly invalid: boolean;
 }
 
@@ -2403,60 +2404,88 @@ function uniqueWitnessRefs(refs: readonly string[]): string[] {
   return result;
 }
 
+function collectPredicateTaskIds(
+  predicate: CognitionPredicateV1,
+  into: Set<string> = new Set(),
+): Set<string> {
+  switch (predicate.kind) {
+    case "all":
+    case "any":
+      for (const child of predicate.children) collectPredicateTaskIds(child, into);
+      break;
+    case "not":
+      collectPredicateTaskIds(predicate.child, into);
+      break;
+    case "task_transition":
+      into.add(predicate.taskId);
+      break;
+    default:
+      break;
+  }
+  return into;
+}
+
 function collectExitWitnesses(
   predicate: CognitionPredicateV1,
   context: CognitionEvaluationContextV1,
 ): ExitWitnessResult {
   const empty = (satisfied: boolean, invalid = false): ExitWitnessResult => ({
     satisfied,
-    refs: Object.freeze([]),
+    positiveRefs: Object.freeze([]),
+    negativeRefs: Object.freeze([]),
     invalid,
+  });
+  const merge = (
+    satisfied: boolean,
+    children: readonly ExitWitnessResult[],
+  ): ExitWitnessResult => ({
+    satisfied,
+    positiveRefs: Object.freeze(uniqueWitnessRefs(children.flatMap((child) => [...child.positiveRefs]))),
+    negativeRefs: Object.freeze(uniqueWitnessRefs(children.flatMap((child) => [...child.negativeRefs]))),
+    invalid: false,
   });
   try {
     switch (predicate.kind) {
       case "all": {
         const children = predicate.children.map((child) => collectExitWitnesses(child, context));
         if (children.some((child) => child.invalid)) return empty(false, true);
-        if (children.some((child) => !child.satisfied && child.refs.length === 0)) {
+        if (children.some((child) => (
+          !child.satisfied
+          && child.positiveRefs.length === 0
+          && child.negativeRefs.length === 0
+        ))) {
           return empty(false);
         }
-        return {
-          satisfied: children.every((child) => child.satisfied),
-          refs: Object.freeze(uniqueWitnessRefs(children.flatMap((child) => [...child.refs]))),
-          invalid: false,
-        };
+        return merge(children.every((child) => child.satisfied), children);
       }
       case "any": {
         const children = predicate.children.map((child) => collectExitWitnesses(child, context));
         if (children.some((child) => child.invalid)) return empty(false, true);
         const satisfiedChildren = children.filter((child) => child.satisfied);
-        if (satisfiedChildren.some((child) => child.refs.length === 0)) return empty(true);
-        if (satisfiedChildren.length > 0) {
-          return {
-            satisfied: true,
-            refs: Object.freeze(uniqueWitnessRefs(satisfiedChildren.flatMap((child) => [...child.refs]))),
-            invalid: false,
-          };
+        if (satisfiedChildren.some((child) => (
+          child.positiveRefs.length === 0
+          && child.negativeRefs.length === 0
+        ))) {
+          return empty(true);
         }
-        return {
-          satisfied: false,
-          refs: Object.freeze(uniqueWitnessRefs(children.flatMap((child) => [...child.refs]))),
-          invalid: false,
-        };
+        if (satisfiedChildren.length > 0) return merge(true, satisfiedChildren);
+        return merge(false, children);
       }
       case "not": {
         const child = collectExitWitnesses(predicate.child, context);
         if (child.invalid) return empty(false, true);
         return {
           satisfied: !child.satisfied,
-          refs: child.refs,
+          positiveRefs: child.negativeRefs,
+          negativeRefs: child.positiveRefs,
           invalid: false,
         };
       }
       case "task_transition":
         return {
           satisfied: context.taskTransitions[predicate.taskId] === predicate.transition,
-          refs: Object.freeze([predicate.taskId]),
+          positiveRefs: Object.freeze([predicate.taskId]),
+          negativeRefs: Object.freeze([]),
           invalid: false,
         };
       case "generation_type":
@@ -2497,6 +2526,13 @@ function unsatisfiedRequiredGatingIds(
     ids.push(id);
   }
   return ids;
+}
+
+function requiredMaterializedTask(
+  ref: string,
+  rows: readonly WorkspaceTaskAcceptanceV1[],
+): boolean {
+  return resolveTaskAcceptance(ref, rows)?.required === true;
 }
 
 type FailedRootSettlementGuard = (taskId: string) => Promise<Record<string, unknown> | null>;
@@ -5575,12 +5611,13 @@ export async function runAgenticWorkPhase(
       signal,
     });
     const readTaskAcceptanceRequired = async (): Promise<readonly WorkspaceTaskAcceptanceV1[]> => {
-      if (!options.workspace?.listTaskAcceptance) {
+      const workspace = options.workspace;
+      if (!workspace) {
         throw new AgenticWorkPhaseError("invalid_plan", "workspace task acceptance is unavailable");
       }
       try {
         const rows = await abortable(
-          Promise.resolve(options.workspace.listTaskAcceptance({ frame: rootFrame, signal })),
+          Promise.resolve(workspace.listTaskAcceptance({ frame: rootFrame, signal })),
           signal,
         );
         if (!Array.isArray(rows)) {
@@ -5597,46 +5634,48 @@ export async function runAgenticWorkPhase(
       if (!phaseMachine || phaseMachine.state().status !== "entered") return null;
       const phase = phaseMachine.currentPhase();
       if (!phase) return null;
-      const input = await readPhaseInput("WORK");
-      if (!input || input.snapshotAvailable === false) {
-        return recoverableCompletionBlockedResultFor(
-          options.workspace,
-          rootFrame,
-          phase.id,
-        );
+      const syntacticRefs = collectPredicateTaskIds(phase.exit);
+      let rows: readonly WorkspaceTaskAcceptanceV1[] | undefined;
+      const syntacticallyNamed = syntacticRefs.has(taskId);
+      if (!syntacticallyNamed) {
+        try {
+          rows = await readTaskAcceptanceRequired();
+        } catch (error) {
+          if (signal.aborted) throw error;
+          return null;
+        }
+        const mapped = rows.find((item) => item.id === taskId || item.templateId === taskId);
+        if (!mapped) return null;
+        if (!(
+          (mapped.templateId !== null && syntacticRefs.has(mapped.templateId))
+          || syntacticRefs.has(mapped.id)
+        )) {
+          return null;
+        }
       }
-      const witnesses = collectExitWitnesses(phase.exit, input.context);
-      if (witnesses.invalid) {
-        return recoverableCompletionBlockedResultFor(
-          options.workspace,
-          rootFrame,
-          phase.id,
-        );
-      }
-      const referenced = witnesses.refs.some((ref) => ref === taskId);
-      let rows: readonly WorkspaceTaskAcceptanceV1[];
-      try {
-        rows = await readTaskAcceptanceRequired();
-      } catch (error) {
-        if (signal.aborted) throw error;
-        return recoverableCompletionBlockedResultFor(
-          options.workspace,
-          rootFrame,
-          phase.id,
-          referenced ? [taskId] : witnesses.refs,
-        );
-      }
-      const row = rows.find((item) => item.id === taskId || item.templateId === taskId);
-      if (!row || !row.required || row.state !== "active") return null;
-      const witnessHit = witnesses.refs.some((ref) => ref === row.templateId || ref === row.id);
-      if (!witnessHit) return null;
-      return recoverableCompletionBlockedResultFor(
+      const blocked = (extraTaskIds: readonly string[] = []) => recoverableCompletionBlockedResultFor(
         options.workspace,
         rootFrame,
         phase.id,
-        unsatisfiedRequiredGatingIds(witnesses.refs, rows),
+        extraTaskIds,
       );
+      const input = await readPhaseInput("WORK");
+      if (!input || input.snapshotAvailable === false) return blocked(syntacticallyNamed ? [taskId] : []);
+      const witnesses = collectExitWitnesses(phase.exit, input.context);
+      if (witnesses.invalid) return blocked(syntacticallyNamed ? [taskId] : []);
+      try {
+        rows = rows ?? await readTaskAcceptanceRequired();
+      } catch (error) {
+        if (signal.aborted) throw error;
+        return blocked(syntacticallyNamed ? [taskId] : []);
+      }
+      const row = rows.find((item) => item.id === taskId || item.templateId === taskId);
+      if (!row || !row.required || row.state !== "active") return null;
+      const witnessHit = witnesses.positiveRefs.some((ref) => ref === row.templateId || ref === row.id);
+      if (!witnessHit) return null;
+      return blocked(unsatisfiedRequiredGatingIds(witnesses.positiveRefs, rows));
     };
+
 
 
     if (!state.reserveChildIds([turnRootFrameId])) {
@@ -6616,12 +6655,14 @@ export async function runAgenticWorkPhase(
                     const witnesses = collectExitWitnesses(phase.exit, phaseInput.context);
                     if (witnesses.invalid) {
                       phaseCompletionFailed = true;
-                    } else if (witnesses.refs.length > 0) {
+                    } else if (witnesses.positiveRefs.length > 0 || witnesses.negativeRefs.length > 0) {
                       try {
-                        gatingUnsatisfied = unsatisfiedRequiredGatingIds(
-                          witnesses.refs,
-                          await readTaskAcceptanceRequired(),
-                        );
+                        const rows = await readTaskAcceptanceRequired();
+                        if (witnesses.negativeRefs.some((ref) => requiredMaterializedTask(ref, rows))) {
+                          phaseCompletionFailed = true;
+                        } else {
+                          gatingUnsatisfied = unsatisfiedRequiredGatingIds(witnesses.positiveRefs, rows);
+                        }
                       } catch (error) {
                         if (signal.aborted) throw error;
                         phaseCompletionFailed = true;

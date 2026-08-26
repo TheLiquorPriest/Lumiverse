@@ -2140,7 +2140,7 @@ export function listWorkspaceTaskAcceptanceV1(raw: unknown): readonly WorkspaceT
     const taskTable = quoteIdentifier("agent_workspace_tasks");
     const submissionTable = quoteIdentifier("agent_workspace_submissions");
     const sql = submissionsAvailable
-      ? `SELECT t.*, CASE WHEN EXISTS (
+      ? `SELECT t.*, CASE WHEN t.state = 'completed' AND EXISTS (
            SELECT 1 FROM ${submissionTable} s
            WHERE s.workspace_id = t.workspace_id
              AND s.user_id = t.user_id
@@ -2171,7 +2171,7 @@ export function listWorkspaceTaskAcceptanceV1(raw: unknown): readonly WorkspaceT
         templateId,
         required: task.required,
         state: task.state,
-        completionAccepted: Number(candidate.completion_accepted) === 1,
+        completionAccepted: task.state === "completed" && Number(candidate.completion_accepted) === 1,
       });
     });
   })();
