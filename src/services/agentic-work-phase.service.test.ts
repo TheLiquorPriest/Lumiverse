@@ -13,7 +13,7 @@ import type {
 import type { WorkCouncilExecutionResult } from "./work-council.service";
 import type { CognitionEvaluationContextV1, CognitionTaskTransition } from "../types/agent-cognition";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
-import { AGENT_SYSTEM_PROMPT_MAX_BYTES, createDisabledAgentConfigV2 } from "../types/agents";
+import { AGENT_SYSTEM_PROMPT_MAX_BYTES, createDisabledAgentConfigV2, parseAgentConfigV2, type AgentConfigV2 } from "../types/agents";
 import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import type { GenerationResponse, LlmMessage, ProviderTransientCarrier, ToolCallResult } from "../llm/types";
 import {
@@ -136,6 +136,7 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
     id: phase.id,
     label: phase.label,
     instructionRefs: phase.instructionRefs,
+    childInstructionSubsets: phase.childInstructionSubsets ?? [],
     required: phase.required,
     enter: phase.enter,
     exit: phase.exit,
@@ -150,12 +151,10 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
     content: block.content,
     role: "system" as const,
     enabled: true,
-    position: "post_history" as const,
+    position: "chat" as const,
     depth: 0,
-    marker: null,
-    sealed: false,
-    isLocked: false,
-    color: null,
+    scanDepth: 0,
+    roleOverride: null,
     injectionTrigger: [],
     group: null,
     order: block.source.promptOrder,
@@ -184,7 +183,7 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
   const baseConfig = createDisabledAgentConfigV2();
   const agentConfig = runtimePolicy === undefined
     ? null
-    : { ...baseConfig, runtimePolicy };
+    : parseAgentConfigV2({ ...baseConfig, runtimePolicy });
   const messages = candidate.messages
     .filter((message) => message.provenance.kind === "history")
     .map((message, index) => {
@@ -323,11 +322,15 @@ function baseOptions(
   const authoredPlan = overrides.plan ?? plan();
   const snapshot = overrides.snapshot ?? snapshotForPlan(authoredPlan);
   const source = snapshot.agentCognition.cognitionSource;
+  const parsedConfig = snapshot.agentConfig as AgentConfigV2 | null;
   const selectedPlan: AssemblyPlanV1 = {
     ...authoredPlan,
     customPhasePlan: compileAgentRuntimePhases(
-      authoredPlan.customPhasePlan.phases,
-      source === null ? undefined : { source },
+      parsedConfig?.runtimePolicy?.phases ?? authoredPlan.customPhasePlan.phases,
+      {
+        source,
+        profileIds: parsedConfig?.profiles.map((profile) => profile.id),
+      },
     ),
   };
   return {
@@ -5690,6 +5693,7 @@ describe("Agentic WORK phase", () => {
     expect(requests[0]?.maxOutputTokens).toBe(8);
     expect(requests[1]?.maxOutputTokens).toBe(8);
     expect(result.code).not.toBe("child_output_limit_exceeded");
+    expect(result.code).not.toBe("root_output_limit_exceeded");
   });
 
   test("exhausts the billed fuse before another dispatch after cumulative completion tokens", async () => {
@@ -5707,7 +5711,7 @@ describe("Agentic WORK phase", () => {
       budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
     }));
     expect(result.status).toBe("exhausted");
-    expect(result.code).toBe("child_output_limit_exceeded");
+    expect(result.code).toBe("root_output_limit_exceeded");
     expect(result.errorMessage).toContain("16");
     expect(result.errorMessage).toContain("maxOutputTokens × maxUnsignedBoundaries");
     expect(round).toBe(2);
@@ -5729,15 +5733,50 @@ describe("Agentic WORK phase", () => {
       budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
     }));
     expect(result.status).toBe("exhausted");
-    expect(result.code).toBe("child_output_limit_exceeded");
+    expect(result.code).toBe("root_output_limit_exceeded");
     expect(round).toBe(2);
   });
 
-  test("keeps missing usage conservative so unsigned boundaries still govern empty rounds", async () => {
+  test("charges missing length usage at the dispatch max_tokens cap", async () => {
     let round = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       round += 1;
       return { content: "", finish_reason: "length" };
+    }, {
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
+    }));
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("root_output_limit_exceeded");
+    expect(result.errorMessage).toContain("16");
+    expect(round).toBe(2);
+  });
+
+  test("charges underreported length usage at the dispatch max_tokens cap", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return {
+        content: "",
+        finish_reason: "length",
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      };
+    }, {
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
+    }));
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("root_output_limit_exceeded");
+    expect(round).toBe(2);
+  });
+
+  test("keeps missing non-length usage conservative so unsigned boundaries still govern empty rounds", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return { content: "", finish_reason: "stop" };
     }, {
       workspace: workspace(),
       workspaceCapabilities: [],
@@ -5766,7 +5805,7 @@ describe("Agentic WORK phase", () => {
     }));
     expect(round).toBe(2);
     expect(result.status).toBe("exhausted");
-    expect(result.code).toBe("child_output_limit_exceeded");
+    expect(result.code).toBe("root_output_limit_exceeded");
   });
 
   test("does not apply the root billed fuse to child frames", async () => {
@@ -5789,9 +5828,14 @@ describe("Agentic WORK phase", () => {
       }),
     });
     expect(child.code).not.toBe("child_output_limit_exceeded");
+    expect(child.code).not.toBe("root_output_limit_exceeded");
   });
 
   test("enriches recoverable completion_blocked with phase, tools, and open task ids then accepts after settlement", async () => {
+    const exerciseRef = phaseRef("exercise-phase", 0);
+    const collaborateRef = phaseRef("collaborate-phase", 1);
+    const workspaceRevision = { value: 4 };
+    const taskTransitions: Record<string, CognitionTaskTransition> = {};
     const openIds = { value: ["turn:fn_baseline"] as string[] };
     const blockedPayloads: Record<string, unknown>[] = [];
     let dispatchCount = 0;
@@ -5812,40 +5856,120 @@ describe("Agentic WORK phase", () => {
         }
       }
       if (dispatchCount === 1) {
-        expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["complete_turn", "chat_search_history"]));
+        expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["complete_turn", "workspace_accept_submission"]));
         expect(tools.map((tool) => tool.name)).not.toContain("agent_delegate");
         return response("", [complete("early-complete")]);
       }
       if (dispatchCount === 2) {
-        return response("", [call("chat_search_history", "clear-gate", { query: "x" })]);
+        return response("", [call("workspace_accept_submission", "settle-evidence", {
+          submissionId: "submission-1",
+          taskId: "fn_evidence",
+        })]);
       }
       return response("", [complete("after-settle")]);
     }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("exercise-phase", ["workspace_write"], {
+            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            instructionRefs: [exerciseRef],
+            nextPhaseIds: ["collaborate-phase"],
+          }),
+          customPhase("collaborate-phase", ["delegation"], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [collaborateRef],
+          }),
+        ]),
+        loomBlocks: [
+          phaseBlock(exerciseRef, "EXERCISE_PHASE_INSTRUCTION"),
+          phaseBlock(collaborateRef, "COLLABORATE_PHASE_INSTRUCTION"),
+        ],
+      }),
       workspace: workspace({
         getCompletionGates: async () => ({
           requiredOpenTasks: openIds.value.length,
           openRequiredTaskIds: openIds.value,
           canComplete: openIds.value.length === 0,
         }),
-        freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(workspaceRevision.value, taskTransitions),
+        applyCognitionWorkspaceTransition: async ({ taskId, transition }) => {
+          expect(taskId).toBe("fn_evidence");
+          expect(transition).toBe("completed");
+          taskTransitions[taskId] = transition;
+          openIds.value = [];
+          workspaceRevision.value += 1;
+          return {
+            result: { accepted: true },
+            cognition: { workspaceRevision: workspaceRevision.value },
+          };
+        },
+        freezeForCompletion: async ({ expectedRevision }) => ({
+          accepted: true,
+          workspaceRevision: expectedRevision ?? workspaceRevision.value,
+        }),
       }),
-      coreToolCapability: { execute: async () => { openIds.value = []; return []; } },
+      workspaceCapabilities: ["accept_submission"],
+      phaseEvaluationContext: phaseContext(),
+      phaseAdmittedCapabilities: ["workspace_write", "delegation"],
+      phaseRevision: 4,
     }));
     expect(result.status).toBe("completed");
+    expect(result.code).toBeUndefined();
     expect(blockedPayloads.length).toBeGreaterThanOrEqual(1);
     expect(blockedPayloads[0]).toMatchObject({
       status: "error",
       errorCode: "completion_blocked",
       message: "Settle the listed required tasks with admitted tools before retrying complete_turn.",
-      currentPhaseId: null,
+      currentPhaseId: "exercise_phase",
       openRequiredTaskIds: ["turn:fn_baseline"],
     });
     expect(blockedPayloads[0]?.admittedToolNames).toEqual(expect.arrayContaining([
       "complete_turn",
-      "chat_search_history",
+      "workspace_accept_submission",
     ]));
     expect(blockedPayloads[0]?.admittedToolNames).not.toContain("agent_delegate");
+    expect(result.observations.find((item) => item.callId === "early-complete")).toMatchObject({
+      status: "rejected",
+      code: "completion_blocked",
+    });
     expect(result.observations.find((item) => item.callId === "after-settle")?.status).toBe("accepted");
+  });
+
+  test("preserves listRequiredOpenTasks string ids when getCompletionGates is absent", async () => {
+    const blockedPayloads: Record<string, unknown>[] = [];
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+      dispatchCount += 1;
+      if (dispatchCount > 1) {
+        for (const message of messages) {
+          if (!Array.isArray(message.content)) continue;
+          for (const part of message.content) {
+            if (part.type !== "tool_result" || typeof part.content !== "string") continue;
+            try {
+              const parsed = JSON.parse(part.content) as Record<string, unknown>;
+              if (parsed.errorCode === "completion_blocked") blockedPayloads.push(parsed);
+            } catch {
+              // ignore non-JSON
+            }
+          }
+        }
+      }
+      if (dispatchCount === 1) return response("", [complete("list-early")]);
+      return response("", [complete("list-after")]);
+    }, {
+      workspace: workspace({
+        getCompletionGates: undefined,
+        listRequiredOpenTasks: async () => ["turn:from-list", { id: "ignored-object" }],
+        freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
+      }),
+      budget: { maxProviderRounds: 3, maxUnsignedBoundaries: 1 },
+    }));
+    expect(result.status).not.toBe("completed");
+    expect(blockedPayloads.length).toBeGreaterThanOrEqual(1);
+    expect(blockedPayloads[0]).toMatchObject({
+      errorCode: "completion_blocked",
+      openRequiredTaskIds: ["turn:from-list"],
+    });
   });
 
 

@@ -153,6 +153,7 @@ export type AgenticWorkErrorCode =
   | "child_required_failed"
   | "council_required_failed"
   | "child_output_limit_exceeded"
+  | "root_output_limit_exceeded"
   | "child_schedule_invalid"
   | "child_executor_unavailable"
   | "provider_error"
@@ -367,6 +368,25 @@ export function rootBilledOutputFuseLimit(
   }
   return maxOutputTokens * maxUnsignedBoundaries;
 }
+
+function reportedCompletionTokens(usage: GenerationResponse["usage"]): number {
+  const reported = usage?.completion_tokens;
+  return typeof reported === "number" && Number.isSafeInteger(reported) && reported >= 0 ? reported : 0;
+}
+
+function rootBilledCompletionTokens(
+  finishReason: string,
+  dispatchMaxOutputTokens: number,
+  usage: GenerationResponse["usage"],
+  publishedSettlement: number,
+): number {
+  const reported = reportedCompletionTokens(usage);
+  const published = Number.isSafeInteger(publishedSettlement) && publishedSettlement > 0 ? publishedSettlement : 0;
+  const cap = Number.isSafeInteger(dispatchMaxOutputTokens) && dispatchMaxOutputTokens > 0 ? dispatchMaxOutputTokens : 0;
+  if (finishReason === "length") return Math.max(reported, published, cap);
+  return Math.max(reported, published);
+}
+
 
 
 export type AgenticWorkspaceSharing = "root_only" | "view_only";
@@ -3306,8 +3326,10 @@ async function readCompletionGates(
   const submissions = workspace.getUnacceptedSubmissions
     ? await abortable(Promise.resolve(workspace.getUnacceptedSubmissions({ frame, signal: frame.signal })), frame.signal)
     : [];
+  const requiredItems = Array.isArray(required) ? required : [];
   return {
-    requiredOpenTasks: required.length,
+    requiredOpenTasks: requiredItems.length,
+    openRequiredTaskIds: sanitizeOpenRequiredTaskIds(requiredItems),
     unacceptedSubmissions: submissions.length,
   };
 }
@@ -3889,9 +3911,9 @@ const PUBLIC_CHILD_FAILURE_CODES: Record<string, true> = {
   provider_round_budget_exhausted: true,
   workspace_budget_exhausted: true,
   tool_result_limit_exceeded: true,
-  child_required_failed: true,
   council_required_failed: true,
   child_output_limit_exceeded: true,
+  root_output_limit_exceeded: true,
   child_schedule_invalid: true,
   child_executor_unavailable: true,
   provider_error: true,
@@ -5615,7 +5637,7 @@ export async function runAgenticWorkPhase(
       if (state.billedOutputFuseExceeded()) {
         return outcomeAfterPending(
           "exhausted",
-          "child_output_limit_exceeded",
+          "root_output_limit_exceeded",
           state.billedOutputFuseExhaustedMessage(),
         );
       }
@@ -5692,7 +5714,15 @@ export async function runAgenticWorkPhase(
         console.error(`[agentic] root WORK reserve tokens failed: ${accounting.outputTokens} vs ${maxOutputTokens}`);
         return outcomeAfterPending("failed", "child_output_limit_exceeded");
       }
-      if (!state.recordProviderUsage(response.usage, accounting.outputTokens)) {
+      if (!state.recordProviderUsage(
+        response.usage,
+        rootBilledCompletionTokens(
+          response.finish_reason,
+          maxOutputTokens,
+          response.usage,
+          accounting.outputTokens,
+        ),
+      )) {
         return outcomeAfterPending("failed", "provider_protocol_error");
       }
       const billedFuseExhausted = state.billedOutputFuseExceeded();
@@ -5743,7 +5773,7 @@ export async function runAgenticWorkPhase(
         if (billedFuseExhausted) {
           return outcomeAfterPending(
             "exhausted",
-            "child_output_limit_exceeded",
+            "root_output_limit_exceeded",
             state.billedOutputFuseExhaustedMessage(),
           );
         }
@@ -6812,7 +6842,7 @@ export async function runAgenticWorkPhase(
       if (billedFuseExhausted) {
         return outcomeAfterPending(
           "exhausted",
-          "child_output_limit_exceeded",
+          "root_output_limit_exceeded",
           state.billedOutputFuseExhaustedMessage(),
         );
       }

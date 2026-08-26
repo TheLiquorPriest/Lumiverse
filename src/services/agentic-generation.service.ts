@@ -571,6 +571,7 @@ function mapAgenticFailureCode(value: unknown): AgenticFailureCode {
     case "child_executor_unavailable":
       return "agentic_protocol_failure";
     case "child_output_limit_exceeded":
+    case "root_output_limit_exceeded":
     case "completion_control_budget_exhausted":
     case "unsigned_boundary_budget_exhausted":
     case "work_budget_exhausted":
