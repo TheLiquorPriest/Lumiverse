@@ -2824,9 +2824,7 @@
     "loadDocFailed": "Échec du chargement du document content",
     "saveDocFailed": "Échec de l'enregistrement du document",
     "remoteDocumentRemoved": "Ce document a été supprimé.",
-    "remoteDatabankRemoved": "Cette banque de données a été supprimée.",
-    "renameDocFailed": "Impossible de renommer ce document.",
-    "deleteDocFailed": "Impossible de supprimer ce document."
+    "remoteDatabankRemoved": "Cette banque de données a été supprimée."
   },
   "creatorWorkshop": {
     "shared": {

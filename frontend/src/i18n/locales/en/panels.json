@@ -3082,9 +3082,7 @@
     "loadDocFailed": "Failed to load document content",
     "saveDocFailed": "Failed to save document",
     "remoteDocumentRemoved": "This document was removed.",
-    "remoteDatabankRemoved": "This databank was removed.",
-    "renameDocFailed": "Couldn't rename this document.",
-    "deleteDocFailed": "Couldn't delete this document."
+    "remoteDatabankRemoved": "This databank was removed."
   },
   "creatorWorkshop": {
     "shared": {

@@ -2824,9 +2824,7 @@
     "loadDocFailed": "ドキュメント コンテンツのロードに失敗しました",
     "saveDocFailed": "ドキュメントの保存に失敗しました",
     "remoteDocumentRemoved": "このドキュメントは削除されました。",
-    "remoteDatabankRemoved": "このデータバンクは削除されました。",
-    "renameDocFailed": "このドキュメントの名前を変更できませんでした。",
-    "deleteDocFailed": "このドキュメントを削除できませんでした。"
+    "remoteDatabankRemoved": "このデータバンクは削除されました。"
   },
   "creatorWorkshop": {
     "shared": {

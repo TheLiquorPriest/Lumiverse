@@ -2824,9 +2824,7 @@
     "loadDocFailed": "加载文档内容失败",
     "saveDocFailed": "保存文档失败",
     "remoteDocumentRemoved": "该文档已被删除。",
-    "remoteDatabankRemoved": "该资料库已被删除。",
-    "renameDocFailed": "无法重命名此文档。",
-    "deleteDocFailed": "无法删除此文档。"
+    "remoteDatabankRemoved": "该资料库已被删除。"
   },
   "creatorWorkshop": {
     "shared": {

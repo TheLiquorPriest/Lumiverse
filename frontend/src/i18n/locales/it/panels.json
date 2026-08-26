@@ -2832,9 +2832,7 @@
     "loadDocFailed": "Errore nel caricamento del contenuto del documento",
     "saveDocFailed": "Errore nel salvataggio del documento",
     "remoteDocumentRemoved": "Questo documento è stato rimosso.",
-    "remoteDatabankRemoved": "Questo archivio dati è stato rimosso.",
-    "renameDocFailed": "Impossibile rinominare questo documento.",
-    "deleteDocFailed": "Impossibile eliminare questo documento."
+    "remoteDatabankRemoved": "Questo archivio dati è stato rimosso."
   },
   "creatorWorkshop": {
     "shared": {

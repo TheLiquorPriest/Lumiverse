@@ -2824,9 +2824,7 @@
     "loadDocFailed": "加載文檔內容失敗",
     "saveDocFailed": "保存文檔失敗",
     "remoteDocumentRemoved": "該文件已被刪除。",
-    "remoteDatabankRemoved": "該資料庫已被刪除。",
-    "renameDocFailed": "無法重新命名此文件。",
-    "deleteDocFailed": "無法刪除此文件。"
+    "remoteDatabankRemoved": "該資料庫已被刪除。"
   },
   "creatorWorkshop": {
     "shared": {
