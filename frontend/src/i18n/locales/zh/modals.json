@@ -409,15 +409,6 @@
       "dedupeRetainedDestination": "去重后保留的目标",
       "outcomeIncluded": "{{status}}: 生效位置 {{index}}",
       "outcomeDeduplicated": "{{status}}: {{entry}}@{{destination}}",
-      "outcomeReason": {
-        "stale_source": "来源已过时",
-        "invalid_source": "来源无效",
-        "required_source_unavailable": "所需来源不可用",
-        "condition_not_met": "未满足条件",
-        "checkpoint_not_reached": "未到达检查点",
-        "selected": "此目标选用的副本",
-        "destination_overlap": "相同目标重叠"
-      },
       "repairRequired": "需要修复。",
       "repairDetail": "请重新选择并确认此确切区块、预设版本和区块版本。不会替换为更新的区块。",
       "workTextHidden": "仅所有者运行检查器可查看精确的 WORK 专属策略文本。",

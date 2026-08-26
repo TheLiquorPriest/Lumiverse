@@ -409,15 +409,6 @@
       "dedupeRetainedDestination": "Destination conservée après déduplication",
       "outcomeIncluded": "{{status}}: position effective {{index}}",
       "outcomeDeduplicated": "{{status}}: {{entry}}@{{destination}}",
-      "outcomeReason": {
-        "stale_source": "Source obsolète",
-        "invalid_source": "Source non valide",
-        "required_source_unavailable": "Source requise indisponible",
-        "condition_not_met": "Condition non remplie",
-        "checkpoint_not_reached": "Point de contrôle non atteint",
-        "selected": "copie retenue pour la destination",
-        "destination_overlap": "chevauchement de destination"
-      },
       "repairRequired": "Réparation requise.",
       "repairDetail": "Resélectionnez et confirmez ce bloc exact, la révision du preset et la révision du bloc. Aucun bloc plus récent n’a été substitué.",
       "workTextHidden": "Le texte exact de la politique WORK est disponible uniquement dans l’inspecteur d’exécution du propriétaire.",

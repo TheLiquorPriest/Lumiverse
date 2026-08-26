@@ -409,15 +409,6 @@
       "dedupeRetainedDestination": "Destinazione mantenuta dopo la deduplicazione",
       "outcomeIncluded": "{{status}}: posizione effettiva {{index}}",
       "outcomeDeduplicated": "{{status}}: {{entry}}@{{destination}}",
-      "outcomeReason": {
-        "stale_source": "Fonte obsoleta",
-        "invalid_source": "Fonte non valida",
-        "required_source_unavailable": "Fonte richiesta non disponibile",
-        "condition_not_met": "Condizione non soddisfatta",
-        "checkpoint_not_reached": "Checkpoint non raggiunto",
-        "selected": "copia selezionata per la destinazione",
-        "destination_overlap": "sovrapposizione di destinazione"
-      },
       "repairRequired": "Riparazione richiesta.",
       "repairDetail": "Seleziona nuovamente e conferma questo blocco esatto, la revisione del preset e la revisione del blocco. Non è stato sostituito alcun blocco più recente.",
       "workTextHidden": "Il testo esatto della politica WORK è disponibile solo nell’ispettore dell’esecuzione del proprietario.",

@@ -409,15 +409,6 @@
       "dedupeRetainedDestination": "去重後保留的目的地",
       "outcomeIncluded": "{{status}}: 生效位置 {{index}}",
       "outcomeDeduplicated": "{{status}}: {{entry}}@{{destination}}",
-      "outcomeReason": {
-        "stale_source": "來源已過時",
-        "invalid_source": "來源無效",
-        "required_source_unavailable": "所需來源無法使用",
-        "condition_not_met": "未滿足條件",
-        "checkpoint_not_reached": "未到達檢查點",
-        "selected": "此目的地選用的副本",
-        "destination_overlap": "相同目的地重疊"
-      },
       "repairRequired": "需要修復。",
       "repairDetail": "請重新選取並確認此精確區塊、預設版本與區塊版本。不會替換為較新的區塊。",
       "workTextHidden": "精確的 WORK 專屬政策文字僅可在擁有者執行檢查器中查看。",

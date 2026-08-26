@@ -22,6 +22,7 @@ import {
   type BreakdownGroup,
 } from '@/lib/prompt-breakdown'
 import { translateBreakdownGroupLabel } from '@/lib/i18n/breakdownGroupLabel'
+import { formatPromptItemizerOutcomeReason } from '@/lib/i18n/promptItemizerOutcome'
 import { getAnthropicBreakdownCacheHints, getAnthropicCacheUsageSummary } from '@/lib/anthropic-breakdown-cache'
 import { getNanoGptCacheUsageSummary } from '@/lib/nanogpt-breakdown-cache'
 import { copyTextToClipboard } from '@/lib/clipboard'
@@ -57,6 +58,7 @@ function countLines(content: string): number {
 export default function PromptItemizerModal() {
   const { t } = useTranslation('modals', { keyPrefix: 'promptItemizer' })
   const { t: ts } = useTranslation('modals', { keyPrefix: 'shared' })
+  const { t: tChat } = useTranslation('chat')
 
   const modalProps = useStore((s) => s.modalProps)
   const closeModal = useStore((s) => s.closeModal)
@@ -873,10 +875,7 @@ export default function PromptItemizerModal() {
                             ? t('ar007.outcomeIncluded', { status: outcomeStatus, index: item.outcome.effectiveIndex + 1 })
                             : item.outcome.status === 'deduplicated'
                               ? t('ar007.outcomeDeduplicated', { status: outcomeStatus, entry: item.outcome.keptEntryId, destination: item.outcome.destination })
-                              : t('ar007.outcomeReason', {
-                                  status: outcomeStatus,
-                                  reason: t(`ar007.outcomeReason.${item.outcome.reason}`, { defaultValue: item.outcome.reason }),
-                                })
+                              : formatPromptItemizerOutcomeReason(outcomeStatus, item.outcome.reason, tChat)
 
                           const repairRequired = outcomeReason === 'stale_source'
                             || outcomeReason === 'invalid_source'
@@ -932,7 +931,7 @@ export default function PromptItemizerModal() {
                                 </div>
                                 <div>
                                   <dt>{t('ar007.outcomeReasonLabel')}</dt>
-                                  <dd><code>{outcomeReason ? t(`ar007.outcomeReason.${outcomeReason}`, { defaultValue: outcomeReason }) : t('ar007.notApplicable')}</code></dd>
+                                  <dd><code>{outcomeReason ? tChat(`ownerInspection.values.${outcomeReason}`, { defaultValue: outcomeReason }) : t('ar007.notApplicable')}</code></dd>
                                 </div>
                                 {item.outcome.status === 'deduplicated' ? (
                                   <>

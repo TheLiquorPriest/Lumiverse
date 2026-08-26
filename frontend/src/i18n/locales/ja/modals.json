@@ -409,15 +409,6 @@
       "dedupeRetainedDestination": "重複排除で保持された宛先",
       "outcomeIncluded": "{{status}}: 有効位置 {{index}}",
       "outcomeDeduplicated": "{{status}}: {{entry}}@{{destination}}",
-      "outcomeReason": {
-        "stale_source": "古いソース",
-        "invalid_source": "無効なソース",
-        "required_source_unavailable": "必須ソースを利用できません",
-        "condition_not_met": "条件未達成",
-        "checkpoint_not_reached": "チェックポイント未到達",
-        "selected": "宛先で選択されたコピー",
-        "destination_overlap": "同一宛先の重複"
-      },
       "repairRequired": "修復が必要です。",
       "repairDetail": "この正確なブロック、プリセットリビジョン、ブロックリビジョンを再選択して確認してください。より新しいブロックへの置き換えは行われていません。",
       "workTextHidden": "正確な WORK 専用ポリシーテキストは所有者の実行インスペクターでのみ確認できます。",

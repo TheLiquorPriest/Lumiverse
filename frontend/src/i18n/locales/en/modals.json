@@ -420,15 +420,6 @@
       "dedupeRetainedDestination": "Dedupe retained destination",
       "outcomeIncluded": "{{status}}: effective {{index}}",
       "outcomeDeduplicated": "{{status}}: {{entry}}@{{destination}}",
-      "outcomeReason": {
-        "stale_source": "stale source",
-        "invalid_source": "invalid source",
-        "required_source_unavailable": "required source unavailable",
-        "condition_not_met": "condition not met",
-        "checkpoint_not_reached": "checkpoint not reached",
-        "selected": "selected destination copy",
-        "destination_overlap": "same destination overlap"
-      },
       "repairRequired": "Repair required.",
       "repairDetail": "Reselect and confirm this exact block, preset revision, and block revision. No newer block was substituted.",
       "workTextHidden": "Exact WORK-only policy text is available only in the owner run inspector.",
