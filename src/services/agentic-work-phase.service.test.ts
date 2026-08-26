@@ -6067,15 +6067,18 @@ describe("Agentic WORK phase", () => {
         return response("", [call("workspace_submit_root_result", "fail-settle", {
           taskId: "fn_gating",
           state: "failed",
+          summary: "attempted failed settlement",
         })]);
       }
       if (dispatchCount === 3) {
         expect(gatingTask.state).toBe("active");
         expect(gatingTask.completionAccepted).toBe(false);
         expect(mutations).toEqual([]);
-        return response("", [call("workspace_accept_submission", "accept-gating", {
-          submissionId: "submission-gating",
+        expect(workspaceRevision.value).toBe(4);
+        return response("", [call("workspace_submit_root_result", "complete-settle", {
           taskId: "fn_gating",
+          state: "completed",
+          summary: "accepted gating evidence",
         })]);
       }
       return response("", [complete(`after-accept-${dispatchCount}`)]);
@@ -6171,7 +6174,7 @@ describe("Agentic WORK phase", () => {
     });
   });
 
-  test("nested conditional required child refs gate only when materialized", async () => {
+  test("nested conditional required child refs gate only on the active branch", async () => {
     const nestRef = phaseRef("nested-phase", 0);
     const afterRef = phaseRef("after-nested", 1);
     const nestedExit = {
@@ -6204,15 +6207,22 @@ describe("Agentic WORK phase", () => {
         phaseBlock(afterRef, "AFTER_NESTED_INSTRUCTION"),
       ],
     });
-    let absentDispatch = 0;
-    const absent = await runAgenticWorkPhase(baseOptions(async () => {
-      absentDispatch += 1;
-      return response("", [complete(`absent-child-${absentDispatch}`)]);
+    const childTask = {
+      id: "turn:fn_required_child",
+      templateId: "fn_required_child",
+      required: true,
+      state: "active" as const,
+      completionAccepted: false,
+    };
+    let inactiveDispatch = 0;
+    const inactive = await runAgenticWorkPhase(baseOptions(async () => {
+      inactiveDispatch += 1;
+      return response("", [complete(`inactive-child-${inactiveDispatch}`)]);
     }, {
-      rootFrameId: "nested-absent",
+      rootFrameId: "nested-inactive",
       plan: nestedPlan,
       workspace: workspace({
-        listTaskAcceptance: async () => [],
+        listTaskAcceptance: async () => [childTask],
         getPhaseEvaluationSnapshot: async () => phaseSnapshot(4),
         freezeForCompletion: async ({ expectedRevision }) => ({
           accepted: true,
@@ -6224,21 +6234,14 @@ describe("Agentic WORK phase", () => {
       phaseRevision: 4,
       budget: { maxProviderRounds: 3, maxUnsignedBoundaries: 2 },
     }));
-    expect(absent.status).toBe("completed");
-    expect(absent.observations.find((item) => item.callId === "absent-child-1")).toMatchObject({
+    expect(inactive.status).toBe("completed");
+    expect(inactive.observations.find((item) => item.callId === "inactive-child-1")).toMatchObject({
       status: "success",
     });
 
-    const childTask = {
-      id: "turn:fn_required_child",
-      templateId: "fn_required_child",
-      required: true,
-      state: "active" as const,
-      completionAccepted: false,
-    };
     const blockedPayloads: Record<string, unknown>[] = [];
     let dispatchCount = 0;
-    const materialized = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+    const active = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
       dispatchCount += 1;
       if (dispatchCount > 1) {
         for (const message of messages) {
@@ -6254,9 +6257,9 @@ describe("Agentic WORK phase", () => {
           }
         }
       }
-      return response("", [complete("materialized-child")]);
+      return response("", [complete("active-child")]);
     }, {
-      rootFrameId: "nested-materialized",
+      rootFrameId: "nested-active",
       plan: nestedPlan,
       workspace: workspace({
         getCompletionGates: async () => ({
@@ -6268,24 +6271,23 @@ describe("Agentic WORK phase", () => {
         getPhaseEvaluationSnapshot: async () => phaseSnapshot(4),
         freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 4 }),
       }),
-      phaseEvaluationContext: phaseContext({ child_active: 0 as unknown as boolean }),
+      phaseEvaluationContext: phaseContext({ child_active: 1 as unknown as boolean }),
       phaseAdmittedCapabilities: ["workspace_write"],
       phaseRevision: 4,
       budget: { maxProviderRounds: 2, maxUnsignedBoundaries: 1 },
     }));
-    expect(materialized.status).not.toBe("completed");
-    expect(materialized.observations.find((item) => item.callId === "materialized-child")).toMatchObject({
+    expect(active.status).not.toBe("completed");
+    expect(active.observations.find((item) => item.callId === "active-child")).toMatchObject({
       status: "rejected",
       code: "completion_blocked",
     });
     expect(blockedPayloads[0]).toMatchObject({
       errorCode: "completion_blocked",
       currentPhaseId: "nested_phase",
-      openRequiredTaskIds: ["fn_required_child"],
     });
   });
 
-  test("keeps fatal invalid_plan unenriched when required gating tasks are also open", async () => {
+  test("keeps fatal invalid_plan when COMPLETE snapshot throws with an open required ref", async () => {
     const results: string[] = [];
     const outcome = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("invalid-with-gating")]), {
       plan: plan({
@@ -6339,7 +6341,75 @@ describe("Agentic WORK phase", () => {
     expect(results.some((entry) => entry.includes("secret-task"))).toBe(false);
     expect(results.some((entry) => entry.includes("openRequiredTaskIds"))).toBe(false);
     expect(results.some((entry) => entry.includes("currentPhaseId"))).toBe(false);
+    expect(results.some((entry) => entry.includes("completion_blocked"))).toBe(false);
   });
+
+  test("fails closed when task acceptance read throws on a valid true exit", async () => {
+    const results: string[] = [];
+    const outcome = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("acceptance-read-failed")]), {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("live-phase", ["workspace_write"], {
+            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            nextPhaseIds: ["next-phase"],
+          }),
+          customPhase("next-phase", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        listTaskAcceptance: async () => {
+          throw new Error("acceptance store unavailable");
+        },
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4, { fn_evidence: "completed" }),
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+      inspection: {
+        record: (_kind, value) => {
+          if (value && typeof value === "object" && "result" in value && typeof value.result === "string") {
+            results.push(value.result);
+          }
+          return null;
+        },
+      },
+    }));
+    expect(outcome.status).toBe("failed");
+    expect(outcome.code).toBe("invalid_plan");
+    expect(results.some((entry) => entry.includes("invalid_plan"))).toBe(true);
+    expect(results.some((entry) => entry.includes("openRequiredTaskIds"))).toBe(false);
+    expect(results.some((entry) => entry.includes("currentPhaseId"))).toBe(false);
+  });
+
+  test("fails closed when task acceptance capability is missing on a valid true exit", async () => {
+    const outcome = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("acceptance-missing")]), {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("live-phase", ["workspace_write"], {
+            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            nextPhaseIds: ["next-phase"],
+          }),
+          customPhase("next-phase", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async () => phaseSnapshot(4, { fn_evidence: "completed" }),
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+    }));
+    expect(outcome.status).toBe("failed");
+    expect(outcome.code).toBe("invalid_plan");
+    expect(outcome.observations.find((item) => item.callId === "acceptance-missing")).toMatchObject({
+      status: "rejected",
+      code: "invalid_plan",
+    });
+  });
+
+
 
 
   test("maps workspace semantic rejects to stable recoverable codes and keeps valid neighbors", async () => {

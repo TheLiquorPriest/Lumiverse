@@ -42,6 +42,7 @@ import {
   type CompiledAgentRuntimePhaseV1,
 } from "./agentic-phase-runtime.service";
 import {
+  evaluateCognitionPredicate,
   parseCognitionEvaluationContext,
   parseLoomPolicyBuckets,
   parseLoomPromptInspectionV1,
@@ -2385,26 +2386,91 @@ async function recoverableCompletionBlockedResultFor(
     openRequiredTaskIds,
   );
 }
+interface ExitWitnessResult {
+  readonly satisfied: boolean;
+  readonly refs: readonly string[];
+  readonly invalid: boolean;
+}
 
-function collectPredicateTaskIds(
-  predicate: CognitionPredicateV1,
-  into: Set<string> = new Set(),
-): Set<string> {
-  switch (predicate.kind) {
-    case "all":
-    case "any":
-      for (const child of predicate.children) collectPredicateTaskIds(child, into);
-      break;
-    case "not":
-      collectPredicateTaskIds(predicate.child, into);
-      break;
-    case "task_transition":
-      into.add(predicate.taskId);
-      break;
-    default:
-      break;
+function uniqueWitnessRefs(refs: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const ref of refs) {
+    if (!ref || seen.has(ref)) continue;
+    seen.add(ref);
+    result.push(ref);
   }
-  return into;
+  return result;
+}
+
+function collectExitWitnesses(
+  predicate: CognitionPredicateV1,
+  context: CognitionEvaluationContextV1,
+): ExitWitnessResult {
+  const empty = (satisfied: boolean, invalid = false): ExitWitnessResult => ({
+    satisfied,
+    refs: Object.freeze([]),
+    invalid,
+  });
+  try {
+    switch (predicate.kind) {
+      case "all": {
+        const children = predicate.children.map((child) => collectExitWitnesses(child, context));
+        if (children.some((child) => child.invalid)) return empty(false, true);
+        if (children.some((child) => !child.satisfied && child.refs.length === 0)) {
+          return empty(false);
+        }
+        return {
+          satisfied: children.every((child) => child.satisfied),
+          refs: Object.freeze(uniqueWitnessRefs(children.flatMap((child) => [...child.refs]))),
+          invalid: false,
+        };
+      }
+      case "any": {
+        const children = predicate.children.map((child) => collectExitWitnesses(child, context));
+        if (children.some((child) => child.invalid)) return empty(false, true);
+        const satisfiedChildren = children.filter((child) => child.satisfied);
+        if (satisfiedChildren.some((child) => child.refs.length === 0)) return empty(true);
+        if (satisfiedChildren.length > 0) {
+          return {
+            satisfied: true,
+            refs: Object.freeze(uniqueWitnessRefs(satisfiedChildren.flatMap((child) => [...child.refs]))),
+            invalid: false,
+          };
+        }
+        return {
+          satisfied: false,
+          refs: Object.freeze(uniqueWitnessRefs(children.flatMap((child) => [...child.refs]))),
+          invalid: false,
+        };
+      }
+      case "not": {
+        const child = collectExitWitnesses(predicate.child, context);
+        if (child.invalid) return empty(false, true);
+        return {
+          satisfied: !child.satisfied,
+          refs: child.refs,
+          invalid: false,
+        };
+      }
+      case "task_transition":
+        return {
+          satisfied: context.taskTransitions[predicate.taskId] === predicate.transition,
+          refs: Object.freeze([predicate.taskId]),
+          invalid: false,
+        };
+      case "generation_type":
+      case "phase":
+      case "preset_variable":
+      case "participant_fact":
+      case "tool_available":
+        return empty(evaluateCognitionPredicate(predicate, context));
+      default:
+        return empty(false, true);
+    }
+  } catch {
+    return empty(false, true);
+  }
 }
 
 function resolveTaskAcceptance(
@@ -2417,7 +2483,7 @@ function resolveTaskAcceptance(
 }
 
 function unsatisfiedRequiredGatingIds(
-  refs: ReadonlySet<string>,
+  refs: readonly string[],
   rows: readonly WorkspaceTaskAcceptanceV1[],
 ): string[] {
   const ids: string[] = [];
@@ -5508,45 +5574,70 @@ export async function runAgenticWorkPhase(
       model: rootModel,
       signal,
     });
-    const readTaskAcceptance = async (): Promise<readonly WorkspaceTaskAcceptanceV1[]> => {
-      if (!options.workspace?.listTaskAcceptance) return [];
+    const readTaskAcceptanceRequired = async (): Promise<readonly WorkspaceTaskAcceptanceV1[]> => {
+      if (!options.workspace?.listTaskAcceptance) {
+        throw new AgenticWorkPhaseError("invalid_plan", "workspace task acceptance is unavailable");
+      }
       try {
         const rows = await abortable(
           Promise.resolve(options.workspace.listTaskAcceptance({ frame: rootFrame, signal })),
           signal,
         );
-        return Array.isArray(rows) ? rows : [];
+        if (!Array.isArray(rows)) {
+          throw new AgenticWorkPhaseError("invalid_plan", "workspace task acceptance is malformed");
+        }
+        return rows;
       } catch (error) {
         if (signal.aborted) throw error;
-        return [];
+        if (error instanceof AgenticWorkPhaseError) throw error;
+        throw new AgenticWorkPhaseError("invalid_plan", "workspace task acceptance read failed");
       }
-    };
-    const livePhaseUnsatisfiedGatingIds = async (): Promise<string[]> => {
-      if (!phaseMachine || phaseMachine.state().status !== "entered") return [];
-      const phase = phaseMachine.currentPhase();
-      if (!phase) return [];
-      const refs = collectPredicateTaskIds(phase.exit);
-      if (refs.size === 0) return [];
-      return unsatisfiedRequiredGatingIds(refs, await readTaskAcceptance());
     };
     const rejectFailedRootSettlement: FailedRootSettlementGuard = async (taskId) => {
       if (!phaseMachine || phaseMachine.state().status !== "entered") return null;
       const phase = phaseMachine.currentPhase();
       if (!phase) return null;
-      const refs = collectPredicateTaskIds(phase.exit);
-      if (refs.size === 0) return null;
-      const rows = await readTaskAcceptance();
+      const input = await readPhaseInput("WORK");
+      if (!input || input.snapshotAvailable === false) {
+        return recoverableCompletionBlockedResultFor(
+          options.workspace,
+          rootFrame,
+          phase.id,
+        );
+      }
+      const witnesses = collectExitWitnesses(phase.exit, input.context);
+      if (witnesses.invalid) {
+        return recoverableCompletionBlockedResultFor(
+          options.workspace,
+          rootFrame,
+          phase.id,
+        );
+      }
+      const referenced = witnesses.refs.some((ref) => ref === taskId);
+      let rows: readonly WorkspaceTaskAcceptanceV1[];
+      try {
+        rows = await readTaskAcceptanceRequired();
+      } catch (error) {
+        if (signal.aborted) throw error;
+        return recoverableCompletionBlockedResultFor(
+          options.workspace,
+          rootFrame,
+          phase.id,
+          referenced ? [taskId] : witnesses.refs,
+        );
+      }
       const row = rows.find((item) => item.id === taskId || item.templateId === taskId);
       if (!row || !row.required || row.state !== "active") return null;
-      const referenced = (row.templateId !== null && refs.has(row.templateId)) || refs.has(row.id);
-      if (!referenced) return null;
+      const witnessHit = witnesses.refs.some((ref) => ref === row.templateId || ref === row.id);
+      if (!witnessHit) return null;
       return recoverableCompletionBlockedResultFor(
         options.workspace,
         rootFrame,
         phase.id,
-        unsatisfiedRequiredGatingIds(refs, rows),
+        unsatisfiedRequiredGatingIds(witnesses.refs, rows),
       );
     };
+
 
     if (!state.reserveChildIds([turnRootFrameId])) {
       return makeOutcome("failed", state, observations, childResults, "child_schedule_invalid");
@@ -6509,30 +6600,61 @@ export async function runAgenticWorkPhase(
               if (!phaseInput) {
                 phaseCompletionFailed = true;
               } else {
-                const gatingUnsatisfied = await livePhaseUnsatisfiedGatingIds();
                 const entered = phaseMachine.state().status === "entered";
-                const blockedExit: CompletionExecutionResult = {
-                  observationStatus: "rejected",
-                  code: "completion_blocked",
-                  result: await recoverableCompletionBlockedResultFor(
-                    options.workspace,
-                    rootFrame,
-                    phaseMachine.currentPhase()?.id ?? null,
-                    gatingUnsatisfied,
-                  ),
-                };
                 const exitDecision = phaseMachine.previewExit(phaseInput);
-                if (exitDecision.status === "completed") {
-                  if (gatingUnsatisfied.length > 0 && entered) {
-                    completion = blockedExit;
+                const validTrueExit = exitDecision.status === "completed" || exitDecision.status === "advanced";
+                const recoverableUnsatisfied = isRecoverableUnsatisfiedLivePhaseExit(
+                  exitDecision,
+                  phaseMachine.state().status,
+                );
+                let gatingUnsatisfied: string[] = [];
+                if (validTrueExit && entered) {
+                  const phase = phaseMachine.currentPhase();
+                  if (!phase) {
+                    phaseCompletionFailed = true;
                   } else {
-                    phaseCompletionExpectedRevision = phaseInput.revision;
-                    phaseTerminalPending = true;
+                    const witnesses = collectExitWitnesses(phase.exit, phaseInput.context);
+                    if (witnesses.invalid) {
+                      phaseCompletionFailed = true;
+                    } else if (witnesses.refs.length > 0) {
+                      try {
+                        gatingUnsatisfied = unsatisfiedRequiredGatingIds(
+                          witnesses.refs,
+                          await readTaskAcceptanceRequired(),
+                        );
+                      } catch (error) {
+                        if (signal.aborted) throw error;
+                        phaseCompletionFailed = true;
+                      }
+                    }
                   }
-                } else if (isRecoverableUnsatisfiedLivePhaseExit(exitDecision, phaseMachine.state().status)) {
-                  completion = blockedExit;
-                } else if (gatingUnsatisfied.length > 0 && entered) {
-                  completion = blockedExit;
+                }
+                if (phaseCompletionFailed) {
+                  // Fatal evaluation/acceptance failure must not be recovered as completion_blocked.
+                } else if (validTrueExit && gatingUnsatisfied.length > 0 && entered) {
+                  completion = {
+                    observationStatus: "rejected",
+                    code: "completion_blocked",
+                    result: await recoverableCompletionBlockedResultFor(
+                      options.workspace,
+                      rootFrame,
+                      phaseMachine.currentPhase()?.id ?? null,
+                      gatingUnsatisfied,
+                    ),
+                  };
+                } else if (exitDecision.status === "completed") {
+                  phaseCompletionExpectedRevision = phaseInput.revision;
+                  phaseTerminalPending = true;
+                } else if (recoverableUnsatisfied) {
+                  completion = {
+                    observationStatus: "rejected",
+                    code: "completion_blocked",
+                    result: await recoverableCompletionBlockedResultFor(
+                      options.workspace,
+                      rootFrame,
+                      phaseMachine.currentPhase()?.id ?? null,
+                    ),
+                  };
                 } else {
                   const committedDecision = phaseMachine.exit(phaseInput);
                   recordPhaseEvidence();
@@ -6544,7 +6666,6 @@ export async function runAgenticWorkPhase(
                         options.workspace,
                         rootFrame,
                         phaseMachine.currentPhase()?.id ?? null,
-                        gatingUnsatisfied,
                       ),
                     };
                   } else if (committedDecision.status === "failed" || committedDecision.status === "blocked") {

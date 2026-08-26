@@ -2126,23 +2126,59 @@ export function listWorkspaceTaskTransitionsV1(raw: unknown): WorkspaceTaskTrans
 export function listWorkspaceTaskAcceptanceV1(raw: unknown): readonly WorkspaceTaskAcceptanceV1[] {
   const input = contextValue(raw, true);
   const row = requireWorkspace(input);
-  const taskRows = listWorkspaceRows("agent_workspace_tasks", row);
-  const submissions = listWorkspaceRows("agent_workspace_submissions", row).map(submissionFromRow);
-  return Object.freeze(taskRows.map((candidate) => {
-    const task = taskFromRow(candidate);
-    const rawTemplateId = candidate.cognition_template_id;
-    const templateId = rawTemplateId === undefined || rawTemplateId === null
-      ? null
-      : cognitionTemplateTransitionId(row, candidate);
-    return Object.freeze({
-      id: task.id,
-      templateId,
-      required: task.required,
-      state: task.state,
-      completionAccepted: taskCompletionAccepted(task, submissions),
+  const database = getDb();
+  let items: WorkspaceTaskAcceptanceV1[] | undefined;
+  database.transaction(() => {
+    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
+    if (!current || current.revision !== row.revision) {
+      fail("stale_revision", "workspace changed while reading task acceptance");
+    }
+    if (!tableExists(database, "agent_workspace_tasks")) {
+      fail("schema_unavailable", "agent_workspace_tasks is unavailable");
+    }
+    const submissionsAvailable = tableExists(database, "agent_workspace_submissions");
+    const taskTable = quoteIdentifier("agent_workspace_tasks");
+    const submissionTable = quoteIdentifier("agent_workspace_submissions");
+    const sql = submissionsAvailable
+      ? `SELECT t.*, CASE WHEN EXISTS (
+           SELECT 1 FROM ${submissionTable} s
+           WHERE s.workspace_id = t.workspace_id
+             AND s.user_id = t.user_id
+             AND s.chat_id = t.chat_id
+             AND s.turn_id = t.turn_id
+             AND s.task_id = t.task_id
+             AND s.state = 'accepted'
+         ) THEN 1 ELSE 0 END AS completion_accepted
+         FROM ${taskTable} t
+         WHERE t.workspace_id = ? AND t.user_id = ? AND t.chat_id = ? AND t.turn_id = ?`
+      : `SELECT t.*, 0 AS completion_accepted
+         FROM ${taskTable} t
+         WHERE t.workspace_id = ? AND t.user_id = ? AND t.chat_id = ? AND t.turn_id = ?`;
+    const taskRows = database.query(sql).all(
+      current.workspaceId,
+      current.userId,
+      current.chatId,
+      current.turnId,
+    ) as Array<Record<string, unknown>>;
+    items = taskRows.map((candidate) => {
+      const task = taskFromRow(candidate);
+      const rawTemplateId = candidate.cognition_template_id;
+      const templateId = rawTemplateId === undefined || rawTemplateId === null
+        ? null
+        : cognitionTemplateTransitionId(current, candidate);
+      return Object.freeze({
+        id: task.id,
+        templateId,
+        required: task.required,
+        state: task.state,
+        completionAccepted: Number(candidate.completion_accepted) === 1,
+      });
     });
-  }));
+  })();
+  if (!items) fail("stale_revision", "task acceptance snapshot did not complete");
+  return Object.freeze(items);
 }
+
 
 function planWorkspaceCompletion(
   row: WorkspaceRow,
