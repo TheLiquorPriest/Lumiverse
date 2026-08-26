@@ -1120,6 +1120,38 @@ describe("production agentic coordinator installation", () => {
     expect(decision.internal.readinessVector.reasons).toContain("cognition_invalid");
   });
 
+  test("explicit Response stays available without Agentic capability poison", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    installAgenticGenerationCoordinator();
+    const decision = await resolveEffectiveRuntime(USER_ID, {
+      chatId: AGENTIC_CHAT_ID,
+      logicalConnectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal",
+      target: { generationType: "normal", messageId: null, swipeId: null },
+      mode: "response",
+      requestEpoch: 202,
+    });
+    expect(decision.requestedMode).toBe("response");
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.capabilityReadiness.ready).toBe(true);
+    expect(decision.capabilityReadiness.required).toEqual([]);
+    expect(decision.capabilityReadiness.missing).toEqual([]);
+    expect(decision.capabilityReadiness.repairCodes).not.toEqual(expect.arrayContaining([
+      "input_revisions_incomplete",
+      "agentic_input_revisions_incomplete",
+      "provider_capability_unavailable",
+    ]));
+    expect(decision.repairCodes).not.toEqual(expect.arrayContaining([
+      "input_revisions_incomplete",
+      "agentic_input_revisions_incomplete",
+    ]));
+    expect(decision.runtimePolicy.availability.state).toBe("available");
+    expect(decision.runtimePolicy.availability.reasonCode).toBeNull();
+  });
+
+
   test("omitted mode snapshots revisions when the resolved request is agentic", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";

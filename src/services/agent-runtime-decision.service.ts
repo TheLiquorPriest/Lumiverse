@@ -777,6 +777,61 @@ function mapCapabilityFailure(requirement: AgentRuntimeCapabilityRequirement): A
   }
 }
 
+function isAgenticOnlyRepairCode(code: string): boolean {
+  return code.startsWith("agentic_")
+    || code.startsWith("cognition_")
+    || code.startsWith("agent_config_")
+    || code === "input_revisions_incomplete"
+    || code === "kill_switch_off"
+    || code === "provider_capability_unavailable"
+    || code === "schema_unavailable"
+    || code === "reconciliation_required"
+    || code === "archive_registry_unavailable"
+    || code === "isolate_unavailable"
+    || code === "publication_store_unavailable"
+    || code === "decision_capacity_exceeded"
+    || code === "decision_refresh_required";
+}
+
+function responseCapabilityWire(
+  requestedMode: AgentRuntimeMode,
+  capabilityReadiness: {
+    ready: boolean;
+    sameDomain: boolean;
+    required: AgentRuntimeCapabilityRequirement[];
+    missing: AgentRuntimeCapabilityRequirement[];
+    repairCodes: AgentRuntimeRepairCode[];
+  },
+  repairCodes: readonly AgentRuntimeRepairCode[],
+): {
+  capabilityReadiness: EffectiveRuntimeDecisionV1["capabilityReadiness"];
+  repairCodes: AgentRuntimeRepairCode[];
+} {
+  if (requestedMode !== "response") {
+    return {
+      capabilityReadiness: {
+        ...capabilityReadiness,
+        ready: capabilityReadiness.ready,
+        responseEscape: AGENT_RUNTIME_RESPONSE_ESCAPE,
+      },
+      repairCodes: [...repairCodes],
+    };
+  }
+  const ordinaryRepairCodes = [...new Set(repairCodes.filter((code) => !isAgenticOnlyRepairCode(code)))];
+  return {
+    capabilityReadiness: {
+      ready: true,
+      sameDomain: true,
+      required: [],
+      missing: [],
+      repairCodes: ordinaryRepairCodes,
+      responseEscape: AGENT_RUNTIME_RESPONSE_ESCAPE,
+    },
+    repairCodes: ordinaryRepairCodes,
+  };
+}
+
+
 function normalizeInputRevisions(value: Partial<InputRevisionSetV1> | null | undefined): { complete: boolean; normalized: Record<string, unknown>; digest: string } {
   if (value !== null && value !== undefined && !isRecord(value)) {
     throw new RuntimeDecisionError("invalid_request", "inputRevisions must be an object or null", 400);
@@ -1983,16 +2038,11 @@ export class AgentRuntimeDecisionService {
       requestedMode: normalizedRequestedMode,
       effectiveMode: context.effectiveMode,
       chatOverride,
-      capabilityReadiness: {
-        ready: normalizedRequestedMode === "response"
-          || (context.capabilityReadiness.ready && context.effectiveMode === "agentic"),
-        sameDomain: context.capabilityReadiness.sameDomain,
-        required: context.capabilityReadiness.required,
-        missing: context.capabilityReadiness.missing,
-        repairCodes: context.capabilityReadiness.repairCodes,
-        responseEscape: AGENT_RUNTIME_RESPONSE_ESCAPE,
-      },
-      repairCodes: context.repairCodes,
+      ...responseCapabilityWire(
+        normalizedRequestedMode,
+        context.capabilityReadiness,
+        context.repairCodes,
+      ),
       runtimeDecisionToken,
       runtimeDecisionExpiresAt,
       internal,

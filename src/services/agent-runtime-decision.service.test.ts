@@ -614,13 +614,24 @@ describe("AgentRuntimeDecisionService", () => {
     });
   });
 
-  test("durable Response stays available when Agentic input revisions are incomplete", async () => {
+  test("durable Response stays agentic-free when the provider lacks Agentic capabilities", async () => {
     const service = makeService({
       override: { mode: "response", revision: 3, state: "ready" },
+      connections: {
+        root: connection("root", {
+          capabilities: {
+            streaming: true,
+            toolCalling: false,
+            toolsDisabledFinalization: false,
+            nativeToolContinuation: false,
+            toolContinuationMode: "unsupported",
+          },
+        }),
+      },
       getInputRevisions: () => null,
-      getReadinessVector: (_userId, _request, context) => ({
+      getReadinessVector: () => ({
         ready: false,
-        reasons: context.requestedMode === "agentic" ? ["input_revisions_incomplete"] : ["input_revisions_incomplete"],
+        reasons: ["input_revisions_incomplete", "provider_capability_unavailable"],
         inputRevisionDigest: "",
       }),
     });
@@ -640,9 +651,56 @@ describe("AgentRuntimeDecisionService", () => {
       scope: "chat",
       availability: { state: "available", reasonCode: null },
     });
+    expect(decision.capabilityReadiness).toMatchObject({
+      ready: true,
+      sameDomain: true,
+      required: [],
+      missing: [],
+      responseEscape: "available",
+    });
+    expect(decision.capabilityReadiness.repairCodes).toEqual([]);
+    expect(decision.repairCodes).toEqual([]);
+  });
+
+  test("one-turn Response stays agentic-free when the provider lacks Agentic capabilities", async () => {
+    const service = makeService({
+      connections: {
+        root: connection("root", {
+          capabilities: {
+            streaming: true,
+            toolCalling: false,
+            toolsDisabledFinalization: false,
+            nativeToolContinuation: false,
+            toolContinuationMode: "unsupported",
+          },
+        }),
+      },
+      getInputRevisions: () => null,
+      getReadinessVector: () => ({
+        ready: false,
+        reasons: ["input_revisions_incomplete", "provider_capability_unavailable"],
+        inputRevisionDigest: "",
+      }),
+    });
+    const decision = await service.resolve(USER_ID, request({
+      mode: "response",
+      transientSelection: { mode: "response", turnFence: 7, authenticated: true },
+      inputRevisions: {},
+    }));
+    expect(decision.requestedMode).toBe("response");
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.runtimePolicy).toMatchObject({
+      authoredValue: "response",
+      effectiveValue: "response",
+      source: "authenticated_one_turn",
+      scope: "turn",
+      availability: { state: "available", reasonCode: null },
+    });
     expect(decision.capabilityReadiness.ready).toBe(true);
-    expect(decision.repairCodes).not.toContain("input_revisions_incomplete");
-    expect(decision.repairCodes).not.toContain("agentic_input_revisions_incomplete");
+    expect(decision.capabilityReadiness.required).toEqual([]);
+    expect(decision.capabilityReadiness.missing).toEqual([]);
+    expect(decision.capabilityReadiness.repairCodes).toEqual([]);
+    expect(decision.repairCodes).toEqual([]);
   });
 
   test("Agentic stays host-rejected when input revisions are incomplete", async () => {
@@ -668,6 +726,38 @@ describe("AgentRuntimeDecisionService", () => {
       "input_revisions_incomplete",
     ]));
   });
+
+  test("Agentic stays host-rejected when the provider lacks Agentic-only capabilities", async () => {
+    const service = makeService({
+      connections: {
+        root: connection("root", {
+          capabilities: {
+            streaming: true,
+            toolCalling: false,
+            toolsDisabledFinalization: false,
+            nativeToolContinuation: false,
+            toolContinuationMode: "unsupported",
+          },
+        }),
+      },
+    });
+    const decision = await service.resolve(USER_ID, request({ mode: "agentic" }));
+    expect(decision.requestedMode).toBe("agentic");
+    expect(decision.effectiveMode).toBe("response");
+    expect(decision.runtimePolicy.source).toBe("host_rejected");
+    expect(decision.capabilityReadiness.ready).toBe(false);
+    expect(decision.capabilityReadiness.missing).toEqual(expect.arrayContaining([
+      "tool_calling",
+      "native_tool_continuation",
+      "tools_disabled_finalization",
+    ]));
+    expect(decision.repairCodes).toEqual(expect.arrayContaining([
+      "agentic_capability_missing_tool_calling",
+      "agentic_capability_missing_native_tool_continuation",
+      "agentic_capability_missing_tools_disabled_finalization",
+    ]));
+  });
+
 
 
   test("keeps repair acknowledgement separate from an unavailable mode choice", () => {
