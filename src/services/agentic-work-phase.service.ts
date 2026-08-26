@@ -72,7 +72,7 @@ import type {
   WorkspaceTaskAcceptanceV1,
 } from "../types/turn-workspace";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
-import { WORKSPACE_ID_MAX_BYTES } from "./turn-workspace.service";
+import { WORKSPACE_ID_MAX_BYTES, WORKSPACE_MAX_TASKS, WORKSPACE_READ_SECTIONS } from "./turn-workspace.service";
 import type {
   CognitionRuntimeCompletionV1,
   CognitionRuntimeTaskTransitionInputV1,
@@ -696,7 +696,7 @@ const BOUNDED_STRING = { type: "string", minLength: 1, maxLength: 16_384 };
 
 const COMPLETE_TURN_DEFINITION: ToolDefinition = Object.freeze({
   name: COMPLETE_TURN_TOOL,
-  description: "Host-owned WORK boundary. Submit private completion evidence and unresolved item IDs; optionally guide the final RESPONSE.",
+  description: "Host-owned WORK boundary. Call complete_turn only as a standalone tool call. In a custom phase, call after the current phase exit predicate is satisfied; acceptance in a non-final phase returns phase_advanced and WORK continues even if later-phase required tasks remain open. Only final-phase or no-active-custom-phase acceptance completes WORK, and it requires all completion gates to be settled.",
   strict: true,
   parameters: schema({
     summary: {
@@ -750,10 +750,10 @@ function workspaceDefinition(
   };
   switch (operation) {
     case "read_section":
-      add("section", { type: "string", minLength: 1, maxLength: 256 }, true);
+      add("section", { type: "string", enum: [...WORKSPACE_READ_SECTIONS] }, true);
       break;
     case "read_page":
-      add("section", { type: "string", minLength: 1, maxLength: 256 }, true);
+      add("section", { type: "string", enum: [...WORKSPACE_READ_SECTIONS] }, true);
       add("page", { type: "integer", minimum: 0, maximum: 100 }, true);
       add("pageSize", { type: "integer", minimum: 1, maximum: 100 });
       break;
@@ -761,7 +761,6 @@ function workspaceDefinition(
       add("taskId", { type: "string", minLength: 1, maxLength: 256 }, true);
       add("title", { type: "string", minLength: 1, maxLength: 1_024 }, true);
       add("objective", { type: "string", maxLength: MAX_COMPLETION_SUMMARY_BYTES });
-      add("required", { type: "boolean" });
       add("dependencyIds", { type: "array", maxItems: 64, items: { type: "string", maxLength: 256 } });
       break;
     case "update_assigned_progress":
@@ -2329,24 +2328,60 @@ function sanitizePhaseId(value: string | null | undefined): string | null {
   return value;
 }
 
-function sanitizeOpenRequiredTaskIds(value: unknown): readonly string[] {
+function sanitizeRequiredTaskIds(
+  value: unknown,
+  maxItems: number,
+  maxIdBytes: number,
+): readonly string[] {
   if (!Array.isArray(value)) return Object.freeze([]);
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const item of value) {
-    if (ids.length >= MAX_COMPLETION_IDS) break;
+    if (ids.length >= maxItems) break;
     if (typeof item !== "string" || item.length === 0 || seen.has(item)) continue;
-    if (encoder.encode(item).byteLength > MAX_COMPLETION_ID_BYTES) continue;
+    if (encoder.encode(item).byteLength > maxIdBytes) continue;
     if (!WORKSPACE_SAFE_ID_PATTERN.test(item)) continue;
     seen.add(item);
     ids.push(item);
   }
-  ids.sort();
+  ids.sort(compareUtf8);
   return Object.freeze(ids);
+}
+
+function sanitizeOpenRequiredTaskIds(value: unknown): readonly string[] {
+  return sanitizeRequiredTaskIds(value, MAX_COMPLETION_IDS, MAX_COMPLETION_ID_BYTES);
+}
+
+function sanitizePhaseControlOpenRequiredTaskIds(value: unknown): readonly string[] {
+  return sanitizeRequiredTaskIds(value, WORKSPACE_MAX_TASKS, WORKSPACE_ID_MAX_BYTES);
 }
 
 function admittedToolNamesFromFrame(frame: AgenticWorkFrame): readonly string[] {
   return Object.freeze([...frame.allowedToolNames].sort());
+}
+
+function rootPhaseControlMessage(
+  currentPhaseId: string | null,
+  definitions: readonly ToolDefinition[],
+  gates: AgenticWorkspaceCompletionGates,
+): LlmMessage {
+  const admittedRootToolNames = Object.freeze(
+    definitions.map((definition) => definition.name).sort(compareUtf8),
+  );
+  const content = jsonStringifyBounded({
+    kind: "host_private_phase_control_v1",
+    currentPhaseId,
+    admittedRootToolNames,
+    openRequiredTaskIds: sanitizePhaseControlOpenRequiredTaskIds(gates.openRequiredTaskIds),
+    completeTurn: {
+      instruction: "MUST call complete_turn as the sole tool call after the current custom phase exit predicate is satisfied; without an active custom phase, call it only after all completion gates are settled.",
+      callMode: "standalone_only",
+      nonFinalAcceptance: "phase_advanced",
+      nonFinalWorkContinues: true,
+      terminalAcceptance: "final_custom_phase_or_no_active_custom_phase_only",
+    },
+  }, MAX_TOOL_RESULT_BYTES);
+  return Object.freeze({ role: "system", content });
 }
 
 function recoverableCompletionBlockedResult(
@@ -3522,9 +3557,62 @@ async function readCompletionGates(
   const requiredItems = Array.isArray(required) ? required : [];
   return {
     requiredOpenTasks: requiredItems.length,
-    openRequiredTaskIds: sanitizeOpenRequiredTaskIds(requiredItems),
+    openRequiredTaskIds: sanitizePhaseControlOpenRequiredTaskIds(requiredItems),
     unacceptedSubmissions: submissions.length,
   };
+}
+
+async function readPhaseControlCompletionGates(
+  workspace: AgenticWorkspaceCapability | undefined,
+  frame: AgenticWorkFrame,
+): Promise<AgenticWorkspaceCompletionGates> {
+  const gates = await readCompletionGates(workspace, frame);
+  const expectedCount = gates.requiredOpenTasks;
+  if (
+    expectedCount !== undefined
+    && (!Number.isSafeInteger(expectedCount) || expectedCount < 0 || expectedCount > WORKSPACE_MAX_TASKS)
+  ) {
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Required-open-task count is malformed");
+  }
+  const providedIds = Array.isArray(gates.openRequiredTaskIds);
+  const provided = sanitizePhaseControlOpenRequiredTaskIds(gates.openRequiredTaskIds);
+  if (providedIds) {
+    if (expectedCount === undefined || provided.length === expectedCount) {
+      return Object.freeze({
+        ...gates,
+        requiredOpenTasks: expectedCount ?? provided.length,
+        openRequiredTaskIds: provided,
+      });
+    }
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Open required task IDs do not match completion gates");
+  }
+  if (expectedCount === 0) {
+    return Object.freeze({ ...gates, openRequiredTaskIds: Object.freeze([]) });
+  }
+  if (!workspace) {
+    if (expectedCount === undefined) {
+      return Object.freeze({ ...gates, requiredOpenTasks: 0, openRequiredTaskIds: Object.freeze([]) });
+    }
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Exact open required task IDs are unavailable");
+  }
+  const rows = await abortable(
+    Promise.resolve(workspace.listTaskAcceptance({ frame, signal: frame.signal })),
+    frame.signal,
+  );
+  if (!Array.isArray(rows)) {
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Task acceptance inventory is malformed");
+  }
+  const resolved = sanitizePhaseControlOpenRequiredTaskIds(
+    rows.filter((row) => row.required && !row.completionAccepted).map((row) => row.id),
+  );
+  if (expectedCount !== undefined && resolved.length !== expectedCount) {
+    throw new AgenticWorkPhaseError("completion_freeze_failed", "Open required task IDs do not match completion gates");
+  }
+  return Object.freeze({
+    ...gates,
+    requiredOpenTasks: expectedCount ?? resolved.length,
+    openRequiredTaskIds: resolved,
+  });
 }
 
 async function executeWorkspaceTool(
@@ -5904,10 +5992,27 @@ export async function runAgenticWorkPhase(
         const status = signalStatus(signal);
         return outcomeAfterPending(status, status);
       }
+      let phaseControlMessage: LlmMessage;
+      try {
+        const gates = await readPhaseControlCompletionGates(options.workspace, rootFrame);
+        const currentPhaseId = phaseMachine?.state().status === "entered"
+          ? phaseMachine.currentPhase()?.id ?? null
+          : null;
+        phaseControlMessage = rootPhaseControlMessage(currentPhaseId, definitions, gates);
+      } catch (error) {
+        if (signal.aborted) {
+          const status = signalStatus(signal);
+          return outcomeAfterPending(status, status);
+        }
+        return outcomeAfterPending(
+          "failed",
+          error instanceof AgenticWorkPhaseError ? error.code : "completion_freeze_failed",
+        );
+      }
       let dispatchInput: BoundedProviderInputV1;
       try {
         dispatchInput = cloneBoundedProviderInput(
-          messages,
+          [...messages, phaseControlMessage],
           providerTransientCarrier,
           options.trustedAssemblyLimits.maxInputBytes,
         );

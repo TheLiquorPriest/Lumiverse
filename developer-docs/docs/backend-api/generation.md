@@ -409,11 +409,14 @@ host-enforced budget or limit exhaustion.
 |---|---|
 | `ASSEMBLE` | Freeze the snapshot, validate the effective decision, compile `AssemblyPlanV1` in two independently supervised terminable isolates, and compare their plans. No generation mutation or child execution occurs. |
 | `WORK` | First reserve and execute the deterministic child descriptors in traversal order, substituting each bounded result once; then run the root provider loop with bounded in-memory provider work notes. The allowlist is `complete_turn`, workspace reads (`workspace_read_section`, `workspace_read_page`), workspace mutations (`workspace_create_task` (root-only), `workspace_update_assigned_progress` (child-only), `workspace_submit_child_result` (child-only), `workspace_accept_submission` (root-only), `workspace_record_finding`, `workspace_record_decision`, `workspace_record_question`, `workspace_attach_artifact`, `workspace_propose_publication`), `agent_delegate`, and the six core retrieval tools: `lore_list_books`, `lore_get_book`, `lore_list_entries`, `lore_get_entry`, `lore_search_entries`, and `chat_search_history`. |
-| `COMPLETE` | The post-acceptance boundary after WORK's sole-call `complete_turn`: required tasks, actions, submissions, and calls are settled, and the workspace is frozen for finalization. Tool-free boundaries are re-prompted in WORK while budget remains; exhaustion enters `EXHAUSTED` with no render or commit. |
+| `COMPLETE` | The post-acceptance boundary after the final custom phase's standalone `complete_turn` is accepted, or after standalone final acceptance when no custom phase is active: required tasks, actions, submissions, and calls are settled, and the workspace is frozen for finalization. Tool-free boundaries are re-prompted in WORK while budget remains; exhaustion enters `EXHAUSTED` with no render or commit. |
 | `RENDER` | Use the same frozen root connection and model with `tools: []`, `toolMode: "finalization"`, and one final-render reservation. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance cross from private WORK; raw retrieval and work notes do not. Native continuation may reuse only that frame’s opaque adapter carrier; legacy continuation uses only the private frame transcript. A returned tool call is a protocol failure and is never executed. |
 | `PREPARE_COMMIT` | Send frozen render content plus pure snapshotted inputs to `prepare_agent_render` in the strict isolate. It performs bounded reasoning-tag cleanup, response transforms, formatting healing, source-message/macro preparation, target/swipe reconciliation, and usage calculation, returning typed deltas only. |
 | `COMMITTING` | Recompute every `InputRevisionSetV1` member. A single CAS owns this boundary; cancellation/deadline can win before it, while Stop after it is `too_late`. |
 | `COMMITTED` | One synchronous SQLite transaction writes the message/swipe/extras, authorized macro/source/chat/world-info/regex deltas, artifact references, terminal handoff, projection, and idempotent receipt. Duplicate commit returns the existing receipt. |
+
+Before every root WORK provider dispatch, the host rebuilds one concise private structured phase-control envelope from live state: `{ kind: "host_private_phase_control_v1", currentPhaseId: string | null, admittedRootToolNames: string[], openRequiredTaskIds: string[], completeTurn: { instruction: "MUST call complete_turn as the sole tool call after the current custom phase exit predicate is satisfied; without an active custom phase, call it only after all completion gates are settled.", callMode: "standalone_only", nonFinalAcceptance: "phase_advanced", nonFinalWorkContinues: true, terminalAcceptance: "final_custom_phase_or_no_active_custom_phase_only" } }`. Future conditional tasks are never speculated. This message belongs only to private WORK input, is not persisted, and is not copied into RENDER, the public workspace projection, or Response.
+
 Unknown phase transitions fail closed. A reversible-phase provider/protocol
 failure, cancellation, or deadline enters `FAILED`, `CANCELLED`, or
 `TIMED_OUT`; budget exhaustion enters `EXHAUSTED`. `COMMITTING` enters
@@ -678,12 +681,16 @@ acknowledgement, depth-one frame limit, and child output bounds. Root frames
 alone may call `complete_turn` (with bounded `summary`, `unresolvedIds`, and
 optional `renderGuidance`).
 
+`complete_turn` must be the only call in its tool-call batch. Before the final custom phase, a valid call after the current exit predicate is satisfied advances the machine and returns `{ status: "phase_advanced", toolName: "complete_turn", workspaceRevision, phaseId }`; it does not accept final completion. Only when the final custom phase's exit is satisfied—or when no custom phase is active—does that standalone call run the completion fixed point and return `{ status: "accepted", toolName: "complete_turn", workspaceRevision }`.
+
 Root-only workspace operations are `workspace_create_task`,
 `workspace_submit_root_result`, and `workspace_accept_submission`. A root
 provider may submit a bounded result only for its own unassigned task;
 assigned child tasks remain child-confined. A child may use only the read,
 assigned-progress, and assigned-submission operations granted to its frame; all
 other workspace operations require an explicit host grant.
+
+`workspace_read_section` and `workspace_read_page` accept exactly `objective`, `constraints`, `tasks`, `records`, `submissions`, `artifacts`, and `summary`. Root-created tasks are always optional, so the root-facing `workspace_create_task` contract does not accept a `required` argument. Host/cognition-authored task templates retain their requiredness, and malformed/manual attempts to create a required root task fail closed.
 
 When a dynamically assigned child fails, is cancelled, or times out, the host
 settles that exact task/frame pair as `failed` or `cancelled` before exposing

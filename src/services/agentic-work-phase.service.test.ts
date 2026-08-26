@@ -1095,7 +1095,9 @@ describe("Agentic WORK phase", () => {
       return response("", [complete("accepted")]);
     }, {
       workspace: workspace({
-        getCompletionGates: async () => required ? { requiredOpenTasks: 1 } : {},
+        getCompletionGates: async () => required
+          ? { requiredOpenTasks: 1, openRequiredTaskIds: ["required-task"] }
+          : { openRequiredTaskIds: [] },
         freezeForCompletion: async () => { freezes += 1; return { accepted: true, workspaceRevision: 8 }; },
       }),
       workspaceCapabilities: [],
@@ -1275,22 +1277,29 @@ describe("Agentic WORK phase", () => {
     expect(tools).not.toContain("mcp_call");
     expect(tools).not.toContain("spindle_tool");
   });
-  test("distinguishes private completion evidence from final-response guidance in the model schema", () => {
+  test("describes complete_turn phase semantics and exposes exact workspace schemas", () => {
     const composition = composeAgenticWorkToolDefinitions({
       coreToolIds: [],
-      workspaceCapabilities: [],
+      workspaceCapabilities: ["read_section", "read_page", "create_task"],
     });
-    const definition = composition.rootDefinitions.find((item) => item.name === "complete_turn");
-    expect(definition?.parameters).toMatchObject({
+    const completion = composition.rootDefinitions.find((item) => item.name === "complete_turn");
+    expect(completion?.description).toBe(
+      "Host-owned WORK boundary. Call complete_turn only as a standalone tool call. In a custom phase, call after the current phase exit predicate is satisfied; acceptance in a non-final phase returns phase_advanced and WORK continues even if later-phase required tasks remain open. Only final-phase or no-active-custom-phase acceptance completes WORK, and it requires all completion gates to be settled.",
+    );
+    expect(completion?.parameters).toMatchObject({
       properties: {
-        summary: {
-          description: expect.stringContaining("not shown to the user"),
-        },
-        renderGuidance: {
-          description: expect.stringContaining("final RESPONSE"),
-        },
+        summary: { description: expect.stringContaining("not shown to the user") },
+        renderGuidance: { description: expect.stringContaining("final RESPONSE") },
       },
     });
+    const sections = ["objective", "constraints", "tasks", "records", "submissions", "artifacts", "summary"];
+    for (const name of ["workspace_read_section", "workspace_read_page"]) {
+      expect(composition.rootDefinitions.find((item) => item.name === name)?.parameters).toMatchObject({
+        properties: { section: { type: "string", enum: sections } },
+      });
+    }
+    expect(composition.rootDefinitions.find((item) => item.name === "workspace_create_task")?.parameters)
+      .not.toHaveProperty("properties.required");
   });
   test("composes the publication workspace capability with its bounded artifact schema", () => {
     const composition = composeAgenticWorkToolDefinitions({
@@ -4001,6 +4010,7 @@ describe("Agentic WORK phase", () => {
         getCompletionGates: async () => ({
           workspaceRevision,
           requiredOpenTasks: 1,
+          openRequiredTaskIds: ["required-recovery-task"],
           canComplete: false,
         }),
         freezeForCompletion: async ({ expectedRevision }) => {
@@ -4165,6 +4175,7 @@ describe("Agentic WORK phase", () => {
         getCompletionGates: async () => ({
           workspaceRevision,
           requiredOpenTasks: 1,
+          openRequiredTaskIds: ["failed-required-task"],
           canComplete: false,
         }),
       }),
@@ -4263,6 +4274,118 @@ describe("Agentic WORK phase", () => {
     expect(dispatches).toBe(0);
   });
 
+  test("refreshes one private phase-control envelope on every root dispatch", async () => {
+    const firstRef = phaseRef("phase-control-first", 0);
+    const secondRef = phaseRef("phase-control-second", 1);
+    const initialOpenRequiredTaskIds = Array.from(
+      { length: 129 },
+      (_, index) => `live-${String(128 - index).padStart(3, "0")}`,
+    );
+    let openRequiredTaskIds = [...initialOpenRequiredTaskIds];
+    const requests: Array<{ readonly messages: string; readonly control: Record<string, unknown> }> = [];
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+      round += 1;
+      const controls = messages.flatMap((message) => {
+        if (message.role !== "system" || typeof message.content !== "string") return [];
+        try {
+          const parsed = JSON.parse(message.content) as Record<string, unknown>;
+          return parsed.kind === "host_private_phase_control_v1" ? [parsed] : [];
+        } catch {
+          return [];
+        }
+      });
+      expect(controls).toHaveLength(1);
+      requests.push({ messages: JSON.stringify(messages), control: controls[0]! });
+      openRequiredTaskIds = round === 1 ? ["live-final"] : [];
+      return response("", [complete("phase-control-" + round)]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("phase-one", ["workspace_read"], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [firstRef],
+            nextPhaseIds: ["phase-two"],
+          }),
+          customPhase("phase-two", ["workspace_write"], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            instructionRefs: [secondRef],
+          }),
+        ]),
+        loomBlocks: [
+          phaseBlock(firstRef, "CURRENT_PHASE_ONLY"),
+          phaseBlock(secondRef, "FUTURE_PHASE_ONLY future-phase-task"),
+        ],
+      }),
+      workspace: workspace({
+        getCompletionGates: async () => ({
+          requiredOpenTasks: openRequiredTaskIds.length,
+          canComplete: openRequiredTaskIds.length === 0,
+        }),
+        listTaskAcceptance: async () => openRequiredTaskIds.map((id) => ({
+          id,
+          templateId: null,
+          required: true,
+          state: "active",
+          completionAccepted: false,
+        })),
+        getPhaseEvaluationSnapshot: async ({ expectedRevision }) => phaseSnapshot(expectedRevision ?? 0),
+      }),
+      workspaceCapabilities: ["read_section", "record_finding"],
+      phaseEvaluationContext: phaseContext(),
+      phaseAdmittedCapabilities: ["workspace_read", "workspace_write"],
+      renderPolicyMessages: [{
+        role: "system",
+        provenance: { kind: "cognition", sourceId: "render-policy", sourceRevision: "1", sourceIndex: 0 },
+        segments: [{ kind: "literal", text: "RENDER_POLICY_MUST_NOT_ENTER_WORK" }],
+      }],
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.control).toMatchObject({
+      kind: "host_private_phase_control_v1",
+      currentPhaseId: "phase_one",
+      admittedRootToolNames: ["complete_turn", "workspace_read_section"],
+      completeTurn: {
+        instruction: "MUST call complete_turn as the sole tool call after the current custom phase exit predicate is satisfied; without an active custom phase, call it only after all completion gates are settled.",
+        callMode: "standalone_only",
+        nonFinalAcceptance: "phase_advanced",
+        nonFinalWorkContinues: true,
+        terminalAcceptance: "final_custom_phase_or_no_active_custom_phase_only",
+      },
+    });
+    expect(requests[0]?.control.openRequiredTaskIds).toEqual([...initialOpenRequiredTaskIds].sort());
+    expect(requests[1]?.control).toMatchObject({
+      currentPhaseId: "phase_two",
+      admittedRootToolNames: ["complete_turn", "workspace_record_finding"],
+      openRequiredTaskIds: ["live-final"],
+    });
+    expect(requests[0]?.messages).not.toContain("FUTURE_PHASE_ONLY");
+    expect(requests[1]?.messages).toContain("FUTURE_PHASE_ONLY");
+    expect(JSON.stringify(requests.map((request) => request.control))).not.toContain("future-phase-task");
+    expect(JSON.stringify(requests)).not.toContain("RENDER_POLICY_MUST_NOT_ENTER_WORK");
+    expect(JSON.stringify(result)).not.toContain("host_private_phase_control_v1");
+    expect(result.observations.map((item) => item.status)).toEqual(["success", "accepted"]);
+  });
+  test("fails closed before dispatch when completion-gate IDs contradict the live count", async () => {
+    let dispatches = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      dispatches += 1;
+      return response("should not dispatch");
+    }, {
+      workspace: workspace({
+        getCompletionGates: async () => ({
+          requiredOpenTasks: 0,
+          openRequiredTaskIds: ["contradictory-required-task"],
+        }),
+      }),
+    }));
+
+    expect(dispatches).toBe(0);
+    expect(result.status).toBe("failed");
+    expect(result.code).toBe("completion_freeze_failed");
+  });
   test("drains skipped phases before exposing next phase material and grants", async () => {
     const skippedRef = phaseRef("skipped-first", 0);
     const enteredRef = phaseRef("entered-second", 1);
@@ -6868,7 +6991,9 @@ describe("Agentic WORK phase", () => {
       return response("", [complete("after-settle")]);
     }, {
       workspace: workspace({
-        getCompletionGates: async () => required ? { requiredOpenTasks: 1 } : {},
+        getCompletionGates: async () => required
+          ? { requiredOpenTasks: 1, openRequiredTaskIds: ["unsigned-required-task"] }
+          : { openRequiredTaskIds: [] },
         freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
       }),
       workspaceCapabilities: [],
@@ -6894,7 +7019,7 @@ describe("Agentic WORK phase", () => {
       return response("still working");
     }, {
       workspace: workspace({
-        getCompletionGates: async () => ({ requiredOpenTasks: 1 }),
+        getCompletionGates: async () => ({ requiredOpenTasks: 1, openRequiredTaskIds: ["storm-required-task"] }),
         freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
       }),
       workspaceCapabilities: [],
@@ -6921,7 +7046,9 @@ describe("Agentic WORK phase", () => {
       return response("", [complete("accepted")]);
     }, {
       workspace: workspace({
-        getCompletionGates: async () => round < 3 ? { requiredOpenTasks: 1 } : {},
+        getCompletionGates: async () => round < 3
+          ? { requiredOpenTasks: 1, openRequiredTaskIds: ["blocked-required-task"] }
+          : { openRequiredTaskIds: [] },
         freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
       }),
       workspaceCapabilities: [],

@@ -136,14 +136,17 @@ const PROVENANCE = new Set<WorkspaceArtifactProvenanceV1>(["host", "root", "chil
  * Closed public section vocabulary for owner-bound workspace reads.
  * The service remains the authority for authorization and redaction.
  */
-export type WorkspaceReadSection =
-  | "objective"
-  | "constraints"
-  | "tasks"
-  | "records"
-  | "submissions"
-  | "artifacts"
-  | "summary";
+export const WORKSPACE_READ_SECTIONS = Object.freeze([
+  "objective",
+  "constraints",
+  "tasks",
+  "records",
+  "submissions",
+  "artifacts",
+  "summary",
+] as const);
+export type WorkspaceReadSection = (typeof WORKSPACE_READ_SECTIONS)[number];
+const WORKSPACE_READ_SECTION_SET: ReadonlySet<string> = new Set(WORKSPACE_READ_SECTIONS);
 
 /** Public workspace snapshot returned by every workspace read/mutation. */
 export type WorkspaceSnapshotV1 = TurnWorkspaceV1;
@@ -229,11 +232,14 @@ export interface CreateWorkspaceTaskInputV1 extends WorkspaceFrameContextV1 {
   readonly taskId?: string;
   readonly title: string;
   readonly objective?: string;
-  readonly required?: boolean;
   readonly dependencyIds: readonly string[];
   readonly assignedFrameId: string | null;
   readonly retention?: WorkspaceRetentionV1;
   readonly ttlSeconds?: number;
+}
+
+interface CreateWorkspaceTaskRuntimeInputV1 extends CreateWorkspaceTaskInputV1 {
+  readonly hostRequired: boolean;
 }
 
 export interface UpdateWorkspaceTaskPolicyInputV1 extends WorkspaceFrameContextV1 {
@@ -601,7 +607,7 @@ export function validateReadWorkspaceSectionInput(value: unknown): ReadWorkspace
   if (!isRecord(value)) fail("invalid_input", "read input must be an object");
   assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "section", "page", "pageSize"], "read");
   const section = value.section;
-  if (typeof section !== "string" || !["objective", "constraints", "tasks", "records", "submissions", "artifacts", "summary"].includes(section)) fail("invalid_input", "section is invalid");
+  if (typeof section !== "string" || !WORKSPACE_READ_SECTION_SET.has(section)) fail("invalid_input", "section is invalid");
   return Object.freeze({ ...parsed, section: section as WorkspaceReadSection, page: integer(value.page ?? 0, "page", 0, Number.MAX_SAFE_INTEGER), pageSize: integer(value.pageSize ?? WORKSPACE_MAX_PAGE_SIZE, "pageSize", 1, WORKSPACE_MAX_PAGE_SIZE) });
 }
 export function validateAssignWorkspaceTasksInput(value: unknown): AssignWorkspaceTasksInputV1 {
@@ -629,13 +635,32 @@ export function validateAssignWorkspaceTasksInput(value: unknown): AssignWorkspa
   });
   return Object.freeze({ ...parsed, assignments: Object.freeze(assignments) });
 }
-export function validateCreateWorkspaceTaskInput(value: unknown): CreateWorkspaceTaskInputV1 {
+function validateCreateWorkspaceTaskRuntimeInput(value: unknown): CreateWorkspaceTaskRuntimeInputV1 {
   const parsed = contextValue(value);
   if (!isRecord(value)) fail("invalid_input", "task input must be an object");
+  const hasRequired = Object.prototype.hasOwnProperty.call(value, "required");
+  if (parsed.actor !== "host" && hasRequired) {
+    if (value.required === true) fail("forbidden", "only the host may create required tasks");
+    fail("invalid_input", "required is a host-only task creation field");
+  }
   assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "taskId", "title", "objective", "required", "dependencyIds", "assignedFrameId", "retention", "ttlSeconds"], "task");
   if (value.required !== undefined && typeof value.required !== "boolean") fail("invalid_input", "required must be boolean");
   const policy = value.retention === undefined ? undefined : retentionValue(value.retention, value.ttlSeconds);
-  return Object.freeze({ ...parsed, taskId: value.taskId === undefined ? undefined : idValue(value.taskId, "taskId"), title: stringValue(value.title, "title", WORKSPACE_TASK_TITLE_MAX_BYTES), objective: value.objective === undefined ? undefined : stringValue(value.objective, "objective", WORKSPACE_TASK_SUMMARY_MAX_BYTES), required: value.required ?? false, dependencyIds: identifierList(value.dependencyIds ?? [], "dependencyIds"), assignedFrameId: nullableId(value.assignedFrameId, "assignedFrameId") ?? null, retention: policy?.retention, ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS) });
+  return Object.freeze({
+    ...parsed,
+    taskId: value.taskId === undefined ? undefined : idValue(value.taskId, "taskId"),
+    title: stringValue(value.title, "title", WORKSPACE_TASK_TITLE_MAX_BYTES),
+    objective: value.objective === undefined ? undefined : stringValue(value.objective, "objective", WORKSPACE_TASK_SUMMARY_MAX_BYTES),
+    hostRequired: parsed.actor === "host" && value.required === true,
+    dependencyIds: identifierList(value.dependencyIds ?? [], "dependencyIds"),
+    assignedFrameId: nullableId(value.assignedFrameId, "assignedFrameId") ?? null,
+    retention: policy?.retention,
+    ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS),
+  });
+}
+export function validateCreateWorkspaceTaskInput(value: unknown): CreateWorkspaceTaskInputV1 {
+  const { hostRequired: _hostRequired, ...input } = validateCreateWorkspaceTaskRuntimeInput(value);
+  return Object.freeze(input);
 }
 export function validateUpdateWorkspaceTaskPolicyInput(value: unknown): UpdateWorkspaceTaskPolicyInputV1 {
   const parsed = contextValue(value);
@@ -1278,8 +1303,7 @@ export function readTurnWorkspaceSection(raw: unknown): WorkspaceSectionPageV1 {
   return { workspace, section: input.section, page: input.page, pageSize: input.pageSize, total: items.length, items: items.slice(input.page * input.pageSize, (input.page + 1) * input.pageSize) };
 }
 export function createWorkspaceTask(raw: unknown): WorkspaceTaskV1 {
-  const input = validateCreateWorkspaceTaskInput(raw);
-  if (input.required && input.actor !== "host") fail("forbidden", "root-created tasks must be optional");
+  const input = validateCreateWorkspaceTaskRuntimeInput(raw);
   const row = requireWritable(input);
   requireCapability(input, "create_task", raw);
   if (input.actor === "child") fail("forbidden", "children cannot create tasks");
@@ -1310,7 +1334,7 @@ export function createWorkspaceTask(raw: unknown): WorkspaceTaskV1 {
       title: input.title,
       description: objective,
       state: "active",
-      required: input.required ? 1 : 0,
+      required: input.hostRequired ? 1 : 0,
       dependencies_json: dependenciesJson,
       assigned_frame_id: input.assignedFrameId,
       progress: 0,
@@ -2636,8 +2660,7 @@ export function createWorkspaceTaskWithCognition(
   raw: unknown,
   factory: CognitionWorkspaceActivationFactoryV1,
 ): CognitionWorkspaceCommitResultV1 {
-  const input = validateCreateWorkspaceTaskInput(raw);
-  if (input.required && input.actor !== "host") fail("forbidden", "root-created tasks must be optional");
+  const input = validateCreateWorkspaceTaskRuntimeInput(raw);
   const row = requireWritable(input);
   requireCapability(input, "create_task", raw);
   if (input.actor === "child") fail("forbidden", "children cannot create tasks");
@@ -2666,7 +2689,7 @@ export function createWorkspaceTaskWithCognition(
       title: input.title,
       description: objective,
       state: "active",
-      required: input.required ? 1 : 0,
+      required: input.hostRequired ? 1 : 0,
       dependencies_json: JSON.stringify(input.dependencyIds),
       assigned_frame_id: input.assignedFrameId,
       progress: 0,

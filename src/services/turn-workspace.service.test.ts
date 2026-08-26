@@ -13,6 +13,7 @@ import {
   acceptWorkspaceSubmission,
   getActiveFrameCapabilityCountForTests,
   measureWorkspaceOperationBytesV1,
+  WORKSPACE_READ_SECTIONS,
   WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS,
   WORKSPACE_MAX_TASK_ASSIGNMENTS,
   WORKSPACE_OBJECTIVE_MAX_BYTES,
@@ -52,6 +53,8 @@ import {
   publishWorkspaceArtifact,
   recordWorkspaceRecord,
   readTurnWorkspaceSection,
+  validateCreateWorkspaceTaskInput,
+  validateReadWorkspaceSectionInput,
   settleWorkspaceChildTask,
   settleWorkspaceChildTaskWithCognition,
   submitWorkspaceChildResult,
@@ -379,14 +382,43 @@ afterEach(() => {
 });
 
 describe("turn workspace validators and CAS operations", () => {
-  test("enforces owner/child permissions and stale workspace revisions", () => {
+  test("keeps root-created tasks optional and omits required from the parsed contract", () => {
     const created = workspace();
     const task = createWorkspaceTask({ ...rootContext(created.id, created.revision), title: "Assigned work" });
     expect(task.required).toBe(false);
+    const parsed = validateCreateWorkspaceTaskInput({
+      ...rootContext(created.id, created.revision + 1),
+      title: "Parsed root task",
+    });
+    expect(parsed).not.toHaveProperty("required");
     expectWorkspaceError("forbidden", () => createWorkspaceTask({ ...rootContext(created.id, created.revision + 1), title: "Required without host", required: true }));
+    expectWorkspaceError("invalid_input", () => createWorkspaceTask({ ...rootContext(created.id, created.revision + 1), title: "Malformed required", required: "true" }));
+    expectWorkspaceError("invalid_input", () => validateCreateWorkspaceTaskInput({ ...rootContext(created.id, created.revision + 1), title: "Stale optional flag", required: false }));
     expectWorkspaceError("stale_revision", () => createWorkspaceTask({ ...rootContext(created.id, created.revision), title: "Stale writer" }));
     expectWorkspaceError("child_confinement", () => updateWorkspaceTaskProgress({ ...childContext(created.id, created.revision + 1), taskId: task.id, state: "blocked" }));
     expectWorkspaceError("not_found", () => getTurnWorkspace({ ...rootContext(created.id, created.revision), userId: OTHER_USER }));
+  });
+
+  test("derives the closed read validator from the canonical section tuple", () => {
+    expect(WORKSPACE_READ_SECTIONS).toEqual([
+      "objective",
+      "constraints",
+      "tasks",
+      "records",
+      "submissions",
+      "artifacts",
+      "summary",
+    ]);
+    for (const section of WORKSPACE_READ_SECTIONS) {
+      expect(validateReadWorkspaceSectionInput({
+        ...rootContext("section-workspace", 0),
+        section,
+      }).section).toBe(section);
+    }
+    expectWorkspaceError("invalid_input", () => validateReadWorkspaceSectionInput({
+      ...rootContext("section-workspace", 0),
+      section: "future_section",
+    }));
   });
   test("child progress cannot complete a task", () => {
     const created = workspace("progress-submission-boundary");
