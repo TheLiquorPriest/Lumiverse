@@ -787,6 +787,7 @@ function PredicateEditor({
           value={value.value}
           disabled={disabled}
           aria-label={t('predicate.generationType')}
+          onChange={(event) => onChange({ ...value, value: event.target.value as typeof value.value })}
         >
           {(['normal', 'continue', 'regenerate', 'swipe'] as const).map((generationType) => (
             <option key={generationType} value={generationType}>{t(`generationTypes.${generationType}`)}</option>
@@ -799,6 +800,7 @@ function PredicateEditor({
           value={value.value}
           disabled={disabled}
           aria-label={t('predicate.phase')}
+          onChange={(event) => onChange({ ...value, value: event.target.value as typeof value.value })}
         >
           {(['ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING', 'COMMITTED',
             'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT'] as const).map((phase) => (
@@ -931,6 +933,7 @@ function PredicateEditor({
             value={value.transition}
             disabled={disabled}
             aria-label={t('predicate.transition')}
+            onChange={(event) => onChange({ ...value, transition: event.target.value as typeof value.transition })}
           >
             {(['pending', 'active', 'blocked', 'completed', 'cancelled', 'failed'] as const).map((transition) => (
               <option key={transition} value={transition}>{t(`predicate.transitions.${transition}`)}</option>

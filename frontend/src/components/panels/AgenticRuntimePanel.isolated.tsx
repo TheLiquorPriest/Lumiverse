@@ -1614,4 +1614,162 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.querySelectorAll('input[type="number"]')).toHaveLength(0)
     expect(container.querySelectorAll('input[type="radio"]')).toHaveLength(4)
   })
+
+  test('updates nested All/Any leaf selects without rewriting siblings', async () => {
+    const evidence = { id: 'evidence', required: true, activation: { kind: 'phase' as const, value: 'WORK' as const } }
+    const keeper = { id: 'keeper', required: true, activation: { kind: 'phase' as const, value: 'WORK' as const } }
+    editorTaskTemplates = [evidence, keeper]
+    const enter = {
+      kind: 'all' as const,
+      children: [
+        { kind: 'generation_type' as const, value: 'normal' as const },
+        { kind: 'phase' as const, value: 'WORK' as const },
+        {
+          kind: 'any' as const,
+          children: [
+            { kind: 'task_transition' as const, taskId: 'evidence', transition: 'active' as const },
+            { kind: 'task_transition' as const, taskId: 'keeper', transition: 'failed' as const },
+          ],
+        },
+      ],
+    }
+    const value = preset()
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('typed_checkpoints', { enter }),
+    ])
+    value.agentConfig!.taskPolicy = { templateIds: ['evidence', 'keeper'] }
+    const dirtyStates: boolean[] = []
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container, root } = renderPanel({
+      value,
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    const enterFieldset = [...container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.enter'
+    ))
+    expect(enterFieldset).not.toBeNull()
+    const generationType = enterFieldset!.querySelector<HTMLSelectElement>('select[aria-label="predicate.generationType"]')
+    const currentPhase = enterFieldset!.querySelector<HTMLSelectElement>('select[aria-label="predicate.phase"]')
+    const transitions = [...enterFieldset!.querySelectorAll<HTMLSelectElement>('select[aria-label="predicate.transition"]')]
+    expect(generationType?.value).toBe('normal')
+    expect(currentPhase?.value).toBe('WORK')
+    expect(transitions.map((control) => control.value)).toEqual(['active', 'failed'])
+
+    changeSelect(generationType!, 'continue')
+    changeSelect(currentPhase!, 'COMPLETE')
+    changeSelect(transitions[0]!, 'completed')
+
+    expect(dirtyStates.at(-1)).toBe(true)
+    expect(button(container, 'save.action').disabled).toBe(false)
+    expect(enterFieldset!.querySelector<HTMLSelectElement>('select[aria-label="predicate.generationType"]')?.value).toBe('continue')
+    expect(enterFieldset!.querySelector<HTMLSelectElement>('select[aria-label="predicate.phase"]')?.value).toBe('COMPLETE')
+    expect([...enterFieldset!.querySelectorAll<HTMLSelectElement>('select[aria-label="predicate.transition"]')].map((control) => control.value)).toEqual(['completed', 'failed'])
+    expect([...enterFieldset!.querySelectorAll<HTMLSelectElement>('select[aria-label="predicate.task"]')].map((control) => control.value)).toEqual(['evidence', 'keeper'])
+
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.enter).toEqual({
+      kind: 'all',
+      children: [
+        { kind: 'generation_type', value: 'continue' },
+        { kind: 'phase', value: 'COMPLETE' },
+        {
+          kind: 'any',
+          children: [
+            { kind: 'task_transition', taskId: 'evidence', transition: 'completed' },
+            { kind: 'task_transition', taskId: 'keeper', transition: 'failed' },
+          ],
+        },
+      ],
+    })
+
+    const reloaded = structuredClone(value)
+    reloaded.agentConfig = structuredClone(saves[0]!.config)
+    reloaded.cacheRevision = (value.cacheRevision ?? 0) + 1
+    reloaded.agentConfigRevision = value.agentConfigRevision + 1
+    unmountRoot(root)
+    const remounted = renderPanel({ value: reloaded })
+    await settle()
+    flushSync(() => button(remounted.container, 'sections.phases.nav').click())
+    const reloadedEnter = [...remounted.container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.enter'
+    ))
+    expect(reloadedEnter?.querySelector<HTMLSelectElement>('select[aria-label="predicate.generationType"]')?.value).toBe('continue')
+    expect(reloadedEnter?.querySelector<HTMLSelectElement>('select[aria-label="predicate.phase"]')?.value).toBe('COMPLETE')
+    expect([...reloadedEnter!.querySelectorAll<HTMLSelectElement>('select[aria-label="predicate.transition"]')].map((control) => control.value)).toEqual(['completed', 'failed'])
+    expect(button(remounted.container, 'save.action').disabled).toBe(true)
+  })
+
+  test('authors a new nested task_transition completed leaf without rewriting All siblings', async () => {
+    const evidence = { id: 'evidence', required: true, activation: { kind: 'phase' as const, value: 'WORK' as const } }
+    editorTaskTemplates = [evidence]
+    const originalEnter = {
+      kind: 'all' as const,
+      children: [
+        { kind: 'generation_type' as const, value: 'normal' as const },
+        { kind: 'phase' as const, value: 'WORK' as const },
+      ],
+    }
+    const value = preset()
+    value.agentConfig!.runtimePolicy = runtimePolicy([
+      customPhase('completed_only', { enter: originalEnter, exit: originalEnter }),
+    ])
+    value.agentConfig!.taskPolicy = { templateIds: ['evidence'] }
+    const saves: AgenticRuntimeSaveDraft[] = []
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        saves.push(structuredClone(draft))
+        return saveResult(value, draft, promptOrder)
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.phases.nav').click())
+    const exitFieldset = [...container.querySelectorAll('fieldset')].find((fieldset) => (
+      fieldset.querySelector(':scope > legend')?.textContent === 'customPhases.exit'
+    ))
+    expect(exitFieldset).not.toBeNull()
+    flushSync(() => {
+      const add = [...exitFieldset!.querySelectorAll('button')].find((candidate) => (
+        candidate.textContent?.includes('predicate.add')
+      ))
+      add!.click()
+    })
+    const childRows = [...exitFieldset!.querySelectorAll<HTMLElement>('.predicateChild')]
+    expect(childRows).toHaveLength(3)
+    const addedKind = childRows[2]!.querySelector<HTMLSelectElement>('select')
+    expect(addedKind).not.toBeNull()
+    changeSelect(addedKind!, 'task_transition')
+    const addedTask = childRows[2]!.querySelector<HTMLSelectElement>('select[aria-label="predicate.task"]')
+    const addedTransition = childRows[2]!.querySelector<HTMLSelectElement>('select[aria-label="predicate.transition"]')
+    expect(addedTask).not.toBeNull()
+    expect(addedTransition?.value).toBe('active')
+    changeSelect(addedTask!, 'evidence')
+    changeSelect(addedTransition!, 'completed')
+
+    expect(exitFieldset!.querySelector<HTMLSelectElement>('select[aria-label="predicate.generationType"]')?.value).toBe('normal')
+    expect(exitFieldset!.querySelector<HTMLSelectElement>('select[aria-label="predicate.phase"]')?.value).toBe('WORK')
+    expect(childRows[2]!.querySelector<HTMLSelectElement>('select[aria-label="predicate.transition"]')?.value).toBe('completed')
+    expect(button(container, 'save.action').disabled).toBe(false)
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.enter).toEqual(originalEnter)
+    expect(saves[0]?.config.runtimePolicy?.phases[0]?.exit).toEqual({
+      kind: 'all',
+      children: [
+        { kind: 'generation_type', value: 'normal' },
+        { kind: 'phase', value: 'WORK' },
+        { kind: 'task_transition', taskId: 'evidence', transition: 'completed' },
+      ],
+    })
+  })
+
 })
