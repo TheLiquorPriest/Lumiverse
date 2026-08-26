@@ -672,11 +672,16 @@ function sameInspectionCorrelationIdentity(
 
 function normalizeError(value: unknown): AgentRunPublicErrorV2 | undefined {
   if (!isUnknownRecord(value)) return undefined
-  const code = isPublicErrorCode(value.code) ? value.code : 'internal_error'
-  const category = typeof value.category === 'string' && ERROR_CATEGORIES.has(value.category)
-    ? value.category as AgentRunPublicErrorV2['category']
+  const knownCode = isPublicErrorCode(value.code)
+  const code = knownCode ? value.code : 'internal_error'
+  const category = knownCode
+    ? (typeof value.category === 'string' && ERROR_CATEGORIES.has(value.category)
+      ? value.category as AgentRunPublicErrorV2['category']
+      : null)
     : 'internal'
-  const summaryCode = boundedString(value.summaryCode, MAX_LABEL_LENGTH)
+  const summaryCode = knownCode
+    ? boundedString(value.summaryCode, MAX_LABEL_LENGTH)
+    : 'internal_error'
   const recoveryAction = isRecoveryAction(value.recoveryAction) ? value.recoveryAction : null
   const target = value.target === null ? null : normalizeWorkTarget(value.target)
   const workPhase = isRunPhase(value.workPhase) ? value.workPhase : null

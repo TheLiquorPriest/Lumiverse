@@ -446,11 +446,11 @@ describe('agent run projection slice', () => {
     expect(unknown?.activity[0]?.errorCode).toBeUndefined()
   })
 
-  test('normalizes unknown owner-run error codes instead of vanishing the run', () => {
+  test('collapses unknown owner-run error taxonomy to canonical internal_error', () => {
     const error = {
       code: 'secret_internal_code',
       category: 'integrity',
-      summaryCode: 'internal_error',
+      summaryCode: 'attacker_taxonomy',
       recoveryEligible: false,
       recoveryAction: 'none',
       target: null,
@@ -463,13 +463,21 @@ describe('agent run projection slice', () => {
     }
     const unknown = normalizeAgentRunPublicV2({ ...run(), error })
     expect(unknown).not.toBeNull()
-    expect(unknown?.error?.code).toBe('internal_error')
+    expect(unknown?.error).toMatchObject({
+      code: 'internal_error',
+      category: 'internal',
+      summaryCode: 'internal_error',
+    })
 
     const approved = normalizeAgentRunPublicV2({
       ...run(),
-      error: { ...error, code: 'child_required_failed' },
+      error: { ...error, code: 'child_required_failed', summaryCode: 'child_required_failed' },
     })
-    expect(approved?.error?.code).toBe('child_required_failed')
+    expect(approved?.error).toMatchObject({
+      code: 'child_required_failed',
+      category: 'integrity',
+      summaryCode: 'child_required_failed',
+    })
   })
 
 
