@@ -1,5 +1,7 @@
 import { getDb } from "../db/connection";
-import { getAgentRunInspectionForTarget } from "./agent-activity-runs.service";
+import { getAgentRunInspection, getAgentRunInspectionForTarget } from "./agent-activity-runs.service";
+import type { AgentRunInspectionDetailV1 } from "../types/agent-run-projection";
+
 
 export function storeBreakdown(userId: string, messageId: string, chatId: string, data: any): void {
   const db = getDb();
@@ -11,22 +13,20 @@ export function storeBreakdown(userId: string, messageId: string, chatId: string
     [messageId, chatId, userId, json]
   );
 }
-function inspectionBreakdown(userId: string, messageId: string): any | null {
-  const db = getDb();
-  const message = db.query("SELECT m.chat_id, m.swipe_id FROM messages m JOIN chats c ON c.id = m.chat_id WHERE m.id = ? AND c.user_id = ? LIMIT 1").get(messageId, userId) as { chat_id?: unknown; swipe_id?: unknown } | null;
-  const swipeId = message?.swipe_id;
-  if (typeof message?.chat_id !== "string" || typeof swipeId !== "number" || !Number.isSafeInteger(swipeId)) return null;
-  // Resolve the inspection for this exact committed target identity. Do not
-  // fall back to a chat-wide transcript or to a different swipe's attempt.
-  const inspection = getAgentRunInspectionForTarget(userId, message.chat_id, messageId, swipeId);
-  if (!inspection) return null;
+function inspectionToBreakdown(inspection: AgentRunInspectionDetailV1): Record<string, unknown> {
   const retained = inspection.promptEvidence.filter((entry) => entry.destination !== "cortex" && entry.destination !== "council");
   const prompts = retained.some((entry) => entry.included)
     ? retained.filter((entry) => entry.included)
     : retained;
   const rootWorkInspection = inspection.promptEvidence.find((entry) => entry.destination === "root_work" && entry.loomInspection)?.loomInspection;
-  const loomPromptInspection = rootWorkInspection ?? inspection.promptEvidence.find((entry) => entry.loomInspection)?.loomInspection ?? null;
-  if (prompts.length === 0 && !loomPromptInspection) return null;
+  const continuationInspection = inspection.promptEvidence.find((entry) => (
+    (entry.destination === "completion_handoff" || entry.destination === "child_work")
+    && entry.loomInspection
+  ))?.loomInspection;
+  const loomPromptInspection = rootWorkInspection
+    ?? continuationInspection
+    ?? inspection.promptEvidence.find((entry) => entry.loomInspection)?.loomInspection
+    ?? null;
   const entries = prompts.map((entry) => ({
     name: entry.sourceId,
     type: "lumiverse",
@@ -34,6 +34,7 @@ function inspectionBreakdown(userId: string, messageId: string): any | null {
     role: entry.role === "user" || entry.role === "assistant" ? entry.role : "system",
     content: entry.content,
     blockId: entry.sourceId,
+    destination: entry.destination,
   }));
   const messages = prompts.map((entry) => ({
     role: entry.role === "user" || entry.role === "assistant" ? entry.role : "system",
@@ -56,8 +57,29 @@ function inspectionBreakdown(userId: string, messageId: string): any | null {
     tokenizer_name: null,
     assemblySurface: "WORK",
     loomPromptInspection,
+    inspectionAttemptId: inspection.attempt.attemptId,
+    target: inspection.target,
   };
 }
+
+function inspectionBreakdown(userId: string, messageId: string): Record<string, unknown> | null {
+  const db = getDb();
+  const message = db.query("SELECT m.chat_id, m.swipe_id FROM messages m JOIN chats c ON c.id = m.chat_id WHERE m.id = ? AND c.user_id = ? LIMIT 1").get(messageId, userId) as { chat_id?: unknown; swipe_id?: unknown } | null;
+  const swipeId = message?.swipe_id;
+  if (typeof message?.chat_id !== "string" || typeof swipeId !== "number" || !Number.isSafeInteger(swipeId)) return null;
+  // Resolve the inspection for this exact committed target identity. Do not
+  // fall back to a chat-wide transcript or to a different swipe's attempt.
+  const inspection = getAgentRunInspectionForTarget(userId, message.chat_id, messageId, swipeId);
+  if (!inspection) return null;
+  return inspectionToBreakdown(inspection);
+}
+
+export function getBreakdownForAttempt(userId: string, attemptId: string, chatId?: string): Record<string, unknown> | null {
+  const inspection = getAgentRunInspection(userId, attemptId, chatId);
+  if (!inspection) return null;
+  return inspectionToBreakdown(inspection);
+}
+
 
 export function getBreakdown(userId: string, messageId: string): any | null {
   const db = getDb();

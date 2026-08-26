@@ -9,13 +9,15 @@ import { useStore } from '@/store'
 import { selectAgentRunForTarget } from '@/store/slices/agent-runs'
 import { generateApi, type DryRunMessage } from '@/api/generate'
 import { agentRunsApi } from '@/api/agent-runs'
-import type { AgentRunInspectionDetailV1 } from '@/types/agent-runs'
 import type { BreakdownCacheEntry } from '@/types/store'
 import { findExpandedTextMatches } from '@/lib/expandedTextSearch'
 import {
   GROUP_COLORS,
   groupBreakdownEntries,
   getBlockDisplayColor,
+  inspectionAttemptTargetMessageId,
+  inspectionDetailToBreakdown,
+  workInspectionCheckpointLabel,
   type BreakdownEntry,
   type BreakdownGroup,
 } from '@/lib/prompt-breakdown'
@@ -51,49 +53,6 @@ function countLines(content: string): number {
   return content.split(/\r\n|\r|\n/).length
 }
 
-function inspectionDetailToBreakdown(detail: AgentRunInspectionDetailV1): BreakdownCacheEntry | null {
-  const retained = detail.promptEvidence.filter(
-    (entry) => entry.destination !== 'cortex' && entry.destination !== 'council',
-  )
-  const prompts = retained.some((entry) => entry.included)
-    ? retained.filter((entry) => entry.included)
-    : retained
-  const rootWorkInspection = detail.promptEvidence.find(
-    (entry) => entry.destination === 'root_work' && entry.loomInspection,
-  )?.loomInspection
-  const loomPromptInspection = rootWorkInspection
-    ?? detail.promptEvidence.find((entry) => entry.loomInspection)?.loomInspection
-    ?? undefined
-  if (prompts.length === 0 && !loomPromptInspection) return null
-  return {
-    entries: prompts.map((entry) => ({
-      name: entry.sourceId,
-      type: 'lumiverse',
-      tokens: 0,
-      role: entry.role,
-      content: entry.content,
-      blockId: entry.sourceId,
-    })),
-    messages: prompts.map((entry) => ({
-      role: entry.role === 'user' || entry.role === 'assistant' ? entry.role : 'system',
-      content: entry.content,
-    })),
-    totalTokens: detail.usage.totals.totalTokens,
-    chatHistoryTokens: 0,
-    maxContext: 0,
-    model: 'recorded',
-    provider: 'inspection',
-    parameters: {},
-    usage: {
-      prompt_tokens: detail.usage.totals.inputTokens,
-      completion_tokens: detail.usage.totals.outputTokens,
-      total_tokens: detail.usage.totals.totalTokens,
-    },
-    tokenizer_name: null,
-    assemblySurface: 'WORK',
-    loomPromptInspection,
-  }
-}
 
 export default function PromptItemizerModal() {
   const { t } = useTranslation('modals', { keyPrefix: 'promptItemizer' })
@@ -214,8 +173,10 @@ export default function PromptItemizerModal() {
           return agentRunsApi.inspection(inspectionAttemptId, chatId ?? undefined)
             .then((detail) => {
               const entry = inspectionDetailToBreakdown(detail)
-              if (!entry) throw new Error('inspection_breakdown_unavailable')
-              cacheBreakdown(messageId, entry)
+              const attemptMessageId = inspectionAttemptTargetMessageId(detail)
+              if (messageId && attemptMessageId === messageId) {
+                cacheBreakdown(messageId, entry)
+              }
               setLoadError(null)
               setData(entry)
             })
@@ -235,7 +196,6 @@ export default function PromptItemizerModal() {
     agentRunsApi.inspection(inspectionAttemptId, chatId ?? undefined)
       .then((detail) => {
         const entry = inspectionDetailToBreakdown(detail)
-        if (!entry) throw new Error('inspection_breakdown_unavailable')
         setLoadError(null)
         setData(entry)
       })
@@ -773,7 +733,7 @@ export default function PromptItemizerModal() {
                       <p className={styles.effectivePromptEyebrow}>
                         <code>{assemblySurface}</code>
                         <span aria-hidden="true">·</span>
-                        <code>{loomInspection?.checkpoint ?? 'ordinary_response'}</code>
+                        <code>{workInspectionCheckpointLabel(assemblySurface, loomInspection?.checkpoint)}</code>
                       </p>
                       <h3 id="effective-prompt-inspection-title">{t('inspectionTitle')}</h3>
                       <p>

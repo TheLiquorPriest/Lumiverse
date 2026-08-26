@@ -22,6 +22,7 @@ import {
   persistAgentRunInspection,
   persistTerminalAgentActivityRun,
 } from "./agent-activity-runs.service";
+import { getBreakdown, getBreakdownForAttempt, storeBreakdown } from "./breakdown.service";
 import { runMigrations } from "../db/migrate";
 import type { AgentActivitySnapshotV1 } from "../types/agent-runtime";
 import type { PersistAgentRunInspectionInputV1 } from "./agent-activity-runs.service";
@@ -2211,6 +2212,190 @@ describe("agent run inspection terminal persistence", () => {
     ]));
     expect(JSON.stringify(detail!.usage)).not.toContain("root-recovered");
   });
+
+  test("resolves exact attempt WORK inspection without a message target and does not attach to greeting", () => {
+    const chat = createChat(OWNER, { name: "inspection-no-target-breakdown" });
+    const greeting = createMessage(chat.id, { is_user: true, name: "User", content: "hello" }, OWNER);
+    const correlation = {
+      turnSessionId: "exhausted-turn",
+      runId: "exhausted-run",
+      attemptId: "exhausted-attempt",
+      chatId: chat.id,
+      generationId: "exhausted-generation",
+      messageId: null,
+      swipeId: null,
+      actorId: "host",
+      recipientId: "agent",
+      phase: "WORK",
+      taskId: null,
+      toolId: null,
+      parentId: null,
+      hostCorrelationId: "inspection-host",
+      hostSequence: 1,
+    };
+    const loomInspection = {
+      version: 1,
+      surface: "WORK",
+      checkpoint: "WORK",
+      items: [],
+      effectiveEntryIds: ["loom-root"],
+    };
+    persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "exhausted-attempt",
+      runId: "exhausted-run",
+      turnSessionId: "exhausted-turn",
+      generationId: "exhausted-generation",
+      targetMessageId: null,
+      targetSwipeId: null,
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "exhausted",
+      reason: "budget_exhausted",
+      promptEvidence: [{
+        version: 1,
+        id: "prompt-root",
+        sourceId: "loom-root",
+        sourceRevision: 3,
+        destination: "root_work",
+        role: "system",
+        correlation,
+        included: true,
+        content: "ROOT_WORK_PROMPT",
+        contentDigest: "a".repeat(64),
+        omissionReason: null,
+        nativeProvenance: null,
+        loomInspection,
+      }, {
+        version: 1,
+        id: "prompt-handoff",
+        sourceId: "phase-continuation",
+        sourceRevision: 3,
+        destination: "completion_handoff",
+        role: "system",
+        correlation: { ...correlation, hostSequence: 2 },
+        included: true,
+        content: "PHASE_CONTINUATION",
+        contentDigest: "b".repeat(64),
+        omissionReason: null,
+        nativeProvenance: null,
+        loomInspection: {
+          version: 1,
+          surface: "WORK",
+          checkpoint: "PREPARE_COMMIT",
+          items: [],
+          effectiveEntryIds: ["phase-continuation"],
+        },
+      }, {
+        version: 1,
+        id: "prompt-cortex",
+        sourceId: "cortex-private",
+        sourceRevision: 1,
+        destination: "cortex",
+        role: "system",
+        correlation: { ...correlation, hostSequence: 3 },
+        included: true,
+        content: "PRIVATE_CORTEX",
+        contentDigest: "c".repeat(64),
+        omissionReason: null,
+        nativeProvenance: null,
+        loomInspection: null,
+      }],
+    }));
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "failed-attempt",
+      runId: "failed-run",
+      turnSessionId: "failed-turn",
+      generationId: "failed-generation",
+      hostCorrelationId: "failed-host",
+      targetMessageId: null,
+      targetSwipeId: null,
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      reason: "required_work_failure",
+      promptEvidence: [{
+        version: 1,
+        id: "prompt-failed",
+        sourceId: "failed-root",
+        sourceRevision: 1,
+        destination: "root_work",
+        role: "system",
+        correlation: {
+          turnSessionId: "failed-turn",
+          runId: "failed-run",
+          attemptId: "failed-attempt",
+          chatId: chat.id,
+          generationId: "failed-generation",
+          messageId: null,
+          swipeId: null,
+          actorId: "host",
+          recipientId: "agent",
+          phase: "WORK",
+          taskId: null,
+          toolId: null,
+          parentId: null,
+          hostCorrelationId: "failed-host",
+          hostSequence: 1,
+        },
+        included: true,
+        content: "FAILED_WORK_PROMPT",
+        contentDigest: "d".repeat(64),
+        omissionReason: null,
+        nativeProvenance: null,
+        loomInspection: {
+          version: 1,
+          surface: "WORK",
+          checkpoint: "WORK",
+          items: [],
+          effectiveEntryIds: ["failed-root"],
+        },
+      }],
+    }))).not.toBeNull();
+
+    const exhausted = getBreakdownForAttempt(OWNER, "exhausted-attempt", chat.id);
+    expect(exhausted).toMatchObject({
+      assemblySurface: "WORK",
+      inspectionAttemptId: "exhausted-attempt",
+      target: null,
+      loomPromptInspection: expect.objectContaining({ surface: "WORK", checkpoint: "WORK" }),
+    });
+    expect((exhausted?.entries as Array<{ content: string }>).map((entry) => entry.content)).toEqual([
+      "ROOT_WORK_PROMPT",
+      "PHASE_CONTINUATION",
+    ]);
+    expect(JSON.stringify(exhausted)).not.toContain("PRIVATE_CORTEX");
+    expect(JSON.stringify(exhausted)).not.toContain("FAILED_WORK_PROMPT");
+    expect(JSON.stringify(exhausted)).not.toContain("ordinary_response");
+
+    const failed = getBreakdownForAttempt(OWNER, "failed-attempt", chat.id);
+    expect(failed).toMatchObject({
+      assemblySurface: "WORK",
+      inspectionAttemptId: "failed-attempt",
+    });
+    expect((failed?.entries as Array<{ content: string }>)[0]?.content).toBe("FAILED_WORK_PROMPT");
+    expect(getBreakdownForAttempt(OWNER, "missing-attempt", chat.id)).toBeNull();
+
+    expect(getBreakdown(OWNER, greeting.id)).toBeNull();
+    storeBreakdown(OWNER, greeting.id, chat.id, {
+      assemblySurface: "RESPONSE",
+      entries: [{ name: "greeting", type: "lumiverse", tokens: 1, role: "user", content: "hello" }],
+      messages: [{ role: "user", content: "hello" }],
+      totalTokens: 1,
+      maxContext: 0,
+      model: "response-model",
+      provider: "response-provider",
+      tokenizer_name: null,
+    });
+    expect(getBreakdown(OWNER, greeting.id)).toMatchObject({
+      assemblySurface: "RESPONSE",
+      model: "response-model",
+    });
+    expect(getBreakdownForAttempt(OWNER, "exhausted-attempt", chat.id)).toMatchObject({
+      assemblySurface: "WORK",
+      inspectionAttemptId: "exhausted-attempt",
+    });
+  });
+
 });
 
 describe("agent run inspection keyset pagination", () => {

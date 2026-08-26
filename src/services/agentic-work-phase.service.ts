@@ -7106,6 +7106,19 @@ export async function runAgenticWorkPhase(
           renderHandoff,
         );
       }
+      // Recoverable complete_turn completion_blocked is an unsigned boundary
+      // attempt on the same maxUnsignedBoundaries counter as prose stops.
+      // Successful phase_advanced / accepted calls do not increment. Count
+      // once per batch, then stop before another provider dispatch at the cap.
+      if (
+        hasCompletion
+        && observations.slice(batchObservationStart).some((item) => item.code === "completion_blocked")
+      ) {
+        if (!state.reserveUnsignedBoundary()) {
+          return finishBatchExit("exhausted", "unsigned_boundary_budget_exhausted");
+        }
+      }
+
       if (providerTransientCarrier?.kind === "openai_responses") {
         const nativeContinuation = hasCompletion
           ? buildNativeHostContinuation(completionCriteria)

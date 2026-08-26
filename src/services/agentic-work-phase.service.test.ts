@@ -6819,4 +6819,125 @@ describe("Agentic WORK phase", () => {
     });
   });
 
+  test("four-phase COMPLETE success does not consume unsigned boundaries", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return response("", [complete(`phase-${round}`)]);
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("phase-0", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            nextPhaseIds: ["phase-1"],
+          }),
+          customPhase("phase-1", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            nextPhaseIds: ["phase-2"],
+          }),
+          customPhase("phase-2", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+            nextPhaseIds: ["phase-3"],
+          }),
+          customPhase("phase-3", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async ({ expectedRevision }) => phaseSnapshot(expectedRevision ?? 0),
+      }),
+      workspaceCapabilities: [],
+      phaseEvaluationContext: phaseContext(),
+      phaseAdmittedCapabilities: [],
+      phaseRevision: 4,
+    }));
+    expect(result.status).toBe("completed");
+    expect(result.code).toBeUndefined();
+    expect(result.unsignedBoundaryCount).toBe(0);
+    expect(round).toBe(4);
+  });
+
+  test("one recoverable complete_turn completion_blocked then correction succeeds on the unsigned budget", async () => {
+    let round = 0;
+    let required = true;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) return response("", [complete("early-blocked")]);
+      if (round === 2) return response("", [call("chat_search_history", "clear-gate", { query: "x" })]);
+      return response("", [complete("after-settle")]);
+    }, {
+      workspace: workspace({
+        getCompletionGates: async () => required ? { requiredOpenTasks: 1 } : {},
+        freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
+      }),
+      workspaceCapabilities: [],
+      coreToolCapability: { execute: async () => { required = false; return []; } },
+      budget: { maxUnsignedBoundaries: 1 },
+    }));
+    expect(result.status).toBe("completed");
+    expect(result.code).toBeUndefined();
+    expect(result.unsignedBoundaryCount).toBe(1);
+    expect(result.observations.find((item) => item.callId === "early-blocked")).toMatchObject({
+      status: "rejected",
+      code: "completion_blocked",
+    });
+    expect(result.observations.find((item) => item.callId === "after-settle")?.status).toBe("accepted");
+    expect(round).toBe(3);
+  });
+
+  test("repeated blocked complete_turn and prose stops share one unsigned budget and exhaust before another dispatch", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1 || round === 3) return response("", [complete(`blocked-${round}`)]);
+      return response("still working");
+    }, {
+      workspace: workspace({
+        getCompletionGates: async () => ({ requiredOpenTasks: 1 }),
+        freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
+      }),
+      workspaceCapabilities: [],
+      budget: { maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
+    }));
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("unsigned_boundary_budget_exhausted");
+    expect(result.completion).toBeUndefined();
+    expect(result.unsignedBoundaryCount).toBe(2);
+    expect(round).toBe(3);
+  });
+
+  test("does not double-count a blocked complete_turn batch or mixed-batch rejections", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      if (round === 1) {
+        return response("", [
+          complete("mixed-complete"),
+          call("chat_search_history", "mixed-action", { query: "x" }),
+        ]);
+      }
+      if (round === 2) return response("", [complete("blocked-once")]);
+      return response("", [complete("accepted")]);
+    }, {
+      workspace: workspace({
+        getCompletionGates: async () => round < 3 ? { requiredOpenTasks: 1 } : {},
+        freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
+      }),
+      workspaceCapabilities: [],
+      coreToolCapability: { execute: async () => [] },
+      budget: { maxUnsignedBoundaries: 2 },
+    }));
+    expect(result.status).toBe("completed");
+    expect(result.observations.find((item) => item.callId === "mixed-complete")?.code).toBe("completion_mixed_batch");
+    expect(result.observations.find((item) => item.callId === "blocked-once")).toMatchObject({
+      status: "rejected",
+      code: "completion_blocked",
+    });
+    expect(result.observations.find((item) => item.callId === "accepted")?.status).toBe("accepted");
+    expect(result.unsignedBoundaryCount).toBe(1);
+    expect(round).toBe(3);
+  });
+
+
 });
