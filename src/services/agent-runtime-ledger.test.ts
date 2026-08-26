@@ -269,5 +269,50 @@ describe("agent turn ledger", () => {
     ledger.close();
   });
 
+  test("retains approved child activity error codes and drops unknown strings", () => {
+    const { ledger } = create();
+    const startedAt = 1;
+    const approved = {
+      id: `${ledger.generationId}:child`,
+      parentId: ledger.generationId,
+      kind: "child_invocation" as const,
+      actor: "child" as const,
+      phase: "failed" as const,
+      status: "failed" as const,
+      startedAt,
+      elapsedMs: 2,
+      errorCode: "child_output_limit_exceeded" as const,
+    };
+    const leaked = {
+      id: `${ledger.generationId}:tool`,
+      parentId: ledger.generationId,
+      kind: "tool_attempt" as const,
+      actor: "tool" as const,
+      phase: "failed" as const,
+      status: "failed" as const,
+      startedAt,
+      elapsedMs: 2,
+      errorCode: "secret_internal_code" as "internal_error",
+    };
+    ledger.recordActivityNode(approved);
+    ledger.recordActivityNode({
+      ...approved,
+      id: `${ledger.generationId}:required`,
+      errorCode: "child_required_failed",
+    });
+    ledger.recordActivityNode({
+      ...approved,
+      id: `${ledger.generationId}:protocol`,
+      errorCode: "agentic_protocol_failure",
+    });
+    ledger.recordActivityNode(leaked);
+    const snapshot = ledger.activitySnapshot("failed", "internal_error");
+    expect(snapshot.nodes.find((node) => node.id === approved.id)?.errorCode).toBe("child_output_limit_exceeded");
+    expect(snapshot.nodes.find((node) => node.id === `${ledger.generationId}:required`)?.errorCode).toBe("child_required_failed");
+    expect(snapshot.nodes.find((node) => node.id === `${ledger.generationId}:protocol`)?.errorCode).toBe("agentic_protocol_failure");
+    expect(snapshot.nodes.find((node) => node.id === leaked.id)?.errorCode).toBeUndefined();
+    ledger.close();
+  });
+
 });
 

@@ -777,6 +777,8 @@
       "logical_provider_request_limit_exceeded": "Limite de requêtes au modèle atteinte.",
       "physical_dispatch_attempt_limit_exceeded": "Limite de tentatives d’envoi atteinte.",
       "child_output_token_limit_exceeded": "Limite de sortie des agents enfants atteinte.",
+      "child_output_limit_exceeded": "L’agent enfant a atteint sa limite de sortie.",
+      "child_required_failed": "Un agent enfant obligatoire a échoué.",
       "root_wall_clock_limit_exceeded": "Limite de temps atteinte.",
       "activity_event_limit_exceeded": "Limite de mises à jour d’activité atteinte.",
       "activity_byte_limit_exceeded": "Limite de taille de l’activité atteinte.",

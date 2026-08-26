@@ -223,9 +223,11 @@ import { resolveCounter } from "./tokenizer.service";
 import { withUserDataMutationSync } from "./user-data/snapshot";
 import {
   publicActivityToolId,
+  AGENT_PUBLIC_ERROR_CODES,
   type AgentActivityLifecycle,
   type AgentActivityNodeV1,
   type AgentActivityUsageV1,
+  type AgentPublicErrorCode,
   type AgentWorkAttemptLineageV1,
 } from "../types/agent-runtime";
 import { getMessage } from "./chats.service";
@@ -1995,6 +1997,14 @@ function publicWorkActivityUsage(
 }
 
 
+const PUBLIC_WORK_ACTIVITY_ERROR_CODES = new Set<string>(AGENT_PUBLIC_ERROR_CODES);
+
+function publicWorkActivityErrorCode(value: unknown): AgentPublicErrorCode | undefined {
+  return typeof value === "string" && PUBLIC_WORK_ACTIVITY_ERROR_CODES.has(value)
+    ? value as AgentPublicErrorCode
+    : undefined;
+}
+
 function recordPublicWorkActivity(
   ledger: { recordActivityNode(node: AgentActivityNodeV1): void },
   outcome: Pick<AgenticWorkPhaseOutcome, "observations" | "childResults">,
@@ -2013,6 +2023,7 @@ function recordPublicWorkActivity(
     const status: AgentActivityLifecycle = observation.status === "error" || observation.status === "rejected"
       ? "failed"
       : "completed";
+    const errorCode = publicWorkActivityErrorCode(observation.code);
     ledger.recordActivityNode({
       id,
       parentId: generationId,
@@ -2024,12 +2035,14 @@ function recordPublicWorkActivity(
       elapsedMs: 0,
       toolId: publicActivityToolId(observation.toolName),
       usage,
+      ...(errorCode ? { errorCode } : {}),
     });
   }
   for (const child of outcome.childResults) {
     if (seenNodeIds.has(child.childId)) continue;
     seenNodeIds.add(child.childId);
     const status: AgentActivityLifecycle = child.status === "succeeded" ? "completed" : child.status;
+    const errorCode = publicWorkActivityErrorCode(child.errorCode);
     ledger.recordActivityNode({
       id: child.childId,
       parentId: generationId,
@@ -2043,6 +2056,7 @@ function recordPublicWorkActivity(
         ? { profileId: child.profileId }
         : {}),
       usage,
+      ...(errorCode ? { errorCode } : {}),
     });
   }
   return usage;

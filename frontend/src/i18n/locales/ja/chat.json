@@ -777,6 +777,8 @@
       "logical_provider_request_limit_exceeded": "モデルリクエスト上限に達しました。",
       "physical_dispatch_attempt_limit_exceeded": "ディスパッチ上限に達しました。",
       "child_output_token_limit_exceeded": "子エージェントの出力上限に達しました。",
+      "child_output_limit_exceeded": "子エージェントが出力上限に達しました。",
+      "child_required_failed": "必須の子エージェントが失敗しました。",
       "root_wall_clock_limit_exceeded": "時間上限に達しました。",
       "activity_event_limit_exceeded": "アクティビティ更新上限に達しました。",
       "activity_byte_limit_exceeded": "アクティビティサイズ上限に達しました。",

@@ -6051,12 +6051,13 @@ describe("Agentic WORK phase", () => {
         return response("", [call("workspace_create_task", "create-owned", { taskId: "fn_required_child", title: "Owned" })]);
       }
       if (dispatchCount === 4) {
-        return response("", [call("workspace_create_task", "create-new", { title: "Optional neighbor" })]);
+        return response("", [call("workspace_create_task", "create-new", { taskId: "optional-neighbor", title: "Optional neighbor" })]);
       }
       if (dispatchCount === 5) {
         return response("", [call("workspace_submit_root_result", "submit-child-owned", {
           taskId: "turn:fn_required_child",
           state: "failed",
+          summary: "child owned",
         })]);
       }
       if (dispatchCount === 6) {
@@ -6089,12 +6090,51 @@ describe("Agentic WORK phase", () => {
     expect(payloads).toEqual(expect.arrayContaining([
       expect.objectContaining({ errorCode: "invalid_input", message: "section is invalid" }),
       expect.objectContaining({ errorCode: "conflict", message: "workspace task identifier is reserved by frozen cognition templates" }),
-      expect.objectContaining({ errorCode: "conflict", message: "root may not settle a child-assigned task" }),
+      expect.objectContaining({ errorCode: "tool_not_allowed", message: "root may not settle a child-assigned task" }),
       expect.objectContaining({ errorCode: "invalid_input", message: "taskId is not a stable identifier" }),
     ]));
     expect(payloads.some((payload) => payload.errorCode === "internal_error")).toBe(false);
     expect(result.observations.find((item) => item.callId === "read-objective")?.status).toBe("success");
     expect(result.observations.find((item) => item.callId === "create-new")?.status).toBe("success");
+  });
+
+  test("maps typed cognition completion_blocked to a recoverable completion_blocked result", async () => {
+    const payloads: Record<string, unknown>[] = [];
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+      dispatchCount += 1;
+      if (dispatchCount > 1) {
+        for (const message of messages) {
+          if (!Array.isArray(message.content)) continue;
+          for (const part of message.content) {
+            if (part.type !== "tool_result" || typeof part.content !== "string") continue;
+            try {
+              payloads.push(JSON.parse(part.content) as Record<string, unknown>);
+            } catch {
+              // ignore non-JSON
+            }
+          }
+        }
+      }
+      if (dispatchCount === 1) {
+        return response("", [call("workspace_read_section", "read-blocked", { section: "objective" })]);
+      }
+      return response("", [complete("after-completion-blocked")]);
+    }, {
+      workspace: workspace({
+        execute: async () => {
+          throw Object.assign(new Error("turn completion is blocked"), { code: "completion_blocked" });
+        },
+      }),
+      workspaceCapabilities: ["read_section"],
+    }));
+    expect(result.status).toBe("completed");
+    expect(result.code).toBeUndefined();
+    expect(payloads[0]).toMatchObject({ errorCode: "completion_blocked", message: "turn completion is blocked" });
+    expect(result.observations.find((item) => item.callId === "read-blocked")).toMatchObject({
+      status: "error",
+      code: "completion_blocked",
+    });
   });
 
   test("keeps unknown workspace exceptions internal without failing WORK", async () => {
@@ -6132,37 +6172,39 @@ describe("Agentic WORK phase", () => {
     expect(JSON.stringify(payloads[0])).not.toContain("sqlite exploded");
   });
 
-  test("fails child length with zero published bytes immediately at the authored cap", async () => {
-    let rounds = 0;
-    const child = await executeBoundedAgenticChildFrame({
-      frame: createAgenticChildFrame({
-        frameId: "child-length-empty",
-        parentFrameId: "root",
-        connectionId: "concrete-connection",
-        model: "frozen-model",
-        coreToolIds: [],
-        signal: new AbortController().signal,
-      }),
-      task: "bounded task",
-      systemPrompt: "bounded system prompt",
-      budget: { maxChildRounds: 3, maxOutputTokens: 384, maxUnsignedBoundaries: 2 },
-      dispatch: async ({ maxOutputTokens }) => {
-        rounds += 1;
-        expect(maxOutputTokens).toBe(384);
-        return {
-          content: "",
-          finish_reason: "length",
-          reasoning: "x".repeat(64),
-          usage: { prompt_tokens: 1, completion_tokens: 384, total_tokens: 385 },
-        };
-      },
+  for (const finishReason of ["length", "max_tokens", "max_output_tokens"] as const) {
+    test(`fails child ${finishReason} with zero published bytes immediately at the authored cap`, async () => {
+      let rounds = 0;
+      const child = await executeBoundedAgenticChildFrame({
+        frame: createAgenticChildFrame({
+          frameId: `child-${finishReason}-empty`,
+          parentFrameId: "root",
+          connectionId: "concrete-connection",
+          model: "frozen-model",
+          coreToolIds: [],
+          signal: new AbortController().signal,
+        }),
+        task: "bounded task",
+        systemPrompt: "bounded system prompt",
+        budget: { maxChildRounds: 3, maxOutputTokens: 384, maxUnsignedBoundaries: 2 },
+        dispatch: async ({ maxOutputTokens }) => {
+          rounds += 1;
+          expect(maxOutputTokens).toBe(384);
+          return {
+            content: "",
+            finish_reason: finishReason,
+            reasoning: "x".repeat(64),
+            usage: { prompt_tokens: 1, completion_tokens: 384, total_tokens: 385 },
+          };
+        },
+      });
+      expect(rounds).toBe(1);
+      expect(child.status).toBe("failed");
+      expect(child.code).toBe("child_output_limit_exceeded");
+      expect(child.errorMessage).toContain("maxOutputTokens=384");
+      expect(child.errorMessage).toContain("finish_reason=length");
     });
-    expect(rounds).toBe(1);
-    expect(child.status).toBe("failed");
-    expect(child.code).toBe("child_output_limit_exceeded");
-    expect(child.errorMessage).toContain("maxOutputTokens=384");
-    expect(child.errorMessage).toContain("finish_reason=length");
-  });
+  }
 
   test("retries one non-length empty child publish then keeps child_required_failed", async () => {
     let rounds = 0;

@@ -55,6 +55,7 @@ const AGENT_PUBLIC_ERROR_CODES: Record<AgentPublicErrorCode, true> = {
   provider_request_error: true, provider_protocol_error: true, provider_schema_error: true,
   invalid_task: true, invalid_profile: true, invalid_arguments: true, batch_rejected: true,
   unknown_tool: true, unauthorized: true, integrity_error: true, internal_error: true,
+  child_required_failed: true, child_output_limit_exceeded: true, agentic_protocol_failure: true,
 }
 const AGENT_ACTIVITY_LIFECYCLES: Record<AgentActivityLifecycle, true> = {
   queued: true, running: true, completed: true, failed: true, cancelled: true, timed_out: true,
@@ -238,7 +239,6 @@ export function normalizeAgentActivityPayload(value: unknown): AgentActivityPayl
     || (swipeId !== undefined && (typeof swipeId !== 'number' || !Number.isSafeInteger(swipeId) || swipeId < 0))
     || (rawRoundIndex !== undefined && roundIndex === null)
     || continuationMode === null
-    || (rawErrorCode !== undefined && !isAgentPublicErrorCode(rawErrorCode))
   ) return null
   const toolName = rawToolName === undefined ? undefined : isAgentActivityToolName(rawToolName) ? rawToolName : null
   if (toolName === null) return null
@@ -255,7 +255,7 @@ export function normalizeAgentActivityPayload(value: unknown): AgentActivityPayl
     ...(profileName !== undefined ? { profileName } : {}),
     phase,
     status,
-    ...(rawErrorCode !== undefined ? { errorCode: rawErrorCode as AgentPublicErrorCode } : {}),
+    ...(isAgentPublicErrorCode(rawErrorCode) ? { errorCode: rawErrorCode } : {}),
     ...(toolName !== undefined ? { toolName } : {}),
     startedAt,
     elapsedMs,
@@ -377,11 +377,7 @@ function normalizeActivityNode(value: unknown): AgentActivityNodeV1 | null {
       ? rawContinuationMode as AgentActivityNodeV1['continuationMode']
       : null
   const rawErrorCode = readOwnDataProperty(source, 'errorCode')
-  const errorCode = rawErrorCode === undefined
-    ? undefined
-    : isAgentPublicErrorCode(rawErrorCode)
-      ? rawErrorCode
-      : null
+  const errorCode = isAgentPublicErrorCode(rawErrorCode) ? rawErrorCode : undefined
   const rawUsage = readOwnDataProperty(source, 'usage')
   const usage = rawUsage === undefined ? undefined : cleanActivityUsage(rawUsage)
   if (
@@ -391,7 +387,7 @@ function normalizeActivityNode(value: unknown): AgentActivityNodeV1 | null {
     || typeof actor !== 'string' || !Object.hasOwn(AGENT_ACTIVITY_NODE_ACTORS, actor)
     || startedAt === null || elapsedMs === null
     || profileId === null || toolId === null || roundIndex === null
-    || continuationMode === null || errorCode === null
+    || continuationMode === null
     || (rawUsage !== undefined && usage === null)
   ) return null
   return {
@@ -474,7 +470,6 @@ export function normalizeActivityRun(value: unknown): AgentActivityRunV1 | null 
       : isAgentPublicErrorCode(rawTerminalErrorCode)
         ? rawTerminalErrorCode
         : undefined
-  if (rawTerminalErrorCode !== undefined && terminalErrorCode === undefined) return null
   return {
     version: 1,
     generationId,

@@ -835,6 +835,8 @@
       "logical_provider_request_limit_exceeded": "Model request limit reached.",
       "physical_dispatch_attempt_limit_exceeded": "Dispatch limit reached.",
       "child_output_token_limit_exceeded": "Child-agent output limit reached.",
+      "child_output_limit_exceeded": "The child agent reached its output limit.",
+      "child_required_failed": "A required child agent failed.",
       "root_wall_clock_limit_exceeded": "Time limit reached.",
       "activity_event_limit_exceeded": "Activity update limit reached.",
       "activity_byte_limit_exceeded": "Activity size limit reached.",

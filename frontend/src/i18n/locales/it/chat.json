@@ -777,6 +777,8 @@
       "logical_provider_request_limit_exceeded": "Limite delle richieste al modello raggiunto.",
       "physical_dispatch_attempt_limit_exceeded": "Limite dei tentativi di invio raggiunto.",
       "child_output_token_limit_exceeded": "Limite dell'output degli agenti secondari raggiunto.",
+      "child_output_limit_exceeded": "L'agente figlio ha raggiunto il limite di output.",
+      "child_required_failed": "Un agente figlio obbligatorio non è riuscito.",
       "root_wall_clock_limit_exceeded": "Limite di tempo raggiunto.",
       "activity_event_limit_exceeded": "Limite degli aggiornamenti dell'attività raggiunto.",
       "activity_byte_limit_exceeded": "Limite delle dimensioni dell'attività raggiunto.",

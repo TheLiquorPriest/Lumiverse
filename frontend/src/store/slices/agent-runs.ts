@@ -203,6 +203,7 @@ const PUBLIC_ERROR_CODES = new Set<string>([
   'stop_unavailable', 'retry_unavailable', 'target_mismatch', 'stale_target', 'resync_required',
   'recovery_unavailable', 'response_mode_required', 'decision_refresh_required', 'limit_exceeded', 'queue_full',
   'worker_disabled', 'worker_unavailable', 'worker_crashed', 'worker_timed_out', 'worker_malformed',
+  'child_required_failed', 'child_output_limit_exceeded', 'agentic_protocol_failure',
 ])
 const ERROR_CATEGORIES = new Set(['capacity', 'budget', 'context', 'integrity', 'timeout', 'cancelled', 'provider', 'validation', 'internal'])
 const RECOVERY_ACTIONS: Record<AgentRunRecoveryActionV2, true> = {
@@ -671,10 +672,10 @@ function sameInspectionCorrelationIdentity(
 
 function normalizeError(value: unknown): AgentRunPublicErrorV2 | undefined {
   if (!isUnknownRecord(value)) return undefined
-  const code = isPublicErrorCode(value.code) ? value.code : null
+  const code = isPublicErrorCode(value.code) ? value.code : 'internal_error'
   const category = typeof value.category === 'string' && ERROR_CATEGORIES.has(value.category)
     ? value.category as AgentRunPublicErrorV2['category']
-    : null
+    : 'internal'
   const summaryCode = boundedString(value.summaryCode, MAX_LABEL_LENGTH)
   const recoveryAction = isRecoveryAction(value.recoveryAction) ? value.recoveryAction : null
   const target = value.target === null ? null : normalizeWorkTarget(value.target)
@@ -774,11 +775,11 @@ function normalizeActivityNode(value: unknown): AgentActivityNodeV2 | null {
       ? value.continuationMode as AgentActivityNodeV2['continuationMode']
       : null
   const usage = value.usage === undefined ? undefined : normalizeUsage(value.usage)
-  const errorCode = value.errorCode === undefined ? undefined : isPublicErrorCode(value.errorCode) ? value.errorCode : null
+  const errorCode = isPublicErrorCode(value.errorCode) ? value.errorCode : undefined
   if (
     !id || parentId === null && value.parentId !== null || !kind || !actor || !phase || !status
     || startedAt === null || elapsedMs === null || profileId === null || toolId === null
-    || roundIndex === null || continuationMode === null || errorCode === null
+    || roundIndex === null || continuationMode === null
     || value.usage !== undefined && usage === null
   ) return null
   const node: AgentActivityNodeV2 = { version: 2, id, parentId, kind, actor, phase, status, startedAt, elapsedMs }

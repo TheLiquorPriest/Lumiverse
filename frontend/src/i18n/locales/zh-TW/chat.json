@@ -777,6 +777,8 @@
       "logical_provider_request_limit_exceeded": "已達到模型請求上限。",
       "physical_dispatch_attempt_limit_exceeded": "已達到調度上限。",
       "child_output_token_limit_exceeded": "已達到子代理程式輸出上限。",
+      "child_output_limit_exceeded": "子代理已達到輸出上限。",
+      "child_required_failed": "必要的子代理失敗。",
       "root_wall_clock_limit_exceeded": "已達到時間上限。",
       "activity_event_limit_exceeded": "已達到活動更新上限。",
       "activity_byte_limit_exceeded": "已達到活動大小上限。",

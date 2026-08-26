@@ -785,6 +785,8 @@
       "logical_provider_request_limit_exceeded": "已达到模型请求上限。",
       "physical_dispatch_attempt_limit_exceeded": "已达到调度上限。",
       "child_output_token_limit_exceeded": "已达到子智能体输出上限。",
+      "child_output_limit_exceeded": "子智能体已达到输出上限。",
+      "child_required_failed": "必需的子智能体失败。",
       "root_wall_clock_limit_exceeded": "已达到时间上限。",
       "activity_event_limit_exceeded": "已达到活动更新上限。",
       "activity_byte_limit_exceeded": "已达到活动大小上限。",

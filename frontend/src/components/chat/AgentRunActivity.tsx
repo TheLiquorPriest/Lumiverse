@@ -97,6 +97,9 @@ const AGENT_PUBLIC_ERROR_LABEL_KEYS = {
   worker_crashed: 'agentRun.errors.worker_crashed',
   worker_timed_out: 'agentRun.errors.worker_timed_out',
   worker_malformed: 'agentRun.errors.worker_malformed',
+  child_required_failed: 'agentRun.errors.child_required_failed',
+  child_output_limit_exceeded: 'agentRun.errors.child_output_limit_exceeded',
+  agentic_protocol_failure: 'agentRun.errors.agentic_protocol_failure',
 } as const
 
 function publicErrorTranslationKey(value: unknown): string {

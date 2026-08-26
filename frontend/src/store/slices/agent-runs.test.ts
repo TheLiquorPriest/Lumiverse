@@ -419,6 +419,60 @@ describe('agent run projection slice', () => {
     expect(explicit?.activity[0]?.toolId).toBe('unknown_tool')
   })
 
+  test('keeps approved activity error codes and does not vanish unknown codes', () => {
+    const approved = normalizeAgentRunPublicV2({
+      ...run(),
+      activity: [{ ...run().activity[0], errorCode: 'child_required_failed' }],
+    })
+    expect(approved?.activity[0]?.errorCode).toBe('child_required_failed')
+
+    const outputLimit = normalizeAgentRunPublicV2({
+      ...run(),
+      activity: [{ ...run().activity[0], errorCode: 'child_output_limit_exceeded' }],
+    })
+    expect(outputLimit?.activity[0]?.errorCode).toBe('child_output_limit_exceeded')
+
+    const protocol = normalizeAgentRunPublicV2({
+      ...run(),
+      activity: [{ ...run().activity[0], errorCode: 'agentic_protocol_failure' }],
+    })
+    expect(protocol?.activity[0]?.errorCode).toBe('agentic_protocol_failure')
+
+    const unknown = normalizeAgentRunPublicV2({
+      ...run(),
+      activity: [{ ...run().activity[0], errorCode: 'secret_internal_code' }],
+    })
+    expect(unknown).not.toBeNull()
+    expect(unknown?.activity[0]?.errorCode).toBeUndefined()
+  })
+
+  test('normalizes unknown owner-run error codes instead of vanishing the run', () => {
+    const error = {
+      code: 'secret_internal_code',
+      category: 'integrity',
+      summaryCode: 'internal_error',
+      recoveryEligible: false,
+      recoveryAction: 'none',
+      target: null,
+      workPhase: 'WORK',
+      workStatus: 'terminal',
+      workOutcome: 'failed',
+      reason: null,
+      omissionCount: 0,
+      inspectionAttemptId: 'attempt-a',
+    }
+    const unknown = normalizeAgentRunPublicV2({ ...run(), error })
+    expect(unknown).not.toBeNull()
+    expect(unknown?.error?.code).toBe('internal_error')
+
+    const approved = normalizeAgentRunPublicV2({
+      ...run(),
+      error: { ...error, code: 'child_required_failed' },
+    })
+    expect(approved?.error?.code).toBe('child_required_failed')
+  })
+
+
   test('fetches workspace state separately and rejects an older workspace revision', () => {
     const indexEpoch = useStore.getState().beginAgentWorkspaceRequest('chat-a', 'turn-a')
     expect(useStore.getState().applyAgentWorkspaceIndex('chat-a', 'turn-a', indexEpoch, {

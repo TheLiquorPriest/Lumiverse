@@ -374,6 +374,12 @@ function reportedCompletionTokens(usage: GenerationResponse["usage"]): number {
   return typeof reported === "number" && Number.isSafeInteger(reported) && reported >= 0 ? reported : 0;
 }
 
+const LENGTH_CAP_FINISH_REASONS = new Set(["length", "max_tokens", "max_output_tokens"]);
+
+function isLengthCapFinishReason(value: unknown): boolean {
+  return typeof value === "string" && LENGTH_CAP_FINISH_REASONS.has(value.trim().toLowerCase());
+}
+
 function rootBilledCompletionTokens(
   finishReason: string,
   dispatchMaxOutputTokens: number,
@@ -383,7 +389,7 @@ function rootBilledCompletionTokens(
   const reported = reportedCompletionTokens(usage);
   const published = Number.isSafeInteger(publishedSettlement) && publishedSettlement > 0 ? publishedSettlement : 0;
   const cap = Number.isSafeInteger(dispatchMaxOutputTokens) && dispatchMaxOutputTokens > 0 ? dispatchMaxOutputTokens : 0;
-  if (finishReason === "length") return Math.max(reported, published, cap);
+  if (isLengthCapFinishReason(finishReason)) return Math.max(reported, published, cap);
   return Math.max(reported, published);
 }
 
@@ -3002,7 +3008,7 @@ const WORKSPACE_SEMANTIC_ERROR_CODES: Record<string, AgenticWorkErrorCode> = {
   task_assignment_conflict: "conflict",
   stale_revision: "conflict",
   duplicate_id: "conflict",
-  child_confinement: "conflict",
+  child_confinement: "tool_not_allowed",
   workspace_frozen: "conflict",
   workspace_cas_conflict: "conflict",
   idempotency_conflict: "conflict",
@@ -3013,6 +3019,7 @@ const WORKSPACE_SEMANTIC_ERROR_CODES: Record<string, AgenticWorkErrorCode> = {
   workspace_budget_exhausted: "workspace_budget_exhausted",
   cancelled: "cancelled",
   timed_out: "timed_out",
+  completion_blocked: "completion_blocked",
   completion_preparation_failed: "completion_freeze_failed",
 };
 
@@ -3941,12 +3948,14 @@ const PUBLIC_CHILD_FAILURE_CODES: Record<string, true> = {
   workspace_budget_exhausted: true,
   tool_result_limit_exceeded: true,
   council_required_failed: true,
+  child_required_failed: true,
   child_output_limit_exceeded: true,
   root_output_limit_exceeded: true,
   child_schedule_invalid: true,
   child_executor_unavailable: true,
   provider_error: true,
   provider_protocol_error: true,
+  agentic_protocol_failure: true,
   cancelled: true,
   timed_out: true,
   not_found: true,
@@ -4381,7 +4390,7 @@ export async function executeBoundedAgenticChildFrame(
         if (nextOutputBytes === 0) {
           const reasoningBytes = typeof response.reasoning === "string" ? utf8ByteLength(response.reasoning) : 0;
           console.error(`[agentic] child published 0 bytes finish=${response.finish_reason} reasoningBytes=${reasoningBytes} retry=${emptyPublishRetries}`);
-          if (response.finish_reason === "length") {
+          if (isLengthCapFinishReason(response.finish_reason)) {
             const errorMessage = `Child published 0 bytes at finish_reason=length with maxOutputTokens=${maxOutputTokens}`;
             return childOutcome({
               status: "failed",

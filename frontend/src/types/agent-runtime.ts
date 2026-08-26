@@ -97,6 +97,7 @@ export type AgentPublicErrorCode =
   | 'provider_request_error' | 'provider_protocol_error' | 'provider_schema_error'
   | 'invalid_task' | 'invalid_profile' | 'invalid_arguments' | 'batch_rejected'
   | 'unknown_tool' | 'unauthorized' | 'integrity_error' | 'internal_error'
+  | 'child_required_failed' | 'child_output_limit_exceeded' | 'agentic_protocol_failure'
 
 export type AgentPublicBudgetId =
   | 'child_admissions' | 'aggregate_tool_calls' | 'logical_provider_requests'

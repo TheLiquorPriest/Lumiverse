@@ -84,4 +84,25 @@ describe('agent activity reconciliation', () => {
     const normalized = normalizeAgentActivityPayload({ ...started, task: 'private', result: 'private' })
     expect(normalized).toEqual(started)
   })
+
+  test('keeps approved activity error codes and omits unknown codes without vanishing', () => {
+    expect(normalizeAgentActivityPayload({
+      ...started,
+      errorCode: 'child_output_limit_exceeded',
+    })).toMatchObject({ errorCode: 'child_output_limit_exceeded' })
+    expect(normalizeAgentActivityPayload({
+      ...started,
+      errorCode: 'child_required_failed',
+    })).toMatchObject({ errorCode: 'child_required_failed' })
+    expect(normalizeAgentActivityPayload({
+      ...started,
+      errorCode: 'agentic_protocol_failure',
+    })).toMatchObject({ errorCode: 'agentic_protocol_failure' })
+    const unknown = normalizeAgentActivityPayload({
+      ...started,
+      errorCode: 'secret_internal_code',
+    })
+    expect(unknown).not.toBeNull()
+    expect(unknown).not.toHaveProperty('errorCode')
+  })
 })
