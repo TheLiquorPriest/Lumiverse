@@ -1402,6 +1402,8 @@
     "removeFromChat": "Rimuovi da questa chat",
     "noChatActive": "Nessun worldbook attivo per questa chat",
     "chatAttachmentSaveFailed": "Impossibile salvare i worldbook di questa chat.",
+    "entrySaveFailed": "Impossibile salvare questa voce del worldbook.",
+    "entryDeleteFailed": "Impossibile eliminare questa voce del worldbook.",
     "activationSettings": "Impostazioni attivazione",
     "selectBook": "Seleziona un libro...",
     "selectWorldBookAria": "Seleziona worldbook",

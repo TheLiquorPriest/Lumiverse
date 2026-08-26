@@ -17,7 +17,7 @@ import {
   resolveWorldInfoCharacters,
 } from "../services/world-info-sources.service";
 import { activateWorldInfo, type WiState, type WorldInfoSettings } from "../services/world-info-activation.service";
-import type { WorldBookEntry } from "../types/world-book";
+import type { CreateWorldBookEntryInput, UpdateWorldBookEntryInput, WorldBookEntry } from "../types/world-book";
 import { makeAssistantCharacter } from "../types/character";
 import { safeFetch, SSRFError } from "../utils/safe-fetch";
 import { rewriteBotBooruUrl } from "../utils/botbooru";
@@ -40,6 +40,22 @@ function parseBulkWorldBookExportFormat(value: unknown): svc.WorldBookExportForm
   if (value === undefined) return "lumiverse";
   return isWorldBookExportFormat(value) ? value : null;
 }
+
+const ENTRY_CLIENT_IDENTITY_KEYS = ["world_book_id", "id", "uid", "created_at", "updated_at", "revision"] as const;
+
+function entryMutationBody(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const next = { ...(body as Record<string, unknown>) };
+  for (const key of ENTRY_CLIENT_IDENTITY_KEYS) delete next[key];
+  return next;
+}
+
+function containedEntry(entry: WorldBookEntry | null, bookId: string): WorldBookEntry | null {
+  if (!entry || entry.world_book_id !== bookId) return null;
+  return { ...entry, world_book_id: bookId };
+}
+
+
 
 
 const app = new Hono();
@@ -932,9 +948,9 @@ app.post("/:id/entries", async (c) => {
   const book = svc.getWorldBook(userId, c.req.param("id"));
   if (!book) return c.json({ error: "World book not found" }, 404);
   const body = await c.req.json();
-  const entry = svc.createEntry(userId, book.id, body);
+  const entry = svc.createEntry(userId, book.id, entryMutationBody(body) as CreateWorldBookEntryInput);
   if (!entry) return c.json({ error: "World book not found" }, 404);
-  return c.json(entry, 201);
+  return c.json(containedEntry(entry, book.id) ?? entry, 201);
 });
 
 app.post("/:id/entries/reorder", async (c) => {
@@ -991,8 +1007,8 @@ app.get("/:id/entries/:eid", (c) => {
   const bookId = c.req.param("id");
   const book = svc.getWorldBook(userId, bookId);
   if (!book) return c.json({ error: "World book not found" }, 404);
-  const entry = svc.getEntry(userId, c.req.param("eid"));
-  if (!entry || entry.world_book_id !== book.id) return c.json({ error: "Not found" }, 404);
+  const entry = containedEntry(svc.getEntry(userId, c.req.param("eid")), book.id);
+  if (!entry) return c.json({ error: "Not found" }, 404);
   return c.json(entry);
 });
 
@@ -1001,11 +1017,14 @@ app.put("/:id/entries/:eid", async (c) => {
   const bookId = c.req.param("id");
   const book = svc.getWorldBook(userId, bookId);
   if (!book) return c.json({ error: "World book not found" }, 404);
-  const existing = svc.getEntry(userId, c.req.param("eid"));
-  if (!existing || existing.world_book_id !== book.id) return c.json({ error: "Not found" }, 404);
+  const existing = containedEntry(svc.getEntry(userId, c.req.param("eid")), book.id);
+  if (!existing) return c.json({ error: "Not found" }, 404);
   const body = await c.req.json();
   try {
-    const entry = svc.updateEntry(userId, existing.id, body);
+    const entry = containedEntry(
+      svc.updateEntry(userId, existing.id, entryMutationBody(body) as UpdateWorldBookEntryInput),
+      book.id,
+    );
     if (!entry) return c.json({ error: "Not found" }, 404);
     return c.json(entry);
   } catch (error) {
@@ -1018,6 +1037,7 @@ app.put("/:id/entries/:eid", async (c) => {
     throw error;
   }
 });
+
 
 app.post("/:id/entries/:eid/duplicate", async (c) => {
   const userId = c.get("userId");
@@ -1071,10 +1091,11 @@ app.delete("/:id/entries/:eid", async (c) => {
   const bookId = c.req.param("id");
   const book = svc.getWorldBook(userId, bookId);
   if (!book) return c.json({ error: "World book not found" }, 404);
-  const entry = svc.getEntry(userId, c.req.param("eid"));
-  if (!entry || entry.world_book_id !== book.id) return c.json({ error: "Not found" }, 404);
+  const entry = containedEntry(svc.getEntry(userId, c.req.param("eid")), book.id);
+  if (!entry) return c.json({ error: "Not found" }, 404);
   if (!(await svc.deleteEntry(userId, entry.id))) return c.json({ error: "Not found" }, 404);
   return c.json({ success: true });
 });
+
 
 export { app as worldBooksRoutes };

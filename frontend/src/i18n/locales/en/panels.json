@@ -1566,6 +1566,8 @@
     "removeFromChat": "Remove from this chat",
     "noChatActive": "No world books active for this chat",
     "chatAttachmentSaveFailed": "Couldn't save this chat's world book attachments.",
+    "entrySaveFailed": "Couldn't save this world book entry.",
+    "entryDeleteFailed": "Couldn't delete this world book entry.",
     "activationSettings": "Activation Settings",
     "selectBook": "Select a book…",
     "selectWorldBookAria": "Select world book",

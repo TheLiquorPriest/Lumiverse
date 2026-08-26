@@ -325,6 +325,18 @@ function rowToEntry(row: any): WorldBookEntry {
   };
 }
 
+function omitClientEntryIdentity<T extends object>(input: T): T {
+  const next = { ...input } as T & Record<string, unknown>;
+  delete next.world_book_id;
+  delete next.id;
+  delete next.uid;
+  delete next.created_at;
+  delete next.updated_at;
+  delete next.revision;
+  return next;
+}
+
+
 function getPendingVectorIndexState(entry: { vectorized: boolean; disabled?: boolean; content?: string | null }): {
   vector_index_status: WorldBookVectorIndexStatus;
   vector_indexed_at: null;
@@ -2202,6 +2214,8 @@ export function createEntry(
   return withUserDataMutationSync(userId, () => {
   const book = getWorldBook(userId, worldBookId);
   if (!book) return null;
+  input = omitClientEntryIdentity(input);
+
 
   const id = crypto.randomUUID();
   const uid = crypto.randomUUID();
@@ -2286,6 +2300,7 @@ export function updateEntry(userId: string, id: string, input: UpdateWorldBookEn
   const expectedRevision = readExpectedRevision(input);
   const existing = getEntry(userId, id);
   if (!existing) return null;
+  input = omitClientEntryIdentity(input);
 
   const fields: string[] = [];
   const values: SQLQueryBindings[] = [];
@@ -2348,12 +2363,13 @@ export function updateEntry(userId: string, id: string, input: UpdateWorldBookEn
   fields.push("updated_at = ?", "revision = revision + 1");
   values.push(now);
 
-  const where = ["id = ?"];
-  values.push(id);
+  const where = ["id = ?", "world_book_id = ?"];
+  values.push(id, existing.world_book_id);
   if (expectedRevision !== undefined) {
     where.push("revision = ?");
     values.push(expectedRevision);
   }
+
 
   const changes = getDb()
     .query(`UPDATE world_book_entries SET ${fields.join(", ")} WHERE ${where.join(" AND ")}`)

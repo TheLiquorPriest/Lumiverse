@@ -1403,6 +1403,8 @@
     "removeFromChat": "Supprimer de ce chat",
     "noChatActive": "Aucun livre du monde actif pour ce chat",
     "chatAttachmentSaveFailed": "Impossible d'enregistrer les livres du monde de ce chat.",
+    "entrySaveFailed": "Impossible d'enregistrer cette entrée du livre du monde.",
+    "entryDeleteFailed": "Impossible de supprimer cette entrée du livre du monde.",
     "activationSettings": "Paramètres d'activation",
     "selectBook": "Sélectionner un livre…",
     "selectWorldBookAria": "Sélectionner le monde book",

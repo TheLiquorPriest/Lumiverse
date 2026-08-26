@@ -1403,6 +1403,8 @@
     "removeFromChat": "從當前聊天移除",
     "noChatActive": "當前聊天沒有激活的世界書",
     "chatAttachmentSaveFailed": "無法保存此聊天的世界書附件。",
+    "entrySaveFailed": "無法保存此世界書條目。",
+    "entryDeleteFailed": "無法刪除此世界書條目。",
     "activationSettings": "激活設置",
     "selectBook": "選擇世界書…",
     "selectWorldBookAria": "選擇世界書",
