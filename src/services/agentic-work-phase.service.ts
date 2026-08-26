@@ -347,6 +347,28 @@ export function normalizeAgenticWorkBudget(
   });
 }
 
+/**
+ * Root WORK billed-output fuse.
+ *
+ * `maxOutputTokens` stays the per-dispatch authored cap (published-content
+ * remaining still governs that cap; reasoning does not zero it). Multiplying
+ * by `maxUnsignedBoundaries` allows that many full-cap reasoning retries —
+ * or equivalent billed completion across tool rounds — then stops before
+ * another provider dispatch. Saturates at MAX_SAFE_INTEGER.
+ */
+export function rootBilledOutputFuseLimit(
+  maxOutputTokens: number,
+  maxUnsignedBoundaries: number,
+): number {
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1) return 0;
+  if (!Number.isSafeInteger(maxUnsignedBoundaries) || maxUnsignedBoundaries < 1) return 0;
+  if (maxUnsignedBoundaries > 0 && maxOutputTokens > Math.floor(Number.MAX_SAFE_INTEGER / maxUnsignedBoundaries)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return maxOutputTokens * maxUnsignedBoundaries;
+}
+
+
 export type AgenticWorkspaceSharing = "root_only" | "view_only";
 
 const CHILD_VIEW_ONLY_OPERATIONS: readonly WorkspaceOperationKindV1[] = Object.freeze([
@@ -848,6 +870,7 @@ export interface AgenticWorkRenderHandoff {
 export interface AgenticWorkspaceCompletionGates {
   readonly inFlightRequiredActions?: number;
   readonly requiredOpenTasks?: number;
+  readonly openRequiredTaskIds?: readonly string[];
   readonly unacceptedSubmissions?: number;
   readonly unresolvedCalls?: number;
   readonly workspaceRevision?: number;
@@ -2263,6 +2286,75 @@ function resultError(code: string, message = "Tool call rejected"): Record<strin
   return { status: "error", errorCode: code, message };
 }
 
+const COMPLETION_BLOCKED_SETTLE_MESSAGE =
+  "Settle the listed required tasks with admitted tools before retrying complete_turn.";
+
+function sanitizePhaseId(value: string | null | undefined): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (encoder.encode(value).byteLength > MAX_PROFILE_ID_BYTES) return null;
+  if (!WORKSPACE_SAFE_ID_PATTERN.test(value)) return null;
+  return value;
+}
+
+function sanitizeOpenRequiredTaskIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) return Object.freeze([]);
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (ids.length >= MAX_COMPLETION_IDS) break;
+    if (typeof item !== "string" || item.length === 0 || seen.has(item)) continue;
+    if (encoder.encode(item).byteLength > MAX_COMPLETION_ID_BYTES) continue;
+    if (!WORKSPACE_SAFE_ID_PATTERN.test(item)) continue;
+    seen.add(item);
+    ids.push(item);
+  }
+  ids.sort();
+  return Object.freeze(ids);
+}
+
+function admittedToolNamesFromFrame(frame: AgenticWorkFrame): readonly string[] {
+  return Object.freeze([...frame.allowedToolNames].sort());
+}
+
+function recoverableCompletionBlockedResult(
+  currentPhaseId: string | null,
+  admittedToolNames: readonly string[],
+  openRequiredTaskIds: readonly string[],
+): Record<string, unknown> {
+  return {
+    status: "error",
+    errorCode: "completion_blocked",
+    message: COMPLETION_BLOCKED_SETTLE_MESSAGE,
+    currentPhaseId: sanitizePhaseId(currentPhaseId),
+    admittedToolNames: Object.freeze([...admittedToolNames]),
+    openRequiredTaskIds: sanitizeOpenRequiredTaskIds(openRequiredTaskIds),
+  };
+}
+
+async function recoverableCompletionBlockedResultFor(
+  workspace: AgenticWorkspaceCapability | undefined,
+  frame: AgenticWorkFrame,
+  currentPhaseId: string | null,
+  extraTaskIds: readonly string[] = [],
+): Promise<Record<string, unknown>> {
+  let openRequiredTaskIds: readonly string[] = extraTaskIds;
+  if (workspace) {
+    try {
+      const gates = await readCompletionGates(workspace, frame);
+      const fromGates = sanitizeOpenRequiredTaskIds(gates.openRequiredTaskIds);
+      if (fromGates.length > 0) openRequiredTaskIds = fromGates;
+    } catch {
+      // Gates are optional on this reject; never execute workspace reads.
+    }
+  }
+  return recoverableCompletionBlockedResult(
+    currentPhaseId,
+    admittedToolNamesFromFrame(frame),
+    openRequiredTaskIds,
+  );
+}
+
+
 function buildContinuation(
   response: GenerationResponse,
   calls: readonly ToolCallResult[],
@@ -2754,6 +2846,16 @@ class WorkBudgetState {
   remainingOutputTokens(limit: number): number {
     return Math.max(0, limit - this.providerOutputTokens);
   }
+  billedOutputFuseLimit(): number {
+    return rootBilledOutputFuseLimit(this.limits.maxOutputTokens, this.limits.maxUnsignedBoundaries);
+  }
+  billedOutputFuseExceeded(): boolean {
+    return this.providerSettledOutputTokens >= this.billedOutputFuseLimit();
+  }
+  billedOutputFuseExhaustedMessage(): string {
+    return `Root billed completion tokens ${this.providerSettledOutputTokens} exceeded fuse ${this.billedOutputFuseLimit()} (maxOutputTokens × maxUnsignedBoundaries)`;
+  }
+
   reserveToolResult(bytes: number, receiveLimitBytes = this.limits.maxWorkOutputBytes): boolean {
     if (
       !Number.isSafeInteger(bytes)
@@ -4915,6 +5017,7 @@ async function executeCompletion(
     cognition?: CognitionRuntimeCompletionV1,
   ) => readonly LlmMessage[],
   expectedWorkspaceRevision?: number,
+  currentPhaseId: string | null = null,
 ): Promise<CompletionExecutionResult> {
   if (frame.kind !== "root" || !frame.canComplete) return { observationStatus: "rejected", code: "completion_not_root", result: resultError("completion_not_root") };
   const parsed = parseCompleteTurnPayload(call.args);
@@ -4982,14 +5085,26 @@ async function executeCompletion(
     try {
       gates = await abortable(Promise.resolve(readCompletionGates(workspace, frame)), frame.signal);
     } catch {
-      return { observationStatus: "rejected", code: "completion_blocked", result: resultError("completion_blocked") };
+      return {
+        observationStatus: "rejected",
+        code: "completion_blocked",
+        result: await recoverableCompletionBlockedResultFor(workspace, frame, currentPhaseId),
+      };
     }
     if (frame.signal.aborted) {
       const status = signalStatus(frame.signal);
       return { observationStatus: "rejected", code: status, result: resultError(status) };
     }
     if (workspaceGateBlocked(gates)) {
-      return { observationStatus: "rejected", code: "completion_blocked", result: resultError("completion_blocked") };
+      return {
+        observationStatus: "rejected",
+        code: "completion_blocked",
+        result: recoverableCompletionBlockedResult(
+          currentPhaseId,
+          admittedToolNamesFromFrame(frame),
+          gates.openRequiredTaskIds ?? [],
+        ),
+      };
     }
     const expectedRevision = expectedWorkspaceRevision ?? gates.workspaceRevision;
     try {
@@ -5009,10 +5124,18 @@ async function executeCompletion(
 
   if (!returned.accepted) {
     const code = (returned.code as AgenticWorkErrorCode | undefined) ?? "completion_freeze_failed";
+    const result = code === "completion_blocked"
+      ? await recoverableCompletionBlockedResultFor(
+        workspace,
+        frame,
+        currentPhaseId,
+        returned.blockerIds ?? [],
+      )
+      : resultError(code);
     return {
       observationStatus: "rejected",
       code,
-      result: resultError(code),
+      result,
       workspaceRevision: returned.workspaceRevision,
       ...(completionCriteriaForCognition
         ? { completionCriteria: completionCriteriaForCognition(returned.cognition) }
@@ -5489,6 +5612,13 @@ export async function runAgenticWorkPhase(
           error instanceof AgenticWorkPhaseError ? error.code : "invalid_input",
         );
       }
+      if (state.billedOutputFuseExceeded()) {
+        return outcomeAfterPending(
+          "exhausted",
+          "child_output_limit_exceeded",
+          state.billedOutputFuseExhaustedMessage(),
+        );
+      }
       if (!state.reserveProviderRound()) {
         return outcomeAfterPending("exhausted", "provider_round_budget_exhausted");
       }
@@ -5565,6 +5695,7 @@ export async function runAgenticWorkPhase(
       if (!state.recordProviderUsage(response.usage, accounting.outputTokens)) {
         return outcomeAfterPending("failed", "provider_protocol_error");
       }
+      const billedFuseExhausted = state.billedOutputFuseExceeded();
       if (!accounting.privateFieldsReadable && (response.tool_calls?.length ?? 0) === 0) {
         return outcomeAfterPending("failed", "provider_protocol_error");
       }
@@ -5609,6 +5740,13 @@ export async function runAgenticWorkPhase(
       if (!state.appendWorkNote(response.content)) return outcomeAfterPending("exhausted", "work_budget_exhausted");
       const calls = canonicalizeDelegateProfileIds(response.tool_calls ?? [], delegatableProfiles);
       if (calls.length === 0) {
+        if (billedFuseExhausted) {
+          return outcomeAfterPending(
+            "exhausted",
+            "child_output_limit_exceeded",
+            state.billedOutputFuseExhaustedMessage(),
+          );
+        }
         if (!state.reserveUnsignedBoundary()) return outcomeAfterPending("exhausted", "unsigned_boundary_budget_exhausted");
         if (providerTransientCarrier?.kind === "openai_responses") {
           providerTransientCarrier = appendNativeInputMessages(
@@ -6196,7 +6334,11 @@ export async function runAgenticWorkPhase(
                   completion = {
                     observationStatus: "rejected",
                     code: "completion_blocked",
-                    result: resultError("completion_blocked"),
+                    result: await recoverableCompletionBlockedResultFor(
+                      options.workspace,
+                      rootFrame,
+                      phaseMachine.currentPhase()?.id ?? null,
+                    ),
                   };
                 } else {
                   const committedDecision = phaseMachine.exit(phaseInput);
@@ -6205,7 +6347,11 @@ export async function runAgenticWorkPhase(
                     completion = {
                       observationStatus: "rejected",
                       code: "completion_blocked",
-                      result: resultError("completion_blocked"),
+                      result: await recoverableCompletionBlockedResultFor(
+                        options.workspace,
+                        rootFrame,
+                        phaseMachine.currentPhase()?.id ?? null,
+                      ),
                     };
                   } else if (committedDecision.status === "failed" || committedDecision.status === "blocked") {
                     phaseCompletionFailed = true;
@@ -6250,6 +6396,7 @@ export async function runAgenticWorkPhase(
                 options.workspace,
                 (cognition) => materializeCompletionCriteriaMessages(plan, options, cognition),
                 phaseCompletionExpectedRevision,
+                phaseMachine?.currentPhase()?.id ?? null,
               );
             }
           }
@@ -6661,6 +6808,13 @@ export async function runAgenticWorkPhase(
         if (phaseCouncilStatus === "failed") {
           return outcomeAfterPending("failed", "council_required_failed");
         }
+      }
+      if (billedFuseExhausted) {
+        return outcomeAfterPending(
+          "exhausted",
+          "child_output_limit_exceeded",
+          state.billedOutputFuseExhaustedMessage(),
+        );
       }
     }
   } catch (error) {

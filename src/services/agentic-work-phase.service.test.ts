@@ -22,6 +22,7 @@ import {
   composeAgenticWorkToolDefinitions,
   executeBoundedAgenticChildFrame as executeBoundedAgenticChildFrameImpl,
   parseCompleteTurnPayload,
+  rootBilledOutputFuseLimit,
   runAgenticWorkPhase,
   validateAgenticAssemblyPlan,
   type AgenticWorkOptions,
@@ -5658,4 +5659,239 @@ describe("Agentic WORK phase", () => {
     ]));
     expect(new Set(associations.map(({ id }) => id)).size).toBe(2);
   });
+
+  test("derives the root billed-output fuse with saturating arithmetic", () => {
+    expect(rootBilledOutputFuseLimit(8192, 4)).toBe(32768);
+    expect(rootBilledOutputFuseLimit(1, 1)).toBe(1);
+    expect(rootBilledOutputFuseLimit(Number.MAX_SAFE_INTEGER, 2)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(rootBilledOutputFuseLimit(0, 4)).toBe(0);
+  });
+
+  test("allows one full-cap reasoning length round to retry under the billed fuse", async () => {
+    const requests: Array<{ readonly maxOutputTokens: number }> = [];
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async (request) => {
+      requests.push({ maxOutputTokens: request.maxOutputTokens });
+      round += 1;
+      if (round === 1) {
+        return {
+          content: "",
+          finish_reason: "length",
+          usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
+        };
+      }
+      return response("", [complete("after-reasoning")]);
+    }, {
+      workspace: workspace(),
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 4 },
+    }));
+    expect(result.status).toBe("completed");
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(requests[0]?.maxOutputTokens).toBe(8);
+    expect(requests[1]?.maxOutputTokens).toBe(8);
+    expect(result.code).not.toBe("child_output_limit_exceeded");
+  });
+
+  test("exhausts the billed fuse before another dispatch after cumulative completion tokens", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return {
+        content: "",
+        finish_reason: "length",
+        usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
+      };
+    }, {
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
+    }));
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("child_output_limit_exceeded");
+    expect(result.errorMessage).toContain("16");
+    expect(result.errorMessage).toContain("maxOutputTokens × maxUnsignedBoundaries");
+    expect(round).toBe(2);
+  });
+
+  test("counts billed completion tokens from tool rounds toward the root fuse", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return {
+        content: "",
+        finish_reason: "tool_calls",
+        tool_calls: [call("chat_search_history", `hist-${round}`, { query: "x" })],
+        usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
+      };
+    }, {
+      workspace: workspace(),
+      coreToolCapability: { execute: async () => [] },
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 8 },
+    }));
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("child_output_limit_exceeded");
+    expect(round).toBe(2);
+  });
+
+  test("keeps missing usage conservative so unsigned boundaries still govern empty rounds", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return { content: "", finish_reason: "length" };
+    }, {
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 1, maxProviderRounds: 8 },
+    }));
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("unsigned_boundary_budget_exhausted");
+    expect(result.errorMessage).toBeUndefined();
+    expect(round).toBe(2);
+  });
+
+  test("does not double-count published tokens and billed completion against the fuse", async () => {
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      round += 1;
+      return {
+        content: "abcd",
+        finish_reason: "stop",
+        usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
+      };
+    }, {
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      budget: { maxOutputTokens: 10, maxUnsignedBoundaries: 1, maxProviderRounds: 8 },
+      countTokens: () => 4,
+    }));
+    expect(round).toBe(2);
+    expect(result.status).toBe("exhausted");
+    expect(result.code).toBe("child_output_limit_exceeded");
+  });
+
+  test("does not apply the root billed fuse to child frames", async () => {
+    const child = await executeBoundedAgenticChildFrame({
+      frame: createAgenticChildFrame({
+        frameId: "child-no-root-fuse",
+        parentFrameId: "root",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        signal: new AbortController().signal,
+      }),
+      task: "bounded task",
+      systemPrompt: "bounded system prompt",
+      budget: { maxChildRounds: 3, maxOutputTokens: 8, maxUnsignedBoundaries: 1 },
+      dispatch: async () => ({
+        content: "",
+        finish_reason: "length",
+        usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
+      }),
+    });
+    expect(child.code).not.toBe("child_output_limit_exceeded");
+  });
+
+  test("enriches recoverable completion_blocked with phase, tools, and open task ids then accepts after settlement", async () => {
+    const openIds = { value: ["turn:fn_baseline"] as string[] };
+    const blockedPayloads: Record<string, unknown>[] = [];
+    let dispatchCount = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async ({ messages, tools }) => {
+      dispatchCount += 1;
+      if (dispatchCount > 1) {
+        for (const message of messages) {
+          if (!Array.isArray(message.content)) continue;
+          for (const part of message.content) {
+            if (part.type !== "tool_result" || typeof part.content !== "string") continue;
+            try {
+              const parsed = JSON.parse(part.content) as Record<string, unknown>;
+              if (parsed.errorCode === "completion_blocked") blockedPayloads.push(parsed);
+            } catch {
+              // ignore non-JSON
+            }
+          }
+        }
+      }
+      if (dispatchCount === 1) {
+        expect(tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["complete_turn", "chat_search_history"]));
+        expect(tools.map((tool) => tool.name)).not.toContain("agent_delegate");
+        return response("", [complete("early-complete")]);
+      }
+      if (dispatchCount === 2) {
+        return response("", [call("chat_search_history", "clear-gate", { query: "x" })]);
+      }
+      return response("", [complete("after-settle")]);
+    }, {
+      workspace: workspace({
+        getCompletionGates: async () => ({
+          requiredOpenTasks: openIds.value.length,
+          openRequiredTaskIds: openIds.value,
+          canComplete: openIds.value.length === 0,
+        }),
+        freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
+      }),
+      coreToolCapability: { execute: async () => { openIds.value = []; return []; } },
+    }));
+    expect(result.status).toBe("completed");
+    expect(blockedPayloads.length).toBeGreaterThanOrEqual(1);
+    expect(blockedPayloads[0]).toMatchObject({
+      status: "error",
+      errorCode: "completion_blocked",
+      message: "Settle the listed required tasks with admitted tools before retrying complete_turn.",
+      currentPhaseId: null,
+      openRequiredTaskIds: ["turn:fn_baseline"],
+    });
+    expect(blockedPayloads[0]?.admittedToolNames).toEqual(expect.arrayContaining([
+      "complete_turn",
+      "chat_search_history",
+    ]));
+    expect(blockedPayloads[0]?.admittedToolNames).not.toContain("agent_delegate");
+    expect(result.observations.find((item) => item.callId === "after-settle")?.status).toBe("accepted");
+  });
+
+
+
+  test("does not attach recoverable completion_blocked details to fatal invalid_plan", async () => {
+    const results: string[] = [];
+    const outcome = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("unavailable-complete")]), {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("live-phase", ["workspace_write"], {
+            exit: { kind: "task_transition", taskId: "fn_evidence", transition: "completed" },
+            nextPhaseIds: ["next-phase"],
+          }),
+          customPhase("next-phase", [], {
+            exit: { kind: "phase", value: "COMPLETE" },
+          }),
+        ]),
+      }),
+      workspace: workspace({
+        getCompletionGates: async () => ({
+          openRequiredTaskIds: ["secret-task"],
+          requiredOpenTasks: 1,
+        }),
+        getPhaseEvaluationSnapshot: async ({ phase, expectedRevision }) => {
+          if (phase === "COMPLETE") throw new Error("phase snapshot unavailable");
+          return phaseSnapshot(expectedRevision ?? 0);
+        },
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+      inspection: {
+        record: (_kind, value) => {
+          if (value && typeof value === "object" && "result" in value && typeof value.result === "string") {
+            results.push(value.result);
+          }
+          return null;
+        },
+      },
+    }));
+    expect(outcome.status).toBe("failed");
+    expect(outcome.code).toBe("invalid_plan");
+    expect(results.some((entry) => entry.includes("invalid_plan"))).toBe(true);
+    expect(results.some((entry) => entry.includes("secret-task"))).toBe(false);
+    expect(results.some((entry) => entry.includes("openRequiredTaskIds"))).toBe(false);
+    expect(results.some((entry) => entry.includes("currentPhaseId"))).toBe(false);
+    expect(results.some((entry) => entry.includes("admittedToolNames"))).toBe(false);
+  });
+
 });

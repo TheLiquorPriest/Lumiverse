@@ -2459,12 +2459,13 @@ function makeWorkspace(
         workspaceRevision: gates.workspaceRevision,
         canComplete: gates.accepted,
         requiredOpenTasks: gates.openRequiredTaskIds.length,
+        openRequiredTaskIds: gates.openRequiredTaskIds,
         unacceptedSubmissions: gates.pendingSubmissionCount,
       };
     },
     listRequiredOpenTasks: ({ frame }) => {
       const gates = getWorkspaceCompletionGatesV1(context(frame));
-      return Array.from({ length: gates.openRequiredTaskIds.length }, () => ({}));
+      return gates.openRequiredTaskIds;
     },
     getUnacceptedSubmissions: ({ frame }) => {
       const gates = getWorkspaceCompletionGatesV1(context(frame));
