@@ -124,8 +124,6 @@ export default function DatabankPanel() {
   const editingDirtyRef = useRef(false)
   const selectedDatabankIdRef = useRef<string | null>(null)
   const pendingContextResetRef = useRef(false)
-  const pendingScopeRef = useRef<Scope | null>(null)
-  const pendingBankIdRef = useRef<string | null | undefined>(undefined)
   const docsRequestRef = useRef(0)
 
 
@@ -156,20 +154,18 @@ export default function DatabankPanel() {
   }, [])
 
   const flushPendingContextReset = useCallback(() => {
-    const resetContext = pendingContextResetRef.current
+    if (!pendingContextResetRef.current) return
     pendingContextResetRef.current = false
-    const scope = pendingScopeRef.current
-    pendingScopeRef.current = null
-    const bankId = pendingBankIdRef.current
-    pendingBankIdRef.current = undefined
-    if (resetContext) {
-      docsRequestRef.current += 1
-      setSelectedDatabankId(null)
-      setDatabankDocuments([])
-    }
-    if (scope) setDatabankScopeFilter(scope)
-    if (bankId !== undefined) setSelectedDatabankId(bankId)
-  }, [setSelectedDatabankId, setDatabankDocuments, setDatabankScopeFilter])
+    docsRequestRef.current += 1
+    setSelectedDatabankId(null)
+    setDatabankDocuments([])
+  }, [setSelectedDatabankId, setDatabankDocuments])
+
+  const settlePendingContextReset = useCallback(() => {
+    pendingContextResetRef.current = false
+    setDiscardConfirmOpen(false)
+  }, [])
+
 
 
   const loadEditorContent = useCallback(async (docId: string, bankId: string) => {
@@ -312,19 +308,12 @@ export default function DatabankPanel() {
         params.scope_id = activeChatId
       }
       const result = await databankApi.list(params)
-      if (requestId !== banksRequestRef.current) return
-      setDatabanks(result.data)
-      const selectedId = selectedDatabankIdRef.current
-      if (selectedId && !pendingContextResetRef.current && !result.data.some((bank) => bank.id === selectedId)) {
-        closeDocEditor()
-        setSelectedDatabankId(null)
-        setDatabankDocuments([])
-        setError(t('databankPanel.remoteDatabankRemoved'))
-      }
+      if (requestId === banksRequestRef.current) setDatabanks(result.data)
     } catch {
       if (requestId === banksRequestRef.current) setDatabanks([])
     }
-  }, [databankScopeFilter, activeCharacterId, activeChatId, setDatabanks, setSelectedDatabankId, setDatabankDocuments, closeDocEditor, t])
+  }, [databankScopeFilter, activeCharacterId, activeChatId, setDatabanks])
+
 
   useEffect(() => {
     void loadBanks()
@@ -348,6 +337,16 @@ export default function DatabankPanel() {
     closeDocEditor()
   }, [databankScopeFilter, activeCharacterId, activeChatId, setSelectedDatabankId, setDatabankDocuments, closeDocEditor])
 
+  // DATABANK_DELETED removes the bank and nulls selection. That is not
+  // user-clean navigation, which closes the editor in the same turn.
+  useEffect(() => {
+    if (!editingDocId || selectedDatabankId) return
+    docsRequestRef.current += 1
+    closeDocEditor()
+    setError(t('databankPanel.remoteDatabankRemoved'))
+  }, [editingDocId, selectedDatabankId, closeDocEditor, t])
+
+
   // ── Load documents when bank selection changes ──
   const loadDocs = useCallback(async () => {
     const requestId = ++docsRequestRef.current
@@ -359,8 +358,9 @@ export default function DatabankPanel() {
       const result = await databankApi.listDocuments(selectedDatabankId, { limit: 1000 })
       if (requestId !== docsRequestRef.current) return
       setDatabankDocuments(result.data)
+      const listComplete = result.offset + result.data.length >= result.total
       const openId = editingDocIdRef.current
-      if (openId && !result.data.some((doc) => doc.id === openId)) {
+      if (listComplete && openId && !result.data.some((doc) => doc.id === openId)) {
         closeDocEditor()
         setError(t('databankPanel.remoteDocumentRemoved'))
       }
@@ -368,6 +368,7 @@ export default function DatabankPanel() {
       if (requestId === docsRequestRef.current && !editingDocIdRef.current) setDatabankDocuments([])
     }
   }, [selectedDatabankId, setDatabankDocuments, closeDocEditor, t])
+
 
   useEffect(() => {
     void loadDocs()
@@ -738,7 +739,7 @@ export default function DatabankPanel() {
             closeDocEditor()
             flushPendingContextReset()
           }}
-          onCancel={() => setDiscardConfirmOpen(false)}
+          onCancel={settlePendingContextReset}
           title={t('databankPanel.discardTitle')}
           message={t('databankPanel.discardMessage')}
           variant="warning"
@@ -907,15 +908,7 @@ export default function DatabankPanel() {
           <button
             key={s}
             className={`${styles.scopeBtn} ${databankScopeFilter === s ? styles.scopeBtnActive : ''}`}
-            onClick={() => {
-              if (s === databankScopeFilter) return
-              if (editingDirtyRef.current && editingDocIdRef.current) {
-                pendingScopeRef.current = s
-                setDiscardConfirmOpen(true)
-                return
-              }
-              setDatabankScopeFilter(s)
-            }}
+            onClick={() => setDatabankScopeFilter(s)}
           >
             {s === 'global' ? t('databankPanel.scopeGlobal') : s === 'character' ? t('databankPanel.scopeCharacter') : t('databankPanel.scopeChat')}
           </button>
@@ -1006,15 +999,7 @@ export default function DatabankPanel() {
         <select
           className={styles.bankSelect}
           value={selectedDatabankId || ''}
-          onChange={(e) => {
-            const next = e.target.value || null
-            if (editingDirtyRef.current && editingDocIdRef.current) {
-              pendingBankIdRef.current = next
-              setDiscardConfirmOpen(true)
-              return
-            }
-            setSelectedDatabankId(next)
-          }}
+          onChange={(e) => setSelectedDatabankId(e.target.value || null)}
         >
           <option value="">{t('databankPanel.selectDatabank')}</option>
           {databanks.map((b) => (
