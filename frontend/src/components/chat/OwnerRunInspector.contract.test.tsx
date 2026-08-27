@@ -613,9 +613,15 @@ test('uses stable deleted-chat provenance and localizes a recovered cancelled ru
     })
     expect(inspection).toHaveBeenCalledTimes(3)
     const errorText = document.body.textContent ?? ''
+    const resolutionError = document.body.querySelector<HTMLElement>('[role="alert"]')
+    const outcomeValue = [...(resolutionError?.querySelectorAll('dt') ?? [])]
+      .find((label) => label.textContent === 'Outcome')
+      ?.nextElementSibling?.textContent
     expect(errorText).toContain('Run resolution error')
     expect(errorText).toContain('Error code: cancelled')
     expect(errorText).toContain('The run was cancelled.')
+    expect(resolutionError?.querySelector('p')?.textContent).toBe('Error code: cancelled · Cancelled · The run was cancelled.')
+    expect(outcomeValue).toBe('Stopped')
     expect(errorText).toContain('User stop')
     expect(errorText).toContain('Authority')
     expect(errorText).toContain('Source')
@@ -629,7 +635,7 @@ test('uses stable deleted-chat provenance and localizes a recovered cancelled ru
     expect(errorText).not.toContain('provenance.scope')
     expect(errorText).not.toContain('provenance.gate')
     expect(errorText).not.toContain('provenance.capabilityNotReady')
-    expect(document.body.querySelector('[role="alert"]')).toBeDefined()
+    expect(resolutionError).toBeDefined()
   } finally {
     if (root) {
       await act(async () => {

@@ -2267,6 +2267,37 @@ function recordCustomPhaseEvidence(
     result: JSON.stringify(evidence),
   }, { lifecycle: "WORK", status: evidence.status === "failed" ? "terminal" : evidence.status === "blocked" ? "waiting" : "running" });
 }
+function recordCustomPhaseRepairEvidence(
+  writer: AgentInspectionWriterV1 | undefined,
+  plan: AgentRuntimePhaseCompileResultV1,
+): void {
+  if (!writer || plan.status !== "repair_required") return;
+  let sequence = 0;
+  for (const issue of plan.issues) {
+    if (issue.code !== "optional_phase_omitted") continue;
+    const evidence = {
+      version: 1 as const,
+      kind: "phase_repair" as const,
+      compileStatus: plan.status,
+      disposition: "omitted" as const,
+      survivingPhaseCount: plan.phases.length,
+      phaseId: issue.phaseId,
+      phaseIndex: issue.phaseIndex,
+      required: issue.required,
+      code: issue.code,
+      source: issue.source,
+      detail: issue.detail,
+    };
+    writer.record("condition", {
+      id: `phase:repair:${issue.phaseIndex}:${sequence}`,
+      kind: "condition",
+      actor: "host",
+      recipient: "agent",
+      result: JSON.stringify(evidence),
+    }, { lifecycle: "WORK", status: "running" });
+    sequence += 1;
+  }
+}
 function recordChildPhaseSubsetProvenance(
   writer: AgentInspectionWriterV1 | undefined,
   phase: CompiledAgentRuntimePhaseV1 | null,
@@ -5794,6 +5825,9 @@ export async function runAgenticWorkPhase(
         lifecycle: "WORK",
         status: "running",
       });
+    }
+    if (plan.customPhasePlan) {
+      recordCustomPhaseRepairEvidence(state.inspection, plan.customPhasePlan);
     }
     let phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null = null;
     let phaseEntryMessages: readonly LlmMessage[] = phaseMachine

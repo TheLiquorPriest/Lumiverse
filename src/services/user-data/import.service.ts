@@ -91,6 +91,7 @@ import { markImportedConnectionForReview } from "../connection-authority";
 import { resolveArchivePathWithinRoot } from "./snapshot";
 import { scrubArchiveRowPrivateData } from "./export.service";
 import { sanitizeEntry, safeJoin, type SanitizedEntry } from "./sanitize";
+import { scrubLegacyImageGenerationSettingRow } from "./private-data";
 import {
   migrateParsedLegacyAgentConfigV1,
   parseLegacyAgentConfigV1,
@@ -5154,9 +5155,15 @@ async function materializeValidatedArchive(job: ImportJob, buf: ImportBuffer): P
       tableRows++;
       totalRows++;
       // Older archives could carry provider-private reasoning carriers in
-      // messages.extra. Remove them before unknown-column validation and
-      // staging so they cannot re-enter live or public message metadata.
-      const archiveRow = entry.table === "messages" ? scrubArchiveRowPrivateData(raw) : raw;
+      // messages.extra or plaintext legacy image-generation credentials.
+      // Scrub both before validation and staging so neither can re-enter live
+      // data. Malformed private containers throw and reject the whole import.
+      const privateDataRow = entry.table === "settings"
+        ? scrubLegacyImageGenerationSettingRow(raw)
+        : raw;
+      const archiveRow = entry.table === "messages"
+        ? scrubArchiveRowPrivateData(privateDataRow)
+        : privateDataRow;
       for (const key of Object.keys(archiveRow)) if (!byName.has(key)) throw new Error(`unknown column ${entry.table}.${key}`);
       for (const column of columns) {
         if (archiveRow[column.name] === undefined && column.notnull && column.dflt_value === null) {

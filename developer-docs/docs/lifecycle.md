@@ -47,7 +47,7 @@ silently becomes Response.
 
 The durable lifecycle is:
 
-`ADMIT` → `ASSEMBLE` → `WORK` → `PREPARE_COMMIT` → `RENDER` → `COMMIT` →
+`ADMIT` → `ASSEMBLE` → `WORK` → `RENDER` → `PREPARE_COMMIT` → `COMMIT` →
 `TERMINAL`.
 
 The status is one of `pending`, `running`, `waiting`, `cancelling`, or
@@ -99,9 +99,10 @@ creates no attempt, projection, or terminal publication.
 4. **WORK:** deterministic child descriptors run in order, then the root
    provider may use only its admitted tool/delegation capabilities. WORK
    notes and private child material are retained only for owner inspection.
-5. **Preparation and render:** `PREPARE_COMMIT` validates typed deltas and
-   `RENDER` produces the final response with tools disabled. A tool call in
-   finalization is a protocol failure, not another delegation.
+5. **Render and preparation:** `RENDER` produces the final response with
+   tools disabled. A tool call in finalization is a protocol failure, not
+   another delegation. `PREPARE_COMMIT` then runs `prepareRender()` over the
+   frozen render result to validate and prepare the typed commit deltas.
 6. **Commit or terminal:** one compare-and-set owner decides whether
    `COMMIT` can begin. A successful commit writes the canonical message/swipe
    and terminal receipt in one transaction. Cancellation, deadline, provider

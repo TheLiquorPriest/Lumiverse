@@ -2870,7 +2870,52 @@ describe.serial("root generation usage accounting", () => {
 
 const ADMISSION_USER_ID = "runtime-token-owner";
 const ADMISSION_PRESET_ID = "runtime-token-preset";
-const ADMISSION_CONNECTION_ID = "runtime-token-connection";
+
+class RuntimeAdmissionProvider implements LlmProvider {
+  readonly name = "authority-provider";
+  readonly displayName = "Runtime admission provider";
+  readonly defaultUrl = "https://authority.invalid/v1";
+  readonly capabilities: ProviderCapabilities = {
+    parameters: {},
+    requiresMaxTokens: false,
+    supportsSystemRole: true,
+    supportsStreaming: true,
+    apiKeyRequired: false,
+    modelListStyle: "none",
+    toolCalling: false,
+    nativeToolContinuation: false,
+    toolContinuationMode: "unsupported",
+    toolsDisabledFinalization: false,
+    supportsToolFinalization: false,
+  };
+  dispatchCount = 0;
+
+  async generate(
+    _apiKey: string,
+    _apiUrl: string,
+    _request: GenerationRequest,
+  ): Promise<GenerationResponse> {
+    this.dispatchCount += 1;
+    throw new Error("Runtime decision dry run dispatched the provider");
+  }
+
+  async *generateStream(
+    _apiKey: string,
+    _apiUrl: string,
+    _request: GenerationRequest,
+  ): AsyncGenerator<StreamChunk, void, unknown> {
+    this.dispatchCount += 1;
+    throw new Error("Runtime decision dry run dispatched the provider");
+  }
+
+  async validateKey(): Promise<boolean> {
+    return true;
+  }
+
+  async listModels(): Promise<string[]> {
+    return ["authority-model"];
+  }
+}
 
 const ADMISSION_INPUT_REVISIONS: InputRevisionSetV1 = {
   target: 1, chat: 2, message: 3, preset: 4, block: 5, config: 6,
@@ -2920,8 +2965,18 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
   await runMigrations(getDb());
   getDb().query('INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)')
     .run(ADMISSION_USER_ID, "Runtime Token Owner", "runtime-token@example.test");
+  const provider = new RuntimeAdmissionProvider();
+  registerProvider(provider);
+  const responseConnection = await connectionsSvc.createConnection(ADMISSION_USER_ID, {
+    name: "Runtime admission connection",
+    provider: provider.name,
+    model: "authority-model",
+    is_default: true,
+  });
   const chat = chatsSvc.createChat(ADMISSION_USER_ID, {
-    character_id: null, name: "Runtime token admission", metadata: { temporary: true },
+    character_id: null,
+    name: "Runtime token admission",
+    metadata: { temporary: true, no_preset: true },
   });
   chatsSvc.createMessage(chat.id, {
     is_user: true, name: "User", content: "Use the reviewed runtime.",
@@ -2933,8 +2988,8 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
   let inputRevisions = { ...ADMISSION_INPUT_REVISIONS };
   let readiness = admissionReadiness();
   const connection: FrozenConcreteConnectionV1 = {
-    logicalId: ADMISSION_CONNECTION_ID, concreteId: ADMISSION_CONNECTION_ID,
-    label: "Reviewed root", provider: "authority-provider", model: "authority-model",
+    logicalId: responseConnection.id, concreteId: responseConnection.id,
+    label: "Reviewed root", provider: provider.name, model: "authority-model",
     effectiveEndpoint: "https://authority.invalid/v1", endpointRevision: "endpoint-1",
     credentialSecretRef: "secret-1", credentialRevision: "credential-1",
     candidateRevision: "candidate-1", revision: "connection-1",
@@ -2964,7 +3019,7 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
     resolveProfile: () => ({ preset_id: ADMISSION_PRESET_ID, source: "chat" }),
     resolvePersona: () => null,
     resolveConcreteConnection: async (userId, logicalId) =>
-      userId === ADMISSION_USER_ID && logicalId === ADMISSION_CONNECTION_ID ? connection : null,
+      userId === ADMISSION_USER_ID && logicalId === responseConnection.id ? connection : null,
     getChatAgentModeOverride: () => null,
     setChatAgentModeOverride: (_userId, chatId, mode) => ({ chatId, mode, revision: 1, state: "ready" }),
     getInputRevisions: () => ({ ...inputRevisions }),
@@ -3018,7 +3073,7 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
   configureAgenticGenerationDependencies(dependencies);
 
   const generationInput = (requestEpoch: number, token?: string) => ({
-    userId: ADMISSION_USER_ID, chat_id: chat.id, connection_id: ADMISSION_CONNECTION_ID,
+    userId: ADMISSION_USER_ID, chat_id: chat.id, connection_id: responseConnection.id,
     preset_id: ADMISSION_PRESET_ID, generation_type: "normal" as const, mode: "agentic" as const,
     request_epoch: requestEpoch, user_input: "Use the reviewed runtime.",
     provider: "caller-untrusted-provider",
@@ -3027,12 +3082,12 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
   const issue = (requestEpoch: number) => service.resolve(
     ADMISSION_USER_ID,
     requestFor({
-      userId: ADMISSION_USER_ID, chatId: chat.id, connectionId: ADMISSION_CONNECTION_ID,
+      userId: ADMISSION_USER_ID, chatId: chat.id, connectionId: responseConnection.id,
       presetId: ADMISSION_PRESET_ID, generationType: "normal", requestEpoch,
     }, { generationType: "normal" }),
   );
   return {
-    service, dispatches, generationInput, issue, requestFor, chatId: chat.id,
+    service, dispatches, provider, generationInput, issue, requestFor, chatId: chat.id,
     advance: (milliseconds: number) => { now += milliseconds; },
     bumpConfig: () => {
       configRevision += 1;
@@ -3171,6 +3226,81 @@ test("rejects explicit Response mode and burns the supplied Agentic token", asyn
     await expect(startGeneration(harness.generationInput(9, token)))
       .rejects.toMatchObject({ code: "decision_refresh_required" });
     expect(resolveSpy).not.toHaveBeenCalled();
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("dry-run runtime decision burns a valid token before rejecting Agentic mode", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const token = (await harness.issue(20)).runtimeDecisionToken!;
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(dryRunGeneration(harness.generationInput(20, token)))
+      .rejects.toMatchObject({ code: "agentic_unsupported_surface" });
+    expect(harness.service.tokenStore.liveCount).toBe(0);
+    expect(harness.dispatches).toHaveLength(0);
+    expect(harness.provider.dispatchCount).toBe(0);
+
+    await expect(startGeneration(harness.generationInput(20, token)))
+      .rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(harness.dispatches).toHaveLength(0);
+    expect(harness.provider.dispatchCount).toBe(0);
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("dry-run runtime decision consumes tokens before successful Response and omitted-mode assembly", async () => {
+  for (const [requestEpoch, mode] of [[21, "response"], [22, undefined]] as const) {
+    const harness = await createRuntimeAdmissionHarness();
+    const token = (await harness.issue(requestEpoch)).runtimeDecisionToken!;
+    const resolveSpy = forbidReplacementResolution();
+    const request = (): Parameters<typeof dryRunGeneration>[0] => {
+      const input: Parameters<typeof dryRunGeneration>[0] = {
+        ...harness.generationInput(requestEpoch, token),
+      };
+      if (mode === undefined) delete input.mode;
+      else input.mode = mode;
+      return input;
+    };
+    try {
+      const result = await dryRunGeneration(request());
+      expect(result.assemblySurface).toBe("RESPONSE");
+      expect(harness.service.tokenStore.liveCount).toBe(0);
+      expect(harness.dispatches).toHaveLength(0);
+      expect(harness.provider.dispatchCount).toBe(0);
+
+      await expect(startGeneration(harness.generationInput(requestEpoch, token)))
+        .rejects.toMatchObject({ code: "decision_refresh_required" });
+      expect(resolveSpy).not.toHaveBeenCalled();
+      expect(harness.dispatches).toHaveLength(0);
+      expect(harness.provider.dispatchCount).toBe(0);
+    } finally {
+      resolveSpy.mockRestore();
+    }
+  }
+});
+
+test("dry-run runtime decision preserves owner checks while burning cross-user attempts", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const token = (await harness.issue(23)).runtimeDecisionToken!;
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(dryRunGeneration({
+      ...harness.generationInput(23, token),
+      userId: "runtime-token-attacker",
+      userName: "Runtime Token Attacker",
+      mode: "response",
+    })).rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(harness.service.tokenStore.getLiveCountForUser(ADMISSION_USER_ID)).toBe(0);
+
+    await expect(startGeneration(harness.generationInput(23, token)))
+      .rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(harness.dispatches).toHaveLength(0);
+    expect(harness.provider.dispatchCount).toBe(0);
   } finally {
     resolveSpy.mockRestore();
   }

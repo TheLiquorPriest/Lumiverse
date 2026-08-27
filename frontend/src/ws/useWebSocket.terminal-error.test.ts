@@ -1,7 +1,14 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import en from '@/i18n/locales/en/chat.json'
+import fr from '@/i18n/locales/fr/chat.json'
+import it from '@/i18n/locales/it/chat.json'
+import ja from '@/i18n/locales/ja/chat.json'
+import zh from '@/i18n/locales/zh/chat.json'
+import zhTW from '@/i18n/locales/zh-TW/chat.json'
 
+const localeCatalogues = { en, fr, it, ja, zh, 'zh-TW': zhTW } as const
 const requestedKeys: string[] = []
 const translations: Record<string, string> = {}
 const testI18n = {
@@ -38,6 +45,7 @@ mock.module('@/api/auth', () => ({
   readAuthErrorResponseMeta: async () => null,
 }))
 
+// Install module mocks before evaluating useWebSocket's static dependency graph.
 const { formatTerminalGenerationError } = await import('./useWebSocket')
 
 beforeEach(() => {
@@ -50,31 +58,43 @@ function installTranslations(values: Readonly<Record<string, string>>): void {
 }
 
 describe('terminal generation error formatting', () => {
-  test('uses the canonical runtime error namespace for a mapped error', () => {
+  test('localizes a known stable public code from the Agent Run catalogue', () => {
     installTranslations({
-      'chat.agentRuntime.errors.agentic_provider_failure': 'Localized provider failure',
+      'chat.agentRun.errors.provider_request_error': 'Localized provider failure',
     })
 
     expect(formatTerminalGenerationError({
-      agentError: { code: 'agentic_provider_failure' },
+      errorCode: 'provider_request_error',
     })).toBe('Localized provider failure')
     expect(requestedKeys).toEqual([
-      'chat.agentRuntime.errors.agentic_provider_failure',
+      'chat.agentRun.errors.provider_request_error',
     ])
   })
 
-  test('falls back to the canonical internal error without consulting activity labels', () => {
+  test('uses the generic Agent Run error for an unknown future code', () => {
     installTranslations({
-      'chat.agentRuntime.errors.agentic_internal_error': 'Localized internal failure',
+      'chat.agentRun.errors.unknown': 'Localized safe failure',
     })
 
     expect(formatTerminalGenerationError({
-      agentError: { code: 'future_agent_error' },
-    })).toBe('Localized internal failure')
+      errorCode: 'future_agent_error',
+    })).toBe('Localized safe failure')
     expect(requestedKeys).toEqual([
-      'chat.agentRuntime.errors.future_agent_error',
-      'chat.agentRuntime.errors.agentic_internal_error',
+      'chat.agentRun.errors.future_agent_error',
+      'chat.agentRun.errors.unknown',
     ])
+    expect(requestedKeys.some((key) => key.includes('agentRuntime.errors'))).toBeFalse()
     expect(requestedKeys.some((key) => key.includes('agentActivity.errors'))).toBeFalse()
+  })
+
+  test('all six locale catalogues provide specific and generic Agent Run errors', () => {
+    for (const [locale, catalogue] of Object.entries(localeCatalogues)) {
+      const errors = catalogue.agentRun.errors
+      expect(errors.provider_request_error, `${locale} provider_request_error`).toBeString()
+      expect(errors.provider_request_error.trim(), `${locale} provider_request_error`).not.toBe('')
+      expect(errors.unknown, `${locale} unknown`).toBeString()
+      expect(errors.unknown.trim(), `${locale} unknown`).not.toBe('')
+      expect(errors.provider_request_error, locale).not.toBe(errors.unknown)
+    }
   })
 })

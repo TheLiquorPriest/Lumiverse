@@ -8,6 +8,7 @@ import {
   MAX_NATIVE_MESSAGE_MEDIA_PARTS,
   MAX_NATIVE_MESSAGE_MEDIA_TOTAL_BYTES,
 } from "../types/media-limits";
+import { AGENT_CHILD_TASK_MAX_BYTES } from "./agent-runtime-accounting";
 
 import { preflightAgentIntrinsics, AgentIntrinsicValidationError } from "./agent-intrinsics.service";
 import { registry as macroRegistry } from "../macros/MacroRegistry";
@@ -1914,7 +1915,14 @@ export async function compileAgentAssemblyPlan(
     );
     const maxOutputTokens = Math.min(authoredOutputTokens, Math.max(1, Math.ceil(maxOutputBytes / 4)));
     const taskBytes = bytes(item.child.task);
-    if (taskBytes > snapshot.limits.maxOperationBytes) failForBlock("limit_exceeded", "Child task exceeds operation limit", item.block, item.blockIndex);
+    if (taskBytes > AGENT_CHILD_TASK_MAX_BYTES) {
+      failForBlock(
+        "limit_exceeded",
+        `Child task exceeds ${AGENT_CHILD_TASK_MAX_BYTES / 1024} KiB UTF-8 limit`,
+        item.block,
+        item.blockIndex,
+      );
+    }
     const slotIndex = children.length;
     const resultName = item.child.resultName ?? `child_${slotIndex}`;
     const seal = digest({ slotIndex, blockIndex: item.blockIndex, blockId: item.block.id, resultName });

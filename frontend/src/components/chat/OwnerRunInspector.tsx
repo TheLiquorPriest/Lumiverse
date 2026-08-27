@@ -1467,7 +1467,7 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
                   </div>
                   <dl className={styles.summaryGrid}>
                     <Field label={t('ownerInspection.attemptId')} value={boundedId(inspection.error.inspectionAttemptId)} mono />
-                    <Field label={t('ownerInspection.outcome')} value={valueLabel(t, inspection.error.category)} />
+                    <Field label={t('ownerInspection.outcome')} value={valueLabel(t, inspection.error.workOutcome)} />
                     {inspection.error.causalCode ? <Field label={t('ownerInspection.errorReason')} value={boundedId(inspection.error.causalCode)} mono /> : null}
                     {inspection.error.reason ? <Field label={t('ownerInspection.reason')} value={valueLabel(t, inspection.error.reason)} /> : null}
                     <Field label={t('agentRuntime.provenance.authority')} value={valueLabel(t, inspection.error.authority)} />

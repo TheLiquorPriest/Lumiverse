@@ -216,6 +216,72 @@ describe("user-data export ZIP64 round-trip", () => {
     expect(manifest.ndjsonMaxRecordBytes).toBe(NDJSON_MAX_RECORD_BYTES);
     expect(manifest.archiveId).toMatch(/^[0-9a-f-]{36}$/i);
   });
+  test("Quick Export recursively scrubs supported legacy image-generation API keys", async () => {
+    const nanoSecret = "quick-export-nanogpt-secret";
+    const novelSecret = "quick-export-novelai-secret";
+    const nestedSecret = "quick-export-nested-secret";
+    const imageGeneration = {
+      enabled: true,
+      nanogpt: { apiKey: nanoSecret, model: "hidream" },
+      novelai: { apiKey: novelSecret, sampler: "k_euler" },
+      compatibility: [
+        { nanogpt: { apiKey: nestedSecret, model: "legacy-nested" } },
+        { wrapper: { novelai: { apiKey: nestedSecret, steps: 28 } } },
+      ],
+    };
+    const insert = getDb().prepare(
+      "INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)",
+    );
+    insert.run("imageGeneration", JSON.stringify(imageGeneration), USER_ID);
+    insert.run("connection_legacy_api_key", "secret-setting-value", USER_ID);
+
+    const bytes = await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }));
+    const rows = readArchiveNdjson(bytes, "database/settings.ndjson");
+    const exported = rows.find((row) => row.key === "imageGeneration");
+    const archive = unzipSync(bytes);
+
+    expect(exported).toBeDefined();
+    expect(JSON.parse(exported!.value)).toEqual({
+      enabled: true,
+      nanogpt: { model: "hidream" },
+      novelai: { sampler: "k_euler" },
+      compatibility: [
+        { nanogpt: { model: "legacy-nested" } },
+        { wrapper: { novelai: { steps: 28 } } },
+      ],
+    });
+    expect(rows.some((row) => row.key === "connection_legacy_api_key")).toBe(false);
+    expect(Object.keys(archive).some((name) => name.startsWith("secrets/"))).toBe(false);
+    const exportedManifest = JSON.parse(strFromU8(archive["manifest.json"]!));
+    expect(exportedManifest.hasEncryptedSecrets).toBe(false);
+    expect(exportedManifest.secretsCount).toBe(0);
+    const archiveText = Object.values(archive).map((entry) => strFromU8(entry)).join("\n");
+    expect(archiveText).not.toContain(nanoSecret);
+    expect(archiveText).not.toContain(novelSecret);
+    expect(archiveText).not.toContain(nestedSecret);
+    expect(archiveText).not.toContain("secret-setting-value");
+  });
+
+  test("Quick Export fails closed for a malformed legacy image-generation value", async () => {
+    const malformedSecret = "malformed-legacy-image-secret";
+    getDb()
+      .prepare("INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)")
+      .run(
+        "imageGeneration",
+        `{"enabled":true,"nanogpt":{"apiKey":"${malformedSecret}"}`,
+        USER_ID,
+      );
+
+    await expect(readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }))).rejects.toThrow("imageGeneration settings value is malformed JSON");
+  });
   test("redacts materialized sealed preset blocks into canonical portable descriptors", async () => {
     const secret = "ARCHIVE_SEALED_SECRET_distinctive_bytes_7b2f";
     const digest = createHash("sha256").update(secret, "utf8").digest("hex");

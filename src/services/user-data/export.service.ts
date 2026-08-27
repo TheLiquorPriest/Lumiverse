@@ -39,6 +39,7 @@ import {
   getArchiveVectorTables,
   buildArchiveOwnerPredicate,
 } from "./table-registry";
+import { scrubLegacyImageGenerationSettingRow } from "./private-data";
 import { scrubPresetMetadata } from "../agent-config-portability.service";
 import {
   cleanupFrozenStaging,
@@ -2029,7 +2030,11 @@ async function runExport(
         if (rowsOut >= MAX_ARCHIVE_ROWS_PER_TABLE || totalRows >= MAX_ARCHIVE_TOTAL_ROWS) {
           throw new Error(`archive row count exceeds cap: ${table}`);
         }
-        await entry.write(scrubArchiveRowPrivateData(scrubRow(exportRow, spec.scrubColumns)));
+        const scrubbedRow = scrubRow(exportRow, spec.scrubColumns);
+        const portableRow = table === "settings"
+          ? scrubLegacyImageGenerationSettingRow(scrubbedRow)
+          : scrubbedRow;
+        await entry.write(scrubArchiveRowPrivateData(portableRow));
         rowsOut++;
         totalRows++;
         if (rowsOut % YIELD_INTERVAL_ROWS === 0) await yieldAndCheck(signal);

@@ -33,7 +33,7 @@ import {
   type CreateAgentCognitionRuntimeInputV1,
 } from "../types/agent-cognition-runtime";
 import type { AgentRuntimePolicyV1 } from "../types/agents";
-import { deriveCognitionOperationalTaskId } from "../types/agent-cognition";
+import { deriveCognitionOperationalTaskId, LOOM_POLICY_CHECKPOINTS } from "../types/agent-cognition";
 import type {
   CognitionActivationResultV1,
   CognitionActivationRootsV1,
@@ -46,6 +46,8 @@ import type {
   CognitionTaskTransition,
   FrozenCognitionGraphV1,
   LoomPolicyBucketsV1,
+  LoomPolicyCheckpointV1,
+  LoomPromptInspectionV1,
   TaskTemplateV1,
 } from "../types/agent-cognition";
 import {
@@ -239,6 +241,8 @@ interface CognitionCompletionClosureV1 {
   readonly blockingRequiredTaskIds: readonly string[];
 }
 
+type LoomCheckpointEvidenceV1 = Map<LoomPolicyCheckpointV1, LoomPromptInspectionV1>;
+
 function completionActivationClosure(
   graph: FrozenCognitionGraphV1,
   state: CognitionActivationStateV1,
@@ -246,11 +250,12 @@ function completionActivationClosure(
   transitions: Readonly<Record<string, CognitionTaskTransition>>,
   frozenSourceDigest: string,
   loomSource: AgentCognitionRuntimeSourceV1,
+  checkpointEvidence: LoomCheckpointEvidenceV1,
   roots: CognitionActivationRootsV1,
 ): CognitionCompletionClosureV1 {
   const startingTemplateIds = state.activatedTemplateIds;
   let current = completeCognitionFixedPoint(graph, state, phaseContext(baseEvaluation, "COMPLETE", transitions), roots);
-  const activationViews: CognitionRuntimeActivationV1[] = [runtimeActivation("COMPLETE", current.state, current, graph, frozenSourceDigest, loomSource, phaseContext(baseEvaluation, "COMPLETE", transitions))];
+  const activationViews: CognitionRuntimeActivationV1[] = [runtimeActivation("COMPLETE", current.state, current, graph, frozenSourceDigest, loomSource, phaseContext(baseEvaluation, "COMPLETE", transitions), checkpointEvidence)];
   let finalActivation: CognitionActivationResultV1 = current;
   for (const phase of SUCCESS_COMPLETION_PHASES) {
     const next = activateCognitionAtPoint(graph, current.state, phaseContext(baseEvaluation, phase, transitions), "phase_entry", roots);
@@ -263,7 +268,7 @@ function completionActivationClosure(
       newlyRequiredTemplateIds: appendedIds(next.state.requiredTemplateIds, state.requiredTemplateIds),
     };
     finalActivation = current;
-    activationViews.push(runtimeActivation(phase, next.state, next, graph, frozenSourceDigest, loomSource, phaseContext(baseEvaluation, phase, transitions)));
+    activationViews.push(runtimeActivation(phase, next.state, next, graph, frozenSourceDigest, loomSource, phaseContext(baseEvaluation, phase, transitions), checkpointEvidence));
   }
   const blockingRequiredTaskIds = Object.freeze(finalActivation.state.requiredTemplateIds.filter((taskId) => transitions[taskId] !== "completed").sort(compareUtf8));
   const activation = Object.freeze({
@@ -275,23 +280,44 @@ function completionActivationClosure(
   const completion = Object.freeze({ ...activation, fixedPointIterations: current.fixedPointIterations, blockingRequiredTaskIds, canComplete: blockingRequiredTaskIds.length === 0 });
   return Object.freeze({ activation, completion, activationViews: Object.freeze(activationViews), materializeTemplates: materializationTemplates(graph, finalActivation.state.activatedTemplateIds.filter((id) => !startingTemplateIds.includes(id))), blockingRequiredTaskIds });
 }
-function loomPolicySurface(phase: CognitionRuntimePhaseV1 | "COMPLETE", source: AgentCognitionRuntimeSourceV1 | undefined, evaluation: CognitionEvaluationContextV1 | undefined): CognitionRuntimeActivationV1["policySurface"] {
-  if (!source?.loomPolicy) return undefined;
-  const checkpoint = phase === "ASSEMBLE" || phase === "WORK" || phase === "RENDER" ? phase : "PREPARE_COMMIT";
-  // A Loom condition is decided at its owning checkpoint. Later terminal
-  // phases may publish the frozen inspection, but must not re-evaluate it with
-  // their own phase context.
-  const checkpointEvaluation = evaluation === undefined
-    ? undefined
-    : phaseContext(evaluation, checkpoint, evaluation.taskTransitions);
-  const inspection = inspectLoomPromptPolicies(source.loomPolicy, {
-    checkpoint,
-    surface: "WORK",
-    blocks: source.loomBlocks ?? [],
-    ...(checkpointEvaluation === undefined ? {} : { evaluation: checkpointEvaluation }),
-  });
-  if (inspection.items.some((item) => item.outcome.status === "rejected")) {
-    throw new AgentCognitionRuntimeError("invalid_source", "required Loom policy source was rejected at its checkpoint");
+
+function loomPolicyCheckpoint(phase: CognitionRuntimePhaseV1 | "COMPLETE"): LoomPolicyCheckpointV1 {
+  return phase === "ASSEMBLE" || phase === "WORK" || phase === "RENDER" ? phase : "PREPARE_COMMIT";
+}
+
+function loomPolicySurface(
+  phase: CognitionRuntimePhaseV1 | "COMPLETE",
+  source: AgentCognitionRuntimeSourceV1,
+  evaluation: CognitionEvaluationContextV1,
+  checkpointEvidence: LoomCheckpointEvidenceV1,
+): CognitionRuntimeActivationV1["policySurface"] {
+  if (!source.loomPolicy) return undefined;
+  const checkpoint = loomPolicyCheckpoint(phase);
+  let inspection = checkpointEvidence.get(checkpoint);
+  if (inspection === undefined) {
+    const targetIndex = LOOM_POLICY_CHECKPOINTS.indexOf(checkpoint);
+    for (let index = 0; index <= targetIndex; index += 1) {
+      const currentCheckpoint = LOOM_POLICY_CHECKPOINTS[index];
+      if (currentCheckpoint === undefined || checkpointEvidence.has(currentCheckpoint)) continue;
+      const priorCheckpoint = index === 0 ? undefined : LOOM_POLICY_CHECKPOINTS[index - 1];
+      const previousInspection = priorCheckpoint === undefined ? undefined : checkpointEvidence.get(priorCheckpoint);
+      const checkpointEvaluation = phaseContext(evaluation, currentCheckpoint, evaluation.taskTransitions);
+      const candidate = inspectLoomPromptPolicies(source.loomPolicy, {
+        checkpoint: currentCheckpoint,
+        surface: "WORK",
+        blocks: source.loomBlocks ?? [],
+        evaluation: checkpointEvaluation,
+        ...(previousInspection === undefined ? {} : { previousInspection }),
+      });
+      if (candidate.items.some((item) => item.outcome.status === "rejected")) {
+        throw new AgentCognitionRuntimeError("invalid_source", "required Loom policy source was rejected at its checkpoint");
+      }
+      checkpointEvidence.set(currentCheckpoint, candidate);
+    }
+    inspection = checkpointEvidence.get(checkpoint);
+  }
+  if (inspection === undefined) {
+    throw new AgentCognitionRuntimeError("invalid_source", "Loom checkpoint evidence was not recorded");
   }
   return Object.freeze({ policies: source.loomPolicy, promptInspection: inspection });
 }
@@ -302,10 +328,11 @@ function runtimeActivation(
   activation: CognitionActivationResultV1,
   graph: FrozenCognitionGraphV1,
   frozenSourceDigest: string,
-  loomSource?: AgentCognitionRuntimeSourceV1,
-  evaluation?: CognitionEvaluationContextV1,
+  loomSource: AgentCognitionRuntimeSourceV1,
+  evaluation: CognitionEvaluationContextV1,
+  checkpointEvidence: LoomCheckpointEvidenceV1,
 ): CognitionRuntimeActivationV1 {
-  const policySurface = loomPolicySurface(phase, loomSource, evaluation);
+  const policySurface = loomPolicySurface(phase, loomSource, evaluation, checkpointEvidence);
   return Object.freeze({
     phase,
     state,
@@ -416,13 +443,14 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
   let state = createCognitionActivationState(graph, initialRevision);
   let currentPhase: CognitionRuntimePhaseV1 = "ASSEMBLE";
   const transitions: Record<string, CognitionTaskTransition> = { ...baseEvaluation.taskTransitions };
+  const checkpointEvidence: LoomCheckpointEvidenceV1 = new Map();
   let completionAccepted = false;
   const operationResults = new Map<string, { fingerprint: string; result: CognitionWorkspaceMutationResultV1 }>();
   const completionResults = new Map<string, { fingerprint: string; result: CognitionRuntimeCompletionV1 }>();
   const initialCandidate = activateCognitionAtPoint(graph, state, phaseContext(baseEvaluation, "ASSEMBLE", transitions), "initial", activationRoots);
   const committed = activateWorkspaceCognitionAtPhase(input.workspace, { state, update: (currentState): CognitionWorkspacePhaseUpdateV1 => phaseWorkspaceUpdate(currentState, initialCandidate, graph) });
   state = committed.state;
-  const initialView = runtimeActivation("ASSEMBLE", state, committed.activation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "ASSEMBLE", transitions));
+  const initialView = runtimeActivation("ASSEMBLE", state, committed.activation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "ASSEMBLE", transitions), checkpointEvidence);
 
   const runtime: AgentCognitionRuntimeV1 = {
     graph,
@@ -450,12 +478,12 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       if (completionAccepted) {
         if (candidate.newlyActivatedTemplateIds.length > 0 || candidate.newlyRequiredTemplateIds.length > 0) throw new AgentCognitionRuntimeError("completion_blocked", `cognition activation is not frozen for ${inputPhase.phase}`);
         currentPhase = inputPhase.phase;
-        return runtimeActivation(inputPhase.phase, state, candidate, graph, frozenSourceDigest, authenticatedSource, phaseEvaluation);
+        return runtimeActivation(inputPhase.phase, state, candidate, graph, frozenSourceDigest, authenticatedSource, phaseEvaluation, checkpointEvidence);
       }
       const phaseCommit = activateWorkspaceCognitionAtPhase(inputPhase.workspace, { state, update: (currentState): CognitionWorkspacePhaseUpdateV1 => phaseWorkspaceUpdate(currentState, candidate, graph) });
       state = phaseCommit.state;
       currentPhase = inputPhase.phase;
-      return runtimeActivation(inputPhase.phase, state, phaseCommit.activation, graph, frozenSourceDigest, authenticatedSource, phaseEvaluation);
+      return runtimeActivation(inputPhase.phase, state, phaseCommit.activation, graph, frozenSourceDigest, authenticatedSource, phaseEvaluation, checkpointEvidence);
     },
     applyWorkspaceTransition(input: CognitionRuntimeTaskTransitionInputV1): CognitionWorkspaceMutationResultV1 {
       throwIfAborted(input.signal);
@@ -513,7 +541,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
                 : acceptWorkspaceSubmissionWithCognition(workspace, { state, update });
       const evaluated = computed;
       if (!evaluated) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "workspace CAS did not evaluate cognition");
-      const cognition = runtimeActivation(currentPhase, workspaceResult.state, workspaceResult.activation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, currentPhase, nextTransitions));
+      const cognition = runtimeActivation(currentPhase, workspaceResult.state, workspaceResult.activation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, currentPhase, nextTransitions), checkpointEvidence);
       const result = deepFreeze({ workspaceRevision: workspaceResult.workspaceRevision, state: workspaceResult.state, activation: workspaceResult.activation, materializedTaskIds: publicMaterializedTaskIds(graph, input.workspace, workspaceResult.materializedTaskIds), taskId: evaluated.taskId, transition: evaluated.transition, cognition, ...(operationKey ? { operationKey } : {}) });
       state = result.state;
       transitions[identity.authoredTaskId] = transition;
@@ -541,7 +569,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       delete workspace.completionRenderGuidance;
       const update = (current: CognitionActivationStateV1): CognitionWorkspaceCompletionUpdateV1 => {
         if (current.workspaceRevision !== state.workspaceRevision) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "cognition state is stale for completion CAS");
-        const activationClosure = completionActivationClosure(graph, current, baseEvaluation, transitions, frozenSourceDigest, authenticatedSource, activationRoots);
+        const activationClosure = completionActivationClosure(graph, current, baseEvaluation, transitions, frozenSourceDigest, authenticatedSource, checkpointEvidence, activationRoots);
         closure = activationClosure;
         const next: CognitionWorkspaceCompletionUpdateV1 = {
           state: Object.freeze({ ...activationClosure.activation.state, workspaceRevision: current.workspaceRevision + 1 }),
@@ -558,7 +586,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
         const operationalBlockingRequiredTaskIds = [...new Set(workspaceResult.blockingRequiredTaskIds.map((id) => authoredTaskIdForOperational(graph, workspace, id)))];
         const blockers = operationalBlockingRequiredTaskIds.map((id) => ({ kind: "task" as const, id }));
         return deepFreeze({
-          ...runtimeActivation("COMPLETE", workspaceResult.state, finalActivation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "PREPARE_COMMIT", transitions)),
+          ...runtimeActivation("COMPLETE", workspaceResult.state, finalActivation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "PREPARE_COMMIT", transitions), checkpointEvidence),
           accepted: workspaceResult.accepted && blockers.length === 0,
           blockers,
           blockingRequiredTaskIds: Object.freeze(blockers.map((blocker) => blocker.id)),

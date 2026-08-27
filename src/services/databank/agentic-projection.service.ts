@@ -30,6 +30,11 @@ import type {
 const encoder = new TextEncoder();
 const MAX_MENTION_COUNT = 64;
 const MAX_AUTOMATIC_CHUNKS = 20;
+// Native history treats JSON true and legacy numeric 1 as hidden. Invalid or
+// non-object extra payloads hydrate as visible, so keep the SQL predicate equal.
+const VISIBLE_MESSAGE_SQL = `CASE
+  WHEN json_valid(m.extra) THEN json_extract(m.extra, '$.hidden')
+END IS NOT 1`;
 const EMPTY_PROJECTION: SnapshotDatabankV1 = Object.freeze({
   enabled: false,
   activeBankIds: Object.freeze([]),
@@ -78,6 +83,7 @@ function latestUserInput(userId: string, chatId: string): string {
        FROM messages m
        JOIN chats c ON c.id = m.chat_id
       WHERE m.chat_id = ? AND c.user_id = ? AND m.is_user = 1
+        AND (${VISIBLE_MESSAGE_SQL})
       ORDER BY m.index_in_chat DESC, m.id DESC
       LIMIT 1`,
   ).get(chatId, userId) as {
@@ -136,6 +142,7 @@ function recentQueryText(
          FROM messages m
          JOIN chats c ON c.id = m.chat_id
         WHERE m.chat_id = ? AND c.user_id = ? AND (? IS NULL OR m.id <> ?)
+          AND (${VISIBLE_MESSAGE_SQL})
         ORDER BY m.index_in_chat DESC, m.id DESC
         LIMIT 6`,
     ).all(

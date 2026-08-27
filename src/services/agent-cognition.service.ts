@@ -1043,6 +1043,54 @@ export function parseLoomPromptInspectionV1(value: unknown, path = "inspection")
   return deepFreeze({ version: LOOM_POLICY_VERSION, surface, checkpoint, items, effectiveEntryIds, ...(responseOmission === undefined ? {} : { responseOmission }) });
 }
 
+function previousLoomInspection(
+  input: LoomPromptInspectionInputV1,
+  surface: "WORK" | "RESPONSE",
+  checkpoint: LoomPolicyCheckpointV1,
+  flattened: readonly { readonly bucket: LoomPolicyBucketV1; readonly entry: LoomPolicyEntryV1 }[],
+): LoomPromptInspectionV1 | undefined {
+  if (input.previousInspection === undefined) return undefined;
+  const previous = parseLoomPromptInspectionV1(input.previousInspection, "inspection.previousInspection");
+  if (surface !== "WORK" || previous.surface !== "WORK") {
+    fail("invalid_value", "inspection.previousInspection.surface", "only WORK inspection evidence can advance checkpoints");
+  }
+  if (LOOM_CHECKPOINT_RANK[previous.checkpoint] >= LOOM_CHECKPOINT_RANK[checkpoint]) {
+    fail("invalid_value", "inspection.previousInspection.checkpoint", "previous inspection must precede the requested checkpoint");
+  }
+  if (previous.items.length !== flattened.length) {
+    fail("invalid_value", "inspection.previousInspection.items", "previous inspection does not cover the Loom policy");
+  }
+  for (let index = 0; index < flattened.length; index += 1) {
+    const expected = flattened[index];
+    const item = previous.items[index];
+    if (!expected || !item) {
+      fail("invalid_value", "inspection.previousInspection.items", "previous inspection does not cover the Loom policy");
+    }
+    const sourceMatches = item.source.kind === expected.entry.source.kind
+      && item.source.blockId === expected.entry.source.blockId
+      && item.source.presetRevision === expected.entry.source.presetRevision
+      && item.source.blockRevision === expected.entry.source.blockRevision
+      && item.source.promptOrder === expected.entry.source.promptOrder;
+    const conditionMatches = item.condition === undefined
+      ? expected.entry.condition === undefined
+      : expected.entry.condition !== undefined
+        && JSON.stringify(item.condition) === JSON.stringify(expected.entry.condition);
+    if (
+      item.entryId !== expected.entry.id
+      || item.bucket !== expected.bucket
+      || item.destination !== expected.entry.destination
+      || item.checkpoint !== expected.entry.checkpoint
+      || item.required !== expected.entry.required
+      || !item.ordinaryPromptSuppressed
+      || !sourceMatches
+      || !conditionMatches
+    ) {
+      fail("invalid_value", `inspection.previousInspection.items[${index}]`, "previous inspection provenance does not match the Loom policy");
+    }
+  }
+  return previous;
+}
+
 export function inspectLoomPromptPolicies(policiesValue: unknown, input: LoomPromptInspectionInputV1): LoomPromptInspectionV1 {
   const policies = parseLoomPolicyBuckets(policiesValue);
   const checkpoint = ensureEnum(input.checkpoint, LOOM_POLICY_CHECKPOINTS, "inspection.checkpoint");
@@ -1064,9 +1112,32 @@ export function inspectLoomPromptPolicies(policiesValue: unknown, input: LoomPro
   const keptByDestinationBlock = new Map<string, string>();
   const conflictingIds = conflictingDestBlockEntryIds(policies);
   const flattened = LOOM_POLICY_BUCKETS.flatMap((bucket) => policies[bucket].map((entry) => ({ bucket, entry })));
-  for (const { bucket, entry } of flattened) {
+  const previous = previousLoomInspection(input, surface, checkpoint, flattened);
+  const previousRank = previous === undefined ? -1 : LOOM_CHECKPOINT_RANK[previous.checkpoint];
+  for (let index = 0; index < flattened.length; index += 1) {
+    const current = flattened[index];
+    if (!current) continue;
+    const { bucket, entry } = current;
     if (surface === "RESPONSE") {
       items.push(loomPromptInspectionItem(entry, bucket, { status: "omitted", reason: "response_mode" }, null, entry.condition === undefined ? "not_applicable" : "not_evaluated"));
+      continue;
+    }
+    if (previous !== undefined && LOOM_CHECKPOINT_RANK[entry.checkpoint] <= previousRank) {
+      const item = previous.items[index];
+      if (!item || (item.outcome.status === "skipped" && item.outcome.reason === "checkpoint_not_reached")) {
+        fail("invalid_value", `inspection.previousInspection.items[${index}]`, "previous inspection did not decide a reached entry");
+      }
+      const deduplicationKey = loomDestBlockKey(item.destination, item.source.blockId);
+      if (item.outcome.status === "included") {
+        if (item.outcome.effectiveIndex !== effectiveEntryIds.length || keptByDestinationBlock.has(deduplicationKey)) {
+          fail("invalid_value", `inspection.previousInspection.items[${index}].outcome`, "previous inspection inclusion order is invalid");
+        }
+        keptByDestinationBlock.set(deduplicationKey, item.entryId);
+        effectiveEntryIds.push(item.entryId);
+      } else if (item.outcome.status === "deduplicated" && keptByDestinationBlock.get(deduplicationKey) !== item.outcome.keptEntryId) {
+        fail("invalid_value", `inspection.previousInspection.items[${index}].outcome`, "previous inspection deduplication evidence is invalid");
+      }
+      items.push(item);
       continue;
     }
     if (conflictingIds.has(entry.id)) {

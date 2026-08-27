@@ -17,6 +17,7 @@ import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
 import { AGENT_CHILD_TASK_MAX_BYTES } from "./agent-runtime-accounting";
 import { WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES } from "./turn-workspace.service";
 import {
+  AGENT_RUNTIME_MAX_CUSTOM_PHASES,
   AGENT_SYSTEM_PROMPT_MAX_BYTES,
   createDisabledAgentConfigV2,
   parseAgentConfigV2,
@@ -4879,6 +4880,103 @@ describe("Agentic WORK phase", () => {
     expect(requests[3]?.tools).toEqual(["complete_turn", "workspace_create_task"]);
     expect(requests.every((request) => !request.tools.includes("council_call"))).toBe(true);
     expect(requests.every((request) => !request.tools.includes("agent_delegate"))).toBe(true);
+  });
+  test("keeps bounded owner omission receipts when every optional custom phase retires", async () => {
+    const fixture = await compiledChildFixture([]);
+    if (!fixture.snapshot.agentConfig) throw new Error("missing agent config fixture");
+    const optionalPhases = Array.from(
+      { length: AGENT_RUNTIME_MAX_CUSTOM_PHASES },
+      (_, index) => customPhase(`retired-optional-${index}`, [], {
+        required: false,
+        instructionRefs: [phaseRef(`missing-retired-source-${index}`, index)],
+      }),
+    );
+    const configured = parseAgentConfigV2({
+      ...fixture.snapshot.agentConfig,
+      runtimePolicy: {
+        version: 1,
+        authority: "loom",
+        scope: "preset",
+        defaultMode: "response",
+        loomPolicy: null,
+        phases: optionalPhases,
+      },
+    });
+    const snapshot = resealSnapshot({
+      ...fixture.snapshot,
+      agentConfig: configured,
+      agentCognition: {
+        ...fixture.snapshot.agentCognition,
+        cognitionSource: {
+          presetRevision: 1,
+          blocks: [],
+        },
+      },
+    });
+    const retiredPlan = await compileAgentAssemblyPlan(snapshot);
+    expect(retiredPlan.customPhasePlan).toMatchObject({
+      status: "repair_required",
+      phases: [],
+    });
+    expect(retiredPlan.customPhasePlan.issues.filter((issue) =>
+      issue.code === "optional_phase_omitted")).toHaveLength(AGENT_RUNTIME_MAX_CUSTOM_PHASES);
+
+    const conditionRecords: Array<Record<string, unknown>> = [];
+    let phaseSnapshotReads = 0;
+    let dispatches = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async () => {
+      dispatches += 1;
+      return response("", [complete("all-optional-retired")]);
+    }, {
+      plan: retiredPlan,
+      snapshot,
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async () => {
+          phaseSnapshotReads += 1;
+          return phaseSnapshot(4);
+        },
+      }),
+      phaseEvaluationContext: phaseContext(),
+      phaseRevision: 4,
+      inspection: {
+        record: (kind, value) => {
+          if (kind === "condition" && value && typeof value === "object") {
+            conditionRecords.push(value as Record<string, unknown>);
+          }
+          return null;
+        },
+      },
+    }));
+
+    const evidence = conditionRecords
+      .map((record) => typeof record.result === "string"
+        ? JSON.parse(record.result) as Record<string, unknown>
+        : null)
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+    const omissionReceipts = evidence.filter((entry) => entry.kind === "phase_repair");
+    expect(result.status).toBe("completed");
+    expect(dispatches).toBe(1);
+    expect(phaseSnapshotReads).toBe(0);
+    expect(evidence.some((entry) => entry.kind === "phase_condition")).toBe(false);
+    expect(omissionReceipts).toHaveLength(AGENT_RUNTIME_MAX_CUSTOM_PHASES);
+    expect(omissionReceipts[0]).toEqual({
+      version: 1,
+      kind: "phase_repair",
+      compileStatus: "repair_required",
+      disposition: "omitted",
+      survivingPhaseCount: 0,
+      phaseId: "retired_optional_0",
+      phaseIndex: 0,
+      required: false,
+      code: "optional_phase_omitted",
+      source: "revision",
+      detail: "source block missing-retired-source-0 revision or order is stale",
+    });
+    expect(new Set(omissionReceipts.map((receipt) => receipt.phaseId)).size)
+      .toBe(AGENT_RUNTIME_MAX_CUSTOM_PHASES);
+    for (const record of conditionRecords) {
+      expect(new TextEncoder().encode(String(record.result)).byteLength).toBeLessThan(1_024);
+    }
   });
   test("runs the editor-default required WORK-to-COMPLETE phase without manual edits", async () => {
     const instruction = phaseRef("editor-default-phase", 0);

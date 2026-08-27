@@ -23,6 +23,7 @@ import { parseAgenticPreprocessingResponseV1 } from "./agentic-preprocessing-wor
 import type { ActiveIsolateJob } from "./isolate-pool";
 import { freezeCognitionGraph } from "./agent-cognition.service";
 import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
+import { AGENT_CHILD_TASK_MAX_BYTES } from "./agent-runtime-accounting";
 
 function schema(): Database {
   const db = new Database(":memory:");
@@ -642,6 +643,56 @@ describe("strict assembly input boundaries", () => {
   });
 });
 describe("strict assembly plan", () => {
+  test("enforces the canonical 32 KiB UTF-8 boundary for authored child tasks", async () => {
+    const compileTask = async (task: string): Promise<AssemblyPlanV1> => {
+      const db = schema();
+      seed(db);
+      const row = db.query("SELECT prompt_order FROM presets WHERE id = ?").get("preset-1") as { prompt_order: string };
+      const blocks = JSON.parse(row.prompt_order) as Array<Record<string, unknown>>;
+      const producer = blocks[0];
+      if (!producer) throw new Error("Missing producer fixture");
+      blocks[0] = { ...producer, content: `{{agent::writer::as=facts}}${task}{{/agent}}` };
+      db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(blocks), "preset-1");
+      try {
+        const snapshot = buildGenerationAssemblySnapshot({
+          assemblySurface: "WORK",
+          userId: "user-1",
+          chatId: "chat-1",
+          presetId: "preset-1",
+          agentConfig: config(),
+          db,
+        });
+        return await compileAgentAssemblyPlan(snapshot);
+      } finally {
+        db.close();
+      }
+    };
+    const asciiBoundary = "a".repeat(AGENT_CHILD_TASK_MAX_BYTES);
+    const multibyteBoundary = "é".repeat(AGENT_CHILD_TASK_MAX_BYTES / 2);
+    const oneByteOver = `${multibyteBoundary}a`;
+
+    expect(Buffer.byteLength(asciiBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(multibyteBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(oneByteOver, "utf8")).toBe(32_769);
+    for (const task of [asciiBoundary, multibyteBoundary]) {
+      const plan = await compileTask(task);
+      expect(plan.children).toHaveLength(1);
+      expect(plan.children[0]).toMatchObject({ task, taskBytes: AGENT_CHILD_TASK_MAX_BYTES });
+    }
+    try {
+      await compileTask(oneByteOver);
+      throw new Error("Expected child task compilation to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(AssemblyPlanValidationError);
+      expect(error).toMatchObject({
+        code: "limit_exceeded",
+        blockIndex: 0,
+        blockId: "producer",
+        message: "Child task exceeds 32 KiB UTF-8 limit",
+      });
+    }
+  });
+
   test("orders children, emits direct slots, and substitutes child output once as literal bytes", async () => {
     const db = schema();
     seed(db);

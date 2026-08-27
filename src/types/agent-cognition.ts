@@ -248,6 +248,8 @@ export interface LoomPromptInspectionInputV1 {
   readonly surface: "WORK" | "RESPONSE";
   readonly evaluation?: CognitionEvaluationContextV1;
   readonly blocks: readonly LoomPromptInspectionBlockV1[];
+  /** Exact host-recorded evidence from an earlier checkpoint in this turn. */
+  readonly previousInspection?: LoomPromptInspectionV1;
 }
 
 /** Alias used by AgentConfig V2 projections. */

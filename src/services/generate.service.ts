@@ -5619,6 +5619,10 @@ export async function startGeneration(
 export async function dryRunGeneration(
   input: GenerateInput,
 ): Promise<DryRunResult> {
+  const callerRuntimeDecisionToken = input.runtime_decision_token;
+  if (callerRuntimeDecisionToken !== undefined) {
+    await consumeCallerRuntimeDecision(input, callerRuntimeDecisionToken);
+  }
   if (input.mode === "agentic") {
     throw new AgenticGenerationError(
       "agentic_unsupported_surface",

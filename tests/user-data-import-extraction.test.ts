@@ -218,6 +218,107 @@ describe("user-data import bounded extraction", () => {
     expect(getDb().query("SELECT state FROM user_data_imports WHERE job_id = ?").get(job.jobId)).toEqual({ state: "committed" });
     expect(getDb().query("SELECT COUNT(*) AS count FROM user_data_import_receipts WHERE job_id = ?").get(job.jobId)).toEqual({ count: 1 });
   });
+  test("scrubs legacy image-generation API keys before merging imported settings", async () => {
+    const archivePath = join(workDir, "legacy-image-secrets.lvbak");
+    const imageGeneration = {
+      enabled: true,
+      nanogpt: { apiKey: "imported-nanogpt-secret", model: "hidream" },
+      novelai: { apiKey: "imported-novelai-secret", sampler: "k_euler" },
+      compatibility: [
+        { nanogpt: { apiKey: "imported-nested-secret", model: "nested" } },
+        { wrapper: { novelai: { apiKey: "imported-nested-secret", steps: 28 } } },
+      ],
+    };
+    getDb()
+      .prepare("INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)")
+      .run("imageGeneration", JSON.stringify({ enabled: false, promptPresets: [] }), USER_ID);
+    writeFileSync(archivePath, zipSync({
+      "manifest.json": strToU8(JSON.stringify(manifest())),
+      "database/settings.ndjson": strToU8(JSON.stringify({
+        key: "imageGeneration",
+        value: JSON.stringify(imageGeneration),
+        user_id: "source-user",
+        updated_at: 0,
+      }) + "\n"),
+    }));
+
+    const job = await startImport({ userId: USER_ID, archivePath, jobId: crypto.randomUUID() });
+    const finished = await waitForTerminal(job.jobId);
+    expect(finished.status).toBe("complete");
+    const stored = getDb()
+      .query("SELECT value FROM settings WHERE key = ? AND user_id = ?")
+      .get("imageGeneration", USER_ID) as { value: string };
+    expect(JSON.parse(stored.value)).toEqual({
+      enabled: false,
+      promptPresets: [],
+      nanogpt: { model: "hidream" },
+      novelai: { sampler: "k_euler" },
+      compatibility: [
+        { nanogpt: { model: "nested" } },
+        { wrapper: { novelai: { steps: 28 } } },
+      ],
+    });
+  });
+
+  test("fails the whole import for a malformed legacy image-generation value", async () => {
+    const archivePath = join(workDir, "malformed-image-setting.lvbak");
+    const malformedSecret = "malformed-imported-image-secret";
+    const rows = [
+      { key: "must_not_commit", value: "true", user_id: "source-user", updated_at: 0 },
+      {
+        key: "imageGeneration",
+        value: "{\"nanogpt\":{\"apiKey\":\"" + malformedSecret + "\"}",
+        user_id: "source-user",
+        updated_at: 0,
+      },
+    ];
+    writeFileSync(archivePath, zipSync({
+      "manifest.json": strToU8(JSON.stringify(manifest())),
+      "database/settings.ndjson": strToU8(rows.map((row) => JSON.stringify(row)).join("\n") + "\n"),
+    }));
+
+    const job = await startImport({ userId: USER_ID, archivePath, jobId: crypto.randomUUID() });
+    const finished = await waitForTerminal(job.jobId);
+    expect(finished.status).toBe("failed");
+    expect(finished.error).toContain("imageGeneration settings value is malformed JSON");
+    expect(getDb().query(
+      "SELECT value FROM settings WHERE key = ? AND user_id = ?",
+    ).get("must_not_commit", USER_ID)).toBeNull();
+    expect(getDb().query(
+      "SELECT COUNT(*) AS count FROM user_data_import_receipts WHERE job_id = ?",
+    ).get(job.jobId)).toEqual({ count: 0 });
+  });
+
+  test("keeps malformed ticket submission fail closed and retryable", async () => {
+    const jobId = crypto.randomUUID();
+    const archivePath = join(workDir, "malformed-ticket.lvbak");
+    const created = await createTicket("malformed-ticket-archive", ["malformed-ticket-secret"]);
+    await writeEncryptedTicketArchive(archivePath, created, "malformed-ticket-secret", {
+      "database/settings.ndjson": strToU8(JSON.stringify({
+        key: "ticket_gated_setting",
+        value: "true",
+        user_id: "source-user",
+        updated_at: 0,
+      }) + "\n"),
+    });
+
+    const job = await startImport({ userId: USER_ID, archivePath, jobId });
+    await waitForStatus(jobId, "awaiting_ticket");
+    await expect(submitTicket(jobId, null)).rejects.toMatchObject({
+      name: "TicketError",
+      code: "malformed",
+    });
+    expect(getJob(jobId)?.status).toBe("awaiting_ticket");
+    expect(getDb().query(
+      "SELECT value FROM settings WHERE key = ? AND user_id = ?",
+    ).get("ticket_gated_setting", USER_ID)).toBeNull();
+    expect(getDb().query(
+      "SELECT 1 FROM import_consumed_tickets WHERE archive_id = ?",
+    ).get(created.ticket.archiveId)).toBeNull();
+
+    await expect(submitTicket(jobId, created.ticket)).resolves.toEqual({ accepted: true });
+    expect((await waitForTerminal(job.jobId)).status).toBe("complete");
+  });
   test("materializes canonical rows asynchronously across validation batches", async () => {
     const rowCount = 300;
     const rows = Array.from({ length: rowCount }, (_, index) => JSON.stringify({
