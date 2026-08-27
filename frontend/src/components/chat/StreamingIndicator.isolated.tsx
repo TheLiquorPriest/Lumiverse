@@ -164,7 +164,7 @@ describe('StreamingIndicator', () => {
     expect(deriveStreamingStatus(input({ isStreaming: false, terminalStatus: 'stopped' }))).toBe('stopped')
   })
 
-  test('shows exact started-event identity in the first queued state', async () => {
+  test('shows exact Agentic started-event identity in the elapsed-zero queued state', async () => {
     setStore({
       activeGenerationId: null,
       isStreaming: false,
@@ -198,6 +198,7 @@ describe('StreamingIndicator', () => {
     expect(indicator?.getAttribute('data-generation-status')).toBe('queued')
     expect(indicator?.textContent).toContain('Queued · preparing context')
     expect(indicator?.textContent).toContain('Provider Deepseek · model deepseek-v4-flash')
+    expect(indicator?.textContent).toContain('elapsed 00:00')
   })
 
   test('reports an absent provider without inferring one from the model', async () => {

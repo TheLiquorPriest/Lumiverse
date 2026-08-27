@@ -4279,17 +4279,20 @@ function buildDependencies(): AgenticGenerationDependencies {
           );
         }
         executionOwnerToken = execution.ownerToken;
+        const lifecycleIdentity = {
+          model: root?.model ?? "",
+          ...(root?.provider ? { provider: root.provider } : {}),
+        };
         pool.createPoolEntry({
           generationId: value.executionId, userId: value.userId, chatId: value.chatId,
-          generationType: binding.target, characterName: "", model: root?.model ?? "",
-          ...(root?.provider ? { provider: root.provider } : {}),
+          generationType: binding.target, characterName: "", ...lifecycleIdentity,
           ...(binding.messageId ? { targetMessageId: binding.messageId } : {}),
           ...(binding.swipeId !== null ? { targetSwipeId: binding.swipeId } : {}),
         });
         eventBus.emit(
           EventType.GENERATION_STARTED,
           {
-            generationId: value.executionId, chatId: value.chatId, model: root?.model ?? "",
+            generationId: value.executionId, chatId: value.chatId, ...lifecycleIdentity,
             targetMessageId: binding.messageId, targetSwipeId: binding.swipeId, generationType: binding.target,
           },
           value.userId,

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { Hono } from "hono";
 import type { AssemblyMessageSegmentV1, AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
 import { createHash } from "node:crypto";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
@@ -43,6 +44,7 @@ import { startGeneration } from "./generate.service";
 import * as breakdownSvc from "./breakdown.service";
 import { getAgentRunInspection } from "./agent-activity-runs.service";
 import { deleteChat } from "./chats.service";
+import { generateRoutes } from "../routes/generate.routes";
 
 import {
   __testing,
@@ -1331,17 +1333,15 @@ describe("production agentic coordinator installation", () => {
     expect(snapshot.agentCognition.revision).toEqual(expect.any(String));
   });
 
-  test("execution takes one root permit, joins the pool, and releases on cleanup", async () => {
+  test("projects frozen provider through the first Agentic event and elapsed-zero recovery polls", async () => {
     const deps = __testing.buildDependencies();
     markAgenticRuntimeReady();
     const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
-    const started: unknown[] = [];
-    // Await the emitted event itself: in-process listeners are dispatched
-    // asynchronously off the streaming hot path.
-    const firstStarted = Promise.withResolvers<void>();
+    const firstStarted = Promise.withResolvers<Record<string, unknown>>();
     const unsubscribe = eventBus.on(EventType.GENERATION_STARTED, (message) => {
-      started.push(message);
-      firstStarted.resolve();
+      if (message.payload?.chatId === AGENTIC_CHAT_ID) {
+        firstStarted.resolve(message.payload as Record<string, unknown>);
+      }
     });
     const decision = await deps.resolveRuntime!(
       { userId: USER_ID, chatId: AGENTIC_CHAT_ID, connectionId: CONNECTION_ID, presetId: AGENTIC_PRESET_ID, generationType: "normal", userInput: USER_INPUT },
@@ -1349,6 +1349,7 @@ describe("production agentic coordinator installation", () => {
       new AbortController().signal,
     );
     const before = AGENT_RUNTIME_ADMISSION_MANAGER.snapshot().rootsByUser[USER_ID] ?? 0;
+    const providerRequestsBefore = providerRequests.length;
     const execution = await deps.createExecution!({
       executionId: "exec-normal-1",
       userId: USER_ID,
@@ -1358,8 +1359,51 @@ describe("production agentic coordinator installation", () => {
       signal: new AbortController().signal,
     });
     try {
+      const startedPayload = await firstStarted.promise;
+      expect(startedPayload).toMatchObject({
+        generationId: "exec-normal-1",
+        chatId: AGENTIC_CHAT_ID,
+        generationType: "normal",
+        provider: "scripted-coordinator",
+        model: "scripted-model",
+      });
+      expect(providerRequests).toHaveLength(providerRequestsBefore);
       expect(AGENT_RUNTIME_ADMISSION_MANAGER.snapshot().rootsByUser[USER_ID] ?? 0).toBe(before + 1);
-      expect(getPoolEntry("exec-normal-1")).toBeDefined();
+      expect(getPoolEntry("exec-normal-1")).toMatchObject({
+        generationId: "exec-normal-1",
+        chatId: AGENTIC_CHAT_ID,
+        status: "assembling",
+        provider: "scripted-coordinator",
+        model: "scripted-model",
+      });
+
+      const pollingApp = new Hono<{ Variables: { userId: string } }>();
+      pollingApp.use("*", async (c, next) => {
+        c.set("userId", USER_ID);
+        await next();
+      });
+      pollingApp.route("/generate", generateRoutes);
+      const [statusResponse, activeResponse] = await Promise.all([
+        pollingApp.request(`http://localhost/generate/status/${AGENTIC_CHAT_ID}`),
+        pollingApp.request("http://localhost/generate/active"),
+      ]);
+      expect(statusResponse.status).toBe(200);
+      expect(await statusResponse.json()).toMatchObject({
+        active: true,
+        generationId: "exec-normal-1",
+        status: "assembling",
+        provider: "scripted-coordinator",
+        model: "scripted-model",
+      });
+      expect(activeResponse.status).toBe(200);
+      expect(await activeResponse.json()).toContainEqual(expect.objectContaining({
+        generationId: "exec-normal-1",
+        chatId: AGENTIC_CHAT_ID,
+        status: "assembling",
+        provider: "scripted-coordinator",
+        model: "scripted-model",
+      }));
+
       const persistentWorkspace = getDb().query(
         "SELECT workspace_id, revision FROM persistent_workspaces WHERE user_id = ? AND chat_id = ?",
       ).get(USER_ID, AGENTIC_CHAT_ID) as { workspace_id: string; revision: number } | null;
@@ -1383,8 +1427,6 @@ describe("production agentic coordinator installation", () => {
       ).get(execution.id, USER_ID, AGENTIC_CHAT_ID) as { workspace_id: string } | null;
       expect(runtimeWorkspace).toEqual({ workspace_id: `workspace:${execution.id}` });
       expect(linkedAssociation?.workspaceId).not.toBe(runtimeWorkspace?.workspace_id);
-      await firstStarted.promise;
-      expect(started.length).toBe(1);
     } finally {
       unsubscribe();
       deps.cleanup!({ execution } as never);
