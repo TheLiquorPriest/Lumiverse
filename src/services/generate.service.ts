@@ -83,6 +83,16 @@ import {
   validateInlineToolCallIds,
   type InlineCouncilToolResult,
 } from "./inline-tool-continuation";
+import {
+  applyInlineWebSearchContextSlots,
+  formatInlineWebSearchContext,
+  INLINE_WEB_SEARCH_MAX_QUERY_CHARS,
+  INLINE_WEB_SEARCH_MAX_RESULTS,
+  INLINE_WEB_SEARCH_TOOL,
+  INLINE_WEB_SEARCH_TOOL_NAME,
+  prepareInlineWebSearchMessagesForProvider,
+} from "./inline-web-search";
+import { getWebSearchSettings } from "./web-search-settings.service";
 import type { Message } from "../types/message";
 import type { ConnectionProfile } from "../types/connection-profile";
 import type { ResolvedConcreteConnectionV1 } from "./connections.service";
@@ -193,7 +203,7 @@ import {
 } from "./prompt-assembly-worker-client";
 import { isPromptRegexChatOwned } from "../spindle/prompt-regex-ownership";
 import { isRunning as isExtensionRunning } from "../spindle/lifecycle";
-import { clampErrorMessage, describeProviderError, ProviderRequestError } from "../utils/provider-errors";
+import { clampErrorMessage, ConnectionCredentialError, describeProviderError, ProviderRequestError } from "../utils/provider-errors";
 import {
   AgentRuntimeFailure,
   asPublicRuntimeCode,
@@ -430,13 +440,182 @@ export interface GenerateInput {
   target_character_id?: string;
   regen_feedback?: string;
   regen_feedback_position?: "system" | "user";
+  regen_feedback_format?: string;
   retain_council?: boolean;
   /** Dry-run only: reassemble as if this message were absent from history
    *  (used to reconstruct the prompt that produced an existing assistant turn). */
   exclude_message_id?: string;
   /** Optional abort signal — when fired, cancels an in-flight dry run. */
   signal?: AbortSignal;
+  /** Deterministic id for edit-and-send replay; when set, skip minting a new UUID. */
+  generationId?: string;
 }
+
+/**
+ * Resolve the connection used by a chat generation. A chat-scoped binding is
+ * authoritative over the caller's active/global connection. If the bound
+ * profile was deleted, fall back to the requested/default profile so an old
+ * metadata reference cannot make the chat unusable.
+ *
+ * When no `connection_id` was supplied by the caller — i.e. the generation was
+ * triggered server-side (Edit-and-Send outbox dispatch, multiplayer host,
+ * spindle sends that forward an `undefined` id) — the fallback is the ACTING
+ * connection (`resolveActingConnectionId`: validated `activeProfileId` → the
+ * `is_default` profile → any owned profile) rather than `is_default` alone.
+ * `is_default` alone is the 401 defect: it is a different piece of state from
+ * the `activeProfileId` the UI sends, so the dispatched generation could run on
+ * a connection the user never selected. A supplied-but-stale id still throws
+ * rather than silently retargeting.
+ *
+ * `opts.preferActiveConnection` is the `editAndSendAlwaysUseActiveConnection`
+ * opt-in, and it is set only for Edit-and-Send dispatches. See below.
+ *
+ * `opts.authoritativeConnectionId` is the connection an Edit-and-Send request was
+ * COMMITTED against, read off `generation_outbox.connection_id`. It is the FIRST
+ * rung, ahead of the opt-in and ahead of the chat pin, because the whole point of
+ * recording it is that no live state re-read may retarget a request the user
+ * already committed. See the rung itself.
+ */
+function resolveChatGenerationConnection(
+  userId: string,
+  metadata: Record<string, any> | null | undefined,
+  requestedConnectionId?: string,
+  opts?: { preferActiveConnection?: boolean; authoritativeConnectionId?: string },
+): ConnectionProfile {
+  // An empty/whitespace-only id already fell through to the default profile
+  // today; normalizing here keeps that outcome while letting the acting
+  // fallback below see "no id was supplied".
+  const requestedId = requestedConnectionId?.trim() || undefined;
+
+  // Rung 0 — the durably COMMITTED connection. Set only for Edit-and-Send
+  // dispatches, and only for rows that actually recorded one.
+  //
+  // This rung exists because an outbox row's dispatch is not a single event: the
+  // same row is dispatched from the POST handler, again from the periodic retry
+  // tick after a backoff, and again from startup crash recovery, potentially
+  // hours apart. Every rung below reads LIVE state (`activeProfileId`, the
+  // opt-in, the chat's `connection_profile_id` pin), so without this rung
+  // switching the active profile between those ticks silently retargets a
+  // request the user already committed. Ahead of `preferActiveConnection` on
+  // purpose: the recorded value ALREADY baked in the opt-in's answer at commit
+  // time (see `connections.service.resolveEditAndSendConnectionId`, which
+  // mirrors this ladder rung for rung), so consulting the opt-in again could
+  // only re-introduce the drift.
+  //
+  // Returning from here bypasses the `connection_model` metadata override at the
+  // bottom of this function, so that override is re-applied inline — but ONLY
+  // when the committed connection IS the chat's live pin. That condition is
+  // exactly the existing `boundConnection && metadata.connection_model` gate, so
+  // a pinned chat keeps its pinned model bit-for-bit. When the committed id came
+  // from the active-profile opt-in instead (i.e. it is NOT the pinned profile),
+  // the override is dropped, matching the reasoning already documented for the
+  // active-profile rung: a pinned model belongs to the pinned profile and is
+  // very often not a model the other endpoint serves, so carrying it over would
+  // produce a second, subtler failure of exactly the kind this fix removes.
+  // Blanket-dropping the override on this rung was the rejected alternative; it
+  // silently changed the MODEL of every pinned chat, which is a behaviour change
+  // this finding never asked for (and which
+  // `edit-and-send-active-connection-optin.integration.test.ts`'s
+  // "binding live, activeProfileId deleted" case pins).
+  //
+  // MISS POLICY: if the recorded id no longer resolves — the profile was deleted
+  // between commit and dispatch — FALL THROUGH to the unchanged ladder rather
+  // than throwing. A deleted profile is unrecoverable: no amount of retrying
+  // brings it back, so throwing would only strand the user's committed edit with
+  // no output at all, which is strictly worse than running it on their current
+  // selection. This mirrors the precedent already documented on this function
+  // for the chat-scoped binding ("If the bound profile was deleted, fall back ...
+  // so an old metadata reference cannot make the chat unusable"). The rejected
+  // alternative was failing the row terminally; that trades a rare wrong-profile
+  // dispatch for a guaranteed lost request.
+  const authoritativeId = opts?.authoritativeConnectionId?.trim() || undefined;
+  if (authoritativeId) {
+    const committed = connectionsSvc.resolveConnection(userId, authoritativeId);
+    if (committed) {
+      const pinnedId = typeof metadata?.connection_profile_id === "string"
+        ? metadata.connection_profile_id.trim()
+        : "";
+      const committedIsPinned = pinnedId !== "" && pinnedId === committed.id;
+      const pinnedModel = committedIsPinned && typeof metadata?.connection_model === "string"
+        ? metadata.connection_model.trim()
+        : "";
+      return pinnedModel ? { ...committed, model: pinnedModel } : committed;
+    }
+  }
+
+  // The opt-in: the user's STRICT active profile wins over a live chat-scoped
+  // binding, for Edit-and-Send only, and only when no explicit id was supplied
+  // (so every interactive path stays bit-identical). The binding's
+  // `connection_model` override is deliberately NOT carried across: the pinned
+  // model belongs to the pinned profile and is very often not a model the
+  // active profile's endpoint serves, so carrying it over would produce a
+  // second, subtler failure of exactly the kind this fix exists to remove.
+  // When the strict rung resolves nothing, control falls through to the
+  // unchanged ladder below — the prescribed safe degradation, structural rather
+  // than defensive: this branch only ever replaces the FIRST choice.
+  if (opts?.preferActiveConnection && !requestedId) {
+    const activeId = connectionsSvc.resolveActiveConnectionId(userId);
+    if (activeId) {
+      const activeConnection = connectionsSvc.resolveConnection(userId, activeId);
+      if (activeConnection) return activeConnection;
+    }
+  }
+
+  const boundId = typeof metadata?.connection_profile_id === "string"
+    ? metadata.connection_profile_id.trim()
+    : "";
+  const boundConnection = boundId
+    ? connectionsSvc.resolveConnection(userId, boundId)
+    : null;
+  // The acting chain (active → is_default → any owned) is evaluated in stages
+  // rather than as one `resolveActingConnectionId` call so that the rungs beyond
+  // `is_default` are only reached when the earlier ones actually came up empty.
+  // `resolveConnection` is the seam every caller and test harness already stubs;
+  // `getDefaultConnection` / `listConnections` are not, and eagerly calling them
+  // would make every generation start touch the database. The staged form is
+  // equivalent to `resolveConnection(userId, resolveActingConnectionId(userId))`
+  // rung for rung — `resolveActingConnectionId` remains the single owner of the
+  // chain and is what the last stage delegates to.
+  const connection = boundConnection
+    ?? connectionsSvc.resolveConnection(
+      userId,
+      requestedId ?? connectionsSvc.resolveActiveConnectionId(userId),
+    )
+    ?? (requestedId
+      ? null
+      : connectionsSvc.resolveConnection(userId, connectionsSvc.resolveActingConnectionId(userId)));
+
+  if (!connection) {
+    throw new Error("No connection profile found. Configure a default connection or select one for this chat.");
+  }
+
+  const modelOverride = boundConnection && typeof metadata?.connection_model === "string"
+    ? metadata.connection_model.trim()
+    : "";
+  return modelOverride ? { ...connection, model: modelOverride } : connection;
+}
+
+/**
+ * The `editAndSendAlwaysUseActiveConnection` Productivity setting, used on the
+ * LEGACY dispatch path — i.e. for outbox rows that recorded no
+ * `connection_id`, either because they were committed before
+ * `migrations/111_generation_outbox_connection_id.sql` or because resolution
+ * came up empty at commit time. Rows that DID record one never reach this read:
+ * the recorded value already baked the opt-in's answer in at commit time.
+ *
+ * The predicate itself now lives in `settings.service`, which owns it for BOTH
+ * ends of the flow — `chats.service.editAndSend` (via
+ * `connections.service.resolveEditAndSendConnectionId`) at commit time and this
+ * module at dispatch time. The rejected alternative was keeping a second copy
+ * here: two independent strict-read implementations for one setting is exactly
+ * how the commit-time and dispatch-time answers would drift, which is the class
+ * of bug this whole change exists to remove. This local alias is retained only
+ * so the `__test__` seam below keeps its existing name and existing callers
+ * (`connections.service.acting-connection.test.ts`,
+ * `edit-and-send-active-connection-optin.property.test.ts`).
+ */
+const readEditAndSendAlwaysUseActiveConnection = (userId: string): boolean =>
+  settingsSvc.readEditAndSendAlwaysUseActiveConnection(userId);
 
 /** Lifecycle context passed from startGeneration → runGeneration */
 interface GenerationLifecycle {
@@ -482,6 +661,9 @@ interface GenerationLifecycle {
   chatHistoryMessages?: LlmMessage[];
   /** Full assembled outbound message list for prompt breakdown inspection. */
   messages?: LlmMessage[];
+  /** Resolved connection display name, used to enrich a provider 401/403 that
+   *  came back from a connection which sent no stored credential. */
+  connectionName?: string;
   /** Model + provider + preset info for breakdown storage */
   model?: string;
   providerName?: string;
@@ -538,16 +720,23 @@ function collectTrailingUserMessageIds(userId: string, chatId: string): string[]
 function injectConnectionMetadataFlags(
   connection: { provider: string; metadata?: Record<string, any> },
   params: GenerationParameters,
+  chatId?: string,
 ): void {
   if (connection.metadata?.use_responses_api) {
     params.use_responses_api = true;
   }
 
-  if (
-    connection.provider === "openrouter" &&
-    connection.metadata?.openrouter
-  ) {
-    params._openrouter = connection.metadata.openrouter;
+  if (connection.provider === "openrouter") {
+    if (connection.metadata?.openrouter) {
+      params._openrouter = connection.metadata.openrouter;
+    }
+    // OpenRouter documents `session_id` as the explicit sticky-routing key.
+    // Keep it scoped to a Lumiverse chat and never replace a caller-provided
+    // session or cache key. The provider then reuses the same upstream cache
+    // across normal turns, swipes, and retries without forcing no-fallback.
+    if (chatId && params.session_id === undefined && params.prompt_cache_key === undefined) {
+      params.session_id = `lumiverse:${chatId}`;
+    }
   }
 }
 
@@ -879,7 +1068,10 @@ export const __test__ = {
   completeInlineToolResults,
   validateInlineToolCallIds,
   mergeProviderTransientCarrier,
+  readEditAndSendAlwaysUseActiveConnection,
+  resolveChatGenerationConnection,
   resolveDryRunMessageReasoning,
+  resolveProviderAndKey,
   validateAgentSealBoundary,
   assertAgentFinalContextFit,
   errorMessage,
@@ -1229,6 +1421,32 @@ function errorMessage(err: unknown): string {
   }
 }
 
+/**
+ * The residual keyless case the credential preflight deliberately leaves
+ * permissive: a connection with `has_api_key = 0` on a provider that does not
+ * declare a key as required sends no `Authorization` header at all (see
+ * `OpenAICompatibleProvider.headers`). Legitimate for a local endpoint —
+ * misconfiguration for a gateway that wants a key, and indistinguishable up
+ * front. When such a call comes back 401/403, name the connection and say that
+ * no stored key was sent, so the user gets a remedy instead of the raw provider
+ * status line alone. `describeProviderError` has no connection context and is
+ * left untouched.
+ */
+function enrichUnauthenticatedConnectionError(
+  message: string,
+  err: unknown,
+  opts: { apiKey: string; connectionName?: string },
+): string {
+  if (opts.apiKey) return message;
+  if (!(err instanceof ProviderRequestError)) return message;
+  if (err.status !== 401 && err.status !== 403) return message;
+  const connectionName = opts.connectionName?.trim();
+  if (!connectionName) return message;
+  return clampErrorMessage(
+    `${message} No stored API key was sent for connection "${connectionName}" — add one via the connection settings, or switch this chat to a connection that has one.`,
+  );
+}
+
 function parseInlineToolCallName(
   name: string,
 ): { memberIdPrefix: string; qualifiedName: string } | null {
@@ -1381,8 +1599,10 @@ async function executeInlineCouncilToolCalls(
   contextMessages: LlmMessage[],
   signal: AbortSignal,
   safeNameToQualifiedName?: ReadonlyMap<string, string>,
+  allowDirectWebSearch = false,
 ): Promise<InlineCouncilToolResult[]> {
   const results: InlineCouncilToolResult[] = [];
+  let directWebSearchExecuted = false;
 
   for (const toolCall of toolCalls) {
     const mappedQualifiedName = safeNameToQualifiedName?.get(toolCall.name);
@@ -1425,6 +1645,40 @@ async function executeInlineCouncilToolCalls(
     // misclassified by the syntactic prefix parser.
     if (isCouncilCall && !member) {
       results.push(unavailableInlineToolResult(toolCall));
+      continue;
+    }
+
+    const isDirectWebSearch =
+      !isCouncilCall &&
+      toolCall.name === INLINE_WEB_SEARCH_TOOL_NAME &&
+      resolvedQualifiedName === INLINE_WEB_SEARCH_TOOL_NAME;
+    if (isDirectWebSearch && (!allowDirectWebSearch || directWebSearchExecuted)) {
+      results.push({
+        callId: toolCall.call_id,
+        qualifiedName: resolvedQualifiedName,
+        toolName: tool.name,
+        toolDisplayName: tool.displayName,
+        result: "Web search can be called only once per generation.",
+        isError: true,
+        isInlineWebSearch: true,
+      });
+      continue;
+    }
+
+    const directQuery = isDirectWebSearch && typeof toolCall.args?.query === "string"
+      ? toolCall.args.query.trim().slice(0, INLINE_WEB_SEARCH_MAX_QUERY_CHARS)
+      : undefined;
+    if (isDirectWebSearch && (!directQuery || directQuery.length < 2)) {
+      results.push({
+        callId: toolCall.call_id,
+        qualifiedName: resolvedQualifiedName,
+        toolName: tool.name,
+        toolDisplayName: tool.displayName,
+        result: "Web search requires a query of at least two characters.",
+        isError: true,
+        isInlineWebSearch: true,
+      });
+      directWebSearchExecuted = true;
       continue;
     }
 
@@ -1495,30 +1749,60 @@ async function executeInlineCouncilToolCalls(
         signal,
       );
     } else if (execution === "host") {
-      if (!member) {
+      if (!member && !isDirectWebSearch) {
         results.push(unavailableInlineToolResult(toolCall));
         continue;
       }
       let lumiaItem: ReturnType<typeof packsSvc.getLumiaItem> = null;
-      try {
-        lumiaItem = packsSvc.getLumiaItem(userId, member.itemId);
-      } catch {
-        // Pack/item may have been removed mid-generation.
+      if (member) {
+        try {
+          lumiaItem = packsSvc.getLumiaItem(userId, member.itemId);
+        } catch {
+          // Pack/item may have been removed mid-generation.
+        }
       }
 
-      result = await raceWithSignal(
-        executeHostCouncilTool({
-          userId,
-          tool,
-          args: toolCall.args ?? {},
-          member,
-          memberContext: buildCouncilMemberContext(member, lumiaItem),
-          contextMessages,
-          timeoutMs,
+      try {
+        const requestedCount = typeof toolCall.args?.result_count === "number"
+          ? toolCall.args.result_count
+          : Number(toolCall.args?.result_count);
+        const args = isDirectWebSearch
+          ? {
+              ...(toolCall.args ?? {}),
+              query: directQuery,
+              result_count: Number.isFinite(requestedCount)
+                ? Math.max(1, Math.min(INLINE_WEB_SEARCH_MAX_RESULTS, Math.round(requestedCount)))
+                : INLINE_WEB_SEARCH_MAX_RESULTS,
+            }
+          : toolCall.args ?? {};
+        result = await raceWithSignal(
+          executeHostCouncilTool({
+            userId,
+            tool,
+            args,
+            member,
+            memberContext: member ? buildCouncilMemberContext(member, lumiaItem) : undefined,
+            contextMessages,
+            timeoutMs,
+            signal,
+          }),
           signal,
-        }),
-        signal,
-      );
+        );
+      } catch (err) {
+        if (signal.aborted) throw signal.reason ?? err;
+        if (!isDirectWebSearch) throw err;
+        results.push({
+          callId: toolCall.call_id,
+          qualifiedName: resolvedQualifiedName,
+          toolName: tool.name,
+          toolDisplayName: tool.displayName,
+          result: `Web search failed: ${errorMessage(err)}`,
+          isError: true,
+          isInlineWebSearch: true,
+        });
+        directWebSearchExecuted = true;
+        continue;
+      }
     }
 
     results.push({
@@ -1527,8 +1811,17 @@ async function executeInlineCouncilToolCalls(
       toolName: tool.name,
       toolDisplayName: tool.displayName,
       memberName: member?.itemName,
-      result,
+      // Keep the immediate result compact. The full, untrusted source text is
+      // attached exactly once in the continuation using the provider-safe form.
+      result: isDirectWebSearch
+        ? "Web search completed. Retrieved reference context is available in the following system message."
+        : result,
+      ...(isDirectWebSearch ? {
+        inlineWebSearchContext: result,
+        isInlineWebSearch: true,
+      } : {}),
     });
+    if (isDirectWebSearch) directWebSearchExecuted = true;
   }
 
   return results;
@@ -2266,6 +2559,8 @@ type ReasoningSettingsSnapshot = {
   apiReasoning?: boolean;
   reasoningEffort?: string;
   thinkingDisplay?: string;
+  clearThinking?: boolean;
+  replayThoughtSignatures?: boolean;
   customBody?: CustomBody;
 } | null;
 
@@ -2442,7 +2737,14 @@ function applyEffectiveReasoningSettings(
         effort,
         modelName,
         reasoningSettings.thinkingDisplay,
+        reasoningSettings.clearThinking,
       );
+    }
+    if (
+      reasoningSettings.replayThoughtSignatures === true &&
+      (providerName === "google" || providerName === "google_vertex")
+    ) {
+      params._replay_thought_signatures = true;
     }
     return;
   }
@@ -2467,14 +2769,37 @@ async function resolveProviderAndKey(
     throw new Error(`Unknown provider: ${connection.provider}`);
   }
 
-  const apiKey = await secretsSvc.getSecret(
-    userId,
-    connectionsSvc.connectionSecretKey(connection.id),
-  );
+  const secretKeyName = connectionsSvc.connectionSecretKey(connection.id);
+  const apiKey = await secretsSvc.getSecret(userId, secretKeyName);
   if (!apiKey && provider.capabilities.apiKeyRequired) {
     throw new Error(
       `No API key found for connection "${connection.name}". Add one via the connection settings.`,
     );
+  }
+  // Credential preflight. `apiKeyRequired` cannot carry this decision: it is a
+  // per-provider constant, and `Custom (OpenAI-compatible)` legitimately serves
+  // both a keyless llama.cpp on loopback and a keyed remote gateway. The signal
+  // that IS per-connection and already durable is `has_api_key`, which the user
+  // sets by storing a key and clears by removing one. Classification on the pair
+  // (has_api_key, resolved secret):
+  //   any   + non-empty          → authenticated, proceed (unchanged)
+  //   false + empty, required    → existing descriptive error above, unchanged
+  //   true  + empty/unreadable   → MISCONFIGURED: fail before any outbound call
+  //   false + empty, not required→ intentionally keyless, proceed (unchanged)
+  // The last row stays permissive on purpose: hard-failing it would break every
+  // working keyless local endpoint. The `has_api_key = true` + empty row is
+  // unambiguous — the profile asserts a credential exists and it cannot be
+  // produced (deleted secret row, failed decrypt, profile duplicated without its
+  // secret) — and it is exactly the case that would otherwise reach a provider
+  // unauthenticated. Key NAME only; no credential value is read into the
+  // message, logged, or persisted.
+  if (!apiKey && connection.has_api_key) {
+    throw new ConnectionCredentialError({
+      connectionId: connection.id,
+      connectionName: connection.name,
+      provider: provider.displayName,
+      secretKeyName,
+    });
   }
 
   return {
@@ -2785,6 +3110,7 @@ async function runPromptPipeline(opts: {
   generationId: string;
   chatId: string;
   connectionId?: string;
+  model?: string;
   presetId?: string;
   forcePresetId?: boolean;
   effectivePresetSnapshot?: EffectiveAgentPresetResolution;
@@ -2810,6 +3136,7 @@ async function runPromptPipeline(opts: {
   precomputedVectorEntries?: PrecomputedWorldInfoVectorEntries;
   regenFeedback?: string;
   regenFeedbackPosition?: "system" | "user";
+  regenFeedbackFormat?: string;
   signal?: AbortSignal;
   activityMessageId?: string;
   isDryRun?: boolean;
@@ -2963,6 +3290,7 @@ async function runPromptPipeline(opts: {
       },
       regenFeedback: opts.regenFeedback,
       regenFeedbackPosition: opts.regenFeedbackPosition,
+      regenFeedbackFormat: opts.regenFeedbackFormat,
       skipPromptRegex: isPromptRegexChatOwned(opts.chatId, isExtensionRunning),
       signal: opts.signal,
     };
@@ -3285,7 +3613,7 @@ async function runPromptPipeline(opts: {
     opts.userId,
     effectiveConnection,
     effectiveConnection.provider,
-    effectiveConnection.model || undefined,
+    opts.model || effectiveConnection.model || undefined,
     parameters,
     undefined,
     !!opts.inputMessages,
@@ -3419,12 +3747,46 @@ async function resolveRawProviderAndKey(
   }
   return { provider, apiKey: "", apiUrl: input.api_url || "", connection: null };
 }
+function resolveStartGenerationId(input: GenerateInput): string {
+  const requested = typeof input.generationId === "string" ? input.generationId.trim() : "";
+  return requested || crypto.randomUUID();
+}
+
+function reusableStagedSwipeIndex(message: Message): number | undefined {
+  if (!Array.isArray(message.swipes) || message.swipes.length === 0) return undefined;
+  const lastIdx = message.swipes.length - 1;
+  return message.swipes[lastIdx] === "" ? lastIdx : undefined;
+}
+
+/**
+ * Trusted, out-of-band start options. A second positional argument keeps these
+ * values unreachable from the request-body spread used by interactive routes.
+ */
+export interface StartGenerationOptions {
+  origin?: "edit_and_send";
+  /** Connection profile committed with the durable Edit-and-Send outbox row. */
+  connectionId?: string;
+}
+
 async function startResponseGeneration(
   input: GenerateInput,
+  options?: StartGenerationOptions,
 ): Promise<{ generationId: string; status: string }> {
-  const generationId = crypto.randomUUID();
-
+  const requestedGenerationId =
+    typeof input.generationId === "string" ? input.generationId.trim() : "";
+  const generationId = resolveStartGenerationId(input);
   let genType = input.generation_type || "normal";
+
+  if (requestedGenerationId) {
+    const existing = activeGenerations.get(generationId);
+    if (existing && existing.userId === input.userId && existing.chatId === input.chat_id) {
+      return { generationId, status: "streaming" };
+    }
+    const poolEntry = pool.getPoolEntry(generationId);
+    if (poolEntry && poolEntry.userId === input.userId && poolEntry.chatId === input.chat_id) {
+      return { generationId, status: "streaming" };
+    }
+  }
 
   // Safety fallback: regenerate/continue should only target an assistant
   // message when the latest chat message is assistant-authored.
@@ -3532,9 +3894,21 @@ async function startResponseGeneration(
         ? chatsSvc.getMessage(input.userId, input.message_id)
         : chatsSvc.getLastAssistantMessage(input.userId, input.chat_id);
       if (target && !target.is_user) {
-        stagedSwipeOriginal = target;
-        stagedSwipe = chatsSvc.addSwipe(input.userId, target.id, "");
-        stagedSwipeId = stagedSwipe?.swipe_id;
+        const reuseIdx = requestedGenerationId ? reusableStagedSwipeIndex(target) : undefined;
+        if (reuseIdx != null) {
+          const priorIdx = reuseIdx > 0 ? reuseIdx - 1 : reuseIdx;
+          stagedSwipeOriginal = {
+            ...target,
+            swipe_id: priorIdx,
+            content: target.swipes[priorIdx] ?? target.content,
+          };
+          stagedSwipe = { ...target, swipe_id: reuseIdx };
+          stagedSwipeId = reuseIdx;
+        } else {
+          stagedSwipeOriginal = target;
+          stagedSwipe = chatsSvc.addSwipe(input.userId, target.id, "");
+          stagedSwipeId = stagedSwipe?.swipe_id;
+        }
       }
     }
 
@@ -3545,11 +3919,33 @@ async function startResponseGeneration(
     await abortChatBackground(input.userId, input.chat_id);
     checkAborted();
 
-    const connection = resolveConnection(input.userId, input.connection_id);
-    input.connection_id = connection.id;
     // Loaded before preset resolution: no-preset temp chats bypass the preset
     // requirement entirely (assertUsablePreset would otherwise reject them).
     const chat = chatsSvc.getChat(input.userId, input.chat_id);
+    const connection = resolveChatGenerationConnection(
+      input.userId,
+      chat?.metadata,
+      input.connection_id,
+      {
+        // The connection this request was COMMITTED against, forwarded from
+        // `generation_outbox.connection_id` by the dispatcher. Gated on the
+        // origin for the same reason as below — and because an interactive
+        // caller must not be able to express it at all. `undefined` for
+        // pre-migration rows and for commits where nothing resolved, which then
+        // take the unchanged ladder.
+        authoritativeConnectionId: options?.origin === "edit_and_send"
+          ? options.connectionId
+          : undefined,
+        // Short-circuited on the origin: interactive paths never reach the
+        // settings read, so they issue ZERO extra queries (and
+        // `generate.service.edit-and-send.test.ts` runs startGeneration with no
+        // database at all). Kept for the legacy path only: a row that recorded a
+        // connection returns from rung 0 before this value is ever consulted.
+        preferActiveConnection: options?.origin === "edit_and_send"
+          && readEditAndSendAlwaysUseActiveConnection(input.userId),
+      },
+    );
+    input.connection_id = connection.id;
     const isNoPresetChat = isNoPresetChatMetadata(chat?.metadata);
     if (isNoPresetChat) {
       input.preset_id = undefined;
@@ -3689,6 +4085,7 @@ async function startResponseGeneration(
 
     const lifecycle: GenerationLifecycle = {
       characterName,
+      connectionName: connection.name,
       generationType: genType,
       personaId: resolvedPersona?.id,
       personaName: resolvedPersona?.name || "User",
@@ -3769,7 +4166,9 @@ async function startResponseGeneration(
     // has a real message ID to attach to the streaming bubble via data-message-id.
     // This eliminates the duplicate ephemeral bubble and renders tokens in-place
     // on the message card, matching the regenerate/swipe UX.
-    if (genType === "normal") {
+    // Edit-and-send supplies a durable generationId and already owns the branch
+    // target — do not pre-create a second placeholder on that path.
+    if (genType === "normal" && !requestedGenerationId) {
       const extra: Record<string, any> = {};
       if (targetCharId) extra.character_id = targetCharId;
       const stagedMsg = chatsSvc.createMessage(
@@ -3895,6 +4294,7 @@ async function startResponseGeneration(
           | undefined;
         let inlineToolSafeNames: Map<string, string> | undefined;
         let inlineMembersByPrefix: Map<string, CouncilMember> | undefined;
+        let inlineWebSearchEnabled = false;
         let precomputedVectorEntries: PrecomputedWorldInfoVectorEntries | undefined;
 
         // Council is active when enabled with members. Tools run if any member has tools assigned.
@@ -4389,6 +4789,40 @@ async function startResponseGeneration(
           }
         }
 
+        // ── Built-in Inline Web Search (independent of Council) ──────────
+        // This is intentionally separate from the preset's Google-native
+        // grounding option. It uses the user's configured web-search
+        // provider and is only offered when both web search and function
+        // calling are explicitly available.
+        if (genType !== "impersonate") {
+          const presetId = input.preset_id || connection.preset_id;
+          const preset = presetId
+            ? presetsSvc.getPreset(input.userId, presetId)
+            : null;
+          const completionSettings = preset?.prompts?.completionSettings;
+          const webSearchSettings = await getWebSearchSettings(input.userId);
+          const configured = webSearchSettings.enabled && !!webSearchSettings.apiUrl &&
+            (webSearchSettings.provider === "searxng" || webSearchSettings.hasApiKey);
+          if (configured && webSearchSettings.inlineToolEnabled && completionSettings?.enableFunctionCalling !== false) {
+            if (!inlineTools) inlineTools = [];
+            if (!inlineToolDefsByName) {
+              inlineToolDefsByName = new Map<string, RuntimeCouncilToolDefinition>();
+            }
+            inlineToolDefsByName.set(INLINE_WEB_SEARCH_TOOL_NAME, {
+              name: INLINE_WEB_SEARCH_TOOL_NAME,
+              displayName: "Web Search",
+              description: INLINE_WEB_SEARCH_TOOL.description,
+              category: "context",
+              execution: "host",
+              argsSchema: INLINE_WEB_SEARCH_TOOL.parameters,
+              strict: true,
+              inputExamples: INLINE_WEB_SEARCH_TOOL.inputExamples,
+            });
+            inlineTools.push(INLINE_WEB_SEARCH_TOOL);
+            inlineWebSearchEnabled = true;
+          }
+        }
+
         // Wire staged message into lifecycle so GENERATION_STARTED includes it as
         // targetMessageId and runGeneration knows to update instead of create.
         if (stagedMessageId) {
@@ -4526,6 +4960,7 @@ async function startResponseGeneration(
             assemblySurface: "RESPONSE",
             chatId: input.chat_id,
             connectionId: input.connection_id,
+            model: connection.model,
             presetId: input.preset_id,
             forcePresetId: input.force_preset_id,
             effectivePresetSnapshot,
@@ -4555,6 +4990,7 @@ async function startResponseGeneration(
             precomputedVectorEntries,
             regenFeedback: input.regen_feedback,
             regenFeedbackPosition: input.regen_feedback_position,
+            regenFeedbackFormat: input.regen_feedback_format,
             signal: abortController.signal,
             activityMessageId: lifecycle.targetMessageId,
             onAgentRuntimeRequired: () => {
@@ -4668,7 +5104,7 @@ async function startResponseGeneration(
         // Strip internal-only keys before they reach the provider
         delete mergedParams.max_context_length;
 
-        injectConnectionMetadataFlags(connection, mergedParams);
+        injectConnectionMetadataFlags(connection, mergedParams, input.chat_id);
 
         const cached = applyPromptCaching(
           {
@@ -4734,6 +5170,7 @@ async function startResponseGeneration(
           inlineToolDefsByName,
           inlineMembersByPrefix,
           inlineToolSafeNames,
+          inlineWebSearchEnabled,
           councilSettings.toolsSettings.timeoutMs,
           pipeline.assistantPrefill,
           pipeline.assistantReasoningPrefill,
@@ -4991,9 +5428,23 @@ async function startReservedGeneration(
  */
 export async function startGeneration(
   input: GenerateInput,
+  options?: StartGenerationOptions,
 ): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
   if (input.mode !== undefined && input.mode !== "response" && input.mode !== "agentic") {
     throw new Error("Unsupported generation mode.");
+  }
+
+  const requestedGenerationId =
+    typeof input.generationId === "string" ? input.generationId.trim() : "";
+  if (requestedGenerationId) {
+    const existing = activeGenerations.get(requestedGenerationId);
+    if (existing && existing.userId === input.userId && existing.chatId === input.chat_id) {
+      return { generationId: requestedGenerationId, status: "streaming" };
+    }
+    const poolEntry = pool.getPoolEntry(requestedGenerationId);
+    if (poolEntry && poolEntry.userId === input.userId && poolEntry.chatId === input.chat_id) {
+      return { generationId: requestedGenerationId, status: "streaming" };
+    }
   }
 
   const decision = await resolveEffectiveRuntime(input.userId, toEffectiveRuntimeRequest(input));
@@ -5027,7 +5478,12 @@ export async function startGeneration(
       startAgenticGeneration(toAgenticGenerationInput(agenticInput), agenticGenerationDependencies),
     );
   }
-  return startReservedGeneration(input, "response", () => startResponseGeneration(input));
+  // Response resolution enriches its working input; keep those derived fields
+  // isolated from the caller-owned request object.
+  const responseInput: GenerateInput = { ...input };
+  return startReservedGeneration(input, "response", () =>
+    startResponseGeneration(responseInput, options),
+  );
 }
 
 /**
@@ -5088,7 +5544,11 @@ export async function dryRunGeneration(
     }
   }
 
-  const connection = resolveConnection(input.userId, input.connection_id);
+  const connection = resolveChatGenerationConnection(
+    input.userId,
+    dryRunChat?.metadata,
+    input.connection_id,
+  );
   input.connection_id = connection.id;
   if (!isNoPresetChat) {
     presetsSvc.assertUsablePreset(
@@ -5124,6 +5584,7 @@ export async function dryRunGeneration(
     assemblySurface: "RESPONSE",
     chatId: input.chat_id,
     connectionId: input.connection_id,
+    model: connection.model,
     presetId: input.preset_id,
     forcePresetId: input.force_preset_id,
     personaId: input.persona_id,
@@ -5227,6 +5688,7 @@ async function runGeneration(
   inlineToolDefsByName?: Map<string, RuntimeCouncilToolDefinition>,
   inlineMembersByPrefix?: Map<string, CouncilMember>,
   inlineToolSafeNames?: ReadonlyMap<string, string>,
+  inlineWebSearchEnabled = false,
   inlineToolTimeoutMs?: number,
   assistantPrefill?: string,
   assistantReasoningPrefill?: string,
@@ -5436,6 +5898,8 @@ async function runGeneration(
   let nativeReasoningContent = "";
   let nativeThinkingBlocks: LlmThinkingBlock[] | undefined;
   let nativeReasoningDetails: Record<string, unknown>[] | undefined;
+  let nativeThoughtSignature: string | undefined;
+
   const persistedNativeReasoningCarrier = (): Record<string, unknown> | undefined => {
     // Agentic work carriers are frame-private by contract. Only Response
     // history may retain the provider-native replay payload on its target
@@ -5451,6 +5915,12 @@ async function runGeneration(
       return {
         type: "reasoning_details",
         details: nativeReasoningDetails.map((detail) => ({ ...detail })),
+      };
+    }
+    if (nativeThoughtSignature) {
+      return {
+        type: "gemini_thought_signature",
+        signature: nativeThoughtSignature,
       };
     }
     if (nativeReasoningContent.length > 0) {
@@ -5739,6 +6209,7 @@ async function runGeneration(
     let providerTransientCarrier: ProviderTransientCarrier | undefined;
     let activeProviderRoundStartedAt: number | undefined;
     let activeProviderRoundMode: "ordinary" | "finalization" = "ordinary";
+    let inlineWebSearchUsed = false;
     for (; inlineRound < maxInlineRounds; inlineRound++) {
       // fullContent/fullReasoning accumulate across rounds for the final
       // persisted message; capture the start offsets so we can slice out just
@@ -5760,6 +6231,7 @@ async function runGeneration(
       let pendingThinkingBlocks: LlmThinkingBlock[] | undefined;
       // OpenRouter reasoning_details captured this round, replayed likewise.
       let pendingReasoningDetails: Record<string, unknown>[] | undefined;
+      let pendingThoughtSignature: string | undefined;
       const observedContentParts: string[] = [];
       const observedReasoningParts: string[] = [];
       let observedFinishReason = "";
@@ -5855,7 +6327,7 @@ async function runGeneration(
         requestTools: ToolDefinition[] | undefined = tools,
       ): AsyncGenerator<StreamChunk, void, unknown> => useStreaming
         ? provider.generateStream(apiKey, apiUrl, {
-            messages: generationMessages,
+            messages: prepareInlineWebSearchMessagesForProvider(generationMessages),
             model,
             parameters,
             stream: true,
@@ -5867,7 +6339,7 @@ async function runGeneration(
           })
         : (async function* () {
             const result = await provider.generate(apiKey, apiUrl, {
-              messages: generationMessages,
+              messages: prepareInlineWebSearchMessagesForProvider(generationMessages),
               model,
               parameters,
               stream: false,
@@ -5885,6 +6357,7 @@ async function runGeneration(
               providerTransientCarrier: result.providerTransientCarrier,
               thinking_blocks: result.thinking_blocks,
               reasoning_details: result.reasoning_details,
+              thought_signature: result.thought_signature,
               usage: result.usage,
             };
           })();
@@ -6150,6 +6623,11 @@ async function runGeneration(
           ];
         }
 
+        if (chunk.thought_signature) {
+          pendingThoughtSignature = chunk.thought_signature;
+          nativeThoughtSignature = chunk.thought_signature;
+        }
+
         // Feature-inactive generation keeps staging's unchecked provider
         // usage shape; round settlement still accumulates every request.
         if (!agentRuntimeOwner && chunk.usage) {
@@ -6340,6 +6818,7 @@ async function runGeneration(
                         inlineContextMessages,
                         effectiveSignal,
                         inlineToolSafeNames,
+                        inlineWebSearchEnabled && !inlineWebSearchUsed,
                       );
                       return ordinaryResult ?? unavailableInlineToolResult(call);
                     },
@@ -6375,6 +6854,7 @@ async function runGeneration(
           inlineContextMessages,
           effectiveSignal,
           inlineToolSafeNames,
+          inlineWebSearchEnabled && !inlineWebSearchUsed,
         );
         for (let index = 0; index < ordinaryResults.length; index += 1) {
           resultsByIndex[index] = ordinaryResults[index];
@@ -6390,11 +6870,52 @@ async function runGeneration(
         break;
       }
 
+      const inlineWebSearchContexts = inlineCouncilResults.flatMap((result) =>
+        result.inlineWebSearchContext
+          ? [formatInlineWebSearchContext(result.inlineWebSearchContext)]
+          : [],
+      );
+      if (inlineCouncilResults.some((result) => result.isInlineWebSearch)) {
+        inlineWebSearchUsed = true;
+      }
+
+      // Prefer explicit {{webSearchContext}} slots captured from preset blocks.
+      // If none exist, retain the safe end-of-context fallback below.
+      const manualPlacement = inlineWebSearchContexts.length > 0
+        ? applyInlineWebSearchContextSlots(
+            generationMessages,
+            inlineWebSearchContexts.join("\n\n"),
+          )
+        : { messages: generationMessages, placed: false };
+      const manuallyPlacedResults = manualPlacement.placed
+        ? inlineCouncilResults.map((result) =>
+            result.inlineWebSearchContext
+              ? {
+                  ...result,
+                  result: "Web search completed. Retrieved reference context has been placed in the preset's webSearchContext slot.",
+                }
+              : result,
+          )
+        : inlineCouncilResults;
+      const continuationResults =
+        (continuationPolicy.structured || pendingProviderTransientCarrier !== undefined) &&
+        !manualPlacement.placed
+          ? inlineCouncilResults.map((result) =>
+              result.inlineWebSearchContext
+                ? {
+                    ...result,
+                    result: formatInlineWebSearchContext(result.inlineWebSearchContext),
+                  }
+                : result,
+            )
+          : manuallyPlacedResults;
+
+      generationMessages = manualPlacement.messages;
       if (pendingProviderTransientCarrier !== undefined) {
         providerTransientCarrier = mergeProviderTransientCarrier(
           providerTransientCarrier,
           pendingProviderTransientCarrier,
-          inlineCouncilResults.map((result) => ({
+          continuationResults.map((result) => ({
             type: "function_call_output" as const,
             call_id: result.callId,
             output: result.result,
@@ -6422,17 +6943,31 @@ async function runGeneration(
           roundContent,
           roundReasoning,
           toolCalls: pendingToolCalls ?? [],
-          results: inlineCouncilResults,
+          results: continuationResults,
           thinkingBlocks: pendingThinkingBlocks,
           reasoningDetails: pendingReasoningDetails,
+          thoughtSignature: pendingThoughtSignature,
         });
-        generationMessages = [...generationMessages, ...continuation];
+        const fallbackWebSearchMessages =
+          !continuationPolicy.structured && !manualPlacement.placed
+            ? inlineWebSearchContexts.map(
+                (content) => ({ role: "system", content }) satisfies LlmMessage,
+              )
+            : [];
+        const continuationEnvelope = [
+          ...continuation,
+          ...fallbackWebSearchMessages,
+        ];
+        generationMessages = [
+          ...generationMessages,
+          ...continuationEnvelope,
+        ];
         if (agentRuntimeOwner) {
           const reservation = nextBatchReservation;
           if (
             !reservation ||
             !reservation.settleContinuation(
-              utf8ByteLength(JSON.stringify(continuation)),
+              utf8ByteLength(JSON.stringify(continuationEnvelope)),
             )
           ) {
             throw new AgentRuntimeFailure(
@@ -7020,7 +7555,14 @@ async function runGeneration(
         emittedStopped = true;
       }
     } else {
-      const msg = errorMessage(terminalError);
+      const msg = enrichUnauthenticatedConnectionError(
+        errorMessage(terminalError),
+        terminalError,
+        {
+          apiKey,
+          connectionName: lifecycle.connectionName,
+        },
+      );
       abortChatBackground(userId, chatId);
       // Socket drops, provider 5xx mid-stream, etc. — persist whatever was
       // already streamed so the user keeps the visible content rather than

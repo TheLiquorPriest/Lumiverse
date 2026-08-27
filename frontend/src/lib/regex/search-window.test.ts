@@ -56,6 +56,14 @@ describe("regex terminal-literal search window", () => {
     expect(getRegexSearchEnd(input, "fooENDING", "g", "$'")).toBe(input.length)
   })
 
+  test("resets sticky lastIndex around cached replacements", () => {
+    const regex = /a/y
+    const apply = () => replaceWithinRegexSearchWindow("a", regex, "a", "y", "x", "x")
+    expect(apply()).toBe("x")
+    expect(regex.lastIndex).toBe(0)
+    expect(apply()).toBe("x")
+  })
+
   test("excludes a large unterminated Social Links tail from regex execution", () => {
     const fields = Array.from({ length: 21 }, (_, index) => `field${index + 1}`).join("|")
     const valid = `[METER|${fields}]body[/METER]`

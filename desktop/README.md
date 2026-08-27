@@ -55,7 +55,7 @@ surface. Browser and PWA rendering ignore this desktop-only setting.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) ≥ 1.3.13 (also required by the server itself)
+- [Bun](https://bun.sh) ≥ 1.4.0 (also required by the server itself)
 - [Rust](https://rustup.rs) stable (Tauri v2 builds the native shell)
 
 Platform-specific requirements:

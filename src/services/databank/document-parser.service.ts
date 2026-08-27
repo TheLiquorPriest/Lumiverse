@@ -161,8 +161,150 @@ function parseJson(raw: string): ParsedDocument {
 }
 
 function parseXml(raw: string): ParsedDocument {
-  // Strip XML tags, keeping text content
-  const text = raw
+  const text = parseStrictXmlText(raw);
+  if (text !== null) {
+    return { text, metadata: { format: "xml", valid: true } };
+  }
+  // Preserve the old lenient behavior for malformed or HTML-flavoured XML.
+  return {
+    text: stripXmlLikeText(raw),
+    metadata: { format: "xml", valid: false },
+  };
+}
+
+function decodeXmlText(raw: string): string | null {
+  let decoded = "";
+  let cursor = 0;
+  while (cursor < raw.length) {
+    const ampersand = raw.indexOf("&", cursor);
+    if (ampersand < 0) return decoded + raw.slice(cursor);
+    decoded += raw.slice(cursor, ampersand);
+    const semicolon = raw.indexOf(";", ampersand + 1);
+    if (semicolon < 0) return null;
+    const entity = raw.slice(ampersand + 1, semicolon);
+    switch (entity) {
+      case "amp": decoded += "&"; break;
+      case "lt": decoded += "<"; break;
+      case "gt": decoded += ">"; break;
+      case "quot": decoded += '"'; break;
+      case "apos": decoded += "'"; break;
+      default: {
+        const hex = /^#x([0-9a-f]+)$/i.exec(entity);
+        const decimal = /^#([0-9]+)$/.exec(entity);
+        const codePoint = hex
+          ? Number.parseInt(hex[1]!, 16)
+          : decimal
+            ? Number.parseInt(decimal[1]!, 10)
+            : -1;
+        const validCodePoint = codePoint === 0x09
+          || codePoint === 0x0a
+          || codePoint === 0x0d
+          || (codePoint >= 0x20 && codePoint <= 0xd7ff)
+          || (codePoint >= 0xe000 && codePoint <= 0xfffd)
+          || (codePoint >= 0x10000 && codePoint <= 0x10ffff);
+        if (!validCodePoint) return null;
+        decoded += String.fromCodePoint(codePoint);
+      }
+    }
+    cursor = semicolon + 1;
+  }
+  return decoded;
+}
+
+function findXmlTagEnd(raw: string, start: number): number {
+  let quote: "'" | '"' | null = null;
+  for (let i = start; i < raw.length; i++) {
+    const char = raw[i]!;
+    if (quote) {
+      if (char === quote) quote = null;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === ">") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function parseStrictXmlText(raw: string): string | null {
+  const openElements: string[] = [];
+  const textParts: string[] = [];
+  let rootSeen = false;
+  let rootClosed = false;
+  let cursor = 0;
+
+  while (cursor < raw.length) {
+    if (raw[cursor] !== "<") {
+      const nextTag = raw.indexOf("<", cursor);
+      const end = nextTag < 0 ? raw.length : nextTag;
+      const decoded = decodeXmlText(raw.slice(cursor, end));
+      if (decoded === null) return null;
+      if (openElements.length === 0) {
+        if (decoded.trim().length > 0) return null;
+      } else if (decoded.length > 0) {
+        textParts.push(decoded);
+      }
+      cursor = end;
+      continue;
+    }
+
+    if (raw.startsWith("<!--", cursor)) {
+      const end = raw.indexOf("-->", cursor + 4);
+      if (end < 0 || raw.slice(cursor + 4, end).includes("--")) return null;
+      cursor = end + 3;
+      continue;
+    }
+    if (raw.startsWith("<?", cursor)) {
+      const end = raw.indexOf("?>", cursor + 2);
+      if (end < 0) return null;
+      cursor = end + 2;
+      continue;
+    }
+    if (raw.startsWith("<![CDATA[", cursor)) {
+      if (openElements.length === 0) return null;
+      const end = raw.indexOf("]]>", cursor + 9);
+      if (end < 0) return null;
+      textParts.push(raw.slice(cursor + 9, end));
+      cursor = end + 3;
+      continue;
+    }
+    if (raw.startsWith("<!", cursor)) return null;
+
+    const end = findXmlTagEnd(raw, cursor + 1);
+    if (end < 0) return null;
+    const body = raw.slice(cursor + 1, end).trim();
+    const closing = /^\/\s*([A-Za-z_:][A-Za-z0-9_.:-]*)\s*$/.exec(body);
+    if (closing) {
+      if (openElements.pop() !== closing[1]) return null;
+      if (openElements.length === 0) rootClosed = true;
+      cursor = end + 1;
+      continue;
+    }
+
+    const selfClosing = /\/\s*$/.test(body);
+    const openingBody = selfClosing ? body.replace(/\/\s*$/, "").trimEnd() : body;
+    const opening = /^([A-Za-z_:][A-Za-z0-9_.:-]*)(?=\s|$)/.exec(openingBody);
+    if (!opening || openingBody.includes("<")) return null;
+    const attributes = openingBody.slice(opening[0].length);
+    if (decodeXmlText(attributes) === null) return null;
+    if (openElements.length === 0) {
+      if (rootSeen || rootClosed) return null;
+      rootSeen = true;
+    }
+    if (selfClosing) {
+      if (openElements.length === 0) rootClosed = true;
+    } else {
+      openElements.push(opening[1]!);
+    }
+    cursor = end + 1;
+  }
+
+  if (!rootSeen || openElements.length > 0) return null;
+  return textParts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function stripXmlLikeText(raw: string): string {
+  return raw
     .replace(/<\?xml[^>]*\?>/gi, "")
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]+>/g, " ")
@@ -173,7 +315,6 @@ function parseXml(raw: string): ParsedDocument {
     .replace(/&apos;/g, "'")
     .replace(/\s+/g, " ")
     .trim();
-  return { text, metadata: { format: "xml" } };
 }
 
 function parseHtml(raw: string): ParsedDocument {

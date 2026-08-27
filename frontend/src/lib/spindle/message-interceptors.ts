@@ -2,6 +2,13 @@ import type {
   SpindleMessageTagIntercept,
   SpindleMessageTagInterceptorOptions,
 } from 'lumiverse-spindle-types'
+import { beginChatDisplayWork, endChatDisplayWork } from '@/lib/chatDisplaySettle'
+import { scheduleMicrotask } from '@/lib/schedule-microtask'
+import {
+  clearAttachedMessageTagInterceptors,
+  noteMessageTagInterceptorAttached,
+  noteMessageTagInterceptorDetached,
+} from './message-tag-runtime-readiness'
 
 type InterceptorHandler = (payload: SpindleMessageTagIntercept) => void
 
@@ -26,18 +33,11 @@ type PendingTagIntercept = {
   interceptor: RegisteredTagInterceptor
 }
 
-type DeferredTagInterceptBatch = {
-  intercepts: PendingTagIntercept[]
-  delivered: Set<string>
-}
-
 const tagInterceptors = new Map<string, RegisteredTagInterceptor[]>()
 const tagMatchPlans = new Map<string, TagMatchPlan>()
 let registeredTagPresenceRe: RegExp | null = null
 let interceptorVersion = 0
 const listeners = new Set<() => void>()
-const deferredTagInterceptBatches: DeferredTagInterceptBatch[] = []
-let deferredTagInterceptTimer: ReturnType<typeof setInterval> | null = null
 
 function notifyInterceptorRegistryChanged(): void {
   registeredTagPresenceRe = tagInterceptors.size > 0
@@ -161,9 +161,13 @@ export function registerTagInterceptor(
   list.push(item)
   tagInterceptors.set(tagName, list)
   rebuildTagMatchPlan(tagName, list)
+  noteMessageTagInterceptorAttached(extensionId)
   notifyInterceptorRegistryChanged()
 
+  let active = true
   return () => {
+    if (!active) return
+    active = false
     const current = tagInterceptors.get(tagName)
     if (!current) return
     const next = current.filter((entry) => entry !== item)
@@ -171,6 +175,7 @@ export function registerTagInterceptor(
     else tagInterceptors.set(tagName, next)
     if (next.length === 0) tagMatchPlans.delete(tagName)
     else rebuildTagMatchPlan(tagName, next)
+    noteMessageTagInterceptorDetached(extensionId)
     notifyInterceptorRegistryChanged()
   }
 }
@@ -187,6 +192,7 @@ export function unregisterTagInterceptorsByExtension(extensionId: string): void 
     else rebuildTagMatchPlan(tagName, next)
   }
   if (changed) {
+    clearAttachedMessageTagInterceptors(extensionId)
     notifyInterceptorRegistryChanged()
   }
 }
@@ -258,42 +264,32 @@ export function stripMessageTags(
 }
 
 function processMessageTagIntercepts(intercepts: PendingTagIntercept[], delivered: Set<string>): void {
+  // Handlers (SimTracker, scene-card widgets, etc.) insert DOM after this
+  // return. Hold the reveal until those first-wave upserts have a chance to
+  // land — otherwise the chat unmasks and the widgets shove every row.
+  const activeWorkScopes = new Set<string | undefined>()
   for (const { payload, interceptor } of intercepts) {
     const key = deliveryKey(payload, interceptor)
     if (delivered.has(key)) continue
     delivered.add(key)
+    const workScope = payload.chatId
+    if (!activeWorkScopes.has(workScope)) {
+      activeWorkScopes.add(workScope)
+      beginChatDisplayWork(workScope)
+    }
     try {
       interceptor.handler({ ...payload, extensionId: interceptor.extensionId })
     } catch (err) {
       console.error(`[Spindle] Tag interceptor failed (${interceptor.extensionId}):`, err)
     }
   }
-}
-
-function ensureDeferredTagInterceptPoller(): void {
-  if (deferredTagInterceptTimer !== null) return
-  deferredTagInterceptTimer = setInterval(() => {
-    if (document.body.hasAttribute('data-chat-chrome-entering')) return
-    clearInterval(deferredTagInterceptTimer!)
-    deferredTagInterceptTimer = null
-    const batches = deferredTagInterceptBatches.splice(0)
-    for (const batch of batches) {
-      processMessageTagIntercepts(batch.intercepts, batch.delivered)
-    }
-  }, 50)
+  if (activeWorkScopes.size > 0) {
+    scheduleMicrotask(() => {
+      for (const workScope of activeWorkScopes) endChatDisplayWork(workScope)
+    })
+  }
 }
 
 export function dispatchMessageTagIntercepts(intercepts: PendingTagIntercept[], delivered: Set<string>): void {
-  if (
-    document.body.hasAttribute('data-chat-chrome-entering') ||
-    deferredTagInterceptBatches.length > 0
-  ) {
-    // Preserve delivery order while using one poller for the entire chat,
-    // rather than one timer per mounted message.
-    deferredTagInterceptBatches.push({ intercepts, delivered })
-    ensureDeferredTagInterceptPoller()
-    return
-  }
-
   processMessageTagIntercepts(intercepts, delivered)
 }

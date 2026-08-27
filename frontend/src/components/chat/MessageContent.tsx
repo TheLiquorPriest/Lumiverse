@@ -4,6 +4,7 @@ import { ChevronDown } from 'lucide-react'
 import { marked } from 'marked'
 import { highlightCode } from '@/lib/codeHighlight'
 import { processMarkdownInHtmlIsland } from './htmlIslandMarkdown'
+import { resolveGalleryImageId } from '@/lib/galleryImageReference'
 import { parseOOC } from '@/lib/oocParser'
 import { createEmphasisAwareRenderer } from '@/lib/markedEmphasisRenderer'
 import { createStrictTildeTokenizer } from '@/lib/markedTokenizer'
@@ -27,6 +28,7 @@ import {
   dispatchMessageContentLayout,
   MESSAGE_CONTENT_LAYOUT_EVENT,
 } from '@/lib/message-content-layout'
+import { beginChatRenderedResource } from '@/lib/chatDisplaySettle'
 import { useStore } from '@/store'
 import i18n from '@/i18n'
 import { useDisplayRegex } from '@/hooks/useDisplayRegex'
@@ -67,7 +69,7 @@ interface MessageContentProps {
   findQuery?: string
 }
 
-// Custom renderer for sheld prose classes
+// Custom renderer for chat prose classes
 const renderer = createEmphasisAwareRenderer({
   emClass: styles.proseItalic,
   strongClass: styles.proseBold,
@@ -1159,14 +1161,33 @@ function notifyMessageContentLayout(el: HTMLElement): void {
   dispatchMessageContentLayout(el)
 }
 
-function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
+function replaceHtmlPreservingImages(root: HTMLElement | ShadowRoot, html: string): void {
+  const stableImgs = new Map<string, HTMLImageElement>()
+  for (const img of root.querySelectorAll<HTMLImageElement>('img[src]')) {
+    const src = img.getAttribute('src')
+    if (src && !stableImgs.has(src)) stableImgs.set(src, img)
+  }
+
+  root.innerHTML = html
+
+  for (const newImg of root.querySelectorAll<HTMLImageElement>('img[src]')) {
+    const src = newImg.getAttribute('src')
+    if (!src) continue
+    const preserved = stableImgs.get(src)
+    if (preserved && newImg.parentNode) {
+      newImg.replaceWith(preserved)
+      stableImgs.delete(src)
+    }
+  }
+}
+export function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
 
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: 'open' })
-    shadow.innerHTML = `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`
+    replaceHtmlPreservingImages(shadow, `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`)
     for (const actionEl of shadow.querySelectorAll<HTMLElement>('[data-lumiverse-regex-action]')) {
       actionEl.style.cursor = 'pointer'
     }
@@ -1306,12 +1327,20 @@ function getChatFindHighlightRoots(container: HTMLElement): ChatFindHighlightRoo
   return roots
 }
 
+function getRenderedImages(container: HTMLElement): HTMLImageElement[] {
+  const images = Array.from(container.querySelectorAll<HTMLImageElement>('img[src]'))
+  for (const island of container.querySelectorAll<HTMLElement>('[data-lumiverse-html-island]')) {
+    if (island.shadowRoot) images.push(...island.shadowRoot.querySelectorAll<HTMLImageElement>('img[src]'))
+  }
+  return images
+}
+
 /**
  * dangerouslySetInnerHTML wrapper that preserves IMG element identity by
  * src across innerHTML replacements, so images don't redo the cache lookup,
  * decode, paint cycle on every chat re-render.
  */
-function ProseHtml({ html, className }: { html: string; className?: string }) {
+export function ProseHtml({ html, className }: { html: string; className?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const lastHtmlRef = useRef<string | null>(null)
 
@@ -1320,35 +1349,13 @@ function ProseHtml({ html, className }: { html: string; className?: string }) {
     if (!el) return
     if (lastHtmlRef.current === html) return
 
-    const stableImgs = new Map<string, HTMLImageElement>()
-    if (lastHtmlRef.current !== null) {
-      for (const img of el.querySelectorAll<HTMLImageElement>('img[src]')) {
-        const src = img.getAttribute('src')
-        if (src && !stableImgs.has(src)) stableImgs.set(src, img)
-      }
-    }
-
-    el.innerHTML = html
+    replaceHtmlPreservingImages(el, html)
     lastHtmlRef.current = html
-
-    if (stableImgs.size > 0) {
-      for (const newImg of el.querySelectorAll<HTMLImageElement>('img[src]')) {
-        const src = newImg.getAttribute('src')
-        if (!src) continue
-        const preserved = stableImgs.get(src)
-        if (preserved && newImg.parentNode) {
-          newImg.replaceWith(preserved)
-          stableImgs.delete(src)
-        }
-      }
-    }
-
     notifyMessageContentLayout(el)
   }, [html])
 
   return <div ref={ref} className={className} />
 }
-
 function TrustedYouTubeEmbed({ embed }: { embed: TrustedYouTubeEmbed }) {
   return (
     <div className={styles.youtubeEmbedWrap}>
@@ -1383,6 +1390,8 @@ function assetStem(name: string): string {
 
 /** Look up an asset reference in the map — tries exact, then stem. Handles embeded:// URIs. */
 function resolveAssetId(src: string, assetMap: Record<string, string>): string | undefined {
+  const galleryImageId = resolveGalleryImageId(src, assetMap)
+  if (galleryImageId) return galleryImageId
   // Strip Risu embeded:// prefix
   const cleaned = src.startsWith('embeded://') ? src.slice('embeded://'.length) : src
   return assetMap[cleaned] ?? assetMap[assetStem(cleaned)]
@@ -1513,11 +1522,11 @@ export default function MessageContent({
   const macroCtx = useMemo(() => ({ charName, userName }), [charName, userName])
   const preprocessOpts = useMemo(
     () => (messageId
-      ? { messageId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
+      ? { messageId, chatId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
       : undefined),
-    [messageId, isUser],
+    [messageId, chatId, isUser],
   )
-  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts)
+  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts, isStreaming)
 
   const risuResolvedContent = useMemo(
     () => {
@@ -2061,6 +2070,67 @@ export default function MessageContent({
     return elements
   }, [blocks, oocEnabled, lumiaOOCStyle, isStreaming])
 
+  const pendingRenderedImagesRef = useRef(new Map<
+    HTMLImageElement,
+    { chatId: string | undefined; release: () => void }
+  >())
+
+  // Display regex completion yields a replacement string; resource fetching is
+  // deliberately outside that CPU clock. Track images after React commits the
+  // rendered replacement so the bounded chat-reveal gate can wait for their
+  // load/error and decode without ever blaming the regex for network latency.
+  useLayoutEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    const images = new Set(getRenderedImages(container))
+    const tracked = pendingRenderedImagesRef.current
+    for (const [image, entry] of tracked) {
+      if (!images.has(image) || image.complete || entry.chatId !== chatId) entry.release()
+    }
+
+    for (const image of images) {
+      if (image.complete || tracked.has(image)) continue
+
+      const releaseBlocker = beginChatRenderedResource(chatId)
+      let released = false
+      const release = () => {
+        if (released) return
+        released = true
+        image.removeEventListener('load', handleLoad)
+        image.removeEventListener('error', handleError)
+        tracked.delete(image)
+        releaseBlocker()
+      }
+      const finishAfterDecode = () => {
+        if (typeof image.decode !== 'function') {
+          release()
+          return
+        }
+        try {
+          void image.decode().catch(() => {}).finally(release)
+        } catch {
+          release()
+        }
+      }
+      const handleLoad = () => finishAfterDecode()
+      const handleError = () => release()
+
+      image.addEventListener('load', handleLoad, { once: true })
+      image.addEventListener('error', handleError, { once: true })
+      tracked.set(image, { chatId, release })
+
+      // A cached image can complete between the initial check and listener
+      // attachment. Re-check synchronously so its blocker cannot leak.
+      if (image.complete) finishAfterDecode()
+    }
+  }, [chatId, renderedBlocks])
+
+  useEffect(() => () => {
+    for (const entry of pendingRenderedImagesRef.current.values()) entry.release()
+    pendingRenderedImagesRef.current.clear()
+  }, [])
+
   useLayoutEffect(() => {
     measureLongMessageOverflow()
   }, [measureLongMessageOverflow, renderContent, renderedBlocks])
@@ -2173,7 +2243,7 @@ export default function MessageContent({
         >
           <div ref={contentBodyRef} className={styles.longMessageBody}>
             {renderedBlocks}
-            <SpindleMessageWidgets messageId={messageId} />
+            <SpindleMessageWidgets messageId={messageId} chatId={chatId} />
           </div>
         </div>
         {longMessageEligible && longMessageOverflowing && (

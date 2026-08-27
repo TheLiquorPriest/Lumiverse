@@ -178,6 +178,40 @@ describe("stripNonProseTags", () => {
 });
 
 describe("stripHtmlFormattingTags", () => {
+  test("never captures Markdown details summary boxes", () => {
+    const details = [
+      '<details class="story-summary" open>',
+      "<summary><strong>Chapter summary</strong></summary>",
+      "The party reached **Westfall**.",
+      '<div class="details-layout">Nested authored content stays intact.</div>',
+      "</details>",
+    ].join("\n");
+    const input = [
+      "Before.",
+      details,
+      '<div class="html-island">Disposable widget</div>',
+      "After <b>bold prose</b>.",
+    ].join("\n");
+
+    const stripped = stripHtmlFormattingTags(input);
+
+    expect(stripped).toContain(details);
+    expect(stripped).not.toContain("Disposable widget");
+    expect(stripped).toContain("After bold prose.");
+  });
+
+  test("preserves summary markup extracted by details keep-only mode", () => {
+    expect(stripHtmlFormattingTags("<summary>Chapter summary</summary>\nFacts remain."))
+      .toBe("<summary>Chapter summary</summary>\nFacts remain.");
+  });
+
+  test("preserves a trailing unclosed details box from an interrupted generation", () => {
+    const input = "Before <b>bold</b>.\n<details><summary>Live summary</summary>\nStill streaming";
+    expect(stripHtmlFormattingTags(input)).toBe(
+      "Before bold.\n<details><summary>Live summary</summary>\nStill streaming",
+    );
+  });
+
   test("removes block-level HTML islands and preserves inline formatted prose", () => {
     const input = [
       'I say <font color="#8B7355">"Y-yeah, that\'s me."</font>',

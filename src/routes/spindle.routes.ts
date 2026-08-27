@@ -18,6 +18,7 @@ import {
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { ifNoneMatchSatisfies } from "../utils/http-cache";
+import { getFrontendRuntimeCapabilities } from "../spindle/frontend-runtime-capabilities";
 
 const app = new Hono();
 
@@ -45,6 +46,7 @@ app.get("/", async (c) => {
   const viewer = getViewer(c);
   const extensions = (await managerSvc.listForUser(viewer.userId, viewer.role)).map((ext) => ({
     ...ext,
+    frontend_runtime_capabilities: getFrontendRuntimeCapabilities(ext.id),
     status: lifecycle.isRunning(ext.id)
       ? "running"
       : ext.enabled
@@ -239,7 +241,7 @@ app.post("/import-local", requireOwner, async (c) => {
 // caller can manage, sequentially, in a background task. Returns immediately
 // (HTTP 202). Progress streams via SPINDLE_BULK_UPDATE_PROGRESS / _COMPLETE
 // WS events; per-extension status streams via SPINDLE_EXTENSION_STATUS.
-app.post("/update-all", async (c) => {
+app.post("/update-all", requireOwner, async (c) => {
   try {
     const viewer = getViewer(c);
     if (!viewer.userId) {
@@ -258,8 +260,12 @@ app.post("/update-all", async (c) => {
   }
 });
 
-// POST /api/v1/spindle/:id/update — Remote reset + rebuild
-app.post("/:id/update", async (c) => {
+// POST /api/v1/spindle/:id/update — Remote reset + rebuild.
+// Owner-only because a rebuild runs `bun install` (dependency lifecycle
+// scripts) and restarts the backend bundle from repository content — whoever
+// controls the branch controls server-side code execution. Install is already
+// owner-only; mutating the code supply chain must match.
+app.post("/:id/update", requireOwner, async (c) => {
   try {
     const ext = await getVisibleExtension(c, c.req.param("id"));
     if (!ext) return c.json({ error: "Not found" }, 404);
@@ -517,7 +523,7 @@ app.get("/:id/branches", async (c) => {
 });
 
 // POST /api/v1/spindle/:id/switch-branch — Switch to a different branch
-app.post("/:id/switch-branch", async (c) => {
+app.post("/:id/switch-branch", requireOwner, async (c) => {
   try {
     const ext = await getVisibleExtension(c, c.req.param("id"));
     if (!ext) return c.json({ error: "Not found" }, 404);

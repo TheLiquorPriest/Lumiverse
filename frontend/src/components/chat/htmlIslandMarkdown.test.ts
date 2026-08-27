@@ -39,4 +39,23 @@ describe('processMarkdownInHtmlIsland', () => {
   test('does not parse text inside svg subtrees', () => {
     expect(render('<svg><text>*bold*</text></svg>')).toBe('<svg><text>*bold*</text></svg>')
   })
+
+  test('unknown pseudo-tags do not flip following prose to inline', () => {
+    const html = '<div><close>\n\n## NPC\n\n*intro*</div>'
+    expect(render(html)).toContain('<block>## NPC\n\n*intro*</block>')
+  })
+
+  test('unreplaced card markers with payloads do not become markdown context', () => {
+    const html = '<div><Name: evan | Background: heropng>\n\n## HEROES</div>'
+    expect(render(html)).toContain('<block>## HEROES</block>')
+  })
+
+  test('stray unknown close tags do not pop known containers', () => {
+    const html = '<div></wiki># heading</div>'
+    expect(render(html)).toBe('<div></wiki><block># heading</block></div>')
+  })
+
+  test('form is sanitizer-forbidden and does not become markdown context', () => {
+    expect(render('<div><form>## heading</div>')).toContain('<block>## heading</block>')
+  })
 })

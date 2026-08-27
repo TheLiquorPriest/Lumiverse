@@ -12,6 +12,8 @@
   justify-content: center;
   z-index: 10010;
   padding: 24px;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 :global([data-glass]) .overlay {
@@ -31,6 +33,7 @@
   max-height: calc(80vh / var(--lumiverse-ui-scale, 1));
   box-shadow: var(--lumiverse-shadow-md, 0 8px 24px rgba(0, 0, 0, 0.4)), 0 0 1px var(--lumiverse-primary-020);
   overflow: hidden;
+  overscroll-behavior: none;
 }
 
 :global([data-glass]) .dialog {
@@ -306,6 +309,10 @@
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  /* Updating the in-flow highlight layer changes its height as lines wrap.
+     Scroll anchoring must not reinterpret that as content inserted above the
+     caret and move the editor during a keystroke or keyboard resize. */
+  overflow-anchor: none;
 }
 
 .highlightInner {
@@ -681,8 +688,9 @@
 /* Touch-only devices have no hover, so reveal the expand button permanently.
    Uses `any-hover: none` so it only matches when NO input device supports hover
    (true phones/tablets). `hover: none` incorrectly matches on Windows touchscreen
-   laptops in Firefox/Edge. The single-scroller overlay above tracks the caret
-   correctly on touch, so syntax highlighting stays enabled here. */
+   laptops in Firefox/Edge. Keep the shared highlight overlay active here: the
+   mobile font-size rule above locks both layers to the same text metrics, while
+   the caret-recovery logic handles keyboard-induced viewport changes. */
 @media (any-hover: none) {
   .expandBtn {
     opacity: 0.7;

@@ -43,7 +43,7 @@
     Upgrade Bun to the latest canary build before continuing
 
 .NOTES
-    Bun versions older than 1.3.13 are automatically upgraded to latest stable.
+    Bun versions older than 1.4.0 are automatically upgraded to latest stable.
 #>
 
 param(
@@ -73,7 +73,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$MinimumBunVersion = [version]"1.3.13"
+$MinimumBunVersion = [version]"1.4.0"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -341,12 +341,73 @@ function Load-EnvFile {
 
 # ─── Install dependencies ───────────────────────────────────────────────────
 
+function Invoke-BunDependencyInstall {
+    param([string]$Dir)
+
+    Push-Location $Dir
+    try {
+        # Bun's default Windows backend hardlinks packages out of its cache.
+        # Filesystem filters (notably sync providers and antivirus) can make
+        # that operation report success while leaving empty package folders.
+        # copyfile is slower, but gives Windows installations ordinary files.
+        & bun install --backend=copyfile
+        $exitCode = $LASTEXITCODE
+    } finally { Pop-Location }
+
+    if ($exitCode -ne 0) {
+        throw "bun install exited with code $exitCode"
+    }
+}
+
+function Test-BackendDependencyLoad {
+    param([string]$Dir)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    Push-Location $Dir
+    try {
+        # PowerShell 5 promotes redirected native stderr to error records. Keep
+        # collecting it for the diagnostic, but judge success by the exit code.
+        $ErrorActionPreference = "Continue"
+        $output = (& bun -e "await import('./src/services/databank/web-page-parser.ts'); await import('./src/utils/remote-image-page.ts')" 2>&1 | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    return [pscustomobject]@{
+        Success = ($exitCode -eq 0)
+        Output  = $output
+    }
+}
+
 function Install-Deps {
     param([string]$Dir, [string]$Name)
 
     Write-Info "Installing $Name dependencies..."
-    Push-Location $Dir
-    try { & bun install } finally { Pop-Location }
+    Invoke-BunDependencyInstall $Dir
+
+    if ($Name -eq "backend") {
+        $probe = Test-BackendDependencyLoad $Dir
+        if (-not $probe.Success) {
+            Write-Warn "Backend dependency validation failed; performing a clean copy-based reinstall..."
+            $nodeModules = Join-Path $Dir "node_modules"
+            if (Test-Path $nodeModules) {
+                Remove-Item $nodeModules -Recurse -Force
+            }
+
+            Invoke-BunDependencyInstall $Dir
+            $probe = Test-BackendDependencyLoad $Dir
+            if (-not $probe.Success) {
+                Write-Err "Backend dependencies are still unreadable after a clean copy-based reinstall."
+                if ($probe.Output) { Write-Err $probe.Output }
+                Write-Err "Check Windows Defender/antivirus quarantine history and filesystem sync software for blocked package files."
+                exit 1
+            }
+            Write-Ok "Backend dependency tree repaired"
+        }
+    }
+
     Write-Ok "$Name dependencies installed"
 }
 

@@ -74,6 +74,19 @@ describe("capture-replacements regex operation", () => {
     );
   });
 
+  test("substitutes unmatched named groups as empty, keeps unknown names untouched", () => {
+    const pattern = "(?<word>[a-z]+)(?:-(?<suffix>[a-z]+))?";
+    const input = "gamma alpha-beta";
+    const replacement = "<$<word>|$<suffix>|$<missing>>";
+
+    const results = captureReplacements(pattern, "g", input, replacement);
+    expect(results).toHaveLength(2);
+    // "gamma": suffix is defined but absent → empty; "missing" is unknown → literal.
+    expect(results[0].replacement).toBe("<gamma||$<missing>>");
+    // "alpha-beta": suffix captured.
+    expect(results[1].replacement).toBe("<alpha|beta|$<missing>>");
+  });
+
   test("handles global zero-length and sticky matches identically", () => {
     for (const testCase of [
       { pattern: "(?=(a))", flags: "g", input: "aa", replacement: "<$1>" },

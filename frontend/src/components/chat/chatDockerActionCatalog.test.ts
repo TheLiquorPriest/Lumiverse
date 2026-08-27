@@ -35,6 +35,7 @@ const {
   registerChatDockerActionOwners,
   subscribeChatDockerActionOwners,
 } = await import('./chatDockerActionCatalog')
+
 beforeEach(() => {
   registerChatDockerActionOwners(null)
 })
@@ -313,6 +314,7 @@ describe('chatDockerActionCatalog', () => {
     inputAreaReplacementCleanup()
     expect(getChatDockerActionOwners()).toEqual({})
   })
+
   test('stale cleanup keeps the current owner snapshot and does not notify subscribers', () => {
     const snapshots: unknown[] = []
     const unsubscribe = subscribeChatDockerActionOwners(() => {

@@ -207,6 +207,11 @@ interface CachedActivationResult {
 
 const wiActivationCache = new Map<string, CachedActivationResult>();
 
+/** Drop cloned activation results without affecting prompt-local scan state. */
+export function clearWorldInfoActivationCache(): void {
+  wiActivationCache.clear();
+}
+
 function cloneActivationProvenance(value: ActivationProvenance): ActivationProvenance {
   const clone = projectActivationProvenance(value);
   if (!clone) throw new Error("Invalid activation provenance in cache");

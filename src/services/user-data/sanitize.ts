@@ -6,8 +6,8 @@ const PREFIX_RE =
   /^(?:database\/|files\/(?:images|thumbnails|avatars|databank|theme-assets|audio|notification-sounds|artifacts)\/|lancedb\/|secrets\/(?:encrypted\.ndjson|index\.json)$|manifest\.json$|manifest-stats\.json$)/;
 
 const UUID_PREFIX = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-const IMAGE_ID_RE = new RegExp(`^${UUID_PREFIX}(?:\\.[a-zA-Z0-9]{1,8}|_(?:h264|hevc)\\.mp4)$`);
-const THUMB_RE = new RegExp(`^${UUID_PREFIX}_thumb_(?:sm|lg)(?:_v2)?\\.webp$`);
+const IMAGE_ID_RE = new RegExp(`^${UUID_PREFIX}(?:\\.[a-zA-Z0-9]{1,8}|_(?:h264|hevc)\\.mp4)?$`);
+const THUMB_RE = new RegExp(`^${UUID_PREFIX}_thumb_(?:sm|lg)(?:\\.webp|_v2\\.(?:webp|avif))$`);
 
 const AVATAR_RE = /^[A-Za-z0-9._-]+$/;
 

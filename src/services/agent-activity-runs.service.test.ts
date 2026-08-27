@@ -46,8 +46,8 @@ async function applyActivitySchema(): Promise<void> {
   db.run("PRAGMA foreign_keys = OFF");
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text());
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "078_chats_character_id_nullable.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "108_agent_run_projection.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "119_agent_inspection_source_retention.sql")).text());
+  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "118_agent_run_projection.sql")).text());
+  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "129_agent_inspection_source_retention.sql")).text());
 }
 
 function snapshot(status: AgentActivitySnapshotV1["status"] = "completed", extra: Record<string, unknown> = {}): AgentActivitySnapshotV1 {
@@ -332,8 +332,8 @@ describe("agent activity migration compatibility", () => {
       expect(columns.map((column) => column.name)).toEqual(expect.arrayContaining([
         "user_id", "chat_id", "generation_id", "target_message_id", "target_swipe_id", "snapshot_json", "byte_size",
       ]));
-      expect(db.query("SELECT name FROM _migrations WHERE name = ?").get("102_agent_activity_runs.sql")).toEqual({
-        name: "102_agent_activity_runs.sql",
+      expect(db.query("SELECT name FROM _migrations WHERE name = ?").get("113_agent_activity_runs.sql")).toEqual({
+        name: "113_agent_activity_runs.sql",
       });
       const chatForeignKey = (
         db.query("PRAGMA foreign_key_list(agent_activity_runs)").all() as Array<{

@@ -3,6 +3,29 @@ const VOID_HTML_TAG_RE = /^<(area|base|br|col|embed|hr|img|input|link|meta|param
 const RAW_TEXT_CONTEXT_TAGS = new Set(['code', 'pre', 'script'])
 const NO_MARKDOWN_SUBTREE_TAGS = new Set(['svg'])
 
+// The sanitizer unwraps elements outside its allowlist while keeping their
+// content, so unknown tags (card pseudo-markers like <close> or an unreplaced
+// <Name: ...>) must not establish markdown context: an unclosed one would
+// force inline rendering for the whole rest of the island. Snapshot of
+// DOMPurify's default HTML allowlist minus richHtmlSanitizer's FORBID_TAGS;
+// update alongside any tag-policy change there.
+const SANITIZER_KEPT_TAGS = new Set([
+  'a', 'abbr', 'acronym', 'address', 'area', 'article', 'aside', 'audio', 'b',
+  'bdi', 'bdo', 'big', 'blink', 'blockquote', 'body', 'br', 'button', 'canvas',
+  'caption', 'center', 'cite', 'code', 'col', 'colgroup', 'content', 'data',
+  'datalist', 'dd', 'decorator', 'del', 'details', 'dfn', 'dialog', 'dir',
+  'div', 'dl', 'dt', 'element', 'em', 'fieldset', 'figcaption', 'figure',
+  'font', 'footer', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header',
+  'hgroup', 'hr', 'html', 'i', 'img', 'input', 'ins', 'kbd', 'label',
+  'legend', 'li', 'main', 'map', 'mark', 'marquee', 'menu', 'menuitem',
+  'meter', 'nav', 'nobr', 'ol', 'optgroup', 'option', 'output', 'p', 'picture',
+  'pre', 'progress', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'section', 'select',
+  'shadow', 'small', 'source', 'spacer', 'span', 'strike', 'strong', 'style',
+  'sub', 'summary', 'sup', 'svg', 'table', 'tbody', 'td', 'template',
+  'textarea', 'tfoot', 'th', 'thead', 'time', 'tr', 'track', 'tt', 'u', 'ul',
+  'var', 'video', 'wbr',
+])
+
 // Only these containers are allowed to promote child text into block markdown
 // like headings or lists. Everything else stays inline to avoid emitting
 // invalid HTML such as <span><h1>…</h1></span>.
@@ -39,6 +62,7 @@ function updateTagStack(part: string, tagStack: string[], rawTextState: { depth:
   if (closeMatch) {
     const tag = closeMatch[1].toLowerCase()
     if (RAW_TEXT_CONTEXT_TAGS.has(tag)) rawTextState.depth = Math.max(0, rawTextState.depth - 1)
+    if (!SANITIZER_KEPT_TAGS.has(tag)) return
     const idx = tagStack.lastIndexOf(tag)
     if (idx >= 0) tagStack.splice(idx, 1)
     return
@@ -49,6 +73,7 @@ function updateTagStack(part: string, tagStack: string[], rawTextState: { depth:
 
   const tag = openMatch[1].toLowerCase()
   if (RAW_TEXT_CONTEXT_TAGS.has(tag)) rawTextState.depth += 1
+  if (!SANITIZER_KEPT_TAGS.has(tag)) return
 
   const isSelfClosing = /\/\s*>$/.test(part) || VOID_HTML_TAG_RE.test(part)
   if (!isSelfClosing) tagStack.push(tag)

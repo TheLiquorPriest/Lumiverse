@@ -25,9 +25,6 @@ import {
   liveMessageInputRevision,
 } from "./prompt-assembly-snapshot.service";
 const baselineSql = await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text();
-const turnSql = await Bun.file(join(import.meta.dir, "..", "db", "migrations", "106_agent_turn_workspace.sql")).text();
-const projectionSql = await Bun.file(join(import.meta.dir, "..", "db", "migrations", "108_agent_run_projection.sql")).text();
-const emptyRevisionDigest = createHash("sha256").update("[]").digest("hex");
 const artifactBytes = new TextEncoder().encode("blob");
 const artifactDigest = createHash("sha256").update(artifactBytes).digest("hex");
 let artifactPath: string | undefined;
@@ -72,8 +69,6 @@ function createDatabase(): Database {
   const artifactStat = statSync(path);
   const artifactIdentity = `${Number(artifactStat.dev)}:${Number(artifactStat.ino)}:${Number(artifactStat.size)}:${Math.trunc(Number(artifactStat.mtimeMs) * 1000)}`;
   db.run(baselineSql);
-  db.run(turnSql);
-  db.run(projectionSql);
   db.run("PRAGMA foreign_keys = ON");
   db.query("INSERT INTO \"user\" (id, name, email) VALUES (?, ?, ?)").run("u1", "Test", "u1@example.test");
   db.query("INSERT INTO characters (id, name) VALUES (?, ?)").run("character-1", "Character");

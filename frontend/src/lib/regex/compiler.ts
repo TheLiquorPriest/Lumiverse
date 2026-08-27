@@ -84,7 +84,7 @@ interface DisplayRegexMatch {
   fullMatch: string
   groups: Array<string | undefined>
   offset: number
-  namedGroups?: Record<string, string>
+  namedGroups?: Record<string, string | undefined>
 }
 
 interface ResolvedRegexAction extends RegexAction {
@@ -169,15 +169,20 @@ function decorateMatchReplacement(replacement: string, script: RegexScript, matc
     : replacement
 }
 
+// Compiled-regex cache: display transforms can evaluate every script on every
+// streaming chunk. Keep validation at this public boundary, then share the
+// import-free leaf cache with the worker bundle.
+import { compileRegex as compileCachedRegex } from './compile-regex'
+
 export function compileRegex(pattern: string, flags: string): RegExp | null {
   if (regexUtf8ByteLength(pattern) > REGEX_LIMITS_V1.maxPatternBytes) return null
   if (flags.length > 16 || new Set(flags).size !== flags.length) return null
-  try {
-    return new RegExp(pattern, flags)
-  } catch {
-    return null
-  }
+  return compileCachedRegex(pattern, flags)
 }
+
+// trim_strings removal can rejoin new occurrences each pass (e.g. 'bbcc' with
+// trim 'bc'), so the loop is bounded instead of a single replaceAll pass.
+const MAX_DISPLAY_TRIM_ITERATIONS = 32
 function hasMacroSyntax(value: string): boolean {
   return value.includes('{{') || value.includes('<USER>') || value.includes('<BOT>') || value.includes('<CHAR>')
 }
@@ -195,7 +200,7 @@ function resolvesReplacementMacros(mode: RegexMacroMode): boolean {
  * Mirrors the backend's macro resolution order, but only for the frontend's
  * lightweight display-macro set.
  */
-function resolveRegexStringMacros(
+export function resolveRegexStringMacros(
   value: string,
   macroCtx: DisplayMacroContext,
 ): string {
@@ -229,7 +234,7 @@ function resolveRegexStringMacros(
   return resolved
 }
 
-function resolveReplacementMacros(
+export function resolveReplacementMacros(
   replaceString: string,
   mode: RegexMacroMode,
   macroCtx: DisplayMacroContext,
@@ -246,13 +251,13 @@ function resolveReplacementMacros(
   return resolved
 }
 
-function substituteRegexCaptures(
+export function substituteRegexCaptures(
   template: string,
   fullMatch: string,
   groups: Array<string | undefined>,
   offset: number,
   input: string,
-  namedGroups?: Record<string, string>,
+  namedGroups?: Record<string, string | undefined>,
 ): string {
   return template.replace(/\$(?:(\$)|(&)|(`)|(')|(\d{1,2})|<([^>]*)>)/g, (token, dollar, amp, backtick, quote, digits, name) => {
     if (dollar !== undefined) return '$'
@@ -264,12 +269,18 @@ function substituteRegexCaptures(
       if (idx >= 1 && idx <= groups.length) return groups[idx - 1] ?? ''
       return token
     }
-    if (name !== undefined && namedGroups) return namedGroups[name] ?? token
+    if (name !== undefined && namedGroups) {
+      // Optional named groups remain keys on the groups object even when they
+      // do not participate in this match. Those values substitute to empty;
+      // only genuinely unknown capture names remain literal.
+      if (Object.prototype.hasOwnProperty.call(namedGroups, name)) return namedGroups[name] ?? ''
+      return token
+    }
     return token
   })
 }
 
-function collectRegexMatches(
+export function collectRegexMatches(
   input: string,
   regex: RegExp,
   pattern: string,
@@ -281,16 +292,21 @@ function collectRegexMatches(
   const searchEnd = getRegexSearchEnd(input, pattern, flags, replacementTemplate)
   const searchable = searchEnd === input.length ? input : input.slice(0, searchEnd)
 
-  searchable.replace(regex, (fullMatch, ...args) => {
-    if (matches.length >= maxMatches) throw new Error('regex match limit exceeded')
-    const hasNamedGroups = typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null
-    const namedGroups = hasNamedGroups ? args.pop() as Record<string, string> : undefined
-    args.pop() as string
-    const offset = args.pop() as number
-    const groups = args as Array<string | undefined>
-    matches.push({ fullMatch, groups, offset, namedGroups })
-    return fullMatch
-  })
+  regex.lastIndex = 0
+  try {
+    searchable.replace(regex, (fullMatch, ...args) => {
+      if (matches.length >= maxMatches) throw new Error('regex match limit exceeded')
+      const hasNamedGroups = typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null
+      const namedGroups = hasNamedGroups ? args.pop() as Record<string, string | undefined> : undefined
+      args.pop() as string
+      const offset = args.pop() as number
+      const groups = args as Array<string | undefined>
+      matches.push({ fullMatch, groups, offset, namedGroups })
+      return fullMatch
+    })
+  } finally {
+    regex.lastIndex = 0
+  }
 
   return matches
 }
@@ -496,7 +512,7 @@ function applyDisplayActions(
   return { handled: false, content }
 }
 
-interface ApplyDisplayRegexContext {
+export interface ApplyDisplayRegexContext {
   isUser: boolean
   depth: number
   chatId?: string
@@ -519,7 +535,7 @@ interface SlowRegexReport {
   thresholdMs: number
 }
 
-const DISPLAY_SLOW_REGEX_WARNING_MS = 5_000
+export const DISPLAY_SLOW_REGEX_WARNING_MS = 5_000
 const REGEX_PERFORMANCE_ENGINE_VERSION = 2
 
 function getRegexPerformanceMetadata(script: RegexScript): RegexPerformanceMetadata | null {
@@ -552,9 +568,10 @@ export interface DisplayRegexBackendResult {
   result: string
   touchedVars?: ReadonlySet<string>
   cacheable?: boolean
+  timedOutScriptIds?: ReadonlySet<string>
 }
 
-async function applyDisplayRegexOnBackend(
+export async function applyDisplayRegexOnBackend(
   content: string,
   scripts: RegexScript[],
   context: ApplyDisplayRegexContext,
@@ -583,12 +600,20 @@ async function applyDisplayRegexOnBackend(
       }),
     })
     if (!res.ok) return null
-    const body = await res.json() as { result?: string; touched_vars?: string[]; cacheable?: boolean }
+    const body = await res.json() as {
+      result?: string
+      touched_vars?: string[]
+      cacheable?: boolean
+      timed_out_script_ids?: string[]
+    }
     if (typeof body.result !== 'string') return null
     return {
       result: body.result,
       touchedVars: Array.isArray(body.touched_vars) ? new Set(body.touched_vars) : undefined,
       cacheable: typeof body.cacheable === 'boolean' ? body.cacheable : undefined,
+      timedOutScriptIds: Array.isArray(body.timed_out_script_ids)
+        ? new Set(body.timed_out_script_ids)
+        : undefined,
     }
   } catch {
     return null
@@ -706,7 +731,15 @@ export function applyDisplayRegex(
       // Apply trim_strings
       for (const trim of script.trim_strings.slice(0, REGEX_LIMITS_V1.maxTrimStrings)) {
         if (trim.length === 0 || regexUtf8ByteLength(trim) > REGEX_LIMITS_V1.maxTrimStringBytes) continue
-        result = result.replaceAll(trim, '')
+        let iterations = 0
+        while (result.includes(trim)) {
+          result = result.replaceAll(trim, '')
+          iterations += 1
+          if (iterations >= MAX_DISPLAY_TRIM_ITERATIONS) {
+            console.warn(`[display] trim loop hit ${MAX_DISPLAY_TRIM_ITERATIONS}-iteration cap, stopping early (script=${script.id} "${script.name}", trim=${JSON.stringify(trim)})`)
+            break
+          }
+        }
       }
       const growth = regexUtf8ByteLength(result) - regexUtf8ByteLength(beforeScript)
       if (growth > 0) expansionBytes += growth
@@ -736,8 +769,8 @@ export function applyDisplayRegex(
           thresholdMs: recoveryThresholdMs,
         })
       }
-    } catch {
-      // Skip invalid regex silently
+    } catch (err) {
+      console.warn(`[display] display regex script threw, skipping (script=${script.id} "${script.name}")`, err)
     }
   }
 
@@ -758,7 +791,46 @@ function toSpindleDisplayContext(context: ApplyDisplayRegexContext): SpindleDisp
   }
 }
 
-export async function applyDisplayRegexAsync(
+// Spindle-owned chats bypass the regex pipeline entirely: when an extension
+// owns the chat surface its resolver applies the scripts on the main thread
+// and the worker/backend tiers must NEVER see that traffic (Task 3d).
+// Returns null when the chat is not owned so callers can continue with their
+// own pipeline.
+export async function applyDisplayRegexViaOwnedResolver(
+  content: string,
+  scripts: RegexScript[],
+  context: ApplyDisplayRegexContext,
+): Promise<DisplayRegexBackendResult | null> {
+  if (!context.chatId || !isDisplayChatOwned(context.chatId)) return null
+  const resolver = getDisplayResolverForChat(context.chatId)
+  if (resolver) {
+    try {
+      const local = await resolver.applyScripts({
+        content,
+        scripts,
+        context: toSpindleDisplayContext(context),
+        ...(context.resolvedFindPatterns ? { resolvedFindPatterns: mapToRecord(context.resolvedFindPatterns) } : {}),
+        ...(context.resolvedReplacements ? { resolvedReplacements: mapToRecord(context.resolvedReplacements) } : {}),
+      })
+      if (local) {
+        return {
+          result: local.content,
+          ...(local.touchedVars ? { touchedVars: new Set(local.touchedVars) } : {}),
+          ...(typeof local.cacheable === 'boolean' ? { cacheable: local.cacheable } : {}),
+        }
+      }
+      console.error(`[display] resolver.applyScripts returned null for owned chat=${context.chatId}; showing raw (no backend fallback)`)
+    } catch (err) {
+      console.error(`[display] resolver.applyScripts threw for owned chat=${context.chatId}; showing raw (no backend fallback)`, err)
+    }
+  }
+  return { result: content, cacheable: false }
+}
+
+// Main-thread reference loop handling every script feature (raw/after capture
+// substitution, match_actions, action decoration). Kept for deterministic
+// reference tests; production display traffic must use the isolated pipeline.
+export async function applyDisplayRegexLocalLoop(
   content: string,
   scripts: RegexScript[],
   context: ApplyDisplayRegexContext,
@@ -958,7 +1030,15 @@ export async function applyDisplayRegexAsync(
 
       for (const trim of script.trim_strings.slice(0, REGEX_LIMITS_V1.maxTrimStrings)) {
         if (trim.length === 0 || regexUtf8ByteLength(trim) > REGEX_LIMITS_V1.maxTrimStringBytes) continue
-        result = result.replaceAll(trim, '')
+        let iterations = 0
+        while (result.includes(trim)) {
+          result = result.replaceAll(trim, '')
+          iterations += 1
+          if (iterations >= MAX_DISPLAY_TRIM_ITERATIONS) {
+            console.warn(`[display] trim loop hit ${MAX_DISPLAY_TRIM_ITERATIONS}-iteration cap, stopping early (script=${script.id} "${script.name}", trim=${JSON.stringify(trim)})`)
+            break
+          }
+        }
       }
       const growth = regexUtf8ByteLength(result) - regexUtf8ByteLength(beforeScript)
       if (growth > 0) asyncExpansionBytes += growth
@@ -968,10 +1048,27 @@ export async function applyDisplayRegexAsync(
       ) {
         result = beforeScript
       }
-    } catch {
-      // Skip invalid regex silently
+    } catch (err) {
+      console.warn(`[display] display regex script threw, skipping (script=${script.id} "${script.name}")`, err)
     }
   }
 
   return { result, cacheable: false }
+}
+
+// Legacy direct-call path retained for compatibility. It no longer falls back
+// to user-authored RegExp execution on the main thread when the backend fails.
+export async function applyDisplayRegexAsync(
+  content: string,
+  scripts: RegexScript[],
+  context: ApplyDisplayRegexContext,
+  _resolveRawTemplates: (templates: Record<string, string>) => Promise<Record<string, string>>,
+): Promise<DisplayRegexBackendResult> {
+  const owned = await applyDisplayRegexViaOwnedResolver(content, scripts, context)
+  if (owned) return owned
+
+  const backendResult = await applyDisplayRegexOnBackend(content, scripts, context)
+  if (backendResult !== null) return backendResult
+
+  return { result: content, cacheable: false }
 }

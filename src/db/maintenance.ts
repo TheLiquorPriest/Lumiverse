@@ -314,6 +314,11 @@ export function applyBaseDatabasePragmas(db: Database): void {
   db.run(`PRAGMA journal_size_limit = ${DEFAULT_JOURNAL_SIZE_LIMIT_BYTES}`);
 }
 
+/** Ask SQLite to release unused page-cache and connection allocations. */
+export function releaseDatabaseMemory(db: Database): void {
+  db.run("PRAGMA shrink_memory");
+}
+
 export function readDatabaseTuningSettings(db: Database, userId?: string | null): DatabaseTuningSettings {
   if (!userId) return {};
   try {

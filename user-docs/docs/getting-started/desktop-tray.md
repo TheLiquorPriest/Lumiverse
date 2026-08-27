@@ -39,7 +39,7 @@ You also need the following build tools:
 | Windows | [Rust](https://rustup.rs/) stable, the Microsoft C++ Build Tools, and WebView2 (included with most Windows 11 installations) |
 | Linux | [Rust](https://rustup.rs/) stable plus the GTK/WebKitGTK and AppIndicator packages listed below |
 
-The tray app uses the same Bun version as Lumiverse: Bun 1.3.13 or later.
+The tray app uses the same Bun version as Lumiverse: Bun 1.4.0 or later.
 
 ### Linux dependencies
 

@@ -125,14 +125,20 @@ const MAX_REGEX_ACTION_FIELD_LENGTH = REGEX_LIMITS_V1.maxActionBytes;
 const REGEX_ACTION_ID_RE = /^[A-Za-z][A-Za-z0-9_:.-]{0,63}$/;
 const REGEX_ACTION_STATE_KEY_RE = /^[A-Za-z][A-Za-z0-9_:.-]{0,127}$/;
 const PRESET_REGEX_ENABLED_SETTING_PREFIX = "presetRegexEnabled:";
-const IMPORTED_CHARACTER_SCRIPT_ID_METADATA_KEY = "imported_script_id";
+const IMPORTED_SOURCE_SCRIPT_ID_METADATA_KEY = "imported_script_id";
+const SPINDLE_EXTENSION_REGEX_METADATA_KEY = "_lumiverse_spindle_extension";
+const MAX_REGEX_FOLDER_VERSION_LENGTH = 100;
 
 interface RegexMutationContext {
   activePresetId?: string | null;
-  /** When present, restrict this mutation to unbound rows owned by this extension. */
+  /** Identifies the calling extension and applies the default ownership boundary. */
   extensionIdentifier?: string;
   /** Imported data is retained disabled with a repair code instead of rejected. */
   foreignImport?: boolean;
+  /** Explicitly-authorized editors may mutate rows outside their extension ownership boundary. */
+  allowUnownedMutation?: boolean;
+  /** Present only when a Spindle mutation explicitly supplied folder_version. */
+  extensionFolderVersion?: unknown;
 }
 
 const EXTENSION_REGEX_OWNERSHIP_ERROR = "Regex script is not an unbound script owned by this extension";
@@ -326,6 +332,43 @@ export function reportRegexScriptPerformance(
   );
   emitRegexChanged(userId, id);
   return { script: getRegexScript(userId, id), newlyFlagged: true, cleared: false };
+}
+
+// Client-side evidence persistence for the display-regex execution tiers
+// (metadata.regex_evidence.quarantined). Quarantine deliberately survives a
+// script edit: a pattern that hung the executor stays skipped until the user
+// clears it from the panel, which sends `quarantined: false` and deletes the
+// key here. Timing evidence used to live alongside it and was removed — no
+// consumer read it, so it could never affect tier selection.
+export function reportRegexScriptEvidence(
+  userId: string,
+  id: string,
+  patch: { quarantined?: boolean },
+): RegexScript | null {
+  const script = getRegexScript(userId, id);
+  if (!script) return null;
+
+  const metadata: Record<string, any> =
+    script.metadata && typeof script.metadata === "object" ? { ...script.metadata } : {};
+  const evidence =
+    metadata.regex_evidence && typeof metadata.regex_evidence === "object" ? { ...metadata.regex_evidence } : {};
+
+  if (patch.quarantined !== undefined) {
+    if (patch.quarantined) {
+      evidence.quarantined = true;
+    } else {
+      delete evidence.quarantined;
+    }
+  }
+
+  metadata.regex_evidence = evidence;
+  getDb().query("UPDATE regex_scripts SET metadata = ? WHERE id = ? AND user_id = ?").run(
+    JSON.stringify(metadata),
+    id,
+    userId,
+  );
+  emitRegexChanged(userId, id);
+  return getRegexScript(userId, id);
 }
 
 function resolveCreateDisabledState(input: CreateRegexScriptInput, activePresetId: string | null): boolean {
@@ -848,6 +891,76 @@ function isPlainMetadataRecord(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+interface SpindleExtensionRegexAttribution {
+  identifier: string;
+  version: string;
+}
+
+function getSpindleExtensionRegexAttribution(metadata: unknown): SpindleExtensionRegexAttribution | null {
+  if (!isPlainMetadataRecord(metadata)) return null;
+  const raw = metadata[SPINDLE_EXTENSION_REGEX_METADATA_KEY];
+  if (!isPlainMetadataRecord(raw)) return null;
+  const identifier = normalizeOptionalId(raw.identifier);
+  const version = normalizeOptionalId(raw.version);
+  return identifier && version ? { identifier, version } : null;
+}
+
+/** Return trusted folder-version attribution for a Spindle-owned regex script. */
+export function getSpindleExtensionRegexFolderVersion(
+  script: Pick<RegexScript, "folder" | "owner_extension_identifier" | "metadata">,
+): string | null {
+  const owner = normalizeOptionalId(script.owner_extension_identifier);
+  if (!owner || !normalizeOptionalId(script.folder)) return null;
+  const attribution = getSpindleExtensionRegexAttribution(script.metadata);
+  return attribution?.identifier === owner ? attribution.version : null;
+}
+
+function validateExtensionFolderVersion(context?: RegexMutationContext): string | null {
+  if (!context || !Object.prototype.hasOwnProperty.call(context, "extensionFolderVersion")) return null;
+  const value = context.extensionFolderVersion;
+  if (value !== null && value !== undefined && typeof value !== "string") {
+    return "folder_version must be a string or null";
+  }
+  if (typeof value === "string" && value.trim().length > MAX_REGEX_FOLDER_VERSION_LENGTH) {
+    return `folder_version exceeds maximum length (${MAX_REGEX_FOLDER_VERSION_LENGTH} characters)`;
+  }
+  return null;
+}
+
+function applySpindleExtensionRegexAttribution<T extends CreateRegexScriptInput | UpdateRegexScriptInput>(
+  input: T,
+  extensionIdentifier: string,
+  context: RegexMutationContext,
+  existing?: RegexScript,
+): T {
+  const suppliedVersion = Object.prototype.hasOwnProperty.call(context, "extensionFolderVersion");
+  const shouldWriteMetadata = !existing
+    || input.metadata !== undefined
+    || input.folder !== undefined
+    || suppliedVersion;
+  if (!shouldWriteMetadata) return { ...input };
+
+  const metadataSource = input.metadata !== undefined ? input.metadata : existing?.metadata;
+  const metadata = isPlainMetadataRecord(metadataSource) ? { ...metadataSource } : {};
+  delete metadata[SPINDLE_EXTENSION_REGEX_METADATA_KEY];
+
+  const existingAttribution = existing
+    ? getSpindleExtensionRegexAttribution(existing.metadata)
+    : null;
+  const version = suppliedVersion
+    ? normalizeOptionalId(context.extensionFolderVersion)
+    : existingAttribution?.identifier === extensionIdentifier
+      ? existingAttribution.version
+      : null;
+  const folder = input.folder !== undefined ? input.folder : existing?.folder;
+
+  if (version && normalizeOptionalId(folder)) {
+    metadata[SPINDLE_EXTENSION_REGEX_METADATA_KEY] = { identifier: extensionIdentifier, version };
+  }
+
+  return { ...input, metadata };
+}
+
 function mapRegexScriptPersistenceError(err: unknown): string | null {
   const message = err instanceof Error ? err.message : String(err ?? "");
   if (
@@ -866,11 +979,86 @@ function prepareCharacterBoundImportedScript<T extends Record<string, any>>(inpu
   const metadata = isPlainMetadataRecord(input.metadata) ? { ...input.metadata } : {};
   metadata.source = source;
   if (importedScriptId) {
-    metadata[IMPORTED_CHARACTER_SCRIPT_ID_METADATA_KEY] = importedScriptId;
+    metadata[IMPORTED_SOURCE_SCRIPT_ID_METADATA_KEY] = importedScriptId;
   }
 
   // Character-bound regexes are rebound per imported character, so their
   // script_id must not remain globally unique across the whole user.
+  return {
+    ...input,
+    script_id: "",
+    metadata,
+  };
+}
+
+export interface PresetBoundRegexAttribution {
+  source?: "lumihub" | "illarin";
+  remotePresetId?: string | null;
+  /** Legacy LumiHub call-site alias. */
+  hubPresetId?: string | null;
+  presetVersion?: string | null;
+  folderName?: string | null;
+}
+
+interface RemotePresetRegexAttribution {
+  id: string | null;
+  version: string | null;
+  folderName: string | null;
+}
+
+type RemotePresetRegexSource = "lumihub" | "illarin";
+
+function remotePresetMetadataKey(source: RemotePresetRegexSource): string {
+  return source === "lumihub" ? "_lumiverse_lumihub_preset" : "_lumiverse_illarin_preset";
+}
+
+function remotePresetLabel(source: RemotePresetRegexSource): string {
+  return source === "lumihub" ? "LumiHub" : "Illarin";
+}
+
+function getRemotePresetRegexAttribution(
+  metadata: unknown,
+  source: RemotePresetRegexSource,
+): RemotePresetRegexAttribution | null {
+  if (!isPlainMetadataRecord(metadata)) return null;
+  const raw = metadata[remotePresetMetadataKey(source)];
+  if (!isPlainMetadataRecord(raw)) return null;
+  const id = normalizeOptionalId(raw.id);
+  const version = normalizeOptionalId(raw.version);
+  const folderName = normalizeOptionalId(raw.folderName);
+  return id || version ? { id, version, folderName } : null;
+}
+
+/**
+ * Preset bundles may reuse a publisher-defined script_id that already exists in
+ * another local preset. Keep that ID as provenance metadata (the macro resolver
+ * already scopes it to the active preset) instead of competing for the user's
+ * globally-unique script_id column.
+ */
+function preparePresetBoundImportedScript<T extends Record<string, any>>(
+  input: T,
+  attribution?: PresetBoundRegexAttribution,
+): T {
+  const importedScriptId = typeof input.script_id === "string"
+    ? normalizeScriptId(input.script_id)
+    : "";
+  const metadata = isPlainMetadataRecord(input.metadata) ? { ...input.metadata } : {};
+  if (importedScriptId) metadata[IMPORTED_SOURCE_SCRIPT_ID_METADATA_KEY] = importedScriptId;
+
+  if (attribution?.source === "lumihub") {
+    metadata._lumiverse_lumihub_preset = {
+      id: normalizeOptionalId(attribution.remotePresetId ?? attribution.hubPresetId),
+      version: normalizeOptionalId(attribution.presetVersion),
+      folderName: normalizeOptionalId(attribution.folderName),
+    };
+  } else if (attribution?.source === "illarin") {
+    metadata._lumiverse_illarin_preset = {
+      id: normalizeOptionalId(attribution.remotePresetId),
+      version: normalizeOptionalId(attribution.presetVersion),
+      folderName: normalizeOptionalId(attribution.folderName),
+    };
+  }
+
   return {
     ...input,
     script_id: "",
@@ -998,9 +1186,14 @@ export function createRegexScript(
   context?: RegexMutationContext,
 ): RegexScript | string {
   const extensionIdentifier = normalizeOptionalId(context?.extensionIdentifier);
-  const nextInput: CreateRegexScriptInput = extensionIdentifier
+  let nextInput: CreateRegexScriptInput = extensionIdentifier
     ? { ...input, pack_id: null, preset_id: null, character_id: null }
     : { ...input };
+  if (extensionIdentifier && context) {
+    const folderVersionError = validateExtensionFolderVersion(context);
+    if (folderVersionError) return folderVersionError;
+    nextInput = applySpindleExtensionRegexAttribution(nextInput, extensionIdentifier, context);
+  }
   let validation = validateInput(nextInput, true);
   if (!validation) {
     validation = validateRegex(nextInput.find_regex, nextInput.flags ?? "gi", nextInput.substitute_macros ?? "none");
@@ -1086,14 +1279,27 @@ export function updateRegexScript(
   if (extensionIdentifier && (
     existing.owner_extension_identifier !== extensionIdentifier
     || existing.preset_id !== null
-  )) {
+  ) && !context?.allowUnownedMutation) {
     return EXTENSION_REGEX_OWNERSHIP_ERROR;
   }
 
   const activePresetId = normalizeOptionalId(context?.activePresetId);
   const isPresetBound = !!existing.preset_id;
-  const nextInput: UpdateRegexScriptInput = { ...input };
+  let nextInput: UpdateRegexScriptInput = { ...input };
   if (extensionIdentifier) {
+    const folderVersionError = validateExtensionFolderVersion(context);
+    if (folderVersionError) return folderVersionError;
+    if (existing.owner_extension_identifier === extensionIdentifier) {
+      nextInput = applySpindleExtensionRegexAttribution(nextInput, extensionIdentifier, context!, existing);
+    } else if (nextInput.metadata !== undefined) {
+      // An unrestricted editor may change ordinary metadata, but must not
+      // spoof or erase another extension's host-validated folder attribution.
+      const metadata = isPlainMetadataRecord(nextInput.metadata) ? { ...nextInput.metadata } : {};
+      const attribution = getSpindleExtensionRegexAttribution(existing.metadata);
+      delete metadata[SPINDLE_EXTENSION_REGEX_METADATA_KEY];
+      if (attribution) metadata[SPINDLE_EXTENSION_REGEX_METADATA_KEY] = attribution;
+      nextInput.metadata = metadata;
+    }
     // These links are host-owned. A script that becomes preset-bound through a
     // native flow automatically becomes read-only to its creating extension.
     delete nextInput.pack_id;
@@ -1107,6 +1313,10 @@ export function updateRegexScript(
       nextInput.scope_id = existing.scope === nextInput.scope ? existing.scope_id : null;
     }
   }
+  // A pattern-affecting edit clears the slow/timed-out warning, since the
+  // measurement described the old shape. The quarantine flag under
+  // metadata.regex_evidence is intentionally left untouched: a script that hung
+  // the executor stays skipped until the user clears it from the panel.
   if (shouldResetRegexPerformance(nextInput)) {
     nextInput.metadata = withoutRegexPerformanceMetadata(nextInput.metadata ?? existing.metadata);
   }
@@ -1229,7 +1439,7 @@ export function deleteRegexScript(userId: string, id: string, context?: RegexMut
   if (extensionIdentifier && existing && (
     existing.owner_extension_identifier !== extensionIdentifier
     || existing.preset_id !== null
-  )) {
+  ) && !context?.allowUnownedMutation) {
     return EXTENSION_REGEX_OWNERSHIP_ERROR;
   }
   const result = getDb()
@@ -1490,7 +1700,7 @@ export function getRegexScriptByScriptId(
   const presetId = normalizeOptionalId(context?.presetId);
   const conditions = [
     "user_id = ?",
-    `(script_id = ? OR json_extract(metadata, '$.${IMPORTED_CHARACTER_SCRIPT_ID_METADATA_KEY}') = ?)`,
+    `(script_id = ? OR json_extract(metadata, '$.${IMPORTED_SOURCE_SCRIPT_ID_METADATA_KEY}') = ?)`,
   ];
   const params: any[] = [userId, normalizedScriptId, normalizedScriptId];
 
@@ -1643,7 +1853,7 @@ export function substituteRegexCaptures(
   groups: (string | undefined)[],
   offset: number,
   input: string,
-  namedGroups?: Record<string, string>,
+  namedGroups?: Record<string, string | undefined>,
 ): string {
   return substituteRegexCapturesCore(template, fullMatch, groups, offset, input, namedGroups);
 }
@@ -2534,6 +2744,400 @@ export function getRegexScriptsByPresetId(userId: string, presetId: string): Reg
   return rows.map(rowToRegexScript);
 }
 
+export interface RetireLumiHubPresetRegexOptions {
+  presetId: string;
+  hubPresetId: string;
+  previousHubPresetId?: string | null;
+  previousVersion?: string | null;
+  incomingVersion?: string | null;
+  presetName: string;
+  preserveIds?: string[];
+}
+
+export interface RetireLumiHubPresetRegexResult {
+  archivedIds: string[];
+  replacedIds: string[];
+}
+
+interface RetireRemotePresetRegexOptions {
+  source: RemotePresetRegexSource;
+  presetId: string;
+  remotePresetId: string;
+  previousRemotePresetId?: string | null;
+  previousVersion?: string | null;
+  incomingVersion?: string | null;
+  presetName: string;
+  preserveIds?: string[];
+}
+
+function versionLabel(version: string | null): string {
+  if (!version) return "previous";
+  return /^v/i.test(version) ? version : `v${version}`;
+}
+
+/** Recover the author-provided source folder for older rows that predate explicit storage. */
+function getRemotePresetSourceFolder(
+  script: Pick<RegexScript, "folder">,
+  attribution: RemotePresetRegexAttribution | null,
+  fallback: string,
+  version: string | null,
+  source: RemotePresetRegexSource,
+): string {
+  const stored = normalizeOptionalId(attribution?.folderName);
+  if (stored) return stored;
+
+  const folder = normalizeOptionalId(script.folder);
+  if (!folder) return fallback;
+  const label = remotePresetLabel(source);
+  const currentMatch = folder.match(new RegExp(`^(.*?) · ${label}(?: \\(\\d+\\))?$`));
+  if (currentMatch?.[1]?.trim()) return currentMatch[1].trim();
+  const historicalSuffix = ` · ${versionLabel(version)}`;
+  if (folder.endsWith(historicalSuffix)) return folder.slice(0, -historicalSuffix.length).trim() || fallback;
+  return folder;
+}
+
+function chooseAvailableRegexFolder(
+  userId: string,
+  desiredFolder: string,
+  allowedOccupantIds: Set<string>,
+  reserveRemoteNamespace = false,
+  remoteLabel = "LumiHub",
+): string {
+  const db = getDb();
+  const base = desiredFolder.trim() || `${remoteLabel} preset`;
+  const candidates = reserveRemoteNamespace
+    ? [`${base} · ${remoteLabel}`]
+    : [base, `${base} · ${remoteLabel}`];
+
+  for (let suffix = 2; suffix < 1000; suffix++) {
+    candidates.push(`${base} · ${remoteLabel} (${suffix})`);
+  }
+
+  for (const candidate of candidates) {
+    const occupants = db
+      .query("SELECT id FROM regex_scripts WHERE user_id = ? AND folder = ?")
+      .all(userId, candidate) as Array<{ id: string }>;
+    if (occupants.every((row) => allowedOccupantIds.has(row.id))) return candidate;
+  }
+
+  return `${base} · ${remoteLabel} (${Date.now()})`;
+}
+
+/**
+ * Preserve historical remote-preset regex payloads while making an update safe:
+ * older versions are disabled and moved into version-specific folders, while a
+ * repeat install of the incoming version is replaced instead of duplicated.
+ *
+ * Selection is based exclusively on preset ownership plus source attribution.
+ * Folder names are never used to decide which rows to mutate.
+ */
+function retireRemotePresetRegexScriptsForUpdate(
+  userId: string,
+  options: RetireRemotePresetRegexOptions,
+): RetireLumiHubPresetRegexResult {
+  const remotePresetId = normalizeOptionalId(options.remotePresetId);
+  const previousRemotePresetId = normalizeOptionalId(options.previousRemotePresetId);
+  const previousVersion = normalizeOptionalId(options.previousVersion);
+  const incomingVersion = normalizeOptionalId(options.incomingVersion);
+  if (!remotePresetId) return { archivedIds: [], replacedIds: [] };
+
+  const acceptedRemoteIds = new Set([remotePresetId, previousRemotePresetId].filter((id): id is string => !!id));
+  const preserveIds = new Set(options.preserveIds ?? []);
+  const rows = getRegexScriptsByPresetId(userId, options.presetId);
+  const matching = rows.flatMap((script) => {
+    if (preserveIds.has(script.id)) return [];
+    const attribution = getRemotePresetRegexAttribution(script.metadata, options.source);
+    if (attribution?.id && !acceptedRemoteIds.has(attribution.id)) return [];
+
+    // Rows from installations predating explicit per-regex attribution are
+    // still attributable through their preset_id, but only when the containing
+    // preset was already a tracked installation from the same remote source.
+    if (!attribution?.id && !previousRemotePresetId) return [];
+    const version = attribution?.version ?? previousVersion;
+    return [{
+      script,
+      version,
+      folderName: getRemotePresetSourceFolder(script, attribution, options.presetName, version, options.source),
+    }];
+  });
+
+  const replaced = matching.filter(({ version }) => version === incomingVersion);
+  const archived = matching.filter(({ version }) => version !== incomingVersion);
+  const replacedIds = replaced.map(({ script }) => script.id);
+  const archivedIds = archived.map(({ script }) => script.id);
+  const replaceIdSet = new Set(replacedIds);
+  const archiveGroups = new Map<string, { version: string | null; folderName: string; ids: Set<string> }>();
+  const archiveKey = (version: string | null, folderName: string) => `${version ?? ""}\u0000${folderName}`;
+  for (const { script, version, folderName } of archived) {
+    const key = archiveKey(version, folderName);
+    const group = archiveGroups.get(key) ?? { version, folderName, ids: new Set<string>() };
+    group.ids.add(script.id);
+    archiveGroups.set(key, group);
+  }
+
+  const foldersByArchiveKey = new Map<string, string>();
+  for (const [key, group] of archiveGroups) {
+    const allowedOccupants = new Set([...group.ids, ...replaceIdSet]);
+    const desired = `${group.folderName} · ${versionLabel(group.version)}`;
+    foldersByArchiveKey.set(key, chooseAvailableRegexFolder(
+      userId,
+      desired,
+      allowedOccupants,
+      false,
+      remotePresetLabel(options.source),
+    ));
+  }
+
+  const db = getDb();
+  const now = Math.floor(Date.now() / 1000);
+  db.transaction(() => {
+    const deleteRow = db.query("DELETE FROM regex_scripts WHERE id = ? AND user_id = ?");
+    for (const { script } of replaced) deleteRow.run(script.id, userId);
+
+    const updateRow = db.query(
+      "UPDATE regex_scripts SET disabled = 1, folder = ?, metadata = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+    );
+    for (const { script, version, folderName } of archived) {
+      const metadata = isPlainMetadataRecord(script.metadata) ? { ...script.metadata } : {};
+      metadata[remotePresetMetadataKey(options.source)] = { id: remotePresetId, version, folderName };
+      updateRow.run(
+        foldersByArchiveKey.get(archiveKey(version, folderName))!,
+        JSON.stringify(metadata),
+        now,
+        script.id,
+        userId,
+      );
+    }
+
+    // Switching back to this preset must never revive a historical version.
+    writeStoredPresetRegexIdsWithDb(db, userId, options.presetId, []);
+  })();
+
+  for (const id of replacedIds) eventBus.emit(EventType.REGEX_SCRIPT_DELETED, { id }, userId);
+  for (const id of archivedIds) emitRegexChanged(userId, id);
+  return { archivedIds, replacedIds };
+}
+
+export function retireLumiHubPresetRegexScriptsForUpdate(
+  userId: string,
+  options: RetireLumiHubPresetRegexOptions,
+): RetireLumiHubPresetRegexResult {
+  return retireRemotePresetRegexScriptsForUpdate(userId, {
+    source: "lumihub",
+    presetId: options.presetId,
+    remotePresetId: options.hubPresetId,
+    previousRemotePresetId: options.previousHubPresetId,
+    previousVersion: options.previousVersion,
+    incomingVersion: options.incomingVersion,
+    presetName: options.presetName,
+    preserveIds: options.preserveIds,
+  });
+}
+
+/** Pick a current-version folder without merging into an unrelated local folder. */
+function resolveRemotePresetRegexInstallFolder(
+  source: RemotePresetRegexSource,
+  userId: string,
+  presetId: string,
+  remotePresetId: string,
+  presetName: string,
+  sourceFolder = presetName,
+): string {
+  const normalizedRemoteId = normalizeOptionalId(remotePresetId);
+  const normalizedSourceFolder = normalizeOptionalId(sourceFolder) ?? presetName;
+  const allowedIds = new Set(
+    getRegexScriptsByPresetId(userId, presetId)
+      .filter((script) => {
+        const attribution = getRemotePresetRegexAttribution(script.metadata, source);
+        return attribution?.id === normalizedRemoteId
+          && getRemotePresetSourceFolder(script, attribution, presetName, attribution.version, source) === normalizedSourceFolder;
+      })
+      .map((script) => script.id),
+  );
+  // The unqualified preset name is user-owned namespace. Even if an older
+  // remote installation is the only current occupant, do not reuse it: a
+  // user can later add local regexes to that folder and the UI groups solely
+  // by folder name. The current remote payload always gets a reserved folder.
+  return chooseAvailableRegexFolder(userId, normalizedSourceFolder, allowedIds, true, remotePresetLabel(source));
+}
+
+export function resolveLumiHubPresetRegexInstallFolder(
+  userId: string,
+  presetId: string,
+  hubPresetId: string,
+  presetName: string,
+  sourceFolder = presetName,
+): string {
+  return resolveRemotePresetRegexInstallFolder(
+    "lumihub", userId, presetId, hubPresetId, presetName, sourceFolder,
+  );
+}
+
+export function resolveIllarinPresetRegexInstallFolder(
+  userId: string,
+  presetId: string,
+  assetId: string,
+  presetName: string,
+  sourceFolder = presetName,
+): string {
+  return resolveRemotePresetRegexInstallFolder(
+    "illarin", userId, presetId, assetId, presetName, sourceFolder,
+  );
+}
+
+export interface InstallLumiHubPresetRegexOptions {
+  presetId: string;
+  presetName: string;
+  hubPresetId: string;
+  presetVersion?: string | null;
+  scripts: any[];
+  previous?: {
+    hubPresetId?: string | null;
+    version?: string | null;
+    presetName?: string | null;
+  } | null;
+}
+
+export interface InstallIllarinPresetRegexOptions {
+  presetId: string;
+  presetName: string;
+  assetId: string;
+  presetVersion?: string | null;
+  scripts: any[];
+  previous?: {
+    assetId?: string | null;
+    version?: string | null;
+    presetName?: string | null;
+  } | null;
+}
+
+interface InstallRemotePresetRegexOptions {
+  source: RemotePresetRegexSource;
+  presetId: string;
+  presetName: string;
+  remotePresetId: string;
+  presetVersion?: string | null;
+  scripts: any[];
+  previous?: {
+    remotePresetId?: string | null;
+    version?: string | null;
+    presetName?: string | null;
+  } | null;
+}
+
+/**
+ * Stage a remote preset's regex payload before retiring the previous version. A partial
+ * import is removed and the old restore-list is reinstated, leaving the prior
+ * working set untouched.
+ */
+function installRemotePresetRegexScripts(
+  userId: string,
+  options: InstallRemotePresetRegexOptions,
+): { imported: number; archived: number; replaced: number; folder: string | null } {
+  const previousRestore = readStoredPresetRegexIdsRecord(userId, options.presetId);
+  const beforeIds = new Set(getRegexScriptsByPresetId(userId, options.presetId).map((script) => script.id));
+  let newIds: string[] = [];
+  let folder: string | null = null;
+
+  try {
+    if (options.scripts.length > 0) {
+      const imported = importPresetBoundRegexScripts(
+        userId,
+        options.presetId,
+        options.presetName,
+        options.scripts,
+        {
+          source: options.source,
+          remotePresetId: options.remotePresetId,
+          presetVersion: options.presetVersion,
+        },
+      );
+      newIds = getRegexScriptsByPresetId(userId, options.presetId)
+        .filter((script) => !beforeIds.has(script.id))
+        .map((script) => script.id);
+      folder = newIds.length > 0 ? getRegexScript(userId, newIds[0])?.folder ?? null : null;
+      if (imported.skipped > 0 || imported.imported !== options.scripts.length) {
+        throw new Error(`${remotePresetLabel(options.source)} preset regex import was incomplete (${imported.imported}/${options.scripts.length})`);
+      }
+    }
+
+    const nextRestore = options.scripts.length > 0
+      ? readStoredPresetRegexIdsRecord(userId, options.presetId).ids
+      : [];
+    const retired = options.previous
+      ? retireRemotePresetRegexScriptsForUpdate(userId, {
+          source: options.source,
+          presetId: options.presetId,
+          remotePresetId: options.remotePresetId,
+          previousRemotePresetId: options.previous.remotePresetId,
+          previousVersion: options.previous.version,
+          incomingVersion: options.presetVersion,
+          presetName: normalizeOptionalId(options.previous.presetName) ?? options.presetName,
+          preserveIds: newIds,
+        })
+      : { archivedIds: [], replacedIds: [] };
+
+    // Retirement clears the old restore-list. Reapply only the staged version's
+    // author-enabled IDs, including an intentionally empty list.
+    writeStoredPresetRegexIdsWithDb(getDb(), userId, options.presetId, nextRestore);
+    return {
+      imported: newIds.length,
+      archived: retired.archivedIds.length,
+      replaced: retired.replacedIds.length,
+      folder,
+    };
+  } catch (error) {
+    newIds = getRegexScriptsByPresetId(userId, options.presetId)
+      .filter((script) => !beforeIds.has(script.id))
+      .map((script) => script.id);
+    if (newIds.length > 0) deleteRegexScripts(userId, newIds);
+    if (previousRestore.exists) {
+      writeStoredPresetRegexIdsWithDb(getDb(), userId, options.presetId, previousRestore.ids);
+    } else {
+      deleteStoredPresetRegexIds(userId, options.presetId);
+    }
+    throw error;
+  }
+}
+
+export function installLumiHubPresetRegexScripts(
+  userId: string,
+  options: InstallLumiHubPresetRegexOptions,
+): { imported: number; archived: number; replaced: number; folder: string | null } {
+  return installRemotePresetRegexScripts(userId, {
+    source: "lumihub",
+    presetId: options.presetId,
+    presetName: options.presetName,
+    remotePresetId: options.hubPresetId,
+    presetVersion: options.presetVersion,
+    scripts: options.scripts,
+    previous: options.previous ? {
+      remotePresetId: options.previous.hubPresetId,
+      version: options.previous.version,
+      presetName: options.previous.presetName,
+    } : null,
+  });
+}
+
+export function installIllarinPresetRegexScripts(
+  userId: string,
+  options: InstallIllarinPresetRegexOptions,
+): { imported: number; archived: number; replaced: number; folder: string | null } {
+  return installRemotePresetRegexScripts(userId, {
+    source: "illarin",
+    presetId: options.presetId,
+    presetName: options.presetName,
+    remotePresetId: options.assetId,
+    presetVersion: options.presetVersion,
+    scripts: options.scripts,
+    previous: options.previous ? {
+      remotePresetId: options.previous.assetId,
+      version: options.previous.version,
+      presetName: options.previous.presetName,
+    } : null,
+  });
+}
+
 export function activatePresetBoundRegexScripts(userId: string, presetId?: string | null): { changedIds: string[]; restoredIds: string[] } {
   const targetPresetId = normalizeOptionalId(presetId);
   const db = getDb();
@@ -2920,6 +3524,7 @@ export function importPresetBoundRegexScripts(
   presetId: string,
   presetName: string,
   scripts: any[],
+  attribution?: PresetBoundRegexAttribution,
 ): { imported: number; skipped: number } {
   if (!Array.isArray(scripts) || scripts.length === 0) {
     return { imported: 0, skipped: 0 };
@@ -2937,9 +3542,26 @@ export function importPresetBoundRegexScripts(
       continue;
     }
     const before = new Set(getRegexScriptsByPresetId(userId, presetId).map((s) => s.id));
+    // Keep the publisher's folder grouping, but namespace it for this remote
+    // installation so a local folder with the same author-provided name cannot
+    // be merged into it.
+    const sourceFolder = normalizeOptionalId(script.folder) ?? presetName;
+    const remoteSource = attribution?.source;
+    const remotePresetId = remoteSource
+      ? normalizeOptionalId(attribution.remotePresetId ?? attribution.hubPresetId)
+      : null;
+    const folder = remoteSource && remotePresetId
+      ? resolveRemotePresetRegexInstallFolder(remoteSource, userId, presetId, remotePresetId, presetName, sourceFolder)
+      : normalizeOptionalId(attribution?.folderName) ?? sourceFolder;
+    const scriptAttribution = remoteSource
+      ? { ...attribution, folderName: sourceFolder }
+      : attribution;
     const result = importRegexScripts(userId, {
-      scripts: [script],
-      folder: presetName,
+      scripts: [{
+        ...preparePresetBoundImportedScript(script, scriptAttribution),
+        folder,
+      }],
+      folder,
       preset_id: presetId,
     });
     imported += result.imported;
@@ -2951,12 +3573,10 @@ export function importPresetBoundRegexScripts(
     }
   }
 
-  // Seed the restore-list so author-enabled scripts activate on the next switch
-  // to this preset. If every script shipped disabled we leave no record — the
-  // activation default (enable currently-undisabled rows) then correctly enables none.
-  if (enabledIds.length > 0) {
-    updateStoredPresetRegexIds(userId, presetId, () => enabledIds);
-  }
+  // Replace the restore-list so only this imported version's author-enabled
+  // scripts can activate. Persist an empty list too; otherwise an older
+  // version's IDs could be restored when every new script ships disabled.
+  updateStoredPresetRegexIds(userId, presetId, () => enabledIds);
 
   return { imported, skipped };
 }

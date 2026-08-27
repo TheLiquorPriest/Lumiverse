@@ -5,6 +5,7 @@
      1 these resolve to the unmodified glass colors, so the look is unchanged. */
   --lcs-bubble-bg: color-mix(in srgb, var(--lcs-glass-bg) calc(var(--lcs-bubble-opacity, 1) * 100%), transparent);
   --lcs-bubble-bg-hover: color-mix(in srgb, var(--lcs-glass-bg-hover, rgba(24, 22, 36, 0.65)) calc(var(--lcs-bubble-opacity, 1) * 100%), transparent);
+  --long-message-fade-color: var(--lcs-bubble-bg);
   display: flex;
   flex-shrink: 0;
   gap: 10px;

@@ -44,6 +44,12 @@ const HTML_TAG_REGEXES = HTML_FORMAT_TAGS.map((tag) => ({
   close: new RegExp(`</${tag}>`, "gi"),
 }));
 
+// <details>/<summary> are authored Markdown structure, not disposable HTML
+// islands. The dedicated details-block context filter is the sole owner of
+// removing them. Protect complete boxes here so HTML cleanup cannot remove or
+// mutate either their tags or anything nested inside them.
+const MARKDOWN_DETAILS_TAG_PATTERN = /<\s*(\/?)\s*(details|summary)\b[^>]*>/gi;
+
 const MAX_FILTER_ITERATIONS = 20;
 
 // ---------------------------------------------------------------------------
@@ -87,14 +93,52 @@ export function stripLoomTags(content: string): string {
   return result;
 }
 
-/**
- * Strip HTML markup from chat-history context.
- *
- * Inline formatting wrappers keep their authored text. Block-level/custom
- * elements are treated as UI islands and removed wholesale so embedded HTML
- * widgets do not leak code, labels, or layout text into the prompt.
- */
-export function stripHtmlFormattingTags(content: string): string {
+/** Run a transformation only outside complete (or trailing unclosed) Markdown details markup. */
+function transformOutsideMarkdownDetails(
+  content: string,
+  transform: (outside: string) => string,
+): string {
+  const pattern = new RegExp(MARKDOWN_DETAILS_TAG_PATTERN.source, "gi");
+  const stack: string[] = [];
+  let protectedStart = -1;
+  let cursor = 0;
+  let result = "";
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(content)) !== null) {
+    const isClosing = match[1] === "/";
+    const tag = match[2].toLowerCase();
+    const isSelfClosing = /\/\s*>$/.test(match[0]);
+
+    if (!isClosing && !isSelfClosing) {
+      if (stack.length === 0) {
+        result += transform(content.slice(cursor, match.index));
+        protectedStart = match.index;
+      }
+      stack.push(tag);
+      continue;
+    }
+
+    if (isClosing && stack.at(-1) === tag) {
+      stack.pop();
+      if (stack.length === 0) {
+        result += content.slice(protectedStart, pattern.lastIndex);
+        cursor = pattern.lastIndex;
+        protectedStart = -1;
+      }
+    }
+  }
+
+  // Preserve an interrupted generation's unclosed details/summary block too.
+  if (stack.length > 0 && protectedStart >= 0) {
+    return result + content.slice(protectedStart);
+  }
+
+  return result + transform(content.slice(cursor));
+}
+
+/** Strip disposable HTML markup from a segment known not to contain details markup. */
+function stripHtmlOutsideMarkdownDetails(content: string): string {
   let result = content;
 
   result = result.replace(/<\s*br\s*\/?>/gi, "\n");
@@ -130,6 +174,21 @@ export function stripHtmlFormattingTags(content: string): string {
     result = result.replace(open, "");
     result = result.replace(close, "");
   }
+
+  return result;
+}
+
+/**
+ * Strip HTML markup from chat-history context.
+ *
+ * Inline formatting wrappers keep their authored text. Block-level/custom
+ * elements are treated as UI islands and removed wholesale so embedded HTML
+ * widgets do not leak code, labels, or layout text into the prompt.
+ * Authored Markdown <details>/<summary> boxes are always preserved; only the
+ * dedicated details-block context filter may remove them.
+ */
+export function stripHtmlFormattingTags(content: string): string {
+  let result = transformOutsideMarkdownDetails(content, stripHtmlOutsideMarkdownDetails);
 
   result = result.replace(/[ \t\f\v]*\n[ \t\f\v]*/g, "\n");
   result = result.replace(/[ \t\f\v]{2,}/g, " ");

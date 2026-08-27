@@ -243,6 +243,9 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
   const state = useStore.getState()
   if (state.activeChatId !== chatId) return 'ignored'
   if (state.mpRoomId && !state.mpIsHost && state.mpChatId === chatId) return 'ignored'
+  // Chat exit keeps one frozen stream frame mounted for its short animation.
+  // Recovery must not resume writes into that fading subtree.
+  if (state.streamingNavigationPaused) return 'ignored'
 
   const request = captureGenerationRequest(chatId, state.activeGenerationId)
 

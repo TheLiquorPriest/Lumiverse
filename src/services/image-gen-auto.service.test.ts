@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "path";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { registerImageProvider } from "../image-gen/registry";
@@ -9,6 +9,7 @@ import * as charactersSvc from "./characters.service";
 import * as chatsSvc from "./chats.service";
 import * as imageGenConnSvc from "./image-gen-connections.service";
 import { maybeAutoGenerateOnReply } from "./image-gen-auto.service";
+import { waitForDeferredImageProcessing } from "./images.service";
 import * as settingsSvc from "./settings.service";
 
 const PROVIDER_NAME = "autogen_fallback_test";
@@ -54,13 +55,6 @@ async function applyBaseline(): Promise<void> {
   const db = getDb();
   db.run("PRAGMA foreign_keys = OFF");
   db.run(sql);
-  db.run("ALTER TABLE images ADD COLUMN owner_extension_identifier TEXT");
-  db.run("ALTER TABLE images ADD COLUMN owner_character_id TEXT REFERENCES characters(id) ON DELETE SET NULL");
-  db.run("ALTER TABLE images ADD COLUMN owner_chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL");
-  // 113: server-owned provenance for public image-gen responses; the save
-  // path writes this column, so mirror the migration in the fixture schema.
-  db.run(`ALTER TABLE images ADD COLUMN public_provenance TEXT
-    CHECK(public_provenance IS NULL OR public_provenance = 'server_image_generation_v1')`);
 }
 
 async function seedChatWithAssistantReply(userId: string) {
@@ -151,6 +145,10 @@ describe("image-gen auto fallback", () => {
       eventBus.removeSessionVisibility(userId, sessionId);
     }
   });
+});
+
+afterEach(async () => {
+  await waitForDeferredImageProcessing();
 });
 
 afterAll(() => {

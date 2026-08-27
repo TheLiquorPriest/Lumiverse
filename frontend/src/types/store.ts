@@ -44,6 +44,9 @@ export interface ChatSlice {
   activeChatName: string | null
   messages: Message[]
   isStreaming: boolean
+  /** True while the chat is fading out to another route. The last rendered
+   * stream frame stays visible, but live/recovery writes are paused. */
+  streamingNavigationPaused: boolean
   streamingContent: string
   streamingReasoning: string
   streamingReasoningDuration: number | null
@@ -86,7 +89,18 @@ export interface ChatSlice {
    */
   landingRecentChats: PaginatedResult<GroupedRecentChat> | null
   setLandingRecentChats: (result: PaginatedResult<GroupedRecentChat> | null) => void
-  setActiveChat: (chatId: string | null, characterId?: string | null) => void
+  setActiveChat: (
+    chatId: string | null,
+    characterId?: string | null,
+    hydration?: {
+      messages: Message[]
+      total: number
+      displayOwner: string | null
+      name: string | null
+      metadata: Record<string, any> | null
+      wallpaper: WallpaperRef | null
+    },
+  ) => void
   setActiveChatWallpaper: (wallpaper: WallpaperRef | null) => void
   setActiveChatAvatarId: (imageId: string | null) => void
   setActiveChatMetadata: (metadata: Record<string, any> | null) => void
@@ -100,6 +114,7 @@ export interface ChatSlice {
   removeMessage: (id: string) => void
   beginStreaming: (regeneratingMessageId?: string, generationType?: string) => void
   startStreaming: (generationId: string, regeneratingMessageId?: string, generationType?: string) => void
+  pauseStreamingForNavigation: () => void
   /** Append a live stream segment. When `offset` (char position of the segment
    *  start in the server's cumulative buffer) is provided, overlap with already-
    *  rendered content is sliced off exactly; returns 'gap' when the segment
@@ -297,6 +312,7 @@ export interface StartupSettings {
   drawerSettings?: DrawerSettings
   spindleSettings?: Partial<SpindleSettings>
   connectionsOrder?: Partial<Record<'llm' | 'imageGen' | 'stt' | 'tts', string[]>>
+  activeProfileId?: string | null
 }
 
 export interface CharactersSlice {
@@ -466,6 +482,7 @@ export interface UISlice {
   closeDrawer: () => void
   setDrawerTab: (tab: string) => void
   openSettings: (view?: string, target?: { extensionId?: string; anchorId?: string }) => void
+  setSettingsActiveView: (view: string) => void
   closeSettings: () => void
   togglePortraitPanel: () => void
   openCommandPalette: () => void
@@ -536,6 +553,8 @@ export interface RegenFeedbackSettings {
   enabled: boolean
   position: RegenFeedbackPosition
   includePreviousGeneration: boolean
+  /** Freeform prompt template. {{$regenInput}} is replaced with the submitted feedback. */
+  format: string
 }
 
 // ---- Reasoning Settings ----
@@ -578,6 +597,10 @@ export interface ReasoningSettings {
   /** Anthropic-only. Maps to `thinking.display` in the Messages API request body.
    *  'auto' leaves the field unset so the API picks a model-appropriate default. */
   thinkingDisplay: ThinkingDisplay
+  /** Z.AI-only. Omitted means use Z.AI's API/model default. */
+  clearThinking?: boolean
+  /** Google Gemini / Vertex only. Replays optional non-tool thought signatures. */
+  replayThoughtSignatures?: boolean
   /**
    * Extra request-body fields. Omitted for legacy settings so the backend can
    * continue honoring an old preset-level custom body until this is saved.
@@ -710,11 +733,49 @@ export interface QuickToolbarSettings {
   rectVersion: number
   /** Undefined keeps the responsive default: hide only on mobile overlays. */
   hideWhenOverlaid?: boolean
+  /** Dock-chrome hide only. Undefined/false keeps the docked toolbar in `chat_top_dock`. */
+  hideInChatTopDock?: boolean
   modalRestoreHandle: boolean
   v2IconSize: number
   v2LabelTextSize: number
   v2LabelVisible: boolean
   v2Density: QuickToolbarDensity
+  /** Optional V2 chrome overrides used by the host surface. */
+  gap?: number
+  padding?: number
+  /** One-time migration marker for stale V2 floating rail rectangles. */
+  v2ViewportGeometryVersion?: 2
+  quickToolbarPlacement?: 'floating' | 'chat_top_dock'
+  autoFitBounds?: boolean
+  v2IconOnly?: boolean
+  /** Stretch docked V2 across leftover `.chatToolbar` width. Default on. */
+  fillTopDockWidth?: boolean
+  /** Native ChatView ListChecks. Default on (`!== false`). */
+  showNativeSelectMessages?: boolean
+  /** Native ChatView ArrowUp (Go to oldest message). Default on (`!== false`). */
+  showNativeScrollToTop?: boolean
+  /** Native ChatView List (Browse messages). Default on (`!== false`). */
+  showNativeBrowseMessages?: boolean
+  editAndSendSide?: 'left' | 'right'
+  branchChatOnEditAndSend?: boolean
+  /** Edit-and-Send only: use the active connection profile even when the chat is pinned. */
+  editAndSendAlwaysUseActiveConnection?: boolean
+  /** Native chat-top-dock controls placement when the Suite toolbar is absent. */
+  nativeDockActionSide?: 'left' | 'right'
+  /** Paint a solid backdrop behind the toolbar when enabled. */
+  opaqueToolbarBackdrop?: boolean
+  /** Optional solid backdrop color for the opaque toolbar plate. */
+  backdropColor?: string
+  /** Card width override in px (0 or undefined for auto content width). */
+  cardWidth?: number
+  /** Card minimum width override in px. */
+  cardMinWidth?: number
+  /** Card maximum width override in px. */
+  cardMaxWidth?: number
+  /** Card padding-inline (space between text and border) in px. */
+  cardPadding?: number
+  /** Card gap (space between icon, text, chevron) in px. */
+  cardGap?: number
 }
 
 export interface ConnectionsPickerSettings {
@@ -739,6 +800,7 @@ export interface ConnectionsPickerSettings {
   rowGap: number
   sectionSpacing: number
   columnWidths: Record<string, number>
+  modelLayout?: 'grid' | 'list'
 }
 
 export interface LoreIndicatorSettings {
@@ -848,7 +910,7 @@ export interface SettingsSlice {
   charactersPerPage: number
   personasPerPage: number
   messagesPerPage: number
-  chatSheldDisplayMode: 'minimal' | 'immersive' | 'bubble'
+  chatDisplayMode: 'minimal' | 'immersive' | 'bubble'
   longMessageCollapseEnabled: boolean
   longMessageCollapsePreset: LongMessageCollapsePreset
   longMessageCollapseCustomHeight: number
@@ -860,7 +922,7 @@ export interface SettingsSlice {
   bubbleUseFullAvatar: boolean
   /** Bubble background opacity, 0–1. 1 = the theme's natural bubble fill (default). */
   bubbleOpacity: number
-  chatSheldEnterToSend: boolean
+  inputBarEnterToSend: boolean
   saveDraftInput: boolean
   chatWidthMode: 'full' | 'comfortable' | 'compact' | 'custom'
   chatContentMaxWidth: number
@@ -916,7 +978,6 @@ export interface SettingsSlice {
   spindleSettings: SpindleSettings
   voiceSettings: VoiceSettings
   connectionsOrder: Record<'llm' | 'imageGen' | 'stt' | 'tts', string[]>
-  landingPageActiveTab: 'chats' | 'characters'
   quickToolbarSettings: QuickToolbarSettings
   connectionsPickerSettings: ConnectionsPickerSettings
   loreIndicatorSettings: LoreIndicatorSettings
@@ -932,6 +993,7 @@ export interface SettingsSlice {
   hydrateStartupSettings: (settings: StartupSettings) => void
   setVoiceSettings: (partial: Partial<VoiceSettings>) => void
   setWallpaper: (settings: Partial<WallpaperSettings>) => void
+  setInputBarEnterToSend: (enabled: boolean) => void
   setSetting: <K extends keyof SettingsSlice>(key: K, value: SettingsSlice[K], source?: SettingsWriteSource) => void
   setTheme: (theme: ThemeConfig | null) => void
   setCharacterThemeOverlay: (overlay: CharacterThemeOverlay | null) => void
@@ -994,6 +1056,7 @@ export interface SpindleSettings {
 export interface LoomRegistryEntry {
   name: string
   blockCount: number
+  coverUrl: string | null
   updatedAt: number
   isDefault: boolean
 }
@@ -1013,11 +1076,18 @@ export interface PresetsSlice {
 }
 
 // ---- Connections Slice ----
+export type ActiveProfileSwitchReason =
+  | 'user_selection'
+  | 'bootstrap_reconcile'
+  | 'profile_deleted'
+  | 'profile_invalidated'
+  | 'settings_reconcile'
+
 export interface ConnectionsSlice {
   profiles: ConnectionProfile[]
   activeProfileId: string | null
   setProfiles: (profiles: ConnectionProfile[]) => void
-  setActiveProfile: (id: string | null) => void
+  setActiveProfile: (id: string | null, reason?: ActiveProfileSwitchReason) => void
 
   addProfile: (profile: ConnectionProfile) => void
   updateProfile: (id: string, updates: Partial<ConnectionProfile>) => void
@@ -1892,17 +1962,19 @@ export interface MigrationSlice {
 }
 
 // ---- Operator Slice ----
-import type { OperatorLogEntry, OperatorStatusPayload } from '@/types/ws-events'
+import type { ImageThumbnailQueuePayload, OperatorLogEntry, OperatorStatusPayload } from '@/types/ws-events'
 
 export interface OperatorSlice {
   operatorLogs: OperatorLogEntry[]
   operatorStatus: OperatorStatusPayload | null
   operatorBusy: string | null
   operatorProgressMessage: string | null
+  thumbnailQueue: ImageThumbnailQueuePayload
   appendOperatorLogs: (entries: OperatorLogEntry[]) => void
   setOperatorStatus: (status: OperatorStatusPayload) => void
   setOperatorBusy: (operation: string | null) => void
   setOperatorProgressMessage: (message: string | null) => void
+  setThumbnailQueue: (status: ImageThumbnailQueuePayload) => void
   clearOperatorLogs: () => void
 }
 
@@ -1979,6 +2051,8 @@ export interface ConnectionSlice {
   wsAuthSynced: boolean
   /** True after a pong has been received since the last open — confirms the round-trip works. */
   wsRoundTripVerified: boolean
+  /** True while a previously healthy PWA is proving a fresh foreground round trip. */
+  wsResumeRecovering: boolean
   /**
    * Flips to true the first time all three healthy signals coincide. Stays true for the rest of
    * the session so the connection-lost overlay only appears AFTER an initial healthy connection.
@@ -1993,6 +2067,7 @@ export interface ConnectionSlice {
   setWsConnected: (connected: boolean) => void
   setWsAuthSynced: (synced: boolean) => void
   setWsRoundTripVerified: (verified: boolean) => void
+  setWsResumeRecovering: (recovering: boolean) => void
   setWsUpdatePending: (pending: boolean) => void
   resetConnectionState: () => void
 }

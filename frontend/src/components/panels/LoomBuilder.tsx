@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect, useDeferredValue, useId, type ReactNode, Fragment } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
+import { useSpindleComponentOverride } from '@/lib/spindle/use-spindle-component-override'
 
 import {
   DndContext,
@@ -59,6 +60,8 @@ import {
   Shield,
   Archive,
   CircleHelp,
+  Square,
+  CheckSquare,
 } from 'lucide-react'
 import clsx from 'clsx'
 import ExpandedTextEditor, { ExpandableTextarea } from '@/components/shared/ExpandedTextEditor'
@@ -68,6 +71,7 @@ import { RangeSlider } from '@/components/shared/RangeSlider'
 import { resolveMacros as resolveMacrosApi } from '@/api/macros'
 import { useLoomBuilder } from '@/hooks/useLoomBuilder'
 import { presetsApi, type StashedPromptBlock } from '@/api/presets'
+import { imagesApi } from '@/api/images'
 import { usePresetProfiles } from '@/hooks/usePresetProfiles'
 import { getEffectivePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
 import {
@@ -75,6 +79,7 @@ import {
   createBlock,
   createMarkerBlock,
   getPortablePresetErrorCode,
+  getRemotePresetOrigin,
   resolvePromptBlockPlacements,
 } from '@/lib/loom/service'
 import { sanitizeCharacterTagTrigger, splitCharacterTagTriggerInput } from '@/lib/loom/characterTagTrigger'
@@ -97,9 +102,11 @@ import { useStore as __contextMeterStore } from '@/store'
 import { groupBreakdownEntries as __groupBreakdownEntries } from '@/lib/prompt-breakdown'
 import PanelFadeIn from '@/components/shared/PanelFadeIn'
 import { Toggle } from '@/components/shared/Toggle'
+import ContextMenu, { type ContextMenuEntry, type ContextMenuPos } from '@/components/shared/ContextMenu'
 import { PromptStashModal } from './PromptStashModal'
 import { Button } from '@/components/shared/FormComponents'
 import { toast } from '@/lib/toast'
+import { useLongPress } from '@/hooks/useLongPress'
 import { markLoomRuntimeProfileContext } from '@/lib/loom/runtimeProfile'
 import { registerActiveLoomPresetSelectionBlocker } from '@/lib/loom/preset-selection-coordinator'
 import SpindlePresetEditorTabContent from '@/components/spindle/SpindlePresetEditorTabContent'
@@ -1017,6 +1024,7 @@ export function BlockEditor({
           placeholder={t('blockEditor.contentPlaceholder')}
           macros={availableMacros}
           onRefreshMacros={refreshMacros}
+          sourceRef={textareaRef}
         />
       )}
     </div>
@@ -1158,28 +1166,57 @@ export function ControlledLoomBlockEditor({
 // ============================================================================
 
 interface PresetSelectorProps {
-  registry: Record<string, { name: string; blockCount: number }>
+  registry: Record<string, { name: string; blockCount: number; coverUrl?: string | null; updatedAt?: number }>
   activePresetId: string | null
   activePresetName: string | null
   onSelect: (id: string | null) => void
   onCreate: (name: string) => void
-  onRename: (name: string) => void
-  onDuplicate: () => void
-  onDelete: () => void
+  onRename: (id: string, name: string) => void
+  onDuplicate: (id: string, name: string) => void
+  onDelete: (id: string) => void
+  onBulkDelete: (ids: string[]) => Promise<string[] | null>
+  onBulkExport: (ids: string[]) => Promise<number | null>
   onImport: (type: string) => void
-  onExport: () => void
+  onExport: (id: string) => void
   onExportLegacy: () => void
 }
 
-function PresetSelector({ registry, activePresetId, activePresetName, onSelect, onCreate, onRename, onDuplicate, onDelete, onImport, onExport, onExportLegacy }: PresetSelectorProps) {
+function PresetSelector({ registry, activePresetId, activePresetName, onSelect, onCreate, onRename, onDuplicate, onDelete, onBulkDelete, onBulkExport, onImport, onExport, onExportLegacy }: PresetSelectorProps) {
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
   const [showMenu, setShowMenu] = useState(false)
+  const [showManager, setShowManager] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
   const [showRename, setShowRename] = useState(false)
   const [newName, setNewName] = useState('')
   const [renameName, setRenameName] = useState('')
+  const [renamePresetId, setRenamePresetId] = useState<string | null>(null)
+  const [cardContextMenu, setCardContextMenu] = useState<{ presetId: string; position: ContextMenuPos } | null>(null)
+  const [selectMode, setSelectMode] = useState(false)
+  const [selectedPresetIds, setSelectedPresetIds] = useState<Set<string>>(new Set())
+  const [bulkDeleteIds, setBulkDeleteIds] = useState<string[] | null>(null)
+  const [bulkActionPending, setBulkActionPending] = useState(false)
   const registryEntries = Object.entries(registry)
+  const allSelected = registryEntries.length > 0 && registryEntries.every(([id]) => selectedPresetIds.has(id))
+  const contextPresetIdRef = useRef<string | null>(null)
+  const selectionAnchorIdRef = useRef<string | null>(null)
+  const cardLongPress = useLongPress({
+    onLongPress: (position) => {
+      const presetId = contextPresetIdRef.current
+      if (presetId && registry[presetId]) setCardContextMenu({ presetId, position })
+    },
+  })
+
+  useEffect(() => {
+    const registryIds = new Set(Object.keys(registry))
+    if (selectionAnchorIdRef.current && !registryIds.has(selectionAnchorIdRef.current)) {
+      selectionAnchorIdRef.current = null
+    }
+    setSelectedPresetIds((current) => {
+      const next = new Set([...current].filter((id) => registryIds.has(id)))
+      return next.size === current.size ? current : next
+    })
+  }, [registry])
 
   const handleCreate = () => {
     if (!newName.trim()) return
@@ -1189,10 +1226,148 @@ function PresetSelector({ registry, activePresetId, activePresetName, onSelect, 
   }
 
   const handleRename = () => {
-    if (!renameName.trim()) return
-    onRename(renameName.trim())
+    if (!renamePresetId || !renameName.trim()) return
+    onRename(renamePresetId, renameName.trim())
     setRenameName('')
+    setRenamePresetId(null)
     setShowRename(false)
+  }
+
+  const openRename = (id: string, name: string) => {
+    setRenamePresetId(id)
+    setRenameName(name)
+    setShowRename(true)
+    setShowMenu(false)
+  }
+
+  const togglePresetSelection = (id: string) => {
+    setSelectedPresetIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const handlePresetSelection = (id: string, selectRange = false) => {
+    const anchorId = selectionAnchorIdRef.current
+    if (selectRange && anchorId) {
+      const anchorIndex = registryEntries.findIndex(([presetId]) => presetId === anchorId)
+      const targetIndex = registryEntries.findIndex(([presetId]) => presetId === id)
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const start = Math.min(anchorIndex, targetIndex)
+        const end = Math.max(anchorIndex, targetIndex)
+        setSelectedPresetIds((current) => {
+          const next = new Set(current)
+          for (let index = start; index <= end; index += 1) {
+            next.add(registryEntries[index][0])
+          }
+          return next
+        })
+        return
+      }
+    }
+
+    selectionAnchorIdRef.current = id
+    togglePresetSelection(id)
+  }
+
+  const handleToggleSelectMode = () => {
+    setSelectMode((current) => {
+      if (current) {
+        setSelectedPresetIds(new Set())
+        selectionAnchorIdRef.current = null
+      }
+      return !current
+    })
+    setCardContextMenu(null)
+  }
+
+  const closeManager = () => {
+    setShowManager(false)
+    setCardContextMenu(null)
+    setSelectMode(false)
+    setSelectedPresetIds(new Set())
+    selectionAnchorIdRef.current = null
+  }
+
+  const handleBulkExport = async () => {
+    const ids = [...selectedPresetIds]
+    if (ids.length === 0 || bulkActionPending) return
+    setBulkActionPending(true)
+    try {
+      const count = await onBulkExport(ids)
+      if (count === null) return
+      toast.success(t('toast.bulkExportStarted', { count }))
+    } catch (error: any) {
+      toast.error(error?.body?.error || error?.message || t('toast.bulkExportFailed'))
+    } finally {
+      setBulkActionPending(false)
+    }
+  }
+
+  const handleBulkDelete = async () => {
+    if (!bulkDeleteIds?.length || bulkActionPending) return
+    setBulkActionPending(true)
+    try {
+      const deleted = await onBulkDelete(bulkDeleteIds)
+      if (deleted === null) return
+      const deletedSet = new Set(deleted)
+      setSelectedPresetIds((current) => new Set([...current].filter((id) => !deletedSet.has(id))))
+      setBulkDeleteIds(null)
+      toast.success(t('toast.bulkDeleted', { count: deleted.length }))
+    } catch (error: any) {
+      toast.error(error?.body?.error || error?.message || t('toast.bulkDeleteFailed'))
+    } finally {
+      setBulkActionPending(false)
+    }
+  }
+
+  const contextPresetId = cardContextMenu?.presetId ?? null
+  const contextPreset = contextPresetId ? registry[contextPresetId] : null
+  const cardContextMenuItems: ContextMenuEntry[] = []
+  if (contextPresetId && contextPreset) {
+    const isActive = contextPresetId === activePresetId
+    cardContextMenuItems.push({
+      key: 'use',
+      label: isActive ? t('preset.currentPreset') : t('preset.usePreset'),
+      icon: <Check size={14} />,
+      active: isActive,
+      onClick: () => { onSelect(contextPresetId); setCardContextMenu(null) },
+    })
+    cardContextMenuItems.push(
+      {
+        key: 'rename',
+        label: t('preset.rename'),
+        icon: <Edit2 size={14} />,
+        onClick: () => { openRename(contextPresetId, contextPreset.name); setCardContextMenu(null) },
+      },
+      {
+        key: 'duplicate',
+        label: t('preset.duplicate'),
+        icon: <Copy size={14} />,
+        onClick: () => { onDuplicate(contextPresetId, contextPreset.name); setCardContextMenu(null) },
+      },
+      {
+        key: 'export',
+        label: t('preset.exportLoomJson'),
+        icon: <Download size={14} />,
+        onClick: () => { onExport(contextPresetId); setCardContextMenu(null) },
+      },
+      { key: 'delete-divider', type: 'divider' },
+      {
+        key: 'delete',
+        label: tc('actions.delete'),
+        icon: <Trash2 size={14} />,
+        danger: true,
+        onClick: () => { onDelete(contextPresetId); setCardContextMenu(null) },
+      },
+    )
+  }
+
+  const getPresetIdFromTarget = (target: EventTarget | null) => {
+    if (!(target instanceof Element)) return null
+    return target.closest<HTMLElement>('[data-preset-id]')?.dataset.presetId ?? null
   }
 
   return (
@@ -1210,15 +1385,16 @@ function PresetSelector({ registry, activePresetId, activePresetName, onSelect, 
         </Button>
         {showMenu && (
           <div className={s.dropdownMenu} style={{ top: '100%', right: 0, minWidth: '160px' }}>
+            <MenuButton icon={<Layers size={14} />} label={t('preset.manage')} onClick={() => { setShowManager(true); setShowMenu(false) }} />
             <MenuButton icon={<Plus size={14} />} label={t('preset.newPreset')} onClick={() => { setShowCreate(true); setShowMenu(false) }} />
             {activePresetId && (
               <>
-                <MenuButton icon={<Edit2 size={14} />} label={t('preset.rename')} onClick={() => { setRenameName(activePresetName || ''); setShowRename(true); setShowMenu(false) }} />
-                <MenuButton icon={<Copy size={14} />} label={t('preset.duplicate')} onClick={() => { onDuplicate(); setShowMenu(false) }} />
-                <MenuButton icon={<Download size={14} />} label={t('preset.exportLoomJson')} onClick={() => { onExport(); setShowMenu(false) }} />
+                <MenuButton icon={<Edit2 size={14} />} label={t('preset.rename')} onClick={() => openRename(activePresetId, activePresetName || '')} />
+                <MenuButton icon={<Copy size={14} />} label={t('preset.duplicate')} onClick={() => { onDuplicate(activePresetId, activePresetName || registry[activePresetId]?.name || 'Preset'); setShowMenu(false) }} />
+                <MenuButton icon={<Download size={14} />} label={t('preset.exportLoomJson')} onClick={() => { onExport(activePresetId); setShowMenu(false) }} />
                 <MenuButton icon={<Download size={14} />} label={t('preset.exportLegacy')} onClick={() => { onExportLegacy(); setShowMenu(false) }} />
                 <hr className={s.menuDivider} />
-                <MenuButton icon={<Trash2 size={14} />} label={tc('actions.delete')} danger onClick={() => { onDelete(); setShowMenu(false) }} />
+                <MenuButton icon={<Trash2 size={14} />} label={tc('actions.delete')} danger onClick={() => { onDelete(activePresetId); setShowMenu(false) }} />
               </>
             )}
             <hr className={s.menuDivider} />
@@ -1227,6 +1403,205 @@ function PresetSelector({ registry, activePresetId, activePresetName, onSelect, 
           </div>
         )}
       </div>
+
+      <ModalShell
+        isOpen={showManager}
+        onClose={closeManager}
+        maxWidth="min(920px, 94vw)"
+        maxHeight="min(780px, 90vh)"
+        className={s.presetManagerModal}
+      >
+        <div className={s.presetManagerHeader}>
+          <div>
+            <h2 className={s.presetManagerTitle}>{t('preset.managerTitle')}</h2>
+            <p className={s.presetManagerSubtitle}>{t('preset.managerSubtitle', { count: registryEntries.length })}</p>
+          </div>
+          <button type="button" className={s.presetManagerClose} onClick={closeManager} aria-label={tc('actions.close')}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className={clsx(s.presetManagerToolbar, selectMode && s.presetManagerToolbarSelecting)}>
+          <div className={s.presetManagerToolbarPrimary}>
+            <button type="button" className={s.presetManagerPrimaryAction} onClick={() => setShowCreate(true)}>
+              <Plus size={15} /> {t('preset.newPreset')}
+            </button>
+            <button type="button" className={s.presetManagerAction} onClick={() => onImport('json')}>
+              <Upload size={15} /> {t('preset.importLoomJson')}
+            </button>
+            <button type="button" className={s.presetManagerAction} onClick={() => onImport('st')}>
+              <Upload size={15} /> {t('preset.importLegacy')}
+            </button>
+          </div>
+          <div className={s.presetManagerBulkActions}>
+            <button
+              type="button"
+              className={clsx(s.presetManagerAction, selectMode && s.presetManagerSelectModeActive)}
+              onClick={handleToggleSelectMode}
+              aria-pressed={selectMode}
+              title={selectMode ? t('preset.exitSelectMode') : t('preset.selectMode')}
+            >
+              {selectMode ? <CheckSquare size={15} /> : <Square size={15} />}
+              {selectMode ? t('preset.doneSelecting') : t('preset.selectMode')}
+            </button>
+            {selectMode && (
+              <>
+                <button
+                  type="button"
+                  className={s.presetManagerSelectAll}
+                  onClick={() => {
+                    selectionAnchorIdRef.current = null
+                    setSelectedPresetIds(allSelected ? new Set() : new Set(registryEntries.map(([id]) => id)))
+                  }}
+                  disabled={registryEntries.length === 0}
+                >
+                  {allSelected ? <CheckSquare size={15} /> : <Square size={15} />}
+                  <span>{allSelected ? t('preset.deselectAll') : t('preset.selectAll')}</span>
+                </button>
+                <span className={s.presetManagerSelectedCount}>{t('preset.selected', { count: selectedPresetIds.size })}</span>
+                {selectedPresetIds.size > 0 && (
+                  <>
+                    <button type="button" className={s.presetManagerAction} onClick={() => { void handleBulkExport() }} disabled={bulkActionPending}>
+                      <Download size={15} /> {t('preset.exportSelected')}
+                    </button>
+                    <button type="button" className={s.presetManagerDangerAction} onClick={() => setBulkDeleteIds([...selectedPresetIds])} disabled={bulkActionPending}>
+                      <Trash2 size={15} /> {t('preset.deleteSelected')}
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+        <div
+          className={s.presetManagerGrid}
+          onTouchStart={(event) => {
+            if (selectMode) return
+            contextPresetIdRef.current = getPresetIdFromTarget(event.target)
+            if (contextPresetIdRef.current) cardLongPress.onTouchStart(event)
+          }}
+          onTouchMove={(event) => {
+            if (!selectMode) cardLongPress.onTouchMove(event)
+          }}
+          onTouchEnd={(event) => {
+            if (!selectMode) cardLongPress.onTouchEnd(event)
+            contextPresetIdRef.current = null
+          }}
+          onTouchCancel={() => {
+            if (!selectMode) cardLongPress.onTouchCancel()
+            contextPresetIdRef.current = null
+          }}
+          onContextMenu={(event) => {
+            contextPresetIdRef.current = getPresetIdFromTarget(event.target)
+            if (selectMode && contextPresetIdRef.current) {
+              event.preventDefault()
+              return
+            }
+            if (contextPresetIdRef.current) cardLongPress.onContextMenu(event)
+          }}
+        >
+          {registryEntries.map(([id, entry]) => {
+            const isActive = id === activePresetId
+            return (
+              <article
+                key={id}
+                data-preset-id={id}
+                role="button"
+                tabIndex={0}
+                aria-pressed={selectMode ? selectedPresetIds.has(id) : isActive}
+                className={clsx(
+                  s.presetManagerCard,
+                  isActive && s.presetManagerCardActive,
+                  selectedPresetIds.has(id) && s.presetManagerCardSelected,
+                )}
+                onClick={(event) => {
+                  const target = event.target
+                  if (target instanceof Element && target.closest('input, label')) return
+                  if (selectMode) handlePresetSelection(id, event.shiftKey)
+                  else onSelect(id)
+                }}
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget) return
+                  if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+                    event.preventDefault()
+                    if (selectMode) return
+                    const rect = event.currentTarget.getBoundingClientRect()
+                    setCardContextMenu({ presetId: id, position: { x: rect.left + 24, y: rect.top + 24 } })
+                    return
+                  }
+                  if (event.key !== 'Enter' && event.key !== ' ') return
+                  event.preventDefault()
+                  if (selectMode) handlePresetSelection(id, event.shiftKey)
+                  else onSelect(id)
+                }}
+              >
+                <div className={clsx(s.presetManagerMedia, selectMode && s.presetManagerMediaSelectable)}>
+                  <Layers size={32} className={s.presetManagerCoverFallback} />
+                  {entry.coverUrl && (
+                    <img
+                      key={entry.coverUrl}
+                      src={imagesApi.displayUrl(entry.coverUrl)}
+                      alt=""
+                      className={s.presetManagerCoverImage}
+                      referrerPolicy="no-referrer"
+                      onLoad={(event) => { event.currentTarget.style.display = '' }}
+                      onError={(event) => {
+                        const fallback = imagesApi.directDisplayFallback(entry.coverUrl!)
+                        if (fallback && event.currentTarget.dataset.directFallback !== fallback) {
+                          event.currentTarget.dataset.directFallback = fallback
+                          event.currentTarget.src = fallback
+                          return
+                        }
+                        event.currentTarget.style.display = 'none'
+                      }}
+                    />
+                  )}
+                  {isActive && <span className={s.presetManagerActiveBadge}>{t('preset.active')}</span>}
+                  {selectMode && (
+                    <label className={s.presetManagerCardSelect} onContextMenu={(event) => event.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        checked={selectedPresetIds.has(id)}
+                        onChange={(event) => handlePresetSelection(id, (event.nativeEvent as MouseEvent).shiftKey)}
+                        aria-label={t('preset.selectForBulk', { name: entry.name })}
+                      />
+                      <span><Check size={13} /></span>
+                    </label>
+                  )}
+                </div>
+                <div className={s.presetManagerCardBody}>
+                  <div className={s.presetManagerCardTitleRow}>
+                    <span className={s.presetManagerCardName} title={entry.name}>
+                      {entry.name}
+                    </span>
+                  </div>
+                  <span className={s.presetManagerCardMeta}>{t('preset.blocks', { count: entry.blockCount })}</span>
+                </div>
+              </article>
+            )
+          })}
+          {registryEntries.length === 0 && (
+            <div className={s.presetManagerEmpty}>{t('preset.managerEmpty')}</div>
+          )}
+        </div>
+      </ModalShell>
+
+      <ContextMenu
+        position={cardContextMenu?.position ?? null}
+        items={cardContextMenuItems}
+        onClose={() => setCardContextMenu(null)}
+      />
+
+      <ConfirmationModal
+        isOpen={!!bulkDeleteIds}
+        zIndex={10005}
+        title={t('confirm.bulkDeletePresetTitle')}
+        message={t('confirm.bulkDeletePresetMessage', { count: bulkDeleteIds?.length ?? 0 })}
+        variant="danger"
+        confirmText={t('preset.deleteSelected')}
+        loading={bulkActionPending}
+        onConfirm={() => { void handleBulkDelete() }}
+        onCancel={() => { if (!bulkActionPending) setBulkDeleteIds(null) }}
+      />
 
       <ModalShell isOpen={showCreate} onClose={() => setShowCreate(false)} maxWidth="clamp(320px, 90vw, min(420px, var(--lumiverse-content-max-width, 420px)))" className={s.presetNameModal}>
         <div className={s.presetNameHeader}>
@@ -1242,7 +1617,7 @@ function PresetSelector({ registry, activePresetId, activePresetName, onSelect, 
         </div>
       </ModalShell>
 
-      <ModalShell isOpen={showRename} onClose={() => setShowRename(false)} maxWidth="clamp(320px, 90vw, min(420px, var(--lumiverse-content-max-width, 420px)))" className={s.presetNameModal}>
+      <ModalShell isOpen={showRename} onClose={() => { setShowRename(false); setRenamePresetId(null) }} maxWidth="clamp(320px, 90vw, min(420px, var(--lumiverse-content-max-width, 420px)))" className={s.presetNameModal} zIndex={10003}>
         <div className={s.presetNameHeader}>
           <Edit2 size={16} />
           <h3 className={s.presetNameTitle}>{t('preset.renameTitle')}</h3>
@@ -1262,16 +1637,38 @@ function PresetSelector({ registry, activePresetId, activePresetName, onSelect, 
 function PresetCoverHeader({ preset }: { preset: LoomPreset }) {
   const { t } = useLb()
   const coverUrl = preset.coverUrl?.trim()
-  if (!coverUrl) return null
-
+  const [failedCoverUrl, setFailedCoverUrl] = useState<string | null>(null)
   const description = preset.description?.trim()
+  const origin = getRemotePresetOrigin(preset)
+  const visibleCoverUrl = coverUrl && failedCoverUrl !== coverUrl ? coverUrl : null
+  if (!visibleCoverUrl && !origin && !preset.presetVersion) return null
 
   return (
-    <section className={s.presetCoverHeader} aria-label={t('preset.coverAria', { name: preset.name })}>
-      <img className={s.presetCoverImage} src={coverUrl} alt="" aria-hidden="true" />
+    <section className={s.presetCoverHeader} aria-label={visibleCoverUrl ? t('preset.coverAria', { name: preset.name }) : undefined}>
+      {visibleCoverUrl && (
+        <img
+          key={visibleCoverUrl}
+          className={s.presetCoverImage}
+          src={imagesApi.displayUrl(visibleCoverUrl)}
+          alt=""
+          aria-hidden="true"
+          referrerPolicy="no-referrer"
+          onLoad={(event) => { event.currentTarget.style.display = '' }}
+          onError={(event) => {
+            const fallback = imagesApi.directDisplayFallback(visibleCoverUrl)
+            if (fallback && event.currentTarget.dataset.directFallback !== fallback) {
+              event.currentTarget.dataset.directFallback = fallback
+              event.currentTarget.src = fallback
+              return
+            }
+            setFailedCoverUrl(visibleCoverUrl)
+          }}
+        />
+      )}
       <div className={s.presetCoverContent}>
         <div className={s.presetCoverBadgeRow}>
-          <span className={s.presetCoverBadge}>{t('preset.lumihubBadge')}</span>
+          {origin === 'lumihub' && <span className={s.presetCoverBadge}>{t('preset.lumihubBadge')}</span>}
+          {origin === 'illarin' && <span className={s.presetCoverBadge}>{t('preset.illarinBadge')}</span>}
           {preset.presetVersion && (
             <span className={s.presetCoverBadge}>{t('preset.version', { version: preset.presetVersion })}</span>
           )}
@@ -1827,7 +2224,7 @@ interface LoomBuilderProps {
   compact?: boolean
 }
 
-export default function LoomBuilder({
+function LoomBuilderNative({
  compact = true }: LoomBuilderProps) {
   const { t: lb } = useLb()
   const { t: tc } = useTranslation('common')
@@ -1848,6 +2245,8 @@ export default function LoomBuilder({
     saveAgenticRuntime,
     reloadActivePreset,
     deletePreset,
+    bulkDeletePresets,
+    bulkExportPresets,
     duplicatePreset,
     renamePreset,
     addBlock,
@@ -2005,7 +2404,7 @@ export default function LoomBuilder({
   const [promptMenuOpen, setPromptMenuOpen] = useState(false)
   const [markerMenuOpen, setMarkerMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
-  const [confirmDeletePreset, setConfirmDeletePreset] = useState(false)
+  const [confirmDeletePresetId, setConfirmDeletePresetId] = useState<string | null>(null)
   const [showLegacyExportConfirm, setShowLegacyExportConfirm] = useState(false)
   const [showPromptVariablesModal, setShowPromptVariablesModal] = useState(false)
   const [showPromptStashModal, setShowPromptStashModal] = useState(false)
@@ -2569,31 +2968,42 @@ export default function LoomBuilder({
     void createPreset(name)
   }, [blockPresetChangeForDirtyAgenticRuntime, createPreset])
 
-  const handleRenamePreset = useCallback(async (newName: string) => {
-    if (blockPresetChangeForDirtyAgenticRuntime() || !activePresetId) return
-    await renamePreset(activePresetId, newName)
-  }, [activePresetId, blockPresetChangeForDirtyAgenticRuntime, renamePreset])
-
-  const handleDuplicatePreset = useCallback(async () => {
-    if (blockPresetChangeForDirtyAgenticRuntime() || !activePreset || !activePresetId) return
-    await duplicatePreset(activePresetId, `${activePreset.name}${lb('preset.copySuffix')}`)
-  }, [activePreset, activePresetId, blockPresetChangeForDirtyAgenticRuntime, duplicatePreset, lb])
-
-  const handleRequestDeletePreset = useCallback(() => {
+  const handleRenamePreset = useCallback(async (presetId: string, newName: string) => {
     if (blockPresetChangeForDirtyAgenticRuntime()) return
-    setConfirmDeletePreset(true)
+    await renamePreset(presetId, newName)
+  }, [blockPresetChangeForDirtyAgenticRuntime, renamePreset])
+
+  const handleDuplicatePreset = useCallback(async (presetId: string, presetName: string) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
+    await duplicatePreset(presetId, presetName + lb('preset.copySuffix'))
+  }, [blockPresetChangeForDirtyAgenticRuntime, duplicatePreset, lb])
+
+  const handleBulkDeletePresets = useCallback(async (presetIds: string[]) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return null
+    return bulkDeletePresets(presetIds)
+  }, [blockPresetChangeForDirtyAgenticRuntime, bulkDeletePresets])
+
+  const handleBulkExportPresets = useCallback(async (presetIds: string[]) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return null
+    return bulkExportPresets(presetIds)
+  }, [blockPresetChangeForDirtyAgenticRuntime, bulkExportPresets])
+
+  const handleRequestDeletePreset = useCallback((presetId: string) => {
+    if (blockPresetChangeForDirtyAgenticRuntime()) return
+    setConfirmDeletePresetId(presetId)
   }, [blockPresetChangeForDirtyAgenticRuntime])
 
   const handleDeletePreset = useCallback(async () => {
-    if (blockPresetChangeForDirtyAgenticRuntime() || !activePresetId) return
-    setConfirmDeletePreset(false)
-    await deletePreset(activePresetId)
-  }, [activePresetId, blockPresetChangeForDirtyAgenticRuntime, deletePreset])
+    if (!confirmDeletePresetId || blockPresetChangeForDirtyAgenticRuntime()) return
+    const presetId = confirmDeletePresetId
+    setConfirmDeletePresetId(null)
+    await deletePreset(presetId)
+  }, [blockPresetChangeForDirtyAgenticRuntime, confirmDeletePresetId, deletePreset])
 
-  const handleExport = useCallback(async () => {
+  const handleExport = useCallback(async (presetId: string) => {
     if (blockPresetChangeForDirtyAgenticRuntime()) return
     try {
-      const data = await exportInternal()
+      const data = await exportInternal(presetId)
       if (!data) return
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
       const url = URL.createObjectURL(blob)
@@ -2680,6 +3090,9 @@ export default function LoomBuilder({
     return (
       <>
         {presetEditorToolbar}
+        <span data-spindle-mount="preset_editor_toolbar" data-spindle-scope={`loom:${activePreset?.id ?? activePresetId ?? 'none'}:preset-toolbar`} style={{ display: 'contents' }} />
+        <span data-spindle-mount="loom_builder_toolbar" data-spindle-scope={`loom:${activePreset?.id ?? activePresetId ?? 'none'}:builder-toolbar`} style={{ display: 'contents' }} />
+        <span data-spindle-mount="loom_builder_inspector" data-spindle-scope={`loom:${activePreset?.id ?? activePresetId ?? 'none'}:inspector`} style={{ display: 'contents' }} />
         <BlockEditor
           block={editingBlock}
           blocks={activePreset?.blocks ?? []}
@@ -2716,6 +3129,8 @@ export default function LoomBuilder({
             onRename={handleRenamePreset}
             onDuplicate={handleDuplicatePreset}
             onDelete={handleRequestDeletePreset}
+            onBulkDelete={handleBulkDeletePresets}
+            onBulkExport={handleBulkExportPresets}
             onImport={handleImport}
             onExport={handleExport}
             onExportLegacy={handleRequestLegacyExport}
@@ -2747,6 +3162,7 @@ export default function LoomBuilder({
               {allCategoriesCollapsed ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               <span className={s.toolbarButtonLabel}>{allCategoriesCollapsed ? lb('category.expandAll') : lb('category.collapseAll')}</span>
             </button>
+            <span data-spindle-mount="loom_builder_toolbar" data-spindle-scope={`loom:${activePreset?.id ?? activePresetId ?? 'none'}:builder-toolbar`} style={{ display: 'contents' }} />
           </div>
           {activePreset && isSearchVisible && (
             <div className={s.searchBarRow}>
@@ -2782,6 +3198,7 @@ export default function LoomBuilder({
         </div>
 
         {presetEditorToolbar}
+        <span data-spindle-mount="preset_editor_toolbar" data-spindle-scope={`loom:${activePreset?.id ?? activePresetId ?? 'none'}:preset-toolbar`} style={{ display: 'contents' }} />
 
         <div
           className={s.extensionTabRow}
@@ -2856,6 +3273,11 @@ export default function LoomBuilder({
                 {tab.title}
               </button>
             ))}
+            <span
+              data-spindle-mount="preset_editor_tab"
+              data-spindle-scope={'loom:' + (activePreset?.id ?? activePresetId ?? 'none') + ':preset-tab'}
+              style={{ display: 'contents' }}
+            />
           </div>
 
           {activePresetExtensionTab?.guide && (
@@ -2925,8 +3347,6 @@ export default function LoomBuilder({
         hidden={activePresetEditorTab !== 'preset'}
         style={{ display: activePresetEditorTab === 'preset' ? 'contents' : 'none' }}
       >
-
-      {activePreset && <PresetCoverHeader preset={activePreset} />}
 
       {/* Connection profile */}
       {activePreset && connectionProfile && (() => {
@@ -3142,6 +3562,8 @@ export default function LoomBuilder({
 
       {/* Scrollable content: settings + block list */}
       <div className={s.scrollArea} ref={scrollAreaRef} onScroll={handleScrollCapture}>
+        {activePreset && <PresetCoverHeader preset={activePreset} />}
+
         {/* Settings accordion sections */}
         {activePreset && (
           <GenerationSettings
@@ -3350,13 +3772,14 @@ export default function LoomBuilder({
 
       {/* Confirm preset delete dialog */}
         <ConfirmationModal
-          isOpen={confirmDeletePreset}
+          isOpen={!!confirmDeletePresetId}
+          zIndex={10004}
           title={lb('confirm.deletePresetTitle')}
-          message={lb('confirm.deletePresetMessage', { name: activePreset?.name })}
+          message={lb('confirm.deletePresetMessage', { name: confirmDeletePresetId ? registry[confirmDeletePresetId]?.name : '' })}
           variant="danger"
           confirmText={tc('actions.delete')}
           onConfirm={() => { void handleDeletePreset() }}
-          onCancel={() => setConfirmDeletePreset(false)}
+          onCancel={() => setConfirmDeletePresetId(null)}
         />
 
         {activePreset && (
@@ -3378,4 +3801,8 @@ export default function LoomBuilder({
       </div>
     </PanelFadeIn>
   )
+}
+
+export default function LoomBuilder(props: LoomBuilderProps) {
+  return useSpindleComponentOverride('LoomBuilder', LoomBuilderNative, props)
 }

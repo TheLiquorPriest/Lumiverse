@@ -17,6 +17,10 @@ const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'http://localhost/',
   pretendToBeVisual: true,
 })
+dom.window.matchMedia = (media: string) => ({
+  addEventListener() {}, addListener() {}, dispatchEvent: () => false, matches: false,
+  media, onchange: null, removeEventListener() {}, removeListener() {},
+})
 const originalGlobals = {
   window: globalThis.window,
   document: globalThis.document,
@@ -81,8 +85,11 @@ function getSpindleStore(): StoreApi<SpindleSlice> {
 
 function readStoreState(): TestStoreState {
   return {
-    profiles: [],
     activeProfileId: null,
+    messages: [],
+    profiles: [],
+    setActiveProfile() {},
+    updateProfile() {},
     ...placementStore.getState(),
     ...getSpindleStore().getState(),
   } as TestStoreState
@@ -167,11 +174,72 @@ const loaderWsClient = {
 }
 let mockedGrantedPermissions = ['ui_panels', 'presets']
 mock.module('@/ws/client', () => ({
-  wsClient: loaderWsClient,
-  WS_OPEN: '__ws_open',
-  WS_CLOSE: '__ws_close',
-  WS_PONG: '__ws_pong',
   WS_AUTH_ERROR: '__ws_auth_error',
+  WS_CLOSE: '__ws_close',
+  WS_OPEN: '__ws_open',
+  WS_PONG: '__ws_pong',
+  WS_RESUME_RECOVERY_START: '__ws_resume_recovery_start',
+  WS_RESUME_RECOVERY_COMPLETE: '__ws_resume_recovery_complete',
+  WS_RESUME_RECOVERY_FAILED: '__ws_resume_recovery_failed',
+  wsClient: loaderWsClient,
+}))
+mock.module('./host-surfaces', () => ({
+  createHostSurfaceAPI: () => ({
+    list: () => [],
+    subscribe: () => () => {},
+    invoke() {},
+    registerDeepLinkTarget: () => () => {},
+  }),
+}))
+mock.module('./character-host-surface-renderers', () => ({}))
+mock.module('./world-book-host-surface-renderers', () => ({}))
+mock.module('./productivity-host-surface-renderers', () => ({}))
+mock.module('./settings-bridge', () => ({
+  createSettingsBridge: () => ({
+    get: async () => undefined,
+    set: async () => {},
+    remove: async () => {},
+    watch: () => () => {},
+    core: {
+      get: () => undefined,
+      watch: () => () => {},
+      list: () => [],
+      isReady: () => true,
+    },
+    dispose() {},
+  }),
+}))
+mock.module('./frontend-domain-api', () => ({
+  createFrontendDomainApi: () => ({
+    connections: {
+      list: () => [],
+      getActive: () => ({ activeProfileId: null, provider: null, model: null }),
+      subscribe: () => () => {},
+      models: async () => ({ models: [] }),
+      setActive() {},
+      setActiveAcknowledged: async () => {},
+      update: async () => ({}),
+    },
+    chats: {
+      listForCharacter: async () => [],
+      getMessages: async () => ({ items: [], total: 0 }),
+    },
+    worldBooks: {
+      list: async () => [],
+      entries: async () => [],
+    },
+    messages: {
+      getContent: () => null,
+      getRecent: () => [],
+    },
+    tokens: {
+      countText: async () => ({}),
+      countMessages: async () => ({}),
+      countChat: async () => ({}),
+      countTextBatch: async () => ({}),
+    },
+    dispose() {},
+  }),
 }))
 mock.module('@/api/spindle', () => ({
   spindleApi: {
@@ -199,17 +267,20 @@ mock.module('@/api/chats', () => ({
   },
 }))
 mock.module('./message-interceptors', () => ({
-  subscribeTagInterceptorRegistry: () => () => {},
+  dispatchMessageTagIntercepts() {},
   getTagInterceptorRegistryVersion: () => 0,
   registerTagInterceptor: () => {
     tagRegistrations += 1
     return () => {}
   },
-  unregisterTagInterceptorsByExtension() {},
   stripMessageTags: (content: string) => ({ content, intercepts: [] }),
-  dispatchMessageTagIntercepts() {},
+  subscribeTagInterceptorRegistry: () => () => {},
+  unregisterTagInterceptorsByExtension() {},
 }))
 mock.module('./display-resolver-registry', () => ({
+  getDisplayOwnerIdentifier: () => null,
+  getDisplayResolverForChat: () => null,
+  isDisplayChatOwned: () => false,
   registerDisplayResolver: () => {
     displayRegistrations += 1
     return () => {}
@@ -225,18 +296,17 @@ mock.module('@/hooks/useDisplayRegex', () => ({
 }))
 mock.module('./message-widgets', () => ({
   SpindleMessageWidgets: () => null,
-  subscribeMessageWidgets: () => () => {},
   getMessageWidgetVersion: () => 0,
   removeMessageWidgetsByExtension() {},
   upsertMessageWidget: () => {
     widgetRegistrations += 1
   },
   removeMessageWidget() {},
+  subscribeMessageWidgets: () => () => {},
 }))
 mock.module('./character-editor-helper', () => ({
-  setCharacterEditorController() {},
-  syncCharacterEditorState() {},
   getCharacterEditorState: () => ({}),
+  setCharacterEditorController() {},
   subscribeCharacterEditorState: (handler: (state: unknown) => void) => {
     characterListeners.add(handler)
     let active = true
@@ -250,6 +320,7 @@ mock.module('./character-editor-helper', () => ({
   updateCharacterEditorExtensions() {},
   flushCharacterEditorExtensions: async () => {},
   setCharacterEditorActiveTab() {},
+  syncCharacterEditorState() {},
 }))
 mock.module('./navigation-guards', () => ({ installSpindleNavigationGuards() {} }))
 mock.module('@/lib/drawer-tab-registry', () => ({
@@ -265,6 +336,10 @@ mock.module('@/lib/drawer-tab-registry', () => ({
   extensionCommandsToCommands: () => [],
 }))
 mock.module('./browser-scheduler', () => ({ yieldToBrowser: async () => {}, scheduleSpindleDomTask: () => () => {} }))
+// The native adapter intentionally imports the production Vite registry. This
+// lifecycle test exercises the loader boundary, so keep that compile-time-only
+// module graph behind its adapter rather than weakening the production macros.
+mock.module('./theme-authoring-native', () => ({ createNativeThemeAuthoringAPI: () => ({}) }))
 
 // These factories intentionally load after the narrow store and visual-component
 // mocks; the real production helpers retain the mocked boundary references.
@@ -453,7 +528,7 @@ describe('loader-owned roots', () => {
     const manifest: SpindleManifest = {
       version: '1.0.0',
       name: 'Loader root contract',
-      identifier: extensionId,
+      identifier: extensionId.replaceAll('-', '_'),
       author: 'test',
       github: 'https://example.test/loader-root',
       homepage: 'https://example.test/loader-root',
@@ -548,7 +623,7 @@ function placementManifest(identifier: string): SpindleManifest {
   return {
     version: '1.0.0',
     name: 'Free placement contract',
-    identifier,
+    identifier: identifier.replaceAll('-', '_'),
     author: 'test',
     github: `https://example.test/${identifier}`,
     homepage: `https://example.test/${identifier}`,
@@ -1174,7 +1249,7 @@ describe('retained non-UI context lifecycle', () => {
     const manifest: SpindleManifest = {
       version: '1.0.0',
       name: 'Retained context contract',
-      identifier: retainedId,
+      identifier: retainedId.replaceAll('-', '_'),
       author: 'test',
       github: `https://example.test/${retainedId}`,
       homepage: `https://example.test/${retainedId}`,

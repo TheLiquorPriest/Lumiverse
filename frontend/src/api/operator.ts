@@ -1,5 +1,5 @@
 import { get, post, put, del } from './client'
-import type { OperatorLogEntry, OperatorStatusPayload } from '@/types/ws-events'
+import type { ImageThumbnailQueuePayload, OperatorLogEntry, OperatorStatusPayload } from '@/types/ws-events'
 
 export type OperatorStatus = OperatorStatusPayload
 
@@ -32,6 +32,9 @@ export interface SharpSettings {
   cacheMemoryMb?: number | null
   cacheFiles?: number | null
   cacheItems?: number | null
+  thumbnailCodec?: 'webp' | 'avif' | null
+  webpQuality?: number | null
+  avifQuality?: number | null
 }
 
 export interface ResolvedSharpSettings {
@@ -39,6 +42,15 @@ export interface ResolvedSharpSettings {
   cacheMemoryMb: number
   cacheFiles: number
   cacheItems: number
+  thumbnailCodec: 'webp' | 'avif'
+  webpQuality: number
+  avifQuality: number
+}
+
+export interface ThumbnailQueueRecovery {
+  pending: number
+  process: number
+  rebuild: number
 }
 
 export interface OperatorSharpStatus {
@@ -46,6 +58,14 @@ export interface OperatorSharpStatus {
   configuredSettings: SharpSettings
   effectiveSettings: ResolvedSharpSettings
   defaults: ResolvedSharpSettings
+  automaticConcurrency?: Record<'webp' | 'avif', number>
+  thumbnailQueue?: ImageThumbnailQueuePayload
+  thumbnailRecovery?: ThumbnailQueueRecovery
+}
+
+export interface ThumbnailQueueSnapshot {
+  queue: ImageThumbnailQueuePayload
+  recovery: ThumbnailQueueRecovery
 }
 
 export interface DnsSettings {
@@ -293,13 +313,25 @@ export interface TrustedHostsUpdateResponse {
   baseline: TrustedHostEntry[]
 }
 
+export interface BrokerOriginsResponse {
+  configured: string[]
+}
+
+export interface BrokerOriginsUpdateResponse {
+  configured: string[]
+}
+
 export const operatorApi = {
   getStatus: () => get<OperatorStatus>('/operator/status'),
   getTrustedHosts: (fresh = false) => get<TrustedHostsResponse>('/operator/trusted-hosts', fresh ? { fresh: 1 } : undefined),
   putTrustedHosts: (hosts: string[]) => put<TrustedHostsUpdateResponse>('/operator/trusted-hosts', { hosts }),
+  getBrokerOrigins: () => get<BrokerOriginsResponse>('/operator/broker-origins'),
+  putBrokerOrigins: (origins: string[]) => put<BrokerOriginsUpdateResponse>('/operator/broker-origins', { origins }),
   getDatabase: () => get<OperatorDatabaseStatus>('/operator/database'),
   getSharp: () => get<OperatorSharpStatus>('/operator/sharp'),
   putSharp: (settings: SharpSettings) => put<OperatorSharpStatus>('/operator/sharp', settings),
+  recoverThumbnailQueue: () => post<ThumbnailQueueSnapshot>('/operator/sharp/queue/recover'),
+  discardThumbnailQueue: () => post<ThumbnailQueueSnapshot>('/operator/sharp/queue/discard'),
   getDns: () => get<OperatorDnsStatus>('/operator/dns'),
   putDns: (settings: DnsSettings) => put<OperatorDnsStatus>('/operator/dns', settings),
   getDiskWarning: () => get<OperatorDiskWarningStatus>('/operator/disk-warning'),

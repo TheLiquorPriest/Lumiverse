@@ -106,6 +106,7 @@ nav = [
   { "Customization" = [
     { "Theme" = "customization/themes.md" },
     { "Wallpaper" = "customization/wallpapers.md" },
+    { "Productivity & Quick Toolbar" = "customization/productivity.md" },
     { "Regex Scripts" = "customization/regex-scripts.md" },
     { "Macros" = "customization/macros.md" },
     { "Display Modes" = "customization/display-modes.md" },
@@ -116,6 +117,7 @@ nav = [
     { "Web Search" = "settings/web-search.md" },
     { "Notifications" = "settings/push-notifications.md" },
     { "LumiHub" = "settings/lumihub.md" },
+    { "Illarin" = "settings/illarin.md" },
     { "Single Sign-On" = "settings/sso.md" },
     { "User Management" = "settings/users.md" },
   ] },

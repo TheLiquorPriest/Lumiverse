@@ -1169,6 +1169,7 @@ describe("strict assembly plan", () => {
       operation: "compile_agent_assembly",
       payload: { snapshot },
       requestId: "worker-request",
+      timeoutMs: 60_000,
       deadlineAt: Date.now() + 60_000,
       resolve: () => undefined,
       reject: () => undefined,

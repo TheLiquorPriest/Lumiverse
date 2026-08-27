@@ -20,7 +20,7 @@ import {
 import { buildMacroEnvForChat } from "./chats.service";
 import { getActivatedWorldInfoEntriesForChat, resolveWorldInfoOutlets } from "./prompt-assembly.service";
 import { evaluate as evaluateMacros, registry as macroRegistry } from "../macros";
-import sharp from "../utils/sharp-config";
+import { resizeInsideToWebp } from "../utils/image-pipeline";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { getImageProvider, getImageProviderList } from "../image-gen/registry";
@@ -62,10 +62,9 @@ async function buildRelayImagePreview(dataUrl: string): Promise<string | undefin
   for (const size of [640, 480, 320]) {
     for (const quality of [75, 60, 45, 30]) {
       try {
-        const output = await sharp(input)
-          .resize(size, size, { fit: "inside", withoutEnlargement: true })
-          .webp({ quality })
-          .toBuffer();
+        const output = await resizeInsideToWebp(input, size, size, quality, {
+          withoutEnlargement: true,
+        });
         const preview = `data:image/webp;base64,${output.toString("base64")}`;
         if (preview.length <= RELAY_IMAGE_PREVIEW_MAX_CHARS) return preview;
       } catch {
@@ -495,7 +494,7 @@ export async function generateSceneBackground(
     }
 
     if (connection.provider === "comfyui" || connection.provider === "swarmui") {
-      await applyComfyUIWorkflowConfig(
+      await applyActiveComfyUIWorkflowConfig(
         connection,
         params,
         promptResult.prompt,
@@ -881,7 +880,15 @@ function isResolvedSourceImage(value: unknown): value is { data: string; mimeTyp
   );
 }
 
-async function applyComfyUIWorkflowConfig(
+/**
+ * Build the outbound Comfy prompt from the connection's active workflow.
+ *
+ * The workflow library stores the selected workflow in `connection.metadata`,
+ * while older profiles can still carry a serialized workflow in
+ * `default_parameters`. Callers using the integrated workflow must use this
+ * helper so the active library selection is authoritative.
+ */
+export async function applyActiveComfyUIWorkflowConfig(
   connection: ImageGenConnectionProfile,
   params: Record<string, unknown>,
   prompt: string,
@@ -890,10 +897,13 @@ async function applyComfyUIWorkflowConfig(
   useLegacySingleLora: boolean,
   apiKey?: string,
 ): Promise<void> {
-  if (params.workflow && typeof params.workflow === "object") return;
-
   const config = readComfyUIConfig(connection.metadata);
   if (!config) return;
+
+  // `default_parameters` can retain a workflow from older connection
+  // settings. The active saved workflow lives in connection metadata and must
+  // win for Lumiverse's integrated generation path; otherwise that stale
+  // parameter bypasses the workflow the user just selected.
 
   const mappings = config.field_mappings || [];
   const hasPositivePrompt = mappings.some((mapping) => mapping.mappedAs === "positive_prompt");

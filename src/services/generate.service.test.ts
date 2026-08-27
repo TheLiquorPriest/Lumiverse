@@ -139,6 +139,34 @@ describe("injectConnectionMetadataFlags", () => {
     expect(params._openrouter).toBeUndefined();
   });
 
+  test("uses the chat id as OpenRouter's documented sticky-routing session key", () => {
+    const params: Record<string, unknown> = {};
+    __test__.injectConnectionMetadataFlags(
+      { provider: "openrouter", metadata: {} },
+      params,
+      "chat-123",
+    );
+    expect(params.session_id).toBe("lumiverse:chat-123");
+  });
+
+  test("does not replace a caller-provided OpenRouter session or cache key", () => {
+    const sessionParams: Record<string, unknown> = { session_id: "custom-session" };
+    __test__.injectConnectionMetadataFlags(
+      { provider: "openrouter", metadata: {} },
+      sessionParams,
+      "chat-123",
+    );
+    expect(sessionParams.session_id).toBe("custom-session");
+
+    const cacheKeyParams: Record<string, unknown> = { prompt_cache_key: "custom-cache-key" };
+    __test__.injectConnectionMetadataFlags(
+      { provider: "openrouter", metadata: {} },
+      cacheKeyParams,
+      "chat-123",
+    );
+    expect(cacheKeyParams.session_id).toBeUndefined();
+  });
+
   test("no-op for empty metadata", () => {
     const params: Record<string, unknown> = {};
     __test__.injectConnectionMetadataFlags(
@@ -1279,7 +1307,10 @@ describe.serial("root generation usage accounting", () => {
     initDatabase(":memory:");
     await runMigrations(getDb());
 
-    const userId = `root-usage-${scenario}`;
+    // The owner lookup is process-cached while this fixture replaces the in-memory DB.
+    // Re-seed the same owner identity after every reset so inherited settings retain
+    // a valid foreign-key principal across all scenarios in this serial suite.
+    const userId = "root-usage-owner";
     const hasResponseWorkPolicy =
       scenario === "response_loom" || scenario === "response_mentions";
     const hasResponsePhasePolicy =
@@ -1673,6 +1704,9 @@ describe.serial("root generation usage accounting", () => {
       chat_memory_mode: "balanced",
       request_timeout: 1,
       has_api_key: true,
+      connectionProfiles: [],
+      primaryProfileId: null,
+      fallbackProfileIds: [],
     });
     const searchSpy = spyOn(databankSvc, "searchDatabanks").mockImplementation(
       async (_userId, _chatId, databankIds) => {
@@ -1841,6 +1875,9 @@ describe.serial("root generation usage accounting", () => {
       chat_memory_mode: "balanced",
       request_timeout: 1,
       has_api_key: false,
+      connectionProfiles: [],
+      primaryProfileId: null,
+      fallbackProfileIds: [],
     });
 
     try {

@@ -910,11 +910,12 @@ That means an extension can opt out of host translation entirely by writing the 
 | Moonshot (Kimi K3) | `reasoning_effort: "max"` | Currently only `"max"` is supported |
 | Moonshot (Kimi K2.7 Code) | `thinking: { type: "enabled", keep: "all" }` | Thinking is always on; preserved-thinking config |
 | Moonshot (Kimi K2.6 / K2.5) | `thinking: { type: "enabled" }` | Toggle-only for these model families |
-| Z.AI (GLM-5.x) | `thinking: { type: "enabled" }` + `reasoning_effort` | `max \| xhigh \| high \| medium \| low \| minimal \| none` (API maps to max/high/none) |
+| Z.AI (GLM-5.3 / GLM-5.3-Flash) | `thinking: { type: "enabled" }` + `reasoning_effort` | Forced thinking; `low \| high \| max` |
+| Z.AI (older GLM-5.x) | `thinking: { type: "enabled" }` + `reasoning_effort` | `max \| xhigh \| high \| medium \| low \| minimal \| none` (API maps to max/high/none) |
 | Z.AI (GLM-4.x) | `thinking: { type: "enabled" }` | Toggle-only — `reasoning_effort` is not supported |
 | Generic OpenAI-compatible | `reasoning: { effort }` | Passed verbatim |
 
-When `apiReasoning: false` the host writes the provider's documented "no extended thinking" shape — `thinking: { type: "disabled" }` for Anthropic, DeepSeek, and Z.AI; `reasoning: { exclude: true }` for NanoGPT; `thinking: { type: "disabled" }` for Moonshot K2.6/K2.5; omission for Moonshot K3/K2.7-code (these models always think).
+When `apiReasoning: false` the host writes the provider's documented "no extended thinking" shape — `thinking: { type: "disabled" }` for Anthropic, DeepSeek, and Z.AI models that support disabling it; `thinking: { type: "enabled" }` with `reasoning_effort: "low"` for the forced-thinking GLM-5.3 family; `reasoning: { exclude: true }` for NanoGPT; `thinking: { type: "disabled" }` for Moonshot K2.6/K2.5; omission for Moonshot K3/K2.7-code (these models always think).
 
 ---
 

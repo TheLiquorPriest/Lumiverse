@@ -58,6 +58,7 @@ export interface PresetRegistryRow {
   name: string;
   provider: string;
   block_count: number;
+  cover_url: string | null;
   updated_at: number;
 }
 
@@ -128,7 +129,9 @@ export function listPresetRegistry(
   const filterSQL = filters.length > 0 ? " AND " + filters.join(" AND ") : "";
 
   return paginatedQuery<any, PresetRegistryRow>(
-    `SELECT id, name, provider, updated_at, COALESCE(json_array_length(prompt_order), 0) as block_count
+    `SELECT id, name, provider, updated_at,
+            COALESCE(json_array_length(prompt_order), 0) as block_count,
+            COALESCE(json_extract(metadata, '$.coverUrl'), json_extract(metadata, '$.cover_url')) as cover_url
      FROM presets
      WHERE user_id = ?${filterSQL}
      ORDER BY updated_at DESC`,
@@ -141,6 +144,7 @@ export function listPresetRegistry(
       provider: row.provider,
       updated_at: row.updated_at,
       block_count: row.block_count ?? 0,
+      cover_url: typeof row.cover_url === "string" && row.cover_url.trim() ? row.cover_url : null,
     })
   );
 }
@@ -236,9 +240,36 @@ export function reconcileActiveLoomPreset(userId: string): string | null {
 export function findPresetByLumihubId(userId: string, lumihubId: string): Preset | null {
   const row = getDb()
     .query(
-      "SELECT * FROM presets WHERE user_id = ? AND json_extract(metadata, '$._lumiverse_lumihub_id') = ? LIMIT 1"
+      `SELECT * FROM presets
+       WHERE user_id = ?
+         AND json_extract(metadata, '$._lumiverse_lumihub_id') = ?
+         AND (
+           json_extract(metadata, '$._lumiverse_install_source') = 'lumihub'
+           OR (
+             json_extract(metadata, '$._lumiverse_install_source') IS NULL
+             AND json_extract(metadata, '$._lumiverse_preset_version') IS NOT NULL
+           )
+         )
+       LIMIT 1`
     )
     .get(userId, lumihubId) as any;
+  return row ? rowToPreset(row) : null;
+}
+
+/** Find an Illarin preset by its immutable asset id for in-place updates. */
+export function findPresetByIllarinAssetId(userId: string, assetId: string): Preset | null {
+  const row = getDb()
+    .query(
+      `SELECT * FROM presets
+       WHERE user_id = ?
+         AND json_extract(metadata, '$._lumiverse_install_source') = 'illarin'
+         AND COALESCE(
+           json_extract(metadata, '$._lumiverse_illarin_asset_id'),
+           json_extract(metadata, '$._lumiverse_lumihub_id')
+         ) = ?
+       LIMIT 1`,
+    )
+    .get(userId, assetId) as any;
   return row ? rowToPreset(row) : null;
 }
 

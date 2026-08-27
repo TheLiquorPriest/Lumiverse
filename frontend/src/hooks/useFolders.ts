@@ -80,7 +80,7 @@ export function useFolders(
       setStoredFolders((prev) => {
         const next = prev.filter((f) => f !== source)
         if (!next.includes(target)) next.push(target)
-        scheduleLowPriorityTask(() => persistFolders(next), { label: 'persist renamed folder' })
+        scheduleLowPriorityTask(() => persistFolders(next), { label: 'persist renamed folders' })
         return next
       })
     },
@@ -91,7 +91,7 @@ export function useFolders(
     (name: string) => {
       setStoredFolders((prev) => {
         const next = prev.filter((f) => f !== name)
-        scheduleLowPriorityTask(() => persistFolders(next), { label: 'persist deleted folder' })
+        scheduleLowPriorityTask(() => persistFolders(next), { label: 'persist deleted folders' })
         return next
       })
     },

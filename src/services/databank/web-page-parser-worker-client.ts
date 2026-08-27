@@ -62,6 +62,18 @@ function destroyWorker(poolWorker: PoolWorker): void {
   poolWorker.worker.terminate();
 }
 
+/** Reap parser isolates immediately instead of waiting for their idle TTL. */
+export function releaseIdleWebPageParserWorkers(): number {
+  if (waiting.length > 0) return 0;
+  let released = 0;
+  for (const poolWorker of [...pool]) {
+    if (poolWorker.job) continue;
+    destroyWorker(poolWorker);
+    released++;
+  }
+  return released;
+}
+
 function markIdle(poolWorker: PoolWorker): void {
   if (poolWorker.idleTimer) clearTimeout(poolWorker.idleTimer);
   poolWorker.idleTimer = setTimeout(() => {

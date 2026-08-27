@@ -15,13 +15,18 @@ if (!("BUN_RUNTIME_TRANSPILER_CACHE_PATH" in process.env)) {
 }
 
 // ── Bun version gate ────────────────────────────────────────────────────────
-// Bun 1.3.10-1.3.12 can panic on occupied Windows IPC named pipes during
-// runner/extension restarts; 1.3.13 contains the upstream fix.
+// Bun 1.4 includes package-install, runtime, and Windows IPC fixes required by
+// Lumiverse, along with the production memory and stream improvements we rely on.
 const [_bunMaj = 0, _bunMin = 0, _bunPat = 0] = Bun.version
   .split(".")
   .map((part) => Number.parseInt(part, 10) || 0);
-if (_bunMaj < 1 || (_bunMaj === 1 && (_bunMin < 3 || (_bunMin === 3 && _bunPat < 13)))) {
-  console.error(`[startup] Bun ${Bun.version} is too old — Lumiverse requires Bun >= 1.3.13.`);
+const _bunMinimum: readonly [number, number, number] = [1, 4, 0];
+const [_requiredBunMaj, _requiredBunMin, _requiredBunPat] = _bunMinimum;
+const _bunTooOld = _bunMaj < _requiredBunMaj
+  || (_bunMaj === _requiredBunMaj
+    && (_bunMin < _requiredBunMin || (_bunMin === _requiredBunMin && _bunPat < _requiredBunPat)));
+if (_bunTooOld) {
+  console.error(`[startup] Bun ${Bun.version} is too old — Lumiverse requires Bun >= ${_bunMinimum.join(".")} on this platform.`);
   console.error(`[startup] Update with ${process.platform === "win32" ? ".\\start.ps1" : "./start.sh"}.`);
   process.exit(1);
 }

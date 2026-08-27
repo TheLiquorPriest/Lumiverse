@@ -1,8 +1,8 @@
-import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
+import { useState, useCallback, useEffect, useRef, useMemo, useSyncExternalStore } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 
-import { Plus, Upload, Download, Trash2, Globe, User, MessageCircle, ChevronRight, FolderPlus, Check, X, Link, Unlink, TriangleAlert, GripVertical, Power, PowerOff, ListChecks, Square, CheckSquare } from 'lucide-react'
+import { Plus, Upload, Download, Trash2, Globe, User, MessageCircle, ChevronRight, FolderPlus, Check, X, Link, Unlink, TriangleAlert, ShieldAlert, GripVertical, Power, PowerOff, ListChecks, Square, CheckSquare } from 'lucide-react'
 import {
   DndContext,
   MouseSensor,
@@ -32,6 +32,12 @@ import { Toggle } from '@/components/shared/Toggle'
 import { Badge } from '@/components/shared/Badge'
 import ConfirmationModal from '@/components/shared/ConfirmationModal'
 import type { RegexScript, RegexScope, RegexPerformanceMetadata } from '@/types/regex'
+import {
+  clearRegexScriptQuarantine,
+  getRegexEvidenceVersion,
+  isRegexScriptQuarantined,
+  subscribeRegexEvidence,
+} from '@/lib/regex/evidence'
 import { resolveRegexCreateScope, type RegexPanelScopeFilterValue } from './regexPanelScope'
 import styles from './RegexPanel.module.css'
 import clsx from 'clsx'
@@ -88,6 +94,67 @@ function getRegexPerformanceMetadata(script: RegexScript): RegexPerformanceMetad
   return raw as RegexPerformanceMetadata
 }
 
+type RemotePresetVersion = { source: 'lumihub' | 'illarin'; version: string }
+
+function getRemotePresetVersions(
+  scripts: RegexScript[],
+  presets: Record<string, { metadata?: Record<string, unknown> }>,
+): RemotePresetVersion[] {
+  const versions = new Map<string, RemotePresetVersion>()
+  for (const script of scripts) {
+    let attributed = false
+    for (const source of ['lumihub', 'illarin'] as const) {
+      const key = source === 'lumihub' ? '_lumiverse_lumihub_preset' : '_lumiverse_illarin_preset'
+      const attribution = script.metadata?.[key]
+      const attributedVersion = attribution && typeof attribution === 'object'
+        && 'version' in attribution && typeof attribution.version === 'string'
+        ? attribution.version.trim()
+        : ''
+      if (attributedVersion) {
+        versions.set(`${source}:${attributedVersion}`, { source, version: attributedVersion })
+        attributed = true
+      }
+    }
+    if (attributed) continue
+
+    const preset = script.preset_id ? presets[script.preset_id] : undefined
+    const source = preset?.metadata?._lumiverse_install_source
+    if (source !== 'lumihub' && source !== 'illarin') continue
+    const version = typeof preset.metadata._lumiverse_preset_version === 'string'
+      ? preset.metadata._lumiverse_preset_version.trim()
+      : ''
+    if (version) versions.set(`${source}:${version}`, { source, version })
+  }
+  return [...versions.values()].sort((left, right) => (
+    left.source.localeCompare(right.source)
+    || left.version.localeCompare(right.version, undefined, { numeric: true, sensitivity: 'base' })
+  ))
+}
+
+function getSpindleExtensionFolderVersions(
+  scripts: RegexScript[],
+): Array<{ identifier: string; version: string }> {
+  const versions = new Map<string, { identifier: string; version: string }>()
+  for (const script of scripts) {
+    const owner = script.owner_extension_identifier?.trim()
+    if (!owner || !script.folder.trim()) continue
+    const attribution = script.metadata?._lumiverse_spindle_extension
+    if (!attribution || typeof attribution !== 'object') continue
+    const identifier = typeof attribution.identifier === 'string' ? attribution.identifier.trim() : ''
+    const version = typeof attribution.version === 'string' ? attribution.version.trim() : ''
+    if (!identifier || identifier !== owner || !version) continue
+    versions.set(`${identifier}\u0000${version}`, { identifier, version })
+  }
+  return [...versions.values()].sort((left, right) => {
+    const byVersion = left.version.localeCompare(right.version, undefined, { numeric: true, sensitivity: 'base' })
+    return byVersion || left.identifier.localeCompare(right.identifier)
+  })
+}
+
+function formatVersionLabel(version: string): string {
+  return /^v/i.test(version) ? version : `v${version}`
+}
+
 export default function RegexPanel() {
   const { t } = useTranslation('panels')
   const { t: tc } = useTranslation('common')
@@ -106,6 +173,7 @@ export default function RegexPanel() {
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const activeChatId = useStore((s) => s.activeChatId)
   const activeLoomPresetId = useStore((s) => s.activeLoomPresetId)
+  const presets = useStore((s) => s.presets)
 
   const [scopeFilter, setScopeFilter] = useState<RegexPanelScopeFilterValue>('all')
   const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -775,6 +843,8 @@ export default function RegexPanel() {
                   const isCollapsed = collapsedFolders.has(folderKey)
                   const folderLabel = group.folder || t('shared:uncategorized')
                   const isNamedFolder = Boolean(group.folder)
+                  const presetVersions = getRemotePresetVersions(group.scripts, presets)
+                  const spindleVersions = getSpindleExtensionFolderVersions(group.scripts)
                   return (
                     <div key={folderKey}>
                       <DroppableFolderHeader folderKey={folderKey} dropDisabled={!isCollapsed} onToggle={() => toggleFolder(folderKey)}>
@@ -803,6 +873,26 @@ export default function RegexPanel() {
                         <span className={styles.folderName}>
                           {folderLabel}
                         </span>
+                        {presetVersions.map(({ source, version }) => (
+                          <span
+                            key={`${source}:${version}`}
+                            className={styles.folderVersionBadge}
+                            title={t(source === 'illarin' ? 'regexPanel.illarinPresetVersion' : 'regexPanel.lumihubPresetVersion', {
+                              version: formatVersionLabel(version),
+                            })}
+                          >
+                            <Badge color="info" size="sm">{formatVersionLabel(version)}</Badge>
+                          </span>
+                        ))}
+                        {spindleVersions.map(({ identifier, version }) => (
+                          <span
+                            key={`${identifier}:${version}`}
+                            className={styles.folderVersionBadge}
+                            title={t('regexPanel.spindleExtensionVersion', { identifier, version: formatVersionLabel(version) })}
+                          >
+                            <Badge color="primary" size="sm">{formatVersionLabel(version)}</Badge>
+                          </span>
+                        ))}
                         <span className={styles.folderCount}>{group.scripts.length}</span>
                         {!bulkMode && <div className={styles.folderActions}>
                           {group.scripts.length > 0 && (
@@ -1103,6 +1193,36 @@ function ScriptRow({
       : t('regexPanel.slowDetected', { seconds: (performance.elapsed_ms / 1000).toFixed(1) })
     : null
 
+  // Quarantine can be set by the display pipeline mid-session, outside any
+  // store write, so the row subscribes to the evidence module instead of
+  // reading script.metadata. The overlay is the source of truth: it also
+  // reflects a clear that has not been refetched from the server yet.
+  useSyncExternalStore(
+    subscribeRegexEvidence,
+    getRegexEvidenceVersion,
+    getRegexEvidenceVersion,
+  )
+  const quarantined = isRegexScriptQuarantined(script)
+  const [clearingQuarantine, setClearingQuarantine] = useState(false)
+  const loadRegexScripts = useStore((s) => s.loadRegexScripts)
+
+  const handleClearQuarantine = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setClearingQuarantine(true)
+    try {
+      await clearRegexScriptQuarantine(script)
+      // Refetch so script.metadata.regex_evidence matches the cleared row.
+      // updateRegexScript() was rejected for this: it would issue a write (and
+      // bump updated_at) purely to read state back.
+      await loadRegexScripts()
+      toast.success(t('regexPanel.quarantineCleared', { name: script.name }))
+    } catch (err: any) {
+      toast.error(err.body?.error || err.message || t('regexPanel.requestFailed'))
+    } finally {
+      setClearingQuarantine(false)
+    }
+  }, [script, loadRegexScripts, t])
+
   return (
     <div ref={setNodeRef} style={rowStyle}>
       <div
@@ -1150,6 +1270,15 @@ function ScriptRow({
             <TriangleAlert size={12} /> {t('regexPanel.slow')}
           </span>
         )}
+        {quarantined && (
+          <span
+            className={styles.slowBadge}
+            title={t('regexPanel.quarantinedDetail')}
+            aria-label={t('regexPanel.quarantinedDetail')}
+          >
+            <ShieldAlert size={12} /> {t('regexPanel.quarantined')}
+          </span>
+        )}
         {targetBadge}
         {!selectionMode && <div onClick={(e) => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center' }}>
           <Toggle.Switch
@@ -1173,6 +1302,7 @@ function ScriptRow({
             <Trash2 size={13} />
           </Button>
         )}
+        <span data-spindle-mount="regex_entry_row" data-spindle-scope={`regex-entry:${script.id}:row`} style={{ display: 'contents' }} />
       </div>
 
       {expanded && !selectionMode && (
@@ -1198,6 +1328,22 @@ function ScriptRow({
                   ? t('regexPanel.timedOutDetail')
                   : t('regexPanel.slowDetail', { seconds: (performance.elapsed_ms / 1000).toFixed(1) })}
               </span>
+            </div>
+          )}
+          {quarantined && (
+            <div className={styles.warningBox}>
+              <ShieldAlert size={14} />
+              <span>{t('regexPanel.quarantinedDetail')}</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className={styles.warningBoxAction}
+                onClick={handleClearQuarantine}
+                loading={clearingQuarantine}
+                aria-label={t('regexPanel.clearQuarantineAria', { name: script.name })}
+              >
+                {t('regexPanel.clearQuarantine')}
+              </Button>
             </div>
           )}
           <div className={styles.field}>

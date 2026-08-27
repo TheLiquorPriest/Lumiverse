@@ -22,12 +22,12 @@ import { uuidv7 } from '@/lib/uuid'
 import { toast } from '@/lib/toast'
 import { shouldForceLoomRuntimePreset } from '@/lib/loom/runtimeProfile'
 import { unmarshalPreset } from '@/lib/loom/service'
-import { presetSaveCoordinator, StalePresetHydrationError } from '@/lib/loom/preset-save-coordinator'
-import { resolveAutoPersonaBinding } from '@/store/slices/personas'
 import {
   inspectPromptVariablesAvailability,
   type PromptVariablesAvailability,
 } from '@/lib/loom/prompt-variable-availability'
+import { presetSaveCoordinator, StalePresetHydrationError } from '@/lib/loom/preset-save-coordinator'
+import { resolveAutoPersonaBinding } from '@/store/slices/personas'
 import {
   CHAT_PERSONA_METADATA_KEY,
   getPersistedChatPersonaId,
@@ -92,7 +92,8 @@ import {
 import { registerChatDockerActionOwners } from './chatDockerActionCatalog'
 import { acknowledgeConnectionProfileSelection } from '@/lib/uiProductivityDefaults'
 import { useSpindleComponentOverride } from '@/lib/spindle/use-spindle-component-override'
-import { readProductivityFlag } from '@/lib/spindle/productivity-feature-toggles'
+import { readProductivityFeature } from '@/lib/spindle/productivity-feature-toggles'
+import { hasEnabledFrontendExtension } from '@/lib/spindle/frontend-extension-availability'
 import { useQuickToolbarActions } from '@/components/quick-toolbar/useQuickToolbarActions'
 import InputAreaCustomizeModal, {
   fromComposerExtraId,
@@ -110,6 +111,7 @@ import {
   acceptGenerationStarted,
   startGenerationWithRecovery,
 } from '@/lib/generation-recovery'
+import { isExtensionComposerActionId } from './composerActionOwnership'
 
 interface InputAreaProps {
   chatId: string
@@ -170,16 +172,6 @@ function resolveGenerationErrorMessage(
       : fallback
 }
 
-function hasLumiverseSuiteExtension(value: unknown): boolean {
-  if (!Array.isArray(value)) return false
-  return value.some((extension) => {
-    if (!extension || typeof extension !== 'object') return false
-    if (!('identifier' in extension) || !('enabled' in extension) || !('has_frontend' in extension)) return false
-    return extension.identifier === 'lumiverse_suite'
-      && extension.enabled === true
-      && extension.has_frontend === true
-  })
-}
 
 const STT_IDLE_BARS = Array.from({ length: STT_VISUALIZER_BARS }, (_, index) => {
   const centerBias = 1 - Math.abs(index - ((STT_VISUALIZER_BARS - 1) / 2)) / (STT_VISUALIZER_BARS / 2)
@@ -359,11 +351,9 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const composerActionBar = useComposerActionBar()
   const { actionById: qtActionById } = useQuickToolbarActions()
   const messageSelectMode = useStore((s) => s.messageSelectMode)
-  const enableToolbarIconReorder = useStore((state) => readProductivityFlag(state, 'enableToolbarIconReorder'))
-  const showComposerCustomizeGear = useStore((state) => readProductivityFlag(state, 'showComposerCustomizeGear'))
-  const hasLumiverseSuite = useStore((state) => hasLumiverseSuiteExtension(
-    'extensions' in state ? state.extensions : undefined,
-  ))
+  const enableToolbarIconReorder = useStore((state) => readProductivityFeature(state, 'enableToolbarIconReorder'))
+  const showComposerCustomizeGear = useStore((state) => readProductivityFeature(state, 'showComposerCustomizeGear'))
+  const hasLumiverseSuite = useStore((state) => hasEnabledFrontendExtension(state.extensions, 'lumiverse_suite'))
   const [openPopover, setOpenPopover] = useState<null | 'guides' | 'quick' | 'persona' | 'tools' | 'extras' | 'altFields' | 'addons' | 'databank' | 'groupMember' | 'connections'>(null)
   const [promptVariablesAvailability, setPromptVariablesAvailability] = useState<PromptVariablesAvailability | null>(null)
   const [memoryCortexInFlight, setMemoryCortexInFlight] = useState(false)
@@ -450,7 +440,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   )
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const activeGroupCharacterId = useStore((s) => s.activeGroupCharacterId)
-  const enterToSend = useStore((s) => s.chatSheldEnterToSend)
+  const enterToSend = useStore((s) => s.inputBarEnterToSend)
   const saveDraftInput = useStore((s) => s.saveDraftInput)
   const activeProfileId = useStore((s) => s.activeProfileId)
   const profiles = useStore((s) => s.profiles)
@@ -2540,6 +2530,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     if (feedback) {
       genOpts.regen_feedback = feedback
       genOpts.regen_feedback_position = regenFeedback.position
+      genOpts.regen_feedback_format = regenFeedback.format
     }
 
     let placeholderId: string | null = null
@@ -2640,7 +2631,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         generationAbortControllerRef.current = null
       }
     }
-  }, [chatId, isGeneratingInChat, messages, isGroupChat, isTemporaryChat, focusedPreviewCharacterId, mpRoomId, activeGenerationId, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, regenFeedback.position, retainCouncilForRegens, addMessage, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, t, te])
+  }, [chatId, isGeneratingInChat, messages, isGroupChat, isTemporaryChat, focusedPreviewCharacterId, mpRoomId, activeGenerationId, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, regenFeedback.position, regenFeedback.format, retainCouncilForRegens, addMessage, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, t, te])
 
   const handleRegenerate = useCallback(() => {
     if (isGeneratingInChat) return
@@ -3066,6 +3057,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     promptVariablesLoading,
     memoryCortexInFlight,
   ])
+
 
   const handleDryRun = useCallback(async () => {
     if (dryRunning || isGeneratingInChat) return
@@ -3809,7 +3801,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
               <Link2 size={14} />
             </button>
           ),
-          connectionsPicker: (() => {
+          connectionsPicker: hasLumiverseSuite ? (() => {
             const picker = qtActionById.get('lumiverse_suite.connections_picker.open')
             if (!picker || picker.hidden) return null
             const Icon = picker.icon
@@ -3829,7 +3821,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                 <Icon size={14} />
               </button>
             )
-          })(),
+          })() : null,
           altFields: altFieldsButton,
           addons: activePersonaId ? (
             <button
@@ -3933,11 +3925,16 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
               order={composerActionBar.order}
               isVisible={composerActionBar.isVisible}
               reorder={composerActionBar.reorder}
-              enableReorder={enableToolbarIconReorder}
+              enableReorder={hasLumiverseSuite && enableToolbarIconReorder}
               renderUnit={(id) => {
-                if (isComposerActionId(id)) return composerActions[id]
-                if (fromComposerExtraId(id) === 'lumiverse_suite.connections_picker.open') return composerActions.connectionsPicker
-                const action = qtActionById.get(fromComposerExtraId(id))
+                if (isComposerActionId(id)) {
+                  if (!hasLumiverseSuite && isExtensionComposerActionId(id)) return null
+                  return composerActions[id]
+                }
+                const extraId = fromComposerExtraId(id)
+                if (!hasLumiverseSuite && isExtensionComposerActionId(extraId)) return null
+                if (extraId === 'lumiverse_suite.connections_picker.open') return composerActions.connectionsPicker
+                const action = qtActionById.get(extraId)
                 if (!action || action.hidden) return null
                 const Icon = action.icon
                 return (
@@ -3981,7 +3978,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         )
       })()}
 
-      {customizeOpen && (
+      {hasLumiverseSuite && customizeOpen && (
         <InputAreaCustomizeModal
           onClose={() => setCustomizeOpen(false)}
           order={composerActionBar.order}
@@ -4012,9 +4009,20 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                 </>
               )}
               {guidedGenerations.map((g) => (
-                <button key={g.id} type="button" className={styles.popRowBtn} onClick={() => toggleGuide(g.id)}>
-                  <span>{g.name}</span>
-                  <span className={styles.popMeta}>{g.enabled ? t('on') : t('off')} • {g.mode}</span>
+                <button
+                  key={g.id}
+                  type="button"
+                  className={clsx(styles.popRowBtn, g.enabled && styles.popRowBtnActive)}
+                  onClick={() => toggleGuide(g.id)}
+                  aria-pressed={g.enabled}
+                >
+                  <span className={styles.personaMain}>
+                    <span className={clsx(styles.popState, g.enabled && styles.popStateActive)}>
+                      {g.enabled ? t('on') : t('off')}
+                    </span>
+                    <span>{g.name}</span>
+                  </span>
+                  <span className={styles.popMeta}>{g.mode}</span>
                 </button>
               ))}
               <button type="button" className={styles.popLink} onClick={() => {
@@ -4217,28 +4225,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                 <span className={styles.personaMain}>
                   <Settings2 size={14} />
                   <span>{isGroupChat ? t('quickMenu.groupSettings') : t('quickMenu.chatSettings')}</span>
-                </span>
-              </button>
-              <button
-                type="button"
-                className={styles.popRowBtn}
-                onClick={() => void openPromptVariablesModal()}
-                disabled={!activeLoomPresetId || promptVariablesLoading}
-                style={!activeLoomPresetId || promptVariablesLoading ? { opacity: 0.5 } : undefined}
-                title={!activeLoomPresetId ? t('quickMenu.promptVariablesSelectPreset') : undefined}
-              >
-                <span className={styles.personaMain}>
-                  <Sliders size={14} />
-                  <span className={styles.personaNameGroup}>
-                    <span>{t('quickMenu.promptVariables')}</span>
-                    <span className={styles.personaTitle}>
-                      {promptVariablesLoading
-                        ? t('quickMenu.loadingPromptVariables')
-                        : activeLoomPresetName
-                          ? t('quickMenu.promptVariablesFor', { name: activeLoomPresetName })
-                          : t('quickMenu.promptVariablesActivePreset')}
-                    </span>
-                  </span>
                 </span>
               </button>
               {!isGroupChat && activeCharacterId && (

@@ -15,7 +15,10 @@
     var(--lumiverse-bg-elevated, rgba(28, 24, 38, 0.95));
   border: 1px solid var(--lumiverse-border);
   border-radius: var(--lcs-radius, 14px);
-  overflow: hidden;
+  /* Visible so the type field cannot be clipped by the glass pill or by
+     extension nodes that used to share the input row. Corners still clip via
+     child radii; drop overlay is inset-absolute. */
+  overflow: visible;
   /* Paint containment plus a stacked overlay can produce stale WebRender tiles
      under Firefox's fractional CSS zoom. Layout/style containment retains the
      useful isolation without forcing the composer into its own paint surface. */
@@ -97,8 +100,51 @@
 .actionBar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 2px;
   padding: 0 2px;
+  min-width: 0;
+}
+
+.composerReorderUnit {
+  display: contents;
+}
+
+.composerReorderUnit[data-toolbar-item-drag-handle] .actionBtn,
+.composerReorderUnit .actionBtn {
+  cursor: grab;
+}
+
+.composerReorderUnit .actionBtn:active:not([data-dragging]) {
+  transform: scale(0.97);
+}
+
+.composerReorderUnit[data-dragging] .actionBtn,
+.composerReorderUnit[data-dragging] .actionDivider {
+  opacity: 1;
+  cursor: grabbing;
+  transform: scale(1.05) translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  outline: 2px solid var(--lumiverse-primary);
+  z-index: 100;
+  position: relative;
+}
+
+.actionBar button[aria-label='Customize composer'],
+.composerCustomizeGear {
+  cursor: pointer !important;
+}
+
+.extensionToolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+}
+
+.extensionToolbar:empty {
+  display: none;
 }
 
 .actionDivider {
@@ -113,6 +159,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   width: 44px;
   min-width: 44px;
   height: 44px;
@@ -410,6 +457,17 @@
   color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.4));
 }
 
+.popState {
+  flex-shrink: 0;
+  font-size: calc(10px * var(--lumiverse-font-scale, 1));
+  font-weight: 600;
+  color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.4));
+}
+
+.popStateActive {
+  color: var(--lumiverse-primary, rgba(140, 130, 255, 0.9));
+}
+
 .popLink {
   border: none;
   background: transparent;
@@ -606,12 +664,27 @@
   display: flex;
   align-items: flex-end;
   gap: 8px;
+  min-width: 0;
+}
+
+.inputToolsSlot {
+  display: flex;
+  align-items: flex-end;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 28%;
+  overflow: hidden;
+}
+
+.inputToolsSlot:empty {
+  display: none;
 }
 
 .inputWrapper {
-  flex: 1;
+  flex: 1 1 auto;
   display: flex;
   align-items: flex-end;
+  min-width: 8rem;
   min-height: 40px;
   max-height: 180px;
   border-radius: var(--lcs-radius, 14px);
@@ -1183,11 +1256,28 @@
   .actionBar {
     gap: 1px;
     padding: 0;
+    max-width: 100%;
+    min-width: 0;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .actionBar::-webkit-scrollbar {
+    display: none;
   }
 
   .actionBtn {
     width: 44px;
     min-width: 44px;
+    flex: 0 0 44px;
+  }
+
+  .actionBar :global([data-spindle-quick-toolbar-action]),
+  .actionBar :global([data-extension-action]) {
+    flex-shrink: 0;
   }
 
   :global(html[data-ios-pwa]) .container {
@@ -1261,8 +1351,14 @@
   display: contents;
 }
 
+/* ── Composer action-bar customizer (InputAreaCustomizeModal) ── */
 .customizeModal {
-  width: min(100%, 560px);
+  width: min(560px, calc(100vw - 32px));
+  padding: 0;
+  overflow: hidden;
+  box-shadow:
+    var(--lumiverse-shadow-xl),
+    0 0 40px var(--lumiverse-primary-020);
 }
 
 .customizeDialog {
@@ -1274,14 +1370,20 @@
 }
 
 .customizeHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   flex: 0 0 auto;
-  padding: 4px 40px 10px 2px;
+  padding: 22px 24px 16px;
+  border-bottom: 1px solid var(--lumiverse-border);
 }
 
 .customizeTitle {
   margin: 0;
   color: var(--lumiverse-text);
-  font-size: calc(17px * var(--lumiverse-font-scale, 1));
+  font-size: calc(16px * var(--lumiverse-font-scale, 1));
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
 
 .customizeSubtitle {
@@ -1292,39 +1394,49 @@
 }
 
 .customizeBody {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
+  gap: 12px;
   overflow: auto;
-  padding: 2px;
+  padding: 16px 18px 18px;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .customizeSectionHeader {
-  display: grid;
-  gap: 6px;
-  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
 .customizeSectionTitle {
   margin: 0;
-  color: var(--lumiverse-text);
-  font-size: calc(13px * var(--lumiverse-font-scale, 1));
+  color: var(--lumiverse-text-secondary, var(--lumiverse-text-muted));
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 .customizeSectionDescription {
   margin: 0;
   color: var(--lumiverse-text-dim);
-  font-size: calc(11px * var(--lumiverse-font-scale, 1));
+  font-size: calc(11.5px * var(--lumiverse-font-scale, 1));
+  line-height: 1.45;
 }
 
 .customizeSearchField {
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-height: 36px;
-  padding: 0 10px;
+  gap: 7px;
+  margin-top: 3px;
+  padding: 7px 9px;
   border: 1px solid var(--lumiverse-border);
-  border-radius: var(--lcs-radius-xs, 6px);
+  border-radius: var(--lumiverse-radius-sm);
+  background: var(--lumiverse-fill-subtle);
   color: var(--lumiverse-text-dim);
-  background: var(--lumiverse-fill);
+  transition: border-color var(--lumiverse-transition-fast), box-shadow var(--lumiverse-transition-fast);
 }
 
 .customizeSearchField:focus-within {
@@ -1334,118 +1446,144 @@
 
 .customizeSearchField input {
   min-width: 0;
-  flex: 1;
+  flex: 1 1 auto;
   border: 0;
   outline: 0;
-  color: var(--lumiverse-text);
   background: transparent;
+  color: var(--lumiverse-text);
   font: inherit;
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+}
+
+.customizeSearchField input::placeholder {
+  color: var(--lumiverse-text-muted);
 }
 
 .customizeList {
-  display: grid;
-  gap: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
 }
 
 .customizeEmptyState {
-  margin: 12px 2px;
+  margin: 0;
+  padding: 30px 18px;
+  border: 1px dashed var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius-lg);
   color: var(--lumiverse-text-dim);
   font-size: calc(12px * var(--lumiverse-font-scale, 1));
   text-align: center;
 }
 
 .customizeRow {
-  display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
-  gap: 9px;
-  min-height: 52px;
-  padding: 6px 8px;
-  border: 1px solid var(--lumiverse-border);
-  border-radius: var(--lcs-radius-xs, 6px);
-  background: color-mix(in srgb, var(--lumiverse-fill) 54%, transparent);
+  gap: 10px;
+  min-height: 48px;
+  padding: 7px 10px 7px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--lumiverse-radius-md);
+  background: var(--lumiverse-fill-subtle);
+  transition: border-color var(--lumiverse-transition-fast), background var(--lumiverse-transition-fast), opacity var(--lumiverse-transition-fast);
 }
 
-.customizeRowDragging {
-  border-color: var(--lumiverse-primary-050);
-  box-shadow: var(--lumiverse-focus-ring);
+.customizeRow:hover {
+  border-color: var(--lumiverse-border);
+  background: var(--lumiverse-fill);
 }
 
 .customizeRowDisabled {
-  opacity: 0.68;
+  opacity: 0.62;
+}
+
+.customizeRowDragging {
+  z-index: 1000;
+  border-color: var(--lumiverse-primary);
+  opacity: 0.96;
+  background: var(--lumiverse-surface-elevated);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.4),
+    0 0 0 1px var(--lumiverse-primary);
 }
 
 .customizeDragHandle {
   display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 34px;
+  flex-shrink: 0;
+  width: 22px;
+  height: 30px;
+  padding: 0;
   border: 0;
-  border-radius: var(--lcs-radius-xs, 6px);
-  color: var(--lumiverse-text-dim);
+  border-radius: var(--lumiverse-radius-xs);
   background: transparent;
+  color: var(--lumiverse-text-muted);
   cursor: grab;
+  touch-action: none;
 }
 
-.customizeDragHandle:hover:not(:disabled),
-.customizeDragHandle:focus-visible {
+.customizeDragHandle:hover:not(:disabled) {
   color: var(--lumiverse-text);
-  background: var(--lumiverse-fill);
+  background: var(--lumiverse-fill-hover);
 }
 
-.customizeDragHandle:focus-visible {
+.customizeDragHandle:focus-visible,
+.customizeResetButton:focus-visible,
+.customizeDoneButton:focus-visible {
   outline: 2px solid var(--lumiverse-primary-050);
-  outline-offset: 1px;
-  box-shadow: var(--lumiverse-focus-ring);
+  outline-offset: 2px;
 }
 
 .customizeDragHandle:disabled {
-  cursor: not-allowed;
-  opacity: 0.45;
+  cursor: default;
 }
 
 .customizeIconWrap {
   display: inline-flex;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  border-radius: var(--lumiverse-radius-sm);
+  background: var(--lumiverse-primary-015);
   color: var(--lumiverse-primary);
 }
 
 .customizeCopy {
+  display: flex;
+  flex: 1 1 auto;
   min-width: 0;
-}
-
-.customizeRowTitle,
-.customizeRowDescription {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex-direction: column;
 }
 
 .customizeRowTitle {
+  overflow: hidden;
   color: var(--lumiverse-text);
-  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-size: calc(12.5px * var(--lumiverse-font-scale, 1));
   font-weight: 650;
+  line-height: 1.3;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .customizeRowDescription {
-  margin: 3px 0 0;
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 2px 0 0;
   color: var(--lumiverse-text-dim);
   font-size: calc(11px * var(--lumiverse-font-scale, 1));
-  line-height: 1.3;
-  white-space: nowrap;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .customizeFooter {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   flex: 0 0 auto;
-  padding: 12px 2px 2px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--lumiverse-border);
 }
 
 .customizeResetButton,
@@ -1453,42 +1591,71 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  min-height: 36px;
-  padding: 0 12px;
-  border: 1px solid var(--lumiverse-border);
-  border-radius: var(--lcs-radius-xs, 6px);
-  color: var(--lumiverse-text);
-  background: var(--lumiverse-fill);
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 16px;
+  border-radius: var(--lumiverse-radius-sm);
+  font-size: calc(12px * var(--lumiverse-font-scale, 1));
+  font-weight: 600;
   cursor: pointer;
-  font: inherit;
+  transition: background var(--lumiverse-transition-fast), color var(--lumiverse-transition-fast), border-color var(--lumiverse-transition-fast);
+}
+
+.customizeResetButton {
+  border: 1px solid var(--lumiverse-border);
+  background: transparent;
+  color: var(--lumiverse-text-secondary);
+}
+
+.customizeResetButton:hover {
+  border-color: var(--lumiverse-border-hover);
+  background: var(--lumiverse-fill-hover);
+  color: var(--lumiverse-text);
 }
 
 .customizeDoneButton {
-  border-color: var(--lumiverse-primary-050);
+  border: 1px solid var(--lumiverse-primary-040);
   background: var(--lumiverse-primary-020);
+  color: var(--lumiverse-primary);
 }
 
-.customizeResetButton:hover,
-.customizeDoneButton:hover,
-.customizeResetButton:focus-visible,
-.customizeDoneButton:focus-visible {
-  border-color: var(--lumiverse-primary-050);
-}
-
-.customizeResetButton:focus-visible,
-.customizeDoneButton:focus-visible {
-  outline: 2px solid var(--lumiverse-primary-050);
-  outline-offset: 2px;
-  box-shadow: var(--lumiverse-focus-ring);
+.customizeDoneButton:hover {
+  background: var(--lumiverse-primary-030);
+  color: var(--lumiverse-text);
 }
 
 @media (max-width: 600px) {
+  .customizeModal {
+    width: min(100%, calc(100vw - 16px));
+    max-height: min(86vh, 720px);
+  }
+
   .customizeDialog {
-    max-height: min(82vh, 720px);
+    max-height: min(86vh, 720px);
+  }
+
+  .customizeHeader {
+    padding: 18px 18px 14px;
+  }
+
+  .customizeBody {
+    padding: 14px 12px 16px;
+  }
+
+  .customizeFooter {
+    padding: 10px 12px;
+  }
+
+  .customizeRow {
+    padding-right: 8px;
   }
 
   .customizeRowDescription {
-    white-space: normal;
+    -webkit-line-clamp: 1;
+  }
+
+  .customizeResetButton,
+  .customizeDoneButton {
+    padding-right: 14px;
   }
 }

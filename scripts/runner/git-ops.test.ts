@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
+  FRONTEND_BUILD_STEPS,
+  bunInstallCmd,
+  hardSyncRefusalMessage,
   inspectDependencyTree,
   packageInstallInputsChanged,
   planChangedDependencies,
@@ -32,7 +35,9 @@ function writePackageJson(
 }
 
 function installPackage(dir: string, packageName: string): void {
-  mkdirSync(join(dir, "node_modules", ...packageName.split("/")), { recursive: true });
+  const packageDir = join(dir, "node_modules", ...packageName.split("/"));
+  mkdirSync(packageDir, { recursive: true });
+  writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: packageName, version: "1.0.0" }));
 }
 
 afterEach(() => {
@@ -62,6 +67,43 @@ test("keeps a manual install without a runner stamp", () => {
   expect(existsSync(join(dir, "node_modules", ".lumiverse-install-complete"))).toBe(true);
   expect(existsSync(join(dir, "node_modules", "hono"))).toBe(true);
   expect(existsSync(join(dir, "node_modules", "bun-types"))).toBe(true);
+});
+
+test("treats an empty direct package directory as an incomplete install", () => {
+  const dir = makeTempDir();
+  writePackageJson(dir, { dependencies: ["linkedom"] });
+  mkdirSync(join(dir, "node_modules", "linkedom"), { recursive: true });
+
+  expect(inspectDependencyTree(dir).missingPackages).toEqual(["linkedom"]);
+});
+
+test("uses copyfile installs on Windows", () => {
+  expect(bunInstallCmd("win32")).toEqual(["bun", "install", "--backend=copyfile"]);
+  expect(bunInstallCmd("linux")).toEqual(["bun", "install"]);
+});
+
+test("reports frontend build phases separately while preserving their order", () => {
+  expect(FRONTEND_BUILD_STEPS.map(({ label, command }) => ({ label, command }))).toEqual([
+    {
+      label: "frontend component metadata extraction",
+      command: ["bun", "run", "extract-props"],
+    },
+    {
+      label: "frontend CSS variable extraction",
+      command: ["bun", "run", "extract-css-vars"],
+    },
+    {
+      label: "frontend Vite bundling",
+      command: ["bun", "run", "scripts/build-frontend.ts"],
+    },
+  ]);
+});
+
+test("explains how to resolve a hard-sync refusal without losing local commits", () => {
+  expect(hardSyncRefusalMessage("staging", "origin/staging", 3)).toBe(
+    "Cannot update 'staging' because it has 3 local commits not present on origin/staging. Push them or move them to another branch before retrying; automatic updates will not discard local commits.",
+  );
+  expect(hardSyncRefusalMessage("main", "origin/main", 1)).toContain("1 local commit not present");
 });
 
 test("restores the previous dependency tree after a failed repair attempt", () => {

@@ -1,6 +1,7 @@
 import type { StateCreator } from 'zustand'
 import type { AppStore, TtsConnectionsSlice } from '@/types/store'
 import type { TtsConnectionProfile } from '@/types/api'
+import { persistKey } from './settings'
 import { normalizeConnectionsOrder, reorderProfiles } from './connections-order-merge'
 
 export const createTtsConnectionsSlice: StateCreator<AppStore, [], [], TtsConnectionsSlice> = (set, get) => ({
@@ -22,21 +23,18 @@ export const createTtsConnectionsSlice: StateCreator<AppStore, [], [], TtsConnec
     const state = get()
     const existingIndex = state.ttsProfiles.findIndex((candidate) => candidate.id === profile.id)
     const ttsProfiles = existingIndex === -1
-      ? [...state.ttsProfiles, profile]
+      ? [profile, ...state.ttsProfiles]
       : state.ttsProfiles.map((candidate, index) => index === existingIndex ? profile : candidate)
     const connectionsOrder = normalizeConnectionsOrder(state.connectionsOrder)
     const order = connectionsOrder.tts
+    const nextOrder = order.includes(profile.id) ? order : [profile.id, ...order]
+    const nextConnectionsOrder = { ...connectionsOrder, tts: nextOrder }
     const selectedId = state.voiceSettings.ttsConnectionId
     const ttsConnectionId = selectedId && ttsProfiles.some((candidate) => candidate.id === selectedId && candidate.review_required !== true)
       ? selectedId
       : null
-    set({
-      ttsProfiles,
-      connectionsOrder: {
-        ...connectionsOrder,
-        tts: order.includes(profile.id) ? order : [...order, profile.id],
-      },
-    })
+    set({ ttsProfiles, connectionsOrder: nextConnectionsOrder })
+    if (nextOrder !== order) persistKey('connectionsOrder', nextConnectionsOrder, 'state-sync')
     if (ttsConnectionId !== selectedId) get().setVoiceSettings({ ttsConnectionId })
   },
 

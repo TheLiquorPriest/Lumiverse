@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getDatabasePath, getDb } from "../db/connection";
 import { healCorruptDatabase } from "../db/maintenance";
 import { bumpChatAndMessageGenerationRevision, bumpChatGenerationRevision, bumpMessageGenerationRevision } from "./chat-generation-revision.service";
@@ -2317,6 +2318,18 @@ function getMsgStmts() {
   return { all: _stmtMsgAll, count: _stmtMsgCount, tail: _stmtMsgTail, byId: _stmtMsgById, rolesBefore: _stmtMsgRolesBefore };
 }
 
+let _msgRevisionCol: boolean | null = null;
+let _msgRevisionGen = -1;
+
+export function messagesHaveRevisionColumn(): boolean {
+  const gen = require("../db/connection").getDbGeneration() as number;
+  if (_msgRevisionCol !== null && _msgRevisionGen === gen) return _msgRevisionCol;
+  const columns = getDb().query("PRAGMA table_info('messages')").all() as Array<{ name: string }>;
+  _msgRevisionCol = columns.some((column) => column.name === "revision");
+  _msgRevisionGen = gen;
+  return _msgRevisionCol;
+}
+
 export function getMessages(userId: string, chatId: string): Message[] {
   const rows = getMsgStmts().all.all(chatId, userId) as any[];
   return rows.map(rowToMessage);
@@ -2844,10 +2857,9 @@ export function createMessage(chatId: string, input: CreateMessageInput, userId:
 
 /**
  * Lightweight attachment append for flows like image-gen "attach to last
- * message". Does one read + one update + one MESSAGE_EDITED emit, skipping the
- * extra read-back, chunk rebuild gate, and chat-memory cache invalidation that
- * updateMessage performs. Returns the synthesized updated message so callers
- * can include it in their response payload.
+ * message". It skips the chunk rebuild gate and chat-memory cache invalidation
+ * that updateMessage performs, while returning the canonical post-write message
+ * so callers receive its projected extra and bumped generation revision.
  */
 export function appendMessageAttachment(
   userId: string,
@@ -3150,6 +3162,7 @@ export function updateMessage(userId: string, id: string, input: UpdateMessageIn
   if (normalizedExtra !== undefined) { fields.push("extra = ?"); values.push(JSON.stringify(normalizedExtra)); }
 
   if (fields.length === 0) return existing;
+  if (messagesHaveRevisionColumn()) fields.push("revision = revision + 1");
   values.push(id);
   values.push(existing.chat_id);
 
@@ -3621,6 +3634,7 @@ interface CreatedChatBranch {
   branchId: string;
   atMessageId: string;
   atMessageIndex: number;
+  idMap: Map<string, string>;
 }
 
 /** Insert a branch while participating in the caller's current transaction. */
@@ -3708,6 +3722,7 @@ function createChatBranchRows(userId: string, chat: Chat, msg: Message, requeste
     branchId,
     atMessageId: msg.id,
     atMessageIndex: msg.index_in_chat,
+    idMap,
   };
 }
 
@@ -3744,6 +3759,315 @@ export function branchChat(userId: string, chatId: string, atMessageId: string, 
     return null;
   }
   return emitCreatedChatBranch(userId, created);
+}
+
+export type EditAndSendMode = "normal" | "swipe";
+
+export interface EditAndSendInput {
+  messageId: string;
+  content: string;
+  expectedVersion: number;
+  requestId: string;
+  branchChatOnEditAndSend?: boolean;
+}
+
+export interface EditAndSendGenerationCursor {
+  generationId: string;
+  chatId: string;
+  requestId: string;
+  mode: EditAndSendMode;
+}
+
+export interface EditAndSendSuccess {
+  branchChatId: string;
+  editedMessageId: string;
+  immediateAssistantId: string | null;
+  generationCursor: EditAndSendGenerationCursor;
+}
+
+export type EditAndSendResult =
+  | { status: "ok"; replayed: boolean; payload: EditAndSendSuccess }
+  | { status: "not_found"; error: string }
+  | { status: "conflict"; error: string }
+  | { status: "bad_request"; error: string };
+
+function editAndSendFingerprint(input: EditAndSendInput): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      messageId: input.messageId,
+      content: input.content,
+      expectedVersion: input.expectedVersion,
+      branchChatOnEditAndSend: input.branchChatOnEditAndSend ?? true,
+    }))
+    .digest("hex");
+}
+
+function parseStoredEditAndSendPayload(raw: string): EditAndSendSuccess | null {
+  try {
+    const parsed = JSON.parse(raw) as EditAndSendSuccess;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.branchChatId !== "string" || typeof parsed.editedMessageId !== "string") return null;
+    if (!parsed.generationCursor || typeof parsed.generationCursor.generationId !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function withImmediateTransaction<T>(fn: () => T): T {
+  const db = getDb();
+  const txn = db.transaction(fn) as (() => T) & { immediate?: () => T };
+  if (typeof txn.immediate === "function") return txn.immediate();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
+    throw err;
+  }
+}
+
+function messageRevision(row: { revision?: unknown }): number {
+  return typeof row.revision === "number" && Number.isInteger(row.revision) ? row.revision : 1;
+}
+
+class EditAndSendBranchMappingError extends Error {}
+
+export function editAndSend(
+  userId: string,
+  chatId: string,
+  input: EditAndSendInput,
+): EditAndSendResult {
+  if (typeof input.requestId !== "string" || input.requestId.trim().length === 0) {
+    return { status: "bad_request", error: "requestId is required" };
+  }
+  if (typeof input.messageId !== "string" || input.messageId.trim().length === 0) {
+    return { status: "bad_request", error: "messageId is required" };
+  }
+  if (typeof input.content !== "string") {
+    return { status: "bad_request", error: "content is required" };
+  }
+  if (input.content.trim().length === 0) {
+    return { status: "bad_request", error: "content must not be empty" };
+  }
+  if (!Number.isInteger(input.expectedVersion) || input.expectedVersion < 1) {
+    return { status: "bad_request", error: "expectedVersion must be a positive integer" };
+  }
+  const branchChatOnEditAndSend = input.branchChatOnEditAndSend ?? true;
+
+  const fingerprint = editAndSendFingerprint(input);
+  const now = Date.now();
+  // Holder object: assignments made inside the transaction callback are not
+  // tracked by control-flow analysis on the bare `let`, which collapsed the
+  // post-transaction guard to `never`.
+  const branchRef: { current: CreatedChatBranch | null } = { current: null };
+  let editedCopy: Message | null = null;
+
+  let outcome: EditAndSendResult;
+  try {
+    outcome = withImmediateTransaction((): EditAndSendResult => {
+    const db = getDb();
+    const existingRequest = db.query(
+      `SELECT request_fingerprint, response FROM edit_and_send_requests
+       WHERE user_id = ? AND chat_id = ? AND request_id = ?`,
+    ).get(userId, chatId, input.requestId) as { request_fingerprint: string; response: string } | null;
+    if (existingRequest) {
+      if (existingRequest.request_fingerprint !== fingerprint) {
+        return { status: "conflict", error: "requestId already used with a different payload" };
+      }
+      const payload = parseStoredEditAndSendPayload(existingRequest.response);
+      if (!payload) return { status: "conflict", error: "stored edit-and-send response is unreadable" };
+      return { status: "ok", replayed: true, payload };
+    }
+
+    const chat = getChat(userId, chatId);
+    if (!chat) return { status: "not_found", error: "Chat not found" };
+    const source = getMessage(userId, input.messageId);
+    if (!source || source.chat_id !== chatId) return { status: "not_found", error: "Message not found" };
+    if (!source.is_user) return { status: "bad_request", error: "Only user messages can be edited and sent" };
+
+    const hasRevision = messagesHaveRevisionColumn();
+    if (hasRevision && messageRevision(source as Message & { revision?: number }) !== input.expectedVersion) {
+      return { status: "conflict", error: "Message revision mismatch" };
+    }
+
+    const subsequent = db.query(
+      `SELECT * FROM messages WHERE chat_id = ? AND index_in_chat = ?`,
+    ).get(chatId, source.index_in_chat + 1) as any;
+    const subsequentAssistant = subsequent && !subsequent.is_user ? rowToMessage(subsequent) : null;
+    const branchAt = subsequentAssistant ?? source;
+    const mode: EditAndSendMode = subsequentAssistant ? "swipe" : "normal";
+
+    let targetChatId: string;
+    let editedMessageId: string;
+    let targetMessageId: string | null;
+
+    if (branchChatOnEditAndSend) {
+      const createdBranch = createChatBranchRows(userId, chat, branchAt);
+      branchRef.current = createdBranch;
+
+      const copiedUserMessageId = createdBranch.idMap.get(source.id);
+      if (!copiedUserMessageId) {
+        throw new EditAndSendBranchMappingError("Failed to copy edited message");
+      }
+
+      targetChatId = createdBranch.newChatId;
+      editedMessageId = copiedUserMessageId;
+      if (subsequentAssistant) {
+        const copiedAssistantMessageId = createdBranch.idMap.get(subsequentAssistant.id);
+        if (!copiedAssistantMessageId) {
+          throw new EditAndSendBranchMappingError("Failed to copy immediate assistant message");
+        }
+        targetMessageId = copiedAssistantMessageId;
+      } else {
+        targetMessageId = null;
+      }
+    } else {
+      targetChatId = chatId;
+      editedMessageId = source.id;
+      targetMessageId = subsequentAssistant?.id ?? null;
+    }
+    const targetSwipeIndex = subsequentAssistant ? subsequentAssistant.swipes.length : null;
+
+    const copied = getMessage(userId, editedMessageId);
+    if (!copied) return { status: "not_found", error: "Copied message not found" };
+    const nextSwipes = [...copied.swipes];
+    const swipeSlot =
+      Number.isInteger(copied.swipe_id) && copied.swipe_id >= 0 && copied.swipe_id < nextSwipes.length
+        ? copied.swipe_id
+        : 0;
+    nextSwipes[swipeSlot] = input.content;
+    const nextDates = [...copied.swipe_dates];
+    if (nextDates.length !== nextSwipes.length) {
+      const stamp = Math.floor(now / 1000);
+      while (nextDates.length < nextSwipes.length) nextDates.push(stamp);
+      if (nextDates.length > nextSwipes.length) nextDates.length = nextSwipes.length;
+    }
+    const revisionSql = hasRevision ? ", revision = revision + 1" : "";
+    db.query(
+      `UPDATE messages SET content = ?, swipes = ?, swipe_id = ?, swipe_dates = ?${revisionSql}
+       WHERE id = ? AND chat_id = ?`,
+    ).run(
+      input.content,
+      JSON.stringify(nextSwipes),
+      swipeSlot,
+      JSON.stringify(nextDates),
+      editedMessageId,
+      targetChatId,
+    );
+
+    editedCopy = getMessage(userId, editedMessageId);
+    const generationId = crypto.randomUUID();
+    const payload: EditAndSendSuccess = {
+      branchChatId: targetChatId,
+      editedMessageId,
+      immediateAssistantId: targetMessageId,
+      generationCursor: {
+        generationId,
+        chatId: targetChatId,
+        requestId: input.requestId,
+        mode,
+      },
+    };
+    const requestRowId = crypto.randomUUID();
+    const cursorJson = JSON.stringify(payload.generationCursor);
+    const responseJson = JSON.stringify(payload);
+
+    db.query(
+      `INSERT INTO edit_and_send_requests (
+        id, user_id, chat_id, request_id, request_fingerprint, branch_chat_id,
+        edited_message_id, target_message_id, target_swipe_index, generation_id,
+        response, cursor, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      requestRowId,
+      userId,
+      chatId,
+      input.requestId,
+      fingerprint,
+      targetChatId,
+      editedMessageId,
+      targetMessageId,
+      targetSwipeIndex,
+      generationId,
+      responseJson,
+      cursorJson,
+      now,
+      now,
+    );
+    // Resolve the connection ONCE, here, at COMMIT time, and store it on the
+    // row. The outbox is durable but its dispatch is not a single event: the
+    // same row can be dispatched from the POST handler, again from the periodic
+    // retry tick after a backoff, and again from startup crash recovery, hours
+    // apart. Re-reading `activeProfileId` / the opt-in / the chat pin on each of
+    // those ticks means switching the active profile retargets a request the
+    // user already committed. Recording the answer makes it immutable for the
+    // life of the request.
+    //
+    // Note the replay short-circuit at the top of this transaction: an existing
+    // `edit_and_send_requests` row returns the ORIGINAL stored payload and never
+    // reaches this INSERT, so the value recorded on the FIRST commit is
+    // automatically the one honored by every subsequent replay of the same
+    // requestId. There is no second resolution to keep in sync.
+    //
+    // Lazily required rather than statically imported (existing precedent in
+    // this file for `resolveConnection`): `chats.service` carries no static
+    // connections/settings import today, and it must never gain a static import
+    // of `generate.service`, which imports this module — that would be a cycle.
+    // `resolveEditAndSendConnectionId` never throws and returns `undefined` when
+    // nothing resolves (including in fixtures with no `settings` /
+    // `connection_profiles` tables), so a connection lookup can never fail the
+    // user's edit; a NULL column simply means "fall back to the legacy
+    // resolve-at-dispatch ladder", exactly like pre-migration rows.
+    const { resolveEditAndSendConnectionId } = require("./connections.service");
+    const committedConnectionId: string | undefined = resolveEditAndSendConnectionId(
+      userId,
+      chat.metadata,
+    );
+    db.query(
+      `INSERT INTO generation_outbox (
+        id, request_id, user_id, chat_id, branch_chat_id, edited_message_id,
+        target_message_id, target_swipe_index, expected_version, generation_id,
+        mode, status, attempt_count, created_at, updated_at, connection_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
+    ).run(
+      crypto.randomUUID(),
+      input.requestId,
+      userId,
+      chatId,
+      targetChatId,
+      editedMessageId,
+      targetMessageId,
+      targetSwipeIndex,
+      input.expectedVersion,
+      generationId,
+      mode,
+      now,
+      now,
+      committedConnectionId ?? null,
+    );
+
+      return { status: "ok", replayed: false, payload };
+    });
+  } catch (error) {
+    if (error instanceof EditAndSendBranchMappingError) {
+      return { status: "not_found", error: error.message };
+    }
+    throw error;
+  }
+
+  if (outcome.status === "ok" && !outcome.replayed) {
+    if (branchRef.current) emitCreatedChatBranch(userId, branchRef.current);
+    if (editedCopy) {
+      const targetChatId = branchRef.current?.newChatId ?? chatId;
+      eventBus.emit(EventType.MESSAGE_EDITED, { chatId: targetChatId, message: editedCopy }, userId);
+      try { invalidateChatMemoryCache(targetChatId); } catch { /* optional in tests */ }
+    }
+  }
+
+  return outcome;
 }
 
 // Branch tree
@@ -3871,6 +4195,23 @@ export function createChatRaw(userId: string, input: { character_id: string; nam
     .run(id, userId, input.character_id, input.name || "", JSON.stringify(input.metadata || {}), createdAt, updatedAt));
 
   return getChat(userId, id)!;
+}
+
+/** Load migration identities once so a rerun does not re-import the same ST chat. */
+export function listChatSourceFilenameIds(userId: string): Map<string, string> {
+  const rows = getDb()
+    .query(
+      `SELECT id, json_extract(metadata, '$._lumiverse_source_filename') AS source_filename
+       FROM chats
+       WHERE user_id = ?
+         AND json_type(metadata, '$._lumiverse_source_filename') = 'text'
+       ORDER BY updated_at ASC`,
+    )
+    .all(userId) as Array<{ id: string; source_filename: string }>;
+
+  const result = new Map<string, string>();
+  for (const row of rows) result.set(row.source_filename, row.id);
+  return result;
 }
 
 export function bulkInsertMessages(chatId: string, messages: BulkMessageInput[], userId: string): number {

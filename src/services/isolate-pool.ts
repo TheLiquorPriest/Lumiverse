@@ -7,6 +7,7 @@ import {
   DEFAULT_ISOLATE_MAX_FRAME_BYTES,
   decodeLengthPrefixedJson,
   IsolateProtocolError,
+  isIsolateStartedEnvelopeV1,
   isIsolateResponseEnvelopeV1,
   makeRequestEnvelopeV1,
   normalizeIsolateMaxFrameBytes,
@@ -40,16 +41,26 @@ export interface IsolateHealthSnapshotV1 {
   readonly checkedAt: number | null;
 }
 
+export type IsolateTimeoutPhase = "startup" | "execution";
+
 export class IsolatePoolError extends Error {
   readonly code: IsolatePoolFailureCode;
   readonly failureCode: IsolatePoolFailureCode;
   readonly retryable: boolean;
   readonly remote: boolean;
+  readonly timeoutPhase?: IsolateTimeoutPhase;
+  readonly timeoutMs?: number;
 
   constructor(
     code: IsolatePoolFailureCode,
     message: string,
-    options?: { cause?: unknown; retryable?: boolean; remote?: boolean },
+    options?: {
+      cause?: unknown;
+      retryable?: boolean;
+      remote?: boolean;
+      timeoutPhase?: IsolateTimeoutPhase;
+      timeoutMs?: number;
+    },
   ) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "IsolatePoolError";
@@ -57,6 +68,8 @@ export class IsolatePoolError extends Error {
     this.failureCode = code;
     this.retryable = options?.retryable ?? (code !== "invalid_input" && code !== "limit_exceeded");
     this.remote = options?.remote ?? false;
+    this.timeoutPhase = options?.timeoutPhase;
+    this.timeoutMs = options?.timeoutMs;
   }
 }
 export type IsolateFailureCodeV1 = IsolatePoolFailureCode;
@@ -84,6 +97,8 @@ export interface IsolatePoolJob<TRequest> {
   readonly payload: TRequest;
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+  /** Optional caller-owned absolute deadline that queue/startup may not exceed. */
+  readonly hardDeadlineAt?: number;
 }
 
 export interface IsolatePoolOptions<TRequest, TResult> {
@@ -103,6 +118,16 @@ export interface IsolatePoolOptions<TRequest, TResult> {
   readonly subprocessRequest?: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
   readonly responseParser?: (message: unknown, job: ActiveIsolateJob<TRequest, TResult>) => TResult | Promise<TResult>;
   /**
+   * Opt-in framed acknowledgement that separates Worker startup from the
+   * execution budget. Pools without this hook keep admission-to-settlement
+   * wall-clock timing unchanged.
+   */
+  readonly workerStartAcknowledgement?: (
+    message: unknown,
+    job: ActiveIsolateJob<TRequest, TResult>,
+  ) => boolean;
+  readonly workerStartTimeoutMs?: number;
+  /**
    * Optional test/host probe for one newly created transport. A replacement is
    * healthy only after this probe resolves.
    */
@@ -116,12 +141,15 @@ export interface IsolatePoolOptions<TRequest, TResult> {
 
 export interface ActiveIsolateJob<TRequest, TResult> extends IsolatePoolJob<TRequest> {
   readonly requestId: string;
+  readonly timeoutMs: number;
   readonly resolve: (value: TResult) => void;
-  /** Absolute admission-to-settlement wall-clock deadline. */
-  readonly deadlineAt: number;
+  /** Current phase deadline; reset on start acknowledgement for opted-in pools. */
+  deadlineAt: number;
   readonly reject: (error: unknown) => void;
   /** Number of bounded backend failovers already attempted for this request. */
   backendFailovers?: number;
+  /** True once this request has entered execution on any backend. */
+  executionStarted?: boolean;
   settled: boolean;
   queueTimer?: ReturnType<typeof setTimeout>;
 }
@@ -507,6 +535,8 @@ export class IsolatePoolV1<TRequest, TResult> {
   private readonly workerRequest: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
   private readonly subprocessRequest: (job: ActiveIsolateJob<TRequest, TResult>) => unknown;
   private readonly responseParser: (message: unknown, job: ActiveIsolateJob<TRequest, TResult>) => TResult | Promise<TResult>;
+  private readonly workerStartAcknowledgement?: IsolatePoolOptions<TRequest, TResult>["workerStartAcknowledgement"];
+  private readonly workerStartTimeoutMs?: number;
   private readonly disabled: boolean;
   private readonly slots = new Set<PoolSlot<TRequest, TResult>>();
   private readonly waitingByUser = new Map<string, ActiveIsolateJob<TRequest, TResult>[]>();
@@ -558,6 +588,16 @@ export class IsolatePoolV1<TRequest, TResult> {
     this.workerRequest = options.workerRequest ?? ((job) => makeRequestEnvelopeV1(job.requestId, job.operation, job.payload));
     this.subprocessRequest = options.subprocessRequest ?? this.workerRequest;
     this.responseParser = options.responseParser ?? ((message, job) => this.parseDefaultResponse(message, job));
+    this.workerStartAcknowledgement = options.workerStartAcknowledgement;
+    if (this.workerStartAcknowledgement) {
+      const workerStartTimeoutMs = options.workerStartTimeoutMs ?? 5_000;
+      if (!Number.isSafeInteger(workerStartTimeoutMs) || workerStartTimeoutMs <= 0) {
+        throw new RangeError("workerStartTimeoutMs must be a positive integer");
+      }
+      this.workerStartTimeoutMs = workerStartTimeoutMs;
+    } else if (options.workerStartTimeoutMs !== undefined) {
+      throw new RangeError("workerStartTimeoutMs requires workerStartAcknowledgement");
+    }
     if (!this.workerFactory && options.workerUrl) {
       this.workerFactory = () => createDefaultWorkerTransport(options, this.maxFrameBytes);
     }
@@ -569,32 +609,44 @@ export class IsolatePoolV1<TRequest, TResult> {
 
   submit(jobInput: IsolatePoolJob<TRequest>): Promise<TResult> {
     if (this.closed) {
-      return Promise.reject(toPoolFailure("worker_unavailable", `${this.name} pool is closed`));
+      return Promise.reject(toPoolFailure("worker_unavailable", this.name + " pool is closed"));
     }
     if (this.disabled) {
-      return Promise.reject(toPoolFailure("worker_disabled", `${this.name} pool is disabled`));
+      return Promise.reject(toPoolFailure("worker_disabled", this.name + " pool is disabled"));
     }
     if (!jobInput.userId || !jobInput.operation) {
-      return Promise.reject(toPoolFailure("invalid_input", `${this.name} job identity is incomplete`));
+      return Promise.reject(toPoolFailure("invalid_input", this.name + " job identity is incomplete"));
     }
     const requestedTimeoutMs = jobInput.timeoutMs ?? this.defaultTimeoutMs;
     if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs <= 0) {
-      return Promise.reject(toPoolFailure("invalid_input", `${this.name} timeout is invalid`));
+      return Promise.reject(toPoolFailure("invalid_input", this.name + " timeout is invalid"));
+    }
+    if (jobInput.hardDeadlineAt !== undefined && !Number.isFinite(jobInput.hardDeadlineAt)) {
+      return Promise.reject(toPoolFailure("invalid_input", this.name + " hard deadline is invalid"));
     }
     const boundedTimeoutMs = Math.min(requestedTimeoutMs, this.defaultTimeoutMs);
     if (jobInput.signal?.aborted) {
-      return Promise.reject(toPoolFailure("cancelled", `${this.name} job was cancelled before admission`));
+      return Promise.reject(toPoolFailure("cancelled", this.name + " job was cancelled before admission"));
     }
 
+    const now = Date.now();
+    const hardDeadlineAt = jobInput.hardDeadlineAt ?? Number.POSITIVE_INFINITY;
+    if (hardDeadlineAt <= now) {
+      return Promise.reject(toPoolFailure("worker_timed_out", this.name + " hard deadline elapsed before admission"));
+    }
+    const phaseTimed = this.workerStartAcknowledgement !== undefined;
+    const initialDeadlineAt = phaseTimed
+      ? hardDeadlineAt
+      : Math.min(now + boundedTimeoutMs, hardDeadlineAt);
     const queuedForUser = this.waitingByUser.get(jobInput.userId)?.length ?? 0;
     if (queuedForUser >= this.maxQueuedPerUser || this.waitingCount >= this.maxQueuedGlobal) {
-      return Promise.reject(toPoolFailure("queue_full", `${this.name} queue capacity is exhausted`));
+      return Promise.reject(toPoolFailure("queue_full", this.name + " queue capacity is exhausted"));
     }
     return new Promise<TResult>((resolve, reject) => {
       const job: ActiveIsolateJob<TRequest, TResult> = {
         ...jobInput,
         requestId: crypto.randomUUID(),
-        deadlineAt: Date.now() + boundedTimeoutMs,
+        deadlineAt: initialDeadlineAt,
         timeoutMs: boundedTimeoutMs,
         resolve,
         reject,
@@ -607,13 +659,15 @@ export class IsolatePoolV1<TRequest, TResult> {
         this.readyUsers.push(job.userId);
       }
       this.waitingCount++;
-      job.queueTimer = setTimeout(() => {
-        if (job.settled) return;
-        this.cancelJob(
-          job,
-          toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
-        );
-      }, boundedTimeoutMs);
+      if (Number.isFinite(initialDeadlineAt)) {
+        job.queueTimer = setTimeout(() => {
+          if (job.settled) return;
+          this.cancelJob(
+            job,
+            toPoolFailure("worker_timed_out", this.name + " isolate exceeded its wall-clock deadline"),
+          );
+        }, Math.max(0, initialDeadlineAt - now));
+      }
       if (job.signal) {
         const onAbort = () => this.cancelJob(job);
         (job as ActiveIsolateJob<TRequest, TResult> & { onAbort?: () => void }).onAbort = onAbort;
@@ -631,6 +685,22 @@ export class IsolatePoolV1<TRequest, TResult> {
     let active = 0;
     for (const slot of this.slots) if (slot.job) active++;
     return active;
+  }
+
+  releaseIdle(): number {
+    if (this.waitingCount > 0) return 0;
+    const idle = [...this.slots].filter((slot) => slot.job === null && !slot.retired);
+    for (const slot of idle) {
+      slot.retired = true;
+      clearTimeout(slot.timeout);
+      slot.timeout = undefined;
+      this.detachSlot(slot);
+      this.slots.delete(slot);
+      const retirement = terminateTransport(slot.transport, "SIGKILL").catch(() => {});
+      this.pendingRetirements.add(retirement);
+      void retirement.finally(() => this.pendingRetirements.delete(retirement));
+    }
+    return idle.length;
   }
   async shutdown(): Promise<void> {
     if (this.closed) return;
@@ -993,7 +1063,7 @@ export class IsolatePoolV1<TRequest, TResult> {
     if (!this.isHealthyBackend(slot.transport.kind) || !this.slotEpochMatches(slot)) {
       const failure = toPoolFailure(
         "worker_unavailable",
-        `${this.name} transport health epoch is stale`,
+        this.name + " transport health epoch is stale",
       );
       this.retireIdleUnhealthySlots();
       if (!this.requeueFailedJob(job)) this.settle(job, () => job.reject(failure));
@@ -1002,6 +1072,10 @@ export class IsolatePoolV1<TRequest, TResult> {
     }
     slot.job = job;
     const generation = ++slot.generation;
+    const startAcknowledgement = kind === "worker"
+      ? this.workerStartAcknowledgement
+      : undefined;
+    let phase: IsolateTimeoutPhase = startAcknowledgement ? "startup" : "execution";
     let responseSeen = false;
     const current = (): boolean =>
       !slot.retired
@@ -1009,52 +1083,126 @@ export class IsolatePoolV1<TRequest, TResult> {
       && slot.job === job
       && !job.settled
       && this.slotEpochMatches(slot);
+    const timeoutFailure = (
+      timeoutPhase: IsolateTimeoutPhase,
+      timeoutMs: number,
+    ): IsolatePoolError => new IsolatePoolError(
+      "worker_timed_out",
+      timeoutPhase === "startup"
+        ? this.name + " Worker did not acknowledge the request within " + timeoutMs + "ms"
+        : this.name + " isolate exceeded its " + timeoutMs + "ms execution deadline",
+      { timeoutPhase, timeoutMs },
+    );
+    let activeTimeoutMs = job.timeoutMs;
+    const armTimeout = (
+      nextPhase: IsolateTimeoutPhase,
+      timeoutMs: number,
+      resetDeadline: boolean,
+    ): boolean => {
+      clearTimeout(slot.timeout);
+      activeTimeoutMs = timeoutMs;
+      phase = nextPhase;
+      if (resetDeadline) {
+        job.deadlineAt = Math.min(
+          Date.now() + timeoutMs,
+          job.hardDeadlineAt ?? Number.POSITIVE_INFINITY,
+        );
+      }
+      const remainingMs = this.remainingWallClockMs(job);
+      if (remainingMs <= 0) return false;
+      slot.timeout = setTimeout(() => {
+        if (job.settled || slot.job !== job) return;
+        this.failSlot(slot, timeoutFailure(nextPhase, timeoutMs), generation);
+      }, remainingMs);
+      return true;
+    };
     const onMessage = (message: unknown) => {
       if (slot.retired || slot.generation !== generation) return;
       if (!this.slotEpochMatches(slot)) {
-        this.failSlot(slot, toPoolFailure("worker_unavailable", `${this.name} transport health epoch changed`), generation);
+        this.failSlot(slot, toPoolFailure("worker_unavailable", this.name + " transport health epoch changed"), generation);
         return;
       }
       if (responseSeen) {
-        this.failSlot(slot, toPoolFailure("worker_malformed", `${this.name} returned a trailing response`), generation);
+        this.failSlot(slot, toPoolFailure("worker_malformed", this.name + " returned a trailing response"), generation);
         return;
       }
       if (!current()) return;
+      if (startAcknowledgement) {
+        let acknowledged = false;
+        try {
+          acknowledged = startAcknowledgement(message, job);
+        } catch (error) {
+          this.failSlot(
+            slot,
+            toPoolFailure("worker_malformed", this.name + " start acknowledgement is invalid", error),
+            generation,
+          );
+          return;
+        }
+        if (phase === "startup") {
+          if (!acknowledged) {
+            this.failSlot(
+              slot,
+              toPoolFailure("worker_malformed", this.name + " returned a response before start acknowledgement"),
+              generation,
+            );
+            return;
+          }
+          const resetExecutionDeadline = !job.executionStarted;
+          job.executionStarted = true;
+          if (!armTimeout("execution", job.timeoutMs, resetExecutionDeadline)) {
+            this.failSlot(slot, timeoutFailure("execution", job.timeoutMs), generation);
+          }
+          return;
+        }
+        if (acknowledged) {
+          this.failSlot(
+            slot,
+            toPoolFailure("worker_malformed", this.name + " returned a duplicate start acknowledgement"),
+            generation,
+          );
+          return;
+        }
+      }
       responseSeen = true;
       this.finishSlot(slot, message, generation);
     };
     const onError = (error: unknown) => {
       if (slot.retired || slot.generation !== generation) return;
       if (!this.slotEpochMatches(slot)) {
-        this.failSlot(slot, toPoolFailure("worker_unavailable", `${this.name} transport health epoch changed`), generation);
+        this.failSlot(slot, toPoolFailure("worker_unavailable", this.name + " transport health epoch changed"), generation);
         return;
       }
       if (!responseSeen && !current()) return;
       const code = error instanceof IsolateProtocolError
         ? transportFailureCode(error)
         : "worker_crashed";
-      this.failSlot(slot, toPoolFailure(code, `${this.name} isolate failed`, error), generation);
+      this.failSlot(slot, toPoolFailure(code, this.name + " isolate failed", error), generation);
     };
     slot.detachMessage = slot.transport.onMessage(onMessage);
     slot.detachError = slot.transport.onError(onError);
-    const remainingWallClockMs = this.remainingWallClockMs(job);
-    if (remainingWallClockMs <= 0) {
+    if (job.queueTimer) {
+      clearTimeout(job.queueTimer);
+      job.queueTimer = undefined;
+    }
+    const phaseTimeoutMs = startAcknowledgement
+      ? this.workerStartTimeoutMs!
+      : job.timeoutMs;
+    const usesPhasedTiming = this.workerStartAcknowledgement !== undefined;
+    const resetDeadline = startAcknowledgement !== undefined
+      || (usesPhasedTiming && !job.executionStarted);
+    if (!startAcknowledgement && usesPhasedTiming && !job.executionStarted) {
+      job.executionStarted = true;
+    }
+    if (!armTimeout(phase, phaseTimeoutMs, resetDeadline)) {
       this.rejectBeforeSend(
         slot,
         job,
-        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
+        timeoutFailure(phase, activeTimeoutMs),
         generation,
       );
       return;
     }
-    slot.timeout = setTimeout(() => {
-      if (job.settled || slot.job !== job) return;
-      this.failSlot(
-        slot,
-        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
-        generation,
-      );
-    }, remainingWallClockMs);
     let request: unknown;
     let frame: Uint8Array;
     try {
@@ -1063,33 +1211,25 @@ export class IsolatePoolV1<TRequest, TResult> {
     } catch (error) {
       const failure = error instanceof IsolatePoolError
         ? error
-        : toPoolFailure(transportFailureCode(error), `${this.name} isolate request is invalid`, error);
+        : toPoolFailure(transportFailureCode(error), this.name + " isolate request is invalid", error);
       this.rejectBeforeSend(slot, job, failure, generation);
       return;
     }
     if (this.remainingWallClockMs(job) <= 0) {
-      this.failSlot(
-        slot,
-        toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
-        generation,
-      );
+      this.failSlot(slot, timeoutFailure(phase, activeTimeoutMs), generation);
       return;
     }
     try {
       await slot.transport.send(frame);
       if (current() && this.remainingWallClockMs(job) <= 0) {
-        this.failSlot(
-          slot,
-          toPoolFailure("worker_timed_out", `${this.name} isolate exceeded its ${job.timeoutMs}ms wall-clock deadline`),
-          generation,
-        );
+        this.failSlot(slot, timeoutFailure(phase, activeTimeoutMs), generation);
       }
     } catch (error) {
       this.failSlot(
         slot,
         error instanceof IsolatePoolError
           ? error
-          : toPoolFailure(transportFailureCode(error), `${this.name} isolate request failed`, error),
+          : toPoolFailure(transportFailureCode(error), this.name + " isolate request failed", error),
         generation,
       );
     }
@@ -1468,6 +1608,9 @@ function getRegexPool(): IsolatePoolV1<RegexIsolateRequest, unknown> {
       workerRequest: regexRequest,
       subprocessRequest: regexRequest,
       responseParser: parseRegexResponse,
+      workerStartAcknowledgement: (message, job) =>
+        isIsolateStartedEnvelopeV1(message) && message.requestId === job.requestId,
+      workerStartTimeoutMs: 5_000,
       maxFrameBytes: DEFAULT_ISOLATE_MAX_FRAME_BYTES,
       defaultTimeoutMs: 500,
     });
@@ -1478,7 +1621,12 @@ function getRegexPool(): IsolatePoolV1<RegexIsolateRequest, unknown> {
 /** Run user-authored Response regex only in a terminable isolate backend. */
 export function runRegexInIsolate(
   request: RegexIsolateRequest,
-  options: { userId: string; timeoutMs?: number; signal?: AbortSignal },
+  options: {
+    userId: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    deadlineAt?: number;
+  },
 ): Promise<unknown> {
   return getRegexPool().submit({
     userId: options.userId,
@@ -1486,7 +1634,12 @@ export function runRegexInIsolate(
     payload: request,
     timeoutMs: options.timeoutMs,
     signal: options.signal,
+    hardDeadlineAt: options.deadlineAt,
   });
+}
+
+export function releaseIdleRegexIsolatePool(): number {
+  return regexPool?.releaseIdle() ?? 0;
 }
 
 export async function shutdownRegexIsolatePool(): Promise<void> {

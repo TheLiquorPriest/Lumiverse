@@ -25,6 +25,13 @@ async function initPresetsTestDb(): Promise<void> {
   getDb().run(`CREATE TABLE "user" (
     id TEXT PRIMARY KEY
   )`);
+  getDb().run(`CREATE TABLE settings (
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (key, user_id)
+  )`);
   getDb().run(`CREATE TABLE connection_profiles (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -39,8 +46,13 @@ async function initPresetsTestDb(): Promise<void> {
     created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0
   )`);
-  getDb().run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "117_agent_runtime_repair_acknowledgements.sql")).text());
+  getDb().run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "127_agent_runtime_repair_acknowledgements.sql")).text());
   getDb().query('INSERT INTO "user" (id) VALUES (?)').run("u1");
+  getDb().run(`CREATE TABLE regex_scripts (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    preset_id TEXT
+  )`);
 }
 
 function insertPreset(id: string, userId: string, cacheRevision = 0): void {
@@ -365,5 +377,35 @@ describe("preset runtime repair acknowledgement", () => {
       "SELECT COUNT(*) AS count FROM agent_runtime_repair_acknowledgements",
     ).get() as { count: number };
     expect(count.count).toBe(0);
+  });
+});
+
+describe("preset bulk mutations", () => {
+  test("deletes only selected presets owned by the authenticated user", async () => {
+    insertPreset("one", "u1");
+    insertPreset("two", "u1");
+    insertPreset("foreign", "u2");
+
+    const response = await app.request("http://localhost/bulk-delete", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({ ids: ["one", "foreign"] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ deleted: ["one"] });
+    expect(getDb().query("SELECT id FROM presets ORDER BY id").all()).toEqual([
+      { id: "foreign" },
+      { id: "two" },
+    ]);
+  });
+
+  test("rejects malformed bulk selections", async () => {
+    const response = await app.request("http://localhost/bulk-delete", {
+      method: "POST",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({ ids: [] }),
+    });
+    expect(response.status).toBe(400);
   });
 });

@@ -61,6 +61,31 @@ describe("GoogleProvider tool calling wire shape", () => {
     });
   });
 
+  test("replays an optional non-tool thought signature only when enabled", () => {
+    const provider = new GoogleProvider();
+    const request = {
+      model: "gemini-3-flash",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "I checked the details.", thought_signature: "TEXT_SIG_A" },
+      ],
+    };
+
+    const enabled = (provider as any).buildBody({
+      ...request,
+      parameters: { _replay_thought_signatures: true },
+    });
+    expect(enabled.contents[1].parts[0]).toEqual({
+      text: "I checked the details.",
+      thoughtSignature: "TEXT_SIG_A",
+    });
+
+    const disabled = (provider as any).buildBody({ ...request, parameters: {} });
+    expect(disabled.contents[1].parts[0].thoughtSignature).toBe(
+      "context_engineering_is_the_way_to_go",
+    );
+  });
+
   test("tool_result part becomes a functionResponse with output key", () => {
     const provider = new GoogleProvider();
     const body = (provider as any).buildBody({
@@ -187,6 +212,33 @@ describe("GoogleProvider tool calling wire shape", () => {
       { role: "user", parts: [{ text: "hi" }] },
     ]);
     expect(body.systemInstruction).toEqual({ parts: [{ text: "be nice" }] });
+  });
+
+  test("hoists only the leading system prefix and preserves later placement", () => {
+    const provider = new GoogleProvider();
+    const body = (provider as any).buildBody({
+      model: "gemini-2.5-flash",
+      messages: [
+        { role: "system", content: "prefix one" },
+        { role: "system", content: "prefix two" },
+        { role: "user", content: "old turn" },
+        { role: "system", content: "depth instruction" },
+        { role: "assistant", content: "reply" },
+        { role: "system", content: "post-history instruction" },
+      ],
+      parameters: {},
+      tools: [],
+    });
+
+    expect(body.systemInstruction).toEqual({
+      parts: [{ text: "prefix one\n\nprefix two" }],
+    });
+    expect(body.contents.map((content: any) => [content.role, content.parts[0].text])).toEqual([
+      ["user", "old turn"],
+      ["user", "depth instruction"],
+      ["model", "reply"],
+      ["user", "post-history instruction"],
+    ]);
   });
 });
 
@@ -641,6 +693,67 @@ describe("GoogleProvider bounded response protocol", () => {
       await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     } finally {
       releasePull?.();
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+
+describe("GoogleProvider streaming", () => {
+  test("waits for stream close before emitting STOP from a multi-envelope Gemini response", async () => {
+    const originalFetch = globalThis.fetch;
+    const requestBodies: unknown[] = [];
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init?.body)));
+      return new Response([
+        'data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}\n\n',
+        'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Lumiverse Gemini test passed"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}\n\n',
+        'data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":5,"totalTokenCount":168}}\n\n',
+      ].join(""), { headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    try {
+      const provider = new GoogleProvider();
+      const chunks = [];
+      for await (const chunk of provider.generateStream("test-key", "https://provider.example.test", {
+        model: "test-model",
+        messages: [{ role: "user", content: "Reply with exactly: Lumiverse Gemini test passed" }],
+        parameters: {
+          temperature: 1,
+          max_tokens: 128,
+          thinkingConfig: { thinkingLevel: "high", includeThoughts: true },
+        },
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(requestBodies[0]).toMatchObject({
+        generationConfig: {
+          temperature: 1,
+          maxOutputTokens: 128,
+          thinkingConfig: { thinkingLevel: "high", includeThoughts: true },
+        },
+      });
+      expect(chunks).toEqual([
+        {
+          token: "",
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        },
+        {
+          token: "Lumiverse Gemini test passed",
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        },
+        {
+          token: "",
+          usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 168 },
+        },
+        {
+          token: "",
+          finish_reason: "stop",
+          usage: { prompt_tokens: 9, completion_tokens: 5, total_tokens: 168 },
+        },
+      ]);
+    } finally {
       globalThis.fetch = originalFetch;
     }
   });

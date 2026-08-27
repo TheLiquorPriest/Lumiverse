@@ -1,13 +1,29 @@
 import { useEffect, useRef } from 'react'
-import { wsClient, WS_OPEN, WS_CLOSE, WS_PONG, WS_AUTH_ERROR } from './client'
+import {
+  wsClient,
+  WS_OPEN,
+  WS_CLOSE,
+  WS_PONG,
+  WS_AUTH_ERROR,
+  WS_RESUME_RECOVERY_START,
+  WS_RESUME_RECOVERY_COMPLETE,
+  WS_RESUME_RECOVERY_FAILED,
+} from './client'
 import { sendRoomAction, relayClient } from './relayClient'
 import { buildActivePersonaSnapshot, activePersonaAddonSignature } from '@/lib/personaSnapshot'
 import { buildActivePersonaLorebook } from '@/lib/personaLorebook'
 import { EventType } from './events'
 import { useStore } from '@/store'
 import { shouldSyncExtensionsAfterConnected } from './connected-extension-sync'
+import {
+  createProviderRegistryProjection,
+  FRONTEND_PROVIDER_SCOPE,
+  type ProviderRegistryChangedPayload,
+  type ProviderRegistryProjection,
+} from './provider-registry-projection'
 import { hasUnsavedSettings, settingsUpdateKeys, shouldReloadSettingsAfterUpdate } from '@/store/slices/settings'
 import { routeBackendMessage, routeFrontendProcessEvent, loadFrontendExtension } from '@/lib/spindle/loader'
+import { applyMessageTagRuntimeCapabilityChange } from '@/lib/spindle/message-tag-runtime-readiness'
 import { applyHostAction, type HostActionRuntime } from '@/lib/spindle/host-actions'
 import { spindleApi } from '@/api/spindle'
 import { messagesApi } from '@/api/chats'
@@ -347,6 +363,22 @@ async function deleteEmptyGeneratedSwipe(
   }
 }
 
+let providerProjection: ProviderRegistryProjection | null = null
+
+function bindProviderProjection(userId: string | null | undefined): ProviderRegistryProjection | null {
+  if (!userId) {
+    providerProjection = null
+    return null
+  }
+  if (!providerProjection || providerProjection.authorizedUserId !== userId) {
+    providerProjection = createProviderRegistryProjection({
+      authorizedUserId: userId,
+      authorizedScope: FRONTEND_PROVIDER_SCOPE,
+    })
+  }
+  return providerProjection
+}
+
 const MACRO_VARS_PREFIX = 'metadata.macro_variables.'
 const CHAT_VARS_PREFIX = 'metadata.chat_variables.'
 
@@ -512,6 +544,7 @@ async function refreshLoomRegistry() {
       {
         name: preset.name,
         blockCount: preset.block_count,
+        coverUrl: preset.cover_url ?? null,
         updatedAt: preset.updated_at,
         isDefault: false,
       },
@@ -710,6 +743,7 @@ export function useWebSocket() {
           store.getState().markAgentRunsStale()
           pendingReconnectBundleCheckRef.current = true
         }
+        bindProviderProjection(store.getState().user?.id)?.beginReconnectResync()
       }),
       wsClient.on(WS_PONG, () => {
         store.getState().setWsRoundTripVerified(true)
@@ -717,6 +751,18 @@ export function useWebSocket() {
           pendingReconnectBundleCheckRef.current = false
           void checkForBundleUpdate()
         }
+      }),
+      // A backgrounded PWA cannot use its frozen JS timers as evidence that
+      // the server died. Keep the failure overlay suppressed until a fresh,
+      // correlated foreground ping succeeds or the recovery window expires.
+      wsClient.on(WS_RESUME_RECOVERY_START, () => {
+        store.getState().setWsResumeRecovering(true)
+      }),
+      wsClient.on(WS_RESUME_RECOVERY_COMPLETE, () => {
+        store.getState().setWsResumeRecovering(false)
+      }),
+      wsClient.on(WS_RESUME_RECOVERY_FAILED, () => {
+        store.getState().setWsResumeRecovering(false)
       }),
       wsClient.on(WS_AUTH_ERROR, () => {
         // Server has explicitly rejected our session — the cookie is invalid
@@ -730,7 +776,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.MESSAGE_SENT, (payload: MessageSentPayload) => {
         const state = store.getState()
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           if (payload.message?.id) invalidateDisplayRegexCacheForMessage(payload.message.id)
 
           // Suppress completed assistant messages while streaming — the streaming
@@ -772,7 +818,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.MESSAGE_EDITED, (payload: MessageEditedPayload) => {
         const state = store.getState()
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           if (payload.message?.id) invalidateDisplayRegexCacheForMessage(payload.message.id)
 
           // During a continue, the backend updates the target message with combined
@@ -792,7 +838,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.MESSAGE_DELETED, (payload: MessageDeletedPayload) => {
         const state = store.getState()
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           state.removeMessage(payload.messageId)
           if (payload.messageId) invalidateDisplayRegexCacheForMessage(payload.messageId)
         }
@@ -800,7 +846,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.MESSAGE_SWIPED, (payload: MessageSwipedPayload) => {
         const state = store.getState()
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           state.updateMessage(payload.message.id, payload.message)
           // Deleting a swipe shifts indices, so a pending "new swipe" pointer is
           // no longer trustworthy — drop it.
@@ -815,6 +861,7 @@ export function useWebSocket() {
         const state = store.getState()
         const changedChatId = payload.chat?.id ?? payload.chatId
         if (changedChatId !== state.activeChatId) return
+        if (state.streamingNavigationPaused) return
 
         if (payload.chat) {
           state.setActiveChatName(payload.chat.name ?? null)
@@ -843,7 +890,7 @@ export function useWebSocket() {
       wsClient.on(EventType.GENERATION_STARTED, (payload: GenerationStartedPayload) => {
         if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           if (state.isGroupChat && payload.characterId) {
             state.setActiveGroupCharacter(payload.characterId)
             state.setRespondingCharacterId(payload.characterId)
@@ -889,7 +936,7 @@ export function useWebSocket() {
       wsClient.on(EventType.GENERATION_IN_PROGRESS, (payload: GenerationInProgressPayload) => {
         if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           if (state.activeGenerationId !== payload.generationId) {
             state.startStreaming(payload.generationId, payload.targetMessageId, payload.generationType)
           } else if (payload.targetMessageId && state.regeneratingMessageId !== payload.targetMessageId) {
@@ -1002,7 +1049,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.STREAM_TOKEN_RECEIVED, (payload: StreamTokenPayload) => {
         const state = store.getState()
-        if (payload.generationId === state.activeGenerationId) {
+        if (!state.streamingNavigationPaused && payload.generationId === state.activeGenerationId) {
           // `offset` (char position of the segment in the server's cumulative
           // buffer) gives exact reconciliation: overlap with recovery-backfilled
           // content is sliced off inside the append, and a segment starting
@@ -1033,7 +1080,7 @@ export function useWebSocket() {
         const terminalRequest = payload.chatId && payload.generationId
           ? captureGenerationRequest(payload.chatId, payload.generationId)
           : null
-        if (payload.chatId === state.activeChatId) {
+        if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           // Guard: ignore events from stale generations that were replaced by a newer one
           if (state.activeGenerationId && payload.generationId && payload.generationId !== state.activeGenerationId) return
           // Mark this generation as ended BEFORE calling endStreaming/setStreamingError,
@@ -1373,7 +1420,7 @@ export function useWebSocket() {
         // If the user is currently viewing this chat, dismiss & acknowledge instead —
         // otherwise the persisted 'completed' head would spawn the moment they navigate away.
         if (payload.chatId && payload.generationId) {
-          if (payload.chatId === state.activeChatId) {
+          if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
             state.deleteChatHead(payload.chatId)
             generateApi.acknowledge(payload.chatId).catch(() => {})
           } else {
@@ -1429,8 +1476,9 @@ export function useWebSocket() {
         state.clearAgentActivity(payload.generationId)
 
         // A stopped event for another chat may update that chat's head, but it
-        // must never stop/reconcile the local stream or clear local queues.
-        if (!isActiveChat) {
+        // must never stop/reconcile the local stream or clear local queues. The
+        // same rule freezes the active stream while its navigation exit fades.
+        if (!isActiveChat || state.streamingNavigationPaused) {
           if (payload.chatId && payload.generationId) {
             state.updateChatHead(payload.generationId, { status: 'stopped' })
             if (state.mpChatId === payload.chatId) syncMultiplayerChatHeadFromStore()
@@ -1438,6 +1486,9 @@ export function useWebSocket() {
           return
         }
 
+        // Guard: only stop streaming if this event matches the active generation
+        // (a newer generation may have already replaced it).
+        if (state.activeGenerationId && payload.generationId && payload.generationId !== state.activeGenerationId) return
         // User stop also cancels any pending @mention chain for this chat.
         if (state.mentionQueue && state.mentionQueue.chatId === payload.chatId) {
           state.setMentionQueue(null)
@@ -1499,6 +1550,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.GENERATION_ERROR, () => {
         const state = store.getState()
+        if (state.streamingNavigationPaused) return
         const regenId = state.regeneratingMessageId
         if (isLocalStreamPlaceholderId(regenId)) {
           state.removeMessage(regenId)
@@ -1509,7 +1561,7 @@ export function useWebSocket() {
       // Group chat events
       wsClient.on(EventType.GROUP_TURN_STARTED, (payload: GroupTurnStartedPayload) => {
         const state = store.getState()
-        if (payload.chatId === state.activeChatId && state.isGroupChat) {
+        if (payload.chatId === state.activeChatId && state.isGroupChat && !state.streamingNavigationPaused) {
           state.setActiveGroupCharacter(payload.characterId)
           state.setNudgeLoopActive(true)
           state.startStreaming(payload.generationId)
@@ -1524,7 +1576,7 @@ export function useWebSocket() {
 
       wsClient.on(EventType.GROUP_ROUND_COMPLETE, (payload: GroupRoundCompletePayload) => {
         const state = store.getState()
-        if (payload.chatId === state.activeChatId && state.isGroupChat) {
+        if (payload.chatId === state.activeChatId && state.isGroupChat && !state.streamingNavigationPaused) {
           state.setNudgeLoopActive(false)
           state.setActiveGroupCharacter(null)
           // Mark all spoken characters
@@ -1539,7 +1591,11 @@ export function useWebSocket() {
         // onopen with an empty payload, and once when the backend's CONNECTED
         // message arrives (carrying the user role). Only the second one means
         // auth has been verified server-side — gate auth-sync on `role`.
-        if (shouldSyncExtensionsAfterConnected(payload)) {
+        const providers = bindProviderProjection(store.getState().user?.id)
+        if (!shouldSyncExtensionsAfterConnected(payload)) {
+          // Local onopen: hold provider_changed until the snapshot resync.
+          providers?.beginReconnectResync()
+        } else {
           store.getState().reconcileRole(payload.role)
           store.getState().setWsAuthSynced(true)
           // Immediately verify round-trip so the overlay can dismiss without
@@ -1610,6 +1666,13 @@ export function useWebSocket() {
         if (payload?.character) {
           store.getState().updateCharacter(payload.id, payload.character)
         }
+      }),
+
+      wsClient.on(EventType.CHARACTER_LIBRARY_CHANGED, () => {
+        // Bulk imports intentionally omit thousands of full-character events.
+        // Mark the full-object cache stale; paginated surfaces independently
+        // refresh their lightweight summaries once.
+        store.getState().setCharactersLoaded(false)
       }),
 
       wsClient.on(EventType.CHARACTER_DELETED, (payload: { id: string }) => {
@@ -1795,6 +1858,31 @@ export function useWebSocket() {
           const current = useStore.getState().bulkUpdateStatus
           if (current?.done) useStore.getState().setBulkUpdateStatus(null)
         }, 3000)
+      }),
+
+      wsClient.on(EventType.SPINDLE_PROVIDER_CHANGED, (payload: ProviderRegistryChangedPayload) => {
+        bindProviderProjection(store.getState().user?.id)?.applyEvent(payload)
+      }),
+
+      wsClient.on(EventType.SPINDLE_FRONTEND_RUNTIME_CAPABILITY_CHANGED, (payload: {
+        action?: unknown
+        extensionId?: unknown
+        capability?: unknown
+      }) => {
+        if (
+          (payload.action !== 'registered' && payload.action !== 'unregistered')
+          || typeof payload.extensionId !== 'string'
+          || typeof payload.capability !== 'string'
+        ) return
+        applyMessageTagRuntimeCapabilityChange({
+          action: payload.action,
+          extensionId: payload.extensionId,
+          capability: payload.capability,
+        }, {
+          visible: store.getState().extensions.some((extension) => (
+            extension.id === payload.extensionId && extension.enabled && extension.has_frontend
+          )),
+        })
       }),
 
       wsClient.on(EventType.SPINDLE_FRONTEND_MSG, (payload: { extensionId: string; data: unknown }) => {
@@ -2030,6 +2118,7 @@ export function useWebSocket() {
             [payload.characterId]: {
               name: payload.characterName,
               blockCount: 0,
+              coverUrl: null,
               updatedAt: Math.floor(Date.now() / 1000),
               isDefault: false,
             },
@@ -2078,6 +2167,11 @@ export function useWebSocket() {
           const inProgress = status !== 'complete' && status !== 'error'
           store.getState().setOperatorBusy(inProgress ? payload.operation : null)
           store.getState().setOperatorProgressMessage(inProgress ? (payload.message ?? null) : null)
+        }
+      }),
+      wsClient.on(EventType.IMAGE_THUMBNAIL_QUEUE, (payload: { processed: number; remaining: number; total: number; active: number; queued: number }) => {
+        if (payload && typeof payload.processed === 'number') {
+          store.getState().setThumbnailQueue(payload)
         }
       }),
 
@@ -2434,6 +2528,7 @@ export function useWebSocket() {
       clearInterval(chatHeadReconcile)
       unsubDrawerTabs()
       unsubPersonaRelay()
+      store.getState().setWsResumeRecovering(false)
       unsubs.forEach(unsub => unsub())
       wsClient.disconnect()
     }

@@ -3,6 +3,24 @@
   pointer-events: auto;
 }
 
+.root[data-opaque-backdrop='1'] {
+  isolation: isolate;
+}
+
+.root[data-opaque-backdrop='1']::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: var(--quick-toolbar-backdrop-color, var(--lumiverse-bg-opaque));
+}
+
+.root[data-opaque-backdrop='1'] > * {
+  position: relative;
+  z-index: 1;
+}
+
 /*
  * The rect *is* the toolbar's box. The rendered box, the persisted value and the
  * eight resize handles therefore agree by construction — the previous rule sized
@@ -15,7 +33,7 @@
   left: var(--quick-toolbar-x, 0px);
   top: var(--quick-toolbar-y, 0px);
   width: var(--quick-toolbar-width, auto);
-  height: var(--quick-toolbar-height, auto);
+  height: var(--quick-toolbar-height, max-content);
   z-index: var(--z-quick-toolbar-floating, 10005);
   display: flex;
   /* Moved off `.toolbar` so the grip and all eight handles rotate *with* the
@@ -35,21 +53,234 @@
 .rootAnchored {
   position: relative;
   display: flex;
-  flex: 1 1 auto;
-  width: 100%;
+  flex: 0 0 auto;
+  width: auto;
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
   align-items: center;
   justify-content: center;
+  align-self: center;
+}
+
+/* V1 docked: fill the rail so the icon group centres as a unit and expands symmetrically. */
+.rootAnchored[data-quick-toolbar-variant='v1'] {
+  flex: 1 1 auto;
   align-self: stretch;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.rootAnchored[data-quick-toolbar-variant='v1'] .toolbarHorizontal {
+  width: auto;
+  max-width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin-inline: auto;
+}
+
+/* Docked V2 uses the leftover flex column; never the full chatToolbar width. */
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+  max-width: 100%;
+}
+
+/* Option B: Container Proportional Fill (Bounded to Column Width, Zero Trailing Waste) */
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  justify-content: flex-start !important;
+  align-self: stretch !important;
+}
+
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardStrip {
+  width: 100%;
+  flex: 1 1 auto;
+  justify-content: flex-start;
+  align-self: stretch;
+}
+
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardScroller {
+  width: 100% !important;
+  max-width: 100% !important;
+  display: flex !important;
+  justify-content: stretch !important;
+  align-items: center !important;
+  box-sizing: border-box !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  gap: 6px !important;
+}
+
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  flex: 1 1 0px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  box-sizing: border-box !important;
+  overflow: visible !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot .card,
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot button,
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot a,
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot [role='button'] {
+  width: 100% !important;
+  max-width: none !important;
+  flex: 1 1 auto !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: 0 !important;
+  padding: 2px 6px !important;
+  gap: 4px !important;
+  box-sizing: border-box !important;
+  white-space: nowrap !important;
+  text-overflow: ellipsis !important;
+  text-align: center !important;
+}
+
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot button span,
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot a span,
+.rootAnchored[data-quick-toolbar-placement='chat_top_dock'][data-quick-toolbar-variant='v2'] .cardSlot [role='button'] span {
+  text-align: center !important;
+}
+
+.fillDockSpacer {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  flex: 0 0 0 !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+/* Option A: Full-Screen Breakout Proportional Fill (Zero Edge Waste) */
+.rootFree[data-fill-screen='1'] {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  z-index: var(--z-quick-toolbar-floating, 10005) !important;
+  background: var(--lcs-glass-bg, rgba(24, 24, 27, 0.94)) !important;
+  backdrop-filter: blur(12px) !important;
+  border-bottom: 1px solid var(--lumiverse-border, rgba(255, 255, 255, 0.12)) !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45) !important;
+  box-sizing: border-box !important;
+  padding: 0 4px !important;
+  margin: 0 !important;
+  --quick-toolbar-x: 0px;
+}
+
+.rootFree[data-fill-screen='1'] .cardScroller {
+  width: 100% !important;
+  max-width: 100% !important;
+  display: flex !important;
+  justify-content: stretch !important;
+  align-items: center !important;
+  box-sizing: border-box !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  gap: 6px !important;
+}
+
+.rootFree[data-fill-screen='1'] .cardSlot {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  flex: 1 1 0px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  box-sizing: border-box !important;
+  overflow: visible !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.rootFree[data-fill-screen='1'] .cardSlot .card,
+.rootFree[data-fill-screen='1'] .cardSlot button {
+  width: 100% !important;
+  max-width: none !important;
+  flex: 1 1 auto !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: 0 !important;
+  padding: 0 8px !important;
+  box-sizing: border-box !important;
+  white-space: nowrap !important;
+  text-overflow: ellipsis !important;
+  text-align: center !important;
+}
+
+.rootFree[data-fill-screen='1'] .cardSlot .card span,
+.rootFree[data-fill-screen='1'] .cardSlot button span {
+  text-align: center !important;
+}
+
+.rootFree[data-autofit='1']:not([data-fill-screen='1']) {
+  width: max-content !important;
+  max-width: 100%;
+  margin: 0 !important;
+}
+
+.rootFree[data-autofit='1']:not([data-fill-screen='1']) > .toolbar {
+  width: max-content !important;
+  max-width: 100%;
+  justify-content: flex-start;
+}
+
+.rootFree .cardStrip {
+  justify-content: flex-start;
+}
+
+.root[data-quick-toolbar-placement='chat_top_dock'] {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
+}
+
+.root[data-quick-toolbar-placement='chat_top_dock'] > .toolbar {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+/* Keep the explicit opt-out meaningful after the top-dock host stretch rule
+   above. Fill-on owns the rail; fill-off owns only the packed card width. */
+.root[data-quick-toolbar-placement='chat_top_dock'][data-fill-top-dock='0'] {
+  flex: 0 0 auto;
+  width: max-content;
+  max-width: 100%;
+}
+
+.root[data-quick-toolbar-placement='chat_top_dock'][data-fill-top-dock='0'] > .toolbar {
+  width: max-content;
+  max-width: 100%;
+  justify-content: flex-start;
 }
 
 .toolbar {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
-  gap: calc(6px * var(--quick-toolbar-scale, 1));
-  padding: calc(8px * var(--quick-toolbar-scale, 1)) calc(10px * var(--quick-toolbar-scale, 1));
+  gap: calc(var(--quick-toolbar-gap, 6px) * var(--quick-toolbar-scale, 1));
+  padding: calc(var(--quick-toolbar-padding-block, 4px) * var(--quick-toolbar-scale, 1)) calc(var(--quick-toolbar-padding-inline, 10px) * var(--quick-toolbar-scale, 1));
   border: 1px solid var(--lumiverse-border, rgba(148, 163, 184, 0.28));
   border-radius: 13px;
   /* One rung BELOW `.card`, which stays on `--lumiverse-surface-raised`. The two
@@ -68,11 +299,12 @@
   overflow: hidden;
 }
 
-/* The nav fills the persisted rect. Without this the rect had no visual effect
-   at all: the nav sized itself from its own content and ignored the box. */
+/* Hug the icon row by default. Stretch height only when TSX paints a pinned
+   `--quick-toolbar-nav-height: 100%` after the user grew N/S chrome. */
 .rootFree .toolbar {
   width: 100%;
-  height: 100%;
+  height: var(--quick-toolbar-nav-height, auto);
+  align-items: center;
 }
 
 /* One synchronous frame-less read of the nav's *natural* extent. The component
@@ -166,9 +398,9 @@
      `.chatToolbar[data-dock-mode='strip']` and on `.topDockActions`, so cards,
      the gear and the two dock buttons are all exactly 6px apart. Nothing in this
      row may add padding or margin on top of it. */
-  gap: 6px;
-  width: 100%;
-  flex: 1 1 auto;
+  gap: var(--quick-toolbar-gap, 6px);
+  width: auto;
+  flex: 0 0 auto;
   min-width: 0;
   max-width: 100%;
   /* The content-width cap, mirroring `LoreIndicator.module.css`'s `.strip`.
@@ -193,11 +425,63 @@
 .cardScroller {
   display: flex;
   min-width: 0;
+  width: auto;
   max-width: 100%;
-  flex: 0 1 auto;
-  gap: 6px;
+  flex: 1 1 auto;
+  gap: var(--quick-toolbar-gap, 6px);
   overflow: hidden;
   scrollbar-width: none;
+}
+
+/* Fill-on owns only the rail; cards and slots retain intrinsic widths so
+   heterogeneous content remains visibly heterogeneous. */
+
+/* The strip owns the available dock rail. The scroller may clip only inside
+   that rail; overflow and customize stay fixed trailing siblings. */
+.root[data-quick-toolbar-placement='chat_top_dock'][data-fill-top-dock='1'] .cardStrip {
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+  justify-content: flex-start;
+}
+
+.root[data-quick-toolbar-placement='chat_top_dock'][data-fill-top-dock='1'] .cardScroller {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+
+/* In fill modes (Option A & B), card slots and buttons expand proportionally to consume the rail */
+.root[data-fill-screen='1'] .cardSlot,
+.root[data-fill-top-dock='1'] .cardSlot {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  flex: 1 1 0px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  box-sizing: border-box !important;
+  overflow: visible !important;
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.root[data-fill-screen='1'] .cardSlot .card,
+.root[data-fill-top-dock='1'] .cardSlot .card {
+  width: var(--quick-toolbar-card-width, 100%) !important;
+  max-width: var(--quick-toolbar-card-max-width, none) !important;
+  flex: 1 1 auto !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: var(--quick-toolbar-card-min-width, 0) !important;
+  padding: 2px var(--quick-toolbar-card-padding-inline, 6px) !important;
+  gap: var(--quick-toolbar-card-gap, 4px) !important;
+  box-sizing: border-box !important;
+  white-space: nowrap !important;
+  text-overflow: ellipsis !important;
+  text-align: center !important;
 }
 
 .cardScroller:empty {
@@ -207,7 +491,16 @@
 .cardSlot {
   display: inline-flex;
   flex: 0 0 auto;
+  width: max-content;
   min-width: 0;
+  transition: transform 160ms ease;
+}
+
+/* Keep the slot in flow so neighbors slide; lift lives on the card transform. */
+.cardSlot[data-dragging],
+.cardSlot:has([data-dragging]) {
+  position: relative;
+  z-index: 8;
 }
 
 .measureRail {
@@ -225,13 +518,11 @@
 .measureRail > span {
   display: inline-flex;
   flex: 0 0 auto;
-  margin-right: 6px;
+  margin-right: var(--quick-toolbar-gap, 6px);
 }
 
-.cardStrip[data-fit='pending'] .cardScroller,
-.cardStrip[data-fit='pending'] .overflowButton {
-  visibility: hidden;
-}
+/* Pending only reports that a fresh measurement is in flight. The previously
+   accepted fit stays painted until that measurement can replace it. */
 
 /*
  * Honest overflow, the `GroupChatMemberBar` way: a side only fades when content
@@ -249,12 +540,13 @@
      their content asks for and the strip scrolls instead, which is what the
      `mask-image` above has always been there to announce. */
   flex: 0 0 auto;
+  width: var(--quick-toolbar-card-width, max-content);
   align-items: center;
-  gap: 8px;
-  min-width: calc(var(--quick-toolbar-icon-size, 28px) + 24px);
-  max-width: 190px;
+  gap: var(--quick-toolbar-card-gap, 8px);
+  min-width: var(--quick-toolbar-card-min-width, calc(var(--quick-toolbar-icon-size, 28px) + 24px));
+  max-width: var(--quick-toolbar-card-max-width, 190px);
   min-height: calc(var(--quick-toolbar-icon-size, 28px) + 20px);
-  padding: 5px 9px 5px 6px;
+  padding: 5px var(--quick-toolbar-card-padding-inline, 9px) 5px var(--quick-toolbar-card-padding-inline, 6px);
   border: 1px solid var(--lumiverse-border-hover);
   /* Never a literal: `theme/engine.ts` recomputes every radius token from the
      user's radius-scale, so the old `11px` silently opted out of that setting
@@ -268,7 +560,9 @@
   transition:
     background var(--lumiverse-transition-fast, 120ms),
     border-color var(--lumiverse-transition-fast, 120ms),
-    color var(--lumiverse-transition-fast, 120ms);
+    color var(--lumiverse-transition-fast, 120ms),
+    transform 160ms ease,
+    box-shadow 160ms ease;
 }
 
 /*
@@ -311,17 +605,24 @@
   color: var(--lumiverse-primary-text, var(--lumiverse-primary));
 }
 
-.cardStrip .card {
+.cardIconOnly {
   min-width: 0;
-  width: max-content;
-  max-width: 190px;
+  max-width: none;
+  padding: 3px;
+  gap: 0;
+}
+
+.cardStrip .card {
+  min-width: var(--quick-toolbar-card-min-width, 0);
+  width: var(--quick-toolbar-card-width, max-content);
+  max-width: var(--quick-toolbar-card-max-width, 190px);
   /* V2 owns a compact rail at the 16px minimum, but the setting's full
      16-36px range must remain real. Growing the pill with its glyph prevents
      a larger SVG from bleeding outside the card or clipping against the dock. */
   min-height: max(32px, calc(var(--quick-toolbar-icon-size, 16px) + 12px));
   height: max(32px, calc(var(--quick-toolbar-icon-size, 16px) + 12px));
-  padding: 3px 8px;
-  gap: 6px;
+  padding: 3px var(--quick-toolbar-card-padding-inline, 8px);
+  gap: var(--quick-toolbar-card-gap, 6px);
   border-radius: 8px;
 }
 
@@ -436,11 +737,12 @@
  * the test helpers parse this sheet with a flat `^selector\s*\{([^}]*)\}`.
  */
 .cardStrip[data-density='compact'] .card {
-  gap: 6px;
-  max-width: 170px;
+  gap: var(--quick-toolbar-card-gap, 6px);
+  width: var(--quick-toolbar-card-width, max-content);
+  max-width: var(--quick-toolbar-card-max-width, 170px);
   min-height: max(32px, calc(var(--quick-toolbar-icon-size, 16px) + 12px));
   height: max(32px, calc(var(--quick-toolbar-icon-size, 16px) + 12px));
-  padding: 3px 8px;
+  padding: 3px var(--quick-toolbar-card-padding-inline, 8px);
 }
 
 .cardStrip[data-density='compact'] .cardIcon {
@@ -518,11 +820,8 @@
 }
 
 .item {
-  /* `min-width: 0` (was `iconSize + 14`) so buttons compress instead of forcing
-     the nav to scroll; `flex: 1 1 auto` so they share any space the user drags
-     in. The floor that stops the toolbar shrinking below its content is
-     `toolbarRectBounds(natural)`, not this rule. */
-  flex: 1 1 auto;
+  /* Shrink-to-content: no artificial min box and no slack-absorbing grow. */
+  flex: 0 0 auto;
   min-width: 0;
   min-height: 0;
   display: inline-flex;
@@ -530,7 +829,7 @@
   align-items: center;
   justify-content: center;
   gap: 3px;
-  padding: 6px 7px;
+  padding: 2px 6px;
   border: 1px solid transparent;
   border-radius: 9px;
   background: transparent;
@@ -568,6 +867,41 @@
   transform: translateX(1px);
 }
 
+[data-toolbar-item-drag-handle] {
+  cursor: grab;
+}
+
+[data-toolbar-item-drag-handle]:active:not([data-dragging]) {
+  transform: scale(0.97);
+}
+
+.card[data-dragging],
+.item[data-dragging],
+.item[data-dragging]:hover,
+.item[data-dragging]:focus-visible,
+.toolbarVertical .item[data-dragging],
+.toolbarVertical .item[data-dragging]:hover,
+.toolbarVertical .item[data-dragging]:focus-visible,
+.cardSlot[data-dragging] .card,
+.root[data-dragging-action] [data-dragging] {
+  z-index: 100;
+  cursor: grabbing;
+  transform: scale(1.05) translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  outline: 2px solid var(--lumiverse-primary);
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.root[data-dragging-action],
+.root[data-dragging-action] * {
+  cursor: grabbing;
+}
+
+button[aria-label='Customize toolbar'],
+.cardStripSettings {
+  cursor: pointer !important;
+}
+
 /*
  * The trailing gear, promoted to a card-height bordered sibling as the confirmed
  * design shows. It used to be a 26px transparent glyph with a 5px radius next to
@@ -578,9 +912,11 @@
  * (0,1,0), so source order is the only thing that lets it win.
  */
 .cardStripSettings {
+  box-sizing: border-box;
   flex: 0 0 auto;
   width: max(36px, calc(var(--quick-toolbar-icon-size, 16px) + 8px));
   min-width: max(36px, calc(var(--quick-toolbar-icon-size, 16px) + 8px));
+  /* Height includes the 1px border. Same formula as `.cardStrip .card`. */
   height: max(32px, calc(var(--quick-toolbar-icon-size, 16px) + 12px));
   min-height: max(32px, calc(var(--quick-toolbar-icon-size, 16px) + 12px));
   padding: 0;
@@ -590,15 +926,35 @@
   border-color: var(--lumiverse-border-hover);
   border-radius: var(--lumiverse-radius-md);
   color: var(--lumiverse-text-muted);
+  /* Strip / toolbar stay `overflow: hidden`; chrome must not clip its own glyph. */
+  overflow: visible;
 }
 
 .overflowButton {
+  box-sizing: border-box;
   width: auto;
-  min-width: 56px;
+  min-width: 0;
   flex-direction: row;
+  align-items: center;
   gap: 4px;
   padding: 0 8px;
   font-size: 11px;
+  overflow: visible;
+}
+
+/* Same clamp as `.cardStrip .cardIcon > svg`. Lucide `size` is presentational. */
+.cardStripSettings > svg {
+  display: block;
+  width: var(--quick-toolbar-icon-size, 16px);
+  height: var(--quick-toolbar-icon-size, 16px);
+  max-width: 100%;
+  max-height: 100%;
+  flex: 0 0 auto;
+}
+
+.overflowButton > span {
+  flex: 0 0 auto;
+  line-height: 1;
 }
 
 .overflowPopover {
@@ -1095,10 +1451,9 @@
 }
 
 /*
- * Inset bands, never negative offsets. The toolbar carries 8px of padding, so an
- * 8px band *inside* the edge can never cover a button — while the space outside
- * the box stays completely free for the drag grip, which is what
- * `.resize_n { top: -4px }` was competing for.
+ * Inset bands, never negative offsets. Padding-block fallback is 4px; the 8px
+ * handle band stays inset so the space outside the box stays free for the drag
+ * grip, which is what `.resize_n { top: -4px }` was competing for.
  */
 .resize_n,
 .resize_s {

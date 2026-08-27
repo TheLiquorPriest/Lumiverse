@@ -24,14 +24,14 @@ function createPersistentPreBundleFixture(): {
       applied_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `);
-  db.run("INSERT INTO _migrations (name) VALUES ('101_before_bundle.sql')");
+  db.run("INSERT INTO _migrations (name) VALUES ('112_before_bundle.sql')");
   db.run("CREATE TABLE pre_bundle_data (value TEXT NOT NULL)");
   db.run("INSERT INTO pre_bundle_data (value) VALUES ('preserve me')");
   return { db, root, migrationsDir };
 }
 
 function installBundleMigration(migrationsDir: string, sql = "CREATE TABLE bundle_marker (id INTEGER PRIMARY KEY)"): void {
-  writeFileSync(join(migrationsDir, "102_bundle.sql"), `${sql};`);
+  writeFileSync(join(migrationsDir, "113_bundle.sql"), `${sql};`);
 }
 
 afterEach(() => {
@@ -62,6 +62,11 @@ describe("database migrations", () => {
       expect(
         db.query("SELECT name FROM _migrations WHERE name = ?").get("095_lumihub_link_user_scope.sql"),
       ).toEqual({ name: "095_lumihub_link_user_scope.sql" });
+      expect(
+        db.query("SELECT name FROM _migrations WHERE name = ?").get("107_world_book_entry_order_index.sql"),
+      ).toEqual({ name: "107_world_book_entry_order_index.sql" });
+      const entryIndexes = db.query("PRAGMA index_list('world_book_entries')").all() as Array<{ name: string }>;
+      expect(entryIndexes.map((index) => index.name)).toContain("idx_wbe_world_book_order");
     } finally {
       db.close();
     }
@@ -120,8 +125,8 @@ describe("database migrations", () => {
   test("does not inspect or overwrite an old backup after crossing the bundle", async () => {
     const { db, migrationsDir } = createPersistentPreBundleFixture();
     try {
-      db.run("INSERT INTO _migrations (name) VALUES ('102_bundle.sql')");
-      writeFileSync(join(migrationsDir, "112_later.sql"), "CREATE TABLE later_marker (id INTEGER PRIMARY KEY);");
+      db.run("INSERT INTO _migrations (name) VALUES ('113_bundle.sql')");
+      writeFileSync(join(migrationsDir, "114_later.sql"), "CREATE TABLE later_marker (id INTEGER PRIMARY KEY);");
       const backupPath = getPreBundleBackupPath(db);
       expect(backupPath).not.toBeNull();
       writeFileSync(backupPath!, "stale backup is retained");
@@ -150,7 +155,7 @@ describe("database migrations", () => {
         const integrity = backup.query("PRAGMA integrity_check").all() as Array<Record<string, unknown>>;
         expect(integrity.map((row) => Object.values(row)[0])).toEqual(["ok"]);
         expect(backup.query("SELECT name FROM _migrations ORDER BY id").all()).toEqual([
-          { name: "101_before_bundle.sql" },
+          { name: "112_before_bundle.sql" },
         ]);
         expect(backup.query("SELECT value FROM pre_bundle_data").get()).toEqual({ value: "preserve me" });
         expect(backup.query("SELECT name FROM sqlite_master WHERE name = 'bundle_marker'").get()).toBeNull();
@@ -165,8 +170,8 @@ describe("database migrations", () => {
       currentDb = restarted;
       await runMigrations(restarted, migrationsDir);
       expect(statSync(backupPath!).mtimeMs).toBe(firstBackupMtime);
-      expect(restarted.query("SELECT name FROM _migrations WHERE name = '102_bundle.sql'").get()).toEqual({
-        name: "102_bundle.sql",
+      expect(restarted.query("SELECT name FROM _migrations WHERE name = '113_bundle.sql'").get()).toEqual({
+        name: "113_bundle.sql",
       });
     } finally {
       currentDb?.close();
@@ -183,7 +188,7 @@ describe("database migrations", () => {
 
       await expect(runMigrations(db, migrationsDir)).rejects.toThrow("pre-bundle backup validation failed");
       expect(db.query("SELECT name FROM _migrations ORDER BY id").all()).toEqual([
-        { name: "101_before_bundle.sql" },
+        { name: "112_before_bundle.sql" },
       ]);
       expect(db.query("SELECT name FROM sqlite_master WHERE name = 'bundle_marker'").get()).toBeNull();
     } finally {

@@ -45,6 +45,7 @@ import { ModalShell } from '@/components/shared/ModalShell'
 import { Toggle } from '@/components/shared/Toggle'
 import { useScaledSortableStyle } from '@/lib/dndUiScale'
 import { filterActionIds, filterActions } from '@/lib/toolbarActionSearch'
+import { hasEnabledFrontendExtension } from '@/lib/spindle/frontend-extension-availability'
 import styles from './InputArea.module.css'
 
 /** localStorage key — no store slice exists on the InputArea allowlist. */
@@ -150,6 +151,32 @@ export function composerExtraItem(action: ToolbarAction): ComposerActionItem {
     icon: action.icon,
     keywords: action.keywords,
   }
+}
+
+/**
+ * The Suite is the owner of Quick Toolbar actions in the composer customizer.
+ * Core composer actions remain available without it, except for its dedicated
+ * Connections Picker launcher.
+ */
+export function buildComposerActionMap(
+  actionCatalog: readonly ToolbarAction[],
+  hasLumiverseSuite: boolean,
+): Map<string, ComposerActionItem> {
+  const nativeActions = hasLumiverseSuite
+    ? COMPOSER_ACTION_CATALOG
+    : COMPOSER_ACTION_CATALOG.filter((action) => action.id !== 'connectionsPicker')
+  const map = new Map<string, ComposerActionItem>(
+    nativeActions.map((action) => [action.id, action]),
+  )
+  if (!hasLumiverseSuite) return map
+
+  for (const action of actionCatalog) {
+    if (action.id === 'lumiverse_suite.connections_picker.open') continue
+    const item = composerExtraItem(action)
+    if (map.has(item.id)) continue
+    map.set(item.id, item)
+  }
+  return map
 }
 
 export function normalizeComposerActionBarState(raw: unknown): ComposerActionBarState {
@@ -321,6 +348,7 @@ export default function InputAreaCustomizeModal({
   const [query, setQuery] = useState('')
   const { t } = useTranslation('chat')
   const { actionCatalog } = useQuickToolbarActions()
+  const hasLumiverseSuite = useStore((state) => hasEnabledFrontendExtension(state.extensions, 'lumiverse_suite'))
   const dialogRef = useRef<HTMLDivElement>(null)
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
@@ -374,28 +402,25 @@ export default function InputAreaCustomizeModal({
   )
 
   const actionById = useMemo<Map<string, ComposerActionItem>>(() => {
-    const map = new Map<string, ComposerActionItem>(
-      COMPOSER_ACTION_CATALOG.map((action): [string, ComposerActionItem] => [action.id, {
+    const map = buildComposerActionMap(actionCatalog, hasLumiverseSuite)
+    for (const action of COMPOSER_ACTION_CATALOG) {
+      if (!map.has(action.id)) continue
+      map.set(action.id, {
         ...action,
         label: t(action.label),
         description: t(action.description),
-      }]),
-    )
-    for (const action of actionCatalog) {
-      if (action.id === 'lumiverse_suite.connections_picker.open') continue
-      const item = composerExtraItem(action)
-      if (map.has(item.id)) continue
-      map.set(item.id, item)
+      })
     }
     return map
-  }, [actionCatalog, t])
+  }, [actionCatalog, hasLumiverseSuite, t])
   const listedOrder = useMemo(() => {
+    const availableQuickToolbarActions = hasLumiverseSuite ? actionCatalog : []
     const seen = new Set(order)
-    const extras = actionCatalog
+    const extras = availableQuickToolbarActions
       .map((action) => toComposerExtraId(action.id))
       .filter((id) => !seen.has(id) && actionById.has(id))
     return [...order, ...extras]
-  }, [actionById, actionCatalog, order])
+  }, [actionById, actionCatalog, hasLumiverseSuite, order])
   const rows = useMemo(
     () => listedOrder
       .map((id) => actionById.get(id))
@@ -403,8 +428,8 @@ export default function InputAreaCustomizeModal({
     [actionById, listedOrder],
   )
   const visibleIds = useMemo(
-    () => order.filter((id) => !hidden.includes(id)),
-    [hidden, order],
+    () => order.filter((id) => !hidden.includes(id) && actionById.has(id)),
+    [actionById, hidden, order],
   )
   const filteredRows = useMemo(() => filterActions(rows, query), [query, rows])
   const sortableIds = useMemo(
@@ -427,7 +452,7 @@ export default function InputAreaCustomizeModal({
   }
 
   return (
-    <ModalShell isOpen onClose={onClose} maxWidth={560} className={styles.customizeModal}>
+    <ModalShell data-component="InputAreaCustomizeModal" isOpen onClose={onClose} maxWidth={560} className={styles.customizeModal}>
       <div
         id="input-area-customize-dialog"
         ref={dialogRef}

@@ -1,4 +1,5 @@
 import { useStore } from '@/store'
+import { hasEnabledFrontendExtensionId } from '@/lib/spindle/frontend-extension-availability'
 
 export type LorebookEditorLaunchTarget = 'native' | 'half' | 'full'
 
@@ -13,8 +14,10 @@ let invocationSequence = 0
 
 function extensionActionFor(target: Exclude<LorebookEditorLaunchTarget, 'native'>) {
   const actionId = ACTION_IDS[target]
-  return useStore.getState().inputBarActions.find((action) =>
+  const state = useStore.getState()
+  return state.inputBarActions.find((action) =>
     action.contributionId === actionId
+    && hasEnabledFrontendExtensionId(state.extensions, action.extensionId)
     && action.enabled
     && action.externallyInvocable !== false
     && action.clickHandlers.size > 0,

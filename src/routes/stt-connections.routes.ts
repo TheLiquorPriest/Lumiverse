@@ -6,7 +6,8 @@ import { withReadableApiKeyStatus, withReadableApiKeyStatuses } from "../service
 const app = new Hono();
 
 app.get("/providers", (c) => {
-  return c.json({ providers: svc.listProviders() });
+  const userId = c.get("userId");
+  return c.json({ providers: svc.listProviders(userId) });
 });
 
 app.post("/models/preview", async (c) => {

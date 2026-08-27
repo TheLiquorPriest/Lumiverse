@@ -12,6 +12,8 @@ const staleTokenCommits: string[] = []
 const updateCalls: Array<{ bookId: string; entryId: string; input: Record<string, unknown> }> = []
 const deleteCalls: Array<{ bookId: string; entryId: string; revision?: number }> = []
 const bulkDeleteCalls: Array<{ bookId: string; input: Record<string, unknown> }> = []
+const listEntryCalls: Array<{ bookId: string; limit: number; offset: number }> = []
+const getEntryCalls: Array<{ bookId: string; entryId: string }> = []
 const wsHandlers = new Map<string, (payload: unknown) => void>()
 let listEntriesResult: { data: WorldBookEntry[]; total: number } = { data: [], total: 0 }
 let updateDeferred: Deferred<WorldBookEntry> | null = null
@@ -72,8 +74,19 @@ mock.module('@/hooks/useTokenCounts', () => ({
 }))
 mock.module('@/api/world-books', () => ({
   worldBooksApi: {
-    listEntries: async () => listEntriesResult,
-    getEntry: async () => { throw new Error('unexpected pending-entry lookup') },
+    listEntries: async (bookId: string, input: { limit: number; offset: number }) => {
+      listEntryCalls.push({ bookId, limit: input.limit, offset: input.offset })
+      return {
+        ...listEntriesResult,
+        data: listEntriesResult.data.slice(input.offset, input.offset + input.limit),
+      }
+    },
+    getEntry: async (bookId: string, entryId: string) => {
+      getEntryCalls.push({ bookId, entryId })
+      const found = listEntriesResult.data.find((candidate) => candidate.id === entryId)
+      if (!found) throw new Error(`missing fixture entry ${entryId}`)
+      return found
+    },
     updateEntry(bookId: string, entryId: string, input: Record<string, unknown>) {
       updateCalls.push({ bookId, entryId, input })
       if (!updateDeferred) throw new Error('missing update deferred')
@@ -252,6 +265,8 @@ afterEach(() => {
   updateCalls.length = 0
   deleteCalls.length = 0
   bulkDeleteCalls.length = 0
+  listEntryCalls.length = 0
+  getEntryCalls.length = 0
   wsHandlers.clear()
   updateDeferred = null
   listEntriesResult = { data: [], total: 0 }
@@ -267,6 +282,22 @@ afterAll(() => {
 })
 
 describe('WorldBookEntriesSection token-count invalidation', () => {
+  test('opens a pending deep-linked entry outside the current server page', async () => {
+    const entries = Array.from({ length: 75 }, (_, index) => entry(`entry-${String(index + 1).padStart(2, '0')}`))
+    storeState.pendingWorldBookEditEntryId = 'entry-60'
+    const { root, host } = await render(entries)
+    try {
+      expect(storeState.pendingWorldBookEditEntryId).toBeNull()
+      expect(host.querySelector('[data-entry-id="entry-60"]')).not.toBeNull()
+      expect(host.querySelector('[data-entry-id="entry-01"]')).not.toBeNull()
+      expect(host.querySelector('[data-entry-id="entry-51"]')).toBeNull()
+      expect(listEntryCalls).toContainEqual({ bookId: book.id, limit: 50, offset: 0 })
+      expect(getEntryCalls).toContainEqual({ bookId: book.id, entryId: 'entry-60' })
+    } finally {
+      unmount(root)
+    }
+  })
+
   test('renders stable row and token-cell anchors with an immediate estimate', async () => {
     const { root, host } = await render([entry('entry-anchor', '12345678')])
     try {

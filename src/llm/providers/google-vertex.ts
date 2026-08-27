@@ -50,6 +50,7 @@ import {
   GOOGLE_SEARCH_HANDLED_PARAMS,
   GOOGLE_SEARCH_PARAMETERS,
 } from "./google-search";
+import { splitLeadingSystemMessagePrefix } from "../system-message-prefix";
 
 /**
  * Keep the provider's clone-safe invalid-arguments sentinel intact while
@@ -365,7 +366,7 @@ export class GoogleVertexProvider implements LlmProvider {
         throw new ProviderProtocolError("Vertex thought marker is malformed");
       }
       if (p.thoughtSignature !== undefined && !p.functionCall) {
-        throw new ProviderProtocolError("Vertex thought signature must accompany a functionCall");
+        thoughtSignatures.add(p.thoughtSignature, this.displayName);
       }
       if (p.thought) {
         if (typeof p.text !== "string") throw new ProviderProtocolError("Vertex reasoning part is malformed");
@@ -399,6 +400,10 @@ export class GoogleVertexProvider implements LlmProvider {
     if (candidate.finishReason !== undefined && typeof candidate.finishReason !== "string") {
       throw new ProviderProtocolError("Vertex finishReason must be a string");
     }
+    const thoughtSignature = this.getNonToolThoughtSignature(
+      parts,
+      request.parameters?._replay_thought_signatures === true,
+    );
     const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
     const groundingMetadata = candidate.groundingMetadata ?? data.groundingMetadata;
 
@@ -407,6 +412,7 @@ export class GoogleVertexProvider implements LlmProvider {
       reasoning: reasoning || undefined,
       finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
       tool_calls: toolCalls,
+      ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
       usage: parseGeminiUsageMetadata(data.usageMetadata, this.displayName, groundingMetadata),
     };
   }
@@ -479,7 +485,7 @@ export class GoogleVertexProvider implements LlmProvider {
           throw new ProviderProtocolError("Vertex thought marker is malformed");
         }
         if (part.thoughtSignature !== undefined && !part.functionCall) {
-          throw new ProviderProtocolError("Vertex thought signature must accompany a functionCall");
+          thoughtSignatures.add(part.thoughtSignature, this.displayName);
         }
         if (part.thought) {
           if (typeof part.text !== "string") throw new ProviderProtocolError("Vertex reasoning part is malformed");
@@ -556,11 +562,27 @@ export class GoogleVertexProvider implements LlmProvider {
             thought_signature: call.thoughtSignature,
           }))
         : undefined;
+      const thoughtSignature = this.getNonToolThoughtSignature(
+        parts ?? [],
+        request.parameters?._replay_thought_signatures === true,
+      );
       if (finishReason) {
         sse.markTerminal();
-        yield { token: text, reasoning: reasoning || undefined, finish_reason: toolCalls ? "tool_calls" : finishReason, tool_calls: toolCalls, usage };
-      } else if (text || reasoning || usage) {
-        yield { token: text, reasoning: reasoning || undefined, usage };
+        yield {
+          token: text,
+          reasoning: reasoning || undefined,
+          finish_reason: toolCalls ? "tool_calls" : finishReason,
+          tool_calls: toolCalls,
+          ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
+          usage,
+        };
+      } else if (text || reasoning || usage || thoughtSignature) {
+        yield {
+          token: text,
+          reasoning: reasoning || undefined,
+          ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
+          usage,
+        };
       } else if (toolCalls) {
         yield { token: "", tool_calls: toolCalls };
       }
@@ -619,12 +641,39 @@ export class GoogleVertexProvider implements LlmProvider {
 
   // ── Body building (mirrors GoogleProvider.buildBody) ──────────────────
 
-  private formatParts(m: LlmMessage, toolNameById: Map<string, string>): any[] {
-    if (typeof m.content === "string") return [{ text: m.content }];
-    return m.content.map((part: LlmMessagePart) => {
+  private getNonToolThoughtSignature(parts: any[], enabled: boolean): string | undefined {
+    if (!enabled) return undefined;
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index];
+      if (!part?.functionCall && typeof part?.thoughtSignature === "string") {
+        return part.thoughtSignature;
+      }
+    }
+    return undefined;
+  }
+
+  private formatParts(
+    m: LlmMessage,
+    toolNameById: Map<string, string>,
+    replayThoughtSignatures: boolean,
+  ): any[] {
+    if (typeof m.content === "string") {
+      return [{
+        text: m.content,
+        ...(m.role === "assistant" && replayThoughtSignatures && m.thought_signature
+          ? { thoughtSignature: m.thought_signature }
+          : {}),
+      }];
+    }
+    const formatted = m.content.map((part: LlmMessagePart) => {
       switch (part.type) {
         case "text":
-          return { text: part.text };
+          return {
+            text: part.text,
+            ...(m.role === "assistant" && replayThoughtSignatures && part.thought_signature
+              ? { thoughtSignature: part.thought_signature }
+              : {}),
+          };
         case "image":
         case "audio":
           return { inlineData: { mimeType: part.mime_type, data: part.data } };
@@ -643,6 +692,13 @@ export class GoogleVertexProvider implements LlmProvider {
           return { text: "" };
       }
     });
+    if (m.role === "assistant" && replayThoughtSignatures && m.thought_signature) {
+      const target = [...formatted].reverse().find((part) =>
+        Object.hasOwn(part, "text") || Object.hasOwn(part, "inlineData"),
+      );
+      if (target) target.thoughtSignature = m.thought_signature;
+    }
+    return formatted;
   }
 
   private buildToolNameMap(messages: readonly LlmMessage[]): Map<string, string> {
@@ -657,7 +713,7 @@ export class GoogleVertexProvider implements LlmProvider {
   }
 
   private static readonly INTERNAL_PARAMS = new Set([
-    "max_context_length", "_include_usage", "_streaming",
+    "max_context_length", "_include_usage", "_streaming", "_replay_thought_signatures",
   ]);
   private static readonly TOOL_CONTROL_PARAMS = new Set([
     "tools", "tool_choice", "parallel_tool_calls", "functions", "function_call",
@@ -672,9 +728,13 @@ export class GoogleVertexProvider implements LlmProvider {
   private buildBody(request: GenerationRequest): any {
     const params = request.parameters || {};
 
-    const systemMessages = request.messages.filter((m) => m.role === "system");
-    const otherMessages = request.messages.filter((m) => m.role !== "system");
+    // Vertex exposes a single systemInstruction. Preserve any system message
+    // after the leading prefix in-place as user-role content so configured
+    // in-history/post-history depth remains meaningful.
+    const { prefix: systemMessages, remainder: otherMessages } =
+      splitLeadingSystemMessagePrefix(request.messages);
     const toolNameById = this.buildToolNameMap(request.messages);
+    const replayThoughtSignatures = params._replay_thought_signatures === true;
     const functionTools = request.tools ?? [];
     const hasFunctionDeclarations = functionTools.length > 0;
     const googleSearchTool = buildGoogleSearchTool(
@@ -687,7 +747,7 @@ export class GoogleVertexProvider implements LlmProvider {
     const body: any = {
       contents: otherMessages.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
-        parts: this.formatParts(m, toolNameById),
+        parts: this.formatParts(m, toolNameById, replayThoughtSignatures),
       })),
     };
 

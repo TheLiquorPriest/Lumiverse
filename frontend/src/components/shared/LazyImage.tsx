@@ -15,6 +15,8 @@ interface LazyImageProps {
   [key: string]: any
 }
 
+const LOADING_INDICATOR_DELAY_MS = 120
+
 export default function LazyImage({
   src,
   alt = '',
@@ -38,6 +40,7 @@ export default function LazyImage({
     if (isImageDecoded(src)) return false
     return true
   })
+  const [showLoadingIndicator, setShowLoadingIndicator] = useState(false)
   const [hasError, setHasError] = useState(false)
   const prevSrcRef = useRef(src)
 
@@ -46,6 +49,7 @@ export default function LazyImage({
       prevSrcRef.current = src
       const decoded = Boolean(src && isImageDecoded(src))
       setIsLoading(!decoded)
+      setShowLoadingIndicator(false)
       setHasError(false)
     }
   }, [src])
@@ -60,19 +64,32 @@ export default function LazyImage({
       return
     }
     return onImageDecoded(src, () => {
-      if (isImageDecoded(src)) setIsLoading(false)
+      if (isImageDecoded(src)) {
+        setIsLoading(false)
+        setShowLoadingIndicator(false)
+      }
     })
   }, [src, isLoading])
+
+  // Cached images commonly settle within a frame or two. Avoid flashing a
+  // spinner for that fast path while still providing feedback for real waits.
+  useEffect(() => {
+    if (!isLoading) return
+    const timer = window.setTimeout(() => setShowLoadingIndicator(true), LOADING_INDICATOR_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [isLoading, src])
 
   const handleLoad = useCallback((event: SyntheticEvent<HTMLImageElement>) => {
     if (src) {
       rememberImageDecoded(src)
     }
     setIsLoading(false)
+    setShowLoadingIndicator(false)
     onLoad?.(event)
   }, [onLoad, src])
   const handleError = useCallback((event: SyntheticEvent<HTMLImageElement>) => {
     setIsLoading(false)
+    setShowLoadingIndicator(false)
     setHasError(true)
     onError?.(event)
   }, [onError])
@@ -85,7 +102,7 @@ export default function LazyImage({
 
   return (
     <div style={containerInline} className={containerClassName || undefined}>
-      {isLoading && (
+      {isLoading && showLoadingIndicator && (
         <div
           style={{
             position: 'absolute',

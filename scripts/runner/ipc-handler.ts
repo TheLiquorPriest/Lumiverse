@@ -16,6 +16,8 @@ import {
   ensureFrontendDependencies,
   rebuildFrontend,
   runWithServerStopped,
+  assertUpdateCanHardSync,
+  assertBranchCanHardSync,
 } from "./git-ops.js";
 import { readEnvConfig, writeTrustAnyOrigin } from "./env-config.js";
 import { getCurrentBranch } from "./lib/git.js";
@@ -133,6 +135,12 @@ export async function handleIPCMessage(msg: any, sink?: ResponseSink): Promise<v
         respond(id, false, undefined, `Operation '${operationInProgress}' already in progress`);
         break;
       }
+      try {
+        assertUpdateCanHardSync();
+      } catch (err) {
+        respond(id, false, undefined, err instanceof Error ? err.message : "Update preflight failed");
+        break;
+      }
       operationInProgress = "update";
       // Ack before killing the server. The fetch that initiated this request
       // will otherwise die along with the old server process — the frontend
@@ -171,6 +179,12 @@ export async function handleIPCMessage(msg: any, sink?: ResponseSink): Promise<v
       // request hanging the full 5-minute timeout with no user feedback.
       if (!AVAILABLE_BRANCHES.includes(target)) {
         respond(id, false, undefined, `Invalid branch: ${target}. Available: ${AVAILABLE_BRANCHES.join(", ")}`);
+        break;
+      }
+      try {
+        assertBranchCanHardSync(target);
+      } catch (err) {
+        respond(id, false, undefined, err instanceof Error ? err.message : "Branch switch preflight failed");
         break;
       }
       operationInProgress = "branch-switch";
@@ -300,8 +314,7 @@ export async function handleIPCMessage(msg: any, sink?: ResponseSink): Promise<v
             progress(id, "rebuild", "Installing frontend dependencies...");
             await ensureFrontendDependencies(frontendDir);
 
-            progress(id, "rebuild", "Waiting for Vite build to finish...");
-            await rebuildFrontend(frontendDir);
+            await rebuildFrontend(frontendDir, (message) => progress(id, "rebuild", message));
           },
         );
       } catch (err) {

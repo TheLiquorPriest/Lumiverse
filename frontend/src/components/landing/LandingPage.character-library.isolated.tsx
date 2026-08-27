@@ -99,7 +99,8 @@ type StoreState = {
   setEditingCharacterId: MockFn
   setSetting: MockFn
   logout: MockFn
-  user: { username: string } | null
+  user: { id: string; username: string } | null
+  extensions: Array<{ id: string; identifier: string; enabled: boolean; has_frontend: boolean }>
   wallpaper: { global?: { image_id?: string | null } }
   profiles: Array<{ id: string; is_default?: boolean; name: string }>
   activeProfileId: string | null
@@ -187,7 +188,8 @@ function createStoreState(landingPageActiveTab: unknown = 'characters', enabled 
     setEditingCharacterId: jest.fn(),
     setSetting,
     logout: jest.fn(),
-    user: { username: 'test-user' },
+    user: { id: 'test-user-id', username: 'test-user' },
+    extensions: [{ id: 'suite-id', identifier: 'lumiverse_suite', enabled: true, has_frontend: true }],
     wallpaper: { global: null },
     profiles: [],
     activeProfileId: null,
@@ -241,7 +243,10 @@ mock.module('@/ws/events', () => ({ EventType: { CHAT_DELETED: 'chat-deleted' } 
 mock.module('@/hooks/useScrollGate', () => ({ useScrollGate: jest.fn() }))
 mock.module('@/hooks/useCharacterTheme', () => ({ warmCharacterPalette: jest.fn() }))
 mock.module('@/hooks/useLongPress', () => ({ useLongPress: () => ({}) }))
-mock.module('@/lib/imageDecodeCache', () => ({ prefetchImages: jest.fn() }))
+mock.module('@/lib/imageDecodeCache', () => ({
+  holdImagesForTransition: jest.fn(),
+  prefetchImages: jest.fn(),
+}))
 mock.module('@/lib/uiScale', () => ({
   measureLayoutHeight: () => 0,
   renderedPxToLayoutPx: (value: number) => value,
@@ -327,6 +332,7 @@ mock.module('motion/react', () => ({
 mock.module('@tanstack/react-virtual', () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
     getVirtualItems: () => count > 0 ? [{ index: 0, key: 'row-0', start: 0, end: 100, size: 100, lane: 0 }] : [],
+    getTotalSize: () => count * 100,
     measure: jest.fn(),
     containerRef: jest.fn(),
     measureElement: jest.fn(),
@@ -434,6 +440,7 @@ function appendReadySuiteRoot(host: HTMLDivElement) {
   root.dataset.homepageCharacterLibraryRoot = 'true'
   root.dataset.homepageCharacterLibraryReady = 'true'
   root.dataset.component = 'HomepageCharacterLibrary'
+  root.dataset.spindleExtId = 'lumiverse_suite'
   root.textContent = 'Character Library'
   charactersMount(host).append(root)
   return root
@@ -558,9 +565,9 @@ describe('LandingPage character library', () => {
     const host = await mountLanding()
     await flush()
 
-    expect(host.querySelectorAll('button[role="tab"]')).toHaveLength(1)
+    expect(host.querySelectorAll('button[role="tab"]')).toHaveLength(0)
     expect(tab(host, 'Characters')).toBeUndefined()
-    expect(tab(host, 'Chats')?.getAttribute('aria-selected')).toBe('true')
+    expect(tab(host, 'Chats')).toBeUndefined()
     expect(host.textContent).toContain('No recent chats')
     expect(listSummaries).not.toHaveBeenCalled()
 
@@ -569,9 +576,9 @@ describe('LandingPage character library', () => {
     root.remove()
     await flush()
 
-    expect(host.querySelectorAll('button[role="tab"]')).toHaveLength(1)
+    expect(host.querySelectorAll('button[role="tab"]')).toHaveLength(0)
     expect(tab(host, 'Characters')).toBeUndefined()
-    expect(tab(host, 'Chats')?.getAttribute('aria-selected')).toBe('true')
+    expect(tab(host, 'Chats')).toBeUndefined()
     expect(host.textContent).toContain('No recent chats')
   })
 
@@ -584,7 +591,7 @@ describe('LandingPage character library', () => {
     const host = await mountLanding()
     await flush()
 
-    expect(tab(host, 'Chats')?.getAttribute('aria-selected')).toBe('true')
+    expect(tab(host, 'Chats')).toBeUndefined()
     expect(host.textContent).toContain('No recent chats')
     expect(listSummaries).not.toHaveBeenCalled()
 
@@ -597,7 +604,7 @@ describe('LandingPage character library', () => {
     expect(charactersMount(host).querySelectorAll('[data-component="HomepageCharacterLibrary"]')).toHaveLength(1)
     expect(listSummaries).not.toHaveBeenCalled()
     expect(listRecentGrouped).toHaveBeenCalledTimes(1)
-    expect(storeState.setSetting).toHaveBeenNthCalledWith(1, 'landingPageActiveTab', 'characters')
+    expect(storeState.setSetting).not.toHaveBeenCalled()
   })
 
   test('returns to native Chats when the suite root is removed', async () => {
@@ -615,7 +622,7 @@ describe('LandingPage character library', () => {
     await flush()
 
     expect(tab(host, 'Characters')).toBeUndefined()
-    expect(tab(host, 'Chats')?.getAttribute('aria-selected')).toBe('true')
+    expect(tab(host, 'Chats')).toBeUndefined()
     expect(host.textContent).toContain('No recent chats')
     expect(listSummaries).not.toHaveBeenCalled()
   })
@@ -631,23 +638,21 @@ describe('LandingPage character library', () => {
 
     const firstRoot = appendReadySuiteRoot(host)
     await flush()
-    expect(storeState.setSetting).toHaveBeenCalledTimes(1)
-    expect(storeState.setSetting).toHaveBeenLastCalledWith('landingPageActiveTab', 'characters')
+    expect(storeState.setSetting).not.toHaveBeenCalled()
     firstRoot.append(document.createElement('span'))
     await flush()
-    expect(storeState.setSetting).toHaveBeenCalledTimes(1)
+    expect(storeState.setSetting).not.toHaveBeenCalled()
 
     firstRoot.remove()
     await flush()
-    expect(tab(host, 'Chats')?.getAttribute('aria-selected')).toBe('true')
+    expect(tab(host, 'Chats')).toBeUndefined()
     expect(host.textContent).toContain('No recent chats')
 
     appendReadySuiteRoot(host)
     await flush()
 
     expect(tab(host, 'Characters')?.getAttribute('aria-selected')).toBe('true')
-    expect(storeState.setSetting).toHaveBeenCalledTimes(2)
-    expect(storeState.setSetting).toHaveBeenLastCalledWith('landingPageActiveTab', 'characters')
+    expect(storeState.setSetting).not.toHaveBeenCalled()
     expect(charactersMount(host).querySelectorAll('[data-homepage-character-library-root]')).toHaveLength(1)
     expect(listRecentGrouped).toHaveBeenCalledTimes(1)
     expect(listSummaries).not.toHaveBeenCalled()

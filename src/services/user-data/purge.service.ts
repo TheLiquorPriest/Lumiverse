@@ -346,6 +346,20 @@ function collectUserFilePaths(userId: string): string[] {
       }
     }
   }
+  // Sweep legacy names too so an old-tier-thumbnail orphan doesn't survive.
+  try {
+    const imgs = getDb()
+      .query("SELECT id FROM images WHERE user_id = ?")
+      .all(userId) as { id: string }[];
+    const dir = join(env.dataDir, "images");
+    for (const img of imgs) {
+      for (const suffix of ["_thumb_sm.webp", "_thumb_lg.webp"]) {
+        seen.add(join(dir, `${img.id}${suffix}`));
+      }
+    }
+  } catch (err) {
+    console.warn(`[purge] legacy thumbnail sweep failed:`, err);
+  }
   return [...seen];
 }
 

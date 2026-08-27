@@ -1,5 +1,6 @@
 import type { StateCreator } from 'zustand'
 import type { SpindleSlice, PendingPermissionRequest, PendingTextEditorRequest, PendingContextMenuRequest, ExtensionThemeOverride, BulkUpdateStatus } from '@/types/store'
+import type { ExtensionInfo } from 'lumiverse-spindle-types'
 import { wsClient } from '@/ws/client'
 import { spindleApi } from '@/api/spindle'
 import { loadFrontendExtension, unloadFrontendExtension } from '@/lib/spindle/loader'
@@ -7,9 +8,42 @@ import { scheduleLowPriorityTask } from '@/lib/low-priority-task'
 import { yieldToBrowser } from '@/lib/spindle/browser-scheduler'
 import { compareFrontendHydrationPriority } from '@/lib/spindle/frontend-startup-priority'
 import { shareExtensionLoad } from '@/lib/spindle/extension-load-flight'
+import { reconcileMessageTagRuntimeCapabilities } from '@/lib/spindle/message-tag-runtime-readiness'
 
 const MUTED_THEMES_KEY = 'lumiverse:mutedExtensionThemes'
 const FRONTEND_HYDRATION_CONCURRENCY = 4
+const SPINDLE_LIST_RETRY_ATTEMPTS = 5
+const SPINDLE_LIST_RETRY_BASE_DELAY_MS = 1_000
+const SPINDLE_LIST_RETRY_BACKOFF = 1.7
+const SPINDLE_LIST_RETRY_MAX_DELAY_MS = 8_000
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Boot hydration is one-shot (WS CONNECTED -> loadExtensions). A transient
+ * failure of the single `GET /api/v1/spindle` request at cold start left the
+ * store empty so Canvas never loaded until the user happened to open the
+ * Extensions panel (which only re-runs when empty). Retry the list fetch with
+ * a bounded backoff so a cold-start hiccup self-heals.
+ */
+async function retrySpindleList(): Promise<{ extensions: ExtensionInfo[]; isPrivileged: boolean }> {
+  let delay = SPINDLE_LIST_RETRY_BASE_DELAY_MS
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await spindleApi.list()
+    } catch (err) {
+      if (attempt >= SPINDLE_LIST_RETRY_ATTEMPTS) throw err
+      console.warn(
+        `[Spindle] Extension list fetch failed (attempt ${attempt}/${SPINDLE_LIST_RETRY_ATTEMPTS}), retrying:`,
+        err,
+      )
+      await sleep(delay)
+      delay = Math.min(delay * SPINDLE_LIST_RETRY_BACKOFF, SPINDLE_LIST_RETRY_MAX_DELAY_MS)
+    }
+  }
+}
 
 function loadMutedThemes(): Record<string, boolean> {
   try {
@@ -47,7 +81,11 @@ export const createSpindleSlice: StateCreator<SpindleSlice> = (set, get) => ({
 
   loadExtensions: () => shareExtensionLoad(async () => {
     try {
-      const { extensions, isPrivileged } = await spindleApi.list()
+      // Retry the one-shot list fetch so a transient cold-start failure does
+      // not leave the store empty (and the extension unloaded until the user
+      // happens to open the Extensions panel, which only re-runs when empty).
+      const { extensions, isPrivileged } = await retrySpindleList()
+      reconcileMessageTagRuntimeCapabilities(extensions)
       set({ extensions, spindlePrivileged: isPrivileged })
 
       await new Promise<void>((resolveHydration) => {
@@ -189,8 +227,6 @@ export const createSpindleSlice: StateCreator<SpindleSlice> = (set, get) => ({
 
   disableExtension: async (id: string) => {
     await spindleApi.disable(id)
-    await unloadFrontendExtension(id)
-    get().clearExtensionChatStyleModes(id)
     set((state) => ({
       extensions: state.extensions.map((e) =>
         e.id === id ? { ...e, enabled: false, status: 'stopped' as const } : e
@@ -200,6 +236,8 @@ export const createSpindleSlice: StateCreator<SpindleSlice> = (set, get) => ({
         Object.entries(state.extensionThemeOverrides).filter(([extensionId]) => extensionId !== id)
       ),
     }))
+    await unloadFrontendExtension(id)
+    get().clearExtensionChatStyleModes(id)
   },
 
   restartExtension: async (id: string) => {

@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { closeDatabase, getDb, initDatabase } from "../../db/connection";
 import {
+  __mentionResolveCacheTest,
+  clearAllResolveCache,
   extractMentionSlugs,
   lookupSlugsInScope,
   stripMentions,
@@ -236,5 +238,25 @@ describe("lookupSlugsInScope", () => {
 
     expect(result.validSlugs.size).toBe(0);
     expect(result.docs.size).toBe(0);
+});
+
+describe("mention resolution cache", () => {
+  test("caps retained results and clears them under memory pressure", () => {
+    clearAllResolveCache();
+    for (let index = 0; index <= 256; index++) {
+      __mentionResolveCacheTest.set(`test-user:chat-${index}:key-${index}`, [{
+        slug: `doc-${index}`,
+        documentName: `Document ${index}`,
+        content: "content",
+        truncated: false,
+      }]);
+    }
+
+    expect(__mentionResolveCacheTest.size()).toBe(256);
+    expect(__mentionResolveCacheTest.keys()).not.toContain("test-user:chat-0:key-0");
+
+    clearAllResolveCache();
+    expect(__mentionResolveCacheTest.size()).toBe(0);
+  });
   });
 });

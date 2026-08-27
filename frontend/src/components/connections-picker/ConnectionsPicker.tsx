@@ -6,14 +6,18 @@ import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
+  LayoutGrid,
   Link2,
+  List,
   LoaderCircle,
   Plus,
+  RefreshCw,
   Search,
   Settings2,
   Star,
   X,
 } from 'lucide-react'
+import { get } from '@/api/client'
 import { connectionsApi } from '@/api/connections'
 import { ResizablePanelFrame } from '@/components/shared/ResizablePanelFrame'
 import {
@@ -29,8 +33,9 @@ import {
   setConnectionProfileFavoriteModels,
 } from '@/lib/connectionsPicker'
 import { DEFAULT_CONNECTIONS_PICKER_SETTINGS } from '@/lib/uiProductivityDefaults'
+import { useSpindleComponentOverride } from '@/lib/spindle/use-spindle-component-override'
 import { useStore } from '@/store'
-import type { ConnectionProfile } from '@/types/api'
+import type { ConnectionModelsResult, ConnectionProfile } from '@/types/api'
 import type { ConnectionsPickerVariant, SurfaceRectPrefs } from '@/types/store'
 import styles from './ConnectionsPicker.module.css'
 
@@ -38,6 +43,31 @@ interface ConnectionsPickerProps {
   open: boolean
   onClose: () => void
   anchorElement?: HTMLElement | null
+}
+
+export function filterModelsForQuery(
+  models: readonly string[],
+  labels: Record<string, string>,
+  query: string,
+): string[] {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return [...models]
+  return models.filter((model) => {
+    const label = (labels[model] || model).toLowerCase()
+    return model.toLowerCase().includes(needle) || label.includes(needle)
+  })
+}
+
+export function shouldApplyModelsResponse(options: {
+  requestId: number
+  currentRequestId: number
+  requestedProfileId: string
+  selectedProfileId: string | null
+  profiles: ReadonlyArray<{ id: string }>
+}): boolean {
+  if (options.requestId !== options.currentRequestId) return false
+  if (options.selectedProfileId !== options.requestedProfileId) return false
+  return options.profiles.some((profile) => profile.id === options.requestedProfileId)
 }
 
 const DENSITY_CLASS = {
@@ -102,9 +132,14 @@ function loadVariantRects() {
   }
 }
 
-export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsPickerProps) {
+function ConnectionsPickerNative({ open, onClose, anchorElement }: ConnectionsPickerProps) {
   const storedSettings = useStore((s) => s.connectionsPickerSettings)
-  const settings = useMemo(() => ({ ...DEFAULT_CONNECTIONS_PICKER_SETTINGS, ...storedSettings }), [storedSettings])
+  const settings = useMemo(() => ({
+    ...DEFAULT_CONNECTIONS_PICKER_SETTINGS,
+    modelLayout: 'grid' as const,
+    ...storedSettings,
+  }), [storedSettings])
+  const modelLayout = settings.modelLayout === 'list' ? 'list' : 'grid'
   const profiles = useStore((s) => s.profiles)
   const activeProfileId = useStore((s) => s.activeProfileId)
   const setActiveProfile = useStore((s) => s.setActiveProfile)
@@ -127,10 +162,45 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
   const initialVariantRef = useRef(settings.variant)
   const variantRectsRef = useRef(loadVariantRects())
   const currentFrameRectRef = useRef(settings.rect)
+  const selectedProfileIdRef = useRef(selectedProfileId)
+  const modelsRequestRef = useRef(0)
+  selectedProfileIdRef.current = selectedProfileId
 
   const updateSettings = useCallback((patch: Partial<typeof settings>) => {
     setSetting('connectionsPickerSettings', { ...settings, ...patch })
   }, [setSetting, settings])
+
+  const loadModels = useCallback(async (profileId: string, cacheBust = false) => {
+    const requestId = ++modelsRequestRef.current
+    setModelsLoading(true)
+    try {
+      const result = cacheBust
+        ? await get<ConnectionModelsResult>(`/connections/${profileId}/models`, { _ts: Date.now() })
+        : await connectionsApi.models(profileId)
+      if (!shouldApplyModelsResponse({
+        requestId,
+        currentRequestId: modelsRequestRef.current,
+        requestedProfileId: profileId,
+        selectedProfileId: selectedProfileIdRef.current,
+        profiles: useStore.getState().profiles,
+      })) return
+      setModels(result.models)
+      setModelLabels(result.model_labels ?? {})
+    } catch {
+      if (!shouldApplyModelsResponse({
+        requestId,
+        currentRequestId: modelsRequestRef.current,
+        requestedProfileId: profileId,
+        selectedProfileId: selectedProfileIdRef.current,
+        profiles: useStore.getState().profiles,
+      })) return
+      const fallback = useStore.getState().profiles.find((profile) => profile.id === profileId)
+      setModels(fallback?.model ? [fallback.model] : [])
+      setModelLabels({})
+    } finally {
+      if (requestId === modelsRequestRef.current) setModelsLoading(false)
+    }
+  }, [])
 
   const rememberVariantRect = useCallback((variant: ConnectionsPickerVariant, rect: SurfaceRectPrefs) => {
     const nextRects = { ...variantRectsRef.current, [variant]: rect }
@@ -173,8 +243,17 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
       ? activeProfileId
       : profiles.find((profile) => profile.review_required !== true)?.id ?? null
     setSelectedProfileId(active)
-
   }, [activeProfileId, anchorElement, open, profiles, settings.variant])
+  useEffect(() => {
+    if (!selectedProfileId) return
+    if (profiles.some((profile) => profile.id === selectedProfileId && profile.review_required !== true)) return
+    modelsRequestRef.current += 1
+    const fallbackId = activeProfileId && profiles.some((profile) => profile.id === activeProfileId && profile.review_required !== true)
+      ? activeProfileId
+      : profiles.find((profile) => profile.review_required !== true)?.id ?? null
+    setSelectedProfileId(fallbackId)
+  }, [activeProfileId, profiles, selectedProfileId])
+
   useEffect(() => {
     if (!open) return
     const viewportWidth = Math.max(document.documentElement.clientWidth, window.innerWidth || 0)
@@ -226,6 +305,7 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
   const favoriteModels = selectedProfile ? getConnectionProfileFavoriteModels(selectedProfile) : []
   const favoriteModelSet = new Set(favoriteModels)
   const orderedModels = [...models].sort((a, b) => Number(favoriteModelSet.has(b)) - Number(favoriteModelSet.has(a)))
+  const visibleModels = filterModelsForQuery(orderedModels, modelLabels, query)
   const savedProfiles = filteredProfiles.filter((profile) => profile.id !== selectedProfile?.id)
   const variantAProfiles = providerTab === 'favorites'
     ? favoriteProfiles
@@ -249,29 +329,17 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
   }, [open, providerTabShowsModels, selectedProfileId, variantAProfiles])
 
   useEffect(() => {
-    let cancelled = false
-    if (!open || !selectedProfile) {
+    if (!open || !selectedProfileId) {
+      modelsRequestRef.current += 1
       setModels([])
+      setModelsLoading(false)
       return
     }
-    setModelsLoading(true)
-    connectionsApi.models(selectedProfile.id)
-      .then((result) => {
-        if (cancelled) return
-        setModels(result.models)
-        setModelLabels(result.model_labels ?? {})
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setModels(selectedProfile.model ? [selectedProfile.model] : [])
-          setModelLabels({})
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setModelsLoading(false)
-      })
-    return () => { cancelled = true }
-  }, [open, selectedProfile])
+    void loadModels(selectedProfileId, false)
+    return () => {
+      modelsRequestRef.current += 1
+    }
+  }, [loadModels, open, selectedProfileId])
 
   useEffect(() => {
     const grid = modelGridRef.current
@@ -365,11 +433,22 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
   }
 
   const renderProfile = (profile: ConnectionProfile) => {
-  const active = profile.id === activeProfileId
-  const favorite = settings.favoriteProfileIds.includes(profile.id)
+    const active = profile.id === activeProfileId
+    const favorite = settings.favoriteProfileIds.includes(profile.id)
     return (
-      <div key={profile.id} className={clsx(styles.profileRow, active && styles.profileRowActive)}>
-        <button type="button" className={styles.profileMain} onClick={() => selectProfile(profile)} disabled={profile.review_required === true} aria-disabled={profile.review_required === true}>
+      <div
+        key={profile.id}
+        className={clsx(styles.profileRow, active && styles.profileRowActive)}
+        data-profile-id={profile.id}
+        data-profile-active={active ? 'true' : 'false'}
+      >
+        <button
+          type="button"
+          className={styles.profileMain}
+          onClick={() => selectProfile(profile)}
+          disabled={profile.review_required === true}
+          aria-disabled={profile.review_required === true}
+        >
           <span className={styles.profileIcon} style={{ width: settings.thumbnailSize, height: settings.thumbnailSize }}>
             <Link2 size={Math.max(14, settings.thumbnailSize - 10)} />
           </span>
@@ -518,15 +597,68 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
       <div className={styles.modelsHeading}>
         <h3>Models</h3>
         {selectedProfile && <span>{selectedProfile.provider}</span>}
+        <label className={styles.modelsHeadingSearch}>
+          <Search size={13} aria-hidden="true" />
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape' || !query) return
+              event.preventDefault()
+              setQuery('')
+            }}
+            placeholder="Search models..."
+            aria-label="Search models"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        <div className={styles.modelsHeadingActions}>
+          <button
+            type="button"
+            className={styles.headerButton}
+            onClick={() => { if (selectedProfileId) void loadModels(selectedProfileId, true) }}
+            title="Refresh models"
+            aria-label="Refresh models"
+          >
+            <RefreshCw size={14} />
+          </button>
+          <button
+            type="button"
+            className={clsx(styles.headerButton, modelLayout === 'grid' && styles.variantButtonActive)}
+            onClick={() => updateSettings({ modelLayout: 'grid' })}
+            title="Grid layout"
+            aria-label="Grid layout"
+            aria-pressed={modelLayout === 'grid'}
+          >
+            <LayoutGrid size={14} />
+          </button>
+          <button
+            type="button"
+            className={clsx(styles.headerButton, modelLayout === 'list' && styles.variantButtonActive)}
+            onClick={() => updateSettings({ modelLayout: 'list' })}
+            title="List layout"
+            aria-label="List layout"
+            aria-pressed={modelLayout === 'list'}
+          >
+            <List size={14} />
+          </button>
+        </div>
       </div>
-      {modelsLoading && <div className={styles.empty}><LoaderCircle className={styles.spinner} size={18} /> Loading models...</div>}
+      {modelsLoading && <div className={styles.empty} data-models-loading="true"><LoaderCircle className={styles.spinner} size={18} /> Loading models...</div>}
       {!modelsLoading && models.length > 0 && (
         <div
           ref={modelGridRef}
-          className={styles.modelsGrid}
-          style={{ '--connections-model-grid-columns': modelGridColumns } as CSSProperties}
+          className={clsx(styles.modelsGrid, modelLayout === 'list' && styles.modelsList)}
+          data-model-layout={modelLayout}
+          data-visible-models={visibleModels.join(',')}
+          style={{
+            '--connections-model-grid-columns': modelLayout === 'list' ? 1 : modelGridColumns,
+            ...(modelLayout === 'list' ? { display: 'flex', flexDirection: 'column', overflow: 'auto' } : {}),
+          } as CSSProperties}
         >
-          {orderedModels.map((model) => {
+          {visibleModels.map((model) => {
             const selected = selectedProfile?.model === model
             const favorite = favoriteModelSet.has(model)
             return (
@@ -551,6 +683,7 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
         </div>
       )}
       {!modelsLoading && selectedProfile && models.length === 0 && <div className={styles.empty}>No models returned.</div>}
+      {!modelsLoading && selectedProfile && models.length > 0 && visibleModels.length === 0 && <div className={styles.empty}>No matching models.</div>}
       {!selectedProfile && <div className={styles.empty}>Choose a connection to browse models.</div>}
     </section>
   )
@@ -626,14 +759,51 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
 
   const variantAModelGrid = providerTabShowsModels && (
     <section className={styles.modelGridSection}>
+      {selectedProfile && (
+        <div className={styles.modelsHeading}>
+          <button
+            type="button"
+            className={styles.headerButton}
+            onClick={() => { if (selectedProfileId) void loadModels(selectedProfileId, true) }}
+            title="Refresh models"
+            aria-label="Refresh models"
+          >
+            <RefreshCw size={14} />
+          </button>
+          <button
+            type="button"
+            className={clsx(styles.headerButton, modelLayout === 'grid' && styles.variantButtonActive)}
+            onClick={() => updateSettings({ modelLayout: 'grid' })}
+            title="Grid layout"
+            aria-label="Grid layout"
+            aria-pressed={modelLayout === 'grid'}
+          >
+            <LayoutGrid size={14} />
+          </button>
+          <button
+            type="button"
+            className={clsx(styles.headerButton, modelLayout === 'list' && styles.variantButtonActive)}
+            onClick={() => updateSettings({ modelLayout: 'list' })}
+            title="List layout"
+            aria-label="List layout"
+            aria-pressed={modelLayout === 'list'}
+          >
+            <List size={14} />
+          </button>
+        </div>
+      )}
       {selectedProfile && modelsLoading && (
-        <div className={styles.empty}>
+        <div className={styles.empty} data-models-loading="true">
           <LoaderCircle className={styles.spinner} size={18} /> Loading models...
         </div>
       )}
       {selectedProfile && !modelsLoading && models.length > 0 && (
-        <div className={styles.modelGrid}>
-          {models.map((model) => {
+        <div
+          className={clsx(styles.modelGrid, modelLayout === 'list' && styles.modelsList)}
+          data-model-layout={modelLayout}
+          style={modelLayout === 'list' ? { display: 'flex', flexDirection: 'column', overflow: 'auto' } : undefined}
+        >
+          {visibleModels.map((model) => {
             const selected = selectedProfile.model === model
             return (
               <button
@@ -650,6 +820,7 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
         </div>
       )}
       {selectedProfile && !modelsLoading && models.length === 0 && <div className={styles.empty}>No models returned.</div>}
+      {selectedProfile && !modelsLoading && models.length > 0 && visibleModels.length === 0 && <div className={styles.empty}>No matching models.</div>}
       {!selectedProfile && <div className={styles.empty}>No matching connections.</div>}
     </section>
   )
@@ -894,4 +1065,8 @@ export function ConnectionsPicker({ open, onClose, anchorElement }: ConnectionsP
     </div>,
     document.body,
   )
+}
+
+export function ConnectionsPicker(props: ConnectionsPickerProps) {
+  return useSpindleComponentOverride('ConnectionsPicker', ConnectionsPickerNative, props)
 }

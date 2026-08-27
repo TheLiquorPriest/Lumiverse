@@ -22,7 +22,9 @@ import {
   type RectBounds,
 } from '@/hooks/usePersistentRect'
 import { imagesApi } from '@/api/images'
+import { assertNever } from '@/lib/assertNever'
 import { getCharacterAvatarUrl } from '@/lib/avatarUrls'
+import { resolveChatContentWidthForReclaim } from '@/lib/chatContentWidth'
 import { hostIntentEventName } from '@/lib/spindle/host-intent-registry'
 import { DEFAULT_PORTRAIT_DOCK_SETTINGS } from '@/lib/uiProductivityDefaults'
 import { useStore } from '@/store'
@@ -209,6 +211,64 @@ export function getPortraitLayoutReclaim(
   return Math.max(0, portraitWidth - reservedWidth)
 }
 
+const CHAT_BODY_SELECTOR = '[data-lumiverse-surface="chat-body"]'
+const CHAT_COLUMN_SELECTOR = '[data-lumiverse-surface="chat-column"]'
+const CHAT_CONTENT_SELECTOR = '[data-lumiverse-surface="chat-column-inner"]'
+
+export interface PortraitLayoutTargets {
+  bodyElement: HTMLElement
+  chatColumn: HTMLElement
+  chatContent: HTMLElement
+}
+
+/**
+ * `closest()` walks the DOM ancestor chain, which the Spindle host surface preserves:
+ * the mount, the extension root, the host surface, and the surface node are all
+ * `display: contents`, so they are laid out as if absent but remain ancestors. That is
+ * why `parentElement` cannot be used here.
+ *
+ * The two inner lookups use `:scope >` because the markers are direct children in the
+ * rendered frame: `ChatView.tsx` renders `chat-column` as a direct child of the
+ * `chat-body` element, and `chat-column-inner` as a direct child of `chat-column`.
+ * Verified against the current source, so the child queries match the real DOM and
+ * cannot drift onto a nested namesake.
+ *
+ * Resolution is all-or-nothing so a partially committed chat frame cannot produce a
+ * half-measured reclaim.
+ */
+export function resolvePortraitLayoutTargets(
+  dockElement: HTMLElement | null,
+): PortraitLayoutTargets | null {
+  const bodyElement = dockElement?.closest<HTMLElement>(CHAT_BODY_SELECTOR) ?? null
+  if (!bodyElement) return null
+  const chatColumn = bodyElement.querySelector<HTMLElement>(`:scope > ${CHAT_COLUMN_SELECTOR}`)
+  const chatContent = chatColumn?.querySelector<HTMLElement>(`:scope > ${CHAT_CONTENT_SELECTOR}`) ?? null
+  if (!chatColumn || !chatContent) return null
+  return { bodyElement, chatColumn, chatContent }
+}
+
+/**
+ * The negative margin always goes on the dock's inner side. Nothing vertical here:
+ * vertical placement stays `top: panel.rect.y` on `dockStyle`, with no offset token and
+ * no transform.
+ *
+ * `inset` clamps a negative reclaim to zero. `getPortraitLayoutReclaim` already floors at
+ * zero and the deliberate floating/mobile path writes exactly zero, so the clamp is a
+ * guard rather than a behavior change.
+ */
+export function resolveDockReclaimStyle(
+  side: PortraitDockSettings['dockSide'],
+  reclaim: number,
+): CSSProperties {
+  const inset = -Math.max(0, reclaim)
+  switch (side) {
+    case 'left': return { order: -1, marginRight: inset }
+    case 'right': return { marginLeft: inset }
+    case 'floating': return {}
+    default: return assertNever(side)
+  }
+}
+
 /** A docked drag transfers sides when the portrait crosses the chat midpoint. */
 export function resolveDockSideForRect(
   rect: Pick<SurfaceRectPrefs, 'x' | 'width'>,
@@ -235,6 +295,12 @@ export default function PortraitDock({ mobile = false, extensionOwned = false }:
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const activeChatAvatarId = useStore((s) => s.activeChatAvatarId)
   const characters = useStore((s) => s.characters)
+  // Read-only. These are the sole source of the `--lumiverse-chat-content-width` value
+  // `ChatView` publishes, so reading them here makes the reclaim math and the published
+  // variable two consumers of one resolver instead of one reading back the other's
+  // rendered result. Never written from this component.
+  const chatWidthMode = useStore((s) => s.chatWidthMode)
+  const chatContentMaxWidth = useStore((s) => s.chatContentMaxWidth)
   const updateFloatingAvatar = useStore((s) => s.updateFloatingAvatar)
   const openFloatingAvatar = useStore((s) => s.openFloatingAvatar)
   const closeFloatingAvatar = useStore((s) => s.closeFloatingAvatar)
@@ -561,48 +627,96 @@ export default function PortraitDock({ mobile = false, extensionOwned = false }:
   }, [floatingAvatar, panel, settings])
 
   useLayoutEffect(() => {
-    if (!dockElement || mobile || isFloating) {
+    // The only deliberate zero: `floating` and `mobile` take the dock out of the chat
+    // body's flex row entirely, so there is no gutter to reclaim. Every other former
+    // bail-to-zero path is gone — a missing or unmeasured target now holds the current
+    // value and retries instead of stranding the dock in its own lane.
+    if (mobile || isFloating) {
       setLayoutReclaim(0)
       return
     }
 
-    // The extension and host-surface nodes are display: contents so the dock is a
-    // flex item visually, but they still remain in its DOM ancestor chain.
-    const bodyElement = dockElement.closest<HTMLElement>('[data-chat-constrained]')
-    if (!bodyElement) {
-      setLayoutReclaim(0)
-      return
-    }
+    // The ref state change re-runs this effect as soon as the dock is committed. Until
+    // then there is no node whose missing ancestors can become resolvable, so observing the
+    // whole document would only retry forever while the dock is closed or unavailable.
+    if (!dockElement) return
 
-    const chatColumn = Array.from(bodyElement.children).find((element) => {
-      if (element === dockElement || !(element instanceof HTMLElement)) return false
-      return Number.parseFloat(window.getComputedStyle(element).flexGrow) > 0
-    })
-    const chatContent = chatColumn?.lastElementChild
-    if (!(chatContent instanceof HTMLElement)) {
-      setLayoutReclaim(0)
-      return
-    }
+    let frame = 0
+    let resizeObserver: ResizeObserver | null = null
+    let mutationObserver: MutationObserver | null = null
 
-    const updateLayoutReclaim = () => {
-      // `getBoundingClientRect()` is rendered px, but `getComputedStyle().maxWidth` and
-      // `panel.rect.width` are layout px. `getPortraitLayoutReclaim` subtracts all three from
+    const measure = (targets: PortraitLayoutTargets) => {
+      // `getBoundingClientRect()` is rendered px; `panel.rect.width` and the resolved
+      // content width are layout px. `getPortraitLayoutReclaim` subtracts all three from
       // one another, so an unconverted body width produced a negative margin hundreds of
-      // pixels too large and pulled the chat column under the portrait.
-      const bodyWidth = toLayoutBox(bodyElement.getBoundingClientRect()).width
-      const chatMaxWidth = Number.parseFloat(window.getComputedStyle(chatContent).maxWidth)
-      const nextReclaim = Number.isFinite(chatMaxWidth)
-        ? Math.round(getPortraitLayoutReclaim(bodyWidth, chatMaxWidth, panel.rect.width))
-        : 0
-      setLayoutReclaim((current) => current === nextReclaim ? current : nextReclaim)
+      // pixels too large and pulled the chat column under the portrait. `toLayoutBox`
+      // divides out `--lumiverse-ui-scale`.
+      const bodyWidth = toLayoutBox(targets.bodyElement.getBoundingClientRect()).width
+      // A zero box means "not laid out yet", never "unconstrained". Hold the current
+      // value; the ResizeObserver delivers again once the element has a box.
+      if (!(bodyWidth > 0)) return
+      // State-derived, not read back off the cascade: the moment hydration flips
+      // `chatWidthMode`, this effect re-runs with the new input rather than waiting for a
+      // computed `max-width` that may not have committed yet.
+      const contentWidth = resolveChatContentWidthForReclaim(chatWidthMode, chatContentMaxWidth, bodyWidth)
+      const next = Math.round(getPortraitLayoutReclaim(bodyWidth, contentWidth, panel.rect.width))
+      setLayoutReclaim((current) => (current === next ? current : next))
     }
 
-    updateLayoutReclaim()
-    const resizeObserver = new ResizeObserver(updateLayoutReclaim)
-    resizeObserver.observe(bodyElement)
-    resizeObserver.observe(chatContent)
-    return () => resizeObserver.disconnect()
-  }, [dockElement, isFloating, mobile, panel.rect.width, settings.dockSide])
+    const attach = (): boolean => {
+      // Idempotent by design (Requirement 7.4). `attach()` is the only constructor of the
+      // ResizeObserver and it owns the single binding cleanup can see, so a second successful
+      // attach inside one effect run would overwrite that binding and leave the first observer
+      // registered with nothing able to disconnect it. Re-entry reports the existing attach.
+      if (resizeObserver) return true
+      const targets = resolvePortraitLayoutTargets(dockElement)
+      if (!targets) return false
+      measure(targets)
+      // Assigned to the outer binding before returning, so a late attach from the retry
+      // path is still visible to cleanup.
+      resizeObserver = new ResizeObserver(() => measure(targets))
+      resizeObserver.observe(targets.bodyElement)
+      resizeObserver.observe(targets.chatColumn)
+      resizeObserver.observe(targets.chatContent)
+      return true
+    }
+
+    if (!attach()) {
+      // Requirement 1.5: the chat frame may commit after this dock's bridge root does.
+      const retry = () => {
+        if (!attach()) return
+        mutationObserver?.disconnect()
+        mutationObserver = null
+        // Both retry registrations below are live at once, and mutation records are delivered as
+        // microtasks — they land BEFORE the animation frame requested alongside them. Without
+        // this cancel the frame runs `retry` a second time after the attach already succeeded.
+        // Do NOT remove as redundant. `frame = 0` keeps cleanup's `if (frame)` guard from
+        // cancelling a handle that has already been released.
+        if (frame) cancelAnimationFrame(frame)
+        frame = 0
+      }
+      const ownerDocument = dockElement.ownerDocument
+      mutationObserver = new MutationObserver(retry)
+      mutationObserver.observe(ownerDocument.body, { childList: true, subtree: true })
+      frame = requestAnimationFrame(retry)
+    }
+
+    return () => {
+      if (frame) cancelAnimationFrame(frame)
+      resizeObserver?.disconnect()
+      mutationObserver?.disconnect()
+      resizeObserver = null
+      mutationObserver = null
+    }
+  }, [
+    chatContentMaxWidth,
+    chatWidthMode,
+    dockElement,
+    isFloating,
+    mobile,
+    panel.rect.width,
+    settings.dockSide,
+  ])
 
   const contextMenuItems = useMemo<ContextMenuEntry[]>(() => [
     { key: 'natural', label: 'Restore original size', onClick: () => applyFit('natural') },
@@ -676,10 +790,7 @@ export default function PortraitDock({ mobile = false, extensionOwned = false }:
     ...(!isFloating && !mobile
       ? {
           top: panel.rect.y,
-          order: settings.dockSide === 'left' ? -1 : undefined,
-          ...(settings.dockSide === 'left'
-            ? { marginRight: -layoutReclaim }
-            : { marginLeft: -layoutReclaim }),
+          ...resolveDockReclaimStyle(settings.dockSide, layoutReclaim),
         }
       : {}),
     ...((isFloating || mobile)

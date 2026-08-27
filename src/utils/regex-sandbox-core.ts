@@ -66,7 +66,7 @@ export interface CollectedMatch {
   fullMatch: string;
   index: number;
   groups: (string | undefined)[];
-  namedGroups?: Record<string, string>;
+  namedGroups?: Record<string, string | undefined>;
 }
 
 export interface CaptureReplacement {
@@ -88,7 +88,7 @@ export function substituteRegexCaptures(
   groups: (string | undefined)[],
   offset: number,
   input: string,
-  namedGroups?: Record<string, string>,
+  namedGroups?: Record<string, string | undefined>,
   maxBytes = REGEX_LIMITS_V1.maxOperationBytes,
 ): string {
   return substituteRegexCapturesFromArrayLike(
@@ -111,7 +111,7 @@ function substitutionToken(
   groupOffset: number,
   offset: number,
   input: string,
-  namedGroups: Record<string, string> | undefined,
+  namedGroups: Record<string, string | undefined> | undefined,
   native: boolean,
 ): { kind: "value"; value: string } | { kind: "span"; start: number; end: number } | null {
   if (token === "$$") return { kind: "value", value: "$" };
@@ -184,7 +184,7 @@ function substituteRegexCapturesFromArrayLike(
   groupOffset: number,
   offset: number,
   input: string,
-  namedGroups?: Record<string, string>,
+  namedGroups?: Record<string, string | undefined>,
   native = false,
   maxBytes?: number,
 ): string {

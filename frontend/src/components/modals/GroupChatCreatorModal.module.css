@@ -330,6 +330,12 @@
   letter-spacing: 0.01em;
 }
 
+.fieldHint {
+  font-size: calc(11px * var(--lumiverse-font-scale, 1));
+  color: var(--lumiverse-text-dim);
+  line-height: 1.45;
+}
+
 .fieldInput {
   width: 100%;
   padding: 8px 12px;

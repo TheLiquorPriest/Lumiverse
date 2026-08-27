@@ -114,6 +114,7 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
       if (feedback) {
         genOpts.regen_feedback = feedback
         genOpts.regen_feedback_position = regenFeedback.position
+        genOpts.regen_feedback_format = regenFeedback.format
       }
       const res = await startGenerationWithRecovery('start', genOpts, {
         forceResponse,
@@ -156,6 +157,7 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
     activeCharacterId,
     getActivePresetForGeneration,
     regenFeedback.position,
+    regenFeedback.format,
     beginStreaming,
     startStreaming,
     setStreamingError,
@@ -259,6 +261,7 @@ export async function executeSwipe(message: Message, chatId: string, direction: 
         if (feedback) {
           genOpts.regen_feedback = feedback
           genOpts.regen_feedback_position = regenFeedback.position
+          genOpts.regen_feedback_format = regenFeedback.format
         }
         const res = await startGenerationWithRecovery('start', genOpts, {
           forceResponse,

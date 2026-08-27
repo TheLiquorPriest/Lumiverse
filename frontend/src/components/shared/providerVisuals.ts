@@ -3,6 +3,8 @@ export const PROVIDER_COLORS: Record<string, string> = {
   // LLM
   openai: '#10a37f',
   anthropic: '#d97757',
+  mistral: '#f97316',
+  cohere: '#39594d',
   google: '#4285f4',
   google_vertex: '#34a853',
   bedrock: '#ff9900',

@@ -29,6 +29,7 @@ Object.defineProperty(globalThis, 'document', {
 
 const {
   clearImageCache,
+  holdImagesForTransition,
   isImageDecoded,
   prefetchImages,
   rememberImageDecoded,
@@ -60,5 +61,16 @@ describe('image decode coordinator', () => {
     expect(MockImage.decoded).toEqual(['/one.webp', '/two.webp'])
     expect(isImageDecoded('/one.webp')).toBe(true)
     expect(isImageDecoded('/two.webp')).toBe(true)
+  })
+
+  test('holds a bounded transition image long enough to bridge route remounting', async () => {
+    MockImage.decoded = []
+    holdImagesForTransition(['/clicked.webp'], 250)
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(MockImage.decoded).toEqual(['/clicked.webp'])
+    expect(isImageDecoded('/clicked.webp')).toBe(true)
+    clearImageCache()
   })
 })

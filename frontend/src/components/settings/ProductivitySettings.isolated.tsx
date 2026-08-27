@@ -1,8 +1,7 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { beforeEach, describe, expect, mock, test } from 'bun:test'
 import { resolve } from 'node:path'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { act } from 'react'
-import { createRoot } from 'react-dom/client'
 import { JSDOM } from 'jsdom'
 
 import { PRODUCTIVITY_DEFAULTS } from '@/lib/uiProductivityDefaults'
@@ -24,6 +23,8 @@ const state = {
     variant: 'v4-bottom-strip',
   },
   profiles: [],
+  user: { id: 'productivity-test-user' } as { id: string } | null,
+  extensions: [{ identifier: 'lumiverse_suite', enabled: true, has_frontend: true }] as Array<Record<string, unknown>>,
   updateProfile: () => undefined,
 }
 
@@ -40,6 +41,7 @@ Object.assign(globalThis, {
   window: dom.window,
   document: dom.window.document,
   HTMLElement: dom.window.HTMLElement,
+  HTMLInputElement: dom.window.HTMLInputElement,
   Element: dom.window.Element,
   Node: dom.window.Node,
   navigator: dom.window.navigator,
@@ -54,7 +56,13 @@ mock.module('@/store/slices/settings', () => ({
   persistKey: (key: string, value: unknown) => persistedKeys.push({ key, value }),
 }))
 
+const { createRoot } = await import('react-dom/client')
+
 mock.module('@/store', () => ({ useStore }))
+// ProductivityFeatureToggles only needs tab metadata to build its location
+// options. Keep this Bun renderer test out of the registry's Vite-only i18n
+// resource graph (`import.meta.glob`).
+mock.module('@/lib/settings-tab-registry', () => ({ SETTINGS_TABS: [] }))
 mock.module('@/components/quick-toolbar/useQuickToolbarActions', () => ({
   DESIGN_DEFAULT_IDS: ['profile', 'connections', 'lorebook', 'settings'],
   useQuickToolbarActions: () => ({
@@ -83,6 +91,31 @@ mock.module('@/lib/avatarUrls', () => ({
 
 
 const { default: ProductivitySettings } = await import('./ProductivitySettings')
+
+beforeEach(() => {
+  Object.assign(state, {
+    ...PRODUCTIVITY_DEFAULTS,
+    quickToolbarSettings: {
+      ...PRODUCTIVITY_DEFAULTS.quickToolbarSettings,
+      variant: 'v2-settings-adjacent',
+    },
+    connectionsPickerSettings: {
+      ...PRODUCTIVITY_DEFAULTS.connectionsPickerSettings,
+      profileTags: [{ id: 'tag-1', name: 'Primary', color: '#64748B', order: 0 }],
+      visibleTagIds: ['tag-1'],
+    },
+    loreIndicatorSettings: {
+      ...PRODUCTIVITY_DEFAULTS.loreIndicatorSettings,
+      variant: 'v4-bottom-strip',
+    },
+    profiles: [],
+    user: { id: 'productivity-test-user' },
+    extensions: [{ identifier: 'lumiverse_suite', enabled: true, has_frontend: true }],
+  })
+  delete (state as typeof state & { characters?: unknown }).characters
+  persistedKeys.length = 0
+  document.body.replaceChildren()
+})
 
 describe('canonical Productivity settings renderer', () => {
   test('renders the approved variant controls and V2 scale guard', () => {
@@ -121,7 +154,76 @@ describe('canonical Productivity settings renderer', () => {
     expect(markup).not.toContain('Toolbar height')
   })
 
-  test('keeps overlay hiding controls out of V2 Adjacent', () => {
+  test('exposes floating dock-host, fill, native select-messages, and opaque backdrop controls', () => {
+    const previous = state.quickToolbarSettings
+    state.quickToolbarSettings = {
+      ...PRODUCTIVITY_DEFAULTS.quickToolbarSettings,
+      quickToolbarPlacement: 'floating',
+    }
+    const floating = renderToStaticMarkup(<ProductivitySettings />)
+    expect(floating).toContain('Keep chat top dock enabled while floating')
+    expect(floating).toContain('quick-keep-dock-enabled-when-floating')
+    expect(floating).not.toContain('Fill chat top bar width')
+    expect(floating).toContain('Fill the entire top of the screen')
+    expect(floating).toContain('quick-fill-top-dock-width')
+    expect(floating).toContain('Stretch across window top')
+    expect(floating).toContain('Show select-messages on chat top bar')
+    expect(floating).toContain('quick-show-native-select-messages')
+    expect(floating).toContain('Native chat-top actions')
+    expect(floating).toContain('Edit and Send position')
+    expect(floating).toContain('Branch chat when using Edit and Send')
+    expect(floating).toContain('Opaque toolbar backdrop')
+    expect(floating).toContain('quick-opaque-toolbar-backdrop')
+
+    state.quickToolbarSettings = {
+      ...PRODUCTIVITY_DEFAULTS.quickToolbarSettings,
+      quickToolbarPlacement: 'chat_top_dock',
+    }
+    const docked = renderToStaticMarkup(<ProductivitySettings />)
+    state.quickToolbarSettings = previous
+
+    expect(docked).not.toContain('Keep chat top dock enabled while floating')
+    expect(docked).not.toContain('quick-keep-dock-enabled-when-floating')
+    expect(docked).toContain('Fill chat top bar width')
+    expect(docked).toContain('quick-fill-top-dock-width')
+    expect(docked).toContain('Stretch across remaining chat top bar')
+    expect(docked).toContain('Show select-messages on chat top bar')
+    expect(docked).toContain('quick-show-native-select-messages')
+    expect(docked).toContain('Native chat-top actions')
+    expect(docked).toContain('Edit and Send position')
+    expect(docked).toContain('Branch chat when using Edit and Send')
+    expect(docked).toContain('quick-opaque-toolbar-backdrop')
+    expect(docked).toContain('id="quick-toolbar-backdrop-color"')
+    expect(docked).toContain('aria-label="Toolbar backdrop color"')
+  })
+  test('persists native toolbar backdrop color changes', async () => {
+    const previous = state.quickToolbarSettings
+    state.quickToolbarSettings = { ...PRODUCTIVITY_DEFAULTS.quickToolbarSettings, backdropColor: '#123456' }
+    persistedKeys.length = 0
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    await act(async () => { root.render(<ProductivitySettings />); await Promise.resolve() })
+
+    const picker = host.querySelector<HTMLInputElement>('#quick-toolbar-backdrop-color')
+    expect(picker?.value).toBe('#123456')
+    await act(async () => {
+      if (picker) {
+        Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')?.set?.call(picker, '#abcdef')
+        picker.dispatchEvent(new dom.window.Event('input', { bubbles: true, cancelable: true }))
+        await new Promise<void>((resolve) => dom.window.setTimeout(resolve, 0))
+      }
+      await Promise.resolve()
+    })
+
+    expect(state.quickToolbarSettings.backdropColor).toBe('#ABCDEF')
+    expect(persistedKeys.at(-1)).toMatchObject({ key: 'quickToolbarSettings', value: expect.objectContaining({ backdropColor: '#ABCDEF' }) })
+    await act(async () => { root.unmount(); await Promise.resolve() })
+    host.remove()
+    state.quickToolbarSettings = previous
+  })
+
+  test('exposes overlay hide and restore on V2 Adjacent floating', () => {
     const previous = state.quickToolbarSettings
     state.quickToolbarSettings = {
       ...PRODUCTIVITY_DEFAULTS.quickToolbarSettings,
@@ -131,7 +233,11 @@ describe('canonical Productivity settings renderer', () => {
     const markup = renderToStaticMarkup(<ProductivitySettings />)
     state.quickToolbarSettings = previous
 
-    expect(markup).not.toContain('Hide when overlaid')
+    expect(markup).toContain('Hide when overlaid')
+    expect(markup).toContain('Restore tab over full-screen dialogs')
+    expect(markup).toContain('quick-v2-hide-when-overlaid')
+    expect(markup).toContain('quick-v2-modal-restore')
+    expect(markup).not.toContain('Vertical orientation')
   })
 
   test('renders Lore Indicator launch-target controls', () => {
@@ -202,7 +308,7 @@ describe('canonical Productivity settings renderer', () => {
     const css = await Bun.file(resolve(import.meta.dir, 'ProductivitySettings.module.css')).text()
 
     expect(markup).toContain('data-productivity-layout="quick-toolbar-controls"')
-    expect((markup.match(/data-productivity-layout="quick-toolbar-slider-pair"/g) ?? []).length).toBe(2)
+    expect((markup.match(/data-productivity-layout="quick-toolbar-slider-pair"/g) ?? []).length).toBe(4)
     expect(markup).toMatch(/id="quick-scale"[^>]*disabled=""/)
     expect(markup).toContain('data-productivity-layout="character-thumbnail-pair"')
     expect(markup).toContain('data-lorebook-section="segments"')
@@ -233,11 +339,36 @@ describe('canonical Productivity settings renderer', () => {
     expect(markup).toContain('>Live preview<')
     expect(markup).toContain('>C<')
     expect(markup).toContain('Pinned preview')
+    expect(markup).toContain('Landing page start view')
     expect(markup).toContain('data-density="compact"')
     expect(css).toContain('.homepagePreviewPlaceholder')
     expect(css).toContain('.homepagePreviewCard[data-footer-mode=\'compact\']')
     expect(css).toContain('.homepagePreviewPanelImage')
     expect(css).toContain('@media (max-width: 720px)')
+  })
+
+  test('removes Suite-owned settings when Lumiverse Suite is unavailable', () => {
+    const originalExtensions = state.extensions
+    state.extensions = []
+
+    const markup = renderToStaticMarkup(<ProductivitySettings />)
+
+    state.extensions = originalExtensions
+    expect(markup).not.toContain('Landing page start view')
+    expect(markup).not.toContain('Enable Quick Toolbar')
+    expect(markup).not.toContain('Enable Connections Picker')
+    expect(markup).not.toContain('Enable Lore Indicator')
+    expect(markup).not.toContain('Homepage Character Library')
+    expect(markup).not.toContain('Character Tab Display')
+    expect(markup).not.toContain('Enable portrait dock')
+    expect(markup).not.toContain('Lorebook Editor')
+    expect(markup).not.toContain('Drag to reorder toolbar icons')
+    expect(markup).not.toContain('Customize composer gear')
+    // Every Suite-owned feature toggle goes with the Suite, so a persisted
+    // true cannot leave a Suite-only surface mounted or an inert checkbox behind.
+    expect(markup).not.toContain('Embedding fallback profiles')
+    expect(markup).not.toContain('Cortex secondary connections')
+    expect(markup).not.toContain('Edit and Send')
   })
 
   test('uses the selected character avatar and metadata in the homepage preview', () => {
@@ -322,11 +453,11 @@ describe('canonical Productivity settings renderer', () => {
   test('keeps V2 toolbar slider cells symmetric and moves its helper below the pair', async () => {
     const markup = renderToStaticMarkup(<ProductivitySettings />)
     const css = await Bun.file(resolve(import.meta.dir, 'ProductivitySettings.module.css')).text()
-    const secondPairStart = markup.indexOf('data-productivity-layout="quick-toolbar-slider-pair"', markup.indexOf('data-productivity-layout="quick-toolbar-slider-pair"') + 1)
+    const lastPairStart = markup.lastIndexOf('data-productivity-layout="quick-toolbar-slider-pair"')
     const hintIndex = markup.indexOf('id="quick-scale-v2-hint"')
 
-    expect(secondPairStart).toBeGreaterThan(-1)
-    expect(hintIndex).toBeGreaterThan(secondPairStart)
+    expect(lastPairStart).toBeGreaterThan(-1)
+    expect(hintIndex).toBeGreaterThan(lastPairStart)
     expect(markup).toContain('aria-describedby="quick-scale-v2-hint"')
     expect((markup.match(/id="quick-scale-v2-hint"/g) ?? []).length).toBe(1)
     expect(css).toContain('.quickToolbarPairHint')

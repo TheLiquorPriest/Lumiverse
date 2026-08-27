@@ -61,6 +61,50 @@ export class ProviderRequestError extends Error {
   }
 }
 
+export interface ConnectionCredentialErrorOptions {
+  connectionId: string;
+  connectionName: string;
+  /** Provider display name, e.g. "Custom (OpenAI-compatible)". */
+  provider: string;
+  /** Secret KEY NAME (`connection_<id>_api_key`) — never a credential value. */
+  secretKeyName: string;
+}
+
+/**
+ * A connection profile declares a stored API key (`has_api_key = 1`) that can
+ * no longer be produced — deleted secret row, failed decrypt, or a profile
+ * duplicated without its secret. Raised by the credential preflight BEFORE any
+ * outbound provider call, so a configuration problem surfaces as an actionable
+ * message naming the connection instead of an opaque provider 401.
+ *
+ * Lives in this dependency-free module (no DB, no services) so the
+ * Edit-and-Send dispatcher can `import` it for `instanceof` classification
+ * without dragging service or database code into its in-memory test harnesses.
+ *
+ * Field NAMES only: no constructor parameter accepts a credential and no field
+ * can hold one.
+ */
+export class ConnectionCredentialError extends Error {
+  readonly code = "credential_unresolved";
+  readonly retryable = false;
+  readonly connectionId: string;
+  readonly connectionName: string;
+  readonly provider: string;
+  readonly secretKeyName: string;
+
+  constructor(options: ConnectionCredentialErrorOptions) {
+    super(
+      `Connection "${options.connectionName}" (${options.provider}) declares an API key, but none could be read from "${options.secretKeyName}". ` +
+        "Re-enter the API key for this connection, or clear it if the endpoint needs none.",
+    );
+    this.name = "ConnectionCredentialError";
+    this.connectionId = options.connectionId;
+    this.connectionName = options.connectionName;
+    this.provider = options.provider;
+    this.secretKeyName = options.secretKeyName;
+  }
+}
+
 function getErrorMessage(err: unknown): string {
   if (err instanceof Error && err.message.trim()) return err.message.trim();
   if (typeof err === "string" && err.trim()) return err.trim();

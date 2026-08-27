@@ -140,6 +140,7 @@ export function useHomepageCharacterLibrary() {
       wsClient.on(EventType.CHARACTER_CREATED, invalidate),
       wsClient.on(EventType.CHARACTER_EDITED, invalidate),
       wsClient.on(EventType.CHARACTER_DELETED, invalidate),
+      wsClient.on(EventType.CHARACTER_LIBRARY_CHANGED, invalidate),
     ]
 
     if (resolved.query.sortField === 'recent' || resolved.query.sortField === 'most_chats') {

@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import { join, basename } from "path";
 import {
   MAX_ARTIFACT_BYTES,
@@ -275,9 +276,11 @@ const imageFiles: readonly ArchiveFileRefV2[] = [
     resolve: (row, dataDir) => row.id ? [
       join(dataDir, "images", `${String(row.id)}_thumb_sm_v2.webp`),
       join(dataDir, "images", `${String(row.id)}_thumb_lg_v2.webp`),
+      join(dataDir, "images", `${String(row.id)}_thumb_sm_v2.avif`),
+      join(dataDir, "images", `${String(row.id)}_thumb_lg_v2.avif`),
       join(dataDir, "images", `${String(row.id)}_thumb_sm.webp`),
       join(dataDir, "images", `${String(row.id)}_thumb_lg.webp`),
-    ] : [],
+    ].filter(existsSync) : [],
     archivePath: (_row, absolutePath) => basename(absolutePath),
   }),
 ];
@@ -909,6 +912,8 @@ const registry: ArchiveTableSpecV2[] = [
   forbidden("extension_grants", via("extension_id", "extensions"), ["id"], [["id"], ["extension_id", "permission"]], [parent("extension_id", "extensions", false)]),
   operational("import_consumed_tickets", direct("user_id"), ["archive_id"], [["archive_id"]], [parent("user_id", "user", true)]),
   forbidden("lumihub_link", direct("user_id"), ["id"], [["id"]], [parent("user_id", "user", true)]),
+  forbidden("illarin_instance", direct("user_id"), ["id"], [["id"], ["user_id"]], [parent("user_id", "user", false)]),
+  forbidden("illarin_delivery_receipt", direct("user_id"), ["user_id", "delivery_id"], [["user_id", "delivery_id"]], [parent("user_id", "user", false)]),
   forbidden("push_subscriptions", direct("user_id"), ["id"], [["id"], ["user_id", "endpoint"]], [parent("user_id", "user", false)]),
   forbidden("secrets", direct("user_id"), ["key", "user_id"], [["key", "user_id"]], [parent("user_id", "user", true)]),
   forbidden("session", direct("userId"), ["id"], [["id"], ["token"]], [parent("userId", "user", false)]),
@@ -1188,7 +1193,7 @@ export const SECRET_SETTING_KEY_PATTERNS: readonly RegExp[] = Object.freeze([
   /^stt_connection_.+_api_key$/,
   /^mcp_server_.+_(?:headers|env)$/,
   /^embedding_api_key(?:_.+)?$/,
-  /^web_search_api_key$/,
+  /^web_search_(?:exa_|tavily_)?api_key$/,
   /^huggingface_api_token$/,
   /^pollinations_app_key$/,
   /^vector_store_secret_.+$/,

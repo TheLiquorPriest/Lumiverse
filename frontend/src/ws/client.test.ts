@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, jest, test } from 'bun:test'
 
 const originalWindow = (globalThis as any).window
 const originalDocument = (globalThis as any).document
@@ -33,6 +33,7 @@ const windowMock = {
 class MockWebSocket {
   static readonly CONNECTING = 0
   static readonly OPEN = 1
+  static readonly CLOSED = 3
   static instances: MockWebSocket[] = []
 
   readyState = MockWebSocket.OPEN
@@ -114,6 +115,14 @@ describe('WebSocketClient resume watchdog guard', () => {
     })).toBe(false)
   })
 
+  test('keeps the heartbeat worker available on Android', () => {
+    expect(shouldUseHeartbeatWorker({
+      userAgent: 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 Chrome/140 Mobile',
+      platform: 'Linux armv8l',
+      maxTouchPoints: 5,
+    })).toBe(true)
+  })
+
   test('sends the fast watchdog ping on an unsuppressed hidden-to-visible transition', () => {
     const client = makeClient()
     const pingTimeouts: number[] = []
@@ -125,7 +134,7 @@ describe('WebSocketClient resume watchdog guard', () => {
 
     client.sendVisibility()
 
-    expect(pingTimeouts).toEqual([3_000])
+    expect(pingTimeouts).toEqual([15_000])
   })
 
   test('suppresses the next fast watchdog ping once when a system modal is expected', () => {
@@ -143,7 +152,7 @@ describe('WebSocketClient resume watchdog guard', () => {
 
     client.wasVisible = false
     client.sendVisibility()
-    expect(pingTimeouts).toEqual([3_000])
+    expect(pingTimeouts).toEqual([15_000])
   })
 
   test('uses the worker to schedule and watch the primary socket heartbeat', () => {
@@ -153,14 +162,14 @@ describe('WebSocketClient resume watchdog guard', () => {
 
     const worker = MockWorker.instances.at(-1)!
     const start = worker.sent.find((message) => message.type === 'start')
-    expect(start).toMatchObject({ intervalMs: 30_000, timeoutMs: 10_000 })
+    expect(start).toMatchObject({ intervalMs: 30_000, timeoutMs: 15_000 })
 
-    worker.emit({ type: 'ping', generation: start.generation, timeoutMs: 10_000 })
+    worker.emit({ type: 'ping', generation: start.generation, timeoutMs: 15_000 })
     expect(socket.sent).toEqual([JSON.stringify({ type: 'ping' })])
     expect(worker.sent.at(-1)).toEqual({
       type: 'arm',
       generation: start.generation,
-      timeoutMs: 10_000,
+      timeoutMs: 15_000,
     })
 
     worker.emit({ type: 'timeout', generation: start.generation })
@@ -183,6 +192,138 @@ describe('WebSocketClient resume watchdog guard', () => {
     expect(socket.closeCalls).toBe(0)
     expect(client.ws).toBe(socket)
     client.disconnect()
+  })
+
+  test('invalidates a heartbeat deadline while the PWA is backgrounded', () => {
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    client.startPing()
+    const worker = MockWorker.instances.at(-1)!
+    const start = worker.sent.find((message) => message.type === 'start')
+
+    client.pauseForBackground()
+    worker.emit({ type: 'timeout', generation: start.generation })
+
+    expect(socket.closeCalls).toBe(0)
+    expect(client.ws).toBe(socket)
+    client.disconnect()
+  })
+
+  test('requires an ID-correlated pong to complete foreground recovery', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    client.connect()
+    const socket = MockWebSocket.instances.at(-1)!
+    ;(socket as any).onopen?.({} as Event)
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+    client.on('__ws_resume_recovery_complete', () => events.push('complete'))
+
+    client.pauseForBackground()
+    client.resumeFromBackground()
+    const worker = MockWorker.instances.at(-1)!
+    const resumePing = worker.sent.find((message) => message.type === 'ping-now' && message.resumeProof)
+    expect(resumePing).toMatchObject({ timeoutMs: 15_000, resumeProof: true })
+
+    worker.emit({ type: 'ping', generation: resumePing.generation, timeoutMs: 15_000, resumeProof: true })
+    const frame = JSON.parse(socket.sent.at(-1)!)
+    expect(frame).toMatchObject({ type: 'ping' })
+    expect(typeof frame.id).toBe('string')
+
+    ;(socket as any).onmessage({ data: JSON.stringify({ type: 'pong', id: frame.id }) })
+    expect(events).toEqual(['start', 'complete'])
+    client.disconnect()
+  })
+
+  test('abandons a socket that remains CONNECTING beyond the handshake deadline', () => {
+    jest.useFakeTimers()
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    const closes: any[] = []
+    client.on('__ws_close', (payload: any) => closes.push(payload))
+
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      socket.readyState = MockWebSocket.CONNECTING
+
+      jest.advanceTimersByTime(14_999)
+      expect(socket.closeCalls).toBe(0)
+
+      jest.advanceTimersByTime(1)
+      expect(socket.closeCalls).toBe(1)
+      expect(client.ws).toBeNull()
+      expect(closes).toEqual([{ code: 1006, reason: 'connection timeout' }])
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
+
+  test('releases the transport on freeze and starts a fresh foreground recovery', () => {
+    jest.useFakeTimers()
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+
+    try {
+      client.pauseForBackground()
+      client.suspendTransport('page frozen')
+
+      expect(socket.closeCalls).toBe(1)
+      expect(client.ws).toBeNull()
+
+      client.resumeFromBackground()
+      expect(events).toEqual(['start'])
+      jest.advanceTimersByTime(249)
+      expect(client.ws).toBeNull()
+      jest.advanceTimersByTime(1)
+      expect(client.ws).toBe(MockWebSocket.instances.at(-1))
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
+
+  test('starts recovery when foregrounding finds no socket even if a hidden event was missed', () => {
+    jest.useFakeTimers()
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+
+    try {
+      client.abandonSocket(socket)
+      client.recoverConnectionOnForeground('focus')
+      expect(events).toEqual(['start'])
+      jest.advanceTimersByTime(250)
+      expect(client.ws).toBe(MockWebSocket.instances.at(-1))
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
+
+  test('uses a timer gap to probe an OPEN socket when lifecycle events were missed', () => {
+    jest.useFakeTimers()
+    const client = makeClient()
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+
+    try {
+      client.lastLifecycleTick = Date.now() - 20_000
+      client.checkForWakeGap()
+
+      expect(events).toEqual(['start'])
+      const worker = MockWorker.instances.at(-1)!
+      expect(worker.sent.some((message) => (
+        message.type === 'ping-now'
+        && message.timeoutMs === 15_000
+        && message.resumeProof === true
+      ))).toBe(true)
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
   })
 })
 

@@ -27,7 +27,7 @@ function resolveConnection(userId: string, connectionId?: string) {
 export async function synthesize(userId: string, input: SynthesizeInput): Promise<TtsResponse> {
   const profile = resolveConnection(userId, input.connectionId);
 
-  const provider = getTtsProvider(profile.provider);
+  const provider = getTtsProvider(profile.provider, userId);
   if (!provider) throw new Error(`Unknown TTS provider: ${profile.provider}`);
 
   const apiKey = await secretsSvc.getSecret(userId, ttsConnSvc.ttsConnectionSecretKey(profile.id));
@@ -53,7 +53,7 @@ export async function* synthesizeStream(
 ): AsyncGenerator<TtsStreamChunk, void, unknown> {
   const profile = resolveConnection(userId, input.connectionId);
 
-  const provider = getTtsProvider(profile.provider);
+  const provider = getTtsProvider(profile.provider, userId);
   if (!provider) throw new Error(`Unknown TTS provider: ${profile.provider}`);
 
   if (!provider.capabilities.supportsStreaming) {

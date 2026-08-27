@@ -1,6 +1,11 @@
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState, useSyncExternalStore, startTransition, memo, type PointerEvent, type ReactNode, type TouchEvent, type WheelEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useVirtualizer, defaultRangeExtractor, type Range, type VirtualItem, type Virtualizer } from '@tanstack/react-virtual'
+import {
+  CHAT_REVEAL_SETTLE_CAP_MS,
+  getChatDisplaySettleDiagnostics,
+  isChatDisplaySettled,
+} from '@/lib/chatDisplaySettle'
 import { useScrollGate } from '@/hooks/useScrollGate'
 import { useChunkedMessages } from '@/hooks/useChunkedMessages'
 import {
@@ -15,7 +20,8 @@ import GroupChatProgressBar from './GroupChatProgressBar'
 import GroupChatMemberBar from './GroupChatMemberBar'
 import { shouldAdjustMessageListScrollOnResize } from './messageListScrollAdjust'
 import { shouldPinMessageListTail } from './messageListPinning'
-import { COLLAPSIBLE_TOGGLE_LAYOUT_EVENT } from './collapsibleLayout'
+import { COLLAPSIBLE_TOGGLE_LAYOUT_EVENT, isCollapsibleToggleElement } from './collapsibleLayout'
+import { getLongMessageCollapseHeight, isLongMessageCollapseEligible, longMessageExpansionKey } from '@/lib/longMessageCollapse'
 import {
   MESSAGE_CONTENT_LAYOUT_EVENT,
   shouldPreserveScrollAnchorForLayout,
@@ -56,6 +62,7 @@ const MOBILE_RANGE_WARM_MS = 1200
 const INITIAL_RANGE_WARM_DELAY_MS = 300
 const USER_CONTROLLED_ROW_RESIZE_SETTLE_MS = 450
 const PROGRAMMATIC_CONTENT_REFLOW_SETTLE_MS = 1500
+const SWIPE_VARIANT_REFLOW_SETTLE_MS = 1500
 const MIN_FORCED_SCROLL_DURATION_MS = 180
 const MAX_FORCED_SCROLL_DURATION_MS = 700
 
@@ -139,7 +146,7 @@ function getFocusedEditableMessageId(root: HTMLElement | null) {
 function getFocusedCollapsibleToggleMessageId(root: HTMLElement | null) {
   const active = document.activeElement
   if (!root || !active || !root.contains(active)) return null
-  if (!(active instanceof Element) || !active.matches('[data-reasoning-toggle], summary')) return null
+  if (!(active instanceof Element) || !isCollapsibleToggleElement(active)) return null
   return active.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? null
 }
 
@@ -258,10 +265,13 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
   const [inputSafeZone, setInputSafeZone] = useState(100)
   const lastInputSafeZoneRef = useRef(100)
   const [editableFocusInList, setEditableFocusInList] = useState(false)
+  const [collapsibleResizeActive, setCollapsibleResizeActive] = useState(false)
   const recentCollapsibleToggleMessageIdRef = useRef<string | null>(null)
   const recentCollapsibleToggleUntilRef = useRef(0)
   const recentCollapsibleToggleTimerRef = useRef<number | null>(null)
   const programmaticReflowUntilByMessageIdRef = useRef<Map<string, number>>(new Map())
+  const previousSwipeIdByMessageIdRef = useRef<Map<string, number>>(new Map())
+  const swipeVariantReflowUntilByMessageIdRef = useRef<Map<string, number>>(new Map())
   const findHighlightTimerRef = useRef<number | null>(null)
   const focusedFindRequestRef = useRef(0)
   const keyboardRepinTimersRef = useRef<number[]>([])
@@ -354,9 +364,12 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     initialScrollSettleUntilRef.current = 0
     userUnpinnedRef.current = false
     setEditableFocusInList(false)
+    setCollapsibleResizeActive(false)
     recentCollapsibleToggleMessageIdRef.current = null
     recentCollapsibleToggleUntilRef.current = 0
     programmaticReflowUntilByMessageIdRef.current.clear()
+    previousSwipeIdByMessageIdRef.current.clear()
+    swipeVariantReflowUntilByMessageIdRef.current.clear()
     if (recentCollapsibleToggleTimerRef.current != null) {
       window.clearTimeout(recentCollapsibleToggleTimerRef.current)
       recentCollapsibleToggleTimerRef.current = null
@@ -411,6 +424,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     if (!shouldAnimate && !shouldRetargetActiveAnimation) {
       cancelForcedScroll()
       el.scrollTop = targetOffset
+      markProgrammaticScroll(el)
       return
     }
 
@@ -431,6 +445,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     const startOffset = el.scrollTop
     if (Math.abs(targetOffset - startOffset) < 1) {
       el.scrollTop = targetOffset
+      markProgrammaticScroll(el)
       return
     }
 
@@ -449,12 +464,14 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
       const nextOffset = animation.startOffset
         + (animation.targetOffset - animation.startOffset) * easeOutQuart(progress)
       el.scrollTop = nextOffset
+      markProgrammaticScroll(el)
 
       if (progress >= 1) {
         // A temporarily stale scrollHeight can clamp this write. TanStack's
         // reconcile loop will issue the corrected destination again once the
         // virtual container has its final measured size.
         el.scrollTop = animation.targetOffset
+        markProgrammaticScroll(el)
         forcedScrollAnimationRef.current = null
         return
       }
@@ -464,7 +481,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
 
     forcedScrollAnimationRef.current = animation
     animation.rafId = requestAnimationFrame(tick)
-  }, [cancelForcedScroll])
+  }, [cancelForcedScroll, markProgrammaticScroll])
 
   const warmMobileRange = useCallback((duration = MOBILE_RANGE_WARM_MS) => {
     setMobileRangeWarm(true)
@@ -479,7 +496,17 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
   const streamingError = useStore((s) => s.streamingError)
   const regeneratingMessageId = useStore((s) => s.regeneratingMessageId)
   const streamingGenerationType = useStore((s) => s.streamingGenerationType)
-  const displayMode = useStore((s) => s.chatSheldDisplayMode)
+  const displayMode = useStore((s) => s.chatDisplayMode)
+  const longMessageCollapseEnabled = useStore((s) => s.longMessageCollapseEnabled)
+  const longMessageCollapsePreset = useStore((s) => s.longMessageCollapsePreset)
+  const longMessageCollapseCustomHeight = useStore((s) => s.longMessageCollapseCustomHeight)
+  const longMessageCollapseDepth = useStore((s) => s.longMessageCollapseDepth)
+  const expandedLongMessageKeys = useStore((s) => s.expandedLongMessageKeys)
+  const expandedLongMessageKeySet = useMemo(() => new Set(expandedLongMessageKeys), [expandedLongMessageKeys])
+  const longMessageCollapseHeight = getLongMessageCollapseHeight(
+    longMessageCollapsePreset,
+    longMessageCollapseCustomHeight,
+  )
   const styleMode = useStore((s) => {
     const claims = s.chatStyleModes[chatId]
     return claims && Object.keys(claims).length > 0 ? 'extension-relaxed' as const : undefined
@@ -511,6 +538,20 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
       const message = visibleMessages[index]
       const content = message.swipes?.[message.swipe_id] ?? message.content ?? ''
       const attachmentCount = message.extra?.attachments?.length ?? 0
+      const depth = visibleMessages.length - 1 - index
+      const longMessageEligible = isLongMessageCollapseEligible({
+        enabled: longMessageCollapseEnabled,
+        isUser: message.is_user,
+        depth,
+        collapseDepth: longMessageCollapseDepth,
+        chatId,
+        messageId: message.id,
+      })
+      const longMessageVariant = longMessageEligible
+        ? expandedLongMessageKeySet.has(longMessageExpansionKey(chatId, message.id))
+          ? 'long-expanded'
+          : `long-${longMessageCollapsePreset}-${longMessageCollapseHeight}`
+        : 'long-off'
       const measureKey = [
         'message',
         message.id,
@@ -522,6 +563,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
         message.extra?.reasoning ? 'reasoning' : 'no-reasoning',
         message.extra?.hidden ? 'hidden' : 'visible',
         lumiaOOCStyle,
+        longMessageVariant,
       ].join(':')
 
       // Key intentionally excludes content AND swipe_id: folding either in
@@ -553,13 +595,34 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     items.push({ type: 'bottom', key: 'bottom' })
 
     return items
-  }, [displayMode, isCoarsePointer, isGroupChat, isNudgeLoopActive, loadingOlder, lumiaOOCStyle, streamingError, visibleMessages])
+  }, [chatId, displayMode, expandedLongMessageKeySet, isCoarsePointer, isGroupChat, isNudgeLoopActive, loadingOlder, longMessageCollapseDepth, longMessageCollapseEnabled, longMessageCollapseHeight, longMessageCollapsePreset, lumiaOOCStyle, streamingError, visibleMessages])
+
+  // ResizeObserver reports a swipe replacement after commit. Remember that
+  // semantic change across the short async measurement window so the resize
+  // predicate can distinguish it from an image/widget reflow in the same row.
+  useLayoutEffect(() => {
+    const previous = previousSwipeIdByMessageIdRef.current
+    const next = new Map<string, number>()
+    const now = performance.now()
+
+    for (const message of visibleMessages) {
+      next.set(message.id, message.swipe_id)
+      if (previous.has(message.id) && previous.get(message.id) !== message.swipe_id) {
+        swipeVariantReflowUntilByMessageIdRef.current.set(
+          message.id,
+          now + SWIPE_VARIANT_REFLOW_SETTLE_MS,
+        )
+      }
+    }
+
+    previousSwipeIdByMessageIdRef.current = next
+  }, [visibleMessages])
 
   useEffect(() => {
     measuredRowHeightsRef.current = new Map()
     lastMeasuredByMessageIdRef.current = new Map()
     averageMeasuredHeightRef.current = null
-  }, [displayMode, isCoarsePointer, lumiaOOCStyle])
+  }, [displayMode, isCoarsePointer, longMessageCollapseEnabled, longMessageCollapseHeight, longMessageCollapsePreset, longMessageCollapseDepth, lumiaOOCStyle])
 
   useEffect(() => {
     setInitialRangeWarm(false)
@@ -707,6 +770,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
       recentCollapsibleToggleMessageIdRef.current = null
       recentCollapsibleToggleUntilRef.current = 0
       recentCollapsibleToggleTimerRef.current = null
+      setCollapsibleResizeActive(false)
     }
 
     const handleCollapsibleToggle = (event: Event) => {
@@ -716,6 +780,14 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
         : null
       if (!messageId) return
 
+      // A disclosure click is reading intent. Suspend tail following before
+      // the row starts its transition so opening reasoning during a stream
+      // keeps the clicked section in place instead of pulling it toward the
+      // top as the virtualizer preserves the end anchor.
+      cancelInitialScrollToEnd()
+      markUserUnpinned()
+      suppressKeyboardRepin(USER_CONTROLLED_ROW_RESIZE_SETTLE_MS + 120)
+      setCollapsibleResizeActive(true)
       recentCollapsibleToggleMessageIdRef.current = messageId
       recentCollapsibleToggleUntilRef.current = performance.now() + USER_CONTROLLED_ROW_RESIZE_SETTLE_MS
       if (recentCollapsibleToggleTimerRef.current != null) {
@@ -735,9 +807,9 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
         recentCollapsibleToggleTimerRef.current = null
       }
     }
-  }, [])
+  }, [cancelInitialScrollToEnd, markUserUnpinned, suppressKeyboardRepin])
 
-  const estimateMessageSize = useCallback((message: Message, measureKey: string) => {
+  const estimateMessageSize = useCallback((message: Message, measureKey: string, depth: number) => {
     const measured = measuredRowHeightsRef.current.get(measureKey)
     if (measured) return measured
 
@@ -803,11 +875,23 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
       extensionTagFloor,
     )
     const average = averageMeasuredHeightRef.current
+    const blendedEstimate = average ? (contentEstimate * 0.7 + average * 0.3) : contentEstimate
+    const isCollapsedLongMessage = isLongMessageCollapseEligible({
+      enabled: longMessageCollapseEnabled,
+      isUser: message.is_user,
+      depth,
+      collapseDepth: longMessageCollapseDepth,
+      chatId,
+      messageId: message.id,
+    }) && !expandedLongMessageKeySet.has(longMessageExpansionKey(chatId, message.id))
+    const collapseAwareEstimate = isCollapsedLongMessage
+      ? Math.min(blendedEstimate, base + longMessageCollapseHeight + 36 + mediaHeight + audioHeight)
+      : blendedEstimate
 
     // Blend content heuristics with the measured chat average so unknown rows
     // near the loaded tail don't all start from the same poor fixed estimate.
-    return clampEstimate(average ? (contentEstimate * 0.7 + average * 0.3) : contentEstimate)
-  }, [isBubble, lumiaOOCStyle])
+    return clampEstimate(collapseAwareEstimate)
+  }, [chatId, expandedLongMessageKeySet, isBubble, longMessageCollapseEnabled, longMessageCollapseDepth, longMessageCollapseHeight, lumiaOOCStyle])
 
   const rangeExtractor = useCallback((range: Range) => {
     const indexes = new Set(defaultRangeExtractor(range))
@@ -854,6 +938,10 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
         ? programmaticReflowUntilByMessageIdRef.current.get(row.message.id) ?? 0
         : 0
       const isProgrammaticContentReflow = performance.now() <= programmaticReflowUntil
+      const swipeVariantReflowUntil = row?.type === 'message'
+        ? swipeVariantReflowUntilByMessageIdRef.current.get(row.message.id) ?? 0
+        : 0
+      const isSwipeVariantChange = performance.now() <= swipeVariantReflowUntil
       return shouldAdjustMessageListScrollOnResize({
         delta,
         itemStart: item.start,
@@ -863,6 +951,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
         hasMeasuredSize: instance.itemSizeCache.has(item.key),
         isPinned: isPinnedRef.current,
         isStreamingTail,
+        isSwipeVariantChange,
         isFocusedEditableRow,
         isUserToggledCollapsibleRow,
         isProgrammaticContentReflow,
@@ -920,7 +1009,11 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
       if (!item) return estimateSize
       switch (item.type) {
         case 'message':
-          return estimateMessageSize(item.message, item.measureKey)
+          return estimateMessageSize(
+            item.message,
+            item.measureKey,
+            visibleMessages.length - 1 - item.messageIndex,
+          )
         case 'loadingOlder':
           return 44
         case 'progressBar':
@@ -935,8 +1028,12 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     overscan: initialRangeWarm ? (isCoarsePointer ? 8 : 5) : 2,
     getItemKey,
     rangeExtractor,
-    anchorTo: editableFocusInList ? 'start' : 'end',
-    followOnAppend: editableFocusInList ? false : true,
+    // TanStack gives end anchoring precedence over the per-row resize
+    // predicate when the viewport is currently at the tail. Temporarily use
+    // start anchoring for a user-controlled disclosure transition so that the
+    // predicate above can keep the viewport stationary throughout the resize.
+    anchorTo: editableFocusInList || collapsibleResizeActive ? 'start' : 'end',
+    followOnAppend: editableFocusInList || collapsibleResizeActive ? false : true,
     scrollEndThreshold: SCROLL_END_THRESHOLD,
     paddingEnd: inputSafeZone,
     directDomUpdatesMode: 'position',
@@ -1055,6 +1152,27 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     ))
     if (targetIndex === -1) return
 
+    const targetItem = virtualListItems[targetIndex]
+    if (targetItem?.type === 'message') {
+      const targetDepth = visibleMessages.length - 1 - targetItem.messageIndex
+      const targetLongMessageEligible = isLongMessageCollapseEligible({
+        enabled: longMessageCollapseEnabled,
+        isUser: targetItem.message.is_user,
+        depth: targetDepth,
+        collapseDepth: longMessageCollapseDepth,
+        chatId,
+        messageId: targetItem.message.id,
+      })
+      if (targetLongMessageEligible) {
+        const store = useStore.getState()
+        const key = longMessageExpansionKey(chatId, findTarget.id)
+        if (!store.expandedLongMessageKeys.includes(key)) {
+          store.setLongMessageExpanded(chatId, findTarget.id, true)
+          return
+        }
+      }
+    }
+
     focusedFindRequestRef.current = findTarget.requestId
     cancelInitialScrollToEnd()
     suppressKeyboardRepin(1200)
@@ -1077,10 +1195,14 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
   }, [
     beginForcedScroll,
     cancelInitialScrollToEnd,
+    chatId,
     findTarget,
+    longMessageCollapseDepth,
+    longMessageCollapseEnabled,
     markUserUnpinned,
     rowVirtualizer,
     suppressKeyboardRepin,
+    visibleMessages.length,
     virtualListItems,
   ])
 
@@ -1148,20 +1270,57 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
 
   const virtualItems = rowVirtualizer.getVirtualItems()
 
-  // Trigger the chat-load fade-in as soon as the virtualizer has real rows.
-  // We dispatch an event so the parent ChatView can perform a container-wide
-  // enter animation including the input area and toolbars.
+  // Trigger the chat-load fade-in once the virtualizer has real rows AND the
+  // display pipeline has settled: tag-interceptor registrations and first
+  // display-regex resolves land asynchronously after mount, and revealing
+  // before they drain paints raw tags/JSON that visibly flash away. Poll the
+  // settle tracker (bounded by CHAT_REVEAL_SETTLE_CAP_MS) before dispatching,
+  // so the parent ChatView animates in final content instead of intermediates.
   const hasPopulated = virtualItems.some((item) => virtualListItems[item.index]?.type === 'message')
   useEffect(() => {
-    if (!hasFadedInRef.current && hasPopulated) {
-      hasFadedInRef.current = true
+    if (hasFadedInRef.current || !hasPopulated) return
+    let cancelled = false
+    let pollTimer: number | null = null
+    const startedAt = Date.now()
+    const dispatchPopulated = () => {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          window.dispatchEvent(new CustomEvent('lumiverse:chat-items-populated'))
+          if (!cancelled) {
+            // Commit the delivered flag with the event. Chat hydration can
+            // temporarily clear the virtual rows during these two frames;
+            // its effect cleanup cancels this dispatch, and the next populated
+            // render must still be allowed to try again.
+            hasFadedInRef.current = true
+            window.dispatchEvent(new CustomEvent('lumiverse:chat-items-populated', { detail: { chatId } }))
+          }
         })
       })
     }
-  }, [hasPopulated, virtualItems])
+    const poll = () => {
+      if (cancelled) return
+      const settled = isChatDisplaySettled(chatId)
+      const elapsedMs = Date.now() - startedAt
+      const timedOut = elapsedMs >= CHAT_REVEAL_SETTLE_CAP_MS
+      if (settled || timedOut) {
+        if (timedOut && !settled) {
+          const detail = {
+            elapsedMs,
+            ...getChatDisplaySettleDiagnostics(chatId),
+          }
+          console.warn('[ChatDisplaySettle] Reveal reached settle cap', detail)
+          window.dispatchEvent(new CustomEvent('lumiverse:chat-display-settle-timeout', { detail }))
+        }
+        dispatchPopulated()
+        return
+      }
+      pollTimer = window.setTimeout(poll, 100)
+    }
+    poll()
+    return () => {
+      cancelled = true
+      if (pollTimer !== null) window.clearTimeout(pollTimer)
+    }
+  }, [chatId, hasPopulated])
 
   // Gate that keeps the keyboard/safe-zone repin from fighting the unified
   // scroll guard while streaming is active.
@@ -1648,7 +1807,11 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
       data-chat-scroll="true"
       data-group-chat={isGroupChat || undefined}
     >
+      <span data-spindle-mount="chat_stream_before" data-spindle-scope={`chat:${chatId}:stream-before`} style={{ display: 'contents' }} />
       {isGroupChat && <GroupChatMemberBar chatId={chatId} />}
+      {!hasRows && (
+        <span data-spindle-mount="chat_empty_state" data-spindle-scope={`chat:${chatId}:empty`} style={{ display: 'contents' }} />
+      )}
       <div
         ref={rowVirtualizer.containerRef}
         className={styles.virtualSpace}
@@ -1713,6 +1876,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
           )
         })}
       </div>
+      <span data-spindle-mount="chat_stream_after" data-spindle-scope={`chat:${chatId}:stream-after`} style={{ display: 'contents' }} />
     </div>
   )
 }
@@ -1779,6 +1943,13 @@ const VirtualRow = memo(function VirtualRow({ virtualIndex, itemType, messageInd
       data-style-mode={relaxed ? 'extension-relaxed' : undefined}
       className={styles.virtualRow}
     >
+      {messageId && (
+        <span
+          data-spindle-mount="message_context_menu"
+          data-spindle-scope={`message:${messageId}:context-menu`}
+          style={{ display: 'contents' }}
+        />
+      )}
       {children}
     </div>
   )

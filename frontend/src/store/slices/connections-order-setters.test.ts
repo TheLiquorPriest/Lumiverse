@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
 import type { StoreApi } from 'zustand'
 import type {
   ConnectionProfile,
@@ -9,12 +9,31 @@ import type {
   TtsConnectionProfile,
 } from '@/types/api'
 import type { AppStore } from '@/types/store'
-import { createConnectionsSlice } from './connections'
 import type { CompleteConnectionsOrder } from './connections-order-merge'
-import { createGenerationSlice } from './generation'
-import { createImageGenConnectionsSlice } from './image-gen-connections'
-import { createSttConnectionsSlice } from './stt-connections'
-import { createTtsConnectionsSlice } from './tts-connections'
+
+const persistedSettings: Array<[string, unknown]> = []
+
+// The slices own the mutation, while settings owns the debounced transport.
+// Mock the latter so these order tests can assert that a new profile queues
+// the shared persisted order without starting real persistence timers.
+mock.module('./settings', () => ({
+  REASONING_DEFAULTS: {
+    prefix: '<think>\n', suffix: '\n</think>', autoParse: true, apiReasoning: false,
+    reasoningEffort: 'auto', keepInHistory: 0, thinkingDisplay: 'auto',
+  },
+  clearDirtyKey: () => {},
+  hasPendingSetting: () => false,
+  persistKey: (key: string, value: unknown) => { persistedSettings.push([key, value]) },
+  persistPendingImageGenerationPatch: () => {},
+}))
+
+const { createConnectionsSlice } = await import('./connections')
+const { createGenerationSlice } = await import('./generation')
+const { createImageGenConnectionsSlice } = await import('./image-gen-connections')
+const { createSttConnectionsSlice } = await import('./stt-connections')
+const { createTtsConnectionsSlice } = await import('./tts-connections')
+
+afterEach(() => { persistedSettings.length = 0 })
 
 type ProfileSetterHarness = Pick<
   AppStore,
@@ -33,7 +52,9 @@ type ProfileSetterHarness = Pick<
   | 'setImageGenProfiles'
   | 'addImageGenProfile'
   | 'setSttProfiles'
+  | 'addSttProfile'
   | 'setTtsProfiles'
+  | 'addTtsProfile'
 >
 
 type StoreUpdate =
@@ -176,21 +197,45 @@ describe('profile replacement ordering', () => {
     expect(store.connectionsOrder).toEqual(persistedDragOrder())
   })
 
-  test('reconciles duplicate WebSocket and REST deliveries of an added LLM profile', () => {
+  test('adds new LLM profiles at the top and reconciles duplicate deliveries', () => {
     const store = createHarness(persistedDragOrder())
     store.profiles = [llmProfile('llm-first')]
 
     store.addProfile({ ...llmProfile('llm-copy'), name: 'WebSocket copy' })
     store.addProfile({ ...llmProfile('llm-copy'), name: 'REST copy' })
 
-    expect(profileIds(store.profiles)).toEqual(['llm-first', 'llm-copy'])
-    expect(store.profiles[1]?.name).toBe('REST copy')
+    expect(profileIds(store.profiles)).toEqual(['llm-copy', 'llm-first'])
+    expect(store.profiles[0]?.name).toBe('REST copy')
     expect(store.connectionsOrder.llm).toEqual([
+      'llm-copy',
       'llm-third',
       'llm-first',
       'removed-llm',
-      'llm-copy',
     ])
+    expect(persistedSettings).toEqual([['connectionsOrder', store.connectionsOrder]])
+  })
+
+  test('adds new image, STT, and TTS profiles at the top and persists the shared order', () => {
+    const store = createHarness(persistedDragOrder())
+    store.imageGenProfiles = [imageProfile('image-first')]
+    store.sttProfiles = [sttProfile('stt-first')]
+    store.ttsProfiles = [ttsProfile('tts-first')]
+
+    store.addImageGenProfile(imageProfile('image-new'))
+    store.addSttProfile(sttProfile('stt-new'))
+    store.addTtsProfile(ttsProfile('tts-new'))
+
+    expect(profileIds(store.imageGenProfiles)).toEqual(['image-new', 'image-first'])
+    expect(profileIds(store.sttProfiles)).toEqual(['stt-new', 'stt-first'])
+    expect(profileIds(store.ttsProfiles)).toEqual(['tts-new', 'tts-first'])
+    expect(store.connectionsOrder).toEqual({
+      llm: ['llm-third', 'llm-first', 'removed-llm'],
+      imageGen: ['image-new', 'image-third', 'image-first', 'removed-image'],
+      stt: ['stt-new', 'stt-third', 'stt-first', 'removed-stt'],
+      tts: ['tts-new', 'tts-third', 'tts-first', 'removed-tts'],
+    })
+    expect(persistedSettings).toHaveLength(3)
+    expect(persistedSettings.at(-1)).toEqual(['connectionsOrder', store.connectionsOrder])
   })
   test('never activates unknown or review-required LLM profile IDs', () => {
     const store = createHarness(persistedDragOrder())
@@ -248,11 +293,11 @@ describe('profile replacement ordering', () => {
 
     store.addImageGenProfile(imageProfile('image-local'))
     expect(profileIds(store.imageGenProfiles)).toEqual([
+      'image-local',
       'image-third',
       'image-first',
       'image-new-first',
       'image-new-second',
-      'image-local',
     ])
     const profilesBeforeStaleRefresh = profileIds(store.imageGenProfiles)
     const versionBeforeStaleRefresh = store.imageGenProfilesVersion

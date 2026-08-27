@@ -1,7 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runMigrations } from "./migrate";
 
@@ -31,18 +29,6 @@ type IndexColumn = {
   key: number;
 };
 
-let temporaryMigrationDirs: string[] = [];
-
-function makeMigrationDir(): string {
-  const directory = mkdtempSync(join(tmpdir(), "lumiverse-migrate-099-test-"));
-  temporaryMigrationDirs.push(directory);
-  return directory;
-}
-
-function installMigration(directory: string): void {
-  writeFileSync(join(directory, MIGRATION_099), MIGRATION_099_SQL);
-}
-
 function libraryScopeColumn(db: Database): CharacterColumn | null {
   const columns = db.query("PRAGMA table_info('characters')").all() as CharacterColumn[];
   const column = columns.find((candidate) => candidate.name === "library_scope");
@@ -63,28 +49,23 @@ function indexColumns(db: Database, indexName: string): Array<Pick<IndexColumn, 
     .map(({ seqno, name, desc }) => ({ seqno, name, desc }));
 }
 
-afterEach(() => {
-  for (const directory of temporaryMigrationDirs) {
-    rmSync(directory, { recursive: true, force: true });
-  }
-  temporaryMigrationDirs = [];
-});
-
-describe("099 character library scope migration", () => {
+describe("099 character library scope", () => {
   test("keeps the canonical migration identity and body", async () => {
     expect(MIGRATION_099).toBe("099_character_library_scope.sql");
     const sql = await Bun.file(join(import.meta.dir, "migrations", MIGRATION_099)).text();
     expect(sql.replaceAll("\r\n", "\n")).toBe(MIGRATION_099_SQL);
   });
 
-  test("ships 099 in the baseline and never re-applies it", async () => {
+  test("is recorded as already applied after a fresh baseline bootstrap", async () => {
     const db = new Database(":memory:");
-    const migrationsDir = makeMigrationDir();
     try {
-      await runMigrations(db, migrationsDir);
+      await runMigrations(db);
 
-      // Baseline bootstrap carries the 099 schema and records the migration
-      // as squashed, so the baseline and the migrated schema stay in sync.
+      expect(
+        (db.query("PRAGMA table_info('characters')").all() as Array<{ name: string }>).some(
+          (column) => column.name === "library_scope",
+        ),
+      ).toBe(true);
       expect(
         db.query("SELECT COUNT(*) AS count FROM _migrations WHERE name = ?").get(MIGRATION_099),
       ).toEqual({ count: 1 });
@@ -125,11 +106,7 @@ describe("099 character library scope migration", () => {
         db.run("INSERT INTO characters (id, name, library_scope) VALUES ('invalid', 'Invalid', 'invalid')"),
       ).toThrow();
 
-      // A migration file reappearing after bootstrap (e.g. a release install
-      // that still ships it) must be skipped, not re-applied — re-running
-      // ALTER TABLE would fail with a duplicate column name.
-      installMigration(migrationsDir);
-      await runMigrations(db, migrationsDir);
+      await runMigrations(db);
       expect(
         db.query("SELECT COUNT(*) AS count FROM _migrations WHERE name = ?").get(MIGRATION_099),
       ).toEqual({ count: 1 });

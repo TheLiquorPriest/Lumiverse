@@ -130,6 +130,17 @@ export function lookupSlugsInScope(
 
 // ─── Heavy Resolution (async, cached) ─────────────────────────
 
+const RESOLVE_CACHE_MAX_ENTRIES = 256;
+
+interface ResolveCacheIndexEntry {
+  userId: string;
+  chatId: string;
+}
+
+// Metadata-only LRU index for the versioned cache store. Results remain owned
+// by mention-resolve-cache.service so mutation-version invalidation has a
+// single authoritative cache.
+const resolveCacheIndex = new Map<string, ResolveCacheIndexEntry>();
 function resolveCacheKey(
   userId: string,
   chatId: string,
@@ -156,8 +167,62 @@ function resolveCacheKey(
 
 /** Drop cached resolutions for a user+chat (e.g. after a doc update). */
 export function clearResolveCache(userId: string, chatId: string): void {
-  clearResolveCacheStore(userId, chatId);
+  clearIndexedResolveCacheScope(userId, chatId);
 }
+
+/** Drop all reconstructable mention resolutions. */
+export function clearAllResolveCache(): void {
+  const scopes = new Map<string, ResolveCacheIndexEntry>();
+  for (const entry of resolveCacheIndex.values()) {
+    scopes.set(`${entry.userId}:${entry.chatId}`, entry);
+  }
+  for (const { userId, chatId } of scopes.values()) {
+    clearResolveCacheStore(userId, chatId);
+  }
+  resolveCacheIndex.clear();
+}
+
+function forgetResolveCacheScope(userId: string, chatId: string): void {
+  for (const [key, entry] of resolveCacheIndex) {
+    if (entry.userId === userId && entry.chatId === chatId) resolveCacheIndex.delete(key);
+  }
+}
+
+function clearIndexedResolveCacheScope(userId: string, chatId: string): void {
+  clearResolveCacheStore(userId, chatId);
+  forgetResolveCacheScope(userId, chatId);
+}
+
+function cacheResolvedMentions(
+  key: string,
+  result: ResolvedMention[],
+  userId: string,
+  chatId: string,
+  expectedVersion: string,
+): void {
+  if (getResolveCacheVersion(userId, chatId) !== expectedVersion) return;
+  resolveCacheIndex.delete(key);
+  while (resolveCacheIndex.size >= RESOLVE_CACHE_MAX_ENTRIES) {
+    const oldest = resolveCacheIndex.values().next().value;
+    if (!oldest) break;
+    clearIndexedResolveCacheScope(oldest.userId, oldest.chatId);
+  }
+  setResolveCache(key, result, userId, chatId, expectedVersion);
+  if (getResolveCacheVersion(userId, chatId) === expectedVersion) {
+    resolveCacheIndex.set(key, { userId, chatId });
+  }
+}
+
+export const __mentionResolveCacheTest = {
+  clear: clearAllResolveCache,
+  keys: (): string[] => [...resolveCacheIndex.keys()],
+  set: (key: string, result: ResolvedMention[]): void => {
+    const [userId, chatId] = key.split(":");
+    if (!userId || !chatId) throw new Error("Mention cache test key must include user and chat IDs");
+    cacheResolvedMentions(key, result, userId, chatId, getResolveCacheVersion(userId, chatId));
+  },
+  size: (): number => resolveCacheIndex.size,
+};
 
 /**
  * Resolve a set of slugs to their injectable content.
@@ -183,7 +248,14 @@ export async function resolveSlugContent(
   const key = resolveCacheKey(userId, chatId, slugArr, docs, queryContext);
   const cacheVersion = getResolveCacheVersion(userId, chatId);
   const cached = getResolveCache(key);
-  if (cached) {
+  if (!cached) {
+    resolveCacheIndex.delete(key);
+  } else {
+    const indexed = resolveCacheIndex.get(key);
+    if (indexed) {
+      resolveCacheIndex.delete(key);
+      resolveCacheIndex.set(key, indexed);
+    }
     return cached;
   }
   const resolved: ResolvedMention[] = [];
@@ -210,7 +282,7 @@ export async function resolveSlugContent(
           const [v] = await embeddingsSvc.cachedEmbedTexts(
             userId,
             [queryContext],
-            { signal },
+            { signal, inputType: "query" },
           );
           if (signal?.aborted) break;
           queryVector = v;
@@ -248,7 +320,13 @@ export async function resolveSlugContent(
   }
 
   if (!signal?.aborted) {
-    setResolveCache(key, resolved, userId, chatId, cacheVersion);
+    cacheResolvedMentions(
+      key,
+      resolved,
+      userId,
+      chatId,
+      cacheVersion,
+    );
   }
   return resolved;
 }

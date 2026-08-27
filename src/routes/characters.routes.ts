@@ -10,9 +10,10 @@ import * as wbSvc from "../services/world-books.service";
 import * as regexSvc from "../services/regex-scripts.service";
 import * as gallerySvc from "../services/character-gallery.service";
 import { fetchChubGalleryUrls, fetchChubJson } from "../services/chub-api.service";
+import { fetchBotBooruGalleryUrls } from "../services/botbooru-api.service";
 import { parsePagination } from "../services/pagination";
 import { safeFetch, SSRFError, validateHost } from "../utils/safe-fetch";
-import { rewriteBotBooruUrl } from "../utils/botbooru";
+import { parseBotBooruId, rewriteBotBooruUrl } from "../utils/botbooru";
 import { createAvatarResolverResponse } from "../utils/avatar-cache";
 import { buildSlug } from "../lumihub/manifest";
 import { applyCharxModulesAndAssets, autoImportEmbeddedWorldbook } from "../services/charx-import.service";
@@ -70,6 +71,7 @@ const LOCAL_CHARACTER_EXTENSION_KEYS = new Set([
   "avatar_crop_image_id",
   "original_image_id",
   "risu_asset_map",
+  "gallery_reference_sequence",
   "landing_perspective_layers",
   "ttsVoice",
 ]);
@@ -221,7 +223,7 @@ async function importGalleryFromUrls(userId: string, characterId: string, urls: 
       const buf = await res.arrayBuffer();
       const contentType = res.headers.get("content-type") || "image/webp";
       const ext = contentType.includes("png") ? "png" : contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "webp";
-      return new File([buf], `chub_gallery_${crypto.randomUUID()}.${ext}`, { type: contentType });
+      return new File([buf], `remote_gallery_${crypto.randomUUID()}.${ext}`, { type: contentType });
     } catch {
       return null;
     }
@@ -559,6 +561,17 @@ app.post("/bulk-update", async (c) => {
   return c.json({ updated, count: updated.length });
 });
 
+app.post("/batch-delete", async (c) => {
+  const userId = c.get("userId");
+  const body: { ids?: unknown } = await c.req.json<{ ids?: unknown }>().catch(() => ({}));
+  if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 1000) {
+    return c.json({ error: "ids must be a non-empty array with at most 1000 items" }, 400);
+  }
+  const ids = body.ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+  if (ids.length === 0) return c.json({ error: "ids must contain character ids" }, 400);
+  return c.json(await svc.batchDeleteCharacters(userId, ids));
+});
+
 app.post("/", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
@@ -595,9 +608,18 @@ app.post("/import-url", async (c) => {
 
     // Check for BotBooru URL → rewrite to the PNG download, which embeds a
     // SillyTavern-compatible card *and* an avatar, then reuse the generic importer.
+    const botBooruId = parseBotBooruId(url);
     const botBooruPngUrl = rewriteBotBooruUrl(url, "png");
-    if (botBooruPngUrl) {
+    if (botBooruId && botBooruPngUrl) {
       character = await fetchGenericCharacter(botBooruPngUrl, userId, libraryScope || "mine");
+      try {
+        const galleryUrls = await fetchBotBooruGalleryUrls(botBooruId);
+        if (galleryUrls.length > 0) {
+          await importGalleryFromUrls(userId, character.id, galleryUrls);
+        }
+      } catch (err) {
+        console.warn("[character import] BotBooru gallery import failed:", err);
+      }
       return c.json({ character, ...loraSurface(character) }, 201);
     }
 

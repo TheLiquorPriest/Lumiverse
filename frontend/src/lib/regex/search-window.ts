@@ -317,14 +317,31 @@ export function replaceWithinRegexSearchWindow(
 ): string {
   const searchEnd = getRegexSearchEnd(input, pattern, flags, replacementTemplate)
   const searchable = searchEnd === input.length ? input : input.slice(0, searchEnd)
-  const outputLimit = Number.isSafeInteger(maxOutputBytes) && maxOutputBytes >= 0
-    ? maxOutputBytes
-    : DEFAULT_MAX_OUTPUT_BYTES
-  const expansionLimit = Number.isSafeInteger(maxExpansionBytes) && maxExpansionBytes >= 0
-    ? maxExpansionBytes
-    : DEFAULT_MAX_EXPANSION_BYTES
-  if (typeof replacement === "string") {
-    assertStringReplacementBudget(
+  // Cached sticky RegExp instances retain lastIndex after a successful
+  // non-global replacement. Reset around every use so cache hits are
+  // observationally identical to a freshly compiled RegExp.
+  regex.lastIndex = 0
+  try {
+    const outputLimit = Number.isSafeInteger(maxOutputBytes) && maxOutputBytes >= 0
+      ? maxOutputBytes
+      : DEFAULT_MAX_OUTPUT_BYTES
+    const expansionLimit = Number.isSafeInteger(maxExpansionBytes) && maxExpansionBytes >= 0
+      ? maxExpansionBytes
+      : DEFAULT_MAX_EXPANSION_BYTES
+    if (typeof replacement === "string") {
+      assertStringReplacementBudget(
+        input,
+        searchable,
+        regex,
+        replacement,
+        outputLimit,
+        expansionLimit,
+        1024,
+      )
+      const replaced = searchable.replace(regex, replacement)
+      return searchEnd === input.length ? replaced : replaced + input.slice(searchEnd)
+    }
+    const callbackResults = preflightCallbackReplacement(
       input,
       searchable,
       regex,
@@ -333,27 +350,18 @@ export function replaceWithinRegexSearchWindow(
       expansionLimit,
       1024,
     )
-    const replaced = searchable.replace(regex, replacement)
+    let callbackIndex = 0
+    const replaced = searchable.replace(regex, () => {
+      const result = callbackResults[callbackIndex]
+      if (result === undefined) throw new Error("regex replacement callback preflight mismatch")
+      callbackIndex += 1
+      return result
+    })
+    if (callbackIndex !== callbackResults.length) {
+      throw new Error("regex replacement callback preflight mismatch")
+    }
     return searchEnd === input.length ? replaced : replaced + input.slice(searchEnd)
+  } finally {
+    regex.lastIndex = 0
   }
-  const callbackResults = preflightCallbackReplacement(
-    input,
-    searchable,
-    regex,
-    replacement,
-    outputLimit,
-    expansionLimit,
-    1024,
-  )
-  let callbackIndex = 0
-  const replaced = searchable.replace(regex, () => {
-    const result = callbackResults[callbackIndex]
-    if (result === undefined) throw new Error("regex replacement callback preflight mismatch")
-    callbackIndex += 1
-    return result
-  })
-  if (callbackIndex !== callbackResults.length) {
-    throw new Error("regex replacement callback preflight mismatch")
-  }
-  return searchEnd === input.length ? replaced : replaced + input.slice(searchEnd)
 }

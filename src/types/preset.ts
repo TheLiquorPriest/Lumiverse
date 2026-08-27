@@ -198,7 +198,7 @@ export interface PromptBehavior {
 
 export interface CompletionSettings {
   assistantPrefill: string;
-  /** Moonshot/Kimi Partial Mode prefix for the model's reasoning_content. */
+  /** Provider-native prefix for the model's reasoning_content. */
   reasoningPrefill?: string;
   assistantImpersonation: string;
   continuePrefill: boolean;

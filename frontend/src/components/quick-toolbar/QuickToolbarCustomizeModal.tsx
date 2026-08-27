@@ -12,7 +12,6 @@ import {
   type DragEndEvent,
 } from '@dnd-kit/core'
 import {
-  arrayMove,
   SortableContext,
   sortableKeyboardCoordinates,
   useSortable,
@@ -23,6 +22,17 @@ import { ModalShell } from '@/components/shared/ModalShell'
 import { Toggle } from '@/components/shared/Toggle'
 import { useScaledSortableStyle } from '@/lib/dndUiScale'
 import { filterActionIds, filterActions } from '@/lib/toolbarActionSearch'
+import {
+  isAutoFitToolbarBounds,
+  isFillTopDockWidth,
+  isOpaqueToolbarBackdrop,
+  isShowNativeBrowseMessages,
+  isShowNativeScrollToTop,
+  isShowNativeSelectMessages,
+  isV2IconOnly,
+  readQuickToolbarPlacement,
+} from './quickToolbarDock'
+import { nextToolbarIconOrder } from './toolbarPointerHold'
 import { useQuickToolbarActions, type ToolbarAction } from './useQuickToolbarActions'
 import styles from './QuickToolbarCustomizeModal.module.css'
 
@@ -171,7 +181,7 @@ export default function QuickToolbarCustomizeModal({ onClose }: QuickToolbarCust
    * the array it has always been and dnd-kit behaviour is bit-for-bit unchanged.
    *
    * `handleDragEnd` below still resolves both endpoints by id against the full
-   * `orderedIds`, so the `arrayMove` math is untouched by filtering.
+   * `orderedIds`, so the move math is untouched by filtering.
    */
   const sortableIds = useMemo(
     () => filterActionIds(orderedIds, actionById, query),
@@ -186,11 +196,10 @@ export default function QuickToolbarCustomizeModal({ onClose }: QuickToolbarCust
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event
-    if (!over || active.id === over.id) return
-    const from = orderedIds.indexOf(String(active.id))
-    const to = orderedIds.indexOf(String(over.id))
-    if (from < 0 || to < 0) return
-    reorderActions(arrayMove(orderedIds, from, to))
+    if (!over) return
+    const next = nextToolbarIconOrder(orderedIds, String(active.id), String(over.id))
+    if (!next) return
+    reorderActions(next)
   }
 
   return (
@@ -302,11 +311,96 @@ export default function QuickToolbarCustomizeModal({ onClose }: QuickToolbarCust
             <div className={styles.switchRow}>
               <span>Show labels</span>
               <Toggle.Switch
-                checked={anchored ? settings.v2LabelVisible !== false : settings.labelVisible}
+                checked={anchored ? settings.v2LabelVisible !== false && !isV2IconOnly(settings) : settings.labelVisible}
                 onChange={(visible) => updateSettings(
-                  anchored ? { v2LabelVisible: visible } : { labelVisible: visible },
+                  anchored
+                    ? { v2LabelVisible: visible }
+                    : { labelVisible: visible },
                 )}
                 aria-label="Show toolbar labels"
+              />
+            </div>
+            {readQuickToolbarPlacement(settings) === 'floating' && (
+              <div className={styles.switchRow}>
+                <span>Keep chat top dock enabled while floating</span>
+                <Toggle.Switch
+                  checked={settings.hideInChatTopDock !== true}
+                  onChange={(keepDockEnabled) => updateSettings({ hideInChatTopDock: !keepDockEnabled } as typeof settings)}
+                  aria-label="Keep chat top dock enabled while floating"
+                />
+              </div>
+            )}
+            {anchored && (
+              <div className={styles.switchRow}>
+                <span>Icon-only</span>
+                <Toggle.Switch
+                  checked={isV2IconOnly(settings)}
+                  onChange={(v2IconOnly) => updateSettings({
+                    v2IconOnly,
+                    v2LabelVisible: v2IconOnly ? false : settings.v2LabelVisible,
+                  } as typeof settings)}
+                  aria-label="V2 icon-only toolbar"
+                />
+              </div>
+            )}
+            {(!anchored || (anchored && readQuickToolbarPlacement(settings) === 'floating')) && (
+              <div className={styles.switchRow}>
+                <span>Auto-fit toolbar bounds to content</span>
+                <Toggle.Switch
+                  checked={isAutoFitToolbarBounds(settings)}
+                  onChange={(autoFitBounds) => updateSettings({ autoFitBounds } as typeof settings)}
+                  aria-label="Auto-fit toolbar bounds to content"
+                />
+              </div>
+            )}
+            <div className={styles.switchRow}>
+              <span>
+                {readQuickToolbarPlacement(settings) === 'chat_top_dock'
+                  ? 'Fill chat top bar width'
+                  : 'Fill the entire top of the screen'}
+              </span>
+              <Toggle.Switch
+                checked={isFillTopDockWidth(settings)}
+                onChange={(fillTopDockWidth) => updateSettings({ fillTopDockWidth } as typeof settings)}
+                aria-label={readQuickToolbarPlacement(settings) === 'chat_top_dock'
+                  ? 'Fill chat top bar width'
+                  : 'Fill the entire top of the screen'}
+              />
+            </div>
+            {readQuickToolbarPlacement(settings) === 'chat_top_dock' && (
+              <>
+                <div className={styles.switchRow}>
+                  <span>Show select-messages on chat top bar</span>
+                  <Toggle.Switch
+                    checked={isShowNativeSelectMessages(settings)}
+                    onChange={(showNativeSelectMessages) => updateSettings({ showNativeSelectMessages } as typeof settings)}
+                    aria-label="Show select-messages on chat top bar"
+                  />
+                </div>
+                <div className={styles.switchRow}>
+                  <span>Show go to oldest message on chat top bar</span>
+                  <Toggle.Switch
+                    checked={isShowNativeScrollToTop(settings)}
+                    onChange={(showNativeScrollToTop) => updateSettings({ showNativeScrollToTop } as typeof settings)}
+                    aria-label="Show go to oldest message on chat top bar"
+                  />
+                </div>
+                <div className={styles.switchRow}>
+                  <span>Show browse messages on chat top bar</span>
+                  <Toggle.Switch
+                    checked={isShowNativeBrowseMessages(settings)}
+                    onChange={(showNativeBrowseMessages) => updateSettings({ showNativeBrowseMessages } as typeof settings)}
+                    aria-label="Show browse messages on chat top bar"
+                  />
+                </div>
+              </>
+            )}
+            <div className={styles.switchRow}>
+              <span>Opaque toolbar backdrop</span>
+              <Toggle.Switch
+                checked={isOpaqueToolbarBackdrop(settings)}
+                onChange={(opaqueToolbarBackdrop) => updateSettings({ opaqueToolbarBackdrop } as typeof settings)}
+                aria-label="Opaque toolbar backdrop"
               />
             </div>
 

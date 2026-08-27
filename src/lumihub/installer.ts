@@ -7,9 +7,10 @@ import * as cardSvc from "../services/character-card.service";
 import * as images from "../services/images.service";
 import * as gallerySvc from "../services/character-gallery.service";
 import { fetchChubGalleryUrls, fetchChubJson } from "../services/chub-api.service";
+import { fetchBotBooruGalleryUrls } from "../services/botbooru-api.service";
 import { safeFetch } from "../utils/safe-fetch";
 import { mapWithConcurrency } from "../utils/concurrency";
-import { rewriteBotBooruUrl } from "../utils/botbooru";
+import { parseBotBooruId, rewriteBotBooruUrl } from "../utils/botbooru";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import * as wbSvc from "../services/world-books.service";
@@ -92,13 +93,29 @@ export async function installCharacter(
 
     // Stamp install source metadata for manifest tracking
     if (result.success && result.characterId) {
-      stampInstallSource(userId, result.characterId, payload);
+      const characterId = result.characterId;
+      stampInstallSource(userId, characterId, payload);
 
-      // Download and import gallery images (best-effort, non-blocking)
-      if (payload.source !== "chub" && payload.galleryImageUrls && payload.galleryImageUrls.length > 0) {
-        importGalleryFromUrls(userId, result.characterId, payload.galleryImageUrls).catch((err) => {
-          console.warn("[LumiHub Installer] Gallery import failed:", err);
-        });
+      // Download and import gallery images (best-effort, non-blocking). When
+      // LumiHub points at BotBooru but does not supply images itself, discover
+      // the post's public mini-gallery directly from BotBooru.
+      if (payload.source !== "chub") {
+        const suppliedUrls = payload.galleryImageUrls ?? [];
+        const botBooruId = payload.importUrl ? parseBotBooruId(payload.importUrl) : null;
+        if (suppliedUrls.length > 0 || botBooruId) {
+          void (async () => {
+            const galleryUrls = suppliedUrls.length > 0
+              ? suppliedUrls
+              : botBooruId
+                ? await fetchBotBooruGalleryUrls(botBooruId)
+                : [];
+            if (galleryUrls.length > 0) {
+              await importGalleryFromUrls(userId, characterId, galleryUrls);
+            }
+          })().catch((err) => {
+            console.warn("[LumiHub Installer] Gallery import failed:", err);
+          });
+        }
       }
     }
 
@@ -318,7 +335,7 @@ async function installFromUrl(
     eventBus.emit(EventType.LUMIHUB_INSTALL_COMPLETED, {
       characterId: character.id,
       characterName: final?.name || payload.characterName,
-      source: "lumihub",
+      source: payload.source,
     }, userId);
 
     return {
@@ -349,7 +366,7 @@ async function installFromUrl(
     eventBus.emit(EventType.LUMIHUB_INSTALL_COMPLETED, {
       characterId: character.id,
       characterName: final?.name || payload.characterName,
-      source: "lumihub",
+      source: payload.source,
     }, userId);
 
     return {
@@ -382,7 +399,7 @@ async function installFromUrl(
   eventBus.emit(EventType.LUMIHUB_INSTALL_COMPLETED, {
     characterId: character.id,
     characterName: final?.name || payload.characterName,
-    source: "lumihub",
+    source: payload.source,
   }, userId);
 
   return {
@@ -527,7 +544,7 @@ export async function installWorldbook(
   try {
     let importData: { name: string; description: string; entries: any[] };
 
-    if (payload.source === "lumihub" && payload.worldbookData) {
+    if ((payload.source === "lumihub" || payload.source === "illarin") && payload.worldbookData) {
       // Inline worldbook data from LumiHub
       importData = payload.worldbookData;
     } else if (payload.source === "chub" && payload.importUrl) {
@@ -641,7 +658,7 @@ export async function installTheme(
     eventBus.emit(EventType.LUMIHUB_INSTALL_COMPLETED, {
       characterId: payload.themeId,
       characterName: payload.themeName,
-      source: "lumihub",
+      source: payload.source,
       type: "theme",
     }, userId);
 
@@ -709,8 +726,10 @@ export async function installPreset(
     // the immutable Hub id, then use that same slug identity as a constrained
     // fallback so a re-created/migrated Hub listing still updates the installed
     // row instead of producing a second local copy.
-    const existing = presetsSvc.findPresetByLumihubId(userId, payload.presetId)
-      ?? (presetSlug ? presetsSvc.findLumihubPresetBySlug(userId, presetSlug) : null);
+    const existing = payload.source === "illarin"
+      ? presetsSvc.findPresetByIllarinAssetId(userId, payload.presetId)
+      : presetsSvc.findPresetByLumihubId(userId, payload.presetId)
+        ?? (presetSlug ? presetsSvc.findLumihubPresetBySlug(userId, presetSlug) : null);
     const existingPassthroughMetadata = existing
       ? extractPresetPassthroughMetadata({ metadata: existing.metadata })
       : {};
@@ -775,6 +794,12 @@ export async function installPreset(
     const incomingSamplerOverrides = isPlainObject(p.samplerOverrides) ? p.samplerOverrides : {};
     const incomingCustomBody = isPlainObject(p.customBody) ? p.customBody : {};
     const incomingPromptVariables = isPlainObject(p.promptVariables) ? p.promptVariables : {};
+    const coverUrl =
+      typeof exported.cover_url === "string" ? exported.cover_url
+      : typeof exported.coverUrl === "string" ? exported.coverUrl
+      : typeof p.coverUrl === "string" ? p.coverUrl
+      : typeof p.cover_url === "string" ? p.cover_url
+      : null;
     const samplerOverrides = existing && isPlainObject(existing.parameters?.samplerOverrides)
       ? existing.parameters.samplerOverrides
       : incomingSamplerOverrides;
@@ -801,9 +826,11 @@ export async function installPreset(
       lastProfileKey: typeof p.lastProfileKey === "string" ? p.lastProfileKey : null,
       promptVariables,
       compatibility: isPlainObject(exported.compatibility) ? exported.compatibility : {},
-      coverUrl: typeof exported.cover_url === "string" ? exported.cover_url : null,
-      _lumiverse_install_source: "lumihub",
-      _lumiverse_lumihub_id: payload.presetId,
+      coverUrl,
+      _lumiverse_install_source: payload.source,
+      ...(payload.source === "illarin"
+        ? { _lumiverse_illarin_asset_id: payload.presetId }
+        : { _lumiverse_lumihub_id: payload.presetId }),
       _lumiverse_preset_version: presetVersion,
       _lumiverse_preset_slug: presetSlug,
       _lumiverse_preset_creator: presetCreator,
@@ -827,22 +854,34 @@ export async function installPreset(
     const importedMetadata = scrubPresetMetadata(authoredMetadata);
 
     const importedRegexScripts = extractPresetRegexScripts(exported);
-    const presetInput = parsePortablePresetPayload({
-      name,
-      provider: "loom",
-      parameters: {
-        samplerOverrides,
-        customBody,
-      },
-      prompt_order: materializedBlocks,
-      prompts: {
-        promptBehavior: isPlainObject(p.promptBehavior) ? p.promptBehavior : {},
-        completionSettings: isPlainObject(p.completionSettings) ? p.completionSettings : {},
-        advancedSettings: isPlainObject(p.advancedSettings) ? p.advancedSettings : {},
-      },
-      metadata: importedMetadata,
-      regex_scripts: importedRegexScripts,
-    });
+    let presetInput: ReturnType<typeof parsePortablePresetPayload>;
+    try {
+      presetInput = parsePortablePresetPayload({
+        name,
+        provider: "loom",
+        parameters: {
+          samplerOverrides,
+          customBody,
+        },
+        prompt_order: materializedBlocks,
+        prompts: {
+          promptBehavior: isPlainObject(p.promptBehavior) ? p.promptBehavior : {},
+          completionSettings: isPlainObject(p.completionSettings) ? p.completionSettings : {},
+          advancedSettings: isPlainObject(p.advancedSettings) ? p.advancedSettings : {},
+        },
+        metadata: importedMetadata,
+        regex_scripts: importedRegexScripts,
+      });
+    } catch (error) {
+      if (
+        payload.source === "illarin"
+        && error instanceof Error
+        && error.message === "AGENT_RUNTIME_PORTABLE_REGEX_INVALID"
+      ) {
+        throw new Error("Illarin preset regex import was incomplete", { cause: error });
+      }
+      throw error;
+    }
     const { agent_config: _portableAgentConfig, ...ordinaryPresetInput } = presetInput;
 
     // A runtime envelope is an authenticated portable wire contract. Parse it
@@ -871,11 +910,63 @@ export async function installPreset(
       eventBus.emit(EventType.PRESET_CHANGED, { id: saved.id, preset: saved }, userId);
     }
 
+    if (!importedRuntimeEnvelope) {
+      // Preset-bound regex scripts ride at the top level of a LumiHub export or
+      // inside Illarin's raw preset document. On update, preserve older remotely
+      // attributed versions as disabled history and replace only an existing copy
+      // of the incoming version. Folder names are never used as ownership, so
+      // same-named local folders are untouched.
+      try {
+        const previousVersion = typeof existing?.metadata?._lumiverse_preset_version === "string"
+          ? existing.metadata._lumiverse_preset_version
+          : null;
+        if (payload.source === "illarin") {
+          const previousAssetId = typeof existing?.metadata?._lumiverse_illarin_asset_id === "string"
+            ? existing.metadata._lumiverse_illarin_asset_id
+            : typeof existing?.metadata?._lumiverse_lumihub_id === "string"
+              ? existing.metadata._lumiverse_lumihub_id
+              : null;
+          regexSvc.installIllarinPresetRegexScripts(userId, {
+            presetId: saved.id,
+            presetName: saved.name,
+            assetId: payload.presetId,
+            presetVersion,
+            scripts: importedRegexScripts,
+            previous: existing ? {
+              assetId: previousAssetId,
+              version: previousVersion,
+              presetName: existing.name,
+            } : null,
+          });
+        } else {
+          regexSvc.installLumiHubPresetRegexScripts(userId, {
+            presetId: saved.id,
+            presetName: saved.name,
+            hubPresetId: payload.presetId,
+            presetVersion,
+            scripts: importedRegexScripts,
+            previous: existing ? {
+              hubPresetId: typeof existing.metadata?._lumiverse_lumihub_id === "string"
+                ? existing.metadata._lumiverse_lumihub_id
+                : null,
+              version: previousVersion,
+              presetName: existing.name,
+            } : null,
+          });
+        }
+        if (importedRegexScripts.length > 0 && presetsSvc.reconcileActiveLoomPreset(userId) === saved.id) {
+          regexSvc.activatePresetBoundRegexScripts(userId, saved.id);
+        }
+      } catch (err) {
+        console.warn(`[${payload.source === "illarin" ? "Illarin" : "LumiHub"} Installer] Preset regex import failed:`, err);
+        if (payload.source === "illarin") throw err;
+      }
+    }
 
     eventBus.emit(EventType.LUMIHUB_INSTALL_COMPLETED, {
       characterId: saved.id,
       characterName: saved.name,
-      source: "lumihub",
+      source: payload.source,
       type: "preset",
     }, userId);
 
@@ -886,7 +977,7 @@ export async function installPreset(
       presetName: saved.name,
     };
   } catch (err: any) {
-    console.error("[LumiHub Installer] Preset install error:", err);
+    console.error(`[${payload.source === "illarin" ? "Illarin" : "LumiHub"} Installer] Preset install error:`, err);
     return { requestId, success: false, error: err.message || "Unknown error during preset install" };
   }
 }

@@ -87,10 +87,6 @@ async function applySchema(): Promise<void> {
   const db = getDb();
   db.run("PRAGMA foreign_keys = ON");
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "106_agent_turn_workspace.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "115_work_alpha1_workspace.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "120_cognition_task_provenance.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "122_persistent_workspace_chat_detach.sql")).text());
 }
 
 function seed(): void {
@@ -2055,7 +2051,7 @@ describe("turn workspace validators and CAS operations", () => {
     expect(second.id).toBe(first.id);
     expect(getDb().query("SELECT published_reference_count FROM agent_artifact_blobs WHERE user_id = ? AND digest = ?").get(USER, BLOB_DIGEST)).toEqual({ published_reference_count: 1 });
   });
-  test("rejects omitted-revision replay when an immutable copy diverges from the source selection", async () => {
+  test("rejects omitted-revision replay when an immutable copy diverges from the source selection", () => {
     const fixture = persistentFixture("publication-copy-replay-fence");
     const sourceId = "publication-copy-replay-fence-source";
     insertOperationalArtifact(fixture.persistent.id, sourceId);
@@ -2068,7 +2064,6 @@ describe("turn workspace validators and CAS operations", () => {
     getDb().query(
       "UPDATE persistent_workspace_publications SET copy_json = ?, copy_digest = ? WHERE publication_id = ?",
     ).run(corruptedCopy, corruptedDigest, first.id);
-    getDb().run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "122_persistent_workspace_chat_detach.sql")).text());
     expectWorkspaceError("stale_revision", () => publishPersistentWorkspaceSelection(
       persistentPublicationInput(fixture.persistent.id, first.revision, "artifact", sourceId),
     ));

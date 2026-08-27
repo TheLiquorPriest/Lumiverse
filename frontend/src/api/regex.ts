@@ -103,4 +103,9 @@ export const regexApi = {
   reportPerformance(id: string, payload: { elapsed_ms: number; timed_out?: boolean; threshold_ms?: number; source?: RegexPerformanceMetadata['source'] }) {
     return post<RegexScript>(`/regex-scripts/${id}/report-performance`, payload)
   },
+
+  // `quarantined: false` is the clear path — the backend deletes the key.
+  reportEvidence(id: string, payload: { quarantined?: boolean }) {
+    return post<RegexScript>(`/regex-scripts/${id}/report-evidence`, payload)
+  },
 }

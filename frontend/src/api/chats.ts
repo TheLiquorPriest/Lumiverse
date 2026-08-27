@@ -7,6 +7,26 @@ import type {
 import type { AgentActivityRunV1 } from '@/types/agent-runtime'
 import type { RegexActionEffect } from '@/types/regex'
 
+export interface EditAndSendInput {
+  messageId: string
+  content: string
+  expectedVersion: number
+  requestId: string
+  branchChatOnEditAndSend?: boolean
+}
+
+export interface EditAndSendResult {
+  branchChatId: string
+  editedMessageId: string
+  immediateAssistantId: string | null
+  generationCursor: {
+    generationId: string
+    chatId: string
+    requestId: string
+    mode: 'swipe' | 'normal'
+  }
+}
+
 export type ChatAppearanceAction =
   | { type: 'avatar'; avatar_entry_id: string; character_id?: string }
   | { type: 'field'; field: 'description' | 'personality' | 'scenario'; variant_id: string | null; character_id?: string }
@@ -187,6 +207,16 @@ export const chatsApi = {
 
   getTree(chatId: string) {
     return get<ChatTreeNode>(`/chats/${chatId}/tree`)
+  },
+
+  /**
+   * Apply an edit and durably dispatch generation, either in a new branch or
+   * in place according to branchChatOnEditAndSend. When a branch is returned,
+   * the client must navigate to it and recover its generation; it must not
+   * update the source message or start a second generation itself.
+   */
+  editAndSend(chatId: string, input: EditAndSendInput, options?: RequestOptions) {
+    return post<EditAndSendResult>(`/chats/${chatId}/edit-and-send`, input, options)
   },
 
   importChat(characterId: string, exportData: { chat: any; messages: any[] }) {

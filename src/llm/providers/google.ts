@@ -19,6 +19,7 @@ import {
   GOOGLE_SEARCH_HANDLED_PARAMS,
   GOOGLE_SEARCH_PARAMETERS,
 } from "./google-search";
+import { splitLeadingSystemMessagePrefix } from "../system-message-prefix";
 
 /**
  * Delegate provider-controlled arguments to the strict shared parser while
@@ -255,7 +256,7 @@ export class GoogleProvider implements LlmProvider {
         throw new ProviderProtocolError("Gemini thought marker is malformed");
       }
       if (p.thoughtSignature !== undefined && !p.functionCall) {
-        throw new ProviderProtocolError("Gemini thought signature must accompany a functionCall");
+        thoughtSignatures.add(p.thoughtSignature, this.displayName);
       }
       if (p.thought) {
         if (typeof p.text !== "string") throw new ProviderProtocolError("Gemini reasoning part is malformed");
@@ -284,6 +285,10 @@ export class GoogleProvider implements LlmProvider {
     if (candidate.finishReason !== undefined && typeof candidate.finishReason !== "string") {
       throw new ProviderProtocolError("Gemini finishReason must be a string");
     }
+    const thoughtSignature = this.getNonToolThoughtSignature(
+      parts,
+      request.parameters?._replay_thought_signatures === true,
+    );
 
     const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
     const groundingMetadata = candidate.groundingMetadata ?? data.groundingMetadata;
@@ -293,6 +298,7 @@ export class GoogleProvider implements LlmProvider {
       reasoning: reasoning || undefined,
       finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
       tool_calls: toolCalls,
+      ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
       usage: parseGeminiUsageMetadata(data.usageMetadata, this.displayName, groundingMetadata),
     };
   }
@@ -321,6 +327,7 @@ export class GoogleProvider implements LlmProvider {
 
     const sse = createBoundedSseReader(res, request.signal, {
       maxResponseBytes: request.receiveLimitBytes,
+      requireTerminal: false,
     });
     const toolCallBuffer = new Map<number, {
       name: string;
@@ -332,6 +339,8 @@ export class GoogleProvider implements LlmProvider {
     const seenNativeIds = new Set<string>();
     let lastNewToolIndex = -1;
     const thoughtSignatures = new GeminiThoughtSignatureAccumulator();
+    let terminalFinishReason: string | undefined;
+    let finalUsage: StreamChunk["usage"];
 
     for await (const event of sse) {
       if (request.signal?.aborted) {
@@ -368,7 +377,7 @@ export class GoogleProvider implements LlmProvider {
           throw new ProviderProtocolError("Gemini thought marker is malformed");
         }
         if (part.thoughtSignature !== undefined && !part.functionCall) {
-          throw new ProviderProtocolError("Gemini thought signature must accompany a functionCall");
+          thoughtSignatures.add(part.thoughtSignature, this.displayName);
         }
         if (part.thought) {
           if (typeof part.text !== "string") throw new ProviderProtocolError("Gemini reasoning part is malformed");
@@ -458,22 +467,49 @@ export class GoogleProvider implements LlmProvider {
             thought_signature: call.thoughtSignature,
           }))
         : undefined;
+      const thoughtSignature = this.getNonToolThoughtSignature(
+        parts ?? [],
+        request.parameters?._replay_thought_signatures === true,
+      );
 
       if (finishReason) {
-        sse.markTerminal();
+        terminalFinishReason = toolCalls
+          ? "tool_calls"
+          : finishReason === "STOP" ? "stop" : finishReason;
+      }
+      if (usage) finalUsage = usage;
+
+      if (text || reasoning || thoughtSignature) {
         yield {
           token: text,
           reasoning: reasoning || undefined,
-          finish_reason: toolCalls ? "tool_calls" : finishReason,
-          tool_calls: toolCalls,
+          ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
           usage,
         };
-      } else if (text || reasoning || usage) {
-        yield { token: text, reasoning: reasoning || undefined, usage };
-      } else if (toolCalls) {
-        yield { token: "", tool_calls: toolCalls };
+      } else if (usage) {
+        yield { token: "", usage };
       }
     }
+
+    if (!terminalFinishReason) {
+      throw new ProviderProtocolError("Gemini stream ended without a finish reason");
+    }
+    const toolCalls = toolCallBuffer.size > 0
+      ? [...toolCallBuffer.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([, call]) => ({
+          name: call.name,
+          args: call.args,
+          call_id: call.callId,
+          thought_signature: call.thoughtSignature,
+        }))
+      : undefined;
+    yield {
+      token: "",
+      finish_reason: terminalFinishReason,
+      tool_calls: toolCalls,
+      usage: finalUsage,
+    };
   }
 
   async validateKey(apiKey: string, apiUrl: string): Promise<boolean> {
@@ -503,12 +539,39 @@ export class GoogleProvider implements LlmProvider {
   }
 
   /** Format message content into Google Gemini parts array, handling multipart (vision/audio) content. */
-  private formatParts(m: LlmMessage, toolNameById: Map<string, string>): any[] {
-    if (typeof m.content === "string") return [{ text: m.content }];
-    return m.content.map((part: LlmMessagePart) => {
+  private getNonToolThoughtSignature(parts: any[], enabled: boolean): string | undefined {
+    if (!enabled) return undefined;
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index];
+      if (!part?.functionCall && typeof part?.thoughtSignature === "string") {
+        return part.thoughtSignature;
+      }
+    }
+    return undefined;
+  }
+
+  private formatParts(
+    m: LlmMessage,
+    toolNameById: Map<string, string>,
+    replayThoughtSignatures: boolean,
+  ): any[] {
+    if (typeof m.content === "string") {
+      return [{
+        text: m.content,
+        ...(m.role === "assistant" && replayThoughtSignatures && m.thought_signature
+          ? { thoughtSignature: m.thought_signature }
+          : {}),
+      }];
+    }
+    const formatted = m.content.map((part: LlmMessagePart) => {
       switch (part.type) {
         case "text":
-          return { text: part.text };
+          return {
+            text: part.text,
+            ...(m.role === "assistant" && replayThoughtSignatures && part.thought_signature
+              ? { thoughtSignature: part.thought_signature }
+              : {}),
+          };
         case "image":
         case "audio":
           return { inlineData: { mimeType: part.mime_type, data: part.data } };
@@ -529,6 +592,13 @@ export class GoogleProvider implements LlmProvider {
           return { text: "" };
       }
     });
+    if (m.role === "assistant" && replayThoughtSignatures && m.thought_signature) {
+      const target = [...formatted].reverse().find((part) =>
+        Object.hasOwn(part, "text") || Object.hasOwn(part, "inlineData"),
+      );
+      if (target) target.thoughtSignature = m.thought_signature;
+    }
+    return formatted;
   }
 
   private buildToolNameMap(messages: readonly LlmMessage[]): Map<string, string> {
@@ -542,9 +612,9 @@ export class GoogleProvider implements LlmProvider {
     return map;
   }
 
-  /** Keys that are internal to Lumiverse and should never be sent to APIs. */
+  /** Keys that are internal to Lumiverse and should never be sent to any provider API. */
   private static readonly INTERNAL_PARAMS = new Set([
-    "max_context_length", "_include_usage", "_streaming",
+    "max_context_length", "_include_usage", "_streaming", "_replay_thought_signatures",
   ]);
   /** Tool controls are scrubbed only for host-owned feature modes. */
   private static readonly TOOL_CONTROL_PARAMS = new Set([
@@ -562,10 +632,13 @@ export class GoogleProvider implements LlmProvider {
   private buildBody(request: GenerationRequest): any {
     const params = request.parameters || {};
 
-    // Google uses a different message format
-    const systemMessages = request.messages.filter((m) => m.role === "system");
-    const otherMessages = request.messages.filter((m) => m.role !== "system");
+    // Gemini has one top-level systemInstruction, so lift only the contiguous
+    // leading prefix. Later system messages are mapped to user-role contents
+    // at their assembled positions instead of being hoisted out of history.
+    const { prefix: systemMessages, remainder: otherMessages } =
+      splitLeadingSystemMessagePrefix(request.messages);
     const toolNameById = this.buildToolNameMap(request.messages);
+    const replayThoughtSignatures = params._replay_thought_signatures === true;
     const functionTools = request.tools ?? [];
     const hasFunctionDeclarations = functionTools.length > 0;
     const googleSearchTool = buildGoogleSearchTool(
@@ -578,7 +651,7 @@ export class GoogleProvider implements LlmProvider {
     const body: any = {
       contents: otherMessages.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
-        parts: this.formatParts(m, toolNameById),
+        parts: this.formatParts(m, toolNameById, replayThoughtSignatures),
       })),
     };
 
@@ -666,7 +739,9 @@ export class GoogleProvider implements LlmProvider {
       for (const entry of body.contents) {
         if (entry.role === "model") {
           for (const part of entry.parts) {
-            part.thoughtSignature = "context_engineering_is_the_way_to_go";
+            if (!part.thoughtSignature) {
+              part.thoughtSignature = "context_engineering_is_the_way_to_go";
+            }
           }
         }
       }

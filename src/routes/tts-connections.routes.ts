@@ -28,7 +28,8 @@ function qwenVoiceMutationStatus(
 
 /** List all TTS providers with capabilities */
 app.get("/providers", (c) => {
-  const providers = getTtsProviderList().map((p) => ({
+  const userId = c.get("userId");
+  const providers = getTtsProviderList(userId).map((p) => ({
     id: p.name,
     name: p.displayName,
     capabilities: p.capabilities,

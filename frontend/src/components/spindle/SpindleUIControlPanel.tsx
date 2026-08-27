@@ -6,6 +6,7 @@ import useIsMobile from '@/hooks/useIsMobile'
 import { resolveDockPanelEdge } from '@/lib/spindle/dock-placement'
 import styles from './SpindleUIControlPanel.module.css'
 import clsx from 'clsx'
+import { filterEnabledFrontendContributions } from '@/lib/spindle/frontend-extension-availability'
 
 export default function SpindleUIControlPanel() {
   const { t } = useTranslation('shared', { keyPrefix: 'spindle' })
@@ -13,23 +14,28 @@ export default function SpindleUIControlPanel() {
   const floatWidgets = useStore((s) => s.floatWidgets)
   const dockPanels = useStore((s) => s.dockPanels)
   const appMounts = useStore((s) => s.appMounts)
+  const extensions = useStore((s) => s.extensions)
   const hiddenPlacements = useStore((s) => s.hiddenPlacements)
   const togglePlacementVisibility = useStore((s) => s.togglePlacementVisibility)
   const showAllPlacements = useStore((s) => s.showAllPlacements)
   const hideAllPlacements = useStore((s) => s.hideAllPlacements)
   const dockPanelDesktopSide = useStore((s) => s.spindleSettings.dockPanelDesktopSide)
   const isMobile = useIsMobile()
+  const enabledDrawerTabs = filterEnabledFrontendContributions(drawerTabs, extensions)
+  const enabledFloatWidgets = filterEnabledFrontendContributions(floatWidgets, extensions)
+  const enabledDockPanels = filterEnabledFrontendContributions(dockPanels, extensions)
+  const enabledAppMounts = filterEnabledFrontendContributions(appMounts, extensions)
 
   const allItems = [
-    ...drawerTabs.map((tab) => ({ id: tab.id, label: tab.title, kind: t('drawerTab'), ext: tab.extensionId })),
-    ...floatWidgets.map((w) => ({ id: w.id, label: w.tooltip || t('floatWidget'), kind: t('floatWidget'), ext: w.extensionId })),
-    ...dockPanels.map((p) => ({
+    ...enabledDrawerTabs.map((tab) => ({ id: tab.id, label: tab.title, kind: t('drawerTab'), ext: tab.extensionId })),
+    ...enabledFloatWidgets.map((w) => ({ id: w.id, label: w.tooltip || t('floatWidget'), kind: t('floatWidget'), ext: w.extensionId })),
+    ...enabledDockPanels.map((p) => ({
       id: p.id,
       label: p.title,
       kind: t('dockPanel', { edge: resolveDockPanelEdge(p.edge, dockPanelDesktopSide, isMobile) }),
       ext: p.extensionId,
     })),
-    ...appMounts.map((m) => ({ id: m.id, label: t('appMount'), kind: t('appMount'), ext: m.extensionId })),
+    ...enabledAppMounts.map((m) => ({ id: m.id, label: t('appMount'), kind: t('appMount'), ext: m.extensionId })),
   ]
 
   if (allItems.length === 0) return null

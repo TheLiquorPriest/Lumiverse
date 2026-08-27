@@ -33,6 +33,7 @@ import {
   frontendAuthorityRowFor,
   type AuthorityRow,
 } from './frontend-authority-map'
+import { filterEnabledFrontendContributions } from './frontend-extension-availability'
 
 export interface HostSurface {
   kind: HostSurfaceKind
@@ -251,7 +252,11 @@ function defaultRuntime(
     },
     navigate: (path) => { void router.navigate(path) },
     setEditingCharacterId: (id) => useStore.getState().setEditingCharacterId(id),
-    openWorldBookEditor: (id) => useStore.getState().openModal('worldBookEditor', { bookId: id }),
+    openWorldBookEditor: (id, entryId) => {
+      const state = useStore.getState()
+      state.setPendingWorldBookEditEntryId(entryId ?? null)
+      state.openModal('worldBookEditor', { bookId: id })
+    },
     invokeInputBarAction: async (id) => {
       const action = getInputAction(id)
       if (!action) throw new Error(`HOST_ACTION_UNMAPPED:input_bar_action:${id}`)
@@ -291,14 +296,18 @@ function permissionError(permission: string, id: string): Error {
 /** Create the generation-scoped H4 host catalog and invoker. */
 export function createHostSurfaceAPI(options: HostSurfaceAPIFactoryOptions): HostSurfaceAPI {
   const assertActive = options.assertActive ?? (() => {})
-  const getInputs = options.getInputs ?? (() => ({
-    ...options,
-    userRole: useStore.getState().user?.role ?? null,
-    settingsTabs: (useStore.getState() as unknown as { settingsTabs?: readonly SettingsTabEntry[] }).settingsTabs,
-    extensionTabs: useStore.getState().drawerTabs,
-    extensionCommands: useStore.getState().extensionCommands,
-    inputBarActions: useStore.getState().inputBarActions,
-  }))
+  const getInputs = options.getInputs ?? (() => {
+    const state = useStore.getState()
+    const extensions = state.extensions
+    return {
+      ...options,
+      userRole: state.user?.role ?? null,
+      settingsTabs: filterEnabledFrontendContributions(state.settingsTabs, extensions) as unknown as readonly SettingsTabEntry[],
+      extensionTabs: filterEnabledFrontendContributions(state.drawerTabs, extensions),
+      extensionCommands: filterEnabledFrontendContributions(state.extensionCommands, extensions),
+      inputBarActions: filterEnabledFrontendContributions(state.inputBarActions, extensions),
+    }
+  })
   const getGranted = options.getGrantedPermissions ?? (() => [])
   const targetHandlers = new Map<string, HostSurfaceTargetHandler>()
   const subscribers = new Set<(surfaces: HostSurface[]) => void>()

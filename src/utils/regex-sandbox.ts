@@ -1,4 +1,8 @@
-import { runRegexInIsolate, shutdownRegexIsolatePool } from "../services/isolate-pool";
+import {
+  releaseIdleRegexIsolatePool,
+  runRegexInIsolate,
+  shutdownRegexIsolatePool,
+} from "../services/isolate-pool";
 import type { RegexIsolateRequest } from "../services/isolate-pool";
 import {
   isRegexValidationErrorCode,
@@ -17,6 +21,7 @@ import {
  */
 const DEFAULT_TIMEOUT_MS = 500;
 
+
 export class RegexTimeoutError extends RegexLimitError {
   constructor(public readonly timeoutMs: number) {
     super("worker_timed_out", `Regex evaluation exceeded ${timeoutMs}ms and was aborted`);
@@ -34,11 +39,18 @@ export class RegexSandboxError extends Error {
   }
 }
 
+export class RegexWorkerStartupTimeoutError extends RegexSandboxError {
+  constructor(public readonly timeoutMs: number) {
+    super(`Regex worker did not acknowledge the request within ${timeoutMs}ms`);
+    this.name = "RegexWorkerStartupTimeoutError";
+  }
+}
+
 export interface SandboxMatch {
   fullMatch: string;
   index: number;
   groups: (string | undefined)[];
-  namedGroups?: Record<string, string>;
+  namedGroups?: Record<string, string | undefined>;
 }
 
 export interface SandboxCaptureReplacement {
@@ -62,9 +74,22 @@ function getTimeoutMs(timeoutMs: number, deadlineAt?: number): number {
   return Math.min(timeoutMs, deadlineAt - Date.now());
 }
 function mapIsolateError(error: unknown, timeoutMs: number): Error {
-  const candidate = error as { code?: unknown; message?: unknown };
+  const candidate = error as {
+    code?: unknown;
+    message?: unknown;
+    timeoutPhase?: unknown;
+    timeoutMs?: unknown;
+  };
   const code = typeof candidate.code === "string" ? candidate.code : "worker_crashed";
   const message = typeof candidate.message === "string" ? candidate.message : "Regex isolate failed";
+  if (
+    (code === "worker_timed_out" || code === "timed_out")
+    && candidate.timeoutPhase === "startup"
+  ) {
+    return new RegexWorkerStartupTimeoutError(
+      typeof candidate.timeoutMs === "number" ? candidate.timeoutMs : timeoutMs,
+    );
+  }
   if (code === "worker_timed_out" || code === "timed_out") return new RegexTimeoutError(timeoutMs);
   if (code === "cancelled") return new RegexCancelledError(message);
   if (code === "deadline_exceeded") return new RegexDeadlineError(message);
@@ -117,6 +142,7 @@ async function runSandboxed<T>(
         userId: options?.userId ?? "regex-host",
         timeoutMs: effectiveTimeoutMs,
         signal: options?.signal,
+        deadlineAt: options?.deadlineAt,
       },
     ) as T;
   } catch (error) {
@@ -126,6 +152,10 @@ async function runSandboxed<T>(
 
 export async function shutdownRegexSandbox(): Promise<void> {
   await shutdownRegexIsolatePool();
+}
+
+export function releaseIdleRegexWorkers(): number {
+  return releaseIdleRegexIsolatePool();
 }
 
 /** Validate pattern bytes before queueing; syntax compilation stays in the isolate. */

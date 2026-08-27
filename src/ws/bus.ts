@@ -1,5 +1,12 @@
 import type { ServerWebSocket } from "bun";
-import { CLIENT_ONLY_EVENTS, EventType, type EventMessage } from "./events";
+import {
+  CLIENT_ONLY_EVENTS,
+  EventType,
+  type EventMessage,
+  type ProviderRegistryAction,
+  type ProviderRegistryChangeAction,
+  type ProviderRegistryChangedPayload,
+} from "./events";
 
 type Listener = (event: EventMessage) => void;
 
@@ -8,6 +15,11 @@ export type BufferedEventRun<T> = { value: T; events: readonly BufferedEvent[] }
 
 const CLIENT_SWEEP_INTERVAL_MS = 60_000;
 const CLIENT_TIMEOUT_MS = 120_000;
+// A suspended PWA cannot reliably run JavaScript heartbeats. Bun's native
+// WebSocket keepalive still detects a broken transport, while this longer lease
+// prevents our application-level sweep from evicting a client merely because it
+// was backgrounded. The entry is still removed immediately on a real close.
+const HIDDEN_CLIENT_TIMEOUT_MS = 30 * 60_000;
 
 function getUserTopic(userId: string): string {
   return `user:${userId}`;
@@ -36,6 +48,7 @@ class EventBus {
   private clientToSession = new Map<ServerWebSocket<unknown>, string>();
   private clientToFocusedChat = new Map<ServerWebSocket<unknown>, string>();
   private clientLastActivity = new Map<ServerWebSocket<unknown>, number>();
+  private clientVisibility = new Map<ServerWebSocket<unknown>, boolean>();
   // ── Multiplayer rooms ──
   // A socket may subscribe to one or more room topics. Peer (room-token)
   // sockets are tracked HERE but NOT in clientToUser — they never receive
@@ -102,6 +115,7 @@ class EventBus {
 
     this.clientToUser.set(ws, userId);
     this.clientLastActivity.set(ws, Date.now());
+    this.clientVisibility.set(ws, true);
 
     // Subscribe to per-user topic and system broadcast topic.
     // Bun's native pub/sub handles delivery in Zig — no JS iteration needed.
@@ -167,6 +181,7 @@ class EventBus {
     // Peer-only sockets are tracked for the sweep but never had a userId, so
     // the userId block above won't have cleared their activity entry.
     if (!userId) this.clientLastActivity.delete(ws);
+    this.clientVisibility.delete(ws);
   }
 
   /** Refresh activity timestamp for a known socket. Called on any message. */
@@ -343,7 +358,10 @@ class EventBus {
     const now = Date.now();
     let closed = 0;
     for (const [ws, lastActivity] of this.clientLastActivity) {
-      if (now - lastActivity > CLIENT_TIMEOUT_MS) {
+      const timeoutMs = this.clientVisibility.get(ws) === false
+        ? HIDDEN_CLIENT_TIMEOUT_MS
+        : CLIENT_TIMEOUT_MS;
+      if (now - lastActivity > timeoutMs) {
         try {
           ws.close(1001, "Timeout");
         } catch {
@@ -485,6 +503,8 @@ class EventBus {
       this.userVisibility.set(userId, new Map());
     }
     this.userVisibility.get(userId)!.set(sessionId, visible);
+    const client = this.sessionToClient.get(sessionId);
+    if (client) this.clientVisibility.set(client, visible);
     this.updateUserVisibilityState(userId);
   }
 
@@ -579,3 +599,71 @@ class EventBus {
 }
 
 export const eventBus = new EventBus();
+
+export interface EmitProviderRegistryChangedArgs {
+  userId: string;
+  scope: string;
+  action: ProviderRegistryChangeAction;
+  generation: number;
+  revision: number;
+  payload: unknown;
+}
+
+export interface EmitProviderRegistrySnapshotArgs {
+  userId: string;
+  scope: string;
+  generation: number;
+  revision: number;
+  payload: unknown;
+}
+
+function isScopedProviderRecipient(userId: unknown, scope: unknown): userId is string {
+  return typeof userId === "string" && userId.trim().length > 0
+    && typeof scope === "string" && scope.trim().length > 0;
+}
+
+function emitScopedProviderRegistryEvent(
+  action: ProviderRegistryAction,
+  args: {
+    userId: string;
+    scope: string;
+    generation: number;
+    revision: number;
+    payload: unknown;
+  },
+): void {
+  if (!isScopedProviderRecipient(args.userId, args.scope)) return;
+  if (!Number.isFinite(args.generation) || !Number.isFinite(args.revision)) return;
+
+  const userId = args.userId.trim();
+  const payload: ProviderRegistryChangedPayload = {
+    userId,
+    scope: args.scope.trim(),
+    action,
+    generation: args.generation,
+    revision: args.revision,
+    payload: args.payload,
+  };
+
+  // Explicit user topic — never the implicit system fallback in emit().
+  eventBus.emit(EventType.SPINDLE_PROVIDER_CHANGED, payload, userId, {
+    topic: getUserTopic(userId),
+  });
+}
+
+/**
+ * Lane 3 registry hook. Recipient-scoped to `user:${userId}`.
+ * Never broadcasts provider registration changes on the system topic.
+ */
+export function emitProviderRegistryChanged(args: EmitProviderRegistryChangedArgs): void {
+  if (args.action !== "add" && args.action !== "remove" && args.action !== "change") return;
+  emitScopedProviderRegistryEvent(args.action, args);
+}
+
+/**
+ * Lane 3 snapshot hook for reconnect resync. Same recipient scoping as
+ * {@link emitProviderRegistryChanged}.
+ */
+export function emitProviderRegistrySnapshot(args: EmitProviderRegistrySnapshotArgs): void {
+  emitScopedProviderRegistryEvent("snapshot", args);
+}

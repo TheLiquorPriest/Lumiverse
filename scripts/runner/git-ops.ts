@@ -82,7 +82,7 @@ function isProotRuntime(): boolean {
   return process.env.LUMIVERSE_IS_PROOT === "true";
 }
 
-function bunInstallCmd(): string[] {
+export function bunInstallCmd(platform: NodeJS.Platform = process.platform): string[] {
   if (isTermuxRuntime() || isProotRuntime()) {
     // Android filesystem emulation can't hardlink — copyfile is the only
     // backend that reliably installs without "Cannot find package" corruption.
@@ -90,6 +90,11 @@ function bunInstallCmd(): string[] {
     // forks lifecycle scripts (ssh2, cpu-features), producing spurious
     // CouldntReadCurrentDirectory errors. Both packages fall back to pure-JS.
     return ["bun", "install", "--backend=copyfile", "--ignore-scripts"];
+  }
+  if (platform === "win32") {
+    // Windows normally hardlinks packages from Bun's cache. Filesystem filters
+    // can leave those package directories empty even though install exits 0.
+    return ["bun", "install", "--backend=copyfile"];
   }
   return ["bun", "install"];
 }
@@ -303,13 +308,34 @@ function getUpstreamRefForSync(branchName: string): string {
   return getUpstreamRef(branchName) || `origin/${branchName}`;
 }
 
+export function hardSyncRefusalMessage(branchName: string, upstreamRef: string, ahead: number): string {
+  return `Cannot update '${branchName}' because it has ${ahead} local commit${ahead === 1 ? "" : "s"} not present on ${upstreamRef}. Push them or move them to another branch before retrying; automatic updates will not discard local commits.`;
+}
+
 function assertNoLocalCommitsBeforeHardSync(branchRef: string, branchName: string, upstreamRef: string): void {
   const ahead = getCommitsAhead(branchRef, upstreamRef);
   if (ahead > 0) {
-    throw new Error(
-      `Refusing to hard-sync '${branchName}': it is ${ahead} commit${ahead === 1 ? "" : "s"} ahead of ${upstreamRef}`
-    );
+    throw new Error(hardSyncRefusalMessage(branchName, upstreamRef, ahead));
   }
+}
+
+/** Validate an update before the runner acknowledges it and stops the server. */
+export function assertUpdateCanHardSync(): void {
+  const currentBranch = getCurrentBranch();
+  if (!currentBranch || currentBranch === "HEAD") {
+    throw new Error("Unable to resolve current git branch");
+  }
+  const currentUpstream = getUpstreamRefForSync(currentBranch);
+  assertNoLocalCommitsBeforeHardSync("HEAD", currentBranch, currentUpstream);
+}
+
+/** Validate a branch switch before the runner acknowledges it and stops the server. */
+export function assertBranchCanHardSync(target: string): void {
+  if (!AVAILABLE_BRANCHES.includes(target as any)) {
+    throw new Error(`Invalid branch: ${target}. Available: ${AVAILABLE_BRANCHES.join(", ")}`);
+  }
+  const targetUpstream = getUpstreamRefForSync(target);
+  assertNoLocalCommitsBeforeHardSync(target, target, targetUpstream);
 }
 
 async function stashLocalChanges(label: string): Promise<void> {
@@ -404,6 +430,7 @@ export async function applyUpdate(
 ): Promise<void> {
   log("Preparing update...");
   const frontendDir = join(PROJECT_ROOT, "frontend");
+  assertUpdateCanHardSync();
 
   await runWithServerStopped("Update", stopServer, startServer, async () => {
     const previousHead = getHeadRef();
@@ -433,7 +460,7 @@ export async function applyUpdate(
       const summary = changedFiles ? summarizeFrontendChanges(changedFiles) : "change list unavailable";
       reportProgress?.(`Waiting for Vite build to finish${summary ? ` (${summary})` : ""}...`);
       log(`Frontend changes detected in update; waiting for Vite build (${summary}).`);
-      await rebuildFrontend(frontendDir);
+      await rebuildFrontend(frontendDir, reportProgress);
     } else {
       reportProgress?.("No frontend changes detected; restarting server...");
       log("No frontend source/config changes detected in pulled files; skipping local Vite rebuild.");
@@ -458,6 +485,7 @@ export async function switchBranch(
   if (!AVAILABLE_BRANCHES.includes(target as any)) {
     throw new Error(`Invalid branch: ${target}. Available: ${AVAILABLE_BRANCHES.join(", ")}`);
   }
+  assertBranchCanHardSync(target);
 
   const frontendDir = join(PROJECT_ROOT, "frontend");
 
@@ -488,7 +516,7 @@ export async function switchBranch(
       const summary = changedFiles ? summarizeFrontendChanges(changedFiles) : "change list unavailable";
       reportProgress?.(`Waiting for Vite build to finish${summary ? ` (${summary})` : ""}...`);
       log(`Frontend changes detected after branch switch; waiting for Vite build (${summary}).`);
-      await rebuildFrontend(frontendDir);
+      await rebuildFrontend(frontendDir, reportProgress);
     } else {
       reportProgress?.("No frontend changes detected; restarting server...");
       log("No frontend source/config changes detected after branch switch; skipping local Vite rebuild.");
@@ -541,7 +569,10 @@ export function inspectDependencyTree(dir: string): DependencyTreeState {
   const nodeModules = join(dir, "node_modules");
   const hasNodeModules = existsSync(nodeModules);
   const declaredPackages = listDeclaredInstallPackages(dir);
-  const missingPackages = declaredPackages.filter((packageName) => !existsSync(packageInstallPath(nodeModules, packageName)));
+  const missingPackages = declaredPackages.filter((packageName) => {
+    const packageDir = packageInstallPath(nodeModules, packageName);
+    return !existsSync(join(packageDir, "package.json"));
+  });
 
   return {
     hasNodeModules,
@@ -715,12 +746,46 @@ async function ensureChangedDependencies(
   }
 }
 
-export async function rebuildFrontend(frontendDir: string): Promise<void> {
+export const FRONTEND_BUILD_STEPS = [
+  {
+    label: "frontend component metadata extraction",
+    progress: "Extracting frontend component metadata...",
+    command: ["bun", "run", "extract-props"],
+  },
+  {
+    label: "frontend CSS variable extraction",
+    progress: "Extracting frontend CSS variables...",
+    command: ["bun", "run", "extract-css-vars"],
+  },
+  {
+    label: "frontend Vite bundling",
+    progress: "Building the frontend bundle with Vite...",
+    command: ["bun", "run", "scripts/build-frontend.ts"],
+  },
+] as const;
+
+export async function rebuildFrontend(
+  frontendDir: string,
+  reportProgress?: ProgressReporter,
+): Promise<void> {
   log("Rebuilding frontend...");
-  await runCommandOrThrow(["bun", "run", "build"], {
-    cwd: frontendDir,
-    timeoutMs: TIMEOUT_BUN_BUILD_MS,
-    label: "frontend build",
-  });
+  const deadline = Date.now() + TIMEOUT_BUN_BUILD_MS;
+
+  for (const step of FRONTEND_BUILD_STEPS) {
+    const timeoutMs = deadline - Date.now();
+    if (timeoutMs <= 0) {
+      throw new Error(
+        `${step.label} did not start because the frontend build exceeded its ${TIMEOUT_BUN_BUILD_MS / 1000}s timeout`,
+      );
+    }
+
+    reportProgress?.(step.progress);
+    log(step.progress);
+    await runCommandOrThrow([...step.command], {
+      cwd: frontendDir,
+      timeoutMs,
+      label: step.label,
+    });
+  }
   log("Frontend rebuilt successfully.");
 }

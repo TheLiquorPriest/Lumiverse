@@ -3,6 +3,10 @@ import { useStore } from '@/store'
 import DOMPurify from 'dompurify'
 import { actionIcon } from './InputBarExtensionActions.icons'
 import styles from './InputArea.module.css'
+import {
+  filterEnabledFrontendContributions,
+  hasEnabledFrontendExtensionId,
+} from '@/lib/spindle/frontend-extension-availability'
 
 interface InputBarExtensionActionsProps {
   onClose: () => void
@@ -11,8 +15,10 @@ interface InputBarExtensionActionsProps {
 export default function InputBarExtensionActions({ onClose }: InputBarExtensionActionsProps) {
   const { t } = useTranslation('chat')
   const inputBarActions = useStore((s) => s.inputBarActions)
+  const extensions = useStore((s) => s.extensions)
 
-  const enabledActions = inputBarActions.filter((a) => a.enabled)
+  const enabledActions = filterEnabledFrontendContributions(inputBarActions, extensions)
+    .filter((action) => action.enabled)
   if (enabledActions.length === 0) return null
 
   const grouped = new Map<string, typeof enabledActions>()
@@ -23,6 +29,7 @@ export default function InputBarExtensionActions({ onClose }: InputBarExtensionA
   }
 
   const handleClick = (action: (typeof enabledActions)[0]) => {
+    if (!hasEnabledFrontendExtensionId(useStore.getState().extensions, action.extensionId)) return
     for (const handler of action.clickHandlers) {
       try { handler() } catch { /* no-op */ }
     }

@@ -91,6 +91,37 @@ describe("OpenAICompatibleProvider structured reasoning deltas", () => {
   });
 });
 
+describe("OpenAICompatibleProvider streamed tool calls", () => {
+  test("compacts non-contiguous provider tool-call indexes", async () => {
+    const provider = new TestOpenAICompatibleProvider();
+    const originalFetch = globalThis.fetch;
+    const stream = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"extract","arguments":"{\\"value\\":1}"}}]}}]}',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ].join("\n\n") + "\n\ndata: [DONE]\n\n";
+
+    globalThis.fetch = (async () => new Response(stream, { status: 200 })) as unknown as typeof fetch;
+    try {
+      const chunks = [];
+      for await (const chunk of provider.generateStream("", "https://example.com", {
+        model: "test",
+        messages: [{ role: "user", content: "extract" }],
+        parameters: {},
+        tools: [],
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]?.tool_calls).toEqual([
+        { name: "extract", args: { value: 1 }, call_id: "call_1" },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("OpenAI reasoning_details incremental bounds", () => {
   const cap = AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES;
 
@@ -137,7 +168,6 @@ describe("OpenAI reasoning_details incremental bounds", () => {
   });
 
 });
-
 
 // Shapes per github.com/openai/openai-node ChatCompletionAssistantMessageParam +
 // ChatCompletionToolMessageParam:

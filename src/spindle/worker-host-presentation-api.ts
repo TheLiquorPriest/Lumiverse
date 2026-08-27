@@ -13,30 +13,12 @@ import { generateThemeVariables as generateThemeVariablesFn } from "../utils/the
 import * as councilSettingsSvc from "../services/council/council-settings.service";
 import { buildCouncilMemberContext } from "../services/council/tool-runtime";
 import * as packsSvc from "../services/packs.service";
+import { validateCssValue } from "./css-value-validation";
 
 const FULL_THEME_SENTINEL_KEYS = ["--lumiverse-primary", "--lumiverse-bg", "--lumiverse-text", "--lumiverse-border", "--lumiverse-fill", "--lcs-glass-bg"] as const;
 const FULL_THEME_MIN_KEYS = 40;
 const USER_PREFERENCE_KEYS = new Set(["--lcs-glass-blur", "--lcs-glass-soft-blur", "--lcs-glass-strong-blur", "--lcs-radius", "--lcs-radius-sm", "--lcs-radius-xs", "--lcs-transition", "--lcs-transition-fast", "--lumiverse-radius", "--lumiverse-radius-sm", "--lumiverse-radius-md", "--lumiverse-radius-lg", "--lumiverse-radius-xl", "--lumiverse-font-family", "--lumiverse-font-mono", "--lumiverse-font-scale", "--lumiverse-ui-scale", "--lumiverse-transition", "--lumiverse-transition-fast"]);
-const MAX_CSS_VALUE_LENGTH = 1024;
 type SpindleUserRole = "operator" | "admin" | "user";
-
-function validateCssValue(value: unknown): string | null {
-  if (value === undefined || value === null || typeof value !== "string") return "value must be a string";
-  if (value.length > MAX_CSS_VALUE_LENGTH) return `value exceeds ${MAX_CSS_VALUE_LENGTH} characters`;
-  if (value.length === 0) return null;
-  const trimmed = value.trim(); const lowered = trimmed.toLowerCase().replace(/\\\\/g, "");
-  if (/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/.test(value)) return "control characters not allowed";
-  if (/[<>]/.test(value)) return "angle brackets not allowed";
-  if (value.includes("{") || value.includes("}") || value.includes(";")) return "must be a single property value (no { } ; )";
-  if (lowered.includes("javascript:")) return "javascript: URLs not allowed";
-  if (lowered.includes("vbscript:")) return "vbscript: URLs not allowed";
-  if (lowered.includes("data:text/html")) return "data:text/html URLs not allowed";
-  if (lowered.includes("expression(")) return "CSS expression() not allowed";
-  if (lowered.startsWith("@")) return "at-rules not allowed in variable values";
-  if (/^url\(\s*['"]?\s*(?!https?:|data:image\/)/i.test(trimmed)) return "url() must point to https: or a data:image/* payload";
-  if (/image-set\(/i.test(trimmed) && !/image-set\(\s*['"]?\s*(https?:|data:image\/)/i.test(trimmed)) return "image-set() must point to https: or a data:image/* payload";
-  return null;
-}
 
 type PresentationPermission = "push_notification" | "web_search" | "app_manipulation";
 export type WorkerHostPresentationApiContext = {

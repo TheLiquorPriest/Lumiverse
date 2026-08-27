@@ -41,4 +41,16 @@ describe("databank retrieval cache invalidation", () => {
     expect(getCachedDatabankResult("user-1", "chat-1", ["bank-a"], "query", 4)).toBeNull();
     expect(getCachedDatabankResult("user-1", "chat-2", ["bank-a"], "query", 4)).toBe(result);
   });
+
+  test("evicts the least recently used result at the cache limit", () => {
+    for (let i = 0; i < 256; i += 1) {
+      setCachedDatabankResult("user-1", "chat-1", ["bank-a"], `query-${i}`, 4, result);
+    }
+
+    expect(getCachedDatabankResult("user-1", "chat-1", ["bank-a"], "query-0", 4)).toBe(result);
+    setCachedDatabankResult("user-1", "chat-1", ["bank-a"], "query-256", 4, result);
+
+    expect(getCachedDatabankResult("user-1", "chat-1", ["bank-a"], "query-0", 4)).toBe(result);
+    expect(getCachedDatabankResult("user-1", "chat-1", ["bank-a"], "query-1", 4)).toBeNull();
+  });
 });

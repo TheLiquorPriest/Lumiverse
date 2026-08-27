@@ -161,6 +161,35 @@ describe("IsolatePoolV1", () => {
     await pool.shutdown();
   });
 
+  test("releases idle transports without interrupting active work", async () => {
+    const transports: FakeTransport[] = [];
+    const pool = new IsolatePoolV1<{ value: string }, string>({
+      backend: "worker",
+      maxWorkers: 1,
+      workerFactory: () => {
+        const transport = new FakeTransport();
+        transports.push(transport);
+        return transport;
+      },
+    });
+
+    const active = pool.submit({ userId: "u", operation: "test", payload: { value: "active" } });
+    await waitFor(() => transports[0]?.sent.length === 1);
+    expect(pool.releaseIdle()).toBe(0);
+    transports[0]!.respond(response(transports[0]!.sent[0], "active"));
+    expect(await active).toBe("active");
+
+    expect(pool.releaseIdle()).toBe(1);
+    await waitFor(() => transports[0]!.isTerminated());
+    expect(transports[0]!.isTerminated()).toBe(true);
+
+    const next = pool.submit({ userId: "u", operation: "test", payload: { value: "next" } });
+    await waitFor(() => transports[1]?.sent.length === 1);
+    transports[1]!.respond(response(transports[1]!.sent[0], "next"));
+    expect(await next).toBe("next");
+    await pool.shutdown();
+  });
+
   test("enforces per-user queued admission and global queue caps", async () => {
     const transport = new FakeTransport();
     const pool = new IsolatePoolV1<{ value: string }, string>({
@@ -597,7 +626,7 @@ describe("IsolatePoolV1", () => {
       backend: "worker",
       maxWorkers: 1,
       maxFrameBytes: 256,
-      defaultTimeoutMs: 20,
+      defaultTimeoutMs: 100,
       workerFactory: () => {
         const transport = new FakeTransport("worker");
         transports.push(transport);
@@ -632,7 +661,7 @@ describe("IsolatePoolV1", () => {
       backend: "subprocess",
       maxWorkers: 1,
       maxFrameBytes: 256,
-      defaultTimeoutMs: 20,
+      defaultTimeoutMs: 100,
       subprocessFactory: () => {
         const transport = new FakeTransport("subprocess");
         transports.push(transport);

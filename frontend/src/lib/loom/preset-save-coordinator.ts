@@ -173,6 +173,111 @@ function sameJson(left: unknown, right: unknown): boolean {
   return leftKeys.every((key) => Object.hasOwn(right, key) && sameJson(left[key], right[key]))
 }
 
+const JSON_MERGE_CONFLICT = Symbol('json-merge-conflict')
+const JSON_MERGE_MISSING = Symbol('json-merge-missing')
+type JsonMergeSentinel = typeof JSON_MERGE_CONFLICT | typeof JSON_MERGE_MISSING
+
+function cloneMergedValue(value: unknown | typeof JSON_MERGE_MISSING): unknown | typeof JSON_MERGE_MISSING {
+  return value === JSON_MERGE_MISSING ? value : clone(value)
+}
+
+/** Conservatively merge JSON-shaped values, rejecting overlapping edits. */
+function mergeJsonValue(
+  base: unknown | typeof JSON_MERGE_MISSING,
+  local: unknown | typeof JSON_MERGE_MISSING,
+  remote: unknown | typeof JSON_MERGE_MISSING,
+): unknown | JsonMergeSentinel {
+  if (local === JSON_MERGE_MISSING || remote === JSON_MERGE_MISSING || base === JSON_MERGE_MISSING) {
+    if (local === remote) return cloneMergedValue(local)
+    if (local === base) return cloneMergedValue(remote)
+    if (remote === base) return cloneMergedValue(local)
+    return JSON_MERGE_CONFLICT
+  }
+  if (sameJson(local, remote)) return clone(local)
+  if (sameJson(local, base)) return clone(remote)
+  if (sameJson(remote, base)) return clone(local)
+  if (!isRecord(base) || !isRecord(local) || !isRecord(remote)) return JSON_MERGE_CONFLICT
+
+  const merged: Record<string, unknown> = {}
+  const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)])
+  for (const key of keys) {
+    const value = mergeJsonValue(
+      Object.hasOwn(base, key) ? base[key] : JSON_MERGE_MISSING,
+      Object.hasOwn(local, key) ? local[key] : JSON_MERGE_MISSING,
+      Object.hasOwn(remote, key) ? remote[key] : JSON_MERGE_MISSING,
+    )
+    if (value === JSON_MERGE_CONFLICT) return value
+    if (value !== JSON_MERGE_MISSING) merged[key] = value
+  }
+  return merged
+}
+
+function keyedBlocks(blocks: LoomPreset['blocks']): {
+  keys: string[]
+  values: Map<string, LoomPreset['blocks'][number]>
+} {
+  const occurrences = new Map<string, number>()
+  const keys: string[] = []
+  const values = new Map<string, LoomPreset['blocks'][number]>()
+  for (const block of blocks) {
+    const occurrence = occurrences.get(block.id) ?? 0
+    occurrences.set(block.id, occurrence + 1)
+    const key = JSON.stringify([block.id, occurrence])
+    keys.push(key)
+    values.set(key, block)
+  }
+  return { keys, values }
+}
+
+function sameSequence(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+/**
+ * Merge block-property edits when at most one side changed block ordering or
+ * membership. Duplicate legacy block ids are matched by occurrence.
+ */
+function mergePromptBlocks(
+  baseBlocks: LoomPreset['blocks'],
+  localBlocks: LoomPreset['blocks'],
+  remoteBlocks: LoomPreset['blocks'],
+): LoomPreset['blocks'] | null {
+  const base = keyedBlocks(baseBlocks)
+  const local = keyedBlocks(localBlocks)
+  const remote = keyedBlocks(remoteBlocks)
+  const targetKeys = sameSequence(local.keys, remote.keys)
+    ? local.keys
+    : sameSequence(local.keys, base.keys)
+      ? remote.keys
+      : sameSequence(remote.keys, base.keys)
+        ? local.keys
+        : null
+  if (!targetKeys) return null
+
+  const allKeys = new Set([...base.keys, ...local.keys, ...remote.keys])
+  const mergedByKey = new Map<string, LoomPreset['blocks'][number]>()
+  for (const key of allKeys) {
+    const merged = mergeJsonValue(
+      base.values.get(key) ?? JSON_MERGE_MISSING,
+      local.values.get(key) ?? JSON_MERGE_MISSING,
+      remote.values.get(key) ?? JSON_MERGE_MISSING,
+    )
+    if (merged === JSON_MERGE_CONFLICT) return null
+    if (merged !== JSON_MERGE_MISSING) {
+      mergedByKey.set(key, merged as LoomPreset['blocks'][number])
+    }
+  }
+
+  const result: LoomPreset['blocks'] = []
+  for (const key of targetKeys) {
+    const block = mergedByKey.get(key)
+    if (!block) return null
+    result.push(block)
+  }
+  if (result.length !== mergedByKey.size) return null
+  return result
+}
+
 function canonicalPersistedPayload(preset: LoomPreset): unknown {
   const { expected_cache_revision: _expectedCacheRevision, ...payload } = marshalUpdate(preset)
   return payload
@@ -696,14 +801,20 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
           }
           const latest = unmarshalPreset(latestRow)
           const current = entries.get(presetId)
-          if (
-            entry.dirty.fields.includes('blocks')
-            && !sameJson(latest.blocks, conflictBase!.blocks)
-          ) {
-            // Block arrays need block-id/property-aware merging. Until that
-            // merge exists, surface only conflicts that changed blocks
-            // remotely; unrelated persisted fields can still be rebased.
-            throw error
+          if (entry.dirty.fields.includes('blocks')) {
+            // Merge independent per-block/property edits before retrying. If
+            // an equivalent queued write already reached persistence, use it
+            // as the base so a newer local edit remains independent too.
+            const blockMergeBase = sameJson(latest.blocks, pendingSnapshot.blocks)
+              ? pendingSnapshot.blocks
+              : conflictBase!.blocks
+            const mergedBlocks = mergePromptBlocks(
+              blockMergeBase,
+              current.draft.blocks,
+              latest.blocks,
+            )
+            if (!mergedBlocks) throw error
+            current.draft = { ...current.draft, blocks: mergedBlocks }
           }
           if (scopeEpoch !== enqueueEpoch || current !== entry) {
             return clone(entry.confirmed)

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import * as svc from "../services/presets.service";
 import * as stashSvc from "../services/prompt-stash.service";
+import * as presetExportSvc from "../services/preset-export.service";
 import { PresetRevisionConflictError } from "../types/preset";
 import { AgentConfigValidationError } from "../types/agents";
 import { parsePagination } from "../services/pagination";
@@ -15,6 +16,14 @@ import { AgentConfigRevisionConflictError, duplicatePresetWithAgentConfig, encod
 import { materializePortableSealedPresetImport, PortableSealedPresetError } from "../lumihub/sealed-presets";
 
 const app = new Hono();
+const MAX_BULK_PRESET_IDS = 200;
+
+function parseBulkPresetIds(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_BULK_PRESET_IDS) return null;
+  const ids = value.filter((id): id is string => typeof id === "string" && !!id.trim()).map((id) => id.trim());
+  if (ids.length !== value.length) return null;
+  return [...new Set(ids)];
+}
 
 function userEtagScope(userId: string): string {
   return createHash("sha256").update(userId).digest("base64url");
@@ -75,6 +84,43 @@ app.get("/registry", (c) => {
   c.header("Cache-Control", REVALIDATE_PRIVATE);
   c.header("Vary", "Cookie, Accept-Encoding");
   return c.json(svc.listPresetRegistry(userId, pagination, provider, engine));
+});
+
+app.post("/bulk-delete", async (c) => {
+  const body = await c.req.json<{ ids?: unknown }>().catch(() => null);
+  const ids = body ? parseBulkPresetIds(body.ids) : null;
+  if (!ids) return c.json({ error: "ids must be a non-empty array of at most 200 strings" }, 400);
+  const deleted = ids.filter((id) => svc.deletePreset(c.get("userId"), id));
+  return c.json({ deleted });
+});
+
+app.post("/bulk-export/prepare", async (c) => {
+  const body = await c.req.json<{ ids?: unknown }>().catch(() => null);
+  const ids = body ? parseBulkPresetIds(body.ids) : null;
+  if (!ids) return c.json({ error: "ids must be a non-empty array of at most 200 strings" }, 400);
+  const prepared = presetExportSvc.preparePresetBulkExport(c.get("userId"), ids);
+  if (!prepared) return c.json({ error: "No exportable presets found" }, 404);
+  return c.json(prepared);
+});
+
+app.get("/bulk-export/:downloadId", (c) => {
+  const prepared = presetExportSvc.consumePreparedPresetExport(c.get("userId"), c.req.param("downloadId"));
+  if (!prepared) return c.json({ error: "Export session not found. Prepare the export again." }, 404);
+  const stream = presetExportSvc.buildPresetBulkExportStream(
+    prepared.userId,
+    prepared.presetIds,
+    c.req.raw.signal,
+  );
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${prepared.filename}"`,
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Transfer-Encoding": "chunked",
+      "X-Accel-Buffering": "no",
+    },
+  });
 });
 
 app.post("/", async (c) => {

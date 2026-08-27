@@ -8,7 +8,7 @@ export interface LumiHubWSMessage {
 }
 
 export interface InstallCharacterPayload {
-  source: "lumihub" | "chub";
+  source: "lumihub" | "chub" | "illarin";
   characterId: string;
   characterName: string;
   /** Full CCSv3 card JSON (for lumihub-sourced characters). */
@@ -37,7 +37,7 @@ export interface InstallResultPayload {
 }
 
 export interface InstallWorldbookPayload {
-  source: "lumihub" | "chub";
+  source: "lumihub" | "chub" | "illarin";
   worldbookId: string;
   worldbookName: string;
   worldbookCreator?: string;
@@ -56,7 +56,7 @@ export interface InstallWorldbookResultPayload {
 }
 
 export interface InstallThemePayload {
-  source: "lumihub";
+  source: "lumihub" | "illarin";
   themeId: string;
   themeName: string;
   /** Export shape returned by LumiHub's /themes/:id/export endpoint. */
@@ -72,7 +72,7 @@ export interface InstallThemeResultPayload {
 }
 
 export interface InstallPresetPayload {
-  source: "lumihub";
+  source: "lumihub" | "illarin";
   presetId: string;
   presetName: string;
   /** Latest published version label (also present at presetData.preset.presetVersion). */

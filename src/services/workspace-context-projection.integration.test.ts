@@ -31,7 +31,6 @@ async function applySchema(): Promise<void> {
   const db = getDb();
   db.run("PRAGMA foreign_keys = OFF");
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text());
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "106_agent_turn_workspace.sql")).text());
   db.run("PRAGMA foreign_keys = ON");
 }
 

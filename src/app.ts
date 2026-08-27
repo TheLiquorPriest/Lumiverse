@@ -36,6 +36,7 @@ import { embeddingsRoutes } from "./routes/embeddings.routes";
 import { tokenizersRoutes } from "./routes/tokenizers.routes";
 import { spindleOAuthRoutes } from "./routes/spindle-oauth.routes";
 import { lumihubCallbackRoute, lumihubRoutes } from "./routes/lumihub.routes";
+import { illarinRoutes } from "./routes/illarin.routes";
 import { systemRoutes } from "./routes/system.routes";
 import { migrateRoutes } from "./routes/migrate.routes";
 import { stMigrationRoutes } from "./routes/st-migration.routes";
@@ -76,6 +77,8 @@ import {
 import { authLockoutService } from "./services/auth-lockout.service";
 import { getClientIp } from "./utils/client-ip";
 import { listSsoLoginOptions } from "./services/sso-providers.service";
+import { userMediaServingHeaders } from "./utils/user-media-headers";
+import { getPublicImageFile } from "./services/images.service";
 
 const app = new Hono();
 const SIGN_IN_AUTH_PATTERN = /^\/api\/auth\/sign-in(?:\/|$)/;
@@ -431,7 +434,6 @@ if (error) {
 
 // Image gen results — unauthenticated, public access for push notifications and embeds
 app.get("/api/v1/image-gen/results/:id", async (c) => {
-  const { getPublicImageFile } = await import("./services/images.service");
   const id = c.req.param("id");
   const size = c.req.query("size") as "sm" | "lg" | undefined;
   const tier = size === "sm" || size === "lg" ? size : undefined;
@@ -441,7 +443,7 @@ app.get("/api/v1/image-gen/results/:id", async (c) => {
     headers: {
       "Cache-Control": "public, max-age=86400",
       "Content-Type": publicFile.contentType,
-      "X-Content-Type-Options": "nosniff",
+      ...userMediaServingHeaders(publicFile.contentType),
     },
   });
   return response;
@@ -509,6 +511,7 @@ app.route("/api/v1/regex-scripts", regexScriptsRoutes);
 app.route("/api/v1/characters/:characterId/expressions", expressionsRoutes);
 app.route("/api/v1/push", pushRoutes);
 app.route("/api/v1/lumihub", lumihubRoutes);
+app.route("/api/v1/illarin", illarinRoutes);
 app.route("/api/v1/memory-cortex", memoryCortexRoutes);
 app.route("/api/v1/operator", operatorRoutes);
 app.route("/api/v1/tts-connections", ttsConnectionsRoutes);

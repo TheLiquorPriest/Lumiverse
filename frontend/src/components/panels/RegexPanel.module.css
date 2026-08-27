@@ -303,6 +303,13 @@
   font-size: calc(11px * var(--lumiverse-font-scale, 1));
 }
 
+/* Keeps a recovery action (e.g. clearing a quarantine) pinned to the trailing
+   edge of a warning box so the explanatory text keeps the remaining width. */
+.warningBoxAction {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
 .fieldRow {
   display: flex;
   gap: 16px;
@@ -495,6 +502,17 @@
   text-transform: uppercase;
   letter-spacing: 0.4px;
   color: var(--lumiverse-text-dim);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderVersionBadge {
+  display: inline-flex;
+  flex-shrink: 0;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .folderCount {
@@ -535,6 +553,13 @@
 @media (any-hover: none) {
   .folderActionBtn {
     opacity: 1;
+  }
+}
+
+@media (max-width: 480px) {
+  .folderVersionBadge :global(span) {
+    padding-inline: 4px;
+    font-size: calc(9px * var(--lumiverse-font-scale, 1));
   }
 }
 

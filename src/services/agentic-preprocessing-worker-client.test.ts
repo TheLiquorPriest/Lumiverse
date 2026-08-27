@@ -52,6 +52,7 @@ function makeJob(input: RenderPreparationInputV1): ActiveIsolateJob<unknown, unk
     operation: "prepare_agent_render",
     payload: input,
     requestId: "job-request",
+    timeoutMs: 60_000,
     deadlineAt: Date.now() + 60_000,
     resolve: () => undefined,
     reject: () => undefined,

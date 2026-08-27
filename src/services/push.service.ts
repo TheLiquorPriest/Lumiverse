@@ -3,6 +3,7 @@ import { getDb } from "../db/connection";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { getVapidPrivateJWK } from "../crypto/vapid";
+import { validateHost, SSRFError } from "../utils/safe-fetch";
 import { getSetting } from "./settings.service";
 import type {
   PushSubscriptionRecord,
@@ -120,6 +121,23 @@ export async function sendPushToUser(
             },
           },
         });
+        // Re-validate at send time. Registration-time validation (HTTPS +
+        // private-range block) can be defeated later by DNS rebinding: a
+        // public hostname that flips to an internal address after signup
+        // would otherwise turn every generation into an internal POST.
+        try {
+          const parsedEndpoint = new URL(request.endpoint);
+          if (parsedEndpoint.protocol !== "https:") {
+            throw new SSRFError("Push endpoint must use HTTPS");
+          }
+          await validateHost(parsedEndpoint.hostname);
+        } catch (err) {
+          if (err instanceof SSRFError) {
+            console.warn(`[push] Skipping ${sub.id}: endpoint failed SSRF validation (${err.message})`);
+            return;
+          }
+          throw err;
+        }
 
         // Send via fetch (Bun-native, no Node http/https needed)
         const response = await fetch(request.endpoint, {

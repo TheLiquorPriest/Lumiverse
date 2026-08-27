@@ -68,6 +68,8 @@ export interface BubbleMessageDefaultProps {
   userLeft: boolean
   handleEdit: () => void
   handleSaveEdit: () => void
+  handleEditAndSend: () => void
+  editAndSendPending: boolean
   handleCancelEdit: () => void
   handleDelete: () => void
   handleToggleHidden: () => void
@@ -184,8 +186,8 @@ export default function BubbleMessageDefault({
   isEditing, editContent, setEditContent, editReasoning, setEditReasoning, showReasoningEditor,
   isUser, isActivelyStreaming, displayContent, reasoning, reasoningDuration, reasoningStartedAt, agentActivity, agentSummary,
   tokenCount, generationMetrics, avatarUrl, fullAvatarUrl, displayAvatarUrl, displayName, macroUserName, isHidden, isContextAnchor, userLeft,
-  handleEdit, handleSaveEdit, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
-  handleFork, handlePromptBreakdown,
+  handleEdit, handleSaveEdit, handleEditAndSend, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
+  handleFork, handlePromptBreakdown, editAndSendPending,
 }: BubbleMessageDefaultProps) {
   const { t } = useTranslation('chat')
   const { t: tc } = useTranslation('common')
@@ -432,6 +434,7 @@ export default function BubbleMessageDefault({
               />
             </div>
           </div>
+          <span data-spindle-mount="message_header" data-spindle-scope={`message:${message.id}:bubble:header`} style={{ display: 'contents' }} />
         </div>
 
         {(reasoning || agentActivity || agentSummary) && !isEditing && (
@@ -460,12 +463,16 @@ export default function BubbleMessageDefault({
         )}
 
         <div className={styles.content}>
+          <span data-spindle-mount="message_body_before" data-spindle-scope={`message:${message.id}:bubble:body-before`} style={{ display: 'contents' }} />
           {isEditing ? (
             <MessageEditArea
               editContent={editContent}
               onChangeContent={setEditContent}
               onSave={handleSaveEdit}
               onCancel={handleCancelEdit}
+              onEditAndSend={isUser ? handleEditAndSend : undefined}
+              messageId={message.id}
+              editAndSendDisabled={editAndSendPending}
               editReasoning={showReasoningEditor ? editReasoning : undefined}
               onChangeReasoning={showReasoningEditor ? setEditReasoning : undefined}
             />
@@ -484,6 +491,7 @@ export default function BubbleMessageDefault({
             <StreamingIndicator />
           ) : null}
         </div>
+        <span data-spindle-mount="message_body_after" data-spindle-scope={`message:${message.id}:bubble:body-after`} style={{ display: 'contents' }} />
 
         {isUser && message.extra?.attachments && message.extra.attachments.length > 0 && !isEditing && (
           <div className={styles.content}>
@@ -503,14 +511,17 @@ export default function BubbleMessageDefault({
         {!isUser && !isEditing && message.index_in_chat !== 0 && (
           <SwipeControls message={message} chatId={chatId} variant="bubble" />
         )}
+        <span data-spindle-mount="message_swipe_indicators" data-spindle-scope={`message:${message.id}:bubble:swipe-indicators`} style={{ display: 'contents' }} />
 
         {message.index_in_chat === 0 && !isUser && !isEditing && (
           <GreetingNav message={message} chatId={chatId} variant="bubble" />
         )}
+        <span data-spindle-mount="message_footer" data-spindle-scope={`message:${message.id}:bubble:footer`} style={{ display: 'contents' }} />
       </div>
 
       {!isEditing && !isSelectMode && (
         <BubbleActions
+          messageId={message.id}
           onEdit={handleEdit}
           onDelete={handleDelete}
           onToggleHidden={handleToggleHidden}

@@ -9,6 +9,7 @@ export enum EventType {
   CHARACTER_CREATED = 'CHARACTER_CREATED',
   CHARACTER_EDITED = 'CHARACTER_EDITED',
   CHARACTER_DELETED = 'CHARACTER_DELETED',
+  CHARACTER_LIBRARY_CHANGED = 'CHARACTER_LIBRARY_CHANGED',
   PERSONA_CHANGED = 'PERSONA_CHANGED',
   MESSAGE_SENT = 'MESSAGE_SENT',
   MESSAGE_EDITED = 'MESSAGE_EDITED',
@@ -68,6 +69,7 @@ export enum EventType {
 
   // World Books (lorebook editor live-sync — mirror src/ws/events.ts)
   WORLD_BOOK_CHANGED = 'WORLD_BOOK_CHANGED',
+  WORLD_BOOK_LIBRARY_CHANGED = 'WORLD_BOOK_LIBRARY_CHANGED',
   WORLD_BOOK_DELETED = 'WORLD_BOOK_DELETED',
   WORLD_BOOK_ENTRY_CHANGED = 'WORLD_BOOK_ENTRY_CHANGED',
   WORLD_BOOK_ENTRY_DELETED = 'WORLD_BOOK_ENTRY_DELETED',
@@ -83,11 +85,15 @@ export enum EventType {
   SPINDLE_BULK_UPDATE_COMPLETE = 'SPINDLE_BULK_UPDATE_COMPLETE',
   SPINDLE_FRONTEND_MSG = 'SPINDLE_FRONTEND_MSG',
   SPINDLE_FRONTEND_PROCESS = 'SPINDLE_FRONTEND_PROCESS',
+  SPINDLE_FRONTEND_RUNTIME_CAPABILITY_CHANGED = 'SPINDLE_FRONTEND_RUNTIME_CAPABILITY_CHANGED',
   SPINDLE_TOAST = 'SPINDLE_TOAST',
   MESSAGE_TAG_INTERCEPTED = 'MESSAGE_TAG_INTERCEPTED',
 
   // Spindle command palette commands
   SPINDLE_COMMANDS_CHANGED = 'SPINDLE_COMMANDS_CHANGED',
+
+  // Spindle provider registry (recipient-scoped; never a system broadcast)
+  SPINDLE_PROVIDER_CHANGED = 'SPINDLE_PROVIDER_CHANGED',
 
   // Spindle UI automation (extension navigates the user to a tab/settings/etc.)
   SPINDLE_UI_NAVIGATE = 'SPINDLE_UI_NAVIGATE',
@@ -162,6 +168,8 @@ export enum EventType {
   OPERATOR_LOG = 'OPERATOR_LOG',
   OPERATOR_STATUS = 'OPERATOR_STATUS',
   OPERATOR_PROGRESS = 'OPERATOR_PROGRESS',
+  IMAGE_THUMBNAIL_QUEUE = 'IMAGE_THUMBNAIL_QUEUE',
+
 
   // Memory Cortex
   CORTEX_REBUILD_PROGRESS = 'CORTEX_REBUILD_PROGRESS',
@@ -281,6 +289,26 @@ export interface OperatorProgressPayload {
   operation: string
   status: 'in_progress' | 'complete' | 'error'
   message: string
+}
+
+export interface ImageThumbnailQueuePayload {
+  processed: number
+  remaining: number
+  total: number
+  active: number
+  queued: number
+}
+
+export type ProviderRegistryChangeAction = 'add' | 'remove' | 'change'
+export type ProviderRegistryAction = ProviderRegistryChangeAction | 'snapshot'
+
+export interface ProviderRegistryChangedPayload {
+  userId: string
+  scope: string
+  action: ProviderRegistryAction
+  generation: number
+  revision: number
+  payload: unknown
 }
 
 export interface SpindlePreGenerationActivityPayload {
@@ -724,6 +752,10 @@ export interface MigrationFailedPayload {
 export interface WorldBookChangedPayload {
   id: string
   worldBook: import('./api').WorldBook
+}
+export interface WorldBookLibraryChangedPayload {
+  reason: string
+  imported: number
 }
 export interface WorldBookDeletedPayload {
   id: string

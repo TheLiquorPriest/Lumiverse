@@ -72,6 +72,7 @@ export interface SettingsTabState {
   iconSvg?: string
   keywords: string[]
   sections: SettingsTabSectionState[]
+  position?: string
   order: number
   sequence: number
   root: HTMLElement
@@ -157,6 +158,8 @@ export interface DockPanelState {
   iconUrl?: string
   /** Keep the requested edge instead of applying the user's dock preference. */
   respectRequestedEdge: boolean
+  /** Show the panel title while collapsed. */
+  showCollapsedTitle: boolean
   /** Extension-local persistence segment, or false to disable persistence. */
   persistGeometry?: string | false
 }

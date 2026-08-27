@@ -1,6 +1,7 @@
 import { getDb } from "../db/connection";
 import * as settingsSvc from "../services/settings.service";
 import { DEFAULT_PROMPT_BEHAVIOR } from "../services/prompt-behavior";
+import { SYSTEM_SECRET_PRINCIPAL_EMAIL } from "../services/secrets.service";
 
 export const DEFAULT_PRESET_BLOCKS = [
   {
@@ -522,9 +523,11 @@ export function seedDefaultPreset(
 }
 
 export function backfillDefaultPresets(): DefaultPresetBackfillResult {
+  // The reserved system principal is not a login account — never seed a
+  // default preset for it.
   const users = getDb()
-    .query('SELECT id FROM "user" ORDER BY createdAt ASC')
-    .all() as Array<{ id: string }>;
+    .query('SELECT id FROM "user" WHERE email IS NULL OR email != ? ORDER BY createdAt ASC')
+    .all(SYSTEM_SECRET_PRINCIPAL_EMAIL) as Array<{ id: string }>;
 
   const result: DefaultPresetBackfillResult = {
     usersScanned: users.length,

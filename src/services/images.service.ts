@@ -1,10 +1,21 @@
-import sharp from "../utils/sharp-config";
 import { getDb } from "../db/connection";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { env } from "../env";
+import { currentWorkerBudget } from "../utils/cpu-budget";
+import { classifyUserMediaContentType } from "../utils/user-media-headers";
+import {
+  convertImageToWebp,
+  readImageMetadata,
+  writeInsideAvif,
+  writeInsideWebp,
+} from "../utils/image-pipeline";
+import {
+  getSharpSettingsStatus,
+  type ThumbnailCodec,
+} from "./sharp-settings.service";
 import type { Image } from "../types/image";
-import { mkdirSync, existsSync, lstatSync, statSync, unlinkSync } from "fs";
+import { mkdirSync, existsSync, lstatSync, readdirSync, statSync, unlinkSync } from "fs";
 import { unlink } from "fs/promises";
 import { join, extname, basename } from "path";
 import {
@@ -17,6 +28,20 @@ import {
 } from "./silent-video.service";
 import * as settingsSvc from "./settings.service";
 import * as chatsSvc from "./chats.service";
+import {
+  completeImageProcessingJob,
+  describeImageProcessingRecovery,
+  discardRecoverableImageProcessingJobs,
+  listRecoverableImageProcessingJobs,
+  recordImageProcessingJob,
+  summarizeImageProcessingRecovery,
+  type ImageProcessingJobKind,
+  type ImageProcessingQueueJob,
+  type ImageProcessingQueueRecovery,
+} from "./image-processing-queue";
+
+export { describeImageProcessingRecovery };
+export type { ImageProcessingQueueRecovery };
 
 import { SERVER_IMAGE_GENERATION_PROVENANCE } from "./image-provenance";
 import { validateSafeMediaBytes, validateSafeMediaFile } from "./user-data/media-validation";
@@ -33,6 +58,73 @@ type ThumbnailSource = Buffer | string;
 
 const inflightThumbnailGenerations = new Map<string, Promise<boolean>>();
 
+interface DeferredImageJob {
+  persistId: string;
+  run: () => Promise<void>;
+}
+
+const deferredImageQueue: DeferredImageJob[] = [];
+const liveImageProcessingJobIds = new Set<string>();
+let deferredImageActive = 0;
+let deferredImageWaiters: Array<() => void> = [];
+let deferredImageWaveTotal = 0;
+let deferredImageWaveCompleted = 0;
+let lastDeferredImageStatusEmitAt = 0;
+
+const DEFERRED_IMAGE_STATUS_EMIT_MS = 150;
+
+export interface DeferredImageProcessingStatus {
+  processed: number;
+  remaining: number;
+  total: number;
+  active: number;
+  queued: number;
+}
+
+export function getDeferredImageProcessingStatus(): DeferredImageProcessingStatus {
+  const live = liveDeferredImageProcessingStatus();
+  if (live.remaining > 0) return live;
+  if (lastExternalDeferredStatus && lastExternalDeferredStatus.remaining > 0) {
+    return lastExternalDeferredStatus;
+  }
+  return lastExternalDeferredStatus ?? live;
+}
+
+let lastExternalDeferredStatus: DeferredImageProcessingStatus | null = null;
+
+export function applyExternalDeferredImageProcessingStatus(
+  status: DeferredImageProcessingStatus,
+): void {
+  lastExternalDeferredStatus = status;
+}
+
+export function setExternalThumbnailWorkActive(active: boolean): void {
+  isolatedThumbnailWorkActive = active;
+  if (!active) lastExternalDeferredStatus = null;
+}
+
+let isolatedThumbnailWorkActive = false;
+
+export function getImageProcessingRecovery(): ImageProcessingQueueRecovery {
+  if (isolatedThumbnailWorkActive) {
+    return { pending: 0, process: 0, rebuild: 0 };
+  }
+  return summarizeImageProcessingRecovery(liveImageProcessingJobIds);
+}
+
+
+function liveDeferredImageProcessingStatus(): DeferredImageProcessingStatus {
+  const queued = deferredImageQueue.length;
+  const remaining = deferredImageActive + queued;
+  return {
+    processed: deferredImageWaveCompleted,
+    remaining,
+    total: deferredImageWaveTotal,
+    active: deferredImageActive,
+    queued,
+  };
+}
+
 export type ThumbTier = "sm" | "lg";
 export type ImageSpecificity = "full" | ThumbTier;
 
@@ -40,6 +132,7 @@ export interface ImageOwnershipOptions {
   owner_extension_identifier?: string;
   owner_character_id?: string;
   owner_chat_id?: string;
+  skip_thumbnail_processing?: boolean;
   strip_audio?: boolean;
   transcode_video_codec?: NormalizedVideoCodec;
   sidecar_video_codecs?: NormalizedVideoCodec[];
@@ -72,6 +165,11 @@ export interface ImageUploadProgress {
 export interface ThumbnailSettings {
   smallSize: number;
   largeSize: number;
+}
+
+interface ThumbnailEncodingSettings {
+  codec: ThumbnailCodec;
+  quality: number;
 }
 
 function buildImageUrl(id: string, specificity: ImageSpecificity = "full"): string {
@@ -158,12 +256,20 @@ async function writeImageFile(filepath: string, data: Uint8Array): Promise<void>
 }
 
 const MIME_BY_EXT: Record<string, string> = {
+  ".apng": "image/apng",
+  ".avif": "image/avif",
+  ".bmp": "image/bmp",
+  ".gif": "image/gif",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
+  ".ico": "image/x-icon",
+  ".jfif": "image/jpeg",
   ".png": "image/png",
+  ".pjp": "image/jpeg",
+  ".pjpeg": "image/jpeg",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
-  ".gif": "image/gif",
-  ".avif": "image/avif",
   ".svg": "image/svg+xml",
   ".mp4": "video/mp4",
   ".webm": "video/webm",
@@ -180,6 +286,13 @@ function inferUploadMimeType(file: File): string {
 function replaceFileExtension(filename: string, nextExt: string): string {
   const base = filename.replace(/\.[^.]+$/, "") || "upload";
   return `${base}${nextExt}`;
+}
+
+function safeMediaValidationIdentity(filename: string, mimeType: string): { filename: string; mimeType: string } {
+  if (extname(filename).toLowerCase() === ".apng" && mimeType === "image/apng") {
+    return { filename: replaceFileExtension(filename, ".png"), mimeType: "image/png" };
+  }
+  return { filename, mimeType };
 }
 
 function uniqueVideoCodecs(codecs: readonly NormalizedVideoCodec[] | undefined): NormalizedVideoCodec[] {
@@ -204,6 +317,7 @@ function rowToImage(row: any, specificity: ImageSpecificity = "full"): Image {
     ...row,
     byte_size: row.byte_size ?? 0,
     has_thumbnail: !!row.has_thumbnail,
+    skip_thumbnail_processing: !!row.skip_thumbnail_processing,
     width: row.width ?? null,
     height: row.height ?? null,
     url: buildImageUrl(row.id, specificity),
@@ -239,14 +353,25 @@ async function deriveMediaMetadataAndThumbnails(
   if (!thumbnailSource) return { width, height, hasThumbnail };
 
   try {
-    const metadata = await sharp(thumbnailSource).metadata();
-    width = metadata.width ?? null;
-    height = metadata.height ?? null;
+    const metadata = await readImageMetadata(thumbnailSource);
+    width = metadata.width;
+    height = metadata.height;
 
     const sizes = getThumbnailSettings(userId);
+    const encoding = getThumbnailEncodingSettings();
     const [smOk, lgOk] = await Promise.all([
-      generateThumbnail(thumbnailSource, join(dir, `${id}${thumbSuffix("sm")}`), sizes.smallSize),
-      generateThumbnail(thumbnailSource, join(dir, `${id}${thumbSuffix("lg")}`), sizes.largeSize),
+      generateThumbnail(
+        thumbnailSource,
+        join(dir, `${id}${thumbSuffix("sm", encoding.codec)}`),
+        sizes.smallSize,
+        encoding,
+      ),
+      generateThumbnail(
+        thumbnailSource,
+        join(dir, `${id}${thumbSuffix("lg", encoding.codec)}`),
+        sizes.largeSize,
+        encoding,
+      ),
     ]);
     hasThumbnail = smOk || lgOk;
   } catch {
@@ -284,24 +409,47 @@ export function getThumbnailSettings(userId: string): ThumbnailSettings {
   return { smallSize: DEFAULT_SMALL_SIZE, largeSize: DEFAULT_LARGE_SIZE };
 }
 
-function thumbSuffix(tier: ThumbTier): string {
-  return `_thumb_${tier}_v2.webp`;
+function getThumbnailEncodingSettings(): ThumbnailEncodingSettings {
+  const settings = getSharpSettingsStatus().effectiveSettings;
+  const codec = settings.thumbnailCodec;
+  return {
+    codec,
+    quality: codec === "avif" ? settings.avifQuality : settings.webpQuality,
+  };
+}
+
+function thumbSuffix(tier: ThumbTier, codec: ThumbnailCodec): string {
+  return `_thumb_${tier}_v2.${codec}`;
 }
 
 function legacyThumbSuffix(tier: ThumbTier): string {
   return `_thumb_${tier}.webp`;
 }
 
+function thumbnailSuffixes(tier: ThumbTier): string[] {
+  return [thumbSuffix(tier, "webp"), thumbSuffix(tier, "avif"), legacyThumbSuffix(tier)];
+}
+
+function isThumbnailFilename(name: string): boolean {
+  return name.includes("_thumb_");
+}
+
 async function generateThumbnail(
   source: ThumbnailSource,
   outputPath: string,
-  size: number
+  size: number,
+  encoding: ThumbnailEncodingSettings,
 ): Promise<boolean> {
   try {
-    await sharp(source)
-      .resize(size, size, { fit: "inside", withoutEnlargement: true })
-      .webp({ quality: WEBP_QUALITY })
-      .toFile(outputPath);
+    if (encoding.codec === "avif") {
+      await writeInsideAvif(source, outputPath, size, size, encoding.quality, {
+        withoutEnlargement: true,
+      });
+    } else {
+      await writeInsideWebp(source, outputPath, size, size, encoding.quality, {
+        withoutEnlargement: true,
+      });
+    }
     return true;
   } catch {
     return false;
@@ -313,33 +461,47 @@ async function ensureThumbnail(
   source: ThumbnailSource,
   outputPath: string,
   size: number,
+  encoding: ThumbnailEncodingSettings,
 ): Promise<boolean> {
-  const existing = inflightThumbnailGenerations.get(cacheKey);
+  const encodingCacheKey = `${cacheKey}:${encoding.codec}:q${encoding.quality}`;
+  const existing = inflightThumbnailGenerations.get(encodingCacheKey);
   if (existing) return existing;
 
-  const job = generateThumbnail(source, outputPath, size).finally(() => {
-    inflightThumbnailGenerations.delete(cacheKey);
+  const job = generateThumbnail(source, outputPath, size, encoding).finally(() => {
+    inflightThumbnailGenerations.delete(encodingCacheKey);
   });
-  inflightThumbnailGenerations.set(cacheKey, job);
+  inflightThumbnailGenerations.set(encodingCacheKey, job);
   return job;
 }
 async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwnershipOptions): Promise<Image> {
   const id = crypto.randomUUID();
   const dir = getImagesDir();
 
+  const originalMimeType = inferUploadMimeType(file);
+  const originalFilename = file.name || `upload-${id}`;
+  const isVideo = isLikelyVideoUpload(originalMimeType, originalFilename);
+
+  // Ordinary raster uploads need no request-time transformation. Persist them
+  // immediately and let the bounded/recoverable worker queue derive metadata
+  // and thumbnails. Video uploads stay on the synchronous path because their
+  // response depends on transcoding, sidecars, and poster extraction.
+  if (!isVideo) {
+    emitImageUploadProgress(options, { phase: "received", step: 0, totalSteps: 1 });
+    const image = await uploadImageDeferredUnsafe(userId, file, options);
+    emitImageUploadProgress(options, { phase: "finalizing", step: 1, totalSteps: 1 });
+    emitImageUploadProgress(options, { phase: "completed", step: 1, totalSteps: 1 });
+    return image;
+  }
+
   const originalBuffer = Buffer.from(await file.arrayBuffer());
   let buffer = Buffer.from(originalBuffer);
-  const originalMimeType = inferUploadMimeType(file);
   let mimeType = originalMimeType;
-  const originalFilename = file.name || `upload-${id}`;
   let storedOriginalFilename = originalFilename;
   let storedExtension = extname(storedOriginalFilename).toLowerCase() || ".bin";
-  const isVideo = isLikelyVideoUpload(mimeType, storedOriginalFilename);
-  const primaryVideoCodec = isVideo ? options?.transcode_video_codec : undefined;
+  const primaryVideoCodec = options?.transcode_video_codec;
   const sidecarVideoCodecs = uniqueVideoCodecs(options?.sidecar_video_codecs)
     .filter((codec) => codec !== primaryVideoCodec);
   const totalProgressSteps = (() => {
-    if (!isVideo) return 1;
     let total = 1; // finalizing
     if (primaryVideoCodec) total += 1;
     total += sidecarVideoCodecs.length;
@@ -381,7 +543,7 @@ async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwne
 
   emitProgress("received");
 
-  if (isVideo && primaryVideoCodec) {
+  if (primaryVideoCodec) {
     advanceProgress("transcoding_primary", {
       codec: primaryVideoCodec,
       phaseProgressPct: 0,
@@ -400,7 +562,7 @@ async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwne
       const stripped = await stripAudioFromVideoBuffer(buffer, mimeType, storedOriginalFilename);
       if (stripped) buffer = Buffer.from(stripped);
     }
-  } else if (isVideo && options?.strip_audio) {
+  } else if (options?.strip_audio) {
     // Wallpaper uploads can opt into a best-effort audio-strip pass so iOS gets
     // a truly silent video without making ffmpeg a hard runtime dependency.
     const stripped = await stripAudioFromVideoBuffer(buffer, mimeType, storedOriginalFilename);
@@ -419,7 +581,7 @@ async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwne
   const filepath = join(dir, filename);
   await writeImageFile(filepath, buffer);
 
-  if (isVideo && sidecarVideoCodecs.length > 0) {
+  if (sidecarVideoCodecs.length > 0) {
     for (const codec of sidecarVideoCodecs) {
       advanceProgress("transcoding_variant", {
         codec,
@@ -436,25 +598,23 @@ async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwne
   }
 
   let finalizingStarted = false;
-  const { width, height, hasThumbnail } = await deriveMediaMetadataAndThumbnails(
-    userId,
-    id,
-    dir,
-    buffer,
-    mimeType,
-    storedOriginalFilename,
-    {
-      onPosterExtractionStarted: isVideo
-        ? () => advanceProgress("extracting_poster")
-        : undefined,
-      onPosterExtractionCompleted: isVideo
-        ? () => {
-            finalizingStarted = true;
-            advanceProgress("finalizing");
-          }
-        : undefined,
-    },
-  );
+  const { width, height, hasThumbnail } = options?.skip_thumbnail_processing
+    ? { width: null, height: null, hasThumbnail: false }
+    : await deriveMediaMetadataAndThumbnails(
+      userId,
+      id,
+      dir,
+      buffer,
+      mimeType,
+      storedOriginalFilename,
+      {
+        onPosterExtractionStarted: () => advanceProgress("extracting_poster"),
+        onPosterExtractionCompleted: () => {
+          finalizingStarted = true;
+          advanceProgress("finalizing");
+        },
+      },
+    );
   if (!finalizingStarted) {
     advanceProgress("finalizing");
   }
@@ -478,8 +638,9 @@ async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwne
          owner_extension_identifier,
          owner_character_id,
          owner_chat_id,
+         skip_thumbnail_processing,
          created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -494,6 +655,7 @@ async function uploadImageUnsafe(userId: string, file: File, options?: ImageOwne
       ownerExtensionIdentifier,
       ownerCharacterId,
       ownerChatId,
+      options?.skip_thumbnail_processing ? 1 : 0,
       now,
     );
 
@@ -516,30 +678,16 @@ async function uploadOptimizedWebpImageUnsafe(userId: string, file: File, option
 
   let width: number | null = null;
   let height: number | null = null;
-  let hasThumbnail = false;
+  const hasThumbnail = false;
 
-  const webpBuffer = await sharp(inputBuffer)
-    .rotate()
-    .webp({ quality: WEBP_QUALITY })
-    .toBuffer({ resolveWithObject: true })
-    .then(({ data, info }) => {
-      width = info.width ?? null;
-      height = info.height ?? null;
-      return Buffer.from(data);
-    });
+  const webpBuffer = await convertImageToWebp(inputBuffer, WEBP_QUALITY, {
+    autoOrient: true,
+  });
+  const metadata = await readImageMetadata(webpBuffer);
+  width = metadata.width;
+  height = metadata.height;
 
   await writeImageFile(filepath, webpBuffer);
-
-  const derived = await deriveMediaMetadataAndThumbnails(
-    userId,
-    id,
-    dir,
-    webpBuffer,
-    "image/webp",
-  );
-  width = derived.width ?? width;
-  height = derived.height ?? height;
-  hasThumbnail = derived.hasThumbnail;
 
   const now = Math.floor(Date.now() / 1000);
   const ownerExtensionIdentifier = normalizeOwnershipValue(options?.owner_extension_identifier);
@@ -560,8 +708,9 @@ async function uploadOptimizedWebpImageUnsafe(userId: string, file: File, option
          owner_extension_identifier,
          owner_character_id,
          owner_chat_id,
+         skip_thumbnail_processing,
          created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -576,10 +725,14 @@ async function uploadOptimizedWebpImageUnsafe(userId: string, file: File, option
       ownerExtensionIdentifier,
       ownerCharacterId,
       ownerChatId,
+      options?.skip_thumbnail_processing ? 1 : 0,
       now,
     );
 
   const image = getImage(userId, id)!;
+  if (!options?.skip_thumbnail_processing) {
+    scheduleDeferredImageProcessing(userId, id, filepath);
+  }
   eventBus.emit(EventType.IMAGE_UPLOADED, { image }, userId);
   return image;
 }
@@ -590,7 +743,7 @@ export async function uploadOptimizedWebpImage(userId: string, file: File, optio
 
 /**
  * Save an image from a base64 data URL (e.g. from image generation).
- * Creates the image record, generates thumbnails, and returns the Image entity.
+ * Creates the image record and queues metadata/thumbnail processing.
  */
 async function saveImageFromDataUrlUnsafe(
   userId: string,
@@ -604,12 +757,6 @@ async function saveImageFromDataUrlUnsafe(
   const mimeType = match[1];
   const base64 = match[2];
   const ext = mimeType === "image/png" ? ".png" : mimeType === "image/jpeg" ? ".jpg" : mimeType === "image/webp" ? ".webp" : ".bin";
-
-  const id = crypto.randomUUID();
-  const filename = `${id}${ext}`;
-  const dir = getImagesDir();
-  const filepath = join(dir, filename);
-
   const mediaPolicy = mimeType.startsWith("video/") ? "image_or_video" : "image";
   const maxBytes = mediaPolicyLimit(mediaPolicy);
   if (maxBytes === null) throw new Error("Unsupported generated image media policy");
@@ -617,67 +764,15 @@ async function saveImageFromDataUrlUnsafe(
   if (Math.floor((base64.length * 3) / 4) > maxBytes) {
     throw new Error("Generated image exceeds the image byte ceiling");
   }
+
   const buffer = Buffer.from(base64, "base64");
-
-  validateSafeMediaBytes(buffer, {
-    filename,
-    bucket: "images",
-    mediaPolicy,
-    expectedMimeType: mimeType,
-  });
-  await writeImageFile(filepath, buffer);
-
-  const { width, height, hasThumbnail } = await deriveMediaMetadataAndThumbnails(
+  const filename = originalFilename || `image-gen-${crypto.randomUUID()}${ext}`;
+  return uploadImageDeferredUnsafe(
     userId,
-    id,
-    dir,
-    buffer,
-    mimeType,
+    new File([buffer], filename, { type: mimeType }),
+    options,
+    SERVER_IMAGE_GENERATION_PROVENANCE,
   );
-
-  const now = Math.floor(Date.now() / 1000);
-  const ownerExtensionIdentifier = normalizeOwnershipValue(options?.owner_extension_identifier);
-  const ownerCharacterId = normalizeOwnershipValue(options?.owner_character_id);
-  const ownerChatId = normalizeOwnershipValue(options?.owner_chat_id);
-  getDb()
-    .query(
-      `INSERT INTO images (
-         id,
-         user_id,
-         filename,
-         original_filename,
-         mime_type,
-         byte_size,
-         width,
-         height,
-         has_thumbnail,
-         owner_extension_identifier,
-         owner_character_id,
-         owner_chat_id,
-         public_provenance,
-         created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      id,
-      userId,
-      filename,
-      originalFilename || `image-gen-${id}${ext}`,
-      mimeType,
-      buffer.byteLength,
-      width,
-      height,
-      hasThumbnail ? 1 : 0,
-      ownerExtensionIdentifier,
-      ownerCharacterId,
-      ownerChatId,
-      SERVER_IMAGE_GENERATION_PROVENANCE,
-      now,
-    );
-
-  const image = getImage(userId, id)!;
-  eventBus.emit(EventType.IMAGE_UPLOADED, { image }, userId);
-  return image;
 }
 
 export async function saveImageFromDataUrl(
@@ -695,6 +790,7 @@ export interface UploadImagesItem {
   mime_type: string;
   owner_character_id?: string;
   owner_chat_id?: string;
+  skip_thumbnail_processing?: boolean;
 }
 
 export interface UploadImagesResult {
@@ -709,10 +805,14 @@ async function uploadImagesUnsafe(
   options?: {
     owner_extension_identifier?: string;
     concurrency?: number;
+    /** Leave metadata/thumbnails to the existing lazy read path. */
+    deferProcessing?: boolean;
+    /** Server-owned provenance; intentionally unavailable on the public batch API. */
+    publicProvenance?: typeof SERVER_IMAGE_GENERATION_PROVENANCE;
   },
 ): Promise<UploadImagesResult[]> {
   if (items.length === 0) return [];
-  const concurrency = Math.min(Math.max(1, options?.concurrency ?? 16), 32);
+  const concurrency = Math.min(Math.max(1, options?.concurrency ?? currentWorkerBudget().workerConcurrency), 16);
   const dir = getImagesDir();
   const ownerExtensionIdentifier = normalizeOwnershipValue(options?.owner_extension_identifier);
 
@@ -733,14 +833,26 @@ async function uploadImagesUnsafe(
       if (i >= items.length) return;
       const item = items[i]!;
       try {
-        validateSafeMediaBytes(item.data, {
-          filename: item.filename,
-          bucket: "images",
-          mediaPolicy: item.mime_type.startsWith("video/") ? "image_or_video" : "image",
-          expectedMimeType: item.mime_type,
-        });
+        if (!(item.data instanceof Uint8Array) || item.data.byteLength === 0) {
+          throw new Error("Image data must be a non-empty Uint8Array");
+        }
+        const uploadMime = (item.mime_type || "").split(";")[0].trim().toLowerCase();
+        const isActiveContent = classifyUserMediaContentType(uploadMime) === "active";
+        if (!isActiveContent) {
+          const validationIdentity = safeMediaValidationIdentity(item.filename, uploadMime);
+          validateSafeMediaBytes(item.data, {
+            filename: validationIdentity.filename,
+            bucket: "images",
+            mediaPolicy: uploadMime.startsWith("video/") ? "image_or_video" : "image",
+            expectedMimeType: validationIdentity.mimeType,
+          });
+        }
         const id = crypto.randomUUID();
-        const ext = extname(item.filename || "").toLowerCase();
+        // Active content (HTML/XHTML) is stored inert: strip the executable
+        // extension and demote the mime so no serving path can render it
+        // inline. This is the single choke point for every image upload path
+        // (direct upload, deferred, data-URL, bulk, gallery extraction).
+        const ext = isActiveContent ? ".bin" : (extname(item.filename || "").toLowerCase() || ".bin");
         const filename = `${id}${ext}`;
         const filepath = join(dir, filename);
         await writeImageFile(filepath, item.data);
@@ -748,8 +860,8 @@ async function uploadImagesUnsafe(
           id,
           filename,
           filepath,
-          item,
-          isImage: (item.mime_type || "").startsWith("image/"),
+          item: isActiveContent ? { ...item, mime_type: "application/octet-stream" } : item,
+          isImage: !isActiveContent && (item.mime_type || "").startsWith("image/"),
         };
       } catch (err: any) {
         errors[i] = err?.message ?? String(err);
@@ -767,8 +879,9 @@ async function uploadImagesUnsafe(
        id, user_id, filename, original_filename, mime_type,
        byte_size, width, height, has_thumbnail,
        owner_extension_identifier, owner_character_id, owner_chat_id,
+       skip_thumbnail_processing, public_provenance,
        created_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   db.transaction(() => {
     for (let i = 0; i < prepared.length; i++) {
@@ -787,6 +900,8 @@ async function uploadImagesUnsafe(
         ownerExtensionIdentifier,
         normalizeOwnershipValue(p.item.owner_character_id),
         normalizeOwnershipValue(p.item.owner_chat_id),
+        p.item.skip_thumbnail_processing ? 1 : 0,
+        options?.publicProvenance ?? null,
         now,
       );
     }
@@ -808,6 +923,7 @@ async function uploadImagesUnsafe(
       width: null,
       height: null,
       has_thumbnail: false,
+      skip_thumbnail_processing: !!p.item.skip_thumbnail_processing,
       url: buildImageUrl(p.id, "full"),
       specificity: "full",
       owner_extension_identifier: ownerExtensionIdentifier,
@@ -816,7 +932,9 @@ async function uploadImagesUnsafe(
       created_at: now,
     };
     results[i] = { id: p.id, image };
-    if (p.isImage) scheduleDeferredImageProcessing(userId, p.id, p.filepath);
+    if (p.isImage && !p.item.skip_thumbnail_processing && options?.deferProcessing !== false) {
+      scheduleDeferredImageProcessing(userId, p.id, p.filepath);
+    }
   }
   return results;
 }
@@ -827,9 +945,175 @@ export async function uploadImages(
   options?: {
     owner_extension_identifier?: string;
     concurrency?: number;
+    /** Leave metadata/thumbnails to the bounded persistent worker queue. */
+    deferProcessing?: boolean;
   },
 ): Promise<UploadImagesResult[]> {
   return withUserDataMutation(userId, () => uploadImagesUnsafe(userId, items, options));
+}
+
+/**
+ * Store one ordinary image through the batched/deferred pipeline.
+ *
+ * Use this for request paths that do not need synchronous media transforms.
+ * It keeps Sharp work off the request path while preserving the single-upload
+ * ownership and IMAGE_UPLOADED semantics.
+ */
+type DeferredImageOwnershipOptions = Pick<
+  ImageOwnershipOptions,
+  "owner_extension_identifier" | "owner_character_id" | "owner_chat_id" | "skip_thumbnail_processing"
+>;
+
+async function uploadImageDeferredUnsafe(
+  userId: string,
+  file: File,
+  options?: DeferredImageOwnershipOptions,
+  publicProvenance?: typeof SERVER_IMAGE_GENERATION_PROVENANCE,
+): Promise<Image> {
+  const [result] = await uploadImagesUnsafe(
+    userId,
+    [{
+      data: new Uint8Array(await file.arrayBuffer()),
+      filename: file.name,
+      mime_type: inferUploadMimeType(file),
+      owner_character_id: options?.owner_character_id,
+      owner_chat_id: options?.owner_chat_id,
+      skip_thumbnail_processing: options?.skip_thumbnail_processing,
+    }],
+    {
+      owner_extension_identifier: options?.owner_extension_identifier,
+      deferProcessing: true,
+      publicProvenance,
+    },
+  );
+
+  if (!result?.image) {
+    throw new Error(result?.error || "Image upload failed");
+  }
+
+  eventBus.emit(EventType.IMAGE_UPLOADED, { image: result.image }, userId);
+  return result.image;
+}
+
+export async function uploadImageDeferred(
+  userId: string,
+  file: File,
+  options?: DeferredImageOwnershipOptions,
+): Promise<Image> {
+  return withUserDataMutation(userId, () => uploadImageDeferredUnsafe(userId, file, options));
+}
+
+function notifyDeferredImageIdle(): void {
+  if (deferredImageActive > 0 || deferredImageQueue.length > 0) return;
+  const waiters = deferredImageWaiters;
+  deferredImageWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
+function emitDeferredImageStatus(force = false): void {
+  const status = liveDeferredImageProcessingStatus();
+  const now = Date.now();
+  if (!force && lastDeferredImageStatusEmitAt > 0 && now - lastDeferredImageStatusEmitAt < DEFERRED_IMAGE_STATUS_EMIT_MS) {
+    return;
+  }
+  lastDeferredImageStatusEmitAt = now;
+  if (status.remaining > 0) lastExternalDeferredStatus = null;
+  if (process.env.LUMIVERSE_ST_MIGRATION_CHILD === "1" && typeof process.send === "function") {
+    process.send({ type: "thumbnailQueue", ...status });
+  }
+  eventBus.emit(EventType.IMAGE_THUMBNAIL_QUEUE, status);
+}
+
+function pumpDeferredImageQueue(): void {
+  const limit = currentWorkerBudget().deferredImageConcurrency;
+  while (deferredImageActive < limit) {
+    const queued = deferredImageQueue.shift();
+    if (!queued) break;
+    deferredImageActive++;
+    emitDeferredImageStatus();
+    void queued.run().finally(() => {
+      deferredImageActive--;
+      deferredImageWaveCompleted++;
+      completeImageProcessingJob(queued.persistId);
+      liveImageProcessingJobIds.delete(queued.persistId);
+      if (deferredImageQueue.length > 0) pumpDeferredImageQueue();
+      else notifyDeferredImageIdle();
+      emitDeferredImageStatus(deferredImageActive === 0 && deferredImageQueue.length === 0);
+    });
+  }
+}
+
+async function processDeferredImage(
+  userId: string,
+  id: string,
+  filepath: string,
+): Promise<void> {
+  const row = getDb()
+    .query("SELECT skip_thumbnail_processing FROM images WHERE id = ?")
+    .get(id) as { skip_thumbnail_processing: number } | undefined;
+  if (!row || row.skip_thumbnail_processing) return;
+
+  let width: number | null = null;
+  let height: number | null = null;
+  try {
+    const meta = await readImageMetadata(filepath);
+    width = meta.width;
+    height = meta.height;
+  } catch {
+    return;
+  }
+  const dir = getImagesDir();
+  const sizes = getThumbnailSettings(userId);
+  const encoding = getThumbnailEncodingSettings();
+  // Run tiers sequentially. The outer queue owns concurrency; fanning out here
+  // multiplies native libvips pipelines during bursts of embedded-image imports.
+  const smOk = await ensureThumbnail(
+    `${id}_sm`,
+    filepath,
+    join(dir, `${id}${thumbSuffix("sm", encoding.codec)}`),
+    sizes.smallSize,
+    encoding,
+  );
+  const lgOk = await ensureThumbnail(
+    `${id}_lg`,
+    filepath,
+    join(dir, `${id}${thumbSuffix("lg", encoding.codec)}`),
+    sizes.largeSize,
+    encoding,
+  );
+  const hasThumb = smOk || lgOk;
+  getDb()
+    .query("UPDATE images SET width = COALESCE(?, width), height = COALESCE(?, height), has_thumbnail = ? WHERE id = ?")
+    .run(width, height, hasThumb ? 1 : 0, id);
+}
+function enqueueDeferredImageJob(persistId: string, job: () => Promise<void>): void {
+  if (deferredImageActive === 0 && deferredImageQueue.length === 0) {
+    deferredImageWaveTotal = 0;
+    deferredImageWaveCompleted = 0;
+  }
+  deferredImageWaveTotal++;
+  liveImageProcessingJobIds.add(persistId);
+  deferredImageQueue.push({
+    persistId,
+    run: async () => {
+      try {
+        await job();
+      } catch (err) {
+        console.warn("[images] deferred image processing failed:", err);
+      }
+    },
+  });
+  pumpDeferredImageQueue();
+}
+
+function enqueuePersistentImageJob(
+  userId: string,
+  imageId: string,
+  kind: ImageProcessingJobKind,
+  job: () => Promise<void>,
+): void {
+  const recorded = recordImageProcessingJob(userId, imageId, kind);
+  enqueueDeferredImageJob(recorded.id, () => withUserDataMutation(userId, job));
 }
 
 function scheduleDeferredImageProcessing(
@@ -837,32 +1121,176 @@ function scheduleDeferredImageProcessing(
   id: string,
   filepath: string,
 ): void {
-  void withUserDataMutation(userId, async () => {
+  enqueuePersistentImageJob(userId, id, "process", () => processDeferredImage(userId, id, filepath));
+}
+
+function scheduleRebuildThumbnailJob(
+  userId: string,
+  id: string,
+  filename: string,
+  progress: ThumbnailRebuildProgress,
+  onProgress?: (p: ThumbnailRebuildProgress) => void,
+): void {
+  enqueuePersistentImageJob(userId, id, "rebuild", async () => {
     try {
-      const buffer = Buffer.from(await Bun.file(filepath).arrayBuffer());
-      let width: number | null = null;
-      let height: number | null = null;
-      try {
-        const meta = await sharp(buffer).metadata();
-        width = meta.width ?? null;
-        height = meta.height ?? null;
-      } catch {
+      const row = getDb()
+        .query("SELECT skip_thumbnail_processing FROM images WHERE id = ?")
+        .get(id) as { skip_thumbnail_processing: number } | undefined;
+      if (!row || row.skip_thumbnail_processing) {
+        progress.skipped++;
         return;
       }
+
       const dir = getImagesDir();
+      const originalPath = join(dir, filename);
+      if (!existsSync(originalPath)) {
+        getDb().query("UPDATE images SET has_thumbnail = 0 WHERE id = ?").run(id);
+        progress.skipped++;
+        return;
+      }
+
       const sizes = getThumbnailSettings(userId);
-      const [smOk, lgOk] = await Promise.all([
-        ensureThumbnail(`${id}_sm`, buffer, join(dir, `${id}${thumbSuffix("sm")}`), sizes.smallSize),
-        ensureThumbnail(`${id}_lg`, buffer, join(dir, `${id}${thumbSuffix("lg")}`), sizes.largeSize),
-      ]);
-      const hasThumb = smOk || lgOk;
-      getDb()
-        .query("UPDATE images SET width = COALESCE(?, width), height = COALESCE(?, height), has_thumbnail = ? WHERE id = ?")
-        .run(width, height, hasThumb ? 1 : 0, id);
+      const encoding = getThumbnailEncodingSettings();
+      const smOk = await generateThumbnail(
+        originalPath,
+        join(dir, `${id}${thumbSuffix("sm", encoding.codec)}`),
+        sizes.smallSize,
+        encoding,
+      );
+      const lgOk = await generateThumbnail(
+        originalPath,
+        join(dir, `${id}${thumbSuffix("lg", encoding.codec)}`),
+        sizes.largeSize,
+        encoding,
+      );
+
+      if (smOk || lgOk) {
+        getDb().query("UPDATE images SET has_thumbnail = 1 WHERE id = ?").run(id);
+        progress.generated++;
+        return;
+      }
+      progress.failed++;
     } catch (err) {
-      console.warn(`[images] deferred image processing failed for ${id}:`, err);
+      progress.failed++;
+      console.warn(`[images] rebuild thumbnail failed for ${id}:`, err);
+    } finally {
+      progress.current++;
+      onProgress?.({ ...progress });
     }
   });
+}
+
+export async function waitForDeferredImageProcessing(): Promise<void> {
+  if (deferredImageActive === 0 && deferredImageQueue.length === 0) return;
+  await new Promise<void>((resolve) => {
+    deferredImageWaiters.push(resolve);
+    notifyDeferredImageIdle();
+  });
+}
+
+export function resetDeferredImageProcessingForTests(): void {
+  deferredImageQueue.length = 0;
+  liveImageProcessingJobIds.clear();
+  deferredImageActive = 0;
+  deferredImageWaiters = [];
+  deferredImageWaveTotal = 0;
+  deferredImageWaveCompleted = 0;
+  lastDeferredImageStatusEmitAt = 0;
+  lastExternalDeferredStatus = null;
+  isolatedThumbnailWorkActive = false;
+}
+
+
+function runRecoverableImageJob(job: ImageProcessingQueueJob, image: { id: string; filename: string }): void {
+  const dir = getImagesDir();
+  const filepath = join(dir, image.filename);
+  if (job.kind === "rebuild") {
+    const progress: ThumbnailRebuildProgress = {
+      total: 1,
+      current: 0,
+      generated: 0,
+      skipped: 0,
+      failed: 0,
+    };
+    enqueueDeferredImageJob(job.id, () => withUserDataMutation(job.userId, () =>
+      scheduleRecoverRebuildBody(job.userId, image.id, image.filename, progress)
+    ));
+    return;
+  }
+  enqueueDeferredImageJob(job.id, () => withUserDataMutation(
+    job.userId,
+    () => processDeferredImage(job.userId, image.id, filepath),
+  ));
+}
+
+async function scheduleRecoverRebuildBody(
+  userId: string,
+  id: string,
+  filename: string,
+  progress: ThumbnailRebuildProgress,
+): Promise<void> {
+  const dir = getImagesDir();
+  const originalPath = join(dir, filename);
+  if (!existsSync(originalPath)) {
+    progress.skipped++;
+    return;
+  }
+  for (const tier of ["sm", "lg"] as const) {
+    for (const suffix of thumbnailSuffixes(tier)) {
+      const p = join(dir, `${id}${suffix}`);
+      if (existsSync(p)) unlinkSync(p);
+    }
+  }
+  const sizes = getThumbnailSettings(userId);
+  const encoding = getThumbnailEncodingSettings();
+  const smOk = await generateThumbnail(
+    originalPath,
+    join(dir, `${id}${thumbSuffix("sm", encoding.codec)}`),
+    sizes.smallSize,
+    encoding,
+  );
+  const lgOk = await generateThumbnail(
+    originalPath,
+    join(dir, `${id}${thumbSuffix("lg", encoding.codec)}`),
+    sizes.largeSize,
+    encoding,
+  );
+  if (smOk || lgOk) {
+    getDb().query("UPDATE images SET has_thumbnail = 1 WHERE id = ?").run(id);
+    progress.generated++;
+    return;
+  }
+  progress.failed++;
+}
+
+export function recoverImageProcessingQueue(): ImageProcessingQueueRecovery {
+  const leftovers = listRecoverableImageProcessingJobs(liveImageProcessingJobIds);
+  for (const job of leftovers) {
+    const image = getDb()
+      .query("SELECT id, filename, skip_thumbnail_processing FROM images WHERE id = ?")
+      .get(job.imageId) as { id: string; filename: string; skip_thumbnail_processing: number } | undefined;
+    if (!image || image.skip_thumbnail_processing) {
+      completeImageProcessingJob(job.id);
+      continue;
+    }
+    runRecoverableImageJob(job, image);
+  }
+  return getImageProcessingRecovery();
+}
+
+export function discardImageProcessingQueue(): ImageProcessingQueueRecovery {
+  discardRecoverableImageProcessingJobs(liveImageProcessingJobIds);
+  return getImageProcessingRecovery();
+}
+
+export function getImageProcessingQueueSnapshot(): {
+  queue: DeferredImageProcessingStatus;
+  recovery: ImageProcessingQueueRecovery;
+} {
+  return {
+    queue: getDeferredImageProcessingStatus(),
+    recovery: getImageProcessingRecovery(),
+  };
 }
 
 export const IMAGE_GEN_FILENAME_PREFIX = "image-gen-";
@@ -874,8 +1302,8 @@ export interface PublicImageFile {
 
 /**
  * Resolve an unauthenticated image-generation result only when the row carries
- * server-owned provenance and the staged file still has an allowlisted media
- * type. The filename prefix remains a compatibility guard, never the
+ * server-owned provenance and the stored file still passes the media-byte
+ * allowlist. The filename prefix remains a compatibility guard, never the
  * authority.
  */
 export async function getPublicImageFile(id: string, tier?: ThumbTier): Promise<PublicImageFile | null> {
@@ -889,6 +1317,8 @@ export async function getPublicImageFile(id: string, tier?: ThumbTier): Promise<
   const filename = row.filename;
   const originalPath = join(dir, filename);
   const expectedMimeType = typeof row.mime_type === "string" ? row.mime_type : null;
+  if (classifyUserMediaContentType(expectedMimeType) === "active") return null;
+
   const validateOriginal = (): PublicImageFile | null => {
     if (!existsSync(originalPath)) return null;
     try {
@@ -904,17 +1334,23 @@ export async function getPublicImageFile(id: string, tier?: ThumbTier): Promise<
     }
   };
 
-  if (!tier) return validateOriginal();
+  const original = validateOriginal();
+  if (!tier) return original;
+  if (!original) return null;
+  if (row.skip_thumbnail_processing) return original;
 
-  const thumbPath = join(dir, `${id}${thumbSuffix(tier)}`);
+  const encoding = getThumbnailEncodingSettings();
+  const suffix = thumbSuffix(tier, encoding.codec);
+  const thumbPath = join(dir, `${id}${suffix}`);
+  const thumbnailMimeType = encoding.codec === "avif" ? "image/avif" : "image/webp";
   const validateThumbnail = (): PublicImageFile | null => {
     if (!existsSync(thumbPath)) return null;
     try {
       const validated = validateSafeMediaFile(thumbPath, {
-        filename: `${id}${thumbSuffix(tier)}`,
+        filename: `${id}${suffix}`,
         bucket: "thumbnails",
         mediaPolicy: "image",
-        expectedMimeType: "image/webp",
+        expectedMimeType: thumbnailMimeType,
       });
       return { filepath: thumbPath, contentType: validated.contentType };
     } catch {
@@ -924,12 +1360,10 @@ export async function getPublicImageFile(id: string, tier?: ThumbTier): Promise<
   const existingThumbnail = validateThumbnail();
   if (existingThumbnail) return existingThumbnail;
 
-  const original = validateOriginal();
-  if (!original) return null;
   const userId = typeof row.user_id === "string" ? row.user_id : "";
   const sizes = getThumbnailSettings(userId);
   const size = tier === "sm" ? sizes.smallSize : sizes.largeSize;
-  const ok = await ensureThumbnail(`${id}:${tier}:public`, original.filepath, thumbPath, size);
+  const ok = await ensureThumbnail(`${id}:${tier}:public`, original.filepath, thumbPath, size, encoding);
   if (!ok) return original;
   return validateThumbnail() ?? original;
 }
@@ -984,10 +1418,14 @@ export async function getImageFilePath(
   const dir = getImagesDir();
 
   if (tier) {
-    const tieredPath = join(dir, `${image.id}${thumbSuffix(tier)}`);
+    const originalPath = join(dir, image.filename);
+    if (image.skip_thumbnail_processing) {
+      return existsSync(originalPath) ? originalPath : null;
+    }
+    const encoding = getThumbnailEncodingSettings();
+    const tieredPath = join(dir, `${image.id}${thumbSuffix(tier, encoding.codec)}`);
     if (existsSync(tieredPath)) return tieredPath;
 
-    const originalPath = join(dir, image.filename);
     if (existsSync(originalPath)) {
       const sizes = getThumbnailSettings(userId);
       const size = tier === "sm" ? sizes.smallSize : sizes.largeSize;
@@ -1007,7 +1445,7 @@ export async function getImageFilePath(
         : originalPath;
 
       const ok = thumbnailSource
-        ? await ensureThumbnail(`${image.id}:${tier}:${userId}`, thumbnailSource, tieredPath, size)
+        ? await ensureThumbnail(`${image.id}:${tier}:${userId}`, thumbnailSource, tieredPath, size, encoding)
         : false;
       if (ok) {
         getDb()
@@ -1040,68 +1478,51 @@ export interface ThumbnailRebuildProgress {
   failed: number;
 }
 
-const REBUILD_BATCH = 20;
-
 export async function rebuildAllThumbnails(
   userId: string,
-  options?: { onProgress?: (p: ThumbnailRebuildProgress) => void }
+  options?: { onProgress?: (p: ThumbnailRebuildProgress) => void },
 ): Promise<ThumbnailRebuildProgress> {
-  const dir = getImagesDir();
-  const sizes = getThumbnailSettings(userId);
-
   const rows = getDb()
-    .query("SELECT id, filename FROM images WHERE user_id = ?")
-    .all(userId) as Array<{ id: string; filename: string }>;
+    .query("SELECT id, filename, skip_thumbnail_processing FROM images WHERE user_id = ?")
+    .all(userId) as Array<{ id: string; filename: string; skip_thumbnail_processing: number }>;
+  const eligibleRows = rows.filter((row) => !row.skip_thumbnail_processing);
+  const eligibleIds = new Set(eligibleRows.map((row) => row.id));
+  const dir = getImagesDir();
+
+  for (const name of readdirSync(dir)) {
+    if (!isThumbnailFilename(name)) continue;
+    const imageId = name.split("_thumb_")[0];
+    if (!imageId || !eligibleIds.has(imageId)) continue;
+    const path = join(dir, name);
+    try {
+      if (lstatSync(path).isFile()) unlinkSync(path);
+    } catch {
+      // Keep going so one stuck file does not abort the wipe.
+    }
+  }
+
+  getDb()
+    .query("UPDATE images SET has_thumbnail = 0 WHERE user_id = ? AND skip_thumbnail_processing = 0")
+    .run(userId);
+
+  const skipped = rows.length - eligibleRows.length;
 
   const progress: ThumbnailRebuildProgress = {
     total: rows.length,
-    current: 0,
+    current: skipped,
     generated: 0,
-    skipped: 0,
+    skipped,
     failed: 0,
   };
 
   options?.onProgress?.({ ...progress });
+  if (rows.length === 0) return progress;
 
-  for (let i = 0; i < rows.length; i += REBUILD_BATCH) {
-    const batch = rows.slice(i, i + REBUILD_BATCH);
-
-    await Promise.all(
-      batch.map(async (img) => {
-        const originalPath = join(dir, img.filename);
-        if (!existsSync(originalPath)) {
-          progress.skipped++;
-          progress.current++;
-          return;
-        }
-
-        // Delete existing tier files
-        for (const tier of ["sm", "lg"] as const) {
-          for (const suffix of [thumbSuffix(tier), legacyThumbSuffix(tier)]) {
-            const p = join(dir, `${img.id}${suffix}`);
-            if (existsSync(p)) unlinkSync(p);
-          }
-        }
-
-        // Regenerate both tiers
-        const [smOk, lgOk] = await Promise.all([
-          generateThumbnail(originalPath, join(dir, `${img.id}${thumbSuffix("sm")}`), sizes.smallSize),
-          generateThumbnail(originalPath, join(dir, `${img.id}${thumbSuffix("lg")}`), sizes.largeSize),
-        ]);
-
-        if (smOk || lgOk) {
-          getDb().query("UPDATE images SET has_thumbnail = 1 WHERE id = ?").run(img.id);
-          progress.generated++;
-        } else {
-          progress.failed++;
-        }
-        progress.current++;
-      })
-    );
-
-    options?.onProgress?.({ ...progress });
+  for (const img of eligibleRows) {
+    scheduleRebuildThumbnailJob(userId, img.id, img.filename, progress, options?.onProgress);
   }
-
+  await waitForDeferredImageProcessing();
+  options?.onProgress?.({ ...progress });
   return progress;
 }
 
@@ -1109,7 +1530,7 @@ function imageFilePaths(dir: string, id: string, filename: string): string[] {
   const paths = [join(dir, filename)];
   for (const codec of ["h264", "hevc"] as const) paths.push(videoVariantPath(dir, id, codec));
   for (const tier of ["sm", "lg"] as const) {
-    for (const suffix of [thumbSuffix(tier), legacyThumbSuffix(tier)]) {
+    for (const suffix of thumbnailSuffixes(tier)) {
       paths.push(join(dir, `${id}${suffix}`));
     }
   }
@@ -1325,7 +1746,11 @@ export function isImageReferenced(userId: string, id: string): boolean {
       [userId, id, WALLPAPER_LIBRARY_OWNER],
     ) ||
     hasImageReference(
-      "SELECT 1 AS found FROM character_gallery WHERE user_id = ? AND image_id = ? LIMIT 1",
+      `SELECT 1 AS found
+         FROM character_gallery cg
+         JOIN characters c ON c.id = cg.character_id
+        WHERE cg.user_id = ? AND cg.image_id = ? AND c.deleting = 0
+        LIMIT 1`,
       [userId, id],
     ) ||
     hasImageReference(
@@ -1340,6 +1765,10 @@ export function isImageReferenced(userId: string, id: string): boolean {
     hasImageReference(
       "SELECT 1 AS found FROM personas WHERE user_id = ? AND (image_id = ? OR metadata LIKE ?) LIMIT 1",
       [userId, id, needle],
+    ) ||
+    hasImageReference(
+      "SELECT 1 AS found FROM presets WHERE user_id = ? AND metadata LIKE ? LIMIT 1",
+      [userId, needle],
     ) ||
     hasImageReference(
       "SELECT 1 AS found FROM theme_assets WHERE user_id = ? AND image_id = ? LIMIT 1",
@@ -1416,7 +1845,13 @@ export function findReferencedImageIds(userId: string, candidates: ReadonlySet<s
         sql: (m) => `SELECT id AS hit FROM images WHERE user_id = ? AND owner_extension_identifier = ? AND id IN (${m})`,
         head: [userId, WALLPAPER_LIBRARY_OWNER],
       },
-      { sql: (m) => `SELECT image_id AS hit FROM character_gallery WHERE user_id = ? AND image_id IN (${m})`, head: [userId] },
+      {
+        sql: (m) => `SELECT cg.image_id AS hit
+                       FROM character_gallery cg
+                       JOIN characters c ON c.id = cg.character_id
+                      WHERE cg.user_id = ? AND c.deleting = 0 AND cg.image_id IN (${m})`,
+        head: [userId],
+      },
       { sql: (m) => `SELECT image_id AS hit FROM characters WHERE user_id = ? AND deleting = 0 AND image_id IN (${m})`, head: [userId] },
       { sql: (m) => `SELECT image_id AS hit FROM personas WHERE user_id = ? AND image_id IN (${m})`, head: [userId] },
       { sql: (m) => `SELECT image_id AS hit FROM theme_assets WHERE user_id = ? AND image_id IN (${m})`, head: [userId] },
@@ -1437,6 +1872,9 @@ export function findReferencedImageIds(userId: string, candidates: ReadonlySet<s
     }
     if (!done()) {
       for (const row of bulkRows("SELECT metadata FROM personas WHERE user_id = ?", [userId])) scanText(row.metadata);
+    }
+    if (!done()) {
+      for (const row of bulkRows("SELECT metadata FROM presets WHERE user_id = ?", [userId])) scanText(row.metadata);
     }
     if (!done()) {
       const rows = bulkRows(

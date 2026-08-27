@@ -3,6 +3,34 @@ import { getCharacter, updateCharacter } from "./characters.service";
 import { uploadImage } from "./images.service";
 import type { Character } from "../types/character";
 
+// Cap on the total bytes produced by expression ZIP decompression. fflate's
+// unzipSync has no built-in output cap, so a small compressed file with a
+// multi-GB decompressed payload would otherwise OOM the process (zip bomb).
+// Mirrors the guard in character-card.service.ts; expression images are tiny,
+// so a 100 MB budget is far above legitimate use.
+const MAX_EXPRESSIONS_DECOMPRESSED_SIZE = 100 * 1024 * 1024;
+
+/**
+ * unzipSync filter that aborts extraction once the archive's declared
+ * decompressed size crosses the cap. Throws inside the filter so fflate stops
+ * before allocating the bomb's output buffer.
+ */
+function makeDecompressionCapFilter(): NonNullable<Parameters<typeof unzipSync>[1]>["filter"] {
+  let plannedBytes = 0;
+  return (entry) => {
+    const ext = entry.name.lastIndexOf(".");
+    const wanted = ext >= 0 && IMAGE_EXTENSIONS.has(entry.name.slice(ext).toLowerCase());
+    if (!wanted) return false;
+    plannedBytes += entry.originalSize ?? 0;
+    if (plannedBytes > MAX_EXPRESSIONS_DECOMPRESSED_SIZE) {
+      throw new Error(
+        `Expression ZIP decompresses to more than ${MAX_EXPRESSIONS_DECOMPRESSED_SIZE / 1024 / 1024} MB`,
+      );
+    }
+    return true;
+  };
+}
+
 export interface ExpressionConfig {
   enabled: boolean;
   defaultExpression: string;
@@ -68,10 +96,7 @@ export async function importFromZip(
   zipBuffer: Buffer
 ): Promise<ExpressionConfig> {
   const unzipped = unzipSync(new Uint8Array(zipBuffer), {
-    filter: (entry) => {
-      const ext = getFileExtension(entry.name);
-      return IMAGE_EXTENSIONS.has(ext);
-    },
+    filter: makeDecompressionCapFilter(),
   });
 
   const existing = getExpressionConfig(userId, characterId) ?? { ...EMPTY_CONFIG };
@@ -267,12 +292,8 @@ export async function importGroupFromZip(
   const group = existing[groupName];
   if (!group) throw new Error("Group not found");
 
-  const { unzipSync } = await import("fflate");
   const unzipped = unzipSync(new Uint8Array(zipBuffer), {
-    filter: (entry) => {
-      const ext = entry.name.lastIndexOf(".");
-      return ext >= 0 && IMAGE_EXTENSIONS.has(entry.name.slice(ext).toLowerCase());
-    },
+    filter: makeDecompressionCapFilter(),
   });
 
   const newMappings: Record<string, string> = { ...group };

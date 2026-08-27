@@ -58,6 +58,10 @@ const dom = new JSDOM('<!doctype html><html><body></body></html>', {
   url: 'http://localhost/',
   pretendToBeVisual: true,
 })
+dom.window.matchMedia = (media: string) => ({
+  addEventListener() {}, addListener() {}, dispatchEvent: () => false, matches: false,
+  media, onchange: null, removeEventListener() {}, removeListener() {},
+})
 const originalGlobals = {
   window: globalThis.window,
   document: globalThis.document,
@@ -144,16 +148,20 @@ Object.defineProperty(URL, 'createObjectURL', {
 })
 Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: () => {} })
 const storeState = {
-  profiles: [],
   activeProfileId: null as string | null,
-  spindleSettings: { infoLoggingEnabled: false },
+  messages: [] as Array<{ id: string; content: string }>,
   pendingPermissionRequest: null as { id: string; extensionId: string } | null,
+  profiles: [] as Array<{ id: string; provider: string; model: string }>,
+  setActiveProfile() {},
   showPermissionRequest(request: { id: string; extensionId: string }) {
     storeState.pendingPermissionRequest = request
   },
+  spindleSettings: { infoLoggingEnabled: false },
+  updateProfile() {},
 }
 const useStoreMock = {
   getState: () => storeState,
+  subscribe: () => () => {},
   setState(update: { pendingPermissionRequest?: null } | ((state: typeof storeState) => Partial<typeof storeState>)) {
     const next = typeof update === 'function' ? update(storeState) : update
     Object.assign(storeState, next)
@@ -227,11 +235,72 @@ mock.module('@/i18n', () => ({
 }))
 mock.module('@/store', () => ({ useStore: useStoreMock }))
 mock.module('@/ws/client', () => ({
-  wsClient: wsClientMock,
-  WS_OPEN: '__ws_open',
-  WS_CLOSE: '__ws_close',
-  WS_PONG: '__ws_pong',
   WS_AUTH_ERROR: '__ws_auth_error',
+  WS_CLOSE: '__ws_close',
+  WS_OPEN: '__ws_open',
+  WS_PONG: '__ws_pong',
+  WS_RESUME_RECOVERY_START: '__ws_resume_recovery_start',
+  WS_RESUME_RECOVERY_COMPLETE: '__ws_resume_recovery_complete',
+  WS_RESUME_RECOVERY_FAILED: '__ws_resume_recovery_failed',
+  wsClient: wsClientMock,
+}))
+mock.module('./host-surfaces', () => ({
+  createHostSurfaceAPI: () => ({
+    list: () => [],
+    subscribe: () => () => {},
+    invoke() {},
+    registerDeepLinkTarget: () => () => {},
+  }),
+}))
+mock.module('./character-host-surface-renderers', () => ({}))
+mock.module('./world-book-host-surface-renderers', () => ({}))
+mock.module('./productivity-host-surface-renderers', () => ({}))
+mock.module('./settings-bridge', () => ({
+  createSettingsBridge: () => ({
+    get: async () => undefined,
+    set: async () => {},
+    remove: async () => {},
+    watch: () => () => {},
+    core: {
+      get: () => undefined,
+      watch: () => () => {},
+      list: () => [],
+      isReady: () => true,
+    },
+    dispose() {},
+  }),
+}))
+mock.module('./frontend-domain-api', () => ({
+  createFrontendDomainApi: () => ({
+    connections: {
+      list: () => [],
+      getActive: () => ({ activeProfileId: null, provider: null, model: null }),
+      subscribe: () => () => {},
+      models: async () => ({ models: [] }),
+      setActive() {},
+      setActiveAcknowledged: async () => {},
+      update: async () => ({}),
+    },
+    chats: {
+      listForCharacter: async () => [],
+      getMessages: async () => ({ items: [], total: 0 }),
+    },
+    worldBooks: {
+      list: async () => [],
+      entries: async () => [],
+    },
+    messages: {
+      getContent: () => null,
+      getRecent: () => [],
+    },
+    tokens: {
+      countText: async () => ({}),
+      countMessages: async () => ({}),
+      countChat: async () => ({}),
+      countTextBatch: async () => ({}),
+    },
+    dispose() {},
+  }),
 }))
 mock.module('@/api/spindle', () => ({ spindleApi: { getPermissions: () => permissionPromise } }))
 mock.module('@/api/characters', () => ({ charactersApi: { get: async () => null } }))
@@ -241,28 +310,34 @@ mock.module('@/api/chats', () => ({
 }))
 mock.module('./dom-helper', () => ({ createDOMHelper: () => ({ cleanup() {} }) }))
 mock.module('./message-interceptors', () => ({
-  subscribeTagInterceptorRegistry: () => () => {},
+  dispatchMessageTagIntercepts() {},
   getTagInterceptorRegistryVersion: () => 0,
   registerTagInterceptor: () => () => {},
-  unregisterTagInterceptorsByExtension() {},
   stripMessageTags: (content: string) => ({ content, intercepts: [] }),
-  dispatchMessageTagIntercepts() {},
+  subscribeTagInterceptorRegistry: () => () => {},
+  unregisterTagInterceptorsByExtension() {},
 }))
-mock.module('./display-resolver-registry', () => ({ registerDisplayResolver: () => () => {}, unregisterDisplayResolver() {} }))
+mock.module('./display-resolver-registry', () => ({
+  getDisplayOwnerIdentifier: () => null,
+  getDisplayResolverForChat: () => null,
+  isDisplayChatOwned: () => false,
+  registerDisplayResolver: () => () => {},
+  unregisterDisplayResolver() {},
+}))
 mock.module('@/hooks/useDisplayRegex', () => ({
-  useDisplayPreprocessed: (content: string) => content,
-  useDisplayRegex: (content: string) => content,
   invalidateDisplayRegexCache() {},
   invalidateDisplayRegexCacheForMessage() {},
   invalidateDisplayRegexCacheForVars() {},
+  useDisplayPreprocessed: (content: string) => content,
+  useDisplayRegex: (content: string) => content,
 }))
 mock.module('./message-widgets', () => ({
   SpindleMessageWidgets: () => null,
-  subscribeMessageWidgets: () => () => {},
   getMessageWidgetVersion: () => 0,
-  removeMessageWidgetsByExtension() {},
-  upsertMessageWidget: () => {},
   removeMessageWidget() {},
+  removeMessageWidgetsByExtension() {},
+  subscribeMessageWidgets: () => () => {},
+  upsertMessageWidget() {},
 }))
 mock.module('./placement-helper', () => ({
   createDrawerTabHandle: () => ({ destroy() {} }),
@@ -277,6 +352,7 @@ mock.module('./placement-helper', () => ({
   createInputBarActionHandle: () => ({ destroy() {} }),
   createTabMobilityHandle: () => ({ requestTabLocation() {} }),
   clearTabMobilityHandle() {},
+  notifyFloatWidgetDragEnd() {},
   destroyAllPlacementsForExtension(extensionId: string) { placementDestroyCalls.push(extensionId) },
   destroyPlacementsForExtensionPermission(extensionId: string, permission: string) {
     placementDestroyCalls.push(`${permission}:${extensionId}`)
@@ -284,10 +360,10 @@ mock.module('./placement-helper', () => ({
   destroyPresetEditorPlacementsForExtension(extensionId: string) { placementDestroyCalls.push(`preset:${extensionId}`) },
 }))
 mock.module('./character-editor-helper', () => ({
-  setCharacterEditorController() {},
-  syncCharacterEditorState() {},
   getCharacterEditorState: () => ({}),
+  setCharacterEditorController() {},
   subscribeCharacterEditorState: () => () => {},
+  syncCharacterEditorState() {},
   setCharacterEditorExtensions() {},
   updateCharacterEditorExtensions() {},
   flushCharacterEditorExtensions: async () => {},
@@ -315,11 +391,12 @@ mock.module('./components-helper', () => ({
   destroyComponentsForExtensionPermission() {},
 }))
 mock.module('@/lib/uuid', () => ({
-  uuidv7: () => 'uuid-v7',
   generateUUID: () => {
     uuidSequence += 1
     return uuidSequence === 1 ? 'request-id' : `request-id-${uuidSequence}`
   },
+  uuidv4: () => `uuid-v4-${uuidSequence += 1}`,
+  uuidv7: () => `uuid-v7-${uuidSequence += 1}`,
 }))
 mock.module('./navigation-guards', () => ({ installSpindleNavigationGuards() {} }))
 mock.module('@/lib/drawer-tab-registry', () => ({
@@ -343,10 +420,11 @@ mock.module('./ui-events-helper', () => ({
     uiEventDestroyPermissionCalls.push({ extensionId, permission })
   },
 }))
-mock.module('./browser-scheduler', () => ({
-  yieldToBrowser: async () => {},
-  scheduleSpindleDomTask: () => () => {},
-}))
+mock.module('./browser-scheduler', () => ({ scheduleSpindleDomTask: () => () => {}, yieldToBrowser: async () => {} }))
+// The native adapter intentionally imports the production Vite registry. This
+// lifecycle test exercises the loader boundary, so keep that compile-time-only
+// module graph behind its adapter rather than weakening the production macros.
+mock.module('./theme-authoring-native', () => ({ createNativeThemeAuthoringAPI: () => ({}) }))
 
 const lifecycleModuleSource = `
   export function teardown() {
@@ -570,6 +648,13 @@ afterAll(async () => {
 })
 
 describe('loader lifecycle orchestration', () => {
+  test('unload purges retained UI registrations without a live loader record', async () => {
+    await unloadFrontendExtension('disabled_without_loaded_record')
+
+    expect(placementDestroyCalls).toContain('disabled_without_loaded_record')
+    expect(uiEventDestroyAllCalls).toContain('disabled_without_loaded_record')
+  })
+
   test('force-stop cleans up when onStop returns without completing', async () => {
     const extensionId = 'stalled_stop'
     let stopCalls = 0

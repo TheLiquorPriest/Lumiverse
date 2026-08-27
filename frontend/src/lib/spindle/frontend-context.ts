@@ -11,6 +11,7 @@ import type {
   FrontendWorldBooksAPI,
 } from './frontend-domain-api'
 import type { StateSelectors } from './state-selectors'
+import type { DecoratorOptions } from './dom-decorator-service'
 import {
   createResizeController as createCoreResizeController,
   getUiScale as readUiScale,
@@ -64,6 +65,8 @@ export type FrontendFloatWidgetOptions = PublishedSpindleFloatWidgetOptions & {
 export type FrontendDockPanelOptions = PublishedSpindleDockPanelOptions & {
   persistGeometry?: string | false
   respectRequestedEdge?: boolean
+  /** Show the panel title while the dock is collapsed. Defaults to false. */
+  showCollapsedTitle?: boolean
   onGeometryCommit?(rect: SpindleGeometryRect): void
 }
 
@@ -126,6 +129,13 @@ export function createFrontendGeometryAPI(): SpindleGeometryAPI {
 export interface FrontendContextAdditions {
   ui: {
     geometry: SpindleGeometryAPI
+    registerComponentOverride?: (options: {
+      host: string
+      mode: 'wrap' | 'replace'
+      component: unknown
+      priority?: number
+    }) => { destroy(): void }
+    registerDomDecorator?: (options: Omit<DecoratorOptions, 'owner' | 'generation'>) => () => void
   }
   state: StateSelectors
   connections: FrontendConnectionsAPI

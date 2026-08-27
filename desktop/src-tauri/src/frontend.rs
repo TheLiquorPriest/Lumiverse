@@ -638,7 +638,24 @@ pub fn set_desktop_widget_catalog(
     if widgets.iter().any(|widget| !ids.insert(widget.id.as_str())) {
         return Err("Floating-widget catalog has duplicate IDs".into());
     }
-    *state.widgets.lock().unwrap() = widgets.clone();
+    let removed_widgets = {
+        let mut catalog = state.widgets.lock().unwrap();
+        let removed = catalog
+            .iter()
+            .filter(|widget| !ids.contains(widget.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        *catalog = widgets.clone();
+        removed
+    };
+    // A disabled extension disappears from the frontend-owned catalog. Close
+    // any already-open native widget at the same time so stale Suite UI cannot
+    // remain usable in a child WebView.
+    for widget in &removed_widgets {
+        if let Some(window) = app.get_webview_window(&extension_widget_label(widget)) {
+            window.close().map_err(|error| error.to_string())?;
+        }
+    }
     // Widget state can change in the primary frontend (for example when an
     // extension expands its own UI). Reflect that change into an already open
     // child window rather than leaving it at the size it had when it opened.

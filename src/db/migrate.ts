@@ -86,21 +86,88 @@ const BASELINE_MIGRATIONS: readonly string[] = [
   "063_lumia_gender_default_any.sql",
   "064_theme_assets.sql",
   "065_regex_script_character_id.sql",
+  "066_chat_chunks_cortex_warmup.sql",
+  "066_dream_weaver_messages.sql",
+  "066_spindle_image_ownership.sql",
+  "068_migrate_dream_weaver_from_1_0.sql",
+  "069_stt_connections.sql",
+  "070_cortex_user_edits.sql",
+  "071_import_consumed_tickets.sql",
+  "072_world_books_folder.sql",
+  "073_cortex_relation_user_edits.sql",
+  "074_audio_files.sql",
+  "075_persona_is_narrator.sql",
+  "076_cortex_salience_peak.sql",
+  "077_regex_target_array.sql",
+  "078_chats_character_id_nullable.sql",
+  "079_weaver_studio_tables.sql",
+  "080_weaver_interview_lifecycle.sql",
+  "081_weaver_bible_review.sql",
+  "082_weaver_dynamic_lane.sql",
+  "083_weaver_session_build_type.sql",
+  "084_weaver_cast.sql",
+  "085_weaver_people_rename.sql",
+  "086_weaver_narration_mode.sql",
+  "087_weaver_persona_plan.sql",
+  "088_lumihub_share_usage_stats.sql",
+  "088_multiplayer.sql",
+  "089_sso_providers.sql",
+  "090_sso_account_indexes.sql",
   "091_images_byte_size.sql",
+  "092_characters_deleting_flag.sql",
+  "093_preset_cache_revision.sql",
   "094_regex_actions.sql",
+  "095_lumihub_link_user_scope.sql",
   "096_character_folders.sql",
   "097_persona_extended_pronouns.sql",
+  "098_world_book_entry_exclude_greeting.sql",
   "098_world_book_entry_revision.sql",
   "099_character_library_scope.sql",
-  "102_agent_activity_runs.sql",
+  "100_stream_deck_tokens.sql",
+  "101_regex_script_extension_ownership.sql",
+  "102_character_source_filename_index.sql",
+  "102_spindle_provider_scope.sql",
+  "103_character_fts_update_columns.sql",
+  "103_edit_and_send_outbox.sql",
+  "104_world_book_source_filename_index.sql",
+  "104_extension_grants_scoped_unique.sql",
+  "105_st_migration_source_indexes.sql",
+  "106_image_processing_queue.sql",
+  "107_world_book_entry_order_index.sql",
+  "108_images_skip_thumbnail_processing.sql",
+  "109_illarin_instance.sql",
+  "110_illarin_delivery_receipts.sql",
+  "111_generation_outbox_connection_id.sql",
+  "112_weaver_session_taste.sql",
+  "113_agent_activity_runs.sql",
+  "114_regex_validation.sql",
+  "115_user_data_import_integrity.sql",
+  "116_agent_config_v2.sql",
+  "117_agent_turn_workspace.sql",
+  "118_agent_run_projection.sql",
+  "119_ticket_consumption_strict.sql",
+  "120_agent_run_projection_outbox.sql",
+  "121_archive_digest_constraints.sql",
+  "122_ticket_consumption_account_delete.sql",
+  "123_image_public_provenance.sql",
+  "124_user_data_import_projection_pending.sql",
+  "125_work_alpha1_workspace.sql",
+  "126_work_alpha1_inspection.sql",
+  "127_agent_runtime_repair_acknowledgements.sql",
+  "128_persistent_workspace_session_revision.sql",
+  "129_agent_inspection_source_retention.sql",
+  "130_cognition_task_provenance.sql",
+  "131_persistent_workspace_session_detach.sql",
+  "132_persistent_workspace_chat_detach.sql",
+  "133_agent_run_resync_snapshots.sql",
 ];
 
 const BASELINE_SET = new Set(BASELINE_MIGRATIONS);
 
 /** The first migration in the PR #277 schema bundle. */
-export const PRE_BUNDLE_MIGRATION_NUMBER = 102;
+export const PRE_BUNDLE_MIGRATION_NUMBER = 113;
 /** Deterministic, adjacent recovery copy retained across later migration runs. */
-export const PRE_BUNDLE_BACKUP_SUFFIX = ".pre-bundle-102.sqlite";
+export const PRE_BUNDLE_BACKUP_SUFFIX = ".pre-bundle-113.sqlite";
 
 type MigrationProof = {
   hasMigrationsTable: boolean;
@@ -449,7 +516,7 @@ function repairDreamWeaverBaselineDrift(db: Database): void {
 
 // The shipped baseline.sql was regenerated from a DB that already had
 // migrations 072, 075, and 076 applied, and includes the persistent workspace
-// session revision introduced by migration 115. Returns true when the
+// session revision introduced by migration 128. Returns true when the
 // migration's effect is already in place and the runner should record it as
 // applied without re-running.
 function isBaselineDriftAlreadyApplied(db: Database, file: string): boolean {
@@ -470,7 +537,7 @@ function isBaselineDriftAlreadyApplied(db: Database, file: string): boolean {
     const characterId = columns.find((column) => column.name === "character_id");
     return !!characterId && characterId.notnull === 0;
   }
-  if (file === "118_persistent_workspace_session_revision.sql") {
+  if (file === "128_persistent_workspace_session_revision.sql") {
     const columns = db.query("PRAGMA table_info('persistent_workspace_turn_sessions')").all() as Array<{ name: string }>;
     return columns.some((column) => column.name === "revision");
   }
@@ -482,10 +549,15 @@ function isBaselineDriftAlreadyApplied(db: Database, file: string): boolean {
 // implicit DELETE that fires ON DELETE CASCADE into every child table.
 // PRAGMA foreign_keys is a no-op inside a transaction, so the runner flips
 // it around the transaction instead of the .sql file doing it itself.
-const FOREIGN_KEYS_OFF_MIGRATIONS: Record<string, true> = {
-  "078_chats_character_id_nullable.sql": true,
-  "121_persistent_workspace_session_detach.sql": true,
-};
+const FOREIGN_KEYS_OFF_MIGRATIONS = new Set([
+  "078_chats_character_id_nullable.sql",
+  // Table rebuild (drop + recreate) of extension_grants, which carries a child
+  // FK into extensions with ON DELETE CASCADE.
+  "104_extension_grants_scoped_unique.sql",
+  // Persistent workspace detach rebuilds its session table while retaining
+  // the canonical child ownership edges.
+  "131_persistent_workspace_session_detach.sql",
+]);
 
 function applyMigrationWithForeignKeysOff(db: Database, file: string, sql: string): void {
   db.run("PRAGMA foreign_keys = OFF");
@@ -598,7 +670,7 @@ export async function runMigrations(db: Database, migrationsDir?: string): Promi
     const sql = await Bun.file(join(dir, file)).text();
     console.log(`Applying migration: ${file}`);
 
-    if (FOREIGN_KEYS_OFF_MIGRATIONS[file]) {
+    if (FOREIGN_KEYS_OFF_MIGRATIONS.has(file)) {
       applyMigrationWithForeignKeysOff(db, file, sql);
       continue;
     }

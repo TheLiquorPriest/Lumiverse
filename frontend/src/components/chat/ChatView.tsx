@@ -27,9 +27,10 @@ import useSwipeKeyboard from '@/hooks/useSwipeKeyboard'
 import useEditKeyboard from '@/hooks/useEditKeyboard'
 import useIsMobile from '@/hooks/useIsMobile'
 import { AgentRunLiveRegion, AgentRunProvisionalLocator } from './AgentRunActivity'
-import { chatLoreDockMode, chatTopDockMode } from '@/lib/chatSurfaceLayout'
+import { chatLoreDockMode, effectiveQuickToolbarDockRequest } from '@/lib/chatSurfaceLayout'
 import { measureLayoutHeight } from '@/lib/uiScale'
 import { resolveCouncilForChat } from '@/hooks/useCouncilProfiles'
+import { CHAT_REVEAL_SETTLE_CAP_MS, getChatDisplaySettleDiagnostics } from '@/lib/chatDisplaySettle'
 import MessageList from './MessageList'
 import StreamingIndicator from './StreamingIndicator'
 import MessageSelectBar from './MessageSelectBar'
@@ -42,11 +43,29 @@ import CouncilPill from './CouncilPill'
 import PortraitPanel from './PortraitPanel'
 import ExpressionDisplay from './expressions/ExpressionDisplay'
 import FloatingAvatarViewer from './FloatingAvatarViewer'
+import { QuickToolbar } from '../quick-toolbar/QuickToolbar'
+import {
+  isShowNativeBrowseMessages,
+  isShowNativeScrollToTop,
+  isShowNativeSelectMessages,
+  readQuickToolbarPlacement,
+} from '../quick-toolbar/quickToolbarDock'
+import {
+  OLDEST_MESSAGE_ACTION_ID,
+  quickToolbarOwnsOldestMessage,
+  quickToolbarRendersOldestMessageAction,
+} from './chatNativeDockOwnership'
+import { keepDockEnabledWhenFloating } from '@/lib/uiProductivityDefaults'
 import { wsClient } from '@/ws/client'
 import { EventType } from '@/ws/events'
 import type { SpindlePreGenerationActivityPayload } from '@/types/ws-events'
 import styles from './ChatView.module.css'
 import clsx from 'clsx'
+import { markLandingPageChatReturn, peekLandingPageSnapshot } from '@/lib/landingPageSnapshot'
+import { holdImagesForTransition } from '@/lib/imageDecodeCache'
+import { takeChatNavigationSnapshot } from '@/lib/chatNavigationSnapshot'
+import { hasEnabledFrontendExtension } from '@/lib/spindle/frontend-extension-availability'
+import { resolveChatContentWidthPx } from '@/lib/chatContentWidth'
 
 interface CortexNotice {
   variant: 'processing' | 'error'
@@ -66,7 +85,6 @@ const SPINDLE_NOTICE_HIDE_DELAY_MS = 280
 const SPINDLE_NOTICE_MIN_VISIBLE_MS = 700
 const WALLPAPER_TRANSITION_HALF_MS = 260
 const WALLPAPER_READY_FALLBACK_MS = 5000
-const CHAT_CHROME_ENTER_MS = 90
 const CHAT_CHROME_LEAVE_MS = 220
 
 function prefersReducedMotion(): boolean {
@@ -76,7 +94,13 @@ function prefersReducedMotion(): boolean {
 function findExtensionChild(anchor: HTMLElement): Element | null {
   for (const child of anchor.children) {
     const marked = child.hasAttribute('data-spindle-extension-root') || child.hasAttribute('data-spindle-ext')
-    const hasMountedContent = child.children.length > 0 || Boolean(child.textContent?.trim())
+    // A retained extension root can contain the canonical host-surface wrapper
+    // even when that surface intentionally renders no content. Inspect the
+    // surface's contents, not the wrapper itself, otherwise delegated
+    // chat_top_dock leaves an invisible host claiming the rail after reload.
+    const surface = child.querySelector<HTMLElement>('[data-surface-id]')
+    const contentRoot = surface ?? child
+    const hasMountedContent = contentRoot.children.length > 0 || Boolean(contentRoot.textContent?.trim())
     if (marked && hasMountedContent) return child
   }
   return null
@@ -106,10 +130,24 @@ function formatIngestionDetail(status: CortexIngestionStatus, t: (key: string, o
     sidecar: t('chatView.cortexSidecar'),
     persisting: t('chatView.cortexPersisting'),
     complete: t('chatView.cortexComplete'),
-    error: status.error || t('chatView.cortexProcessingFailed'),
+    error: formatCortexError(status.error, t, 'chatView.cortexProcessingFailed'),
   }
 
   return phaseDetail[status.phase] + (status.pendingJobs > 1 ? t('chatView.cortexJobsPending', { count: status.pendingJobs }) : '')
+}
+
+function formatCortexError(
+  error: string | undefined,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  fallbackKey: string,
+): string {
+  // Sidecar status codes are internal implementation details. They arrive via
+  // the progress socket rather than a user-facing error contract, so never
+  // render values such as "sidecar_failed" in the memory notice.
+  if (/^sidecar(?:[_\s-].*)?$/i.test(error?.trim() ?? '')) {
+    return t(fallbackKey)
+  }
+  return error || t(fallbackKey)
 }
 
 function formatRebuildDetail(payload: CortexRebuildStatus, t: (key: string, opts?: Record<string, unknown>) => string): string {
@@ -129,7 +167,7 @@ function buildCortexNotice(
     return {
       variant: 'error',
       title: t('chatView.memory'),
-      detail: rebuildStatus.error || t('chatView.memoryRebuildFailed'),
+      detail: formatCortexError(rebuildStatus.error, t, 'chatView.memoryRebuildFailed'),
       percent: rebuildStatus.percent,
     }
   }
@@ -138,7 +176,7 @@ function buildCortexNotice(
     return {
       variant: 'error',
       title: t('chatView.memory'),
-      detail: ingestionStatus.error || t('chatView.backgroundMemoryFailed'),
+      detail: formatCortexError(ingestionStatus.error, t, 'chatView.backgroundMemoryFailed'),
     }
   }
 
@@ -238,7 +276,37 @@ export default function ChatView() {
   const portraitPanelOpen = useStore((s) => s.portraitPanelOpen)
   const togglePortraitPanel = useStore((s) => s.togglePortraitPanel)
   const portraitPanelSide = useStore((s) => s.portraitPanelSide)
+  const suiteExtensionEnabled = useStore((s) => hasEnabledFrontendExtension(s.extensions, 'lumiverse_suite'))
   const [portraitSurfaceOccupied, setPortraitSurfaceOccupied] = useState(false)
+  const quickToolbarSettings = useStore((s) => s.quickToolbarSettings)
+  const nativeDockActionSide = suiteExtensionEnabled && quickToolbarSettings?.nativeDockActionSide === 'left' ? 'left' : 'right'
+  const quickToolbarPlacement = readQuickToolbarPlacement(quickToolbarSettings)
+  // Native chat-top visibility follows the persisted flags in both Suite states.
+  // Settings exposes these checkboxes with and without the Suite, so an absent
+  // Suite no longer has to force them on to stay reachable.
+  const showNativeSelectMessages = isShowNativeSelectMessages(quickToolbarSettings)
+  const showNativeScrollToTop = isShowNativeScrollToTop(quickToolbarSettings)
+  const showNativeBrowseMessages = isShowNativeBrowseMessages(quickToolbarSettings)
+  const dockQuickToolbar = suiteExtensionEnabled && quickToolbarPlacement === 'chat_top_dock'
+  const keepFloatingDockHost = suiteExtensionEnabled && quickToolbarPlacement === 'floating' && keepDockEnabledWhenFloating(quickToolbarSettings)
+  // Starts optimistic so the settings-derived answer still holds for server
+  // rendering and the first commit; the probe below corrects it from the DOM.
+  const [quickToolbarRendersOldestAction, setQuickToolbarRendersOldestAction] = useState(true)
+  const quickToolbarSettingsClaimOldestMessage = quickToolbarOwnsOldestMessage(
+    suiteExtensionEnabled,
+    quickToolbarSettings,
+  )
+  // Ownership must follow the action that is actually rendered. The persisted
+  // setting alone hands the oldest-message action to a toolbar that may not be
+  // mounted (floating host absent, hidden behind an overlay, replaced by an
+  // extension) or that normalizes/packs the action out of its rendered list,
+  // which left an eligible chat with no oldest-message control at all.
+  const quickToolbarOwnsOldestMessageAction = quickToolbarSettingsClaimOldestMessage
+    && quickToolbarRendersOldestAction
+  // Native controls own the top strip. QuickToolbar placement is a separate
+  // Suite concern and must not move or hide this native group.
+  const nativeDockRequest = 'strip' as const
+  const chatTopDockRequest = nativeDockRequest
   useEffect(() => {
     const readOccupied = () => {
       // The extension root can survive a ChatView transition while its new mount
@@ -249,6 +317,10 @@ export default function ChatView() {
       setPortraitSurfaceOccupied(Boolean(
         document.querySelector('[data-spindle-host-surface="portrait_dock.workspace"]'),
       ))
+      // Same authority rule for the shared oldest-message action: the rendered
+      // control decides ownership, not the persisted toolbar setting. The
+      // native copy is excluded by its own marker, so this cannot oscillate.
+      setQuickToolbarRendersOldestAction(quickToolbarRendersOldestMessageAction(document))
     }
     readOccupied()
     const Observer = document.defaultView?.MutationObserver
@@ -273,7 +345,10 @@ export default function ChatView() {
   const wallpaperTransitionTimeouts = useRef<number[]>([])
   const chromeEnterTimerRef = useRef<number | null>(null)
   const chromeLeaveTimerRef = useRef<number | null>(null)
-  const [chatChromeEntering, setChatChromeEntering] = useState(() => !prefersReducedMotion())
+  // Stabilization is independent of animation preference: reduced-motion
+  // users should still never see raw extension payloads before interceptors
+  // attach. CSS makes the eventual reveal instantaneous for them.
+  const [chatChromeEntering, setChatChromeEntering] = useState(true)
   const [chatChromeLeaving, setChatChromeLeaving] = useState(false)
   const messageSelectMode = useStore((s) => s.messageSelectMode)
   const setMessageSelectMode = useStore((s) => s.setMessageSelectMode)
@@ -341,6 +416,7 @@ export default function ChatView() {
     })
   }, [chatId, messageEditDraft, resumeMessageEdit, totalChatLength])
 
+
   useEffect(() => {
     const handleFindShortcut = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return
@@ -376,15 +452,11 @@ export default function ChatView() {
       chromeEnterTimerRef.current = null
     }
 
-    if (prefersReducedMotion()) {
-      setChatChromeEntering(false)
-      document.body.removeAttribute('data-chat-chrome-entering')
-      return
-    }
-
     setChatChromeEntering(true)
     document.body.setAttribute('data-chat-chrome-entering', 'true')
-    const handlePopulated = () => {
+    const handlePopulated = (event: Event) => {
+      const populatedChatId = (event as CustomEvent<{ chatId?: string }>).detail?.chatId
+      if (populatedChatId !== chatId) return
       setChatChromeEntering(false)
       document.body.removeAttribute('data-chat-chrome-entering')
       if (chromeEnterTimerRef.current !== null) {
@@ -392,14 +464,23 @@ export default function ChatView() {
         chromeEnterTimerRef.current = null
       }
     }
-    window.addEventListener('lumiverse:chat-items-populated', handlePopulated, { once: true })
+    window.addEventListener('lumiverse:chat-items-populated', handlePopulated)
 
-    // Fallback if virtualizer fails or is completely empty
+    // Fallback if virtualizer fails or is completely empty. Must exceed the
+    // MessageList settle gate (CHAT_REVEAL_SETTLE_CAP_MS) so a chat whose
+    // content is still resolving does not get revealed mid-pipeline by this
+    // timer racing the populated dispatch.
     chromeEnterTimerRef.current = window.setTimeout(() => {
       chromeEnterTimerRef.current = null
+      const detail = {
+        elapsedMs: CHAT_REVEAL_SETTLE_CAP_MS + 1500,
+        ...getChatDisplaySettleDiagnostics(chatId),
+      }
+      console.warn('[ChatDisplaySettle] ChatView fallback reveal', detail)
+      window.dispatchEvent(new CustomEvent('lumiverse:chat-display-fallback-timeout', { detail }))
       setChatChromeEntering(false)
       document.body.removeAttribute('data-chat-chrome-entering')
-    }, Math.max(CHAT_CHROME_ENTER_MS, 400))
+    }, CHAT_REVEAL_SETTLE_CAP_MS + 1500)
 
     return () => {
       window.removeEventListener('lumiverse:chat-items-populated', handlePopulated)
@@ -420,20 +501,45 @@ export default function ChatView() {
     }
   }, [])
 
+  const completeNavigateHome = useCallback(() => {
+    // Detach the visible chat before committing the route. In particular this
+    // cancels the closure-owned 32ms stream flush; leaving it for passive
+    // unmount cleanup gives that timer a window to write the streaming buffer
+    // into the newly mounted landing page.
+    const state = useStore.getState()
+    if (state.activeChatId === chatId) {
+      state.setActiveChat(null)
+      state.clearGroupChat()
+    }
+    markLandingPageChatReturn()
+    navigate('/')
+  }, [chatId, navigate])
+
   const handleNavigateHome = useCallback(() => {
     if (chromeLeaveTimerRef.current !== null) return
 
+    const landingImageUrls = peekLandingPageSnapshot()?.imageUrls ?? []
+    if (landingImageUrls.length > 0) holdImagesForTransition(landingImageUrls)
+
+    // Freeze the local stream on its newest frame before animating it out.
+    // Standalone WebKit can terminate the page when the opacity/transform
+    // transition and streaming subtree remeasurement run concurrently. The
+    // backend generation and chat head continue normally during this pause.
+    const state = useStore.getState()
+    const isActivelyStreamingThisChat = state.activeChatId === chatId && state.isStreaming
+    if (isActivelyStreamingThisChat) state.pauseStreamingForNavigation()
+
     if (prefersReducedMotion()) {
-      navigate('/')
+      completeNavigateHome()
       return
     }
 
     setChatChromeLeaving(true)
     chromeLeaveTimerRef.current = window.setTimeout(() => {
       chromeLeaveTimerRef.current = null
-      navigate('/')
+      completeNavigateHome()
     }, CHAT_CHROME_LEAVE_MS)
-  }, [navigate])
+  }, [chatId, completeNavigateHome])
 
   const cortexNotice = useMemo(() => buildCortexNotice(ingestionStatus, rebuildStatus, t), [ingestionStatus, rebuildStatus, t])
 
@@ -592,14 +698,58 @@ export default function ChatView() {
     }
   }, [chatId, t])
 
-  const innerStyle = useMemo(() => {
-    switch (chatWidthMode) {
-      case 'comfortable': return { '--lumiverse-chat-content-width': '1000px' } as React.CSSProperties
-      case 'compact': return { '--lumiverse-chat-content-width': '760px' } as React.CSSProperties
-      case 'custom': return { '--lumiverse-chat-content-width': `${chatContentMaxWidth}px` } as React.CSSProperties
-      default: return undefined
-    }
+  // Single source of truth for the chat content width. The resolver reports `null` for
+  // every unconstrained mode, which is exactly the set of modes that must publish no
+  // `--lumiverse-chat-content-width` variable at all.
+  const innerStyle = useMemo<React.CSSProperties | undefined>(() => {
+    const width = resolveChatContentWidthPx(chatWidthMode, chatContentMaxWidth)
+    return width === null
+      ? undefined
+      : ({ '--lumiverse-chat-content-width': `${width}px` } as React.CSSProperties)
   }, [chatWidthMode, chatContentMaxWidth])
+
+  // React Router reuses this component when only the chatId parameter changes.
+  // Reset the previous chat in a layout effect so its messages and streaming
+  // timer state cannot paint under the new route. Branch actions stage their
+  // freshly loaded tail so that reset can hydrate the target in the same store
+  // write instead of exposing an intermediate empty message list.
+  useLayoutEffect(() => {
+    if (!chatId || activeChatId === chatId) return
+
+    const state = useStore.getState()
+    const isHydratedMultiplayerPeer = !!state.mpRoomId
+      && !state.mpIsHost
+      && state.mpChatId === chatId
+    if (isHydratedMultiplayerPeer) return
+
+    const staged = takeChatNavigationSnapshot(chatId)
+    const metadata = staged?.chat.metadata ?? null
+    const wallpaper = metadata?.wallpaper as WallpaperRef | undefined
+    setActiveChat(chatId, staged?.chat.character_id ?? null, staged ? {
+      messages: staged.messagePage.data,
+      total: staged.messagePage.total,
+      displayOwner: staged.chat.character_display_owner ?? null,
+      name: staged.chat.name ?? null,
+      metadata,
+      wallpaper: wallpaper?.image_id ? wallpaper : null,
+    } : undefined)
+
+    if (staged) {
+      const next = useStore.getState()
+      const groupCharacterIds: string[] = metadata?.group === true
+        ? (metadata.character_ids || [])
+        : []
+      const mutedCharacterIds: string[] = metadata?.group === true
+        ? (metadata.muted_character_ids || [])
+        : []
+
+      if (metadata?.group === true && groupCharacterIds.length > 0) {
+        next.setGroupChat(true, groupCharacterIds, mutedCharacterIds)
+      } else {
+        next.clearGroupChat()
+      }
+    }
+  }, [activeChatId, chatId, setActiveChat])
 
   // Load chat and messages
   useEffect(() => {
@@ -624,15 +774,25 @@ export default function ChatView() {
         ])
         if (cancelled) return
 
-        setActiveChat(chatId, chat.character_id)
+        const activeState = useStore.getState()
+        if (activeState.activeChatId !== chatId) {
+          setActiveChat(chatId, chat.character_id)
+        } else {
+          // The route-transition layout effect already performed the destructive
+          // chat reset. Only fill in the owner now, so a generation event that
+          // arrived during the fetch is not cleared a second time.
+          activeState.setActiveCharacter(chat.character_id)
+        }
         useStore.getState().setActiveChatDisplayOwner(chat.character_display_owner ?? null)
         useStore.getState().setActiveChatName(chat.name ?? null)
         setMessages(msgPage.data, msgPage.total)
 
         if (msgPage.data.length === 0) {
           requestAnimationFrame(() => {
+            if (cancelled) return
             requestAnimationFrame(() => {
-              window.dispatchEvent(new CustomEvent('lumiverse:chat-items-populated'))
+              if (cancelled) return
+              window.dispatchEvent(new CustomEvent('lumiverse:chat-items-populated', { detail: { chatId } }))
             })
           })
         }
@@ -879,10 +1039,15 @@ export default function ChatView() {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      setActiveChat(null)
-      useStore.getState().clearGroupChat()
+      const state = useStore.getState()
+      // A home navigation now detaches synchronously. Avoid repeating that
+      // reset (or letting a stale cleanup clear a newer active chat).
+      if (state.activeChatId === chatId) {
+        state.setActiveChat(null)
+        state.clearGroupChat()
+      }
     }
-  }, [setActiveChat])
+  }, [chatId])
 
   const activeChatWallpaper = useStore((s) => s.activeChatWallpaper)
   const activeCharacterId = useStore((s) => s.activeCharacterId)
@@ -912,12 +1077,19 @@ export default function ChatView() {
   const pendingWallpaperReadyKeyRef = useRef<string | null>(null)
   const [wallpaperTransitioning, setWallpaperTransitioning] = useState(false)
   const hasAnyBackground = !!(sceneBackground || displayedWallpaper?.image_id || wallpaper.global?.image_id)
-
-  useEffect(() => {
-    if (displayedWallpaperKeyRef.current === effectiveWallpaperKey) return
-
+  const clearWallpaperTransitionTimers = useCallback(() => {
     wallpaperTransitionTimeouts.current.forEach(window.clearTimeout)
     wallpaperTransitionTimeouts.current = []
+  }, [])
+
+  useEffect(() => {
+    clearWallpaperTransitionTimers()
+    pendingWallpaperReadyKeyRef.current = null
+    if (displayedWallpaperKeyRef.current === effectiveWallpaperKey) {
+      setWallpaperTransitioning(false)
+      return clearWallpaperTransitionTimers
+    }
+
     setWallpaperTransitioning(true)
 
     const swapTimer = window.setTimeout(() => {
@@ -940,23 +1112,16 @@ export default function ChatView() {
     }, WALLPAPER_TRANSITION_HALF_MS)
 
     wallpaperTransitionTimeouts.current.push(swapTimer)
-  }, [effectiveWallpaper, effectiveWallpaperKey])
-
-  useEffect(() => {
-    return () => {
-      wallpaperTransitionTimeouts.current.forEach(window.clearTimeout)
-      wallpaperTransitionTimeouts.current = []
-    }
-  }, [])
+    return clearWallpaperTransitionTimers
+  }, [clearWallpaperTransitionTimers, effectiveWallpaper, effectiveWallpaperKey])
 
   const handleWallpaperVisualReady = useCallback((wallpaperKey: string) => {
     if (pendingWallpaperReadyKeyRef.current !== wallpaperKey) return
     pendingWallpaperReadyKeyRef.current = null
-    wallpaperTransitionTimeouts.current.forEach(window.clearTimeout)
-    wallpaperTransitionTimeouts.current = []
+    clearWallpaperTransitionTimers()
     const revealTimer = window.setTimeout(() => setWallpaperTransitioning(false), 40)
     wallpaperTransitionTimeouts.current.push(revealTimer)
-  }, [])
+  }, [clearWallpaperTransitionTimers])
 
   // Sync data-chat-bg on the root so message card CSS can skip backdrop-filter
   // when the background is a solid color (blur on solid = pure GPU waste).
@@ -1009,13 +1174,17 @@ export default function ChatView() {
       else anchor.removeAttribute('data-spindle-occupied')
     }
 
-    const syncDockRequest = (anchor: HTMLElement, resolve: (request: unknown) => string) => {
-      const request = resolve(findExtensionChild(anchor)?.getAttribute('data-dock-request') ?? null)
+    const syncDockRequest = (anchor: HTMLElement, resolve: (request: unknown) => string, defaultRequest: string | null = null, resolveChild: (request: unknown) => string = resolve) => {
+      const child = findExtensionChild(anchor)
+      const requested = child?.getAttribute('data-dock-request') ?? defaultRequest
+      const request = resolve(requested)
+      const childRequest = child ? resolveChild(requested) : null
       if (anchor.getAttribute('data-dock-request') !== request) anchor.setAttribute('data-dock-request', request)
+      if (child && childRequest !== null && child.getAttribute('data-dock-request') !== childRequest) child.setAttribute('data-dock-request', childRequest)
     }
 
     const syncTopDockHeight = () => {
-      const height = findExtensionChild(chatTopDock) ? measureLayoutHeight(chatTopDock) : 0
+      const height = measureLayoutHeight(chatTopDock)
       chatColumnInner.style.setProperty('--lcs-top-dock-height', `${height}px`)
     }
 
@@ -1024,8 +1193,8 @@ export default function ChatView() {
       syncOccupied(chatColumnTop)
       syncOccupied(chatTopDock)
       if (composerAbove) syncOccupied(composerAbove)
-      syncDockRequest(chatColumnTop, chatTopDockMode)
-      syncDockRequest(chatTopDock, chatTopDockMode)
+      syncDockRequest(chatColumnTop, (request) => effectiveQuickToolbarDockRequest(request, quickToolbarSettings))
+      syncDockRequest(chatTopDock, () => nativeDockRequest, nativeDockRequest, (request) => effectiveQuickToolbarDockRequest(request, quickToolbarSettings))
       if (composerAbove) syncDockRequest(composerAbove, chatLoreDockMode)
       syncTopDockHeight()
     }
@@ -1063,7 +1232,7 @@ export default function ChatView() {
       chatColumnInner.style.removeProperty('--lcs-top-dock-height')
       chatComposerAboveRef.current = null
     }
-  }, [chatId])
+  }, [chatId, dockQuickToolbar, keepFloatingDockHost, quickToolbarSettings])
 
   if (!chatId) return null
 
@@ -1105,7 +1274,8 @@ export default function ChatView() {
         }}
       />
       <div className={clsx(styles.wallpaperTransitionLayer, wallpaperTransitioning && !sceneBackground && styles.wallpaperTransitionLayerActive)} />
-      <div className={styles.body} {...(chatWidthMode !== 'full' ? { 'data-chat-constrained': '' } : {})}>
+      <div className={styles.body} data-lumiverse-surface="chat-body" data-chat-width-mode={chatWidthMode} {...(chatWidthMode !== 'full' ? { 'data-chat-constrained': '' } : {})}>
+        <div data-spindle-mount="chat_sidebar_left" data-spindle-scope={`chat:${chatId}:sidebar-left`} style={{ display: 'contents' }} />
         {!portraitSurfaceOccupied && portraitPanelSide !== 'none' && portraitPanelSide === 'left' && (
           <div className={clsx(styles.portraitSide, styles.portraitSideLeft, portraitPanelOpen && styles.portraitSideOpen)}>
             {!isMobile && !portraitSurfaceOccupied && <PortraitPanel side="left" />}
@@ -1162,51 +1332,33 @@ export default function ChatView() {
             data-chat-chrome-leaving={(wallpaperTransitioning || chatChromeLeaving) || undefined}
           >
             <div ref={chatColumnTopRef} data-spindle-mount="chat_column_top" />
-            <div ref={chatTopDockRef} className={styles.chatToolbar} data-spindle-mount="chat_top_dock" data-dock-request="floating">
-              <button
-                type="button"
-                className={clsx(styles.toolbarBtn, styles.toolbarBtnPrimary, messageSelectMode && styles.toolbarBtnActive)}
-                onClick={toggleSelectMode}
-                title={messageSelectMode ? t('chatView.exitSelectionMode') : t('chatView.selectMessages')}
-              >
-                <ListChecks size={14} />
-              </button>
-              {totalChatLength > 1 && (
-                <button
-                  type="button"
-                  className={styles.toolbarBtn}
-                  onClick={() => void navigateToOldestMessage()}
-                  disabled={loadingOldestMessage}
-                  title={t('scrollToTop')}
-                  aria-label={t('scrollToTop')}
-                >
-                  {loadingOldestMessage
-                    ? <LoaderCircle size={14} className={styles.toolbarSpinner} />
-                    : <ArrowUp size={14} />}
-                </button>
-              )}
-              {totalChatLength > 0 && (
-                <button
-                  type="button"
-                  className={styles.toolbarBtn}
-                  onClick={openMessageNavigator}
-                  title={t('messageNavigator.open')}
-                  aria-label={t('messageNavigator.open')}
-                >
-                  <List size={14} />
-                </button>
-              )}
-              {messageEditDraft?.chatId === chatId && (
-                <button
-                  type="button"
-                  className={clsx(styles.toolbarBtn, styles.toolbarBtnActive)}
-                  onClick={returnToEditedMessage}
-                  title={t('messageNavigator.returnToEdit')}
-                  aria-label={t('messageNavigator.returnToEdit')}
-                >
-                  <Pencil size={14} />
-                </button>
-              )}
+            <div data-spindle-mount="chat_header_left" data-spindle-scope={`chat:${chatId}:header-left`} style={{ display: 'contents' }} />
+            <div data-spindle-mount="chat_header_center" data-spindle-scope={`chat:${chatId}:header-center`} style={{ display: 'contents' }} />
+            <div data-spindle-mount="chat_header_right" data-spindle-scope={`chat:${chatId}:header-right`} style={{ display: 'contents' }} />
+            <div ref={chatTopDockRef} className={styles.chatToolbar} data-spindle-mount="chat_top_dock" data-spindle-scope={`chat:${chatId}:top-dock`} data-dock-request={chatTopDockRequest} data-native-action-side={nativeDockActionSide}>
+              <div className={styles.nativeDockActions}>
+                {showNativeSelectMessages && (
+                  <button type="button" className={clsx(styles.toolbarBtn, messageSelectMode && styles.toolbarBtnActive)} onClick={toggleSelectMode} title={messageSelectMode ? t('chatView.exitSelectionMode') : t('chatView.selectMessages')} aria-label={messageSelectMode ? t('chatView.exitSelectionMode') : t('chatView.selectMessages')} aria-pressed={messageSelectMode}>
+                    <ListChecks size={14} />
+                  </button>
+                )}
+                {!quickToolbarOwnsOldestMessageAction && showNativeScrollToTop && totalChatLength > 1 && (
+                  <button type="button" className={styles.toolbarBtn} data-toolbar-action={OLDEST_MESSAGE_ACTION_ID} data-native-dock-action={OLDEST_MESSAGE_ACTION_ID} onClick={() => void navigateToOldestMessage()} disabled={loadingOldestMessage} title={t('scrollToTop')} aria-label={t('scrollToTop')}>
+                    {loadingOldestMessage ? <LoaderCircle size={14} className={styles.toolbarSpinner} /> : <ArrowUp size={14} />}
+                  </button>
+                )}
+                {showNativeBrowseMessages && totalChatLength > 0 && (
+                  <button type="button" className={styles.toolbarBtn} onClick={openMessageNavigator} title={t('messageNavigator.open')} aria-label={t('messageNavigator.open')}>
+                    <List size={14} />
+                  </button>
+                )}
+                {messageEditDraft?.chatId === chatId && (
+                  <button type="button" className={clsx(styles.toolbarBtn, styles.toolbarBtnActive)} onClick={returnToEditedMessage} title={t('messageNavigator.returnToEdit')} aria-label={t('messageNavigator.returnToEdit')}>
+                    <Pencil size={14} />
+                  </button>
+                )}
+              </div>
+              {dockQuickToolbar && <QuickToolbar />}
             </div>
             <ChatFindBar
               chatId={chatId}
@@ -1233,7 +1385,7 @@ export default function ChatView() {
             <ScrollToBottom />
             <CouncilPill />
             {messageSelectMode && <MessageSelectBar chatId={chatId} />}
-            <div data-spindle-mount="chat_bottom_dock" data-dock-request="strip" />
+            <div data-spindle-mount="chat_bottom_dock" data-spindle-scope={`chat:${chatId}:bottom-dock`} data-dock-request="strip" />
             {isStreaming || showTerminalGenerationStatus ? <StreamingIndicator /> : null}
             <InputArea chatId={chatId} onNavigateHome={handleNavigateHome} onOpenChatFind={openChatFind} />
           </div>
@@ -1252,8 +1404,9 @@ export default function ChatView() {
             {!isMobile && !portraitSurfaceOccupied && <PortraitPanel side="right" />}
           </div>
         )}
-        <div data-spindle-mount="lorebook_half_workspace" />
-        <div data-spindle-mount="chat_surface_side" />
+        <div data-spindle-mount="chat_sidebar_right" data-spindle-scope={`chat:${chatId}:sidebar-right`} style={{ display: 'contents' }} />
+        <div data-spindle-mount="lorebook_half_workspace" data-spindle-scope={`chat:${chatId}:lorebook-half-workspace`} />
+        <div data-spindle-mount="chat_surface_side" data-spindle-scope={`chat:${chatId}:surface-side`} />
       </div>
       {isMobile && !portraitSurfaceOccupied && portraitPanelSide !== 'none' && (
         <PortraitPanel

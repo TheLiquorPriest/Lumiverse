@@ -40,8 +40,12 @@ function pickRandomGoodbyeLine(lines: string[]): string {
   const [M = 0, m = 0, p = 0] = Bun.version
     .split(".")
     .map((part) => Number.parseInt(part, 10) || 0);
-  if (M < 1 || (M === 1 && (m < 3 || (m === 3 && p < 13)))) {
-    console.error(`\n  Bun ${Bun.version} is too old — Lumiverse requires Bun >= 1.3.13.`);
+  const minimum: readonly [number, number, number] = [1, 4, 0];
+  const [requiredM, requiredMnr, requiredP] = minimum;
+  const isTooOld = M < requiredM
+    || (M === requiredM && (m < requiredMnr || (m === requiredMnr && p < requiredP)));
+  if (isTooOld) {
+    console.error(`\n  Bun ${Bun.version} is too old — Lumiverse requires Bun >= ${minimum.join(".")} on this platform.`);
     console.error(`  Update with ${process.platform === "win32" ? ".\\start.ps1" : "./start.sh"}.\n`);
     process.exit(1);
   }

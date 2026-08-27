@@ -20,6 +20,7 @@ import {
   getPreviousSameRoleContent,
   getTrailingVisibleUserMessageIds,
   listHiddenRecentChats,
+  listGroupChatSummaries,
   listRecentChats,
   listRecentChatsGrouped,
   patchMessageExtra,
@@ -723,6 +724,27 @@ describe("recent chats", () => {
     expect(group.metadata.branched_from).toBeUndefined();
     expect(group.metadata.branch_at_message).toBeUndefined();
     expect(getChatTree("u1", group.id)?.id).toBe(group.id);
+  });
+
+  test("keeps a forked one-member converted group separate from unrelated solo RPs", () => {
+    seedChat("solo-source", "c1", "Converted RP", "{}", 100);
+    seedMessage("source-msg-1", "solo-source", "Opening", {}, { index: 0 });
+    seedMessage("source-msg-2", "solo-source", "Reply", {}, { index: 1, isUser: true });
+    seedChat("unrelated-solo", "c1", "Other RP", "{}", 300);
+    seedChat("unrelated-solo-fork", "c1", "Other RP — Branch", JSON.stringify({
+      branched_from: "unrelated-solo",
+      branch_at_message: "other-msg",
+    }), 400);
+
+    const converted = convertSoloChatToGroup("u1", "solo-source")!;
+    const convertedMessages = getMessages("u1", converted.id);
+    const fork = branchChat("u1", converted.id, convertedMessages[1].id)!;
+
+    const groupHistory = listGroupChatSummaries("u1", ["c1"]);
+
+    expect(groupHistory.map((chat) => chat.id).sort()).toEqual([converted.id, fork.id].sort());
+    expect(groupHistory.every((chat) => !chat.name.startsWith("Other RP"))).toBe(true);
+    expect(getChat("u1", converted.id)).not.toBeNull();
   });
 });
 

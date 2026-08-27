@@ -3,14 +3,14 @@ services:
     image: ghcr.io/prolix-oc/lumiverse:latest
     container_name: lumiverse
     ports:
-      - "7860:7860"
+      - "${PORT:-7860}:${PORT:-7860}"
     environment:
       # ── Required ──────────────────────────────────────────────────────
       - OWNER_PASSWORD=changeme123        # min 8 chars, change this!
 
       # ── Optional ──────────────────────────────────────────────────────
       - OWNER_USERNAME=admin
-      - PORT=7860
+      - PORT=${PORT:-7860}
 
       # CORS: true = accept any origin (default for Docker).
       # For production behind a reverse proxy, set to false and use TRUSTED_ORIGINS.

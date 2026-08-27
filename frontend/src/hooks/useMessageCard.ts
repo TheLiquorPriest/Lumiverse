@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useEffect, useLayoutEffect } from 'react'
+import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router'
 import { useStore } from '@/store'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { agentActivityGenerationKey, activityGenerationFromRun, agentSummaryFromRun } from '@/store/slices/chat'
+import { generateUUID } from '@/lib/uuid'
 import {
   getCharacterAvatarThumbUrlById,
   getCharacterAvatarLargeUrlById,
@@ -20,6 +21,10 @@ import { imagesApi } from '@/api/images'
 import type { AgentSummary, AgentUsage, Message } from '@/types/api'
 import type { GenerationMetrics } from '@/types/ws-events'
 import { resolveMultiplayerMessageAuthor } from '@/lib/multiplayerMessageAuthor'
+import {
+  preloadChatNavigationSnapshot,
+  preloadChatNavigationSnapshotById,
+} from '@/lib/chatNavigationSnapshot'
 
 const AGENT_SUMMARY_STATUSES: Record<AgentSummary['status'], true> = {
   succeeded: true,
@@ -157,6 +162,8 @@ export function useMessageCard(message: Message, chatId: string) {
   const setEditReasoning = useCallback((reasoning: string) => {
     updateMessageEditDraft({ reasoning })
   }, [updateMessageEditDraft])
+  const editAndSendRequestRef = useRef<{ fingerprint: string; requestId: string } | null>(null)
+  const [editAndSendPending, setEditAndSendPending] = useState(false)
   const removeMessage = useStore((s) => s.removeMessage)
   const openModal = useStore((s) => s.openModal)
   const activeCharacterId = useStore((s) => s.activeCharacterId)
@@ -172,7 +179,8 @@ export function useMessageCard(message: Message, chatId: string) {
   const activeChatAvatarId = useStore((s) => s.activeChatAvatarId)
   const activeChatMetadata = useStore((s) => s.activeChatMetadata)
   const setActiveChatMetadata = useStore((s) => s.setActiveChatMetadata)
-  const isBubbleMode = useStore((s) => s.chatSheldDisplayMode) === 'bubble'
+  const isBubbleMode = useStore((s) => s.chatDisplayMode) === 'bubble'
+  const branchChatOnEditAndSend = useStore((s) => s.quickToolbarSettings?.branchChatOnEditAndSend ?? true)
 
   const regeneratingMessageId = useStore((s) => s.regeneratingMessageId)
   const streamingSwipeId = useStore((s) => s.streamingSwipeId)
@@ -518,8 +526,54 @@ export function useMessageCard(message: Message, chatId: string) {
   }, [activeDraft?.hadReasoning, chatId, message.id, editContent, editReasoning, message.is_user, message.extra, clearMessageEdit, updateMessage, addToast, t])
 
   const handleCancelEdit = useCallback(() => {
+    if (editAndSendPending) return
+    editAndSendRequestRef.current = null
     clearMessageEdit()
-  }, [clearMessageEdit])
+  }, [clearMessageEdit, editAndSendPending])
+
+  const handleEditAndSend = useCallback(async () => {
+    if (!message.is_user || editAndSendPending || isStreaming) return
+    const cleanContent = editContent.trim()
+    if (!cleanContent) {
+      addToast({ type: 'error', message: t('emptyEditAndSend', { defaultValue: 'Message cannot be empty' }) })
+      return
+    }
+
+    const expectedVersion = message.revision ?? 1
+    const fingerprint = `${message.id}\0${expectedVersion}\0${cleanContent}\0${branchChatOnEditAndSend ? '1' : '0'}`
+    if (editAndSendRequestRef.current?.fingerprint !== fingerprint) {
+      editAndSendRequestRef.current = { fingerprint, requestId: generateUUID() }
+    }
+    const requestId = editAndSendRequestRef.current.requestId
+
+    setEditAndSendPending(true)
+    try {
+      const result = await chatsApi.editAndSend(chatId, {
+        messageId: message.id,
+        content: cleanContent,
+        expectedVersion,
+        requestId,
+        branchChatOnEditAndSend,
+      })
+      if (branchChatOnEditAndSend) {
+        const messageLimit = useStore.getState().messagesPerPage || 50
+        await preloadChatNavigationSnapshotById(result.branchChatId, messageLimit).catch((err) => {
+          console.warn('[MessageCard] Failed to preload edit-and-send branch:', err)
+        })
+      }
+      editAndSendRequestRef.current = null
+      clearMessageEdit()
+      if (branchChatOnEditAndSend) navigate(`/chat/${result.branchChatId}`)
+    } catch (err: any) {
+      console.error('[MessageCard] Failed to edit and send:', err)
+      addToast({
+        type: 'error',
+        message: err?.body?.error || err?.message || t('failedEditAndSend', { defaultValue: 'Failed to edit and send' }),
+      })
+    } finally {
+      setEditAndSendPending(false)
+    }
+  }, [branchChatOnEditAndSend, chatId, editAndSendPending, editContent, isStreaming, message, t, addToast, clearMessageEdit, navigate])
 
   const doDeleteMessage = useCallback(async () => {
     try {
@@ -600,6 +654,10 @@ export function useMessageCard(message: Message, chatId: string) {
       onConfirm: async (name: string) => {
         try {
           const newChat = await chatsApi.branch(chatId, message.id, name)
+          const messageLimit = useStore.getState().messagesPerPage || 50
+          await preloadChatNavigationSnapshot(newChat, messageLimit).catch((err) => {
+            console.warn('[MessageCard] Failed to preload forked chat:', err)
+          })
           navigate(`/chat/${newChat.id}`)
         } catch (err) {
           console.error('[MessageCard] Failed to fork chat:', err)
@@ -642,7 +700,6 @@ export function useMessageCard(message: Message, chatId: string) {
   // back to the live roster because no per-message snapshot exists for them.
   // Non-reactive read on purpose: avoids re-rendering every card on
   // typing/presence churn.
-  // eslint-disable-next-line react-compiler/react-compiler
   const mpStore = useStore.getState()
   const mpAuthor = resolveMultiplayerMessageAuthor({
     message,
@@ -689,7 +746,9 @@ export function useMessageCard(message: Message, chatId: string) {
     isContextAnchor,
     handleEdit,
     handleSaveEdit,
+    handleEditAndSend,
     handleCancelEdit,
+    editAndSendPending,
     handleDelete,
     handleToggleHidden,
     handleToggleContextAnchor,

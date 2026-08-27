@@ -25,6 +25,7 @@ import { translateBreakdownGroupLabel } from '@/lib/i18n/breakdownGroupLabel'
 import { formatPromptItemizerOutcomeReason } from '@/lib/i18n/promptItemizerOutcome'
 import { getAnthropicBreakdownCacheHints, getAnthropicCacheUsageSummary } from '@/lib/anthropic-breakdown-cache'
 import { getNanoGptCacheUsageSummary } from '@/lib/nanogpt-breakdown-cache'
+import { getOpenAiCompatibleCacheUsageSummary } from '@/lib/openai-compatible-breakdown-cache'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { dryRunToRawPromptInput, formatRawPrompt, type RawPromptInput, type RawPromptView } from '@/lib/formatRawPrompt'
 import { shouldForceLoomRuntimePreset } from '@/lib/loom/runtimeProfile'
@@ -595,6 +596,10 @@ export default function PromptItemizerModal() {
     () => data ? getNanoGptCacheUsageSummary(data.provider, data.usage) : null,
     [data],
   )
+  const openAiCompatibleCacheUsage = useMemo(
+    () => data ? getOpenAiCompatibleCacheUsageSummary(data.provider, data.usage) : null,
+    [data],
+  )
   const cacheHintsByKey = useMemo(() => {
     const hintByEntry = new Map<BreakdownEntry, (typeof cacheHints)[number]>()
     data?.entries.forEach((entry, index) => {
@@ -1087,6 +1092,20 @@ export default function PromptItemizerModal() {
                     )}
                     {nanoGptCacheUsage.cachedTokensOpenAiStyle > 0 && (
                       <span className={styles.cacheSummaryMetric}>{t('cacheCached', { count: nanoGptCacheUsage.cachedTokensOpenAiStyle.toLocaleString() })}</span>
+                    )}
+                  </div>
+                )}
+                {openAiCompatibleCacheUsage && (
+                  <div className={styles.cacheSummary}>
+                    <span>{data.provider === 'openrouter' ? t('openRouterCache') : t('openAiCache')}</span>
+                    {openAiCompatibleCacheUsage.cacheReadInputTokens > 0 && (
+                      <span className={styles.cacheSummaryMetric}>{t('cacheRead', { count: openAiCompatibleCacheUsage.cacheReadInputTokens.toLocaleString() })}</span>
+                    )}
+                    {openAiCompatibleCacheUsage.cacheCreationInputTokens > 0 && (
+                      <span className={styles.cacheSummaryMetric}>{t('cacheWrite', { count: openAiCompatibleCacheUsage.cacheCreationInputTokens.toLocaleString() })}</span>
+                    )}
+                    {openAiCompatibleCacheUsage.cachedTokens > 0 && (
+                      <span className={styles.cacheSummaryMetric}>{t('cacheCached', { count: openAiCompatibleCacheUsage.cachedTokens.toLocaleString() })}</span>
                     )}
                   </div>
                 )}

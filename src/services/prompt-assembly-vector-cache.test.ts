@@ -107,6 +107,9 @@ function fingerprintInput(): FingerprintInput {
       request_timeout: 60,
       vertex_region: "global",
       has_api_key: true,
+      connectionProfiles: [],
+      primaryProfileId: null,
+      fallbackProfileIds: [],
     },
     worldBookVectorSettings: {
       presetMode: "balanced" as const,

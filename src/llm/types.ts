@@ -16,6 +16,8 @@ export interface LlmTextPart {
   type: "text";
   text: string;
   cache_control?: Record<string, unknown>;
+  /** Opaque Gemini thought signature for this non-tool part. */
+  thought_signature?: string;
 }
 
 export interface LlmImagePart {
@@ -107,6 +109,8 @@ export interface LlmMessage {
    *  Replayed verbatim (entire sequence, unmodified) on the assistant message
    *  to preserve chain-of-thought across tool calls. Opaque to Lumiverse. */
   reasoning_details?: Record<string, unknown>[];
+  /** Opaque Gemini signature on a non-tool response part, replayed when enabled. */
+  thought_signature?: string;
 }
 
 /** Helper: extract the text content from an LlmMessage regardless of format. */
@@ -335,6 +339,8 @@ export interface GenerationResponse {
    * and must never reach persistence, logs, error payloads, or activity DTOs.
    */
   providerTransientCarrier?: ProviderTransientCarrier;
+  /** Optional Gemini signature from a non-tool response part. */
+  thought_signature?: string;
   usage?: GenerationUsage;
 }
 
@@ -353,6 +359,8 @@ export interface StreamChunk {
   reasoning_details?: Record<string, unknown>[];
   /** Frame-private provider state; never persisted or rendered. */
   providerTransientCarrier?: ProviderTransientCarrier;
+  /** Optional Gemini signature from a non-tool response part. */
+  thought_signature?: string;
   usage?: GenerationUsage;
 }
 
@@ -425,6 +433,8 @@ export interface AssemblyContext {
   regenFeedback?: string;
   /** Where to inject regen feedback: 'system' (last system msg) or 'user' (last user msg). */
   regenFeedbackPosition?: "system" | "user";
+  /** Freeform prompt template containing the guarded {{$regenInput}} placeholder. */
+  regenFeedbackFormat?: string;
   /** When true, an extension owns this chat's `target:prompt` regex and the
    *  host skips its own per-message prompt-regex pass. */
   skipPromptRegex?: boolean;
@@ -610,10 +620,8 @@ export interface AssemblyResult {
    *  The generate service must prepend this to the LLM response content since the model
    *  continues *after* the prefill (it's not included in the model's output). */
   assistantPrefill?: string;
-  /**
-   * A Moonshot/Kimi Partial Mode prefix for `reasoning_content`. The generation
-   * service surfaces this before the provider's streamed reasoning tail.
-   */
+  /** A provider-native `reasoning_content` prefix. The generation service
+   * surfaces this before the provider's streamed reasoning tail. */
   assistantReasoningPrefill?: string;
   /** Summary of all world info entries activated during this assembly. */
   activatedWorldInfo?: ActivatedWorldInfoEntry[];
@@ -683,6 +691,13 @@ export interface AssemblyBreakdownEntry {
   firstMessageIndex?: number;
   /** Pre-counted token value (e.g. from sidecar usage stats). Skips local tokenization. */
   preCountedTokens?: number;
+  /**
+   * Alternate content used only for prompt-breakdown tokenization. The normal
+   * `content` remains the fully resolved text shown in inspectors.
+   */
+  tokenCountContent?: string;
+  /** True when this entry's token-count content delegates marker-mode WI to its World Info rows. */
+  attributesWorldInfoMarkerTokens?: boolean;
   /** If true, tokens are displayed but NOT added to the total (e.g. sidecar tokens spent on a separate LLM). */
   excludeFromTotal?: boolean;
   /** Present for prompt blocks injected by Spindle interceptors. */

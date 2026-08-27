@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { createPreset, getPreset, updatePreset } from "../services/presets.service";
+import { createRegexScript, getRegexScript, getRegexScriptsByPresetId } from "../services/regex-scripts.service";
 import { validateInstallPresetPayload } from "./payload-validation";
 import { installPreset as installPresetForUser, type InstallPresetDependencies } from "./installer";
 import type { InstallPresetPayload } from "./types";
@@ -52,8 +53,33 @@ function initInstallerTestDb(): void {
   db.run(`CREATE TABLE regex_scripts (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    script_id TEXT NOT NULL DEFAULT '',
+    find_regex TEXT NOT NULL,
+    replace_string TEXT NOT NULL DEFAULT '',
+    actions TEXT NOT NULL DEFAULT '[]',
+    flags TEXT NOT NULL DEFAULT 'gi',
+    placement TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    scope_id TEXT,
+    target TEXT NOT NULL,
+    min_depth INTEGER,
+    max_depth INTEGER,
+    trim_strings TEXT NOT NULL,
+    run_on_edit INTEGER NOT NULL DEFAULT 0,
+    substitute_macros TEXT NOT NULL DEFAULT 'none',
+    disabled INTEGER NOT NULL DEFAULT 0,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
+    folder TEXT NOT NULL DEFAULT '',
+    pack_id TEXT,
     preset_id TEXT,
-    owner_extension_identifier TEXT
+    character_id TEXT,
+    owner_extension_identifier TEXT,
+    validation_error_code TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
   )`);
   db.exec(`
     CREATE TABLE preset_agent_configs (
@@ -125,6 +151,9 @@ function initInstallerTestDb(): void {
       PRIMARY KEY (user_id, preset_id, slot_id)
     );
   `);
+  db.run(`CREATE UNIQUE INDEX idx_regex_scripts_script_id
+    ON regex_scripts(user_id, script_id)
+    WHERE script_id != ''`);
 }
 
 function installPayload(
@@ -231,6 +260,151 @@ describe("LumiHub preset installer metadata", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("AGENT_RUNTIME_PORTABLE_INVALID");
     expect(called).toBe(false);
+  });
+
+  test("imports a cover URL embedded in the preset payload", async () => {
+    const result = await installPreset("request-cover", installPayload("hub-cover", {
+      name: "Covered preset",
+      blocks: [],
+      coverUrl: "https://cdn.example.test/cover.webp",
+    }));
+
+    expect(result.success).toBe(true);
+    expect(getPreset(USER_ID, result.presetId!)?.metadata.coverUrl).toBe("https://cdn.example.test/cover.webp");
+  });
+
+  test("keeps older bundled regexes disabled without touching a same-named local folder", async () => {
+    const firstPayload = installPayload("hub-regex-history", {
+      name: "Hub preset",
+      presetVersion: "1.0.0",
+      blocks: [],
+    });
+    firstPayload.presetData.regex_scripts = [{
+      name: "Bundled v1",
+      find_regex: "v1",
+      disabled: false,
+    }];
+    const first = await installPreset("request-regex-v1", firstPayload);
+    expect(first.success).toBe(true);
+
+    const local = createRegexScript(USER_ID, {
+      name: "Local same-folder regex",
+      find_regex: "local",
+      folder: "Hub preset",
+      disabled: false,
+    });
+    expect(typeof local).not.toBe("string");
+
+    const secondPayload = installPayload("hub-regex-history", {
+      name: "Hub preset",
+      presetVersion: "2.0.0",
+      blocks: [],
+    });
+    secondPayload.presetVersion = "2.0.0";
+    secondPayload.presetData.regex_scripts = [{
+      name: "Bundled v2",
+      find_regex: "v2",
+      folder: "Hub preset",
+      disabled: false,
+    }];
+    const second = await installPreset("request-regex-v2", secondPayload);
+    expect(second.success).toBe(true);
+    expect(second.presetId).toBe(first.presetId);
+
+    const bundled = getRegexScriptsByPresetId(USER_ID, first.presetId!);
+    const v1 = bundled.find((script) => script.metadata._lumiverse_lumihub_preset?.version === "1.0.0");
+    const v2 = bundled.find((script) => script.metadata._lumiverse_lumihub_preset?.version === "2.0.0");
+    expect(v1).toMatchObject({ disabled: true, folder: "Hub preset · v1.0.0" });
+    expect(v2).toMatchObject({ disabled: true, folder: "Hub preset · LumiHub" });
+    expect(getRegexScript(USER_ID, (local as { id: string }).id)).toMatchObject({
+      disabled: false,
+      folder: "Hub preset",
+      preset_id: null,
+      metadata: {},
+    });
+  });
+
+  test("imports and versions Illarin-packaged regexes with Illarin provenance", async () => {
+    const illarinPayload = (version: string, findRegex: string): InstallPresetPayload => ({
+      source: "illarin",
+      presetId: "illarin-asset-1",
+      presetName: "Illarin preset",
+      presetVersion: version,
+      presetData: {
+        preset: {
+          name: "Illarin preset",
+          presetVersion: version,
+          blocks: [],
+          regex_scripts: [{
+            name: `Bundled ${version}`,
+            find_regex: findRegex,
+            folder: "Publisher scripts",
+            disabled: false,
+          }],
+        },
+      },
+    });
+
+    const first = await installPreset("illarin-v1", illarinPayload("1.0.0", "v1"));
+    expect(first.success).toBe(true);
+    const local = createRegexScript(USER_ID, {
+      name: "Local publisher script",
+      find_regex: "local",
+      folder: "Publisher scripts",
+      disabled: false,
+    });
+    expect(typeof local).not.toBe("string");
+
+    const second = await installPreset("illarin-v2", illarinPayload("2.0.0", "v2"));
+    expect(second.success).toBe(true);
+    expect(second.presetId).toBe(first.presetId);
+
+    const preset = getPreset(USER_ID, first.presetId!);
+    expect(preset?.metadata).toMatchObject({
+      _lumiverse_install_source: "illarin",
+      _lumiverse_illarin_asset_id: "illarin-asset-1",
+      _lumiverse_preset_version: "2.0.0",
+    });
+    expect(preset?.metadata._lumiverse_lumihub_id).toBeUndefined();
+
+    const bundled = getRegexScriptsByPresetId(USER_ID, first.presetId!);
+    const v1 = bundled.find((script) => script.metadata._lumiverse_illarin_preset?.version === "1.0.0");
+    const v2 = bundled.find((script) => script.metadata._lumiverse_illarin_preset?.version === "2.0.0");
+    expect(v1).toMatchObject({
+      disabled: true,
+      folder: "Publisher scripts · v1.0.0",
+      metadata: { _lumiverse_illarin_preset: { id: "illarin-asset-1", folderName: "Publisher scripts" } },
+    });
+    expect(v2).toMatchObject({
+      folder: "Publisher scripts · Illarin",
+      metadata: { _lumiverse_illarin_preset: { id: "illarin-asset-1", folderName: "Publisher scripts" } },
+    });
+    expect(getRegexScript(USER_ID, (local as { id: string }).id)).toMatchObject({
+      disabled: false,
+      folder: "Publisher scripts",
+      preset_id: null,
+      metadata: {},
+    });
+  });
+
+  test("fails an Illarin install when its packaged regex set is incomplete", async () => {
+    const result = await installPreset("illarin-invalid-regex", {
+      source: "illarin",
+      presetId: "illarin-asset-invalid",
+      presetName: "Broken Illarin preset",
+      presetVersion: "1.0.0",
+      presetData: {
+        preset: {
+          name: "Broken Illarin preset",
+          presetVersion: "1.0.0",
+          blocks: [],
+          regex_scripts: [null],
+        },
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Illarin preset regex import was incomplete");
   });
 
   test("preserves internal passthrough metadata on create and serialized metadata on update", async () => {
@@ -709,6 +883,28 @@ describe("LumiHub preset installer metadata", () => {
     });
 
     const installed = await installPreset("request-local-lookalike", installPayload("hub-lookalike", {
+      name: "Hub preset",
+      blocks: [],
+    }));
+
+    expect(installed.success).toBe(true);
+    expect(installed.presetId).not.toBe(local.id);
+    const count = getDb().query("SELECT COUNT(*) AS count FROM presets WHERE user_id = ?").get(USER_ID) as { count: number };
+    expect(count.count).toBe(2);
+  });
+
+  test("does not claim a local import that retains the Hub preset id", async () => {
+    const local = createPreset(USER_ID, {
+      name: "Imported local copy",
+      provider: "loom",
+      metadata: {
+        _lumiverse_install_source: "local",
+        _lumiverse_lumihub_id: "hub-local-copy",
+        _lumiverse_preset_version: "1.0.0",
+      },
+    });
+
+    const installed = await installPreset("request-local-id", installPayload("hub-local-copy", {
       name: "Hub preset",
       blocks: [],
     }));

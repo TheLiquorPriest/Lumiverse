@@ -91,24 +91,28 @@ export function isSafeResponseAssemblyFallbackError(error: unknown): boolean {
     || code === "worker_malformed";
 }
 
-const pool = new IsolatePoolV1<PromptAssemblyWorkerContext, AssemblyResult>({
-  name: "prompt-assembly",
-  workerUrl: new URL("./prompt-assembly-worker.ts", import.meta.url),
-  subprocessCommand: defaultIsolateCommand(new URL("./prompt-assembly-subprocess.ts", import.meta.url)),
-  workerRequest: (job) => ({
-    version: 1,
-    type: "request",
-    requestId: job.requestId,
-    operation: "assemble_prompt",
-    payload: job.payload,
-  }),
-  responseParser: parsePromptAssemblyResponse,
-  maxWorkers: HOST_PREPARATION_LIMITS_V1.maxWorkers,
-  maxQueuedPerUser: HOST_PREPARATION_LIMITS_V1.maxQueuedJobsPerUser,
-  maxQueuedGlobal: HOST_PREPARATION_LIMITS_V1.maxQueuedJobsProcess,
-  maxFrameBytes: HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
-  defaultTimeoutMs: HOST_PREPARATION_LIMITS_V1.maxWallClockMs,
-});
+function createPromptAssemblyPool(): IsolatePoolV1<PromptAssemblyWorkerContext, AssemblyResult> {
+  return new IsolatePoolV1<PromptAssemblyWorkerContext, AssemblyResult>({
+    name: "prompt-assembly",
+    workerUrl: new URL("./prompt-assembly-worker.ts", import.meta.url),
+    subprocessCommand: defaultIsolateCommand(new URL("./prompt-assembly-subprocess.ts", import.meta.url)),
+    workerRequest: (job) => ({
+      version: 1,
+      type: "request",
+      requestId: job.requestId,
+      operation: "assemble_prompt",
+      payload: job.payload,
+    }),
+    responseParser: parsePromptAssemblyResponse,
+    maxWorkers: HOST_PREPARATION_LIMITS_V1.maxWorkers,
+    maxQueuedPerUser: HOST_PREPARATION_LIMITS_V1.maxQueuedJobsPerUser,
+    maxQueuedGlobal: HOST_PREPARATION_LIMITS_V1.maxQueuedJobsProcess,
+    maxFrameBytes: HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
+    defaultTimeoutMs: HOST_PREPARATION_LIMITS_V1.maxWallClockMs,
+  });
+}
+
+let pool = createPromptAssemblyPool();
 
 export function assemblePromptInWorker(ctx: AssemblyContext): Promise<AssemblyResult> {
   const {
@@ -129,6 +133,15 @@ export function assemblePromptInWorker(ctx: AssemblyContext): Promise<AssemblyRe
 
 export function getPromptAssemblyWorkerHealth() {
   return getIsolateHealthSnapshot();
+}
+
+/** Release the reconstructable pool only when no prompt is active or queued. */
+export function releaseIdlePromptAssemblyWorkers(): number {
+  if (pool.activeCount() > 0 || pool.queuedCount() > 0) return 0;
+  const idlePool = pool;
+  pool = createPromptAssemblyPool();
+  void idlePool.shutdown();
+  return 1;
 }
 
 export async function shutdownPromptAssemblyWorkerPool(): Promise<void> {

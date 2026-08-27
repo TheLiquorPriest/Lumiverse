@@ -13,6 +13,7 @@ let container: HTMLDivElement
 let previousGlobals: Record<string, unknown>
 
 const storeState = {
+  extensions: [{ id: 'suite', enabled: true, has_frontend: true }],
   activatedWorldInfo: [{
     id: 'legacy-entry',
     comment: 'Legacy lore',
@@ -49,7 +50,9 @@ const storeState = {
   },
   lorebookEditorSettings: { loreIndicatorActionEnabled: false },
   inputBarActions: [] as Array<{
+    extensionId: string
     enabled: boolean
+    externallyInvocable?: boolean
     contributionId: string
     payloadVersion?: number
     clickHandlers: Set<(payload?: unknown) => void>
@@ -174,7 +177,9 @@ describe('LoreIndicatorPanel legacy appearance settings', () => {
     const invoked: unknown[] = []
     storeState.lorebookEditorSettings.loreIndicatorActionEnabled = true
     storeState.inputBarActions = [{
+      extensionId: 'suite',
       enabled: true,
+      externallyInvocable: true,
       contributionId: 'lumiverse_suite.lorebook.open_half',
       payloadVersion: 1,
       clickHandlers: new Set<(payload?: unknown) => void>([(payload) => invoked.push(payload)]),

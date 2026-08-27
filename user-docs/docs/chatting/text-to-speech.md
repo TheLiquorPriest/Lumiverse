@@ -24,6 +24,8 @@ Once a connection exists, open **Settings → Voice & Speech**, turn on **Enable
 
 ## Providers
 
+The built-in providers are listed below. Enabled [Spindle extensions](../extensions/index.md#extension-provided-ai-providers) can also register TTS providers; those appear in Lumiverse's voice provider and connection selectors after an operator approves the extension's privileged provider permission.
+
 ### OpenAI TTS
 
 - **API key:** Required.

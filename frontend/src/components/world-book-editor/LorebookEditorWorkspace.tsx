@@ -19,6 +19,8 @@ import { useTranslation } from 'react-i18next'
 import { ApiError } from '@/api/client'
 import { worldBooksApi } from '@/api/world-books'
 import { toast } from '@/lib/toast'
+import { wsClient } from '@/ws/client'
+import { EventType } from '@/ws/events'
 import {
   backfillEntryMetadata,
   buildEntryGridTemplate,
@@ -174,6 +176,9 @@ export default function LorebookEditorWorkspace({
   selectedBookIdRef.current = selectedBookId
   const requestedEntriesBookId = useRef<string | null>(null)
   const entriesRequestSeq = useRef(0)
+  const entriesAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => entriesAbortRef.current?.abort(), [])
 
   useEffect(() => {
     setSavedAt(null)
@@ -184,11 +189,14 @@ export default function LorebookEditorWorkspace({
   const loadEntries = useCallback((bookId: string, preserveSelection = true): Promise<void> => {
     requestedEntriesBookId.current = bookId
     const seq = ++entriesRequestSeq.current
+    entriesAbortRef.current?.abort()
+    const controller = new AbortController()
+    entriesAbortRef.current = controller
     setLoading(true)
     setEntriesComplete(false)
     return (async () => {
       try {
-        const result = await worldBooksApi.listAllEntries(bookId)
+        const result = await worldBooksApi.listAllEntries(bookId, { signal: controller.signal })
         // A newer request started while this one was in flight — a book switch,
         // Refresh, or the reload that ends every bulk action. That answer is the
         // current one, so this older payload is dropped rather than committed
@@ -206,7 +214,10 @@ export default function LorebookEditorWorkspace({
           return result[0]?.id ?? null
         })
         setSelectedIds((current) => current.filter((id) => result.some((entry) => entry.id === id)))
+      } catch (error) {
+        if (!controller.signal.aborted) throw error
       } finally {
+        if (entriesAbortRef.current === controller) entriesAbortRef.current = null
         // Only the newest request owns the spinner; a superseded one clearing it
         // would report "loaded" while the current fetch is still out.
         if (seq === entriesRequestSeq.current) setLoading(false)
@@ -234,6 +245,12 @@ export default function LorebookEditorWorkspace({
     setSelectedBookId((current) => current ?? initialBookId ?? result.data[0]?.id ?? null)
     if (resolved && requestedEntriesBookId.current !== resolved) void loadEntries(resolved, false)
   }, [initialBookId, loadEntries])
+
+  useEffect(() => {
+    return wsClient.on(EventType.WORLD_BOOK_LIBRARY_CHANGED, () => {
+      void loadBooks()
+    })
+  }, [loadBooks])
 
   // The two opening requests, issued in the same tick.
   //
@@ -693,6 +710,11 @@ export default function LorebookEditorWorkspace({
           )}
         </div>
       </header>
+      <span
+        data-spindle-mount="lorebook_workspace"
+        data-spindle-scope={`lorebook:${selectedBookId ?? 'none'}:workspace`}
+        className={styles.spindleWorkspaceMount}
+      />
 
       <div className={styles.panes} ref={panesRef}>
         {variant === 'full' && (
@@ -790,6 +812,7 @@ export default function LorebookEditorWorkspace({
           />
 
           <EntryTable
+            bookId={selectedBookId}
             entries={entries}
             filteredEntries={filteredEntries}
             searchResultsById={entrySearchResultsById}
@@ -837,30 +860,32 @@ export default function LorebookEditorWorkspace({
             <span>Editing Entry</span>
             <span>{savedAt ? 'Saved' : ''}</span>
           </div>
-          {selectedEntry ? (
-            <>
-              {conflicts[selectedEntry.id] && (
-                <div className={styles.conflictBanner} role="alert">
-                  <strong>Newer server revision detected.</strong>
-                  <span>Your unsaved draft is preserved.</span>
-                  <button type="button" onClick={() => void resolveConflict(selectedEntry.id, true)}>Reapply draft</button>
-                  <button type="button" onClick={() => void resolveConflict(selectedEntry.id, false)}>Use server version</button>
-                </div>
-              )}
-              {/* Keyed on id + conflict state only. Including the revision remounted
-                  the editor on every background save — including the automatic token
-                  estimate — which reset local field state mid-edit. */}
-              <WorldBookEntryEditor
-                key={`${selectedEntry.id}:${conflicts[selectedEntry.id] ? 'conflict' : 'clean'}`}
-                entry={selectedEntry}
-                onUpdate={debouncedSaveEntry}
-                onImmediateUpdate={saveEntry}
-                density="compact"
-              />
-            </>
-          ) : (
-            <div className={styles.empty}>Select an entry to edit.</div>
-          )}
+          <div className={styles.inspectorBody}>
+            {selectedEntry ? (
+              <>
+                {conflicts[selectedEntry.id] && (
+                  <div className={styles.conflictBanner} role="alert">
+                    <strong>Newer server revision detected.</strong>
+                    <span>Your unsaved draft is preserved.</span>
+                    <button type="button" onClick={() => void resolveConflict(selectedEntry.id, true)}>Reapply draft</button>
+                    <button type="button" onClick={() => void resolveConflict(selectedEntry.id, false)}>Use server version</button>
+                  </div>
+                )}
+                {/* Keyed on id + conflict state only. Including the revision remounted
+                    the editor on every background save — including the automatic token
+                    estimate — which reset local field state mid-edit. */}
+                <WorldBookEntryEditor
+                  key={`${selectedEntry.id}:${conflicts[selectedEntry.id] ? 'conflict' : 'clean'}`}
+                  entry={selectedEntry}
+                  onUpdate={debouncedSaveEntry}
+                  onImmediateUpdate={saveEntry}
+                  density="compact"
+                />
+              </>
+            ) : (
+              <div className={styles.empty}>Select an entry to edit.</div>
+            )}
+          </div>
         </aside>
       </div>
     </section>

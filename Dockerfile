@@ -11,7 +11,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build frontend (Vite + TypeScript)
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3.14-slim@sha256:d56a2534ffd262e92c12fd3249d3924d296d97086da773f821d7d0477435ea04 AS frontend-build
+FROM oven/bun:1.4.0-slim@sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6 AS frontend-build
 WORKDIR /app/frontend
 
 # Install dependencies first (cache layer)
@@ -38,7 +38,7 @@ RUN echo "frontend-refresh: ${FRONTEND_REFRESH}" && bun run build
 # ---------------------------------------------------------------------------
 # Stage 2: Install backend production dependencies
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3.14-slim@sha256:d56a2534ffd262e92c12fd3249d3924d296d97086da773f821d7d0477435ea04 AS backend-deps
+FROM oven/bun:1.4.0-slim@sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6 AS backend-deps
 
 WORKDIR /app
 
@@ -50,7 +50,7 @@ RUN bun install --production --frozen-lockfile
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3.14-slim@sha256:d56a2534ffd262e92c12fd3249d3924d296d97086da773f821d7d0477435ea04
+FROM oven/bun:1.4.0-slim@sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6
 
 # CA_REFRESH: cache-busting marker for the apt layer below. Bump (or pass via
 # --build-arg) to force apt-get to re-fetch the `ca-certificates` package so the

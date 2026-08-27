@@ -4,6 +4,7 @@ import { useStore } from '@/store'
 import { ModalShell } from '@/components/shared/ModalShell'
 import { CloseButton } from '@/components/shared/CloseButton'
 import { Button } from '@/components/shared/FormComponents'
+import ConnectionSelect from '@/components/shared/ConnectionSelect'
 import VoicePicker from '@/components/shared/VoicePicker'
 import { chatsApi } from '@/api/chats'
 import { presetsApi } from '@/api/presets'
@@ -74,6 +75,12 @@ export default function GroupSettingsModal() {
   const [loadingPresets, setLoadingPresets] = useState(false)
   const [impersonationPresetId, setImpersonationPresetId] = useState<string>(
     typeof metadata.impersonation_preset_id === 'string' ? metadata.impersonation_preset_id : ''
+  )
+  const [connectionProfileId, setConnectionProfileId] = useState<string>(
+    typeof metadata.connection_profile_id === 'string' ? metadata.connection_profile_id : ''
+  )
+  const [connectionModel, setConnectionModel] = useState<string>(
+    typeof metadata.connection_model === 'string' ? metadata.connection_model : ''
   )
   const [talkativenessOverrides, setTalkativenessOverrides] = useState<Record<string, number>>(
     metadata.talkativeness_overrides ?? {}
@@ -164,6 +171,8 @@ export default function GroupSettingsModal() {
 
       const metadataPatch: Record<string, any> = {
         impersonation_preset_id: impersonationPresetId || null,
+        connection_profile_id: connectionProfileId || null,
+        connection_model: connectionProfileId && connectionModel.trim() ? connectionModel.trim() : null,
       }
 
       if (isGroup) {
@@ -211,7 +220,7 @@ export default function GroupSettingsModal() {
     } finally {
       setSaving(false)
     }
-  }, [saving, chatId, groupName, impersonationPresetId, isGroup, talkativenessOverrides, groupCardMode, groupLorebookMode, groupResponseOrder, scenarioMode, scenarioMemberId, scenarioCustom, chatCharacter, characterOverride, narratorOverride, initialVoiceOverrides, setActiveChatMetadata, modalProps, closeModal])
+  }, [saving, chatId, groupName, impersonationPresetId, connectionProfileId, connectionModel, isGroup, talkativenessOverrides, groupCardMode, groupLorebookMode, groupResponseOrder, scenarioMode, scenarioMemberId, scenarioCustom, chatCharacter, characterOverride, narratorOverride, initialVoiceOverrides, setActiveChatMetadata, modalProps, closeModal])
 
   return (
     <ModalShell isOpen={true} onClose={closeModal} maxWidth={520}>
@@ -256,6 +265,32 @@ export default function GroupSettingsModal() {
             </select>
             <div style={{ fontSize: 'calc(11px * var(--lumiverse-font-scale, 1))', color: 'var(--lumiverse-text-dim)', lineHeight: 1.45 }}>
               {t('impersonationHint')}
+            </div>
+          </div>
+
+          <div className={styles.fieldGroup}>
+            <label className={styles.fieldLabel}>{t('connectionProfile')}</label>
+            <ConnectionSelect
+              kind="llm"
+              value={connectionProfileId}
+              onChange={setConnectionProfileId}
+              withModel
+              modelValue={connectionModel}
+              onModelChange={setConnectionModel}
+              seedDefaultModel={false}
+              placeholder={t('useGlobalConnection')}
+              emptyMessage={t('noConnectionProfiles')}
+              ariaLabel={t('connectionProfile')}
+              clearable
+              clearLabel={t('useGlobalConnection')}
+              portal
+              modelPlaceholder={t('useConnectionDefaultModel')}
+              modelEmptyMessage={t('noModelsForConnection')}
+              modelNoConnectionMessage={t('selectConnectionFirst')}
+              modelAppearance="standard"
+            />
+            <div className={styles.fieldHint}>
+              {t('connectionProfileHint')}
             </div>
           </div>
 

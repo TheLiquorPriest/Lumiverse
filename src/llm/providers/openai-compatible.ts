@@ -91,6 +91,7 @@ export function parseOpenAIResponsesUsage(
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: promptTokens + completionTokens,
+    provider_raw: { ...record },
   };
 }
 
@@ -304,11 +305,11 @@ type OpenAIStreamToolCallBuffer = { id: string; name: string; argsJson: string }
 
 /** Complete identified stream-end tool calls become executable results; incomplete or malformed calls are dropped. */
 function finalizeOpenAIStreamToolCalls(
-  buffer: OpenAIStreamToolCallBuffer[],
+  buffer: Array<OpenAIStreamToolCallBuffer | undefined>,
 ): ToolCallResult[] | undefined {
   const completed: ToolCallResult[] = [];
   for (const tc of buffer) {
-    if (!tc.name || !tc.id) continue;
+    if (!tc?.name || !tc.id) continue;
     try {
       completed.push({
         name: tc.name,
@@ -372,6 +373,15 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     return url;
   }
 
+  /** Resolve the request URL separately from model/auth endpoints so providers
+   * can route opt-in chat features without changing their stable API base. */
+  protected chatCompletionsUrl(
+    apiUrl: string,
+    _request: GenerationRequest,
+  ): string {
+    return `${this.baseUrl(apiUrl)}/chat/completions`;
+  }
+
   /** Override to add provider-specific headers (e.g. OpenRouter's HTTP-Referer). */
   protected extraHeaders(_apiKey: string): Record<string, string> {
     return {};
@@ -396,7 +406,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     apiUrl: string,
     request: GenerationRequest
   ): Promise<GenerationResponse> {
-    const url = `${this.baseUrl(apiUrl)}/chat/completions`;
+    const url = this.chatCompletionsUrl(apiUrl, request);
     const body = this.buildBody(request, false);
 
     const res = await fetchWithPreflightAbort(url, {
@@ -501,7 +511,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     apiUrl: string,
     request: GenerationRequest
   ): AsyncGenerator<StreamChunk, void, unknown> {
-    const url = `${this.baseUrl(apiUrl)}/chat/completions`;
+    const url = this.chatCompletionsUrl(apiUrl, request);
     const body = this.buildBody(request, true);
 
     const res = await fetchWithPreflightAbort(url, {
@@ -526,7 +536,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
     });
     let eventCount = 0;
     let reasoningKey: "reasoning" | "reasoning_content" | null = null;
-    const toolCallBuffer: Array<{ id: string; name: string; argsJson: string }> = [];
+    const toolCallBuffer: Array<OpenAIStreamToolCallBuffer | undefined> = [];
     const reasoningDetails = new ReasoningDetailsAccumulator();
     let sawFinishReason = false;
     let sawUsageTrailer = false;
@@ -627,10 +637,13 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
           throw new ProviderProtocolError("OpenAI tool_calls delta must be an array");
         }
         for (const tc of rawToolDeltas) {
-          if (!tc || typeof tc !== "object" || !Number.isSafeInteger(tc.index) || tc.index < 0) {
+          if (!tc || typeof tc !== "object") {
+            throw new ProviderProtocolError("OpenAI tool call delta is malformed");
+          }
+          const idx = tc.index ?? toolCallBuffer.length;
+          if (!Number.isSafeInteger(idx) || idx < 0) {
             throw new ProviderProtocolError("OpenAI tool call delta has an invalid index");
           }
-          const idx = tc.index as number;
           if (idx > PROVIDER_STREAM_LIMITS.maxCalls - 1) {
             throw new ProviderResponseTooLargeError(
               `OpenAI tool call count exceeded ${PROVIDER_STREAM_LIMITS.maxCalls}`,
@@ -638,10 +651,8 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
               idx + 1,
             );
           }
-          if (idx > toolCallBuffer.length) {
-            throw new ProviderProtocolError("OpenAI tool call deltas arrived out of order");
-          }
-          if (idx === toolCallBuffer.length) {
+          let buffered = toolCallBuffer[idx];
+          if (!buffered) {
             if (typeof tc.id !== "string" || tc.id.length === 0) {
               throw new ProviderProtocolError("OpenAI tool call is missing its native ID");
             }
@@ -652,8 +663,9 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
               throw new ProviderProtocolError("OpenAI tool call IDs must be unique");
             }
             seenNativeIds.add(tc.id);
-            toolCallBuffer.push({ id: tc.id, name: "", argsJson: "" });
-          } else if (tc.id !== undefined && tc.id !== toolCallBuffer[idx].id) {
+            buffered = { id: tc.id, name: "", argsJson: "" };
+            toolCallBuffer[idx] = buffered;
+          } else if (tc.id !== undefined && tc.id !== buffered.id) {
             throw new ProviderProtocolError("OpenAI tool call ID changed during streaming");
           }
           const functionDelta = tc.function;
@@ -664,11 +676,11 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
             if (typeof functionDelta.name !== "string" || functionDelta.name.length === 0) {
               throw new ProviderProtocolError("OpenAI tool function name must be a non-empty string");
             }
-            const currentName = toolCallBuffer[idx].name;
+            const currentName = buffered.name;
             if (currentName && currentName !== functionDelta.name) {
               throw new ProviderProtocolError("OpenAI tool function name changed during streaming");
             }
-            toolCallBuffer[idx].name = functionDelta.name;
+            buffered.name = functionDelta.name;
           }
           if (functionDelta?.arguments !== undefined) {
             if (typeof functionDelta.arguments !== "string") {
@@ -682,7 +694,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
                 deltaBytes,
               );
             }
-            const nextBytes = Buffer.byteLength(toolCallBuffer[idx].argsJson, "utf8") + deltaBytes;
+            const nextBytes = Buffer.byteLength(buffered.argsJson, "utf8") + deltaBytes;
             if (nextBytes > PROVIDER_STREAM_LIMITS.maxArgumentsBytes) {
               throw new ProviderResponseTooLargeError(
                 "OpenAI tool arguments exceeded their bounded carrier",
@@ -690,7 +702,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
                 nextBytes,
               );
             }
-            toolCallBuffer[idx].argsJson += functionDelta.arguments;
+            buffered.argsJson += functionDelta.arguments;
           }
         }
       }
@@ -889,12 +901,22 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       return { reasoning_details: m.reasoning_details };
     }
     if (!includePlaintext) return {};
-    return m.reasoning_content
+    return m.reasoning_content && this.replayReasoningContentOnPlainAssistant(m)
       ? { reasoning_content: m.reasoning_content }
       : {};
   }
 
-  /** Keys that are internal to Lumiverse and should never be sent to APIs. */
+  /**
+   * Most OpenAI-compatible relays retain native reasoning on ordinary history
+   * turns. Providers whose APIs only accept `reasoning_content` on tool-call
+   * continuations override this hook; the explicit tool-call branch above is
+   * intentionally unaffected.
+   */
+  protected replayReasoningContentOnPlainAssistant(_message: LlmMessage): boolean {
+    return true;
+  }
+
+  /** Keys that are internal to Lumiverse and should never be sent to any provider API. */
   protected static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "use_responses_api"]);
 
   /** Keys that custom bodies cannot use to widen a feature-active tool mode. */

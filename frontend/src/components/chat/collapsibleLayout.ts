@@ -6,6 +6,14 @@ function getTagName(target: EventTarget | null | undefined): string | null {
   return typeof rawTagName === 'string' ? rawTagName.toLowerCase() : null
 }
 
+export function isCollapsibleToggleElement(target: EventTarget | null | undefined): boolean {
+  if (getTagName(target) === 'summary') return true
+  const hasAttribute = (target as { hasAttribute?: unknown } | null)?.hasAttribute
+  if (typeof hasAttribute !== 'function') return false
+  const element = target as unknown as { hasAttribute(name: string): boolean }
+  return element.hasAttribute('data-reasoning-toggle') || element.hasAttribute('data-long-message-toggle')
+}
+
 export function getEventPath(event: Event): readonly EventTarget[] {
   if (typeof event.composedPath === 'function') {
     const path = event.composedPath()

@@ -16,6 +16,7 @@ import { copyTextToClipboard } from '@/lib/clipboard'
 import { shouldForceLoomRuntimePreset } from '@/lib/loom/runtimeProfile'
 import { agentRuntimeErrorTranslationKey } from '@/lib/agentRuntimeSelection'
 import { startGenerationWithRecovery } from '@/lib/generation-recovery'
+import { preloadChatNavigationSnapshot } from '@/lib/chatNavigationSnapshot'
 
 export type CommandScope = 'global' | 'chat' | 'chat-idle' | 'landing' | 'character'
 
@@ -264,6 +265,10 @@ export const COMMANDS: Command[] = [
         onConfirm: async (name: string) => {
           try {
             const newChat = await chatsApi.branch(activeChatId, lastMessage.id, name)
+            const messageLimit = useStore.getState().messagesPerPage || 50
+            await preloadChatNavigationSnapshot(newChat, messageLimit).catch((err) => {
+              console.warn('[commands] Failed to preload forked chat:', err)
+            })
             navigate(`/chat/${newChat.id}`)
           } catch {
             useStore.getState().addToast({ type: 'error', message: tc('toast.failedForkChat') })

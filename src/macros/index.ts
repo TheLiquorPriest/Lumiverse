@@ -48,6 +48,7 @@ import { registerPromptVarMacros } from "./definitions/prompt-vars";
 import { registerMultiplayerMacros } from "./definitions/multiplayer";
 import { registerIterationMacros } from "./definitions/iteration";
 import { registerListMacros } from "./definitions/lists";
+import { registerWebSearchMacros } from "./definitions/web-search";
 
 let initialized = false;
 
@@ -83,4 +84,5 @@ export function initMacros(): void {
   registerMultiplayerMacros();
   registerIterationMacros();
   registerListMacros();
+  registerWebSearchMacros();
 }

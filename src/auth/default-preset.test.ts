@@ -7,6 +7,7 @@ import {
   BUILTIN_DEFAULT_PRESET_SLUG,
   seedDefaultPreset,
 } from "./default-preset";
+import { SYSTEM_SECRET_PRINCIPAL, SYSTEM_SECRET_PRINCIPAL_EMAIL } from "../services/secrets.service";
 
 function initDefaultPresetTestDb(): void {
   closeDatabase();
@@ -16,6 +17,7 @@ function initDefaultPresetTestDb(): void {
   db.run(`CREATE TABLE "user" (
     id TEXT PRIMARY KEY,
     username TEXT,
+    email TEXT,
     createdAt INTEGER NOT NULL
   )`);
 
@@ -213,5 +215,21 @@ describe("default preset seeding", () => {
     expect(second.upgradedLegacy).toBe(0);
     expect(second.activated).toBe(0);
     expect(second.markedSeeded).toBe(0);
+  });
+
+  test("startup backfill skips the reserved system principal", () => {
+    // The synthetic row sorts first (createdAt = 0 legacy shape): the
+    // exclusion guard must keep it out of preset seeding regardless.
+    getDb().run(
+      `INSERT INTO "user" (id, username, email, createdAt) VALUES (?, 'System', ?, 0)`,
+      [SYSTEM_SECRET_PRINCIPAL, SYSTEM_SECRET_PRINCIPAL_EMAIL],
+    );
+    insertUser("u1", 1);
+
+    const result = backfillDefaultPresets();
+
+    expect(result.usersScanned).toBe(1);
+    expect(countPresets(SYSTEM_SECRET_PRINCIPAL)).toBe(0);
+    expect(findBuiltInPreset("u1")).not.toBeNull();
   });
 });

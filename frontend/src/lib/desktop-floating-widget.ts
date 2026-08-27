@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import type { FloatWidgetState } from '@/store/slices/spindle-placement'
 import type { ExtensionInfo } from 'lumiverse-spindle-types'
+import { filterEnabledFrontendContributions } from '@/lib/spindle/frontend-extension-availability'
 
 export interface DesktopFloatingWidgetTarget {
   extensionId: string
@@ -70,10 +71,14 @@ export function buildDesktopFloatingWidgetCatalog(
   widgets: FloatWidgetState[],
   extensions: ExtensionInfo[],
 ): DesktopFloatingWidgetCatalogEntry[] {
-  const extensionNames = new Map(extensions.map((extension) => [extension.id, extension.name]))
+  const extensionNames = new Map(
+    extensions
+      .filter((extension) => extension.enabled && extension.has_frontend)
+      .map((extension) => [extension.id, extension.name]),
+  )
   const positions = new Map<string, number>()
 
-  return widgets
+  return filterEnabledFrontendContributions(widgets, extensions)
     .filter((widget) => widget.visible)
     .map((widget) => {
       const index = positions.get(widget.extensionId) ?? 0

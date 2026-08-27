@@ -152,6 +152,8 @@ export interface ApplyDisplayRegexResult {
   result: string;
   touchedVars: ReadonlySet<string>;
   cacheable: boolean;
+  /** Scripts independently stopped by the backend sandbox watchdog. */
+  timedOutScriptIds: ReadonlySet<string>;
 }
 
 function getDisplayBehaviorContext(
@@ -304,11 +306,17 @@ export async function applyDisplayRegex(input: ApplyDisplayRegexInput): Promise<
   if (!noCache) {
     const cached = DISPLAY_REGEX_CACHE.get(cacheKey);
     if (cached && (env ? cached.touched.every(([n, val]) => varStateForKey(env, n) === val) : cached.touched.length === 0)) {
-      return { result: cached.result, touchedVars: new Set(cached.touched.map(([n]) => n)), cacheable: true };
+      return {
+        result: cached.result,
+        touchedVars: new Set(cached.touched.map(([n]) => n)),
+        cacheable: true,
+        timedOutScriptIds: new Set(),
+      };
     }
   }
 
   const fingerprint = { touchedVars: new Set<string>(), cacheable: true };
+  const timedOutScriptIds = new Set<string>();
   const hasRepeatBack = hasRegexMatchAction(input.scripts, "repeat_back");
   const behaviorContext = hasRepeatBack
     ? getDisplayBehaviorContext(input.userId, input.context)
@@ -326,6 +334,9 @@ export async function applyDisplayRegex(input: ApplyDisplayRegexInput): Promise<
     {
       source: "display_backend",
       outFingerprint: fingerprint,
+      onPerformanceIssue: (issue) => {
+        if (issue.timedOut) timedOutScriptIds.add(issue.scriptId);
+      },
       ...(behaviorContext ?? {}),
     },
   );
@@ -343,5 +354,6 @@ export async function applyDisplayRegex(input: ApplyDisplayRegexInput): Promise<
     result,
     touchedVars: fingerprint.touchedVars,
     cacheable: fingerprint.cacheable,
+    timedOutScriptIds,
   };
 }

@@ -1,4 +1,4 @@
-import { get, post, put, del } from './client'
+import { BASE_URL, get, post, put, del } from './client'
 import type { Preset, PresetRegistryItem, CreatePresetInput, UpdatePresetInput, PaginatedResult } from '@/types/api'
 import type { PromptBlock } from '@/lib/loom/types'
 import type { PortableAgentConfigV1, PortableAgenticRuntimeEnvelopeV1 } from '@/lib/loom/service'
@@ -75,6 +75,27 @@ export const presetsApi = {
 
   delete(id: string) {
     return del<void>(`/presets/${id}`)
+  },
+
+  bulkDelete(ids: string[]) {
+    return post<{ deleted: string[] }>('/presets/bulk-delete', { ids })
+  },
+
+  prepareBulkExport(ids: string[]) {
+    return post<{ downloadId: string; archiveUrl: string; filename: string; count: number }>(
+      '/presets/bulk-export/prepare',
+      { ids },
+    )
+  },
+
+  downloadPreparedExport(archiveUrl: string, filename: string) {
+    const anchor = document.createElement('a')
+    anchor.href = archiveUrl.startsWith('/') ? archiveUrl : `${BASE_URL}${archiveUrl}`
+    anchor.download = filename
+    anchor.style.display = 'none'
+    document.body.appendChild(anchor)
+    anchor.click()
+    document.body.removeChild(anchor)
   },
 
   listStash() {

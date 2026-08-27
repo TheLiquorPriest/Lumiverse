@@ -7,8 +7,8 @@ import * as resolveSvc from "../services/tokenizer-resolve.service";
 import * as hfSvc from "../services/huggingface.service";
 
 const app = new Hono();
-const publicBodyLimit = bodyLimit({
-  maxSize: 1024 * 1024,
+const publicTokenizerBodyLimit = bodyLimit({
+  maxSize: 256 * 1024,
   onError: (c) => c.json({ error: "Request body too large" }, 413),
 });
 
@@ -66,7 +66,7 @@ app.post("/test", requireOwner, async (c) => {
   }
 });
 
-app.post("/count", publicBodyLimit, async (c) => {
+app.post("/count", publicTokenizerBodyLimit, async (c) => {
   const body = await c.req.json();
   if (!body.model_id || !body.text) return c.json({ error: "model_id and text are required" }, 400);
   const count = await tokenizerSvc.countForModel(body.model_id, body.text);
@@ -76,19 +76,30 @@ app.post("/count", publicBodyLimit, async (c) => {
   });
 });
 
-app.post("/count-batch", publicBodyLimit, async (c) => {
+app.post("/count-batch", publicTokenizerBodyLimit, async (c) => {
   const body = await c.req.json();
-  if (!body.model_id || !Array.isArray(body.texts) || !body.texts.every((text: unknown) => typeof text === "string")) {
+  if (!body.model_id || !Array.isArray(body.texts)) {
     return c.json({ error: "model_id and texts are required" }, 400);
   }
-  if (body.texts.length > 64) return c.json({ error: "Batch exceeds the 64-item cap" }, 413);
-  const counts = await Promise.all(body.texts.map((text: string) => tokenizerSvc.countForModel(body.model_id, text)));
-  return c.json({
-    results: body.texts.map((text: string, index: number) => ({
-      token_count: counts[index] ?? null,
+  if (body.texts.length > tokenizerSvc.MAX_COUNT_BATCH_TEXTS) {
+    return c.json({ error: `Batch exceeds the ${tokenizerSvc.MAX_COUNT_BATCH_TEXTS}-item cap` }, 413);
+  }
+  if (body.texts.some((text: unknown) => typeof text !== "string")) {
+    return c.json({ error: "texts must contain only strings" }, 400);
+  }
+
+  const results: Array<{ token_count: number | null; char_count: number }> = [];
+  for (let index = 0; index < body.texts.length; index += 1) {
+    const text = body.texts[index] as string;
+    results.push({
+      token_count: await tokenizerSvc.countForModel(body.model_id, text),
       char_count: text.length,
-    })),
-  });
+    });
+    if ((index + 1) % tokenizerSvc.COUNT_BATCH_YIELD_EVERY === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+  return c.json({ results });
 });
 
 // Resolve a pasted HuggingFace model URL / slug into a verified, installable
@@ -168,7 +179,7 @@ app.delete("/patterns/:id", requireOwner, async (c) => {
   }
 });
 
-app.post("/patterns/test", publicBodyLimit, async (c) => {
+app.post("/patterns/test", publicTokenizerBodyLimit, async (c) => {
   const body = await c.req.json();
   if (!body.model_id) return c.json({ error: "model_id is required" }, 400);
   const tokenizerId = tokenizerSvc.getTokenizerIdForModel(body.model_id);

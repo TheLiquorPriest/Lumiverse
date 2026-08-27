@@ -22,6 +22,11 @@ const DEFAULT_FLAGS: MacroFlags = {
 const AST_CACHE_MAX = 128;
 const astCache = new Map<string, AstNode[]>();
 
+/** Drop parsed templates; they are rebuilt on the next macro evaluation. */
+export function clearMacroAstCache(): void {
+  astCache.clear();
+}
+
 /**
  * Parse a macro template string into an AST.
  * Input is first lexed, then the token stream is walked to produce nodes.

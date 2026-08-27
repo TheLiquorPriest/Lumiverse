@@ -275,7 +275,7 @@ export async function testConnection(
   const profile = getUsableConnection(userId, id);
   if (!profile) return { success: false, message: "Connection requires owner review", provider: "" };
 
-  const provider = getTtsProvider(profile.provider);
+  const provider = getTtsProvider(profile.provider, userId);
   if (!provider) {
     return { success: false, message: `Unknown provider: ${profile.provider}`, provider: profile.provider };
   }
@@ -333,7 +333,7 @@ export async function listConnectionModelsPreview(
     apiKey = (await secretsSvc.getSecret(userId, ttsConnectionSecretKey(existing.id))) || undefined;
   }
 
-  const provider = getTtsProvider(providerId);
+  const provider = getTtsProvider(providerId, userId);
   if (!provider) {
     return { models: [], provider: providerId, error: `Unknown provider: ${providerId}` };
   }
@@ -384,7 +384,7 @@ export async function listConnectionVoicesPreview(
     apiKey = (await secretsSvc.getSecret(userId, ttsConnectionSecretKey(existing.id))) || undefined;
   }
 
-  const provider = getTtsProvider(providerId);
+  const provider = getTtsProvider(providerId, userId);
   if (!provider) {
     return { voices: [], provider: providerId, error: `Unknown provider: ${providerId}` };
   }

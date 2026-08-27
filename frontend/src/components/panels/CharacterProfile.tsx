@@ -131,7 +131,7 @@ function SingleCharacterProfile({
   }, [charId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const avatarUrl = getCharacterAvatarLargeUrl(character) ?? ''
-  // Stored images resolve to the large WebP thumbnail tier (`?size=lg`), which
+  // Stored images resolve to the configured large thumbnail tier (`?size=lg`), which
   // is plenty for palette sampling and avoids decoding original PNG cards.
   const heroSampleUrl = avatarUrl
 

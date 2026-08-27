@@ -116,13 +116,16 @@ export type HostSurfaceJsonValue =
 
 export type HostSurfaceProps = Record<string, HostSurfaceJsonValue>
 
-export type HostSurfaceEventHandler = (payload: HostSurfaceJsonValue) => void
+// Published spindle declarations intentionally accept arbitrary event payloads.
+// Keep the registry boundary equally broad; renderers may still validate JSON.
+export type HostSurfaceEventHandler = (payload: unknown) => void
 export type HostSurfaceUnsubscribe = () => void
 
 export interface SpindleHostSurfaceHandle {
   update(props: HostSurfaceProps): void
   destroy(): void
-  on(event: string, handler: HostSurfaceEventHandler): HostSurfaceUnsubscribe
+  /** Accept both legacy JSON-only and newer unknown-payload declarations. */
+  on(event: string, handler: HostSurfaceEventHandler | ((payload: HostSurfaceJsonValue) => void)): HostSurfaceUnsubscribe
 }
 
 export interface SpindleHostSurfaceInfo {

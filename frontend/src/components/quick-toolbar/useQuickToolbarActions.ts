@@ -20,6 +20,12 @@ import { useStore } from '@/store'
 import type { QuickToolbarSettings } from '@/types/store'
 import type { InputBarActionState } from '@/store/slices/spindle-placement'
 import { nextToolbarIconOrder } from './toolbarPointerHold'
+import {
+  filterEnabledFrontendContributions,
+  hasEnabledFrontendExtension,
+  hasEnabledFrontendExtensionId,
+} from '@/lib/spindle/frontend-extension-availability'
+import { isExtensionComposerActionId } from '@/components/chat/composerActionOwnership'
 
 export type ToolbarActionIcon = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>
 
@@ -183,13 +189,23 @@ export function useQuickToolbarActions() {
   const extensionDrawerTabs = useStore((s) => s.drawerTabs)
   const extensionCommands = useStore((s) => s.extensionCommands)
   const inputBarActions = useStore((s) => s.inputBarActions)
+  const extensions = useStore((s) => s.extensions)
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const activeChatId = useStore((s) => s.activeChatId)
   const isGroupChat = useStore((s) => s.isGroupChat)
   const activeLoomPresetId = useStore((s) => s.activeLoomPresetId)
   const messageSelectMode = useStore((s) => s.messageSelectMode)
   const openModal = useStore((s) => s.openModal)
-  const ownerSnapshot = useSyncExternalStore(subscribeChatDockerActionOwners, getChatDockerActionOwners, getChatDockerActionOwners)
+  // The snapshot is a value, not just a re-render trigger. ChatView registers
+  // navigateToOldestMessage / openMessageNavigator in an effect, i.e. after
+  // the toolbar in the same commit has already rendered — so a catalog memo that
+  // read the owners imperatively kept the empty registration forever and
+  // rendered chat actions whose run did nothing.
+  const chatDockerActionOwners = useSyncExternalStore(
+    subscribeChatDockerActionOwners,
+    getChatDockerActionOwners,
+    getChatDockerActionOwners,
+  )
   const openDrawer = useStore((s) => s.openDrawer)
   const closeDrawer = useStore((s) => s.closeDrawer)
   const setDrawerTab = useStore((s) => s.setDrawerTab)
@@ -233,7 +249,10 @@ export function useQuickToolbarActions() {
   }, [closeDrawer, closeSettings, openDrawer, openSettings, setDrawerTab])
 
   const actionCatalog = useMemo<ToolbarAction[]>(() => {
-    const drawerActions: ToolbarAction[] = [...DRAWER_TABS, ...adaptExtensionTabs(extensionDrawerTabs)].map((tab) => {
+    const enabledDrawerTabs = filterEnabledFrontendContributions(extensionDrawerTabs, extensions)
+    const enabledExtensionCommands = filterEnabledFrontendContributions(extensionCommands, extensions)
+    const enabledInputBarActions = filterEnabledFrontendContributions(inputBarActions, extensions)
+    const drawerActions: ToolbarAction[] = [...DRAWER_TABS, ...adaptExtensionTabs(enabledDrawerTabs)].map((tab) => {
       const surface: ToolbarSurface = { kind: 'drawer', tabId: tab.id }
       return {
         id: tab.id,
@@ -259,7 +278,7 @@ export function useQuickToolbarActions() {
     })
     const registeredActions: ToolbarAction[] = [
       ...COMMANDS.filter((command) => command.group === 'actions'),
-      ...extensionCommandsToCommands(extensionCommands),
+      ...extensionCommandsToCommands(enabledExtensionCommands),
     ].map((command) => ({
       id: `command:${command.id}`,
       label: command.label,
@@ -275,7 +294,7 @@ export function useQuickToolbarActions() {
       surface: { kind: 'command' },
       run: () => runSurface({ kind: 'command' }, () => void command.run(router.navigate)),
     }))
-    const extensionInputActions: ToolbarAction[] = inputBarActions
+    const extensionInputActions: ToolbarAction[] = enabledInputBarActions
       // These named Lumiverse Suite actions are registered by extension-owned
       // surfaces, but they are also first-class Quick Toolbar actions. Keep this
       // allowlist narrow so unrelated contributions never leak into the global
@@ -296,11 +315,14 @@ export function useQuickToolbarActions() {
           surface: { kind: 'command' } as const,
           run: () => runSurface(
             { kind: 'command' },
-            () => action.clickHandlers.forEach((handler) => handler()),
+            () => {
+              if (!hasEnabledFrontendExtensionId(useStore.getState().extensions, action.extensionId)) return
+              action.clickHandlers.forEach((handler) => handler())
+            },
           ),
         }
       })
-    const owners = ownerSnapshot
+    const owners = chatDockerActionOwners
     const chatDockerActions: ToolbarAction[] = buildChatDockerActionCatalog({
       owners: {
         ...owners,
@@ -348,18 +370,22 @@ export function useQuickToolbarActions() {
       ...registeredActions,
       ...extensionInputActions,
     ]
-    return catalog
+    const availableCatalog = hasEnabledFrontendExtension(extensions, 'lumiverse_suite')
+      ? catalog
+      : catalog.filter((action) => !isExtensionComposerActionId(action.id))
+    return [...new Map(availableCatalog.map((action) => [action.id, action])).values()]
   }, [
     activeCharacterId,
     activeChatId,
     activeLoomPresetId,
+    chatDockerActionOwners,
     extensionCommands,
     extensionDrawerTabs,
+    extensions,
     inputBarActions,
     isGroupChat,
     messageSelectMode,
     openModal,
-    ownerSnapshot,
     runSurface,
     t,
     userRole,

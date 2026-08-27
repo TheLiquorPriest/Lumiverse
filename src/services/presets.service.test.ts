@@ -6,6 +6,7 @@ import {
   getPreset,
   getPresetCacheRevision,
   getPresetRegistrySignature,
+  listPresetRegistry,
   normalizePromptBlocks,
   reconcileActiveLoomPreset,
   updatePreset,
@@ -236,6 +237,30 @@ beforeEach(initPresetsTestDb);
 afterEach(() => closeDatabase());
 
 describe("presets.service — ETag sources + row trim", () => {
+  test("always generates a fresh id even when an imported payload supplies one", () => {
+    const created = createPreset("u1", {
+      id: "portable-source-id",
+      name: "Imported",
+      provider: "loom",
+    } as any);
+
+    expect(created.id).not.toBe("portable-source-id");
+    expect(created.id).toBeString();
+  });
+
+  test("includes normalized cover URLs in the lightweight registry", () => {
+    insertPreset({
+      id: "covered",
+      name: "Covered",
+      provider: "loom",
+      user_id: "u1",
+      metadata: { coverUrl: "https://cdn.example.test/cover.webp" },
+    });
+
+    expect(listPresetRegistry("u1", { limit: 20, offset: 0 }, "loom").data[0]?.cover_url)
+      .toBe("https://cdn.example.test/cover.webp");
+  });
+
   test("getPreset parses JSON columns and does NOT leak internal columns (user_id)", () => {
     insertPreset({
       id: "p1",

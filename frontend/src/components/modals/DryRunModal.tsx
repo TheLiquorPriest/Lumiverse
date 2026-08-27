@@ -14,6 +14,7 @@ import { findExpandedTextMatches } from '@/lib/expandedTextSearch'
 import i18n from '@/i18n'
 import { getAnthropicBreakdownCacheHints, getAnthropicCacheUsageSummary } from '@/lib/anthropic-breakdown-cache'
 import { getNanoGptCacheUsageSummary } from '@/lib/nanogpt-breakdown-cache'
+import { getOpenAiCompatibleCacheUsageSummary } from '@/lib/openai-compatible-breakdown-cache'
 import styles from './DryRunModal.module.css'
 import clsx from 'clsx'
 
@@ -422,6 +423,10 @@ export default function DryRunModal() {
     () => getNanoGptCacheUsageSummary(provider, modalProps.usage),
     [provider, modalProps.usage],
   )
+  const openAiCompatibleCacheUsage = useMemo(
+    () => getOpenAiCompatibleCacheUsageSummary(provider, modalProps.usage),
+    [provider, modalProps.usage],
+  )
 
   const parametersJson = useMemo(
     () => JSON.stringify(parameters, null, 2),
@@ -674,6 +679,17 @@ export default function DryRunModal() {
                               nanoGptCacheUsage.cacheReadInputTokens > 0 && `read ${nanoGptCacheUsage.cacheReadInputTokens.toLocaleString()}`,
                               nanoGptCacheUsage.cacheCreationInputTokens > 0 && `write ${nanoGptCacheUsage.cacheCreationInputTokens.toLocaleString()}`,
                               nanoGptCacheUsage.cachedTokensOpenAiStyle > 0 && `cached ${nanoGptCacheUsage.cachedTokensOpenAiStyle.toLocaleString()}`,
+                            ].filter(Boolean).join(' • ')}
+                          </span>
+                        )}
+                        {openAiCompatibleCacheUsage && (
+                          <span className={styles.breakdownSource}>
+                            {provider === 'openrouter' ? t('openRouterCache') : t('openAiCache')}
+                            {' • '}
+                            {[
+                              openAiCompatibleCacheUsage.cacheReadInputTokens > 0 && `read ${openAiCompatibleCacheUsage.cacheReadInputTokens.toLocaleString()}`,
+                              openAiCompatibleCacheUsage.cacheCreationInputTokens > 0 && `write ${openAiCompatibleCacheUsage.cacheCreationInputTokens.toLocaleString()}`,
+                              openAiCompatibleCacheUsage.cachedTokens > 0 && `cached ${openAiCompatibleCacheUsage.cachedTokens.toLocaleString()}`,
                             ].filter(Boolean).join(' • ')}
                           </span>
                         )}

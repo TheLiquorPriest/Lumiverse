@@ -297,6 +297,8 @@ export interface Message {
   parent_message_id: string | null;
   branch_id: string | null;
   created_at: number;
+  /** Optimistic-concurrency token from messages.revision (server default 1). */
+  revision?: number;
 }
 
 export interface ChatMessageSearchMatch {
@@ -389,6 +391,7 @@ export interface ConnectionModelsResult {
 }
 
 export interface EmbeddingModelsPreviewInput {
+  profile_id?: string
   provider?: EmbeddingConfig['provider']
   api_url?: string
   api_key?: string
@@ -833,6 +836,7 @@ export interface PresetRegistryItem {
   name: string;
   provider: string;
   block_count: number;
+  cover_url?: string | null;
   updated_at: number;
 }
 
@@ -840,6 +844,8 @@ export interface PresetRegistryItem {
 export interface CharacterGalleryItem {
   id: string;
   image_id: string;
+  /** Portable source for Markdown image embeds, preserved across CharX installs. */
+  reference: string;
   caption: string;
   sort_order: number;
   created_at: number;
@@ -1311,9 +1317,31 @@ export interface WorldBookEntryBulkActionResult {
   target_book_id?: string;
 }
 
+export type EmbeddingProvider = 'openai-compatible' | 'openai' | 'mistral' | 'cohere' | 'openrouter' | 'electronhub' | 'bananabread' | 'nanogpt' | 'nvidia-nim' | 'google_vertex';
+
+export interface EmbeddingProviderProfile {
+  api_url: string;
+  model: string;
+  dimensions: number | null;
+  send_dimensions: boolean;
+  retrieval_top_k: number;
+  hybrid_weight_mode: 'keyword_first' | 'balanced' | 'vector_first';
+  preferred_context_size: number;
+  batch_size: number;
+  similarity_threshold: number;
+  rerank_cutoff: number;
+  vectorize_world_books: boolean;
+  vectorize_chat_messages: boolean;
+  vectorize_chat_documents: boolean;
+  chat_memory_mode: 'conservative' | 'balanced' | 'aggressive';
+  request_timeout: number;
+  vertex_region?: string;
+  has_api_key: boolean;
+}
+
 export interface EmbeddingConfig {
   enabled: boolean;
-  provider: 'openai-compatible' | 'openai' | 'openrouter' | 'electronhub' | 'bananabread' | 'nanogpt';
+  provider: EmbeddingProvider;
   api_url: string;
   model: string;
   dimensions: number | null;
@@ -1330,6 +1358,7 @@ export interface EmbeddingConfig {
   chat_memory_mode: 'conservative' | 'balanced' | 'aggressive';
   request_timeout: number;
   has_api_key: boolean;
+  provider_profiles?: Partial<Record<EmbeddingProvider, EmbeddingProviderProfile>>;
   /** True when the server owner has enabled a shared embedding config and the
    *  current user is a non-owner inheriting it. The form should be read-only
    *  and the config is not user-editable while this flag is set. */

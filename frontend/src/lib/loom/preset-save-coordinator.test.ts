@@ -938,6 +938,73 @@ describe('preset save coordinator', () => {
     localStorage.clear()
   })
 
+  test('merges non-overlapping block edits after a revision conflict', async () => {
+    localStorage.clear()
+    const firstBlock = {
+      id: 'block-a',
+      name: 'Block A',
+      content: 'base',
+      role: 'system' as const,
+      enabled: true,
+      position: 'pre_history' as const,
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+    }
+    const base = unmarshalPreset(rawPreset({
+      prompt_order: [firstBlock],
+      cache_revision: 18,
+    }))
+    const latest = rawPreset({
+      prompt_order: [{ ...firstBlock, content: 'remote stash edit' }],
+      cache_revision: 19,
+    })
+    const conflict = Object.assign(new Error('preset revision conflict'), {
+      status: 409,
+      body: { code: 'PRESET_REVISION_CONFLICT' },
+    })
+    const writes: UpdatePresetInput[] = []
+    let updateCalls = 0
+    const coordinator = createPresetSaveCoordinator({
+      async update(presetId, input) {
+        writes.push(structuredClone(input))
+        updateCalls += 1
+        if (updateCalls === 1) throw conflict
+        return rawPreset({
+          ...latest,
+          id: presetId,
+          prompt_order: input.prompt_order ?? latest.prompt_order,
+          cache_revision: 20,
+        })
+      },
+      async get() {
+        return latest
+      },
+    })
+    coordinator.hydrate(base)
+    coordinator.mutate(
+      base.id,
+      base,
+      (preset) => ({
+        ...preset,
+        blocks: preset.blocks.map((block) => (
+          block.id === firstBlock.id ? { ...block, enabled: false } : block
+        )),
+      }),
+      { immediate: true },
+    )
+
+    const saved = await coordinator.flush(base.id)
+
+    expect(writes.map((input) => input.expected_cache_revision)).toEqual([18, 19])
+    expect(writes[1].prompt_order?.map((block) => block.id)).toEqual(['block-a'])
+    expect(writes[1].prompt_order?.[0]).toMatchObject({ content: 'remote stash edit', enabled: false })
+    expect(saved?.blocks).toEqual(writes[1].prompt_order)
+    localStorage.clear()
+  })
+
   test('surfaces a block conflict instead of replaying a stale array', async () => {
     localStorage.clear()
     const baseBlock = {

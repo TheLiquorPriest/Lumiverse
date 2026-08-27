@@ -34,6 +34,12 @@ export interface IsolateRequestEnvelopeV1<T = unknown> {
   readonly payload: T;
 }
 
+export interface IsolateStartedEnvelopeV1 {
+  readonly version: typeof ISOLATE_PROTOCOL_VERSION_V1;
+  readonly type: "started";
+  readonly requestId: string;
+}
+
 export interface IsolateSuccessEnvelopeV1<T = unknown> {
   readonly version: typeof ISOLATE_PROTOCOL_VERSION_V1;
   readonly type: "result";
@@ -311,6 +317,18 @@ export function isIsolateRequestEnvelopeV1(value: unknown): value is IsolateRequ
   );
 }
 
+export function isIsolateStartedEnvelopeV1(value: unknown): value is IsolateStartedEnvelopeV1 {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return (
+    item.version === ISOLATE_PROTOCOL_VERSION_V1
+    && item.type === "started"
+    && typeof item.requestId === "string"
+    && item.requestId.length > 0
+    && item.requestId.length <= 128
+  );
+}
+
 export function isIsolateResponseEnvelopeV1(value: unknown): value is IsolateResponseEnvelopeV1 {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>;
@@ -341,6 +359,17 @@ export function makeRequestEnvelopeV1<T>(
     requestId,
     operation,
     payload,
+  };
+}
+
+export function makeStartedEnvelopeV1(requestId: string): IsolateStartedEnvelopeV1 {
+  if (!requestId || requestId.length > 128) {
+    throw new IsolateProtocolError("malformed_message", "Invalid isolate request identity");
+  }
+  return {
+    version: ISOLATE_PROTOCOL_VERSION_V1,
+    type: "started",
+    requestId,
   };
 }
 

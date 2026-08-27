@@ -29,7 +29,8 @@ describe('landingPageTabs', () => {
     expect(source.match(/data-spindle-mount="landing_chats"/g)).toHaveLength(1)
     expect(source).toContain('data-homepage-character-library-ready="true"')
     expect(source).toContain('data-recent-chats-ready="true"')
-    expect(source).toContain("'landingPageActiveTab', 'characters'")
+    expect(source).toContain("setRequestedLandingTab('characters')")
+    expect(source).not.toContain("setSetting('landingPageActiveTab'")
   })
 
   test('uses Characters as the default and keeps persisted Chats valid', () => {

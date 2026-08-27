@@ -12,6 +12,7 @@ import {
   validateImageMagicBytes,
 } from "../utils/image-signature";
 import { extractRemoteImageUrlFromHtml } from "../utils/remote-image-page";
+import { userMediaServingHeaders } from "../utils/user-media-headers";
 
 const app = new Hono();
 
@@ -46,6 +47,7 @@ function parseWallpaperUploadProgressId(value: string | undefined): WallpaperUpl
 
 function resolveImageContentType(filepath: string, fallbackMimeType: string): string | null {
   if (filepath.endsWith(".webp")) return "image/webp";
+  if (filepath.endsWith(".avif")) return "image/avif";
   if (filepath.endsWith(".mp4")) return "video/mp4";
   if (filepath.endsWith(".webm")) return "video/webm";
   if (filepath.endsWith(".mov")) return "video/quicktime";
@@ -301,6 +303,9 @@ app.get("/:id", async (c) => {
     "X-Accel-Buffering": "no",
   };
   if (contentType) baseHeaders["Content-Type"] = contentType;
+  // Stored-XSS boundary for user-uploaded bytes: sandbox CSP on direct
+  // navigation, nosniff, and demotion of active content to an inert download.
+  Object.assign(baseHeaders, userMediaServingHeaders(contentType ?? file.type));
 
   const parsed = parseRangeHeader(c.req.header("range"), totalSize);
 

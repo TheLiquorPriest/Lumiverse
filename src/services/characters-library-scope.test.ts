@@ -33,9 +33,7 @@ async function initDb(): Promise<void> {
   const db = getDb();
   db.run("PRAGMA foreign_keys = OFF");
   db.run(await Bun.file(join(import.meta.dir, "..", "db", "baseline.sql")).text());
-  // Baseline ships characters.folder and characters.library_scope (096/099
-  // squashed); only 092's deleting flag is still file-applied.
-  db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "092_characters_deleting_flag.sql")).text());
+
 }
 
 function summaryIds(userId: string, scope: "mine" | "shared", options: Omit<SummaryQueryOptions, "scope"> = {}): string[] {

@@ -3657,8 +3657,8 @@ function persistentChatOwnerExists(userId: string, chatId: string): boolean {
 
 
 /**
- * Migration 115 intentionally stores attempt_id as a logical association:
- * migration 116 owns the durable attempt table and runs later. Once that
+ * Migration 125 intentionally stores attempt_id as a logical association:
+ * migration 126 owns the durable attempt table and runs later. Once that
  * table exists, new workspace sessions must still prove the complete
  * owner/chat/turn/attempt tuple before they can be created.
  */

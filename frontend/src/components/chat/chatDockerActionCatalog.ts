@@ -61,6 +61,7 @@ export interface ChatDockerActionOwners {
   openChatSettings?: () => void
   openGroupChatCreator?: () => void
   openModal?: (id: string, payload?: unknown) => void
+  warmMemories?: (chatId: string) => void | Promise<void>
   navigateToOldestMessage?: () => void | Promise<void>
   navigateToOldestMessageLoading?: boolean
   openMessageNavigator?: () => void
@@ -71,7 +72,6 @@ export interface ChatDockerActionOwners {
   promptVariablesLoading?: boolean
   memoryCortexAvailable?: boolean
   memoryCortexInFlight?: boolean
-  warmMemories?: (chatId: string) => void | Promise<void>
   groupChatCreatorRegistered?: boolean
 }
 
@@ -94,6 +94,7 @@ export interface BuildChatDockerActionCatalogOptions {
   scope?: ChatDockerActionScope
   translate?: ChatDockerActionTranslate
 }
+
 let registeredOwners: ChatDockerActionOwners = {}
 const ownerListeners = new Set<() => void>()
 const ownerRegistrationByKey = new Map<keyof ChatDockerActionOwners, symbol>()

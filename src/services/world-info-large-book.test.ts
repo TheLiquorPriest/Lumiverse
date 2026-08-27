@@ -13,6 +13,7 @@ import {
 } from "./prompt-assembly.service";
 import {
   activateWorldInfo,
+  clearWorldInfoActivationCache,
   finalizeActivatedWorldInfoEntries,
   normalizeWorldInfoSettings,
   type WorldInfoSettings,
@@ -285,6 +286,34 @@ describe("world info RNG injection", () => {
       expect(Math.random()).toBe(0.42);
     } finally {
       Math.random = originalRandom;
+    }
+  });
+});
+
+describe("world info activation cache pressure release", () => {
+  test("drops cached probability results so the next activation recomputes", () => {
+    const originalRandom = Math.random;
+    const entry = makeEntry({ key: ["alpha"], probability: 50 });
+    const input = {
+      entries: [entry],
+      messages: [makeMessage("alpha")],
+      chatTurn: 1,
+      settings: {},
+    };
+
+    try {
+      clearWorldInfoActivationCache();
+      Math.random = () => 0;
+      expect(activateWorldInfo({ ...input, wiState: {} }).activatedEntries).toHaveLength(1);
+
+      Math.random = () => 0.99;
+      expect(activateWorldInfo({ ...input, wiState: {} }).activatedEntries).toHaveLength(1);
+
+      clearWorldInfoActivationCache();
+      expect(activateWorldInfo({ ...input, wiState: {} }).activatedEntries).toHaveLength(0);
+    } finally {
+      Math.random = originalRandom;
+      clearWorldInfoActivationCache();
     }
   });
 });

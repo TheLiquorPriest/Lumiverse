@@ -1,6 +1,7 @@
 import type { StateCreator } from 'zustand'
 import type { AppStore, SttConnectionsSlice } from '@/types/store'
 import type { SttConnectionProfile } from '@/types/api'
+import { persistKey } from './settings'
 import { normalizeConnectionsOrder, reorderProfiles } from './connections-order-merge'
 
 export const createSttConnectionsSlice: StateCreator<AppStore, [], [], SttConnectionsSlice> = (set, get) => ({
@@ -22,21 +23,18 @@ export const createSttConnectionsSlice: StateCreator<AppStore, [], [], SttConnec
     const state = get()
     const existingIndex = state.sttProfiles.findIndex((candidate) => candidate.id === profile.id)
     const sttProfiles = existingIndex === -1
-      ? [...state.sttProfiles, profile]
+      ? [profile, ...state.sttProfiles]
       : state.sttProfiles.map((candidate, index) => index === existingIndex ? profile : candidate)
     const connectionsOrder = normalizeConnectionsOrder(state.connectionsOrder)
     const order = connectionsOrder.stt
+    const nextOrder = order.includes(profile.id) ? order : [profile.id, ...order]
+    const nextConnectionsOrder = { ...connectionsOrder, stt: nextOrder }
     const selectedId = state.voiceSettings.sttConnectionId
     const sttConnectionId = selectedId && sttProfiles.some((candidate) => candidate.id === selectedId && candidate.review_required !== true)
       ? selectedId
       : null
-    set({
-      sttProfiles,
-      connectionsOrder: {
-        ...connectionsOrder,
-        stt: order.includes(profile.id) ? order : [...order, profile.id],
-      },
-    })
+    set({ sttProfiles, connectionsOrder: nextConnectionsOrder })
+    if (nextOrder !== order) persistKey('connectionsOrder', nextConnectionsOrder, 'state-sync')
     if (sttConnectionId !== selectedId) get().setVoiceSettings({ sttConnectionId })
   },
 

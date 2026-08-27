@@ -35,10 +35,12 @@ interface RequestState {
   sent: number;
   kind: "child" | "root" | "root-inline";
   body: Record<string, unknown>;
+  model: string;
 }
 const requests: RequestState[] = [];
 let server: ReturnType<typeof Bun.serve>;
 let connectionId: string;
+let chatConnectionId: string;
 let presetId: string;
 let agentPresetId: string;
 let rootFixtureToolExecutions = 0;
@@ -74,6 +76,7 @@ beforeAll(async () => {
         sent: 0,
         kind: isRootInlineFixture ? "root-inline" : isChild ? "child" : "root",
         body,
+        model: typeof body.model === "string" ? body.model : "",
       };
       requests.push(state);
       if (isChild) {
@@ -176,17 +179,6 @@ beforeAll(async () => {
   const db = getDb();
   db.run("PRAGMA foreign_keys = OFF");
   db.run(await Bun.file(join(import.meta.dir, "..", "src", "db", "baseline.sql")).text());
-  // Baseline is a 001-065 snapshot; apply later migrations on top (skipping
-  // any change the baseline already absorbed).
-  const migrationsDir = join(import.meta.dir, "..", "src", "db", "migrations");
-  const post065 = readdirSync(migrationsDir)
-    .filter((f) => f.endsWith(".sql") && parseInt(f.slice(0, 3), 10) > 65)
-    .sort();
-  for (const file of post065) {
-    try {
-      db.run(await Bun.file(join(migrationsDir, file)).text());
-    } catch { /* baseline already includes this change */ }
-  }
 
   presetId = presetsSvc.createPreset(USER_ID, {
     name: "stop-test-preset",
@@ -257,6 +249,12 @@ beforeAll(async () => {
       },
     ],
   }).id;
+  chatConnectionId = (await connectionsSvc.createConnection(USER_ID, {
+    name: "chat-bound-mock",
+    provider: "custom",
+    api_url: `http://localhost:${server.port}/v1`,
+    model: "chat-profile-model",
+  } as any)).id;
 });
 
 afterAll(() => {
@@ -426,6 +424,55 @@ describe("stop generation", () => {
         apiUrl: previousWebSearchSettings.apiUrl,
       });
     }
+  });
+  test("chat settings override the requested connection profile and its default model", async () => {
+    const requestIndex = requests.length;
+    const chat = chatsSvc.createChat(USER_ID, {
+      character_id: null,
+      name: "Chat-bound Connection Test",
+      metadata: { temporary: true, connection_profile_id: chatConnectionId },
+    });
+    chatsSvc.createMessage(chat.id, { is_user: true, name: "User", content: "Go." }, USER_ID);
+
+    const { generationId } = await genSvc.startGeneration({
+      userId: USER_ID,
+      chat_id: chat.id,
+      connection_id: connectionId,
+      preset_id: presetId,
+      generation_type: "normal",
+    } as any);
+
+    expect(poolSvc.getPoolForChat(USER_ID, chat.id)?.model).toBe("chat-profile-model");
+    expect(await waitFor(() => requests[requestIndex]?.sent >= 1, 5000)).toBe(true);
+    expect(requests[requestIndex].model).toBe("chat-profile-model");
+    expect(await genSvc.stopGeneration(USER_ID, generationId)).toBe(true);
+  });
+
+  test("chat settings can override the bound connection's model", async () => {
+    const requestIndex = requests.length;
+    const chat = chatsSvc.createChat(USER_ID, {
+      character_id: null,
+      name: "Chat-bound Model Test",
+      metadata: {
+        temporary: true,
+        connection_profile_id: chatConnectionId,
+        connection_model: "chat-model-override",
+      },
+    });
+    chatsSvc.createMessage(chat.id, { is_user: true, name: "User", content: "Go." }, USER_ID);
+
+    const { generationId } = await genSvc.startGeneration({
+      userId: USER_ID,
+      chat_id: chat.id,
+      connection_id: connectionId,
+      preset_id: presetId,
+      generation_type: "normal",
+    } as any);
+
+    expect(poolSvc.getPoolForChat(USER_ID, chat.id)?.model).toBe("chat-model-override");
+    expect(await waitFor(() => requests[requestIndex]?.sent >= 1, 5000)).toBe(true);
+    expect(requests[requestIndex].model).toBe("chat-model-override");
+    expect(await genSvc.stopGeneration(USER_ID, generationId)).toBe(true);
   });
   test("stopGeneration aborts the stream and the upstream server sees the disconnect", async () => {
     const { chatId, generationId, state } = await startStreamingGeneration();

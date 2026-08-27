@@ -326,6 +326,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
           {
             name: p.name,
             blockCount: p.block_count,
+            coverUrl: p.cover_url ?? null,
             updatedAt: p.updated_at,
             isDefault: false,
           },
@@ -681,6 +682,36 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     }
   }, [refreshRegistry])
 
+  const bulkDeletePresets = useCallback(async (presetIds: string[]) => {
+    const ids = [...new Set(presetIds)].filter(Boolean)
+    if (ids.length === 0) return []
+    await Promise.all(ids.map((id) => flushPresetForGeneration(id)))
+    const result = await presetsApi.bulkDelete(ids)
+    for (const id of result.deleted) presetSaveCoordinator.remove(id)
+    await refreshRegistry()
+    if (useStore.getState().activeLoomPresetId && result.deleted.includes(useStore.getState().activeLoomPresetId!)) {
+      activePresetRef.current = null
+      useStore.getState().setActiveLoomPreset(null)
+      setActivePreset(null)
+    }
+    try {
+      const res = await connectionsApi.list({ limit: 100 })
+      useStore.getState().setProfiles(res.data)
+    } catch {
+      // Non-fatal; the next profile refresh will pick up cleared references.
+    }
+    return result.deleted
+  }, [refreshRegistry])
+
+  const bulkExportPresets = useCallback(async (presetIds: string[]) => {
+    const ids = [...new Set(presetIds)].filter(Boolean)
+    if (ids.length === 0) return 0
+    await Promise.all(ids.map((id) => flushPresetForGeneration(id)))
+    const prepared = await presetsApi.prepareBulkExport(ids)
+    presetsApi.downloadPreparedExport(prepared.archiveUrl, prepared.filename)
+    return prepared.count
+  }, [])
+
   // Duplicate a preset through the authenticated server operation. The
   // endpoint copies normalized Agentic configuration, authored cognition
   // envelope, bindings, and regex companions transactionally; reconstructing
@@ -1029,19 +1060,20 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
 
   // Export internal JSON. The runtime envelope is fetched from the server
   // after all pending Loom saves settle, so prompt revisions and task metadata
-  // cannot drift across the export boundary.
-  const exportInternal = useCallback(async () => {
-    const current = activePresetRef.current ?? activePreset
-    if (!current) return null
+  // cannot drift across the export boundary. An explicit target id keeps the
+  // upstream preset-manager export action functional for non-active presets.
+  const exportInternal = useCallback(async (presetId?: string) => {
+    const targetId = presetId ?? activePresetRef.current?.id ?? activePreset?.id
+    if (!targetId) return null
     const maxAttempts = 2
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      await flushPendingPreset()
-      const persistedBefore = await presetApi.get(current.id)
-      const envelopeBefore = await presetApi.getPortableAgentRuntime(current.id)
-      const regexBefore = await regexApi.exportScripts(undefined, { preset_id: current.id })
-      const persistedAfter = await presetApi.get(current.id)
-      const envelopeAfter = await presetApi.getPortableAgentRuntime(current.id)
-      const regexAfter = await regexApi.exportScripts(undefined, { preset_id: current.id })
+      await flushPresetForGeneration(targetId)
+      const persistedBefore = await presetApi.get(targetId)
+      const envelopeBefore = await presetApi.getPortableAgentRuntime(targetId)
+      const regexBefore = await regexApi.exportScripts(undefined, { preset_id: targetId })
+      const persistedAfter = await presetApi.get(targetId)
+      const envelopeAfter = await presetApi.getPortableAgentRuntime(targetId)
+      const regexAfter = await regexApi.exportScripts(undefined, { preset_id: targetId })
       const presetStable = persistedBefore.cache_revision === persistedAfter.cache_revision
         && persistedBefore.updated_at === persistedAfter.updated_at
       const envelopeStable = portableSnapshotKey(envelopeBefore) === portableSnapshotKey(envelopeAfter)
@@ -1066,7 +1098,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       }
     }
     return null
-  }, [activePreset, flushPendingPreset])
+  }, [activePreset, flushPresetForGeneration])
 
   // Export as legacy (SillyTavern) JSON
   const exportLegacy = useCallback(() => {
@@ -1153,6 +1185,8 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     saveLoomValue,
     saveAgenticRuntime,
     deletePreset,
+    bulkDeletePresets,
+    bulkExportPresets,
     duplicatePreset,
     renamePreset,
     refreshRegistry,

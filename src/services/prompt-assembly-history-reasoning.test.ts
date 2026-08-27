@@ -4,7 +4,7 @@ import { type LlmMessage } from "../llm/types";
 import { __reasoningHistoryTest } from "./prompt-assembly.service";
 
 describe("native reasoning prompt history", () => {
-  test("does not expose persisted provider reasoning carriers to prompt history", () => {
+  test("hydrates persisted provider reasoning onto private Response history", () => {
     const message = {
       is_user: false,
       extra: {
@@ -15,8 +15,25 @@ describe("native reasoning prompt history", () => {
       },
     } as any;
 
-    expect(__reasoningHistoryTest).not.toHaveProperty("getStoredReasoningCarrier");
-    expect(message.extra.reasoningCarrier).toBeDefined();
+    expect(__reasoningHistoryTest.getStoredReasoningCarrier(message)).toEqual({
+      reasoning_details: [{ type: "reasoning.text", text: "Native reasoning" }],
+    });
+  });
+
+  test("hydrates a persisted optional Gemini thought signature onto its assistant message", () => {
+    const message = {
+      is_user: false,
+      extra: {
+        reasoningCarrier: {
+          type: "gemini_thought_signature",
+          signature: "opaque-gemini-signature",
+        },
+      },
+    } as any;
+
+    expect(__reasoningHistoryTest.getStoredReasoningCarrier(message)).toEqual({
+      thought_signature: "opaque-gemini-signature",
+    });
   });
 
   test("keepInHistory removes old native carriers without converting them to CoT", () => {

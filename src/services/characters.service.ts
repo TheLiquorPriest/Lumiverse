@@ -918,7 +918,16 @@ export function getCharactersByIds(userId: string, ids: string[]): Map<string, C
   return result;
 }
 
-export function createCharacter(userId: string, input: CreateCharacterInput): Character {
+export interface CreateCharacterOptions {
+  /** Bulk workflows publish one library invalidation after committing. */
+  emitEvent?: boolean;
+}
+
+export function createCharacter(
+  userId: string,
+  input: CreateCharacterInput,
+  options: CreateCharacterOptions = {},
+): Character {
   return withUserDataMutationSync(userId, () => {
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
@@ -959,7 +968,9 @@ export function createCharacter(userId: string, input: CreateCharacterInput): Ch
   }
 
   const character = getCharacter(userId, id)!;
-  eventBus.emit(EventType.CHARACTER_CREATED, { id, character }, userId);
+  if (options.emitEvent !== false) {
+    eventBus.emit(EventType.CHARACTER_CREATED, { id, character }, userId);
+  }
   return character;
   });
 }
@@ -1362,6 +1373,25 @@ export function findCharacterBySourceFilename(userId: string, sourceFilename: st
   return row ? rowToCharacter(row) : null;
 }
 
+/** Load migration identities once so a large import does not issue one lookup
+ * per card. Duplicate legacy identities resolve deterministically to the most
+ * recently updated character, matching the old LIMIT 1 behavior closely. */
+export function listCharacterSourceFilenameIds(userId: string): Map<string, string> {
+  const rows = getDb()
+    .query(
+      `SELECT id, json_extract(extensions, '$._lumiverse_source_filename') AS source_filename
+       FROM characters
+       WHERE user_id = ?
+         AND json_type(extensions, '$._lumiverse_source_filename') = 'text'
+       ORDER BY updated_at ASC`,
+    )
+    .all(userId) as Array<{ id: string; source_filename: string }>;
+
+  const result = new Map<string, string>();
+  for (const row of rows) result.set(row.source_filename, row.id);
+  return result;
+}
+
 export function setCharacterSourceFilename(userId: string, id: string, sourceFilename: string): void {
   withUserDataMutationSync(userId, () => {
   const char = getCharacter(userId, id);
@@ -1381,24 +1411,132 @@ export function deleteCharacter(userId: string, id: string): boolean {
       .query("UPDATE characters SET deleting = 1 WHERE id = ? AND user_id = ? AND deleting = 0")
       .run(id, userId)
   );
-  if (marked.changes === 0) return true;
-  eventBus.emit(EventType.CHARACTER_DELETED, { id }, userId);
-  void runCharacterDeletionCascade(userId, id).catch((err) =>
+  if (marked.changes > 0) eventBus.emit(EventType.CHARACTER_DELETED, { id }, userId);
+  void scheduleCharacterDeletionCascade(userId, id).catch((err) =>
     console.error(`[characters] deletion cascade failed for ${id}:`, err instanceof Error ? err.message : err)
   );
   return true;
+}
+
+export interface CharacterBatchDeleteResult {
+  deleted: string[];
+  failed: string[];
+}
+
+/**
+ * Mark a set of characters first, then await each resumable cleanup cascade.
+ * Marking the whole set up front keeps assets shared only by members of this
+ * batch from looking live while the first member is being cleaned up.
+ */
+export async function batchDeleteCharacters(userId: string, ids: string[]): Promise<CharacterBatchDeleteResult> {
+  const uniqueIds = [...new Set(ids.filter((id) => typeof id === "string" && id.length > 0))];
+  if (uniqueIds.length === 0) return { deleted: [], failed: [] };
+
+  const existing = getCharactersByIds(userId, uniqueIds);
+  const marked: string[] = [];
+  getDb().transaction(() => {
+    const statement = getDb().query(
+      "UPDATE characters SET deleting = 1 WHERE id = ? AND user_id = ? AND deleting = 0",
+    );
+    for (const id of uniqueIds) {
+      if (!existing.has(id)) continue;
+      if (statement.run(id, userId).changes > 0) marked.push(id);
+    }
+  })();
+  for (const id of marked) eventBus.emit(EventType.CHARACTER_DELETED, { id }, userId);
+
+  const deleted: string[] = [];
+  const failed: string[] = [];
+  for (const id of uniqueIds) {
+    if (!existing.has(id)) {
+      failed.push(id);
+      continue;
+    }
+    try {
+      await scheduleCharacterDeletionCascade(userId, id);
+      if (getCharacter(userId, id)) failed.push(id);
+      else deleted.push(id);
+    } catch (err) {
+      console.error(`[characters] batch deletion cascade failed for ${id}:`, err instanceof Error ? err.message : err);
+      failed.push(id);
+    }
+  }
+  return { deleted, failed };
+}
+
+const characterDeletionCascades = new Map<string, Promise<void>>();
+
+function scheduleCharacterDeletionCascade(userId: string, id: string): Promise<void> {
+  const key = `${userId}\0${id}`;
+  const active = characterDeletionCascades.get(key);
+  if (active) return active;
+  const cascade = runCharacterDeletionCascade(userId, id).finally(() => {
+    if (characterDeletionCascades.get(key) === cascade) characterDeletionCascades.delete(key);
+  });
+  characterDeletionCascades.set(key, cascade);
+  return cascade;
 }
 
 async function runCharacterDeletionCascade(userId: string, id: string): Promise<void> {
   return withUserDataMutation(userId, async () => {
   const existing = getCharacter(userId, id);
   if (!existing) return;
+
+  // A character FK would cascade-delete its primary chats, bypassing the
+  // non-SQL cleanup in chats.deleteChat (audio, vectors, caches and timers).
+  // Delete those chats explicitly first. Also remove the character from group
+  // metadata where it is not the primary member, so no dead member IDs remain.
+  try {
+    const chatsSvc = await import("./chats.service");
+    const primaryChats = getDb()
+      .query("SELECT id FROM chats WHERE user_id = ? AND character_id = ?")
+      .all(userId, id) as Array<{ id: string }>;
+    chatsSvc.deleteChats(userId, primaryChats.map((row) => row.id));
+
+    const groupRows = getDb().query(
+      `SELECT c.id
+         FROM chats c
+        WHERE c.user_id = ?
+          AND COALESCE(json_extract(c.metadata, '$.group'), 0) = 1
+          AND c.character_id != ?
+          AND EXISTS (
+            SELECT 1 FROM json_each(c.metadata, '$.character_ids') member
+             WHERE member.value = ?
+          )`,
+    ).all(userId, id, id) as Array<{ id: string }>;
+    for (const row of groupRows) {
+      const chat = chatsSvc.getChat(userId, row.id);
+      const members = Array.isArray(chat?.metadata?.character_ids) ? chat.metadata.character_ids : [];
+      if (members.length > 2) chatsSvc.removeGroupMember(userId, row.id, id);
+      else chatsSvc.deleteChat(userId, row.id);
+    }
+  } catch (err: any) {
+    // Focused tests may omit the chats table. Real cleanup failures must keep
+    // the tombstone in place so startup recovery can retry safely.
+    if (!/no such table: chats/i.test(String(err?.message ?? err))) throw err;
+  }
+
   const imageIds = collectCharacterImageIds(existing);
   for (const imageId of listCharacterGalleryImageIds(userId, id)) imageIds.add(imageId);
   const plan = imagesSvc.imageDeletePlan(userId, unreferencedImageIds(userId, imageIds));
 
   await imagesSvc.unlinkPaths(plan.paths);
-  if (existing.avatar_path) await filesSvc.deleteAvatar(existing.avatar_path, userId).catch(() => {});
+  if (existing.avatar_path) {
+    const stillReferenced = (() => {
+      try {
+        return !!getDb().query(
+          `SELECT 1 AS found FROM characters
+            WHERE user_id = ? AND deleting = 0 AND avatar_path = ?
+           UNION ALL
+           SELECT 1 AS found FROM personas WHERE user_id = ? AND avatar_path = ?
+           LIMIT 1`,
+        ).get(userId, existing.avatar_path, userId, existing.avatar_path);
+      } catch {
+        return false;
+      }
+    })();
+    if (!stillReferenced) await filesSvc.deleteAvatar(existing.avatar_path, userId).catch(() => {});
+  }
   await deleteAutoManagedCharacterWorldBooks(userId, id);
 
   getDb().transaction(() => {
@@ -1420,7 +1558,7 @@ export async function resumePendingCharacterDeletions(): Promise<number> {
   }
   for (const row of rows) {
     try {
-      await runCharacterDeletionCascade(row.user_id, row.id);
+      await scheduleCharacterDeletionCascade(row.user_id, row.id);
     } catch (err) {
       console.error(`[characters] deletion resume failed for ${row.id}:`, err instanceof Error ? err.message : err);
     }

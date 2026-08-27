@@ -375,7 +375,7 @@ table. Older archive formats use explicit bounded compatibility handling.
 
 ### Journaled files and atomic live apply
 
-Migration `src/db/migrations/104_user_data_import_integrity.sql` creates:
+Migration `src/db/migrations/115_user_data_import_integrity.sql` creates:
 
 - `user_data_imports`, keyed by `job_id`, with `user_id`, archive and
   idempotency identity, archive digest, bounded manifest/staging references,
@@ -450,12 +450,12 @@ configuration rows are canonical but their enabled state is reset off.
 
 ### Pre-bundle SQLite backup and downgrade boundary
 
-Migration `102` is the first migration in this schema bundle
+Migration `113` is the first migration in this schema bundle
 (`PRE_BUNDLE_MIGRATION_NUMBER`). `runMigrations()` calls
 `ensurePreBundleBackup()` (`src/db/migrate.ts`) before `_migrations` is created
 and before any baseline or migration SQL executes, so upgrading an existing
 install always leaves a recovery point at
-`<database path>.pre-bundle-102.sqlite` (`PRE_BUNDLE_BACKUP_SUFFIX`). The copy
+`<database path>.pre-bundle-113.sqlite` (`PRE_BUNDLE_BACKUP_SUFFIX`). The copy
 sits next to the database, is retained across later migration runs, and its path
 never reaches logs or error messages.
 
@@ -480,7 +480,7 @@ being treated as a filesystem path.
 Downgrade boundary: these migrations are one-way, and running an executable from
 before the bundle against the upgraded schema is unsupported — the older code
 does not know the new tables, ledger states, or reset policies. To return to
-that build, restore `<database path>.pre-bundle-102.sqlite` alongside the
+that build, restore `<database path>.pre-bundle-113.sqlite` alongside the
 matching older executable rather than downgrading in place; anything written
 after the upgrade is not in that copy. Rolling back only the strict Agentic
 runtime needs no schema change — use the `LUMIVERSE_AGENTIC_RUNTIME` switch in

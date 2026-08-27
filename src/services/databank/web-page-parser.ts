@@ -1,5 +1,5 @@
 import { Readability } from "@mozilla/readability";
-import { JSDOM } from "jsdom";
+import { parseHTML } from "linkedom";
 
 export type WebPageParseErrorCode = "no_content" | "parse_error";
 
@@ -33,14 +33,17 @@ function cleanExtractedText(text: string): string {
  * Parse an HTML document into readable plain text.
  *
  * This is deliberately isolated from the fetcher so it can run in a Worker:
- * JSDOM construction and Readability traversal are synchronous CPU work and
+ * DOM construction and Readability traversal are synchronous CPU work and
  * large pages can otherwise starve the server's WebSocket heartbeat handler.
  */
 export function parseWebPage(html: string, url: string): ParsedWebPage {
-  let dom: JSDOM | null = null;
   try {
-    dom = new JSDOM(html, { url });
-    const article = new Readability(dom.window.document).parse();
+    const { document } = parseHTML(html);
+    const base = document.createElement("base");
+    base.setAttribute("href", url);
+    document.head?.prepend(base);
+
+    const article = new Readability(document).parse();
 
     if (!article) {
       throw new WebPageParseError(
@@ -50,7 +53,7 @@ export function parseWebPage(html: string, url: string): ParsedWebPage {
     }
 
     // Readability already provides plain text. Using it avoids constructing a
-    // second JSDOM instance solely to read textContent from article.content.
+    // second DOM solely to read textContent from article.content.
     const content = cleanExtractedText(article.textContent || "");
     if (!content) {
       throw new WebPageParseError("Extracted content is empty", "no_content");
@@ -65,7 +68,5 @@ export function parseWebPage(html: string, url: string): ParsedWebPage {
   } catch (err) {
     if (err instanceof WebPageParseError) throw err;
     throw new WebPageParseError("Failed to parse page content", "parse_error");
-  } finally {
-    dom?.window.close();
   }
 }

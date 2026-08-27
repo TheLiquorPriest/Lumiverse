@@ -29,8 +29,8 @@ test('productivity settings cases pass in an isolated module graph', async () =>
   }
   expect(timedOut).toBe(false)
   expect(exitCode).toBe(0)
-  expect(summary).toMatch(/\b17 pass\b/)
+  expect(summary).toMatch(/\b20 pass\b/)
   expect(summary).toMatch(/\b0 fail\b/)
   expect(summary).toMatch(/\b[1-9]\d* expect\(\) calls\b/)
-  expect(summary).toMatch(/Ran 17 tests across 1 file/)
+  expect(summary).toMatch(/Ran 20 tests across 1 file/)
 }, 15_000)

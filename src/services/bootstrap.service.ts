@@ -107,6 +107,7 @@ interface StartupSettings {
   drawerSettings?: unknown;
   spindleSettings?: unknown;
   connectionsOrder?: Partial<Record<"llm" | "imageGen" | "stt" | "tts", string[]>>;
+  activeProfileId?: string | null;
 }
 
 const LIST_LIMIT_CONNECTIONS = 100;
@@ -114,7 +115,7 @@ const LIST_LIMIT_PACKS_PERSONAS = 200;
 const LIST_LIMIT_REGEX = 1000;
 const LANDING_CHATS_DEFAULT_LIMIT = 12;
 const LANDING_CHATS_MAX_LIMIT = 100;
-const STARTUP_SETTINGS_KEYS = [
+export const STARTUP_SETTINGS_KEYS = [
   "favorites",
   "landingHiddenCharacterIds",
   "filterTab",
@@ -130,6 +131,7 @@ const STARTUP_SETTINGS_KEYS = [
   "drawerSettings",
   "spindleSettings",
   "connectionsOrder",
+  "activeProfileId",
 ] as const;
 
 /**
@@ -157,7 +159,7 @@ export function sanitizeConnectionsOrder(
   return sanitized;
 }
 
-function getStartupSettings(userId: string): StartupSettings {
+export function getStartupSettings(userId: string): StartupSettings {
   const rows = settingsSvc.getSettingsByKeys(userId, [...STARTUP_SETTINGS_KEYS]);
   const startupSettings: StartupSettings = {};
 
@@ -239,6 +241,15 @@ function getStartupSettings(userId: string): StartupSettings {
     startupSettings.connectionsOrder = connectionsOrder;
   }
 
+  if (rows.has("activeProfileId")) {
+    const activeProfileId = rows.get("activeProfileId");
+    if (typeof activeProfileId === "string" && activeProfileId.length > 0) {
+      startupSettings.activeProfileId = activeProfileId;
+    } else if (activeProfileId === null) {
+      startupSettings.activeProfileId = null;
+    }
+  }
+
   return startupSettings;
 }
 
@@ -307,16 +318,16 @@ function listLlmProviders(): ProviderListEntry[] {
   }));
 }
 
-function listTtsProviders(): ProviderSummaryEntry[] {
-  return getTtsProviderList().map((p) => ({
+function listTtsProviders(userId: string): ProviderSummaryEntry[] {
+  return getTtsProviderList(userId).map((p) => ({
     id: p.name,
     name: p.displayName,
     capabilities: p.capabilities,
   }));
 }
 
-function listSttProviders(): ProviderSummaryEntry[] {
-  return sttConnectionsSvc.listProviders().map((p) => ({
+function listSttProviders(userId: string): ProviderSummaryEntry[] {
+  return sttConnectionsSvc.listProviders(userId).map((p) => ({
     id: p.id,
     name: p.name,
     capabilities: p.capabilities,
@@ -393,9 +404,9 @@ export async function buildBootstrapPayload(
   const llmConnections = safeSync("llm.connections", () => collectAll((p) => connectionsSvc.listConnections(userId, p)), emptyPage<ConnectionProfile>(LIST_LIMIT_CONNECTIONS));
   const llmProviders = safeSync("llm.providers", () => listLlmProviders(), [] as ProviderListEntry[]);
   const sttConnections = safeSync("stt.connections", () => collectAll((p) => sttConnectionsSvc.listConnections(userId, p)), emptyPage<SttConnectionProfile>(LIST_LIMIT_CONNECTIONS));
-  const sttProviders = safeSync("stt.providers", () => listSttProviders(), [] as ProviderSummaryEntry[]);
+  const sttProviders = safeSync("stt.providers", () => listSttProviders(userId), [] as ProviderSummaryEntry[]);
   const ttsConnections = safeSync("tts.connections", () => collectAll((p) => ttsConnectionsSvc.listConnections(userId, p)), emptyPage<TtsConnectionProfile>(LIST_LIMIT_CONNECTIONS));
-  const ttsProviders = safeSync("tts.providers", () => listTtsProviders(), [] as ProviderSummaryEntry[]);
+  const ttsProviders = safeSync("tts.providers", () => listTtsProviders(userId), [] as ProviderSummaryEntry[]);
   const imageGenConnections = safeSync("imageGen.connections", () => collectAll((p) => imageGenConnectionsSvc.listConnections(userId, p)), emptyPage<ImageGenConnectionProfile>(LIST_LIMIT_CONNECTIONS));
   const imageGenProviders = safeSync("imageGen.providers", () => listImageGenProviders(), [] as ProviderSummaryEntry[]);
   const packs = safeSync("packs", () => packsSvc.listPacks(userId, pagLargeMisc), emptyPage<Pack>(LIST_LIMIT_PACKS_PERSONAS));

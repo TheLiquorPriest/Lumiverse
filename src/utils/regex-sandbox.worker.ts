@@ -5,6 +5,7 @@ import {
   encodeLengthPrefixedJson,
   isIsolateRequestEnvelopeV1,
   makeErrorEnvelopeV1,
+  makeStartedEnvelopeV1,
   makeResultEnvelopeV1,
   normalizeIsolateMaxFrameBytes,
 } from "../services/isolate-protocol";
@@ -83,6 +84,10 @@ async function handleRequest(message: unknown): Promise<void> {
   if (!isIsolateRequestEnvelopeV1(request) || REGEX_OPERATIONS[request.operation] !== true) {
     throw new Error("Malformed isolate regex request envelope");
   }
+  workerSelf.postMessage(encodeLengthPrefixedJson(
+    makeStartedEnvelopeV1(request.requestId),
+    workerMaxFrameBytes,
+  ));
   try {
     const result = executeRegexRequest(request.payload, request.requestId, request.operation);
     workerSelf.postMessage(encodeLengthPrefixedJson(

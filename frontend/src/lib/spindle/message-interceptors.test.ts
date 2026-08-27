@@ -75,26 +75,14 @@ describe('message tag interception', () => {
     expect(result.intercepts).toHaveLength(0)
   })
 
-  test('deduplicates delivery after sharing the chat-enter poller', async () => {
+  test('delivers immediately and deduplicates within a delivered set', () => {
     const deliveries = register('queued-extension', { tagName: 'queued' })
     const first = stripMessageTags('<queued>one</queued>', { messageId: 'm1' })
     const second = stripMessageTags('<queued>two</queued>', { messageId: 'm2' })
-    const previousDocument = (globalThis as any).document
-    let entering = true
-    ;(globalThis as any).document = {
-      body: { hasAttribute: () => entering },
-    }
-
-    try {
-      const delivered = new Set<string>()
-      dispatchMessageTagIntercepts(first.intercepts, delivered)
-      dispatchMessageTagIntercepts(first.intercepts, delivered)
-      dispatchMessageTagIntercepts(second.intercepts, delivered)
-      entering = false
-      await Bun.sleep(60)
-      expect(deliveries.map((payload) => payload.content)).toEqual(['one', 'two'])
-    } finally {
-      ;(globalThis as any).document = previousDocument
-    }
+    const delivered = new Set<string>()
+    dispatchMessageTagIntercepts(first.intercepts, delivered)
+    dispatchMessageTagIntercepts(first.intercepts, delivered)
+    dispatchMessageTagIntercepts(second.intercepts, delivered)
+    expect(deliveries.map((payload) => payload.content)).toEqual(['one', 'two'])
   })
 })

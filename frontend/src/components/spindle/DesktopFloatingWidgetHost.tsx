@@ -6,6 +6,7 @@ import {
   returnDesktopFloatingWidgetToPage,
   syncDesktopFloatingWidgetSize,
 } from '@/lib/desktop-floating-widget'
+import { hasEnabledFrontendExtensionId } from '@/lib/spindle/frontend-extension-availability'
 
 const resizeHandles = [
   ['North', { top: -4, left: 10, right: 10, height: 8, cursor: 'n-resize' }],
@@ -23,8 +24,12 @@ export default function DesktopFloatingWidgetHost() {
   const target = desktopFloatingWidgetTarget!
   const nativeWindow = getCurrentWindow()
   const widgets = useStore((state) => state.floatWidgets)
+  const extensions = useStore((state) => state.extensions)
   const updateFloatWidget = useStore((state) => state.updateFloatWidget)
-  const widget = widgets.filter((entry) => entry.extensionId === target.extensionId && entry.visible)[target.index]
+  const extensionEnabled = hasEnabledFrontendExtensionId(extensions, target.extensionId)
+  const widget = extensionEnabled
+    ? widgets.filter((entry) => entry.extensionId === target.extensionId && entry.visible)[target.index]
+    : undefined
   const widgetId = widget?.id
   const widgetWidth = widget?.width
   const widgetHeight = widget?.height
@@ -38,6 +43,10 @@ export default function DesktopFloatingWidgetHost() {
   useEffect(() => {
     widgetRef.current = widget
   }, [widget])
+
+  useEffect(() => {
+    if (!extensionEnabled) void nativeWindow.close().catch(() => {})
+  }, [extensionEnabled, nativeWindow])
 
   useEffect(() => {
     const host = hostRef.current
@@ -157,6 +166,8 @@ export default function DesktopFloatingWidgetHost() {
     window.addEventListener('spindle:float-size-request', handleSizeRequest)
     return () => window.removeEventListener('spindle:float-size-request', handleSizeRequest)
   }, [hostChromeHeight, nativeWindow, widgetId])
+
+  if (!extensionEnabled) return null
 
   return (
     <div
