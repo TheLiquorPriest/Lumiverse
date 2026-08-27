@@ -3771,12 +3771,33 @@ function buildDependencies(): AgenticGenerationDependencies {
     // until terminal reconciliation has completed. publishTerminal owns the
     // immutable terminal snapshot after the persistent session and inspection
     // writes have succeeded.
-    publishAgentRunCommit: (db: Database, input: AgentRunProjectionInputV2) =>
-      appendAgentRunSnapshot(db, {
+    publishAgentRunCommit: (db: Database, input: AgentRunProjectionInputV2) => {
+      const projection = appendAgentRunSnapshot(db, {
         ...input,
         status: "COMMITTING",
         terminalHandoff: null,
-      }),
+      });
+      const commitRecorded = inspectionWriters.get(input.generationId)?.record("milestone", {
+        id: `phase:${input.generationId}:COMMIT`,
+        kind: "milestone",
+        actor: "host",
+        recipient: "owner",
+        result: JSON.stringify({
+          phase: "COMMIT",
+          workPhase: "COMMIT",
+          workStatus: "waiting",
+          workOutcome: null,
+          reason: null,
+        }),
+        correlation: { parentId: "root" },
+      }, {
+        lifecycle: "COMMIT",
+        status: "waiting",
+        updatedAt: Date.now(),
+      });
+      if (!commitRecorded) throw new Error("commit_chronology_projection_missing");
+      return projection;
+    },
   });
   const refreshPersistentAssociation = (association: PersistentRuntimeAssociation): void => {
     const workspace = getPersistentWorkspaceById({

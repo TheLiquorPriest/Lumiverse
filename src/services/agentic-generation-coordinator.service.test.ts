@@ -1799,7 +1799,7 @@ describe("production agentic coordinator installation", () => {
     }
     expect((rejected as Error | null)?.message).toBe("agentic_target_unsupported");
   });
-  test("production installer runs a normal turn through tool work, render, commit, and Response escape", async () => {
+  test("production installer persists one canonical COMMIT chronology through a live Agentic turn and recovered inspection", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
     await probeIsolateBackendsAtStartup();
@@ -1955,6 +1955,18 @@ describe("production agentic coordinator installation", () => {
       workspaceId === persistentWorkspace?.workspace_id
       && workspaceId !== `workspace:${started.generationId}`,
     )).toBe(true);
+    const commitMilestoneId = `phase:${started.generationId}:COMMIT`;
+    const prepareMilestoneId = `phase:${started.generationId}:PREPARE_COMMIT`;
+    const liveChronology = workspaceInspection?.transcript ?? [];
+    const livePrepareMilestone = liveChronology.find(({ id }) => id === prepareMilestoneId);
+    const liveCommitMilestones = liveChronology.filter(({ id }) => id === commitMilestoneId);
+    expect(livePrepareMilestone?.correlation.phase).toBe("PREPARE_COMMIT");
+    expect(liveCommitMilestones).toHaveLength(1);
+    expect(liveCommitMilestones[0]?.correlation.phase).toBe("COMMIT");
+    expect(liveCommitMilestones[0]!.correlation.hostSequence).toBeGreaterThan(
+      livePrepareMilestone!.correlation.hostSequence,
+    );
+    expect(liveChronology.at(-1)?.id).toBe(commitMilestoneId);
 
     let responseGenerationId = "";
     let responseRequestActive = true;
@@ -2002,6 +2014,18 @@ describe("production agentic coordinator installation", () => {
       responseRequestActive = false;
       unsubscribeResponse();
     }
+    __testing.resetInstallation();
+    installAgenticGenerationCoordinator();
+    const recoveredInspection = getAgentRunInspection(USER_ID, started.generationId, AGENTIC_CHAT_ID);
+    const recoveredChronology = recoveredInspection?.transcript ?? [];
+    const recoveredPrepareMilestone = recoveredChronology.find(({ id }) => id === prepareMilestoneId);
+    const recoveredCommitMilestones = recoveredChronology.filter(({ id }) => id === commitMilestoneId);
+    expect(recoveredCommitMilestones).toHaveLength(1);
+    expect(recoveredCommitMilestones[0]?.correlation.phase).toBe("COMMIT");
+    expect(recoveredCommitMilestones[0]!.correlation.hostSequence).toBeGreaterThan(
+      recoveredPrepareMilestone!.correlation.hostSequence,
+    );
+    expect(recoveredChronology.at(-1)?.id).toBe(commitMilestoneId);
   });
   test("freezes custom phase instruction sources and rejects ambiguous prompt block IDs", async () => {
     markAgenticRuntimeReady();
