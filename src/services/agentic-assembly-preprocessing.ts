@@ -26,6 +26,7 @@ import type {
   SnapshotMessageV1,
   SnapshotRegexScriptV1,
   SnapshotWorldEntryV1,
+  SnapshotNativeWorldInfoRuntimePlacementV1,
 } from "./prompt-assembly-snapshot.service";
 import { runRegexRequest } from "../utils/regex-sandbox-core";
 const RESULT_MARKER_RE = /\{\{(?:agent(?:::|Result::)[^}]*)|\/agent\}\}/;
@@ -37,6 +38,7 @@ export interface SnapshotWorldPreparationV1 {
   readonly state: WiState;
   readonly stateDeltas: readonly WorldInfoStateDeltaV1[];
   readonly evidence: readonly Readonly<Record<string, unknown>>[];
+  readonly runtimePlacements: readonly SnapshotNativeWorldInfoRuntimePlacementV1[];
 }
 
 function utf8Bytes(value: string): number {
@@ -337,8 +339,11 @@ function asWorldEntry(entry: SnapshotWorldEntryV1): WorldBookEntry {
   };
 }
 
-function initialWorldState(snapshot: GenerationAssemblySnapshotV1): WiState {
-  const source = record(snapshot.worldInfo.state);
+function worldStateFromSource(
+  snapshot: GenerationAssemblySnapshotV1,
+  sourceValue: Readonly<Record<string, unknown>>,
+): WiState {
+  const source = record(sourceValue);
   const state: WiState = {};
   for (const entry of snapshot.worldInfo.entries) {
     const candidate = record(source[entry.uid] ?? source[entry.id]);
@@ -350,6 +355,10 @@ function initialWorldState(snapshot: GenerationAssemblySnapshotV1): WiState {
     };
   }
   return state;
+}
+
+function initialWorldState(snapshot: GenerationAssemblySnapshotV1): WiState {
+  return worldStateFromSource(snapshot, snapshot.worldInfo.state);
 }
 
 function stateDelta(
@@ -381,11 +390,37 @@ function stateDelta(
   };
 }
 
-/** Recompute keyword/constant WI from the frozen snapshot and deterministic PRNG. */
+/** Consume host-finalized native WI when present; legacy fixtures retain deterministic replay. */
 export function activateSnapshotWorldInfo(
   snapshot: GenerationAssemblySnapshotV1,
 ): SnapshotWorldPreparationV1 {
   const entries = snapshot.worldInfo.entries.map(asWorldEntry);
+  const native = snapshot.worldInfo.native;
+  if (native) {
+    const entriesById = new Map(entries.map((entry) => [entry.id, entry]));
+    const activatedEntries = native.activatedEntryIds.map((entryId) => {
+      const entry = entriesById.get(entryId);
+      if (!entry) throw new Error(`invalid_input: native WI activation references unknown entry ${entryId}`);
+      return Object.freeze({ ...entry });
+    });
+    const before = initialWorldState(snapshot);
+    const state = worldStateFromSource(snapshot, native.stateAfter);
+    const stateDeltas: WorldInfoStateDeltaV1[] = [];
+    for (const entry of snapshot.worldInfo.entries) {
+      const beforeState = before[entry.uid] ?? { stickyLeft: 0, cooldownLeft: 0, delayCount: 0, active: false };
+      const afterState = state[entry.uid] ?? beforeState;
+      const delta = stateDelta(entry, beforeState, afterState);
+      if (delta) stateDeltas.push(Object.freeze(delta));
+    }
+    return Object.freeze({
+      activatedEntries: Object.freeze(activatedEntries),
+      cache: structuredClone(native.cache),
+      state,
+      stateDeltas: Object.freeze(stateDeltas),
+      evidence: Object.freeze(native.activationEvidence.map((item) => Object.freeze({ ...item }))),
+      runtimePlacements: Object.freeze(structuredClone(native.runtimePlacements ?? [])),
+    });
+  }
   const messages = snapshot.messages
     .filter((message) => message.id !== snapshot.target.excludedMessageId)
     .map(toMessage) as unknown as Message[];
@@ -418,6 +453,9 @@ export function activateSnapshotWorldInfo(
       uid: entry.uid,
       activated: result.activatedEntries.some((candidate) => candidate.id === entry.id),
       origin: result.activationProvenanceById.get(entry.id)?.origin ?? "none",
+      keyword: null,
+      vectorScore: null,
+      vectorDisposition: null,
       state: Object.freeze({ ...afterState }),
     }));
   }
@@ -427,6 +465,7 @@ export function activateSnapshotWorldInfo(
     state,
     stateDeltas: Object.freeze(stateDeltas),
     evidence: Object.freeze(evidence),
+    runtimePlacements: Object.freeze([]),
   });
 }
 

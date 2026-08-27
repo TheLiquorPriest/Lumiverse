@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
 import type { AssemblySurfaceV1 } from "../llm/types";
+import { STRUCTURAL_PROMPT_MARKERS } from "../types/preset";
+import { projectActivationProvenance } from "../spindle/activation-provenance";
+import {
+  MAX_AUDIO_BYTES,
+  MAX_IMAGE_BYTES,
+  MAX_NATIVE_MESSAGE_MEDIA_PARTS,
+  MAX_NATIVE_MESSAGE_MEDIA_TOTAL_BYTES,
+} from "../types/media-limits";
 
 import { preflightAgentIntrinsics, AgentIntrinsicValidationError } from "./agent-intrinsics.service";
 import { registry as macroRegistry } from "../macros/MacroRegistry";
@@ -40,6 +48,7 @@ import type {
   AssemblyDatabankMessageProvenanceV1,
   AssemblyProfileOutputLimitV1,
   AssemblyLiteralSegmentV1 as SharedAssemblyLiteralSegmentV1,
+  AssemblyMediaSegmentV1 as SharedAssemblyMediaSegmentV1,
   AssemblyMessageProvenanceV1 as SharedAssemblyMessageProvenanceV1,
   AssemblyMessageSourceKindV1,
   AssemblyPlanV1 as SharedAssemblyPlanV1,
@@ -123,9 +132,11 @@ export type AssemblyResultSlotSegmentV1 = SharedAssemblyResultSlotSegmentV1 & {
   readonly maxBytes: number;
   readonly bytes: 0;
 };
+export type AssemblyMediaSegmentV1 = SharedAssemblyMediaSegmentV1 & { readonly bytes: 0 };
 export type AssemblyMessageSegmentV1 =
   | AssemblyLiteralSegmentV1
-  | AssemblyResultSlotSegmentV1;
+  | AssemblyResultSlotSegmentV1
+  | AssemblyMediaSegmentV1;
 export interface AssemblyLoomMessageProvenanceV1 {
   readonly entryId: string;
   readonly bucket: LoomPolicyBucketV1;
@@ -459,12 +470,48 @@ function validateNestedSnapshotRecords(candidate: Record<string, unknown>, limit
   text(chat.revision, "chat.revision");
   if (!Array.isArray(candidate.messages)) fail("messages collection");
   const messages = candidate.messages as readonly unknown[];
+  let nativeMediaPartCount = 0;
+  let nativeMediaTotalBytes = 0;
   for (const [index, raw] of messages.entries()) {
     const message = record(raw, `message[${index}]`);
     closed(message, [
       "id", "chat_id", "index_in_chat", "is_user", "name", "content", "send_date",
-      "swipe_id", "swipes", "swipe_dates", "extra", "parent_message_id", "branch_id", "created_at", "revision",
+      "swipe_id", "swipes", "swipe_dates", "extra", "parent_message_id", "branch_id", "created_at", "revision", "mediaParts",
     ], `message[${index}]`);
+    const mediaParts: unknown[] = Array.isArray(message.mediaParts)
+      ? message.mediaParts
+      : fail(`message[${index}].mediaParts`);
+    for (const [mediaIndex, rawMedia] of mediaParts.entries()) {
+      const media = record(rawMedia, `message[${index}].mediaParts[${mediaIndex}]`);
+      closed(media, ["kind", "mediaType", "mediaId", "mimeType", "byteLength", "sha256"], `message[${index}].mediaParts[${mediaIndex}]`);
+      const mediaByteLength = media.byteLength;
+      const mediaLimit = media.mediaType === "image" ? MAX_IMAGE_BYTES : media.mediaType === "audio" ? MAX_AUDIO_BYTES : 0;
+      if (
+        media.kind !== "media"
+        || typeof media.mediaId !== "string"
+        || media.mediaId.length === 0
+        || bytes(media.mediaId) > 256
+        || typeof media.mimeType !== "string"
+        || !/^(?:image|audio)\/[a-z0-9.+-]{1,96}$/.test(media.mimeType)
+        || typeof mediaByteLength !== "number"
+        || !Number.isSafeInteger(mediaByteLength)
+        || mediaByteLength < 1
+        || mediaByteLength > mediaLimit
+        || typeof media.sha256 !== "string"
+        || !/^[0-9a-f]{64}$/.test(media.sha256)
+        || message.is_user !== true
+      ) fail(`message[${index}].mediaParts[${mediaIndex}]`);
+      if (typeof mediaByteLength === "number") {
+        nativeMediaPartCount += 1;
+        if (
+          nativeMediaPartCount > MAX_NATIVE_MESSAGE_MEDIA_PARTS
+          || mediaByteLength > MAX_NATIVE_MESSAGE_MEDIA_TOTAL_BYTES - nativeMediaTotalBytes
+        ) fail("message[" + index + "].mediaParts limits");
+        nativeMediaTotalBytes += mediaByteLength;
+      } else {
+        fail("message[" + index + "].mediaParts[" + mediaIndex + "]");
+      }
+    }
     text(message.id, `message[${index}].id`);
     text(message.chat_id, `message[${index}].chat_id`);
     if (!Number.isSafeInteger(message.index_in_chat) || (message.index_in_chat as number) < 0) fail(`message[${index}].index_in_chat`);
@@ -662,6 +709,12 @@ interface SnapshotPreprocessingResult {
   readonly worldInfo: SnapshotWorldPreparationV1;
   readonly worldBefore: readonly AssemblyProviderMessageV1[];
   readonly worldAfter: readonly AssemblyProviderMessageV1[];
+  readonly worldAnBefore: readonly AssemblyProviderMessageV1[];
+  readonly worldAnAfter: readonly AssemblyProviderMessageV1[];
+  readonly worldEmBefore: readonly AssemblyProviderMessageV1[];
+  readonly worldEmAfter: readonly AssemblyProviderMessageV1[];
+  readonly worldDepth: readonly Readonly<{ message: AssemblyProviderMessageV1; depth: number }>[];
+  readonly worldRuntime: readonly Readonly<{ message: AssemblyProviderMessageV1; direction: "from_start" | "from_end"; depth: number }>[];
   readonly deltas: readonly PreparationDeltaV1[];
   readonly macroEvidence: readonly Readonly<Record<string, unknown>>[];
   readonly regexEvidence: readonly Readonly<Record<string, unknown>>[];
@@ -730,6 +783,16 @@ function assertChildMarkersAreSealed(
   return true;
 }
 
+function projectStructuralBlockAdmission(
+  block: SnapshotBlockV1,
+  values: Readonly<Record<string, string>> | undefined,
+): SnapshotBlockV1 {
+  if (block.marker === null || !STRUCTURAL_PROMPT_MARKERS.has(block.marker)) return block;
+  const content = values?.[block.id];
+  return content === undefined
+    ? frozen({ ...block, enabled: false, content: "" })
+    : frozen({ ...block, content });
+}
 async function preprocessSnapshot(
   snapshot: GenerationAssemblySnapshotV1,
   phasePolicyBlockIds: ReadonlySet<string> = new Set(),
@@ -876,7 +939,9 @@ async function preprocessSnapshot(
     if (outlet) outletValues[outlet] = await resolveWorldText(entry.content);
   }
   const blocks: SnapshotBlockV1[] = [];
-  for (const [blockIndex, block] of snapshot.blocks.entries()) {
+  const structuralBlockValues = snapshot.participants.structuralBlockValues;
+  for (const [blockIndex, sourceBlock] of snapshot.blocks.entries()) {
+    const block = projectStructuralBlockAdmission(sourceBlock, structuralBlockValues);
     const child = assertChildMarkersAreSealed(block.content, block, blockIndex);
     if (child && phasePolicyBlockIds.has(block.id)) {
       failForBlock("requires_response_mode", "Cognition policy blocks cannot contain agent result references", block, blockIndex);
@@ -947,6 +1012,25 @@ async function preprocessSnapshot(
   // Source deltas follow frozen history order, independent of regex-action
   // insertion order, so the deferred write intent is deterministic.
   deltas.push(...sourceMessageDeltas);
+  const worldRuntime: Array<Readonly<{ message: AssemblyProviderMessageV1; direction: "from_start" | "from_end"; depth: number }>> = [];
+  for (const [placementIndex, item] of worldInfo.runtimePlacements.entries()) {
+    if (agentMarkersPresent(item.content)) {
+      throw new AssemblyPlanValidationError("invalid_input", "Agent markers cannot occur in world-info content");
+    }
+    worldRuntime.push(frozen({
+      message: messageForWorldInfo(
+        await resolveWorldText(item.content),
+        item.placement.role,
+        snapshot.limits.maxOperationBytes,
+        item.entryLabel,
+        digest({ entryId: item.id, placement: item.placement, content: item.content }),
+        history.length + placementIndex,
+      ),
+      direction: item.placement.direction,
+      depth: Math.max(0, Math.floor(item.placement.depth)),
+    }));
+  }
+
   const worldContent = [
     ...worldInfo.cache.before,
     ...worldInfo.cache.anBefore,
@@ -961,47 +1045,48 @@ async function preprocessSnapshot(
       throw new AssemblyPlanValidationError("invalid_input", "Agent markers cannot occur in world-info content");
     }
   }
-  const worldBeforeItems = [
-    ...worldInfo.cache.before,
-    ...worldInfo.cache.anBefore,
-    ...worldInfo.cache.emBefore,
-    ...worldInfo.cache.depth,
-  ];
-  const worldAfterItems = [
-    ...worldInfo.cache.emAfter,
-    ...worldInfo.cache.anAfter,
-    ...worldInfo.cache.after,
-  ];
   const worldSourceRevision = (item: { content: string; entryLabel: string }): string =>
     digest({ entryLabel: item.entryLabel, content: item.content });
-  const worldBefore = [];
-  for (const [sourceIndex, item] of worldBeforeItems.entries()) {
-    worldBefore.push(messageForWorldInfo(
-      await resolveWorldText(item.content),
-      item.role,
-      snapshot.limits.maxOperationBytes,
-      item.entryLabel,
-      worldSourceRevision(item),
-      sourceIndex,
-    ));
-  }
-  const worldAfter = [];
-  for (const [sourceIndex, item] of worldAfterItems.entries()) {
-    worldAfter.push(messageForWorldInfo(
-      await resolveWorldText(item.content),
-      item.role,
-      snapshot.limits.maxOperationBytes,
-      item.entryLabel,
-      worldSourceRevision(item),
-      worldBeforeItems.length + sourceIndex,
-    ));
-  }
+  let worldSourceIndex = 0;
+  const worldMessages = async <T extends { content: string; entryLabel: string; role: string }>(
+    items: readonly T[],
+  ): Promise<AssemblyProviderMessageV1[]> => {
+    const messages: AssemblyProviderMessageV1[] = [];
+    for (const item of items) {
+      messages.push(messageForWorldInfo(
+        await resolveWorldText(item.content),
+        item.role,
+        snapshot.limits.maxOperationBytes,
+        item.entryLabel,
+        worldSourceRevision(item),
+        worldSourceIndex++,
+      ));
+    }
+    return messages;
+  };
+  const worldBefore = await worldMessages(worldInfo.cache.before);
+  const worldAfter = await worldMessages(worldInfo.cache.after);
+  const worldAnBefore = await worldMessages(worldInfo.cache.anBefore);
+  const worldAnAfter = await worldMessages(worldInfo.cache.anAfter);
+  const worldEmBefore = await worldMessages(worldInfo.cache.emBefore);
+  const worldEmAfter = await worldMessages(worldInfo.cache.emAfter);
+  const worldDepthMessages = await worldMessages(worldInfo.cache.depth);
+  const worldDepth = worldDepthMessages.map((message, index) => frozen({
+    message,
+    depth: Math.max(0, Math.floor(worldInfo.cache.depth[index]!.depth)),
+  }));
   return frozen({
     blocks: frozen(blocks),
     history: frozen(history),
     worldInfo,
     worldBefore: frozen(worldBefore),
     worldAfter: frozen(worldAfter),
+    worldAnBefore: frozen(worldAnBefore),
+    worldAnAfter: frozen(worldAnAfter),
+    worldEmBefore: frozen(worldEmBefore),
+    worldEmAfter: frozen(worldEmAfter),
+    worldDepth: frozen(worldDepth),
+    worldRuntime: frozen(worldRuntime),
     deltas: frozen(deltas),
     macroEvidence: frozen(macroEvidence),
     regexEvidence: frozen(regexEvidence),
@@ -1608,12 +1693,19 @@ function messageForBlock(
 }
 
 function messageForHistory(message: SnapshotMessageV1, maxBytes: number, sourceIndex: number): AssemblyProviderMessageV1 {
-  const text = typeof message.content === "string" ? message.content : "";
+  const rawText = typeof message.content === "string" ? message.content : "";
+  const mediaParts = message.mediaParts ?? [];
+  const text = mediaParts.length > 0 ? rawText.replace(/\s*\(attached\)\s*$/u, "") : rawText;
   if (bytes(text) > maxBytes) throw new AssemblyPlanValidationError("limit_exceeded", "Chat message exceeds operation limit");
+  const segments: AssemblyMessageSegmentV1[] = [];
+  if (text.length > 0 || mediaParts.length === 0) {
+    segments.push(frozen({ kind: "literal", text, bytes: bytes(text) }));
+  }
+  for (const media of mediaParts) segments.push(frozen({ ...media, bytes: 0 }));
   return frozen({
     role: message.is_user ? "user" : "assistant",
     ...(message.name ? { name: message.name } : {}),
-    segments: frozen([frozen({ kind: "literal", text, bytes: bytes(text) })]),
+    segments: frozen(segments),
     contentKind: "segments",
     provenance: messageProvenance("history", message.id, message.revision, sourceIndex),
   });
@@ -1819,6 +1911,17 @@ export async function compileAgentAssemblyPlan(
   for (const item of parsed) {
     if (!item.block.enabled) continue;
     const child = item.child;
+    const explicitWorldMessages = !child && item.block.marker === "world_info_before"
+      ? preparation.worldBefore
+      : !child && item.block.marker === "world_info_after"
+        ? preparation.worldAfter
+        : null;
+    if (explicitWorldMessages) {
+      for (const message of explicitWorldMessages) {
+        addBlockMessage(item.block, frozen({ ...message, role: roleForWorldInfo(item.block.role) }));
+      }
+      continue;
+    }
     if (child) {
       const descriptor = children.find((candidate) => candidate.blockIndex === item.blockIndex);
       const slot = descriptor ? slots[descriptor.slotIndex] : undefined;
@@ -1846,21 +1949,75 @@ export async function compileAgentAssemblyPlan(
   }
   const automaticDatabankMessage = macroHandlesDatabank
     ? null
-    : messageForDatabank(snapshot, preparation.worldBefore.length + preHistoryMessages.length);
+    : messageForDatabank(snapshot, preHistoryMessages.length);
+  const hasWorldBeforeMarker = parsed.some((item) => item.block.enabled && !item.child && item.block.marker === "world_info_before");
+  const hasWorldAfterMarker = parsed.some((item) => item.block.enabled && !item.child && item.block.marker === "world_info_after");
   const providerMessages: AssemblyProviderMessageV1[] = [
-    ...preparation.worldBefore,
     ...preHistoryMessages,
     ...(automaticDatabankMessage ? [automaticDatabankMessage] : []),
     ...historyWithDepth,
     ...postHistoryMessages,
-    ...preparation.worldAfter,
   ];
+  const insertMessages = (index: number, messages: readonly AssemblyProviderMessageV1[]): number => {
+    if (messages.length === 0) return 0;
+    const boundary = Math.max(0, Math.min(index, providerMessages.length));
+    providerMessages.splice(boundary, 0, ...messages);
+    return messages.length;
+  };
+  const historyIndexes = (): number[] => providerMessages
+    .map((message, index) => message.provenance.kind === "history" ? index : -1)
+    .filter((index) => index >= 0);
+  let chatIndexes = historyIndexes();
+  if (!hasWorldBeforeMarker) {
+    insertMessages(chatIndexes[0] ?? 0, preparation.worldBefore);
+  }
+  chatIndexes = historyIndexes();
+  if (!hasWorldAfterMarker) {
+    insertMessages(chatIndexes.length > 0 ? chatIndexes[chatIndexes.length - 1]! + 1 : providerMessages.length, preparation.worldAfter);
+  }
+  chatIndexes = historyIndexes();
+  if (chatIndexes.length > 0) {
+    insertMessages(chatIndexes[0]!, preparation.worldAnBefore);
+    chatIndexes = historyIndexes();
+    insertMessages(chatIndexes[0]! + 1, preparation.worldAnAfter);
+    chatIndexes = historyIndexes();
+    const emStart = chatIndexes[0]!;
+    insertMessages(emStart, preparation.worldEmBefore);
+    insertMessages(emStart + 1, preparation.worldEmAfter);
+  }
+  for (const entry of preparation.worldDepth) {
+    insertMessages(providerMessages.length - entry.depth, [entry.message]);
+  }
+  const runtimeSequence = new Set<AssemblyProviderMessageV1>(
+    providerMessages.filter((message) => message.provenance.kind === "history"),
+  );
+  for (const entry of preparation.worldRuntime) {
+    chatIndexes = providerMessages
+      .map((message, index) => runtimeSequence.has(message) ? index : -1)
+      .filter((index) => index >= 0);
+    const sequenceLength = chatIndexes.length;
+    const spliceStart = entry.direction === "from_start" ? entry.depth : sequenceLength - entry.depth;
+    const logicalBoundary = spliceStart < 0
+      ? Math.max(sequenceLength + spliceStart, 0)
+      : Math.min(spliceStart, sequenceLength);
+    const physicalBoundary = logicalBoundary < sequenceLength
+      ? chatIndexes[logicalBoundary]!
+      : sequenceLength > 0
+        ? chatIndexes[sequenceLength - 1]! + 1
+        : providerMessages.length - postHistoryMessages.length;
+    insertMessages(physicalBoundary, [entry.message]);
+    runtimeSequence.add(entry.message);
+  }
   const workPolicyMessages = phasePolicyMessages(preparation.blocks, phaseRefs.workPolicy, snapshot.limits, "workPolicy", loomPolicy);
   const workspaceUsageMessages = phasePolicyMessages(preparation.blocks, phaseRefs.workspaceUsage, snapshot.limits, "workspaceUsage", loomPolicy);
   const completionCriteriaMessages = phasePolicyMessages(preparation.blocks, phaseRefs.completionCriteria, snapshot.limits, "completionCriteria", loomPolicy);
   const renderPolicyMessages = phasePolicyMessages(preparation.blocks, phaseRefs.renderPolicy, snapshot.limits, "renderPolicy", loomPolicy);
   const phaseMessages = [...workPolicyMessages, ...workspaceUsageMessages, ...completionCriteriaMessages, ...renderPolicyMessages];
-  if (providerMessages.length + phaseMessages.length > snapshot.limits.maxPromptBlocks + snapshot.messages.length + preparation.worldBefore.length + preparation.worldAfter.length) {
+  const worldInfoMessageCount = preparation.worldBefore.length + preparation.worldAfter.length
+    + preparation.worldAnBefore.length + preparation.worldAnAfter.length
+    + preparation.worldEmBefore.length + preparation.worldEmAfter.length
+    + preparation.worldDepth.length + preparation.worldRuntime.length;
+  if (providerMessages.length + phaseMessages.length > snapshot.limits.maxPromptBlocks + snapshot.messages.length + worldInfoMessageCount) {
     throw new AssemblyPlanValidationError("limit_exceeded", "Provider and cognition policy message limit exceeded");
   }
   const seals: AssemblySealV1[] = [];
@@ -1886,7 +2043,7 @@ export async function compileAgentAssemblyPlan(
   for (const message of [...providerMessages, ...phaseMessages]) {
     for (const segment of message.segments) {
       if (segment.kind === "literal") literalInputBytes += segment.bytes;
-      else reservedResultBytes += segment.maxBytes;
+      else if (segment.kind === "result_slot") reservedResultBytes += segment.maxBytes;
     }
   }
   if (literalInputBytes > snapshot.limits.maxInputBytes || literalInputBytes + reservedResultBytes > snapshot.limits.maxInputBytes) {
@@ -2208,13 +2365,28 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
     "ruleSourceRevision", "tokenCost", "byteCost",
   ]);
   const privateActivationKeys = new Set(["blockIndex", "blockId", "hasChild", "referenceCount"]);
-  const privateWorldInfoKeys = new Set(["kind", "entryId", "uid", "activated", "origin", "state"]);
+  const privateWorldInfoKeys = new Set(["kind", "entryId", "uid", "activated", "origin", "keyword", "vectorScore", "vectorDisposition", "state"]);
   const privateWorldStateKeys = new Set(["stickyLeft", "cooldownLeft", "delayCount", "active"]);
   const privateMacroKeys = new Set(["kind", "blockId", "operation", "inputBytes", "outputBytes"]);
   const privateRegexKeys = new Set(["kind", "scriptId", "operation", "inputBytes", "outputBytes"]);
   const boundedEvidenceText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && bytes(value) <= 256;
   const boundedEvidenceBytes = (value: unknown): value is number =>
     Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= limits.maxOperationBytes;
+  const validKeywordProvenance = (value: unknown): boolean => {
+    if (value === null) return true;
+    const projected = projectActivationProvenance(value);
+    return projected !== undefined && canonical(projected) === canonical(value);
+  };
+  const validVectorDisposition = (value: unknown): boolean => {
+    if (value === null) return true;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const disposition = value as Record<string, unknown>;
+    return Object.keys(disposition).every((key) => ["code", "conflictingEntryId", "conflictingSource"].includes(key))
+      && Object.keys(disposition).length === 3
+      && boundedEvidenceText(disposition.code)
+      && (disposition.conflictingEntryId === null || boundedEvidenceText(disposition.conflictingEntryId))
+      && (disposition.conflictingSource === null || boundedEvidenceText(disposition.conflictingSource));
+  };
   for (const entry of privateEvidence.activation) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       throw new AssemblyPlanValidationError("invalid_input", "Invalid private activation evidence");
@@ -2238,6 +2410,12 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
         || !boundedEvidenceText(record.uid)
         || typeof record.activated !== "boolean"
         || !boundedEvidenceText(record.origin)
+        || !("keyword" in record)
+        || !validKeywordProvenance(record.keyword)
+        || !("vectorScore" in record)
+        || (record.vectorScore !== null && (typeof record.vectorScore !== "number" || !Number.isFinite(record.vectorScore)))
+        || !("vectorDisposition" in record)
+        || !validVectorDisposition(record.vectorDisposition)
         || !state || typeof state !== "object" || Array.isArray(state)
         || Object.keys(state).some((key) => !privateWorldStateKeys.has(key))
         || !Number.isSafeInteger((state as Record<string, unknown>).stickyLeft)
@@ -2618,6 +2796,7 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
   const messageKeys = new Set(["role", "segments", "name", "blockIndex", "blockId", "contentKind", "provenance"]);
   const literalKeys = new Set(["kind", "text", "bytes"]);
   const resultSlotKeys = new Set(["kind", "slotIndex", "resultName", "maxBytes", "bytes"]);
+  const mediaKeys = new Set(["kind", "mediaType", "mediaId", "mimeType", "byteLength", "sha256", "bytes"]);
   const roles = new Set(["system", "developer", "user", "assistant", "tool"]);
   const sealKeys = new Set(["kind", "resultName", "slotIndex", "blockIndex", "blockId", "sequence"]);
   for (const seal of candidate.seals) {
@@ -2764,6 +2943,31 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
           throw new AssemblyPlanValidationError("invalid_input", "Literal byte mismatch");
         }
         providerLiteralBytes += segment.bytes;
+        continue;
+      }
+      if (segment.kind === "media") {
+        const mediaLimit = segment.mediaType === "image"
+          ? MAX_IMAGE_BYTES
+          : segment.mediaType === "audio"
+            ? MAX_AUDIO_BYTES
+            : 0;
+        if (
+          Object.keys(segment).some((key) => !mediaKeys.has(key))
+          || message.provenance.kind !== "history"
+          || message.role !== "user"
+          || typeof segment.mediaId !== "string"
+          || segment.mediaId.length === 0
+          || bytes(segment.mediaId) > 256
+          || typeof segment.mimeType !== "string"
+          || !/^(?:image|audio)\/[a-z0-9.+-]{1,96}$/.test(segment.mimeType)
+          || !Number.isSafeInteger(segment.byteLength)
+          || segment.byteLength < 1
+          || segment.byteLength > mediaLimit
+          || !/^[0-9a-f]{64}$/.test(segment.sha256)
+          || segment.bytes !== 0
+        ) {
+          throw new AssemblyPlanValidationError("invalid_input", "Invalid native media segment");
+        }
         continue;
       }
       if (
@@ -3021,7 +3225,9 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   }
   const config = parserConfig(configFor(snapshot, undefined));
   const phaseRefs = cognitionPhaseRefs(snapshot, config, expectedPlan.customPhasePlan);
-  const parsed = parseBlocks(snapshot, config, snapshot.blocks, phaseRefs.excludedBlockIds);
+  const validationBlocks = snapshot.blocks.map((block) =>
+    projectStructuralBlockAdmission(block, snapshot.participants.structuralBlockValues));
+  const parsed = parseBlocks(snapshot, config, validationBlocks, phaseRefs.excludedBlockIds);
   const expectedProfileOutputLimits = profileOutputLimitsFor(snapshot, config);
   if (canonical(plan.profileOutputLimits) !== canonical(expectedProfileOutputLimits)) {
     throw new AssemblyPlanValidationError("invalid_input", "Profile output limits are not bound to the requested snapshot");
@@ -3104,14 +3310,18 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
     const insertionIndex = Math.max(0, Math.min(history.length, history.length - depth));
     history.splice(insertionIndex, 0, { blockIndex: item.blockIndex, depth });
   }
+  const emitsDirectBlockMessage = (item: InternalBlockPlan): boolean =>
+    item.block.marker !== "world_info_before"
+    && item.block.marker !== "world_info_after"
+    && (item.child !== null || (!mayTransform(item.block) && item.block.content.length > 0));
   const expectedBlockOrder = [
-    ...pre.filter((item) => item.child !== null || (!mayTransform(item.block) && item.block.content.length > 0)).map((item) => item.blockIndex),
+    ...pre.filter(emitsDirectBlockMessage).map((item) => item.blockIndex),
     ...history.flatMap((entry) => {
       if (!entry) return [];
       const item = selected.find((candidate) => candidate.blockIndex === entry.blockIndex);
-      return item && (item.child !== null || (!mayTransform(item.block) && item.block.content.length > 0)) ? [entry.blockIndex] : [];
+      return item && emitsDirectBlockMessage(item) ? [entry.blockIndex] : [];
     }),
-    ...post.filter((item) => item.child !== null || (!mayTransform(item.block) && item.block.content.length > 0)).map((item) => item.blockIndex),
+    ...post.filter(emitsDirectBlockMessage).map((item) => item.blockIndex),
   ];
   const sourceBlockOrder = [
     ...pre.map((item) => item.blockIndex),
@@ -3224,7 +3434,9 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   const rawComparable = (block: SnapshotBlockV1): boolean => {
     const withoutResults = block.content.replace(/\{\{agentResult::[a-z][a-z0-9_]{0,63}\}\}/g, "");
     const placement = block.role === "user" ? "user_input" : block.role === "assistant" ? "ai_output" : "world_info";
-    return !withoutResults.includes("{{")
+    const structurallyProjected = block.marker !== null
+      && Object.hasOwn(snapshot.participants.structuralBlockValues ?? {}, block.id);
+    return !structurallyProjected && !withoutResults.includes("{{")
       && !snapshot.regexScripts.some((script) => script.target.includes("prompt") && script.placement.includes(placement))
       && !snapshot.worldInfo.entries.some((entry) => entry.wiMarker !== null && entry.wiMarker.length > 0 && block.content.includes(entry.wiMarker));
   };
@@ -3362,6 +3574,10 @@ export function materializeAssemblyPlan(
       if (segment.kind === "literal") {
         assembledInputBytes += segment.bytes;
         segments.push(frozen({ kind: "literal", text: segment.text, bytes: segment.bytes }));
+        continue;
+      }
+      if (segment.kind === "media") {
+        segments.push(frozen({ ...segment }));
         continue;
       }
       const value = childResults[segment.slotIndex];

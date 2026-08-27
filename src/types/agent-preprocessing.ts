@@ -628,7 +628,19 @@ export interface AssemblyResultSlotSegmentV1 {
   readonly slotIndex: number;
 }
 
-export type AssemblyMessageSegmentV1 = AssemblyLiteralSegmentV1 | AssemblyResultSlotSegmentV1;
+export interface AssemblyMediaSegmentV1 {
+  readonly kind: "media";
+  readonly mediaType: "image" | "audio";
+  readonly mediaId: string;
+  readonly mimeType: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+}
+
+export type AssemblyMessageSegmentV1 =
+  | AssemblyLiteralSegmentV1
+  | AssemblyResultSlotSegmentV1
+  | AssemblyMediaSegmentV1;
 
 export type AssemblyMessageSourceKindV1 = "block" | "history" | "world_info" | "cognition" | "databank";
 

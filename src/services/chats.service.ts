@@ -2368,7 +2368,7 @@ export function getTrailingVisibleUserMessageIds(userId: string, chatId: string)
       let hidden = false;
       try {
         const extra = JSON.parse(row.extra || "{}");
-        hidden = extra?.hidden === true;
+        hidden = extra?.hidden === true || extra?.hidden === 1;
       } catch {
         // Match rowToMessage's malformed-extra fallback: treat it as visible.
       }

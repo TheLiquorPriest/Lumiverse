@@ -36,7 +36,9 @@ import type {
   PromptVariableValue,
   PromptVariableValues,
 } from "../types/preset";
+import { STRUCTURAL_PROMPT_MARKERS } from "../types/preset";
 import type { WorldInfoCache, WorldBook, WorldBookEntry } from "../types/world-book";
+import type { SnapshotWorldInfoV1, SnapshotWorldBookV1, SnapshotWorldEntryV1 } from "./prompt-assembly-snapshot.service";
 import type { Character } from "../types/character";
 import { getEffectiveCharacterName, makeAssistantCharacter } from "../types/character";
 import type { Persona } from "../types/persona";
@@ -1180,16 +1182,6 @@ function resolveGroupScenarioOverride(
 // Structural / content marker sets (mirrors frontend loom/constants.ts)
 // ---------------------------------------------------------------------------
 
-const STRUCTURAL_MARKERS = new Set([
-  "chat_history",
-  "world_info_before",
-  "world_info_after",
-  "char_description",
-  "char_personality",
-  "persona_description",
-  "scenario",
-  "dialogue_examples",
-]);
 
 const CONTENT_BEARING_MARKERS = new Set([
   "main_prompt",
@@ -1556,6 +1548,17 @@ async function evaluatePromptBlockContent(
 ): Promise<string> {
   return withPromptBlockContext(macroEnv, block, async () =>
     evaluateHostPromptSource(content, macroEnv, "prompt_source:preset_block", budget),
+  );
+}
+
+async function evaluateNativeStructuralMarkerBlock(
+  block: PromptBlock,
+  macroEnv: MacroEnv,
+): Promise<string> {
+  const macro = block.marker ? MARKER_TO_MACRO[block.marker] : undefined;
+  if (!macro) return "";
+  return normalizePromptBlockText(
+    await evaluatePromptBlockContent(macro, macroEnv, block),
   );
 }
 /**
@@ -2066,6 +2069,405 @@ function responseLoomPolicyAssembly(
   };
 }
 
+interface NativeWorldInfoAuthorityInput {
+  readonly ctx: AssemblyContext;
+  readonly chat: Chat;
+  readonly character: Character;
+  readonly persona: Persona | null;
+  readonly messages: Message[];
+  readonly profiler: ReturnType<typeof createPromptAssemblyProfiler>;
+}
+
+/** Single native Response World Info authority shared by Response and sealed projection. */
+async function resolveNativeWorldInfo(
+  input: NativeWorldInfoAuthorityInput,
+) {
+  const { ctx, chat, character, persona, messages, profiler } = input;
+  const pf = ctx.prefetched;
+  // ---- World Info activation ----
+  let phaseStartedAt = performance.now();
+  const globalWorldBooks =
+    pf?.allSettings.get("globalWorldBooks") ??
+    (settingsSvc.getSetting(ctx.userId, "globalWorldBooks")?.value as
+      | string[]
+      | undefined) ??
+    [];
+  const chatWorldBookIds =
+    (chat.metadata?.chat_world_book_ids as string[] | undefined) ?? [];
+  const wiSources =
+    pf?.worldInfoSources ??
+    collectWorldInfoSources(
+      ctx.userId,
+      character,
+      persona,
+      globalWorldBooks,
+      chatWorldBookIds,
+      { chat, groupCharacters: pf?.groupCharacters },
+    );
+  let wiEntries = wiSources.entries;
+  // Multiplayer: splice in active peers' attached persona lorebooks (relayed
+  // from each peer's own instance, materialized into runtime entries). No-op for
+  // single-user chats (provider returns null). These flow through the normal
+  // interceptor + activation path below, so keyword matching / positions / token
+  // budgeting all apply identically to host-owned world info.
+  const mpWorldInfo = multiplayerWorldInfoProvider?.(ctx.chatId);
+  if (mpWorldInfo && mpWorldInfo.entries.length > 0) {
+    wiEntries = wiEntries.concat(mpWorldInfo.entries);
+    for (const bookId of mpWorldInfo.bookIds) wiSources.bookSourceMap.set(bookId, "peer");
+  }
+  const wiState: WiState = structuredClone((chat.metadata?.wi_state as WiState) ?? {});
+  const nativeWiStateBefore = structuredClone(wiState);
+  const configuredWorldInfoSettings =
+    pf?.allSettings.get("worldInfoSettings") ??
+    (settingsSvc.getSetting(ctx.userId, "worldInfoSettings")?.value as
+      | Partial<WorldInfoSettings>
+      | undefined) ??
+    {};
+  const normalizedWorldInfoSettings = normalizeWorldInfoSettings(
+    configuredWorldInfoSettings,
+  );
+  const interception = await worldInfoInterceptorChain.run(
+    wiEntries,
+    {
+      chatId: ctx.chatId,
+      characterId: character.id,
+      userId: ctx.userId,
+      messages: messages.map((m) => {
+        const extra = (m.extra ?? {}) as { greeting?: unknown; greeting_index?: unknown };
+        const isGreeting = extra.greeting === true;
+        const greetingIndex =
+          isGreeting && typeof extra.greeting_index === "number"
+            ? extra.greeting_index
+            : undefined;
+        return {
+          id: m.id,
+          role: m.is_user ? ("user" as const) : ("assistant" as const),
+          content: m.content,
+          is_user: m.is_user,
+          is_greeting: isGreeting,
+          ...(greetingIndex !== undefined ? { greeting_index: greetingIndex } : {}),
+          swipe_id: m.swipe_id,
+          index_in_chat: m.index_in_chat,
+        };
+      }),
+      chatTurn: messages.length,
+      chatMetadata: chat.metadata ?? {},
+      activationSettings: {
+        globalScanDepth: normalizedWorldInfoSettings.globalScanDepth,
+        maxRecursionPasses: normalizedWorldInfoSettings.maxRecursionPasses,
+      },
+    },
+    ctx.userId,
+    wiSources.bookSourceMap
+  );
+  const worldInfoSettings: WorldInfoSettings = {
+    ...normalizedWorldInfoSettings,
+    maxRecursionPasses:
+      interception.activationOverrides.disableRecursion === true
+        ? 0
+        : normalizedWorldInfoSettings.maxRecursionPasses,
+  };
+  const intercepted = interception.entries;
+  const hasCaptureRequests = interception.captureRequests.size > 0;
+  const hasCapturedIds = [...interception.captureRequests.values()].some(
+    (ids) => ids.size > 0,
+  );
+  const captureWiState =
+    hasCapturedIds ? structuredClone(wiState) : null;
+  const activationScanCache =
+    captureWiState ? createWorldInfoActivationScanCache() : undefined;
+  if (activationScanCache) {
+    primeWorldInfoActivationScanCache(
+      activationScanCache,
+      [intercepted, wiEntries],
+      worldInfoSettings,
+    );
+  }
+  const wiResult = profiler.measureSync(
+    "world-info-keyword",
+    () => activateWorldInfo({
+      entries: intercepted,
+      messages,
+      chatTurn: messages.length,
+      wiState,
+      settings: worldInfoSettings,
+      scanCache: activationScanCache,
+      selectionContentByEntryId: interception.selectionContentByEntryId,
+    }),
+  );
+
+  // Yield after world-info activation — the keyword scanning loop above is
+  // synchronous and can block for 50-200ms on large setups (hundreds of
+  // entries × thousands of messages). Yielding here lets Bun drain its I/O
+  // queue before the next heavy phase (vector retrieval, macro evaluation).
+  if (wiEntries.length > 50) {
+    await new Promise<void>((r) => setTimeout(r, 0));
+  }
+
+  // Optional vector retrieval for vectorized world book entries.
+  // These entries are merged with keyword-activated entries when enabled.
+  // When pre-computed results are available (from the generation pipeline's
+  // council enrichment phase), reuse them to avoid redundant embedding queries.
+  let vectorQueryPreview = "";
+  let vectorRetrievalDetails: VectorWorldInfoRetrievalResult | null = null;
+  let captureVectorQuery: PreparedWorldInfoVectorQuery | undefined;
+  const vectorViewsEquivalent = areWorldInfoVectorViewsEquivalent(
+    wiEntries,
+    intercepted,
+  );
+  const captureVectorViewCanShareNative =
+    captureWiState !== null && vectorViewsEquivalent;
+  const nativeWorldInfoEntryIds = new Set(
+    intercepted.map((entry) => entry.id),
+  );
+  const precomputedVectorEntries = ctx.precomputedVectorEntries;
+  const precomputedVectorSourceMatches =
+    precomputedVectorEntries !== undefined &&
+    precomputedVectorEntries.sourceFingerprint ===
+      buildWorldInfoVectorSourceFingerprint(
+        wiEntries,
+        wiSources.worldBookIds,
+      );
+  let vectorActivated =
+    precomputedVectorEntries &&
+    precomputedVectorSourceMatches &&
+    !hasCaptureRequests &&
+    vectorViewsEquivalent
+      ? projectVectorActivatedEntries(
+          precomputedVectorEntries.entries.filter((item) =>
+            nativeWorldInfoEntryIds.has(item.entry.id),
+          ),
+          intercepted,
+        )
+      : null;
+  let rawVectorActivated: VectorActivatedEntry[] | null = null;
+  if (!vectorActivated) {
+    try {
+      const detailed = await profiler.measure(
+        "world-info-vector",
+        () => collectVectorActivatedWorldInfoDetailed(
+          ctx.userId,
+          ctx.chatId,
+          wiSources.worldBookIds,
+          intercepted,
+          messages,
+          ctx.signal,
+          worldInfoSettings,
+        ),
+      );
+      vectorActivated = detailed.entries;
+      vectorRetrievalDetails = detailed;
+      vectorQueryPreview = detailed.queryPreview;
+      if (detailed.queryPreview.length > 0) {
+        captureVectorQuery = {
+          queryPreview: detailed.queryPreview,
+          queryScope: detailed.queryScope,
+        };
+      }
+      if (captureVectorViewCanShareNative) {
+        rawVectorActivated = projectVectorActivatedEntries(
+          detailed.entries,
+          wiEntries,
+        );
+      }
+
+      if (detailed.blockerMessages.length > 0 && detailed.eligibleCount > 0) {
+        console.log(
+          "[prompt-assembly] Vector WI blocked: %s (eligible=%d, books=%d)",
+          detailed.blockerMessages.join("; "),
+          detailed.eligibleCount,
+          wiSources.worldBookIds.length,
+        );
+      } else if (detailed.blockerMessages.length === 0) {
+        console.log(
+          "[prompt-assembly] Vector WI retrieval: eligible=%d, hits=%d, afterThreshold=%d, afterRerank=%d, shortlisted=%d (topK=%d, timingsMs queryBuild=%d embed=%d search=%d rank=%d total=%d)",
+          detailed.eligibleCount,
+          detailed.hitsBeforeThreshold,
+          detailed.hitsAfterThreshold,
+          detailed.hitsAfterRerankCutoff,
+          detailed.entries.length,
+          detailed.topK,
+          Math.round(detailed.timingsMs?.queryBuildMs ?? 0),
+          Math.round(detailed.timingsMs?.queryEmbedMs ?? 0),
+          Math.round(detailed.timingsMs?.searchMs ?? 0),
+          Math.round(detailed.timingsMs?.rankingMs ?? 0),
+          Math.round(detailed.timingsMs?.totalMs ?? 0),
+        );
+      }
+    } catch (err) {
+      // Propagate aborts so the entire assembly unwinds instead of silently
+      // continuing with keyword-only results after the user stopped generation.
+      if (ctx.signal?.aborted || (err as any)?.name === "AbortError") throw err;
+      console.warn(
+        "[prompt-assembly] Vector world info activation failed, continuing with keyword-only:",
+        err,
+      );
+      vectorActivated = [];
+      if (captureVectorViewCanShareNative) rawVectorActivated = [];
+    }
+  }
+  const mergedWorldInfo = profiler.measureSync(
+    "world-info-merge",
+    () => mergeActivatedWorldInfoEntries(
+      wiResult.activatedEntries,
+      vectorActivated ?? [],
+      worldInfoSettings,
+      wiSources.bookSourceMap,
+      wiSources.bookNameMap,
+      undefined,
+      interception.selectionContentByEntryId,
+    ),
+  );
+  const runtimeWorldInfoPlacements = buildRuntimeWorldInfoChatPlacements(
+    mergedWorldInfo.activatedEntries,
+    interception.placementByEntryId,
+  );
+  const runtimePlacementIds = new Set(
+    runtimeWorldInfoPlacements.map((entry) => entry.id),
+  );
+  const wiCache =
+    runtimePlacementIds.size === 0
+      ? mergedWorldInfo.cache
+      : materializeWorldInfoCache(
+          mergedWorldInfo.activatedEntries.filter(
+            (entry) => !runtimePlacementIds.has(entry.id),
+          ),
+        );
+  wiResult.activatedEntries = mergedWorldInfo.activatedEntries;
+  const activatedWorldInfo = mergedWorldInfo.activatedWorldInfo;
+  let spindleWorldInfoCaptures:
+    | Record<string, ActivatedWorldInfoEntry[]>
+    | undefined;
+  if (hasCaptureRequests && !captureWiState) {
+    spindleWorldInfoCaptures = buildWorldInfoCaptureMap(
+      interception.captureRequests,
+      [],
+    );
+  } else if (captureWiState) {
+    const captureRandom = createWorldInfoCaptureRandom();
+    const captureKeywordResult = profiler.measureSync(
+      "world-info-capture-keyword",
+      () => activateWorldInfo({
+        entries: wiEntries,
+        messages,
+        chatTurn: messages.length,
+        wiState: captureWiState,
+        settings: worldInfoSettings,
+        scanCache: activationScanCache,
+        random: captureRandom,
+      }),
+    );
+    if (!rawVectorActivated) {
+      try {
+        rawVectorActivated = (
+          await profiler.measure(
+            "world-info-capture-vector",
+            () => collectVectorActivatedWorldInfoDetailed(
+              ctx.userId,
+              ctx.chatId,
+              wiSources.worldBookIds,
+              wiEntries,
+              messages,
+              ctx.signal,
+              worldInfoSettings,
+              captureVectorQuery,
+            ),
+          )
+        ).entries;
+      } catch (err) {
+        if (ctx.signal?.aborted || (err as any)?.name === "AbortError") {
+          throw err;
+        }
+        console.warn(
+          "[prompt-assembly] Raw capture vector activation failed, continuing with keyword-only:",
+          err,
+        );
+        rawVectorActivated = [];
+      }
+    }
+    const capturedMergedWorldInfo = profiler.measureSync(
+      "world-info-capture-merge",
+      () => mergeActivatedWorldInfoEntries(
+        captureKeywordResult.activatedEntries,
+        rawVectorActivated ?? [],
+        worldInfoSettings,
+        wiSources.bookSourceMap,
+        wiSources.bookNameMap,
+        captureRandom,
+      ),
+    );
+    spindleWorldInfoCaptures = buildWorldInfoCaptureMap(
+      interception.captureRequests,
+      capturedMergedWorldInfo.activatedWorldInfo,
+    );
+  }
+
+  const worldInfoStats = {
+    ...wiResult.stats,
+    activatedBeforeBudget: mergedWorldInfo.activatedBeforeBudget,
+    activatedAfterBudget: mergedWorldInfo.activatedAfterBudget,
+    evictedByBudget: mergedWorldInfo.evictedByBudget,
+    estimatedTokens: mergedWorldInfo.estimatedTokens,
+    keywordActivated: mergedWorldInfo.keywordActivated,
+    vectorActivated: mergedWorldInfo.vectorActivated,
+    totalActivated: mergedWorldInfo.totalActivated,
+    deduplicated: mergedWorldInfo.deduplicated,
+    queryPreview: vectorQueryPreview,
+    vectorRetrieval: vectorRetrievalDetails
+      ? {
+          eligibleCount: vectorRetrievalDetails.eligibleCount,
+          hitsBeforeThreshold: vectorRetrievalDetails.hitsBeforeThreshold,
+          hitsAfterThreshold: vectorRetrievalDetails.hitsAfterThreshold,
+          thresholdRejected: vectorRetrievalDetails.thresholdRejected,
+          hitsAfterRerankCutoff: vectorRetrievalDetails.hitsAfterRerankCutoff,
+          rerankRejected: vectorRetrievalDetails.rerankRejected,
+          topK: vectorRetrievalDetails.topK,
+          blockerMessages: vectorRetrievalDetails.blockerMessages,
+          timingsMs: {
+            queryBuild: vectorRetrievalDetails.timingsMs?.queryBuildMs ?? 0,
+            queryEmbed: vectorRetrievalDetails.timingsMs?.queryEmbedMs ?? 0,
+            search: vectorRetrievalDetails.timingsMs?.searchMs ?? 0,
+            ranking: vectorRetrievalDetails.timingsMs?.rankingMs ?? 0,
+            merge: mergedWorldInfo.mergeDurationMs ?? 0,
+            total:
+              (vectorRetrievalDetails.timingsMs?.totalMs ?? 0) +
+              (mergedWorldInfo.mergeDurationMs ?? 0),
+          },
+        }
+      : undefined,
+  };
+  profiler.addPhase("world-info", performance.now() - phaseStartedAt);
+
+  // ---- Defer WI state persistence to after generation ----
+  // Only carry the keys this writer owns. The post-generation save uses
+  // mergeChatMetadata so any user-driven changes (alt field selections, world
+  // book attachments, author's notes) that landed during generation survive.
+  const deferredWiState = {
+    chatId: chat.id,
+    partial: { wi_state: wiResult.wiState } as Record<string, any>,
+  };
+
+  return {
+    wiSources,
+    sourceEntries: wiEntries,
+    intercepted,
+    interception,
+    worldInfoSettings,
+    nativeWiStateBefore,
+    wiResult,
+    vectorActivated: vectorActivated ?? [],
+    vectorViewsEquivalent,
+    precomputedVectorAccepted:
+      precomputedVectorSourceMatches && !hasCaptureRequests && vectorViewsEquivalent,
+    mergedWorldInfo,
+    runtimeWorldInfoPlacements,
+    wiCache,
+    activatedWorldInfo,
+    spindleWorldInfoCaptures,
+    worldInfoStats,
+    deferredWiState,
+  };
+}
 function assertResponseSourceUserMessages(
   ctx: AssemblyContext,
   messages: readonly Message[],
@@ -2281,7 +2683,6 @@ export async function assemblePrompt(
     chat,
   );
   if (
-    responseLoomPolicy.normalizedLoomResponse &&
     responseLoomPolicy.excludedBlockIds.size > 0 &&
     !effectiveBlocks.some(
       (block) =>
@@ -2654,367 +3055,28 @@ export async function assemblePrompt(
     }
   }
 
-  // ---- World Info activation ----
-  phaseStartedAt = performance.now();
-  const globalWorldBooks =
-    pf?.allSettings.get("globalWorldBooks") ??
-    (settingsSvc.getSetting(ctx.userId, "globalWorldBooks")?.value as
-      | string[]
-      | undefined) ??
-    [];
-  const chatWorldBookIds =
-    (chat.metadata?.chat_world_book_ids as string[] | undefined) ?? [];
-  const wiSources =
-    pf?.worldInfoSources ??
-    collectWorldInfoSources(
-      ctx.userId,
-      character,
-      persona,
-      globalWorldBooks,
-      chatWorldBookIds,
-      { chat, groupCharacters: pf?.groupCharacters },
-    );
-  let wiEntries = wiSources.entries;
-  // Multiplayer: splice in active peers' attached persona lorebooks (relayed
-  // from each peer's own instance, materialized into runtime entries). No-op for
-  // single-user chats (provider returns null). These flow through the normal
-  // interceptor + activation path below, so keyword matching / positions / token
-  // budgeting all apply identically to host-owned world info.
-  const mpWorldInfo = multiplayerWorldInfoProvider?.(ctx.chatId);
-  if (mpWorldInfo && mpWorldInfo.entries.length > 0) {
-    wiEntries = wiEntries.concat(mpWorldInfo.entries);
-    for (const bookId of mpWorldInfo.bookIds) wiSources.bookSourceMap.set(bookId, "peer");
-  }
-  const wiState: WiState = (chat.metadata?.wi_state as WiState) ?? {};
-  const configuredWorldInfoSettings =
-    pf?.allSettings.get("worldInfoSettings") ??
-    (settingsSvc.getSetting(ctx.userId, "worldInfoSettings")?.value as
-      | Partial<WorldInfoSettings>
-      | undefined) ??
-    {};
-  const normalizedWorldInfoSettings = normalizeWorldInfoSettings(
-    configuredWorldInfoSettings,
-  );
-  const interception = await worldInfoInterceptorChain.run(
-    wiEntries,
-    {
-      chatId: ctx.chatId,
-      characterId: character.id,
-      userId: ctx.userId,
-      messages: messages.map((m) => {
-        const extra = (m.extra ?? {}) as { greeting?: unknown; greeting_index?: unknown };
-        const isGreeting = extra.greeting === true;
-        const greetingIndex =
-          isGreeting && typeof extra.greeting_index === "number"
-            ? extra.greeting_index
-            : undefined;
-        return {
-          id: m.id,
-          role: m.is_user ? ("user" as const) : ("assistant" as const),
-          content: m.content,
-          is_user: m.is_user,
-          is_greeting: isGreeting,
-          ...(greetingIndex !== undefined ? { greeting_index: greetingIndex } : {}),
-          swipe_id: m.swipe_id,
-          index_in_chat: m.index_in_chat,
-        };
-      }),
-      chatTurn: messages.length,
-      chatMetadata: chat.metadata ?? {},
-      activationSettings: {
-        globalScanDepth: normalizedWorldInfoSettings.globalScanDepth,
-        maxRecursionPasses: normalizedWorldInfoSettings.maxRecursionPasses,
-      },
-    },
-    ctx.userId,
-    wiSources.bookSourceMap
-  );
-  const worldInfoSettings: WorldInfoSettings = {
-    ...normalizedWorldInfoSettings,
-    maxRecursionPasses:
-      interception.activationOverrides.disableRecursion === true
-        ? 0
-        : normalizedWorldInfoSettings.maxRecursionPasses,
-  };
-  const intercepted = interception.entries;
-  const hasCaptureRequests = interception.captureRequests.size > 0;
-  const hasCapturedIds = [...interception.captureRequests.values()].some(
-    (ids) => ids.size > 0,
-  );
-  const captureWiState =
-    hasCapturedIds ? structuredClone(wiState) : null;
-  const activationScanCache =
-    captureWiState ? createWorldInfoActivationScanCache() : undefined;
-  if (activationScanCache) {
-    primeWorldInfoActivationScanCache(
-      activationScanCache,
-      [intercepted, wiEntries],
-      worldInfoSettings,
-    );
-  }
-  const wiResult = profiler.measureSync(
-    "world-info-keyword",
-    () => activateWorldInfo({
-      entries: intercepted,
-      messages,
-      chatTurn: messages.length,
-      wiState,
-      settings: worldInfoSettings,
-      scanCache: activationScanCache,
-      selectionContentByEntryId: interception.selectionContentByEntryId,
-    }),
-  );
-
-  // Yield after world-info activation — the keyword scanning loop above is
-  // synchronous and can block for 50-200ms on large setups (hundreds of
-  // entries × thousands of messages). Yielding here lets Bun drain its I/O
-  // queue before the next heavy phase (vector retrieval, macro evaluation).
-  if (wiEntries.length > 50) {
-    await new Promise<void>((r) => setTimeout(r, 0));
-  }
-
-  // Optional vector retrieval for vectorized world book entries.
-  // These entries are merged with keyword-activated entries when enabled.
-  // When pre-computed results are available (from the generation pipeline's
-  // council enrichment phase), reuse them to avoid redundant embedding queries.
-  let vectorQueryPreview = "";
-  let vectorRetrievalDetails: VectorWorldInfoRetrievalResult | null = null;
-  let captureVectorQuery: PreparedWorldInfoVectorQuery | undefined;
-  const vectorViewsEquivalent = areWorldInfoVectorViewsEquivalent(
-    wiEntries,
+  const {
+    wiSources,
     intercepted,
-  );
-  const captureVectorViewCanShareNative =
-    captureWiState !== null && vectorViewsEquivalent;
-  const nativeWorldInfoEntryIds = new Set(
-    intercepted.map((entry) => entry.id),
-  );
-  const precomputedVectorEntries = ctx.precomputedVectorEntries;
-  const precomputedVectorSourceMatches =
-    precomputedVectorEntries !== undefined &&
-    precomputedVectorEntries.sourceFingerprint ===
-      buildWorldInfoVectorSourceFingerprint(
-        wiEntries,
-        wiSources.worldBookIds,
-      );
-  let vectorActivated =
-    precomputedVectorEntries &&
-    precomputedVectorSourceMatches &&
-    !hasCaptureRequests &&
-    vectorViewsEquivalent
-      ? projectVectorActivatedEntries(
-          precomputedVectorEntries.entries.filter((item) =>
-            nativeWorldInfoEntryIds.has(item.entry.id),
-          ),
-          intercepted,
-        )
-      : null;
-  let rawVectorActivated: VectorActivatedEntry[] | null = null;
-  if (!vectorActivated) {
-    try {
-      const detailed = await profiler.measure(
-        "world-info-vector",
-        () => collectVectorActivatedWorldInfoDetailed(
-          ctx.userId,
-          ctx.chatId,
-          wiSources.worldBookIds,
-          intercepted,
-          messages,
-          ctx.signal,
-          worldInfoSettings,
-        ),
-      );
-      vectorActivated = detailed.entries;
-      vectorRetrievalDetails = detailed;
-      vectorQueryPreview = detailed.queryPreview;
-      if (detailed.queryPreview.length > 0) {
-        captureVectorQuery = {
-          queryPreview: detailed.queryPreview,
-          queryScope: detailed.queryScope,
-        };
-      }
-      if (captureVectorViewCanShareNative) {
-        rawVectorActivated = projectVectorActivatedEntries(
-          detailed.entries,
-          wiEntries,
-        );
-      }
-
-      if (detailed.blockerMessages.length > 0 && detailed.eligibleCount > 0) {
-        console.log(
-          "[prompt-assembly] Vector WI blocked: %s (eligible=%d, books=%d)",
-          detailed.blockerMessages.join("; "),
-          detailed.eligibleCount,
-          wiSources.worldBookIds.length,
-        );
-      } else if (detailed.blockerMessages.length === 0) {
-        console.log(
-          "[prompt-assembly] Vector WI retrieval: eligible=%d, hits=%d, afterThreshold=%d, afterRerank=%d, shortlisted=%d (topK=%d, timingsMs queryBuild=%d embed=%d search=%d rank=%d total=%d)",
-          detailed.eligibleCount,
-          detailed.hitsBeforeThreshold,
-          detailed.hitsAfterThreshold,
-          detailed.hitsAfterRerankCutoff,
-          detailed.entries.length,
-          detailed.topK,
-          Math.round(detailed.timingsMs?.queryBuildMs ?? 0),
-          Math.round(detailed.timingsMs?.queryEmbedMs ?? 0),
-          Math.round(detailed.timingsMs?.searchMs ?? 0),
-          Math.round(detailed.timingsMs?.rankingMs ?? 0),
-          Math.round(detailed.timingsMs?.totalMs ?? 0),
-        );
-      }
-    } catch (err) {
-      // Propagate aborts so the entire assembly unwinds instead of silently
-      // continuing with keyword-only results after the user stopped generation.
-      if (ctx.signal?.aborted || (err as any)?.name === "AbortError") throw err;
-      console.warn(
-        "[prompt-assembly] Vector world info activation failed, continuing with keyword-only:",
-        err,
-      );
-      vectorActivated = [];
-      if (captureVectorViewCanShareNative) rawVectorActivated = [];
-    }
-  }
-  const mergedWorldInfo = profiler.measureSync(
-    "world-info-merge",
-    () => mergeActivatedWorldInfoEntries(
-      wiResult.activatedEntries,
-      vectorActivated ?? [],
-      worldInfoSettings,
-      wiSources.bookSourceMap,
-      wiSources.bookNameMap,
-      undefined,
-      interception.selectionContentByEntryId,
-    ),
-  );
-  const runtimeWorldInfoPlacements = buildRuntimeWorldInfoChatPlacements(
-    mergedWorldInfo.activatedEntries,
-    interception.placementByEntryId,
-  );
-  const runtimePlacementIds = new Set(
-    runtimeWorldInfoPlacements.map((entry) => entry.id),
-  );
-  const wiCache =
-    runtimePlacementIds.size === 0
-      ? mergedWorldInfo.cache
-      : materializeWorldInfoCache(
-          mergedWorldInfo.activatedEntries.filter(
-            (entry) => !runtimePlacementIds.has(entry.id),
-          ),
-        );
-  wiResult.activatedEntries = mergedWorldInfo.activatedEntries;
-  const activatedWorldInfo = mergedWorldInfo.activatedWorldInfo;
-  let spindleWorldInfoCaptures:
-    | Record<string, ActivatedWorldInfoEntry[]>
-    | undefined;
-  if (hasCaptureRequests && !captureWiState) {
-    spindleWorldInfoCaptures = buildWorldInfoCaptureMap(
-      interception.captureRequests,
-      [],
-    );
-  } else if (captureWiState) {
-    const captureRandom = createWorldInfoCaptureRandom();
-    const captureKeywordResult = profiler.measureSync(
-      "world-info-capture-keyword",
-      () => activateWorldInfo({
-        entries: wiEntries,
-        messages,
-        chatTurn: messages.length,
-        wiState: captureWiState,
-        settings: worldInfoSettings,
-        scanCache: activationScanCache,
-        random: captureRandom,
-      }),
-    );
-    if (!rawVectorActivated) {
-      try {
-        rawVectorActivated = (
-          await profiler.measure(
-            "world-info-capture-vector",
-            () => collectVectorActivatedWorldInfoDetailed(
-              ctx.userId,
-              ctx.chatId,
-              wiSources.worldBookIds,
-              wiEntries,
-              messages,
-              ctx.signal,
-              worldInfoSettings,
-              captureVectorQuery,
-            ),
-          )
-        ).entries;
-      } catch (err) {
-        if (ctx.signal?.aborted || (err as any)?.name === "AbortError") {
-          throw err;
-        }
-        console.warn(
-          "[prompt-assembly] Raw capture vector activation failed, continuing with keyword-only:",
-          err,
-        );
-        rawVectorActivated = [];
-      }
-    }
-    const capturedMergedWorldInfo = profiler.measureSync(
-      "world-info-capture-merge",
-      () => mergeActivatedWorldInfoEntries(
-        captureKeywordResult.activatedEntries,
-        rawVectorActivated ?? [],
-        worldInfoSettings,
-        wiSources.bookSourceMap,
-        wiSources.bookNameMap,
-        captureRandom,
-      ),
-    );
-    spindleWorldInfoCaptures = buildWorldInfoCaptureMap(
-      interception.captureRequests,
-      capturedMergedWorldInfo.activatedWorldInfo,
-    );
-  }
-
-  const worldInfoStats = {
-    ...wiResult.stats,
-    activatedBeforeBudget: mergedWorldInfo.activatedBeforeBudget,
-    activatedAfterBudget: mergedWorldInfo.activatedAfterBudget,
-    evictedByBudget: mergedWorldInfo.evictedByBudget,
-    estimatedTokens: mergedWorldInfo.estimatedTokens,
-    keywordActivated: mergedWorldInfo.keywordActivated,
-    vectorActivated: mergedWorldInfo.vectorActivated,
-    totalActivated: mergedWorldInfo.totalActivated,
-    deduplicated: mergedWorldInfo.deduplicated,
-    queryPreview: vectorQueryPreview,
-    vectorRetrieval: vectorRetrievalDetails
-      ? {
-          eligibleCount: vectorRetrievalDetails.eligibleCount,
-          hitsBeforeThreshold: vectorRetrievalDetails.hitsBeforeThreshold,
-          hitsAfterThreshold: vectorRetrievalDetails.hitsAfterThreshold,
-          thresholdRejected: vectorRetrievalDetails.thresholdRejected,
-          hitsAfterRerankCutoff: vectorRetrievalDetails.hitsAfterRerankCutoff,
-          rerankRejected: vectorRetrievalDetails.rerankRejected,
-          topK: vectorRetrievalDetails.topK,
-          blockerMessages: vectorRetrievalDetails.blockerMessages,
-          timingsMs: {
-            queryBuild: vectorRetrievalDetails.timingsMs?.queryBuildMs ?? 0,
-            queryEmbed: vectorRetrievalDetails.timingsMs?.queryEmbedMs ?? 0,
-            search: vectorRetrievalDetails.timingsMs?.searchMs ?? 0,
-            ranking: vectorRetrievalDetails.timingsMs?.rankingMs ?? 0,
-            merge: mergedWorldInfo.mergeDurationMs ?? 0,
-            total:
-              (vectorRetrievalDetails.timingsMs?.totalMs ?? 0) +
-              (mergedWorldInfo.mergeDurationMs ?? 0),
-          },
-        }
-      : undefined,
-  };
-  profiler.addPhase("world-info", performance.now() - phaseStartedAt);
-
-  // ---- Defer WI state persistence to after generation ----
-  // Only carry the keys this writer owns. The post-generation save uses
-  // mergeChatMetadata so any user-driven changes (alt field selections, world
-  // book attachments, author's notes) that landed during generation survive.
-  const deferredWiState = {
-    chatId: chat.id,
-    partial: { wi_state: wiResult.wiState } as Record<string, any>,
-  };
+    interception,
+    nativeWiStateBefore,
+    wiResult,
+    vectorActivated,
+    mergedWorldInfo,
+    runtimeWorldInfoPlacements,
+    wiCache,
+    activatedWorldInfo,
+    spindleWorldInfoCaptures,
+    worldInfoStats,
+    deferredWiState,
+  } = await resolveNativeWorldInfo({
+    ctx,
+    chat,
+    character,
+    persona,
+    messages,
+    profiler,
+  });
 
   // ---- Macro engine ----
   phaseStartedAt = performance.now();
@@ -4080,13 +4142,10 @@ export async function assemblePrompt(
     if (
       !hasAgentSyntax &&
       block.marker &&
-      STRUCTURAL_MARKERS.has(block.marker) &&
+      STRUCTURAL_PROMPT_MARKERS.has(block.marker) &&
       MARKER_TO_MACRO[block.marker]
     ) {
-      const macro = MARKER_TO_MACRO[block.marker];
-      const resolved = normalizePromptBlockText(
-        await evaluatePromptBlockContent(macro, macroEnv, block),
-      );
+      const resolved = await evaluateNativeStructuralMarkerBlock(block, macroEnv);
       if (resolved) {
         const role = (block.role || "system") as LlmMessage["role"];
         if (block.position === "in_history") {
@@ -6578,6 +6637,342 @@ export async function collectVectorActivatedWorldInfo(
     settingsInput,
   );
   return result.entries;
+}
+
+interface NativePromptProjectionOptions {
+  readonly personaId?: string | null;
+  readonly targetCharacterId?: string | null;
+  readonly personaAddonStates?: Readonly<Record<string, boolean>>;
+  readonly excludedMessageId?: string | null;
+  readonly generationType?: GenerationType;
+  readonly presetId?: string | null;
+  readonly connectionId?: string | null;
+  readonly forcePresetId?: boolean;
+  readonly userInput?: string;
+  readonly precomputedVectorEntries?: PrecomputedWorldInfoVectorEntries;
+  readonly signal?: AbortSignal;
+}
+
+
+async function projectNativeStructuralMarkerValues(
+  userId: string,
+  chat: Chat,
+  character: Character,
+  persona: Persona | null,
+  messages: Message[],
+  authority: Awaited<ReturnType<typeof resolveNativeWorldInfo>>,
+  options: NativePromptProjectionOptions,
+): Promise<Readonly<Record<string, string>>> {
+  const connection = connectionsSvc.resolveConnection(userId, options.connectionId ?? undefined);
+  const requestedPresetId = options.presetId ?? connection?.preset_id ?? null;
+  const resolvedProfile = options.forcePresetId && options.presetId
+    ? { preset_id: options.presetId, binding: null }
+    : presetProfilesSvc.resolveProfile(
+        userId,
+        requestedPresetId,
+        chat.id,
+        options.targetCharacterId ?? chat.character_id,
+        {
+          isGroup: chat.metadata?.group === true,
+          connectionId: connection?.id ?? null,
+          personaId: persona?.id ?? null,
+        },
+      );
+  const preset = resolvedProfile.preset_id
+    ? presetsSvc.getPreset(userId, resolvedProfile.preset_id)
+    : null;
+  const blocks = (preset?.prompt_order ?? []).map((block) => ({ ...block }));
+  if (resolvedProfile.binding && blocks.length > 0) {
+    presetProfilesSvc.applyProfileToBlocks(blocks, resolvedProfile.binding);
+  }
+  presetProfilesSvc.normalizeCategoryBlockStates(blocks);
+  const profilePromptVariables = resolvedProfile.binding?.prompt_variables ?? undefined;
+  const effectiveBlocks = resolvePromptBlockPlacements(
+    blocks,
+    preset,
+    profilePromptVariables,
+  );
+  const focusedCharacter = resolveCharacterWithAlternateFields(character, chat);
+  const effectiveCharacter = resolveGroupScenarioOverride(
+    buildGroupMergedCharacter(focusedCharacter, chat, userId),
+    chat,
+    userId,
+  );
+  initMacros();
+  const env = buildEnv({
+    character: effectiveCharacter,
+    focusedCharacter,
+    persona,
+    chat,
+    messages,
+    generationType: options.generationType ?? "normal",
+    commit: false,
+    connection,
+    userInput: options.userInput,
+    targetCharacterId: options.targetCharacterId ?? undefined,
+    targetCharacterName: options.targetCharacterId
+      ? getEffectiveCharacterName(focusedCharacter)
+      : undefined,
+    signal: options.signal,
+  });
+  env._expansionBudget = createExpansionBudget(undefined, options.signal);
+  if (preset) {
+    env.extra.presetId = preset.id;
+    env.extra.presetMetadata = preset.metadata || {};
+  }
+  resolvePromptVariables(env, blocks, preset, profilePromptVariables);
+  const multiplayerContext = multiplayerMacroContextProvider?.(chat.id) ?? null;
+  if (multiplayerContext) env.extra.multiplayer = multiplayerContext;
+  await resolveWorldInfoOutlets(authority.mergedWorldInfo.activatedEntries, env, options.signal);
+  env.extra.worldInfoAtMarker = authority.wiCache.atMarker.map((entry) => entry.content).join("\n\n");
+  const intrinsicPlan = preflightAgentIntrinsics(effectiveBlocks, preset?.agent_config);
+  const values: Record<string, string> = {};
+  for (const [index, block] of effectiveBlocks.entries()) {
+    if (!block.enabled) continue;
+    if (block.injectionTrigger?.length && !block.injectionTrigger.includes(options.generationType ?? "normal")) continue;
+    if (!promptBlockMatchesCharacterTags(block.characterTagTrigger, focusedCharacter.tags)) continue;
+    const hasAgentSyntax = preset?.agent_config?.agentsEnabled === true
+      && intrinsicPlan.blocks[index].nodes.length > 0;
+    if (!block.marker || !STRUCTURAL_PROMPT_MARKERS.has(block.marker)) continue;
+    if (hasAgentSyntax) {
+      values[block.id] = block.content;
+      continue;
+    }
+    if (block.marker === "world_info_before" || block.marker === "world_info_after") {
+      const entries = block.marker === "world_info_before" ? authority.wiCache.before : authority.wiCache.after;
+      values[block.id] = entries.map((entry) => entry.content).join("\n\n");
+      continue;
+    }
+    values[block.id] = await evaluateNativeStructuralMarkerBlock(block, env);
+  }
+  return Object.freeze(values);
+}
+
+function nativeWorldEntrySnapshot(
+  entry: WorldBookEntry,
+  book: SnapshotWorldBookV1,
+  order: number,
+  activatedIds: ReadonlySet<string>,
+  state: WiState,
+): SnapshotWorldEntryV1 {
+  return Object.freeze({
+    id: entry.id,
+    bookId: entry.world_book_id,
+    bookName: book.name,
+    source: book.source,
+    uid: entry.uid,
+    outletName: entry.outlet_name,
+    wiMarker: entry.wi_marker,
+    wiMarkerSide: entry.wi_marker_side,
+    order,
+    orderValue: entry.order_value,
+    activated: activatedIds.has(entry.id),
+    disabled: entry.disabled,
+    constant: entry.constant,
+    selective: entry.selective,
+    groupName: entry.group_name,
+    groupOverride: entry.group_override,
+    groupWeight: entry.group_weight,
+    probability: entry.probability,
+    scanDepth: entry.scan_depth,
+    excludeGreeting: entry.exclude_greeting,
+    caseSensitive: entry.case_sensitive,
+    matchWholeWords: entry.match_whole_words,
+    useRegex: entry.use_regex,
+    preventRecursion: entry.prevent_recursion,
+    excludeRecursion: entry.exclude_recursion,
+    delayUntilRecursion: entry.delay_until_recursion,
+    priority: entry.priority,
+    sticky: entry.sticky,
+    cooldown: entry.cooldown,
+    delay: entry.delay,
+    selectiveLogic: entry.selective_logic,
+    useProbability: entry.use_probability,
+    vectorized: entry.vectorized,
+    vectorIndexStatus: entry.vector_index_status,
+    content: entry.content,
+    comment: entry.comment,
+    keys: Object.freeze([...entry.key]),
+    secondaryKeys: Object.freeze([...entry.keysecondary]),
+    position: entry.position,
+    depth: entry.depth,
+    role: entry.role,
+    state: Object.freeze({ ...(state[entry.uid] ?? {}) }),
+    revision: String(entry.revision),
+  });
+}
+
+/** Serialize the exact post-interceptor native authority result as closed snapshot data. */
+function serializeNativeWorldInfoProjection(
+  authority: Awaited<ReturnType<typeof resolveNativeWorldInfo>>,
+): SnapshotWorldInfoV1 {
+  const activatedIds = new Set(authority.mergedWorldInfo.activatedEntries.map((entry) => entry.id));
+  const sourceEntryByBookId = new Map<string, WorldBookEntry>();
+  for (const entry of authority.intercepted) {
+    if (!sourceEntryByBookId.has(entry.world_book_id)) sourceEntryByBookId.set(entry.world_book_id, entry);
+  }
+  const orderedBookIds = [...authority.wiSources.worldBookIds];
+  for (const entry of authority.intercepted) {
+    if (!orderedBookIds.includes(entry.world_book_id)) orderedBookIds.push(entry.world_book_id);
+  }
+  const books = orderedBookIds.map((bookId, order) => {
+    const book = authority.wiSources.bookMap.get(bookId);
+    const fallbackEntry = sourceEntryByBookId.get(bookId);
+    return Object.freeze({
+      id: bookId,
+      name: book?.name ?? authority.wiSources.bookNameMap.get(bookId) ?? bookId,
+      description: book?.description ?? "",
+      source: authority.wiSources.bookSourceMap.get(bookId) ?? "global",
+      order,
+      revision: String(book?.updated_at ?? fallbackEntry?.revision ?? "0"),
+    } satisfies SnapshotWorldBookV1);
+  });
+  const booksById = new Map(books.map((book) => [book.id, book]));
+  const exactEntries = authority.intercepted.map((entry) => {
+    const selectionContent = authority.interception.selectionContentByEntryId.get(entry.id);
+    return selectionContent === undefined ? entry : { ...entry, content: selectionContent };
+  });
+  const entries = exactEntries.flatMap((entry, order) => {
+    const book = booksById.get(entry.world_book_id);
+    return book
+      ? [nativeWorldEntrySnapshot(entry, book, order, activatedIds, authority.nativeWiStateBefore)]
+      : [];
+  });
+  const vectorById = new Map(authority.vectorActivated.map((candidate) => [candidate.entry.id, candidate]));
+  const vectorDispositions: Record<string, Readonly<Record<string, unknown>>> = {};
+  for (const [entryId, disposition] of authority.mergedWorldInfo.vectorDispositions) {
+    vectorDispositions[entryId] = Object.freeze({
+      code: disposition.code,
+      conflictingEntryId: disposition.conflictingEntry?.id ?? null,
+      conflictingSource: disposition.conflictingSource ?? null,
+    });
+  }
+  const activationEvidence = entries.map((entry) => {
+    const provenance = authority.wiResult.activationProvenanceById.get(entry.id);
+    const vectorEntry = vectorById.get(entry.id);
+    const state = authority.wiResult.wiState[entry.uid] ?? {
+      active: false,
+      stickyLeft: 0,
+      cooldownLeft: 0,
+      delayCount: 0,
+    };
+    return Object.freeze({
+      kind: "world_info",
+      entryId: entry.id,
+      uid: entry.uid,
+      activated: activatedIds.has(entry.id),
+      origin: provenance?.origin ?? (vectorEntry ? "vector" : "none"),
+      keyword: provenance ? Object.freeze({ ...provenance }) : null,
+      vectorScore: vectorEntry?.score ?? null,
+      vectorDisposition: vectorDispositions[entry.id] ?? null,
+      source: entry.source,
+      state: Object.freeze({ ...state }),
+    });
+  });
+  return Object.freeze({
+    books: Object.freeze(books),
+    entries: Object.freeze(entries),
+    candidates: Object.freeze(entries),
+    state: Object.freeze(structuredClone(authority.nativeWiStateBefore)),
+    native: Object.freeze({
+      activatedEntryIds: Object.freeze(authority.mergedWorldInfo.activatedEntries.map((entry) => entry.id)),
+      cache: Object.freeze(structuredClone(authority.wiCache)),
+      runtimePlacements: Object.freeze(structuredClone(authority.runtimeWorldInfoPlacements)),
+      captures: authority.spindleWorldInfoCaptures
+        ? Object.freeze(structuredClone(authority.spindleWorldInfoCaptures))
+        : undefined,
+      activationOverrides: Object.freeze({ ...authority.interception.activationOverrides }),
+      sourceFingerprint: buildWorldInfoVectorSourceFingerprint(
+        authority.sourceEntries,
+        authority.wiSources.worldBookIds,
+      ),
+      precomputedVectorAccepted: authority.precomputedVectorAccepted,
+      vectorViewsEquivalent: authority.vectorViewsEquivalent,
+      stateAfter: Object.freeze(structuredClone(authority.wiResult.wiState)),
+      activationEvidence: Object.freeze(activationEvidence),
+      vectorDispositions: Object.freeze(vectorDispositions),
+      stats: Object.freeze(structuredClone(authority.worldInfoStats)),
+    }),
+  });
+}
+
+async function resolveNativeProjectionAuthority(
+  userId: string,
+  chatId: string,
+  options: NativePromptProjectionOptions,
+) {
+  const chat = chatsSvc.getChat(userId, chatId);
+  if (!chat) throw new Error("Chat not found");
+  const characterId = options.targetCharacterId ?? chat.character_id;
+  const character = characterId
+    ? charactersSvc.getCharacter(userId, characterId)
+    : makeAssistantCharacter();
+  if (!character) throw new Error("Character not found");
+  let persona = isTemporaryChatMetadata(chat.metadata)
+    ? null
+    : personasSvc.resolvePersonaOrDefault(userId, options.personaId ?? undefined);
+  persona = applyPersonaAddonStates(persona, options.personaAddonStates);
+  persona = globalAddonsSvc.resolvePersonaGlobalAddons(userId, persona);
+  const messages = chatsSvc.getMessages(userId, chatId)
+    .filter((message) => message.id !== options.excludedMessageId);
+  const profiler = createPromptAssemblyProfiler("native-world-info-projection", { chatId });
+  try {
+    const authority = await resolveNativeWorldInfo({
+      ctx: {
+        userId,
+        generationId: `native-world-info:${chatId}`,
+        dryRun: false,
+        chatId,
+        assemblySurface: "WORK",
+        generationType: options.generationType ?? "normal",
+        personaId: options.personaId ?? undefined,
+        personaAddonStates: options.personaAddonStates
+          ? { ...options.personaAddonStates }
+          : undefined,
+        excludeMessageId: options.excludedMessageId ?? undefined,
+        targetCharacterId: options.targetCharacterId ?? undefined,
+        precomputedVectorEntries: options.precomputedVectorEntries,
+        macroCommit: false,
+        signal: options.signal,
+      },
+      chat,
+      character,
+      persona,
+      messages,
+      profiler,
+    });
+    return { chat, character, persona, messages, authority };
+  } finally {
+    profiler.finish();
+  }
+}
+
+
+export interface NativeContextProjectionV1 {
+  readonly structuralBlockValues: Readonly<Record<string, string>>;
+  readonly worldInfo: SnapshotWorldInfoV1;
+}
+
+/** Resolve WI and per-block structural values from one authenticated host observation. */
+export async function projectNativeContextForChat(
+  userId: string,
+  chatId: string,
+  options: NativePromptProjectionOptions = {},
+): Promise<NativeContextProjectionV1> {
+  const resolved = await resolveNativeProjectionAuthority(userId, chatId, options);
+  const structuralBlockValues = await projectNativeStructuralMarkerValues(
+    userId,
+    resolved.chat,
+    resolved.character,
+    resolved.persona,
+    resolved.messages,
+    resolved.authority,
+    options,
+  );
+  return Object.freeze({
+    structuralBlockValues,
+    worldInfo: serializeNativeWorldInfoProjection(resolved.authority),
+  });
 }
 
 /**

@@ -157,16 +157,18 @@ provider helpers: they do not assemble a preset and do not execute
 preset-owned intrinsics. With no executable Response-mode configuration,
 ordinary generation and existing Council continuation behavior are unchanged.
 
-Normalized Loom omission removes only the WORK-owned policy and phase source
-blocks from Response. If that leaves no active authored `chat_history` marker,
-assembly inserts one ephemeral host-owned structural marker, then runs the same
-native history, World Info, Author's Note, and automatic Databank paths. The
-marker is never persisted or exported and does not replace an active authored
-marker. Normal generations carry the exact persisted source-user row IDs into
-assembly; a nonempty source set must resolve to visible user rows or assembly
-fails before provider dispatch. Those IDs are identity only. The empty-send
-nudge is admitted only when the source set is empty, so a real current user turn
-cannot be replaced by a stale nudge.
+Loom omission removes only WORK-owned policy and phase source blocks from
+Response, regardless of whether the effective cognition source is normalized,
+directly authored, quarantined/stale, or a legacy carrier. If exclusions leave
+no enabled `chat_history` marker that is active for the current generation and
+character tags, assembly inserts exactly one ephemeral host-owned structural
+marker and runs the same native history, World Info, Author's Note, and
+automatic Databank paths. The marker is never persisted or exported and is not
+inserted when an active authored marker remains. Normal generations carry the
+exact persisted source-user row IDs into assembly; a nonempty source set must
+resolve to visible user rows or assembly fails before provider dispatch. Those
+IDs are identity only. The empty-send nudge is admitted only when the source set
+is empty, so a real current user turn cannot be replaced by a stale nudge.
 
 ### Child runtime
 
@@ -374,20 +376,32 @@ expiry all require a fresh decision.
 serializable `GenerationAssemblySnapshotV1` immediately before the strict
 preprocessing isolate. It contains the selected preset and ordered blocks,
 target chat/messages/swipes, persona/character/group facts, prompt-variable
-state, active regex rows, deterministic world/lore books, entries and state,
-settings used by macros/token accounting, concrete connection identity,
-normalized V2 config, frozen Loom/task cognition policy, immutable
-tool/participant availability, preparation limits, and a closed
-`InputRevisionSetV1`. Native World Info and Databank assembly remains outside
-Loom: those systems resolve their live attached objects through their existing
-activation, placement, automatic retrieval, and explicit `#slug` paths.
-`extensionData` and `ambientSpindleData` are explicitly `null`; no database
-handle, callback, extension registry, or live Spindle registry crosses the
-boundary.
+state, active regex rows, settings used by macros/token accounting, concrete
+connection identity, normalized V2 config, frozen Loom/task cognition policy,
+immutable tool/participant availability, preparation limits, and a closed
+`InputRevisionSetV1`. The host resolves native World Info once, including
+keyword, constant, and vector activation, native ordering, budgets, cache,
+state, and activation provenance; the strict worker consumes that finalized
+projection and does not run a parallel World Info implementation. Native
+Databank retrieval remains outside Loom and is projected from authenticated
+live attached objects. `extensionData` and `ambientSpindleData` are explicitly
+`null`; no database handle, callback, extension registry, or live Spindle
+registry crosses the boundary.
+The snapshot also carries exact host-native structural values for
+`description`, `personality`, `persona`, `scenario`, and `examples`;
+`chat_history` remains structural rather than authored text. Native history uses
+the visible context anchor and excludes hidden rows from both WORK and RENDER.
+For the current user turn, authenticated ownership/chat/swipe/visibility checks
+seal image and audio descriptors from authoritative storage rows, MIME bytes,
+and per-item/aggregate caps before any provider call. WORK and RENDER then
+materialize those descriptors as typed multipart content; the textual
+`(attached)` sentinel is removed whenever real media is present and is never a
+substitute for a validated part.
 
 The strict worker protocol has only two operations:
 `compile_agent_assembly` and `prepare_agent_render`. `AssemblyPlanV1` returns
-ordered provider messages made of literal/result-slot segments, deterministic
+ordered provider messages made of literal, authenticated-media, and result-slot
+segments, deterministic
 child descriptors in traversal order, bounded result slots, activation/token
 evidence, the complete input revision set, context snapshot, and typed deferred
 deltas. Preflight rejects generated, nested, transformed, recursive, or

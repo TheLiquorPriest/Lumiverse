@@ -3953,6 +3953,50 @@ describe("agentic RENDER narrative prompt", () => {
     expect(messages.filter((message) => message.role !== "system").map((message) => message.content)).not.toContain("complete_turn");
   });
 
+  test("preserves authenticated image and audio as typed multipart in finalization messages", () => {
+    const nativeUserMessage: AssemblyProviderMessageV1 = {
+      ...assembledRenderMessage("user", "Review these files", "history", "user-media"),
+      segments: [
+        ...renderLiteralSegments("Review these files"),
+        {
+          kind: "media",
+          mediaType: "image",
+          mediaId: "image-1",
+          mimeType: "image/png",
+          byteLength: 8,
+          sha256: "a".repeat(64),
+          bytes: 0,
+        },
+        {
+          kind: "media",
+          mediaType: "audio",
+          mediaId: "audio-1",
+          mimeType: "audio/wav",
+          byteLength: 12,
+          sha256: "b".repeat(64),
+          bytes: 0,
+        },
+      ],
+    };
+    const messages = __testing.buildAgenticRenderPolicyMessages({
+      nativeMessages: [nativeUserMessage],
+      materializeMedia: (segment) => segment.mediaType === "image"
+        ? { type: "image", data: `sealed:${segment.mediaId}`, mime_type: segment.mimeType }
+        : { type: "audio", data: `sealed:${segment.mediaId}`, mime_type: segment.mimeType },
+      renderPolicyMessages: [],
+      renderGuidance: null,
+    });
+
+    expect(messages[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Review these files" },
+        { type: "image", data: "sealed:image-1", mime_type: "image/png" },
+        { type: "audio", data: "sealed:audio-1", mime_type: "audio/wav" },
+      ],
+    });
+    expect(JSON.stringify(messages)).not.toContain("(attached)");
+  });
   test("appends authored render policy instead of the host contract and excludes WORK-only messages", () => {
     const messages = __testing.buildAgenticRenderPolicyMessages({
       nativeMessages: [

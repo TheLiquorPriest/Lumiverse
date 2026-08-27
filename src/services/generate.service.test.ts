@@ -27,6 +27,7 @@ import * as breakdownSvc from "./breakdown.service";
 import * as chatMacroRenderSvc from "./chat-macro-render.service";
 import * as chatsSvc from "./chats.service";
 import { getChatPipelineStatus } from "./chat-pipeline-coordinator.service";
+import * as charactersSvc from "./characters.service";
 import * as connectionsSvc from "./connections.service";
 import {
   __test__,
@@ -41,7 +42,8 @@ import { buildInlineToolContinuation } from "./inline-tool-continuation";
 import * as presetsSvc from "./presets.service";
 import { writePresetAgentConfig } from "./agent-config-portability.service";
 import * as worldBooksSvc from "./world-books.service";
-import { assemblePrompt } from "./prompt-assembly.service";
+import { assemblePrompt, projectNativeContextForChat } from "./prompt-assembly.service";
+import { worldInfoInterceptorChain } from "../spindle/world-info-interceptor";
 import * as databankSvc from "./databank";
 import * as embeddingsSvc from "./embeddings.service";
 import * as runtimeDecisionSvc from "./agent-runtime-decision.service";
@@ -1585,6 +1587,120 @@ describe.serial("root generation usage accounting", () => {
     );
     return { userId, userName: "Usage Owner", provider, preset, connection, chat };
   }
+  test("uses one combined native authority for sealed structural and intercepted WI provider context", async () => {
+    const fixture = await createFixture("finalization");
+    const character = charactersSvc.createCharacter(fixture.userId, {
+      name: "Projection Character",
+      description: "SEALED-DESCRIPTION-{{calc::1+1}}",
+      extensions: {},
+    });
+    const worldBook = worldBooksSvc.createWorldBook(fixture.userId, { name: "Projection lore" });
+    const worldEntry = worldBooksSvc.createEntry(fixture.userId, worldBook.id, {
+      key: ["Delegate"],
+      content: "ORIGINAL-RUNTIME",
+      comment: "Projection runtime",
+      constant: true,
+      disabled: false,
+      role: "system",
+    });
+    if (!worldEntry) throw new Error("Expected projection World Info entry");
+    const fixedEntry = worldBooksSvc.createEntry(fixture.userId, worldBook.id, {
+      key: ["Delegate"],
+      content: "SEALED-WI-BLOCK",
+      comment: "Projection fixed",
+      constant: true,
+      disabled: false,
+      role: "system",
+    });
+    if (!fixedEntry) throw new Error("Expected fixed projection World Info entry");
+    getDb().query("UPDATE chats SET character_id = ? WHERE id = ?").run(character.id, fixture.chat.id);
+    chatsSvc.updateChat(fixture.userId, fixture.chat.id, {
+      metadata: {
+        temporary: false,
+        chat_world_book_ids: [worldBook.id],
+        active_world_info_entry_ids: [worldEntry.id, fixedEntry.id],
+      },
+    });
+    const projectedBlocks = [
+      { id: "sealed-description", name: "Description", content: "raw placeholder", role: "system" as const, enabled: true, position: "pre_history" as const, depth: 0, marker: "char_description" as const, isLocked: false, color: null, injectionTrigger: [], group: null },
+      { id: "sealed-world-before", name: "World before", content: "raw world placeholder", role: "user" as const, enabled: true, position: "pre_history" as const, depth: 0, marker: "world_info_before" as const, isLocked: false, color: null, injectionTrigger: [], group: null },
+      { id: "excluded-generation-description", name: "Excluded generation description", content: "LEAKED-GENERATION-STRUCTURAL", role: "system" as const, enabled: true, position: "pre_history" as const, depth: 0, marker: "char_description" as const, isLocked: false, color: null, injectionTrigger: ["continue"], group: null },
+      { id: "excluded-tag-world-before", name: "Excluded tag world before", content: "LEAKED-TAG-WORLD-MARKER", role: "system" as const, enabled: true, position: "pre_history" as const, depth: 0, marker: "world_info_before" as const, isLocked: false, color: null, injectionTrigger: [], characterTagTrigger: ["missing-character-tag"], group: null },
+      ...fixture.preset.prompt_order,
+      { id: "projection-post", name: "Projection post", content: "PROJECTION-POST", role: "system" as const, enabled: true, position: "post_history" as const, depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null },
+    ];
+    const updatedPreset = presetsSvc.updatePreset(fixture.userId, fixture.preset.id, { prompt_order: projectedBlocks });
+    if (!updatedPreset) throw new Error("Expected projection preset update");
+    const structuralProjection = await projectNativeContextForChat(fixture.userId, fixture.chat.id, {
+      generationType: "normal",
+      presetId: updatedPreset.id,
+      connectionId: fixture.connection.id,
+      forcePresetId: true,
+      targetCharacterId: character.id,
+      userInput: "Delegate this.",
+    });
+    expect(structuralProjection.structuralBlockValues["sealed-description"]).toBe("SEALED-DESCRIPTION-2");
+    expect(structuralProjection.structuralBlockValues["sealed-world-before"]).toContain("SEALED-WI-BLOCK");
+    expect(Object.hasOwn(structuralProjection.structuralBlockValues, "excluded-generation-description")).toBe(false);
+    expect(Object.hasOwn(structuralProjection.structuralBlockValues, "excluded-tag-world-before")).toBe(false);
+    let interceptorCalls = 0;
+    const unregister = worldInfoInterceptorChain.register({
+      extensionId: "projection-test",
+      userId: fixture.userId,
+      priority: -100,
+      handler: async (ctx) => {
+        interceptorCalls += 1;
+        const target = ctx.entries.find((entry) => entry.id === worldEntry.id);
+        if (!target) throw new Error("Expected attached projection World Info entry");
+        return {
+          mutated: [{
+            id: target.id,
+            content: "MUTATED-RUNTIME",
+            selectionContent: "SELECTED-AUTHORITY",
+            placement: { type: "chat_depth", role: "system", direction: "from_start", depth: 0 },
+          }],
+          captured: [target.id],
+          activationOverrides: { disableRecursion: true },
+        };
+      },
+    });
+    try {
+      const started = await startGeneration({
+        userId: fixture.userId,
+        userName: fixture.userName,
+        chat_id: fixture.chat.id,
+        connection_id: fixture.connection.id,
+        preset_id: updatedPreset.id,
+        force_preset_id: true,
+        target_character_id: character.id,
+        generation_type: "normal",
+      });
+      const terminal = await waitForGenerationTerminal(started.generationId);
+      expect(terminal.event).toBe(EventType.GENERATION_ENDED);
+      expect(interceptorCalls).toBe(1);
+      const requestTexts = fixture.provider.rootRequests[0]?.messages.map((message) =>
+        typeof message.content === "string" ? message.content : JSON.stringify(message.content)
+      ) ?? [];
+      const runtimeIndex = requestTexts.findIndex((text) => text.includes("MUTATED-RUNTIME"));
+      const fixedIndex = requestTexts.findIndex((text) => text.includes("SEALED-WI-BLOCK"));
+      const historyIndex = requestTexts.findIndex((text) => text.includes("Delegate this."));
+      const postIndex = requestTexts.findIndex((text) => text.includes("PROJECTION-POST"));
+      expect(runtimeIndex).toBeGreaterThanOrEqual(0);
+      expect(fixedIndex).toBeGreaterThanOrEqual(0);
+      expect(runtimeIndex).toBeGreaterThan(fixedIndex);
+      expect(historyIndex).toBeGreaterThan(runtimeIndex);
+      expect(postIndex).toBeGreaterThan(historyIndex);
+      expect(requestTexts.join("\n")).toContain("SEALED-DESCRIPTION-2");
+      expect(requestTexts.join("\n")).not.toContain("raw placeholder");
+      expect(requestTexts.join("\n")).not.toContain("LEAKED-GENERATION-STRUCTURAL");
+      expect(requestTexts.join("\n")).not.toContain("LEAKED-TAG-WORLD-MARKER");
+      expect(requestTexts.join("\n")).not.toContain("ORIGINAL-RUNTIME");
+      expect(requestTexts.join("\n")).not.toContain("SELECTED-AUTHORITY");
+    } finally {
+      unregister();
+      await cleanupFixture(fixture.chat.id);
+    }
+  }, 15_000);
   function scenarioIsAgentActive(scenario: UsageScenario): boolean {
     return scenario !== "inactive_success" && scenario !== "inactive_failure";
   }
@@ -1777,11 +1893,9 @@ describe.serial("root generation usage accounting", () => {
       expect(requestText).toContain(
         "World context for Usage Owner: blue lantern.",
       );
-      expect(requestText).toContain("Prior public request.");
-      expect(requestText).toContain("Prior public reply.");
-      expect(requestText).toContain(
-        "RESPONSE-SOURCE-ROW: answer this exact request.",
-      );
+      expect(requestText.match(/Prior public request\./g)).toHaveLength(1);
+      expect(requestText.match(/Prior public reply\./g)).toHaveLength(1);
+      expect(requestText.match(/RESPONSE-SOURCE-ROW: answer this exact request\./g)).toHaveLength(1);
       expect(requestText).toContain(
         "NATIVE-WI-RESPONSE: preserve the exact current request.",
       );

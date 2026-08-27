@@ -13,6 +13,9 @@ export const MAX_DATABANK_DOCUMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_AUDIO_BYTES = 50 * 1024 * 1024;
 export const MAX_NOTIFICATION_SOUND_BYTES = 2 * 1024 * 1024;
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+/** Provider-bound current-turn media remains bounded before base64 expansion. */
+export const MAX_NATIVE_MESSAGE_MEDIA_PARTS = 8;
+export const MAX_NATIVE_MESSAGE_MEDIA_TOTAL_BYTES = 64 * 1024 * 1024;
 
 export type MediaDomain =
   | "images"

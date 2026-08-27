@@ -203,6 +203,16 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
       const content = message.segments
         .map((segment) => segment.kind === "literal" ? segment.text : "")
         .join("");
+      const mediaParts = message.segments.flatMap((segment) => segment.kind === "media"
+        ? [{
+          kind: segment.kind,
+          mediaType: segment.mediaType,
+          mediaId: segment.mediaId,
+          mimeType: segment.mimeType,
+          byteLength: segment.byteLength,
+          sha256: segment.sha256,
+        }]
+        : []);
       return {
         id: provenance.sourceId,
         chat_id: "chat-1",
@@ -215,6 +225,7 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
         swipes: [content],
         swipe_dates: [0],
         extra: {},
+        mediaParts,
         parent_message_id: null,
         branch_id: null,
         created_at: 0,
@@ -642,6 +653,60 @@ function acceptedCouncilResult(advice: string): WorkCouncilExecutionResult {
 }
 
 describe("Agentic WORK phase", () => {
+  test("materializes sealed current-turn media as typed multipart before WORK dispatch", async () => {
+    const base = plan();
+    const sourceMessage = base.messages[0];
+    if (!sourceMessage) throw new Error("missing source message fixture");
+    const mediaMessage = {
+      ...sourceMessage,
+      segments: [
+        ...sourceMessage.segments,
+        {
+          kind: "media" as const,
+          mediaType: "image" as const,
+          mediaId: "image-1",
+          mimeType: "image/png",
+          byteLength: 8,
+          sha256: "a".repeat(64),
+          bytes: 0 as const,
+        },
+      ],
+    };
+    const mediaPlan = plan({ messages: [mediaMessage], providerMessages: [mediaMessage] });
+    let dispatchedMessages: readonly LlmMessage[] = [];
+    const completed = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
+      dispatchedMessages = messages;
+      return response("", [complete("media-complete")]);
+    }, {
+      plan: mediaPlan,
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      materializeMedia: (segment) => ({
+        type: "image",
+        data: `sealed:${segment.mediaId}:${segment.sha256}`,
+        mime_type: segment.mimeType,
+      }),
+    }));
+
+    expect(completed.status).toBe("completed");
+    expect(dispatchedMessages[0]?.content).toEqual([
+      { type: "text", text: "Work" },
+      { type: "image", data: `sealed:image-1:${"a".repeat(64)}`, mime_type: "image/png" },
+    ]);
+
+    let unsealedDispatches = 0;
+    const rejected = await runAgenticWorkPhase(baseOptions(async () => {
+      unsealedDispatches += 1;
+      return response("", [complete("must-not-dispatch")]);
+    }, {
+      plan: mediaPlan,
+      workspace: workspace(),
+      workspaceCapabilities: [],
+    }));
+    expect(rejected.status).toBe("failed");
+    expect(rejected.code).toBe("invalid_plan");
+    expect(unsealedDispatches).toBe(0);
+  });
   test("retries a tool-free response as a private unsigned boundary", async () => {
     const requests: string[] = [];
     let round = 0;

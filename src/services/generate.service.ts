@@ -5323,6 +5323,8 @@ function toAgenticGenerationInput(input: GenerateInput): AgenticGenerationInput 
     ...(input.preset_id ? { presetId: input.preset_id } : {}),
     ...(input.force_preset_id !== undefined ? { forcePresetId: input.force_preset_id } : {}),
     ...(input.persona_id ? { personaId: input.persona_id } : {}),
+    ...(input.persona_addon_states ? { personaAddonStates: { ...input.persona_addon_states } } : {}),
+    sourceUserMessageIds: chatsSvc.getTrailingVisibleUserMessageIds(input.userId, input.chat_id),
     ...(input.message_id ? { messageId: input.message_id } : {}),
     ...(input.swipe_id !== undefined ? { swipeId: input.swipe_id } : {}),
     ...(input.target_character_id ? { targetCharacterId: input.target_character_id } : {}),

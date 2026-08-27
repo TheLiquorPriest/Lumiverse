@@ -75,6 +75,10 @@ export interface AgenticGenerationInput {
   presetId?: string;
   forcePresetId?: boolean;
   personaId?: string;
+  /** Add-on enablement already resolved by the authenticated generation entrypoint. */
+  personaAddonStates?: Readonly<Record<string, boolean>>;
+  /** Visible current-turn user messages eligible for native multipart admission. */
+  sourceUserMessageIds?: readonly string[];
   messageId?: string;
   swipeId?: number;
   targetCharacterId?: string;

@@ -361,6 +361,117 @@ describe("GenerationAssemblySnapshotV1", () => {
     expect(snapshot.inputRevisionSet.digest.length).toBeGreaterThan(0);
     db.close();
   });
+  test("projects exact structural markers and only anchored visible typed-media history", async () => {
+    const db = schema();
+    seed(db);
+    const structuralBlocks = [
+      { id: "description", name: "Description", content: "authored placeholder", role: "system", enabled: true, position: "pre_history", depth: 0, marker: "char_description", isLocked: false, color: null, injectionTrigger: [], group: null },
+      { id: "history", name: "History", content: "", role: "system", enabled: true, position: "pre_history", depth: 0, marker: "chat_history", isLocked: false, color: null, injectionTrigger: [], group: null },
+    ];
+    db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(structuralBlocks), "preset-1");
+    db.query("UPDATE chats SET metadata = ? WHERE id = ?").run(JSON.stringify({ context_history_anchor_message_id: "message-1" }), "chat-1");
+    db.query("UPDATE messages SET content = ?, swipes = ?, extra = ? WHERE id = ?").run("hello (attached)", JSON.stringify(["hello (attached)"]), "{}", "message-1");
+    const insertMessage = db.query("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    insertMessage.run("before", "chat-1", -1, 0, "Aria", "before anchor", 1, 0, JSON.stringify(["before anchor"]), JSON.stringify([1]), "{}", null, null, 1, 1, 1);
+    insertMessage.run("hidden", "chat-1", 1, 0, "Aria", "hidden after", 1, 0, JSON.stringify(["hidden after"]), JSON.stringify([1]), JSON.stringify({ hidden: 1 }), null, null, 1, 1, 1);
+    insertMessage.run("after", "chat-1", 2, 0, "Aria", "visible after", 1, 0, JSON.stringify(["visible after"]), JSON.stringify([1]), "{}", null, null, 1, 1, 1);
+
+    const snapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      agentConfig: config(),
+      structuralBlockValues: { description: "exact composed description" },
+      mediaPartsByMessageId: {
+        "message-1": [{ kind: "media", mediaType: "image", mediaId: "image-1", mimeType: "image/png", byteLength: 8, sha256: "a".repeat(64) }],
+      },
+      db,
+    });
+    expect(snapshot.messages.map((message) => message.id)).toEqual(["message-1", "after"]);
+    const plan = await compileAgentAssemblyPlan(snapshot);
+    const description = plan.providerMessages.find((message) => message.blockId === "description");
+    expect(description?.segments).toHaveLength(1);
+    const descriptionSegment = description?.segments[0];
+    expect(descriptionSegment?.kind).toBe("literal");
+    if (descriptionSegment?.kind !== "literal") throw new Error("description projection was not literal");
+    expect(descriptionSegment.text).toBe("exact composed description");
+    expect(descriptionSegment.bytes).toBe(26);
+    const anchored = plan.providerMessages.find((message) => message.provenance.kind === "history" && message.provenance.sourceId === "message-1");
+    expect(anchored?.segments.map((segment) => segment.kind)).toEqual(["literal", "media"]);
+    expect(anchored?.segments.filter((segment) => segment.kind === "literal").map((segment) => segment.text).join("")).toBe("hello");
+    expect(JSON.stringify(plan.providerMessages)).not.toContain("(attached)");
+    const materialized = materializeAssemblyPlan(plan, [], plan.limits);
+    expect(materialized.find((message) => message.provenance.kind === "history" && message.provenance.sourceId === "message-1")?.segments.at(-1))
+      .toMatchObject({ kind: "media", mediaType: "image", mediaId: "image-1", mimeType: "image/png", byteLength: 8, bytes: 0 });
+    await validateAssemblyPlanAgainstSnapshotV1(plan, snapshot);
+    db.close();
+  });
+  test("preserves native fixed, explicit-marker, depth, and runtime World Info placement", async () => {
+    const db = schema();
+    seed(db);
+    const blocks = [
+      { id: "pre", name: "Pre", content: "pre", role: "system", enabled: true, position: "pre_history", depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null },
+      { id: "wi-before", name: "WI Before", content: "LEAKED-EXCLUDED-WI-MARKER", role: "system", enabled: true, position: "pre_history", depth: 0, marker: "world_info_before", isLocked: false, color: null, injectionTrigger: [], group: null },
+      { id: "history", name: "History", content: "", role: "system", enabled: true, position: "in_history", depth: 0, marker: "chat_history", isLocked: false, color: null, injectionTrigger: [], group: null },
+      { id: "post", name: "Post", content: "post", role: "system", enabled: true, position: "post_history", depth: 0, marker: null, isLocked: false, color: null, injectionTrigger: [], group: null },
+    ];
+    db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(blocks), "preset-1");
+    const base = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
+    const activationEvidence = [{
+      kind: "world_info", entryId: "entry-1", uid: base.worldInfo.entries.find((entry) => entry.id === "entry-1")!.uid,
+      activated: true, origin: "vector", keyword: null, vectorScore: 0.91,
+      vectorDisposition: { code: "accepted", conflictingEntryId: null, conflictingSource: null },
+      state: { active: false, stickyLeft: 0, cooldownLeft: 0, delayCount: 0 },
+    }];
+    const nativeWorldInfo: typeof base.worldInfo = {
+      ...base.worldInfo,
+      native: {
+        activatedEntryIds: ["entry-1"],
+        cache: {
+          before: [{ content: "before", role: "system", entryLabel: "Before" }],
+          after: [{ content: "after", role: "system", entryLabel: "After" }],
+          anBefore: [{ content: "an-before", role: "system", entryLabel: "AN before" }],
+          anAfter: [{ content: "an-after", role: "system", entryLabel: "AN after" }],
+          depth: [{ content: "depth", role: "system", depth: 1, entryLabel: "Depth" }],
+          emBefore: [{ content: "em-before", role: "system", entryLabel: "EM before" }],
+          emAfter: [{ content: "em-after", role: "system", entryLabel: "EM after" }],
+          atMarker: [], pinnedMarkers: [],
+        },
+        runtimePlacements: [
+          { id: "runtime", content: "runtime", entryLabel: "Runtime", orderValue: 0, placement: { role: "system", direction: "from_start", depth: 0 } },
+          { id: "runtime-2", content: "runtime-2", entryLabel: "Runtime 2", orderValue: 1, placement: { role: "system", direction: "from_start", depth: 1 } },
+        ],
+        stateAfter: {}, activationEvidence,
+        vectorDispositions: { "entry-1": { code: "accepted", conflictingEntryId: null, conflictingSource: null } },
+        stats: { keywordActivated: 0, vectorActivated: 1, totalActivated: 1 },
+      },
+    };
+    const snapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1",
+      agentConfig: config(), structuralBlockValues: { "wi-before": "before" }, nativeWorldInfo, db,
+    });
+    const plan = await compileAgentAssemblyPlan(snapshot);
+    const texts = plan.providerMessages.flatMap((message) =>
+      message.segments.filter((segment) => segment.kind === "literal").map((segment) => segment.text)
+    );
+    expect(texts).toEqual(["pre", "before", "an-before", "em-before", "em-after", "runtime", "runtime-2", "hello", "an-after", "after", "depth", "post"]);
+    expect(texts.filter((text) => text === "before")).toHaveLength(1);
+    expect(plan.privateEvidence.activation.filter((item) => item.kind === "world_info")).toEqual(activationEvidence);
+    await validateAssemblyPlanAgainstSnapshotV1(plan, snapshot);
+    const excludedSnapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1",
+      agentConfig: config(), structuralBlockValues: {}, nativeWorldInfo, db,
+    });
+    const excludedPlan = await compileAgentAssemblyPlan(excludedSnapshot);
+    const excludedTexts = excludedPlan.providerMessages.flatMap((message) =>
+      message.segments.filter((segment) => segment.kind === "literal").map((segment) => segment.text)
+    );
+    expect(excludedTexts).not.toContain("LEAKED-EXCLUDED-WI-MARKER");
+    expect(excludedTexts.filter((text) => text === "before")).toHaveLength(1);
+    await validateAssemblyPlanAgainstSnapshotV1(excludedPlan, excludedSnapshot);
+    db.close();
+  });
 
 });
 async function compiledAssemblyPlan(): Promise<AssemblyPlanV1> {
@@ -651,7 +762,7 @@ describe("strict assembly plan", () => {
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify([producer, inHistory, consumer]), "preset-1");
     const snapshot = buildGenerationAssemblySnapshot({ assemblySurface: "WORK", userId: "user-1", chatId: "chat-1", presetId: "preset-1", agentConfig: config(), db });
     const plan = await compileAgentAssemblyPlan(snapshot);
-    expect(plan.providerMessages.map((message) => message.blockId ?? "history")).toEqual(["history", "producer", "history", "in-history", "consumer"]);
+    expect(plan.providerMessages.map((message) => message.blockId ?? "history")).toEqual(["producer", "history", "history", "in-history", "consumer"]);
     db.close();
   });
 

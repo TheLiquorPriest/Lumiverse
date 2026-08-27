@@ -66,7 +66,7 @@ export async function processDocument(userId: string, docId: string): Promise<vo
 
   try {
     // Mark as processing
-    crud.updateDocumentStatus(docId, "processing");
+    crud.updateDocumentStatus(docId, "processing", { errorMessage: null });
     emitStatus(userId, doc, "processing");
 
     // 1. Parse the file

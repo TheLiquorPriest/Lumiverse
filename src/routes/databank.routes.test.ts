@@ -1,7 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { Hono } from "hono";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { env } from "../env";
+import * as databank from "../services/databank";
+import type { DatabankDocument } from "../services/databank/types";
+import {
+  UserDataBarrierBusyError,
+  withUserDataExportSync,
+} from "../services/user-data/snapshot";
 import { databankRoutes } from "./databank.routes";
 
 const USER_ID = "databank-route-user";
@@ -172,6 +181,68 @@ describe("databank mention routes", () => {
       const rejectedResponse = await resolve(slug);
       expect(rejectedResponse.status).toBe(404);
       expect(await rejectedResponse.json()).toEqual({ error: "Document not found" });
+    }
+  });
+});
+
+describe("databank scrape ingestion", () => {
+  test("publishes the pending row before starting one native processing run", async () => {
+    const originalDataDir = env.dataDir;
+    const dataDir = mkdtempSync(join(tmpdir(), "lumiverse-databank-scrape-route-"));
+    const scrapeSpy = spyOn(databank, "scrapeUrl").mockResolvedValue({
+      title: "Committed scrape",
+      url: "https://example.test/committed",
+      content: "Scraped route content.",
+      sourceType: "web",
+      contentLength: 22,
+      metadata: {},
+    });
+    let processingDocument: DatabankDocument | null = null;
+    let mutationContextExited = false;
+    const processSpy = spyOn(databank, "processDocument").mockImplementation(async (userId, documentId) => {
+      try {
+        withUserDataExportSync(userId, () => {});
+      } catch (error) {
+        mutationContextExited = error instanceof UserDataBarrierBusyError;
+      }
+      processingDocument = databank.getDocument(userId, documentId);
+    });
+
+    try {
+      env.dataDir = dataDir;
+      const response = await app.request(
+        "/cross-ref-bank/documents/scrape",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ url: "https://example.test/committed" }),
+        },
+      );
+      const body = await response.json() as Record<string, any>;
+
+      expect(response.status).toBe(201);
+      expect(body).toMatchObject({
+        databankId: ACTIVE_BANK_ID,
+        status: "pending",
+        scraped: {
+          title: "Committed scrape",
+          sourceType: "web",
+          contentLength: 22,
+        },
+      });
+      expect(processSpy).toHaveBeenCalledTimes(1);
+      expect(processSpy).toHaveBeenCalledWith(USER_ID, body.id);
+      expect(mutationContextExited).toBe(true);
+      expect(processingDocument).toMatchObject({
+        id: body.id,
+        databankId: ACTIVE_BANK_ID,
+        status: "pending",
+      });
+    } finally {
+      processSpy.mockRestore();
+      scrapeSpy.mockRestore();
+      env.dataDir = originalDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
     }
   });
 });

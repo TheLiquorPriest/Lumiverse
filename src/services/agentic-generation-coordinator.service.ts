@@ -51,9 +51,18 @@ import {
   type GenerationAssemblySnapshotV1,
 } from "./prompt-assembly-snapshot.service";
 import { resolveAgenticDatabankProjection } from "./databank/agentic-projection.service";
-import { resolveCognitionPresetVariables } from "./prompt-assembly.service";
+import {
+  projectNativeContextForChat,
+  resolveCognitionPresetVariables,
+} from "./prompt-assembly.service";
+import {
+  NativeMediaProjectionError,
+  resolveNativeCurrentTurnMedia,
+  type NativeMediaProjectionResultV1,
+} from "./native-message-media.service";
 import {
   selectEffectiveLoomPolicyMessagesV1,
+  type AssemblyMediaSegmentV1,
   type AssemblyPlanV1,
   type AssemblyProviderMessageV1,
 } from "./agentic-assembly-compiler";
@@ -243,7 +252,7 @@ import { cloneAndFreeze, resolveConcreteConnectionV1, type ResolvedConcreteConne
 import * as pool from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
-import type { GenerationRequest, GenerationResponse, GenerationParameters, LlmMessage, StreamChunk } from "../llm/types";
+import type { GenerationRequest, GenerationResponse, GenerationParameters, LlmMessage, LlmMessagePart, StreamChunk } from "../llm/types";
 import { redactAgentOutputFrames } from "./agent-seals.service";
 import { observeOutputTokens } from "./agent-runtime-accounting";
 function cognitionSnapshotInputs(
@@ -373,6 +382,7 @@ function cognitionSnapshotInputs(
 type AgenticRenderPolicyMessageInputV1 = {
   /** Strict ASSEMBLE projection with phased/agent-result carriers excluded. */
   readonly nativeMessages: readonly AssemblyProviderMessageV1[];
+  readonly materializeMedia?: (segment: AssemblyMediaSegmentV1) => LlmMessagePart;
   readonly renderGuidance: AgenticWorkRenderHandoff["renderGuidance"];
   readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
 };
@@ -411,6 +421,7 @@ const DELEGATED_WORKSPACE_OPERATIONS: Readonly<Record<string, true>> = Object.fr
 
 function materializeNativeRenderMessages(
   messages: readonly AssemblyProviderMessageV1[],
+  materializeMedia?: (segment: AssemblyMediaSegmentV1) => LlmMessagePart,
 ): readonly LlmMessage[] {
   const allowedSources = new Set(["block", "history", "world_info", "databank"]);
   const result: LlmMessage[] = [];
@@ -422,13 +433,33 @@ function materializeNativeRenderMessages(
       || provenance.loom !== undefined
       || (message.role !== "system" && message.role !== "user" && message.role !== "assistant")
       || !Array.isArray(message.segments)
-      || message.segments.some((segment) => segment.kind !== "literal")
+      || message.segments.some((segment) => segment.kind === "result_slot")
     ) {
       continue;
     }
-    const content = message.segments
-      .map((segment) => segment.kind === "literal" ? segment.text : "")
-      .join("");
+    const parts: LlmMessagePart[] = [];
+    let text = "";
+    const flushText = (): void => {
+      if (text.length === 0) return;
+      parts.push({ type: "text", text });
+      text = "";
+    };
+    for (const segment of message.segments) {
+      if (segment.kind === "literal") {
+        text += segment.text;
+      } else {
+        if (!materializeMedia) throw new Error("agentic_render_media_unavailable");
+        flushText();
+        parts.push(materializeMedia(segment));
+      }
+    }
+    let content: LlmMessage["content"];
+    if (parts.length === 0) {
+      content = text;
+    } else {
+      flushText();
+      content = parts;
+    }
     result.push({
       role: message.role,
       content,
@@ -453,7 +484,7 @@ function completionHandoffMessage(
 
 function buildAgenticRenderPolicyMessages(input: AgenticRenderPolicyMessageInputV1): readonly LlmMessage[] {
   const messages: LlmMessage[] = [
-    ...materializeNativeRenderMessages(input.nativeMessages),
+    ...materializeNativeRenderMessages(input.nativeMessages, input.materializeMedia),
     completionHandoffMessage(input.renderGuidance),
   ];
   const authored = materializePolicyMessages(input.renderPolicyMessages);
@@ -1190,26 +1221,73 @@ function snapshotInput(
     ...cognition,
   };
 }
-async function snapshotInputWithNativeDatabank(
+interface NativeSnapshotProjectionResult {
+  readonly snapshotInput: GenerationAssemblySnapshotInputV1;
+  readonly materializeMedia: NativeMediaProjectionResultV1["materialize"];
+}
+
+async function snapshotInputWithNativeContext(
   input: AgenticGenerationInput,
   decision: AgenticRuntimeDecision,
   target: AgenticTargetSnapshot,
   concreteConnection: FrozenConcreteConnectionV1 | null | undefined,
   signal: AbortSignal,
-): Promise<GenerationAssemblySnapshotInputV1> {
+): Promise<NativeSnapshotProjectionResult> {
   const base = snapshotInput(input, decision, target, concreteConnection);
-  const databank = await resolveAgenticDatabankProjection({
-    userId: input.userId,
-    chatId: input.chatId,
+  const excludedMessageId =
+    target.generationType === "regenerate" || target.generationType === "swipe"
+      ? target.messageId ?? input.messageId ?? null
+      : null;
+  const projectionOptions = {
+    personaId: input.personaId ?? null,
     targetCharacterId: target.targetCharacterId ?? input.targetCharacterId ?? null,
-    excludedMessageId:
-      target.generationType === "regenerate" || target.generationType === "swipe"
-        ? target.messageId ?? null
-        : null,
+    personaAddonStates: input.personaAddonStates,
+    excludedMessageId,
+    generationType: target.generationType,
+    presetId: base.presetId,
+    connectionId: base.connectionId,
+    forcePresetId: base.forcePresetId,
     userInput: input.userInput ?? "",
     signal,
-  });
-  return { ...base, databank };
+  };
+  let media: NativeMediaProjectionResultV1;
+  try {
+    const [databank, nativeContext, resolvedMedia] = await Promise.all([
+      resolveAgenticDatabankProjection({
+        userId: input.userId,
+        chatId: input.chatId,
+        targetCharacterId: projectionOptions.targetCharacterId,
+        excludedMessageId,
+        userInput: input.userInput ?? "",
+        signal,
+      }),
+      projectNativeContextForChat(input.userId, input.chatId, projectionOptions),
+      resolveNativeCurrentTurnMedia(
+        input.userId,
+        input.chatId,
+        input.sourceUserMessageIds ?? [],
+      ),
+    ]);
+    media = resolvedMedia;
+    return {
+      snapshotInput: {
+        ...base,
+        databank,
+        structuralBlockValues: nativeContext.structuralBlockValues,
+        mediaPartsByMessageId: media.byMessageId,
+        nativeWorldInfo: nativeContext.worldInfo,
+      },
+      materializeMedia: media.materialize,
+    };
+  } catch (error) {
+    if (error instanceof NativeMediaProjectionError) {
+      throw new AgenticGenerationError("agentic_protocol_failure", error.message, {
+        phase: "ASSEMBLE",
+        cause: error,
+      });
+    }
+    throw error;
+  }
 }
 
 function runtimeInputRevisions(snapshot: RuntimeSnapshot): RuntimeInputRevisionSetV1 {
@@ -3852,6 +3930,7 @@ function preservedDecisionRefreshCode(errorCode: unknown): "decision_refresh_req
 function buildDependencies(): AgenticGenerationDependencies {
   const cognitionRuntimes = new Map<string, AgentCognitionRuntimeV1>();
   const snapshots = new Map<string, RuntimeSnapshot>();
+  const mediaMaterializers = new Map<string, NativeMediaProjectionResultV1["materialize"]>();
   const plans = new Map<string, RuntimePlan>();
   const renders = new Map<string, { content: string }>();
   const renderProjections = new Map<string, FrozenRenderCommitProjection>();
@@ -4679,6 +4758,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         persistentAssociations.delete(value.executionId);
         caps.delete(value.executionId);
         snapshots.delete(value.executionId);
+        mediaMaterializers.delete(value.executionId);
         plans.delete(value.executionId);
         works.delete(value.executionId);
         renderFrames.delete(value.executionId);
@@ -4798,15 +4878,14 @@ function buildDependencies(): AgenticGenerationDependencies {
       if (rootSignal.aborted) {
         throw assemblyAbortError(rootSignal);
       }
-      const snapshot = buildGenerationAssemblySnapshot(
-        await snapshotInputWithNativeDatabank(
-          input,
-          decision,
-          target,
-          internalDecision(decision).internal.rootConnection,
-          rootSignal,
-        ),
+      const nativeProjection = await snapshotInputWithNativeContext(
+        input,
+        decision,
+        target,
+        internalDecision(decision).internal.rootConnection,
+        rootSignal,
       );
+      const snapshot = buildGenerationAssemblySnapshot(nativeProjection.snapshotInput);
       if (rootSignal.aborted) {
         throw assemblyAbortError(rootSignal);
       }
@@ -4819,6 +4898,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         });
       }
       snapshots.set(executionId, snapshot);
+      mediaMaterializers.set(executionId, nativeProjection.materializeMedia);
       const inspectionWriter = inspectionWriters.get(executionId);
       inspectionWriter?.record("input", {
         id: "assemble:input",
@@ -5160,6 +5240,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         workspaceAssociationRevision: persistentAssociation.workspaceRevision,
         trustedAssemblyLimits: runtimeSnapshot.limits,
         snapshot: runtimeSnapshot,
+        materializeMedia: mediaMaterializers.get(execution.id),
         plan,
         connectionId: root.concreteId,
         model: root.model,
@@ -5434,6 +5515,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       );
       const renderMessages = buildAgenticRenderPolicyMessages({
         nativeMessages: plan.providerMessages,
+        materializeMedia: mediaMaterializers.get(execution.id),
         renderGuidance: frame.handoff.renderGuidance,
         renderPolicyMessages: effectiveRenderPolicyMessages,
       });
@@ -6365,6 +6447,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         persistentAssociations.delete(id);
       }
       snapshots.delete(id);
+      mediaMaterializers.delete(id);
       cognitionRuntimes.delete(id);
       plans.delete(id);
       works.delete(id);

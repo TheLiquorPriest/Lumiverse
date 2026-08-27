@@ -6,6 +6,8 @@ import { getDb } from "../db/connection";
 import type { Chat } from "../types/chat";
 import { isNoPresetChatMetadata, isTemporaryChatMetadata } from "../types/chat";
 import type { Message } from "../types/message";
+import { MAX_AUDIO_BYTES, MAX_IMAGE_BYTES } from "../types/media-limits";
+import type { WorldInfoCache } from "../types/world-book";
 import type { PromptBlock, PromptVariableValues } from "../types/preset";
 import type { PresetProfileBinding } from "../types/preset-profile";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
@@ -30,6 +32,8 @@ import {
   resolveProfileWithDb,
 } from "./preset-profiles.service";
 import { collectResolvedPromptVariableValues } from "./prompt-assembly.service";
+import { selectNativeVisibleHistory } from "./native-chat-corpus";
+import type { AssemblyMediaSegmentV1 as NativeMediaPartProjectionV1 } from "../types/agent-preprocessing";
 import { compareUtf8 } from "../utils/utf8-order";
 import type {
   CognitionSourceSnapshotV1,
@@ -96,6 +100,12 @@ export interface GenerationAssemblySnapshotInputV1 {
   readonly userInput?: string;
   /** Live native Databank material resolved before the strict isolate. */
   readonly databank?: SnapshotDatabankV1;
+  /** Exact host-resolved structural marker values keyed by active prompt-block ID. */
+  readonly structuralBlockValues?: Readonly<Record<string, string>>;
+  /** Authenticated media descriptors keyed by admitted current-turn message. */
+  readonly mediaPartsByMessageId?: Readonly<Record<string, readonly NativeMediaPartProjectionV1[]>>;
+  /** Final native keyword/constant/vector World Info projection. */
+  readonly nativeWorldInfo?: SnapshotWorldInfoV1;
   readonly toolIds?: readonly string[];
   /** Authenticated normalized-config revision captured by runtime admission. */
   readonly configRevision?: number | string | null;
@@ -174,6 +184,7 @@ export interface SnapshotMessageV1 extends Omit<Message, "extra" | "swipes" | "s
   readonly extra: Readonly<Record<string, unknown>>;
   readonly swipes: readonly string[];
   readonly swipe_dates: readonly number[];
+  readonly mediaParts?: readonly NativeMediaPartProjectionV1[];
   readonly revision: string;
 }
 
@@ -198,6 +209,8 @@ export interface SnapshotParticipantV1 {
   readonly persona: Readonly<Record<string, unknown>> | null;
   readonly character: Readonly<Record<string, unknown>>;
   readonly group: readonly Readonly<Record<string, unknown>>[];
+  /** Exact host-resolved structural marker values keyed by active prompt-block ID. */
+  readonly structuralBlockValues?: Readonly<Record<string, string>>;
   readonly availabilityRevision: string;
 }
 
@@ -298,11 +311,35 @@ export interface SnapshotWorldEntryV1 {
   readonly revision: string;
 }
 
+export interface SnapshotNativeWorldInfoRuntimePlacementV1 {
+  readonly id: string;
+  readonly content: string;
+  readonly entryLabel: string;
+  readonly orderValue: number;
+  readonly placement: Readonly<{ role: "system" | "user" | "assistant"; direction: "from_start" | "from_end"; depth: number }>;
+}
+
+export interface SnapshotNativeWorldInfoV1 {
+  readonly activatedEntryIds: readonly string[];
+  readonly cache: WorldInfoCache;
+  readonly runtimePlacements?: readonly SnapshotNativeWorldInfoRuntimePlacementV1[];
+  readonly captures?: Readonly<Record<string, readonly unknown[]>>;
+  readonly activationOverrides?: Readonly<Record<string, unknown>>;
+  readonly sourceFingerprint?: string;
+  readonly precomputedVectorAccepted?: boolean;
+  readonly vectorViewsEquivalent?: boolean;
+  readonly stateAfter: Readonly<Record<string, unknown>>;
+  readonly activationEvidence: readonly Readonly<Record<string, unknown>>[];
+  readonly vectorDispositions: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  readonly stats: Readonly<Record<string, unknown>>;
+}
+
 export interface SnapshotWorldInfoV1 {
   readonly books: readonly SnapshotWorldBookV1[];
   readonly entries: readonly SnapshotWorldEntryV1[];
   readonly candidates: readonly SnapshotWorldEntryV1[];
   readonly state: Readonly<Record<string, unknown>>;
+  readonly native?: SnapshotNativeWorldInfoV1;
 }
 
 export interface SnapshotDatabankChunkV1 {
@@ -1017,7 +1054,46 @@ function normalizePreset(row: RawRow, limits: Limits): SnapshotPresetV1 {
   return deepFreeze(value);
 }
 
-function normalizeMessage(row: RawRow, limits: Limits): SnapshotMessageV1 {
+function normalizeMediaParts(
+  parts: readonly NativeMediaPartProjectionV1[] | undefined,
+  limits: Limits,
+): readonly NativeMediaPartProjectionV1[] {
+  if (parts === undefined) return Object.freeze([]);
+  if (!Array.isArray(parts) || parts.length > limits.promptBlocks) {
+    throw new SnapshotLimitError("message media-part limit exceeded");
+  }
+  const allowedKeys = new Set(["kind", "mediaType", "mediaId", "mimeType", "byteLength", "sha256"]);
+  return Object.freeze(parts.map((part) => {
+    if (
+      !part
+      || typeof part !== "object"
+      || Array.isArray(part)
+      || Object.keys(part).some((key) => !allowedKeys.has(key))
+      || part.kind !== "media"
+      || (part.mediaType !== "image" && part.mediaType !== "audio")
+      || typeof part.mediaId !== "string"
+      || part.mediaId.length === 0
+      || utf8Bytes(part.mediaId) > 256
+      || typeof part.mimeType !== "string"
+      || !/^(?:image|audio)\/[a-z0-9.+-]+$/.test(part.mimeType)
+      || (part.mediaType === "image") !== part.mimeType.startsWith("image/")
+      || !Number.isSafeInteger(part.byteLength)
+      || part.byteLength < 1
+      || part.byteLength > (part.mediaType === "image" ? MAX_IMAGE_BYTES : MAX_AUDIO_BYTES)
+      || typeof part.sha256 !== "string"
+      || !/^[a-f0-9]{64}$/.test(part.sha256)
+    ) {
+      throw new SnapshotInputError("message media projection is invalid");
+    }
+    return deepFreeze({ ...part });
+  }));
+}
+
+function normalizeMessage(
+  row: RawRow,
+  limits: Limits,
+  mediaParts?: readonly NativeMediaPartProjectionV1[],
+): SnapshotMessageV1 {
   const max = limits.inputBytes;
   const swipes = safeArrayOfStrings(row.swipes, "message swipes", max);
   const swipeDatesRaw = arrayValue(row.swipe_dates, "message swipe dates", max);
@@ -1036,6 +1112,7 @@ function normalizeMessage(row: RawRow, limits: Limits): SnapshotMessageV1 {
     swipes,
     swipe_dates: swipeDates,
     extra,
+    mediaParts: normalizeMediaParts(mediaParts, limits),
     parent_message_id: typeof row.parent_message_id === "string" ? row.parent_message_id : null,
     branch_id: typeof row.branch_id === "string" ? row.branch_id : null,
     created_at: rowNumber(row, "created_at"),
@@ -1055,6 +1132,28 @@ function normalizeChat(row: RawRow, limits: Limits): SnapshotChatV1 {
     updated_at: rowNumber(row, "updated_at"),
     revision: String(row.generation_revision ?? row.revision ?? digest({ id: row.id, metadata })),
   } as SnapshotChatV1);
+}
+
+
+function normalizeStructuralMarkerValues(
+  input: Readonly<Record<string, string>> | undefined,
+  limits: Limits,
+): Readonly<Record<string, string>> {
+  if (input === undefined) return Object.freeze({});
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new SnapshotInputError("structural block values are invalid");
+  }
+  const entries = Object.entries(input);
+  if (entries.length > limits.promptBlocks) {
+    throw new SnapshotLimitError("structural block value count exceeds snapshot limit");
+  }
+  const output: Record<string, string> = {};
+  for (const [blockId, value] of entries) {
+    const id = assertId(blockId, "structural block id");
+    if (typeof value !== "string") throw new SnapshotInputError("structural block value is invalid");
+    output[id] = assertString(value, "structural block value", limits.inputBytes);
+  }
+  return deepFreeze(output);
 }
 
 function normalizeParticipant(row: RawRow | null, limits: Limits): Readonly<Record<string, unknown>> {
@@ -1179,6 +1278,41 @@ function getWorldBookIds(
   const globals = settings.globalWorldBooks;
   if (Array.isArray(globals)) for (const id of globals) push(id, "global");
   return output;
+}
+
+function normalizeNativeWorldInfo(
+  input: SnapshotWorldInfoV1,
+  limits: Limits,
+): SnapshotWorldInfoV1 {
+  if (boundedClosedDataBytes(input, limits.inputBytes) > limits.inputBytes) {
+    throw new SnapshotLimitError("native World Info projection exceeds the input limit");
+  }
+  const value = cloneClosedData(input) as SnapshotWorldInfoV1;
+  const maxEntries = limits.promptBlocks * 16;
+  if (
+    !value
+    || typeof value !== "object"
+    || !Array.isArray(value.books)
+    || !Array.isArray(value.entries)
+    || !Array.isArray(value.candidates)
+    || value.books.length > limits.promptBlocks
+    || value.entries.length > maxEntries
+    || value.candidates.length > maxEntries
+    || !value.native
+    || !Array.isArray(value.native.activatedEntryIds)
+    || !Array.isArray(value.native.activationEvidence)
+  ) {
+    throw new SnapshotInputError("native World Info projection is invalid");
+  }
+  const entryIds = new Set(value.entries.map((entry) => entry.id));
+  if (
+    value.entries.some((entry) => typeof entry.id !== "string" || typeof entry.revision !== "string")
+    || value.books.some((book) => typeof book.id !== "string" || typeof book.revision !== "string")
+    || value.native.activatedEntryIds.some((id) => typeof id !== "string" || !entryIds.has(id))
+  ) {
+    throw new SnapshotInputError("native World Info identity is invalid");
+  }
+  return deepFreeze(value);
 }
 
 function tableColumnSet(db: Database, table: "world_book_entries"): ReadonlySet<string> {
@@ -1691,9 +1825,8 @@ export function buildGenerationAssemblySnapshot(
   const chat = normalizeChat(chatRow, limits);
     const maxMessages = limits.promptBlocks * 16;
     const messagePageSize = 1;
-    const messages: SnapshotMessageV1[] = [];
+    const storedMessages: SnapshotMessageV1[] = [];
     let messageOffset = 0;
-    let messageBytes = 0;
     while (messageOffset <= maxMessages) {
       const page = rowsFor<RawRow>(
         db,
@@ -1703,15 +1836,21 @@ export function buildGenerationAssemblySnapshot(
         messageOffset,
       );
       if (page.length === 0) break;
-      if (messages.length + page.length > maxMessages) throw new SnapshotLimitError("message count limit exceeded");
+      if (storedMessages.length + page.length > maxMessages) throw new SnapshotLimitError("message count limit exceeded");
       for (const row of page) {
-        const message = normalizeMessage(row, limits);
-        messageBytes += utf8Bytes(canonical(message));
-        if (messageBytes > limits.inputBytes) throw new SnapshotLimitError("message input limit exceeded");
-        messages.push(message);
+        const rowId = typeof row.id === "string" ? row.id : "";
+        storedMessages.push(normalizeMessage(row, limits, input.mediaPartsByMessageId?.[rowId]));
       }
       messageOffset += page.length;
       if (page.length < messagePageSize) break;
+    }
+    const storedMessageIds = new Set(storedMessages.map((message) => message.id));
+    for (const messageId of Object.keys(input.mediaPartsByMessageId ?? {})) {
+      if (!storedMessageIds.has(messageId)) throw new SnapshotInputError("media projection references an unavailable message");
+    }
+    const messages = selectNativeVisibleHistory(chat, storedMessages);
+    if (utf8Bytes(canonical(messages)) > limits.inputBytes) {
+      throw new SnapshotLimitError("message input limit exceeded");
     }
     const metadata = chat.metadata;
     const selectedPresetId = input.presetId ?? (typeof input.connectionId === "string" ? null : null);
@@ -1859,7 +1998,9 @@ export function buildGenerationAssemblySnapshot(
       revision: digest(variableIdentity),
     } satisfies SnapshotVariableStateV1);
     const regexScripts = activeRegexRows(db, input.userId, chat, characterId, effectivePresetId, settings, limits);
-    const worldInfo = normalizeWorld(db, input.userId, chat, character, persona, group, settings, limits);
+    const worldInfo = input.nativeWorldInfo
+      ? normalizeNativeWorldInfo(input.nativeWorldInfo, limits)
+      : normalizeWorld(db, input.userId, chat, character, persona, group, settings, limits);
     const targetMessageId = input.targetMessageId ?? input.continueMessageId ?? null;
     const target = deepFreeze({
       generationType: input.generationType ?? "normal",
@@ -1992,6 +2133,7 @@ export function buildGenerationAssemblySnapshot(
         persona,
         character,
         group: Object.freeze(group),
+        structuralBlockValues: normalizeStructuralMarkerValues(input.structuralBlockValues, limits),
         availabilityRevision: availability.revision,
       } satisfies SnapshotParticipantV1),
       variables,

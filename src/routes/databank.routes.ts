@@ -210,7 +210,19 @@ app.post("/:id/documents/scrape", async (c) => {
       );
     });
 
-    return c.json({ ...doc, scraped: { title: scraped.title, sourceType: scraped.sourceType, contentLength: scraped.contentLength } }, 201);
+    // Match native uploads by starting ingestion only after the pending row is published.
+    databank.processDocument(userId, doc.id).catch((err) => {
+      console.error(`[databank] Background processing failed for scraped document ${doc.id}:`, err);
+    });
+
+    return c.json({
+      ...doc,
+      scraped: {
+        title: scraped.title,
+        sourceType: scraped.sourceType,
+        contentLength: scraped.contentLength,
+      },
+    }, 201);
   } catch (err: any) {
     if (err instanceof databank.ScrapeError) {
       const status = err.type === "not_found" ? 404

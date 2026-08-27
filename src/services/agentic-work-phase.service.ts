@@ -7,6 +7,7 @@ import {
 } from "./workspace-context-projection.service";
 import type {
   AssemblyChildDescriptorV1,
+  AssemblyMediaSegmentV1,
   AssemblyPlanV1,
   AssemblyProviderMessageV1,
   AssemblyResultSlotV1,
@@ -1190,6 +1191,8 @@ export interface AgenticWorkOptions {
   readonly trustedAssemblyLimits: PreparationLimitsV1;
   /** Immutable ASSEMBLE snapshot that must exactly authorize this WORK plan. */
   readonly snapshot?: GenerationAssemblySnapshotV1;
+  /** Host-only resolver for authenticated sealed current-turn media. */
+  readonly materializeMedia?: (segment: AssemblyMediaSegmentV1) => LlmMessagePart;
   readonly connectionId: string | null;
   readonly model: string;
   /** Public-safe provider identity for lifecycle projection. */
@@ -1891,6 +1894,17 @@ function normalizeCompilerAssemblyPlan(
         }
         return Object.freeze({ kind: "literal" as const, text: segment.text, bytes: segment.bytes });
       }
+      if (segment.kind === "media") {
+        return Object.freeze({
+          kind: "media" as const,
+          mediaType: segment.mediaType,
+          mediaId: segment.mediaId,
+          mimeType: segment.mimeType,
+          byteLength: segment.byteLength,
+          sha256: segment.sha256,
+          bytes: 0 as const,
+        });
+      }
       if (
         !("resultName" in segment)
         || typeof segment.resultName !== "string"
@@ -2016,7 +2030,7 @@ export async function validateAgenticAssemblyPlan(
       const segment = message.segments[segmentIndex]!;
       if (segment.kind === "literal") {
         literalBytes += segment.bytes;
-      } else {
+      } else if (segment.kind === "result_slot") {
         const slot = candidate.resultSlots.find((entry) => entry.slotIndex === segment.slotIndex);
         if (!slot) throw new AgenticWorkPhaseError("invalid_plan", "Result slot occurrence is undeclared", `messages[${messageIndex}].segments[${segmentIndex}]`);
         reservedResultBytes += slot.maxBytes;
@@ -2032,13 +2046,33 @@ export async function validateAgenticAssemblyPlan(
 function materializeAssemblyMessages(
   messages: readonly AssemblyProviderMessageV1[],
   results: ReadonlyMap<number, string>,
+  materializeMedia?: (segment: AssemblyMediaSegmentV1) => LlmMessagePart,
 ): LlmMessage[] {
   return messages.map((message) => {
-    const text = message.segments.map((segment) =>
-      segment.kind === "literal" ? segment.text : results.get(segment.slotIndex) ?? "",
-    ).join("");
+    const parts: LlmMessagePart[] = [];
+    let text = "";
+    const flushText = (): void => {
+      if (text.length === 0) return;
+      parts.push({ type: "text", text });
+      text = "";
+    };
+    for (const segment of message.segments) {
+      if (segment.kind === "literal") {
+        text += segment.text;
+      } else if (segment.kind === "result_slot") {
+        text += results.get(segment.slotIndex) ?? "";
+      } else {
+        if (!materializeMedia) {
+          throw new AgenticWorkPhaseError("invalid_plan", "Authenticated media resolver is unavailable");
+        }
+        flushText();
+        parts.push(materializeMedia(segment));
+      }
+    }
     const role: LlmMessage["role"] = message.role === "assistant" ? "assistant" : message.role === "system" || message.role === "developer" ? "system" : "user";
-    return { role, content: text };
+    if (parts.length === 0) return { role, content: text };
+    flushText();
+    return { role, content: parts };
   });
 }
 
@@ -2089,6 +2123,7 @@ function materializeWorkMessages(
   const materialized = materializeAssemblyMessages(
     [...cortexMessages, ...plan.messages, ...workPolicyMessages, ...workspaceUsageMessages],
     results,
+    options.materializeMedia,
   );
   if (options.cortexContext && materialized[0]) {
     materialized[0] = Object.freeze({

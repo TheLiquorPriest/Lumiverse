@@ -59,6 +59,17 @@ export class PresetRevisionConflictError extends Error {
 }
 
 // --- Loom Preset Assembly Types ---
+/** Prompt markers whose content and admission are resolved by native assembly. */
+export const STRUCTURAL_PROMPT_MARKERS = new Set([
+  "chat_history",
+  "world_info_before",
+  "world_info_after",
+  "char_description",
+  "char_personality",
+  "persona_description",
+  "scenario",
+  "dialogue_examples",
+]);
 
 export interface PromptVariableOption {
   id: string;
