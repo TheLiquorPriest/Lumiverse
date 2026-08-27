@@ -37,6 +37,15 @@ const fallbackPolicy: LoomRuntimePolicyV1 = {
 }
 
 function validResponse(): EffectiveRuntimePublicResponseV1 {
+  const responseOmission: NonNullable<EffectiveRuntimePublicResponseV1['responseOmission']> = {
+    version: 1,
+    surface: 'RESPONSE',
+    visibility: 'work_only',
+    reason: 'work_only',
+    omittedEntryIds: [],
+    source: [],
+    omittedPhaseInstructions: [],
+  }
   return {
     version: 1,
     chatId: 'chat-1',
@@ -57,6 +66,15 @@ function validResponse(): EffectiveRuntimePublicResponseV1 {
     defaultMode: 'response',
     requestedMode: 'response',
     effectiveMode: 'response',
+    inspection: {
+      version: 1,
+      surface: 'RESPONSE',
+      checkpoint: 'ASSEMBLE',
+      items: [],
+      effectiveEntryIds: [],
+      responseOmission,
+    },
+    responseOmission,
     runtimePolicy: structuredClone(fallbackPolicy),
     chatOverride: null,
     capabilityReadiness: {

@@ -511,6 +511,8 @@ export interface LoomPreset {
   cacheRevision?: number
   agentConfig: AgentConfigV2 | null
   agentConfigRevision: number
+  agentConfigReview: AgentConfigReview | null
+  agentSlotBindings: Record<string, string | null>
   agentTaskTemplates: AgentTaskTemplate[]
   blocks: PromptBlock[]
   source: PresetSource | null

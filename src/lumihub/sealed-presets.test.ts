@@ -59,11 +59,12 @@ describe("LumiHub sealed preset wire contract", () => {
   test("materializes exact unmarked placeholders and verifies the resolver digest", async () => {
     const content = "resolved private content";
     const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
+    const importedBlocks: unknown[] = [{ content: "{{pblock::private}}" }];
     let resolverCalls = 0;
     const materialized = await materializePortableSealedPresetImport(
       "user",
       {
-        prompt_order: [{ content: "{{pblock::private}}" }],
+        prompt_order: importedBlocks,
         metadata: {
           portableSealedPreset: {
             hubPresetId: "preset-id",

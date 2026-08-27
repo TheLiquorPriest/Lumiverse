@@ -8,6 +8,15 @@ const selectCalls: string[] = []
 const overrideCalls: Array<string | null> = []
 
 const refreshCalls: string[] = []
+const responseOmission: NonNullable<EffectiveRuntimeState['responseOmission']> = {
+  version: 1,
+  surface: 'RESPONSE',
+  visibility: 'work_only',
+  reason: 'work_only',
+  omittedEntryIds: [],
+  source: [],
+  omittedPhaseInstructions: [],
+}
 const readyDecision: NonNullable<EffectiveRuntimeState['decision']> = {
   version: 1,
   chatId: 'chat-1',
@@ -28,6 +37,15 @@ const readyDecision: NonNullable<EffectiveRuntimeState['decision']> = {
   defaultMode: 'response',
   requestedMode: 'response',
   effectiveMode: 'response',
+  inspection: {
+    version: 1,
+    surface: 'RESPONSE',
+    checkpoint: 'ASSEMBLE',
+    items: [],
+    effectiveEntryIds: [],
+    responseOmission,
+  },
+  responseOmission,
   runtimePolicy: {
     version: 1,
     authoredValue: 'response',
@@ -139,6 +157,8 @@ const mountedRoots = new Set<Root>()
 function baseState(overrides: Partial<EffectiveRuntimeState> = {}): EffectiveRuntimeState {
   return {
     decision: readyDecision,
+    inspection: readyDecision.inspection,
+    responseOmission: readyDecision.responseOmission,
     mode: 'response',
     oneTurnMode: null,
     loading: false,
@@ -717,6 +737,6 @@ describe('AgentRuntimeModeControl', () => {
       await Promise.resolve()
     })
     expect(host.querySelector('[role="alert"]')).toBeNull()
-    expect(overrideCalls).toEqual(['response', 'response'])
+    expect(overrideCalls).toEqual(['response', 'agentic'])
   })
 })

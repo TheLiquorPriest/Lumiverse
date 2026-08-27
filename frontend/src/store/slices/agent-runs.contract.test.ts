@@ -16,7 +16,6 @@ import {
   normalizeAgentRunInspectionDetailV1,
   normalizeAgentRunInspectionListV1,
   normalizeAgentRunInspectionRetryResponseV1,
-  normalizeAgentRunPublicV2,
   normalizeAgentRunStopResultV2,
   normalizePersistentWorkspace,
   normalizePersistentWorkspaceCollection,
@@ -196,6 +195,7 @@ const inspectionCorrelation = {
 function stopResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     version: 2,
+    turnId: 'turn-a',
     generationId: 'generation-a',
     status: 'accepted',
     revision: 2,
@@ -238,7 +238,7 @@ function transcriptRecord(overrides: Record<string, unknown> = {}): Record<strin
 }
 
 function loomInspection(
-  condition?: Record<string, unknown>,
+  condition?: unknown,
   effectiveText: unknown = null,
 ): Record<string, unknown> {
   return {
@@ -255,7 +255,7 @@ function loomInspection(
       effectiveText,
       required: true,
       ordinaryPromptSuppressed: true,
-      outcome: { status: 'included', effectiveIndex: 0 },
+      outcome: { status: 'included', effectiveIndex: 0, reason: 'selected' },
     }],
     effectiveEntryIds: ['loom-entry-a'],
   }
@@ -521,10 +521,24 @@ describe('strict owner inspection contracts', () => {
   })
 
   test('keeps a normal source target distinct from the committed Response target', () => {
-    const normalized = normalizeAgentRunInspectionDetailV1(inspectionDetail({
+    const detachedAttempt = {
+      ...attempt,
+      target: { ...attempt.target, messageId: null, swipeId: null },
+    }
+    const detail = inspectionDetail()
+    const activity = detail.activity
+    if (!activity || typeof activity !== 'object') throw new Error('inspection activity fixture is invalid')
+    const normalized = normalizeAgentRunInspectionDetailV1({
+      ...detail,
+      attempt: detachedAttempt,
       target: null,
+      activity: {
+        ...activity,
+        attempt: detachedAttempt,
+        target: null,
+      },
       committedTarget: { messageId: 'response-a', swipeId: 0 },
-    }))
+    })
 
     expect(normalized?.target).toBeNull()
     expect(normalized?.committedTarget).toEqual({ messageId: 'response-a', swipeId: 0 })

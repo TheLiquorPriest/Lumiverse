@@ -46,6 +46,7 @@ function phase(overrides: Partial<AgentCustomPhaseV1> = {}): AgentCustomPhaseV1 
     id: "draft",
     label: "Draft",
     instructionRefs: [sourceRef("draft-instructions")],
+    childInstructionSubsets: [],
     required: true,
     enter: { kind: "phase", value: "WORK" },
     exit: { kind: "phase", value: "WORK" },

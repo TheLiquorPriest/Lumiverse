@@ -206,6 +206,31 @@ describe('public Persistent Workspace recovery', () => {
       requestedWorkspaceId = workspaceId
       return submissions
     }
+    useStore.setState({
+      agentPersistentWorkspaceById: {
+        'workspace-a': {
+          status: 'ready',
+          availability: 'detached',
+          workspace: {
+            version: 1,
+            id: 'workspace-a',
+            userId: 'user-a',
+            chatId: null,
+            objective: 'Retain detached work',
+            metadata: { title: 'Workspace A', summary: '', labels: [], ownerNote: '' },
+            progress: { state: 'in_progress', percent: 50, summary: '', updatedAt: 1_100 },
+            state: 'active',
+            revision: 1,
+            quota: { maxTasks: 10, maxRecords: 10, maxSubmissions: 10, maxArtifacts: 10, maxPublications: 10, maxBytes: 10_000 },
+            usage: { taskCount: 0, recordCount: 0, submissionCount: 3, artifactCount: 0, publicationCount: 0, byteCount: 0 },
+            createdAt: 1_000,
+            updatedAt: 1_100,
+          },
+          error: null,
+          requestEpoch: 1,
+        },
+      },
+    })
 
     await loadPersistentWorkspaceCollection('workspace-a', 'submissions', recoveryApi, recoveryStore)
 

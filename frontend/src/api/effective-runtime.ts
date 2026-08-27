@@ -14,7 +14,6 @@ import type {
 } from '@/lib/loom/types'
 import type {
   AgentRuntimeCapabilityRequirement,
-  AgentRuntimeMode,
   AgentRuntimeRepairCode,
   ChatAgentModeWriteResponseV1,
   ChatAgentModeWriteV1,
@@ -246,7 +245,7 @@ function enumArray<T extends string>(
   value: unknown,
   values: readonly T[],
   path: string,
-  max = EFFECTIVE_RUNTIME_LIMITS.maxArrayItems,
+  max: number = EFFECTIVE_RUNTIME_LIMITS.maxArrayItems,
 ): T[] {
   if (!Array.isArray(value) || value.length > max) invalid(path, 'must be a bounded array')
   const result: T[] = []

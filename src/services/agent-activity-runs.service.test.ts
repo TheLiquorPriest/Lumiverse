@@ -1242,6 +1242,7 @@ describe("agent run inspection terminal persistence", () => {
       runId: "child-required-run",
       turnSessionId: "child-required-turn",
       generationId: "child-required-generation",
+      hostCorrelationId: "child-required-host",
       outcome: "failed",
       reason: "required_work_failure",
       terminalReceipt: {
@@ -1263,8 +1264,9 @@ describe("agent run inspection terminal persistence", () => {
       runId: "protocol-run",
       turnSessionId: "protocol-turn",
       generationId: "protocol-generation",
+      hostCorrelationId: "protocol-host",
       outcome: "failed",
-      reason: "failed",
+      reason: "invalid_input",
       terminalReceipt: {
         error: {
           code: "agentic_protocol_failure",
@@ -1276,6 +1278,7 @@ describe("agent run inspection terminal persistence", () => {
       code: "agentic_protocol_failure",
       category: "validation",
       summaryCode: "agentRun.errors.agentic_protocol_failure",
+      reason: "invalid_input",
     });
 
     const limit = persistAgentRunInspection(inspectionInput(chat.id, {
@@ -1283,6 +1286,7 @@ describe("agent run inspection terminal persistence", () => {
       runId: "child-limit-run",
       turnSessionId: "child-limit-turn",
       generationId: "child-limit-generation",
+      hostCorrelationId: "child-limit-host",
       outcome: "failed",
       reason: "budget_exhausted",
       terminalReceipt: {
@@ -1303,8 +1307,9 @@ describe("agent run inspection terminal persistence", () => {
       runId: "unknown-run",
       turnSessionId: "unknown-turn",
       generationId: "unknown-generation",
+      hostCorrelationId: "unknown-host",
       outcome: "failed",
-      reason: "failed",
+      reason: "unknown",
       terminalReceipt: {
         error: {
           code: "not_a_public_code",

@@ -17,11 +17,8 @@ import {
   COGNITION_MAX_LIST_ITEMS,
   COGNITION_MAX_PREDICATE_DEPTH,
   COGNITION_MAX_SOURCE_BLOCKS,
-  LOOM_POLICY_VERSION,
 } from "./agent-cognition";
 import {
-  LOOM_BUCKET_CHECKPOINT,
-  LOOM_BUCKET_DESTINATION,
   parseCognitionPredicate,
   parseLoomPolicyBuckets,
 } from "../services/agent-cognition.service";
@@ -1204,15 +1201,6 @@ function parseLegacyCognitionPolicy(value: unknown, path: string): LegacyAgentCo
     completionCriteria: parsePromptBlockRefs(policy.completionCriteria, `${path}.completionCriteria`),
     renderPolicy: parsePromptBlockRefs(policy.renderPolicy, `${path}.renderPolicy`),
   };
-}
-
-function parseCanonicalLoomPolicy(value: unknown, path: string): AgentLoomPolicyV1 {
-  try {
-    return parseLoomPolicyBuckets(value);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "invalid Loom policy";
-    throw new AgentConfigValidationError(path, message);
-  }
 }
 
 function parseCanonicalLoomPolicy(value: unknown, path: string): AgentLoomPolicyV1 {

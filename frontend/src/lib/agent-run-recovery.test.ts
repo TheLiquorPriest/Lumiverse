@@ -166,9 +166,18 @@ describe('exact agent run recovery', () => {
             runId: `run-${index}`,
             turnId: `turn-${index}`,
             generationId: `generation-${index}`,
+            inspectionAttemptId: `attempt-${index}`,
+            attemptLineage: { ...activeRun().attemptLineage, attemptId: `attempt-${index}` },
             sequence: index + 1,
           }))
-        : [activeRun({ runId: 'run-16', turnId: 'turn-16', generationId: 'generation-16', sequence: 17 })]
+        : [activeRun({
+            runId: 'run-16',
+            turnId: 'turn-16',
+            generationId: 'generation-16',
+            inspectionAttemptId: 'attempt-16',
+            attemptLineage: { ...activeRun().attemptLineage, attemptId: 'attempt-16' },
+            sequence: 17,
+          })]
       return {
         ...changesPayload(runs),
         ...page,

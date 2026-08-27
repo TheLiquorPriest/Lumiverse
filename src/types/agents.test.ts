@@ -421,8 +421,8 @@ describe("canonical custom Phased Instructions policy parser", () => {
 
 
 
-  test("normalizes legacy phasePolicy ingress into visible Loom buckets without a live alias", () => {
-    const parsed = parseAgentConfigV2(v2Config({
+  test("requires explicit repair for legacy phasePolicy ingress", () => {
+    expect(() => parseAgentConfigV2(v2Config({
       phasePolicy: {
         work: [{
           blockId: "legacy-work",
@@ -435,36 +435,9 @@ describe("canonical custom Phased Instructions policy parser", () => {
           expectedBlockRevision: 5,
         }],
       },
-    }));
-    const policy = parsed.runtimePolicy;
-    expect(policy?.phases).toEqual([]);
-    expect(policy?.loomPolicy?.workPolicy).toHaveLength(1);
-    expect(policy?.loomPolicy?.workPolicy[0]).toMatchObject({
-      destination: "root_work",
-      checkpoint: "WORK",
-      source: {
-        blockId: "legacy-work",
-        presetRevision: 7,
-        blockRevision: 3,
-      },
-    });
-    expect(policy?.loomPolicy?.renderPolicy[0]).toMatchObject({
-      destination: "render",
-      checkpoint: "RENDER",
-      source: {
-        blockId: "legacy-render",
-        presetRevision: 7,
-        blockRevision: 5,
-      },
-    });
-    expect(Object.hasOwn(parsed as object, "phasePolicy")).toBe(false);
-    expect(Object.keys(policy?.loomPolicy ?? {})).toEqual([
-      "version",
-      "workPolicy",
-      "workspaceUsage",
-      "completionCriteria",
-      "renderPolicy",
-    ]);
+    }))).toThrow(
+      "agentConfig.phasePolicy: legacy Loom policy requires explicit repair with current Loom source order",
+    );
   });
 
   test("does not accept a hidden fifth bucket in canonical runtime policy", () => {

@@ -1941,9 +1941,13 @@ function advanceWorkspaceRevision(execution: Pick<RuntimeExecution, "workspaceRe
  * Keep the private cognition state aligned with a successful workspace CAS that
  * cannot change cognition predicates (records, artifacts, or child assignment).
  */
+type WorkspaceCognitionRuntime = Pick<
+  AgentCognitionRuntimeV1,
+  "acceptCompletionFixedPoint" | "adoptWorkspaceMutationRevision" | "applyWorkspaceTransition"
+>;
 function advanceNonCognitionWorkspaceRevision(
   execution: Pick<RuntimeExecution, "workspaceRevision">,
-  cognitionRuntime: AgentCognitionRuntimeV1 | undefined,
+  cognitionRuntime: WorkspaceCognitionRuntime | undefined,
   workspaceRevision: number,
 ): void {
   if (!cognitionRuntime) {
@@ -2208,7 +2212,7 @@ function makeWorkspace(
   execution: RuntimeExecution,
   capabilities: WorkspaceOperationCapabilitiesV1,
   workspaceContextBytes: number,
-  cognitionRuntime?: AgentCognitionRuntimeV1,
+  cognitionRuntime?: WorkspaceCognitionRuntime,
 ): AgenticWorkspaceCapability {
   const sanitizeWorkspaceArgs = (operationArgs: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(
     Object.entries(operationArgs).filter(([key]) =>
@@ -6233,7 +6237,7 @@ export const __testing = {
   makeWorkspace: (
     execution: AgenticExecutionHandle,
     capabilities: WorkspaceOperationCapabilitiesV1,
-    cognitionRuntime?: AgentCognitionRuntimeV1,
+    cognitionRuntime?: WorkspaceCognitionRuntime,
   ) => makeWorkspace(
     requireRuntimeExecution(execution),
     capabilities,

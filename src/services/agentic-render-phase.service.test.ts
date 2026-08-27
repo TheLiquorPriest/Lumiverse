@@ -49,7 +49,10 @@ const workspace: AgenticAcceptedWorkspaceProjectionV1 = {
     sourceWorkspaceRevision: 12,
     mandatory: [],
     optional: [],
-    omissions: [],
+    omissions: [
+      { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+      { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+    ],
     literal: "",
     utf8Bytes: 0,
   },
@@ -197,8 +200,9 @@ test("keeps frozen policy messages isolated from provider mutation", async () =>
   const original = structuredClone(policy.messages);
   await runAgenticRenderPhaseV1(input(), {
     dispatch: (request) => {
-      const mutableMessages = request.messages as LlmMessage[];
-      mutableMessages[0]!.content = "provider mutation";
+      expect(Object.isFrozen(request.messages)).toBe(true);
+      expect(Object.isFrozen(request.messages[0])).toBe(true);
+      expect(Reflect.set(request.messages[0]!, "content", "provider mutation")).toBe(false);
       return response("isolated");
     },
   });
@@ -207,16 +211,25 @@ test("keeps frozen policy messages isolated from provider mutation", async () =>
 
 test("frames the accepted workspace projection as authoritative finalization facts", async () => {
   const observed: LlmMessage[] = [];
+  const acceptedLiteral = 'finding "finding-1": "Accepted finding: stable"\n';
   const accepted: AgenticAcceptedWorkspaceProjectionV1 = {
     revision: 12,
     workspaceContextProjection: {
       version: 1,
       sourceWorkspaceRevision: 12,
       mandatory: [],
-      optional: [],
-      omissions: [],
-      literal: "Accepted finding: stable",
-      utf8Bytes: new TextEncoder().encode("Accepted finding: stable").byteLength,
+      optional: [{
+        kind: "finding",
+        id: "finding-1",
+        text: "Accepted finding: stable",
+        sourceRevision: 12,
+      }],
+      omissions: [
+        { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+        { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+      ],
+      literal: acceptedLiteral,
+      utf8Bytes: new TextEncoder().encode(acceptedLiteral).byteLength,
     },
   };
   await runAgenticRenderPhaseV1(input({ acceptedWorkspace: accepted }), {
@@ -274,10 +287,10 @@ test("never dispatches WORK transcript or WORK providerTransientCarrier", async 
         return response("final");
       },
     });
-    expect(observed?.providerTransientCarrier).toBeUndefined();
+    expect(observed).not.toHaveProperty("providerTransientCarrier");
     expect(observed?.tools).toEqual([]);
-    expect(observed?.messages).toEqual(policy.messages);
-    expect(JSON.stringify(observed?.messages)).not.toContain("complete_turn");
+    expect(observed?.messages.slice(1)).toEqual([...policy.messages]);
+    expect(observed?.messages[0]?.content).toContain("final complete_turn submission was accepted");
     expect(JSON.stringify(observed?.messages)).not.toContain("private transcript");
     expect(result).toEqual(expect.objectContaining({ text: "final" }));
     expect(result).not.toHaveProperty("providerTransientCarrier");

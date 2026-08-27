@@ -25,7 +25,7 @@ interface Harness {
 
 function findActionTarget(event: Event): Element | null {
   return event.composedPath().find((node): node is Element => (
-    node instanceof Element && node.hasAttribute('data-lumiverse-regex-action')
+    node instanceof dom.window.Element && node.hasAttribute('data-lumiverse-regex-action')
   )) ?? null
 }
 

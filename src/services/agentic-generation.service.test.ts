@@ -15,7 +15,7 @@ import type { GenerationAssemblySnapshotV1, InputRevisionSetV1Local } from "./pr
 const TEST_REVISIONS: InputRevisionSetV1Local = Object.freeze({
   version: 1, revisions: [], digest: "test-revisions", entries: [],
   target: [], chat: [], messages: [], preset: [], blocks: [], config: [], slotBinding: [],
-  connection: [], endpoint: [], credential: [], participants: [], worldLore: [], settings: [],
+  connection: [], endpoint: [], credential: [], participants: [], worldLore: [], databank: [], settings: [],
   variables: [], regex: [], cognition: [], readiness: [],
 });
 

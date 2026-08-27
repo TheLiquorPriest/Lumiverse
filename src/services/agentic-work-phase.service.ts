@@ -62,7 +62,6 @@ import type {
   ProviderTransientCarrier,
   ResponsesFunctionCallOutput,
   ResponsesInputMessageItem,
-  ResponsesOutputItem,
   ToolCallResult,
   ToolDefinition,
 } from "../llm/types";
@@ -1135,6 +1134,7 @@ type AgenticPhasePlan = AssemblyPlanV1 & Readonly<{
   readonly renderPolicyMessages?: readonly AssemblyProviderMessageV1[];
   readonly customPhasePlan?: AgentRuntimePhaseCompileResultV1;
   readonly loomBlocks?: readonly LoomPromptInspectionBlockV1[];
+  readonly loomPolicy: CompilerAssemblyPlanV1["loomPolicy"];
   readonly sealedLoomPolicyMessages?: Readonly<{
     readonly workPolicy: readonly CompilerAssemblyProviderMessageV1[];
     readonly workspaceUsage: readonly CompilerAssemblyProviderMessageV1[];
@@ -1848,7 +1848,29 @@ function normalizeCompilerAssemblyPlan(
     message: CompilerAssemblyProviderMessageV1,
   ): CompilerAssemblyProviderMessageV1 => Object.freeze({
     ...message,
-    segments: Object.freeze(message.segments.map((segment) => Object.freeze({ ...segment }))),
+    segments: Object.freeze(message.segments.map((segment, segmentIndex) => {
+      if (segment.kind === "literal") {
+        if (!("bytes" in segment) || typeof segment.bytes !== "number") {
+          throw new AgenticWorkPhaseError("invalid_plan", "Compiled literal segment is missing its byte count", "messages.segments[" + segmentIndex + "]");
+        }
+        return Object.freeze({ kind: "literal" as const, text: segment.text, bytes: segment.bytes });
+      }
+      if (
+        !("resultName" in segment)
+        || typeof segment.resultName !== "string"
+        || !("maxBytes" in segment)
+        || typeof segment.maxBytes !== "number"
+      ) {
+        throw new AgenticWorkPhaseError("invalid_plan", "Compiled result segment is missing slot metadata", "messages.segments[" + segmentIndex + "]");
+      }
+      return Object.freeze({
+        kind: "result_slot" as const,
+        slotIndex: segment.slotIndex,
+        resultName: segment.resultName,
+        maxBytes: segment.maxBytes,
+        bytes: 0 as const,
+      });
+    })),
   });
   const messages = candidate.messages.map(cloneCompilerMessage);
   const providerMessages = candidate.providerMessages.map(cloneCompilerMessage);
@@ -1990,7 +2012,6 @@ function cortexContextMessageName(context: CortexSidecarAcceptedV1): string {
 }
 function inspectedPlanPolicyMessages(
   plan: AgenticPhasePlan,
-  options: AgenticWorkOptions,
   bucket: "workPolicy" | "workspaceUsage" | "completionCriteria",
   inspection: LoomPromptInspectionV1 | undefined,
   limits: PreparationLimitsV1,
@@ -2018,8 +2039,8 @@ function materializeWorkMessages(
 ): LlmMessage[] {
   const limits = lowerPreparationLimitsV1(options.trustedAssemblyLimits);
   const inspection = options.promptInspection;
-  const workPolicyMessages = inspectedPlanPolicyMessages(plan, options, "workPolicy", inspection, limits);
-  const workspaceUsageMessages = inspectedPlanPolicyMessages(plan, options, "workspaceUsage", inspection, limits);
+  const workPolicyMessages = inspectedPlanPolicyMessages(plan, "workPolicy", inspection, limits);
+  const workspaceUsageMessages = inspectedPlanPolicyMessages(plan, "workspaceUsage", inspection, limits);
   const cortexMessages: readonly AssemblyProviderMessageV1[] = options.cortexContext
     ? Object.freeze([Object.freeze({
       role: "system" as const,
@@ -2187,7 +2208,9 @@ function recordChildPhaseSubsetProvenance(
       executionStatus,
       ...(errorCode ? { errorCode } : {}),
     }),
-  }, { lifecycle: "WORK", status: executionStatus === "succeeded" ? "completed" : executionStatus === "running" ? "running" : "terminal" });
+  }, executionStatus === "succeeded"
+    ? { lifecycle: "WORK" }
+    : { lifecycle: "WORK", status: executionStatus === "running" ? "running" : "terminal" });
 }
 
 
@@ -2198,7 +2221,7 @@ function materializeCompletionCriteriaMessages(
 ): readonly LlmMessage[] {
   const limits = lowerPreparationLimitsV1(options.trustedAssemblyLimits);
   const inspection = cognition?.policySurface?.promptInspection ?? options.promptInspection;
-  const messages = inspectedPlanPolicyMessages(plan, options, "completionCriteria", inspection, limits);
+  const messages = inspectedPlanPolicyMessages(plan, "completionCriteria", inspection, limits);
   return materializeAssemblyMessages(messages, new Map());
 }
 
@@ -2227,9 +2250,6 @@ function normalizeToolResult(
   return { status: "success", serialized };
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
-}
 
 function signalStatus(signal: AbortSignal): "cancelled" | "timed_out" {
   const reason = signal.reason;
@@ -4236,7 +4256,7 @@ function requiredChildFailure(status: string, errorCode?: string): AgenticWorkEr
 }
 
 async function executeChildSchedule(
-  plan: AssemblyPlanV1,
+  plan: AgenticPhasePlan,
   options: AgenticWorkOptions,
   rootFrame: AgenticWorkFrame,
   state: WorkBudgetState,
@@ -4246,7 +4266,7 @@ async function executeChildSchedule(
 ): Promise<{ results: Map<number, string>; metadata: AgenticChildResultMetadata[]; failure?: AgenticWorkErrorCode }> {
   const results = new Map<number, string>();
   const metadata: AgenticChildResultMetadata[] = [];
-  const scheduled: Array<{ readonly descriptor: AssemblyPlanV1["children"][number]; readonly frameId: string }> = [];
+  const scheduled: Array<{ readonly descriptor: AgenticPhasePlan["children"][number]; readonly frameId: string }> = [];
   const frameIds = new Set<string>([rootFrame.frameId]);
   const reservedIds = new Set<string>([
     ...plan.children.map((descriptor) => descriptor.childId),
@@ -5915,7 +5935,6 @@ export async function runAgenticWorkPhase(
     let definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
     let providerTransientCarrier: ProviderTransientCarrier | undefined;
     let workspaceContextMessageIndex = -1;
-    let finalWorkspaceContextProjection: WorkspaceContextProjectionV1 | undefined;
     const refreshWorkspaceContext = async (
       refreshFrame: AgenticWorkFrame = rootFrame,
       refreshSignal: AbortSignal = signal,
@@ -5943,7 +5962,6 @@ export async function runAgenticWorkPhase(
         );
       }
       workspaceContextRevision = projection.sourceWorkspaceRevision;
-      finalWorkspaceContextProjection = projection;
       const contextMessage = Object.freeze({ role: "system" as const, content: projection.literal });
       if (workspaceContextMessageIndex < 0) {
         workspaceContextMessageIndex = messages.length;
@@ -7225,6 +7243,11 @@ export async function runAgenticWorkPhase(
       }
 
       if (providerTransientCarrier?.kind === "openai_responses") {
+        providerTransientCarrier = mergeWorkProviderCarrier(
+          providerTransientCarrier,
+          calls.slice(0, serializedResults.length),
+          serializedResults,
+        );
         const nativeContinuation = hasCompletion
           ? buildNativeHostContinuation(completionCriteria)
           : [];

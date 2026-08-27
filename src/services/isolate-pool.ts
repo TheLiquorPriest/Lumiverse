@@ -817,14 +817,15 @@ export class IsolatePoolV1<TRequest, TResult> {
     void drainTask.then(
       () => {
         this.draining = false;
-        const shouldDrainAgain = this.drainRequested || this.waitingCount > 0;
+        const shouldDrainAgain = this.drainRequested;
         this.drainRequested = false;
         if (!this.closed && shouldDrainAgain) this.drain();
       },
       () => {
         this.draining = false;
+        const shouldDrainAgain = this.drainRequested;
         this.drainRequested = false;
-        if (!this.closed && this.waitingCount > 0) this.drain();
+        if (!this.closed && shouldDrainAgain) this.drain();
       },
     );
   }

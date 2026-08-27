@@ -71,7 +71,6 @@ const CURSOR_TTL_SECONDS = 5 * 60;
 const RESYNC_SNAPSHOT_TTL_SECONDS = CURSOR_TTL_SECONDS;
 const MAX_SAFE_COUNTER = Number.MAX_SAFE_INTEGER;
 const MAX_RECONCILIATION_ROWS = 256;
-const TERMINAL_STATUS_SQL = "'COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED', 'TIMED_OUT'";
 const SWIPE_EXPIRY_THRESHOLD = 100_000_000_000;
 const TERMINAL_OUTBOX_LEASE_SECONDS = 30;
 const TERMINAL_OUTBOX_PROCESS_ID = randomUUID();
@@ -153,9 +152,6 @@ const WORKSPACE_SECTIONS: readonly AgentWorkspaceSectionIdV2[] = [
 const RETENTIONS = new Set<AgentWorkspaceRetentionV2>([
   "operational", "turn_terminal", "chat_lifetime",
 ]);
-const VISIBILITIES = new Set<AgentWorkspaceVisibilityV2>([
-  "owner", "participants", "public",
-]);
 
 export interface AgentRunProjectionInputV2 {
   readonly userId: string;
@@ -205,6 +201,17 @@ export interface AgentRunProjectionInputV2 {
   /** Write a terminal public projection without inspecting/rewriting an already-exact inspection. */
   readonly preserveTerminalInspection?: boolean;
 }
+type AgentRunNormalizationInputV2 = Omit<
+  AgentRunProjectionInputV2,
+  "targetMessageId" | "targetSwipeId" | "attemptLineage" | "terminalHandoff" | "omission"
+> & {
+  readonly targetMessageId?: unknown;
+  readonly targetSwipeId?: unknown;
+  readonly attemptLineage?: unknown;
+  readonly terminalHandoff?: unknown;
+  readonly omission?: unknown;
+};
+
 export interface AgentRunReceiptRepairOptions {
   readonly reason?: string | null;
   readonly error?: AgentRunProjectionInputV2["error"];
@@ -515,6 +522,22 @@ const WORK_OUTCOMES = new Set<AgentRunPublicOutcomeV2>([
 ]);
 type CanonicalTerminalCause = "stopped" | "exhausted" | "failed";
 
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isAgentRunPublicPhase(value: unknown): value is AgentRunPublicPhaseV2 {
+  return typeof value === "string" && WORK_PHASES.has(value as AgentRunPublicPhaseV2);
+}
+
+function isAgentRunPublicStatus(value: unknown): value is AgentRunPublicStatusV2 {
+  return typeof value === "string" && WORK_STATUSES.has(value as AgentRunPublicStatusV2);
+}
+
+function isAgentRunPublicOutcome(value: unknown): value is AgentRunPublicOutcomeV2 {
+  return typeof value === "string" && WORK_OUTCOMES.has(value as AgentRunPublicOutcomeV2);
+}
+
 function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
   if (typeof value !== "string") return null;
   const code = value.trim().toLowerCase();
@@ -538,14 +561,14 @@ function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
   return "failed";
 }
 
-function terminalCodeForInput(input: AgentRunProjectionInputV2, existing?: AgentRunPublicV2): unknown {
+function terminalCodeForInput(input: AgentRunNormalizationInputV2, existing?: AgentRunPublicV2): unknown {
   if (input.error !== undefined) {
     return input.error && typeof input.error === "object" ? input.error.code : undefined;
   }
   return existing?.error?.code;
 }
 
-function reasonCodeForInput(input: AgentRunProjectionInputV2, existing?: AgentRunPublicV2): unknown {
+function reasonCodeForInput(input: AgentRunNormalizationInputV2, existing?: AgentRunPublicV2): unknown {
   return input.reason === undefined ? existing?.reason : input.reason;
 }
 
@@ -580,7 +603,7 @@ function storedStateFromCanonical(
 }
 
 function normalizeInputState(
-  input: AgentRunProjectionInputV2,
+  input: AgentRunNormalizationInputV2,
   existing?: AgentRunPublicV2,
 ): StoredRunState {
   if (input.status !== undefined) return normalizeStoredState(input.status);
@@ -627,10 +650,7 @@ function statusForStoredState(
 }
 
 function normalizeWorkPhase(value: unknown, state: StoredRunState): AgentRunPublicPhaseV2 {
-  if (typeof value === "string" && WORK_PHASES.has(value as AgentRunPublicPhaseV2)) {
-    return value as AgentRunPublicPhaseV2;
-  }
-  return phaseForStoredState(state);
+  return isAgentRunPublicPhase(value) ? value : phaseForStoredState(state);
 }
 
 function normalizeWorkStatus(
@@ -639,10 +659,9 @@ function normalizeWorkStatus(
   cancelling = false,
   terminalCode?: unknown,
 ): AgentRunPublicStatusV2 {
-  if (typeof value === "string" && WORK_STATUSES.has(value as AgentRunPublicStatusV2)) {
-    return value as AgentRunPublicStatusV2;
-  }
-  return statusForStoredState(state, cancelling, terminalCode);
+  return isAgentRunPublicStatus(value)
+    ? value
+    : statusForStoredState(state, cancelling, terminalCode);
 }
 
 function normalizeWorkOutcome(
@@ -653,10 +672,7 @@ function normalizeWorkOutcome(
   const derived = outcomeForStoredState(state, terminalCode);
   if (derived !== null) return derived;
   if (value === null) return null;
-  if (typeof value === "string" && WORK_OUTCOMES.has(value as AgentRunPublicOutcomeV2)) {
-    return value as AgentRunPublicOutcomeV2;
-  }
-  return null;
+  return isAgentRunPublicOutcome(value) ? value : null;
 }
 
 function normalizeReason(value: unknown, state: StoredRunState, outcome: AgentRunPublicOutcomeV2 | null): string | null {
@@ -696,7 +712,7 @@ function normalizeTargetIdentity(
 }
 
 function normalizeAttemptLineage(
-  input: AgentRunProjectionInputV2,
+  input: AgentRunNormalizationInputV2,
   chatId: string,
   generationType: AgentRunGenerationTypeV1,
   target: AgentRunTargetV1 | null,
@@ -862,23 +878,36 @@ function mapCompatibilityLifecycle(run: AgentRunPublicV2): "queued" | "running" 
   return "failed";
 }
 
-function storedStateForRun(run: AgentRunPublicV2): StoredRunState {
-  if (run.workStatus === "terminal") {
-    if (run.workOutcome === "completed") return "COMMITTED";
-    if (run.workOutcome === "stopped") {
-      return terminalCauseForCode(run.error?.code) === "failed" ? "FAILED" : "CANCELLED";
+function storedStateForPublicProjection(
+  workPhase: AgentRunPublicPhaseV2,
+  workStatus: AgentRunPublicStatusV2,
+  workOutcome: AgentRunPublicOutcomeV2 | null,
+  terminalCode?: unknown,
+): StoredRunState {
+  if (workStatus === "terminal") {
+    if (workOutcome === "completed") return "COMMITTED";
+    if (workOutcome === "stopped") {
+      return terminalCauseForCode(terminalCode) === "failed" ? "FAILED" : "CANCELLED";
     }
-    if (run.workOutcome === "exhausted") return "EXHAUSTED";
+    if (workOutcome === "exhausted") return "EXHAUSTED";
     return "FAILED";
   }
-  if (run.workPhase === "ADMIT" || run.workPhase === "ASSEMBLE") return "ASSEMBLE";
-  if (run.workPhase === "WORK") return "WORK";
-  if (run.workPhase === "PREPARE_COMMIT") return "COMPLETE";
-  if (run.workPhase === "RENDER") return "RENDER";
-  if (run.workPhase === "COMMIT") return "COMMITTING";
+  if (workPhase === "ADMIT" || workPhase === "ASSEMBLE") return "ASSEMBLE";
+  if (workPhase === "WORK") return "WORK";
+  if (workPhase === "PREPARE_COMMIT") return "COMPLETE";
+  if (workPhase === "RENDER") return "RENDER";
+  if (workPhase === "COMMIT") return "COMMITTING";
   return "FAILED";
 }
 
+function storedStateForRun(run: AgentRunPublicV2): StoredRunState {
+  return storedStateForPublicProjection(
+    run.workPhase,
+    run.workStatus,
+    run.workOutcome,
+    run.error?.code,
+  );
+}
 function compatibilitySnapshot(run: AgentRunPublicV2): PersistAgentActivityRunInput["snapshot"] {
   const lifecycle = mapCompatibilityLifecycle(run);
   return {
@@ -907,7 +936,7 @@ function compatibilitySnapshot(run: AgentRunPublicV2): PersistAgentActivityRunIn
 }
 
 function normalizeRun(
-  input: AgentRunProjectionInputV2,
+  input: AgentRunNormalizationInputV2,
   sequence: number,
   revision: number,
   existing?: AgentRunPublicV2,
@@ -977,13 +1006,13 @@ function normalizeRun(
     const node = normalizeNode(sourceActivity[index], index, workPhase);
     if (node) activity.push(node);
   }
+  const inputOmission = isRecordValue(input.omission) ? input.omission : null;
   const normalizedOmittedNodeCount = boundedCounter(
-    (input.omission && typeof input.omission.omittedNodeCount === "number"
-      ? input.omission.omittedNodeCount : 0)
+    (typeof inputOmission?.omittedNodeCount === "number" ? inputOmission.omittedNodeCount : 0)
       + Math.max(0, sourceActivity.length - MAX_NODES),
   );
   const omission: AgentOmissionMarkerV2 = {
-    ...normalizeOmission(input.omission),
+    ...normalizeOmission(inputOmission),
     omittedNodeCount: normalizedOmittedNodeCount,
   };
   const startedAt = fallbackStartedAt;
@@ -3205,8 +3234,13 @@ function parseResyncSnapshotRun(
   snapshotSequence: number,
 ): AgentRunPublicV2 | null {
   try {
-    const parsed = JSON.parse(row.run_json) as Partial<AgentRunPublicV2>;
+    const decoded: unknown = JSON.parse(row.run_json);
+    if (!isRecordValue(decoded)) return null;
+    const parsed = decoded;
     const generationType = normalizeGenerationType(parsed.generationType);
+    const workOutcome = parsed.workOutcome === null
+      ? null
+      : isAgentRunPublicOutcome(parsed.workOutcome) ? parsed.workOutcome : undefined;
     if (
       parsed.version !== 2
       || parsed.chatId !== chatId
@@ -3216,52 +3250,68 @@ function parseResyncSnapshotRun(
       || !validId(parsed.turnId)
       || !validId(parsed.generationId)
       || !generationType
-      || typeof parsed.workPhase !== "string"
-      || !WORK_PHASES.has(parsed.workPhase as AgentRunPublicPhaseV2)
-      || typeof parsed.workStatus !== "string"
-      || !WORK_STATUSES.has(parsed.workStatus as AgentRunPublicStatusV2)
-      || parsed.workOutcome !== null
-      && (typeof parsed.workOutcome !== "string"
-        || !WORK_OUTCOMES.has(parsed.workOutcome as AgentRunPublicOutcomeV2))
-      || !Number.isSafeInteger(parsed.sequence)
+      || !isAgentRunPublicPhase(parsed.workPhase)
+      || !isAgentRunPublicStatus(parsed.workStatus)
+      || workOutcome === undefined
+      || !isSafeResyncCursorNumber(parsed.sequence)
       || parsed.sequence < 1
       || parsed.sequence > snapshotSequence
-      || !Number.isSafeInteger(parsed.revision)
+      || !isSafeResyncCursorNumber(parsed.revision)
       || parsed.revision < 1
-      || !Number.isSafeInteger(parsed.startedAt)
-      || parsed.startedAt < 0
-      || !Number.isSafeInteger(parsed.updatedAt)
-      || parsed.updatedAt < 0
+      || !isSafeResyncCursorNumber(parsed.startedAt)
+      || !isSafeResyncCursorNumber(parsed.updatedAt)
       || parsed.updatedAt !== row.updated_at
     ) return null;
-    const candidate = parsed as AgentRunPublicV2;
-    const storedState = storedStateForRun(candidate);
+    const target = isRecordValue(parsed.target) ? parsed.target : null;
+    const parsedError: AgentRunProjectionInputV2["error"] | undefined = isRecordValue(parsed.error)
+      ? {
+          code: parsed.error.code,
+          category: parsed.error.category,
+          summaryCode: parsed.error.summaryCode,
+          recoveryEligible: parsed.error.recoveryEligible,
+          recoveryAction: parsed.error.recoveryAction,
+          target: parsed.error.target,
+          workPhase: parsed.error.workPhase,
+          workStatus: parsed.error.workStatus,
+          workOutcome: parsed.error.workOutcome,
+          reason: parsed.error.reason,
+          omissionCount: parsed.error.omissionCount,
+          inspectionAttemptId: parsed.error.inspectionAttemptId,
+          retryable: parsed.error.retryable,
+        }
+      : parsed.error === null ? null : undefined;
+    const storedState = storedStateForPublicProjection(
+      parsed.workPhase,
+      parsed.workStatus,
+      workOutcome,
+      parsedError?.code,
+    );
     const canonical = normalizeRun({
       userId,
       chatId,
-      turnId: candidate.turnId,
-      generationId: candidate.generationId,
+      turnId: parsed.turnId,
+      generationId: parsed.generationId,
       generationType,
-      targetMessageId: candidate.target?.messageId ?? null,
-      targetSwipeId: candidate.target?.swipeId ?? null,
+      targetMessageId: target?.messageId ?? null,
+      targetSwipeId: target?.swipeId ?? null,
       status: storedState,
       phase: storedState,
-      workPhase: candidate.workPhase,
-      workStatus: candidate.workStatus,
-      workOutcome: candidate.workOutcome,
-      reason: candidate.reason,
-      attemptLineage: candidate.attemptLineage,
-      revision: candidate.revision,
-      startedAt: candidate.startedAt,
-      updatedAt: candidate.updatedAt,
-      activity: candidate.activity,
-      usage: candidate.usage,
-      error: candidate.error ?? null,
-      terminalHandoff: candidate.terminalHandoff ?? null,
-      omission: candidate.omission,
-    }, candidate.sequence, candidate.revision);
-    if (!canonical || JSON.stringify(canonical) !== JSON.stringify(candidate)) return null;
-    return candidate;
+      workPhase: parsed.workPhase,
+      workStatus: parsed.workStatus,
+      workOutcome,
+      reason: parsed.reason,
+      attemptLineage: parsed.attemptLineage,
+      revision: parsed.revision,
+      startedAt: parsed.startedAt,
+      updatedAt: parsed.updatedAt,
+      activity: parsed.activity,
+      usage: parsed.usage,
+      error: parsedError,
+      terminalHandoff: parsed.terminalHandoff,
+      omission: parsed.omission,
+    }, parsed.sequence, parsed.revision);
+    if (!canonical || JSON.stringify(canonical) !== JSON.stringify(parsed)) return null;
+    return canonical;
   } catch {
     return null;
   }

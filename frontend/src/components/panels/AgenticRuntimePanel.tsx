@@ -1126,8 +1126,8 @@ function reviewSlotId(item: AgentConfigRepairItem): string | null {
       : null
   return prefix && item.id.startsWith(prefix) ? item.id.slice(prefix.length) : null
 }
-function revisePromptBlockContent(block: PromptBlock, content: string): PromptBlock {
-  if (content === block.content) return block
+function revisePromptBlockContent(block: PromptBlock, content: unknown): PromptBlock {
+  if (typeof content !== 'string' || content === block.content) return block
   const currentRevision = block.revision ?? 1
   if (!isCanonicalBlockRevision(currentRevision)
     || currentRevision === Number.MAX_SAFE_INTEGER) {
@@ -1336,12 +1336,6 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   const draftSlotBindings = draft.slotBindings && typeof draft.slotBindings === 'object'
     ? draft.slotBindings
     : {}
-  const draftMainToolIds = Array.isArray(draftConfigRecord.mainToolIds)
-    ? draftConfigRecord.mainToolIds.filter((toolId): toolId is CoreAgentToolId => CORE_AGENT_TOOL_IDS.includes(toolId as CoreAgentToolId))
-    : []
-  const draftConnectionSlots = Array.isArray(draftConfigRecord.connectionSlots)
-    ? draftConfigRecord.connectionSlots
-    : []
   const draftTaskTemplates = draft.taskTemplates
   const draftAllowedModes = draft.config.allowedModes
   const draftLoomPolicy = useMemo(
@@ -3580,7 +3574,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
               <div className={styles.formGrid}><label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.id')}</span><input className={styles.input} disabled={draftControlsLocked} value={template.id} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, id: event.target.value }))} /></label><label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.label')}</span><input className={styles.input} value={template.label ?? ''} maxLength={AGENTIC_LABEL_MAX_LENGTH} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, label: event.target.value }))} /></label></div>
               <label className={styles.field}><span className={styles.fieldLabel}>{t('tasks.description')}</span><textarea className={styles.textarea} value={template.description ?? ''} maxLength={AGENTIC_DESCRIPTION_MAX_BYTES} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, description: event.target.value }))} /></label>
               <label className={styles.settingRow}><span><strong>{t('tasks.required')}</strong><small>{t('tasks.requiredHint')}</small></span><input type="checkbox" checked={template.required} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, required: event.target.checked }))} /></label>
-              <fieldset className={styles.fieldset}><legend className={styles.fieldLabel}>{t('tasks.dependencies')}</legend><div className={styles.optionList}>{draft.taskTemplates.filter((_candidate, candidateIndex) => candidateIndex !== index).filter(isAgentTaskTemplate).map((candidate) => <label className={styles.listChoice} key={candidate.id}><input type="checkbox" checked={(template.dependencies ?? []).includes(candidate.id)} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, dependencies: event.target.checked ? [...(current.dependencies ?? []), candidate.id] : (current.dependencies ?? []).filter((id) => id !== candidate.id) }))} /><span><strong>{candidate.label || candidate.id}</strong><small>{candidate.id}</small></span></label>)}</div></fieldset>
+              <fieldset className={styles.fieldset}><legend className={styles.fieldLabel}>{t('tasks.dependencies')}</legend><div className={styles.optionList}>{draft.taskTemplates.filter((_candidate, candidateIndex) => candidateIndex !== index).filter((candidate) => isAgentTaskTemplate(candidate)).map((candidate) => <label className={styles.listChoice} key={candidate.id}><input type="checkbox" checked={(template.dependencies ?? []).includes(candidate.id)} onChange={(event) => updateTaskTemplate(index, (current) => ({ ...current, dependencies: event.target.checked ? [...(current.dependencies ?? []), candidate.id] : (current.dependencies ?? []).filter((id) => id !== candidate.id) }))} /><span><strong>{candidate.label || candidate.id}</strong><small>{candidate.id}</small></span></label>)}</div></fieldset>
               <PredicateEditor value={template.activation ?? { kind: 'phase', value: 'WORK' }} taskTemplateIds={taskTemplateIds} disabled={draftControlsLocked} onChange={(activation) => updateTaskTemplate(index, (current) => ({ ...current, activation }))} />
               <button type="button" className={styles.dangerButton} onClick={() => removeTaskTemplate(index)}><Trash2 size={16} aria-hidden="true" /> {t('tasks.remove')}</button>
             </div>
@@ -3773,7 +3767,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
             <strong>{t('save.conflict')}</strong>
             <p>{t('save.conflictHint')}</p>
             {conflictRecoveryState === 'error' && <p>{t('save.reloadError')}</p>}
-            <button type="button" className={styles.button} onClick={retryEditorLoad} disabled={saveState === 'saving'}>
+            <button type="button" className={styles.button} onClick={retryEditorLoad}>
               <RefreshCw size={16} aria-hidden="true" />
               {t('load.retry')}
             </button>

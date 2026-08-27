@@ -191,6 +191,7 @@ const sourceDeletedInspection: AgentRunInspectionDetailV1 = {
   },
   error: null,
   promptEvidence: [],
+  renderCrossings: [],
   cortexReceipts: [],
   councilReceipts: [],
   workspaceAssociations: [{
@@ -346,6 +347,7 @@ const boundedInspection: AgentRunInspectionDetailV1 = {
     content: `prompt-${index}`,
     contentDigest: `digest-${index}`,
     omissionReason: null,
+    nativeProvenance: null,
     loomInspection: null,
   })),
   markers: Array.from({ length: 40 }, (_, index): AgentInspectionMarkerV1 => ({
@@ -480,7 +482,7 @@ test('uses a stable workspace association when the historical chat is deleted', 
     configurable: true,
     value: domWindow.navigator,
   })
-  const writeText = mock(() => Promise.reject(new Error('clipboard unavailable')))
+  const writeText = mock((): Promise<void> => Promise.reject(new Error('clipboard unavailable')))
   Object.defineProperty(domWindow.navigator, 'clipboard', {
     configurable: true,
     value: { writeText },

@@ -49,7 +49,7 @@ function parsePromptAssemblyResponse(
   if (isIsolateResponseEnvelopeV1(message) && message.requestId === job.requestId) {
     if (message.type === "result") return message.result as AssemblyResult;
     const error = new IsolatePoolError(
-      isPreparationFailureCode(message.code) ? message.code : "worker_malformed",
+      isPreparationFailureCode(message.code) ? message.code : "worker_unavailable",
       message.error,
       { remote: true },
     );

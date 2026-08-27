@@ -63,8 +63,6 @@ function config(): Record<string, unknown> {
       timeoutMs: 5000,
     }],
     connectionSlots: [],
-    phasePolicy: { work: [], render: [] },
-    cognitionPolicy: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
   };
 }
 function nestedData(depth: number): Record<string, unknown> {
@@ -257,7 +255,8 @@ describe("GenerationAssemblySnapshotV1", () => {
     };
     const bound = buildGenerationAssemblySnapshot({ ...snapshotInput, forcePresetId: false });
     expect(bound.blocks.find((block) => block.id === "producer")?.enabled).toBe(false);
-    expect(bound.variables.effective?.values.fn_require_child).toBe(1);
+    expect(bound.variables.profile).toEqual({ producer: { fn_require_child: 1 } });
+    expect(bound.variables.effective?.values.fn_require_child).toBeUndefined();
     const initial = buildGenerationAssemblySnapshot(snapshotInput);
     const rebuilt = buildGenerationAssemblySnapshot({ ...snapshotInput, db });
     expect(initial.blocks.find((block) => block.id === "producer")?.enabled).toBe(true);
@@ -322,7 +321,8 @@ describe("GenerationAssemblySnapshotV1", () => {
     });
     expect(lasting.participants.persona).not.toBeNull();
     expect(lasting.blocks.find((block) => block.id === "producer")?.enabled).toBe(false);
-    expect(lasting.variables.effective?.values.fn_require_child).toBe(1);
+    expect(lasting.variables.profile).toEqual({ producer: { fn_require_child: 1 } });
+    expect(lasting.variables.effective?.values.fn_require_child).toBeUndefined();
     expect(lasting.variables.revision).not.toBe(temporary.variables.revision);
     db.close();
   });
@@ -924,7 +924,7 @@ describe("strict assembly plan", () => {
     const staleOptionalWorkPolicy = {
       ...canonicalWorkPolicy,
       id: "zzz-stale-workPolicy",
-      source: { ...canonicalWorkPolicy.source, promptOrder: existing.length + 100 },
+      source: { ...canonicalWorkPolicy.source, blockId: "stale-policy-work", promptOrder: existing.length + 100 },
     };
     const cognitionPolicy = {
       version: 1 as const,
@@ -938,22 +938,20 @@ describe("strict assembly plan", () => {
       policies: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
       templates: [],
     }, source);
-    const canonicalConfig = { ...config() };
-    delete canonicalConfig.phasePolicy;
-    delete canonicalConfig.cognitionPolicy;
     const snapshot = buildGenerationAssemblySnapshot({
       assemblySurface: "WORK",
       userId: "user-1",
       chatId: "chat-1",
       presetId: "preset-1",
       agentConfig: {
-        ...canonicalConfig,
+        ...config(),
         runtimePolicy: {
           version: 1,
           authority: "loom",
           scope: "preset",
           defaultMode: "agentic",
           loomPolicy: cognitionPolicy,
+          phases: [],
         },
       },
       cognitionGraph: graph,
@@ -973,6 +971,17 @@ describe("strict assembly plan", () => {
           presetRevision: 7,
           blockRevision: 1,
           promptOrder: existing.length,
+        },
+      }, {
+        id: "zzz-stale-workPolicy",
+        destination: "root_work",
+        checkpoint: "WORK",
+        source: {
+          kind: "loom_block",
+          blockId: "stale-policy-work",
+          presetRevision: 7,
+          blockRevision: 1,
+          promptOrder: existing.length + 100,
         },
       }],
       workspaceUsage: [{
@@ -1023,7 +1032,7 @@ describe("strict assembly plan", () => {
       },
     };
     expect(() => validateAssemblyPlanV1(forgedCompletionPhase, plan.limits)).toThrow(/Cognition evidence/i);
-    await expect(validateAssemblyPlanAgainstSnapshotV1(forgedCompletionPhase, snapshot)).rejects.toThrow(/Cognition policy source binding/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(forgedCompletionPhase, snapshot)).rejects.toThrow(/Cognition evidence does not match phase message order or accounting/i);
     expect(() => validateAssemblyPlanV1(plan, plan.limits)).not.toThrow();
     await expect(validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).resolves.toBeUndefined();
     db.close();
@@ -1181,13 +1190,12 @@ describe("strict assembly plan", () => {
 
   test("rejects duplicate phase block references across policy sections", async () => {
     const plan = await compiledAssemblyPlan();
-    const duplicate = policyMessage("duplicate");
+    const entry = policyEntry("duplicate");
     const forged = {
-      ...withWorkPolicyEntries(plan, [policyEntry("duplicate")]),
-      workPolicyMessages: [duplicate],
-      workspaceUsageMessages: [duplicate],
+      ...plan,
+      loomPolicy: { ...plan.loomPolicy, workPolicy: [entry], workspaceUsage: [entry] },
     };
-    expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/cognition policy|invalid/i);
+    expect(() => validateAssemblyPlanV1(forged, plan.limits)).toThrow(/Assembly Loom policy is invalid/i);
   });
   test("rejects malformed worker requests before compile dispatch", async () => {
     expect(() => parseCompileAgentAssemblyRequest({

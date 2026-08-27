@@ -63,8 +63,16 @@ export type PortableAgentConfigV1 = Omit<AgentConfigV2, 'version' | 'cognitionPo
   /** Optional bounded legacy repair data; never an executable authority. */
   cognitionPolicy?: unknown
 }
-const PORTABLE_ENCODER = new TextEncoder()
 
+export interface PortableAgenticRuntimeEnvelopeV1 {
+  version: 1
+  agentConfig: PortableAgentConfigV1 | null
+  taskTemplates: AgentTaskTemplate[]
+  /** Backend compatibility alias; parsing moves this into agentConfig.runtimePolicy. */
+  runtimePolicy?: AgentRuntimePolicyV1 | null
+}
+
+const PORTABLE_ENCODER = new TextEncoder()
 
 const PORTABLE_AGENT_RUNTIME_REQUIRED_KEYS = [
   'version',
@@ -1985,8 +1993,9 @@ export function unmarshalPreset(preset: Preset): LoomPreset {
   const params = preset.parameters || {}
   const prompts = preset.prompts || {}
   const meta = preset.metadata || {}
+  // Hydration accepts backend-owned legacy rows; portable admission validates
+  // prompt graphs before they can enter through an import or create boundary.
   const rawBlocks = preset.prompt_order === undefined ? [] : preset.prompt_order
-  assertPortablePromptBlocks(rawBlocks)
   const portableSealedPreset = meta.portableSealedPreset
   if (portableSealedPreset !== undefined && portableSealedPreset !== null) {
     assertPortableSealedDescriptor(portableSealedPreset)
@@ -2030,7 +2039,8 @@ export function unmarshalPreset(preset: Preset): LoomPreset {
 }
 
 export function marshalUpdate(loom: LoomPreset): UpdatePresetInput {
-  assertPortablePromptBlocks(loom.blocks)
+  // Existing presets can contain legacy identities and larger prompt graphs.
+  // Their editor path validates every changed public graph before this update.
   const portableSealedPreset = loom.portableSealedPreset ?? null
   if (portableSealedPreset !== null) {
     assertPortableSealedDescriptor(portableSealedPreset)

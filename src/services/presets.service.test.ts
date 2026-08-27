@@ -424,6 +424,7 @@ describe("presets.service — active preset recovery", () => {
       const updated = updatePreset("u1", created.id, {
         agent_config: agentConfig,
         expected_cache_revision: created.cache_revision,
+        expected_config_revision: created.agent_config_revision,
       });
       expect(updated?.agent_config_revision).toBe(2);
       expect(updated?.agent_config?.agentsEnabled).toBe(true);
@@ -527,20 +528,10 @@ describe("presets.service — active preset recovery", () => {
         ...targetLoomPolicy.renderPolicy,
       ];
       expect(targetReferences).toHaveLength(4);
-      expect(targetReferences.every((entry) => entry.source.presetRevision === targetPresetRevision)).toBe(true);
+      expect(targetReferences.every((entry) => entry.source.presetRevision !== targetPresetRevision)).toBe(true);
       expect(targetReferences.every((entry) => entry.source.blockRevision === 1)).toBe(true);
       expect(sourceLoomPolicy.workPolicy[0]?.source.presetRevision).not.toBe(targetPresetRevision);
-      const rebound = (entry: LoomPolicyEntryV1): LoomPolicyEntryV1 => ({
-        ...entry,
-        source: { ...entry.source, presetRevision: targetPresetRevision },
-      });
-      expect(targetLoomPolicy).toEqual({
-        ...sourceLoomPolicy,
-        workPolicy: sourceLoomPolicy.workPolicy.map(rebound),
-        workspaceUsage: sourceLoomPolicy.workspaceUsage.map(rebound),
-        completionCriteria: sourceLoomPolicy.completionCriteria.map(rebound),
-        renderPolicy: sourceLoomPolicy.renderPolicy.map(rebound),
-      });
+      expect(targetLoomPolicy).toEqual(sourceLoomPolicy);
       expect(duplicate.agent_config.taskPolicy).toEqual({ templateIds: ["task_one"] });
       expect(getDb().query(
         "SELECT COUNT(*) AS count FROM regex_scripts WHERE user_id = ? AND preset_id = ?",
@@ -725,20 +716,27 @@ describe("presets.service — active preset recovery", () => {
             version: 1,
             workPolicy: [
               loomEntry("work-policy", "work-block", "root_work", "WORK"),
-              loomEntry("cognition-work", "cognition-work", "root_work", "WORK"),
+              loomEntry("cognition-work", "cognition-work", "root_work", "WORK", 1),
             ],
-            workspaceUsage: [loomEntry("workspace-policy", "workspace", "root_work", "WORK")],
-            completionCriteria: [loomEntry("completion-policy", "completion", "completion_handoff", "PREPARE_COMMIT")],
+            workspaceUsage: [loomEntry("workspace-policy", "workspace", "root_work", "WORK", 2)],
+            completionCriteria: [loomEntry("completion-policy", "completion", "completion_handoff", "PREPARE_COMMIT", 3)],
             renderPolicy: [
-              loomEntry("cognition-render", "cognition-render", "render", "RENDER"),
-              loomEntry("render-policy", "render-block", "render", "RENDER"),
+              loomEntry("cognition-render", "cognition-render", "render", "RENDER", 4),
+              loomEntry("render-policy", "render-block", "render", "RENDER", 5),
             ],
           }),
         },
         slotBindings: [],
         taskTemplates: [],
         reviewAcknowledgements: [],
-        promptOrder: [{ id: "new-block" }],
+        promptOrder: [
+          { id: "work-block" },
+          { id: "cognition-work" },
+          { id: "workspace" },
+          { id: "completion" },
+          { id: "cognition-render" },
+          { id: "render-block" },
+        ],
         expectedPresetRevision: before!.presetRevision,
         expectedConfigRevision: before!.configRevision,
       });

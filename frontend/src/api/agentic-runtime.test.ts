@@ -20,6 +20,7 @@ import type {
   LoomPreset,
   PromptBlock,
 } from '@/lib/loom/types'
+import type { Preset } from '@/types/api'
 
 type DraftWithQuarantine = AgenticRuntimeSaveDraft & {
   quarantinedProfiles?: AgenticRuntimeQuarantineItem[]
@@ -54,6 +55,22 @@ function json(body: unknown, status = 200): Response {
   })
 }
 
+function savedPreset(): Preset {
+  return {
+    id: 'preset-1',
+    name: 'Runtime preset',
+    provider: 'loom',
+    engine: 'classic',
+    parameters: {},
+    prompt_order: [],
+    prompts: {},
+    metadata: {},
+    created_at: 1,
+    updated_at: 1,
+    cache_revision: 9,
+  }
+}
+
 function installApiFixture(editor: unknown = editorProjection()): void {
   globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
@@ -61,7 +78,7 @@ function installApiFixture(editor: unknown = editorProjection()): void {
     const path = url.pathname.replace('/api/v1', '')
     if (path === '/presets/preset-1/agent-config' && init?.method === 'PUT') {
       return json({
-        preset: {},
+        preset: savedPreset(),
         editor: editorProjection(),
       })
     }

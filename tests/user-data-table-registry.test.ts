@@ -52,7 +52,35 @@ describe("archive table registry", () => {
     db.close();
   });
   
-  test("registers the migrated Weaver people table with account and session edges", () => { $$$ });
+  test("registers the migrated Weaver people table with account and session edges", () => {
+    expect(getArchiveTableSpec("weaver_people")).toEqual({
+      table: "weaver_people",
+      kind: "canonical",
+      owner: { kind: "direct", column: "user_id" },
+      primaryKey: ["id"],
+      uniqueKeys: [["id"]],
+      parentEdges: [
+        {
+          column: "user_id",
+          parentTable: "user",
+          parentColumn: "id",
+          nullable: false,
+          onMissing: "reject",
+        },
+        {
+          column: "session_id",
+          parentTable: "weaver_sessions",
+          parentColumn: "id",
+          nullable: false,
+          onMissing: "reject",
+        },
+      ],
+      mergePolicy: "upsert",
+      authorityReset: "preserve",
+      fileRefs: [],
+    });
+    expect(getArchiveTableSpec("weaver_cast")).toBeUndefined();
+  });
   test("computes parent-first order from declared canonical edges", () => {
     const order = getCanonicalImportOrder();
     const positions = new Map(order.map((table, index) => [table, index]));

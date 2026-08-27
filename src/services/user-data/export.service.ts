@@ -23,7 +23,6 @@ import {
 import type { WriteStream } from "fs";
 import { ZipArchive, type ArchiverError } from "archiver";
 import { PassThrough, Writable } from "stream";
-import { once } from "events";
 import { createHash } from "crypto";
 import { join, resolve } from "path";
 import { eventBus } from "../../ws/bus";
@@ -630,13 +629,15 @@ function canonicalizeSealedPresetRow(raw: Record<string, any>): Record<string, a
       continue;
     }
     const next = readSealedManifest(candidate.value, candidate.label);
-    if (manifest && !sealedManifestEqual(manifest, next)) {
+    if (manifest === null) {
+      manifest = next;
+      continue;
+    }
+    if (!sealedManifestEqual(manifest, next)) {
       throw new Error("sealed preset metadata contains inconsistent manifests");
     }
-    if (!manifest) {
-      manifest = next;
-    } else if (!manifest.version && next.version) {
-      manifest = { ...manifest, version: next.version };
+    if (manifest.version === null && next.version !== null) {
+      manifest = { version: next.version, blocks: manifest.blocks };
     }
   }
 

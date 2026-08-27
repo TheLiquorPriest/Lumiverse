@@ -17,6 +17,7 @@ import {
 import { beginActiveLoomPresetSelection, transitionActiveLoomPreset } from '@/lib/loom/preset-selection-coordinator'
 import { getMacroCatalog } from '@/api/macros'
 import type { SaveAgenticRuntimeEditorResult } from '@/api/agentic-runtime'
+import type { Preset } from '@/types/api'
 import type {
   AgenticRuntimeSaveDraft,
   LoomPreset,
@@ -343,9 +344,11 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     }
     const hydration = presetSaveCoordinator.beginHydration(presetId, 'agentic-runtime-conflict')
     let reloaded: LoomPreset
+    let reloadedPreset: Preset
     try {
+      reloadedPreset = await presetApi.get(presetId)
       reloaded = presetSaveCoordinator.hydrate(
-        unmarshalPreset(await presetApi.get(presetId)),
+        unmarshalPreset(reloadedPreset),
         hydration,
       )
       if (useStore.getState().activeLoomPresetId !== reloaded.id) {
@@ -363,7 +366,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     if (useStore.getState().activeLoomPresetId !== presetId) {
       throw new Error('No active preset')
     }
-    return { preset: marshalPreset(reloaded), editor }
+    return { preset: reloadedPreset, editor }
   }, [activeLoomPresetId, presetApi, presetSaveCoordinator, refreshRegistry])
 
   // Load registry on mount. The registry is kept in the store across panel

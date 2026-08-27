@@ -603,6 +603,7 @@ function LoomInspectionLedger({
           t={t}
           renderItem={(item) => {
             const repairReason = loomRepairReason(item, t)
+            const outcomeReason = item.outcome.reason
             const fixedRole = t(`ownerInspection.values.${item.bucket}`, { defaultValue: item.bucket })
             return (
               <details className={styles.loomItem}>
@@ -994,6 +995,10 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
   }, [persistentWorkspace?.chatId, persistentWorkspace?.id])
   const [workspaceSessions, setWorkspaceSessions] = useState<AgentPersistentWorkspaceTurnSessionV1[]>([])
   const [workspaceSessionsTotal, setWorkspaceSessionsTotal] = useState(0)
+  const workspaceSessionsTotalRef = useRef(0)
+  useEffect(() => {
+    workspaceSessionsTotalRef.current = workspaceSessionsTotal
+  }, [workspaceSessionsTotal])
   const [workspaceSessionsNextOffset, setWorkspaceSessionsNextOffset] = useState(0)
   const [workspaceSessionsLoadingMore, setWorkspaceSessionsLoadingMore] = useState(false)
   const [workspaceTasks, setWorkspaceTasks] = useState<AgentPersistentWorkspaceTaskV1[]>([])
@@ -1159,7 +1164,7 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
         fetchCollection('publications', () => agentRunsApi.persistentWorkspacePublications(nextWorkspace.id)),
       ])
       if (!isCurrent() || !sessionPage) return
-      const preserveSessionPage = preserveLoadedCollections && keepWorkspaceMounted && sessionPage.total >= workspaceSessionsTotal
+      const preserveSessionPage = preserveLoadedCollections && keepWorkspaceMounted && sessionPage.total >= workspaceSessionsTotalRef.current
       if (preserveSessionPage) {
         setWorkspaceSessions((current) => {
           const byId = new Map(current.map((item) => [item.id, item]))
@@ -1186,7 +1191,7 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
     } finally {
       if (isCurrent()) setWorkspaceLoading(false)
     }
-  }, [applyPersistentWorkspace, applyPersistentWorkspaceCollection, beginPersistentWorkspaceCollection, beginPersistentWorkspaceRequest, chatId, failPersistentWorkspaceCollection, t, workspaceSessionsTotal])
+  }, [applyPersistentWorkspace, applyPersistentWorkspaceCollection, beginPersistentWorkspaceCollection, beginPersistentWorkspaceRequest, chatId, failPersistentWorkspaceCollection, t])
   const refreshInspectionAndWorkspace = useCallback(async (
     fallbackInspection: AgentRunInspectionDetailV1 | null = null,
     generation = inspectionGenerationRef.current,

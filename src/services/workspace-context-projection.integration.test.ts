@@ -124,7 +124,11 @@ describe("owner-bound workspace context projection", () => {
     submitWorkspaceChildResult({ ...childContext(workspace.id, workspaceRevision), taskId: task.id, summary: "accepted child submission", resultDigest: "e".repeat(64), byteCount: 26 });
     workspaceRevision += 1;
     const submission = getDb().query("SELECT submission_id FROM agent_workspace_submissions WHERE task_id = ?").get(task.id) as { submission_id: string };
-    acceptWorkspaceSubmission({ ...hostContext(workspace.id, workspaceRevision), submissionId: submission.submission_id });
+    acceptWorkspaceSubmission({
+      ...hostContext(workspace.id, workspaceRevision),
+      submissionId: submission.submission_id,
+      taskId: task.id,
+    });
     workspaceRevision += 1;
 
     const result = buildWorkspaceContextProjectionFromWorkspaceV1(

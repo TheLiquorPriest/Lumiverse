@@ -273,7 +273,20 @@ describe("WORK Council terminal receipts", () => {
     controller.abort("parent cancelled");
     const startedAt = Date.now();
     const capability = createWorkCouncilCapability(admission());
-    expect(Object.keys(capability)).toEqual(["required", "invoke"]);
+    expect(Object.keys(capability)).toEqual([
+      "required",
+      "provider",
+      "connectionLabel",
+      "model",
+      "invoke",
+    ]);
+    expect(capability).toMatchObject({
+      required: false,
+      provider: null,
+      connectionLabel: null,
+      model: null,
+    });
+    expect(typeof capability.invoke).toBe("function");
     expect(Object.keys(capability)).not.toEqual(expect.arrayContaining([
       "tools",
       "write",

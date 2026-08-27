@@ -3522,6 +3522,7 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
     result.inspected += rows.length;
     for (const raw of rows) {
       if (reconciliationNowMs() >= scanDeadline) {
+        result.complete = false
         noteFailure("scan", new Error("scan_deadline"))
         return finish()
       }

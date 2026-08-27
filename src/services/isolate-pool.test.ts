@@ -16,14 +16,19 @@ class FakeTransport implements IsolateTransport {
   private messageHandler: ((message: unknown) => void) | null = null;
   private errorHandler: ((error: unknown) => void) | null = null;
   private terminated = false;
+  private readonly firstSend = Promise.withResolvers<void>();
 
-  constructor(kind: IsolateBackendKind = "worker") {
+  constructor(
+    kind: IsolateBackendKind = "worker",
+    private readonly deferTermination = false,
+  ) {
     this.kind = kind;
   }
 
   send(message: unknown): void {
     if (this.terminated) throw new Error("transport terminated");
     this.sent.push(message);
+    this.firstSend.resolve();
   }
 
   onMessage(handler: (message: unknown) => void): () => void {
@@ -40,8 +45,17 @@ class FakeTransport implements IsolateTransport {
     };
   }
 
-  terminate(): void {
-    this.terminated = true;
+  terminate(): void | Promise<void> {
+    if (!this.deferTermination) {
+      this.terminated = true;
+      return;
+    }
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        this.terminated = true;
+        resolve();
+      }, 0);
+    });
   }
 
   respond(message: unknown): void {
@@ -62,6 +76,9 @@ class FakeTransport implements IsolateTransport {
 
   isTerminated(): boolean {
     return this.terminated;
+  }
+  waitForSend(): Promise<void> {
+    return this.firstSend.promise;
   }
 }
 
@@ -523,13 +540,13 @@ describe("IsolatePoolV1", () => {
     await recoveringPool.shutdown();
   });
 
-  test("retires an idle slot whose health epoch changed in another pool", async () => {
+  test("retires a stale idle slot without starving asynchronous replacement", async () => {
     const firstPoolTransports: FakeTransport[] = [];
     const firstPool = new IsolatePoolV1<{ value: string }, string>({
       backend: "worker",
       maxWorkers: 1,
       workerFactory: () => {
-        const transport = new FakeTransport("worker");
+        const transport = new FakeTransport("worker", true);
         firstPoolTransports.push(transport);
         return transport;
       },
@@ -562,9 +579,11 @@ describe("IsolatePoolV1", () => {
 
     const replacementJob = firstPool.submit({ userId: "first", operation: "test", payload: { value: "replacement" } });
     await waitFor(() => firstPoolTransports.length === 2 && firstPoolTransports[1]!.sent.length === 1, 64);
-    expect(firstPoolTransports[0]!.isTerminated()).toBe(true);
-    firstPoolTransports[1]!.respond(response(firstPoolTransports[1]!.sent[0], "replacement"));
+    setTimeout(() => {
+      firstPoolTransports[1]!.respond(response(firstPoolTransports[1]!.sent[0], "replacement"));
+    }, 0);
     expect(await replacementJob).toBe("replacement");
+    expect(firstPoolTransports[0]!.isTerminated()).toBe(true);
     await firstPool.shutdown();
     await secondPool.shutdown();
   });
@@ -572,6 +591,7 @@ describe("IsolatePoolV1", () => {
 
   test("replaces a timed-out Worker slot and keeps the backend healthy", async () => {
     const transports: FakeTransport[] = [];
+    const replacementCreated = Promise.withResolvers<FakeTransport>();
     let probeCount = 0;
     const pool = new IsolatePoolV1<{ value: string }, string>({
       backend: "worker",
@@ -581,6 +601,7 @@ describe("IsolatePoolV1", () => {
       workerFactory: () => {
         const transport = new FakeTransport("worker");
         transports.push(transport);
+        if (transports.length === 2) replacementCreated.resolve(transport);
         return transport;
       },
       transportProbe: async () => {
@@ -590,20 +611,15 @@ describe("IsolatePoolV1", () => {
     const startingEpoch = getIsolateHealthSnapshot().epoch;
     const failed = pool.submit({ userId: "u", operation: "test", payload: { value: "timeout" }, timeoutMs: 1 });
     await expect(failed).rejects.toMatchObject({ code: "worker_timed_out" });
-    await waitFor(
-      () => transports.length === 2 && getIsolateHealthSnapshot().worker === "healthy",
-      64,
-    );
+    const benign = pool.submit({ userId: "u", operation: "test", payload: { value: "ok" } });
+    const replacement = await replacementCreated.promise;
+    await replacement.waitForSend();
     const health = getIsolateHealthSnapshot();
     expect(transports).toHaveLength(2);
     expect(transports[0]?.isTerminated()).toBe(true);
     expect(health.worker).toBe("healthy");
     expect(health.epoch).toBeGreaterThan(startingEpoch);
     expect(probeCount).toBeGreaterThanOrEqual(2);
-
-    const benign = pool.submit({ userId: "u", operation: "test", payload: { value: "ok" } });
-    await waitFor(() => (transports.at(-1)?.sent.length ?? 0) > 0);
-    const replacement = transports.at(-1)!;
     replacement.respond(response(replacement.sent.at(-1), "ok"));
     expect(await benign).toBe("ok");
     await pool.shutdown();
@@ -611,6 +627,7 @@ describe("IsolatePoolV1", () => {
 
   test("replaces a timed-out subprocess slot without poisoning Worker health", async () => {
     const transports: FakeTransport[] = [];
+    const replacementCreated = Promise.withResolvers<FakeTransport>();
     const pool = new IsolatePoolV1<{ value: string }, string>({
       backend: "subprocess",
       maxWorkers: 1,
@@ -619,24 +636,20 @@ describe("IsolatePoolV1", () => {
       subprocessFactory: () => {
         const transport = new FakeTransport("subprocess");
         transports.push(transport);
+        if (transports.length === 2) replacementCreated.resolve(transport);
         return transport;
       },
       transportProbe: async () => {},
     });
     const failed = pool.submit({ userId: "u", operation: "test", payload: { value: "timeout" }, timeoutMs: 1 });
     await expect(failed).rejects.toMatchObject({ code: "worker_timed_out" });
-    await waitFor(
-      () => transports.length === 2 && getIsolateHealthSnapshot().subprocess === "healthy",
-      64,
-    );
+    const benign = pool.submit({ userId: "u", operation: "test", payload: { value: "ok" } });
+    const replacement = await replacementCreated.promise;
+    await replacement.waitForSend();
     const health = getIsolateHealthSnapshot();
     expect(transports).toHaveLength(2);
     expect(health.subprocess).toBe("healthy");
     expect(health.worker).toBe("unknown");
-
-    const benign = pool.submit({ userId: "u", operation: "test", payload: { value: "ok" } });
-    await waitFor(() => (transports.at(-1)?.sent.length ?? 0) > 0);
-    const replacement = transports.at(-1)!;
     replacement.respond(response(replacement.sent.at(-1), "ok"));
     expect(await benign).toBe("ok");
     await pool.shutdown();

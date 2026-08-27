@@ -65,8 +65,6 @@ function config(): Record<string, unknown> {
       timeoutMs: 5000,
     }],
     connectionSlots: [],
-    phasePolicy: { work: [], render: [] },
-    cognitionPolicy: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
   };
 }
 

@@ -21,7 +21,6 @@ import type {
   AgentRuntimeRepairCategory,
   ChatAgentModeWriteResponseV1,
   EffectiveRuntimeDisplayV1,
-  EffectiveRuntimePublicResponseV1,
   EffectiveRuntimeRequestV1,
   GenerationTargetV1,
 } from '@/types/effective-runtime'

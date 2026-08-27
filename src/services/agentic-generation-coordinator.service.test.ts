@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { SnapshotMessageV1, SnapshotWorldInfoV1 } from "./prompt-assembly-snapshot.service";
-import type { AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
+import type { AssemblyMessageSegmentV1, AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
 import { createHash } from "node:crypto";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
@@ -9,6 +8,8 @@ import type { LlmProvider } from "../llm/provider";
 import type { GenerationRequest, GenerationResponse, StreamChunk } from "../llm/types";
 import { createDisabledAgentConfigV2, type AgentCustomPhaseV1 } from "../types/agents";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
+import type { CognitionActivationResultV1, CognitionActivationStateV1 } from "../types/agent-cognition";
+import type { CognitionRuntimeActivationV1 } from "../types/agent-cognition-runtime";
 import { AgentRuntimeOwner } from "./agent-runtime.service";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
 import { createAgenticChildFrame, createAgenticRootFrame, executeBoundedAgenticChildFrame } from "./agentic-work-phase.service";
@@ -19,6 +20,7 @@ import {
   setAgenticRuntimeReadiness,
   startAgentRuntimeEpoch,
   calculateFinalRenderReservationEnvelopeV1,
+  finalRenderActivityChunksFromHostLimitsV1,
   createTurnExecution,
   finalizeTurnCommit,
   reconcileAgentTurns,
@@ -32,6 +34,7 @@ import {
 } from "./agent-runtime-decision.service";
 import { getIsolateHealthEpoch, probeIsolateBackendsAtStartup } from "./isolate-pool";
 import { AGENT_RUNTIME_ADMISSION_MANAGER } from "./agent-runtime-admission";
+import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
 import { createPoolEntry, getPoolEntry, removePoolEntry } from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
@@ -173,7 +176,6 @@ class ScriptedProvider implements LlmProvider {
                 taskId: "blocked-terminal-task",
                 title: "Blocked-terminal submission",
                 objective: "Keep terminal completion blocked until the pending submission is accepted.",
-                required: false,
                 dependencyIds: [],
               },
               call_id: "blocked-terminal-create-task",
@@ -287,7 +289,6 @@ class ScriptedProvider implements LlmProvider {
                 taskId: "phase-two-task",
                 title: "Phase two workspace mutation",
                 objective: "Persist the phase-two task before final completion.",
-                required: false,
                 dependencyIds: [],
               },
               call_id: "phase-two-create-task",
@@ -339,7 +340,6 @@ class ScriptedProvider implements LlmProvider {
                 taskId: "task-delegate",
                 title: "Delegated workspace task",
                 objective: "Inspect the delegated workspace task.",
-                required: false,
                 dependencyIds: [],
               },
               call_id: "task-create-1",
@@ -831,7 +831,6 @@ describe("production agentic coordinator installation", () => {
           taskId: "task-auth",
           title: "Authenticated assignment",
           objective: "Verify root caller binding.",
-          required: false,
           dependencyIds: [],
         },
         { actor: "root", frame: rootFrame, operation: "create_task", signal: rootSignal },
@@ -917,7 +916,6 @@ describe("production agentic coordinator installation", () => {
           taskId: "root-result-auth",
           title: "Root result task",
           objective: "Verify root-only completion.",
-          required: false,
           dependencyIds: [],
         },
         { actor: "root", frame: rootFrame, operation: "create_task", signal: rootSignal },
@@ -958,7 +956,7 @@ describe("production agentic coordinator installation", () => {
         operationKey: "coordinator-test-settlement",
         signal: rootSignal,
       });
-      expect(settled?.accepted).toBe(true);
+      expect(settled).toMatchObject({ accepted: true });
       expect(getDb().query(
         "SELECT state, assigned_frame_id FROM agent_workspace_tasks WHERE turn_id = ? AND task_id = ?",
       ).get(execution.id, "task-auth")).toEqual({ state: "failed", assigned_frame_id: "valid-child-frame" });
@@ -1540,26 +1538,35 @@ describe("production agentic coordinator installation", () => {
     } finally {
       getDb().run("DROP TRIGGER reject_agentic_workspace_admission");
     }
-    const session = getDb().query(
-      "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ? AND chat_id = ?",
-    ).get(executionId, USER_ID, AGENTIC_CHAT_ID) as {
-      phase: string;
-      status: string;
-      outcome: string | null;
-      revision: number;
-    } | null;
-    expect(session).toMatchObject({
-      phase: "TERMINAL",
-      status: "terminal",
-      outcome: "failed",
-      revision: 1,
-    });
-    const inspection = getAgentRunInspection(USER_ID, executionId, AGENTIC_CHAT_ID);
-    expect(inspection?.workspaceAssociations).toHaveLength(1);
-    expect(inspection?.workspaceAssociations[0]).toMatchObject({
-      id: `workspace:linked:${executionId}`,
-      relation: "linked",
-    });
+    try {
+      const session = getDb().query(
+        "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ? AND chat_id = ?",
+      ).get(executionId, USER_ID, AGENTIC_CHAT_ID) as {
+        phase: string;
+        status: string;
+        outcome: string | null;
+        revision: number;
+      } | null;
+      expect(session).toMatchObject({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "failed",
+        revision: 1,
+      });
+      const inspection = getAgentRunInspection(USER_ID, executionId, AGENTIC_CHAT_ID);
+      expect(inspection?.workspaceAssociations).toHaveLength(1);
+      expect(inspection?.workspaceAssociations[0]).toMatchObject({
+        id: `workspace:linked:${executionId}`,
+        relation: "linked",
+      });
+    } finally {
+      getDb().query("DELETE FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?")
+        .run(executionId, USER_ID);
+      getDb().query("DELETE FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?")
+        .run(USER_ID, executionId);
+      getDb().query("DELETE FROM agent_turn_executions WHERE user_id = ? AND id = ?")
+        .run(USER_ID, executionId);
+    }
   });
   test("records a failed persistent session when admission is aborted by a timeout", async () => {
     const deps = __testing.buildDependencies();
@@ -1592,20 +1599,29 @@ describe("production agentic coordinator installation", () => {
     } finally {
       getDb().run("DROP TRIGGER reject_agentic_timeout_workspace_admission");
     }
-    const session = getDb().query(
-      "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
-    ).get(executionId, USER_ID) as {
-      phase: string;
-      status: string;
-      outcome: string | null;
-      revision: number;
-    } | null;
-    expect(session).toMatchObject({
-      phase: "TERMINAL",
-      status: "terminal",
-      outcome: "failed",
-      revision: 1,
-    });
+    try {
+      const session = getDb().query(
+        "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
+      ).get(executionId, USER_ID) as {
+        phase: string;
+        status: string;
+        outcome: string | null;
+        revision: number;
+      } | null;
+      expect(session).toMatchObject({
+        phase: "TERMINAL",
+        status: "terminal",
+        outcome: "failed",
+        revision: 1,
+      });
+    } finally {
+      getDb().query("DELETE FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?")
+        .run(executionId, USER_ID);
+      getDb().query("DELETE FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?")
+        .run(USER_ID, executionId);
+      getDb().query("DELETE FROM agent_turn_executions WHERE user_id = ? AND id = ?")
+        .run(USER_ID, executionId);
+    }
   });
   test("admission reserves the exact final render envelope and keeps the RENDER re-reservation exclusive", async () => {
     const deps = __testing.buildDependencies();
@@ -1640,8 +1656,11 @@ describe("production agentic coordinator installation", () => {
       }>;
       expect(reservations).toHaveLength(1);
       expect(reservations[0].id).toBe(`render:${execution.id}`);
+      const activityChunks = finalRenderActivityChunksFromHostLimitsV1(
+        getAgentRuntimeHostLimits().activityEvents,
+      );
       const envelope = calculateFinalRenderReservationEnvelopeV1({
-        activityChunks: 16,
+        activityChunks,
         contextBytes: HOST_PREPARATION_LIMITS_V1.maxInputBytes,
         outputBytes: HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
       });
@@ -1662,7 +1681,7 @@ describe("production agentic coordinator installation", () => {
 
       // A different envelope for the same key stays exclusively rejected.
       const drifted = calculateFinalRenderReservationEnvelopeV1({
-        activityChunks: 16,
+        activityChunks,
         contextBytes: HOST_PREPARATION_LIMITS_V1.maxInputBytes + 1,
         outputBytes: HOST_PREPARATION_LIMITS_V1.maxOutputBytes,
       });
@@ -1969,6 +1988,7 @@ describe("production agentic coordinator installation", () => {
       id: "snapshot_source",
       label: "Snapshot phase",
       instructionRefs: [phaseSource],
+      childInstructionSubsets: [],
       required: true,
       enter: { kind: "phase", value: "WORK" },
       exit: { kind: "phase", value: "COMPLETE" },
@@ -2471,32 +2491,32 @@ describe("production agentic coordinator installation", () => {
     };
     const target = { generationType: "normal" as const };
     const signal = new AbortController().signal;
+    const writeProfileRuntime = getDb().query(
+      "UPDATE preset_agent_profiles SET workspace_capabilities = ?, max_output_tokens = ? WHERE user_id = ? AND preset_id = ? AND profile_id = ?",
+    );
+    writeProfileRuntime.run(
+      JSON.stringify(["update_assigned_progress", "submit_child_result"]),
+      1024,
+      USER_ID,
+      AGENTIC_PRESET_ID,
+      "delegate",
+    );
+    writeProfileRuntime.run(JSON.stringify([]), 1024, USER_ID, AGENTIC_PRESET_ID, "delegate_alt");
     const decision = await deps.resolveRuntime!(input, target, signal);
     const snapshot = await deps.buildAssemblySnapshot!(input, decision, target, signal, "test-delegate");
     const config = snapshot.agentConfig as {
       readonly profiles?: readonly Record<string, unknown>[];
     } | null;
     if (!config || !Array.isArray(config.profiles)) throw new Error("Agentic profile config was not snapshotted");
+    expect(config.profiles.find((profile) => profile.id === "delegate")).toMatchObject({
+      workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
+      maxOutputTokens: 1024,
+    });
+    expect(config.profiles.find((profile) => profile.id === "delegate_alt")).toMatchObject({
+      workspaceCapabilities: [],
+      maxOutputTokens: 1024,
+    });
     const plan = await deps.compileAssemblyPlan!(snapshot, input, decision, signal, "test-delegate");
-    const assignmentSnapshot = {
-      ...snapshot,
-      agentConfig: {
-        ...config,
-        profiles: config.profiles.map((profile) => profile.id === "delegate"
-          ? {
-            ...profile,
-            workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-            maxOutputTokens: 1024,
-          }
-          : profile.id === "delegate_alt"
-            ? {
-              ...profile,
-              workspaceCapabilities: [],
-              maxOutputTokens: 1024,
-            }
-            : profile),
-      },
-    } as typeof snapshot;
     const execution = await deps.createExecution!({
       executionId: `exec-delegate-${Date.now()}`,
       userId: USER_ID,
@@ -2510,7 +2530,7 @@ describe("production agentic coordinator installation", () => {
         execution,
         input,
         decision,
-        snapshot: assignmentSnapshot,
+        snapshot,
         plan,
         signal,
       });
@@ -2531,7 +2551,7 @@ describe("production agentic coordinator installation", () => {
         "workspace_update_assigned_progress",
         "workspace_submit_child_result",
       ]);
-      expect(childRequest?.parameters?.max_tokens).toBe(512);
+      expect(childRequest?.parameters?.max_tokens).toBe(1024);
       const workspace = getDb().query(
         "SELECT revision FROM agent_turn_workspaces WHERE workspace_id = ? AND user_id = ? AND chat_id = ? AND turn_id = ?",
       ).get(`workspace:${execution.id}`, USER_ID, AGENTIC_CHAT_ID, execution.id) as { revision: number } | null;
@@ -2582,7 +2602,7 @@ describe("production agentic coordinator installation", () => {
           execution: emptyExecution,
           input,
           decision,
-          snapshot: assignmentSnapshot,
+          snapshot,
           plan,
           signal,
         });
@@ -2609,6 +2629,8 @@ describe("production agentic coordinator installation", () => {
       scriptedChildSubmitted = false;
       scriptedWorkRound = 0;
       scriptedDelegateProfileId = "delegate";
+      writeProfileRuntime.run(JSON.stringify([]), 512, USER_ID, AGENTIC_PRESET_ID, "delegate");
+      writeProfileRuntime.run(JSON.stringify([]), 128, USER_ID, AGENTIC_PRESET_ID, "delegate_alt");
     }
   });
   test("keeps the real workspace writable through an intermediate phase completion", async () => {
@@ -2629,6 +2651,7 @@ describe("production agentic coordinator installation", () => {
         id: "two_phase_first",
         label: "Two-phase first",
         instructionRefs: [],
+        childInstructionSubsets: [],
         required: true,
         enter: { kind: "phase", value: "WORK" },
         exit: { kind: "phase", value: "COMPLETE" },
@@ -2641,6 +2664,7 @@ describe("production agentic coordinator installation", () => {
         id: "two_phase_second",
         label: "Two-phase second",
         instructionRefs: [],
+        childInstructionSubsets: [],
         required: true,
         enter: { kind: "phase", value: "WORK" },
         exit: { kind: "phase", value: "COMPLETE" },
@@ -2705,7 +2729,7 @@ describe("production agentic coordinator installation", () => {
         expect(work).toMatchObject({ status: "completed" });
         expect(scriptedTwoPhaseSnapshots).toEqual([{
           state: "active",
-          revision: 1,
+          revision: 3,
           taskCount: 1,
           taskState: "active",
           frozenAt: null,
@@ -2754,7 +2778,7 @@ describe("production agentic coordinator installation", () => {
 
         const completionObservations = (work.observations ?? []).filter((observation) => observation.toolName === "complete_turn");
         expect(completionObservations).toHaveLength(2);
-        expect(completionObservations.every((observation) => observation.status === "accepted")).toBe(true);
+        expect(completionObservations.map((observation) => observation.status)).toEqual(["success", "accepted"]);
       } finally {
         deps.cleanup!({ execution } as never);
       }
@@ -2790,6 +2814,7 @@ describe("production agentic coordinator installation", () => {
       status: "completed",
       phase: "COMMITTED",
       target: { generationType: "normal" },
+      receipt: { receiptId: "receipt-committed-success" },
     });
     const completedPayload = await completed;
     expect(completedPayload).not.toHaveProperty("error");
@@ -2997,7 +3022,7 @@ describe("production agentic coordinator installation", () => {
           status: terminalCase.status,
           phase: terminalCase.eventPhase,
           target: { generationType: "normal" as const },
-          ...(terminalCase.errorCode ? { errorCode: terminalCase.errorCode } : {}),
+          ...("errorCode" in terminalCase ? { errorCode: terminalCase.errorCode } : {}),
         } as const;
         if (recoveryMode === "inspection") {
           db.run(`
@@ -3334,62 +3359,57 @@ describe("production agentic coordinator installation", () => {
   });
 });
 
-function renderNarrativeMessage(overrides: {
-  readonly is_user: boolean;
-  readonly content?: string;
-  readonly swipe_id?: number;
-  readonly swipes?: readonly string[];
-}): SnapshotMessageV1 {
-  const content = overrides.content ?? "";
+type RenderMessageSourceKind = "block" | "history" | "world_info" | "cognition" | "databank";
+
+function renderLiteralSegments(text: string): readonly AssemblyMessageSegmentV1[] {
+  return [{ kind: "literal", text, bytes: Buffer.byteLength(text, "utf8") }];
+}
+
+function assembledRenderMessage(
+  role: AssemblyProviderMessageV1["role"],
+  text: string,
+  kind: RenderMessageSourceKind,
+  sourceId: string,
+): AssemblyProviderMessageV1 {
   return {
-    id: overrides.is_user ? "user-1" : "assistant-1",
-    chat_id: AGENTIC_CHAT_ID,
-    index_in_chat: overrides.is_user ? 0 : 1,
-    is_user: overrides.is_user,
-    name: overrides.is_user ? "User" : "Eleanor",
-    content,
-    send_date: 1,
-    swipe_id: overrides.swipe_id ?? 0,
-    swipes: [...(overrides.swipes ?? [content])],
-    swipe_dates: [1],
-    extra: {},
-    parent_message_id: null,
-    branch_id: null,
-    created_at: 1,
-    revision: "1",
-  } as SnapshotMessageV1;
+    role,
+    contentKind: "segments",
+    provenance: { kind, sourceId, sourceRevision: "1", sourceIndex: 0 },
+    segments: renderLiteralSegments(text),
+  };
 }
 
 function authoredRenderPolicy(text: string): AssemblyProviderMessageV1 {
+  return assembledRenderMessage("system", text, "cognition", "render-policy");
+}
+
+function loomTaggedRenderMessage(text: string): AssemblyProviderMessageV1 {
   return {
     role: "system",
     contentKind: "segments",
-    provenance: { kind: "cognition", sourceId: "render-policy", sourceRevision: "1", sourceIndex: 0 },
-    segments: [{ kind: "literal", text, bytes: text.length }],
-  } as unknown as AssemblyProviderMessageV1;
+    provenance: {
+      kind: "block",
+      sourceId: "loom-render-block",
+      sourceRevision: "1",
+      sourceIndex: 0,
+      loom: {
+        entryId: "loom-render",
+        bucket: "renderPolicy",
+        destination: "render",
+        checkpoint: "RENDER",
+        source: {
+          kind: "loom_block",
+          blockId: "loom-render-block",
+          presetRevision: 1,
+          blockRevision: 1,
+          promptOrder: 0,
+        },
+        effectiveText: text,
+      },
+    },
+    segments: renderLiteralSegments(text),
+  };
 }
-
-const RENDER_NARRATIVE_FACTS = Object.freeze({
-  character: {
-    name: "Eleanor",
-    personality: "Warm, reserved, and precise.",
-    scenario: "A rain-soaked London boarding house.",
-    description: "A retired cartographer.",
-  },
-  worldInfo: {
-    books: [{
-      id: "book-london",
-      name: "London",
-      description: "Fog-bound streets above a shuttered map shop.",
-      source: "character" as const,
-      order: 0,
-      revision: "1",
-    }],
-    entries: [],
-    candidates: [],
-    state: {},
-  } satisfies SnapshotWorldInfoV1,
-});
 
 const RENDER_NARRATIVE_FACT_MESSAGE = [
   "Name: Eleanor",
@@ -3397,6 +3417,11 @@ const RENDER_NARRATIVE_FACT_MESSAGE = [
   "Scenario: A rain-soaked London boarding house.",
   "Description: A retired cartographer.",
   "World (London): Fog-bound streets above a shuttered map shop.",
+].join("\n");
+
+const COMPLETION_HANDOFF_MESSAGE = [
+  "Host-accepted completion handoff (not the reply):",
+  "WORK has completed. Treat the accepted workspace findings/submissions as additional host-accepted evidence alongside the supplied conversation and native World Info/Databank context. Never infer or expose private WORK records, reasoning, completion evidence, unresolved item IDs, or the operational transcript.",
 ].join("\n");
 
 describe("agentic render crossings", () => {
@@ -3472,109 +3497,78 @@ describe("agentic terminal inspection", () => {
 });
 
 describe("agentic RENDER narrative prompt", () => {
-  test("uses current swipe chat turns, host contract when policy is empty, and labelled guidance", () => {
+  test("uses only strict native ASSEMBLE messages, adds the completion handoff, and falls back to the host contract", () => {
+    const renderGuidance = "Keep the reply intimate and in Eleanor's voice.";
     const messages = __testing.buildAgenticRenderPolicyMessages({
-      snapshotMessages: [
-        renderNarrativeMessage({
-          is_user: true,
-          content: "stale user line",
-          swipe_id: 1,
-          swipes: ["stale user line", USER_INPUT],
-        }),
-        renderNarrativeMessage({
-          is_user: false,
-          content: "stale assistant swipe",
-          swipe_id: 0,
-          swipes: ["Eleanor is already in the room."],
-        }),
+      nativeMessages: [
+        assembledRenderMessage("system", RENDER_NARRATIVE_FACT_MESSAGE, "world_info", "world-london"),
+        assembledRenderMessage("user", USER_INPUT, "history", "user-1"),
+        assembledRenderMessage("assistant", "Eleanor is already in the room.", "history", "assistant-1"),
       ],
       renderPolicyMessages: [],
-      renderGuidance: "Keep the reply intimate and in Eleanor's voice.",
-      character: RENDER_NARRATIVE_FACTS.character,
-      worldInfo: RENDER_NARRATIVE_FACTS.worldInfo,
+      renderGuidance,
     });
     expect(messages).toEqual([
       { role: "system", content: RENDER_NARRATIVE_FACT_MESSAGE },
       { role: "user", content: USER_INPUT },
       { role: "assistant", content: "Eleanor is already in the room." },
-      { role: "system", content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT },
       {
         role: "system",
-        content: "Host-accepted render guidance (not the reply): WORK has completed. The accepted workspace projection is authoritative; do not deny its supported facts merely because RESPONSE is tools-disabled. Follow this guidance only where supported by that projection, and do not expose private reasoning or the operational transcript.\nKeep the reply intimate and in Eleanor's voice.",
+        content: `${COMPLETION_HANDOFF_MESSAGE}\nRender guidance:\n${renderGuidance}`,
       },
+      { role: "system", content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT },
     ]);
-    expect(messages.some((message) => message.role === "user" && message.content === USER_INPUT)).toBe(true);
     expect(messages.filter((message) => message.role !== "system").map((message) => message.content)).not.toContain("complete_turn");
-    expect(JSON.stringify(messages)).not.toContain("stale user line");
   });
 
-  test("appends authored render policy instead of the host contract and ignores WORK complete_turn text", () => {
+  test("appends authored render policy instead of the host contract and excludes WORK-only messages", () => {
     const messages = __testing.buildAgenticRenderPolicyMessages({
-      snapshotMessages: [
-        renderNarrativeMessage({ is_user: true, content: USER_INPUT }),
+      nativeMessages: [
+        assembledRenderMessage("system", RENDER_NARRATIVE_FACT_MESSAGE, "world_info", "world-london"),
+        assembledRenderMessage("user", USER_INPUT, "history", "user-1"),
+        authoredRenderPolicy("MUST-NOT-APPEAR-complete_turn"),
       ],
+      renderGuidance: null,
       renderPolicyMessages: [authoredRenderPolicy("Stay in character as Eleanor.")],
-      character: RENDER_NARRATIVE_FACTS.character,
-      worldInfo: RENDER_NARRATIVE_FACTS.worldInfo,
     });
     expect(messages).toEqual([
       { role: "system", content: RENDER_NARRATIVE_FACT_MESSAGE },
       { role: "user", content: USER_INPUT },
+      { role: "system", content: COMPLETION_HANDOFF_MESSAGE },
       { role: "system", content: "Stay in character as Eleanor." },
     ]);
     expect(messages.some((message) => message.content === __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT)).toBe(false);
     expect(JSON.stringify(messages)).not.toContain("complete_turn");
   });
 
-  test("bounds character and world facts before chat turns", () => {
-    const overflow = `${"x".repeat(80)}${"\u{1F9E0}".repeat(40)}`;
+  test("filters non-native, Loom-tagged, and non-narrative ASSEMBLE messages", () => {
     const messages = __testing.buildAgenticRenderPolicyMessages({
-      snapshotMessages: [
-        renderNarrativeMessage({ is_user: true, content: USER_INPUT }),
+      nativeMessages: [
+        assembledRenderMessage("system", "Native preset context.", "block", "preset-block"),
+        assembledRenderMessage("user", USER_INPUT, "history", "user-1"),
+        assembledRenderMessage("assistant", "Native world continuation.", "world_info", "world-1"),
+        assembledRenderMessage("system", "Native databank context.", "databank", "databank-1"),
+        authoredRenderPolicy("MUST-NOT-APPEAR-COGNITION"),
+        loomTaggedRenderMessage("MUST-NOT-APPEAR-LOOM"),
+        assembledRenderMessage("tool", "MUST-NOT-APPEAR-TOOL", "history", "tool-1"),
+        assembledRenderMessage("developer", "MUST-NOT-APPEAR-DEVELOPER", "history", "developer-1"),
       ],
+      renderGuidance: null,
       renderPolicyMessages: [],
-      character: {
-        name: "Eleanor",
-        description: overflow,
-      },
-      worldInfo: {
-        ...RENDER_NARRATIVE_FACTS.worldInfo,
-        books: [
-          {
-            ...RENDER_NARRATIVE_FACTS.worldInfo.books[0]!,
-            description: "y".repeat(200),
-          },
-          {
-            id: "book-late",
-            name: "LateBook",
-            description: "MUST-NOT-APPEAR-LATE-WORLD",
-            source: "character",
-            order: 1,
-            revision: "1",
-          },
-        ],
-        entries: [{
-          disabled: false,
-          constant: true,
-          content: "MUST-NOT-APPEAR-LATE-ENTRY",
-        }] as unknown as SnapshotWorldInfoV1["entries"],
-      },
-      maxFactBytes: 64,
     });
-    const facts = messages[0];
-    expect(facts?.role).toBe("system");
-    const factsContent = String(facts?.content ?? "");
-    const encoded = new TextEncoder().encode(factsContent);
-    expect(encoded.byteLength).toBeLessThanOrEqual(64);
-    expect(new TextDecoder().decode(encoded)).toBe(factsContent);
-    expect(factsContent).toContain("Eleanor");
-    expect(factsContent).not.toContain("MUST-NOT-APPEAR-LATE-WORLD");
-    expect(factsContent).not.toContain("MUST-NOT-APPEAR-LATE-ENTRY");
-    expect(messages.some((message) => message.role === "user" && message.content === USER_INPUT)).toBe(true);
-    expect(messages).toContainEqual({
-      role: "system",
-      content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT,
-    });
+    expect(messages).toEqual([
+      { role: "system", content: "Native preset context." },
+      { role: "user", content: USER_INPUT },
+      { role: "assistant", content: "Native world continuation." },
+      { role: "system", content: "Native databank context." },
+      { role: "system", content: COMPLETION_HANDOFF_MESSAGE },
+      { role: "system", content: __testing.HOST_RENDER_FINAL_RESPONSE_CONTRACT },
+    ]);
+    const serialized = JSON.stringify(messages);
+    expect(serialized).not.toContain("MUST-NOT-APPEAR-COGNITION");
+    expect(serialized).not.toContain("MUST-NOT-APPEAR-LOOM");
+    expect(serialized).not.toContain("MUST-NOT-APPEAR-TOOL");
+    expect(serialized).not.toContain("MUST-NOT-APPEAR-DEVELOPER");
   });
 });
 
@@ -3676,12 +3670,35 @@ describe("coordinator cognition transition snapshot seam", () => {
     const executionSignal = execution.signal;
     if (!executionSignal) throw new Error("Cognition settlement execution signal was not installed");
     const seenTransitions: Array<{ readonly operation: string; readonly operationKey?: string; readonly actor?: unknown }> = [];
-    const cognitionRuntime = {
-      applyWorkspaceTransition: (transition: {
-        readonly operation: string;
-        readonly operationKey?: string;
-        readonly workspace: Record<string, unknown>;
-      }) => {
+    const cognitionState: CognitionActivationStateV1 = {
+      version: 1,
+      workspaceRevision: 1,
+      activatedTemplateIds: [],
+      requiredTemplateIds: [],
+    };
+    const cognitionActivation: CognitionActivationResultV1 = {
+      point: "task_transition",
+      state: cognitionState,
+      newlyActivatedTemplateIds: [],
+      newlyRequiredTemplateIds: [],
+    };
+    const cognition: CognitionRuntimeActivationV1 = {
+      phase: "WORK",
+      state: cognitionState,
+      activation: cognitionActivation,
+      promptBlocks: { phase: "WORK", refs: [] },
+      sourceRevisions: { presetRevision: 1, blockRevisions: [] },
+      sourceDigest: "coordinator-settlement-test",
+      workspaceRevision: 1,
+    };
+    const cognitionRuntime: Parameters<typeof __testing.makeWorkspace>[2] = {
+      acceptCompletionFixedPoint: () => {
+        throw new Error("Settlement test unexpectedly requested cognition completion");
+      },
+      adoptWorkspaceMutationRevision: () => {
+        throw new Error("Settlement test unexpectedly adopted a non-cognition mutation");
+      },
+      applyWorkspaceTransition: (transition) => {
         seenTransitions.push({
           operation: transition.operation,
           operationKey: transition.operationKey,
@@ -3689,12 +3706,15 @@ describe("coordinator cognition transition snapshot seam", () => {
         });
         return {
           workspaceRevision: 1,
+          state: cognitionState,
+          activation: cognitionActivation,
           taskId: "settlement-task",
-          transition: "failed" as const,
+          transition: "failed",
           materializedTaskIds: [],
+          cognition,
         };
       },
-    } as unknown as Parameters<typeof __testing.makeWorkspace>[2];
+    };
     try {
       const workspace = __testing.makeWorkspace(execution, {
         revision: 1,
@@ -3819,6 +3839,7 @@ describe("coordinator cognition transition snapshot seam", () => {
         workspaceRevision: initialRevision,
         workspace: workspaceContext(initialRevision),
       });
+      runtimeExecution.workspaceRevision = cognition.initialActivation.workspaceRevision;
       const workActivation = cognition.enterPhase({
         phase: "WORK",
         workspace: workspaceContext(runtimeExecution.workspaceRevision),
@@ -4007,7 +4028,6 @@ describe("coordinator cognition transition snapshot seam", () => {
           taskId: "ad-hoc-cognition-task",
           title: "Ad-hoc task",
           objective: "Keep arbitrary host task identity stable.",
-          required: false,
           dependencyIds: [],
         },
         signal: rootSignal,
@@ -4027,7 +4047,6 @@ describe("coordinator cognition transition snapshot seam", () => {
           taskId: templateId,
           title: "Conflicting ad-hoc task",
           objective: "This authored identity must fail closed when duplicated.",
-          required: false,
           dependencyIds: [],
         },
         { actor: "root", frame: rootFrame, operation: "create_task", signal: rootSignal },
@@ -4067,6 +4086,7 @@ describe("coordinator blocked terminal completion seam", () => {
         id: "blocked_terminal_first",
         label: "Blocked terminal first phase",
         instructionRefs: [],
+        childInstructionSubsets: [],
         required: true,
         enter: { kind: "phase", value: "WORK" },
         exit: { kind: "phase", value: "COMPLETE" },
@@ -4079,6 +4099,7 @@ describe("coordinator blocked terminal completion seam", () => {
         id: "blocked_terminal_last",
         label: "Blocked terminal last phase",
         instructionRefs: [],
+        childInstructionSubsets: [],
         required: true,
         enter: { kind: "phase", value: "WORK" },
         exit: { kind: "phase", value: "COMPLETE" },
@@ -4190,7 +4211,7 @@ describe("coordinator blocked terminal completion seam", () => {
 
         const completions = (work.observations ?? []).filter((observation) => observation.toolName === "complete_turn");
         expect(completions).toHaveLength(3);
-        expect(completions.map((observation) => observation.status)).toEqual(["accepted", "rejected", "accepted"]);
+        expect(completions.map((observation) => observation.status)).toEqual(["success", "rejected", "accepted"]);
         expect(completions[1]?.code).toBe("completion_blocked");
       } finally {
         deps.cleanup!({ execution } as never);

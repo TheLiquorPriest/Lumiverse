@@ -2668,7 +2668,7 @@ function publicInspectionErrorCode(value: unknown): AgentPublicErrorCode | null 
 }
 
 function inspectionErrorCategory(code: AgentPublicErrorCode): AgentPublicErrorCategory {
-  if (code.includes("limit") || code.includes("budget") || code === "exhausted") return "budget";
+  if (code.includes("limit") || code.includes("budget")) return "budget";
   if (code === "child_required_failed" || code === "agentic_protocol_failure") return "validation";
   if (code.startsWith("provider_") || code.startsWith("worker_")) return "provider";
   if (code.startsWith("invalid_") || code === "batch_rejected" || code === "unknown_tool") return "validation";

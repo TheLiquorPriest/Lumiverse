@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
 import type { AgentRuntimePolicyV1, PortableAgentConfigV1 } from "../types/agents";
-import { COGNITION_MAX_LIST_BYTES, COGNITION_MAX_LIST_ITEMS, COGNITION_MAX_PREDICATE_DEPTH, type LoomPolicyCheckpointV1, type LoomPolicyDestinationV1, type LoomPolicyEntryV1 } from "../types/agent-cognition";
+import { COGNITION_MAX_LIST_ITEMS, COGNITION_MAX_PREDICATE_DEPTH, type LoomPolicyCheckpointV1, type LoomPolicyDestinationV1, type LoomPolicyEntryV1 } from "../types/agent-cognition";
 import { REGEX_LIMITS_V1 } from "../utils/regex-limits";
 import {
   duplicatePresetWithAgentConfig,
@@ -50,9 +50,9 @@ function authoredRuntimePolicy(): AgentRuntimePolicyV1 {
     loomPolicy: {
       version: 1,
       workPolicy: [loomEntry("work", "work-block", "root_work", "WORK", 0, { kind: "phase", value: "WORK" })],
-      workspaceUsage: [loomEntry("workspace", "workspace-block", "root_work", "WORK")],
-      completionCriteria: [loomEntry("completion", "completion-block", "completion_handoff", "PREPARE_COMMIT")],
-      renderPolicy: [loomEntry("render", "render-block", "render", "RENDER")],
+      workspaceUsage: [loomEntry("workspace", "workspace-block", "root_work", "WORK", 1)],
+      completionCriteria: [loomEntry("completion", "completion-block", "completion_handoff", "PREPARE_COMMIT", 2)],
+      renderPolicy: [loomEntry("render", "render-block", "render", "RENDER", 3)],
     },
     phases: [{
       version: 1,
@@ -63,8 +63,9 @@ function authoredRuntimePolicy(): AgentRuntimePolicyV1 {
         blockId: "phase-instructions",
         presetRevision: 0,
         blockRevision: 3,
-        promptOrder: 1,
+        promptOrder: 4,
       }],
+      childInstructionSubsets: [],
       required: true,
       enter: { kind: "phase", value: "WORK" },
       exit: { kind: "phase", value: "WORK" },
@@ -216,6 +217,23 @@ function promptBlock(index: number): Record<string, unknown> {
     injectionTrigger: [],
     group: null,
     categoryMode: null,
+  };
+}
+function presetWithAuthoredRuntime() {
+  const blocks = [
+    ["work-block", 2],
+    ["workspace-block", 2],
+    ["completion-block", 2],
+    ["render-block", 2],
+    ["phase-instructions", 3],
+  ] as const;
+  return {
+    ...preset(),
+    prompt_order: blocks.map(([id, revision], index) => ({
+      ...promptBlock(index),
+      id,
+      revision,
+    })),
   };
 }
 function nativeLoomPromptBlocks(): Record<string, unknown>[] {
@@ -479,7 +497,7 @@ describe("portable preset runtime import atomicity", () => {
     const authoredRuntime = authoredConfig.runtimePolicy;
 
     const result = importPortablePresetRuntime(USER_ID, {
-      preset: preset(),
+      preset: presetWithAuthoredRuntime(),
       agentRuntime,
     });
 
@@ -513,7 +531,7 @@ describe("portable preset runtime import atomicity", () => {
   test("loads canonical Loom cognition when an empty task graph was omitted", () => {
     const agentRuntime = canonicalRuntimeEnvelope();
     const result = importPortablePresetRuntime(USER_ID, {
-      preset: preset(),
+      preset: presetWithAuthoredRuntime(),
       agentRuntime,
     });
     const ready = writePresetAgentConfig(USER_ID, result.preset.id, {
@@ -523,7 +541,7 @@ describe("portable preset runtime import atomicity", () => {
     getDb().query(
       "UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?",
     ).run(
-      JSON.stringify({ config: agentRuntime.agentConfig }),
+      JSON.stringify({ config: ready.config }),
       USER_ID,
       result.preset.id,
     );
@@ -531,7 +549,7 @@ describe("portable preset runtime import atomicity", () => {
     expect(ready.review.state).toBe("ready");
     const source = getPresetAgentCognitionSourceV1(USER_ID, result.preset.id);
     expect(source?.taskTemplates).toEqual([]);
-    expect(source?.config.runtimePolicy).toEqual(agentRuntime.agentConfig?.runtimePolicy);
+    expect(source?.config.runtimePolicy).toEqual(ready.config.runtimePolicy);
   });
 
 

@@ -10,7 +10,7 @@ import {
   selectActiveAgentRunForChat,
   selectAgentRunForTarget,
 } from './agent-runs'
-import type { AgentRunPublicV2 } from '@/types/agent-runs'
+import type { AgentRunChangesV2, AgentRunPublicV2 } from '@/types/agent-runs'
 
 type TestStore = Pick<AppStore, 'activeChatId'> & AgentRunsSlice
 
@@ -73,25 +73,35 @@ function run(overrides: Partial<AgentRunPublicV2> = {}): AgentRunPublicV2 {
   }
 }
 
-function changes(runs: AgentRunPublicV2[], overrides: Record<string, unknown> = {}) {
+function changes(
+  runs: AgentRunPublicV2[],
+  overrides: Partial<Pick<AgentRunChangesV2,
+    | 'cursor'
+    | 'cursorSequence'
+    | 'lastSequence'
+    | 'tailSequence'
+    | 'hasMore'
+    | 'resync'
+    | 'resyncPage'
+  >> = {},
+): AgentRunChangesV2 {
   const sequence = runs.reduce((max, item) => Math.max(max, item.sequence), 0)
-  const lastSequence = typeof overrides.lastSequence === 'number' ? overrides.lastSequence : sequence
-  const cursorSequence = typeof overrides.cursorSequence === 'number' ? overrides.cursorSequence : lastSequence
-  const tailSequence = typeof overrides.tailSequence === 'number' ? overrides.tailSequence : Math.max(sequence, lastSequence)
-  const hasMore = typeof overrides.hasMore === 'boolean' ? overrides.hasMore : false
+  const lastSequence = overrides.lastSequence ?? sequence
+  const cursorSequence = overrides.cursorSequence ?? lastSequence
+  const tailSequence = overrides.tailSequence ?? Math.max(sequence, lastSequence)
   return {
     version: 2,
     chatId: 'chat-a',
-    cursor: { version: 1, token: 'opaque-cursor-a' },
+    cursor: overrides.cursor ?? { version: 1, token: 'opaque-cursor-a' },
     cursorSequence,
     lastSequence,
     tailSequence,
-    hasMore,
-    resync: false,
+    hasMore: overrides.hasMore ?? false,
+    resync: overrides.resync ?? false,
+    ...(overrides.resyncPage ? { resyncPage: overrides.resyncPage } : {}),
     runs,
     events: [],
     omission: { omittedNodeCount: 0, omittedEventCount: 0, firstOmittedSequence: null, lastOmittedSequence: null },
-    ...overrides,
   }
 }
 
@@ -254,6 +264,8 @@ describe('agent run projection slice', () => {
       tailSequence: 2,
       resyncPage: { offset: 0, returnedRuns: 16, totalRuns: 18, snapshotSequence: 2, complete: false, omittedRuns: 2 },
     })
+    const firstResyncPage = firstPayload.resyncPage
+    if (!firstResyncPage) throw new Error('full resync fixture is missing its page descriptor')
     expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, firstPayload)).toBe(true)
     const accepted = selectActiveAgentRunForChat(useStore.getState(), 'chat-a')
     const acceptedCursor = useStore.getState().agentRunCursorByChat['chat-a']
@@ -279,16 +291,16 @@ describe('agent run projection slice', () => {
 
     expect(normalizeAgentRunChangesV2({
       ...firstPayload,
-      resyncPage: { ...firstPayload.resyncPage, returnedRuns: 2 },
+      resyncPage: { ...firstResyncPage, returnedRuns: 2 },
     })).toBeNull()
     expect(normalizeAgentRunChangesV2({
       ...firstPayload,
-      resyncPage: { ...firstPayload.resyncPage, returnedRuns: 17, totalRuns: 17, omittedRuns: 0, complete: true },
+      resyncPage: { ...firstResyncPage, returnedRuns: 17, totalRuns: 17, omittedRuns: 0, complete: true },
       hasMore: false,
     })).toBeNull()
     expect(normalizeAgentRunChangesV2({
       ...firstPayload,
-      resyncPage: { ...firstPayload.resyncPage, complete: true },
+      resyncPage: { ...firstResyncPage, complete: true },
     })).toBeNull()
     expect(normalizeAgentRunChangesV2({
       ...firstPayload,
@@ -637,16 +649,6 @@ describe('agent run projection slice', () => {
         ...run().attemptLineage,
         target: { chatId: 'chat-a', generationType: 'normal', messageId: 'message-target', swipeId: 1 },
       },
-      runId: 'run-old',
-      turnId: 'turn-old',
-      generationId: 'generation-old',
-      workStatus: 'terminal',
-      workPhase: 'TERMINAL',
-      workOutcome: 'completed',
-      revision: 99,
-      sequence: 19,
-      updatedAt: 99_000,
-      target: { messageId: 'message-target', swipeId: 1 },
       terminalHandoff: {
         version: 2,
         committed: true,

@@ -851,7 +851,7 @@ describe("turn workspace validators and CAS operations", () => {
     const submissionRow = getDb().query("SELECT submission_id, state FROM agent_workspace_submissions WHERE task_id = ?").get(prerequisite.id) as { submission_id: string; state: string } | null;
     expect(submitted.state).toBe("completed");
     expect(submissionRow?.state).toBe("submitted");
-    const accepted = acceptWorkspaceSubmission({ ...hostContext(created.id, 2), submissionId: submissionRow?.submission_id });
+    const accepted = acceptWorkspaceSubmission({ ...hostContext(created.id, 2), submissionId: submissionRow?.submission_id, taskId: prerequisite.id });
     expect(accepted.state).toBe("accepted");
     const dependent = createWorkspaceTask({ ...rootContext(created.id, 3), taskId: "assignment-dependent", title: "Dependent", dependencyIds: [prerequisite.id] });
     const independent = createWorkspaceTask({ ...rootContext(created.id, 4), taskId: "assignment-independent", title: "Independent" });
@@ -1638,7 +1638,7 @@ describe("turn workspace validators and CAS operations", () => {
     expect(submitted.state).toBe("completed");
     const submissionRow = getDb().query("SELECT submission_id, state FROM agent_workspace_submissions WHERE task_id = ?").get(task.id) as { submission_id: string; state: string } | null;
     expect(submissionRow?.state).toBe("submitted");
-    const accepted = acceptWorkspaceSubmission({ ...hostContext(created.id, 3), submissionId: submissionRow?.submission_id });
+    const accepted = acceptWorkspaceSubmission({ ...hostContext(created.id, 3), submissionId: submissionRow?.submission_id, taskId: task.id });
     expect(accepted.state).toBe("accepted");
     const frozen = freezeTurnWorkspace(rootContext(created.id, 4));
     expect(frozen.state).toBe("frozen");
@@ -1672,7 +1672,7 @@ describe("turn workspace validators and CAS operations", () => {
     expect(getWorkspaceCompletionGatesV1(rootContext(created.id, 2)).pendingSubmissionCount).toBe(1);
 
     const submissionRow = getDb().query("SELECT submission_id FROM agent_workspace_submissions WHERE task_id = ?").get(required.id) as { submission_id: string } | null;
-    acceptWorkspaceSubmission({ ...hostContext(created.id, 2), submissionId: submissionRow?.submission_id });
+    acceptWorkspaceSubmission({ ...hostContext(created.id, 2), submissionId: submissionRow?.submission_id, taskId: required.id });
     const exactPreview = previewWorkspaceForCompletionV1(rootContext(created.id, 3));
     const accepted = freezeWorkspaceForCompletionV1(rootContext(created.id, 3), {
       prepare: (candidate) => (

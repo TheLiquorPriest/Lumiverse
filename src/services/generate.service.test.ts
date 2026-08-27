@@ -16,6 +16,7 @@ import type {
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
 import type { AgentConfigV2 } from "../types/agents";
+import type { LoomPromptInspectionV1 } from "../types/agent-cognition";
 import type { ResolvedConcreteConnectionV1 } from "./connections.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
@@ -1438,6 +1439,7 @@ describe.serial("root generation usage accounting", () => {
                         (block) => block?.id === "phase-policy",
                       ),
                     }],
+                    childInstructionSubsets: [],
                     required: false,
                     enter: { kind: "generation_type" as const, value: "normal" },
                     exit: { kind: "phase" as const, value: "WORK" },
@@ -1541,6 +1543,50 @@ describe.serial("root generation usage accounting", () => {
   }
   test("keeps ordinary Response context and emits typed Loom omission evidence", async () => {
     const fixture = await createFixture("response_loom");
+    const omittedEntryIds = Array.from(
+      { length: 5 },
+      (_, index) => `work-only-entry-${index + 1}`,
+    );
+    const workPolicySource = {
+      kind: "loom_block" as const,
+      blockId: "work-policy",
+      presetRevision: fixture.preset.cache_revision ?? 1,
+      blockRevision: 1,
+      promptOrder: fixture.preset.prompt_order.findIndex(
+        (block) => block?.id === "work-policy",
+      ),
+    };
+    const expectedLoomInspection: LoomPromptInspectionV1 = {
+      version: 1,
+      surface: "RESPONSE",
+      checkpoint: "ASSEMBLE",
+      items: omittedEntryIds.map((entryId) => ({
+        entryId,
+        bucket: "workPolicy",
+        destination: "root_work",
+        checkpoint: "WORK",
+        source: workPolicySource,
+        conditionResult: "not_applicable",
+        effectiveText: null,
+        required: false,
+        ordinaryPromptSuppressed: true,
+        outcome: {
+          status: "omitted",
+          reason: "response_mode",
+        },
+      })),
+      effectiveEntryIds: [],
+      responseOmission: {
+        version: 1,
+        surface: "RESPONSE",
+        visibility: "work_only",
+        reason: "work_only",
+        reviewReason: "response_surface",
+        omittedEntryIds,
+        source: omittedEntryIds.map(() => workPolicySource),
+        omittedPhaseInstructions: [],
+      },
+    };
     const globalDatabank = databankSvc.createDatabank(fixture.userId, {
       name: "Response global",
       scope: "global",
@@ -1592,40 +1638,7 @@ describe.serial("root generation usage accounting", () => {
         generation_type: "normal",
       });
       expect(dryRun.assemblySurface).toBe("RESPONSE");
-      expect(dryRun.loomPromptInspection).toMatchObject({
-        version: 1,
-        surface: "RESPONSE",
-        checkpoint: "ASSEMBLE",
-        responseOmission: {
-          version: 1,
-          surface: "RESPONSE",
-          visibility: "work_only",
-          reason: "work_only",
-          omittedEntryIds: Array.from(
-            { length: 5 },
-            (_, index) => `work-only-entry-${index + 1}`,
-          ),
-          source: [expect.objectContaining({
-            blockId: "work-policy",
-          })],
-        },
-      });
-      expect(dryRun.loomPromptInspection?.items).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            entryId: "work-only-entry-1",
-            source: expect.objectContaining({
-              blockId: "work-policy",
-              presetRevision: expect.any(Number),
-              blockRevision: 1,
-            }),
-            outcome: {
-              status: "omitted",
-              reason: "response_mode",
-            },
-          }),
-        ]),
-      );
+      expect(dryRun.loomPromptInspection).toEqual(expectedLoomInspection);
 
       const started = await startFixture(fixture);
       const emittedBreakdownPromise = waitForGenerationEvent(
@@ -1637,18 +1650,7 @@ describe.serial("root generation usage accounting", () => {
       expect(terminal.event).toBe(EventType.GENERATION_ENDED);
       expect(emittedBreakdown.breakdown).toMatchObject({
         assemblySurface: "RESPONSE",
-        loomPromptInspection: {
-          surface: "RESPONSE",
-          responseOmission: {
-            surface: "RESPONSE",
-            visibility: "work_only",
-            reason: "work_only",
-            omittedEntryIds: Array.from(
-              { length: 5 },
-              (_, index) => `work-only-entry-${index + 1}`,
-            ),
-          },
-        },
+        loomPromptInspection: expectedLoomInspection,
       });
 
       const requestText = fixture.provider.rootRequests[0]?.messages

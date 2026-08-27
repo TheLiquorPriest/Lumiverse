@@ -54,6 +54,7 @@ import {
   runAgenticWorkPhase,
   type AgenticWorkOptions,
   type AgenticWorkspaceCapability,
+  type AgenticWorkspaceCompletionFixedPointResult,
 } from "./agentic-work-phase.service";
 import {
   buildGenerationAssemblySnapshot,
@@ -376,23 +377,33 @@ function zeroCallbackWorkspace(): AgenticWorkspaceCapability {
     getCompletionGates: async () => ({}),
     listTaskAcceptance: async () => [],
     freezeForCompletion: async (input) => {
-      const candidate = {
-        accepted: true as const,
+      const candidate: AgenticWorkspaceCompletionFixedPointResult = {
+        accepted: true,
         workspaceRevision: 4,
         workspaceContextProjection: {
-          version: 1 as const,
+          version: 1,
           sourceWorkspaceRevision: 4,
           mandatory: [],
           optional: [],
-          omissions: [],
+          omissions: [
+            { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+            { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+            { class: "optional_task", omittedCount: 0, firstOmittedCursor: null },
+            { class: "artifact", omittedCount: 0, firstOmittedCursor: null },
+          ],
           literal: "",
           utf8Bytes: 0,
         },
       };
       if (!input.prepareAcceptance) return candidate;
-      return input.prepareAcceptance(candidate)
+      const acknowledged = await input.prepareAcceptance(candidate);
+      return acknowledged
         ? candidate
-        : { accepted: false, code: "completion_freeze_failed" as const };
+        : {
+          accepted: false,
+          workspaceRevision: candidate.workspaceRevision,
+          code: "completion_freeze_failed",
+        };
     },
   };
 }
@@ -532,7 +543,7 @@ describe("Agentic strict phases enter zero host callbacks", () => {
   });
 
   test("WORK dispatches only its closed tool set and never reaches a Response-only executor", async () => {
-    const { plan } = await assembledFixture();
+    const { snapshot, plan } = await assembledFixture();
     let composedTools: readonly string[] = [];
     let round = 0;
 
@@ -564,7 +575,7 @@ describe("Agentic strict phases enter zero host callbacks", () => {
           args: { summary: "bounded work completed", unresolvedIds: [] },
         }],
       };
-    }, { budget: { maxProviderRounds: 2, maxToolResultBytes: 1024 } }));
+    }, { snapshot, budget: { maxProviderRounds: 2, maxToolResultBytes: 1024 } }));
 
     for (const name of RESPONSE_ONLY_TOOL_NAMES) expect(composedTools).not.toContain(name);
     expect(composedTools).toContain("complete_turn");

@@ -39,6 +39,15 @@ const runtimePolicy: LoomRuntimePolicyV1 = {
 }
 
 function response(chatId: string, revision: number | null): EffectiveRuntimePublicResponseV1 {
+  const responseOmission: NonNullable<EffectiveRuntimePublicResponseV1['responseOmission']> = {
+    version: 1,
+    surface: 'RESPONSE',
+    visibility: 'work_only',
+    reason: 'work_only',
+    omittedEntryIds: [],
+    source: [],
+    omittedPhaseInstructions: [],
+  }
   return {
     version: 1,
     chatId,
@@ -59,6 +68,15 @@ function response(chatId: string, revision: number | null): EffectiveRuntimePubl
     defaultMode: 'response',
     requestedMode: 'response',
     effectiveMode: 'response',
+    inspection: {
+      version: 1,
+      surface: 'RESPONSE',
+      checkpoint: 'ASSEMBLE',
+      items: [],
+      effectiveEntryIds: [],
+      responseOmission,
+    },
+    responseOmission,
     runtimePolicy,
     chatOverride: revision === null ? null : { mode: 'agentic', revision, state: 'ready' },
     capabilityReadiness: {

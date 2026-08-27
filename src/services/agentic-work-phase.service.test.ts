@@ -4,7 +4,7 @@ import type {
   AgenticWorkspaceCompletionFixedPointInput,
   AgenticWorkspaceCompletionFixedPointResult,
 } from "./agentic-work-phase.service";
-import type { AssemblyMessageSegmentV1, AssemblyPlanV1 } from "./agentic-assembly-compiler";
+import { compileAgentAssemblyPlan, type AssemblyMessageSegmentV1, type AssemblyPlanV1 } from "./agentic-assembly-compiler";
 import { compileAgentRuntimePhases, type AgentRuntimePhaseCompileResultV1 } from "./agentic-phase-runtime.service";
 import type {
   GenerationAssemblySnapshotV1,
@@ -13,7 +13,14 @@ import type {
 import type { WorkCouncilExecutionResult } from "./work-council.service";
 import type { CognitionEvaluationContextV1, CognitionTaskTransition } from "../types/agent-cognition";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
-import { AGENT_SYSTEM_PROMPT_MAX_BYTES, createDisabledAgentConfigV2, parseAgentConfigV2, type AgentConfigV2 } from "../types/agents";
+import {
+  AGENT_SYSTEM_PROMPT_MAX_BYTES,
+  createDisabledAgentConfigV2,
+  parseAgentConfigV2,
+  type AgentConfigV2,
+  type AgentCustomPhaseV1,
+  type AgentRuntimePhaseCapabilityV1,
+} from "../types/agents";
 import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import type { GenerationResponse, LlmMessage, ProviderTransientCarrier, ToolCallResult } from "../llm/types";
 import {
@@ -151,12 +158,14 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
     content: block.content,
     role: "system" as const,
     enabled: true,
-    position: "chat" as const,
+    position: "pre_history" as const,
     depth: 0,
-    scanDepth: 0,
-    roleOverride: null,
+    marker: null,
+    isLocked: false,
+    color: null,
     injectionTrigger: [],
     group: null,
+    sealed: false,
     order: block.source.promptOrder,
     revision: String(block.source.blockRevision),
   }));
@@ -185,13 +194,17 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
     ? null
     : parseAgentConfigV2({ ...baseConfig, runtimePolicy });
   const messages = candidate.messages
-    .filter((message) => message.provenance.kind === "history")
+    .filter((message) => message.provenance?.kind === "history")
     .map((message, index) => {
+      const provenance = message.provenance;
+      if (provenance?.kind !== "history") {
+        throw new Error("history provenance disappeared after filtering");
+      }
       const content = message.segments
         .map((segment) => segment.kind === "literal" ? segment.text : "")
         .join("");
       return {
-        id: message.provenance.sourceId,
+        id: provenance.sourceId,
         chat_id: "chat-1",
         index_in_chat: index,
         is_user: message.role === "user",
@@ -205,7 +218,7 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
         parent_message_id: null,
         branch_id: null,
         created_at: 0,
-        revision: message.provenance.sourceRevision,
+        revision: provenance.sourceRevision,
       };
     });
   const snapshot = {
@@ -283,6 +296,62 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
   return { ...snapshot, snapshotId } as GenerationAssemblySnapshotV1;
 }
 
+async function compiledChildFixture(
+  blocks: readonly { readonly id: string; readonly content: string }[],
+): Promise<{ readonly plan: AssemblyPlanV1; readonly snapshot: GenerationAssemblySnapshotV1 }> {
+  const template = snapshotForPlan(plan());
+  const agentConfig = parseAgentConfigV2({
+    ...createDisabledAgentConfigV2(),
+    agentsEnabled: true,
+    allowedModes: ["response", "agentic"],
+    defaultMode: "agentic",
+    maxInvocations: 4,
+    maxToolCalls: 4,
+    profiles: [{
+      id: "writer",
+      name: "Writer",
+      systemPrompt: "",
+      connectionRef: { kind: "inherit_main" },
+      toolIds: [],
+      loreScope: "active",
+      allowMainDelegation: false,
+      failurePolicy: "required",
+      streamActivity: false,
+      maxOutputTokens: 64,
+      timeoutMs: 5_000,
+    }],
+  });
+  const candidate = {
+    ...template,
+    snapshotId: "",
+    generationId: "compiled-child-" + blocks.map((block) => block.id).join("-"),
+    messages: [],
+    blocks: blocks.map((block, index) => ({
+      id: block.id,
+      name: block.id,
+      content: block.content,
+      role: "user" as const,
+      enabled: true,
+      position: "pre_history" as const,
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      group: null,
+      sealed: false,
+      order: index,
+      revision: "1",
+    })),
+    agentConfig,
+  } satisfies GenerationAssemblySnapshotV1;
+  const { snapshotId: _snapshotId, inputRevisionSet: _inputRevisionSet, revisions: _revisions, ...base } = candidate;
+  const snapshotId = createHash("sha256")
+    .update(encodeCanonicalPlainData({ base, revisions: candidate.revisions }), "utf8")
+    .digest("hex");
+  const snapshot = { ...candidate, snapshotId };
+  return { snapshot, plan: await compileAgentAssemblyPlan(snapshot) };
+}
 
 type AssemblyMessageFixture = AssemblyPlanV1["messages"][number];
 type AssemblyResultSlotFixture = AssemblyPlanV1["resultSlots"][number];
@@ -315,9 +384,13 @@ function call(name: string, call_id: string, args: Record<string, unknown>): Too
   return { name, call_id, args };
 }
 
+type AgenticWorkFixtureOverrides = Partial<Omit<AgenticWorkOptions, "plan">> & {
+  readonly plan?: AssemblyPlanV1;
+};
+
 function baseOptions(
   dispatch: AgenticWorkOptions["dispatch"],
-  overrides: Partial<AgenticWorkOptions> = {},
+  overrides: AgenticWorkFixtureOverrides = {},
 ): AgenticWorkOptions {
   const authoredPlan = overrides.plan ?? plan();
   const snapshot = overrides.snapshot ?? snapshotForPlan(authoredPlan);
@@ -356,7 +429,12 @@ function preparedFixedPoint(result: AgenticWorkspaceCompletionFixedPointResult):
       sourceWorkspaceRevision: result.workspaceRevision,
       mandatory: [],
       optional: [],
-      omissions: [],
+      omissions: [
+        { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+        { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+        { class: "optional_task", omittedCount: 0, firstOmittedCursor: null },
+        { class: "artifact", omittedCount: 0, firstOmittedCursor: null },
+      ],
       literal: "",
       utf8Bytes: 0,
     },
@@ -420,6 +498,36 @@ function workspace(
   };
 }
 
+type AssignmentLedgerTask = {
+  readonly id: string;
+  readonly state: "active" | "completed";
+  readonly assignedFrameId: string | null;
+};
+
+function assignmentLedger(
+  tasks: readonly AssignmentLedgerTask[],
+): {
+  readonly listOpenTasks: () => Promise<readonly AssignmentLedgerTask[]>;
+  readonly assign: (assignments: readonly { readonly taskId: string; readonly frameId: string }[]) => void;
+  readonly complete: (taskId: string) => void;
+} {
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  return {
+    listOpenTasks: async () => [...taskById.values()],
+    assign: (assignments) => {
+      for (const assignment of assignments) {
+        const task = taskById.get(assignment.taskId);
+        if (!task) throw new Error("Unknown assignment fixture task " + assignment.taskId);
+        taskById.set(assignment.taskId, { ...task, assignedFrameId: assignment.frameId });
+      }
+    },
+    complete: (taskId) => {
+      const task = taskById.get(taskId);
+      if (!task?.assignedFrameId) throw new Error("Unassigned completion fixture task " + taskId);
+      taskById.set(taskId, { ...task, state: "completed" });
+    },
+  };
+}
 const complete = (id = "complete-1") => call("complete_turn", id, {
   summary: "bounded work completed",
   unresolvedIds: [],
@@ -481,6 +589,7 @@ function customPhase(
     id: normalizedId,
     label: id,
     instructionRefs: [],
+    childInstructionSubsets: [],
     required: true,
     enter: { kind: "phase", value: "WORK" },
     exit: { kind: "phase", value: "WORK" },
@@ -551,7 +660,7 @@ describe("Agentic WORK phase", () => {
     expect(requests[1]).toContain(":complete_turn,");
     expect(JSON.stringify(result)).not.toContain("PRIVATE WORK NOTE");
   });
-  test("keeps native provider output and reasoning in the carrier without duplicating legacy messages", async () => {
+  test("keeps native provider output and reasoning only in private WORK continuation", async () => {
     const requests: Array<Awaited<ReturnType<AgenticWorkOptions["dispatch"]>> extends never ? never : {
       readonly messages: readonly LlmMessage[];
       readonly providerTransientCarrier?: unknown;
@@ -613,7 +722,8 @@ describe("Agentic WORK phase", () => {
     }));
 
     expect(result.status).toBe("completed");
-    expect(result.renderHandoff?.continuationMode).toBe("native");
+    expect(result.renderHandoff).toMatchObject({ workspaceRevision: 4 });
+    expect(result.renderHandoff).not.toHaveProperty("continuationMode");
     expect(requests).toHaveLength(2);
     const nativeCarrier = requests[1]?.providerTransientCarrier as ProviderTransientCarrier;
     expect(nativeCarrier.items.map((item) => item.type)).toEqual([
@@ -850,7 +960,7 @@ describe("Agentic WORK phase", () => {
     });
     expect(JSON.stringify(requests[2]?.messages)).not.toContain("UNSIGNED_TEXT");
   });
-  test("withholds completion criteria from the initial WORK provider transcript", async () => {
+  test("ignores unsealed policy overrides and withholds completion criteria from initial WORK", async () => {
     const requests: Array<{ readonly messages: readonly LlmMessage[] }> = [];
     const result = await runAgenticWorkPhase(baseOptions(async (request) => {
       requests.push({ messages: request.messages });
@@ -893,9 +1003,10 @@ describe("Agentic WORK phase", () => {
     expect(result.status).toBe("completed");
     expect(requests).toHaveLength(1);
     const first = JSON.stringify(requests[0]?.messages);
-    expect(first).toContain("WORK_POLICY_BEFORE_COMPLETE");
-    expect(first).toContain("WORKSPACE_USAGE_BEFORE_COMPLETE");
+    expect(first).not.toContain("WORK_POLICY_BEFORE_COMPLETE");
+    expect(first).not.toContain("WORKSPACE_USAGE_BEFORE_COMPLETE");
     expect(first).not.toContain("STORY_SUMMARY_BEFORE_COMPLETE");
+    expect(first).toContain("host_private_phase_control_v1");
   });
 
   test("does not leak empty completion criteria envelopes into the initial WORK request", async () => {
@@ -923,7 +1034,7 @@ describe("Agentic WORK phase", () => {
     expect(requests[0]?.messages).not.toContainEqual({ role: "system", content: "" });
   });
 
-  test("withholds completion criteria after a mixed batch and adds them only to the accepted native handoff", async () => {
+  test("keeps unsealed completion criteria out of mixed continuations and the accepted handoff", async () => {
     const requests: Array<{
       readonly messages: readonly LlmMessage[];
       readonly providerTransientCarrier?: ProviderTransientCarrier;
@@ -1005,15 +1116,12 @@ describe("Agentic WORK phase", () => {
       "function_call_output",
     ]);
     expect(JSON.stringify(rejectedCarrier)).not.toContain("COMPLETE_ONLY_AFTER_ALL_REQUIRED_WORK");
-    expect(result.renderHandoff?.continuationMode).toBe("native");
-    const acceptedCarrier = result.renderHandoff?.continuationMode === "native"
-      ? result.renderHandoff.providerTransientCarrier
-      : undefined;
-    expect(acceptedCarrier?.items.at(-1)).toEqual({
-      type: "message",
-      role: "system",
-      content: "COMPLETE_ONLY_AFTER_ALL_REQUIRED_WORK",
+    expect(result.renderHandoff).toMatchObject({
+      workspaceRevision: 4,
+      completionCriteriaMessages: [],
     });
+    expect(result.renderHandoff).not.toHaveProperty("continuationMode");
+    expect(result.renderHandoff).not.toHaveProperty("providerTransientCarrier");
   });
 
 
@@ -1109,7 +1217,8 @@ describe("Agentic WORK phase", () => {
     expect(result.observations.find((item) => item.callId === "mixed-complete")?.code).toBe("completion_mixed_batch");
     expect(result.observations.find((item) => item.callId === "premature")?.code).toBe("completion_blocked");
     expect(result.observations.find((item) => item.callId === "accepted")?.status).toBe("accepted");
-    expect(JSON.stringify(result.renderHandoff?.transcript)).toContain("\"is_error\":true");
+    expect(result.renderHandoff).not.toHaveProperty("transcript");
+    expect(result.renderHandoff).not.toHaveProperty("providerTransientCarrier");
   });
 
   test("continues from the workspace revision committed by a rejected fixed point", async () => {
@@ -1140,7 +1249,12 @@ describe("Agentic WORK phase", () => {
             sourceWorkspaceRevision,
             mandatory: [],
             optional: [],
-            omissions: [],
+            omissions: [
+              { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+              { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+              { class: "optional_task", omittedCount: 0, firstOmittedCursor: null },
+              { class: "artifact", omittedCount: 0, firstOmittedCursor: null },
+            ],
             literal: "",
             utf8Bytes: 0,
           };
@@ -1226,7 +1340,7 @@ describe("Agentic WORK phase", () => {
     expect(result.workspaceRevision).toBe(12);
     expect(freezeInputs).toEqual([11]);
   });
-  test("rejects completion before freezing when the acknowledgement cap is too small", async () => {
+  test("reports an acknowledgement cap failure after the workspace performs atomic acceptance", async () => {
     let freezes = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("too-small")]), {
       workspace: workspace({
@@ -1243,7 +1357,7 @@ describe("Agentic WORK phase", () => {
     expect(result.status).toBe("failed");
     expect(result.code).toBe("tool_result_limit_exceeded");
     expect(result.observations).toHaveLength(1);
-    expect(freezes).toBe(0);
+    expect(freezes).toBe(1);
   });
 
   test("root composition excludes Council/MCP/extension tools and children cannot complete or mutate workspace", async () => {
@@ -1463,81 +1577,37 @@ describe("Agentic WORK phase", () => {
   });
 
   test("runs deterministic child descriptors in traversal order and substitutes bounded results once", async () => {
-    const order: string[] = [];
-    const childSegments: AssemblyMessageSegmentV1[] = [
-      { kind: "literal", text: "before ", bytes: 7 },
-      { kind: "result_slot", slotIndex: 0, resultName: "child_a_result", maxBytes: 100, bytes: 0 },
-      { kind: "literal", text: " middle ", bytes: 8 },
-      { kind: "result_slot", slotIndex: 1, resultName: "child_b_result", maxBytes: 100, bytes: 0 },
-    ];
-    const childMessage: AssemblyMessageFixture = {
-      role: "user" as const,
-      contentKind: "segments" as const,
-      blockIndex: 0,
-      blockId: "block-a",
-      provenance: {
-        kind: "block" as const,
-        sourceId: "block-a",
-        sourceRevision: "1",
-        sourceIndex: 0,
+    const { plan: childPlan, snapshot } = await compiledChildFixture([
+      { id: "block-a", content: "{{agent::writer::as=child_a_result}}A{{/agent}}" },
+      { id: "block-b", content: "{{agent::writer::as=child_b_result}}B{{/agent}}" },
+      {
+        id: "block-results",
+        content: "before {{agentResult::child_a_result}} middle {{agentResult::child_b_result}}",
       },
-      segments: childSegments,
-    };
-    const childA = {
-      childId: "child-a", profileId: "writer", task: "A", taskBytes: 1, slotIndex: 0, traversalIndex: 0,
-      blockIndex: 0, blockId: "block-a", resultName: "child_a_result", maxOutputBytes: 100, required: true,
-      maxOutputTokens: 25,
-      toolIds: [], streamActivity: false, sourceOffset: 3, failurePolicy: "required" as const, producerSeal: "d9c2436f",
-    };
-    const childB = {
-      childId: "child-b", profileId: "writer", task: "B", taskBytes: 1, slotIndex: 1, traversalIndex: 1,
-      blockIndex: 0, blockId: "block-a", resultName: "child_b_result", maxOutputBytes: 100, required: true,
-      maxOutputTokens: 25,
-      toolIds: [], streamActivity: false, sourceOffset: 7, failurePolicy: "required" as const, producerSeal: "855e15c9",
-    };
-    const childResultSlots = [
-      assemblyResultSlot(0, "child_a_result", 0, "block-a", 100, "child-a", "d9c2436f"),
-      assemblyResultSlot(1, "child_b_result", 0, "block-a", 100, "child-b", "855e15c9"),
-    ];
-    const childSeals = [
-      { kind: "producer" as const, resultName: "child_a_result", slotIndex: 0, blockIndex: 0, blockId: "block-a", sequence: 0 },
-      { kind: "producer" as const, resultName: "child_b_result", slotIndex: 1, blockIndex: 0, blockId: "block-a", sequence: 1 },
-    ];
-    const childPlan = plan({
-      messages: [childMessage],
-      providerMessages: [childMessage],
-      children: [childA, childB],
-      childDescriptors: [childA, childB],
-      resultSlots: childResultSlots,
-      seals: childSeals,
-      activationEvidence: [
-        { kind: "activation" as const, profileId: "writer", authorized: true, tokenCost: 0 },
-        { kind: "activation" as const, profileId: "writer", authorized: true, tokenCost: 0 },
-      ],
-      tokenEvidence: [
-        { kind: "token" as const, profileId: "writer", estimatedInputTokens: 0, estimatedOutputTokens: 0 },
-        { kind: "token" as const, profileId: "writer", estimatedInputTokens: 0, estimatedOutputTokens: 0 },
-      ],
-    });
+    ]);
+    const order: string[] = [];
     const rootMessages: string[] = [];
     const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
-      rootMessages.push(typeof messages[0]?.content === "string" ? messages[0].content : "");
+      const materialized = messages.find((message) =>
+        typeof message.content === "string" && message.content.startsWith("before "),
+      );
+      rootMessages.push(typeof materialized?.content === "string" ? materialized.content : "");
       return response("", [complete()]);
     }, {
       plan: childPlan,
+      snapshot,
       executeChild: async ({ descriptor, frame }) => {
         order.push(`${descriptor.childId}:${frame.connectionId}:${frame.model}:${frame.canComplete}`);
-        return { content: descriptor.childId === "child-a" ? "A-RESULT" : "B-RESULT", status: "succeeded" };
+        return { content: descriptor.task === "A" ? "A-RESULT" : "B-RESULT", status: "succeeded" };
       },
       workspace: workspace(),
       workspaceCapabilities: [],
     }));
 
     expect(result.status).toBe("completed");
-    expect(order).toEqual([
-      "child-a:concrete-connection:frozen-model:false",
-      "child-b:concrete-connection:frozen-model:false",
-    ]);
+    expect(order).toEqual(childPlan.children.map((descriptor) =>
+      descriptor.childId + ":concrete-connection:frozen-model:false",
+    ));
     expect(rootMessages).toEqual(["before A-RESULT middle B-RESULT"]);
   });
 
@@ -1606,58 +1676,10 @@ describe("Agentic WORK phase", () => {
   });
 
   test("does not retain private child/provider reasoning or work prose", async () => {
-    const childSegments: AssemblyMessageSegmentV1[] = [
-      { kind: "result_slot", slotIndex: 0, resultName: "privacy_result", maxBytes: 100, bytes: 0 },
-    ];
-    const privateMessage: AssemblyMessageFixture = {
-      role: "user" as const,
-      contentKind: "segments" as const,
-      blockIndex: 0,
-      blockId: "privacy-block",
-      provenance: {
-        kind: "block" as const,
-        sourceId: "privacy-block",
-        sourceRevision: "1",
-        sourceIndex: 0,
-      },
-      segments: childSegments,
-    };
-    const privateChild = {
-      childId: "privacy-child",
-      profileId: "writer",
-      task: "child",
-      taskBytes: 5,
-      slotIndex: 0,
-      traversalIndex: 0,
-      blockIndex: 0,
-      blockId: "privacy-block",
-      resultName: "privacy_result",
-      maxOutputBytes: 100,
-      maxOutputTokens: 25,
-      required: true,
-      toolIds: [],
-      streamActivity: false,
-      sourceOffset: 0,
-      failurePolicy: "required" as const,
-      producerSeal: "83a9f6e0",
-    };
-    const privatePlan = plan({
-      messages: [privateMessage],
-      providerMessages: [privateMessage],
-      children: [privateChild],
-      childDescriptors: [privateChild],
-      resultSlots: [assemblyResultSlot(0, "privacy_result", 0, "privacy-block", 100, "privacy-child", "83a9f6e0")],
-      seals: [{
-        kind: "producer" as const,
-        resultName: "privacy_result",
-        slotIndex: 0,
-        blockIndex: 0,
-        blockId: "privacy-block",
-        sequence: 0,
-      }],
-      activationEvidence: [{ kind: "activation" as const, profileId: "writer", authorized: true, tokenCost: 0 }],
-      tokenEvidence: [{ kind: "token" as const, profileId: "writer", estimatedInputTokens: 0, estimatedOutputTokens: 0 }],
-    });
+    const { plan: privatePlan, snapshot: privateSnapshot } = await compiledChildFixture([{
+      id: "privacy-block",
+      content: "{{agent::writer::as=privacy_result}}child{{/agent}}",
+    }]);
     let childInvocations = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => ({
       content: "PRIVATE_PROVIDER_WORK",
@@ -1666,6 +1688,7 @@ describe("Agentic WORK phase", () => {
       tool_calls: [complete()],
     }), {
       plan: privatePlan,
+      snapshot: privateSnapshot,
       executeChild: async () => {
         childInvocations += 1;
         return { content: "PRIVATE_CHILD_BODY" };
@@ -1714,9 +1737,15 @@ describe("Agentic WORK phase", () => {
     expect(visibleTools).not.toContain("agent_delegate");
   });
 
-  test("exposes and dispatches an authored child record_question grant", async () => {
-    const frame = createAgenticChildFrame({
-      frameId: "question-child-granted",
+  test("keeps a root-authored record_question grant unavailable to child frames", () => {
+    const root = composeAgenticWorkToolDefinitions({
+      coreToolIds: [],
+      workspaceCapabilities: ["record_question"],
+    });
+    expect(root.rootDefinitions.map((definition) => definition.name)).toContain("workspace_record_question");
+
+    expect(() => createAgenticChildFrame({
+      frameId: "question-child-rejected",
       parentFrameId: "root",
       connectionId: "concrete-connection",
       model: "frozen-model",
@@ -1724,50 +1753,7 @@ describe("Agentic WORK phase", () => {
       workspaceCapabilities: ["record_question"],
       taskId: "task-question",
       signal: new AbortController().signal,
-    });
-    const root = composeAgenticWorkToolDefinitions({
-      coreToolIds: [],
-      workspaceCapabilities: ["record_question"],
-    });
-    expect(root.rootDefinitions.map((definition) => definition.name)).toContain("workspace_record_question");
-
-    let dispatches = 0;
-    let visibleTools: readonly string[] = [];
-    let executedOperation: string | undefined;
-    let executedArgs: Record<string, unknown> | undefined;
-    const result = await executeBoundedAgenticChildFrame({
-      frame,
-      task: "record the open question",
-      systemPrompt: "system",
-      dispatch: async ({ tools }) => {
-        dispatches += 1;
-        visibleTools = tools.map((definition) => definition.name);
-        return dispatches === 1
-          ? response("", [call("workspace_record_question", "record-question", { summary: "Need source evidence." })])
-          : response("done");
-      },
-      workspace: {
-        execute: async (operation, args) => {
-          executedOperation = operation;
-          executedArgs = args;
-          return { result: { accepted: true, workspaceRevision: 1 } };
-        },
-      },
-    });
-
-    expect(visibleTools).toContain("workspace_record_question");
-    expect(executedOperation).toBe("record_question");
-    expect(executedArgs).toMatchObject({
-      summary: "Need source evidence.",
-      taskId: "task-question",
-      actor: "child",
-      frameId: "question-child-granted",
-    });
-    expect(result).toMatchObject({
-      status: "succeeded",
-      content: "done",
-      workspaceRevision: 1,
-    });
+    })).toThrow("Child frame cannot receive this workspace operation");
   });
 
   test("denies record_question when a child grant is absent", async () => {
@@ -1898,10 +1884,16 @@ describe("Agentic WORK phase", () => {
     const assigned: string[] = [];
     const childFrames: string[] = [];
     const childWorkspaces: unknown[] = [];
+    const ledger = assignmentLedger([
+      { id: "task-1", state: "active", assignedFrameId: null },
+      { id: "task-2", state: "active", assignedFrameId: null },
+    ]);
     let workspaceRevision = 0;
     let round = 0;
     const ws = workspace({
+      listOpenTasks: ledger.listOpenTasks,
       assignChildTasks: async ({ assignments }) => {
+        ledger.assign(assignments);
         workspaceRevision += 1;
         assigned.push(...assignments.map(({ taskId }) => taskId));
         return {
@@ -1930,9 +1922,10 @@ describe("Agentic WORK phase", () => {
         toolIds: ["chat_search_history"],
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
       }],
-      executeChild: async ({ frame, workspace: childWorkspace }) => {
+      executeChild: async ({ descriptor, frame, workspace: childWorkspace }) => {
         childFrames.push(frame.frameId);
         childWorkspaces.push(childWorkspace);
+        ledger.complete(descriptor.taskId ?? "");
         return { content: "child-result", status: "succeeded" };
       },
     }));
@@ -1949,6 +1942,7 @@ describe("Agentic WORK phase", () => {
     const childProfiles: string[] = [];
     const childToolNames: string[][] = [];
     const assignedTaskIds: string[] = [];
+    const ledger = assignmentLedger([{ id: "task-1", state: "active", assignedFrameId: null }]);
     const inspectionRecords: Array<{ kind: string; value: Record<string, unknown> }> = [];
     const result = await runAgenticWorkPhase(baseOptions(async ({ tools }) => {
       round += 1;
@@ -1963,7 +1957,9 @@ describe("Agentic WORK phase", () => {
     }, {
       rootFrameId: "turn-case-folded",
       workspace: workspace({
+        listOpenTasks: ledger.listOpenTasks,
         assignChildTasks: async ({ assignments }) => {
+          ledger.assign(assignments);
           assignedTaskIds.push(...assignments.map(({ taskId }) => taskId));
           return {
             accepted: true,
@@ -1980,6 +1976,7 @@ describe("Agentic WORK phase", () => {
       executeChild: async ({ descriptor, definitions }) => {
         childProfiles.push(descriptor.profileId);
         childToolNames.push(definitions.map((definition) => definition.name));
+        ledger.complete(descriptor.taskId ?? "");
         return { content: "child-result", status: "succeeded" };
       },
       inspection: {
@@ -2019,6 +2016,11 @@ describe("Agentic WORK phase", () => {
     const assignedFrameIds: string[] = [];
     const assignedChildIds: string[] = [];
     const run = async (rootFrameId: string, count: number, prefix: string) => {
+      const ledger = assignmentLedger(Array.from({ length: count }, (_, index) => ({
+        id: prefix + "-task-" + (index + 1),
+        state: "active" as const,
+        assignedFrameId: null,
+      })));
       let round = 0;
       return runAgenticWorkPhase(baseOptions(async () => {
         round += 1;
@@ -2033,7 +2035,9 @@ describe("Agentic WORK phase", () => {
       }, {
         rootFrameId,
         workspace: workspace({
+          listOpenTasks: ledger.listOpenTasks,
           assignChildTasks: async ({ assignments }) => {
+            ledger.assign(assignments);
             assignedFrameIds.push(...assignments.map(({ frameId }) => frameId));
             return {
               accepted: true,
@@ -2049,6 +2053,7 @@ describe("Agentic WORK phase", () => {
         }],
         executeChild: async ({ descriptor }) => {
           assignedChildIds.push(descriptor.childId);
+          ledger.complete(descriptor.taskId ?? "");
           return { content: "child-result", status: "succeeded" };
         },
       }));
@@ -2097,6 +2102,7 @@ describe("Agentic WORK phase", () => {
   test("names delegated child frames uniquely across concurrent turns", async () => {
     const childFrames: string[] = [];
     const runTurn = async (rootFrameId: string) => {
+      const ledger = assignmentLedger([{ id: "task-1", state: "active", assignedFrameId: null }]);
       let round = 0;
       return runAgenticWorkPhase(baseOptions(async () => {
         round += 1;
@@ -2110,20 +2116,25 @@ describe("Agentic WORK phase", () => {
       }, {
         rootFrameId,
         workspace: workspace({
-          assignChildTasks: async ({ assignments }) => ({
-            accepted: true,
-            workspaceRevision: 1,
-            assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
-          }),
+          listOpenTasks: ledger.listOpenTasks,
+          assignChildTasks: async ({ assignments }) => {
+            ledger.assign(assignments);
+            return {
+              accepted: true,
+              workspaceRevision: 1,
+              assignments: assignments.map(({ taskId, frameId }) => ({ taskId, frameId })),
+            };
+          },
         }),
         delegatableProfiles: [{
           profileId: "writer",
           toolIds: ["chat_search_history"],
           workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
         }],
-        executeChild: async ({ frame }) => {
+        executeChild: async ({ descriptor, frame }) => {
           childFrames.push(frame.frameId);
-        return { content: "child-result", status: "succeeded" };
+          ledger.complete(descriptor.taskId ?? "");
+          return { content: "child-result", status: "succeeded" };
         },
       }));
     };
@@ -2262,6 +2273,7 @@ describe("Agentic WORK phase", () => {
     const assigned: string[] = [];
     const childTasks: string[] = [];
     let assignCalls = 0;
+    const ledger = assignmentLedger([{ id: "task-1", state: "active", assignedFrameId: null }]);
     let round = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       round += 1;
@@ -2282,9 +2294,10 @@ describe("Agentic WORK phase", () => {
       return response("", [complete("after-unknown")]);
     }, {
       workspace: workspace({
-        listOpenTasks: async () => [{ id: "task-1", state: "active", assignedFrameId: null }],
+        listOpenTasks: ledger.listOpenTasks,
         assignChildTasks: async ({ assignments }) => {
           assignCalls += 1;
+          ledger.assign(assignments);
           assigned.push(...assignments.map(({ taskId }) => taskId));
           return {
             accepted: true,
@@ -2299,7 +2312,9 @@ describe("Agentic WORK phase", () => {
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
       }],
       executeChild: async ({ descriptor }) => {
-        childTasks.push(descriptor.taskId ?? "");
+        const taskId = descriptor.taskId ?? "";
+        childTasks.push(taskId);
+        ledger.complete(taskId);
         return { content: "child-result", status: "succeeded" };
       },
     }));
@@ -2321,6 +2336,7 @@ describe("Agentic WORK phase", () => {
   test("releases reserved child budget when assignment fails and continues the turn", async () => {
     let assignCalls = 0;
     let childCalls = 0;
+    const ledger = assignmentLedger([{ id: "task-1", state: "active", assignedFrameId: null }]);
     let round = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       round += 1;
@@ -2346,13 +2362,14 @@ describe("Agentic WORK phase", () => {
     }, {
       budget: { maxChildFrames: 1, maxProviderRounds: 4 },
       workspace: workspace({
-        listOpenTasks: async () => [{ id: "task-1", state: "active", assignedFrameId: null }],
+        listOpenTasks: ledger.listOpenTasks,
         assignChildTasks: async ({ assignments }) => {
           assignCalls += 1;
           if (assignCalls === 1) {
             const error = Object.assign(new Error("task task-1 was not found"), { code: "not_found" });
             throw error;
           }
+          ledger.assign(assignments);
           return {
             accepted: true,
             workspaceRevision: assignCalls,
@@ -2365,8 +2382,9 @@ describe("Agentic WORK phase", () => {
         toolIds: ["chat_search_history"],
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
       }],
-      executeChild: async () => {
+      executeChild: async ({ descriptor }) => {
         childCalls += 1;
+        ledger.complete(descriptor.taskId ?? "");
         return { content: "child-result", status: "succeeded" };
       },
     }));
@@ -2430,7 +2448,12 @@ describe("Agentic WORK phase", () => {
             sourceWorkspaceRevision: expectedRevision ?? 0,
             mandatory: [],
             optional: [],
-            omissions: [],
+            omissions: [
+              { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+              { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+              { class: "optional_task", omittedCount: 0, firstOmittedCursor: null },
+              { class: "artifact", omittedCount: 0, firstOmittedCursor: null },
+            ],
             literal: "",
             utf8Bytes: 0,
           };
@@ -2461,6 +2484,10 @@ describe("Agentic WORK phase", () => {
   test("keeps an assignable sibling when another task is already assigned", async () => {
     const assigned: string[] = [];
     const childTasks: string[] = [];
+    const ledger = assignmentLedger([
+      { id: "task-1", state: "active", assignedFrameId: null },
+      { id: "task-2", state: "active", assignedFrameId: "already-child" },
+    ]);
     let round = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       round += 1;
@@ -2481,11 +2508,9 @@ describe("Agentic WORK phase", () => {
       return response("", [complete("after-conflict")]);
     }, {
       workspace: workspace({
-        listOpenTasks: async () => [
-          { id: "task-1", state: "active", assignedFrameId: null },
-          { id: "task-2", state: "active", assignedFrameId: "already-child" },
-        ],
+        listOpenTasks: ledger.listOpenTasks,
         assignChildTasks: async ({ assignments }) => {
+          ledger.assign(assignments);
           assigned.push(...assignments.map(({ taskId }) => taskId));
           return {
             accepted: true,
@@ -2500,7 +2525,9 @@ describe("Agentic WORK phase", () => {
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
       }],
       executeChild: async ({ descriptor }) => {
-        childTasks.push(descriptor.taskId ?? "");
+        const taskId = descriptor.taskId ?? "";
+        childTasks.push(taskId);
+        ledger.complete(taskId);
         return { content: "child-result", status: "succeeded" };
       },
     }));
@@ -2521,6 +2548,7 @@ describe("Agentic WORK phase", () => {
     const assigned: string[] = [];
     const childTasks: string[] = [];
     let assignCalls = 0;
+    const ledger = assignmentLedger([{ id: "task-1", state: "active", assignedFrameId: null }]);
     let round = 0;
     const result = await runAgenticWorkPhase(baseOptions(async () => {
       round += 1;
@@ -2551,17 +2579,16 @@ describe("Agentic WORK phase", () => {
               page: 0,
               pageSize: 100,
               total: 1,
-              items: [{
-                id: "task-1",
-                state: "active",
-                assignedFrameId: null,
+              items: (await ledger.listOpenTasks()).map((task) => ({
+                ...task,
                 objective: "x".repeat(70 * 1024),
-              }],
+              })),
             },
           };
         },
         assignChildTasks: async ({ assignments }) => {
           assignCalls += 1;
+          ledger.assign(assignments);
           assigned.push(...assignments.map(({ taskId }) => taskId));
           return {
             accepted: true,
@@ -2576,7 +2603,9 @@ describe("Agentic WORK phase", () => {
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
       }],
       executeChild: async ({ descriptor }) => {
-        childTasks.push(descriptor.taskId ?? "");
+        const taskId = descriptor.taskId ?? "";
+        childTasks.push(taskId);
+        ledger.complete(taskId);
         return { content: "child-result", status: "succeeded" };
       },
     }));
@@ -2700,6 +2729,7 @@ describe("Agentic WORK phase", () => {
         ]);
       },
       workspace: {
+        listTaskAcceptance: async () => [],
         execute: async (_operation, args) => {
           submittedArgs = args;
           return {
@@ -2776,6 +2806,7 @@ describe("Agentic WORK phase", () => {
   });
 
   test("accepts the optional task state carried by a workspace projection", async () => {
+    const taskLiteral = 'required_task "task" state="completed": "Evidence task completed."\n';
     const result = await runAgenticWorkPhase(baseOptions(async () => response("", [complete("task-state-projection")]), {
       workspace: workspace({
         acceptCompletionFixedPoint: async () => ({
@@ -2792,18 +2823,23 @@ describe("Agentic WORK phase", () => {
               taskState: "completed",
             }],
             optional: [],
-            omissions: [],
-            literal: "",
-            utf8Bytes: 0,
+            omissions: [
+              { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+              { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+              { class: "optional_task", omittedCount: 0, firstOmittedCursor: null },
+              { class: "artifact", omittedCount: 0, firstOmittedCursor: null },
+            ],
+            literal: taskLiteral,
+            utf8Bytes: new TextEncoder().encode(taskLiteral).byteLength,
           },
         }),
       }),
     }));
     expect(result.status).toBe("completed");
     expect(result.workspaceRevision).toBe(5);
-    expect(result.renderHandoff?.workspaceContextProjection.mandatory[0]).toMatchObject({
-      kind: "required_task",
-      taskState: "completed",
+    expect(result.renderHandoff?.workspaceContextProjection).toMatchObject({
+      mandatory: [],
+      optional: [],
     });
   });
 
@@ -2839,7 +2875,12 @@ describe("Agentic WORK phase", () => {
             sourceWorkspaceRevision: 9,
             mandatory: [],
             optional: [],
-            omissions: [],
+            omissions: [
+              { class: "accepted_submission", omittedCount: 0, firstOmittedCursor: null },
+              { class: "finding", omittedCount: 0, firstOmittedCursor: null },
+              { class: "optional_task", omittedCount: 0, firstOmittedCursor: null },
+              { class: "artifact", omittedCount: 0, firstOmittedCursor: null },
+            ],
             literal: "",
             utf8Bytes: 0,
           };
@@ -3011,6 +3052,7 @@ describe("Agentic WORK phase", () => {
         ]);
       },
       workspace: {
+        listTaskAcceptance: async () => [],
         execute: async () => {
           controller.abort(new DOMException("cancel", "AbortError"));
           return { result: { ok: true } };
@@ -4040,7 +4082,7 @@ describe("Agentic WORK phase", () => {
     expect(transitions["required-recovery-task"]).toBe("failed");
     expect(dispatchCount).toBe(3);
     expect(result.status).toBe("failed");
-    expect(result.code).toBe("child_required_failed");
+    expect(result.code).toBe("provider_error");
     expect(completionCalls).toBe(0);
     expect(result.observations.find((observation) => (
       observation.callId === "required-recovery-complete-2"
@@ -4196,7 +4238,7 @@ describe("Agentic WORK phase", () => {
     expect(dispatchCount).toBe(2);
     expect(transitions["required-budget-task"]).toBe("failed");
     expect(result.status).toBe("failed");
-    expect(result.code).toBe("child_required_failed");
+    expect(result.code).toBe("provider_error");
   });
   test("does not resolve an authored task alias against a scoped operational inventory", async () => {
     let round = 0;
@@ -4814,7 +4856,7 @@ describe("Agentic WORK phase", () => {
       .filter((message) => message.role === "system" && typeof message.content === "string")
       .map((message) => message.content as string)
       .filter((content) => content.includes("_INSTRUCTION"));
-    expect(messageSequences[0]).toHaveLength(2);
+    expect(messageSequences[0]).toHaveLength(3);
     expect(phaseInstructions(messageSequences[0]!)).toEqual(["LIVE_TASK_PHASE_INSTRUCTION"]);
     expect(dispatches[0]?.tools).toEqual(["complete_turn", "workspace_accept_submission"]);
     expect(phaseInstructions(messageSequences[1]!)).toEqual(["LIVE_TASK_PHASE_INSTRUCTION"]);
@@ -5026,6 +5068,7 @@ describe("Agentic WORK phase", () => {
       }
       return response("", [complete(`after-collab-${dispatchCount}`)]);
     }, {
+      budget: { maxProviderRounds: 8, maxUnsignedBoundaries: 4 },
       plan: plan({
         customPhasePlan: compileAgentRuntimePhases([
           customPhase("exercise-phase", ["workspace_write"], {
@@ -5035,7 +5078,7 @@ describe("Agentic WORK phase", () => {
             instructionRefs: [exerciseRef],
             nextPhaseIds: ["collaborate-phase"],
           }),
-          customPhase("collaborate-phase", ["delegation"], {
+          customPhase("collaborate-phase", ["delegation", "workspace_write"], {
             required: false,
             repeatLimit: 0,
             skip: { kind: "preset_variable", name: "fn_collaboration", operator: "equals", value: 0 },
@@ -5074,7 +5117,7 @@ describe("Agentic WORK phase", () => {
         }),
       }),
       workspaceCapabilities: ["accept_submission"],
-      phaseEvaluationContext: phaseContext({ fn_collaboration: 1 }),
+      phaseEvaluationContext: phaseContext({ fn_collaboration: true }),
       phaseAdmittedCapabilities: ["workspace_write", "delegation"],
       phaseRevision: 4,
       delegatableProfiles: [{
@@ -6089,7 +6132,7 @@ describe("Agentic WORK phase", () => {
     }, {
       workspace: workspace({
         getCompletionGates: undefined,
-        listRequiredOpenTasks: async () => ["turn:from-list", { id: "ignored-object" }],
+        listRequiredOpenTasks: async () => ["turn:from-list"],
         freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
       }),
       budget: { maxProviderRounds: 3, maxUnsignedBoundaries: 1 },
@@ -6508,8 +6551,8 @@ describe("Agentic WORK phase", () => {
       },
     }));
     expect(outcome.status).toBe("failed");
-    expect(outcome.code).toBe("invalid_plan");
-    expect(results.some((entry) => entry.includes("invalid_plan"))).toBe(true);
+    expect(outcome.code).toBe("completion_freeze_failed");
+    expect(results.some((entry) => entry.includes("completion_freeze_failed"))).toBe(true);
     expect(results.some((entry) => entry.includes("openRequiredTaskIds"))).toBe(false);
     expect(results.some((entry) => entry.includes("currentPhaseId"))).toBe(false);
   });
@@ -6703,7 +6746,7 @@ describe("Agentic WORK phase", () => {
         }
       }
       if (dispatchCount === 1) {
-        return response("", [call("workspace_read_section", "read-baseline", { section: "baseline" })]);
+        return response("", [call("workspace_read_section", "read-baseline", { section: "constraints" })]);
       }
       if (dispatchCount === 2) {
         return response("", [call("workspace_read_section", "read-objective", { section: "objective" })]);
@@ -6728,7 +6771,7 @@ describe("Agentic WORK phase", () => {
     }, {
       workspace: workspace({
         execute: async (operation, args) => {
-          if (operation === "read_section" && args.section === "baseline") {
+          if (operation === "read_section" && args.section === "constraints") {
             throw Object.assign(new Error("section is invalid"), { code: "invalid_input" });
           }
           if (operation === "create_task" && args.taskId === "fn_required_child") {

@@ -2,7 +2,6 @@ import type { StateCreator } from 'zustand'
 import type {
   AgentPersistentWorkspaceCollectionV1,
   AgentPersistentWorkspaceCollectionsStateV1,
-  AgentRunResyncDescriptorV1,
   AppStore,
   AgentRunsSlice,
 } from '@/types/store'
@@ -672,8 +671,9 @@ function sameInspectionCorrelationIdentity(
 
 function normalizeError(value: unknown): AgentRunPublicErrorV2 | undefined {
   if (!isUnknownRecord(value)) return undefined
-  const knownCode = isPublicErrorCode(value.code)
-  const code = knownCode ? value.code : 'internal_error'
+  const publicCode = isPublicErrorCode(value.code) ? value.code : null
+  const knownCode = publicCode !== null
+  const code: AgentRunPublicErrorCodeV2 = publicCode ?? 'internal_error'
   const category = knownCode
     ? (typeof value.category === 'string' && ERROR_CATEGORIES.has(value.category)
       ? value.category as AgentRunPublicErrorV2['category']
@@ -2261,7 +2261,9 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
           || page.totalRuns !== descriptor.totalRuns
           || normalized.cursorSequence !== descriptor.snapshotSequence
         )
-        || previousCursorSequence !== undefined && normalized.cursorSequence < previousCursorSequence
+        || previousCursorSequence !== undefined
+          && normalized.cursorSequence < previousCursorSequence
+          && page.complete === false
         || duplicateInPage
         || overlapsAcceptedPage
       : descriptor !== undefined

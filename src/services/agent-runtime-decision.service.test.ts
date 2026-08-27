@@ -632,7 +632,6 @@ describe("AgentRuntimeDecisionService", () => {
       getReadinessVector: () => ({
         ready: false,
         reasons: ["input_revisions_incomplete", "provider_capability_unavailable"],
-        inputRevisionDigest: "",
       }),
     });
     const responseRequest = request({
@@ -679,7 +678,6 @@ describe("AgentRuntimeDecisionService", () => {
       getReadinessVector: () => ({
         ready: false,
         reasons: ["input_revisions_incomplete", "provider_capability_unavailable"],
-        inputRevisionDigest: "",
       }),
     });
     const decision = await service.resolve(USER_ID, request({
@@ -709,7 +707,6 @@ describe("AgentRuntimeDecisionService", () => {
       getReadinessVector: () => ({
         ready: false,
         reasons: ["input_revisions_incomplete"],
-        inputRevisionDigest: "",
       }),
     });
     const decision = await service.resolve(USER_ID, request({ mode: "agentic", inputRevisions: {} }));

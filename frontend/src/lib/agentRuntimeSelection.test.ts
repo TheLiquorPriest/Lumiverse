@@ -1,11 +1,11 @@
-import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { effectiveRuntimeApi } from '@/api/effective-runtime'
 import type {
   EffectiveRuntimePublicResponseV1,
   EffectiveRuntimeRequestV1,
   LoomRuntimePolicyV1,
 } from '@/types/effective-runtime'
-import { repairCategoryForCode } from '@/types/effective-runtime'
+import { isAgenticGenerationType, repairCategoryForCode } from '@/types/effective-runtime'
 import * as runtime from './agentRuntimeSelection'
 import type { RuntimeGenerationRequest } from './agentRuntimeSelection'
 
@@ -55,10 +55,38 @@ function decision(
   const runtimeDecisionExpiresAt = overrides.runtimeDecisionExpiresAt === undefined
     ? (runtimeDecisionToken === null ? null : Date.now() + 60_000)
     : overrides.runtimeDecisionExpiresAt
+  const responseInspectionOmission: NonNullable<EffectiveRuntimePublicResponseV1['responseOmission']> = {
+    version: 1,
+    surface: 'RESPONSE',
+    visibility: 'work_only',
+    reason: 'work_only',
+    omittedEntryIds: [],
+    source: [],
+    omittedPhaseInstructions: [],
+  }
+  const responseOmission = effectiveMode === 'response' ? responseInspectionOmission : null
+  const inspection: EffectiveRuntimePublicResponseV1['inspection'] = effectiveMode === 'response'
+    ? {
+        version: 1,
+        surface: 'RESPONSE',
+        checkpoint: 'ASSEMBLE',
+        items: [],
+        effectiveEntryIds: [],
+        responseOmission: responseInspectionOmission,
+      }
+    : {
+        version: 1,
+        surface: 'WORK',
+        checkpoint: 'ASSEMBLE',
+        items: [],
+        effectiveEntryIds: [],
+      }
   return {
     version: 1,
     chatId: request.chatId,
-    target: request.target ?? { generationType },
+    target: request.target ?? {
+      generationType: isAgenticGenerationType(request.generationType) ? request.generationType : 'normal',
+    },
     connection: {
       id: 'connection-1',
       label: 'Primary',
@@ -69,14 +97,8 @@ function decision(
       credentialRevision: 1,
       candidateRevision: 1,
     },
-    inspection: {
-      version: 1,
-      surface: 'WORK',
-      checkpoint: 'WORK',
-      items: [],
-      effectiveEntryIds: [],
-    },
-    responseOmission: null,
+    inspection,
+    responseOmission,
     preset: { id: 'preset-1', label: 'Preset', revision: 1, source: 'chat' },
     agentsEnabled: true,
     allowedModes: ['response', 'agentic'],

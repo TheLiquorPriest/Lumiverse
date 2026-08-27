@@ -1094,14 +1094,13 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(delta?.resync).toBe(false);
     expect(delta?.events).toHaveLength(1);
     expect(delta?.events[0]).toMatchObject({
-      sequence: expect.any(Number),
       run: {
         turnId: updatedTurnId,
         revision: updatedRevision,
         updatedAt,
       },
     });
-    expect(delta!.events[0]!.sequence).toBeGreaterThan(first!.cursorSequence);
+    expect(delta!.events[0]!.sequence).toBe(first!.cursorSequence + 1);
   });
   test("freezes resync membership across expiry and projection deletion", () => {
     seedChat(OWNER, "chat-resync-retention");
@@ -1156,7 +1155,7 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     ).get(snapshotId!)).toEqual({ count: 0 });
   });
 
-  test("keeps null, zero, negative, and malformed expiry rows visible in resync", () => {
+  test("keeps null, zero, negative, and malformed legacy expiry rows visible in resync", () => {
     seedChat(OWNER, "chat-resync-expiry-values");
     const turnIds = [
       "turn-resync-expiry-null",
@@ -1171,6 +1170,13 @@ describe("AgentRunPublicV2 projection and cursor", () => {
         revision: 1,
       }));
     }
+    // Production writes use the strict execution table. Rebuild only this
+    // read fixture without constraints to exercise rows left by legacy schemas.
+    getDb().run("PRAGMA foreign_keys = OFF");
+    getDb().run("ALTER TABLE agent_turn_executions RENAME TO strict_agent_turn_executions");
+    getDb().run(
+      "CREATE TABLE agent_turn_executions AS SELECT * FROM strict_agent_turn_executions",
+    );
     getDb().query("UPDATE agent_turn_executions SET expires_at = NULL WHERE id = ?")
       .run(turnIds[0]!);
     getDb().query("UPDATE agent_turn_executions SET expires_at = 0 WHERE id = ?")

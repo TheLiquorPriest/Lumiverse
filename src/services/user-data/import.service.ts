@@ -85,13 +85,12 @@ import {
   buildArchiveOwnerPredicate,
   assertArchiveRegistryCoverage,
   isSecretSettingKey,
-  type ArchiveTableSpecV2,
 } from "./table-registry";
 import { markImportedConnectionForReview } from "../connection-authority";
 
 import { resolveArchivePathWithinRoot } from "./snapshot";
 import { scrubArchiveRowPrivateData } from "./export.service";
-import { sanitizeEntry, safeJoin, SanitizeError, type SanitizedEntry } from "./sanitize";
+import { sanitizeEntry, safeJoin, type SanitizedEntry } from "./sanitize";
 import {
   migrateParsedLegacyAgentConfigV1,
   parseLegacyAgentConfigV1,
@@ -1655,7 +1654,6 @@ const MAX_MANIFEST_COMPRESSED_BYTES = 32 * 1024 * 1024;
 // field" (tag 0x0001); we honour those below when the standard 32-bit
 // fields are the 0xFFFFFFFF / 0xFFFF sentinels.
 
-const EOCD_SIG = 0x06054b50; // "PK\x05\x06"
 const CDH_SIG = 0x02014b50;  // "PK\x01\x02"
 const LFH_SIG = 0x04034b50;  // "PK\x03\x04"
 const ZIP64_EOCD_LOCATOR_SIG = 0x07064b50; // "PK\x06\x07"
@@ -2564,21 +2562,6 @@ function ident(name: string): string {
     throw new Error(`unsafe identifier: ${name}`);
   }
   return `"${name}"`;
-}
-
-function getTableColumns(table: string): string[] {
-  return (
-    getDb()
-      .query(`PRAGMA table_info(${ident(table)})`)
-      .all() as { name: string }[]
-  ).map((c) => c.name);
-}
-
-function tableExists(table: string): boolean {
-  const row = getDb()
-    .query("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?")
-    .get(table) as { name: string } | null;
-  return !!row;
 }
 
 function ensureDir(dir: string): void {
@@ -3817,7 +3800,7 @@ function validateVectorArchiveRowShape(
   const userId = boundedUtf8(row.user_id, "user_id", MAX_VECTOR_ID_BYTES);
   const sourceType = boundedUtf8(row.source_type, "source_type", MAX_VECTOR_ID_BYTES);
   const sourceId = boundedUtf8(row.source_id, "source_id", MAX_VECTOR_ID_BYTES);
-  const ownerId = boundedUtf8(row.owner_id, "owner_id", MAX_VECTOR_ID_BYTES);
+  boundedUtf8(row.owner_id, "owner_id", MAX_VECTOR_ID_BYTES);
   const id = boundedUtf8(row.id, "id", MAX_VECTOR_ID_BYTES);
   const chunkIndex = row.chunk_index;
   if (!Number.isSafeInteger(chunkIndex) || Number(chunkIndex) < 0 || Number(chunkIndex) > MAX_VECTOR_DIMENSION) {
@@ -4197,7 +4180,7 @@ function sealedPresetImportError(message: string): Error {
   return new Error(`sealed preset ${message}`);
 }
 
-function isSealedPresetPlaceholder(value: unknown): boolean {
+function isSealedPresetPlaceholder(value: unknown): value is string {
   return typeof value === "string"
     && SEALED_PRESET_PLACEHOLDER_ENVELOPE_RE.test(value.trim());
 }
@@ -4249,6 +4232,28 @@ function descriptorBlocksEqual(
   return left.blocks.every((block) => rightByKey.get(block.key) === block.sha256);
 }
 
+type ImportSealedPresetManifest = {
+  version: string | null;
+  blocks: Array<{ key: string; sha256: string }>;
+};
+
+function parseImportSealedPresetManifest(value: unknown): ImportSealedPresetManifest {
+  const manifest = parseSealedPresetManifest(value);
+  if (!Array.isArray(manifest.blocks)) {
+    throw sealedPresetImportError("manifest normalization returned no blocks");
+  }
+  const blocks = manifest.blocks.map((block) => {
+    if (typeof block.key !== "string" || typeof block.sha256 !== "string") {
+      throw sealedPresetImportError("manifest normalization returned an invalid block");
+    }
+    return { key: block.key, sha256: block.sha256 };
+  });
+  if (manifest.version !== null && manifest.version !== undefined && typeof manifest.version !== "string") {
+    throw sealedPresetImportError("manifest normalization returned an invalid version");
+  }
+  return { version: manifest.version ?? null, blocks };
+}
+
 function readSealedMetadataText(
   metadata: Record<string, unknown>,
   key: string,
@@ -4281,19 +4286,9 @@ function collectSealedBlockText(
   return values;
 }
 
-type SealedPresetLinkedCarrier = {
-  stashId: string;
-  sealed: boolean;
-  key: string | null;
-  hubPresetId: string | null;
-  hubPresetVersion: string | null;
-  sha256: string | null;
-};
-
 type SealedPresetDescriptorPlan = {
   promptOrder: unknown[];
   metadata: Record<string, unknown>;
-  linkedStashCarriers: SealedPresetLinkedCarrier[];
 };
 
 function readLinkedCarrierString(
@@ -4316,28 +4311,15 @@ function readLinkedCarrierString(
   return key === "sealedSha256" ? value.toLowerCase() : value;
 }
 
-function collectSealedPresetLinkedCarriers(
-  promptOrder: readonly unknown[],
-): SealedPresetLinkedCarrier[] {
-  const carriers: SealedPresetLinkedCarrier[] = [];
+function validateSealedPresetLinkedCarriers(promptOrder: readonly unknown[]): void {
   for (const value of promptOrder) {
     if (!isRecord(value) || !Object.hasOwn(value, "stashId")) continue;
     if (value.stashId === null || value.stashId === undefined) continue;
     if (typeof value.stashId !== "string" || !value.stashId.trim()) {
       throw sealedPresetImportError("preset linked stashId must be a non-empty string");
     }
-    const stashId = value.stashId.trim();
-    if (!isCanonicalSealedPresetBlock(value)) {
-      carriers.push({
-        stashId,
-        sealed: false,
-        key: null,
-        hubPresetId: null,
-        hubPresetVersion: null,
-        sha256: null,
-      });
-      continue;
-    }
+    if (!isCanonicalSealedPresetBlock(value)) continue;
+
     const placeholderKey = sealedPresetPlaceholder(value.content);
     if (isSealedPresetPlaceholder(value.content) && !placeholderKey) {
       throw sealedPresetImportError("linked stash block has an empty placeholder key");
@@ -4346,32 +4328,14 @@ function collectSealedPresetLinkedCarriers(
     if (sealedKey && placeholderKey && sealedKey !== placeholderKey) {
       throw sealedPresetImportError("linked stash block key conflicts with its placeholder");
     }
-    const key = sealedKey ?? placeholderKey;
-    if (!key) throw sealedPresetImportError("linked stash block is missing its key");
-    carriers.push({
-      stashId,
-      sealed: true,
-      key,
-      hubPresetId: readLinkedCarrierString(value, "sealedOriginPresetId", true),
-      hubPresetVersion: readLinkedCarrierString(value, "sealedOriginVersion", true),
-      sha256: readLinkedCarrierString(value, "sealedSha256", true),
-    });
+    if (!(sealedKey ?? placeholderKey)) {
+      throw sealedPresetImportError("linked stash block is missing its key");
+    }
+    readLinkedCarrierString(value, "sealedOriginPresetId", true);
+    readLinkedCarrierString(value, "sealedOriginVersion", true);
+    readLinkedCarrierString(value, "sealedSha256", true);
   }
-  return carriers;
 }
-
-function linkedStashCarriersEqual(
-  left: SealedPresetLinkedCarrier,
-  right: SealedPresetLinkedCarrier,
-): boolean {
-  return left.stashId === right.stashId
-    && left.sealed === right.sealed
-    && left.key === right.key
-    && left.hubPresetId === right.hubPresetId
-    && left.hubPresetVersion === right.hubPresetVersion
-    && left.sha256 === right.sha256;
-}
-
 function promptValueHasSealedHint(value: unknown): boolean {
   if (isRecord(value)) return hasSealedPresetBlockMarker(value);
   if (isSealedPresetPlaceholder(value)) return true;
@@ -4484,7 +4448,7 @@ async function prepareSealedPresetRow(
     portableCandidates.push(parsePortableSealedPresetDescriptor(metadata.portableSealedPreset));
   }
   const legacyCandidates = legacyManifestValues.map((value) => ({
-    manifest: parseSealedPresetManifest(value),
+    manifest: parseImportSealedPresetManifest(value),
   }));
   const firstPortable = portableCandidates[0] ?? null;
   const firstLegacy = legacyCandidates[0]?.manifest ?? null;
@@ -4552,12 +4516,7 @@ async function prepareSealedPresetRow(
     throw sealedPresetImportError("metadata and block origins are inconsistent");
   }
 
-  const legacyBlocks = Array.isArray(firstLegacy?.blocks)
-    ? firstLegacy.blocks.map((block) => ({
-      key: block.key as string,
-      sha256: block.sha256 as string,
-    }))
-    : [];
+  const legacyBlocks = firstLegacy?.blocks ?? [];
   const descriptorBlocks = firstPortable?.blocks ?? legacyBlocks;
   if (descriptorBlocks.length === 0) {
     throw sealedPresetImportError("descriptor has no blocks");
@@ -4602,10 +4561,10 @@ async function prepareSealedPresetRow(
   if (!Array.isArray(materialized.prompt_order) || !isRecord(materialized.metadata)) {
     throw sealedPresetImportError("materializer returned an invalid preset");
   }
+  validateSealedPresetLinkedCarriers(materialized.prompt_order);
   return {
     promptOrder: materialized.prompt_order,
     metadata: materialized.metadata,
-    linkedStashCarriers: collectSealedPresetLinkedCarriers(materialized.prompt_order),
   };
 }
 
@@ -7269,14 +7228,6 @@ async function computeVectorSourceDigest(
   return digest.digest("hex");
 }
 
-function scheduleDerivedRebuildSafely(userId: string): number {
-  try {
-    return scheduleDerivedVectorProjectionSync(userId);
-  } catch {
-    return 0;
-  }
-}
-
 async function projectDerivedVectorsAfterReceipt(job: ImportJob, stage: StagedArchive): Promise<void> {
   const vectorDeadlineAt = Date.now() + IMPORT_FILE_OPERATION_DEADLINE_MS;
   const intent = await buildVectorProjectionIntent(
@@ -7407,6 +7358,7 @@ function parseReceiptSummaryForProjection(raw: string): Record<string, unknown> 
     const identities = vectorRecord[key];
     if (!identities || typeof identities !== "object" || Array.isArray(identities)) return null;
     const entries = Object.entries(identities as Record<string, unknown>);
+    if (entries.length > MAX_PROJECTION_IDENTITY_TABLES) return null;
     const validRebuildSource = new Set(["chats", "messages", "databank_documents", "memory_consolidations"]);
     for (const [table, digest] of entries) {
       const validSourceTable = ARCHIVE_CANONICAL_TABLES.some((spec) => spec.table === table && !!spec.lancedb)
@@ -7677,26 +7629,21 @@ function scheduleDerivedVectorProjectionSyncDetailed(
         AND wbe.disabled = 0 AND length(trim(wbe.content)) > 0`,
     worldState.cursor,
   );
-  const worldRows = worldState.pending
-    ? page<{ id: string }>(
+  if (worldState.pending) {
+    page<{ id: string }>(
       worldState,
       worldQuery.sql.replaceAll("id > ?", "wbe.id > ?").replace("ORDER BY id", "ORDER BY wbe.id"),
       worldQuery.args,
       (row) => {
         db.query(
-          `UPDATE world_book_entries
-              SET vector_index_status = 'pending',
-                  vector_indexed_at = NULL,
-                  vector_index_error = NULL
-            WHERE id = ?`,
+          "UPDATE world_book_entries SET vector_index_status = 'pending', vector_indexed_at = NULL, vector_index_error = NULL WHERE id = ?",
         ).run(row.id);
         queueWorldBookEntryVectorization(userId, row.id, 2, true);
         queued++;
         worldState.queued++;
       },
-    )
-    : [];
-
+    );
+  }
   const complete = VECTOR_REBUILD_SOURCES.every((source) => {
     const state = progress[source];
     return !state.pending && state.queuePending !== true;
