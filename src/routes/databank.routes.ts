@@ -397,7 +397,6 @@ app.post("/search", async (c) => {
 
 // GET /mentions/autocomplete — Autocomplete for # mentions
 app.get("/mentions/autocomplete", (c) => {
-  c.header("Cache-Control", "private, no-store");
   const userId = c.get("userId");
   const q = c.req.query("q") || "";
   const chatId = c.req.query("chatId") || "";
