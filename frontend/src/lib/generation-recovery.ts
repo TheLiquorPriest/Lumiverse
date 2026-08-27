@@ -267,6 +267,23 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
   if (latest.activeChatId !== chatId) return 'ignored'
   if (!isGenerationRequestCurrent(request, genStatus.generationId, genStatus.active)) return 'stale'
 
+  // A fenced active pool snapshot identifies this exact lifecycle. Wire the
+  // lifecycle first because startStreaming clears prior-run metadata, then
+  // project provider/model verbatim without guessing from the model name.
+  if (genStatus.active && genStatus.generationId) {
+    if (!acceptGenerationStarted(chatId, genStatus.generationId)) return 'stale'
+    latest.startStreaming(
+      genStatus.generationId,
+      genStatus.targetMessageId,
+      genStatus.status === 'council' ? undefined : getLocalStreamingType(genStatus.generationType),
+    )
+    latest.setGenerationProviderMetadata({
+      provider: genStatus.provider ?? null,
+      model: genStatus.model ?? null,
+    })
+    latest.setStreamingSwipeId(genStatus.targetSwipeId ?? null)
+  }
+
   if (
     genStatus.active &&
     genStatus.generationId &&
@@ -274,9 +291,6 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
     genStatus.councilRetryPending &&
     genStatus.councilToolsFailure
   ) {
-    if (!acceptGenerationStarted(chatId, genStatus.generationId)) return 'stale'
-    latest.startStreaming(genStatus.generationId, genStatus.targetMessageId)
-    latest.setStreamingSwipeId(genStatus.targetSwipeId ?? null)
     latest.setCouncilExecuting(false)
     const existingFailure = latest.councilToolsFailure
     if (existingFailure?.generationId !== genStatus.generationId) {
@@ -294,9 +308,6 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
   }
 
   if (genStatus.active && genStatus.generationId && (genStatus.status === 'streaming' || genStatus.status === 'reasoning')) {
-    if (!acceptGenerationStarted(chatId, genStatus.generationId)) return 'stale'
-    latest.startStreaming(genStatus.generationId, genStatus.targetMessageId, getLocalStreamingType(genStatus.generationType))
-    latest.setStreamingSwipeId(genStatus.targetSwipeId ?? null)
     if (genStatus.content) latest.reconcileStreamContent(genStatus.content, genStatus.contentOffset ?? 0)
     if (genStatus.reasoning) latest.reconcileStreamReasoning(genStatus.reasoning, genStatus.reasoningOffset ?? 0)
     if (genStatus.reasoningDurationMs) {
@@ -308,9 +319,6 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
   }
 
   if (genStatus.active && genStatus.generationId) {
-    if (!acceptGenerationStarted(chatId, genStatus.generationId)) return 'stale'
-    latest.startStreaming(genStatus.generationId, genStatus.targetMessageId, getLocalStreamingType(genStatus.generationType))
-    latest.setStreamingSwipeId(genStatus.targetSwipeId ?? null)
     return 'applied'
   }
 

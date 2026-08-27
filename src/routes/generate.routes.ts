@@ -151,6 +151,7 @@ app.get("/active", (c) => {
       characterName: e.characterName,
       characterId: e.characterId,
       model: e.model,
+      provider: e.provider,
       startedAt: e.startedAt,
       councilRetryPending: e.councilRetryPending || false,
     };
@@ -214,6 +215,7 @@ app.get("/status/:chatId", (c) => {
     characterName: entry.characterName,
     characterId: entry.characterId,
     model: entry.model,
+    provider: entry.provider,
     startedAt: entry.startedAt,
     reasoningStartedAt: entry.reasoningStartedAt,
     reasoningDurationMs: entry.reasoningDurationMs,

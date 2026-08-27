@@ -4282,6 +4282,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         pool.createPoolEntry({
           generationId: value.executionId, userId: value.userId, chatId: value.chatId,
           generationType: binding.target, characterName: "", model: root?.model ?? "",
+          ...(root?.provider ? { provider: root.provider } : {}),
           ...(binding.messageId ? { targetMessageId: binding.messageId } : {}),
           ...(binding.swipeId !== null ? { targetSwipeId: binding.swipeId } : {}),
         });

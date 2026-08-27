@@ -33,6 +33,7 @@ Object.assign(globalThis, {
   window: dom.window,
   document: dom.window.document,
   navigator: dom.window.navigator,
+  localStorage: dom.window.localStorage,
   HTMLElement: dom.window.HTMLElement,
   Node: dom.window.Node,
   requestAnimationFrame: (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 0),
@@ -43,6 +44,8 @@ Object.assign(globalThis, {
 
 const i18n = createInstance()
 let useStore!: typeof import('@/store').useStore
+let generateApi!: typeof import('@/api/generate').generateApi
+let originalGetActive!: typeof generateApi.getActive
 let StreamingIndicator!: typeof import('./StreamingIndicator').default
 let deriveStreamingStatus!: typeof import('./StreamingIndicator').deriveStreamingStatus
 let root: Root | null = null
@@ -92,6 +95,9 @@ function setStore(overrides: Record<string, unknown> = {}) {
     streamingContent: '',
     streamingReasoning: '',
     streamingGenerationType: 'normal',
+    lastGenerationProvider: null,
+    lastGenerationConnectionLabel: null,
+    lastGenerationModel: null,
     chatHeads: [{
       generationId,
       chatId,
@@ -127,6 +133,9 @@ beforeAll(async () => {
   })
   const store = await import('@/store')
   useStore = store.useStore
+  const generate = await import('@/api/generate')
+  generateApi = generate.generateApi
+  originalGetActive = generateApi.getActive
   const indicator = await import('./StreamingIndicator')
   StreamingIndicator = indicator.default
   deriveStreamingStatus = indicator.deriveStreamingStatus
@@ -135,6 +144,8 @@ beforeAll(async () => {
 beforeEach(() => {
   root?.unmount()
   host?.remove()
+  dom.window.localStorage.clear()
+  generateApi.getActive = originalGetActive
   host = document.createElement('div')
   document.body.appendChild(host)
   root = createRoot(host)
@@ -151,6 +162,109 @@ describe('StreamingIndicator', () => {
     expect(deriveStreamingStatus(input({ isStreaming: false, terminalStatus: 'completed' }))).toBe('completed')
     expect(deriveStreamingStatus(input({ isStreaming: false, streamingError: 'provider failed' }))).toBe('error')
     expect(deriveStreamingStatus(input({ isStreaming: false, terminalStatus: 'stopped' }))).toBe('stopped')
+  })
+
+  test('shows exact started-event identity in the first queued state', async () => {
+    setStore({
+      activeGenerationId: null,
+      isStreaming: false,
+      chatHeads: [],
+      lastGenerationProvider: 'stale-provider',
+      lastGenerationModel: 'stale-model',
+    })
+    const state = useStore.getState()
+    state.startStreaming(generationId, undefined, 'normal')
+    state.setGenerationProviderMetadata({
+      provider: 'Deepseek',
+      model: 'deepseek-v4-flash',
+    })
+    state.addChatHead({
+      generationId,
+      chatId,
+      characterName: 'Assistant',
+      avatarUrl: null,
+      status: 'assembling',
+      provider: 'Deepseek',
+      model: 'deepseek-v4-flash',
+      startedAt: Date.now(),
+    })
+
+    expect(useStore.getState()).toMatchObject({
+      lastGenerationProvider: 'Deepseek',
+      lastGenerationModel: 'deepseek-v4-flash',
+    })
+    await renderIndicator()
+    const indicator = host?.querySelector('[role="status"]')
+    expect(indicator?.getAttribute('data-generation-status')).toBe('queued')
+    expect(indicator?.textContent).toContain('Queued · preparing context')
+    expect(indicator?.textContent).toContain('Provider Deepseek · model deepseek-v4-flash')
+  })
+
+  test('reports an absent provider without inferring one from the model', async () => {
+    setStore({
+      lastGenerationProvider: null,
+      lastGenerationModel: 'deepseek-v4-flash',
+      chatHeads: [{
+        generationId,
+        chatId,
+        characterName: 'Assistant',
+        avatarUrl: null,
+        status: 'assembling',
+        model: 'deepseek-v4-flash',
+        startedAt: Date.now(),
+      }],
+    })
+
+    await renderIndicator()
+    const indicator = host?.querySelector('[role="status"]')
+    expect(indicator?.textContent).toContain('Provider not reported · model deepseek-v4-flash')
+    expect(indicator?.textContent).not.toContain('Provider Deepseek')
+  })
+
+  test('persists provider identity across active-generation reconciliation and drops it when absent', async () => {
+    setStore()
+    const startedAt = Date.now() - 5_000
+    generateApi.getActive = async () => [{
+      generationId,
+      chatId,
+      status: 'assembling',
+      generationType: 'normal',
+      characterName: 'Assistant',
+      model: 'deepseek-v4-flash',
+      provider: 'Deepseek',
+      startedAt,
+      councilRetryPending: false,
+    }]
+
+    await useStore.getState().reconcileChatHeads()
+    expect(useStore.getState().chatHeads[0]).toMatchObject({
+      generationId,
+      provider: 'Deepseek',
+      model: 'deepseek-v4-flash',
+    })
+    const persistedWithProvider = JSON.parse(
+      localStorage.getItem('lumiverse:chatHeads') ?? '[]',
+    ) as Array<Record<string, unknown>>
+    expect(persistedWithProvider[0]?.provider).toBe('Deepseek')
+
+    generateApi.getActive = async () => [{
+      generationId,
+      chatId,
+      status: 'assembling',
+      generationType: 'normal',
+      characterName: 'Assistant',
+      model: 'deepseek-v4-flash',
+      startedAt,
+      councilRetryPending: false,
+    }]
+    await useStore.getState().reconcileChatHeads()
+
+    const reconciled = useStore.getState().chatHeads[0]
+    expect(reconciled && 'provider' in reconciled).toBe(false)
+    const persistedWithoutProvider = JSON.parse(
+      localStorage.getItem('lumiverse:chatHeads') ?? '[]',
+    ) as Array<Record<string, unknown>>
+    expect(persistedWithoutProvider[0] && 'provider' in persistedWithoutProvider[0]).toBe(false)
   })
   test('clears a deferred-send error without projecting failure or tearing down the active lifecycle', async () => {
     setStore({

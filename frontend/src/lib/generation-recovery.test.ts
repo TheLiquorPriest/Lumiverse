@@ -32,9 +32,9 @@ test('generation recovery authority cases pass in an isolated module graph', asy
       .filter((line) => /^\d+ (?:pass|fail|skip)$/.test(line))
     expect(timedOut).toBe(false)
     expect(exitCode).toBe(0)
-    expect(summaryLines).toEqual(['2 pass', '0 fail'])
+    expect(summaryLines).toEqual(['5 pass', '0 fail'])
     expect(summary).toMatch(/\b[1-9]\d* expect\(\) calls\b/)
-    expect(summary).toMatch(/Ran 2 tests across 1 file/)
+    expect(summary).toMatch(/Ran 5 tests across 1 file/)
   } finally {
     clearTimeout(watchdog)
   }

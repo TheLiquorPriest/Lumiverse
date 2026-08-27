@@ -856,6 +856,13 @@ export function useWebSocket() {
             // called without a targetMessageId (e.g. regeneration flow).
             state.setRegeneratingMessageId(payload.targetMessageId)
           }
+          // GENERATION_STARTED is the first authoritative provider/model identity
+          // for this run. Project it before any provider call starts, and clear
+          // omitted fields so a previous generation can never fill the gap.
+          state.setGenerationProviderMetadata({
+            provider: payload.provider ?? null,
+            model: payload.model ?? null,
+          })
           // Anchor the streaming buffer to its swipe so the user can navigate to
           // other swipes mid-generation without smearing live tokens onto them.
           state.setStreamingSwipeId(payload.targetSwipeId ?? null)

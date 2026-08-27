@@ -392,6 +392,7 @@ export interface GenerationStatusResponse {
   characterName?: string
   characterId?: string
   model?: string
+  provider?: string
   startedAt?: number
   reasoningStartedAt?: number
   reasoningDurationMs?: number
@@ -408,6 +409,7 @@ export interface ActiveGenerationEntry {
   characterName: string
   characterId?: string
   model: string
+  provider?: string
   startedAt: number
   councilRetryPending: boolean
 }

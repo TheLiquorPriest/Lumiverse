@@ -1549,7 +1549,7 @@ describe.serial("root generation usage accounting", () => {
       generation_type: "normal",
     });
   }
-  test("includes the exact resolved provider in ordinary started and in-progress events", async () => {
+  test("keeps exact ordinary provider identity from pool creation through lifecycle events", async () => {
     const fixture = await createFixture("inactive_success");
     const started = Promise.withResolvers<Record<string, any>>();
     const inProgress = Promise.withResolvers<Record<string, any>>();
@@ -1568,6 +1568,16 @@ describe.serial("root generation usage accounting", () => {
 
     try {
       const response = await startFixture(fixture);
+
+      expect(fixture.provider.rootRequests).toHaveLength(0);
+      expect(pool.getPoolEntry(response.generationId)).toMatchObject({
+        generationId: response.generationId,
+        chatId: fixture.chat.id,
+        status: "assembling",
+        provider: fixture.connection.provider,
+        model: fixture.connection.model,
+      });
+
       const [startedPayload, inProgressPayload, terminalPayload] =
         await Promise.all([started.promise, inProgress.promise, terminal.promise]);
 

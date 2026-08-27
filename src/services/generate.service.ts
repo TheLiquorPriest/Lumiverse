@@ -3802,6 +3802,7 @@ async function startResponseGeneration(
       characterName,
       characterId: targetCharId,
       model: connection.model,
+      provider: connection.provider,
       targetMessageId: lifecycle.targetMessageId,
       targetSwipeId,
     });
