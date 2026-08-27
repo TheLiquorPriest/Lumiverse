@@ -138,7 +138,7 @@ export const databankApi = {
   },
 
   // Autocomplete for # mentions
-  autocomplete(params: { q: string; chatId?: string; characterId?: string }) {
-    return get<{ data: AutocompleteResult[] }>('/databanks/mentions/autocomplete', params)
+  autocomplete(params: { q: string; chatId?: string; characterId?: string }, signal?: AbortSignal) {
+    return get<{ data: AutocompleteResult[] }>('/databanks/mentions/autocomplete', params, { signal })
   },
 }

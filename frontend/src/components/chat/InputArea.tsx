@@ -47,6 +47,7 @@ import ProviderIcon from '@/components/shared/ProviderIcon'
 import { databankApi } from '@/api/databank'
 import { resolveMacros } from '@/api/macros'
 import type { AutocompleteResult } from '@/api/databank'
+import { DatabankAutocompleteCoordinator, getDatabankMentionAtCaret } from '@/lib/databankMentionAutocomplete'
 import styles from './InputArea.module.css'
 import clsx from 'clsx'
 import InputBarExtensionActions from './InputBarExtensionActions'
@@ -411,7 +412,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const [hashStartIndex, setHashStartIndex] = useState(0)
   const [databankResults, setDatabankResults] = useState<AutocompleteResult[]>([])
   const [databankActiveIdx, setDatabankActiveIdx] = useState(0)
-  const databankDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [atQuery, setAtQuery] = useState<string | null>(null)
   const [atStartIndex, setAtStartIndex] = useState(0)
   const [atResults, setAtResults] = useState<Array<{ id: string; name: string; slug: string; muted: boolean; image_id: string | null; extensions?: Record<string, any> }>>([])
@@ -449,6 +449,13 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     )?.generationId ?? null
   )
   const activeCharacterId = useStore((s) => s.activeCharacterId)
+  const databankAutocompleteContextKey = chatId
+    ? `chat:${chatId}`
+    : `character:${activeCharacterId ?? ''}`
+  const databankAutocompleteCoordinator = useMemo(
+    () => new DatabankAutocompleteCoordinator({ delayMs: 200 }),
+    [databankAutocompleteContextKey],
+  )
   const activeGroupCharacterId = useStore((s) => s.activeGroupCharacterId)
   const enterToSend = useStore((s) => s.chatSheldEnterToSend)
   const saveDraftInput = useStore((s) => s.saveDraftInput)
@@ -1500,21 +1507,26 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     setPromptVariablesBinding(null)
   }, [activeLoomPresetId, chatId, promptVariablesPreset, promptVariablesBinding])
 
+  useEffect(() => {
+    setDatabankResults([])
+    setDatabankActiveIdx(0)
+    if (openPopoverRef.current === 'databank') setOpenPopover(null)
+    return () => databankAutocompleteCoordinator.dispose()
+  }, [databankAutocompleteCoordinator])
+
   // Databank # autocomplete — search when hash query changes
   useEffect(() => {
-    if (databankDebounceRef.current) clearTimeout(databankDebounceRef.current)
-      if (hashQuery === null || hashQuery.length === 0) {
-      if (openPopoverRef.current === 'databank') setOpenPopover(null)
-      setDatabankResults([])
-      return
-    }
-    databankDebounceRef.current = setTimeout(async () => {
-      try {
-        const params: { q: string; chatId?: string; characterId?: string } = { q: hashQuery }
-        if (chatId) params.chatId = chatId
-        if (activeCharacterId) params.characterId = activeCharacterId
-        const res = await databankApi.autocomplete(params)
-        const results = res.data || []
+    databankAutocompleteCoordinator.schedule<AutocompleteResult[]>({
+      query: hashQuery,
+      contextKey: databankAutocompleteContextKey,
+      request: async (query, signal) => {
+        const params: { q: string; chatId?: string; characterId?: string } = chatId
+          ? { q: query, chatId }
+          : { q: query, ...(activeCharacterId ? { characterId: activeCharacterId } : {}) }
+        const res = await databankApi.autocomplete(params, signal)
+        return res.data ?? []
+      },
+      onSuccess: (results) => {
         setDatabankResults(results)
         setDatabankActiveIdx(0)
         if (results.length > 0) {
@@ -1522,12 +1534,18 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         } else if (openPopoverRef.current === 'databank') {
           setOpenPopover(null)
         }
-      } catch {
+      },
+      onError: () => {
         setDatabankResults([])
-      }
-    }, 200)
-    return () => { if (databankDebounceRef.current) clearTimeout(databankDebounceRef.current) }
-  }, [hashQuery, chatId, activeCharacterId])
+        if (openPopoverRef.current === 'databank') setOpenPopover(null)
+      },
+      onClear: () => {
+        setDatabankResults([])
+        setDatabankActiveIdx(0)
+        if (openPopoverRef.current === 'databank') setOpenPopover(null)
+      },
+    })
+  }, [hashQuery, chatId, activeCharacterId, databankAutocompleteContextKey, databankAutocompleteCoordinator])
 
   // @ autocomplete — filter locally against group members. Muted members are
   // kept in the list (dimmed in UI); selecting them overrides mute for this turn.
@@ -3323,25 +3341,18 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   // and caret position. Pulled out of `handleInput` so `compositionend` can
   // re-run the same scan once IME input has fully committed.
   const runAutocompleteDetection = useCallback((ta: HTMLTextAreaElement) => {
-    const val = ta.value
-    const cursorPos = ta.selectionStart ?? val.length
-    const textBeforeCursor = val.slice(0, cursorPos)
-
-    const hashIdx = textBeforeCursor.lastIndexOf('#')
-    if (hashIdx >= 0) {
-      const charBefore = hashIdx > 0 ? textBeforeCursor[hashIdx - 1] : ' '
-      if (hashIdx === 0 || /\s/.test(charBefore)) {
-        const fragment = textBeforeCursor.slice(hashIdx + 1)
-        if (!fragment.includes(' ') && fragment.length > 0) {
-          setHashQuery(fragment)
-          setHashStartIndex(hashIdx)
-          setAtQuery(null)
-          return
-        }
-      }
+    const databankMention = getDatabankMentionAtCaret(ta)
+    if (databankMention) {
+      setHashQuery(databankMention.query)
+      setHashStartIndex(databankMention.startIndex)
+      setAtQuery(null)
+      return
     }
     setHashQuery(null)
 
+    const val = ta.value
+    const cursorPos = ta.selectionStart ?? val.length
+    const textBeforeCursor = val.slice(0, cursorPos)
     if (isGroupChat) {
       const atIdx = textBeforeCursor.lastIndexOf('@')
       if (atIdx >= 0) {
