@@ -1237,6 +1237,10 @@
     "tabsUsage": "Usage",
     "tabsProvenance": "Provenance",
     "tabsReceipts": "Receipts",
+    "resolutionError": {
+      "title": "Run resolution error",
+      "code": "Error code: {{code}}"
+    },
     "values": {
       "ADMIT": "Admit",
       "ASSEMBLE": "Assemble",
@@ -1365,7 +1369,26 @@
       "workPolicy": "Work policy",
       "workspaceUsage": "Workspace usage",
       "completionCriteria": "Completion criteria",
-      "renderPolicy": "Render policy"
+      "renderPolicy": "Render policy",
+      "COMPLETE": "Work complete",
+      "COMMITTING": "Saving response",
+      "COMMITTED": "Saved",
+      "COMMIT_FAILED": "Save failed",
+      "EXHAUSTED": "Budget exhausted",
+      "FAILED": "Failed",
+      "CANCELLED": "Cancelled",
+      "TIMED_OUT": "Timed out",
+      "capacity": "Capacity",
+      "budget": "Budget",
+      "integrity": "Integrity",
+      "timeout": "Timeout",
+      "validation": "Validation",
+      "internal": "Internal",
+      "preset": "Preset",
+      "execution": "Execution",
+      "projection": "Projection",
+      "attempt": "Attempt",
+      "phase": "Phase"
     },
     "ar007": {
       "nativeWorldInfo": "Native World Info",

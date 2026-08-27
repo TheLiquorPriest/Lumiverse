@@ -124,6 +124,20 @@ function leafPaths(value: unknown, prefix = ''): string[] {
     .sort()
 }
 
+const OWNER_ERROR_VALUE_KEYS = [
+  'ADMIT', 'ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMIT',
+  'COMMITTING', 'COMMITTED', 'COMMIT_FAILED', 'EXHAUSTED', 'FAILED', 'CANCELLED',
+  'TIMED_OUT', 'TERMINAL', 'pending', 'running', 'waiting', 'cancelling', 'terminal',
+  'completed', 'stopped', 'failed', 'exhausted', 'rejected', 'none', 'user_stop',
+  'deadline', 'provider_failure', 'tool_failure', 'required_work_failure',
+  'budget_exhausted', 'invalid_input', 'stale_input', 'unavailable', 'needs_attention',
+  'interrupted', 'retry_requested', 'reconciled', 'unknown', 'capacity', 'budget',
+  'context', 'integrity', 'timeout', 'cancelled', 'provider', 'validation', 'internal',
+  'host', 'preset', 'owner', 'system', 'cortex', 'council', 'execution', 'projection',
+  'tool', 'recovery', 'run', 'attempt', 'turn_session', 'target', 'phase', 'usage',
+  'transcript', 'workspace',
+] as const
+
 describe('AgentRunActivity locale coverage', () => {
   test('keeps the complete Agentic activity and workspace key set in all six locales', () => {
     const expected = leafPaths(en.agentRun)
@@ -131,6 +145,7 @@ describe('AgentRunActivity locale coverage', () => {
     expect(PUBLIC_ERROR_CODES.length).toBeGreaterThan(0)
     expect(PUBLIC_ERROR_CODES).toEqual(BACKEND_PUBLIC_ERROR_CODES)
     const expectedErrorKeys = Object.keys(en.agentRun.errors).sort()
+    const expectedOwnerInspection = leafPaths(en.ownerInspection)
     for (const key of ['unknown', ...BACKEND_PUBLIC_ERROR_CODES]) {
       expect(expectedErrorKeys).toContain(key)
     }
@@ -141,6 +156,15 @@ describe('AgentRunActivity locale coverage', () => {
       expect(rootResultLabel, 'workspace_submit_root_result legacy activity label').toBeString()
       expect(rootResultLabel.trim()).not.toBe('')
       expect(leafPaths(locale.agentRun)).toEqual(expected)
+      expect(leafPaths(locale.ownerInspection)).toEqual(expectedOwnerInspection)
+      expect(locale.ownerInspection.resolutionError.title.trim()).not.toBe('')
+      expect(locale.ownerInspection.resolutionError.code).toContain('{{code}}')
+      const ownerValues = locale.ownerInspection.values as Record<string, unknown>
+      for (const key of OWNER_ERROR_VALUE_KEYS) {
+        const label = ownerValues[key]
+        expect(label, key + ' owner error-state label').toBeString()
+        if (typeof label === 'string') expect(label.trim()).not.toBe('')
+      }
       const errors = locale.agentRun.errors as Record<string, unknown>
       expect(errors.invalid_input).not.toBe(errors.unknown)
       expect(Object.keys(errors).sort()).toEqual(expectedErrorKeys)
@@ -149,7 +173,6 @@ describe('AgentRunActivity locale coverage', () => {
         expect(label).toBeString()
         if (typeof label === 'string') expect(label.trim()).not.toBe('')
       }
-      const ownerValues = locale.ownerInspection.values as Record<string, unknown>
       for (const destination of PROMPT_EVIDENCE_DESTINATIONS) {
         const label = ownerValues[destination]
         expect(label, `${destination} owner inspection label`).toBeString()

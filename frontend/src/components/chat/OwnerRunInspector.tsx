@@ -331,6 +331,17 @@ function valueLabel(translate: (key: string, options?: Record<string, unknown>) 
   return translate(`ownerInspection.values.${value}`, { defaultValue: formatEnum(value) })
 }
 
+function errorSummaryLabel(
+  translate: (key: string, options?: Record<string, unknown>) => string,
+  summaryCode: string,
+  code: string,
+): string {
+  const key = summaryCode.startsWith('agentRun.errors.')
+    ? summaryCode
+    : `agentRun.errors.${code}`
+  return translate(key, { defaultValue: formatEnum(code) })
+}
+
 function Field({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
   return (
     <div className={styles.field}>
@@ -1450,15 +1461,15 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
                 <section className={styles.section} role="alert" aria-labelledby="owner-inspection-error-heading">
                   <div className={styles.sectionHeading}>
                     <div>
-                      <h3 id="owner-inspection-error-heading">{t('resolutionError.title')}</h3>
-                      <p>{t('resolutionError.code', { code: boundedId(inspection.error.code) })} · {valueLabel(t, inspection.error.category)} · {boundedId(inspection.error.summaryCode)}</p>
+                      <h3 id="owner-inspection-error-heading">{t('ownerInspection.resolutionError.title')}</h3>
+                      <p>{t('ownerInspection.resolutionError.code', { code: boundedId(inspection.error.code) })} · {valueLabel(t, inspection.error.category)} · {errorSummaryLabel(t, inspection.error.summaryCode, inspection.error.code)}</p>
                     </div>
                   </div>
                   <dl className={styles.summaryGrid}>
                     <Field label={t('ownerInspection.attemptId')} value={boundedId(inspection.error.inspectionAttemptId)} mono />
                     <Field label={t('ownerInspection.outcome')} value={valueLabel(t, inspection.error.category)} />
                     {inspection.error.causalCode ? <Field label={t('ownerInspection.errorReason')} value={boundedId(inspection.error.causalCode)} mono /> : null}
-                    {inspection.error.reason ? <Field label={t('ownerInspection.reason')} value={boundedId(inspection.error.reason)} /> : null}
+                    {inspection.error.reason ? <Field label={t('ownerInspection.reason')} value={valueLabel(t, inspection.error.reason)} /> : null}
                     <Field label={t('provenance.authority')} value={valueLabel(t, inspection.error.authority)} />
                     <Field label={t('provenance.source')} value={valueLabel(t, inspection.error.source)} />
                     <Field label={t('provenance.scope')} value={valueLabel(t, inspection.error.scope)} />

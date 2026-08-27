@@ -1179,6 +1179,10 @@
     "tabsUsage": "Utilizzo",
     "tabsProvenance": "Provenienza",
     "tabsReceipts": "Ricevute",
+    "resolutionError": {
+      "title": "Errore di risoluzione dell’esecuzione",
+      "code": "Codice errore: {{code}}"
+    },
     "values": {
       "ADMIT": "Ammetti",
       "ASSEMBLE": "Assemblaggio",
@@ -1308,7 +1312,26 @@
       "workPolicy": "Policy di lavoro",
       "workspaceUsage": "Uso del Workspace",
       "completionCriteria": "Criteri di completamento",
-      "renderPolicy": "Policy di rendering"
+      "renderPolicy": "Policy di rendering",
+      "COMPLETE": "Lavoro completato",
+      "COMMITTING": "Salvataggio della risposta",
+      "COMMITTED": "Salvata",
+      "COMMIT_FAILED": "Salvataggio non riuscito",
+      "EXHAUSTED": "Budget esaurito",
+      "FAILED": "Non riuscito",
+      "CANCELLED": "Annullato",
+      "TIMED_OUT": "Tempo scaduto",
+      "capacity": "Capacità",
+      "budget": "Budget",
+      "integrity": "Integrità",
+      "timeout": "Timeout",
+      "validation": "Convalida",
+      "internal": "Interno",
+      "preset": "Preset",
+      "execution": "Esecuzione",
+      "projection": "Proiezione",
+      "attempt": "Tentativo",
+      "phase": "Fase"
     },
     "ar007": {
       "nativeWorldInfo": "World Info nativo",

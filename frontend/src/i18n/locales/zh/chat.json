@@ -1187,6 +1187,10 @@
     "tabsUsage": "用量",
     "tabsProvenance": "来源",
     "tabsReceipts": "回执",
+    "resolutionError": {
+      "title": "运行解析错误",
+      "code": "错误代码：{{code}}"
+    },
     "values": {
       "ADMIT": "准入",
       "ASSEMBLE": "组装",
@@ -1316,7 +1320,26 @@
       "workPolicy": "工作策略",
       "workspaceUsage": "Workspace 用法",
       "completionCriteria": "完成标准",
-      "renderPolicy": "渲染策略"
+      "renderPolicy": "渲染策略",
+      "COMPLETE": "工作完成",
+      "COMMITTING": "正在保存响应",
+      "COMMITTED": "已保存",
+      "COMMIT_FAILED": "保存失败",
+      "EXHAUSTED": "预算已耗尽",
+      "FAILED": "失败",
+      "CANCELLED": "已取消",
+      "TIMED_OUT": "已超时",
+      "capacity": "容量",
+      "budget": "预算",
+      "integrity": "完整性",
+      "timeout": "超时",
+      "validation": "验证",
+      "internal": "内部",
+      "preset": "预设",
+      "execution": "执行",
+      "projection": "投影",
+      "attempt": "尝试",
+      "phase": "阶段"
     },
     "ar007": {
       "nativeWorldInfo": "原生 World Info",

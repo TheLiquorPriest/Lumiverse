@@ -230,39 +230,47 @@ const sourceDeletedWithoutAssociationInspection: AgentRunInspectionDetailV1 = {
     reason: 'stale_input',
   }],
 }
-const inspectionWithError: AgentRunInspectionDetailV1 = {
+const recoveredCancelledInspection: AgentRunInspectionDetailV1 = {
   ...sourceDeletedInspection,
+  outcome: 'stopped',
+  reason: 'user_stop',
+  committedTarget: null,
+  activity: {
+    ...sourceDeletedInspection.activity,
+    outcome: 'stopped',
+    reason: 'user_stop',
+    reconciliation: 'recovered',
+  },
   error: {
     version: 1,
     inspectionAttemptId: attempt.attemptId,
-    code: 'child_output_token_limit_exceeded',
-    category: 'capacity',
-    summaryCode: 'child_output_token_limit_exceeded',
-    causalCode: 'output_limit',
+    code: 'cancelled',
+    category: 'cancelled',
+    summaryCode: 'agentRun.errors.cancelled',
+    causalCode: null,
     authority: 'host',
     source: 'execution',
     scope: 'attempt',
-    capGate: {
-      id: 'child_output_token_budget',
-      limit: 128,
-      observed: 256,
-      exceeded: true,
-      authority: 'host',
-      source: 'execution',
-    },
+    capGate: null,
     target: {
       chatId: 'chat-deleted',
       generationType: 'normal',
       messageId: 'message-a',
       swipeId: 0,
     },
-    workPhase: 'WORK',
+    workPhase: 'TERMINAL',
     workStatus: 'terminal',
-    workOutcome: 'failed',
-    reason: 'output_limit',
-    recoveryEligible: false,
-    recoveryAction: 'resync',
-    omissionCount: 3,
+    workOutcome: 'stopped',
+    reason: 'user_stop',
+    recoveryEligible: true,
+    recoveryAction: 'retry',
+    omissionCount: 0,
+  },
+  retry: {
+    allowed: true,
+    reason: 'user_stop',
+    targetValid: true,
+    linkedAttemptId: attempt.attemptId,
   },
 }
 const attachedWorkspaceRevision1: AgentPersistentWorkspaceV1 = {
@@ -441,7 +449,7 @@ const boundedInspection: AgentRunInspectionDetailV1 = {
   })),
 }
 
-test('uses a stable workspace association when the historical chat is deleted', async () => {
+test('uses stable deleted-chat provenance and localizes a recovered cancelled run', async () => {
   const previousWindow = globalThis.window
   const previousDocument = globalThis.document
   const previousElement = globalThis.Element
@@ -493,7 +501,7 @@ test('uses a stable workspace association when the historical chat is deleted', 
   const inspection = spyOn(agentRunsApi, 'inspection')
     .mockResolvedValueOnce(sourceDeletedInspection)
     .mockResolvedValueOnce(sourceDeletedWithoutAssociationInspection)
-    .mockResolvedValueOnce(inspectionWithError)
+    .mockResolvedValueOnce(recoveredCancelledInspection)
   const chatWorkspace = spyOn(agentRunsApi, 'persistentWorkspace').mockRejectedValue(new Error('chat route must not be used'))
   const workspaceById = spyOn(agentRunsApi, 'persistentWorkspaceById').mockResolvedValue(detachedWorkspace)
   const sessions = spyOn(agentRunsApi, 'persistentWorkspaceSessions').mockResolvedValue(detachedSessionPage)
@@ -585,7 +593,7 @@ test('uses a stable workspace association when the historical chat is deleted', 
             chatId="chat-deleted"
             isOpen
             onClose={() => {}}
-            initialInspection={inspectionWithError}
+            initialInspection={recoveredCancelledInspection}
           />
         </I18nextProvider>,
       )
@@ -594,8 +602,12 @@ test('uses a stable workspace association when the historical chat is deleted', 
     })
     expect(inspection).toHaveBeenCalledTimes(3)
     const errorText = document.body.textContent ?? ''
-    expect(errorText).toContain('child_output_token_limit_exceeded')
-    expect(errorText).toContain('output_limit')
+    expect(errorText).toContain('Run resolution error')
+    expect(errorText).toContain('Error code: cancelled')
+    expect(errorText).toContain('The run was cancelled.')
+    expect(errorText).toContain('User stop')
+    expect(errorText).not.toContain('resolutionError.title')
+    expect(errorText).not.toContain('agentRun.errors.cancelled')
     expect(document.body.querySelector('[role="alert"]')).toBeDefined()
   } finally {
     if (root) {

@@ -1179,6 +1179,10 @@
     "tabsUsage": "使用量",
     "tabsProvenance": "来歴",
     "tabsReceipts": "レシート",
+    "resolutionError": {
+      "title": "実行解決エラー",
+      "code": "エラーコード: {{code}}"
+    },
     "values": {
       "ADMIT": "受け入れ",
       "ASSEMBLE": "組み立て",
@@ -1308,7 +1312,26 @@
       "workPolicy": "Work ポリシー",
       "workspaceUsage": "Workspace 使用",
       "completionCriteria": "完了条件",
-      "renderPolicy": "Render ポリシー"
+      "renderPolicy": "Render ポリシー",
+      "COMPLETE": "作業完了",
+      "COMMITTING": "応答を保存中",
+      "COMMITTED": "保存済み",
+      "COMMIT_FAILED": "保存失敗",
+      "EXHAUSTED": "予算上限到達",
+      "FAILED": "失敗",
+      "CANCELLED": "キャンセル済み",
+      "TIMED_OUT": "タイムアウト",
+      "capacity": "容量",
+      "budget": "予算",
+      "integrity": "整合性",
+      "timeout": "タイムアウト",
+      "validation": "検証",
+      "internal": "内部",
+      "preset": "プリセット",
+      "execution": "実行",
+      "projection": "プロジェクション",
+      "attempt": "試行",
+      "phase": "フェーズ"
     },
     "ar007": {
       "nativeWorldInfo": "ネイティブ World Info",
