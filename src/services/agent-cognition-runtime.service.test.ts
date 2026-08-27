@@ -65,6 +65,7 @@ function loomEntry(
   source: LoomPolicySourceV1,
   destination: LoomPolicyDestinationV1,
   checkpoint: LoomPolicyCheckpointV1,
+  transition: "pending" | "completed" = "pending",
 ): LoomPolicyEntryV1 {
   return {
     version: 1,
@@ -74,7 +75,7 @@ function loomEntry(
     checkpoint,
     required: false,
     visibility: "work_only",
-    condition: { kind: "task_transition", taskId: TASK_ID, transition: "pending" },
+    condition: { kind: "task_transition", taskId: TASK_ID, transition },
   };
 }
 
@@ -205,5 +206,122 @@ describe("agent cognition Loom checkpoint evidence", () => {
       outcome: { status: "included", reason: "selected" },
     });
     expect(renderInspection?.effectiveEntryIds).toEqual(["completion-entry", "render-entry"]);
+  });
+
+  test("discards later-checkpoint evidence from a blocked completion before task transition retry", async () => {
+    const workspace = createTurnWorkspace({
+      userId: USER_ID,
+      chatId: CHAT_ID,
+      turnId: TURN_ID,
+      workspaceId: WORKSPACE_ID,
+      objective: "Retry a blocked checkpoint from fresh task state",
+      constraints: [],
+      retention: "operational",
+      ttlSeconds: 100,
+      quota: { maxTasks: 8, maxRecords: 8, maxSubmissions: 8, maxArtifacts: 4, maxBytes: 2048 },
+      capabilities: {
+        revision: 1,
+        allowed: ["read_section", "read_page", "submit_root_result"],
+        maxOperationBytes: 131_072,
+        maxOperations: 128,
+      },
+    });
+    const workSource = loomSource("blocked-work-block", 0);
+    const completionSource = loomSource("blocked-completion-block", 1);
+    const renderSource = loomSource("blocked-render-block", 2);
+    const sourceBlocks = [workSource, completionSource, renderSource];
+    const runtime = createAgentCognitionRuntime({
+      source: {
+        graph: {
+          version: 1,
+          policies: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
+          templates: [{
+            id: TASK_ID,
+            label: "Required late task",
+            description: "Must finish before completion can be accepted.",
+            required: true,
+            dependencies: [],
+            activation: { kind: "phase", value: "WORK" },
+          }],
+        },
+        source: {
+          presetRevision: 1,
+          blocks: sourceBlocks.map((source) => ({
+            blockId: source.blockId,
+            revision: source.blockRevision,
+            promptOrder: source.promptOrder,
+          })),
+        },
+        loomPolicy: {
+          version: 1,
+          workPolicy: [loomEntry("blocked-work-entry", workSource, "root_work", "WORK", "completed")],
+          workspaceUsage: [],
+          completionCriteria: [loomEntry("blocked-completion-entry", completionSource, "completion_handoff", "PREPARE_COMMIT", "completed")],
+          renderPolicy: [loomEntry("blocked-render-entry", renderSource, "render", "RENDER", "completed")],
+        },
+        loomBlocks: sourceBlocks.map((source) => ({ source, content: source.blockId + " content" })),
+      },
+      evaluation: {
+        generationType: "normal",
+        phase: "ASSEMBLE",
+        presetVariables: {},
+        participantFacts: {},
+        availableTools: [],
+        taskTransitions: {},
+      },
+      workspaceRevision: workspace.revision,
+      workspace: workspaceContext(workspace.revision),
+    });
+
+    const work = runtime.enterPhase({
+      phase: "WORK",
+      workspace: workspaceContext(runtime.initialActivation.workspaceRevision),
+    });
+    const workItem = work.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-work-entry");
+    expect(workItem).toMatchObject({
+      conditionResult: "false",
+      outcome: { status: "skipped", reason: "condition_not_met" },
+    });
+
+    const blocked = await runtime.acceptCompletionFixedPoint({
+      workspace: workspaceContext(work.workspaceRevision),
+    });
+    expect(blocked.accepted).toBe(false);
+    expect(blocked.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-completion-entry")).toMatchObject({
+      conditionResult: "false",
+      outcome: { status: "skipped", reason: "condition_not_met" },
+    });
+    const blockedRender = blocked.preCommitActivations.find((activation) => activation.phase === "RENDER");
+    expect(blockedRender?.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-render-entry")).toMatchObject({
+      conditionResult: "false",
+      outcome: { status: "skipped", reason: "condition_not_met" },
+    });
+
+    const completedTask = await runtime.applyWorkspaceTransition({
+      taskId: TASK_ID,
+      transition: "completed",
+      operation: "submit_root_result",
+      operationKey: "complete-required-task",
+      workspace: workspaceContext(blocked.workspaceRevision, {
+        summary: "Required task completed after the blocked attempt",
+        state: "completed",
+      }),
+    });
+    expect(completedTask.cognition.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-work-entry")).toEqual(workItem);
+
+    const retry = await runtime.acceptCompletionFixedPoint({
+      workspace: workspaceContext(completedTask.workspaceRevision),
+    });
+    expect(retry.accepted).toBe(true);
+    expect(retry.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-work-entry")).toEqual(workItem);
+    expect(retry.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-completion-entry")).toMatchObject({
+      conditionResult: "true",
+      outcome: { status: "included", reason: "selected" },
+    });
+    const retryRender = retry.preCommitActivations.find((activation) => activation.phase === "RENDER");
+    expect(retryRender?.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-render-entry")).toMatchObject({
+      conditionResult: "true",
+      outcome: { status: "included", reason: "selected" },
+    });
   });
 });

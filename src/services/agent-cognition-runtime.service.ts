@@ -443,7 +443,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
   let state = createCognitionActivationState(graph, initialRevision);
   let currentPhase: CognitionRuntimePhaseV1 = "ASSEMBLE";
   const transitions: Record<string, CognitionTaskTransition> = { ...baseEvaluation.taskTransitions };
-  const checkpointEvidence: LoomCheckpointEvidenceV1 = new Map();
+  let checkpointEvidence: LoomCheckpointEvidenceV1 = new Map();
   let completionAccepted = false;
   const operationResults = new Map<string, { fingerprint: string; result: CognitionWorkspaceMutationResultV1 }>();
   const completionResults = new Map<string, { fingerprint: string; result: CognitionRuntimeCompletionV1 }>();
@@ -561,6 +561,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       }
       if (completionAccepted) throw new AgentCognitionRuntimeError("completion_blocked", "completion fixed point is already accepted");
       assertWorkspaceRevision(input.workspace, state.workspaceRevision);
+      const candidateCheckpointEvidence: LoomCheckpointEvidenceV1 = new Map(checkpointEvidence);
       let computed: CognitionWorkspaceCompletionUpdateV1 | undefined;
       let closure: CognitionCompletionClosureV1 | undefined;
       const workspace = { ...input.workspace };
@@ -569,7 +570,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       delete workspace.completionRenderGuidance;
       const update = (current: CognitionActivationStateV1): CognitionWorkspaceCompletionUpdateV1 => {
         if (current.workspaceRevision !== state.workspaceRevision) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "cognition state is stale for completion CAS");
-        const activationClosure = completionActivationClosure(graph, current, baseEvaluation, transitions, frozenSourceDigest, authenticatedSource, checkpointEvidence, activationRoots);
+        const activationClosure = completionActivationClosure(graph, current, baseEvaluation, transitions, frozenSourceDigest, authenticatedSource, candidateCheckpointEvidence, activationRoots);
         closure = activationClosure;
         const next: CognitionWorkspaceCompletionUpdateV1 = {
           state: Object.freeze({ ...activationClosure.activation.state, workspaceRevision: current.workspaceRevision + 1 }),
@@ -586,7 +587,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
         const operationalBlockingRequiredTaskIds = [...new Set(workspaceResult.blockingRequiredTaskIds.map((id) => authoredTaskIdForOperational(graph, workspace, id)))];
         const blockers = operationalBlockingRequiredTaskIds.map((id) => ({ kind: "task" as const, id }));
         return deepFreeze({
-          ...runtimeActivation("COMPLETE", workspaceResult.state, finalActivation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "PREPARE_COMMIT", transitions), checkpointEvidence),
+          ...runtimeActivation("COMPLETE", workspaceResult.state, finalActivation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, "PREPARE_COMMIT", transitions), candidateCheckpointEvidence),
           accepted: workspaceResult.accepted && blockers.length === 0,
           blockers,
           blockingRequiredTaskIds: Object.freeze(blockers.map((blocker) => blocker.id)),
@@ -628,6 +629,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       state = workspaceResult.state;
       currentPhase = "WORK";
       completionAccepted = result.accepted;
+      if (result.accepted) checkpointEvidence = candidateCheckpointEvidence;
       if (operationKey) completionResults.set(operationKey, { fingerprint, result });
       return result;
     },
