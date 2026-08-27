@@ -245,11 +245,15 @@ most 256 KiB per root. Deterministic requests rejected before admission
 errors and remain in failure summaries/activity without consuming the
 child-invocation ceiling. An admitted child invocation consumes one admission
 even if it later fails, is cancelled, times out, or exceeds a runtime, tool,
-output, or retention budget. Deterministic profiles use their configured
-`required` or `optional` failure policy: required failure aborts generation,
-while optional failure records the failure, restores an empty direct value, and
-binds an empty named result. A dynamic delegation failure is returned as a
-typed tool error to the main model instead of aborting it.
+output, or retention budget. Every child frame is stamped with the exact
+frozen concrete provider, model, and connection selected for its profile; the
+host rejects a frame/dispatch identity mismatch. That same frozen identity
+drives tokenization, usage accounting, and owner inspection. Deterministic
+profiles use their configured `required` or `optional` failure policy:
+required failure aborts generation, while optional failure records the failure,
+restores an empty direct value, and binds an empty named result. A dynamic
+delegation failure is returned as a typed tool error to the main model instead
+of aborting it.
 
 ### Main-model continuation and provider support
 

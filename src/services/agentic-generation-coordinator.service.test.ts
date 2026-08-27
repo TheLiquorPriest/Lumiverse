@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { Hono } from "hono";
-import type { AssemblyMessageSegmentV1, AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
+import { compileAgentAssemblyPlan, type AssemblyMessageSegmentV1, type AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
 import { createHash } from "node:crypto";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
@@ -46,6 +46,8 @@ import { getAgentRunInspection } from "./agent-activity-runs.service";
 import { deleteChat } from "./chats.service";
 import { generateRoutes } from "../routes/generate.routes";
 
+import * as tokenizerService from "./tokenizer.service";
+import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import {
   __testing,
   installAgenticGenerationCoordinator,
@@ -104,6 +106,11 @@ const scriptedBlockedTerminalSnapshots: Array<{
 }> = [];
 /** Records every provider request so the test can prove the real input arrived. */
 const providerRequests: GenerationRequest[] = [];
+const boundProviderDispatches: Array<{
+  readonly provider: string;
+  readonly url: string;
+  readonly request: GenerationRequest;
+}> = [];
 
 class ScriptedProvider implements LlmProvider {
   readonly name = "scripted-coordinator";
@@ -432,6 +439,42 @@ class ScriptedProvider implements LlmProvider {
   async validateKey(): Promise<boolean> { return true; }
   async listModels(): Promise<string[]> { return ["scripted-model"]; }
 }
+class BoundScriptedProvider implements LlmProvider {
+  readonly displayName: string;
+  readonly capabilities = new ScriptedProvider().capabilities;
+  private readonly delegate = new ScriptedProvider();
+
+  constructor(
+    readonly name: string,
+    readonly defaultUrl: string,
+    readonly model: string,
+    readonly usage: NonNullable<GenerationResponse["usage"]>,
+  ) {
+    this.displayName = name;
+  }
+
+  async generate(key: string, url: string, request: GenerationRequest): Promise<GenerationResponse> {
+    boundProviderDispatches.push({ provider: this.name, url, request });
+    return { ...(await this.delegate.generate(key, url, request)), usage: this.usage };
+  }
+
+  async *generateStream(key: string, url: string, request: GenerationRequest): AsyncGenerator<StreamChunk, void, unknown> {
+    boundProviderDispatches.push({ provider: this.name, url, request });
+    const isBoundedChild = request.messages.some((message) =>
+      typeof message.content === "string" && message.content.includes("bounded subordinate frame"));
+    if (isBoundedChild) {
+      yield { token: "bound child output from " + this.name };
+      yield { token: "", finish_reason: "stop", usage: this.usage };
+      return;
+    }
+    for await (const chunk of this.delegate.generateStream(key, url, request)) {
+      yield chunk.finish_reason ? { ...chunk, usage: this.usage } : chunk;
+    }
+  }
+
+  async validateKey(): Promise<boolean> { return true; }
+  async listModels(): Promise<string[]> { return [this.model]; }
+}
 
 async function applyBaseline(): Promise<void> {
   const db = getDb();
@@ -450,7 +493,7 @@ function seed(): void {
     "INSERT INTO characters (id, name, description, personality, scenario, first_mes, mes_example, creator, creator_notes, system_prompt, post_history_instructions, tags, alternate_greetings, extensions, created_at, updated_at, user_id) VALUES (?, ?, '', '', '', '', '', '', '', '', '', '[]', '[]', '{}', ?, ?, ?)",
   ).run("character-coordinator", "Coordinator Character", now, now, USER_ID);
   db.query(
-    "INSERT INTO connection_profiles (id, user_id, name, provider, api_url, model, is_default, has_api_key, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
+    "INSERT INTO connection_profiles (id, user_id, name, provider, api_url, model, is_default, has_api_key, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)",
   ).run(CONNECTION_ID, USER_ID, "Scripted", "scripted-coordinator", "https://scripted.invalid/v1", "scripted-model", "{}", now, now);
   db.query(
 "    INSERT INTO chats (id, user_id, character_id, name, created_at, updated_at, metadata, generation_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -549,6 +592,22 @@ beforeAll(async () => {
   await applyBaseline();
   seed();
   if (!getProvider("scripted-coordinator")) registerProvider(new ScriptedProvider());
+  if (!getProvider("scripted-child-a")) {
+    registerProvider(new BoundScriptedProvider(
+      "scripted-child-a",
+      "https://child-a.invalid/v1",
+      "child-model-a",
+      { prompt_tokens: 11, completion_tokens: 13, total_tokens: 24 },
+    ));
+  }
+  if (!getProvider("scripted-child-b")) {
+    registerProvider(new BoundScriptedProvider(
+      "scripted-child-b",
+      "https://child-b.invalid/v1",
+      "child-model-b",
+      { prompt_tokens: 17, completion_tokens: 19, total_tokens: 36 },
+    ));
+  }
   // The production installer is install-once per process; another suite in this
   // process may already have installed it. Do not reset it here.
 });
@@ -848,8 +907,9 @@ describe("production agentic coordinator installation", () => {
       const forgedChild = createAgenticChildFrame({
         frameId: "forged-child-frame",
         parentFrameId: execution.id,
-        connectionId: null,
-        model: "",
+        provider: "scripted-coordinator",
+        connectionId: CONNECTION_ID,
+        model: "scripted-model",
         coreToolIds: [],
         taskId: "task-auth",
         workspaceCapabilities: ["update_assigned_progress"],
@@ -928,8 +988,9 @@ describe("production agentic coordinator installation", () => {
       const rootResultChild = createAgenticChildFrame({
         frameId: "root-result-child",
         parentFrameId: execution.id,
-        connectionId: null,
-        model: "",
+        provider: "scripted-coordinator",
+        connectionId: CONNECTION_ID,
+        model: "scripted-model",
         coreToolIds: [],
         taskId: "root-result-auth",
         workspaceCapabilities: ["submit_child_result"],
@@ -2699,6 +2760,311 @@ describe("production agentic coordinator installation", () => {
       writeProfileRuntime.run(JSON.stringify([]), 128, USER_ID, AGENTIC_PRESET_ID, "delegate_alt");
     }
   });
+  test("keeps heterogeneous child provider, connection, model, tokenizer, usage, activity, and inspection identity exact", async () => {
+    markAgenticRuntimeReady();
+    process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
+    await probeIsolateBackendsAtStartup();
+    startAgentRuntimeEpoch();
+    installAgenticGenerationCoordinator();
+    const db = getDb();
+    const now = Date.now();
+    const childConnectionIds = ["connection-child-a", "connection-child-b"] as const;
+    const originalBindings = db.query(
+      "SELECT slot_id, connection_id FROM preset_agent_slot_bindings WHERE user_id = ? AND preset_id = ? AND slot_id IN ('delegate', 'delegate_alt') ORDER BY slot_id",
+    ).all(USER_ID, AGENTIC_PRESET_ID) as Array<{ slot_id: string; connection_id: string }>;
+    const originalProfiles = db.query(
+      "SELECT profile_id, workspace_capabilities, max_output_tokens FROM preset_agent_profiles WHERE user_id = ? AND preset_id = ? AND profile_id IN ('delegate', 'delegate_alt') ORDER BY profile_id",
+    ).all(USER_ID, AGENTIC_PRESET_ID) as Array<{
+      profile_id: string;
+      workspace_capabilities: string;
+      max_output_tokens: number;
+    }>;
+    db.query(
+      "INSERT INTO connection_profiles (id, user_id, name, provider, api_url, model, is_default, has_api_key, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, '{}', ?, ?)",
+    ).run(childConnectionIds[0], USER_ID, "Child A", "scripted-child-a", "https://child-a.invalid/v1", "child-model-a", now, now);
+    db.query(
+      "INSERT INTO connection_profiles (id, user_id, name, provider, api_url, model, is_default, has_api_key, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, '{}', ?, ?)",
+    ).run(childConnectionIds[1], USER_ID, "Child B", "scripted-child-b", "https://child-b.invalid/v1", "child-model-b", now + 1, now + 1);
+    db.query(
+      "UPDATE preset_agent_slot_bindings SET connection_id = ?, updated_at = ? WHERE user_id = ? AND preset_id = ? AND slot_id = 'delegate'",
+    ).run(childConnectionIds[0], now, USER_ID, AGENTIC_PRESET_ID);
+    db.query(
+      "UPDATE preset_agent_slot_bindings SET connection_id = ?, updated_at = ? WHERE user_id = ? AND preset_id = ? AND slot_id = 'delegate_alt'",
+    ).run(childConnectionIds[1], now + 1, USER_ID, AGENTIC_PRESET_ID);
+    db.query(
+      "UPDATE preset_agent_profiles SET workspace_capabilities = ?, max_output_tokens = 1024 WHERE user_id = ? AND preset_id = ? AND profile_id IN ('delegate', 'delegate_alt')",
+    ).run(JSON.stringify(["update_assigned_progress", "submit_child_result"]), USER_ID, AGENTIC_PRESET_ID);
+
+    const tokenizerModels: string[] = [];
+    const resolveCounter = tokenizerService.resolveCounter;
+    const tokenizerSpy = spyOn(tokenizerService, "resolveCounter").mockImplementation(async (model) => {
+      tokenizerModels.push(model);
+      return resolveCounter(model);
+    });
+    const expectedByProfile = {
+      delegate: {
+        provider: "scripted-child-a",
+        connectionId: childConnectionIds[0],
+        endpoint: "https://child-a.invalid/v1",
+        model: "child-model-a",
+        totalTokens: 24,
+      },
+      delegate_alt: {
+        provider: "scripted-child-b",
+        connectionId: childConnectionIds[1],
+        endpoint: "https://child-b.invalid/v1",
+        model: "child-model-b",
+        totalTokens: 36,
+      },
+    } as const;
+    const deps = __testing.buildDependencies();
+    const input = {
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: USER_INPUT,
+      parameters: { max_tokens: 1024 },
+    };
+    const target = { generationType: "normal" as const };
+    const signal = new AbortController().signal;
+    try {
+      const decision = await deps.resolveRuntime!(input, target, signal);
+      const internal = decision.internal as {
+        readonly childConnections?: Readonly<Record<string, {
+          readonly concreteId?: string;
+          readonly provider?: string;
+          readonly effectiveEndpoint?: string;
+          readonly model?: string | null;
+          readonly candidateRevision?: string | number;
+          readonly fingerprint?: string | null;
+        }>>;
+      };
+      const childConnections = internal.childConnections;
+      if (!childConnections) throw new Error("Child connections were not frozen");
+      expect({
+        concreteId: childConnections.delegate?.concreteId,
+        provider: childConnections.delegate?.provider,
+        endpoint: childConnections.delegate?.effectiveEndpoint,
+        model: childConnections.delegate?.model,
+      }).toEqual({
+        concreteId: childConnectionIds[0],
+        provider: expectedByProfile.delegate.provider,
+        endpoint: expectedByProfile.delegate.endpoint,
+        model: expectedByProfile.delegate.model,
+      });
+      expect({
+        concreteId: childConnections.delegate_alt?.concreteId,
+        provider: childConnections.delegate_alt?.provider,
+        endpoint: childConnections.delegate_alt?.effectiveEndpoint,
+        model: childConnections.delegate_alt?.model,
+      }).toEqual({
+        concreteId: childConnectionIds[1],
+        provider: expectedByProfile.delegate_alt.provider,
+        endpoint: expectedByProfile.delegate_alt.endpoint,
+        model: expectedByProfile.delegate_alt.model,
+      });
+      const baseSnapshot = await deps.buildAssemblySnapshot!(
+        input,
+        decision,
+        target,
+        signal,
+        "test-heterogeneous-children",
+      );
+      const scheduledBlocks = [
+        {
+          id: "heterogeneous-child-a",
+          name: "Heterogeneous child A",
+          content: "{{agent::delegate::as=heterogeneous_child_a_result}}child a{{/agent}}",
+          role: "user" as const,
+          enabled: true,
+          position: "pre_history" as const,
+          depth: 0,
+          marker: null,
+          isLocked: false,
+          color: null,
+          injectionTrigger: [],
+          group: null,
+          sealed: false,
+          order: baseSnapshot.blocks.length,
+          revision: "1",
+        },
+        {
+          id: "heterogeneous-child-b",
+          name: "Heterogeneous child B",
+          content: "{{agent::delegate_alt::as=heterogeneous_child_b_result}}child b{{/agent}}",
+          role: "user" as const,
+          enabled: true,
+          position: "pre_history" as const,
+          depth: 0,
+          marker: null,
+          isLocked: false,
+          color: null,
+          injectionTrigger: [],
+          group: null,
+          sealed: false,
+          order: baseSnapshot.blocks.length + 1,
+          revision: "1",
+        },
+      ] as const;
+      const snapshotCandidate = {
+        ...baseSnapshot,
+        snapshotId: "",
+        generationId: "test-heterogeneous-children",
+        blocks: [...baseSnapshot.blocks, ...scheduledBlocks],
+      };
+      const {
+        snapshotId: _snapshotId,
+        inputRevisionSet: _inputRevisionSet,
+        revisions: _revisions,
+        ...snapshotBase
+      } = snapshotCandidate;
+      const snapshot = {
+        ...snapshotCandidate,
+        snapshotId: createHash("sha256")
+          .update(encodeCanonicalPlainData({ base: snapshotBase, revisions: snapshotCandidate.revisions }), "utf8")
+          .digest("hex"),
+      } as typeof baseSnapshot;
+      const plan = await compileAgentAssemblyPlan(snapshot);
+      expect(plan.children.map((child) => child.profileId)).toEqual(["delegate", "delegate_alt"]);
+
+      scriptedDelegate = false;
+      scriptedWorkRound = 0;
+      boundProviderDispatches.length = 0;
+      providerRequests.length = 0;
+      const execution = await deps.createExecution!({
+        executionId: "exec-heterogeneous-scheduled-" + Date.now(),
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        target,
+        decision,
+        signal,
+      });
+      try {
+        const work = await deps.runWork!({ execution, input, decision, snapshot, plan, signal });
+        expect(work).toMatchObject({ status: "completed" });
+        expect(boundProviderDispatches).toHaveLength(2);
+        const inspection = getAgentRunInspection(USER_ID, execution.id, AGENTIC_CHAT_ID);
+        for (const profileId of ["delegate", "delegate_alt"] as const) {
+          const expected = expectedByProfile[profileId];
+          const dispatches = boundProviderDispatches.filter((dispatch) => dispatch.provider === expected.provider);
+          expect(dispatches).toHaveLength(1);
+          expect(dispatches[0]).toMatchObject({ provider: expected.provider, url: expected.endpoint });
+          expect(dispatches[0]?.request.model).toBe(expected.model);
+          expect(dispatches[0]?.request.model).not.toBe("scripted-model");
+          expect(tokenizerModels).toContain(expected.model);
+
+          const childExchange = inspection?.transcript.find((record) =>
+            record.kind === "provider_exchange"
+            && record.recipient === "child"
+            && record.provider?.providerId === expected.provider);
+          expect(childExchange?.provider).toMatchObject({
+            adapter: "agentic-work",
+            providerId: expected.provider,
+            modelId: expected.model,
+            connectionRevision: childConnections[profileId]?.candidateRevision,
+            fingerprint: childConnections[profileId]?.fingerprint,
+          });
+          const exchangeArguments = JSON.parse(childExchange?.arguments ?? "{}");
+          expect(exchangeArguments).toMatchObject({
+            profileId,
+            provider: expected.provider,
+            connectionId: expected.connectionId,
+            model: expected.model,
+          });
+          const childUsage = inspection?.usageEvidence.find((usage) =>
+            usage.layer === "child"
+            && usage.source === "provider_reported"
+            && usage.totalTokens === expected.totalTokens);
+          expect(childUsage).toMatchObject({
+            inputTokens: profileId === "delegate" ? 11 : 17,
+            outputTokens: profileId === "delegate" ? 13 : 19,
+            totalTokens: expected.totalTokens,
+            canonical: false,
+          });
+          const childActivity = inspection?.activity.milestones.find((activity) =>
+            activity.actor === "child"
+            && activity.id === "projection:" + childExchange?.correlation.taskId);
+          expect(childActivity).toMatchObject({ kind: "child", actor: "child" });
+        }
+        expect(tokenizerModels).toContain("scripted-model");
+        expect(tokenizerModels).toContain("child-model-a");
+        expect(tokenizerModels).toContain("child-model-b");
+      } finally {
+        deps.cleanup!({ execution } as never);
+      }
+      const malformedDecisions = [
+        {
+          ...decision,
+          internal: {
+            ...internal,
+            childConnections: { delegate: childConnections.delegate },
+          },
+        },
+        {
+          ...decision,
+          internal: {
+            ...internal,
+            childConnections: {
+              ...childConnections,
+              delegate_alt: { ...childConnections.delegate_alt, model: null },
+            },
+          },
+        },
+      ] as unknown as readonly [typeof decision, typeof decision];
+      for (const [index, malformedDecision] of malformedDecisions.entries()) {
+        boundProviderDispatches.length = 0;
+        providerRequests.length = 0;
+        const execution = await deps.createExecution!({
+          executionId: "exec-incomplete-child-" + index + "-" + Date.now(),
+          userId: USER_ID,
+          chatId: AGENTIC_CHAT_ID,
+          target,
+          decision,
+          signal,
+        });
+        try {
+          await expect(deps.runWork!({
+            execution,
+            input,
+            decision: malformedDecision,
+            snapshot,
+            plan,
+            signal,
+          })).rejects.toMatchObject({ code: "decision_refresh_required", phase: "WORK" });
+          expect(boundProviderDispatches).toHaveLength(0);
+          expect(providerRequests).toHaveLength(0);
+        } finally {
+          deps.cleanup!({ execution } as never);
+        }
+      }
+    } finally {
+      tokenizerSpy.mockRestore();
+      for (const binding of originalBindings) {
+        db.query(
+          "UPDATE preset_agent_slot_bindings SET connection_id = ?, updated_at = ? WHERE user_id = ? AND preset_id = ? AND slot_id = ?",
+        ).run(binding.connection_id, Date.now(), USER_ID, AGENTIC_PRESET_ID, binding.slot_id);
+      }
+      for (const profile of originalProfiles) {
+        db.query(
+          "UPDATE preset_agent_profiles SET workspace_capabilities = ?, max_output_tokens = ? WHERE user_id = ? AND preset_id = ? AND profile_id = ?",
+        ).run(profile.workspace_capabilities, profile.max_output_tokens, USER_ID, AGENTIC_PRESET_ID, profile.profile_id);
+      }
+      db.query("DELETE FROM connection_profiles WHERE user_id = ? AND id IN (?, ?)")
+        .run(USER_ID, childConnectionIds[0], childConnectionIds[1]);
+      scriptedDelegate = false;
+      scriptedDelegateProfileId = "delegate";
+      scriptedTaskCreated = false;
+      delegateIssued = false;
+      scriptedAcceptSubmission = false;
+      scriptedAcceptanceIssued = false;
+      scriptedChildSubmitted = false;
+      scriptedWorkRound = 0;
+      boundProviderDispatches.length = 0;
+      providerRequests.length = 0;
+    }
+  });
   test("keeps the real workspace writable through an intermediate phase completion", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
@@ -3949,8 +4315,9 @@ describe("coordinator cognition transition snapshot seam", () => {
       const childFrame = createAgenticChildFrame({
         frameId: childFrameId,
         parentFrameId: execution.id,
-        connectionId: null,
-        model: "",
+        provider: "scripted-coordinator",
+        connectionId: CONNECTION_ID,
+        model: "scripted-model",
         coreToolIds: [],
         taskId: materialized.task_id,
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],

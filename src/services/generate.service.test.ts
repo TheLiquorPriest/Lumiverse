@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 
 import type { LlmProvider } from "../llm/provider";
 import type { ProviderCapabilities } from "../llm/param-schema";
@@ -30,6 +30,7 @@ import { getChatPipelineStatus } from "./chat-pipeline-coordinator.service";
 import * as connectionsSvc from "./connections.service";
 import {
   __test__,
+  configureAgenticGenerationDependencies,
   dryRunGeneration,
   getActiveGenerationCount,
   startGeneration,
@@ -43,6 +44,27 @@ import * as worldBooksSvc from "./world-books.service";
 import { assemblePrompt } from "./prompt-assembly.service";
 import * as databankSvc from "./databank";
 import * as embeddingsSvc from "./embeddings.service";
+import * as runtimeDecisionSvc from "./agent-runtime-decision.service";
+import {
+  AgentRuntimeDecisionService,
+  RuntimeDecisionTokenStore,
+  type RuntimeDecisionDependencies,
+} from "./agent-runtime-decision.service";
+import {
+  AgenticGenerationError,
+  waitForAgenticGeneration,
+  type AgenticGenerationDependencies,
+  type AgenticGenerationInput,
+  type AgenticRuntimeDecision,
+  type AgenticTargetSnapshot,
+} from "./agentic-generation.service";
+import type {
+  AgenticReadinessVectorV1,
+  EffectiveRuntimeDecisionV1,
+  EffectiveRuntimeRequestV1,
+  FrozenConcreteConnectionV1,
+  InputRevisionSetV1,
+} from "../types/agent-runtime-decision";
 const TEST_CONNECTION: ResolvedConcreteConnectionV1 = {
   logicalId: "child-connection",
   concreteId: "child-connection",
@@ -2616,4 +2638,326 @@ describe.serial("root generation usage accounting", () => {
       await cleanupFixture(fixture.chat.id);
     }
   }, 15_000);
+});
+
+const ADMISSION_USER_ID = "runtime-token-owner";
+const ADMISSION_PRESET_ID = "runtime-token-preset";
+const ADMISSION_CONNECTION_ID = "runtime-token-connection";
+
+const ADMISSION_INPUT_REVISIONS: InputRevisionSetV1 = {
+  target: 1, chat: 2, message: 3, preset: 4, block: 5, config: 6,
+  binding: 7, connection: 8, endpoint: 9, credential: 10, persona: 11,
+  character: 12, group: 13, world: 14, lore: 15, settings: 16, macro: 17,
+  regex: 18, cognition: 19, readiness: 20,
+};
+
+function admissionReadiness(): AgenticReadinessVectorV1 {
+  return {
+    schemaEpoch: 1, runtimeEpoch: 1, reconciliationEpoch: 1, archiveRegistryVersion: 1,
+    isolateHealthEpoch: 1, publicationStoreHealthEpoch: 1, providerCapabilityRevision: 1,
+    configRevision: 1, bindingRevision: 1, concreteConnectionRevision: 1, targetRevision: 1,
+    inputRevisionDigest: "runtime-token-snapshot", cognitionRevision: 1,
+    killSwitchState: "auto", ready: true, reasons: [],
+  };
+}
+
+function mapAdmissionDecision(decision: EffectiveRuntimeDecisionV1): AgenticRuntimeDecision {
+  const root = decision.internal.rootConnection;
+  return {
+    mode: decision.effectiveMode,
+    presetId: decision.internal.binding.presetId ?? undefined,
+    configRevision: decision.internal.binding.configRevision ?? undefined,
+    bindingRevision: decision.internal.binding.bindingRevision ?? undefined,
+    readinessDigest: decision.internal.binding.readinessDigest,
+    connection: root ? {
+      logicalId: root.logicalId ?? undefined,
+      concreteId: root.concreteId ?? undefined,
+      provider: root.provider ?? undefined,
+      model: root.model ?? undefined,
+      endpoint: root.effectiveEndpoint ?? undefined,
+      candidateRevision: root.candidateRevision ?? undefined,
+      endpointRevision: root.endpointRevision ?? undefined,
+      credentialRevision: root.credentialRevision ?? undefined,
+      capabilities: root.capabilities,
+      fingerprint: root.fingerprint ?? undefined,
+    } : undefined,
+    internal: decision.internal,
+  };
+}
+
+async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
+  pool.clearAllPoolEntries();
+  closeDatabase();
+  initDatabase(":memory:");
+  await runMigrations(getDb());
+  getDb().query('INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)')
+    .run(ADMISSION_USER_ID, "Runtime Token Owner", "runtime-token@example.test");
+  const chat = chatsSvc.createChat(ADMISSION_USER_ID, {
+    character_id: null, name: "Runtime token admission", metadata: { temporary: true },
+  });
+  chatsSvc.createMessage(chat.id, {
+    is_user: true, name: "User", content: "Use the reviewed runtime.",
+  }, ADMISSION_USER_ID);
+
+  let now = 1_000;
+  let configRevision = 1;
+  let bindingRevision = 1;
+  let inputRevisions = { ...ADMISSION_INPUT_REVISIONS };
+  let readiness = admissionReadiness();
+  const connection: FrozenConcreteConnectionV1 = {
+    logicalId: ADMISSION_CONNECTION_ID, concreteId: ADMISSION_CONNECTION_ID,
+    label: "Reviewed root", provider: "authority-provider", model: "authority-model",
+    effectiveEndpoint: "https://authority.invalid/v1", endpointRevision: "endpoint-1",
+    credentialSecretRef: "secret-1", credentialRevision: "credential-1",
+    candidateRevision: "candidate-1", revision: "connection-1",
+    fingerprint: "authority-domain", capabilityDigest: "authority-capabilities",
+    capabilities: {
+      streaming: true, toolCalling: true, toolsDisabledFinalization: true,
+      nativeToolContinuation: true, toolContinuationMode: "native",
+    },
+  };
+  const agentConfig = {
+    version: 2 as const, agentsEnabled: true, allowedModes: ["response", "agentic"] as const,
+    defaultMode: "agentic" as const, maxInvocations: 8, maxToolCalls: 8,
+    mainToolIds: [] as string[], mainLoreScope: "active" as const,
+    profiles: [], connectionSlots: [],
+  };
+  const decisionDependencies: Partial<RuntimeDecisionDependencies> = {
+    getChat: (userId, chatId) => userId === ADMISSION_USER_ID && chatId === chat.id
+      ? { id: chat.id, character_id: null, metadata: { temporary: true } } : null,
+    getPreset: (userId, presetId) => userId === ADMISSION_USER_ID && presetId === ADMISSION_PRESET_ID
+      ? { id: ADMISSION_PRESET_ID, name: "Runtime token preset", cache_revision: 1 } : null,
+    getPresetAgentConfig: (userId, presetId) => userId === ADMISSION_USER_ID && presetId === ADMISSION_PRESET_ID
+      ? {
+          config: agentConfig,
+          review: { state: "ready", reasonCode: null, unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false },
+          configRevision, bindingRevision, bindings: [],
+        } : null,
+    resolveProfile: () => ({ preset_id: ADMISSION_PRESET_ID, source: "chat" }),
+    resolvePersona: () => null,
+    resolveConcreteConnection: async (userId, logicalId) =>
+      userId === ADMISSION_USER_ID && logicalId === ADMISSION_CONNECTION_ID ? connection : null,
+    getChatAgentModeOverride: () => null,
+    setChatAgentModeOverride: (_userId, chatId, mode) => ({ chatId, mode, revision: 1, state: "ready" }),
+    getInputRevisions: () => ({ ...inputRevisions }),
+    getReadinessVector: () => ({ ...readiness, reasons: [...readiness.reasons] }),
+  };
+  const service = new AgentRuntimeDecisionService({
+    now: () => now,
+    tokenStore: new RuntimeDecisionTokenStore(() => now, { ttlMs }),
+    dependencies: decisionDependencies,
+  });
+  const dispatches: Array<{ provider?: string; model?: string }> = [];
+
+  const requestFor = (input: AgenticGenerationInput, target: AgenticTargetSnapshot): EffectiveRuntimeRequestV1 => ({
+    chatId: input.chatId, logicalConnectionId: input.connectionId ?? null,
+    presetId: input.presetId ?? null, forcePresetId: input.forcePresetId === true,
+    personaId: input.personaId ?? null, targetCharacterId: input.targetCharacterId ?? null,
+    generationType: target.generationType,
+    target: {
+      generationType: target.generationType, messageId: target.messageId ?? null,
+      swipeId: target.swipeId ?? null,
+      targetCharacterId: target.targetCharacterId ?? input.targetCharacterId ?? null,
+      ...(target.revision === undefined ? {} : { revision: target.revision }),
+    },
+    mode: "agentic", requestEpoch: input.requestEpoch ?? 0,
+  });
+  const rejectRefresh = (): never => {
+    throw new AgenticGenerationError("decision_refresh_required", "decision_refresh_required", {
+      phase: "ASSEMBLE", retryable: true,
+    });
+  };
+  const dependencies: AgenticGenerationDependencies = {
+    resolveRuntime: async (input, target) => mapAdmissionDecision(
+      await service.resolve(input.userId, requestFor(input, target), { issueToken: false }),
+    ),
+    consumeRuntimeToken: async (input, target, token) => {
+      const consumed = await service.consume(input.userId, token, requestFor(input, target));
+      return consumed.accepted && consumed.decision ? mapAdmissionDecision(consumed.decision) : rejectRefresh();
+    },
+    assemble: async () => ({ snapshot: {} as never, plan: {} as never }),
+    runWork: async ({ decision }) => {
+      dispatches.push({ provider: decision.connection?.provider, model: decision.connection?.model });
+      return { status: "completed", summary: "dispatched" };
+    },
+    render: async () => ({ content: "rendered" }),
+    prepareRender: async () => ({ content: "rendered" }),
+    commit: async () => ({ receiptId: crypto.randomUUID() }),
+  };
+  configureAgenticGenerationDependencies(dependencies);
+
+  const generationInput = (requestEpoch: number, token?: string) => ({
+    userId: ADMISSION_USER_ID, chat_id: chat.id, connection_id: ADMISSION_CONNECTION_ID,
+    preset_id: ADMISSION_PRESET_ID, generation_type: "normal" as const, mode: "agentic" as const,
+    request_epoch: requestEpoch, user_input: "Use the reviewed runtime.",
+    provider: "caller-untrusted-provider",
+    ...(token === undefined ? {} : { runtime_decision_token: token }),
+  });
+  const issue = (requestEpoch: number) => service.resolve(
+    ADMISSION_USER_ID,
+    requestFor({
+      userId: ADMISSION_USER_ID, chatId: chat.id, connectionId: ADMISSION_CONNECTION_ID,
+      presetId: ADMISSION_PRESET_ID, generationType: "normal", requestEpoch,
+    }, { generationType: "normal" }),
+  );
+  return {
+    service, dispatches, generationInput, issue, requestFor, chatId: chat.id,
+    advance: (milliseconds: number) => { now += milliseconds; },
+    bumpConfig: () => {
+      configRevision += 1;
+      inputRevisions = { ...inputRevisions, config: Number(inputRevisions.config) + 1 };
+    },
+    resetConfig: () => {
+      configRevision = 1;
+      inputRevisions = { ...ADMISSION_INPUT_REVISIONS };
+    },
+    bumpReadiness: () => { readiness = { ...readiness, runtimeEpoch: Number(readiness.runtimeEpoch) + 1 }; },
+  };
+}
+
+function forbidReplacementResolution() {
+  return spyOn(runtimeDecisionSvc, "resolveEffectiveRuntime").mockImplementation(async () => {
+    throw new Error("caller token attempted replacement resolution");
+  });
+}
+
+describe.serial("startGeneration caller runtime decision authority", () => {
+  afterAll(() => {
+    pool.clearAllPoolEntries();
+    closeDatabase();
+  });
+
+test("consumes the exact token, freezes provider/model, and rejects replay", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const issued = await harness.issue(1);
+  const token = issued.runtimeDecisionToken!;
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    const started = await startGeneration(harness.generationInput(1, token));
+    expect(resolveSpy).not.toHaveBeenCalled();
+    expect(harness.service.tokenStore.liveCount).toBe(0);
+    await waitForAgenticGeneration(started.generationId);
+    expect(harness.dispatches).toEqual([{ provider: "authority-provider", model: "authority-model" }]);
+    await expect(startGeneration(harness.generationInput(1, token))).rejects.toMatchObject({
+      code: "decision_refresh_required",
+    });
+    expect(harness.dispatches).toHaveLength(1);
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("rejects expiry before dispatch", async () => {
+  const harness = await createRuntimeAdmissionHarness(1);
+  const token = (await harness.issue(2)).runtimeDecisionToken!;
+  harness.advance(2);
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(startGeneration(harness.generationInput(2, token))).rejects.toMatchObject({
+      code: "decision_refresh_required",
+    });
+    expect(harness.dispatches).toHaveLength(0);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("rejects stale revisions and readiness before dispatch", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const revisionToken = (await harness.issue(3)).runtimeDecisionToken!;
+  harness.bumpConfig();
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(startGeneration(harness.generationInput(3, revisionToken))).rejects.toMatchObject({
+      code: "decision_refresh_required",
+    });
+    harness.resetConfig();
+    const readinessToken = (await harness.issue(4)).runtimeDecisionToken!;
+    harness.bumpReadiness();
+    await expect(startGeneration(harness.generationInput(4, readinessToken))).rejects.toMatchObject({
+      code: "decision_refresh_required",
+    });
+    expect(harness.dispatches).toHaveLength(0);
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("consumes request-mismatched and cross-user tokens", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const mismatchToken = (await harness.issue(5)).runtimeDecisionToken!;
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(startGeneration(harness.generationInput(6, mismatchToken))).rejects.toMatchObject({ code: "decision_refresh_required" });
+    await expect(startGeneration(harness.generationInput(5, mismatchToken))).rejects.toMatchObject({ code: "decision_refresh_required" });
+    const crossUserToken = (await harness.issue(7)).runtimeDecisionToken!;
+    await expect(startGeneration({
+      ...harness.generationInput(7, crossUserToken), userId: "runtime-token-attacker",
+    })).rejects.toMatchObject({ code: "decision_refresh_required" });
+    await expect(startGeneration(harness.generationInput(7, crossUserToken))).rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(harness.dispatches).toHaveLength(0);
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("consumes supplied authority before requested-generation idempotency", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const token = (await harness.issue(8)).runtimeDecisionToken!;
+  const generationId = "existing-runtime-token-generation";
+  pool.createPoolEntry({
+    generationId, userId: ADMISSION_USER_ID, chatId: harness.chatId,
+    generationType: "normal", characterName: "", model: "",
+  });
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(startGeneration({
+      ...harness.generationInput(8, token), generationId,
+    })).resolves.toEqual({ generationId, status: "streaming" });
+    expect(harness.service.tokenStore.liveCount).toBe(0);
+    expect(harness.dispatches).toHaveLength(0);
+    await expect(startGeneration({
+      ...harness.generationInput(8, token), generationId,
+    })).rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(resolveSpy).not.toHaveBeenCalled();
+  } finally {
+    resolveSpy.mockRestore();
+    pool.removePoolEntry(generationId);
+  }
+});
+
+test("rejects explicit Response mode and burns the supplied Agentic token", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const token = (await harness.issue(9)).runtimeDecisionToken!;
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    await expect(startGeneration({
+      ...harness.generationInput(9, token), mode: "response" as const,
+    })).rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(harness.service.tokenStore.liveCount).toBe(0);
+    expect(harness.dispatches).toHaveLength(0);
+    await expect(startGeneration(harness.generationInput(9, token)))
+      .rejects.toMatchObject({ code: "decision_refresh_required" });
+    expect(resolveSpy).not.toHaveBeenCalled();
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
+
+test("allows only a tokenless direct caller to resolve internally", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const resolveSpy = spyOn(runtimeDecisionSvc, "resolveEffectiveRuntime").mockImplementation(
+    (userId, request) => harness.service.resolve(userId, request),
+  );
+  try {
+    const started = await startGeneration(harness.generationInput(9));
+    expect(resolveSpy).toHaveBeenCalledTimes(1);
+    expect(harness.service.tokenStore.liveCount).toBe(0);
+    await waitForAgenticGeneration(started.generationId);
+    expect(harness.dispatches).toEqual([{ provider: "authority-provider", model: "authority-model" }]);
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
 });

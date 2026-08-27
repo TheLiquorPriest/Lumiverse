@@ -769,12 +769,39 @@ function assertProviderCapabilitySnapshot(
   }
 }
 
+type CompleteFrozenConnectionV1 = FrozenConcreteConnectionV1 & {
+  readonly logicalId: string;
+  readonly concreteId: string;
+  readonly label: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly effectiveEndpoint: string;
+  readonly endpointRevision: Exclude<FrozenConcreteConnectionV1["endpointRevision"], null>;
+  readonly credentialSecretRef: string;
+  readonly credentialRevision: Exclude<FrozenConcreteConnectionV1["credentialRevision"], null>;
+  readonly candidateRevision: Exclude<FrozenConcreteConnectionV1["candidateRevision"], null>;
+  readonly fingerprint: string;
+};
+
 /**
- * Require a complete provider descriptor while preserving the capabilities
- * captured by runtime admission. The live adapter is consulted only to verify
- * its canonical capability digest; it never replaces the frozen snapshot.
+ * Refine one frozen admission descriptor without substituting live/default
+ * identity. Provider capabilities are the only live value consulted, and only
+ * to prove that the admitted adapter contract has not changed.
  */
-function requireRenderConnection(connection: FrozenConcreteConnectionV1): ResolvedConcreteConnectionV1 {
+function requireCompleteFrozenConnection(
+  connection: FrozenConcreteConnectionV1 | null | undefined,
+  phase: AgenticPhase,
+  subject: "root" | "child",
+): CompleteFrozenConnectionV1 {
+  if (!connection) {
+    throw new AgenticGenerationError(
+      subject === "root" ? "agentic_provider_failure" : "decision_refresh_required",
+      subject === "root"
+        ? "Agentic root connection is unavailable."
+        : "Agentic child connection is unavailable.",
+      { phase, retryable: subject === "child" },
+    );
+  }
   const providerName = connection.provider;
   const logicalId = connection.logicalId;
   const concreteId = connection.concreteId;
@@ -786,8 +813,7 @@ function requireRenderConnection(connection: FrozenConcreteConnectionV1): Resolv
   const credentialRevision = connection.credentialRevision;
   const candidateRevision = connection.candidateRevision;
   const provider = typeof providerName === "string" && providerName ? getProvider(providerName) : undefined;
-  const resolvedEndpoint = connection.effectiveEndpoint
-    || (typeof provider?.defaultUrl === "string" ? provider.defaultUrl : "");
+  const resolvedEndpoint = connection.effectiveEndpoint;
   if (
     !provider
     || typeof providerName !== "string" || !providerName
@@ -802,24 +828,35 @@ function requireRenderConnection(connection: FrozenConcreteConnectionV1): Resolv
     || (typeof credentialRevision !== "string" && typeof credentialRevision !== "number")
     || (typeof candidateRevision !== "string" && typeof candidateRevision !== "number")
   ) {
-    throw new AgenticGenerationError("agentic_provider_failure", "Agentic root connection is incomplete.", { phase: "ASSEMBLE" });
+    throw new AgenticGenerationError(
+      subject === "root" ? "agentic_provider_failure" : "decision_refresh_required",
+      subject === "root"
+        ? "Agentic root connection is incomplete."
+        : "Agentic child connection is incomplete.",
+      { phase, retryable: subject === "child" },
+    );
   }
   assertProviderCapabilitySnapshot(connection, provider);
   validateProviderCapabilities(provider);
+  return connection as CompleteFrozenConnectionV1;
+}
+
+function requireRenderConnection(connection: FrozenConcreteConnectionV1): ResolvedConcreteConnectionV1 {
+  const complete = requireCompleteFrozenConnection(connection, "RENDER", "root");
   return Object.freeze({
-    logicalId,
-    concreteId,
-    label,
-    provider: providerName,
-    model,
-    endpoint: resolvedEndpoint,
-    effectiveEndpoint: resolvedEndpoint,
-    endpointRevision: String(endpointRevision),
-    credentialSecretRef,
-    credentialRevision: String(credentialRevision),
-    candidateRevision: String(candidateRevision),
-    fingerprint,
-    capabilities: cloneAndFreeze(connection.capabilities) as unknown as LlmProvider["capabilities"],
+    logicalId: complete.logicalId,
+    concreteId: complete.concreteId,
+    label: complete.label,
+    provider: complete.provider,
+    model: complete.model,
+    endpoint: complete.effectiveEndpoint,
+    effectiveEndpoint: complete.effectiveEndpoint,
+    endpointRevision: String(complete.endpointRevision),
+    credentialSecretRef: complete.credentialSecretRef,
+    credentialRevision: String(complete.credentialRevision),
+    candidateRevision: String(complete.candidateRevision),
+    fingerprint: complete.fingerprint,
+    capabilities: cloneAndFreeze(complete.capabilities) as unknown as LlmProvider["capabilities"],
   });
 }
 
@@ -1726,21 +1763,46 @@ async function collectProviderResponse(
   return response;
 }
 
+type WorkProviderExchangeObserver = (
+  request: AgenticWorkProviderRequest,
+  response: GenerationResponse,
+) => void;
+
+function assertExactWorkDispatchIdentity(
+  request: AgenticWorkProviderRequest,
+  connection: CompleteFrozenConnectionV1,
+): void {
+  if (
+    request.connectionId !== connection.concreteId
+    || request.model !== connection.model
+    || request.frame.connectionId !== connection.concreteId
+    || request.frame.provider !== connection.provider
+    || request.frame.model !== connection.model
+  ) {
+    throw new AgenticWorkPhaseError(
+      "provider_protocol_error",
+      "Provider dispatch identity does not match the frozen connection",
+    );
+  }
+}
+
 function makeWorkProvider(
   userId: string,
-  connection: FrozenConcreteConnectionV1,
+  connection: CompleteFrozenConnectionV1,
   parameters: GenerationParameters | undefined,
   ledger: AgentRuntimeOwner["ledger"] | undefined,
   frozenCredential: string,
+  onExchange?: WorkProviderExchangeObserver,
 ) {
   return async (request: AgenticWorkProviderRequest): Promise<GenerationResponse> => {
+    assertExactWorkDispatchIdentity(request, connection);
     const continuationMode = connection.capabilities.toolContinuationMode;
     if (continuationMode !== "native" && continuationMode !== "legacy") {
       throw new AgenticWorkPhaseError("provider_protocol_error", "Provider tool continuation is unsupported");
     }
     const generationRequest: GenerationRequest = {
       messages: [...request.messages],
-      model: connection.model ?? request.model,
+      model: connection.model,
       parameters: { ...(parameters ?? {}), max_tokens: request.maxOutputTokens },
       tools: [...request.tools],
       stream: true,
@@ -1752,9 +1814,77 @@ function makeWorkProvider(
         : {}),
     };
     const stream = await providerStream(userId, connection, generationRequest, frozenCredential, ledger);
-    const counter = await resolveCounter(connection.model ?? request.model);
-    return collectProviderResponse(stream, request.receiveLimitBytes, ledger, request.frame.kind === "child", counter.count);
+    const counter = await resolveCounter(connection.model);
+    const response = await collectProviderResponse(
+      stream,
+      request.receiveLimitBytes,
+      ledger,
+      request.frame.kind === "child",
+      counter.count,
+    );
+    onExchange?.(request, response);
+    return response;
   };
+}
+function recordChildProviderExchange(
+  writer: AgentInspectionWriterV1 | undefined,
+  request: AgenticWorkProviderRequest,
+  response: GenerationResponse,
+  connection: CompleteFrozenConnectionV1,
+  profileId: string,
+  childId: string,
+): void {
+  if (!writer) return;
+  const frameDigest = createHash("sha256").update(request.frame.frameId, "utf8").digest("hex");
+  const exchangeId = "provider:work:child:" + frameDigest + ":" + request.roundIndex;
+  const correlation = { taskId: childId, parentId: request.frame.parentFrameId };
+  const boundary = { lifecycle: "WORK" as const, status: "running" as const };
+  writer.record("provider_exchange", {
+    id: exchangeId,
+    kind: "provider_exchange",
+    actor: "provider",
+    recipient: "child",
+    content: response.content,
+    arguments: JSON.stringify({
+      profileId,
+      provider: connection.provider,
+      connectionId: connection.concreteId,
+      model: connection.model,
+      roundIndex: request.roundIndex,
+      toolCalls: (response.tool_calls ?? []).map((call) => ({
+        callId: call.call_id,
+        toolName: call.name,
+        args: call.args,
+      })),
+    }),
+    result: JSON.stringify({
+      finishReason: response.finish_reason,
+      usage: response.usage ?? null,
+    }),
+    provider: {
+      adapter: "agentic-work",
+      providerId: connection.provider,
+      modelId: connection.model,
+      connectionRevision: connection.candidateRevision,
+      fingerprint: connection.fingerprint,
+    },
+    correlation,
+  }, boundary);
+  if (response.usage) {
+    writer.record("usage", {
+      version: 1,
+      id: "usage:" + exchangeId,
+      source: "provider_reported",
+      layer: "child",
+      correlation,
+      inputTokens: response.usage.prompt_tokens,
+      outputTokens: response.usage.completion_tokens,
+      totalTokens: response.usage.total_tokens,
+      toolCalls: response.tool_calls?.length ?? 0,
+      childInvocations: 0,
+      canonical: false,
+    }, boundary);
+  }
 }
 
 
@@ -4762,9 +4892,10 @@ function buildDependencies(): AgenticGenerationDependencies {
     runWork: async ({ execution, input, decision, snapshot, plan, signal }) => {
       const runtimeExecution = requireRuntimeExecution(execution);
       const internal = internalDecision(decision).internal;
-      const root = internal.rootConnection;
+      const frozenRoot = internal.rootConnection;
       const runtimeSnapshot = snapshot;
-      if (!root) return { status: "failed", errorCode: "agentic_provider_failure" };
+      if (!frozenRoot) return { status: "failed", errorCode: "agentic_provider_failure" };
+      const root = requireCompleteFrozenConnection(frozenRoot, "WORK", "root");
       const phaseSignal = runtimeExecution.signal ?? signal;
       const workspaceCapabilities = caps.get(execution.id);
       if (!workspaceCapabilities) {
@@ -4902,12 +5033,43 @@ function buildDependencies(): AgenticGenerationDependencies {
       // `allowMainDelegation` gates only the agent_delegate tool exposed to
       const profiles = config.profiles ?? [];
       const delegatable = profiles.filter((profile) => profile.allowMainDelegation === true);
-      const connectionFor = (profileId: string) => internal.childConnections[profileId] ?? root;
+      const profileConnections = new Map(profiles.map((profile) => {
+        const frozenConnection = profile.connectionRef.kind === "slot"
+          ? internal.childConnections[profile.id]
+          : root;
+        return [
+          profile.id,
+          requireCompleteFrozenConnection(frozenConnection, "WORK", "child"),
+        ] as const;
+      }));
+      const connectionFor = (profileId: string): CompleteFrozenConnectionV1 => {
+        const connection = profileConnections.get(profileId);
+        if (!connection) {
+          throw new AgenticGenerationError(
+            "decision_refresh_required",
+            "No frozen child connection is bound to profile " + profileId + ".",
+            { phase: "WORK" },
+          );
+        }
+        return connection;
+      };
+      const childProfiles = profiles.map((profile) => {
+        const child = connectionFor(profile.id);
+        return Object.freeze({
+          profileId: profile.id,
+          provider: child.provider,
+          connectionId: child.concreteId,
+          model: child.model,
+        });
+      });
       const profileOutputLimits = new Map(plan.profileOutputLimits.map((entry) => [entry.profileId, entry.maxOutputTokens]));
       const delegatableProfiles = delegatable.map((profile) => {
         const child = connectionFor(profile.id);
         return {
           profileId: profile.id,
+          provider: child.provider,
+          connectionId: child.concreteId,
+          model: child.model,
           toolIds: (profile.toolIds ?? []).filter((id) => available.has(id)),
           workspaceCapabilities: Object.freeze(
             (profile.workspaceCapabilities ?? []).filter((operation) =>
@@ -4916,8 +5078,6 @@ function buildDependencies(): AgenticGenerationDependencies {
             ),
           ),
           ...(profileOutputLimits.has(profile.id) ? { maxOutputTokens: profileOutputLimits.get(profile.id)! } : {}),
-          model: child.model ?? root.model ?? "",
-          connectionId: child.concreteId ?? child.logicalId ?? null,
         };
       });
       const hostLimits = getAgentRuntimeHostLimits();
@@ -5001,10 +5161,10 @@ function buildDependencies(): AgenticGenerationDependencies {
         trustedAssemblyLimits: runtimeSnapshot.limits,
         snapshot: runtimeSnapshot,
         plan,
-        connectionId: root.concreteId ?? root.logicalId ?? null,
-        model: root.model ?? "",
-        provider: root.provider ?? null,
-        connectionLabel: root.concreteId ?? root.logicalId ?? null,
+        connectionId: root.concreteId,
+        model: root.model,
+        provider: root.provider,
+        connectionLabel: root.label,
         dispatch: makeWorkProvider(
           input.userId,
           root,
@@ -5100,6 +5260,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         workspaceCapabilities,
         allowAgentDelegate: delegatable.length > 0,
         delegatableProfiles,
+        childProfiles,
         budget: {
           maxToolCalls: Math.min(config.maxToolCalls ?? hostLimits.aggregateToolCalls, hostLimits.aggregateToolCalls),
           maxChildFrames: Math.min(config.maxInvocations ?? hostLimits.childAdmissions, hostLimits.childAdmissions),
@@ -5129,7 +5290,21 @@ function buildDependencies(): AgenticGenerationDependencies {
             maxInputBytes: runtimeSnapshot.limits.maxInputBytes,
             reserveInitialInput: (bytes) =>
               runtimeExecution.owner.ledger.chargeBytes("initial_input_bytes", bytes),
-            dispatch: makeWorkProvider(input.userId, child, effectiveParameters, runtimeExecution.owner.ledger, frozenCredentialFor(runtimeExecution, child)),
+            dispatch: makeWorkProvider(
+              input.userId,
+              child,
+              effectiveParameters,
+              runtimeExecution.owner.ledger,
+              frozenCredentialFor(runtimeExecution, child),
+              (request, response) => recordChildProviderExchange(
+                inspectionWriter,
+                request,
+                response,
+                child,
+                profile.id,
+                descriptor.childId,
+              ),
+            ),
             executeCore: executorFor(childToolIds, normalizeLoreScope(profile.loreScope)),
             budget: {
               maxChildOutputBytes: descriptor.maxOutputBytes,

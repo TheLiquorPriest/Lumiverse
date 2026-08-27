@@ -298,6 +298,7 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
 
 async function compiledChildFixture(
   blocks: readonly { readonly id: string; readonly content: string }[],
+  profileIds: readonly string[] = ["writer"],
 ): Promise<{ readonly plan: AssemblyPlanV1; readonly snapshot: GenerationAssemblySnapshotV1 }> {
   const template = snapshotForPlan(plan());
   const agentConfig = parseAgentConfigV2({
@@ -307,19 +308,19 @@ async function compiledChildFixture(
     defaultMode: "agentic",
     maxInvocations: 4,
     maxToolCalls: 4,
-    profiles: [{
-      id: "writer",
-      name: "Writer",
+    profiles: profileIds.map((profileId) => ({
+      id: profileId,
+      name: profileId,
       systemPrompt: "",
-      connectionRef: { kind: "inherit_main" },
+      connectionRef: { kind: "inherit_main" as const },
       toolIds: [],
-      loreScope: "active",
+      loreScope: "active" as const,
       allowMainDelegation: false,
-      failurePolicy: "required",
+      failurePolicy: "required" as const,
       streamActivity: false,
       maxOutputTokens: 64,
       timeoutMs: 5_000,
-    }],
+    })),
   });
   const candidate = {
     ...template,
@@ -1365,6 +1366,7 @@ describe("Agentic WORK phase", () => {
     const childFrame = createAgenticChildFrame({
       frameId: "child-1",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: ["chat_search_history"],
@@ -1390,6 +1392,28 @@ describe("Agentic WORK phase", () => {
     expect(tools).not.toContain("workspace_submit_child_result");
     expect(tools).not.toContain("mcp_call");
     expect(tools).not.toContain("spindle_tool");
+  });
+  test("rejects child frames without a non-empty concrete provider, connection, and model", () => {
+    const valid: Parameters<typeof createAgenticChildFrame>[0] = {
+      frameId: "child-concrete-identity",
+      parentFrameId: "root",
+      provider: "test-child-provider",
+      connectionId: "test-child-connection",
+      model: "test-child-model",
+      coreToolIds: [],
+      signal: new AbortController().signal,
+    };
+    for (const invalid of [
+      { ...valid, provider: "" },
+      { ...valid, provider: null },
+      { ...valid, connectionId: "" },
+      { ...valid, connectionId: null },
+      { ...valid, model: "" },
+    ]) {
+      expect(() => createAgenticChildFrame(
+        invalid as unknown as Parameters<typeof createAgenticChildFrame>[0],
+      )).toThrow();
+    }
   });
   test("describes complete_turn phase semantics and exposes exact workspace schemas", () => {
     const composition = composeAgenticWorkToolDefinitions({
@@ -1534,6 +1558,7 @@ describe("Agentic WORK phase", () => {
       const frame = createAgenticChildFrame({
         frameId,
         parentFrameId: "test-root",
+        provider: "test-child-provider",
         connectionId: "concrete-connection",
         model: "frozen-model",
         coreToolIds: [],
@@ -1579,13 +1604,13 @@ describe("Agentic WORK phase", () => {
   test("runs deterministic child descriptors in traversal order and substitutes bounded results once", async () => {
     const { plan: childPlan, snapshot } = await compiledChildFixture([
       { id: "block-a", content: "{{agent::writer::as=child_a_result}}A{{/agent}}" },
-      { id: "block-b", content: "{{agent::writer::as=child_b_result}}B{{/agent}}" },
+      { id: "block-b", content: "{{agent::researcher::as=child_b_result}}B{{/agent}}" },
       {
         id: "block-results",
         content: "before {{agentResult::child_a_result}} middle {{agentResult::child_b_result}}",
       },
-    ]);
-    const order: string[] = [];
+    ], ["writer", "researcher"]);
+    const identities: string[] = [];
     const rootMessages: string[] = [];
     const result = await runAgenticWorkPhase(baseOptions(async ({ messages }) => {
       const materialized = messages.find((message) =>
@@ -1596,8 +1621,15 @@ describe("Agentic WORK phase", () => {
     }, {
       plan: childPlan,
       snapshot,
+      provider: "root-provider",
+      connectionId: "root-connection",
+      model: "root-model",
+      childProfiles: [
+        { profileId: "writer", provider: "writer-provider", connectionId: "writer-connection", model: "writer-model" },
+        { profileId: "researcher", provider: "research-provider", connectionId: "research-connection", model: "research-model" },
+      ],
       executeChild: async ({ descriptor, frame }) => {
-        order.push(`${descriptor.childId}:${frame.connectionId}:${frame.model}:${frame.canComplete}`);
+        identities.push(descriptor.childId + ":" + descriptor.profileId + ":" + frame.provider + ":" + frame.connectionId + ":" + frame.model + ":" + frame.canComplete);
         return { content: descriptor.task === "A" ? "A-RESULT" : "B-RESULT", status: "succeeded" };
       },
       workspace: workspace(),
@@ -1605,8 +1637,12 @@ describe("Agentic WORK phase", () => {
     }));
 
     expect(result.status).toBe("completed");
-    expect(order).toEqual(childPlan.children.map((descriptor) =>
-      descriptor.childId + ":concrete-connection:frozen-model:false",
+    const bindings = new Map([
+      ["writer", "writer-provider:writer-connection:writer-model"],
+      ["researcher", "research-provider:research-connection:research-model"],
+    ]);
+    expect(identities).toEqual(childPlan.children.map((descriptor) =>
+      descriptor.childId + ":" + descriptor.profileId + ":" + bindings.get(descriptor.profileId) + ":false",
     ));
     expect(rootMessages).toEqual(["before A-RESULT middle B-RESULT"]);
   });
@@ -1689,6 +1725,9 @@ describe("Agentic WORK phase", () => {
     }), {
       plan: privatePlan,
       snapshot: privateSnapshot,
+      childProfiles: [
+        { profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model" },
+      ],
       executeChild: async () => {
         childInvocations += 1;
         return { content: "PRIVATE_CHILD_BODY" };
@@ -1710,6 +1749,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: ["chat_search_history"],
@@ -1747,6 +1787,7 @@ describe("Agentic WORK phase", () => {
     expect(() => createAgenticChildFrame({
       frameId: "question-child-rejected",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -1760,6 +1801,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "question-child-denied",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -1796,6 +1838,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "child-profile",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: ["chat_search_history"],
@@ -1830,6 +1873,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "child-profile-bounds",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: ["chat_search_history"],
@@ -1883,6 +1927,7 @@ describe("Agentic WORK phase", () => {
   test("uses turn-global host IDs for sequential delegate batches and passes workspace authority", async () => {
     const assigned: string[] = [];
     const childFrames: string[] = [];
+    const childIdentities: Array<{ profileId: string; provider: string | null; connectionId: string | null; model: string }> = [];
     const childWorkspaces: unknown[] = [];
     const ledger = assignmentLedger([
       { id: "task-1", state: "active", assignedFrameId: null },
@@ -1908,7 +1953,7 @@ describe("Agentic WORK phase", () => {
       round += 1;
       if (round <= 2) {
         return response("", [call("agent_delegate", "provider-reused-call-id", {
-          profile_id: "writer",
+          profile_id: round === 1 ? "writer" : "researcher",
           task_id: `task-${round}`,
           task: `task ${round}`,
         })]);
@@ -1916,14 +1961,22 @@ describe("Agentic WORK phase", () => {
       return response("", [complete("delegate-complete")]);
     }, {
       rootFrameId: "turn-1",
+      provider: "root-provider",
+      connectionId: "root-connection",
+      model: "root-model",
       workspace: ws,
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [
+        { profileId: "writer", provider: "writer-provider", connectionId: "writer-connection", model: "writer-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] },
+        { profileId: "researcher", provider: "research-provider", connectionId: "research-connection", model: "research-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] },
+      ],
       executeChild: async ({ descriptor, frame, workspace: childWorkspace }) => {
         childFrames.push(frame.frameId);
+        childIdentities.push({
+          profileId: descriptor.profileId,
+          provider: frame.provider,
+          connectionId: frame.connectionId,
+          model: frame.model,
+        });
         childWorkspaces.push(childWorkspace);
         ledger.complete(descriptor.taskId ?? "");
         return { content: "child-result", status: "succeeded" };
@@ -1935,6 +1988,10 @@ describe("Agentic WORK phase", () => {
     expect(childFrames[1]).toMatch(/^turn-1\.[0-9a-f]{64}:child-1$/);
     expect(assigned).toEqual(["task-1", "task-2"]);
     expect(childWorkspaces).toEqual([ws, ws]);
+    expect(childIdentities).toEqual([
+      { profileId: "writer", provider: "writer-provider", connectionId: "writer-connection", model: "writer-model" },
+      { profileId: "researcher", provider: "research-provider", connectionId: "research-connection", model: "research-model" },
+    ]);
   });
   test("advertises authorized delegate IDs and canonicalizes a unique case-insensitive provider spelling", async () => {
     let round = 0;
@@ -1968,11 +2025,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor, definitions }) => {
         childProfiles.push(descriptor.profileId);
         childToolNames.push(definitions.map((definition) => definition.name));
@@ -2046,11 +2099,7 @@ describe("Agentic WORK phase", () => {
             };
           },
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async ({ descriptor }) => {
           assignedChildIds.push(descriptor.childId);
           ledger.complete(descriptor.taskId ?? "");
@@ -2126,11 +2175,7 @@ describe("Agentic WORK phase", () => {
             };
           },
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async ({ descriptor, frame }) => {
           childFrames.push(frame.frameId);
           ledger.complete(descriptor.taskId ?? "");
@@ -2166,11 +2211,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress"] }],
       executeChild: async () => {
         children += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -2210,11 +2251,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         children += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -2251,11 +2288,7 @@ describe("Agentic WORK phase", () => {
             assignments: mode === "reordered" ? [...requested].reverse() : requested.slice(0, 1),
           }),
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async () => {
           childCalls += 1;
           return { content: "unexpected", status: "succeeded" };
@@ -2306,11 +2339,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor }) => {
         const taskId = descriptor.taskId ?? "";
         childTasks.push(taskId);
@@ -2377,11 +2406,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor }) => {
         childCalls += 1;
         ledger.complete(descriptor.taskId ?? "");
@@ -2459,11 +2484,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         childCalls += 1;
         return { content: "child-result", status: "succeeded" };
@@ -2519,11 +2540,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor }) => {
         const taskId = descriptor.taskId ?? "";
         childTasks.push(taskId);
@@ -2597,11 +2614,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor }) => {
         const taskId = descriptor.taskId ?? "";
         childTasks.push(taskId);
@@ -2658,11 +2671,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         childCalls += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -2687,6 +2696,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "empty-child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -2706,6 +2716,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "submitted-child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -3007,11 +3018,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         childCalls += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -3032,6 +3039,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "cancel-child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -3162,6 +3170,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "cumulative-child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -3209,6 +3218,7 @@ describe("Agentic WORK phase", () => {
     const frame = (frameId: string) => createAgenticChildFrame({
       frameId,
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -3250,6 +3260,7 @@ describe("Agentic WORK phase", () => {
       frame: createAgenticChildFrame({
         frameId: "private-reasoning-child",
         parentFrameId: "root",
+        provider: "test-child-provider",
         connectionId: "concrete-connection",
         model: "frozen-model",
         coreToolIds: [],
@@ -3267,6 +3278,7 @@ describe("Agentic WORK phase", () => {
       frame: createAgenticChildFrame({
         frameId: "private-reasoning-child-ok",
         parentFrameId: "root",
+        provider: "test-child-provider",
         connectionId: "concrete-connection",
         model: "frozen-model",
         coreToolIds: [],
@@ -3305,6 +3317,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "stateful-child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "concrete-connection",
       model: "frozen-model",
       coreToolIds: [],
@@ -3383,11 +3396,7 @@ describe("Agentic WORK phase", () => {
       coreToolIds: ["chat_search_history"],
       workspaceCapabilities: ["record_finding"],
       allowAgentDelegate: true,
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
     });
     expect(composition.rootDefinitions.map((definition) => definition.name)).toContain("agent_delegate");
     expect(composition.rootDefinitions.find((definition) => definition.name === "agent_delegate")).toMatchObject({
@@ -3417,6 +3426,7 @@ describe("Agentic WORK phase", () => {
     const frame = createAgenticChildFrame({
       frameId: "child",
       parentFrameId: "root",
+      provider: "test-child-provider",
       connectionId: "connection",
       model: "model",
       coreToolIds: ["chat_search_history"],
@@ -3487,11 +3497,7 @@ describe("Agentic WORK phase", () => {
         : response("", [complete("narrow-only")]);
     }, {
       workspace: workspace(),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
     }));
     expect(result.status).toBe("completed");
     expect(result.observations.find((item) => item.callId === "wide-grant")).toMatchObject({
@@ -3530,11 +3536,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         children += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -3598,11 +3600,7 @@ describe("Agentic WORK phase", () => {
           },
           freezeForCompletion: async () => ({ accepted: true, workspaceRevision: 8 }),
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async ({ frame, descriptor }) => {
           childTaskId = descriptor.taskId ?? "";
           childAssignedTaskId = frame.assignedTaskId ?? "";
@@ -3687,11 +3685,7 @@ describe("Agentic WORK phase", () => {
             return { accepted: true, workspaceRevision: 2 };
           },
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async () => JSON.parse('"legacy-string"'),
       }));
 
@@ -3746,11 +3740,7 @@ describe("Agentic WORK phase", () => {
             return { accepted: true, workspaceRevision: 2 };
           },
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async () => ({
           status: "succeeded",
           content: "provider claimed completion",
@@ -3807,11 +3797,7 @@ describe("Agentic WORK phase", () => {
           return { accepted: true, workspaceRevision: 2 };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "failed",
         content: "",
@@ -3854,11 +3840,7 @@ describe("Agentic WORK phase", () => {
           return { accepted: true, workspaceRevision: 1, assignments: [] };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({ content: "", status: "succeeded" }),
     }));
     await started;
@@ -3910,11 +3892,7 @@ describe("Agentic WORK phase", () => {
           throw settlementFailure;
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ frame, descriptor }) => {
         expect(frame.assignedTaskId).toBe("abort-settlement-task");
         expect(descriptor.taskId).toBe("abort-settlement-task");
@@ -3968,11 +3946,7 @@ describe("Agentic WORK phase", () => {
           return { accepted: true, workspaceRevision: 2 };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor }) => {
         childCalls += 1;
         if (descriptor.taskId === "cleanup-task-1") {
@@ -4064,11 +4038,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "failed",
         content: "",
@@ -4142,11 +4112,7 @@ describe("Agentic WORK phase", () => {
             return { accepted: true, workspaceRevision: 2 };
           },
         }),
-        delegatableProfiles: [{
-          profileId: "writer",
-          toolIds: ["chat_search_history"],
-          workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-        }],
+        delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
         executeChild: async () => ({
           status: "failed",
           content: "",
@@ -4221,11 +4187,7 @@ describe("Agentic WORK phase", () => {
           canComplete: false,
         }),
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "failed",
         content: "",
@@ -4271,11 +4233,7 @@ describe("Agentic WORK phase", () => {
           };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         children += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -4466,11 +4424,7 @@ describe("Agentic WORK phase", () => {
       workspaceCapabilities: ["read_section"],
       coreToolIds: ["chat_search_history"],
       allowAgentDelegate: true,
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       phaseEvaluationContext: phaseContext({ "skip-first": true }),
       phaseAdmittedCapabilities: ["core_retrieval", "workspace_read"],
     }));
@@ -4521,11 +4475,7 @@ describe("Agentic WORK phase", () => {
       workspaceCapabilities: ["read_section"],
       coreToolIds: ["chat_search_history"],
       allowAgentDelegate: true,
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       phaseEvaluationContext: phaseContext({ "skip-a": true, "skip-b": true }),
       phaseAdmittedCapabilities: ["core_retrieval", "workspace_read"],
     }));
@@ -4636,11 +4586,7 @@ describe("Agentic WORK phase", () => {
       workspaceCapabilities: ["read_section", "create_task"],
       coreToolIds: ["chat_search_history"],
       allowAgentDelegate: true,
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       phaseEvaluationContext: phaseContext(),
       phaseAdmittedCapabilities: ["core_retrieval", "workspace_read", "workspace_write", "council"],
       council: {
@@ -5014,11 +4960,7 @@ describe("Agentic WORK phase", () => {
       phaseEvaluationContext: phaseContext(),
       phaseAdmittedCapabilities: ["workspace_write", "delegation"],
       phaseRevision: 4,
-      delegatableProfiles: [{
-        profileId: "fn_required_retriever",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "fn_required_retriever", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["submit_child_result"] }],
     }));
 
     expect(result.status).toBe("completed");
@@ -5120,11 +5062,7 @@ describe("Agentic WORK phase", () => {
       phaseEvaluationContext: phaseContext({ fn_collaboration: true }),
       phaseAdmittedCapabilities: ["workspace_write", "delegation"],
       phaseRevision: 4,
-      delegatableProfiles: [{
-        profileId: "fn_required_retriever",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "fn_required_retriever", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["submit_child_result"] }],
     }));
 
     expect(result.status).toBe("completed");
@@ -5268,11 +5206,7 @@ describe("Agentic WORK phase", () => {
           return { accepted: true, workspaceRevision: 8 };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         childCalls += 1;
         return { content: "unexpected", status: "succeeded" };
@@ -5350,11 +5284,7 @@ describe("Agentic WORK phase", () => {
           throw new Error("timed-out settlement rejected");
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async ({ descriptor }) => {
         if (descriptor.taskId === "completed-sibling-task") {
           return { status: "succeeded", content: "already submitted", workspaceRevision: 2 };
@@ -5425,11 +5355,7 @@ describe("Agentic WORK phase", () => {
           return { accepted: true, workspaceRevision: 2 };
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "succeeded",
         content: "provider claimed success without submission",
@@ -5499,11 +5425,7 @@ describe("Agentic WORK phase", () => {
           workspaceRevision: expectedRevision ?? 7,
         }),
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "failed",
         content: "",
@@ -5584,11 +5506,7 @@ describe("Agentic WORK phase", () => {
           workspaceRevision: expectedRevision ?? 8,
         }),
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         childCalls += 1;
         return { status: "failed", content: "", errorCode: "provider_error" };
@@ -5663,11 +5581,7 @@ describe("Agentic WORK phase", () => {
           throw new Error("adapter threw after paged revision drift");
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => {
         childCalls += 1;
         return { status: "failed", content: "", errorCode: "provider_error" };
@@ -5726,11 +5640,7 @@ describe("Agentic WORK phase", () => {
           workspaceRevision: expectedRevision ?? 9,
         }),
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "failed",
         content: "",
@@ -5775,11 +5685,7 @@ describe("Agentic WORK phase", () => {
           throw Object.assign(new Error("terminal state conflict"), { code: "task_assignment_conflict" });
         },
       }),
-      delegatableProfiles: [{
-        profileId: "writer",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
       executeChild: async () => ({
         status: "failed",
         content: "",
@@ -5981,6 +5887,7 @@ describe("Agentic WORK phase", () => {
       frame: createAgenticChildFrame({
         frameId: "child-no-root-fuse",
         parentFrameId: "root",
+        provider: "test-child-provider",
         connectionId: "concrete-connection",
         model: "frozen-model",
         coreToolIds: [],
@@ -6305,11 +6212,7 @@ describe("Agentic WORK phase", () => {
       phaseEvaluationContext: phaseContext(),
       phaseAdmittedCapabilities: ["workspace_write", "delegation"],
       phaseRevision: 4,
-      delegatableProfiles: [{
-        profileId: "fn_required_retriever",
-        toolIds: ["chat_search_history"],
-        workspaceCapabilities: ["submit_child_result"],
-      }],
+      delegatableProfiles: [{ profileId: "fn_required_retriever", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: ["chat_search_history"], workspaceCapabilities: ["submit_child_result"] }],
     }));
     expect(result.status).toBe("completed");
     expect(result.code).toBeUndefined();
@@ -6883,6 +6786,7 @@ describe("Agentic WORK phase", () => {
         frame: createAgenticChildFrame({
           frameId: `child-${finishReason}-empty`,
           parentFrameId: "root",
+          provider: "test-child-provider",
           connectionId: "concrete-connection",
           model: "frozen-model",
           coreToolIds: [],
@@ -6916,6 +6820,7 @@ describe("Agentic WORK phase", () => {
       frame: createAgenticChildFrame({
         frameId: "child-empty-stop",
         parentFrameId: "root",
+        provider: "test-child-provider",
         connectionId: "concrete-connection",
         model: "frozen-model",
         coreToolIds: [],
@@ -6961,6 +6866,9 @@ describe("Agentic WORK phase", () => {
       }),
       delegatableProfiles: [{
         profileId: "fn_required_retriever",
+        provider: "test-child-provider",
+        connectionId: "test-child-connection",
+        model: "test-child-model",
         toolIds: ["chat_search_history"],
         workspaceCapabilities: ["update_assigned_progress", "submit_child_result"],
         maxOutputTokens: 384,

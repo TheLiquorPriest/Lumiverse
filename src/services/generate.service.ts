@@ -3,6 +3,7 @@ import {
   requestAgenticGenerationCancellation,
   requestAgenticChatCancellation,
   waitForAgenticGeneration,
+  waitForAgenticGenerationAdmission,
   getActiveAgenticGenerationForChat,
   getActiveAgenticGenerationContext,
   stopAgenticUserGenerations,
@@ -11,6 +12,7 @@ import {
   AgenticGenerationError,
   type AgenticGenerationDependencies,
   type AgenticGenerationInput,
+  type AgenticTargetSnapshot,
 } from "./agentic-generation.service";
 import { getProvider } from "../llm/registry";
 import {
@@ -5328,7 +5330,7 @@ function toAgenticGenerationInput(input: GenerateInput): AgenticGenerationInput 
     ...(input.parameters ? { parameters: input.parameters } : {}),
     userInput: input.user_input ?? "",
     ...(input.regen_feedback !== undefined ? { regenFeedback: input.regen_feedback } : {}),
-    ...(input.runtime_decision_token ? { runtimeDecisionToken: input.runtime_decision_token } : {}),
+    ...(input.runtime_decision_token !== undefined ? { runtimeDecisionToken: input.runtime_decision_token } : {}),
     ...(input.request_epoch !== undefined ? { requestEpoch: input.request_epoch } : {}),
     signal: input.signal,
     isImpersonate: input.generation_type === "impersonate" || input.impersonate_mode !== undefined,
@@ -5420,11 +5422,73 @@ async function startReservedGeneration(
     throw error;
   }
 }
+function callerDecisionTarget(input: AgenticGenerationInput): AgenticTargetSnapshot {
+  const generationType = input.generationType;
+  if (
+    generationType !== "normal"
+    && generationType !== "continue"
+    && generationType !== "regenerate"
+    && generationType !== "swipe"
+  ) {
+    throw new AgenticGenerationError(
+      "agentic_unsupported_surface",
+      "This generation surface is only available in Response mode.",
+    );
+  }
+  return {
+    generationType,
+    ...(input.messageId ? { messageId: input.messageId } : {}),
+    ...(input.swipeId !== undefined ? { swipeId: input.swipeId } : {}),
+    ...(input.targetCharacterId ? { targetCharacterId: input.targetCharacterId } : {}),
+  };
+}
+
+async function consumeCallerRuntimeDecision(input: GenerateInput, token: string): Promise<void> {
+  const agenticInput = toAgenticGenerationInput(input);
+  const consume = agenticGenerationDependencies?.consumeRuntimeToken;
+  if (!consume) {
+    throw new AgenticGenerationError(
+      "agentic_runtime_unavailable",
+      "Agentic decision authority is unavailable.",
+      { phase: "ASSEMBLE", retryable: true },
+    );
+  }
+  await consume(
+    agenticInput,
+    callerDecisionTarget(agenticInput),
+    token,
+    agenticInput.signal ?? new AbortController().signal,
+  );
+}
+
+async function startAdmittedAgenticGeneration(input: GenerateInput) {
+  const started = await startAgenticGeneration(
+    toAgenticGenerationInput(input),
+    agenticGenerationDependencies,
+  );
+  try {
+    await waitForAgenticGenerationAdmission(started.generationId);
+  } catch (error) {
+    // Admission failures are detached terminal turns. Join their cleanup so a
+    // rejected token cannot leave a transient chat owner behind.
+    await waitForAgenticGeneration(started.generationId);
+    throw error;
+  }
+  return started;
+}
+
+function runtimeDecisionRefreshRequired(message: string): AgenticGenerationError {
+  return new AgenticGenerationError(
+    "decision_refresh_required",
+    message,
+    { phase: "ASSEMBLE", retryable: true },
+  );
+}
 
 /**
- * Common authenticated generation admission. Every mode, including a
- * one-turn selection, resolves through the runtime decision authority before
- * entering Response or Agentic execution.
+ * Common authenticated generation admission. A caller-supplied Agentic token
+ * is the sole decision authority for that request; tokenless callers resolve
+ * through the runtime decision authority before entering either mode.
  */
 export async function startGeneration(
   input: GenerateInput,
@@ -5434,17 +5498,48 @@ export async function startGeneration(
     throw new Error("Unsupported generation mode.");
   }
 
+  const callerRuntimeDecisionToken = input.runtime_decision_token;
+  if (callerRuntimeDecisionToken !== undefined && (
+    typeof callerRuntimeDecisionToken !== "string"
+    || callerRuntimeDecisionToken.length === 0
+  )) {
+    throw runtimeDecisionRefreshRequired("Agentic runtime decision is no longer valid.");
+  }
+  if (callerRuntimeDecisionToken !== undefined && input.mode === "response") {
+    await consumeCallerRuntimeDecision(input, callerRuntimeDecisionToken);
+    throw runtimeDecisionRefreshRequired(
+      "The supplied Agentic runtime decision does not match explicit Response mode.",
+    );
+  }
+
   const requestedGenerationId =
     typeof input.generationId === "string" ? input.generationId.trim() : "";
   if (requestedGenerationId) {
     const existing = activeGenerations.get(requestedGenerationId);
     if (existing && existing.userId === input.userId && existing.chatId === input.chat_id) {
+      if (callerRuntimeDecisionToken !== undefined) {
+        await consumeCallerRuntimeDecision(input, callerRuntimeDecisionToken);
+      }
       return { generationId: requestedGenerationId, status: "streaming" };
     }
     const poolEntry = pool.getPoolEntry(requestedGenerationId);
     if (poolEntry && poolEntry.userId === input.userId && poolEntry.chatId === input.chat_id) {
+      if (callerRuntimeDecisionToken !== undefined) {
+        await consumeCallerRuntimeDecision(input, callerRuntimeDecisionToken);
+      }
       return { generationId: requestedGenerationId, status: "streaming" };
     }
+  }
+
+  if (callerRuntimeDecisionToken !== undefined) {
+    const agenticInput: GenerateInput = {
+      ...input,
+      mode: "agentic",
+      runtime_decision_token: callerRuntimeDecisionToken,
+    };
+    return startReservedGeneration(input, "agentic", () =>
+      startAdmittedAgenticGeneration(agenticInput),
+    );
   }
 
   const decision = await resolveEffectiveRuntime(input.userId, toEffectiveRuntimeRequest(input));
@@ -5452,10 +5547,8 @@ export async function startGeneration(
     const reasons = decision.capabilityReadiness.repairCodes.length > 0
       ? decision.capabilityReadiness.repairCodes.join(", ")
       : "agentic_response_escape";
-    throw new AgenticGenerationError(
-      "decision_refresh_required",
+    throw runtimeDecisionRefreshRequired(
       `Agentic mode is unavailable (${reasons}); choose Response mode explicitly to continue.`,
-      { phase: "ASSEMBLE", retryable: true },
     );
   }
 
@@ -5463,11 +5556,7 @@ export async function startGeneration(
   let agenticInput = input;
   if (mode === "agentic") {
     if (!decision.runtimeDecisionToken) {
-      throw new AgenticGenerationError(
-        "decision_refresh_required",
-        "Agentic runtime decision is no longer valid.",
-        { phase: "ASSEMBLE", retryable: true },
-      );
+      throw runtimeDecisionRefreshRequired("Agentic runtime decision is no longer valid.");
     }
     agenticInput = {
       ...input,
@@ -5475,7 +5564,7 @@ export async function startGeneration(
       runtime_decision_token: decision.runtimeDecisionToken,
     };
     return startReservedGeneration(input, "agentic", () =>
-      startAgenticGeneration(toAgenticGenerationInput(agenticInput), agenticGenerationDependencies),
+      startAdmittedAgenticGeneration(agenticInput),
     );
   }
   // Response resolution enriches its working input; keep those derived fields

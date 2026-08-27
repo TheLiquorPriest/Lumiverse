@@ -418,6 +418,7 @@ export interface AgenticWorkFrame {
   readonly kind: "root" | "child";
   readonly frameId: string;
   readonly parentFrameId: string | null;
+  readonly provider: string | null;
   readonly connectionId: string | null;
   readonly model: string;
   readonly allowedToolNames: readonly string[];
@@ -432,6 +433,7 @@ export interface AgenticWorkFrame {
 
 export interface AgenticRootFrameOptions {
   readonly frameId: string;
+  readonly provider?: string | null;
   readonly connectionId: string | null;
   readonly model: string;
   readonly coreToolIds: readonly CoreAgentToolId[];
@@ -445,7 +447,8 @@ export interface AgenticRootFrameOptions {
 export interface AgenticChildFrameOptions {
   readonly frameId: string;
   readonly parentFrameId: string;
-  readonly connectionId: string | null;
+  readonly provider: string;
+  readonly connectionId: string;
   readonly model: string;
   readonly coreToolIds: readonly CoreAgentToolId[];
   readonly workspaceSharing?: AgenticWorkspaceSharing;
@@ -456,40 +459,67 @@ export interface AgenticChildFrameOptions {
   readonly signal: AbortSignal;
 }
 
-export interface AgenticDelegatableProfile {
+export interface AgenticChildProfileBinding {
   readonly profileId: string;
+  readonly provider: string;
+  readonly connectionId: string;
+  readonly model: string;
+}
+
+export interface AgenticDelegatableProfile extends AgenticChildProfileBinding {
   readonly toolIds: readonly CoreAgentToolId[];
   readonly workspaceCapabilities?: readonly WorkspaceOperationKindV1[];
   /** Exact authored child generation cap; never inferred from the root profile. */
   readonly maxOutputTokens?: number;
 }
+
+function snapshotChildProfileBindings(
+  profiles: readonly AgenticChildProfileBinding[] | undefined,
+  field = "childProfiles",
+): readonly AgenticChildProfileBinding[] {
+  const source = profiles ?? [];
+  if (source.length > MAX_CHILD_FRAMES) {
+    throw new AgenticWorkPhaseError("limit_exceeded", "Child profile count exceeds the host limit", field);
+  }
+  const ids = new Set<string>();
+  const snapshot: AgenticChildProfileBinding[] = [];
+  for (const profile of source) {
+    if (!profile || !profile.profileId || encoder.encode(profile.profileId).byteLength > MAX_PROFILE_ID_BYTES) {
+      throw new AgenticWorkPhaseError("invalid_input", "Invalid child profile ID", field);
+    }
+    if (ids.has(profile.profileId)) {
+      throw new AgenticWorkPhaseError("invalid_input", "Duplicate child profile ID", field);
+    }
+    ids.add(profile.profileId);
+    snapshot.push(Object.freeze({
+      profileId: profile.profileId,
+      provider: ensureBoundedString(profile.provider, MAX_PROVIDER_MODEL_BYTES, "provider"),
+      connectionId: ensureBoundedString(profile.connectionId, MAX_FRAME_ID_BYTES, "connectionId"),
+      model: ensureBoundedString(profile.model, MAX_PROVIDER_MODEL_BYTES, "model"),
+    }));
+  }
+  return Object.freeze(snapshot);
+}
+
 function snapshotDelegatableProfiles(
   profiles: readonly AgenticDelegatableProfile[] | undefined,
 ): readonly AgenticDelegatableProfile[] {
   const source = profiles ?? [];
-  if (source.length > MAX_CHILD_FRAMES) {
-    throw new AgenticWorkPhaseError("limit_exceeded", "Delegatable profile count exceeds the host limit", "delegatableProfiles");
-  }
-  const ids = new Set<string>();
+  const bindings = snapshotChildProfileBindings(source, "delegatableProfiles");
   const snapshot: AgenticDelegatableProfile[] = [];
-  for (const profile of source) {
-    if (!profile || !profile.profileId || encoder.encode(profile.profileId).byteLength > MAX_PROFILE_ID_BYTES) {
-      throw new AgenticWorkPhaseError("invalid_input", "Invalid delegatable profile ID", "delegatableProfiles");
-    }
-    if (ids.has(profile.profileId)) {
-      throw new AgenticWorkPhaseError("invalid_input", "Duplicate delegatable profile ID", "delegatableProfiles");
-    }
+  for (let index = 0; index < source.length; index += 1) {
+    const profile = source[index]!;
+    const binding = bindings[index]!;
     if (!Array.isArray(profile.toolIds) || profile.toolIds.length > CORE_AGENT_TOOL_IDS.length) {
       throw new AgenticWorkPhaseError("invalid_input", "Invalid delegatable profile tool grant", "delegatableProfiles");
     }
-    ids.add(profile.profileId);
     const toolIds = validCoreToolIds(profile.toolIds);
     const workspaceCapabilities = Object.freeze([...normalizedWorkspaceCapabilities(profile.workspaceCapabilities)]);
     if (profile.maxOutputTokens !== undefined && (!Number.isSafeInteger(profile.maxOutputTokens) || profile.maxOutputTokens < 1)) {
       throw new AgenticWorkPhaseError("invalid_input", "Invalid child output token limit", "delegatableProfiles");
     }
     snapshot.push(Object.freeze({
-      profileId: profile.profileId,
+      ...binding,
       toolIds: Object.freeze([...toolIds]),
       workspaceCapabilities,
       ...(profile.maxOutputTokens === undefined ? {} : { maxOutputTokens: profile.maxOutputTokens }),
@@ -601,6 +631,9 @@ export function createAgenticRootFrame(options: AgenticRootFrameOptions): Agenti
     throw new AgenticWorkPhaseError("invalid_input", "Invalid root frame ID", "frameId");
   }
   const model = ensureBoundedString(options.model, MAX_PROVIDER_MODEL_BYTES, "model", true);
+  const provider = options.provider == null
+    ? null
+    : ensureBoundedString(options.provider, MAX_PROVIDER_MODEL_BYTES, "provider");
   const connectionId = options.connectionId === null
     ? null
     : ensureBoundedString(options.connectionId, MAX_FRAME_ID_BYTES, "connectionId");
@@ -625,6 +658,7 @@ export function createAgenticRootFrame(options: AgenticRootFrameOptions): Agenti
     kind: "root",
     frameId: options.frameId,
     parentFrameId: null,
+    provider,
     connectionId,
     model,
     allowedToolNames: [...new Set(names)],
@@ -643,10 +677,9 @@ export function createAgenticChildFrame(options: AgenticChildFrameOptions): Agen
   if (encoder.encode(options.frameId).byteLength > MAX_FRAME_ID_BYTES || encoder.encode(options.parentFrameId).byteLength > MAX_FRAME_ID_BYTES) {
     throw new AgenticWorkPhaseError("invalid_input", "Child frame identity exceeds the frame limit");
   }
-  const model = ensureBoundedString(options.model, MAX_PROVIDER_MODEL_BYTES, "model", true);
-  const connectionId = options.connectionId === null
-    ? null
-    : ensureBoundedString(options.connectionId, MAX_FRAME_ID_BYTES, "connectionId");
+  const model = ensureBoundedString(options.model, MAX_PROVIDER_MODEL_BYTES, "model");
+  const provider = ensureBoundedString(options.provider, MAX_PROVIDER_MODEL_BYTES, "provider");
+  const connectionId = ensureBoundedString(options.connectionId, MAX_FRAME_ID_BYTES, "connectionId");
   if (options.taskId !== undefined && (!options.taskId || encoder.encode(options.taskId).byteLength > MAX_PROFILE_ID_BYTES)) {
     throw new AgenticWorkPhaseError("invalid_input", "Invalid assigned workspace task ID", "taskId");
   }
@@ -668,6 +701,7 @@ export function createAgenticChildFrame(options: AgenticChildFrameOptions): Agen
     kind: "child",
     frameId: options.frameId,
     parentFrameId: options.parentFrameId,
+    provider,
     connectionId,
     model,
     allowedToolNames: [...coreToolIds, ...workspaceNames],
@@ -1172,6 +1206,8 @@ export interface AgenticWorkOptions {
   readonly workspaceCapabilities?: WorkspaceOperationCapabilitiesV1 | readonly WorkspaceOperationKindV1[];
   readonly allowAgentDelegate?: boolean;
   readonly delegatableProfiles?: readonly AgenticDelegatableProfile[];
+  /** Frozen bindings for every schedulable child profile, including non-delegatable profiles. */
+  readonly childProfiles?: readonly AgenticChildProfileBinding[];
   readonly executeChild?: AgenticChildExecutor;
   readonly rootFrameId: string;
   readonly rootMessages?: readonly LlmMessage[];
@@ -4266,6 +4302,7 @@ async function executeChildSchedule(
 ): Promise<{ results: Map<number, string>; metadata: AgenticChildResultMetadata[]; failure?: AgenticWorkErrorCode }> {
   const results = new Map<number, string>();
   const metadata: AgenticChildResultMetadata[] = [];
+  const childProfiles = snapshotChildProfileBindings(options.childProfiles);
   const scheduled: Array<{ readonly descriptor: AgenticPhasePlan["children"][number]; readonly frameId: string }> = [];
   const frameIds = new Set<string>([rootFrame.frameId]);
   const reservedIds = new Set<string>([
@@ -4310,11 +4347,14 @@ async function executeChildSchedule(
   }
   for (const { descriptor, frameId } of scheduled) {
     if (signal.aborted) return { results, metadata, failure: signalStatus(signal) };
+    const profile = childProfiles.find((candidate) => candidate.profileId === descriptor.profileId);
+    if (!profile) return { results, metadata, failure: "child_schedule_invalid" };
     const frame = createAgenticChildFrame({
       frameId,
       parentFrameId: rootFrame.frameId,
-      connectionId: rootFrame.connectionId,
-      model: rootFrame.model,
+      provider: profile.provider,
+      connectionId: profile.connectionId,
+      model: profile.model,
       coreToolIds: phaseAllowsCapability(phaseCapabilities, "core_retrieval")
         ? descriptor.toolIds as CoreAgentToolId[]
         : [],
@@ -5707,6 +5747,9 @@ export async function runAgenticWorkPhase(
     );
     const turnRootFrameId = ensureBoundedString(options.rootFrameId, MAX_FRAME_ID_BYTES, "rootFrameId");
     const rootModel = ensureBoundedString(options.model, MAX_PROVIDER_MODEL_BYTES, "model");
+    const rootProvider = options.provider == null
+      ? null
+      : ensureBoundedString(options.provider, MAX_PROVIDER_MODEL_BYTES, "provider");
     const countTokens = await workTokenCounter(rootModel, options.countTokens);
     const rootConnectionId = options.connectionId === null
       ? null
@@ -5714,6 +5757,7 @@ export async function runAgenticWorkPhase(
     let rootFrame = freezeFrame({
       ...composition.rootFrame,
       frameId: turnRootFrameId,
+      provider: rootProvider,
       connectionId: rootConnectionId,
       model: rootModel,
       signal,
@@ -6414,6 +6458,9 @@ export async function runAgenticWorkPhase(
       const delegateFailures = new Map<string, AgenticWorkErrorCode>();
       const delegateCandidates = new Map<string, {
         readonly profileId: string;
+        readonly provider: string;
+        readonly connectionId: string;
+        readonly model: string;
         readonly taskId: string;
         readonly task: string;
         readonly required: boolean;
@@ -6457,6 +6504,9 @@ export async function runAgenticWorkPhase(
         }
         delegateCandidates.set(call.call_id, {
           profileId,
+          provider: profile.provider,
+          connectionId: profile.connectionId,
+          model: profile.model,
           taskId,
           task,
           required: false,
@@ -6568,8 +6618,9 @@ export async function runAgenticWorkPhase(
         const frame = createAgenticChildFrame({
           frameId,
           parentFrameId: rootFrame.frameId,
-          connectionId: rootFrame.connectionId,
-          model: rootFrame.model,
+          provider: candidate.provider,
+          connectionId: candidate.connectionId,
+          model: candidate.model,
           taskId: candidate.taskId,
           coreToolIds: candidate.requestedToolIds,
           workspaceCapabilities: candidate.workspaceCapabilities,
@@ -7281,6 +7332,7 @@ export async function runAgenticWorkPhase(
         rootFrame = freezeFrame({
           ...composition.rootFrame,
           frameId: turnRootFrameId,
+          provider: rootProvider,
           connectionId: rootConnectionId,
           model: rootModel,
           signal,
