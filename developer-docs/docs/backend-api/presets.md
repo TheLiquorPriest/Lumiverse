@@ -67,7 +67,6 @@ The closed authored shape is `AgentConfigV2`:
       'native_tool_continuation' | 'tools_disabled_finalization',
     ][],
   }],
-  phasePolicy?: { work: AgentPromptBlockRefV1[], render: AgentPromptBlockRefV1[] },
   cognitionPolicy?: AgentCognitionPolicyV1,
   taskPolicy?: AgentTaskPolicyV1,
   workspacePolicy?: { retention: 'turn_terminal' | 'chat_lifetime', sharing: 'root_only' | 'view_only' },
@@ -150,7 +149,7 @@ Routing is fixed: `workPolicy` and `workspaceUsage` feed `root_work` at `WORK` (
 
 The **Phased Instructions** editor is the single WORK/Agentic-only authoring surface for these fixed Loom policy buckets, bounded custom runtime phases, and typed conditions. Loom owns only existing prompt blocks plus Phased Instructions; it does not create a second context authority. `runtimePolicy.phases` is bounded and current-phase-only: later phase instructions are not materialized early. Each phase can carry explicit `childInstructionSubsets`; a child receives only its named admitted subset, never the root phase instructions or another child’s subset.
 
-`phasePolicy` remains a legacy compatibility field for imported records; it is not a second editor or authority. No live `cognitionPolicy`, metadata alias, or extension callback can replace the canonical Loom record.
+No live `cognitionPolicy`, metadata alias, or extension callback can replace the canonical Loom record.
 
 World Books (the native World Info system) and Databanks remain outside this policy and revision contract. World Books own native lore activation, placement, attachment, editing, and access. Databanks own attached documents, attachment, editing, access, automatic semantic retrieval, and explicit `#slug` retrieval. Their live native objects remain authoritative. Loom never copies that content, stores an external revision, pins it, or repairs it. [Context Filters](../../../user-docs/docs/presets/context-filters.md) and unrelated native Loom content [packs](../../../user-docs/docs/packs/index.md) remain supported outside Loom.
 

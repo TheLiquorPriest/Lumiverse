@@ -409,7 +409,6 @@ function normalizeConfig(value: unknown, path: string): AgentConfigV2 | null {
     'mainLoreScope',
     'profiles',
     'connectionSlots',
-    'phasePolicy',
     'runtimePolicy',
     'cognitionPolicy',
     'taskPolicy',
@@ -480,8 +479,8 @@ function normalizeConfig(value: unknown, path: string): AgentConfigV2 | null {
     }
   }
   const hasRuntimePolicy = Object.hasOwn(record, 'runtimePolicy')
-  if (hasRuntimePolicy && (Object.hasOwn(record, 'phasePolicy') || Object.hasOwn(record, 'cognitionPolicy'))) {
-    projectionError(`${path}.runtimePolicy`, 'cannot accompany legacy phasePolicy or cognitionPolicy')
+  if (hasRuntimePolicy && Object.hasOwn(record, 'cognitionPolicy')) {
+    projectionError(`${path}.runtimePolicy`, 'cannot accompany legacy cognitionPolicy')
   }
   const normalized: AgentConfigV2 = {
     version: 2,
@@ -494,16 +493,6 @@ function normalizeConfig(value: unknown, path: string): AgentConfigV2 | null {
     mainLoreScope: record.mainLoreScope,
     profiles,
     connectionSlots,
-  }
-  if (Object.hasOwn(record, 'phasePolicy')) {
-    const phasePolicy = asRecord(record.phasePolicy, `${path}.phasePolicy`)
-    exactKeys(phasePolicy, ['work', 'render'], `${path}.phasePolicy`)
-    requireOwn(phasePolicy, 'work', `${path}.phasePolicy`)
-    requireOwn(phasePolicy, 'render', `${path}.phasePolicy`)
-    normalized.phasePolicy = {
-      work: normalizePromptRefs(phasePolicy.work, `${path}.phasePolicy.work`),
-      render: normalizePromptRefs(phasePolicy.render, `${path}.phasePolicy.render`),
-    }
   }
   if (Object.hasOwn(record, 'runtimePolicy')) {
     try {

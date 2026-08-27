@@ -1337,7 +1337,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   const policyRepairItems = useMemo<PanelRepairItem[]>(() => {
     const seen = new Set<string>()
     return validation.issues
-      .filter((issue) => /^config\.(?:runtimePolicy|cognitionPolicy|phasePolicy)(?:\.|$)/.test(issue.path))
+      .filter((issue) => /^config\.(?:runtimePolicy|cognitionPolicy)(?:\.|$)/.test(issue.path))
       .filter((issue) => {
         if (seen.has(issue.path)) return false
         seen.add(issue.path)
@@ -1898,7 +1898,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         completionCriteria: [],
         renderPolicy: [],
       }
-      if (/^config\.(?:cognitionPolicy|phasePolicy)(?:\.|$)/.test(path)) {
+      if (/^config\.cognitionPolicy(?:\.|$)/.test(path)) {
         const canonicalBuckets = getAgentRuntimePolicyBuckets(config, promptOrder)
         const canonicalPhases = getAgentRuntimeCustomPhases(config)
         const withBuckets = setAgentRuntimePolicyBuckets(config, canonicalBuckets)

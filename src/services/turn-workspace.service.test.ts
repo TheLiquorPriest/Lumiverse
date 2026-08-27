@@ -378,6 +378,49 @@ afterEach(() => {
 });
 
 describe("turn workspace validators and CAS operations", () => {
+  test("bounds child submissions at 32 KiB UTF-8 without narrowing root submissions or records", () => {
+    const created = workspace("workspace-submission-byte-limits");
+    const context = childContext(created.id, created.revision, "child-byte-boundary");
+    const asciiBoundary = "a".repeat(workspaceService.WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES);
+    const multibyteBoundary = "é".repeat(workspaceService.WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES / 2);
+    const oneByteOver = `${multibyteBoundary}a`;
+    const base = {
+      ...context,
+      taskId: "task-byte-boundary",
+      resultDigest: "a".repeat(64),
+    };
+
+    expect(Buffer.byteLength(asciiBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(multibyteBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(oneByteOver, "utf8")).toBe(32_769);
+    for (const summary of [asciiBoundary, multibyteBoundary]) {
+      expect(workspaceService.validateSubmitWorkspaceChildResultInput({
+        ...base,
+        summary,
+        byteCount: Buffer.byteLength(summary, "utf8"),
+      }).summary).toBe(summary);
+    }
+    expectWorkspaceError("quota_exceeded", () =>
+      workspaceService.validateSubmitWorkspaceChildResultInput({
+        ...base,
+        summary: oneByteOver,
+        byteCount: Buffer.byteLength(oneByteOver, "utf8"),
+      }));
+
+    const aboveChildBoundary = "r".repeat(32_769);
+    expect(workspaceService.validateSubmitWorkspaceRootResultInput({
+      ...rootContext(created.id, created.revision),
+      taskId: "task-byte-boundary",
+      summary: aboveChildBoundary,
+      state: "completed",
+    }).summary).toBe(aboveChildBoundary);
+    expect(workspaceService.validateRecordWorkspaceRecordInput({
+      ...rootContext(created.id, created.revision),
+      kind: "finding",
+      summary: aboveChildBoundary,
+      taskId: null,
+    }).summary).toBe(aboveChildBoundary);
+  });
   test("keeps root-created tasks optional and omits required from the parsed contract", () => {
     const created = workspace();
     const task = createWorkspaceTask({ ...rootContext(created.id, created.revision), title: "Assigned work" });

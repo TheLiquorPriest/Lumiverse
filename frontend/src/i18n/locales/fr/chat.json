@@ -247,7 +247,14 @@
       "repairAcknowledgementRequired": "Vérification requise",
       "repairAcknowledgementAcknowledged": "Confirmé",
       "unavailable": "Indisponible",
-      "none": "aucun"
+      "none": "aucun",
+      "resolutionError": {
+        "title": "Échec de la résolution d’exécution",
+        "target": "Cible : {{generationType}} · message {{messageId}} · swipe {{swipeId}}",
+        "none": "aucun",
+        "code": "Code d’erreur : {{code}}",
+        "retry": "Réessayer la résolution"
+      }
     },
     "announcement": {
       "oneTurn": "Le mode {{mode}} est sélectionné pour le prochain tour.",
@@ -267,13 +274,6 @@
     "preflight": {
       "refreshRequired": "L’exécution a changé avant le début de la génération. Vérifiez le mode et réessayez.",
       "unavailable": "Le mode agentique n’est pas prêt. Utilisez Réponse ou effectuez la correction indiquée."
-    },
-    "resolutionError": {
-      "title": "Échec de la résolution d’exécution",
-      "target": "Cible : {{generationType}} · message {{messageId}} · swipe {{swipeId}}",
-      "none": "aucun",
-      "code": "Code d’erreur : {{code}}",
-      "retry": "Réessayer la résolution"
     },
     "errors": {
       "not_found": "La cible d’exécution demandée est introuvable.",
@@ -1411,6 +1411,7 @@
     }
   },
   "persistentWorkspace": {
+    "label": "Persistent Workspace",
     "eyebrow": "Persistent Workspace",
     "untitled": "Espace de travail sans titre",
     "notAvailableTitle": "Persistent Workspace indisponible",

@@ -49,6 +49,7 @@ import {
   parseLoomPromptInspectionV1,
 } from "./agent-cognition.service";
 import {
+  AGENT_CHILD_TASK_MAX_BYTES,
   AGENT_INITIAL_INPUT_MAX_BYTES,
   evaluateOutputTokens,
   measureJsonValue,
@@ -72,7 +73,12 @@ import type {
   WorkspaceTaskAcceptanceV1,
 } from "../types/turn-workspace";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
-import { WORKSPACE_ID_MAX_BYTES, WORKSPACE_MAX_TASKS, WORKSPACE_READ_SECTIONS } from "./turn-workspace.service";
+import {
+  WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES,
+  WORKSPACE_ID_MAX_BYTES,
+  WORKSPACE_MAX_TASKS,
+  WORKSPACE_READ_SECTIONS,
+} from "./turn-workspace.service";
 import type {
   CognitionRuntimeCompletionV1,
   CognitionRuntimeTaskTransitionInputV1,
@@ -762,7 +768,7 @@ function delegateDefinition(
     parameters: schema({
       profile_id: { type: "string", enum: profileIds },
       task_id: { type: "string", minLength: 1, maxLength: MAX_PROFILE_ID_BYTES },
-      task: { type: "string", minLength: 1, maxLength: MAX_COMPLETION_SUMMARY_BYTES },
+      task: { type: "string", minLength: 1, maxLength: AGENT_CHILD_TASK_MAX_BYTES },
       tool_ids: {
         type: "array",
         maxItems: CORE_AGENT_TOOL_IDS.length,
@@ -802,7 +808,7 @@ function workspaceDefinition(
       add("progress", { type: "number", minimum: 0, maximum: 1 });
       break;
     case "submit_child_result":
-      add("summary", { type: "string", minLength: 1, maxLength: MAX_COMPLETION_SUMMARY_BYTES }, true);
+      add("summary", { type: "string", minLength: 1, maxLength: WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES }, true);
       break;
     case "submit_root_result":
       add("taskId", { type: "string", minLength: 1, maxLength: MAX_COMPLETION_ID_BYTES }, true);
@@ -3774,6 +3780,13 @@ async function executeWorkspaceTool(
   }
   if (!workspace) throw new AgenticWorkPhaseError("tool_not_allowed", "Workspace capability is unavailable");
   workspace.authenticateFrame?.(frame);
+  const childSubmissionSummary = operation === "submit_child_result"
+    ? ensureBoundedString(
+      args.summary,
+      WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES,
+      "workspace_submit_child_result.summary",
+    )
+    : undefined;
   const authenticatedArgs = {
     ...args,
     ...(frame.kind === "child" && frame.assignedTaskId !== undefined
@@ -3781,10 +3794,10 @@ async function executeWorkspaceTool(
       : {}),
     actor: frame.kind,
     frameId: frame.frameId,
-    ...(operation === "submit_child_result" && typeof args.summary === "string"
+    ...(childSubmissionSummary !== undefined
       ? {
-        resultDigest: createHash("sha256").update(args.summary, "utf8").digest("hex"),
-        byteCount: utf8ByteLength(args.summary),
+        resultDigest: createHash("sha256").update(childSubmissionSummary, "utf8").digest("hex"),
+        byteCount: utf8ByteLength(childSubmissionSummary),
       }
       : {}),
   };
@@ -4623,7 +4636,7 @@ export async function executeBoundedAgenticChildFrame(
   let phaseInstructionText = "";
   let assignedTaskId: string | undefined;
   try {
-    task = ensureBoundedString(options.task, MAX_COMPLETION_SUMMARY_BYTES, "task");
+    task = ensureBoundedString(options.task, AGENT_CHILD_TASK_MAX_BYTES, "task");
     if (options.taskId !== undefined && options.frame.assignedTaskId !== undefined && options.taskId !== options.frame.assignedTaskId) {
       throw new AgenticWorkPhaseError("child_schedule_invalid", "Child task ID does not match the frame assignment", "taskId");
     }
@@ -6582,6 +6595,10 @@ export async function runAgenticWorkPhase(
           ? call.args.tool_ids as CoreAgentToolId[]
           : profile?.toolIds ?? [];
         if (!profile || !taskId || !task || requestedToolIds.some((toolId) => !profile.toolIds.includes(toolId))) continue;
+        if (utf8ByteLength(task) > AGENT_CHILD_TASK_MAX_BYTES) {
+          delegateFailures.set(call.call_id, "limit_exceeded");
+          continue;
+        }
         const phaseToolIds = phaseAllowsCapability(phaseCapabilities, "core_retrieval")
           ? requestedToolIds
           : [];

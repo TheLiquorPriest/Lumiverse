@@ -72,7 +72,6 @@ export default function DataPortability() {
   const [includeSecrets, setIncludeSecrets] = useState(false)
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null)
   const [exportError, setExportError] = useState<string | null>(null)
-  const [exportWarnings, setExportWarnings] = useState<string[]>([])
   const [exporting, setExporting] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
@@ -133,7 +132,6 @@ export default function DataPortability() {
 
   const handleExport = async () => {
     setExportError(null)
-    setExportWarnings([])
     setExporting(true)
     setExportProgress({ phase: 'start' })
     const anchor = downloadAnchorRef.current
@@ -155,7 +153,6 @@ export default function DataPortability() {
     }
     try {
       const response = await userDataApi.prepareSecretsExport(includeVectors)
-      if (response.unreachableSecrets.length > 0) setExportWarnings(response.unreachableSecrets)
       if (response.ticket && response.ticketFilename) {
         const ticketBlob = new Blob([JSON.stringify(response.ticket, null, 2)], { type: 'application/json' })
         const ticketUrl = URL.createObjectURL(ticketBlob)
@@ -170,11 +167,8 @@ export default function DataPortability() {
       anchor.click()
       setExporting(false)
       setExportProgress(null)
-    } catch (error) {
-      const failure = normalizeUserDataApiFailure(error, 'import_start_failed')
-      setExportError(t(`dataPortability.failureReasons.${failure.code}`, {
-        defaultValue: t('dataPortability.failureReasons.import_start_failed'),
-      }))
+    } catch {
+      setExportError(t('dataPortability.exportPrepareFailed'))
       setExporting(false)
       setExportProgress(null)
     }
@@ -302,7 +296,6 @@ export default function DataPortability() {
           </div>
         )}
         {exportError && <div className={styles.error}>{exportError}</div>}
-        {exportWarnings.length > 0 && <div className={styles.warning}>{t('dataPortability.exportSecretsWarn', { count: exportWarnings.length, keys: exportWarnings.join(', ') })}</div>}
       </section>
 
       <section className={styles.section}>

@@ -149,11 +149,18 @@ shape:
   state: 'accepted' | 'omitted' | 'failed' | 'cancelled',
   memberCount: number,
   resultDigest: string | null,
-  correlation: string,
-  reason: string | null,
+  correlation: AgentInspectionCorrelationV1,
+  reason: AgentInspectionReasonV1 | null,
   canonical: false,
 }
 ```
+
+`correlation` is the closed owner-inspection object, not an opaque string. It
+contains `turnSessionId`, `runId`, `attemptId`, `chatId`, `generationId`,
+nullable `messageId`, `swipeId`, `actorId`, and `recipientId`, plus
+`phase`, nullable `taskId`, `toolId`, and `parentId`,
+`hostCorrelationId`, and `hostSequence`. `reason` is the closed
+`AgentInspectionReasonV1` union or `null`.
 
 The Council transcript, prompt inspection, usage evidence, and omission
 details are owner-inspection data. They are not Response content or a public

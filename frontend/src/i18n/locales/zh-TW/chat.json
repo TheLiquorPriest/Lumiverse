@@ -247,7 +247,14 @@
       "repairAcknowledgementRequired": "需要審查",
       "repairAcknowledgementAcknowledged": "已確認",
       "unavailable": "無法使用",
-      "none": "無"
+      "none": "無",
+      "resolutionError": {
+        "title": "執行階段解析失敗",
+        "target": "目標：{{generationType}} · 訊息 {{messageId}} · 滑動 {{swipeId}}",
+        "none": "無",
+        "code": "錯誤代碼：{{code}}",
+        "retry": "重試解析"
+      }
     },
     "announcement": {
       "oneTurn": "下一回合已選擇{{mode}}模式。",
@@ -267,13 +274,6 @@
     "preflight": {
       "refreshRequired": "生成開始前執行階段已變更。請檢查模式後重試。",
       "unavailable": "代理模式尚未就緒。請使用回應模式或完成列出的修復。"
-    },
-    "resolutionError": {
-      "title": "執行階段解析失敗",
-      "target": "目標：{{generationType}} · 訊息 {{messageId}} · 滑動 {{swipeId}}",
-      "none": "無",
-      "code": "錯誤代碼：{{code}}",
-      "retry": "重試解析"
     },
     "errors": {
       "not_found": "找不到要求的執行階段目標。",
@@ -1411,6 +1411,7 @@
     }
   },
   "persistentWorkspace": {
+    "label": "Persistent Workspace",
     "eyebrow": "Persistent Workspace",
     "untitled": "未命名工作區",
     "notAvailableTitle": "Persistent Workspace 無法使用",

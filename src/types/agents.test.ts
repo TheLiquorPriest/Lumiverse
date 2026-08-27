@@ -421,23 +421,23 @@ describe("canonical custom Phased Instructions policy parser", () => {
 
 
 
-  test("requires explicit repair for legacy phasePolicy ingress", () => {
-    expect(() => parseAgentConfigV2(v2Config({
-      phasePolicy: {
-        work: [{
-          blockId: "legacy-work",
-          expectedPresetRevision: 7,
-          expectedBlockRevision: 3,
-        }],
-        render: [{
-          blockId: "legacy-render",
-          expectedPresetRevision: 7,
-          expectedBlockRevision: 5,
-        }],
-      },
-    }))).toThrow(
-      "agentConfig.phasePolicy: legacy Loom policy requires explicit repair with current Loom source order",
-    );
+  test("rejects phasePolicy as an unknown public live-config field", () => {
+    const phasePolicy = {
+      work: [{
+        blockId: "legacy-work",
+        expectedPresetRevision: 7,
+        expectedBlockRevision: 3,
+      }],
+      render: [{
+        blockId: "legacy-render",
+        expectedPresetRevision: 7,
+        expectedBlockRevision: 5,
+      }],
+    };
+    expect(() => parseAgentConfigV2(v2Config({ phasePolicy })))
+      .toThrow(/phasePolicy.*unknown key/i);
+    expect(() => parsePortableAgentConfigV1(portableConfig({ phasePolicy })))
+      .toThrow(/phasePolicy.*unknown key/i);
   });
 
   test("does not accept a hidden fifth bucket in canonical runtime policy", () => {

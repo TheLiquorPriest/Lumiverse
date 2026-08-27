@@ -4238,7 +4238,7 @@ export async function assemblePrompt(
         );
       }
       let agentContent = outcome.content;
-      if (outcome.status !== "succeeded") {
+      if (outcome.outcome !== "succeeded") {
         if (intrinsic.profile.failurePolicy === "required") {
           throw new AgentRuntimeFailure(
             outcome.errorCode ?? "provider_failed",
@@ -4250,7 +4250,7 @@ export async function assemblePrompt(
       }
       const sealedOutput = {
         producerLabel: intrinsic.profile.name,
-        status: outcome.status,
+        status: outcome.outcome,
         content: agentContent,
       };
       const seals = agentRuntimeOwner.seals;

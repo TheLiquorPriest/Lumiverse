@@ -1470,12 +1470,12 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
                     <Field label={t('ownerInspection.outcome')} value={valueLabel(t, inspection.error.category)} />
                     {inspection.error.causalCode ? <Field label={t('ownerInspection.errorReason')} value={boundedId(inspection.error.causalCode)} mono /> : null}
                     {inspection.error.reason ? <Field label={t('ownerInspection.reason')} value={valueLabel(t, inspection.error.reason)} /> : null}
-                    <Field label={t('provenance.authority')} value={valueLabel(t, inspection.error.authority)} />
-                    <Field label={t('provenance.source')} value={valueLabel(t, inspection.error.source)} />
-                    <Field label={t('provenance.scope')} value={valueLabel(t, inspection.error.scope)} />
+                    <Field label={t('agentRuntime.provenance.authority')} value={valueLabel(t, inspection.error.authority)} />
+                    <Field label={t('agentRuntime.provenance.source')} value={valueLabel(t, inspection.error.source)} />
+                    <Field label={t('agentRuntime.provenance.scope')} value={valueLabel(t, inspection.error.scope)} />
                     <Field label={t('ownerInspection.phase')} value={valueLabel(t, inspection.error.workPhase)} />
                     <Field label={t('ownerInspection.status')} value={valueLabel(t, inspection.error.workStatus)} />
-                    {inspection.error.capGate ? <Field label={t('provenance.gate')} value={`${boundedId(inspection.error.capGate.id)} · ${inspection.error.capGate.observed ?? '—'} / ${inspection.error.capGate.limit ?? '—'} · ${inspection.error.capGate.exceeded ? t('provenance.capabilityNotReady') : t('provenance.capabilityReady')}`} mono /> : null}
+                    {inspection.error.capGate ? <Field label={t('agentRuntime.provenance.gate')} value={`${boundedId(inspection.error.capGate.id)} · ${inspection.error.capGate.observed ?? '—'} / ${inspection.error.capGate.limit ?? '—'} · ${inspection.error.capGate.exceeded ? t('agentRuntime.provenance.capabilityNotReady') : t('agentRuntime.provenance.capabilityReady')}`} mono /> : null}
                     <Field label={t('ownerInspection.omitted')} value={inspection.error.omissionCount} />
                   </dl>
                 </section>

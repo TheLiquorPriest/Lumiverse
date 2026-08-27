@@ -111,7 +111,7 @@ Open the **Agentic run** strip under the assistant response and inspect the stat
 - **Timed out** means the bounded turn deadline expired. Retry once after checking the provider connection; if it repeats, choose Response or reduce the authored work.
 - **Failed** can indicate a provider, protocol, readiness, Loom revision, or commit problem. Follow any repair category, refresh the exact preset and Loom block revisions, and retry. If the same run fails again, use Response and keep the activity status when contacting an administrator.
 
-Agentic does not retry by silently switching modes, and a failed turn does not make private work notes or provider payloads available for debugging.
+Agentic does not retry by silently switching modes. A failed run's public activity remains status-only; the authenticated owner may inspect whatever bounded WORK transcript, provider content, private child material, and tool arguments/results survived retention and omission limits. Raw private reasoning and opaque continuation carriers are not promised.
 
 ### The Activity Tree is stale or the Workspace tab cannot load
 

@@ -108,7 +108,8 @@ export const WORKSPACE_CONSTRAINTS_MAX_BYTES = 131_072;
 export const WORKSPACE_TASK_TITLE_MAX_BYTES = 4_096;
 export const WORKSPACE_TASK_SUMMARY_MAX_BYTES = 65_536;
 export const WORKSPACE_RECORD_SUMMARY_MAX_BYTES = 65_536;
-export const WORKSPACE_SUBMISSION_SUMMARY_MAX_BYTES = 65_536;
+export const WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES = 32_768;
+export const WORKSPACE_ROOT_SUBMISSION_SUMMARY_MAX_BYTES = 65_536;
 export const WORKSPACE_MAX_TASKS = 256;
 export const WORKSPACE_MAX_TASK_ASSIGNMENTS = WORKSPACE_MAX_TASKS;
 export const WORKSPACE_MAX_RECORDS = 1_024;
@@ -688,7 +689,7 @@ export function validateSubmitWorkspaceChildResultInput(value: unknown): SubmitW
   const policy = value.retention === undefined ? undefined : retentionValue(value.retention, value.ttlSeconds);
   const resultDigest = stringValue(value.resultDigest, "resultDigest", 64);
   if (!DIGEST.test(resultDigest)) fail("invalid_input", "resultDigest must be SHA-256");
-  return Object.freeze({ ...parsed, taskId: idValue(value.taskId, "taskId"), summary: stringValue(value.summary, "summary", WORKSPACE_SUBMISSION_SUMMARY_MAX_BYTES), resultDigest, byteCount: integer(value.byteCount ?? 0, "byteCount", 0, WORKSPACE_MAX_BYTES), retention: policy?.retention, ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS) });
+  return Object.freeze({ ...parsed, taskId: idValue(value.taskId, "taskId"), summary: stringValue(value.summary, "summary", WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES), resultDigest, byteCount: integer(value.byteCount ?? 0, "byteCount", 0, WORKSPACE_MAX_BYTES), retention: policy?.retention, ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS) });
 }
 /**
  * Root-owned completion is a separate operation from child submission. It
@@ -705,7 +706,7 @@ export function validateSubmitWorkspaceRootResultInput(value: unknown): SubmitWo
   return Object.freeze({
     ...parsed,
     taskId: idValue(value.taskId, "taskId"),
-    summary: stringValue(value.summary, "summary", WORKSPACE_SUBMISSION_SUMMARY_MAX_BYTES),
+    summary: stringValue(value.summary, "summary", WORKSPACE_ROOT_SUBMISSION_SUMMARY_MAX_BYTES),
     state: value.state,
     retention: policy?.retention,
     ttlSeconds: value.ttlSeconds === undefined ? undefined : integer(value.ttlSeconds, "ttlSeconds", 1, policy?.retention === "operational" ? WORKSPACE_MAX_OPERATIONAL_TTL_SECONDS : WORKSPACE_MAX_TERMINAL_TTL_SECONDS),

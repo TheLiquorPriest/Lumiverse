@@ -146,19 +146,25 @@ describe('AgentRunActivity locale coverage', () => {
     expect(PUBLIC_ERROR_CODES).toEqual(BACKEND_PUBLIC_ERROR_CODES)
     const expectedErrorKeys = Object.keys(en.agentRun.errors).sort()
     const expectedOwnerInspection = leafPaths(en.ownerInspection)
+    const expectedPersistentWorkspace = leafPaths(en.persistentWorkspace)
     for (const key of ['unknown', ...BACKEND_PUBLIC_ERROR_CODES]) {
       expect(expectedErrorKeys).toContain(key)
     }
     const locales = [en, fr, it, ja, zh, zhTW]
     for (const locale of locales) {
       expect(leafPaths(locale.agentActivity)).toEqual(expectedActivity)
+      expect('errors' in locale.agentActivity).toBeFalse()
       const rootResultLabel = locale.agentActivity.tools.workspace_submit_root_result
       expect(rootResultLabel, 'workspace_submit_root_result legacy activity label').toBeString()
       expect(rootResultLabel.trim()).not.toBe('')
       expect(leafPaths(locale.agentRun)).toEqual(expected)
       expect(leafPaths(locale.ownerInspection)).toEqual(expectedOwnerInspection)
+      expect(leafPaths(locale.persistentWorkspace)).toEqual(expectedPersistentWorkspace)
       expect(locale.ownerInspection.resolutionError.title.trim()).not.toBe('')
       expect(locale.ownerInspection.resolutionError.code).toContain('{{code}}')
+      expect(locale.persistentWorkspace.label.trim()).not.toBe('')
+      expect(locale.persistentWorkspace.creators.owner.trim()).not.toBe('')
+      expect(locale.persistentWorkspace.sessionStatus.terminal.trim()).not.toBe('')
       const ownerValues = locale.ownerInspection.values as Record<string, unknown>
       for (const key of OWNER_ERROR_VALUE_KEYS) {
         const label = ownerValues[key]
@@ -209,8 +215,16 @@ describe('AgentRunActivity locale coverage', () => {
       'agentic_provider_failure',
       'agentic_internal_error',
     ]
+    const expectedResolutionError = leafPaths(en.agentRuntime.provenance.resolutionError)
     for (const locale of [en, fr, it, ja, zh, zhTW]) {
       const errors = locale.agentRuntime.errors as Record<string, unknown>
+      expect('errors' in locale.agentActivity).toBeFalse()
+      expect('resolutionError' in locale.agentRuntime).toBeFalse()
+      expect(leafPaths(locale.agentRuntime.provenance.resolutionError)).toEqual(expectedResolutionError)
+      expect(locale.agentRuntime.provenance.resolutionError.title.trim()).not.toBe('')
+      expect(locale.agentRuntime.provenance.resolutionError.target).toContain('{{generationType}}')
+      expect(locale.agentRuntime.provenance.resolutionError.code).toContain('{{code}}')
+      expect(locale.agentRuntime.provenance.resolutionError.retry.trim()).not.toBe('')
       expect(Object.keys(errors).sort()).toEqual([...expectedErrorKeys].sort())
       for (const key of expectedErrorKeys) {
         const label = errors[key]

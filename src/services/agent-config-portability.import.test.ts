@@ -380,6 +380,25 @@ describe("portable preset runtime import atomicity", () => {
       },
     });
   });
+
+  test("does not inject the historical phase policy carrier into live config", () => {
+    const envelope = canonicalRuntimeEnvelope();
+    if (!envelope.agentConfig) throw new Error("missing agent config fixture");
+    const result = importPortablePresetRuntime(USER_ID, {
+      preset: presetWithAuthoredRuntime(),
+      agentRuntime: envelope,
+    });
+    getDb().query(
+      "UPDATE preset_agent_configs SET phase_policy_json = ? WHERE user_id = ? AND preset_id = ?",
+    ).run(JSON.stringify({
+      work: [{ blockId: "historical-work", expectedPresetRevision: 0, expectedBlockRevision: 0 }],
+      render: [],
+    }), USER_ID, result.preset.id);
+
+    const projection = getPresetAgentConfig(USER_ID, result.preset.id);
+    expect(projection?.config).toEqual(result.agent_config);
+    expect(Object.hasOwn(projection?.config ?? {}, "phasePolicy")).toBe(false);
+  });
   test("rolls back an existing preset replacement when a later regex fails", () => {
     const initial = importPortablePresetRuntime(USER_ID, {
       preset: preset([validRegex("original")], "Original"),

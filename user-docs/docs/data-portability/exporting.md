@@ -116,6 +116,8 @@ lancedb/                   Optional derived vector dumps
 secrets/
   index.json               Secret names covered by the ticket, when enabled
   encrypted.ndjson         Encrypted secret values, when enabled
+```
+
 `manifest.json` is written last. It records the archive ID, archive schema and
 registry versions, the dedicated snapshot ID, row and byte counts, embedding
 identity, optional-file omissions, and a sorted authenticated entry ledger.

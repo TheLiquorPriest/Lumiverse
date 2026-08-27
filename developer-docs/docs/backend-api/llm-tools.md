@@ -68,7 +68,7 @@ Each child profile and the main model has an independent tool allowlist and lore
 
 Tool results are host-framed lower-authority derived data. They do not expose credentials, exception stacks, arbitrary metadata bags, hidden messages, disabled lore, or raw user IDs beyond documented IDs. In `text` format, rendering uses only a fresh minimal context and the no-argument display-name/group macros `user`, `char`, `group`, `groupNotMuted`, `notChar`, `isGroupChat`, `groupOthers`, and `groupMemberCount` (and their built-in aliases); disallowed macro syntax remains literal and does not receive the full macro environment.
 
-This catalog is not Council. Council still uses registered tools and its configured sidecar/inline behavior described below. The Agents & Tools feature does not discover extension tools, invoke extension workers, or persist a child transcript. Live activity is status-only; a real staged/target assistant message may retain a compact swipe-scoped summary.
+This catalog is not Council. Council still uses registered tools and its configured sidecar/inline behavior described below. The Agents & Tools feature does not discover extension tools or invoke extension workers. Live activity stays status-only, while owner-only inspection may retain a bounded WORK transcript, provider and private child content, and tool arguments/results subject to retention and omission limits; raw private reasoning and opaque continuation carriers are not promised. A real staged/target assistant message may retain a compact swipe-scoped summary.
 
 ### Runtime activity and privacy
 

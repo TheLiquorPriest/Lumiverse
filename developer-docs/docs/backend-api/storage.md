@@ -141,7 +141,7 @@ registry.
 ### Closed archive registry
 
 `src/services/user-data/table-registry.ts` exports
-`ARCHIVE_REGISTRY_VERSION = 2` and one frozen
+`ARCHIVE_REGISTRY_VERSION = 3` and one frozen
 `ARCHIVE_TABLE_REGISTRY: readonly ArchiveTableSpecV2[]`. A spec is the only
 authority for a SQLite table's archive behavior:
 
@@ -295,12 +295,14 @@ ownership/graph validation on import.
 
 ### Secret export
 
-When optional secret export is requested, the prepare route reads the candidate
-keys under the source identity, reports missing/unreachable/undecryptable
-candidates as `unreachableSecrets`, and binds the ticket to the remaining exact
-secret index. A later missing row or decryption failure for a ticket-bound key
-aborts archive generation; it does not produce a usable partial secret package.
-The prepared ticket binds the archive ID and that exact filtered secret index.
+When optional secret export is requested, the prepare route enumerates and
+reads every candidate key under the source identity before issuing the ticket.
+Any enumeration, read, identity-key, or decryption failure aborts preparation;
+the route never filters a failed key or creates a partial ticket/archive pair.
+On success, the ticket binds the archive ID and complete exact secret index,
+and the closed response field is always `unreachableSecrets: []`. A
+later missing row or decryption failure for any bound key aborts archive
+generation rather than producing a usable partial secret package.
 
 ### Import validation and staging database
 
@@ -309,7 +311,7 @@ The authenticated user-data routes are:
 | Method | Route | Contract |
 |---|---|---|
 | `GET` | `/api/v1/user-data/export` | Streams a no-secret `.lvbak`; `includeVectors=0` omits vector dumps. |
-| `POST` | `/api/v1/user-data/export/prepare` | Creates the archive/ticket binding for an optional secret export. |
+| `POST` | `/api/v1/user-data/export/prepare` | Accepts `{ includeVectors, includeSecrets: true }`; after all-or-nothing secret admission, returns `{ archiveId, archiveUrl, archiveFilename, ticketFilename, ticket, secretsCount, unreachableSecrets: [] }`. |
 | `GET` | `/api/v1/user-data/export/archive/:archiveId` | Consumes the prepared binding and streams the archive. |
 | `POST` | `/api/v1/user-data/import` | Streams a raw ZIP request body, validates its manifest, and returns `{ jobId, status }` with `202`. Multipart bodies are rejected to avoid materializing a multi-GB body. |
 | `GET` | `/api/v1/user-data/import/:jobId/status` | Returns the owner-scoped durable job state (with manifest, public table counters, `fileSummary`, and stable error); it falls back to the durable import-control row and receipt after in-memory retention or process restart. |

@@ -8,7 +8,6 @@ import {
   type AgentConfigRepairItem,
   type AgentCustomPhaseCapability,
   type AgentCustomPhaseV1,
-  type AgentPromptBlockRef,
   type AgentConfigV2,
   type AgentMode,
   type AgentProfileConfigV2,
@@ -596,7 +595,6 @@ export function parseAgentRuntimePolicyV1(value: unknown): AgentRuntimePolicyV1 
 function refsToLoomPolicyBuckets(
   refs: AgentCognitionPolicy,
   blocks: readonly PromptBlock[],
-  legacy = false,
 ): LoomPolicyBucketsV1 {
   const sourceById = new Map(blocks.map((block, index) => [block.id, {
     kind: 'loom_block' as const,
@@ -612,7 +610,7 @@ function refsToLoomPolicyBuckets(
       if (!source) loomPolicyError(`${bucket}[${index}].blockId`, 'source block is unavailable')
       return {
         version: 1,
-        id: `${legacy ? 'legacy-' : ''}${bucket}-${ref.blockId}`,
+        id: `${bucket}-${ref.blockId}`,
         source: {
           ...source,
           presetRevision: ref.expectedPresetRevision,
@@ -634,49 +632,25 @@ function refsToLoomPolicyBuckets(
   }
 }
 
-export function normalizeLegacyLoomPolicyV1(value: unknown): AgentCognitionPolicy {
-  const object = loomPolicyRecord(value, 'config.phasePolicy')
-  loomPolicyExactKeys(object, ['work', 'render'], 'config.phasePolicy')
-  if (!isIndexedArray(object.work) || !isIndexedArray(object.render)) {
-    loomPolicyError('config.phasePolicy', 'work and render must be dense arrays')
-  }
-  if (!object.work.every(isCognitionPolicyRef) || !object.render.every(isCognitionPolicyRef)) {
-    loomPolicyError('config.phasePolicy', 'work and render must contain exact block references')
-  }
-  return {
-    workPolicy: object.work,
-    workspaceUsage: [],
-    completionCriteria: [],
-    renderPolicy: object.render,
-  }
-}
-
-export const normalizeLegacyPhasePolicyV1 = normalizeLegacyLoomPolicyV1
 export function normalizeLoomPolicyBucketsV1(
   value: unknown,
   sourceBlocks: readonly PromptBlock[],
-  legacyPhasePolicyValue?: unknown,
 ): LoomPolicyBucketsV1 {
-  const parsed = isUnknownRecord(value) && value.version === 1
-    ? parseLoomPolicyBucketsV1(value)
-    : refsToLoomPolicyBuckets((isCognitionPolicyShape(value) ? value : defaultCognitionPolicy()) as AgentCognitionPolicy, sourceBlocks)
-  const legacy = legacyPhasePolicyValue === undefined || legacyPhasePolicyValue === null
-    ? undefined
-    : refsToLoomPolicyBuckets(normalizeLegacyLoomPolicyV1(legacyPhasePolicyValue), sourceBlocks, true)
-  const merged = Object.fromEntries(LOOM_POLICY_BUCKET_ORDER.map((bucket) => [
-    bucket,
-    sortLoomPolicyEntriesV1([...(parsed[bucket] ?? []), ...(legacy?.[bucket] ?? [])]),
-  ])) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>
+  if (isUnknownRecord(value) && value.version === 1) {
+    return parseLoomPolicyBucketsV1(value)
+  }
+  const normalized = refsToLoomPolicyBuckets(
+    (isCognitionPolicyShape(value) ? value : defaultCognitionPolicy()) as AgentCognitionPolicy,
+    sourceBlocks,
+  )
   return Object.freeze({
     version: 1,
-    workPolicy: Object.freeze(merged.workPolicy),
-    workspaceUsage: Object.freeze(merged.workspaceUsage),
-    completionCriteria: Object.freeze(merged.completionCriteria),
-    renderPolicy: Object.freeze(merged.renderPolicy),
+    workPolicy: Object.freeze(normalized.workPolicy),
+    workspaceUsage: Object.freeze(normalized.workspaceUsage),
+    completionCriteria: Object.freeze(normalized.completionCriteria),
+    renderPolicy: Object.freeze(normalized.renderPolicy),
   })
 }
-
-export const normalizeLoomPolicyBuckets = normalizeLoomPolicyBucketsV1
 
 function loomSourcePin(source: LoomPolicySourceV1): string {
   return `${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`
@@ -761,6 +735,18 @@ function evaluateLoomPredicate(predicate: CognitionPredicate, evaluation: NonNul
   }
 }
 
+function copyAndDeepFreezeLoomInspectionValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => copyAndDeepFreezeLoomInspectionValue(item)))
+  }
+  if (!isUnknownRecord(value)) return value
+  const copy: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value)) {
+    copy[key] = copyAndDeepFreezeLoomInspectionValue(item)
+  }
+  return Object.freeze(copy)
+}
+
 function loomInspectionItem(
   entry: LoomPolicyEntryV1,
   bucket: LoomPolicyBucketV1,
@@ -768,7 +754,7 @@ function loomInspectionItem(
   effectiveText: string | null,
   conditionResult: LoomPromptInspectionItemV1['conditionResult'] = 'not_applicable',
 ): LoomPromptInspectionItemV1 {
-  return {
+  return copyAndDeepFreezeLoomInspectionValue({
     entryId: entry.id,
     bucket,
     destination: entry.destination,
@@ -780,7 +766,7 @@ function loomInspectionItem(
     required: entry.required,
     ordinaryPromptSuppressed: true,
     outcome,
-  }
+  }) as LoomPromptInspectionItemV1
 }
 
 export function inspectLoomPromptPoliciesV1(
@@ -1286,17 +1272,6 @@ function defaultCognitionPolicy() {
     renderPolicy: [],
   }
 }
-const COGNITION_POLICY_REF_KEYS = ['blockId', 'expectedPresetRevision', 'expectedBlockRevision'] as const
-
-function isCognitionPolicyRef(value: unknown): value is AgentPromptBlockRef {
-  return isUnknownRecord(value)
-    && hasOnlyKeys(value, COGNITION_POLICY_REF_KEYS)
-    && typeof value.blockId === 'string'
-    && value.blockId.length > 0
-    && !/\s/.test(value.blockId)
-    && isNonNegativeSafeInteger(value.expectedPresetRevision)
-    && isNonNegativeSafeInteger(value.expectedBlockRevision)
-}
 
 export function createLoomPolicyEntryV1(
   bucket: LoomPolicyBucketV1,
@@ -1349,7 +1324,7 @@ export function getAgentRuntimePolicyBuckets(
     }
   }
   try {
-    return normalizeLoomPolicyBucketsV1(rawConfig.cognitionPolicy, sourceBlocks, rawConfig.phasePolicy)
+    return normalizeLoomPolicyBucketsV1(rawConfig.cognitionPolicy, sourceBlocks)
   } catch {
     return {
       version: 1,
@@ -1397,7 +1372,6 @@ export function setAgentRuntimeCustomPhases(
     : null
   const {
     cognitionPolicy: _legacyCognitionPolicy,
-    phasePolicy: _legacyPhasePolicy,
     ...withoutLegacyPolicy
   } = rawConfig
   const runtimePolicy: AgentRuntimePolicyV1 = {
@@ -1425,7 +1399,6 @@ export function setAgentRuntimePolicyBuckets(
     : []
   const {
     cognitionPolicy: _legacyCognitionPolicy,
-    phasePolicy: _legacyPhasePolicy,
     ...withoutLegacyPolicy
   } = rawConfig
   const runtimePolicy: AgentRuntimePolicyV1 = {
@@ -1640,7 +1613,7 @@ export function normalizeAgentConfigForEditor(
   } else if (
     sourceBlocks !== undefined
     && !Object.hasOwn(raw, 'runtimePolicy')
-    && (Object.hasOwn(raw, 'cognitionPolicy') || Object.hasOwn(raw, 'phasePolicy'))
+    && Object.hasOwn(raw, 'cognitionPolicy')
     && (raw.cognitionPolicy === undefined
       || raw.cognitionPolicy === null
       || isCognitionPolicyShape(raw.cognitionPolicy))
@@ -1651,7 +1624,7 @@ export function normalizeAgentConfigForEditor(
       // to validation instead of being silently discarded.
       next = setAgentRuntimePolicyBuckets(
         next,
-        normalizeLoomPolicyBucketsV1(raw.cognitionPolicy, sourceBlocks, raw.phasePolicy),
+        normalizeLoomPolicyBucketsV1(raw.cognitionPolicy, sourceBlocks),
       )
     } catch {
       // Validation and explicit repair own legacy rows that cannot be converted.
@@ -1675,8 +1648,7 @@ export function prepareAgentConfigForRuntimeSave(
   }
   const normalized = normalizeAgentConfigForEditor(config, sourceBlocks)
   const normalizedRecord = normalized as unknown as Record<string, unknown>
-  if (Object.hasOwn(normalizedRecord, 'cognitionPolicy')
-    || Object.hasOwn(normalizedRecord, 'phasePolicy')) {
+  if (Object.hasOwn(normalizedRecord, 'cognitionPolicy')) {
     return loomPolicyError('config.runtimePolicy', 'legacy policy input requires explicit repair before save')
   }
   const rawRuntimePolicy = normalizedRecord.runtimePolicy
@@ -2253,13 +2225,8 @@ function validateLegacyPolicySurface(
   issues: AgenticRuntimeValidationIssue[],
 ): void {
   const raw = config as unknown as Record<string, unknown>
-  const hasLegacyCognition = Object.hasOwn(raw, 'cognitionPolicy')
-  const hasLegacyPhases = Object.hasOwn(raw, 'phasePolicy')
-  if (hasLegacyCognition) {
+  if (Object.hasOwn(raw, 'cognitionPolicy')) {
     issues.push({ code: 'invalid_runtime_policy', path: 'config.cognitionPolicy' })
-  }
-  if (hasLegacyPhases) {
-    issues.push({ code: 'invalid_runtime_policy', path: 'config.phasePolicy' })
   }
 }
 

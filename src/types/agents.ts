@@ -212,11 +212,6 @@ export interface AgentPromptBlockRefV1 {
   expectedBlockRevision: number;
 }
 
-interface LegacyAgentPhasePolicyV1 {
-  work: AgentPromptBlockRefV1[];
-  render: AgentPromptBlockRefV1[];
-}
-
 /** Legacy plain-reference cognition policy accepted only at ingress. */
 interface LegacyAgentCognitionPolicyV1 {
   workPolicy: AgentPromptBlockRefV1[];
@@ -1001,11 +996,6 @@ function parsePromptBlockRefs(value: unknown, path: string): AgentPromptBlockRef
   }
   return refs;
 }
-function parsePhasePolicy(value: unknown, path: string): LegacyAgentPhasePolicyV1 {
-  const policy = ownDataEntries(value, path); exactKeys(policy, ["work", "render"], path);
-  return { work: parsePromptBlockRefs(policy.work, `${path}.work`), render: parsePromptBlockRefs(policy.render, `${path}.render`) };
-}
-
 function parseLoomInstructionRefs(value: unknown, path: string): LoomPolicySourceV1[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
     throw new AgentConfigValidationError(path, "must be an array");
@@ -1312,7 +1302,7 @@ function parseAgentProfileV2(value: unknown, path: string): AgentProfileConfigV2
 }
 
 function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfigV2 {
-  exactKeys(config, ["version", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], path, ["phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
+  exactKeys(config, ["version", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], path, ["cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
   const agentsEnabled = requireBoolean(config.agentsEnabled, `${path}.agentsEnabled`);
   const allowedModes = requireModeList(config.allowedModes, `${path}.allowedModes`);
   if (config.defaultMode !== "response" && config.defaultMode !== "agentic") throw new AgentConfigValidationError(`${path}.defaultMode`, "must be response or agentic");
@@ -1349,21 +1339,16 @@ function parseAgentConfigV2Object(config: PlainRecord, path: string): AgentConfi
   };
   if (Object.hasOwn(config, "taskPolicy")) parsed.taskPolicy = parseTaskPolicy(config.taskPolicy, `${path}.taskPolicy`);
   if (Object.hasOwn(config, "workspacePolicy")) parsed.workspacePolicy = parseWorkspacePolicy(config.workspacePolicy, `${path}.workspacePolicy`);
-  const hasLegacyPhase = Object.hasOwn(config, "phasePolicy");
-  const legacyPhase = hasLegacyPhase
-    ? parsePhasePolicy(config.phasePolicy, `${path}.phasePolicy`)
-    : undefined;
   const hasLegacyCognition = Object.hasOwn(config, "cognitionPolicy");
   const legacyCognition = hasLegacyCognition
     ? parseLegacyCognitionPolicy(config.cognitionPolicy, `${path}.cognitionPolicy`)
     : undefined;
   if (Object.hasOwn(config, "runtimePolicy")) {
     if (hasLegacyCognition) throw new AgentConfigValidationError(`${path}.cognitionPolicy`, "legacy cognitionPolicy cannot accompany runtimePolicy");
-    if (hasLegacyPhase) throw new AgentConfigValidationError(`${path}.phasePolicy`, "legacy phasePolicy cannot accompany runtimePolicy");
     parsed.runtimePolicy = parseRuntimePolicy(config.runtimePolicy, `${path}.runtimePolicy`, profileIds);
-  } else if (legacyCognition !== undefined || legacyPhase !== undefined) {
+  } else if (legacyCognition !== undefined) {
     throw new AgentConfigValidationError(
-      hasLegacyPhase ? `${path}.phasePolicy` : `${path}.cognitionPolicy`,
+      `${path}.cognitionPolicy`,
       "legacy Loom policy requires explicit repair with current Loom source order",
     );
   }
@@ -1381,7 +1366,7 @@ export function createDisabledAgentConfigV2(): AgentConfigV2 {
 
 export function parsePortableAgentConfigV1(raw: unknown): PortableAgentConfigV1 {
   const portable = ownDataEntries(raw, "portableAgentConfig");
-  exactKeys(portable, ["portableVersion", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], "portableAgentConfig", ["phasePolicy", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
+  exactKeys(portable, ["portableVersion", "agentsEnabled", "allowedModes", "defaultMode", "maxInvocations", "maxToolCalls", "mainToolIds", "mainLoreScope", "profiles", "connectionSlots", "cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"], "portableAgentConfig", ["cognitionPolicy", "taskPolicy", "workspacePolicy", "runtimePolicy"]);
   if (portable.portableVersion !== PORTABLE_AGENT_CONFIG_VERSION) throw new AgentConfigValidationError("portableAgentConfig.portableVersion", "must be version 1");
   const hasLegacyCognition = Object.hasOwn(portable, "cognitionPolicy");
   if (hasLegacyCognition && Object.hasOwn(portable, "runtimePolicy")) {

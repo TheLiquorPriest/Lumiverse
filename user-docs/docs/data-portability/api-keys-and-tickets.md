@@ -4,7 +4,7 @@ title: API Keys & Tickets
 
 # API Keys & Decryption Tickets
 
-By default, exports **do not** include API keys or any other content from your `secrets` table — those stay encrypted at rest on the source server. If you want a 1:1 restore (no need to paste keys back in), enable **Include API keys**. This produces two files: the archive and a separate, one-use decryption ticket. Tickets include an issuer identity and expire after 24 hours.
+By default, exports **do not** include API keys or any other content from your `secrets` table — those stay encrypted at rest on the source server. If you want a 1:1 restore (no need to paste keys back in), enable **Include API keys**. This produces two files: the archive and a separate decryption ticket. The ticket contains the raw AES key, includes an issuer identity, expires after 24 hours, and is accepted at most once by each destination account and instance.
 
 ---
 
@@ -63,14 +63,16 @@ If you can't find the ticket, click **Skip API keys** — the import continues a
 
 ### One-Use Tickets
 
-Tickets expire after 24 hours and can be consumed only once globally for an
-archive ID. A replay, stale ticket, missing issuer fields, wrong issuer, or
-ticket for another archive is rejected before any secret is decrypted or
-applied. Validation and secret preparation happen before the commit fence, so
-decrypt failures, cancellation, filesystem failures, and pre-commit database
-failures leave the ticket retryable. Once the transaction commits, the
-tombstone is permanent and cannot be rolled back. To restore the same backup
-on another instance, create a fresh key-bearing export and ticket.
+Tickets expire after 24 hours. A destination account and instance can consume
+a ticket only once for an archive ID. A replay on that destination, a stale
+ticket, missing issuer fields, a wrong issuer, or a ticket for another archive
+is rejected before any secret is decrypted or applied. Validation and secret
+preparation happen before the commit fence, so decrypt failures, cancellation,
+filesystem failures, and pre-commit database failures leave the ticket
+retryable. Once the transaction commits, that destination stores a permanent
+tombstone for the account, archive, and ticket identity. The tombstone is
+local: another Lumiverse instance does not share it and may import the same
+archive/ticket pair while the ticket remains within its 24-hour lifetime.
 
 ---
 
@@ -111,9 +113,10 @@ What it **cannot** protect:
 ## Tips & Caveats
 
 !!! tip "Use a password manager for the ticket"
-    The ticket is a small JSON file containing a one-use AES key and binding
-    metadata. Keep it separate from the archive and do not upload it anywhere
-    except the matching import job.
+    The ticket is a small JSON file containing the raw 256-bit AES key and
+    binding metadata. A destination's one-use tombstone does not revoke this
+    file: anyone with both files can still decrypt the secrets offline. Keep it
+    separate from the archive and upload it only to the matching import job.
 
 !!! tip "Secret restore is all-or-nothing"
     A ticket covers the exact encrypted-secret set. You cannot selectively

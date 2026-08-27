@@ -31,11 +31,13 @@ When you hit send, Lumiverse builds the prompt in a defined sequence. Here's the
 10. Inject utility prompts (continue nudge, impersonation, etc.)
 11. Apply assistant prefill, prompt bias, context filters, and token clipping
 12. Merge selected main-model core tools and `agent_delegate` when authorized
-13. For rounds exposing Agents & Tools, use native structured continuation when
-    the provider advertises `nativeToolContinuation` or `interleavedThinking`;
-    otherwise use bounded legacy assistant-text/user-result continuation. Council-only
-    rounds retain compatibility behavior: only `interleavedThinking` selects structured
-    continuation, and other fallbacks use assistant-text/system-result.
+13. For rounds exposing Agents & Tools, require tool calling, a supported
+    native/legacy continuation mode, and tools-disabled finalization before any
+    provider request. Use native structured continuation only when both
+    `nativeToolContinuation` is true and `toolContinuationMode` is `native`;
+    an admitted `legacy` mode uses bounded assistant-text/user-result
+    continuation. Council-only rounds select structured continuation only for
+    `interleavedThinking`; other Council fallbacks use assistant-text/system-result.
 ```
 
 The critical thing to understand: **ordinary macro evaluation happens during step 7**, while the block list is walked in order. The macro environment is built at step 5 and reused for every block. World Info is activated at step 6, after feature preflight and before the block walk. With no agent configuration, this follows the existing pipeline.
@@ -52,7 +54,7 @@ For an enabled single-user generation:
 4. `{{agentResult::name}}` is resolved only after its producer and is restored as host-framed, lower-authority derived data. It is never re-run through the macro, regex, or interceptor passes.
 5. Required failures abort generation; optional failures record the failure, restore an empty direct value, and bind an empty named result. Values are bounded rather than silently truncated.
 
-Main-model core tools and `agent_delegate` are selected after prompt assembly. They are separate from deterministic block execution and from Council tools. When feature tools are exposed, a provider advertising `nativeToolContinuation` or `interleavedThinking` receives one ordered native result batch with provider call IDs and native reasoning/signature carriers preserved. Otherwise, the host uses bounded legacy assistant-text/user-result continuation, so provider capability no longer gates agent tools; an upstream endpoint without function-calling support may not honor tool definitions. Tool and child results remain host-framed, untrusted derived data. Council-only rounds retain their existing compatibility decision: only `interleavedThinking` selects structured continuation; otherwise the bounded assistant-text/system-result path is used.
+Main-model core tools and `agent_delegate` are selected after prompt assembly. They are separate from deterministic block execution and Council tools. Feature tools are rejected before a provider request unless the adapter declares tool calling, a `native` or `legacy` continuation mode, and tools-disabled finalization. After admission, native structured continuation is used if and only if `nativeToolContinuation` is true and `toolContinuationMode` is `native`; admitted `legacy` mode uses bounded assistant-text/user-result continuation. Tool and child results remain host-framed, untrusted derived data. Council-only rounds keep their separate rule: only `interleavedThinking` selects structured continuation, and other fallbacks use assistant-text/system-result.
 
 Dry Run never allocates an agent runtime or calls a child provider. An executable intrinsic in Dry Run reports unsupported inspection. In an active multiplayer room, feature tools are omitted and an executable intrinsic fails before snapshot or provider work. Live `stream` activity is status-only; retained message data is a compact swipe-scoped summary, not a child transcript.
 
@@ -243,7 +245,7 @@ Each filter has a `keepDepth` — messages within that many from the end are unt
 
 ### Steps 12-13: Main Tools and Provider
 
-Selected main-model core tools and authorized `agent_delegate` are merged after prompt assembly. When feature tools are exposed, a provider advertising `nativeToolContinuation` or `interleavedThinking` receives one ordered native result batch and preserves provider call IDs and native reasoning/signature carriers on that path. Otherwise, the host uses bounded legacy assistant-text/user-result continuation; provider capability no longer gates agent tools, and an upstream endpoint without function-calling support may not honor tool definitions. Tool and child results remain untrusted host-framed derived data. If no feature tool is exposed, Council-only rounds retain their existing compatibility decision: only `interleavedThinking` selects structured continuation; otherwise the bounded assistant-text/system-result path is used.
+Selected main-model core tools and authorized `agent_delegate` are merged after prompt assembly. A feature-tool round first requires tool calling, a supported `native` or `legacy` continuation mode, and tools-disabled finalization. It preserves provider call IDs and native reasoning/signature carriers only on the structured path, selected if and only if `nativeToolContinuation` is true and `toolContinuationMode` is `native`; an admitted `legacy` mode uses bounded assistant-text/user-result continuation. Tool and child results remain untrusted host-framed derived data. With no feature tool exposed, Council-only rounds select structured continuation only for `interleavedThinking`; other Council fallbacks use assistant-text/system-result.
 
 
 ---

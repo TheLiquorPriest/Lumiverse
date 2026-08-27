@@ -259,12 +259,16 @@ of aborting it.
 
 ### Main-model continuation and provider support
 
-For Response-mode rounds with feature tools, the host uses native structured
-tool continuation only when the provider advertises both
-`nativeToolContinuation: true` and `toolContinuationMode: "native"`. Otherwise
-it uses bounded legacy assistant-text/user-result continuation. Tool and child
-results remain host-framed, untrusted derived data. Provider capability
-declarations, rather than a provider-name allowlist, select the serializer.
+For Response-mode rounds with feature tools, the host first applies
+`assertAgentToolCapability()`: `toolCalling` must be true,
+`toolContinuationMode` must not be `unsupported`, and
+`toolsDisabledFinalization` must be true. A failing declaration rejects the
+feature before any provider request. After that gate, native structured
+continuation is selected if and only if both `nativeToolContinuation: true`
+and `toolContinuationMode: "native"`; an admitted `legacy` mode uses bounded
+assistant-text/user-result continuation. Tool and child results remain
+host-framed, untrusted derived data. Provider capability declarations, rather
+than a provider-name allowlist, select the serializer.
 
 Those declarations live on `ProviderCapabilities` (`src/llm/param-schema.ts`).
 Every adapter states them as literals so readiness can never infer them from an
@@ -273,7 +277,7 @@ adapter base class:
 | Field | Meaning |
 |---|---|
 | `toolCalling` | The adapter advertises and parses host function calls. Deliberately independent of continuation mode. |
-| `nativeToolContinuation` | The adapter has a provider-native tool continuation wire format. Declared even when the mode is `legacy`/`unsupported`. |
+| `nativeToolContinuation` | Boolean mirror of a provider-native continuation wire format; the registry requires it to be true exactly when `toolContinuationMode` is `native`. |
 | `toolContinuationMode` | `native` (correlated provider call identities and results), `legacy` (bounded assistant-text/user-result, retained for feature-inactive Council compatibility), or `unsupported` (reject agent tools before any provider request). |
 | `toolsDisabledFinalization` | The adapter can issue an explicit tools-disabled finalization request once a continuation reaches its budget. `supportsToolFinalization` is the older Response/Council projection; readiness reads `toolsDisabledFinalization`. |
 
@@ -288,9 +292,12 @@ declaring `toolCalling: false` with `toolContinuationMode: "unsupported"` and
 `toolsDisabledFinalization: false` — `pollinations-text` today — is admitted by
 neither path.
 
-Council calls are part of this existing Response-only compatibility path.
-Council, extension callbacks, MCP tools, and generic Spindle tools are not
-admitted by the strict Agentic runtime described below.
+Feature-inactive Council calls remain on the existing Response-only path and
+do not use `assertAgentToolCapability()`. Council selects structured
+continuation only when `interleavedThinking` is true; otherwise it uses
+assistant-text/system-result continuation. Council, extension callbacks, MCP
+tools, and generic Spindle tools are not admitted by the strict Agentic runtime
+described below.
 
 ### Dry run, multiplayer, and retained activity
 
@@ -568,10 +575,12 @@ switch returns to `auto`. Schema rollback is the separate, narrower boundary in
 `EffectiveRuntimePublicResponseV1`. Its closed public fields are
 `version`, `chatId`, `target`, safe `connection` and `preset` projections,
 `agentsEnabled`, `allowedModes`, `defaultMode`, `requestedMode`,
-`effectiveMode`, `runtimePolicy`, `chatOverride`, `capabilityReadiness`,
-`repairCodes`, `runtimeDecisionToken`, and
-`runtimeDecisionExpiresAt`. It never returns a credential, normalized
-endpoint, or trust-domain fingerprint.
+`effectiveMode`, required `inspection`, nullable `responseOmission`,
+`runtimePolicy`, `chatOverride`, `capabilityReadiness`, `repairCodes`,
+`runtimeDecisionToken`, and `runtimeDecisionExpiresAt`. `inspection` is
+present for both modes; `responseOmission` carries Response-only omission
+evidence and is `null` for Agentic. The response never returns a credential,
+normalized endpoint, or trust-domain fingerprint.
 
 The effective mode has one explicit precedence chain:
 

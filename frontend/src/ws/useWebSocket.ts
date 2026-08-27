@@ -256,11 +256,11 @@ function localizedAgentError(error: unknown): string | null {
   if (error === null || typeof error !== 'object' || Array.isArray(error) || !('code' in error)) return null
   const code = error.code
   if (typeof code !== 'string' || code.length === 0) return null
-  for (const key of [`chat.agentRuntime.errors.${code}`, `chat.agentActivity.errors.${code}`]) {
-    const translated = i18n.t(key)
-    if (translated !== key) return translated
-  }
-  return i18n.t('chat.agentActivity.errors.generic')
+  const key = `chat.agentRuntime.errors.${code}`
+  const translated = i18n.t(key)
+  return translated !== key
+    ? translated
+    : i18n.t('chat.agentRuntime.errors.agentic_internal_error')
 }
 
 function isCommittedSuccessPayload(payload: {

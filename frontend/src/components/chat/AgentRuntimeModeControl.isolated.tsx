@@ -114,10 +114,10 @@ mock.module('@/hooks/useEffectiveRuntime', () => ({
 mock.module('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) => {
-      if (key === 'agentRuntime.resolutionError.target') {
+      if (key === 'agentRuntime.provenance.resolutionError.target') {
         return `${String(options?.generationType)} ${String(options?.messageId)} ${String(options?.swipeId)}`
       }
-      if (key === 'agentRuntime.resolutionError.code') return String(options?.code)
+      if (key === 'agentRuntime.provenance.resolutionError.code') return String(options?.code)
       return key
     },
   }),
@@ -377,7 +377,7 @@ describe('AgentRuntimeModeControl', () => {
     const { host } = await renderControl()
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('TargetConflict')
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('normal')
-    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.resolutionError.retry'))
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.provenance.resolutionError.retry'))
     const response = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('agentRuntime.useResponse'))
     await act(async () => retry?.click())
     await act(async () => response?.click())

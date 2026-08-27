@@ -16,6 +16,7 @@ import type {
 import type { AgentPublicErrorCode } from "../types/agent-runtime";
 import type { ResolvedConcreteConnectionV1 } from "./connections.service";
 import {
+  AGENT_CHILD_TASK_MAX_BYTES,
   AGENT_SERIALIZED_VALUE_MAX_BYTES,
   AGENT_CHILD_SYSTEM_GUIDANCE,
   AGENT_TIMER_MAX_DELAY_MS,
@@ -171,7 +172,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(outcome.content).toBe("done");
     expect(requests).toHaveLength(1);
     expect(requests[0].connection.concreteId).toBe("root-connection");
@@ -205,7 +206,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "succeeded",
+      outcome: "succeeded",
       content: "",
       usage: { inputTokens: 11, outputTokens: 128, totalTokens: 139 },
     });
@@ -276,7 +277,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(owner.usage).toEqual({
       inputTokens: 13,
       outputTokens: 37,
@@ -305,7 +306,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "provider_protocol_error",
       usage: { inputTokens: 0, outputTokens: 4, totalTokens: 4 },
     });
@@ -336,7 +337,7 @@ describe("AgentRuntimeOwner", () => {
         task,
         kind: "deterministic",
       });
-      expect(outcome.status).toBe("succeeded");
+      expect(outcome.outcome).toBe("succeeded");
     }
 
     const expectedUsage = {
@@ -385,9 +386,9 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(first.status).toBe("succeeded");
+    expect(first.outcome).toBe("succeeded");
     expect(second).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "provider_protocol_error",
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     });
@@ -421,7 +422,7 @@ describe("AgentRuntimeOwner", () => {
       .nodes.find((node) => node.kind === "provider_round");
 
     expect(deterministic).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "child_output_token_limit_exceeded",
     });
     expect(providerRound?.errorCode).toBe("child_output_token_limit_exceeded");
@@ -498,7 +499,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
     expect(first).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "child_output_token_limit_exceeded",
       usage: { inputTokens: 2, outputTokens: 7, totalTokens: 9 },
     });
@@ -515,7 +516,7 @@ describe("AgentRuntimeOwner", () => {
       task: "consume remaining aggregate output",
       kind: "deterministic",
     });
-    expect(second.status).toBe("succeeded");
+    expect(second.outcome).toBe("succeeded");
     expect(dispatchCount).toBe(2);
     expect(owner.ledger.counters.childOutputTokens).toBe(10);
 
@@ -525,7 +526,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
     expect(third).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "child_output_token_limit_exceeded",
     });
     expect(dispatchCount).toBe(2);
@@ -568,7 +569,7 @@ describe("AgentRuntimeOwner", () => {
       task: "seed aggregate usage",
       kind: "deterministic",
     });
-    expect(first.status).toBe("succeeded");
+    expect(first.outcome).toBe("succeeded");
 
     const second = await owner.invoke({
       profileId: "writer",
@@ -576,7 +577,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
     expect(second).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "child_output_token_limit_exceeded",
       usage: { inputTokens: 1, outputTokens: 7, totalTokens: 8 },
     });
@@ -621,7 +622,7 @@ describe("AgentRuntimeOwner", () => {
       .nodes
       .filter((node) => node.kind === "provider_round");
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(dispatches).toBe(5);
     expect(providerRounds).toHaveLength(5);
     expect(providerRounds.map((node) => node.roundIndex)).toEqual([0, 1, 2, 3, 4]);
@@ -662,7 +663,7 @@ describe("AgentRuntimeOwner", () => {
       const providerRound = snapshot.nodes.find(
         (node) => node.kind === "provider_round",
       );
-      expect(outcome).toMatchObject({ status: "failed", errorCode: code });
+      expect(outcome).toMatchObject({ outcome: "failed", errorCode: code });
       expect(events.at(-1)).toMatchObject({ phase: "failed", errorCode: code });
       expect(childNode).toMatchObject({ phase: "failed", errorCode: code });
       expect(providerRound).toMatchObject({ phase: "failed", errorCode: code });
@@ -767,7 +768,7 @@ describe("AgentRuntimeOwner", () => {
     pendingTimers[0]!();
     const outcome = await pendingOutcome;
 
-    expect(outcome.status).toBe("timed_out");
+    expect(outcome.outcome).toBe("timed_out");
     expect(outcome.errorCode).toBe("profile_timeout");
     owner.close();
   });
@@ -824,7 +825,7 @@ describe("AgentRuntimeOwner", () => {
 
       release(response("late"));
       const outcome = await pendingOutcome;
-      expect(outcome.status).toBe("cancelled");
+      expect(outcome.outcome).toBe("cancelled");
       expect(outcome.errorCode).toBe("cancelled");
       owner.close();
     }
@@ -870,7 +871,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(requests).toHaveLength(2);
     expect(requests[0].tools).toHaveLength(1);
     expect(requests[1].messages[2]?.role).toBe("assistant");
@@ -959,7 +960,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(requests).toHaveLength(3);
     expect(requests[1]!.messages).toHaveLength(2);
     expect(requests[1]!.providerTransientCarrier?.items).toEqual([
@@ -1030,7 +1031,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
 
-    expect(outcome.status).toBe("failed");
+    expect(outcome.outcome).toBe("failed");
     expect(outcome.errorCode).toBe("provider_protocol_error");
     expect(events.some((event) => event.toolName === "chat_search_history")).toBe(false);
     owner.close();
@@ -1071,7 +1072,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(outcome.content).toBe("partialfinal");
     expect(requests).toHaveLength(2);
     expect(requests[0].tools).toHaveLength(1);
@@ -1124,7 +1125,7 @@ describe("AgentRuntimeOwner", () => {
       stream: true,
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(outcome.content).toBe("final");
     expect(requests).toHaveLength(5);
     for (let index = 0; index < 4; index += 1) {
@@ -1160,7 +1161,7 @@ describe("AgentRuntimeOwner", () => {
         profileId: "writer",
         task: `task-${index}`,
         kind: "deterministic",
-      })).status).toBe("succeeded");
+      })).outcome).toBe("succeeded");
     }
     expect(owner.ledger.counters.childOutputTokens).toBe(5);
     expect(dispatches).toBe(5);
@@ -1186,7 +1187,7 @@ describe("AgentRuntimeOwner", () => {
         profileId: "writer",
         task: `task-${index}`,
         kind: "deterministic",
-      })).status).toBe("succeeded");
+      })).outcome).toBe("succeeded");
     }
     await expect(owner.invoke({
       profileId: "writer",
@@ -1219,7 +1220,7 @@ describe("AgentRuntimeOwner", () => {
       },
       "invalid_task",
     );
-    expect(rejected.status).toBe("failed");
+    expect(rejected.outcome).toBe("failed");
     expect(owner.summary).toMatchObject({
       invocationCount: 1,
       failedCount: 1,
@@ -1232,7 +1233,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
       stream: true,
     });
-    expect(completed.status).toBe("succeeded");
+    expect(completed.outcome).toBe("succeeded");
     expect(dispatches).toBe(1);
 
     await expect(owner.invoke({
@@ -1279,7 +1280,7 @@ describe("AgentRuntimeOwner", () => {
         profileId: "writer",
         task: `task-${index}`,
         kind: "deterministic",
-      })).status).toBe("succeeded");
+      })).outcome).toBe("succeeded");
     }
     await expect(owner.invoke({
       profileId: "writer",
@@ -1308,7 +1309,7 @@ describe("AgentRuntimeOwner", () => {
         profileId: "writer",
         task: `task-${index}`,
         kind: "deterministic",
-      })).status).toBe("succeeded");
+      })).outcome).toBe("succeeded");
     }
     await expect(owner.invoke({
       profileId: "writer",
@@ -1486,7 +1487,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("failed");
+    expect(outcome.outcome).toBe("failed");
     expect(outcome.errorCode).toBe("capacity_exceeded");
     expect(owner.ledger.remaining("child_output_tokens"))
       .toBe(AGENT_HOST_DEFAULT_LIMITS.childOutputTokens);
@@ -1519,7 +1520,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "logical_provider_request_limit_exceeded",
     });
     expect(owner.ledger.activitySnapshot("failed").nodes.find(
@@ -1556,7 +1557,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "child_output_token_limit_exceeded",
     });
     expect(dispatches).toBe(0);
@@ -1623,7 +1624,7 @@ describe("AgentRuntimeOwner", () => {
     });
     release(response("late"));
     const outcome = await pending;
-    expect(outcome.status).toBe("cancelled");
+    expect(outcome.outcome).toBe("cancelled");
     expect(outcome.content).toBe("");
     expect(owner.usage).toEqual({
       inputTokens: 2,
@@ -1655,7 +1656,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "cancelled",
+      outcome: "cancelled",
       usage: { inputTokens: 2, outputTokens: 7, totalTokens: 9 },
     });
     expect(owner.ledger.counters.childOutputTokens).toBe(7);
@@ -1694,7 +1695,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "root_wall_clock_limit_exceeded",
       usage: { inputTokens: 2, outputTokens: 4, totalTokens: 6 },
     });
@@ -1731,7 +1732,7 @@ describe("AgentRuntimeOwner", () => {
     release(response("late"));
     const outcome = await pending;
 
-    expect(outcome.status).toBe("cancelled");
+    expect(outcome.outcome).toBe("cancelled");
     expect(outcome.content).toBe("");
     expect(events.map((event) => event.phase)).toEqual(["queued", "started"]);
     expect(owner.summary).toMatchObject({
@@ -1843,7 +1844,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("failed");
+    expect(outcome.outcome).toBe("failed");
     expect(outcome.errorCode).toBe("provider_failed");
     expect(requests).toHaveLength(1);
     expect(owner.summary).toMatchObject({ toolCallCount: 0 });
@@ -1883,7 +1884,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("failed");
+    expect(outcome.outcome).toBe("failed");
     expect(outcome.errorCode).toBe("provider_failed");
     expect(requests).toHaveLength(1);
     expect(owner.summary).toMatchObject({ toolCallCount: 0 });
@@ -1918,6 +1919,41 @@ describe("AgentRuntimeOwner", () => {
     owner.close();
   });
 
+  test("accepts 32 KiB ASCII and multibyte child tasks and rejects 32 KiB plus one byte before dispatch", async () => {
+    let dispatchCount = 0;
+    const owner = new AgentRuntimeOwner({
+      generationId: "gen-child-task-boundary",
+      config: config(),
+      rootConnection: connection(),
+      dispatch: async () => {
+        dispatchCount += 1;
+        return response("done");
+      },
+    });
+    const asciiBoundary = "a".repeat(AGENT_CHILD_TASK_MAX_BYTES);
+    const multibyteBoundary = "é".repeat(AGENT_CHILD_TASK_MAX_BYTES / 2);
+    const oneByteOver = `${multibyteBoundary}a`;
+
+    expect(Buffer.byteLength(asciiBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(multibyteBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(oneByteOver, "utf8")).toBe(32_769);
+    for (const task of [asciiBoundary, multibyteBoundary]) {
+      const outcome = await owner.invoke({
+        profileId: "writer",
+        task,
+        kind: "deterministic",
+      });
+      expect(outcome.outcome).toBe("succeeded");
+    }
+    await expect(owner.invoke({
+      profileId: "writer",
+      task: oneByteOver,
+      kind: "deterministic",
+    })).rejects.toMatchObject({ code: "invalid_task" });
+    expect(dispatchCount).toBe(2);
+    owner.close();
+  });
+
   test("rejects deterministic child output one byte above serialized value limit", async () => {
     const boundaryContentBytes =
       AGENT_SERIALIZED_VALUE_MAX_BYTES -
@@ -1943,7 +1979,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("failed");
+    expect(outcome.outcome).toBe("failed");
     expect(outcome.errorCode).toBe("serialized_value_limit_exceeded");
     const failureNode = owner.ledger.activitySnapshot("failed").nodes.find(
       (node) => node.kind === "child_invocation",
@@ -1977,7 +2013,7 @@ describe("AgentRuntimeOwner", () => {
       kind: "deterministic",
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(Buffer.byteLength(outcome.content, "utf8")).toBe(
       boundaryContentBytes,
     );
@@ -2122,7 +2158,7 @@ describe("AgentRuntimeOwner", () => {
     });
 
     expect(outcome).toMatchObject({
-      status: "succeeded",
+      outcome: "succeeded",
       content: "done",
       terminalReason: "completed",
     });
@@ -2156,7 +2192,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
     expect(completed).toMatchObject({
-      status: "succeeded",
+      outcome: "succeeded",
       terminalReason: "completed_at_tool_budget",
     });
     expect(finalizationRequests).toHaveLength(2);
@@ -2191,7 +2227,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
     expect(violation).toMatchObject({
-      status: "failed",
+      outcome: "failed",
       errorCode: "tool_round_limit_exceeded",
     });
     expect(violatingRequests).toHaveLength(2);
@@ -2241,7 +2277,7 @@ describe("AgentRuntimeOwner", () => {
       toolIds: ["chat_search_history"],
     });
 
-    expect(outcome.status).toBe("succeeded");
+    expect(outcome.outcome).toBe("succeeded");
     expect(events.filter((event) => event.toolName === "chat_search_history"))
       .toHaveLength(0);
     const resultMessage = [...(requests[1]?.messages ?? [])]

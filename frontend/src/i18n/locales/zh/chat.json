@@ -247,7 +247,14 @@
       "repairAcknowledgementRequired": "需要审核",
       "repairAcknowledgementAcknowledged": "已确认",
       "unavailable": "不可用",
-      "none": "无"
+      "none": "无",
+      "resolutionError": {
+        "title": "运行时解析失败",
+        "target": "目标：{{generationType}} · 消息 {{messageId}} · 滑动 {{swipeId}}",
+        "none": "无",
+        "code": "错误代码：{{code}}",
+        "retry": "重试解析"
+      }
     },
     "announcement": {
       "oneTurn": "下一回合已选择{{mode}}模式。",
@@ -267,13 +274,6 @@
     "preflight": {
       "refreshRequired": "生成开始前运行时已发生变化。请检查模式后重试。",
       "unavailable": "智能体模式尚未就绪。请使用响应模式或完成列出的修复。"
-    },
-    "resolutionError": {
-      "title": "运行时解析失败",
-      "target": "目标：{{generationType}} · 消息 {{messageId}} · 滑动 {{swipeId}}",
-      "none": "无",
-      "code": "错误代码：{{code}}",
-      "retry": "重试解析"
     },
     "errors": {
       "not_found": "找不到请求的运行时目标。",
@@ -1419,6 +1419,7 @@
     }
   },
   "persistentWorkspace": {
+    "label": "Persistent Workspace",
     "eyebrow": "Persistent Workspace",
     "untitled": "未命名工作区",
     "notAvailableTitle": "Persistent Workspace 不可用",

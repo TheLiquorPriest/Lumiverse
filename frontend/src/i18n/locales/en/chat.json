@@ -273,7 +273,14 @@
       "capabilityNotReady": "Not ready",
       "capabilityMissing": "Missing: {{capabilities}}",
       "gateBothModes": "Response and Agentic available",
-      "gateResponseOnly": "Response only"
+      "gateResponseOnly": "Response only",
+      "resolutionError": {
+        "title": "Runtime resolution failed",
+        "target": "Target: {{generationType}} · message {{messageId}} · swipe {{swipeId}}",
+        "none": "none",
+        "code": "Error code: {{code}}",
+        "retry": "Retry resolution"
+      }
     },
     "announcement": {
       "oneTurn": "{{mode}} selected for the next turn.",
@@ -293,13 +300,6 @@
     "preflight": {
       "refreshRequired": "The runtime changed before generation started. Review the mode and try again.",
       "unavailable": "Agentic mode is not ready. Use Response or complete the listed repair."
-    },
-    "resolutionError": {
-      "title": "Runtime resolution failed",
-      "target": "Target: {{generationType}} · message {{messageId}} · swipe {{swipeId}}",
-      "none": "none",
-      "code": "Error code: {{code}}",
-      "retry": "Retry resolution"
     },
     "errors": {
       "not_found": "The requested runtime target was not found.",

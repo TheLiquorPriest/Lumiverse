@@ -619,9 +619,9 @@ function rowToConfig(row: Record<string, unknown>, profiles: AgentProfileConfigV
     profiles,
     connectionSlots: slots,
   };
-  const phasePolicy = parseJsonObject(row.phase_policy_json);
-  // cognition_policy_json is a legacy repair carrier. It is never copied into
-  // the normalized runtime projection; exports read the carrier explicitly.
+  // phase_policy_json and cognition_policy_json are historical repair
+  // carriers. They are never copied into the normalized runtime projection;
+  // explicit repair/export paths read the carriers directly.
   const taskPolicy = parseJsonObject(row.task_policy_json);
   const workspacePolicy = parseJsonObject(row.workspace_policy_json);
   const authoredEnvelope = parseJsonObject(row.config_json);
@@ -632,7 +632,6 @@ function rowToConfig(row: Record<string, unknown>, profiles: AgentProfileConfigV
     authoredRuntimePolicy = (authoredConfig as Record<string, unknown>).runtimePolicy;
     hasCanonicalRuntimePolicy = authoredRuntimePolicy !== undefined;
   }
-  if (!hasCanonicalRuntimePolicy && Object.keys(phasePolicy).length) configInput.phasePolicy = phasePolicy;
   if (Object.keys(taskPolicy).length) configInput.taskPolicy = taskPolicy;
   if (Object.keys(workspacePolicy).length) configInput.workspacePolicy = workspacePolicy;
   try {

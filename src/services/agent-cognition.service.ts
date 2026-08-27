@@ -442,12 +442,12 @@ function loomSourceForRef(ref: CognitionLoomBlockRefV1, source: CognitionSourceS
   return { kind: "loom_block", blockId: block.blockId, presetRevision: source.presetRevision, blockRevision: block.revision, promptOrder: block.promptOrder };
 }
 
-function policyEntriesFromRefs(refs: CognitionPolicyRefsV1, source: CognitionSourceSnapshotV1, legacy = false): LoomPolicyBucketsV1 {
+function policyEntriesFromRefs(refs: CognitionPolicyRefsV1, source: CognitionSourceSnapshotV1): LoomPolicyBucketsV1 {
   const buckets = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [
     bucket,
     sortLoomPolicyEntries(refs[bucket].map((ref, index) => ({
       version: LOOM_POLICY_VERSION,
-      id: `${legacy ? "legacy-" : ""}${bucket}-${ref.blockId}`,
+      id: `${bucket}-${ref.blockId}`,
       source: loomSourceForRef(ref, source, `policies.${bucket}[${index}]`),
       destination: LOOM_BUCKET_DESTINATION[bucket],
       checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
@@ -476,31 +476,13 @@ function validateLoomPolicySources(policies: LoomPolicyBucketsV1, source: Cognit
   }
 }
 
-function mergeLoomPolicyBuckets(left: LoomPolicyBucketsV1, right: LoomPolicyBucketsV1): LoomPolicyBucketsV1 {
-  const merged = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [bucket, sortLoomPolicyEntries([...left[bucket], ...right[bucket]])])) as Record<LoomPolicyBucketV1, LoomPolicyEntryV1[]>;
-  const ids = LOOM_POLICY_BUCKETS.flatMap((bucket) => merged[bucket].map((entry) => entry.id));
-  assertUniqueIds(ids, "policies");
-  return { version: LOOM_POLICY_VERSION, workPolicy: merged.workPolicy, workspaceUsage: merged.workspaceUsage, completionCriteria: merged.completionCriteria, renderPolicy: merged.renderPolicy };
-}
-
-export function normalizeLegacyLoomPolicyV1(value: unknown, sourceValue: unknown): LoomPolicyBucketsV1 {
-  const source = parseCognitionSourceSnapshot(sourceValue);
-  const object = record(value, "config.phasePolicy");
-  exactKeys(object, ["work", "render"], "config.phasePolicy");
-  const refs = parseCognitionPolicyRefs({ workPolicy: object.work, workspaceUsage: [], completionCriteria: [], renderPolicy: object.render });
-  return deepFreeze(policyEntriesFromRefs(refs, source, true));
-}
-export const normalizeLegacyPhasePolicyV1 = normalizeLegacyLoomPolicyV1;
-
-export function normalizeLoomPolicyBucketsV1(value: unknown, sourceValue: unknown, legacyPhasePolicyValue?: unknown): LoomPolicyBucketsV1 {
+export function normalizeLoomPolicyBucketsV1(value: unknown, sourceValue: unknown): LoomPolicyBucketsV1 {
   const source = parseCognitionSourceSnapshot(sourceValue);
   const parsed = value === undefined || value === null
     ? policyEntriesFromRefs({ workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] }, source)
     : isPlainRecord(value) && value.version === LOOM_POLICY_VERSION ? parseLoomPolicyBuckets(value) : policyEntriesFromRefs(parseCognitionPolicyRefs(value), source);
   validateLoomPolicySources(parsed, source);
-  const canonical = legacyPhasePolicyValue === undefined || legacyPhasePolicyValue === null ? parsed : mergeLoomPolicyBuckets(parsed, normalizeLegacyLoomPolicyV1(legacyPhasePolicyValue, source));
-  validateLoomPolicySources(canonical, source);
-  return deepFreeze(canonical);
+  return deepFreeze(parsed);
 }
 export const normalizeLoomPolicyBuckets = normalizeLoomPolicyBucketsV1;
 

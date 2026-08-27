@@ -95,7 +95,6 @@ const PORTABLE_AGENT_CONFIG_REQUIRED_KEYS = [
 ] as const
 
 const PORTABLE_AGENT_CONFIG_OPTIONAL_KEYS = [
-  'phasePolicy',
   'cognitionPolicy',
   'taskPolicy',
   'workspacePolicy',
@@ -141,8 +140,6 @@ const PORTABLE_LEGACY_MAX_DEPTH = AGENTIC_PREDICATE_MAX_DEPTH
 const PORTABLE_SCAN_MAX_DEPTH = 64
 const PORTABLE_SCAN_MAX_NODES = 16_384
 const PORTABLE_SCAN_MAX_BYTES = 16 * 1024 * 1024
-const PORTABLE_PHASE_SECTION_LIMIT = 64
-const PORTABLE_PHASE_TOTAL_LIMIT = 128
 const PORTABLE_FORBIDDEN_AUTHORITY_KEY = /^(?:connection(ProfileId|Id)|localConnectionId|connection_id|agentSlotBindings?|slotBindings?|bindingRevision|credential|secret|grant|acl|enabledAuthority)$/i
 
 function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -389,39 +386,6 @@ function isWorkspaceCapabilityList(value: unknown): value is WorkspaceCapability
   return true
 }
 
-function isPortableBlockReference(value: unknown): value is {
-  blockId: string
-  expectedPresetRevision: number
-  expectedBlockRevision: number
-} {
-  return isPlainDataRecord(value)
-    && hasExactKeys(value, ['blockId', 'expectedPresetRevision', 'expectedBlockRevision'])
-    && isSafePortableId(value.blockId, 128)
-    && Number.isSafeInteger(value.expectedPresetRevision)
-    && value.expectedPresetRevision >= 0
-    && Number.isSafeInteger(value.expectedBlockRevision)
-    && value.expectedBlockRevision >= 0
-}
-
-function isPortableLegacyPhasePolicy(value: unknown): boolean {
-  if (!isPlainDataRecord(value) || !hasExactKeys(value, ['work', 'render'])) return false
-  const seen = new Set<string>()
-  let total = 0
-  for (const key of ['work', 'render'] as const) {
-    const refs = value[key]
-    if (!isDensePortableArray(refs) || refs.length > PORTABLE_PHASE_SECTION_LIMIT) return false
-    for (const ref of refs) {
-      if (!isPortableBlockReference(ref)) return false
-      const blockId = ref.blockId
-      if (seen.has(`${key}:${blockId}`)) return false
-      seen.add(`${key}:${blockId}`)
-      total += 1
-    }
-  }
-  return total <= PORTABLE_PHASE_TOTAL_LIMIT
-}
-
-
 function isPortableTaskPolicy(value: unknown): value is { templateIds: string[] } {
   return isPlainDataRecord(value)
     && hasExactKeys(value, ['templateIds'])
@@ -437,7 +401,7 @@ function isPortableWorkspacePolicy(value: unknown): boolean {
 
 function hasPortableRuntimePolicyConflict(value: Record<string, unknown>): boolean {
   return Object.hasOwn(value, 'runtimePolicy')
-    && (Object.hasOwn(value, 'phasePolicy') || Object.hasOwn(value, 'cognitionPolicy'))
+    && Object.hasOwn(value, 'cognitionPolicy')
 }
 
 function isPortableConnectionRef(value: unknown): boolean {
@@ -500,7 +464,6 @@ function isPortableAgentConfig(value: unknown): value is PortableAgentConfigV1 {
     || !hasNoPortableAuthorityLeak(value)
     || hasPortableRuntimePolicyConflict(value)
     || Object.hasOwn(value, 'cognitionPolicy') && !isBoundedLegacyCognition(value.cognitionPolicy)
-    || Object.hasOwn(value, 'phasePolicy') && !isPortableLegacyPhasePolicy(value.phasePolicy)
     || Object.hasOwn(value, 'taskPolicy') && !isPortableTaskPolicy(value.taskPolicy)
     || Object.hasOwn(value, 'workspacePolicy') && !isPortableWorkspacePolicy(value.workspacePolicy)
     || Object.hasOwn(value, 'runtimePolicy') && !isPortableAgentRuntimePolicy(value.runtimePolicy)) return false
@@ -643,7 +606,6 @@ export function isPortableAgenticRuntimeEnvelope(value: unknown): boolean {
     if (value.agentConfig === null
       || !isPlainDataRecord(value.agentConfig)
       || Object.hasOwn(value.agentConfig, 'runtimePolicy')
-      || Object.hasOwn(value.agentConfig, 'phasePolicy')
       || Object.hasOwn(value.agentConfig, 'cognitionPolicy')) return false
     try {
       effectiveAgentConfig = {

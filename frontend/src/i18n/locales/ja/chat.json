@@ -247,7 +247,14 @@
       "repairAcknowledgementRequired": "確認が必要",
       "repairAcknowledgementAcknowledged": "確認済み",
       "unavailable": "利用不可",
-      "none": "なし"
+      "none": "なし",
+      "resolutionError": {
+        "title": "ランタイムの解決に失敗しました",
+        "target": "対象: {{generationType}} · メッセージ {{messageId}} · スワイプ {{swipeId}}",
+        "none": "なし",
+        "code": "エラーコード: {{code}}",
+        "retry": "解決を再試行"
+      }
     },
     "announcement": {
       "oneTurn": "次のターンに{{mode}}を選択しました。",
@@ -267,13 +274,6 @@
     "preflight": {
       "refreshRequired": "生成開始前にランタイムが変更されました。モードを確認して再試行してください。",
       "unavailable": "エージェントモードの準備ができていません。レスポンスを使用するか、表示された修復を完了してください。"
-    },
-    "resolutionError": {
-      "title": "ランタイムの解決に失敗しました",
-      "target": "対象: {{generationType}} · メッセージ {{messageId}} · スワイプ {{swipeId}}",
-      "none": "なし",
-      "code": "エラーコード: {{code}}",
-      "retry": "解決を再試行"
     },
     "errors": {
       "not_found": "要求されたランタイム対象が見つかりません。",
@@ -1411,6 +1411,7 @@
     }
   },
   "persistentWorkspace": {
+    "label": "Persistent Workspace",
     "eyebrow": "Persistent Workspace",
     "untitled": "無題のワークスペース",
     "notAvailableTitle": "Persistent Workspace は利用不可",

@@ -344,13 +344,13 @@ export default function AgentRuntimeModeControl(props: AgentRuntimeModeControlPr
           <div className={styles.repairCopy}>
             <ShieldAlert size={16} aria-hidden="true" />
             <div className={styles.repairBody}>
-              <strong>{t('agentRuntime.resolutionError.title')}</strong>
-              <p>{t('agentRuntime.resolutionError.target', {
+              <strong>{t('agentRuntime.provenance.resolutionError.title')}</strong>
+              <p>{t('agentRuntime.provenance.resolutionError.target', {
                 generationType: props.generationType,
-                messageId: props.messageId ?? t('agentRuntime.resolutionError.none'),
-                swipeId: props.swipeId ?? t('agentRuntime.resolutionError.none'),
+                messageId: props.messageId ?? t('agentRuntime.provenance.resolutionError.none'),
+                swipeId: props.swipeId ?? t('agentRuntime.provenance.resolutionError.none'),
               })}</p>
-              <p>{t('agentRuntime.resolutionError.code', { code: resolutionError.code })}</p>
+              <p>{t('agentRuntime.provenance.resolutionError.code', { code: resolutionError.code })}</p>
               <p>{resolutionError.message}</p>
             </div>
           </div>
@@ -362,7 +362,7 @@ export default function AgentRuntimeModeControl(props: AgentRuntimeModeControlPr
               disabled={runtime.loading}
             >
               <RotateCw size={14} aria-hidden="true" />
-              <span>{t('agentRuntime.resolutionError.retry')}</span>
+              <span>{t('agentRuntime.provenance.resolutionError.retry')}</span>
             </button>
             <button type="button" className={styles.responseEscape} onClick={useResponse}>
               <MessageSquare size={14} aria-hidden="true" />
@@ -492,7 +492,7 @@ export default function AgentRuntimeModeControl(props: AgentRuntimeModeControlPr
               disabled={runtime.loading}
             >
               <RotateCw size={14} aria-hidden="true" />
-              <span>{t('agentRuntime.resolutionError.retry')}</span>
+              <span>{t('agentRuntime.provenance.resolutionError.retry')}</span>
             </button>
             {shouldShowResponseEscape && (
               <button type="button" className={styles.responseEscape} onClick={useResponse}>

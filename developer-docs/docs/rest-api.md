@@ -119,6 +119,8 @@ The response is the closed `EffectiveRuntimePublicResponseV1` projection:
   defaultMode: 'response' | 'agentic',
   requestedMode: 'response' | 'agentic',
   effectiveMode: 'response' | 'agentic',
+  inspection: LoomPromptInspectionV1,
+  responseOmission: LoomResponsePolicyOmissionV1 | null,
   runtimePolicy: LoomRuntimePolicyV1,
   chatOverride: {
     mode: 'response' | 'agentic' | null,
@@ -339,19 +341,25 @@ is `{ generationId, status: 'streaming', mode: 'agentic', phase: 'ASSEMBLE',
 responseModeAvailable: true }`. The closed `AgenticFailureCode` union is
 `agentic_unsupported_surface`, `agentic_runtime_unavailable`,
 `agentic_preflight_failed`, `decision_refresh_required`,
-`agentic_protocol_failure`, `agentic_work_exhausted`, `agentic_cancelled`,
-`agentic_timed_out`, `agentic_commit_failed`, `agentic_revision_conflict`,
+`agentic_chat_busy`, `agentic_protocol_failure`,
+`agentic_work_exhausted`, `agentic_cancelled`, `agentic_timed_out`,
+`agentic_commit_failed`, `agentic_revision_conflict`,
 `agentic_provider_failure`, and `agentic_internal_error`; the route includes
 `responseModeAvailable: true` but never switches modes.
 
 `startAgenticGeneration` returns that initial response before ASSEMBLE/WORK
 phase work begins. A synchronously thrown `AgenticGenerationError` is mapped
 by the HTTP route to `409` only for `decision_refresh_required`, `503` for
-`agentic_runtime_unavailable`, and `400` for other closed codes. After the
-initial response, WORK, RENDER, commit, cancellation, deadline, and provider
-failures settle asynchronously through the Agent Run projection and terminal
-compatibility event; they are not returned by a later generation HTTP
-response. Read their final status and error code from those authenticated
+`agentic_runtime_unavailable`, and `400` for every other closed code.
+`agentic_chat_busy` means another generation already owns the chat and is
+retryable internally, but its HTTP body remains the closed
+`{ error, code, responseModeAvailable: true }` shape and never serializes a
+`retryable` field.
+
+After the initial response, WORK, RENDER, commit, cancellation, deadline, and
+provider failures settle asynchronously through the Agent Run projection and
+terminal compatibility event; they are not returned by a later generation
+HTTP response. Read their final status and error code from those authenticated
 projection/event surfaces.
 Agentic accepts only `normal`, `continue`, `regenerate`, and `swipe` on a
 single-character, non-multiplayer, non-Council chat. `continue` requires an
@@ -366,11 +374,13 @@ Response/direct surfaces.
 
 Response-mode generation retains the existing provider message, tool
 continuation, prompt/response transform, reasoning, usage, partial Stop, and
-message persistence behavior. Agentic provider work notes, reasoning, and
-carriers are memory-only and are destroyed at settlement. The turn workspace
-retains only bounded host-controlled records and artifact metadata for its
-view-only projection; the final atomic commit is the only canonical chat
-output.
+message persistence behavior. Agentic owner inspection may retain a bounded
+WORK transcript, provider content, private child material, and tool
+arguments/results; retention does not promise raw private reasoning or opaque
+continuation carriers. Public Agent Run projections remain status-only. The
+turn workspace retains bounded host-controlled records and artifact metadata
+for its view-only projection, and the final atomic commit is the only canonical
+chat output.
 
 ## Agent Run projection and workspace routes
 

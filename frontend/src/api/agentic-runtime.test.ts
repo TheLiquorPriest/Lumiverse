@@ -469,9 +469,13 @@ describe('agentic runtime API editor projection boundary', () => {
     configCases.push(['mismatched runtime policy mode', mismatchedPolicyConfig])
 
     const duplicatePolicyConfig = validConfig()
-    duplicatePolicyConfig.phasePolicy = { work: [], render: [] }
+    duplicatePolicyConfig.cognitionPolicy = {
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
     configCases.push(['duplicate runtime policy authority', duplicatePolicyConfig])
-
 
     const cyclicTaskConfig = validConfig()
     cyclicTaskConfig.taskPolicy = { templateIds: ['task-a', 'task-b'] }

@@ -768,40 +768,35 @@ describe('Loom portable Agentic runtime adapter', () => {
       runtimePolicy: runtimePolicy(),
     })).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
   })
-  test('rejects canonical runtimePolicy alongside legacy policy fields in nested and top-level aliases', () => {
-    const legacyVariants = [
-      ['phasePolicy', { work: [], render: [] }],
-      ['cognitionPolicy', {
-        workPolicy: [],
-        workspaceUsage: [],
-        completionCriteria: [],
-        renderPolicy: [],
-      }],
-    ] as const
+  test('rejects canonical runtimePolicy alongside legacy cognition in nested and top-level aliases', () => {
+    const legacyCognitionPolicy = {
+      workPolicy: [],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
     const canonicalConfig: PortableAgentConfigV1 = {
       ...portableConfig(),
       runtimePolicy: parseAgentRuntimePolicyV1(runtimePolicy()),
     }
-    for (const [legacyKey, legacyValue] of legacyVariants) {
-      const nestedInput: unknown = {
-        ...envelope(),
-        agentConfig: {
-          ...canonicalConfig,
-          [legacyKey]: legacyValue,
-        },
-      }
-      expect(() => parsePortableAgenticRuntimeEnvelope(nestedInput)).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
-
-      const topLevelInput: unknown = {
-        ...envelope(),
-        agentConfig: {
-          ...portableConfig(),
-          [legacyKey]: legacyValue,
-        },
-        runtimePolicy: parseAgentRuntimePolicyV1(runtimePolicy()),
-      }
-      expect(() => parsePortableAgenticRuntimeEnvelope(topLevelInput)).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
+    const nestedInput: unknown = {
+      ...envelope(),
+      agentConfig: {
+        ...canonicalConfig,
+        cognitionPolicy: legacyCognitionPolicy,
+      },
     }
+    expect(() => parsePortableAgenticRuntimeEnvelope(nestedInput)).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
+
+    const topLevelInput: unknown = {
+      ...envelope(),
+      agentConfig: {
+        ...portableConfig(),
+        cognitionPolicy: legacyCognitionPolicy,
+      },
+      runtimePolicy: parseAgentRuntimePolicyV1(runtimePolicy()),
+    }
+    expect(() => parsePortableAgenticRuntimeEnvelope(topLevelInput)).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
   })
   test('preserves bounded legacy cognition only as inert repair data and accepts explicit empty graph policies', () => {
     const legacy = {

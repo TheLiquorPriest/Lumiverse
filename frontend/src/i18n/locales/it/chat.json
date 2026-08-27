@@ -247,7 +247,14 @@
       "repairAcknowledgementRequired": "Revisione richiesta",
       "repairAcknowledgementAcknowledged": "Confermata",
       "unavailable": "Non disponibile",
-      "none": "Nessuno"
+      "none": "Nessuno",
+      "resolutionError": {
+        "title": "Risoluzione del runtime non riuscita",
+        "target": "Destinazione: {{generationType}} · messaggio {{messageId}} · swipe {{swipeId}}",
+        "none": "nessuno",
+        "code": "Codice errore: {{code}}",
+        "retry": "Riprova risoluzione"
+      }
     },
     "announcement": {
       "oneTurn": "La modalità {{mode}} è selezionata per il prossimo turno.",
@@ -267,13 +274,6 @@
     "preflight": {
       "refreshRequired": "Il runtime è cambiato prima dell’avvio della generazione. Controlla la modalità e riprova.",
       "unavailable": "La modalità agentica non è pronta. Usa Risposta o completa la correzione indicata."
-    },
-    "resolutionError": {
-      "title": "Risoluzione del runtime non riuscita",
-      "target": "Destinazione: {{generationType}} · messaggio {{messageId}} · swipe {{swipeId}}",
-      "none": "nessuno",
-      "code": "Codice errore: {{code}}",
-      "retry": "Riprova risoluzione"
     },
     "errors": {
       "not_found": "La destinazione runtime richiesta non è stata trovata.",
@@ -1411,6 +1411,7 @@
     }
   },
   "persistentWorkspace": {
+    "label": "Persistent Workspace",
     "eyebrow": "Persistent Workspace",
     "untitled": "Spazio di lavoro senza titolo",
     "notAvailableTitle": "Persistent Workspace non disponibile",

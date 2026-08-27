@@ -1,7 +1,7 @@
 import type { GenerationResponse } from "../llm/types";
 import type { AgentPublicBudgetId, AgentPublicErrorCode } from "../types/agent-runtime";
 
-export const AGENT_TASK_MAX_BYTES = 32 * 1024;
+export const AGENT_CHILD_TASK_MAX_BYTES = 32 * 1024;
 export const AGENT_INITIAL_INPUT_MAX_BYTES = 256 * 1024;
 export const AGENT_RETAINED_DATA_MAX_BYTES = 256 * 1024;
 export const AGENT_SERIALIZED_VALUE_MAX_BYTES = 64 * 1024;

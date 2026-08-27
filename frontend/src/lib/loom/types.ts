@@ -250,10 +250,6 @@ export interface AgentPromptBlockRef {
   expectedPresetRevision: number
   expectedBlockRevision: number
 }
-export interface AgentPhasePolicyV1 {
-  work: AgentPromptBlockRef[]
-  render: AgentPromptBlockRef[]
-}
 
 export const AGENT_CUSTOM_PHASE_CAPABILITIES = [
   'core_retrieval',
@@ -390,7 +386,6 @@ export interface AgentConfigV2 {
   mainLoreScope: AgentLoreScope
   profiles: AgentProfileConfigV2[]
   connectionSlots: AgentConnectionSlot[]
-  phasePolicy?: AgentPhasePolicyV1
   runtimePolicy?: AgentRuntimePolicyV1
   cognitionPolicy?: AgentCognitionPolicy
   taskPolicy?: {

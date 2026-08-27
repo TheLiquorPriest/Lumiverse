@@ -26,6 +26,10 @@ mock.module('@/i18n/resources', () => ({
   fallbackLanguagesFor: (language: string) => language === 'zh-TW' ? ['zh-TW', 'zh', 'en'] : language === 'en' ? ['en'] : [language, 'en'],
   loadLanguageBundles: async () => {},
 }))
+mock.module('@/lib/cssModuleRegistry', () => ({
+  CSS_MODULE_REGISTRY: [],
+  generateSelector: () => '',
+}))
 
 const detachedWorkspace: AgentPersistentWorkspaceV1 = {
   version: 1,
@@ -251,7 +255,14 @@ const recoveredCancelledInspection: AgentRunInspectionDetailV1 = {
     authority: 'host',
     source: 'execution',
     scope: 'attempt',
-    capGate: null,
+    capGate: {
+      id: 'agent-capacity',
+      limit: 1,
+      observed: 2,
+      exceeded: true,
+      authority: 'host',
+      source: 'execution',
+    },
     target: {
       chatId: 'chat-deleted',
       generationType: 'normal',
@@ -606,8 +617,18 @@ test('uses stable deleted-chat provenance and localizes a recovered cancelled ru
     expect(errorText).toContain('Error code: cancelled')
     expect(errorText).toContain('The run was cancelled.')
     expect(errorText).toContain('User stop')
+    expect(errorText).toContain('Authority')
+    expect(errorText).toContain('Source')
+    expect(errorText).toContain('Applies to')
+    expect(errorText).toContain('Availability')
+    expect(errorText).toContain('Not ready')
     expect(errorText).not.toContain('resolutionError.title')
     expect(errorText).not.toContain('agentRun.errors.cancelled')
+    expect(errorText).not.toContain('provenance.authority')
+    expect(errorText).not.toContain('provenance.source')
+    expect(errorText).not.toContain('provenance.scope')
+    expect(errorText).not.toContain('provenance.gate')
+    expect(errorText).not.toContain('provenance.capabilityNotReady')
     expect(document.body.querySelector('[role="alert"]')).toBeDefined()
   } finally {
     if (root) {

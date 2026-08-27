@@ -41,7 +41,7 @@ export const userDataApi = {
     try {
       return normalizeUserDataExportPrepare(await post<unknown>('/user-data/export/prepare', { includeVectors, includeSecrets: true }))
     } catch (error) {
-      throw apiFailure(error, 'import_start_failed')
+      throw apiFailure(error)
     }
   },
   /** Parse ticket input exactly once before it crosses the API boundary. */

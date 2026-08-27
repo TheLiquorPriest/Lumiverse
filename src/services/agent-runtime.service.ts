@@ -37,7 +37,7 @@ import {
   AGENT_JSON_DEPTH_MAX,
   AGENT_JSON_NODE_MAX,
   AGENT_SERIALIZED_VALUE_MAX_BYTES,
-  AGENT_TASK_MAX_BYTES,
+  AGENT_CHILD_TASK_MAX_BYTES,
   AgentAccountingFailure,
   assertJsonValueBounds,
   boundedJsonValueBytes,
@@ -75,7 +75,7 @@ export {
   AGENT_INITIAL_INPUT_MAX_BYTES,
   AGENT_RETAINED_DATA_MAX_BYTES,
   AGENT_SERIALIZED_VALUE_MAX_BYTES,
-  AGENT_TASK_MAX_BYTES,
+  AGENT_CHILD_TASK_MAX_BYTES,
 } from "./agent-runtime-accounting";
 
 export const AGENT_TIMER_MAX_DELAY_MS = 2_147_483_647;
@@ -322,7 +322,7 @@ export interface AgentRunRequest {
 }
 
 export interface AgentRunOutcome {
-  status: Extract<
+  outcome: Extract<
     AgentInvocationStatus,
     "succeeded" | "failed" | "cancelled" | "timed_out"
   >;
@@ -718,7 +718,7 @@ export class AgentRuntimeOwner {
         typeof task !== "string" ||
         taskBytes === 0 ||
         task.trim().length === 0 ||
-        taskBytes > AGENT_TASK_MAX_BYTES
+        taskBytes > AGENT_CHILD_TASK_MAX_BYTES
       ) {
         throw new AgentRuntimeFailure("invalid_task");
       }
@@ -1360,11 +1360,11 @@ export class AgentRuntimeOwner {
           parentInvocationId: activity.id,
         });
         const delegatedResult: AgentToolResult =
-          outcome.status === "succeeded"
+          outcome.outcome === "succeeded"
             ? {
                 status: "success",
                 toolName: "agent_delegate",
-                data: { status: outcome.status, content: outcome.content },
+                data: { status: outcome.outcome, content: outcome.content },
               }
             : {
                 status: "error",
@@ -1682,7 +1682,7 @@ export class AgentRuntimeOwner {
       errorCode,
     );
     return {
-      status,
+      outcome: status,
       invocationId: invocation.id,
       content,
       usage: { ...invocation.usage },
@@ -2130,7 +2130,7 @@ function agentDelegateDefinition(
           type: "string",
           enum: profiles.map((profile) => profile.id),
         },
-        task: { type: "string", minLength: 1, maxLength: AGENT_TASK_MAX_BYTES },
+        task: { type: "string", minLength: 1, maxLength: AGENT_CHILD_TASK_MAX_BYTES },
         tool_ids: {
           type: "array",
           maxItems: 6,
@@ -2162,7 +2162,7 @@ function parseDelegateArgs(
   const keys = Object.keys(record);
   if (keys.some((key) => !["profile_id", "task", "tool_ids"].includes(key))) return null;
   if (typeof record.profile_id !== "string" || typeof record.task !== "string") return null;
-  if (Buffer.byteLength(record.task, "utf8") > AGENT_TASK_MAX_BYTES || !record.task) return null;
+  if (Buffer.byteLength(record.task, "utf8") > AGENT_CHILD_TASK_MAX_BYTES || !record.task) return null;
   let toolIds: CoreAgentToolId[] | undefined;
   if (record.tool_ids !== undefined) {
     if (!Array.isArray(record.tool_ids) || record.tool_ids.length > 6) return null;

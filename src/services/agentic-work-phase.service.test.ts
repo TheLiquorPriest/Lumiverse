@@ -14,6 +14,8 @@ import { inspectLoomPromptPolicies } from "./agent-cognition.service";
 import type { WorkCouncilExecutionResult } from "./work-council.service";
 import type { CognitionEvaluationContextV1, CognitionTaskTransition } from "../types/agent-cognition";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
+import { AGENT_CHILD_TASK_MAX_BYTES } from "./agent-runtime-accounting";
+import { WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES } from "./turn-workspace.service";
 import {
   AGENT_SYSTEM_PROMPT_MAX_BYTES,
   createDisabledAgentConfigV2,
@@ -1994,7 +1996,7 @@ describe("Agentic WORK phase", () => {
     });
     const oversizedTask = await executeBoundedAgenticChildFrame({
       ...shared,
-      task: "t".repeat(16 * 1024 + 1),
+      task: `${"é".repeat(AGENT_CHILD_TASK_MAX_BYTES / 2)}a`,
       systemPrompt: "system",
     });
     const malformed = await executeBoundedAgenticChildFrame({
@@ -2006,6 +2008,36 @@ describe("Agentic WORK phase", () => {
     expect(oversizedTask).toMatchObject({ status: "failed", code: "limit_exceeded" });
     expect(malformed).toMatchObject({ status: "failed", code: "invalid_input" });
     expect(dispatchCalls).toBe(0);
+  });
+
+  test("accepts exact 32 KiB ASCII and multibyte child task text", async () => {
+    let dispatchCalls = 0;
+    const run = async (task: string, index: number) => executeBoundedAgenticChildFrame({
+      frame: createAgenticChildFrame({
+        frameId: `child-task-boundary-${index}`,
+        parentFrameId: "root",
+        provider: "test-child-provider",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        signal: new AbortController().signal,
+      }),
+      task,
+      systemPrompt: "system",
+      countTokens: () => 1,
+      dispatch: async () => {
+        dispatchCalls += 1;
+        return response("done");
+      },
+    });
+    const asciiBoundary = "a".repeat(AGENT_CHILD_TASK_MAX_BYTES);
+    const multibyteBoundary = "é".repeat(AGENT_CHILD_TASK_MAX_BYTES / 2);
+
+    expect(Buffer.byteLength(asciiBoundary, "utf8")).toBe(32_768);
+    expect(Buffer.byteLength(multibyteBoundary, "utf8")).toBe(32_768);
+    expect(await run(asciiBoundary, 1)).toMatchObject({ status: "succeeded", content: "done" });
+    expect(await run(multibyteBoundary, 2)).toMatchObject({ status: "succeeded", content: "done" });
+    expect(dispatchCalls).toBe(2);
   });
 
 
@@ -2151,6 +2183,7 @@ describe("Agentic WORK phase", () => {
       parameters: {
         properties: {
           profile_id: { type: "string", enum: ["writer"] },
+          task: { type: "string", minLength: 1, maxLength: AGENT_CHILD_TASK_MAX_BYTES },
         },
       },
     });
@@ -2320,6 +2353,41 @@ describe("Agentic WORK phase", () => {
     expect(result.code).toBe("child_schedule_invalid");
     expect(result.observations).toHaveLength(1);
     expect(result.observations[0]?.code).toBe("child_schedule_invalid");
+    expect(assignments).toBe(0);
+    expect(children).toBe(0);
+  });
+
+  test("rejects a 32 KiB plus one-byte multibyte delegate task before assignment or child dispatch", async () => {
+    const oneByteOver = `${"é".repeat(AGENT_CHILD_TASK_MAX_BYTES / 2)}a`;
+    let assignments = 0;
+    let children = 0;
+    expect(Buffer.byteLength(oneByteOver, "utf8")).toBe(32_769);
+    const result = await runAgenticWorkPhase(baseOptions(async () => response("", [
+      call("agent_delegate", "delegate-task-over-limit", {
+        profile_id: "writer",
+        task_id: "task-1",
+        task: oneByteOver,
+      }),
+    ]), {
+      workspace: workspace({
+        assignChildTasks: async () => {
+          assignments += 1;
+          return { accepted: false, workspaceRevision: 0, assignments: [] };
+        },
+      }),
+      delegatableProfiles: [{ profileId: "writer", provider: "test-child-provider", connectionId: "test-child-connection", model: "test-child-model", toolIds: [], workspaceCapabilities: ["update_assigned_progress", "submit_child_result"] }],
+      executeChild: async () => {
+        children += 1;
+        return { content: "unexpected", status: "succeeded" };
+      },
+    }));
+
+    expect(result).toMatchObject({ status: "failed", code: "limit_exceeded" });
+    expect(result.observations).toContainEqual(expect.objectContaining({
+      callId: "delegate-task-over-limit",
+      status: "error",
+      code: "limit_exceeded",
+    }));
     expect(assignments).toBe(0);
     expect(children).toBe(0);
   });
@@ -2858,7 +2926,7 @@ describe("Agentic WORK phase", () => {
     expect(submissionSchema).toEqual({
       type: "object",
       properties: {
-        summary: { type: "string", minLength: 1, maxLength: 16_384 },
+        summary: { type: "string", minLength: 1, maxLength: WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES },
       },
       required: ["summary"],
       additionalProperties: false,
@@ -2878,6 +2946,89 @@ describe("Agentic WORK phase", () => {
         status: "success",
       }),
     ]);
+  });
+
+  test("validates child submission UTF-8 bytes before hashing or workspace execution", async () => {
+    let workspaceCalls = 0;
+    const runAccepted = async (summary: string, index: number) => {
+      let submittedArgs: Record<string, unknown> | undefined;
+      const frame = createAgenticChildFrame({
+        frameId: `submitted-boundary-child-${index}`,
+        parentFrameId: "root",
+        provider: "test-child-provider",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        workspaceCapabilities: ["submit_child_result"],
+        taskId: `task-boundary-${index}`,
+        signal: new AbortController().signal,
+      });
+      const result = await executeBoundedAgenticChildFrame({
+        frame,
+        task: "submit bounded result",
+        systemPrompt: "system",
+        countTokens: () => 1,
+        dispatch: async () => response("", [
+          call("workspace_submit_child_result", `submit-boundary-${index}`, { summary }),
+        ]),
+        workspace: {
+          listTaskAcceptance: async () => [],
+          execute: async (_operation, args) => {
+            workspaceCalls += 1;
+            submittedArgs = args;
+            return { result: { accepted: true, workspaceRevision: index } };
+          },
+        },
+      });
+      expect(result).toMatchObject({ status: "succeeded", content: summary });
+      expect(submittedArgs).toMatchObject({
+        summary,
+        resultDigest: createHash("sha256").update(summary, "utf8").digest("hex"),
+        byteCount: Buffer.byteLength(summary, "utf8"),
+      });
+    };
+    const asciiBoundary = "a".repeat(WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES);
+    const multibyteBoundary = "é".repeat(WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES / 2);
+    const oneByteOver = `${multibyteBoundary}a`;
+
+    expect(Buffer.byteLength(oneByteOver, "utf8")).toBe(32_769);
+    await runAccepted(asciiBoundary, 1);
+    await runAccepted(multibyteBoundary, 2);
+
+    const rejectedFrame = createAgenticChildFrame({
+      frameId: "submitted-boundary-child-rejected",
+      parentFrameId: "root",
+      provider: "test-child-provider",
+      connectionId: "concrete-connection",
+      model: "frozen-model",
+      coreToolIds: [],
+      workspaceCapabilities: ["submit_child_result"],
+      taskId: "task-boundary-rejected",
+      signal: new AbortController().signal,
+    });
+    const rejected = await executeBoundedAgenticChildFrame({
+      frame: rejectedFrame,
+      task: "reject oversized result",
+      systemPrompt: "system",
+      countTokens: () => 1,
+      budget: { maxProviderRounds: 1 },
+      dispatch: async () => response("", [
+        call("workspace_submit_child_result", "submit-boundary-rejected", { summary: oneByteOver }),
+      ]),
+      workspace: {
+        listTaskAcceptance: async () => [],
+        execute: async () => {
+          workspaceCalls += 1;
+          return { result: { accepted: true, workspaceRevision: 3 } };
+        },
+      },
+    });
+    expect(rejected.observations).toContainEqual(expect.objectContaining({
+      callId: "submit-boundary-rejected",
+      status: "error",
+      code: "limit_exceeded",
+    }));
+    expect(workspaceCalls).toBe(2);
   });
   test("rejects an accepted workspace with an unclosed projection before reporting completion", async () => {
     let round = 0;

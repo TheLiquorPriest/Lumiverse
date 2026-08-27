@@ -241,9 +241,10 @@ unbounded allocation.
     commit fence. The one-use tombstone commits atomically with the secret
     rows, canonical graph, and receipt; a decrypt error, cancellation,
     filesystem failure, database rollback, or process crash before that
-    transaction leaves the ticket reusable. Once the receipt commits, the
-    tombstone is never rolled back, and a later attempt must use a fresh
-    key-bearing export.
+    transaction leaves the ticket reusable. Once the receipt commits, that
+    destination account rejects replay permanently. Another destination does
+    not share the tombstone and may accept the same archive/ticket pair before
+    the ticket expires.
 
 !!! warning "A merge can restore deleted content"
     Importing an older archive may add back characters, chats, presets, or
