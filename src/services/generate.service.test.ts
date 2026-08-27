@@ -1541,6 +1541,45 @@ describe.serial("root generation usage accounting", () => {
       generation_type: "normal",
     });
   }
+  test("includes the exact resolved provider in ordinary started and in-progress events", async () => {
+    const fixture = await createFixture("inactive_success");
+    const started = Promise.withResolvers<Record<string, any>>();
+    const inProgress = Promise.withResolvers<Record<string, any>>();
+    const terminal = Promise.withResolvers<Record<string, any>>();
+    const unsubscribers = [
+      eventBus.on(EventType.GENERATION_STARTED, (event) => {
+        if (event.payload?.chatId === fixture.chat.id) started.resolve(event.payload);
+      }),
+      eventBus.on(EventType.GENERATION_IN_PROGRESS, (event) => {
+        if (event.payload?.chatId === fixture.chat.id) inProgress.resolve(event.payload);
+      }),
+      eventBus.on(EventType.GENERATION_ENDED, (event) => {
+        if (event.payload?.chatId === fixture.chat.id) terminal.resolve(event.payload);
+      }),
+    ];
+
+    try {
+      const response = await startFixture(fixture);
+      const [startedPayload, inProgressPayload, terminalPayload] =
+        await Promise.all([started.promise, inProgress.promise, terminal.promise]);
+
+      expect(startedPayload).toMatchObject({
+        generationId: response.generationId,
+        chatId: fixture.chat.id,
+        provider: fixture.connection.provider,
+        model: fixture.connection.model,
+      });
+      expect(inProgressPayload).toMatchObject({
+        generationId: response.generationId,
+        chatId: fixture.chat.id,
+        provider: fixture.connection.provider,
+        model: fixture.connection.model,
+      });
+      expect(terminalPayload.generationId).toBe(response.generationId);
+    } finally {
+      for (const unsubscribe of unsubscribers) unsubscribe();
+    }
+  });
   test("keeps ordinary Response context and emits typed Loom omission evidence", async () => {
     const fixture = await createFixture("response_loom");
     const omittedEntryIds = Array.from(

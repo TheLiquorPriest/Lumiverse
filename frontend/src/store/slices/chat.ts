@@ -1165,6 +1165,13 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
     },
 
     setStreamingError: (error) => {
+      if (error === null) {
+        set({
+          streamingError: null,
+          lastGenerationTerminalStatus: null,
+        })
+        return
+      }
       const id = get().activeGenerationId
       if (id) endedGenerationIds.add(id)
       cancelStreamFlush()

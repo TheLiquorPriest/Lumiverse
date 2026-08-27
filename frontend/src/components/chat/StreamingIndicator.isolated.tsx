@@ -152,6 +152,54 @@ describe('StreamingIndicator', () => {
     expect(deriveStreamingStatus(input({ isStreaming: false, streamingError: 'provider failed' }))).toBe('error')
     expect(deriveStreamingStatus(input({ isStreaming: false, terminalStatus: 'stopped' }))).toBe('stopped')
   })
+  test('clears a deferred-send error without projecting failure or tearing down the active lifecycle', async () => {
+    setStore({
+      streamingError: 'stale failure',
+      lastGenerationTerminalStatus: 'error',
+      lastGenerationProvider: 'Deepseek',
+      lastGenerationModel: 'deepseek-v4-flash',
+      streamingContent: 'partial',
+      streamingReasoning: 'reasoning',
+    })
+
+    useStore.getState().setStreamingError(null)
+
+    const cleared = useStore.getState()
+    expect(cleared.streamingError).toBeNull()
+    expect(cleared.lastGenerationTerminalStatus).toBeNull()
+    expect(cleared.isStreaming).toBe(true)
+    expect(cleared.activeGenerationId).toBe(generationId)
+    expect(cleared.lastGenerationProvider).toBe('Deepseek')
+    expect(cleared.lastGenerationModel).toBe('deepseek-v4-flash')
+    expect(cleared.streamingContent).toBe('partial')
+    expect(cleared.streamingReasoning).toBe('reasoning')
+
+    await renderIndicator()
+    const activeIndicator = host?.querySelector('[role="status"]')
+    expect(activeIndicator?.getAttribute('data-generation-status')).not.toBe('error')
+    expect(activeIndicator?.textContent).not.toContain('Generation failed')
+
+    useStore.getState().setStreamingError('Provider timed out')
+    const failed = useStore.getState()
+    expect(failed.streamingError).toBe('Provider timed out')
+    expect(failed.lastGenerationTerminalStatus).toBe('error')
+    expect(failed.isStreaming).toBe(false)
+    expect(failed.activeGenerationId).toBeNull()
+  })
+
+  test('shows recovered provider identity when in-progress arrives without a started chat head', async () => {
+    setStore({
+      chatHeads: [],
+      lastGenerationProvider: 'deepseek',
+      lastGenerationModel: 'deepseek-v4-flash',
+      streamingContent: 'partial',
+    })
+
+    await renderIndicator()
+    const indicator = host?.querySelector('[role="status"]')
+    expect(indicator?.getAttribute('data-generation-status')).toBe('streaming')
+    expect(indicator?.textContent).toContain('Provider deepseek · model deepseek-v4-flash')
+  })
 
   test('shows Council waiting operation and provider metadata', async () => {
     setStore({

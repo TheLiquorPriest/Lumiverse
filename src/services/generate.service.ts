@@ -3818,6 +3818,7 @@ async function startResponseGeneration(
         generationId,
         chatId: input.chat_id,
         model: connection.model,
+        provider: connection.provider,
         targetMessageId: lifecycle.targetMessageId,
         targetSwipeId,
         characterId: targetCharId,
@@ -4718,6 +4719,7 @@ async function startResponseGeneration(
         await runGeneration(
           generationId,
           provider,
+          connection.provider,
           apiKey,
           apiUrl,
           connection.model,
@@ -5210,6 +5212,7 @@ export async function dryRunGeneration(
 async function runGeneration(
   generationId: string,
   provider: import("../llm/provider").LlmProvider,
+  providerId: string,
   apiKey: string,
   apiUrl: string,
   model: string,
@@ -5331,6 +5334,7 @@ async function runGeneration(
       generationId,
       chatId,
       model,
+      provider: providerId,
       targetMessageId: lifecycle.targetMessageId,
       targetSwipeId: lifecycle.streamingSwipeId,
       characterId: lifecycle.targetCharacterId,
