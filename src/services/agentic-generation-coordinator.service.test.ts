@@ -38,7 +38,7 @@ import {
 import { getIsolateHealthEpoch, probeIsolateBackendsAtStartup } from "./isolate-pool";
 import { AGENT_RUNTIME_ADMISSION_MANAGER } from "./agent-runtime-admission";
 import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
-import { createPoolEntry, getPoolEntry, removePoolEntry } from "./generation-pool.service";
+import { appendPoolContent, createPoolEntry, getPoolEntry, removePoolEntry } from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { waitForAgenticGeneration } from "./agentic-generation.service";
@@ -590,6 +590,8 @@ function seedTargetMessage(id: string, chatId: string, revision: number): void {
   ).run(id, chatId, "Coordinator", "target", now, JSON.stringify(["target"]), JSON.stringify([now]), now, revision);
 }
 function seedCommittedExecution(id: string, chatId = AGENTIC_CHAT_ID): void {
+  const messageId = "message:" + id;
+  seedTargetMessage(messageId, chatId, 0);
   const created = createTurnExecution({
     id,
     userId: USER_ID,
@@ -617,8 +619,8 @@ function seedCommittedExecution(id: string, chatId = AGENTIC_CHAT_ID): void {
     executionId: id,
     ownerToken: created.ownerToken,
     receiptId: `receipt:${id}`,
-    messageId: null,
-    swipeId: null,
+    messageId,
+    swipeId: 0,
     summary: { source: "coordinator-test" },
   });
 }
@@ -2363,6 +2365,226 @@ describe("production agentic coordinator installation", () => {
     );
     expect(recoveredChronology.at(-1)?.id).toBe(commitMilestoneId);
   });
+  test("COMMITTED continued swipe emits the exact durable content after its projection", async () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    const executionId = "exec-terminal-continue-" + Date.now();
+    const messageId = "message-terminal-continue-" + Date.now();
+    const prefix = "durable continued prefix";
+    const provisionalSuffix = " prepared suffix";
+    const committedContent = prefix + provisionalSuffix;
+    seedTargetMessage(messageId, AGENTIC_CHAT_ID, ADMITTED_TARGET_REVISION);
+    const now = Date.now();
+    db.query(
+      "UPDATE messages SET content = ?, swipe_id = 1, swipes = ?, swipe_dates = ? WHERE id = ? AND chat_id = ?",
+    ).run(
+      prefix,
+      JSON.stringify(["untouched alternative", prefix]),
+      JSON.stringify([now, now]),
+      messageId,
+      AGENTIC_CHAT_ID,
+    );
+    const target = {
+      generationType: "continue" as const,
+      messageId,
+      swipeId: 1,
+      revision: ADMITTED_TARGET_REVISION,
+    };
+    const created = createTurnExecution({
+      id: executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      generationId: executionId,
+      target: {
+        kind: "continue",
+        messageId,
+        swipeId: 1,
+        messageIndex: 0,
+        swipeCount: 2,
+        chatGenerationRevision: ADMITTED_TARGET_REVISION,
+        messageGenerationRevision: ADMITTED_TARGET_REVISION,
+      },
+      mode: "agentic",
+      runtimeEpoch: 1,
+      deadlineAt: Date.now() + 60_000,
+      workspaceId: "workspace:" + executionId,
+      rootLedger: {},
+      frameCapabilities: {},
+    });
+    const execution = created.execution;
+    const ownerToken = created.ownerToken;
+    createPoolEntry({
+      generationId: executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      generationType: "continue",
+      characterName: "Coordinator",
+      model: "scripted-model",
+      targetMessageId: messageId,
+      targetSwipeId: 1,
+    });
+    appendPoolContent(executionId, provisionalSuffix);
+    let currentPhase = execution.phase;
+    for (const nextPhase of ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING"] as const) {
+      currentPhase = transitionTurnExecution({
+        executionId,
+        ownerToken,
+        expectedPhase: currentPhase,
+        nextPhase,
+        ignoreCancellation: true,
+      }).execution.phase;
+    }
+    db.query(
+      "UPDATE messages SET content = ?, swipe_id = 1, swipes = ?, generation_revision = generation_revision + 1 WHERE id = ? AND chat_id = ?",
+    ).run(
+      committedContent,
+      JSON.stringify(["untouched alternative", committedContent]),
+      messageId,
+      AGENTIC_CHAT_ID,
+    );
+    finalizeTurnCommit({
+      executionId,
+      ownerToken,
+      receiptId: "receipt:" + executionId,
+      messageId,
+      swipeId: 1,
+      summary: { source: "continued-swipe-terminal-test" },
+    });
+
+    const order: string[] = [];
+    const ended = Promise.withResolvers<Record<string, unknown>>();
+    const removeProjection = eventBus.onInternal(EventType.AGENT_RUN_CHANGED, (event) => {
+      const payload = event.payload as { readonly run?: { readonly turnId?: unknown } } | undefined;
+      if (payload?.run?.turnId === executionId) order.push("projection");
+    });
+    const removeTerminal = eventBus.on(EventType.GENERATION_ENDED, (event) => {
+      const payload = event.payload as Record<string, unknown> | undefined;
+      if (payload?.generationId !== executionId) return;
+      order.push("terminal");
+      ended.resolve(payload);
+    });
+    const timeout = setTimeout(() => ended.reject(new Error("continued-swipe terminal event missing")), 2_000);
+    try {
+      deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "completed",
+        phase: "COMMITTED",
+        target,
+      });
+      const payload = await ended.promise;
+      expect(payload).toMatchObject({
+        generationId: executionId,
+        chatId: AGENTIC_CHAT_ID,
+        messageId,
+        targetMessageId: messageId,
+        targetSwipeId: 1,
+        content: committedContent,
+        phase: "COMMITTED",
+        status: "COMMITTED",
+      });
+      expect(payload.content).not.toBe(provisionalSuffix);
+      expect(order).toEqual(["projection", "terminal"]);
+      expect(getPoolEntry(executionId)).toMatchObject({
+        status: "completed",
+        content: provisionalSuffix,
+        completedMessageId: messageId,
+        targetMessageId: messageId,
+        targetSwipeId: 1,
+      });
+      const durable = db.query(
+        "SELECT content, swipe_id, swipes FROM messages WHERE id = ? AND chat_id = ?",
+      ).get(messageId, AGENTIC_CHAT_ID) as { content: string; swipe_id: number; swipes: string } | null;
+      expect(durable).not.toBeNull();
+      expect(durable?.content).toBe(committedContent);
+      expect(durable?.swipe_id).toBe(1);
+      expect(JSON.parse(durable?.swipes ?? "[]")).toEqual(["untouched alternative", committedContent]);
+    } finally {
+      clearTimeout(timeout);
+      removeProjection();
+      removeTerminal();
+      deps.cleanup!({ execution, phase: "COMMITTED", status: "completed" } as never);
+      removePoolEntry(executionId);
+    }
+  });
+  test("COMMITTED terminal fails closed when the receipt swipe cannot resolve", () => {
+    const deps = __testing.buildDependencies();
+    const executionId = "exec-terminal-invalid-swipe-" + Date.now();
+    const messageId = "message-terminal-invalid-swipe-" + Date.now();
+    seedTargetMessage(messageId, AGENTIC_CHAT_ID, ADMITTED_TARGET_REVISION);
+    const created = createTurnExecution({
+      id: executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      generationId: executionId,
+      target: {
+        kind: "continue",
+        messageId,
+        swipeId: 9,
+        messageIndex: 0,
+        swipeCount: 10,
+        chatGenerationRevision: ADMITTED_TARGET_REVISION,
+        messageGenerationRevision: ADMITTED_TARGET_REVISION,
+      },
+      mode: "agentic",
+      runtimeEpoch: 1,
+      deadlineAt: Date.now() + 60_000,
+      workspaceId: "workspace:" + executionId,
+      rootLedger: {},
+      frameCapabilities: {},
+    });
+    let current = created.execution;
+    for (const nextPhase of ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING"] as const) {
+      current = transitionTurnExecution({
+        executionId,
+        ownerToken: created.ownerToken,
+        expectedPhase: current.phase,
+        nextPhase,
+        ignoreCancellation: true,
+      }).execution;
+    }
+    finalizeTurnCommit({
+      executionId,
+      ownerToken: created.ownerToken,
+      receiptId: "receipt:" + executionId,
+      messageId,
+      swipeId: 9,
+      summary: { source: "invalid-terminal-swipe-test" },
+    });
+    createPoolEntry({
+      generationId: executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      generationType: "continue",
+      characterName: "Coordinator",
+      model: "scripted-model",
+      targetMessageId: messageId,
+      targetSwipeId: 9,
+    });
+    appendPoolContent(executionId, "provisional content must not be committed");
+    const ended: string[] = [];
+    const removeEnded = eventBus.on(EventType.GENERATION_ENDED, (event) => {
+      const payload = event.payload as { readonly generationId?: unknown } | undefined;
+      if (payload?.generationId === executionId) ended.push(executionId);
+    });
+    try {
+      expect(() => deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "completed",
+        phase: "COMMITTED",
+        target: { generationType: "continue", messageId, swipeId: 9 },
+      })).toThrow("committed_terminal_message_integrity_failed");
+      expect(ended).toEqual([]);
+      expect(getPoolEntry(executionId)?.content).toBe("provisional content must not be committed");
+      expect(getPoolEntry(executionId)?.status).not.toBe("completed");
+    } finally {
+      removeEnded();
+      removePoolEntry(executionId);
+    }
+  });
   test("freezes custom phase instruction sources and rejects ambiguous prompt block IDs", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
@@ -3566,6 +3788,7 @@ describe("production agentic coordinator installation", () => {
       });
       return settled.promise;
     };
+    seedCommittedExecution("exec-committed-success");
     const completed = waitForEnded("exec-committed-success");
     deps.publishTerminal!({
       executionId: "exec-committed-success",
@@ -3574,13 +3797,14 @@ describe("production agentic coordinator installation", () => {
       status: "completed",
       phase: "COMMITTED",
       target: { generationType: "normal" },
-      receipt: { receiptId: "receipt-committed-success" },
     });
     const completedPayload = await completed;
     expect(completedPayload).not.toHaveProperty("error");
     expect(completedPayload).not.toHaveProperty("errorCode");
     expect(completedPayload.phase).toBe("COMMITTED");
     expect(completedPayload.status).toBe("COMMITTED");
+    expect(completedPayload.content).toBe("target");
+    expect(completedPayload.messageId).toBe("message:exec-committed-success");
     const completedInspection = getDb().query(
       "SELECT outcome, reason, terminal FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
     ).get(USER_ID, "exec-committed-success") as {
@@ -3594,6 +3818,15 @@ describe("production agentic coordinator installation", () => {
       terminal: 1,
     });
 
+    createPoolEntry({
+      generationId: "exec-committed-failed",
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      generationType: "normal",
+      characterName: "Coordinator",
+      model: "scripted-model",
+    });
+    appendPoolContent("exec-committed-failed", "provisional failure output");
     const failed = waitForEnded("exec-committed-failed");
     deps.publishTerminal!({
       executionId: "exec-committed-failed",
@@ -3609,6 +3842,8 @@ describe("production agentic coordinator installation", () => {
     expect(failedPayload.errorCode).toBe("provider_request_error");
     expect(failedPayload.error).toBe("WORK: provider_request_error: upstream refused");
     expect(failedPayload.phase).toBe("WORK");
+    expect(failedPayload.content).toBe("provisional failure output");
+    removePoolEntry("exec-committed-failed");
   });
 
   test("terminal inspection and projection are emitted before GENERATION_ENDED", async () => {
@@ -3894,12 +4129,14 @@ describe("production agentic coordinator installation", () => {
         ignoreCancellation: true,
       }).execution.phase;
     }
+    const committedMessageId = "message:" + executionId;
+    seedTargetMessage(committedMessageId, AGENTIC_CHAT_ID, 0);
     finalizeTurnCommit({
       executionId,
       ownerToken,
       receiptId: `receipt:${executionId}`,
-      messageId: null,
-      swipeId: null,
+      messageId: committedMessageId,
+      swipeId: 0,
       summary: { source: "coordinator-test" },
     });
     const trigger = `agentic_terminal_inspection_failure_${Date.now()}`;

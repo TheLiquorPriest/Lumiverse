@@ -15,6 +15,7 @@ import { buildActivePersonaLorebook } from '@/lib/personaLorebook'
 import { EventType } from './events'
 import { useStore } from '@/store'
 import { shouldSyncExtensionsAfterConnected } from './connected-extension-sync'
+import { resolveGenerationPhaseRoute } from './generation-phase-routing'
 import {
   createProviderRegistryProjection,
   FRONTEND_PROVIDER_SCOPE,
@@ -1016,19 +1017,22 @@ export function useWebSocket() {
 
       wsClient.on(EventType.GENERATION_PHASE_CHANGED, (payload: GenerationPhaseChangedPayload) => {
         const state = store.getState()
+        const route = resolveGenerationPhaseRoute(payload, state)
         if (payload.agentLifecycle) {
-          state.setGenerationProviderMetadata({
-            ...(payload.provider ? { provider: payload.provider } : {}),
-            ...(payload.connectionLabel ? { connectionLabel: payload.connectionLabel } : {}),
-            ...(payload.model ? { model: payload.model } : {}),
-          })
-          if (payload.generationId) {
+          if (route.activeMetadata) {
+            state.setGenerationProviderMetadata({
+              ...(payload.provider ? { provider: payload.provider } : {}),
+              ...(payload.connectionLabel ? { connectionLabel: payload.connectionLabel } : {}),
+              ...(payload.model ? { model: payload.model } : {}),
+            })
+          }
+          if (route.chatHead) {
             const status = payload.agentLifecycle === 'error'
               ? 'error'
               : payload.agentLifecycle === 'cancelled'
                 ? 'stopped'
                 : 'waiting'
-            state.updateChatHead(payload.generationId, {
+            state.updateChatHead(route.chatHead.generationId, {
               status,
               ...(payload.agentOperation ? { agentOperation: payload.agentOperation } : {}),
               agentLifecycle: payload.agentLifecycle,
@@ -1039,11 +1043,8 @@ export function useWebSocket() {
           }
           return
         }
-        if (payload.generationId) {
-          const head = state.chatHeads.find((h) => h.generationId === payload.generationId)
-          if (head && head.status !== payload.phase) {
-            state.updateChatHead(payload.generationId, { status: payload.phase })
-          }
+        if (route.chatHead && route.chatHead.status !== payload.phase) {
+          state.updateChatHead(route.chatHead.generationId, { status: payload.phase })
         }
       }),
 

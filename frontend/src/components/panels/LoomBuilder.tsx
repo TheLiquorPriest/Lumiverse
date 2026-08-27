@@ -108,7 +108,10 @@ import { Button } from '@/components/shared/FormComponents'
 import { toast } from '@/lib/toast'
 import { useLongPress } from '@/hooks/useLongPress'
 import { markLoomRuntimeProfileContext } from '@/lib/loom/runtimeProfile'
-import { registerActiveLoomPresetSelectionBlocker } from '@/lib/loom/preset-selection-coordinator'
+import {
+  registerActiveLoomPresetSelectionBlocker,
+  type ActiveLoomPresetSelectionBlockerRegistration,
+} from '@/lib/loom/preset-selection-coordinator'
 import SpindlePresetEditorTabContent from '@/components/spindle/SpindlePresetEditorTabContent'
 import SpindlePresetEditorToolbarItem from '@/components/spindle/SpindlePresetEditorToolbarItem'
 import { applyPresetEditorDraft, toPresetEditorDraft } from '@/lib/spindle/preset-editor-adapter'
@@ -2399,6 +2402,11 @@ function LoomBuilderNative({
   const [activePresetEditorTab, setActivePresetEditorTab] = useState('preset')
   const [guideOpen, setGuideOpen] = useState(false)
   const [agenticRuntimeDirty, setAgenticRuntimeDirty] = useState(false)
+  const agenticRuntimeDirtyRef = useRef(false)
+  const blockPresetChangeForDirtyAgenticRuntimeRef = useRef<() => boolean>(() => false)
+  const presetSelectionBlockerRef = useRef<ActiveLoomPresetSelectionBlockerRegistration | null>(null)
+  const cleanPresetSelectionReleaseRef = useRef<string | null>(null)
+  const loomBuilderMountedRef = useRef(true)
   const [editingBlock, setEditingBlock] = useState<PromptBlock | null>(null)
   const [blockValidationError, setBlockValidationError] = useState<string | null>(null)
   const [promptMenuOpen, setPromptMenuOpen] = useState(false)
@@ -2545,6 +2553,7 @@ function LoomBuilderNative({
     })
     return true
   }, [addToast, agenticRuntimeDirty, lb])
+  blockPresetChangeForDirtyAgenticRuntimeRef.current = blockPresetChangeForDirtyAgenticRuntime
   const handleEditorTabChange = useCallback((tabId: string): boolean => {
     if (tabId === activePresetEditorTab) return true
     if (!outerEditorTabIds.includes(tabId)) return false
@@ -2587,12 +2596,65 @@ function LoomBuilderNative({
   }, [activePreset, handleEditorTabChange, outerEditorTabIds])
 
   useLayoutEffect(() => {
-    if (!agenticRuntimeDirty) return
-    return registerActiveLoomPresetSelectionBlocker((presetId) => (
-      presetId !== activePresetRef.current?.id
-        && blockPresetChangeForDirtyAgenticRuntime()
+    loomBuilderMountedRef.current = true
+    return () => {
+      loomBuilderMountedRef.current = false
+      cleanPresetSelectionReleaseRef.current = null
+      const blocker = presetSelectionBlockerRef.current
+      presetSelectionBlockerRef.current = null
+      blocker?.cancel()
+    }
+  }, [])
+  useLayoutEffect(() => {
+    const ownerPresetId = activePreset?.id ?? null
+    if (!agenticRuntimeDirty || !ownerPresetId) return
+    const blocker = registerActiveLoomPresetSelectionBlocker((presetId) => (
+      presetId !== ownerPresetId
+        && blockPresetChangeForDirtyAgenticRuntimeRef.current()
     ))
-  }, [agenticRuntimeDirty, blockPresetChangeForDirtyAgenticRuntime])
+    presetSelectionBlockerRef.current = blocker
+    return () => {
+      if (presetSelectionBlockerRef.current !== blocker) return
+      presetSelectionBlockerRef.current = null
+      cleanPresetSelectionReleaseRef.current = null
+      blocker.cancel()
+    }
+  }, [activePreset?.id, agenticRuntimeDirty])
+  const handleSaveAgenticRuntime = useCallback(async (
+    ...args: Parameters<typeof saveAgenticRuntime>
+  ) => {
+    const result = await saveAgenticRuntime(...args)
+    if (activePresetRef.current?.id === result.editor.presetId) {
+      cleanPresetSelectionReleaseRef.current = result.editor.presetId
+    }
+    return result
+  }, [saveAgenticRuntime])
+  const handleReloadActivePreset = useCallback(async () => {
+    const result = await reloadActivePreset()
+    if (activePresetRef.current?.id === result.editor.presetId) {
+      cleanPresetSelectionReleaseRef.current = result.editor.presetId
+    }
+    return result
+  }, [reloadActivePreset])
+  const handleAgenticRuntimeDirtyChange = useCallback((dirty: boolean) => {
+    agenticRuntimeDirtyRef.current = dirty
+    setAgenticRuntimeDirty(dirty)
+    if (dirty) return
+    const cleanPresetId = cleanPresetSelectionReleaseRef.current
+    if (!cleanPresetId) return
+    queueMicrotask(() => {
+      if (
+        !loomBuilderMountedRef.current
+        || agenticRuntimeDirtyRef.current
+        || cleanPresetSelectionReleaseRef.current !== cleanPresetId
+        || activePresetRef.current?.id !== cleanPresetId
+      ) return
+      cleanPresetSelectionReleaseRef.current = null
+      const blocker = presetSelectionBlockerRef.current
+      presetSelectionBlockerRef.current = null
+      blocker?.release()
+    })
+  }, [])
   useEffect(() => {
     if (!agenticRuntimeDirty || typeof window === 'undefined') return
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -3320,9 +3382,9 @@ function LoomBuilderNative({
           <AgenticRuntimePanel
             key={activePreset.id}
             preset={activePreset}
-            onSave={saveAgenticRuntime}
-            onReload={reloadActivePreset}
-            onDirtyChange={setAgenticRuntimeDirty}
+            onSave={handleSaveAgenticRuntime}
+            onReload={handleReloadActivePreset}
+            onDirtyChange={handleAgenticRuntimeDirtyChange}
           />
         )}
       </div>

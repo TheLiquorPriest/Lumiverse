@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
 import { create } from 'zustand'
-import type { AgentRunChangesV2, AgentRunPublicV2 } from '@/types/agent-runs'
+import type { AgentRunChangesV2, AgentRunPublicV2, AgentWorkspaceIndexPublicV2 } from '@/types/agent-runs'
 import type { AgentRunsSlice, AppStore } from '@/types/store'
 import { createAgentRunsSlice, selectActiveAgentRunForChat } from '@/store/slices/agent-runs'
-import { recoverAgentRuns as recoverAgentRunsWithDependencies } from './agent-run-recovery'
+import { loadAgentWorkspace, recoverAgentRuns as recoverAgentRunsWithDependencies } from './agent-run-recovery'
 import type { AgentRunChangesApi, AgentRunRecoveryStore } from './agent-run-recovery'
 
 type TestStore = Pick<AppStore, 'activeChatId'> & AgentRunsSlice
@@ -263,5 +263,36 @@ describe('exact agent run recovery', () => {
     const state = useStore.getState()
     expect(changesCalls).toBe(2)
     expect(selectActiveAgentRunForChat(state, 'chat-a')).toMatchObject({ turnId: 'turn-a', generationId: 'generation-a' })
+  })
+})
+
+describe('workspace index refresh', () => {
+  test('coalesces one signal but lets a newer signal start and rejects the late older response', async () => {
+    const calls: string[] = []
+    const releases: Array<(payload: AgentWorkspaceIndexPublicV2) => void> = []
+    const api = {
+      workspace: (turnId: string) => {
+        calls.push(turnId)
+        return new Promise<AgentWorkspaceIndexPublicV2>((resolve) => { releases.push(resolve) })
+      },
+    }
+
+    const first = loadAgentWorkspace('chat-a', 'turn-a', 9, 4, api, recoveryStore)
+    const duplicate = loadAgentWorkspace('chat-a', 'turn-a', 9, 4, api, recoveryStore)
+    expect(duplicate).toBe(first)
+    expect(calls).toEqual(['turn-a'])
+
+    const newer = loadAgentWorkspace('chat-a', 'turn-a', 10, 5, api, recoveryStore)
+    expect(newer).not.toBe(first)
+    expect(calls).toEqual(['turn-a', 'turn-a'])
+
+    releases[1]!({ version: 2, turnId: 'turn-a', workspaceRevision: 8, sections: [], omitted: 0 })
+    await newer
+    expect(useStore.getState().agentWorkspaceByTurn['turn-a']?.index?.workspaceRevision).toBe(8)
+
+    releases[0]!({ version: 2, turnId: 'turn-a', workspaceRevision: 7, sections: [], omitted: 0 })
+    await first
+    expect(useStore.getState().agentWorkspaceByTurn['turn-a']?.index?.workspaceRevision).toBe(8)
+    expect(useStore.getState().agentWorkspaceByTurn['turn-a']?.status).toBe('ready')
   })
 })

@@ -105,6 +105,7 @@ const HOST_CEILING_KEYS = [
 ] as const satisfies readonly (keyof AgenticRuntimeHostCeilings)[]
 const DANGEROUS_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 const UTF8_ENCODER = new TextEncoder()
+const MATCHED_EDITOR_GET_ATTEMPTS = 3
 
 type UnknownRecord = Record<string, unknown>
 
@@ -812,18 +813,46 @@ function normalizePreset(value: unknown): Preset {
   if (record.cache_revision !== undefined) {
     preset.cache_revision = nonNegativeSafeInteger(record.cache_revision, 'save result.preset.cache_revision')
   }
+  if (Object.hasOwn(record, 'agent_config')) {
+    preset.agent_config = normalizeConfig(record.agent_config, 'save result.preset.agent_config')
+  }
+  if (Object.hasOwn(record, 'agent_config_revision')) {
+    preset.agent_config_revision = nonNegativeSafeInteger(
+      record.agent_config_revision,
+      'save result.preset.agent_config_revision',
+    )
+  }
+  if (Object.hasOwn(record, 'agent_config_review')) {
+    preset.agent_config_review = normalizeReview(record.agent_config_review)
+  }
+  if (Object.hasOwn(record, 'agent_slot_bindings')) {
+    preset.agent_slot_bindings = normalizeSlotBindings(record.agent_slot_bindings)
+  }
+  if (Object.hasOwn(record, 'agent_task_templates')) {
+    preset.agent_task_templates = normalizeTaskTemplates(record.agent_task_templates)
+  }
   return preset
 }
+
+class MatchedEditorRevisionError extends Error {}
 
 function normalizeEditorResult(value: unknown): SaveAgenticRuntimeEditorResult {
   const result = asRecord(value, 'save result')
   exactKeys(result, ['preset', 'editor'], 'save result')
   requireOwn(result, 'preset', 'save result')
   requireOwn(result, 'editor', 'save result')
-  return {
-    preset: normalizePreset(result.preset),
-    editor: normalizeEditorProjection(result.editor),
+  const preset = normalizePreset(result.preset)
+  const editor = normalizeEditorProjection(result.editor)
+  if (preset.id !== editor.presetId) {
+    throw new MatchedEditorRevisionError('Invalid agentic runtime editor result: preset and editor identities do not match')
   }
+  if (preset.cache_revision === undefined || preset.cache_revision !== editor.presetRevision) {
+    throw new MatchedEditorRevisionError('Invalid agentic runtime editor result: preset and editor revisions do not match')
+  }
+  if (preset.agent_config_revision === undefined || preset.agent_config_revision !== editor.configRevision) {
+    throw new MatchedEditorRevisionError('Invalid agentic runtime editor result: preset and editor config revisions do not match')
+  }
+  return { preset, editor }
 }
 
 export interface SaveAgenticRuntimeEditorInput extends AgenticRuntimeSaveDraft {
@@ -836,6 +865,23 @@ export const agenticRuntimeApi = {
   async getEditor(presetId: string) {
     const projection = await get<unknown>(`/presets/${presetId}/agent-config`)
     return normalizeEditorProjection(projection)
+  },
+
+  async getMatchedEditor(presetId: string) {
+    let mismatch: MatchedEditorRevisionError | null = null
+    for (let attempt = 0; attempt < MATCHED_EDITOR_GET_ATTEMPTS; attempt += 1) {
+      const [preset, editor] = await Promise.all([
+        get<unknown>(`/presets/${presetId}`),
+        get<unknown>(`/presets/${presetId}/agent-config`),
+      ])
+      try {
+        return normalizeEditorResult({ preset, editor })
+      } catch (error) {
+        if (!(error instanceof MatchedEditorRevisionError)) throw error
+        mismatch = error
+      }
+    }
+    throw mismatch ?? new MatchedEditorRevisionError('Unable to load a matched agentic runtime editor result')
   },
 
   async saveEditor(presetId: string, input: SaveAgenticRuntimeEditorInput) {

@@ -412,7 +412,14 @@ function WorkspaceEntry({ entry }: { entry: AgentWorkspaceEntryPreviewV2 }) {
     </li>
   )
 }
-function WorkspaceTab({ chatId, turnId, runId, hidden }: { chatId: string; turnId: string; runId: string; hidden: boolean }) {
+function WorkspaceTab({ chatId, turnId, runId, runSequence, runRevision, hidden }: {
+  chatId: string
+  turnId: string
+  runId: string
+  runSequence: number
+  runRevision: number
+  hidden: boolean
+}) {
   const { t } = useTranslation('chat')
   const panelIdPrefix = `agent-run-${runId}`
   const workspace = useStore((state) => state.agentWorkspaceByTurn[turnId])
@@ -420,10 +427,8 @@ function WorkspaceTab({ chatId, turnId, runId, hidden }: { chatId: string; turnI
 
   useEffect(() => {
     if (hidden) return
-    if (!workspace || workspace.status === 'loading' || (workspace.status === 'idle' && !workspace.error)) {
-      void loadAgentWorkspace(chatId, turnId, agentRunsApi, useStore)
-    }
-  }, [chatId, turnId, hidden, workspace?.status])
+    void loadAgentWorkspace(chatId, turnId, runSequence, runRevision, agentRunsApi, useStore)
+  }, [chatId, turnId, runSequence, runRevision, hidden])
 
 
   useEffect(() => {
@@ -473,7 +478,7 @@ function WorkspaceTab({ chatId, turnId, runId, hidden }: { chatId: string; turnI
         <div className={styles.emptyState} role="alert">
           <CircleX aria-hidden="true" />
           <p>{t('agentRun.workspace.error')}</p>
-          <button type="button" className={styles.secondaryButton} onClick={() => void loadAgentWorkspace(chatId, turnId, agentRunsApi, useStore)}>
+          <button type="button" className={styles.secondaryButton} onClick={() => void loadAgentWorkspace(chatId, turnId, runSequence, runRevision, agentRunsApi, useStore)}>
             <RefreshCw aria-hidden="true" />{t('agentRun.workspace.retry')}
           </button>
         </div>
@@ -687,7 +692,14 @@ function AgentRunSurface({
 
         <div className={styles.surfaceBody}>
           <ActivityTree run={run} syncStatus={syncStatus} omittedEvents={omittedEvents} hidden={tab !== 'activity'} />
-          <WorkspaceTab chatId={run.chatId} turnId={run.turnId} runId={run.runId} hidden={tab !== 'workspace'} />
+          <WorkspaceTab
+            chatId={run.chatId}
+            turnId={run.turnId}
+            runId={run.runId}
+            runSequence={run.sequence}
+            runRevision={run.revision}
+            hidden={tab !== 'workspace'}
+          />
         </div>
 
         {!isTerminalRun(run) ? (
@@ -742,8 +754,11 @@ export function AgentRunActivityStrip({ chatId, messageId, swipeId }: {
   const closeSurface = useCallback(() => setOpen(false), [])
   const run = useStore((state) => {
     const candidate = selectAgentRunForTarget(state, chatId, messageId, swipeId)
-    const streamingInChat = state.isStreaming && state.activeChatId === chatId
-    if (!streamingInChat) return candidate
+    const streamingThisTarget = state.isStreaming
+      && state.activeChatId === chatId
+      && state.regeneratingMessageId === messageId
+      && (state.streamingSwipeId === null || state.streamingSwipeId === swipeId)
+    if (!streamingThisTarget) return candidate
     if (state.activeGenerationId) {
       return candidate?.generationId === state.activeGenerationId ? candidate : undefined
     }

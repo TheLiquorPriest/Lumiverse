@@ -37,10 +37,16 @@ unsub()
 |-------|---------------|-------------|
 | `GENERATION_STARTED` | `GenerationStartedPayloadDTO` | A generation has begun |
 | `STREAM_TOKEN_RECEIVED` | `StreamTokenPayloadDTO` | A token was received from the LLM |
-| `GENERATION_ENDED` | `GenerationEndedPayloadDTO` | Generation completed (success or error) |
-| `GENERATION_STOPPED` | `GenerationStoppedPayloadDTO` | User stopped the generation |
+| `GENERATION_ENDED` | `GenerationEndedPayloadDTO` | Generation completed or failed; completed content is settled, while failed content remains provisional |
+| `GENERATION_STOPPED` | `GenerationStoppedPayloadDTO` | User stopped the generation; content remains the provisional pool partial |
 
 These events have typed overloads — payloads are automatically narrowed when using `lumiverse-spindle-types`:
+
+For a successful target-backed `GENERATION_ENDED`, `content` exactly matches
+the durable generated swipe after response regex, formatting healing, and macro
+resolution. Continue completion includes the original content and configured
+postfix. Failed `GENERATION_ENDED` and `GENERATION_STOPPED` keep the
+provisional pool partial instead.
 
 ```ts
 spindle.on('STREAM_TOKEN_RECEIVED', (payload) => {

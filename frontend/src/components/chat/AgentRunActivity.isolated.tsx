@@ -17,6 +17,11 @@ let failWorkspaceSection = false
 let deferWorkspaceSection = false
 const pendingWorkspaceSections: Array<() => void> = []
 
+mock.module('@/lib/cssModuleRegistry', () => ({
+  CSS_MODULE_REGISTRY: [],
+  generateSelector: () => '',
+}))
+
 mock.module('@/api/agent-runs', () => ({
   agentRunsApi: {
     changes: async () => { throw new Error('unused_changes') },
@@ -27,7 +32,17 @@ mock.module('@/api/agent-runs', () => ({
         invalidWorkspaceIndexResponse = false
         return { version: 2, turnId, workspaceRevision: 7, sections: 'invalid', omitted: 0 }
       }
-      throw new Error('unused_workspace')
+      return {
+        version: 2,
+        turnId,
+        workspaceRevision: 7,
+        omitted: 0,
+        sections: [
+          { section: 'tasks', count: 1, revision: 7, retention: 'chat_lifetime', visibility: 'owner' },
+          { section: 'records', count: 1, revision: 7, retention: 'chat_lifetime', visibility: 'owner' },
+          { section: 'artifacts', count: 1, revision: 7, retention: 'chat_lifetime', visibility: 'owner' },
+        ],
+      }
     },
     workspaceSection: async (
       turnId: string,
@@ -611,6 +626,75 @@ describe('AgentRunActivity', () => {
       await Promise.resolve()
     })
     expect(document.querySelector('[aria-haspopup="dialog"]')).not.toBeNull()
+  })
+
+  test('keeps retained terminal activity visible while a different message streams', async () => {
+    useStore.setState({
+      isStreaming: true,
+      activeChatId: 'chat-public',
+      activeGenerationId: 'generation-current',
+      regeneratingMessageId: 'message-other',
+      streamingSwipeId: 1,
+    })
+
+    await renderActivity()
+
+    expect(document.querySelector('[data-attempt-id="attempt-public"]')).not.toBeNull()
+  })
+
+  test('keeps retained terminal activity visible while a sibling swipe streams', async () => {
+    useStore.setState({
+      isStreaming: true,
+      activeChatId: 'chat-public',
+      activeGenerationId: 'generation-current',
+      regeneratingMessageId: 'message-public',
+      streamingSwipeId: 2,
+    })
+
+    await renderActivity()
+
+    expect(document.querySelector('[data-attempt-id="attempt-public"]')).not.toBeNull()
+  })
+
+  test('refreshes a visible workspace once per authoritative run signal and not on unrelated rerenders', async () => {
+    await renderActivity()
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-haspopup="dialog"]')?.click())
+    expect(workspaceRequests).toHaveLength(0)
+
+    await act(async () => {
+      findAgentRunTab('workspace')?.click()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(workspaceRequests).toEqual(['turn-public'])
+
+    await act(async () => {
+      useStore.setState({ agentRunOmittedEventsByChat: { 'chat-public': 1 } })
+      await Promise.resolve()
+    })
+    expect(workspaceRequests).toHaveLength(1)
+
+    const liveRun = { ...terminalRun(), sequence: 10, revision: 5 }
+    await act(async () => {
+      useStore.setState({ agentRunTerminalByTarget: { 'chat-public:message-public:1': liveRun } })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(workspaceRequests).toEqual(['turn-public', 'turn-public'])
+
+    const recoveredRun = { ...liveRun, revision: 6 }
+    await act(async () => {
+      useStore.setState({ agentRunTerminalByTarget: { 'chat-public:message-public:1': recoveredRun } })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(workspaceRequests).toEqual(['turn-public', 'turn-public', 'turn-public'])
+
+    await act(async () => {
+      useStore.setState({ agentRunOmittedEventsByChat: { 'chat-public': 2 } })
+      await Promise.resolve()
+    })
+    expect(workspaceRequests).toHaveLength(3)
   })
   test('terminalizes a malformed workspace index without refetching on rerender', async () => {
     invalidWorkspaceIndexResponse = true

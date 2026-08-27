@@ -40,6 +40,7 @@ import {
 import * as pool from "./generation-pool.service";
 import { buildInlineToolContinuation } from "./inline-tool-continuation";
 import * as presetsSvc from "./presets.service";
+import * as regexScriptsSvc from "./regex-scripts.service";
 import { writePresetAgentConfig } from "./agent-config-portability.service";
 import * as worldBooksSvc from "./world-books.service";
 import { assemblePrompt, projectNativeContextForChat } from "./prompt-assembly.service";
@@ -1767,6 +1768,104 @@ describe.serial("root generation usage accounting", () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
     }
   });
+
+  function installResponseSettlementScript(
+    userId: string,
+    findRegex = "ordinary",
+    replacement = "{{user}} * settled *",
+  ): void {
+    const created = regexScriptsSvc.createRegexScript(userId, {
+      name: "Response settlement transform",
+      find_regex: findRegex,
+      replace_string: replacement,
+      flags: "g",
+      placement: ["ai_output"],
+      scope: "global",
+      target: ["response"],
+      substitute_macros: "none",
+    });
+    if (typeof created === "string") throw new Error(created);
+  }
+
+  test("emits exact durable transformed content on ordinary completion", async () => {
+    const fixture = await createFixture("inactive_success");
+    installResponseSettlementScript(fixture.userId);
+    try {
+      const started = await startFixture(fixture);
+      const terminal = await waitForGenerationTerminal(started.generationId);
+      const message = chatsSvc.getMessage(
+        fixture.userId,
+        terminal.payload.messageId,
+      );
+      const settledContent = "Usage Owner *settled* answer";
+
+      expect(terminal.event).toBe(EventType.GENERATION_ENDED);
+      expect(message?.content).toBe(settledContent);
+      expect(message?.swipes[0]).toBe(settledContent);
+      expect(terminal.payload.content).toBe(message?.swipes[0]);
+      expect(pool.getPoolEntry(started.generationId)?.content).toBe(
+        "ordinary answer",
+      );
+    } finally {
+      await cleanupFixture(fixture.chat.id);
+    }
+  }, 15_000);
+
+  test("emits the exact transformed continued swipe including its durable prefix", async () => {
+    const fixture = await createFixture("inactive_success");
+    installResponseSettlementScript(fixture.userId);
+    const original = chatsSvc.createMessage(
+      fixture.chat.id,
+      {
+        is_user: false,
+        name: "Assistant",
+        content: "Settled prefix",
+      },
+      fixture.userId,
+    );
+    const continuePostfix = "\n--continue--\n";
+    const preset = presetsSvc.updatePreset(fixture.userId, fixture.preset.id, {
+      prompts: {
+        ...fixture.preset.prompts,
+        completionSettings: {
+          ...fixture.preset.prompts.completionSettings,
+          continuePostfix,
+        },
+      },
+    });
+    if (!preset) throw new Error("Expected continue preset update");
+
+    try {
+      const started = await startGeneration({
+        userId: fixture.userId,
+        userName: fixture.userName,
+        chat_id: fixture.chat.id,
+        connection_id: fixture.connection.id,
+        preset_id: preset.id,
+        force_preset_id: true,
+        generation_type: "continue",
+        message_id: original.id,
+        swipe_id: original.swipe_id,
+      });
+      const terminal = await waitForGenerationTerminal(started.generationId);
+      const message = chatsSvc.getMessage(fixture.userId, original.id);
+      const settledContent =
+        "Settled prefix\n--continue--\nUsage Owner *settled* answer";
+
+      expect(terminal.event).toBe(EventType.GENERATION_ENDED);
+      expect(terminal.payload.messageId).toBe(original.id);
+      expect(message?.swipes[original.swipe_id]).toBe(settledContent);
+      expect(message?.content).toBe(settledContent);
+      expect(terminal.payload.content).toBe(
+        message?.swipes[original.swipe_id],
+      );
+      expect(pool.getPoolEntry(started.generationId)?.content).toBe(
+        "ordinary answer",
+      );
+    } finally {
+      await cleanupFixture(fixture.chat.id);
+    }
+  }, 15_000);
   test("keeps ordinary Response context and emits typed Loom omission evidence", async () => {
     const fixture = await createFixture("response_loom");
     const omittedEntryIds = Array.from(
@@ -2267,6 +2366,11 @@ describe.serial("root generation usage accounting", () => {
 
   test("keeps feature-inactive failures on the ordinary error path", async () => {
     const fixture = await createFixture("inactive_failure");
+    installResponseSettlementScript(
+      fixture.userId,
+      "partial",
+      "durable transformed partial",
+    );
     try {
       const started = await startFixture(fixture);
       const terminal = await waitForGenerationTerminal(started.generationId);
@@ -2275,6 +2379,13 @@ describe.serial("root generation usage accounting", () => {
       expect(terminal.payload.error).toEqual(
         expect.stringContaining("Provider stream failed after usage"),
       );
+      const message = chatsSvc.getLastAssistantMessage(
+        fixture.userId,
+        fixture.chat.id,
+      );
+      expect(terminal.payload.content).toBe("partial");
+      expect(message?.content).toBe("durable transformed partial");
+      expect(pool.getPoolEntry(started.generationId)?.content).toBe("partial");
       expect(terminal.payload).not.toHaveProperty("agentActivity");
       expect(terminal.payload).not.toHaveProperty("agentError");
       expect(hasPersistedActivity(started.generationId)).toBe(false);
@@ -2668,6 +2779,7 @@ describe.serial("root generation usage accounting", () => {
 
   test("projects a stop that wins during completed-response post-processing", async () => {
     const fixture = await createFixture("finalization");
+    installResponseSettlementScript(fixture.userId, "done", "durable stopped");
     const originalReconcile = chatMacroRenderSvc.reconcileChatMessageMacros;
     const {
       promise: reconcileGate,
@@ -2718,6 +2830,7 @@ describe.serial("root generation usage accounting", () => {
       unsubscribeEnded();
 
       expect(terminal.event).toBe(EventType.GENERATION_STOPPED);
+      expect(terminal.payload.content).toBe("done");
       expect(terminal.payload.agentError).toMatchObject({
         code: "cancelled",
         category: "cancelled",
@@ -2731,6 +2844,7 @@ describe.serial("root generation usage accounting", () => {
         fixture.chat.id,
       );
       const usage = message?.extra?.usage;
+      expect(message?.content).toBe("durable stopped");
       if (!usage) throw new Error("Expected persisted generation usage");
       expect(usage.prompt_tokens).toBe(28);
       expect(usage.completion_tokens).toBeGreaterThanOrEqual(10);

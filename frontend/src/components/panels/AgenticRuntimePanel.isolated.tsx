@@ -383,6 +383,23 @@ function saveResult(
   }
 }
 
+function reloadResult(base: LoomPreset): SaveAgenticRuntimeEditorResult {
+  return {
+    preset: wirePreset(base),
+    editor: {
+      presetId: base.id,
+      presetRevision: base.cacheRevision ?? 0,
+      configRevision: base.agentConfigRevision,
+      config: structuredClone(base.agentConfig ?? createDefaultAgentConfigV2()),
+      review: structuredClone(base.agentConfigReview),
+      slotBindings: { ...base.agentSlotBindings },
+      taskTemplates: structuredClone(base.agentTaskTemplates),
+      reviewAcknowledgements: [],
+      hostCeilings,
+    },
+  }
+}
+
 
 function renderPanel(options: {
   value?: LoomPreset
@@ -391,20 +408,22 @@ function renderPanel(options: {
     promptOrder: PromptBlock[],
     expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
   ) => Promise<SaveAgenticRuntimeEditorResult>
-  onReload?: () => Promise<SaveAgenticRuntimeEditorResult | void>
+  onReload?: () => Promise<SaveAgenticRuntimeEditorResult>
   onDirtyChange?: (dirty: boolean) => void
 } = {}) {
   const container = document.createElement('div')
   document.body.append(container)
   const root = createRoot(container)
   const value = options.value ?? preset()
+  editorPresetRevision = value.cacheRevision ?? 0
+  editorConfigRevision = value.agentConfigRevision
   editorConfig = structuredClone(value.agentConfig)
   editorReview = structuredClone(value.agentConfigReview)
   flushSync(() => root.render(createElement(AgenticRuntimePanel, {
     preset: value,
     onSave: options.onSave ?? (async (draft, promptOrder) => saveResult(value, draft, promptOrder)),
     onDirtyChange: options.onDirtyChange ?? (() => {}),
-    onReload: options.onReload ?? (async () => undefined),
+    onReload: options.onReload ?? (async () => reloadResult(value)),
   })))
   mountedRoots.add(root)
   return { container, root }
@@ -582,7 +601,7 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => root.render(createElement(AgenticRuntimePanel, {
       preset: refreshed,
       onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
-      onReload: async () => undefined,
+      onReload: async () => reloadResult(refreshed),
       onDirtyChange: () => {},
     })))
     await settle()
@@ -998,7 +1017,7 @@ describe('Agentic Runtime shared editor', () => {
       },
       onReload: async () => {
         const committed = latestResult
-        if (!committed) return
+        if (!committed) throw new Error('Expected a committed editor snapshot')
         editorPresetRevision = committed.editor.presetRevision
         editorConfigRevision = committed.editor.configRevision
         editorConfig = structuredClone(committed.editor.config)
@@ -1013,9 +1032,10 @@ describe('Agentic Runtime shared editor', () => {
             latestResult = saveResult(refreshed, draft, promptOrder)
             return latestResult
           },
-          onReload: async () => undefined,
+          onReload: async () => reloadResult(refreshed),
           onDirtyChange: () => {},
         })))
+        return committed
       },
     })
     await settle()
@@ -1477,7 +1497,7 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => root.render(createElement(AgenticRuntimePanel, {
       preset: refreshed,
       onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
-      onReload: async () => undefined,
+      onReload: async () => reloadResult(refreshed),
       onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
     })))
     await settle()
@@ -1521,7 +1541,7 @@ describe('Agentic Runtime shared editor', () => {
     expect(button(container, 'save.action').disabled).toBe(true)
   })
 
-  test('keeps a dirty 404 fallback in conflict until reset or retry', async () => {
+  test('preserves a dirty 404 conflict until an exact reload is available', async () => {
     const value = preset()
     const dirtyStates: boolean[] = []
     const { container, root } = renderPanel({
@@ -1538,20 +1558,23 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => root.render(createElement(AgenticRuntimePanel, {
       preset: refreshed,
       onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
-      onReload: async () => undefined,
+      onReload: async () => reloadResult(refreshed),
       onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
     })))
     await settle()
 
-    expect(container.textContent).not.toContain('load.error')
+    expect(container.textContent).toContain('load.error')
     expect(container.textContent).toContain('save.conflict')
-    expect(container.textContent).toContain('load.retry')
+    expect(container.textContent).toContain('save.reloadLatest')
     expect(container.querySelector('[role="tab"]')).toBeNull()
-    expect(button(container, 'save.reset').disabled).toBe(false)
+    expect(button(container, 'save.reset').disabled).toBe(true)
+    expect(dirtyStates.at(-1)).toBe(true)
 
-    flushSync(() => button(container, 'save.reset').click())
+    flushSync(() => button(container, 'save.reloadLatest').click())
+    await settle()
     expect(container.querySelector('[role="tab"]')).not.toBeNull()
     expect(container.textContent).toContain('save.saved')
+    expect(container.textContent).not.toContain('load.error')
     expect(dirtyStates.at(-1)).toBe(false)
   })
 
@@ -1566,7 +1589,7 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => root.render(createElement(AgenticRuntimePanel, {
       preset: refreshed,
       onSave: async (draft, promptOrder) => saveResult(refreshed, draft, promptOrder),
-      onReload: async () => undefined,
+      onReload: async () => reloadResult(refreshed),
       onDirtyChange: () => {},
     })))
 
@@ -1577,22 +1600,29 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).toContain('load.error')
   })
 
-  test('retains a revision conflict after retrying into a mismatched projection', async () => {
+  test('rejects a mismatched Retry pair and keeps the editor closed', async () => {
     editorGetError = new ApiError(500, 'Internal Server Error')
     const value = preset()
-    const { container } = renderPanel({ value })
+    const { container } = renderPanel({
+      value,
+      onReload: async () => {
+        const mismatched = reloadResult(value)
+        mismatched.preset = {
+          ...mismatched.preset,
+          agent_config_revision: mismatched.editor.configRevision + 1,
+        }
+        return mismatched
+      },
+    })
     await settle()
     expect(container.textContent).toContain('load.error')
 
-    editorGetError = null
-    editorPresetRevision = (value.cacheRevision ?? 0) + 1
-    editorConfigRevision = (value.agentConfigRevision ?? 0) + 1
     flushSync(() => button(container, 'load.retry').click())
     await settle()
 
-    expect(container.querySelector('[role="tab"]')).not.toBeNull()
-    expect(container.textContent).not.toContain('load.error')
-    expect(container.textContent).toContain('save.conflict')
+    expect(container.querySelector('[role="tab"]')).toBeNull()
+    expect(container.textContent).toContain('load.error')
+    expect(container.textContent).toContain('save.reloadError')
     expect(button(container, 'save.action').disabled).toBe(true)
   })
 
@@ -1812,14 +1842,21 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.querySelector('input[value="Researcher"]')).not.toBeNull()
   })
 
-  test('no-op Reload latest after 409 stays in conflict', async () => {
+  test('rejects a mismatched Reload latest pair and stays in conflict', async () => {
     const value = preset()
     const { container } = renderPanel({
       value,
       onSave: async () => {
         throw new ApiError(409, 'Conflict')
       },
-      onReload: async () => undefined,
+      onReload: async () => {
+        const mismatched = reloadResult(value)
+        mismatched.preset = {
+          ...mismatched.preset,
+          cache_revision: mismatched.editor.presetRevision + 1,
+        }
+        return mismatched
+      },
     })
     await settle()
     flushSync(() => button(container, 'sections.agents.nav').click())
@@ -1831,42 +1868,52 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => button(container, 'save.reloadLatest').click())
     await settle()
     expect(container.textContent).not.toContain('save.reloadingLatest')
+    expect(container.textContent).toContain('save.reloadError')
     expect(container.textContent).toContain('save.conflict')
     expect(container.querySelector('input[value="Unsaved analyst"]')).not.toBeNull()
   })
 
-  test('Reload latest hydrates and clears conflict from a fresh higher server identity', async () => {
+  test('Reload latest applies one exact prompt/config pair to the next save', async () => {
     const value = preset()
-    const { container } = renderPanel({
-      value,
-      onSave: async () => {
+    const latestConfig = agentConfig()
+    latestConfig.profiles[0]!.name = 'Latest analyst'
+    const latestBlock = {
+      ...promptBlock(7),
+      name: 'Latest policy block',
+      content: 'Use the latest prompt only.',
+    }
+    const latest: LoomPreset = {
+      ...value,
+      blocks: [latestBlock],
+      agentConfig: latestConfig,
+      cacheRevision: 9,
+      agentConfigRevision: 5,
+    }
+    const saves: Array<{ draft: AgenticRuntimeSaveDraft; promptOrder: PromptBlock[] }> = []
+    let root: Root
+    const onSave = async (draft: AgenticRuntimeSaveDraft, promptOrder: PromptBlock[]) => {
+      if (saves.length === 0 && draft.config.profiles[0]?.name === 'Unsaved analyst') {
         throw new ApiError(409, 'Conflict')
-      },
-      onReload: async () => {
-        const latest = {
-          ...value,
-          cacheRevision: 9,
-          agentConfigRevision: 5,
-        }
-        editorPresetRevision = 9
-        editorConfigRevision = 5
-        editorConfig = structuredClone(latest.agentConfig)
-        return {
-          preset: wirePreset(latest),
-          editor: {
-            presetId: latest.id,
-            presetRevision: 9,
-            configRevision: 5,
-            config: latest.agentConfig,
-            review: latest.agentConfigReview,
-            slotBindings: {},
-            taskTemplates: [],
-            reviewAcknowledgements: [],
-            hostCeilings,
-          },
-        }
-      },
-    })
+      }
+      saves.push({ draft: structuredClone(draft), promptOrder: structuredClone(promptOrder) })
+      return saveResult(latest, draft, promptOrder)
+    }
+    const onReload = async () => {
+      editorPresetRevision = 9
+      editorConfigRevision = 5
+      editorConfig = structuredClone(latest.agentConfig)
+      const result = reloadResult(latest)
+      flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+        preset: latest,
+        onSave,
+        onReload: async () => reloadResult(latest),
+        onDirtyChange: () => {},
+      })))
+      return result
+    }
+    const rendered = renderPanel({ value, onSave, onReload })
+    root = rendered.root
+    const { container } = rendered
     await settle()
     flushSync(() => button(container, 'sections.agents.nav').click())
     changeInput(container.querySelector<HTMLInputElement>('input[value="Researcher"]')!, 'Unsaved analyst')
@@ -1880,7 +1927,16 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).not.toContain('save.conflict')
     expect(container.textContent).toContain('save.saved')
     expect(container.querySelector('input[value="Unsaved analyst"]')).toBeNull()
-    expect(container.querySelector('input[value="Researcher"]')).not.toBeNull()
+    const latestName = container.querySelector<HTMLInputElement>('input[value="Latest analyst"]')
+    expect(latestName).not.toBeNull()
+
+    changeInput(latestName!, 'Post reload edit')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+    expect(saves).toHaveLength(1)
+    expect(saves[0]?.draft.config.profiles[0]?.name).toBe('Post reload edit')
+    expect(saves[0]?.promptOrder).toHaveLength(1)
+    expect(saves[0]?.promptOrder[0]).toMatchObject(latestBlock)
   })
 
   test('failed reload latest leaves an actionable error and stays in conflict', async () => {
@@ -1935,7 +1991,7 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => root.render(createElement(AgenticRuntimePanel, {
       preset: next,
       onSave: async (draft, promptOrder) => saveResult(next, draft, promptOrder),
-      onReload: async () => undefined,
+      onReload: async () => reloadResult(next),
       onDirtyChange: () => {},
     })))
     await settle()

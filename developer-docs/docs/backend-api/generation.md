@@ -1403,7 +1403,7 @@ observer.generationId  // active generation ID, or null if idle
 | `generationId` | `string` | Generation ID |
 | `chatId` | `string` | Chat ID |
 | `messageId` | `string` | ID of the saved message (absent on error) |
-| `content` | `string` | Final generated content (absent on error) |
+| `content` | `string` | On success, the final settled content. For a saved target this exactly matches its generated swipe after response regex, formatting healing, and macro resolution; a continue includes the original content and continue postfix. On failure, this is the provisional accumulated stream content. |
 | `error` | `string` | Error message (absent on success) |
 
 ### GenerationStoppedPayloadDTO
@@ -1412,7 +1412,11 @@ observer.generationId  // active generation ID, or null if idle
 |---|---|---|
 | `generationId` | `string` | Generation ID |
 | `chatId` | `string` | Chat ID |
-| `content` | `string` | Partial content accumulated before the stop |
+| `content` | `string` | Provisional stream content accumulated before the stop; it is not a post-processed durable-content snapshot. |
+On successful completion, use `result.content` as the authoritative settled
+value. The observer's token accumulator can differ when response transforms run.
+Failed and stopped terminal payloads intentionally retain the provisional pool
+partial instead.
 
 ### Raw event subscription
 

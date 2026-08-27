@@ -65,25 +65,33 @@ function savedPreset(): Preset {
     prompt_order: [],
     prompts: {},
     metadata: {},
+    agent_config: validConfig(),
+    agent_config_revision: 5,
+    agent_config_review: null,
+    agent_slot_bindings: { writer: 'connection-1' },
+    agent_task_templates: [],
     created_at: 1,
     updated_at: 1,
-    cache_revision: 9,
+    cache_revision: 8,
   }
 }
 
-function installApiFixture(editor: unknown = editorProjection()): void {
+function installApiFixture(
+  editor: unknown = editorProjection(),
+  preset: Preset = savedPreset(),
+): void {
   globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
     requests.push({ url, init })
     const path = url.pathname.replace('/api/v1', '')
     if (path === '/presets/preset-1/agent-config' && init?.method === 'PUT') {
-      return json({
-        preset: savedPreset(),
-        editor: editorProjection(),
-      })
+      return json({ preset, editor })
     }
     if (path === '/presets/preset-1/agent-config' && (init?.method === undefined || init?.method === 'GET')) {
       return json(editor)
+    }
+    if (path === '/presets/preset-1' && (init?.method === undefined || init?.method === 'GET')) {
+      return json(preset)
     }
     throw new Error(`Unexpected request: ${init?.method ?? 'GET'} ${url}`)
   }) as unknown as typeof fetch
@@ -260,6 +268,71 @@ describe('agentic runtime API save boundary', () => {
       expect(draft.quarantinedProfiles).toEqual(quarantinedState.quarantinedProfiles)
       expect(draft.quarantinedConnectionSlots).toEqual(quarantinedState.quarantinedConnectionSlots)
     }
+  })
+})
+describe('agentic runtime API matched editor boundary', () => {
+  test('returns only an exact pair and preserves every preset agent field', async () => {
+    const result = await agenticRuntimeApi.getMatchedEditor('preset-1')
+
+    expect(result.preset.id).toBe(result.editor.presetId)
+    expect(result.preset.cache_revision).toBe(result.editor.presetRevision)
+    expect(result.preset.agent_config_revision).toBe(result.editor.configRevision)
+    expect(result.preset.agent_config).toEqual(validConfig())
+    expect(result.preset.agent_config_review).toBeNull()
+    expect(result.preset.agent_slot_bindings).toEqual({ writer: 'connection-1' })
+    expect(result.preset.agent_task_templates).toEqual([])
+  })
+
+  test('retries a racing GET only until preset and editor revisions match', async () => {
+    const firstPreset = savedPreset()
+    const latestPreset = { ...savedPreset(), cache_revision: 9 }
+    const latestEditor = { ...editorProjection(), presetRevision: 9 }
+    let presetReads = 0
+    let editorReads = 0
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost')
+      requests.push({ url, init })
+      const path = url.pathname.replace('/api/v1', '')
+      if (path === '/presets/preset-1') {
+        presetReads += 1
+        return json(presetReads === 1 ? firstPreset : latestPreset)
+      }
+      if (path === '/presets/preset-1/agent-config') {
+        editorReads += 1
+        return json(latestEditor)
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    }) as unknown as typeof fetch
+
+    const result = await agenticRuntimeApi.getMatchedEditor('preset-1')
+
+    expect(result.preset.cache_revision).toBe(9)
+    expect(result.editor.presetRevision).toBe(9)
+    expect(presetReads).toBe(2)
+    expect(editorReads).toBe(2)
+  })
+
+  test('fails closed after the bounded attempts when no exact pair exists', async () => {
+    installApiFixture(
+      { ...editorProjection(), presetRevision: 9 },
+      savedPreset(),
+    )
+
+    await expect(agenticRuntimeApi.getMatchedEditor('preset-1')).rejects.toThrow('revisions do not match')
+    expect(requests.filter((request) => request.url.pathname.endsWith('/presets/preset-1')).length).toBe(3)
+    expect(requests.filter((request) => request.url.pathname.endsWith('/agent-config')).length).toBe(3)
+  })
+
+  test('rejects a mismatched save response instead of publishing either half', async () => {
+    installApiFixture(editorProjection(), { ...savedPreset(), cache_revision: 9 })
+    const draft = withAuthorityFields(createAgenticRuntimeDraft(sourcePreset(validConfig())))
+
+    await expect(agenticRuntimeApi.saveEditor('preset-1', {
+      ...draft,
+      expectedPresetRevision: 8,
+      expectedConfigRevision: 4,
+      promptOrder,
+    })).rejects.toThrow('revisions do not match')
   })
 })
 

@@ -2064,6 +2064,7 @@ class GenerationTerminalCoordinator {
   #reason: AgentTerminalReason | null = null;
   #eventEmitted = false;
   #pendingProjection: pool.PoolTerminalProjection | undefined;
+  #pendingCompletedContent: string | undefined;
   #runLoopProjectionReady = true;
   #activityPersisted = false;
   #persistedActivitySnapshot: AgentActivitySnapshotV1 | undefined;
@@ -2254,8 +2255,14 @@ class GenerationTerminalCoordinator {
     };
   }
 
-  #queuePoolProjection(projection: pool.PoolTerminalProjection): void {
+  #queuePoolProjection(
+    projection: pool.PoolTerminalProjection,
+    completedContent?: string,
+  ): void {
     const normalized = this.#normalizePoolProjection(projection);
+    if (normalized.status === "completed" && completedContent !== undefined) {
+      this.#pendingCompletedContent = completedContent;
+    }
     const previous = this.#pendingProjection;
     this.#pendingProjection = previous
       ? {
@@ -2282,13 +2289,15 @@ class GenerationTerminalCoordinator {
       return;
     }
     const projection = this.#pendingProjection;
+    const completedContent = this.#pendingCompletedContent;
     this.#pendingProjection = undefined;
+    this.#pendingCompletedContent = undefined;
     const projected = pool.projectPoolTerminal(
       this.generationId,
       projection,
     );
     if (projected || this.hasTerminalPoolProjection()) {
-      this.emitPoolProjection(projection);
+      this.emitPoolProjection(projection, completedContent);
     }
   }
 
@@ -2315,10 +2324,11 @@ class GenerationTerminalCoordinator {
   claimAndProject(
     reason: AgentTerminalReason,
     projection: pool.PoolTerminalProjection,
+    completedContent?: string,
   ): boolean {
     const claimed = this.tryTerminate(reason);
     if (!claimed && this.#reason === null) return false;
-    this.#queuePoolProjection(projection);
+    this.#queuePoolProjection(projection, completedContent);
     this.#emitPendingProjection();
     return true;
   }
@@ -2342,7 +2352,10 @@ class GenerationTerminalCoordinator {
     });
     return this.hasTerminalPoolProjection();
   }
-  emitPoolProjection(projection: pool.PoolTerminalProjection): void {
+  emitPoolProjection(
+    projection: pool.PoolTerminalProjection,
+    completedContent?: string,
+  ): void {
     if (this.#eventEmitted) return;
     this.#eventEmitted = true;
     const winningReason = this.#reason ?? "failed";
@@ -2364,7 +2377,10 @@ class GenerationTerminalCoordinator {
     );
     const agentActivity = this.#persistActivity(terminalStatus, agentError);
     const entry = pool.getPoolEntry(this.generationId);
-    const content = entry?.content ?? "";
+    const content =
+      projection.status === "completed" && completedContent !== undefined
+        ? completedContent
+        : (entry?.content ?? "");
     const chatId = entry?.chatId ?? this.#chatId;
     const userId = entry?.userId ?? this.#userId;
     const target = {
@@ -2435,9 +2451,13 @@ function claimGenerationTerminal(
   generationId: string,
   reason: AgentTerminalReason,
   projection: pool.PoolTerminalProjection,
+  completedContent?: string,
 ): boolean {
   const entry = activeGenerations.get(generationId);
-  return entry?.terminal.claimAndProject(reason, projection) ?? false;
+  return (
+    entry?.terminal.claimAndProject(reason, projection, completedContent) ??
+    false
+  );
 }
 
 // Per-chat generation lock: prevents concurrent generations (including council) in the same chat.
@@ -7404,9 +7424,10 @@ async function runGeneration(
         generationId,
         agentBudgetExhausted ? "completed_at_tool_budget" : "completed",
         {
-        status: "completed",
-        ...(messageId !== undefined ? { messageId } : {}),
+          status: "completed",
+          ...(messageId !== undefined ? { messageId } : {}),
         },
+        fullContent,
       );
 
       // Non-critical post-processing can be expensive on low-power/mobile

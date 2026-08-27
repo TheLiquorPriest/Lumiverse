@@ -4027,6 +4027,46 @@ type CoordinatorTerminalPublicationState = Readonly<{
   phase: AgenticPhase;
   outcome: RecoverablePersistentWorkspaceOutcome;
 }>;
+type CoordinatorCommittedTerminalSettlement = Readonly<{
+  messageId: string;
+  swipeId: number;
+  content: string;
+}>;
+
+/**
+ * A COMMITTED compatibility event may expose only the exact durable swipe
+ * named by its owner-scoped receipt. The render pool contains provisional
+ * output (for continue it is only the appended suffix), so it is never a
+ * committed-content authority.
+ */
+function requireCommittedTerminalSettlement(
+  event: Pick<CoordinatorTerminalEvent, "executionId" | "userId" | "chatId" | "receipt">,
+  receipt: TurnCommitReceipt | null,
+): CoordinatorCommittedTerminalSettlement {
+  const messageId = receipt?.messageId;
+  const swipeId = receipt?.swipeId;
+  if (
+    !receipt
+    || receipt.executionId !== event.executionId
+    || receipt.userId !== event.userId
+    || receipt.chatId !== event.chatId
+    || typeof messageId !== "string"
+    || messageId.length === 0
+    || typeof swipeId !== "number"
+    || !Number.isSafeInteger(swipeId)
+    || swipeId < 0
+    || event.receipt?.messageId !== undefined && event.receipt.messageId !== messageId
+    || event.receipt?.swipeId !== undefined && event.receipt.swipeId !== swipeId
+  ) {
+    throw new Error("committed_terminal_receipt_integrity_failed");
+  }
+  const message = getMessage(event.userId, messageId);
+  const content = message?.swipes[swipeId];
+  if (message?.chat_id !== event.chatId || typeof content !== "string") {
+    throw new Error("committed_terminal_message_integrity_failed");
+  }
+  return { messageId, swipeId, content };
+}
 
 /**
  * Keep terminal publication recovery on the exact same status/outcome
@@ -6231,6 +6271,9 @@ function buildDependencies(): AgenticGenerationDependencies {
         && (event.receipt !== undefined || durableReceipt !== null);
       const terminalState = coordinatorTerminalPublicationState(event, committedBoundary);
       const status = terminalState.status;
+      const committedSettlement = status === "COMMITTED"
+        ? requireCommittedTerminalSettlement(event, durableReceipt)
+        : null;
       const terminalOutcome = terminalState.outcome;
       const terminalInspection = ensureInspectionWriter(event);
       const inspectionReasonValue: AgentInspectionReasonV1 = committedBoundary && event.status !== "completed"
@@ -6243,8 +6286,14 @@ function buildDependencies(): AgenticGenerationDependencies {
       const binding = bindings.get(event.executionId);
       const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
       const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
-      const terminalMessageId = event.receipt?.messageId ?? durableReceipt?.messageId ?? null;
-      const terminalSwipeId = event.receipt?.swipeId ?? durableReceipt?.swipeId ?? null;
+      const terminalMessageId = committedSettlement?.messageId
+        ?? event.receipt?.messageId
+        ?? durableReceipt?.messageId
+        ?? null;
+      const terminalSwipeId = committedSettlement?.swipeId
+        ?? event.receipt?.swipeId
+        ?? durableReceipt?.swipeId
+        ?? null;
       const committedTargetRevisions = commitTargetRevisions.get(event.executionId);
       const terminalMessageRevision = terminalMessageId === null
         ? null
@@ -6322,8 +6371,10 @@ function buildDependencies(): AgenticGenerationDependencies {
         return appendAgentRunSnapshot(db, projection);
       });
       const messageId = terminalMessageId ?? undefined;
-      const content = pool.getPoolEntry(event.executionId)?.content ?? "";
       const completed = status === "COMMITTED";
+      const content = committedSettlement?.content
+        ?? pool.getPoolEntry(event.executionId)?.content
+        ?? "";
       const terminalPhase = terminalState.phase;
       const diagnostic = completed
         ? ""

@@ -142,35 +142,134 @@ describe('preset selection coordinator', () => {
     expect(activePresetId).toBe('preset-c')
   })
 
-  test('replays the latest bound selection after a dirty editor is saved', async () => {
+  test('keeps the original blocked request pending until its owner explicitly releases it', async () => {
     let activePresetId: string | null = 'preset-a'
-    const replayed = deferred<void>()
+    configurePresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (presetId) => { activePresetId = presetId },
+      flushPreset: async () => {},
+    })
+    const registration = registerActiveLoomPresetSelectionBlocker((presetId) => (
+      presetId !== activePresetId
+    ))
+    const request = beginActiveLoomPresetSelection()
+    const transition = request.transition('preset-b')
+    let settled: boolean | undefined
+    void transition.then((result) => { settled = result })
+
+    await Promise.resolve()
+
+    expect(settled).toBeUndefined()
+    expect(request.isCurrent()).toBe(true)
+    expect(activePresetId).toBe('preset-a')
+
+    registration.release()
+
+    expect(await transition).toBe(true)
+    expect(request.isCurrent()).toBe(false)
+    expect(activePresetId).toBe('preset-b')
+  })
+
+  test('replays only the newest blocked request in chronological order', async () => {
+    let activePresetId: string | null = 'preset-a'
+    const exposed: string[] = []
     configurePresetSelectionCoordinator({
       getActivePresetId: () => activePresetId,
       setActivePresetId: (presetId) => {
         activePresetId = presetId
-        replayed.resolve()
+        exposed.push(presetId)
       },
       flushPreset: async () => {},
     })
     const blockedTargets: Array<string | null> = []
-    const unblock = registerActiveLoomPresetSelectionBlocker((presetId) => {
+    const registration = registerActiveLoomPresetSelectionBlocker((presetId) => {
       blockedTargets.push(presetId)
-      return presetId !== activePresetId
+      return true
     })
 
-    const firstResolution = Promise.resolve('preset-b').then((presetId) => (
-      beginActiveLoomPresetSelection().transition(presetId)
-    ))
-    expect(await firstResolution).toBe(false)
-    expect(await beginActiveLoomPresetSelection().transition('preset-c')).toBe(false)
+    const staleTransition = beginActiveLoomPresetSelection().transition('preset-b')
+    const currentTransition = beginActiveLoomPresetSelection().transition('preset-c')
+
+    expect(await staleTransition).toBe(false)
+    expect(activePresetId).toBe('preset-a')
+    registration.release()
+
+    expect(await currentTransition).toBe(true)
+    expect(exposed).toEqual(['preset-c'])
+    expect(blockedTargets).toEqual(['preset-b', 'preset-c'])
+  })
+
+  test('does not let an older delayed transition displace a newer blocked request', async () => {
+    let activePresetId: string | null = 'preset-a'
+    configurePresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (presetId) => { activePresetId = presetId },
+      flushPreset: async () => {},
+    })
+    const blockedTargets: Array<string | null> = []
+    const registration = registerActiveLoomPresetSelectionBlocker((presetId) => {
+      blockedTargets.push(presetId)
+      return true
+    })
+    const older = beginActiveLoomPresetSelection()
+    const newer = beginActiveLoomPresetSelection()
+    const newerTransition = newer.transition('preset-c')
+
+    expect(await older.transition('preset-b')).toBe(false)
+    expect(older.isCurrent()).toBe(false)
+    expect(newer.isCurrent()).toBe(true)
+    registration.release()
+
+    expect(await newerTransition).toBe(true)
+    expect(activePresetId).toBe('preset-c')
+    expect(blockedTargets).toEqual(['preset-c'])
+  })
+
+  test('replays through the original request fence instead of starting a fresh request', async () => {
+    let activePresetId: string | null = 'preset-a'
+    const exposed: string[] = []
+    configurePresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (presetId) => {
+        activePresetId = presetId
+        exposed.push(presetId)
+      },
+      flushPreset: async () => {},
+    })
+    const registration = registerActiveLoomPresetSelectionBlocker((presetId) => presetId === 'preset-b')
+    const blockedTransition = beginActiveLoomPresetSelection().transition('preset-b')
+
+    expect(await beginActiveLoomPresetSelection().transition('preset-c')).toBe(true)
+    registration.release()
+
+    expect(await blockedTransition).toBe(false)
+    expect(activePresetId).toBe('preset-c')
+    expect(exposed).toEqual(['preset-c'])
+  })
+
+  test('waits until every blocking owner releases the clean draft', async () => {
+    let activePresetId: string | null = 'preset-a'
+    configurePresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (presetId) => { activePresetId = presetId },
+      flushPreset: async () => {},
+    })
+    const firstRegistration = registerActiveLoomPresetSelectionBlocker(() => true)
+    const secondRegistration = registerActiveLoomPresetSelectionBlocker(() => true)
+    const transition = beginActiveLoomPresetSelection().transition('preset-b')
+    let settled: boolean | undefined
+    void transition.then((result) => { settled = result })
+
+    firstRegistration.release()
+    await Promise.resolve()
+
+    expect(settled).toBeUndefined()
     expect(activePresetId).toBe('preset-a')
 
-    unblock()
-    await replayed.promise
+    secondRegistration.release()
 
-    expect(activePresetId).toBe('preset-c')
-    expect(blockedTargets).toEqual(['preset-b', 'preset-c'])
+    expect(await transition).toBe(true)
+    expect(activePresetId).toBe('preset-b')
   })
 
   test('drops a blocked replay when its bound-selection lifecycle is cancelled', async () => {
@@ -184,43 +283,57 @@ describe('preset selection coordinator', () => {
       },
       flushPreset: async () => {},
     })
-    const unblock = registerActiveLoomPresetSelectionBlocker(() => true)
+    const registration = registerActiveLoomPresetSelectionBlocker(() => true)
     const selection = beginActiveLoomPresetSelection()
+    const transition = selection.transition('stale-preset')
 
-    expect(await selection.transition('stale-preset')).toBe(false)
     selection.cancel()
-    unblock()
-    await Promise.resolve()
 
+    expect(await transition).toBe(false)
+    registration.release()
+    await Promise.resolve()
     expect(activePresetId).toBe('preset-a')
     expect(selectionChanges).toBe(0)
+  })
+
+  test('cancels a blocked replay when its blocker owner retires', async () => {
+    let activePresetId: string | null = 'preset-a'
+    configurePresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (presetId) => { activePresetId = presetId },
+      flushPreset: async () => {},
+    })
+    const registration = registerActiveLoomPresetSelectionBlocker(() => true)
+    const transition = beginActiveLoomPresetSelection().transition('stale-preset')
+
+    registration.cancel()
+
+    expect(await transition).toBe(false)
+    expect(activePresetId).toBe('preset-a')
   })
 
   test('cancels a replay in flight when its originating context ends', async () => {
     let activePresetId: string | null = 'preset-a'
     const flushStarted = deferred<void>()
     const releaseFlush = deferred<void>()
-    const flushReturned = deferred<void>()
     configurePresetSelectionCoordinator({
       getActivePresetId: () => activePresetId,
       setActivePresetId: (presetId) => { activePresetId = presetId },
       flushPreset: async () => {
         flushStarted.resolve()
         await releaseFlush.promise
-        flushReturned.resolve()
       },
     })
-    const unblock = registerActiveLoomPresetSelectionBlocker(() => true)
+    const registration = registerActiveLoomPresetSelectionBlocker(() => true)
     const selection = beginActiveLoomPresetSelection()
+    const transition = selection.transition('stale-preset')
 
-    expect(await selection.transition('stale-preset')).toBe(false)
-    unblock()
+    registration.release()
     await flushStarted.promise
     selection.cancel()
     releaseFlush.resolve()
-    await flushReturned.promise
-    await Promise.resolve()
 
+    expect(await transition).toBe(false)
     expect(activePresetId).toBe('preset-a')
   })
 
@@ -233,14 +346,13 @@ describe('preset selection coordinator', () => {
     })
     const abort = new AbortController()
     abort.abort()
-    const unblock = registerActiveLoomPresetSelectionBlocker(() => true)
+    const registration = registerActiveLoomPresetSelectionBlocker(() => true)
+    const selection = beginActiveLoomPresetSelection({ signal: abort.signal })
 
-    expect(await beginActiveLoomPresetSelection({
-      signal: abort.signal,
-    }).transition('stale-preset')).toBe(false)
-    unblock()
+    expect(selection.isCurrent()).toBe(false)
+    expect(await selection.transition('stale-preset')).toBe(false)
+    registration.release()
     await Promise.resolve()
-
     expect(activePresetId).toBe('preset-a')
   })
 })

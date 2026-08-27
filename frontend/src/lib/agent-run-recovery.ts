@@ -287,10 +287,12 @@ export function loadPersistentWorkspaceCollection(
 export function loadAgentWorkspace(
   chatId: string,
   turnId: string,
+  runSequence: number,
+  runRevision: number,
   api: AgentRunWorkspaceApi,
   store: AgentRunRecoveryStore,
 ): Promise<void> {
-  const key = `${chatId}:${turnId}`
+  const key = `${chatId}:${turnId}:sequence:${runSequence}:revision:${runRevision}`
   const existing = workspaceIndexInFlight.get(key)
   if (existing) return existing
 

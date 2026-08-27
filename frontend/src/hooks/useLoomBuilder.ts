@@ -17,7 +17,6 @@ import {
 import { beginActiveLoomPresetSelection, transitionActiveLoomPreset } from '@/lib/loom/preset-selection-coordinator'
 import { getMacroCatalog } from '@/api/macros'
 import type { SaveAgenticRuntimeEditorResult } from '@/api/agentic-runtime'
-import type { Preset } from '@/types/api'
 import type {
   AgenticRuntimeSaveDraft,
   LoomPreset,
@@ -175,6 +174,7 @@ function applyPrivateBlockChange(
 
 type LoomBuilderDependencies = {
   presetsApi?: typeof presetsApi
+  agenticRuntimeApi?: typeof agenticRuntimeApi
   saveCoordinator?: PresetSaveCoordinator
   flushPresetForGeneration?: typeof defaultFlushPresetForGeneration
 }
@@ -187,6 +187,7 @@ interface AgenticRuntimeSaveIdentity {
 
 export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
   const presetApi = dependencies.presetsApi ?? presetsApi
+  const runtimeApi = dependencies.agenticRuntimeApi ?? agenticRuntimeApi
   const presetSaveCoordinator = useMemo(
     () => dependencies.saveCoordinator ?? (
       dependencies.presetsApi
@@ -344,12 +345,13 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       throw new Error('No active preset')
     }
     const hydration = presetSaveCoordinator.beginHydration(presetId, 'agentic-runtime-conflict')
-    let reloaded: LoomPreset
-    let reloadedPreset: Preset
     try {
-      reloadedPreset = await presetApi.get(presetId)
-      reloaded = presetSaveCoordinator.hydrate(
-        unmarshalPreset(reloadedPreset),
+      const result = await runtimeApi.getMatchedEditor(presetId)
+      if (useStore.getState().activeLoomPresetId !== presetId) {
+        throw new Error('No active preset')
+      }
+      const reloaded = presetSaveCoordinator.hydrate(
+        unmarshalPreset(result.preset),
         hydration,
       )
       if (useStore.getState().activeLoomPresetId !== reloaded.id) {
@@ -359,16 +361,12 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       setActivePreset(reloaded)
       setError(null)
       await refreshRegistry()
+      return result
     } catch (error) {
       presetSaveCoordinator.cancelHydration(hydration)
       throw error
     }
-    const editor = await agenticRuntimeApi.getEditor(presetId)
-    if (useStore.getState().activeLoomPresetId !== presetId) {
-      throw new Error('No active preset')
-    }
-    return { preset: reloadedPreset, editor }
-  }, [activeLoomPresetId, presetApi, presetSaveCoordinator, refreshRegistry])
+  }, [activeLoomPresetId, presetSaveCoordinator, refreshRegistry, runtimeApi])
 
   // Load registry on mount. The registry is kept in the store across panel
   // open/close cycles, and every mutation path below (create/delete/rename/
@@ -580,20 +578,25 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       normalizedBlocks,
       expectedIdentity.presetRevision,
     )
-    const result = await agenticRuntimeApi.saveEditor(flushed.id, {
+    const result = await runtimeApi.saveEditor(flushed.id, {
       ...draft,
       config: preparedConfig,
       expectedPresetRevision: expectedIdentity.presetRevision,
       expectedConfigRevision: expectedIdentity.configRevision,
       promptOrder: normalizedBlocks,
     })
+    const livePreset = activePresetRef.current
+    if (
+      useStore.getState().activeLoomPresetId !== flushed.id
+      || livePreset?.id !== flushed.id
+      || (livePreset.cacheRevision ?? 0) > result.editor.presetRevision
+    ) return result
     const refreshed = presetSaveCoordinator.hydrate(unmarshalPreset(result.preset))
-    if (useStore.getState().activeLoomPresetId !== refreshed.id) return result
     activePresetRef.current = refreshed
     setActivePreset(refreshed)
     await refreshRegistry()
     return result
-  }, [presetSaveCoordinator, refreshRegistry])
+  }, [presetSaveCoordinator, refreshRegistry, runtimeApi])
 
   const saveLoomValue = useCallback(async (
     blocks: PromptBlock[],
@@ -991,7 +994,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
 
       if (agentRuntime) {
         try {
-          const editor = await agenticRuntimeApi.getEditor(created.id)
+          const editor = await runtimeApi.getEditor(created.id)
           created = {
             ...created,
             agent_config: editor.config,
@@ -1038,7 +1041,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     } finally {
       setIsLoading(false)
     }
-  }, [presetApi, presetSaveCoordinator, refreshRegistry])
+  }, [presetApi, presetSaveCoordinator, refreshRegistry, runtimeApi])
 
   // Import from legacy preset JSON
   const importFromST = useCallback(async (stData: any, fileName: string) => {
