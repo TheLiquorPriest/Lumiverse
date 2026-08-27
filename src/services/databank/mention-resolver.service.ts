@@ -13,10 +13,15 @@
  * while document or scope changes cannot return stale content.
  */
 
+import { getDb } from "../../db/connection";
 import * as crud from "./databank-crud.service";
 import * as embeddingsSvc from "../embeddings.service";
-import { resolveActiveDatabankIds } from "./scope-resolver.service";
-import type { DatabankDocument, ResolvedMention } from "./types";
+import {
+  rowToDocument,
+  type DatabankDocument,
+  type DatabankDocumentRow,
+  type ResolvedMention,
+} from "./types";
 import {
   clearResolveCache as clearResolveCacheStore,
   getResolveCache,
@@ -75,31 +80,50 @@ export interface SlugLookupResult {
 }
 
 /**
- * Sync batch lookup: for a deduped set of slugs, return the subset that maps
- * to ready documents in active databanks (plus the doc rows themselves).
- * One indexed SQL query per unique slug — cheap enough to call unconditionally.
+ * Sync batch lookup against the caller's already-resolved active databank IDs.
+ * The lookup independently enforces ownership, enabled banks, ready documents,
+ * and materialized chunks so malformed or stale callers fail closed.
  */
 export function lookupSlugsInScope(
   userId: string,
   slugs: Iterable<string>,
-  chatId: string,
-  characterIds: string | string[],
+  activeBankIds: readonly string[],
 ): SlugLookupResult {
   const validSlugs = new Set<string>();
   const docs = new Map<string, DatabankDocument>();
-  const slugArr = Array.from(slugs);
-  if (slugArr.length === 0) return { validSlugs, docs };
+  const slugArr = [...new Set(Array.from(slugs, (slug) => slug.toLowerCase()).filter(Boolean))];
+  const bankIds = [...new Set(activeBankIds.filter(Boolean))];
+  if (slugArr.length === 0 || bankIds.length === 0) return { validSlugs, docs };
 
-  const activeBankIds = resolveActiveDatabankIds(userId, chatId, characterIds);
-  if (activeBankIds.length === 0) return { validSlugs, docs };
-  const activeBankSet = new Set(activeBankIds);
+  const slugPlaceholders = slugArr.map(() => "?").join(",");
+  const bankPlaceholders = bankIds.map(() => "?").join(",");
+  const rows = getDb().query(
+    `SELECT dd.*
+       FROM databank_documents dd
+       JOIN databanks d
+         ON d.id = dd.databank_id
+        AND d.user_id = dd.user_id
+      WHERE dd.user_id = ?
+        AND d.user_id = ?
+        AND d.enabled = 1
+        AND dd.status = 'ready'
+        AND dd.total_chunks > 0
+        AND dd.slug IN (${slugPlaceholders})
+        AND dd.databank_id IN (${bankPlaceholders})
+        AND EXISTS (
+          SELECT 1
+            FROM databank_chunks dc
+           WHERE dc.document_id = dd.id
+             AND dc.databank_id = dd.databank_id
+             AND dc.user_id = dd.user_id
+        )
+      ORDER BY dd.updated_at DESC, dd.id ASC`,
+  ).all(userId, userId, ...slugArr, ...bankIds) as DatabankDocumentRow[];
 
-  for (const slug of slugArr) {
-    const doc = crud.getDocumentBySlug(userId, slug, activeBankIds);
-    if (!doc) continue;
-    if (!activeBankSet.has(doc.databankId)) continue;
-    validSlugs.add(slug);
-    docs.set(slug, doc);
+  for (const row of rows) {
+    if (docs.has(row.slug)) continue;
+    validSlugs.add(row.slug);
+    docs.set(row.slug, rowToDocument(row));
   }
   return { validSlugs, docs };
 }

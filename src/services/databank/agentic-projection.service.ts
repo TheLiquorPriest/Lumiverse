@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { getDb } from "../../db/connection";
 import * as embeddingsSvc from "../embeddings.service";
-import { getCharacterDatabankIds } from "../../utils/character-databanks";
 import * as crud from "./databank-crud.service";
 import {
   extractMentionSlugs,
@@ -15,7 +14,7 @@ import {
   searchDatabanks,
 } from "./retrieval.service";
 import { loadDatabankSettings } from "./databank-settings.service";
-import { resolveActiveDatabankIds } from "./scope-resolver.service";
+import { resolvePersistedActiveDatabankIds } from "./scope-resolver.service";
 import type {
   DatabankDocument,
   DatabankRetrievalResult,
@@ -48,24 +47,6 @@ function bytes(value: string): number {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function parseRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "string" || value.length === 0) return {};
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
-    : [];
 }
 
 function clampUtf8(value: string, maxBytes: number): string {
@@ -176,41 +157,6 @@ function recentQueryText(
     return clampUtf8(userInput, maxBytes);
   }
 }
-
-function resolveScope(
-  userId: string,
-  chatId: string,
-  targetCharacterId: string | null | undefined,
-): { activeBankIds: string[]; characterIds: string[] } {
-  const db = getDb();
-  const chat = db.query(
-    "SELECT character_id, metadata FROM chats WHERE id = ? AND user_id = ? LIMIT 1",
-  ).get(chatId, userId) as { character_id?: unknown; metadata?: unknown } | null;
-  const metadata = parseRecord(chat?.metadata);
-  const memoryIsolated = metadata.memory_isolation === true;
-  const characterId = !memoryIsolated && typeof (targetCharacterId ?? chat?.character_id) === "string"
-    ? String(targetCharacterId ?? chat?.character_id)
-    : null;
-  let characterDatabankIds: string[] = [];
-  if (characterId) {
-    const character = db.query(
-      "SELECT extensions FROM characters WHERE id = ? AND user_id = ? LIMIT 1",
-    ).get(characterId, userId) as { extensions?: unknown } | null;
-    characterDatabankIds = getCharacterDatabankIds(parseRecord(character?.extensions));
-  }
-  const characterIds = characterId ? [characterId] : [];
-  const activeBankIds = resolveActiveDatabankIds(
-    userId,
-    chatId,
-    characterIds,
-    {
-      characterDatabankIds: memoryIsolated ? [] : characterDatabankIds,
-      chatDatabankIds: stringArray(metadata.chat_databank_ids),
-    },
-  );
-  return { activeBankIds, characterIds };
-}
-
 function hydrateAutomaticChunks(
   userId: string,
   activeBankIds: readonly string[],
@@ -334,8 +280,11 @@ export async function resolveAgenticDatabankProjection(input: {
   const maxBytes = Math.max(1, Math.min(input.maxBytes ?? 8 * 1024 * 1024, 8 * 1024 * 1024));
   if (input.signal?.aborted) return emptyProjection(userInput);
   try {
-    const scope = resolveScope(input.userId, input.chatId, input.targetCharacterId);
-    const activeBankIds = scope.activeBankIds;
+    const activeBankIds = resolvePersistedActiveDatabankIds(
+      input.userId,
+      input.chatId,
+      input.targetCharacterId ?? [],
+    );
     const queryText = recentQueryText(
       input.userId,
       input.chatId,
@@ -368,19 +317,9 @@ export async function resolveAgenticDatabankProjection(input: {
     let validSlugs = new Set<string>();
     let docs = new Map<string, DatabankDocument>();
     if (slugs.length > 0 && activeBankIds.length > 0) {
-      const lookup = lookupSlugsInScope(input.userId, slugs, input.chatId, scope.characterIds);
+      const lookup = lookupSlugsInScope(input.userId, slugs, activeBankIds);
       validSlugs = lookup.validSlugs;
       docs = lookup.docs;
-      // lookupSlugsInScope predates character/chat cross-reference attachments.
-      // Fill only its misses from the already-resolved active set so explicit
-      // current-message tags honor every native attachment scope.
-      for (const slug of slugs) {
-        if (docs.has(slug)) continue;
-        const doc = crud.getDocumentBySlug(input.userId, slug, activeBankIds);
-        if (!doc) continue;
-        validSlugs.add(slug);
-        docs.set(slug, doc);
-      }
     }
     const resolved = validSlugs.size > 0
       ? await resolveSlugContent(input.userId, input.chatId, validSlugs, docs, queryText, input.signal)

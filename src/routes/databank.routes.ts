@@ -403,8 +403,18 @@ app.get("/mentions/autocomplete", (c) => {
   const characterId = c.req.query("characterId") || "";
 
   const characterIds = characterId ? [characterId] : [];
-  const activeBankIds = databank.resolveActiveDatabankIds(userId, chatId, characterIds);
-  const results = databank.searchDocumentsBySlug(userId, q, activeBankIds, 10);
+  const activeBankIds = databank.resolvePersistedActiveDatabankIds(userId, chatId, characterIds);
+  if (activeBankIds.length === 0) return c.json({ data: [] });
+
+  const candidates = databank.searchDocumentsBySlug(userId, q, activeBankIds, 10);
+  const { docs } = databank.lookupSlugsInScope(
+    userId,
+    candidates.map((candidate) => candidate.slug),
+    activeBankIds,
+  );
+  const results = candidates.filter((candidate) =>
+    docs.get(candidate.slug)?.databankId === candidate.databankId
+  );
   return c.json({ data: results });
 });
 
@@ -421,12 +431,12 @@ app.post("/mentions/resolve", async (c) => {
   const characterIds = Array.isArray(characterId)
     ? characterId.filter((id): id is string => typeof id === "string")
     : typeof characterId === "string" && characterId ? [characterId] : [];
-  const { docs } = databank.lookupSlugsInScope(
+  const activeBankIds = databank.resolvePersistedActiveDatabankIds(
     userId,
-    [requestedSlug],
     activeChatId,
     characterIds,
   );
+  const { docs } = databank.lookupSlugsInScope(userId, [requestedSlug], activeBankIds);
   const doc = docs.get(requestedSlug);
   if (!doc) return c.json({ error: "Document not found" }, 404);
 

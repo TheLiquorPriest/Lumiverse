@@ -3417,7 +3417,6 @@ export async function assemblePrompt(
   //      user message's slugs (the only ones that contribute to the appendix).
   let databankMentionAppendix = "";
   {
-    const charIds = databankCharIds;
     let lastUserIdx = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].is_user) {
@@ -3442,8 +3441,7 @@ export async function assemblePrompt(
         const { validSlugs, docs } = databankSvc.lookupSlugsInScope(
           ctx.userId,
           allSlugs,
-          ctx.chatId,
-          charIds,
+          activeDatabankIds,
         );
 
         if (validSlugs.size > 0) {

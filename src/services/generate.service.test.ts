@@ -1050,7 +1050,8 @@ describe.serial("root generation usage accounting", () => {
     | "inactive_success"
     | "inactive_failure"
     | "response_loom"
-    | "response_phase_loom";
+    | "response_phase_loom"
+    | "response_mentions";
 
   class ProductionUsageProvider implements LlmProvider {
     readonly name = "root-usage-test";
@@ -1102,7 +1103,8 @@ describe.serial("root generation usage accounting", () => {
       this.rootRequests.push(request);
       if (
         this.scenario === "response_loom" ||
-        this.scenario === "response_phase_loom"
+        this.scenario === "response_phase_loom" ||
+        this.scenario === "response_mentions"
       ) {
         try {
           yield {
@@ -1278,8 +1280,12 @@ describe.serial("root generation usage accounting", () => {
     await runMigrations(getDb());
 
     const userId = `root-usage-${scenario}`;
+    const hasResponseWorkPolicy =
+      scenario === "response_loom" || scenario === "response_mentions";
+    const hasResponsePhasePolicy =
+      scenario === "response_phase_loom" || scenario === "response_mentions";
     const isResponseLoomScenario =
-      scenario === "response_loom" || scenario === "response_phase_loom";
+      hasResponseWorkPolicy || hasResponsePhasePolicy;
     getDb().query(
       'INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)',
     ).run(userId, "Usage Owner", `${userId}@example.test`);
@@ -1338,7 +1344,7 @@ describe.serial("root generation usage accounting", () => {
           injectionTrigger: [],
           group: null,
         },
-        ...(scenario === "response_loom" ? [] : [{
+        ...(hasResponseWorkPolicy ? [] : [{
           id: "history",
           name: "Chat History",
           content: "",
@@ -1352,7 +1358,7 @@ describe.serial("root generation usage accounting", () => {
           injectionTrigger: [],
           group: null,
         }]),
-        ...(scenario === "response_loom" ? [{
+        ...(hasResponseWorkPolicy ? [{
           id: "work-policy",
           name: "Work policy",
           content: "Internal work-only policy.",
@@ -1366,7 +1372,7 @@ describe.serial("root generation usage accounting", () => {
           injectionTrigger: [],
           group: null,
         }] : []),
-        ...(scenario === "response_phase_loom" ? [{
+        ...(hasResponsePhasePolicy ? [{
           id: "phase-policy",
           name: "Phase policy",
           content: "Internal phase-only policy.",
@@ -1394,7 +1400,7 @@ describe.serial("root generation usage accounting", () => {
               authority: "loom",
               scope: "preset",
               defaultMode: "response",
-              loomPolicy: scenario === "response_loom"
+              loomPolicy: hasResponseWorkPolicy
                 ? {
                     version: 1,
                     workPolicy: Array.from({ length: 5 }, (_, index) => ({
@@ -1425,7 +1431,7 @@ describe.serial("root generation usage accounting", () => {
                     completionCriteria: [],
                     renderPolicy: [],
                   },
-              phases: scenario === "response_phase_loom"
+              phases: hasResponsePhasePolicy
                 ? Array.from({ length: 6 }, (_, index) => ({
                     version: 1 as const,
                     id: `phase_only_${index + 1}`,
@@ -1491,7 +1497,7 @@ describe.serial("root generation usage accounting", () => {
         },
       });
     }
-    if (scenario === "response_loom") {
+    if (hasResponseWorkPolicy) {
       chatsSvc.createMessage(
         chat.id,
         {
@@ -1516,9 +1522,11 @@ describe.serial("root generation usage accounting", () => {
       {
         is_user: true,
         name: "User",
-        content: scenario === "response_loom"
-          ? "RESPONSE-SOURCE-ROW: answer this exact request."
-          : "Delegate this.",
+        content: scenario === "response_mentions"
+          ? "RESPONSE-MENTION-SOURCE: use #global-response-source and #cross-reference-chat-source."
+          : hasResponseWorkPolicy
+            ? "RESPONSE-SOURCE-ROW: answer this exact request."
+            : "Delegate this.",
       },
       userId,
     );
@@ -1729,6 +1737,175 @@ describe.serial("root generation usage accounting", () => {
     } finally {
       embeddingSpy.mockRestore();
       searchSpy.mockRestore();
+      await cleanupFixture(fixture.chat.id);
+    }
+  }, 15_000);
+  test("resolves READY global and chat-cross-referenced mentions in ordinary Response", async () => {
+    const fixture = await createFixture("response_mentions");
+    const detachedChat = chatsSvc.createChat(fixture.userId, {
+      character_id: null,
+      name: "Detached databank owner",
+      metadata: { temporary: true },
+    });
+    const globalBank = databankSvc.createDatabank(fixture.userId, {
+      name: "Global Response Bank",
+      scope: "global",
+    });
+    const crossReferenceBank = databankSvc.createDatabank(fixture.userId, {
+      name: "Cross Reference Chat Bank",
+      scope: "chat",
+      scopeId: detachedChat.id,
+    });
+    const createReadyDocument = (
+      databankId: string,
+      name: string,
+      fileStem: string,
+      content: string,
+    ) => {
+      const document = databankSvc.createDocument(
+        fixture.userId,
+        databankId,
+        name,
+        fileStem + ".txt",
+        "text/plain",
+        content.length,
+        "hash-" + fileStem,
+      );
+      databankSvc.insertChunks([{
+        id: crypto.randomUUID(),
+        documentId: document.id,
+        databankId,
+        userId: fixture.userId,
+        chunkIndex: 0,
+        content,
+        tokenCount: content.split(/\s+/).length,
+      }]);
+      databankSvc.updateDocumentStatus(document.id, "ready", { totalChunks: 1 });
+      return databankSvc.getDocument(fixture.userId, document.id);
+    };
+    const globalMarker =
+      "GLOBAL-RESPONSE-SOURCE-MARKER: exact global source text.";
+    const crossReferenceMarker =
+      "CROSS-REFERENCE-CHAT-SOURCE-MARKER: exact attached chat source text.";
+    const globalDocument = createReadyDocument(
+      globalBank.id,
+      "Global Response Source",
+      "global-response-source",
+      globalMarker,
+    );
+    const crossReferenceDocument = createReadyDocument(
+      crossReferenceBank.id,
+      "Cross Reference Chat Source",
+      "cross-reference-chat-source",
+      crossReferenceMarker,
+    );
+    const currentChat = chatsSvc.getChat(fixture.userId, fixture.chat.id);
+    if (!currentChat) throw new Error("Expected the Response chat to exist");
+    const updatedChat = chatsSvc.updateChat(fixture.userId, fixture.chat.id, {
+      metadata: {
+        ...currentChat.metadata,
+        chat_databank_ids: [crossReferenceBank.id],
+      },
+    });
+    if (!updatedChat) throw new Error("Expected the Response chat to update");
+
+    const embeddingSpy = spyOn(
+      embeddingsSvc,
+      "getEmbeddingConfig",
+    ).mockResolvedValue({
+      enabled: false,
+      provider: "openai",
+      api_url: "https://unused.test",
+      model: "unused",
+      dimensions: null,
+      send_dimensions: false,
+      retrieval_top_k: 4,
+      hybrid_weight_mode: "balanced",
+      preferred_context_size: 512,
+      batch_size: 8,
+      similarity_threshold: 0,
+      rerank_cutoff: 0,
+      vectorize_world_books: false,
+      vectorize_chat_messages: false,
+      vectorize_chat_documents: false,
+      chat_memory_mode: "balanced",
+      request_timeout: 1,
+      has_api_key: false,
+    });
+
+    try {
+      expect(globalDocument).toMatchObject({
+        slug: "global-response-source",
+        status: "ready",
+        totalChunks: 1,
+      });
+      expect(crossReferenceDocument).toMatchObject({
+        slug: "cross-reference-chat-source",
+        status: "ready",
+        totalChunks: 1,
+      });
+      expect(crossReferenceBank.scopeId).not.toBe(fixture.chat.id);
+      expect(updatedChat.metadata.chat_databank_ids).toEqual([
+        crossReferenceBank.id,
+      ]);
+
+      const started = await startFixture(fixture);
+      const emittedBreakdownPromise = waitForGenerationEvent(
+        EventType.GENERATION_BREAKDOWN_READY,
+        started.generationId,
+      );
+      const terminal = await waitForGenerationTerminal(started.generationId);
+      const emittedBreakdown = await emittedBreakdownPromise;
+      expect(terminal.event).toBe(EventType.GENERATION_ENDED);
+      expect(fixture.provider.rootRequests).toHaveLength(1);
+
+      const requestText = fixture.provider.rootRequests[0]!.messages
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content),
+        )
+        .join("\n");
+      const globalSource = "## Global Response Source\n" + globalMarker;
+      const crossReferenceSource =
+        "## Cross Reference Chat Source\n" + crossReferenceMarker;
+      expect(requestText).not.toContain("#global-response-source");
+      expect(requestText).not.toContain("#cross-reference-chat-source");
+      expect(requestText).toContain(globalSource);
+      expect(requestText).toContain(crossReferenceSource);
+      expect(requestText).toContain(
+        "NATIVE-WI-RESPONSE: preserve the exact current request.",
+      );
+      expect(requestText).not.toContain("Internal work-only policy.");
+      expect(requestText).not.toContain("Internal phase-only policy.");
+
+      const mentionEntry = emittedBreakdown.breakdown.entries.find(
+        (entry: Record<string, any>) => entry.type === "databank_mention",
+      );
+      expect(mentionEntry).toMatchObject({
+        name: "Databank Reference",
+        role: "user",
+      });
+      expect(mentionEntry.content).toContain(globalSource);
+      expect(mentionEntry.content).toContain(crossReferenceSource);
+
+      const responseOmission =
+        emittedBreakdown.breakdown.loomPromptInspection.responseOmission;
+      expect(responseOmission.omittedEntryIds).toEqual(
+        Array.from(
+          { length: 5 },
+          (_, index) => "work-only-entry-" + (index + 1),
+        ),
+      );
+      expect(
+        responseOmission.omittedPhaseInstructions.map(
+          (item: { phaseId: string }) => item.phaseId,
+        ),
+      ).toEqual(
+        Array.from({ length: 6 }, (_, index) => "phase_only_" + (index + 1)),
+      );
+    } finally {
+      embeddingSpy.mockRestore();
       await cleanupFixture(fixture.chat.id);
     }
   }, 15_000);

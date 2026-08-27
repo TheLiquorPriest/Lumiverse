@@ -57,7 +57,10 @@ export {
 } from "./retrieval.service";
 
 // Scope resolution
-export { resolveActiveDatabankIds } from "./scope-resolver.service";
+export {
+  resolveActiveDatabankIds,
+  resolvePersistedActiveDatabankIds,
+} from "./scope-resolver.service";
 
 // Mention resolution
 export {
