@@ -2885,6 +2885,9 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
     resolveRuntime: async (input, target) => mapAdmissionDecision(
       await service.resolve(input.userId, requestFor(input, target), { issueToken: false }),
     ),
+    claimRuntimeToken: (input, token) => {
+      if (!service.claim(input.userId, token)) rejectRefresh();
+    },
     consumeRuntimeToken: async (input, target, token) => {
       const consumed = await service.consume(input.userId, token, requestFor(input, target));
       return consumed.accepted && consumed.decision ? mapAdmissionDecision(consumed.decision) : rejectRefresh();
@@ -3056,6 +3059,37 @@ test("rejects explicit Response mode and burns the supplied Agentic token", asyn
     expect(resolveSpy).not.toHaveBeenCalled();
   } finally {
     resolveSpy.mockRestore();
+  }
+});
+
+test("burns valid tokens on unsupported surfaces with omitted and explicit Response mode", async () => {
+  for (const [requestEpoch, mode] of [[10, undefined], [11, "response"]] as const) {
+    const harness = await createRuntimeAdmissionHarness();
+    const token = (await harness.issue(requestEpoch)).runtimeDecisionToken!;
+    const resolveSpy = forbidReplacementResolution();
+    try {
+      const unsupported: Parameters<typeof startGeneration>[0] = {
+        ...harness.generationInput(requestEpoch, token),
+        generation_type: "impersonate",
+      };
+      if (mode === undefined) delete unsupported.mode;
+      else unsupported.mode = mode;
+
+      await expect(startGeneration(unsupported)).rejects.toMatchObject({
+        code: "agentic_unsupported_surface",
+      });
+      expect(harness.service.tokenStore.liveCount).toBe(0);
+      expect(harness.dispatches).toHaveLength(0);
+      expect(getActiveGenerationCount()).toBe(0);
+
+      await expect(startGeneration(harness.generationInput(requestEpoch, token)))
+        .rejects.toMatchObject({ code: "decision_refresh_required" });
+      expect(harness.dispatches).toHaveLength(0);
+      expect(getActiveGenerationCount()).toBe(0);
+      expect(resolveSpy).not.toHaveBeenCalled();
+    } finally {
+      resolveSpy.mockRestore();
+    }
   }
 });
 

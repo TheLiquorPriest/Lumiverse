@@ -1083,6 +1083,8 @@
     "providerId": "プロバイダー ID",
     "modelId": "モデル",
     "connectionRevision": "接続リビジョン",
+    "connectionId": "接続 ID",
+    "configRevision": "設定リビジョン",
     "errorReason": "エラー理由",
     "turnSession": "非公開 Turn Session",
     "turnSessionIntro": "トランスクリプトにリンクされた、オーナー範囲の型付きライフサイクルおよび復旧エントリです。",

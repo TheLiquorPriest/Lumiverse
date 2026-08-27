@@ -1083,6 +1083,8 @@
     "providerId": "提供者 ID",
     "modelId": "模型",
     "connectionRevision": "連線修訂版",
+    "connectionId": "連線 ID",
+    "configRevision": "設定修訂版",
     "errorReason": "錯誤原因",
     "turnSession": "私有 Turn Session",
     "turnSessionIntro": "與轉錄關聯、限定擁有者範圍的類型化生命週期和復原項目。",

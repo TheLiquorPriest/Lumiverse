@@ -231,6 +231,12 @@ export interface AgenticGenerationDependencies {
     token: string,
     signal: AbortSignal,
   ) => Promise<AgenticRuntimeDecision>;
+  /** Burn a one-use token before rejecting a target that has no Agentic shape. */
+  claimRuntimeToken?: (
+    input: AgenticGenerationInput,
+    token: string,
+    signal: AbortSignal,
+  ) => Promise<void> | void;
   createExecution?: (
     input: AgenticExecutionCreateInput,
   ) => Promise<AgenticExecutionHandle> | AgenticExecutionHandle;
@@ -1349,8 +1355,31 @@ export async function runAgenticGeneration(
   deps?: AgenticGenerationDependencies,
 ): Promise<AgenticGenerationResult> {
   const resolvedDeps = resolveDependencies(deps);
-  const target = targetFromInput(input);
-  assertSupportedSurface(input);
+  let target: AgenticTargetSnapshot;
+  try {
+    target = targetFromInput(input);
+    assertSupportedSurface(input);
+  } catch (error) {
+    if (
+      error instanceof AgenticGenerationError
+      && error.code === "agentic_unsupported_surface"
+      && input.runtimeDecisionToken
+    ) {
+      if (!resolvedDeps.claimRuntimeToken) {
+        throw new AgenticGenerationError(
+          "agentic_runtime_unavailable",
+          "Agentic decision authority is unavailable.",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      }
+      await resolvedDeps.claimRuntimeToken(
+        input,
+        input.runtimeDecisionToken,
+        input.signal ?? new AbortController().signal,
+      );
+    }
+    throw error;
+  }
   const generationId = crypto.randomUUID();
   const attemptLineage = attemptLineageFor(generationId, input, target);
   const controller = new AbortController();

@@ -1264,14 +1264,30 @@ function normalizeTranscriptProvider(value: unknown): AgentInspectionProviderIde
   const adapter = boundedString(value.adapter, 128)
   const providerId = nullableBoundedString(value.providerId, 128)
   const modelId = nullableBoundedString(value.modelId, 256)
+  const connectionId = nullableBoundedString(value.connectionId, 256)
+  const configRevision = value.configRevision === undefined
+    ? undefined
+    : value.configRevision === null
+      ? null
+      : typeof value.configRevision === 'number' && Number.isSafeInteger(value.configRevision) && value.configRevision >= 0
+        ? value.configRevision
+        : typeof value.configRevision === 'string' ? boundedString(value.configRevision, 256) : undefined
   const connectionRevision = value.connectionRevision === null
     ? null
     : typeof value.connectionRevision === 'number' && Number.isSafeInteger(value.connectionRevision) && value.connectionRevision >= 0
       ? value.connectionRevision
       : typeof value.connectionRevision === 'string' ? boundedString(value.connectionRevision, 256) : undefined
   const fingerprint = nullableBoundedString(value.fingerprint, 256)
-  if (!adapter || providerId === undefined || modelId === undefined || connectionRevision === undefined || fingerprint === undefined) return null
-  return { adapter, providerId, modelId, connectionRevision, fingerprint }
+  if (!adapter || providerId === undefined || modelId === undefined || connectionId === undefined || (value.configRevision !== undefined && configRevision === undefined) || connectionRevision === undefined || fingerprint === undefined) return null
+  return {
+    adapter,
+    providerId,
+    modelId,
+    ...(connectionId === undefined ? {} : { connectionId }),
+    ...(configRevision === undefined ? {} : { configRevision }),
+    connectionRevision,
+    fingerprint,
+  }
 }
 function normalizeInspectionTranscriptRecord(value: unknown): AgentInspectionTranscriptRecordV1 | null {
   if (!isUnknownRecord(value) || value.version !== 1) return null

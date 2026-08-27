@@ -482,13 +482,17 @@ describe("portable preset runtime import atomicity", () => {
       "SELECT id, script_id, preset_id, metadata, name FROM regex_scripts WHERE user_id = ? AND preset_id = ? ORDER BY name",
     ).all(USER_ID, copied.preset.id) as Array<{ id: string; script_id: string; preset_id: string; metadata: string; name: string }>;
     expect(rows).toHaveLength(2);
-    expect(rows.every((row) => /^portable_[0-9a-f]+$/.test(row.script_id))).toBe(true);
+    expect(rows.every((row) => row.script_id === "")).toBe(true);
     expect(rows.every((row) => row.preset_id === copied.preset.id)).toBe(true);
     const sourceCopy = rows.find((row) => row.name === "Portable source");
     const dependent = rows.find((row) => row.name === "Portable dependent");
     expect(sourceCopy).toBeDefined();
     expect(dependent).toBeDefined();
-    expect(JSON.parse(dependent!.metadata).script_id).toBe(sourceCopy!.script_id);
+    const sourceMetadata = JSON.parse(sourceCopy!.metadata) as Record<string, unknown>;
+    const dependentMetadata = JSON.parse(dependent!.metadata) as Record<string, unknown>;
+    expect(new Set(rows.map((row) => JSON.parse(row.metadata).imported_script_id)).size).toBe(2);
+    expect(rows.every((row) => /^portable_[0-9a-f]+$/.test(JSON.parse(row.metadata).imported_script_id))).toBe(true);
+    expect(dependentMetadata.script_id).toBe(sourceMetadata.imported_script_id);
   });
   test("quarantines an authored Agentic runtime while preserving canonical Loom policy and phases", () => {
     const agentRuntime = canonicalRuntimeEnvelope();

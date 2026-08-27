@@ -230,6 +230,8 @@ function cleanNode(value: unknown): AgentActivityNodeV1 | null {
   if (!id || !kind || !actor || !phase || !status || startedAt === null || elapsedMs === null) return null;
   const profileId = typeof source.profileId === "string" && encoder.encode(source.profileId).byteLength <= MAX_PROFILE_ID_BYTES
     ? source.profileId : undefined;
+  const taskId = source.taskId === undefined ? undefined : boundedId(source.taskId) ?? null;
+  if (taskId === null) return null;
   const toolId = typeof source.toolId === "string"
     ? TOOL_IDS.has(source.toolId as AgentActivityToolId) ? source.toolId as AgentActivityToolId : "unknown_tool"
     : undefined;
@@ -241,7 +243,7 @@ function cleanNode(value: unknown): AgentActivityNodeV1 | null {
     ? source.errorCode as AgentPublicErrorCode : undefined;
   return {
     id, parentId: source.parentId === null ? null : boundedId(source.parentId), kind, actor, phase, status,
-    ...(profileId ? { profileId } : {}), ...(toolId ? { toolId } : {}),
+    ...(taskId ? { taskId } : {}), ...(profileId ? { profileId } : {}), ...(toolId ? { toolId } : {}),
     ...(roundIndex !== null ? { roundIndex } : {}), ...(continuationMode ? { continuationMode } : {}),
     startedAt, elapsedMs, ...(usage ? { usage } : {}), ...(errorCode ? { errorCode } : {}),
   };
@@ -1761,6 +1763,12 @@ function normalizeInspectionTranscript(
       !boundedInspectionString(provider.adapter, 128)
       || !(provider.providerId === null || boundedInspectionString(provider.providerId, 128) !== null)
       || !(provider.modelId === null || boundedInspectionString(provider.modelId, 256) !== null)
+      || !(provider.connectionId === null
+        || provider.connectionId === undefined
+        || boundedInspectionString(provider.connectionId, 256) !== null)
+      || !(provider.configRevision === null
+        || provider.configRevision === undefined
+        || normalizeCortexRevision(provider.configRevision) !== null)
       || !(provider.connectionRevision === null
         || provider.connectionRevision === undefined
         || normalizeCortexRevision(provider.connectionRevision) !== null)
@@ -1791,6 +1799,12 @@ function normalizeInspectionTranscript(
       adapter: provider.adapter as string,
       providerId: provider.providerId as string | null,
       modelId: provider.modelId as string | null,
+      connectionId: provider.connectionId === null || provider.connectionId === undefined
+        ? null
+        : boundedInspectionString(provider.connectionId, 256),
+      configRevision: provider.configRevision === null || provider.configRevision === undefined
+        ? null
+        : normalizeCortexRevision(provider.configRevision),
       connectionRevision: provider.connectionRevision === null || provider.connectionRevision === undefined
         ? null
         : normalizeCortexRevision(provider.connectionRevision),
@@ -2465,7 +2479,8 @@ function projectAgentRunActivity(
     const actor: AgentActivityMilestoneV1["actor"] = kind === "root" ? "agent" : kind;
     const toolId = node.toolId === undefined ? null : boundedInspectionString(node.toolId, 128);
     const profileId = node.profileId === undefined ? null : boundedInspectionString(node.profileId, 128);
-    if ((node.toolId !== undefined && !toolId) || (node.profileId !== undefined && !profileId)) {
+    const taskId = node.taskId === undefined ? null : boundedInspectionString(node.taskId, 256);
+    if ((node.taskId !== undefined && !taskId) || (node.toolId !== undefined && !toolId) || (node.profileId !== undefined && !profileId)) {
       markUnavailable(
         `${row.attempt_id}:activity:projection-invalid:${index}`,
         "activity record unavailable: malformed or legacy node identity.",
@@ -2494,7 +2509,7 @@ function projectAgentRunActivity(
       status,
       label,
       toolId,
-      taskId: null,
+      taskId,
       sequence: hostSequence,
       startedAt,
       endedAt,
@@ -2504,6 +2519,7 @@ function projectAgentRunActivity(
         actorId: actor,
         phase,
         toolId,
+        taskId,
         parentId: parentId ? `projection:${parentId}` : null,
         hostSequence,
       }, hostSequence),

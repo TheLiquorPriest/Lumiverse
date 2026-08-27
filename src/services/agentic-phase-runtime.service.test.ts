@@ -277,7 +277,15 @@ describe("canonical custom Phased Instructions machine", () => {
     expect(orderedMachine.state()).toMatchObject({ status: "ready", phaseId: "two", phaseIndex: 1 });
     expect(orderedMachine.enter({ revision: 2, context: context() }).status).toBe("entered");
     expect(orderedMachine.exit({ revision: 2, context: context() })).toMatchObject({ status: "completed", phaseId: "two" });
-    expect(orderedMachine.state().status).toBe("completed");
+    expect(orderedMachine.state()).toMatchObject({
+      status: "completed",
+      phaseId: null,
+      phaseIndex: null,
+      nextPhaseId: null,
+      repeatCount: 0,
+    });
+    expect(orderedMachine.currentPhase()).toBeNull();
+    expect(orderedMachine.capabilities()).toEqual([]);
   });
 
   test("keeps an unsatisfied exit entered when the next phase is not a self-loop", () => {
@@ -519,6 +527,7 @@ describe("canonical custom Phased Instructions machine", () => {
     expect(optionalMachine.evidence()).toEqual(expect.arrayContaining([
       expect.objectContaining({ status: "skipped", condition: "invalid", required: false }),
     ]));
-    expect(optionalMachine.state().status).toBe("completed");
+    expect(optionalMachine.state()).toMatchObject({ status: "completed", phaseId: null, phaseIndex: null });
+    expect(optionalMachine.currentPhase()).toBeNull();
   });
 });

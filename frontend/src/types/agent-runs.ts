@@ -378,6 +378,8 @@ export interface AgentInspectionProviderIdentityV1 {
   adapter: string
   providerId: string | null
   modelId: string | null
+  connectionId?: string | null
+  configRevision?: RuntimeRevision | null
   connectionRevision: RuntimeRevision | null
   fingerprint: string | null
 }

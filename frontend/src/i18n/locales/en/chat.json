@@ -1141,6 +1141,8 @@
     "providerId": "Provider ID",
     "modelId": "Model",
     "connectionRevision": "Connection revision",
+    "connectionId": "Connection ID",
+    "configRevision": "Config revision",
     "errorReason": "Error reason",
     "turnSession": "Private Turn Session",
     "turnSessionIntro": "Typed owner-scoped lifecycle and recovery entries linked to the transcript.",

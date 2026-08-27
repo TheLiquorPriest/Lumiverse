@@ -196,6 +196,22 @@ describe("agentic generation orchestration", () => {
       resolveRuntime: async () => { calls += 1; return { mode: "agentic" }; },
     }))).rejects.toMatchObject({ code: "agentic_unsupported_surface" });
   });
+  test("burns a presented token before rejecting an unsupported surface", async () => {
+    const calls: string[] = [];
+    await expect(runAgenticGeneration(input({
+      generationType: "impersonate",
+      runtimeDecisionToken: "runtime-token",
+    }), dependencies([], {
+      claimRuntimeToken: (_input, token) => { calls.push(`claim:${token}`); },
+      consumeRuntimeToken: async () => { calls.push("consume"); return { mode: "agentic" }; },
+      resolveRuntime: async () => { calls.push("resolve"); return { mode: "agentic" }; },
+      createExecution: ({ executionId }) => { calls.push("execution"); return { id: executionId }; },
+      runWork: async () => { calls.push("work"); return { status: "completed" }; },
+    }))).rejects.toMatchObject({ code: "agentic_unsupported_surface" });
+
+    expect(calls).toEqual(["claim:runtime-token"]);
+  });
+
   test("does not reject a non-impersonation Agentic request", async () => {
     let resolved = 0;
     const started = await runAgenticGeneration(input({ isImpersonate: false }), dependencies([], {

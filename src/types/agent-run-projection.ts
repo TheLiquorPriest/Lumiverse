@@ -416,6 +416,10 @@ export interface AgentInspectionProviderIdentityV1 {
   readonly adapter: string;
   readonly providerId: string | null;
   readonly modelId: string | null;
+  /** Concrete frozen connection identity, when the producer has one. */
+  readonly connectionId?: string | null;
+  /** Frozen Agentic config revision that authorized this dispatch. */
+  readonly configRevision?: RuntimeRevision | null;
   readonly connectionRevision: RuntimeRevision | null;
   readonly fingerprint: string | null;
 }

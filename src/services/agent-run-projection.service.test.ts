@@ -1573,10 +1573,10 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(requestAgentRunStop(OTHER, "chat-stop", "turn-stop")).toBeNull();
   });
 
-  test("accepts Stop in every reversible pre-commit phase without output or commit", () => {
+  test("returns too_late throughout the irreversible post-WORK phases without output or commit", () => {
     for (const phase of ["COMPLETE", "RENDER", "PREPARE_COMMIT"] as const) {
-      const chatId = `chat-stop-${phase.toLowerCase()}`;
-      const turnId = `turn-stop-${phase.toLowerCase()}`;
+      const chatId = "chat-stop-" + phase.toLowerCase();
+      const turnId = "turn-stop-" + phase.toLowerCase();
       seedChat(OWNER, chatId);
       seedRun(OWNER, chatId, turnId, turnId, phase);
       withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
@@ -1586,19 +1586,13 @@ describe("AgentRunPublicV2 projection and cursor", () => {
 
       expect(requestAgentRunStop(OWNER, chatId, turnId)).toMatchObject({
         version: 2,
-        status: "accepted",
+        status: "too_late",
         turnId,
-        revision: 2,
+        revision: 1,
       });
       expect(getDb().query(
         "SELECT state, cas_owner FROM agent_turn_executions WHERE id = ?",
-      ).get(turnId)).toEqual({ state: "CANCELLED", cas_owner: null });
-      expect(getAgentRun(OWNER, turnId)).toMatchObject({
-        workPhase: "TERMINAL",
-        workStatus: "terminal",
-        workOutcome: "stopped",
-        reason: "stopped",
-      });
+      ).get(turnId)).toEqual({ state: phase, cas_owner: null });
       expect(getDb().query(
         "SELECT COUNT(*) AS count FROM messages WHERE chat_id = ?",
       ).get(chatId)).toEqual({ count: 0 });

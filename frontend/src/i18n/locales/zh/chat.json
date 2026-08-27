@@ -1091,6 +1091,8 @@
     "providerId": "提供商 ID",
     "modelId": "模型",
     "connectionRevision": "连接修订版",
+    "connectionId": "连接 ID",
+    "configRevision": "配置修订版",
     "errorReason": "错误原因",
     "turnSession": "私有 Turn Session",
     "turnSessionIntro": "与转录关联的、按所有者范围划分的类型化生命周期和恢复条目。",

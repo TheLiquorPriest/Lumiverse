@@ -5,6 +5,7 @@ import {
   beginTurnCommit,
   calculateFinalRenderReservationEnvelopeV1,
   createTurnExecution,
+  expireTurnExecution,
   reserveFinalRender,
   transitionTurnExecution,
   finalizeTurnCommit,
@@ -243,6 +244,61 @@ describe("control races and terminal ownership", () => {
     expect(result.execution.workOutcome).toBe("failed");
   });
 
+  test("Stop is too late from COMPLETE while deadline expiry remains TIMED_OUT", () => {
+    const working = newExecution(db, "stop-work-boundary");
+    transition(db, "stop-work-boundary", working.ownerToken, "ASSEMBLE", "WORK");
+    expect(requestTurnCancellation({
+      db,
+      executionId: "stop-work-boundary",
+      ownerToken: working.ownerToken,
+    })).toMatchObject({ code: "cancelled", execution: { phase: "CANCELLED" } });
+
+    const latePhases = [
+      { id: "stop-complete", path: ["WORK", "COMPLETE"] as const },
+      { id: "stop-render", path: ["WORK", "COMPLETE", "RENDER"] as const },
+      { id: "stop-prepare", path: ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT"] as const },
+    ];
+    for (const { id, path } of latePhases) {
+      const created = newExecution(db, id, Date.now() + 60_000);
+      let expected: TurnExecutionPhase = "ASSEMBLE";
+      for (const phase of path) {
+        transition(db, id, created.ownerToken, expected, phase);
+        expected = phase;
+      }
+      const stopped = requestTurnCancellation({
+        db,
+        executionId: id,
+        ownerToken: created.ownerToken,
+        reason: "timed_out",
+      });
+      expect(stopped.code).toBe("too_late");
+      expect(stopped.execution.phase).toBe(expected);
+    }
+
+    const dormant = newExecution(db, "stop-dormant-complete");
+    transition(db, "stop-dormant-complete", dormant.ownerToken, "ASSEMBLE", "WORK");
+    transition(db, "stop-dormant-complete", dormant.ownerToken, "WORK", "COMPLETE");
+    db.query(
+      "UPDATE agent_turn_executions SET cas_owner = NULL, cas_expires_at = NULL WHERE id = 'stop-dormant-complete'",
+    ).run();
+    expect(requestDormantTurnCancellation({
+      db,
+      executionId: "stop-dormant-complete",
+      userId: "u1",
+      chatId: "c1",
+    })).toMatchObject({ code: "too_late", execution: { phase: "COMPLETE" } });
+
+    const deadlineAt = Date.now() + 60_000;
+    const expiring = newExecution(db, "deadline-complete", deadlineAt);
+    transition(db, "deadline-complete", expiring.ownerToken, "ASSEMBLE", "WORK");
+    transition(db, "deadline-complete", expiring.ownerToken, "WORK", "COMPLETE");
+    expect(expireTurnExecution({
+      db,
+      executionId: "deadline-complete",
+      ownerToken: expiring.ownerToken,
+      now: deadlineAt,
+    })).toMatchObject({ code: "timed_out", execution: { phase: "TIMED_OUT" } });
+  });
   test("projects active and terminal phases with canonical status/outcome pairs", () => {
     const active = newExecution(db, "projection-active");
     expect(active.execution.workStatus).toBe("running");

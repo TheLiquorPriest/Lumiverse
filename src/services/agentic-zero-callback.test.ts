@@ -465,6 +465,7 @@ describe("Agentic strict phases enter zero host callbacks", () => {
       "interceptorPipeline",
       "macroInterceptorChain",
       "messageContentProcessorChain",
+      "providerRegistry",
       "toolRegistry",
       "worldInfoInterceptorChain",
     ]);

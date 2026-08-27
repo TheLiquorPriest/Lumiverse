@@ -353,6 +353,15 @@ export class AgentTurnLedger implements AgentTurnLedgerContract {
       !/[\u0000-\u001f\u007f]/.test(node.profileId)
         ? node.profileId
         : undefined;
+    const taskId =
+      node.taskId !== undefined &&
+      typeof node.taskId === "string" &&
+      node.taskId.length > 0 &&
+      node.taskId.length <= 256 &&
+      !/[\u0000-\u001f\u007f]/.test(node.taskId)
+        ? node.taskId
+        : undefined;
+    if (node.taskId !== undefined && taskId === undefined) return undefined;
     const toolId =
       node.toolId !== undefined && ACTIVITY_TOOL_IDS.has(node.toolId)
         ? node.toolId
@@ -376,6 +385,7 @@ export class AgentTurnLedger implements AgentTurnLedgerContract {
       kind: node.kind,
       actor: node.actor,
       ...(profileId ? { profileId } : {}),
+      ...(taskId ? { taskId } : {}),
       ...(toolId ? { toolId } : {}),
       phase: node.phase,
       status: node.status,

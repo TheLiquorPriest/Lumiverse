@@ -4,12 +4,13 @@ import type {
   AgenticWorkspaceCompletionFixedPointInput,
   AgenticWorkspaceCompletionFixedPointResult,
 } from "./agentic-work-phase.service";
-import { compileAgentAssemblyPlan, type AssemblyMessageSegmentV1, type AssemblyPlanV1 } from "./agentic-assembly-compiler";
+import { compileAgentAssemblyPlan, selectEffectiveLoomPolicyMessagesV1, type AssemblyMessageSegmentV1, type AssemblyPlanV1 } from "./agentic-assembly-compiler";
 import { compileAgentRuntimePhases, type AgentRuntimePhaseCompileResultV1 } from "./agentic-phase-runtime.service";
 import type {
   GenerationAssemblySnapshotV1,
   InputRevisionSetV1Local,
 } from "./prompt-assembly-snapshot.service";
+import { inspectLoomPromptPolicies } from "./agent-cognition.service";
 import type { WorkCouncilExecutionResult } from "./work-council.service";
 import type { CognitionEvaluationContextV1, CognitionTaskTransition } from "../types/agent-cognition";
 import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
@@ -307,6 +308,13 @@ function snapshotForPlan(candidate: AssemblyPlanV1): GenerationAssemblySnapshotV
   return { ...snapshot, snapshotId } as GenerationAssemblySnapshotV1;
 }
 
+function resealSnapshot(snapshot: GenerationAssemblySnapshotV1): GenerationAssemblySnapshotV1 {
+  const { snapshotId: _snapshotId, inputRevisionSet: _inputRevisionSet, revisions: _revisions, ...base } = snapshot;
+  const snapshotId = createHash("sha256")
+    .update(encodeCanonicalPlainData({ base, revisions: snapshot.revisions }), "utf8")
+    .digest("hex");
+  return { ...snapshot, snapshotId };
+}
 async function compiledChildFixture(
   blocks: readonly { readonly id: string; readonly content: string }[],
   profileIds: readonly string[] = ["writer"],
@@ -612,6 +620,18 @@ function customPhase(
   };
 }
 
+function acceptedCortexContext(marker: string): NonNullable<AgenticWorkOptions["cortexContext"]> {
+  return {
+    kind: "accepted",
+    value: { marker },
+    receipt: {
+      id: "cortex-receipt-1",
+      snapshotId: "cortex-snapshot-1",
+      revision: "cortex-revision-1",
+      sourceRevision: "cortex-source-1",
+    },
+  } as unknown as NonNullable<AgenticWorkOptions["cortexContext"]>;
+}
 function acceptedCouncilResult(advice: string): WorkCouncilExecutionResult {
   return {
     advice,
@@ -653,6 +673,19 @@ function acceptedCouncilResult(advice: string): WorkCouncilExecutionResult {
 }
 
 describe("Agentic WORK phase", () => {
+  test("preserves Cortex context for the unrestricted default WORK phase", async () => {
+    let dispatchedMessages: readonly LlmMessage[] = [];
+    const result = await runAgenticWorkPhase(baseOptions(async (request) => {
+      dispatchedMessages = request.messages;
+      return response("", [complete()]);
+    }, {
+      cortexContext: acceptedCortexContext("DEFAULT_WORK_CORTEX"),
+      workspace: workspace(),
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(JSON.stringify(dispatchedMessages)).toContain("DEFAULT_WORK_CORTEX");
+  });
   test("materializes sealed current-turn media as typed multipart before WORK dispatch", async () => {
     const base = plan();
     const sourceMessage = base.messages[0];
@@ -7083,4 +7116,343 @@ describe("Agentic WORK phase", () => {
   });
 
 
+  test("excludes stale optional cognition before preprocessing and detects Databank macros only on active authored blocks", async () => {
+    const databank = {
+      enabled: true,
+      activeBankIds: ["bank-1"],
+      automaticChunks: [],
+      automaticFormatted: "AUTOMATIC_DATABANK_CONTEXT",
+      mentions: [],
+      strippedUserInput: "",
+      mentionAppendix: "",
+      provenance: [{
+        kind: "automatic" as const,
+        databankId: "bank-1",
+        documentId: "document-1",
+        documentName: "Document",
+        chunkId: "chunk-1",
+        documentContentHash: null,
+        contentHash: "a".repeat(64),
+      }],
+    };
+    const withDatabank = (snapshot: GenerationAssemblySnapshotV1): GenerationAssemblySnapshotV1 =>
+      resealSnapshot({ ...snapshot, databank });
+    const stalePhaseSnapshot = (required: boolean): GenerationAssemblySnapshotV1 => {
+      const source = phaseRef("stale-optional-databank", 0);
+      const authored = plan({
+        customPhasePlan: compileAgentRuntimePhases([
+          customPhase("stale-optional", [], {
+            required,
+            instructionRefs: [source],
+          }),
+        ]),
+        loomBlocks: [phaseBlock(source, "STALE_OPTIONAL_MACRO {{databank}}")],
+      });
+      const snapshot = snapshotForPlan(authored);
+      const cognitionSource = snapshot.agentCognition.cognitionSource;
+      if (!cognitionSource) throw new Error("missing cognition source fixture");
+      return withDatabank({
+        ...snapshot,
+        blocks: snapshot.blocks.map((block) => block.id === source.blockId
+          ? { ...block, revision: "2" }
+          : block),
+        agentCognition: {
+          ...snapshot.agentCognition,
+          cognitionSource: {
+            ...cognitionSource,
+            blocks: cognitionSource.blocks.map((block) => block.blockId === source.blockId
+              ? { ...block, revision: 2 }
+              : block),
+          },
+        },
+      });
+    };
+
+    const optionalPlan = await compileAgentAssemblyPlan(stalePhaseSnapshot(false));
+    expect(optionalPlan.customPhasePlan.status).toBe("repair_required");
+    expect(optionalPlan.customPhasePlan.phases).toEqual([]);
+    expect(optionalPlan.providerMessages.some((message) => message.provenance.kind === "databank")).toBe(true);
+    expect(JSON.stringify(optionalPlan.providerMessages)).not.toContain("STALE_OPTIONAL_MACRO");
+    await expect(compileAgentAssemblyPlan(stalePhaseSnapshot(true))).rejects.toThrow(
+      "Required custom WORK phase could not be compiled",
+    );
+
+    const activeSource = phaseRef("active-databank-macro", 0);
+    const activeSnapshot = withDatabank(snapshotForPlan(plan({
+      loomBlocks: [phaseBlock(activeSource, "ACTIVE_MACRO {{databank}}")],
+    })));
+    const activePlan = await compileAgentAssemblyPlan(activeSnapshot);
+    expect(activePlan.providerMessages.some((message) => message.provenance.kind === "databank")).toBe(false);
+    const activeText = activePlan.providerMessages.flatMap((message) => message.segments)
+      .filter((segment): segment is Extract<AssemblyMessageSegmentV1, { kind: "literal" }> => segment.kind === "literal")
+      .map((segment) => segment.text)
+      .join("\n");
+    expect(activeText).toContain("ACTIVE_MACRO");
+  });
+
+  test("selects the later true same-source Loom entry and deterministically deduplicates two true entries", async () => {
+    const source = phaseRef("same-source-policy", 0);
+    const entry = (
+      id: string,
+      condition: { readonly kind: "phase"; readonly value: "WORK" | "RENDER" },
+    ): AssemblyPlanV1["loomPolicy"]["workPolicy"][number] => ({
+      version: 1,
+      id,
+      source,
+      destination: "root_work",
+      checkpoint: "WORK",
+      required: true,
+      visibility: "work_only",
+      condition,
+    });
+    const compilePolicy = async (
+      entries: readonly AssemblyPlanV1["loomPolicy"]["workPolicy"][number][],
+    ): Promise<AssemblyPlanV1> => compileAgentAssemblyPlan(snapshotForPlan(plan({
+      loomBlocks: [phaseBlock(source, "SAME_SOURCE_POLICY_TEXT")],
+      loomPolicy: {
+        version: 1,
+        workPolicy: entries,
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      },
+    })));
+    const select = (compiled: AssemblyPlanV1) => selectEffectiveLoomPolicyMessagesV1(
+      compiled.workPolicyMessages,
+      inspectLoomPromptPolicies(compiled.loomPolicy, {
+        surface: "WORK",
+        checkpoint: "WORK",
+        blocks: compiled.loomBlocks,
+        evaluation: phaseContext(),
+      }),
+      "workPolicy",
+      HOST_PREPARATION_LIMITS_V1,
+    );
+
+    const laterWinnerPlan = await compilePolicy([
+      entry("policy_a_false", { kind: "phase", value: "RENDER" }),
+      entry("policy_b_true", { kind: "phase", value: "WORK" }),
+    ]);
+    expect(laterWinnerPlan.workPolicyMessages.map((message) => (
+      message.provenance as { readonly loom?: { readonly entryId?: string } } | undefined
+    )?.loom?.entryId)).toEqual([
+      "policy_a_false",
+      "policy_b_true",
+    ]);
+    const laterWinner = select(laterWinnerPlan);
+    expect(laterWinner).toHaveLength(1);
+    expect(laterWinner[0]?.provenance.loom?.entryId).toBe("policy_b_true");
+    expect(laterWinner[0]?.segments[0]).toMatchObject({ kind: "literal", text: "SAME_SOURCE_POLICY_TEXT" });
+
+    const firstWinnerPlan = await compilePolicy([
+      entry("policy_a_first", { kind: "phase", value: "WORK" }),
+      entry("policy_b_second", { kind: "phase", value: "WORK" }),
+    ]);
+    const firstWinner = select(firstWinnerPlan);
+    expect(firstWinner).toHaveLength(1);
+    expect(firstWinner[0]?.provenance.loom?.entryId).toBe("policy_a_first");
+  });
+
+  test("replaces native phase and Cortex inputs across add, replace, and deletion transitions", async () => {
+    const first = phaseRef("native-phase-one", 0);
+    const second = phaseRef("native-phase-two", 1);
+    const third = phaseRef("native-phase-three", 2);
+    const skipped = phaseRef("native-phase-skipped", 3);
+    const phases = [
+      customPhase("native-one", [], {
+        instructionRefs: [first],
+        exit: { kind: "phase", value: "COMPLETE" },
+        nextPhaseIds: ["native-two"],
+      }),
+      customPhase("native-two", ["cortex", "council"], {
+        instructionRefs: [second],
+        exit: { kind: "phase", value: "COMPLETE" },
+        nextPhaseIds: ["native-three"],
+      }),
+      customPhase("native-three", ["cortex", "council"], {
+        instructionRefs: [third],
+        exit: { kind: "phase", value: "COMPLETE" },
+        nextPhaseIds: ["native-skipped"],
+      }),
+      customPhase("native-skipped", ["cortex"], {
+        required: false,
+        skip: { kind: "preset_variable", name: "skip-native", operator: "equals", value: true },
+        instructionRefs: [skipped],
+      }),
+    ];
+    const requests: Array<{
+      readonly messages: readonly LlmMessage[];
+      readonly providerTransientCarrier?: ProviderTransientCarrier;
+    }> = [];
+    let round = 0;
+    const result = await runAgenticWorkPhase(baseOptions(async (request) => {
+      requests.push({
+        messages: structuredClone(request.messages),
+        ...(request.providerTransientCarrier
+          ? { providerTransientCarrier: structuredClone(request.providerTransientCarrier) }
+          : {}),
+      });
+      round += 1;
+      const toolCall = complete(`native-phase-call-${round}`);
+      return {
+        content: "",
+        finish_reason: "tool_calls",
+        tool_calls: [toolCall],
+        providerTransientCarrier: {
+          kind: "openai_responses" as const,
+          items: [{
+            type: "function_call" as const,
+            id: `native-function-${round}`,
+            call_id: toolCall.call_id,
+            name: toolCall.name,
+            arguments: JSON.stringify(toolCall.args),
+          }],
+        },
+      };
+    }, {
+      plan: plan({
+        customPhasePlan: compileAgentRuntimePhases(phases),
+        loomBlocks: [
+          phaseBlock(first, "NATIVE_PHASE_ONE_ONLY"),
+          phaseBlock(second, "NATIVE_PHASE_TWO_ONLY"),
+          phaseBlock(third, "NATIVE_PHASE_THREE_ONLY"),
+          phaseBlock(skipped, "NATIVE_PHASE_SKIPPED_ONLY"),
+        ],
+      }),
+      cortexContext: acceptedCortexContext("CORTEX_PHASE_CONTEXT"),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async ({ expectedRevision }) => phaseSnapshot(expectedRevision ?? 0),
+      }),
+      workspaceCapabilities: [],
+      phaseEvaluationContext: phaseContext({ "skip-native": true }),
+      phaseAdmittedCapabilities: ["cortex", "council"],
+      council: {
+        required: true,
+        invoke: async () => acceptedCouncilResult("NATIVE_PHASE_COUNCIL_ADVICE"),
+      },
+      budget: { maxProviderRounds: 4 },
+    }));
+
+    expect(result).toMatchObject({ status: "completed" });
+    expect(requests).toHaveLength(4);
+    const texts = requests.map((request) => JSON.stringify(request));
+    const occurrences = (text: string, marker: string): number => text.split(marker).length - 1;
+    expect(occurrences(texts[0]!, "NATIVE_PHASE_ONE_ONLY")).toBe(1);
+    expect(occurrences(texts[0]!, "CORTEX_PHASE_CONTEXT")).toBe(0);
+    expect(texts[0]).not.toContain("NATIVE_PHASE_TWO_ONLY");
+
+    expect(occurrences(texts[1]!, "NATIVE_PHASE_TWO_ONLY")).toBe(1);
+    expect(occurrences(texts[1]!, "CORTEX_PHASE_CONTEXT")).toBe(1);
+    expect(occurrences(texts[1]!, "NATIVE_PHASE_COUNCIL_ADVICE")).toBe(1);
+    expect(texts[1]).not.toContain("NATIVE_PHASE_ONE_ONLY");
+    expect(texts[1]).not.toContain("NATIVE_PHASE_THREE_ONLY");
+
+    expect(occurrences(texts[2]!, "NATIVE_PHASE_THREE_ONLY")).toBe(1);
+    expect(occurrences(texts[2]!, "CORTEX_PHASE_CONTEXT")).toBe(1);
+    expect(occurrences(texts[2]!, "NATIVE_PHASE_COUNCIL_ADVICE")).toBe(1);
+    expect(texts[2]).not.toContain("NATIVE_PHASE_TWO_ONLY");
+
+    expect(texts[3]).not.toContain("NATIVE_PHASE_ONE_ONLY");
+    expect(texts[3]).not.toContain("NATIVE_PHASE_TWO_ONLY");
+    expect(texts[3]).not.toContain("NATIVE_PHASE_THREE_ONLY");
+    expect(texts[3]).not.toContain("NATIVE_PHASE_SKIPPED_ONLY");
+    expect(texts[3]).not.toContain("CORTEX_PHASE_CONTEXT");
+    expect(texts[3]).not.toContain("NATIVE_PHASE_COUNCIL_ADVICE");
+    expect(JSON.stringify(result.materializedMessages)).not.toContain("NATIVE_PHASE_");
+    expect(JSON.stringify(result.materializedMessages)).not.toContain("CORTEX_PHASE_CONTEXT");
+  });
+
+  test("omits child phase context after all authored phases are skipped", async () => {
+    const fixture = await compiledChildFixture([
+      { id: "phase-child", content: "{{agent::writer::as=phase_child_result}}child{{/agent}}" },
+      { id: "phase-child-result", content: "result {{agentResult::phase_child_result}}" },
+    ]);
+    const source = phaseRef("skipped-child-phase", 2);
+    const phase = customPhase("skipped-child-phase", ["cortex"], {
+      required: false,
+      skip: { kind: "preset_variable", name: "skip-child-phase", operator: "equals", value: true },
+      instructionRefs: [source],
+    });
+    const blocks = [...fixture.snapshot.blocks, {
+      id: source.blockId,
+      name: source.blockId,
+      content: "SKIPPED_CHILD_PHASE_CONTEXT",
+      role: "system" as const,
+      enabled: true,
+      position: "pre_history" as const,
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      group: null,
+      sealed: false,
+      order: source.promptOrder,
+      revision: String(source.blockRevision),
+    }];
+    if (!fixture.snapshot.agentConfig) throw new Error("missing child config fixture");
+    const configured = parseAgentConfigV2({
+      ...fixture.snapshot.agentConfig,
+      runtimePolicy: {
+        version: 1,
+        authority: "loom",
+        scope: "preset",
+        defaultMode: "response",
+        loomPolicy: null,
+        phases: [phase],
+      },
+    });
+    const phasedSnapshot = resealSnapshot({
+      ...fixture.snapshot,
+      blocks,
+      agentConfig: configured,
+      agentCognition: {
+        ...fixture.snapshot.agentCognition,
+        cognitionSource: {
+          presetRevision: source.presetRevision,
+          blocks: blocks.map((block) => ({
+            blockId: block.id,
+            revision: Number(block.revision),
+            promptOrder: block.order,
+          })),
+        },
+      },
+    });
+    const phasedPlan = await compileAgentAssemblyPlan(phasedSnapshot);
+    let childHadPhaseId = true;
+    let childHadPhaseSubset = true;
+    const rootRequests: string[] = [];
+    const result = await runAgenticWorkPhase(baseOptions(async (request) => {
+      rootRequests.push(JSON.stringify(request));
+      return response("", [complete("skipped-child-complete")]);
+    }, {
+      plan: phasedPlan,
+      snapshot: phasedSnapshot,
+      childProfiles: [{
+        profileId: "writer",
+        provider: "writer-provider",
+        connectionId: "writer-connection",
+        model: "writer-model",
+      }],
+      executeChild: async (input) => {
+        childHadPhaseId = Object.hasOwn(input, "phaseId");
+        childHadPhaseSubset = Object.hasOwn(input, "phaseInstructionSubset");
+        return { content: "CHILD_RESULT", status: "succeeded" };
+      },
+      cortexContext: acceptedCortexContext("SKIPPED_CHILD_CORTEX"),
+      workspace: workspace({
+        getPhaseEvaluationSnapshot: async ({ expectedRevision }) => phaseSnapshot(expectedRevision ?? 0),
+      }),
+      workspaceCapabilities: [],
+      phaseEvaluationContext: phaseContext({ "skip-child-phase": true }),
+      phaseAdmittedCapabilities: ["cortex"],
+    }));
+
+    expect(result.status).toBe("completed");
+    expect(childHadPhaseId).toBe(false);
+    expect(childHadPhaseSubset).toBe(false);
+    expect(rootRequests).toHaveLength(1);
+    expect(rootRequests[0]).not.toContain("SKIPPED_CHILD_PHASE_CONTEXT");
+    expect(rootRequests[0]).not.toContain("SKIPPED_CHILD_CORTEX");
+  });
 });

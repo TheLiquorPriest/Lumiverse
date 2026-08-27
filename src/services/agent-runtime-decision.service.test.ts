@@ -334,6 +334,27 @@ describe("AgentRuntimeDecisionService", () => {
     const expired = await service.consume(USER_ID, issuedExpired.runtimeDecisionToken!, request());
     expect(expired.accepted).toBe(false);
   });
+  test("claims one-use tokens without resolving a target and burns cross-user claims", async () => {
+    const service = makeService();
+
+    const owned = await service.resolve(USER_ID, request());
+    expect(service.claim(USER_ID, "not-a-runtime-token")).toBe(false);
+    expect(service.claim(USER_ID, owned.runtimeDecisionToken!)).toBe(true);
+    expect(service.claim(USER_ID, owned.runtimeDecisionToken!)).toBe(false);
+    await expect(service.consume(USER_ID, owned.runtimeDecisionToken!, request())).resolves.toMatchObject({
+      accepted: false,
+      code: "decision_refresh_required",
+    });
+
+    const crossUser = await service.resolve(USER_ID, request());
+    expect(service.claim("user-b", crossUser.runtimeDecisionToken!)).toBe(false);
+    expect(service.claim(USER_ID, crossUser.runtimeDecisionToken!)).toBe(false);
+    await expect(service.consume(USER_ID, crossUser.runtimeDecisionToken!, request())).resolves.toMatchObject({
+      accepted: false,
+      code: "decision_refresh_required",
+    });
+  });
+
   test("consumes a token when readiness is absent from both requests", async () => {
     const service = makeService();
     const issueRequest = request();

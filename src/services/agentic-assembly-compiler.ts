@@ -796,6 +796,7 @@ function projectStructuralBlockAdmission(
 async function preprocessSnapshot(
   snapshot: GenerationAssemblySnapshotV1,
   phasePolicyBlockIds: ReadonlySet<string> = new Set(),
+  ignoredCognitionBlockIds: ReadonlySet<string> = new Set(),
 ): Promise<SnapshotPreprocessingResult> {
   const worldInfo = activateSnapshotWorldInfo(snapshot);
   const env = buildSnapshotMacroEnv(snapshot);
@@ -942,6 +943,10 @@ async function preprocessSnapshot(
   const structuralBlockValues = snapshot.participants.structuralBlockValues;
   for (const [blockIndex, sourceBlock] of snapshot.blocks.entries()) {
     const block = projectStructuralBlockAdmission(sourceBlock, structuralBlockValues);
+    if (ignoredCognitionBlockIds.has(block.id)) {
+      blocks.push(frozen({ ...block, enabled: false, content: "" }));
+      continue;
+    }
     const child = assertChildMarkersAreSealed(block.content, block, blockIndex);
     if (child && phasePolicyBlockIds.has(block.id)) {
       failForBlock("requires_response_mode", "Cognition policy blocks cannot contain agent result references", block, blockIndex);
@@ -1207,8 +1212,10 @@ function cognitionPhaseRefs(
   const normalize = (
     refs: readonly CognitionLoomBlockRefV1[],
     path: string,
+    preserveDuplicates = false,
   ): CognitionLoomBlockRefV1[] => {
     const seen = new Map<string, CognitionLoomBlockRefV1>();
+    const retained: CognitionLoomBlockRefV1[] = [];
     for (const ref of refs) {
       const previous = seen.get(ref.blockId);
       if (previous && (
@@ -1229,18 +1236,19 @@ function cognitionPhaseRefs(
       ) {
         throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} source revision mismatch`);
       }
-      seen.set(ref.blockId, ref);
+      if (!previous) seen.set(ref.blockId, ref);
+      if (preserveDuplicates || !previous) retained.push(ref);
     }
-    return [...seen.values()].sort((left, right) => {
+    return retained.sort((left, right) => {
       const leftOrder = sourceBlocks.get(left.blockId)?.promptOrder ?? 0;
       const rightOrder = sourceBlocks.get(right.blockId)?.promptOrder ?? 0;
       return leftOrder - rightOrder || compareUtf8(left.blockId, right.blockId);
     });
   };
-  const normalizedWork = normalize(workPolicy, "workPolicy");
-  const normalizedUsage = normalize(workspaceUsage, "workspaceUsage");
-  const normalizedCompletion = normalize(completionCriteria, "completionCriteria");
-  const normalizedRender = normalize(renderPolicy, "renderPolicy");
+  const normalizedWork = normalize(workPolicy, "workPolicy", true);
+  const normalizedUsage = normalize(workspaceUsage, "workspaceUsage", true);
+  const normalizedCompletion = normalize(completionCriteria, "completionCriteria", true);
+  const normalizedRender = normalize(renderPolicy, "renderPolicy", true);
   const normalizedCustom = normalize(customInstructions, "customPhases");
   const excludedBlockIds = new Set([
     ...normalizedWork,
@@ -1255,6 +1263,34 @@ function cognitionPhaseRefs(
     completionCriteria: normalizedCompletion,
     renderPolicy: normalizedRender,
     excludedBlockIds,
+  };
+}
+interface CognitionBlockAdmissionV1 {
+  readonly excludedBlockIds: ReadonlySet<string>;
+  readonly ignoredBlockIds: ReadonlySet<string>;
+}
+
+function cognitionBlockAdmission(
+  loomPolicy: LoomPolicyBucketsV1,
+  parsedConfig: AgentConfigV2 | undefined,
+  phaseRefs: CognitionPhaseRefsV1,
+): CognitionBlockAdmissionV1 {
+  const authoredBlockIds = new Set<string>();
+  for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
+    for (const entry of loomPolicy[bucket]) authoredBlockIds.add(entry.source.blockId);
+  }
+  for (const phase of parsedConfig?.runtimePolicy?.phases ?? []) {
+    for (const ref of phase.instructionRefs) authoredBlockIds.add(ref.blockId);
+    for (const subset of phase.childInstructionSubsets) {
+      for (const ref of subset.instructionRefs) authoredBlockIds.add(ref.blockId);
+    }
+  }
+  const ignoredBlockIds = new Set(
+    [...authoredBlockIds].filter((blockId) => !phaseRefs.excludedBlockIds.has(blockId)),
+  );
+  return {
+    excludedBlockIds: new Set([...phaseRefs.excludedBlockIds, ...authoredBlockIds]),
+    ignoredBlockIds,
   };
 }
 const EMPTY_LOOM_POLICY: LoomPolicyBucketsV1 = Object.freeze({
@@ -1494,19 +1530,26 @@ function phasePolicyMessages(
   policy: LoomPolicyBucketsV1,
 ): readonly AssemblyProviderMessageV1[] {
   const byId = new Map(blocks.map((block, index) => [block.id, { block, index }] as const));
-  const policyBySource = new Map<string, LoomPolicyEntryV1>();
+  const policyBySource = new Map<string, LoomPolicyEntryV1[]>();
   for (const entry of policy[bucket]) {
     const key = `${entry.source.blockId}\u0000${entry.source.presetRevision}\u0000${entry.source.blockRevision}`;
-    if (!policyBySource.has(key)) policyBySource.set(key, entry);
+    const entries = policyBySource.get(key) ?? [];
+    entries.push(entry);
+    policyBySource.set(key, entries);
   }
+  const consumedBySource = new Map<string, number>();
   const messages: AssemblyProviderMessageV1[] = [];
   for (const [order, ref] of refs.entries()) {
     const entry = byId.get(ref.blockId);
     if (!entry) throw new AssemblyPlanValidationError("invalid_input", `Loom policy block ${ref.blockId} is missing`);
-    const sourceEntry = policyBySource.get(`${ref.blockId}\u0000${ref.expectedPresetRevision}\u0000${ref.expectedBlockRevision}`);
+    const sourceKey = `${ref.blockId}\u0000${ref.expectedPresetRevision}\u0000${ref.expectedBlockRevision}`;
+    const sourceEntries = policyBySource.get(sourceKey);
+    const sourceEntryIndex = consumedBySource.get(sourceKey) ?? 0;
+    const sourceEntry = sourceEntries?.[sourceEntryIndex];
     if (!sourceEntry) {
       throw new AssemblyPlanValidationError("invalid_input", `Loom policy provenance is missing for ${ref.blockId}`);
     }
+    consumedBySource.set(sourceKey, sourceEntryIndex + 1);
     if (!entry.block.enabled) throw new AssemblyPlanValidationError("invalid_input", `Loom policy block ${ref.blockId} is disabled`);
     if (agentMarkersPresent(entry.block.content)) throw new AssemblyPlanValidationError("requires_response_mode", "Loom policy blocks cannot contain agent result references");
     const literal = makeLiteral(entry.block.content, limits.maxOperationBytes, entry.block, entry.index)
@@ -1822,9 +1865,17 @@ export async function compileAgentAssemblyPlan(
   }
   const loomPolicy = loomPolicyForSnapshot(snapshot, parsedConfig);
   const phaseRefs = cognitionPhaseRefs(snapshot, parsedConfig, customPhasePlan);
-  const preparation = await preprocessSnapshot(snapshot, phaseRefs.excludedBlockIds);
-  const macroHandlesDatabank = snapshotUsesDatabankRetrievalMacro(preparation.blocks);
-  const parsed = parseBlocks(snapshot, parsedConfig, preparation.blocks, phaseRefs.excludedBlockIds);
+  const cognitionAdmission = cognitionBlockAdmission(loomPolicy, parsedConfig, phaseRefs);
+  const preparation = await preprocessSnapshot(
+    snapshot,
+    cognitionAdmission.excludedBlockIds,
+    cognitionAdmission.ignoredBlockIds,
+  );
+  const authoredNonCognitionBlocks = snapshot.blocks
+    .map((block) => projectStructuralBlockAdmission(block, snapshot.participants.structuralBlockValues))
+    .filter((block) => !cognitionAdmission.excludedBlockIds.has(block.id));
+  const macroHandlesDatabank = snapshotUsesDatabankRetrievalMacro(authoredNonCognitionBlocks);
+  const parsed = parseBlocks(snapshot, parsedConfig, preparation.blocks, cognitionAdmission.excludedBlockIds);
   const loomBlocks = loomBlocksForPolicy(loomPolicy, preparation.blocks, snapshot.agentCognition.cognitionSource, customPhasePlan);
   const producerByName = new Map<string, { block: SnapshotBlockV1; blockIndex: number; child: ParsedChild }>();
   for (const item of parsed) {
@@ -2013,11 +2064,7 @@ export async function compileAgentAssemblyPlan(
   const completionCriteriaMessages = phasePolicyMessages(preparation.blocks, phaseRefs.completionCriteria, snapshot.limits, "completionCriteria", loomPolicy);
   const renderPolicyMessages = phasePolicyMessages(preparation.blocks, phaseRefs.renderPolicy, snapshot.limits, "renderPolicy", loomPolicy);
   const phaseMessages = [...workPolicyMessages, ...workspaceUsageMessages, ...completionCriteriaMessages, ...renderPolicyMessages];
-  const worldInfoMessageCount = preparation.worldBefore.length + preparation.worldAfter.length
-    + preparation.worldAnBefore.length + preparation.worldAnAfter.length
-    + preparation.worldEmBefore.length + preparation.worldEmAfter.length
-    + preparation.worldDepth.length + preparation.worldRuntime.length;
-  if (providerMessages.length + phaseMessages.length > snapshot.limits.maxPromptBlocks + snapshot.messages.length + worldInfoMessageCount) {
+  if (providerMessages.length + phaseMessages.length > snapshot.limits.maxPromptBlocks * 16) {
     throw new AssemblyPlanValidationError("limit_exceeded", "Provider and cognition policy message limit exceeded");
   }
   const seals: AssemblySealV1[] = [];
@@ -3225,9 +3272,10 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   }
   const config = parserConfig(configFor(snapshot, undefined));
   const phaseRefs = cognitionPhaseRefs(snapshot, config, expectedPlan.customPhasePlan);
+  const cognitionAdmission = cognitionBlockAdmission(expectedPlan.loomPolicy, config, phaseRefs);
   const validationBlocks = snapshot.blocks.map((block) =>
     projectStructuralBlockAdmission(block, snapshot.participants.structuralBlockValues));
-  const parsed = parseBlocks(snapshot, config, validationBlocks, phaseRefs.excludedBlockIds);
+  const parsed = parseBlocks(snapshot, config, validationBlocks, cognitionAdmission.excludedBlockIds);
   const expectedProfileOutputLimits = profileOutputLimitsFor(snapshot, config);
   if (canonical(plan.profileOutputLimits) !== canonical(expectedProfileOutputLimits)) {
     throw new AssemblyPlanValidationError("invalid_input", "Profile output limits are not bound to the requested snapshot");

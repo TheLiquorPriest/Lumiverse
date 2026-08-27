@@ -12,8 +12,9 @@ import { HOST_PREPARATION_LIMITS_V1 } from "../types/agent-preprocessing";
 import type { CognitionActivationResultV1, CognitionActivationStateV1 } from "../types/agent-cognition";
 import type { CognitionRuntimeActivationV1 } from "../types/agent-cognition-runtime";
 import { AgentRuntimeOwner } from "./agent-runtime.service";
+import type { FrozenConcreteConnectionV1 } from "../types/agent-runtime-decision";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
-import { createAgenticChildFrame, createAgenticRootFrame, executeBoundedAgenticChildFrame } from "./agentic-work-phase.service";
+import { createAgenticChildFrame, createAgenticRootFrame, executeBoundedAgenticChildFrame, type AgenticWorkProviderRequest } from "./agentic-work-phase.service";
 import { compileAgentRuntimePhases } from "./agentic-phase-runtime.service";
 import { createAgentCognitionRuntime } from "./agent-cognition-runtime.service";
 import { evaluateCognitionPredicate } from "./agent-cognition.service";
@@ -31,6 +32,7 @@ import {
 } from "./turn-execution.service";
 import {
   AGENT_RUNTIME_DECISION_SERVICE,
+  canonicalRuntimeCapabilityDigest,
   resolveEffectiveRuntime,
 } from "./agent-runtime-decision.service";
 import { getIsolateHealthEpoch, probeIsolateBackendsAtStartup } from "./isolate-pool";
@@ -42,7 +44,7 @@ import { EventType } from "../ws/events";
 import { waitForAgenticGeneration } from "./agentic-generation.service";
 import { startGeneration } from "./generate.service";
 import * as breakdownSvc from "./breakdown.service";
-import { getAgentRunInspection } from "./agent-activity-runs.service";
+import { createAgentInspectionWriter, getAgentRunInspection, type AgentInspectionWriterV1 } from "./agent-activity-runs.service";
 import { deleteChat } from "./chats.service";
 import { generateRoutes } from "../routes/generate.routes";
 
@@ -439,6 +441,42 @@ class ScriptedProvider implements LlmProvider {
   async validateKey(): Promise<boolean> { return true; }
   async listModels(): Promise<string[]> { return ["scripted-model"]; }
 }
+type InspectionProviderScenario = "success" | "throw_after_yield" | "abort_after_yield" | "timeout_after_yield" | "receive_cap" | "output_cap";
+let inspectionProviderScenario: InspectionProviderScenario = "success";
+let inspectionProviderYielded: (() => void) | undefined;
+class InspectionLifecycleProvider implements LlmProvider {
+  readonly name = "inspection-lifecycle-provider";
+  readonly displayName = "Inspection lifecycle provider";
+  readonly defaultUrl = "https://inspection-lifecycle.invalid/v1";
+  readonly capabilities = new ScriptedProvider().capabilities;
+
+  async generate(): Promise<GenerationResponse> {
+    return { content: "unused", finish_reason: "stop" };
+  }
+
+  async *generateStream(key: string, _url: string, request: GenerationRequest): AsyncGenerator<StreamChunk, void, unknown> {
+    yield { token: "partial" };
+    inspectionProviderYielded?.();
+    if (inspectionProviderScenario === "throw_after_yield") throw new Error("provider-secret:" + key);
+    if (inspectionProviderScenario === "timeout_after_yield") throw new DOMException("provider-secret:" + key, "TimeoutError");
+    if (inspectionProviderScenario === "abort_after_yield") {
+      await new Promise<void>(() => {});
+      return;
+    }
+    if (inspectionProviderScenario === "receive_cap") {
+      yield { token: "x".repeat(1024) };
+      return;
+    }
+    yield {
+      token: inspectionProviderScenario === "output_cap" ? " capped-output" : " success",
+      finish_reason: "stop",
+      usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
+    };
+  }
+
+  async validateKey(): Promise<boolean> { return true; }
+  async listModels(): Promise<string[]> { return ["inspection-model"]; }
+}
 class BoundScriptedProvider implements LlmProvider {
   readonly displayName: string;
   readonly capabilities = new ScriptedProvider().capabilities;
@@ -592,6 +630,7 @@ beforeAll(async () => {
   await applyBaseline();
   seed();
   if (!getProvider("scripted-coordinator")) registerProvider(new ScriptedProvider());
+  if (!getProvider("inspection-lifecycle-provider")) registerProvider(new InspectionLifecycleProvider());
   if (!getProvider("scripted-child-a")) {
     registerProvider(new BoundScriptedProvider(
       "scripted-child-a",
@@ -623,6 +662,242 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     expect(true).toBe(true);
   });
+  test("records every child provider stream outcome exactly once without leaking secrets", async () => {
+    const capabilities = new InspectionLifecycleProvider().capabilities;
+    const connection = {
+      logicalId: "inspection-connection",
+      concreteId: "inspection-connection",
+      label: "Inspection connection",
+      provider: "inspection-lifecycle-provider",
+      model: "inspection-model",
+      effectiveEndpoint: "https://inspection-lifecycle.invalid/v1",
+      endpointRevision: "endpoint-frozen",
+      credentialSecretRef: "credential-ref-frozen",
+      credentialRevision: "credential-frozen",
+      candidateRevision: "candidate-frozen",
+      revision: "connection-frozen",
+      fingerprint: "source-fingerprint-frozen",
+      capabilityDigest: canonicalRuntimeCapabilityDigest(capabilities),
+      capabilities,
+    } satisfies FrozenConcreteConnectionV1;
+    const records: Array<{ kind: string; value: Record<string, unknown>; state: unknown }> = [];
+    const writer: AgentInspectionWriterV1 = {
+      record: (kind, value, state) => {
+        records.push({ kind, value: value as Record<string, unknown>, state });
+        return null;
+      },
+    };
+    const authoredCorrelation = __testing.createChildInspectionCorrelation(writer);
+    authoredCorrelation.writer!.record("policy", {
+      id: "work:child-policy:generated-authored",
+      kind: "policy",
+      actor: "host",
+      recipient: "child",
+    });
+    expect(records).toHaveLength(0);
+    authoredCorrelation.bind("generated-authored", "authored-task-id");
+    expect(records[0]?.value.correlation).toEqual({ taskId: "authored-task-id" });
+    records.length = 0;
+    authoredCorrelation.writer!.record("transcript", {
+      id: "tool:work:0:collision-id",
+      kind: "delegation",
+      actor: "agent",
+      recipient: "host",
+      correlation: { toolId: "agent_delegate", taskId: "authored-task-a" },
+    });
+    authoredCorrelation.writer!.record("transcript", {
+      id: "work:task:1:authored-task",
+      kind: "task",
+      actor: "agent",
+      recipient: "host",
+      correlation: { taskId: "collision-id" },
+    });
+    expect(records.at(-1)?.value.correlation).toEqual({ taskId: "collision-id" });
+    records.length = 0;
+
+    const activityNodes: Array<{ readonly id: string; readonly actor: string; readonly taskId?: string }> = [];
+    __testing.recordPublicWorkActivity({
+      recordActivityNode: (node) => activityNodes.push({ id: node.id, actor: node.actor, ...(node.taskId ? { taskId: node.taskId } : {}) }),
+    }, {
+      observations: [{
+        sequence: 0,
+        callId: "authored-task-a",
+        correlationId: "authored-task-a",
+        toolName: "workspace_create_task",
+        status: "success",
+        resultBytes: 0,
+      }],
+      childResults: [{
+        childId: "generated-collision-child",
+        profileId: "delegate",
+        slotIndex: 0,
+        required: true,
+        status: "succeeded",
+        outputBytes: 1,
+      }],
+    }, "generation-collision", new Map([["generated-collision-child", "authored-task-a"]]));
+    expect(activityNodes).toEqual([
+      { id: "authored-task-a", actor: "tool" },
+      { id: "task:authored-task-a", actor: "child", taskId: "authored-task-a" },
+    ]);
+    const intrinsicCorrelation = __testing.createChildInspectionCorrelation(writer);
+    intrinsicCorrelation.writer!.record("policy", {
+      id: "work:child-policy:generated-intrinsic",
+      kind: "policy",
+      actor: "host",
+      recipient: "child",
+    });
+    intrinsicCorrelation.bind("generated-intrinsic");
+    expect(records[0]?.value.correlation).toEqual({ taskId: "generated-intrinsic" });
+    records.length = 0;
+    const makeRequest = (controller: AbortController, receiveLimitBytes = 4096): AgenticWorkProviderRequest => ({
+      frame: createAgenticChildFrame({
+        frameId: "inspection-child-frame",
+        parentFrameId: "inspection-root-frame",
+        provider: connection.provider,
+        connectionId: connection.concreteId,
+        model: connection.model,
+        coreToolIds: [],
+        taskId: "authored-task-id",
+        workspaceCapabilities: [],
+        signal: controller.signal,
+      }),
+      connectionId: connection.concreteId,
+      model: connection.model,
+      messages: [{ role: "user", content: "bounded provider lifecycle" }],
+      receiveLimitBytes,
+      publishedOutputLimitBytes: 4096,
+      tools: [],
+      toolMode: "ordinary",
+      maxOutputTokens: 32,
+      roundIndex: 0,
+      signal: controller.signal,
+    });
+    const outputCapLedger = {
+      reserveProviderDispatch: () => ({
+        logical: { consume() {}, release() {} },
+        physical: { consume() {}, release() {} },
+      }),
+      acquireProviderPermit: () => ({}),
+      releaseOperationPermit() {},
+      remaining: () => 0,
+      charge: () => false,
+    } as unknown as NonNullable<Parameters<typeof __testing.makeWorkProvider>[3]>;
+    const dispatch = (request: AgenticWorkProviderRequest, ledger?: typeof outputCapLedger) =>
+      __testing.makeWorkProvider(
+        USER_ID,
+        connection,
+        undefined,
+        ledger,
+        "RAW_CREDENTIAL_SENTINEL",
+        (providerRequest, outcome) => __testing.recordChildProviderExchange(
+          writer,
+          providerRequest,
+          outcome,
+          connection,
+          ADMITTED_CONFIG_REVISION,
+          "delegate",
+          "generated-child-id",
+        ),
+      )(request);
+    const assertSingleFailure = (reason: string, code: string): void => {
+      const exchanges = records.filter((record) => record.kind === "provider_exchange");
+      expect(exchanges).toHaveLength(1);
+      expect(records.filter((record) => record.kind === "usage")).toHaveLength(0);
+      const exchange = exchanges[0]!.value;
+      expect(exchange).not.toHaveProperty("content");
+      expect(exchange.errorReason).toBe(reason);
+      expect(JSON.parse(String(exchange.result))).toEqual(expect.objectContaining({ code }));
+      expect(exchange.provider).toEqual({
+        adapter: "agentic-work",
+        providerId: connection.provider,
+        modelId: connection.model,
+        connectionId: connection.concreteId,
+        configRevision: ADMITTED_CONFIG_REVISION,
+        connectionRevision: connection.candidateRevision,
+        fingerprint: connection.fingerprint,
+      });
+      expect(exchange.correlation).toEqual({
+        taskId: "authored-task-id",
+        parentId: "inspection-root-frame",
+      });
+      const encoded = JSON.stringify(records);
+      expect(encoded).not.toContain("RAW_CREDENTIAL_SENTINEL");
+      expect(encoded).not.toContain("provider-secret");
+      expect(encoded).not.toContain("abort-secret");
+    };
+
+    inspectionProviderScenario = "success";
+    await dispatch(makeRequest(new AbortController()));
+    expect(records.filter((record) => record.kind === "provider_exchange")).toHaveLength(1);
+    expect(records.filter((record) => record.kind === "usage")).toHaveLength(1);
+    records.length = 0;
+
+    for (const [scenario, reason, code, receiveLimitBytes, ledger] of [
+      ["throw_after_yield", "provider_failure", "provider_failure", 4096, undefined],
+      ["timeout_after_yield", "provider_failure", "provider_failure", 4096, undefined],
+      ["receive_cap", "budget_exhausted", "limit_exceeded", 32, undefined],
+      ["output_cap", "budget_exhausted", "child_output_limit_exceeded", 4096, outputCapLedger],
+    ] as const) {
+      inspectionProviderScenario = scenario;
+      await expect(dispatch(makeRequest(new AbortController(), receiveLimitBytes), ledger)).rejects.toBeDefined();
+      assertSingleFailure(reason, code);
+      records.length = 0;
+    }
+    inspectionProviderScenario = "success";
+    await expect(dispatch({ ...makeRequest(new AbortController()), publishedOutputLimitBytes: 1 })).rejects.toBeDefined();
+    assertSingleFailure("budget_exhausted", "child_output_limit_exceeded");
+    records.length = 0;
+
+    inspectionProviderScenario = "abort_after_yield";
+    const controller = new AbortController();
+    const yielded = new Promise<void>((resolve) => { inspectionProviderYielded = resolve; });
+    const pending = dispatch(makeRequest(controller));
+    await yielded;
+    controller.abort(new DOMException("abort-secret", "AbortError"));
+    await expect(pending).rejects.toBeDefined();
+    assertSingleFailure("interrupted", "cancelled");
+    inspectionProviderYielded = undefined;
+    inspectionProviderScenario = "success";
+    const persistedAttemptId = "inspection-provider-failure-persisted";
+    const persistedWriter = createAgentInspectionWriter({
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      attemptId: persistedAttemptId,
+      runId: persistedAttemptId,
+      turnSessionId: persistedAttemptId,
+      generationId: persistedAttemptId,
+      generationType: "normal",
+      hostCorrelationId: persistedAttemptId,
+      lifecycle: "WORK",
+      status: "running",
+    });
+    const persistedDispatch = (request: AgenticWorkProviderRequest) =>
+      __testing.makeWorkProvider(
+        USER_ID,
+        connection,
+        undefined,
+        undefined,
+        "RAW_CREDENTIAL_SENTINEL",
+        (providerRequest, outcome) => __testing.recordChildProviderExchange(
+          persistedWriter,
+          providerRequest,
+          outcome,
+          connection,
+          ADMITTED_CONFIG_REVISION,
+          "delegate",
+          "generated-child-id",
+        ),
+      )(request);
+    inspectionProviderScenario = "throw_after_yield";
+    await expect(persistedDispatch(makeRequest(new AbortController()))).rejects.toBeDefined();
+    const persistedInspection = getAgentRunInspection(USER_ID, persistedAttemptId, AGENTIC_CHAT_ID);
+    expect(persistedInspection?.transcript.filter((record) => record.kind === "provider_exchange")).toHaveLength(1);
+    expect(JSON.stringify(persistedInspection)).not.toContain("RAW_CREDENTIAL_SENTINEL");
+    expect(JSON.stringify(persistedInspection)).not.toContain("provider-secret");
+    inspectionProviderScenario = "success";
+  });
+
   test("bounds persistent recovery while prioritizing receipt-backed committed sessions", () => {
     const db = getDb();
     const workspaceId = "workspace:persistent-recovery-budget";
@@ -2709,6 +2984,46 @@ describe("production agentic coordinator installation", () => {
         "SELECT child_frame_id FROM agent_workspace_submissions WHERE turn_id = ? AND task_id = ?",
       ).get(execution.id, "task-delegate") as { child_frame_id: string } | null;
       expect(submission).toEqual({ child_frame_id: expectedChildFrameId });
+      const inspection = getAgentRunInspection(USER_ID, execution.id, AGENTIC_CHAT_ID);
+      const frozenDelegate = (decision.internal as {
+        readonly childConnections?: Readonly<Record<string, {
+          readonly concreteId?: string | null;
+          readonly candidateRevision?: string | number | null;
+          readonly fingerprint?: string | null;
+        }>>;
+      }).childConnections?.delegate;
+      const childExchanges = inspection?.transcript.filter((record) =>
+        record.kind === "provider_exchange" && record.recipient === "child") ?? [];
+      expect(childExchanges.length).toBeGreaterThanOrEqual(1);
+      for (const exchange of childExchanges) {
+        expect(exchange.correlation.taskId).toBe("task-delegate");
+        expect(exchange.provider).toEqual({
+          adapter: "agentic-work",
+          providerId: "scripted-coordinator",
+          modelId: "scripted-model",
+          connectionId: frozenDelegate?.concreteId ?? null,
+          configRevision: ADMITTED_CONFIG_REVISION,
+          connectionRevision: frozenDelegate?.candidateRevision ?? null,
+          fingerprint: frozenDelegate?.fingerprint ?? null,
+        });
+        expect(JSON.parse(exchange.arguments ?? "{}")).toMatchObject({
+          profileId: "delegate",
+          connectionId: frozenDelegate?.concreteId,
+          configRevision: ADMITTED_CONFIG_REVISION,
+          sourceFingerprint: frozenDelegate?.fingerprint,
+        });
+      }
+      const correlatedDelegation = inspection?.transcript.filter((record) => record.kind === "delegation") ?? [];
+      expect(correlatedDelegation.length).toBeGreaterThanOrEqual(2);
+      expect(correlatedDelegation.every((record) => record.correlation.taskId === "task-delegate")).toBe(true);
+      const childLifecycle = inspection?.transcript.filter((record) =>
+        record.kind === "child_result") ?? [];
+      expect(childLifecycle.length).toBeGreaterThanOrEqual(1);
+      expect(childLifecycle.every((record) => record.correlation.taskId === "task-delegate")).toBe(true);
+      expect(inspection?.activity.milestones.some((node) =>
+        node.id === "projection:task:task-delegate" && node.actor === "child")).toBe(true);
+      expect(inspection?.activity.milestones.some((node) =>
+        node.id === "projection:" + expectedChildFrameId || node.id === "projection:" + expectedDelegateFrameId)).toBe(false);
       scriptedTaskCreated = false;
       delegateIssued = false;
       scriptedAcceptanceIssued = false;
@@ -2948,6 +3263,8 @@ describe("production agentic coordinator installation", () => {
         const inspection = getAgentRunInspection(USER_ID, execution.id, AGENTIC_CHAT_ID);
         for (const profileId of ["delegate", "delegate_alt"] as const) {
           const expected = expectedByProfile[profileId];
+          const plannedChild = plan.children.find((child) => child.profileId === profileId);
+          expect(plannedChild).toBeDefined();
           const dispatches = boundProviderDispatches.filter((dispatch) => dispatch.provider === expected.provider);
           expect(dispatches).toHaveLength(1);
           expect(dispatches[0]).toMatchObject({ provider: expected.provider, url: expected.endpoint });
@@ -2959,19 +3276,24 @@ describe("production agentic coordinator installation", () => {
             record.kind === "provider_exchange"
             && record.recipient === "child"
             && record.provider?.providerId === expected.provider);
-          expect(childExchange?.provider).toMatchObject({
+          expect(childExchange?.provider).toEqual({
             adapter: "agentic-work",
             providerId: expected.provider,
             modelId: expected.model,
-            connectionRevision: childConnections[profileId]?.candidateRevision,
-            fingerprint: childConnections[profileId]?.fingerprint,
+            connectionId: expected.connectionId,
+            configRevision: ADMITTED_CONFIG_REVISION,
+            connectionRevision: childConnections[profileId]?.candidateRevision ?? null,
+            fingerprint: childConnections[profileId]?.fingerprint ?? null,
           });
+          expect(childExchange?.correlation.taskId).toBe(plannedChild!.childId);
           const exchangeArguments = JSON.parse(childExchange?.arguments ?? "{}");
           expect(exchangeArguments).toMatchObject({
             profileId,
             provider: expected.provider,
             connectionId: expected.connectionId,
             model: expected.model,
+            configRevision: ADMITTED_CONFIG_REVISION,
+            sourceFingerprint: childConnections[profileId]?.fingerprint,
           });
           const childUsage = inspection?.usageEvidence.find((usage) =>
             usage.layer === "child"
@@ -2983,9 +3305,15 @@ describe("production agentic coordinator installation", () => {
             totalTokens: expected.totalTokens,
             canonical: false,
           });
+          expect(childUsage?.correlation?.taskId).toBe(plannedChild!.childId);
+          const intrinsicLifecycle = inspection?.transcript.filter((record) =>
+            record.kind === "child_result" && record.id.includes(plannedChild!.childId)) ?? [];
+          expect(intrinsicLifecycle.length).toBeGreaterThanOrEqual(1);
+          expect(intrinsicLifecycle.every((record) =>
+            record.correlation.taskId === plannedChild!.childId)).toBe(true);
           const childActivity = inspection?.activity.milestones.find((activity) =>
             activity.actor === "child"
-            && activity.id === "projection:" + childExchange?.correlation.taskId);
+            && activity.id === "projection:task:" + childExchange?.correlation.taskId);
           expect(childActivity).toMatchObject({ kind: "child", actor: "child" });
         }
         expect(tokenizerModels).toContain("scripted-model");

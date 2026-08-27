@@ -899,6 +899,7 @@ export interface AgenticWorkObservation {
   readonly sequence: number;
   readonly callId: string;
   readonly correlationId: string;
+  readonly taskId?: string;
   readonly toolName: string;
   readonly status: "success" | "accepted" | "rejected" | "error";
   readonly code?: AgenticWorkErrorCode | string;
@@ -1143,6 +1144,7 @@ export interface AgenticWorkProviderRequest {
   readonly model: string;
   readonly messages: readonly LlmMessage[];
   readonly receiveLimitBytes: number;
+  readonly publishedOutputLimitBytes: number;
   readonly tools: readonly ToolDefinition[];
   readonly toolMode: "ordinary";
   readonly maxOutputTokens: number;
@@ -1636,7 +1638,7 @@ async function workTokenCounter(
   }
 }
 
-function accountProviderResponse(
+export function accountProviderResponse(
   response: GenerationResponse,
   receiveLimitBytes: number,
   maxOutputTokens: number,
@@ -2111,27 +2113,29 @@ function materializeWorkMessages(
   const inspection = options.promptInspection;
   const workPolicyMessages = inspectedPlanPolicyMessages(plan, "workPolicy", inspection, limits);
   const workspaceUsageMessages = inspectedPlanPolicyMessages(plan, "workspaceUsage", inspection, limits);
-  const cortexMessages: readonly AssemblyProviderMessageV1[] = options.cortexContext
-    ? Object.freeze([Object.freeze({
-      role: "system" as const,
-      segments: Object.freeze([{
-        kind: "literal" as const,
-        text: `${HOST_CORTEX_CONTEXT_PREFIX} snapshot ${options.cortexContext.receipt.snapshotId}, revision ${String(options.cortexContext.receipt.revision ?? options.cortexContext.receipt.sourceRevision)}): ${jsonStringifyBounded(options.cortexContext.value, Math.min(limits.maxInputBytes, WORK_CORTEX_MAX_RESULT_BYTES))}`,
-      }]),
-    })])
-    : Object.freeze([]);
-  const materialized = materializeAssemblyMessages(
-    [...cortexMessages, ...plan.messages, ...workPolicyMessages, ...workspaceUsageMessages],
+  return materializeAssemblyMessages(
+    [...plan.messages, ...workPolicyMessages, ...workspaceUsageMessages],
     results,
     options.materializeMedia,
   );
-  if (options.cortexContext && materialized[0]) {
-    materialized[0] = Object.freeze({
-      ...materialized[0],
-      name: cortexContextMessageName(options.cortexContext),
-    });
-  }
-  return materialized;
+}
+
+function materializeActivePhaseMessages(
+  plan: AgenticPhasePlan,
+  phase: CompiledAgentRuntimePhaseV1 | null,
+  capabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null,
+  options: AgenticWorkOptions,
+): readonly LlmMessage[] {
+  const limits = lowerPreparationLimitsV1(options.trustedAssemblyLimits);
+  const phaseMessages = materializeCustomPhaseMessages(plan, phase, limits);
+  const context = options.cortexContext;
+  if (!context || !phaseAllowsCapability(capabilities, "cortex")) return phaseMessages;
+  const contextMessage = Object.freeze({
+    role: "system" as const,
+    name: cortexContextMessageName(context),
+    content: `${HOST_CORTEX_CONTEXT_PREFIX} snapshot ${context.receipt.snapshotId}, revision ${String(context.receipt.revision ?? context.receipt.sourceRevision)}): ${jsonStringifyBounded(context.value, Math.min(limits.maxInputBytes, WORK_CORTEX_MAX_RESULT_BYTES))}`,
+  });
+  return Object.freeze([contextMessage, ...phaseMessages]);
 }
 function materializeCustomPhaseMessages(
   plan: AgenticPhasePlan,
@@ -2845,11 +2849,7 @@ function nativeInputContent(message: LlmMessage): string {
     .join("");
 }
 
-function appendNativeInputMessages(
-  carrier: ProviderTransientCarrier | undefined,
-  messages: readonly LlmMessage[],
-): ProviderTransientCarrier | undefined {
-  if (!carrier || carrier.kind !== "openai_responses" || messages.length === 0) return carrier;
+function nativeInputMessageItems(messages: readonly LlmMessage[]): readonly ResponsesInputMessageItem[] {
   const inputItems: ResponsesInputMessageItem[] = [];
   for (const message of messages) {
     if (message.role !== "user" && message.role !== "assistant" && message.role !== "system") {
@@ -2864,9 +2864,57 @@ function appendNativeInputMessages(
     }
     inputItems.push({ type: "message", role: message.role, content });
   }
+  return inputItems;
+}
+
+function appendNativeInputMessages(
+  carrier: ProviderTransientCarrier | undefined,
+  messages: readonly LlmMessage[],
+): ProviderTransientCarrier | undefined {
+  if (!carrier || carrier.kind !== "openai_responses" || messages.length === 0) return carrier;
   return clonePrivateValue({
     kind: "openai_responses" as const,
-    items: [...carrier.items, ...inputItems],
+    items: [...carrier.items, ...nativeInputMessageItems(messages)],
+  }, MAX_PROVIDER_CARRIER_BYTES, "providerTransientCarrier");
+}
+
+function replaceNativePhaseInputMessages(
+  carrier: ProviderTransientCarrier | undefined,
+  previous: readonly LlmMessage[],
+  next: readonly LlmMessage[],
+): ProviderTransientCarrier | undefined {
+  if (!carrier || carrier.kind !== "openai_responses") return carrier;
+  if (previous.length === 0 && next.length === 0) return carrier;
+  const previousItems = nativeInputMessageItems(previous);
+  const items = [...carrier.items];
+  if (previousItems.length > 0) {
+    let matchStart = -1;
+    for (let start = items.length - previousItems.length; start >= 0; start -= 1) {
+      const matches = previousItems.every((expected, offset) => {
+        const item = items[start + offset];
+        return item?.type === "message"
+          && "role" in item
+          && "content" in item
+          && item.role === expected.role
+          && item.content === expected.content;
+      });
+      if (matches) {
+        matchStart = start;
+        break;
+      }
+    }
+    if (matchStart < 0) {
+      throw new AgenticWorkPhaseError(
+        "provider_protocol_error",
+        "Native continuation lost the active host phase instruction",
+      );
+    }
+    items.splice(matchStart, previousItems.length);
+  }
+  items.push(...nativeInputMessageItems(next));
+  return clonePrivateValue({
+    kind: "openai_responses" as const,
+    items,
   }, MAX_PROVIDER_CARRIER_BYTES, "providerTransientCarrier");
 }
 
@@ -3818,11 +3866,18 @@ function completionObservation(
   }
   const sequence = state.nextObservationSequence;
   state.nextObservationSequence += 1;
+  const taskId = call.name === AGENT_DELEGATE_TOOL
+    && typeof call.args.task_id === "string"
+    && WORKSPACE_SAFE_ID_PATTERN.test(call.args.task_id)
+    && boundedBytes(call.args.task_id) <= WORKSPACE_ID_MAX_BYTES
+    ? call.args.task_id
+    : undefined;
   return Object.freeze({
     sequence,
     callId: call.call_id,
     correlationId: call.call_id,
     toolName: call.name,
+    ...(taskId ? { taskId } : {}),
     status,
     ...(code ? { code } : {}),
     resultBytes: Math.min(resultBytes, MAX_TOOL_RESULT_BYTES),
@@ -4025,7 +4080,7 @@ function recordWorkInspection(
         resultBytes: observation.resultBytes,
       }),
       correlation: {
-        taskId: observation.callId,
+        taskId: observation.taskId ?? observation.callId,
         toolId: observation.toolName,
         parentId: "root",
       },
@@ -4404,6 +4459,9 @@ async function executeChildSchedule(
       lowerPreparationLimitsV1(options.trustedAssemblyLimits),
       descriptor.profileId,
     ).map((message) => message.content);
+    const childPhaseContext = phase === null
+      ? {}
+      : { phaseId: phase.id, phaseInstructionSubset };
     try {
       if (!options.executeChild) throw new AgenticWorkPhaseError("child_executor_unavailable");
       const output = await abortable(Promise.resolve(options.executeChild({
@@ -4411,8 +4469,7 @@ async function executeChildSchedule(
         descriptor,
         definitions: Object.freeze(getCoreAgentToolDefinitions(frame.allowedCoreToolIds)),
         signal,
-        phaseId: phase?.id,
-        phaseInstructionSubset,
+        ...childPhaseContext,
         ...(options.workspace ? { workspace: options.workspace } : {}),
       })), signal);
       if (!isRecord(output)) {
@@ -4687,6 +4744,7 @@ export async function executeBoundedAgenticChildFrame(
           ? { providerTransientCarrier: dispatchInput.providerTransientCarrier }
           : {}),
         receiveLimitBytes,
+        publishedOutputLimitBytes: Math.max(0, state.limits.maxChildOutputBytes - boundedBytes(output)),
         signal: options.frame.signal,
       })), options.frame.signal);
       const response = snapshotProviderResponse(rawResponse);
@@ -5725,7 +5783,9 @@ export async function runAgenticWorkPhase(
       });
     }
     let phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null = null;
-    let phaseEntryMessages: readonly LlmMessage[] = Object.freeze([]);
+    let phaseEntryMessages: readonly LlmMessage[] = phaseMachine
+      ? Object.freeze([])
+      : materializeActivePhaseMessages(plan, null, null, options);
     const phaseEntryDrainLimit = Math.max(
       1,
       (plan.customPhasePlan?.phases ?? []).reduce((total, phase) => total + phase.repeatLimit + 1, 0) + 1,
@@ -5742,10 +5802,11 @@ export async function runAgenticWorkPhase(
           const currentPhase = phaseMachine.currentPhase();
           if (!currentPhase) return false;
           phaseCapabilities = new Set(phaseMachine.capabilities());
-          phaseEntryMessages = materializeCustomPhaseMessages(
+          phaseEntryMessages = materializeActivePhaseMessages(
             plan,
             currentPhase,
-            lowerPreparationLimitsV1(options.trustedAssemblyLimits),
+            phaseCapabilities,
+            options,
           );
           return true;
         }
@@ -5888,11 +5949,10 @@ export async function runAgenticWorkPhase(
         ? clonePrivateValue(options.rootMessages, MAX_PRIVATE_TRANSCRIPT_BYTES, "rootMessages")
         : materializeWorkMessages(plan, schedule.results, options)).map((message) => deepFreeze(structuredClone(message))),
     );
-    const materializedMessages: readonly LlmMessage[] = Object.freeze([
+    const messages: LlmMessage[] = [
       ...baseMaterializedMessages,
       ...phaseEntryMessages,
-    ]);
-    const messages: LlmMessage[] = materializedMessages.map((message) => structuredClone(message));
+    ].map((message) => structuredClone(message));
     let phaseEntryMessageStart = baseMaterializedMessages.length;
     let phaseEntryMessageCount = phaseEntryMessages.length;
     const replacePhaseEntryMessages = (next: readonly LlmMessage[]): void => {
@@ -5915,7 +5975,12 @@ export async function runAgenticWorkPhase(
     const clearCouncilAdvice = (): void => {
       if (councilAdviceMessage) {
         const index = messages.indexOf(councilAdviceMessage);
-        if (index >= 0) messages.splice(index, 1);
+        if (index >= 0) {
+          messages.splice(index, 1);
+          if (index < phaseEntryMessageStart) phaseEntryMessageStart -= 1;
+          if (workspaceContextMessageIndex > index) workspaceContextMessageIndex -= 1;
+          else if (workspaceContextMessageIndex === index) workspaceContextMessageIndex = -1;
+        }
         councilAdviceMessage = undefined;
       }
       state.councilResult = undefined;
@@ -6013,6 +6078,7 @@ export async function runAgenticWorkPhase(
     let definitions = composition.rootDefinitions;
     let definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
     let providerTransientCarrier: ProviderTransientCarrier | undefined;
+    let nativePhaseEntryMessages: readonly LlmMessage[] = Object.freeze([]);
     let workspaceContextMessageIndex = -1;
     const refreshWorkspaceContext = async (
       refreshFrame: AgenticWorkFrame = rootFrame,
@@ -6154,6 +6220,7 @@ export async function runAgenticWorkPhase(
             ? { providerTransientCarrier: dispatchInput.providerTransientCarrier }
             : {}),
           receiveLimitBytes,
+          publishedOutputLimitBytes: receiveLimitBytes,
           signal,
         });
         reportProviderProgress("root_dispatch", "waiting", provider, connectionLabel, model);
@@ -6328,7 +6395,7 @@ export async function runAgenticWorkPhase(
         readonly descriptor: AssemblyChildDescriptorV1 & Readonly<{ taskId: string }>;
         readonly frame: AgenticWorkFrame;
         readonly phaseId?: string;
-        readonly phaseInstructionSubset: readonly string[];
+        readonly phaseInstructionSubset?: readonly string[];
       };
       const preparedDelegates = new Map<string, PreparedDelegate>();
       const assignedDelegates = new Map<string, PreparedDelegate>();
@@ -6672,8 +6739,9 @@ export async function runAgenticWorkPhase(
         preparedDelegates.set(call.call_id, {
           descriptor,
           frame,
-          phaseId: currentPhase?.id,
-          phaseInstructionSubset,
+          ...(currentPhase === null
+            ? {}
+            : { phaseId: currentPhase.id, phaseInstructionSubset }),
         });
         assignments.push({ taskId: candidate.taskId, frameId: frame.frameId });
       }
@@ -7036,8 +7104,12 @@ export async function runAgenticWorkPhase(
                 descriptor: prepared.descriptor,
                 definitions: childToolDefinitions(prepared.frame),
                 signal,
-                phaseId: prepared.phaseId,
-                phaseInstructionSubset: prepared.phaseInstructionSubset,
+                ...(prepared.phaseId === undefined
+                  ? {}
+                  : {
+                    phaseId: prepared.phaseId,
+                    phaseInstructionSubset: prepared.phaseInstructionSubset ?? [],
+                  }),
                 ...(options.workspace ? { workspace: options.workspace } : {}),
               })), signal);
               if (signal.aborted) {
@@ -7311,7 +7383,7 @@ export async function runAgenticWorkPhase(
           undefined,
           acceptance.completion,
           acceptance.workspaceRevision,
-          materializedMessages,
+          baseMaterializedMessages,
           renderHandoff,
         );
       }
@@ -7376,19 +7448,14 @@ export async function runAgenticWorkPhase(
         definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
         const nextPhaseMessages = phaseTerminal
           ? Object.freeze([])
-          : materializeCustomPhaseMessages(
+          : materializeActivePhaseMessages(
             plan,
             phaseMachine?.currentPhase() ?? null,
-            lowerPreparationLimitsV1(options.trustedAssemblyLimits),
+            phaseCapabilities,
+            options,
           );
         phaseEntryMessages = nextPhaseMessages;
         replacePhaseEntryMessages(nextPhaseMessages);
-        if (providerTransientCarrier?.kind === "openai_responses") {
-          providerTransientCarrier = appendNativeInputMessages(
-            providerTransientCarrier,
-            nextPhaseMessages.map((message) => structuredClone(message)),
-          );
-        }
         const phaseCouncilStatus = await invokeCouncilForCurrentPhase();
         if (phaseCouncilStatus === "aborted") {
           const status = signalStatus(signal);
@@ -7396,6 +7463,17 @@ export async function runAgenticWorkPhase(
         }
         if (phaseCouncilStatus === "failed") {
           return outcomeAfterPending("failed", "council_required_failed");
+        }
+        if (providerTransientCarrier?.kind === "openai_responses") {
+          replacePhaseEntryMessages(Object.freeze([]));
+          providerTransientCarrier = replaceNativePhaseInputMessages(
+            providerTransientCarrier,
+            nativePhaseEntryMessages,
+            nextPhaseMessages,
+          );
+          nativePhaseEntryMessages = nextPhaseMessages;
+        } else {
+          nativePhaseEntryMessages = Object.freeze([]);
         }
       }
       if (billedFuseExhausted) {

@@ -644,10 +644,16 @@ describe('strict owner inspection contracts', () => {
       adapter: 'openai',
       providerId: null,
       modelId: null,
+      connectionId: 'frozen-connection',
+      configRevision: 17,
       connectionRevision: null,
       fingerprint: null,
     }
     expect(withTranscript(transcriptRecord({ provider: validNullableProvider }))).not.toBeNull()
+    expect(withTranscript(transcriptRecord({ provider: validNullableProvider }))?.transcript[0]?.provider).toMatchObject({
+      connectionId: 'frozen-connection',
+      configRevision: 17,
+    })
 
     for (const messageId of ['', 42, 'x'.repeat(257)]) {
       expect(withTranscript(transcriptRecord({

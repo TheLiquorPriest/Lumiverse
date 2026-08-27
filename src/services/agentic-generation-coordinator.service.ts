@@ -15,6 +15,7 @@ import * as breakdownSvc from "./breakdown.service";
 import {
   canonicalInputRevisionDigest,
   canonicalRuntimeCapabilityDigest,
+  claimRuntimeDecisionToken,
   consumeRuntimeDecisionToken,
   configureAgentRuntimeDecisionDependencies,
   resolveEffectiveRuntimeWithoutToken,
@@ -83,6 +84,7 @@ import {
   type WorldInfoStateDeltaV1,
 } from "../types/agent-preprocessing";
 import {
+  accountProviderResponse,
   executeBoundedAgenticChildFrame,
   runAgenticWorkPhase,
   AgenticWorkPhaseError,
@@ -1841,9 +1843,13 @@ async function collectProviderResponse(
   return response;
 }
 
+type WorkProviderExchangeOutcome =
+  | { readonly status: "succeeded"; readonly response: GenerationResponse }
+  | { readonly status: "failed"; readonly error: unknown };
+
 type WorkProviderExchangeObserver = (
   request: AgenticWorkProviderRequest,
-  response: GenerationResponse,
+  outcome: WorkProviderExchangeOutcome,
 ) => void;
 
 function assertExactWorkDispatchIdentity(
@@ -1891,64 +1897,142 @@ function makeWorkProvider(
         ? { providerTransientCarrier: request.providerTransientCarrier }
         : {}),
     };
-    const stream = await providerStream(userId, connection, generationRequest, frozenCredential, ledger);
-    const counter = await resolveCounter(connection.model);
-    const response = await collectProviderResponse(
-      stream,
-      request.receiveLimitBytes,
-      ledger,
-      request.frame.kind === "child",
-      counter.count,
-    );
-    onExchange?.(request, response);
-    return response;
+    let providerSettled = false;
+    try {
+      const stream = await providerStream(userId, connection, generationRequest, frozenCredential, ledger);
+      const iterator = stream[Symbol.asyncIterator]();
+      const iterable: AsyncIterable<StreamChunk> = { [Symbol.asyncIterator]: () => iterator };
+      const counter = await resolveCounter(connection.model);
+      const collection = collectProviderResponse(
+        iterable,
+        request.receiveLimitBytes,
+        ledger,
+        request.frame.kind === "child",
+        counter.count,
+      );
+      let abortListener: (() => void) | undefined;
+      const aborted = new Promise<never>((_resolve, reject) => {
+        abortListener = () => {
+          void iterator.return?.();
+          reject(request.signal.reason ?? new DOMException("Aborted", "AbortError"));
+        };
+        if (request.signal.aborted) abortListener();
+        else request.signal.addEventListener("abort", abortListener, { once: true });
+      });
+      let response: GenerationResponse;
+      try {
+        response = await Promise.race([collection, aborted]);
+      } finally {
+        if (abortListener) request.signal.removeEventListener("abort", abortListener);
+      }
+      accountProviderResponse(
+        response,
+        request.receiveLimitBytes,
+        request.maxOutputTokens,
+        { tokenBasis: "published_content", countTokens: counter.count },
+      );
+      if (
+        (response.tool_calls?.length ?? 0) === 0
+        && UTF8_ENCODER.encode(response.content).byteLength > request.publishedOutputLimitBytes
+      ) {
+        throw new AgenticWorkPhaseError("child_output_limit_exceeded", "Provider output exceeds the child publication limit");
+      }
+      providerSettled = true;
+      onExchange?.(request, { status: "succeeded", response });
+      return response;
+    } catch (error) {
+      if (!providerSettled) onExchange?.(request, { status: "failed", error });
+      throw error;
+    }
   };
 }
+
+function isProviderTimeout(value: unknown): boolean {
+  return value instanceof DOMException && value.name === "TimeoutError"
+    || value instanceof AgenticGenerationError && value.code === "agentic_timed_out"
+    || value instanceof Error && value.name === "TimeoutError";
+}
+
+function childProviderFailure(
+  error: unknown,
+  signal: AbortSignal,
+): { readonly status: "failed" | "cancelled" | "timed_out"; readonly code: string; readonly reason: AgentInspectionReasonV1 } {
+  if (signal.aborted) {
+    return isProviderTimeout(signal.reason)
+      ? { status: "timed_out", code: "timed_out", reason: "deadline" }
+      : { status: "cancelled", code: "cancelled", reason: "interrupted" };
+  }
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return { status: "cancelled", code: "cancelled", reason: "interrupted" };
+  }
+  if (error instanceof AgenticWorkPhaseError) {
+    if (error.code === "limit_exceeded" || error.code === "child_output_limit_exceeded") {
+      return { status: "failed", code: error.code, reason: "budget_exhausted" };
+    }
+    if (error.code === "provider_protocol_error") {
+      return { status: "failed", code: error.code, reason: "invalid_input" };
+    }
+  }
+  return { status: "failed", code: "provider_failure", reason: "provider_failure" };
+}
+
 function recordChildProviderExchange(
   writer: AgentInspectionWriterV1 | undefined,
   request: AgenticWorkProviderRequest,
-  response: GenerationResponse,
+  outcome: WorkProviderExchangeOutcome,
   connection: CompleteFrozenConnectionV1,
+  configRevision: string | number | null,
   profileId: string,
   childId: string,
 ): void {
   if (!writer) return;
   const frameDigest = createHash("sha256").update(request.frame.frameId, "utf8").digest("hex");
   const exchangeId = "provider:work:child:" + frameDigest + ":" + request.roundIndex;
-  const correlation = { taskId: childId, parentId: request.frame.parentFrameId };
-  const boundary = { lifecycle: "WORK" as const, status: "running" as const };
+  const taskId = request.frame.assignedTaskId ?? childId;
+  const correlation = { taskId, parentId: request.frame.parentFrameId };
+  const response = outcome.status === "succeeded" ? outcome.response : undefined;
+  const failure = outcome.status === "failed"
+    ? childProviderFailure(outcome.error, request.signal)
+    : undefined;
+  const boundary = failure?.status === "cancelled"
+    ? { lifecycle: "WORK" as const, status: "cancelling" as const }
+    : { lifecycle: "WORK" as const, status: "running" as const };
   writer.record("provider_exchange", {
     id: exchangeId,
     kind: "provider_exchange",
     actor: "provider",
     recipient: "child",
-    content: response.content,
+    ...(response ? { content: response.content } : {}),
     arguments: JSON.stringify({
       profileId,
       provider: connection.provider,
       connectionId: connection.concreteId,
       model: connection.model,
+      configRevision,
+      sourceFingerprint: connection.fingerprint,
       roundIndex: request.roundIndex,
-      toolCalls: (response.tool_calls ?? []).map((call) => ({
+      toolCalls: (response?.tool_calls ?? []).map((call) => ({
         callId: call.call_id,
         toolName: call.name,
         args: call.args,
       })),
     }),
-    result: JSON.stringify({
-      finishReason: response.finish_reason,
-      usage: response.usage ?? null,
-    }),
+    result: response
+      ? JSON.stringify({ finishReason: response.finish_reason, usage: response.usage ?? null })
+      : JSON.stringify({ status: failure!.status, code: failure!.code }),
     provider: {
       adapter: "agentic-work",
       providerId: connection.provider,
       modelId: connection.model,
+      connectionId: connection.concreteId,
+      configRevision,
       connectionRevision: connection.candidateRevision,
       fingerprint: connection.fingerprint,
     },
+    ...(failure ? { errorReason: failure.reason } : {}),
     correlation,
   }, boundary);
-  if (response.usage) {
+  if (response?.usage) {
     writer.record("usage", {
       version: 1,
       id: "usage:" + exchangeId,
@@ -1965,6 +2049,73 @@ function recordChildProviderExchange(
   }
 }
 
+type InspectionRecordArguments = Parameters<AgentInspectionWriterV1["record"]>;
+
+function createChildInspectionCorrelation(
+  authority: AgentInspectionWriterV1 | undefined,
+): {
+  readonly writer: AgentInspectionWriterV1 | undefined;
+  readonly childTaskIds: ReadonlyMap<string, string>;
+  readonly bind: (childId: string, assignedTaskId?: string) => void;
+  readonly flush: () => void;
+} {
+  const childTaskIds = new Map<string, string>();
+  const pendingPolicies = new Map<string, InspectionRecordArguments[]>();
+
+  const write = (
+    kind: InspectionRecordArguments[0],
+    value: InspectionRecordArguments[1],
+    state: InspectionRecordArguments[2],
+    allowDefer: boolean,
+  ) => {
+    if (!authority || !isRecord(value)) return authority?.record(kind, value, state) ?? null;
+    const source = value;
+    const requestedCorrelation = isRecord(source.correlation) ? source.correlation : {};
+    const requestedTaskId = typeof requestedCorrelation.taskId === "string"
+      ? requestedCorrelation.taskId
+      : undefined;
+    const policyPrefix = "work:child-policy:";
+    const policyChildId = typeof source.id === "string" && source.id.startsWith(policyPrefix)
+      ? source.id.slice(policyPrefix.length)
+      : undefined;
+    let projectedTaskId = requestedTaskId;
+    if (requestedTaskId !== undefined && source.kind === "child_result" && source.actor === "child") {
+      projectedTaskId = childTaskIds.get(requestedTaskId) ?? requestedTaskId;
+    }
+    if (policyChildId) {
+      const bound = childTaskIds.get(policyChildId);
+      if (!bound && allowDefer) {
+        const pending = pendingPolicies.get(policyChildId) ?? [];
+        pending.push([kind, value, state]);
+        pendingPolicies.set(policyChildId, pending);
+        return null;
+      }
+      projectedTaskId = bound ?? policyChildId;
+    }
+    if (projectedTaskId === undefined) return authority.record(kind, value, state);
+    return authority.record(kind, {
+      ...source,
+      correlation: { ...requestedCorrelation, taskId: projectedTaskId },
+    }, state);
+  };
+
+  const bind = (childId: string, assignedTaskId?: string): void => {
+    childTaskIds.set(childId, assignedTaskId ?? childId);
+    const pending = pendingPolicies.get(childId);
+    if (!pending) return;
+    pendingPolicies.delete(childId);
+    for (const [kind, value, state] of pending) write(kind, value, state, false);
+  };
+  const flush = (): void => {
+    for (const childId of [...pendingPolicies.keys()]) bind(childId);
+  };
+  const writer = authority
+    ? Object.freeze({
+        record: (...args: InspectionRecordArguments) => write(args[0], args[1], args[2], true),
+      })
+    : undefined;
+  return Object.freeze({ writer, childTaskIds, bind, flush });
+}
 
 /** Never throws: tokenizer resolution falls back to chars/4. */
 async function resolveRenderCountTokens(model: string | undefined): Promise<(text: string) => number> {
@@ -2222,6 +2373,7 @@ function recordPublicWorkActivity(
   ledger: { recordActivityNode(node: AgentActivityNodeV1): void },
   outcome: Pick<AgenticWorkPhaseOutcome, "observations" | "childResults">,
   generationId: string,
+  childTaskIds?: ReadonlyMap<string, string>,
   seenNodeIds: Set<string> = new Set<string>(),
   usage: AgentActivityUsageV1 = publicWorkActivityUsage(outcome),
 ): AgentActivityUsageV1 {
@@ -2252,12 +2404,14 @@ function recordPublicWorkActivity(
     });
   }
   for (const child of outcome.childResults) {
-    if (seenNodeIds.has(child.childId)) continue;
-    seenNodeIds.add(child.childId);
+    const taskId = childTaskIds?.get(child.childId) ?? child.childId;
+    const id = "task:" + taskId;
+    if (seenNodeIds.has(id)) continue;
+    seenNodeIds.add(id);
     const status: AgentActivityLifecycle = child.status === "succeeded" ? "completed" : child.status;
     const errorCode = publicWorkActivityErrorCode(child.errorCode);
     ledger.recordActivityNode({
-      id: child.childId,
+      id,
       parentId: generationId,
       kind: "child_invocation",
       actor: "child",
@@ -2265,6 +2419,7 @@ function recordPublicWorkActivity(
       status,
       startedAt,
       elapsedMs: 0,
+      taskId,
       ...(typeof child.profileId === "string" && child.profileId.length > 0
         ? { profileId: child.profileId }
         : {}),
@@ -4281,6 +4436,15 @@ function buildDependencies(): AgenticGenerationDependencies {
     cancelAndJoinChildren: (execution) => joinChildren(execution.id),
     resolveRuntime: resolve,
     consumeRuntimeToken: (input, target, token) => consume(input, target, token),
+    claimRuntimeToken: (input, token) => {
+      if (!claimRuntimeDecisionToken(input.userId, token)) {
+        throw new AgenticGenerationError(
+          "decision_refresh_required",
+          "decision_refresh_required",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      }
+    },
     createExecution: async (value) => {
       const decision = internalDecision(value.decision);
       const root = decision.internal.rootConnection;
@@ -5095,6 +5259,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       const rootToolIds = (config.mainToolIds ?? []).filter((id) => available.has(id));
       const rootLoreScope = normalizeLoreScope(config.mainLoreScope);
       const inspectionWriter = inspectionWriters.get(execution.id);
+      const childInspection = createChildInspectionCorrelation(inspectionWriter);
       const toolSnapshot = makeToolSnapshot(runtimeSnapshot, phaseSignal);
       // The root grant is exactly the authored main grant narrowed by snapshot
       // availability. A child never inherits it.
@@ -5255,7 +5420,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         ),
         signal: phaseSignal,
         deadlineAt: runtimeExecution.deadlineAt,
-        inspection: inspectionWriter,
+        inspection: childInspection.writer,
         onProgress: (progress) => {
           if (progress.provider) {
             eventBus.emit(EventType.GENERATION_PHASE_CHANGED, {
@@ -5273,6 +5438,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             runtimeExecution.owner.ledger,
             progress,
             execution.id,
+            childInspection.childTaskIds,
             seenPublicActivityNodeIds,
             {
               inputTokens: 0,
@@ -5356,6 +5522,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           workspace: childWorkspace,
         }): Promise<AgenticChildExecutionResult> =>
           trackChild(execution.id, async () => {
+          childInspection.bind(descriptor.childId, frame.assignedTaskId);
           const profile = profiles.find((candidate) => candidate.id === descriptor.profileId);
           if (!profile || typeof profile.systemPrompt !== "string") {
             return { content: "", status: "failed" as const, errorCode: "child_profile_unauthorized" };
@@ -5377,11 +5544,12 @@ function buildDependencies(): AgenticGenerationDependencies {
               effectiveParameters,
               runtimeExecution.owner.ledger,
               frozenCredentialFor(runtimeExecution, child),
-              (request, response) => recordChildProviderExchange(
-                inspectionWriter,
+              (request, outcome) => recordChildProviderExchange(
+                childInspection.writer,
                 request,
-                response,
+                outcome,
                 child,
+                internal.binding.configRevision ?? null,
                 profile.id,
                 descriptor.childId,
               ),
@@ -5403,12 +5571,13 @@ function buildDependencies(): AgenticGenerationDependencies {
           };
           }),
       };
-      const outcome = await runAgenticWorkPhase(options);
+      const outcome = await runAgenticWorkPhase(options).finally(() => childInspection.flush());
       const workspaceRevision = adoptWorkWorkspaceRevision(runtimeExecution, outcome);
       recordPublicWorkActivity(
         runtimeExecution.owner.ledger,
         outcome,
         execution.id,
+        childInspection.childTaskIds,
         seenPublicActivityNodeIds,
       );
       const usage = runtimeExecution.owner.ledger.activitySnapshot().usage;
@@ -6511,6 +6680,10 @@ export function installAgenticGenerationCoordinator(): void {
 
 export const __testing = {
   buildDependencies,
+  makeWorkProvider,
+  recordChildProviderExchange,
+  createChildInspectionCorrelation,
+  recordPublicWorkActivity,
   reconcilePersistentWorkspaceSessions,
   persistentRecoveryLimits: Object.freeze({
     pageSize: PERSISTENT_SESSION_RECOVERY_PAGE_SIZE,

@@ -775,6 +775,8 @@ class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
       this.status = "completed";
       const completed = this.decision("completed", decision.condition, input, phase, "phase sequence completed", decision.checkpoint);
       this.record(completed, phase);
+      this.currentIndex = this.phases.length;
+      this.repeatCount = 0;
       return completed;
     }
     if (phase.nextPhaseIds.length > 0 && !phase.nextPhaseIds.includes(next.id)) {

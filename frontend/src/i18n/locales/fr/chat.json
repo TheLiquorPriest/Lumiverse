@@ -1083,6 +1083,8 @@
     "providerId": "ID du fournisseur",
     "modelId": "Modèle",
     "connectionRevision": "Révision de connexion",
+    "connectionId": "ID de connexion",
+    "configRevision": "Révision de configuration",
     "errorReason": "Motif de l’erreur",
     "turnSession": "Turn Session privée",
     "turnSessionIntro": "Entrées typées du cycle de vie et de récupération, limitées au propriétaire et liées à la transcription.",

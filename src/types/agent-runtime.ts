@@ -390,6 +390,7 @@ export interface AgentActivityNodeV1 {
   readonly id: string;
   readonly parentId: string | null;
   readonly kind: AgentActivityNodeKind;
+  readonly taskId?: string;
   readonly actor: AgentActivityActor;
   readonly profileId?: string;
   readonly toolId?: AgentActivityToolId;

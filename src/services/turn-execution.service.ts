@@ -527,6 +527,13 @@ const AGENT_TURN_RECONCILIATION_MAX_ROWS = 2048;
 const AGENT_TURN_RECONCILIATION_MAX_MS = 5_000;
 const TERMINAL_PHASE_SET = new Set<TurnExecutionPhase>(TERMINAL_TURN_PHASES);
 const REVERSIBLE_PHASE_SET = new Set<TurnExecutionPhase>(REVERSIBLE_TURN_PHASES);
+const STOP_TOO_LATE_PHASE_SET = new Set<TurnExecutionPhase>([
+  "COMPLETE",
+  "RENDER",
+  "PREPARE_COMMIT",
+  "COMMITTING",
+  "COMMITTED",
+]);
 
 let receiptRepairHandler: ((
   execution: TurnExecutionRecord,
@@ -1532,7 +1539,7 @@ export function requestTurnCancellation(input: {
 }): TurnCancellationResult {
   const db = input.db ?? getDb();
   const current = requireExecution(db, input.executionId).execution;
-  if (current.phase === "COMMITTING" || current.phase === "COMMITTED") {
+  if (STOP_TOO_LATE_PHASE_SET.has(current.phase)) {
     return { execution: current, code: "too_late" };
   }
   if (TERMINAL_PHASE_SET.has(current.phase)) return { execution: current, code: "already_terminal" };
@@ -1577,7 +1584,7 @@ export function requestDormantTurnCancellation(input: {
       executionId: current.id,
     });
   }
-  if (current.phase === "COMMITTING" || current.phase === "COMMITTED") {
+  if (STOP_TOO_LATE_PHASE_SET.has(current.phase)) {
     return { execution: current, code: "too_late" };
   }
   if (TERMINAL_PHASE_SET.has(current.phase)) {

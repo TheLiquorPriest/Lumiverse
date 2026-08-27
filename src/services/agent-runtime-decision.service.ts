@@ -2129,6 +2129,14 @@ export class AgentRuntimeDecisionService {
     }
     return { accepted: true, code: "accepted", decision: current };
   }
+  /**
+   * Atomically claim a one-use token without interpreting a generation target.
+   * Unsupported surfaces use this authority before rejecting, so they cannot
+   * leave a valid Agentic decision replayable or manufacture a supported target.
+   */
+  claim(userId: string, token: string): boolean {
+    return this.tokenStore.consume(userId, token) !== null;
+  }
 
   getChatAgentModeOverride(userId: string, chatId: string): ChatAgentModeOverrideV1 | null {
     return this.dependencies.getChatAgentModeOverride(userId, chatId);
@@ -2221,6 +2229,10 @@ export async function consumeRuntimeDecisionToken(
   request: EffectiveRuntimeRequestV1,
 ): Promise<RuntimeDecisionTokenConsumptionV1> {
   return AGENT_RUNTIME_DECISION_SERVICE.consume(userId, token, request);
+}
+
+export function claimRuntimeDecisionToken(userId: string, token: string): boolean {
+  return AGENT_RUNTIME_DECISION_SERVICE.claim(userId, token);
 }
 
 export function toPublicRuntimeDecision(decision: EffectiveRuntimeDecisionV1): EffectiveRuntimePublicResponseV1 {

@@ -5447,6 +5447,24 @@ function callerDecisionTarget(input: AgenticGenerationInput): AgenticTargetSnaps
 
 async function consumeCallerRuntimeDecision(input: GenerateInput, token: string): Promise<void> {
   const agenticInput = toAgenticGenerationInput(input);
+  const signal = agenticInput.signal ?? new AbortController().signal;
+  let target: AgenticTargetSnapshot;
+  try {
+    target = callerDecisionTarget(agenticInput);
+  } catch (error) {
+    if (error instanceof AgenticGenerationError && error.code === "agentic_unsupported_surface") {
+      const claim = agenticGenerationDependencies?.claimRuntimeToken;
+      if (!claim) {
+        throw new AgenticGenerationError(
+          "agentic_runtime_unavailable",
+          "Agentic decision authority is unavailable.",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      }
+      await claim(agenticInput, token, signal);
+    }
+    throw error;
+  }
   const consume = agenticGenerationDependencies?.consumeRuntimeToken;
   if (!consume) {
     throw new AgenticGenerationError(
@@ -5455,13 +5473,9 @@ async function consumeCallerRuntimeDecision(input: GenerateInput, token: string)
       { phase: "ASSEMBLE", retryable: true },
     );
   }
-  await consume(
-    agenticInput,
-    callerDecisionTarget(agenticInput),
-    token,
-    agenticInput.signal ?? new AbortController().signal,
-  );
+  await consume(agenticInput, target, token, signal);
 }
+
 
 async function startAdmittedAgenticGeneration(input: GenerateInput) {
   const started = await startAgenticGeneration(

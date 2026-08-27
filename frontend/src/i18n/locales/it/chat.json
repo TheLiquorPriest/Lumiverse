@@ -1083,6 +1083,8 @@
     "providerId": "ID provider",
     "modelId": "Modello",
     "connectionRevision": "Revisione della connessione",
+    "connectionId": "ID connessione",
+    "configRevision": "Revisione della configurazione",
     "errorReason": "Motivo dell’errore",
     "turnSession": "Turn Session privata",
     "turnSessionIntro": "Voci tipizzate del ciclo di vita e del ripristino, limitate al proprietario e collegate alla trascrizione.",

@@ -394,10 +394,12 @@ describe("agent run inspection terminal persistence", () => {
       result: "{\"finishReason\":\"tool_calls\"}",
       provider: {
         adapter: "agentic-work",
-        providerId: null,
+        providerId: "deepseek",
         modelId: "deepseek-v4-flash",
-        connectionRevision: null,
-        fingerprint: null,
+        connectionId: "connection-frozen",
+        configRevision: 17,
+        connectionRevision: "candidate-4",
+        fingerprint: "source-fingerprint",
       },
       correlation: { parentId: "root" },
     });
@@ -408,6 +410,15 @@ describe("agent run inspection terminal persistence", () => {
       durationMs: null,
       late: false,
       errorReason: null,
+      provider: {
+        adapter: "agentic-work",
+        providerId: "deepseek",
+        modelId: "deepseek-v4-flash",
+        connectionId: "connection-frozen",
+        configRevision: 17,
+        connectionRevision: "candidate-4",
+        fingerprint: "source-fingerprint",
+      },
     });
     expect(detail?.markers.some((marker) => marker.scope === "transcript")).toBe(false);
   });
