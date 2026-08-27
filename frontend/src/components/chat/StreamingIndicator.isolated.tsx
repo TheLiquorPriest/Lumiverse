@@ -190,10 +190,17 @@ describe('StreamingIndicator', () => {
   test('shows recovered provider identity when in-progress arrives without a started chat head', async () => {
     setStore({
       chatHeads: [],
-      lastGenerationProvider: 'deepseek',
-      lastGenerationModel: 'deepseek-v4-flash',
-      streamingContent: 'partial',
+      activeGenerationId: null,
+      isStreaming: false,
+      lastGenerationProvider: null,
+      lastGenerationModel: null,
     })
+    useStore.getState().startStreaming('generation-recovered')
+    useStore.getState().setGenerationProviderMetadata({
+      provider: 'deepseek',
+      model: 'deepseek-v4-flash',
+    })
+    useStore.getState().reconcileStreamContent('partial', 0)
 
     await renderIndicator()
     const indicator = host?.querySelector('[role="status"]')

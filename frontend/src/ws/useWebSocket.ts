@@ -883,15 +883,15 @@ export function useWebSocket() {
         if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId) {
-          state.setGenerationProviderMetadata({
-            ...(payload.provider ? { provider: payload.provider } : {}),
-            ...(payload.model ? { model: payload.model } : {}),
-          })
           if (state.activeGenerationId !== payload.generationId) {
             state.startStreaming(payload.generationId, payload.targetMessageId, payload.generationType)
           } else if (payload.targetMessageId && state.regeneratingMessageId !== payload.targetMessageId) {
             state.setRegeneratingMessageId(payload.targetMessageId)
           }
+          state.setGenerationProviderMetadata({
+            ...(payload.provider ? { provider: payload.provider } : {}),
+            ...(payload.model ? { model: payload.model } : {}),
+          })
           // Refine (never clobber) the swipe anchor — GENERATION_STARTED is the
           // authoritative source; only overwrite if this event actually carries it.
           if (payload.targetSwipeId != null) state.setStreamingSwipeId(payload.targetSwipeId)
