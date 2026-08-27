@@ -22,6 +22,8 @@ import { initIdentity } from "../src/crypto/init";
 import { runMigrations } from "../src/db/migrate";
 import { env } from "../src/env";
 import { buildExportStream } from "../src/services/user-data/export.service";
+import { ArtifactBlobStore, publishArtifactCommit } from "../src/services/agent-artifact-blobs.service";
+import { attachWorkspaceArtifactReference, proposeWorkspacePublication } from "../src/services/turn-workspace.service";
 import {
   __test__ as importTest,
   cancelImportForUser,
@@ -742,21 +744,19 @@ describe("user-data import bounded extraction", () => {
     expect(finished.error).toMatch(/notification|completion/i);
   });
 
-  test("round-trips a published artifact with row-bound storage metadata", async () => {
+  test("round-trips a staged and committed artifact across owner roots", async () => {
+    const destinationUserId = "artifact-destination-user";
     const characterId = "artifact-character";
     const chatId = "artifact-chat";
     const messageId = "artifact-message";
-    const artifactId = "artifact-published";
     const sourceArtifactId = "artifact-source";
     const turnId = "artifact-turn";
     const workspaceId = "artifact-workspace";
-    const journalId = "artifact-journal";
-    const storagePath = "artifact.bin";
-    const artifactPath = join(workDir, "agent-artifacts", USER_ID, storagePath);
+    const creatorToken = "artifact-creator";
     const artifactBytes = new Uint8Array([0x41, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74]);
     const digest = createHash("sha256").update(artifactBytes).digest("hex");
-    mkdirSync(join(workDir, "agent-artifacts", USER_ID), { recursive: true });
-    writeFileSync(artifactPath, artifactBytes);
+    const storagePath = `${digest}.blob`;
+    const sourceArtifactRoot = join(workDir, "agent-artifacts");
     getDb().query(
       "INSERT INTO characters (id, name, user_id) VALUES (?, ?, ?)",
     ).run(characterId, "Artifact Character", USER_ID);
@@ -773,73 +773,97 @@ describe("user-data import bounded extraction", () => {
        (id, user_id, chat_id, generation_id, target_kind, target_message_id,
         target_chat_revision, target_message_revision, mode, runtime_epoch,
         deadline_at, state, root_ledger_json, frame_capabilities_json, commit_key, expires_at)
-       VALUES (?, ?, ?, ?, 'normal', ?, 0, 0, 'agentic', 0, 0, 'COMMITTED', '{}', '{}', ?, 0)`,
-    ).run(turnId, USER_ID, chatId, "artifact-generation", messageId, "artifact-commit");
+       VALUES (?, ?, ?, ?, 'normal', ?, 0, 0, 'agentic', 0, ?, 'WORK', '{}', '{}', ?, ?)`,
+    ).run(turnId, USER_ID, chatId, "artifact-generation", messageId, Date.now() + 60_000, "artifact-commit", Math.floor(Date.now() / 1000) + 600);
     getDb().query(
       `INSERT INTO agent_turn_workspaces
        (workspace_id, turn_id, execution_id, user_id, chat_id, objective, constraints_json,
-        state, operation_caps_json, field_caps_json, retention, expires_at,
+        state, revision, operation_caps_json, field_caps_json, retention, expires_at,
         quota_tasks, quota_records, quota_submissions, quota_artifacts, quota_bytes)
-       VALUES (?, ?, ?, ?, ?, ?, '{}', 'frozen', '{}', '{}', 'chat_lifetime', 0, 4, 4, 4, 4, 1048576)`,
-    ).run(workspaceId, turnId, turnId, USER_ID, chatId, "Artifact objective");
-    getDb().query(
-      `INSERT INTO agent_artifact_blobs
-       (digest, user_id, byte_count, mime_type, storage_path, provenance_json,
-        published_reference_count, retention, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, 'chat_lifetime', 0)`,
-    ).run(digest, USER_ID, artifactBytes.byteLength, "application/octet-stream", storagePath, JSON.stringify({ source: "test" }));
-    getDb().query(
-      `INSERT INTO agent_artifact_blob_journal
-       (journal_id, blob_digest, user_id, turn_id, creator_token, fence_generation,
-        staged_path, final_path, state, observed_identity, byte_count, digest)
-       VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'installed', ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, '{}', 'active', 0, ?, '{}', 'chat_lifetime', ?, 4, 4, 4, 4, 1048576)`,
     ).run(
-      journalId,
-      digest,
-      USER_ID,
-      turnId,
-      "artifact-creator",
-      join(workDir, "staging-artifact.bin"),
-      artifactPath,
-      JSON.stringify({ dev: 1, ino: 1, size: artifactBytes.byteLength }),
-      artifactBytes.byteLength,
-      digest,
-    );
-    getDb().query(
-      `INSERT INTO agent_workspace_artifacts
-       (artifact_id, workspace_id, turn_id, user_id, chat_id, blob_digest,
-        mime_type, byte_count, provenance_json, publication_state, retention, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'published', 'chat_lifetime', 0)`,
-    ).run(
-      sourceArtifactId,
       workspaceId,
       turnId,
+      turnId,
       USER_ID,
       chatId,
-      digest,
-      "application/octet-stream",
-      artifactBytes.byteLength,
-      JSON.stringify({ source: "test", journalId }),
+      "Artifact objective",
+      JSON.stringify({ revision: 1, allowed: ["attach_artifact", "propose_publication"], maxOperationBytes: 131072, maxOperations: 128 }),
+      Math.floor(Date.now() / 1000) + 600,
     );
-    getDb().query(
-      `INSERT INTO agent_published_workspace_artifacts
-       (published_artifact_id, receipt_id, source_artifact_id, blob_digest, user_id, chat_id,
-        message_id, swipe_id, storage_path, mime_type, byte_count, digest, retention, revision, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'chat_lifetime', 0, 0)`,
-    ).run(
-      artifactId,
-      "artifact-receipt",
-      sourceArtifactId,
+
+    const store = new ArtifactBlobStore({ db: getDb(), rootDir: sourceArtifactRoot });
+    const handle = await store.stageArtifact({
+      userId: USER_ID,
+      turnId,
+      workspaceId,
+      bytes: artifactBytes,
       digest,
-      USER_ID,
+      mimeType: "application/octet-stream",
+      provenance: "root",
+      retention: "chat_lifetime",
+      expiresAt: Math.floor(Date.now() / 1000) + 600,
+      fence: 1,
+      assertFence: () => {},
+      creatorToken,
+    });
+    expect(handle.storagePath).toBe(join(sourceArtifactRoot, USER_ID, storagePath));
+    const attached = attachWorkspaceArtifactReference({
+      userId: USER_ID,
       chatId,
-      messageId,
-      0,
-      storagePath,
-      "application/octet-stream",
-      artifactBytes.byteLength,
-      digest,
-    );
+      turnId,
+      workspaceId,
+      actor: "root",
+      expectedRevision: 0,
+      artifactId: sourceArtifactId,
+      blobDigest: digest,
+      byteCount: artifactBytes.byteLength,
+      mimeType: "application/octet-stream",
+      provenance: "root",
+      creatorToken,
+      taskId: null,
+      retention: "chat_lifetime",
+    });
+    expect(attached.publicationState).toBe("attached");
+    expect(proposeWorkspacePublication({
+      userId: USER_ID,
+      chatId,
+      turnId,
+      workspaceId,
+      actor: "root",
+      expectedRevision: 1,
+      artifactId: sourceArtifactId,
+    }).publicationState).toBe("proposed");
+    const receipt = getDb().transaction(() => publishArtifactCommit(getDb(), {
+      userId: USER_ID,
+      chatId,
+      turnId,
+      executionId: turnId,
+      workspaceId,
+      commitKey: "artifact-commit",
+      receiptId: "artifact-receipt",
+      targetMessageId: messageId,
+      targetSwipeId: 0,
+      assertFence: () => {},
+      refs: [{
+        digest,
+        byteCount: artifactBytes.byteLength,
+        mimeType: "application/octet-stream",
+        provenance: "root",
+        retention: "chat_lifetime",
+        messageId,
+        swipeId: 0,
+        workspaceArtifactId: sourceArtifactId,
+      }],
+    }))();
+    expect(receipt.duplicate).toBe(false);
+    const published = getDb().query(
+      `SELECT published_artifact_id, storage_path
+         FROM agent_published_workspace_artifacts
+        WHERE user_id = ? AND blob_digest = ?`,
+    ).get(USER_ID, digest) as { published_artifact_id: string; storage_path: string };
+    expect(published.storage_path).toBe(storagePath);
+
     const archivePath = join(workDir, "artifact-round-trip.lvbak");
     const archiveBytes = await streamToBytes(
       buildExportStream({ userId: USER_ID, includeVectors: false, producerVersion: "test" }),
@@ -847,24 +871,42 @@ describe("user-data import bounded extraction", () => {
     const archive = unzipSync(archiveBytes);
     const artifactEntries = Object.keys(archive).filter((name) => name.startsWith("files/artifacts/"));
     expect(artifactEntries).toEqual([`files/artifacts/${chatId}/${storagePath}`]);
+    const publishedRowsEntry = Object.keys(archive).find((name) => name.endsWith("agent_published_workspace_artifacts.ndjson"));
+    if (!publishedRowsEntry) throw new Error("published artifact canonical rows are missing from export");
+    const publishedRows = new TextDecoder().decode(archive[publishedRowsEntry]!);
+    expect(publishedRows).toContain(`"storage_path":"${storagePath}"`);
+    expect(publishedRows).not.toContain(workDir);
+    expect(Object.keys(archive).some((name) => name.includes("agent_artifact_blobs") || name.includes("agent_artifact_blob_journal") || name.includes("agent_workspace_artifacts"))).toBe(false);
     expect(new Set(Object.keys(archive)).size).toBe(Object.keys(archive).length);
     writeFileSync(archivePath, archiveBytes);
-    rmSync(artifactPath);
 
-    const job = await startImport({ userId: USER_ID, archivePath, jobId: crypto.randomUUID() });
+    const destinationRoot = mkdtempSync(join(tmpdir(), "lvbak-artifact-destination-"));
+    closeDatabase();
+    env.dataDir = destinationRoot;
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+    getDb().query('INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)').run(
+      destinationUserId,
+      "Artifact Destination",
+      "artifact-destination@example.test",
+    );
+    const destinationArtifactPath = join(destinationRoot, "agent-artifacts", destinationUserId, storagePath);
+    const job = await startImport({ userId: destinationUserId, archivePath, jobId: crypto.randomUUID() });
     const finished = await waitForTerminal(job.jobId);
     expect(finished.status).toBe("complete");
-    expect(existsSync(artifactPath)).toBe(true);
-    expect(new Uint8Array(readFileSync(artifactPath))).toEqual(artifactBytes);
-    expect(
-      getDb().query(
-        "SELECT final_path, install_state FROM user_data_import_files WHERE job_id = ? AND archive_path = ?",
-      ).get(job.jobId, `files/artifacts/${chatId}/${storagePath}`),
-    ).toEqual({ final_path: artifactPath, install_state: "installed" });
-    expect(
-      getDb().query("SELECT source_artifact_id, message_id, swipe_id, storage_path, mime_type, byte_count, digest FROM agent_published_workspace_artifacts WHERE published_artifact_id = ?")
-        .get(artifactId),
-    ).toEqual({
+    expect(existsSync(destinationArtifactPath)).toBe(true);
+    expect(new Uint8Array(readFileSync(destinationArtifactPath))).toEqual(artifactBytes);
+    expect(getDb().query(
+      "SELECT final_path, install_state FROM user_data_import_files WHERE job_id = ? AND archive_path = ?",
+    ).get(job.jobId, `files/artifacts/${chatId}/${storagePath}`)).toEqual({
+      final_path: destinationArtifactPath,
+      install_state: "installed",
+    });
+    expect(getDb().query(
+      `SELECT user_id, source_artifact_id, message_id, swipe_id, storage_path, mime_type, byte_count, digest
+         FROM agent_published_workspace_artifacts WHERE published_artifact_id = ?`,
+    ).get(published.published_artifact_id)).toEqual({
+      user_id: destinationUserId,
       source_artifact_id: sourceArtifactId,
       message_id: messageId,
       swipe_id: 0,
@@ -873,6 +915,7 @@ describe("user-data import bounded extraction", () => {
       byte_count: artifactBytes.byteLength,
       digest,
     });
+    rmSync(destinationRoot, { recursive: true, force: true });
   });
 
   test("round-trips a ZIP64 export containing a record larger than 4 MiB", async () => {

@@ -65,6 +65,9 @@ const MAX_NODES = 128;
 const MAX_EVENTS = 128;
 const MAX_RUNS = 16;
 const MAX_RESYNC_RUNS = 256;
+const MAX_RESYNC_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_ACTIVE_RESYNC_SNAPSHOTS_PER_OWNER = 16;
+const MAX_ACTIVE_RESYNC_BYTES_PER_OWNER = 64 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES = 64;
 const MAX_CURSOR_BYTES = 2048;
 const CURSOR_TTL_SECONDS = 5 * 60;
@@ -3191,6 +3194,7 @@ interface ResyncSnapshotMetadata {
   readonly snapshotId: string;
   readonly snapshotSequence: number;
   readonly totalRuns: number;
+  readonly omittedOlderRuns: number;
   readonly expiresAt: number;
 }
 
@@ -3204,11 +3208,12 @@ interface ResyncSnapshotMemberRow {
 interface ResyncSnapshotPage {
   readonly runs: AgentRunPublicV2[];
   readonly totalRuns: number;
+  readonly omittedOlderRuns: number;
   readonly expiresAt: number;
   readonly lastOrdinal?: number;
 }
 
-function cleanupResyncSnapshots(db: Database, userId: string, chatId: string, nowSeconds: number): void {
+function cleanupResyncSnapshots(db: Database, userId: string, nowSeconds: number): void {
   if (
     !tableExists(db, "agent_run_resync_snapshots")
     || !tableExists(db, "agent_run_resync_snapshot_members")
@@ -3218,12 +3223,12 @@ function cleanupResyncSnapshots(db: Database, userId: string, chatId: string, no
       WHERE snapshot_id IN (
         SELECT snapshot_id
           FROM agent_run_resync_snapshots
-         WHERE user_id = ? AND chat_id = ? AND expires_at <= ?
+         WHERE user_id = ? AND expires_at <= ?
       )`,
-  ).run(userId, chatId, nowSeconds);
+  ).run(userId, nowSeconds);
   db.query(
-    "DELETE FROM agent_run_resync_snapshots WHERE user_id = ? AND chat_id = ? AND expires_at <= ?",
-  ).run(userId, chatId, nowSeconds);
+    "DELETE FROM agent_run_resync_snapshots WHERE user_id = ? AND expires_at <= ?",
+  ).run(userId, nowSeconds);
 }
 
 
@@ -3331,31 +3336,100 @@ function materializeResyncSnapshot(
     throw new Error("agent run resync snapshot schema is unavailable");
   }
   const nowSeconds = Math.floor(Date.now() / 1000);
-  cleanupResyncSnapshots(db, userId, chatId, nowSeconds);
-  const source = listCurrentRuns(db, userId, chatId, snapshotSequence, snapshotAt, MAX_RESYNC_RUNS + 1);
-  if (source.totalRuns > MAX_RESYNC_RUNS || source.runs.length > MAX_RESYNC_RUNS) {
+  cleanupResyncSnapshots(db, userId, nowSeconds);
+  const existing = db.query(
+    `SELECT snapshot_id, snapshot_sequence, total_runs, omitted_runs, expires_at
+       FROM agent_run_resync_snapshots
+      WHERE user_id = ? AND chat_id = ? AND snapshot_sequence = ? AND expires_at > ?
+      ORDER BY created_at DESC, snapshot_id DESC
+      LIMIT 1`,
+  ).get(userId, chatId, snapshotSequence, nowSeconds) as {
+    snapshot_id: string;
+    snapshot_sequence: number;
+    total_runs: number;
+    omitted_runs: number;
+    expires_at: number;
+  } | null;
+  if (
+    existing
+    && validId(existing.snapshot_id)
+    && existing.snapshot_sequence === snapshotSequence
+    && Number.isSafeInteger(existing.total_runs)
+    && existing.total_runs >= 0
+    && existing.total_runs <= MAX_RESYNC_RUNS
+    && Number.isSafeInteger(existing.omitted_runs)
+    && existing.omitted_runs >= 0
+    && Number.isSafeInteger(existing.expires_at)
+    && existing.expires_at > nowSeconds
+  ) {
+    return {
+      snapshotId: existing.snapshot_id,
+      snapshotSequence,
+      totalRuns: existing.total_runs,
+      omittedOlderRuns: existing.omitted_runs,
+      expiresAt: existing.expires_at,
+    };
+  }
+
+  // Remove only a malformed same-watermark candidate. Active snapshots at
+  // different watermarks may still back issued continuation cursors.
+  if (existing) {
+    db.query("DELETE FROM agent_run_resync_snapshot_members WHERE snapshot_id = ?")
+      .run(existing.snapshot_id);
+    db.query("DELETE FROM agent_run_resync_snapshots WHERE snapshot_id = ?")
+      .run(existing.snapshot_id);
+  }
+
+  const source = listCurrentRuns(db, userId, chatId, snapshotSequence, snapshotAt, MAX_RESYNC_RUNS);
+  if (source.runs.length > MAX_RESYNC_RUNS || source.runs.length > source.totalRuns) {
     throw new Error("agent run resync membership exceeds the retained snapshot bound");
   }
+  const members: Array<{ readonly run: AgentRunPublicV2; readonly json: string; readonly bytes: number }> = [];
+  let snapshotBytes = 0;
+  for (const run of source.runs) {
+    const json = JSON.stringify(run);
+    const bytes = encoder.encode(json).byteLength;
+    if (bytes > 65536) throw new Error("agent run resync snapshot member exceeds storage bounds");
+    if (snapshotBytes + bytes > MAX_RESYNC_SNAPSHOT_BYTES) break;
+    members.push({ run, json, bytes });
+    snapshotBytes += bytes;
+  }
+  const omittedOlderRuns = Math.max(0, source.totalRuns - members.length);
+  const ownerUsage = db.query(
+    `SELECT COUNT(DISTINCT s.snapshot_id) AS snapshot_count,
+            COALESCE(SUM(length(CAST(m.run_json AS BLOB))), 0) AS snapshot_bytes
+       FROM agent_run_resync_snapshots s
+       LEFT JOIN agent_run_resync_snapshot_members m ON m.snapshot_id = s.snapshot_id
+      WHERE s.user_id = ? AND s.expires_at > ?`,
+  ).get(userId, nowSeconds) as { snapshot_count?: unknown; snapshot_bytes?: unknown } | null;
+  const ownerSnapshotCount = Number(ownerUsage?.snapshot_count ?? 0);
+  const ownerSnapshotBytes = Number(ownerUsage?.snapshot_bytes ?? 0);
+  if (
+    !Number.isSafeInteger(ownerSnapshotCount)
+    || ownerSnapshotCount >= MAX_ACTIVE_RESYNC_SNAPSHOTS_PER_OWNER
+    || !Number.isSafeInteger(ownerSnapshotBytes)
+    || ownerSnapshotBytes < 0
+    || ownerSnapshotBytes + snapshotBytes > MAX_ACTIVE_RESYNC_BYTES_PER_OWNER
+  ) {
+    throw new Error("agent run resync snapshot owner quota exceeded");
+  }
+
   const snapshotId = randomUUID();
   const expiresAt = nowSeconds + RESYNC_SNAPSHOT_TTL_SECONDS;
   db.query(
     `INSERT INTO agent_run_resync_snapshots
-      (snapshot_id, user_id, chat_id, snapshot_sequence, snapshot_at, total_runs, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(snapshotId, userId, chatId, snapshotSequence, snapshotAt, source.runs.length, expiresAt);
+      (snapshot_id, user_id, chat_id, snapshot_sequence, snapshot_at, total_runs, omitted_runs, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(snapshotId, userId, chatId, snapshotSequence, snapshotAt, members.length, omittedOlderRuns, expiresAt);
   const insertMember = db.query(
     `INSERT INTO agent_run_resync_snapshot_members
       (snapshot_id, user_id, ordinal, turn_id, updated_at, run_json)
      VALUES (?, ?, ?, ?, ?, ?)`,
   );
-  source.runs.forEach((run, ordinal) => {
-    const runJson = JSON.stringify(run);
-    if (encoder.encode(runJson).byteLength > 65536) {
-      throw new Error("agent run resync snapshot member exceeds storage bounds");
-    }
-    insertMember.run(snapshotId, userId, ordinal, run.turnId, run.updatedAt, runJson);
+  members.forEach(({ run, json }, ordinal) => {
+    insertMember.run(snapshotId, userId, ordinal, run.turnId, run.updatedAt, json);
   });
-  return { snapshotId, snapshotSequence, totalRuns: source.runs.length, expiresAt };
+  return { snapshotId, snapshotSequence, totalRuns: members.length, omittedOlderRuns, expiresAt };
 }
 
 function readResyncSnapshotPage(
@@ -3373,15 +3447,16 @@ function readResyncSnapshotPage(
     throw new Error("agent run resync snapshot schema is unavailable");
   }
   const nowSeconds = Math.floor(Date.now() / 1000);
-  cleanupResyncSnapshots(db, userId, chatId, nowSeconds);
+  cleanupResyncSnapshots(db, userId, nowSeconds);
   const metadata = db.query(
-    `SELECT snapshot_sequence, total_runs, expires_at
+    `SELECT snapshot_sequence, total_runs, omitted_runs, expires_at
        FROM agent_run_resync_snapshots
       WHERE snapshot_id = ? AND user_id = ? AND chat_id = ? AND expires_at > ?
       LIMIT 1`,
   ).get(snapshotId, userId, chatId, nowSeconds) as {
     snapshot_sequence: number;
     total_runs: number;
+    omitted_runs: number;
     expires_at: number;
   } | null;
   if (
@@ -3392,6 +3467,8 @@ function readResyncSnapshotPage(
     || !Number.isSafeInteger(metadata.total_runs)
     || metadata.total_runs < 0
     || metadata.total_runs > MAX_RESYNC_RUNS
+    || !Number.isSafeInteger(metadata.omitted_runs)
+    || metadata.omitted_runs < 0
     || !Number.isSafeInteger(metadata.expires_at)
     || metadata.expires_at <= nowSeconds
   ) {
@@ -3456,6 +3533,7 @@ function readResyncSnapshotPage(
   return {
     runs,
     totalRuns: metadata.total_runs,
+    omittedOlderRuns: metadata.omitted_runs,
     expiresAt: metadata.expires_at,
     ...(lastOrdinal === undefined ? {} : { lastOrdinal }),
   };
@@ -3465,7 +3543,7 @@ export function getAgentRunChanges(userId: string, chatId: string, cursorToken?:
   const db = getDb();
   return db.transaction(() => {
     if (!validId(userId) || !validId(chatId) || !assertOwnedChat(db, userId, chatId)) return null;
-    cleanupResyncSnapshots(db, userId, chatId, Math.floor(Date.now() / 1000));
+    cleanupResyncSnapshots(db, userId, Math.floor(Date.now() / 1000));
     const decoded = decodeCursor(cursorToken);
     const bounds = sequenceBounds(db, userId, chatId);
     const cursorMatches = decoded.reason === "ok"
@@ -3504,6 +3582,7 @@ export function getAgentRunChanges(userId: string, chatId: string, cursorToken?:
             snapshotId: decoded.claims.r!,
             snapshotSequence,
             totalRuns: 0,
+            omittedOlderRuns: 0,
             expiresAt: 0,
           }
         : materializeResyncSnapshot(db, userId, chatId, snapshotSequence, Date.now());
@@ -3544,6 +3623,7 @@ export function getAgentRunChanges(userId: string, chatId: string, cursorToken?:
           snapshotSequence,
           complete,
           omittedRuns: Math.max(0, page.totalRuns - resyncOffset - page.runs.length),
+          omittedOlderRuns: page.omittedOlderRuns,
         },
         runs: page.runs,
         events,
@@ -4153,7 +4233,10 @@ export interface AgentRunProjectionReconcileResult {
   readonly removedWorkspaces: number;
   readonly preservedChatLifetimeEntries: number;
   readonly failures: number;
+  /** False only when a row-level reconciliation operation failed. */
   readonly healthy: boolean;
+  /** False while another bounded cleanup page remains. */
+  readonly complete: boolean;
 }
 
 export interface AgentRunProjectionReconcileOptions {
@@ -4302,7 +4385,8 @@ export function reconcileAgentRunProjections(
     removedWorkspaces,
     preservedChatLifetimeEntries,
     failures,
-    healthy: failures === 0 && !pendingProjections && !pendingWorkspaces,
+    healthy: failures === 0,
+    complete: !pendingProjections && !pendingWorkspaces,
   };
 }
 

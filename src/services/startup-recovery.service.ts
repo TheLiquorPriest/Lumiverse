@@ -46,6 +46,11 @@ export type StartupStageOutcome =
     }
   | {
       readonly ok: false;
+      readonly status: "pending";
+      readonly errorCode: null;
+    }
+  | {
+      readonly ok: false;
       readonly status: "failed";
       readonly errorCode: StartupStageFailureCode;
     };
@@ -78,14 +83,14 @@ export interface StartupRecoveryResult {
   readonly readiness: AgenticReadinessVectorV1;
 }
 
-export interface StartupArtifactContinuationTimer {
+export interface StartupReconciliationContinuationTimer {
   readonly cancel: () => void;
 }
 
-export type StartupArtifactContinuationScheduler = (
+export type StartupReconciliationContinuationScheduler = (
   task: () => Promise<void>,
   delayMs: number,
-) => StartupArtifactContinuationTimer;
+) => StartupReconciliationContinuationTimer;
 
 export interface StartupRecoveryDependencies {
   readonly startAgentRuntimeEpoch?: () => number;
@@ -100,13 +105,13 @@ export interface StartupRecoveryDependencies {
     patch: Partial<Record<"schema" | "reconciliation" | "archiveRegistry" | "isolateTermination" | "publicationStore", boolean>>,
   ) => AgenticReadinessVectorV1;
   readonly installAgenticGenerationCoordinator?: () => void;
-  readonly scheduleArtifactReconcileContinuation?: StartupArtifactContinuationScheduler;
+  readonly scheduleReconciliationContinuation?: StartupReconciliationContinuationScheduler;
 }
 
-const defaultScheduleArtifactReconcileContinuation: StartupArtifactContinuationScheduler = (task, delayMs) => {
+const defaultScheduleReconciliationContinuation: StartupReconciliationContinuationScheduler = (task, delayMs) => {
   const timer = setTimeout(() => {
     void task().catch(() => {
-      // The continuation owns its retry decision and keeps readiness closed.
+      // Durable rows remain pending; the continuation owns its retry decision.
     });
   }, delayMs);
   timer.unref?.();
@@ -125,44 +130,62 @@ const defaultDependencies: Required<StartupRecoveryDependencies> = {
   probeIsolateBackendsAtStartup,
   setAgenticRuntimeReadiness,
   installAgenticGenerationCoordinator,
-  scheduleArtifactReconcileContinuation: defaultScheduleArtifactReconcileContinuation,
+  scheduleReconciliationContinuation: defaultScheduleReconciliationContinuation,
 };
-const ARTIFACT_CONTINUATION_INITIAL_DELAY_MS = 25;
-const ARTIFACT_CONTINUATION_MAX_DELAY_MS = 30_000;
+const RECONCILIATION_CONTINUATION_INITIAL_DELAY_MS = 25;
+const RECONCILIATION_CONTINUATION_MAX_DELAY_MS = 30_000;
 
-let artifactContinuationTimer: StartupArtifactContinuationTimer | undefined;
-let artifactContinuationGeneration = 0;
-let artifactContinuationRunning = false;
+interface StartupContinuationReadiness {
+  readonly schema: boolean;
+  readonly archiveRegistry: boolean;
+  readonly turnsReady: boolean;
+  artifactsReady: boolean;
+  projectionsReady: boolean;
+  readonly isolateTermination: boolean;
+}
 
-function cancelArtifactReconcileContinuation(): void {
-  artifactContinuationGeneration++;
-  const timer = artifactContinuationTimer;
-  artifactContinuationTimer = undefined;
+let reconciliationContinuationTimer: StartupReconciliationContinuationTimer | undefined;
+let reconciliationContinuationGeneration = 0;
+let reconciliationContinuationRunning = false;
+
+function cancelReconciliationContinuation(): void {
+  reconciliationContinuationGeneration++;
+  const timer = reconciliationContinuationTimer;
+  reconciliationContinuationTimer = undefined;
   timer?.cancel();
 }
 
-function scheduleArtifactReconcileContinuation(
+function continuationReadinessPatch(state: StartupContinuationReadiness) {
+  return {
+    schema: state.schema,
+    archiveRegistry: state.archiveRegistry,
+    reconciliation: state.archiveRegistry
+      && state.turnsReady
+      && state.artifactsReady
+      && state.projectionsReady,
+    publicationStore: state.artifactsReady,
+    isolateTermination: state.isolateTermination,
+  } as const;
+}
+
+function scheduleReconciliationContinuation(
   db: Database,
   deps: Required<StartupRecoveryDependencies>,
-  readiness: {
-    readonly schema: boolean;
-    readonly archiveRegistry: boolean;
-    readonly reconciliation: boolean;
-    readonly publicationStore: boolean;
-    readonly isolateTermination: boolean;
-  },
+  readiness: StartupContinuationReadiness,
+  initial: { readonly artifactsPending: boolean; readonly projectionsPending: boolean },
 ): void {
-  artifactContinuationGeneration++;
-  const generation = artifactContinuationGeneration;
-  artifactContinuationTimer?.cancel();
-  artifactContinuationTimer = undefined;
-  let delayMs = ARTIFACT_CONTINUATION_INITIAL_DELAY_MS;
-  let converged = false;
+  reconciliationContinuationGeneration++;
+  const generation = reconciliationContinuationGeneration;
+  reconciliationContinuationTimer?.cancel();
+  reconciliationContinuationTimer = undefined;
+  let artifactsPending = initial.artifactsPending;
+  let projectionsPending = initial.projectionsPending;
+  let delayMs = RECONCILIATION_CONTINUATION_INITIAL_DELAY_MS;
 
-  const reopenReadiness = (): boolean => {
-    if (generation !== artifactContinuationGeneration) return false;
+  const publishReadiness = (): boolean => {
+    if (generation !== reconciliationContinuationGeneration) return false;
     try {
-      deps.setAgenticRuntimeReadiness(readiness);
+      deps.setAgenticRuntimeReadiness(continuationReadinessPatch(readiness));
       return true;
     } catch {
       return false;
@@ -170,48 +193,65 @@ function scheduleArtifactReconcileContinuation(
   };
 
   const scheduleNext = (): void => {
-    if (generation !== artifactContinuationGeneration || artifactContinuationTimer) return;
+    if (generation !== reconciliationContinuationGeneration || reconciliationContinuationTimer) return;
     const nextDelayMs = delayMs;
-    delayMs = Math.min(ARTIFACT_CONTINUATION_MAX_DELAY_MS, delayMs * 2);
-    let timer!: StartupArtifactContinuationTimer;
+    delayMs = Math.min(RECONCILIATION_CONTINUATION_MAX_DELAY_MS, delayMs * 2);
+    let timer!: StartupReconciliationContinuationTimer;
     const task = async (): Promise<void> => {
-      if (artifactContinuationTimer === timer) artifactContinuationTimer = undefined;
-      if (generation !== artifactContinuationGeneration) return;
-      if (converged) {
-        if (!reopenReadiness()) scheduleNext();
-        return;
-      }
-      if (artifactContinuationRunning) {
+      if (reconciliationContinuationTimer === timer) reconciliationContinuationTimer = undefined;
+      if (generation !== reconciliationContinuationGeneration) return;
+      if (reconciliationContinuationRunning) {
         scheduleNext();
         return;
       }
-      artifactContinuationRunning = true;
+      reconciliationContinuationRunning = true;
+      let readinessChanged = false;
       try {
-        let result: ArtifactReconcileResult;
-        try {
-          result = await deps.reconcileAgentArtifactBlobs({
-            db,
-            maxRows: DEFAULT_ARTIFACT_BLOB_LIMITS.maxCleanupRows,
-          });
-        } catch {
-          scheduleNext();
-          return;
+        if (artifactsPending) {
+          try {
+            const result = await deps.reconcileAgentArtifactBlobs({
+              db,
+              maxRows: DEFAULT_ARTIFACT_BLOB_LIMITS.maxCleanupRows,
+            });
+            if (result.pendingGlobal === true) {
+              artifactsPending = true;
+            } else if (result.healthy === true) {
+              artifactsPending = false;
+              readiness.artifactsReady = true;
+              readinessChanged = true;
+            } else {
+              artifactsPending = false;
+              logStageFailure("artifacts", "unhealthy");
+            }
+          } catch {
+            artifactsPending = true;
+          }
         }
-        if (generation !== artifactContinuationGeneration) return;
-        if (result.pendingGlobal === true) {
-          scheduleNext();
-          return;
+        if (projectionsPending) {
+          try {
+            const result = deps.reconcileAgentRunProjections(db);
+            if (!result.healthy) {
+              projectionsPending = false;
+              logStageFailure("projections", "unhealthy");
+            } else if (result.complete) {
+              projectionsPending = false;
+              readiness.projectionsReady = true;
+              readinessChanged = true;
+            }
+          } catch {
+            projectionsPending = false;
+            logStageFailure("projections", "stage_failed");
+          }
         }
-        if (result.healthy === true) {
-          converged = true;
-          if (!reopenReadiness()) scheduleNext();
-        }
+        const pending = artifactsPending || projectionsPending;
+        const published = !readinessChanged || publishReadiness();
+        if (pending || !published) scheduleNext();
       } finally {
-        artifactContinuationRunning = false;
+        reconciliationContinuationRunning = false;
       }
     };
-    timer = deps.scheduleArtifactReconcileContinuation(task, nextDelayMs);
-    artifactContinuationTimer = timer;
+    timer = deps.scheduleReconciliationContinuation(task, nextDelayMs);
+    reconciliationContinuationTimer = timer;
   };
 
   scheduleNext();
@@ -224,7 +264,9 @@ function completedStage(): StartupStageOutcome {
 function failedStage(errorCode: StartupStageFailureCode = "stage_failed"): StartupStageOutcome {
   return { ok: false, status: "failed", errorCode };
 }
-
+function pendingStage(): StartupStageOutcome {
+  return { ok: false, status: "pending", errorCode: null };
+}
 /**
  * Log only a stable stage/code pair. Recovery exceptions may contain provider,
  * path, or credential data and are intentionally never emitted at startup.
@@ -279,6 +321,7 @@ function emptyProjectionReconcileResult(): AgentRunProjectionReconcileResult {
     preservedChatLifetimeEntries: 0,
     failures: 0,
     healthy: false,
+    complete: false,
   };
 }
 
@@ -378,7 +421,7 @@ export async function reconcileStartupState(
   db: Database,
   dependencies: StartupRecoveryDependencies = {},
 ): Promise<StartupRecoveryResult> {
-  cancelArtifactReconcileContinuation();
+  cancelReconciliationContinuation();
   const deps = { ...defaultDependencies, ...dependencies };
   const runtimeEpoch = deps.startAgentRuntimeEpoch();
 
@@ -422,7 +465,7 @@ export async function reconcileStartupState(
     if (artifacts.healthy === false) {
       artifactContinuationPending = artifacts.pendingGlobal === true || hasPendingArtifactReconcileGlobal(db);
       artifactFailureCode = "unhealthy";
-      logStageFailure("artifacts", artifactFailureCode);
+      if (!artifactContinuationPending) logStageFailure("artifacts", artifactFailureCode);
     } else {
       artifactsReady = true;
     }
@@ -447,14 +490,17 @@ export async function reconcileStartupState(
 
   let projections = emptyProjectionReconcileResult();
   let projectionsReady = false;
+  let projectionContinuationPending = false;
   let projectionFailureCode: StartupStageFailureCode = "stage_failed";
   try {
     projections = deps.reconcileAgentRunProjections(db);
-    if (projections.healthy) {
-      projectionsReady = true;
-    } else {
+    if (!projections.healthy) {
       projectionFailureCode = "unhealthy";
       logStageFailure("projections", projectionFailureCode);
+    } else if (projections.complete) {
+      projectionsReady = true;
+    } else {
+      projectionContinuationPending = true;
     }
   } catch {
     logStageFailure("projections", projectionFailureCode);
@@ -482,13 +528,15 @@ export async function reconcileStartupState(
     logStageFailure("isolate", "stage_failed");
   }
 
-  const readinessPatch = {
+  const continuationReadiness: StartupContinuationReadiness = {
     schema: true,
     archiveRegistry: importsReady,
-    reconciliation: importsReady && artifactsReady && turnsReady && projectionsReady,
-    publicationStore: artifactsReady,
+    turnsReady,
+    artifactsReady,
+    projectionsReady,
     isolateTermination: isolateReady,
-  } satisfies Partial<Record<"schema" | "reconciliation" | "archiveRegistry" | "isolateTermination" | "publicationStore", boolean>>;
+  };
+  const readinessPatch = continuationReadinessPatch(continuationReadiness);
   let readiness = failClosedReadiness(runtimeEpoch);
   let readinessOutcome: StartupStageOutcome = failedStage();
   try {
@@ -512,24 +560,22 @@ export async function reconcileStartupState(
     isolateOutcome = failedStage("unhealthy");
   }
 
-  if (artifactContinuationPending && readinessOutcome.ok && coordinatorOutcome.ok) {
+  if ((artifactContinuationPending || projectionContinuationPending) && readinessOutcome.ok && coordinatorOutcome.ok) {
     try {
-      scheduleArtifactReconcileContinuation(db, deps, {
-        schema: true,
-        archiveRegistry: importsReady,
-        reconciliation: importsReady && turnsReady && projectionsReady,
-        publicationStore: true,
-        isolateTermination: isolateReady,
+      scheduleReconciliationContinuation(db, deps, continuationReadiness, {
+        artifactsPending: artifactContinuationPending,
+        projectionsPending: projectionContinuationPending,
       });
     } catch {
-      logStageFailure("artifacts", "stage_failed");
+      if (artifactContinuationPending) logStageFailure("artifacts", "stage_failed");
+      if (projectionContinuationPending) logStageFailure("projections", "stage_failed");
     }
   }
   const stages: StartupRecoveryStages = {
     imports: importsReady ? completedStage() : failedStage(importFailureCode),
-    artifacts: artifactsReady ? completedStage() : failedStage(artifactFailureCode),
+    artifacts: artifactsReady ? completedStage() : artifactContinuationPending ? pendingStage() : failedStage(artifactFailureCode),
     turns: turnsReady ? completedStage() : failedStage(),
-    projections: projectionsReady ? completedStage() : failedStage(projectionFailureCode),
+    projections: projectionsReady ? completedStage() : projectionContinuationPending ? pendingStage() : failedStage(projectionFailureCode),
     isolate: isolateOutcome,
     readiness: readinessOutcome,
     coordinator: coordinatorOutcome,
@@ -566,7 +612,7 @@ const defaultShutdownDependencies: Required<StartupIsolateShutdownDependencies> 
 export async function shutdownIsolatePools(
   dependencies: StartupIsolateShutdownDependencies = {},
 ): Promise<void> {
-  cancelArtifactReconcileContinuation();
+  cancelReconciliationContinuation();
   const deps = { ...defaultShutdownDependencies, ...dependencies };
   await Promise.allSettled([
     deps.shutdownPromptAssemblyWorkerPool(),

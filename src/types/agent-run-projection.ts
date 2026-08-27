@@ -250,6 +250,8 @@ export interface AgentRunResyncPageV1 {
   readonly complete: boolean;
   /** Runs not returned yet; this is not an event omission. */
   readonly omittedRuns: number;
+  /** Older visible runs outside the bounded newest snapshot. */
+  readonly omittedOlderRuns: number;
 }
 
 export interface AgentRunChangeEventV2 {

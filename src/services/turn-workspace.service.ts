@@ -331,7 +331,6 @@ export interface ProposeWorkspacePublicationInputV1 extends WorkspaceFrameContex
 export interface PublishWorkspaceArtifactInputV1 extends WorkspaceFrameContextV1 {
   readonly artifactId: string;
   readonly receiptId?: string;
-  readonly storagePath?: string;
   readonly messageId?: string | null;
   readonly swipeId?: number | null;
 }
@@ -789,8 +788,8 @@ export function validateProposeWorkspacePublicationInput(value: unknown): Propos
 export function validatePublishWorkspaceArtifactInput(value: unknown): PublishWorkspaceArtifactInputV1 {
   const parsed = contextValue(value);
   if (!isRecord(value)) fail("invalid_input", "publish input must be an object");
-  assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "artifactId", "receiptId", "storagePath", "messageId", "swipeId"], "publish");
-  return Object.freeze({ ...parsed, artifactId: idValue(value.artifactId, "artifactId"), receiptId: value.receiptId === undefined ? undefined : idValue(value.receiptId, "receiptId"), storagePath: value.storagePath === undefined ? undefined : stringValue(value.storagePath, "storagePath", 4096), messageId: value.messageId === undefined ? undefined : nullableId(value.messageId, "messageId") ?? null, swipeId: value.swipeId === undefined ? undefined : integer(value.swipeId, "swipeId", 0, Number.MAX_SAFE_INTEGER) });
+  assertKeys(value, ["userId", "chatId", "turnId", "workspaceId", "actor", "frameId", "expectedRevision", "revision", "capabilities", "fieldCapabilities", "artifactId", "receiptId", "messageId", "swipeId"], "publish");
+  return Object.freeze({ ...parsed, artifactId: idValue(value.artifactId, "artifactId"), receiptId: value.receiptId === undefined ? undefined : idValue(value.receiptId, "receiptId"), messageId: value.messageId === undefined ? undefined : nullableId(value.messageId, "messageId") ?? null, swipeId: value.swipeId === undefined ? undefined : integer(value.swipeId, "swipeId", 0, Number.MAX_SAFE_INTEGER) });
 }
 export function validateWorkspaceCompletionMetadataInput(value: unknown): WorkspaceCompletionMetadataInputV1 {
   const parsed = contextValue(value);

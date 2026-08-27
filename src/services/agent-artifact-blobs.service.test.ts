@@ -189,7 +189,34 @@ describe("agent artifact blob store", () => {
     publish(first, sourceArtifactId);
     expect(db.query("SELECT published_reference_count FROM agent_artifact_blobs WHERE digest = ? AND user_id = ?").get(first.digest, USER_ID)).toEqual({ published_reference_count: 1 });
     expect(db.query("SELECT published_reference_count FROM agent_artifact_blobs WHERE digest = ? AND user_id = ?").get(other.digest, OTHER_USER_ID)).toEqual({ published_reference_count: 0 });
-    expect(db.query("SELECT storage_path FROM agent_published_workspace_artifacts WHERE blob_digest = ? AND user_id = ?").get(first.digest, USER_ID)).toEqual({ storage_path: first.storagePath });
+    expect(db.query("SELECT storage_path FROM agent_published_workspace_artifacts WHERE blob_digest = ? AND user_id = ?").get(first.digest, USER_ID)).toEqual({ storage_path: `${first.digest}.blob` });
+  });
+  test("repairs a legacy absolute publication path during idempotent republish", async () => {
+    const handle = await store.stageArtifact(writeInput(new TextEncoder().encode("portable republish")));
+    const sourceArtifactId = await insertWorkspaceReference(handle);
+    publish(handle, sourceArtifactId);
+    db.run("DROP TRIGGER trg_agent_published_artifact_relative_path_update");
+    db.query(
+      "UPDATE agent_published_workspace_artifacts SET storage_path = ? WHERE user_id = ? AND blob_digest = ?",
+    ).run(handle.storagePath, USER_ID, handle.digest);
+    db.query("UPDATE agent_workspace_artifacts SET publication_state = 'proposed' WHERE artifact_id = ?")
+      .run(sourceArtifactId);
+
+    expect(publish(handle, sourceArtifactId).duplicate).toBe(true);
+    expect(db.query(
+      "SELECT storage_path FROM agent_published_workspace_artifacts WHERE user_id = ? AND blob_digest = ?",
+    ).get(USER_ID, handle.digest)).toEqual({ storage_path: `${handle.digest}.blob` });
+  });
+
+  test("rejects nonportable canonical publication paths at the database boundary", async () => {
+    const handle = await store.stageArtifact(writeInput(new TextEncoder().encode("portable guard")));
+    const sourceArtifactId = await insertWorkspaceReference(handle);
+    publish(handle, sourceArtifactId);
+    expect(() => db.query(
+      "UPDATE agent_published_workspace_artifacts SET storage_path = ? WHERE user_id = ? AND blob_digest = ?",
+    ).run(handle.storagePath, USER_ID, handle.digest)).toThrow(
+      "published artifact storage_path must be portable and owner-relative",
+    );
   });
   test("counts a deduped blob once per turn while enforcing turn quota", async () => {
     const bounded = new ArtifactBlobStore({ db, rootDir, now: () => NOW_MS, limits: { maxTurnBytes: 3 } });

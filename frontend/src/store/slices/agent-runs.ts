@@ -979,12 +979,15 @@ function normalizeResyncPage(value: unknown): AgentRunResyncPageV1 | undefined {
   const totalRuns = nonNegativeInteger(value.totalRuns)
   const snapshotSequence = nonNegativeInteger(value.snapshotSequence)
   const omittedRuns = nonNegativeInteger(value.omittedRuns)
+  const omittedOlderRuns = nonNegativeInteger(value.omittedOlderRuns)
   if (
     offset === null
     || returnedRuns === null
     || totalRuns === null
     || snapshotSequence === null
     || omittedRuns === null
+    || omittedOlderRuns === null
+    || totalRuns > 256
     || typeof value.complete !== 'boolean'
     || returnedRuns > MAX_RESYNC_RUNS_PER_PAGE
     || offset > totalRuns
@@ -992,7 +995,7 @@ function normalizeResyncPage(value: unknown): AgentRunResyncPageV1 | undefined {
     || omittedRuns !== totalRuns - offset - returnedRuns
     || value.complete !== (omittedRuns === 0)
   ) return undefined
-  return { offset, returnedRuns, totalRuns, snapshotSequence, complete: value.complete, omittedRuns }
+  return { offset, returnedRuns, totalRuns, snapshotSequence, complete: value.complete, omittedRuns, omittedOlderRuns }
 }
 
 export function normalizeAgentRunChangesV2(value: unknown): AgentRunChangesV2 | null {
@@ -2275,6 +2278,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
         || descriptor !== undefined && (
           page.snapshotSequence !== descriptor.snapshotSequence
           || page.totalRuns !== descriptor.totalRuns
+          || page.omittedOlderRuns !== descriptor.omittedOlderRuns
           || normalized.cursorSequence !== descriptor.snapshotSequence
         )
         || previousCursorSequence !== undefined
@@ -2319,6 +2323,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
         nextDescriptors[chatId] = {
           snapshotSequence: nextPage.snapshotSequence,
           totalRuns: nextPage.totalRuns,
+          omittedOlderRuns: nextPage.omittedOlderRuns,
           nextOffset: nextPage.offset + normalized.runs.length,
           identities: {
             ...(descriptor?.identities ?? {}),

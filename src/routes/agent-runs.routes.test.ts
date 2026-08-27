@@ -98,6 +98,57 @@ describe("authenticated Agentic run routes", () => {
     expect(forbidden.status).toBe(404);
   });
 
+  test("serves a bounded 257-run resync instead of returning 503", async () => {
+    const chatId = "route-large-resync";
+    seedChat(OWNER, chatId);
+    for (let index = 0; index < 257; index += 1) {
+      const turnId = `route-large-turn-${index.toString().padStart(3, "0")}`;
+      seedRun(OWNER, chatId, turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        userId: OWNER,
+        chatId,
+        turnId,
+        generationId: turnId,
+        generationType: "normal",
+        status: "WORK",
+        updatedAt: index + 1,
+      }));
+    }
+
+    const response = await app.request(`http://localhost/agent-runs/changes/${chatId}`, {
+      headers: { "x-test-user": OWNER },
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()).resyncPage).toMatchObject({
+      returnedRuns: 16,
+      totalRuns: 256,
+      omittedOlderRuns: 1,
+      complete: false,
+    });
+  });
+
+  test("shares one authenticated owner-chat throttle across every active alias", async () => {
+    const chatId = "route-throttled-resync";
+    seedChat(OWNER, chatId);
+    const aliases = [
+      `/changes/${chatId}`,
+      `/${chatId}/changes`,
+      `/active/${chatId}`,
+      `/${chatId}/active`,
+      `/active?chatId=${chatId}`,
+    ];
+    for (let index = 0; index < 60; index += 1) {
+      const response = await app.request(`http://localhost/agent-runs${aliases[index % aliases.length]}`, {
+        headers: { "x-test-user": OWNER },
+      });
+      expect(response.status).toBe(200);
+    }
+    const limited = await app.request(`http://localhost/agent-runs/active?chat_id=${chatId}`, {
+      headers: { "x-test-user": OWNER },
+    });
+    expect(limited.status).toBe(429);
+    expect(Number(limited.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
+  });
   test("exact root Stop never broadens to another chat and is idempotent", async () => {
     seedChat(OWNER, "route-stop-chat");
     seedChat(OWNER, "route-other-chat");

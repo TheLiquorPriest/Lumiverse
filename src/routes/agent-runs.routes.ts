@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { rateLimit } from "../middleware/rate-limit";
 import {
   AgentRunStopUnavailableError,
   getAgentRun,
@@ -50,6 +51,16 @@ import type {
 } from "../types/agent-runtime";
 
 const app = new Hono();
+const resyncLimiter = rateLimit({
+  bucket: "agent-run-resync",
+  max: 60,
+  windowMs: 60 * 1000,
+  key: (c) => {
+    const userId = c.get("userId");
+    const chatId = c.req.param("chatId") || c.req.query("chatId") || c.req.query("chat_id") || "invalid-chat";
+    return `agent-run-resync:${typeof userId === "string" ? userId : "unauthenticated"}:${chatId}`;
+  },
+});
 const WORKSPACE_SECTIONS = new Set<AgentWorkspaceSectionIdV2>([
   "objective", "tasks", "records", "submissions", "artifacts",
 ]);
@@ -207,11 +218,11 @@ function chatChanges(c: Context, chatId: string | undefined): Response {
 
 // Cursor delta/full-resync endpoints. The aliases keep the public surface
 // stable while the frontend migrates from active polling to chat cursors.
-app.get("/changes/:chatId", (c) => chatChanges(c, c.req.param("chatId")));
-app.get("/:chatId/changes", (c) => chatChanges(c, c.req.param("chatId")));
-app.get("/active/:chatId", (c) => chatChanges(c, c.req.param("chatId")));
-app.get("/:chatId/active", (c) => chatChanges(c, c.req.param("chatId")));
-app.get("/active", (c) => {
+app.get("/changes/:chatId", resyncLimiter, (c) => chatChanges(c, c.req.param("chatId")));
+app.get("/:chatId/changes", resyncLimiter, (c) => chatChanges(c, c.req.param("chatId")));
+app.get("/active/:chatId", resyncLimiter, (c) => chatChanges(c, c.req.param("chatId")));
+app.get("/:chatId/active", resyncLimiter, (c) => chatChanges(c, c.req.param("chatId")));
+app.get("/active", resyncLimiter, (c) => {
   const chatId = optionalQueryId(c, ["chatId", "chat_id"]);
   if (chatId.invalid || !chatId.value) return routeError(c, 400, "invalid_request", "invalid_chat_id");
   return chatChanges(c, chatId.value);

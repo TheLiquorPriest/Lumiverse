@@ -104,6 +104,7 @@ function healthyRecoveryDependencies(
       preservedChatLifetimeEntries: 0,
       failures: 0,
       healthy: true,
+      complete: true,
     }),
     probeIsolateBackendsAtStartup: async () => isolate("worker"),
     setAgenticRuntimeReadiness: (patch) => readiness(patch),
@@ -145,6 +146,7 @@ describe("startup recovery sequencing", () => {
       preservedChatLifetimeEntries: 1,
       failures: 0,
       healthy: true,
+      complete: true,
     } as const;
     const readinessPatches: Array<Partial<Record<"schema" | "reconciliation" | "archiveRegistry" | "isolateTermination" | "publicationStore", boolean>>> = [];
     const result = await reconcileStartupState(db, {
@@ -319,6 +321,7 @@ describe("startup recovery sequencing", () => {
         preservedChatLifetimeEntries: 0,
         failures: 0,
         healthy: true,
+        complete: true,
       }),
       probeIsolateBackendsAtStartup: async () => isolate("unavailable"),
       installAgenticGenerationCoordinator: () => {},
@@ -365,6 +368,7 @@ describe("startup recovery sequencing", () => {
           preservedChatLifetimeEntries: 0,
           failures: 0,
           healthy: true,
+          complete: true,
         }),
         probeIsolateBackendsAtStartup: async () => isolate("worker"),
         setAgenticRuntimeReadiness: (patch) => readiness(patch),
@@ -416,7 +420,7 @@ describe("startup recovery sequencing", () => {
         readinessPatches.push(patch);
         return readiness(patch);
       },
-      scheduleArtifactReconcileContinuation: (task, delayMs) => {
+      scheduleReconciliationContinuation: (task, delayMs) => {
         const entry = { task, delayMs, canceled: false };
         scheduled.push(entry);
         return { cancel: () => { entry.canceled = true; } };
@@ -440,6 +444,60 @@ describe("startup recovery sequencing", () => {
       isolateTermination: true,
     });
   });
+  test("uses one continuation for simultaneous bounded artifact and projection backlog", async () => {
+    const db = new Database(":memory:");
+    dbs.push(db);
+    let artifactAttempts = 0;
+    let projectionAttempts = 0;
+    const scheduled: Array<{ readonly task: () => Promise<void>; readonly delayMs: number }> = [];
+    const readinessPatches: Array<Partial<Record<"schema" | "reconciliation" | "archiveRegistry" | "isolateTermination" | "publicationStore", boolean>>> = [];
+    const result = await reconcileStartupState(db, healthyRecoveryDependencies({
+      reconcileAgentArtifactBlobs: async () => {
+        artifactAttempts++;
+        return artifactAttempts === 1
+          ? { inspected: 256, retained: 256, removed: 0, stale: 0, quarantined: 0, bytesRemoved: 0, pendingGlobal: true, healthy: false }
+          : { inspected: 1, retained: 0, removed: 1, stale: 0, quarantined: 0, bytesRemoved: 0, pendingGlobal: false, healthy: true };
+      },
+      reconcileAgentRunProjections: () => {
+        projectionAttempts++;
+        const complete = projectionAttempts >= 3;
+        return {
+          inspectedProjections: complete ? 1 : 256,
+          removedProjections: complete ? 1 : 256,
+          inspectedWorkspaces: complete ? 1 : 256,
+          removedWorkspaces: complete ? 1 : 256,
+          preservedChatLifetimeEntries: 0,
+          failures: 0,
+          healthy: true,
+          complete,
+        };
+      },
+      setAgenticRuntimeReadiness: (patch) => {
+        readinessPatches.push(patch);
+        return readiness(patch);
+      },
+      scheduleReconciliationContinuation: (task, delayMs) => {
+        scheduled.push({ task, delayMs });
+        return { cancel: () => {} };
+      },
+    }));
+
+    expect(result.stages.artifacts).toEqual({ ok: false, status: "pending", errorCode: null });
+    expect(result.stages.projections).toEqual({ ok: false, status: "pending", errorCode: null });
+    expect(scheduled).toHaveLength(1);
+    const first = scheduled.shift();
+    if (!first) throw new Error("shared continuation was not scheduled");
+    expect(first.delayMs).toBe(25);
+    await first.task();
+    expect(readinessPatches[1]).toMatchObject({ publicationStore: true, reconciliation: false });
+    expect(scheduled).toHaveLength(1);
+    const second = scheduled.shift();
+    if (!second) throw new Error("projection continuation was not rescheduled");
+    expect(second.delayMs).toBe(50);
+    await second.task();
+    expect(readinessPatches.at(-1)).toMatchObject({ publicationStore: true, reconciliation: true });
+    expect(scheduled).toHaveLength(0);
+  });
   test("cancels artifact continuation on startup shutdown", async () => {
     const db = new Database(":memory:");
     dbs.push(db);
@@ -450,7 +508,7 @@ describe("startup recovery sequencing", () => {
         attempts++;
         return { inspected: 128, retained: 128, removed: 0, stale: 0, quarantined: 0, bytesRemoved: 0, pendingGlobal: true, healthy: false };
       },
-      scheduleArtifactReconcileContinuation: (task) => {
+      scheduleReconciliationContinuation: (task) => {
         const entry = { task, canceled: false };
         scheduled.push(entry);
         return { cancel: () => { entry.canceled = true; } };
@@ -574,6 +632,7 @@ describe("startup recovery sequencing", () => {
           preservedChatLifetimeEntries: 0,
           failures: 1,
           healthy: false,
+          complete: false,
         };
       },
       probeIsolateBackendsAtStartup: async () => {
@@ -603,6 +662,7 @@ describe("startup recovery sequencing", () => {
       preservedChatLifetimeEntries: 0,
       failures: 1,
       healthy: false,
+      complete: false,
     });
     expect(result.readiness).toMatchObject({
       archiveRegistry: true,
@@ -670,6 +730,7 @@ describe("startup recovery sequencing", () => {
             preservedChatLifetimeEntries: 0,
             failures: 0,
             healthy: true,
+            complete: true,
           };
         },
         probeIsolateBackendsAtStartup: async () => {
@@ -754,6 +815,7 @@ describe("startup recovery sequencing", () => {
           preservedChatLifetimeEntries: 0,
           failures: 0,
           healthy: false,
+          complete: false,
         });
       }
     });

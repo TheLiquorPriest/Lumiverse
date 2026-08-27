@@ -161,6 +161,8 @@ export interface AgentRunResyncPageV1 {
   snapshotSequence: number
   complete: boolean
   omittedRuns: number
+  /** Older visible runs outside the bounded newest snapshot. */
+  omittedOlderRuns: number
 }
 
 export interface AgentRunChangesV2 {

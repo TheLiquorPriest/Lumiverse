@@ -4734,11 +4734,14 @@ CREATE TABLE IF NOT EXISTS agent_run_resync_snapshots (
   total_runs INTEGER NOT NULL CHECK(total_runs >= 0),
   expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
   created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  omitted_runs INTEGER NOT NULL DEFAULT 0 CHECK(omitted_runs >= 0),
   FOREIGN KEY (user_id, chat_id) REFERENCES chats(user_id, id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_run_resync_snapshots_owner_expiry
   ON agent_run_resync_snapshots(user_id, chat_id, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_run_resync_snapshots_watermark
+  ON agent_run_resync_snapshots(user_id, chat_id, snapshot_sequence);
 
 CREATE TABLE IF NOT EXISTS agent_run_resync_snapshot_members (
   snapshot_id TEXT NOT NULL REFERENCES agent_run_resync_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -4753,3 +4756,35 @@ CREATE TABLE IF NOT EXISTS agent_run_resync_snapshot_members (
 
 CREATE INDEX IF NOT EXISTS idx_agent_run_resync_snapshot_members_key
   ON agent_run_resync_snapshot_members(snapshot_id, updated_at DESC, turn_id DESC);
+
+-- Final feature bundle step: 134_bounded_resync_and_portable_artifacts.sql
+-- Canonical paths are portable owner-relative references; host paths stay operational.
+CREATE TRIGGER IF NOT EXISTS trg_agent_published_artifact_relative_path_insert
+BEFORE INSERT ON agent_published_workspace_artifacts
+WHEN NEW.storage_path LIKE '/%'
+  OR NEW.storage_path GLOB '[A-Za-z]:*'
+  OR NEW.storage_path LIKE '%\%'
+  OR NEW.storage_path = '..' OR NEW.storage_path LIKE '../%'
+  OR NEW.storage_path LIKE '%/../%' OR NEW.storage_path LIKE '%/..'
+  OR NEW.storage_path = '.' OR NEW.storage_path LIKE './%'
+  OR NEW.storage_path LIKE '%/./%' OR NEW.storage_path LIKE '%/.'
+  OR NEW.storage_path LIKE '%//%' OR NEW.storage_path LIKE '%/'
+  OR NEW.storage_path GLOB '*[^A-Za-z0-9._/-]*'
+BEGIN
+  SELECT RAISE(ABORT, 'published artifact storage_path must be portable and owner-relative');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_agent_published_artifact_relative_path_update
+BEFORE UPDATE OF storage_path ON agent_published_workspace_artifacts
+WHEN NEW.storage_path LIKE '/%'
+  OR NEW.storage_path GLOB '[A-Za-z]:*'
+  OR NEW.storage_path LIKE '%\%'
+  OR NEW.storage_path = '..' OR NEW.storage_path LIKE '../%'
+  OR NEW.storage_path LIKE '%/../%' OR NEW.storage_path LIKE '%/..'
+  OR NEW.storage_path = '.' OR NEW.storage_path LIKE './%'
+  OR NEW.storage_path LIKE '%/./%' OR NEW.storage_path LIKE '%/.'
+  OR NEW.storage_path LIKE '%//%' OR NEW.storage_path LIKE '%/'
+  OR NEW.storage_path GLOB '*[^A-Za-z0-9._/-]*'
+BEGIN
+  SELECT RAISE(ABORT, 'published artifact storage_path must be portable and owner-relative');
+END;

@@ -202,6 +202,7 @@ export interface AgentRunRetryStateV1 {
 export interface AgentRunResyncDescriptorV1 {
   snapshotSequence: number
   totalRuns: number
+  omittedOlderRuns: number
   nextOffset: number
   identities: Record<string, true>
 }

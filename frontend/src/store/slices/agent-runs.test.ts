@@ -217,6 +217,7 @@ describe('agent run projection slice', () => {
         snapshotSequence: 20,
         complete: false,
         omittedRuns: 1,
+        omittedOlderRuns: 0,
       },
     }))).toBe(true)
     expect(useStore.getState().agentRunSyncByChat['chat-a']).toBe('stale')
@@ -240,6 +241,7 @@ describe('agent run projection slice', () => {
         snapshotSequence: 20,
         complete: true,
         omittedRuns: 0,
+        omittedOlderRuns: 0,
       },
     }))).toBe(true)
     expect(Object.keys(useStore.getState().agentRunProvisionalByKey)).toHaveLength(17)
@@ -262,7 +264,7 @@ describe('agent run projection slice', () => {
       cursorSequence: 2,
       lastSequence: 2,
       tailSequence: 2,
-      resyncPage: { offset: 0, returnedRuns: 16, totalRuns: 18, snapshotSequence: 2, complete: false, omittedRuns: 2 },
+      resyncPage: { offset: 0, returnedRuns: 16, totalRuns: 18, snapshotSequence: 2, complete: false, omittedRuns: 2, omittedOlderRuns: 0 },
     })
     const firstResyncPage = firstPayload.resyncPage
     if (!firstResyncPage) throw new Error('full resync fixture is missing its page descriptor')
@@ -282,7 +284,7 @@ describe('agent run projection slice', () => {
       cursorSequence: 2,
       lastSequence: 2,
       tailSequence: 2,
-      resyncPage: { offset: 17, returnedRuns: 1, totalRuns: 18, snapshotSequence: 2, complete: true, omittedRuns: 0 },
+      resyncPage: { offset: 17, returnedRuns: 1, totalRuns: 18, snapshotSequence: 2, complete: true, omittedRuns: 0, omittedOlderRuns: 0 },
     })
     expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, firstPayload)).toBe(false)
     expect(useStore.getState().applyAgentRunChanges('chat-a', epoch, skippedPage)).toBe(false)
@@ -295,7 +297,7 @@ describe('agent run projection slice', () => {
     })).toBeNull()
     expect(normalizeAgentRunChangesV2({
       ...firstPayload,
-      resyncPage: { ...firstResyncPage, returnedRuns: 17, totalRuns: 17, omittedRuns: 0, complete: true },
+      resyncPage: { ...firstResyncPage, returnedRuns: 17, totalRuns: 17, omittedRuns: 0, omittedOlderRuns: 0, complete: true },
       hasMore: false,
     })).toBeNull()
     expect(normalizeAgentRunChangesV2({
@@ -333,7 +335,7 @@ describe('agent run projection slice', () => {
       resync: true,
       lastSequence: 5,
       cursor: { version: 1, token: 'fresh-cursor' },
-      resyncPage: { offset: 0, returnedRuns: 1, totalRuns: 1, snapshotSequence: 5, complete: true, omittedRuns: 0 },
+      resyncPage: { offset: 0, returnedRuns: 1, totalRuns: 1, snapshotSequence: 5, complete: true, omittedRuns: 0, omittedOlderRuns: 0 },
     }))
     expect(useStore.getState().agentRunSyncByChat['chat-a']).toBe('ready')
     expect(useStore.getState().agentRunCursorByChat['chat-a']).toBe('fresh-cursor')
@@ -688,7 +690,7 @@ describe('agent run projection slice', () => {
       resync: true,
       lastSequence: 8,
       cursor: { version: 1, token: 'cursor-old' },
-      resyncPage: { offset: 0, returnedRuns: 1, totalRuns: 1, snapshotSequence: 8, complete: true, omittedRuns: 0 },
+      resyncPage: { offset: 0, returnedRuns: 1, totalRuns: 1, snapshotSequence: 8, complete: true, omittedRuns: 0, omittedOlderRuns: 0 },
     })
     expect(useStore.getState().applyAgentRunChanges('chat-a', restoreEpoch, payload)).toBe(true)
     expect(useStore.getState().applyAgentRunChanges('chat-a', restoreEpoch, payload)).toBe(true)

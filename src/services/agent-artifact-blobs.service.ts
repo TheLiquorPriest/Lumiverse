@@ -1934,8 +1934,11 @@ function insertPublishedReference(db: Database, input: ArtifactPublishInput, ref
   if (finalPath !== blobPath || Number(blob.byte_count) !== ref.byteCount || identity.size !== ref.byteCount || marker.after !== identityString(identity) || hashFileSync(finalPath, ref.byteCount) !== ref.digest) {
     throw new ArtifactBlobError("artifact_file_mismatch", "Artifact bytes do not match the immutable journal");
   }
+  // Blob/journal paths are operational absolute paths. Canonical publication
+  // rows are portable owner-relative references and must never inherit them.
+  const canonicalStoragePath = `${ref.digest}.blob`;
   const associateReceipt = (): void => {
-    db.query(`UPDATE ${table} SET ${q(receiptColumn)} = ? WHERE ${q(userColumn)} = ? AND ${q(chatColumn)} = ? AND ${q(messageColumn)} IS ? AND ${q(swipeColumn)} IS ? AND ${q(digestColumn)} = ?`).run(receiptId, input.userId, input.chatId, ref.messageId, ref.swipeId, ref.digest);
+    db.query(`UPDATE ${table} SET ${q(receiptColumn)} = ?, ${q(pathColumn)} = ? WHERE ${q(userColumn)} = ? AND ${q(chatColumn)} = ? AND ${q(messageColumn)} IS ? AND ${q(swipeColumn)} IS ? AND ${q(digestColumn)} = ?`).run(receiptId, canonicalStoragePath, input.userId, input.chatId, ref.messageId, ref.swipeId, ref.digest);
   };
   const existing = db.query(`SELECT 1 FROM ${table} WHERE ${q(userColumn)} = ? AND ${q(chatColumn)} = ? AND ${q(messageColumn)} IS ? AND ${q(swipeColumn)} IS ? AND ${q(digestColumn)} = ? LIMIT 1`).get(input.userId, input.chatId, ref.messageId, ref.swipeId, ref.digest);
   if (existing) {
@@ -1951,7 +1954,7 @@ function insertPublishedReference(db: Database, input: ArtifactPublishInput, ref
     [swipeColumn]: ref.swipeId,
     [digestColumn]: ref.digest,
     ...(columns.has("digest") && digestColumn !== "digest" ? { digest: ref.digest } : {}),
-    [pathColumn]: blob.storage_path,
+    [pathColumn]: canonicalStoragePath,
     [bytesColumn]: ref.byteCount,
     [mimeColumn]: ref.mimeType,
     [retentionColumn]: "chat_lifetime",

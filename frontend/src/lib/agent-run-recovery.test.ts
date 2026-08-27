@@ -143,6 +143,7 @@ describe('exact agent run recovery', () => {
               snapshotSequence: 20,
               complete: false,
               omittedRuns: 1,
+              omittedOlderRuns: 0,
             },
           }
         : {
@@ -159,6 +160,7 @@ describe('exact agent run recovery', () => {
               snapshotSequence: 20,
               complete: true,
               omittedRuns: 0,
+              omittedOlderRuns: 0,
             },
           }
       const runs = calls === 1

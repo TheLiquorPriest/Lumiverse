@@ -1347,23 +1347,53 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     )).toThrow("agent run resync snapshot membership is incomplete");
   });
 
-  test("rejects a full resync whose membership exceeds the retained bound", () => {
-    seedChat(OWNER, "chat-resync-bound");
+  test("retains a deterministic 256-run snapshot and reports older omissions", () => {
+    const chatId = "chat-resync-bound";
+    seedChat(OWNER, chatId);
     for (let index = 0; index < 257; index += 1) {
-      const turnId = `turn-resync-bound-${index}`;
-      seedRun(OWNER, "chat-resync-bound", turnId);
+      const turnId = `turn-resync-bound-${index.toString().padStart(3, "0")}`;
+      seedRun(OWNER, chatId, turnId);
       withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
-        ...baseInput(OWNER, "chat-resync-bound", turnId),
+        ...baseInput(OWNER, chatId, turnId),
         revision: 1,
+        updatedAt: index + 1,
       }));
     }
 
-    expect(() => getAgentRunChanges(OWNER, "chat-resync-bound")).toThrow(
-      "agent run resync membership exceeds the retained snapshot bound",
-    );
+    const first = getAgentRunChanges(OWNER, chatId);
+    if (!first?.resyncPage) throw new Error("initial bounded resync page is unavailable");
+    expect(first.resync).toBe(true);
+    expect(first.resyncPage).toMatchObject({
+      offset: 0,
+      returnedRuns: 16,
+      totalRuns: 256,
+      omittedRuns: 240,
+      omittedOlderRuns: 1,
+      complete: false,
+    });
+    const repeated = getAgentRunChanges(OWNER, chatId);
+    if (!repeated?.resyncPage) throw new Error("reused bounded resync page is unavailable");
+    expect(repeated.resyncPage.omittedOlderRuns).toBe(1);
     expect(getDb().query(
       "SELECT COUNT(*) AS count FROM agent_run_resync_snapshots WHERE user_id = ? AND chat_id = ?",
-    ).get(OWNER, "chat-resync-bound")).toEqual({ count: 0 });
+    ).get(OWNER, chatId)).toEqual({ count: 1 });
+
+    const retainedIds = new Set(first.runs.map((run) => run.turnId));
+    let page = first;
+    while (page.resyncPage?.complete === false) {
+      const next = getAgentRunChanges(OWNER, chatId, page.cursor.token);
+      if (!next?.resyncPage) throw new Error("bounded resync continuation is unavailable");
+      page = next;
+      for (const run of page.runs) retainedIds.add(run.turnId);
+    }
+    expect(retainedIds.size).toBe(256);
+    expect(retainedIds.has("turn-resync-bound-000")).toBe(false);
+    expect(page?.resyncPage).toMatchObject({
+      totalRuns: 256,
+      omittedRuns: 0,
+      omittedOlderRuns: 1,
+      complete: true,
+    });
   });
 
   test("startup terminalization atomically repairs FAILED and COMMIT_FAILED projections and outbox rows", () => {
@@ -1986,7 +2016,8 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     const bounded = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
     expect(bounded.inspectedProjections).toBe(256);
     expect(bounded.removedProjections).toBe(256);
-    expect(bounded.healthy).toBe(false);
+    expect(bounded.healthy).toBe(true);
+    expect(bounded.complete).toBe(false);
     expect(getDb().query(
       "SELECT COUNT(*) AS count FROM agent_run_projections WHERE user_id = ? AND chat_id = ?",
     ).get(OWNER, chatId)).toEqual({ count: 1 });
@@ -1995,6 +2026,7 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(converged.inspectedProjections).toBe(1);
     expect(converged.removedProjections).toBe(1);
     expect(converged.healthy).toBe(true);
+    expect(converged.complete).toBe(true);
     expect(getDb().query(
       "SELECT COUNT(*) AS count FROM agent_run_projections WHERE user_id = ? AND chat_id = ?",
     ).get(OWNER, chatId)).toEqual({ count: 0 });
@@ -2026,7 +2058,8 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     const bounded = reconcileAgentRunProjections(getDb(), { nowMilliseconds: 2_000, nowSeconds: 2 });
     expect(bounded.inspectedWorkspaces).toBe(256);
     expect(bounded.removedWorkspaces).toBe(256);
-    expect(bounded.healthy).toBe(false);
+    expect(bounded.healthy).toBe(true);
+    expect(bounded.complete).toBe(false);
     expect(getDb().query(
       "SELECT COUNT(*) AS count FROM agent_turn_workspaces WHERE user_id = ? AND chat_id = ?",
     ).get(OWNER, chatId)).toEqual({ count: 1 });
@@ -2035,6 +2068,7 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     expect(converged.inspectedWorkspaces).toBe(1);
     expect(converged.removedWorkspaces).toBe(1);
     expect(converged.healthy).toBe(true);
+    expect(converged.complete).toBe(true);
     expect(getDb().query(
       "SELECT COUNT(*) AS count FROM agent_turn_workspaces WHERE user_id = ? AND chat_id = ?",
     ).get(OWNER, chatId)).toEqual({ count: 0 });

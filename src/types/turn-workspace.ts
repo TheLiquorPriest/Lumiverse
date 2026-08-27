@@ -232,6 +232,7 @@ export interface AgentArtifactBlobV1 {
   readonly userId: string;
   readonly byteCount: number;
   readonly mimeType: string;
+  /** Host-absolute operational blob path; never serialized into account archives. */
   readonly storagePath: string;
   readonly publishedReferenceCount: number;
   readonly createdAt: number;
@@ -284,6 +285,7 @@ export interface PublishedWorkspaceArtifactV1 {
   readonly messageId: string | null;
   readonly swipeId: number | null;
   readonly blobDigest: string;
+  /** Portable owner-relative canonical path used by export and import. */
   readonly storagePath: string;
   readonly mimeType: string;
   readonly byteCount: number;
