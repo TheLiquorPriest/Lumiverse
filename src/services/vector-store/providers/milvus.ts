@@ -245,8 +245,9 @@ export class MilvusStore implements VectorStore {
     const client = await this.getClient();
     signal?.throwIfAborted();
     const name = this.collectionName(collection);
-    if (!(await this.hasCollection(name))) return;
+    const exists = await this.hasCollection(name);
     signal?.throwIfAborted();
+    if (!exists) return;
     await assertOk(client.delete({ collection_name: name, filter: translateFilter(filter) }));
     signal?.throwIfAborted();
     await this.flush(name);
@@ -259,8 +260,9 @@ export class MilvusStore implements VectorStore {
     const client = await this.getClient();
     signal?.throwIfAborted();
     const name = this.collectionName(collection);
-    if (!(await this.hasCollection(name))) return;
+    const exists = await this.hasCollection(name);
     signal?.throwIfAborted();
+    if (!exists) return;
     for (let i = 0; i < ids.length; i += 512) {
       await assertOk(client.delete({ collection_name: name, ids: ids.slice(i, i + 512) }));
       signal?.throwIfAborted();
@@ -436,8 +438,9 @@ export class MilvusStore implements VectorStore {
     signal?.throwIfAborted();
     for (const collection of _collections ?? ["embeddings", "embeddings_world_books"] as CollectionName[]) {
       const name = this.collectionName(collection);
-      if (await this.hasCollection(name)) {
-        signal?.throwIfAborted();
+      const exists = await this.hasCollection(name);
+      signal?.throwIfAborted();
+      if (exists) {
         await this.flush(name);
         signal?.throwIfAborted();
         await this.loadCollection(name, true);

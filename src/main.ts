@@ -429,7 +429,7 @@ async function gracefulShutdown(signal: string) {
   stopPkceSweep();
   stopIllarinSweeps();
   stopAllDeliveryWorkers();
-  stopChatChunkVectorizationWorker();
+  await stopChatChunkVectorizationWorker();
   stopQueryCacheCleanup();
   stopWorldBookVectorizationSweep();
   stopVersionCheckCleanup();
@@ -466,8 +466,8 @@ async function gracefulShutdown(signal: string) {
   stopSmartctlMonitor();
 
   // 8. Close database (triggers WAL checkpoint)
-  const { closeDatabase } = await import("./db/connection");
-  closeDatabase();
+  const { closeDatabaseAsync } = await import("./db/connection");
+  await closeDatabaseAsync();
 
   console.log("[Shutdown] Cleanup complete.");
   process.exit(0);

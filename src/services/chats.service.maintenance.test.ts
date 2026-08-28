@@ -307,6 +307,46 @@ describe.serial("chat chunk maintenance lifecycle", () => {
       .toEqual({ content: "replacement-processed" });
   });
 
+  test("ordinary old-generation rejection cannot requeue into the replacement epoch", async () => {
+    track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockResolvedValue(enabledEmbeddingConfig));
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "ordinary-message", 0, true, "old source");
+    seedChunk(chat.id, "ordinary-chunk", ["ordinary-message"], 1);
+
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let processorCalls = 0;
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async () => {
+      processorCalls += 1;
+      entered.resolve();
+      await release.promise;
+      throw new Error("ordinary old-generation failure");
+    });
+
+    const maintenance = vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "ordinary-chunk", 1);
+    let settlements = 0;
+    const observed = maintenance.then(
+      () => { settlements += 1; return { status: "resolved" as const }; },
+      (reason: unknown) => { settlements += 1; return { status: "rejected" as const, reason }; },
+    );
+    await entered.promise;
+    await replaceDatabaseWithCollision(chat.id, "ordinary-message", "ordinary-chunk");
+    release.resolve();
+
+    expect(await observed).toMatchObject({
+      status: "rejected",
+      reason: { code: "database_generation_cancelled" },
+    });
+    await Bun.sleep(150);
+    expect(vectorizationQueueSvc.getQueueStatus()).toEqual({
+      queueLength: 0,
+      processing: false,
+      chunkJobs: 0,
+      worldBookJobs: 0,
+    });
+    expect(processorCalls).toBe(1);
+    expect(settlements).toBe(1);
+  });
   test("reset aborts an admitted Lance delete before replacement SQLite mutation", async () => {
     const chat = createTemporaryChat();
     seedMessage(chat.id, "lance-message", 0, true, "old source");

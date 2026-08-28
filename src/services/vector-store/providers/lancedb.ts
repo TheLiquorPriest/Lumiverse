@@ -24,7 +24,7 @@ export type { Table } from "@lancedb/lancedb";
 import { dirname, join } from "path";
 import { mkdirSync, readdirSync, renameSync, rmdirSync, rmSync, existsSync, readFileSync, statSync, writeFileSync, type Dirent } from "fs";
 import { env } from "../../../env";
-import { getDb, onDbReset } from "../../../db/connection";
+import { getDb, onDbReset, registerDatabaseReplacementFence } from "../../../db/connection";
 import { embeddingCache } from "../../embedding-cache";
 import { resolveBrokenTermuxLanceDbMirrorPath, resolveLanceDbConnectUri } from "../../../utils/lancedb-path";
 import type { WorldBookVectorIndexStatus } from "../../../types/world-book";
@@ -124,6 +124,10 @@ let connGeneration = 0;
 let lancedbPathDiagnosticsLogged = false;
 let optimizeTimer: ReturnType<typeof setTimeout> | null = null;
 let deferredOptimizeEpoch = 0;
+let nativeMutationAdmissionsBlocked = 0;
+let activeNativeMutations = 0;
+const nativeMutationDrainWaiters = new Set<() => void>();
+let databaseReplacementTail: Promise<void> = Promise.resolve();
 const OPTIMIZE_DEBOUNCE_MS = 15_000; // 15 seconds after last write (reduced from 30s)
 /** Grace period for version cleanup — keeps old versions alive long enough for
  *  in-flight reads and eventually-consistent handles to advance. Without this,
@@ -748,6 +752,63 @@ function cancelDeferredOptimize(): void {
   lastChatOptimizeScheduledAt = 0;
   lastWorldBookOptimizeScheduledAt = 0;
 }
+function waitForNativeMutationDrain(): Promise<void> {
+  if (activeNativeMutations === 0) return Promise.resolve();
+  return new Promise<void>((resolve) => nativeMutationDrainWaiters.add(resolve));
+}
+
+function releaseNativeMutation(): void {
+  activeNativeMutations -= 1;
+  if (activeNativeMutations !== 0) return;
+  for (const resolve of nativeMutationDrainWaiters) resolve();
+  nativeMutationDrainWaiters.clear();
+}
+
+function prepareLanceDatabaseReplacement(): Promise<() => void> {
+  nativeMutationAdmissionsBlocked += 1;
+  cancelDeferredOptimize();
+  const previous = databaseReplacementTail;
+  const gate = Promise.withResolvers<void>();
+  databaseReplacementTail = previous.then(() => gate.promise, () => gate.promise);
+
+  return (async () => {
+    await previous.catch(() => undefined);
+    await waitForNativeMutationDrain();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      nativeMutationAdmissionsBlocked -= 1;
+      gate.resolve();
+    };
+  })();
+}
+
+function tryPrepareLanceDatabaseReplacementSync(): (() => void) | null {
+  if (nativeMutationAdmissionsBlocked !== 0 || activeNativeMutations !== 0) return null;
+  nativeMutationAdmissionsBlocked = 1;
+  cancelDeferredOptimize();
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    nativeMutationAdmissionsBlocked = 0;
+  };
+}
+
+async function withLanceDatabaseReplacement<T>(replace: () => Promise<T> | T): Promise<T> {
+  const release = await prepareLanceDatabaseReplacement();
+  try {
+    return await replace();
+  } finally {
+    release();
+  }
+}
+
+registerDatabaseReplacementFence({
+  prepare: prepareLanceDatabaseReplacement,
+  tryPrepareSync: tryPrepareLanceDatabaseReplacementSync,
+});
 
 function resetInMemoryVectorStoreState(): void {
   cancelDeferredOptimize();
@@ -785,9 +846,11 @@ function resetInMemoryVectorStoreState(): void {
  * The parent did not execute the transaction and may otherwise retain a table
  * handle pointing at a pre-compaction manifest or index generation.
  */
-export function refreshLanceDbAfterExternalMaintenance(): void {
-  resetInMemoryVectorStoreState();
-  startIndexHealthMonitor(EMBEDDINGS_TABLE);
+export async function refreshLanceDbAfterExternalMaintenance(): Promise<void> {
+  await withLanceDatabaseReplacement(async () => {
+    resetInMemoryVectorStoreState();
+    startIndexHealthMonitor(EMBEDDINGS_TABLE);
+  });
 }
 
 export function resetSqliteVectorizationState(): void {
@@ -807,28 +870,30 @@ export function resetSqliteVectorizationState(): void {
   }
 }
 
-function performBrokenEmbeddingsTableRecovery(reason: string, err: unknown): void {
-  resetInMemoryVectorStoreState();
+async function performBrokenEmbeddingsTableRecovery(reason: string, err: unknown): Promise<void> {
+  await withLanceDatabaseReplacement(async () => {
+    resetInMemoryVectorStoreState();
 
-  // This store only contains one shared table, so deleting just embeddings.lance
-  // can leave parent-level LanceDB metadata claiming the table still exists.
-  // Reset the entire store so the next operation can recreate it cleanly.
-  const deleted = existsSync(LANCEDB_PATH);
-  if (deleted) {
-    rmSync(LANCEDB_PATH, { recursive: true, force: true });
-  }
-  resetSqliteVectorizationState();
-  console.warn(`[embeddings] Recovered incomplete LanceDB table after ${reason}; deleted ${LANCEDB_PATH}`, err);
+    // This store only contains one shared table, so deleting just embeddings.lance
+    // can leave parent-level LanceDB metadata claiming the table still exists.
+    // Reset the entire store so the next operation can recreate it cleanly.
+    const deleted = existsSync(LANCEDB_PATH);
+    if (deleted) {
+      rmSync(LANCEDB_PATH, { recursive: true, force: true });
+    }
+    resetSqliteVectorizationState();
+    console.warn("[embeddings] Recovered incomplete LanceDB table after " + reason + "; deleted " + LANCEDB_PATH, err);
+  });
 }
 
 async function recoverBrokenEmbeddingsTable(tableName: string, reason: string, err: unknown, lockHeld = false): Promise<boolean> {
   if (!isIncompleteEmbeddingsTableError(err, tableName)) return false;
   if (lockHeld) {
-    performBrokenEmbeddingsTableRecovery(reason, err);
+    await performBrokenEmbeddingsTableRecovery(reason, err);
     return true;
   }
   await withWriteLock(async () => {
-    performBrokenEmbeddingsTableRecovery(reason, err);
+    await performBrokenEmbeddingsTableRecovery(reason, err);
   });
   return true;
 }
@@ -1535,11 +1600,21 @@ export async function runAbortFencedNativeMutation<T>(
   mutation: () => Promise<T>,
 ): Promise<T> {
   signal?.throwIfAborted();
-  const result = await mutation();
-  signal?.throwIfAborted();
-  return result;
-}
+  if (nativeMutationAdmissionsBlocked !== 0) {
+    signal?.throwIfAborted();
+    throw new DOMException("LanceDB replacement is in progress", "AbortError");
+  }
 
+  activeNativeMutations += 1;
+  try {
+    signal?.throwIfAborted();
+    const result = await mutation();
+    signal?.throwIfAborted();
+    return result;
+  } finally {
+    releaseNativeMutation();
+  }
+}
 export async function optimizeTable(tableNames?: string[], signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   const targets = tableNames && tableNames.length > 0
@@ -1985,26 +2060,22 @@ function cleanupBrokenTermuxLanceDbMirror(): void {
  * recovering from corruption (e.g. "vector not divisible by 8" errors).
  */
 export async function forceResetLanceDB(): Promise<{ deleted: boolean; path: string }> {
-  // Acquire write lock to ensure no LanceDB operations are in-flight when we
-  // delete the directory. Without this, concurrent writes would panic trying
-  // to access files that no longer exist.
-  return withWriteLock(async () => {
+  // Lock ordering is always write lock then replacement fence. Queued writes
+  // reach the fenced native admission and retire without touching replacement files.
+  return withWriteLock(async () => withLanceDatabaseReplacement(async () => {
     resetInMemoryVectorStoreState();
 
-    // Delete the entire LanceDB directory from disk
     const deleted = existsSync(LANCEDB_PATH);
     if (deleted) {
       rmSync(LANCEDB_PATH, { recursive: true, force: true });
-      console.info(`[embeddings] Force-deleted LanceDB directory: ${LANCEDB_PATH}`);
+      console.info("[embeddings] Force-deleted LanceDB directory: " + LANCEDB_PATH);
     }
 
     resetSqliteVectorizationState();
-
     console.info("[embeddings] LanceDB force reset complete. Vector store will reinitialize on next use.");
     return { deleted, path: LANCEDB_PATH };
-  });
+  }));
 }
-
 // ---------------------------------------------------------------------------
 // Structured filter → LanceDB SQL `where()` translation
 // ---------------------------------------------------------------------------
@@ -2261,7 +2332,9 @@ export class LanceDbStore implements VectorStore {
   }
 
   async close(): Promise<void> {
-    resetInMemoryVectorStoreState();
+    await withWriteLock(async () => withLanceDatabaseReplacement(async () => {
+      resetInMemoryVectorStoreState();
+    }));
   }
 
   withWriteLock<T>(fn: () => Promise<T>): Promise<T> {

@@ -235,6 +235,7 @@ class VectorizationQueue {
       || this.queue.length === 0
     ) return;
     this.processingEpoch = epoch;
+    let admittedGeneration: number | null = null;
 
     try {
       while (epoch === this.processorEpoch && this.queue.length > 0) {
@@ -252,6 +253,7 @@ class VectorizationQueue {
           }
         }
         const generation = this.queue[0].generation;
+        admittedGeneration = generation;
         const userId = this.queue[0].userId;
         let maxBatch = 10;
         try {
@@ -261,6 +263,7 @@ class VectorizationQueue {
           );
           maxBatch = Math.max(1, Math.min(cfg.batch_size, 200));
         } catch (error) {
+          this.assertProcessorEpoch(epoch, generation);
           if (isDatabaseGenerationCancellation(error)) {
             if (epoch !== this.processorEpoch) return;
             this.invalidateStale(generation, error.currentGeneration);
@@ -281,10 +284,14 @@ class VectorizationQueue {
             }
           });
         } catch (error) {
+          this.assertProcessorEpoch(epoch, generation);
           if (!isDatabaseGenerationCancellation(error)) throw error;
           for (const job of batch) rejectVectorizationJob(job, error);
         } finally {
-          if (this.activeBatch === batch) this.activeBatch = [];
+          if (this.activeBatch === batch) {
+            this.assertProcessorEpoch(epoch, generation);
+            this.activeBatch = [];
+          }
         }
 
         if (epoch !== this.processorEpoch) return;
@@ -294,6 +301,7 @@ class VectorizationQueue {
       }
     } finally {
       if (this.processingEpoch === epoch) {
+        if (admittedGeneration !== null) this.assertProcessorEpoch(epoch, admittedGeneration);
         this.processingEpoch = null;
         if (this.queue.length > 0) this.scheduleProcessing();
       }
@@ -384,6 +392,7 @@ class VectorizationQueue {
         console.info(`[vectorization] Processed ${result.processedCount} chunk(s)`);
       }
     } catch (err) {
+      this.assertProcessorEpoch(epoch, generation);
       if (isDatabaseGenerationCancellation(err)) {
         for (const job of jobs) rejectVectorizationJob(job, err);
         return;
@@ -451,10 +460,10 @@ class VectorizationQueue {
       this.assertProcessorEpoch(epoch, generation);
       console.info(`[vectorization] Processed ${entries.length} world book entr${entries.length === 1 ? "y" : "ies"} for ${bookParts.length === 1 ? bookLabel : `multiple books: ${bookLabel}`}`);
     } catch (err) {
+      this.assertProcessorEpoch(epoch, generation);
       if (isDatabaseGenerationCancellation(err)) throw err;
       const errorMsg = String(err instanceof Error ? err.message : err);
       console.warn("[vectorization] World book batch failed, marked as error:", errorMsg);
-      assertDbGeneration(generation);
       if (configFingerprint) {
         await embeddingsSvc.markWorldBookEntriesVectorErrorIfCurrent(
           jobs[0].userId,
@@ -524,11 +533,11 @@ onDbReset(({ previousGeneration, nextGeneration }) => {
   queue.invalidateStale(previousGeneration, nextGeneration);
 });
 
-export function queueChunkVectorization(userId: string, chatId: string, chunkId: string, priority = 5): void {
+export function queueChunkVectorization(userId: string, chatId: string, chunkId: string, priority = 5): Promise<void> {
   const generation = getDbGeneration();
   const signal = getDbGenerationSignal(generation);
   const { promise, resolve, reject } = Promise.withResolvers<void>();
-  void trackChatChunkMaintenance(chatId, promise, generation);
+  const tracked = trackChatChunkMaintenance(chatId, promise, generation);
   queue.add({
     generation,
     signal,
@@ -540,6 +549,7 @@ export function queueChunkVectorization(userId: string, chatId: string, chunkId:
     queuedAt: Date.now(),
     settlements: [{ resolve, reject }],
   });
+  return tracked;
 }
 
 export function queuePendingChatChunkVectorization(userId: string, chatId: string, priority = 4): number {
@@ -718,6 +728,6 @@ export function stopWorldBookVectorizationSweep(): void {
   }
 }
 
-export function stopChatChunkVectorizationWorker(): void {
-  shutdownChatChunkVectorizationSubprocess();
+export function stopChatChunkVectorizationWorker(): Promise<void> {
+  return shutdownChatChunkVectorizationSubprocess();
 }

@@ -15,14 +15,22 @@ export interface DatabaseResetEvent {
   nextGeneration: number;
 }
 
+export interface DatabaseReplacementFence {
+  /** Block new owner work immediately, then resolve once old work is drained. */
+  prepare(): Promise<() => void>;
+  /** Synchronous teardown may proceed only when the fence can be acquired now. */
+  tryPrepareSync(): (() => void) | null;
+}
 interface DatabaseGenerationAdmission {
   generation: number;
   signal: AbortSignal;
 }
 
 const _resetListeners = new Set<(event: DatabaseResetEvent) => void>();
+const _replacementFences = new Set<DatabaseReplacementFence>();
 const admittedGeneration = new AsyncLocalStorage<DatabaseGenerationAdmission>();
 let generationController = new AbortController();
+let databaseReplacement: Promise<void> | null = null;
 
 export class DatabaseGenerationCancelledError extends Error {
   readonly code = "database_generation_cancelled";
@@ -34,6 +42,11 @@ export class DatabaseGenerationCancelledError extends Error {
 }
 
 export function initDatabase(path?: string): Database {
+  if (databaseReplacement || generationController.signal.aborted) {
+    throw generationController.signal.reason instanceof Error
+      ? generationController.signal.reason
+      : new Error("Database replacement is in progress");
+  }
   if (db) return db;
 
   const dbPath = path || `${env.dataDir}/lumiverse.db`;
@@ -51,6 +64,11 @@ export function initDatabase(path?: string): Database {
 export function getDb(): Database {
   const admitted = admittedGeneration.getStore();
   if (admitted !== undefined) assertDbGeneration(admitted.generation);
+  if (generationController.signal.aborted) {
+    throw generationController.signal.reason instanceof Error
+      ? generationController.signal.reason
+      : new DatabaseGenerationCancelledError(_generation, _generation + 1);
+  }
   if (!db) throw new Error("Database not initialized. Call initDatabase() first.");
   return db;
 }
@@ -60,11 +78,60 @@ export function getDatabasePath(): string {
 }
 
 export function closeDatabase(): void {
+  if (databaseReplacement) {
+    throw new Error("Cannot synchronously close the database while an asynchronous replacement is pending");
+  }
+  const releases: Array<() => void> = [];
+  for (const fence of _replacementFences) {
+    const release = fence.tryPrepareSync();
+    if (!release) {
+      for (const acquired of releases.reverse()) acquired();
+      throw new Error("Cannot synchronously close the database while database-owned native work is active");
+    }
+    releases.push(release);
+  }
   const closing = db;
-  dbPathResolved = null;
-  const reset = replaceGenerationDatabase(null);
-  closing?.close();
-  notifyReset(reset);
+  try {
+    dbPathResolved = null;
+    const reset = replaceGenerationDatabase(null);
+    closing?.close();
+    notifyReset(reset);
+  } finally {
+    for (const release of releases.reverse()) release();
+  }
+}
+
+/**
+ * Authoritative production replacement path. Fences synchronously stop new
+ * generation-owned native work, retire the generation signal, and wait for
+ * already-invoked native work before the generation, handle, or close becomes
+ * observable.
+ */
+export function closeDatabaseAsync(): Promise<void> {
+  if (databaseReplacement) return databaseReplacement;
+
+  const closing = db;
+  const previousGeneration = _generation;
+  const nextGeneration = previousGeneration + 1;
+  const waits = Array.from(_replacementFences, (fence) => fence.prepare());
+  generationController.abort(new DatabaseGenerationCancelledError(previousGeneration, nextGeneration));
+
+  const replacement = (async () => {
+    const releases = await Promise.all(waits);
+    try {
+      dbPathResolved = null;
+      const reset = replaceGenerationDatabase(null);
+      closing?.close();
+      notifyReset(reset);
+    } finally {
+      for (const release of releases.reverse()) release();
+    }
+  })();
+  const tracked = replacement.finally(() => {
+    if (databaseReplacement === tracked) databaseReplacement = null;
+  });
+  databaseReplacement = tracked;
+  return tracked;
 }
 
 export function getDbGeneration(): number {
@@ -143,6 +210,11 @@ export function isDatabaseGenerationCancellation(error: unknown): error is Datab
 export function onDbReset(listener: (event: DatabaseResetEvent) => void): () => void {
   _resetListeners.add(listener);
   return () => _resetListeners.delete(listener);
+}
+/** Register native/storage work that must drain before a DB generation changes. */
+export function registerDatabaseReplacementFence(fence: DatabaseReplacementFence): () => void {
+  _replacementFences.add(fence);
+  return () => _replacementFences.delete(fence);
 }
 
 function replaceGenerationDatabase(nextDb: Database | null): DatabaseResetEvent {

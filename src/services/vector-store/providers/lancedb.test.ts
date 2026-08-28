@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { closeDatabase, getDbGeneration, getDbGenerationSignal, initDatabase } from "../../../db/connection";
+import { closeDatabase, closeDatabaseAsync, getDb, getDbGeneration, getDbGenerationSignal, initDatabase } from "../../../db/connection";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -58,35 +58,49 @@ describe("lancedb write conflict handling", () => {
     expect(isRetryableLanceWriteConflict(new Error("table 'embeddings' was not found"))).toBe(false);
   });
 });
+
 describe("lancedb generation mutation fencing", () => {
-  test("rejects a native delete that completes after database reset", async () => {
+  test("holds database replacement until an invoked native delete drains", async () => {
     initDatabase(":memory:");
     const generation = getDbGeneration();
     const signal = getDbGenerationSignal(generation);
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    let staleContinuation = false;
+    let nativeMutations = 0;
     const table = {
       countRows: async () => 1,
       delete: async () => {
+        nativeMutations += 1;
         entered.resolve();
         await release.promise;
       },
     };
 
-    const deletion = safeTableDelete(table as any, "id = 'stale'", "general", signal).then(() => {
-      staleContinuation = true;
-    });
+    const deletion = safeTableDelete(table as any, "id = 'stale'", "general", signal);
     await entered.promise;
-    closeDatabase();
-    expect(signal.aborted).toBe(true);
-    release.resolve();
+    const reset = closeDatabaseAsync();
+    let resetSettled = false;
+    void reset.then(() => { resetSettled = true; });
+    await Promise.resolve();
 
+    expect(signal.aborted).toBe(true);
+    expect(resetSettled).toBe(false);
+    expect(getDbGeneration()).toBe(generation);
+    expect(() => getDb()).toThrow("was replaced by generation");
+    await expect(runAbortFencedNativeMutation(signal, async () => {
+      nativeMutations += 1;
+    })).rejects.toMatchObject({ code: "database_generation_cancelled" });
+    expect(nativeMutations).toBe(1);
+
+    release.resolve();
     await expect(deletion).rejects.toMatchObject({ code: "database_generation_cancelled" });
-    expect(staleContinuation).toBe(false);
+    await reset;
+    expect(getDbGeneration()).toBe(generation + 1);
+    await Bun.sleep(0);
+    expect(nativeMutations).toBe(1);
   });
 
-  test("cancels deferred optimize and rejects suspended native optimize on reset", async () => {
+  test("invalidates deferred optimize before draining suspended native optimize", async () => {
     initDatabase(":memory:");
     const generation = getDbGeneration();
     const signal = getDbGenerationSignal(generation);
@@ -95,24 +109,33 @@ describe("lancedb generation mutation fencing", () => {
 
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    let staleContinuation = false;
+    let nativeMutations = 0;
     const optimizing = runAbortFencedNativeMutation(signal, async () => {
+      nativeMutations += 1;
       entered.resolve();
       await release.promise;
-    }).then(() => {
-      staleContinuation = true;
     });
     await entered.promise;
-    closeDatabase();
+    const reset = closeDatabaseAsync();
+    let resetSettled = false;
+    void reset.then(() => { resetSettled = true; });
+    await Promise.resolve();
 
     expect(signal.aborted).toBe(true);
     expect(isDeferredOptimizeScheduled()).toBe(false);
+    expect(resetSettled).toBe(false);
+    expect(getDbGeneration()).toBe(generation);
+    expect(() => scheduleOptimize("general", signal)).toThrow();
+
     release.resolve();
     await expect(optimizing).rejects.toMatchObject({ code: "database_generation_cancelled" });
-    expect(staleContinuation).toBe(false);
+    await reset;
+    await Bun.sleep(0);
+    expect(nativeMutations).toBe(1);
+    expect(isDeferredOptimizeScheduled()).toBe(false);
   });
-});
 
+});
 describe("lancedb empty index directory cleanup", () => {
   test("removes only aged, empty UUID directories", () => {
     const root = mkdtempSync(join(tmpdir(), "lumiverse-lancedb-index-sweep-test-"));

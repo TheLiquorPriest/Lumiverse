@@ -72,7 +72,7 @@ async function run({ mode, tableNames }: LanceDbMaintenanceOptions): Promise<voi
   } finally {
     // The child may have committed a new manifest even if it ultimately
     // reports failure. Never let the serving process retain stale handles.
-    refreshLanceDbAfterExternalMaintenance();
+    await refreshLanceDbAfterExternalMaintenance();
     releaseServingGate();
   }
 }

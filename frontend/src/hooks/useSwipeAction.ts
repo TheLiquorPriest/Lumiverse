@@ -8,7 +8,8 @@ import {
   agentRuntimeErrorTranslationKey,
   agentRuntimePreflightTranslationKey,
 } from '@/lib/agentRuntimeSelection'
-import { generateApi, type GenerateRequest } from '@/api/generate'
+import type { GenerateRequest } from '@/api/generate'
+import { startGenerationWithRecovery } from '@/lib/generation-recovery'
 import type { Message } from '@/types/api'
 
 function fallbackErrorMessage(error: unknown): string | undefined {
@@ -115,7 +116,8 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
         genOpts.regen_feedback_position = regenFeedback.position
         genOpts.regen_feedback_format = regenFeedback.format
       }
-      const res = await generateApi.start(genOpts, {
+      const res = await startGenerationWithRecovery('start', genOpts, {
+        forceResponse,
         signal: generationAbortController.signal,
       })
       if (
@@ -261,7 +263,8 @@ export async function executeSwipe(message: Message, chatId: string, direction: 
           genOpts.regen_feedback_position = regenFeedback.position
           genOpts.regen_feedback_format = regenFeedback.format
         }
-        const res = await generateApi.start(genOpts, {
+        const res = await startGenerationWithRecovery('start', genOpts, {
+          forceResponse,
           signal: generationAbortController.signal,
         })
         const latest = useStore.getState()

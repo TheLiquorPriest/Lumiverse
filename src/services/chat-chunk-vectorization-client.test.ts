@@ -4,6 +4,7 @@ import {
   __test__,
   canUseChatChunkVectorizationSubprocess,
   processChatChunkVectorizationBatchInSubprocess,
+  shutdownChatChunkVectorizationSubprocess,
 } from "./chat-chunk-vectorization-client";
 
 describe("canUseChatChunkVectorizationSubprocess", () => {
@@ -123,6 +124,56 @@ describe("chat chunk vectorization subprocess generation lifecycle", () => {
       processedCount: 1,
       failedChunkIds: [],
       refreshedChatIds: ["chat"],
+    });
+  });
+  it("bounds an ignore-shutdown worker through cooperative grace, TERM, KILL, and observed exit", async () => {
+    let worker!: WorkerHarness;
+    __test__.setShutdownCooperativeGraceMs(1);
+    __test__.setForceKillGraceMs(1);
+    __test__.setSubprocessFactory((options) => {
+      const harness: WorkerHarness = { messages: [], kills: [], ipc: options.ipc, exit: () => undefined };
+      worker = harness;
+      const fakeProcess = {
+        send(message: unknown) { harness.messages.push(message); },
+        kill(signal: string) { harness.kills.push(signal); },
+      };
+      harness.exit = () => options.onExit(fakeProcess as unknown as ReturnType<typeof Bun.spawn>, null, 9);
+      queueMicrotask(() => options.ipc({ type: "ready" }));
+      return fakeProcess as unknown as ReturnType<typeof Bun.spawn>;
+    });
+
+    const controller = new AbortController();
+    const batch = processChatChunkVectorizationBatchInSubprocess([
+      { userId: "owner", chatId: "chat", chunkId: "shutdown-chunk" },
+    ], 51, controller.signal);
+    await waitForMessage(worker, "process_batch");
+    let settlements = 0;
+    const observedBatch = batch.catch((error) => {
+      settlements += 1;
+      throw error;
+    });
+
+    const shutdown = shutdownChatChunkVectorizationSubprocess();
+    let shutdownSettled = false;
+    void shutdown.then(() => { shutdownSettled = true; });
+    await expect(observedBatch).rejects.toThrow("shutting down");
+    expect(worker.messages.some((message) => messageOfType(message, "shutdown"))).toBe(true);
+    await expect(processChatChunkVectorizationBatchInSubprocess([
+      { userId: "owner", chatId: "chat", chunkId: "late-admission" },
+    ], 51, new AbortController().signal)).rejects.toThrow("shutting down");
+
+    await Bun.sleep(5);
+    expect(worker.kills).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(shutdownSettled).toBe(false);
+    expect(settlements).toBe(1);
+    worker.exit();
+    await shutdown;
+    expect(__test__.getState()).toEqual({
+      queueLength: 0,
+      inflight: false,
+      subprocess: false,
+      retirement: false,
+      shutdownRequested: true,
     });
   });
 });

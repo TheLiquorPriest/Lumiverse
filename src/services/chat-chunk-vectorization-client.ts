@@ -51,6 +51,8 @@ type VectorizationSubprocessOptions = {
 type VectorizationSubprocessFactory = (options: VectorizationSubprocessOptions) => VectorizationSubprocess;
 
 const defaultVectorizationSubprocessFactory: VectorizationSubprocessFactory = (options) => Bun.spawn(options);
+const DEFAULT_SHUTDOWN_COOPERATIVE_GRACE_MS = 1_000;
+let shutdownCooperativeGraceMs = DEFAULT_SHUTDOWN_COOPERATIVE_GRACE_MS;
 let vectorizationSubprocessFactory = defaultVectorizationSubprocessFactory;
 const READY_TIMEOUT_MS = 30_000;
 let forceKillGraceMs = CHAT_CHUNK_VECTORIZATION_FORCE_KILL_GRACE_MS;
@@ -72,6 +74,7 @@ type SubprocessRetirement = {
   proc: VectorizationSubprocess;
   promise: Promise<void>;
   resolve: () => void;
+  termTimer: ReturnType<typeof setTimeout> | null;
   forceTimer: ReturnType<typeof setTimeout>;
 };
 let retirement: SubprocessRetirement | null = null;
@@ -138,16 +141,22 @@ function terminateSubprocess(
   }
 }
 
-function retireSubprocess(proc: VectorizationSubprocess): Promise<void> {
+function retireSubprocess(proc: VectorizationSubprocess, cooperativeGraceMs = 0): Promise<void> {
   if (retirement?.proc === proc) return retirement.promise;
   const { promise, resolve } = Promise.withResolvers<void>();
-  const forceTimer = setTimeout(() => terminateSubprocess(proc, "SIGKILL"), forceKillGraceMs);
+  const terminate = () => terminateSubprocess(proc, "SIGTERM");
+  const termTimer = cooperativeGraceMs > 0 ? setTimeout(terminate, cooperativeGraceMs) : null;
+  termTimer?.unref?.();
+  if (!termTimer) terminate();
+  const forceTimer = setTimeout(
+    () => terminateSubprocess(proc, "SIGKILL"),
+    cooperativeGraceMs + forceKillGraceMs,
+  );
   forceTimer.unref?.();
-  retirement = { proc, promise, resolve, forceTimer };
+  retirement = { proc, promise, resolve, termTimer, forceTimer };
   expectedExit = true;
   ready = false;
   workerGeneration = null;
-  terminateSubprocess(proc);
   return promise;
 }
 
@@ -186,6 +195,7 @@ function handleExit(
     completedRetirement === null && !ready,
   );
   if (completedRetirement) {
+    if (completedRetirement.termTimer) clearTimeout(completedRetirement.termTimer);
     clearTimeout(completedRetirement.forceTimer);
     retirement = null;
   }
@@ -193,7 +203,7 @@ function handleExit(
   ready = false;
   workerGeneration = null;
   expectedExit = false;
-  shutdownRequested = false;
+  shutdownRequested = wasShutdown;
   clearStarting(launchError);
   failInflight(launchError);
   if (!wasExpected) {
@@ -245,6 +255,9 @@ function handleMessage(source: VectorizationSubprocess, message: SubprocessToHos
 }
 
 function ensureSubprocess(): Promise<void> {
+  if (shutdownRequested) {
+    return Promise.reject(new Error("Chat chunk vectorization subprocess is shutting down"));
+  }
   if (retirement) return retirement.promise.then(() => ensureSubprocess());
   if (subprocess && ready) return Promise.resolve();
   if (subprocessUnavailableReason) {
@@ -397,6 +410,9 @@ export function processChatChunkVectorizationBatchInSubprocess(
   generation: number,
   signal: AbortSignal,
 ): Promise<ChatChunkVectorizationBatchResult> {
+  if (shutdownRequested) {
+    return Promise.reject(new Error("Chat chunk vectorization subprocess is shutting down"));
+  }
   if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
     const item: PendingBatch = {
@@ -450,26 +466,23 @@ export function cancelChatChunkVectorizationGeneration(
   }
 }
 
-export function shutdownChatChunkVectorizationSubprocess(): void {
+export function shutdownChatChunkVectorizationSubprocess(): Promise<void> {
+  if (shutdownRequested) return retirement?.promise ?? Promise.resolve();
   const shutdownError = new Error("Chat chunk vectorization subprocess is shutting down");
   shutdownRequested = true;
   expectedExit = true;
   rejectQueued(shutdownError);
   failInflight(shutdownError);
-  if (!subprocess) {
-    shutdownRequested = false;
-    expectedExit = false;
-    return;
-  }
+  clearStarting(shutdownError);
+  const retiring = subprocess;
+  if (!retiring) return Promise.resolve();
+  const observedExit = retireSubprocess(retiring, shutdownCooperativeGraceMs);
   try {
-    subprocess.send({ type: "shutdown" } satisfies HostToSubprocessMessage);
+    retiring.send({ type: "shutdown" } satisfies HostToSubprocessMessage);
   } catch {
-    try {
-      terminateSubprocess(subprocess);
-    } catch {
-      /* noop */
-    }
+    // Observed exit remains authoritative.
   }
+  return observedExit;
 }
 export const __test__ = {
   setSubprocessFactory(factory: VectorizationSubprocessFactory): void {
@@ -477,6 +490,9 @@ export const __test__ = {
   },
   setForceKillGraceMs(ms: number): void {
     forceKillGraceMs = ms;
+  },
+  setShutdownCooperativeGraceMs(ms: number): void {
+    shutdownCooperativeGraceMs = ms;
   },
   reset(): void {
     const resetError = new Error("Chat chunk vectorization client test reset");
@@ -486,6 +502,7 @@ export const __test__ = {
     const procs = new Set<VectorizationSubprocess>();
     if (subprocess) procs.add(subprocess);
     if (retirement) {
+      if (retirement.termTimer) clearTimeout(retirement.termTimer);
       clearTimeout(retirement.forceTimer);
       procs.add(retirement.proc);
       retirement.resolve();
@@ -499,7 +516,17 @@ export const __test__ = {
     subprocessUnavailableReason = null;
     warnedDisabled = false;
     forceKillGraceMs = CHAT_CHUNK_VECTORIZATION_FORCE_KILL_GRACE_MS;
+    shutdownCooperativeGraceMs = DEFAULT_SHUTDOWN_COOPERATIVE_GRACE_MS;
     vectorizationSubprocessFactory = defaultVectorizationSubprocessFactory;
     for (const proc of procs) terminateSubprocess(proc, "SIGKILL");
+  },
+  getState(): { queueLength: number; inflight: boolean; subprocess: boolean; retirement: boolean; shutdownRequested: boolean } {
+    return {
+      queueLength: queue.length,
+      inflight: inflight !== null,
+      subprocess: subprocess !== null,
+      retirement: retirement !== null,
+      shutdownRequested,
+    };
   },
 };
