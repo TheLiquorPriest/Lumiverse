@@ -283,6 +283,47 @@ describe('agentic runtime API matched editor boundary', () => {
     expect(result.preset.agent_task_templates).toEqual([])
   })
 
+  test('reconciles an accepted save from the authoritative editor when the preset carries its base review shape', async () => {
+    const committedConfig = validConfig()
+    committedConfig.maxToolCalls = 63
+    const baseReview = {
+      state: 'ready',
+      reasonCode: null,
+      unresolvedSlotIds: [],
+      staleSlotIds: [],
+      acknowledged: true,
+    }
+    const authoritativeReview = { ...baseReview, revision: 5, items: [] }
+    const backendPreset = {
+      ...savedPreset(),
+      agent_config: committedConfig,
+      agent_config_review: baseReview,
+    } as unknown as Preset
+    delete backendPreset.agent_slot_bindings
+    delete backendPreset.agent_task_templates
+    const editor = {
+      ...editorProjection(),
+      config: committedConfig,
+      review: authoritativeReview,
+    }
+    installApiFixture(editor, backendPreset)
+    const draft = withAuthorityFields(createAgenticRuntimeDraft(sourcePreset(committedConfig)))
+
+    const result = await agenticRuntimeApi.saveEditor('preset-1', {
+      ...draft,
+      expectedPresetRevision: 8,
+      expectedConfigRevision: 4,
+      promptOrder,
+    })
+
+    expect(result.editor.config?.maxToolCalls).toBe(63)
+    expect(result.preset.agent_config?.maxToolCalls).toBe(63)
+    expect(result.preset.agent_config_revision).toBe(5)
+    expect(result.preset.agent_config_review).toEqual(authoritativeReview)
+    expect(result.preset.agent_slot_bindings).toEqual({ writer: 'connection-1' })
+    expect(result.preset.agent_task_templates).toEqual([])
+  })
+
   test('retries a racing GET only until preset and editor revisions match', async () => {
     const firstPreset = savedPreset()
     const latestPreset = { ...savedPreset(), cache_revision: 9 }

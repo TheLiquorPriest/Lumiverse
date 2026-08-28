@@ -802,23 +802,11 @@ function normalizePreset(value: unknown): Preset {
   if (record.cache_revision !== undefined) {
     preset.cache_revision = nonNegativeSafeInteger(record.cache_revision, 'save result.preset.cache_revision')
   }
-  if (Object.hasOwn(record, 'agent_config')) {
-    preset.agent_config = normalizeConfig(record.agent_config, 'save result.preset.agent_config')
-  }
   if (Object.hasOwn(record, 'agent_config_revision')) {
     preset.agent_config_revision = nonNegativeSafeInteger(
       record.agent_config_revision,
       'save result.preset.agent_config_revision',
     )
-  }
-  if (Object.hasOwn(record, 'agent_config_review')) {
-    preset.agent_config_review = normalizeReview(record.agent_config_review)
-  }
-  if (Object.hasOwn(record, 'agent_slot_bindings')) {
-    preset.agent_slot_bindings = normalizeSlotBindings(record.agent_slot_bindings)
-  }
-  if (Object.hasOwn(record, 'agent_task_templates')) {
-    preset.agent_task_templates = normalizeTaskTemplates(record.agent_task_templates)
   }
   return preset
 }
@@ -841,7 +829,19 @@ function normalizeEditorResult(value: unknown): SaveAgenticRuntimeEditorResult {
   if (preset.agent_config_revision === undefined || preset.agent_config_revision !== editor.configRevision) {
     throw new MatchedEditorRevisionError('Invalid agentic runtime editor result: preset and editor config revisions do not match')
   }
-  return { preset, editor }
+  // Presets carry only the base review projection and omit editor-owned bindings/templates.
+  // Publish every agent field from the validated editor so consumers hydrate one exact pair.
+  return {
+    preset: {
+      ...preset,
+      agent_config: editor.config,
+      agent_config_revision: editor.configRevision,
+      agent_config_review: editor.review,
+      agent_slot_bindings: editor.slotBindings,
+      agent_task_templates: editor.taskTemplates,
+    },
+    editor,
+  }
 }
 
 export interface SaveAgenticRuntimeEditorInput extends AgenticRuntimeSaveDraft {
