@@ -156,6 +156,29 @@ function createTerminalRecoverySchema(db: Database): void {
     )
   `);
   db.run(`
+    CREATE TABLE agent_chat_event_sequences (
+      user_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      last_sequence INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id, chat_id)
+    )
+  `);
+  db.run(`
+    CREATE TABLE agent_activity_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      generation_id TEXT NOT NULL,
+      target_message_id TEXT,
+      target_swipe_id INTEGER,
+      snapshot_json TEXT NOT NULL,
+      byte_size INTEGER NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(user_id, chat_id, generation_id)
+    )
+  `);
+  db.run(`
     CREATE TABLE chats (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL
@@ -176,6 +199,101 @@ function newExecution(db: Database, id: string, deadlineAt = Date.now() + 60_000
     deadlineAt,
     expiresAt: deadlineAt + 60_000,
   }, db);
+}
+
+function seedLegacyStaleDecisionTerminal(
+  db: Database,
+  id: string,
+  projectionErrorCode = "decision_refresh_required",
+) {
+  const created = newExecution(db, id);
+  transitionTurnExecution({
+    db,
+    executionId: created.execution.id,
+    ownerToken: created.ownerToken,
+    expectedPhase: "ASSEMBLE",
+    nextPhase: "FAILED",
+    reason: "decision_refresh_required",
+  });
+  const now = Date.now();
+  const generationId = `${id}-generation`;
+  const omission = {
+    omittedNodeCount: 0,
+    omittedEventCount: 0,
+    firstOmittedSequence: null,
+    lastOmittedSequence: null,
+  };
+  const snapshot = {
+    version: 2,
+    runId: generationId,
+    turnId: id,
+    chatId: "c1",
+    generationId,
+    generationType: "normal",
+    target: null,
+    attemptLineage: {
+      version: 1,
+      attemptId: id,
+      previousAttemptId: null,
+      target: { chatId: "c1", generationType: "normal", messageId: null, swipeId: null },
+      createdAt: now,
+    },
+    revision: 1,
+    sequence: 1,
+    workPhase: "TERMINAL",
+    workStatus: "terminal",
+    workOutcome: "failed",
+    reason: "stale_input",
+    error: {
+      code: projectionErrorCode,
+      recoveryAction: "resync",
+      reason: "stale_input",
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+    },
+    startedAt: now,
+    updatedAt: now,
+    activity: [],
+    terminalHandoff: null,
+    omission,
+  };
+  db.query(`
+    INSERT INTO agent_run_attempts (
+      user_id, chat_id, attempt_id, previous_attempt_id, run_id, turn_id,
+      generation_id, generation_type, target_message_id, target_swipe_id,
+      lifecycle, status, outcome, reason, terminal, started_at, updated_at,
+      terminal_at, host_correlation_id, reconciliation_state, terminal_receipt_json
+    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    "u1", "c1", id, generationId, id, generationId, "normal",
+    "TERMINAL", "terminal", "failed", "stale_input", 1,
+    now, now, now, `agentic:${id}`, "authoritative",
+  );
+  db.query(`
+    INSERT INTO agent_run_projections (
+      user_id, chat_id, turn_id, generation_id, generation_type,
+      target_message_id, target_swipe_id, status, phase, revision, sequence,
+      started_at, updated_at, snapshot_json, terminal_handoff_json, omission_json
+    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+  `).run(
+    "u1", "c1", id, generationId, "normal", "FAILED", "FAILED", 1, 1,
+    now, now, JSON.stringify(snapshot), JSON.stringify(omission),
+  );
+  db.query(`
+    INSERT INTO agent_chat_events (
+      user_id, chat_id, sequence, turn_id, generation_id, run_revision,
+      status, event_kind, snapshot_json, terminal_handoff_json, omission_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+  `).run(
+    "u1", "c1", 1, id, generationId, 1,
+    "FAILED", "terminal", JSON.stringify(snapshot), JSON.stringify(omission),
+  );
+  db.query(`
+    INSERT INTO agent_chat_event_sequences (user_id, chat_id, last_sequence, updated_at)
+    VALUES (?, ?, ?, ?)
+  `).run("u1", "c1", 1, now);
+  return created;
 }
 
 function transition(
@@ -1334,6 +1452,101 @@ describe("receipt commit and startup recovery", () => {
     expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("priority-receipt") as { state: string }).state).toBe("COMMITTED");
   });
 
+
+  test("repairs the legacy stale-decision terminal outcome once and remains restart-idempotent", () => {
+    createTerminalRecoverySchema(db);
+    seedLegacyStaleDecisionTerminal(db, "legacy-stale-decision");
+
+    const first = reconcileAgentTurns(db);
+    expect(first.complete).toBe(true);
+    expect(first.inspected).toBe(1);
+    expect(first.projectionRepairs).toBe(1);
+
+    const attempt = db.query(`
+      SELECT outcome, reason, reconciliation_state, terminal_receipt_json
+      FROM agent_run_attempts WHERE attempt_id = ?
+    `).get("legacy-stale-decision") as {
+      outcome: string;
+      reason: string;
+      reconciliation_state: string;
+      terminal_receipt_json: string | null;
+    };
+    expect(attempt).toEqual({
+      outcome: "rejected",
+      reason: "stale_input",
+      reconciliation_state: "recovered",
+      terminal_receipt_json: null,
+    });
+    const projection = db.query(`
+      SELECT revision, sequence, snapshot_json
+      FROM agent_run_projections WHERE turn_id = ?
+    `).get("legacy-stale-decision") as {
+      revision: number;
+      sequence: number;
+      snapshot_json: string;
+    };
+    const snapshot = JSON.parse(projection.snapshot_json) as {
+      workOutcome: string;
+      reason: string;
+      error: { code: string; workOutcome: string };
+    };
+    expect(snapshot).toMatchObject({
+      workOutcome: "rejected",
+      reason: "stale_input",
+      error: { code: "decision_refresh_required", workOutcome: "rejected" },
+    });
+    expect(db.query(`
+      SELECT phase, terminal_code FROM agent_turn_executions WHERE id = ?
+    `).get("legacy-stale-decision")).toEqual({
+      phase: "FAILED",
+      terminal_code: "decision_refresh_required",
+    });
+    expect((db.query(`
+      SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?
+    `).get("legacy-stale-decision") as { count: number }).count).toBe(0);
+    expect((db.query(`
+      SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?
+    `).get("legacy-stale-decision") as { count: number }).count).toBe(2);
+
+    const second = reconcileAgentTurns(db);
+    expect(second.complete).toBe(true);
+    expect(second.inspected).toBe(0);
+    expect(second.projectionRepairs).toBe(0);
+    const replayedProjection = db.query(`
+      SELECT revision, sequence, snapshot_json
+      FROM agent_run_projections WHERE turn_id = ?
+    `).get("legacy-stale-decision") as typeof projection;
+    expect(replayedProjection).toEqual(projection);
+    expect((db.query(`
+      SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?
+    `).get("legacy-stale-decision") as { count: number }).count).toBe(2);
+  });
+
+  test("leaves unrelated terminal mismatches immutable and fails startup closed", () => {
+    createTerminalRecoverySchema(db);
+    seedLegacyStaleDecisionTerminal(db, "unrelated-terminal-mismatch");
+    db.query(`
+      UPDATE agent_run_attempts SET outcome = 'completed' WHERE attempt_id = ?
+    `).run("unrelated-terminal-mismatch");
+    const beforeProjection = db.query(`
+      SELECT revision, sequence, snapshot_json
+      FROM agent_run_projections WHERE turn_id = ?
+    `).get("unrelated-terminal-mismatch");
+
+    const result = reconcileAgentTurns(db);
+    expect(result.complete).toBe(false);
+    expect(result.projectionRepairs).toBe(0);
+    expect((db.query(`
+      SELECT outcome FROM agent_run_attempts WHERE attempt_id = ?
+    `).get("unrelated-terminal-mismatch") as { outcome: string }).outcome).toBe("completed");
+    expect(db.query(`
+      SELECT revision, sequence, snapshot_json
+      FROM agent_run_projections WHERE turn_id = ?
+    `).get("unrelated-terminal-mismatch")).toEqual(beforeProjection);
+    expect((db.query(`
+      SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?
+    `).get("unrelated-terminal-mismatch") as { count: number }).count).toBe(1);
+  });
 });
 
 describe("dormant runtime kill switch", () => {

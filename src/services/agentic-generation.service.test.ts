@@ -534,4 +534,59 @@ describe("agentic generation orchestration", () => {
     }]);
     expect(calls).toEqual(["terminal:rejected", "cleanup"]);
   });
+
+  test("keeps a stale-decision rejection canonical when the durable FAILED CAS already won", async () => {
+    let durablePhase = "ASSEMBLE";
+    let terminal: {
+      status: string;
+      phase: string;
+      workOutcome?: string | null;
+      reason?: string | null;
+      errorCode?: string;
+    } | undefined;
+    const started = await runAgenticGeneration(input(), dependencies([], {
+      buildAssemblySnapshot: async () => {
+        throw new AgenticGenerationError(
+          "decision_refresh_required",
+          "decision_refresh_required: runtime_policy",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      },
+      readExecutionPhase: () => durablePhase as "ASSEMBLE" | "FAILED",
+      transitionExecution: (_execution, _from, to) => {
+        if (to === "FAILED") {
+          durablePhase = "FAILED";
+          throw new AgenticGenerationError(
+            "agentic_internal_error",
+            "terminal CAS already settled",
+            { phase: "FAILED" },
+          );
+        }
+      },
+      publishTerminal: (event) => {
+        terminal = event;
+      },
+    }));
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      workOutcome: string | null;
+      reason: string | null;
+      errorCode?: string;
+    };
+    expect(result).toMatchObject({
+      status: "rejected",
+      phase: "FAILED",
+      workOutcome: "rejected",
+      reason: "decision_refresh_required",
+      errorCode: "decision_refresh_required",
+    });
+    expect(terminal).toMatchObject({
+      status: "rejected",
+      phase: "FAILED",
+      workOutcome: "rejected",
+      reason: "decision_refresh_required",
+      errorCode: "decision_refresh_required",
+    });
+  });
 });

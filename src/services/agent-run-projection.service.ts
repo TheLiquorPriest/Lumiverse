@@ -201,6 +201,8 @@ export interface AgentRunProjectionInputV2 {
   readonly compatibilitySnapshot?: unknown;
   readonly receiptRepair?: boolean;
   readonly recoveryRepair?: boolean;
+  /** One-time recovery of the fd8 stale-decision failed→rejected writer defect. */
+  readonly decisionRefreshOutcomeRepair?: boolean;
   /** Write a terminal public projection without inspecting/rewriting an already-exact inspection. */
   readonly preserveTerminalInspection?: boolean;
 }
@@ -2685,26 +2687,50 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
           AND status = 'terminal' AND outcome = 'failed'
         LIMIT 1`,
     ).get(input.userId, existing.attemptLineage.attemptId));
-  const rawSnapshotOutcome = (() => {
+  const rawSnapshot = (() => {
     try {
       const parsed = JSON.parse(String(existingRow?.snapshot_json ?? "null"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !("workOutcome" in parsed)) {
-        return undefined;
-      }
-      return parsed.workOutcome;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
     } catch {
-      return undefined;
+      return null;
     }
   })();
+  const rawSnapshotOutcome = rawSnapshot?.workOutcome;
+  const rawSnapshotError = rawSnapshot?.error && typeof rawSnapshot.error === "object" && !Array.isArray(rawSnapshot.error)
+    ? rawSnapshot.error as Record<string, unknown>
+    : null;
   const exhaustedSnapshotRepair = input.recoveryRepair === true
     && existingRow?.status === "EXHAUSTED"
     && existingRow.phase === "EXHAUSTED"
     && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "EXHAUSTED"
     && input.workOutcome === "exhausted"
     && rawSnapshotOutcome !== "exhausted";
-  const recoveryRepairNeeded = input.recoveryRepair === true && !!existing && (
-    !isTerminal(existing) || exhaustedSnapshotRepair
-  );
+  const decisionRefreshOutcomeRepair = input.decisionRefreshOutcomeRepair === true
+    && existingRow?.status === "FAILED"
+    && existingRow.phase === "FAILED"
+    && existing?.workStatus === "terminal"
+    && rawSnapshotOutcome === "failed"
+    && rawSnapshot?.reason === "stale_input"
+    && rawSnapshotError?.code === "decision_refresh_required"
+    && rawSnapshotError?.workOutcome === "failed"
+    && (existing?.terminalHandoff === null || existing?.terminalHandoff?.committed === false)
+    && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "FAILED"
+    && input.workStatus === "terminal"
+    && input.workOutcome === "rejected"
+    && input.reason === "stale_input"
+    && input.error?.code === "decision_refresh_required"
+    && input.error?.workOutcome === "rejected"
+    && (input.terminalHandoff === null || input.terminalHandoff?.committed === false)
+    && input.receiptId === undefined
+    && tableExists(db, "agent_turn_commit_receipts")
+    && !db.query(
+      "SELECT 1 FROM agent_turn_commit_receipts WHERE user_id = ? AND (execution_id = ? OR turn_id = ?) LIMIT 1",
+    ).get(input.userId, input.turnId, input.turnId);
+  const recoveryRepairNeeded = (
+    input.recoveryRepair === true && !!existing && (!isTerminal(existing) || exhaustedSnapshotRepair)
+  ) || decisionRefreshOutcomeRepair;
   if (existing && (
     (input.revision !== undefined && input.revision <= existing.revision)
     || (isTerminal(existing) && !receiptRepairNeeded && !recoveryRepairNeeded)

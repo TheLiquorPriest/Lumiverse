@@ -775,12 +775,13 @@ function workPhaseForAgentic(phase: AgenticPhase, terminal: boolean): AgentWorkP
   return "TERMINAL";
 }
 
-type CanonicalTerminalCause = "stopped" | "exhausted" | "failed";
+type CanonicalTerminalCause = "stopped" | "exhausted" | "rejected" | "failed";
 
 function terminalCauseForCode(value: unknown): CanonicalTerminalCause | null {
   if (typeof value !== "string") return null;
   const code = value.trim().toLowerCase();
   if (!code) return null;
+  if (code === "decision_refresh_required") return "rejected";
   if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
     return "stopped";
   }
@@ -833,6 +834,7 @@ function workOutcomeForStatus(
   const cause = terminalCauseForCode(errorCode);
   if (cause === "stopped") return active.cancellationRequested ? "stopped" : "failed";
   if (cause === "exhausted") return "exhausted";
+  if (cause === "rejected") return "rejected";
   if (cause === "failed") return "failed";
   if (status === "failed") return "failed";
   return null;
@@ -896,6 +898,9 @@ function durableTerminalResultForPhase(
   if (phase === "EXHAUSTED") return { status: "exhausted", phase, errorCode: "agentic_work_exhausted" };
   if (phase === "COMMIT_FAILED") return { status: "failed", phase, errorCode: "agentic_commit_failed" };
   if (phase === "FAILED") {
+    if (fallbackCode === "decision_refresh_required") {
+      return { status: "rejected", phase, errorCode: fallbackCode };
+    }
     const staleTerminalCode = fallbackStatus === "failed"
       && fallbackCode
       && !["agentic_cancelled", "agentic_timed_out", "agentic_work_exhausted"].includes(fallbackCode)

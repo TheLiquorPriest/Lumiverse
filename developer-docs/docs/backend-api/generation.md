@@ -509,6 +509,13 @@ request-admission checks: the effective-runtime decision validates the exact
 frozen request before issuing a dispatchable Agentic decision. A healthy
 startup vector never substitutes for those per-request checks.
 
+Terminal history remains immutable during this pass except for the exact legacy
+stale-decision writer defect: a receipt-free `FAILED` execution with
+`decision_refresh_required` and the old `failed`/`stale_input` outcome is
+reconciled once to canonical `rejected` with a new projection revision.
+Restart replay is idempotent; every other terminal conflict still fails startup
+closed instead of rewriting durable history.
+
 
 Agentic turns join the standard generation compatibility stream without
 exposing private work:

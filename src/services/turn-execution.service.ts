@@ -2637,6 +2637,7 @@ interface TerminalInspectionResolution {
   readonly inspectionExact: boolean;
   readonly inspectionRow: Record<string, unknown> | null;
   readonly historicalRepair: boolean;
+  readonly legacyDecisionRefreshOutcomeRepair: boolean;
   readonly explicitUnrecoverable: boolean;
 }
 
@@ -2857,6 +2858,26 @@ function attemptLineageForRecovery(
   };
 }
 
+function isLegacyDecisionRefreshOutcomeDefect(
+  db: Database,
+  execution: TurnExecutionRecord,
+  row: Record<string, unknown>,
+): boolean {
+  return execution.phase === "FAILED"
+    && execution.terminalCode === "decision_refresh_required"
+    && execution.workOutcome === "rejected"
+    && rowString(row, "lifecycle") === "TERMINAL"
+    && rowString(row, "status") === "terminal"
+    && rowNumber(row, "terminal") === 1
+    && rowString(row, "outcome") === "failed"
+    && rowString(row, "reason") === "stale_input"
+    && rowString(row, "terminal_receipt_json") === null
+    && (rowString(row, "reconciliation_state") === "authoritative"
+      || rowString(row, "reconciliation_state") === "recovered")
+    && hasTable(db, "agent_turn_commit_receipts")
+    && rawReceipt(db, execution) === null;
+}
+
 function resolveTerminalInspection(
   db: Database,
   row: Record<string, unknown> | null,
@@ -2894,6 +2915,7 @@ function resolveTerminalInspection(
       inspectionExact: false,
       inspectionRow: null,
       historicalRepair: false,
+      legacyDecisionRefreshOutcomeRepair: false,
       explicitUnrecoverable: false,
     };
   }
@@ -2911,7 +2933,11 @@ function resolveTerminalInspection(
   const outcomeMismatch = rowTerminal && rowOutcome !== null && rowOutcome !== executionOutcome;
   const historicalState = rowString(row, "reconciliation_state") === "authoritative"
     || rowString(row, "reconciliation_state") === "recovered";
-  const requiresAudit = !executionTargetValid || targetMismatch || outcomeMismatch;
+  const legacyDecisionRefreshOutcomeRepair = outcomeMismatch
+    && isLegacyDecisionRefreshOutcomeDefect(db, execution, row);
+  const requiresAudit = !executionTargetValid
+    || targetMismatch
+    || outcomeMismatch && !legacyDecisionRefreshOutcomeRepair;
   const evidence = requiresAudit
     ? terminalAuditEvidence(db, execution, row, [executionTarget, inspectionTarget])
     : null;
@@ -2958,7 +2984,7 @@ function resolveTerminalInspection(
     requiresAudit && !historicalState
     || targetRedacted && !auditedTarget && !explicitUnrecoverable
     || targetMismatch && !auditedTarget && !explicitUnrecoverable
-    || outcomeMismatch && !auditedOutcome
+    || outcomeMismatch && !legacyDecisionRefreshOutcomeRepair && !auditedOutcome
   ) {
     throw new TurnExecutionError("invalid_execution_input", "terminal inspection contradiction is not durably audited", {
       executionId: execution.id,
@@ -2978,7 +3004,8 @@ function resolveTerminalInspection(
       phase: execution.phase,
     });
   }
-  const useStoredOutcome = rowTerminal && rowOutcome !== null
+  const useStoredOutcome = !legacyDecisionRefreshOutcomeRepair
+    && rowTerminal && rowOutcome !== null
     && (
       !outcomeMismatch
       || evidence?.terminalOutcome === rowOutcome
@@ -2993,6 +3020,7 @@ function resolveTerminalInspection(
   const historicalRepair = targetRedacted || targetMismatch || outcomeMismatch || !rowTerminal;
   const inspectionExact = rowTerminal
     && historicalState
+    && !legacyDecisionRefreshOutcomeRepair
     && (
       rowString(row, "reconciliation_state") === "authoritative"
       || auditedOutcome && (!explicitUnrecoverable || Boolean(evidence?.quarantineEvidence))
@@ -3016,6 +3044,7 @@ function resolveTerminalInspection(
     inspectionExact,
     inspectionRow: row,
     historicalRepair,
+    legacyDecisionRefreshOutcomeRepair,
     explicitUnrecoverable,
   };
 }
@@ -3027,6 +3056,7 @@ function terminalProjectionMatches(
   reason: string,
   errorCode: string | null,
   target: TerminalRecoveryTarget,
+  legacyDecisionRefreshOutcomeRepair: boolean,
 ): boolean {
   const projectionColumns = tableColumns(db, "agent_run_projections");
   const projectionStatusColumns = ["status", "phase"]
@@ -3099,10 +3129,25 @@ function terminalProjectionMatches(
   const storedOutcome = parsed.workOutcome;
   const storedReason = typeof parsed.reason === "string" ? parsed.reason : null;
   const storedErrorCode = parsedError && typeof parsedError.code === "string" ? parsedError.code : null;
+  const storedErrorOutcome = parsedError?.workOutcome;
   // Identity plus terminal outcome is the immutable authority. A later
   // recovery pass may re-derive reason/error labels; those must not rewrite
   // an already-terminal projection or fail the whole startup scan.
   if (storedStatus === execution.phase && storedOutcome === outcome) return true;
+  if (
+    legacyDecisionRefreshOutcomeRepair
+    && storedStatus === "FAILED"
+    && execution.phase === "FAILED"
+    && storedOutcome === "failed"
+    && storedReason === "stale_input"
+    && storedErrorCode === "decision_refresh_required"
+    && storedErrorOutcome === "failed"
+    && outcome === "rejected"
+    && reason === "stale_input"
+    && errorCode === "decision_refresh_required"
+  ) {
+    return false;
+  }
   if (
     storedStatus === execution.phase
     && storedStatus === "EXHAUSTED"
@@ -3134,6 +3179,23 @@ function persistRecoveredTerminalInspection(
   const rowUpdatedAt = row ? rowNumber(row, "updated_at") : null;
   const rowTerminalAt = row ? rowNumber(row, "terminal_at") : null;
   const attemptId = rowAttemptId ?? execution.attemptLineage.attemptId;
+  if (resolution.legacyDecisionRefreshOutcomeRepair) {
+    const repaired = db.query(
+      "UPDATE agent_run_attempts SET outcome = 'rejected', reconciliation_state = 'recovered' WHERE user_id = ? AND attempt_id = ? AND run_id = ? AND turn_id = ? AND generation_id = ? AND lifecycle = 'TERMINAL' AND status = 'terminal' AND terminal = 1 AND outcome = 'failed' AND reason = 'stale_input' AND terminal_receipt_json IS NULL AND reconciliation_state IN ('authoritative', 'recovered')",
+    ).run(
+      execution.userId,
+      attemptId,
+      execution.generationId,
+      execution.id,
+      execution.generationId,
+    );
+    if (repaired.changes !== 1) {
+      throw new TurnExecutionError("invalid_execution_input", "legacy stale-decision inspection repair lost its exact authority", {
+        executionId: execution.id,
+        phase: execution.phase,
+      });
+    }
+  }
   const inspectionTarget = resolution.inspectionTarget;
   const updatedAt = Math.max(
     rowUpdatedAt ?? 0,
@@ -3183,6 +3245,9 @@ function persistRecoveredTerminalInspection(
           quarantine: "unrecoverable_target",
           quarantineReason: "historical terminal target is invalid without an audited replacement",
         } : {}),
+        ...(resolution.legacyDecisionRefreshOutcomeRepair
+          ? { repairedDefect: "fd8_stale_decision_terminal_outcome" }
+          : {}),
       }),
       correlation: {
         parentId: "root",
@@ -3249,6 +3314,9 @@ function appendRecoveredTerminalProjection(
       messageRevision: null,
       swipeRevision: null,
     },
+    ...(resolution.legacyDecisionRefreshOutcomeRepair
+      ? { decisionRefreshOutcomeRepair: true as const }
+      : {}),
     ...(rewriteInspection || execution.phase === "EXHAUSTED" ? { recoveryRepair: true as const } : { preserveTerminalInspection: true as const }),
   };
   appendAgentRunSnapshot(db, projection);
@@ -3287,6 +3355,7 @@ function reconcileTerminalExecutionProjection(
     resolution.projectionReason,
     errorCode,
     resolution.projectionTarget,
+    resolution.legacyDecisionRefreshOutcomeRepair,
   );
   if (resolution.inspectionExact && projectionExact) return false;
   db.transaction(() => {
