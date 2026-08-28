@@ -2863,17 +2863,23 @@ function isLegacyDecisionRefreshOutcomeDefect(
   execution: TurnExecutionRecord,
   row: Record<string, unknown>,
 ): boolean {
+  const inspectionOutcome = rowString(row, "outcome");
+  const reconciliationState = rowString(row, "reconciliation_state");
+  const legacyInspection = inspectionOutcome === "failed"
+    && (reconciliationState === "authoritative" || reconciliationState === "recovered");
+  // The old writer could settle the inspection after it had already emitted
+  // the obsolete failed projection, leaving only the projection to repair.
+  const canonicalInspectionFromOldWriter = inspectionOutcome === "rejected"
+    && reconciliationState === "recovered";
   return execution.phase === "FAILED"
     && execution.terminalCode === "decision_refresh_required"
     && execution.workOutcome === "rejected"
     && rowString(row, "lifecycle") === "TERMINAL"
     && rowString(row, "status") === "terminal"
     && rowNumber(row, "terminal") === 1
-    && rowString(row, "outcome") === "failed"
     && rowString(row, "reason") === "stale_input"
     && rowString(row, "terminal_receipt_json") === null
-    && (rowString(row, "reconciliation_state") === "authoritative"
-      || rowString(row, "reconciliation_state") === "recovered")
+    && (legacyInspection || canonicalInspectionFromOldWriter)
     && hasTable(db, "agent_turn_commit_receipts")
     && rawReceipt(db, execution) === null;
 }
@@ -2933,8 +2939,7 @@ function resolveTerminalInspection(
   const outcomeMismatch = rowTerminal && rowOutcome !== null && rowOutcome !== executionOutcome;
   const historicalState = rowString(row, "reconciliation_state") === "authoritative"
     || rowString(row, "reconciliation_state") === "recovered";
-  const legacyDecisionRefreshOutcomeRepair = outcomeMismatch
-    && isLegacyDecisionRefreshOutcomeDefect(db, execution, row);
+  const legacyDecisionRefreshOutcomeRepair = isLegacyDecisionRefreshOutcomeDefect(db, execution, row);
   const requiresAudit = !executionTargetValid
     || targetMismatch
     || outcomeMismatch && !legacyDecisionRefreshOutcomeRepair;
@@ -3004,7 +3009,7 @@ function resolveTerminalInspection(
       phase: execution.phase,
     });
   }
-  const useStoredOutcome = !legacyDecisionRefreshOutcomeRepair
+  const useStoredOutcome = !(legacyDecisionRefreshOutcomeRepair && outcomeMismatch)
     && rowTerminal && rowOutcome !== null
     && (
       !outcomeMismatch
@@ -3020,7 +3025,7 @@ function resolveTerminalInspection(
   const historicalRepair = targetRedacted || targetMismatch || outcomeMismatch || !rowTerminal;
   const inspectionExact = rowTerminal
     && historicalState
-    && !legacyDecisionRefreshOutcomeRepair
+    && !(legacyDecisionRefreshOutcomeRepair && outcomeMismatch)
     && (
       rowString(row, "reconciliation_state") === "authoritative"
       || auditedOutcome && (!explicitUnrecoverable || Boolean(evidence?.quarantineEvidence))
