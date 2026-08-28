@@ -217,6 +217,34 @@ describe("AgentRuntimeDecisionService", () => {
   afterEach(() => {
     closeDatabase();
   });
+  test("uses the first nonblank frozen endpoint alias before issuing a token", async () => {
+    let observedEndpoint: string | null | undefined;
+    const root = {
+      ...connection("root", { effectiveEndpoint: "https://canonical.example/v1" }),
+      endpoint: "   ",
+    } as FakeConnection & { endpoint: string };
+    const service = makeService({
+      connections: { root },
+      getReadinessVector: (_userId, _request, context) => {
+        observedEndpoint = context.rootConnection?.effectiveEndpoint;
+        return readiness();
+      },
+    });
+
+    const decision = await service.resolve(USER_ID, request());
+    expect(observedEndpoint).toBe("https://canonical.example/v1");
+    expect(decision.runtimeDecisionToken).toMatch(/^lvrd_/);
+  });
+
+  test("fails readiness for a provider without an endpoint before token issuance", async () => {
+    const service = makeService({
+      connections: { root: connection("root", { effectiveEndpoint: null }) },
+    });
+
+    const decision = await service.resolve(USER_ID, request());
+    expect(decision.runtimeDecisionToken).toBeNull();
+    expect(decision.repairCodes).toContain("agentic_connection_unavailable");
+  });
 
   test("resolves chat precedence and skips character bindings for groups", async () => {
     const calls: Array<{ characterId: string | null; isGroup?: boolean }> = [];

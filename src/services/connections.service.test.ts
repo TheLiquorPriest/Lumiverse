@@ -11,8 +11,17 @@ import {
   toPublicConnection,
   updateConnection,
 } from "./connections.service";
+import { getProvider } from "../llm/registry";
 
 describe("resolveEffectiveApiUrl", () => {
+  test("freezes the provider default for blank saved endpoints and preserves custom endpoints", () => {
+    const defaultUrl = getProvider("openai")?.defaultUrl;
+    expect(defaultUrl).toBeTruthy();
+    expect(resolveEffectiveApiUrl({ provider: "openai", api_url: "   " })).toBe(defaultUrl);
+    expect(resolveEffectiveApiUrl({ provider: "openai", api_url: "https://proxy.example/v1" }))
+      .toBe("https://proxy.example/v1");
+    expect(resolveEffectiveApiUrl({ provider: "provider-without-a-default", api_url: "" })).toBe("");
+  });
   test("uses the current Z.AI general endpoint by default", () => {
     expect(resolveEffectiveApiUrl({ provider: "zai", api_url: "", metadata: {} })).toBe("https://api.z.ai/api/paas/v4");
   });
@@ -246,6 +255,17 @@ describe("resolveConcreteConnectionV1", () => {
     expect(endpointChange.endpoint).toBe("https://api.z.ai/api/coding/paas/v4");
     expect(endpointChange.endpointRevision).not.toBe(initial.endpointRevision);
     expect(endpointChange.candidateRevision).not.toBe(initial.candidateRevision);
+  });
+  test("includes a provider default in frozen endpoint identity before hashing", () => {
+    insertResolverProfile("default-endpoint-profile", {
+      provider: "openai",
+      apiUrl: "   ",
+    });
+    const resolved = resolveConcreteConnectionV1(RESOLVER_USER_ID, "default-endpoint-profile")!;
+    expect(resolved.endpoint).toBe(getProvider("openai")?.defaultUrl);
+    expect(resolved.effectiveEndpoint).toBe(resolved.endpoint);
+    expect(resolved.endpointRevision).toBeTruthy();
+    expect(resolved.fingerprint).toBeTruthy();
   });
 
   test("changes credential revision and trust fingerprint on credential rotation", () => {

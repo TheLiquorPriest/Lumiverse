@@ -694,6 +694,9 @@ function normalizeConcreteConnection(raw: unknown, logicalId: string | null): Ru
   const capabilities = freezePolicy(isRecord(raw.capabilities) ? { ...raw.capabilities } : {});
   const concreteId = safeString(raw.concreteId ?? raw.concrete_id ?? raw.id, null);
   const normalizedLogicalId = safeString(raw.logicalId ?? raw.logical_id, logicalId);
+  const effectiveEndpoint = [raw.endpoint, raw.effectiveEndpoint, raw.apiUrl, raw.api_url]
+    .map((value) => safeString(value, null))
+    .find((value): value is string => value !== null) ?? null;
   return Object.freeze({
     logicalId: normalizedLogicalId,
     concreteId,
@@ -701,7 +704,7 @@ function normalizeConcreteConnection(raw: unknown, logicalId: string | null): Ru
     presetId: safeString(raw.presetId ?? raw.preset_id, null),
     provider: safeString(raw.provider, null),
     model: safeString(raw.model, null),
-    effectiveEndpoint: safeString(raw.endpoint ?? raw.effectiveEndpoint ?? raw.apiUrl ?? raw.api_url, null),
+    effectiveEndpoint,
     endpointRevision: readRevision(["endpointRevision", "endpoint_revision"], "connection.endpointRevision"),
     credentialSecretRef: safeString(raw.credentialSecretRef ?? raw.credential_secret_ref, null),
     credentialRevision: readRevision(["credentialRevision", "credential_revision"], "connection.credentialRevision"),
@@ -1669,7 +1672,7 @@ export class AgentRuntimeDecisionService {
       : null;
 
     const repairCodes: AgentRuntimeRepairCode[] = [];
-    if (!rootConnection) repairCodes.push("agentic_connection_unavailable");
+    if (!rootConnection?.effectiveEndpoint) repairCodes.push("agentic_connection_unavailable");
     if (invalidType) repairCodes.push("agentic_generation_type_unsupported");
     if (target.generationType !== "normal" && !target.messageId && !target.revision) repairCodes.push("agentic_target_unsupported");
     if (target.targetCharacterId && !isGroup && target.targetCharacterId !== chat.character_id) repairCodes.push("agentic_target_unsupported");
@@ -1832,7 +1835,7 @@ export class AgentRuntimeDecisionService {
           ),
           connectionId,
         );
-        if (!childConnection) {
+        if (!childConnection?.effectiveEndpoint) {
           repairCodes.push("agentic_slot_stale");
           continue;
         }

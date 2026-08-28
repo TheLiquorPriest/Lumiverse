@@ -369,6 +369,12 @@ capability, unresolved/stale slot, changed target, incomplete revision set,
 invalid cognition, unavailable isolate/publication health, or kill switch
 prevents Agentic admission and exposes the Response escape.
 
+A blank or whitespace-only saved endpoint is resolved centrally to the
+provider's canonical default before readiness, revision hashing, decision-token
+issuance, freezing, or dispatch. A nonblank custom endpoint remains
+authoritative. Providers without a canonical default fail Agentic readiness
+before token consumption; dispatch never invents a later fallback.
+
 The decision token is opaque, bound to the authenticated user, chat/target,
 request epoch, concrete candidate and revisions, config/bindings, input
 revision digest, and readiness digest. It expires after 60 seconds; at most 16

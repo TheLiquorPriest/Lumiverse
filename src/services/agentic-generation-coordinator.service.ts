@@ -1671,8 +1671,7 @@ async function providerStream(
 ): Promise<AsyncIterable<StreamChunk>> {
   const providerName = connection.provider;
   const provider = typeof providerName === "string" && providerName ? getProvider(providerName) : undefined;
-  const endpoint = connection.effectiveEndpoint
-    || (typeof provider?.defaultUrl === "string" ? provider.defaultUrl : "");
+  const endpoint = connection.effectiveEndpoint;
   if (!providerName || !endpoint || !connection.model || !provider) throw new Error("provider_unavailable");
   assertProviderCapabilitySnapshot(connection, provider);
 

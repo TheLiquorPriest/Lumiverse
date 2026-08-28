@@ -170,7 +170,7 @@ export function connectionSecretKey(id: string): string {
   return `connection_${id}_api_key`;
 }
 
-/** Resolve effective API URL, accounting for provider-specific metadata flags. */
+/** Resolve the canonical endpoint used by readiness, freezing, and dispatch. */
 export function resolveEffectiveApiUrl(profile: { provider: string; api_url?: string | null; metadata?: Record<string, any> | null }): string {
   const url = (profile.api_url || "").trim();
   if (profile.provider === "nanogpt" && profile.metadata?.use_subscription_api) {
@@ -197,7 +197,9 @@ export function resolveEffectiveApiUrl(profile: { provider: string; api_url?: st
       ? `https://bedrock-runtime.${region}.amazonaws.com/v1`
       : `https://bedrock-mantle.${region}.api.aws/v1`;
   }
-  return url;
+  if (url) return url;
+  const provider = getProvider(profile.provider);
+  return typeof provider?.defaultUrl === "string" ? provider.defaultUrl.trim() : "";
 }
 
 export function resolveNanoGptSubscriptionUsageUrl(profile: { api_url?: string | null }): string {
