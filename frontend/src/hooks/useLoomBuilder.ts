@@ -556,6 +556,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     draft: AgenticRuntimeSaveDraft,
     promptOrder: PromptBlock[],
     expectedIdentity: AgenticRuntimeSaveIdentity,
+    acceptSnapshot: (result: SaveAgenticRuntimeEditorResult) => boolean,
   ): Promise<SaveAgenticRuntimeEditorResult> => {
     const current = activePresetRef.current
     if (!current || useStore.getState().activeLoomPresetId !== current.id) {
@@ -589,8 +590,16 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     if (
       useStore.getState().activeLoomPresetId !== flushed.id
       || livePreset?.id !== flushed.id
-      || (livePreset.cacheRevision ?? 0) > result.editor.presetRevision
-    ) return result
+    ) {
+      throw new Error('No active preset')
+    }
+    if (
+      (livePreset.cacheRevision ?? 0) > result.editor.presetRevision
+      || livePreset.agentConfigRevision > result.editor.configRevision
+      || !acceptSnapshot(result)
+    ) {
+      throw new ApiError(409, 'Conflict', { code: 'AGENT_CONFIG_REVISION_CONFLICT' })
+    }
     const refreshed = presetSaveCoordinator.hydrate(unmarshalPreset(result.preset))
     activePresetRef.current = refreshed
     setActivePreset(refreshed)

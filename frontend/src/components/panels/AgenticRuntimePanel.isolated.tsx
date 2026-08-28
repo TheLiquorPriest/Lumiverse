@@ -407,6 +407,7 @@ function renderPanel(options: {
     draft: AgenticRuntimeSaveDraft,
     promptOrder: PromptBlock[],
     expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
+    acceptSnapshot: (result: SaveAgenticRuntimeEditorResult) => boolean,
   ) => Promise<SaveAgenticRuntimeEditorResult>
   onReload?: () => Promise<SaveAgenticRuntimeEditorResult>
   onDirtyChange?: (dirty: boolean) => void
@@ -537,6 +538,91 @@ describe('Agentic Runtime shared editor', () => {
     expect(saves[0]?.promptOrder.map((item) => item.id)).toEqual(['policy-block'])
     expect(dirtyStates.at(-1)).toBe(false)
   })
+
+  test('accepts its own saved revision before parent hydration and still conflicts on a later writer', async () => {
+    const value = preset()
+    value.agentConfig!.maxToolCalls = 63
+    const dirtyStates: boolean[] = []
+    let root!: Root
+    let committed!: LoomPreset
+    const onSave = async (
+      draft: AgenticRuntimeSaveDraft,
+      nextPromptOrder: PromptBlock[],
+      _expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
+      acceptSnapshot: (result: SaveAgenticRuntimeEditorResult) => boolean,
+    ) => {
+      await Promise.resolve()
+      const result = saveResult(value, draft, nextPromptOrder)
+      committed = {
+        ...value,
+        blocks: structuredClone(nextPromptOrder),
+        cacheRevision: result.editor.presetRevision,
+        agentConfigRevision: result.editor.configRevision,
+        agentConfig: structuredClone(result.editor.config),
+        agentConfigReview: structuredClone(result.editor.review),
+        agentSlotBindings: { ...result.editor.slotBindings },
+        agentTaskTemplates: structuredClone(result.editor.taskTemplates),
+      }
+      editorPresetRevision = result.editor.presetRevision
+      editorConfigRevision = result.editor.configRevision
+      editorConfig = structuredClone(result.editor.config)
+      editorReview = structuredClone(result.editor.review)
+      expect(acceptSnapshot(result)).toBe(true)
+      flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+        preset: committed,
+        onSave,
+        onReload: async () => reloadResult(committed),
+        onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+      })))
+      return result
+    }
+    const rendered = renderPanel({
+      value,
+      onSave,
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+    })
+    root = rendered.root
+    const { container } = rendered
+    await settle()
+
+    flushSync(() => button(container, 'sections.tools.nav').click())
+    const maxToolCalls = container.querySelector<HTMLInputElement>('#agents-max-tool-calls')!
+    changeInput(maxToolCalls, '62')
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    expect(container.textContent).toContain('save.saved')
+    expect(container.textContent).not.toContain('save.conflict')
+    expect(container.textContent).not.toContain('save.reviewLatest')
+    expect(maxToolCalls.value).toBe('62')
+    expect(dirtyStates.at(-1)).toBe(false)
+
+    changeInput(maxToolCalls, '61')
+    const externalConfig = structuredClone(committed.agentConfig!)
+    externalConfig.maxToolCalls = 60
+    const external = {
+      ...committed,
+      cacheRevision: (committed.cacheRevision ?? 0) + 1,
+      agentConfigRevision: committed.agentConfigRevision + 1,
+      agentConfig: externalConfig,
+    }
+    editorPresetRevision = external.cacheRevision ?? 0
+    editorConfigRevision = external.agentConfigRevision
+    editorConfig = structuredClone(external.agentConfig)
+    flushSync(() => root.render(createElement(AgenticRuntimePanel, {
+      preset: external,
+      onSave,
+      onReload: async () => reloadResult(external),
+      onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
+    })))
+    await settle()
+
+    expect(maxToolCalls.value).toBe('61')
+    expect(container.textContent).toContain('save.conflict')
+    expect(container.textContent).toContain('save.reviewLatest')
+    expect(dirtyStates.at(-1)).toBe(true)
+  })
+
   test('fences draft and numeric edits while a save is already in flight', async () => {
     const submitted: AgenticRuntimeSaveDraft[] = []
     let release!: () => void

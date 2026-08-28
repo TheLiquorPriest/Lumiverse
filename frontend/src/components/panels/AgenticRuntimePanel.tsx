@@ -228,6 +228,7 @@ interface AgenticRuntimePanelProps {
     draft: AgenticRuntimeSaveDraft,
     promptOrder: PromptBlock[],
     expectedIdentity: { presetId: string; presetRevision: number; configRevision: number },
+    acceptSnapshot: (result: SaveAgenticRuntimeEditorResult) => boolean,
   ) => Promise<SaveAgenticRuntimeEditorResult>
   onReload: () => Promise<SaveAgenticRuntimeEditorResult>
   onDirtyChange: (dirty: boolean) => void
@@ -2440,14 +2441,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     submittedDraft.reviewAcknowledgements = submittedDraft.reviewAcknowledgements.filter((id) => requiredReviewIds.includes(id))
     const submittedPromptOrder = structuredClone(promptOrder)
     const submittedFingerprint = `${runtimeDraftFingerprint(submittedDraft)}\n${JSON.stringify(submittedPromptOrder)}`
-    saveInFlightRef.current = true
-    setSaveState('saving')
-    try {
-      const result = await onSave(submittedDraft, submittedPromptOrder, { ...submittedIdentity })
+    let acceptedSnapshot: SaveAgenticRuntimeEditorResult | null = null
+    const acceptSnapshot = (result: SaveAgenticRuntimeEditorResult): boolean => {
+      if (acceptedSnapshot !== null) return acceptedSnapshot === result
       const snapshot = readMatchedEditorSnapshot(result)
-      if (!snapshot || snapshot.editor.presetId !== submittedIdentity.presetId) {
-        throw new Error('Save did not return a matched preset/editor snapshot')
-      }
+      if (!snapshot || snapshot.editor.presetId !== submittedIdentity.presetId) return false
       const projection = snapshot.editor
       const currentIdentity = currentPresetIdentityRef.current
       const parentStillSubmitted = editorIdentityMatchesParent(
@@ -2462,7 +2460,8 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         projection.presetRevision,
         projection.configRevision,
       )
-      if (!parentStillSubmitted && !parentMatchesResult) return
+      if (!parentStillSubmitted && !parentMatchesResult) return false
+
       setLoomRevisionRestagePending(false)
       lastReturnedIdentityRef.current = {
         presetId: projection.presetId,
@@ -2480,13 +2479,17 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       if (liveFingerprint !== submittedFingerprint) {
         conflictSourceRef.current = null
         setSaveState('idle')
-        return
+        acceptedSnapshot = result
+        return true
       }
       const committedPreset = snapshot.preset
       const committedPromptOrder = snapshot.promptOrder
       const hydrated = hydrateDraftFromEditor(submittedDraft, projection, committedPromptOrder)
       committedDraftRef.current = structuredClone(hydrated)
       committedPromptOrderRef.current = structuredClone(committedPromptOrder)
+      draftRef.current = hydrated
+      promptOrderRef.current = structuredClone(committedPromptOrder)
+      dirtyRef.current = false
       pendingExternalDraftRef.current = null
       pendingExternalPromptOrderRef.current = null
       setRepairedSlotIds(new Set())
@@ -2505,6 +2508,21 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       setConflictRecoveryState('idle')
       conflictSourceRef.current = null
       setSaveState('saved')
+      acceptedSnapshot = result
+      return true
+    }
+    saveInFlightRef.current = true
+    setSaveState('saving')
+    try {
+      const result = await onSave(
+        submittedDraft,
+        submittedPromptOrder,
+        { ...submittedIdentity },
+        acceptSnapshot,
+      )
+      if (acceptedSnapshot === null && !acceptSnapshot(result)) {
+        throw new Error('Save did not return a matched preset/editor snapshot')
+      }
     } catch (error) {
       if (!editorIdentityMatchesParent(
         currentPresetIdentityRef.current,
