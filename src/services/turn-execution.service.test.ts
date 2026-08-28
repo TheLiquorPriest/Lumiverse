@@ -1221,6 +1221,38 @@ describe("receipt commit and startup recovery", () => {
     expect(recovered.committedFromReceipt).toBe(1);
     expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("receipt-repair-failure") as { state: string }).state).toBe("COMMITTED");
   });
+  test("does not replay expired terminal authority after its retained projection is evicted", () => {
+    createTerminalRecoverySchema(db);
+    const failed = newExecution(db, "expired-terminal-failure");
+    transition(db, failed.execution.id, failed.ownerToken, "ASSEMBLE", "FAILED");
+    const committed = newExecution(db, "expired-terminal-commit");
+    moveToCommit(db, committed.execution.id, committed.ownerToken);
+    finalizeTurnCommit({
+      db,
+      executionId: committed.execution.id,
+      ownerToken: committed.ownerToken,
+      summary: {},
+    });
+    db.query("UPDATE agent_turn_executions SET expires_at = 1 WHERE id IN (?, ?)")
+      .run(failed.execution.id, committed.execution.id);
+
+    let receiptRepairCalls = 0;
+    registerAgentTurnReceiptRepair(() => {
+      receiptRepairCalls++;
+      throw new Error("expired terminal receipt must not replay");
+    });
+    try {
+      const recovered = reconcileAgentTurns(db);
+      expect(recovered.complete).toBe(true);
+      expect(recovered.inspected).toBe(0);
+      expect(recovered.alreadyTerminal).toBe(0);
+      expect(recovered.projectionRepairs).toBe(0);
+      expect(receiptRepairCalls).toBe(0);
+      expect((db.query("SELECT COUNT(*) AS count FROM agent_run_projections").get() as { count: number }).count).toBe(0);
+    } finally {
+      registerAgentTurnReceiptRepair(null);
+    }
+  });
 
   test("expires interrupted turns without invoking provider or projection callbacks", async () => {
     let callbackCount = 0;

@@ -3774,11 +3774,11 @@ function exactTerminalReconciliationPredicate(
 }
 /**
  * Build a keyset-paginated candidate scan. Reversible and COMMITTING rows are
- * always candidates. Noncommitted terminal history enters the bounded budget
- * only while its private inspection or public projection still needs repair;
- * COMMITTED rows remain receipt-repaired only.
+ * always candidates. Retained noncommitted terminal history enters the bounded
+ * budget only while its private inspection or public projection needs repair;
+ * COMMITTED rows remain receipt-repaired only while retained.
  */
-function reconciliationCandidateQuery(db: Database): {
+function reconciliationCandidateQuery(db: Database, now: number): {
   readonly sql: string;
   readonly phaseValues: readonly TurnExecutionPhase[];
   readonly orderedAtSql: string;
@@ -3790,6 +3790,11 @@ function reconciliationCandidateQuery(db: Database): {
   if (!phase || !orderedValue || !id) return null;
 
   const orderedAt = `COALESCE(${orderedValue}, 0)`;
+  const retainedTerminal = executionColumns.has("expires_at")
+    ? `(typeof(e.${quoteColumn("expires_at")}) NOT IN ('integer', 'real')
+        OR e.${quoteColumn("expires_at")} <= 0
+        OR e.${quoteColumn("expires_at")} > ${now})`
+    : "CAST(1 AS INTEGER)";
   const phaseValues = [...REVERSIBLE_TURN_PHASES, "COMMITTING"] as const;
   const terminalRecoveryAvailable = terminalRecoveryTablesAvailable(db);
   const terminalRepairPhases = terminalRecoveryAvailable
@@ -3799,8 +3804,8 @@ function reconciliationCandidateQuery(db: Database): {
     ? exactTerminalReconciliationPredicate(db, executionColumns, phase, id)
     : null;
   const terminalRepairPredicate = exactTerminal
-    ? `(${phase} IN (${terminalRepairPhases}) AND NOT ${exactTerminal})`
-    : `${phase} IN (${terminalRepairPhases})`;
+    ? `(${retainedTerminal} AND ${phase} IN (${terminalRepairPhases}) AND NOT ${exactTerminal})`
+    : `(${retainedTerminal} AND ${phase} IN (${terminalRepairPhases}))`;
   const candidatePredicates = [
     `${phase} IN (${phaseValues.map(() => "?").join(", ")})`,
     ...(terminalRecoveryAvailable ? [terminalRepairPredicate] : []),
@@ -3856,7 +3861,8 @@ function reconciliationCandidateQuery(db: Database): {
              )
         )`;
       const committedRepair = `(
-        ${phase} = 'COMMITTED'
+        ${retainedTerminal}
+        AND ${phase} = 'COMMITTED'
         AND ${receiptExists}
         AND (${projectionNeedsRepair})
       )`;
@@ -4004,13 +4010,13 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
     return result
   }
   if (!hasTable(db, "agent_turn_executions")) return result;
-  const scan = reconciliationCandidateQuery(db);
+  const scanStartedAt = reconciliationNowMs();
+  const scan = reconciliationCandidateQuery(db, scanStartedAt);
   if (!scan) return result;
 
   // Freeze the upper bound from the durable population rather than the wall
   // clock. Rapid inserts can legitimately carry timestamps just ahead of the
   // clock observed at the start of this pass.
-  const scanStartedAt = reconciliationNowMs();
   const scanUpperBound = (() => {
     try {
       const row = db.query(
