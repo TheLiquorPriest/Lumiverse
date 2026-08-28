@@ -18,6 +18,7 @@ import {
   type TurnCommitReceipt,
   type TurnExecutionRecord,
 } from "./turn-execution.service";
+import * as generationPool from "./generation-pool.service";
 import {
   AGENT_PUBLIC_ERROR_CODES,
   type AgentPublicErrorCategory,
@@ -1339,6 +1340,96 @@ function terminalActivityNodes(
     status: node.status === "pending" || node.status === "running" ? terminalNodeStatus : node.status,
   }));
 }
+function inspectionReasonForTerminalState(
+  status: StoredRunState,
+  terminalCode?: unknown,
+): PersistAgentRunInspectionInputV1["reason"] {
+  const code = boundedText(terminalCode, MAX_ID_BYTES)?.toLowerCase() ?? "";
+  if (status === "COMMITTED") return "none";
+  if (status === "CANCELLED") return "user_stop";
+  if (status === "TIMED_OUT") return "deadline";
+  if (status === "EXHAUSTED" || code.includes("budget") || code.includes("limit")) return "budget_exhausted";
+  if (code === "invalid_input" || code === "agentic_runtime_unavailable") return "invalid_input";
+  if (code.includes("provider")) return "provider_failure";
+  if (code.includes("tool")) return "tool_failure";
+  if (code.includes("required_work")) return "required_work_failure";
+  if (code === "interrupted" || code === "process_interrupted") return "interrupted";
+  return code.length > 0 ? "needs_attention" : "unknown";
+}
+
+function convergeDurableTerminalOwnersInTransaction(
+  db: Database,
+  userId: string,
+  run: AgentRunPublicV2,
+  status: StoredRunState,
+  terminalCode?: unknown,
+): void {
+  const outcome = outcomeForStoredState(status, terminalCode);
+  if (!outcome) throw new Error("terminal execution outcome is unavailable");
+  const reason = status === "CANCELLED"
+    ? "stopped"
+    : boundedText(terminalCode, MAX_ID_BYTES)
+      ?? (status === "TIMED_OUT" ? "timed_out" : status.toLowerCase());
+  const now = Date.now();
+  if (tableExists(db, "persistent_workspace_turn_sessions")) {
+    const session = db.query(
+      "SELECT phase, status, outcome, revision, attempt_id FROM persistent_workspace_turn_sessions " +
+        "WHERE user_id = ? AND turn_id = ? AND execution_id = ? LIMIT 1",
+    ).get(
+      userId,
+      run.turnId,
+      run.turnId,
+    ) as { phase: string; status: string; outcome: string | null; revision: number; attempt_id: string } | null;
+    if (session && session.attempt_id !== run.attemptLineage.attemptId && session.attempt_id !== run.turnId) {
+      throw new Error("terminal Turn Session attempt identity conflicts with durable execution");
+    }
+    if (session) {
+      if (session.phase === "TERMINAL" || session.status === "terminal") {
+        if (session.phase !== "TERMINAL" || session.status !== "terminal" || session.outcome !== outcome) {
+          throw new Error("terminal Turn Session conflicts with durable execution");
+        }
+      } else {
+        const changed = db.query(
+          "UPDATE persistent_workspace_turn_sessions " +
+            "SET phase = 'TERMINAL', status = 'terminal', outcome = ?, reason = ?, revision = revision + 1, updated_at = ?, terminal_at = ? " +
+            "WHERE user_id = ? AND turn_id = ? AND attempt_id = ? AND execution_id = ? AND revision = ?",
+        ).run(
+          outcome,
+          reason,
+          Math.floor(now / 1000),
+          Math.floor(now / 1000),
+          userId,
+          run.turnId,
+          session.attempt_id,
+          run.turnId,
+          session.revision,
+        ).changes;
+        if (changed !== 1) throw new Error("terminal Turn Session CAS failed");
+      }
+    }
+  }
+  const inspection = persistAgentRunInspectionInTransaction(db, {
+    userId,
+    chatId: run.chatId,
+    attemptId: run.attemptLineage.attemptId,
+    previousAttemptId: run.attemptLineage.previousAttemptId,
+    runId: run.turnId,
+    turnSessionId: run.turnId,
+    generationId: run.generationId,
+    generationType: run.generationType,
+    targetMessageId: run.target?.messageId ?? null,
+    targetSwipeId: run.target?.swipeId ?? null,
+    hostCorrelationId: "agentic:" + run.turnId + ":" + run.attemptLineage.attemptId,
+    lifecycle: "TERMINAL",
+    status: "terminal",
+    outcome,
+    reason: inspectionReasonForTerminalState(status, terminalCode),
+    updatedAt: now,
+    terminalAt: now,
+    reconciliation: "recovered",
+  });
+  if (!inspection) throw new Error("terminal inspection convergence failed");
+}
 
 function appendDurableTerminalProjection(
   db: Database,
@@ -1347,6 +1438,7 @@ function appendDurableTerminalProjection(
   status: StoredRunState,
   terminalCode?: unknown,
 ): AgentRunProjectionCommitResult {
+  convergeDurableTerminalOwnersInTransaction(db, userId, run, status, terminalCode);
   const reason = status === "CANCELLED"
     ? "stopped"
     : boundedText(terminalCode, MAX_ID_BYTES)
@@ -2491,7 +2583,7 @@ export function repairAgentRunProjectionFromReceipt(
     | "targetMessageRevision"
     | "createdAt"
     | "updatedAt"
-  >,
+  > & Partial<Pick<TurnExecutionRecord, "attemptLineage">>,
   receipt: Pick<TurnCommitReceipt, "id" | "messageId" | "swipeId" | "createdAt">,
   options: AgentRunReceiptRepairOptions = {},
 ): AgentRunProjectionCommitResult {
@@ -2532,6 +2624,7 @@ export function repairAgentRunProjectionFromReceipt(
     targetSwipeId: swipeId,
     status: "COMMITTED",
     ...(revision !== undefined ? { revision: revision + 1 } : {}),
+    ...(execution.attemptLineage ? { attemptLineage: execution.attemptLineage } : {}),
     startedAt: epochSeconds(execution.createdAt),
     updatedAt: timestamp,
     activity: [],
@@ -4586,6 +4679,19 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
     return publishTerminal(durableResult.execution.phase, "accepted", durableResult.execution.terminalCode);
   });
   const latestRun = getAgentRun(userId, turnId, chatId) ?? run;
+  if (isTerminal(latestRun)) {
+    if (latestRun.workOutcome === "stopped") {
+      generationPool.stopPool(turnId);
+    } else if (latestRun.workOutcome === "completed") {
+      generationPool.completePool(turnId, latestRun.terminalHandoff?.messageId ?? undefined);
+    } else {
+      generationPool.errorPool(turnId, latestRun.reason ?? latestRun.error?.code ?? "agentic_failed");
+    }
+    const terminalPool = generationPool.getPoolEntry(turnId);
+    if (!terminalPool || terminalPool.status === "completed" || terminalPool.status === "stopped" || terminalPool.status === "error") {
+      generationPool.unregisterPoolTerminalOwner(turnId);
+    }
+  }
   return stopResponseForRun(latestRun, result.status, result.revision);
 }
 

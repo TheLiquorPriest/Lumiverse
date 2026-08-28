@@ -38,7 +38,7 @@ import {
 import { getIsolateHealthEpoch, probeIsolateBackendsAtStartup } from "./isolate-pool";
 import { AGENT_RUNTIME_ADMISSION_MANAGER } from "./agent-runtime-admission";
 import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
-import { appendPoolContent, createPoolEntry, getPoolEntry, removePoolEntry } from "./generation-pool.service";
+import { appendPoolContent, completePool, createPoolEntry, errorPool, getPoolEntry, removePoolEntry } from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { runAgenticGeneration, waitForAgenticGeneration } from "./agentic-generation.service";
@@ -1197,7 +1197,7 @@ describe("production agentic coordinator installation", () => {
       installAgenticGenerationCoordinator();
     }
   });
-  test("marks persistent recovery incomplete when receipt projection repair fails", () => {
+  test("rolls back the persistent session when receipt projection repair fails", () => {
     const db = getDb();
     const workspaceId = "workspace:persistent-recovery-projection-failure";
     const executionId = "persistent-recovery-projection-failure-execution";
@@ -1243,9 +1243,9 @@ describe("production agentic coordinator installation", () => {
       expect(db.query(
         "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
       ).get(sessionId)).toEqual({
-        phase: "TERMINAL",
-        status: "terminal",
-        outcome: "completed",
+        phase: "WORK",
+        status: "running",
+        outcome: null,
       });
     } finally {
       db.run("DROP TRIGGER persistent_recovery_projection_failure_insert");
@@ -1257,7 +1257,7 @@ describe("production agentic coordinator installation", () => {
       db.query("DELETE FROM agent_turn_workspaces WHERE turn_id = ?").run(executionId);
     }
   });
-  test("stops before an expensive persistent session when the recovery deadline expires", () => {
+  test("never invents terminal outcomes for persistent sessions without an execution owner", () => {
     const db = getDb();
     const workspaceId = "workspace:persistent-recovery-slow-clock";
     const firstSessionId = "persistent-recovery-slow-a";
@@ -1297,13 +1297,13 @@ describe("production agentic coordinator installation", () => {
     try {
       const blocked = __testing.reconcilePersistentWorkspaceSessions();
       expect(blocked.complete).toBe(false);
-      expect(blocked.recovered).toBe(1);
+      expect(blocked.recovered).toBe(0);
       expect(db.query(
         "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
       ).get(firstSessionId)).toEqual({
-        phase: "TERMINAL",
-        status: "terminal",
-        outcome: "failed",
+        phase: "WORK",
+        status: "running",
+        outcome: null,
       });
       expect(db.query(
         "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
@@ -1314,14 +1314,14 @@ describe("production agentic coordinator installation", () => {
       });
       __testing.setPersistentRecoveryClock(null);
       const recovered = __testing.reconcilePersistentWorkspaceSessions();
-      expect(recovered.complete).toBe(true);
-      expect(recovered.recovered).toBe(1);
+      expect(recovered.complete).toBe(false);
+      expect(recovered.recovered).toBe(0);
       expect(db.query(
         "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE turn_session_id = ?",
       ).get(secondSessionId)).toEqual({
-        phase: "TERMINAL",
-        status: "terminal",
-        outcome: "failed",
+        phase: "WORK",
+        status: "running",
+        outcome: null,
       });
     } finally {
       __testing.setPersistentRecoveryClock(null);
@@ -2015,11 +2015,22 @@ describe("production agentic coordinator installation", () => {
       } finally {
         db.run("PRAGMA foreign_keys = OFF");
       }
-      deps.cleanup!({
-        execution,
-        phase: "CANCELLED",
+      transitionTurnExecution({
+        executionId,
+        ownerToken: execution.ownerToken!,
+        expectedPhase: execution.phase!,
+        nextPhase: "CANCELLED",
+        reason: "agentic_cancelled",
+      });
+      deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId,
         status: "cancelled",
-      } as never);
+        phase: "CANCELLED",
+        target,
+        errorCode: "agentic_cancelled",
+      });
       const session = db.query(
         "SELECT chat_id, phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
       ).get(USER_ID, executionId) as {
@@ -2042,7 +2053,7 @@ describe("production agentic coordinator installation", () => {
       } as never);
     }
   });
-  test("restart recovery terminalizes a persistent session after transient cleanup CAS failure", async () => {
+  test("restart recovery converges the persistent session after a transient terminal transaction failure", async () => {
     const db = getDb();
     const deps = __testing.buildDependencies();
     markAgenticRuntimeReady();
@@ -2074,6 +2085,22 @@ describe("production agentic coordinator installation", () => {
       END
     `);
     try {
+      transitionTurnExecution({
+        executionId,
+        ownerToken: execution.ownerToken!,
+        expectedPhase: execution.phase!,
+        nextPhase: "FAILED",
+        reason: "agentic_internal_error",
+      });
+      expect(() => deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "failed",
+        phase: "FAILED",
+        target,
+        errorCode: "agentic_internal_error",
+      })).toThrow();
       deps.cleanup!({ execution, phase: "FAILED", status: "failed" } as never);
       expect(db.query(
         "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
@@ -2130,27 +2157,40 @@ describe("production agentic coordinator installation", () => {
       getDb().run("DROP TRIGGER reject_agentic_workspace_admission");
     }
     try {
-      const session = getDb().query(
+      const before = getDb().query(
         "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ? AND chat_id = ?",
-      ).get(executionId, USER_ID, AGENTIC_CHAT_ID) as {
-        phase: string;
-        status: string;
-        outcome: string | null;
-        revision: number;
-      } | null;
-      expect(session).toMatchObject({
+      ).get(executionId, USER_ID, AGENTIC_CHAT_ID);
+      expect(before).toMatchObject({ phase: "ADMIT", status: "pending", outcome: null, revision: 0 });
+      deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "failed",
+        phase: "FAILED",
+        target,
+        errorCode: "agentic_internal_error",
+      });
+      expect(getDb().query(
+        "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ? AND chat_id = ?",
+      ).get(executionId, USER_ID, AGENTIC_CHAT_ID)).toMatchObject({
         phase: "TERMINAL",
         status: "terminal",
         outcome: "failed",
         revision: 1,
       });
       const inspection = getAgentRunInspection(USER_ID, executionId, AGENTIC_CHAT_ID);
+      expect(inspection).toMatchObject({ status: "terminal", outcome: "failed" });
       expect(inspection?.workspaceAssociations).toHaveLength(1);
       expect(inspection?.workspaceAssociations[0]).toMatchObject({
-        id: `workspace:linked:${executionId}`,
+        id: "workspace:linked:" + executionId,
         relation: "linked",
       });
+      expect(getAgentRun(USER_ID, executionId, AGENTIC_CHAT_ID)).toMatchObject({
+        workStatus: "terminal",
+        workOutcome: "failed",
+      });
     } finally {
+      deps.cleanup!({ executionId, phase: "FAILED", status: "failed" } as never);
       getDb().query("DELETE FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?")
         .run(executionId, USER_ID);
       getDb().query("DELETE FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?")
@@ -2191,21 +2231,39 @@ describe("production agentic coordinator installation", () => {
       getDb().run("DROP TRIGGER reject_agentic_timeout_workspace_admission");
     }
     try {
-      const session = getDb().query(
+      expect(getDb().query(
         "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
-      ).get(executionId, USER_ID) as {
-        phase: string;
-        status: string;
-        outcome: string | null;
-        revision: number;
-      } | null;
-      expect(session).toMatchObject({
+      ).get(executionId, USER_ID)).toMatchObject({ phase: "ADMIT", status: "pending", outcome: null, revision: 0 });
+      deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "timed_out",
+        phase: "TIMED_OUT",
+        target,
+        errorCode: "agentic_timed_out",
+      });
+      expect(getDb().query(
+        "SELECT phase, status, outcome, revision FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?",
+      ).get(executionId, USER_ID)).toMatchObject({
         phase: "TERMINAL",
         status: "terminal",
         outcome: "failed",
         revision: 1,
       });
+      expect(getAgentRunInspection(USER_ID, executionId, AGENTIC_CHAT_ID)).toMatchObject({
+        status: "terminal",
+        outcome: "failed",
+        reason: "deadline",
+      });
+      const run = getAgentRun(USER_ID, executionId, AGENTIC_CHAT_ID);
+      expect(run).toMatchObject({
+        workStatus: "terminal",
+        workOutcome: "failed",
+      });
+      expect(run?.error?.code).not.toBe("projection_unavailable");
     } finally {
+      deps.cleanup!({ executionId, phase: "TIMED_OUT", status: "timed_out" } as never);
       getDb().query("DELETE FROM persistent_workspace_turn_sessions WHERE execution_id = ? AND user_id = ?")
         .run(executionId, USER_ID);
       getDb().query("DELETE FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?")
@@ -4073,8 +4131,8 @@ describe("production agentic coordinator installation", () => {
     });
     const failedPayload = await failed;
     expect(failedPayload.errorCode).toBe("provider_request_error");
-    expect(failedPayload.error).toBe("WORK: provider_request_error: upstream refused");
-    expect(failedPayload.phase).toBe("WORK");
+    expect(failedPayload.error).toBe("FAILED: provider_request_error: upstream refused");
+    expect(failedPayload.phase).toBe("FAILED");
     expect(failedPayload.content).toBe("provisional failure output");
     removePoolEntry("exec-committed-failed");
   });
@@ -4122,19 +4180,17 @@ describe("production agentic coordinator installation", () => {
     }
     expect(order).toEqual(["inspection", "projection", "terminal"]);
   });
-  test("terminal publication failure preserves a durable committed receipt", () => {
+  test("terminal convergence rolls back every derived plane and retries without a synthetic cause", () => {
     const db = getDb();
     const deps = __testing.buildDependencies();
-    const executionId = `exec-terminal-reconcile-${Date.now()}`;
-    const trigger = `agentic_projection_failure_${Date.now()}`;
+    const executionId = "exec-terminal-atomic-" + Date.now();
+    const trigger = "agentic_projection_failure_" + Date.now();
+    const ended: string[] = [];
     seedCommittedExecution(executionId);
-    db.run(`
-      CREATE TRIGGER ${trigger}
-      BEFORE INSERT ON agent_run_projections
-      BEGIN
-        SELECT RAISE(ABORT, 'projection write unavailable');
-      END
-    `);
+    const removeEnded = eventBus.on(EventType.GENERATION_ENDED, (emitted) => {
+      const payload = emitted.payload as { readonly generationId?: unknown } | undefined;
+      if (payload?.generationId === executionId) ended.push(executionId);
+    });
     const event = {
       executionId,
       userId: USER_ID,
@@ -4143,85 +4199,39 @@ describe("production agentic coordinator installation", () => {
       phase: "COMMITTED" as const,
       target: { generationType: "normal" as const },
     };
+    db.run(`
+      CREATE TRIGGER ${trigger}
+      BEFORE INSERT ON agent_run_projections
+      BEGIN
+        SELECT RAISE(ABORT, 'projection write unavailable');
+      END
+    `);
     try {
       expect(() => deps.publishTerminal!(event)).toThrow();
+      expect(db.query(
+        "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+      ).get(USER_ID, executionId)).toBeNull();
+      expect(db.query(
+        "SELECT outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+      ).get(USER_ID, executionId)).not.toMatchObject({ outcome: "completed" });
+      expect(ended).toEqual([]);
     } finally {
       db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
     }
-    deps.terminalPublicationFailed!(event, new Error("projection write unavailable"));
-    const projection = db.query(
-      "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
-    ).get(USER_ID, executionId) as { status: string; snapshot_json: string } | null;
-    expect(projection?.status).toBe("COMMITTED");
-    expect(JSON.parse(projection?.snapshot_json ?? "{}")).toMatchObject({
-      error: {
-        code: "projection_unavailable",
-        recoveryAction: "resync",
-      },
-    });
-    expect(db.query(
-      "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
-    ).get(USER_ID, executionId)).toMatchObject({
-      status: "terminal",
-      outcome: "completed",
-    });
-  });
 
-  test("terminal publication failure preserves each original terminal status and pool route", () => {
-    const db = getDb();
-    const deps = __testing.buildDependencies();
-    const cases = [
-      { status: "completed", phase: "COMMIT_FAILED", projectionStatus: "COMMIT_FAILED", outcome: "failed", poolStatus: "error" },
-      { status: "cancelled", phase: "CANCELLED", projectionStatus: "CANCELLED", outcome: "stopped", poolStatus: "stopped" },
-      { status: "timed_out", phase: "TIMED_OUT", projectionStatus: "TIMED_OUT", outcome: "failed", poolStatus: "error" },
-      { status: "exhausted", phase: "EXHAUSTED", projectionStatus: "EXHAUSTED", outcome: "exhausted", poolStatus: "error" },
-      { status: "rejected", phase: "FAILED", projectionStatus: "FAILED", outcome: "rejected", poolStatus: "error" },
-      { status: "failed", phase: "FAILED", projectionStatus: "FAILED", outcome: "failed", poolStatus: "error" },
-    ] as const;
-
-    for (const terminalCase of cases) {
-      const executionId = `exec-terminal-reconcile-${terminalCase.status}-${Date.now()}`;
-      createPoolEntry({
-        generationId: executionId,
-        userId: USER_ID,
-        chatId: AGENTIC_CHAT_ID,
-        generationType: "normal",
-        characterName: "",
-        model: "",
-      });
-      try {
-        deps.terminalPublicationFailed!({
-          executionId,
-          userId: USER_ID,
-          chatId: AGENTIC_CHAT_ID,
-          status: terminalCase.status,
-          phase: terminalCase.phase,
-          target: { generationType: "normal" },
-        }, new Error("projection write unavailable"));
-        expect(db.query(
-          "SELECT state FROM agent_turn_executions WHERE user_id = ? AND id = ?",
-        ).get(USER_ID, executionId)).toEqual({
-          state: terminalCase.projectionStatus,
-        });
-        const projection = db.query(
-          "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
-        ).get(USER_ID, executionId) as { status: string; snapshot_json: string } | null;
-        expect(projection?.status).toBe(terminalCase.projectionStatus);
-        expect(JSON.parse(projection?.snapshot_json ?? "{}")).toMatchObject({
-          workPhase: "TERMINAL",
-          workStatus: "terminal",
-          workOutcome: terminalCase.outcome,
-        });
-        expect(db.query(
-          "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
-        ).get(USER_ID, executionId)).toMatchObject({
-          status: "terminal",
-          outcome: terminalCase.outcome,
-        });
-        expect(getPoolEntry(executionId)?.status).toBe(terminalCase.poolStatus);
-      } finally {
-        removePoolEntry(executionId);
-      }
+    try {
+      deps.publishTerminal!(event);
+      const projection = db.query(
+        "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+      ).get(USER_ID, executionId) as { status: string; snapshot_json: string } | null;
+      expect(projection?.status).toBe("COMMITTED");
+      expect(JSON.parse(projection?.snapshot_json ?? "{}")).not.toHaveProperty("error.code", "projection_unavailable");
+      expect(db.query(
+        "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({ status: "terminal", outcome: "completed" });
+      expect(ended).toEqual([executionId]);
+    } finally {
+      removeEnded();
     }
   });
 
@@ -4270,13 +4280,7 @@ describe("production agentic coordinator installation", () => {
           `);
         }
         try {
-          try {
-            deps.publishTerminal!(event);
-          } catch {
-            // The failure callback below records the durable terminal outcome
-            // while the selected private/public write remains unavailable.
-          }
-          deps.terminalPublicationFailed!(event, new Error(`${recoveryMode} recovery loss`));
+          expect(() => deps.publishTerminal!(event)).toThrow();
         } finally {
           db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
         }
@@ -4320,7 +4324,7 @@ describe("production agentic coordinator installation", () => {
     }
   });
 
-  test("terminal inspection persistence failure defers session and projection recovery", async () => {
+  test("terminal inspection failure defers every derived surface and pool settlement", async () => {
     const db = getDb();
     const deps = __testing.buildDependencies();
     markAgenticRuntimeReady();
@@ -4352,6 +4356,8 @@ describe("production agentic coordinator installation", () => {
     if (ownerToken === undefined || initialPhase === undefined) {
       throw new Error("coordinator test execution did not return durable ownership");
     }
+    errorPool(executionId, "watchdog fired before durable terminal convergence");
+    expect(getPoolEntry(executionId)?.status).not.toBe("error");
     let currentPhase = initialPhase;
     for (const nextPhase of ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING"] as const) {
       currentPhase = transitionTurnExecution({
@@ -4391,7 +4397,6 @@ describe("production agentic coordinator installation", () => {
     `);
     try {
       expect(() => deps.publishTerminal!(event)).toThrow();
-      deps.terminalPublicationFailed!(event, new Error("terminal inspection unavailable"));
       expect(db.query(
         "SELECT status, snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
       ).get(USER_ID, executionId)).toBeNull();
@@ -4408,6 +4413,8 @@ describe("production agentic coordinator installation", () => {
       expect(db.query(
         "SELECT receipt_id FROM agent_turn_commit_receipts WHERE user_id = ? AND execution_id = ?",
       ).get(USER_ID, executionId)).toMatchObject({ receipt_id: `receipt:${executionId}` });
+      errorPool(executionId, "watchdog fired after execution but before durable projections");
+      expect(getPoolEntry(executionId)?.status).not.toBe("error");
     } finally {
       db.run(`DROP TRIGGER IF EXISTS ${trigger}`);
       deps.cleanup!({
@@ -4423,9 +4430,29 @@ describe("production agentic coordinator installation", () => {
       status: "pending",
       outcome: null,
     });
+    const recovery = __testing.reconcilePersistentWorkspaceSessions();
+    expect(recovery.complete).toBe(true);
+    expect(db.query(
+      "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+    ).get(USER_ID, executionId)).toMatchObject({
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "completed",
+    });
+    expect(db.query(
+      "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+    ).get(USER_ID, executionId)).toMatchObject({ status: "COMMITTED" });
+    expect(db.query(
+      "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+    ).get(USER_ID, executionId)).toMatchObject({ status: "terminal", outcome: "completed" });
+    completePool(executionId, committedMessageId);
+    expect(getPoolEntry(executionId)).toMatchObject({
+      status: "completed",
+      completedMessageId: committedMessageId,
+    });
   });
 
-  test("failed terminal projection reconciliation leaves a durable failed inspection without success", () => {
+  test("failed terminal convergence leaves only the durable execution cause and emits nothing", () => {
     const db = getDb();
     const deps = __testing.buildDependencies();
     const executionId = `exec-terminal-reconcile-failure-${Date.now()}`;
@@ -4452,16 +4479,18 @@ describe("production agentic coordinator installation", () => {
     };
     try {
       expect(() => deps.publishTerminal!(event)).toThrow();
-      deps.terminalPublicationFailed!(event, new Error("projection write unavailable"));
       expect(db.query(
         "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
       ).get(USER_ID, executionId)).toBeNull();
       expect(db.query(
-        "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+        "SELECT state, terminal_code FROM agent_turn_executions WHERE user_id = ? AND id = ?",
       ).get(USER_ID, executionId)).toMatchObject({
-        status: "terminal",
-        outcome: "failed",
+        state: "COMMIT_FAILED",
+        terminal_code: "agentic_commit_failed",
       });
+      expect(db.query(
+        "SELECT status, outcome FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+      ).get(USER_ID, executionId)).toBeNull();
       expect(ended).toEqual([]);
     } finally {
       db.run(`DROP TRIGGER IF EXISTS ${trigger}`);

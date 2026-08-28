@@ -361,30 +361,6 @@ export interface AgenticGenerationDependencies {
     errorMessage?: string;
     retryable?: boolean;
   }) => Promise<void> | void;
-  /**
-   * Projection/terminal reconciliation invoked when publication fails after
-   * durable terminal ownership was established. It must not replay runtime
-   * work or provider side effects.
-   */
-  terminalPublicationFailed?: (
-    event: {
-      executionId: string;
-      userId: string;
-      chatId: string;
-      status: AgenticTerminalStatus;
-      phase: AgenticPhase;
-      workPhase?: AgentWorkPhase;
-      workStatus?: AgentWorkStatus;
-      workOutcome?: AgentWorkOutcome | null;
-      reason?: string | null;
-      attemptLineage?: AgentWorkAttemptLineageV1;
-      target: AgenticTargetSnapshot;
-      receipt?: AgenticCommitReceipt;
-      errorCode?: AgenticFailureCode | string;
-      retryable?: boolean;
-    },
-    error: unknown,
-  ) => Promise<void> | void;
   cleanup?: (context: {
     execution?: AgenticExecutionHandle;
     executionId?: string;
@@ -1506,48 +1482,10 @@ export async function runAgenticGeneration(
       try {
         if (resolvedDeps.publishTerminal) await resolvedDeps.publishTerminal(terminalEvent);
       } catch (error) {
-        // Once the commit receipt and execution are durable, publication is a
-        // recoverable projection concern. Never turn that chat success into a
-        // COMMIT_FAILED result while the receipt remains authoritative.
-        const committedBoundary = projected.status === "completed" && projected.phase === "COMMITTED";
-        const publicationErrorCode = "projection_unavailable";
-        try {
-          await resolvedDeps.terminalPublicationFailed?.({
-            ...terminalEvent,
-            ...(committedBoundary ? { reason: "reconciliation_required" } : {}),
-            errorCode: publicationErrorCode,
-            retryable: true,
-          }, error);
-        } catch (reconciliationError) {
-          console.error("[agentic] terminal reconciliation failed", reconciliationError);
-        }
-        if (committedBoundary) {
-          projected = {
-            ...projected,
-            status: "completed",
-            phase: "COMMITTED",
-            reason: "reconciliation_required",
-            errorCode: publicationErrorCode,
-            retryable: true,
-            errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : projected.errorMessage,
-          };
-        } else {
-          // Projection failure must not rewrite a durable terminal decision.
-          // The terminal event already carries the authoritative phase/status/
-          // outcome; only the projection error is new and retryable.
-          projected = {
-            ...projected,
-            status: terminalEvent.status,
-            phase: terminalEvent.phase,
-            workPhase: terminalEvent.workPhase,
-            workStatus: terminalEvent.workStatus,
-            workOutcome: terminalEvent.workOutcome,
-            reason: terminalEvent.reason,
-            errorCode: publicationErrorCode,
-            retryable: true,
-            errorMessage: error instanceof Error && error.message.trim().length > 0 ? error.message : projected.errorMessage,
-          };
-        }
+        // The durable execution remains the terminal authority. Atomic
+        // reconciliation is idempotent and startup recovery may complete it;
+        // never replace the WORK/COMMIT cause with a projection-layer cause.
+        console.error("[agentic] terminal convergence deferred", error);
       }
     }
     try {

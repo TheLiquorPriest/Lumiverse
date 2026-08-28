@@ -455,15 +455,22 @@ host-enforced budget or limit exhaustion.
 | `RENDER` | Use the same frozen root connection and model with `tools: []`, `toolMode: "finalization"`, and one final-render reservation. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance cross from private WORK; raw retrieval and work notes do not. Native continuation may reuse only that frame’s opaque adapter carrier; legacy continuation uses only the private frame transcript. A returned tool call is a protocol failure and is never executed. |
 | `PREPARE_COMMIT` | Send frozen render content plus pure snapshotted inputs to `prepare_agent_render` in the strict isolate. It performs bounded reasoning-tag cleanup, response transforms, formatting healing, source-message/macro preparation, target/swipe reconciliation, and usage calculation, returning typed deltas only. |
 | `COMMITTING` | Recompute every `InputRevisionSetV1` member. A single CAS owns this boundary; cancellation/deadline can win before it, while Stop after it is `too_late`. |
-| `COMMITTED` | One synchronous SQLite transaction writes the message/swipe/extras, authorized macro/source/chat/world-info/regex deltas, artifact references, terminal handoff, projection, and idempotent receipt. Duplicate commit returns the existing receipt. |
+| `COMMITTED` | One synchronous SQLite transaction writes the message/swipe/extras, authorized macro/source/chat/world-info/regex deltas, artifact references, a mutable `COMMITTING` projection, the idempotent receipt, and the execution's `COMMITTED` CAS. Duplicate commit returns the existing receipt. A second exact-identity convergence transaction terminalizes the persistent Turn Session, owner inspection attempt, immutable Agent Run projection, compatibility activity, and terminal outbox. |
 
 Before every root WORK provider dispatch, the host rebuilds one concise private structured phase-control envelope from live state: `{ kind: "host_private_phase_control_v1", currentPhaseId: string | null, admittedRootToolNames: string[], openRequiredTaskIds: string[], completeTurn: { instruction: "MUST call complete_turn as the sole tool call after the current custom phase exit predicate is satisfied; without an active custom phase, call it only after all completion gates are settled.", callMode: "standalone_only", nonFinalAcceptance: "phase_advanced", nonFinalWorkContinues: true, terminalAcceptance: "final_custom_phase_or_no_active_custom_phase_only" } }`. Future conditional tasks are never speculated. This message belongs only to private WORK input, is not persisted, and is not copied into RENDER, the public workspace projection, or Response.
 
 Unknown phase transitions fail closed. A reversible-phase provider/protocol
 failure, cancellation, or deadline enters `FAILED`, `CANCELLED`, or
 `TIMED_OUT`; budget exhaustion enters `EXHAUSTED`. `COMMITTING` enters
-`COMMITTED` only with its receipt, otherwise `COMMIT_FAILED`. One terminal
-owner emits the terminal event; later callers may only release resources.
+`COMMITTED` only with its receipt, otherwise `COMMIT_FAILED`. The durable
+execution is the primary terminal cause. Pool and compatibility terminal events
+publish only after all durable derived surfaces commit; projection failure never
+relabels the WORK/COMMIT cause as `projection_unavailable`.
+Admission failures that occur after execution creation use the same durable-first
+boundary; they do not terminalize inspection, Turn Session, or pool state from
+cleanup. If the source chat was already deleted, chat-owned projections no
+longer exist: the detached persistent Turn Session is terminalized with the
+execution, the pool is settled afterward, and no chat websocket event is sent.
 
 The strict preprocessing ceilings are immutable host defaults: 8 MiB input,
 8 MiB output, 16 MiB cumulative expansion, 2 MiB per operation, 1,024 prompt
@@ -500,12 +507,16 @@ background swipe admission remains valid, projects no tokens into another
 active chat, and recovers once from the correlated pool when that chat reopens.
 Startup runs `reconcileStartupState()` before `Bun.serve`: imports, artifact
 blobs, turns, and Agent Run projections reconcile sequentially, then isolate
-backends are probed. Agentic readiness requires successful import/artifact/turn
+backends are probed. Receipt-backed success repairs the persistent Turn Session,
+inspection attempt, Agent Run projection, and terminal outbox in one transaction;
+noncommitted terminal execution repair uses the same all-or-nothing owner set.
+Recovery is idempotent and never publishes an ephemeral pool or compatibility
+terminal event before that durable boundary. Agentic readiness requires successful import/artifact/turn
 and healthy projection stages, a usable publication store, and terminable
 isolate health; any failed gate closes Agentic while Response remains
 available. The startup stage records stable failure outcomes rather than
-dispatching providers or publishing events. Readiness additionally requires the
-operational rollback switch below to be `auto`: the readiness vector carries
+dispatching providers or publishing events.
+Readiness additionally requires the operational rollback switch below to be `auto`: the readiness vector carries
 `killSwitchState` and adds the `kill_switch_off` reason whenever it is not.
 The startup vector contains only those server-owned components that can be
 settled before a request selects a provider, preset binding, context snapshot,

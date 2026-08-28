@@ -158,6 +158,7 @@ import {
   ensurePersistentWorkspaceHost,
   getPersistentWorkspaceById,
   updatePersistentWorkspaceHostTurnSession,
+  updatePersistentWorkspaceHostTurnSessionInTransaction,
 } from "./turn-workspace.service";
 import {
   WORKSPACE_OPERATIONS,
@@ -219,6 +220,7 @@ import {
 import { getDb } from "../db/connection";
 import {
   createAgentInspectionWriter,
+  persistAgentRunInspectionInTransaction,
   type AgentInspectionWriterV1,
 } from "./agent-activity-runs.service";
 import type {
@@ -3751,43 +3753,10 @@ type PersistentWorkspaceRecoveryResult = {
   readonly complete: boolean;
 };
 
-function persistentOutcomeFromAttempt(value: unknown): RecoverablePersistentWorkspaceOutcome | undefined {
-  switch (value) {
-    case "completed":
-    case "stopped":
-    case "failed":
-    case "exhausted":
-    case "rejected":
-      return value;
-    default:
-      return undefined;
-  }
-}
-
-function persistentOutcomeFromTerminalState(value: unknown): RecoverablePersistentWorkspaceOutcome | undefined {
-  switch (value) {
-    case "COMMITTED":
-      return "completed";
-    case "CANCELLED":
-      return "stopped";
-    case "TIMED_OUT":
-      return "failed";
-    case "EXHAUSTED":
-      return "exhausted";
-    case "COMMIT_FAILED":
-    case "FAILED":
-      return "failed";
-    default:
-      return undefined;
-  }
-}
 
 /**
- * Host turn sessions are the only persistent session records. A process
- * restart leaves no live host authority, so a surviving nonterminal session
- * with a terminal durable attempt/projection is deterministically stale and
- * must be terminalized. Receipt-backed projection repair is deliberately
- * ordered after that session CAS.
+ * Receipt-backed COMMITTED sessions converge with their inspection/projection
+ * in one transaction. Noncommitted sessions are owned by reconcileAgentTurns.
  */
 function reconcilePersistentWorkspaceSessions(): PersistentWorkspaceRecoveryResult {
   const db = getDb();
@@ -3818,6 +3787,13 @@ function reconcilePersistentWorkspaceSessions(): PersistentWorkspaceRecoveryResu
     recovered: 0,
     complete: true,
   };
+  try {
+    const turnRecovery = reconcileAgentTurns(db);
+    if (!turnRecovery.complete) result.complete = false;
+  } catch (error) {
+    console.error("[agentic] durable turn recovery failed", error);
+    result.complete = false;
+  }
   const receiptBacked = `
     e.state IN ('COMMITTED', 'COMMITTING')
     AND EXISTS (
@@ -3924,85 +3900,39 @@ function reconcilePersistentWorkspaceSessions(): PersistentWorkspaceRecoveryResu
         result.complete = false;
         continue;
       }
-
-      const projectionOutcome = persistentOutcomeFromTerminalState(row.projection_status);
-      const attemptOutcome = row.attempt_status === "terminal"
-        ? persistentOutcomeFromAttempt(row.attempt_outcome)
-        : undefined;
-      const executionOutcome = persistentOutcomeFromTerminalState(row.execution_state);
-      const executionRuntimeEpoch = typeof row.execution_runtime_epoch === "number"
-        && Number.isSafeInteger(row.execution_runtime_epoch)
-        ? row.execution_runtime_epoch
-        : undefined;
-      const executionDeadlineAt = typeof row.execution_deadline_at === "number"
-        && Number.isFinite(row.execution_deadline_at)
-        ? row.execution_deadline_at
-        : undefined;
-      // Nonterminal execution rows are owned by turn startup reconciliation.
-      // Do not invent an exhausted outcome while a COMMITTING/WORK row still
-      // has a replayable phase transition pending.
-      const staleExecution = row.execution_state === null
-        || row.execution_state === undefined
-        || executionRuntimeEpoch !== undefined && executionRuntimeEpoch !== runtimeEpoch
-        || executionDeadlineAt !== undefined && executionDeadlineAt <= Date.now();
-      const outcome = executionCommittedWithReceipt
-        ? "completed"
-        : projectionOutcome && projectionOutcome !== "completed"
-          ? projectionOutcome
-          : attemptOutcome && attemptOutcome !== "completed"
-            ? attemptOutcome
-            : executionOutcome ?? attemptOutcome ?? projectionOutcome
-              ?? (staleExecution ? "failed" : undefined);
-      if (!outcome) {
+      if (!executionCommittedWithReceipt || !execution || !receipt) {
+        // Noncommitted terminal executions are reconciled by reconcileAgentTurns
+        // in one execution/inspection/session/projection transaction. Never
+        // infer a terminal session independently from partial derived rows.
         result.complete = false;
         continue;
       }
-
-      let recovered = false;
       try {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            const workspace = getPersistentWorkspaceById({ userId, workspaceId });
-            const session = updatePersistentWorkspaceHostTurnSession(authority, {
+        const session = withAgentRunProjectionTransaction((projectionDb) => {
+          const workspace = getPersistentWorkspaceById({ userId, workspaceId });
+          const terminalSession = updatePersistentWorkspaceHostTurnSessionInTransaction(
+            projectionDb,
+            authority,
+            {
               userId,
               workspaceId,
               expectedRevision: workspace.revision,
               turnSessionId,
               phase: "TERMINAL",
               status: "terminal",
-              outcome,
-            });
-            recovered = session.phase === "TERMINAL"
-              && session.status === "terminal"
-              && session.outcome === outcome;
-            if (recovered) break;
-          } catch (error) {
-            if (attempt === 1) throw error;
-          }
-        }
-        if (!recovered) {
-          console.error(`[agentic] persistent session recovery did not converge (${turnSessionId})`);
-          result.complete = false;
-          continue;
-        }
-      } catch (error) {
-        console.error(`[agentic] persistent session recovery failed (${turnSessionId})`, error);
-        result.complete = false;
-        continue;
-      }
-      result.recovered++;
-
-      if (executionCommittedWithReceipt && execution && receipt) {
-        try {
-          withAgentRunProjectionTransaction((projectionDb) =>
-            repairAgentRunProjectionFromReceipt(projectionDb, execution!, receipt!),
+              outcome: "completed",
+            },
           );
-        } catch (error) {
-          // The session CAS is already durable. Leave the staged projection and
-          // receipt for the next bounded startup repair attempt.
-          result.complete = false;
-          console.error(`[agentic] persistent receipt projection repair failed (${turnSessionId})`, error);
+          repairAgentRunProjectionFromReceipt(projectionDb, execution, receipt);
+          return terminalSession;
+        });
+        if (session.phase !== "TERMINAL" || session.status !== "terminal" || session.outcome !== "completed") {
+          throw new Error("persistent receipt convergence did not settle the Turn Session");
         }
+        result.recovered++;
+      } catch (error) {
+        result.complete = false;
+        console.error("[agentic] persistent receipt convergence failed (" + turnSessionId + ")", error);
       }
     }
     const lastRow = rows[rows.length - 1]!;
@@ -4072,6 +4002,8 @@ function requireCommittedTerminalSettlement(
     || swipeId < 0
     || event.receipt?.messageId !== undefined && event.receipt.messageId !== messageId
     || event.receipt?.swipeId !== undefined && event.receipt.swipeId !== swipeId
+    || event.receipt?.receiptId !== undefined && event.receipt.receiptId !== receipt.id
+    || event.receipt?.commitKey !== undefined && event.receipt.commitKey !== receipt.commitKey
   ) {
     throw new Error("committed_terminal_receipt_integrity_failed");
   }
@@ -4083,50 +4015,37 @@ function requireCommittedTerminalSettlement(
   return { messageId, swipeId, content };
 }
 
-/**
- * Keep terminal publication recovery on the exact same status/outcome
- * translation as the normal terminal publisher. The event phase is already
- * canonicalized by the generation owner and must not be replaced by a generic
- * FAILED phase during recovery.
- */
+/** Derive public terminal truth from the immutable durable execution winner. */
 function coordinatorTerminalPublicationState(
-  event: Pick<CoordinatorTerminalEvent, "status" | "phase" | "workOutcome">,
+  execution: TurnExecutionRecord,
   committedBoundary: boolean,
 ): CoordinatorTerminalPublicationState {
-  const status = committedBoundary
+  const status: CoordinatorTerminalPublicationState["status"] = committedBoundary
     ? "COMMITTED"
-    : event.status === "completed"
+    : execution.phase === "COMMIT_FAILED"
       ? "COMMIT_FAILED"
-      : event.status === "cancelled"
+      : execution.phase === "CANCELLED"
         ? "CANCELLED"
-        : event.status === "timed_out"
+        : execution.phase === "TIMED_OUT"
           ? "TIMED_OUT"
-          : event.status === "exhausted"
+          : execution.phase === "EXHAUSTED"
             ? "EXHAUSTED"
-            : "FAILED";
-  const reportedOutcome = event.workOutcome;
-  const outcome = committedBoundary
-    ? "completed"
-    : event.status === "completed"
-      ? "failed"
-      : event.status === "cancelled"
-        ? "stopped"
-        : event.status === "timed_out"
-          ? "failed"
-          : event.status === "exhausted"
-            ? "exhausted"
-            : event.status === "rejected"
-              ? "rejected"
-              : reportedOutcome === "stopped"
-                ? "stopped"
-                : reportedOutcome === "exhausted"
-                  ? "exhausted"
-                  : reportedOutcome === "rejected"
-                    ? "rejected"
-                    : "failed";
+            : execution.phase === "FAILED"
+              ? "FAILED"
+              : (() => { throw new Error("terminal execution is not settled"); })();
+  const outcome = execution.workOutcome;
+  if (
+    outcome !== "completed"
+    && outcome !== "stopped"
+    && outcome !== "failed"
+    && outcome !== "exhausted"
+    && outcome !== "rejected"
+  ) {
+    throw new Error("terminal execution outcome is unavailable");
+  }
   return {
     status,
-    phase: committedBoundary ? "COMMITTED" : event.phase,
+    phase: committedBoundary ? "COMMITTED" : execution.phase,
     outcome,
   };
 }
@@ -4178,12 +4097,6 @@ function buildDependencies(): AgenticGenerationDependencies {
   const bindings = new Map<string, LiveTargetBinding>();
   const inspectionWriters = new Map<string, AgentInspectionWriterV1>();
   const persistentAssociations = new Map<string, PersistentRuntimeAssociation>();
-  /**
-   * A failed terminal inspection is deliberately remembered through the
-   * request cleanup. Cleanup must not convert the still-mutable persistent
-   * session into a terminal row after this callback has deferred recovery.
-   */
-  const terminalInspectionFailures = new Set<string>();
   const commitDependencies: typeof AGENTIC_COMMIT_DEPENDENCIES_V1 = Object.freeze({
     ...AGENTIC_COMMIT_DEPENDENCIES_V1,
     // The commit transaction must leave a mutable COMMITTING projection
@@ -4196,23 +4109,44 @@ function buildDependencies(): AgenticGenerationDependencies {
         status: "COMMITTING",
         terminalHandoff: null,
       });
-      const commitRecorded = inspectionWriters.get(input.generationId)?.record("milestone", {
-        id: `phase:${input.generationId}:COMMIT`,
-        kind: "milestone",
-        actor: "host",
-        recipient: "owner",
-        result: JSON.stringify({
-          phase: "COMMIT",
-          workPhase: "COMMIT",
-          workStatus: "waiting",
-          workOutcome: null,
-          reason: null,
-        }),
-        correlation: { parentId: "root" },
-      }, {
+      const attemptId = input.attemptLineage?.attemptId ?? input.generationId;
+      const committedAt = Date.now();
+      const commitRecorded = persistAgentRunInspectionInTransaction(db, {
+        userId: input.userId,
+        chatId: input.chatId,
+        attemptId,
+        ...(input.attemptLineage?.previousAttemptId !== undefined
+          ? { previousAttemptId: input.attemptLineage.previousAttemptId }
+          : {}),
+        runId: input.turnId,
+        turnSessionId: input.turnId,
+        generationId: input.generationId,
+        generationType: input.generationType,
+        targetMessageId: input.targetMessageId ?? null,
+        targetSwipeId: input.targetSwipeId ?? null,
+        hostCorrelationId: "agentic:" + input.turnId + ":" + attemptId,
         lifecycle: "COMMIT",
         status: "waiting",
-        updatedAt: Date.now(),
+        outcome: null,
+        reason: "none",
+        ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
+        updatedAt: committedAt,
+        reconciliation: "authoritative",
+        transcript: [{
+          id: "phase:" + input.generationId + ":COMMIT",
+          kind: "milestone",
+          actor: "host",
+          recipient: "owner",
+          occurredAt: committedAt,
+          result: JSON.stringify({
+            phase: "COMMIT",
+            workPhase: "COMMIT",
+            workStatus: "waiting",
+            workOutcome: null,
+            reason: null,
+          }),
+          correlation: { parentId: "root" },
+        }],
       });
       if (!commitRecorded) throw new Error("commit_chronology_projection_missing");
       return projection;
@@ -4230,11 +4164,12 @@ function buildDependencies(): AgenticGenerationDependencies {
     phase: PersistentWorkspaceTurnSession["phase"],
     status: PersistentWorkspaceTurnSession["status"],
     outcome?: PersistentWorkspaceTurnSession["outcome"],
-  ): void => {
+    database?: Database,
+  ): PersistentWorkspaceTurnSession | null => {
     const association = persistentAssociations.get(executionId);
-    if (!association) return;
+    if (!association) return null;
     refreshPersistentAssociation(association);
-    association.session = updatePersistentWorkspaceHostTurnSession(association.authority, {
+    const update = {
       userId: association.session.userId,
       workspaceId: association.workspaceId,
       expectedRevision: association.workspaceRevision,
@@ -4242,44 +4177,12 @@ function buildDependencies(): AgenticGenerationDependencies {
       phase,
       status,
       ...(outcome === undefined ? {} : { outcome }),
-    });
-  };
-  const terminalizePersistentSession = (
-    executionId: string,
-    outcome: Exclude<PersistentWorkspaceTurnSession["outcome"], null>,
-  ): boolean => {
-    const association = persistentAssociations.get(executionId);
-    if (!association) return true;
-    if (association.session.phase === "TERMINAL" && association.session.status === "terminal") {
-      return association.session.outcome === outcome;
-    }
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        // Admission failure can race another persistent workspace mutation or
-        // chat deletion. Refresh the owner/workspace CAS immediately before
-        // each terminal attempt; the host session update itself is detached.
-        refreshPersistentAssociation(association);
-        const terminal = updatePersistentWorkspaceHostTurnSession(association.authority, {
-          userId: association.session.userId,
-          workspaceId: association.workspaceId,
-          expectedRevision: association.workspaceRevision,
-          turnSessionId: association.session.id,
-          phase: "TERMINAL",
-          status: "terminal",
-          outcome,
-        });
-        association.session = terminal;
-        return terminal.phase === "TERMINAL"
-          && terminal.status === "terminal"
-          && terminal.outcome === outcome;
-      } catch (error) {
-        const code = isRecord(error) && typeof error.code === "string" ? error.code : "internal_error";
-        if (code === "stale_revision" && attempt === 0) continue;
-        console.error(`[agentic] persistent session terminalization failed (${code})`);
-        return false;
-      }
-    }
-    return false;
+    };
+    const session = database
+      ? updatePersistentWorkspaceHostTurnSessionInTransaction(database, association.authority, update)
+      : updatePersistentWorkspaceHostTurnSession(association.authority, update);
+    if (!database) association.session = session;
+    return session;
   };
   const stopRegistrations = new Map<string, () => void>();
   const rootSignals = new Map<string, AbortSignal>();
@@ -4328,43 +4231,6 @@ function buildDependencies(): AgenticGenerationDependencies {
         if (timeout !== undefined) clearTimeout(timeout);
       }
     }
-  };
-  const ensureInspectionWriter = (event: {
-    readonly executionId: string;
-    readonly userId: string;
-    readonly chatId: string;
-    readonly target: AgenticTargetSnapshot;
-    readonly attemptLineage?: AgentWorkAttemptLineageV1;
-  }): { readonly writer: AgentInspectionWriterV1; readonly recovered: boolean } => {
-    const existing = inspectionWriters.get(event.executionId);
-    if (existing) return { writer: existing, recovered: false };
-    const lineage = event.attemptLineage;
-    const attemptId = lineage?.attemptId ?? event.executionId;
-    const writer = createAgentInspectionWriter({
-      userId: event.userId,
-      chatId: event.chatId,
-      attemptId,
-      ...(lineage?.previousAttemptId !== undefined ? { previousAttemptId: lineage.previousAttemptId } : {}),
-      runId: event.executionId,
-      turnSessionId: event.executionId,
-      generationId: event.executionId,
-      generationType: event.target.generationType,
-      targetMessageId: event.target.messageId ?? null,
-      targetSwipeId: event.target.swipeId ?? null,
-      hostCorrelationId: `agentic:${event.executionId}:${attemptId}`,
-      ...(lineage?.createdAt !== undefined ? { startedAt: lineage.createdAt } : {}),
-      reconciliation: "recovered",
-    });
-    inspectionWriters.set(event.executionId, writer);
-    writer.record("recovery", {
-      id: `recovery:writer:${event.executionId}`,
-      kind: "recovery",
-      actor: "host",
-      recipient: "owner",
-      result: JSON.stringify({ executionId: event.executionId, source: "terminal_publication" }),
-      correlation: { parentId: "root" },
-    }, { lifecycle: "ADMIT", status: "pending", reconciliation: "recovered" });
-    return { writer, recovered: true };
   };
 
   const materializeFallbackExecution = (event: CoordinatorTerminalEvent): TurnExecutionRecord | null => {
@@ -4427,7 +4293,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         ownerToken: created.ownerToken,
         expectedPhase: current.phase,
         nextPhase: "COMMIT_FAILED",
-        reason: event.errorCode ?? "terminal_publication_failed",
+        reason: event.errorCode ?? "agentic_commit_failed",
         ignoreCancellation: true,
       }).execution;
     }
@@ -4456,7 +4322,14 @@ function buildDependencies(): AgenticGenerationDependencies {
       reason: preservedDecisionRefreshCode(event.errorCode)
         ?? (event.status === "rejected"
           ? "invalid_input"
-          : event.errorCode ?? "terminal_publication_failed"),
+          : event.errorCode
+            ?? (event.status === "cancelled"
+              ? "agentic_cancelled"
+              : event.status === "timed_out"
+                ? "agentic_timed_out"
+                : event.status === "exhausted"
+                  ? "agentic_work_exhausted"
+                  : "agentic_internal_error")),
       ignoreCancellation: true,
     }).execution;
   };
@@ -4589,6 +4462,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           worldLoreSnapshotId: null, worldLoreRevision: 0, mode: "agentic", runtimeEpoch: getRuntimeEpoch(),
           deadlineAt, workspaceId: `workspace:${value.executionId}`, rootLedger: {}, frameCapabilities: {},
         });
+        executionOwnerToken = execution.ownerToken;
         const lineage = isAgentWorkAttemptLineage(value.attemptLineage)
           ? value.attemptLineage
           : execution.execution.attemptLineage;
@@ -4727,7 +4601,6 @@ function buildDependencies(): AgenticGenerationDependencies {
             { phase: "ASSEMBLE", retryable: true },
           );
         }
-        executionOwnerToken = execution.ownerToken;
         const lifecycleIdentity = {
           model: root?.model ?? "",
           ...(root?.provider ? { provider: root.provider } : {}),
@@ -4737,6 +4610,42 @@ function buildDependencies(): AgenticGenerationDependencies {
           generationType: binding.target, characterName: "", ...lifecycleIdentity,
           ...(binding.messageId ? { targetMessageId: binding.messageId } : {}),
           ...(binding.swipeId !== null ? { targetSwipeId: binding.swipeId } : {}),
+        });
+        pool.registerPoolTerminalOwner(value.executionId, {
+          tryTerminate: (reason) => {
+            const durable = getTurnExecution(value.executionId, value.userId);
+            if (!durable) return false;
+            const reasonMatches = reason === "completed"
+              ? durable.phase === "COMMITTED"
+              : reason === "stopped"
+                ? durable.phase === "CANCELLED"
+                : reason === "timeout"
+                  ? durable.phase === "TIMED_OUT"
+                  : durable.phase === "COMMIT_FAILED"
+                    || durable.phase === "TIMED_OUT"
+                    || durable.phase === "EXHAUSTED"
+                    || durable.phase === "FAILED";
+            if (!reasonMatches) return false;
+            const database = getDb();
+            const projection = database.query(
+              "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ? LIMIT 1",
+            ).get(value.userId, value.executionId) as { status?: string } | null;
+            if (projection?.status === durable.phase) return true;
+            const detachedSession = database.query(
+              "SELECT phase, status, outcome, chat_id FROM persistent_workspace_turn_sessions " +
+                "WHERE user_id = ? AND execution_id = ? LIMIT 1",
+            ).get(value.userId, value.executionId) as {
+              phase?: string;
+              status?: string;
+              outcome?: string | null;
+              chat_id?: string | null;
+            } | null;
+            return detachedSession?.chat_id === null
+              && detachedSession.phase === "TERMINAL"
+              && detachedSession.status === "terminal"
+              && detachedSession.outcome === durable.workOutcome;
+          },
+          projectTerminal: (projection) => pool.projectPoolTerminal(value.executionId, projection),
         });
         eventBus.emit(
           EventType.GENERATION_STARTED,
@@ -4899,24 +4808,12 @@ function buildDependencies(): AgenticGenerationDependencies {
         const workspaceCapabilities: WorkspaceOperationCapabilitiesV1 = {
           revision: 1, allowed: WORKSPACE_OPERATIONS, maxOperationBytes: 131_072, maxOperations: 128,
         };
-        try {
-          createTurnWorkspace({
-            userId: value.userId, chatId: value.chatId, turnId: value.executionId, workspaceId,
-            objective: "Complete the requested turn", constraints: [], retention: policy.retention,
-            ...(policy.retention === "turn_terminal" ? { ttlSeconds: WORKSPACE_MAX_TERMINAL_TTL_SECONDS } : {}),
-            quota: DEFAULT_QUOTA, capabilities: workspaceCapabilities,
-          });
-        } catch (error) {
-          const admissionOutcome = persistentAdmissionOutcomeForFailure({
-            executionId: value.executionId,
-            userId: value.userId,
-            error,
-            signals: [value.signal, rootSignal],
-            deadlineAt,
-          });
-          terminalizePersistentSession(value.executionId, admissionOutcome);
-          throw error;
-        }
+        createTurnWorkspace({
+          userId: value.userId, chatId: value.chatId, turnId: value.executionId, workspaceId,
+          objective: "Complete the requested turn", constraints: [], retention: policy.retention,
+          ...(policy.retention === "turn_terminal" ? { ttlSeconds: WORKSPACE_MAX_TERMINAL_TTL_SECONDS } : {}),
+          quota: DEFAULT_QUOTA, capabilities: workspaceCapabilities,
+        });
         caps.set(value.executionId, workspaceCapabilities);
         runtimeOwners.set(value.executionId, runtimeOwner);
         return {
@@ -4945,67 +4842,64 @@ function buildDependencies(): AgenticGenerationDependencies {
           signals: [value.signal, rootSignal],
           deadlineAt,
         });
-        const persistentSessionTerminalized = terminalizePersistentSession(value.executionId, admissionOutcome);
-        inspectionWriters.get(value.executionId)?.record("failure", {
-          id: `admit:failure:${value.executionId}`,
-          kind: "failure",
-          actor: "host",
-          recipient: "agent",
-          errorReason: error instanceof AgenticGenerationError ? inspectionReason(error.code) : "needs_attention",
-        }, {
-          lifecycle: "TERMINAL",
-          status: "terminal",
-          outcome: admissionOutcome,
-          reason: error instanceof AgenticGenerationError ? inspectionReason(error.code) : "needs_attention",
-        });
-        console.error("[agentic] createExecution failed", error);
-        const unregisterStop = stopRegistrations.get(value.executionId);
-        stopRegistrations.delete(value.executionId);
-        try {
-          unregisterStop?.();
-        } catch (unregisterError) {
-          console.error("[agentic] stop registration cleanup failed", unregisterError);
+        // Durable execution terminalization owns admission failure too. Do not
+        // publish a Turn Session, inspection, pool, or event independently;
+        // publishTerminal will converge every derived owner in one transaction.
+        if (executionOwnerToken) {
+          try {
+            let current = getTurnExecution(value.executionId, value.userId);
+            if (current && current.workStatus !== "terminal") {
+              const timedOut = isAgenticTimeout(error, [value.signal, rootSignal], deadlineAt);
+              const errorCode = error instanceof AgenticGenerationError
+                ? error.code
+                : timedOut
+                  ? "agentic_timed_out"
+                  : admissionOutcome === "stopped"
+                    ? "agentic_cancelled"
+                    : admissionOutcome === "exhausted"
+                      ? "agentic_work_exhausted"
+                      : "agentic_internal_error";
+              if (admissionOutcome === "exhausted") {
+                for (const next of ["ASSEMBLE", "WORK"] as const) {
+                  if (current.phase === next || current.workStatus === "terminal") continue;
+                  current = transitionTurnExecution({
+                    executionId: current.id,
+                    ownerToken: executionOwnerToken,
+                    expectedPhase: current.phase,
+                    nextPhase: next,
+                    ignoreCancellation: true,
+                  }).execution;
+                }
+              }
+              if (current.workStatus !== "terminal") {
+                const nextPhase = timedOut
+                  ? "TIMED_OUT"
+                  : admissionOutcome === "stopped"
+                    ? "CANCELLED"
+                    : admissionOutcome === "exhausted"
+                      ? "EXHAUSTED"
+                      : "FAILED";
+                transitionTurnExecution({
+                  executionId: current.id,
+                  ownerToken: executionOwnerToken,
+                  expectedPhase: current.phase,
+                  nextPhase,
+                  reason: errorCode,
+                  ignoreCancellation: true,
+                });
+              }
+            }
+          } catch (terminalizeError) {
+            console.error("[agentic] durable admission terminalization failed", terminalizeError);
+          }
         }
         try {
-          invalidateFrameCapabilitiesForTurn({ userId: value.userId, chatId: value.chatId, turnId: value.executionId });
-        } catch (invalidateError) {
-          console.error("[agentic] frame capability cleanup failed", invalidateError);
+          owner?.close();
+        } catch (closeError) {
+          console.error("[agentic] admission runtime owner cleanup failed", closeError);
         }
-        if (!persistentSessionTerminalized) {
-          console.error("[agentic] persistent admission session could not be terminalized");
-        }
-        persistentAssociations.delete(value.executionId);
-        caps.delete(value.executionId);
-        snapshots.delete(value.executionId);
-        mediaMaterializers.delete(value.executionId);
-        plans.delete(value.executionId);
-        works.delete(value.executionId);
-        renderFrames.delete(value.executionId);
-        renders.delete(value.executionId);
-        renderProjections.delete(value.executionId);
-        cognitionRuntimes.delete(value.executionId);
-        inspectionWriters.delete(value.executionId);
-        renderBreakdowns.delete(value.executionId);
-        workUsages.delete(value.executionId);
-        terminalUsages.delete(value.executionId);
-        bindings.delete(value.executionId);
-        childJoins.delete(value.executionId);
-        try {
-          pool.removePoolEntry(value.executionId);
-        } catch {
-          // A failed create may have occurred before the pool entry existed.
-        }
-        try {
-          requestTurnCancellation({ executionId: value.executionId, reason: "admission_failed" });
-        } catch {
-          // A failed create may have occurred before the durable row existed.
-        }
-        owner?.close();
         credentialCarrier?.clear();
-        deadlineDisposers.get(value.executionId)?.();
-        deadlineDisposers.delete(value.executionId);
-        rootSignals.delete(value.executionId);
-        rootDeadlines.delete(value.executionId);
+        console.error("[agentic] createExecution failed", error);
         throw error;
       }
     },
@@ -6278,42 +6172,77 @@ function buildDependencies(): AgenticGenerationDependencies {
       const initialExecution = getTurnExecution(event.executionId, event.userId);
       if (!initialExecution && event.attemptLineage?.previousAttemptId) return;
       const durableExecution = initialExecution ?? materializeFallbackExecution(event);
+      if (
+        !durableExecution
+        || durableExecution.id !== event.executionId
+        || durableExecution.userId !== event.userId
+        || durableExecution.chatId !== event.chatId
+        || durableExecution.generationId !== event.executionId
+        || event.target.generationType !== durableExecution.targetKind
+        || (event.target.messageId !== undefined && event.target.messageId !== durableExecution.targetMessageId)
+        || (event.target.swipeId !== undefined && event.target.swipeId !== durableExecution.targetSwipeId)
+        || (event.attemptLineage && durableExecution.attemptLineage.attemptId !== event.attemptLineage.attemptId)
+      ) {
+        throw new Error("terminal execution identity mismatch");
+      }
       const durableReceipt = durableExecution
         ? getTurnCommitReceipt(event.executionId, event.userId)
         : null;
-      const receiptForProjection = event.receipt ?? (durableReceipt
+      const receiptForProjection = durableReceipt
         ? {
             receiptId: durableReceipt.id,
+            commitKey: durableReceipt.commitKey,
             messageId: durableReceipt.messageId ?? undefined,
             swipeId: durableReceipt.swipeId ?? undefined,
             summary: durableReceipt.summary,
           }
-        : undefined);
-      const committedBoundary = durableExecution?.phase === "COMMITTED"
+        : undefined;
+      const committedBoundary = durableExecution.phase === "COMMITTED"
         && (event.receipt !== undefined || durableReceipt !== null);
-      const terminalState = coordinatorTerminalPublicationState(event, committedBoundary);
+      const terminalState = coordinatorTerminalPublicationState(durableExecution, committedBoundary);
       const status = terminalState.status;
       const committedSettlement = status === "COMMITTED"
         ? requireCommittedTerminalSettlement(event, durableReceipt)
         : null;
       const terminalOutcome = terminalState.outcome;
-      const terminalInspection = ensureInspectionWriter(event);
-      const inspectionReasonValue: AgentInspectionReasonV1 = committedBoundary && event.status !== "completed"
-        ? "reconciled"
-        : terminalInspectionReason(committedBoundary ? "completed" : event.status, event.reason, event.errorCode);
-      const terminalReason = committedBoundary && event.status !== "completed"
-        ? "reconciliation_required"
-        : inspectionReasonValue;
+      const terminalErrorCode = status === "COMMITTED"
+        ? undefined
+        : durableExecution.terminalCode
+          ?? (status === "COMMIT_FAILED"
+            ? "agentic_commit_failed"
+            : status === "CANCELLED"
+              ? "agentic_cancelled"
+              : status === "TIMED_OUT"
+                ? "agentic_timed_out"
+                : status === "EXHAUSTED"
+                  ? "agentic_work_exhausted"
+                  : "agentic_internal_error");
+      const inspectionStatus = status === "COMMITTED"
+        ? "completed"
+        : status === "COMMIT_FAILED"
+          ? "completed"
+          : status === "CANCELLED"
+            ? "cancelled"
+            : status === "TIMED_OUT"
+              ? "timed_out"
+              : status === "EXHAUSTED"
+                ? "exhausted"
+                : terminalOutcome === "rejected"
+                  ? "rejected"
+                  : "failed";
+      const inspectionReasonValue = terminalInspectionReason(
+        inspectionStatus,
+        terminalErrorCode,
+        terminalErrorCode,
+      );
+      const terminalReason = inspectionReasonValue;
       const terminalAt = Date.now();
-      const binding = bindings.get(event.executionId);
-      const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
-      const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
+      const targetMessageId = durableExecution.targetMessageId;
+      const targetSwipeId = durableExecution.targetSwipeId;
       const terminalMessageId = committedSettlement?.messageId
-        ?? event.receipt?.messageId
         ?? durableReceipt?.messageId
         ?? null;
       const terminalSwipeId = committedSettlement?.swipeId
-        ?? event.receipt?.swipeId
         ?? durableReceipt?.swipeId
         ?? null;
       const committedTargetRevisions = commitTargetRevisions.get(event.executionId);
@@ -6329,21 +6258,21 @@ function buildDependencies(): AgenticGenerationDependencies {
         chatId: event.chatId,
         turnId: event.executionId,
         generationId: event.executionId,
-        generationType: event.target.generationType,
+        generationType: durableExecution.targetKind,
         targetMessageId,
         targetSwipeId,
-        ...(event.attemptLineage ? { attemptLineage: event.attemptLineage } : {}),
+        attemptLineage: durableExecution.attemptLineage,
         status,
         workPhase: "TERMINAL",
         workStatus: "terminal",
         workOutcome: terminalOutcome,
         reason: terminalReason,
-        ...(event.errorCode || status === "COMMIT_FAILED" ? {
+        ...(terminalErrorCode || status === "COMMIT_FAILED" ? {
           error: {
-            code: preservedDecisionRefreshCode(event.errorCode)
+            code: preservedDecisionRefreshCode(terminalErrorCode)
               ?? (terminalOutcome === "rejected"
                 ? "invalid_input"
-                : event.errorCode ?? "agentic_commit_failed"),
+                : terminalErrorCode ?? "agentic_commit_failed"),
             recoveryAction: "resync",
             reason: event.errorMessage ?? terminalReason,
             workPhase: "TERMINAL",
@@ -6361,37 +6290,72 @@ function buildDependencies(): AgenticGenerationDependencies {
         },
         ...(terminalUsage ? { usage: terminalUsage } : {}),
       };
-      // Terminal reconciliation is one durable boundary. The nonterminal
-      // COMMITTING projection staged by commitAgenticTurnV1 remains mutable
-      // until both the host session CAS and terminal inspection succeed.
+      // Terminal convergence is one exact-identity durable boundary. Keep the
+      // process-local session unchanged until the enclosing transaction commits.
+      const association = persistentAssociations.get(event.executionId);
+      if (association && (
+        association.session.userId !== durableExecution.userId
+        || (association.session.chatId !== null && association.session.chatId !== durableExecution.chatId)
+        || association.session.turnId !== durableExecution.id
+        || (
+          association.session.attemptId !== durableExecution.attemptLineage.attemptId
+          && association.session.attemptId !== durableExecution.id
+        )
+        || association.session.executionId !== durableExecution.id
+      )) {
+        throw new Error("terminal Turn Session identity mismatch");
+      }
+      let committedSession: PersistentWorkspaceTurnSession | null = null;
+      const sourceDetached = association?.session.chatId === null;
       withAgentRunProjectionTransaction((db) => {
-        syncPersistentSession(event.executionId, "TERMINAL", "terminal", terminalOutcome);
-        const terminalRecorded = terminalInspection.writer.record("terminal", {
-          id: `terminal:${event.executionId}`,
-          kind: "terminal",
-          actor: "host",
-          recipient: "owner",
-          result: JSON.stringify({
-            status,
-            phase: terminalState.phase,
-            workOutcome: terminalOutcome,
-            errorCode: event.errorCode ?? null,
-            errorMessage: event.errorMessage ?? null,
-            receiptId: receiptForProjection?.receiptId ?? null,
-          }),
-          errorReason: inspectionReasonValue,
-        }, {
+        const currentExecution = getTurnExecution(event.executionId, event.userId, db);
+        if (
+          !currentExecution
+          || currentExecution.chatId !== durableExecution.chatId
+          || currentExecution.generationId !== durableExecution.generationId
+          || currentExecution.attemptLineage.attemptId !== durableExecution.attemptLineage.attemptId
+          || currentExecution.phase !== durableExecution.phase
+          || currentExecution.casRevision !== durableExecution.casRevision
+        ) {
+          throw new Error("terminal execution changed during convergence");
+        }
+        committedSession = syncPersistentSession(
+          event.executionId,
+          "TERMINAL",
+          "terminal",
+          terminalOutcome,
+          db,
+        );
+        if (sourceDetached) return;
+        const attemptId = durableExecution.attemptLineage.attemptId;
+        const inspection = persistAgentRunInspectionInTransaction(db, {
+          userId: event.userId,
+          chatId: event.chatId,
+          attemptId,
+          previousAttemptId: durableExecution.attemptLineage.previousAttemptId,
+          runId: event.executionId,
+          turnSessionId: event.executionId,
+          generationId: event.executionId,
+          generationType: durableExecution.targetKind,
+          targetMessageId,
+          targetSwipeId,
+          hostCorrelationId: "agentic:" + event.executionId + ":" + attemptId,
           lifecycle: "TERMINAL",
           status: "terminal",
           outcome: terminalOutcome,
           reason: inspectionReasonValue,
+          startedAt: durableExecution.attemptLineage.createdAt,
+          updatedAt: terminalAt,
           terminalAt,
+          reconciliation: inspectionWriters.has(event.executionId) ? "authoritative" : "recovered",
           terminalReceipt: receiptForProjection ?? null,
-          ...(terminalInspection.recovered ? { reconciliation: "recovered" as const } : {}),
         });
-        if (!terminalRecorded) throw new Error("terminal_inspection_projection_failed");
+        if (!inspection) throw new Error("terminal_inspection_projection_failed");
         return appendAgentRunSnapshot(db, projection);
       });
+      if (association && committedSession && persistentAssociations.get(event.executionId) === association) {
+        association.session = committedSession;
+      }
       const messageId = terminalMessageId ?? undefined;
       const completed = status === "COMMITTED";
       const content = committedSettlement?.content
@@ -6402,17 +6366,22 @@ function buildDependencies(): AgenticGenerationDependencies {
         ? ""
         : [
           terminalPhase,
-          event.errorCode ?? (status === "COMMIT_FAILED" ? "agentic_commit_failed" : null),
-          event.errorMessage && event.errorMessage !== event.errorCode ? event.errorMessage : null,
+          terminalErrorCode ?? (status === "COMMIT_FAILED" ? "agentic_commit_failed" : null),
+          event.errorMessage && event.errorMessage !== terminalErrorCode ? event.errorMessage : null,
         ].filter((part): part is string => typeof part === "string" && part.length > 0).join(": ");
       try {
         if (status === "CANCELLED") pool.stopPool(event.executionId);
         else if (completed) pool.completePool(event.executionId, messageId);
-        else pool.errorPool(event.executionId, diagnostic || event.errorCode || "agentic_failed");
+        else pool.errorPool(event.executionId, diagnostic || terminalErrorCode || "agentic_failed");
       } catch (error) {
         console.error("[agentic] terminal pool settlement failed", error);
       }
       try {
+        const terminalPool = pool.getPoolEntry(event.executionId);
+        if (!terminalPool || terminalPool.status === "completed" || terminalPool.status === "stopped" || terminalPool.status === "error") {
+          pool.unregisterPoolTerminalOwner(event.executionId);
+        }
+        if (sourceDetached) return;
         eventBus.emit(
           status === "CANCELLED" ? EventType.GENERATION_STOPPED : EventType.GENERATION_ENDED,
           {
@@ -6424,7 +6393,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             ...(targetSwipeId !== null ? { targetSwipeId } : {}),
             phase: terminalPhase,
             status,
-            ...(completed || !event.errorCode ? {} : { errorCode: event.errorCode }),
+            ...(completed || !terminalErrorCode ? {} : { errorCode: terminalErrorCode }),
             ...(completed || !diagnostic ? {} : { error: diagnostic }),
           },
           event.userId,
@@ -6435,182 +6404,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         console.error("[agentic] terminal event emission failed", error);
       }
     },
-    terminalPublicationFailed: (event, error) => {
-      terminalInspectionFailures.delete(event.executionId);
-      const initialExecution = getTurnExecution(event.executionId, event.userId);
-      if (!initialExecution && event.attemptLineage?.previousAttemptId) return;
-      const durableExecution = initialExecution ?? materializeFallbackExecution(event);
-      const durableReceipt = durableExecution
-        ? getTurnCommitReceipt(event.executionId, event.userId)
-        : null;
-      const committedBoundary = durableExecution?.phase === "COMMITTED"
-        && (event.receipt !== undefined || durableReceipt !== null);
-      const receiptForProjection = event.receipt ?? (durableReceipt
-        ? {
-            receiptId: durableReceipt.id,
-            messageId: durableReceipt.messageId ?? undefined,
-            swipeId: durableReceipt.swipeId ?? undefined,
-            summary: durableReceipt.summary,
-          }
-        : undefined);
-      const terminalState = coordinatorTerminalPublicationState(event, committedBoundary);
-      const terminalAt = Date.now();
-      const failureCode = "projection_unavailable";
-      const inspectionReasonValue: AgentInspectionReasonV1 = committedBoundary ? "reconciled" : inspectionReason(failureCode);
-      const terminalReason = committedBoundary ? "reconciliation_required" : failureCode;
-      const terminalOutcome = terminalState.outcome;
-      const terminalLifecycleErrorCode = terminalOutcome === "stopped"
-        ? "cancelled"
-        : terminalOutcome === "exhausted"
-          ? "limit_exceeded"
-          : preservedDecisionRefreshCode(event.errorCode)
-            ?? (terminalOutcome === "rejected"
-              ? "invalid_input"
-              : "internal_error");
-      const terminalStatus = terminalState.status;
-      const terminalPhase = terminalState.phase;
-      const terminalMessageId = event.receipt?.messageId ?? durableReceipt?.messageId ?? null;
-      const terminalSwipeId = event.receipt?.swipeId ?? durableReceipt?.swipeId ?? null;
-      let terminalInspection: { readonly writer: AgentInspectionWriterV1; readonly recovered: boolean } | undefined;
-      let terminalInspectionPersisted = false;
-      const settlePool = (): void => {
-        const diagnostic = terminalStatus === "COMMITTED"
-          ? ""
-          : [
-            terminalPhase,
-            failureCode,
-          ].filter((part): part is string => part.length > 0).join(": ");
-        try {
-          if (terminalStatus === "CANCELLED") pool.stopPool(event.executionId);
-          else if (terminalStatus === "COMMITTED") pool.completePool(event.executionId, terminalMessageId ?? undefined);
-          else pool.errorPool(event.executionId, diagnostic || failureCode);
-        } catch (poolError) {
-          console.error("[agentic] terminal failure pool reconciliation failed", poolError);
-        }
-      };
-
-      try {
-        terminalInspection = ensureInspectionWriter(event);
-        const recorded = terminalInspection.writer.record(committedBoundary ? "terminal" : "failure", {
-          id: committedBoundary
-            ? `terminal:${event.executionId}`
-            : `terminal:failure:${event.executionId}`,
-          kind: committedBoundary ? "terminal" : "failure",
-          actor: "host",
-          recipient: "owner",
-          result: JSON.stringify({
-            phase: terminalPhase,
-            status: terminalStatus,
-            workOutcome: terminalOutcome,
-            error: error instanceof Error ? error.message : String(error),
-            receiptId: receiptForProjection?.receiptId ?? null,
-          }),
-          errorReason: inspectionReasonValue,
-          correlation: { parentId: "root" },
-        }, {
-          lifecycle: "TERMINAL",
-          status: "terminal",
-          outcome: terminalOutcome,
-          reason: inspectionReasonValue,
-          updatedAt: terminalAt,
-          terminalReceipt: receiptForProjection ?? null,
-          ...(terminalInspection.recovered ? { reconciliation: "recovered" as const } : {}),
-        });
-        if (!recorded) throw new Error("terminal_failure_inspection_projection_failed");
-        terminalInspectionPersisted = true;
-      } catch (inspectionError) {
-        console.error("[agentic] terminal failure inspection reconciliation failed", inspectionError);
-      }
-      if (!terminalInspectionPersisted || !terminalInspection) {
-        terminalInspectionFailures.add(event.executionId);
-        console.error("[agentic] terminal failure recovery deferred until inspection persistence succeeds");
-        settlePool();
-        return;
-      }
-
-      let persistentSessionTerminal = false;
-      try {
-        persistentSessionTerminal = terminalizePersistentSession(event.executionId, terminalOutcome);
-      } catch (syncError) {
-        console.error("[agentic] terminal failure session reconciliation failed", syncError);
-      }
-
-      if (committedBoundary && durableExecution && durableReceipt && !persistentSessionTerminal) {
-        console.error("[agentic] committed receipt projection deferred until persistent session terminalization");
-      }
-
-      try {
-        if (committedBoundary && durableExecution && durableReceipt) {
-          if (persistentSessionTerminal) {
-            withAgentRunProjectionTransaction((db) =>
-              repairAgentRunProjectionFromReceipt(db, durableExecution!, durableReceipt, {
-                reason: terminalReason,
-                error: {
-                  code: failureCode,
-                  recoveryEligible: true,
-                  recoveryAction: "resync",
-                  workPhase: "TERMINAL",
-                  workStatus: "terminal",
-                  workOutcome: "completed",
-                  reason: terminalReason,
-                },
-              }),
-            );
-          }
-        } else if (!committedBoundary) {
-          const binding = bindings.get(event.executionId);
-          const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
-          const targetSwipeId = binding?.swipeId ?? event.target.swipeId ?? null;
-          const committedTargetRevisions = commitTargetRevisions.get(event.executionId);
-          const terminalMessageRevision = terminalMessageId === null
-            ? null
-            : committedTargetRevisions?.messageRevision ?? null;
-          const terminalSwipeRevision = terminalSwipeId === null
-            ? null
-            : committedTargetRevisions?.swipeRevision ?? terminalMessageRevision;
-          const terminalUsage = terminalUsages.get(event.executionId) ?? workUsages.get(event.executionId);
-          withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
-            userId: event.userId,
-            chatId: event.chatId,
-            turnId: event.executionId,
-            generationId: event.executionId,
-            generationType: event.target.generationType,
-            targetMessageId,
-            targetSwipeId,
-            ...(event.attemptLineage ? { attemptLineage: event.attemptLineage } : {}),
-            status: terminalStatus,
-            workPhase: "TERMINAL",
-            workStatus: "terminal",
-            workOutcome: terminalOutcome,
-            reason: terminalReason,
-            error: {
-              code: terminalLifecycleErrorCode,
-              summaryCode: `agentRun.errors.${failureCode}`,
-              recoveryEligible: true,
-              recoveryAction: "resync",
-              reason: terminalReason,
-              workPhase: "TERMINAL",
-              workStatus: "terminal",
-              workOutcome: terminalOutcome,
-            },
-            terminalHandoff: {
-              version: 2,
-              committed: false,
-              messageId: terminalMessageId,
-              swipeId: terminalSwipeId,
-              messageRevision: terminalMessageRevision,
-              swipeRevision: terminalSwipeRevision,
-            },
-            ...(terminalUsage ? { usage: terminalUsage } : {}),
-          }));
-        }
-      } catch (reconciliationError) {
-        console.error("[agentic] terminal failure projection reconciliation failed", reconciliationError);
-      }
-
-      settlePool();
-    },
-    cleanup: ({ execution, executionId, phase, status }) => {
+    cleanup: ({ execution, executionId }) => {
       const id = execution?.id ?? executionId;
       if (!id) return;
       const runtimeExecution = execution && isRuntimeExecution(execution) ? execution : undefined;
@@ -6641,53 +6435,9 @@ function buildDependencies(): AgenticGenerationDependencies {
       } catch (error) {
         console.error("[agentic] stop registration cleanup failed", error);
       }
-      const deferTerminalRecovery = terminalInspectionFailures.delete(id);
-      const persistentAssociation = persistentAssociations.get(id);
-      const cleanupOutcome: Exclude<PersistentWorkspaceTurnSession["outcome"], null> =
-        status === "timed_out" || phase === "TIMED_OUT"
-          ? "failed"
-          : status === "exhausted" || phase === "EXHAUSTED"
-            ? "exhausted"
-            : status === "completed" || phase === "COMMITTED"
-              ? "completed"
-              : status === "cancelled" || phase === "CANCELLED"
-                ? "stopped"
-                : status === "rejected"
-                  ? "rejected"
-                  : "failed";
-      if (persistentAssociation) {
-        if (deferTerminalRecovery) {
-          console.error("[agentic] persistent session cleanup deferred until terminal inspection recovery");
-        } else {
-          const terminal = persistentAssociation.session.phase === "TERMINAL"
-            && persistentAssociation.session.status === "terminal"
-            && persistentAssociation.session.outcome === cleanupOutcome;
-          const terminalized = terminal || terminalizePersistentSession(id, cleanupOutcome);
-          if (!terminalized) {
-            console.error("[agentic] persistent session cleanup reconciliation failed");
-            try {
-              inspectionWriters.get(id)?.record("failure", {
-                id: `cleanup:failure:${id}`,
-                kind: "failure",
-                actor: "host",
-                recipient: "owner",
-                errorReason: "needs_attention",
-                correlation: { parentId: "root" },
-              }, {
-                lifecycle: "TERMINAL",
-                status: "terminal",
-                outcome: "failed",
-                reason: "needs_attention",
-              });
-            } catch (error) {
-              console.error("[agentic] persistent session cleanup inspection failed", error);
-            }
-          }
-        }
-        // A failed CAS must not retain process-local authority or fabricate
-        // success by retrying after cleanup has released the execution.
-        persistentAssociations.delete(id);
-      }
+      // Durable convergence owns terminalization. Cleanup only releases the
+      // process-local association; it must never publish a partial terminal.
+      persistentAssociations.delete(id);
       snapshots.delete(id);
       mediaMaterializers.delete(id);
       cognitionRuntimes.delete(id);

@@ -116,6 +116,19 @@ creates no attempt, projection, or terminal publication.
    failure, or exhaustion before that boundary produces a terminal outcome
    without an authoritative chat write.
 
+The immutable execution row is terminal cause authority. Terminal publication
+then uses one exact-identity transaction for the persistent Turn Session,
+inspection attempt, Agent Run projection, compatibility activity, and terminal
+outbox. Only after that transaction commits may the Agentic pool or compatibility
+websocket event become terminal. If convergence is interrupted, the original
+WORK/COMMIT cause remains unchanged and startup or exact dormant Stop repairs
+the durable owner surfaces idempotently without replaying provider work.
+This includes failures after durable admission but before workspace setup
+finishes. Cleanup releases process resources only. When source-chat deletion
+has already removed every chat-owned projection, recovery converges the
+surviving detached Turn Session from the terminal execution and emits no chat
+event.
+
 Internally, after WORK completes and freezes, the orchestrator enters
 `COMPLETE`, enters `RENDER` and calls `render()`, then enters its internal
 `PREPARE_COMMIT` state and calls `prepareRender()` before `commit()`.

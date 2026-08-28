@@ -384,94 +384,44 @@ describe("agentic generation orchestration", () => {
     expect(log).toContain("cleanup");
   });
 
-  test("terminal projection failure surfaces retryable projection_unavailable", async () => {
-    const terminalEvents: string[] = [];
+  test("terminal convergence failure does not invent a projection cause for committed success", async () => {
     const started = await runAgenticGeneration(input(), dependencies([], {
       publishTerminal: () => {
         throw new Error("projection schema failure");
       },
-      terminalPublicationFailed: (event) => {
-        terminalEvents.push(`${event.status}:${event.phase}:${event.errorCode}:${event.retryable}`);
-      },
     }));
-    const result = await settle(started.generationId) as {
-      status: string;
-      phase: string;
-      errorCode?: string;
-      retryable?: boolean;
-    };
+    const result = await settle(started.generationId) as Record<string, unknown>;
     expect(result).toMatchObject({
       status: "completed",
       phase: "COMMITTED",
-      reason: "reconciliation_required",
-      errorCode: "projection_unavailable",
-      retryable: true,
+      workOutcome: "completed",
     });
-    expect(terminalEvents).toEqual(["completed:COMMITTED:projection_unavailable:true"]);
-  });
-  test("terminal publication failure preserves a timed-out result with retryable projection error", async () => {
-    const terminalEvents: string[] = [];
-    const started = await runAgenticGeneration(input(), dependencies([], {
-      readExecutionPhase: () => "TIMED_OUT",
-      runWork: async () => ({ status: "timed_out", errorCode: "agentic_timed_out" }),
-      publishTerminal: () => {
-        throw new Error("projection schema failure");
-      },
-      terminalPublicationFailed: (event) => {
-        terminalEvents.push(`${event.status}:${event.phase}:${event.workOutcome}:${event.errorCode}:${event.retryable}`);
-      },
-    }));
-    const result = await settle(started.generationId) as {
-      status: string;
-      phase: string;
-      workOutcome: string;
-      errorCode?: string;
-      retryable?: boolean;
-    };
-    expect(result).toMatchObject({
-      status: "timed_out",
-      phase: "TIMED_OUT",
-      workOutcome: "failed",
-      errorCode: "projection_unavailable",
-      retryable: true,
-    });
-    expect(terminalEvents).toEqual(["timed_out:TIMED_OUT:failed:projection_unavailable:true"]);
+    expect(result).not.toHaveProperty("errorCode", "projection_unavailable");
+    expect(result).not.toHaveProperty("reason", "reconciliation_required");
   });
 
-  test("terminal publication failure preserves stopped and exhausted durable truth", async () => {
+  test("terminal convergence failure preserves each durable noncommit cause", async () => {
     const cases = [
+      { status: "timed_out", phase: "TIMED_OUT", code: "agentic_timed_out", outcome: "failed" },
       { status: "cancelled", phase: "CANCELLED", code: "agentic_cancelled", outcome: "stopped" },
       { status: "exhausted", phase: "EXHAUSTED", code: "agentic_work_exhausted", outcome: "exhausted" },
     ] as const;
     for (const terminalCase of cases) {
-      const terminalEvents: string[] = [];
       const started = await runAgenticGeneration(input(), dependencies([], {
         readExecutionPhase: () => terminalCase.phase,
         runWork: async () => ({ status: terminalCase.status, errorCode: terminalCase.code }),
         publishTerminal: () => {
           throw new Error("projection schema failure");
         },
-        terminalPublicationFailed: (event) => {
-          terminalEvents.push(`${event.status}:${event.phase}:${event.workOutcome}:${event.errorCode}:${event.retryable}`);
-        },
       }));
-      const result = await settle(started.generationId) as {
-        status: string;
-        phase: string;
-        workOutcome: string;
-        errorCode?: string;
-        retryable?: boolean;
-      };
+      const result = await settle(started.generationId) as Record<string, unknown>;
       expect(result).toMatchObject({
         status: terminalCase.status,
         phase: terminalCase.phase,
         workOutcome: terminalCase.outcome,
-        errorCode: "projection_unavailable",
-        retryable: true,
+        errorCode: terminalCase.code,
       });
-      expect(terminalEvents).toEqual([
-        `${terminalCase.status}:${terminalCase.phase}:${terminalCase.outcome}:projection_unavailable:true`,
-      ]);
+      expect(result.errorCode).not.toBe("projection_unavailable");
     }
   });
 

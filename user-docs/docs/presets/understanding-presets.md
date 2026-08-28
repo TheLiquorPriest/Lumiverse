@@ -199,6 +199,11 @@ Private WORK retrieval does not automatically cross into tools-disabled **RENDER
 
 After an Agentic response or swipe, the message can show an **Agentic run** strip. Open it for **Agent activity**, with an **Activity Tree** and a sibling **Workspace** tab. The tree can show safe phase chronology, root/provider/child/tool labels, status, elapsed duration, bounded token/tool/child counts, continuation mode, omissions, and a localized terminal reason. On reconnect it keeps the last known tree while the connection recovers; it does not infer failure from silence.
 
+A terminal label keeps the run's actual cause (for example provider failure,
+Stop, timeout, or exhausted budget). Reconnect recovery repairs the run's
+status surfaces together; it does not replace that cause with a generic
+projection error or show a terminal chat head before the durable run settles.
+
 The public projection is status-only. It never exposes prompts, work prose, child results, tool arguments or retrieval data, provider messages, credentials, raw reasoning, or continuation carriers. Separate owner-only inspection may retain a bounded WORK transcript, provider content, private child material, and tool arguments/results. Retention is subject to host limits and explicit omission markers; raw private reasoning and opaque continuation carriers are not promised. None of this becomes public activity or canonical response content.
 For a Response turn, unified owner inspection remains the evidence surface for this boundary. It explains routes and order, conditions, exact source identities and preset/block revisions, hashes when recorded, one effective copy for each destination-level overlap plus every retained role/reason/overlap outcome, omissions, custom-phase and child-subset receipts, accepted crossings, and tools/delegation. If evidence is unavailable, inspection says so; it is never inferred.
 

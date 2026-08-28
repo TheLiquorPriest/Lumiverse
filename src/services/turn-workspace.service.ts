@@ -3596,8 +3596,10 @@ function persistentWorkspaceSnapshot(workspace: PersistentWorkspaceRow): Persist
   });
 }
 
-function persistentWorkspaceUsage(workspace: PersistentWorkspaceRow): PersistentWorkspaceUsageV1 {
-  const database = getDb();
+function persistentWorkspaceUsage(
+  workspace: PersistentWorkspaceRow,
+  database: Database = getDb(),
+): PersistentWorkspaceUsageV1 {
   const requiredTables = [
     "persistent_workspace_tasks",
     "persistent_workspace_records",
@@ -3636,14 +3638,16 @@ function persistentWorkspaceUsage(workspace: PersistentWorkspaceRow): Persistent
       + bytes("persistent_workspace_publications", ["byte_count"]),
   });
 }
-function persistentRefreshedWorkspace(workspace: PersistentWorkspaceRow): PersistentWorkspaceRow {
-  const database = getDb();
+function persistentRefreshedWorkspace(
+  workspace: PersistentWorkspaceRow,
+  database: Database = getDb(),
+): PersistentWorkspaceRow {
   const raw = database.query(
     "SELECT * FROM persistent_workspaces WHERE workspace_id = ? AND user_id = ?",
   ).get(workspace.id, workspace.userId) as Record<string, unknown> | null;
   if (!raw) persistentFail("not_found", "persistent workspace was not found");
   const current = persistentWorkspaceFromRow(raw);
-  const usage = persistentWorkspaceUsage(current);
+  const usage = persistentWorkspaceUsage(current, database);
   return { ...current, usage };
 }
  
@@ -4215,8 +4219,20 @@ export function updatePersistentWorkspaceHostTurnSession(
   authorityRaw: unknown,
   raw: unknown,
 ): PersistentWorkspaceTurnSession {
+  return updatePersistentWorkspaceHostTurnSessionInTransaction(getDb(), authorityRaw, raw);
+}
+
+/**
+ * Transaction-aware host transition used when the Turn Session must converge
+ * with its execution, inspection attempt, and Agent Run projection atomically.
+ */
+export function updatePersistentWorkspaceHostTurnSessionInTransaction(
+  database: Database,
+  authorityRaw: unknown,
+  raw: unknown,
+): PersistentWorkspaceTurnSession {
   requirePersistentWorkspaceHostAuthority(authorityRaw);
-  return updatePersistentWorkspaceTurnSession(raw);
+  return updatePersistentWorkspaceTurnSession(database, raw);
 }
 
 /**
@@ -4383,14 +4399,16 @@ function validatePersistentSessionUpdate(value: unknown): PersistentWorkspaceHos
   });
 }
 
-function updatePersistentWorkspaceTurnSession(raw: unknown): PersistentWorkspaceTurnSession {
+function updatePersistentWorkspaceTurnSession(
+  database: Database,
+  raw: unknown,
+): PersistentWorkspaceTurnSession {
   const input = validatePersistentSessionUpdate(raw);
-  const database = getDb();
   const workspaceRaw = database.query(
     "SELECT * FROM persistent_workspaces WHERE workspace_id = ? AND user_id = ? LIMIT 1",
   ).get(input.workspaceId, input.userId) as Record<string, unknown> | null;
   if (!workspaceRaw) persistentFail("not_found", "persistent workspace was not found");
-  const workspace = persistentRefreshedWorkspace(persistentWorkspaceFromRow(workspaceRaw));
+  const workspace = persistentRefreshedWorkspace(persistentWorkspaceFromRow(workspaceRaw), database);
   const current = database.query(
     `SELECT * FROM persistent_workspace_turn_sessions
       WHERE turn_session_id = ? AND workspace_id = ? AND user_id = ? LIMIT 1`,

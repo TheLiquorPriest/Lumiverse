@@ -3333,12 +3333,109 @@ function terminalRecoveryTablesAvailable(db: Database): boolean {
     && hasTable(db, "agent_run_projections")
     && hasTable(db, "agent_chat_events");
 }
+interface TerminalPersistentSessionRow {
+  readonly phase: string;
+  readonly status: string;
+  readonly outcome: string | null;
+  readonly revision: number;
+  readonly attemptId: string;
+  readonly chatId: string | null;
+}
+
+function terminalPersistentSessionRow(
+  db: Database,
+  execution: TurnExecutionRecord,
+): TerminalPersistentSessionRow | null {
+  if (!hasTable(db, "persistent_workspace_turn_sessions")) return null;
+  const row = db.query(
+    "SELECT phase, status, outcome, revision, attempt_id AS attemptId, chat_id AS chatId FROM persistent_workspace_turn_sessions " +
+      "WHERE user_id = ? AND turn_id = ? AND execution_id = ? LIMIT 1",
+  ).get(
+    execution.userId,
+    execution.id,
+    execution.id,
+  ) as TerminalPersistentSessionRow | null;
+  if (row && row.attemptId !== execution.attemptLineage.attemptId && row.attemptId !== execution.id) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal Turn Session attempt identity conflicts with the execution");
+  }
+  return row;
+}
+
+function persistentSessionMatchesTerminalExecution(
+  row: TerminalPersistentSessionRow | null,
+  outcome: AgentInspectionOutcomeV1,
+): boolean {
+  if (!row) return true;
+  if (row.phase !== "TERMINAL" && row.status !== "terminal") return false;
+  if (row.phase !== "TERMINAL" || row.status !== "terminal" || row.outcome !== outcome) {
+    throw new TurnExecutionError("invalid_execution_input", "terminal Turn Session conflicts with the execution");
+  }
+  return true;
+}
+
+function persistRecoveredTerminalSession(
+  db: Database,
+  execution: TurnExecutionRecord,
+  row: TerminalPersistentSessionRow | null,
+  outcome: AgentInspectionOutcomeV1,
+  reason: string,
+): void {
+  if (!row) return;
+  const terminalAt = Math.floor(Date.now() / 1000);
+  const changed = db.query(
+    "UPDATE persistent_workspace_turn_sessions " +
+      "SET phase = 'TERMINAL', status = 'terminal', outcome = ?, reason = ?, revision = revision + 1, updated_at = ?, terminal_at = ? " +
+      "WHERE user_id = ? AND turn_id = ? AND attempt_id = ? AND execution_id = ? AND revision = ?",
+  ).run(
+    outcome,
+    reason,
+    terminalAt,
+    terminalAt,
+    execution.userId,
+    execution.id,
+    row.attemptId,
+    execution.id,
+    row.revision,
+  ).changes;
+  if (changed !== 1) {
+    throw new TurnExecutionError("stale_execution", "terminal Turn Session changed during recovery", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+}
+function reconcileCommittedPersistentSession(
+  db: Database,
+  execution: TurnExecutionRecord,
+): void {
+  const row = terminalPersistentSessionRow(db, execution);
+  if (persistentSessionMatchesTerminalExecution(row, "completed")) return;
+  persistRecoveredTerminalSession(db, execution, row, "completed", "completed");
+}
 
 function reconcileTerminalExecutionProjection(
   db: Database,
   execution: TurnExecutionRecord,
 ): boolean {
   if (!isNoncommittedTerminalPhase(execution.phase)) return false;
+  const persistentSession = terminalPersistentSessionRow(db, execution);
+  if (persistentSession?.chatId === null) {
+    const outcome = terminalRecoveryOutcome(execution);
+    const reason = terminalRecoveryReason(execution, terminalInspectionReasonForExecution(execution), outcome);
+    const persistentSessionExact = persistentSessionMatchesTerminalExecution(persistentSession, outcome);
+    if (persistentSessionExact) return false;
+    db.transaction(() => {
+      const latest = requireExecution(db, execution.id).execution;
+      if (latest.phase !== execution.phase || latest.casRevision !== execution.casRevision) {
+        throw new TurnExecutionError("stale_execution", "terminal execution changed during detached session recovery", {
+          executionId: execution.id,
+          phase: execution.phase,
+        });
+      }
+      persistRecoveredTerminalSession(db, latest, persistentSession, outcome, reason);
+    })();
+    return true;
+  }
   if (!terminalRecoveryTablesAvailable(db)) return false;
   const attempt = execution.attemptLineage;
   const inspectionRow = db.query(
@@ -3362,7 +3459,8 @@ function reconcileTerminalExecutionProjection(
     resolution.projectionTarget,
     resolution.legacyDecisionRefreshOutcomeRepair,
   );
-  if (resolution.inspectionExact && projectionExact) return false;
+  const persistentSessionExact = persistentSessionMatchesTerminalExecution(persistentSession, resolution.outcome);
+  if (resolution.inspectionExact && projectionExact && persistentSessionExact) return false;
   db.transaction(() => {
     const latest = requireExecution(db, execution.id).execution;
     if (latest.phase !== execution.phase || latest.casRevision !== execution.casRevision) {
@@ -3370,6 +3468,9 @@ function reconcileTerminalExecutionProjection(
         executionId: execution.id,
         phase: execution.phase,
       });
+    }
+    if (!persistentSessionExact) {
+      persistRecoveredTerminalSession(db, latest, persistentSession, resolution.outcome, resolution.projectionReason);
     }
     if (!resolution.inspectionExact) persistRecoveredTerminalInspection(db, latest, resolution);
     if (!projectionExact) appendRecoveredTerminalProjection(db, latest, resolution, !resolution.inspectionExact);
@@ -3930,6 +4031,7 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
             try {
               db.transaction(() => {
                 const latest = requireExecution(db, current.id).execution;
+                reconcileCommittedPersistentSession(db, latest);
                 invokeReceiptRepair(
                   normalizedReceiptExecution(db, latest, receipt),
                   receipt,
@@ -4041,6 +4143,7 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
           db.transaction(() => {
             const latest = requireExecution(db, claimed.id).execution;
             const repaired = repairCommittedFromReceipt(db, latest, receipt, ownerToken, now, false);
+            reconcileCommittedPersistentSession(db, repaired);
             invokeReceiptRepair(repaired, receipt);
           })();
           result.committedFromReceipt++;
