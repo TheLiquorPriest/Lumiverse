@@ -180,17 +180,32 @@ function ensureSystemPrincipalRow(): void {
   ).run(now, now, SYSTEM_SECRET_PRINCIPAL);
 }
 
-export async function putSecret(userId: string, key: string, value: string): Promise<void> {
-  if (userId === SYSTEM_SECRET_PRINCIPAL) ensureSystemPrincipalRow();
-  const { encrypted, iv, tag } = await encrypt(value);
-  const now = Math.floor(Date.now() / 1000);
+export interface PreparedSecretWrite {
+  encrypted: string;
+  iv: string;
+  tag: string;
+  updatedAt: number;
+}
 
+/** Encrypt a secret before entering a synchronous SQLite transaction. */
+export async function prepareSecretWrite(value: string): Promise<PreparedSecretWrite> {
+  const { encrypted, iv, tag } = await encrypt(value);
+  return { encrypted, iv, tag, updatedAt: Math.floor(Date.now() / 1000) };
+}
+
+/** Persist a prepared secret on the caller's current SQLite transaction. */
+export function putPreparedSecret(userId: string, key: string, prepared: PreparedSecretWrite): void {
+  if (userId === SYSTEM_SECRET_PRINCIPAL) ensureSystemPrincipalRow();
   getDb()
     .query(
       `INSERT INTO secrets (key, encrypted_value, iv, tag, user_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(key, user_id) DO UPDATE SET encrypted_value = excluded.encrypted_value, iv = excluded.iv, tag = excluded.tag, updated_at = excluded.updated_at`
+       ON CONFLICT(key, user_id) DO UPDATE SET encrypted_value = excluded.encrypted_value, iv = excluded.iv, tag = excluded.tag, updated_at = excluded.updated_at`,
     )
-    .run(key, encrypted, iv, tag, userId, now);
+    .run(key, prepared.encrypted, prepared.iv, prepared.tag, userId, prepared.updatedAt);
+}
+
+export async function putSecret(userId: string, key: string, value: string): Promise<void> {
+  putPreparedSecret(userId, key, await prepareSecretWrite(value));
 }
 
 export async function getSecret(userId: string, key: string): Promise<string | null> {

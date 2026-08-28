@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import * as imageGenConnSvc from "../services/image-gen-connections.service";
 import { imageGenConnectionSecretKey } from "../services/image-gen-connections.service";
 import * as settingsSvc from "../services/settings.service";
 import { getSecret, listSecretKeys, putSecret } from "../services/secrets.service";
+import * as secretsSvc from "../services/secrets.service";
 import {
   startImport,
   submitTicket,
@@ -46,10 +47,14 @@ function seedUser(userId: string): void {
     .run(userId, userId, `${userId}@example.test`);
 }
 
-function seedLegacySettings(userId: string, activeConnectionId?: string): void {
+function seedLegacySettings(
+  userId: string,
+  activeConnectionId?: string,
+  provider: "nanogpt" | "novelai" = "novelai",
+): void {
   settingsSvc.putSetting(userId, "imageGeneration", {
     enabled: true,
-    provider: "novelai",
+    provider,
     activeImageGenConnectionId: activeConnectionId ?? null,
     nanogpt: {
       apiKey: NANO_SECRET,
@@ -68,6 +73,39 @@ function seedLegacySettings(userId: string, activeConnectionId?: string): void {
       JSON.stringify({ wrapper: { novelai: { apiKey: NOVEL_SECRET, marker: "encoded-novel" } } }),
     ],
   });
+}
+
+function rejectLaterLegacyProvider(): void {
+  getDb().run(
+    "CREATE TRIGGER reject_second_legacy_provider "
+      + "BEFORE INSERT ON image_gen_connections "
+      + "WHEN NEW.provider = 'novelai' "
+      + "BEGIN SELECT RAISE(ABORT, 'forced later-provider failure'); END",
+  );
+}
+
+async function requestSecretExportPreparation(): Promise<Response> {
+  return await app.request(
+    "http://localhost/api/v1/user-data/export/prepare",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-test-user": SOURCE_USER },
+      body: JSON.stringify({ includeSecrets: true, includeVectors: false }),
+    },
+  );
+}
+
+async function expectRetainedNanoPair(settingsBefore: unknown): Promise<void> {
+  const connections = imageGenConnSvc.listConnections(SOURCE_USER, { limit: 20, offset: 0 });
+  expect(connections.total).toBe(1);
+  const nano = connections.data[0]!;
+  expect(nano).toMatchObject({ provider: "nanogpt", has_api_key: true, is_default: true });
+  const secretKey = imageGenConnectionSecretKey(nano.id);
+  expect(listSecretKeys(SOURCE_USER)).toEqual([secretKey]);
+  expect(await getSecret(SOURCE_USER, secretKey)).toBe(NANO_SECRET);
+  expect(imageGenConnSvc.getDefaultConnection(SOURCE_USER)?.id).toBe(nano.id);
+  expect(settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value).toEqual(settingsBefore);
+  expect(prepareCacheSize()).toBe(0);
 }
 
 
@@ -526,6 +564,72 @@ describe("legacy image credentials at user-data ticket preparation", () => {
     expect(listSecretKeys(SOURCE_USER)).toEqual([]);
     expect(settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value).toEqual(settingsBefore);
     expect(prepareCacheSize()).toBe(0);
+  });
+
+  test("rollback database failure retains a complete staged pair and plaintext", async () => {
+    seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
+    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+    rejectLaterLegacyProvider();
+    getDb().run(
+      "CREATE TRIGGER reject_compensation_profile_delete "
+        + "BEFORE DELETE ON image_gen_connections "
+        + "WHEN OLD.provider = 'nanogpt' "
+        + "BEGIN SELECT RAISE(ABORT, 'forced compensation database failure'); END",
+    );
+
+    const response = await requestSecretExportPreparation();
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining("staged profile-secret pairs and plaintext settings were retained"),
+    });
+    await expectRetainedNanoPair(settingsBefore);
+  });
+
+  test("secret deletion failure retains a complete staged pair and plaintext", async () => {
+    seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
+    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+    rejectLaterLegacyProvider();
+    const deleteSpy = spyOn(secretsSvc, "deleteSecret").mockImplementation(() => {
+      throw new Error("forced compensation secret deletion failure");
+    });
+
+    let response: Response;
+    try {
+      response = await requestSecretExportPreparation();
+    } finally {
+      deleteSpy.mockRestore();
+    }
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining("staged profile-secret pairs and plaintext settings were retained"),
+    });
+    await expectRetainedNanoPair(settingsBefore);
+  });
+
+  test("combined secret mutation and rollback trigger still retain the paired staged state", async () => {
+    seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
+    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+    rejectLaterLegacyProvider();
+    getDb().run(
+      "CREATE TRIGGER reject_combined_profile_delete "
+        + "BEFORE DELETE ON image_gen_connections "
+        + "WHEN OLD.provider = 'nanogpt' "
+        + "BEGIN SELECT RAISE(ABORT, 'forced combined rollback failure'); END",
+    );
+    const originalDeleteSecret = secretsSvc.deleteSecret;
+    const deleteSpy = spyOn(secretsSvc, "deleteSecret").mockImplementation((userId, key) => {
+      originalDeleteSecret(userId, key);
+      throw new Error("forced failure after secret deletion");
+    });
+
+    let response: Response;
+    try {
+      response = await requestSecretExportPreparation();
+    } finally {
+      deleteSpy.mockRestore();
+    }
+    expect(response.status).toBe(500);
+    await expectRetainedNanoPair(settingsBefore);
   });
 
   test("connection mutation serialization is same-owner keyed rather than global", async () => {

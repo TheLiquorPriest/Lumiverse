@@ -21,6 +21,12 @@ import {
   worldBookVectorSettingsFingerprint,
 } from "./world-book-vector-state";
 import { loadWorldBookVectorSettings } from "./world-book-vector-settings.service";
+import { trackChatChunkMaintenance } from "./chat-chunk-maintenance.service";
+
+interface MaintenanceSettlement {
+  resolve: () => void;
+  reject: (reason?: unknown) => void;
+}
 
 interface VectorizationJob {
   type: "chunk" | "world_book_entry";
@@ -31,7 +37,12 @@ interface VectorizationJob {
   worldBookEntryId?: string;
   supersedesIndexed?: boolean;
   queuedAt: number;
+  settlements?: MaintenanceSettlement[];
 }
+
+let chatChunkBatchProcessorOverride:
+  | ((tasks: ChatChunkVectorizationTask[]) => Promise<ChatChunkVectorizationBatchResult>)
+  | null = null;
 
 const WORLD_BOOK_SWEEP_INTERVAL_MS = 60_000;
 const WORLD_BOOK_SWEEP_LIMIT_PER_USER = 100;
@@ -59,6 +70,17 @@ function normalizeWorldBookVectorIndexStatus(row: any): WorldBookVectorIndexStat
 function mergeVectorizationJobs(existing: VectorizationJob, incoming: VectorizationJob): void {
   existing.priority = Math.max(existing.priority, incoming.priority);
   existing.supersedesIndexed = !!(existing.supersedesIndexed || incoming.supersedesIndexed);
+  if (incoming.settlements?.length) {
+    existing.settlements = [...(existing.settlements ?? []), ...incoming.settlements];
+  }
+}
+
+function resolveVectorizationJob(job: VectorizationJob): void {
+  for (const settlement of job.settlements ?? []) settlement.resolve();
+}
+
+function rejectVectorizationJob(job: VectorizationJob, reason: unknown): void {
+  for (const settlement of job.settlements ?? []) settlement.reject(reason);
 }
 
 function remainingWorldBookSettleMs(queuedAt: number, now: number): number {
@@ -246,10 +268,14 @@ class VectorizationQueue {
           chatId: job.chatId,
           chunkId: job.chunkId,
         }));
-      if (tasks.length === 0) return;
+      if (tasks.length !== jobs.length) {
+        throw new Error("Chunk vectorization queue contained a job without a chunk id");
+      }
 
       let result: ChatChunkVectorizationBatchResult;
-      if (canUseChatChunkVectorizationSubprocess()) {
+      if (chatChunkBatchProcessorOverride) {
+        result = await chatChunkBatchProcessorOverride(tasks);
+      } else if (canUseChatChunkVectorizationSubprocess()) {
         try {
           result = await processChatChunkVectorizationBatchInSubprocess(tasks);
         } catch (err) {
@@ -264,14 +290,22 @@ class VectorizationQueue {
 
       const failedChunkIds = new Set(result.failedChunkIds);
 
-      for (const job of jobs) {
-        if (job.chunkId && failedChunkIds.has(job.chunkId) && job.priority > 0) {
-          this.add({ ...job, priority: job.priority - 1 });
-        }
-      }
-
       for (const chatId of result.refreshedChatIds) {
         scheduleChatMemoryRefresh(jobs[0].userId, chatId, 7);
+      }
+
+      for (const job of jobs) {
+        if (job.chunkId && failedChunkIds.has(job.chunkId)) {
+          if (job.priority > 0) {
+            this.add({ ...job, priority: job.priority - 1 });
+          } else {
+            const failure = new Error(`Chunk vectorization failed after retries: ${job.chunkId}`);
+            console.error("[vectorization] Terminal chunk failure:", failure);
+            rejectVectorizationJob(job, failure);
+          }
+        } else {
+          resolveVectorizationJob(job);
+        }
       }
 
       if (result.processedCount > 0) {
@@ -282,6 +316,8 @@ class VectorizationQueue {
       for (const job of jobs) {
         if (job.priority > 0) {
           this.add({ ...job, priority: job.priority - 1 });
+        } else {
+          rejectVectorizationJob(job, err);
         }
       }
     }
@@ -358,7 +394,9 @@ class VectorizationQueue {
 
 const queue = new VectorizationQueue();
 
-export function queueChunkVectorization(userId: string, chatId: string, chunkId: string, priority = 5) {
+export function queueChunkVectorization(userId: string, chatId: string, chunkId: string, priority = 5): void {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  void trackChatChunkMaintenance(chatId, promise);
   queue.add({
     type: "chunk",
     priority,
@@ -366,6 +404,7 @@ export function queueChunkVectorization(userId: string, chatId: string, chunkId:
     chatId,
     chunkId,
     queuedAt: Date.now(),
+    settlements: [{ resolve, reject }],
   });
 }
 
@@ -483,6 +522,11 @@ export const __test__ = {
   worldBookJobsHaveSettled,
   remainingWorldBookSettleMs,
   nextProcessDelayMs,
+  setChatChunkBatchProcessor(
+    processor: ((tasks: ChatChunkVectorizationTask[]) => Promise<ChatChunkVectorizationBatchResult>) | null,
+  ): void {
+    chatChunkBatchProcessorOverride = processor;
+  },
 };
 
 /**

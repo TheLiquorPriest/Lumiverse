@@ -25,6 +25,10 @@ import * as memoryCortex from "./memory-cortex";
 import * as regexScriptsSvc from "./regex-scripts.service";
 import { removePoolEntriesForChat } from "./generation-pool.service";
 import { invalidateChatMemoryCache, refreshChatMemoryCache } from "./chat-memory-cache.service";
+import {
+  trackChatChunkMaintenance,
+  waitForChatChunkMaintenance as waitForTrackedChatChunkMaintenance,
+} from "./chat-chunk-maintenance.service";
 import { enqueueChatPipelineTask } from "./chat-pipeline-coordinator.service";
 import { getReasoningStripOptions } from "../utils/reasoning-strip";
 import { buildEnv, type MacroEnv } from "../macros";
@@ -4876,51 +4880,11 @@ function snapshotSalienceForChunks(chatId: string, chunkIds: string[]): Map<stri
 }
 
 /**
- * Tracks every launched chunk mutation until its complete async lifecycle has
- * settled. Callers can use the barrier before replacing or closing the backing
- * database, rather than racing fire-and-forget message maintenance.
- */
-const _chatChunkMaintenanceInflight = new Map<string, Set<Promise<void>>>();
-
-function trackChatChunkMaintenance(chatId: string, task: Promise<void>): Promise<void> {
-  let tasks = _chatChunkMaintenanceInflight.get(chatId);
-  if (!tasks) {
-    tasks = new Set();
-    _chatChunkMaintenanceInflight.set(chatId, tasks);
-  }
-  tasks.add(task);
-
-  const removeTask = () => {
-    const current = _chatChunkMaintenanceInflight.get(chatId);
-    if (!current) return;
-    current.delete(task);
-    if (current.size === 0) _chatChunkMaintenanceInflight.delete(chatId);
-  };
-  void task.then(removeTask, removeTask);
-  return task;
-}
-
-/**
  * Wait for launched chunk updates and rebuilds to quiesce. Omitting chatId
  * drains all chats, which is required before replacing the process database.
  */
-export async function waitForChatChunkMaintenance(chatId?: string): Promise<void> {
-  const failures: unknown[] = [];
-  while (true) {
-    const tasks = chatId === undefined
-      ? [..._chatChunkMaintenanceInflight.values()].flatMap(current => [...current])
-      : [...(_chatChunkMaintenanceInflight.get(chatId) ?? [])];
-    if (tasks.length === 0) break;
-    const results = await Promise.allSettled(tasks);
-    for (const result of results) {
-      if (result.status === "rejected") failures.push(result.reason);
-    }
-  }
-
-  if (failures.length === 1) throw failures[0];
-  if (failures.length > 1) {
-    throw new AggregateError(failures, "Chat chunk maintenance failed");
-  }
+export function waitForChatChunkMaintenance(chatId?: string): Promise<void> {
+  return waitForTrackedChatChunkMaintenance(chatId);
 }
 
 /**

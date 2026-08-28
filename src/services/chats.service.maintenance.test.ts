@@ -7,6 +7,7 @@ import * as embeddingsSvc from "./embeddings.service";
 import type { EmbeddingConfigWithStatus } from "./embeddings.service";
 import * as memoryCortex from "./memory-cortex";
 import * as vectorizationQueueSvc from "./vectorization-queue.service";
+import { __test__ as userDataImportTest } from "./user-data/import.service";
 
 const USER_ID = "maintenance-owner";
 
@@ -108,8 +109,13 @@ describe.serial("chat chunk maintenance lifecycle", () => {
     };
 
     track(spyOn(embeddingsSvc, "deleteChatChunkEmbeddings").mockResolvedValue(undefined));
-    track(spyOn(vectorizationQueueSvc, "queueChunkVectorization").mockImplementation(() => {}));
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => ({
+      processedCount: tasks.length,
+      failedChunkIds: [],
+      refreshedChatIds: [],
+    }));
     refreshCacheImpl = async () => {};
+    chatMemoryCacheSvc.__test__.setRefreshChatMemoryCache(async () => refreshCacheImpl());
     track(spyOn(chatMemoryCacheSvc, "refreshChatMemoryCache").mockImplementation(() => (
       refreshCacheImpl()
     )));
@@ -122,6 +128,8 @@ describe.serial("chat chunk maintenance lifecycle", () => {
     } catch (error) {
       maintenanceError = error;
     }
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(null);
+    chatMemoryCacheSvc.__test__.setRefreshChatMemoryCache(null);
     for (const spy of spies.splice(0)) spy.mockRestore();
     closeDatabase();
     if (maintenanceError) throw maintenanceError;
@@ -263,5 +271,102 @@ describe.serial("chat chunk maintenance lifecycle", () => {
 
     expect(rebuildResult).toEqual({ status: "rejected", reason: hashFailure });
     expect(maintenanceResult).toEqual({ status: "rejected", reason: hashFailure });
+  });
+  test("barrier follows the real vector queue timer through a retry", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "retry-message", 0, true, "retry vectorization");
+    seedChunk(chat.id, "retry-chunk", ["retry-message"], 1);
+
+    let calls = 0;
+    const retryEntered = Promise.withResolvers<void>();
+    const releaseRetry = Promise.withResolvers<void>();
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => {
+      calls += 1;
+      if (calls === 1) {
+        return { processedCount: 0, failedChunkIds: tasks.map((task) => task.chunkId), refreshedChatIds: [] };
+      }
+      retryEntered.resolve();
+      await releaseRetry.promise;
+      return { processedCount: tasks.length, failedChunkIds: [], refreshedChatIds: [] };
+    });
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "retry-chunk", 1);
+    const maintenance = chatsSvc.waitForChatChunkMaintenance(chat.id);
+    const maintenancePending = isPending(maintenance);
+    await retryEntered.promise;
+    await Promise.resolve();
+    expect(maintenancePending()).toBe(true);
+    expect(calls).toBe(2);
+
+    releaseRetry.resolve();
+    await maintenance;
+  });
+
+  test("terminal vector failure is retained until the barrier reports it", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "failed-message", 0, true, "fail vectorization");
+    seedChunk(chat.id, "failed-chunk", ["failed-message"], 1);
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => ({
+      processedCount: 0,
+      failedChunkIds: tasks.map((task) => task.chunkId),
+      refreshedChatIds: [],
+    }));
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "failed-chunk", 0);
+    await expect(chatsSvc.waitForChatChunkMaintenance(chat.id))
+      .rejects.toThrow("Chunk vectorization failed after retries: failed-chunk");
+  });
+
+  test("barrier includes the cache refresh scheduled after vector persistence", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "cache-message", 0, true, "refresh cache after vectors");
+    seedChunk(chat.id, "cache-chunk", ["cache-message"], 1);
+    const refreshEntered = Promise.withResolvers<void>();
+    const releaseRefresh = Promise.withResolvers<void>();
+    refreshCacheImpl = async () => {
+      refreshEntered.resolve();
+      await releaseRefresh.promise;
+    };
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => ({
+      processedCount: tasks.length,
+      failedChunkIds: [],
+      refreshedChatIds: [chat.id],
+    }));
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "cache-chunk", 1);
+    const maintenance = chatsSvc.waitForChatChunkMaintenance(chat.id);
+    const maintenancePending = isPending(maintenance);
+    await refreshEntered.promise;
+    await Promise.resolve();
+    expect(maintenancePending()).toBe(true);
+
+    releaseRefresh.resolve();
+    await maintenance;
+  });
+
+  test("import rebuild is registered before its dynamic import can resolve", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "import-message", 0, true, "rebuild after import");
+    track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockResolvedValue(enabledEmbeddingConfig));
+
+    const vectorEntered = Promise.withResolvers<void>();
+    const releaseVector = Promise.withResolvers<void>();
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => {
+      vectorEntered.resolve();
+      await releaseVector.promise;
+      return { processedCount: tasks.length, failedChunkIds: [], refreshedChatIds: [] };
+    });
+
+    expect(userDataImportTest.scheduleDerivedVectorProjectionSync(USER_ID)).toBeGreaterThan(0);
+    const maintenance = chatsSvc.waitForChatChunkMaintenance(chat.id);
+    const maintenancePending = isPending(maintenance);
+    await vectorEntered.promise;
+    await Promise.resolve();
+    expect(maintenancePending()).toBe(true);
+
+    releaseVector.resolve();
+    await maintenance;
+    expect(getDb().query("SELECT COUNT(*) AS count FROM chat_chunks WHERE chat_id = ?").get(chat.id))
+      .toEqual({ count: 1 });
   });
 });

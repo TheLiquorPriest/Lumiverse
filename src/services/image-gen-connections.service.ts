@@ -178,17 +178,12 @@ export async function createConnection(
   input: CreateImageGenConnectionInput
 ): Promise<ImageGenConnectionProfile> {
   return withImageGenConnectionOwnerLock(userId, async () => {
-  const id = crypto.randomUUID();
-  const now = Math.floor(Date.now() / 1000);
-  const secretKey = imageGenConnectionSecretKey(id);
-  const hasApiKey = input.api_key ? 1 : 0;
-  let secretPersisted = false;
-
-  try {
-    if (input.api_key) {
-      await secretsSvc.putSecret(userId, secretKey, input.api_key);
-      secretPersisted = true;
-    }
+    const id = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    const secretKey = imageGenConnectionSecretKey(id);
+    const preparedSecret = input.api_key
+      ? await secretsSvc.prepareSecretWrite(input.api_key)
+      : null;
 
     const db = getDb();
     db.transaction(() => {
@@ -210,30 +205,21 @@ export async function createConnection(
         input.api_url || "",
         input.model || "",
         input.is_default ? 1 : 0,
-        hasApiKey,
+        preparedSecret ? 1 : 0,
         JSON.stringify(input.default_parameters || {}),
         JSON.stringify(clearImportedConnectionReview(input.metadata || {})),
         now,
         now,
       );
-    })();
-  } catch (error) {
-    if (secretPersisted) {
-      try {
-        secretsSvc.deleteSecret(userId, secretKey);
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [error, rollbackError],
-          "Image connection creation failed and its secret could not be rolled back",
-        );
-      }
-    }
-    throw error;
-  }
 
-  const profile = getConnection(userId, id)!;
-  eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id, profile: toPublicImageGenConnection(profile) }, userId);
-  return profile;
+      if (preparedSecret) {
+        secretsSvc.putPreparedSecret(userId, secretKey, preparedSecret);
+      }
+    })();
+
+    const profile = getConnection(userId, id)!;
+    eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id, profile: toPublicImageGenConnection(profile) }, userId);
+    return profile;
   });
 }
 

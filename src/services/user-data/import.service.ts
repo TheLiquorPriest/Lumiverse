@@ -57,6 +57,7 @@ import {
 import type { CollectionName, VectorRow } from "../vector-store/types";
 import { rowId } from "../vector-store/addressing";
 import * as embeddingsService from "../embeddings.service";
+import { trackChatChunkMaintenance } from "../chat-chunk-maintenance.service";
 import { validateSafeMediaFile } from "./media-validation";
 import {
   parseManifest,
@@ -7538,9 +7539,14 @@ function scheduleDerivedVectorProjectionSyncDetailed(
     ? page<{ id: string }>(chatState, chatPage.sql.replaceAll("id > ?", "c.id > ?"), chatPage.args, (chat) => {
       const exists = db.query("SELECT 1 FROM chat_chunks WHERE chat_id = ? LIMIT 1").get(chat.id);
       if (!exists) {
-        void import("../chats.service")
-          .then(({ rebuildChatChunks }) => rebuildChatChunks(userId, chat.id))
-          .catch(() => {});
+        const admission = import("../chats.service").then(({ rebuildChatChunks }) => {
+          void rebuildChatChunks(userId, chat.id).catch((err) => {
+            console.error(`[user-data-import] Chat chunk rebuild failed for ${chat.id}:`, err);
+          });
+        });
+        void trackChatChunkMaintenance(chat.id, admission).catch((err) => {
+          console.error(`[user-data-import] Chat chunk rebuild admission failed for ${chat.id}:`, err);
+        });
         queued++;
         chatState.queued++;
       }

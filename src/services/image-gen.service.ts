@@ -2013,7 +2013,6 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
     ).all(userId) as ConnectionSnapshotRow[];
     const originalConnectionIds = new Set(originalConnections.map((row) => row.id));
     const migratedSecretKeys = new Set<string>();
-    let writtenSettingJson: string | null = null;
 
     try {
       const activeConnectionId = typeof (currentValue as Record<string, unknown>).activeImageGenConnectionId === "string"
@@ -2041,13 +2040,6 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
         migratedSecretKeys.add(imageGenConnectionSecretKey(connection.id));
       }
 
-      const latestSettingRow = db.query(
-        "SELECT value FROM settings WHERE key = ? AND user_id = ?",
-      ).get(IMAGE_SETTINGS_KEY, userId) as { value: string } | null;
-      if (latestSettingRow?.value !== originalSettingRow.value) {
-        throw new Error("Legacy image settings changed during migration");
-      }
-
       const selectedConnection = selectedProvider === null
         ? null
         : migratedConnections.get(selectedProvider) ?? null;
@@ -2059,20 +2051,41 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
           writable: true,
         });
       }
-      writtenSettingJson = JSON.stringify(inspection.scrubbedValue);
-      settingsSvc.putSetting(userId, IMAGE_SETTINGS_KEY, inspection.scrubbedValue);
 
-      const persistedValue = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY)?.value;
-      if (persistedValue === undefined) {
-        throw new Error("Legacy image settings disappeared after migration cleanup");
-      }
-      const residual = inspectLegacyImageGenerationPrivateData(persistedValue);
+      const scrubbedSettingJson = JSON.stringify(inspection.scrubbedValue);
+      const residual = inspectLegacyImageGenerationPrivateData(inspection.scrubbedValue);
       if (residual.credentials.length !== 0 || residual.changed) {
-        throw new Error("Legacy image API keys remain after durable migration cleanup");
+        throw new Error("Legacy image API keys remain after migration cleanup preparation");
+      }
+
+      db.transaction(() => {
+        const latestSettingRow = db.query(
+          "SELECT value FROM settings WHERE key = ? AND user_id = ?",
+        ).get(IMAGE_SETTINGS_KEY, userId) as { value: string } | null;
+        if (latestSettingRow?.value !== originalSettingRow.value) {
+          throw new Error("Legacy image settings changed during migration");
+        }
+        const updated = db.query(
+          "UPDATE settings SET value = ?, updated_at = ? WHERE key = ? AND user_id = ? AND value = ?",
+        ).run(
+          scrubbedSettingJson,
+          Math.floor(Date.now() / 1000),
+          IMAGE_SETTINGS_KEY,
+          userId,
+          originalSettingRow.value,
+        );
+        if (updated.changes !== 1) {
+          throw new Error("Legacy image settings could not be committed atomically");
+        }
+      })();
+
+      try {
+        eventBus.emit(EventType.SETTINGS_UPDATED, { key: IMAGE_SETTINGS_KEY, value: inspection.scrubbedValue }, userId);
+      } catch (broadcastError) {
+        console.error("[image-gen] Legacy credential migration committed but settings broadcast failed:", broadcastError);
       }
       return [...migratedSecretKeys].sort();
     } catch (error) {
-      const rollbackErrors: unknown[] = [];
       const currentConnections = db.query(
         "SELECT id FROM image_gen_connections WHERE user_id = ?",
       ).all(userId) as Array<{ id: string }>;
@@ -2080,16 +2093,10 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
         .map((row) => row.id)
         .filter((id) => !originalConnectionIds.has(id));
 
-      for (const id of createdConnectionIds) {
-        try {
-          secretsSvc.deleteSecret(userId, imageGenConnectionSecretKey(id));
-        } catch (rollbackError) {
-          rollbackErrors.push(rollbackError);
-        }
-      }
       try {
         db.transaction(() => {
           for (const id of createdConnectionIds) {
+            secretsSvc.deleteSecret(userId, imageGenConnectionSecretKey(id));
             db.query("DELETE FROM image_gen_connections WHERE id = ? AND user_id = ?").run(id, userId);
           }
           for (const row of originalConnections) {
@@ -2105,28 +2112,9 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
           }
         })();
       } catch (rollbackError) {
-        rollbackErrors.push(rollbackError);
-      }
-
-      if (writtenSettingJson !== null) {
-        try {
-          const currentRow = db.query(
-            "SELECT value FROM settings WHERE key = ? AND user_id = ?",
-          ).get(IMAGE_SETTINGS_KEY, userId) as { value: string } | null;
-          if (currentRow?.value === writtenSettingJson) {
-            db.query(
-              "UPDATE settings SET value = ?, updated_at = ? WHERE key = ? AND user_id = ?",
-            ).run(originalSettingRow.value, originalSettingRow.updated_at, IMAGE_SETTINGS_KEY, userId);
-          }
-        } catch (rollbackError) {
-          rollbackErrors.push(rollbackError);
-        }
-      }
-
-      if (rollbackErrors.length > 0) {
         throw new AggregateError(
-          [error, ...rollbackErrors],
-          "Legacy image credential migration failed and could not be fully rolled back",
+          [error, rollbackError],
+          "Legacy image credential migration failed; staged profile-secret pairs and plaintext settings were retained",
         );
       }
       throw error;

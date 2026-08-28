@@ -5,6 +5,7 @@ import { getReasoningStripOptions } from "../utils/reasoning-strip";
 import { type MacroEnv } from "../macros";
 import { resolveAndSanitizeForVectorization } from "./vectorization-content.service";
 import { buildMacroEnvForChat } from "./chats.service";
+import { trackChatChunkMaintenance } from "./chat-chunk-maintenance.service";
 
 const MAX_STALE_VISIBLE_MESSAGES = 2;
 const REFRESH_DEBOUNCE_MS = 100;
@@ -64,7 +65,15 @@ interface RefreshJob {
   userId: string;
   chatId: string;
   priority: number;
+  settlements: Array<{
+    resolve: () => void;
+    reject: (reason?: unknown) => void;
+  }>;
 }
+
+let refreshChatMemoryCacheOverride:
+  | ((userId: string, chatId: string) => Promise<void>)
+  | null = null;
 
 const EMPTY_RESULT: CachedChatMemoryResult = {
   chunks: [],
@@ -552,6 +561,7 @@ class ChatMemoryRefreshQueue {
 
     if (existing >= 0) {
       this.queue[existing].priority = Math.max(this.queue[existing].priority, job.priority);
+      this.queue[existing].settlements.push(...job.settlements);
     } else {
       this.queue.push(job);
     }
@@ -575,7 +585,17 @@ class ChatMemoryRefreshQueue {
     try {
       while (this.queue.length > 0) {
         const job = this.queue.shift()!;
-        await refreshChatMemoryCache(job.userId, job.chatId);
+        try {
+          if (refreshChatMemoryCacheOverride) {
+            await refreshChatMemoryCacheOverride(job.userId, job.chatId);
+          } else {
+            await refreshChatMemoryCache(job.userId, job.chatId);
+          }
+          for (const settlement of job.settlements) settlement.resolve();
+        } catch (err) {
+          console.error(`[chat-memory-cache] Refresh failed for chat ${job.chatId}:`, err);
+          for (const settlement of job.settlements) settlement.reject(err);
+        }
       }
     } finally {
       this.processing = false;
@@ -587,8 +607,18 @@ class ChatMemoryRefreshQueue {
 const refreshQueue = new ChatMemoryRefreshQueue();
 
 export function scheduleChatMemoryRefresh(userId: string, chatId: string, priority = 5): void {
-  refreshQueue.add({ userId, chatId, priority });
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  void trackChatChunkMaintenance(chatId, promise);
+  refreshQueue.add({ userId, chatId, priority, settlements: [{ resolve, reject }] });
 }
+
+export const __test__ = {
+  setRefreshChatMemoryCache(
+    refresh: ((userId: string, chatId: string) => Promise<void>) | null,
+  ): void {
+    refreshChatMemoryCacheOverride = refresh;
+  },
+};
 
 export async function readCachedChatMemory(
   userId: string,
