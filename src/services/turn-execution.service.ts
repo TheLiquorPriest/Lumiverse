@@ -3473,6 +3473,7 @@ function exactTerminalReconciliationPredicate(
     WHEN ${phase} = 'TIMED_OUT' THEN 'failed'
     WHEN ${phase} = 'EXHAUSTED' THEN 'exhausted'
     WHEN ${terminalCode} IN (${sqlCodeList(STOPPED_TERMINAL_CODES)}) THEN 'stopped'
+    WHEN ${terminalCode} IN (${sqlCodeList(FAILED_TERMINAL_CODES)}) THEN 'failed'
     WHEN ${exhaustedCode} THEN 'exhausted'
     WHEN ${terminalCode} IN (${sqlCodeList(REJECTED_TERMINAL_CODES)}) THEN 'rejected'
     ELSE 'failed'

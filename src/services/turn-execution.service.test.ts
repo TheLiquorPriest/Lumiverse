@@ -1053,7 +1053,7 @@ describe("receipt commit and startup recovery", () => {
       "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE state IN ('ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING')",
     ).get() as { count: number }).count).toBe(0);
   });
-  test("skips 2,049 tab/NBSP-padded exact terminal authorities so newer work reaches ready startup", async () => {
+  test("skips 2,049 padded failed wall-clock authorities so newer work reaches ready startup", async () => {
     createTerminalRecoverySchema(db);
     const retainedCount = TURN_EXECUTION_RECONCILIATION.maxRows + 1;
     const omissionJson = JSON.stringify({
@@ -1149,7 +1149,7 @@ describe("receipt commit and startup recovery", () => {
         const orderedAt = index + 1;
         const historical = newExecution(db, id);
         transition(db, id, historical.ownerToken, "ASSEMBLE", "FAILED");
-        db.query("UPDATE agent_turn_executions SET created_at = ?, updated_at = ? WHERE id = ?")
+        db.query("UPDATE agent_turn_executions SET terminal_code = 'root_wall_clock_limit_exceeded', created_at = ?, updated_at = ? WHERE id = ?")
           .run(orderedAt, orderedAt, id);
         const settledOutcome = index % 2 === 0 ? "\tfailed\t" : "\u00a0failed\u00a0";
         persistExactTerminal(id, historical.execution.generationId, orderedAt, orderedAt, settledOutcome);
@@ -1168,7 +1168,7 @@ describe("receipt commit and startup recovery", () => {
     );
 
     expect((db.query(
-      "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE id LIKE 'retained-terminal-%' AND state = 'FAILED'",
+      "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE id LIKE 'retained-terminal-%' AND state = 'FAILED' AND terminal_code = 'root_wall_clock_limit_exceeded'",
     ).get() as { count: number }).count).toBe(retainedCount);
     const paddedOutcomes = db.query(`
       SELECT
