@@ -5427,7 +5427,15 @@ function toEffectiveRuntimeRequest(input: GenerateInput): EffectiveRuntimeReques
       swipeId: input.swipe_id ?? null,
       targetCharacterId: input.target_character_id ?? null,
     },
-    ...(input.mode !== undefined ? { mode: input.mode } : {}),
+    ...(input.mode !== undefined
+      ? {
+        transientSelection: {
+          mode: input.mode,
+          turnFence: input.request_epoch ?? 0,
+          authenticated: true as const,
+        },
+      }
+      : {}),
     ...(input.request_epoch !== undefined ? { requestEpoch: input.request_epoch } : {}),
   };
 }

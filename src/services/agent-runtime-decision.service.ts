@@ -1746,14 +1746,7 @@ export class AgentRuntimeDecisionService {
       configAllowedModes = ["response"];
       configDefaultMode = "response";
     }
-    const rawTransientSelection = request.transientSelection
-      ?? (request.mode
-        ? {
-          mode: request.mode,
-          turnFence: request.requestEpoch ?? DEFAULT_REVISION,
-          authenticated: true as const,
-        }
-        : null);
+    const rawTransientSelection = request.transientSelection ?? null;
     const transientSelectionInvalid = rawTransientSelection !== null
       && rawTransientSelection !== undefined
       && (!isAgentRuntimeMode(rawTransientSelection.mode)
@@ -1800,7 +1793,6 @@ export class AgentRuntimeDecisionService {
     const requestedMode = initialRuntimePolicy.authoredValue;
     const normalizedRequestedMode = requestedMode;
     if (transientSelectionInvalid) repairCodes.push("loom_policy_invalid");
-    if (request.mode && !isAgentRuntimeMode(request.mode)) repairCodes.push("agentic_mode_not_allowed");
     if (initialRuntimePolicy.availability.reasonCode) repairCodes.push(initialRuntimePolicy.availability.reasonCode);
     if (normalizedRequestedMode === "agentic" && unsupportedAgenticSurface) {
       repairCodes.push("agentic_target_unsupported");
@@ -2090,9 +2082,12 @@ export class AgentRuntimeDecisionService {
       logicalConnectionId: expected.logicalConnectionId,
       presetId: expected.presetId,
       forcePresetId: storedRequest.forcePresetId === true,
-      transientSelection: stored.decision.runtimePolicy?.transientSelection ?? storedRequest.transientSelection ?? null,
-      mode: "agentic",
+      // Preserve only the token's authenticated one-turn selector. Every
+      // other policy input is re-resolved from current authority below. A
+      // resolved Agentic mode is not itself transient turn authority.
+      transientSelection: stored.decision.runtimePolicy.transientSelection,
     };
+    delete currentRequest.mode;
     const readinessVector = request.readinessVector ?? storedRequest.readinessVector;
     const currentRequestForResolve = readinessVector === undefined
       ? currentRequest
@@ -2423,6 +2418,27 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
   const parsedTransientSelection = transient.present
     ? parseStrictTransientSelection(transient.value, "transientSelection")
     : undefined;
+  const parsedRequestEpoch = requestEpoch.present
+    ? parseStrictRevision(requestEpoch.value, "requestEpoch", false) as RuntimeRevision
+    : undefined;
+  if (mode.present && transient.present && (
+    parsedTransientSelection == null
+    || parsedTransientSelection.mode !== parsedMode
+  )) {
+    throw new RuntimeDecisionError("invalid_request", "mode conflicts with transientSelection", 400);
+  }
+  // Canonical normalized requests carry exactly one policy selector. `mode` is
+  // accepted at the authenticated wire boundary, then serialized into the
+  // explicit one-turn authority shape before any resolution or token storage.
+  const canonicalTransientSelection = transient.present
+    ? parsedTransientSelection
+    : mode.present
+      ? {
+        mode: parsedMode as AgentRuntimeMode,
+        turnFence: parsedRequestEpoch ?? DEFAULT_REVISION,
+        authenticated: true as const,
+      }
+      : undefined;
   const parsedForcePreset = forcePreset.present
     ? (typeof forcePreset.value === "boolean"
       ? forcePreset.value
@@ -2483,11 +2499,8 @@ export function normalizeEffectiveRuntimeRequest(raw: unknown): EffectiveRuntime
       : {}),
     ...(generation.present ? { generationType: generationType as EffectiveRuntimeRequestV1["generationType"] } : {}),
     target,
-    ...(mode.present ? { mode: parsedMode as AgentRuntimeMode } : {}),
-    ...(transient.present ? { transientSelection: parsedTransientSelection } : {}),
-    ...(requestEpoch.present
-      ? { requestEpoch: parseStrictRevision(requestEpoch.value, "requestEpoch", false) as RuntimeRevision }
-      : {}),
+    ...((mode.present || transient.present) ? { transientSelection: canonicalTransientSelection } : {}),
+    ...(requestEpoch.present ? { requestEpoch: parsedRequestEpoch } : {}),
     ...(inputRevisions.present ? { inputRevisions: parsedInputRevisions } : {}),
     ...(readiness.present ? { readinessVector: parsedReadiness } : {}),
   };

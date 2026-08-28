@@ -127,6 +127,7 @@ function makeService(options: {
   getReadinessVector?: RuntimeDecisionDependencies["getReadinessVector"];
   getInputRevisions?: RuntimeDecisionDependencies["getInputRevisions"];
   now?: () => number;
+  defaultMode?: "response" | "agentic";
 } = {}) {
   const chat = {
     id: CHAT_ID,
@@ -142,7 +143,7 @@ function makeService(options: {
       version: 2,
       agentsEnabled: true,
       allowedModes: ["response", "agentic"],
-      defaultMode: "response",
+      defaultMode: options.defaultMode ?? "response",
       maxInvocations: 8,
       maxToolCalls: 8,
       mainToolIds: [],
@@ -378,6 +379,110 @@ describe("AgentRuntimeDecisionService", () => {
     const decision = await makeService().resolve(USER_ID, request({ inputRevisions }));
     expect(decision.internal.binding.inputRevisionDigest).toBe(expectedDigest);
   });
+  test("preserves durable preset and chat Agentic policy while consuming tokens", async () => {
+    const service = makeService({ defaultMode: "agentic" });
+    const durableRequest = request({ requestEpoch: 29 });
+    delete durableRequest.mode;
+
+    const issued = await service.resolve(USER_ID, durableRequest);
+    expect(issued.runtimePolicy).toMatchObject({
+      authoredValue: "agentic",
+      effectiveValue: "agentic",
+      source: "reviewed_preset_default",
+      scope: "preset",
+      transientSelection: null,
+    });
+
+    const consumed = await service.consume(
+      USER_ID,
+      issued.runtimeDecisionToken!,
+      request({ mode: "agentic", requestEpoch: 29 }),
+    );
+    expect(consumed).toMatchObject({
+      accepted: true,
+      code: "accepted",
+      decision: {
+        runtimePolicy: {
+          authoredValue: "agentic",
+          effectiveValue: "agentic",
+          source: "reviewed_preset_default",
+          scope: "preset",
+          transientSelection: null,
+        },
+      },
+    });
+    const chatService = makeService({
+      override: { mode: "agentic", revision: 5, state: "ready" },
+    });
+    const durableChatRequest = request({ requestEpoch: 30 });
+    delete durableChatRequest.mode;
+    const chatIssued = await chatService.resolve(USER_ID, durableChatRequest);
+    expect(chatIssued.runtimePolicy).toMatchObject({
+      source: "durable_chat_override",
+      scope: "chat",
+      transientSelection: null,
+    });
+    const chatConsumed = await chatService.consume(
+      USER_ID,
+      chatIssued.runtimeDecisionToken!,
+      request({ mode: "agentic", requestEpoch: 30 }),
+    );
+    expect(chatConsumed).toMatchObject({
+      accepted: true,
+      code: "accepted",
+      decision: {
+        runtimePolicy: {
+          source: "durable_chat_override",
+          scope: "chat",
+          transientSelection: null,
+        },
+      },
+    });
+  });
+
+  test("keeps explicit one-turn Response serialized as turn authority", async () => {
+    const decision = await makeService({ defaultMode: "agentic" }).resolve(
+      USER_ID,
+      request({ mode: "response", requestEpoch: 31 }),
+    );
+
+    expect(decision).toMatchObject({
+      requestedMode: "response",
+      effectiveMode: "response",
+      runtimeDecisionToken: null,
+      runtimePolicy: {
+        authoredValue: "response",
+        effectiveValue: "response",
+        source: "authenticated_one_turn",
+        scope: "turn",
+        transientSelection: {
+          mode: "response",
+          turnFence: 31,
+          authenticated: true,
+        },
+      },
+    });
+  });
+
+  test("fails closed when durable Agentic policy authority changes before consume", async () => {
+    const service = makeService({ defaultMode: "agentic" });
+    const durableRequest = request({ requestEpoch: 37 });
+    delete durableRequest.mode;
+    const issued = await service.resolve(USER_ID, durableRequest);
+
+    service.setChatAgentModeOverride(USER_ID, CHAT_ID, "agentic");
+    const consumed = await service.consume(
+      USER_ID,
+      issued.runtimeDecisionToken!,
+      request({ mode: "agentic", requestEpoch: 37 }),
+    );
+    expect(consumed).toEqual({
+      accepted: false,
+      code: "decision_refresh_required",
+      decision: null,
+      mismatch: "runtime_policy",
+    });
+  });
   test("consumes an authenticated one-turn decision once", async () => {
     const service = makeService();
     const issued = await service.resolve(USER_ID, request({
@@ -401,7 +506,11 @@ describe("AgentRuntimeDecisionService", () => {
     }));
     expect(accepted.accepted).toBe(true);
     expect(accepted.code).toBe("accepted");
-    expect(accepted.decision?.runtimePolicy.source).toBe("authenticated_one_turn");
+    expect(accepted.decision?.runtimePolicy).toMatchObject({
+      source: "authenticated_one_turn",
+      scope: "turn",
+      transientSelection: { mode: "agentic", turnFence: 7, authenticated: true },
+    });
 
     const replayed = await service.consume(USER_ID, issued.runtimeDecisionToken!, request({
       mode: "agentic",
@@ -961,6 +1070,27 @@ describe("effective runtime request DTO", () => {
     expect(() => normalizeEffectiveRuntimeRequest(oneTurn)).not.toThrow();
   });
 
+  test("serializes wire mode into one canonical transient authority shape", () => {
+    const canonical = normalizeEffectiveRuntimeRequest({
+      chatId: CHAT_ID,
+      mode: "response",
+      requestEpoch: 41,
+    });
+
+    expect(Object.hasOwn(canonical, "mode")).toBe(false);
+    expect(canonical.transientSelection).toEqual({
+      mode: "response",
+      turnFence: 41,
+      authenticated: true,
+    });
+    expect(normalizeEffectiveRuntimeRequest(canonical)).toEqual(canonical);
+    expect(() => normalizeEffectiveRuntimeRequest({
+      chatId: CHAT_ID,
+      mode: "agentic",
+      transientSelection: null,
+      requestEpoch: 41,
+    })).toThrow("mode conflicts with transientSelection");
+  });
   test("accepts the documented aliases only when they agree and preserves a closed target", () => {
     const parsed = normalizeEffectiveRuntimeRequest({
       chat_id: CHAT_ID,

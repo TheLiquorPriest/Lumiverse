@@ -3112,7 +3112,11 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
   });
   const dispatches: Array<{ provider?: string; model?: string }> = [];
 
-  const requestFor = (input: AgenticGenerationInput, target: AgenticTargetSnapshot): EffectiveRuntimeRequestV1 => ({
+  const requestFor = (
+    input: AgenticGenerationInput,
+    target: AgenticTargetSnapshot,
+    transientMode?: "agentic",
+  ): EffectiveRuntimeRequestV1 => ({
     chatId: input.chatId, logicalConnectionId: input.connectionId ?? null,
     presetId: input.presetId ?? null, forcePresetId: input.forcePresetId === true,
     personaId: input.personaId ?? null, targetCharacterId: input.targetCharacterId ?? null,
@@ -3123,7 +3127,16 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
       targetCharacterId: target.targetCharacterId ?? input.targetCharacterId ?? null,
       ...(target.revision === undefined ? {} : { revision: target.revision }),
     },
-    mode: "agentic", requestEpoch: input.requestEpoch ?? 0,
+    ...(transientMode
+      ? {
+        transientSelection: {
+          mode: transientMode,
+          turnFence: input.requestEpoch ?? 0,
+          authenticated: true as const,
+        },
+      }
+      : {}),
+    requestEpoch: input.requestEpoch ?? 0,
   });
   const rejectRefresh = (): never => {
     throw new AgenticGenerationError("decision_refresh_required", "decision_refresh_required", {
@@ -3132,7 +3145,7 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
   };
   const dependencies: AgenticGenerationDependencies = {
     resolveRuntime: async (input, target) => mapAdmissionDecision(
-      await service.resolve(input.userId, requestFor(input, target), { issueToken: false }),
+      await service.resolve(input.userId, requestFor(input, target, "agentic"), { issueToken: false }),
     ),
     claimRuntimeToken: (input, token) => {
       if (!service.claim(input.userId, token)) rejectRefresh();
@@ -3164,10 +3177,17 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
     requestFor({
       userId: ADMISSION_USER_ID, chatId: chat.id, connectionId: responseConnection.id,
       presetId: ADMISSION_PRESET_ID, generationType: "normal", requestEpoch,
+    }, { generationType: "normal" }, "agentic"),
+  );
+  const issueDurable = (requestEpoch: number) => service.resolve(
+    ADMISSION_USER_ID,
+    requestFor({
+      userId: ADMISSION_USER_ID, chatId: chat.id, connectionId: responseConnection.id,
+      presetId: ADMISSION_PRESET_ID, generationType: "normal", requestEpoch,
     }, { generationType: "normal" }),
   );
   return {
-    service, dispatches, provider, generationInput, issue, requestFor, chatId: chat.id,
+    service, dispatches, provider, generationInput, issue, issueDurable, requestFor, chatId: chat.id,
     advance: (milliseconds: number) => { now += milliseconds; },
     bumpConfig: () => {
       configRevision += 1;
@@ -3194,6 +3214,26 @@ describe.serial("startGeneration caller runtime decision authority", () => {
     closeDatabase();
   });
 
+test("consumes durable preset Agentic authority without making it turn-scoped", async () => {
+  const harness = await createRuntimeAdmissionHarness();
+  const issued = await harness.issueDurable(1);
+  expect(issued.runtimePolicy).toMatchObject({
+    authoredValue: "agentic",
+    effectiveValue: "agentic",
+    source: "reviewed_preset_default",
+    scope: "preset",
+    transientSelection: null,
+  });
+  const resolveSpy = forbidReplacementResolution();
+  try {
+    const started = await startGeneration(harness.generationInput(1, issued.runtimeDecisionToken!));
+    expect(resolveSpy).not.toHaveBeenCalled();
+    await waitForAgenticGeneration(started.generationId);
+    expect(harness.dispatches).toEqual([{ provider: "authority-provider", model: "authority-model" }]);
+  } finally {
+    resolveSpy.mockRestore();
+  }
+});
 test("consumes the exact token, freezes provider/model, and rejects replay", async () => {
   const harness = await createRuntimeAdmissionHarness();
   const issued = await harness.issue(1);

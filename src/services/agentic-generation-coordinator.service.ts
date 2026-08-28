@@ -920,7 +920,11 @@ function snapshotConnection(connection: FrozenConcreteConnectionV1 | null): Read
   return Object.freeze(projected);
 }
 
-function runtimeRequest(input: AgenticGenerationInput, target: AgenticTargetSnapshot): EffectiveRuntimeRequestV1 {
+function runtimeRequest(
+  input: AgenticGenerationInput,
+  target: AgenticTargetSnapshot,
+  transientMode?: "agentic",
+): EffectiveRuntimeRequestV1 {
   return {
     chatId: input.chatId,
     logicalConnectionId: input.connectionId ?? null,
@@ -936,7 +940,15 @@ function runtimeRequest(input: AgenticGenerationInput, target: AgenticTargetSnap
       targetCharacterId: target.targetCharacterId ?? input.targetCharacterId ?? null,
       ...(target.revision !== undefined ? { revision: target.revision } : {}),
     },
-    mode: "agentic",
+    ...(transientMode
+      ? {
+        transientSelection: {
+          mode: transientMode,
+          turnFence: input.requestEpoch ?? 0,
+          authenticated: true as const,
+        },
+      }
+      : {}),
     requestEpoch: input.requestEpoch ?? 0,
   };
 }
@@ -4451,7 +4463,7 @@ function buildDependencies(): AgenticGenerationDependencies {
   };
 
   const resolve = async (input: AgenticGenerationInput, target: AgenticTargetSnapshot): Promise<AgenticRuntimeDecision> => {
-    const result = await resolveEffectiveRuntimeWithoutToken(input.userId, runtimeRequest(input, target));
+    const result = await resolveEffectiveRuntimeWithoutToken(input.userId, runtimeRequest(input, target, "agentic"));
     return mapDecision(result);
   };
   const consume = async (input: AgenticGenerationInput, target: AgenticTargetSnapshot, token: string): Promise<AgenticRuntimeDecision> => {
