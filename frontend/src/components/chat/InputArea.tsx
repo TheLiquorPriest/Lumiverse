@@ -2536,6 +2536,11 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     let placeholderId: string | null = null
     try {
       const prepared = await generateApi.preflightGeneration('/generate', genOpts, {
+        // A regeneration changes the target at the action boundary. Never
+        // consume a display token issued for the prior assistant turn or its
+        // runtime policy; resolve the selected mode and complete authority
+        // again for this exact regenerate target.
+        forceRuntimeRefresh: true,
         forceResponse,
         signal: generationAbortController.signal,
       })
