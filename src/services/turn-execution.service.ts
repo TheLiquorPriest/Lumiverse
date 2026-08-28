@@ -3054,6 +3054,11 @@ function resolveTerminalInspection(
   };
 }
 
+interface TerminalProjectionMatch {
+  readonly exact: boolean;
+  readonly terminalRejectedOutcomeRepair: boolean;
+}
+
 function terminalProjectionMatches(
   db: Database,
   execution: TurnExecutionRecord,
@@ -3062,7 +3067,8 @@ function terminalProjectionMatches(
   errorCode: string | null,
   target: TerminalRecoveryTarget,
   legacyDecisionRefreshOutcomeRepair: boolean,
-): boolean {
+  inspectionExact: boolean,
+): TerminalProjectionMatch {
   const projectionColumns = tableColumns(db, "agent_run_projections");
   const projectionStatusColumns = ["status", "phase"]
     .filter((column) => projectionColumns.has(column))
@@ -3081,7 +3087,7 @@ function terminalProjectionMatches(
       WHERE user_id = ? AND turn_id = ?
       LIMIT 1`,
   ).get(execution.userId, execution.id) as Record<string, unknown> | null;
-  if (!row) return false;
+  if (!row) return { exact: false, terminalRejectedOutcomeRepair: false };
   const parsed = (() => {
     try {
       const value = JSON.parse(String(row.snapshot_json ?? "{}"));
@@ -3127,7 +3133,7 @@ function terminalProjectionMatches(
   }
 
   const storedTerminal = TERMINAL_PHASE_SET.has(storedStatus as TurnExecutionPhase);
-  if (!storedTerminal) return false;
+  if (!storedTerminal) return { exact: false, terminalRejectedOutcomeRepair: false };
   const parsedError = parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error)
     ? parsed.error as Record<string, unknown>
     : null;
@@ -3138,7 +3144,9 @@ function terminalProjectionMatches(
   // Identity plus terminal outcome is the immutable authority. A later
   // recovery pass may re-derive reason/error labels; those must not rewrite
   // an already-terminal projection or fail the whole startup scan.
-  if (storedStatus === execution.phase && storedOutcome === outcome) return true;
+  if (storedStatus === execution.phase && storedOutcome === outcome) {
+    return { exact: true, terminalRejectedOutcomeRepair: false };
+  }
   if (
     legacyDecisionRefreshOutcomeRepair
     && storedStatus === "FAILED"
@@ -3151,14 +3159,34 @@ function terminalProjectionMatches(
     && reason === "stale_input"
     && errorCode === "decision_refresh_required"
   ) {
-    return false;
+    return { exact: false, terminalRejectedOutcomeRepair: true };
+  }
+  if (
+    !legacyDecisionRefreshOutcomeRepair
+    && inspectionExact
+    && execution.phase === "FAILED"
+    && execution.workOutcome === "rejected"
+    && execution.terminalCode === "invalid_input"
+    && storedStatus === "FAILED"
+    && storedOutcome === "failed"
+    && storedReason === "failed"
+    && storedErrorCode === "internal_error"
+    && storedErrorOutcome === "failed"
+    && outcome === "rejected"
+    && reason === "invalid_input"
+    && errorCode === "invalid_input"
+    && rowString(row, "target_message_id") === target.messageId
+    && rowNumber(row, "target_swipe_id") === target.swipeId
+    && rawReceipt(db, execution) === null
+  ) {
+    return { exact: false, terminalRejectedOutcomeRepair: true };
   }
   if (
     storedStatus === execution.phase
     && storedStatus === "EXHAUSTED"
     && outcome === "exhausted"
   ) {
-    return false;
+    return { exact: false, terminalRejectedOutcomeRepair: false };
   }
   throw new TurnExecutionError(
     "invalid_execution_input",
@@ -3274,6 +3302,7 @@ function appendRecoveredTerminalProjection(
   execution: TurnExecutionRecord,
   resolution: TerminalInspectionResolution,
   rewriteInspection: boolean,
+  terminalRejectedOutcomeRepair: boolean,
 ): void {
   const errorCode = resolution.explicitUnrecoverable
     ? "internal_error"
@@ -3319,8 +3348,8 @@ function appendRecoveredTerminalProjection(
       messageRevision: null,
       swipeRevision: null,
     },
-    ...(resolution.legacyDecisionRefreshOutcomeRepair
-      ? { decisionRefreshOutcomeRepair: true as const }
+    ...(terminalRejectedOutcomeRepair
+      ? { terminalRejectedOutcomeRepair: true as const }
       : {}),
     ...(rewriteInspection || execution.phase === "EXHAUSTED" ? { recoveryRepair: true as const } : { preserveTerminalInspection: true as const }),
   };
@@ -3450,7 +3479,7 @@ function reconcileTerminalExecutionProjection(
     resolution.inspectionReason,
     resolution.outcome,
   );
-  const projectionExact = terminalProjectionMatches(
+  const projectionMatch = terminalProjectionMatches(
     db,
     execution,
     resolution.outcome,
@@ -3458,9 +3487,10 @@ function reconcileTerminalExecutionProjection(
     errorCode,
     resolution.projectionTarget,
     resolution.legacyDecisionRefreshOutcomeRepair,
+    resolution.inspectionExact,
   );
   const persistentSessionExact = persistentSessionMatchesTerminalExecution(persistentSession, resolution.outcome);
-  if (resolution.inspectionExact && projectionExact && persistentSessionExact) return false;
+  if (resolution.inspectionExact && projectionMatch.exact && persistentSessionExact) return false;
   db.transaction(() => {
     const latest = requireExecution(db, execution.id).execution;
     if (latest.phase !== execution.phase || latest.casRevision !== execution.casRevision) {
@@ -3473,7 +3503,15 @@ function reconcileTerminalExecutionProjection(
       persistRecoveredTerminalSession(db, latest, persistentSession, resolution.outcome, resolution.projectionReason);
     }
     if (!resolution.inspectionExact) persistRecoveredTerminalInspection(db, latest, resolution);
-    if (!projectionExact) appendRecoveredTerminalProjection(db, latest, resolution, !resolution.inspectionExact);
+    if (!projectionMatch.exact) {
+      appendRecoveredTerminalProjection(
+        db,
+        latest,
+        resolution,
+        !resolution.inspectionExact,
+        projectionMatch.terminalRejectedOutcomeRepair,
+      );
+    }
   })();
   return true;
 }

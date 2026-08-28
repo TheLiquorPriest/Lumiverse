@@ -170,6 +170,63 @@ describe("agentic generation orchestration", () => {
     expect(calls).toEqual(["snapshot", "FAILED", "terminal:rejected", "cleanup"]);
   });
 
+  test("publishes an ASSEMBLE revision rejection only through the terminal owner", async () => {
+    const phaseEvents: string[] = [];
+    const terminalEvents: Array<{
+      status: string;
+      phase: string;
+      workOutcome?: string | null;
+      errorCode?: string;
+    }> = [];
+    let durablePhase: "ASSEMBLE" | "FAILED" = "ASSEMBLE";
+    const started = await runAgenticGeneration(input(), dependencies([], {
+      buildAssemblySnapshot: async () => {
+        throw new AgenticGenerationError(
+          "agentic_revision_conflict",
+          "stale_input_revision",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      },
+      transitionExecution: (execution, from, to, reason) => {
+        expect(from).toBe("ASSEMBLE");
+        expect(to).toBe("FAILED");
+        expect(reason).toBe("invalid_input");
+        durablePhase = "FAILED";
+        return { ...execution, phase: to };
+      },
+      readExecutionPhase: () => durablePhase,
+      publishPhase: (event) => { phaseEvents.push(event.phase); },
+      publishTerminal: (event) => {
+        terminalEvents.push({
+          status: event.status,
+          phase: event.phase,
+          workOutcome: event.workOutcome,
+          errorCode: event.errorCode,
+        });
+      },
+    }));
+
+    const result = await settle(started.generationId) as {
+      status: string;
+      phase: string;
+      workOutcome: string | null;
+      errorCode?: string;
+    };
+    expect(result).toMatchObject({
+      status: "rejected",
+      phase: "FAILED",
+      workOutcome: "rejected",
+      errorCode: "agentic_revision_conflict",
+    });
+    expect(phaseEvents).toEqual(["ASSEMBLE"]);
+    expect(terminalEvents).toEqual([{
+      status: "rejected",
+      phase: "FAILED",
+      workOutcome: "rejected",
+      errorCode: "agentic_revision_conflict",
+    }]);
+  });
+
   test("uses internal resolution when UI did not provide a token", async () => {
     let resolved = 0;
     const started = await runAgenticGeneration(input(), dependencies([], {

@@ -673,7 +673,7 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     expect(true).toBe(true);
   });
-  test("forwards canonical phase fields so the public projection cannot stick or regress", async () => {
+  test("publishes canonical nonterminal phases but leaves terminal publication to the cause owner", async () => {
     const executionId = `exec-public-phase-order-${Date.now()}`;
     createTurnExecution({
       id: executionId,
@@ -724,6 +724,23 @@ describe("production agentic coordinator installation", () => {
       { phase: "COMMIT", status: "waiting", outcome: null },
       { phase: "COMMIT", status: "running", outcome: null },
     ]);
+
+    await publishPhase({
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      phase: "FAILED",
+      workPhase: "TERMINAL",
+      workStatus: "terminal",
+      workOutcome: "failed",
+      reason: "failed",
+      target: { generationType: "normal" },
+    });
+    expect(getAgentRun(USER_ID, executionId)).toMatchObject({
+      workPhase: "COMMIT",
+      workStatus: "running",
+      workOutcome: null,
+    });
   });
 
   test("maps the retained Turn Session through public COMMIT during normal preparation", async () => {

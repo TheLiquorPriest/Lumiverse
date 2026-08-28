@@ -123,6 +123,13 @@ outbox. Only after that transaction commits may the Agentic pool or compatibilit
 websocket event become terminal. If convergence is interrupted, the original
 WORK/COMMIT cause remains unchanged and startup or exact dormant Stop repairs
 the durable owner surfaces idempotently without replaying provider work.
+Ordinary phase publication stops before every terminal phase; only the terminal
+publisher may freeze the cause-aware terminal surfaces. Startup may append one
+recovered terminal revision for the known premature generic
+`FAILED / failed / internal_error` projection only when the immutable
+execution and exact inspection agree on `FAILED / rejected / invalid_input`,
+the target identity is exact, and no commit receipt exists. Any near-match or
+unrelated terminal mismatch remains immutable and fails readiness closed.
 This includes failures after durable admission but before workspace setup
 finishes. Cleanup releases process resources only. When source-chat deletion
 has already removed every chat-owned projection, recovery converges the

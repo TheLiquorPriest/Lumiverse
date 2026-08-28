@@ -350,6 +350,40 @@ function seedLegacyStaleDecisionTerminal(
   return created;
 }
 
+function seedLegacyPrematureFailedProjection(db: Database, id: string) {
+  const created = seedLegacyStaleDecisionTerminal(db, id, "internal_error");
+  db.query("UPDATE agent_turn_executions SET terminal_code = 'invalid_input' WHERE id = ?")
+    .run(id);
+  const projectionRow = db.query(
+    "SELECT snapshot_json FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+  ).get("u1", id) as { snapshot_json: string };
+  const projection = JSON.parse(projectionRow.snapshot_json) as {
+    reason: string;
+    error: { reason: string };
+  };
+  projection.reason = "failed";
+  projection.error.reason = "failed";
+  const projectionJson = JSON.stringify(projection);
+  db.query("UPDATE agent_run_projections SET snapshot_json = ? WHERE user_id = ? AND turn_id = ?")
+    .run(projectionJson, "u1", id);
+  db.query("UPDATE agent_chat_events SET snapshot_json = ? WHERE user_id = ? AND turn_id = ?")
+    .run(projectionJson, "u1", id);
+  db.query("UPDATE agent_run_attempts SET reason = 'invalid_input' WHERE user_id = ? AND attempt_id = ?")
+    .run("u1", id);
+  const activityRow = db.query(
+    "SELECT snapshot_json FROM agent_activity_runs WHERE user_id = ? AND generation_id = ?",
+  ).get("u1", id + "-generation") as { snapshot_json: string };
+  const activity = JSON.parse(activityRow.snapshot_json) as {
+    snapshot: { errorCounts: Record<string, number>; terminalErrorCode: string };
+  };
+  activity.snapshot.errorCounts = { internal_error: 1 };
+  activity.snapshot.terminalErrorCode = "internal_error";
+  const activityJson = JSON.stringify(activity);
+  db.query("UPDATE agent_activity_runs SET snapshot_json = ?, byte_size = ? WHERE user_id = ? AND generation_id = ?")
+    .run(activityJson, new TextEncoder().encode(activityJson).byteLength, "u1", id + "-generation");
+  return created;
+}
+
 function replayStartupTurnReconciliation(db: Database) {
   return reconcileStartupState(db, {
     reconcileExportStaging: () => ({ inspected: 0, removed: 0, preserved: 0, failures: 0 }),
@@ -1674,6 +1708,90 @@ describe("receipt commit and startup recovery", () => {
     expect((db.query(`
       SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?
     `).get("legacy-stale-decision") as { count: number }).count).toBe(2);
+  });
+
+  test("repairs the premature generic FAILED projection from a canonical invalid-input rejection", async () => {
+    createTerminalRecoverySchema(db);
+    seedLegacyPrematureFailedProjection(db, "legacy-premature-failed-projection");
+
+    const firstStartup = await replayStartupTurnReconciliation(db);
+    expect(firstStartup.stages.turns.ok).toBe(true);
+    expect(firstStartup.turns).toMatchObject({
+      complete: true,
+      inspected: 1,
+      projectionRepairs: 1,
+    });
+    expect(db.query(
+      "SELECT outcome, reason, reconciliation_state FROM agent_run_attempts WHERE attempt_id = ?",
+    ).get("legacy-premature-failed-projection")).toEqual({
+      outcome: "rejected",
+      reason: "invalid_input",
+      reconciliation_state: "recovered",
+    });
+    const projection = db.query(
+      "SELECT revision, sequence, snapshot_json FROM agent_run_projections WHERE turn_id = ?",
+    ).get("legacy-premature-failed-projection") as {
+      revision: number;
+      sequence: number;
+      snapshot_json: string;
+    };
+    expect(projection).toMatchObject({ revision: 2, sequence: 2 });
+    expect(JSON.parse(projection.snapshot_json)).toMatchObject({
+      workOutcome: "rejected",
+      reason: "invalid_input",
+      error: { code: "invalid_input", workOutcome: "rejected" },
+    });
+    expect(db.query(
+      "SELECT phase, terminal_code FROM agent_turn_executions WHERE id = ?",
+    ).get("legacy-premature-failed-projection")).toEqual({
+      phase: "FAILED",
+      terminal_code: "invalid_input",
+    });
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?",
+    ).get("legacy-premature-failed-projection") as { count: number }).count).toBe(0);
+    const outcomes = db.query(
+      "SELECT snapshot_json FROM agent_chat_events WHERE turn_id = ? ORDER BY sequence",
+    ).all("legacy-premature-failed-projection") as Array<{ snapshot_json: string }>;
+    expect(outcomes.map((event) => (
+      JSON.parse(event.snapshot_json) as { workOutcome: string }
+    ).workOutcome)).toEqual(["failed", "rejected"]);
+
+    const secondStartup = await replayStartupTurnReconciliation(db);
+    expect(secondStartup.stages.turns.ok).toBe(true);
+    expect(secondStartup.turns).toMatchObject({
+      complete: true,
+      inspected: 0,
+      projectionRepairs: 0,
+    });
+    expect(db.query(
+      "SELECT revision, sequence, snapshot_json FROM agent_run_projections WHERE turn_id = ?",
+    ).get("legacy-premature-failed-projection")).toEqual(projection);
+  });
+
+  test("leaves near-match FAILED projections immutable when the historical defect shape differs", async () => {
+    createTerminalRecoverySchema(db);
+    seedLegacyPrematureFailedProjection(db, "unrelated-premature-failed-projection");
+    const row = db.query(
+      "SELECT snapshot_json FROM agent_run_projections WHERE turn_id = ?",
+    ).get("unrelated-premature-failed-projection") as { snapshot_json: string };
+    const snapshot = JSON.parse(row.snapshot_json) as { reason: string };
+    snapshot.reason = "provider_failure";
+    db.query("UPDATE agent_run_projections SET snapshot_json = ? WHERE turn_id = ?")
+      .run(JSON.stringify(snapshot), "unrelated-premature-failed-projection");
+    const before = db.query(
+      "SELECT revision, sequence, snapshot_json FROM agent_run_projections WHERE turn_id = ?",
+    ).get("unrelated-premature-failed-projection");
+
+    const startup = await replayStartupTurnReconciliation(db);
+    expect(startup.stages.turns.ok).toBe(false);
+    expect(startup.turns).toMatchObject({ complete: false, projectionRepairs: 0 });
+    expect(db.query(
+      "SELECT revision, sequence, snapshot_json FROM agent_run_projections WHERE turn_id = ?",
+    ).get("unrelated-premature-failed-projection")).toEqual(before);
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE turn_id = ?",
+    ).get("unrelated-premature-failed-projection") as { count: number }).count).toBe(1);
   });
 
   test("leaves unrelated terminal mismatches immutable and fails startup closed", async () => {

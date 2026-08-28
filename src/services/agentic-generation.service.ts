@@ -666,7 +666,12 @@ async function transition(
     }
     active.phase = next;
   }
-  if (deps.publishPhase && active.execution) {
+  // Durable terminal CAS is only the cause authority. The single terminal
+  // publisher owns every immutable terminal projection and Turn Session write;
+  // routing FAILED/CANCELLED/etc. through the ordinary phase publisher first
+  // would freeze a generic failed/internal_error snapshot before cause-aware
+  // convergence can publish rejected, stopped, exhausted, or failed truth.
+  if (deps.publishPhase && active.execution && !isTerminalAgenticPhase(next)) {
     const target = targetFor(active);
     const canonical = canonicalFor(active, next, "streaming");
     await deps.publishPhase({

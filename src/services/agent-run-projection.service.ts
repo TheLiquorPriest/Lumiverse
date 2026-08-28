@@ -203,8 +203,8 @@ export interface AgentRunProjectionInputV2 {
   readonly compatibilitySnapshot?: unknown;
   readonly receiptRepair?: boolean;
   readonly recoveryRepair?: boolean;
-  /** One-time recovery of the fd8 stale-decision failed→rejected writer defect. */
-  readonly decisionRefreshOutcomeRepair?: boolean;
+  /** One-time, exact-shape recovery for known premature FAILED→rejected writer defects. */
+  readonly terminalRejectedOutcomeRepair?: boolean;
   /** Write a terminal public projection without inspecting/rewriting an already-exact inspection. */
   readonly preserveTerminalInspection?: boolean;
 }
@@ -2801,20 +2801,16 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "EXHAUSTED"
     && input.workOutcome === "exhausted"
     && rawSnapshotOutcome !== "exhausted";
-  const decisionRefreshOutcomeRepair = input.decisionRefreshOutcomeRepair === true
+  const rejectedRepairBase = input.terminalRejectedOutcomeRepair === true
     && existingRow?.status === "FAILED"
     && existingRow.phase === "FAILED"
     && existing?.workStatus === "terminal"
     && rawSnapshotOutcome === "failed"
-    && rawSnapshot?.reason === "stale_input"
-    && rawSnapshotError?.code === "decision_refresh_required"
     && rawSnapshotError?.workOutcome === "failed"
     && (existing?.terminalHandoff === null || existing?.terminalHandoff?.committed === false)
     && normalizeStoredState(input.status ?? input.phase ?? input.workPhase) === "FAILED"
     && input.workStatus === "terminal"
     && input.workOutcome === "rejected"
-    && input.reason === "stale_input"
-    && input.error?.code === "decision_refresh_required"
     && input.error?.workOutcome === "rejected"
     && (input.terminalHandoff === null || input.terminalHandoff?.committed === false)
     && input.receiptId === undefined
@@ -2822,9 +2818,20 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     && !db.query(
       "SELECT 1 FROM agent_turn_commit_receipts WHERE user_id = ? AND (execution_id = ? OR turn_id = ?) LIMIT 1",
     ).get(input.userId, input.turnId, input.turnId);
+  const staleDecisionRejectedRepair = rejectedRepairBase
+    && rawSnapshot?.reason === "stale_input"
+    && rawSnapshotError?.code === "decision_refresh_required"
+    && input.reason === "stale_input"
+    && input.error?.code === "decision_refresh_required";
+  const prematurePhaseRejectedRepair = rejectedRepairBase
+    && rawSnapshot?.reason === "failed"
+    && rawSnapshotError?.code === "internal_error"
+    && input.reason === "invalid_input"
+    && input.error?.code === "invalid_input";
+  const terminalRejectedOutcomeRepair = staleDecisionRejectedRepair || prematurePhaseRejectedRepair;
   const recoveryRepairNeeded = (
     input.recoveryRepair === true && !!existing && (!isTerminal(existing) || exhaustedSnapshotRepair)
-  ) || decisionRefreshOutcomeRepair;
+  ) || terminalRejectedOutcomeRepair;
   if (existing && (
     (input.revision !== undefined && input.revision <= existing.revision)
     || (isTerminal(existing) && !receiptRepairNeeded && !recoveryRepairNeeded)

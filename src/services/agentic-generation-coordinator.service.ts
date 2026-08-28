@@ -6115,6 +6115,10 @@ function buildDependencies(): AgenticGenerationDependencies {
       return { receiptId: result.receipt.id, commitKey: execution.commitKey, messageId: result.messageId ?? undefined, swipeId: result.swipeId ?? undefined, summary: typeof result.receipt.summary === "object" ? result.receipt.summary as Record<string, unknown> : undefined };
     },
     publishPhase: (event) => {
+      // publishTerminal owns all immutable terminal surfaces in one transaction.
+      if (event.phase === "COMMITTED" || event.phase === "COMMIT_FAILED"
+        || event.phase === "EXHAUSTED" || event.phase === "FAILED"
+        || event.phase === "CANCELLED" || event.phase === "TIMED_OUT") return;
       const phaseWriter = inspectionWriters.get(event.executionId);
       phaseWriter?.record("milestone", {
         id: `phase:${event.executionId}:${event.phase}`,
@@ -6135,10 +6139,6 @@ function buildDependencies(): AgenticGenerationDependencies {
         reason: inspectionReason(event.reason),
         updatedAt: Date.now(),
       });
-      // COMMITTED is the immutable terminal projection. It is published by
-      // publishTerminal only after persistent-session and inspection
-      // reconciliation succeeds.
-      if (event.phase === "COMMITTED") return;
       if (!getTurnExecution(event.executionId, event.userId)) return;
       const binding = bindings.get(event.executionId);
       const targetMessageId = binding?.messageId ?? event.target.messageId ?? null;
