@@ -1925,6 +1925,29 @@ function mergeRun(provisional: Record<string, AgentRunPublicV2>, terminal: Recor
   if (run.terminalHandoff?.committed && run.terminalHandoff.messageId !== null && run.terminalHandoff.swipeId !== null) terminal[agentRunTerminalTargetKey(run.chatId, run.terminalHandoff.messageId, run.terminalHandoff.swipeId)] = run
   else provisional[agentRunProvisionalKey(run)] = run
 }
+
+function settleExactTerminalGenerationRequest(get: () => AppStore, run: AgentRunPublicV2): void {
+  if (run.workStatus !== 'terminal' || run.workOutcome === null) return
+  const state = get()
+  const accepted = findRunByTurnId(state, run.turnId)
+  const request = state.generationRequests?.[run.chatId]
+  if (
+    accepted?.workStatus !== 'terminal'
+    || accepted.generationId !== run.generationId
+    || request?.generationId !== run.generationId
+  ) return
+  const status = run.workOutcome === 'completed'
+    ? 'completed'
+    : run.workOutcome === 'stopped'
+      ? 'stopped'
+      : 'error'
+  state.settleGenerationRequest?.(
+    run.chatId,
+    status,
+    run.generationId,
+    request.requestAuthorityId,
+  )
+}
 function withoutChat<T extends AgentRunPublicV2>(values: Record<string, T>, chatId: string): Record<string, T> {
   return Object.fromEntries(Object.entries(values).filter(([, run]) => run.chatId !== chatId))
 }
@@ -2346,6 +2369,8 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
         agentRunOmittedEventsByChat: { ...current.agentRunOmittedEventsByChat, [chatId]: Math.max(current.agentRunOmittedEventsByChat[chatId] ?? 0, normalized.omission.omittedEventCount) },
       }
     })
+    normalized.runs.forEach((run) => settleExactTerminalGenerationRequest(get, run))
+    normalized.events.forEach((event) => settleExactTerminalGenerationRequest(get, event.run))
     return true
   },
   failAgentRunRestore: (chatId, requestEpoch) => {
@@ -2380,6 +2405,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
         agentRunOmittedEventsByChat: { ...state.agentRunOmittedEventsByChat, [event.chatId]: (state.agentRunOmittedEventsByChat[event.chatId] ?? 0) + event.omission.omittedEventCount + (gap ? event.sequence - currentSequence - 1 : 0) },
       }
     })
+    settleExactTerminalGenerationRequest(get, event.run)
     return gap ? 'gap' : 'applied'
   },
   reconcileExactAgentRun: (chatId, payload) => {
@@ -2391,6 +2417,7 @@ export const createAgentRunsSlice: StateCreator<AppStore, [], [], AgentRunsSlice
       mergeRun(provisional, terminal, run)
       return { agentRunProvisionalByKey: provisional, agentRunTerminalByTarget: terminal }
     })
+    settleExactTerminalGenerationRequest(get, run)
     return true
   },
   markAgentRunsStale: (chatId) => set((state) => {

@@ -30,6 +30,7 @@ import type {
 } from "../types/agent-runtime-decision";
 import { ARCHIVE_REGISTRY_VERSION } from "./user-data/table-registry";
 import { CanonicalDataError, canonicalPlainDataBounds } from "../utils/canonical-plain-data";
+import { compareUtf8 } from "../utils/utf8-order";
 import { getIsolateHealthEpoch } from "./isolate-pool";
 import {
   getPresetAgentConfig,
@@ -1313,10 +1314,12 @@ function runtimeInputRevisions(snapshot: RuntimeSnapshot): RuntimeInputRevisionS
     if (entries.length === 0) return null;
     if (entries.length === 1) return entries[0].revision;
     // Native World Info activation enriches source rows with turn-derived
-    // state after admission. Its fence is the ordered source identity and
-    // monotonic revision, not the preflight/ASSEMBLE projection digest.
+    // state after admission. Its fence is the canonical source identity and
+    // monotonic revision set, not collector order or projection digest.
     const authority = sourceOwned
-      ? entries.map((entry) => ({ id: entry.id, revision: entry.revision }))
+      ? entries
+        .map((entry) => ({ id: entry.id, revision: entry.revision }))
+        .sort((left, right) => compareUtf8(left.id, right.id) || compareUtf8(left.revision, right.revision))
       : entries;
     return createHash("sha256").update(JSON.stringify(authority)).digest("hex");
   };

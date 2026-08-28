@@ -396,8 +396,9 @@ immutable tool/participant availability, preparation limits, and a closed
 keyword, constant, and vector activation, native ordering, budgets, cache,
 state, and activation provenance; the strict worker consumes that finalized
 projection and does not run a parallel World Info implementation. Runtime
-admission aggregates a multi-entry World Info fence from each ordered source
-ID and monotonic revision, not from activation-enriched projection digests;
+admission aggregates a multi-entry World Info fence from every authoritative
+member ID and revision in canonical member order, not from collector traversal
+order or activation-enriched projection digests;
 ASSEMBLE still freezes the finalized projection and COMMIT rechecks every exact
 source member. Native
 Databank retrieval remains outside Loom and is projected from authenticated

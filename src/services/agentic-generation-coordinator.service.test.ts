@@ -1876,11 +1876,15 @@ describe("production agentic coordinator installation", () => {
     expect(snapshot.agentConfig).toBeNull();
     expect(Array.isArray(snapshot.availability.toolIds)).toBe(true);
   });
-  test("admits turn-derived World Info activation without weakening source revision fences", async () => {
+  test("admits differently ordered World Info projections before provider without weakening source revision fences", async () => {
     const db = getDb();
     const bookId = "book-runtime-world-authority";
-    const firstEntryId = "entry-runtime-world-authority-a";
-    const secondEntryId = "entry-runtime-world-authority-b";
+    // Native World Info retains insertion order for equal order_value rows,
+    // while admission's fallback query uses the ID tie-breaker. These IDs
+    // deliberately make the two projections traverse the same sources in
+    // opposite orders.
+    const firstEntryId = "entry-runtime-world-authority-z";
+    const secondEntryId = "entry-runtime-world-authority-a";
     const character = db.query("SELECT extensions FROM characters WHERE id = ?").get("character-coordinator") as { extensions: string };
     const now = Date.now();
     db.query(
@@ -1895,6 +1899,7 @@ describe("production agentic coordinator installation", () => {
       .run(JSON.stringify({ world_book_ids: [bookId] }), "character-coordinator");
 
     try {
+      const providerRequestsBefore = providerRequests.length;
       const deps = __testing.buildDependencies();
       const input = {
         userId: USER_ID,
@@ -1918,6 +1923,7 @@ describe("production agentic coordinator installation", () => {
         [firstEntryId, true],
         [secondEntryId, true],
       ]);
+      expect(providerRequests).toHaveLength(providerRequestsBefore);
 
       db.query("UPDATE world_book_entries SET revision = revision + 1 WHERE id = ?").run(secondEntryId);
       await expect(deps.buildAssemblySnapshot!(
@@ -1931,6 +1937,7 @@ describe("production agentic coordinator installation", () => {
         code: "agentic_revision_conflict",
         message: "stale_input_revision",
       });
+      expect(providerRequests).toHaveLength(providerRequestsBefore);
     } finally {
       db.query("UPDATE characters SET extensions = ? WHERE id = ?")
         .run(character.extensions, "character-coordinator");

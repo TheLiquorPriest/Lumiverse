@@ -12,10 +12,38 @@ import {
 } from './agent-runs'
 import type { AgentRunChangesV2, AgentRunPublicV2 } from '@/types/agent-runs'
 
-type TestStore = Pick<AppStore, 'activeChatId'> & AgentRunsSlice
+type TestStore = Pick<AppStore, 'activeChatId' | 'generationRequests' | 'settleGenerationRequest'> & AgentRunsSlice
 
 const useStore = create<TestStore>()((set, get, api) => ({
   activeChatId: 'chat-a',
+  generationRequests: {},
+  settleGenerationRequest: (chatId, status, generationId, requestAuthorityId) => {
+    let settled = false
+    set((state) => {
+      const current = state.generationRequests[chatId]
+      if (
+        !current
+        || generationId === null
+        || current.generationId !== generationId
+        || current.requestAuthorityId !== requestAuthorityId
+      ) return state
+      settled = true
+      return {
+        generationRequests: {
+          ...state.generationRequests,
+          [chatId]: {
+            ...current,
+            status,
+            abortController: null,
+            terminalGenerationIds: current.terminalGenerationIds.includes(generationId)
+              ? current.terminalGenerationIds
+              : [...current.terminalGenerationIds, generationId],
+          },
+        },
+      }
+    })
+    return settled
+  },
   ...createAgentRunsSlice(
     set as unknown as Parameters<typeof createAgentRunsSlice>[0],
     get as unknown as Parameters<typeof createAgentRunsSlice>[1],
@@ -108,6 +136,7 @@ function changes(
 beforeEach(() => {
   useStore.setState({
     activeChatId: 'chat-a',
+    generationRequests: {},
     agentRunProvisionalByKey: {},
     agentRunTerminalByTarget: {},
     agentRunCursorByChat: {},
@@ -124,6 +153,46 @@ beforeEach(() => {
 
 
 describe('agent run projection slice', () => {
+  test('an exact rejected terminal run retires the queued request authority', () => {
+    useStore.setState({
+      generationRequests: {
+        'chat-a': {
+          chatId: 'chat-a',
+          epoch: 1,
+          requestAuthorityId: 'request-a',
+          generationId: 'generation-a',
+          abortController: new AbortController(),
+          status: 'queued',
+          generationType: 'normal',
+          targetMessageId: null,
+          targetSwipeId: null,
+          retiredGenerationIds: [],
+          terminalGenerationIds: [],
+        },
+      },
+    })
+
+    expect(useStore.getState().reconcileAgentRunEvent({
+      version: 2,
+      chatId: 'chat-a',
+      sequence: 1,
+      run: run({
+        revision: 2,
+        sequence: 1,
+        workPhase: 'TERMINAL',
+        workStatus: 'terminal',
+        workOutcome: 'rejected',
+        reason: 'needs_attention',
+      }),
+      omission: { omittedNodeCount: 0, omittedEventCount: 0, firstOmittedSequence: null, lastOmittedSequence: null },
+    })).toBe('applied')
+
+    const request = useStore.getState().generationRequests['chat-a']
+    expect(request.status).toBe('error')
+    expect(request.abortController).toBeNull()
+    expect(request.terminalGenerationIds).toEqual(['generation-a'])
+    expect(selectActiveAgentRunForChat(useStore.getState(), 'chat-a', 'generation-a')).toBeUndefined()
+  })
   test('rejects public runs whose attempt lineage does not bind to the run identity', () => {
     expect(normalizeAgentRunPublicV2(run({
       inspectionAttemptId: 'attempt-other',
