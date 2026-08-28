@@ -3568,7 +3568,7 @@ function exactTerminalReconciliationPredicate(
          AND typeof(a.reconciliation_state) = 'text'
          AND a.reconciliation_state IN ('authoritative', 'recovered')
          AND typeof(a.outcome) = 'text'
-         AND lower(trim(a.outcome)) = ${expectedOutcome}
+         AND lower(trim(a.outcome, ${SQL_ECMASCRIPT_TRIM_CHARACTERS})) = ${expectedOutcome}
          AND typeof(a.reason) = 'text'
          AND ${exactReason}
          AND typeof(p.user_id) = 'text'

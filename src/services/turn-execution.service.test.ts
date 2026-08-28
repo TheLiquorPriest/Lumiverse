@@ -1053,7 +1053,7 @@ describe("receipt commit and startup recovery", () => {
       "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE state IN ('ASSEMBLE', 'WORK', 'COMPLETE', 'RENDER', 'PREPARE_COMMIT', 'COMMITTING')",
     ).get() as { count: number }).count).toBe(0);
   });
-  test("skips retained exact terminal history so newer interrupted work reaches ready startup", async () => {
+  test("skips 2,049 tab/NBSP-padded exact terminal authorities so newer work reaches ready startup", async () => {
     createTerminalRecoverySchema(db);
     const retainedCount = TURN_EXECUTION_RECONCILIATION.maxRows + 1;
     const omissionJson = JSON.stringify({
@@ -1068,7 +1068,7 @@ describe("receipt commit and startup recovery", () => {
       lifecycle, status, outcome, reason, terminal, started_at, updated_at,
       terminal_at, host_correlation_id, reconciliation_state, created_at
     ) VALUES (?, 'c1', ?, NULL, ?, ?, ?, 'normal', NULL, NULL,
-      'TERMINAL', 'terminal', 'failed', 'interrupted', 1, ?, ?, ?, ?, 'recovered', ?)`);
+      'TERMINAL', 'terminal', ?, 'interrupted', 1, ?, ?, ?, ?, 'recovered', ?)`);
     const insertProjection = db.query(`INSERT INTO agent_run_projections (
       user_id, chat_id, turn_id, generation_id, generation_type, target_message_id,
       target_swipe_id, status, phase, revision, sequence, started_at, updated_at,
@@ -1083,6 +1083,7 @@ describe("receipt commit and startup recovery", () => {
       generationId: string,
       sequence: number,
       orderedAt: number,
+      settledOutcome = "failed",
     ): void => {
       const snapshot = JSON.stringify({
         version: 2,
@@ -1122,6 +1123,7 @@ describe("receipt commit and startup recovery", () => {
         generationId,
         executionId,
         generationId,
+        settledOutcome,
         orderedAt,
         orderedAt,
         orderedAt,
@@ -1149,7 +1151,8 @@ describe("receipt commit and startup recovery", () => {
         transition(db, id, historical.ownerToken, "ASSEMBLE", "FAILED");
         db.query("UPDATE agent_turn_executions SET created_at = ?, updated_at = ? WHERE id = ?")
           .run(orderedAt, orderedAt, id);
-        persistExactTerminal(id, historical.execution.generationId, orderedAt, orderedAt);
+        const settledOutcome = index % 2 === 0 ? "\tfailed\t" : "\u00a0failed\u00a0";
+        persistExactTerminal(id, historical.execution.generationId, orderedAt, orderedAt, settledOutcome);
       }
     })();
 
@@ -1167,6 +1170,16 @@ describe("receipt commit and startup recovery", () => {
     expect((db.query(
       "SELECT COUNT(*) AS count FROM agent_turn_executions WHERE id LIKE 'retained-terminal-%' AND state = 'FAILED'",
     ).get() as { count: number }).count).toBe(retainedCount);
+    const paddedOutcomes = db.query(`
+      SELECT
+        SUM(CASE WHEN outcome = char(9) || 'failed' || char(9) THEN 1 ELSE 0 END) AS tabs,
+        SUM(CASE WHEN outcome = char(160) || 'failed' || char(160) THEN 1 ELSE 0 END) AS nbsps
+      FROM agent_run_attempts
+      WHERE turn_id LIKE 'retained-terminal-%'
+    `).get() as { tabs: number; nbsps: number };
+    expect(paddedOutcomes.tabs).toBeGreaterThan(0);
+    expect(paddedOutcomes.nbsps).toBeGreaterThan(0);
+    expect(paddedOutcomes.tabs + paddedOutcomes.nbsps).toBe(retainedCount);
 
     const previousPreprocessingWorker = process.env.LUMIVERSE_AGENTIC_PREPROCESSING_WORKER;
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
