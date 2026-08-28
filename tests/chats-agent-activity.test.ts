@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { join } from "path";
-import { closeDatabase, getDb, initDatabase } from "../src/db/connection";
+import { closeDatabaseAsync, getDb, initDatabase } from "../src/db/connection";
 import * as chatsSvc from "../src/services/chats.service";
 import type { AgentSummary } from "../src/types/agents";
 
@@ -46,7 +46,8 @@ function createAssistantMessage(extra: Record<string, unknown> = {}) {
 
 describe("AgentSummary swipe-scoped message extras", () => {
   beforeEach(async () => {
-    closeDatabase();
+    await chatsSvc.waitForChatChunkMaintenance();
+    await closeDatabaseAsync();
     initDatabase(":memory:");
     await applyBaseline();
   });

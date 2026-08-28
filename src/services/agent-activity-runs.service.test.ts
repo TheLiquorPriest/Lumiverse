@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
-import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Hono } from "hono";
 import { join } from "node:path";
-import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { closeDatabaseAsync, getDb, initDatabase } from "../db/connection";
+import * as embeddingsSvc from "./embeddings.service";
 import { chatsRoutes } from "../routes/chats.routes";
 import {
   AGENT_ACTIVITY_CHAT_MAX_BYTES,
@@ -74,11 +75,12 @@ function snapshot(status: AgentActivitySnapshotV1["status"] = "completed", extra
 }
 
 beforeEach(async () => {
-  closeDatabase();
+  spyOn(embeddingsSvc, "deleteChatChunkEmbeddings").mockResolvedValue(undefined);
+  await closeDatabaseAsync();
   initDatabase(":memory:");
   await applyActivitySchema();
 });
-afterEach(() => closeDatabase());
+afterEach(async () => closeDatabaseAsync());
 function inspectionInput(
   chatId: string,
   overrides: Partial<PersistAgentRunInspectionInputV1> = {},

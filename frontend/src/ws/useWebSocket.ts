@@ -54,6 +54,7 @@ import {
 } from '@/lib/generation-recovery'
 import { startGenerationWithRecovery } from '@/lib/generation-recovery'
 import { recoverAgentRuns } from '@/lib/agent-run-recovery'
+import { acceptsClientGenerationAuthority } from '@/lib/generation-request-authority'
 import { checkForBundleUpdate } from '@/lib/swUpdater'
 import type {
   StreamTokenPayload,
@@ -889,6 +890,7 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_STARTED, (payload: GenerationStartedPayload) => {
+        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
         if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
@@ -935,6 +937,7 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_IN_PROGRESS, (payload: GenerationInProgressPayload) => {
+        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
         if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
@@ -1069,6 +1072,7 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_ENDED, (payload: GenerationEndedPayload) => {
+        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
         const state = store.getState()
         if (
           payload.generationId &&
@@ -1465,6 +1469,7 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_STOPPED, (payload: GenerationStoppedPayload) => {
+        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
         const state = store.getState()
         const isActiveChat = !!payload.chatId && payload.chatId === state.activeChatId
         if (

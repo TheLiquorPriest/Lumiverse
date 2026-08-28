@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import * as embeddingsSvc from "./embeddings.service";
 import { eventBus } from "../ws/bus";
 import { EventType, type EventMessage } from "../ws/events";
 import {
@@ -185,6 +186,7 @@ function seedMessage(
 }
 
 beforeEach(() => {
+  spyOn(embeddingsSvc, "deleteChatChunkEmbeddings").mockResolvedValue(undefined);
   initChatsTestDb();
   seedCharacter("c1", "Alpha");
   seedCharacter("c2", "Beta");

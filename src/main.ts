@@ -466,6 +466,8 @@ async function gracefulShutdown(signal: string) {
   stopSmartctlMonitor();
 
   // 8. Close database (triggers WAL checkpoint)
+  const { stopLanceDbMaintenanceSupervisor } = await import("./services/lancedb-maintenance-supervisor");
+  await stopLanceDbMaintenanceSupervisor();
   const { closeDatabaseAsync } = await import("./db/connection");
   await closeDatabaseAsync();
 

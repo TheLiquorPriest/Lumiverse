@@ -36,6 +36,7 @@ import {
   getActiveGenerationCount,
   startGeneration,
   stopGeneration,
+  stopGenerationRequestAuthority,
 } from "./generate.service";
 import * as pool from "./generation-pool.service";
 import { buildInlineToolContinuation } from "./inline-tool-continuation";
@@ -1756,6 +1757,48 @@ describe.serial("root generation usage accounting", () => {
       generation_type: "normal",
     });
   }
+  test("correlated id-less Stop retires a request suspended before generation registration", async () => {
+    const fixture = await createFixture("inactive_success");
+    const authorityId = crypto.randomUUID();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const originalResolve = runtimeDecisionSvc.resolveEffectiveRuntime;
+    const resolveSpy = spyOn(runtimeDecisionSvc, "resolveEffectiveRuntime").mockImplementation(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return originalResolve(...args);
+    });
+    try {
+      const starting = startGeneration({
+        userId: fixture.userId,
+        userName: fixture.userName,
+        chat_id: fixture.chat.id,
+        connection_id: fixture.connection.id,
+        preset_id: fixture.preset.id,
+        force_preset_id: true,
+        generation_type: "swipe",
+        request_authority_id: authorityId,
+      });
+      const outcome = starting.then(
+        (result) => ({ result, error: null }),
+        (error) => ({ result: null, error }),
+      );
+      await entered.promise;
+      expect(getActiveGenerationCount()).toBe(0);
+      expect(await stopGenerationRequestAuthority(fixture.userId, fixture.chat.id, authorityId)).toBe(true);
+      release.resolve();
+      const settled = await outcome;
+      expect(settled.result).toBeNull();
+      expect(settled.error).toMatchObject({ name: "AbortError" });
+      expect(getActiveGenerationCount()).toBe(0);
+      expect(pool.getPoolForChat(fixture.userId, fixture.chat.id)).toBeUndefined();
+      expect(fixture.provider.rootRequests).toHaveLength(0);
+    } finally {
+      release.resolve();
+      resolveSpy.mockRestore();
+      await cleanupFixture(fixture.chat.id);
+    }
+  });
   test("keeps exact ordinary provider identity from pool creation through lifecycle events", async () => {
     const fixture = await createFixture("inactive_success");
     const started = Promise.withResolvers<Record<string, any>>();

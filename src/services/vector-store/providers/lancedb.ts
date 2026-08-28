@@ -19,6 +19,7 @@
  * embeddings.service.ts.
  */
 import { connect, Index, type Connection, type Table } from "@lancedb/lancedb";
+import { AsyncLocalStorage } from "node:async_hooks"
 
 export type { Table } from "@lancedb/lancedb";
 import { dirname, join } from "path";
@@ -125,7 +126,108 @@ let lancedbPathDiagnosticsLogged = false;
 let optimizeTimer: ReturnType<typeof setTimeout> | null = null;
 let deferredOptimizeEpoch = 0;
 let nativeMutationAdmissionsBlocked = 0;
-let activeNativeMutations = 0;
+let lanceDatabaseGeneration = 0;
+let nextLanceGenerationOwnerId = 1;
+type LanceGenerationOwnerKind = "write" | "native_mutation" | "replacement" | "external_maintenance";
+type LanceGenerationOwner = {
+  readonly id: number;
+  readonly kind: LanceGenerationOwnerKind;
+  generation: number;
+  readonly controller: AbortController;
+  readonly externalSignal?: AbortSignal;
+  retire?: () => void | Promise<void>;
+  released: boolean;
+};
+const lanceGenerationOwners = new Map<number, LanceGenerationOwner>();
+const lanceGenerationOwnerStorage = new AsyncLocalStorage<LanceGenerationOwner>();
+
+export class LanceDatabaseGenerationCancelledError extends Error {
+  readonly code = "lancedb_generation_cancelled";
+
+  constructor(readonly admittedGeneration: number, readonly currentGeneration: number) {
+    super(`LanceDB generation ${admittedGeneration} was replaced by generation ${currentGeneration}`);
+    this.name = "LanceDatabaseGenerationCancelledError";
+  }
+}
+
+function lanceGenerationCancellation(owner: LanceGenerationOwner): unknown {
+  return owner.externalSignal?.aborted
+    ? owner.externalSignal.reason ?? new DOMException("Aborted", "AbortError")
+    : owner.controller.signal.reason instanceof Error
+      ? owner.controller.signal.reason
+      : new LanceDatabaseGenerationCancelledError(owner.generation, lanceDatabaseGeneration);
+}
+
+function assertLanceGenerationOwner(owner: LanceGenerationOwner): void {
+  if (
+    owner.released
+    || owner.externalSignal?.aborted
+    || owner.controller.signal.aborted
+    || owner.generation !== lanceDatabaseGeneration
+  ) {
+    throw lanceGenerationCancellation(owner);
+  }
+}
+
+function releaseLanceGenerationOwner(owner: LanceGenerationOwner): void {
+  if (owner.released) return;
+  owner.released = true;
+  lanceGenerationOwners.delete(owner.id);
+  for (const resolve of nativeMutationDrainWaiters) resolve();
+  nativeMutationDrainWaiters.clear();
+}
+
+function admitLanceGenerationOwner(
+  kind: LanceGenerationOwnerKind,
+  externalSignal?: AbortSignal,
+): LanceGenerationOwner {
+  externalSignal?.throwIfAborted();
+  if (nativeMutationAdmissionsBlocked !== 0) {
+    throw new LanceDatabaseGenerationCancelledError(
+      lanceDatabaseGeneration,
+      lanceDatabaseGeneration + 1,
+    );
+  }
+  const owner: LanceGenerationOwner = {
+    id: nextLanceGenerationOwnerId++,
+    kind,
+    generation: lanceDatabaseGeneration,
+    controller: new AbortController(),
+    ...(externalSignal ? { externalSignal } : {}),
+    released: false,
+  };
+  lanceGenerationOwners.set(owner.id, owner);
+  return owner;
+}
+
+export interface LanceExternalMaintenanceAdmission {
+  readonly signal: AbortSignal;
+  setRetirement(retire: () => void | Promise<void>): void;
+  run<T>(callback: () => Promise<T>): Promise<T>;
+  release(): void;
+}
+
+export function admitLanceExternalMaintenanceOwner(): LanceExternalMaintenanceAdmission {
+  const owner = admitLanceGenerationOwner("external_maintenance");
+  return {
+    signal: owner.controller.signal,
+    setRetirement(retire) {
+      owner.retire = retire;
+      if (owner.controller.signal.aborted) void Promise.resolve(retire()).catch(() => {});
+    },
+    async run(callback) {
+      assertLanceGenerationOwner(owner);
+      return lanceGenerationOwnerStorage.run(owner, async () => {
+        const result = await callback();
+        assertLanceGenerationOwner(owner);
+        return result;
+      });
+    },
+    release() {
+      releaseLanceGenerationOwner(owner);
+    },
+  };
+}
 const nativeMutationDrainWaiters = new Set<() => void>();
 let databaseReplacementTail: Promise<void> = Promise.resolve();
 const OPTIMIZE_DEBOUNCE_MS = 15_000; // 15 seconds after last write (reduced from 30s)
@@ -367,12 +469,14 @@ async function acquireCrossProcessWriteLockIfNeeded(): Promise<(() => void) | nu
   }
 }
 
-export async function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
-  // A child maintenance process asks the serving process to close this gate
-  // before it starts mutating Lance files. Writers need to honor the same
-  // gate as readers; the cross-process write lock alone cannot protect a
-  // native read from optimize() deleting its version files.
+async function withWriteLockForOwner<T>(
+  owner: LanceGenerationOwner,
+  fn: () => Promise<T>,
+): Promise<T> {
+  assertLanceGenerationOwner(owner);
   await awaitMaintenanceGate();
+  assertLanceGenerationOwner(owner);
+
   if (!_writeLockHeld) {
     _writeLockHeld = true;
   } else {
@@ -389,19 +493,41 @@ export async function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
           reject(new Error(`[embeddings] Write lock acquisition timed out after ${WRITE_LOCK_WAIT_TIMEOUT_MS}ms (${_writeLockQueue.length} still queued)`));
         }
       }, WRITE_LOCK_WAIT_TIMEOUT_MS);
-      // Clear the timer if the lock is acquired before timeout
       const origResolve = entry.resolve;
       entry.resolve = () => { clearTimeout(timer); origResolve(); };
     });
+    assertLanceGenerationOwner(owner);
   }
-  const releaseCrossProcessLock = await acquireCrossProcessWriteLockIfNeeded();
+
+  let releaseCrossProcessLock: (() => void) | null = null;
   try {
-    return await fn();
+    releaseCrossProcessLock = await acquireCrossProcessWriteLockIfNeeded();
+    assertLanceGenerationOwner(owner);
+    const result = await fn();
+    assertLanceGenerationOwner(owner);
+    return result;
   } finally {
     releaseCrossProcessLock?.();
     const next = _writeLockQueue.shift();
     if (next) next.resolve();
     else _writeLockHeld = false;
+  }
+}
+
+export async function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+  const inherited = lanceGenerationOwnerStorage.getStore();
+  if (inherited) {
+    assertLanceGenerationOwner(inherited);
+    return withWriteLockForOwner(inherited, fn);
+  }
+  const owner = admitLanceGenerationOwner("write");
+  try {
+    return await lanceGenerationOwnerStorage.run(
+      owner,
+      () => withWriteLockForOwner(owner, fn),
+    );
+  } finally {
+    releaseLanceGenerationOwner(owner);
   }
 }
 
@@ -752,28 +878,46 @@ function cancelDeferredOptimize(): void {
   lastChatOptimizeScheduledAt = 0;
   lastWorldBookOptimizeScheduledAt = 0;
 }
-function waitForNativeMutationDrain(): Promise<void> {
-  if (activeNativeMutations === 0) return Promise.resolve();
-  return new Promise<void>((resolve) => nativeMutationDrainWaiters.add(resolve));
+async function waitForNativeMutationDrain(excludedOwnerId?: number): Promise<void> {
+  while ([...lanceGenerationOwners.values()].some((owner) => owner.id !== excludedOwnerId)) {
+    await new Promise<void>((resolve) => nativeMutationDrainWaiters.add(resolve));
+  }
 }
 
-function releaseNativeMutation(): void {
-  activeNativeMutations -= 1;
-  if (activeNativeMutations !== 0) return;
-  for (const resolve of nativeMutationDrainWaiters) resolve();
-  nativeMutationDrainWaiters.clear();
+function releaseNativeMutation(owner: LanceGenerationOwner): void {
+  releaseLanceGenerationOwner(owner);
 }
 
 function prepareLanceDatabaseReplacement(): Promise<() => void> {
+  return prepareLanceDatabaseReplacementForOwner(lanceGenerationOwnerStorage.getStore());
+}
+
+function prepareLanceDatabaseReplacementForOwner(
+  excludedOwner?: LanceGenerationOwner,
+): Promise<() => void> {
   nativeMutationAdmissionsBlocked += 1;
   cancelDeferredOptimize();
   const previous = databaseReplacementTail;
   const gate = Promise.withResolvers<void>();
   databaseReplacementTail = previous.then(() => gate.promise, () => gate.promise);
 
+  const previousGeneration = lanceDatabaseGeneration;
+  lanceDatabaseGeneration += 1;
+  if (excludedOwner) excludedOwner.generation = lanceDatabaseGeneration;
+  const cancellation = new LanceDatabaseGenerationCancelledError(
+    previousGeneration,
+    lanceDatabaseGeneration,
+  );
+  for (const owner of lanceGenerationOwners.values()) {
+    if (owner === excludedOwner) continue;
+    owner.controller.abort(cancellation);
+    if (owner.retire) void Promise.resolve(owner.retire()).catch(() => {});
+  }
+
   return (async () => {
     await previous.catch(() => undefined);
-    await waitForNativeMutationDrain();
+    await waitForNativeMutationDrain(excludedOwner?.id);
+    await waitForReadsToDrain();
     let released = false;
     return () => {
       if (released) return;
@@ -785,8 +929,13 @@ function prepareLanceDatabaseReplacement(): Promise<() => void> {
 }
 
 function tryPrepareLanceDatabaseReplacementSync(): (() => void) | null {
-  if (nativeMutationAdmissionsBlocked !== 0 || activeNativeMutations !== 0) return null;
+  if (
+    nativeMutationAdmissionsBlocked !== 0
+    || lanceGenerationOwners.size !== 0
+    || _activeReadCount !== 0
+  ) return null;
   nativeMutationAdmissionsBlocked = 1;
+  lanceDatabaseGeneration += 1;
   cancelDeferredOptimize();
   let released = false;
   return () => {
@@ -797,11 +946,21 @@ function tryPrepareLanceDatabaseReplacementSync(): (() => void) | null {
 }
 
 async function withLanceDatabaseReplacement<T>(replace: () => Promise<T> | T): Promise<T> {
-  const release = await prepareLanceDatabaseReplacement();
+  const inherited = lanceGenerationOwnerStorage.getStore();
+  const owner = inherited ?? admitLanceGenerationOwner("replacement");
+  const releasePromise = prepareLanceDatabaseReplacementForOwner(owner);
+  let releaseFence: (() => void) | undefined;
   try {
-    return await replace();
+    releaseFence = await releasePromise;
+    assertLanceGenerationOwner(owner);
+    if (inherited) return await replace();
+    return await lanceGenerationOwnerStorage.run(
+      owner,
+      () => withWriteLockForOwner(owner, async () => await replace()),
+    );
   } finally {
-    release();
+    releaseFence?.();
+    if (!inherited) releaseLanceGenerationOwner(owner);
   }
 }
 
@@ -854,20 +1013,16 @@ export async function refreshLanceDbAfterExternalMaintenance(): Promise<void> {
 }
 
 export function resetSqliteVectorizationState(): void {
-  try {
-    const db = getDb();
-    db.run(
-      `UPDATE world_book_entries
-       SET vector_index_status = ${worldBookVectorDesiredStatusSql()},
-           vector_indexed_at = NULL,
-           vector_index_error = NULL`
-    );
-    db.run(`UPDATE chat_chunks SET vectorized_at = NULL, vector_model = NULL`);
-    db.run(`DELETE FROM query_vector_cache`);
-    db.run(`DELETE FROM chat_memory_cache`);
-  } catch (err) {
-    console.warn("[embeddings] Failed to reset SQLite vectorization state:", err);
-  }
+  const db = getDb();
+  db.run(
+    `UPDATE world_book_entries
+     SET vector_index_status = ${worldBookVectorDesiredStatusSql()},
+         vector_indexed_at = NULL,
+         vector_index_error = NULL`,
+  );
+  db.run(`UPDATE chat_chunks SET vectorized_at = NULL, vector_model = NULL`);
+  db.run(`DELETE FROM query_vector_cache`);
+  db.run(`DELETE FROM chat_memory_cache`);
 }
 
 async function performBrokenEmbeddingsTableRecovery(reason: string, err: unknown): Promise<void> {
@@ -1599,20 +1754,17 @@ export async function runAbortFencedNativeMutation<T>(
   signal: AbortSignal | undefined,
   mutation: () => Promise<T>,
 ): Promise<T> {
-  signal?.throwIfAborted();
-  if (nativeMutationAdmissionsBlocked !== 0) {
-    signal?.throwIfAborted();
-    throw new DOMException("LanceDB replacement is in progress", "AbortError");
-  }
-
-  activeNativeMutations += 1;
+  const inherited = lanceGenerationOwnerStorage.getStore();
+  const owner = inherited ?? admitLanceGenerationOwner("native_mutation", signal);
   try {
-    signal?.throwIfAborted();
-    const result = await mutation();
-    signal?.throwIfAborted();
+    assertLanceGenerationOwner(owner);
+    const result = await (inherited
+      ? mutation()
+      : lanceGenerationOwnerStorage.run(owner, mutation));
+    assertLanceGenerationOwner(owner);
     return result;
   } finally {
-    releaseNativeMutation();
+    if (!inherited) releaseNativeMutation(owner);
   }
 }
 export async function optimizeTable(tableNames?: string[], signal?: AbortSignal): Promise<void> {
@@ -2060,11 +2212,8 @@ function cleanupBrokenTermuxLanceDbMirror(): void {
  * recovering from corruption (e.g. "vector not divisible by 8" errors).
  */
 export async function forceResetLanceDB(): Promise<{ deleted: boolean; path: string }> {
-  // Lock ordering is always write lock then replacement fence. Queued writes
-  // reach the fenced native admission and retire without touching replacement files.
-  return withWriteLock(async () => withLanceDatabaseReplacement(async () => {
+  return withLanceDatabaseReplacement(async () => {
     resetInMemoryVectorStoreState();
-
     const deleted = existsSync(LANCEDB_PATH);
     if (deleted) {
       rmSync(LANCEDB_PATH, { recursive: true, force: true });
@@ -2074,7 +2223,7 @@ export async function forceResetLanceDB(): Promise<{ deleted: boolean; path: str
     resetSqliteVectorizationState();
     console.info("[embeddings] LanceDB force reset complete. Vector store will reinitialize on next use.");
     return { deleted, path: LANCEDB_PATH };
-  }));
+  });
 }
 // ---------------------------------------------------------------------------
 // Structured filter → LanceDB SQL `where()` translation
@@ -2332,9 +2481,7 @@ export class LanceDbStore implements VectorStore {
   }
 
   async close(): Promise<void> {
-    await withWriteLock(async () => withLanceDatabaseReplacement(async () => {
-      resetInMemoryVectorStoreState();
-    }));
+    await withLanceDatabaseReplacement(async () => { resetInMemoryVectorStoreState(); });
   }
 
   withWriteLock<T>(fn: () => Promise<T>): Promise<T> {

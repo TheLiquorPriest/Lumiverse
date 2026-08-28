@@ -472,14 +472,26 @@ accepted. Stable isolate failures are
 
 ### Cancellation, recovery, and compatibility events
 
-The request `AbortSignal` is connected to the Agentic owner. Exact root
-`POST /api/v1/agent-runs/:turnId/stop` is projection-gated: it accepts a
-reversible `ASSEMBLE` or `WORK` run and returns `too_late` from `COMPLETE`,
-`RENDER`, `PREPARE_COMMIT`, or `COMMITTING` onward. The existing
-`/api/v1/generate/stop` generation- or chat-scoped route uses the same
-Agentic owner and returns `{ stopped: boolean, status: "accepted" | "too_late" | "not_found" }`; a generation-id race may try the supplied chat fallback. Use the exact Agent Run Stop route when the `too_late` distinction
-is required. A stop or deadline that wins before `COMMITTING` leaves no
-authoritative generation write.
+The request `AbortSignal` is connected to the Agentic owner. UI-owned generation
+requests also carry a client-minted `request_authority_id`, scoped by user and
+chat. The backend reserves that authority synchronously before effective-runtime
+resolution or chat-mode admission. `POST /api/v1/generate/stop` accepts the
+same authority with `chat_id`; therefore an id-less Stop can tombstone and abort
+a request suspended before generation-ID registration. The authority is copied
+to pool status and generation lifecycle events so a stopped request cannot be
+resurrected by WS-before-HTTP ordering. Legacy callers without the field retain
+the generation- and chat-scoped behavior.
+
+Exact root `POST /api/v1/agent-runs/:turnId/stop` is projection-gated: it accepts
+a reversible `ASSEMBLE` or `WORK` run and returns `too_late` from `COMPLETE`,
+`RENDER`, `PREPARE_COMMIT`, or `COMMITTING` onward. The generation Stop route
+uses the same Agentic owner and returns `{ stopped: boolean, status: "accepted" |
+"too_late" | "not_found" }`; a generation-ID race may try the supplied chat
+fallback. Use the exact Agent Run Stop route when the `too_late` distinction is
+required. A stop or deadline that wins before `COMMITTING` leaves no
+authoritative generation write. Client navigation is not Stop authority:
+background swipe admission remains valid, projects no tokens into another
+active chat, and recovers once from the correlated pool when that chat reopens.
 Startup runs `reconcileStartupState()` before `Bun.serve`: imports, artifact
 blobs, turns, and Agent Run projections reconcile sequentially, then isolate
 backends are probed. Agentic readiness requires successful import/artifact/turn

@@ -415,6 +415,8 @@ export interface GenerateInput {
   /** Pre-resolved authenticated account name used when no persona is selected. */
   userName?: string;
   chat_id: string;
+  /** Client-minted authority correlating a pending request with id-less Stop. */
+  request_authority_id?: string;
   connection_id?: string;
   persona_id?: string;
   persona_addon_states?: Record<string, boolean>;
@@ -2384,6 +2386,7 @@ class GenerationTerminalCoordinator {
     const chatId = entry?.chatId ?? this.#chatId;
     const userId = entry?.userId ?? this.#userId;
     const target = {
+      ...(entry?.requestAuthorityId ? { requestAuthorityId: entry.requestAuthorityId } : {}),
       ...(entry?.targetMessageId ? { targetMessageId: entry.targetMessageId } : {}),
       ...(entry?.targetSwipeId !== undefined
         ? { targetSwipeId: entry.targetSwipeId }
@@ -2464,6 +2467,41 @@ function claimGenerationTerminal(
 // Keyed by `${userId}:${chatId}` → generationId. Registered BEFORE council execution so that
 // a second request for the same chat will abort the in-flight one (including its council tools).
 const activeChatGenerations = new Map<string, string>();
+type PendingGenerationRequestAuthority = {
+  readonly userId: string;
+  readonly chatId: string;
+  readonly authorityId: string;
+  readonly controller: AbortController;
+  generationId?: string;
+};
+
+const pendingGenerationRequestAuthorities = new Map<string, PendingGenerationRequestAuthority>();
+const stoppedGenerationRequestAuthorities = new Set<string>();
+const MAX_STOPPED_REQUEST_AUTHORITIES = 2048;
+const REQUEST_AUTHORITY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function generationRequestAuthorityKey(userId: string, chatId: string, authorityId: string): string {
+  return JSON.stringify([userId, chatId, authorityId]);
+}
+
+function normalizeGenerationRequestAuthorityId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return REQUEST_AUTHORITY_ID_PATTERN.test(normalized) ? normalized : null;
+}
+
+function rememberStoppedGenerationRequestAuthority(key: string): void {
+  stoppedGenerationRequestAuthorities.add(key);
+  while (stoppedGenerationRequestAuthorities.size > MAX_STOPPED_REQUEST_AUTHORITIES) {
+    const oldest = stoppedGenerationRequestAuthorities.values().next().value;
+    if (oldest === undefined) break;
+    stoppedGenerationRequestAuthorities.delete(oldest);
+  }
+}
+
+function throwIfGenerationRequestAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Generation stopped", "AbortError");
+}
 type ChatModeReservation = {
   readonly mode: "response" | "agentic";
   readonly ownerId: string;
@@ -3814,6 +3852,7 @@ async function startResponseGeneration(
   options?: StartGenerationOptions,
   admitted?: ReturnType<typeof resolveResponseGenerationAdmission>,
 ): Promise<{ generationId: string; status: string }> {
+  throwIfGenerationRequestAborted(input.signal);
   const requestedGenerationId =
     typeof input.generationId === "string" ? input.generationId.trim() : "";
   const generationId = resolveStartGenerationId(input);
@@ -3879,6 +3918,7 @@ async function startResponseGeneration(
   // The completion promise is created up-front (deferred) so a replacement
   // generation can always await teardown — even if it arrives during the setup
   // phase before the streaming IIFE has started.
+  throwIfGenerationRequestAborted(input.signal);
   const abortController = new AbortController();
   const terminal = new GenerationTerminalCoordinator(
     generationId,
@@ -3888,6 +3928,9 @@ async function startResponseGeneration(
   );
   let resolveCompletion!: () => void;
   const completion = new Promise<void>((r) => { resolveCompletion = r; });
+  const onRequestAbort = () => terminal.claimAndProject("stopped", { status: "stopped" });
+  input.signal?.addEventListener("abort", onRequestAbort, { once: true });
+  void completion.finally(() => input.signal?.removeEventListener("abort", onRequestAbort));
   const generationStartedAt = Date.now();
   activeGenerations.set(generationId, {
     controller: abortController,
@@ -4216,6 +4259,7 @@ async function startResponseGeneration(
       generationId,
       userId: input.userId,
       chatId: input.chat_id,
+      requestAuthorityId: input.request_authority_id,
       generationType: genType,
       characterName,
       characterId: targetCharId,
@@ -4238,6 +4282,7 @@ async function startResponseGeneration(
         generationId,
         chatId: input.chat_id,
         model: connection.model,
+        requestAuthorityId: input.request_authority_id,
         provider: connection.provider,
         targetMessageId: lifecycle.targetMessageId,
         targetSwipeId,
@@ -5392,17 +5437,24 @@ async function startReservedGeneration(
   mode: "response" | "agentic",
   start: () => Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }>,
 ): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
+  throwIfGenerationRequestAborted(input.signal);
   const reservationId = `${mode}:${crypto.randomUUID()}`;
   let finishReservation!: () => void;
   const done = new Promise<void>((resolve) => {
     finishReservation = resolve;
   });
   await reserveChatMode(input.userId, input.chat_id, mode, reservationId, done);
+  if (input.signal?.aborted) {
+    finishReservation();
+    releaseChatModeReservation(input.userId, input.chat_id, reservationId);
+    throw new DOMException("Generation stopped", "AbortError");
+  }
   if (!ownsChatModeReservation(input.userId, input.chat_id, reservationId)) {
     finishReservation();
     throw new AgenticGenerationError("agentic_chat_busy", "Another generation owns this chat.", { retryable: true });
   }
   try {
+    throwIfGenerationRequestAborted(input.signal);
     const result = await start();
     if (!ownsChatModeReservation(input.userId, input.chat_id, reservationId)) {
       if (mode === "agentic") {
@@ -5524,7 +5576,7 @@ function runtimeDecisionRefreshRequired(message: string): AgenticGenerationError
  * is the sole decision authority for that request; tokenless callers resolve
  * through the runtime decision authority before entering either mode.
  */
-export async function startGeneration(
+async function startGenerationAfterRequestAuthority(
   input: GenerateInput,
   options?: StartGenerationOptions,
 ): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
@@ -5577,6 +5629,7 @@ export async function startGeneration(
   }
 
   const decision = await resolveEffectiveRuntime(input.userId, toEffectiveRuntimeRequest(input));
+  throwIfGenerationRequestAborted(input.signal);
   if (decision.requestedMode === "agentic" && decision.effectiveMode !== "agentic") {
     const reasons = decision.capabilityReadiness.repairCodes.length > 0
       ? decision.capabilityReadiness.repairCodes.join(", ")
@@ -5613,6 +5666,54 @@ export async function startGeneration(
   );
 }
 
+/**
+ * Reserve the client request authority before any asynchronous admission.
+ * A correlated id-less Stop can therefore retire this request even before a
+ * generation ID or chat-mode owner exists.
+ */
+export async function startGeneration(
+  input: GenerateInput,
+  options?: StartGenerationOptions,
+): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
+  const authorityId = normalizeGenerationRequestAuthorityId(input.request_authority_id);
+  if (!authorityId) return startGenerationAfterRequestAuthority(input, options);
+
+  const key = generationRequestAuthorityKey(input.userId, input.chat_id, authorityId);
+  if (stoppedGenerationRequestAuthorities.has(key)) {
+    throw new DOMException("Generation stopped", "AbortError");
+  }
+  if (pendingGenerationRequestAuthorities.has(key)) {
+    throw new Error("Generation request authority is already active.");
+  }
+
+  const controller = new AbortController();
+  const onSourceAbort = () => controller.abort(input.signal?.reason);
+  if (input.signal?.aborted) onSourceAbort();
+  else input.signal?.addEventListener("abort", onSourceAbort, { once: true });
+  const reservation: PendingGenerationRequestAuthority = {
+    userId: input.userId,
+    chatId: input.chat_id,
+    authorityId,
+    controller,
+  };
+  pendingGenerationRequestAuthorities.set(key, reservation);
+
+  try {
+    throwIfGenerationRequestAborted(controller.signal);
+    const result = await startGenerationAfterRequestAuthority({ ...input, signal: controller.signal }, options);
+    reservation.generationId = result.generationId;
+    if (controller.signal.aborted || stoppedGenerationRequestAuthorities.has(key)) {
+      await stopGeneration(input.userId, result.generationId);
+      throw new DOMException("Generation stopped", "AbortError");
+    }
+    return result;
+  } finally {
+    input.signal?.removeEventListener("abort", onSourceAbort);
+    if (pendingGenerationRequestAuthorities.get(key) === reservation) {
+      pendingGenerationRequestAuthorities.delete(key);
+    }
+  }
+}
 /**
  * Dry-run generation: assemble the full prompt (with macro resolution,
  * world info, post-processing, interceptors) but stop before the LLM call.
@@ -5927,6 +6028,7 @@ async function runGeneration(
     {
       generationId,
       chatId,
+      requestAuthorityId: pool.getPoolEntry(generationId)?.requestAuthorityId,
       model,
       provider: providerId,
       targetMessageId: lifecycle.targetMessageId,
@@ -7900,6 +8002,23 @@ function emitExpressionChanged(
   );
 }
 
+export async function stopGenerationRequestAuthority(
+  userId: string,
+  chatId: string,
+  rawAuthorityId: unknown,
+): Promise<boolean> {
+  const authorityId = normalizeGenerationRequestAuthorityId(rawAuthorityId);
+  if (!userId || !chatId || !authorityId) return false;
+  const key = generationRequestAuthorityKey(userId, chatId, authorityId);
+  rememberStoppedGenerationRequestAuthority(key);
+  const reservation = pendingGenerationRequestAuthorities.get(key);
+  if (!reservation || reservation.userId !== userId || reservation.chatId !== chatId) return true;
+  reservation.controller.abort(new DOMException("Generation stopped", "AbortError"));
+  if (reservation.generationId) {
+    await stopGeneration(userId, reservation.generationId);
+  }
+  return true;
+}
 export async function stopGeneration(
   userId: string,
   generationId: string,

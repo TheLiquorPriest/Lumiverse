@@ -11,6 +11,7 @@ import {
 } from '@/lib/agentRuntimeSelection'
 import type { AgentRuntimeMode } from '@/types/effective-runtime'
 import type { LoomPromptInspectionV1 } from '@/types/agent-runtime'
+import { beginClientGenerationAuthority, getClientGenerationAuthority, stopClientGenerationAuthority } from '@/lib/generation-request-authority'
 
 /** Generation requests go through prompt assembly + council + embedding calls
  *  which can legitimately take longer than the default 30s client timeout. */
@@ -76,9 +77,11 @@ function assertGenerationIntent(chatId: string, epoch: number, signal?: AbortSig
  * id to the caller. The stop endpoint calls this before targeting a known
  * generation, so an optimistic stop also handles the id-less window.
  */
-export function cancelPendingGeneration(chatId: string): void {
+export function cancelPendingGeneration(chatId: string): string | null {
   generationIntentEpochs.set(chatId, (generationIntentEpochs.get(chatId) ?? 0) + 1)
+  const requestAuthorityId = stopClientGenerationAuthority(chatId)
   generationIntentControllers.get(chatId)?.abort(new DOMException('Generation cancelled', 'AbortError'))
+  return requestAuthorityId
 }
 
 /**
@@ -91,6 +94,7 @@ export function beginPreparedGenerationIntent(chatId: string): number {
   generationIntentControllers.get(chatId)?.abort(new DOMException('Superseded generation', 'AbortError'))
   const epoch = (generationIntentEpochs.get(chatId) ?? 0) + 1
   generationIntentEpochs.set(chatId, epoch)
+  beginClientGenerationAuthority(chatId)
   return epoch
 }
 
@@ -100,39 +104,40 @@ export type GenerationType = 'normal' | 'continue' | 'regenerate' | 'swipe' | 'i
 
 export type ImpersonateMode = 'prompts' | 'oneliner' | 'sovereign_hand'
 
-export interface GenerateRequest {
-  chat_id: string
-  connection_id?: string
-  persona_id?: string
-  persona_addon_states?: Record<string, boolean>
-  preset_id?: string
-  force_preset_id?: boolean
-  message_id?: string
-  continue_from?: string
-  force_name?: string
-  generation_type?: GenerationType
-  /** Target swipe index for swipe generation. */
-  swipe_id?: number
-  /** Explicit one-turn mode. This never mutates the preset or durable chat override. */
-  mode?: AgentRuntimeMode
-  /** Opaque one-use token issued by the effective-runtime preflight. */
-  runtime_decision_token?: string
-  /** Request epoch bound to the one-use runtime decision token. */
-  request_epoch?: number
-  impersonate_mode?: ImpersonateMode
-  /** For impersonate: free-form text from the input box, appended to the impersonation prompt. */
-  impersonate_input?: string
-  /** Exact input-bar draft snapshot captured when this generation started. */
-  user_input?: string
-  /** For impersonate: stream to input box instead of creating a message. */
-  impersonate_draft?: boolean
-  target_character_id?: string
-  regen_feedback?: string
-  regen_feedback_position?: 'system' | 'user'
-  regen_feedback_format?: string
-  retain_council?: boolean
-  /** Dry-run only: reassemble as if this message were absent from history. */
-  exclude_message_id?: string
+export interface GenerateRequest { chat_id: string
+connection_id?: string
+persona_id?: string
+persona_addon_states?: Record<string, boolean>
+preset_id?: string
+force_preset_id?: boolean
+message_id?: string
+continue_from?: string
+force_name?: string
+generation_type?: GenerationType
+/** Target swipe index for swipe generation. */
+swipe_id?: number
+/** Explicit one-turn mode. This never mutates the preset or durable chat override. */
+mode?: AgentRuntimeMode
+/** Opaque one-use token issued by the effective-runtime preflight. */
+runtime_decision_token?: string
+/** Request epoch bound to the one-use runtime decision token. */
+request_epoch?: number
+impersonate_mode?: ImpersonateMode
+/** For impersonate: free-form text from the input box, appended to the impersonation prompt. */
+impersonate_input?: string
+/** Exact input-bar draft snapshot captured when this generation started. */
+user_input?: string
+/** For impersonate: stream to input box instead of creating a message. */
+impersonate_draft?: boolean
+target_character_id?: string
+regen_feedback?: string
+regen_feedback_position?: 'system' | 'user'
+regen_feedback_format?: string
+retain_council?: boolean
+/** Dry-run only: reassemble as if this message were absent from history. */
+exclude_message_id?: string
+  /** Client-minted authority binding pending HTTP admission to Stop and WS events. */
+  request_authority_id?: string
 }
 
 export interface GenerationStopResult {
@@ -365,6 +370,7 @@ export interface BreakdownResponse {
 export interface GenerationStatusResponse {
   active: boolean
   generationId?: string
+  requestAuthorityId?: string
   status?: 'assembling' | 'council' | 'waiting' | 'streaming' | 'completed' | 'stopped' | 'error' | 'reasoning'
   councilRetryPending?: boolean
   councilToolsFailure?: {
@@ -436,9 +442,13 @@ export async function preflightGeneration(
   throwIfGenerationAborted(options.signal)
   await flushPresetForGeneration(request.preset_id)
   throwIfGenerationAborted(options.signal)
+  const requestAuthorityId = request.request_authority_id
+    ?? getClientGenerationAuthority(request.chat_id)
+    ?? beginClientGenerationAuthority(request.chat_id)
   return prepareAgentRuntimeRequest({
     ...request,
     generation_type: request.generation_type ?? impliedGenerationType(path),
+    request_authority_id: requestAuthorityId,
   }, options)
 }
 
@@ -510,17 +520,13 @@ export const generateApi = {
   },
 
   stop(generationId?: string, chatId?: string) {
-    // Fence the optimistic preflight/POST window before asking the backend to
-    // stop a known generation (or whatever is active for this chat).
-    if (chatId) cancelPendingGeneration(chatId)
-    // chat_id lets the backend fall back to stopping whatever is actually
-    // running for the chat when generation_id is stale (or not yet known).
+    const requestAuthorityId = chatId ? cancelPendingGeneration(chatId) : null
     const body: Record<string, string> = {}
     if (generationId) body.generation_id = generationId
     if (chatId) body.chat_id = chatId
+    if (requestAuthorityId) body.request_authority_id = requestAuthorityId
     return post<GenerationStopResult>('/generate/stop', body)
   },
-
   regenerate(request: GenerateRequest, options?: GenerationRequestOptions) {
     return startPreparedGeneration('/generate/regenerate', request, options)
   },

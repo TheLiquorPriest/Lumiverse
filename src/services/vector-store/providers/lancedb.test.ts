@@ -6,6 +6,7 @@ import { join } from "path";
 import {
   ensureVectorIndex,
   isCrossProcessLockFromPriorProcessInstance,
+  admitLanceExternalMaintenanceOwner,
   isDeferredOptimizeScheduled,
   isRetryableLanceWriteConflict,
   pauseLanceDbForExternalMaintenance,
@@ -14,6 +15,7 @@ import {
   safeTableDelete,
   scheduleOptimize,
   shouldUseCrossProcessWriteLock,
+  withWriteLock,
   sweepEmptyIndexDirs,
   WORLD_BOOK_EMBEDDINGS_TABLE,
 } from "./lancedb";
@@ -135,6 +137,57 @@ describe("lancedb generation mutation fencing", () => {
     expect(isDeferredOptimizeScheduled()).toBe(false);
   });
 
+  test("retires a queued write before replacement and drains the active owner", async () => {
+    initDatabase(":memory:");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let queuedWriteRan = false;
+    const activeWrite = withWriteLock(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const activeOutcome = activeWrite.then(() => null, (error) => error);
+    await entered.promise;
+    const queuedWrite = withWriteLock(async () => {
+      queuedWriteRan = true;
+    });
+    const queuedOutcome = queuedWrite.then(() => null, (error) => error);
+    const replacement = closeDatabaseAsync();
+    let replacementSettled = false;
+    void replacement.then(() => { replacementSettled = true; });
+    await Promise.resolve();
+
+    expect(replacementSettled).toBe(false);
+    release.resolve();
+    expect(await activeOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
+    expect(await queuedOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
+    await replacement;
+    expect(queuedWriteRan).toBe(false);
+  });
+
+  test("replacement retires and drains an admitted external maintenance owner", async () => {
+    initDatabase(":memory:");
+    const admission = admitLanceExternalMaintenanceOwner();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const external = admission.run(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const externalOutcome = external.then(() => null, (error) => error);
+    await entered.promise;
+    const replacement = closeDatabaseAsync();
+    let replacementSettled = false;
+    void replacement.then(() => { replacementSettled = true; });
+    await Promise.resolve();
+
+    expect(admission.signal.aborted).toBe(true);
+    expect(replacementSettled).toBe(false);
+    release.resolve();
+    expect(await externalOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
+    admission.release();
+    await replacement;
+  });
 });
 describe("lancedb empty index directory cleanup", () => {
   test("removes only aged, empty UUID directories", () => {

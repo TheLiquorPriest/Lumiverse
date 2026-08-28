@@ -2,6 +2,7 @@ import { generateApi } from '@/api/generate'
 import type { GenerateRequest, GenerateResponse, GenerationRequestOptions } from '@/api/generate'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { useStore } from '@/store'
+import { acceptsClientGenerationAuthority, resetClientGenerationAuthoritiesForTests } from '@/lib/generation-request-authority'
 /**
  * Per-chat generation authority. Store streaming fields are intentionally not
  * sufficient during stop→regenerate: G2 is optimistic while G1 HTTP/WS work
@@ -178,10 +179,8 @@ export async function startGenerationWithRecovery(
       ? await generateApi.continueGeneration(request, options)
       : await generateApi.start(request, options)
 
-  const latest = useStore.getState()
   if (
-    latest.activeChatId !== request.chat_id
-    || generationRequest.epoch !== requestEpoch
+    generationRequest.epoch !== requestEpoch
     || !isGenerationRequestCurrent(generationRequest, response.generationId, true)
     || !acceptGenerationStarted(request.chat_id, response.generationId)
   ) {
@@ -195,6 +194,7 @@ export async function startGenerationWithRecovery(
 export function resetGenerationRecoveryGuardsForTests(): void {
   generationAuthorities.clear()
   gapRecoveryStates.clear()
+  resetClientGenerationAuthoritiesForTests()
 }
 
 const agentActivityRecoveryInFlight = new Map<string, Promise<void>>()
@@ -273,13 +273,16 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
   // A fenced active pool snapshot identifies this exact lifecycle. Wire the
   // lifecycle first because startStreaming clears prior-run metadata, then
   // project provider/model verbatim without guessing from the model name.
+  if (!acceptsClientGenerationAuthority(chatId, genStatus.requestAuthorityId)) return 'stale'
   if (genStatus.active && genStatus.generationId) {
     if (!acceptGenerationStarted(chatId, genStatus.generationId)) return 'stale'
-    latest.startStreaming(
-      genStatus.generationId,
-      genStatus.targetMessageId,
-      genStatus.status === 'council' ? undefined : getLocalStreamingType(genStatus.generationType),
-    )
+    if (!latest.isStreaming || latest.activeGenerationId !== genStatus.generationId) {
+      latest.startStreaming(
+        genStatus.generationId,
+        genStatus.targetMessageId,
+        genStatus.status === 'council' ? undefined : getLocalStreamingType(genStatus.generationType),
+      )
+    }
     latest.setGenerationProviderMetadata({
       provider: genStatus.provider ?? null,
       model: genStatus.model ?? null,

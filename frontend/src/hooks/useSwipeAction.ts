@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import { messagesApi } from '@/api/chats'
@@ -66,10 +66,6 @@ export default function useSwipeAction(message: Message, chatId: string): SwipeA
 
   const isLastAssistantMessage = !message.is_user && messages.length > 0 && messages[messages.length - 1].id === message.id
   const generationAbortControllerRef = useRef<AbortController | null>(null)
-  useEffect(() => () => {
-    generationAbortControllerRef.current?.abort(new DOMException('Generation cancelled', 'AbortError'))
-    generationAbortControllerRef.current = null
-  }, [chatId])
   const regenerateNonceRef = useRef(0)
 
   // Is THIS message the one currently being streamed into?

@@ -365,6 +365,7 @@ export interface ContextClipStats {
 export interface GenerationStartedPayload {
   generationId: string
   chatId: string
+  requestAuthorityId?: string
   model?: string
   provider?: string
   targetMessageId?: string
@@ -475,6 +476,7 @@ export interface GenerationMetrics {
 export interface GenerationEndedPayload {
   generationId: string
   chatId: string
+  requestAuthorityId?: string
   messageId?: string
   targetMessageId?: string
   targetSwipeId?: number
@@ -493,6 +495,7 @@ export interface GenerationEndedPayload {
 export interface GenerationStoppedPayload {
   generationId: string
   chatId: string
+  requestAuthorityId?: string
   messageId?: string
   targetMessageId?: string
   targetSwipeId?: number

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { closeDatabaseAsync, getDb, initDatabase } from "../db/connection";
 import {
   createEntry,
   createWorldBook,
@@ -71,12 +71,12 @@ describe("WI marker fields — import normalization (pure)", () => {
 
 describe("WI marker fields — persistence round trip", () => {
   beforeEach(async () => {
-    closeDatabase();
+    await closeDatabaseAsync();
     initDatabase(":memory:");
     await applyBaseline();
   });
 
-  afterEach(() => closeDatabase());
+  afterEach(async () => closeDatabaseAsync());
 
   test("create + read preserves wi_marker and wi_marker_side", () => {
     const book = createWorldBook(USER_ID, { name: "Markers" });

@@ -432,18 +432,31 @@ The running job then schedules derived vector projection; a queue failure keeps
 the receipt authoritative with `rebuild_required`/`projectionPending` state and
 recoverable error evidence.
 Every delayed chunk, vector, cache, and import-rebuild continuation is admitted
-against the current database generation and receives that generation's abort
-signal. Closing or replacing SQLite publishes the raw previous/next generation
-pair outside any inherited async context, aborts in-flight waits, and invalidates
-queued work synchronously. Maintenance barriers race the same signal, so reset
-cannot hang behind an embedding provider, hash, cortex callback, dynamic import,
-or other native/external wait that ignores cancellation. Generation cancellation
-is normal lifecycle control, not projection failure, and can never target equal
-IDs in a replacement database. The chat-vector subprocess is bound to one host
-generation; reset sends a cancellation message and terminates that process before
-a later generation can start a fresh worker. SQLite and Lance writes recheck the
-signal immediately after external awaits and before the next side effect.
+against the current SQLite database generation and receives that generation's
+abort signal. Closing or replacing SQLite publishes the raw previous/next
+generation pair outside inherited async context, aborts queued work
+synchronously, and requires registered replacement fences to drain before the
+new generation is installed.
 
+LanceDB has a separate centralized generation owner. Every native mutation path
+(including merge-insert, table creation, delete, index creation, optimize,
+startup repair, and migration) admits an owner before its first asynchronous
+wait. Queued and active owners are both visible to replacement. Replacement
+blocks new admission, cancels deferred optimize, retires every prior owner, and
+drains owners plus native reads before closing handles or deleting files.
+External maintenance children use the same owner; retirement sends SIGTERM,
+waits up to two seconds, escalates to SIGKILL, and awaits child exit before the
+owner releases. An in-process native Lance call cannot be interrupted safely,
+so replacement waits for that admitted call to return rather than claiming an
+unbounded no-hang guarantee.
+
+The active vector-store handle is retired before its asynchronous close begins,
+and lifecycle operations are serialized. A queued lookup therefore cannot
+receive the old handle after replacement. Runtime configuration transitions
+await close/reconciliation before publishing settings or credentials. Close or
+SQLite reconciliation failure rejects the transition, publishes no new config,
+and leaves the next lookup to construct a fresh handle from the still-current
+configuration.
 Owner-scoped image-connection mutation serialization uses revocable async leases.
 Awaited same-owner nested service calls may re-enter while the lease is active,
 but a detached callback that inherited the async context must queue normally once

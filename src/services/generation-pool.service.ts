@@ -23,6 +23,7 @@ export interface PooledTokensEntry {
   chatId: string;
   content: string;
   reasoning: string;
+  requestAuthorityId?: string;
   tokenSeq: number;
   generationType: GenerationType;
   targetMessageId?: string;
@@ -130,6 +131,7 @@ export function createPoolEntry(opts: {
   generationId: string;
   userId: string;
   chatId: string;
+  requestAuthorityId?: string;
   generationType: GenerationType;
   characterName: string;
   characterId?: string;
@@ -143,6 +145,7 @@ export function createPoolEntry(opts: {
     generationId: opts.generationId,
     userId: opts.userId,
     chatId: opts.chatId,
+    requestAuthorityId: opts.requestAuthorityId,
     content: "",
     reasoning: "",
     tokenSeq: 0,

@@ -41,6 +41,8 @@ const storeState = {
   },
   startStreaming: (generationId: string) => {
     streamStarts.push(generationId)
+    storeState.activeGenerationId = generationId
+    storeState.isStreaming = true
     currentProvider = null
     currentModel = null
   },
@@ -65,12 +67,14 @@ mock.module('@/api/chats', () => ({
   chatsApi: {},
 }))
 
-mock.module('@/store', () => ({
-  useStore: {
+const mockedUseStore = Object.assign(
+  <T>(selector: (state: typeof storeState) => T): T => selector(storeState),
+  {
     getState: () => storeState,
     setState: (updates: Record<string, unknown>) => Object.assign(storeState, updates),
   },
-}))
+)
+mock.module('@/store', () => ({ useStore: mockedUseStore }))
 
 // Dynamic import is intentional: the store mock must be registered before
 // Bun evaluates the real production authority module and its dependencies.
@@ -83,7 +87,12 @@ const {
   recoverPooledGeneration,
   resetGenerationRecoveryGuardsForTests,
 } = await import('./generation-recovery')
-const { executeSwipe } = await import('../hooks/useSwipeAction')
+const { default: useSwipeAction, executeSwipe } = await import('../hooks/useSwipeAction')
+const {
+  acceptsClientGenerationAuthority,
+  beginClientGenerationAuthority,
+  stopClientGenerationAuthority,
+} = await import('./generation-request-authority')
 
 beforeEach(() => {
   resetGenerationRecoveryGuardsForTests()
@@ -138,33 +147,81 @@ describe('generation authority invalidation', () => {
     expect(isGenerationRequestCurrent({ chatId: 'chat-a', epoch: 1, generationId: 'G2' }, 'G2')).toBe(false)
   })
 
-  test('a deferred swipe response cannot survive Stop and navigation authority invalidation', async () => {
+  test('executeSwipe rejects WS-before-HTTP resurrection after same-chat Stop', async () => {
     storeState.activeChatId = 'chat-a'
-    const message = {
-      id: 'assistant-1',
-      is_user: false,
-      swipe_id: 0,
-      swipes: ['first'],
-      extra: {},
-    }
+    const message = { id: 'assistant-1', is_user: false, swipe_id: 0, swipes: ['first'], extra: {} }
     storeState.messages = [message]
-
+    const authorityId = beginClientGenerationAuthority('chat-a')
     const swipe = executeSwipe(message as never, 'chat-a', 'right')
     await Promise.resolve()
     expect(generationStarts).toHaveLength(1)
+    expect(acceptsClientGenerationAuthority('chat-a', authorityId)).toBe(true)
+    expect(acceptGenerationStarted('chat-a', 'G-before-http')).toBe(true)
 
-    invalidateGenerationRequest('chat-a')
-    storeState.activeChatId = 'chat-b'
-    storeState.isStreaming = false
-    generationStart.resolve({ generationId: 'late-swipe' })
+    expect(stopClientGenerationAuthority('chat-a')).toBe(authorityId)
+    invalidateGenerationRequest('chat-a', 'G-before-http')
+    generationStart.resolve({ generationId: 'G-before-http' })
     await swipe
 
+    expect(storeState.activeChatId).toBe('chat-a')
     expect(streamStarts).toEqual([])
-    expect(streamingErrors).toEqual([])
-    expect(acceptGenerationStarted('chat-a', 'late-swipe')).toBe(false)
+    expect(acceptsClientGenerationAuthority('chat-a', authorityId)).toBe(false)
+    expect(acceptGenerationStarted('chat-a', 'G-before-http')).toBe(false)
+  })
+
+  test('the real useSwipeAction hook rejects the same Stop ordering', async () => {
+    const { JSDOM } = await import('jsdom')
+    const React = await import('react')
+    const { createRoot } = await import('react-dom/client')
+    const { act } = React
+    const dom = new JSDOM('<div id="root"></div>')
+    Object.assign(globalThis, { window: dom.window, document: dom.window.document, navigator: dom.window.navigator })
+    storeState.activeChatId = 'chat-a'
+    const message = { id: 'assistant-hook', is_user: false, swipe_id: 0, swipes: ['first'], extra: {} }
+    storeState.messages = [message]
+    let actions: ReturnType<typeof useSwipeAction> | null = null
+    const Harness = () => {
+      actions = useSwipeAction(message as never, 'chat-a')
+      return null
+    }
+    const root = createRoot(dom.window.document.getElementById('root')!)
+    await act(async () => { root.render(React.createElement(Harness)) })
+    const authorityId = beginClientGenerationAuthority('chat-a')
+    actions!.handleRegenerate()
+    await Promise.resolve()
+    expect(generationStarts).toHaveLength(1)
+    expect(acceptGenerationStarted('chat-a', 'G-hook-before-http')).toBe(true)
+    expect(stopClientGenerationAuthority('chat-a')).toBe(authorityId)
+    invalidateGenerationRequest('chat-a', 'G-hook-before-http')
+    generationStart.resolve({ generationId: 'G-hook-before-http' })
+    await Bun.sleep(0)
+    expect(streamStarts).toEqual([])
+    expect(acceptsClientGenerationAuthority('chat-a', authorityId)).toBe(false)
+    await act(async () => { root.unmount() })
+    dom.window.close()
+  })
+
+  test('navigation preserves a deferred swipe and pooled recovery projects it once', async () => {
+    storeState.activeChatId = 'chat-a'
+    const message = { id: 'assistant-nav', is_user: false, swipe_id: 0, swipes: ['first'], extra: {} }
+    storeState.messages = [message]
+    const swipe = executeSwipe(message as never, 'chat-a', 'right')
+    await Promise.resolve()
+    storeState.activeChatId = 'chat-b'
+    storeState.isStreaming = false
+    generationStart.resolve({ generationId: 'G-background' })
+    await swipe
+    expect(acceptGenerationStarted('chat-a', 'G-background')).toBe(true)
+    expect(streamStarts).toEqual([])
+
+    storeState.activeChatId = 'chat-a'
+    storeState.activeGenerationId = null
+    generationStatus = { active: true, generationId: 'G-background', status: 'streaming' }
+    expect(await recoverPooledGeneration('chat-a')).toBe('applied')
+    expect(await recoverPooledGeneration('chat-a')).toBe('applied')
+    expect(streamStarts).toEqual(['G-background'])
   })
 })
-
 describe('generation status provider identity', () => {
   test('projects the exact provider and model from a current active snapshot', async () => {
     storeState.activeChatId = 'chat-a'
