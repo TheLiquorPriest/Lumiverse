@@ -265,6 +265,9 @@ function resolveAbortError(signal: AbortSignal | undefined, fallbackMessage = "A
   }
   return new DOMException(fallbackMessage, "AbortError");
 }
+function assertSignalActive(signal?: AbortSignal): void {
+  if (signal?.aborted) throw resolveAbortError(signal);
+}
 
 export type EmbeddingProvider =
   | "openai-compatible"
@@ -1284,7 +1287,9 @@ async function replaceChatChunkEmbeddingRows(
   userId: string,
   targets: Array<{ chatId: string; chunkId: string }>,
   rows: EmbeddingRow[],
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertSignalActive(signal);
   if (targets.length > 0) {
     const chunkIdsByChat = new Map<string, string[]>();
     for (const target of targets) {
@@ -1293,14 +1298,18 @@ async function replaceChatChunkEmbeddingRows(
       else chunkIdsByChat.set(target.chatId, [target.chunkId]);
     }
     for (const [chatId, chunkIds] of chunkIdsByChat) {
+      assertSignalActive(signal);
       await deleteStoreRows("embeddings", andFilter([
         ownerScope(userId, "chat_chunk", chatId),
         inSet("source_id", Array.from(new Set(chunkIds))),
-      ]));
+      ]), signal);
+      assertSignalActive(signal);
     }
   }
   if (rows.length > 0) {
-    await upsertStoreRows("embeddings", rows);
+    assertSignalActive(signal);
+    await upsertStoreRows("embeddings", rows, signal);
+    assertSignalActive(signal);
   }
 }
 
@@ -1628,12 +1637,19 @@ function vectorFilterUserId(filter: VectorFilter): string | null {
   return userIds.length > 0 && userIds.every((value) => value === userIds[0]) ? userIds[0]! : null;
 }
 
-async function deleteStoreRows(collection: CollectionName, filter: VectorFilter): Promise<void> {
+async function deleteStoreRows(
+  collection: CollectionName,
+  filter: VectorFilter,
+  signal?: AbortSignal,
+): Promise<void> {
+  assertSignalActive(signal);
   const userId = vectorFilterUserId(filter);
   if (!userId) throw new Error("vector deletion must be scoped to one user");
   await withUserDataProjectionMutation(userId, async () => {
     const store = await getActiveVectorStore();
+    assertSignalActive(signal);
     await store.deleteByFilter(collection, filter);
+    assertSignalActive(signal);
   });
 }
 const MAX_STORED_VECTOR_DIMENSION = 16_384;
@@ -1698,7 +1714,12 @@ function assertSafeEmbeddingRows(collection: CollectionName, rows: readonly Embe
     }
   }
 }
-async function upsertStoreRows(collection: CollectionName, rows: EmbeddingRow[]): Promise<void> {
+async function upsertStoreRows(
+  collection: CollectionName,
+  rows: EmbeddingRow[],
+  signal?: AbortSignal,
+): Promise<void> {
+  assertSignalActive(signal);
   if (rows.length === 0) return;
   assertSafeEmbeddingRows(collection, rows);
   const userId = rows[0]!.user_id;
@@ -1707,7 +1728,9 @@ async function upsertStoreRows(collection: CollectionName, rows: EmbeddingRow[])
   // coverage publication after its final batch succeeds.
   await withUserDataProjectionMutation(userId, async () => {
     const store = await getActiveVectorStore();
+    assertSignalActive(signal);
     await store.upsert(collection, rows);
+    assertSignalActive(signal);
   });
 }
 
@@ -3429,13 +3452,17 @@ async function withWorldBookEntryVectorCommitLocks<T>(
   }
 }
 
-async function deleteWorldBookEntryRowsUnlocked(userId: string, entryIds: string[]): Promise<void> {
+async function deleteWorldBookEntryRowsUnlocked(
+  userId: string,
+  entryIds: string[],
+  signal?: AbortSignal,
+): Promise<void> {
   if (entryIds.length === 0) return;
   await deleteStoreRows("embeddings_world_books", andFilter([
     eq("user_id", userId),
     eq("source_type", "world_book_entry"),
     inSet("source_id", entryIds),
-  ]));
+  ]), signal);
 }
 
 async function deleteWorldBookRowsUnlocked(userId: string, worldBookIds: string[]): Promise<void> {
@@ -3693,8 +3720,8 @@ interface WorldBookVectorCommitDependencies {
     settingsFingerprint: string,
     configFingerprint: string,
   ) => Promise<WorldBookEntry[]>;
-  deleteRows: (userId: string, entryIds: string[]) => Promise<void>;
-  upsertRows: (rows: EmbeddingRow[]) => Promise<void>;
+  deleteRows: (userId: string, entryIds: string[], signal?: AbortSignal) => Promise<void>;
+  upsertRows: (rows: EmbeddingRow[], signal?: AbortSignal) => Promise<void>;
   markIndexedIfCurrent: (userId: string, entries: WorldBookEntry[], indexedAt: number) => Promise<string[]> | string[];
 }
 
@@ -3706,7 +3733,7 @@ interface WorldBookVectorCommitResult {
 const defaultWorldBookVectorCommitDependencies: WorldBookVectorCommitDependencies = {
   filterCurrent: filterCurrentWorldBookEntriesForWrite,
   deleteRows: deleteWorldBookEntryRowsUnlocked,
-  upsertRows: (rows) => upsertStoreRows("embeddings_world_books", rows),
+  upsertRows: (rows, signal) => upsertStoreRows("embeddings_world_books", rows, signal),
   markIndexedIfCurrent: (userId, entries, indexedAt) =>
     updateWorldBookEntriesVectorStateIfCurrent(userId, entries, "indexed", indexedAt, null),
 };
@@ -3718,12 +3745,15 @@ async function commitWorldBookVectorWritesIfCurrent(
   configFingerprint: string,
   indexedAt: number,
   dependencies: WorldBookVectorCommitDependencies = defaultWorldBookVectorCommitDependencies,
+  signal?: AbortSignal,
 ): Promise<WorldBookVectorCommitResult> {
+  assertSignalActive(signal);
   const writesByEntryId = new Map(writes.map((write) => [write.entry.id, write] as const));
   const requestedIds = Array.from(writesByEntryId.keys());
   if (requestedIds.length === 0) return { indexedIds: [], staleIds: [] };
 
   return withWorldBookEntryVectorCommitLocks(userId, requestedIds, async () => {
+    assertSignalActive(signal);
     const requestedEntries = Array.from(writesByEntryId.values()).map((write) => write.entry);
     const stableBeforeWrite = await dependencies.filterCurrent(
       userId,
@@ -3731,14 +3761,18 @@ async function commitWorldBookVectorWritesIfCurrent(
       settingsFingerprint,
       configFingerprint,
     );
+    assertSignalActive(signal);
     const stableBeforeIds = new Set(stableBeforeWrite.map((entry) => entry.id));
     const staleIds = requestedIds.filter((entryId) => !stableBeforeIds.has(entryId));
     if (stableBeforeWrite.length === 0) return { indexedIds: [], staleIds };
 
     const rows = stableBeforeWrite.flatMap((entry) => writesByEntryId.get(entry.id)?.rows ?? []);
     const writtenIds = stableBeforeWrite.map((entry) => entry.id);
-    await dependencies.deleteRows(userId, writtenIds);
-    await dependencies.upsertRows(rows);
+    assertSignalActive(signal);
+    await dependencies.deleteRows(userId, writtenIds, signal);
+    assertSignalActive(signal);
+    await dependencies.upsertRows(rows, signal);
+    assertSignalActive(signal);
 
     const stableAfterWrite = await dependencies.filterCurrent(
       userId,
@@ -3746,11 +3780,15 @@ async function commitWorldBookVectorWritesIfCurrent(
       settingsFingerprint,
       configFingerprint,
     );
+    assertSignalActive(signal);
     const indexedIds = await dependencies.markIndexedIfCurrent(userId, stableAfterWrite, indexedAt);
+    assertSignalActive(signal);
     const indexedIdSet = new Set(indexedIds);
     const staleAfterWrite = writtenIds.filter((entryId) => !indexedIdSet.has(entryId));
     if (staleAfterWrite.length > 0) {
-      await dependencies.deleteRows(userId, staleAfterWrite);
+      assertSignalActive(signal);
+      await dependencies.deleteRows(userId, staleAfterWrite, signal);
+      assertSignalActive(signal);
       staleIds.push(...staleAfterWrite);
     }
 
@@ -3867,8 +3905,10 @@ export async function reindexWorldBookEntries(
     optimizeAfter?: boolean;
     rebuildVectorIndex?: boolean;
     onProgress?: (progress: WorldBookReindexProgress) => void;
+    signal?: AbortSignal;
   }
 ) : Promise<WorldBookReindexResult> {
+  assertSignalActive(options?.signal);
   const batchSize = Math.max(1, Math.min(options?.batchSize ?? 50, 200));
   const force = options?.force ?? false;
   const optimizeAfter = options?.optimizeAfter ?? true;
@@ -3913,7 +3953,9 @@ export async function reindexWorldBookEntries(
   progress.eligible = toIndex.length;
 
   for (const entry of notEnabled) {
+    assertSignalActive(options?.signal);
     await deleteWorldBookEntryEmbeddings(userId, entry.id);
+    assertSignalActive(options?.signal);
     updateWorldBookEntryVectorState(entry.id, "not_enabled", null, null);
     progress.removed += 1;
     progress.current += 1;
@@ -3921,7 +3963,9 @@ export async function reindexWorldBookEntries(
   }
 
   for (const entry of disabledOrEmpty) {
+    assertSignalActive(options?.signal);
     await deleteWorldBookEntryEmbeddings(userId, entry.id);
+    assertSignalActive(options?.signal);
     updateWorldBookEntryVectorState(entry.id, "not_enabled", null, null);
     progress.removed += 1;
     progress.current += 1;
@@ -3934,10 +3978,13 @@ export async function reindexWorldBookEntries(
   }
 
   const cfg = await getEmbeddingConfig(userId);
+  assertSignalActive(options?.signal);
   const configFingerprint = getWorldBookVectorWriteFingerprint(cfg);
   if (!cfg.enabled || !cfg.vectorize_world_books) {
     for (const entry of toIndex) {
+      assertSignalActive(options?.signal);
       await deleteWorldBookEntryEmbeddings(userId, entry.id);
+      assertSignalActive(options?.signal);
       updateWorldBookEntryVectorState(entry.id, "not_enabled", null, null);
       progress.removed += 1;
       progress.current += 1;
@@ -3945,8 +3992,9 @@ export async function reindexWorldBookEntries(
     }
     return progress;
   }
-
+  assertSignalActive(options?.signal);
   await ensureWorldBookVectorVersion(userId);
+  assertSignalActive(options?.signal);
   const worldBookSettings = loadWorldBookVectorSettings(userId, {
     retrievalTopK: cfg.retrieval_top_k,
   });
@@ -3960,7 +4008,9 @@ export async function reindexWorldBookEntries(
   progress.eligible = entryGroups.length;
 
   for (const group of emptiedEntries) {
+    assertSignalActive(options?.signal);
     await deleteWorldBookEntryEmbeddings(userId, group.entry.id);
+    assertSignalActive(options?.signal);
     updateWorldBookEntryVectorState(group.entry.id, "not_enabled", null, null);
     progress.removed += 1;
     progress.current += 1;
@@ -3971,10 +4021,12 @@ export async function reindexWorldBookEntries(
     groups: Array<{ entry: WorldBookEntry; chunks: Array<{ chunkIndex: number; content: string; searchText: string; chunkCount: number }> }>,
     currentSize: number,
   ): Promise<void> => {
+    assertSignalActive(options?.signal);
     if (groups.length === 0) return;
     const payloads = groups.flatMap((group) => group.chunks.map((chunk) => ({ entry: group.entry, chunk })));
     try {
-      const vectors = await cachedEmbedTexts(userId, payloads.map((payload) => payload.chunk.searchText));
+      const vectors = await cachedEmbedTexts(userId, payloads.map((payload) => payload.chunk.searchText), { signal: options?.signal });
+      assertSignalActive(options?.signal);
       const now = Math.floor(Date.now() / 1000);
       const vectorSlices = new Map<string, number[][]>();
       let offset = 0;
@@ -3983,13 +4035,14 @@ export async function reindexWorldBookEntries(
         vectorSlices.set(group.entry.id, slice);
         offset += group.chunks.length;
       }
-
+      assertSignalActive(options?.signal);
       const stableEntries = await filterCurrentWorldBookEntriesForWrite(
         userId,
         groups.map((group) => group.entry),
         settingsFingerprint,
         configFingerprint,
       );
+      assertSignalActive(options?.signal);
       const stableIds = new Set(stableEntries.map((entry) => entry.id));
       const stableGroups = groups.filter((group) => stableIds.has(group.entry.id));
       if (stableGroups.length === 0) {
@@ -4022,7 +4075,10 @@ export async function reindexWorldBookEntries(
         settingsFingerprint,
         configFingerprint,
         now,
+        undefined,
+        options?.signal,
       );
+      assertSignalActive(options?.signal);
       if (commit.staleIds.length > 0) {
         console.info(
           "[embeddings] Discarded %d stale world-book vector commit%s after write validation",
@@ -4034,6 +4090,7 @@ export async function reindexWorldBookEntries(
       progress.current += groups.length;
       emitProgress();
     } catch (err) {
+      assertSignalActive(options?.signal);
       const error = err instanceof Error ? err : new Error(String(err));
       if (isRetryableBatchError(error) && currentSize > 1) {
         const half = Math.max(1, Math.floor(currentSize / 2));
@@ -4046,6 +4103,7 @@ export async function reindexWorldBookEntries(
         return;
       }
       console.warn("[embeddings] Batch embedding failed:", error);
+      assertSignalActive(options?.signal);
       const failed = await markWorldBookEntriesVectorErrorIfCurrent(
         userId,
         groups.map((group) => group.entry),
@@ -4053,6 +4111,7 @@ export async function reindexWorldBookEntries(
         settingsFingerprint,
         configFingerprint,
       );
+      assertSignalActive(options?.signal);
       progress.failed += failed;
       progress.current += groups.length;
       emitProgress();
@@ -4060,7 +4119,9 @@ export async function reindexWorldBookEntries(
   };
 
   for (let i = 0; i < entryGroups.length; i += batchSize) {
+    assertSignalActive(options?.signal);
     await processGroupBatch(entryGroups.slice(i, i + batchSize), batchSize);
+    assertSignalActive(options?.signal);
   }
 
   // Compact all fragments into fewer files, prune old versions, and optionally
@@ -4068,14 +4129,20 @@ export async function reindexWorldBookEntries(
   // so a burst of edited entries does not repeatedly rewrite a large index.
   if (optimizeAfter) {
     try {
+      assertSignalActive(options?.signal);
       const store = await getActiveVectorStore();
+      assertSignalActive(options?.signal);
       if (rebuildVectorIndex) getTableState(WORLD_BOOK_EMBEDDINGS_TABLE).vectorIndexReady = false;
       await store.optimize(["embeddings_world_books"]);
+      assertSignalActive(options?.signal);
     } catch (err) {
+      assertSignalActive(options?.signal);
       console.warn("[embeddings] Post-reindex optimize failed:", err);
     }
   } else {
+    assertSignalActive(options?.signal);
     await scheduleStoreOptimize("world_book");
+    assertSignalActive(options?.signal);
   }
 
   return progress;
@@ -4547,17 +4614,21 @@ export async function deleteChatChunkEmbeddings(
   userId: string,
   chatId: string,
   chunkIds?: string | string[],
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertSignalActive(signal);
   const idList = chunkIds === undefined
     ? null
     : (Array.isArray(chunkIds) ? chunkIds : [chunkIds]);
   if (idList && idList.length === 0) return;
-
+  assertSignalActive(signal);
   await deleteStoreRows("embeddings", andFilter([
     ownerScope(userId, "chat_chunk", chatId),
     idList ? inSet("source_id", idList) : null,
-  ]));
+  ]), signal);
+  assertSignalActive(signal);
   await scheduleStoreOptimize("chat_chunk");
+  assertSignalActive(signal);
 }
 
 /**
@@ -4578,19 +4649,24 @@ export async function reconcileChatChunkEmbeddings(
   userId: string,
   chatId: string,
   validChunkIds: Iterable<string>,
+  signal?: AbortSignal,
 ): Promise<number> {
+  assertSignalActive(signal);
   const valid = new Set(validChunkIds);
   if (valid.size === 0) return 0;
 
   const store = await getActiveVectorStore();
+  assertSignalActive(signal);
   const rows = await store.getRowsByFilter("embeddings", ownerScope(userId, "chat_chunk", chatId));
+  assertSignalActive(signal);
 
   const orphanIds = Array.from(
     new Set((rows as any[]).map((r) => String(r.source_id)).filter((id) => !valid.has(id))),
   );
   if (orphanIds.length === 0) return 0;
-
-  await deleteChatChunkEmbeddings(userId, chatId, orphanIds);
+  assertSignalActive(signal);
+  await deleteChatChunkEmbeddings(userId, chatId, orphanIds, signal);
+  assertSignalActive(signal);
   console.info(`[embeddings] Reconciled chat ${chatId.split("-")[0]}…: removed ${orphanIds.length} orphaned chunk vector(s)`);
   return orphanIds.length;
 }
@@ -4646,7 +4722,9 @@ export async function syncChatChunkEmbedding(
 export async function batchUpsertChunkVectors(
   userId: string,
   chunks: Array<{ chatId: string; chunkId: string; vector: number[]; content: string; metadata?: Record<string, any> }>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertSignalActive(signal);
   if (chunks.length === 0) return;
   return withCompleteUserProjection(userId, async () => {
   const now = Math.floor(Date.now() / 1000);
@@ -4659,15 +4737,18 @@ export async function batchUpsertChunkVectors(
     { chunkId: c.chunkId, ...(c.metadata || {}) },
     now,
   ));
-
+  assertSignalActive(signal);
   await replaceChatChunkEmbeddingRows(
     userId,
     chunks.map((chunk) => ({ chatId: chunk.chatId, chunkId: chunk.chunkId })),
     rows,
+    signal,
   );
-
+  assertSignalActive(signal);
   console.info(`[embeddings] Batch-vectorized ${rows.length} chat chunk(s)`);
+  assertSignalActive(signal);
   await scheduleStoreOptimize("chat_chunk");
+  assertSignalActive(signal);
   });
 }
 

@@ -1,4 +1,8 @@
-import { isDatabaseGenerationCancellation } from "../db/connection";
+import {
+  getDbGeneration,
+  isDatabaseGenerationCancellation,
+  raceDbGenerationCancellation,
+} from "../db/connection";
 
 const maintenanceTasks = new Map<string, Set<Promise<void>>>();
 const failureLedger: MaintenanceFailureSummary[] = [];
@@ -61,22 +65,27 @@ function failureError(summary: MaintenanceFailureSummary): Error {
  * vector storage, or the derived chat-memory cache. Settled tasks are always
  * removed; bounded summaries preserve failures until a barrier consumes them.
  */
-export function trackChatChunkMaintenance(chatId: string, task: Promise<void>): Promise<void> {
+export function trackChatChunkMaintenance(
+  chatId: string,
+  task: Promise<void>,
+  generation = getDbGeneration(),
+): Promise<void> {
   let tasks = maintenanceTasks.get(chatId);
   if (!tasks) {
     tasks = new Set();
     maintenanceTasks.set(chatId, tasks);
   }
-  tasks.add(task);
+  const tracked = raceDbGenerationCancellation(generation, task);
+  tasks.add(tracked);
 
-  void task.then(
-    () => removeMaintenanceTask(chatId, task),
+  void tracked.then(
+    () => removeMaintenanceTask(chatId, tracked),
     (reason) => {
-      removeMaintenanceTask(chatId, task);
+      removeMaintenanceTask(chatId, tracked);
       recordFailure(chatId, reason);
     },
   );
-  return task;
+  return tracked;
 }
 
 function removeMaintenanceTask(chatId: string, task: Promise<void>): void {

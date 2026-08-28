@@ -432,11 +432,22 @@ The running job then schedules derived vector projection; a queue failure keeps
 the receipt authoritative with `rebuild_required`/`projectionPending` state and
 recoverable error evidence.
 Every delayed chunk, vector, cache, and import-rebuild continuation is admitted
-against the current database generation. Closing or replacing SQLite invalidates
-queued work centrally; an in-flight continuation observes a typed cancellation
-before its next database access. Generation cancellation is normal lifecycle
-control, not projection failure, and can never target equal IDs in a replacement
-database.
+against the current database generation and receives that generation's abort
+signal. Closing or replacing SQLite publishes the raw previous/next generation
+pair outside any inherited async context, aborts in-flight waits, and invalidates
+queued work synchronously. Maintenance barriers race the same signal, so reset
+cannot hang behind an embedding provider, hash, cortex callback, dynamic import,
+or other native/external wait that ignores cancellation. Generation cancellation
+is normal lifecycle control, not projection failure, and can never target equal
+IDs in a replacement database. The chat-vector subprocess is bound to one host
+generation; reset sends a cancellation message and terminates that process before
+a later generation can start a fresh worker. SQLite and Lance writes recheck the
+signal immediately after external awaits and before the next side effect.
+
+Owner-scoped image-connection mutation serialization uses revocable async leases.
+Awaited same-owner nested service calls may re-enter while the lease is active,
+but a detached callback that inherited the async context must queue normally once
+the outer critical section releases. Different owners remain independent.
 
 Do not describe this as one filesystem transaction: SQLite can roll back the
 relational transaction, but it cannot roll back a hard link or copy. The

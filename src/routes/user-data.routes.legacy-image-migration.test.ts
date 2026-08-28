@@ -658,7 +658,118 @@ describe("legacy image credentials at user-data ticket preparation", () => {
     await Promise.all([first, sameOwner]);
     expect(sameOwnerEntered).toBe(true);
   });
+  test("connection mutation lock allows awaited same-owner nested service calls", async () => {
+    let nestedEntered = false;
+    await imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      await imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+        nestedEntered = true;
+      });
+    });
+    expect(nestedEntered).toBe(true);
+  });
 
+  test("detached inherited owner context queues after its outer lease is released", async () => {
+    let releaseSecond!: () => void;
+    let signalSecondEntered!: () => void;
+    let signalDetachedScheduled!: () => void;
+    const secondEntered = new Promise<void>((resolve) => { signalSecondEntered = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const detachedScheduled = new Promise<void>((resolve) => { signalDetachedScheduled = resolve; });
+    let detachedEntered = false;
+    let detachedTask: Promise<void> | null = null;
+
+    await imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      setTimeout(() => {
+        detachedTask = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+          detachedEntered = true;
+        });
+        signalDetachedScheduled();
+      }, 0);
+    });
+
+    const second = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      signalSecondEntered();
+      await secondGate;
+    });
+    await secondEntered;
+    await detachedScheduled;
+    expect(detachedEntered).toBe(false);
+
+    releaseSecond();
+    await second;
+    await detachedTask;
+    expect(detachedEntered).toBe(true);
+  });
+  test("rejected owner callback revokes inherited detached lease before release", async () => {
+    const secondGate = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<void>();
+    const detachedScheduled = Promise.withResolvers<void>();
+    let detachedEntered = false;
+    let detachedTask: Promise<void> | null = null;
+
+    await expect(imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      setTimeout(() => {
+        detachedTask = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+          detachedEntered = true;
+        });
+        detachedScheduled.resolve();
+      }, 0);
+      throw new Error("expected owner callback rejection");
+    })).rejects.toThrow("expected owner callback rejection");
+
+    const second = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      secondEntered.resolve();
+      await secondGate.promise;
+    });
+    await secondEntered.promise;
+    await detachedScheduled.promise;
+    expect(detachedEntered).toBe(false);
+
+    secondGate.resolve();
+    await second;
+    await detachedTask;
+    expect(detachedEntered).toBe(true);
+  });
+
+  test("post-commit connection event cannot retain stale owner lock authority", async () => {
+    const secondGate = Promise.withResolvers<void>();
+    const secondEntered = Promise.withResolvers<void>();
+    const eventTaskScheduled = Promise.withResolvers<void>();
+    let eventTaskEntered = false;
+    let eventTask: Promise<void> | null = null;
+    const stopListening = eventBus.onInternal(EventType.IMAGE_GEN_CONNECTION_CHANGED, (event) => {
+      if (event.userId !== SOURCE_USER) return;
+      setTimeout(() => {
+        eventTask = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+          eventTaskEntered = true;
+        });
+        eventTaskScheduled.resolve();
+      }, 0);
+    });
+
+    try {
+      await imageGenConnSvc.createConnection(SOURCE_USER, {
+        name: "Owner lease event",
+        provider: "comfyui",
+        api_url: "http://127.0.0.1:8188",
+      });
+      const second = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+        secondEntered.resolve();
+        await secondGate.promise;
+      });
+      await secondEntered.promise;
+      await eventTaskScheduled.promise;
+      expect(eventTaskEntered).toBe(false);
+
+      secondGate.resolve();
+      await second;
+      await eventTask;
+      expect(eventTaskEntered).toBe(true);
+    } finally {
+      stopListening();
+      secondGate.resolve();
+    }
+  });
   test("archive rejects a private setting changed after ticket preparation", async () => {
     seedLegacySettings(SOURCE_USER);
     const preparedResponse = await app.request(

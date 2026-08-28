@@ -4611,6 +4611,7 @@ function updateChatChunks(userId: string, chatId: string, newMessage: Message): 
   return trackChatChunkMaintenance(
     chatId,
     runWithDbGeneration(generation, () => updateChatChunksImpl(userId, chatId, newMessage)),
+    generation,
   );
 }
 
@@ -4931,6 +4932,7 @@ export function rebuildChatChunks(userId: string, chatId: string): Promise<void>
   return trackChatChunkMaintenance(
     chatId,
     runWithDbGeneration(generation, () => runChatChunkRebuild(userId, chatId)),
+    generation,
   );
 }
 
@@ -4982,6 +4984,7 @@ export function rebuildChatChunksFromMessages(
       generation,
       () => runChatChunkRebuildFromMessages(userId, chatId, affectedMessageIds),
     ),
+    generation,
   );
 }
 

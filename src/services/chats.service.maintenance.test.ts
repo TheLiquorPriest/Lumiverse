@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import {
+  closeDatabase,
+  getDb,
+  getDbGeneration,
+  initDatabase,
+  onDbReset,
+  runWithDbGeneration,
+} from "../db/connection";
 import { runMigrations } from "../db/migrate";
 import * as chatMemoryCacheSvc from "./chat-memory-cache.service";
 import * as chatsSvc from "./chats.service";
@@ -155,6 +162,98 @@ describe.serial("chat chunk maintenance lifecycle", () => {
     for (const spy of spies.splice(0)) spy.mockRestore();
     closeDatabase();
     if (maintenanceError) throw maintenanceError;
+  });
+  test("reset listeners receive raw generations outside a nested stale admission context", async () => {
+    const previousGeneration = getDbGeneration();
+    const observed: Array<{ previousGeneration: number; nextGeneration: number }> = [];
+    const unsubscribe = onDbReset((event) => { observed.push(event); });
+
+    runWithDbGeneration(previousGeneration, () => closeDatabase());
+    unsubscribe();
+
+    expect(observed).toEqual([{
+      previousGeneration,
+      nextGeneration: previousGeneration + 1,
+    }]);
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+  });
+  test("nested reset cancels hung vector cache rebuild and import work before the barrier", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "hung-message", 0, true, "old hung source");
+    seedChunk(chat.id, "hung-chunk", ["hung-message"], 1);
+    const importChat = createTemporaryChat();
+    seedMessage(importChat.id, "hung-import-message", 0, true, "old import source");
+
+    const rebuildEntered = Promise.withResolvers<void>();
+    const rebuildGate = Promise.withResolvers<void>();
+    let embeddingConfigCalls = 0;
+    track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockImplementation(async () => {
+      embeddingConfigCalls += 1;
+      if (embeddingConfigCalls === 1) {
+        rebuildEntered.resolve();
+        await rebuildGate.promise;
+      }
+      return enabledEmbeddingConfig;
+    }));
+    const rebuild = chatsSvc.rebuildChatChunks(USER_ID, chat.id);
+    void rebuild.catch(() => undefined);
+    await rebuildEntered.promise;
+
+    const vectorEntered = Promise.withResolvers<void>();
+    const vectorGate = Promise.withResolvers<void>();
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => {
+      vectorEntered.resolve();
+      await vectorGate.promise;
+      getDb().query("UPDATE chat_chunks SET content = 'late-vector' WHERE id = ?").run(tasks[0]!.chunkId);
+      return { processedCount: tasks.length, failedChunkIds: [], refreshedChatIds: [] };
+    });
+    const cacheEntered = Promise.withResolvers<void>();
+    const cacheGate = Promise.withResolvers<void>();
+    chatMemoryCacheSvc.__test__.setRefreshChatMemoryCache(async (_userId, chatId) => {
+      cacheEntered.resolve();
+      await cacheGate.promise;
+      getDb().query("UPDATE chat_chunks SET content = 'late-cache' WHERE chat_id = ?").run(chatId);
+    });
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "hung-chunk", 1);
+    chatMemoryCacheSvc.scheduleChatMemoryRefresh(USER_ID, chat.id, 1);
+    expect(userDataImportTest.scheduleDerivedVectorProjectionSync(USER_ID)).toBeGreaterThan(0);
+    await Promise.all([vectorEntered.promise, cacheEntered.promise]);
+
+    const previousGeneration = getDbGeneration();
+    runWithDbGeneration(previousGeneration, () => closeDatabase());
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+    getDb().query(
+      'INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)',
+    ).run(USER_ID, "Replacement Owner", "replacement-owner@example.test");
+    getDb().run("CREATE TABLE lifecycle_probe (stage TEXT PRIMARY KEY)");
+    const replacementChat = createTemporaryChat();
+    getDb().query("UPDATE chats SET id = ? WHERE id = ?").run(chat.id, replacementChat.id);
+    const replacementImportChat = createTemporaryChat();
+    getDb().query("UPDATE chats SET id = ? WHERE id = ?").run(importChat.id, replacementImportChat.id);
+    seedMessage(chat.id, "hung-message", 0, true, "replacement message");
+    seedChunk(chat.id, "hung-chunk", ["hung-message"], 1);
+    seedMessage(importChat.id, "hung-import-message", 0, true, "replacement import message");
+    seedChunk(importChat.id, "hung-import-chunk", ["hung-import-message"], 1);
+
+    await Promise.race([
+      chatsSvc.waitForChatChunkMaintenance(),
+      Bun.sleep(250).then(() => { throw new Error("maintenance barrier remained blocked by stale work"); }),
+    ]);
+
+    rebuildGate.resolve();
+    vectorGate.resolve();
+    cacheGate.resolve();
+    await Promise.allSettled([rebuild]);
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'hung-chunk'").get())
+      .toEqual({ content: "chunk:hung-chunk" });
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'hung-import-chunk'").get())
+      .toEqual({ content: "chunk:hung-import-chunk" });
   });
 
   test("create waits through the deferred cortex callback before database replacement", async () => {

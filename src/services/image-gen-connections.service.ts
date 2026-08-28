@@ -20,8 +20,13 @@ import {
   sanitizeConnectionMetadata,
 } from "./connection-authority";
 
+interface OwnerMutationLease {
+  readonly userId: string;
+  active: boolean;
+}
+
 const ownerMutationTails = new Map<string, Promise<void>>();
-const ownerMutationContext = new AsyncLocalStorage<ReadonlySet<string>>();
+const ownerMutationContext = new AsyncLocalStorage<ReadonlyMap<string, OwnerMutationLease>>();
 
 /**
  * Serialize connection/profile/secret mutations for one authenticated owner.
@@ -33,7 +38,8 @@ export async function withImageGenConnectionOwnerLock<T>(
   callback: () => Promise<T>,
 ): Promise<T> {
   const inherited = ownerMutationContext.getStore();
-  if (inherited?.has(userId)) return callback();
+  const inheritedLease = inherited?.get(userId);
+  if (inheritedLease?.active) return callback();
 
   const previous = ownerMutationTails.get(userId) ?? Promise.resolve();
   let releaseCurrent!: () => void;
@@ -44,11 +50,13 @@ export async function withImageGenConnectionOwnerLock<T>(
   ownerMutationTails.set(userId, tail);
   await previous.catch(() => undefined);
 
-  const held = new Set(inherited ?? []);
-  held.add(userId);
+  const lease: OwnerMutationLease = { userId, active: true };
+  const held = new Map(inherited ?? []);
+  held.set(userId, lease);
   try {
     return await ownerMutationContext.run(held, callback);
   } finally {
+    lease.active = false;
     releaseCurrent();
     if (ownerMutationTails.get(userId) === tail) ownerMutationTails.delete(userId);
   }

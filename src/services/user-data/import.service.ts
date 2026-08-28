@@ -7549,7 +7549,7 @@ function scheduleDerivedVectorProjectionSyncDetailed(
           const { rebuildChatChunks } = await import("../chats.service");
           await rebuildChatChunks(userId, chat.id);
         });
-        void trackChatChunkMaintenance(chat.id, admission);
+        void trackChatChunkMaintenance(chat.id, admission, generation);
         void admission.catch((err) => {
           if (!isDatabaseGenerationCancellation(err)) {
             console.error(`[user-data-import] Chat chunk rebuild failed for ${chat.id}:`, err);

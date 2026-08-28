@@ -1,7 +1,9 @@
 import {
   DatabaseGenerationCancelledError,
+  assertDbGeneration,
   getDb,
   getDbGeneration,
+  getDbGenerationSignal,
   isDatabaseGenerationCancellation,
   onDbReset,
   runWithDbGeneration,
@@ -360,12 +362,15 @@ async function computeFreshMemoryResult(
   messages: MemoryMessageView[],
   chatMemorySettings: embeddingsSvc.ChatMemorySettings | null,
   perChatOverrides: embeddingsSvc.PerChatMemoryOverrides | null,
+  generation: number,
 ): Promise<{
   settingsKey: string;
   sourceMessageCount: number;
   result: CachedChatMemoryResult;
   retrievalMode: ChatMemoryCacheRow["retrieval_mode"];
 }> {
+  const signal = getDbGenerationSignal(generation);
+  assertDbGeneration(generation);
   if (perChatOverrides?.enabled === false) {
     return {
       settingsKey: "disabled",
@@ -376,12 +381,14 @@ async function computeFreshMemoryResult(
   }
 
   const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
+  assertDbGeneration(generation);
   const settings = embeddingsSvc.resolveEffectiveChatMemorySettings(chatMemorySettings, cfg);
   const settingsSource: "global" | "per_chat" = perChatOverrides ? "per_chat" : "global";
   const sourceMessageCount = getVisibleMessageCount(messages);
   const reasoningStrip = getReasoningStripOptions(userId);
   const env = buildMacroEnvForChat(userId, chatId);
   const queryText = await buildQueryText(messages, settings, env, reasoningStrip);
+  assertDbGeneration(generation);
   const settingsKey = computeSettingsKey(settings, perChatOverrides, cfg.hybrid_weight_mode);
 
   const chunkStats = getDb()
@@ -472,7 +479,8 @@ async function computeFreshMemoryResult(
     // Shrink-and-retry on oversized-input errors so a long multi-message query
     // doesn't silently collapse to the recency fallback on token-limited
     // embedding backends (llama.cpp n_ubatch, 512-token models, etc.).
-    const queryVector = await embeddingsSvc.embedQueryAdaptive(userId, queryText);
+    const queryVector = await embeddingsSvc.embedQueryAdaptive(userId, queryText, { signal });
+    assertDbGeneration(generation);
     if (!queryVector || queryVector.length === 0) {
       return {
         settingsKey,
@@ -489,6 +497,7 @@ async function computeFreshMemoryResult(
       };
     }
 
+    assertDbGeneration(generation);
     const hits = await embeddingsSvc.searchChatChunks(
       userId,
       chatId,
@@ -498,7 +507,7 @@ async function computeFreshMemoryResult(
       queryText,
       cfg.hybrid_weight_mode,
       undefined,
-      undefined,
+      signal,
       // Skip the vector column in chat-memory retrievals. MMR degrades to
       // distance-ordered top-K — diversity is nice-to-have, but pulling 4 MB
       // of Float32 vectors per query through Lance/Arrow has been Bun-fragile
@@ -506,6 +515,7 @@ async function computeFreshMemoryResult(
       // duplicate-content hits.
       { skipVectorFetch: true },
     );
+    assertDbGeneration(generation);
 
     // The similarity threshold gates on vector distance (lower = closer). A
     // keyword-only hit has no distance (score === null) and can't clear a
@@ -562,6 +572,7 @@ class ChatMemoryRefreshQueue {
   private queue: RefreshJob[] = [];
   private processing = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private activeJob: RefreshJob | null = null;
 
   add(job: RefreshJob): void {
     const existing = this.queue.findIndex((entry) =>
@@ -594,12 +605,14 @@ class ChatMemoryRefreshQueue {
     try {
       while (this.queue.length > 0) {
         const job = this.queue.shift()!;
+        this.activeJob = job;
         try {
           await runWithDbGeneration(job.generation, async () => {
             if (refreshChatMemoryCacheOverride) {
               await refreshChatMemoryCacheOverride(job.userId, job.chatId);
+              assertDbGeneration(job.generation);
             } else {
-              await refreshChatMemoryCache(job.userId, job.chatId);
+              await refreshChatMemoryCache(job.userId, job.chatId, job.generation);
             }
           });
           for (const settlement of job.settlements) settlement.resolve();
@@ -608,6 +621,8 @@ class ChatMemoryRefreshQueue {
             console.error(`[chat-memory-cache] Refresh failed for chat ${job.chatId}:`, err);
           }
           for (const settlement of job.settlements) settlement.reject(err);
+        } finally {
+          if (this.activeJob === job) this.activeJob = null;
         }
       }
     } finally {
@@ -616,7 +631,11 @@ class ChatMemoryRefreshQueue {
     }
   }
 
-  invalidateStale(currentGeneration: number): void {
+  invalidateStale(previousGeneration: number, currentGeneration: number): void {
+    if (this.activeJob?.generation === previousGeneration) {
+      const cancellation = new DatabaseGenerationCancelledError(previousGeneration, currentGeneration);
+      for (const settlement of this.activeJob.settlements) settlement.reject(cancellation);
+    }
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -635,13 +654,16 @@ class ChatMemoryRefreshQueue {
 }
 
 const refreshQueue = new ChatMemoryRefreshQueue();
-onDbReset(() => refreshQueue.invalidateStale(getDbGeneration()));
+onDbReset(({ previousGeneration, nextGeneration }) => {
+  refreshQueue.invalidateStale(previousGeneration, nextGeneration);
+});
 
 export function scheduleChatMemoryRefresh(userId: string, chatId: string, priority = 5): void {
+  const generation = getDbGeneration();
   const { promise, resolve, reject } = Promise.withResolvers<void>();
-  void trackChatChunkMaintenance(chatId, promise);
+  void trackChatChunkMaintenance(chatId, promise, generation);
   refreshQueue.add({
-    generation: getDbGeneration(),
+    generation,
     userId,
     chatId,
     priority,
@@ -722,7 +744,12 @@ export async function readCachedChatMemory(
   return toCachedResult(row);
 }
 
-export async function refreshChatMemoryCache(userId: string, chatId: string): Promise<void> {
+export async function refreshChatMemoryCache(
+  userId: string,
+  chatId: string,
+  generation = getDbGeneration(),
+): Promise<void> {
+  assertDbGeneration(generation);
   const context = getChatMemoryContext(userId, chatId);
   if (!context.exists) {
     invalidateChatMemoryCache(chatId);
@@ -736,7 +763,9 @@ export async function refreshChatMemoryCache(userId: string, chatId: string): Pr
     context.messages,
     chatMemorySettings,
     context.perChatOverrides,
+    generation,
   );
+  assertDbGeneration(generation);
 
   upsertCacheRow(
     userId,

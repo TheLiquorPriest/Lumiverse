@@ -1,5 +1,10 @@
-import { describe, expect, it } from "bun:test";
-import { canUseChatChunkVectorizationSubprocess } from "./chat-chunk-vectorization-client";
+import { afterEach, describe, expect, it } from "bun:test";
+import { DatabaseGenerationCancelledError } from "../db/connection";
+import {
+  __test__,
+  canUseChatChunkVectorizationSubprocess,
+  processChatChunkVectorizationBatchInSubprocess,
+} from "./chat-chunk-vectorization-client";
 
 describe("canUseChatChunkVectorizationSubprocess", () => {
   it("defaults to enabled on non-Windows runtimes", () => {
@@ -23,5 +28,92 @@ describe("canUseChatChunkVectorizationSubprocess", () => {
     expect(canUseChatChunkVectorizationSubprocess("win32", {
       LUMIVERSE_CHAT_VECTORIZATION_SUBPROCESS: "true",
     })).toBe(true);
+  });
+});
+type WorkerHarness = {
+  messages: unknown[];
+  kills: string[];
+  ipc: (message: unknown) => void;
+};
+
+function messageOfType(value: unknown, type: string): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && "type" in value && value.type === type;
+}
+
+async function waitForMessage(harness: WorkerHarness, type: string): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const message = harness.messages.find((candidate) => messageOfType(candidate, type));
+    if (message && messageOfType(message, type)) return message;
+    await Bun.sleep(0);
+  }
+  throw new Error(`Timed out waiting for worker message ${type}`);
+}
+
+afterEach(() => {
+  __test__.reset();
+});
+
+describe("chat chunk vectorization subprocess generation lifecycle", () => {
+  it("terminates an active old-generation worker and ignores its late completion", async () => {
+    const workers: WorkerHarness[] = [];
+    __test__.setSubprocessFactory((options) => {
+      const harness: WorkerHarness = { messages: [], kills: [], ipc: options.ipc };
+      workers.push(harness);
+      const fakeProcess = {
+        send(message: unknown) { harness.messages.push(message); },
+        kill(signal: string) { harness.kills.push(signal); },
+      };
+      queueMicrotask(() => options.ipc({ type: "ready" }));
+      // The production client only uses send/kill; the seam deliberately models that boundary.
+      return fakeProcess as unknown as ReturnType<typeof Bun.spawn>;
+    });
+
+    const firstController = new AbortController();
+    const first = processChatChunkVectorizationBatchInSubprocess([
+      { userId: "owner", chatId: "chat", chunkId: "old-chunk" },
+    ], 41, firstController.signal);
+    const firstRequest = await waitForMessage(workers[0]!, "process_batch");
+    expect(firstRequest.generation).toBe(41);
+
+    firstController.abort(new DatabaseGenerationCancelledError(41, 42));
+    await expect(first).rejects.toMatchObject({
+      code: "database_generation_cancelled",
+      admittedGeneration: 41,
+      currentGeneration: 42,
+    });
+    expect(workers[0]!.messages.some((message) => (
+      messageOfType(message, "cancel_generation") && message.generation === 41
+    ))).toBe(true);
+    expect(workers[0]!.kills).toContain("SIGTERM");
+
+    const secondController = new AbortController();
+    const second = processChatChunkVectorizationBatchInSubprocess([
+      { userId: "owner", chatId: "chat", chunkId: "new-chunk" },
+    ], 42, secondController.signal);
+    const secondRequest = await waitForMessage(workers[1]!, "process_batch");
+    const firstRequestId = firstRequest.requestId;
+    const secondRequestId = secondRequest.requestId;
+    if (typeof firstRequestId !== "string" || typeof secondRequestId !== "string") {
+      throw new Error("Worker requests must include request ids");
+    }
+
+    workers[0]!.ipc({
+      type: "result",
+      requestId: firstRequestId,
+      generation: 41,
+      result: { processedCount: 1, failedChunkIds: [], refreshedChatIds: ["stale"] },
+    });
+    workers[1]!.ipc({
+      type: "result",
+      requestId: secondRequestId,
+      generation: 42,
+      result: { processedCount: 1, failedChunkIds: [], refreshedChatIds: ["chat"] },
+    });
+
+    await expect(second).resolves.toEqual({
+      processedCount: 1,
+      failedChunkIds: [],
+      refreshedChatIds: ["chat"],
+    });
   });
 });
