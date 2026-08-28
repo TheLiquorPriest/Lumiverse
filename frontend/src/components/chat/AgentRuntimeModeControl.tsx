@@ -156,7 +156,14 @@ export default function AgentRuntimeModeControl(props: AgentRuntimeModeControlPr
     && canonicalTransientMode === runtime.pendingOneTurnMode
     ? runtime.pendingOneTurnMode
     : null
-  const selectedMode = localOneTurnMode ?? policy?.effectiveValue ?? (decision ? runtime.mode : 'response')
+  // A degraded Agentic request may have an effective Response fallback, but
+  // that fallback is status, not a user selection. Keep the selected control
+  // bound to authored authority until the user explicitly chooses otherwise.
+  const selectedMode = localOneTurnMode
+    ?? canonicalTransientMode
+    ?? policy?.authoredValue
+    ?? decision?.requestedMode
+    ?? 'response'
   const requestedMode = policy?.authoredValue ?? decision?.requestedMode ?? 'response'
   const authoredMode = policy?.authoredValue ?? decision?.defaultMode ?? 'response'
   const effectiveMode = policy?.effectiveValue ?? decision?.effectiveMode ?? 'response'

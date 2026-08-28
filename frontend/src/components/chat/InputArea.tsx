@@ -497,6 +497,13 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const requestPendingInChat = generationRequestAuthority?.status === 'pending'
     || generationRequestAuthority?.status === 'queued'
     || generationRequestAuthority?.status === 'working'
+  const generationRequestStatusLabel = generationRequestAuthority?.status === 'pending'
+    ? t('agentRun.status.pending')
+    : generationRequestAuthority?.status === 'queued'
+      ? t('agentRun.phase.queued')
+      : generationRequestAuthority?.status === 'working'
+        ? t('agentRun.phase.started')
+        : null
   const isGeneratingInChat = !!liveChatGenerationId || localGenerationInChat || requestPendingInChat
   const runtimeSelection = useSyncExternalStore(
     useCallback((listener) => subscribeRuntimeSelection(chatId, listener), [chatId]),
@@ -4871,6 +4878,11 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
           {showStopControl ? (
             <div className={styles.sendBtnShell}>
+              {generationRequestStatusLabel ? (
+                <span className={styles.requestStatusBadge} role="status">
+                  {generationRequestStatusLabel}
+                </span>
+              ) : null}
               {activeAgentRun ? (
                 <AgentRunStopButton
                   turnId={activeAgentRun.turnId}
@@ -4908,9 +4920,9 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                   data-stop-state={composerStopping ? 'stopping' : undefined}
                 >
                   <Square size={16} />
-                  {composerStopping
-                    ? <span>{t('agentRuntime.stop.stopping')}</span>
-                    : null}
+                  <span>{composerStopping
+                    ? t('agentRuntime.stop.stopping')
+                    : t('agentRuntime.stop.stop')}</span>
                 </button>
               )}
             </div>

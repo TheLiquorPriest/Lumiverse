@@ -3,6 +3,7 @@ import type { GenerateRequest, GenerateResponse, GenerationRequestOptions } from
 import { messagesApi, chatsApi } from '@/api/chats'
 import { useStore } from '@/store'
 import type { GenerationRequestAuthority } from '@/types/store'
+import { yieldToBrowser } from '@/lib/spindle/browser-scheduler'
 
 export interface GenerationRequestEpoch {
   chatId: string
@@ -160,6 +161,16 @@ export async function startGenerationWithRecovery(
   const requestOptions: GenerationRequestOptions = { ...options, signal: controller.signal }
 
   try {
+    // The request authority is the human's Stop surface before either runtime
+    // preflight or backend admission has an ID. Give React one shared paint
+    // boundary to commit it, then re-check the same authority and signal.
+    await yieldToBrowser({ when: 'paint' })
+    if (controller.signal.aborted) {
+      throw controller.signal.reason ?? new DOMException('Generation cancelled', 'AbortError')
+    }
+    if (!isGenerationRequestCurrent(generationRequest, undefined, true)) {
+      throw new DOMException('Generation cancelled', 'AbortError')
+    }
     const response = path === 'regenerate'
       ? await generateApi.regenerate(admittedRequest, requestOptions)
       : path === 'continue'

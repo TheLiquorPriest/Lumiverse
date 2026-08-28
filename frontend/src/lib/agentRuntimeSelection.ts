@@ -639,6 +639,9 @@ export async function prepareAgentRuntimeRequest<T extends RuntimeGenerationRequ
   }
 
   const explicitMode = selection.oneTurnMode
+  const explicitResponseSelected = forceResponse
+    || request.mode === 'response'
+    || explicitMode === 'response'
   const shouldPreflightAgentic = !forceResponse && request.mode !== 'response' && explicitMode !== 'response' && (
     request.mode === 'agentic'
       || explicitMode === 'agentic'
@@ -666,7 +669,7 @@ export async function prepareAgentRuntimeRequest<T extends RuntimeGenerationRequ
     return {
       request: responseGenerationRequest(
         request,
-        forceResponse
+        explicitResponseSelected
           || explicitMode !== null
           || request.mode !== undefined
           || request.runtime_decision_token !== undefined

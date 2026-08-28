@@ -1086,7 +1086,8 @@
   white-space: nowrap;
 }
 
-.abortBadge {
+.abortBadge,
+.requestStatusBadge {
   position: absolute;
   right: 0;
   bottom: calc(100% + 8px);
@@ -1106,6 +1107,11 @@
   white-space: nowrap;
   pointer-events: none;
   z-index: 2;
+}
+
+.requestStatusBadge {
+  background: color-mix(in srgb, var(--lumiverse-primary, rgba(140, 130, 255, 0.9)) 88%, black 12%);
+  border-color: color-mix(in srgb, var(--lumiverse-primary, rgba(140, 130, 255, 0.9)) 70%, white 12%);
 }
 
 .mobileQueueHint {
