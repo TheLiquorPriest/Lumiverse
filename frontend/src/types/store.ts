@@ -112,7 +112,11 @@ export interface ChatSlice {
   addMessage: (message: Message) => void
   updateMessage: (id: string, updates: Partial<Message>) => void
   removeMessage: (id: string) => void
-  beginStreaming: (regeneratingMessageId?: string, generationType?: string) => void
+  beginStreaming: (
+    regeneratingMessageId?: string,
+    generationType?: string,
+    options?: { createPlaceholder?: boolean },
+  ) => void
   startStreaming: (generationId: string, regeneratingMessageId?: string, generationType?: string) => void
   pauseStreamingForNavigation: () => void
   /** Append a live stream segment. When `offset` (char position of the segment

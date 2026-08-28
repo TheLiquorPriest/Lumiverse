@@ -2136,6 +2136,10 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     generationAbortControllerRef.current = generationAbortController
     beginGenerationRequest(chatId, activeGenerationId)
     const generationRequest = captureGenerationRequest(chatId)
+    // Publish the cancellable local intent before message persistence and
+    // runtime preflight. The target message does not exist yet, so defer the
+    // normal stream placeholder until the authoritative START identifies it.
+    beginStreaming(undefined, 'normal', { createPlaceholder: false })
     if (contentOverride === undefined) {
       setText('')
       setPendingAttachments([])
@@ -2268,7 +2272,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         consumeOneshotGuides()
       } else if (hasQueuedMessages) {
         // Queued user messages waiting — trigger normal generation
-        beginStreaming()
         const res = await generateApi.start(genOpts, { forceResponse, signal: generationAbortController.signal })
         if (
           !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true) ||
@@ -2279,7 +2282,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       } else {
         // Empty send from the input bar is a nudge for a fresh reply, not the
         // explicit Continue action that appends onto the previous assistant message.
-        beginStreaming()
         const res = await generateApi.start(genOpts, { forceResponse, signal: generationAbortController.signal })
         if (
           !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true) ||
@@ -2510,6 +2512,9 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       swipeId: targetSwipeId,
       targetCharacterId,
     })
+    // The existing generation control must become Stop before runtime
+    // resolution or HTTP admission, including the id-less decision window.
+    beginStreaming(targetMessage?.id, 'regenerate')
 
     const presetId = getActivePresetForGeneration() || undefined
     const forceResponse = isGroupChat || !!mpRoomId
@@ -2551,7 +2556,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       const isAgentic = prepared.request.mode === 'agentic'
 
       if (isAgentic) {
-        beginStreaming(targetMessage?.id, 'regenerate')
         const res = await generateApi.dispatchPreparedGeneration('/generate', prepared, {
           forceResponse,
           signal: generationAbortController.signal,
@@ -2598,7 +2602,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         created_at: Math.floor(Date.now() / 1000),
       }
       addMessage(placeholder)
-      beginStreaming(placeholderId)
+      useStore.getState().setRegeneratingMessageId(placeholderId)
 
       const responsePrepared = {
         ...prepared,

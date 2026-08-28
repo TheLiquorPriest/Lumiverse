@@ -925,7 +925,7 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
         return { messages, totalChatLength: Math.max(0, state.totalChatLength - 1), unseenSwipes }
       }),
 
-    beginStreaming: (regeneratingMessageId, generationType) => {
+    beginStreaming: (regeneratingMessageId, generationType, options) => {
       cancelStreamFlush()
       rawStreamContent = ''
       rawStreamReasoning = ''
@@ -936,7 +936,11 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
       let nextMessages = current.messages
       let nextTotalChatLength = current.totalChatLength
 
-      if (!nextRegeneratingMessageId && shouldUseLocalStreamPlaceholder(generationType)) {
+      if (
+        options?.createPlaceholder !== false
+        && !nextRegeneratingMessageId
+        && shouldUseLocalStreamPlaceholder(generationType)
+      ) {
         const placeholder = createLocalStreamPlaceholder(current)
         if (placeholder) {
           nextRegeneratingMessageId = placeholder.id
