@@ -3904,6 +3904,52 @@ type TurnReconciliationFailure = {
   readonly message: string | null
   count: number
 }
+/**
+ * Reconcile one already-terminal Agentic turn by exact owner and execution ID.
+ * Generic Stop uses this after a live terminal publication fault; it never
+ * claims or advances a reversible execution and never replays provider work.
+ */
+export function reconcileTerminalAgentTurn(
+  executionId: string,
+  userId: string,
+  db: Database = getDb(),
+): boolean {
+  const execution = getTurnExecution(executionId, userId, db);
+  if (!execution || !TERMINAL_PHASE_SET.has(execution.phase)) return false;
+  if (execution.phase === "COMMITTED") {
+    const receiptRow = rawReceipt(db, execution);
+    if (!receiptRow) return false;
+    const receipt = receiptFromRow(receiptRow, execution, { allowHistoricalTarget: true, db });
+    const historicalTargetRedaction = execution.targetMessageId !== receipt.messageId
+      || execution.targetSwipeId !== receipt.swipeId;
+    db.transaction(() => {
+      const latest = requireExecution(db, execution.id).execution;
+      if (
+        latest.userId !== execution.userId
+        || latest.chatId !== execution.chatId
+        || latest.generationId !== execution.generationId
+        || latest.attemptLineage.attemptId !== execution.attemptLineage.attemptId
+        || latest.phase !== execution.phase
+        || latest.casRevision !== execution.casRevision
+      ) {
+        throw new TurnExecutionError("stale_execution", "terminal execution changed during exact recovery", {
+          executionId,
+          phase: execution.phase,
+        });
+      }
+      reconcileCommittedPersistentSession(db, latest);
+      invokeReceiptRepair(
+        normalizedReceiptExecution(db, latest, receipt),
+        receipt,
+        historicalTargetRedaction ? { historicalTargetRedaction: true } : undefined,
+      );
+    })();
+    return true;
+  }
+  if (!isNoncommittedTerminalPhase(execution.phase) || !terminalRecoveryTablesAvailable(db)) return false;
+  reconcileTerminalExecutionProjection(db, execution);
+  return true;
+}
 
 /**
  * Startup reconciliation is bounded and receipt-free for every noncommitted

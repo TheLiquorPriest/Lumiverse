@@ -39,4 +39,18 @@ describe("generation Stop request authority", () => {
     expect(authorityStop).toHaveBeenCalledWith("user-a", "chat-a", authorityId);
     expect(chatStop).toHaveBeenCalledWith("user-a", "chat-a");
   });
+  test("passes owner chat authority to generation-id Stop", async () => {
+    const exactStop = spyOn(generateService, "stopGeneration").mockResolvedValue(true);
+    spies.push(exactStop);
+
+    const response = await authenticatedRoutes("user-a").request("/generate/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generation_id: "turn-a", chat_id: "chat-a" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ stopped: true, status: "accepted" });
+    expect(exactStop).toHaveBeenCalledWith("user-a", "turn-a", "chat-a");
+  });
 });

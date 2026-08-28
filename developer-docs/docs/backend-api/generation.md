@@ -471,6 +471,10 @@ boundary; they do not terminalize inspection, Turn Session, or pool state from
 cleanup. If the source chat was already deleted, chat-owned projections no
 longer exist: the detached persistent Turn Session is terminalized with the
 execution, the pool is settled afterward, and no chat websocket event is sent.
+The generic generation Stop path also recognizes an exact owner/chat/turn whose
+live registration was released after a terminal publication fault. It invokes
+the dormant Agent Run Stop owner, repairs the terminal transaction, and settles
+the visible pool only after that repair; owner or chat mismatch fails closed.
 
 The strict preprocessing ceilings are immutable host defaults: 8 MiB input,
 8 MiB output, 16 MiB cumulative expansion, 2 MiB per operation, 1,024 prompt

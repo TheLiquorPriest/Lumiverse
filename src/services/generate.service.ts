@@ -14,6 +14,8 @@ import {
   type AgenticGenerationInput,
   type AgenticTargetSnapshot,
 } from "./agentic-generation.service";
+import { getTurnExecution } from "./turn-execution.service";
+import { requestAgentRunStop } from "./agent-run-projection.service";
 import { getProvider } from "../llm/registry";
 import {
   AgentToolCapabilityError,
@@ -8027,9 +8029,29 @@ export async function stopGenerationRequestAuthority(
   }
   return true;
 }
+function requestDormantAgenticGenerationStop(
+  userId: string,
+  generationId: string,
+  expectedChatId?: string,
+): boolean | "too_late" {
+  try {
+    const execution = getTurnExecution(generationId, userId);
+    if (
+      !execution
+      || execution.mode !== "agentic"
+      || (expectedChatId !== undefined && execution.chatId !== expectedChatId)
+    ) return false;
+    const stopped = requestAgentRunStop(userId, execution.chatId, execution.id);
+    if (!stopped) return false;
+    return stopped.status === "too_late" ? "too_late" : true;
+  } catch {
+    return false;
+  }
+}
 export async function stopGeneration(
   userId: string,
   generationId: string,
+  expectedChatId?: string,
 ): Promise<boolean | "too_late"> {
   const agenticContext = getActiveAgenticGenerationContext(userId, generationId);
   const agenticResult = await requestAgenticGenerationCancellation(userId, generationId);
@@ -8051,7 +8073,9 @@ export async function stopGeneration(
   const entry = activeGenerations.get(generationId);
   // User scoping: a generationId is unguessable, but never let one user's
   // stop request abort another user's generation.
-  if (!entry || entry.userId !== userId) return false;
+  if (!entry || entry.userId !== userId) {
+    return requestDormantAgenticGenerationStop(userId, generationId, expectedChatId);
+  }
   const claimed = entry.terminal.tryTerminate("stopped");
   // The same chat may still own an Agentic turn from a legacy race; its durable
   // owner decides acceptance before this Stop reports a result.
@@ -8092,7 +8116,11 @@ export async function stopChatGenerations(
     if (entry) stopped = entry.terminal.tryTerminate("stopped");
   }
   abortChatBackground(userId, chatId);
-  return stopped;
+  if (stopped) return true;
+  const dormantPool = pool.getPoolForChat(userId, chatId);
+  return dormantPool
+    ? requestDormantAgenticGenerationStop(userId, dormantPool.generationId, chatId)
+    : false;
 }
 
 export async function stopAllGenerations(): Promise<boolean | "too_late"> {

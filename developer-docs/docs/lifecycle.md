@@ -144,6 +144,10 @@ is reversible, `too_late` after the completion boundary, or `terminal` once a
 terminal owner has settled it. The compatibility
 `POST /api/v1/generate/stop` route returns `{ stopped: boolean, status: "accepted" | "too_late" | "not_found" }`; use the
 Agent Run Stop route when the phase distinction matters.
+If live terminal publication failed and its in-memory generation registration has
+already been released, generic generation Stop resolves the exact owner/chat/turn
+execution, repairs its durable terminal surfaces, and only then settles the
+visible pool. A mismatched owner or chat cannot invoke this recovery.
 
 ### Inspection, recovery, and retention
 

@@ -14,6 +14,7 @@ import {
 import {
   AGENTIC_FINAL_RENDER_RESERVATION_COMPONENTS_V1,
   requestDormantTurnCancellation,
+  reconcileTerminalAgentTurn,
   type TurnCancellationResult,
   type TurnCommitReceipt,
   type TurnExecutionRecord,
@@ -4568,14 +4569,38 @@ function stopResponseForRun(
     ...(error ? { error } : {}),
   };
 }
+function settlePoolAfterDurableRun(run: AgentRunPublicV2): void {
+  if (!isTerminal(run)) return;
+  if (run.workOutcome === "stopped") {
+    generationPool.stopPool(run.turnId);
+  } else if (run.workOutcome === "completed") {
+    generationPool.completePool(run.turnId, run.terminalHandoff?.messageId ?? undefined);
+  } else {
+    generationPool.errorPool(run.turnId, run.reason ?? run.error?.code ?? "agentic_failed");
+  }
+  const terminalPool = generationPool.getPoolEntry(run.turnId);
+  if (!terminalPool || terminalPool.status === "completed" || terminalPool.status === "stopped" || terminalPool.status === "error") {
+    generationPool.unregisterPoolTerminalOwner(run.turnId);
+  }
+}
 
 export function requestAgentRunStop(userId: string, chatId: string, turnId: string): AgentRunStopResponseV2 | null {
   if (!validId(userId) || !validId(chatId) || !validId(turnId)) return null;
   const db = getDb();
-  const run = getAgentRun(userId, turnId, chatId);
-  if (!run) return null;
-
-  const initialControl = executionControlRow(db, userId, chatId, turnId);
+  let initialControl = executionControlRow(db, userId, chatId, turnId);
+  let run = getAgentRun(userId, turnId, chatId);
+  if (!run) {
+    if (!initialControl) return null;
+    try {
+      if (!reconcileTerminalAgentTurn(turnId, userId, db)) return null;
+    } catch {
+      throw new AgentRunStopUnavailableError(turnId);
+    }
+    run = getAgentRun(userId, turnId, chatId);
+    initialControl = executionControlRow(db, userId, chatId, turnId);
+    if (!run || !initialControl) throw new AgentRunStopUnavailableError(turnId);
+  }
+  if (isTerminal(run)) settlePoolAfterDurableRun(run);
   const initialDurable = canonicalExecutionProjection(initialControl);
   if (initialControl && !initialDurable) throw new AgentRunStopUnavailableError(turnId);
   const currentStoredState = storedStateForRun(run);
@@ -4679,19 +4704,7 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
     return publishTerminal(durableResult.execution.phase, "accepted", durableResult.execution.terminalCode);
   });
   const latestRun = getAgentRun(userId, turnId, chatId) ?? run;
-  if (isTerminal(latestRun)) {
-    if (latestRun.workOutcome === "stopped") {
-      generationPool.stopPool(turnId);
-    } else if (latestRun.workOutcome === "completed") {
-      generationPool.completePool(turnId, latestRun.terminalHandoff?.messageId ?? undefined);
-    } else {
-      generationPool.errorPool(turnId, latestRun.reason ?? latestRun.error?.code ?? "agentic_failed");
-    }
-    const terminalPool = generationPool.getPoolEntry(turnId);
-    if (!terminalPool || terminalPool.status === "completed" || terminalPool.status === "stopped" || terminalPool.status === "error") {
-      generationPool.unregisterPoolTerminalOwner(turnId);
-    }
-  }
+  settlePoolAfterDurableRun(latestRun);
   return stopResponseForRun(latestRun, result.status, result.revision);
 }
 

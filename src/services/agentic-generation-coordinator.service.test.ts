@@ -42,7 +42,7 @@ import { appendPoolContent, completePool, createPoolEntry, errorPool, getPoolEnt
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { runAgenticGeneration, waitForAgenticGeneration } from "./agentic-generation.service";
-import { startGeneration } from "./generate.service";
+import { startGeneration, stopGeneration } from "./generate.service";
 import * as breakdownSvc from "./breakdown.service";
 import { createAgentInspectionWriter, getAgentRunInspection, type AgentInspectionWriterV1 } from "./agent-activity-runs.service";
 import { getAgentRun } from "./agent-run-projection.service";
@@ -4450,6 +4450,77 @@ describe("production agentic coordinator installation", () => {
       status: "completed",
       completedMessageId: committedMessageId,
     });
+  });
+  test("generic Stop repairs a publish fault through the exact dormant owner", async () => {
+    const db = getDb();
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(
+      { userId: USER_ID, chatId: AGENTIC_CHAT_ID, connectionId: CONNECTION_ID, presetId: AGENTIC_PRESET_ID, generationType: "normal", userInput: USER_INPUT },
+      target,
+      signal,
+    );
+    const executionId = "exec-generic-stop-recovery-" + Date.now();
+    const trigger = "agentic_generic_stop_projection_failure_" + Date.now();
+    const execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      target,
+      decision,
+      signal,
+    });
+    if (!execution.ownerToken || !execution.phase) throw new Error("durable execution ownership unavailable");
+    transitionTurnExecution({
+      executionId,
+      ownerToken: execution.ownerToken,
+      expectedPhase: execution.phase,
+      nextPhase: "FAILED",
+      reason: "agentic_provider_failure",
+    });
+    db.run(
+      "CREATE TRIGGER " + trigger + " BEFORE INSERT ON agent_run_projections " +
+      "BEGIN SELECT RAISE(ABORT, 'projection write unavailable'); END",
+    );
+    try {
+      expect(() => deps.publishTerminal!({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        status: "failed",
+        phase: "FAILED",
+        target,
+        errorCode: "agentic_provider_failure",
+      })).toThrow();
+    } finally {
+      db.run("DROP TRIGGER IF EXISTS " + trigger);
+      deps.cleanup!({ execution, executionId, phase: "FAILED", status: "failed" } as never);
+    }
+    try {
+      expect(await stopGeneration("user-other", executionId, AGENTIC_CHAT_ID)).toBe(false);
+      expect(await stopGeneration(USER_ID, executionId, "chat-other")).toBe(false);
+      expect(db.query(
+        "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+      ).get(USER_ID, executionId)).toBeNull();
+      expect(await stopGeneration(USER_ID, executionId, AGENTIC_CHAT_ID)).toBe(true);
+      expect(db.query(
+        "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({ phase: "TERMINAL", status: "terminal", outcome: "failed" });
+      expect(db.query(
+        "SELECT status, outcome, reason FROM agent_run_attempts WHERE user_id = ? AND attempt_id = ?",
+      ).get(USER_ID, executionId)).toMatchObject({ status: "terminal", outcome: "failed", reason: "provider_failure" });
+      expect(db.query(
+        "SELECT status FROM agent_run_projections WHERE user_id = ? AND chat_id = ? AND turn_id = ?",
+      ).get(USER_ID, AGENTIC_CHAT_ID, executionId)).toMatchObject({ status: "FAILED" });
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND chat_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get(USER_ID, AGENTIC_CHAT_ID, executionId) as { count: number }).count).toBe(1);
+      expect(getPoolEntry(executionId)?.status).toBe("error");
+    } finally {
+      removePoolEntry(executionId);
+    }
   });
 
   test("failed terminal convergence leaves only the durable execution cause and emits nothing", () => {

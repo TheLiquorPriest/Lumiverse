@@ -112,7 +112,7 @@ app.post("/stop", async (c) => {
   const withRequestAuthority = (result: boolean | "too_late") => requestAuthorityStopped ? true : result;
 
   if (body.generation_id) {
-    const stopped = await svc.stopGeneration(userId, body.generation_id);
+    const stopped = await svc.stopGeneration(userId, body.generation_id, body.chat_id);
     if (!stopped && body.chat_id) {
       const fallback = await svc.stopChatGenerations(userId, body.chat_id);
       return c.json(stopResultPayload(withRequestAuthority(fallback)));
