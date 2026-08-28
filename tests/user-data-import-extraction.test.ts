@@ -222,12 +222,26 @@ describe("user-data import bounded extraction", () => {
     const archivePath = join(workDir, "legacy-image-secrets.lvbak");
     const imageGeneration = {
       enabled: true,
-      nanogpt: { apiKey: "imported-nanogpt-secret", model: "hidream" },
+      unrelated: { apiKey: "retained-import-api-key" },
+      nanogpt: {
+        apiKey: "imported-nanogpt-secret",
+        model: "hidream",
+        credentials: { apiKey: "imported-deep-secret", label: "primary" },
+        variants: [{ nested: { apiKey: "imported-array-secret", steps: 20 } }],
+      },
       novelai: { apiKey: "imported-novelai-secret", sampler: "k_euler" },
       compatibility: [
         { nanogpt: { apiKey: "imported-nested-secret", model: "nested" } },
         { wrapper: { novelai: { apiKey: "imported-nested-secret", steps: 28 } } },
       ],
+      encodedCompatibility: JSON.stringify({
+        wrapper: {
+          nanogpt: {
+            credentials: { apiKey: "imported-encoded-secret", label: "encoded" },
+            model: "encoded-nano",
+          },
+        },
+      }),
     };
     getDb()
       .prepare("INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)")
@@ -251,23 +265,75 @@ describe("user-data import bounded extraction", () => {
     expect(JSON.parse(stored.value)).toEqual({
       enabled: false,
       promptPresets: [],
-      nanogpt: { model: "hidream" },
+      unrelated: { apiKey: "retained-import-api-key" },
+      nanogpt: {
+        model: "hidream",
+        credentials: { label: "primary" },
+        variants: [{ nested: { steps: 20 } }],
+      },
       novelai: { sampler: "k_euler" },
       compatibility: [
         { nanogpt: { model: "nested" } },
         { wrapper: { novelai: { steps: 28 } } },
       ],
+      encodedCompatibility: JSON.stringify({
+        wrapper: {
+          nanogpt: {
+            credentials: { label: "encoded" },
+            model: "encoded-nano",
+          },
+        },
+      }),
     });
   });
 
-  test("fails the whole import for a malformed legacy image-generation value", async () => {
+  test("merges own prototype keys onto an existing image-generation setting", async () => {
+    const archivePath = join(workDir, "prototype-image-setting.lvbak");
+    const importedValue =
+      ' { "__proto__": { "polluted": "no" }, "constructor": { "kind": "imported" }, "enabled": true, "ordinary": "imported", "restored": "yes" } ';
+    getDb()
+      .prepare("INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)")
+      .run(
+        "imageGeneration",
+        JSON.stringify({ enabled: false, ordinary: "existing" }),
+        USER_ID,
+      );
+    writeFileSync(archivePath, zipSync({
+      "manifest.json": strToU8(JSON.stringify(manifest())),
+      "database/settings.ndjson": strToU8(JSON.stringify({
+        key: "imageGeneration",
+        value: importedValue,
+        user_id: "source-user",
+        updated_at: 0,
+      }) + "\n"),
+    }));
+
+    const job = await startImport({ userId: USER_ID, archivePath, jobId: crypto.randomUUID() });
+    const finished = await waitForTerminal(job.jobId);
+    expect(finished.status).toBe("complete");
+
+    const stored = getDb()
+      .query("SELECT value FROM settings WHERE key = ? AND user_id = ?")
+      .get("imageGeneration", USER_ID) as { value: string };
+    const parsed = JSON.parse(stored.value);
+    expect(Object.prototype.hasOwnProperty.call(parsed, "__proto__")).toBe(true);
+    expect(parsed.__proto__).toEqual({ polluted: "no" });
+    expect(Object.prototype.hasOwnProperty.call(parsed, "constructor")).toBe(true);
+    expect(parsed.constructor).toEqual({ kind: "imported" });
+    expect(parsed.enabled).toBe(false);
+    expect(parsed.ordinary).toBe("existing");
+    expect(parsed.restored).toBe("yes");
+    expect(({} as any).polluted).toBeUndefined();
+  });
+
+  test("fails the whole import for Unicode-escaped malformed provider data", async () => {
     const archivePath = join(workDir, "malformed-image-setting.lvbak");
-    const malformedSecret = "malformed-imported-image-secret";
+    const escapedPrivateData = String.raw`{"\u006e\u0061\u006e\u006f\u0067\u0070\u0074":{"\u0061\u0070\u0069\u004b\u0065\u0079":"escaped-import-secret"}`;
     const rows = [
       { key: "must_not_commit", value: "true", user_id: "source-user", updated_at: 0 },
       {
         key: "imageGeneration",
-        value: "{\"nanogpt\":{\"apiKey\":\"" + malformedSecret + "\"}",
+        value: JSON.stringify({ wrapper: escapedPrivateData }),
         user_id: "source-user",
         updated_at: 0,
       },
@@ -280,7 +346,9 @@ describe("user-data import bounded extraction", () => {
     const job = await startImport({ userId: USER_ID, archivePath, jobId: crypto.randomUUID() });
     const finished = await waitForTerminal(job.jobId);
     expect(finished.status).toBe("failed");
-    expect(finished.error).toContain("imageGeneration settings value is malformed JSON");
+    expect(finished.error).toContain(
+      "imageGeneration settings contain malformed JSON-encoded provider data",
+    );
     expect(getDb().query(
       "SELECT value FROM settings WHERE key = ? AND user_id = ?",
     ).get("must_not_commit", USER_ID)).toBeNull();

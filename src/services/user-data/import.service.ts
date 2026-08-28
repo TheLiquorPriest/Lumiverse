@@ -3483,6 +3483,19 @@ function ndjsonLineLimitForManifest(manifest: ArchiveManifest | null): number {
  * authored on the source instance — so persona/character bindings that
  * reference those preset IDs resolve cleanly instead of 404'ing.
  */
+function defineOwnSettingField(
+  target: Record<string, unknown>,
+  key: string,
+  value: unknown,
+): void {
+  Object.defineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
 function mergeSettingValue(existingValue: unknown, importedValue: unknown): unknown {
   const isPlainObject = (v: unknown): v is Record<string, unknown> =>
     !!v && typeof v === "object" && !Array.isArray(v);
@@ -3503,11 +3516,19 @@ function mergeSettingValue(existingValue: unknown, importedValue: unknown): unkn
   if (!isPlainObject(existingValue) || !isPlainObject(importedValue)) {
     return existingValue;
   }
-  const result: Record<string, unknown> = { ...existingValue };
-  for (const [k, importedField] of Object.entries(importedValue)) {
-    const existingField = (existingValue as any)[k];
-    if (existingField === undefined || existingField === null) {
-      result[k] = importedField;
+
+  // Object.hasOwn is part of the merge contract. Inherited Object.prototype
+  // fields such as __proto__ and constructor do not count as destination
+  // values, and every write uses a data property on a null-prototype target.
+  const result = Object.create(null) as Record<string, unknown>;
+  for (const [key, existingField] of Object.entries(existingValue)) {
+    defineOwnSettingField(result, key, existingField);
+  }
+  for (const [key, importedField] of Object.entries(importedValue)) {
+    const hasExistingField = Object.hasOwn(existingValue, key);
+    const existingField = hasExistingField ? existingValue[key] : undefined;
+    if (!hasExistingField || existingField === undefined || existingField === null) {
+      defineOwnSettingField(result, key, importedField);
       continue;
     }
     // Merge an id-keyed array if the imported side actually has shape (so
@@ -3519,7 +3540,6 @@ function mergeSettingValue(existingValue: unknown, importedValue: unknown): unkn
       for (const item of existingField) {
         const id = String(item.id);
         if (!seen.has(id)) {
-
           merged.push(item);
           seen.add(id);
         }
@@ -3531,7 +3551,7 @@ function mergeSettingValue(existingValue: unknown, importedValue: unknown): unkn
           seen.add(id);
         }
       }
-      result[k] = merged;
+      defineOwnSettingField(result, key, merged);
       continue;
     }
     // Default: existing wins for this field.

@@ -128,16 +128,20 @@ async function settle(generationId: string): Promise<unknown> {
 }
 
 describe("agentic generation orchestration", () => {
-  test("runs the closed phases and commits all four target kinds", async () => {
+  test("keeps internal execution chronology separate from canonical public phases for all targets", async () => {
     for (const generationType of ["normal", "continue", "regenerate", "swipe"] as const) {
       const log: string[] = [];
-      const started = await runAgenticGeneration(input({ generationType }), dependencies(log));
+      const publicPhases: string[] = [];
+      const started = await runAgenticGeneration(input({ generationType }), dependencies(log, {
+        publishPhase: (event) => { publicPhases.push(event.workPhase ?? "missing"); },
+      }));
       expect(started.status).toBe("streaming");
       const result = await settle(started.generationId) as { status: string; phase: string; receipt?: { receiptId: string } };
       expect(result.status).toBe("completed");
       expect(result.phase).toBe("COMMITTED");
       expect(result.receipt?.receiptId).toBe("receipt-1");
       expect(log).toEqual(["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "terminal:completed", "cleanup"]);
+      expect(publicPhases).toEqual(["ASSEMBLE", "WORK", "PREPARE_COMMIT", "RENDER", "COMMIT"]);
     }
   });
   test("publishes completed orchestration without a failure reason", async () => {

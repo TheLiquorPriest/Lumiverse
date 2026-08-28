@@ -45,10 +45,15 @@ silently becomes Response.
 
 ### Phase, status, and outcome vocabulary
 
-The durable lifecycle is:
+The public Agent Run lifecycle is:
 
-`ADMIT` → `ASSEMBLE` → `WORK` → `RENDER` → `PREPARE_COMMIT` → `COMMIT` →
+`ADMIT` → `ASSEMBLE` → `WORK` → `PREPARE_COMMIT` → `RENDER` → `COMMIT` →
 `TERMINAL`.
+
+`PREPARE_COMMIT` is the public completion/freeze handoff. At that boundary,
+the host has accepted completion and frozen the workspace and render context
+that final rendering will consume. These public phases are projections; do not
+derive their order from the runtime's similarly named internal states.
 
 The status is one of `pending`, `running`, `waiting`, `cancelling`, or
 `terminal`. A terminal Turn Session has one outcome: `completed`, `stopped`,
@@ -99,15 +104,27 @@ creates no attempt, projection, or terminal publication.
 4. **WORK:** deterministic child descriptors run in order, then the root
    provider may use only its admitted tool/delegation capabilities. WORK
    notes and private child material are retained only for owner inspection.
-5. **Render and preparation:** `RENDER` produces the final response with
-   tools disabled. A tool call in finalization is a protocol failure, not
-   another delegation. `PREPARE_COMMIT` then runs `prepareRender()` over the
-   frozen render result to validate and prepare the typed commit deltas.
-6. **Commit or terminal:** one compare-and-set owner decides whether
-   `COMMIT` can begin. A successful commit writes the canonical message/swipe
-   and terminal receipt in one transaction. Cancellation, deadline, provider
-   failure, required-work failure, or exhaustion before that boundary produces
-   a terminal outcome without an authoritative chat write.
+5. **Completion handoff and render:** public `PREPARE_COMMIT` marks accepted
+   completion and freezes the workspace and render context. Public `RENDER`
+   then produces the final response with tools disabled. A tool call in
+   finalization is a protocol failure, not another delegation.
+6. **Commit or terminal:** public `COMMIT` includes the pure, snapshot-bound
+   `prepareRender()` processing and the durable commit attempt. One
+   compare-and-set owner decides whether the canonical write can begin. A
+   successful durable commit writes the message/swipe and terminal receipt in
+   one transaction. Cancellation, deadline, provider failure, required-work
+   failure, or exhaustion before that boundary produces a terminal outcome
+   without an authoritative chat write.
+
+Internally, after WORK completes and freezes, the orchestrator enters
+`COMPLETE`, enters `RENDER` and calls `render()`, then enters its internal
+`PREPARE_COMMIT` state and calls `prepareRender()` before `commit()`.
+Those are implementation states and calls, not additional public phases.
+Internal `COMPLETE` supplies the public `PREPARE_COMMIT` completion handoff,
+and internal `RENDER` supplies public `RENDER`. Internal `PREPARE_COMMIT`,
+which calls `prepareRender()`, and `COMMITTING` both project as public `COMMIT`.
+They do not insert another public completion handoff after `RENDER`; the durable
+commit CAS and transaction remain the only authority for the canonical write.
 
 `POST /api/v1/agent-runs/:turnId/stop` returns `accepted` only while the run
 is reversible, `too_late` after the completion boundary, or `terminal` once a

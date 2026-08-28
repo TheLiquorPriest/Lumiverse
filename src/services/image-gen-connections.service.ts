@@ -145,40 +145,56 @@ export async function createConnection(
 ): Promise<ImageGenConnectionProfile> {
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
+  const secretKey = imageGenConnectionSecretKey(id);
+  const hasApiKey = input.api_key ? 1 : 0;
+  let secretPersisted = false;
 
-  if (input.is_default) {
-    getDb()
-      .query("UPDATE image_gen_connections SET is_default = 0 WHERE is_default = 1 AND user_id = ?")
-      .run(userId);
+  try {
+    if (input.api_key) {
+      await secretsSvc.putSecret(userId, secretKey, input.api_key);
+      secretPersisted = true;
+    }
+
+    const db = getDb();
+    db.transaction(() => {
+      if (input.is_default) {
+        db.query(
+          "UPDATE image_gen_connections SET is_default = 0 WHERE is_default = 1 AND user_id = ?",
+        ).run(userId);
+      }
+
+      db.query(
+        "INSERT INTO image_gen_connections "
+          + "(id, user_id, name, provider, api_url, model, is_default, has_api_key, default_parameters, metadata, created_at, updated_at) "
+          + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(
+        id,
+        userId,
+        input.name,
+        input.provider,
+        input.api_url || "",
+        input.model || "",
+        input.is_default ? 1 : 0,
+        hasApiKey,
+        JSON.stringify(input.default_parameters || {}),
+        JSON.stringify(clearImportedConnectionReview(input.metadata || {})),
+        now,
+        now,
+      );
+    })();
+  } catch (error) {
+    if (secretPersisted) {
+      try {
+        secretsSvc.deleteSecret(userId, secretKey);
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          "Image connection creation failed and its secret could not be rolled back",
+        );
+      }
+    }
+    throw error;
   }
-
-  let hasApiKey = 0;
-  if (input.api_key) {
-    await secretsSvc.putSecret(userId, imageGenConnectionSecretKey(id), input.api_key);
-    hasApiKey = 1;
-  }
-
-  getDb()
-    .query(
-      `INSERT INTO image_gen_connections
-        (id, user_id, name, provider, api_url, model, is_default, has_api_key, default_parameters, metadata, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      id,
-      userId,
-      input.name,
-      input.provider,
-      input.api_url || "",
-      input.model || "",
-      input.is_default ? 1 : 0,
-      hasApiKey,
-      JSON.stringify(input.default_parameters || {}),
-      JSON.stringify(clearImportedConnectionReview(input.metadata || {})),
-      now,
-      now
-    );
-
 
   const profile = getConnection(userId, id)!;
   eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id, profile: toPublicImageGenConnection(profile) }, userId);

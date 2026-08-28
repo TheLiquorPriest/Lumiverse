@@ -45,6 +45,7 @@ import { waitForAgenticGeneration } from "./agentic-generation.service";
 import { startGeneration } from "./generate.service";
 import * as breakdownSvc from "./breakdown.service";
 import { createAgentInspectionWriter, getAgentRunInspection, type AgentInspectionWriterV1 } from "./agent-activity-runs.service";
+import { getAgentRun } from "./agent-run-projection.service";
 import { deleteChat } from "./chats.service";
 import { generateRoutes } from "../routes/generate.routes";
 
@@ -664,6 +665,59 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     expect(true).toBe(true);
   });
+  test("forwards canonical phase fields so the public projection cannot stick or regress", async () => {
+    const executionId = `exec-public-phase-order-${Date.now()}`;
+    createTurnExecution({
+      id: executionId,
+      userId: USER_ID,
+      chatId: AGENTIC_CHAT_ID,
+      generationId: executionId,
+      target: { kind: "normal" },
+      mode: "agentic",
+      runtimeEpoch: 1,
+      deadlineAt: Date.now() + 60_000,
+      workspaceId: `workspace:${executionId}`,
+      rootLedger: {},
+      frameCapabilities: {},
+    });
+    const publishPhase = __testing.buildDependencies().publishPhase;
+    if (!publishPhase) throw new Error("phase publication authority is unavailable");
+
+    const observed: Array<{ phase: string; status: string; outcome: string | null }> = [];
+    for (const event of [
+      { phase: "WORK", workPhase: "WORK", workStatus: "running" },
+      { phase: "COMPLETE", workPhase: "PREPARE_COMMIT", workStatus: "waiting" },
+      { phase: "RENDER", workPhase: "RENDER", workStatus: "running" },
+      { phase: "PREPARE_COMMIT", workPhase: "COMMIT", workStatus: "waiting" },
+      { phase: "COMMITTING", workPhase: "COMMIT", workStatus: "running" },
+    ] as const) {
+      await publishPhase({
+        executionId,
+        userId: USER_ID,
+        chatId: AGENTIC_CHAT_ID,
+        ...event,
+        workOutcome: null,
+        reason: null,
+        target: { generationType: "normal" },
+      });
+      const projection = getAgentRun(USER_ID, executionId);
+      if (!projection) throw new Error("phase projection was not persisted");
+      observed.push({
+        phase: projection.workPhase,
+        status: projection.workStatus,
+        outcome: projection.workOutcome,
+      });
+    }
+
+    expect(observed).toEqual([
+      { phase: "WORK", status: "running", outcome: null },
+      { phase: "PREPARE_COMMIT", status: "waiting", outcome: null },
+      { phase: "RENDER", status: "running", outcome: null },
+      { phase: "COMMIT", status: "waiting", outcome: null },
+      { phase: "COMMIT", status: "running", outcome: null },
+    ]);
+  });
+
   test("records every child provider stream outcome exactly once without leaking secrets", async () => {
     const capabilities = new InspectionLifecycleProvider().capabilities;
     const connection = {
@@ -2298,7 +2352,7 @@ describe("production agentic coordinator installation", () => {
     const liveChronology = workspaceInspection?.transcript ?? [];
     const livePrepareMilestone = liveChronology.find(({ id }) => id === prepareMilestoneId);
     const liveCommitMilestones = liveChronology.filter(({ id }) => id === commitMilestoneId);
-    expect(livePrepareMilestone?.correlation.phase).toBe("PREPARE_COMMIT");
+    expect(livePrepareMilestone?.correlation.phase).toBe("COMMIT");
     expect(liveCommitMilestones).toHaveLength(1);
     expect(liveCommitMilestones[0]?.correlation.phase).toBe("COMMIT");
     expect(liveCommitMilestones[0]!.correlation.hostSequence).toBeGreaterThan(

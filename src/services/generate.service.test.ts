@@ -68,6 +68,7 @@ import type {
   FrozenConcreteConnectionV1,
   InputRevisionSetV1,
 } from "../types/agent-runtime-decision";
+import type { CreateMessageInput, Message } from "../types/message";
 const TEST_CONNECTION: ResolvedConcreteConnectionV1 = {
   logicalId: "child-connection",
   concreteId: "child-connection",
@@ -115,6 +116,50 @@ function makeContextClipStats(
     tokenizerUsed: "approximate",
     ...overrides,
   };
+}
+
+const TEST_OWNER_ID = "root-usage-owner";
+
+// These fixtures replace the process-global in-memory database between cases.
+// Insert synchronously so createMessage cannot leave detached chunk work behind.
+function insertFixtureMessage(
+  userId: string,
+  chatId: string,
+  input: Pick<CreateMessageInput, "is_user" | "name" | "content">,
+): Message {
+  const db = getDb();
+  const id = crypto.randomUUID();
+  const now = Math.floor(Date.now() / 1_000);
+  const maxIndex = db.query(
+    "SELECT COALESCE(MAX(index_in_chat), -1) AS max_idx FROM messages WHERE chat_id = ?",
+  ).get(chatId) as { max_idx: number };
+
+  db.transaction(() => {
+    db.query(
+      "INSERT INTO messages " +
+        "(id, chat_id, index_in_chat, is_user, name, content, send_date, " +
+        "swipe_id, swipes, swipe_dates, extra, parent_message_id, branch_id, created_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, '{}', NULL, NULL, ?)",
+    ).run(
+      id,
+      chatId,
+      maxIndex.max_idx + 1,
+      input.is_user ? 1 : 0,
+      input.name,
+      input.content,
+      now,
+      JSON.stringify([input.content]),
+      JSON.stringify([now]),
+      now,
+    );
+    db.query(
+      "UPDATE chats SET updated_at = ?, generation_revision = generation_revision + 1 WHERE id = ? AND user_id = ?",
+    ).run(now, chatId, userId);
+  })();
+
+  const message = chatsSvc.getMessage(userId, id);
+  if (!message) throw new Error("Expected fixture message to be inserted");
+  return message;
 }
 
 // Provider-specific caching behavior lives in src/services/caching/ — see the
@@ -1308,7 +1353,10 @@ describe.serial("root generation usage accounting", () => {
         observe(EventType.GENERATION_STOPPED),
       ),
     );
-    return promise;
+    return promise.then(async observation => {
+      await chatsSvc.waitForChatChunkMaintenance(observation.payload.chatId);
+      return observation;
+    });
   }
 
   function waitForGenerationEvent(
@@ -1327,6 +1375,7 @@ describe.serial("root generation usage accounting", () => {
 
   async function createFixture(scenario: UsageScenario) {
     process.env.LUMIVERSE_PROMPT_ASSEMBLY_WORKER = "false";
+    await chatsSvc.waitForChatChunkMaintenance();
     pool.clearAllPoolEntries();
     closeDatabase();
     initDatabase(":memory:");
@@ -1334,8 +1383,8 @@ describe.serial("root generation usage accounting", () => {
 
     // The owner lookup is process-cached while this fixture replaces the in-memory DB.
     // Re-seed the same owner identity after every reset so inherited settings retain
-    // a valid foreign-key principal across all scenarios in this serial suite.
-    const userId = "root-usage-owner";
+    // a valid foreign-key principal across all reset fixtures in this file.
+    const userId = TEST_OWNER_ID;
     const hasResponseWorkPolicy =
       scenario === "response_loom" || scenario === "response_mentions";
     const hasResponsePhasePolicy =
@@ -1554,38 +1603,26 @@ describe.serial("root generation usage accounting", () => {
       });
     }
     if (hasResponseWorkPolicy) {
-      chatsSvc.createMessage(
-        chat.id,
-        {
-          is_user: true,
-          name: "User",
-          content: "Prior public request.",
-        },
-        userId,
-      );
-      chatsSvc.createMessage(
-        chat.id,
-        {
-          is_user: false,
-          name: "Assistant",
-          content: "Prior public reply.",
-        },
-        userId,
-      );
-    }
-    chatsSvc.createMessage(
-      chat.id,
-      {
+      insertFixtureMessage(userId, chat.id, {
         is_user: true,
         name: "User",
-        content: scenario === "response_mentions"
-          ? "RESPONSE-MENTION-SOURCE: use #global-response-source and #cross-reference-chat-source."
-          : hasResponseWorkPolicy
-            ? "RESPONSE-SOURCE-ROW: answer this exact request."
-            : "Delegate this.",
-      },
-      userId,
-    );
+        content: "Prior public request.",
+      });
+      insertFixtureMessage(userId, chat.id, {
+        is_user: false,
+        name: "Assistant",
+        content: "Prior public reply.",
+      });
+    }
+    insertFixtureMessage(userId, chat.id, {
+      is_user: true,
+      name: "User",
+      content: scenario === "response_mentions"
+        ? "RESPONSE-MENTION-SOURCE: use #global-response-source and #cross-reference-chat-source."
+        : hasResponseWorkPolicy
+          ? "RESPONSE-SOURCE-ROW: answer this exact request."
+          : "Delegate this.",
+    });
     return { userId, userName: "Usage Owner", provider, preset, connection, chat };
   }
   test("uses one combined native authority for sealed structural and intercepted WI provider context", async () => {
@@ -1766,6 +1803,7 @@ describe.serial("root generation usage accounting", () => {
       expect(terminalPayload.generationId).toBe(response.generationId);
     } finally {
       for (const unsubscribe of unsubscribers) unsubscribe();
+      await cleanupFixture(fixture.chat.id);
     }
   });
 
@@ -1814,15 +1852,11 @@ describe.serial("root generation usage accounting", () => {
   test("emits the exact transformed continued swipe including its durable prefix", async () => {
     const fixture = await createFixture("inactive_success");
     installResponseSettlementScript(fixture.userId);
-    const original = chatsSvc.createMessage(
-      fixture.chat.id,
-      {
-        is_user: false,
-        name: "Assistant",
-        content: "Settled prefix",
-      },
-      fixture.userId,
-    );
+    const original = insertFixtureMessage(fixture.userId, fixture.chat.id, {
+      is_user: false,
+      name: "Assistant",
+      content: "Settled prefix",
+    });
     const continuePostfix = "\n--continue--\n";
     const preset = presetsSvc.updatePreset(fixture.userId, fixture.preset.id, {
       prompts: {
@@ -2329,6 +2363,7 @@ describe.serial("root generation usage accounting", () => {
     ) {
       await Bun.sleep(1);
     }
+    await chatsSvc.waitForChatChunkMaintenance(chatId);
     for (
       let attempt = 0;
       attempt < 1_000 && getChatPipelineStatus(chatId)?.running;
@@ -2336,6 +2371,7 @@ describe.serial("root generation usage accounting", () => {
     ) {
       await Bun.sleep(1);
     }
+    await chatsSvc.waitForChatChunkMaintenance(chatId);
     if (previousPromptAssemblyWorker === undefined) {
       delete process.env.LUMIVERSE_PROMPT_ASSEMBLY_WORKER;
     } else {
@@ -2868,7 +2904,7 @@ describe.serial("root generation usage accounting", () => {
   }, 15_000);
 });
 
-const ADMISSION_USER_ID = "runtime-token-owner";
+const ADMISSION_USER_ID = TEST_OWNER_ID;
 const ADMISSION_PRESET_ID = "runtime-token-preset";
 
 class RuntimeAdmissionProvider implements LlmProvider {
@@ -2959,6 +2995,7 @@ function mapAdmissionDecision(decision: EffectiveRuntimeDecisionV1): AgenticRunt
 }
 
 async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
+  await chatsSvc.waitForChatChunkMaintenance();
   pool.clearAllPoolEntries();
   closeDatabase();
   initDatabase(":memory:");
@@ -2978,9 +3015,9 @@ async function createRuntimeAdmissionHarness(ttlMs = 60_000) {
     name: "Runtime token admission",
     metadata: { temporary: true, no_preset: true },
   });
-  chatsSvc.createMessage(chat.id, {
+  insertFixtureMessage(ADMISSION_USER_ID, chat.id, {
     is_user: true, name: "User", content: "Use the reviewed runtime.",
-  }, ADMISSION_USER_ID);
+  });
 
   let now = 1_000;
   let configRevision = 1;
@@ -3108,7 +3145,8 @@ function forbidReplacementResolution() {
 }
 
 describe.serial("startGeneration caller runtime decision authority", () => {
-  afterAll(() => {
+  afterAll(async () => {
+    await chatsSvc.waitForChatChunkMaintenance();
     pool.clearAllPoolEntries();
     closeDatabase();
   });

@@ -3541,10 +3541,14 @@ async function enterCognitionPhase(
 }
 
 function inspectionLifecycleForPhase(phase: AgenticPhase): AgentInspectionLifecycleV1 {
+  if (phase === "ASSEMBLE") return "ASSEMBLE";
+  if (phase === "WORK") return "WORK";
   if (phase === "COMPLETE") return "PREPARE_COMMIT";
-  if (phase === "COMMITTING" || phase === "COMMITTED" || phase === "COMMIT_FAILED") return "COMMIT";
-  if (phase === "CANCELLED" || phase === "TIMED_OUT" || phase === "EXHAUSTED" || phase === "FAILED") return "TERMINAL";
-  return phase as AgentInspectionLifecycleV1;
+  if (phase === "RENDER") return "RENDER";
+  if (phase === "PREPARE_COMMIT" || phase === "COMMITTING" || phase === "COMMITTED" || phase === "COMMIT_FAILED") {
+    return "COMMIT";
+  }
+  return "TERMINAL";
 }
 
 function inspectionStatusForPhase(
@@ -6235,6 +6239,10 @@ function buildDependencies(): AgenticGenerationDependencies {
         targetSwipeId,
         ...(event.attemptLineage ? { attemptLineage: event.attemptLineage } : {}),
         status: event.phase,
+        workPhase: event.workPhase,
+        workStatus: event.workStatus,
+        workOutcome: event.workOutcome,
+        reason: event.reason,
         ...(activitySnapshot
           ? {
               activity: activitySnapshot.nodes,

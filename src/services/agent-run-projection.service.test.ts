@@ -144,6 +144,38 @@ describe("AgentRunPublicV2 projection and cursor", () => {
     const delta = getAgentRunChanges(OWNER, "chat-sequence", __test__mintChatRunCursor(OWNER, "chat-sequence", 0).token);
     expect(delta?.events.map((event) => event.sequence)).toEqual([1, 2]);
   });
+  test("maps internal completion chronology to the monotonic public lifecycle", () => {
+    const chatId = "chat-public-phase-order";
+    const turnId = "turn-public-phase-order";
+    seedChat(OWNER, chatId);
+    seedRun(OWNER, chatId, turnId);
+
+    const workPhases = (["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT"] as const).map((status) => (
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        ...baseInput(OWNER, chatId, turnId),
+        status,
+      })).run.workPhase
+    ));
+    expect(workPhases).toEqual(["WORK", "PREPARE_COMMIT", "RENDER", "COMMIT"]);
+
+    const committing = withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      ...baseInput(OWNER, chatId, turnId),
+      status: "COMMITTING",
+    }));
+    expect({
+      workPhase: committing.run.workPhase,
+      workStatus: committing.run.workStatus,
+      workOutcome: committing.run.workOutcome,
+    }).toEqual({ workPhase: "COMMIT", workStatus: "running", workOutcome: null });
+    const stored = getAgentRun(OWNER, turnId);
+    if (!stored) throw new Error("public phase projection was not persisted");
+    expect({
+      workPhase: stored.workPhase,
+      workStatus: stored.workStatus,
+      workOutcome: stored.workOutcome,
+    }).toEqual({ workPhase: "COMMIT", workStatus: "running", workOutcome: null });
+  });
+
   test("returns the processed page watermark and resumes after more than 128 events", () => {
     seedChat(OWNER, "chat-paged-delta");
     seedRun(OWNER, "chat-paged-delta", "turn-paged-delta");

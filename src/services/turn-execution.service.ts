@@ -887,49 +887,58 @@ function workPhaseForExecution(phase: TurnExecutionPhase): AgentWorkPhase {
   if (phase === "WORK") return "WORK";
   if (phase === "COMPLETE") return "PREPARE_COMMIT";
   if (phase === "RENDER") return "RENDER";
-  if (phase === "PREPARE_COMMIT") return "PREPARE_COMMIT";
+  if (phase === "PREPARE_COMMIT") return "COMMIT";
   if (phase === "COMMITTING") return "COMMIT";
   return "TERMINAL";
 }
 
 type CanonicalTerminalCause = "stopped" | "exhausted" | "failed" | "rejected";
 
+const STOPPED_TERMINAL_CODES: ReadonlySet<string> = new Set([
+  "cancelled",
+  "canceled",
+  "stopped",
+  "user_stop",
+  "accepted_cancellation",
+  "agentic_cancelled",
+]);
+const FAILED_TERMINAL_CODES: ReadonlySet<string> = new Set([
+  "timed_out",
+  "timeout",
+  "deadline_exceeded",
+  "agentic_timed_out",
+  "root_wall_clock_limit_exceeded",
+]);
+const EXHAUSTED_TERMINAL_CODES: ReadonlySet<string> = new Set([
+  "exhausted",
+  "budget_exhausted",
+  "budget_exceeded",
+  "limit_exceeded",
+  "agentic_work_exhausted",
+]);
+const REJECTED_TERMINAL_CODES: ReadonlySet<string> = new Set([
+  "rejected",
+  "invalid_input",
+  "decision_refresh_required",
+  "agentic_runtime_unavailable",
+]);
+// SQLite's one-argument trim removes only U+0020. This set mirrors
+// ECMAScript String.prototype.trim WhiteSpace and LineTerminator code points.
+const SQL_ECMASCRIPT_TRIM_CHARACTERS = "char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279)";
+
 function terminalCauseForExecutionCode(value: string | null): CanonicalTerminalCause | null {
   if (!value) return null;
   const code = value.trim().toLowerCase();
   if (!code) return null;
-  if (["cancelled", "canceled", "stopped", "user_stop", "accepted_cancellation", "agentic_cancelled"].includes(code)) {
-    return "stopped";
-  }
-  if ([
-    "timed_out",
-    "timeout",
-    "deadline_exceeded",
-    "agentic_timed_out",
-    "root_wall_clock_limit_exceeded",
-  ].includes(code)) {
-    return "failed";
-  }
+  if (STOPPED_TERMINAL_CODES.has(code)) return "stopped";
+  if (FAILED_TERMINAL_CODES.has(code)) return "failed";
   if (
-    code === "exhausted"
-    || code === "budget_exhausted"
-    || code === "budget_exceeded"
-    || code === "limit_exceeded"
-    || code === "agentic_work_exhausted"
+    EXHAUSTED_TERMINAL_CODES.has(code)
     || code.endsWith("_limit_exceeded")
     || code.endsWith("_budget_exhausted")
     || code.endsWith("_budget_exceeded")
-  ) {
-    return "exhausted";
-  }
-  if ([
-    "rejected",
-    "invalid_input",
-    "decision_refresh_required",
-    "agentic_runtime_unavailable",
-  ].includes(code)) {
-    return "rejected";
-  }
+  ) return "exhausted";
+  if (REJECTED_TERMINAL_CODES.has(code)) return "rejected";
   return "failed";
 }
 
@@ -3019,9 +3028,20 @@ function terminalProjectionMatches(
   errorCode: string | null,
   target: TerminalRecoveryTarget,
 ): boolean {
+  const projectionColumns = tableColumns(db, "agent_run_projections");
+  const projectionStatusColumns = ["status", "phase"]
+    .filter((column) => projectionColumns.has(column))
+    .map(quoteColumn)
+    .join(", ");
+  if (!projectionStatusColumns) {
+    throw new TurnExecutionError("execution_schema_unavailable", "terminal projection status is unavailable", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
   const row = db.query(
     `SELECT user_id, chat_id, turn_id, generation_id, generation_type,
-            target_message_id, target_swipe_id, status, phase, snapshot_json
+            target_message_id, target_swipe_id, ${projectionStatusColumns}, snapshot_json
        FROM agent_run_projections
       WHERE user_id = ? AND turn_id = ?
       LIMIT 1`,
@@ -3299,35 +3319,315 @@ function invokeReceiptRepair(
   if (pending) void pending.catch(() => {});
 }
 
+function orderedTypedColumnSql(
+  tableAlias: string,
+  columns: ReadonlySet<string>,
+  sqliteTypes: readonly string[],
+  names: readonly string[],
+): string | null {
+  const candidates = names.filter((name) => columns.has(name));
+  if (candidates.length === 0) return null;
+  const typeList = sqliteTypes.map((type) => `'${type}'`).join(", ");
+  const branches = candidates.map((name) => {
+    const column = `${tableAlias}.${quoteColumn(name)}`;
+    return `WHEN typeof(${column}) IN (${typeList}) THEN ${column}`;
+  });
+  return `(CASE ${branches.join(" ")} ELSE NULL END)`;
+}
+
+function orderedTextColumnSql(
+  tableAlias: string,
+  columns: ReadonlySet<string>,
+  ...names: string[]
+): string | null {
+  return orderedTypedColumnSql(tableAlias, columns, ["text"], names);
+}
+
+function orderedNumberColumnSql(
+  tableAlias: string,
+  columns: ReadonlySet<string>,
+  ...names: string[]
+): string | null {
+  return orderedTypedColumnSql(tableAlias, columns, ["integer", "real"], names);
+}
+function exactTerminalReconciliationPredicate(
+  db: Database,
+  executionColumns: ReadonlySet<string>,
+  phase: string,
+  executionId: string,
+): string | null {
+  const attemptColumns = tableColumns(db, "agent_run_attempts");
+  const projectionColumns = tableColumns(db, "agent_run_projections");
+  const requiredAttemptColumns = [
+    "user_id", "chat_id", "attempt_id", "run_id", "turn_id", "generation_id", "generation_type",
+    "target_message_id", "target_swipe_id", "status", "outcome", "reason", "terminal",
+    "reconciliation_state",
+  ] as const;
+  const requiredProjectionColumns = [
+    "user_id", "chat_id", "turn_id", "generation_id", "generation_type", "target_message_id",
+    "target_swipe_id", "status", "snapshot_json",
+  ] as const;
+  if (
+    !requiredAttemptColumns.every((column) => attemptColumns.has(column))
+    || !requiredProjectionColumns.every((column) => projectionColumns.has(column))
+  ) return null;
+
+  const executionUserId = orderedTextColumnSql("e", executionColumns, "user_id");
+  const executionChatId = orderedTextColumnSql("e", executionColumns, "chat_id");
+  const executionCommitKey = orderedTextColumnSql("e", executionColumns, "commit_key");
+  const executionTargetKind = orderedTextColumnSql("e", executionColumns, "target_kind", "target");
+  if (!executionUserId || !executionChatId || !executionCommitKey || !executionTargetKind) return null;
+  const storedGenerationId = orderedTextColumnSql("e", executionColumns, "generation_id");
+  const executionGenerationId = storedGenerationId
+    ? `COALESCE(${storedGenerationId}, ${executionId})`
+    : executionId;
+  const executionTargetMessageId = orderedTextColumnSql(
+    "e",
+    executionColumns,
+    "target_message_id",
+    "message_id",
+  ) ?? "NULL";
+  const executionTargetSwipeId = orderedNumberColumnSql(
+    "e",
+    executionColumns,
+    "target_swipe_id",
+    "swipe_id",
+  ) ?? "NULL";
+
+  const targetSnapshot = orderedTextColumnSql(
+    "e",
+    executionColumns,
+    "target_snapshot_json",
+    "target_snapshot",
+  );
+  const attemptId = targetSnapshot
+    ? (() => {
+        const validSnapshot = `(CASE WHEN json_valid(${targetSnapshot}) THEN ${targetSnapshot} ELSE '{}' END)`;
+        const lineageType = `json_type(${validSnapshot}, '$.attemptLineage')`;
+        const storedAttemptId = `json_extract(${validSnapshot}, '$.attemptLineage.attemptId')`;
+        const storedAttemptIdType = `json_type(${validSnapshot}, '$.attemptLineage.attemptId')`;
+        const previousAttemptId = `json_extract(${validSnapshot}, '$.attemptLineage.previousAttemptId')`;
+        const previousAttemptIdType = `json_type(${validSnapshot}, '$.attemptLineage.previousAttemptId')`;
+        const lineageCreatedAt = `json_extract(${validSnapshot}, '$.attemptLineage.createdAt')`;
+        const lineageCreatedAtType = `json_type(${validSnapshot}, '$.attemptLineage.createdAt')`;
+        const validAttemptId = `(
+          ${lineageType} IS NOT 'object'
+          OR ${storedAttemptIdType} IS NULL
+          OR ${storedAttemptIdType} = 'null'
+          OR (
+            ${storedAttemptIdType} = 'text'
+            AND (${storedAttemptId} = '' OR length(CAST(${storedAttemptId} AS BLOB)) <= ${MAX_ID_BYTES})
+          )
+        )`;
+        const validPreviousAttemptId = `(
+          ${lineageType} IS NOT 'object'
+          OR ${previousAttemptIdType} IS NULL
+          OR ${previousAttemptIdType} = 'null'
+          OR (
+            ${previousAttemptIdType} = 'text'
+            AND (${previousAttemptId} = '' OR length(CAST(${previousAttemptId} AS BLOB)) <= ${MAX_ID_BYTES})
+          )
+        )`;
+        const validCreatedAt = `(
+          ${lineageType} IS NOT 'object'
+          OR ${lineageCreatedAtType} IS NULL
+          OR ${lineageCreatedAtType} = 'null'
+          OR (
+            ${lineageCreatedAtType} IN ('integer', 'real')
+            AND ${lineageCreatedAt} BETWEEN -${Number.MAX_SAFE_INTEGER} AND ${Number.MAX_SAFE_INTEGER}
+            AND CAST(${lineageCreatedAt} AS INTEGER) = ${lineageCreatedAt}
+          )
+        )`;
+        return {
+          value: `(CASE
+            WHEN ${lineageType} = 'object'
+             AND ${storedAttemptIdType} = 'text'
+             AND ${storedAttemptId} <> ''
+             AND length(CAST(${storedAttemptId} AS BLOB)) <= ${MAX_ID_BYTES}
+            THEN ${storedAttemptId}
+            ELSE ${executionId}
+          END)`,
+          valid: `(${validAttemptId} AND ${validPreviousAttemptId} AND ${validCreatedAt})`,
+        };
+      })()
+    : { value: executionId, valid: "1 = 1" };
+
+  const storedTerminalCode = orderedTextColumnSql(
+    "e",
+    executionColumns,
+    "terminal_code",
+    "error_code",
+  );
+  const terminalCode = `lower(trim(COALESCE(${storedTerminalCode ?? "NULL"}, ''), ${SQL_ECMASCRIPT_TRIM_CHARACTERS}))`;
+  const sqlCodeList = (values: ReadonlySet<string>): string => [...values]
+    .map((value) => `'${value}'`)
+    .join(", ");
+  const exhaustedCode = `(
+    ${terminalCode} IN (${sqlCodeList(EXHAUSTED_TERMINAL_CODES)})
+    OR ${terminalCode} GLOB '*_limit_exceeded'
+    OR ${terminalCode} GLOB '*_budget_exhausted'
+    OR ${terminalCode} GLOB '*_budget_exceeded'
+  )`;
+  const expectedOutcome = `(CASE
+    WHEN ${phase} = 'CANCELLED' THEN 'stopped'
+    WHEN ${phase} = 'TIMED_OUT' THEN 'failed'
+    WHEN ${phase} = 'EXHAUSTED' THEN 'exhausted'
+    WHEN ${terminalCode} IN (${sqlCodeList(STOPPED_TERMINAL_CODES)}) THEN 'stopped'
+    WHEN ${exhaustedCode} THEN 'exhausted'
+    WHEN ${terminalCode} IN (${sqlCodeList(REJECTED_TERMINAL_CODES)}) THEN 'rejected'
+    ELSE 'failed'
+  END)`;
+
+  const canonicalReasons = [...INSPECTION_RECOVERY_REASONS]
+    .map((reason) => `'${reason}'`)
+    .join(", ");
+  const exactReason = `(
+    a.reason IN (${canonicalReasons})
+    OR a.reason IN ('failed', 'process_interrupted')
+    OR (${phase} = 'CANCELLED' AND a.reason IN ('stopped', 'cancelled'))
+    OR (${phase} = 'EXHAUSTED' AND a.reason = 'exhausted')
+    OR (${phase} = 'COMMIT_FAILED' AND a.reason = 'stale_input_revision')
+  )`;
+
+  const messageColumns = tableColumns(db, "messages");
+  const messageTargetValid = messageColumns.has("id")
+    && messageColumns.has("chat_id")
+    && messageColumns.has("swipes")
+    ? `OR (
+        ${executionTargetMessageId} IS NOT NULL
+        AND ${executionTargetMessageId} <> ''
+        AND EXISTS (
+          SELECT 1
+            FROM messages AS m
+           WHERE m.id = ${executionTargetMessageId}
+             AND m.chat_id = ${executionChatId}
+             AND (
+               ${executionTargetSwipeId} IS NULL
+               OR (
+                 ${executionTargetSwipeId} BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                 AND CAST(${executionTargetSwipeId} AS INTEGER) = ${executionTargetSwipeId}
+                 AND typeof(m.swipes) = 'text'
+                 AND json_valid(m.swipes)
+                 AND json_type(CASE WHEN typeof(m.swipes) = 'text' AND json_valid(m.swipes) THEN m.swipes ELSE '[]' END) = 'array'
+                 AND ${executionTargetSwipeId} < json_array_length(CASE WHEN typeof(m.swipes) = 'text' AND json_valid(m.swipes) THEN m.swipes ELSE '[]' END)
+               )
+             )
+        )
+      )`
+    : "";
+  const targetValid = `(
+    (${executionTargetMessageId} IS NULL AND ${executionTargetSwipeId} IS NULL)
+    ${messageTargetValid}
+  )`;
+  const projectionSnapshot = `(CASE
+    WHEN typeof(p.snapshot_json) = 'text' AND json_valid(p.snapshot_json)
+    THEN p.snapshot_json
+    ELSE '{}'
+  END)`;
+
+  return `(
+    ${executionId} <> ''
+    AND ${executionUserId} <> ''
+    AND ${executionChatId} <> ''
+    AND ${executionCommitKey} <> ''
+    AND ${executionTargetKind} IN ('normal', 'continue', 'regenerate', 'swipe')
+    AND ${attemptId.valid}
+    AND ${targetValid}
+    AND EXISTS (
+      SELECT 1
+        FROM agent_run_attempts AS a
+        JOIN agent_run_projections AS p
+          ON p.user_id = a.user_id
+         AND p.turn_id = ${executionId}
+       WHERE typeof(a.user_id) = 'text'
+         AND a.user_id = ${executionUserId}
+         AND typeof(a.attempt_id) = 'text'
+         AND a.attempt_id = ${attemptId.value}
+         AND typeof(a.chat_id) = 'text'
+         AND a.chat_id = ${executionChatId}
+         AND typeof(a.run_id) = 'text'
+         AND a.run_id = ${executionGenerationId}
+         AND typeof(a.turn_id) = 'text'
+         AND a.turn_id = ${executionId}
+         AND typeof(a.generation_id) = 'text'
+         AND a.generation_id = ${executionGenerationId}
+         AND typeof(a.generation_type) = 'text'
+         AND a.generation_type = ${executionTargetKind}
+         AND (
+           (a.target_message_id IS NULL AND ${executionTargetMessageId} IS NULL)
+           OR (typeof(a.target_message_id) = 'text' AND a.target_message_id IS ${executionTargetMessageId})
+         )
+         AND (
+           (a.target_swipe_id IS NULL AND ${executionTargetSwipeId} IS NULL)
+           OR (typeof(a.target_swipe_id) IN ('integer', 'real') AND a.target_swipe_id IS ${executionTargetSwipeId})
+         )
+         AND typeof(a.status) = 'text'
+         AND a.status = 'terminal'
+         AND typeof(a.terminal) IN ('integer', 'real')
+         AND a.terminal = 1
+         AND typeof(a.reconciliation_state) = 'text'
+         AND a.reconciliation_state IN ('authoritative', 'recovered')
+         AND typeof(a.outcome) = 'text'
+         AND lower(trim(a.outcome)) = ${expectedOutcome}
+         AND typeof(a.reason) = 'text'
+         AND ${exactReason}
+         AND typeof(p.user_id) = 'text'
+         AND typeof(p.chat_id) = 'text'
+         AND p.chat_id = ${executionChatId}
+         AND typeof(p.turn_id) = 'text'
+         AND typeof(p.generation_id) = 'text'
+         AND p.generation_id = ${executionGenerationId}
+         AND typeof(p.generation_type) = 'text'
+         AND p.generation_type = ${executionTargetKind}
+         AND (
+           (p.target_message_id IS NULL AND ${executionTargetMessageId} IS NULL)
+           OR (typeof(p.target_message_id) = 'text' AND p.target_message_id IS ${executionTargetMessageId})
+         )
+         AND (
+           (p.target_swipe_id IS NULL AND ${executionTargetSwipeId} IS NULL)
+           OR (typeof(p.target_swipe_id) IN ('integer', 'real') AND p.target_swipe_id IS ${executionTargetSwipeId})
+         )
+         AND typeof(p.status) = 'text'
+         AND p.status = ${phase}
+         AND typeof(p.snapshot_json) = 'text'
+         AND json_valid(p.snapshot_json)
+         AND json_type(${projectionSnapshot}) = 'object'
+         AND json_extract(${projectionSnapshot}, '$.workOutcome') = ${expectedOutcome}
+    )
+  )`;
+}
 /**
- * Build a keyset-paginated candidate scan. Every noncommitted terminal row is
- * a durable recovery authority until its private inspection and public
- * projection are both present; COMMITTED rows remain receipt-repaired only.
+ * Build a keyset-paginated candidate scan. Reversible and COMMITTING rows are
+ * always candidates. Noncommitted terminal history enters the bounded budget
+ * only while its private inspection or public projection still needs repair;
+ * COMMITTED rows remain receipt-repaired only.
  */
 function reconciliationCandidateQuery(db: Database): {
   readonly sql: string;
   readonly phaseValues: readonly TurnExecutionPhase[];
-  readonly orderColumn: string;
-  readonly idColumn: string;
+  readonly orderedAtSql: string;
 } | null {
   const executionColumns = tableColumns(db, "agent_turn_executions");
-  const phaseColumn = firstColumn(executionColumns, "phase", "state");
-  const orderColumn = firstColumn(executionColumns, "created_at", "updated_at");
-  const idColumn = firstColumn(executionColumns, "id", "execution_id");
-  if (!phaseColumn || !orderColumn || !idColumn) return null;
+  const phase = orderedTextColumnSql("e", executionColumns, "phase", "state");
+  const orderedValue = orderedNumberColumnSql("e", executionColumns, "created_at", "updated_at");
+  const id = orderedTextColumnSql("e", executionColumns, "id", "execution_id");
+  if (!phase || !orderedValue || !id) return null;
 
-  const phase = `e.${quoteColumn(phaseColumn)}`;
-  const orderedAt = `COALESCE(e.${quoteColumn(orderColumn)}, 0)`;
-  const id = `e.${quoteColumn(idColumn)}`;
+  const orderedAt = `COALESCE(${orderedValue}, 0)`;
   const phaseValues = [...REVERSIBLE_TURN_PHASES, "COMMITTING"] as const;
   const terminalRecoveryAvailable = terminalRecoveryTablesAvailable(db);
   const terminalRepairPhases = terminalRecoveryAvailable
     ? NONCOMMITTED_TERMINAL_PHASES.map((value) => `'${value}'`).join(", ")
     : "";
+  const exactTerminal = terminalRecoveryAvailable
+    ? exactTerminalReconciliationPredicate(db, executionColumns, phase, id)
+    : null;
+  const terminalRepairPredicate = exactTerminal
+    ? `(${phase} IN (${terminalRepairPhases}) AND NOT ${exactTerminal})`
+    : `${phase} IN (${terminalRepairPhases})`;
   const candidatePredicates = [
-    terminalRecoveryAvailable
-      ? `(${phase} IN (${phaseValues.map(() => "?").join(", ")}) OR ${phase} IN (${terminalRepairPhases}))`
-      : `${phase} IN (${phaseValues.map(() => "?").join(", ")})`,
+    `${phase} IN (${phaseValues.map(() => "?").join(", ")})`,
+    ...(terminalRecoveryAvailable ? [terminalRepairPredicate] : []),
   ];
   const priorityPredicates: string[] = [];
 
@@ -3413,8 +3713,7 @@ function reconciliationCandidateQuery(db: Database): {
        LIMIT ?
     `,
     phaseValues,
-    orderColumn,
-    idColumn,
+    orderedAtSql: orderedAt,
   };
 }
 function reconciliationFailureCode(error: unknown): string {
@@ -3493,8 +3792,8 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
   const scanUpperBound = (() => {
     try {
       const row = db.query(
-        `SELECT MAX(COALESCE(${quoteColumn(scan.orderColumn)}, 0)) AS max_ordered_at
-           FROM ${quoteColumn("agent_turn_executions")}`,
+        `SELECT MAX(${scan.orderedAtSql}) AS max_ordered_at
+           FROM ${quoteColumn("agent_turn_executions")} AS e`,
       ).get() as Record<string, unknown> | null;
       return (row ? rowNumber(row, "max_ordered_at") : null) ?? scanStartedAt;
     } catch {
@@ -3720,8 +4019,8 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
     }
     const lastRow = rows[rows.length - 1]!;
     const nextPriority = rowNumber(lastRow, "__reconciliation_priority") ?? cursorPriority;
-    const nextUpdatedAt = rowNumber(lastRow, "__reconciliation_ordered_at", scan.orderColumn) ?? cursorUpdatedAt;
-    const nextId = rowString(lastRow, "__reconciliation_id", scan.idColumn)
+    const nextUpdatedAt = rowNumber(lastRow, "__reconciliation_ordered_at") ?? cursorUpdatedAt;
+    const nextId = rowString(lastRow, "__reconciliation_id")
       ?? rowString(lastRow, "id", "execution_id")
       ?? cursorId;
     if (nextPriority < cursorPriority

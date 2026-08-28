@@ -17,6 +17,7 @@ import {
   type NewTicket,
 } from "../services/user-data/secret-ticket.service";
 import { listSecretKeys, getSecret as readSecret } from "../services/secrets.service";
+import { migrateLegacyImageGenerationSecrets } from "../services/image-gen.service";
 import {
   persistUploadedArchive,
   startImport,
@@ -299,7 +300,14 @@ app.post("/export/prepare", async (c) => {
     // A ticket-bound export is all-or-nothing. Enumerating or reading even
     // one source secret failing must abort before a ticket is issued; binding
     // only the successful subset would create a misleading backup.
+    const migratedSecretKeys = await migrateLegacyImageGenerationSecrets(userId);
     const candidates = listSecretKeys(userId);
+    const candidateSet = new Set(candidates);
+    for (const key of migratedSecretKeys) {
+      if (!candidateSet.has(key)) {
+        throw new Error(`migrated image credential ${key} is missing from export enumeration`);
+      }
+    }
     for (const key of candidates) {
       if (c.req.raw.signal.aborted) {
         throw c.req.raw.signal.reason ?? new Error("export cancelled");

@@ -9,6 +9,10 @@ import * as gallerySvc from "./character-gallery.service";
 import * as secretsSvc from "./secrets.service";
 import * as imageGenConnSvc from "./image-gen-connections.service";
 import { imageGenConnectionSecretKey } from "./image-gen-connections.service";
+import {
+  inspectLegacyImageGenerationPrivateData,
+  type LegacyImageProvider,
+} from "./user-data/private-data";
 import * as connectionsSvc from "./connections.service";
 import { connectionSecretKey } from "./connections.service";
 import * as imageGenBindingsSvc from "./image-gen-preset-bindings.service";
@@ -1833,69 +1837,232 @@ export function getImageGenSettings(userId: string): ImageGenSettings {
 
 // --- Auto-Migration (Legacy Settings → Connection Profiles) ---
 
-async function maybeAutoMigrate(userId: string, settings: ImageGenSettings): Promise<void> {
-  // Skip if user already has connection profiles
-  const existing = imageGenConnSvc.listConnections(userId, { limit: 1, offset: 0 });
-  if (existing.total > 0) return;
+const LEGACY_IMAGE_CONNECTION_NAMES: Record<LegacyImageProvider, string> = {
+  nanogpt: "Nano-GPT (migrated)",
+  novelai: "NovelAI (migrated)",
+};
 
-  // Skip if no legacy provider-specific config exists
-  const hasLegacy =
-    settings.nanogpt?.apiKey || settings.novelai?.apiKey || settings.google?.connectionProfileId;
-  if (!hasLegacy) return;
+async function findLegacyImageConnection(
+  userId: string,
+  provider: LegacyImageProvider,
+  apiKey: string,
+): Promise<ImageGenConnectionProfile | null> {
+  const name = LEGACY_IMAGE_CONNECTION_NAMES[provider];
+  const pageSize = 200;
+  for (let offset = 0; ; offset += pageSize) {
+    const page = imageGenConnSvc.listConnections(userId, { limit: pageSize, offset });
+    for (const connection of page.data) {
+      if (
+        connection.provider !== provider
+        || connection.name !== name
+        || !connection.has_api_key
+      ) {
+        continue;
+      }
+      try {
+        const stored = await secretsSvc.getSecret(
+          userId,
+          imageGenConnectionSecretKey(connection.id),
+        );
+        if (stored === apiKey) return connection;
+      } catch {
+        // An unreadable old candidate cannot prove preservation. Leave it
+        // untouched and create a fresh, verifiable canonical connection.
+      }
+    }
+    if (offset + page.data.length >= page.total || page.data.length === 0) return null;
+  }
+}
+
+async function ensureLegacyImageConnection(
+  userId: string,
+  provider: LegacyImageProvider,
+  legacy: Record<string, any>,
+  apiKey: string,
+  isDefault: boolean,
+): Promise<ImageGenConnectionProfile> {
+  let connection = await findLegacyImageConnection(userId, provider, apiKey);
+  if (!connection) {
+    connection = provider === "nanogpt"
+      ? await imageGenConnSvc.createConnection(userId, {
+          name: LEGACY_IMAGE_CONNECTION_NAMES.nanogpt,
+          provider,
+          model: legacy.model || "hidream",
+          is_default: isDefault,
+          default_parameters: {
+            size: legacy.size || "1024x1024",
+            strength: legacy.strength ?? 0.8,
+            guidanceScale: legacy.guidanceScale ?? 7.5,
+            numInferenceSteps: legacy.numInferenceSteps ?? 30,
+            seed: legacy.seed ?? null,
+            referenceImages: legacy.referenceImages || [],
+          },
+          api_key: apiKey,
+        })
+      : await imageGenConnSvc.createConnection(userId, {
+          name: LEGACY_IMAGE_CONNECTION_NAMES.novelai,
+          provider,
+          model: legacy.model || "nai-diffusion-4-5-full",
+          is_default: isDefault,
+          default_parameters: {
+            sampler: legacy.sampler || "k_euler_ancestral",
+            resolution: legacy.resolution || "1216x832",
+            steps: legacy.steps ?? 28,
+            guidance: legacy.guidance ?? 5,
+            negativePrompt: legacy.negativePrompt || "",
+            smea: legacy.smea ?? false,
+            smeaDyn: legacy.smeaDyn ?? false,
+            seed: legacy.seed ?? null,
+            referenceImages: legacy.referenceImages || [],
+            includeCharacterAvatar: legacy.includeCharacterAvatar ?? false,
+            includePersonaAvatar: legacy.includePersonaAvatar ?? false,
+            referenceStrength: legacy.referenceStrength ?? 0.5,
+            referenceInfoExtracted: legacy.referenceInfoExtracted ?? 1,
+            referenceFidelity: legacy.referenceFidelity ?? 1,
+            referenceType: legacy.referenceType || "character&style",
+            avatarReferenceType: legacy.avatarReferenceType || "character",
+          },
+          api_key: apiKey,
+        });
+  } else if (isDefault && !connection.is_default) {
+    connection = await imageGenConnSvc.updateConnection(userId, connection.id, { is_default: true })
+      ?? connection;
+  }
+
+  const secretKey = imageGenConnectionSecretKey(connection.id);
+  const persistedConnection = imageGenConnSvc.getConnection(userId, connection.id);
+  const persistedSecret = await secretsSvc.getSecret(userId, secretKey);
+  if (!persistedConnection?.has_api_key || persistedSecret !== apiKey) {
+    throw new Error(`Legacy ${provider} image API key could not be preserved in canonical encrypted storage`);
+  }
+  return persistedConnection;
+}
+
+/**
+ * Move every recursively discovered credential for the two legacy image
+ * providers into the canonical encrypted connection store. Plaintext fields
+ * are removed only after every connection and secret read back successfully.
+ *
+ * The scan deliberately ignores unrelated image connections: an existing
+ * ComfyUI/OpenRouter/etc. profile must never strand these legacy credentials.
+ */
+export async function migrateLegacyImageGenerationSecrets(userId: string): Promise<string[]> {
+  const migratedSecretKeys = new Set<string>();
+
+  // Secret encryption yields to other work. Compare the complete source
+  // value before cleanup and retry rather than deleting any concurrent edit.
+  for (let pass = 0; pass < 8; pass += 1) {
+    const currentSetting = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY);
+    if (!currentSetting) return [...migratedSecretKeys].sort();
+    const currentValue = currentSetting.value;
+    if (!currentValue || typeof currentValue !== "object" || Array.isArray(currentValue)) {
+      throw new Error("Legacy image credentials cannot be mapped from a non-object setting");
+    }
+
+    const inspection = inspectLegacyImageGenerationPrivateData(currentValue);
+    if (inspection.credentials.length === 0) return [...migratedSecretKeys].sort();
+    if (
+      !inspection.changed
+      || !inspection.scrubbedValue
+      || typeof inspection.scrubbedValue !== "object"
+      || Array.isArray(inspection.scrubbedValue)
+    ) {
+      throw new Error("Legacy image credentials could not be mapped to a safe cleanup");
+    }
+
+    const credentials = new Map<
+      LegacyImageProvider,
+      { apiKey: string; providerSettings: Record<string, any> }
+    >();
+    for (const credential of inspection.credentials) {
+      if (credential.apiKey === null || credential.apiKey === undefined || credential.apiKey === "") {
+        continue;
+      }
+      if (typeof credential.apiKey !== "string") {
+        throw new Error("Legacy " + credential.provider + " image API key has an unsupported non-empty value");
+      }
+      const existing = credentials.get(credential.provider);
+      if (existing && existing.apiKey !== credential.apiKey) {
+        throw new Error("Legacy " + credential.provider + " image settings contain ambiguous API keys");
+      }
+      if (!existing) {
+        credentials.set(credential.provider, {
+          apiKey: credential.apiKey,
+          providerSettings: credential.providerSettings,
+        });
+      }
+    }
+
+    const currentSnapshot = JSON.stringify(currentValue);
+    const activeConnectionId = typeof currentValue.activeImageGenConnectionId === "string"
+      ? currentValue.activeImageGenConnectionId
+      : null;
+    const preserveCanonicalSelection = (
+      (activeConnectionId !== null && imageGenConnSvc.getConnection(userId, activeConnectionId) !== null)
+      || imageGenConnSvc.getDefaultConnection(userId) !== null
+    );
+    const selectedProvider: LegacyImageProvider | null = (
+      currentValue.provider === "nanogpt" || currentValue.provider === "novelai"
+    ) ? currentValue.provider : null;
+    const migratedConnections = new Map<LegacyImageProvider, ImageGenConnectionProfile>();
+
+    for (const [provider, credential] of credentials) {
+      const connection = await ensureLegacyImageConnection(
+        userId,
+        provider,
+        credential.providerSettings,
+        credential.apiKey,
+        !preserveCanonicalSelection && selectedProvider === provider,
+      );
+      migratedConnections.set(provider, connection);
+      migratedSecretKeys.add(imageGenConnectionSecretKey(connection.id));
+    }
+
+    const latestSetting = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY);
+    if (!latestSetting) {
+      throw new Error("Legacy image settings disappeared before migration cleanup");
+    }
+    if (JSON.stringify(latestSetting.value) !== currentSnapshot) continue;
+
+    const selectedConnection = selectedProvider === null
+      ? null
+      : migratedConnections.get(selectedProvider) ?? null;
+    if (!preserveCanonicalSelection && selectedConnection) {
+      Object.defineProperty(inspection.scrubbedValue, "activeImageGenConnectionId", {
+        configurable: true,
+        enumerable: true,
+        value: selectedConnection.id,
+        writable: true,
+      });
+    }
+    settingsSvc.putSetting(userId, IMAGE_SETTINGS_KEY, inspection.scrubbedValue);
+
+    const persistedValue = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY)?.value;
+    if (persistedValue === undefined) {
+      throw new Error("Legacy image settings disappeared after migration cleanup");
+    }
+    const residual = inspectLegacyImageGenerationPrivateData(persistedValue);
+    if (residual.credentials.length !== 0 || residual.changed) {
+      throw new Error("Legacy image API keys remain after durable migration cleanup");
+    }
+    return [...migratedSecretKeys].sort();
+  }
+
+  throw new Error("Legacy image settings changed repeatedly during migration");
+}
+
+async function maybeAutoMigrate(userId: string, _settings: ImageGenSettings): Promise<void> {
+  const hadConnections = imageGenConnSvc.listConnections(userId, { limit: 1, offset: 0 }).total > 0;
+  await migrateLegacyImageGenerationSecrets(userId);
+
+  // Keep the pre-existing Google borrowing migration's original boundary.
+  // NanoGPT/NovelAI above are different: plaintext credentials must migrate
+  // even when an unrelated image connection already exists.
+  if (hadConnections) return;
+  const settings = getImageGenSettings(userId);
+  if (!settings.google?.connectionProfileId) return;
 
   let defaultConnectionId: string | null = null;
-
-  // Migrate NanoGPT
-  if (settings.nanogpt?.apiKey) {
-    const nano = settings.nanogpt;
-    const conn = await imageGenConnSvc.createConnection(userId, {
-      name: "Nano-GPT (migrated)",
-      provider: "nanogpt",
-      model: nano.model || "hidream",
-      is_default: settings.provider === "nanogpt",
-      default_parameters: {
-        size: nano.size || "1024x1024",
-        strength: nano.strength ?? 0.8,
-        guidanceScale: nano.guidanceScale ?? 7.5,
-        numInferenceSteps: nano.numInferenceSteps ?? 30,
-        seed: nano.seed ?? null,
-        referenceImages: nano.referenceImages || [],
-      },
-      api_key: nano.apiKey,
-    });
-    if (settings.provider === "nanogpt") defaultConnectionId = conn.id;
-  }
-
-  // Migrate NovelAI
-  if (settings.novelai?.apiKey) {
-    const nai = settings.novelai;
-    const conn = await imageGenConnSvc.createConnection(userId, {
-      name: "NovelAI (migrated)",
-      provider: "novelai",
-      model: nai.model || "nai-diffusion-4-5-full",
-      is_default: settings.provider === "novelai",
-      default_parameters: {
-        sampler: nai.sampler || "k_euler_ancestral",
-        resolution: nai.resolution || "1216x832",
-        steps: nai.steps ?? 28,
-        guidance: nai.guidance ?? 5,
-        negativePrompt: nai.negativePrompt || "",
-        smea: nai.smea ?? false,
-        smeaDyn: nai.smeaDyn ?? false,
-        seed: nai.seed ?? null,
-        referenceImages: nai.referenceImages || [],
-        includeCharacterAvatar: nai.includeCharacterAvatar ?? false,
-        includePersonaAvatar: nai.includePersonaAvatar ?? false,
-        referenceStrength: nai.referenceStrength ?? 0.5,
-        referenceInfoExtracted: nai.referenceInfoExtracted ?? 1,
-        referenceFidelity: nai.referenceFidelity ?? 1,
-        referenceType: nai.referenceType || "character&style",
-        avatarReferenceType: nai.avatarReferenceType || "character",
-      },
-      api_key: nai.apiKey,
-    });
-    if (settings.provider === "novelai") defaultConnectionId = conn.id;
-  }
 
   // Migrate Google Gemini (borrow API key from LLM connection)
   if (settings.google?.connectionProfileId) {

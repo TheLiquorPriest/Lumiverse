@@ -4591,7 +4591,14 @@ function restoreSalienceForRebuiltChunk(chatId: string, chunk: ChatChunk, salien
   })();
 }
 
-async function updateChatChunks(userId: string, chatId: string, newMessage: Message): Promise<void> {
+function updateChatChunks(userId: string, chatId: string, newMessage: Message): Promise<void> {
+  return trackChatChunkMaintenance(
+    chatId,
+    updateChatChunksImpl(userId, chatId, newMessage),
+  );
+}
+
+async function updateChatChunksImpl(userId: string, chatId: string, newMessage: Message): Promise<void> {
   const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
   if (!cfg.enabled || !cfg.vectorize_chat_messages) return;
 
@@ -4875,6 +4882,45 @@ function snapshotSalienceForChunks(chatId: string, chunkIds: string[]): Map<stri
 }
 
 /**
+ * Tracks every launched chunk mutation until its complete async lifecycle has
+ * settled. Callers can use the barrier before replacing or closing the backing
+ * database, rather than racing fire-and-forget message maintenance.
+ */
+const _chatChunkMaintenanceInflight = new Map<string, Set<Promise<void>>>();
+
+function trackChatChunkMaintenance(chatId: string, task: Promise<void>): Promise<void> {
+  let tasks = _chatChunkMaintenanceInflight.get(chatId);
+  if (!tasks) {
+    tasks = new Set();
+    _chatChunkMaintenanceInflight.set(chatId, tasks);
+  }
+  tasks.add(task);
+
+  const removeTask = () => {
+    const current = _chatChunkMaintenanceInflight.get(chatId);
+    if (!current) return;
+    current.delete(task);
+    if (current.size === 0) _chatChunkMaintenanceInflight.delete(chatId);
+  };
+  void task.then(removeTask, removeTask);
+  return task;
+}
+
+/**
+ * Wait for launched chunk updates and rebuilds to quiesce. Omitting chatId
+ * drains all chats, which is required before replacing the process database.
+ */
+export async function waitForChatChunkMaintenance(chatId?: string): Promise<void> {
+  while (true) {
+    const tasks = chatId === undefined
+      ? [..._chatChunkMaintenanceInflight.values()].flatMap(current => [...current])
+      : [...(_chatChunkMaintenanceInflight.get(chatId) ?? [])];
+    if (tasks.length === 0) return;
+    await Promise.allSettled(tasks);
+  }
+}
+
+/**
  * In-flight rebuild tracking per chat — prevents concurrent rebuilds from
  * racing each other (each deleting the previous one's chunks). When a
  * rebuild is already running for a chatId, subsequent calls wait for it
@@ -4896,7 +4942,11 @@ export function isChatChunkRebuildInProgress(chatId: string): boolean {
  * immediately, subsequent callers wait for it and then a single follow-up
  * rebuild runs to capture any changes that landed during the first.
  */
-export async function rebuildChatChunks(userId: string, chatId: string): Promise<void> {
+export function rebuildChatChunks(userId: string, chatId: string): Promise<void> {
+  return trackChatChunkMaintenance(chatId, runChatChunkRebuild(userId, chatId));
+}
+
+async function runChatChunkRebuild(userId: string, chatId: string): Promise<void> {
   const inflight = _rebuildInflight.get(chatId);
   if (inflight) {
     // Another rebuild is already running — mark pending and wait for it
@@ -4932,7 +4982,18 @@ export async function rebuildChatChunks(userId: string, chatId: string): Promise
  *     because we can't know which scope covers the work that landed during
  *     the wait).
  */
-export async function rebuildChatChunksFromMessages(
+export function rebuildChatChunksFromMessages(
+  userId: string,
+  chatId: string,
+  affectedMessageIds: Iterable<string>,
+): Promise<void> {
+  return trackChatChunkMaintenance(
+    chatId,
+    runChatChunkRebuildFromMessages(userId, chatId, affectedMessageIds),
+  );
+}
+
+async function runChatChunkRebuildFromMessages(
   userId: string,
   chatId: string,
   affectedMessageIds: Iterable<string>,

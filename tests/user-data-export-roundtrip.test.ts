@@ -220,14 +220,31 @@ describe("user-data export ZIP64 round-trip", () => {
     const nanoSecret = "quick-export-nanogpt-secret";
     const novelSecret = "quick-export-novelai-secret";
     const nestedSecret = "quick-export-nested-secret";
+    const deepSecret = "quick-export-deep-secret";
+    const arraySecret = "quick-export-array-secret";
+    const encodedSecret = "quick-export-encoded-secret";
     const imageGeneration = {
       enabled: true,
-      nanogpt: { apiKey: nanoSecret, model: "hidream" },
+      unrelated: { apiKey: "retained-unrelated-api-key" },
+      nanogpt: {
+        apiKey: nanoSecret,
+        model: "hidream",
+        credentials: { apiKey: deepSecret, label: "primary" },
+        variants: [{ nested: { apiKey: arraySecret, steps: 20 } }],
+      },
       novelai: { apiKey: novelSecret, sampler: "k_euler" },
       compatibility: [
         { nanogpt: { apiKey: nestedSecret, model: "legacy-nested" } },
         { wrapper: { novelai: { apiKey: nestedSecret, steps: 28 } } },
       ],
+      encodedCompatibility: JSON.stringify({
+        wrapper: {
+          nanogpt: {
+            credentials: { apiKey: encodedSecret, label: "encoded" },
+            model: "encoded-nano",
+          },
+        },
+      }),
     };
     const insert = getDb().prepare(
       "INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)",
@@ -247,12 +264,25 @@ describe("user-data export ZIP64 round-trip", () => {
     expect(exported).toBeDefined();
     expect(JSON.parse(exported!.value)).toEqual({
       enabled: true,
-      nanogpt: { model: "hidream" },
+      unrelated: { apiKey: "retained-unrelated-api-key" },
+      nanogpt: {
+        model: "hidream",
+        credentials: { label: "primary" },
+        variants: [{ nested: { steps: 20 } }],
+      },
       novelai: { sampler: "k_euler" },
       compatibility: [
         { nanogpt: { model: "legacy-nested" } },
         { wrapper: { novelai: { steps: 28 } } },
       ],
+      encodedCompatibility: JSON.stringify({
+        wrapper: {
+          nanogpt: {
+            credentials: { label: "encoded" },
+            model: "encoded-nano",
+          },
+        },
+      }),
     });
     expect(rows.some((row) => row.key === "connection_legacy_api_key")).toBe(false);
     expect(Object.keys(archive).some((name) => name.startsWith("secrets/"))).toBe(false);
@@ -260,19 +290,49 @@ describe("user-data export ZIP64 round-trip", () => {
     expect(exportedManifest.hasEncryptedSecrets).toBe(false);
     expect(exportedManifest.secretsCount).toBe(0);
     const archiveText = Object.values(archive).map((entry) => strFromU8(entry)).join("\n");
-    expect(archiveText).not.toContain(nanoSecret);
-    expect(archiveText).not.toContain(novelSecret);
-    expect(archiveText).not.toContain(nestedSecret);
-    expect(archiveText).not.toContain("secret-setting-value");
+    for (const secret of [
+      nanoSecret,
+      novelSecret,
+      nestedSecret,
+      deepSecret,
+      arraySecret,
+      encodedSecret,
+      "secret-setting-value",
+    ]) {
+      expect(archiveText).not.toContain(secret);
+    }
+    expect(archiveText).toContain("retained-unrelated-api-key");
   });
 
-  test("Quick Export fails closed for a malformed legacy image-generation value", async () => {
-    const malformedSecret = "malformed-legacy-image-secret";
+  test("Quick Export preserves an unrelated image-generation value exactly", async () => {
+    const exactValue =
+      ' { "__proto__": { "retained": "exact" }, "custom": { "apiKey": "unrelated" } } ';
+    getDb()
+      .prepare("INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)")
+      .run("imageGeneration", exactValue, USER_ID);
+
+    const bytes = await readAll(buildExportStream({
+      userId: USER_ID,
+      includeVectors: false,
+      producerVersion: "test",
+    }));
+    const exported = readArchiveNdjson(bytes, "database/settings.ndjson")
+      .find((row) => row.key === "imageGeneration");
+    const parsed = JSON.parse(exported!.value);
+
+    expect(exported!.value).toBe(exactValue);
+    expect(Object.prototype.hasOwnProperty.call(parsed, "__proto__")).toBe(true);
+    expect(parsed.__proto__).toEqual({ retained: "exact" });
+    expect(parsed.custom).toEqual({ apiKey: "unrelated" });
+  });
+
+  test("Quick Export fails closed for Unicode-escaped malformed private data", async () => {
+    const escapedPrivateData = String.raw`{"\u006e\u0061\u006e\u006f\u0067\u0070\u0074":{"\u0061\u0070\u0069\u004b\u0065\u0079":"escaped-export-secret"}`;
     getDb()
       .prepare("INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, 0)")
       .run(
         "imageGeneration",
-        `{"enabled":true,"nanogpt":{"apiKey":"${malformedSecret}"}`,
+        JSON.stringify({ wrapper: escapedPrivateData }),
         USER_ID,
       );
 
@@ -280,7 +340,9 @@ describe("user-data export ZIP64 round-trip", () => {
       userId: USER_ID,
       includeVectors: false,
       producerVersion: "test",
-    }))).rejects.toThrow("imageGeneration settings value is malformed JSON");
+    }))).rejects.toThrow(
+      "imageGeneration settings contain malformed JSON-encoded provider data",
+    );
   });
   test("redacts materialized sealed preset blocks into canonical portable descriptors", async () => {
     const secret = "ARCHIVE_SEALED_SECRET_distinctive_bytes_7b2f";

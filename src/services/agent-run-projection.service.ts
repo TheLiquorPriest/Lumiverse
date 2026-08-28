@@ -621,9 +621,9 @@ function normalizeInputState(
 function phaseForStoredState(state: StoredRunState): AgentRunPublicPhaseV2 {
   if (state === "ASSEMBLE") return "ASSEMBLE";
   if (state === "WORK") return "WORK";
-  if (state === "COMPLETE" || state === "PREPARE_COMMIT") return "PREPARE_COMMIT";
+  if (state === "COMPLETE") return "PREPARE_COMMIT";
   if (state === "RENDER") return "RENDER";
-  if (state === "COMMITTING") return "COMMIT";
+  if (state === "PREPARE_COMMIT" || state === "COMMITTING") return "COMMIT";
   return "TERMINAL";
 }
 
@@ -961,8 +961,11 @@ function normalizeRun(
   );
   const fallbackStartedAt = boundedCounter(input.startedAt, existing?.startedAt ?? Math.floor(Date.now() / 1000));
   const terminalState = outcomeForStoredState(storedState, causalCode) !== null;
+  const derivesFromStoredState = input.status !== undefined || input.phase !== undefined;
   const workPhase = normalizeWorkPhase(
-    terminalState ? undefined : input.workPhase ?? existing?.workPhase,
+    terminalState
+      ? undefined
+      : input.workPhase ?? (derivesFromStoredState ? undefined : existing?.workPhase),
     storedState,
   );
   const workOutcome = normalizeWorkOutcome(
@@ -971,7 +974,9 @@ function normalizeRun(
     causalCode,
   );
   const workStatus = normalizeWorkStatus(
-    terminalState ? undefined : input.workStatus ?? existing?.workStatus,
+    terminalState
+      ? undefined
+      : input.workStatus ?? (derivesFromStoredState ? undefined : existing?.workStatus),
     storedState,
     storedState === "CANCELLED" || storedState === "TIMED_OUT",
     causalCode,
@@ -4458,7 +4463,7 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
   if (TOO_LATE_STATES.has(currentStoredState)) {
     if (
       initialDurable
-      && initialDurable.state !== currentStoredState
+      && phaseForStoredState(initialDurable.state) !== run.workPhase
       && !(isTerminal(run) && terminalProjectionMatchesState(run, initialDurable.state, executionTerminalCode(initialControl)))
     ) {
       throw new AgentRunStopUnavailableError(turnId);
