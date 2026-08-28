@@ -46,7 +46,6 @@ import {
   recoverPooledGeneration,
   recoverAgentActivityRuns,
   requestStreamGapRecovery,
-  beginGenerationRequest,
   acceptGenerationStarted,
   acceptGenerationEnded,
   captureGenerationRequest,
@@ -54,7 +53,6 @@ import {
 } from '@/lib/generation-recovery'
 import { startGenerationWithRecovery } from '@/lib/generation-recovery'
 import { recoverAgentRuns } from '@/lib/agent-run-recovery'
-import { acceptsClientGenerationAuthority } from '@/lib/generation-request-authority'
 import { checkForBundleUpdate } from '@/lib/swUpdater'
 import type {
   StreamTokenPayload,
@@ -890,8 +888,12 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_STARTED, (payload: GenerationStartedPayload) => {
-        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
-        if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
+        if (!acceptGenerationStarted(
+          payload.chatId,
+          payload.generationId,
+          payload.requestAuthorityId,
+          'queued',
+        )) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           if (state.isGroupChat && payload.characterId) {
@@ -937,8 +939,12 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_IN_PROGRESS, (payload: GenerationInProgressPayload) => {
-        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
-        if (!acceptGenerationStarted(payload.chatId, payload.generationId)) return
+        if (!acceptGenerationStarted(
+          payload.chatId,
+          payload.generationId,
+          payload.requestAuthorityId,
+          'working',
+        )) return
         const state = store.getState()
         if (payload.chatId === state.activeChatId && !state.streamingNavigationPaused) {
           if (state.activeGenerationId !== payload.generationId) {
@@ -1072,11 +1078,15 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_ENDED, (payload: GenerationEndedPayload) => {
-        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
         const state = store.getState()
         if (
           payload.generationId &&
-          !acceptGenerationEnded(payload.chatId, payload.generationId)
+          !acceptGenerationEnded(
+            payload.chatId,
+            payload.generationId,
+            payload.error || payload.errorCode || payload.agentError ? 'error' : 'completed',
+            payload.requestAuthorityId,
+          )
         ) {
           return
         }
@@ -1469,12 +1479,16 @@ export function useWebSocket() {
       }),
 
       wsClient.on(EventType.GENERATION_STOPPED, (payload: GenerationStoppedPayload) => {
-        if (!acceptsClientGenerationAuthority(payload.chatId, payload.requestAuthorityId)) return
         const state = store.getState()
         const isActiveChat = !!payload.chatId && payload.chatId === state.activeChatId
         if (
           payload.generationId &&
-          !acceptGenerationEnded(payload.chatId, payload.generationId)
+          !acceptGenerationEnded(
+            payload.chatId,
+            payload.generationId,
+            'stopped',
+            payload.requestAuthorityId,
+          )
         ) {
           return
         }

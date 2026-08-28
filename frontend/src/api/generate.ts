@@ -11,7 +11,6 @@ import {
 } from '@/lib/agentRuntimeSelection'
 import type { AgentRuntimeMode } from '@/types/effective-runtime'
 import type { LoomPromptInspectionV1 } from '@/types/agent-runtime'
-import { beginClientGenerationAuthority, getClientGenerationAuthority, stopClientGenerationAuthority } from '@/lib/generation-request-authority'
 
 /** Generation requests go through prompt assembly + council + embedding calls
  *  which can legitimately take longer than the default 30s client timeout. */
@@ -28,74 +27,12 @@ export interface GenerationRequestOptions extends RequestOptions {
   forceResponse?: boolean
 }
 
-const generationIntentEpochs = new Map<string, number>()
-const generationIntentControllers = new Map<string, AbortController>()
-
 function abortReason(signal?: AbortSignal): unknown {
   return signal?.reason ?? new DOMException('Generation cancelled', 'AbortError')
 }
+
 function throwIfGenerationAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortReason(signal)
-}
-
-function beginGenerationIntent(chatId: string, externalSignal?: AbortSignal): {
-  epoch: number
-  controller: AbortController
-  cleanup: () => void
-} {
-  generationIntentControllers.get(chatId)?.abort(new DOMException('Superseded generation', 'AbortError'))
-  const epoch = (generationIntentEpochs.get(chatId) ?? 0) + 1
-  generationIntentEpochs.set(chatId, epoch)
-  const controller = new AbortController()
-  const onAbort = () => controller.abort(abortReason(externalSignal))
-  if (externalSignal) {
-    if (externalSignal.aborted) controller.abort(abortReason(externalSignal))
-    else externalSignal.addEventListener('abort', onAbort, { once: true })
-  }
-  generationIntentControllers.set(chatId, controller)
-  return {
-    epoch,
-    controller,
-    cleanup: () => {
-      externalSignal?.removeEventListener('abort', onAbort)
-      if (generationIntentControllers.get(chatId) === controller) {
-        generationIntentControllers.delete(chatId)
-      }
-    },
-  }
-}
-
-function assertGenerationIntent(chatId: string, epoch: number, signal?: AbortSignal): void {
-  throwIfGenerationAborted(signal)
-  if (generationIntentEpochs.get(chatId) !== epoch) {
-    throw new DOMException('Generation cancelled', 'AbortError')
-  }
-}
-
-/**
- * Fence and abort a preflight or POST that has not yet handed its generation
- * id to the caller. The stop endpoint calls this before targeting a known
- * generation, so an optimistic stop also handles the id-less window.
- */
-export function cancelPendingGeneration(chatId: string): string | null {
-  generationIntentEpochs.set(chatId, (generationIntentEpochs.get(chatId) ?? 0) + 1)
-  const requestAuthorityId = stopClientGenerationAuthority(chatId)
-  generationIntentControllers.get(chatId)?.abort(new DOMException('Generation cancelled', 'AbortError'))
-  return requestAuthorityId
-}
-
-/**
- * Reserve an intent epoch for callers that must preflight before performing a
- * local presentation mutation (for example Response regenerate). The caller
- * passes the returned epoch to dispatchPreparedGeneration; Stop increments the
- * same fence through cancelPendingGeneration.
- */
-export function beginPreparedGenerationIntent(chatId: string): number {
-  generationIntentControllers.get(chatId)?.abort(new DOMException('Superseded generation', 'AbortError'))
-  const epoch = (generationIntentEpochs.get(chatId) ?? 0) + 1
-  generationIntentEpochs.set(chatId, epoch)
-  beginClientGenerationAuthority(chatId)
-  return epoch
 }
 
 const LONG: RequestOptions = { timeout: 120_000 }
@@ -437,18 +374,17 @@ export async function preflightGeneration(
   options: GenerationRequestOptions = {},
 ): Promise<PreparedRuntimeRequest<GenerateRequest>> {
   throwIfGenerationAborted(options.signal)
+  if (!request.request_authority_id) {
+    throw new DOMException('Generation request authority is required', 'AbortError')
+  }
   resetActiveGenerationMode(request.chat_id)
   await flushSettingsNow()
   throwIfGenerationAborted(options.signal)
   await flushPresetForGeneration(request.preset_id)
   throwIfGenerationAborted(options.signal)
-  const requestAuthorityId = request.request_authority_id
-    ?? getClientGenerationAuthority(request.chat_id)
-    ?? beginClientGenerationAuthority(request.chat_id)
   return prepareAgentRuntimeRequest({
     ...request,
     generation_type: request.generation_type ?? impliedGenerationType(path),
-    request_authority_id: requestAuthorityId,
   }, options)
 }
 
@@ -456,9 +392,8 @@ export async function dispatchPreparedGeneration(
   path: GenerationPath,
   prepared: PreparedRuntimeRequest<GenerateRequest>,
   options: GenerationRequestOptions = {},
-  intentEpoch?: number,
 ): Promise<GenerateResponse> {
-  assertGenerationIntent(prepared.request.chat_id, intentEpoch ?? (generationIntentEpochs.get(prepared.request.chat_id) ?? 0), options.signal)
+  throwIfGenerationAborted(options.signal)
   if (prepared.request.mode === 'agentic') {
     const runtimeEpoch = prepared.request.request_epoch
     const selection = getRuntimeSelectionSnapshot(prepared.request.chat_id)
@@ -473,7 +408,7 @@ export async function dispatchPreparedGeneration(
   }
   const { forceRuntimeRefresh: _forceRuntimeRefresh, forceResponse: _forceResponse, ...requestOptions } = options
   const response = await post<GenerateResponse>(path, prepared.request, { ...LONG, ...requestOptions })
-  assertGenerationIntent(prepared.request.chat_id, intentEpoch ?? (generationIntentEpochs.get(prepared.request.chat_id) ?? 0), options.signal)
+  throwIfGenerationAborted(options.signal)
   if (prepared.request.mode === 'agentic') {
     const runtimeEpoch = prepared.request.request_epoch
     const selection = getRuntimeSelectionSnapshot(prepared.request.chat_id)
@@ -495,20 +430,12 @@ async function startPreparedGeneration(
   request: GenerateRequest,
   options: GenerationRequestOptions = {},
 ) {
-  const intent = beginGenerationIntent(request.chat_id, options.signal)
   try {
-    const intentOptions: GenerationRequestOptions = {
-      ...options,
-      signal: intent.controller.signal,
-    }
-    const prepared = await preflightGeneration(path, request, intentOptions)
-    assertGenerationIntent(request.chat_id, intent.epoch, intent.controller.signal)
-    return await dispatchPreparedGeneration(path, prepared, intentOptions, intent.epoch)
+    const prepared = await preflightGeneration(path, request, options)
+    return await dispatchPreparedGeneration(path, prepared, options)
   } catch (error) {
     resetActiveGenerationMode(request.chat_id)
     throw error
-  } finally {
-    intent.cleanup()
   }
 }
 
@@ -519,8 +446,7 @@ export const generateApi = {
     return startPreparedGeneration('/generate', request, options)
   },
 
-  stop(generationId?: string, chatId?: string) {
-    const requestAuthorityId = chatId ? cancelPendingGeneration(chatId) : null
+  stop(generationId?: string, chatId?: string, requestAuthorityId?: string) {
     const body: Record<string, string> = {}
     if (generationId) body.generation_id = generationId
     if (chatId) body.chat_id = chatId

@@ -25,6 +25,22 @@ import type {
   UserDataFailure,
   UserDataJob,
 } from './user-data'
+export type GenerationRequestStatus = 'pending' | 'queued' | 'working' | 'completed' | 'stopped' | 'error'
+
+export interface GenerationRequestAuthority {
+  chatId: string
+  epoch: number
+  requestAuthorityId: string | null
+  generationId: string | null
+  abortController: AbortController | null
+  status: GenerationRequestStatus
+  generationType: string
+  targetMessageId: string | null
+  targetSwipeId: number | null
+  retiredGenerationIds: string[]
+  terminalGenerationIds: string[]
+}
+
 // ---- Chat Slice ----
 export interface ChatSlice {
   activeChatId: string | null
@@ -43,6 +59,8 @@ export interface ChatSlice {
   /** The chat row's `name` for the currently-open chat (group chats display it as the group name) */
   activeChatName: string | null
   messages: Message[]
+  /** Per-chat authority for the complete pending → terminal request lifecycle. */
+  generationRequests: Record<string, GenerationRequestAuthority>
   isStreaming: boolean
   /** True while the chat is fading out to another route. The last rendered
    * stream frame stays visible, but live/recovery writes are paused. */
@@ -112,6 +130,28 @@ export interface ChatSlice {
   addMessage: (message: Message) => void
   updateMessage: (id: string, updates: Partial<Message>) => void
   removeMessage: (id: string) => void
+  beginGenerationRequest: (
+    chatId: string,
+    intent: {
+      generationType: string
+      targetMessageId?: string | null
+      targetSwipeId?: number | null
+      requestAuthorityId?: string | null
+    },
+  ) => GenerationRequestAuthority
+  acceptGenerationRequest: (
+    chatId: string,
+    generationId: string,
+    requestAuthorityId?: string,
+    status?: 'queued' | 'working',
+  ) => boolean
+  settleGenerationRequest: (
+    chatId: string,
+    status: 'completed' | 'stopped' | 'error',
+    generationId?: string | null,
+    requestAuthorityId?: string,
+  ) => boolean
+  stopGenerationRequest: (chatId: string) => GenerationRequestAuthority | null
   beginStreaming: (
     regeneratingMessageId?: string,
     generationType?: string,

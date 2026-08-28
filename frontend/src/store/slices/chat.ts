@@ -1,5 +1,5 @@
 import type { StateCreator } from 'zustand'
-import type { ChatSlice } from '@/types/store'
+import type { ChatSlice, GenerationRequestAuthority } from '@/types/store'
 import type { Message, AgentSummary } from '@/types/api'
 import type {
   AgentActivityGeneration,
@@ -23,6 +23,18 @@ import { reconcileMessageTail } from '@/store/messageTailReconciliation'
 
 export const AGENT_ACTIVITY_EVENT_LIMIT = 128
 export const AGENT_ACTIVITY_BYTES_LIMIT = 64 * 1024
+const GENERATION_AUTHORITY_HISTORY_LIMIT = 32
+
+function boundedGenerationHistory(values: readonly string[], next?: string | null): string[] {
+  const result = next && !values.includes(next) ? [...values, next] : [...values]
+  return result.length > GENERATION_AUTHORITY_HISTORY_LIMIT
+    ? result.slice(result.length - GENERATION_AUTHORITY_HISTORY_LIMIT)
+    : result
+}
+
+function liveGenerationRequest(status: GenerationRequestAuthority['status']): boolean {
+  return status === 'pending' || status === 'queued' || status === 'working'
+}
 
 const AGENT_ACTIVITY_PHASES: Record<AgentActivityPhase, true> = {
   queued: true, started: true, tool_call: true, completed: true, failed: true, cancelled: true, timed_out: true,
@@ -715,6 +727,7 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
     activeChatAvatarId: null,
     activeChatMetadata: null,
     messages: [],
+    generationRequests: {},
     isStreaming: false,
     streamingNavigationPaused: false,
     streamingContent: '',
@@ -924,7 +937,122 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
           : state.unseenSwipes
         return { messages, totalChatLength: Math.max(0, state.totalChatLength - 1), unseenSwipes }
       }),
+    beginGenerationRequest: (chatId, intent) => {
+      const current = get().generationRequests[chatId]
+      current?.abortController?.abort(new DOMException('Superseded generation', 'AbortError'))
+      const previousGenerationId = current?.generationId ?? null
+      const next: GenerationRequestAuthority = {
+        chatId,
+        epoch: (current?.epoch ?? 0) + 1,
+        requestAuthorityId: intent.requestAuthorityId === undefined
+          ? crypto.randomUUID()
+          : intent.requestAuthorityId,
+        generationId: null,
+        abortController: new AbortController(),
+        status: 'pending',
+        generationType: intent.generationType,
+        targetMessageId: intent.targetMessageId ?? null,
+        targetSwipeId: intent.targetSwipeId ?? null,
+        retiredGenerationIds: boundedGenerationHistory(
+          current?.retiredGenerationIds ?? [],
+          liveGenerationRequest(current?.status ?? 'completed') ? previousGenerationId : null,
+        ),
+        terminalGenerationIds: boundedGenerationHistory(
+          current?.terminalGenerationIds ?? [],
+          previousGenerationId,
+        ),
+      }
+      set((state) => ({
+        generationRequests: { ...state.generationRequests, [chatId]: next },
+      }))
+      return next
+    },
 
+    acceptGenerationRequest: (chatId, generationId, requestAuthorityId, status = 'queued') => {
+      let accepted = false
+      set((state) => {
+        const current = state.generationRequests[chatId]
+        if (current) {
+          if (!liveGenerationRequest(current.status)) return state
+          if (current.requestAuthorityId !== null && current.requestAuthorityId !== (requestAuthorityId ?? null)) return state
+          if (current.retiredGenerationIds.includes(generationId) || current.terminalGenerationIds.includes(generationId)) return state
+          if (current.generationId && current.generationId !== generationId) return state
+          accepted = true
+          return {
+            generationRequests: {
+              ...state.generationRequests,
+              [chatId]: {
+                ...current,
+                generationId,
+                status: current.status === 'working' ? 'working' : status,
+              },
+            },
+          }
+        }
+        accepted = true
+        return {
+          generationRequests: {
+            ...state.generationRequests,
+            [chatId]: {
+              chatId,
+              epoch: 1,
+              requestAuthorityId: requestAuthorityId ?? null,
+              generationId,
+              abortController: null,
+              status,
+              generationType: 'normal',
+              targetMessageId: null,
+              targetSwipeId: null,
+              retiredGenerationIds: [],
+              terminalGenerationIds: [],
+            },
+          },
+        }
+      })
+      return accepted
+    },
+
+    settleGenerationRequest: (chatId, status, generationId, requestAuthorityId) => {
+      let settled = false
+      set((state) => {
+        const current = state.generationRequests[chatId]
+        if (!current) return state
+        if (current.requestAuthorityId !== null && current.requestAuthorityId !== (requestAuthorityId ?? null)) return state
+        if (generationId && current.generationId && current.generationId !== generationId) return state
+        if (generationId && current.retiredGenerationIds.includes(generationId)) return state
+        if (!liveGenerationRequest(current.status)) return state
+        settled = true
+        const terminalId = generationId ?? current.generationId
+        return {
+          generationRequests: {
+            ...state.generationRequests,
+            [chatId]: {
+              ...current,
+              generationId: terminalId,
+              abortController: null,
+              status,
+              terminalGenerationIds: boundedGenerationHistory(current.terminalGenerationIds, terminalId),
+            },
+          },
+        }
+      })
+      return settled
+    },
+    stopGenerationRequest: (chatId) => {
+      const current = get().generationRequests[chatId]
+      if (!current || !liveGenerationRequest(current.status)) return current ?? null
+      current.abortController?.abort(new DOMException('Generation cancelled', 'AbortError'))
+      const stopped: GenerationRequestAuthority = {
+        ...current,
+        abortController: null,
+        status: 'stopped',
+        terminalGenerationIds: boundedGenerationHistory(current.terminalGenerationIds, current.generationId),
+      }
+      set((state) => ({
+        generationRequests: { ...state.generationRequests, [chatId]: stopped },
+      }))
+      return stopped
+    },
     beginStreaming: (regeneratingMessageId, generationType, options) => {
       cancelStreamFlush()
       rawStreamContent = ''

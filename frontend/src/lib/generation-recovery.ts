@@ -2,132 +2,94 @@ import { generateApi } from '@/api/generate'
 import type { GenerateRequest, GenerateResponse, GenerationRequestOptions } from '@/api/generate'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { useStore } from '@/store'
-import { acceptsClientGenerationAuthority, resetClientGenerationAuthoritiesForTests } from '@/lib/generation-request-authority'
-/**
- * Per-chat generation authority. Store streaming fields are intentionally not
- * sufficient during stop→regenerate: G2 is optimistic while G1 HTTP/WS work
- * may still resolve with `activeGenerationId === null`.
- */
-interface GenerationAuthority {
-  epoch: number
-  currentGenerationId: string | null
-  retiredGenerationIds: Set<string>
-  terminalGenerationIds: Set<string>
-}
+import type { GenerationRequestAuthority } from '@/types/store'
 
 export interface GenerationRequestEpoch {
   chatId: string
   epoch: number
+  requestAuthorityId: string | null
   generationId: string | null
 }
 
-const generationAuthorities = new Map<string, GenerationAuthority>()
-const MAX_GENERATION_HISTORY = 32
-
-function getGenerationAuthority(chatId: string): GenerationAuthority {
-  let authority = generationAuthorities.get(chatId)
-  if (!authority) {
-    authority = {
-      epoch: 0,
-      currentGenerationId: null,
-      retiredGenerationIds: new Set(),
-      terminalGenerationIds: new Set(),
-    }
-    generationAuthorities.set(chatId, authority)
-  }
-  return authority
+export interface GenerationRequestIntent {
+  generationType?: string
+  targetMessageId?: string | null
+  targetSwipeId?: number | null
+  requestAuthorityId?: string | null
 }
 
-function rememberGenerationId(set: Set<string>, generationId: string): void {
-  if (!generationId) return
-  set.add(generationId)
-  while (set.size > MAX_GENERATION_HISTORY) {
-    const oldest = set.values().next().value
-    if (oldest === undefined) break
-    set.delete(oldest)
-  }
+function isLiveRequest(authority: GenerationRequestAuthority | undefined): authority is GenerationRequestAuthority {
+  return authority?.status === 'pending' || authority?.status === 'queued' || authority?.status === 'working'
 }
 
-export function beginGenerationRequest(chatId: string, previousGenerationId?: string | null): number {
-  if (!chatId) return 0
-  const authority = getGenerationAuthority(chatId)
-  const previous = previousGenerationId ?? authority.currentGenerationId
-  if (previous) {
-    rememberGenerationId(authority.retiredGenerationIds, previous)
-    rememberGenerationId(authority.terminalGenerationIds, previous)
-  }
-  authority.currentGenerationId = null
-  authority.epoch += 1
+/** Publish the sole reactive per-chat request authority synchronously. */
+export function beginGenerationRequest(
+  chatId: string,
+  intentOrPrevious: GenerationRequestIntent | string = {},
+): number {
+  const intent = typeof intentOrPrevious === 'string' ? {} : intentOrPrevious
+  const authority = useStore.getState().beginGenerationRequest(chatId, {
+    generationType: intent.generationType ?? 'normal',
+    targetMessageId: intent.targetMessageId,
+    targetSwipeId: intent.targetSwipeId,
+    requestAuthorityId: intent.requestAuthorityId,
+  })
   return authority.epoch
 }
 
 export function invalidateGenerationRequest(chatId: string, generationId?: string | null): number {
-  if (!chatId) return 0
-  const authority = getGenerationAuthority(chatId)
-  const suppliedGenerationId = generationId ?? null
-
-  // A late response belongs to the generation it names. Retire that
-  // generation so a pending start cannot resurrect it, but never revoke the
-  // authority that has since moved on to a newer generation.
-  if (suppliedGenerationId) {
-    rememberGenerationId(authority.retiredGenerationIds, suppliedGenerationId)
-    rememberGenerationId(authority.terminalGenerationIds, suppliedGenerationId)
-    if (authority.currentGenerationId !== suppliedGenerationId) return authority.epoch
-  } else if (authority.currentGenerationId) {
-    rememberGenerationId(authority.retiredGenerationIds, authority.currentGenerationId)
-    rememberGenerationId(authority.terminalGenerationIds, authority.currentGenerationId)
-  }
-
-  // Clearing the current authority and advancing its epoch are a single
-  // current-generation transition. Repeating an invalidation after the
-  // authority has moved on is therefore a no-op for the epoch.
-  authority.currentGenerationId = null
-  authority.epoch += 1
-  return authority.epoch
+  const state = useStore.getState()
+  const current = state.generationRequests[chatId]
+  if (!current) return 0
+  if (generationId && current.generationId && current.generationId !== generationId) return current.epoch
+  state.settleGenerationRequest(chatId, 'stopped', generationId)
+  return current.epoch
 }
 
-export function acceptGenerationStarted(chatId: string, generationId: string): boolean {
+export function acceptGenerationStarted(
+  chatId: string,
+  generationId: string,
+  requestAuthorityId?: string,
+  status: 'queued' | 'working' = 'queued',
+): boolean {
   if (!chatId || !generationId) return false
-  const authority = getGenerationAuthority(chatId)
-  if (
-    authority.retiredGenerationIds.has(generationId) ||
-    authority.terminalGenerationIds.has(generationId)
-  ) return false
-  if (authority.currentGenerationId === generationId) return true
-  if (authority.currentGenerationId) {
-    rememberGenerationId(authority.retiredGenerationIds, authority.currentGenerationId)
-    authority.epoch += 1
-  }
-  authority.currentGenerationId = generationId
-  return true
+  return useStore.getState().acceptGenerationRequest(
+    chatId,
+    generationId,
+    requestAuthorityId,
+    status,
+  )
 }
 
-export function acceptGenerationEnded(chatId: string, generationId: string): boolean {
+export function acceptGenerationEnded(
+  chatId: string,
+  generationId: string,
+  status: 'completed' | 'stopped' | 'error' = 'completed',
+  requestAuthorityId?: string,
+): boolean {
   if (!chatId || !generationId) return false
-  const authority = getGenerationAuthority(chatId)
-  if (authority.retiredGenerationIds.has(generationId)) return false
-  if (!authority.currentGenerationId || authority.currentGenerationId !== generationId) return false
-  rememberGenerationId(authority.terminalGenerationIds, generationId)
-  return true
+  return useStore.getState().settleGenerationRequest(
+    chatId,
+    status,
+    generationId,
+    requestAuthorityId,
+  )
 }
 
 export function captureGenerationRequest(
   chatId: string,
   observedGenerationId?: string | null,
 ): GenerationRequestEpoch {
-  const authority = getGenerationAuthority(chatId)
-  if (observedGenerationId && !authority.currentGenerationId) {
-    if (
-      !authority.retiredGenerationIds.has(observedGenerationId) &&
-      !authority.terminalGenerationIds.has(observedGenerationId)
-    ) {
-      authority.currentGenerationId = observedGenerationId
-    }
+  let authority = useStore.getState().generationRequests[chatId]
+  if (observedGenerationId && !authority) {
+    useStore.getState().acceptGenerationRequest(chatId, observedGenerationId)
+    authority = useStore.getState().generationRequests[chatId]
   }
   return {
     chatId,
-    epoch: authority.epoch,
-    generationId: observedGenerationId ?? authority.currentGenerationId,
+    epoch: authority?.epoch ?? 0,
+    requestAuthorityId: authority?.requestAuthorityId ?? null,
+    generationId: observedGenerationId ?? authority?.generationId ?? null,
   }
 }
 
@@ -136,14 +98,16 @@ export function isGenerationRequestCurrent(
   generationId?: string | null,
   active = false,
 ): boolean {
-  if (!request.chatId) return false
-  const authority = getGenerationAuthority(request.chatId)
-  if (authority.epoch !== request.epoch) return false
+  const authority = useStore.getState().generationRequests[request.chatId]
+  if (!authority || authority.epoch !== request.epoch) return false
+  if (authority.requestAuthorityId !== request.requestAuthorityId) return false
   if (generationId && request.generationId && generationId !== request.generationId) return false
-  if (generationId && authority.retiredGenerationIds.has(generationId)) return false
-  if (active && generationId && authority.currentGenerationId && authority.currentGenerationId !== generationId) return false
+  if (generationId && authority.retiredGenerationIds.includes(generationId)) return false
+  if (active && !isLiveRequest(authority)) return false
+  if (active && generationId && authority.generationId && authority.generationId !== generationId) return false
   return true
 }
+
 export function isGenerationRequestCurrentForChat(
   request: GenerationRequestEpoch,
   generationId?: string | null,
@@ -156,10 +120,9 @@ export function isGenerationRequestCurrentForChat(
 export type RecoveredGenerationPath = 'start' | 'regenerate' | 'continue'
 
 /**
- * Start every UI-owned generation through one authority fence. The API client
- * protects the runtime decision token and pending HTTP intent; this wrapper
- * additionally protects the store's generation epoch and active-chat scope so
- * a late response cannot resurrect streaming after Stop or navigation.
+ * Start a UI-owned generation through the store authority. If the caller
+ * already published its request before an earlier write, that exact authority
+ * is carried through runtime resolution, HTTP admission, Stop, and WS events.
  */
 export async function startGenerationWithRecovery(
   path: RecoveredGenerationPath,
@@ -171,32 +134,70 @@ export async function startGenerationWithRecovery(
     throw new DOMException('Generation cancelled', 'AbortError')
   }
 
-  const requestEpoch = beginGenerationRequest(request.chat_id, initial.activeGenerationId)
+  const existing = initial.generationRequests[request.chat_id]
+  const authority = isLiveRequest(existing)
+    && request.request_authority_id !== undefined
+    && existing.requestAuthorityId === request.request_authority_id
+    ? existing
+    : initial.beginGenerationRequest(request.chat_id, {
+        generationType: request.generation_type ?? 'normal',
+        targetMessageId: request.message_id ?? null,
+        targetSwipeId: request.swipe_id ?? null,
+        requestAuthorityId: request.request_authority_id,
+      })
   const generationRequest = captureGenerationRequest(request.chat_id)
-  const response = path === 'regenerate'
-    ? await generateApi.regenerate(request, options)
-    : path === 'continue'
-      ? await generateApi.continueGeneration(request, options)
-      : await generateApi.start(request, options)
-
-  if (
-    generationRequest.epoch !== requestEpoch
-    || !isGenerationRequestCurrent(generationRequest, response.generationId, true)
-    || !acceptGenerationStarted(request.chat_id, response.generationId)
-  ) {
-    invalidateGenerationRequest(request.chat_id, response.generationId)
-    throw new DOMException('Generation cancelled', 'AbortError')
+  const admittedRequest: GenerateRequest = {
+    ...request,
+    request_authority_id: authority.requestAuthorityId ?? undefined,
   }
-  return response
-}
+  const controller = authority.abortController
+  if (!controller) throw new DOMException('Generation cancelled', 'AbortError')
+  const onExternalAbort = () => controller.abort(
+    options.signal?.reason ?? new DOMException('Generation cancelled', 'AbortError'),
+  )
+  if (options.signal?.aborted) onExternalAbort()
+  else options.signal?.addEventListener('abort', onExternalAbort, { once: true })
+  const requestOptions: GenerationRequestOptions = { ...options, signal: controller.signal }
 
+  try {
+    const response = path === 'regenerate'
+      ? await generateApi.regenerate(admittedRequest, requestOptions)
+      : path === 'continue'
+        ? await generateApi.continueGeneration(admittedRequest, requestOptions)
+        : await generateApi.start(admittedRequest, requestOptions)
+
+    if (
+      !isGenerationRequestCurrent(generationRequest, response.generationId, true)
+      || !acceptGenerationStarted(
+        request.chat_id,
+        response.generationId,
+        authority.requestAuthorityId ?? undefined,
+      )
+    ) {
+      invalidateGenerationRequest(request.chat_id, response.generationId)
+      throw new DOMException('Generation cancelled', 'AbortError')
+    }
+    return response
+  } catch (error) {
+    const status = error instanceof DOMException && error.name === 'AbortError'
+      ? 'stopped'
+      : 'error'
+    useStore.getState().settleGenerationRequest(
+      request.chat_id,
+      status,
+      undefined,
+      authority.requestAuthorityId ?? undefined,
+    )
+    throw error
+  } finally {
+    options.signal?.removeEventListener('abort', onExternalAbort)
+  }
+}
 
 export function resetGenerationRecoveryGuardsForTests(): void {
-  generationAuthorities.clear()
+  useStore.setState({ generationRequests: {} })
   gapRecoveryStates.clear()
-  resetClientGenerationAuthoritiesForTests()
 }
-
 const agentActivityRecoveryInFlight = new Map<string, Promise<void>>()
 
 /** Fetch terminal status-only runs once per chat at a time and merge idempotently. */
@@ -268,14 +269,21 @@ export async function recoverPooledGeneration(chatId: string): Promise<Generatio
 
   const latest = useStore.getState()
   if (latest.activeChatId !== chatId) return 'ignored'
-  if (!isGenerationRequestCurrent(request, genStatus.generationId, genStatus.active)) return 'stale'
+  if (request.epoch > 0 && !isGenerationRequestCurrent(request, genStatus.generationId, genStatus.active)) return 'stale'
 
   // A fenced active pool snapshot identifies this exact lifecycle. Wire the
   // lifecycle first because startStreaming clears prior-run metadata, then
   // project provider/model verbatim without guessing from the model name.
-  if (!acceptsClientGenerationAuthority(chatId, genStatus.requestAuthorityId)) return 'stale'
   if (genStatus.active && genStatus.generationId) {
-    if (!acceptGenerationStarted(chatId, genStatus.generationId)) return 'stale'
+    const status = genStatus.status === 'assembling' || genStatus.status === 'waiting'
+      ? 'queued'
+      : 'working'
+    if (!acceptGenerationStarted(
+      chatId,
+      genStatus.generationId,
+      genStatus.requestAuthorityId,
+      status,
+    )) return 'stale'
     if (!latest.isStreaming || latest.activeGenerationId !== genStatus.generationId) {
       latest.startStreaming(
         genStatus.generationId,

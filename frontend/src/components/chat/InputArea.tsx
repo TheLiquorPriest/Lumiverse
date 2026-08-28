@@ -9,7 +9,7 @@ import { messagesApi, chatsApi } from '@/api/chats'
 import { presetsApi } from '@/api/presets'
 import { presetProfilesApi, type PresetProfileBinding } from '@/api/preset-profiles'
 import { charactersApi } from '@/api/characters'
-import { beginPreparedGenerationIntent, cancelPendingGeneration, generateApi } from '@/api/generate'
+import { generateApi } from '@/api/generate'
 import { memoryCortexApi } from '@/api/memory-cortex'
 import { agentRunsApi } from '@/api/agent-runs'
 import { recoverAgentRuns } from '@/lib/agent-run-recovery'
@@ -106,9 +106,7 @@ import { ComposerActionBarLive } from './InputAreaComposerBar'
 import {
   beginGenerationRequest,
   captureGenerationRequest,
-  invalidateGenerationRequest,
   isGenerationRequestCurrentForChat,
-  acceptGenerationStarted,
   startGenerationWithRecovery,
 } from '@/lib/generation-recovery'
 import { isExtensionComposerActionId } from './composerActionOwnership'
@@ -495,13 +493,19 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const regeneratingMessageId = useStore((s) => s.regeneratingMessageId)
   const streamingSwipeId = useStore((s) => s.streamingSwipeId)
   const localGenerationInChat = isStreaming && activeChatId === chatId
-  const isGeneratingInChat = !!liveChatGenerationId || localGenerationInChat
+  const generationRequestAuthority = useStore((s) => s.generationRequests[chatId])
+  const requestPendingInChat = generationRequestAuthority?.status === 'pending'
+    || generationRequestAuthority?.status === 'queued'
+    || generationRequestAuthority?.status === 'working'
+  const isGeneratingInChat = !!liveChatGenerationId || localGenerationInChat || requestPendingInChat
   const runtimeSelection = useSyncExternalStore(
     useCallback((listener) => subscribeRuntimeSelection(chatId, listener), [chatId]),
     useCallback(() => getRuntimeSelectionSnapshot(chatId), [chatId]),
     useCallback(() => getRuntimeSelectionSnapshot(chatId), [chatId]),
   )
-  const generationIdForChat = liveChatGenerationId || (localGenerationInChat ? activeGenerationId : null)
+  const generationIdForChat = generationRequestAuthority?.generationId
+    || liveChatGenerationId
+    || (localGenerationInChat ? activeGenerationId : null)
   const waitingForExactAgentRun = isGeneratingInChat
     && !isGroupChat
     && !mpRoomId
@@ -540,18 +544,18 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     || agentRunSyncStatus === 'stale'
   const cancelGenerationLocally = useCallback(() => {
     generationNonceRef.current += 1
+    const stoppedAuthority = useStore.getState().stopGenerationRequest(chatId)
     generationAbortControllerRef.current?.abort(new DOMException('Generation cancelled', 'AbortError'))
     generationAbortControllerRef.current = null
-    cancelPendingGeneration(chatId)
-    invalidateGenerationRequest(chatId, generationIdForChat)
-  }, [chatId, generationIdForChat])
+    stopStreaming()
+    return stoppedAuthority
+  }, [chatId, stopStreaming])
   const beginComposerAbort = useCallback(() => {
     recordComposerStopResult(null)
     setComposerStopping(true)
     setComposerAbortInFlight(true)
-    cancelGenerationLocally()
-    stopStreaming()
-  }, [cancelGenerationLocally, recordComposerStopResult, stopStreaming])
+    return cancelGenerationLocally()
+  }, [cancelGenerationLocally, recordComposerStopResult])
   const settleComposerAbort = useCallback(() => {
     setComposerAbortInFlight(false)
     if (composerStopResultRef.current === null) setComposerStopping(false)
@@ -1692,7 +1696,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         e.preventDefault()
         e.stopPropagation()
         const knownRun = activeAgentRun
-        beginComposerAbort()
+        const stoppedAuthority = beginComposerAbort()
         if (knownRun) {
           void agentRunsApi.stop(knownRun.turnId, {
             chatId,
@@ -1710,7 +1714,11 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           } else {
             pendingAgentStopRef.current = null
           }
-          void generateApi.stop(generationIdForChat || undefined, chatId)
+          void generateApi.stop(
+            stoppedAuthority?.generationId || generationIdForChat || undefined,
+            chatId,
+            stoppedAuthority?.requestAuthorityId ?? undefined,
+          )
             .then((result) => recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status))
             .catch(console.error)
             .finally(settleComposerAbort)
@@ -2103,10 +2111,17 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     sendingRef.current = true
     setComposerStopping(false)
     setComposerAbortInFlight(false)
+    const nonce = ++generationNonceRef.current
+    generationAbortControllerRef.current?.abort()
+    const generationAbortController = new AbortController()
+    generationAbortControllerRef.current = generationAbortController
+    beginGenerationRequest(chatId, { generationType: 'normal' })
+    const generationRequest = captureGenerationRequest(chatId)
 
     // Multiplayer: route through the room (turn/window-gated) unless we're the
     // host in round-robin, who sends locally on their own chat.
     if (await attemptRoomSend(contentOverride, triggerAction) !== 'local') {
+      useStore.getState().stopGenerationRequest(chatId)
       sendingRef.current = false
       return
     }
@@ -2126,16 +2141,13 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
     const willCreateMessage = !!content || !!attachments
     if (willCreateMessage && !await finalizeRegexSelections(pendingSelections, triggerAction)) {
+      useStore.getState().stopGenerationRequest(chatId)
       sendingRef.current = false
       return
     }
 
-    const nonce = ++generationNonceRef.current
-    generationAbortControllerRef.current?.abort()
-    const generationAbortController = new AbortController()
-    generationAbortControllerRef.current = generationAbortController
-    beginGenerationRequest(chatId, activeGenerationId)
-    const generationRequest = captureGenerationRequest(chatId)
+    // The request authority was published before any async routing, message
+    // persistence, runtime decision, or generation admission.
     // Publish the cancellable local intent before message persistence and
     // runtime preflight. The target message does not exist yet, so defer the
     // normal stream placeholder until the authoritative START identifies it.
@@ -2178,6 +2190,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         mode: forceResponse ? 'response' : undefined,
         target_character_id: !isGroupChat ? focusedPreviewCharacterId ?? undefined : undefined,
         user_input: sourceText || undefined,
+        request_authority_id: generationRequest.requestAuthorityId ?? undefined,
       }
 
       // Parse @mentions in the user's message (group chats only). Each mention
@@ -2259,34 +2272,31 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         ) return
         // Optimistically add to store so it appears immediately
         addMessage(msg)
-        const res = await generateApi.start(genOpts, {
+        const res = await startGenerationWithRecovery('start', genOpts, {
           forceRuntimeRefresh: true,
           forceResponse,
           signal: generationAbortController.signal,
         })
-        if (
-          !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true) ||
-          !acceptGenerationStarted(chatId, res.generationId)
-        ) return
+        if (!isGenerationRequestCurrentForChat(generationRequest, res.generationId, true)) return
         startStreaming(res.generationId)
         consumeOneshotGuides()
       } else if (hasQueuedMessages) {
         // Queued user messages waiting — trigger normal generation
-        const res = await generateApi.start(genOpts, { forceResponse, signal: generationAbortController.signal })
-        if (
-          !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true) ||
-          !acceptGenerationStarted(chatId, res.generationId)
-        ) return
+        const res = await startGenerationWithRecovery('start', genOpts, {
+          forceResponse,
+          signal: generationAbortController.signal,
+        })
+        if (!isGenerationRequestCurrentForChat(generationRequest, res.generationId, true)) return
         startStreaming(res.generationId)
         consumeOneshotGuides()
       } else {
         // Empty send from the input bar is a nudge for a fresh reply, not the
         // explicit Continue action that appends onto the previous assistant message.
-        const res = await generateApi.start(genOpts, { forceResponse, signal: generationAbortController.signal })
-        if (
-          !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true) ||
-          !acceptGenerationStarted(chatId, res.generationId)
-        ) return
+        const res = await startGenerationWithRecovery('start', genOpts, {
+          forceResponse,
+          signal: generationAbortController.signal,
+        })
+        if (!isGenerationRequestCurrentForChat(generationRequest, res.generationId, true)) return
         startStreaming(res.generationId)
         consumeOneshotGuides()
       }
@@ -2492,28 +2502,26 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     generationAbortControllerRef.current?.abort()
     const generationAbortController = new AbortController()
     generationAbortControllerRef.current = generationAbortController
-    beginGenerationRequest(chatId, activeGenerationId)
-    const generationRequest = captureGenerationRequest(chatId)
-    const intentEpoch = beginPreparedGenerationIntent(chatId)
+
     const lastMsg = messages[messages.length - 1]
     const targetMessage = lastMsg && !lastMsg.is_user ? lastMsg : null
     const targetCharacterId = isGroupChat && typeof targetMessage?.extra?.character_id === 'string'
       ? targetMessage.extra.character_id
       : focusedPreviewCharacterId
     const targetSwipeId = targetMessage?.swipe_id ?? null
+    beginGenerationRequest(chatId, {
+      generationType: 'regenerate',
+      targetMessageId: targetMessage?.id ?? null,
+      targetSwipeId,
+    })
+    const generationRequest = captureGenerationRequest(chatId)
 
-    // Runtime admission must complete before deleting or staging any
-    // assistant row. Agentic regenerate keeps the exact message/swipe target;
-    // Response retains the legacy delete-and-placeholder presentation only
-    // after its preflight succeeds.
     setPendingRuntimeTarget({
       generationType: 'regenerate',
       messageId: targetMessage?.id ?? null,
       swipeId: targetSwipeId,
       targetCharacterId,
     })
-    // The existing generation control must become Stop before runtime
-    // resolution or HTTP admission, including the id-less decision window.
     beginStreaming(targetMessage?.id, 'regenerate')
 
     const presetId = getActivePresetForGeneration() || undefined
@@ -2531,6 +2539,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       swipe_id: targetSwipeId ?? undefined,
       target_character_id: targetCharacterId ?? undefined,
       retain_council: retainCouncilForRegens || undefined,
+      request_authority_id: generationRequest.requestAuthorityId ?? undefined,
     }
     if (feedback) {
       genOpts.regen_feedback = feedback
@@ -2538,89 +2547,15 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       genOpts.regen_feedback_format = regenFeedback.format
     }
 
-    let placeholderId: string | null = null
     try {
-      const prepared = await generateApi.preflightGeneration('/generate', genOpts, {
-        // A regeneration changes the target at the action boundary. Never
-        // consume a display token issued for the prior assistant turn or its
-        // runtime policy; resolve the selected mode and complete authority
-        // again for this exact regenerate target.
+      const res = await startGenerationWithRecovery('regenerate', genOpts, {
         forceRuntimeRefresh: true,
         forceResponse,
         signal: generationAbortController.signal,
       })
       if (
         generationNonceRef.current !== nonce
-        || !isGenerationRequestCurrentForChat(generationRequest)
-      ) return
-      const isAgentic = prepared.request.mode === 'agentic'
-
-      if (isAgentic) {
-        const res = await generateApi.dispatchPreparedGeneration('/generate', prepared, {
-          forceResponse,
-          signal: generationAbortController.signal,
-        }, intentEpoch)
-        if (
-          generationNonceRef.current !== nonce
-          || !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true)
-          || !acceptGenerationStarted(chatId, res.generationId)
-        ) return
-        startStreaming(res.generationId)
-        consumeOneshotGuides()
-        return
-      }
-
-      // Preserve Response mode's existing local replacement semantics, but
-      // only after runtime admission has succeeded.
-      const nextIndex = targetMessage?.index_in_chat ?? ((lastMsg?.index_in_chat ?? -1) + 1)
-      if (targetMessage) {
-        try {
-          await messagesApi.delete(chatId, targetMessage.id)
-          if (!isGenerationRequestCurrentForChat(generationRequest)) return
-          useStore.getState().removeMessage(targetMessage.id)
-        } catch (err) {
-          console.error('[InputArea] Failed to delete before regenerate:', err)
-        }
-      }
-
-      if (!isGenerationRequestCurrentForChat(generationRequest)) return
-      placeholderId = `__regen_placeholder_${Date.now()}`
-      const placeholder: import('@/types/api').Message = {
-        id: placeholderId,
-        chat_id: chatId,
-        index_in_chat: nextIndex,
-        is_user: false,
-        name: '',
-        content: '',
-        send_date: Math.floor(Date.now() / 1000),
-        swipe_id: 0,
-        swipes: [''],
-        swipe_dates: [Math.floor(Date.now() / 1000)],
-        extra: {},
-        parent_message_id: null,
-        branch_id: null,
-        created_at: Math.floor(Date.now() / 1000),
-      }
-      addMessage(placeholder)
-      useStore.getState().setRegeneratingMessageId(placeholderId)
-
-      const responsePrepared = {
-        ...prepared,
-        request: {
-          ...prepared.request,
-          message_id: undefined,
-          swipe_id: undefined,
-          target_character_id: isGroupChat ? targetCharacterId ?? undefined : undefined,
-        },
-      }
-      const res = await generateApi.dispatchPreparedGeneration('/generate', responsePrepared, {
-        forceResponse,
-        signal: generationAbortController.signal,
-      }, intentEpoch)
-      if (
-        generationNonceRef.current !== nonce
         || !isGenerationRequestCurrentForChat(generationRequest, res.generationId, true)
-        || !acceptGenerationStarted(chatId, res.generationId)
       ) return
       startStreaming(res.generationId)
       consumeOneshotGuides()
@@ -2629,7 +2564,6 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         generationNonceRef.current !== nonce
         || useStore.getState().activeChatId !== chatId
       ) return
-      if (placeholderId) useStore.getState().removeMessage(placeholderId)
       if (err instanceof DOMException && err.name === 'AbortError') return
       console.error('[InputArea] Failed to regenerate:', err)
       const msg = resolveGenerationErrorMessage(err, te('failedToRegenerate'), t)
@@ -2640,7 +2574,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         generationAbortControllerRef.current = null
       }
     }
-  }, [chatId, isGeneratingInChat, messages, isGroupChat, isTemporaryChat, focusedPreviewCharacterId, mpRoomId, activeGenerationId, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, regenFeedback.position, regenFeedback.format, retainCouncilForRegens, addMessage, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, t, te])
+  }, [chatId, isGeneratingInChat, messages, isGroupChat, isTemporaryChat, focusedPreviewCharacterId, mpRoomId, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, regenFeedback.position, regenFeedback.format, retainCouncilForRegens, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, t, te])
 
   const handleRegenerate = useCallback(() => {
     if (isGeneratingInChat) return
@@ -2817,7 +2751,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const handleStop = useCallback(async () => {
     if ((!isGeneratingInChat && !composerAbortInFlight) || isRoomPeer) return
     const knownRun = activeAgentRun
-    beginComposerAbort()
+    const stoppedAuthority = beginComposerAbort()
     try {
       if (knownRun) {
         pendingAgentStopRef.current = null
@@ -2844,7 +2778,11 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         try {
           // The chat id remains the backend fallback while an optimistic
           // generation has not handed its durable id to the client.
-          const result = await generateApi.stop(generationIdForChat || undefined, chatId)
+          const result = await generateApi.stop(
+            stoppedAuthority?.generationId || generationIdForChat || undefined,
+            chatId,
+            stoppedAuthority?.requestAuthorityId ?? undefined,
+          )
           recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status)
         } catch (err: unknown) {
           console.error('[InputArea] Failed to stop:', err)
@@ -2858,7 +2796,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
 
   const handleRetryStopLookup = useCallback(async () => {
     if (isRoomPeer) return
-    beginComposerAbort()
+    const stoppedAuthority = beginComposerAbort()
     try {
       await recoverAgentRuns(chatId, agentRunsApi, useStore)
       const recovered = selectActiveAgentRunForChat(
@@ -2873,7 +2811,11 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         })
         recordComposerStopResult(result.status)
       } else {
-        const result = await generateApi.stop(generationIdForChat || undefined, chatId)
+        const result = await generateApi.stop(
+          stoppedAuthority?.generationId || generationIdForChat || undefined,
+          chatId,
+          stoppedAuthority?.requestAuthorityId ?? undefined,
+        )
         recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status)
       }
     } catch (error) {
