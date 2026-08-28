@@ -41,6 +41,8 @@ All of the above are bundled when you opt into the secrets flow. Connection prof
 
 If any source secret cannot be enumerated or decrypted (legacy data, identity-key drift, or corruption), the key-bearing export fails as a whole. No partial ticket/archive pair is valid; repair the source secret and start a fresh export.
 
+The ticket is also bound to the exact image-generation private-data and encrypted-secret inventory present during preparation. If either changes before the archive snapshot starts, the download fails closed; discard the old ticket and start a fresh export so the pair describes one source state.
+
 If the archive download is interrupted or fails before completion, the server
 restores the owner-bound pending export for a retry (or wipes it if the
 bounded cache can no longer retain it). A successfully completed stream

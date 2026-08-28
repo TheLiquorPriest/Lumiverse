@@ -105,6 +105,7 @@ describe("user-data decryption tickets", () => {
         includeSecrets: true,
         smk: new Uint8Array([1, 2, 3]),
         secretKeys: ["key"],
+        privateDataFingerprint: "fingerprint",
         archiveFilename: `${id}.lvbak`,
         createdAt: Math.floor(Date.now() / 1000),
       })).toBe(true);
@@ -115,6 +116,7 @@ describe("user-data decryption tickets", () => {
       includeSecrets: true,
       smk: new Uint8Array([9, 9, 9]),
       secretKeys: ["key"],
+      privateDataFingerprint: "fingerprint",
       archiveFilename: "rejected.lvbak",
       createdAt: Math.floor(Date.now() / 1000),
     };
@@ -131,6 +133,7 @@ describe("user-data decryption tickets", () => {
       includeSecrets: true,
       smk: new Uint8Array([7, 7, 7]),
       secretKeys: ["key"],
+      privateDataFingerprint: "fingerprint",
       archiveFilename: "expired.lvbak",
       createdAt: Math.floor((Date.now() - PREPARE_CACHE_TTL_MS - 1_000) / 1000),
     };
@@ -146,6 +149,7 @@ describe("user-data decryption tickets", () => {
       includeSecrets: false,
       smk: null,
       secretKeys: [],
+      privateDataFingerprint: null,
       archiveFilename: "archive.lvbak",
       createdAt: Math.floor(Date.now() / 1000),
     };

@@ -792,6 +792,82 @@ describe("agent run inspection terminal persistence", () => {
     expect(inspection?.transcript).toHaveLength(0);
   });
 
+  test("advances lifecycle by public phase before status and retains render chronology", () => {
+    const chat = createChat(OWNER, { name: "inspection-phase-primary" });
+    const writer = createAgentInspectionWriter({
+      userId: OWNER,
+      chatId: chat.id,
+      attemptId: "phase-primary-attempt",
+      runId: "phase-primary-run",
+      turnSessionId: "phase-primary-turn",
+      generationId: "phase-primary-generation",
+      generationType: "normal",
+      hostCorrelationId: "phase-primary-host",
+      lifecycle: "PREPARE_COMMIT",
+      status: "waiting",
+      startedAt: 100,
+    });
+
+    expect(writer.record("milestone", {
+      id: "phase:completion-handoff",
+      kind: "milestone",
+      actor: "host",
+      recipient: "owner",
+      occurredAt: 100,
+      result: JSON.stringify({ workPhase: "PREPARE_COMMIT", workStatus: "waiting" }),
+    }, {
+      lifecycle: "PREPARE_COMMIT",
+      status: "waiting",
+      updatedAt: 100,
+    })).not.toBeNull();
+
+    const rendered = writer.record("milestone", {
+      id: "phase:render",
+      kind: "milestone",
+      actor: "host",
+      recipient: "owner",
+      occurredAt: 200,
+      result: JSON.stringify({ workPhase: "RENDER", workStatus: "running" }),
+    }, {
+      lifecycle: "RENDER",
+      status: "running",
+      updatedAt: 200,
+    });
+    expect(rendered?.lifecycle).toBe("RENDER");
+    expect(rendered?.status).toBe("running");
+    expect(rendered?.transcript.map(({ id }) => id)).toEqual([
+      "phase:completion-handoff",
+      "phase:render",
+    ]);
+    expect(rendered?.transcript[1]).toMatchObject({
+      id: "phase:render",
+      result: JSON.stringify({ workPhase: "RENDER", workStatus: "running" }),
+      correlation: { phase: "RENDER", hostSequence: 2 },
+    });
+
+    expect(writer.record("milestone", {
+      id: "phase:true-regression",
+      kind: "milestone",
+      actor: "host",
+      recipient: "owner",
+      occurredAt: 300,
+      result: JSON.stringify({ workPhase: "PREPARE_COMMIT", workStatus: "waiting" }),
+    }, {
+      lifecycle: "PREPARE_COMMIT",
+      status: "waiting",
+      updatedAt: 300,
+    })).toBeNull();
+
+    const retained = getAgentRunInspection(OWNER, "phase-primary-attempt", chat.id);
+    expect(retained?.lifecycle).toBe("RENDER");
+    expect(retained?.status).toBe("running");
+    expect(retained?.updatedAt).toBe(200);
+    expect(retained?.transcript.map(({ id }) => id)).toEqual([
+      "phase:completion-handoff",
+      "phase:render",
+    ]);
+  });
+
   test("rejects stale phase, status, and timestamp replays", () => {
     const chat = createChat(OWNER, { name: "inspection-monotonic" });
     expect(persistAgentRunInspection(inspectionInput(chat.id, {

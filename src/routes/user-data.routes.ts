@@ -18,6 +18,11 @@ import {
 } from "../services/user-data/secret-ticket.service";
 import { listSecretKeys, getSecret as readSecret } from "../services/secrets.service";
 import { migrateLegacyImageGenerationSecrets } from "../services/image-gen.service";
+import { withImageGenConnectionOwnerLock } from "../services/image-gen-connections.service";
+import {
+  fingerprintPrivateDataAndSecretInventory,
+  type PrivateDataSecretInventoryEntry,
+} from "../services/user-data/private-data";
 import {
   persistUploadedArchive,
   startImport,
@@ -40,6 +45,35 @@ import { EventType } from "../ws/events";
 import type { ArchiveManifest } from "../services/user-data/manifest";
 import { getDb } from "../db/connection";
 
+function currentPrivateDataFingerprint(userId: string): string {
+  const db = getDb();
+  const settingRow = db.query(
+    "SELECT value FROM settings WHERE key = 'imageGeneration' AND user_id = ?",
+  ).get(userId) as { value?: unknown } | null;
+  let imageGenerationSetting: unknown = undefined;
+  if (settingRow) {
+    if (typeof settingRow.value !== "string") {
+      throw new Error("imageGeneration settings value is not JSON text");
+    }
+    try {
+      imageGenerationSetting = JSON.parse(settingRow.value);
+    } catch {
+      throw new Error("imageGeneration settings value is malformed JSON");
+    }
+  }
+  const inventory = db.query(
+    "SELECT key, encrypted_value, iv, tag, updated_at FROM secrets WHERE user_id = ? ORDER BY key",
+  ).all(userId) as PrivateDataSecretInventoryEntry[];
+  return fingerprintPrivateDataAndSecretInventory(imageGenerationSetting, inventory);
+}
+
+function discardPreparedSecretMaterial(entry: ExportPrepareEntry): void {
+  try {
+    entry.smk?.fill(0);
+  } finally {
+    entry.smk = null;
+  }
+}
 
 const ARCHIVE_ERROR_MESSAGES: Record<string, string> = {
   not_zip: "archive is not a ZIP file",
@@ -295,32 +329,47 @@ app.post("/export/prepare", async (c) => {
   let ticket: NewTicket["ticket"] | null = null;
   let smk: Uint8Array | null = null;
   const secretKeys: string[] = [];
+  let privateDataFingerprint: string | null = null;
 
   if (includeSecrets) {
-    // A ticket-bound export is all-or-nothing. Enumerating or reading even
-    // one source secret failing must abort before a ticket is issued; binding
-    // only the successful subset would create a misleading backup.
-    const migratedSecretKeys = await migrateLegacyImageGenerationSecrets(userId);
-    const candidates = listSecretKeys(userId);
-    const candidateSet = new Set(candidates);
-    for (const key of migratedSecretKeys) {
-      if (!candidateSet.has(key)) {
-        throw new Error(`migrated image credential ${key} is missing from export enumeration`);
+    await withImageGenConnectionOwnerLock(userId, async () => {
+      // Migration, profile/default cleanup, secret enumeration and ticket
+      // binding are one same-owner critical section. Awaited encryption for a
+      // different account is not blocked.
+      const migratedSecretKeys = await migrateLegacyImageGenerationSecrets(userId);
+      const candidates = listSecretKeys(userId);
+      const candidateSet = new Set(candidates);
+      for (const key of migratedSecretKeys) {
+        if (!candidateSet.has(key)) {
+          throw new Error("migrated image credential " + key + " is missing from export enumeration");
+        }
       }
-    }
-    for (const key of candidates) {
-      if (c.req.raw.signal.aborted) {
-        throw c.req.raw.signal.reason ?? new Error("export cancelled");
+      for (const key of candidates) {
+        if (c.req.raw.signal.aborted) {
+          throw c.req.raw.signal.reason ?? new Error("export cancelled");
+        }
+        const value = await readSecret(userId, key);
+        if (value === null) throw new Error("secret " + key + " could not be read for export");
+        secretKeys.push(key);
       }
-      const value = await readSecret(userId, key);
-      if (value === null) {
-        throw new Error(`secret ${key} could not be read for export`);
+
+      const created = await createTicket(archiveId, secretKeys);
+      try {
+        const recheckedKeys = listSecretKeys(userId);
+        if (
+          recheckedKeys.length !== secretKeys.length
+          || recheckedKeys.some((key, index) => key !== secretKeys[index])
+        ) {
+          throw new Error("secret set changed during export preparation");
+        }
+        privateDataFingerprint = currentPrivateDataFingerprint(userId);
+        ticket = created.ticket;
+        smk = created.smk;
+      } catch (error) {
+        created.smk.fill(0);
+        throw error;
       }
-      secretKeys.push(key);
-    }
-    const created = await createTicket(archiveId, secretKeys);
-    ticket = created.ticket;
-    smk = created.smk;
+    });
   }
 
   const slug = lookupUserSlug(userId);
@@ -334,6 +383,7 @@ app.post("/export/prepare", async (c) => {
     includeSecrets,
     smk,
     secretKeys,
+    privateDataFingerprint,
     archiveFilename,
     createdAt: Math.floor(Date.now() / 1000),
   });
@@ -360,7 +410,7 @@ app.post("/export/prepare", async (c) => {
   });
 });
 
-app.get("/export/archive/:archiveId", (c) => {
+app.get("/export/archive/:archiveId", async (c) => {
   const userId = c.get("userId");
   const archiveId = c.req.param("archiveId");
   const entry = consumePrepareEntry(archiveId, userId);
@@ -369,6 +419,32 @@ app.get("/export/archive/:archiveId", (c) => {
       { error: "Export session not found. Call /export/prepare first." },
       404,
     );
+  }
+  if (entry.includeSecrets) {
+    let currentFingerprint: string;
+    try {
+      currentFingerprint = await withImageGenConnectionOwnerLock(
+        userId,
+        async () => currentPrivateDataFingerprint(userId),
+      );
+    } catch {
+      discardPreparedSecretMaterial(entry);
+      return c.json(
+        { error: "Export source changed after preparation. Prepare a new export.", code: "export_source_changed" },
+        409,
+      );
+    }
+    if (
+      !entry.smk
+      || !entry.privateDataFingerprint
+      || currentFingerprint !== entry.privateDataFingerprint
+    ) {
+      discardPreparedSecretMaterial(entry);
+      return c.json(
+        { error: "Export source changed after preparation. Prepare a new export.", code: "export_source_changed" },
+        409,
+      );
+    }
   }
   // Reuse the filename pinned at prepare time so the archive and its paired
   // ticket share the exact same HHMMSS suffix on disk.
@@ -384,7 +460,11 @@ app.get("/export/archive/:archiveId", (c) => {
       archiveId,
       secrets:
         entry.includeSecrets && entry.smk
-          ? { smk: entry.smk, secretKeys: entry.secretKeys }
+          ? {
+              smk: entry.smk,
+              secretKeys: entry.secretKeys,
+              privateDataFingerprint: entry.privateDataFingerprint!,
+            }
           : undefined,
     });
   } catch (error) {

@@ -1,3 +1,4 @@
+import { getDb } from "../db/connection";
 import { BUILTIN_TOOLS_MAP } from "./council/builtin-tools";
 import { getSidecarSettings } from "./sidecar-settings.service";
 import * as settingsSvc from "./settings.service";
@@ -1947,20 +1948,36 @@ async function ensureLegacyImageConnection(
  * ComfyUI/OpenRouter/etc. profile must never strand these legacy credentials.
  */
 export async function migrateLegacyImageGenerationSecrets(userId: string): Promise<string[]> {
-  const migratedSecretKeys = new Set<string>();
+  type ConnectionSnapshotRow = {
+    id: string;
+    user_id: string;
+    name: string;
+    provider: string;
+    api_url: string;
+    model: string;
+    is_default: number;
+    has_api_key: number;
+    default_parameters: string;
+    metadata: string;
+    created_at: number;
+    updated_at: number;
+  };
+  type SettingSnapshotRow = { value: string; updated_at: number };
 
-  // Secret encryption yields to other work. Compare the complete source
-  // value before cleanup and retry rather than deleting any concurrent edit.
-  for (let pass = 0; pass < 8; pass += 1) {
+  return imageGenConnSvc.withImageGenConnectionOwnerLock(userId, async () => {
+    const db = getDb();
+    const originalSettingRow = db.query(
+      "SELECT value, updated_at FROM settings WHERE key = ? AND user_id = ?",
+    ).get(IMAGE_SETTINGS_KEY, userId) as SettingSnapshotRow | null;
     const currentSetting = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY);
-    if (!currentSetting) return [...migratedSecretKeys].sort();
+    if (!currentSetting || !originalSettingRow) return [];
     const currentValue = currentSetting.value;
     if (!currentValue || typeof currentValue !== "object" || Array.isArray(currentValue)) {
       throw new Error("Legacy image credentials cannot be mapped from a non-object setting");
     }
 
     const inspection = inspectLegacyImageGenerationPrivateData(currentValue);
-    if (inspection.credentials.length === 0) return [...migratedSecretKeys].sort();
+    if (inspection.credentials.length === 0 && !inspection.changed) return [];
     if (
       !inspection.changed
       || !inspection.scrubbedValue
@@ -1975,9 +1992,7 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
       { apiKey: string; providerSettings: Record<string, any> }
     >();
     for (const credential of inspection.credentials) {
-      if (credential.apiKey === null || credential.apiKey === undefined || credential.apiKey === "") {
-        continue;
-      }
+      if (credential.apiKey === null || credential.apiKey === undefined || credential.apiKey === "") continue;
       if (typeof credential.apiKey !== "string") {
         throw new Error("Legacy " + credential.provider + " image API key has an unsupported non-empty value");
       }
@@ -1993,62 +2008,130 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
       }
     }
 
-    const currentSnapshot = JSON.stringify(currentValue);
-    const activeConnectionId = typeof currentValue.activeImageGenConnectionId === "string"
-      ? currentValue.activeImageGenConnectionId
-      : null;
-    const preserveCanonicalSelection = (
-      (activeConnectionId !== null && imageGenConnSvc.getConnection(userId, activeConnectionId) !== null)
-      || imageGenConnSvc.getDefaultConnection(userId) !== null
-    );
-    const selectedProvider: LegacyImageProvider | null = (
-      currentValue.provider === "nanogpt" || currentValue.provider === "novelai"
-    ) ? currentValue.provider : null;
-    const migratedConnections = new Map<LegacyImageProvider, ImageGenConnectionProfile>();
+    const originalConnections = db.query(
+      "SELECT * FROM image_gen_connections WHERE user_id = ? ORDER BY id",
+    ).all(userId) as ConnectionSnapshotRow[];
+    const originalConnectionIds = new Set(originalConnections.map((row) => row.id));
+    const migratedSecretKeys = new Set<string>();
+    let writtenSettingJson: string | null = null;
 
-    for (const [provider, credential] of credentials) {
-      const connection = await ensureLegacyImageConnection(
-        userId,
-        provider,
-        credential.providerSettings,
-        credential.apiKey,
-        !preserveCanonicalSelection && selectedProvider === provider,
+    try {
+      const activeConnectionId = typeof (currentValue as Record<string, unknown>).activeImageGenConnectionId === "string"
+        ? (currentValue as Record<string, string>).activeImageGenConnectionId
+        : null;
+      const preserveCanonicalSelection = (
+        (activeConnectionId !== null && imageGenConnSvc.getConnection(userId, activeConnectionId) !== null)
+        || imageGenConnSvc.getDefaultConnection(userId) !== null
       );
-      migratedConnections.set(provider, connection);
-      migratedSecretKeys.add(imageGenConnectionSecretKey(connection.id));
-    }
+      const configuredProvider = (currentValue as Record<string, unknown>).provider;
+      const selectedProvider: LegacyImageProvider | null = (
+        configuredProvider === "nanogpt" || configuredProvider === "novelai"
+      ) ? configuredProvider : null;
+      const migratedConnections = new Map<LegacyImageProvider, ImageGenConnectionProfile>();
 
-    const latestSetting = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY);
-    if (!latestSetting) {
-      throw new Error("Legacy image settings disappeared before migration cleanup");
-    }
-    if (JSON.stringify(latestSetting.value) !== currentSnapshot) continue;
+      for (const [provider, credential] of credentials) {
+        const connection = await ensureLegacyImageConnection(
+          userId,
+          provider,
+          credential.providerSettings,
+          credential.apiKey,
+          !preserveCanonicalSelection && selectedProvider === provider,
+        );
+        migratedConnections.set(provider, connection);
+        migratedSecretKeys.add(imageGenConnectionSecretKey(connection.id));
+      }
 
-    const selectedConnection = selectedProvider === null
-      ? null
-      : migratedConnections.get(selectedProvider) ?? null;
-    if (!preserveCanonicalSelection && selectedConnection) {
-      Object.defineProperty(inspection.scrubbedValue, "activeImageGenConnectionId", {
-        configurable: true,
-        enumerable: true,
-        value: selectedConnection.id,
-        writable: true,
-      });
-    }
-    settingsSvc.putSetting(userId, IMAGE_SETTINGS_KEY, inspection.scrubbedValue);
+      const latestSettingRow = db.query(
+        "SELECT value FROM settings WHERE key = ? AND user_id = ?",
+      ).get(IMAGE_SETTINGS_KEY, userId) as { value: string } | null;
+      if (latestSettingRow?.value !== originalSettingRow.value) {
+        throw new Error("Legacy image settings changed during migration");
+      }
 
-    const persistedValue = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY)?.value;
-    if (persistedValue === undefined) {
-      throw new Error("Legacy image settings disappeared after migration cleanup");
-    }
-    const residual = inspectLegacyImageGenerationPrivateData(persistedValue);
-    if (residual.credentials.length !== 0 || residual.changed) {
-      throw new Error("Legacy image API keys remain after durable migration cleanup");
-    }
-    return [...migratedSecretKeys].sort();
-  }
+      const selectedConnection = selectedProvider === null
+        ? null
+        : migratedConnections.get(selectedProvider) ?? null;
+      if (!preserveCanonicalSelection && selectedConnection) {
+        Object.defineProperty(inspection.scrubbedValue, "activeImageGenConnectionId", {
+          configurable: true,
+          enumerable: true,
+          value: selectedConnection.id,
+          writable: true,
+        });
+      }
+      writtenSettingJson = JSON.stringify(inspection.scrubbedValue);
+      settingsSvc.putSetting(userId, IMAGE_SETTINGS_KEY, inspection.scrubbedValue);
 
-  throw new Error("Legacy image settings changed repeatedly during migration");
+      const persistedValue = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY)?.value;
+      if (persistedValue === undefined) {
+        throw new Error("Legacy image settings disappeared after migration cleanup");
+      }
+      const residual = inspectLegacyImageGenerationPrivateData(persistedValue);
+      if (residual.credentials.length !== 0 || residual.changed) {
+        throw new Error("Legacy image API keys remain after durable migration cleanup");
+      }
+      return [...migratedSecretKeys].sort();
+    } catch (error) {
+      const rollbackErrors: unknown[] = [];
+      const currentConnections = db.query(
+        "SELECT id FROM image_gen_connections WHERE user_id = ?",
+      ).all(userId) as Array<{ id: string }>;
+      const createdConnectionIds = currentConnections
+        .map((row) => row.id)
+        .filter((id) => !originalConnectionIds.has(id));
+
+      for (const id of createdConnectionIds) {
+        try {
+          secretsSvc.deleteSecret(userId, imageGenConnectionSecretKey(id));
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      try {
+        db.transaction(() => {
+          for (const id of createdConnectionIds) {
+            db.query("DELETE FROM image_gen_connections WHERE id = ? AND user_id = ?").run(id, userId);
+          }
+          for (const row of originalConnections) {
+            const restored = db.query(
+              "UPDATE image_gen_connections SET name = ?, provider = ?, api_url = ?, model = ?, "
+                + "is_default = ?, has_api_key = ?, default_parameters = ?, metadata = ?, created_at = ?, updated_at = ? "
+                + "WHERE id = ? AND user_id = ?",
+            ).run(
+              row.name, row.provider, row.api_url, row.model, row.is_default, row.has_api_key,
+              row.default_parameters, row.metadata, row.created_at, row.updated_at, row.id, userId,
+            );
+            if (restored.changes !== 1) throw new Error("Original image connection disappeared during rollback");
+          }
+        })();
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+
+      if (writtenSettingJson !== null) {
+        try {
+          const currentRow = db.query(
+            "SELECT value FROM settings WHERE key = ? AND user_id = ?",
+          ).get(IMAGE_SETTINGS_KEY, userId) as { value: string } | null;
+          if (currentRow?.value === writtenSettingJson) {
+            db.query(
+              "UPDATE settings SET value = ?, updated_at = ? WHERE key = ? AND user_id = ?",
+            ).run(originalSettingRow.value, originalSettingRow.updated_at, IMAGE_SETTINGS_KEY, userId);
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackErrors],
+          "Legacy image credential migration failed and could not be fully rolled back",
+        );
+      }
+      throw error;
+    }
+  });
 }
 
 async function maybeAutoMigrate(userId: string, _settings: ImageGenSettings): Promise<void> {
@@ -2226,7 +2309,8 @@ export function exportImageGenConfig(
     }
   }
 
-  return out;
+  const inspection = inspectLegacyImageGenerationPrivateData(out);
+  return inspection.scrubbedValue as ImageGenConfigExport;
 }
 
 /**
@@ -2276,6 +2360,15 @@ export async function importImageGenConfig(
   }
   if (Number(payload.version) > IMAGE_GEN_EXPORT_VERSION) {
     throw new Error(`Unsupported export version ${payload.version}`);
+  }
+
+  // Dedicated config files never carry or persist plaintext provider data.
+  // Use the exact recursive inspector shared with full user-data portability,
+  // including its malformed/depth fail-closed behavior.
+  const privateDataInspection = inspectLegacyImageGenerationPrivateData(payload);
+  payload = privateDataInspection.scrubbedValue;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("Invalid import payload");
   }
 
   const errors: string[] = [];

@@ -689,7 +689,11 @@ describe("user-data export ZIP64 round-trip", () => {
           userId: USER_ID,
           includeVectors: false,
           producerVersion: "test",
-          secrets: { smk: new Uint8Array(32), secretKeys: ["missing-secret"] },
+          secrets: {
+            smk: new Uint8Array(32),
+            secretKeys: ["missing-secret"],
+            privateDataFingerprint: "unreached",
+          },
         }),
       ),
     ).rejects.toThrow();

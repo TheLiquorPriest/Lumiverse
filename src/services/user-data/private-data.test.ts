@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  fingerprintPrivateDataAndSecretInventory,
   inspectLegacyImageGenerationPrivateData,
   scrubLegacyImageGenerationSettingRow,
 } from "./private-data";
@@ -171,5 +172,77 @@ describe("legacy image-generation private data", () => {
     expect(() => scrub(JSON.stringify({ wrapper: escapedPrivateData }))).toThrow(
       "imageGeneration settings contain malformed JSON-encoded provider data",
     );
+  });
+
+  test("decodes double and triple encoded provider data while preserving each encoding layer", () => {
+    const providerPayload = JSON.stringify({ apiKey: "drop-repeated", model: "keep-model" });
+    const doubleEncoded = JSON.stringify(providerPayload);
+    const tripleEncoded = JSON.stringify(doubleEncoded);
+    const unrelatedDoubleEncoded = JSON.stringify(JSON.stringify({ apiKey: "retain-unrelated" }));
+
+    const result = parsedValue(scrub(JSON.stringify({
+      novelai: { doubleEncoded, tripleEncoded },
+      unrelatedDoubleEncoded,
+    })));
+
+    expect(JSON.parse(JSON.parse(result.novelai.doubleEncoded))).toEqual({ model: "keep-model" });
+    expect(JSON.parse(JSON.parse(JSON.parse(result.novelai.tripleEncoded)))).toEqual({ model: "keep-model" });
+    expect(result.unrelatedDoubleEncoded).toBe(unrelatedDoubleEncoded);
+  });
+
+  test("recognizes explicit provider fields and fails closed at an inner encoded layer", () => {
+    const scoped = inspectLegacyImageGenerationPrivateData({
+      provider: "nanogpt",
+      metadata: { apiKey: "drop-explicit", label: "keep" },
+    });
+    expect(JSON.parse(JSON.stringify(scoped.scrubbedValue))).toEqual({
+      provider: "nanogpt",
+      metadata: { label: "keep" },
+    });
+
+    const malformedInnerLayer = JSON.stringify('{"apiKey":"hidden"');
+    expect(() => inspectLegacyImageGenerationPrivateData({
+      provider: "novelai",
+      metadata: malformedInnerLayer,
+    })).toThrow("imageGeneration settings contain malformed JSON-encoded provider data");
+  });
+
+  test("fails closed at the privacy depth boundary without touching unrelated JSON-ish strings", () => {
+    let tooDeep: unknown = { apiKey: "drop-too-deep" };
+    for (let depth = 0; depth < 130; depth++) tooDeep = { nested: tooDeep };
+    expect(() => inspectLegacyImageGenerationPrivateData({ nanogpt: tooDeep })).toThrow(
+      "imageGeneration settings exceed the portable privacy depth limit",
+    );
+
+    const unrelated = '{"apiKey":"ordinary","broken":';
+    const exact = inspectLegacyImageGenerationPrivateData({ unrelated });
+    expect(exact.changed).toBe(false);
+    expect((exact.scrubbedValue as { unrelated: string }).unrelated).toBe(unrelated);
+  });
+
+  test("fingerprint is canonical and binds exact encrypted secret inventory", () => {
+    const firstInventory = [
+      { key: "b", encrypted_value: "cipher-b", iv: "iv-b", tag: "tag-b", updated_at: 2 },
+      { key: "a", encrypted_value: "cipher-a", iv: "iv-a", tag: "tag-a", updated_at: 1 },
+    ];
+    const first = fingerprintPrivateDataAndSecretInventory(
+      { provider: "novelai", nested: { beta: 2, alpha: 1 } },
+      firstInventory,
+    );
+    const reordered = fingerprintPrivateDataAndSecretInventory(
+      { nested: { alpha: 1, beta: 2 }, provider: "novelai" },
+      [...firstInventory].reverse(),
+    );
+    const changedCiphertext = fingerprintPrivateDataAndSecretInventory(
+      { nested: { alpha: 1, beta: 2 }, provider: "novelai" },
+      [{ ...firstInventory[1], encrypted_value: "changed" }, firstInventory[0]],
+    );
+
+    expect(reordered).toBe(first);
+    expect(changedCiphertext).not.toBe(first);
+    expect(() => fingerprintPrivateDataAndSecretInventory(
+      { novelai: { apiKey: "plaintext" } },
+      [],
+    )).toThrow("imageGeneration settings contain unmigrated private data");
   });
 });

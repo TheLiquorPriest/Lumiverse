@@ -41,7 +41,7 @@ import { getAgentRuntimeHostLimits } from "./agent-runtime-limits";
 import { appendPoolContent, createPoolEntry, getPoolEntry, removePoolEntry } from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
-import { waitForAgenticGeneration } from "./agentic-generation.service";
+import { runAgenticGeneration, waitForAgenticGeneration } from "./agentic-generation.service";
 import { startGeneration } from "./generate.service";
 import * as breakdownSvc from "./breakdown.service";
 import { createAgentInspectionWriter, getAgentRunInspection, type AgentInspectionWriterV1 } from "./agent-activity-runs.service";
@@ -584,6 +584,14 @@ function seed(): void {
     "INSERT INTO preset_agent_profiles (user_id, preset_id, profile_id, name, system_prompt, connection_ref_kind, slot_id, tool_ids, lore_scope, allow_main_delegation, failure_policy, stream_activity, max_output_tokens, timeout_ms, profile_revision, created_at, updated_at) VALUES (?, ?, 'delegate_alt', 'Delegate Alt', '', 'slot', 'delegate_alt', ?, 'active', 1, 'optional', 0, 128, 5000, 1, ?, ?)",
   ).run(USER_ID, AGENTIC_PRESET_ID, JSON.stringify(["chat_search_history"]), now, now);
 }
+
+function seedTransientAgenticChat(id: string): void {
+  const now = Date.now();
+  getDb().query(
+    "INSERT INTO chats (id, user_id, character_id, name, created_at, updated_at, metadata, generation_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(id, USER_ID, "character-coordinator", "Transient Agentic Coordinator Chat", now, now, "{}", ADMITTED_TARGET_REVISION);
+}
+
 function seedTargetMessage(id: string, chatId: string, revision: number): void {
   const now = Date.now();
   getDb().query(
@@ -716,6 +724,155 @@ describe("production agentic coordinator installation", () => {
       { phase: "COMMIT", status: "waiting", outcome: null },
       { phase: "COMMIT", status: "running", outcome: null },
     ]);
+  });
+
+  test("maps the retained Turn Session through public COMMIT during normal preparation", async () => {
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const chatId = `chat-retained-phase-order-${Date.now()}`;
+    seedTransientAgenticChat(chatId);
+    const target = { generationType: "normal" as const, revision: ADMITTED_TARGET_REVISION };
+    const signal = new AbortController().signal;
+    const decision = await deps.resolveRuntime!(
+      {
+        userId: USER_ID,
+        chatId,
+        connectionId: CONNECTION_ID,
+        presetId: AGENTIC_PRESET_ID,
+        generationType: "normal",
+        userInput: USER_INPUT,
+      },
+      target,
+      signal,
+    );
+    const executionId = `exec-retained-phase-order-${Date.now()}`;
+    let execution = await deps.createExecution!({
+      executionId,
+      userId: USER_ID,
+      chatId,
+      target,
+      decision,
+      signal,
+    });
+    const observed: Array<{ phase: string; status: string; outcome: string | null }> = [];
+
+    try {
+      for (const next of ["WORK", "COMPLETE", "RENDER", "PREPARE_COMMIT", "COMMITTING"] as const) {
+        const expected = execution.phase;
+        if (!expected) throw new Error("retained session execution phase is unavailable");
+        const transitioned = await deps.transitionExecution!(execution, expected, next);
+        if (!transitioned) throw new Error("retained session transition did not return its execution");
+        execution = transitioned;
+        const session = getDb().query(
+          "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+        ).get(USER_ID, executionId) as { phase: string; status: string; outcome: string | null } | null;
+        if (!session) throw new Error("retained Turn Session was not persisted");
+        observed.push(session);
+      }
+
+      expect(observed).toEqual([
+        { phase: "WORK", status: "running", outcome: null },
+        { phase: "PREPARE_COMMIT", status: "waiting", outcome: null },
+        { phase: "RENDER", status: "running", outcome: null },
+        { phase: "COMMIT", status: "waiting", outcome: null },
+        { phase: "COMMIT", status: "running", outcome: null },
+      ]);
+    } finally {
+      const durablePhase = await deps.readExecutionPhase!(execution);
+      if (durablePhase === "COMMITTING") {
+        const failed = await deps.transitionExecution!(
+          { ...execution, phase: durablePhase },
+          durablePhase,
+          "COMMIT_FAILED",
+          "test_cleanup",
+        );
+        if (failed) execution = failed;
+      } else if (
+        durablePhase === "ASSEMBLE"
+        || durablePhase === "WORK"
+        || durablePhase === "COMPLETE"
+        || durablePhase === "RENDER"
+        || durablePhase === "PREPARE_COMMIT"
+      ) {
+        const failed = await deps.transitionExecution!(
+          { ...execution, phase: durablePhase },
+          durablePhase,
+          "FAILED",
+          "test_cleanup",
+        );
+        if (failed) execution = failed;
+      }
+      deps.cleanup!({ execution, phase: execution.phase, status: "failed" } as never);
+    }
+  });
+
+  test("retains COMMIT/waiting when render preparation fails before terminal publication", async () => {
+    const deps = __testing.buildDependencies();
+    markAgenticRuntimeReady();
+    const chatId = `chat-preparation-failure-${Date.now()}`;
+    seedTransientAgenticChat(chatId);
+    scriptedWorkRound = 0;
+    const preparationBoundaries: Array<{ phase: string; status: string; outcome: string | null }> = [];
+    let preparationExecutionId = "";
+    const generationInput = {
+      userId: USER_ID,
+      chatId,
+      connectionId: CONNECTION_ID,
+      presetId: AGENTIC_PRESET_ID,
+      generationType: "normal" as const,
+      userInput: "forced preparation failure",
+      parameters: { max_tokens: 64 },
+    };
+    const admittedDecision = {
+      ...await deps.resolveRuntime!(
+        generationInput,
+        { generationType: "normal", revision: ADMITTED_TARGET_REVISION },
+        new AbortController().signal,
+      ),
+      mode: "agentic" as const,
+    };
+
+    const started = await runAgenticGeneration(generationInput, {
+      ...deps,
+      resolveRuntime: async () => admittedDecision,
+      buildAssemblySnapshot: async () => ({}) as never,
+      compileAssemblyPlan: async () => ({}) as never,
+      runWork: async () => ({ status: "completed" }),
+      render: async () => ({ content: "prepared render" }),
+      prepareRender: async ({ execution }) => {
+        preparationExecutionId = execution.id;
+        const boundary = getDb().query(
+          "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+        ).get(USER_ID, execution.id) as { phase: string; status: string; outcome: string | null } | null;
+        if (!boundary) throw new Error("missing retained preparation boundary");
+        preparationBoundaries.push(boundary);
+        throw new Error("forced_render_preparation_failure");
+      },
+    });
+    const settled = await waitForAgenticGeneration(started.generationId);
+
+    expect(preparationExecutionId).toBe(started.generationId);
+    expect(preparationBoundaries).toEqual([{
+      phase: "COMMIT",
+      status: "waiting",
+      outcome: null,
+    }]);
+    expect(settled).toMatchObject({ status: "failed", phase: "FAILED" });
+    expect(getDb().query(
+      "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
+    ).get(USER_ID, started.generationId)).toEqual({
+      phase: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+    });
+
+    const chronology = getAgentRunInspection(USER_ID, started.generationId, chatId)?.transcript ?? [];
+    const renderIndex = chronology.findIndex(({ id }) => id === `phase:${started.generationId}:RENDER`);
+    const preparationIndex = chronology.findIndex(({ id }) => id === `phase:${started.generationId}:PREPARE_COMMIT`);
+    expect(renderIndex).toBeGreaterThanOrEqual(0);
+    expect(preparationIndex).toBeGreaterThan(renderIndex);
+    expect(chronology[renderIndex]?.correlation.phase).toBe("RENDER");
+    expect(chronology[preparationIndex]?.correlation.phase).toBe("COMMIT");
   });
 
   test("records every child provider stream outcome exactly once without leaking secrets", async () => {
@@ -2349,10 +2506,22 @@ describe("production agentic coordinator installation", () => {
     )).toBe(true);
     const commitMilestoneId = `phase:${started.generationId}:COMMIT`;
     const prepareMilestoneId = `phase:${started.generationId}:PREPARE_COMMIT`;
+    const renderMilestoneId = `phase:${started.generationId}:RENDER`;
+    const completionMilestoneId = `phase:${started.generationId}:COMPLETE`;
     const liveChronology = workspaceInspection?.transcript ?? [];
+    const liveCompletionMilestone = liveChronology.find(({ id }) => id === completionMilestoneId);
+    const liveRenderMilestone = liveChronology.find(({ id }) => id === renderMilestoneId);
     const livePrepareMilestone = liveChronology.find(({ id }) => id === prepareMilestoneId);
     const liveCommitMilestones = liveChronology.filter(({ id }) => id === commitMilestoneId);
+    expect(liveCompletionMilestone?.correlation.phase).toBe("PREPARE_COMMIT");
+    expect(liveRenderMilestone?.correlation.phase).toBe("RENDER");
     expect(livePrepareMilestone?.correlation.phase).toBe("COMMIT");
+    expect(liveRenderMilestone!.correlation.hostSequence).toBeGreaterThan(
+      liveCompletionMilestone!.correlation.hostSequence,
+    );
+    expect(livePrepareMilestone!.correlation.hostSequence).toBeGreaterThan(
+      liveRenderMilestone!.correlation.hostSequence,
+    );
     expect(liveCommitMilestones).toHaveLength(1);
     expect(liveCommitMilestones[0]?.correlation.phase).toBe("COMMIT");
     expect(liveCommitMilestones[0]!.correlation.hostSequence).toBeGreaterThan(
@@ -2410,8 +2579,18 @@ describe("production agentic coordinator installation", () => {
     installAgenticGenerationCoordinator();
     const recoveredInspection = getAgentRunInspection(USER_ID, started.generationId, AGENTIC_CHAT_ID);
     const recoveredChronology = recoveredInspection?.transcript ?? [];
+    const recoveredCompletionMilestone = recoveredChronology.find(({ id }) => id === completionMilestoneId);
+    const recoveredRenderMilestone = recoveredChronology.find(({ id }) => id === renderMilestoneId);
     const recoveredPrepareMilestone = recoveredChronology.find(({ id }) => id === prepareMilestoneId);
     const recoveredCommitMilestones = recoveredChronology.filter(({ id }) => id === commitMilestoneId);
+    expect(recoveredCompletionMilestone?.correlation.phase).toBe("PREPARE_COMMIT");
+    expect(recoveredRenderMilestone?.correlation.phase).toBe("RENDER");
+    expect(recoveredRenderMilestone!.correlation.hostSequence).toBeGreaterThan(
+      recoveredCompletionMilestone!.correlation.hostSequence,
+    );
+    expect(recoveredPrepareMilestone!.correlation.hostSequence).toBeGreaterThan(
+      recoveredRenderMilestone!.correlation.hostSequence,
+    );
     expect(recoveredCommitMilestones).toHaveLength(1);
     expect(recoveredCommitMilestones[0]?.correlation.phase).toBe("COMMIT");
     expect(recoveredCommitMilestones[0]!.correlation.hostSequence).toBeGreaterThan(

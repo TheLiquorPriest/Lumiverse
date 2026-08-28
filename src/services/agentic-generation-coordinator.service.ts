@@ -5018,6 +5018,9 @@ function buildDependencies(): AgenticGenerationDependencies {
             case "COMPLETE":
               syncPersistentSession(execution.id, "PREPARE_COMMIT", "waiting");
               break;
+            case "PREPARE_COMMIT":
+              syncPersistentSession(execution.id, "COMMIT", "waiting");
+              break;
             case "COMMITTING":
               syncPersistentSession(execution.id, "COMMIT", "running");
               break;

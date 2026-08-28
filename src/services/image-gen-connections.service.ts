@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { getDb } from "../db/connection";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
@@ -19,6 +20,39 @@ import {
   sanitizeConnectionMetadata,
 } from "./connection-authority";
 
+const ownerMutationTails = new Map<string, Promise<void>>();
+const ownerMutationContext = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/**
+ * Serialize connection/profile/secret mutations for one authenticated owner.
+ * Different owners proceed independently, and nested service calls inherit
+ * the lock so update -> secret helpers cannot deadlock.
+ */
+export async function withImageGenConnectionOwnerLock<T>(
+  userId: string,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const inherited = ownerMutationContext.getStore();
+  if (inherited?.has(userId)) return callback();
+
+  const previous = ownerMutationTails.get(userId) ?? Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const tail = previous.then(() => current, () => current);
+  ownerMutationTails.set(userId, tail);
+  await previous.catch(() => undefined);
+
+  const held = new Set(inherited ?? []);
+  held.add(userId);
+  try {
+    return await ownerMutationContext.run(held, callback);
+  } finally {
+    releaseCurrent();
+    if (ownerMutationTails.get(userId) === tail) ownerMutationTails.delete(userId);
+  }
+}
 
 /** Secret key for an image gen connection's API key. */
 export function imageGenConnectionSecretKey(id: string): string {
@@ -143,6 +177,7 @@ export async function createConnection(
   userId: string,
   input: CreateImageGenConnectionInput
 ): Promise<ImageGenConnectionProfile> {
+  return withImageGenConnectionOwnerLock(userId, async () => {
   const id = crypto.randomUUID();
   const now = Math.floor(Date.now() / 1000);
   const secretKey = imageGenConnectionSecretKey(id);
@@ -199,6 +234,7 @@ export async function createConnection(
   const profile = getConnection(userId, id)!;
   eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id, profile: toPublicImageGenConnection(profile) }, userId);
   return profile;
+  });
 }
 
 export async function updateConnection(
@@ -206,6 +242,7 @@ export async function updateConnection(
   id: string,
   input: UpdateImageGenConnectionInput
 ): Promise<ImageGenConnectionProfile | null> {
+  return withImageGenConnectionOwnerLock(userId, async () => {
   const existing = getConnection(userId, id);
   if (!existing) return null;
   const reviewRequested = input.reviewed === true;
@@ -249,9 +286,11 @@ export async function updateConnection(
   const updated = getConnection(userId, id)!;
   eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id, profile: toPublicImageGenConnection(updated) }, userId);
   return updated;
+  });
 }
 
 export async function duplicateConnection(userId: string, id: string): Promise<ImageGenConnectionProfile | null> {
+  return withImageGenConnectionOwnerLock(userId, async () => {
   const existing = getConnection(userId, id);
   if (!existing) return null;
 
@@ -290,9 +329,11 @@ export async function duplicateConnection(userId: string, id: string): Promise<I
   const profile = getConnection(userId, newId)!;
   eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id: newId, profile: toPublicImageGenConnection(profile) }, userId);
   return profile;
+  });
 }
 
 export async function deleteConnection(userId: string, id: string): Promise<boolean> {
+  return withImageGenConnectionOwnerLock(userId, async () => {
   const deleted =
     getDb()
       .query("DELETE FROM image_gen_connections WHERE id = ? AND user_id = ?")
@@ -302,20 +343,25 @@ export async function deleteConnection(userId: string, id: string): Promise<bool
     eventBus.emit(EventType.IMAGE_GEN_CONNECTION_CHANGED, { id, deleted: true }, userId);
   }
   return deleted;
+  });
 }
 
 export async function setConnectionApiKey(userId: string, id: string, key: string): Promise<void> {
+  return withImageGenConnectionOwnerLock(userId, async () => {
   await secretsSvc.putSecret(userId, imageGenConnectionSecretKey(id), key);
   getDb()
     .query("UPDATE image_gen_connections SET has_api_key = 1, updated_at = ? WHERE id = ? AND user_id = ?")
     .run(Math.floor(Date.now() / 1000), id, userId);
+  });
 }
 
 export async function clearConnectionApiKey(userId: string, id: string): Promise<void> {
+  return withImageGenConnectionOwnerLock(userId, async () => {
   secretsSvc.deleteSecret(userId, imageGenConnectionSecretKey(id));
   getDb()
     .query("UPDATE image_gen_connections SET has_api_key = 0, updated_at = ? WHERE id = ? AND user_id = ?")
     .run(Math.floor(Date.now() / 1000), id, userId);
+  });
 }
 
 export async function testConnection(

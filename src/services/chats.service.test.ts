@@ -29,6 +29,7 @@ import {
   setGroupMemberAlternateFields,
   setSwipeScopedExtra,
   updateMessage,
+  waitForChatChunkMaintenance,
 } from "./chats.service";
 
 function initChatsTestDb(): void {
@@ -104,6 +105,31 @@ function initChatsTestDb(): void {
     updated_at INTEGER NOT NULL,
     UNIQUE(chat_id, settings_key)
   )`);
+
+  db.run(`CREATE TABLE settings (
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (key, user_id)
+  )`);
+
+  db.run(`CREATE TABLE chat_chunks (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    message_ids TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL DEFAULT 0
+  )`);
+
+  db.run(`CREATE TABLE secrets (
+    key TEXT NOT NULL,
+    encrypted_value TEXT NOT NULL,
+    iv TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    user_id TEXT,
+    PRIMARY KEY (key, user_id)
+  )`);
 }
 
 function seedCharacter(id: string, name: string): void {
@@ -164,7 +190,8 @@ beforeEach(() => {
   seedCharacter("c2", "Beta");
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await waitForChatChunkMaintenance();
   closeDatabase();
 });
 

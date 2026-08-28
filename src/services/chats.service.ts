@@ -24,7 +24,7 @@ import * as audioSvc from "./audio.service";
 import * as memoryCortex from "./memory-cortex";
 import * as regexScriptsSvc from "./regex-scripts.service";
 import { removePoolEntriesForChat } from "./generation-pool.service";
-import { invalidateChatMemoryCache, scheduleChatMemoryRefresh } from "./chat-memory-cache.service";
+import { invalidateChatMemoryCache, refreshChatMemoryCache } from "./chat-memory-cache.service";
 import { enqueueChatPipelineTask } from "./chat-pipeline-coordinator.service";
 import { getReasoningStripOptions } from "../utils/reasoning-strip";
 import { buildEnv, type MacroEnv } from "../macros";
@@ -4629,114 +4629,110 @@ async function updateChatChunksImpl(userId: string, chatId: string, newMessage: 
     vectorizationQueue.queueChunkVectorization(userId, chatId, lastChunk.id, 5);
   }
 
-  scheduleChatMemoryRefresh(userId, chatId, 8);
+  await refreshChatMemoryCache(userId, chatId);
 
   // Memory Cortex: process chunk for entity extraction, salience scoring, etc.
-  // Runs async and never blocks the main flow.
-  try {
-    const chunk = getDb().query("SELECT * FROM chat_chunks WHERE id = ?").get(chunkId) as any;
-    if (chunk) {
-      const cortexConfig = memoryCortex.getCortexConfig(userId);
-      if (!memoryCortex.isCortexEnabledForChat(cortexConfig, chat?.metadata)) return;
+  // The create-message hot path remains non-blocking because its maintenance
+  // promise is detached by that caller, but every deferred callback stays in
+  // the tracked maintenance graph so database teardown can await it.
+  const chunk = getDb().query("SELECT * FROM chat_chunks WHERE id = ?").get(chunkId) as any;
+  if (chunk) {
+    const cortexConfig = memoryCortex.getCortexConfig(userId);
+    if (!memoryCortex.isCortexEnabledForChat(cortexConfig, chat?.metadata)) return;
 
-      const characterNames: string[] = [];
-      const aliasMaps: Map<string, string>[] = [];
-      if (chat) {
-        const character = chat.character_id ? getCharacter(userId, chat.character_id) : null;
-        if (character) {
-          // Normalize sloppy bot-card names to extract the real character name
-          const normalized = memoryCortex.normalizeCharacterName(character.name);
-          characterNames.push(normalized);
-          aliasMaps.push(memoryCortex.extractDescriptionAliases(
-            normalized, character.description, character.personality, character.scenario,
-          ));
-        }
-        // Group chat: add all character names + extract aliases
-        if (chat.metadata?.character_ids) {
-          for (const cid of chat.metadata.character_ids as string[]) {
-            const c = getCharacter(userId, cid);
-            if (!c) continue;
-            const normalized = memoryCortex.normalizeCharacterName(c.name);
-            if (!characterNames.includes(normalized)) {
-              characterNames.push(normalized);
-              aliasMaps.push(memoryCortex.extractDescriptionAliases(normalized, c.description, c.personality));
-            }
+    const characterNames: string[] = [];
+    const aliasMaps: Map<string, string>[] = [];
+    if (chat) {
+      const character = chat.character_id ? getCharacter(userId, chat.character_id) : null;
+      if (character) {
+        // Normalize sloppy bot-card names to extract the real character name
+        const normalized = memoryCortex.normalizeCharacterName(character.name);
+        characterNames.push(normalized);
+        aliasMaps.push(memoryCortex.extractDescriptionAliases(
+          normalized, character.description, character.personality, character.scenario,
+        ));
+      }
+      // Group chat: add all character names + extract aliases
+      if (chat.metadata?.character_ids) {
+        for (const cid of chat.metadata.character_ids as string[]) {
+          const c = getCharacter(userId, cid);
+          if (!c) continue;
+          const normalized = memoryCortex.normalizeCharacterName(c.name);
+          if (!characterNames.includes(normalized)) {
+            characterNames.push(normalized);
+            aliasMaps.push(memoryCortex.extractDescriptionAliases(normalized, c.description, c.personality));
           }
         }
-        // User's persona
-        try {
-          const { resolvePersonaOrDefault } = require("./personas.service");
-          const persona = resolvePersonaOrDefault(userId);
-          if (persona?.name) {
-            const normalized = memoryCortex.normalizeCharacterName(persona.name);
-            if (!characterNames.includes(normalized)) {
-              characterNames.push(normalized);
-              aliasMaps.push(memoryCortex.extractDescriptionAliases(normalized, persona.description));
-            }
+      }
+      // User's persona
+      try {
+        const { resolvePersonaOrDefault } = require("./personas.service");
+        const persona = resolvePersonaOrDefault(userId);
+        if (persona?.name) {
+          const normalized = memoryCortex.normalizeCharacterName(persona.name);
+          if (!characterNames.includes(normalized)) {
+            characterNames.push(normalized);
+            aliasMaps.push(memoryCortex.extractDescriptionAliases(normalized, persona.description));
           }
-        } catch { /* non-fatal */ }
-      }
-      // Merge aliases with collision detection (safe for group chats)
-      const descriptionAliases = memoryCortex.mergeDescriptionAliases(...aliasMaps);
-
-      // Resolve sidecar connection for Tier 2 features (LLM-assisted extraction).
-      let sidecarConnectionId: string | undefined;
-
-      // Resolve the provider from the connection profile for structured output injection
-      let sidecarProvider: string | null = null;
-      if (memoryCortex.shouldUseCortexSidecar(cortexConfig)) {
-        const { resolveConnection } = require("./connections.service");
-        const { getProvider } = require("../llm/registry");
-        const requestedSidecarConnectionId = cortexConfig.sidecar.connectionProfileId || undefined;
-        const conn = requestedSidecarConnectionId ? resolveConnection(userId, requestedSidecarConnectionId) : null;
-        const provider = conn ? getProvider(conn.provider) : null;
-        const apiKeyRequired = provider?.capabilities.apiKeyRequired ?? true;
-        if (conn && provider && (!apiKeyRequired || conn.has_api_key)) {
-          sidecarConnectionId = conn.id;
-          sidecarProvider = conn.provider;
         }
-      }
-
-      // Build a generateRaw adapter. Injects structured output params (response_format /
-      // responseMimeType + responseSchema) based on the provider so the LLM returns
-      // valid JSON natively instead of relying on prompt engineering.
-      const generateRawFn = sidecarConnectionId
-        ? memoryCortex.createCortexSidecarGenerateRawAdapter({
-            userId,
-            sidecarProvider: sidecarProvider!,
-            cortexConfig,
-          })
-        : undefined;
-
-      const chunkPayload = {
-        chunkId: chunk.id,
-        chatId,
-        userId,
-        characterId,
-        content: chunk.content,
-        messageIds: JSON.parse(chunk.message_ids || "[]"),
-        startMessageIndex: 0,
-        endMessageIndex: 0,
-        createdAt: chunk.created_at,
-      };
-
-      // Kick the cortex pass onto the next macrotask so chat creation and
-      // MESSAGE_SENT delivery complete before CPU-bound heuristics begin.
-      setTimeout(() => {
-        memoryCortex.scheduleProcessChunk(
-          chunkPayload,
-          characterNames,
-          generateRawFn,
-          sidecarConnectionId,
-          descriptionAliases.size > 0 ? descriptionAliases : undefined,
-        ).catch(err => {
-          console.warn("[chats] Memory cortex processing failed:", err);
-        });
-      }, 0);
+      } catch { /* non-fatal */ }
     }
-  } catch (err) {
-    // Non-fatal: cortex processing should never break chunk creation
-    console.warn("[chats] Memory cortex hook error:", err);
+    // Merge aliases with collision detection (safe for group chats)
+    const descriptionAliases = memoryCortex.mergeDescriptionAliases(...aliasMaps);
+
+    // Resolve sidecar connection for Tier 2 features (LLM-assisted extraction).
+    let sidecarConnectionId: string | undefined;
+
+    // Resolve the provider from the connection profile for structured output injection
+    let sidecarProvider: string | null = null;
+    if (memoryCortex.shouldUseCortexSidecar(cortexConfig)) {
+      const { resolveConnection } = require("./connections.service");
+      const { getProvider } = require("../llm/registry");
+      const requestedSidecarConnectionId = cortexConfig.sidecar.connectionProfileId || undefined;
+      const conn = requestedSidecarConnectionId ? resolveConnection(userId, requestedSidecarConnectionId) : null;
+      const provider = conn ? getProvider(conn.provider) : null;
+      const apiKeyRequired = provider?.capabilities.apiKeyRequired ?? true;
+      if (conn && provider && (!apiKeyRequired || conn.has_api_key)) {
+        sidecarConnectionId = conn.id;
+        sidecarProvider = conn.provider;
+      }
+    }
+
+    // Build a generateRaw adapter. Injects structured output params (response_format /
+    // responseMimeType + responseSchema) based on the provider so the LLM returns
+    // valid JSON natively instead of relying on prompt engineering.
+    const generateRawFn = sidecarConnectionId
+      ? memoryCortex.createCortexSidecarGenerateRawAdapter({
+          userId,
+          sidecarProvider: sidecarProvider!,
+          cortexConfig,
+        })
+      : undefined;
+
+    const chunkPayload = {
+      chunkId: chunk.id,
+      chatId,
+      userId,
+      characterId,
+      content: chunk.content,
+      messageIds: JSON.parse(chunk.message_ids || "[]"),
+      startMessageIndex: 0,
+      endMessageIndex: 0,
+      createdAt: chunk.created_at,
+    };
+
+    // Kick the cortex pass onto the next macrotask so chat creation and
+    // MESSAGE_SENT delivery complete before CPU-bound heuristics begin. Await
+    // both the timer and the queued cortex task inside the maintenance promise;
+    // callers that need quiescence must never race either callback.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await memoryCortex.scheduleProcessChunk(
+      chunkPayload,
+      characterNames,
+      generateRawFn,
+      sidecarConnectionId,
+      descriptionAliases.size > 0 ? descriptionAliases : undefined,
+    );
   }
 }
 
@@ -4778,19 +4774,17 @@ export function getVectorizationStatus(userId: string, chatId: string): {
  * Called after chunks are built/rebuilt so we can detect staleness later.
  */
 async function stampChatMemoryHash(userId: string, chatId: string): Promise<void> {
-  try {
-    const hash = await getCurrentChatMemoryHash(userId);
-    if (!hash) return;
+  const hash = await getCurrentChatMemoryHash(userId);
+  if (!hash) return;
 
-    const chat = getChat(userId, chatId);
-    if (!chat) return;
-    const metadata = { ...chat.metadata, ltcm_config_hash: hash };
-    const db = getDb();
-    db.transaction(() => {
-      db.query("UPDATE chats SET metadata = ? WHERE id = ? AND user_id = ?").run(JSON.stringify(metadata), chatId, userId);
-      bumpChatGenerationRevision(db, chatId, userId);
-    })();
-  } catch { /* non-fatal */ }
+  const chat = getChat(userId, chatId);
+  if (!chat) return;
+  const metadata = { ...chat.metadata, ltcm_config_hash: hash };
+  const db = getDb();
+  db.transaction(() => {
+    db.query("UPDATE chats SET metadata = ? WHERE id = ? AND user_id = ?").run(JSON.stringify(metadata), chatId, userId);
+    bumpChatGenerationRevision(db, chatId, userId);
+  })();
 }
 
 export async function getCurrentChatMemoryHash(userId: string): Promise<string | null> {
@@ -4911,12 +4905,21 @@ function trackChatChunkMaintenance(chatId: string, task: Promise<void>): Promise
  * drains all chats, which is required before replacing the process database.
  */
 export async function waitForChatChunkMaintenance(chatId?: string): Promise<void> {
+  const failures: unknown[] = [];
   while (true) {
     const tasks = chatId === undefined
       ? [..._chatChunkMaintenanceInflight.values()].flatMap(current => [...current])
       : [...(_chatChunkMaintenanceInflight.get(chatId) ?? [])];
-    if (tasks.length === 0) return;
-    await Promise.allSettled(tasks);
+    if (tasks.length === 0) break;
+    const results = await Promise.allSettled(tasks);
+    for (const result of results) {
+      if (result.status === "rejected") failures.push(result.reason);
+    }
+  }
+
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, "Chat chunk maintenance failed");
   }
 }
 
@@ -5068,8 +5071,8 @@ async function _rebuildChatChunksBody(userId: string, chatId: string): Promise<v
   await chunkAndPersistMessages(userId, chatId, messages, chatMemSettings, salienceByContent);
 
   // Stamp the config hash so we can detect staleness later
-  stampChatMemoryHash(userId, chatId);
-  scheduleChatMemoryRefresh(userId, chatId, 9);
+  await stampChatMemoryHash(userId, chatId);
+  await refreshChatMemoryCache(userId, chatId);
 
   console.info(`[chats] Rebuilt chunks for chat ${chatId}`);
 }
@@ -5233,8 +5236,8 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   getDb().query(`DELETE FROM chat_chunks WHERE id IN (${placeholders})`).run(...discardedChunkIds);
 
   if (messagesToChunk.length === 0) {
-    stampChatMemoryHash(userId, chatId);
-    scheduleChatMemoryRefresh(userId, chatId, 9);
+    await stampChatMemoryHash(userId, chatId);
+    await refreshChatMemoryCache(userId, chatId);
     console.info(`[chats] Surgically rebuilt chat ${chatId}: dropped ${discardedChunkIds.length} trailing chunks (no replacement messages)`);
     return;
   }
@@ -5245,8 +5248,8 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   );
   await chunkAndPersistMessages(userId, chatId, messagesToChunk, chatMemSettings, salienceByContent);
 
-  stampChatMemoryHash(userId, chatId);
-  scheduleChatMemoryRefresh(userId, chatId, 9);
+  await stampChatMemoryHash(userId, chatId);
+  await refreshChatMemoryCache(userId, chatId);
 
   console.info(`[chats] Surgically rebuilt chat ${chatId}: ${discardedChunkIds.length} chunks → re-chunked ${messagesToChunk.length} messages (${fromIdx} chunks preserved)`);
 }

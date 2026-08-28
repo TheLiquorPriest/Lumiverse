@@ -381,6 +381,8 @@ export interface ExportPrepareEntry {
   includeSecrets: boolean;
   smk: Uint8Array | null;
   secretKeys: readonly string[];
+  /** Exact private-data and encrypted-secret inventory captured at prepare. */
+  privateDataFingerprint: string | null;
   /**
    * Filename pinned at prepare time. The archive endpoint reuses this so
    * the archive and its paired ticket file share the exact same HHMMSS

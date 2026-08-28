@@ -17,7 +17,16 @@ export interface LegacyImagePrivateDataInspection {
 }
 
 const MAX_PRIVATE_DATA_DEPTH = 128;
-const PRIVATE_JSON_MARKER = /\b(?:nanogpt|novelai|apiKey)\b/;
+const PRIVATE_PROVIDER_JSON_MARKER = /\b(?:nanogpt|novelai)\b/;
+const PRIVATE_DATA_FINGERPRINT_DOMAIN = "lumiverse-private-data-and-secret-inventory-v1";
+
+export interface PrivateDataSecretInventoryEntry {
+  key: string;
+  encrypted_value: string;
+  iv: string;
+  tag: string;
+  updated_at: number;
+}
 
 interface ScrubResult {
   value: unknown;
@@ -53,19 +62,18 @@ function copyEntriesBefore(
   }
 }
 
-function looksLikeJsonContainer(value: string): boolean {
+function looksLikeJsonContainer(value: string, allowEncodedString: boolean): boolean {
   const first = value.trimStart()[0];
-  return first === "{" || first === "[";
+  return first === "{" || first === "[" || (allowEncodedString && first === '"');
 }
 
-function looksLikeJsonStructure(value: string): boolean {
-  const trimmed = value.trimStart();
-  const firstValueCharacter = trimmed.slice(1).trimStart()[0];
-  if (trimmed[0] === "{") {
-    return firstValueCharacter === '"' || firstValueCharacter === "}";
-  }
-  return trimmed[0] === "["
-    && '"{[-0123456789tfn]'.includes(firstValueCharacter);
+function classifyJsonMarkers(value: string): string {
+  // Decode JSON Unicode escapes only for classification. The original string
+  // remains byte-for-byte intact whenever no supported provider data exists.
+  return value.replace(
+    /\\u([0-9a-fA-F]{4})/g,
+    (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)),
+  );
 }
 
 function scrubEncodedProviderContainer(
@@ -75,29 +83,23 @@ function scrubEncodedProviderContainer(
   depth: number,
   credentials: LegacyImageProviderCredential[],
 ): ScrubResult {
-  if (!looksLikeJsonContainer(value)) return { value, changed: false };
+  const classified = classifyJsonMarkers(value);
+  const providerMarker = PRIVATE_PROVIDER_JSON_MARKER.test(classified);
+  if (!looksLikeJsonContainer(value, provider !== null || providerMarker)) {
+    return { value, changed: false };
+  }
+  // Outside a known provider scope, opaque JSON matters only when it can
+  // contain a supported provider key. This leaves unrelated strings entirely
+  // untouched and spends decoder depth only on credential-bearing candidates.
+  if (provider === null && !providerMarker) return { value, changed: false };
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
   } catch {
-    // Decode JSON Unicode escapes only for classification. The content stays
-    // opaque, but an attacker cannot hide a truncated provider/apiKey marker
-    // from the fail-closed decision with \uXXXX spelling.
-    const classified = value.replace(
-      /\\u([0-9a-fA-F]{4})/g,
-      (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)),
+    throw new Error(
+      "imageGeneration settings contain malformed JSON-encoded provider data",
     );
-    if (
-      provider !== null
-      || PRIVATE_JSON_MARKER.test(classified)
-      || looksLikeJsonStructure(value)
-    ) {
-      throw new Error(
-        "imageGeneration settings contain malformed JSON-encoded provider data",
-      );
-    }
-    return { value, changed: false };
   }
 
   const scrubbed = scrubLegacyProviderSecrets(
@@ -155,16 +157,22 @@ function scrubLegacyProviderSecrets(
   }
 
   const objectValue = value as Record<string, unknown>;
-  const scopedProviderSettings = provider === null
+  const explicitProvider = typeof objectValue.provider === "string"
+    ? legacyProviderForKey(objectValue.provider)
+    : null;
+  const effectiveProvider = explicitProvider ?? provider;
+  const scopedProviderSettings = effectiveProvider === null
     ? null
-    : providerSettings ?? objectValue;
+    : explicitProvider === null
+      ? providerSettings ?? objectValue
+      : objectValue;
   const entries = Object.entries(objectValue);
   let out: Record<string, unknown> | null = null;
   for (let index = 0; index < entries.length; index++) {
     const [key, entry] = entries[index];
-    if (provider !== null && key === "apiKey") {
+    if (effectiveProvider !== null && key === "apiKey") {
       credentials.push({
-        provider,
+        provider: effectiveProvider,
         apiKey: entry,
         providerSettings: scopedProviderSettings ?? objectValue,
       });
@@ -178,7 +186,7 @@ function scrubLegacyProviderSecrets(
     const nestedProvider = legacyProviderForKey(key);
     const scrubbed = scrubLegacyProviderSecrets(
       entry,
-      nestedProvider ?? provider,
+      nestedProvider ?? effectiveProvider,
       nestedProvider === null ? scopedProviderSettings : null,
       depth + 1,
       credentials,
@@ -209,6 +217,73 @@ export function inspectLegacyImageGenerationPrivateData(
     credentials,
     changed: scrubbed.changed,
   };
+}
+
+function canonicalPrivateJson(value: unknown, depth = 0): string {
+  if (depth > MAX_PRIVATE_DATA_DEPTH) {
+    throw new Error("private data fingerprint exceeds the portable privacy depth limit");
+  }
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("private data fingerprint contains a non-JSON number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return "[" + value.map((entry) => canonicalPrivateJson(entry, depth + 1)).join(",") + "]";
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error("private data fingerprint contains a non-JSON value");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("private data fingerprint contains a non-JSON value");
+  }
+  const record = value as Record<string, unknown>;
+  return "{" + Object.keys(record).sort().map((key) => {
+    const entry = record[key];
+    if (entry === undefined) throw new Error("private data fingerprint contains undefined");
+    return JSON.stringify(key) + ":" + canonicalPrivateJson(entry, depth + 1);
+  }).join(",") + "}";
+}
+
+/**
+ * Bind a prepared ticket to the exact safe image-generation projection and
+ * encrypted secret-row inventory. Ciphertext identity detects replacements
+ * without exposing a plaintext-derived digest to the ticket holder.
+ */
+export function fingerprintPrivateDataAndSecretInventory(
+  imageGenerationSetting: unknown,
+  secretInventory: readonly PrivateDataSecretInventoryEntry[],
+): string {
+  const inspection = inspectLegacyImageGenerationPrivateData(imageGenerationSetting);
+  if (inspection.changed || inspection.credentials.length > 0) {
+    throw new Error("imageGeneration settings contain unmigrated private data");
+  }
+  const seen = new Set<string>();
+  const inventory = [...secretInventory].sort((a, b) => a.key.localeCompare(b.key)).map((entry) => {
+    if (
+      typeof entry.key !== "string" || entry.key.length === 0 || seen.has(entry.key)
+      || typeof entry.encrypted_value !== "string"
+      || typeof entry.iv !== "string"
+      || typeof entry.tag !== "string"
+      || !Number.isSafeInteger(entry.updated_at)
+    ) {
+      throw new Error("secret inventory is malformed or contains duplicate keys");
+    }
+    seen.add(entry.key);
+    return entry;
+  });
+  const payload = canonicalPrivateJson({
+    imageGenerationPresent: imageGenerationSetting !== undefined,
+    imageGeneration: imageGenerationSetting ?? null,
+    secretInventory: inventory,
+  });
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(PRIVATE_DATA_FINGERPRINT_DOMAIN);
+  hasher.update("\0");
+  hasher.update(payload);
+  return hasher.digest("hex");
 }
 
 /**

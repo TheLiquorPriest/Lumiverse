@@ -39,7 +39,11 @@ import {
   getArchiveVectorTables,
   buildArchiveOwnerPredicate,
 } from "./table-registry";
-import { scrubLegacyImageGenerationSettingRow } from "./private-data";
+import {
+  fingerprintPrivateDataAndSecretInventory,
+  scrubLegacyImageGenerationSettingRow,
+  type PrivateDataSecretInventoryEntry,
+} from "./private-data";
 import { scrubPresetMetadata } from "../agent-config-portability.service";
 import {
   cleanupFrozenStaging,
@@ -218,6 +222,7 @@ export function reconcileStaleExportStaging(now = Date.now()): ExportStagingReco
 export interface ExportSecretsContext {
   smk: Uint8Array;
   secretKeys: readonly string[];
+  privateDataFingerprint: string;
 }
 
 export interface ExportOptions {
@@ -1581,6 +1586,28 @@ function assertSnapshotSecretSelection(snapshotDb: any, userId: string, selected
   }
 }
 
+function snapshotPrivateDataFingerprint(snapshotDb: any, userId: string): string {
+  const settingRow = snapshotDb
+    .query("SELECT value FROM settings WHERE key = 'imageGeneration' AND user_id = ?")
+    .get(userId) as { value?: unknown } | null;
+  let imageGenerationSetting: unknown = undefined;
+  if (settingRow) {
+    if (typeof settingRow.value !== "string") {
+      throw new Error("imageGeneration settings value is not JSON text");
+    }
+    try {
+      imageGenerationSetting = JSON.parse(settingRow.value);
+    } catch {
+      throw new Error("imageGeneration settings value is malformed JSON");
+    }
+  }
+  const inventory = snapshotDb
+    .query(
+      "SELECT key, encrypted_value, iv, tag, updated_at FROM secrets WHERE user_id = ? ORDER BY key",
+    )
+    .all(userId) as PrivateDataSecretInventoryEntry[];
+  return fingerprintPrivateDataAndSecretInventory(imageGenerationSetting, inventory);
+}
 
 const LANCEDB_DUMP_TABLES = getArchiveVectorTables();
 
@@ -1951,6 +1978,10 @@ async function runExport(
       snapshot = await openUserDataReadSnapshot(userId);
       if (opts.secrets) {
         assertSnapshotSecretSelection(snapshot.db, userId, opts.secrets.secretKeys);
+        const actualFingerprint = snapshotPrivateDataFingerprint(snapshot.db, userId);
+        if (actualFingerprint !== opts.secrets.privateDataFingerprint) {
+          throw new Error("private data changed between export preparation and snapshot");
+        }
       }
       const pending = await collectFileRefs(snapshot.db, specs, userId, signal);
       // Notification sounds are the sole descriptor-only class. All other

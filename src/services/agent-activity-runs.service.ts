@@ -440,6 +440,20 @@ const INSPECTION_STATUS_RANK: Readonly<Record<string, number>> = {
   cancelling: 3,
   terminal: 4,
 };
+
+function inspectionLifecycleTupleRegresses(
+  nextLifecycle: string,
+  nextStatus: string,
+  currentLifecycle: string,
+  currentStatus: string,
+): boolean {
+  const phaseDelta = (INSPECTION_PHASE_RANK[nextLifecycle] ?? -1)
+    - (INSPECTION_PHASE_RANK[currentLifecycle] ?? -1);
+  if (phaseDelta !== 0) return phaseDelta < 0;
+  return (INSPECTION_STATUS_RANK[nextStatus] ?? -1)
+    < (INSPECTION_STATUS_RANK[currentStatus] ?? -1);
+}
+
 const INSPECTION_REASONS = new Set([
   "none", "user_stop", "deadline", "provider_failure", "tool_failure", "required_work_failure",
   "budget_exhausted", "invalid_input", "stale_input", "unavailable", "needs_attention",
@@ -3061,8 +3075,12 @@ export function persistAgentRunInspectionInTransaction(
       || (input.previousAttemptId !== undefined && previousAttemptId !== existing.previous_attempt_id)
     ) return null;
     if (
-      (INSPECTION_PHASE_RANK[storedLifecycle] ?? -1) < (INSPECTION_PHASE_RANK[existing.lifecycle] ?? -1)
-      || (INSPECTION_STATUS_RANK[storedStatus] ?? -1) < (INSPECTION_STATUS_RANK[existing.status] ?? -1)
+      inspectionLifecycleTupleRegresses(
+        storedLifecycle,
+        storedStatus,
+        existing.lifecycle,
+        existing.status,
+      )
       || requestedUpdatedAt < existing.updated_at
     ) return null;
     if (

@@ -11,7 +11,7 @@ import { env } from "../env";
 import * as imageGenConnSvc from "../services/image-gen-connections.service";
 import { imageGenConnectionSecretKey } from "../services/image-gen-connections.service";
 import * as settingsSvc from "../services/settings.service";
-import { getSecret, listSecretKeys } from "../services/secrets.service";
+import { getSecret, listSecretKeys, putSecret } from "../services/secrets.service";
 import {
   startImport,
   submitTicket,
@@ -500,5 +500,107 @@ describe("legacy image credentials at user-data ticket preparation", () => {
     });
     expect(listSecretKeys(SOURCE_USER)).toEqual([]);
     expect(settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value).toEqual(settingsBefore);
+  });
+
+  test("later-provider failure compensates the entire multi-provider migration", async () => {
+    seedLegacySettings(SOURCE_USER);
+    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+    getDb().run(
+      "CREATE TRIGGER reject_second_legacy_provider "
+        + "BEFORE INSERT ON image_gen_connections "
+        + "WHEN NEW.provider = 'novelai' "
+        + "BEGIN SELECT RAISE(ABORT, 'forced later-provider failure'); END",
+    );
+
+    const response = await app.request(
+      "http://localhost/api/v1/user-data/export/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-user": SOURCE_USER },
+        body: JSON.stringify({ includeSecrets: true, includeVectors: false }),
+      },
+    );
+
+    expect(response.status).toBe(500);
+    expect(imageGenConnSvc.listConnections(SOURCE_USER, { limit: 20, offset: 0 }).total).toBe(0);
+    expect(listSecretKeys(SOURCE_USER)).toEqual([]);
+    expect(settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value).toEqual(settingsBefore);
+    expect(prepareCacheSize()).toBe(0);
+  });
+
+  test("connection mutation serialization is same-owner keyed rather than global", async () => {
+    let releaseFirst!: () => void;
+    let signalFirstEntered!: () => void;
+    const firstEntered = new Promise<void>((resolve) => { signalFirstEntered = resolve; });
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let sameOwnerEntered = false;
+    let otherOwnerEntered = false;
+
+    const first = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      signalFirstEntered();
+      await firstGate;
+    });
+    await firstEntered;
+    const sameOwner = imageGenConnSvc.withImageGenConnectionOwnerLock(SOURCE_USER, async () => {
+      sameOwnerEntered = true;
+    });
+    const otherOwner = imageGenConnSvc.withImageGenConnectionOwnerLock(IMPORT_USER, async () => {
+      otherOwnerEntered = true;
+    });
+    await otherOwner;
+
+    expect(otherOwnerEntered).toBe(true);
+    expect(sameOwnerEntered).toBe(false);
+    releaseFirst();
+    await Promise.all([first, sameOwner]);
+    expect(sameOwnerEntered).toBe(true);
+  });
+
+  test("archive rejects a private setting changed after ticket preparation", async () => {
+    seedLegacySettings(SOURCE_USER);
+    const preparedResponse = await app.request(
+      "http://localhost/api/v1/user-data/export/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-user": SOURCE_USER },
+        body: JSON.stringify({ includeSecrets: true, includeVectors: false }),
+      },
+    );
+    expect(preparedResponse.status).toBe(200);
+    const prepared = await preparedResponse.json() as { archiveUrl: string };
+    const setting = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+    settingsSvc.putSetting(SOURCE_USER, "imageGeneration", { ...setting, changedAfterPrepare: true });
+
+    const archiveResponse = await app.request(
+      "http://localhost" + prepared.archiveUrl,
+      { headers: { "x-test-user": SOURCE_USER } },
+    );
+    expect(archiveResponse.status).toBe(409);
+    expect(await archiveResponse.json()).toMatchObject({ code: "export_source_changed" });
+    expect(prepareCacheSize()).toBe(0);
+  });
+
+  test("archive rejects a secret inventory changed after ticket preparation", async () => {
+    await putSecret(SOURCE_USER, "existing-secret", "existing-value");
+    settingsSvc.putSetting(SOURCE_USER, "imageGeneration", { enabled: true });
+    const preparedResponse = await app.request(
+      "http://localhost/api/v1/user-data/export/prepare",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-test-user": SOURCE_USER },
+        body: JSON.stringify({ includeSecrets: true, includeVectors: false }),
+      },
+    );
+    expect(preparedResponse.status).toBe(200);
+    const prepared = await preparedResponse.json() as { archiveUrl: string };
+    await putSecret(SOURCE_USER, "added-after-prepare", "later-value");
+
+    const archiveResponse = await app.request(
+      "http://localhost" + prepared.archiveUrl,
+      { headers: { "x-test-user": SOURCE_USER } },
+    );
+    expect(archiveResponse.status).toBe(409);
+    expect(await archiveResponse.json()).toMatchObject({ code: "export_source_changed" });
+    expect(prepareCacheSize()).toBe(0);
   });
 });

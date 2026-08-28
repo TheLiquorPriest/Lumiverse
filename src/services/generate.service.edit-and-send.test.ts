@@ -219,6 +219,7 @@ describe("startGeneration edit-and-send", () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     pool.clearAllPoolEntries();
     stopGenerationSweep();
+    await chatsSvc.waitForChatChunkMaintenance();
     for (const spy of spies.splice(0)) spy.mockRestore();
     closeDatabase();
   });
