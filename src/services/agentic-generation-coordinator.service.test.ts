@@ -1859,6 +1859,68 @@ describe("production agentic coordinator installation", () => {
     expect(snapshot.agentConfig).toBeNull();
     expect(Array.isArray(snapshot.availability.toolIds)).toBe(true);
   });
+  test("admits turn-derived World Info activation without weakening source revision fences", async () => {
+    const db = getDb();
+    const bookId = "book-runtime-world-authority";
+    const firstEntryId = "entry-runtime-world-authority-a";
+    const secondEntryId = "entry-runtime-world-authority-b";
+    const character = db.query("SELECT extensions FROM characters WHERE id = ?").get("character-coordinator") as { extensions: string };
+    const now = Date.now();
+    db.query(
+      "INSERT INTO world_books (id, user_id, name, description, folder, metadata, created_at, updated_at) VALUES (?, ?, ?, '', '', '{}', ?, ?)",
+    ).run(bookId, USER_ID, "Runtime World Authority", now, now);
+    const insertEntry = db.query(
+      "INSERT INTO world_book_entries (id, world_book_id, uid, key, content, constant, disabled, vectorized, revision, created_at, updated_at) VALUES (?, ?, ?, '[]', ?, 1, 0, 0, 1, ?, ?)",
+    );
+    insertEntry.run(firstEntryId, bookId, firstEntryId, "First constant source", now, now);
+    insertEntry.run(secondEntryId, bookId, secondEntryId, "Second constant source", now, now);
+    db.query("UPDATE characters SET extensions = ? WHERE id = ?")
+      .run(JSON.stringify({ world_book_ids: [bookId] }), "character-coordinator");
+
+    try {
+      const deps = __testing.buildDependencies();
+      const input = {
+        userId: USER_ID,
+        chatId: CHAT_ID,
+        connectionId: CONNECTION_ID,
+        presetId: PRESET_ID,
+        generationType: "normal" as const,
+        userInput: USER_INPUT,
+      };
+      const target = { generationType: "normal" as const };
+      const signal = new AbortController().signal;
+      const decision = await deps.resolveRuntime!(input, target, signal);
+      const snapshot = await deps.buildAssemblySnapshot!(
+        input,
+        decision,
+        target,
+        signal,
+        "test-world-derived-activation",
+      );
+      expect(snapshot.worldInfo.entries.map((entry) => [entry.id, entry.activated])).toEqual([
+        [firstEntryId, true],
+        [secondEntryId, true],
+      ]);
+
+      db.query("UPDATE world_book_entries SET revision = revision + 1 WHERE id = ?").run(secondEntryId);
+      await expect(deps.buildAssemblySnapshot!(
+        input,
+        decision,
+        target,
+        signal,
+        "test-world-stale-source",
+      )).rejects.toMatchObject({
+        name: "AgenticGenerationError",
+        code: "agentic_revision_conflict",
+        message: "stale_input_revision",
+      });
+    } finally {
+      db.query("UPDATE characters SET extensions = ? WHERE id = ?")
+        .run(character.extensions, "character-coordinator");
+      db.query("DELETE FROM world_book_entries WHERE world_book_id = ?").run(bookId);
+      db.query("DELETE FROM world_books WHERE id = ?").run(bookId);
+    }
+  });
   test("production assembly keeps cognition inactive when no Loom source is authored", async () => {
     const deps = __testing.buildDependencies();
     const input = {

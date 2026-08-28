@@ -1308,11 +1308,17 @@ async function snapshotInputWithNativeContext(
 }
 
 function runtimeInputRevisions(snapshot: RuntimeSnapshot): RuntimeInputRevisionSetV1 {
-  type Entry = { readonly revision: string; readonly digest: string };
-  const revision = (entries: readonly Entry[]): string | null => {
+  type Entry = { readonly id: string; readonly revision: string; readonly digest: string };
+  const revision = (entries: readonly Entry[], sourceOwned = false): string | null => {
     if (entries.length === 0) return null;
     if (entries.length === 1) return entries[0].revision;
-    return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+    // Native World Info activation enriches source rows with turn-derived
+    // state after admission. Its fence is the ordered source identity and
+    // monotonic revision, not the preflight/ASSEMBLE projection digest.
+    const authority = sourceOwned
+      ? entries.map((entry) => ({ id: entry.id, revision: entry.revision }))
+      : entries;
+    return createHash("sha256").update(JSON.stringify(authority)).digest("hex");
   };
   const revisions = snapshot.inputRevisionSet;
   return {
@@ -1329,8 +1335,8 @@ function runtimeInputRevisions(snapshot: RuntimeSnapshot): RuntimeInputRevisionS
     persona: revision(revisions.participants),
     character: revision(revisions.participants),
     group: revision(revisions.participants),
-    world: revision(revisions.worldLore),
-    lore: revision(revisions.worldLore),
+    world: revision(revisions.worldLore, true),
+    lore: revision(revisions.worldLore, true),
     settings: revision(revisions.settings),
     macro: revision(revisions.variables),
     regex: revision(revisions.regex),
