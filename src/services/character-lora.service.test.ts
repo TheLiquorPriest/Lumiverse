@@ -37,7 +37,6 @@ function initTestDb(): void {
     tags TEXT NOT NULL DEFAULT '[]',
     alternate_greetings TEXT NOT NULL DEFAULT '[]',
     extensions TEXT NOT NULL DEFAULT '{}',
-    library_scope TEXT NOT NULL DEFAULT 'mine',
     image_id TEXT,
     avatar_path TEXT,
     created_at INTEGER NOT NULL,

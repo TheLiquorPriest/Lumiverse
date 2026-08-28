@@ -256,6 +256,95 @@ describe.serial("chat chunk maintenance lifecycle", () => {
       .toEqual({ content: "chunk:hung-import-chunk" });
   });
 
+  test("replacement vectorization starts before a cancelled processor returns", async () => {
+    track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockResolvedValue(enabledEmbeddingConfig));
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "epoch-message", 0, true, "old source");
+    seedChunk(chat.id, "epoch-chunk", ["epoch-message"], 1);
+
+    const oldEntered = Promise.withResolvers<void>();
+    const oldGate = Promise.withResolvers<void>();
+    const replacementEntered = Promise.withResolvers<void>();
+    let calls = 0;
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => {
+      calls += 1;
+      if (calls === 1) {
+        oldEntered.resolve();
+        await oldGate.promise;
+        getDb().query("UPDATE chat_chunks SET content = 'late-old-processor' WHERE id = ?").run(tasks[0]!.chunkId);
+      } else {
+        replacementEntered.resolve();
+        getDb().query("UPDATE chat_chunks SET content = 'replacement-processed' WHERE id = ?").run(tasks[0]!.chunkId);
+      }
+      return { processedCount: tasks.length, failedChunkIds: [], refreshedChatIds: [] };
+    });
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "epoch-chunk", 1);
+    await oldEntered.promise;
+    closeDatabase();
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+    getDb().query(
+      'INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)',
+    ).run(USER_ID, "Replacement Owner", "replacement-owner@example.test");
+    const replacementChat = createTemporaryChat();
+    getDb().query("UPDATE chats SET id = ? WHERE id = ?").run(chat.id, replacementChat.id);
+    seedMessage(chat.id, "epoch-message", 0, true, "replacement source");
+    seedChunk(chat.id, "epoch-chunk", ["epoch-message"], 1);
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "epoch-chunk", 1);
+    await Promise.race([
+      replacementEntered.promise,
+      Bun.sleep(250).then(() => { throw new Error("replacement vectorization was blocked by the retired processor"); }),
+    ]);
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'epoch-chunk'").get())
+      .toEqual({ content: "replacement-processed" });
+
+    oldGate.resolve();
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'epoch-chunk'").get())
+      .toEqual({ content: "replacement-processed" });
+  });
+
+  test("reset aborts an admitted Lance delete before replacement SQLite mutation", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "lance-message", 0, true, "old source");
+    seedChunk(chat.id, "lance-chunk", ["lance-message"], 1);
+    const deleteEntered = Promise.withResolvers<void>();
+    const deleteGate = Promise.withResolvers<void>();
+    let observedSignal: AbortSignal | undefined;
+    track(spyOn(embeddingsSvc, "deleteChatChunkEmbeddings").mockImplementation(async (
+      _userId,
+      _chatId,
+      _chunkIds,
+      signal,
+    ) => {
+      observedSignal = signal;
+      deleteEntered.resolve();
+      await deleteGate.promise;
+    }));
+
+    const rebuild = chatsSvc.rebuildChatChunks(USER_ID, chat.id);
+    void rebuild.catch(() => undefined);
+    await deleteEntered.promise;
+    closeDatabase();
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+    getDb().query(
+      'INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)',
+    ).run(USER_ID, "Replacement Owner", "replacement-owner@example.test");
+    const replacementChat = createTemporaryChat();
+    getDb().query("UPDATE chats SET id = ? WHERE id = ?").run(chat.id, replacementChat.id);
+    seedMessage(chat.id, "lance-message", 0, true, "replacement source");
+    seedChunk(chat.id, "lance-chunk", ["lance-message"], 1);
+
+    expect(observedSignal?.aborted).toBe(true);
+    deleteGate.resolve();
+    await expect(rebuild).rejects.toMatchObject({ code: "database_generation_cancelled" });
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'lance-chunk'").get())
+      .toEqual({ content: "chunk:lance-chunk" });
+  });
   test("create waits through the deferred cortex callback before database replacement", async () => {
     track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockResolvedValue(enabledEmbeddingConfig));
     track(spyOn(memoryCortex, "isCortexEnabledForChat").mockReturnValue(true));

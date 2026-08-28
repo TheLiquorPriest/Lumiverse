@@ -3327,7 +3327,10 @@ export function importRegexScripts(
   } else {
     scripts = [];
   }
-  const importContext: RegexMutationContext = { ...context, foreignImport: true };
+  const importContext: RegexMutationContext = {
+    ...context,
+    foreignImport: context?.foreignImport ?? true,
+  };
 
   for (let i = 0; i < scripts.length; i++) {
     let item = scripts[i];
@@ -3563,7 +3566,7 @@ export function importPresetBoundRegexScripts(
       }],
       folder,
       preset_id: presetId,
-    });
+    }, { foreignImport: false });
     imported += result.imported;
     skipped += result.skipped;
     if (result.imported > 0 && !script.disabled) {

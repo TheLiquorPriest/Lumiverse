@@ -1648,7 +1648,7 @@ async function deleteStoreRows(
   await withUserDataProjectionMutation(userId, async () => {
     const store = await getActiveVectorStore();
     assertSignalActive(signal);
-    await store.deleteByFilter(collection, filter);
+    await store.deleteByFilter(collection, filter, signal);
     assertSignalActive(signal);
   });
 }
@@ -1775,15 +1775,22 @@ export async function restoreArchivedVectorRows(
   return rows.length;
 }
 
-async function scheduleStoreOptimize(reason: "general" | "chat_chunk" | "world_book" = "general"): Promise<void> {
+async function scheduleStoreOptimize(
+  reason: "general" | "chat_chunk" | "world_book" = "general",
+  signal?: AbortSignal,
+): Promise<void> {
+  assertSignalActive(signal);
   const store = await getActiveVectorStore();
+  assertSignalActive(signal);
   if (store.capabilities.supportsOptimize) {
-    scheduleOptimize(reason);
+    scheduleOptimize(reason, signal);
     return;
   }
   if (store.capabilities.requiresExplicitFlush) {
     const collections: CollectionName[] = reason === "world_book" ? ["embeddings_world_books"] : ["embeddings"];
-    await store.optimize(collections);
+    assertSignalActive(signal);
+    await store.optimize(collections, signal);
+    assertSignalActive(signal);
   }
 }
 
@@ -4133,7 +4140,7 @@ export async function reindexWorldBookEntries(
       const store = await getActiveVectorStore();
       assertSignalActive(options?.signal);
       if (rebuildVectorIndex) getTableState(WORLD_BOOK_EMBEDDINGS_TABLE).vectorIndexReady = false;
-      await store.optimize(["embeddings_world_books"]);
+      await store.optimize(["embeddings_world_books"], options?.signal);
       assertSignalActive(options?.signal);
     } catch (err) {
       assertSignalActive(options?.signal);
@@ -4627,7 +4634,7 @@ export async function deleteChatChunkEmbeddings(
     idList ? inSet("source_id", idList) : null,
   ]), signal);
   assertSignalActive(signal);
-  await scheduleStoreOptimize("chat_chunk");
+  await scheduleStoreOptimize("chat_chunk", signal);
   assertSignalActive(signal);
 }
 
@@ -4676,26 +4683,31 @@ export async function syncChatChunkEmbedding(
   chatId: string,
   chunkId: string,
   content: string,
-  metadata?: Record<string, any>
+  metadata?: Record<string, any>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertSignalActive(signal);
   const cfg = await getEmbeddingConfig(userId);
+  assertSignalActive(signal);
   if (!cfg.enabled || !cfg.vectorize_chat_messages) {
-    await deleteChatChunkEmbeddings(userId, chatId, chunkId);
+    await deleteChatChunkEmbeddings(userId, chatId, chunkId, signal);
     return;
   }
 
   const text = content.trim();
   if (!text) {
-    await deleteChatChunkEmbeddings(userId, chatId, chunkId);
+    await deleteChatChunkEmbeddings(userId, chatId, chunkId, signal);
     return;
   }
 
+  assertSignalActive(signal);
   const baseMetadata = {
     chunkId,
     messageIds: loadChatChunkMessageIds(chunkId),
     ...(metadata || {}),
   };
-  const leaves = await embedChatChunkContentLeaves(userId, text);
+  const leaves = await embedChatChunkContentLeaves(userId, text, undefined, { signal });
+  assertSignalActive(signal);
   const rows = buildChatChunkEmbeddingRows(
     userId,
     chatId,
@@ -4705,13 +4717,15 @@ export async function syncChatChunkEmbedding(
     baseMetadata,
     Math.floor(Date.now() / 1000),
   );
-  await replaceChatChunkEmbeddingRows(userId, [{ chatId, chunkId }], rows);
+  await replaceChatChunkEmbeddingRows(userId, [{ chatId, chunkId }], rows, signal);
+  assertSignalActive(signal);
 
   console.info(
     `[embeddings] Vectorized chat chunk ${chunkId} for chat ${chatId}${rows.length > 1 ? ` (${rows.length} split rows)` : ""}`,
   );
 
-  await scheduleStoreOptimize("chat_chunk");
+  await scheduleStoreOptimize("chat_chunk", signal);
+  assertSignalActive(signal);
 }
 
 /**
@@ -4747,14 +4761,21 @@ export async function batchUpsertChunkVectors(
   assertSignalActive(signal);
   console.info(`[embeddings] Batch-vectorized ${rows.length} chat chunk(s)`);
   assertSignalActive(signal);
-  await scheduleStoreOptimize("chat_chunk");
+  await scheduleStoreOptimize("chat_chunk", signal);
   assertSignalActive(signal);
   });
 }
 
-async function getExistingChatChunks(userId: string, chatId: string): Promise<Record<string, string>> {
+async function getExistingChatChunks(
+  userId: string,
+  chatId: string,
+  signal?: AbortSignal,
+): Promise<Record<string, string>> {
+  assertSignalActive(signal);
   const store = await getActiveVectorStore();
+  assertSignalActive(signal);
   const rows = await store.getRowsByFilter("embeddings", ownerScope(userId, "chat_chunk", chatId));
+  assertSignalActive(signal);
   const map: Record<string, string> = {};
   for (const r of rows) {
     const meta = parseChatChunkEmbeddingMetadata(r.metadata_json);
@@ -4768,24 +4789,24 @@ async function getExistingChatChunks(userId: string, chatId: string): Promise<Re
 export async function reindexChatMessages(
   userId: string,
   chatId: string,
-  chunks: Array<{ chunkId: string; content: string; metadata?: Record<string, any> }>
+  chunks: Array<{ chunkId: string; content: string; metadata?: Record<string, any> }>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  assertSignalActive(signal);
   return withCompleteUserProjection(userId, async () => {
+  assertSignalActive(signal);
   const cfg = await getEmbeddingConfig(userId);
+  assertSignalActive(signal);
   if (!cfg.enabled || !cfg.vectorize_chat_messages) {
-    // If disabled, just ensure it's wiped
-    await deleteChatChunkEmbeddings(userId, chatId);
+    await deleteChatChunkEmbeddings(userId, chatId, undefined, signal);
     return;
   }
 
   const validChunks = chunks.filter(c => c.content.trim().length > 0);
-  
-  // Smart Diffing: Query LanceDB for the chunks we already know about.
-  const existingChunks = await getExistingChatChunks(userId, chatId);
+  const existingChunks = await getExistingChatChunks(userId, chatId, signal);
   const chunksToUpsert: Array<{ chunkId: string; content: string; metadata?: Record<string, any> }> = [];
   const validChunkIds = new Set<string>();
 
-  // 1. Find chunks that are entirely new OR have changed content.
   for (const chunk of validChunks) {
     validChunkIds.add(chunk.chunkId);
     const existingContentHash = existingChunks[chunk.chunkId];
@@ -4794,17 +4815,14 @@ export async function reindexChatMessages(
     }
   }
 
-  // 2. Find "orphaned" chunks.
   const chunksToDelete: string[] = [];
   for (const existingId of Object.keys(existingChunks)) {
-    if (!validChunkIds.has(existingId)) {
-      chunksToDelete.push(existingId);
-    }
+    if (!validChunkIds.has(existingId)) chunksToDelete.push(existingId);
   }
 
-  // Delete orphaned chunks in a single call (the helper accepts a string[]).
   if (chunksToDelete.length > 0) {
-    await deleteChatChunkEmbeddings(userId, chatId, chunksToDelete);
+    await deleteChatChunkEmbeddings(userId, chatId, chunksToDelete, signal);
+    assertSignalActive(signal);
   }
 
   const batchSize = Math.max(1, Math.min(cfg.batch_size, 200));
@@ -4814,6 +4832,7 @@ export async function reindexChatMessages(
     batchSize,
     (c) => c.content.trim(),
     async (batch, _texts, vectors) => {
+      assertSignalActive(signal);
       const now = Math.floor(Date.now() / 1000);
       const rows: EmbeddingRow[] = batch.flatMap((c, idx) => buildChatChunkEmbeddingRows(
         userId,
@@ -4824,14 +4843,16 @@ export async function reindexChatMessages(
         { chunkId: c.chunkId, ...(c.metadata || {}) },
         now,
       ));
-
       await replaceChatChunkEmbeddingRows(
         userId,
         batch.map((chunk) => ({ chatId, chunkId: chunk.chunkId })),
         rows,
+        signal,
       );
+      assertSignalActive(signal);
     },
     async (failedBatch, err) => {
+      assertSignalActive(signal);
       if (failedBatch.length === 1) {
         const [failed] = failedBatch;
         const recovered = await tryRecoverChatChunkEmbeddingWithAutoSplit(
@@ -4841,19 +4862,24 @@ export async function reindexChatMessages(
           failed.content,
           err,
           { chunkId: failed.chunkId, ...(failed.metadata || {}) },
+          undefined,
+          { signal },
         );
+        assertSignalActive(signal);
         if (recovered.recovered) return;
       }
       console.warn("[embeddings] Batch chat embedding failed:", err);
     },
-    { label: "chat memory" },
+    { label: "chat memory", signal },
   );
+  assertSignalActive(signal);
 
   if (chunksToDelete.length > 0 || chunksToUpsert.length > 0) {
     console.info(`[embeddings] Synced chat memory for ${chatId.split('-')[0]}... (+${chunksToUpsert.length} updated, -${chunksToDelete.length} removed)`);
   }
 
-  await scheduleStoreOptimize("chat_chunk");
+  await scheduleStoreOptimize("chat_chunk", signal);
+  assertSignalActive(signal);
   });
 }
 

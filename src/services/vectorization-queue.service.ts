@@ -35,6 +35,7 @@ import { loadWorldBookVectorSettings } from "./world-book-vector-settings.servic
 import { trackChatChunkMaintenance } from "./chat-chunk-maintenance.service";
 
 interface MaintenanceSettlement {
+  settled?: boolean;
   resolve: () => void;
   reject: (reason?: unknown) => void;
 }
@@ -89,11 +90,19 @@ function mergeVectorizationJobs(existing: VectorizationJob, incoming: Vectorizat
 }
 
 function resolveVectorizationJob(job: VectorizationJob): void {
-  for (const settlement of job.settlements ?? []) settlement.resolve();
+  for (const settlement of job.settlements ?? []) {
+    if (settlement.settled) continue;
+    settlement.settled = true;
+    settlement.resolve();
+  }
 }
 
 function rejectVectorizationJob(job: VectorizationJob, reason: unknown): void {
-  for (const settlement of job.settlements ?? []) settlement.reject(reason);
+  for (const settlement of job.settlements ?? []) {
+    if (settlement.settled) continue;
+    settlement.settled = true;
+    settlement.reject(reason);
+  }
 }
 
 function remainingWorldBookSettleMs(queuedAt: number, now: number): number {
@@ -163,7 +172,8 @@ function rowToWorldBookEntry(row: any): WorldBookEntry {
 
 class VectorizationQueue {
   private queue: VectorizationJob[] = [];
-  private processing = false;
+  private processingEpoch: number | null = null;
+  private processorEpoch = 0;
   private processingTimer: ReturnType<typeof setTimeout> | null = null;
   private activeBatch: VectorizationJob[] = [];
 
@@ -198,10 +208,11 @@ class VectorizationQueue {
       clearTimeout(this.processingTimer);
       this.processingTimer = null;
     }
+    const epoch = this.processorEpoch;
     const delayMs = nextProcessDelayMs(this.queue, Date.now());
     this.processingTimer = setTimeout(() => {
       this.processingTimer = null;
-      void this.processQueue().catch((error) => {
+      void this.processQueue(epoch).catch((error) => {
         if (!isDatabaseGenerationCancellation(error)) {
           console.error("[vectorization] Queue processing failed:", error);
         }
@@ -217,18 +228,23 @@ class VectorizationQueue {
     }
   }
 
-  private async processQueue() {
-    if (this.processing || this.queue.length === 0) return;
-    this.processing = true;
+  private async processQueue(epoch: number) {
+    if (
+      epoch !== this.processorEpoch
+      || this.processingEpoch === epoch
+      || this.queue.length === 0
+    ) return;
+    this.processingEpoch = epoch;
 
     try {
-      while (this.queue.length > 0) {
+      while (epoch === this.processorEpoch && this.queue.length > 0) {
         if (this.queue[0].type === "world_book_entry") {
           if (!worldBookJobsHaveSettled(this.queue, Date.now())) {
             this.scheduleProcessing();
             return;
           }
           await this.awaitLanceMaintenanceIdle(this.queue[0].generation);
+          if (epoch !== this.processorEpoch) return;
           if (this.queue.length === 0 || this.queue[0].type !== "world_book_entry") continue;
           if (!worldBookJobsHaveSettled(this.queue, Date.now())) {
             this.scheduleProcessing();
@@ -246,10 +262,12 @@ class VectorizationQueue {
           maxBatch = Math.max(1, Math.min(cfg.batch_size, 200));
         } catch (error) {
           if (isDatabaseGenerationCancellation(error)) {
+            if (epoch !== this.processorEpoch) return;
             this.invalidateStale(generation, error.currentGeneration);
             continue;
           }
         }
+        if (epoch !== this.processorEpoch) return;
         const batch = this.takeBatch(maxBatch, generation);
         if (batch.length === 0) continue;
         this.activeBatch = batch;
@@ -257,9 +275,9 @@ class VectorizationQueue {
         try {
           await runWithDbGeneration(generation, async () => {
             if (batch[0]!.type === "chunk") {
-              await this.processChunkBatch(batch, generation, batch[0]!.signal);
+              await this.processChunkBatch(batch, generation, batch[0]!.signal, epoch);
             } else {
-              await this.processWorldBookEntryBatch(batch, generation, batch[0]!.signal);
+              await this.processWorldBookEntryBatch(batch, generation, batch[0]!.signal, epoch);
             }
           });
         } catch (error) {
@@ -269,13 +287,16 @@ class VectorizationQueue {
           if (this.activeBatch === batch) this.activeBatch = [];
         }
 
+        if (epoch !== this.processorEpoch) return;
         const { promise, resolve } = Promise.withResolvers<void>();
         setTimeout(resolve, 100);
         await promise;
       }
     } finally {
-      this.processing = false;
-      if (this.queue.length > 0) this.scheduleProcessing();
+      if (this.processingEpoch === epoch) {
+        this.processingEpoch = null;
+        if (this.queue.length > 0) this.scheduleProcessing();
+      }
     }
   }
 
@@ -308,6 +329,7 @@ class VectorizationQueue {
     jobs: VectorizationJob[],
     generation: number,
     signal: AbortSignal,
+    epoch: number,
   ) {
     try {
       const tasks = jobs
@@ -336,7 +358,7 @@ class VectorizationQueue {
         warnChatChunkVectorizationFallback();
         result = await processChatChunkVectorizationBatch(tasks, { signal });
       }
-      assertDbGeneration(generation);
+      this.assertProcessorEpoch(epoch, generation);
 
       const failedChunkIds = new Set(result.failedChunkIds);
 
@@ -381,7 +403,9 @@ class VectorizationQueue {
     jobs: VectorizationJob[],
     generation: number,
     signal: AbortSignal,
+    epoch: number,
   ) {
+    this.assertProcessorEpoch(epoch, generation);
     const entryIds = Array.from(new Set(jobs.map((job) => job.worldBookEntryId).filter((id): id is string => !!id)));
     if (entryIds.length === 0) return;
 
@@ -415,7 +439,7 @@ class VectorizationQueue {
     let configFingerprint: string | null = null;
     try {
       const cfg = await embeddingsSvc.getEmbeddingConfig(jobs[0].userId);
-      assertDbGeneration(generation);
+      this.assertProcessorEpoch(epoch, generation);
       configFingerprint = embeddingsSvc.getWorldBookVectorWriteFingerprint(cfg);
       await embeddingsSvc.reindexWorldBookEntries(jobs[0].userId, entries, {
         batchSize: Math.max(1, Math.min(cfg.batch_size, entries.length, 200)),
@@ -424,7 +448,7 @@ class VectorizationQueue {
         rebuildVectorIndex: false,
         signal,
       });
-      assertDbGeneration(generation);
+      this.assertProcessorEpoch(epoch, generation);
       console.info(`[vectorization] Processed ${entries.length} world book entr${entries.length === 1 ? "y" : "ies"} for ${bookParts.length === 1 ? bookLabel : `multiple books: ${bookLabel}`}`);
     } catch (err) {
       if (isDatabaseGenerationCancellation(err)) throw err;
@@ -445,13 +469,24 @@ class VectorizationQueue {
     }
   }
 
+  private assertProcessorEpoch(epoch: number, generation: number): void {
+    if (epoch !== this.processorEpoch) {
+      throw new DatabaseGenerationCancelledError(generation, getDbGeneration());
+    }
+    assertDbGeneration(generation);
+  }
+
   invalidateStale(previousGeneration: number, currentGeneration: number): void {
     if (this.processingTimer) {
       clearTimeout(this.processingTimer);
       this.processingTimer = null;
     }
+    this.processorEpoch += 1;
+    this.processingEpoch = null;
+    const retiredBatch = this.activeBatch;
+    this.activeBatch = [];
     cancelChatChunkVectorizationGeneration(previousGeneration, currentGeneration);
-    for (const job of this.activeBatch) {
+    for (const job of retiredBatch) {
       if (job.generation === previousGeneration) {
         rejectVectorizationJob(
           job,
@@ -477,7 +512,7 @@ class VectorizationQueue {
   getStatus() {
     return {
       queueLength: this.queue.length,
-      processing: this.processing,
+      processing: this.processingEpoch !== null,
       chunkJobs: this.queue.filter((j) => j.type === "chunk").length,
       worldBookJobs: this.queue.filter((j) => j.type === "world_book_entry").length,
     };

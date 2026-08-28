@@ -609,7 +609,16 @@ function QuickToolbarNative() {
     if (!anchored) return
     const toolbar = toolbarRef.current
     const root = rootRef.current
-    if (!toolbar || !root) return
+    if (!toolbar || !root) {
+      if (!isRetry) {
+        if (v2FitRetryRafRef.current) cancelToolbarFrame(v2FitRetryRafRef.current)
+        v2FitRetryRafRef.current = scheduleToolbarFrame(() => {
+          v2FitRetryRafRef.current = 0
+          measureV2FitRef.current(true)
+        })
+      }
+      return
+    }
     const uiScale = readUiScale()
     const toLayoutWidth = (node: HTMLElement | null, fallback: number) => {
       const renderedWidth = node?.getBoundingClientRect().width ?? 0

@@ -33,6 +33,7 @@ export interface PooledTokensEntry {
   characterId?: string;
   model: string;
   provider?: string;
+  connectionId?: string;
   startedAt: number;
   reasoningStartedAt?: number;
   reasoningDurationMs?: number;
@@ -134,6 +135,7 @@ export function createPoolEntry(opts: {
   characterId?: string;
   model: string;
   provider?: string;
+  connectionId?: string;
   targetMessageId?: string;
   targetSwipeId?: number;
 }): void {
@@ -151,6 +153,7 @@ export function createPoolEntry(opts: {
     characterId: opts.characterId,
     model: opts.model,
     provider: opts.provider,
+    connectionId: opts.connectionId,
     startedAt: Date.now(),
     status: "assembling",
     lastActivityAt: Date.now(),

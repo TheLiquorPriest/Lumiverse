@@ -1,13 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import { closeDatabase, getDbGeneration, getDbGenerationSignal, initDatabase } from "../../../db/connection";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
   ensureVectorIndex,
   isCrossProcessLockFromPriorProcessInstance,
+  isDeferredOptimizeScheduled,
   isRetryableLanceWriteConflict,
   pauseLanceDbForExternalMaintenance,
   raceWithSignal,
+  runAbortFencedNativeMutation,
+  safeTableDelete,
+  scheduleOptimize,
   shouldUseCrossProcessWriteLock,
   sweepEmptyIndexDirs,
   WORLD_BOOK_EMBEDDINGS_TABLE,
@@ -51,6 +56,60 @@ describe("lancedb write conflict handling", () => {
   test("ignores non-conflict Lance warnings", () => {
     expect(isRetryableLanceWriteConflict(new Error("vector not divisible by 8"))).toBe(false);
     expect(isRetryableLanceWriteConflict(new Error("table 'embeddings' was not found"))).toBe(false);
+  });
+});
+describe("lancedb generation mutation fencing", () => {
+  test("rejects a native delete that completes after database reset", async () => {
+    initDatabase(":memory:");
+    const generation = getDbGeneration();
+    const signal = getDbGenerationSignal(generation);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let staleContinuation = false;
+    const table = {
+      countRows: async () => 1,
+      delete: async () => {
+        entered.resolve();
+        await release.promise;
+      },
+    };
+
+    const deletion = safeTableDelete(table as any, "id = 'stale'", "general", signal).then(() => {
+      staleContinuation = true;
+    });
+    await entered.promise;
+    closeDatabase();
+    expect(signal.aborted).toBe(true);
+    release.resolve();
+
+    await expect(deletion).rejects.toMatchObject({ code: "database_generation_cancelled" });
+    expect(staleContinuation).toBe(false);
+  });
+
+  test("cancels deferred optimize and rejects suspended native optimize on reset", async () => {
+    initDatabase(":memory:");
+    const generation = getDbGeneration();
+    const signal = getDbGenerationSignal(generation);
+    scheduleOptimize("general", signal);
+    expect(isDeferredOptimizeScheduled()).toBe(true);
+
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let staleContinuation = false;
+    const optimizing = runAbortFencedNativeMutation(signal, async () => {
+      entered.resolve();
+      await release.promise;
+    }).then(() => {
+      staleContinuation = true;
+    });
+    await entered.promise;
+    closeDatabase();
+
+    expect(signal.aborted).toBe(true);
+    expect(isDeferredOptimizeScheduled()).toBe(false);
+    release.resolve();
+    await expect(optimizing).rejects.toMatchObject({ code: "database_generation_cancelled" });
+    expect(staleContinuation).toBe(false);
   });
 });
 

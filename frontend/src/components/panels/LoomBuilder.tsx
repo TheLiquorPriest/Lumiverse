@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect, use
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
 import { useSpindleComponentOverride } from '@/lib/spindle/use-spindle-component-override'
+import { scheduleLowPriorityTask } from '@/lib/low-priority-task'
 
 import {
   DndContext,
@@ -2642,7 +2643,7 @@ function LoomBuilderNative({
     if (dirty) return
     const cleanPresetId = cleanPresetSelectionReleaseRef.current
     if (!cleanPresetId) return
-    queueMicrotask(() => {
+    scheduleLowPriorityTask(() => {
       if (
         !loomBuilderMountedRef.current
         || agenticRuntimeDirtyRef.current
@@ -2653,7 +2654,7 @@ function LoomBuilderNative({
       const blocker = presetSelectionBlockerRef.current
       presetSelectionBlockerRef.current = null
       blocker?.release()
-    })
+    }, { label: 'release Loom preset selection blocker' })
   }, [])
   useEffect(() => {
     if (!agenticRuntimeDirty || typeof window === 'undefined') return

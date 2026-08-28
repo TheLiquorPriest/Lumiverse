@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import {
+  assertDbGeneration,
   getDatabasePath,
   getDb,
   getDbGeneration,
+  getDbGenerationSignal,
   isDatabaseGenerationCancellation,
   onDbReset,
   runWithDbGeneration,
@@ -4929,30 +4931,38 @@ export function isChatChunkRebuildInProgress(chatId: string): boolean {
  */
 export function rebuildChatChunks(userId: string, chatId: string): Promise<void> {
   const generation = getDbGeneration();
+  const signal = getDbGenerationSignal(generation);
   return trackChatChunkMaintenance(
     chatId,
-    runWithDbGeneration(generation, () => runChatChunkRebuild(userId, chatId)),
+    runWithDbGeneration(generation, () => runChatChunkRebuild(userId, chatId, generation, signal)),
     generation,
   );
 }
 
-async function runChatChunkRebuild(userId: string, chatId: string): Promise<void> {
+async function runChatChunkRebuild(
+  userId: string,
+  chatId: string,
+  generation: number,
+  signal: AbortSignal,
+): Promise<void> {
+  assertDbGeneration(generation);
   const inflight = _rebuildInflight.get(chatId);
   if (inflight) {
-    // Another rebuild is already running — mark pending and wait for it
     _rebuildPending.add(chatId);
     await inflight;
-    // If we're the one to run the follow-up, do it; otherwise another
-    // caller already picked it up.
+    assertDbGeneration(generation);
     if (!_rebuildPending.has(chatId)) return;
     _rebuildPending.delete(chatId);
   }
 
-  const promise = _rebuildChatChunksImpl(userId, chatId);
+  assertDbGeneration(generation);
+  const promise = _rebuildChatChunksImpl(userId, chatId, generation, signal);
   _rebuildInflight.set(chatId, promise);
   try {
     await promise;
+    assertDbGeneration(generation);
   } finally {
+    assertDbGeneration(generation);
     if (_rebuildInflight.get(chatId) === promise) {
       _rebuildInflight.delete(chatId);
     }
@@ -4978,11 +4988,12 @@ export function rebuildChatChunksFromMessages(
   affectedMessageIds: Iterable<string>,
 ): Promise<void> {
   const generation = getDbGeneration();
+  const signal = getDbGenerationSignal(generation);
   return trackChatChunkMaintenance(
     chatId,
     runWithDbGeneration(
       generation,
-      () => runChatChunkRebuildFromMessages(userId, chatId, affectedMessageIds),
+      () => runChatChunkRebuildFromMessages(userId, chatId, affectedMessageIds, generation, signal),
     ),
     generation,
   );
@@ -4992,56 +5003,74 @@ async function runChatChunkRebuildFromMessages(
   userId: string,
   chatId: string,
   affectedMessageIds: Iterable<string>,
+  generation: number,
+  signal: AbortSignal,
 ): Promise<void> {
+  assertDbGeneration(generation);
   const anchorChunkId = findAnchorChunkForMessages(chatId, affectedMessageIds);
   if (anchorChunkId === null) {
-    return rebuildChatChunks(userId, chatId);
+    assertDbGeneration(generation);
+    return _rebuildChatChunksImpl(userId, chatId, generation, signal);
   }
 
   const inflight = _rebuildInflight.get(chatId);
   if (inflight) {
     _rebuildPending.add(chatId);
     await inflight;
+    assertDbGeneration(generation);
     if (!_rebuildPending.has(chatId)) return;
     _rebuildPending.delete(chatId);
-    // Conservative follow-up: the in-flight rebuild may have already replaced
-    // the chunk graph, so the anchor we picked could be stale. A full rebuild
-    // is correct under any state.
-    return rebuildChatChunks(userId, chatId);
+    return _rebuildChatChunksImpl(userId, chatId, generation, signal);
   }
 
-  const promise = _rebuildChatChunksFromImpl(userId, chatId, anchorChunkId);
+  const promise = _rebuildChatChunksFromImpl(userId, chatId, anchorChunkId, generation, signal);
   _rebuildInflight.set(chatId, promise);
   try {
     await promise;
+    assertDbGeneration(generation);
   } finally {
+    assertDbGeneration(generation);
     if (_rebuildInflight.get(chatId) === promise) {
       _rebuildInflight.delete(chatId);
     }
   }
 }
 
-async function _rebuildChatChunksImpl(userId: string, chatId: string): Promise<void> {
+async function _rebuildChatChunksImpl(
+  userId: string,
+  chatId: string,
+  generation: number,
+  signal: AbortSignal,
+): Promise<void> {
+  assertDbGeneration(generation);
   await enqueueChatPipelineTask({
     chatId,
     kind: "chunk_rebuild",
     exclusive: true,
-    run: () => _rebuildChatChunksBody(userId, chatId),
+    run: () => _rebuildChatChunksBody(userId, chatId, generation, signal),
   });
+  assertDbGeneration(generation);
 }
 
-async function _rebuildChatChunksBody(userId: string, chatId: string): Promise<void> {
+async function _rebuildChatChunksBody(
+  userId: string,
+  chatId: string,
+  generation: number,
+  signal: AbortSignal,
+): Promise<void> {
+  assertDbGeneration(generation);
   invalidateChatMemoryCache(chatId);
 
-  // Clean up old vectors from LanceDB before wiping chat_chunks so they don't leak
-  // and aren't retrieved by future LanceDB searches.
   try {
-    await embeddingsSvc.deleteChatChunkEmbeddings(userId, chatId);
+    await embeddingsSvc.deleteChatChunkEmbeddings(userId, chatId, undefined, signal);
   } catch (err) {
+    if (isDatabaseGenerationCancellation(err)) throw err;
     console.warn(`[chats] Failed to delete LanceDB chat_chunk vectors for chat ${chatId}:`, err);
   }
+  assertDbGeneration(generation);
 
   const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
+  assertDbGeneration(generation);
   if (!cfg.enabled || !cfg.vectorize_chat_messages) {
     getDb().query("DELETE FROM chat_chunks WHERE chat_id = ?").run(chatId);
     return;
@@ -5060,11 +5089,13 @@ async function _rebuildChatChunksBody(userId: string, chatId: string): Promise<v
     embeddingsSvc.loadChatMemorySettings(userId),
     cfg,
   );
-  await chunkAndPersistMessages(userId, chatId, messages, chatMemSettings, salienceByContent);
+  await chunkAndPersistMessages(userId, chatId, messages, chatMemSettings, salienceByContent, generation);
+  assertDbGeneration(generation);
 
-  // Stamp the config hash so we can detect staleness later
   await stampChatMemoryHash(userId, chatId);
+  assertDbGeneration(generation);
   await refreshChatMemoryCache(userId, chatId);
+  assertDbGeneration(generation);
 
   console.info(`[chats] Rebuilt chunks for chat ${chatId}`);
 }
@@ -5081,7 +5112,9 @@ async function chunkAndPersistMessages(
   messages: Message[],
   chatMemSettings: embeddingsSvc.ChatMemorySettings,
   salienceByContent: Map<string, SalienceSnapshotRow[]>,
+  generation: number,
 ): Promise<void> {
+  assertDbGeneration(generation);
   if (messages.length === 0) return;
 
   const targetTokens = chatMemSettings.chunkTargetTokens;
@@ -5094,10 +5127,14 @@ async function chunkAndPersistMessages(
   const env = anyMessageHasMacros ? buildMacroEnvForChat(userId, chatId) : null;
   const sanitizedByMsgId = new Map<string, string>();
   for (const msg of messages) {
+    assertDbGeneration(generation);
     const memStripped = memoryScripts.length > 0
       ? await regexScriptsSvc.applyRegexScripts(msg.content, memoryScripts, "memory", undefined, undefined, undefined, { source: "prompt_backend" })
       : msg.content;
-    sanitizedByMsgId.set(msg.id, await resolveAndSanitizeForVectorization(memStripped, env, reasoningStrip));
+    assertDbGeneration(generation);
+    const sanitized = await resolveAndSanitizeForVectorization(memStripped, env, reasoningStrip);
+    assertDbGeneration(generation);
+    sanitizedByMsgId.set(msg.id, sanitized);
   }
 
   let currentChunk: Message[] = [];
@@ -5146,6 +5183,7 @@ async function chunkAndPersistMessages(
     }
 
     if (forceNewChunk) {
+      assertDbGeneration(generation);
       const chunk = createChatChunk(chatId, currentChunk, currentChunkSanitized);
       restoreSalienceForRebuiltChunk(chatId, chunk, salienceByContent);
       vectorizationQueue.queueChunkVectorization(userId, chatId, chunk.id, 3);
@@ -5160,6 +5198,7 @@ async function chunkAndPersistMessages(
   }
 
   if (currentChunk.length > 0) {
+    assertDbGeneration(generation);
     const chunk = createChatChunk(chatId, currentChunk, currentChunkSanitized);
     restoreSalienceForRebuiltChunk(chatId, chunk, salienceByContent);
     vectorizationQueue.queueChunkVectorization(userId, chatId, chunk.id, 3);
@@ -5174,23 +5213,37 @@ async function chunkAndPersistMessages(
  * rebuild whenever the inputs make a surgical pass unsafe (anchor missing,
  * anchor is chunk 0, preserved chunk's tail message has been deleted).
  */
-async function _rebuildChatChunksFromImpl(userId: string, chatId: string, fromChunkId: string): Promise<void> {
+async function _rebuildChatChunksFromImpl(
+  userId: string,
+  chatId: string,
+  fromChunkId: string,
+  generation: number,
+  signal: AbortSignal,
+): Promise<void> {
+  assertDbGeneration(generation);
   await enqueueChatPipelineTask({
     chatId,
     kind: "chunk_rebuild",
     exclusive: true,
-    run: () => _rebuildChatChunksFromBody(userId, chatId, fromChunkId),
+    run: () => _rebuildChatChunksFromBody(userId, chatId, fromChunkId, generation, signal),
   });
+  assertDbGeneration(generation);
 }
 
-async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromChunkId: string): Promise<void> {
+async function _rebuildChatChunksFromBody(
+  userId: string,
+  chatId: string,
+  fromChunkId: string,
+  generation: number,
+  signal: AbortSignal,
+): Promise<void> {
+  assertDbGeneration(generation);
   invalidateChatMemoryCache(chatId);
 
   const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
+  assertDbGeneration(generation);
   if (!cfg.enabled || !cfg.vectorize_chat_messages) {
-    // Without embeddings, chunks have no purpose — fall back to the full
-    // rebuild path which handles the disabled-embeddings drop cleanly.
-    return _rebuildChatChunksBody(userId, chatId);
+    return _rebuildChatChunksBody(userId, chatId, generation, signal);
   }
 
   const allChunks = getDb()
@@ -5199,9 +5252,8 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   const fromIdx = allChunks.findIndex((c) => c.id === fromChunkId);
 
   if (fromIdx <= 0) {
-    // Anchor disappeared between selection and execution, or it was the very
-    // first chunk (preserving nothing → equivalent to full rebuild).
-    return _rebuildChatChunksBody(userId, chatId);
+    assertDbGeneration(generation);
+    return _rebuildChatChunksBody(userId, chatId, generation, signal);
   }
 
   const lastPreserved = allChunks[fromIdx - 1];
@@ -5210,26 +5262,28 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
   const allMessages = getMessages(userId, chatId).filter((m) => m.extra?.hidden !== true);
   const preservedEndIdx = allMessages.findIndex((m) => m.id === lastPreserved.end_message_id);
   if (preservedEndIdx < 0) {
-    // The last preserved chunk's tail message was deleted; the surgical
-    // boundary is no longer well-defined. Full rebuild is safer.
-    return _rebuildChatChunksBody(userId, chatId);
+    assertDbGeneration(generation);
+    return _rebuildChatChunksBody(userId, chatId, generation, signal);
   }
   const messagesToChunk = allMessages.slice(preservedEndIdx + 1);
 
   const salienceByContent = snapshotSalienceForChunks(chatId, discardedChunkIds);
 
   try {
-    await embeddingsSvc.deleteChatChunkEmbeddings(userId, chatId, discardedChunkIds);
+    await embeddingsSvc.deleteChatChunkEmbeddings(userId, chatId, discardedChunkIds, signal);
   } catch (err) {
+    if (isDatabaseGenerationCancellation(err)) throw err;
     console.warn(`[chats] Failed to delete LanceDB chat_chunk vectors for chat ${chatId}:`, err);
   }
-
+  assertDbGeneration(generation);
   const placeholders = discardedChunkIds.map(() => "?").join(",");
   getDb().query(`DELETE FROM chat_chunks WHERE id IN (${placeholders})`).run(...discardedChunkIds);
 
   if (messagesToChunk.length === 0) {
     await stampChatMemoryHash(userId, chatId);
+    assertDbGeneration(generation);
     await refreshChatMemoryCache(userId, chatId);
+    assertDbGeneration(generation);
     console.info(`[chats] Surgically rebuilt chat ${chatId}: dropped ${discardedChunkIds.length} trailing chunks (no replacement messages)`);
     return;
   }
@@ -5238,10 +5292,13 @@ async function _rebuildChatChunksFromBody(userId: string, chatId: string, fromCh
     embeddingsSvc.loadChatMemorySettings(userId),
     cfg,
   );
-  await chunkAndPersistMessages(userId, chatId, messagesToChunk, chatMemSettings, salienceByContent);
+  await chunkAndPersistMessages(userId, chatId, messagesToChunk, chatMemSettings, salienceByContent, generation);
+  assertDbGeneration(generation);
 
   await stampChatMemoryHash(userId, chatId);
+  assertDbGeneration(generation);
   await refreshChatMemoryCache(userId, chatId);
+  assertDbGeneration(generation);
 
   console.info(`[chats] Surgically rebuilt chat ${chatId}: ${discardedChunkIds.length} chunks → re-chunked ${messagesToChunk.length} messages (${fromIdx} chunks preserved)`);
 }

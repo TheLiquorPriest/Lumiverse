@@ -34,6 +34,7 @@ type WorkerHarness = {
   messages: unknown[];
   kills: string[];
   ipc: (message: unknown) => void;
+  exit: () => void;
 };
 
 function messageOfType(value: unknown, type: string): value is Record<string, unknown> {
@@ -56,13 +57,15 @@ afterEach(() => {
 describe("chat chunk vectorization subprocess generation lifecycle", () => {
   it("terminates an active old-generation worker and ignores its late completion", async () => {
     const workers: WorkerHarness[] = [];
+    __test__.setForceKillGraceMs(1);
     __test__.setSubprocessFactory((options) => {
-      const harness: WorkerHarness = { messages: [], kills: [], ipc: options.ipc };
+      const harness: WorkerHarness = { messages: [], kills: [], ipc: options.ipc, exit: () => undefined };
       workers.push(harness);
       const fakeProcess = {
         send(message: unknown) { harness.messages.push(message); },
         kill(signal: string) { harness.kills.push(signal); },
       };
+      harness.exit = () => options.onExit(fakeProcess as unknown as ReturnType<typeof Bun.spawn>, null, 15);
       queueMicrotask(() => options.ipc({ type: "ready" }));
       // The production client only uses send/kill; the seam deliberately models that boundary.
       return fakeProcess as unknown as ReturnType<typeof Bun.spawn>;
@@ -90,6 +93,12 @@ describe("chat chunk vectorization subprocess generation lifecycle", () => {
     const second = processChatChunkVectorizationBatchInSubprocess([
       { userId: "owner", chatId: "chat", chunkId: "new-chunk" },
     ], 42, secondController.signal);
+    await Bun.sleep(0);
+    expect(workers).toHaveLength(1);
+    await Bun.sleep(5);
+    expect(workers[0]!.kills).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(workers).toHaveLength(1);
+    workers[0]!.exit();
     const secondRequest = await waitForMessage(workers[1]!, "process_batch");
     const firstRequestId = firstRequest.requestId;
     const secondRequestId = secondRequest.requestId;

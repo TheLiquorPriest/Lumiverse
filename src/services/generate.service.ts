@@ -3789,10 +3789,30 @@ export interface StartGenerationOptions {
   /** Connection profile committed with the durable Edit-and-Send outbox row. */
   connectionId?: string;
 }
+function resolveResponseGenerationAdmission(
+  input: GenerateInput,
+  options?: StartGenerationOptions,
+) {
+  const chat = chatsSvc.getChat(input.userId, input.chat_id);
+  const connection = resolveChatGenerationConnection(
+    input.userId,
+    chat?.metadata,
+    input.connection_id,
+    {
+      authoritativeConnectionId: options?.origin === "edit_and_send"
+        ? options.connectionId
+        : undefined,
+      preferActiveConnection: options?.origin === "edit_and_send"
+        && readEditAndSendAlwaysUseActiveConnection(input.userId),
+    },
+  );
+  return { chat, connection };
+}
 
 async function startResponseGeneration(
   input: GenerateInput,
   options?: StartGenerationOptions,
+  admitted?: ReturnType<typeof resolveResponseGenerationAdmission>,
 ): Promise<{ generationId: string; status: string }> {
   const requestedGenerationId =
     typeof input.generationId === "string" ? input.generationId.trim() : "";
@@ -3943,30 +3963,7 @@ async function startResponseGeneration(
 
     // Loaded before preset resolution: no-preset temp chats bypass the preset
     // requirement entirely (assertUsablePreset would otherwise reject them).
-    const chat = chatsSvc.getChat(input.userId, input.chat_id);
-    const connection = resolveChatGenerationConnection(
-      input.userId,
-      chat?.metadata,
-      input.connection_id,
-      {
-        // The connection this request was COMMITTED against, forwarded from
-        // `generation_outbox.connection_id` by the dispatcher. Gated on the
-        // origin for the same reason as below — and because an interactive
-        // caller must not be able to express it at all. `undefined` for
-        // pre-migration rows and for commits where nothing resolved, which then
-        // take the unchanged ladder.
-        authoritativeConnectionId: options?.origin === "edit_and_send"
-          ? options.connectionId
-          : undefined,
-        // Short-circuited on the origin: interactive paths never reach the
-        // settings read, so they issue ZERO extra queries (and
-        // `generate.service.edit-and-send.test.ts` runs startGeneration with no
-        // database at all). Kept for the legacy path only: a row that recorded a
-        // connection returns from rung 0 before this value is ever consulted.
-        preferActiveConnection: options?.origin === "edit_and_send"
-          && readEditAndSendAlwaysUseActiveConnection(input.userId),
-      },
-    );
+    const { chat, connection } = admitted ?? resolveResponseGenerationAdmission(input, options);
     input.connection_id = connection.id;
     const isNoPresetChat = isNoPresetChatMetadata(chat?.metadata);
     if (isNoPresetChat) {
@@ -4224,6 +4221,7 @@ async function startResponseGeneration(
       characterId: targetCharId,
       model: connection.model,
       provider: connection.provider,
+      connectionId: connection.id,
       targetMessageId: lifecycle.targetMessageId,
       targetSwipeId,
     });
@@ -5603,11 +5601,15 @@ export async function startGeneration(
       startAdmittedAgenticGeneration(agenticInput),
     );
   }
-  // Response resolution enriches its working input; keep those derived fields
-  // isolated from the caller-owned request object.
-  const responseInput: GenerateInput = { ...input };
+  // Resolve and commit the concrete Response connection at admission. Prompt
+  // assembly still owns an isolated working copy of every other derived field.
+  const responseAdmission = resolveResponseGenerationAdmission(input, options);
+  const responseInput: GenerateInput = {
+    ...input,
+    connection_id: responseAdmission.connection.id,
+  };
   return startReservedGeneration(input, "response", () =>
-    startResponseGeneration(responseInput, options),
+    startResponseGeneration(responseInput, options, responseAdmission),
   );
 }
 

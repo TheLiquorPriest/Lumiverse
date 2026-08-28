@@ -24,7 +24,7 @@ export type { Table } from "@lancedb/lancedb";
 import { dirname, join } from "path";
 import { mkdirSync, readdirSync, renameSync, rmdirSync, rmSync, existsSync, readFileSync, statSync, writeFileSync, type Dirent } from "fs";
 import { env } from "../../../env";
-import { getDb } from "../../../db/connection";
+import { getDb, onDbReset } from "../../../db/connection";
 import { embeddingCache } from "../../embedding-cache";
 import { resolveBrokenTermuxLanceDbMirrorPath, resolveLanceDbConnectUri } from "../../../utils/lancedb-path";
 import type { WorldBookVectorIndexStatus } from "../../../types/world-book";
@@ -123,6 +123,7 @@ let connHandle: Connection | null = null;
 let connGeneration = 0;
 let lancedbPathDiagnosticsLogged = false;
 let optimizeTimer: ReturnType<typeof setTimeout> | null = null;
+let deferredOptimizeEpoch = 0;
 const OPTIMIZE_DEBOUNCE_MS = 15_000; // 15 seconds after last write (reduced from 30s)
 /** Grace period for version cleanup — keeps old versions alive long enough for
  *  in-flight reads and eventually-consistent handles to advance. Without this,
@@ -738,12 +739,18 @@ function isIncompleteEmbeddingsTableError(err: unknown, tableName: string): bool
   );
 }
 
-function resetInMemoryVectorStoreState(): void {
-  if (optimizeTimer) {
-    clearTimeout(optimizeTimer);
-    optimizeTimer = null;
-  }
+function cancelDeferredOptimize(): void {
+  deferredOptimizeEpoch += 1;
+  if (optimizeTimer) clearTimeout(optimizeTimer);
+  optimizeTimer = null;
   optimizeQueuedAt = null;
+  optimizeWorldBooksQueued = false;
+  lastChatOptimizeScheduledAt = 0;
+  lastWorldBookOptimizeScheduledAt = 0;
+}
+
+function resetInMemoryVectorStoreState(): void {
+  cancelDeferredOptimize();
   stopIndexHealthMonitor();
   embeddingCache.clear();
 
@@ -1077,6 +1084,7 @@ let optimizeQueuedAt: number | null = null;
 let lastChatOptimizeScheduledAt = 0;
 let lastWorldBookOptimizeScheduledAt = 0;
 let optimizeWorldBooksQueued = false;
+onDbReset(() => cancelDeferredOptimize());
 
 // ---------------------------------------------------------------------------
 // Index health tracking — detect when indexes need rebuilding
@@ -1522,14 +1530,28 @@ export async function runStartupVectorMaintenance(): Promise<void> {
   startIndexHealthMonitor(EMBEDDINGS_TABLE);
 }
 
-export async function optimizeTable(tableNames?: string[]): Promise<void> {
+export async function runAbortFencedNativeMutation<T>(
+  signal: AbortSignal | undefined,
+  mutation: () => Promise<T>,
+): Promise<T> {
+  signal?.throwIfAborted();
+  const result = await mutation();
+  signal?.throwIfAborted();
+  return result;
+}
+
+export async function optimizeTable(tableNames?: string[], signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   const targets = tableNames && tableNames.length > 0
     ? tableNames
     : [EMBEDDINGS_TABLE, WORLD_BOOK_EMBEDDINGS_TABLE];
   await withWriteLock(async () => {
+    signal?.throwIfAborted();
     for (const tableName of targets) {
+      signal?.throwIfAborted();
       try {
         let table = await getTableIfExists(tableName, true);
+        signal?.throwIfAborted();
         if (!table) continue;
         let activeTable: Table = table;
 
@@ -1537,19 +1559,25 @@ export async function optimizeTable(tableNames?: string[]): Promise<void> {
         // optimize already updates indexes; rebuilding every scalar/FTS index
         // again here only creates a second orphaned UUID generation.
         await withMaintenanceExclusive(async () => {
-          await withRetryableLanceWriteConflictRetry(`${tableName}: optimize`, tableName, async () => {
+          signal?.throwIfAborted();
+          await withRetryableLanceWriteConflictRetry(tableName + ": optimize", tableName, async () => {
+            signal?.throwIfAborted();
             activeTable = await reopenTableForWrite(tableName);
-            await activeTable.optimize({
+            signal?.throwIfAborted();
+            await runAbortFencedNativeMutation(signal, () => activeTable.optimize({
               cleanupOlderThan: new Date(Date.now() - CLEANUP_GRACE_PERIOD_MS),
-            });
+            }));
           });
+          signal?.throwIfAborted();
           sweepTableEmptyIndexDirs(tableName);
         });
       } catch (err) {
-        console.warn(`[embeddings] Optimize failed for ${tableName}:`, err);
+        signal?.throwIfAborted();
+        console.warn("[embeddings] Optimize failed for " + tableName + ":", err);
       }
     }
   });
+  signal?.throwIfAborted();
 }
 
 export interface CombinedVectorStoreHealth {
@@ -1672,7 +1700,11 @@ export async function getVectorStoreHealth(): Promise<CombinedVectorStoreHealth>
   };
 }
 
-export function scheduleOptimize(reason: "general" | "chat_chunk" | "world_book" = "general"): void {
+export function scheduleOptimize(
+  reason: "general" | "chat_chunk" | "world_book" = "general",
+  signal?: AbortSignal,
+): void {
+  signal?.throwIfAborted();
   const now = Date.now();
   if (reason === "chat_chunk") {
     // Chat memory writes are high-frequency, but they share the same Lance table
@@ -1680,15 +1712,11 @@ export function scheduleOptimize(reason: "general" | "chat_chunk" | "world_book"
     // every chat-churn window can make disk usage balloon during active chats.
     // Rate-limit the background optimize for chat-only writes. Lorebook edits are
     // independently rate-limited below so typing does not rewrite the table.
-    if (now - lastChatOptimizeScheduledAt < CHAT_OPTIMIZE_MIN_INTERVAL_MS) {
-      return;
-    }
+    if (now - lastChatOptimizeScheduledAt < CHAT_OPTIMIZE_MIN_INTERVAL_MS) return;
     lastChatOptimizeScheduledAt = now;
   }
   if (reason === "world_book") {
-    if (now - lastWorldBookOptimizeScheduledAt < WORLD_BOOK_OPTIMIZE_MIN_INTERVAL_MS) {
-      return;
-    }
+    if (now - lastWorldBookOptimizeScheduledAt < WORLD_BOOK_OPTIMIZE_MIN_INTERVAL_MS) return;
     lastWorldBookOptimizeScheduledAt = now;
     optimizeWorldBooksQueued = true;
   }
@@ -1698,17 +1726,28 @@ export function scheduleOptimize(reason: "general" | "chat_chunk" | "world_book"
   const delay = elapsed >= OPTIMIZE_MAX_WAIT_MS
     ? 0
     : Math.min(OPTIMIZE_DEBOUNCE_MS, OPTIMIZE_MAX_WAIT_MS - elapsed);
+  const admittedEpoch = deferredOptimizeEpoch;
   optimizeTimer = setTimeout(async () => {
     optimizeTimer = null;
     optimizeQueuedAt = null;
+    if (admittedEpoch !== deferredOptimizeEpoch || signal?.aborted) return;
     try {
       const includeWorldBooks = optimizeWorldBooksQueued;
       optimizeWorldBooksQueued = false;
-      await optimizeTable(includeWorldBooks ? undefined : [EMBEDDINGS_TABLE]);
+      signal?.throwIfAborted();
+      if (admittedEpoch !== deferredOptimizeEpoch) return;
+      await optimizeTable(includeWorldBooks ? undefined : [EMBEDDINGS_TABLE], signal);
+      signal?.throwIfAborted();
+      if (admittedEpoch !== deferredOptimizeEpoch) return;
     } catch (err) {
+      if (signal?.aborted || admittedEpoch !== deferredOptimizeEpoch) return;
       console.warn("[embeddings] Deferred optimize failed:", err);
     }
   }, delay);
+}
+
+export function isDeferredOptimizeScheduled(): boolean {
+  return optimizeTimer !== null;
 }
 
 /**
@@ -1735,13 +1774,18 @@ export async function safeTableDelete(
   table: Table,
   filter: string,
   reason: "general" | "chat_chunk" | "world_book" = "general",
+  signal?: AbortSignal,
 ): Promise<void> {
-  if ((await table.countRows()) === 0) return;
+  signal?.throwIfAborted();
+  const rowCount = await table.countRows();
+  signal?.throwIfAborted();
+  if (rowCount === 0) return;
   try {
-    await table.delete(filter);
+    await runAbortFencedNativeMutation(signal, () => table.delete(filter));
   } catch (err) {
+    signal?.throwIfAborted();
     if (!isEmptyFragmentDeleteError(err)) throw err;
-    scheduleOptimize(reason);
+    scheduleOptimize(reason, signal);
   }
 }
 
@@ -2059,36 +2103,49 @@ export class LanceDbStore implements VectorStore {
     })).filter((row) => row.vector.length > 0);
   }
 
-  async deleteByFilter(collection: CollectionName, filter: VectorFilter): Promise<void> {
+  async deleteByFilter(collection: CollectionName, filter: VectorFilter, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const tableName = collectionToTable(collection);
     await withWriteLock(async () => {
+      signal?.throwIfAborted();
       let table = await getTableIfExists(tableName, true);
+      signal?.throwIfAborted();
       if (!table) return;
-      await withRetryableLanceWriteConflictRetry(`${tableName}: delete by filter`, tableName, async () => {
+      await withRetryableLanceWriteConflictRetry(tableName + ": delete by filter", tableName, async () => {
+        signal?.throwIfAborted();
         table = await reopenTableForWrite(tableName);
-        await safeTableDelete(table, translateFilter(filter), "general");
+        signal?.throwIfAborted();
+        await safeTableDelete(table, translateFilter(filter), "general", signal);
       });
     });
-    scheduleOptimize("general");
+    signal?.throwIfAborted();
+    scheduleOptimize("general", signal);
   }
 
-  async deleteByIds(collection: CollectionName, ids: string[]): Promise<void> {
+  async deleteByIds(collection: CollectionName, ids: string[], signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (ids.length === 0) return;
     const tableName = collectionToTable(collection);
     await withWriteLock(async () => {
+      signal?.throwIfAborted();
       let table = await getTableIfExists(tableName, true);
+      signal?.throwIfAborted();
       if (!table) return;
       const BATCH = 500;
       for (let i = 0; i < ids.length; i += BATCH) {
+        signal?.throwIfAborted();
         const batch = ids.slice(i, i + BATCH);
-        const filter = `id IN (${batch.map((id) => sqlValue(id)).join(", ")})`;
-        await withRetryableLanceWriteConflictRetry(`${tableName}: delete batch`, tableName, async () => {
+        const filter = "id IN (" + batch.map((id) => sqlValue(id)).join(", ") + ")";
+        await withRetryableLanceWriteConflictRetry(tableName + ": delete batch", tableName, async () => {
+          signal?.throwIfAborted();
           table = await reopenTableForWrite(tableName);
-          await safeTableDelete(table, filter, "general");
+          signal?.throwIfAborted();
+          await safeTableDelete(table, filter, "general", signal);
         });
       }
     });
-    scheduleOptimize("general");
+    signal?.throwIfAborted();
+    scheduleOptimize("general", signal);
   }
 
   async vectorSearch(opts: SearchOptions): Promise<VectorHit[]> {
@@ -2184,9 +2241,11 @@ export class LanceDbStore implements VectorStore {
     return (rows as any[]).length;
   }
 
-  async optimize(collections?: CollectionName[]): Promise<void> {
+  async optimize(collections?: CollectionName[], signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const tables = collections?.map(collectionToTable);
-    await optimizeTable(tables);
+    await optimizeTable(tables, signal);
+    signal?.throwIfAborted();
   }
 
   async health(collection: CollectionName): Promise<TableHealth> {
