@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Hono } from "hono";
 import { strFromU8, unzipSync } from "fflate";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { migrateLegacyImageGenerationSecrets } from "../services/image-gen.service";
 import { runMigrations } from "../db/migrate";
 import { initIdentity } from "../crypto/init";
 import { env } from "../env";
@@ -74,40 +75,6 @@ function seedLegacySettings(
     ],
   });
 }
-
-function rejectLaterLegacyProvider(): void {
-  getDb().run(
-    "CREATE TRIGGER reject_second_legacy_provider "
-      + "BEFORE INSERT ON image_gen_connections "
-      + "WHEN NEW.provider = 'novelai' "
-      + "BEGIN SELECT RAISE(ABORT, 'forced later-provider failure'); END",
-  );
-}
-
-async function requestSecretExportPreparation(): Promise<Response> {
-  return await app.request(
-    "http://localhost/api/v1/user-data/export/prepare",
-    {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-test-user": SOURCE_USER },
-      body: JSON.stringify({ includeSecrets: true, includeVectors: false }),
-    },
-  );
-}
-
-async function expectRetainedNanoPair(settingsBefore: unknown): Promise<void> {
-  const connections = imageGenConnSvc.listConnections(SOURCE_USER, { limit: 20, offset: 0 });
-  expect(connections.total).toBe(1);
-  const nano = connections.data[0]!;
-  expect(nano).toMatchObject({ provider: "nanogpt", has_api_key: true, is_default: true });
-  const secretKey = imageGenConnectionSecretKey(nano.id);
-  expect(listSecretKeys(SOURCE_USER)).toEqual([secretKey]);
-  expect(await getSecret(SOURCE_USER, secretKey)).toBe(NANO_SECRET);
-  expect(imageGenConnSvc.getDefaultConnection(SOURCE_USER)?.id).toBe(nano.id);
-  expect(settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value).toEqual(settingsBefore);
-  expect(prepareCacheSize()).toBe(0);
-}
-
 
 function archiveRows(
   archive: Record<string, Uint8Array>,
@@ -566,70 +533,102 @@ describe("legacy image credentials at user-data ticket preparation", () => {
     expect(prepareCacheSize()).toBe(0);
   });
 
-  test("rollback database failure retains a complete staged pair and plaintext", async () => {
-    seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
-    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
-    rejectLaterLegacyProvider();
-    getDb().run(
-      "CREATE TRIGGER reject_compensation_profile_delete "
-        + "BEFORE DELETE ON image_gen_connections "
-        + "WHEN OLD.provider = 'nanogpt' "
-        + "BEGIN SELECT RAISE(ABORT, 'forced compensation database failure'); END",
-    );
-
-    const response = await requestSecretExportPreparation();
-    expect(response.status).toBe(500);
-    expect(await response.json()).toMatchObject({
-      error: expect.stringContaining("staged profile-secret pairs and plaintext settings were retained"),
+  test("settings CAS failure exposes no staged profile or event and preserves a coherent concurrent selection", async () => {
+    const existing = await imageGenConnSvc.createConnection(SOURCE_USER, {
+      name: "Concurrent canonical selection",
+      provider: "comfyui",
+      is_default: true,
     });
-    await expectRetainedNanoPair(settingsBefore);
+    seedLegacySettings(SOURCE_USER, existing.id, "nanogpt");
+    await Bun.sleep(0);
+
+    const generatedIds: string[] = [];
+    const originalRandomUUID = crypto.randomUUID.bind(crypto);
+    const uuidSpy = spyOn(crypto, "randomUUID").mockImplementation(() => {
+      const id = originalRandomUUID();
+      generatedIds.push(id);
+      return id;
+    });
+    const originalPrepare = secretsSvc.prepareSecretWrite;
+    const { promise: encryptionGate, resolve: releaseEncryption } = Promise.withResolvers<void>();
+    const { promise: encryptionStarted, resolve: signalEncryptionStarted } = Promise.withResolvers<void>();
+    const prepareSpy = spyOn(secretsSvc, "prepareSecretWrite").mockImplementation(async (value) => {
+      signalEncryptionStarted();
+      await encryptionGate;
+      return originalPrepare(value);
+    });
+    const connectionEvents: unknown[] = [];
+    const stopListening = eventBus.onInternal(EventType.IMAGE_GEN_CONNECTION_CHANGED, (event) => {
+      connectionEvents.push(event.payload);
+    });
+
+    try {
+      const migration = migrateLegacyImageGenerationSecrets(SOURCE_USER);
+      await encryptionStarted;
+      const stagedId = generatedIds[0]!;
+      expect(stagedId).toBeString();
+      expect(imageGenConnSvc.getUsableConnection(SOURCE_USER, stagedId)).toBeNull();
+      expect(imageGenConnSvc.listConnections(SOURCE_USER, { limit: 20, offset: 0 }).data).toEqual([existing]);
+      expect(connectionEvents).toEqual([]);
+
+      const concurrent = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+      const attemptedSelection = imageGenConnSvc.getUsableConnection(SOURCE_USER, stagedId)?.id ?? existing.id;
+      settingsSvc.putSetting(SOURCE_USER, "imageGeneration", {
+        ...concurrent,
+        activeImageGenConnectionId: attemptedSelection,
+        concurrentMutation: true,
+      });
+      releaseEncryption();
+      await expect(migration).rejects.toThrow("Legacy image settings changed during migration");
+      await Bun.sleep(0);
+
+      expect(imageGenConnSvc.listConnections(SOURCE_USER, { limit: 20, offset: 0 }).data).toEqual([existing]);
+      expect(listSecretKeys(SOURCE_USER)).toEqual([]);
+      expect(connectionEvents).toEqual([]);
+      const finalValue = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
+      expect(finalValue).toMatchObject({
+        activeImageGenConnectionId: existing.id,
+        concurrentMutation: true,
+      });
+      expect(imageGenConnSvc.getUsableConnection(SOURCE_USER, finalValue.activeImageGenConnectionId)?.id).toBe(existing.id);
+    } finally {
+      releaseEncryption();
+      stopListening();
+      prepareSpy.mockRestore();
+      uuidSpy.mockRestore();
+    }
   });
 
-  test("secret deletion failure retains a complete staged pair and plaintext", async () => {
+  test("database replacement during migration encryption cancels without touching colliding replacement rows", async () => {
     seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
-    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
-    rejectLaterLegacyProvider();
-    const deleteSpy = spyOn(secretsSvc, "deleteSecret").mockImplementation(() => {
-      throw new Error("forced compensation secret deletion failure");
+    const originalPrepare = secretsSvc.prepareSecretWrite;
+    const { promise: encryptionGate, resolve: releaseEncryption } = Promise.withResolvers<void>();
+    const { promise: encryptionStarted, resolve: signalEncryptionStarted } = Promise.withResolvers<void>();
+    const prepareSpy = spyOn(secretsSvc, "prepareSecretWrite").mockImplementation(async (value) => {
+      signalEncryptionStarted();
+      await encryptionGate;
+      return originalPrepare(value);
     });
 
-    let response: Response;
     try {
-      response = await requestSecretExportPreparation();
-    } finally {
-      deleteSpy.mockRestore();
-    }
-    expect(response.status).toBe(500);
-    expect(await response.json()).toMatchObject({
-      error: expect.stringContaining("staged profile-secret pairs and plaintext settings were retained"),
-    });
-    await expectRetainedNanoPair(settingsBefore);
-  });
+      const migration = migrateLegacyImageGenerationSecrets(SOURCE_USER);
+      await encryptionStarted;
+      closeDatabase();
+      initDatabase(":memory:");
+      await runMigrations(getDb());
+      seedUser(SOURCE_USER);
+      seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
+      const replacementValue = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
 
-  test("combined secret mutation and rollback trigger still retain the paired staged state", async () => {
-    seedLegacySettings(SOURCE_USER, undefined, "nanogpt");
-    const settingsBefore = settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value;
-    rejectLaterLegacyProvider();
-    getDb().run(
-      "CREATE TRIGGER reject_combined_profile_delete "
-        + "BEFORE DELETE ON image_gen_connections "
-        + "WHEN OLD.provider = 'nanogpt' "
-        + "BEGIN SELECT RAISE(ABORT, 'forced combined rollback failure'); END",
-    );
-    const originalDeleteSecret = secretsSvc.deleteSecret;
-    const deleteSpy = spyOn(secretsSvc, "deleteSecret").mockImplementation((userId, key) => {
-      originalDeleteSecret(userId, key);
-      throw new Error("forced failure after secret deletion");
-    });
-
-    let response: Response;
-    try {
-      response = await requestSecretExportPreparation();
+      releaseEncryption();
+      await expect(migration).rejects.toMatchObject({ code: "database_generation_cancelled" });
+      expect(imageGenConnSvc.listConnections(SOURCE_USER, { limit: 20, offset: 0 }).total).toBe(0);
+      expect(listSecretKeys(SOURCE_USER)).toEqual([]);
+      expect(settingsSvc.getSetting(SOURCE_USER, "imageGeneration")!.value).toEqual(replacementValue);
     } finally {
-      deleteSpy.mockRestore();
+      releaseEncryption();
+      prepareSpy.mockRestore();
     }
-    expect(response.status).toBe(500);
-    await expectRetainedNanoPair(settingsBefore);
   });
 
   test("connection mutation serialization is same-owner keyed rather than global", async () => {

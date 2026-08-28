@@ -8,6 +8,10 @@ import type { EmbeddingConfigWithStatus } from "./embeddings.service";
 import * as memoryCortex from "./memory-cortex";
 import * as vectorizationQueueSvc from "./vectorization-queue.service";
 import { __test__ as userDataImportTest } from "./user-data/import.service";
+import {
+  __test__ as maintenanceTest,
+  trackChatChunkMaintenance,
+} from "./chat-chunk-maintenance.service";
 
 const USER_ID = "maintenance-owner";
 
@@ -89,6 +93,24 @@ describe.serial("chat chunk maintenance lifecycle", () => {
       () => { pending = false; },
     );
     return () => pending;
+  }
+
+  async function replaceDatabaseWithCollision(
+    chatId: string,
+    messageId: string,
+    chunkId: string,
+  ): Promise<void> {
+    closeDatabase();
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+    getDb().query(
+      'INSERT INTO "user" (id, name, email, emailVerified) VALUES (?, ?, ?, 1)',
+    ).run(USER_ID, "Replacement Owner", "replacement-owner@example.test");
+    getDb().run("CREATE TABLE lifecycle_probe (stage TEXT PRIMARY KEY)");
+    const replacement = createTemporaryChat();
+    getDb().query("UPDATE chats SET id = ? WHERE id = ?").run(chatId, replacement.id);
+    seedMessage(chatId, messageId, 0, true, "replacement message");
+    seedChunk(chatId, chunkId, [messageId], 1);
   }
 
   beforeEach(async () => {
@@ -369,4 +391,139 @@ describe.serial("chat chunk maintenance lifecycle", () => {
     expect(getDb().query("SELECT COUNT(*) AS count FROM chat_chunks WHERE chat_id = ?").get(chat.id))
       .toEqual({ count: 1 });
   });
+
+  test("stale vector retry cannot write a replacement database with colliding ids", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "collision-message", 0, true, "old vector source");
+    seedChunk(chat.id, "collision-chunk", ["collision-message"], 1);
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    vectorizationQueueSvc.__test__.setChatChunkBatchProcessor(async (tasks) => {
+      entered.resolve();
+      await gate.promise;
+      getDb().query("UPDATE chat_chunks SET content = 'stale-vector-write' WHERE id = ?")
+        .run(tasks[0]!.chunkId);
+      return { processedCount: tasks.length, failedChunkIds: [], refreshedChatIds: [] };
+    });
+
+    vectorizationQueueSvc.queueChunkVectorization(USER_ID, chat.id, "collision-chunk", 1);
+    await entered.promise;
+    await replaceDatabaseWithCollision(chat.id, "collision-message", "collision-chunk");
+    gate.resolve();
+    await chatsSvc.waitForChatChunkMaintenance(chat.id);
+
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'collision-chunk'").get())
+      .toEqual({ content: "chunk:collision-chunk" });
+  });
+
+  test("stale cache refresh cannot write a replacement database with colliding ids", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "cache-collision-message", 0, true, "old cache source");
+    seedChunk(chat.id, "cache-collision-chunk", ["cache-collision-message"], 1);
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    chatMemoryCacheSvc.__test__.setRefreshChatMemoryCache(async (_userId, chatId) => {
+      entered.resolve();
+      await gate.promise;
+      getDb().query("UPDATE chat_chunks SET content = 'stale-cache-write' WHERE chat_id = ?").run(chatId);
+    });
+
+    chatMemoryCacheSvc.scheduleChatMemoryRefresh(USER_ID, chat.id, 9);
+    await entered.promise;
+    await replaceDatabaseWithCollision(chat.id, "cache-collision-message", "cache-collision-chunk");
+    gate.resolve();
+    await chatsSvc.waitForChatChunkMaintenance(chat.id);
+
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'cache-collision-chunk'").get())
+      .toEqual({ content: "chunk:cache-collision-chunk" });
+  });
+
+  test("stale hash continuation cannot stamp colliding replacement chat metadata", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "hash-collision-message", 0, true, "old hash source");
+    seedChunk(chat.id, "hash-collision-chunk", ["hash-collision-message"], 1);
+    let calls = 0;
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockImplementation(async () => {
+      calls += 1;
+      if (calls === 2) {
+        entered.resolve();
+        await gate.promise;
+      }
+      return enabledEmbeddingConfig;
+    }));
+
+    chatsSvc.updateMessage(USER_ID, "hash-collision-message", { content: "old edit" });
+    await entered.promise;
+    await replaceDatabaseWithCollision(chat.id, "hash-collision-message", "hash-collision-chunk");
+    gate.resolve();
+    await chatsSvc.waitForChatChunkMaintenance(chat.id);
+
+    expect(chatsSvc.getChat(USER_ID, chat.id)?.metadata.ltcm_config_hash).toBeUndefined();
+    expect(chatsSvc.getMessage(USER_ID, "hash-collision-message")?.content).toBe("replacement message");
+  });
+
+  test("stale cortex continuation cannot write a colliding replacement database", async () => {
+    track(spyOn(embeddingsSvc, "getEmbeddingConfig").mockResolvedValue(enabledEmbeddingConfig));
+    track(spyOn(memoryCortex, "isCortexEnabledForChat").mockReturnValue(true));
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    track(spyOn(memoryCortex, "scheduleProcessChunk").mockImplementation(async () => {
+      entered.resolve();
+      await gate.promise;
+      getDb().query("INSERT INTO lifecycle_probe (stage) VALUES ('stale-cortex')").run();
+      return { status: "completed" };
+    }));
+
+    const chat = createTemporaryChat();
+    const message = chatsSvc.createMessage(chat.id, {
+      is_user: true,
+      name: "User",
+      content: "old cortex source",
+    }, USER_ID);
+    await entered.promise;
+    await replaceDatabaseWithCollision(chat.id, message.id, crypto.randomUUID());
+    gate.resolve();
+    await chatsSvc.waitForChatChunkMaintenance(chat.id);
+
+    expect(getDb().query("SELECT stage FROM lifecycle_probe").all()).toEqual([]);
+  });
+
+  test("stale import microtask cannot rebuild colliding replacement rows", async () => {
+    const chat = createTemporaryChat();
+    seedMessage(chat.id, "import-collision-message", 0, true, "old import source");
+
+    expect(userDataImportTest.scheduleDerivedVectorProjectionSync(USER_ID)).toBeGreaterThan(0);
+    await replaceDatabaseWithCollision(chat.id, "import-collision-message", "import-collision-chunk");
+    await chatsSvc.waitForChatChunkMaintenance(chat.id);
+
+    expect(getDb().query("SELECT content FROM chat_chunks WHERE id = 'import-collision-chunk'").get())
+      .toEqual({ content: "chunk:import-collision-chunk" });
+  });
+
+  test("failure summaries remain bounded, are consumed by the barrier, and never go unhandled", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      for (let index = 0; index < 1_000; index += 1) {
+        const chatId = `failure-chat-${index % 20}`;
+        void trackChatChunkMaintenance(chatId, Promise.reject(new Error(`failure-${index}`)));
+      }
+      await Bun.sleep(0);
+      const snapshot = maintenanceTest.snapshot();
+      expect(snapshot.pending).toBe(0);
+      expect(snapshot.failures).toBeLessThanOrEqual(256);
+      expect(Math.max(...Object.values(snapshot.perChatFailures))).toBeLessThanOrEqual(16);
+      await expect(chatsSvc.waitForChatChunkMaintenance()).rejects.toThrow("Chat chunk maintenance failed");
+      expect(maintenanceTest.snapshot()).toEqual({ pending: 0, failures: 0, perChatFailures: {} });
+      await expect(chatsSvc.waitForChatChunkMaintenance()).resolves.toBeUndefined();
+      await Bun.sleep(0);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
 });

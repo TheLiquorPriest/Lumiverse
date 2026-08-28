@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { getDatabasePath, getDb } from "../db/connection";
+import {
+  getDatabasePath,
+  getDb,
+  getDbGeneration,
+  isDatabaseGenerationCancellation,
+  onDbReset,
+  runWithDbGeneration,
+} from "../db/connection";
 import { healCorruptDatabase } from "../db/maintenance";
 import { bumpChatAndMessageGenerationRevision, bumpChatGenerationRevision, bumpMessageGenerationRevision } from "./chat-generation-revision.service";
 import { eventBus } from "../ws/bus";
@@ -2852,7 +2859,9 @@ export function createMessage(chatId: string, input: CreateMessageInput, userId:
 
   if (userId) {
     updateChatChunks(userId, chatId, message).catch(err => {
-      console.warn("[chats] Failed to update chunks:", err);
+      if (!isDatabaseGenerationCancellation(err)) {
+        console.warn("[chats] Failed to update chunks:", err);
+      }
     });
   }
 
@@ -3205,7 +3214,9 @@ export function updateMessage(userId: string, id: string, input: UpdateMessageIn
     } catch { /* ignore if not loaded */ }
 
     rebuildChatChunksFromMessages(userId, updated.chat_id, [updated.id]).catch(err => {
-      console.warn("[chats] Failed to rebuild chunks after message edit:", err);
+      if (!isDatabaseGenerationCancellation(err)) {
+        console.warn("[chats] Failed to rebuild chunks after message edit:", err);
+      }
     });
   }
 
@@ -4596,9 +4607,10 @@ function restoreSalienceForRebuiltChunk(chatId: string, chunk: ChatChunk, salien
 }
 
 function updateChatChunks(userId: string, chatId: string, newMessage: Message): Promise<void> {
+  const generation = getDbGeneration();
   return trackChatChunkMaintenance(
     chatId,
-    updateChatChunksImpl(userId, chatId, newMessage),
+    runWithDbGeneration(generation, () => updateChatChunksImpl(userId, chatId, newMessage)),
   );
 }
 
@@ -4823,6 +4835,7 @@ export async function ensureChatMemoryFresh(userId: string, chatId: string): Pro
     await rebuildChatChunks(userId, chatId);
     return true;
   } catch (err) {
+    if (isDatabaseGenerationCancellation(err)) throw err;
     console.warn("[chats] LTCM freshness check failed:", err);
     return false;
   }
@@ -4896,6 +4909,10 @@ export function waitForChatChunkMaintenance(chatId?: string): Promise<void> {
  */
 const _rebuildInflight = new Map<string, Promise<void>>();
 const _rebuildPending = new Set<string>();
+onDbReset(() => {
+  _rebuildInflight.clear();
+  _rebuildPending.clear();
+});
 
 export function isChatChunkRebuildInProgress(chatId: string): boolean {
   return _rebuildInflight.has(chatId);
@@ -4910,7 +4927,11 @@ export function isChatChunkRebuildInProgress(chatId: string): boolean {
  * rebuild runs to capture any changes that landed during the first.
  */
 export function rebuildChatChunks(userId: string, chatId: string): Promise<void> {
-  return trackChatChunkMaintenance(chatId, runChatChunkRebuild(userId, chatId));
+  const generation = getDbGeneration();
+  return trackChatChunkMaintenance(
+    chatId,
+    runWithDbGeneration(generation, () => runChatChunkRebuild(userId, chatId)),
+  );
 }
 
 async function runChatChunkRebuild(userId: string, chatId: string): Promise<void> {
@@ -4954,9 +4975,13 @@ export function rebuildChatChunksFromMessages(
   chatId: string,
   affectedMessageIds: Iterable<string>,
 ): Promise<void> {
+  const generation = getDbGeneration();
   return trackChatChunkMaintenance(
     chatId,
-    runChatChunkRebuildFromMessages(userId, chatId, affectedMessageIds),
+    runWithDbGeneration(
+      generation,
+      () => runChatChunkRebuildFromMessages(userId, chatId, affectedMessageIds),
+    ),
   );
 }
 

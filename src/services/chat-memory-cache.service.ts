@@ -1,4 +1,11 @@
-import { getDb } from "../db/connection";
+import {
+  DatabaseGenerationCancelledError,
+  getDb,
+  getDbGeneration,
+  isDatabaseGenerationCancellation,
+  onDbReset,
+  runWithDbGeneration,
+} from "../db/connection";
 import * as embeddingsSvc from "./embeddings.service";
 import { type SanitizeOptions } from "../utils/content-sanitizer";
 import { getReasoningStripOptions } from "../utils/reasoning-strip";
@@ -62,6 +69,7 @@ export interface CachedChatMemoryResult {
 }
 
 interface RefreshJob {
+  generation: number;
   userId: string;
   chatId: string;
   priority: number;
@@ -529,6 +537,7 @@ async function computeFreshMemoryResult(
       retrievalMode: chunks.length > 0 ? "vector" : "empty",
     };
   } catch (err) {
+    if (isDatabaseGenerationCancellation(err)) throw err;
     console.warn("[chat-memory-cache] Background refresh failed, storing recency fallback:", err);
     const chunks = getRecentFallbackChunks(chatId, effectiveTopK, excludeIds);
     return {
@@ -556,7 +565,7 @@ class ChatMemoryRefreshQueue {
 
   add(job: RefreshJob): void {
     const existing = this.queue.findIndex((entry) =>
-      entry.userId === job.userId && entry.chatId === job.chatId,
+      entry.generation === job.generation && entry.userId === job.userId && entry.chatId === job.chatId,
     );
 
     if (existing >= 0) {
@@ -586,14 +595,18 @@ class ChatMemoryRefreshQueue {
       while (this.queue.length > 0) {
         const job = this.queue.shift()!;
         try {
-          if (refreshChatMemoryCacheOverride) {
-            await refreshChatMemoryCacheOverride(job.userId, job.chatId);
-          } else {
-            await refreshChatMemoryCache(job.userId, job.chatId);
-          }
+          await runWithDbGeneration(job.generation, async () => {
+            if (refreshChatMemoryCacheOverride) {
+              await refreshChatMemoryCacheOverride(job.userId, job.chatId);
+            } else {
+              await refreshChatMemoryCache(job.userId, job.chatId);
+            }
+          });
           for (const settlement of job.settlements) settlement.resolve();
         } catch (err) {
-          console.error(`[chat-memory-cache] Refresh failed for chat ${job.chatId}:`, err);
+          if (!isDatabaseGenerationCancellation(err)) {
+            console.error(`[chat-memory-cache] Refresh failed for chat ${job.chatId}:`, err);
+          }
           for (const settlement of job.settlements) settlement.reject(err);
         }
       }
@@ -602,14 +615,38 @@ class ChatMemoryRefreshQueue {
       if (this.queue.length > 0) this.schedule();
     }
   }
+
+  invalidateStale(currentGeneration: number): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    const retained: RefreshJob[] = [];
+    for (const job of this.queue) {
+      if (job.generation === currentGeneration) {
+        retained.push(job);
+        continue;
+      }
+      const cancellation = new DatabaseGenerationCancelledError(job.generation, currentGeneration);
+      for (const settlement of job.settlements) settlement.reject(cancellation);
+    }
+    this.queue = retained;
+  }
 }
 
 const refreshQueue = new ChatMemoryRefreshQueue();
+onDbReset(() => refreshQueue.invalidateStale(getDbGeneration()));
 
 export function scheduleChatMemoryRefresh(userId: string, chatId: string, priority = 5): void {
   const { promise, resolve, reject } = Promise.withResolvers<void>();
   void trackChatChunkMaintenance(chatId, promise);
-  refreshQueue.add({ userId, chatId, priority, settlements: [{ resolve, reject }] });
+  refreshQueue.add({
+    generation: getDbGeneration(),
+    userId,
+    chatId,
+    priority,
+    settlements: [{ resolve, reject }],
+  });
 }
 
 export const __test__ = {

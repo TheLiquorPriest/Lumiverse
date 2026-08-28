@@ -303,6 +303,11 @@ On success, the ticket binds the archive ID and complete exact secret index,
 and the closed response field is always `unreachableSecrets: []`. A
 later missing row or decryption failure for any bound key aborts archive
 generation rather than producing a usable partial secret package.
+Legacy NanoGPT and NovelAI setting credentials are normalized before ticket
+admission. Encryption happens before SQLite; the scrubbed setting CAS, active
+connection identity, profile/default rows, and encrypted secret rows then commit
+in one synchronous transaction. Connection and settings events are emitted only
+after commit, so a CAS or statement failure exposes no staged profile.
 
 ### Import validation and staging database
 
@@ -426,6 +431,12 @@ only durable proof that canonical data committed.
 The running job then schedules derived vector projection; a queue failure keeps
 the receipt authoritative with `rebuild_required`/`projectionPending` state and
 recoverable error evidence.
+Every delayed chunk, vector, cache, and import-rebuild continuation is admitted
+against the current database generation. Closing or replacing SQLite invalidates
+queued work centrally; an in-flight continuation observes a typed cancellation
+before its next database access. Generation cancellation is normal lifecycle
+control, not projection failure, and can never target equal IDs in a replacement
+database.
 
 Do not describe this as one filesystem transaction: SQLite can roll back the
 relational transaction, but it cannot roll back a hard link or copy. The

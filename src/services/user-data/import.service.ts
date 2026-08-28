@@ -43,7 +43,12 @@ import {
 } from "fs";
 import { lstat as lstatAsync, open as openAsync, unlink as unlinkAsync } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
-import { getDb } from "../../db/connection";
+import {
+  getDb,
+  getDbGeneration,
+  isDatabaseGenerationCancellation,
+  runWithDbGeneration,
+} from "../../db/connection";
 import { env } from "../../env";
 import { getEncryptionKeyBytes } from "../../crypto/init";
 import { eventBus } from "../../ws/bus";
@@ -7505,6 +7510,7 @@ function scheduleDerivedVectorProjectionSyncDetailed(
   userId: string,
   priorProgress?: unknown,
 ): VectorProjectionSchedule {
+  const generation = getDbGeneration();
   const db = getDb();
   const progress = copyVectorRebuildProgress(priorProgress);
   let queued = 0;
@@ -7539,13 +7545,15 @@ function scheduleDerivedVectorProjectionSyncDetailed(
     ? page<{ id: string }>(chatState, chatPage.sql.replaceAll("id > ?", "c.id > ?"), chatPage.args, (chat) => {
       const exists = db.query("SELECT 1 FROM chat_chunks WHERE chat_id = ? LIMIT 1").get(chat.id);
       if (!exists) {
-        const admission = import("../chats.service").then(({ rebuildChatChunks }) => {
-          void rebuildChatChunks(userId, chat.id).catch((err) => {
-            console.error(`[user-data-import] Chat chunk rebuild failed for ${chat.id}:`, err);
-          });
+        const admission = runWithDbGeneration(generation, async () => {
+          const { rebuildChatChunks } = await import("../chats.service");
+          await rebuildChatChunks(userId, chat.id);
         });
-        void trackChatChunkMaintenance(chat.id, admission).catch((err) => {
-          console.error(`[user-data-import] Chat chunk rebuild admission failed for ${chat.id}:`, err);
+        void trackChatChunkMaintenance(chat.id, admission);
+        void admission.catch((err) => {
+          if (!isDatabaseGenerationCancellation(err)) {
+            console.error(`[user-data-import] Chat chunk rebuild failed for ${chat.id}:`, err);
+          }
         });
         queued++;
         chatState.queued++;
@@ -7615,9 +7623,10 @@ function scheduleDerivedVectorProjectionSyncDetailed(
           markDatabankDocumentRebuildBlocked(db, document.id, userId);
           return;
         }
-        void import("../databank/vectorization.service")
-          .then(({ processDocument }) => processDocument(userId, document.id))
-          .catch(() => {});
+        void runWithDbGeneration(generation, async () => {
+          const { processDocument } = await import("../databank/vectorization.service");
+          await processDocument(userId, document.id);
+        }).catch(() => {});
         queued++;
         databankState.queued++;
       },

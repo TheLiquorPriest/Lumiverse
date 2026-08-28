@@ -1,4 +1,4 @@
-import { getDb } from "../db/connection";
+import { getDb, getDbForGeneration, getDbGeneration, runWithDbGeneration } from "../db/connection";
 import { BUILTIN_TOOLS_MAP } from "./council/builtin-tools";
 import { getSidecarSettings } from "./sidecar-settings.service";
 import * as settingsSvc from "./settings.service";
@@ -1875,146 +1875,108 @@ async function findLegacyImageConnection(
   }
 }
 
-async function ensureLegacyImageConnection(
-  userId: string,
+interface StagedLegacyImageConnection {
+  provider: LegacyImageProvider;
+  id: string;
+  existing: ImageGenConnectionProfile | null;
+  model: string;
+  defaultParameters: Record<string, any>;
+  preparedSecret: secretsSvc.PreparedSecretWrite | null;
+  isDefault: boolean;
+}
+
+function legacyDefaultParameters(
   provider: LegacyImageProvider,
   legacy: Record<string, any>,
-  apiKey: string,
-  isDefault: boolean,
-): Promise<ImageGenConnectionProfile> {
-  let connection = await findLegacyImageConnection(userId, provider, apiKey);
-  if (!connection) {
-    connection = provider === "nanogpt"
-      ? await imageGenConnSvc.createConnection(userId, {
-          name: LEGACY_IMAGE_CONNECTION_NAMES.nanogpt,
-          provider,
-          model: legacy.model || "hidream",
-          is_default: isDefault,
-          default_parameters: {
-            size: legacy.size || "1024x1024",
-            strength: legacy.strength ?? 0.8,
-            guidanceScale: legacy.guidanceScale ?? 7.5,
-            numInferenceSteps: legacy.numInferenceSteps ?? 30,
-            seed: legacy.seed ?? null,
-            referenceImages: legacy.referenceImages || [],
-          },
-          api_key: apiKey,
-        })
-      : await imageGenConnSvc.createConnection(userId, {
-          name: LEGACY_IMAGE_CONNECTION_NAMES.novelai,
-          provider,
-          model: legacy.model || "nai-diffusion-4-5-full",
-          is_default: isDefault,
-          default_parameters: {
-            sampler: legacy.sampler || "k_euler_ancestral",
-            resolution: legacy.resolution || "1216x832",
-            steps: legacy.steps ?? 28,
-            guidance: legacy.guidance ?? 5,
-            negativePrompt: legacy.negativePrompt || "",
-            smea: legacy.smea ?? false,
-            smeaDyn: legacy.smeaDyn ?? false,
-            seed: legacy.seed ?? null,
-            referenceImages: legacy.referenceImages || [],
-            includeCharacterAvatar: legacy.includeCharacterAvatar ?? false,
-            includePersonaAvatar: legacy.includePersonaAvatar ?? false,
-            referenceStrength: legacy.referenceStrength ?? 0.5,
-            referenceInfoExtracted: legacy.referenceInfoExtracted ?? 1,
-            referenceFidelity: legacy.referenceFidelity ?? 1,
-            referenceType: legacy.referenceType || "character&style",
-            avatarReferenceType: legacy.avatarReferenceType || "character",
-          },
-          api_key: apiKey,
-        });
-  } else if (isDefault && !connection.is_default) {
-    connection = await imageGenConnSvc.updateConnection(userId, connection.id, { is_default: true })
-      ?? connection;
+): Record<string, any> {
+  if (provider === "nanogpt") {
+    return {
+      size: legacy.size || "1024x1024",
+      strength: legacy.strength ?? 0.8,
+      guidanceScale: legacy.guidanceScale ?? 7.5,
+      numInferenceSteps: legacy.numInferenceSteps ?? 30,
+      seed: legacy.seed ?? null,
+      referenceImages: legacy.referenceImages || [],
+    };
   }
-
-  const secretKey = imageGenConnectionSecretKey(connection.id);
-  const persistedConnection = imageGenConnSvc.getConnection(userId, connection.id);
-  const persistedSecret = await secretsSvc.getSecret(userId, secretKey);
-  if (!persistedConnection?.has_api_key || persistedSecret !== apiKey) {
-    throw new Error(`Legacy ${provider} image API key could not be preserved in canonical encrypted storage`);
-  }
-  return persistedConnection;
+  return {
+    sampler: legacy.sampler || "k_euler_ancestral",
+    resolution: legacy.resolution || "1216x832",
+    steps: legacy.steps ?? 28,
+    guidance: legacy.guidance ?? 5,
+    negativePrompt: legacy.negativePrompt || "",
+    smea: legacy.smea ?? false,
+    smeaDyn: legacy.smeaDyn ?? false,
+    seed: legacy.seed ?? null,
+    referenceImages: legacy.referenceImages || [],
+    includeCharacterAvatar: legacy.includeCharacterAvatar ?? false,
+    includePersonaAvatar: legacy.includePersonaAvatar ?? false,
+    referenceStrength: legacy.referenceStrength ?? 0.5,
+    referenceInfoExtracted: legacy.referenceInfoExtracted ?? 1,
+    referenceFidelity: legacy.referenceFidelity ?? 1,
+    referenceType: legacy.referenceType || "character&style",
+    avatarReferenceType: legacy.avatarReferenceType || "character",
+  };
 }
 
 /**
- * Move every recursively discovered credential for the two legacy image
- * providers into the canonical encrypted connection store. Plaintext fields
- * are removed only after every connection and secret read back successfully.
- *
- * The scan deliberately ignores unrelated image connections: an existing
- * ComfyUI/OpenRouter/etc. profile must never strand these legacy credentials.
+ * Atomically move recursively discovered legacy credentials into canonical
+ * encrypted profiles. No profile, default, secret, or active identity becomes
+ * observable unless the settings compare-and-swap commits in the same SQLite
+ * transaction.
  */
 export async function migrateLegacyImageGenerationSecrets(userId: string): Promise<string[]> {
-  type ConnectionSnapshotRow = {
-    id: string;
-    user_id: string;
-    name: string;
-    provider: string;
-    api_url: string;
-    model: string;
-    is_default: number;
-    has_api_key: number;
-    default_parameters: string;
-    metadata: string;
-    created_at: number;
-    updated_at: number;
-  };
-  type SettingSnapshotRow = { value: string; updated_at: number };
+  const generation = getDbGeneration();
+  return imageGenConnSvc.withImageGenConnectionOwnerLock(userId, () =>
+    runWithDbGeneration(generation, async () => {
+      const initialDb = getDbForGeneration(generation);
+      const originalSettingRow = initialDb.query(
+        "SELECT value, updated_at FROM settings WHERE key = ? AND user_id = ?",
+      ).get(IMAGE_SETTINGS_KEY, userId) as { value: string; updated_at: number } | null;
+      if (!originalSettingRow) return [];
 
-  return imageGenConnSvc.withImageGenConnectionOwnerLock(userId, async () => {
-    const db = getDb();
-    const originalSettingRow = db.query(
-      "SELECT value, updated_at FROM settings WHERE key = ? AND user_id = ?",
-    ).get(IMAGE_SETTINGS_KEY, userId) as SettingSnapshotRow | null;
-    const currentSetting = settingsSvc.getSetting(userId, IMAGE_SETTINGS_KEY);
-    if (!currentSetting || !originalSettingRow) return [];
-    const currentValue = currentSetting.value;
-    if (!currentValue || typeof currentValue !== "object" || Array.isArray(currentValue)) {
-      throw new Error("Legacy image credentials cannot be mapped from a non-object setting");
-    }
-
-    const inspection = inspectLegacyImageGenerationPrivateData(currentValue);
-    if (inspection.credentials.length === 0 && !inspection.changed) return [];
-    if (
-      !inspection.changed
-      || !inspection.scrubbedValue
-      || typeof inspection.scrubbedValue !== "object"
-      || Array.isArray(inspection.scrubbedValue)
-    ) {
-      throw new Error("Legacy image credentials could not be mapped to a safe cleanup");
-    }
-
-    const credentials = new Map<
-      LegacyImageProvider,
-      { apiKey: string; providerSettings: Record<string, any> }
-    >();
-    for (const credential of inspection.credentials) {
-      if (credential.apiKey === null || credential.apiKey === undefined || credential.apiKey === "") continue;
-      if (typeof credential.apiKey !== "string") {
-        throw new Error("Legacy " + credential.provider + " image API key has an unsupported non-empty value");
+      let currentValue: unknown;
+      try {
+        currentValue = JSON.parse(originalSettingRow.value);
+      } catch {
+        throw new Error("Legacy image credentials cannot be mapped from an invalid setting");
       }
-      const existing = credentials.get(credential.provider);
-      if (existing && existing.apiKey !== credential.apiKey) {
-        throw new Error("Legacy " + credential.provider + " image settings contain ambiguous API keys");
+      if (!currentValue || typeof currentValue !== "object" || Array.isArray(currentValue)) {
+        throw new Error("Legacy image credentials cannot be mapped from a non-object setting");
       }
-      if (!existing) {
-        credentials.set(credential.provider, {
-          apiKey: credential.apiKey,
-          providerSettings: credential.providerSettings,
-        });
+
+      const inspection = inspectLegacyImageGenerationPrivateData(currentValue);
+      if (inspection.credentials.length === 0 && !inspection.changed) return [];
+      if (
+        !inspection.changed
+        || !inspection.scrubbedValue
+        || typeof inspection.scrubbedValue !== "object"
+        || Array.isArray(inspection.scrubbedValue)
+      ) {
+        throw new Error("Legacy image credentials could not be mapped to a safe cleanup");
       }
-    }
 
-    const originalConnections = db.query(
-      "SELECT * FROM image_gen_connections WHERE user_id = ? ORDER BY id",
-    ).all(userId) as ConnectionSnapshotRow[];
-    const originalConnectionIds = new Set(originalConnections.map((row) => row.id));
-    const migratedSecretKeys = new Set<string>();
+      const credentials = new Map<LegacyImageProvider, {
+        apiKey: string;
+        providerSettings: Record<string, any>;
+      }>();
+      for (const credential of inspection.credentials) {
+        if (credential.apiKey === null || credential.apiKey === undefined || credential.apiKey === "") continue;
+        if (typeof credential.apiKey !== "string") {
+          throw new Error(`Legacy ${credential.provider} image API key has an unsupported non-empty value`);
+        }
+        const duplicate = credentials.get(credential.provider);
+        if (duplicate && duplicate.apiKey !== credential.apiKey) {
+          throw new Error(`Legacy ${credential.provider} image settings contain ambiguous API keys`);
+        }
+        if (!duplicate) {
+          credentials.set(credential.provider, {
+            apiKey: credential.apiKey,
+            providerSettings: credential.providerSettings,
+          });
+        }
+      }
 
-    try {
       const activeConnectionId = typeof (currentValue as Record<string, unknown>).activeImageGenConnectionId === "string"
         ? (currentValue as Record<string, string>).activeImageGenConnectionId
         : null;
@@ -2023,103 +1985,121 @@ export async function migrateLegacyImageGenerationSecrets(userId: string): Promi
         || imageGenConnSvc.getDefaultConnection(userId) !== null
       );
       const configuredProvider = (currentValue as Record<string, unknown>).provider;
-      const selectedProvider: LegacyImageProvider | null = (
+      const selectedProvider: LegacyImageProvider | null =
         configuredProvider === "nanogpt" || configuredProvider === "novelai"
-      ) ? configuredProvider : null;
-      const migratedConnections = new Map<LegacyImageProvider, ImageGenConnectionProfile>();
+          ? configuredProvider
+          : null;
 
+      const staged: StagedLegacyImageConnection[] = [];
       for (const [provider, credential] of credentials) {
-        const connection = await ensureLegacyImageConnection(
-          userId,
+        const existing = await findLegacyImageConnection(userId, provider, credential.apiKey);
+        const id = existing?.id ?? crypto.randomUUID();
+        staged.push({
           provider,
-          credential.providerSettings,
-          credential.apiKey,
-          !preserveCanonicalSelection && selectedProvider === provider,
-        );
-        migratedConnections.set(provider, connection);
-        migratedSecretKeys.add(imageGenConnectionSecretKey(connection.id));
+          id,
+          existing,
+          model: existing?.model || credential.providerSettings.model || (
+            provider === "nanogpt" ? "hidream" : "nai-diffusion-4-5-full"
+          ),
+          defaultParameters: existing?.default_parameters
+            ?? legacyDefaultParameters(provider, credential.providerSettings),
+          preparedSecret: existing
+            ? null
+            : await secretsSvc.prepareSecretWrite(credential.apiKey),
+          isDefault: !preserveCanonicalSelection && selectedProvider === provider,
+        });
       }
 
       const selectedConnection = selectedProvider === null
         ? null
-        : migratedConnections.get(selectedProvider) ?? null;
+        : staged.find((candidate) => candidate.provider === selectedProvider) ?? null;
+      const scrubbedValue = { ...(inspection.scrubbedValue as Record<string, unknown>) };
       if (!preserveCanonicalSelection && selectedConnection) {
-        Object.defineProperty(inspection.scrubbedValue, "activeImageGenConnectionId", {
-          configurable: true,
-          enumerable: true,
-          value: selectedConnection.id,
-          writable: true,
-        });
+        scrubbedValue.activeImageGenConnectionId = selectedConnection.id;
       }
-
-      const scrubbedSettingJson = JSON.stringify(inspection.scrubbedValue);
-      const residual = inspectLegacyImageGenerationPrivateData(inspection.scrubbedValue);
+      const residual = inspectLegacyImageGenerationPrivateData(scrubbedValue);
       if (residual.credentials.length !== 0 || residual.changed) {
         throw new Error("Legacy image API keys remain after migration cleanup preparation");
       }
+      const scrubbedSettingJson = JSON.stringify(scrubbedValue);
+      const now = Math.floor(Date.now() / 1000);
+      const commitDb = getDbForGeneration(generation);
 
-      db.transaction(() => {
-        const latestSettingRow = db.query(
-          "SELECT value FROM settings WHERE key = ? AND user_id = ?",
-        ).get(IMAGE_SETTINGS_KEY, userId) as { value: string } | null;
-        if (latestSettingRow?.value !== originalSettingRow.value) {
-          throw new Error("Legacy image settings changed during migration");
-        }
-        const updated = db.query(
-          "UPDATE settings SET value = ?, updated_at = ? WHERE key = ? AND user_id = ? AND value = ?",
+      commitDb.transaction(() => {
+        const updated = commitDb.query(
+          "UPDATE settings SET value = ?, updated_at = ? "
+            + "WHERE key = ? AND user_id = ? AND value = ? AND updated_at = ?",
         ).run(
           scrubbedSettingJson,
-          Math.floor(Date.now() / 1000),
+          now,
           IMAGE_SETTINGS_KEY,
           userId,
           originalSettingRow.value,
+          originalSettingRow.updated_at,
         );
         if (updated.changes !== 1) {
-          throw new Error("Legacy image settings could not be committed atomically");
+          throw new Error("Legacy image settings changed during migration");
+        }
+
+        if (staged.some((candidate) => candidate.isDefault)) {
+          commitDb.query(
+            "UPDATE image_gen_connections SET is_default = 0 WHERE user_id = ? AND is_default = 1",
+          ).run(userId);
+        }
+        for (const candidate of staged) {
+          if (candidate.existing) {
+            if (candidate.isDefault && !candidate.existing.is_default) {
+              commitDb.query(
+                "UPDATE image_gen_connections SET is_default = 1, updated_at = ? WHERE id = ? AND user_id = ?",
+              ).run(now, candidate.id, userId);
+            }
+            continue;
+          }
+          commitDb.query(
+            "INSERT INTO image_gen_connections "
+              + "(id, user_id, name, provider, api_url, model, is_default, has_api_key, "
+              + "default_parameters, metadata, created_at, updated_at) "
+              + "VALUES (?, ?, ?, ?, '', ?, ?, 1, ?, '{}', ?, ?)",
+          ).run(
+            candidate.id,
+            userId,
+            LEGACY_IMAGE_CONNECTION_NAMES[candidate.provider],
+            candidate.provider,
+            candidate.model,
+            candidate.isDefault ? 1 : 0,
+            JSON.stringify(candidate.defaultParameters),
+            now,
+            now,
+          );
+          secretsSvc.putPreparedSecret(
+            userId,
+            imageGenConnectionSecretKey(candidate.id),
+            candidate.preparedSecret!,
+          );
         }
       })();
 
+      for (const candidate of staged) {
+        const profile = imageGenConnSvc.getConnection(userId, candidate.id);
+        if (!profile) throw new Error("Committed legacy image connection could not be read back");
+        try {
+          eventBus.emit(
+            EventType.IMAGE_GEN_CONNECTION_CHANGED,
+            { id: profile.id, profile: imageGenConnSvc.toPublicImageGenConnection(profile) },
+            userId,
+          );
+        } catch (broadcastError) {
+          console.error("[image-gen] Legacy connection migration committed but broadcast failed:", broadcastError);
+        }
+      }
       try {
-        eventBus.emit(EventType.SETTINGS_UPDATED, { key: IMAGE_SETTINGS_KEY, value: inspection.scrubbedValue }, userId);
+        eventBus.emit(EventType.SETTINGS_UPDATED, { key: IMAGE_SETTINGS_KEY, value: scrubbedValue }, userId);
       } catch (broadcastError) {
         console.error("[image-gen] Legacy credential migration committed but settings broadcast failed:", broadcastError);
       }
-      return [...migratedSecretKeys].sort();
-    } catch (error) {
-      const currentConnections = db.query(
-        "SELECT id FROM image_gen_connections WHERE user_id = ?",
-      ).all(userId) as Array<{ id: string }>;
-      const createdConnectionIds = currentConnections
-        .map((row) => row.id)
-        .filter((id) => !originalConnectionIds.has(id));
-
-      try {
-        db.transaction(() => {
-          for (const id of createdConnectionIds) {
-            secretsSvc.deleteSecret(userId, imageGenConnectionSecretKey(id));
-            db.query("DELETE FROM image_gen_connections WHERE id = ? AND user_id = ?").run(id, userId);
-          }
-          for (const row of originalConnections) {
-            const restored = db.query(
-              "UPDATE image_gen_connections SET name = ?, provider = ?, api_url = ?, model = ?, "
-                + "is_default = ?, has_api_key = ?, default_parameters = ?, metadata = ?, created_at = ?, updated_at = ? "
-                + "WHERE id = ? AND user_id = ?",
-            ).run(
-              row.name, row.provider, row.api_url, row.model, row.is_default, row.has_api_key,
-              row.default_parameters, row.metadata, row.created_at, row.updated_at, row.id, userId,
-            );
-            if (restored.changes !== 1) throw new Error("Original image connection disappeared during rollback");
-          }
-        })();
-      } catch (rollbackError) {
-        throw new AggregateError(
-          [error, rollbackError],
-          "Legacy image credential migration failed; staged profile-secret pairs and plaintext settings were retained",
-        );
-      }
-      throw error;
-    }
-  });
+      return staged.map((candidate) => imageGenConnectionSecretKey(candidate.id)).sort();
+    }),
+  );
 }
 
 async function maybeAutoMigrate(userId: string, _settings: ImageGenSettings): Promise<void> {
