@@ -31,7 +31,6 @@ function initCharactersTestDb(): void {
     tags TEXT NOT NULL DEFAULT '[]',
     alternate_greetings TEXT NOT NULL DEFAULT '[]',
     extensions TEXT NOT NULL DEFAULT '{}',
-    library_scope TEXT NOT NULL DEFAULT 'mine',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     deleting INTEGER NOT NULL DEFAULT 0
