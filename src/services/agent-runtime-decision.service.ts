@@ -249,6 +249,14 @@ export class RuntimeDecisionTokenStore {
   }
 
   issue(userId: string, decision: RuntimeDecisionInternalV1, request: EffectiveRuntimeRequestV1): { token: string; expiresAt: number } {
+    if (!isRecord(decision.runtimePolicy)) {
+      throw new RuntimeDecisionError(
+        "runtime_policy_invalid",
+        "Runtime decision policy authority is missing.",
+        400,
+        "loom_policy_invalid",
+      );
+    }
     const now = this.now();
     this.purgeExpired(now);
     const userTokens = this.byUser.get(userId);
@@ -286,7 +294,11 @@ export class RuntimeDecisionTokenStore {
     const userTokens = this.byUser.get(stored.userId);
     userTokens?.delete(tokenHash);
     if (userTokens && userTokens.size === 0) this.byUser.delete(stored.userId);
-    if (stored.userId !== userId || stored.decision.expiresAt <= now) return null;
+    if (
+      stored.userId !== userId
+      || stored.decision.expiresAt <= now
+      || !isRecord(stored.decision.runtimePolicy)
+    ) return null;
     return stored;
   }
 

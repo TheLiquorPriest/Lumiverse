@@ -671,6 +671,10 @@ The returned `runtimePolicy` records both decision value and provenance:
   nextTurnOnly: true,
 }
 ```
+The same complete `runtimePolicy` is required on the private frozen decision
+stored behind every one-use token. Missing internal policy authority fails
+closed at token issue or consumption; it is never synthesized from the
+resolved mode.
 
 `PUT /api/v1/chats/:id/agent-mode` accepts exactly
 `{ mode: 'response' | 'agentic', expectedRevision: number }`; `DELETE` on

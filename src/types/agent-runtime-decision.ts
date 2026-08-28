@@ -361,7 +361,8 @@ export interface RuntimeDecisionInternalV1 {
   councilProfile?: Readonly<ResolvedCouncilProfile>;
   /** Concrete sidecar connection identity resolved with the decision. */
   councilConnection?: FrozenConcreteConnectionV1 | null;
-  runtimePolicy?: LoomRuntimePolicyV1;
+  /** Exact policy authority frozen into every internal decision and token. */
+  runtimePolicy: LoomRuntimePolicyV1;
   readinessVector: AgenticReadinessVectorV1;
   issuedAt: number;
   expiresAt: number;

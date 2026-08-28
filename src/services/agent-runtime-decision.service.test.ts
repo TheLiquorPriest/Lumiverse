@@ -68,7 +68,9 @@ function connection(id: string, overrides: Partial<FakeConnection> = {}): FakeCo
       toolContinuationMode: "native",
     },
     ...overrides,
-    effectiveEndpoint: overrides.effectiveEndpoint ?? null,
+    effectiveEndpoint: Object.hasOwn(overrides, "effectiveEndpoint")
+      ? overrides.effectiveEndpoint ?? null
+      : "https://test-provider.example/v1",
   };
 }
 
