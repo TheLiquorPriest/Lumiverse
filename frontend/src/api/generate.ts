@@ -11,6 +11,7 @@ import {
 } from '@/lib/agentRuntimeSelection'
 import type { AgentRuntimeMode } from '@/types/effective-runtime'
 import type { LoomPromptInspectionV1 } from '@/types/agent-runtime'
+import type { AgentRunStopResultV2 } from '@/types/agent-runs'
 
 /** Generation requests go through prompt assembly + council + embedding calls
  *  which can legitimately take longer than the default 30s client timeout. */
@@ -77,10 +78,13 @@ exclude_message_id?: string
   request_authority_id?: string
 }
 
-export interface GenerationStopResult {
-  stopped: boolean
-  status: 'accepted' | 'too_late' | 'not_found'
-}
+export type GenerationStopResult =
+  | { stopped: boolean; status: 'accepted' | 'too_late' | 'not_found'; terminal?: never }
+  | {
+      stopped: false
+      status: 'terminal'
+      terminal: AgentRunStopResultV2 & { generationId: string }
+    }
 
 export interface GenerateResponse {
   generationId: string

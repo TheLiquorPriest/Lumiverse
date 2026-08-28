@@ -16,6 +16,7 @@ import {
 } from "./agentic-generation.service";
 import { getTurnExecution } from "./turn-execution.service";
 import { requestAgentRunStop } from "./agent-run-projection.service";
+import type { AgentRunStopResponseV2 } from "../types/agent-run-projection";
 import { getProvider } from "../llm/registry";
 import {
   AgentToolCapabilityError,
@@ -8016,7 +8017,7 @@ export async function stopGenerationRequestAuthority(
   userId: string,
   chatId: string,
   rawAuthorityId: unknown,
-): Promise<boolean> {
+): Promise<GenerationStopResult> {
   const authorityId = normalizeGenerationRequestAuthorityId(rawAuthorityId);
   if (!userId || !chatId || !authorityId) return false;
   const key = generationRequestAuthorityKey(userId, chatId, authorityId);
@@ -8025,15 +8026,24 @@ export async function stopGenerationRequestAuthority(
   if (!reservation || reservation.userId !== userId || reservation.chatId !== chatId) return true;
   reservation.controller.abort(new DOMException("Generation stopped", "AbortError"));
   if (reservation.generationId) {
-    await stopGeneration(userId, reservation.generationId);
+    const stopped = await stopGeneration(userId, reservation.generationId, chatId);
+    if (stopped !== false) return stopped;
   }
   return true;
 }
+export interface TerminalGenerationStopResult {
+  readonly status: "terminal";
+  readonly generationId: string;
+  readonly run: AgentRunStopResponseV2;
+}
+
+export type GenerationStopResult = boolean | "too_late" | TerminalGenerationStopResult;
+
 function requestDormantAgenticGenerationStop(
   userId: string,
   generationId: string,
   expectedChatId?: string,
-): boolean | "too_late" {
+): GenerationStopResult {
   try {
     const execution = getTurnExecution(generationId, userId);
     if (
@@ -8043,7 +8053,9 @@ function requestDormantAgenticGenerationStop(
     ) return false;
     const stopped = requestAgentRunStop(userId, execution.chatId, execution.id);
     if (!stopped) return false;
-    return stopped.status === "too_late" ? "too_late" : true;
+    if (stopped.status === "too_late") return "too_late";
+    if (stopped.status === "terminal") return { status: "terminal", generationId: execution.id, run: stopped };
+    return true;
   } catch {
     return false;
   }
@@ -8052,7 +8064,7 @@ export async function stopGeneration(
   userId: string,
   generationId: string,
   expectedChatId?: string,
-): Promise<boolean | "too_late"> {
+): Promise<GenerationStopResult> {
   const agenticContext = getActiveAgenticGenerationContext(userId, generationId);
   const agenticResult = await requestAgenticGenerationCancellation(userId, generationId);
   if (agenticResult !== false) {
@@ -8105,7 +8117,7 @@ export async function stopUserGenerations(userId: string): Promise<boolean | "to
 export async function stopChatGenerations(
   userId: string,
   chatId: string,
-): Promise<boolean | "too_late"> {
+): Promise<GenerationStopResult> {
   const agenticResult = await requestAgenticChatCancellation(userId, chatId);
   if (agenticResult !== false) return agenticResult;
   const chatKey = `${userId}:${chatId}`;

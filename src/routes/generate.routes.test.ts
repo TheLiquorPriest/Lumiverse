@@ -53,4 +53,51 @@ describe("generation Stop request authority", () => {
     expect(await response.json()).toEqual({ stopped: true, status: "accepted" });
     expect(exactStop).toHaveBeenCalledWith("user-a", "turn-a", "chat-a");
   });
+  test("canonical dormant failure outranks optimistic request-authority Stop", async () => {
+    const terminal = {
+      status: "terminal" as const,
+      generationId: "turn-failed",
+      run: {
+        version: 2 as const,
+        status: "terminal" as const,
+        turnId: "turn-failed",
+        revision: 4,
+        target: { chatId: "chat-a", generationType: "normal", messageId: null, swipeId: null },
+        workPhase: "WORK",
+        workStatus: "terminal",
+        workOutcome: "failed",
+        reason: "provider_failure",
+        recoveryEligible: true,
+        recoveryAction: "retry",
+        omissionCount: 0,
+        inspectionAttemptId: "turn-failed",
+        error: { code: "agentic_provider_failure" },
+      },
+    } as never;
+    const authorityStop = spyOn(generateService, "stopGenerationRequestAuthority").mockResolvedValue(true);
+    const exactStop = spyOn(generateService, "stopGeneration").mockResolvedValue(terminal);
+    spies.push(authorityStop, exactStop);
+
+    const response = await authenticatedRoutes("user-a").request("/generate/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        generation_id: "turn-failed",
+        chat_id: "chat-a",
+        request_authority_id: "authority-a",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      stopped: false,
+      status: "terminal",
+      terminal: {
+        generationId: "turn-failed",
+        status: "terminal",
+        workOutcome: "failed",
+        reason: "provider_failure",
+      },
+    });
+  });
 });

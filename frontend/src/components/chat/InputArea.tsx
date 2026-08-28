@@ -106,8 +106,10 @@ import { ComposerActionBarLive } from './InputAreaComposerBar'
 import {
   beginGenerationRequest,
   captureGenerationRequest,
+  consumeGenerationStopResult,
   isGenerationRequestCurrentForChat,
   startGenerationWithRecovery,
+  type GenerationStopWireResult,
 } from '@/lib/generation-recovery'
 import { isExtensionComposerActionId } from './composerActionOwnership'
 
@@ -415,6 +417,10 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     generationId: string | null
     stoppedTurnId: string | null
   } | null>(null)
+  const composerStopAuthorityRef = useRef<{
+    generationId: string | null
+    requestAuthorityId: string | null
+  } | null>(null)
   const touchHoldPromptTimerRef = useRef<number>(0)
   const touchQueueArmTimerRef = useRef<number>(0)
   const touchHoldStartedAtRef = useRef(0)
@@ -537,6 +543,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const showStopControl = !isRoomPeer && (isGeneratingInChat || composerAbortInFlight) && !composerAbortSettled
   useEffect(() => {
     pendingAgentStopRef.current = null
+    composerStopAuthorityRef.current = null
     setComposerStopping(false)
     setComposerAbortInFlight(false)
     composerStopResultRef.current = null
@@ -546,22 +553,38 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     composerStopResultRef.current = result
     setComposerStopResult(result)
   }, [])
+  const applyComposerStopResult = useCallback((result: GenerationStopWireResult, knownGenerationId?: string) => {
+    const authority = composerStopAuthorityRef.current
+    composerStopAuthorityRef.current = null
+    recordComposerStopResult(consumeGenerationStopResult(
+      chatId,
+      result,
+      knownGenerationId ?? authority?.generationId ?? undefined,
+      t('generationStatus.error'),
+      authority ? authority.requestAuthorityId : undefined,
+    ))
+  }, [chatId, recordComposerStopResult, t])
   const agentRunSyncStatus = useStore((s) => s.agentRunSyncByChat[chatId])
   const canRetryExactAgentRunLookup = agentRunSyncStatus === 'error'
     || agentRunSyncStatus === 'stale'
   const cancelGenerationLocally = useCallback(() => {
     generationNonceRef.current += 1
-    const stoppedAuthority = useStore.getState().stopGenerationRequest(chatId)
+    const authority = useStore.getState().generationRequests[chatId] ?? null
+    authority?.abortController?.abort(new DOMException('Generation cancelled', 'AbortError'))
     generationAbortControllerRef.current?.abort(new DOMException('Generation cancelled', 'AbortError'))
     generationAbortControllerRef.current = null
-    stopStreaming()
-    return stoppedAuthority
-  }, [chatId, stopStreaming])
+    return authority
+  }, [chatId])
   const beginComposerAbort = useCallback(() => {
     recordComposerStopResult(null)
     setComposerStopping(true)
     setComposerAbortInFlight(true)
-    return cancelGenerationLocally()
+    const authority = cancelGenerationLocally()
+    composerStopAuthorityRef.current = authority ? {
+      generationId: authority.generationId,
+      requestAuthorityId: authority.requestAuthorityId,
+    } : null
+    return authority
   }, [cancelGenerationLocally, recordComposerStopResult])
   const settleComposerAbort = useCallback(() => {
     setComposerAbortInFlight(false)
@@ -581,14 +604,14 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
       if (pendingAgentStopRef.current === pending && pending.stoppedTurnId === activeAgentRun.turnId) {
         pendingAgentStopRef.current = null
       }
-      recordComposerStopResult(result.status)
+      applyComposerStopResult(result, activeAgentRun.generationId)
     }).catch(() => {
       if (pendingAgentStopRef.current === pending && pending.stoppedTurnId === activeAgentRun.turnId) {
         pending.stoppedTurnId = null
       }
       console.error('[InputArea] Failed to stop located Agentic run:')
     })
-  }, [activeAgentRun, chatId, recordComposerStopResult])
+  }, [activeAgentRun, applyComposerStopResult, chatId])
 
   useEffect(() => {
     if (!waitingForExactAgentRun || activeAgentRun) return
@@ -1708,7 +1731,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           void agentRunsApi.stop(knownRun.turnId, {
             chatId,
             generationId: knownRun.generationId,
-          }).then((result) => recordComposerStopResult(result.status))
+          }).then((result) => applyComposerStopResult(result, knownRun.generationId))
             .catch(console.error)
             .finally(settleComposerAbort)
         } else {
@@ -1726,7 +1749,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             chatId,
             stoppedAuthority?.requestAuthorityId ?? undefined,
           )
-            .then((result) => recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status))
+            .then((result) => applyComposerStopResult(result, stoppedAuthority?.generationId || generationIdForChat || undefined))
             .catch(console.error)
             .finally(settleComposerAbort)
         }
@@ -1734,7 +1757,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     }
     window.addEventListener('keydown', handleEscape)
     return () => window.removeEventListener('keydown', handleEscape)
-  }, [activeAgentRun, waitingForExactAgentRun, isGeneratingInChat, generationIdForChat, chatId, beginComposerAbort, recordComposerStopResult, settleComposerAbort, isRoomPeer])
+  }, [activeAgentRun, waitingForExactAgentRun, isGeneratingInChat, generationIdForChat, chatId, beginComposerAbort, applyComposerStopResult, settleComposerAbort, isRoomPeer])
 
   useEffect(() => {
     if (openPopover !== 'persona') {
@@ -2767,7 +2790,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             chatId,
             generationId: knownRun.generationId,
           })
-          recordComposerStopResult(result.status)
+          applyComposerStopResult(result, knownRun.generationId)
         } catch (err: unknown) {
           console.error('[InputArea] Failed to stop Agentic run:', err)
           setComposerStopping(false)
@@ -2790,7 +2813,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
             chatId,
             stoppedAuthority?.requestAuthorityId ?? undefined,
           )
-          recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status)
+          applyComposerStopResult(result, stoppedAuthority?.generationId || generationIdForChat || undefined)
         } catch (err: unknown) {
           console.error('[InputArea] Failed to stop:', err)
           setComposerStopping(false)
@@ -2799,7 +2822,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     } finally {
       settleComposerAbort()
     }
-  }, [isGeneratingInChat, composerAbortInFlight, isRoomPeer, activeAgentRun, beginComposerAbort, recordComposerStopResult, settleComposerAbort, waitingForExactAgentRun, generationIdForChat, chatId])
+  }, [isGeneratingInChat, composerAbortInFlight, isRoomPeer, activeAgentRun, beginComposerAbort, applyComposerStopResult, settleComposerAbort, waitingForExactAgentRun, generationIdForChat, chatId])
 
   const handleRetryStopLookup = useCallback(async () => {
     if (isRoomPeer) return
@@ -2816,14 +2839,14 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           chatId,
           generationId: recovered.generationId,
         })
-        recordComposerStopResult(result.status)
+        applyComposerStopResult(result, recovered.generationId)
       } else {
         const result = await generateApi.stop(
           stoppedAuthority?.generationId || generationIdForChat || undefined,
           chatId,
           stoppedAuthority?.requestAuthorityId ?? undefined,
         )
-        recordComposerStopResult(result.status === 'not_found' ? 'terminal' : result.status)
+        applyComposerStopResult(result, stoppedAuthority?.generationId || generationIdForChat || undefined)
       }
     } catch (error) {
       console.error('[InputArea] Failed to recover exact stop target:', error)
@@ -2836,7 +2859,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     chatId,
     generationIdForChat,
     isRoomPeer,
-    recordComposerStopResult,
+    applyComposerStopResult,
     settleComposerAbort,
   ])
 
@@ -4890,7 +4913,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                   generationId={activeAgentRun.generationId}
                   onBeforeStop={beginComposerAbort}
                   onSettled={settleComposerAbort}
-                  onResult={(result) => recordComposerStopResult(result.status)}
+                  onResult={(result) => applyComposerStopResult(result, activeAgentRun.generationId)}
                 />
               ) : waitingForExactAgentRun ? (
                 <button

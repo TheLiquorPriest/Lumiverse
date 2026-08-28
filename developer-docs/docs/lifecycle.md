@@ -142,12 +142,18 @@ commit CAS and transaction remain the only authority for the canonical write.
 `POST /api/v1/agent-runs/:turnId/stop` returns `accepted` only while the run
 is reversible, `too_late` after the completion boundary, or `terminal` once a
 terminal owner has settled it. The compatibility
-`POST /api/v1/generate/stop` route returns `{ stopped: boolean, status: "accepted" | "too_late" | "not_found" }`; use the
-Agent Run Stop route when the phase distinction matters.
+`POST /api/v1/generate/stop` returns `accepted`, `too_late`, or
+`not_found` with `{ stopped, status }`; an already-terminal durable run
+instead returns `{ stopped: false, status: "terminal", terminal }`, where
+`terminal` is the canonical Agent Run Stop result plus `generationId`.
 If live terminal publication failed and its in-memory generation registration has
 already been released, generic generation Stop resolves the exact owner/chat/turn
 execution, repairs its durable terminal surfaces, and only then settles the
-visible pool. A mismatched owner or chat cannot invoke this recovery.
+visible pool. A mismatched owner or chat cannot invoke this recovery. The repair
+returns the existing canonical `terminal`/`too_late` result, never `accepted`;
+the composer consumes that terminal outcome before settling request/stream state,
+so FAILED replaces any optimistic stopped state while a genuinely reversible
+accepted cancellation still renders stopped.
 
 ### Inspection, recovery, and retention
 

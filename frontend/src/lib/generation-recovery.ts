@@ -1,5 +1,6 @@
 import { generateApi } from '@/api/generate'
-import type { GenerateRequest, GenerateResponse, GenerationRequestOptions } from '@/api/generate'
+import type { GenerateRequest, GenerateResponse, GenerationRequestOptions, GenerationStopResult } from '@/api/generate'
+import type { AgentRunStopResultV2 } from '@/types/agent-runs'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { useStore } from '@/store'
 import type { GenerationRequestAuthority } from '@/types/store'
@@ -77,6 +78,65 @@ export function acceptGenerationEnded(
   )
 }
 
+export type GenerationStopWireResult = GenerationStopResult | AgentRunStopResultV2
+
+/**
+ * Settle visible request/stream state only after the Stop owner answers.
+ * A repaired terminal run is canonical and may replace an earlier optimistic
+ * stopped request with its exact completed/failed outcome.
+ */
+export function consumeGenerationStopResult(
+  chatId: string,
+  result: GenerationStopWireResult,
+  knownGenerationId?: string,
+  failureMessage = 'Generation failed',
+  knownRequestAuthorityId?: string | null,
+): 'accepted' | 'too_late' | 'terminal' {
+  let state = useStore.getState()
+  let current = state.generationRequests[chatId]
+  const expectedGenerationId = result.status === 'terminal' && 'terminal' in result
+    ? result.terminal.generationId
+    : knownGenerationId
+  const targetsCurrentRequest = !current || (
+    (knownRequestAuthorityId === undefined || current.requestAuthorityId === knownRequestAuthorityId)
+    && (!expectedGenerationId || !current.generationId || current.generationId === expectedGenerationId)
+  )
+  if (result.status === 'accepted') {
+    if (targetsCurrentRequest && (!current || isLiveRequest(current))) {
+      state.stopGenerationRequest(chatId)
+      state.stopStreaming()
+    }
+    return 'accepted'
+  }
+  if (result.status === 'terminal') {
+    if (!targetsCurrentRequest) return 'terminal'
+    const terminal = 'terminal' in result ? result.terminal : result
+    const generationId = 'terminal' in result ? result.terminal.generationId : knownGenerationId
+    const terminalStatus = terminal.workOutcome === 'stopped'
+      ? 'stopped'
+      : terminal.workOutcome === 'completed'
+        ? 'completed'
+        : 'error'
+    if (!current && generationId) {
+      state.acceptGenerationRequest(chatId, generationId, knownRequestAuthorityId ?? undefined, 'working')
+      state = useStore.getState()
+      current = state.generationRequests[chatId]
+    }
+    const settled = state.settleGenerationRequest(
+      chatId,
+      terminalStatus,
+      generationId,
+      knownRequestAuthorityId ?? current?.requestAuthorityId ?? undefined,
+    )
+    if (!settled) return 'terminal'
+    if (terminalStatus === 'error') state.setStreamingError(failureMessage)
+    else if (terminalStatus === 'stopped') state.stopStreaming()
+    else state.endStreaming()
+    return 'terminal'
+  }
+  if (result.status === 'not_found') return 'terminal'
+  return 'too_late'
+}
 export function captureGenerationRequest(
   chatId: string,
   observedGenerationId?: string | null,

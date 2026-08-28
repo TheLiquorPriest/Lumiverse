@@ -4504,7 +4504,18 @@ describe("production agentic coordinator installation", () => {
       expect(db.query(
         "SELECT status FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
       ).get(USER_ID, executionId)).toBeNull();
-      expect(await stopGeneration(USER_ID, executionId, AGENTIC_CHAT_ID)).toBe(true);
+      const terminalStop = await stopGeneration(USER_ID, executionId, AGENTIC_CHAT_ID);
+      expect(terminalStop).toMatchObject({
+        status: "terminal",
+        generationId: executionId,
+        run: {
+          status: "terminal",
+          turnId: executionId,
+          workStatus: "terminal",
+          workOutcome: "failed",
+          reason: "provider_failure",
+        },
+      });
       expect(db.query(
         "SELECT phase, status, outcome FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ?",
       ).get(USER_ID, executionId)).toMatchObject({ phase: "TERMINAL", status: "terminal", outcome: "failed" });

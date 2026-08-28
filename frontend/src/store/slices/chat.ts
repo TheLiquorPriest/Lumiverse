@@ -1020,7 +1020,11 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
         if (current.requestAuthorityId !== null && current.requestAuthorityId !== (requestAuthorityId ?? null)) return state
         if (generationId && current.generationId && current.generationId !== generationId) return state
         if (generationId && current.retiredGenerationIds.includes(generationId)) return state
-        if (!liveGenerationRequest(current.status)) return state
+        const canonicalOverridesOptimisticStop = current.status === 'stopped'
+          && status !== 'stopped'
+          && !!generationId
+          && (!current.generationId || current.generationId === generationId)
+        if (!liveGenerationRequest(current.status) && !canonicalOverridesOptimisticStop) return state
         settled = true
         const terminalId = generationId ?? current.generationId
         return {

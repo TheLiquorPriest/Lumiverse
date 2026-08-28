@@ -205,7 +205,10 @@ status surfaces together; it does not replace that cause with a generic
 projection error or show a terminal chat head before the durable run settles.
 If a temporary persistence fault leaves the activity visibly active after work
 has already ended, **Stop** performs an owner- and chat-scoped durable repair;
-it does not rerun the model or replace the original terminal cause.
+it does not rerun the model or replace the original terminal cause. Because the
+work already ended, the repaired result may correctly appear as **Generation
+failed** rather than **Generation stopped**. Only a Stop that cancels work while
+it is still reversible appears as stopped.
 
 The public projection is status-only. It never exposes prompts, work prose, child results, tool arguments or retrieval data, provider messages, credentials, raw reasoning, or continuation carriers. Separate owner-only inspection may retain a bounded WORK transcript, provider content, private child material, and tool arguments/results. Retention is subject to host limits and explicit omission markers; raw private reasoning and opaque continuation carriers are not promised. None of this becomes public activity or canonical response content.
 For a Response turn, unified owner inspection remains the evidence surface for this boundary. It explains routes and order, conditions, exact source identities and preset/block revisions, hashes when recorded, one effective copy for each destination-level overlap plus every retained role/reason/overlap outcome, omissions, custom-phase and child-subset receipts, accepted crossings, and tools/delegation. If evidence is unavailable, inspection says so; it is never inferred.

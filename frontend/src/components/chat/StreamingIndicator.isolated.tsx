@@ -48,6 +48,7 @@ let generateApi!: typeof import('@/api/generate').generateApi
 let originalGetActive!: typeof generateApi.getActive
 let StreamingIndicator!: typeof import('./StreamingIndicator').default
 let deriveStreamingStatus!: typeof import('./StreamingIndicator').deriveStreamingStatus
+let consumeGenerationStopResult!: typeof import('@/lib/generation-recovery').consumeGenerationStopResult
 let root: Root | null = null
 let host: HTMLDivElement | null = null
 
@@ -109,6 +110,7 @@ function setStore(overrides: Record<string, unknown> = {}) {
       startedAt: Date.now() - 1_000,
     }],
     agentActivityByGeneration: {},
+    generationRequests: {},
     ...overrides,
   } as never)
 }
@@ -139,6 +141,7 @@ beforeAll(async () => {
   const indicator = await import('./StreamingIndicator')
   StreamingIndicator = indicator.default
   deriveStreamingStatus = indicator.deriveStreamingStatus
+  ;({ consumeGenerationStopResult } = await import('@/lib/generation-recovery'))
 })
 
 beforeEach(() => {
@@ -360,33 +363,63 @@ describe('StreamingIndicator', () => {
     expect(indicator?.textContent).toContain('Still waiting after 30 seconds')
   })
 
-  test('keeps terminal provider failures and stops visible after streaming ends', async () => {
-    setStore({
-      isStreaming: false,
-      activeGenerationId: null,
-      streamingError: 'Provider timed out',
-      lastGenerationTerminalStatus: 'error',
-      lastGenerationProvider: 'Deepseek',
-      lastGenerationConnectionLabel: 'agent-root-connection',
-      lastGenerationModel: 'deepseek-v4-flash',
-      chatHeads: [],
+  test('renders repaired failures as failed and accepted cancellation as stopped', async () => {
+    setStore({ chatHeads: [] })
+    let state = useStore.getState()
+    state.beginGenerationRequest(chatId, {
+      generationType: 'normal',
+      requestAuthorityId: 'authority-failed',
     })
+    state.acceptGenerationRequest(chatId, generationId, 'authority-failed', 'working')
+    state.stopGenerationRequest(chatId)
+    consumeGenerationStopResult(chatId, {
+      stopped: false,
+      status: 'terminal',
+      terminal: {
+        version: 2,
+        status: 'terminal',
+        turnId: generationId,
+        generationId,
+        revision: 3,
+        target: { chatId, generationType: 'normal', messageId: null, swipeId: null },
+        workPhase: 'WORK',
+        workStatus: 'terminal',
+        workOutcome: 'failed',
+        reason: 'provider_failure',
+        recoveryEligible: true,
+        recoveryAction: 'retry',
+        omissionCount: 0,
+        inspectionAttemptId: generationId,
+      },
+    }, generationId, 'Provider failed', 'authority-failed')
+
     await renderIndicator()
     let indicator = host?.querySelector('[role="status"]')
+    expect(useStore.getState().generationRequests[chatId]?.status).toBe('error')
     expect(indicator?.getAttribute('data-generation-status')).toBe('error')
     expect(indicator?.textContent).toContain('Generation failed')
-    expect(indicator?.textContent).toContain('Provider timed out')
-    expect(indicator?.textContent).toContain('Provider Deepseek · model deepseek-v4-flash')
-    expect(indicator?.textContent).toContain('agent-root-connection')
-    await act(async () => {
-      useStore.setState({ streamingError: null, lastGenerationTerminalStatus: 'stopped' } as never)
-      await Promise.resolve()
+    expect(indicator?.textContent).not.toContain('Generation stopped')
+
+    setStore({ chatHeads: [] })
+    state = useStore.getState()
+    state.beginGenerationRequest(chatId, {
+      generationType: 'normal',
+      requestAuthorityId: 'authority-accepted',
     })
+    state.acceptGenerationRequest(chatId, generationId, 'authority-accepted', 'working')
+    consumeGenerationStopResult(
+      chatId,
+      { stopped: true, status: 'accepted' },
+      generationId,
+      'Generation failed',
+      'authority-accepted',
+    )
+
+    await renderIndicator()
     indicator = host?.querySelector('[role="status"]')
+    expect(useStore.getState().generationRequests[chatId]?.status).toBe('stopped')
     expect(indicator?.getAttribute('data-generation-status')).toBe('stopped')
     expect(indicator?.textContent).toContain('Generation stopped')
-    expect(indicator?.textContent).toContain('Stopped. Retry when ready.')
-    expect(indicator?.textContent).toContain('Provider Deepseek · model deepseek-v4-flash')
-    expect(indicator?.textContent).toContain('agent-root-connection')
+    expect(indicator?.textContent).not.toContain('Generation failed')
   })
 })

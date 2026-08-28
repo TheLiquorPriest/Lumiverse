@@ -91,7 +91,14 @@ function chatRoute(
   };
 }
 
-function stopResultPayload(result: boolean | "too_late") {
+function stopResultPayload(result: svc.GenerationStopResult) {
+  if (typeof result === "object") {
+    return {
+      stopped: false,
+      status: "terminal" as const,
+      terminal: { ...result.run, generationId: result.generationId },
+    };
+  }
   return {
     stopped: result === true,
     status: result === true ? "accepted" as const : result === "too_late" ? "too_late" as const : "not_found" as const,
@@ -106,10 +113,15 @@ app.post("/dry-run", chatRoute(svc.dryRunGeneration));
 app.post("/stop", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
-  const requestAuthorityStopped = body.chat_id && body.request_authority_id
+  const requestAuthorityResult: svc.GenerationStopResult = body.chat_id && body.request_authority_id
     ? await svc.stopGenerationRequestAuthority(userId, body.chat_id, body.request_authority_id)
     : false;
-  const withRequestAuthority = (result: boolean | "too_late") => requestAuthorityStopped ? true : result;
+  const withRequestAuthority = (result: svc.GenerationStopResult): svc.GenerationStopResult => {
+    if (typeof result === "object") return result;
+    if (typeof requestAuthorityResult === "object") return requestAuthorityResult;
+    if (result === "too_late" || requestAuthorityResult === "too_late") return "too_late";
+    return result === true || requestAuthorityResult === true;
+  };
 
   if (body.generation_id) {
     const stopped = await svc.stopGeneration(userId, body.generation_id, body.chat_id);

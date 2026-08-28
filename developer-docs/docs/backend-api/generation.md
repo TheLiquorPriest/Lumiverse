@@ -475,6 +475,9 @@ The generic generation Stop path also recognizes an exact owner/chat/turn whose
 live registration was released after a terminal publication fault. It invokes
 the dormant Agent Run Stop owner, repairs the terminal transaction, and settles
 the visible pool only after that repair; owner or chat mismatch fails closed.
+An already-terminal repair returns `status: "terminal"` with the canonical Agent
+Run outcome and `stopped: false`; only a cancellation that wins a reversible
+phase returns `status: "accepted"` and may render Generation stopped.
 
 The strict preprocessing ceilings are immutable host defaults: 8 MiB input,
 8 MiB output, 16 MiB cumulative expansion, 2 MiB per operation, 1,024 prompt
@@ -503,10 +506,13 @@ Exact root `POST /api/v1/agent-runs/:turnId/stop` is projection-gated: it accept
 a reversible `ASSEMBLE` or `WORK` run and returns `too_late` from `COMPLETE`,
 `RENDER`, `PREPARE_COMMIT`, or `COMMITTING` onward. The generation Stop route
 uses the same Agentic owner and returns `{ stopped: boolean, status: "accepted" |
-"too_late" | "not_found" }`; a generation-ID race may try the supplied chat
-fallback. Use the exact Agent Run Stop route when the `too_late` distinction is
-required. A stop or deadline that wins before `COMMITTING` leaves no
-authoritative generation write. Client navigation is not Stop authority:
+"terminal" | "too_late" | "not_found", terminal?: AgentRunStopResultV2 &
+{ generationId: string } }`. The terminal member is present only for an
+already-terminal durable run and must be consumed as canonical before client
+request/stream settlement; it is never an accepted Stop. A generation-ID race
+may try the supplied chat fallback. A stop or deadline that wins before
+`COMMITTING` leaves no authoritative generation write. Client navigation is
+not Stop authority:
 background swipe admission remains valid, projects no tokens into another
 active chat, and recovers once from the correlated pool when that chat reopens.
 Startup runs `reconcileStartupState()` before `Bun.serve`: imports, artifact
