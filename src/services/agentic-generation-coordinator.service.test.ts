@@ -1923,6 +1923,20 @@ describe("production agentic coordinator installation", () => {
         [firstEntryId, true],
         [secondEntryId, true],
       ]);
+      const plan = await deps.compileAssemblyPlan!(
+        snapshot,
+        input,
+        decision,
+        signal,
+        "test-world-derived-activation",
+      );
+      const worldInfoEvidence = plan.privateEvidence.activation
+        .filter((entry) => entry.kind === "world_info");
+      expect(worldInfoEvidence.map((entry) => entry.entryId)).toEqual([
+        firstEntryId,
+        secondEntryId,
+      ]);
+      expect(worldInfoEvidence.every((entry) => !("source" in entry))).toBe(true);
       expect(providerRequests).toHaveLength(providerRequestsBefore);
 
       db.query("UPDATE world_book_entries SET revision = revision + 1 WHERE id = ?").run(secondEntryId);

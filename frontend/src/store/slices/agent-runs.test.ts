@@ -9,6 +9,7 @@ import {
   normalizeAgentRunPublicV2,
   selectActiveAgentRunForChat,
   selectAgentRunForTarget,
+  settleGenerationRequestFromExactTerminalRun,
 } from './agent-runs'
 import type { AgentRunChangesV2, AgentRunPublicV2 } from '@/types/agent-runs'
 
@@ -192,6 +193,87 @@ describe('agent run projection slice', () => {
     expect(request.abortController).toBeNull()
     expect(request.terminalGenerationIds).toEqual(['generation-a'])
     expect(selectActiveAgentRunForChat(useStore.getState(), 'chat-a', 'generation-a')).toBeUndefined()
+  })
+  test('settles a terminal Agent Run that arrived before the exact start response bound its request', () => {
+    useStore.setState({
+      generationRequests: {
+        'chat-a': {
+          chatId: 'chat-a',
+          epoch: 1,
+          requestAuthorityId: 'request-a',
+          generationId: null,
+          abortController: new AbortController(),
+          status: 'pending',
+          generationType: 'normal',
+          targetMessageId: null,
+          targetSwipeId: null,
+          retiredGenerationIds: [],
+          terminalGenerationIds: [],
+        },
+      },
+    })
+    expect(useStore.getState().reconcileAgentRunEvent({
+      version: 2,
+      chatId: 'chat-a',
+      sequence: 1,
+      run: run({
+        revision: 2,
+        sequence: 1,
+        workPhase: 'TERMINAL',
+        workStatus: 'terminal',
+        workOutcome: 'rejected',
+        reason: 'needs_attention',
+      }),
+      omission: { omittedNodeCount: 0, omittedEventCount: 0, firstOmittedSequence: null, lastOmittedSequence: null },
+    })).toBe('applied')
+    expect(useStore.getState().generationRequests['chat-a'].status).toBe('pending')
+
+    useStore.setState((state) => ({
+      generationRequests: {
+        ...state.generationRequests,
+        'chat-a': {
+          ...state.generationRequests['chat-a'],
+          generationId: 'generation-a',
+          status: 'queued',
+        },
+      },
+    }))
+    expect(settleGenerationRequestFromExactTerminalRun(
+      useStore.getState(),
+      'chat-a',
+      'generation-a',
+    )).toBe(true)
+    expect(useStore.getState().generationRequests['chat-a']).toMatchObject({
+      requestAuthorityId: 'request-a',
+      generationId: 'generation-a',
+      status: 'error',
+      terminalGenerationIds: ['generation-a'],
+    })
+
+    useStore.setState((state) => ({
+      generationRequests: {
+        ...state.generationRequests,
+        'chat-a': {
+          ...state.generationRequests['chat-a'],
+          requestAuthorityId: 'request-b',
+          generationId: 'generation-b',
+          status: 'queued',
+          abortController: new AbortController(),
+          terminalGenerationIds: [],
+        },
+      },
+    }))
+    expect(settleGenerationRequestFromExactTerminalRun(
+      useStore.getState(),
+      'chat-a',
+      'generation-a',
+    )).toBe(false)
+    expect(useStore.getState().generationRequests['chat-a']).toMatchObject({
+      requestAuthorityId: 'request-b',
+      generationId: 'generation-b',
+      status: 'queued',
+      terminalGenerationIds: [],
+    })
   })
   test('rejects public runs whose attempt lineage does not bind to the run identity', () => {
     expect(normalizeAgentRunPublicV2(run({

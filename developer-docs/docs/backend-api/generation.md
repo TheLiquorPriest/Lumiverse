@@ -395,12 +395,16 @@ immutable tool/participant availability, preparation limits, and a closed
 `InputRevisionSetV1`. The host resolves native World Info once, including
 keyword, constant, and vector activation, native ordering, budgets, cache,
 state, and activation provenance; the strict worker consumes that finalized
-projection and does not run a parallel World Info implementation. Runtime
-admission aggregates a multi-entry World Info fence from every authoritative
-member ID and revision in canonical member order, not from collector traversal
-order or activation-enriched projection digests;
-ASSEMBLE still freezes the finalized projection and COMMIT rechecks every exact
-source member. Native
+projection and does not run a parallel World Info implementation. Private World
+Info activation evidence is a closed, content-free host-only record: native and
+fallback producers emit the same bounded fields, while snapshot identity and the
+input revision digest bind that evidence to its authenticated source revision
+set. Runtime admission aggregates a multi-entry World Info fence from every
+authoritative member ID and revision in canonical member order, not from
+collector traversal order or activation-enriched projection digests; this
+canonicalization does not reorder native semantic entry activation or its vector
+source fingerprint. ASSEMBLE freezes the finalized projection and COMMIT
+rechecks every exact source member. Native
 Databank retrieval remains outside Loom and is projected from authenticated
 live attached objects. `extensionData` and `ambientSpindleData` are explicitly
 `null`; no database handle, callback, extension registry, or live Spindle

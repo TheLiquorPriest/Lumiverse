@@ -6865,7 +6865,6 @@ function serializeNativeWorldInfoProjection(
       keyword: provenance ? Object.freeze({ ...provenance }) : null,
       vectorScore: vectorEntry?.score ?? null,
       vectorDisposition: vectorDispositions[entry.id] ?? null,
-      source: entry.source,
       state: Object.freeze({ ...state }),
     });
   });

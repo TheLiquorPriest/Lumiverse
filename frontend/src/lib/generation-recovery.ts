@@ -5,6 +5,7 @@ import { messagesApi, chatsApi } from '@/api/chats'
 import { useStore } from '@/store'
 import type { GenerationRequestAuthority } from '@/types/store'
 import { yieldToBrowser } from '@/lib/spindle/browser-scheduler'
+import { settleGenerationRequestFromExactTerminalRun } from '@/store/slices/agent-runs'
 
 export interface GenerationRequestEpoch {
   chatId: string
@@ -55,14 +56,20 @@ export function acceptGenerationStarted(
   status: 'queued' | 'working' = 'queued',
 ): boolean {
   if (!chatId || !generationId) return false
-  return useStore.getState().acceptGenerationRequest(
+  const state = useStore.getState()
+  const accepted = state.acceptGenerationRequest(
     chatId,
     generationId,
     requestAuthorityId,
     status,
   )
+  if (!accepted) return false
+  // A terminal Agent Run can win the WS race before the HTTP start response
+  // binds its generation ID to the live request. Settle only after that exact
+  // response binding; nonmatching and superseding requests remain untouched.
+  settleGenerationRequestFromExactTerminalRun(useStore.getState(), chatId, generationId)
+  return true
 }
-
 export function acceptGenerationEnded(
   chatId: string,
   generationId: string,

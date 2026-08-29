@@ -1926,27 +1926,50 @@ function mergeRun(provisional: Record<string, AgentRunPublicV2>, terminal: Recor
   else provisional[agentRunProvisionalKey(run)] = run
 }
 
-function settleExactTerminalGenerationRequest(get: () => AppStore, run: AgentRunPublicV2): void {
-  if (run.workStatus !== 'terminal' || run.workOutcome === null) return
-  const state = get()
-  const accepted = findRunByTurnId(state, run.turnId)
-  const request = state.generationRequests?.[run.chatId]
-  if (
-    accepted?.workStatus !== 'terminal'
-    || accepted.generationId !== run.generationId
-    || request?.generationId !== run.generationId
-  ) return
+type ExactTerminalRequestState = Pick<AppStore,
+  'agentRunProvisionalByKey' | 'agentRunTerminalByTarget' | 'generationRequests' | 'settleGenerationRequest'
+>
+
+function findRunByGeneration(
+  state: Pick<AgentRunsSlice, 'agentRunProvisionalByKey' | 'agentRunTerminalByTarget'>,
+  chatId: string,
+  generationId: string,
+): AgentRunPublicV2 | undefined {
+  let selected: AgentRunPublicV2 | undefined
+  for (const run of [...Object.values(state.agentRunTerminalByTarget), ...Object.values(state.agentRunProvisionalByKey)]) {
+    if (
+      run.chatId === chatId
+      && run.generationId === generationId
+      && (!selected || compareRunFreshness(run, selected) > 0)
+    ) selected = run
+  }
+  return selected
+}
+
+export function settleGenerationRequestFromExactTerminalRun(
+  state: ExactTerminalRequestState,
+  chatId: string,
+  generationId: string,
+): boolean {
+  const request = state.generationRequests[chatId]
+  const run = findRunByGeneration(state, chatId, generationId)
+  if (request?.generationId !== generationId || run?.workStatus !== 'terminal' || run.workOutcome === null) return false
   const status = run.workOutcome === 'completed'
     ? 'completed'
     : run.workOutcome === 'stopped'
       ? 'stopped'
       : 'error'
-  state.settleGenerationRequest?.(
-    run.chatId,
+  return state.settleGenerationRequest(
+    chatId,
     status,
-    run.generationId,
+    generationId,
     request.requestAuthorityId,
   )
+}
+
+function settleExactTerminalGenerationRequest(get: () => AppStore, run: AgentRunPublicV2): void {
+  if (run.workStatus !== 'terminal' || run.workOutcome === null) return
+  settleGenerationRequestFromExactTerminalRun(get(), run.chatId, run.generationId)
 }
 function withoutChat<T extends AgentRunPublicV2>(values: Record<string, T>, chatId: string): Record<string, T> {
   return Object.fromEntries(Object.entries(values).filter(([, run]) => run.chatId !== chatId))
