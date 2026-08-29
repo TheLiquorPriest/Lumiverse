@@ -5991,6 +5991,9 @@ export async function runAgenticWorkPhase(
       const status = schedule.failure === "cancelled" ? "cancelled" : schedule.failure === "timed_out" ? "timed_out" : "failed";
       return makeOutcome(status, state, observations, childResults, schedule.failure);
     }
+    // Deterministic children may mutate their assigned turn workspace before
+    // the root's first projection, invalidating the phase-entry snapshot.
+    workspaceContextRevision = undefined;
     const baseMaterializedMessages: readonly LlmMessage[] = Object.freeze(
       (options.rootMessages
         ? clonePrivateValue(options.rootMessages, MAX_PRIVATE_TRANSCRIPT_BYTES, "rootMessages")
