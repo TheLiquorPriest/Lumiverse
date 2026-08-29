@@ -86,6 +86,7 @@ import {
 } from "../types/agent-preprocessing";
 import {
   accountProviderResponse,
+  createAgenticChildFrame,
   executeBoundedAgenticChildFrame,
   runAgenticWorkPhase,
   AgenticWorkPhaseError,
@@ -5484,15 +5485,58 @@ function buildDependencies(): AgenticGenerationDependencies {
           workspace: childWorkspace,
         }): Promise<AgenticChildExecutionResult> =>
           trackChild(execution.id, async () => {
-          childInspection.bind(descriptor.childId, frame.assignedTaskId);
           const profile = profiles.find((candidate) => candidate.id === descriptor.profileId);
           if (!profile || typeof profile.systemPrompt !== "string") {
             return { content: "", status: "failed" as const, errorCode: "child_profile_unauthorized" };
           }
-          const childToolIds = (profile.toolIds ?? []).filter((id) => available.has(id));
           const child = connectionFor(descriptor.profileId);
+          const childToolIds = (profile.toolIds ?? []).filter((id) => available.has(id));
+          const childWorkspaceCapabilities = Object.freeze(
+            (profile.workspaceCapabilities ?? []).filter((operation) =>
+              workspaceCapabilities.allowed.includes(operation)
+              && DELEGATED_WORKSPACE_OPERATIONS[operation] === true,
+            ),
+          );
+          let boundedFrame = frame;
+          if (descriptor.required && childWorkspaceCapabilities.includes("submit_child_result")) {
+            const taskId = execution.id + ":task:" + descriptor.childId;
+            const expectedRevision = runtimeExecution.workspaceRevision ?? 0;
+            createWorkspaceTask({
+              userId: runtimeExecution.userId,
+              chatId: runtimeExecution.chatId,
+              turnId: runtimeExecution.id,
+              workspaceId: runtimeExecution.workspaceId,
+              actor: "host",
+              expectedRevision,
+              taskId,
+              title: "Required task " + (descriptor.slotIndex + 1),
+              objective: descriptor.task,
+              required: true,
+              assignedFrameId: frame.frameId,
+            });
+            const workspaceRevision = getCurrentWorkspaceRevisionV1({
+              userId: runtimeExecution.userId,
+              chatId: runtimeExecution.chatId,
+              turnId: runtimeExecution.id,
+              workspaceId: runtimeExecution.workspaceId,
+            });
+            advanceNonCognitionWorkspaceRevision(runtimeExecution, cognitionRuntime, workspaceRevision);
+            boundedFrame = createAgenticChildFrame({
+              frameId: frame.frameId,
+              parentFrameId: frame.parentFrameId!,
+              provider: child.provider,
+              connectionId: child.concreteId,
+              model: child.model,
+              coreToolIds: frame.allowedCoreToolIds,
+              workspaceCapabilities: childWorkspaceCapabilities,
+              workspaceSharing: "view_only",
+              taskId,
+              signal: frame.signal,
+            });
+          }
+          childInspection.bind(descriptor.childId, boundedFrame.assignedTaskId);
           const result = await executeBoundedAgenticChildFrame({
-            frame, task: descriptor.task, definitions,
+            frame: boundedFrame, task: descriptor.task, definitions,
             ...(childWorkspace ? { workspace: childWorkspace } : {}),
             ...(phaseId !== undefined ? { phaseId } : {}),
             ...(phaseInstructionSubset ? { phaseInstructionSubset } : {}),

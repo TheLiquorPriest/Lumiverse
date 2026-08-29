@@ -3733,7 +3733,7 @@ describe("production agentic coordinator installation", () => {
       writeProfileRuntime.run(JSON.stringify([]), 128, USER_ID, AGENTIC_PRESET_ID, "delegate_alt");
     }
   });
-  test("keeps heterogeneous child provider, connection, model, tokenizer, usage, activity, and inspection identity exact", async () => {
+  test("keeps heterogeneous child identity exact and fails closed when assigned children omit submission", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
     await probeIsolateBackendsAtStartup();
@@ -3916,13 +3916,14 @@ describe("production agentic coordinator installation", () => {
       });
       try {
         const work = await deps.runWork!({ execution, input, decision, snapshot, plan, signal });
-        expect(work).toMatchObject({ status: "completed" });
+        expect(work).toMatchObject({ status: "failed" });
         expect(boundProviderDispatches).toHaveLength(2);
         const inspection = getAgentRunInspection(USER_ID, execution.id, AGENTIC_CHAT_ID);
         for (const profileId of ["delegate", "delegate_alt"] as const) {
           const expected = expectedByProfile[profileId];
           const plannedChild = plan.children.find((child) => child.profileId === profileId);
           expect(plannedChild).toBeDefined();
+          const expectedTaskId = execution.id + ":task:" + plannedChild!.childId;
           const dispatches = boundProviderDispatches.filter((dispatch) => dispatch.provider === expected.provider);
           expect(dispatches).toHaveLength(1);
           expect(dispatches[0]).toMatchObject({ provider: expected.provider, url: expected.endpoint });
@@ -3943,7 +3944,7 @@ describe("production agentic coordinator installation", () => {
             connectionRevision: childConnections[profileId]?.candidateRevision ?? null,
             fingerprint: childConnections[profileId]?.fingerprint ?? null,
           });
-          expect(childExchange?.correlation.taskId).toBe(plannedChild!.childId);
+          expect(childExchange?.correlation.taskId).toBe(expectedTaskId);
           const exchangeArguments = JSON.parse(childExchange?.arguments ?? "{}");
           expect(exchangeArguments).toMatchObject({
             profileId,
@@ -3963,17 +3964,25 @@ describe("production agentic coordinator installation", () => {
             totalTokens: expected.totalTokens,
             canonical: false,
           });
-          expect(childUsage?.correlation?.taskId).toBe(plannedChild!.childId);
+          expect(childUsage?.correlation?.taskId).toBe(expectedTaskId);
           const intrinsicLifecycle = inspection?.transcript.filter((record) =>
             record.kind === "child_result" && record.id.includes(plannedChild!.childId)) ?? [];
           expect(intrinsicLifecycle.length).toBeGreaterThanOrEqual(1);
           expect(intrinsicLifecycle.every((record) =>
-            record.correlation.taskId === plannedChild!.childId)).toBe(true);
+            record.correlation.taskId === expectedTaskId)).toBe(true);
           const childActivity = inspection?.activity.milestones.find((activity) =>
             activity.actor === "child"
-            && activity.id === "projection:task:" + childExchange?.correlation.taskId);
+            && activity.id === "projection:task:" + expectedTaskId);
           expect(childActivity).toMatchObject({ kind: "child", actor: "child" });
         }
+        const requiredRows = db.query(
+          "SELECT state, assigned_frame_id FROM agent_workspace_tasks WHERE workspace_id = ? AND turn_id = ? AND required = 1 ORDER BY task_id",
+        ).all("workspace:" + execution.id, execution.id) as Array<{ state: string; assigned_frame_id: string | null }>;
+        expect(requiredRows).toHaveLength(2);
+        expect(requiredRows.every((task) => task.state === "active" && task.assigned_frame_id !== null)).toBe(true);
+        expect((db.query(
+          "SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE workspace_id = ? AND turn_id = ?",
+        ).get("workspace:" + execution.id, execution.id) as { count: number }).count).toBe(0);
         expect(tokenizerModels).toContain("scripted-model");
         expect(tokenizerModels).toContain("child-model-a");
         expect(tokenizerModels).toContain("child-model-b");
