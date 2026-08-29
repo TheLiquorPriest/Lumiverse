@@ -400,11 +400,13 @@ Info activation evidence is a closed, content-free host-only record: native and
 fallback producers emit the same bounded fields, while snapshot identity and the
 input revision digest bind that evidence to its authenticated source revision
 set. Runtime admission aggregates a multi-entry World Info fence from every
-authoritative member ID and revision in canonical member order, not from
-collector traversal order or activation-enriched projection digests; this
-canonicalization does not reorder native semantic entry activation or its vector
-source fingerprint. ASSEMBLE freezes the finalized projection and COMMIT
-rechecks every exact source member. Native
+authoritative member ID and source revision in canonical member order. Each
+entry fence hashes source-owned fields, including content, but excludes collector
+order, turn-derived activation, and per-turn state; the shared membership digest
+also rejects member additions and removals. This does not reorder native semantic
+entry activation or its vector source fingerprint. ASSEMBLE freezes the finalized
+projection and COMMIT rechecks exact membership, source revisions, and source
+content without exposing content in revision evidence. Native
 Databank retrieval remains outside Loom and is projected from authenticated
 live attached objects. `extensionData` and `ambientSpindleData` are explicitly
 `null`; no database handle, callback, extension registry, or live Spindle

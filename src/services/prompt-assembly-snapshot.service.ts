@@ -35,6 +35,7 @@ import { collectResolvedPromptVariableValues } from "./prompt-assembly.service";
 import { selectNativeVisibleHistory } from "./native-chat-corpus";
 import type { AssemblyMediaSegmentV1 as NativeMediaPartProjectionV1 } from "../types/agent-preprocessing";
 import { compareUtf8 } from "../utils/utf8-order";
+import { worldInfoEntrySourceDigest } from "./world-info-input-revision";
 import type {
   CognitionSourceSnapshotV1,
   FrozenCognitionGraphV1,
@@ -309,6 +310,7 @@ export interface SnapshotWorldEntryV1 {
   readonly role: string | null;
   readonly state: Readonly<Record<string, unknown>>;
   readonly revision: string;
+  readonly sourceDigest: string;
 }
 
 export interface SnapshotNativeWorldInfoRuntimePlacementV1 {
@@ -1306,7 +1308,7 @@ function normalizeNativeWorldInfo(
   }
   const entryIds = new Set(value.entries.map((entry) => entry.id));
   if (
-    value.entries.some((entry) => typeof entry.id !== "string" || typeof entry.revision !== "string")
+    value.entries.some((entry) => typeof entry.id !== "string" || typeof entry.revision !== "string" || typeof entry.sourceDigest !== "string")
     || value.books.some((book) => typeof book.id !== "string" || typeof book.revision !== "string")
     || value.native.activatedEntryIds.some((id) => typeof id !== "string" || !entryIds.has(id))
   ) {
@@ -1388,7 +1390,7 @@ function normalizeWorld(
       const rawOutlet = extensions.outlet_name ?? extensions.outletName;
       const rawMarker = extensions.wi_marker ?? extensions.wiMarker;
       const rawMarkerSide = extensions.wi_marker_side ?? extensions.wiMarkerSide;
-      const entry = deepFreeze({
+      const entryValue = {
         id: assertId(row.id, "world entry id"),
         bookId: book.id,
         bookName: book.name,
@@ -1430,8 +1432,12 @@ function normalizeWorld(
         position: rowNumber(row, "position"),
         depth: rowNumber(row, "depth", 4),
         role: typeof row.role === "string" ? row.role : null,
-        state: deepFreeze({}),
+        state: {},
         revision: String(row.revision ?? row.updated_at ?? digest(row)),
+      } satisfies Omit<SnapshotWorldEntryV1, "sourceDigest">;
+      const entry = deepFreeze({
+        ...entryValue,
+        sourceDigest: worldInfoEntrySourceDigest(entryValue),
       } satisfies SnapshotWorldEntryV1);
       entries.push(entry);
     }
@@ -2066,10 +2072,25 @@ export function buildGenerationAssemblySnapshot(
       revision("character", String(character.id), character, character.revision),
       ...group.map((member) => revision("group", String(member.id), member, member.revision)),
     ].filter((item): item is SnapshotRevisionV1 => !!item);
+    const worldMembershipDigest = digest({
+      books: worldInfo.books.map((book) => book.id).sort(compareUtf8),
+      entries: worldInfo.entries.map((entry) => entry.id).sort(compareUtf8),
+    });
     const worldRevisions = [
-      ...worldInfo.books.map((book) => revision("world_lore", book.id, book, book.revision)),
-      ...worldInfo.entries.map((entry) => revision("world_lore", entry.id, entry, entry.revision)),
-      revision("world_lore", chat.id, worldInfo.state, digest(worldInfo.state)),
+      ...worldInfo.books.map((book) => revision("world_lore", book.id, {
+        id: book.id,
+        name: book.name,
+        description: book.description,
+        membershipDigest: worldMembershipDigest,
+      }, book.revision)),
+      ...worldInfo.entries.map((entry) => revision("world_lore", entry.id, {
+        sourceDigest: entry.sourceDigest,
+        membershipDigest: worldMembershipDigest,
+      }, entry.revision)),
+      revision("world_lore", chat.id, {
+        state: worldInfo.state,
+        membershipDigest: worldMembershipDigest,
+      }, digest(worldInfo.state)),
     ];
     const databankRevisions: SnapshotRevisionV1[] = [];
     const seenDatabankDocuments = new Set<string>();

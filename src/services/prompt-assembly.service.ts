@@ -151,6 +151,7 @@ import {
   getGroupCardMode,
   type BookSource,
 } from "./world-info-sources.service";
+import { storedWorldInfoEntrySourceDigest } from "./world-info-input-revision";
 import { promptBlockMatchesCharacterTags } from "../utils/prompt-block-character-tags";
 import {
   captureInlineWebSearchContextSlot,
@@ -6750,6 +6751,7 @@ async function projectNativeStructuralMarkerValues(
 
 function nativeWorldEntrySnapshot(
   entry: WorldBookEntry,
+  sourceEntry: WorldBookEntry,
   book: SnapshotWorldBookV1,
   order: number,
   activatedIds: ReadonlySet<string>,
@@ -6799,6 +6801,7 @@ function nativeWorldEntrySnapshot(
     role: entry.role,
     state: Object.freeze({ ...(state[entry.uid] ?? {}) }),
     revision: String(entry.revision),
+    sourceDigest: storedWorldInfoEntrySourceDigest(sourceEntry, book.source),
   });
 }
 
@@ -6811,6 +6814,7 @@ function serializeNativeWorldInfoProjection(
   for (const entry of authority.intercepted) {
     if (!sourceEntryByBookId.has(entry.world_book_id)) sourceEntryByBookId.set(entry.world_book_id, entry);
   }
+  const sourceEntryById = new Map(authority.sourceEntries.map((entry) => [entry.id, entry]));
   const orderedBookIds = [...authority.wiSources.worldBookIds];
   for (const entry of authority.intercepted) {
     if (!orderedBookIds.includes(entry.world_book_id)) orderedBookIds.push(entry.world_book_id);
@@ -6835,7 +6839,7 @@ function serializeNativeWorldInfoProjection(
   const entries = exactEntries.flatMap((entry, order) => {
     const book = booksById.get(entry.world_book_id);
     return book
-      ? [nativeWorldEntrySnapshot(entry, book, order, activatedIds, authority.nativeWiStateBefore)]
+      ? [nativeWorldEntrySnapshot(entry, sourceEntryById.get(entry.id) ?? entry, book, order, activatedIds, authority.nativeWiStateBefore)]
       : [];
   });
   const vectorById = new Map(authority.vectorActivated.map((candidate) => [candidate.entry.id, candidate]));

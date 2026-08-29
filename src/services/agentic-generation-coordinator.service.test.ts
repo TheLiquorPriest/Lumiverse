@@ -1876,7 +1876,7 @@ describe("production agentic coordinator installation", () => {
     expect(snapshot.agentConfig).toBeNull();
     expect(Array.isArray(snapshot.availability.toolIds)).toBe(true);
   });
-  test("admits differently ordered World Info projections before provider without weakening source revision fences", async () => {
+  test("admits differently ordered World Info commit authority without provider and rejects source or member mutations", async () => {
     const db = getDb();
     const bookId = "book-runtime-world-authority";
     // Native World Info retains insertion order for equal order_value rows,
@@ -1885,6 +1885,7 @@ describe("production agentic coordinator installation", () => {
     // opposite orders.
     const firstEntryId = "entry-runtime-world-authority-z";
     const secondEntryId = "entry-runtime-world-authority-a";
+    const addedEntryId = "entry-runtime-world-authority-member";
     const character = db.query("SELECT extensions FROM characters WHERE id = ?").get("character-coordinator") as { extensions: string };
     const now = Date.now();
     db.query(
@@ -1939,7 +1940,51 @@ describe("production agentic coordinator installation", () => {
       expect(worldInfoEvidence.every((entry) => !("source" in entry))).toBe(true);
       expect(providerRequests).toHaveLength(providerRequestsBefore);
 
+      const revisionReader = __testing.makeRevisionReader({
+        userId: USER_ID,
+        chatId: CHAT_ID,
+        assemblySurface: "WORK",
+        presetId: PRESET_ID,
+        targetCharacterId: "character-coordinator",
+      });
+      const worldMembers = snapshot.inputRevisionSet.entries
+        .filter((member) => member.kind === "world_lore");
+      expect(worldMembers).toHaveLength(4);
+      for (const member of worldMembers) {
+        expect(revisionReader(member, db)).toEqual({
+          revision: member.revision,
+          digest: member.digest,
+        });
+      }
+      expect(providerRequests).toHaveLength(providerRequestsBefore);
+
+      const contentMember = worldMembers.find((member) => member.id === secondEntryId)!;
+      db.query("UPDATE world_book_entries SET content = ? WHERE id = ?")
+        .run("Second source changed without revision", secondEntryId);
+      const contentChanged = revisionReader(contentMember, db);
+      expect(contentChanged?.revision).toBe(contentMember.revision);
+      expect(contentChanged?.digest).not.toBe(contentMember.digest);
+      db.query("UPDATE world_book_entries SET content = ? WHERE id = ?")
+        .run("Second constant source", secondEntryId);
+      expect(revisionReader(contentMember, db)).toEqual({
+        revision: contentMember.revision,
+        digest: contentMember.digest,
+      });
+
+      insertEntry.run(addedEntryId, bookId, addedEntryId, "Added authority member", now, now);
+      const retainedMember = worldMembers.find((member) => member.id === firstEntryId)!;
+      const membershipChanged = revisionReader(retainedMember, db);
+      expect(membershipChanged?.revision).toBe(retainedMember.revision);
+      expect(membershipChanged?.digest).not.toBe(retainedMember.digest);
+      db.query("DELETE FROM world_book_entries WHERE id = ?").run(addedEntryId);
+      expect(revisionReader(retainedMember, db)).toEqual({
+        revision: retainedMember.revision,
+        digest: retainedMember.digest,
+      });
+
       db.query("UPDATE world_book_entries SET revision = revision + 1 WHERE id = ?").run(secondEntryId);
+      expect(revisionReader(contentMember, db)?.revision).not.toBe(contentMember.revision);
+      expect(providerRequests).toHaveLength(providerRequestsBefore);
       await expect(deps.buildAssemblySnapshot!(
         input,
         decision,
