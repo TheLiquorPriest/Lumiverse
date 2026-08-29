@@ -1475,6 +1475,16 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     }
   }, [promptVariablesPreset, promptVariablesBinding, chatId, t])
 
+  const reloadPromptVariableValues = useCallback(async (): Promise<PromptVariableValues> => {
+    const presetId = promptVariablesPreset?.id
+    if (!presetId || useStore.getState().activeLoomPresetId !== presetId) {
+      throw new Error('No active preset')
+    }
+    const latest = presetSaveCoordinator.acceptPersisted(unmarshalPreset(await presetsApi.get(presetId)))
+    if (useStore.getState().activeLoomPresetId !== presetId) throw new Error('No active preset')
+    setPromptVariablesPreset(latest)
+    return latest.promptVariables
+  }, [promptVariablesPreset?.id])
   useEffect(() => subscribePresetProfilePromptVariableChanges(({ target, binding }) => {
     const currentTarget = promptVariablesBindingRef.current
     if (
@@ -3625,6 +3635,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           blocks={promptVariablesPreset.blocks}
           values={promptVariablesPreset.promptVariables ?? {}}
           onSave={savePromptVariableValues}
+          onReloadLatest={reloadPromptVariableValues}
           onClose={() => setPromptVariablesModalOpen(false)}
         />
       )}

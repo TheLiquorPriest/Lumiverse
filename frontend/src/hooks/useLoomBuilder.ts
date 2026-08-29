@@ -192,7 +192,6 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     () => dependencies.saveCoordinator ?? (
       dependencies.presetsApi
         ? createPresetSaveCoordinator({
-            get: (presetId) => presetApi.get(presetId),
             update: (presetId, input) => presetApi.update(presetId, input),
           })
         : defaultPresetSaveCoordinator
@@ -344,28 +343,19 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     if (!presetId || useStore.getState().activeLoomPresetId !== presetId) {
       throw new Error('No active preset')
     }
-    const hydration = presetSaveCoordinator.beginHydration(presetId, 'agentic-runtime-conflict')
-    try {
-      const result = await runtimeApi.getMatchedEditor(presetId)
-      if (useStore.getState().activeLoomPresetId !== presetId) {
-        throw new Error('No active preset')
-      }
-      const reloaded = presetSaveCoordinator.hydrate(
-        unmarshalPreset(result.preset),
-        hydration,
-      )
-      if (useStore.getState().activeLoomPresetId !== reloaded.id) {
-        throw new Error('No active preset')
-      }
-      activePresetRef.current = reloaded
-      setActivePreset(reloaded)
-      setError(null)
-      await refreshRegistry()
-      return result
-    } catch (error) {
-      presetSaveCoordinator.cancelHydration(hydration)
-      throw error
+    const result = await runtimeApi.getMatchedEditor(presetId)
+    if (useStore.getState().activeLoomPresetId !== presetId) {
+      throw new Error('No active preset')
     }
+    const reloaded = presetSaveCoordinator.acceptPersisted(unmarshalPreset(result.preset))
+    if (useStore.getState().activeLoomPresetId !== reloaded.id) {
+      throw new Error('No active preset')
+    }
+    activePresetRef.current = reloaded
+    setActivePreset(reloaded)
+    setError(null)
+    await refreshRegistry()
+    return result
   }, [activeLoomPresetId, presetSaveCoordinator, refreshRegistry, runtimeApi])
 
   // Load registry on mount. The registry is kept in the store across panel

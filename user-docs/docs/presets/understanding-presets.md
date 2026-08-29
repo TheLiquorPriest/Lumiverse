@@ -162,6 +162,11 @@ Open the preset in Loom Builder and select **Agentic Runtime**. The tab is a sha
 7. In **Workspace Retention & Sharing**, choose the view-only workspace retention and sharing policy. **Portability & Repair** lists unresolved or stale slots, imported review items, invalid cognition or task references, stale Loom block revisions, and provider capability mismatches. The current runtime behavior for workspace retention and visibility is described below.
 8. Acknowledge every imported review item, repair the listed issues, and save. A dirty draft or a revision conflict must be resolved before changing, importing, or exporting the preset.
 
+If **Configure Prompt Variables** reports that the preset changed elsewhere,
+your unsaved values have not replaced the newer preset. Choose **Reload latest
+for review** to stage the canonical values, review them, and then make any
+intended changes again.
+
 Profile IDs and named results use lowercase letters, digits, and underscores, starting with a letter. `as=`, `tools=`, and `stream` are optional intrinsic options; a `tools=` list can narrow a profile's grants but cannot widen them. A profile's literal system prompt is not a place for preset macro expansion. Child timeout is edited in whole seconds with a minimum of 5 seconds. Cancelling the root turn stops active child work.
 
 ### Provider and connection requirements

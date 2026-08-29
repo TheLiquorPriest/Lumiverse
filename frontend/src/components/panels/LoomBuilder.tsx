@@ -82,6 +82,7 @@ import {
   getPortablePresetErrorCode,
   getRemotePresetOrigin,
   resolvePromptBlockPlacements,
+  unmarshalPreset,
 } from '@/lib/loom/service'
 import { sanitizeCharacterTagTrigger, splitCharacterTagTriggerInput } from '@/lib/loom/characterTagTrigger'
 import {
@@ -2306,6 +2307,10 @@ function LoomBuilderNative({
     const savedToProfile = await saveActivePromptVariableValues(values)
     if (!savedToProfile) await savePresetPromptVariableValues(values)
   }, [activePreset?.id, isResolved, resolvedPresetId, saveActivePromptVariableValues, savePresetPromptVariableValues])
+  const reloadPromptVariableValues = useCallback(async (): Promise<PromptVariableValues> => {
+    const latest = await reloadActivePreset()
+    return unmarshalPreset(latest.preset).promptVariables
+  }, [reloadActivePreset])
   const presetEditorTabs = __contextMeterStore((state) => state.presetEditorTabs)
   const outerEditorTabIds = useMemo(
     () => ['preset', 'agentic-runtime', ...presetEditorTabs.map((tab) => tab.id)],
@@ -3852,6 +3857,7 @@ function LoomBuilderNative({
             blocks={activePreset.blocks}
             values={effectivePromptVariableValues}
             onSave={savePromptVariableValues}
+            onReloadLatest={reloadPromptVariableValues}
             onClose={() => setShowPromptVariablesModal(false)}
           />
         )}

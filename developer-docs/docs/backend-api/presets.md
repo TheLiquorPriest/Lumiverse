@@ -260,7 +260,13 @@ The separate ordinary `PUT /api/v1/presets/:id` route always requires
 additionally requires snake_case `expected_config_revision`; an ordinary update
 without `agent_config` does not require that config precondition. This is
 distinct from the dedicated `/agent-config` route above, whose preconditions
-are camelCase. A stale ordinary Agentic-config write returns HTTP
+are camelCase. A stale ordinary preset precondition returns HTTP
+`409 PRESET_REVISION_CONFLICT`. Treat that response as an authoritative
+concurrency boundary: preserve the local draft, surface conflict/review UI,
+and wait for an explicit canonical reload. Clients must not fetch the newer
+revision and automatically retry the stale mutation, because doing so bypasses
+the compare-and-swap guard and can silently overwrite the newer preset. A stale
+ordinary Agentic-config write instead returns HTTP
 `409 AGENT_CONFIG_REVISION_CONFLICT` with the canonical snake_case fields
 `{ preset_id, expected_config_revision, actual_config_revision, preset,
 agent_config_revision, agent_config, agent_config_review, cache_revision }`.
