@@ -3733,7 +3733,7 @@ describe("production agentic coordinator installation", () => {
       writeProfileRuntime.run(JSON.stringify([]), 128, USER_ID, AGENTIC_PRESET_ID, "delegate_alt");
     }
   });
-  test("keeps heterogeneous child identity exact and fails closed after the root observes omitted submissions", async () => {
+  test("materializes authored child task macros once while keeping heterogeneous child identity exact", async () => {
     markAgenticRuntimeReady();
     process.env.LUMIVERSE_AGENTIC_RUNTIME = "auto";
     await probeIsolateBackendsAtStartup();
@@ -3845,11 +3845,32 @@ describe("production agentic coordinator installation", () => {
         signal,
         "test-heterogeneous-children",
       );
+      const exactTaskVariables = {
+        fn_selector_bank: "B",
+        fn_scenario_a: "CC-P01",
+        fn_scenario_b: "IN-I01",
+        fn_run_nonce: "IN-I01-M4-CP-034-C857-20260829T082526Z",
+      } as const;
+      const authoredTask = "SELECTOR_BANK={{var::fn_selector_bank}} BANK_A={{var::fn_scenario_a}} BANK_B={{var::fn_scenario_b}} RUN_NONCE={{var::fn_run_nonce}}. Execute only the assigned required child task.";
+      const expectedTask = "SELECTOR_BANK=B BANK_A=CC-P01 BANK_B=IN-I01 RUN_NONCE=IN-I01-M4-CP-034-C857-20260829T082526Z. Execute only the assigned required child task.";
+      const baseEffectiveVariables = baseSnapshot.variables.effective;
+      if (!baseEffectiveVariables) throw new Error("Effective prompt variables were not frozen");
+      const effectiveVariables = {
+        ...baseEffectiveVariables,
+        values: { ...baseEffectiveVariables.values, ...exactTaskVariables },
+      };
+      const variables = {
+        ...baseSnapshot.variables,
+        effective: effectiveVariables,
+        revision: createHash("sha256")
+          .update(encodeCanonicalPlainData(effectiveVariables), "utf8")
+          .digest("hex"),
+      };
       const scheduledBlocks = [
         {
           id: "heterogeneous-child-a",
           name: "Heterogeneous child A",
-          content: "{{agent::delegate::as=heterogeneous_child_a_result}}child a{{/agent}}",
+          content: "{{agent::delegate::as=heterogeneous_child_a_result}}" + authoredTask + "{{/agent}}",
           role: "user" as const,
           enabled: true,
           position: "pre_history" as const,
@@ -3885,6 +3906,7 @@ describe("production agentic coordinator installation", () => {
         ...baseSnapshot,
         snapshotId: "",
         generationId: "test-heterogeneous-children",
+        variables,
         blocks: [...baseSnapshot.blocks, ...scheduledBlocks],
       };
       const {
@@ -3901,6 +3923,16 @@ describe("production agentic coordinator installation", () => {
       } as typeof baseSnapshot;
       const plan = await compileAgentAssemblyPlan(snapshot);
       expect(plan.children.map((child) => child.profileId)).toEqual(["delegate", "delegate_alt"]);
+      expect(plan.children[0]).toMatchObject({
+        blockId: "heterogeneous-child-a",
+        task: expectedTask,
+        taskBytes: Buffer.byteLength(expectedTask, "utf8"),
+      });
+      expect(plan.privateEvidence.activation).toContainEqual(expect.objectContaining({
+        kind: "macro",
+        blockId: "heterogeneous-child-a",
+        operation: "resolve",
+      }));
 
       scriptedDelegate = false;
       scriptedWorkRound = 0;
@@ -3932,6 +3964,13 @@ describe("production agentic coordinator installation", () => {
           expect(dispatches[0]?.request.model).toBe(expected.model);
           expect(dispatches[0]?.request.model).not.toBe("scripted-model");
           expect(tokenizerModels).toContain(expected.model);
+          if (profileId === "delegate") {
+            expect(dispatches[0]?.request.messages.some((message) =>
+              typeof message.content === "string" && message.content.includes(expectedTask))).toBe(true);
+            expect(db.query(
+              "SELECT description FROM agent_workspace_tasks WHERE turn_id = ? AND task_id = ?",
+            ).get(execution.id, expectedTaskId)).toEqual({ description: expectedTask });
+          }
 
           const childExchange = inspection?.transcript.find((record) =>
             record.kind === "provider_exchange"

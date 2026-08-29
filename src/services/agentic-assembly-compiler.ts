@@ -952,7 +952,49 @@ async function preprocessSnapshot(
     if (child && phasePolicyBlockIds.has(block.id)) {
       failForBlock("requires_response_mode", "Cognition policy blocks cannot contain agent result references", block, blockIndex);
     }
-    if (child || !block.enabled) {
+    if (child && block.enabled) {
+      const parsedChild = parseChildOpening(block, blockIndex);
+      if (!parsedChild) {
+        failForBlock("invalid_intrinsic", "Agent intrinsic markers must form a sealed child block", block, blockIndex);
+      }
+      setSnapshotBlockMacroContext(env, snapshot, block);
+      let resolvedTask: string;
+      try {
+        resolvedTask = await resolveSnapshotMacroText(parsedChild.task, env, budget);
+        if (agentMarkersPresent(resolvedTask)) {
+          throw new Error("generated_result_reference: macro generated a protected agent marker");
+        }
+      } catch (error) {
+        if (error instanceof AssemblyPlanValidationError) throw error;
+        const message = error instanceof Error ? error.message : "unknown preprocessing failure";
+        const code: AssemblyPlanFailureCode = message.startsWith("requires_response_mode:")
+          ? "requires_response_mode"
+          : message.startsWith("generated_result_reference:")
+            ? "generated_result_reference"
+            : message.startsWith("limit_exceeded:")
+              ? "limit_exceeded"
+              : "invalid_input";
+        failForBlock(code, message, block, blockIndex);
+      }
+      if (resolvedTask !== parsedChild.task) {
+        macroEvidence.push(frozen({
+          kind: "macro",
+          blockId: block.id,
+          operation: "resolve",
+          inputBytes: bytes(parsedChild.task),
+          outputBytes: bytes(resolvedTask),
+        }));
+      }
+      const openingEnd = block.content.indexOf("}}", OPEN_PREFIX.length) + 2;
+      const resolvedBlock = frozen({
+        ...block,
+        content: block.content.slice(0, openingEnd) + resolvedTask + CLOSE_TAG,
+      });
+      parseChildOpening(resolvedBlock, blockIndex);
+      blocks.push(resolvedBlock);
+      continue;
+    }
+    if (!block.enabled) {
       blocks.push(block);
       continue;
     }
