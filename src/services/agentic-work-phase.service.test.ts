@@ -1494,6 +1494,50 @@ describe("Agentic WORK phase", () => {
     expect(tools).not.toContain("mcp_call");
     expect(tools).not.toContain("spindle_tool");
   });
+
+  test("keeps assigned child workspace reads free of mutation-only task arguments", async () => {
+    const workspaceCalls: Array<{
+      readonly operation: string;
+      readonly args: Record<string, unknown>;
+    }> = [];
+    let round = 0;
+    const child = await executeBoundedAgenticChildFrame({
+      frame: createAgenticChildFrame({
+        frameId: "child-read-frame",
+        parentFrameId: "root",
+        provider: "test-child-provider",
+        connectionId: "concrete-connection",
+        model: "frozen-model",
+        coreToolIds: [],
+        workspaceCapabilities: ["read_section"],
+        taskId: "assigned-child-task",
+        signal: new AbortController().signal,
+      }),
+      task: "Read the assigned workspace projection.",
+      taskId: "assigned-child-task",
+      systemPrompt: "Use the granted workspace reader.",
+      workspace: workspace({
+        execute: async (operation, args) => {
+          workspaceCalls.push({ operation, args });
+          return { section: args.section, tasks: [] };
+        },
+      }),
+      dispatch: async () => {
+        round += 1;
+        return round === 1
+          ? response("", [call("workspace_read_section", "child-read", { section: "tasks" })])
+          : response("read complete");
+      },
+    });
+
+    expect(child.status).toBe("succeeded");
+    expect(workspaceCalls).toHaveLength(1);
+    expect(workspaceCalls[0]).toMatchObject({
+      operation: "read_section",
+      args: { section: "tasks", actor: "child", frameId: "child-read-frame" },
+    });
+    expect(workspaceCalls[0]?.args).not.toHaveProperty("taskId");
+  });
   test("rejects child frames without a non-empty concrete provider, connection, and model", () => {
     const valid: Parameters<typeof createAgenticChildFrame>[0] = {
       frameId: "child-concrete-identity",
@@ -6252,6 +6296,41 @@ describe("Agentic WORK phase", () => {
     expect(child.status).toBe("succeeded");
     expect(child.code).not.toBe("child_output_limit_exceeded");
     expect(child.code).not.toBe("root_output_limit_exceeded");
+    const { plan: childPlan, snapshot } = await compiledChildFixture([{
+      id: "root-fuse-child",
+      content: "{{agent::writer::as=root_fuse_child_result}}child{{/agent}}",
+    }]);
+    let rootRounds = 0;
+    const root = await runAgenticWorkPhase(baseOptions(async () => {
+      rootRounds += 1;
+      if (rootRounds === 1) {
+        return {
+          content: "",
+          finish_reason: "length",
+          usage: { prompt_tokens: 1, completion_tokens: 8, total_tokens: 9 },
+        };
+      }
+      return response("", [complete("after-child-usage")]);
+    }, {
+      plan: childPlan,
+      snapshot,
+      childProfiles: [{
+        profileId: "writer",
+        provider: "test-child-provider",
+        connectionId: "test-child-connection",
+        model: "test-child-model",
+      }],
+      executeChild: async () => ({
+        content: "child result",
+        status: "succeeded",
+        usage: { inputTokens: 1, outputTokens: 8, totalTokens: 9 },
+      }),
+      workspace: workspace(),
+      workspaceCapabilities: [],
+      budget: { maxOutputTokens: 8, maxUnsignedBoundaries: 2, maxProviderRounds: 4 },
+    }));
+    expect(root.status).toBe("completed");
+    expect(rootRounds).toBe(2);
   });
 
   test("enriches recoverable completion_blocked with phase, tools, and open task ids then accepts after settlement", async () => {

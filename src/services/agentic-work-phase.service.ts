@@ -433,7 +433,7 @@ export interface AgenticWorkFrame {
   readonly workspaceCapabilities: ReadonlySet<WorkspaceOperationKindV1>;
   readonly workspaceSharing: AgenticWorkspaceSharing;
   readonly canComplete: boolean;
-  /** Host-authenticated assignment carried into child workspace calls. */
+  /** Host-authenticated assignment carried into child task mutations. */
   readonly assignedTaskId?: string;
   readonly signal: AbortSignal;
 }
@@ -3138,6 +3138,7 @@ class WorkBudgetState {
   receiveBytes = 0;
   providerInputTokens = 0;
   providerSettledOutputTokens = 0;
+  rootBilledOutputTokens = 0;
   providerTotalTokens = 0;
   reservedToolResultBytes = 0;
   observations = 0;
@@ -3201,15 +3202,19 @@ class WorkBudgetState {
     return true;
   }
 
-  recordProviderUsage(usage: GenerationResponse["usage"], settledOutputTokens: number): boolean {
+  recordProviderUsage(
+    usage: GenerationResponse["usage"],
+    settledOutputTokens: number,
+    frameKind: "root" | "child" = "child",
+  ): boolean {
     const inputTokens = usage?.prompt_tokens ?? 0;
     const outputTokens = Math.max(usage?.completion_tokens ?? 0, settledOutputTokens);
     const reportedTotalTokens = usage?.total_tokens ?? 0;
     const totalTokens = Math.max(reportedTotalTokens, inputTokens + outputTokens);
-    return this.mergeProviderUsage({ inputTokens, outputTokens, totalTokens });
+    return this.mergeProviderUsage({ inputTokens, outputTokens, totalTokens }, frameKind);
   }
 
-  mergeProviderUsage(usage: AgenticWorkUsage): boolean {
+  mergeProviderUsage(usage: AgenticWorkUsage, frameKind: "root" | "child" = "child"): boolean {
     if (
       !Number.isSafeInteger(usage.inputTokens)
       || usage.inputTokens < 0
@@ -3219,10 +3224,12 @@ class WorkBudgetState {
       || usage.totalTokens < usage.inputTokens + usage.outputTokens
       || this.providerInputTokens > Number.MAX_SAFE_INTEGER - usage.inputTokens
       || this.providerSettledOutputTokens > Number.MAX_SAFE_INTEGER - usage.outputTokens
+      || (frameKind === "root" && this.rootBilledOutputTokens > Number.MAX_SAFE_INTEGER - usage.outputTokens)
       || this.providerTotalTokens > Number.MAX_SAFE_INTEGER - usage.totalTokens
     ) return false;
     this.providerInputTokens += usage.inputTokens;
     this.providerSettledOutputTokens += usage.outputTokens;
+    if (frameKind === "root") this.rootBilledOutputTokens += usage.outputTokens;
     this.providerTotalTokens += usage.totalTokens;
     return true;
   }
@@ -3245,10 +3252,10 @@ class WorkBudgetState {
     return rootBilledOutputFuseLimit(this.limits.maxOutputTokens, this.limits.maxUnsignedBoundaries);
   }
   billedOutputFuseExceeded(): boolean {
-    return this.providerSettledOutputTokens >= this.billedOutputFuseLimit();
+    return this.rootBilledOutputTokens >= this.billedOutputFuseLimit();
   }
   billedOutputFuseExhaustedMessage(): string {
-    return `Root billed completion tokens ${this.providerSettledOutputTokens} exceeded fuse ${this.billedOutputFuseLimit()} (maxOutputTokens × maxUnsignedBoundaries)`;
+    return `Root billed completion tokens ${this.rootBilledOutputTokens} exceeded fuse ${this.billedOutputFuseLimit()} (maxOutputTokens × maxUnsignedBoundaries)`;
   }
 
   reserveToolResult(bytes: number, receiveLimitBytes = this.limits.maxWorkOutputBytes): boolean {
@@ -3820,7 +3827,7 @@ async function executeWorkspaceTool(
     : undefined;
   const authenticatedArgs = {
     ...args,
-    ...(frame.kind === "child" && frame.assignedTaskId !== undefined
+    ...(childOnly && frame.assignedTaskId !== undefined
       ? { taskId: frame.assignedTaskId }
       : {}),
     actor: frame.kind,
@@ -6324,6 +6331,7 @@ export async function runAgenticWorkPhase(
           response.usage,
           accounting.outputTokens,
         ),
+        "root",
       )) {
         return outcomeAfterPending("failed", "provider_protocol_error");
       }
