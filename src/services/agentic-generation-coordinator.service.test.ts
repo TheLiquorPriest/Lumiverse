@@ -1,6 +1,11 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { Hono } from "hono";
-import { compileAgentAssemblyPlan, type AssemblyMessageSegmentV1, type AssemblyProviderMessageV1 } from "./agentic-assembly-compiler";
+import {
+  compileAgentAssemblyPlan,
+  validateAssemblyPlanAgainstSnapshotV1,
+  type AssemblyMessageSegmentV1,
+  type AssemblyProviderMessageV1,
+} from "./agentic-assembly-compiler";
 import { createHash } from "node:crypto";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
@@ -3933,6 +3938,8 @@ describe("production agentic coordinator installation", () => {
         blockId: "heterogeneous-child-a",
         operation: "resolve",
       }));
+      await expect(validateAssemblyPlanAgainstSnapshotV1(plan, snapshot, snapshot.limits)).resolves.toBeUndefined();
+
 
       scriptedDelegate = false;
       scriptedWorkRound = 0;

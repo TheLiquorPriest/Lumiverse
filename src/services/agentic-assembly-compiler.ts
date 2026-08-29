@@ -3330,53 +3330,8 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   if (canonical(plan.profileOutputLimits) !== canonical(expectedProfileOutputLimits)) {
     throw new AssemblyPlanValidationError("invalid_input", "Profile output limits are not bound to the requested snapshot");
   }
-  const expectedChildren: AssemblyChildDescriptorV1[] = [];
-  const expectedSlots: AssemblyResultSlotV1[] = [];
-  for (const item of parsed) {
-    if (!item.child) continue;
-    const profile = config?.profiles.find((candidate: IntrinsicProfile) => candidate.id === item.child!.profileId);
-    const authoredOutputTokens = typeof profile?.maxOutputTokens === "number" && Number.isFinite(profile.maxOutputTokens)
-      ? Math.max(1, Math.floor(profile.maxOutputTokens))
-      : Math.max(1, Math.floor(snapshot.limits.maxOperationBytes / 4));
-    const maxOutputBytes = Math.min(
-      snapshot.limits.maxOutputBytes,
-      authoredOutputTokens * CHILD_RESULT_BYTES_PER_AUTHORED_TOKEN,
-    );
-    const maxOutputTokens = Math.min(authoredOutputTokens, Math.max(1, Math.ceil(maxOutputBytes / 4)));
-    const slotIndex = expectedChildren.length;
-    const resultName = item.child.resultName ?? `child_${slotIndex}`;
-    const childId = `${snapshot.snapshotId}:child:${slotIndex}`;
-    const producerSeal = digest({ slotIndex, blockIndex: item.blockIndex, blockId: item.block.id, resultName });
-    const child = frozen({
-      childId,
-      slotIndex,
-      traversalIndex: slotIndex,
-      blockIndex: item.blockIndex,
-      blockId: item.block.id,
-      profileId: item.child.profileId,
-      resultName,
-      task: item.child.task,
-      taskBytes: bytes(item.child.task),
-      maxOutputBytes,
-      maxOutputTokens,
-      required: item.child.failurePolicy === "required",
-      toolIds: frozen([...item.child.toolIds]),
-      streamActivity: item.child.stream,
-      sourceOffset: item.blockIndex,
-      failurePolicy: item.child.failurePolicy,
-      producerSeal,
-    });
-    expectedChildren.push(child);
-    expectedSlots.push(frozen({
-      childId,
-      slotIndex,
-      resultName,
-      producerBlockIndex: item.blockIndex,
-      producerBlockId: item.block.id,
-      maxBytes: maxOutputBytes,
-      seal: producerSeal,
-    }));
-  }
+  const expectedChildren: readonly AssemblyChildDescriptorV1[] = expectedPlan.childDescriptors;
+  const expectedSlots: readonly AssemblyResultSlotV1[] = expectedPlan.resultSlots;
   const expectedChildrenCanonical = canonical(expectedChildren);
   if (
     canonical(plan.children) !== expectedChildrenCanonical
