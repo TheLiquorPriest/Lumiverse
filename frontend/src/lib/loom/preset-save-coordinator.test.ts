@@ -13,6 +13,7 @@ import {
 } from './preset-save-coordinator'
 import { unmarshalPreset } from './service'
 import { presetsApi } from '@/api/presets'
+import { getRuntimeAuthorityRevision } from '@/lib/agentRuntimeSelection'
 
 function rawPreset(overrides: Partial<Preset> = {}): Preset {
   return {
@@ -100,6 +101,76 @@ describe('preset save coordinator', () => {
     expect(writes[1].prompt_order).toHaveLength(1)
     expect(writes[1].metadata?.promptVariables).toEqual({ 'block-1': { tone: 'warm' } })
   })
+
+  test('commits runtime authority only when the server advances preset revision', async () => {
+    const before = getRuntimeAuthorityRevision()
+    const advanced = createPresetSaveCoordinator({
+      async update(presetId, input) {
+        return rawPreset({ ...persistedFromUpdate(presetId, input), cache_revision: 2 })
+      },
+    })
+    const revisionOne = unmarshalPreset(rawPreset({ cache_revision: 1 }))
+    advanced.hydrate(revisionOne)
+    advanced.mutate(revisionOne.id, revisionOne, (preset) => ({ ...preset, name: 'Advanced' }), { immediate: true })
+    await advanced.flush(revisionOne.id)
+    expect(getRuntimeAuthorityRevision()).toBe(before + 1)
+
+    const unchanged = createPresetSaveCoordinator({
+      async update(presetId, input) {
+        return rawPreset({ ...persistedFromUpdate(presetId, input), cache_revision: 2 })
+      },
+    })
+    const revisionTwo = unmarshalPreset(rawPreset({ cache_revision: 2 }))
+    unchanged.hydrate(revisionTwo)
+    unchanged.mutate(revisionTwo.id, revisionTwo, (preset) => ({ ...preset, name: 'No-op response' }), { immediate: true })
+    await unchanged.flush(revisionTwo.id)
+    expect(getRuntimeAuthorityRevision()).toBe(before + 1)
+  })
+  test('commits an advanced stale-scope success before suppressing local publication', async () => {
+    const before = getRuntimeAuthorityRevision()
+    let resolveUpdate!: (preset: Preset) => void
+    const pendingUpdate = new Promise<Preset>((resolve) => { resolveUpdate = resolve })
+    const updateStarted = Promise.withResolvers<void>()
+    const coordinator = createPresetSaveCoordinator({
+      async update() {
+        updateStarted.resolve()
+        return pendingUpdate
+      },
+    })
+    const presetId = 'stale-authority-preset'
+    const scopeA = unmarshalPreset(rawPreset({ id: presetId, name: 'Scope A', cache_revision: 1 }))
+    const scopeB = unmarshalPreset(rawPreset({ id: presetId, name: 'Scope B', cache_revision: 9 }))
+
+    coordinator.setScope('user-a')
+    coordinator.hydrate(scopeA)
+    coordinator.mutate(presetId, scopeA, (preset) => ({ ...preset, name: 'Pending A' }), { immediate: true })
+    const flush = coordinator.flush(presetId)
+    await updateStarted.promise
+
+    coordinator.setScope('user-b')
+    let scopeBPublications = 0
+    coordinator.subscribe(presetId, () => { scopeBPublications += 1 })
+    coordinator.hydrate(scopeB)
+    scopeBPublications = 0
+    resolveUpdate(rawPreset({ id: presetId, name: 'Persisted A', cache_revision: 2 }))
+    await flush
+
+    expect(getRuntimeAuthorityRevision()).toBe(before + 1)
+    expect(coordinator.getDraft(presetId)?.name).toBe('Scope B')
+    expect(scopeBPublications).toBe(0)
+  })
+  test('does not commit runtime authority for a failed save', async () => {
+    const before = getRuntimeAuthorityRevision()
+    const coordinator = createPresetSaveCoordinator({
+      async update() { throw new Error('save failed') },
+    })
+    const base = unmarshalPreset(rawPreset({ cache_revision: 1 }))
+    coordinator.hydrate(base)
+    coordinator.mutate(base.id, base, (preset) => ({ ...preset, name: 'Rejected' }), { immediate: true })
+    await expect(coordinator.flush(base.id)).rejects.toThrow('save failed')
+    expect(getRuntimeAuthorityRevision()).toBe(before)
+  })
+
   test('retains same-tick functional block updates over the coordinator draft', async () => {
     const writes: UpdatePresetInput[] = []
     const coordinator = createPresetSaveCoordinator({
@@ -810,6 +881,26 @@ describe('preset save coordinator', () => {
     let canonical = rawPreset({
       cache_revision: 1,
       metadata: { promptVariables: { fixture: { bank: 'A', nonce: 'original' } } },
+      prompt_order: [{
+        id: 'fixture',
+        name: 'Fixture',
+        content: '',
+        role: 'system',
+        enabled: true,
+        position: 'pre_history',
+        depth: 0,
+        marker: null,
+        isLocked: false,
+        color: null,
+        injectionTrigger: [],
+        characterTagTrigger: [],
+        group: null,
+        categoryMode: null,
+        variables: [
+          { id: 'bank', name: 'bank', label: 'Bank', type: 'text', defaultValue: '' },
+          { id: 'nonce', name: 'nonce', label: 'Nonce', type: 'text', defaultValue: '' },
+        ],
+      }],
     })
     const updateCalls = { profileA: 0, profileB: 0 }
     const conflict = (expected: number) => Object.assign(new Error('preset revision conflict'), {
@@ -1146,5 +1237,53 @@ describe('preset save coordinator', () => {
       presetSaveCoordinator.setScope(null)
       localStorage.clear()
     }
+  })
+  test('uses response-hydrated preset revision without coupling an ordinary save to config CAS', async () => {
+    localStorage.clear()
+    const writes: UpdatePresetInput[] = []
+    const coordinator = createPresetSaveCoordinator({
+      async update(presetId, input) {
+        writes.push(structuredClone(input))
+        return rawPreset({
+          id: presetId,
+          name: input.name ?? 'Hydrated owner',
+          cache_revision: 8,
+          agent_config_revision: 10,
+        })
+      },
+    })
+    coordinator.setScope('regex-cas-user')
+    const base = unmarshalPreset(rawPreset({
+      id: 'regex-owner-cas',
+      name: 'Before regex mutation',
+      cache_revision: 2,
+      agent_config_revision: 3,
+    }))
+    const published: LoomPreset[] = []
+    const unsubscribe = coordinator.subscribe(base.id, (preset) => published.push(preset))
+    coordinator.hydrate(base)
+    const authority = unmarshalPreset(rawPreset({
+      id: base.id,
+      name: 'After regex mutation',
+      cache_revision: 7,
+      agent_config_revision: 9,
+    }))
+    expect(coordinator.observeAuthority(authority)).toBe(true)
+    expect(published.at(-1)).toMatchObject({ cacheRevision: 7, agentConfigRevision: 9 })
+
+    const hydrated = coordinator.getDraft(base.id)!
+    coordinator.mutate(base.id, hydrated, (preset) => ({ ...preset, description: 'ordinary save' }), { immediate: true })
+    await coordinator.flush(base.id)
+
+    expect(writes).toHaveLength(1)
+    expect(writes[0]).toMatchObject({
+      expected_cache_revision: 7,
+      metadata: { description: 'ordinary save' },
+    })
+    expect(writes[0]).not.toHaveProperty('agent_config')
+    expect(writes[0]).not.toHaveProperty('expected_config_revision')
+    unsubscribe()
+    coordinator.setScope(null)
+    localStorage.clear()
   })
 })

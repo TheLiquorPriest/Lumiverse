@@ -96,7 +96,7 @@ function stopResultPayload(result: svc.GenerationStopResult) {
     return {
       stopped: false,
       status: "terminal" as const,
-      terminal: { ...result.run, generationId: result.generationId },
+      terminal: result.run,
     };
   }
   return {
@@ -109,10 +109,38 @@ app.post("/", chatRoute(svc.startGeneration));
 app.post("/regenerate", chatRoute(svc.startGeneration, { generation_type: "regenerate" }));
 app.post("/continue", chatRoute(svc.startGeneration, { generation_type: "continue" }));
 app.post("/dry-run", chatRoute(svc.dryRunGeneration));
+app.post("/dispatch-acknowledge", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json<{
+    chat_id?: string;
+    generation_id?: string;
+    request_authority_id?: string;
+  }>();
+  const state = svc.acknowledgeGenerationDispatch(
+    userId,
+    body.chat_id ?? "",
+    body.generation_id,
+    body.request_authority_id,
+  );
+  return state === false
+    ? c.json({ acknowledged: false as const, state: "rejected" as const }, 409)
+    : c.json({ acknowledged: true as const, state });
+});
+
 
 app.post("/stop", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
+  if (body.request_authority_id && body.generation_id) {
+    if (!body.chat_id) return c.json(stopResultPayload(false));
+    const exactAuthorityStop = await svc.stopGenerationRequestAuthority(
+      userId,
+      body.chat_id,
+      body.request_authority_id,
+      body.generation_id,
+    );
+    return c.json(stopResultPayload(exactAuthorityStop));
+  }
   const requestAuthorityResult: svc.GenerationStopResult = body.chat_id && body.request_authority_id
     ? await svc.stopGenerationRequestAuthority(userId, body.chat_id, body.request_authority_id)
     : false;

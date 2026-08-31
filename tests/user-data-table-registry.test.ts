@@ -14,12 +14,45 @@ describe("archive table registry", () => {
   test("classifies the current archive-sensitive table families exactly once", () => {
     const names = ARCHIVE_TABLE_REGISTRY.map((spec) => spec.table);
     expect(new Set(names).size).toBe(names.length);
-    expect(ARCHIVE_REGISTRY_VERSION).toBe(3);
+    expect(ARCHIVE_REGISTRY_VERSION).toBe(5);
     expect(getArchiveTableSpec("audio_files")?.kind).toBe("canonical");
     expect(getArchiveTableSpec("agent_run_projections")?.kind).toBe("operational");
     expect(getArchiveTableSpec("agent_activity_runs")?.kind).toBe("operational");
     expect(getArchiveTableSpec("multiplayer_rooms")?.kind).toBe("operational");
     expect(getArchiveTableSpec("user_data_import_receipts")?.kind).toBe("operational");
+    for (const table of [
+      "agent_work_segment_recovery",
+      "agent_work_segments",
+      "agent_work_segment_transitions",
+      "agent_work_segment_dispatches",
+      "agent_work_workspace_receipts",
+    ]) {
+      expect(getArchiveTableSpec(table)?.kind).toBe("operational");
+      expect(getArchiveTableSpec(table)?.owner).toEqual({ kind: "direct", column: "user_id" });
+    }
+    expect(getArchiveTableSpec("agent_work_segment_recovery")?.parentEdges.map((edge) => edge.parentTable)).toEqual([
+      "user",
+      "agent_turn_executions",
+      "agent_run_attempts",
+      "agent_turn_workspaces",
+    ]);
+    const receiptDispatchEdge = getArchiveTableSpec("agent_work_workspace_receipts")?.parentEdges.find(
+      (edge) => edge.parentTable === "agent_work_segment_dispatches",
+    );
+    expect(receiptDispatchEdge).toEqual({
+      column: "user_id",
+      parentTable: "agent_work_segment_dispatches",
+      parentColumn: "user_id",
+      columns: ["user_id", "execution_id", "segment_id", "logical_dispatch"],
+      parentColumns: ["user_id", "execution_id", "segment_id", "dispatch_ordinal"],
+      nullable: false,
+      onMissing: "reject",
+    });
+    const sourceTransitionEdge = getArchiveTableSpec("agent_work_segments")?.parentEdges.find(
+      (edge) => edge.parentTable === "agent_work_segment_transitions",
+    );
+    expect(sourceTransitionEdge?.nullable).toBe(true);
+    expect(sourceTransitionEdge?.deferred).toBe(true);
     expect(getArchiveTableSpec("sso_providers")?.kind).toBe("forbidden");
     expect(getArchiveTableSpec("characters_fts_data")?.kind).toBe("forbidden");
     expect(getArchiveTableSpec("stream_deck_tokens")?.kind).toBe("forbidden");

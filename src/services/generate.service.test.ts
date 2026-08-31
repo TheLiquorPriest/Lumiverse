@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 
 import type { LlmProvider } from "../llm/provider";
 import type { ProviderCapabilities } from "../llm/param-schema";
@@ -13,7 +13,7 @@ import type {
   ProviderTransientCarrier,
   StreamChunk,
 } from "../llm/types";
-import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { closeDatabase, closeDatabaseAsync, getDb, initDatabase } from "../db/connection";
 import { runMigrations } from "../db/migrate";
 import type { AgentConfigV2 } from "../types/agents";
 import type { LoomPromptInspectionV1 } from "../types/agent-cognition";
@@ -34,6 +34,7 @@ import {
   configureAgenticGenerationDependencies,
   dryRunGeneration,
   getActiveGenerationCount,
+  rawGenerate,
   startGeneration,
   stopGeneration,
   stopGenerationRequestAuthority,
@@ -91,6 +92,7 @@ const TEST_CONNECTION: ResolvedConcreteConnectionV1 = {
     apiKeyRequired: false,
     modelListStyle: "none",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,
@@ -1137,6 +1139,155 @@ describe("production agent final context fit", () => {
   });
 });
 
+describe("raw generation tool mode", () => {
+  beforeAll(async () => {
+    initDatabase(":memory:");
+    await runMigrations(getDb());
+  });
+
+  afterAll(async () => {
+    await closeDatabaseAsync();
+  });
+
+  const toolDefinitions: NonNullable<GenerationRequest["tools"]> = [{
+    name: "record_result",
+    description: "Record the result",
+    parameters: { type: "object", additionalProperties: false },
+  }];
+
+  class RawToolModeProvider implements LlmProvider {
+    readonly displayName = "Raw tool mode test provider";
+    readonly defaultUrl = "https://raw-tool-mode.invalid/v1";
+    readonly capabilities: ProviderCapabilities;
+    readonly requests: GenerationRequest[] = [];
+
+    constructor(
+      readonly name: string,
+      requiredToolChoice: boolean,
+    ) {
+      this.capabilities = {
+        parameters: {},
+        requiresMaxTokens: false,
+        supportsSystemRole: true,
+        supportsStreaming: true,
+        apiKeyRequired: false,
+        modelListStyle: "none",
+        toolCalling: true,
+        requiredToolChoice,
+        nativeToolContinuation: true,
+        toolContinuationMode: "native",
+        toolsDisabledFinalization: true,
+        supportsToolFinalization: true,
+      };
+    }
+
+    async generate(
+      _apiKey: string,
+      _apiUrl: string,
+      request: GenerationRequest,
+    ): Promise<GenerationResponse> {
+      this.requests.push(request);
+      return { content: "ok", finish_reason: "stop" };
+    }
+
+    async *generateStream(
+      _apiKey: string,
+      _apiUrl: string,
+      request: GenerationRequest,
+    ): AsyncGenerator<StreamChunk, void, unknown> {
+      this.requests.push(request);
+      yield { token: "ok", finish_reason: "stop" };
+    }
+
+    async validateKey(): Promise<boolean> {
+      return true;
+    }
+
+    async listModels(): Promise<string[]> {
+      return ["raw-tool-mode-model"];
+    }
+  }
+
+  function inputFor(
+    provider: RawToolModeProvider,
+    toolMode: GenerationRequest["toolMode"],
+  ): Parameters<typeof rawGenerate>[1] {
+    return {
+      provider: provider.name,
+      model: "raw-tool-mode-model",
+      messages: [{ role: "user", content: "Use the admitted tool." }],
+      api_key: "test-key",
+      reasoning: { source: "off" },
+      toolMode,
+    };
+  }
+
+  test("forwards ordinary and required modes to a capable provider request", async () => {
+    const provider = new RawToolModeProvider(
+      "raw-tool-mode-capable-forwarding",
+      true,
+    );
+    registerProvider(provider);
+
+    await rawGenerate("raw-tool-mode-user", {
+      ...inputFor(provider, "ordinary"),
+      tools: toolDefinitions,
+    });
+    await rawGenerate("raw-tool-mode-user", {
+      ...inputFor(provider, "required"),
+      tools: toolDefinitions,
+    });
+
+    expect(provider.requests.map((request) => request.toolMode)).toEqual([
+      "ordinary",
+      "required",
+    ]);
+    expect(provider.requests.map((request) => request.tools)).toEqual([
+      toolDefinitions,
+      toolDefinitions,
+    ]);
+  });
+
+  test("fails required mode closed without an admitted tool", async () => {
+    const provider = new RawToolModeProvider(
+      "raw-tool-mode-capable-no-tools",
+      true,
+    );
+    registerProvider(provider);
+
+    await expect(
+      rawGenerate(
+        "raw-tool-mode-user",
+        inputFor(provider, "required"),
+      ),
+    ).rejects.toThrow("Required tool mode needs at least one admitted host tool");
+    expect(provider.requests).toHaveLength(0);
+  });
+
+  test("uses runtime capability for required mode without blocking ordinary mode", async () => {
+    const provider = new RawToolModeProvider(
+      "raw-tool-mode-incapable",
+      false,
+    );
+    registerProvider(provider);
+
+    await rawGenerate("raw-tool-mode-user", {
+      ...inputFor(provider, "ordinary"),
+      tools: toolDefinitions,
+    });
+    await expect(
+      rawGenerate("raw-tool-mode-user", {
+        ...inputFor(provider, "required"),
+        tools: toolDefinitions,
+      }),
+    ).rejects.toThrow(
+      'Provider "raw-tool-mode-incapable" does not support required tool choice',
+    );
+
+    expect(provider.requests).toHaveLength(1);
+    expect(provider.requests[0]?.toolMode).toBe("ordinary");
+  });
+});
 describe.serial("root generation usage accounting", () => {
   const previousPromptAssemblyWorker =
     process.env.LUMIVERSE_PROMPT_ASSEMBLY_WORKER;
@@ -1164,6 +1315,7 @@ describe.serial("root generation usage accounting", () => {
       apiKeyRequired: false,
       modelListStyle: "openai",
       toolCalling: true,
+      requiredToolChoice: true,
       nativeToolContinuation: true,
       toolContinuationMode: "native",
       toolsDisabledFinalization: true,
@@ -2962,6 +3114,7 @@ class RuntimeAdmissionProvider implements LlmProvider {
     apiKeyRequired: false,
     modelListStyle: "none",
     toolCalling: false,
+    requiredToolChoice: false,
     nativeToolContinuation: false,
     toolContinuationMode: "unsupported",
     toolsDisabledFinalization: false,

@@ -23,6 +23,7 @@ export class MoonshotProvider extends OpenAICompatibleProvider {
     apiKeyRequired: true,
     modelListStyle: "openai",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,

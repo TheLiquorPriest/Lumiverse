@@ -86,12 +86,12 @@ function refsFromCanonicalLoomPolicy(value: unknown, sourceValue?: unknown): Cog
       const expectedPresetRevision = sourceValue.presetRevision;
       const expectedBlockRevision = sourceValue.blockRevision;
       const expectedPromptOrder = sourceValue.promptOrder;
-      const sourceBlock = source?.blocks.find((block) => block.blockId === sourceValue.blockId);
+      const sourceBlock = source?.blocks.find((block) => block.promptOrder === expectedPromptOrder);
       const exact = source !== null
         && sourceBlock !== undefined
+        && sourceBlock.blockId === sourceValue.blockId
         && source.presetRevision === expectedPresetRevision
-        && sourceBlock.revision === expectedBlockRevision
-        && sourceBlock.promptOrder === expectedPromptOrder;
+        && sourceBlock.revision === expectedBlockRevision;
       if (!exact) {
         if (rawEntry.required) failSource(path, "required Loom block provenance is stale");
         return [];
@@ -100,6 +100,7 @@ function refsFromCanonicalLoomPolicy(value: unknown, sourceValue?: unknown): Cog
         blockId: sourceValue.blockId,
         expectedPresetRevision,
         expectedBlockRevision,
+        promptOrder: expectedPromptOrder,
       }];
     });
   }
@@ -210,8 +211,9 @@ function phaseRefs(graph: FrozenCognitionGraphV1, phase: CognitionPhase): Cognit
           : [];
   const seen = new Set<string>();
   const ordered = refs.filter((ref) => {
-    if (seen.has(ref.blockId)) return false;
-    seen.add(ref.blockId);
+    const occurrenceKey = `${ref.blockId.length}:${ref.blockId}:${ref.promptOrder}`;
+    if (seen.has(occurrenceKey)) return false;
+    seen.add(occurrenceKey);
     return true;
   });
   return Object.freeze({ phase, refs: Object.freeze(ordered) });
@@ -488,7 +490,8 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
     applyWorkspaceTransition(input: CognitionRuntimeTaskTransitionInputV1): CognitionWorkspaceMutationResultV1 {
       throwIfAborted(input.signal);
       const identity = cognitionTaskIdentity(graph, input.workspace, input.taskId);
-      const operationKey = input.operationKey;
+      const reservation = input.reservation;
+      const operationKey = reservation.operationKey;
       const transition: CognitionTaskTransition = input.operation === "create_task"
         ? "pending"
         : input.operation === "submit_child_result" || input.operation === "accept_submission"
@@ -507,13 +510,15 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
                       ? "failed"
                       : (() => { throw new AgentCognitionRuntimeError("invalid_source", "workspace progress state is invalid"); })();
       if (input.transition !== transition) throw new AgentCognitionRuntimeError("invalid_source", "workspace transition does not match the authenticated operation");
-      const fingerprint = canonical({ operation: input.operation, taskId: identity.authoredTaskId, transition, payload: semanticWorkspacePayload(input.operation, input.workspace) });
-      if (operationKey) {
-        const previous = operationResults.get(operationKey);
-        if (previous) {
-          if (previous.fingerprint !== fingerprint) throw new AgentCognitionRuntimeError("idempotency_conflict", "operation key was reused for a different transition", operationKey);
-          return previous.result;
-        }
+      const reservationOperation = input.operation === "settle_child_failure" ? "settle_child_task" : input.operation;
+      if (reservation.operationKind !== reservationOperation) {
+        throw new AgentCognitionRuntimeError("invalid_source", "workspace reservation does not match the authenticated operation");
+      }
+      const fingerprint = canonical({ reservation, operation: input.operation, taskId: identity.authoredTaskId, transition, payload: semanticWorkspacePayload(input.operation, input.workspace) });
+      const previous = operationResults.get(operationKey);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new AgentCognitionRuntimeError("idempotency_conflict", "operation key was reused for a different transition", operationKey);
+        return previous.result;
       }
       if (completionAccepted) throw new AgentCognitionRuntimeError("completion_blocked", "workspace cognition is frozen after completion");
       assertWorkspaceRevision(input.workspace, state.workspaceRevision);
@@ -523,7 +528,7 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       const update = (current: CognitionActivationStateV1): CognitionWorkspaceActivationUpdateV1 => {
         if (current.workspaceRevision !== state.workspaceRevision) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "cognition state is stale for workspace CAS");
         const activation = activateCognitionAtPoint(graph, current, phaseContext(baseEvaluation, currentPhase, nextTransitions), "task_transition", activationRoots);
-        const next: CognitionWorkspaceActivationUpdateV1 = { taskId: identity.operationalTaskId, transition, ...(operationKey ? { operationKey } : {}), state: Object.freeze({ ...activation.state, workspaceRevision: current.workspaceRevision + 1 }), activation, materializeTemplates: materializationTemplates(graph, activation.newlyActivatedTemplateIds) };
+        const next: CognitionWorkspaceActivationUpdateV1 = { taskId: identity.operationalTaskId, transition, reservation, state: Object.freeze({ ...activation.state, workspaceRevision: current.workspaceRevision + 1 }), activation, materializeTemplates: materializationTemplates(graph, activation.newlyActivatedTemplateIds) };
         computed = next;
         return next;
       };
@@ -542,10 +547,23 @@ export function createAgentCognitionRuntime(input: CreateAgentCognitionRuntimeIn
       const evaluated = computed;
       if (!evaluated) throw new AgentCognitionRuntimeError("workspace_cas_conflict", "workspace CAS did not evaluate cognition");
       const cognition = runtimeActivation(currentPhase, workspaceResult.state, workspaceResult.activation, graph, frozenSourceDigest, authenticatedSource, phaseContext(baseEvaluation, currentPhase, nextTransitions), checkpointEvidence);
-      const result = deepFreeze({ workspaceRevision: workspaceResult.workspaceRevision, state: workspaceResult.state, activation: workspaceResult.activation, materializedTaskIds: publicMaterializedTaskIds(graph, input.workspace, workspaceResult.materializedTaskIds), taskId: evaluated.taskId, transition: evaluated.transition, cognition, ...(operationKey ? { operationKey } : {}) });
+      const result = deepFreeze({
+        workspaceRevision: workspaceResult.workspaceRevision,
+        state: workspaceResult.state,
+        activation: workspaceResult.activation,
+        materializedTaskIds: publicMaterializedTaskIds(graph, input.workspace, workspaceResult.materializedTaskIds),
+        taskId: evaluated.taskId,
+        transition: evaluated.transition,
+        operationKey: workspaceResult.operationKey,
+        segmentId: workspaceResult.segmentId,
+        logicalDispatch: workspaceResult.logicalDispatch,
+        frameId: workspaceResult.frameId,
+        operationDigest: workspaceResult.operationDigest,
+        cognition,
+      });
       state = result.state;
       transitions[identity.authoredTaskId] = transition;
-      if (operationKey) operationResults.set(operationKey, { fingerprint, result });
+      operationResults.set(operationKey, { fingerprint, result });
       return result;
     },
     async acceptCompletionFixedPoint(input: CognitionRuntimeCompletionInputV1): Promise<CognitionRuntimeCompletionV1> {

@@ -21,7 +21,7 @@ import {
 } from "./agentic-assembly-compiler";
 import { parseAgenticPreprocessingResponseV1 } from "./agentic-preprocessing-worker-client";
 import type { ActiveIsolateJob } from "./isolate-pool";
-import { freezeCognitionGraph } from "./agent-cognition.service";
+import { freezeCognitionGraph, inspectLoomPromptPolicies } from "./agent-cognition.service";
 import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import { AGENT_CHILD_TASK_MAX_BYTES } from "./agent-runtime-accounting";
 
@@ -716,55 +716,72 @@ describe("strict assembly plan", () => {
     expect(segments.some((segment) => segment.kind === "literal" && segment.text === "{{regex_should_not_run}}" && segment.text.includes("{{"))).toBe(true);
     db.close();
   });
-  test("orders equal-prompt-order Loom blocks by raw UTF-8 bytes", async () => {
+  test("binds duplicate-ID cognition provenance by Loom prompt order", async () => {
     const db = schema();
     seed(db);
-    const firstId = "z-block";
-    const secondId = "é-block";
-    const sourceBlocks = [firstId, secondId].map((blockId) => ({
-      blockId,
-      revision: 1,
-      promptOrder: 0,
-    }));
-    const promptBlocks = [firstId, secondId].map((id) => ({
+    db.run("ALTER TABLE world_book_entries ADD COLUMN extensions TEXT NOT NULL DEFAULT '{}'");
+    db.query("UPDATE world_book_entries SET content = ?, extensions = ? WHERE id = ?").run(
+      "ASSEMBLY_OUTLET_CONTEXT",
+      JSON.stringify({ outlet_name: "policy_context" }),
+      "entry-2",
+    );
+    const blockId = "shared-policy-block";
+    const promptBlock = (id: string, content: string, revision = 1) => ({
       id,
       name: id,
-      content: `policy-${id}`,
-      role: "user",
-      enabled: true,
-      position: "pre_history",
+      content,
+      role: "user" as const,
+      enabled: id === blockId,
+      position: "pre_history" as const,
       depth: 0,
       marker: null,
       isLocked: false,
       color: null,
       injectionTrigger: [],
       group: null,
-    }));
+      revision,
+    });
+    const promptBlocks = [
+      promptBlock("filler-0", ""),
+      promptBlock("filler-1", ""),
+      promptBlock("filler-2", ""),
+      promptBlock(blockId, "Occurrence three {{outlet::policy_context}}.", 1),
+      promptBlock("filler-4", ""),
+      promptBlock("filler-5", ""),
+      promptBlock("filler-6", ""),
+      promptBlock(blockId, "Occurrence seven compiled policy.", 2),
+    ];
     db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(JSON.stringify(promptBlocks), "preset-1");
-    const cognitionSource = { presetRevision: 7, blocks: sourceBlocks };
+    const cognitionSource = {
+      presetRevision: 7,
+      blocks: [
+        { blockId, revision: 1, promptOrder: 3 },
+        { blockId, revision: 2, promptOrder: 7 },
+      ],
+    };
     const cognitionGraph = freezeCognitionGraph({
       version: 1,
       policies: { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
       templates: [],
     }, cognitionSource);
-    const policyEntry = (blockId: string) => ({
+    const policyEntry = (id: string, promptOrder: number, blockRevision: number, required: boolean) => ({
       version: 1 as const,
-      id: `policy-${blockId}`,
+      id,
       source: {
         kind: "loom_block" as const,
         blockId,
         presetRevision: 7,
-        blockRevision: 1,
-        promptOrder: 0,
+        blockRevision,
+        promptOrder,
       },
       destination: "root_work" as const,
       checkpoint: "WORK" as const,
-      required: false,
+      required,
       visibility: "work_only" as const,
     });
     const loomPolicy = {
       version: 1 as const,
-      workPolicy: [policyEntry(firstId), policyEntry(secondId)],
+      workPolicy: [policyEntry("policy-three", 3, 1, true), policyEntry("policy-seven", 7, 2, false)],
       workspaceUsage: [],
       completionCriteria: [],
       renderPolicy: [],
@@ -781,9 +798,126 @@ describe("strict assembly plan", () => {
       db,
     });
     const plan = await compileAgentAssemblyPlan(snapshot);
+    const inspection = inspectLoomPromptPolicies(plan.loomPolicy, {
+      surface: "WORK",
+      checkpoint: "WORK",
+      blocks: plan.loomBlocks,
+    });
+    expect(inspection.effectiveEntryIds).toEqual(["policy-three", "policy-seven"]);
+    expect(inspection.items[0]?.effectiveText).toBe("Occurrence three ASSEMBLY_OUTLET_CONTEXT.");
+    expect(inspection.items.map((item) => [item.required, item.outcome.status])).toEqual([
+      [true, "included"],
+      [false, "included"],
+    ]);
     expect(plan.workPolicyMessages.map((message) =>
       message.segments.map((segment) => segment.kind === "literal" ? segment.text : "").join(""),
-    )).toEqual([`policy-${firstId}`, `policy-${secondId}`]);
+    )).toEqual(["Occurrence three ASSEMBLY_OUTLET_CONTEXT.", "Occurrence seven compiled policy."]);
+    expect(plan.workPolicyMessages.map((message) => [
+      message.provenance.sourceIndex,
+      message.provenance.loom.source.promptOrder,
+      message.provenance.sourceRevision,
+      message.blockIndex,
+    ])).toEqual([
+      [0, 3, "1", 3],
+      [1, 7, "2", 7],
+    ]);
+    expect(plan.workPolicyMessages[0]).toMatchObject({
+      blockIndex: 3,
+      provenance: {
+        kind: "cognition",
+        sourceIndex: 0,
+        loom: {
+          entryId: "policy-three",
+          bucket: "workPolicy",
+          destination: "root_work",
+          checkpoint: "WORK",
+          effectiveText: "Occurrence three ASSEMBLY_OUTLET_CONTEXT.",
+          source: { promptOrder: 3 },
+        },
+      },
+    });
+    expect(plan.loomBlocks.map((entry) => [entry.source.promptOrder, entry.source.blockRevision, entry.content])).toEqual([
+      [3, 1, "Occurrence three ASSEMBLY_OUTLET_CONTEXT."],
+      [7, 2, "Occurrence seven compiled policy."],
+    ]);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(plan, snapshot)).resolves.toBeUndefined();
+
+    const first = plan.workPolicyMessages[0]!;
+    const firstLoom = first.provenance.loom!;
+    const forgedMessage = ({
+      sourceId = first.provenance.sourceId,
+      sourceRevision = first.provenance.sourceRevision,
+      sourceIndex = first.provenance.sourceIndex,
+      promptOrder = firstLoom.source.promptOrder,
+      blockRevision = firstLoom.source.blockRevision,
+      loomBlockId = firstLoom.source.blockId,
+      messageBlockId = first.blockId,
+      messageBlockIndex = first.blockIndex,
+    }: {
+      sourceId?: string;
+      sourceRevision?: string;
+      sourceIndex?: number;
+      promptOrder?: number;
+      blockRevision?: number;
+      loomBlockId?: string;
+      messageBlockId?: string;
+      messageBlockIndex?: number;
+    }): AssemblyPlanV1["workPolicyMessages"][number] => ({
+      ...first,
+      blockId: messageBlockId,
+      blockIndex: messageBlockIndex,
+      provenance: {
+        ...first.provenance,
+        sourceId,
+        sourceRevision,
+        sourceIndex,
+        loom: {
+          ...firstLoom,
+          source: { ...firstLoom.source, blockId: loomBlockId, blockRevision, promptOrder },
+        },
+      },
+    });
+    const forgedPlan = (message: AssemblyPlanV1["workPolicyMessages"][number]): AssemblyPlanV1 => ({
+      ...plan,
+      workPolicyMessages: [message, plan.workPolicyMessages[1]!],
+    });
+    const siblingOccurrence = forgedPlan(forgedMessage({
+      sourceRevision: "2",
+      promptOrder: 7,
+      blockRevision: 2,
+      messageBlockIndex: 7,
+    }));
+    await expect(validateAssemblyPlanAgainstSnapshotV1(siblingOccurrence, snapshot)).rejects.toThrow(/source|provenance|projection/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(forgedPlan(forgedMessage({ sourceRevision: "2" })), snapshot)).rejects.toThrow(/source|provenance|projection/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(forgedPlan(forgedMessage({ sourceId: "forged-id" })), snapshot)).rejects.toThrow(/source|provenance|projection/i);
+    await expect(validateAssemblyPlanAgainstSnapshotV1(forgedPlan(forgedMessage({ loomBlockId: "forged-id" })), snapshot)).rejects.toThrow(/source|provenance|projection/i);
+    for (const promptOrder of [8, 3.5, -1]) {
+      await expect(validateAssemblyPlanAgainstSnapshotV1(forgedPlan(forgedMessage({ promptOrder })), snapshot)).rejects.toThrow(/source|provenance|projection|invalid/i);
+    }
+    for (const sourceIndex of [1, 2]) {
+      expect(() => validateAssemblyPlanV1(forgedPlan(forgedMessage({ sourceIndex })), plan.limits))
+        .toThrow("Cognition policy message provenance is not source-bound");
+    }
+    for (const sourceIndex of [0.5, -1]) {
+      expect(() => validateAssemblyPlanV1(forgedPlan(forgedMessage({ sourceIndex })), plan.limits))
+        .toThrow("Invalid cognition policy message provenance");
+    }
+    db.query("UPDATE presets SET prompt_order = ? WHERE id = ?").run(
+      JSON.stringify(promptBlocks.map((block, promptOrder) => promptOrder === 7 ? { ...block, marker: "category" } : block)),
+      "preset-1",
+    );
+    const categorySnapshot = buildGenerationAssemblySnapshot({
+      assemblySurface: "WORK",
+      userId: "user-1",
+      chatId: "chat-1",
+      presetId: "preset-1",
+      agentConfig: config(),
+      cognitionGraph,
+      cognitionSource,
+      loomPolicy,
+      db,
+    });
+    await expect(compileAgentAssemblyPlan(categorySnapshot)).rejects.toThrow(/category marker/i);
     db.close();
   });
   test("rejects a Response snapshot at the strict compiler boundary", async () => {
@@ -1298,7 +1432,7 @@ describe("strict assembly plan", () => {
       const forged = {
         ...message,
         provenance: { ...message.provenance, sourceRevision: `${message.provenance.sourceRevision}-forged` },
-      };
+      } as typeof message;
       const forgedMessages = plan.providerMessages.map((candidate, candidateIndex) => candidateIndex === index ? forged : candidate);
       await expect(validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(forgedMessages), snapshot)).rejects.toThrow(/source-bound|messages/i);
     }
@@ -1308,7 +1442,7 @@ describe("strict assembly plan", () => {
       : message);
     await expect(validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(roleForged), snapshot)).rejects.toThrow(/source-bound|messages|role/i);
     const sourceIndexForged = plan.providerMessages.map((message, candidateIndex) => candidateIndex === roleIndex
-      ? { ...message, provenance: { ...message.provenance, sourceIndex: message.provenance.sourceIndex + 1 } }
+      ? ({ ...message, provenance: { ...message.provenance, sourceIndex: message.provenance.sourceIndex + 1 } } as typeof message)
       : message);
     await expect(validateAssemblyPlanAgainstSnapshotV1(withProviderMessages(sourceIndexForged), snapshot)).rejects.toThrow(/source-bound|messages|index/i);
   });

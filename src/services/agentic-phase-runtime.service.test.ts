@@ -109,6 +109,20 @@ describe("canonical custom Phased Instructions compiler", () => {
     ]));
   });
 
+  test("accepts duplicate block IDs at distinct prompt-order occurrences", () => {
+    const firstOccurrence = sourceRef("repeated", 2, 0);
+    const secondOccurrence = sourceRef("repeated", 3, 1);
+    const result = compile([
+      phase({ instructionRefs: [firstOccurrence, secondOccurrence] }),
+    ], [firstOccurrence, secondOccurrence]);
+
+    expect(result.status).toBe("ready");
+    expect(result.phases[0]?.sourceIdentity).toEqual([
+      { blockId: "repeated", presetRevision: 7, blockRevision: 2, promptOrder: 0 },
+      { blockId: "repeated", presetRevision: 7, blockRevision: 3, promptOrder: 1 },
+    ]);
+  });
+
   test("repairs optional stale phases but fails closed for malformed required phases", () => {
     const optional = compile([
       phase({
@@ -149,10 +163,12 @@ describe("canonical custom Phased Instructions compiler", () => {
   });
 
   test("revalidates duplicate IDs, closed capabilities, and arbitrary transitions", () => {
+    const draftInstructionsRef = sourceRef("draft-instructions", 1, 0);
+    const sameSecondRef = sourceRef("same-2", 1, 1);
     const duplicate = compile([
-      phase({ id: "same" }),
-      phase({ id: "same", instructionRefs: [sourceRef("same-2")] }),
-    ], [sourceRef("draft-instructions"), sourceRef("same-2")]);
+      phase({ id: "same", instructionRefs: [draftInstructionsRef] }),
+      phase({ id: "same", instructionRefs: [sameSecondRef] }),
+    ], [draftInstructionsRef, sameSecondRef]);
     expect(duplicate.status).toBe("failed");
     expect(duplicate.issues).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "duplicate_phase_id", required: true }),
@@ -166,11 +182,14 @@ describe("canonical custom Phased Instructions compiler", () => {
       expect.objectContaining({ code: "invalid_phase", required: true }),
     ]));
 
+    const oneRef = sourceRef("one", 1, 0);
+    const twoRef = sourceRef("two", 1, 1);
+    const threeRef = sourceRef("three", 1, 2);
     const arbitraryJump = compile([
-      phase({ id: "one", nextPhaseIds: ["three"], instructionRefs: [sourceRef("one")] }),
-      phase({ id: "two", instructionRefs: [sourceRef("two")] }),
-      phase({ id: "three", instructionRefs: [sourceRef("three")] }),
-    ], [sourceRef("one"), sourceRef("two"), sourceRef("three")]);
+      phase({ id: "one", nextPhaseIds: ["three"], instructionRefs: [oneRef] }),
+      phase({ id: "two", instructionRefs: [twoRef] }),
+      phase({ id: "three", instructionRefs: [threeRef] }),
+    ], [oneRef, twoRef, threeRef]);
     expect(arbitraryJump.status).toBe("failed");
     expect(arbitraryJump.issues).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: "invalid_transition", phaseId: "one", source: "transition" }),
@@ -267,10 +286,13 @@ describe("canonical custom Phased Instructions machine", () => {
     });
     expect(machine.state().status).toBe("failed");
 
+    const orderedOneRef = sourceRef("one", 1, 0);
+    const orderedTwoRef = sourceRef("two", 1, 1);
     const ordered = compile([
-      phase({ id: "one", nextPhaseIds: ["two"], instructionRefs: [sourceRef("one")] }),
-      phase({ id: "two", instructionRefs: [sourceRef("two")] }),
-    ], [sourceRef("one"), sourceRef("two")]);
+      phase({ id: "one", nextPhaseIds: ["two"], instructionRefs: [orderedOneRef] }),
+      phase({ id: "two", instructionRefs: [orderedTwoRef] }),
+    ], [orderedOneRef, orderedTwoRef]);
+    expect(ordered.status).toBe("ready");
     const orderedMachine = createAgentRuntimePhaseMachine(ordered);
     expect(orderedMachine.enter({ revision: 1, context: context() }).status).toBe("entered");
     expect(orderedMachine.exit({ revision: 1, context: context() })).toMatchObject({ status: "advanced", phaseId: "one" });
@@ -289,19 +311,22 @@ describe("canonical custom Phased Instructions machine", () => {
   });
 
   test("keeps an unsatisfied exit entered when the next phase is not a self-loop", () => {
+    const exerciseRef = sourceRef("exercise", 1, 0);
+    const collaborateRef = sourceRef("collaborate", 1, 1);
     const compiled = compile([
       phase({
         id: "exercise",
         exit: { kind: "task_transition", taskId: "evidence", transition: "completed" },
         repeatLimit: 2,
         nextPhaseIds: ["collaborate"],
-        instructionRefs: [sourceRef("exercise")],
+        instructionRefs: [exerciseRef],
       }),
       phase({
         id: "collaborate",
-        instructionRefs: [sourceRef("collaborate")],
+        instructionRefs: [collaborateRef],
       }),
-    ], [sourceRef("exercise"), sourceRef("collaborate")]);
+    ], [exerciseRef, collaborateRef]);
+    expect(compiled.status).toBe("ready");
     const machine = createAgentRuntimePhaseMachine(compiled);
     expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
     expect(machine.exit({
@@ -322,6 +347,8 @@ describe("canonical custom Phased Instructions machine", () => {
   });
 
   test("keeps optional repeatLimit 0 unsatisfied exits entered when skip is false", () => {
+    const collaborateRef = sourceRef("collaborate", 1, 0);
+    const settleRef = sourceRef("settle", 1, 1);
     const compiled = compile([
       phase({
         id: "collaborate",
@@ -330,10 +357,11 @@ describe("canonical custom Phased Instructions machine", () => {
         skip: { kind: "preset_variable", name: "fn_collaboration", operator: "equals", value: 0 },
         exit: { kind: "task_transition", taskId: "fn_collaboration", transition: "completed" },
         nextPhaseIds: ["settle"],
-        instructionRefs: [sourceRef("collaborate")],
+        instructionRefs: [collaborateRef],
       }),
-      phase({ id: "settle", instructionRefs: [sourceRef("settle")] }),
-    ], [sourceRef("collaborate"), sourceRef("settle")]);
+      phase({ id: "settle", instructionRefs: [settleRef] }),
+    ], [collaborateRef, settleRef]);
+    expect(compiled.status).toBe("ready");
     const machine = createAgentRuntimePhaseMachine(compiled);
     expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
     expect(machine.exit({
@@ -382,6 +410,8 @@ describe("canonical custom Phased Instructions machine", () => {
   });
 
   test("skips an optional phase only when its skip predicate is true", () => {
+    const collaborateRef = sourceRef("collaborate", 1, 0);
+    const settleRef = sourceRef("settle", 1, 1);
     const compiled = compile([
       phase({
         id: "collaborate",
@@ -389,10 +419,11 @@ describe("canonical custom Phased Instructions machine", () => {
         repeatLimit: 0,
         skip: { kind: "preset_variable", name: "fn_collaboration", operator: "equals", value: 0 },
         nextPhaseIds: ["settle"],
-        instructionRefs: [sourceRef("collaborate")],
+        instructionRefs: [collaborateRef],
       }),
-      phase({ id: "settle", instructionRefs: [sourceRef("settle")] }),
-    ], [sourceRef("collaborate"), sourceRef("settle")]);
+      phase({ id: "settle", instructionRefs: [settleRef] }),
+    ], [collaborateRef, settleRef]);
+    expect(compiled.status).toBe("ready");
     const skipped = createAgentRuntimePhaseMachine(compiled);
     expect(skipped.enter({
       revision: 1,
@@ -411,14 +442,17 @@ describe("canonical custom Phased Instructions machine", () => {
   });
 
   test("fails a required exit closed when the host snapshot is absent", () => {
+    const exerciseRef = sourceRef("exercise", 1, 0);
+    const collaborateRef = sourceRef("collaborate", 1, 1);
     const compiled = compile([
       phase({
         id: "exercise",
         nextPhaseIds: ["collaborate"],
-        instructionRefs: [sourceRef("exercise")],
+        instructionRefs: [exerciseRef],
       }),
-      phase({ id: "collaborate", instructionRefs: [sourceRef("collaborate")] }),
-    ], [sourceRef("exercise"), sourceRef("collaborate")]);
+      phase({ id: "collaborate", instructionRefs: [collaborateRef] }),
+    ], [exerciseRef, collaborateRef]);
+    expect(compiled.status).toBe("ready");
     const machine = createAgentRuntimePhaseMachine(compiled);
     expect(machine.enter({ revision: 1, context: context() }).status).toBe("entered");
     expect(machine.exit({
@@ -434,15 +468,17 @@ describe("canonical custom Phased Instructions machine", () => {
   });
 
   test("fails closed when exit would take an illegal phase advance", () => {
+    const oneRef = sourceRef("one", 1, 0);
+    const twoRef = sourceRef("two", 1, 1);
     const compiled = compile([
       phase({
         id: "one",
         repeatLimit: 1,
         nextPhaseIds: ["one"],
-        instructionRefs: [sourceRef("one")],
+        instructionRefs: [oneRef],
       }),
-      phase({ id: "two", instructionRefs: [sourceRef("two")] }),
-    ], [sourceRef("one"), sourceRef("two")]);
+      phase({ id: "two", instructionRefs: [twoRef] }),
+    ], [oneRef, twoRef]);
     expect(compiled.status).toBe("ready");
     expect(compiled.phases.map((entry) => entry.id)).toEqual(["one", "two"]);
     expect(compiled.phases[0]?.nextPhaseIds).toEqual(["one"]);
@@ -529,5 +565,146 @@ describe("canonical custom Phased Instructions machine", () => {
     ]));
     expect(optionalMachine.state()).toMatchObject({ status: "completed", phaseId: null, phaseIndex: null });
     expect(optionalMachine.currentPhase()).toBeNull();
+  });
+
+  test("restores an exact admitted occurrence without replaying phase actions", () => {
+    const prepareRef = sourceRef("prepare", 1, 0);
+    const executeRef = sourceRef("execute", 1, 1);
+    const compiled = compile([
+      phase({
+        id: "prepare",
+        nextPhaseIds: ["execute"],
+        instructionRefs: [prepareRef],
+      }),
+      phase({
+        id: "execute",
+        enter: { kind: "preset_variable", name: "gate", operator: "equals", value: "open" },
+        skip: { kind: "preset_variable", name: "skip", operator: "equals", value: true },
+        repeatLimit: 2,
+        nextPhaseIds: ["execute"],
+        capabilityRequests: ["workspace_read"],
+        instructionRefs: [executeRef],
+      }),
+    ], [prepareRef, executeRef]);
+    expect(compiled.status).toBe("ready");
+
+    const machine = createAgentRuntimePhaseMachine(compiled, {
+      admittedCapabilities: ["workspace_read"],
+      initialState: {
+        status: "entered",
+        phaseIndex: 1,
+        phaseId: "execute",
+        repeatCount: 2,
+        checkpointRevision: 23,
+      },
+    });
+
+    expect(machine.state()).toEqual({
+      status: "entered",
+      phaseIndex: 1,
+      phaseId: "execute",
+      repeatCount: 2,
+      checkpointRevision: 23,
+      nextPhaseId: null,
+    });
+    expect(machine.currentPhase()).toBe(compiled.phases[1]);
+    expect(machine.capabilities()).toEqual(["workspace_read"]);
+    expect(machine.evidence()).toEqual([]);
+
+    expect(machine.enter({
+      revision: 23,
+      context: context({ presetVariables: { gate: "closed", skip: true } }),
+    })).toMatchObject({
+      status: "noop",
+      condition: "omitted",
+      reason: "entry checkpoint already evaluated",
+      repeatCount: 2,
+    });
+    expect(machine.state()).toMatchObject({ status: "entered", phaseId: "execute", repeatCount: 2 });
+    expect(machine.evidence()).toEqual([]);
+
+    expect(machine.previewExit({ revision: 24, context: context() })).toMatchObject({
+      status: "completed",
+      checkpoint: "exit",
+      phaseId: "execute",
+      condition: "true",
+      repeatCount: 2,
+    });
+    expect(machine.state()).toMatchObject({ status: "entered", phaseId: "execute", repeatCount: 2 });
+    expect(machine.evidence()).toEqual([]);
+  });
+
+  test("rejects non-exact and impossible admitted occurrence restoration", () => {
+    const compiled = compile([
+      phase({
+        id: "repeatable",
+        repeatLimit: 2,
+        nextPhaseIds: ["repeatable"],
+        instructionRefs: [sourceRef("repeatable")],
+      }),
+    ], [sourceRef("repeatable")]);
+    const initialState = {
+      status: "entered" as const,
+      phaseIndex: 0,
+      phaseId: "repeatable",
+      repeatCount: 1,
+      checkpointRevision: 8,
+    };
+    const invalidStates: readonly unknown[] = [
+      null,
+      { ...initialState, status: "ready" },
+      { ...initialState, phaseIndex: -1 },
+      { ...initialState, phaseIndex: 0.5 },
+      { ...initialState, phaseIndex: Number.MAX_SAFE_INTEGER + 1 },
+      { ...initialState, phaseIndex: 1 },
+      { ...initialState, phaseId: "other" },
+      { ...initialState, repeatCount: -1 },
+      { ...initialState, repeatCount: 0.5 },
+      { ...initialState, repeatCount: 3 },
+      { ...initialState, checkpointRevision: -1 },
+      { ...initialState, checkpointRevision: 0.5 },
+      { ...initialState, checkpointRevision: Number.MAX_SAFE_INTEGER + 1 },
+    ];
+
+    for (const invalidState of invalidStates) {
+      expect(() => createAgentRuntimePhaseMachine(compiled, {
+        initialState: invalidState as never,
+      })).toThrow(/invalid initial phase machine state/);
+    }
+
+    const noSelfTransition = compile([
+      phase({
+        id: "single",
+        repeatLimit: 2,
+        nextPhaseIds: [],
+        instructionRefs: [sourceRef("single")],
+      }),
+    ], [sourceRef("single")]);
+    expect(() => createAgentRuntimePhaseMachine(noSelfTransition, {
+      initialState: {
+        status: "entered",
+        phaseIndex: 0,
+        phaseId: "single",
+        repeatCount: 1,
+        checkpointRevision: 8,
+      },
+    })).toThrow(/authored transition cycle/);
+
+    const oneRef = sourceRef("one", 1, 0);
+    const twoRef = sourceRef("two", 1, 1);
+    const ordered = compile([
+      phase({ id: "one", nextPhaseIds: ["two"], instructionRefs: [oneRef] }),
+      phase({ id: "two", instructionRefs: [twoRef] }),
+    ], [oneRef, twoRef]);
+    expect(ordered.status).toBe("ready");
+    expect(() => createAgentRuntimePhaseMachine([ordered.phases[1]!], {
+      initialState: {
+        status: "entered",
+        phaseIndex: 0,
+        phaseId: "two",
+        repeatCount: 0,
+        checkpointRevision: 8,
+      },
+    })).toThrow(/compiled phase authority/);
   });
 });

@@ -228,6 +228,7 @@ projection includes
 |---|---|---|
 | `GET` | `/api/v1/presets/:id/agent-config` | Return the shared V2 editor object directly (not a `{ preset, editor }` wrapper): `presetId`, `presetRevision`, `configRevision`, `config`, `review`, `slotBindings`, `taskTemplates`, `hostCeilings`, and `reviewAcknowledgements`. Missing/foreign presets return `404`. |
 | `PUT` | `/api/v1/presets/:id/agent-config` | Atomically save `config`, `slotBindings`, `taskTemplates`, `reviewAcknowledgements`, `promptOrder`, `expectedPresetRevision`, and `expectedConfigRevision`. Unknown or malformed bodies return `400`; a missing revision precondition returns `428`; success returns canonical `{ preset, editor }` state with refreshed preset/config revisions. |
+For the shared editor `PUT`, exact Loom references are submitted against `expectedPresetRevision`; clients never pre-advance them. When prompt order changes, the server rebases only a reference whose persisted and submitted blocks at that exact prompt-order occurrence retain the same ID, effective block revision, and semantic content. Moved, new, replaced, or occurrence-locally changed duplicate blocks preserve the authored old reference and return `repair_required / loom_reference_repair_required`. Config-only current-reference repairs retain the preset revision.
 | `GET` | `/api/v1/presets/:id/agent-runtime/portable` | Return the complete `PortablePresetRuntimeEnvelopeV1`: portable config and task templates, without local bindings or credentials. |
 | `POST` | `/api/v1/presets/import-portable` | Accept `{ preset: PortablePresetPayload, agentRuntime: PortablePresetRuntimeEnvelopeV1 }` and atomically import the complete preset/runtime graph as disabled, response-only, and review-required. |
 | `GET` | `/api/v1/presets/:id/agent-config/portable` | Return config-only `PortableAgentConfigV1` without local bindings or credentials. |
@@ -251,7 +252,8 @@ authored task templates.
 
 `AgentConfigV2.runtimePolicy.loomPolicy` is the canonical four-bucket Loom authoring record (`workPolicy`, `workspaceUsage`, `completionCriteria`, `renderPolicy`). Loom owns only existing prompt blocks plus **Phased Instructions**; it is not a second context authority.
 
-The fixed routes are `workPolicy` and `workspaceUsage` → root **WORK** / **WORK**, `completionCriteria` → completion handoff / **PREPARE_COMMIT**, and `renderPolicy` → tools-disabled **RENDER** / **RENDER**. Source revisions, fixed destinations/checkpoints, typed conditions, and `visibility: 'work_only'` are preserved by the config and portable routes. Conditions evaluate fail-closed at their owning checkpoint against its immutable snapshot and remain fixed for that checkpoint.
+The fixed routes are `workPolicy` and `workspaceUsage` → root **WORK** / **WORK**, `completionCriteria` → completion handoff / **PREPARE_COMMIT**, and `renderPolicy` → tools-disabled **RENDER** / **RENDER**. Source revisions, fixed destinations/checkpoints, typed conditions, and `visibility: 'work_only'` are preserved by the config and portable routes. Conditions evaluate fail-closed at their owning checkpoint against its immutable snapshot and remain fixed for that checkpoint. A PREPARE_COMMIT acceptance is host-owned current-turn control state. RENDER places a concrete terminal record—host authority, accepted status, current-request scope, and exact frozen workspace revision—before the native conversation. That system record does not quote user text: it binds to the final user-role message already present in the provider request by host-fixed message position, complete UTF-8 byte length, and SHA-256 digest. The complete request remains user-role data, including multiline and requests longer than 1,024 characters. The host-owned handoff remains after authored render policy as the final policy message, requires a completed and settled response, and forbids announcing future execution because WORK is already terminal.
+The request binding uses a zero-based provider-message index plus the full byte length and digest, and explicitly records that the referenced imperative request is historical input to already-completed WORK. Tools-disabled RENDER must report that settlement rather than re-evaluate executability or deny the WORK tools, workspace, task graph, or child-agent capabilities recorded by the accepted projection.
 
 `runtimePolicy.phases` is bounded and current-phase-only; later phase instructions are not materialized early. Each custom phase can declare explicit `childInstructionSubsets`, and each child receives only its named admitted subset.
 
@@ -374,12 +376,17 @@ Response/direct surfaces.
 
 Response-mode generation retains the existing provider message, tool
 continuation, prompt/response transform, reasoning, usage, partial Stop, and
-message persistence behavior. Agentic owner inspection may retain a bounded
-WORK transcript, provider content, private child material, and tool
-arguments/results; retention does not promise raw private reasoning or opaque
-continuation carriers. Public Agent Run projections remain status-only. The
-turn workspace retains bounded host-controlled records and artifact metadata
-for its view-only projection, and the final atomic commit is the only canonical
+message persistence behavior. One Agentic request instead owns one Turn
+Execution and an ordered durable Work Segment chain. Next-segment provider
+context never replays prior provider prose/messages, tool calls/results, hidden
+reasoning, opaque continuation carrier, stale phase instructions, or unaccepted
+claims. That replay boundary does not shrink authenticated owner inspection:
+its existing bounded provider exchanges, tool fields, accounting, accepted
+workspace IDs/effect receipts, open required IDs, and handoff guidance remain
+available under retention/omission limits. Only raw hidden reasoning and opaque
+continuation carriers are prohibited. Public Agent Run and Activity remain
+status-only; segment boundaries emit no additional user message or public token
+stream. The final tools-disabled render plus atomic commit is the sole canonical
 chat output.
 
 ## Agent Run projection and workspace routes
@@ -431,6 +438,7 @@ private `transcript`, `turnSession`, `markers`, `usageEvidence`, layered
 `cortexReceipts`, `councilReceipts`, `workspaceAssociations`, and stop/retry
 inspection records. These fields are owner-inspection data; the public run
 projection remains status-only.
+`AgentPromptEvidenceV1.promptOrder` is required. Cognition evidence projects the frozen Loom `blockId + promptOrder + blockRevision` coordinate into `sourceId + promptOrder + sourceRevision`; non-cognition evidence uses its assembly provenance coordinate. Prompt record IDs are bounded deterministic hashes that distinguish lifecycle, destination, provenance kind, exact occurrence, cognition entry/bucket, role, content, and local position. Consumers correlate Loom roles only by the exact tuple when prompt `sectionAvailability` is `available`; malformed, conflicting, or incomplete projections are unavailable rather than inferred from a sibling or retained prefix.
 
 `POST /api/v1/agent-runs/:attemptId/retry` accepts only an empty body or `{}`.
 Owner-scoped preflight requires a terminal attempt with outcome `failed`,

@@ -86,8 +86,14 @@ export type GenerationStopResult =
       terminal: AgentRunStopResultV2 & { generationId: string }
     }
 
+export type GenerationDispatchAcknowledgementResult = {
+  acknowledged: true
+  state: 'accepted' | 'already_acknowledged'
+}
+
 export interface GenerateResponse {
   generationId: string
+  mode?: AgentRuntimeMode
 }
 
 export interface QuietGenerateRequest {
@@ -450,13 +456,21 @@ export const generateApi = {
     return startPreparedGeneration('/generate', request, options)
   },
 
-  stop(generationId?: string, chatId?: string, requestAuthorityId?: string) {
+  stop(generationId?: string, chatId?: string, requestAuthorityId?: string, options?: RequestOptions) {
     const body: Record<string, string> = {}
     if (generationId) body.generation_id = generationId
     if (chatId) body.chat_id = chatId
     if (requestAuthorityId) body.request_authority_id = requestAuthorityId
-    return post<GenerationStopResult>('/generate/stop', body)
+    return post<GenerationStopResult>('/generate/stop', body, options)
   },
+  acknowledgeDispatch(generationId: string, chatId: string, requestAuthorityId: string, options?: RequestOptions) {
+    return post<GenerationDispatchAcknowledgementResult>('/generate/dispatch-acknowledge', {
+      generation_id: generationId,
+      chat_id: chatId,
+      request_authority_id: requestAuthorityId,
+    }, options)
+  },
+
   regenerate(request: GenerateRequest, options?: GenerationRequestOptions) {
     return startPreparedGeneration('/generate/regenerate', request, options)
   },
@@ -504,8 +518,8 @@ export const generateApi = {
     return get<BreakdownResponse>(`/generate/breakdown/${messageId}`)
   },
 
-  getStatus(chatId: string, known?: { generationId: string; contentLen: number; reasoningLen: number }) {
-    return get<GenerationStatusResponse>(`/generate/status/${chatId}`, known)
+  getStatus(chatId: string, known?: { generationId: string; contentLen: number; reasoningLen: number }, options?: RequestOptions) {
+    return get<GenerationStatusResponse>(`/generate/status/${chatId}`, known, options)
   },
 
   getActive() {

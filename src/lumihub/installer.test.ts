@@ -1136,15 +1136,52 @@ describe("LumiHub preset installer metadata", () => {
       expect(presetCount()).toBe(expectedCount);
     }
   });
-  test("rejects duplicate, empty, and malformed unsealed prompt blocks before mutation", async () => {
+  test("preserves repeated unsealed block IDs as distinct prompt-order occurrences across install and update", async () => {
+    const presetId = "hub-unsealed-occurrences";
+    const presetSlug = "creator/" + presetId;
+    const initialBlocks = [
+      canonicalPromptBlock({ id: "repeated", name: "Occurrence zero", content: "zero" }),
+      canonicalPromptBlock({ id: "repeated", name: "Occurrence one", content: "one" }),
+    ];
+    const initialPayload = installPayload(presetId, {
+      name: "Repeated occurrences",
+      blocks: initialBlocks,
+    });
+    initialPayload.presetSlug = presetSlug;
+
+    const created = await installPreset("create-unsealed-occurrences", initialPayload);
+
+    expect(created.success).toBe(true);
+    const createdPreset = getPreset(USER_ID, created.presetId!)!;
+    expect(createdPreset.prompt_order).toEqual(initialBlocks);
+    expect(createdPreset.prompt_order.map((entry, promptOrder) => ({ blockId: entry.id, promptOrder }))).toEqual([
+      { blockId: "repeated", promptOrder: 0 },
+      { blockId: "repeated", promptOrder: 1 },
+    ]);
+
+    const updatedBlocks = [
+      canonicalPromptBlock({ id: "repeated", name: "Updated occurrence zero", content: "updated zero" }),
+      canonicalPromptBlock({ id: "repeated", name: "Updated occurrence one", content: "updated one" }),
+    ];
+    const updatePayload = installPayload(presetId, {
+      name: "Repeated occurrences",
+      blocks: updatedBlocks,
+    });
+    updatePayload.presetSlug = presetSlug;
+
+    const updated = await installPreset("update-unsealed-occurrences", updatePayload);
+
+    expect(updated).toMatchObject({ success: true, presetId: created.presetId });
+    expect(presetCount()).toBe(1);
+    const updatedPreset = getPreset(USER_ID, created.presetId!)!;
+    expect(updatedPreset.prompt_order).toEqual(updatedBlocks);
+    expect(updatedPreset.prompt_order.map((entry, promptOrder) => ({ blockId: entry.id, promptOrder }))).toEqual([
+      { blockId: "repeated", promptOrder: 0 },
+      { blockId: "repeated", promptOrder: 1 },
+    ]);
+  });
+  test("rejects empty and malformed unsealed prompt blocks before mutation", async () => {
     const failures: Array<{ label: string; blocks: Record<string, unknown>[] }> = [
-      {
-        label: "duplicate",
-        blocks: [
-          canonicalPromptBlock({ id: "duplicate" }),
-          canonicalPromptBlock({ id: "duplicate", name: "Duplicate copy" }),
-        ],
-      },
       {
         label: "empty",
         blocks: [canonicalPromptBlock({ id: "" })],

@@ -231,7 +231,6 @@ export const WORKSPACE_CAPABILITIES = [
   'read_page',
   'update_assigned_progress',
   'submit_child_result',
-  'record_question',
 ] as const
 export type WorkspaceCapability = (typeof WORKSPACE_CAPABILITIES)[number]
 
@@ -435,6 +434,19 @@ export interface AgenticRuntimeHostCeilings {
   logicalProviderRequests: number
   physicalDispatchAttempts: number
   childOutputTokens: number
+  workAttemptOutputTokens: number
+  workAttemptProviderDispatches: number
+  workAttemptUnsignedBoundaries: number
+  workAttemptToolCalls: number
+  workAttemptWorkspaceOperations: number
+  workSegmentOutputTokens: number
+  workSegmentProviderDispatches: number
+  workSegmentUnsignedBoundaries: number
+  workSegmentToolCalls: number
+  workSegmentWorkspaceOperations: number
+  workDispatchOutputTokens: number
+  workRecoveryReserveOutputTokens: number
+  workFuturePhaseReserveOutputTokens: number
   rootWallClockMs: number
   activityEvents: number
   activityBytes: number

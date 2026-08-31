@@ -22,7 +22,7 @@ import {
 
 describe("agent turn archive classification", () => {
   test("pins the current archive registry contract version", () => {
-    expect(ARCHIVE_REGISTRY_VERSION).toBe(3);
+    expect(ARCHIVE_REGISTRY_VERSION).toBe(5);
   });
   test("keeps operational turn rows out and makes publication rows self-contained", () => {
     const operational = [
@@ -35,11 +35,47 @@ describe("agent turn archive classification", () => {
       "agent_artifact_blob_journal",
       "agent_workspace_artifacts",
       "agent_turn_commit_receipts",
+      "agent_work_segment_recovery",
+      "agent_work_segments",
+      "agent_work_segment_transitions",
+      "agent_work_segment_dispatches",
+      "agent_work_workspace_receipts",
     ];
     for (const table of operational) {
       expect(getArchiveTableSpec(table)?.kind).toBe("operational");
     }
 
+    const segmentRecoveryEdge = getArchiveTableSpec("agent_work_segments")?.parentEdges
+      .find((edge) => edge.parentTable === "agent_work_segment_recovery");
+    expect(segmentRecoveryEdge?.columns).toEqual(["user_id", "execution_id", "attempt_id", "workspace_id"]);
+    expect(segmentRecoveryEdge?.parentColumns).toEqual(["user_id", "execution_id", "attempt_id", "workspace_id"]);
+
+    const transitionSegmentEdge = getArchiveTableSpec("agent_work_segment_transitions")?.parentEdges
+      .find((edge) => edge.parentTable === "agent_work_segments");
+    expect(transitionSegmentEdge?.columns).toEqual(["user_id", "execution_id", "source_segment_id"]);
+    expect(transitionSegmentEdge?.parentColumns).toEqual(["user_id", "execution_id", "segment_id"]);
+
+    const dispatchSegmentEdge = getArchiveTableSpec("agent_work_segment_dispatches")?.parentEdges
+      .find((edge) => edge.parentTable === "agent_work_segments");
+    expect(dispatchSegmentEdge?.columns).toEqual([
+      "user_id", "execution_id", "segment_id", "attempt_id", "workspace_id",
+    ]);
+    expect(dispatchSegmentEdge?.parentColumns).toEqual([
+      "user_id", "execution_id", "segment_id", "attempt_id", "workspace_id",
+    ]);
+
+    const receipt = getArchiveTableSpec("agent_work_workspace_receipts");
+    expect(receipt?.parentEdges
+      .find((edge) => edge.parentTable === "agent_turn_workspaces")?.columns)
+      .toEqual(["user_id", "execution_id", "workspace_id"]);
+    const receiptDispatchEdge = receipt?.parentEdges
+      .find((edge) => edge.parentTable === "agent_work_segment_dispatches");
+    expect(receiptDispatchEdge).toMatchObject({
+      columns: ["user_id", "execution_id", "segment_id", "logical_dispatch"],
+      parentColumns: ["user_id", "execution_id", "segment_id", "dispatch_ordinal"],
+      nullable: false,
+      onMissing: "reject",
+    });
     const published = getArchiveTableSpec("agent_published_workspace_artifacts");
     expect(published?.kind).toBe("canonical");
     expect(published?.primaryKey).toEqual(["published_artifact_id"]);

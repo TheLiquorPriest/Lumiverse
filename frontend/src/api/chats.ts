@@ -87,8 +87,8 @@ export const chatsApi = {
     return get<Chat>(`/chats/${id}`, params)
   },
 
-  listAgentActivityRuns(chatId: string) {
-    return get<{ runs: AgentActivityRunV1[] }>(`/chats/${chatId}/agent-activity-runs`)
+  listAgentActivityRuns(chatId: string, options?: RequestOptions) {
+    return get<{ runs: AgentActivityRunV1[] }>(`/chats/${chatId}/agent-activity-runs`, undefined, options)
   },
 
   create(input: CreateChatInput) {

@@ -379,19 +379,34 @@ describe("canonical custom Phased Instructions policy parser", () => {
       phases: [customPhase({ instructionRefs: overLimit })],
     }))).toThrow(/64|instruction|limit/i);
   });
-  test("enforces the aggregate source block bound across Loom policy and custom phases", () => {
+  test("requires promptOrder and deduplicates only exact instruction occurrences", () => {
+    const repeatedId = [loomSource("shared", 0), loomSource("shared", 1)];
+    expect(parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ instructionRefs: repeatedId })],
+    })).phases[0]?.instructionRefs).toEqual(repeatedId);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ instructionRefs: [repeatedId[0], repeatedId[0]] })],
+    }))).toThrow(/duplicate|instructionRefs/i);
+    const { promptOrder: _promptOrder, ...missingPromptOrder } = loomSource("shared", 0);
+    expect(() => parseAgentRuntimePolicyV1(runtimePolicy({
+      phases: [customPhase({ instructionRefs: [missingPromptOrder] })],
+    }))).toThrow(/promptOrder/i);
+  });
+
+  test("counts repeated block IDs at different prompt orders toward the aggregate source ceiling", () => {
     const loomBlockId = "loom-policy-source";
+    const policyEntry = (id: string, promptOrder: number) => ({
+      version: 1,
+      id,
+      source: loomSource(loomBlockId, promptOrder),
+      destination: "root_work",
+      checkpoint: "WORK",
+      required: true,
+      visibility: "work_only",
+    });
     const loomPolicy = {
       version: 1,
-      workPolicy: [{
-        version: 1,
-        id: "policy-source",
-        source: loomSource(loomBlockId),
-        destination: "root_work",
-        checkpoint: "WORK",
-        required: true,
-        visibility: "work_only",
-      }],
+      workPolicy: [policyEntry("policy-source-zero", 0), policyEntry("policy-source-one", 1)],
       workspaceUsage: [],
       completionCriteria: [],
       renderPolicy: [],
@@ -401,7 +416,7 @@ describe("canonical custom Phased Instructions policy parser", () => {
         id: `phase_${phaseIndex}`,
         label: `Phase ${phaseIndex}`,
         instructionRefs: Array.from(
-          { length: includeExtraSource && phaseIndex === 0 ? 9 : 8 },
+          { length: phaseIndex === 0 ? (includeExtraSource ? 8 : 7) : 8 },
           (_, refIndex) => loomSource(
             phaseIndex === 0 && refIndex === 0 ? loomBlockId : `phase-${phaseIndex}-${refIndex}`,
             refIndex,

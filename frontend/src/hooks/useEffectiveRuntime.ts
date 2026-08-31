@@ -7,6 +7,7 @@ import {
 } from '@/api/effective-runtime'
 import {
   createRuntimeScopeFingerprint,
+  getRuntimeAuthorityRevision,
   getRuntimeSelectionSnapshot,
   invalidateRuntimeDecision,
   isCurrentRuntimeDisplayRequest,
@@ -15,6 +16,7 @@ import {
   redactRuntimeDecision,
   setOneTurnRuntimeMode,
   subscribeRuntimeSelection,
+  subscribeRuntimeAuthority,
 } from '@/lib/agentRuntimeSelection'
 import type {
   AgentRuntimeMode,
@@ -213,13 +215,23 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     swipeId,
     targetCharacterId,
   ])
-  const scopeRef = useRef<{ fingerprint: string; revision: number }>({
+  const runtimeAuthorityRevision = useSyncExternalStore(
+    subscribeRuntimeAuthority,
+    getRuntimeAuthorityRevision,
+    getRuntimeAuthorityRevision,
+  )
+  const scopeRef = useRef<{ fingerprint: string; authorityRevision: number; revision: number }>({
     fingerprint: scopeFingerprint,
+    authorityRevision: runtimeAuthorityRevision,
     revision: 0,
   })
-  if (scopeRef.current.fingerprint !== scopeFingerprint) {
+  if (
+    scopeRef.current.fingerprint !== scopeFingerprint
+    || scopeRef.current.authorityRevision !== runtimeAuthorityRevision
+  ) {
     scopeRef.current = {
       fingerprint: scopeFingerprint,
+      authorityRevision: runtimeAuthorityRevision,
       revision: scopeRef.current.revision + 1,
     }
   }
@@ -266,7 +278,7 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
   setDecision(null)
   setDecisionChatId(null)
   setDecisionScopeFingerprint(null)
-  }, [chatId, scopeFingerprint, wakePendingWrites])
+  }, [chatId, runtimeAuthorityRevision, scopeFingerprint, wakePendingWrites])
 
   const resolve = useCallback(async (
     signal?: AbortSignal,
@@ -370,6 +382,7 @@ export function useEffectiveRuntime(options: UseEffectiveRuntimeOptions): Effect
     logicalConnectionId,
     personaId,
     presetId,
+    runtimeAuthorityRevision,
     scopeFingerprint,
     supported,
     target,

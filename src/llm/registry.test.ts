@@ -38,6 +38,7 @@ const REGISTERED_PROVIDER_NAMES = [
 const REQUIRED_KEYS = [
   "supportsStreaming",
   "toolCalling",
+  "requiredToolChoice",
   "nativeToolContinuation",
   "toolContinuationMode",
   "toolsDisabledFinalization",
@@ -65,6 +66,8 @@ describe("registered provider tool capability contract", () => {
         expect(Object.prototype.hasOwnProperty.call(capabilities, key)).toBe(true);
       }
       expect(typeof capabilities.supportsStreaming).toBe("boolean");
+      expect(typeof capabilities.requiredToolChoice).toBe("boolean");
+      if (capabilities.requiredToolChoice) expect(capabilities.toolCalling).toBe(true);
       expect(typeof capabilities.toolCalling).toBe("boolean");
       expect(typeof capabilities.nativeToolContinuation).toBe("boolean");
       expect(["native", "legacy", "unsupported"]).toContain(capabilities.toolContinuationMode);
@@ -82,6 +85,17 @@ describe("registered provider tool capability contract", () => {
         expect(capabilities.toolContinuationMode).toBe("native");
       }
     }
+  });
+
+  test("required-tool support is explicit on concrete wrapper adapters", () => {
+    const capabilities = Object.fromEntries(
+      getProviderList().map((provider) => [provider.name, provider.capabilities.requiredToolChoice]),
+    );
+    expect(capabilities.deepseek).toBe(true);
+    expect(capabilities.openrouter).toBe(true);
+    expect(capabilities.moonshot).toBe(true);
+    expect(capabilities.zai).toBe(true);
+    expect(capabilities.custom).toBe(false);
   });
 
   test("registration validation rejects inherited or implicit declarations", () => {
@@ -104,6 +118,7 @@ describe("registered provider tool capability contract", () => {
 
   test("Pollinations text remains explicitly unavailable for agent tools", () => {
     const provider = getProviderList().find((candidate) => candidate.name === "pollinations_text");
+    expect(provider?.capabilities.requiredToolChoice).toBe(false);
     expect(provider?.capabilities.toolCalling).toBe(false);
     expect(provider?.capabilities.nativeToolContinuation).toBe(false);
     expect(provider?.capabilities.toolContinuationMode).toBe("unsupported");

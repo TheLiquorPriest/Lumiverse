@@ -17,6 +17,7 @@ import {
 import type {
   CognitionValue,
   LoomPolicyBucketsV1,
+  LoomPolicySourceV1,
   LoomPromptInspectionBlockV1,
   LoomPromptInspectionV1,
 } from "../types/agent-cognition";
@@ -1957,8 +1958,85 @@ export function selectAgentToolChatCorpora(
 
 interface ResponseLoomPolicyAssemblyV1 {
   readonly excludedBlockIds: ReadonlySet<string>;
+  readonly excludedBlockOccurrences: ReadonlySet<string>;
   readonly normalizedLoomResponse: boolean;
   readonly inspection?: LoomPromptInspectionV1;
+}
+
+interface ResponseLoomPolicyBlockExclusionsV1 {
+  readonly excludedBlockIds: ReadonlySet<string>;
+  readonly excludedBlockOccurrences: ReadonlySet<string>;
+  readonly inspectionBlocks: readonly LoomPromptInspectionBlockV1[];
+}
+
+function responseLoomPolicyBlockOccurrenceKey(blockId: string, promptOrder: number): string {
+  return blockId + "\u0000" + promptOrder;
+}
+
+export function resolveResponseLoomPolicyBlockExclusions(
+  blocks: readonly PromptBlock[],
+  sources: readonly LoomPolicySourceV1[],
+  presetRevision: number,
+  conservativeExcludedBlockIds: readonly string[],
+): ResponseLoomPolicyBlockExclusionsV1 {
+  const excludedBlockIds = new Set<string>(conservativeExcludedBlockIds);
+  const excludedBlockOccurrences = new Set<string>();
+  const validatedBlockIds = new Set<string>();
+  const unresolvedBlockIds = new Set<string>();
+  const inspectionBlocksBySource = new Map<string, LoomPromptInspectionBlockV1>();
+  for (const source of sources) {
+    const block = blocks[source.promptOrder];
+    const blockRevision = block && Number((block as PromptBlock & { revision?: unknown }).revision ?? 1);
+    const sourcePresetRevision = Number(source.presetRevision);
+    const sourceCoordinateMatches = Number.isSafeInteger(source.promptOrder)
+      && source.promptOrder >= 0
+      && !!block
+      && block.id === source.blockId
+      && block.marker !== "category";
+    const sourceValid =
+      sourceCoordinateMatches
+      && Number.isSafeInteger(sourcePresetRevision)
+      && sourcePresetRevision === presetRevision
+      && Number.isSafeInteger(blockRevision)
+      && blockRevision === source.blockRevision;
+    if (sourceValid) {
+      validatedBlockIds.add(source.blockId);
+      excludedBlockOccurrences.add(
+        responseLoomPolicyBlockOccurrenceKey(source.blockId, source.promptOrder),
+      );
+      inspectionBlocksBySource.set(
+        source.blockId + "\u0000" + source.presetRevision + "\u0000" + source.blockRevision + "\u0000" + source.promptOrder,
+        { source, content: block.content },
+      );
+    } else {
+      // Missing or mismatched authority has no safe occurrence coordinate.
+      unresolvedBlockIds.add(source.blockId);
+      excludedBlockIds.add(source.blockId);
+    }
+  }
+  for (const blockId of validatedBlockIds) {
+    if (!unresolvedBlockIds.has(blockId)) excludedBlockIds.delete(blockId);
+  }
+  return {
+    excludedBlockIds,
+    excludedBlockOccurrences,
+    inspectionBlocks: [...inspectionBlocksBySource.values()],
+  };
+}
+
+/** Filter Response blocks without collapsing distinct prompt-order occurrences. */
+export function filterResponseLoomPolicyBlocks(
+  blocks: readonly PromptBlock[],
+  excludedBlockIds: ReadonlySet<string>,
+  excludedBlockOccurrences: ReadonlySet<string>,
+): PromptBlock[] {
+  return blocks.filter(
+    (block, promptOrder) =>
+      !excludedBlockIds.has(block.id)
+      && !excludedBlockOccurrences.has(
+        responseLoomPolicyBlockOccurrenceKey(block.id, promptOrder),
+      ),
+  );
 }
 
 const RESPONSE_STRUCTURAL_CHAT_HISTORY_BLOCK: Readonly<PromptBlock> = {
@@ -1983,17 +2061,26 @@ function responseLoomPolicyAssembly(
   blocks: readonly PromptBlock[],
 ): ResponseLoomPolicyAssemblyV1 {
   if (ctx.assemblySurface !== "RESPONSE" || !preset?.id) {
-    return { excludedBlockIds: new Set<string>(), normalizedLoomResponse: false };
+    return { excludedBlockIds: new Set<string>(), excludedBlockOccurrences: new Set<string>(), normalizedLoomResponse: false };
   }
   const authored = getPresetAgentResponseCognitionSourceV1(ctx.userId, preset.id);
   if (!authored) {
-    return { excludedBlockIds: new Set<string>(), normalizedLoomResponse: false };
+    return { excludedBlockIds: new Set<string>(), excludedBlockOccurrences: new Set<string>(), normalizedLoomResponse: false };
   }
-  const excludedBlockIds = new Set<string>(authored.conservativeExcludedBlockIds);
   const normalizedLoomResponse = authored.sourceKind === "normalized";
   const runtimePolicy = authored.config.runtimePolicy;
   if (!runtimePolicy) {
-    return { excludedBlockIds, normalizedLoomResponse };
+    const exclusions = resolveResponseLoomPolicyBlockExclusions(
+      blocks,
+      [],
+      authored.presetRevision,
+      authored.conservativeExcludedBlockIds,
+    );
+    return {
+      excludedBlockIds: exclusions.excludedBlockIds,
+      excludedBlockOccurrences: exclusions.excludedBlockOccurrences,
+      normalizedLoomResponse,
+    };
   }
 
   const phaseInstructions = runtimePolicy.phases.flatMap((phase) => [
@@ -2013,28 +2100,28 @@ function responseLoomPolicyAssembly(
     ...policies.completionCriteria,
     ...policies.renderPolicy,
   ];
-  if (allEntries.length === 0 && phaseInstructions.length === 0) {
-    return { excludedBlockIds, normalizedLoomResponse };
-  }
-
-  const inspectionBlocksBySource = new Map<string, LoomPromptInspectionBlockV1>();
   const referencedSources = [
     ...allEntries.map((entry) => entry.source),
     ...phaseInstructions.map((instruction) => instruction.source),
   ];
-  for (const source of referencedSources) {
-    const block = blocks[source.promptOrder];
-    const blockRevision = block && Number((block as PromptBlock & { revision?: unknown }).revision ?? 1);
-    if (!block || block.id !== source.blockId || !Number.isSafeInteger(blockRevision) || blockRevision !== source.blockRevision) continue;
-    inspectionBlocksBySource.set(
-      source.blockId + "\u0000" + source.presetRevision + "\u0000" + source.blockRevision + "\u0000" + source.promptOrder,
-      { source, content: block.content },
-    );
+  const exclusions = resolveResponseLoomPolicyBlockExclusions(
+    blocks,
+    referencedSources,
+    authored.presetRevision,
+    authored.conservativeExcludedBlockIds,
+  );
+  if (allEntries.length === 0 && phaseInstructions.length === 0) {
+    return {
+      excludedBlockIds: exclusions.excludedBlockIds,
+      excludedBlockOccurrences: exclusions.excludedBlockOccurrences,
+      normalizedLoomResponse,
+    };
   }
+
   const inspection = inspectLoomPromptPolicies(policies, {
     checkpoint: "ASSEMBLE",
     surface: "RESPONSE",
-    blocks: [...inspectionBlocksBySource.values()],
+    blocks: exclusions.inspectionBlocks,
   });
   const responseOmission = inspection.responseOmission;
   if (!responseOmission) {
@@ -2050,21 +2137,9 @@ function responseLoomPolicyAssembly(
       omittedPhaseInstructions: phaseInstructions,
     },
   };
-  const excludedSourceKeys = new Set<string>();
-  for (const source of [
-    ...allEntries.map((entry) => entry.source),
-    ...phaseInstructions.map((instruction) => instruction.source),
-  ]) {
-    const sourceKey = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
-    if (excludedSourceKeys.has(sourceKey)) continue;
-    excludedSourceKeys.add(sourceKey);
-    // Exclude by authored block identity even when its revision is stale or
-    // unavailable in the live prompt list. Ordinary Response must never execute
-    // a referenced quarantined/stale Loom source by accident.
-    excludedBlockIds.add(source.blockId);
-  }
   return {
-    excludedBlockIds,
+    excludedBlockIds: exclusions.excludedBlockIds,
+    excludedBlockOccurrences: exclusions.excludedBlockOccurrences,
     normalizedLoomResponse,
     inspection: enrichedInspection,
   };
@@ -2669,9 +2744,14 @@ export async function assemblePrompt(
     profilePromptVariables,
   );
   const responseLoomPolicy = responseLoomPolicyAssembly(ctx, preset, blocks);
-  if (responseLoomPolicy.excludedBlockIds.size > 0) {
-    effectiveBlocks = effectiveBlocks.filter(
-      (block) => !responseLoomPolicy.excludedBlockIds.has(block.id),
+  if (
+    responseLoomPolicy.excludedBlockIds.size > 0
+    || responseLoomPolicy.excludedBlockOccurrences.size > 0
+  ) {
+    effectiveBlocks = filterResponseLoomPolicyBlocks(
+      effectiveBlocks,
+      responseLoomPolicy.excludedBlockIds,
+      responseLoomPolicy.excludedBlockOccurrences,
     );
   }
 
@@ -2684,7 +2764,7 @@ export async function assemblePrompt(
     chat,
   );
   if (
-    responseLoomPolicy.excludedBlockIds.size > 0 &&
+    (responseLoomPolicy.excludedBlockIds.size > 0 || responseLoomPolicy.excludedBlockOccurrences.size > 0) &&
     !effectiveBlocks.some(
       (block) =>
         block.marker === "chat_history" &&

@@ -197,7 +197,7 @@ export interface GenerationRequest {
   /** Receive-boundary cap selected by the root/child runtime frame. */
   receiveLimitBytes?: number;
   /** Host-owned tool policy; provider parameters cannot override it. */
-  toolMode?: "ordinary" | "finalization";
+  toolMode?: "ordinary" | "required" | "finalization";
   /**
    * Provider-native continuation state. This is owned by the active loop frame,
    * must never be copied into an LlmMessage or persisted, and is cleared after

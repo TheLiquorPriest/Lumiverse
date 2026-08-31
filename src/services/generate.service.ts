@@ -1,4 +1,6 @@
 import {
+  acknowledgeAgenticGenerationDispatch,
+  abortAcceptedAgenticGeneration,
   startAgenticGeneration,
   requestAgenticGenerationCancellation,
   requestAgenticChatCancellation,
@@ -12,9 +14,10 @@ import {
   AgenticGenerationError,
   type AgenticGenerationDependencies,
   type AgenticGenerationInput,
+  type AgenticDispatchAcknowledgementState,
   type AgenticTargetSnapshot,
 } from "./agentic-generation.service";
-import { getTurnExecution } from "./turn-execution.service";
+import { getTurnExecution, requestTurnCancellation } from "./turn-execution.service";
 import { requestAgentRunStop } from "./agent-run-projection.service";
 import type { AgentRunStopResponseV2 } from "../types/agent-run-projection";
 import { getProvider } from "../llm/registry";
@@ -1100,6 +1103,8 @@ export interface RawGenerateInput {
   api_key?: string;
   /** Optional tool/function definitions for inline function calling. */
   tools?: ToolDefinition[];
+  /** Internal host tool policy, aligned exactly with the provider request contract. */
+  toolMode?: GenerationRequest["toolMode"];
   /**
    * Optional per-request reasoning override. When omitted (or `source: "inherit"`),
    * the connection's bound reasoning settings are applied, falling back to
@@ -1114,6 +1119,8 @@ export interface QuietGenerateInput {
   parameters?: GenerationParameters;
   /** Optional tool/function definitions for inline function calling. */
   tools?: ToolDefinition[];
+  /** Internal host policy used by Memory Cortex; never exposed by the REST request DTO. */
+  toolMode?: "required";
   /** Optional abort signal — when fired, cancels the in-flight HTTP request. */
   signal?: AbortSignal;
   /**
@@ -2475,16 +2482,68 @@ type PendingGenerationRequestAuthority = {
   readonly chatId: string;
   readonly authorityId: string;
   readonly controller: AbortController;
+  mode?: "response" | "agentic";
+  sourceAborted: boolean;
+  stopRequested: boolean;
+  cancellationResult?: Promise<GenerationStopResult>;
   generationId?: string;
 };
 
 const pendingGenerationRequestAuthorities = new Map<string, PendingGenerationRequestAuthority>();
-const stoppedGenerationRequestAuthorities = new Set<string>();
-const MAX_STOPPED_REQUEST_AUTHORITIES = 2048;
+const stoppedGenerationRequestAuthorities = new Map<string, Map<string, number>>();
+const admittedGenerationRequestAuthorities = new Map<string, string>();
+const admittedGenerationRequestAuthorityByGeneration = new Map<string, string>();
+type AcknowledgedGenerationRequestAuthorityReceipt = {
+  readonly generationId: string;
+  terminalExpiresAt: number | null;
+};
+const acknowledgedGenerationRequestAuthorities = new Map<string, AcknowledgedGenerationRequestAuthorityReceipt>();
+const ACKNOWLEDGED_DISPATCH_RETRY_GRACE_MS = 60_000;
+let nextAcknowledgedGenerationRequestAuthorityExpiry = Number.POSITIVE_INFINITY;
+interface AcknowledgedReceiptCleanupScheduler {
+  now(): number;
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+const SYSTEM_ACKNOWLEDGED_RECEIPT_CLEANUP_SCHEDULER: AcknowledgedReceiptCleanupScheduler = {
+  now: () => Date.now(),
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+let acknowledgedReceiptCleanupScheduler = SYSTEM_ACKNOWLEDGED_RECEIPT_CLEANUP_SCHEDULER;
+let acknowledgedReceiptCleanupHandle: unknown | null = null;
+let acknowledgedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+const STOPPED_REQUEST_AUTHORITY_RECEIPT_GRACE_MS = 60_000;
+const MAX_STOPPED_REQUEST_AUTHORITY_RECEIPTS_PER_USER = 2_048;
+let stoppedReceiptCleanupScheduler: AcknowledgedReceiptCleanupScheduler = SYSTEM_ACKNOWLEDGED_RECEIPT_CLEANUP_SCHEDULER;
+let stoppedReceiptCleanupHandle: unknown | null = null;
+let stoppedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+let nextStoppedRequestAuthorityExpiry = Number.POSITIVE_INFINITY;
 const REQUEST_AUTHORITY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function generationRequestAuthorityKey(userId: string, chatId: string, authorityId: string): string {
   return JSON.stringify([userId, chatId, authorityId]);
+}
+function generationRequestOwnerKey(userId: string, chatId: string, generationId: string): string {
+  return JSON.stringify([userId, chatId, generationId]);
+}
+
+export function resolveGenerationRequestAuthority(
+  userId: string,
+  chatId: string,
+  generationId: string,
+): string | null {
+  if (!userId || !chatId || !generationId) return null;
+  for (const reservation of pendingGenerationRequestAuthorities.values()) {
+    if (
+      reservation.userId === userId
+      && reservation.chatId === chatId
+      && reservation.generationId === generationId
+    ) return reservation.authorityId;
+  }
+  return admittedGenerationRequestAuthorityByGeneration.get(
+    generationRequestOwnerKey(userId, chatId, generationId),
+  ) ?? null;
 }
 
 function normalizeGenerationRequestAuthorityId(value: unknown): string | null {
@@ -2493,12 +2552,283 @@ function normalizeGenerationRequestAuthorityId(value: unknown): string | null {
   return REQUEST_AUTHORITY_ID_PATTERN.test(normalized) ? normalized : null;
 }
 
-function rememberStoppedGenerationRequestAuthority(key: string): void {
-  stoppedGenerationRequestAuthorities.add(key);
-  while (stoppedGenerationRequestAuthorities.size > MAX_STOPPED_REQUEST_AUTHORITIES) {
-    const oldest = stoppedGenerationRequestAuthorities.values().next().value;
-    if (oldest === undefined) break;
-    stoppedGenerationRequestAuthorities.delete(oldest);
+function scheduleStoppedGenerationRequestAuthorityCleanup(): void {
+  const expiry = nextStoppedRequestAuthorityExpiry;
+  if (stoppedReceiptCleanupHandle !== null && stoppedReceiptCleanupScheduledAt === expiry) return;
+  if (stoppedReceiptCleanupHandle !== null) {
+    stoppedReceiptCleanupScheduler.clearTimeout(stoppedReceiptCleanupHandle);
+    stoppedReceiptCleanupHandle = null;
+  }
+  stoppedReceiptCleanupScheduledAt = expiry;
+  if (!Number.isFinite(expiry)) return;
+  stoppedReceiptCleanupHandle = stoppedReceiptCleanupScheduler.setTimeout(() => {
+    stoppedReceiptCleanupHandle = null;
+    stoppedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+    pruneExpiredStoppedGenerationRequestAuthorities(stoppedReceiptCleanupScheduler.now());
+  }, Math.max(0, expiry - stoppedReceiptCleanupScheduler.now()));
+}
+
+function pruneExpiredStoppedGenerationRequestAuthorities(
+  now = stoppedReceiptCleanupScheduler.now(),
+): void {
+  if (now < nextStoppedRequestAuthorityExpiry) return;
+  let nextExpiry = Number.POSITIVE_INFINITY;
+  for (const [userId, receipts] of stoppedGenerationRequestAuthorities) {
+    for (const [key, expiresAt] of receipts) {
+      if (expiresAt <= now) receipts.delete(key);
+      else nextExpiry = Math.min(nextExpiry, expiresAt);
+    }
+    if (receipts.size === 0) stoppedGenerationRequestAuthorities.delete(userId);
+  }
+  nextStoppedRequestAuthorityExpiry = nextExpiry;
+  scheduleStoppedGenerationRequestAuthorityCleanup();
+}
+
+function rememberStoppedGenerationRequestAuthority(
+  userId: string,
+  key: string,
+  allowOwnerOverflow = false,
+  now = stoppedReceiptCleanupScheduler.now(),
+): boolean {
+  pruneExpiredStoppedGenerationRequestAuthorities(now);
+  let receipts = stoppedGenerationRequestAuthorities.get(userId);
+  const existing = receipts?.has(key) ?? false;
+  if (!existing && !allowOwnerOverflow
+    && (receipts?.size ?? 0) >= MAX_STOPPED_REQUEST_AUTHORITY_RECEIPTS_PER_USER) return false;
+  if (!receipts) {
+    receipts = new Map();
+    stoppedGenerationRequestAuthorities.set(userId, receipts);
+  }
+  const expiresAt = now + STOPPED_REQUEST_AUTHORITY_RECEIPT_GRACE_MS;
+  receipts.set(key, expiresAt);
+  nextStoppedRequestAuthorityExpiry = Math.min(nextStoppedRequestAuthorityExpiry, expiresAt);
+  scheduleStoppedGenerationRequestAuthorityCleanup();
+  return true;
+}
+
+function hasStoppedGenerationRequestAuthority(
+  userId: string,
+  key: string,
+  now = stoppedReceiptCleanupScheduler.now(),
+): boolean {
+  pruneExpiredStoppedGenerationRequestAuthorities(now);
+  return stoppedGenerationRequestAuthorities.get(userId)?.has(key) ?? false;
+}
+
+function clearStoppedGenerationRequestAuthorities(): void {
+  if (stoppedReceiptCleanupHandle !== null) {
+    stoppedReceiptCleanupScheduler.clearTimeout(stoppedReceiptCleanupHandle);
+    stoppedReceiptCleanupHandle = null;
+  }
+  stoppedGenerationRequestAuthorities.clear();
+  nextStoppedRequestAuthorityExpiry = Number.POSITIVE_INFINITY;
+  stoppedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+}
+
+function configureStoppedReceiptCleanupScheduler(
+  scheduler: AcknowledgedReceiptCleanupScheduler = SYSTEM_ACKNOWLEDGED_RECEIPT_CLEANUP_SCHEDULER,
+): void {
+  if (stoppedReceiptCleanupHandle !== null) {
+    stoppedReceiptCleanupScheduler.clearTimeout(stoppedReceiptCleanupHandle);
+    stoppedReceiptCleanupHandle = null;
+  }
+  stoppedReceiptCleanupScheduler = scheduler;
+  stoppedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+  nextStoppedRequestAuthorityExpiry = Number.POSITIVE_INFINITY;
+  for (const receipts of stoppedGenerationRequestAuthorities.values()) {
+    for (const expiresAt of receipts.values()) {
+      nextStoppedRequestAuthorityExpiry = Math.min(nextStoppedRequestAuthorityExpiry, expiresAt);
+    }
+  }
+  scheduleStoppedGenerationRequestAuthorityCleanup();
+}
+
+function scheduleAcknowledgedGenerationRequestAuthorityCleanup(): void {
+  const expiry = nextAcknowledgedGenerationRequestAuthorityExpiry;
+  if (acknowledgedReceiptCleanupHandle !== null && acknowledgedReceiptCleanupScheduledAt === expiry) return;
+  if (acknowledgedReceiptCleanupHandle !== null) {
+    acknowledgedReceiptCleanupScheduler.clearTimeout(acknowledgedReceiptCleanupHandle);
+    acknowledgedReceiptCleanupHandle = null;
+  }
+  acknowledgedReceiptCleanupScheduledAt = expiry;
+  if (!Number.isFinite(expiry)) return;
+  acknowledgedReceiptCleanupHandle = acknowledgedReceiptCleanupScheduler.setTimeout(() => {
+    acknowledgedReceiptCleanupHandle = null;
+    acknowledgedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+    pruneExpiredAcknowledgedGenerationRequestAuthorities(acknowledgedReceiptCleanupScheduler.now());
+  }, Math.max(0, expiry - acknowledgedReceiptCleanupScheduler.now()));
+}
+
+function pruneExpiredAcknowledgedGenerationRequestAuthorities(
+  now = acknowledgedReceiptCleanupScheduler.now(),
+): void {
+  if (now < nextAcknowledgedGenerationRequestAuthorityExpiry) return;
+  let nextExpiry = Number.POSITIVE_INFINITY;
+  for (const [key, receipt] of acknowledgedGenerationRequestAuthorities) {
+    if (receipt.terminalExpiresAt === null) continue;
+    if (receipt.terminalExpiresAt <= now) acknowledgedGenerationRequestAuthorities.delete(key);
+    else nextExpiry = Math.min(nextExpiry, receipt.terminalExpiresAt);
+  }
+  nextAcknowledgedGenerationRequestAuthorityExpiry = nextExpiry;
+  scheduleAcknowledgedGenerationRequestAuthorityCleanup();
+}
+
+function clearAcknowledgedGenerationRequestAuthorities(): void {
+  if (acknowledgedReceiptCleanupHandle !== null) {
+    acknowledgedReceiptCleanupScheduler.clearTimeout(acknowledgedReceiptCleanupHandle);
+    acknowledgedReceiptCleanupHandle = null;
+  }
+  acknowledgedGenerationRequestAuthorities.clear();
+  nextAcknowledgedGenerationRequestAuthorityExpiry = Number.POSITIVE_INFINITY;
+  acknowledgedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+}
+
+function configureAcknowledgedReceiptCleanupScheduler(
+  scheduler = SYSTEM_ACKNOWLEDGED_RECEIPT_CLEANUP_SCHEDULER,
+): void {
+  if (acknowledgedReceiptCleanupHandle !== null) {
+    acknowledgedReceiptCleanupScheduler.clearTimeout(acknowledgedReceiptCleanupHandle);
+    acknowledgedReceiptCleanupHandle = null;
+  }
+  acknowledgedReceiptCleanupScheduler = scheduler;
+  acknowledgedReceiptCleanupScheduledAt = Number.POSITIVE_INFINITY;
+  nextAcknowledgedGenerationRequestAuthorityExpiry = Number.POSITIVE_INFINITY;
+  for (const receipt of acknowledgedGenerationRequestAuthorities.values()) {
+    if (receipt.terminalExpiresAt !== null) {
+      nextAcknowledgedGenerationRequestAuthorityExpiry = Math.min(
+        nextAcknowledgedGenerationRequestAuthorityExpiry,
+        receipt.terminalExpiresAt,
+      );
+    }
+  }
+  scheduleAcknowledgedGenerationRequestAuthorityCleanup();
+}
+
+function rememberAcknowledgedGenerationRequestAuthority(
+  key: string,
+  generationId: string,
+  now = acknowledgedReceiptCleanupScheduler.now(),
+): void {
+  pruneExpiredAcknowledgedGenerationRequestAuthorities(now);
+  acknowledgedGenerationRequestAuthorities.set(key, { generationId, terminalExpiresAt: null });
+  // This is deliberately a soft cap. Exact live receipts and terminal receipts
+  // inside the transport retry grace are protocol state and cannot be evicted.
+}
+
+function acknowledgedGenerationRequestAuthorityMatches(
+  key: string,
+  generationId: string,
+  now = acknowledgedReceiptCleanupScheduler.now(),
+): boolean {
+  pruneExpiredAcknowledgedGenerationRequestAuthorities(now);
+  return acknowledgedGenerationRequestAuthorities.get(key)?.generationId === generationId;
+}
+
+function markAcknowledgedGenerationRequestAuthorityTerminal(
+  key: string,
+  generationId: string,
+  now = acknowledgedReceiptCleanupScheduler.now(),
+): void {
+  const receipt = acknowledgedGenerationRequestAuthorities.get(key);
+  if (receipt?.generationId === generationId) {
+    receipt.terminalExpiresAt = now + ACKNOWLEDGED_DISPATCH_RETRY_GRACE_MS;
+    nextAcknowledgedGenerationRequestAuthorityExpiry = Math.min(
+      nextAcknowledgedGenerationRequestAuthorityExpiry,
+      receipt.terminalExpiresAt,
+    );
+    scheduleAcknowledgedGenerationRequestAuthorityCleanup();
+  }
+}
+
+function rememberAdmittedGenerationRequestAuthority(
+  key: string,
+  userId: string,
+  chatId: string,
+  authorityId: string,
+  generationId: string,
+): void {
+  if (!getActiveAgenticGenerationContext(userId, generationId)) return;
+  const ownerKey = generationRequestOwnerKey(userId, chatId, generationId);
+  admittedGenerationRequestAuthorities.set(key, generationId);
+  admittedGenerationRequestAuthorityByGeneration.set(ownerKey, authorityId);
+  const forgetTerminalOwner = () => {
+    if (admittedGenerationRequestAuthorities.get(key) === generationId) {
+      admittedGenerationRequestAuthorities.delete(key);
+    }
+    if (admittedGenerationRequestAuthorityByGeneration.get(ownerKey) === authorityId) {
+      admittedGenerationRequestAuthorityByGeneration.delete(ownerKey);
+    }
+    markAcknowledgedGenerationRequestAuthorityTerminal(key, generationId);
+  };
+  void waitForAgenticGeneration(generationId).then(forgetTerminalOwner, forgetTerminalOwner);
+}
+
+export const __generationRequestAuthorityTesting = Object.freeze({
+  retainedOwnerCount: (): number => admittedGenerationRequestAuthorities.size,
+  acknowledgedReceiptCount: (): number => acknowledgedGenerationRequestAuthorities.size,
+  acknowledgedReceiptRetryGraceMs: ACKNOWLEDGED_DISPATCH_RETRY_GRACE_MS,
+  stoppedReceiptGraceMs: STOPPED_REQUEST_AUTHORITY_RECEIPT_GRACE_MS,
+  stoppedReceiptCapacityPerUser: MAX_STOPPED_REQUEST_AUTHORITY_RECEIPTS_PER_USER,
+  configureStoppedReceiptCleanupScheduler,
+  clearStoppedReceipts: clearStoppedGenerationRequestAuthorities,
+  stoppedReceiptCount: (userId: string): number => stoppedGenerationRequestAuthorities.get(userId)?.size ?? 0,
+  hasStoppedReceipt: (userId: string, chatId: string, authorityId: string): boolean => (
+    hasStoppedGenerationRequestAuthority(userId, generationRequestAuthorityKey(userId, chatId, authorityId))
+  ),
+  retainAdmittedOwner: (
+    userId: string,
+    chatId: string,
+    authorityId: string,
+    generationId: string,
+  ): void => {
+    const normalizedAuthorityId = normalizeGenerationRequestAuthorityId(authorityId);
+    if (!normalizedAuthorityId) throw new Error("Invalid request authority ID.");
+    admittedGenerationRequestAuthorities.set(
+      generationRequestAuthorityKey(userId, chatId, normalizedAuthorityId),
+      generationId,
+    );
+    admittedGenerationRequestAuthorityByGeneration.set(
+      generationRequestOwnerKey(userId, chatId, generationId),
+      normalizedAuthorityId,
+    );
+  },
+  clearAdmittedOwners: (): void => {
+    admittedGenerationRequestAuthorities.clear();
+    admittedGenerationRequestAuthorityByGeneration.clear();
+  },
+  configureAcknowledgedReceiptCleanupScheduler,
+  clearAcknowledgedReceipts: clearAcknowledgedGenerationRequestAuthorities,
+  hasAcknowledgedReceipt: (
+    userId: string,
+    chatId: string,
+    authorityId: string,
+    generationId: string,
+  ): boolean => acknowledgedGenerationRequestAuthorityMatches(
+    generationRequestAuthorityKey(userId, chatId, authorityId),
+    generationId,
+  ),
+  retainAcknowledgedReceipt: (
+    userId: string,
+    chatId: string,
+    authorityId: string,
+    generationId: string,
+  ): void => rememberAcknowledgedGenerationRequestAuthority(
+    generationRequestAuthorityKey(userId, chatId, authorityId),
+    generationId,
+  ),
+  forgetAcknowledgedReceipt: (userId: string, chatId: string, authorityId: string): void => {
+    acknowledgedGenerationRequestAuthorities.delete(generationRequestAuthorityKey(userId, chatId, authorityId));
+  },
+});
+
+function setGenerationRequestAuthorityMode(
+  reservation: PendingGenerationRequestAuthority | undefined,
+  mode: "response" | "agentic",
+): void {
+  if (!reservation) return;
+  reservation.mode = mode;
+  if (mode === "response" && (reservation.sourceAborted || reservation.stopRequested)) {
+    reservation.controller.abort(new DOMException("Generation stopped", "AbortError"));
   }
 }
 
@@ -5399,6 +5729,7 @@ function toAgenticGenerationInput(input: GenerateInput): AgenticGenerationInput 
     userInput: input.user_input ?? "",
     ...(input.regen_feedback !== undefined ? { regenFeedback: input.regen_feedback } : {}),
     ...(input.runtime_decision_token !== undefined ? { runtimeDecisionToken: input.runtime_decision_token } : {}),
+    requireDispatchAcknowledgement: normalizeGenerationRequestAuthorityId(input.request_authority_id) !== null,
     ...(input.request_epoch !== undefined ? { requestEpoch: input.request_epoch } : {}),
     signal: input.signal,
     isImpersonate: input.generation_type === "impersonate" || input.impersonate_mode !== undefined,
@@ -5558,11 +5889,20 @@ async function consumeCallerRuntimeDecision(input: GenerateInput, token: string)
 }
 
 
-async function startAdmittedAgenticGeneration(input: GenerateInput) {
+async function startAdmittedAgenticGeneration(
+  input: GenerateInput,
+  requestAuthority?: PendingGenerationRequestAuthority,
+) {
   const started = await startAgenticGeneration(
     toAgenticGenerationInput(input),
     agenticGenerationDependencies,
   );
+  if (requestAuthority) {
+    requestAuthority.generationId = started.generationId;
+    if (requestAuthority.sourceAborted || requestAuthority.stopRequested) {
+      await requestAgenticGenerationCancellation(input.userId, started.generationId);
+    }
+  }
   try {
     await waitForAgenticGenerationAdmission(started.generationId);
   } catch (error) {
@@ -5590,9 +5930,15 @@ function runtimeDecisionRefreshRequired(message: string): AgenticGenerationError
 async function startGenerationAfterRequestAuthority(
   input: GenerateInput,
   options?: StartGenerationOptions,
+  requestAuthority?: PendingGenerationRequestAuthority,
 ): Promise<{ generationId: string; status: string; mode?: "response" | "agentic"; responseModeAvailable?: true; phase?: string; errorCode?: string }> {
   if (input.mode !== undefined && input.mode !== "response" && input.mode !== "agentic") {
     throw new Error("Unsupported generation mode.");
+  }
+
+  if (input.mode === "response") {
+    setGenerationRequestAuthorityMode(requestAuthority, "response");
+    throwIfGenerationRequestAborted(input.signal);
   }
 
   const callerRuntimeDecisionToken = input.runtime_decision_token;
@@ -5634,8 +5980,9 @@ async function startGenerationAfterRequestAuthority(
       mode: "agentic",
       runtime_decision_token: callerRuntimeDecisionToken,
     };
+    setGenerationRequestAuthorityMode(requestAuthority, "agentic");
     return startReservedGeneration(input, "agentic", () =>
-      startAdmittedAgenticGeneration(agenticInput),
+      startAdmittedAgenticGeneration(agenticInput, requestAuthority),
     );
   }
 
@@ -5661,12 +6008,14 @@ async function startGenerationAfterRequestAuthority(
       mode: "agentic",
       runtime_decision_token: decision.runtimeDecisionToken,
     };
+    setGenerationRequestAuthorityMode(requestAuthority, "agentic");
     return startReservedGeneration(input, "agentic", () =>
-      startAdmittedAgenticGeneration(agenticInput),
+      startAdmittedAgenticGeneration(agenticInput, requestAuthority),
     );
   }
   // Resolve and commit the concrete Response connection at admission. Prompt
   // assembly still owns an isolated working copy of every other derived field.
+  setGenerationRequestAuthorityMode(requestAuthority, "response");
   const responseAdmission = resolveResponseGenerationAdmission(input, options);
   const responseInput: GenerateInput = {
     ...input,
@@ -5690,36 +6039,56 @@ export async function startGeneration(
   if (!authorityId) return startGenerationAfterRequestAuthority(input, options);
 
   const key = generationRequestAuthorityKey(input.userId, input.chat_id, authorityId);
-  if (stoppedGenerationRequestAuthorities.has(key)) {
-    throw new DOMException("Generation stopped", "AbortError");
-  }
-  if (pendingGenerationRequestAuthorities.has(key)) {
+  if (pendingGenerationRequestAuthorities.has(key) || admittedGenerationRequestAuthorities.has(key)) {
     throw new Error("Generation request authority is already active.");
   }
 
   const controller = new AbortController();
-  const onSourceAbort = () => controller.abort(input.signal?.reason);
-  if (input.signal?.aborted) onSourceAbort();
-  else input.signal?.addEventListener("abort", onSourceAbort, { once: true });
   const reservation: PendingGenerationRequestAuthority = {
     userId: input.userId,
     chatId: input.chat_id,
     authorityId,
     controller,
+    sourceAborted: input.signal?.aborted ?? false,
+    stopRequested: hasStoppedGenerationRequestAuthority(input.userId, key),
   };
+  let retainSourceAbortUntilTerminal = false;
+  const onSourceAbort = () => {
+    input.signal?.removeEventListener("abort", onSourceAbort);
+    reservation.sourceAborted = true;
+    if (reservation.mode === "response") {
+      controller.abort(input.signal?.reason ?? new DOMException("Generation stopped", "AbortError"));
+    } else if (reservation.mode === "agentic" && reservation.generationId) {
+      reservation.cancellationResult = settleAbortedAgenticReservation(reservation);
+    }
+  };
+  if (!input.signal?.aborted) input.signal?.addEventListener("abort", onSourceAbort, { once: true });
   pendingGenerationRequestAuthorities.set(key, reservation);
 
   try {
-    throwIfGenerationRequestAborted(controller.signal);
-    const result = await startGenerationAfterRequestAuthority({ ...input, signal: controller.signal }, options);
+    const result = await startGenerationAfterRequestAuthority({ ...input, signal: controller.signal }, options, reservation);
     reservation.generationId = result.generationId;
-    if (controller.signal.aborted || stoppedGenerationRequestAuthorities.has(key)) {
-      await stopGeneration(input.userId, result.generationId);
+    rememberAdmittedGenerationRequestAuthority(key, input.userId, input.chat_id, authorityId, result.generationId);
+    if (reservation.sourceAborted || reservation.stopRequested || controller.signal.aborted || hasStoppedGenerationRequestAuthority(input.userId, key)) {
+      if (reservation.sourceAborted && reservation.mode === "agentic") {
+        reservation.cancellationResult ??= settleAbortedAgenticReservation(reservation);
+        await reservation.cancellationResult;
+      } else {
+        await stopGeneration(input.userId, result.generationId, input.chat_id);
+      }
       throw new DOMException("Generation stopped", "AbortError");
+    }
+    if (reservation.mode === "agentic" && input.signal) {
+      retainSourceAbortUntilTerminal = true;
+      const releaseSourceAbort = () => {
+        input.signal?.removeEventListener("abort", onSourceAbort);
+      };
+      void waitForAgenticGeneration(result.generationId)
+        .then(releaseSourceAbort, releaseSourceAbort);
     }
     return result;
   } finally {
-    input.signal?.removeEventListener("abort", onSourceAbort);
+    if (!retainSourceAbortUntilTerminal) input.signal?.removeEventListener("abort", onSourceAbort);
     if (pendingGenerationRequestAuthorities.get(key) === reservation) {
       pendingGenerationRequestAuthorities.delete(key);
     }
@@ -8013,18 +8382,53 @@ function emitExpressionChanged(
   );
 }
 
+export function acknowledgeGenerationDispatch(
+  userId: string,
+  chatId: string,
+  rawGenerationId: unknown,
+  rawAuthorityId: unknown,
+): AgenticDispatchAcknowledgementState | false {
+  if (typeof rawGenerationId !== "string" || rawGenerationId.length === 0) return false;
+  const authorityId = normalizeGenerationRequestAuthorityId(rawAuthorityId);
+  if (!userId || !chatId || !authorityId) return false;
+  const key = generationRequestAuthorityKey(userId, chatId, authorityId);
+  if (hasStoppedGenerationRequestAuthority(userId, key)) return false;
+  if (acknowledgedGenerationRequestAuthorityMatches(key, rawGenerationId)) {
+    return "already_acknowledged";
+  }
+  if (admittedGenerationRequestAuthorities.get(key) !== rawGenerationId) return false;
+  const context = getActiveAgenticGenerationContext(userId, rawGenerationId);
+  if (!context || context.chatId !== chatId) return false;
+  const acknowledgement = acknowledgeAgenticGenerationDispatch(userId, rawGenerationId);
+  if (acknowledgement !== "accepted") return false;
+  rememberAcknowledgedGenerationRequestAuthority(key, rawGenerationId);
+  return acknowledgement;
+}
+
 export async function stopGenerationRequestAuthority(
   userId: string,
   chatId: string,
   rawAuthorityId: unknown,
+  expectedGenerationId?: string,
 ): Promise<GenerationStopResult> {
   const authorityId = normalizeGenerationRequestAuthorityId(rawAuthorityId);
   if (!userId || !chatId || !authorityId) return false;
   const key = generationRequestAuthorityKey(userId, chatId, authorityId);
-  rememberStoppedGenerationRequestAuthority(key);
-  const reservation = pendingGenerationRequestAuthorities.get(key);
-  if (!reservation || reservation.userId !== userId || reservation.chatId !== chatId) return true;
-  reservation.controller.abort(new DOMException("Generation stopped", "AbortError"));
+  const candidate = pendingGenerationRequestAuthorities.get(key);
+  const reservation = candidate?.userId === userId && candidate.chatId === chatId ? candidate : undefined;
+  const generationId = admittedGenerationRequestAuthorities.get(key);
+  const boundGenerationId = reservation?.generationId ?? generationId;
+  if (expectedGenerationId && boundGenerationId !== expectedGenerationId) return false;
+  const retained = rememberStoppedGenerationRequestAuthority(userId, key, !!reservation || !!generationId);
+  if (!retained && !reservation && !generationId) return false;
+  if (!reservation) {
+    if (!generationId) return true;
+    return stopGeneration(userId, generationId, chatId);
+  }
+  reservation.stopRequested = true;
+  if (reservation.mode === "response") {
+    reservation.controller.abort(new DOMException("Generation stopped", "AbortError"));
+  }
   if (reservation.generationId) {
     const stopped = await stopGeneration(userId, reservation.generationId, chatId);
     if (stopped !== false) return stopped;
@@ -8038,6 +8442,50 @@ export interface TerminalGenerationStopResult {
 }
 
 export type GenerationStopResult = boolean | "too_late" | TerminalGenerationStopResult;
+async function settleAbortedAgenticReservation(
+  reservation: PendingGenerationRequestAuthority,
+): Promise<GenerationStopResult> {
+  const generationId = reservation.generationId;
+  if (!generationId) return false;
+  let cancellationError: unknown;
+  try {
+    const stopped = await requestAgenticGenerationCancellation(reservation.userId, generationId);
+    if (stopped === true) return true;
+    if (stopped === "too_late") return "too_late";
+  } catch (error) {
+    cancellationError = error;
+  }
+
+  const execution = getTurnExecution(generationId, reservation.userId);
+  if (execution && execution.chatId === reservation.chatId) {
+    try {
+      const durable = requestTurnCancellation({
+        executionId: execution.id,
+        ...(execution.casOwner ? { ownerToken: execution.casOwner } : {}),
+        reason: "stopped",
+      });
+      if (durable.code === "cancelled") {
+        abortAcceptedAgenticGeneration(reservation.userId, generationId);
+        return true;
+      }
+      if (durable.code === "too_late" || durable.code === "timed_out") return "too_late";
+      if (durable.code === "already_terminal") {
+        return durable.execution.state === "CANCELLED" ? true : "too_late";
+      }
+    } catch (error) {
+      cancellationError = error;
+    }
+  }
+
+  // Both durable cancellation authorities were unavailable. Keep dispatch
+  // fenced and force the durable owner itself through terminal convergence.
+  reservation.controller.abort(new DOMException("Generation stopped", "AbortError"));
+  const terminal = await waitForAgenticGeneration(generationId);
+  if (terminal?.status === "cancelled") return true;
+  if (terminal?.status === "completed") return "too_late";
+  if (cancellationError !== undefined) throw cancellationError;
+  return false;
+}
 
 function requestDormantAgenticGenerationStop(
   userId: string,
@@ -8054,7 +8502,7 @@ function requestDormantAgenticGenerationStop(
     const stopped = requestAgentRunStop(userId, execution.chatId, execution.id);
     if (!stopped) return false;
     if (stopped.status === "too_late") return "too_late";
-    if (stopped.status === "terminal") return { status: "terminal", generationId: execution.id, run: stopped };
+    if (stopped.status === "terminal") return { status: "terminal", generationId: stopped.generationId, run: stopped };
     return true;
   } catch {
     return false;
@@ -8271,13 +8719,22 @@ async function prepareRawCall(
     { params: parameters, messages: input.messages, tools: input.tools },
   );
 
-  const request: GenerationRequest = {
-    messages: cached.messages,
-    model: input.model,
-    parameters: cached.params,
-    tools: cached.tools,
-    signal: input.signal,
-  };
+  if (input.toolMode === "required") {
+      if (!cached.tools || cached.tools.length === 0) {
+        throw new Error("Required tool mode needs at least one admitted host tool");
+      }
+      if (provider.capabilities.requiredToolChoice !== true) {
+        throw new Error('Provider "' + provider.name + '" does not support required tool choice');
+      }
+    }
+    const request: GenerationRequest = {
+      messages: cached.messages,
+      model: input.model,
+      parameters: cached.params,
+      tools: cached.tools,
+      signal: input.signal,
+      toolMode: input.toolMode,
+    };
   return { provider, apiKey, apiUrl, request };
 }
 
@@ -8333,12 +8790,21 @@ async function prepareQuietCall(
     { params: mergedParams, messages: input.messages, tools: input.tools },
   );
 
+  if (input.toolMode === "required") {
+    if (!cached.tools || cached.tools.length === 0) {
+      throw new Error("Required tool mode needs at least one admitted host tool");
+    }
+    if (provider.capabilities.requiredToolChoice !== true) {
+      throw new Error('Provider "' + provider.name + '" does not support required tool choice');
+    }
+  }
   const request: GenerationRequest = {
     messages: cached.messages,
     model: resolvedModel,
     parameters: cached.params,
     tools: cached.tools,
     signal: input.signal,
+    toolMode: input.toolMode,
   };
 
   return { provider, apiKey, apiUrl, request };

@@ -51,7 +51,7 @@ import {
 } from "./agentic-assembly-compiler";
 import { prepareAgentRenderV1 } from "./agentic-render-preparation.service";
 import {
-  runAgenticWorkPhase,
+  runSegmentedAgenticWorkV1,
   type AgenticWorkOptions,
   type AgenticWorkspaceCapability,
   type AgenticWorkspaceCompletionFixedPointResult,
@@ -552,7 +552,7 @@ describe("Agentic strict phases enter zero host callbacks", () => {
     // maxToolResultBytes is lowered so the forged batch survives result-byte
     // reservation and the genuine per-call allowlist rejection surfaces
     // (tool_not_allowed) instead of batch-reservation exhaustion.
-    const result = await runAgenticWorkPhase(workOptions(plan, async ({ tools, messages }) => {
+    const result = await runSegmentedAgenticWorkV1(workOptions(plan, async ({ tools, messages }) => {
       composedTools = tools.map((tool) => tool.name);
       expect(JSON.stringify(messages)).not.toContain(MARKER);
       round += 1;

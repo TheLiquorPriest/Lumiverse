@@ -12,12 +12,15 @@ import {
   importPortablePreset,
   importPortablePresetRuntime,
   parsePortablePresetRuntimeEnvelope,
+  portablePresetRegexScriptsMatchStored,
   parsePortablePresetRuntimeImportRequest,
   PORTABLE_PRESET_FIELDS_MAX_BYTES,
   PORTABLE_JSON_MAX_NODES,
   writePresetAgentConfig,
   type PortablePresetRuntimeEnvelopeV1,
 } from "./agent-config-portability.service";
+import { getPreset, updatePreset } from "./presets.service";
+import { updateRegexScript } from "./regex-scripts.service";
 
 const USER_ID = "portable-import-user";
 
@@ -348,15 +351,15 @@ describe("portable preset runtime import atomicity", () => {
     expect(db.query("SELECT COUNT(*) AS count FROM regex_scripts WHERE user_id = ?").get(USER_ID)).toEqual({ count: 0 });
     expect(db.query("SELECT COUNT(*) AS count FROM settings WHERE user_id = ? AND key LIKE 'presetRegexEnabled:%'").get(USER_ID)).toEqual({ count: 0 });
   });
-  test("rejects root-only child workspace grants during portable import", () => {
+  test("rejects retired record_question child grants during portable import", () => {
     expect(() => importPortablePresetRuntime(USER_ID, {
       preset: preset(),
-      agentRuntime: runtimeEnvelopeWithProfile(["submit_root_result"]),
+      agentRuntime: runtimeEnvelopeWithProfile(["record_question"]),
     })).toThrow("workspace operation is not allowed for child profiles");
     expect(getDb().query("SELECT COUNT(*) AS count FROM presets WHERE user_id = ?").get(USER_ID)).toEqual({ count: 0 });
   });
 
-  test("quarantines a persisted root-only child grant without making the preset unreadable", () => {
+  test("quarantines a persisted retired record_question grant without making the preset unreadable", () => {
     const result = importPortablePresetRuntime(USER_ID, {
       preset: preset(),
       agentRuntime: runtimeEnvelopeWithProfile(["read_section"]),
@@ -364,7 +367,7 @@ describe("portable preset runtime import atomicity", () => {
     const db = getDb();
     db.query(
       "UPDATE preset_agent_profiles SET workspace_capabilities = ? WHERE user_id = ? AND preset_id = ?",
-    ).run(JSON.stringify(["submit_root_result"]), USER_ID, result.preset.id);
+    ).run(JSON.stringify(["record_question"]), USER_ID, result.preset.id);
 
     expect(getPresetAgentConfig(USER_ID, result.preset.id)).toMatchObject({
       config: {
@@ -478,6 +481,45 @@ describe("portable preset runtime import atomicity", () => {
     expect(duplicate.copiedRegexScriptIds).toHaveLength(2);
     expect(db.query("SELECT COUNT(*) AS count FROM regex_scripts WHERE user_id = ? AND preset_id = ?").get(USER_ID, duplicate.preset.id)).toEqual({ count: 2 });
   });
+  test("replaces a provenance-stamped regex after an opposite direct mutation", () => {
+    const source = {
+      ...validRegex("provenance"),
+      target: ["response", "prompt"],
+      metadata: { nested: { alpha: 1, beta: 2 } },
+    };
+    const initial = importPortablePresetRuntime(USER_ID, {
+      preset: preset([source], "Provenance"),
+      agentRuntime: runtimeEnvelope(),
+    });
+    const reordered = {
+      ...Object.fromEntries(Object.entries(source).reverse()),
+      metadata: { nested: { beta: 2, alpha: 1 } },
+    };
+    expect(portablePresetRegexScriptsMatchStored(USER_ID, initial.preset.id, [reordered])).toBe(true);
+    expect(portablePresetRegexScriptsMatchStored(USER_ID, initial.preset.id, [{
+      ...reordered,
+      target: ["prompt", "response"],
+    }])).toBe(false);
+
+    const stored = getDb().query(
+      "SELECT id FROM regex_scripts WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, initial.preset.id) as { id: string };
+    const mutated = updateRegexScript(USER_ID, stored.id, { find_regex: "locally-mutated" });
+    expect(mutated && typeof mutated !== "string" ? mutated.find_regex : null).toBe("locally-mutated");
+    expect(portablePresetRegexScriptsMatchStored(USER_ID, initial.preset.id, [source])).toBe(false);
+
+    const beforeReplace = getPreset(USER_ID, initial.preset.id)!;
+    const beforeRevision = beforeReplace.cache_revision ?? 0;
+    const replaced = updatePreset(USER_ID, initial.preset.id, {
+      regex_scripts: [source],
+      expected_cache_revision: beforeRevision,
+    })!;
+    expect(replaced.cache_revision).toBe(beforeRevision + 1);
+    expect(getDb().query(
+      "SELECT find_regex FROM regex_scripts WHERE user_id = ? AND preset_id = ?",
+    ).get(USER_ID, initial.preset.id)).toEqual({ find_regex: "foo" });
+  });
+
   test("reimports regex companions as independent local rows and remaps references", () => {
     const source = importPortablePresetRuntime(USER_ID, {
       preset: preset([validRegex("source")], "Source"),
@@ -622,7 +664,41 @@ describe("portable preset field bounds", () => {
       agentRuntime: runtimeEnvelope(false),
     })).toThrow("unknown prompt block field");
   });
-  test("rejects ambiguous Loom prompt identities before either import persists", () => {
+  test("round-trips repeated Loom block IDs at distinct prompt-order occurrences through both imports", () => {
+    const repeatedBlocks = [
+      { ...promptBlock(0), id: "repeated", name: "Occurrence zero", content: "zero" },
+      { ...promptBlock(1), id: "repeated", name: "Occurrence one", content: "one" },
+    ];
+    const directPreset = {
+      ...preset(undefined, "Direct repeated occurrences"),
+      prompt_order: repeatedBlocks,
+    };
+
+    const parsed = parsePortablePresetRuntimeImportRequest({
+      preset: directPreset,
+      agentRuntime: runtimeEnvelope(false),
+    });
+    expect(parsed.preset.prompt_order).toEqual(repeatedBlocks);
+
+    const direct = importPortablePreset(USER_ID, directPreset);
+    expect(direct.preset.prompt_order).toEqual(repeatedBlocks);
+    expect(direct.preset.prompt_order.map((entry, promptOrder) => ({ blockId: entry.id, promptOrder }))).toEqual([
+      { blockId: "repeated", promptOrder: 0 },
+      { blockId: "repeated", promptOrder: 1 },
+    ]);
+
+    const runtime = importPortablePresetRuntime(USER_ID, {
+      preset: { ...directPreset, name: "Runtime repeated occurrences" },
+      agentRuntime: runtimeEnvelope(false),
+    });
+    expect(runtime.preset.prompt_order).toEqual(repeatedBlocks);
+    expect(runtime.preset.prompt_order.map((entry, promptOrder) => ({ blockId: entry.id, promptOrder }))).toEqual([
+      { blockId: "repeated", promptOrder: 0 },
+      { blockId: "repeated", promptOrder: 1 },
+    ]);
+    expect(getDb().query("SELECT COUNT(*) AS count FROM presets WHERE user_id = ?").get(USER_ID)).toEqual({ count: 2 });
+  });
+  test("rejects empty and malformed nested Loom prompt identities before either import persists", () => {
     const textVariable = (id: string, name: string): Record<string, unknown> => ({
       id,
       name,
@@ -636,10 +712,6 @@ describe("portable preset field bounds", () => {
       {
         blocks: [{ ...firstBlock, id: "   " }, secondBlock],
         error: "must not be empty",
-      },
-      {
-        blocks: [firstBlock, { ...secondBlock, id: firstBlock.id }],
-        error: "duplicate block id",
       },
       {
         blocks: [{

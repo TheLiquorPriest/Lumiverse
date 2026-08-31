@@ -68,7 +68,9 @@ function connection(id: string, overrides: Partial<FakeConnection> = {}): FakeCo
       toolContinuationMode: "native",
     },
     ...overrides,
-    effectiveEndpoint: overrides.effectiveEndpoint ?? null,
+    effectiveEndpoint: Object.hasOwn(overrides, "effectiveEndpoint")
+      ? overrides.effectiveEndpoint ?? null
+      : "https://default.example/v1",
   };
 }
 
@@ -319,6 +321,106 @@ describe("AgentRuntimeDecisionService", () => {
     }
   });
 
+  test("omits undecided required and optional Loom outcomes until authoritative assembly", async () => {
+    const block = {
+      id: "outlet-policy",
+      name: "Outlet policy",
+      content: "Authoritative {{outlet::policy_context}}",
+      role: "system",
+      enabled: true,
+      position: "pre_history",
+      depth: 0,
+      marker: null,
+      isLocked: false,
+      color: null,
+      injectionTrigger: [],
+      revision: 1,
+    };
+    const optionalBlock = {
+      ...block,
+      id: "optional-policy",
+      name: "Optional policy",
+      content: "Optional authored policy",
+    };
+    getDb().run(
+      `INSERT INTO "user" (id, name, email) VALUES (?, ?, ?)`,
+      [USER_ID, "Runtime decision user", "runtime-decision@example.test"],
+    );
+    getDb().run(
+      `INSERT INTO presets (id, name, provider, user_id, cache_revision, prompt_order) VALUES (?, ?, ?, ?, ?, ?)`,
+      ["preset-default", "Default", "test", USER_ID, 3, JSON.stringify([block, optionalBlock])],
+    );
+    const runtimePolicy = {
+      version: 1,
+      authority: "loom",
+      scope: "preset",
+      defaultMode: "agentic",
+      loomPolicy: {
+        version: 1,
+        workPolicy: [{
+          version: 1,
+          id: "outlet-policy-entry",
+          source: {
+            kind: "loom_block",
+            blockId: block.id,
+            presetRevision: 3,
+            blockRevision: 1,
+            promptOrder: 0,
+          },
+          destination: "root_work",
+          checkpoint: "WORK",
+          required: true,
+          visibility: "work_only",
+        }, {
+          version: 1,
+          id: "optional-policy-entry",
+          source: {
+            kind: "loom_block",
+            blockId: optionalBlock.id,
+            presetRevision: 3,
+            blockRevision: 1,
+            promptOrder: 1,
+          },
+          destination: "root_work",
+          checkpoint: "WORK",
+          required: false,
+          visibility: "work_only",
+        }],
+        workspaceUsage: [],
+        completionCriteria: [],
+        renderPolicy: [],
+      },
+      phases: [],
+    };
+    const service = makeService({
+      preset: {
+        id: "preset-default",
+        name: "Default",
+        cache_revision: 3,
+        agent_config: {
+          version: 2,
+          agentsEnabled: true,
+          allowedModes: ["response", "agentic"],
+          defaultMode: "agentic",
+          maxInvocations: 8,
+          maxToolCalls: 8,
+          mainToolIds: [],
+          mainLoreScope: "active",
+          profiles: [],
+          connectionSlots: [],
+          runtimePolicy,
+        },
+      },
+    });
+
+    const selected = await service.resolve(USER_ID, request());
+    expect(selected.inspection).toMatchObject({
+      effectiveEntryIds: [],
+      items: [],
+    });
+    expect(JSON.stringify(selected.inspection)).not.toMatch(/required_source_unavailable|stale_source|rejected/);
+  });
+
   test("issues an opaque token and rejects mismatch, replay, expiry, and revision races", async () => {
     let now = 1_000;
     const connections = { root: connection("root") };
@@ -498,7 +600,7 @@ describe("AgentRuntimeDecisionService", () => {
     delete durableRequest.mode;
     const issued = await service.resolve(USER_ID, durableRequest);
 
-    service.setChatAgentModeOverride(USER_ID, CHAT_ID, "agentic");
+    service.setChatAgentModeOverride(USER_ID, CHAT_ID, "agentic", 0);
     const consumed = await service.consume(
       USER_ID,
       issued.runtimeDecisionToken!,
@@ -604,43 +706,51 @@ describe("AgentRuntimeDecisionService", () => {
     expect(decision.repairCodes).toContain("agentic_target_unsupported");
   });
 
-  test("accepts legacy root continuation while rejecting unsupported root continuation", async () => {
-    const unsupported = await makeService({
+  test("requires both native continuation signals and keeps legacy continuation in Response", async () => {
+    const resolveWithCapabilities = (capabilities: FakeConnection["capabilities"]) => makeService({
       connections: {
-        root: connection("root", {
-          capabilities: {
-            streaming: true,
-            toolCalling: true,
-            toolsDisabledFinalization: true,
-          },
-        }),
+        root: connection("root", { capabilities }),
       },
     }).resolve(USER_ID, request());
 
-    expect(unsupported.effectiveMode).toBe("response");
-    expect(unsupported.capabilityReadiness.ready).toBe(false);
-    expect(unsupported.capabilityReadiness.missing).toContain("native_tool_continuation");
-    expect(unsupported.repairCodes).toContain("agentic_capability_missing_native_tool_continuation");
+    const native = await resolveWithCapabilities({
+      streaming: true,
+      toolCalling: true,
+      toolsDisabledFinalization: true,
+      nativeToolContinuation: true,
+      toolContinuationMode: "native",
+    });
+    expect(native.effectiveMode).toBe("agentic");
+    expect(native.capabilityReadiness.ready).toBe(true);
 
-    const legacy = await makeService({
-      connections: {
-        root: connection("root", {
-          capabilities: {
-            streaming: true,
-            toolCalling: true,
-            toolsDisabledFinalization: true,
-            nativeToolContinuation: true,
-            toolContinuationMode: "legacy",
-          },
-        }),
+    for (const incapable of [
+      {
+        streaming: true,
+        toolCalling: true,
+        toolsDisabledFinalization: true,
+        nativeToolContinuation: false,
+        toolContinuationMode: "native" as const,
       },
-    }).resolve(USER_ID, request());
-    expect(legacy.effectiveMode).toBe("agentic");
-    expect(legacy.capabilityReadiness.ready).toBe(true);
-    expect(legacy.capabilityReadiness.missing).not.toContain("native_tool_continuation");
-    expect(legacy.repairCodes).not.toContain("agentic_capability_missing_native_tool_continuation");
+      {
+        streaming: true,
+        toolCalling: true,
+        toolsDisabledFinalization: true,
+        nativeToolContinuation: true,
+        toolContinuationMode: "legacy" as const,
+      },
+      {
+        streaming: true,
+        toolCalling: true,
+        toolsDisabledFinalization: true,
+      },
+    ]) {
+      const decision = await resolveWithCapabilities(incapable);
+      expect(decision.effectiveMode).toBe("response");
+      expect(decision.capabilityReadiness.ready).toBe(false);
+      expect(decision.capabilityReadiness.missing).toContain("native_tool_continuation");
+      expect(decision.repairCodes).toContain("agentic_capability_missing_native_tool_continuation");
+    }
   });
-
   test("returns an explicit Response escape for slot, capability, and domain failures", async () => {
     const preset = {
       id: "preset-default",

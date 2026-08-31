@@ -21,6 +21,7 @@ export class AI21Provider extends OpenAICompatibleProvider {
     apiKeyRequired: true,
     modelListStyle: "openai",
     toolCalling: true,
+    requiredToolChoice: false,
     nativeToolContinuation: false,
     toolContinuationMode: "legacy",
     toolsDisabledFinalization: true,

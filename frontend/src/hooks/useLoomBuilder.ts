@@ -51,8 +51,7 @@ import {
   sanitizeLumiHubSealedBlocksForExport,
   normalizeCategoryBlockState,
   stripPortableRegexOwnership,
-  toggleBlockWithCategoryRules,
-  toggleCategoryWithChildren,
+  computeGroups,
   coerceImportedLoomPreset,
   detectImportedPresetKind,
   reconcilePromptVariableValues,
@@ -61,17 +60,36 @@ import {
 } from '@/lib/loom/service'
 import { prepareAgentConfigForRuntimeSave } from '@/lib/loom/agenticRuntime'
 import { mergePromptVariableValues } from '@/hooks/preset-profile-prompt-variables'
+import { commitRuntimeAuthorityMutation } from '@/lib/agentRuntimeSelection'
 
-type LoomPrivateBlockFields = Pick<
-  PromptBlock,
-  'sealed' | 'sealedKey' | 'sealedSource' | 'sealedOriginPresetId' | 'sealedOriginVersion' | 'sealedSha256'
->
+export interface LoomBlockOccurrence {
+  readonly blockId: string
+  readonly promptOrder: number
+}
 
-type LoomPrivateBlockChange = {
-  blockId: string
-  /** Zero-based occurrence among blocks sharing blockId; required for duplicates. */
-  occurrence?: number
-  patch: Partial<LoomPrivateBlockFields>
+export function encodeLoomBlockOccurrence(target: LoomBlockOccurrence): string {
+  return JSON.stringify([target.blockId, target.promptOrder])
+}
+
+export function decodeLoomBlockOccurrence(value: unknown): LoomBlockOccurrence | null {
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed) || parsed.length !== 2) return null
+    const [blockId, promptOrder] = parsed
+    if (typeof blockId !== 'string' || blockId.length === 0) return null
+    if (!Number.isSafeInteger(promptOrder) || (promptOrder as number) < 0) return null
+    return { blockId, promptOrder: promptOrder as number }
+  } catch {
+    return null
+  }
+}
+
+export function canMovePromptVariableBetweenOccurrences(
+  source: LoomBlockOccurrence,
+  target: LoomBlockOccurrence,
+): boolean {
+  return source.promptOrder !== target.promptOrder && source.blockId !== target.blockId
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -137,39 +155,152 @@ function normalizeAgentSlotBindings(value: unknown): Record<string, string | nul
   ) as Record<string, string | null>
 }
 
-function applyPrivateBlockChange(
-  currentBlocks: PromptBlock[],
-  nextBlocks: PromptBlock[],
-  change: LoomPrivateBlockChange | undefined,
-): PromptBlock[] {
-  if (!change) return nextBlocks
-  const currentMatches = currentBlocks.filter((block) => block.id === change.blockId).length
-  const nextMatches = nextBlocks.filter((block) => block.id === change.blockId).length
-  const occurrence = change.occurrence
-  if (currentMatches > 1) {
-    if (!Number.isSafeInteger(occurrence) || occurrence < 0 || occurrence >= currentMatches) {
-      throw new Error('LOOM_AMBIGUOUS_BLOCK_OCCURRENCE: duplicate block changes require an exact occurrence')
+export function getLoomBlockAtOccurrence(
+  blocks: readonly PromptBlock[],
+  target: LoomBlockOccurrence,
+): PromptBlock | null {
+  if (!Number.isSafeInteger(target.promptOrder) || target.promptOrder < 0) return null
+  const block = blocks[target.promptOrder]
+  return block?.id === target.blockId ? block : null
+}
+
+function sameBooleanRecord(left: Record<string, boolean>, right: Record<string, boolean>): boolean {
+  const leftKeys = Object.keys(left)
+  if (leftKeys.length !== Object.keys(right).length) return false
+  return leftKeys.every((key) => Object.hasOwn(right, key) && left[key] === right[key])
+}
+
+function canonicalizeCategorySnapshots(blocks: PromptBlock[]): PromptBlock[] {
+  let replacements: Map<PromptBlock, Record<string, boolean>> | null = null
+  for (const group of computeGroups(blocks)) {
+    const category = group.categoryBlock
+    const snapshot = category?.savedChildEnabled
+    if (!category || !snapshot) continue
+    const children = new Set(group.children)
+    const canonical: Record<string, boolean> = {}
+    for (let promptOrder = 0; promptOrder < blocks.length; promptOrder += 1) {
+      const child = blocks[promptOrder]!
+      if (!children.has(child)) continue
+      const coordinateKey = encodeLoomBlockOccurrence({ blockId: child.id, promptOrder })
+      if (Object.hasOwn(snapshot, coordinateKey)) {
+        canonical[coordinateKey] = snapshot[coordinateKey] === true
+      } else if (Object.hasOwn(snapshot, child.id)) {
+        // Legacy snapshots were ID-wide. Duplicate occurrences therefore receive
+        // the same legacy value rather than an invented per-occurrence ordering.
+        canonical[coordinateKey] = snapshot[child.id] === true
+      }
     }
-    if (nextMatches !== currentMatches) {
-      throw new Error('LOOM_AMBIGUOUS_BLOCK_OCCURRENCE: duplicate block occurrence count changed')
+    if (!sameBooleanRecord(snapshot, canonical)) {
+      if (!replacements) replacements = new Map()
+      replacements.set(category, canonical)
     }
-  } else if (occurrence !== undefined && occurrence !== 0) {
-    throw new Error('LOOM_AMBIGUOUS_BLOCK_OCCURRENCE: occurrence must identify the unique block')
   }
-  let seen = 0
-  let applied = false
-  const updated = nextBlocks.map((block) => {
-    if (block.id !== change.blockId) return block
-    const matches = occurrence === undefined || occurrence === seen
-    seen += 1
-    if (!matches) return block
-    applied = true
-    return { ...block, ...change.patch }
+  if (!replacements) return blocks
+  return blocks.map((block) => {
+    const savedChildEnabled = replacements.get(block)
+    return savedChildEnabled ? { ...block, savedChildEnabled } : block
   })
-  if (!applied) {
-    throw new Error('LOOM_AMBIGUOUS_BLOCK_OCCURRENCE: requested block occurrence is absent')
+}
+
+function canonicalizeHydratedPreset(preset: LoomPreset): LoomPreset {
+  const blocks = canonicalizeCategorySnapshots(preset.blocks)
+  return blocks === preset.blocks ? preset : { ...preset, blocks }
+}
+
+export interface LoomBlockReorderEntry {
+  readonly block: PromptBlock
+  readonly source: LoomBlockOccurrence | null
+}
+
+export function remapCategorySnapshotsForReorder(
+  sourceBlocks: PromptBlock[],
+  reorderedEntries: readonly LoomBlockReorderEntry[],
+): PromptBlock[] {
+  const canonicalSourceBlocks = canonicalizeCategorySnapshots(sourceBlocks)
+  const targetBySource = new Map<string, LoomBlockOccurrence>()
+  for (let promptOrder = 0; promptOrder < reorderedEntries.length; promptOrder += 1) {
+    const entry = reorderedEntries[promptOrder]!
+    if (!entry.source) continue
+    const sourceBlock = getLoomBlockAtOccurrence(canonicalSourceBlocks, entry.source)
+    if (!sourceBlock || sourceBlock.id !== entry.block.id) continue
+    targetBySource.set(encodeLoomBlockOccurrence(entry.source), {
+      blockId: entry.block.id,
+      promptOrder,
+    })
   }
-  return updated
+
+  return reorderedEntries.map((entry) => {
+    if (!entry.source) return entry.block
+    const sourceBlock = getLoomBlockAtOccurrence(canonicalSourceBlocks, entry.source)
+    if (!sourceBlock?.savedChildEnabled) return entry.block
+    const savedChildEnabled: Record<string, boolean> = {}
+    for (const [sourceKey, enabled] of Object.entries(sourceBlock.savedChildEnabled)) {
+      const target = targetBySource.get(sourceKey)
+      if (!target) continue
+      savedChildEnabled[encodeLoomBlockOccurrence(target)] = enabled
+    }
+    return { ...entry.block, savedChildEnabled }
+  })
+}
+
+function toggleBlockAtOccurrence(
+  blocks: PromptBlock[],
+  target: LoomBlockOccurrence,
+): PromptBlock[] {
+  const targetBlock = getLoomBlockAtOccurrence(blocks, target)
+  if (!targetBlock) return blocks
+  const categoryGroup = computeGroups(blocks).find((group) => (
+    group.categoryBlock?.categoryMode === 'radio'
+    && group.children.includes(targetBlock)
+  ))
+  if (!categoryGroup?.categoryBlock) {
+    return blocks.map((block, promptOrder) => (
+      promptOrder === target.promptOrder ? { ...block, enabled: !block.enabled } : block
+    ))
+  }
+  const children = new Set(categoryGroup.children)
+  return blocks.map((block) => (
+    children.has(block) ? { ...block, enabled: block === targetBlock } : block
+  ))
+}
+
+function toggleCategoryAtOccurrence(
+  blocks: PromptBlock[],
+  target: LoomBlockOccurrence,
+): PromptBlock[] {
+  const targetCategory = getLoomBlockAtOccurrence(blocks, target)
+  if (!targetCategory || targetCategory.marker !== 'category') return blocks
+  const canonicalBlocks = canonicalizeCategorySnapshots(blocks)
+  const category = getLoomBlockAtOccurrence(canonicalBlocks, target)!
+  const group = computeGroups(canonicalBlocks).find((candidate) => candidate.categoryBlock === category)
+  const groupChildren = group?.children ?? []
+  const children = new Set(groupChildren)
+  const disabling = category.enabled
+  const snapshot = category.savedChildEnabled
+  let savedChildEnabled: Record<string, boolean> | undefined
+  if (disabling) {
+    savedChildEnabled = {}
+    for (let promptOrder = 0; promptOrder < canonicalBlocks.length; promptOrder += 1) {
+      const block = canonicalBlocks[promptOrder]!
+      if (!children.has(block)) continue
+      savedChildEnabled[encodeLoomBlockOccurrence({ blockId: block.id, promptOrder })] = block.enabled === true
+    }
+  }
+  const toggled = canonicalBlocks.map((block, promptOrder) => {
+    if (block === category) {
+      return {
+        ...block,
+        enabled: !disabling,
+        savedChildEnabled,
+      }
+    }
+    if (!children.has(block)) return block
+    if (disabling) return { ...block, enabled: false }
+    const snapshotKey = encodeLoomBlockOccurrence({ blockId: block.id, promptOrder })
+    if (!snapshot || !Object.hasOwn(snapshot, snapshotKey)) return block
+    return { ...block, enabled: snapshot[snapshotKey] === true }
+  })
+  return normalizeCategoryBlockState(toggled)
 }
 
 type LoomBuilderDependencies = {
@@ -281,7 +412,10 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
         presetSaveCoordinator.cancelHydration(hydration)
         return
       }
-      const loadedPreset = presetSaveCoordinator.hydrate(unmarshalPreset(preset), hydration)
+      const loadedPreset = presetSaveCoordinator.hydrate(
+        canonicalizeHydratedPreset(unmarshalPreset(preset)),
+        hydration,
+      )
       activePresetRef.current = loadedPreset
       setActivePreset(loadedPreset)
       setIsLoading(false)
@@ -347,7 +481,9 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     if (useStore.getState().activeLoomPresetId !== presetId) {
       throw new Error('No active preset')
     }
-    const reloaded = presetSaveCoordinator.acceptPersisted(unmarshalPreset(result.preset))
+    const reloaded = presetSaveCoordinator.acceptPersisted(
+      canonicalizeHydratedPreset(unmarshalPreset(result.preset)),
+    )
     if (useStore.getState().activeLoomPresetId !== reloaded.id) {
       throw new Error('No active preset')
     }
@@ -374,7 +510,9 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     try {
       const loom = createNewLoomPreset(name, description)
       const created = await presetApi.create(marshalPreset(loom))
-      const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
+      const newLoom = presetSaveCoordinator.hydrate(
+        canonicalizeHydratedPreset(unmarshalPreset(created)),
+      )
       await refreshRegistry()
       if (await selection.transition(created.id)) {
         activePresetRef.current = newLoom
@@ -444,7 +582,10 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
           presetSaveCoordinator.cancelHydration(hydration)
           return
         }
-        const restored = presetSaveCoordinator.hydrate(unmarshalPreset(preset), hydration)
+        const restored = presetSaveCoordinator.hydrate(
+          canonicalizeHydratedPreset(unmarshalPreset(preset)),
+          hydration,
+        )
         if (activePresetRef.current?.id !== restored.id) return
         activePresetRef.current = restored
         setActivePreset(restored)
@@ -479,7 +620,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     const updated = presetSaveCoordinator.mutate(
       current.id,
       current,
-      updater,
+      (draft) => canonicalizeHydratedPreset(updater(draft)),
       { immediate },
     )
     activePresetRef.current = updated
@@ -497,7 +638,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     const current = activePresetRef.current
     if (!current || useStore.getState().activeLoomPresetId !== current.id) return false
     try {
-      const normalizedBlocks = normalizeCategoryBlockState(blocks)
+      const normalizedBlocks = canonicalizeCategorySnapshots(normalizeCategoryBlockState(blocks))
       validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: current.blocks })
       let promptVariables: PromptVariableValues
       try {
@@ -562,7 +703,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     }
     activePresetRef.current = flushed
     setActivePreset(flushed)
-    const normalizedBlocks = normalizeCategoryBlockState(promptOrder)
+    const normalizedBlocks = canonicalizeCategorySnapshots(normalizeCategoryBlockState(promptOrder))
     validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: flushed.blocks })
     const preparedConfig = prepareAgentConfigForRuntimeSave(
       draft.config,
@@ -576,6 +717,9 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
       expectedConfigRevision: expectedIdentity.configRevision,
       promptOrder: normalizedBlocks,
     })
+    const authorityChanged = result.editor.presetRevision !== expectedIdentity.presetRevision
+      || result.editor.configRevision !== expectedIdentity.configRevision
+    if (authorityChanged) commitRuntimeAuthorityMutation()
     const livePreset = activePresetRef.current
     if (
       useStore.getState().activeLoomPresetId !== flushed.id
@@ -590,23 +734,24 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     ) {
       throw new ApiError(409, 'Conflict', { code: 'AGENT_CONFIG_REVISION_CONFLICT' })
     }
-    const refreshed = presetSaveCoordinator.hydrate(unmarshalPreset(result.preset))
+    const refreshed = presetSaveCoordinator.hydrate(
+      canonicalizeHydratedPreset(unmarshalPreset(result.preset)),
+    )
     activePresetRef.current = refreshed
     setActivePreset(refreshed)
-    await refreshRegistry()
+    if (authorityChanged) await refreshRegistry()
     return result
   }, [presetSaveCoordinator, refreshRegistry, runtimeApi])
 
   const saveLoomValue = useCallback(async (
     blocks: PromptBlock[],
     promptVariables: PromptVariableValues,
-    privateBlockChange?: LoomPrivateBlockChange,
   ) => {
     const current = activePresetRef.current
     if (!current || useStore.getState().activeLoomPresetId !== current.id) return
-    const normalizedBlocks = normalizeCategoryBlockState(blocks)
+    const normalizedBlocks = canonicalizeCategorySnapshots(normalizeCategoryBlockState(blocks))
     validatePromptVariableSchema(normalizedBlocks, { legacyBaseline: current.blocks })
-    const nextBlocks = applyPrivateBlockChange(current.blocks, normalizedBlocks, privateBlockChange)
+    const nextBlocks = normalizedBlocks
     setRuntimePresetProfile((profile) => profile?.presetId === current.id
       ? {
           presetId: current.id,
@@ -641,7 +786,10 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     if (!current) {
       const hydration = presetSaveCoordinator.beginHydration(presetId, 'preset-rename')
       try {
-        current = presetSaveCoordinator.hydrate(unmarshalPreset(await presetApi.get(presetId)), hydration)
+        current = presetSaveCoordinator.hydrate(
+          canonicalizeHydratedPreset(unmarshalPreset(await presetApi.get(presetId))),
+          hydration,
+        )
       } catch (error) {
         presetSaveCoordinator.cancelHydration(hydration)
         throw error
@@ -650,7 +798,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     const updated = presetSaveCoordinator.mutate(
       presetId,
       current,
-      (draft) => ({ ...draft, name: newName }),
+      (draft) => canonicalizeHydratedPreset({ ...draft, name: newName }),
       { immediate: true },
     )
     if (updated.id === activePresetRef.current?.id) {
@@ -724,7 +872,9 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     try {
       await flushPresetForGeneration(presetId)
       const duplicated = await presetApi.duplicate(presetId, newName)
-      const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(duplicated.preset))
+      const newLoom = presetSaveCoordinator.hydrate(
+        canonicalizeHydratedPreset(unmarshalPreset(duplicated.preset)),
+      )
       await refreshRegistry()
       if (await selection.transition(duplicated.preset.id)) {
         activePresetRef.current = newLoom
@@ -755,26 +905,49 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
   }, [saveBlocks])
 
   const removeBlock = useCallback(async (
-    blockId: string,
+    target: LoomBlockOccurrence,
     replacement?: { blocks: PromptBlock[]; promptVariables?: PromptVariableValues },
   ) => {
     const current = effectiveActivePresetRef.current
     if (!current) return
     const sourceBlocks = replacement?.blocks ?? current.blocks
-    const blocks = sourceBlocks
-      .filter((block) => block.id !== blockId)
-      .map((block) => block.group === blockId ? { ...block, group: null } : block)
+    const targetBlock = getLoomBlockAtOccurrence(sourceBlocks, target)
+    if (!targetBlock) return
+    const categoryChildPromptOrders = new Set<number>()
+    if (targetBlock.marker === 'category') {
+      const children = new Set(
+        computeGroups(sourceBlocks).find((group) => group.categoryBlock === targetBlock)?.children ?? [],
+      )
+      for (let promptOrder = 0; promptOrder < sourceBlocks.length; promptOrder += 1) {
+        if (children.has(sourceBlocks[promptOrder]!)) categoryChildPromptOrders.add(promptOrder)
+      }
+    }
+    let entries: LoomBlockReorderEntry[] = sourceBlocks
+      .map((block, promptOrder) => ({ block, source: { blockId: block.id, promptOrder } }))
+      .filter((entry) => entry.source.promptOrder !== target.promptOrder)
+    const duplicateIdRemains = entries.some((entry) => entry.block.id === target.blockId)
+    // Persisted group links are ID-scoped. Exact category child coordinates are
+    // released directly; ID-wide orphan cleanup waits until the last duplicate is gone.
+    const orphanedGroupId = duplicateIdRemains ? null : target.blockId
+    entries = entries.map((entry) => (
+      categoryChildPromptOrders.has(entry.source.promptOrder)
+      || (orphanedGroupId !== null && entry.block.group === orphanedGroupId)
+        ? { ...entry, block: { ...entry.block, group: null } }
+        : entry
+    ))
+    const blocks = remapCategorySnapshotsForReorder(sourceBlocks, entries)
     const promptVariables = { ...(replacement?.promptVariables ?? current.promptVariables ?? {}) }
-    delete promptVariables[blockId]
+    if (!duplicateIdRemains) delete promptVariables[target.blockId]
     await saveLoomValue(blocks, promptVariables)
   }, [saveLoomValue])
 
-  const updateBlock = useCallback((blockId: string, updates: Partial<PromptBlock>): boolean => {
+  const updateBlock = useCallback((target: LoomBlockOccurrence, updates: Partial<PromptBlock>): boolean => {
     const current = effectiveActivePresetRef.current
     if (!current) return false
-    const blocks = current.blocks.map(b => (
-      b.id === blockId ? { ...b, ...updates } : b
-    ))
+    const targetBlock = getLoomBlockAtOccurrence(current.blocks, target)
+    if (!targetBlock) return false
+    const blocks = [...current.blocks]
+    blocks[target.promptOrder] = { ...targetBlock, ...updates }
     let normalizedBlocks: PromptBlock[]
     try {
       normalizedBlocks = normalizeCategoryBlockState(blocks)
@@ -786,63 +959,62 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     return true
   }, [saveBlocks])
 
-  const toggleBlock = useCallback((blockId: string) => {
+  const toggleBlock = useCallback((target: LoomBlockOccurrence) => {
     const current = effectiveActivePresetRef.current
     if (!current) return
-    const blocks = toggleBlockWithCategoryRules(current.blocks, blockId)
-    saveBlocks(blocks)
+    const blocks = toggleBlockAtOccurrence(current.blocks, target)
+    if (blocks === current.blocks) return
+    void saveBlocks(blocks)
   }, [saveBlocks])
 
   // Blanket category toggle: disable captures each child's enabled state on
   // the category block; enable restores that exact snapshot.
-  const toggleCategoryChildren = useCallback((categoryId: string) => {
+  const toggleCategoryChildren = useCallback((target: LoomBlockOccurrence) => {
     const current = effectiveActivePresetRef.current
     if (!current) return
-    const blocks = toggleCategoryWithChildren(current.blocks, categoryId)
-    saveBlocks(blocks)
+    const blocks = toggleCategoryAtOccurrence(current.blocks, target)
+    if (blocks === current.blocks) return
+    void saveBlocks(blocks)
   }, [saveBlocks])
 
   /**
-   * Move a variable definition from one block to another, carrying its saved
-   * value bucket along. Def and value travel together in a single
-   * saveLoomValue so the backend's orphan pruning never sees the value
-   * stranded under the old block. A placement binding on the source block
-   * that pointed at the moved selector is dropped (the same cleanup
-   * cleanPlacementBinding performs on save). Returns false -- without
-   * saving -- when the move would create a duplicate name in the target.
+   * Move a variable definition from one exact block occurrence to another,
+   * carrying its saved value bucket along. Def and value travel together in
+   * a single saveLoomValue so backend orphan pruning never sees the value
+   * stranded under the old block.
    */
   const movePromptVariable = useCallback((
-    sourceBlockId: string,
+    sourceTarget: LoomBlockOccurrence,
     variable: PromptVariableDef,
-    targetBlockId: string,
+    targetTarget: LoomBlockOccurrence,
   ): boolean => {
     const current = effectiveActivePresetRef.current
-    if (!current || sourceBlockId === targetBlockId) return false
-    const sourceBlock = current.blocks.find((b) => b.id === sourceBlockId)
-    const targetBlock = current.blocks.find((b) => b.id === targetBlockId)
+    if (!current || !canMovePromptVariableBetweenOccurrences(sourceTarget, targetTarget)) return false
+    const sourceBlock = getLoomBlockAtOccurrence(current.blocks, sourceTarget)
+    const targetBlock = getLoomBlockAtOccurrence(current.blocks, targetTarget)
     if (!sourceBlock || !targetBlock) return false
 
     const name = variable.name?.trim()
     if (!name) return false
-    if ((targetBlock.variables ?? []).some((v) => v.name?.trim() === name)) return false
+    if ((targetBlock.variables ?? []).some((candidate) => candidate.name?.trim() === name)) return false
 
-    const blocks = current.blocks.map((b) => {
-      if (b.id === sourceBlockId) {
+    const blocks = current.blocks.map((block, promptOrder) => {
+      if (promptOrder === sourceTarget.promptOrder) {
         const next: Partial<PromptBlock> = {
-          variables: (b.variables ?? []).filter((v) => v.id !== variable.id),
+          variables: (block.variables ?? []).filter((candidate) => candidate.id !== variable.id),
         }
-        if (b.placementBinding?.variableId === variable.id) next.placementBinding = undefined
-        return { ...b, ...next }
+        if (block.placementBinding?.variableId === variable.id) next.placementBinding = undefined
+        return { ...block, ...next }
       }
-      if (b.id === targetBlockId) {
-        return { ...b, variables: [...(b.variables ?? []), variable] }
+      if (promptOrder === targetTarget.promptOrder) {
+        return { ...block, variables: [...(block.variables ?? []), variable] }
       }
-      return b
+      return block
     })
 
     const values = current.promptVariables ?? {}
-    const sourceBucket = values[sourceBlockId]
-    const savedName = (sourceBlock.variables ?? []).find((v) => v.id === variable.id)?.name?.trim()
+    const sourceBucket = values[sourceTarget.blockId]
+    const savedName = (sourceBlock.variables ?? []).find((candidate) => candidate.id === variable.id)?.name?.trim()
     let nextValues = values
     if (sourceBucket) {
       const valueKey = savedName && savedName in sourceBucket
@@ -856,8 +1028,8 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
         delete nextSource[valueKey]
         nextValues = {
           ...values,
-          [sourceBlockId]: nextSource,
-          [targetBlockId]: { ...(values[targetBlockId] ?? {}), [name]: moved },
+          [sourceTarget.blockId]: nextSource,
+          [targetTarget.blockId]: { ...(values[targetTarget.blockId] ?? {}), [name]: moved },
         }
       }
     }
@@ -925,7 +1097,7 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
     const updated = presetSaveCoordinator.mutate(
       current.id,
       current,
-      (draft) => ({ ...draft, promptVariables: values }),
+      (draft) => canonicalizeHydratedPreset({ ...draft, promptVariables: values }),
       { immediate: true },
     )
     activePresetRef.current = updated
@@ -1005,7 +1177,9 @@ export function useLoomBuilder(dependencies: LoomBuilderDependencies = {}) {
         }
       }
 
-      const newLoom = presetSaveCoordinator.hydrate(unmarshalPreset(created))
+      const newLoom = presetSaveCoordinator.hydrate(
+        canonicalizeHydratedPreset(unmarshalPreset(created)),
+      )
       try {
         await refreshRegistry()
       } catch {

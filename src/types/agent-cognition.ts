@@ -99,6 +99,7 @@ export interface CognitionLoomBlockRefV1 {
   readonly blockId: string;
   readonly expectedPresetRevision: number;
   readonly expectedBlockRevision: number;
+  readonly promptOrder: number;
 }
 
 /**
@@ -346,6 +347,7 @@ export interface CognitionFrozenSourceRevisionsV1 {
   readonly blockRevisions: readonly {
     readonly blockId: string;
     readonly revision: number;
+    readonly promptOrder: number;
   }[];
 }
 

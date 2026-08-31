@@ -80,6 +80,37 @@ class ExposedAnthropicProvider extends AnthropicProvider {
   }
 }
 
+describe("AnthropicProvider required tool mode", () => {
+  test("uses provider-neutral any-tool selection over exactly the admitted tools", () => {
+    const body = (new AnthropicProvider() as any).buildBody({
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "continue" }],
+      parameters: {
+        tool_choice: { type: "tool", name: "attacker" },
+        tools: [{ name: "attacker" }],
+      },
+      toolMode: "required",
+      tools: [{ name: "host_a", description: "A", parameters: { type: "object" } }],
+    });
+    expect(body.tool_choice).toEqual({ type: "any" });
+    expect(body.tools).toEqual([{
+      name: "host_a",
+      description: "A",
+      input_schema: { type: "object" },
+      strict: false,
+    }]);
+  });
+
+  test("rejects required mode without an admitted tool", () => {
+    expect(() => (new AnthropicProvider() as any).buildBody({
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: "continue" }],
+      toolMode: "required",
+      tools: [],
+    })).toThrow("at least one admitted host tool");
+  });
+});
+
 describe("AnthropicProvider thinking carrier replay", () => {
   test("preserves an explicitly empty signature field", () => {
     const provider = new ExposedAnthropicProvider();

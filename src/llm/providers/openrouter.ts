@@ -89,6 +89,7 @@ export class OpenRouterProvider extends OpenAICompatibleProvider {
     apiKeyRequired: true,
     modelListStyle: "openai",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,
@@ -143,7 +144,7 @@ export class OpenRouterProvider extends OpenAICompatibleProvider {
     // Feature-active modes suppress provider-hosted plugins. Ordinary mode
     // retains the immutable host tool catalog emitted by the base serializer;
     // finalization removes every tool surface and explicitly disables calls.
-    if (request.toolMode === "ordinary") {
+    if (request.toolMode === "ordinary" || request.toolMode === "required") {
       delete body.plugins;
       return body;
     }

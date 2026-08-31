@@ -65,6 +65,7 @@ import type {
   AgentInspectionUsageLayerV1,
   AgentInspectionUsageProjectionV1,
   AgentInspectionUsageV1,
+  AgentWorkSegmentInspectionProjectionV1,
   AgentPromptDatabankSourceV1,
   AgentPromptEvidenceV1,
   AgentPromptNativeProvenanceV1,
@@ -78,6 +79,7 @@ import type {
   AgentTurnSessionEntryV1,
   AgentWorkspaceAssociationV1,
 } from "../types/agent-run-projection";
+import { readWorkSegmentInspectionChainV1 } from "./agentic-work-segment.repository";
 
 import { compareUtf8 } from "../utils/utf8-order";
 
@@ -405,9 +407,13 @@ export function listAgentActivityRuns(userId: string, chatId: string): AgentActi
   return rows.map(decodeRow).filter((run): run is AgentActivityRunV1 => run !== null);
 }
 
-export function ownsChatForActivity(userId: string, chatId: string): boolean {
+function ownsChatForActivityInDb(db: Database, userId: string, chatId: string): boolean {
   if (!boundedId(userId) || !boundedId(chatId)) return false;
-  return Boolean(getDb().query("SELECT 1 FROM chats WHERE id = ? AND user_id = ? LIMIT 1").get(chatId, userId));
+  return Boolean(db.query("SELECT 1 FROM chats WHERE id = ? AND user_id = ? LIMIT 1").get(chatId, userId));
+}
+
+export function ownsChatForActivity(userId: string, chatId: string): boolean {
+  return ownsChatForActivityInDb(getDb(), userId, chatId);
 }
 
 export function __test__serializeAgentActivityRun(input: PersistAgentActivityRunInput) {
@@ -1429,13 +1435,21 @@ function auditRows(
   const omittedCount = Math.max(0, totalRow.count - rows.length);
   if (omittedCount > 0) {
     invalidCount += omittedCount;
-    unavailableMarkers.push(unavailableInspectionMarker(
-      row,
-      `${row.attempt_id}:${scope}:truncated`,
-      scope,
-      {},
-      `${scope} records truncated: additional records omitted.`,
-    ));
+    const id = `${row.attempt_id}:${scope}:truncated`;
+    const detail = `${scope} records truncated: additional records omitted.`;
+    unavailableMarkers.push(scope === "prompt"
+      ? {
+          version: 1,
+          id,
+          kind: "truncated",
+          scope,
+          correlation: null,
+          firstSequence: null,
+          lastSequence: null,
+          recoverable: false,
+          detail,
+        }
+      : unavailableInspectionMarker(row, id, scope, {}, detail));
   }
   return {
     records,
@@ -2263,6 +2277,7 @@ function normalizeInspectionPrompt(
     || !boundedInspectionString(value.id)
     || !boundedInspectionString(value.sourceId)
     || sourceRevision === null
+    || !isSafeInspectionInteger(value.promptOrder)
     || typeof value.destination !== "string"
     || !PROMPT_DESTINATIONS.has(value.destination)
     || typeof value.role !== "string"
@@ -2284,6 +2299,7 @@ function normalizeInspectionPrompt(
     id: value.id as string,
     sourceId: value.sourceId as string,
     sourceRevision,
+    promptOrder: value.promptOrder,
     destination: value.destination as AgentPromptEvidenceV1["destination"],
     role: value.role as AgentPromptEvidenceV1["role"],
     correlation: inspectionCorrelation(row, value.correlation),
@@ -2862,6 +2878,36 @@ interface InspectionSections {
   readonly error: AgentInspectionErrorDetailV1 | null;
 }
 
+function promptOccurrenceKey(prompt: AgentPromptEvidenceV1): string {
+  return JSON.stringify([prompt.sourceId, prompt.promptOrder, prompt.sourceRevision]);
+}
+
+function omitCollidingPromptOccurrences(
+  row: InspectionAttemptRow,
+  records: readonly NormalizedInspectionPrompt[],
+): { records: readonly NormalizedInspectionPrompt[]; markers: readonly AgentInspectionMarkerV1[] } {
+  const fingerprints = new Map<string, string>();
+  const collisions = new Set<string>();
+  for (const prompt of records) {
+    const key = promptOccurrenceKey(prompt);
+    const fingerprint = JSON.stringify([prompt.role, prompt.contentDigest, prompt.content]);
+    const retained = fingerprints.get(key);
+    if (retained === undefined) fingerprints.set(key, fingerprint);
+    else if (retained !== fingerprint) collisions.add(key);
+  }
+  if (collisions.size === 0) return { records, markers: [] };
+  return {
+    records: records.filter((prompt) => !collisions.has(promptOccurrenceKey(prompt))),
+    markers: [...collisions].map((_, index) => unavailableInspectionMarker(
+      row,
+      `${row.attempt_id}:prompt:occurrence-collision:${index}`,
+      "prompt",
+      {},
+      "Prompt occurrence unavailable: conflicting retained evidence.",
+    )),
+  };
+}
+
 function projectInspectionSections(db: Database, row: InspectionAttemptRow): InspectionSections {
   const budget: InspectionProjectionBudget = {
     remaining: AGENT_RUN_INSPECTION_MAX_RECORDS,
@@ -2871,6 +2917,7 @@ function projectInspectionSections(db: Database, row: InspectionAttemptRow): Ins
   const turnSessionProjection = projectInspectionRecords(db, row, "turn_session", "turn_session", normalizeInspectionTurnSession, budget);
   const usageRecordsProjection = projectInspectionRecords(db, row, "usage", "usage", normalizeInspectionUsage, budget);
   const promptProjection = projectInspectionRecords(db, row, "prompt", "prompt", normalizeInspectionPrompt, budget);
+  const promptOccurrences = omitCollidingPromptOccurrences(row, promptProjection.records);
   const cortexProjection = projectInspectionRecords(db, row, "cortex", "cortex", normalizeCortexReceipt, budget);
   const councilProjection = projectInspectionRecords(db, row, "council", "council", normalizeCouncilReceipt, budget);
   const workspaceProjection = projectInspectionRecords(db, row, "workspace", "workspace", normalizeInspectionWorkspace, budget);
@@ -2885,6 +2932,7 @@ function projectInspectionSections(db: Database, row: InspectionAttemptRow): Ins
     ...turnSessionProjection.unavailableMarkers,
     ...usageRecordsProjection.unavailableMarkers,
     ...promptProjection.unavailableMarkers,
+    ...promptOccurrences.markers,
     ...cortexProjection.unavailableMarkers,
     ...councilProjection.unavailableMarkers,
     ...workspaceProjection.unavailableMarkers,
@@ -2920,8 +2968,8 @@ function projectInspectionSections(db: Database, row: InspectionAttemptRow): Ins
     turnSession: turnSessionProjection.records,
     usageEvidence: validUsage,
     usage: usageProjection(row, validUsage, usageRecordsProjection.invalidCount + duplicateUsageCount),
-    promptEvidence: promptProjection.records.map(({ renderCrossing: _renderCrossing, ...prompt }) => prompt),
-    renderCrossings: promptProjection.records.flatMap(({ renderCrossing }) => renderCrossing === undefined ? [] : [renderCrossing]),
+    promptEvidence: promptOccurrences.records.map(({ renderCrossing: _renderCrossing, ...prompt }) => prompt),
+    renderCrossings: promptOccurrences.records.flatMap(({ renderCrossing }) => renderCrossing === undefined ? [] : [renderCrossing]),
     cortexReceipts: cortexProjection.records,
     councilReceipts: councilProjection.records,
     workspaceAssociations: workspaceProjection.records,
@@ -2980,6 +3028,127 @@ function summaryFromRow(db: Database, row: InspectionAttemptRow): AgentRunInspec
   };
 }
 
+function inspectionWorkUsage(
+  usage: Readonly<{
+    providerDispatches: number;
+    providerInputTokens: number;
+    providerOutputTokens: number;
+    providerTotalTokens: number;
+    billedOutputTokens: number;
+    toolCalls: number;
+    workspaceOperations: number;
+    unsignedBoundaries: number;
+    receiveBytes: number;
+    publishedOutputBytes: number;
+  }>,
+): AgentWorkSegmentInspectionProjectionV1["segments"][number]["usage"] {
+  return Object.freeze({
+    providerDispatches: usage.providerDispatches,
+    providerInputTokens: usage.providerInputTokens,
+    providerOutputTokens: usage.providerOutputTokens,
+    providerTotalTokens: usage.providerTotalTokens,
+    billedOutputTokens: usage.billedOutputTokens,
+    toolCalls: usage.toolCalls,
+    workspaceOperations: usage.workspaceOperations,
+    unsignedBoundaries: usage.unsignedBoundaries,
+    receiveBytes: usage.receiveBytes,
+    publishedOutputBytes: usage.publishedOutputBytes,
+  });
+}
+
+function workSegmentsFromInspectionRow(
+  db: Database,
+  row: InspectionAttemptRow,
+): AgentWorkSegmentInspectionProjectionV1 | null {
+  const hasRecoveryAuthorityTable = db.query(
+    `SELECT 1 AS present
+       FROM sqlite_schema
+       WHERE type = 'table' AND name = 'agent_work_segment_recovery'`,
+  ).get() as { present: number } | null;
+  if (!hasRecoveryAuthorityTable) return null;
+
+  const authority = db.query(
+    `SELECT workspace_id
+       FROM agent_work_segment_recovery
+       WHERE user_id = ?
+         AND execution_id = ?
+         AND attempt_id = ?`,
+  ).get(row.user_id, row.turn_id, row.attempt_id) as { workspace_id: string } | null;
+  if (!authority?.workspace_id) return null;
+  const chain = readWorkSegmentInspectionChainV1({
+    db,
+    userId: row.user_id,
+    chatId: row.chat_id,
+    executionId: row.turn_id,
+    attemptId: row.attempt_id,
+    workspaceId: authority.workspace_id,
+  });
+  if (!chain) return null;
+  const segmentById = new Map(chain.segments.map((segment) => [segment.identity.segmentId, segment] as const));
+  return Object.freeze({
+    recovery: Object.freeze({
+      state: chain.recovery.state,
+      phaseId: chain.recovery.phaseId,
+      phaseIndex: chain.recovery.phaseIndex,
+      phaseOccurrence: chain.recovery.phaseOccurrence,
+      nextSegmentOrdinal: chain.recovery.nextSegmentOrdinal,
+      currentSegmentId: chain.recovery.currentSegmentId,
+      workspaceRevision: chain.recovery.workspaceRevision,
+      terminalCloseResult: chain.recovery.terminalCloseResult,
+      terminalBoundaryClass: chain.recovery.terminalBoundaryClass,
+      usage: Object.freeze({ ...inspectionWorkUsage(chain.recovery.usage), segments: chain.recovery.usage.segments }),
+    }),
+    segments: Object.freeze(chain.segments.map((segment) => Object.freeze({
+      identity: Object.freeze({
+        segmentId: segment.identity.segmentId,
+        phaseId: segment.identity.phaseId,
+        phaseIndex: segment.identity.phaseIndex,
+        phaseOccurrence: segment.identity.phaseOccurrence,
+        segmentOrdinal: segment.identity.segmentOrdinal,
+      }),
+      lifecycle: segment.lifecycle,
+      workspaceRevision: segment.workspaceRevision,
+      boundaryClass: segment.boundaryClass,
+      closeResult: segment.closeResult,
+      closedWorkspaceRevision: segment.closedWorkspaceRevision,
+      usage: inspectionWorkUsage(segment.usage),
+    }))),
+    dispatches: Object.freeze(chain.dispatches.map((dispatch) => Object.freeze({
+      dispatchId: dispatch.dispatchId,
+      segmentId: dispatch.segmentId,
+      dispatchOrdinal: dispatch.dispatchOrdinal,
+      lifecycle: dispatch.lifecycle,
+      toolMode: dispatch.toolMode,
+      budgetClass: dispatch.budgetClass,
+      workspaceRevision: dispatch.workspaceRevision,
+      settledWorkspaceRevision: dispatch.settledWorkspaceRevision,
+      boundaryClass: dispatch.boundaryClass,
+      usage: dispatch.usage ? inspectionWorkUsage(dispatch.usage) : null,
+    }))),
+    transitions: Object.freeze(chain.transitions.map((transition) => {
+      const handoff = transition.handoff;
+      return Object.freeze({
+        transitionId: transition.transitionId,
+        handoffId: handoff.handoffId,
+        transitionKind: handoff.transitionKind,
+        sourceSegment: Object.freeze({
+          segmentId: handoff.sourceSegment.segmentId,
+          phaseId: handoff.sourceSegment.phaseId,
+          phaseIndex: handoff.sourceSegment.phaseIndex,
+          phaseOccurrence: handoff.sourceSegment.phaseOccurrence,
+          segmentOrdinal: handoff.sourceSegment.segmentOrdinal,
+        }),
+        sourceWorkspaceRevision: handoff.sourceWorkspaceRevision,
+        targetPhaseId: handoff.targetPhaseId,
+        targetPhaseIndex: handoff.targetPhaseIndex,
+        targetPhaseOccurrence: handoff.targetPhaseOccurrence,
+        targetSegmentOrdinal: handoff.targetSegmentOrdinal,
+        cause: segmentById.get(handoff.sourceSegment.segmentId)?.boundaryClass ?? null,
+      });
+    })),
+  });
+}
+
 function detailFromRow(db: Database, row: InspectionAttemptRow): AgentRunInspectionDetailV1 {
   const summary = summaryFromRow(db, row);
   const sections = projectInspectionSections(db, row);
@@ -2997,6 +3166,7 @@ function detailFromRow(db: Database, row: InspectionAttemptRow): AgentRunInspect
     councilReceipts: sections.councilReceipts,
     workspaceAssociations: sections.workspaceAssociations,
     stop: sections.stop,
+    workSegments: workSegmentsFromInspectionRow(db, row),
     sectionAvailability: sections.sectionAvailability,
     retry: {
       allowed: false,
@@ -3030,7 +3200,7 @@ export function persistAgentRunInspectionInTransaction(
     || (input.previousAttemptId !== undefined && input.previousAttemptId !== null && previousAttemptId === null)
     || (input.targetMessageId !== undefined && input.targetMessageId !== null && targetMessageId === null)
   ) return null;
-  if (!ownsChatForActivity(userId, chatId)) return null;
+  if (!ownsChatForActivityInDb(db, userId, chatId)) return null;
   if (inspectionSourceDeletionExists(db, userId, attemptId)) return null;
 
   const lifecycle = normalizeInspectionPhase(input.lifecycle);
@@ -3502,6 +3672,7 @@ function deletedInspectionDetail(row: AgentInspectionSourceDeletionV1): AgentRun
     councilReceipts: [],
     workspaceAssociations: row.workspaceAssociations,
     stop: null,
+    workSegments: null,
     retry: {
       allowed: false,
       reason: "unavailable",

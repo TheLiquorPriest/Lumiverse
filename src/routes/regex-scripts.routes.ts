@@ -20,7 +20,15 @@ const APPLY_VALID_MACRO_MODES: Record<RegexMacroMode, true> = {
   escaped: true,
   after: true,
 };
-
+function runRegexAuthorityMutation<T>(userId: string, mutate: () => T): {
+  value: T;
+  presetAuthorityChanged: boolean;
+  presetAuthorities: ReturnType<typeof svc.resolveRegexPresetAuthorities>["presetAuthorities"];
+} {
+  const before = svc.captureRegexPresetAuthorities(userId);
+  const value = mutate();
+  return { value, ...svc.resolveRegexPresetAuthorities(userId, before) };
+}
 function isSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value);
 }
@@ -192,9 +200,10 @@ app.post("/", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
   const { active_preset_id, ...input } = body ?? {};
-  const result = svc.createRegexScript(userId, input, { activePresetId: active_preset_id ?? null });
+  const mutation = runRegexAuthorityMutation(userId, () => svc.createRegexScript(userId, input, { activePresetId: active_preset_id ?? null }));
+  const result = mutation.value;
   if (typeof result === "string") return c.json({ error: result }, 400);
-  return c.json(result, 201);
+  return c.json({ script: result, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities }, 201);
 });
 
 // POST /apply — apply display regex using the backend sandboxed regex engine.
@@ -344,7 +353,8 @@ app.post("/export", async (c) => {
 app.post("/import", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
-  return c.json(svc.importRegexScripts(userId, body, { activePresetId: body?.active_preset_id ?? null }), 201);
+  const mutation = runRegexAuthorityMutation(userId, () => svc.importRegexScripts(userId, body, { activePresetId: body?.active_preset_id ?? null }));
+  return c.json({ ...mutation.value, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities }, 201);
 });
 
 // PUT /reorder — bulk reorder
@@ -352,8 +362,8 @@ app.put("/reorder", async (c) => {
   const userId = c.get("userId");
   const { ids } = await c.req.json();
   if (!Array.isArray(ids)) return c.json({ error: "ids must be an array" }, 400);
-  svc.reorderRegexScripts(userId, ids);
-  return c.json({ success: true });
+  const mutation = runRegexAuthorityMutation(userId, () => svc.reorderRegexScripts(userId, ids));
+  return c.json({ success: true, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 // POST /bulk-delete — delete many scripts in one transaction
@@ -362,8 +372,8 @@ app.post("/bulk-delete", async (c) => {
   const { ids } = await c.req.json();
   if (!Array.isArray(ids)) return c.json({ error: "ids must be an array" }, 400);
   const stringIds = ids.filter((v: unknown): v is string => typeof v === "string" && v.length > 0);
-  const deleted = svc.deleteRegexScripts(userId, stringIds);
-  return c.json({ deleted, count: deleted.length });
+  const mutation = runRegexAuthorityMutation(userId, () => svc.deleteRegexScripts(userId, stringIds));
+  return c.json({ deleted: mutation.value, count: mutation.value.length, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 // POST /bulk-toggle — enable/disable an explicit selection in one transaction
@@ -372,10 +382,10 @@ app.post("/bulk-toggle", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   if (!Array.isArray(body?.ids)) return c.json({ error: "ids must be an array" }, 400);
   const stringIds = body.ids.filter((v: unknown): v is string => typeof v === "string" && v.length > 0);
-  const result = svc.toggleRegexScriptsByIds(userId, stringIds, !!body?.disabled, {
+  const mutation = runRegexAuthorityMutation(userId, () => svc.toggleRegexScriptsByIds(userId, stringIds, !!body?.disabled, {
     activePresetId: body?.active_preset_id ?? null,
-  });
-  return c.json(result);
+  }));
+  return c.json({ ...mutation.value, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 // GET /:id — get by ID
@@ -391,17 +401,19 @@ app.put("/:id", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
   const { active_preset_id, ...input } = body ?? {};
-  const result = svc.updateRegexScript(userId, c.req.param("id"), input, { activePresetId: active_preset_id ?? null });
+  const mutation = runRegexAuthorityMutation(userId, () => svc.updateRegexScript(userId, c.req.param("id"), input, { activePresetId: active_preset_id ?? null }));
+  const result = mutation.value;
   if (result === null) return c.json({ error: "Not found" }, 404);
   if (typeof result === "string") return c.json({ error: result }, 400);
-  return c.json(result);
+  return c.json({ script: result, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 // DELETE /:id — delete
 app.delete("/:id", (c) => {
   const userId = c.get("userId");
-  if (!svc.deleteRegexScript(userId, c.req.param("id"))) return c.json({ error: "Not found" }, 404);
-  return c.json({ success: true });
+  const mutation = runRegexAuthorityMutation(userId, () => svc.deleteRegexScript(userId, c.req.param("id")));
+  if (!mutation.value) return c.json({ error: "Not found" }, 404);
+  return c.json({ success: true, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 // POST /:id/duplicate — duplicate
@@ -463,9 +475,10 @@ app.post("/:id/report-evidence", async (c) => {
 app.put("/:id/toggle", async (c) => {
   const userId = c.get("userId");
   const { disabled, active_preset_id } = await c.req.json();
-  const script = svc.toggleRegexScript(userId, c.req.param("id"), !!disabled, { activePresetId: active_preset_id ?? null });
+  const mutation = runRegexAuthorityMutation(userId, () => svc.toggleRegexScript(userId, c.req.param("id"), !!disabled, { activePresetId: active_preset_id ?? null }));
+  const script = mutation.value;
   if (!script) return c.json({ error: "Not found" }, 404);
-  return c.json(script);
+  return c.json({ script, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 // POST /folders/toggle — bulk enable/disable every script in a folder
@@ -474,10 +487,10 @@ app.post("/folders/toggle", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const folder = typeof body?.folder === "string" ? body.folder : undefined;
   if (folder === undefined) return c.json({ error: "folder is required" }, 400);
-  const result = svc.toggleRegexScriptsByFolder(userId, folder, !!body?.disabled, {
+  const mutation = runRegexAuthorityMutation(userId, () => svc.toggleRegexScriptsByFolder(userId, folder, !!body?.disabled, {
     activePresetId: body?.active_preset_id ?? null,
-  });
-  return c.json(result);
+  }));
+  return c.json({ ...mutation.value, presetAuthorityChanged: mutation.presetAuthorityChanged, presetAuthorities: mutation.presetAuthorities });
 });
 
 export { app as regexScriptsRoutes };

@@ -46,6 +46,7 @@ export class PollinationsTextProvider extends OpenAICompatibleProvider {
     apiKeyRequired: false,
     modelListStyle: "openai",
     toolCalling: false,
+    requiredToolChoice: false,
     nativeToolContinuation: false,
     toolContinuationMode: "unsupported",
     toolsDisabledFinalization: false,
@@ -105,6 +106,7 @@ export class PollinationsTextProvider extends OpenAICompatibleProvider {
 
   /** Pollinations has no tool-calling wire; suppress all tool controls. */
   protected buildBody(request: GenerationRequest, stream: boolean): any {
+    if (request.toolMode === "required") throw new Error("Pollinations Text cannot require a host tool");
     const body = super.buildBody({ ...request, tools: undefined, toolMode: undefined }, stream);
     for (const key of ["tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"]) {
       delete body[key];

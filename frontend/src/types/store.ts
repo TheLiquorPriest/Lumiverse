@@ -34,6 +34,8 @@ export interface GenerationRequestAuthority {
   generationId: string | null
   abortController: AbortController | null
   status: GenerationRequestStatus
+  /** Stop was issued after an ambiguous dispatch ACK, but no canonical terminal is observable yet. */
+  stopPending?: boolean
   generationType: string
   targetMessageId: string | null
   targetSwipeId: number | null
@@ -1810,6 +1812,7 @@ export interface BreakdownCacheEntry {
     role?: string
     content?: string
     blockId?: string
+    promptOrder?: number
     extensionId?: string
     extensionName?: string
     messageCount?: number

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getDb } from "../db/connection";
 import type { Database } from "bun:sqlite";
 import type {
@@ -27,6 +28,8 @@ import { resolveConcreteConnectionV1, type ResolvedConcreteConnectionV1 } from "
 import * as regexScriptsService from "./regex-scripts.service";
 import { REGEX_LIMITS_V1 } from "../utils/regex-limits";
 import type { AgentRuntimeHostLimits } from "../types/agent-runtime";
+import { canonicalJsonValue, sameJsonValue } from "../utils/json-value";
+import { eventBus } from "../ws/bus";
 export const AGENT_RUNTIME_RESERVED_PRESET_KEYS = Object.freeze([
   "agent_config",
   "agent_config_revision",
@@ -1311,18 +1314,10 @@ function assertPortablePromptBlock(value: unknown, path: string): asserts value 
 function assertPortablePromptOrder(value: unknown): void {
   if (!Array.isArray(value)) return cognitionValidation("invalid_type", "preset.prompt_order", "must be an array");
 
-  const blockIds = new Set<string>();
   for (const [index, block] of value.entries()) {
     const path = `preset.prompt_order[${index}]`;
     assertPortablePromptBlock(block, path);
-
-    const blockId = block.id;
-    assertPortablePromptNonEmptyText(blockId, `${path}.id`);
-    const canonicalBlockId = blockId.trim();
-    if (blockIds.has(canonicalBlockId)) {
-      return cognitionValidation("duplicate_id", `${path}.id`, "duplicate block id");
-    }
-    blockIds.add(canonicalBlockId);
+    assertPortablePromptNonEmptyText(block.id, `${path}.id`);
 
     if (block.variables === undefined) continue;
     if (!Array.isArray(block.variables)) {
@@ -1573,6 +1568,51 @@ function readPortableRegexScripts(input: PortablePresetPayload): readonly Record
   if (!Array.isArray(value)) throw new Error("AGENT_RUNTIME_PORTABLE_REGEX_INVALID");
   return value;
 }
+
+const PORTABLE_PRESET_REGEX_SOURCE_FINGERPRINT = "lumiverse_portable_source_fingerprint";
+const PORTABLE_PRESET_REGEX_CURRENT_FINGERPRINT = "lumiverse_portable_current_fingerprint";
+
+function fingerprintPortableRegexScripts(scripts: readonly Record<string, unknown>[]): string {
+  return createHash("sha256").update(canonicalJsonValue(scripts)).digest("hex");
+}
+
+function regexFingerprintMetadata(script: Record<string, unknown>, key: string): unknown {
+  const metadata = script.metadata;
+  return typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)
+    ? (metadata as Record<string, unknown>)[key]
+    : undefined;
+}
+
+function currentPortableRegexFingerprint(scripts: readonly Record<string, unknown>[]): string {
+  const semanticScripts = scripts.map((script) => {
+    const metadata = typeof script.metadata === "object" && script.metadata !== null && !Array.isArray(script.metadata)
+      ? { ...(script.metadata as Record<string, unknown>) }
+      : {};
+    delete metadata[PORTABLE_PRESET_REGEX_SOURCE_FINGERPRINT];
+    delete metadata[PORTABLE_PRESET_REGEX_CURRENT_FINGERPRINT];
+    // Execution evidence is operational telemetry, not authored regex semantics.
+    delete metadata.regex_performance;
+    delete metadata.regex_evidence;
+    return { ...script, metadata };
+  });
+  return fingerprintPortableRegexScripts(semanticScripts);
+}
+
+export function portablePresetRegexScriptsMatchStored(
+  userId: string,
+  presetId: string,
+  scripts: readonly Record<string, unknown>[],
+): boolean {
+  const existing = regexScriptsService.exportRegexScripts(userId, { presetId }).scripts as readonly Record<string, unknown>[];
+  if (sameJsonValue(scripts, existing)) return true;
+  if (scripts.length !== existing.length || scripts.length === 0) return false;
+  const sourceFingerprint = fingerprintPortableRegexScripts(scripts);
+  const expectedCurrentFingerprint = currentPortableRegexFingerprint(existing);
+  return existing.every((script) => (
+    regexFingerprintMetadata(script, PORTABLE_PRESET_REGEX_SOURCE_FINGERPRINT) === sourceFingerprint
+    && regexFingerprintMetadata(script, PORTABLE_PRESET_REGEX_CURRENT_FINGERPRINT) === expectedCurrentFingerprint
+  ));
+}
 function remapPortableRegexReferences(value: unknown, ids: ReadonlyMap<string, string>, key?: string): unknown {
   if (typeof value === "string" && key && /^(?:script_id|scriptId|regex_script_id|regexScriptId|imported_script_id)$/.test(key)) {
     return ids.get(value) ?? ids.get(value.toLowerCase()) ?? value;
@@ -1589,6 +1629,7 @@ function remapPortableRegexReferences(value: unknown, ids: ReadonlyMap<string, s
 function preparePortableRegexScripts(
   scripts: readonly Record<string, unknown>[],
 ): Record<string, unknown>[] {
+  const sourceFingerprint = fingerprintPortableRegexScripts(scripts);
   const ids = new Map<string, string>();
   for (const [index, script] of scripts.entries()) {
     if (typeof script !== "object" || script === null || Array.isArray(script)) {
@@ -1619,6 +1660,13 @@ function preparePortableRegexScripts(
     withoutOwnership.script_id = localId ?? `portable_${crypto.randomUUID().replaceAll("-", "")}`;
     withoutOwnership.scope = "global";
     withoutOwnership.scope_id = null;
+    const sourceMetadata = typeof withoutOwnership.metadata === "object" && withoutOwnership.metadata !== null && !Array.isArray(withoutOwnership.metadata)
+      ? withoutOwnership.metadata as Record<string, unknown>
+      : {};
+    withoutOwnership.metadata = {
+      ...sourceMetadata,
+      [PORTABLE_PRESET_REGEX_SOURCE_FINGERPRINT]: sourceFingerprint,
+    };
     return remapPortableRegexReferences(withoutOwnership, ids) as Record<string, unknown>;
   });
 }
@@ -1644,13 +1692,43 @@ export function importPortablePresetRegexScriptsWithDb(
     presetId,
     presetName,
     [...scripts],
+    undefined,
+    { suppressPresetAuthorityMutation: true },
   );
   if (result.skipped !== 0 || result.imported !== scripts.length) {
     throw new Error(`AGENT_RUNTIME_PORTABLE_REGEX_INVALID:skipped=${result.skipped}`);
   }
+  const stored = regexScriptsService.exportRegexScripts(userId, { presetId }).scripts as readonly Record<string, unknown>[];
+  const currentFingerprint = currentPortableRegexFingerprint(stored);
+  const rows = db.query(
+    "SELECT id, metadata FROM regex_scripts WHERE user_id = ? AND preset_id = ?",
+  ).all(userId, presetId) as Array<{ id: string; metadata?: string }>;
+  const updateMetadata = db.query(
+    "UPDATE regex_scripts SET metadata = ? WHERE id = ? AND user_id = ? AND preset_id = ?",
+  );
+  for (const row of rows) {
+    let metadata: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(row.metadata ?? "{}");
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) metadata = parsed;
+    } catch {}
+    updateMetadata.run(
+      JSON.stringify({ ...metadata, [PORTABLE_PRESET_REGEX_CURRENT_FINGERPRINT]: currentFingerprint }),
+      row.id,
+      userId,
+      presetId,
+    );
+  }
   return result;
 }
 
+function withCommittedPortableImportEvents<T>(callback: () => T): T {
+  const buffered = eventBus.withBufferedEvents(callback);
+  for (const event of buffered.events) {
+    eventBus.emit(event.event, event.payload, event.userId, event.options);
+  }
+  return buffered.value;
+}
 export function importPortablePreset(userId: string, input: PortablePresetPayload): PortablePresetImportResult {
   const db = getDb();
   const preset = parsePortablePresetPayload(input);
@@ -1677,13 +1755,12 @@ export function importPortablePreset(userId: string, input: PortablePresetPayloa
       reasonCode: cognition.reasonCode ?? preparedBase.review.reasonCode,
     },
   };
-  const inserted = db.transaction(() => {
+  return withCommittedPortableImportEvents(() => db.transaction(() => {
     const stored = insertPresetWithDb(db, userId, preset, prepared.config, prepared.review, undefined, hasLegacyCognition ? legacyCognition : undefined);
     importPortablePresetRegexScriptsWithDb(db, userId, stored.id, preset.name, preset);
-    return stored;
-  })();
-  const row = assertPresetOwned(db, userId, inserted.id);
-  return { preset: rowToPreset(row, inserted.projection), agent_config: inserted.projection.config, agent_config_review: inserted.projection.review };
+    const row = assertPresetOwned(db, userId, stored.id);
+    return { preset: rowToPreset(row, stored.projection), agent_config: stored.projection.config, agent_config_review: stored.projection.review };
+  })());
 }
 
 export interface PortablePresetRuntimeImportInput {
@@ -1698,7 +1775,7 @@ export function importPortablePresetRuntime(userId: string, input: PortablePrese
   const db = getDb();
   const preset = parsePortablePresetPayload(input.preset);
   const envelope = parsePortablePresetRuntimeEnvelope(input.agentRuntime);
-  return db.transaction(() => {
+  return withCommittedPortableImportEvents(() => db.transaction(() => {
     const configIngress = envelope.agentConfig ? parsePortableAgentConfigIngress(envelope.agentConfig) : null;
     const portable = configIngress?.config ?? toPortableAgentConfigV1(createDisabledAgentConfigV2());
     const hasLegacyCognition = configIngress?.hasLegacyCognition === true;
@@ -1733,7 +1810,7 @@ export function importPortablePresetRuntime(userId: string, input: PortablePrese
     importPortablePresetRegexScriptsWithDb(db, userId, stored.id, preset.name, preset);
     const row = assertPresetOwned(db, userId, stored.id);
     return { preset: rowToPreset(row, stored.projection), agent_config: stored.projection.config, agent_config_review: stored.projection.review };
-  })();
+  })());
 }
 
 function copyRegexCompanionsWithDb(db: Database, userId: string, sourcePresetId: string, targetPresetId: string): string[] {
@@ -1828,16 +1905,29 @@ export function duplicatePresetWithAgentConfig(userId: string, sourcePresetId: s
     const targetPresetRevision = Number(targetPreset.cache_revision) || 0;
     let targetAuthoredRuntimeEnvelope = authoredRuntimeEnvelope;
     if (authoredRuntimeEnvelope !== "{}") {
-          const parsedEnvelope = parseJsonObject(authoredRuntimeEnvelope);
-          targetAuthoredRuntimeEnvelope = JSON.stringify({
-            ...parsedEnvelope,
-            // Keep exact Loom source bindings across duplication. A new preset
-            // revision must surface stale references for explicit repair.
-            config: targetConfig,
-          });
-        }
+      const parsedEnvelope = parseJsonObject(authoredRuntimeEnvelope);
+      targetAuthoredRuntimeEnvelope = JSON.stringify({
+        ...parsedEnvelope,
+        // Keep exact Loom source bindings across duplication. A new preset
+        // revision must surface stale references for explicit repair.
+        config: targetConfig,
+      });
+    }
     db.query("UPDATE preset_agent_configs SET config_json = ? WHERE user_id = ? AND preset_id = ?")
       .run(targetAuthoredRuntimeEnvelope, userId, inserted.id);
+
+    const nextTargetPresetRevision = Math.max(targetPresetRevision, Number(source.cache_revision) || 0) + 1;
+    const authorityAdvance = db.query(
+      "UPDATE presets SET cache_revision = ?, updated_at = ? WHERE id = ? AND user_id = ? AND cache_revision = ?",
+    ).run(nextTargetPresetRevision, Math.floor(Date.now() / 1000), inserted.id, userId, targetPresetRevision);
+    if (authorityAdvance.changes !== 1) throw new Error("PRESET_REVISION_CONFLICT");
+    quarantineAgentConfigForPresetRevisionWithDb(
+      db,
+      userId,
+      inserted.id,
+      nextTargetPresetRevision,
+      parseJsonArray(targetPreset.prompt_order),
+    );
     const copiedRegexScriptIds = copyRegexCompanionsWithDb(db, userId, sourcePresetId, inserted.id);
     const row = assertPresetOwned(db, userId, inserted.id);
     const projection = getPresetAgentConfig(userId, inserted.id)!;
@@ -1921,6 +2011,32 @@ function normalizeDraftConfig(raw: unknown, taskTemplates: readonly unknown[]): 
   return input;
 }
 
+function parseAuthoredCognitionEnvelope(raw: unknown): Record<string, unknown> | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed === "" || trimmed === "{}") return null;
+  }
+  if (typeof raw !== "string" || UTF8_ENCODER.encode(raw).byteLength > PORTABLE_PRESET_FIELDS_MAX_BYTES) {
+    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
+  }
+  try {
+    const authored = parsed as Record<string, unknown>;
+    assertExactObjectKeys(authored, ["config"], "authored agent runtime", ["taskTemplates", "reviewAcknowledgements"]);
+    return authored;
+  } catch {
+    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
+  }
+}
 function readAuthoredCognitionSource(
   db: Database,
   userId: string,
@@ -1934,21 +2050,8 @@ function readAuthoredCognitionSource(
     ? db.query("SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?").get(userId, presetId) as { config_json?: unknown } | null
     : null;
   if (!preset || !row) return null;
-  const rawConfig = row.config_json;
-  if (rawConfig === undefined || rawConfig === null || (typeof rawConfig === "string" && rawConfig.trim() === "")) return null;
-  if (typeof rawConfig !== "string" || UTF8_ENCODER.encode(rawConfig).byteLength > PORTABLE_PRESET_FIELDS_MAX_BYTES) {
-    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawConfig);
-  } catch {
-    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("AGENT_RUNTIME_PORTABLE_COGNITION_INVALID");
-  }
-  const authored = parsed as Record<string, unknown>;
+  const authored = parseAuthoredCognitionEnvelope(row.config_json);
+  if (!authored) return null;
   const authoredConfig = authored.config;
   const hasCanonicalRuntimePolicy = authoredConfig !== null
     && typeof authoredConfig === "object"
@@ -1960,7 +2063,6 @@ function readAuthoredCognitionSource(
     && !hasCanonicalRuntimePolicy
   ) return null;
   try {
-    assertExactObjectKeys(authored, ["config"], "authored agent runtime", ["taskTemplates", "reviewAcknowledgements"]);
     const taskTemplates = normalizeDraftList(authored.taskTemplates, "taskTemplates")
       .map((template) => parseTaskTemplate(template));
     const authoredConfig = normalizeDraftConfig(authored.config, taskTemplates);
@@ -1997,6 +2099,34 @@ export interface AgentPresetResponseCognitionSourceV1 extends AgentPresetCogniti
   readonly conservativeExcludedBlockIds: readonly string[];
 }
 
+function resolveLegacyLoomSourceOrder(
+  promptOrder: readonly unknown[],
+  blockId: string,
+  blockRevision: number,
+  explicitOrder: unknown,
+): number | null {
+  const exactOccurrence = (order: number): boolean => {
+    const value = promptOrder[order];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const row = value as Record<string, unknown>;
+    return row.id === blockId
+      && row.marker !== "category"
+      && promptBlockRevision(value) === blockRevision;
+  };
+  if (explicitOrder !== undefined) {
+    if (!Number.isSafeInteger(explicitOrder) || (explicitOrder as number) < 0) return null;
+    return exactOccurrence(explicitOrder as number) ? explicitOrder as number : null;
+  }
+  let matchedOrder: number | null = null;
+  for (let order = 0; order < promptOrder.length; order += 1) {
+    const value = promptOrder[order];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+    if ((value as Record<string, unknown>).id !== blockId) continue;
+    if (matchedOrder !== null) return null;
+    matchedOrder = order;
+  }
+  return matchedOrder !== null && exactOccurrence(matchedOrder) ? matchedOrder : null;
+}
 function responseLegacyPolicyEntry(
   bucket: "workPolicy" | "workspaceUsage" | "completionCriteria" | "renderPolicy",
   ref: unknown,
@@ -2009,12 +2139,10 @@ function responseLegacyPolicyEntry(
   const blockId = typeof raw.blockId === "string" && raw.blockId.length > 0 ? raw.blockId : null;
   const expectedPresetRevision = Number(raw.expectedPresetRevision);
   const expectedBlockRevision = Number(raw.expectedBlockRevision);
-  if (!blockId || !Number.isSafeInteger(expectedPresetRevision) || expectedPresetRevision < 0
+  if (!blockId || !Number.isSafeInteger(expectedPresetRevision) || expectedPresetRevision !== presetRevision
     || !Number.isSafeInteger(expectedBlockRevision) || expectedBlockRevision < 0) return null;
-  const order = promptOrder.findIndex((candidate) => typeof candidate === "object" && candidate !== null && !Array.isArray(candidate)
-    && (candidate as Record<string, unknown>).id === blockId);
-  const explicitOrder = Number(raw.promptOrder);
-  const sourceOrder = Number.isSafeInteger(explicitOrder) && explicitOrder >= 0 ? explicitOrder : order >= 0 ? order : 0;
+  const sourceOrder = resolveLegacyLoomSourceOrder(promptOrder, blockId, expectedBlockRevision, raw.promptOrder);
+  if (sourceOrder === null) return null;
   const destination = bucket === "completionCriteria" ? "completion_handoff" : bucket === "renderPolicy" ? "render" : "root_work";
   const checkpoint = bucket === "completionCriteria" ? "PREPARE_COMMIT" : bucket === "renderPolicy" ? "RENDER" : "WORK";
   return {
@@ -2038,14 +2166,10 @@ function responseLegacyPhaseSource(
   const blockId = typeof source.blockId === "string" && source.blockId.length > 0 ? source.blockId : null;
   const expectedPresetRevision = Number(source.presetRevision ?? source.expectedPresetRevision);
   const expectedBlockRevision = Number(source.blockRevision ?? source.expectedBlockRevision);
-  if (!blockId || !Number.isSafeInteger(expectedPresetRevision) || expectedPresetRevision < 0
+  if (!blockId || !Number.isSafeInteger(expectedPresetRevision) || expectedPresetRevision !== presetRevision
     || !Number.isSafeInteger(expectedBlockRevision) || expectedBlockRevision < 0) return null;
-  const explicitOrder = Number(source.promptOrder);
-  const foundOrder = promptOrder.findIndex((candidate) => typeof candidate === "object" && candidate !== null && !Array.isArray(candidate)
-    && (candidate as Record<string, unknown>).id === blockId);
-  const order = Number.isSafeInteger(explicitOrder) && explicitOrder >= 0
-    ? explicitOrder
-    : foundOrder >= 0 ? foundOrder : 0;
+  const order = resolveLegacyLoomSourceOrder(promptOrder, blockId, expectedBlockRevision, source.promptOrder);
+  if (order === null) return null;
   return {
     kind: "loom_block",
     blockId,
@@ -2309,16 +2433,21 @@ export function getAgentRuntimeSharedDraft(userId: string, presetId: string): Ag
   const preset = db.query("SELECT cache_revision FROM presets WHERE user_id = ? AND id = ?").get(userId, presetId) as { cache_revision?: unknown } | null;
   if (!preset) return null;
   const projection = getPresetAgentConfig(userId, presetId);
-  const config = projection?.config ?? createDisabledAgentConfigV2();
   const review = projection?.review ?? { state: "ready" as const, reasonCode: null, unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false };
   const configRevision = projection?.configRevision ?? 0;
   const bindings = projection?.bindings ?? [];
   const authoredRow = tableExists(db, "preset_agent_configs")
     ? db.query("SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?").get(userId, presetId) as { config_json?: unknown } | null
     : null;
-  const authored = parseJsonObject(authoredRow?.config_json);
-  const taskTemplates = Array.isArray(authored.taskTemplates) ? authored.taskTemplates.slice(0, 128) : [];
-  const reviewAcknowledgements = Array.isArray(authored.reviewAcknowledgements)
+  const authored = parseAuthoredCognitionEnvelope(authoredRow?.config_json);
+  const taskTemplates = normalizeDraftList(authored?.taskTemplates, "taskTemplates")
+    .map((template) => parseTaskTemplate(template));
+  const config = parseAgentConfigV2(normalizeDraftConfig(
+    projection?.config ?? createDisabledAgentConfigV2(),
+    taskTemplates,
+  ));
+  parsePortableTaskGraph(taskTemplates, config);
+  const reviewAcknowledgements = Array.isArray(authored?.reviewAcknowledgements)
     ? authored.reviewAcknowledgements.filter((value): value is string => typeof value === "string").slice(0, 128)
     : [];
   return {
@@ -2414,15 +2543,6 @@ function editorReview(
         acknowledged: acknowledgements.includes(importId),
       });
     }
-  } else if (items.length === 0 && review.state !== "ready") {
-    const reasonCode = review.reasonCode ?? review.state;
-    items.push({
-      id: `review:${reasonCode}`,
-      kind: "disabled_import",
-      reasonCode,
-      action: { kind: "acknowledge" },
-      acknowledged: review.state === "review_required" && acknowledgements.includes(`review:${reasonCode}`),
-    });
   }
   return { ...review, revision, items };
 }
@@ -2437,25 +2557,24 @@ function promptBlockRevision(value: unknown): number {
   }
   return 1;
 }
-
+function promptBlockSemanticValue(value: unknown): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const { revision: _revision, ...semantic } = value as Record<string, unknown>;
+  return semantic;
+}
 function loomReferencesMatchPromptOrder(
   config: AgentConfigV2,
   presetRevision: number,
   promptOrder: readonly unknown[],
 ): boolean {
-  const blocks = new Map<string, { readonly index: number; readonly revision: number }>();
-  for (const [index, value] of promptOrder.entries()) {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
-    const id = (value as Record<string, unknown>).id;
-    if (typeof id !== "string" || id.length === 0 || blocks.has(id)) return false;
-    blocks.set(id, { index, revision: promptBlockRevision(value) });
-  }
   const sourceMatches = (source: { readonly blockId: string; readonly presetRevision: number; readonly blockRevision: number; readonly promptOrder: number }): boolean => {
-    const block = blocks.get(source.blockId);
-    return block !== undefined
+    const value = promptOrder[source.promptOrder];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+    const row = value as Record<string, unknown>;
+    return row.id === source.blockId
+      && row.marker !== "category"
       && source.presetRevision === presetRevision
-      && source.promptOrder === block.index
-      && source.blockRevision === block.revision;
+      && source.blockRevision === promptBlockRevision(value);
   };
   const runtimePolicy = config.runtimePolicy;
   if (!runtimePolicy) return true;
@@ -2480,30 +2599,43 @@ function rebaseValidLoomSourcesToCommittedRevision(
   config: AgentConfigV2,
   expectedPresetRevision: number,
   committedPresetRevision: number,
+  persistedPromptOrder: readonly unknown[],
   promptOrder: readonly unknown[],
 ): AgentConfigV2 {
   const runtimePolicy = config.runtimePolicy;
   if (!runtimePolicy) return config;
   if (!Number.isSafeInteger(committedPresetRevision) || committedPresetRevision < 0) return config;
-  const blocks = new Map<string, { readonly index: number; readonly revision: number; readonly category: boolean }>();
-  for (const [index, value] of promptOrder.entries()) {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+  type IndexedPromptBlock = {
+    readonly id: string;
+    readonly revision: number;
+    readonly category: boolean;
+    readonly value: unknown;
+  };
+  const indexBlocks = (values: readonly unknown[]): Array<IndexedPromptBlock | null> => values.map((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
     const row = value as Record<string, unknown>;
-    const id = row.id;
-    if (typeof id !== "string" || id.length === 0 || blocks.has(id)) continue;
-    blocks.set(id, {
-      index,
+    if (typeof row.id !== "string" || row.id.length === 0) return null;
+    return {
+      id: row.id,
       revision: promptBlockRevision(value),
       category: row.marker === "category",
-    });
-  }
+      value: promptBlockSemanticValue(value),
+    };
+  });
+  const persistedBlocks = indexBlocks(persistedPromptOrder);
+  const blocks = indexBlocks(promptOrder);
   const rebaseSource = (source: LoomPolicySourceV1): LoomPolicySourceV1 => {
-    const block = blocks.get(source.blockId);
-    if (!block || block.category) return source;
-    if (source.blockRevision !== block.revision || source.promptOrder !== block.index) return source;
-    if (source.presetRevision !== expectedPresetRevision && source.presetRevision !== committedPresetRevision) return source;
-    if (source.presetRevision === committedPresetRevision) return source;
-    return { ...source, presetRevision: committedPresetRevision };
+    const block = blocks[source.promptOrder];
+    if (!block || block.id !== source.blockId || block.category) return source;
+    if (source.blockRevision !== block.revision) return source;
+    if (source.presetRevision !== expectedPresetRevision) return source;
+    const persisted = persistedBlocks[source.promptOrder];
+    const unchanged = persisted !== undefined
+      && persisted !== null
+      && persisted.id === block.id
+      && persisted.revision === block.revision
+      && sameJsonValue(persisted.value, block.value);
+    return unchanged ? { ...source, presetRevision: committedPresetRevision } : source;
   };
   const loomPolicy = runtimePolicy.loomPolicy == null
     ? runtimePolicy.loomPolicy
@@ -2532,11 +2664,11 @@ function rebaseValidLoomSourcesToCommittedRevision(
 }
 
 /**
- * Prompt edits advance the preset revision. Strict Loom bucket references are
- * immutable provenance, so a prompt mutation that no longer matches those
- * references quarantines the normalized config instead of leaving it ready.
+ * Ordinary preset revision advances invalidate immutable Loom provenance.
+ * Quarantine the normalized config whenever any exact source no longer
+ * matches the newly committed preset and prompt-block revisions.
  */
-export function quarantineAgentConfigForPromptEditWithDb(
+export function quarantineAgentConfigForPresetRevisionWithDb(
   db: Database,
   userId: string,
   presetId: string,
@@ -2579,6 +2711,12 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
     const actualPresetRevision = Number(preset.cache_revision) || 0;
     if (expectedPresetRevision !== actualPresetRevision) throw new Error("PRESET_REVISION_CONFLICT");
     if (!Number.isSafeInteger(draft.expectedConfigRevision) || (draft.expectedConfigRevision as number) < 0) throw new Error("AGENT_CONFIG_REVISION_REQUIRED");
+    const currentProjection = readNormalizedProjection(db, userId, presetId);
+    const inheritedReview = currentProjection?.review ?? { state: "ready" as const, reasonCode: null, unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false };
+    const actualConfigRevision = currentProjection?.configRevision ?? 0;
+    if (draft.expectedConfigRevision !== actualConfigRevision) {
+      throw new AgentConfigRevisionConflictError(presetId, draft.expectedConfigRevision as number, actualConfigRevision);
+    }
     const taskTemplates = normalizeDraftList(draft.taskTemplates, "taskTemplates");
     const config = normalizeDraftConfig(draft.config, taskTemplates);
     const slotBindings = (draft.slotBindings ?? []).map((binding, index) => {
@@ -2593,11 +2731,6 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
     });
     const promptOrder = draft.promptOrder;
     if (!Array.isArray(promptOrder)) throw new Error("promptOrder must be an array");
-    const now = Math.floor(Date.now() / 1000);
-    const promptResult = db.query("UPDATE presets SET prompt_order = ?, updated_at = ?, cache_revision = cache_revision + 1 WHERE id = ? AND user_id = ? AND cache_revision = ?").run(JSON.stringify(promptOrder), now, presetId, userId, actualPresetRevision);
-    if (promptResult.changes !== 1) throw new Error("PRESET_REVISION_CONFLICT");
-    const currentProjection = readNormalizedProjection(db, userId, presetId);
-    const inheritedReview = currentProjection?.review ?? { state: "ready" as const, reasonCode: null, unresolvedSlotIds: [], staleSlotIds: [], acknowledged: false };
     const persistedAuthoredRow = db.query(
       "SELECT config_json FROM preset_agent_configs WHERE user_id = ? AND preset_id = ?",
     ).get(userId, presetId) as { config_json?: unknown } | null;
@@ -2606,13 +2739,53 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
       ? persistedAuthored.reviewAcknowledgements.filter((value): value is string => typeof value === "string")
       : [];
     const parsedConfig = parseAgentConfigV2(config);
-    const committedPresetRevision = actualPresetRevision + 1;
-    const committedConfig = rebaseValidLoomSourcesToCommittedRevision(
-      parsedConfig,
-      actualPresetRevision,
-      committedPresetRevision,
-      promptOrder,
-    );
+    const persistedPromptOrder = parseJsonArray(preset.prompt_order);
+    const promptOrderChanged = !sameJsonValue(promptOrder, persistedPromptOrder);
+    const currentConfig = currentProjection?.config ?? createDisabledAgentConfigV2();
+    const currentBindings = (currentProjection?.bindings ?? []).map(({ slotId, connectionId }) => ({ slotId, connectionId })).sort((a, b) => a.slotId.localeCompare(b.slotId));
+    const requestedBindings = slotBindings.map(({ slotId, connectionId }) => ({ slotId, connectionId })).sort((a, b) => a.slotId.localeCompare(b.slotId));
+    const persistedTaskTemplates = Array.isArray(persistedAuthored.taskTemplates) ? persistedAuthored.taskTemplates.slice(0, 128) : [];
+    const persistedReviewAcknowledgementsCanonical = [...persistedReviewAcknowledgements].sort();
+    const configPayloadUnchanged = sameJsonValue(parsedConfig, currentConfig)
+      && sameJsonValue(requestedBindings, currentBindings)
+      && sameJsonValue(taskTemplates, persistedTaskTemplates);
+    let trueNoOp = false;
+    if (!promptOrderChanged && configPayloadUnchanged && inheritedReview.state === "ready") {
+      const requestedAcknowledgements = normalizeReviewAcknowledgements(draft.reviewAcknowledgements, reviewItemIds(inheritedReview));
+      trueNoOp = sameJsonValue(requestedAcknowledgements, persistedReviewAcknowledgementsCanonical);
+    }
+    if (trueNoOp) {
+      const projection = currentProjection ?? {
+        config: currentConfig,
+        review: inheritedReview,
+        configRevision: actualConfigRevision,
+        bindingRevision: 0,
+        bindings: [],
+      };
+      const editor = {
+        presetId,
+        presetRevision: actualPresetRevision,
+        configRevision: actualConfigRevision,
+        config: projection.config,
+        review: editorReview(projection.review, projection.configRevision, persistedReviewAcknowledgements),
+        slotBindings: projection.bindings,
+        taskTemplates: persistedTaskTemplates,
+        hostCeilings: getAgentRuntimeHostLimits(),
+        reviewAcknowledgements: persistedReviewAcknowledgements,
+      };
+      return { preset: rowToPreset(preset, projection), editor };
+    }
+    const submittedLoomReferenceRepairRequired = promptOrderChanged
+      && !loomReferencesMatchPromptOrder(parsedConfig, actualPresetRevision, persistedPromptOrder);
+    const committedPresetRevision = promptOrderChanged ? actualPresetRevision + 1 : actualPresetRevision;
+    const committedConfig = promptOrderChanged
+      ? rebaseValidLoomSourcesToCommittedRevision(parsedConfig, actualPresetRevision, committedPresetRevision, persistedPromptOrder, promptOrder)
+      : parsedConfig;
+    if (promptOrderChanged) {
+      const now = Math.floor(Date.now() / 1000);
+      const promptResult = db.query("UPDATE presets SET prompt_order = ?, updated_at = ?, cache_revision = cache_revision + 1 WHERE id = ? AND user_id = ? AND cache_revision = ?").run(JSON.stringify(promptOrder), now, presetId, userId, actualPresetRevision);
+      if (promptResult.changes !== 1) throw new Error("PRESET_REVISION_CONFLICT");
+    }
     const connectionCache = new Map<string, ResolvedConcreteConnectionV1 | null>();
     const capabilityMismatchSlotIds: string[] = [];
     parsePortableTaskGraph(taskTemplates, committedConfig);
@@ -2630,18 +2803,20 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
       && STICKY_IMPORT_REVIEW_REASON_CODES[inheritedReview.reasonCode] === true;
     const candidateReview = {
       ...inheritedReview,
-      state: repairStillRequired
+      state: submittedLoomReferenceRepairRequired || repairStillRequired
         ? "repair_required" as const
         : capabilityMismatchSlotIds.length > 0 || preserveReview
           ? "review_required" as const
           : "ready" as const,
-      reasonCode: repairStillRequired
-        ? inheritedReview.reasonCode
-        : preserveReview
+      reasonCode: submittedLoomReferenceRepairRequired
+        ? "loom_reference_repair_required"
+        : repairStillRequired
           ? inheritedReview.reasonCode
-          : capabilityMismatchSlotIds.length > 0
-            ? "capability_mismatch"
-            : null,
+          : preserveReview
+            ? inheritedReview.reasonCode
+            : capabilityMismatchSlotIds.length > 0
+              ? "capability_mismatch"
+              : null,
       unresolvedSlotIds: slotBindings.filter((binding) => binding.connectionId === null).map((binding) => binding.slotId),
       staleSlotIds: capabilityMismatchSlotIds,
     };
@@ -2687,7 +2862,7 @@ export function saveAgentRuntimeSharedDraft(userId: string, presetId: string, dr
     const updated = assertPresetOwned(db, userId, presetId);
     const editor = {
       presetId,
-      presetRevision: actualPresetRevision + 1,
+      presetRevision: Number(updated.cache_revision) || actualPresetRevision,
       configRevision: projection.configRevision,
       config: projection.config,
       review: editorReview(projection.review, projection.configRevision, reviewAcknowledgements),

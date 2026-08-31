@@ -9,6 +9,7 @@ import {
   inspectLoomPromptPolicies,
   normalizeLoomPolicyBucketsV1,
   parseCognitionGraph,
+  parseCognitionSourceSnapshot,
   parseCognitionPredicate,
   parseLoomPromptInspectionV1,
   parseTaskTemplate,
@@ -19,16 +20,17 @@ import {
   COGNITION_MAX_PREDICATE_DEPTH,
   COGNITION_MAX_STRING_BYTES,
   type CognitionEvaluationContextV1,
+  type CognitionPolicyRefsV1,
   type LoomPolicyBucketsV1,
 } from "../types/agent-cognition";
 
-const emptyPolicy = Object.freeze({ workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] });
+const emptyPolicy: CognitionPolicyRefsV1 = Object.freeze({ workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [] });
 
 function source(blocks: Array<{ blockId: string; revision: number; promptOrder: number }> = []) {
   return { presetRevision: 7, blocks };
 }
 
-function graph(templates: unknown[] = [], policies: unknown = emptyPolicy) {
+function graph(templates: unknown[] = [], policies: CognitionPolicyRefsV1 = emptyPolicy) {
   return { version: AGENT_COGNITION_VERSION, policies, templates };
 }
 
@@ -223,6 +225,95 @@ describe("Loom policy inspection", () => {
     expect(response.effectiveEntryIds).toEqual([]);
     expect(response.items.every((item) => item.outcome.status === "omitted")).toBe(true);
     expect(response.responseOmission?.omittedEntryIds).toEqual(["required", "optional"]);
+  });
+
+  test("round-trips and binds repeated block IDs to distinct prompt-order occurrences", () => {
+    const duplicateIdSource = source([
+      { blockId: "same", revision: 3, promptOrder: 0 },
+      { blockId: "same", revision: 3, promptOrder: 1 },
+    ]);
+    expect(parseCognitionSourceSnapshot(duplicateIdSource).blocks.map((entry) => [entry.blockId, entry.promptOrder])).toEqual([
+      ["same", 0],
+      ["same", 1],
+    ]);
+    expectCode(() => parseCognitionSourceSnapshot(source([
+      { blockId: "same", revision: 3, promptOrder: 0 },
+      { blockId: "same", revision: 3, promptOrder: 0 },
+    ])), "duplicate_id");
+
+    const raw = {
+      version: 1,
+      workPolicy: [
+        loomEntry("occurrence-zero", "workPolicy", { blockId: "same", promptOrder: 0 }),
+        loomEntry("occurrence-one", "workPolicy", { blockId: "same", promptOrder: 1 }),
+      ],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    };
+    const normalized = normalizeLoomPolicyBucketsV1(raw, duplicateIdSource);
+    const inspected = inspectLoomPromptPolicies(normalized, {
+      checkpoint: "WORK",
+      surface: "WORK",
+      blocks: [block("same", "Occurrence zero", 0), block("same", "Occurrence one", 1)],
+      evaluation: evaluation(),
+    });
+    expect(inspected.effectiveEntryIds).toEqual(["occurrence-zero", "occurrence-one"]);
+    expect(inspected.items.filter((item) => item.outcome.status === "included").map((item) => item.effectiveText)).toEqual(["Occurrence zero", "Occurrence one"]);
+
+    const occurrencePolicyRefs: CognitionPolicyRefsV1 = {
+      workPolicy: [
+        { blockId: "same", expectedPresetRevision: 7, expectedBlockRevision: 3, promptOrder: 0 },
+        { blockId: "same", expectedPresetRevision: 7, expectedBlockRevision: 3, promptOrder: 1 },
+      ],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    };
+    expect(parseCognitionGraph(graph([], occurrencePolicyRefs)).policies).toEqual(occurrencePolicyRefs);
+    expectCode(() => parseCognitionGraph(graph([], {
+      ...occurrencePolicyRefs,
+      workPolicy: [occurrencePolicyRefs.workPolicy[0]!, occurrencePolicyRefs.workPolicy[0]!],
+    })), "duplicate_id");
+    const frozen = freezeCognitionGraph(graph([], occurrencePolicyRefs), duplicateIdSource);
+    expect(frozen.policies).toEqual(occurrencePolicyRefs);
+    expect(frozen.sourceRevisions.blockRevisions).toEqual([
+      { blockId: "same", revision: 3, promptOrder: 0 },
+      { blockId: "same", revision: 3, promptOrder: 1 },
+    ]);
+
+    const conflict = normalizeLoomPolicyBucketsV1({
+      ...raw,
+      workPolicy: [
+        { ...loomEntry("conflict-a", "workPolicy", { blockId: "same", promptOrder: 0, required: false }) },
+        {
+          ...loomEntry("conflict-b", "workPolicy", { blockId: "same", promptOrder: 0, required: false }),
+          source: { ...(loomEntry("unused", "workPolicy", { blockId: "same", promptOrder: 0 }).source as Record<string, unknown>), blockRevision: 4 },
+        },
+      ],
+    }, duplicateIdSource);
+    const conflictInspection = inspectLoomPromptPolicies(conflict, {
+      checkpoint: "WORK",
+      surface: "WORK",
+      blocks: [block("same", "Occurrence zero", 0)],
+      evaluation: evaluation(),
+    });
+    expect(conflictInspection.items.map((item) => item.outcome)).toEqual([
+      { status: "rejected", reason: "invalid_source" },
+      { status: "rejected", reason: "invalid_source" },
+    ]);
+
+    const denied = inspectLoomPromptPolicies(normalized, {
+      checkpoint: "WORK",
+      surface: "WORK",
+      blocks: [block("same", "Occurrence zero", 0), block("other", "Wrong occurrence", 1)],
+      evaluation: evaluation(),
+    });
+    expect(denied.items.map((item) => item.outcome.status)).toEqual(["included", "rejected"]);
+    expectCode(() => normalizeLoomPolicyBucketsV1({
+      ...raw,
+      workPolicy: [{ ...loomEntry("wrong-category", "workPolicy", { blockId: "same", promptOrder: 0 }), destination: "render" }],
+    }, duplicateIdSource), "invalid_value");
   });
 
   test("round-trips inspection evidence", () => {

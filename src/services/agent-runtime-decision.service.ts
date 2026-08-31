@@ -47,12 +47,11 @@ import {
   isAgentRuntimeMode,
 } from "../types/agent-runtime-decision";
 import type { AgentConfigV2, AgentRuntimePolicyV1 } from "../types/agents";
-import type { LoomPromptInspectionBlockV1, LoomPromptInspectionV1, LoomResponsePolicyOmissionV1 } from "../types/agent-cognition";
+import type { LoomPromptInspectionV1, LoomResponsePolicyOmissionV1 } from "../types/agent-cognition";
 import { parseAgentConfigV2, parseAgentRuntimePolicyV1 } from "../types/agents";
 import { LOOM_POLICY_VERSION } from "../types/agent-cognition";
 import { isTemporaryChatMetadata } from "../types/chat";
 import { inspectLoomPromptPolicies } from "./agent-cognition.service";
-import { listPromptBlocks } from "./presets.service";
 import {
   canonicalizeAgenticReadinessVectorV1,
   hashAgenticReadinessVectorV1,
@@ -745,24 +744,12 @@ function capabilityIsPresent(capabilities: Readonly<Record<string, unknown>>, re
       || capabilities.supportsToolCalling === true;
   }
   if (requirement === "native_tool_continuation") {
-    /*
-     * Agentic WORK supports both provider-native continuation carriers and
-     * the bounded legacy assistant/user-result transcript. The provider
-     * contract is explicit: an unsupported mode is the only rejection.
-     */
-    const mode = capabilities.toolContinuationMode
-      ?? capabilities.tool_continuation_mode;
-    if (mode === "native") {
-      return (
-        (capabilities.nativeToolContinuation === true
-          || capabilities.native_tool_continuation === true)
-        && capabilityIsPresent(capabilities, "tool_calling")
-      );
-    }
-    if (mode === "legacy") {
-      return capabilityIsPresent(capabilities, "tool_calling");
-    }
-    return false;
+    // Agentic WORK is admitted only for the canonical provider-native
+    // continuation contract. Legacy transcript continuation remains available
+    // to Response and Council, but it is never Agentic capability authority.
+    return capabilities.nativeToolContinuation === true
+      && capabilities.toolContinuationMode === "native"
+      && capabilityIsPresent(capabilities, "tool_calling");
   }
   return capabilities.toolsDisabledFinalization === true
     || capabilities.tools_disabled_finalization === true
@@ -1088,7 +1075,6 @@ function buildBinding(
 function publicLoomInspection(
   userId: string,
   presetId: string | null,
-  presetRevision: RuntimeRevision | null,
   config: AgentConfigView | null,
   effectiveMode: AgentRuntimeMode,
 ): {
@@ -1096,6 +1082,7 @@ function publicLoomInspection(
   readonly responseOmission: LoomResponsePolicyOmissionV1 | null;
 } {
   const surface = effectiveMode === "response" ? "RESPONSE" as const : "WORK" as const;
+  const checkpoint = surface === "WORK" ? "WORK" as const : "ASSEMBLE" as const;
   const responseSource = surface === "RESPONSE" && presetId ? getPresetAgentResponseCognitionSourceV1(userId, presetId) : null;
   const inspectionConfig = surface === "RESPONSE" ? responseSource?.config ?? null : config;
   const reviewReason = responseSource?.reviewReason
@@ -1105,45 +1092,20 @@ function publicLoomInspection(
     ...phase.childInstructionSubsets.flatMap((subset) => subset.instructionRefs.map((source) => Object.freeze({ phaseId: phase.id, profileId: subset.profileId, source }))),
   ]));
   const policy = inspectionConfig?.runtimePolicy?.loomPolicy;
-  const blocks: LoomPromptInspectionBlockV1[] = [];
-  if (policy && presetId && presetRevision !== null && surface === "WORK") {
-    const currentBlocks = listPromptBlocks(userId, presetId) ?? [];
-    const seenSources = new Set<string>();
-    for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
-      for (const entry of policy[bucket]) {
-        const source = entry.source;
-        const sourceKey = `${source.blockId}\u0000${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
-        if (seenSources.has(sourceKey)) continue;
-        seenSources.add(sourceKey);
-        const block = currentBlocks.find((candidate) => candidate.id === source.blockId);
-        if (
-          !block
-          || currentBlocks.indexOf(block) !== source.promptOrder
-          || source.presetRevision !== presetRevision
-        ) continue;
-        const blockValue: unknown = block;
-        const blockRevisionValue = isRecord(blockValue) ? blockValue.revision : undefined;
-        if (
-          typeof blockRevisionValue !== "number"
-          || !Number.isSafeInteger(blockRevisionValue)
-          || blockRevisionValue < 0
-          || blockRevisionValue !== source.blockRevision
-          || typeof block.content !== "string"
-        ) continue;
-        blocks.push({ source, content: block.content });
-      }
-    }
-  }
-  const baseInspection = policy
+  // Only the snapshot compiler owns enough context to resolve WORK policy
+  // content. Admission therefore omits undecided per-entry outcomes entirely;
+  // RESPONSE omission remains authoritative because work-only visibility does
+  // not depend on content materialization.
+  const baseInspection = policy && surface === "RESPONSE"
     ? inspectLoomPromptPolicies(policy, {
-      checkpoint: "ASSEMBLE",
+      checkpoint,
       surface,
-      blocks,
+      blocks: [],
     })
     : {
       version: LOOM_POLICY_VERSION,
       surface,
-      checkpoint: "ASSEMBLE" as const,
+      checkpoint,
       items: [],
       effectiveEntryIds: [],
       ...(surface === "RESPONSE"
@@ -1840,6 +1802,12 @@ export class AgentRuntimeDecisionService {
           continue;
         }
         childConnections[profile.id] = childConnection;
+        for (const requirement of REQUIRED_AGENTIC_CAPABILITIES) {
+          if (!capabilityIsPresent(childConnection.capabilities, requirement)) {
+            if (!missingCapabilities.includes(requirement)) missingCapabilities.push(requirement);
+            repairCodes.push(mapCapabilityFailure(requirement));
+          }
+        }
         for (const requirement of slot.requiredCapabilities) {
           if (!requiredCapabilities.includes(requirement)) requiredCapabilities.push(requirement);
           if (!capabilityIsPresent(childConnection.capabilities, requirement)) {
@@ -2009,7 +1977,6 @@ export class AgentRuntimeDecisionService {
     const publicInspection = publicLoomInspection(
       userId,
       preset?.id ?? null,
-      presetRevision,
       config,
       context.effectiveMode,
     );
@@ -2048,6 +2015,8 @@ export class AgentRuntimeDecisionService {
   async consume(userId: string, token: string, request: EffectiveRuntimeRequestV1): Promise<RuntimeDecisionTokenConsumptionV1> {
     const stored = this.tokenStore.consume(userId, token);
     if (!stored) return consumeRefreshRejection();
+    const storedRuntimePolicy = stored.decision.runtimePolicy;
+    if (!storedRuntimePolicy) return consumeRefreshRejection();
     let normalizedRequest: EffectiveRuntimeRequestV1;
     try {
       normalizedRequest = normalizeEffectiveRuntimeRequest(request);
@@ -2088,7 +2057,7 @@ export class AgentRuntimeDecisionService {
       // Preserve only the token's authenticated one-turn selector. Every
       // other policy input is re-resolved from current authority below. A
       // resolved Agentic mode is not itself transient turn authority.
-      transientSelection: stored.decision.runtimePolicy.transientSelection,
+      transientSelection: storedRuntimePolicy.transientSelection,
     };
     delete currentRequest.mode;
     const readinessVector = request.readinessVector ?? storedRequest.readinessVector;
@@ -2112,7 +2081,7 @@ export class AgentRuntimeDecisionService {
       currentBinding,
       expected,
       current.internal.runtimePolicy,
-      stored.decision.runtimePolicy,
+      storedRuntimePolicy,
       current.internal.rootConnection,
       storedRoot,
     );

@@ -1,4 +1,4 @@
-import type { SQLQueryBindings } from "bun:sqlite";
+import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { getDb } from "../db/connection";
 import { paginatedQuery } from "./pagination";
 import type { PaginationParams } from "../types/pagination";
@@ -15,6 +15,7 @@ import type {
   RegexAction,
   RegexActionEffect,
 } from "../types/regex-script";
+import type { Preset } from "../types/preset";
 import { evaluate, registry } from "../macros";
 import type { MacroEnv, EvaluateResult } from "../macros/types";
 import type { EvaluateOptions } from "../macros/MacroEvaluator";
@@ -48,6 +49,8 @@ import {
   utf8ByteLength,
 } from "../utils/regex-limits";
 import { createExpansionBudget } from "../types/agent-preprocessing";
+import { getPresetAgentConfig, quarantineAgentConfigForPresetRevisionWithDb } from "./agent-config-portability.service";
+import { sameJsonValue } from "../utils/json-value";
 
 const REGEX_SCRIPT_TIMEOUT_MS = 500;
 const REGEX_SLOW_WARNING_MS = 5_000;
@@ -139,8 +142,58 @@ interface RegexMutationContext {
   allowUnownedMutation?: boolean;
   /** Present only when a Spindle mutation explicitly supplied folder_version. */
   extensionFolderVersion?: unknown;
+  /** Collects owners so one bulk/import operation advances each preset once. */
+  presetAuthorityBatch?: Set<string>;
+  /** The enclosing preset mutation already owns its revision advance. */
+  suppressPresetAuthorityMutation?: boolean;
+}
+export type RegexPresetAuthoritySnapshot = Map<string, string>;
+
+function readRegexPresetAuthorities(userId: string): Preset[] {
+  const rows = getDb().query("SELECT * FROM presets WHERE user_id = ? ORDER BY id").all(userId) as any[];
+  return rows.map((row) => {
+    const preset: Preset = {
+      id: row.id,
+      name: row.name,
+      provider: row.provider,
+      engine: row.engine,
+      parameters: JSON.parse(row.parameters),
+      prompt_order: JSON.parse(row.prompt_order),
+      prompts: JSON.parse(row.prompts),
+      metadata: JSON.parse(row.metadata),
+      cache_revision: row.cache_revision ?? 0,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+    const projection = getPresetAgentConfig(userId, row.id);
+    if (projection) {
+      preset.agent_config = projection.config;
+      preset.agent_config_revision = projection.configRevision;
+      preset.agent_config_review = projection.review;
+    }
+    return preset;
+  });
 }
 
+export function captureRegexPresetAuthorities(userId: string): RegexPresetAuthoritySnapshot {
+  return new Map(readRegexPresetAuthorities(userId).map((preset) => [
+    preset.id,
+    `${preset.cache_revision ?? 0}:${preset.agent_config_revision ?? 0}`,
+  ]));
+}
+
+export function resolveRegexPresetAuthorities(
+  userId: string,
+  before: RegexPresetAuthoritySnapshot,
+): { presetAuthorityChanged: boolean; presetAuthorities: Preset[] } {
+  const presetAuthorities = readRegexPresetAuthorities(userId).filter((preset) => (
+    before.get(preset.id) !== `${preset.cache_revision ?? 0}:${preset.agent_config_revision ?? 0}`
+  ));
+  for (const preset of presetAuthorities) {
+    eventBus.emit(EventType.PRESET_CHANGED, { id: preset.id, preset }, userId);
+  }
+  return { presetAuthorityChanged: presetAuthorities.length > 0, presetAuthorities };
+}
 const EXTENSION_REGEX_OWNERSHIP_ERROR = "Regex script is not an unbound script owned by this extension";
 
 function normalizeOptionalId(value: unknown): string | null {
@@ -219,6 +272,62 @@ function emitRegexChanged(userId: string, id: string): void {
   eventBus.emit(EventType.REGEX_SCRIPT_CHANGED, { id, script }, userId);
 }
 
+function advancePresetRegexAuthoritiesWithDb(
+  db: Database,
+  userId: string,
+  presetIds: Iterable<string>,
+): Set<string> {
+  const advanced = new Set<string>();
+  const now = Math.floor(Date.now() / 1000);
+  for (const presetId of new Set(presetIds)) {
+    const row = db.query(
+      "SELECT cache_revision, prompt_order FROM presets WHERE id = ? AND user_id = ?",
+    ).get(presetId, userId) as { cache_revision?: number; prompt_order?: string } | null;
+    if (!row) continue;
+    const currentRevision = Number(row.cache_revision) || 0;
+    const result = db.query(
+      "UPDATE presets SET cache_revision = cache_revision + 1, updated_at = ? WHERE id = ? AND user_id = ? AND cache_revision = ?",
+    ).run(now, presetId, userId, currentRevision);
+    if (result.changes !== 1) throw new Error("PRESET_REVISION_CONFLICT");
+    let promptOrder: readonly unknown[] = [];
+    try {
+      const parsed = JSON.parse(row.prompt_order ?? "[]");
+      if (Array.isArray(parsed)) promptOrder = parsed;
+    } catch {}
+    quarantineAgentConfigForPresetRevisionWithDb(
+      db,
+      userId,
+      presetId,
+      currentRevision + 1,
+      promptOrder,
+    );
+    advanced.add(presetId);
+  }
+  return advanced;
+}
+
+function recordPresetRegexAuthorities(
+  db: Database,
+  userId: string,
+  presetIds: Iterable<string | null | undefined>,
+  context?: RegexMutationContext,
+): void {
+  if (context?.suppressPresetAuthorityMutation) return;
+  const owners = [...presetIds].filter((value): value is string => typeof value === "string" && value.length > 0);
+  if (context?.presetAuthorityBatch) {
+    for (const presetId of owners) context.presetAuthorityBatch.add(presetId);
+    return;
+  }
+  advancePresetRegexAuthoritiesWithDb(db, userId, owners);
+}
+
+function regexAuthoritySemantics(script: RegexScript): Record<string, unknown> {
+  const { id: _id, user_id: _userId, created_at: _createdAt, updated_at: _updatedAt, ...semantic } = script;
+  const metadata = { ...(semantic.metadata ?? {}) };
+  delete metadata.regex_performance;
+  delete metadata.regex_evidence;
+  return { ...semantic, metadata };
+}
 function getRegexPerformanceMetadata(script: RegexScript): RegexPerformanceMetadata | null {
   const raw = script.metadata?.regex_performance;
   if (!raw || typeof raw !== "object") return null;
@@ -1215,13 +1324,13 @@ export function createRegexScript(
   const activePresetId = normalizeOptionalId(context?.activePresetId);
   const disabled = validation ? true : resolveCreateDisabledState(persistedInput, activePresetId);
 
+  const db = getDb();
   try {
-    getDb()
-      .query(
+    db.transaction(() => {
+      db.query(
         `INSERT INTO regex_scripts (id, user_id, name, script_id, find_regex, replace_string, actions, flags, placement, scope, scope_id, target, min_depth, max_depth, trim_strings, run_on_edit, substitute_macros, disabled, sort_order, description, folder, pack_id, preset_id, character_id, owner_extension_identifier, validation_error_code, metadata, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+      ).run(
         id,
         userId,
         persistedInput.name.trim(),
@@ -1252,6 +1361,12 @@ export function createRegexScript(
         now,
         now,
       );
+      const presetId = normalizeOptionalId(persistedInput.preset_id);
+      if (presetId && presetId === activePresetId) {
+        setPresetBoundScriptEnabledInRestoreList(userId, presetId, id, !disabled);
+      }
+      recordPresetRegexAuthorities(db, userId, [presetId], context);
+    })();
   } catch (error) {
     const mapped = mapRegexScriptPersistenceError(error);
     if (mapped) return mapped;
@@ -1259,9 +1374,6 @@ export function createRegexScript(
   }
 
   const script = getRegexScript(userId, id)!;
-  if (script.preset_id && script.preset_id === activePresetId) {
-    setPresetBoundScriptEnabledInRestoreList(userId, script.preset_id, script.id, !script.disabled);
-  }
   eventBus.emit(EventType.REGEX_SCRIPT_CHANGED, { id, script }, userId);
   return script;
 }
@@ -1412,23 +1524,30 @@ export function updateRegexScript(
   values.push(id);
   values.push(userId);
 
+  const db = getDb();
+  let updated: RegexScript;
   try {
-    getDb().query(`UPDATE regex_scripts SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`).run(...values);
+    db.transaction(() => {
+      db.query(`UPDATE regex_scripts SET ${fields.join(", ")} WHERE id = ? AND user_id = ?`).run(...values);
+      updated = getRegexScript(userId, id)!;
+      if (existing.preset_id && existing.preset_id !== updated.preset_id) {
+        setPresetBoundScriptEnabledInRestoreList(userId, existing.preset_id, updated.id, false);
+      }
+      if (updated.preset_id && (hasPresetIdUpdate || (mayPersistPresetEnablement && nextInput.disabled !== undefined))) {
+        setPresetBoundScriptEnabledInRestoreList(userId, updated.preset_id, updated.id, !updated.disabled);
+      }
+      if (!sameJsonValue(regexAuthoritySemantics(existing), regexAuthoritySemantics(updated))) {
+        recordPresetRegexAuthorities(db, userId, [existing.preset_id, updated.preset_id], context);
+      }
+    })();
   } catch (err) {
     const mapped = mapRegexScriptPersistenceError(err);
     if (mapped) return mapped;
     throw err;
   }
 
-  const updated = getRegexScript(userId, id)!;
-  if (existing.preset_id && existing.preset_id !== updated.preset_id) {
-    setPresetBoundScriptEnabledInRestoreList(userId, existing.preset_id, updated.id, false);
-  }
-  if (updated.preset_id && (hasPresetIdUpdate || (mayPersistPresetEnablement && nextInput.disabled !== undefined))) {
-    setPresetBoundScriptEnabledInRestoreList(userId, updated.preset_id, updated.id, !updated.disabled);
-  }
-  eventBus.emit(EventType.REGEX_SCRIPT_CHANGED, { id, script: updated }, userId);
-  return updated;
+  eventBus.emit(EventType.REGEX_SCRIPT_CHANGED, { id, script: updated! }, userId);
+  return updated!;
 }
 
 export function deleteRegexScript(userId: string, id: string): boolean;
@@ -1442,13 +1561,16 @@ export function deleteRegexScript(userId: string, id: string, context?: RegexMut
   ) && !context?.allowUnownedMutation) {
     return EXTENSION_REGEX_OWNERSHIP_ERROR;
   }
-  const result = getDb()
-    .query("DELETE FROM regex_scripts WHERE id = ? AND user_id = ?")
-    .run(id, userId);
-  if (result.changes > 0) {
-    if (existing?.preset_id) {
+  const db = getDb();
+  const result = db.transaction(() => {
+    const deleted = db.query("DELETE FROM regex_scripts WHERE id = ? AND user_id = ?").run(id, userId);
+    if (deleted.changes > 0 && existing?.preset_id) {
       setPresetBoundScriptEnabledInRestoreList(userId, existing.preset_id, existing.id, false);
+      recordPresetRegexAuthorities(db, userId, [existing.preset_id], context);
     }
+    return deleted;
+  })();
+  if (result.changes > 0) {
     eventBus.emit(EventType.REGEX_SCRIPT_DELETED, { id }, userId);
     return true;
   }
@@ -1460,7 +1582,7 @@ export function deleteRegexScript(userId: string, id: string, context?: RegexMut
  * REGEX_SCRIPT_DELETED per removed row. Returns the IDs that were actually
  * deleted (missing / cross-user IDs are silently skipped).
  */
-export function deleteRegexScripts(userId: string, ids: string[]): string[] {
+export function deleteRegexScripts(userId: string, ids: string[], context?: RegexMutationContext): string[] {
   if (ids.length === 0) return [];
 
   const db = getDb();
@@ -1474,16 +1596,15 @@ export function deleteRegexScripts(userId: string, ids: string[]): string[] {
   const existingPlaceholders = existingIds.map(() => "?").join(", ");
 
   db.transaction(() => {
-    db
-      .query(`DELETE FROM regex_scripts WHERE user_id = ? AND id IN (${existingPlaceholders})`)
+    db.query(`DELETE FROM regex_scripts WHERE user_id = ? AND id IN (${existingPlaceholders})`)
       .run(userId, ...existingIds);
-  })();
-
-  for (const row of existingRows) {
-    if (row.preset_id) {
-      setPresetBoundScriptEnabledInRestoreList(userId, row.preset_id, row.id, false);
+    for (const row of existingRows) {
+      if (row.preset_id) {
+        setPresetBoundScriptEnabledInRestoreList(userId, row.preset_id, row.id, false);
+      }
     }
-  }
+    recordPresetRegexAuthorities(db, userId, existingRows.map((row) => row.preset_id), context);
+  })();
 
   for (const id of existingIds) {
     eventBus.emit(EventType.REGEX_SCRIPT_DELETED, { id }, userId);
@@ -1538,13 +1659,23 @@ export function duplicateRegexScript(userId: string, id: string): RegexScript | 
 
 export function reorderRegexScripts(userId: string, orderedIds: string[]): boolean {
   const db = getDb();
-  const txn = db.transaction(() => {
+  const rows = orderedIds.length === 0 ? [] : db.query(
+    `SELECT id, preset_id, sort_order FROM regex_scripts WHERE user_id = ? AND id IN (${orderedIds.map(() => "?").join(", ")})`,
+  ).all(userId, ...orderedIds) as Array<{ id: string; preset_id?: string | null; sort_order: number }>;
+  const rowsById = new Map(rows.map((row) => [row.id, row]));
+  const changed = orderedIds.flatMap((id, index) => {
+    const row = rowsById.get(id);
+    return row && row.sort_order !== index ? [row] : [];
+  });
+  if (changed.length === 0) return true;
+  db.transaction(() => {
+    const now = Math.floor(Date.now() / 1000);
     for (let i = 0; i < orderedIds.length; i++) {
       db.query("UPDATE regex_scripts SET sort_order = ?, updated_at = ? WHERE id = ? AND user_id = ?")
-        .run(i, Math.floor(Date.now() / 1000), orderedIds[i], userId);
+        .run(i, now, orderedIds[i], userId);
     }
-  });
-  txn();
+    recordPresetRegexAuthorities(db, userId, changed.map((row) => row.preset_id));
+  })();
   return true;
 }
 
@@ -1562,14 +1693,18 @@ export function toggleRegexScript(
     return existing;
   }
 
-  getDb()
-    .query("UPDATE regex_scripts SET disabled = ?, updated_at = ? WHERE id = ? AND user_id = ?")
-    .run(disabled ? 1 : 0, Math.floor(Date.now() / 1000), id, userId);
+  if (existing.disabled === disabled) return existing;
+  const db = getDb();
+  db.transaction(() => {
+    db.query("UPDATE regex_scripts SET disabled = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+      .run(disabled ? 1 : 0, Math.floor(Date.now() / 1000), id, userId);
+    if (existing.preset_id) {
+      setPresetBoundScriptEnabledInRestoreList(userId, existing.preset_id, existing.id, !disabled);
+    }
+    recordPresetRegexAuthorities(db, userId, [existing.preset_id], context);
+  })();
 
   const updated = getRegexScript(userId, id)!;
-  if (updated.preset_id) {
-    setPresetBoundScriptEnabledInRestoreList(userId, updated.preset_id, updated.id, !updated.disabled);
-  }
   eventBus.emit(EventType.REGEX_SCRIPT_CHANGED, { id, script: updated }, userId);
   return updated;
 }
@@ -1581,6 +1716,7 @@ function toggleRegexScriptRows(
   rows: RegexToggleRow[],
   disabled: boolean,
   activePresetId: string | null,
+  context?: RegexMutationContext,
 ): { changedIds: string[]; skippedIds: string[] } {
   const changedIds: string[] = [];
   const skippedIds: string[] = [];
@@ -1609,13 +1745,16 @@ function toggleRegexScriptRows(
   db.transaction(() => {
     db.query(`UPDATE regex_scripts SET disabled = ?, updated_at = ? WHERE id IN (${placeholders}) AND user_id = ?`)
       .run(disabled ? 1 : 0, now, ...targetIds, userId);
+    for (const target of targets) {
+      if (target.preset_id) {
+        setPresetBoundScriptEnabledInRestoreList(userId, target.preset_id, target.id, !disabled);
+      }
+    }
+    recordPresetRegexAuthorities(db, userId, targets.map((target) => target.preset_id), context);
   })();
 
   for (const target of targets) {
     changedIds.push(target.id);
-    if (target.preset_id) {
-      setPresetBoundScriptEnabledInRestoreList(userId, target.preset_id, target.id, !disabled);
-    }
     const updated = getRegexScript(userId, target.id);
     if (updated) {
       eventBus.emit(EventType.REGEX_SCRIPT_CHANGED, { id: target.id, script: updated }, userId);
@@ -1650,7 +1789,7 @@ export function toggleRegexScriptsByIds(
     return row ? [row] : [];
   });
 
-  return toggleRegexScriptRows(userId, rows, disabled, normalizeOptionalId(context?.activePresetId));
+  return toggleRegexScriptRows(userId, rows, disabled, normalizeOptionalId(context?.activePresetId), context);
 }
 
 /**
@@ -1671,7 +1810,7 @@ export function toggleRegexScriptsByFolder(
     .query("SELECT id, preset_id, disabled FROM regex_scripts WHERE user_id = ? AND folder = ?")
     .all(userId, folder) as RegexToggleRow[];
 
-  return toggleRegexScriptRows(userId, rows, disabled, activePresetId);
+  return toggleRegexScriptRows(userId, rows, disabled, activePresetId, context);
 }
 
 // ── Character-bound query ────────────────────────────────────────────────────
@@ -3030,11 +3169,12 @@ interface InstallRemotePresetRegexOptions {
  * import is removed and the old restore-list is reinstated, leaving the prior
  * working set untouched.
  */
-function installRemotePresetRegexScripts(
+function installRemotePresetRegexScriptsInTransaction(
   userId: string,
   options: InstallRemotePresetRegexOptions,
 ): { imported: number; archived: number; replaced: number; folder: string | null } {
   const previousRestore = readStoredPresetRegexIdsRecord(userId, options.presetId);
+  const presetAuthorityBatch = new Set<string>();
   const beforeIds = new Set(getRegexScriptsByPresetId(userId, options.presetId).map((script) => script.id));
   let newIds: string[] = [];
   let folder: string | null = null;
@@ -3051,6 +3191,7 @@ function installRemotePresetRegexScripts(
           remotePresetId: options.remotePresetId,
           presetVersion: options.presetVersion,
         },
+        { presetAuthorityBatch },
       );
       newIds = getRegexScriptsByPresetId(userId, options.presetId)
         .filter((script) => !beforeIds.has(script.id))
@@ -3077,6 +3218,10 @@ function installRemotePresetRegexScripts(
         })
       : { archivedIds: [], replacedIds: [] };
 
+    if (retired.archivedIds.length > 0 || retired.replacedIds.length > 0) {
+      presetAuthorityBatch.add(options.presetId);
+    }
+    advancePresetRegexAuthoritiesWithDb(getDb(), userId, presetAuthorityBatch);
     // Retirement clears the old restore-list. Reapply only the staged version's
     // author-enabled IDs, including an intentionally empty list.
     writeStoredPresetRegexIdsWithDb(getDb(), userId, options.presetId, nextRestore);
@@ -3090,7 +3235,7 @@ function installRemotePresetRegexScripts(
     newIds = getRegexScriptsByPresetId(userId, options.presetId)
       .filter((script) => !beforeIds.has(script.id))
       .map((script) => script.id);
-    if (newIds.length > 0) deleteRegexScripts(userId, newIds);
+    if (newIds.length > 0) deleteRegexScripts(userId, newIds, { suppressPresetAuthorityMutation: true });
     if (previousRestore.exists) {
       writeStoredPresetRegexIdsWithDb(getDb(), userId, options.presetId, previousRestore.ids);
     } else {
@@ -3098,6 +3243,22 @@ function installRemotePresetRegexScripts(
     }
     throw error;
   }
+}
+function installRemotePresetRegexScripts(
+  userId: string,
+  options: InstallRemotePresetRegexOptions,
+): { imported: number; archived: number; replaced: number; folder: string | null } {
+  const db = getDb();
+  const authorityBefore = captureRegexPresetAuthorities(userId);
+  const buffered = eventBus.withBufferedEvents(() => {
+    const value = db.transaction(() => installRemotePresetRegexScriptsInTransaction(userId, options))();
+    resolveRegexPresetAuthorities(userId, authorityBefore);
+    return value;
+  });
+  for (const event of buffered.events) {
+    eventBus.emit(event.event, event.payload, event.userId, event.options);
+  }
+  return buffered.value;
 }
 
 export function installLumiHubPresetRegexScripts(
@@ -3292,7 +3453,22 @@ export function importRegexScripts(
   userId: string,
   payload: any,
   context?: RegexMutationContext,
-): { imported: number; skipped: number; errors: string[] } {
+): { imported: number; skipped: number; errors: string[]; presetAuthorityChanged?: boolean } {
+  if (!context?.presetAuthorityBatch) {
+    const db = getDb();
+    const presetAuthorityBatch = new Set<string>();
+    const buffered = eventBus.withBufferedEvents(() => db.transaction(() => {
+      const result = importRegexScripts(userId, payload, { ...context, presetAuthorityBatch });
+      const advanced = context?.suppressPresetAuthorityMutation
+        ? new Set<string>()
+        : advancePresetRegexAuthoritiesWithDb(db, userId, presetAuthorityBatch);
+      return { ...result, presetAuthorityChanged: advanced.size > 0 };
+    })());
+    for (const event of buffered.events) {
+      eventBus.emit(event.event, event.payload, event.userId, event.options);
+    }
+    return buffered.value;
+  }
   const errors: string[] = [];
   let imported = 0;
   let skipped = 0;
@@ -3528,9 +3704,32 @@ export function importPresetBoundRegexScripts(
   presetName: string,
   scripts: any[],
   attribution?: PresetBoundRegexAttribution,
+  context?: RegexMutationContext,
 ): { imported: number; skipped: number } {
   if (!Array.isArray(scripts) || scripts.length === 0) {
     return { imported: 0, skipped: 0 };
+  }
+  if (!context?.presetAuthorityBatch) {
+    const db = getDb();
+    const presetAuthorityBatch = new Set<string>();
+    const buffered = eventBus.withBufferedEvents(() => db.transaction(() => {
+      const result = importPresetBoundRegexScripts(
+        userId,
+        presetId,
+        presetName,
+        scripts,
+        attribution,
+        { ...context, presetAuthorityBatch },
+      );
+      if (!context?.suppressPresetAuthorityMutation) {
+        advancePresetRegexAuthoritiesWithDb(db, userId, presetAuthorityBatch);
+      }
+      return result;
+    })());
+    for (const event of buffered.events) {
+      eventBus.emit(event.event, event.payload, event.userId, event.options);
+    }
+    return buffered.value;
   }
 
   let imported = 0;
@@ -3566,7 +3765,11 @@ export function importPresetBoundRegexScripts(
       }],
       folder,
       preset_id: presetId,
-    }, { foreignImport: false });
+    }, {
+      foreignImport: false,
+      presetAuthorityBatch: context.presetAuthorityBatch,
+      suppressPresetAuthorityMutation: context.suppressPresetAuthorityMutation,
+    });
     imported += result.imported;
     skipped += result.skipped;
     if (result.imported > 0 && !script.disabled) {

@@ -49,6 +49,18 @@ describe("user-data snapshot barrier", () => {
     ]);
   });
 
+  test("exclusive completion releases synchronous mutation access before settling", async () => {
+    const barrier = new UserDataSnapshotBarrier();
+    await barrier.withExclusive("user-exclusive-settlement", async () => "exported");
+
+    expect(barrier.getState("user-exclusive-settlement")).toEqual({
+      activeMutations: 0,
+      activeExclusive: false,
+      queued: 0,
+    });
+    expect(barrier.withMutationSync("user-exclusive-settlement", () => "mutated")).toBe("mutated");
+  });
+
   test("abort releases a queued waiter without bypassing the exclusive fence", async () => {
     const barrier = new UserDataSnapshotBarrier();
     let release!: () => void;

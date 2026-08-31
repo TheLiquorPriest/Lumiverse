@@ -28,6 +28,8 @@ export interface ProviderCapabilities {
    * Response and feature-active compatibility paths.
    */
   toolCalling: boolean;
+  /** True only when the adapter can force some admitted host tool without naming one. */
+  requiredToolChoice: boolean;
   /**
    * Whether this adapter has a provider-native tool continuation wire format.
    * This remains explicit even when `toolContinuationMode` is legacy or

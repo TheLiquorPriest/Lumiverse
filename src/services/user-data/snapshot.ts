@@ -329,11 +329,20 @@ export class UserDataSnapshotBarrier {
       state.queue.shift();
       if (first.settled) return this.drain(userId, state);
       state.activeExclusive = true;
-      this.startWaiter(first, state).finally(() => {
-        state.activeExclusive = false;
-        this.cleanupState(userId, state);
-        this.drain(userId, state);
-      });
+      void this.startWaiter(first).then(
+        (result) => {
+          state.activeExclusive = false;
+          this.cleanupState(userId, state);
+          this.drain(userId, state);
+          first.resolve(result);
+        },
+        (error: unknown) => {
+          state.activeExclusive = false;
+          this.cleanupState(userId, state);
+          this.drain(userId, state);
+          first.reject(error);
+        },
+      );
       return;
     }
 
@@ -343,30 +352,33 @@ export class UserDataSnapshotBarrier {
       const waiter = state.queue.shift()!;
       if (waiter.settled) continue;
       state.activeMutations += 1;
-      void this.startWaiter(waiter, state).finally(() => {
-        state.activeMutations -= 1;
-        this.cleanupState(userId, state);
-        this.drain(userId, state);
-      });
+      void this.startWaiter(waiter).then(
+        (result) => {
+          state.activeMutations -= 1;
+          this.cleanupState(userId, state);
+          this.drain(userId, state);
+          waiter.resolve(result);
+        },
+        (error: unknown) => {
+          state.activeMutations -= 1;
+          this.cleanupState(userId, state);
+          this.drain(userId, state);
+          waiter.reject(error);
+        },
+      );
     }
   }
 
-  private async startWaiter<T>(waiter: Waiter<T>, state: BarrierState): Promise<void> {
-    if (waiter.settled) return;
+  private async startWaiter<T>(waiter: Waiter<T>): Promise<T> {
     waiter.settled = true;
     if (waiter.signal && waiter.abortListener) waiter.signal.removeEventListener("abort", waiter.abortListener);
     const parent = this.context.getStore();
     const store = new Set(parent);
     store.add(waiter.userId);
     const signal = waiter.signal ?? neverAbortedSignal;
-    try {
-      throwIfAborted(signal);
-      if (waiter.kind === "mutation") this.advanceSourceEpoch(waiter.userId);
-      const result = await this.context.run(store, () => waiter.callback(signal));
-      waiter.resolve(result);
-    } catch (error) {
-      waiter.reject(error);
-    }
+    throwIfAborted(signal);
+    if (waiter.kind === "mutation") this.advanceSourceEpoch(waiter.userId);
+    return this.context.run(store, () => waiter.callback(signal));
   }
 
   private advanceSourceEpoch(userId: string): void {

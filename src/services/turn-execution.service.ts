@@ -23,6 +23,7 @@ import {
   type AgentRunReceiptRepairOptions,
 } from "./agent-run-projection.service";
 import { invalidateFrameCapabilitiesForTurn } from "./turn-workspace.service";
+import { cancellationTerminalCause } from "../utils/turn-cancellation-cause";
 
 /**
  * Durable turn execution states.  This is intentionally a closed union: adding
@@ -704,6 +705,7 @@ function updateRow(
   values: Record<string, unknown>,
   where: string,
   params: readonly SQLQueryBindings[],
+  resultMode: "changes" | "matched" = "changes",
 ): number {
   const columns = tableColumns(db, table);
   const selected = Object.entries(values).filter(([name, value]) => columns.has(name) && value !== undefined);
@@ -721,6 +723,10 @@ function updateRow(
     ...bindings,
     ...params,
   ) as { changes?: number };
+  if (resultMode === "matched") {
+    const directResult = db.query("SELECT changes() AS changes").get() as { changes?: unknown } | null;
+    return Number(directResult?.changes ?? 0);
+  }
   return Number(result?.changes ?? 0);
 }
 function normalizeTarget(input: TurnExecutionInput): GenerationTargetRecord {
@@ -1220,6 +1226,18 @@ function terminalCodeFor(phase: TerminalTurnPhase, reason?: string): string {
 }
 
 
+function cancellationMarkerAbsentPredicates(db: Database): readonly string[] {
+  const columns = tableColumns(db, "agent_turn_executions");
+  if (columns.has("cancel_requested_at")) return [`${quoteColumn("cancel_requested_at")} IS NULL`];
+  const compatible = ["cancel_requested", "cancellation_requested"].filter((column) => columns.has(column));
+  if (compatible.length === 0) {
+    throw new TurnExecutionError(
+      "execution_schema_unavailable",
+      "agent turn execution schema has no durable cancellation marker",
+    );
+  }
+  return compatible.map((column) => `COALESCE(${quoteColumn(column)}, 0) = 0`);
+}
 function updateCas(
   db: Database,
   current: TurnExecutionRecord,
@@ -1227,6 +1245,7 @@ function updateCas(
   ownerToken: string | null,
   expectedPhase: TurnExecutionPhase,
   expectedRevision: number,
+  additionalPredicates: readonly string[] = [],
 ): boolean {
   const columns = tableColumns(db, "agent_turn_executions");
   const where: string[] = ["id = ?"];
@@ -1261,24 +1280,28 @@ function updateCas(
   } else {
     return false;
   }
-  return updateRow(db, "agent_turn_executions", values, where.join(" AND "), params) === 1;
+  where.push(...additionalPredicates);
+  return updateRow(db, "agent_turn_executions", values, where.join(" AND "), params, "matched") === 1;
 }
 
 function terminalUpdateValues(
+  db: Database,
+  current: TurnExecutionRecord,
   phase: TerminalTurnPhase,
   now: number,
   reason?: string,
 ): Record<string, unknown> {
-  const terminalEventId = randomId("terminal");
-  return {
+  // COMMITTED first becomes authoritative with its receipt. Its public
+  // terminal event is a separate, receipt-backed convergence transaction.
+  const terminalEventId = phase === "COMMITTED" ? null : randomId("terminal");
+  const values: Record<string, unknown> = {
     phase,
     state: phase,
     terminal_code: terminalCodeFor(phase, reason),
     terminal_at: now,
     updated_at: now,
     terminal_event_id: terminalEventId,
-    terminal_event_emitted_at: now,
-    cancel_requested_at: phase === "CANCELLED" ? now : undefined,
+    terminal_event_emitted_at: phase === "COMMITTED" ? null : now,
     cas_owner: null,
     lease_owner: null,
     cas_expires_at: null,
@@ -1287,6 +1310,22 @@ function terminalUpdateValues(
     final_render_reservation_released_at: now,
     final_render_reservations_json: "[]",
   };
+  const markerAt = current.cancelRequested
+    ? current.cancelRequestedAt ?? current.updatedAt
+    : phase === "CANCELLED" ? now : null;
+  if (markerAt !== null) {
+    const columns = tableColumns(db, "agent_turn_executions");
+    if (columns.has("cancel_requested_at")) {
+      values.cancel_requested_at = markerAt;
+    } else {
+      for (const column of ["cancel_requested", "cancellation_requested"]) {
+        if (columns.has(column)) values[column] = 1;
+      }
+      // Boolean-only compatibility uses updated_at as first-cause authority.
+      values.updated_at = markerAt;
+    }
+  }
+  return values;
 }
 
 function terminalizeWithCas(
@@ -1298,11 +1337,12 @@ function terminalizeWithCas(
   phase: TerminalTurnPhase,
   reason?: string,
   now = nowMs(),
+  additionalPredicates: readonly string[] = [],
 ): TransitionTurnExecutionResult {
-  const values = terminalUpdateValues(phase, now, reason);
+  const values = terminalUpdateValues(db, current, phase, now, reason);
   values.cas_revision = current.casRevision + 1;
   values.phase_revision = current.phaseRevision + 1;
-  if (!updateCas(db, current, values, ownerToken, expectedPhase, expectedRevision)) {
+  if (!updateCas(db, current, values, ownerToken, expectedPhase, expectedRevision, additionalPredicates)) {
     const latest = rawExecution(db, current.id);
     if (latest && TERMINAL_PHASE_SET.has(rowPhase(latest))) {
       return { execution: recordFromRow(latest), terminalEventEmitted: false };
@@ -1314,6 +1354,95 @@ function terminalizeWithCas(
   }
   const latest = requireExecution(db, current.id).execution;
   return { execution: latest, terminalEventEmitted: true };
+}
+function ensureCanonicalMarkerTerminal(
+  execution: TurnExecutionRecord,
+  markerCause: ReturnType<typeof cancellationTerminalCause>,
+): void {
+  if (execution.phase !== markerCause.phase
+    || execution.terminalCode !== terminalCodeFor(markerCause.phase, markerCause.reason)) {
+    throw new TurnExecutionError("invalid_execution_input", "accepted cancellation marker lost its terminal cause", {
+      executionId: execution.id,
+      phase: execution.phase,
+    });
+  }
+}
+function terminalizeWithCancellationMarkerFence(
+  db: Database,
+  current: TurnExecutionRecord,
+  ownerToken: string | null,
+  phase: TerminalTurnPhase,
+  reason: string | undefined,
+  now: number,
+): {
+  outcome: TransitionTurnExecutionResult;
+  markerCause: ReturnType<typeof cancellationTerminalCause> | null;
+} {
+  const terminalizeMarker = (candidate: TurnExecutionRecord) => {
+    const markerCause = cancellationTerminalCause(
+      candidate.cancelRequestedAt ?? candidate.updatedAt,
+      candidate.deadlineAt,
+    );
+    const outcome = terminalizeWithCas(
+      db,
+      candidate,
+      ownerToken,
+      candidate.phase,
+      candidate.casRevision,
+      markerCause.phase,
+      markerCause.reason,
+      now,
+    );
+    ensureCanonicalMarkerTerminal(outcome.execution, markerCause);
+    return { outcome, markerCause };
+  };
+
+  if (current.cancelRequested) return terminalizeMarker(current);
+  const terminalReason = phase === "CANCELLED"
+    ? cancellationTerminalCause(now, current.deadlineAt).reason
+    : reason;
+  try {
+    const outcome = terminalizeWithCas(
+      db,
+      current,
+      ownerToken,
+      current.phase,
+      current.casRevision,
+      phase,
+      terminalReason,
+      now,
+      cancellationMarkerAbsentPredicates(db),
+    );
+    const markerCause = outcome.execution.cancelRequested
+      ? cancellationTerminalCause(
+          outcome.execution.cancelRequestedAt ?? outcome.execution.updatedAt,
+          outcome.execution.deadlineAt,
+        )
+      : null;
+    if (markerCause) ensureCanonicalMarkerTerminal(outcome.execution, markerCause);
+    return { outcome, markerCause };
+  } catch (error) {
+    if (!(error instanceof TurnExecutionError) || error.code !== "stale_execution") throw error;
+  }
+
+  const latest = requireExecution(db, current.id).execution;
+  if (latest.cancelRequested && REVERSIBLE_PHASE_SET.has(latest.phase)) {
+    return terminalizeMarker(latest);
+  }
+  if (TERMINAL_PHASE_SET.has(latest.phase)) {
+    const markerCause = latest.cancelRequested
+      ? cancellationTerminalCause(latest.cancelRequestedAt ?? latest.updatedAt, latest.deadlineAt)
+      : null;
+    if (markerCause) ensureCanonicalMarkerTerminal(latest, markerCause);
+    return {
+      outcome: { execution: latest, terminalEventEmitted: false },
+      markerCause,
+    };
+  }
+  throw new TurnExecutionError("stale_execution", "execution changed before cancellation-fenced terminal transition", {
+    executionId: latest.id,
+    phase: latest.phase,
+  });
 }
 
 /** Create the durable row before any generation/chat mutation is permitted. */
@@ -1361,7 +1490,7 @@ export function createTurnExecution(
   addValue(columns, values, ["phase_revision"], 0);
   addValues(columns, values, ["cas_owner", "lease_owner", "owner_token"], normalized.ownerToken);
   addValue(columns, values, ["lease_generation"], 1);
-  addValue(columns, values, ["cas_expires_at", "lease_expires_at", "lease_expires"], now + DEFAULT_LEASE_MS);
+  addValue(columns, values, ["cas_expires_at", "lease_expires_at", "lease_expires"], Math.min(now + DEFAULT_LEASE_MS, normalized.deadlineAt));
   addValue(columns, values, ["commit_key"], normalized.commitKey);
   addValue(columns, values, ["final_render_reservations_json"], "[]");
   addValue(columns, values, ["expires_at"], normalized.expiresAt);
@@ -1382,7 +1511,13 @@ export function createTurnExecution(
   if (input.cancelSignal) {
     input.cancelSignal.addEventListener("abort", () => {
       try {
-        requestTurnCancellation({ executionId: normalized.id, ownerToken: normalized.ownerToken, db });
+        const reason = input.cancelSignal?.reason as { name?: unknown } | undefined;
+        requestActiveTurnCancellation({
+          executionId: normalized.id,
+          ownerToken: normalized.ownerToken,
+          reason: reason?.name === "TimeoutError" ? "timed_out" : "cancelled",
+          db,
+        });
       } catch {
         // A terminal owner or process restart owns cleanup; abort never retries.
       }
@@ -1496,35 +1631,58 @@ export function transitionTurnExecution(input: TransitionTurnExecutionInput): Tr
     });
   }
   const now = input.now ?? nowMs();
-  if (!input.ignoreCancellation && REVERSIBLE_PHASE_SET.has(current.phase)) {
-    if (current.cancelRequested && input.nextPhase !== "CANCELLED") {
-      return terminalizeWithCas(db, current, input.ownerToken, current.phase, expectedRevision, "CANCELLED", "cancelled", now);
-    }
-    if (current.deadlineAt > 0 && now >= current.deadlineAt && input.nextPhase !== "TIMED_OUT") {
-      return terminalizeWithCas(db, current, input.ownerToken, current.phase, expectedRevision, "TIMED_OUT", "root_wall_clock_limit_exceeded", now);
-    }
+  const cancellationFenced = !input.ignoreCancellation && REVERSIBLE_PHASE_SET.has(current.phase);
+  const markerAbsentPredicates = cancellationFenced ? cancellationMarkerAbsentPredicates(db) : [];
+  if (cancellationFenced && current.cancelRequested) {
+    const markerAt = current.cancelRequestedAt ?? current.updatedAt;
+    const requestedCause = cancellationTerminalCause(markerAt, current.deadlineAt);
+    return terminalizeWithCancellationMarkerFence(
+      db,
+      current,
+      input.ownerToken,
+      requestedCause.phase,
+      requestedCause.reason,
+      now,
+    ).outcome;
   }
-  const terminal = TERMINAL_PHASE_SET.has(input.nextPhase);
+  const deadlineElapsed = cancellationFenced && current.deadlineAt > 0 && now >= current.deadlineAt;
+  const nextPhase = deadlineElapsed ? "TIMED_OUT" : input.nextPhase;
+  const reason = deadlineElapsed ? "root_wall_clock_limit_exceeded" : input.reason;
+  const terminal = TERMINAL_PHASE_SET.has(nextPhase);
   const values: Record<string, unknown> = terminal
     ? {
-        ...terminalUpdateValues(input.nextPhase as TerminalTurnPhase, now, input.reason),
+        ...terminalUpdateValues(db, current, nextPhase as TerminalTurnPhase, now, reason),
         cas_revision: current.casRevision + 1,
         phase_revision: current.phaseRevision + 1,
       }
     : {
-        phase: input.nextPhase,
-        state: input.nextPhase,
+        phase: nextPhase,
+        state: nextPhase,
         cas_revision: current.casRevision + 1,
         revision: current.casRevision + 1,
         phase_revision: current.phaseRevision + 1,
         updated_at: now,
       };
-  if (!updateCas(db, current, values, input.ownerToken, input.expectedPhase, expectedRevision)) {
-    const latest = rawExecution(db, current.id);
-    if (latest && TERMINAL_PHASE_SET.has(rowPhase(latest))) {
-      throw new TurnExecutionError("already_terminal", "execution became terminal", { executionId: current.id, phase: rowPhase(latest) });
+  if (!updateCas(
+    db, current, values, input.ownerToken, input.expectedPhase, expectedRevision, markerAbsentPredicates,
+  )) {
+    const latest = requireExecution(db, current.id).execution;
+    if (cancellationFenced && latest.cancelRequested && REVERSIBLE_PHASE_SET.has(latest.phase)) {
+      const markerAt = latest.cancelRequestedAt ?? latest.updatedAt;
+      const requestedCause = cancellationTerminalCause(markerAt, latest.deadlineAt);
+      return terminalizeWithCancellationMarkerFence(
+        db,
+        latest,
+        input.ownerToken,
+        requestedCause.phase,
+        requestedCause.reason,
+        now,
+      ).outcome;
     }
-    throw new TurnExecutionError("stale_execution", "execution changed before transition", { executionId: current.id, phase: current.phase });
+    if (TERMINAL_PHASE_SET.has(latest.phase)) {
+      throw new TurnExecutionError("already_terminal", "execution became terminal", { executionId: current.id, phase: latest.phase });
+    }
+    throw new TurnExecutionError("stale_execution", "execution changed before transition", { executionId: current.id, phase: latest.phase });
   }
   return {
     execution: requireExecution(db, current.id).execution,
@@ -1537,6 +1695,145 @@ export type TurnCancellationCode = "cancelled" | "timed_out" | "too_late" | "alr
 export interface TurnCancellationResult {
   readonly execution: TurnExecutionRecord;
   readonly code: TurnCancellationCode;
+}
+export interface ActiveTurnCancellationRequestResult {
+  readonly execution: TurnExecutionRecord;
+  readonly code: TurnCancellationCode;
+}
+function cancellationResultFromSettlement(
+  settled: ReturnType<typeof terminalizeWithCancellationMarkerFence>,
+  fallbackCode: TurnCancellationCode,
+): TurnCancellationResult {
+  const execution = settled.outcome.execution;
+  const cancellationAuthority = settled.outcome.terminalEventEmitted || settled.markerCause !== null;
+  const code: TurnCancellationCode = cancellationAuthority && execution.phase === "CANCELLED"
+    ? "cancelled"
+    : cancellationAuthority && execution.phase === "TIMED_OUT"
+      ? "timed_out"
+      : STOP_TOO_LATE_PHASE_SET.has(execution.phase)
+        ? "too_late"
+        : TERMINAL_PHASE_SET.has(execution.phase)
+          ? "already_terminal"
+          : fallbackCode;
+  return { execution, code };
+}
+
+/**
+ * Persist cancellation intent for a live reversible turn without releasing its
+ * owner or changing its CAS revision. Segmented WORK must settle and close its
+ * durable dispatch/recovery authority before the ordinary terminal transition
+ * clears that authority.
+ */
+export function requestActiveTurnCancellation(input: {
+  executionId: string;
+  ownerToken: string;
+  reason?: string;
+  now?: number;
+  db?: Database;
+}): ActiveTurnCancellationRequestResult {
+  const db = input.db ?? getDb();
+  const current = requireExecution(db, input.executionId).execution;
+  if (STOP_TOO_LATE_PHASE_SET.has(current.phase)) {
+    return { execution: current, code: "too_late" };
+  }
+  if (TERMINAL_PHASE_SET.has(current.phase)) {
+    return { execution: current, code: "already_terminal" };
+  }
+  if (!REVERSIBLE_PHASE_SET.has(current.phase)) {
+    return { execution: current, code: "too_late" };
+  }
+  ensureOwner(current, input.ownerToken);
+  const now = input.now ?? nowMs();
+  // The first persisted request wins. Its timestamp relative to the immutable
+  // deadline is also the durable cause discriminator, so retries keep the
+  // original request time even if a same-owner forward CAS advances the row.
+  const requestAt = current.cancelRequested
+    ? current.cancelRequestedAt ?? current.updatedAt
+    : input.reason === "timed_out" && current.deadlineAt > now ? current.deadlineAt : now;
+  const acceptedCause = cancellationTerminalCause(requestAt, current.deadlineAt);
+  const acceptedCode: TurnCancellationCode = acceptedCause.code;
+  if (current.cancelRequested) return { execution: current, code: acceptedCode };
+  if (acceptedCode === "cancelled" && (current.leaseExpiresAt === null || current.leaseExpiresAt <= now)) {
+    throw new TurnExecutionError("stale_owner", "execution owner lease expired before cancellation request", {
+      executionId: current.id,
+      phase: current.phase,
+    });
+  }
+
+  const columns = tableColumns(db, "agent_turn_executions");
+  const markerValues: Record<string, unknown> = { updated_at: requestAt };
+  const markerAbsentPredicates: string[] = [];
+  if (columns.has("cancel_requested_at")) {
+    markerValues.cancel_requested_at = requestAt;
+    markerAbsentPredicates.push(`${quoteColumn("cancel_requested_at")} IS NULL`);
+  } else {
+    for (const column of ["cancel_requested", "cancellation_requested"]) {
+      if (!columns.has(column)) continue;
+      markerValues[column] = 1;
+      markerAbsentPredicates.push(`COALESCE(${quoteColumn(column)}, 0) = 0`);
+    }
+    if (markerAbsentPredicates.length === 0) {
+      throw new TurnExecutionError(
+        "execution_schema_unavailable",
+        "agent turn execution schema has no durable cancellation marker",
+        { executionId: current.id },
+      );
+    }
+  }
+
+  const sameExecutionIdentity = (candidate: TurnExecutionRecord): boolean => candidate.id === current.id
+    && candidate.userId === current.userId
+    && candidate.chatId === current.chatId
+    && candidate.generationId === current.generationId
+    && candidate.mode === current.mode
+    && candidate.runtimeEpoch === current.runtimeEpoch
+    && candidate.deadlineAt === current.deadlineAt;
+  let candidate = current;
+  // One bounded retry closes the only valid forward race: a same-owner
+  // reversible CAS that advances the execution after this request's read.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (updateCas(
+      db,
+      candidate,
+      markerValues,
+      input.ownerToken,
+      candidate.phase,
+      candidate.casRevision,
+      markerAbsentPredicates,
+    )) {
+      return { execution: requireExecution(db, input.executionId).execution, code: acceptedCode };
+    }
+
+    const latest = requireExecution(db, input.executionId).execution;
+    if (STOP_TOO_LATE_PHASE_SET.has(latest.phase)) return { execution: latest, code: "too_late" };
+    if (TERMINAL_PHASE_SET.has(latest.phase)) return { execution: latest, code: "already_terminal" };
+    if (!REVERSIBLE_PHASE_SET.has(latest.phase)) return { execution: latest, code: "too_late" };
+    if (!sameExecutionIdentity(latest)) {
+      throw new TurnExecutionError("stale_execution", "execution identity changed before cancellation request", {
+        executionId: current.id,
+        phase: latest.phase,
+      });
+    }
+    if (latest.casOwner !== input.ownerToken) ensureOwner(latest, input.ownerToken);
+    if (latest.cancelRequested) {
+      const latestRequestAt = latest.cancelRequestedAt ?? latest.updatedAt;
+      return {
+        execution: latest,
+        code: cancellationTerminalCause(latestRequestAt, latest.deadlineAt).code,
+      };
+    }
+    if (acceptedCode === "cancelled" && (latest.leaseExpiresAt === null || latest.leaseExpiresAt <= now)) {
+      throw new TurnExecutionError("stale_owner", "execution owner lease expired before cancellation retry", {
+        executionId: latest.id,
+        phase: latest.phase,
+      });
+    }
+    candidate = latest;
+  }
+  throw new TurnExecutionError("stale_execution", "execution changed repeatedly before cancellation request", {
+    executionId: current.id,
+    phase: candidate.phase,
+  });
 }
 
 export function requestTurnCancellation(input: {
@@ -1551,25 +1848,35 @@ export function requestTurnCancellation(input: {
   if (STOP_TOO_LATE_PHASE_SET.has(current.phase)) {
     return { execution: current, code: "too_late" };
   }
+  if (current.phase === "WORK") {
+    const owner = input.ownerToken ?? current.casOwner;
+    if (!owner) throw new TurnExecutionError("stale_owner", "execution has no active owner", { executionId: current.id });
+    return requestActiveTurnCancellation({
+      executionId: current.id,
+      ownerToken: owner,
+      reason: input.reason,
+      now: input.now,
+      db,
+    });
+  }
   if (TERMINAL_PHASE_SET.has(current.phase)) return { execution: current, code: "already_terminal" };
   if (input.ownerToken) ensureOwner(current, input.ownerToken);
   const now = input.now ?? nowMs();
-  const target: TerminalTurnPhase = input.reason === "timed_out"
-    ? "TIMED_OUT"
-    : current.deadlineAt > 0 && now >= current.deadlineAt ? "TIMED_OUT" : "CANCELLED";
+  const requestAt = current.cancelRequested
+    ? current.cancelRequestedAt ?? current.updatedAt
+    : input.reason === "timed_out" && current.deadlineAt > now ? current.deadlineAt : now;
+  const cause = cancellationTerminalCause(requestAt, current.deadlineAt);
   const owner = input.ownerToken ?? current.casOwner;
   if (!owner) throw new TurnExecutionError("stale_owner", "execution has no active owner", { executionId: current.id });
-  const result = terminalizeWithCas(
+  const settled = terminalizeWithCancellationMarkerFence(
     db,
     current,
     owner,
-    current.phase,
-    current.casRevision,
-    target,
-    target === "TIMED_OUT" ? "root_wall_clock_limit_exceeded" : input.reason ?? "cancelled",
+    cause.phase,
+    cause.phase === "TIMED_OUT" ? cause.reason : input.reason ?? cause.reason,
     now,
   );
-  return { execution: result.execution, code: target === "TIMED_OUT" ? "timed_out" : "cancelled" };
+  return cancellationResultFromSettlement(settled, cause.code);
 }
 
 /**
@@ -1619,23 +1926,19 @@ export function requestDormantTurnCancellation(input: {
   }
 
   const now = input.now ?? nowMs();
-  const target: TerminalTurnPhase = current.deadlineAt > 0 && now >= current.deadlineAt ? "TIMED_OUT" : "CANCELLED";
-  const result = terminalizeWithCas(
+  const markerAt = current.cancelRequested
+    ? current.cancelRequestedAt ?? current.updatedAt
+    : input.reason === "timed_out" && current.deadlineAt > now ? current.deadlineAt : now;
+  const cause = cancellationTerminalCause(markerAt, current.deadlineAt);
+  const settled = terminalizeWithCancellationMarkerFence(
     db,
     current,
     null,
-    current.phase,
-    current.casRevision,
-    target,
-    target === "TIMED_OUT" ? "root_wall_clock_limit_exceeded" : input.reason ?? "cancelled",
+    cause.phase,
+    cause.phase === "TIMED_OUT" ? cause.reason : input.reason ?? cause.reason,
     now,
   );
-  const settledCode: TurnCancellationCode = result.execution.phase === "TIMED_OUT"
-    ? "timed_out"
-    : result.execution.phase === "CANCELLED"
-      ? "cancelled"
-      : "already_terminal";
-  return { execution: result.execution, code: settledCode };
+  return cancellationResultFromSettlement(settled, cause.code);
 }
 
 
@@ -1646,18 +1949,37 @@ export function expireTurnExecution(input: {
   ownerToken: string;
   now?: number;
   db?: Database;
-}): { execution: TurnExecutionRecord; code: "timed_out" | "too_late" | "already_terminal" } {
+}): TurnCancellationResult {
   const db = input.db ?? getDb();
   const current = requireExecution(db, input.executionId).execution;
-  if (current.phase === "COMMITTING" || current.phase === "COMMITTED") return { execution: current, code: "too_late" };
+  if (current.phase === "COMMITTING" || current.phase === "COMMITTED") {
+    return { execution: current, code: "too_late" };
+  }
   if (TERMINAL_PHASE_SET.has(current.phase)) return { execution: current, code: "already_terminal" };
   ensureOwner(current, input.ownerToken);
   const now = input.now ?? nowMs();
-  if (current.deadlineAt > 0 && now < current.deadlineAt) {
-    throw new TurnExecutionError("deadline_exceeded", "execution deadline has not elapsed", { executionId: current.id, phase: current.phase });
+  if (!current.cancelRequested && current.deadlineAt > 0 && now < current.deadlineAt) {
+    throw new TurnExecutionError("deadline_exceeded", "execution deadline has not elapsed", {
+      executionId: current.id,
+      phase: current.phase,
+    });
   }
-  const result = terminalizeWithCas(db, current, input.ownerToken, current.phase, current.casRevision, "TIMED_OUT", "root_wall_clock_limit_exceeded", now);
-  return { execution: result.execution, code: "timed_out" };
+  const cause = current.cancelRequested
+    ? cancellationTerminalCause(current.cancelRequestedAt ?? current.updatedAt, current.deadlineAt)
+    : {
+        phase: "TIMED_OUT" as const,
+        reason: "root_wall_clock_limit_exceeded" as const,
+        code: "timed_out" as const,
+      };
+  const settled = terminalizeWithCancellationMarkerFence(
+    db,
+    current,
+    input.ownerToken,
+    cause.phase,
+    cause.reason,
+    now,
+  );
+  return cancellationResultFromSettlement(settled, cause.code);
 }
 
 export function reserveFinalRender(
@@ -1954,7 +2276,7 @@ function repairCommittedFromReceipt(
 ): TurnExecutionRecord {
   if (current.phase === "COMMITTED") return current;
   if (current.phase !== "COMMITTING") throw new TurnExecutionError("invalid_transition", "only COMMITTING executions can be receipt-repaired", { executionId: current.id, phase: current.phase });
-  const values = terminalUpdateValues("COMMITTED", now, "committed");
+  const values = terminalUpdateValues(db, current, "COMMITTED", now, "committed");
   values.cas_revision = current.casRevision + 1;
   values.phase_revision = current.phaseRevision + 1;
   if (!updateCas(db, current, values, ownerToken, "COMMITTING", current.casRevision)) {
@@ -2042,7 +2364,7 @@ export function finalizeTurnCommit(input: CommitReceiptInput): { execution: Turn
         return;
       }
       const receipt = writeReceipt(db, inside, input, now);
-      const values = terminalUpdateValues("COMMITTED", now, "committed");
+      const values = terminalUpdateValues(db, inside, "COMMITTED", now, "committed");
       values.cas_revision = inside.casRevision + 1;
       values.phase_revision = inside.phaseRevision + 1;
       if (!updateCas(db, inside, values, ownerToken, "COMMITTING", inside.casRevision)) {
@@ -2091,7 +2413,7 @@ export function finalizeTurnCommitInTransaction<T>(
   if (existing) {
     const receipt = receiptFromRow(existing, current);
     if (current.phase === "COMMITTING") {
-      const repairedValues = terminalUpdateValues("COMMITTED", nowMs(), "committed");
+      const repairedValues = terminalUpdateValues(db, current, "COMMITTED", nowMs(), "committed");
       repairedValues.cas_revision = current.casRevision + 1;
       repairedValues.phase_revision = current.phaseRevision + 1;
       if (!updateCas(db, current, repairedValues, ownerToken, "COMMITTING", current.casRevision)) {
@@ -2111,7 +2433,7 @@ export function finalizeTurnCommitInTransaction<T>(
   const value = input.apply(db);
   const now = nowMs();
   const receipt = writeReceipt(db, current, input, now);
-  const values = terminalUpdateValues("COMMITTED", now, "committed");
+  const values = terminalUpdateValues(db, current, "COMMITTED", now, "committed");
   values.cas_revision = current.casRevision + 1;
   values.phase_revision = current.phaseRevision + 1;
   if (!updateCas(db, current, values, ownerToken, "COMMITTING", current.casRevision)) {
@@ -2331,8 +2653,12 @@ function claimForReconciliation(db: Database, current: TurnExecutionRecord, owne
     cas_revision: current.casRevision + 1,
     revision: current.casRevision + 1,
     phase_revision: current.phaseRevision,
-    updated_at: now,
   };
+  const booleanOnlyCancellationMarker = !columns.has("cancel_requested_at")
+    && (columns.has("cancel_requested") || columns.has("cancellation_requested"));
+  // In boolean-only compatibility schemas updated_at is the marker timestamp.
+  // A reconciliation lease claim must not replace first-cause authority.
+  if (!booleanOnlyCancellationMarker) values.updated_at = now;
   const where = ["id = ?"];
   const params: SQLQueryBindings[] = [current.id];
   if (columns.has("phase")) {
@@ -2357,6 +2683,196 @@ function claimForReconciliation(db: Database, current: TurnExecutionRecord, owne
   return requireExecution(db, current.id).execution;
 }
 
+type WorkSegmentRecoveryFence =
+  | Readonly<{ kind: "none" }>
+  | Readonly<{ kind: "pending"; reason: "active_work_segment_recovery" | "terminal_work_handoff_pending" }>
+  | Readonly<{
+      kind: "terminal";
+      phase: "FAILED" | "EXHAUSTED" | "CANCELLED" | "TIMED_OUT";
+      reason: string;
+    }>;
+
+const WORK_SEGMENT_TERMINAL_PHASE: Readonly<Record<
+  "failed" | "exhausted" | "cancelled",
+  "FAILED" | "EXHAUSTED" | "CANCELLED"
+>> = Object.freeze({
+  failed: "FAILED",
+  exhausted: "EXHAUSTED",
+  cancelled: "CANCELLED",
+});
+
+function invalidWorkSegmentRecovery(
+  execution: TurnExecutionRecord,
+  message: string,
+): TurnExecutionError {
+  return new TurnExecutionError("execution_schema_unavailable", message, {
+    executionId: execution.id,
+    phase: execution.phase,
+  });
+}
+
+/**
+ * Classify the exact durable V1 WORK-chain authority before generic startup
+ * recovery is allowed to claim the Turn Execution. A successful terminal
+ * transition still owns final render/commit recovery, while a terminal close
+ * is already sufficient authority for a typed Turn Execution terminal CAS.
+ */
+function workSegmentRecoveryFence(
+  db: Database,
+  execution: TurnExecutionRecord,
+): WorkSegmentRecoveryFence {
+  if (execution.phase !== "WORK" || !hasTable(db, "agent_work_segment_recovery")) {
+    return { kind: "none" };
+  }
+  const recovery = db.query(`SELECT
+      user_id, execution_id, attempt_id, workspace_id, workspace_revision,
+      execution_cas_revision, state, phase_id, phase_index, phase_occurrence,
+      next_segment_ordinal, current_segment_id, terminal_close_result,
+      terminal_close_reason, terminal_boundary_class, schema_version, record_complete
+    FROM agent_work_segment_recovery
+    WHERE user_id = ? AND execution_id = ?`)
+    .get(execution.userId, execution.id) as Record<string, unknown> | null;
+  if (!recovery) return { kind: "none" };
+
+  const invalid = (message: string): never => {
+    throw invalidWorkSegmentRecovery(execution, message);
+  };
+  const recoveryAttemptId = rowString(recovery, "attempt_id");
+  const recoveryWorkspaceId = rowString(recovery, "workspace_id");
+  const recoveryWorkspaceRevision = rowNumber(recovery, "workspace_revision");
+  const recoveryExecutionRevision = rowNumber(recovery, "execution_cas_revision");
+  if (
+    rowNumber(recovery, "schema_version") !== 1
+    || rowNumber(recovery, "record_complete") !== 1
+    || rowString(recovery, "user_id") !== execution.userId
+    || rowString(recovery, "execution_id") !== execution.id
+    || recoveryAttemptId !== execution.attemptLineage.attemptId
+    || recoveryWorkspaceId === null
+    || recoveryWorkspaceId !== execution.workspaceId
+    || recoveryWorkspaceRevision === null
+    || recoveryWorkspaceRevision !== execution.workspaceRevision
+    || recoveryExecutionRevision === null
+    || recoveryExecutionRevision !== execution.casRevision
+  ) {
+    return invalid("WORK segment recovery authority does not match its Turn Execution fence");
+  }
+
+  const state = rowString(recovery, "state");
+  if (state === "active") {
+    return { kind: "pending", reason: "active_work_segment_recovery" };
+  }
+  if (state !== "closed"
+    || recovery.current_segment_id !== null
+    || recovery.phase_id !== null
+    || recovery.phase_index !== null
+    || recovery.phase_occurrence !== null) {
+    return invalid("closed WORK segment recovery authority is malformed");
+  }
+  if (!hasTable(db, "agent_work_segments") || !hasTable(db, "agent_work_segment_transitions")) {
+    return invalid("closed WORK segment recovery ledger is unavailable");
+  }
+
+  const nextSegmentOrdinal = rowNumber(recovery, "next_segment_ordinal");
+  if (nextSegmentOrdinal === null || !Number.isSafeInteger(nextSegmentOrdinal) || nextSegmentOrdinal < 1) {
+    return invalid("closed WORK segment recovery cursor is invalid");
+  }
+  const source = db.query(`SELECT
+      segment_id, attempt_id, workspace_id, workspace_revision, execution_cas_revision,
+      segment_ordinal, lifecycle, close_result, close_reason, boundary_class,
+      closed_workspace_revision, closed_execution_cas_revision, closure_digest,
+      schema_version, record_complete
+    FROM agent_work_segments
+    WHERE user_id = ? AND execution_id = ? AND segment_ordinal = ?`)
+    .get(execution.userId, execution.id, nextSegmentOrdinal - 1) as Record<string, unknown> | null;
+  const sourceSegmentId = source ? rowString(source, "segment_id") : null;
+  const sourceWorkspaceRevision = source ? rowNumber(source, "workspace_revision") : null;
+  const sourceExecutionRevision = source ? rowNumber(source, "execution_cas_revision") : null;
+  const sourceClosedExecutionRevision = source ? rowNumber(source, "closed_execution_cas_revision") : null;
+  if (
+    !source
+    || sourceSegmentId === null
+    || rowNumber(source, "schema_version") !== 1
+    || rowNumber(source, "record_complete") !== 1
+    || rowString(source, "attempt_id") !== recoveryAttemptId
+    || rowString(source, "workspace_id") !== recoveryWorkspaceId
+    || sourceWorkspaceRevision === null
+    || sourceWorkspaceRevision > recoveryWorkspaceRevision!
+    || sourceExecutionRevision === null
+    || sourceExecutionRevision > recoveryExecutionRevision!
+    || rowNumber(source, "segment_ordinal") !== nextSegmentOrdinal - 1
+    || rowNumber(source, "closed_workspace_revision") !== recoveryWorkspaceRevision
+    || sourceClosedExecutionRevision === null
+    || sourceClosedExecutionRevision > recoveryExecutionRevision!
+    || rowString(source, "closure_digest")?.length !== 64
+  ) {
+    return invalid("closed WORK segment source does not match its recovery authority");
+  }
+
+  const closeResultValue = recovery.terminal_close_result;
+  if (closeResultValue === null) {
+    if (recovery.terminal_close_reason !== null || recovery.terminal_boundary_class !== null
+      || rowString(source, "lifecycle") !== "closed"
+      || rowString(source, "close_result") !== "work_complete"
+      || rowString(source, "close_reason") !== "transition:terminal") {
+      return invalid("terminal WORK handoff close is malformed");
+    }
+    const transition = db.query(`SELECT
+        attempt_id, workspace_id, workspace_revision, execution_cas_revision,
+        transition_kind, target_phase_id, target_phase_index,
+        target_phase_occurrence, target_segment_ordinal,
+        remaining_required_phase_count, schema_version, record_complete
+      FROM agent_work_segment_transitions
+      WHERE user_id = ? AND execution_id = ? AND source_segment_id = ?`)
+      .get(execution.userId, execution.id, sourceSegmentId) as Record<string, unknown> | null;
+    if (
+      !transition
+      || rowNumber(transition, "schema_version") !== 1
+      || rowNumber(transition, "record_complete") !== 1
+      || rowString(transition, "attempt_id") !== recoveryAttemptId
+      || rowString(transition, "workspace_id") !== recoveryWorkspaceId
+      || rowNumber(transition, "workspace_revision") !== recoveryWorkspaceRevision
+      || rowNumber(transition, "execution_cas_revision") !== sourceClosedExecutionRevision
+      || rowString(transition, "transition_kind") !== "terminal"
+      || transition.target_phase_id !== null
+      || transition.target_phase_index !== null
+      || transition.target_phase_occurrence !== null
+      || transition.target_segment_ordinal !== null
+      || rowNumber(transition, "remaining_required_phase_count") !== 0
+    ) {
+      return invalid("terminal WORK handoff authority is incomplete");
+    }
+    return { kind: "pending", reason: "terminal_work_handoff_pending" };
+  }
+
+  if (closeResultValue !== "failed" && closeResultValue !== "exhausted" && closeResultValue !== "cancelled") {
+    return invalid("terminal WORK close result is invalid");
+  }
+  const reason = rowString(recovery, "terminal_close_reason");
+  const sourceTransition = db.query(
+    `SELECT 1 FROM agent_work_segment_transitions
+      WHERE user_id = ? AND execution_id = ? AND source_segment_id = ? LIMIT 1`,
+  ).get(execution.userId, execution.id, sourceSegmentId);
+  if (
+    reason === null
+    || reason.length === 0
+    || byteLength(reason) > 256
+    || sourceTransition != null
+    || rowString(source, "lifecycle") !== closeResultValue
+    || rowString(source, "close_result") !== closeResultValue
+    || rowString(source, "close_reason") !== reason
+    || rowString(source, "boundary_class") !== rowString(recovery, "terminal_boundary_class")
+  ) {
+    return invalid("terminal WORK close does not match its durable source segment");
+  }
+  return {
+    kind: "terminal",
+    phase: closeResultValue === "failed" && reason === "root_wall_clock_limit_exceeded"
+      ? "TIMED_OUT"
+      : WORK_SEGMENT_TERMINAL_PHASE[closeResultValue],
+    reason,
+  };
+}
+
 function projectionNeedsReceiptRepair(db: Database, execution: TurnExecutionRecord): boolean {
   if (!hasTable(db, "agent_run_projections") || !hasTable(db, "agent_chat_events")) return false;
   const row = db.query(
@@ -2378,6 +2894,48 @@ function projectionNeedsReceiptRepair(db: Database, execution: TurnExecutionReco
     terminal_event_present?: number;
   } | null;
   return row?.status !== "COMMITTED" || Number(row?.terminal_event_present ?? 0) !== 1;
+}
+
+function markCommittedTerminalConvergence(
+  db: Database,
+  execution: TurnExecutionRecord,
+  now = nowMs(),
+): TurnExecutionRecord {
+  if (execution.phase !== "COMMITTED" || execution.terminalEventId) return execution;
+  if (!hasTable(db, "agent_run_projections") || !hasTable(db, "agent_chat_events")) return execution;
+  if (projectionNeedsReceiptRepair(db, execution)) return execution;
+
+  const executionColumns = tableColumns(db, "agent_turn_executions");
+  const terminalEventColumn = firstColumn(executionColumns, "terminal_event_id", "terminal_event_key");
+  if (!terminalEventColumn) return execution;
+  const terminalEventSql = quoteColumn(terminalEventColumn);
+  const values: Record<string, unknown> = {
+    [terminalEventColumn]: randomId("terminal"),
+    cas_revision: execution.casRevision + 1,
+    revision: execution.casRevision + 1,
+    updated_at: now,
+  };
+  const emittedAtColumn = firstColumn(executionColumns, "terminal_event_emitted_at");
+  if (emittedAtColumn) values[emittedAtColumn] = now;
+
+  if (!updateCas(
+    db,
+    execution,
+    values,
+    null,
+    "COMMITTED",
+    execution.casRevision,
+    [`(typeof(${terminalEventSql}) <> 'text' OR ${terminalEventSql} = '')`],
+  )) {
+    const latest = requireExecution(db, execution.id).execution;
+    if (latest.phase === "COMMITTED" && latest.terminalEventId) return latest;
+    throw new TurnExecutionError(
+      "stale_execution",
+      "committed execution changed before terminal convergence",
+      { executionId: execution.id, phase: execution.phase },
+    );
+  }
+  return requireExecution(db, execution.id).execution;
 }
 
 const NONCOMMITTED_TERMINAL_PHASES: readonly TerminalTurnPhase[] = [
@@ -2454,6 +3012,16 @@ function adoptPublishedTerminalAuthority(
   const fromInterruptedFailure = current.phase === "FAILED" && current.terminalCode === "process_interrupted";
   const fromReversible = REVERSIBLE_PHASE_SET.has(current.phase);
   if (!fromInterruptedFailure && !fromReversible) return null;
+  if (current.cancelRequested || authority.phase === "CANCELLED" || authority.phase === "TIMED_OUT") {
+    return terminalizeWithCancellationMarkerFence(
+      db,
+      current,
+      ownerToken,
+      authority.phase,
+      authority.reason,
+      now,
+    ).outcome.execution;
+  }
   return terminalizeWithCas(
     db,
     current,
@@ -2588,6 +3156,7 @@ function terminalProjectionErrorCodeForExecution(
 ): string | null {
   const code = execution.terminalCode?.trim().toLowerCase() ?? "";
   if (code === "decision_refresh_required") return "decision_refresh_required";
+  if (code === "agentic_runtime_unavailable") return "invalid_input";
   if (code === "agentic_work_exhausted") return "limit_exceeded";
   if (code && AGENT_PUBLIC_ERROR_CODES_SET.has(code)) return code;
   if (inspectionReason === "needs_attention" || code === "terminal_publication_failed") {
@@ -3834,6 +4403,10 @@ function reconciliationCandidateQuery(db: Database, now: number): {
         OR e.${quoteColumn("expires_at")} > ${now})`
     : "CAST(1 AS INTEGER)";
   const phaseValues = [...REVERSIBLE_TURN_PHASES, "COMMITTING"] as const;
+  const terminalEventColumn = firstColumn(executionColumns, "terminal_event_id", "terminal_event_key");
+  const terminalEventNeedsConvergence = terminalEventColumn
+    ? `(typeof(e.${quoteColumn(terminalEventColumn)}) <> 'text' OR e.${quoteColumn(terminalEventColumn)} = '')`
+    : "CAST(0 AS INTEGER)";
   const terminalRecoveryAvailable = terminalRecoveryTablesAvailable(db);
   const terminalRepairPhases = terminalRecoveryAvailable
     ? NONCOMMITTED_TERMINAL_PHASES.map((value) => `'${value}'`).join(", ")
@@ -3902,7 +4475,7 @@ function reconciliationCandidateQuery(db: Database, now: number): {
         ${retainedTerminal}
         AND ${phase} = 'COMMITTED'
         AND ${receiptExists}
-        AND (${projectionNeedsRepair})
+        AND ((${projectionNeedsRepair}) OR ${terminalEventNeedsConvergence})
       )`;
       candidatePredicates.push(committedRepair);
       priorityPredicates.push(`(${phase} = 'COMMITTING' AND ${receiptExists})`);
@@ -3987,6 +4560,7 @@ export function reconcileTerminalAgentTurn(
         receipt,
         historicalTargetRedaction ? { historicalTargetRedaction: true } : undefined,
       );
+      markCommittedTerminalConvergence(db, latest);
     })();
     return true;
   }
@@ -4127,6 +4701,7 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
                   receipt,
                   historicalTargetRedaction ? { historicalTargetRedaction: true } : undefined,
                 );
+                markCommittedTerminalConvergence(db, latest);
               })();
               if (needsRepair && !projectionNeedsReceiptRepair(db, current)) {
                 result.projectionRepairs++;
@@ -4157,6 +4732,76 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
         }
         continue;
       }
+      if (current.phase === "WORK" && hasTable(db, "agent_work_segment_recovery")) {
+        let segmentFence: WorkSegmentRecoveryFence;
+        try {
+          segmentFence = workSegmentRecoveryFence(db, current);
+        } catch (error) {
+          result.complete = false;
+          noteFailure("WORK", error, current.id);
+          continue;
+        }
+        if (segmentFence.kind === "pending") {
+          result.complete = false;
+          noteFailure("WORK", new Error(segmentFence.reason), current.id);
+          // The specialized V1 recovery drain owns both active segments and a
+          // closed work-complete handoff. Generic interruption must wait until
+          // that drain advances or terminalizes the Turn Execution.
+          continue;
+        }
+        if (segmentFence.kind === "terminal") {
+          const terminalFence = segmentFence;
+          try {
+            let outcome: TransitionTurnExecutionResult | undefined;
+            db.transaction(() => {
+              const latest = requireExecution(db, current.id).execution;
+              if (latest.phase !== "WORK" || latest.casRevision !== current.casRevision) {
+                throw new TurnExecutionError("stale_execution", "WORK execution changed before terminal close convergence", {
+                  executionId: current.id,
+                  phase: latest.phase,
+                });
+              }
+              const latestFence = workSegmentRecoveryFence(db, latest);
+              if (latestFence.kind !== "terminal"
+                || latestFence.phase !== terminalFence.phase
+                || latestFence.reason !== terminalFence.reason) {
+                throw invalidWorkSegmentRecovery(latest, "terminal WORK close authority changed before convergence");
+              }
+              const settled = terminalizeWithCancellationMarkerFence(
+                db,
+                latest,
+                latest.casOwner,
+                terminalFence.phase,
+                terminalFence.reason,
+                now,
+              );
+              outcome = settled.outcome;
+              if (!settled.markerCause
+                && (outcome.execution.phase !== terminalFence.phase
+                  || outcome.execution.terminalCode !== terminalCodeFor(terminalFence.phase, terminalFence.reason))) {
+                throw invalidWorkSegmentRecovery(outcome.execution, "terminal WORK close lost its typed Turn Execution cause");
+              }
+            })();
+            if (!outcome) {
+              throw invalidWorkSegmentRecovery(current, "terminal WORK close convergence produced no Turn Execution");
+            }
+            try {
+              if (terminalRecoveryTablesAvailable(db)
+                && reconcileTerminalExecutionProjection(db, outcome.execution)) {
+                result.projectionRepairs++;
+              }
+            } catch (error) {
+              result.complete = false;
+              noteFailure(terminalFence.phase, error, current.id);
+            }
+            if (current.finalRenderReservationKey) result.releasedReservations++;
+          } catch (error) {
+            result.complete = false;
+            noteFailure("WORK", error, current.id);
+          }
+          continue;
+        }
+      }
       const ownerToken = randomId("reconcile");
       const claimed = claimForReconciliation(db, current, ownerToken, now);
       if (!claimed) {
@@ -4180,36 +4825,46 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
             if (claimed.finalRenderReservationKey) result.releasedReservations++;
             continue;
           }
+          const interruptionCause = claimed.cancelRequested
+            ? cancellationTerminalCause(claimed.cancelRequestedAt ?? claimed.updatedAt, claimed.deadlineAt)
+            : null;
+          const terminalPhase: TerminalTurnPhase = interruptionCause?.phase ?? "FAILED";
+          const terminalReason = interruptionCause?.reason ?? "process_interrupted";
           let outcome: TransitionTurnExecutionResult | undefined;
           db.transaction(() => {
-            outcome = terminalizeWithCas(
-              db,
-              claimed,
-              ownerToken,
-              claimed.phase,
-              claimed.casRevision,
-              "FAILED",
-              "process_interrupted",
-              now,
-            );
+            outcome = interruptionCause
+              ? terminalizeWithCancellationMarkerFence(
+                  db,
+                  claimed,
+                  ownerToken,
+                  interruptionCause.phase,
+                  interruptionCause.reason,
+                  now,
+                ).outcome
+              : terminalizeWithCas(
+                  db,
+                  claimed,
+                  ownerToken,
+                  claimed.phase,
+                  claimed.casRevision,
+                  terminalPhase,
+                  terminalReason,
+                  now,
+                );
           })();
           if (outcome?.terminalEventEmitted) {
             try {
               if (terminalRecoveryTablesAvailable(db)) {
-                // Keep the registered projection-only repairer in the loop
-                // before the richer inspection+projection transaction. This
-                // preserves the existing public repair contract; the built-in
-                // pass then supplies the durable private inspection boundary.
-                invokeTerminalRecovery(outcome.execution, "FAILED");
+                if (terminalPhase === "FAILED") invokeTerminalRecovery(outcome.execution, "FAILED");
                 if (reconcileTerminalExecutionProjection(db, outcome.execution)) result.projectionRepairs++;
-              } else {
+              } else if (terminalPhase === "FAILED") {
                 invokeTerminalRecovery(outcome.execution, "FAILED");
               }
             } catch (error) {
               result.complete = false
               noteFailure(claimed.phase, error, claimed.id)
             }
-            result.failedInterrupted++;
+            if (terminalPhase === "FAILED") result.failedInterrupted++;
           }
           if (claimed.finalRenderReservationKey) result.releasedReservations++;
         } catch (error) {
@@ -4235,6 +4890,7 @@ export function reconcileAgentTurns(db: Database = getDb()): ReconcileAgentTurns
             const repaired = repairCommittedFromReceipt(db, latest, receipt, ownerToken, now, false);
             reconcileCommittedPersistentSession(db, repaired);
             invokeReceiptRepair(repaired, receipt);
+            markCommittedTerminalConvergence(db, repaired, now);
           })();
           result.committedFromReceipt++;
           if (needsRepair && !projectionNeedsReceiptRepair(db, claimed)) {

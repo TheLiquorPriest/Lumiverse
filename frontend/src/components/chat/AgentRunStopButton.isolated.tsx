@@ -5,7 +5,7 @@ import type { Root } from 'react-dom/client'
 import * as actualReactI18next from 'react-i18next'
 import { createInstance } from 'i18next'
 import type { AgentRunStopResultV2 } from '@/types/agent-runs'
-const stopCalls: Array<{ turnId: string; input?: { generationId?: string; chatId?: string } }> = []
+const stopCalls: Array<{ turnId: string; input?: { generationId?: string; chatId?: string; requestAuthorityId?: string } }> = []
 const pendingStops: Array<{
   promise: Promise<AgentRunStopResultV2>
   resolve(value: AgentRunStopResultV2): void
@@ -14,7 +14,7 @@ const pendingStops: Array<{
 
 mock.module('@/api/agent-runs', () => ({
   agentRunsApi: {
-    stop(turnId: string, input?: { generationId?: string; chatId?: string }) {
+    stop(turnId: string, input?: { generationId?: string; chatId?: string; requestAuthorityId?: string }) {
       stopCalls.push({ turnId, input })
       const pending = Promise.withResolvers<AgentRunStopResultV2>()
       pendingStops.push(pending)
@@ -67,6 +67,7 @@ type RenderStopButtonOptions = {
   turnId?: string
   chatId?: string
   generationId?: string
+  requestAuthorityId?: string
   terminal?: boolean
   onBeforeStop?: () => void
   onResult?: (result: AgentRunStopResultV2) => void
@@ -81,6 +82,7 @@ async function renderStopButton(
     turnId: string
     chatId: string
     generationId: string
+    requestAuthorityId: string
     terminal: boolean
     onBeforeStop?: () => void
     onResult?: (result: AgentRunStopResultV2) => void
@@ -89,6 +91,7 @@ async function renderStopButton(
     turnId: initialOptions.turnId ?? 'turn-1',
     chatId: initialOptions.chatId ?? 'chat-1',
     generationId: initialOptions.generationId ?? 'generation-1',
+    requestAuthorityId: initialOptions.requestAuthorityId ?? '11111111-1111-4111-8111-111111111111',
     terminal: initialOptions.terminal ?? false,
     onBeforeStop: initialOptions.onBeforeStop,
     onResult: initialOptions.onResult,
@@ -103,6 +106,7 @@ async function renderStopButton(
       turnId: nextOptions.turnId ?? props.turnId,
       chatId: nextOptions.chatId ?? props.chatId,
       generationId: nextOptions.generationId ?? props.generationId,
+      requestAuthorityId: nextOptions.requestAuthorityId ?? props.requestAuthorityId,
       terminal: nextOptions.terminal === undefined ? props.terminal : nextOptions.terminal,
       onBeforeStop: nextOptions.onBeforeStop === undefined ? props.onBeforeStop : nextOptions.onBeforeStop,
       onResult: nextOptions.onResult === undefined ? props.onResult : nextOptions.onResult,
@@ -158,7 +162,7 @@ describe('AgentRunStopButton', () => {
 
     expect(stopCalls).toEqual([{
       turnId: 'turn-1',
-      input: { chatId: 'chat-1', generationId: 'generation-1' },
+      input: { chatId: 'chat-1', generationId: 'generation-1', requestAuthorityId: '11111111-1111-4111-8111-111111111111' },
     }])
     expect(button.disabled).toBeTrue()
     expect(button.textContent).toContain('agentRuntime.stop.stopping')
@@ -197,8 +201,8 @@ describe('AgentRunStopButton', () => {
 
     await act(async () => newButton.click())
     expect(stopCalls).toEqual([
-      { turnId: 'turn-1', input: { chatId: 'chat-1', generationId: 'generation-1' } },
-      { turnId: 'turn-1', input: { chatId: 'chat-1', generationId: 'generation-2' } },
+      { turnId: 'turn-1', input: { chatId: 'chat-1', generationId: 'generation-1', requestAuthorityId: '11111111-1111-4111-8111-111111111111' } },
+      { turnId: 'turn-1', input: { chatId: 'chat-1', generationId: 'generation-2', requestAuthorityId: '11111111-1111-4111-8111-111111111111' } },
     ])
   })
 

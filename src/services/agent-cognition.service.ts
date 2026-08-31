@@ -321,15 +321,20 @@ export const parseCognitionPredicateV1 = parseCognitionPredicate;
 export const validateCognitionPredicateV1 = parseCognitionPredicate;
 export const validateCognitionPredicate = parseCognitionPredicate;
 
+function loomOccurrenceKey(blockId: string, promptOrder: number): string {
+  return `${blockId.length}:${blockId}:${promptOrder}`;
+}
+
 function parseBlockRef(value: unknown, path: string, budget: ParseBudget): CognitionLoomBlockRefV1 {
   const object = record(value, path);
-  exactKeys(object, ["blockId", "expectedPresetRevision", "expectedBlockRevision"], path);
+  exactKeys(object, ["blockId", "expectedPresetRevision", "expectedBlockRevision", "promptOrder"], path);
   const blockId = ensureId(object.blockId, `${path}.blockId`);
   accountListBytes(budget, blockId, `${path}.blockId`);
   return {
     blockId,
     expectedPresetRevision: ensureRevision(object.expectedPresetRevision, `${path}.expectedPresetRevision`),
     expectedBlockRevision: ensureRevision(object.expectedBlockRevision, `${path}.expectedBlockRevision`),
+    promptOrder: ensureRevision(object.promptOrder, `${path}.promptOrder`),
   };
 }
 
@@ -339,8 +344,9 @@ function parseBlockRefs(value: unknown, path: string, budget: ParseBudget): Cogn
   const seen = new Set<string>();
   for (let index = 0; index < values.length; index += 1) {
     const ref = parseBlockRef(values[index], `${path}[${index}]`, budget);
-    if (seen.has(ref.blockId)) fail("duplicate_id", `${path}[${index}].blockId`, "duplicate block reference");
-    seen.add(ref.blockId);
+    const occurrenceKey = loomOccurrenceKey(ref.blockId, ref.promptOrder);
+    if (seen.has(occurrenceKey)) fail("duplicate_id", `${path}[${index}].blockId`, "duplicate block occurrence reference");
+    seen.add(occurrenceKey);
     result.push(ref);
   }
   return result;
@@ -435,8 +441,8 @@ export function parseLoomPolicyBuckets(value: unknown): LoomPolicyBucketsV1 {
 export const parseLoomPolicyBucketsV1 = parseLoomPolicyBuckets;
 
 function loomSourceForRef(ref: CognitionLoomBlockRefV1, source: CognitionSourceSnapshotV1, path: string): LoomPolicySourceV1 {
-  const block = source.blocks.find((candidate) => candidate.blockId === ref.blockId);
-  if (!block) fail("missing_reference", `${path}.blockId`, "Loom block is missing from the source snapshot");
+  const block = source.blocks.find((candidate) => candidate.promptOrder === ref.promptOrder);
+  if (!block || block.blockId !== ref.blockId) fail("missing_reference", `${path}.blockId`, "Loom block occurrence is missing from the source snapshot");
   if (ref.expectedPresetRevision !== source.presetRevision) fail("revision_mismatch", `${path}.expectedPresetRevision`, "preset revision does not match the frozen source");
   if (ref.expectedBlockRevision !== block.revision) fail("revision_mismatch", `${path}.expectedBlockRevision`, "block revision does not match the frozen source");
   return { kind: "loom_block", blockId: block.blockId, presetRevision: source.presetRevision, blockRevision: block.revision, promptOrder: block.promptOrder };
@@ -447,7 +453,7 @@ function policyEntriesFromRefs(refs: CognitionPolicyRefsV1, source: CognitionSou
     bucket,
     sortLoomPolicyEntries(refs[bucket].map((ref, index) => ({
       version: LOOM_POLICY_VERSION,
-      id: `${bucket}-${ref.blockId}`,
+      id: `${bucket}-${ref.promptOrder}-${ref.blockId}`,
       source: loomSourceForRef(ref, source, `policies.${bucket}[${index}]`),
       destination: LOOM_BUCKET_DESTINATION[bucket],
       checkpoint: LOOM_BUCKET_CHECKPOINT[bucket],
@@ -459,19 +465,18 @@ function policyEntriesFromRefs(refs: CognitionPolicyRefsV1, source: CognitionSou
 }
 
 function validateLoomPolicySources(policies: LoomPolicyBucketsV1, source: CognitionSourceSnapshotV1): void {
-  const sourceById = new Map(source.blocks.map((block) => [block.blockId, block] as const));
+  const sourceByPromptOrder = new Map(source.blocks.map((block) => [block.promptOrder, block] as const));
   for (const bucket of LOOM_POLICY_BUCKETS) {
     for (const [index, entry] of policies[bucket].entries()) {
-      const block = sourceById.get(entry.source.blockId);
-      if (!block) {
-        if (entry.required) fail("missing_reference", `policies.${bucket}[${index}].source.blockId`, "Loom block is missing from the source snapshot");
+      const block = sourceByPromptOrder.get(entry.source.promptOrder);
+      if (!block || block.blockId !== entry.source.blockId) {
+        if (entry.required) fail("missing_reference", `policies.${bucket}[${index}].source.blockId`, "Loom block occurrence is missing from the source snapshot");
         continue;
       }
       if (entry.source.presetRevision !== source.presetRevision || entry.source.blockRevision !== block.revision) {
         if (entry.required) fail("revision_mismatch", `policies.${bucket}[${index}].source`, "source revision does not match the frozen source");
         continue;
       }
-      if (entry.source.promptOrder !== block.promptOrder && entry.required) fail("revision_mismatch", `policies.${bucket}[${index}].source.promptOrder`, "source Loom order does not match the frozen source");
     }
   }
 }
@@ -556,7 +561,11 @@ export function parseCognitionSourceSnapshot(value: unknown): CognitionSourceSna
     accountListBytes(budget, blockId, `source.blocks[${index}].blockId`);
     return { blockId, revision: ensureRevision(block.revision, `source.blocks[${index}].revision`), promptOrder: ensureRevision(block.promptOrder, `source.blocks[${index}].promptOrder`) };
   });
-  assertUniqueIds(blocks.map((item) => item.blockId), "source.blocks");
+  const promptOrders = new Set<number>();
+  for (const [index, block] of blocks.entries()) {
+    if (promptOrders.has(block.promptOrder)) fail("duplicate_id", `source.blocks[${index}].promptOrder`, "duplicate prompt-order occurrence");
+    promptOrders.add(block.promptOrder);
+  }
   blocks.sort((left, right) => compareNumber(left.promptOrder, right.promptOrder) || compareUtf8(left.blockId, right.blockId));
   return { presetRevision: ensureRevision(object.presetRevision, "source.presetRevision"), blocks };
 }
@@ -636,21 +645,20 @@ function dependencyClosure(ids: readonly string[], dependencies: ReadonlyMap<str
 }
 
 function normalizePolicyRefs(policies: CognitionPolicyRefsV1, source: CognitionSourceSnapshotV1): { policies: CognitionPolicyRefsV1; blockRevisions: CognitionFrozenSourceRevisionsV1["blockRevisions"] } {
-  const sourceById = new Map(source.blocks.map((block) => [block.blockId, block] as const));
-  const selected = new Map<string, number>();
+  const sourceByPromptOrder = new Map(source.blocks.map((block) => [block.promptOrder, block] as const));
+  const selected = new Map<number, CognitionSourceBlockV1>();
   const normalize = (refs: readonly CognitionLoomBlockRefV1[], path: string): CognitionLoomBlockRefV1[] => {
-    const result: Array<CognitionLoomBlockRefV1 & { promptOrder: number }> = [];
+    const result: CognitionLoomBlockRefV1[] = [];
     for (let index = 0; index < refs.length; index += 1) {
       const ref = refs[index];
-      const block = sourceById.get(ref.blockId);
-      if (!block) fail("missing_reference", `${path}[${index}].blockId`, "Loom block is missing from the source snapshot");
+      const block = sourceByPromptOrder.get(ref.promptOrder);
+      if (!block || block.blockId !== ref.blockId) fail("missing_reference", `${path}[${index}].blockId`, "Loom block occurrence is missing from the source snapshot");
       if (ref.expectedPresetRevision !== source.presetRevision) fail("revision_mismatch", `${path}[${index}].expectedPresetRevision`, "preset revision does not match the frozen source");
       if (ref.expectedBlockRevision !== block.revision) fail("revision_mismatch", `${path}[${index}].expectedBlockRevision`, "block revision does not match the frozen source");
-      selected.set(ref.blockId, block.revision);
-      result.push({ ...ref, promptOrder: block.promptOrder });
+      selected.set(ref.promptOrder, block);
+      result.push(ref);
     }
-    result.sort((left, right) => compareNumber(left.promptOrder, right.promptOrder) || compareUtf8(left.blockId, right.blockId));
-    return result.map(({ promptOrder: _promptOrder, ...ref }) => ref);
+    return result.sort((left, right) => compareNumber(left.promptOrder, right.promptOrder) || compareUtf8(left.blockId, right.blockId));
   };
   const normalized = {
     workPolicy: normalize(policies.workPolicy, "policies.workPolicy"),
@@ -658,7 +666,8 @@ function normalizePolicyRefs(policies: CognitionPolicyRefsV1, source: CognitionS
     completionCriteria: normalize(policies.completionCriteria, "policies.completionCriteria"),
     renderPolicy: normalize(policies.renderPolicy, "policies.renderPolicy"),
   } satisfies CognitionPolicyRefsV1;
-  const blockRevisions = [...selected.entries()].map(([blockId, revision]) => ({ blockId, revision })).sort((left, right) => compareUtf8(left.blockId, right.blockId));
+  const blockRevisions = [...selected.values()].map((block) => ({ blockId: block.blockId, revision: block.revision, promptOrder: block.promptOrder }))
+    .sort((left, right) => compareNumber(left.promptOrder, right.promptOrder) || compareUtf8(left.blockId, right.blockId));
   return { policies: normalized, blockRevisions };
 }
 
@@ -700,13 +709,13 @@ export interface FrozenAgentCognitionV1 {
 const EMPTY_COGNITION_POLICY: CognitionPolicyRefsV1 = Object.freeze({ workPolicy: Object.freeze([]), workspaceUsage: Object.freeze([]), completionCriteria: Object.freeze([]), renderPolicy: Object.freeze([]) });
 
 function refsFromLoomPolicyBuckets(policies: LoomPolicyBucketsV1, source: CognitionSourceSnapshotV1): CognitionPolicyRefsV1 {
-  const sourceById = new Map(source.blocks.map((block) => [block.blockId, block] as const));
+  const sourceByPromptOrder = new Map(source.blocks.map((block) => [block.promptOrder, block] as const));
   const refs = Object.fromEntries(LOOM_POLICY_BUCKETS.map((bucket) => [
     bucket,
     policies[bucket].filter((entry) => {
-      const block = sourceById.get(entry.source.blockId);
-      return block !== undefined && entry.source.presetRevision === source.presetRevision && entry.source.blockRevision === block.revision && entry.source.promptOrder === block.promptOrder;
-    }).map((entry) => ({ blockId: entry.source.blockId, expectedPresetRevision: entry.source.presetRevision, expectedBlockRevision: entry.source.blockRevision })),
+      const block = sourceByPromptOrder.get(entry.source.promptOrder);
+      return block !== undefined && block.blockId === entry.source.blockId && entry.source.presetRevision === source.presetRevision && entry.source.blockRevision === block.revision;
+    }).map((entry) => ({ blockId: entry.source.blockId, expectedPresetRevision: entry.source.presetRevision, expectedBlockRevision: entry.source.blockRevision, promptOrder: entry.source.promptOrder })),
   ])) as Record<LoomPolicyBucketV1, CognitionLoomBlockRefV1[]>;
   return { workPolicy: refs.workPolicy, workspaceUsage: refs.workspaceUsage, completionCriteria: refs.completionCriteria, renderPolicy: refs.renderPolicy };
 }
@@ -887,8 +896,8 @@ function loomSourcePin(source: LoomPolicySourceV1): string {
   return `${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`;
 }
 
-function loomDestBlockKey(destination: LoomPolicyDestinationV1, blockId: string): string {
-  return `${destination}\u0000${blockId}`;
+function loomDestBlockKey(destination: LoomPolicyDestinationV1, source: LoomPolicySourceV1): string {
+  return `${destination}:${loomOccurrenceKey(source.blockId, source.promptOrder)}`;
 }
 
 function conflictingDestBlockEntryIds(policies: LoomPolicyBucketsV1): ReadonlySet<string> {
@@ -896,7 +905,7 @@ function conflictingDestBlockEntryIds(policies: LoomPolicyBucketsV1): ReadonlySe
   const conflicting = new Set<string>();
   for (const bucket of LOOM_POLICY_BUCKETS) {
     for (const entry of policies[bucket]) {
-      const key = loomDestBlockKey(entry.destination, entry.source.blockId);
+      const key = loomDestBlockKey(entry.destination, entry.source);
       const pin = loomSourcePin(entry.source);
       const group = groups.get(key);
       if (!group) {
@@ -1127,7 +1136,7 @@ export function inspectLoomPromptPolicies(policiesValue: unknown, input: LoomPro
       if (!item || (item.outcome.status === "skipped" && item.outcome.reason === "checkpoint_not_reached")) {
         fail("invalid_value", `inspection.previousInspection.items[${index}]`, "previous inspection did not decide a reached entry");
       }
-      const deduplicationKey = loomDestBlockKey(item.destination, item.source.blockId);
+      const deduplicationKey = loomDestBlockKey(item.destination, item.source);
       if (item.outcome.status === "included") {
         if (item.outcome.effectiveIndex !== effectiveEntryIds.length || keptByDestinationBlock.has(deduplicationKey)) {
           fail("invalid_value", `inspection.previousInspection.items[${index}].outcome`, "previous inspection inclusion order is invalid");
@@ -1172,7 +1181,7 @@ export function inspectLoomPromptPolicies(policiesValue: unknown, input: LoomPro
         continue;
       }
     }
-    const deduplicationKey = loomDestBlockKey(entry.destination, entry.source.blockId);
+    const deduplicationKey = loomDestBlockKey(entry.destination, entry.source);
     const keptEntryId = keptByDestinationBlock.get(deduplicationKey);
     if (keptEntryId) {
       items.push(loomPromptInspectionItem(entry, bucket, { status: "deduplicated", reason: "destination_overlap", keptEntryId, destination: entry.destination }, block.content, conditionResult));

@@ -14,6 +14,7 @@ import type {
   LoomResponsePolicyOmissionV1,
   TaskTemplateV1,
 } from "./agent-cognition";
+import type { AgenticWorkWorkspaceMutationReservationV1 } from "./agent-work-segment";
 
 /** Runtime phases which may activate authored cognition. */
 export const COGNITION_RUNTIME_PHASES = [
@@ -106,7 +107,7 @@ export interface CognitionRuntimeCompletionV1 extends CognitionRuntimeActivation
 export interface CognitionWorkspaceActivationUpdateV1 {
   readonly taskId: string;
   readonly transition: CognitionTaskTransition;
-  readonly operationKey?: string;
+  readonly reservation: AgenticWorkWorkspaceMutationReservationV1;
   readonly state: CognitionActivationStateV1;
   readonly activation: CognitionActivationResultV1;
   readonly materializeTemplates: readonly TaskTemplateV1[];
@@ -173,7 +174,12 @@ export interface CognitionWorkspaceCommitResultV1 {
   readonly materializedTaskIds: readonly string[];
   readonly taskId: string;
   readonly transition: CognitionTaskTransition;
-  readonly operationKey?: string;
+  readonly operationKey: string;
+  readonly segmentId: string;
+  readonly logicalDispatch: number;
+  readonly frameId: string;
+  /** Host-computed digest of the exact atomically committed workspace mutation. */
+  readonly operationDigest: string;
 }
 
 /** Runtime result wraps the committed DB result with the private cognition view. */
@@ -187,7 +193,7 @@ export interface CognitionWorkspaceMutationResultV1 extends Omit<CognitionWorksp
 export interface CognitionRuntimeTaskTransitionInputV1 {
   readonly taskId: string;
   readonly transition: CognitionTaskTransition;
-  readonly operationKey?: string;
+  readonly reservation: AgenticWorkWorkspaceMutationReservationV1;
   /** Transport-only cancellation fence; never enters fingerprints or persisted state. */
   readonly signal?: AbortSignal;
   readonly workspace: Record<string, unknown>;

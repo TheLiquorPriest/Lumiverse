@@ -8,6 +8,7 @@ import type {
 } from '@/api/agentic-runtime'
 import type { AgentConfigV2, LoomPreset, PromptBlock } from '@/lib/loom/types'
 import type { Preset, PresetRegistryItem } from '@/types/api'
+import { getRuntimeAuthorityRevision } from '@/lib/agentRuntimeSelection'
 
 const presetId = 'preset-agentic-runtime-reload'
 
@@ -132,6 +133,19 @@ const hostCeilings = {
   logicalProviderRequests: 0,
   physicalDispatchAttempts: 0,
   childOutputTokens: 0,
+  workAttemptOutputTokens: 0,
+  workAttemptProviderDispatches: 0,
+  workAttemptUnsignedBoundaries: 0,
+  workAttemptToolCalls: 0,
+  workAttemptWorkspaceOperations: 0,
+  workSegmentOutputTokens: 0,
+  workSegmentProviderDispatches: 0,
+  workSegmentUnsignedBoundaries: 0,
+  workSegmentToolCalls: 0,
+  workSegmentWorkspaceOperations: 0,
+  workDispatchOutputTokens: 0,
+  workRecoveryReserveOutputTokens: 0,
+  workFuturePhaseReserveOutputTokens: 0,
   rootWallClockMs: 0,
   activityEvents: 0,
   activityBytes: 0,
@@ -159,6 +173,7 @@ const latestPair: SaveAgenticRuntimeEditorResult = {
   preset: latestPreset,
   editor: latestEditor,
 }
+let saveEditorResult: SaveAgenticRuntimeEditorResult = latestPair
 
 let presetGetCalls = 0
 let resolveMatched: ((result: SaveAgenticRuntimeEditorResult) => void) | null = null
@@ -188,6 +203,7 @@ const runtimeApiMock = {
       rejectMatched = reject
     })
   },
+  saveEditor: async (): Promise<SaveAgenticRuntimeEditorResult> => saveEditorResult,
 }
 const injectedPresetsApi = presetsApiMock as unknown as Parameters<typeof useLoomBuilder>[0]['presetsApi']
 const injectedRuntimeApi = runtimeApiMock as unknown as Parameters<typeof useLoomBuilder>[0]['agenticRuntimeApi']
@@ -195,6 +211,7 @@ const injectedRuntimeApi = runtimeApiMock as unknown as Parameters<typeof useLoo
 interface LoomBuilderTestSurface {
   activePreset: LoomPreset | null
   reloadActivePreset(): Promise<SaveAgenticRuntimeEditorResult>
+  saveAgenticRuntime: ReturnType<typeof useLoomBuilder>['saveAgenticRuntime']
 }
 let hookSurface: LoomBuilderTestSurface
 /* eslint-disable react-compiler/react-compiler */
@@ -228,6 +245,7 @@ beforeEach(() => {
   presetGetCalls = 0
   resolveMatched = null
   rejectMatched = null
+  saveEditorResult = latestPair
 })
 
 afterEach(async () => {
@@ -279,6 +297,78 @@ describe('useLoomBuilder agentic runtime reload', () => {
     }
   })
 
+  test('commits runtime authority after the atomic editor save', async () => {
+    const { root, host } = await mountHook()
+    const before = getRuntimeAuthorityRevision()
+    try {
+      await act(async () => {
+        await hookSurface.saveAgenticRuntime({
+          config: oldConfig,
+          slotBindings: {},
+          taskTemplates: [],
+          reviewAcknowledgements: [],
+        }, [oldBlock], {
+          presetId,
+          presetRevision: 1,
+          configRevision: 1,
+        }, () => true)
+      })
+
+      expect(getRuntimeAuthorityRevision()).toBe(before + 1)
+    } finally {
+      await act(async () => {
+        root.unmount()
+        await Promise.resolve()
+      })
+      host.remove()
+    }
+  })
+
+  test('does not invalidate runtime authority for an exact editor save no-op', async () => {
+    saveEditorResult = {
+      preset: initialPreset,
+      editor: { ...latestEditor, presetRevision: 1, configRevision: 1, config: oldConfig },
+    }
+    const { root, host } = await mountHook()
+    const before = getRuntimeAuthorityRevision()
+    try {
+      await act(async () => {
+        await hookSurface.saveAgenticRuntime({
+          config: oldConfig,
+          slotBindings: {},
+          taskTemplates: [],
+          reviewAcknowledgements: [],
+        }, [oldBlock], { presetId, presetRevision: 1, configRevision: 1 }, () => true)
+      })
+      expect(getRuntimeAuthorityRevision()).toBe(before)
+    } finally {
+      await act(async () => { root.unmount(); await Promise.resolve() })
+      host.remove()
+    }
+  })
+
+  test('invalidates runtime authority once for a config-only editor save', async () => {
+    saveEditorResult = {
+      preset: wirePreset([oldBlock], latestConfig, 1, 2),
+      editor: { ...latestEditor, presetRevision: 1, configRevision: 2, config: latestConfig },
+    }
+    const { root, host } = await mountHook()
+    const before = getRuntimeAuthorityRevision()
+    try {
+      await act(async () => {
+        await hookSurface.saveAgenticRuntime({
+          config: latestConfig,
+          slotBindings: {},
+          taskTemplates: [],
+          reviewAcknowledgements: [],
+        }, [oldBlock], { presetId, presetRevision: 1, configRevision: 1 }, () => true)
+      })
+      expect(getRuntimeAuthorityRevision()).toBe(before + 1)
+    } finally {
+      await act(async () => { root.unmount(); await Promise.resolve() })
+      host.remove()
+    }
+  })
   test('preserves the current preset when matched reload fails', async () => {
     const { root, host } = await mountHook()
     let reload: Promise<SaveAgenticRuntimeEditorResult> | null = null

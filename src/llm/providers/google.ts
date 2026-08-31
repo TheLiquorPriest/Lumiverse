@@ -195,6 +195,7 @@ export class GoogleProvider implements LlmProvider {
     apiKeyRequired: true,
     modelListStyle: "google",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,
@@ -630,6 +631,9 @@ export class GoogleProvider implements LlmProvider {
   ]);
 
   private buildBody(request: GenerationRequest): any {
+    if (request.toolMode === "required" && !this.capabilities.requiredToolChoice) {
+      throw new Error("Provider does not support required tool choice");
+    }
     const params = request.parameters || {};
 
     // Gemini has one top-level systemInstruction, so lift only the contiguous
@@ -713,6 +717,16 @@ export class GoogleProvider implements LlmProvider {
     if (request.toolMode === "finalization") {
       delete body.tools;
       body.toolConfig = { functionCallingConfig: { mode: "NONE" } };
+    } else if (request.toolMode === "required") {
+      if (!hasFunctionDeclarations) throw new Error("Required tool mode needs at least one admitted host tool");
+      body.tools = [{
+        functionDeclarations: functionTools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          parameters: sanitizeGeminiSchema(t.parameters),
+        })),
+      }];
+      body.toolConfig = { functionCallingConfig: { mode: "ANY" } };
     } else if (request.toolMode === "ordinary") {
       if (hasFunctionDeclarations) {
         body.tools = [{

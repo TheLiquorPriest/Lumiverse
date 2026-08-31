@@ -4,39 +4,8 @@ import { Activity, Archive, Gauge, RefreshCw, ShieldCheck } from 'lucide-react'
 import { Button } from '@/components/shared/FormComponents'
 import { presetsApi } from '@/api/presets'
 import type { AgentRuntimeHostLimits } from '@/types/agent-runtime'
+import { AGENT_RUNTIME_LIMIT_GROUPS } from './AgentRuntimeSettingsModel'
 import styles from './AgentRuntimeSettings.module.css'
-
-const LIMIT_GROUPS: ReadonlyArray<{
-  titleKey: string
-  keys: ReadonlyArray<keyof AgentRuntimeHostLimits>
-}> = [
-  {
-    titleKey: 'agentRuntimeSettings.limits.turn',
-    keys: [
-      'childAdmissions',
-      'aggregateToolCalls',
-      'logicalProviderRequests',
-      'physicalDispatchAttempts',
-      'childOutputTokens',
-      'rootWallClockMs',
-    ],
-  },
-  {
-    titleKey: 'agentRuntimeSettings.limits.activity',
-    keys: ['activityEvents', 'activityBytes', 'lifecycleLogRecords'],
-  },
-  {
-    titleKey: 'agentRuntimeSettings.limits.capacity',
-    keys: [
-      'activeRootsPerUser',
-      'activeRootsProcess',
-      'providerDispatchesPerUser',
-      'providerDispatchesProcess',
-      'toolExecutionsPerUser',
-      'toolExecutionsProcess',
-    ],
-  },
-]
 
 export default function AgentRuntimeSettings() {
   const { t, i18n } = useTranslation('settings')
@@ -114,7 +83,7 @@ export default function AgentRuntimeSettings() {
           </div>
         ) : (
           <div className={styles.limitGroups}>
-            {LIMIT_GROUPS.map((group) => (
+            {AGENT_RUNTIME_LIMIT_GROUPS.map((group) => (
               <section key={group.titleKey}>
                 <h4>{t(group.titleKey)}</h4>
                 <dl>

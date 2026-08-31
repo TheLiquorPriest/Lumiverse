@@ -58,6 +58,32 @@ Main-model core tools and `agent_delegate` are selected after prompt assembly. T
 
 Dry Run never allocates an agent runtime or calls a child provider. An executable intrinsic in Dry Run reports unsupported inspection. In an active multiplayer room, feature tools are omitted and an executable intrinsic fails before snapshot or provider work. Live `stream` activity is status-only; retained message data is a compact swipe-scoped summary, not a child transcript.
 
+### Agentic WORK segment order
+
+Agentic does not reuse the Response provider loop above as one growing
+conversation. One Turn Execution owns an attempt of ordered Work Segments. At
+each segment admission, the host builds a fresh context from the frozen root
+objective, exactly the current phase and its completion criteria, accepted
+workspace records, open required IDs, independent attempt/segment budgets, and
+the previous bounded handoff. Later phase instructions are not preloaded.
+
+The segment ends at one of six classified provider boundaries: a signed tool
+action, a tool-free stop, reasoning-only stop, reasoning-only length exhaustion,
+an empty provider response, or a provider protocol failure. The host applies a
+bounded recovery policy. A recovery segment may request **some** admitted host
+tool only when the selected provider positively declares required-tool support;
+it never names a particular tool. Unknown and custom providers are unsupported
+unless they declare that capability. A new segment receives no earlier provider
+messages, reasoning, tool-result carrier, or opaque continuation state.
+
+Normal work, recovery, and future required phases have protected token reserves,
+and every provider dispatch also has a hard output cap. Authored phase advance
+may release the reserve for phases that are no longer required; same-phase
+repeat and recovery rollover cannot. Failed, exhausted, or cancelled segments
+close the attempt durably without manufacturing a handoff. Work completion is
+followed by one tools-disabled final render and one atomic chat commit; internal
+segment tokens never appear as per-segment chat streams.
+
 
 ---
 

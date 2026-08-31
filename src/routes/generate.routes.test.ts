@@ -39,6 +39,51 @@ describe("generation Stop request authority", () => {
     expect(authorityStop).toHaveBeenCalledWith("user-a", "chat-a", authorityId);
     expect(chatStop).toHaveBeenCalledWith("user-a", "chat-a");
   });
+  test("rejects a mismatched authority-generation pair without cancelling either live generation", async () => {
+    const authorityA = crypto.randomUUID();
+    const authorityB = crypto.randomUUID();
+    const owners = new Map<unknown, string>([
+      [authorityA, "generation-a"],
+      [authorityB, "generation-b"],
+    ]);
+    const authorityStop = spyOn(generateService, "stopGenerationRequestAuthority")
+      .mockImplementation(async (_userId, _chatId, authorityId, expectedGenerationId) => (
+        owners.get(authorityId) === expectedGenerationId
+      ));
+    const exactStop = spyOn(generateService, "stopGeneration").mockResolvedValue(true);
+    const chatStop = spyOn(generateService, "stopChatGenerations").mockResolvedValue(true);
+    spies.push(authorityStop, exactStop, chatStop);
+
+    const mismatched = await authenticatedRoutes("user-a").request("/generate/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        generation_id: "generation-b",
+        chat_id: "chat-a",
+        request_authority_id: authorityA,
+      }),
+    });
+    expect(mismatched.status).toBe(200);
+    expect(await mismatched.json()).toEqual({ stopped: false, status: "not_found" });
+    expect(authorityStop).toHaveBeenLastCalledWith("user-a", "chat-a", authorityA, "generation-b");
+    expect(exactStop).not.toHaveBeenCalled();
+    expect(chatStop).not.toHaveBeenCalled();
+
+    const exact = await authenticatedRoutes("user-a").request("/generate/stop", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        generation_id: "generation-b",
+        chat_id: "chat-a",
+        request_authority_id: authorityB,
+      }),
+    });
+    expect(exact.status).toBe(200);
+    expect(await exact.json()).toEqual({ stopped: true, status: "accepted" });
+    expect(authorityStop).toHaveBeenLastCalledWith("user-a", "chat-a", authorityB, "generation-b");
+    expect(exactStop).not.toHaveBeenCalled();
+    expect(chatStop).not.toHaveBeenCalled();
+  });
   test("passes owner chat authority to generation-id Stop", async () => {
     const exactStop = spyOn(generateService, "stopGeneration").mockResolvedValue(true);
     spies.push(exactStop);
@@ -61,6 +106,7 @@ describe("generation Stop request authority", () => {
         version: 2 as const,
         status: "terminal" as const,
         turnId: "turn-failed",
+        generationId: "turn-failed",
         revision: 4,
         target: { chatId: "chat-a", generationType: "normal", messageId: null, swipeId: null },
         workPhase: "WORK",
@@ -74,8 +120,8 @@ describe("generation Stop request authority", () => {
         error: { code: "agentic_provider_failure" },
       },
     } as never;
-    const authorityStop = spyOn(generateService, "stopGenerationRequestAuthority").mockResolvedValue(true);
-    const exactStop = spyOn(generateService, "stopGeneration").mockResolvedValue(terminal);
+    const authorityStop = spyOn(generateService, "stopGenerationRequestAuthority").mockResolvedValue(terminal);
+    const exactStop = spyOn(generateService, "stopGeneration").mockResolvedValue(true);
     spies.push(authorityStop, exactStop);
 
     const response = await authenticatedRoutes("user-a").request("/generate/stop", {
@@ -99,5 +145,7 @@ describe("generation Stop request authority", () => {
         reason: "provider_failure",
       },
     });
+    expect(authorityStop).toHaveBeenCalledWith("user-a", "chat-a", "authority-a", "turn-failed");
+    expect(exactStop).not.toHaveBeenCalled();
   });
 });

@@ -233,6 +233,18 @@ const decisionTokens = new Map<string, {
   scopeFingerprint: string
 }>()
 
+let runtimeAuthorityRevision = 0
+const runtimeAuthorityListeners = new Set<() => void>()
+
+export function getRuntimeAuthorityRevision(): number {
+  return runtimeAuthorityRevision
+}
+
+export function subscribeRuntimeAuthority(listener: () => void): () => void {
+  runtimeAuthorityListeners.add(listener)
+  return () => runtimeAuthorityListeners.delete(listener)
+}
+
 function publish(chatId: string, next: RuntimeSelectionSnapshot): void {
   snapshots.set(chatId, next)
   listeners.get(chatId)?.forEach((listener) => listener())
@@ -265,6 +277,23 @@ export function invalidateRuntimeDecision(chatId: string): void {
   ) {
     nextRuntimeRequestEpoch(chatId)
   }
+}
+
+/**
+ * Commit point for any persisted preset or preset-profile authority write.
+ * It invalidates one-use decisions, fences unresolved display/send requests,
+ * and wakes every mounted runtime projection to resolve against the new state.
+ */
+export function commitRuntimeAuthorityMutation(): void {
+  runtimeAuthorityRevision += 1
+  const chatIds = new Set([
+    ...snapshots.keys(),
+    ...listeners.keys(),
+    ...decisionTokens.keys(),
+    ...pendingRequestEpochs.keys(),
+  ])
+  for (const chatId of chatIds) invalidateRuntimeDecision(chatId)
+  for (const listener of runtimeAuthorityListeners) listener()
 }
 
 export function setOneTurnRuntimeMode(chatId: string, mode: AgentRuntimeMode | null): void {
@@ -773,4 +802,6 @@ export function resetAgentRuntimeSelectionForTests(): void {
   displayEpochs.clear()
   pendingRequestEpochs.clear()
   decisionTokens.clear()
+  runtimeAuthorityRevision = 0
+  runtimeAuthorityListeners.clear()
 }

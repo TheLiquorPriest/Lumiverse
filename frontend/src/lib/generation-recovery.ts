@@ -1,11 +1,12 @@
 import { generateApi } from '@/api/generate'
-import type { GenerateRequest, GenerateResponse, GenerationRequestOptions, GenerationStopResult } from '@/api/generate'
+import type { GenerateRequest, GenerateResponse, GenerationRequestOptions, GenerationStatusResponse, GenerationStopResult } from '@/api/generate'
 import type { AgentRunStopResultV2 } from '@/types/agent-runs'
 import { messagesApi, chatsApi } from '@/api/chats'
 import { useStore } from '@/store'
 import type { GenerationRequestAuthority } from '@/types/store'
 import { yieldToBrowser } from '@/lib/spindle/browser-scheduler'
 import { settleGenerationRequestFromExactTerminalRun } from '@/store/slices/agent-runs'
+import { ApiError, type RequestOptions } from '@/api/client'
 
 export interface GenerationRequestEpoch {
   chatId: string
@@ -187,6 +188,205 @@ export function isGenerationRequestCurrentForChat(
 
 export type RecoveredGenerationPath = 'start' | 'regenerate' | 'continue'
 
+class DispatchAcknowledgementRejectedError extends Error {}
+
+const STOP_CONVERGENCE_DEADLINE_MS = 30_000
+const STOP_CONVERGENCE_POLL_MS = 250
+const STOP_CONVERGENCE_REQUEST_TIMEOUT_MS = 5_000
+
+export interface GenerationStopConvergenceScheduler {
+  now(): number
+  wait(delayMs: number): Promise<void>
+}
+
+const SYSTEM_STOP_CONVERGENCE_SCHEDULER: GenerationStopConvergenceScheduler = {
+  now: () => Date.now(),
+  wait: (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+}
+
+let stopConvergenceScheduler = SYSTEM_STOP_CONVERGENCE_SCHEDULER
+let stopConvergenceDeadlineMs = STOP_CONVERGENCE_DEADLINE_MS
+let stopConvergencePollMs = STOP_CONVERGENCE_POLL_MS
+
+export const __generationRecoveryTesting = {
+  configureStopConvergence(input?: {
+    scheduler?: GenerationStopConvergenceScheduler
+    deadlineMs?: number
+    pollMs?: number
+  }): void {
+    stopConvergenceScheduler = input?.scheduler ?? SYSTEM_STOP_CONVERGENCE_SCHEDULER
+    stopConvergenceDeadlineMs = input?.deadlineMs ?? STOP_CONVERGENCE_DEADLINE_MS
+    stopConvergencePollMs = input?.pollMs ?? STOP_CONVERGENCE_POLL_MS
+  },
+}
+
+function isSemanticHttpRejection(error: unknown): boolean {
+  return error instanceof ApiError && error.status >= 400 && error.status < 500
+}
+
+function isSemanticDispatchAcknowledgementRejection(error: unknown): boolean {
+  return error instanceof DispatchAcknowledgementRejectedError || isSemanticHttpRejection(error)
+}
+
+function markGenerationStopPending(chatId: string, generationId: string, requestAuthorityId: string): void {
+  const state = useStore.getState()
+  const current = state.generationRequests[chatId]
+  if (!current
+    || current.generationId !== generationId
+    || current.requestAuthorityId !== requestAuthorityId
+    || !isLiveRequest(current)) return
+  useStore.setState({
+    generationRequests: {
+      ...state.generationRequests,
+      [chatId]: { ...current, stopPending: true },
+    },
+  })
+}
+
+type CanonicalStopConvergenceOutcome = 'stopped_or_error' | 'completed' | 'pending'
+
+function terminalRequestOutcome(status: 'completed' | 'stopped' | 'error'): Exclude<CanonicalStopConvergenceOutcome, 'pending'> {
+  return status === 'completed' ? 'completed' : 'stopped_or_error'
+}
+
+function settleTerminalGenerationStatus(
+  chatId: string,
+  generationId: string,
+  requestAuthorityId: string,
+  status: GenerationStatusResponse,
+): Exclude<CanonicalStopConvergenceOutcome, 'pending'> | null {
+  if (status.active
+    || status.generationId !== generationId
+    || status.requestAuthorityId !== requestAuthorityId
+    || (status.status !== 'completed' && status.status !== 'stopped' && status.status !== 'error')) return null
+  const state = useStore.getState()
+  const settled = state.settleGenerationRequest(
+    chatId,
+    status.status,
+    generationId,
+    requestAuthorityId,
+  )
+  if (settled) {
+    if (status.status === 'completed') state.endStreaming()
+    else if (status.status === 'stopped') state.stopStreaming()
+    else state.setStreamingError(status.error || 'Generation failed')
+  }
+  return terminalRequestOutcome(status.status)
+}
+
+async function observeCanonicalGenerationTerminal(
+  chatId: string,
+  generationId: string,
+  requestAuthorityId: string,
+  options: RequestOptions,
+): Promise<Exclude<CanonicalStopConvergenceOutcome, 'pending'> | null> {
+  try {
+    const status = await generateApi.getStatus(chatId, undefined, options)
+    const outcome = settleTerminalGenerationStatus(chatId, generationId, requestAuthorityId, status)
+    if (outcome) return outcome
+  } catch { /* status transport remains ambiguous */ }
+
+  try {
+    await recoverAgentActivityRuns(chatId, options)
+  } catch { /* terminal activity recovery remains ambiguous */ }
+  const state = useStore.getState()
+  settleGenerationRequestFromExactTerminalRun(state, chatId, generationId)
+  const current = useStore.getState().generationRequests[chatId]
+  if (current?.generationId !== generationId || current.requestAuthorityId !== requestAuthorityId) return null
+  if (current.status !== 'completed' && current.status !== 'stopped' && current.status !== 'error') return null
+  return terminalRequestOutcome(current.status)
+}
+
+type ExactStopAttempt = 'stopped_or_error' | 'completed' | 'semantic' | 'ambiguous'
+
+
+async function attemptExactGenerationStop(
+  response: GenerateResponse,
+  chatId: string,
+  requestAuthorityId: string,
+  options: RequestOptions,
+): Promise<ExactStopAttempt> {
+  try {
+    const result = await generateApi.stop(response.generationId, chatId, requestAuthorityId, options)
+    if (result.status === 'terminal') {
+      if (result.terminal.generationId !== response.generationId) return 'semantic'
+      consumeGenerationStopResult(chatId, result, response.generationId, 'Generation failed', requestAuthorityId)
+      return result.terminal.workOutcome === 'completed' ? 'completed' : 'stopped_or_error'
+    }
+    return 'semantic'
+  } catch (error) {
+    return isSemanticHttpRejection(error) ? 'semantic' : 'ambiguous'
+  }
+}
+
+async function convergeAmbiguousDispatchStop(
+  response: GenerateResponse,
+  chatId: string,
+  requestAuthorityId: string,
+): Promise<CanonicalStopConvergenceOutcome> {
+  const deadline = stopConvergenceScheduler.now() + Math.max(0, stopConvergenceDeadlineMs)
+  let mayReissueStop = true
+
+  for (let attempt = 0; attempt < 2 && mayReissueStop; attempt += 1) {
+    const remaining = Math.max(1, deadline - stopConvergenceScheduler.now())
+    const outcome = await attemptExactGenerationStop(response, chatId, requestAuthorityId, {
+      timeout: Math.min(STOP_CONVERGENCE_REQUEST_TIMEOUT_MS, remaining),
+    })
+    if (outcome === 'completed' || outcome === 'stopped_or_error') return outcome
+    if (outcome === 'semantic') mayReissueStop = false
+  }
+
+  while (true) {
+    const remaining = deadline - stopConvergenceScheduler.now()
+    const requestOptions = { timeout: Math.max(1, Math.min(STOP_CONVERGENCE_REQUEST_TIMEOUT_MS, remaining)) }
+    const observed = await observeCanonicalGenerationTerminal(chatId, response.generationId, requestAuthorityId, requestOptions)
+    if (observed) return observed
+    if (remaining <= 0) break
+    await stopConvergenceScheduler.wait(Math.min(stopConvergencePollMs, remaining))
+    const postWaitRemaining = deadline - stopConvergenceScheduler.now()
+    if (mayReissueStop && postWaitRemaining > 0) {
+      const outcome = await attemptExactGenerationStop(response, chatId, requestAuthorityId, {
+        timeout: Math.min(STOP_CONVERGENCE_REQUEST_TIMEOUT_MS, postWaitRemaining),
+      })
+      if (outcome === 'completed' || outcome === 'stopped_or_error') return outcome
+      if (outcome === 'semantic') mayReissueStop = false
+    }
+  }
+
+  markGenerationStopPending(chatId, response.generationId, requestAuthorityId)
+  return 'pending'
+}
+
+async function acknowledgeDispatchWithRecovery(
+  response: GenerateResponse,
+  chatId: string,
+  requestAuthorityId: string,
+  requestOptions: GenerationRequestOptions,
+): Promise<void> {
+  let ambiguousFailure: unknown
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const acknowledgement = await generateApi.acknowledgeDispatch(
+        response.generationId,
+        chatId,
+        requestAuthorityId,
+        requestOptions,
+      )
+      if (acknowledgement.acknowledged !== true) {
+        throw new DispatchAcknowledgementRejectedError('Dispatch acknowledgement rejected')
+      }
+      return
+    } catch (error) {
+      if (isSemanticDispatchAcknowledgementRejection(error)) throw error
+      ambiguousFailure = error
+      if (requestOptions.signal?.aborted || attempt === 1) break
+    }
+  }
+
+  const convergence = await convergeAmbiguousDispatchStop(response, chatId, requestAuthorityId)
+  if (convergence === 'stopped_or_error') throw ambiguousFailure
+}
+
 /**
  * Start a UI-owned generation through the store authority. If the caller
  * already published its request before an earlier write, that exact authority
@@ -255,6 +455,18 @@ export async function startGenerationWithRecovery(
       invalidateGenerationRequest(request.chat_id, response.generationId)
       throw new DOMException('Generation cancelled', 'AbortError')
     }
+    if (response.mode === 'agentic') {
+      const requestAuthorityId = authority.requestAuthorityId
+      if (typeof requestAuthorityId !== 'string') {
+        throw new DOMException('Generation cancelled', 'AbortError')
+      }
+      await acknowledgeDispatchWithRecovery(
+        response,
+        request.chat_id,
+        requestAuthorityId,
+        requestOptions,
+      )
+    }
     return response
   } catch (error) {
     const status = error instanceof DOMException && error.name === 'AbortError'
@@ -275,15 +487,16 @@ export async function startGenerationWithRecovery(
 export function resetGenerationRecoveryGuardsForTests(): void {
   useStore.setState({ generationRequests: {} })
   gapRecoveryStates.clear()
+  __generationRecoveryTesting.configureStopConvergence()
 }
 const agentActivityRecoveryInFlight = new Map<string, Promise<void>>()
 
 /** Fetch terminal status-only runs once per chat at a time and merge idempotently. */
-export function recoverAgentActivityRuns(chatId: string): Promise<void> {
+export function recoverAgentActivityRuns(chatId: string, options?: RequestOptions): Promise<void> {
   if (!chatId) return Promise.resolve()
   const existing = agentActivityRecoveryInFlight.get(chatId)
   if (existing) return existing
-  const request = chatsApi.listAgentActivityRuns(chatId)
+  const request = chatsApi.listAgentActivityRuns(chatId, options)
     .then((response) => {
       const state = useStore.getState()
       if (state.activeChatId === chatId && Array.isArray(response.runs)) {

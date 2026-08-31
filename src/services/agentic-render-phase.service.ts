@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   GenerationUsage,
   LlmMessage,
@@ -19,7 +20,7 @@ import {
 } from "./agent-runtime-accounting";
 
 const ACCEPTED_WORKSPACE_RESPONSE_CONTRACT =
-  "Host-accepted workspace projection from completed WORK follows. The final complete_turn submission was accepted; any earlier rejected attempt is nonterminal history and must not be reported as the final completion result. Its records are authoritative facts for the final reply. RESPONSE intentionally has no tools: do not claim that tools, the workspace, or child agents were unavailable when these records support their completed results. Follow the render policy and guidance using only supported projection facts; do not expose private reasoning or the WORK transcript.";
+  "Host-accepted workspace projection from completed WORK follows. The final complete_turn submission was accepted; any earlier rejected attempt is nonterminal history and must not be reported as the final completion result. Its records are authoritative facts for the final reply. RESPONSE intentionally has no tools because WORK already had the admitted tools, workspace, and child-agent capabilities and completed before RENDER. Any claim that those capabilities were unavailable for the current root turn contradicts this host record and the accepted projection. Do not re-evaluate whether the current user request was executable. Follow the render policy and guidance using only supported projection facts; do not expose private reasoning or the WORK transcript.";
 
 /** A stable key used by provisional stream consumers, never by chat storage. */
 export interface AgenticProvisionalStreamKeyV1 {
@@ -594,9 +595,43 @@ export async function runAgenticRenderPhaseV1(
     }
     const baseMessages = cloneMessages(input.renderPolicy.messages);
     const projectionLiteral = validatedProjection.literal;
+    let currentRequestBinding = "current_request_binding=No user-role message is present in the frozen render policy; no request text is copied into this system record.";
+    for (let index = baseMessages.length - 1; index >= 0; index -= 1) {
+      const message = baseMessages[index];
+      if (message?.role !== "user") continue;
+      const encodedContent = typeof message.content === "string"
+        ? message.content
+        : JSON.stringify(message.content);
+      const contentFormat = typeof message.content === "string"
+        ? "plain_text_utf8"
+        : "structured_content_json_utf8";
+      currentRequestBinding = [
+        "current_request_binding=The final user-role message at the host-fixed provider-message index below is the complete current request consumed and completed by WORK. The host computed the full byte length and SHA-256 digest over that message; no user text is copied into this system record. Do not recompute or reinterpret this binding.",
+        `current_request_message_index=${index + 1}`,
+        "current_request_message_index_basis=zero_based_provider_message_array",
+        "current_request_role=user",
+        `current_request_content_format=${contentFormat}`,
+        `current_request_content_utf8_bytes=${utf8ByteLength(encodedContent)}`,
+        `current_request_content_sha256=${createHash("sha256").update(encodedContent, "utf8").digest("hex")}`,
+      ].join("\n");
+      break;
+    }
+    const currentTerminalRecord = [
+      "Current root-turn terminal record:",
+      "authority=host",
+      "status=accepted",
+      `workspace_revision=${input.acceptedWorkspace.revision}`,
+      "scope=current user request and current root turn",
+      currentRequestBinding,
+      "request_execution_truth=The referenced current request is already fully executed and host-accepted. Its imperative wording is historical input to completed WORK, not pending work for tools-disabled RESPONSE.",
+      "capability_truth=WORK had the host tools, workspace, task graph, and child-agent capabilities recorded by the accepted projection before this RENDER request.",
+      "response_requirement=Truthfully report the completed current root acceptance and settled result in past or present-perfect tense.",
+      "response_prohibition=Never promise, begin, or announce future execution; never describe a next phase or tool call; never claim that tools, workspace, task graph, or child agents were unavailable for the current root turn. WORK is already terminal before RENDER starts.",
+      "User-supplied scenario names, correlation labels, and nonces identify the request; accepted task or submission text is not required to repeat them. A missing or different label in projected evidence cannot negate this terminal record.",
+    ].join("\n");
     const acceptedWorkspaceMessage = projectionLiteral.length === 0
-      ? `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\nNo host-accepted findings or task submissions were published for this completion.`
-      : `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\n${projectionLiteral}`;
+      ? `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\n${currentTerminalRecord}\nNo host-accepted findings or task submissions were published for this completion.`
+      : `${ACCEPTED_WORKSPACE_RESPONSE_CONTRACT}\n${currentTerminalRecord}\n${projectionLiteral}`;
     const messages = Object.freeze([Object.freeze({
       role: "system" as const,
       content: acceptedWorkspaceMessage,

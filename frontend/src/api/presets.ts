@@ -33,7 +33,12 @@ export interface StashedPromptBlock {
   createdAt: number
   updatedAt: number
 }
-
+export interface PromptStashRemovalResult {
+  success: true
+  removed: true
+  presetAuthorityChanged: boolean
+  presetAuthorities: Preset[]
+}
 export const presetsApi = {
   list(params?: { limit?: number; offset?: number; provider?: string }) {
     return get<PaginatedResult<Preset>>('/presets', params)
@@ -107,6 +112,6 @@ export const presetsApi = {
   },
 
   removeFromStash(id: string) {
-    return del<void>(`/presets/stash/${id}`)
+    return del<PromptStashRemovalResult>(`/presets/stash/${id}`)
   },
 }

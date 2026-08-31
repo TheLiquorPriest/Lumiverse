@@ -24,6 +24,7 @@ export class CustomProvider extends OpenAICompatibleProvider {
     apiKeyRequired: false,
     modelListStyle: "openai",
     toolCalling: true,
+    requiredToolChoice: false,
     nativeToolContinuation: false,
     toolContinuationMode: "legacy",
     toolsDisabledFinalization: true,

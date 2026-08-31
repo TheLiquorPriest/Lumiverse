@@ -44,7 +44,6 @@ export const AGENT_CHILD_WORKSPACE_CAPABILITIES = [
   "read_page",
   "update_assigned_progress",
   "submit_child_result",
-  "record_question",
 ] as const satisfies readonly WorkspaceOperationKindV1[];
 export type AgentChildWorkspaceCapabilityV1 = (typeof AGENT_CHILD_WORKSPACE_CAPABILITIES)[number];
 /** The six host-owned retrieval tools available to the main model and children. */
@@ -210,6 +209,7 @@ export interface AgentPromptBlockRefV1 {
   blockId: string;
   expectedPresetRevision: number;
   expectedBlockRevision: number;
+  promptOrder: number;
 }
 
 /** Legacy plain-reference cognition policy accepted only at ingress. */
@@ -988,11 +988,13 @@ function parsePromptBlockRefs(value: unknown, path: string): AgentPromptBlockRef
   const refs: AgentPromptBlockRefV1[] = []; const seen = new Set<string>();
   for (let index = 0; index < value.length; index += 1) {
     const refPath = `${path}[${index}]`; const ref = ownDataEntries(value[index], refPath);
-    exactKeys(ref, ["blockId", "expectedPresetRevision", "expectedBlockRevision"], refPath);
+    exactKeys(ref, ["blockId", "expectedPresetRevision", "expectedBlockRevision", "promptOrder"], refPath);
     const blockId = requireString(ref.blockId, `${refPath}.blockId`, 128);
-    if (!blockId || seen.has(blockId)) throw new AgentConfigValidationError(`${refPath}.blockId`, "must be unique and non-empty");
-    seen.add(blockId);
-    refs.push({ blockId, expectedPresetRevision: requireIntegerInRange(ref.expectedPresetRevision, `${refPath}.expectedPresetRevision`, 0, Number.MAX_SAFE_INTEGER), expectedBlockRevision: requireIntegerInRange(ref.expectedBlockRevision, `${refPath}.expectedBlockRevision`, 0, Number.MAX_SAFE_INTEGER) });
+    const promptOrder = requireIntegerInRange(ref.promptOrder, `${refPath}.promptOrder`, 0, Number.MAX_SAFE_INTEGER);
+    const occurrenceKey = `${blockId}\u0000${promptOrder}`;
+    if (!blockId || seen.has(occurrenceKey)) throw new AgentConfigValidationError(`${refPath}.blockId`, "must identify a unique, non-empty block occurrence");
+    seen.add(occurrenceKey);
+    refs.push({ blockId, expectedPresetRevision: requireIntegerInRange(ref.expectedPresetRevision, `${refPath}.expectedPresetRevision`, 0, Number.MAX_SAFE_INTEGER), expectedBlockRevision: requireIntegerInRange(ref.expectedBlockRevision, `${refPath}.expectedBlockRevision`, 0, Number.MAX_SAFE_INTEGER), promptOrder });
   }
   return refs;
 }
@@ -1013,16 +1015,18 @@ function parseLoomInstructionRefs(value: unknown, path: string): LoomPolicySourc
       throw new AgentConfigValidationError(`${refPath}.kind`, "must be loom_block");
     }
     const blockId = requireString(ref.blockId, `${refPath}.blockId`, 128);
-    if (!blockId || seen.has(blockId)) {
-      throw new AgentConfigValidationError(`${refPath}.blockId`, "must be unique and non-empty");
+    const promptOrder = requireIntegerInRange(ref.promptOrder, `${refPath}.promptOrder`, 0, Number.MAX_SAFE_INTEGER);
+    const occurrenceKey = `${blockId}\u0000${promptOrder}`;
+    if (!blockId || seen.has(occurrenceKey)) {
+      throw new AgentConfigValidationError(`${refPath}.blockId`, "must identify a unique, non-empty block occurrence");
     }
-    seen.add(blockId);
+    seen.add(occurrenceKey);
     refs.push({
       kind: "loom_block",
       blockId,
       presetRevision: requireIntegerInRange(ref.presetRevision, `${refPath}.presetRevision`, 0, Number.MAX_SAFE_INTEGER),
       blockRevision: requireIntegerInRange(ref.blockRevision, `${refPath}.blockRevision`, 0, Number.MAX_SAFE_INTEGER),
-      promptOrder: requireIntegerInRange(ref.promptOrder, `${refPath}.promptOrder`, 0, Number.MAX_SAFE_INTEGER),
+      promptOrder,
     });
   }
   return refs;
@@ -1221,17 +1225,17 @@ function parseRuntimePolicy(value: unknown, path: string, profileIds?: ReadonlyS
     ? null
     : parseCanonicalLoomPolicy(policy.loomPolicy, `${path}.loomPolicy`);
   const phases = Object.hasOwn(policy, "phases") ? parseCustomPhases(policy.phases, `${path}.phases`, profileIds) : [];
-  const sourceBlockIds = new Set<string>();
+  const sourceOccurrences = new Set<string>();
   for (const bucket of AGENT_LOOM_POLICY_BUCKETS) {
-    for (const entry of loomPolicy?.[bucket] ?? []) sourceBlockIds.add(entry.source.blockId);
+    for (const entry of loomPolicy?.[bucket] ?? []) sourceOccurrences.add(`${entry.source.blockId}\u0000${entry.source.promptOrder}`);
   }
   for (const phase of phases) {
-    for (const source of phase.instructionRefs) sourceBlockIds.add(source.blockId);
+    for (const source of phase.instructionRefs) sourceOccurrences.add(`${source.blockId}\u0000${source.promptOrder}`);
   }
-  if (sourceBlockIds.size > COGNITION_MAX_SOURCE_BLOCKS) {
+  if (sourceOccurrences.size > COGNITION_MAX_SOURCE_BLOCKS) {
     throw new AgentConfigValidationError(
       path,
-      `source block references must contain at most ${COGNITION_MAX_SOURCE_BLOCKS} distinct block IDs`,
+      `source block references must contain at most ${COGNITION_MAX_SOURCE_BLOCKS} distinct block occurrences`,
     );
   }
   return {

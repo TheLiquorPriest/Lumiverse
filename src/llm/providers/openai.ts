@@ -515,6 +515,7 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
     apiKeyRequired: true,
     modelListStyle: "openai",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,
@@ -615,6 +616,9 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
    * - Multipart content uses `input_text` / `input_image` / `input_audio` types
    */
   private buildResponsesBody(request: GenerationRequest): Record<string, any> {
+    if (request.toolMode === "required" && !this.capabilities.requiredToolChoice) {
+      throw new Error("Provider does not support required tool choice");
+    }
     const params = request.parameters || {};
     // Only the leading system prefix belongs in top-level instructions.
     // Later system messages may be depth-positioned inside/after history, and
@@ -722,6 +726,10 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
       body.tools = [];
       body.tool_choice = "none";
       body.parallel_tool_calls = false;
+    } else if (request.toolMode === "required") {
+      if (!hostTools?.length) throw new Error("Required tool mode needs at least one admitted host tool");
+      body.tools = hostTools;
+      body.tool_choice = "required";
     } else if (request.toolMode === "ordinary") {
       if (hostTools?.length) {
         body.tools = hostTools;

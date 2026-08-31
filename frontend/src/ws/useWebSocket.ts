@@ -35,6 +35,8 @@ import { operatorApi } from '@/api/operator'
 import { agentRunsApi } from '@/api/agent-runs'
 import { presetsApi } from '@/api/presets'
 import { toast } from '@/lib/toast'
+import type { Preset } from '@/types/api'
+import { applyPresetAuthorityResult } from '@/lib/loom/preset-save-coordinator'
 import i18n from '@/i18n'
 import {
   invalidateDisplayRegexCache,
@@ -2104,6 +2106,17 @@ export function useWebSocket() {
         if (payload?.id) {
           store.getState().deleteChatHead(payload.id)
         }
+      }),
+
+      // Preset authority events carry the committed owner projection. Applying
+      // them through the coordinator hydrates every tab; duplicate REST/event
+      // delivery is revision-deduplicated before the global epoch advances.
+      wsClient.on(EventType.PRESET_CHANGED, (payload: { preset?: Preset }) => {
+        if (!payload?.preset) return
+        applyPresetAuthorityResult({
+          presetAuthorityChanged: true,
+          presetAuthorities: [payload.preset],
+        })
       }),
 
       // Regex script events — reload for multi-tab sync

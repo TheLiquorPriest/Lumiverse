@@ -137,21 +137,29 @@ describe("lancedb generation mutation fencing", () => {
     expect(isDeferredOptimizeScheduled()).toBe(false);
   });
 
-  test("retires a queued write before replacement and drains the active owner", async () => {
+  test("drains cancelled queued writes and leaves the write lock usable after replacement", async () => {
     initDatabase(":memory:");
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    let queuedWriteRan = false;
+    let firstQueuedWriteRan = false;
+    let secondQueuedWriteRan = false;
     const activeWrite = withWriteLock(async () => {
       entered.resolve();
       await release.promise;
     });
     const activeOutcome = activeWrite.then(() => null, (error) => error);
     await entered.promise;
-    const queuedWrite = withWriteLock(async () => {
-      queuedWriteRan = true;
+    const firstQueuedWrite = withWriteLock(async () => {
+      firstQueuedWriteRan = true;
     });
-    const queuedOutcome = queuedWrite.then(() => null, (error) => error);
+    const firstQueuedOutcome = firstQueuedWrite.then(() => null, (error) => error);
+    const secondQueuedWrite = withWriteLock(async () => {
+      secondQueuedWriteRan = true;
+    });
+    const secondQueuedOutcome = secondQueuedWrite.then(() => null, (error) => error);
+    // Let both admitted owners reach the in-process queue before replacement
+    // cancels their Lance generation.
+    await Promise.resolve();
     const replacement = closeDatabaseAsync();
     let replacementSettled = false;
     void replacement.then(() => { replacementSettled = true; });
@@ -160,9 +168,18 @@ describe("lancedb generation mutation fencing", () => {
     expect(replacementSettled).toBe(false);
     release.resolve();
     expect(await activeOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
-    expect(await queuedOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
+    expect(await firstQueuedOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
+    expect(await secondQueuedOutcome).toMatchObject({ code: "lancedb_generation_cancelled" });
     await replacement;
-    expect(queuedWriteRan).toBe(false);
+    expect(replacementSettled).toBe(true);
+    expect(firstQueuedWriteRan).toBe(false);
+    expect(secondQueuedWriteRan).toBe(false);
+
+    let subsequentWriteRan = false;
+    await withWriteLock(async () => {
+      subsequentWriteRan = true;
+    });
+    expect(subsequentWriteRan).toBe(true);
   });
 
   test("replacement retires and drains an admitted external maintenance owner", async () => {

@@ -33,6 +33,7 @@ import {
   parseAgentCustomPhasesV1,
   parseAgentRuntimePolicyV1,
   parseLoomPolicyBucketsV1,
+  prepareAgentConfigForRuntimeSave,
   requiredReviewAcknowledgements,
   setAgentRuntimeCustomPhases,
   setAgentRuntimePolicyBuckets,
@@ -147,6 +148,59 @@ describe('Agentic Runtime shared draft validation', () => {
       path: 'config.runtimePolicy.loomPolicy.workPolicy.0.source',
     })
   })
+  test('submits exact sources at the loaded preset revision for server-owned conditional rebase', () => {
+    const config = createDefaultAgentConfigV2()
+    config.runtimePolicy!.loomPolicy = {
+      version: 1,
+      workPolicy: [createLoomPolicyEntryV1('workPolicy', block(3), 8, 0)],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+
+    const prepared = prepareAgentConfigForRuntimeSave(config, [block(3)], 8)
+
+    expect(prepared.runtimePolicy?.loomPolicy.workPolicy[0]?.source.presetRevision).toBe(8)
+  })
+
+  test('keeps duplicate block IDs distinct by prompt occurrence during save and repair validation', () => {
+    const first = { ...block(3), name: 'First occurrence', content: 'First occurrence content.' }
+    const second = { ...block(7), name: 'Second occurrence', content: 'Second occurrence content.' }
+    const config = createDefaultAgentConfigV2()
+    config.runtimePolicy!.loomPolicy = {
+      version: 1,
+      workPolicy: [
+        createLoomPolicyEntryV1('workPolicy', first, 8, 0),
+        createLoomPolicyEntryV1('workPolicy', second, 8, 1),
+      ],
+      workspaceUsage: [],
+      completionCriteria: [],
+      renderPolicy: [],
+    }
+
+    const prepared = prepareAgentConfigForRuntimeSave(config, [first, second], 8)
+    const entries = prepared.runtimePolicy?.loomPolicy.workPolicy ?? []
+    expect(entries).toHaveLength(2)
+    expect(new Set(entries.map((entry) => entry.id)).size).toBe(2)
+    expect(entries.map((entry) => entry.source.promptOrder)).toEqual([0, 1])
+    expect(entries[0]?.source).toMatchObject({ blockId: 'policy-block', promptOrder: 0, presetRevision: 8, blockRevision: 3 })
+    expect(entries[1]?.source).toMatchObject({ blockId: 'policy-block', promptOrder: 1, presetRevision: 8, blockRevision: 7 })
+    expect(validateAgenticRuntimeDraft({ ...draft(), config: prepared }, [first, second], 8).valid).toBe(true)
+
+    const moved = createLoomPolicyEntryV1('workPolicy', second, 8, 0)
+    config.runtimePolicy!.loomPolicy = {
+      ...config.runtimePolicy!.loomPolicy,
+      workPolicy: [moved],
+    }
+    expect(() => prepareAgentConfigForRuntimeSave(config, [first, second], 8)).toThrow()
+
+    const categorySecond = { ...second, marker: 'category' as const }
+    config.runtimePolicy!.loomPolicy = {
+      ...config.runtimePolicy!.loomPolicy,
+      workPolicy: [createLoomPolicyEntryV1('workPolicy', categorySecond, 8, 1)],
+    }
+    expect(() => prepareAgentConfigForRuntimeSave(config, [first, categorySecond], 8)).toThrow()
+  })
 
   test('rejects cyclic task dependencies', () => {
     const candidate = draft()
@@ -198,6 +252,88 @@ describe('Agentic Runtime shared draft validation', () => {
       'slot:writer',
       'review:foreign_import',
     ])
+  })
+  test('does not misclassify repair-required state as imported review', () => {
+    const repairing = presetWithMetadata({})
+    repairing.agentConfigReview = {
+      state: 'repair_required',
+      revision: 2,
+      reasonCode: 'loom_reference_repair_required',
+      unresolvedSlotIds: [],
+      staleSlotIds: [],
+      items: [],
+    }
+    expect(getAgenticRuntimeRepairItems(repairing)).toEqual([])
+  })
+  test('does not fabricate imported review for an empty non-import review state', () => {
+    const reviewing = presetWithMetadata({})
+    reviewing.agentConfigReview = {
+      state: 'review_required',
+      revision: 3,
+      reasonCode: 'local_capability_review',
+      unresolvedSlotIds: [],
+      staleSlotIds: [],
+      items: [],
+    }
+    expect(getAgenticRuntimeRepairItems(reviewing)).toEqual([])
+  })
+
+  test('does not fabricate imported review from malformed review data', () => {
+    const malformed = presetWithMetadata({})
+    malformed.agentConfigReview = 'malformed' as unknown as LoomPreset['agentConfigReview']
+    expect(getAgenticRuntimeRepairItems(malformed)).toEqual([])
+  })
+
+  test('constructs disabled-import acknowledgement only from foreign-import review provenance', () => {
+    const imported = presetWithMetadata({})
+    imported.agentConfigReview = {
+      state: 'review_required',
+      revision: 4,
+      reasonCode: 'foreign_import',
+      unresolvedSlotIds: [],
+      staleSlotIds: [],
+      items: [],
+    }
+    expect(getAgenticRuntimeRepairItems(imported)).toEqual([{
+      id: 'review:foreign_import',
+      kind: 'disabled_import',
+      label: 'foreign_import',
+      reasonCode: 'foreign_import',
+      action: { kind: 'acknowledge' },
+      acknowledged: false,
+    }])
+  })
+  test('preserves an acknowledged foreign-import item while another repair remains', () => {
+    const imported = presetWithMetadata({})
+    imported.agentConfigReview = {
+      state: 'review_required',
+      revision: 5,
+      reasonCode: 'foreign_import',
+      unresolvedSlotIds: ['writer'],
+      staleSlotIds: [],
+      items: [{
+        id: 'review:foreign_import',
+        kind: 'disabled_import',
+        reasonCode: 'foreign_import',
+        action: { kind: 'acknowledge' },
+        acknowledged: true,
+      }],
+    }
+    expect(getAgenticRuntimeRepairItems(imported)).toEqual([{
+      id: 'slot:writer',
+      kind: 'unresolved_slot',
+      label: 'writer',
+      reasonCode: 'unresolved_slot',
+      action: { kind: 'map_slot' },
+      acknowledged: false,
+    }, {
+      id: 'review:foreign_import',
+      kind: 'disabled_import',
+      label: 'foreign_import',
+      reasonCode: 'foreign_import',
+      action: { kind: 'acknowledge' },
+      acknowledged: true,
+    }])
   })
  
   test('accepts one internally consistent draft containing phase and task policy', () => {
@@ -595,6 +731,33 @@ describe('Canonical Loom policy and custom phase contracts', () => {
     if (includeSkip) value.skip = { kind: 'phase', value: 'ASSEMBLE' }
     return value
   }
+
+  test('counts duplicate-ID occurrences independently at the source reference ceiling', () => {
+    const references = Array.from({ length: 513 }, (_, promptOrder) => source('duplicate-block', promptOrder))
+    const phases = Array.from({ length: 9 }, (_, phaseIndex) => {
+      const start = phaseIndex * 64
+      return {
+        version: 1,
+        id: `phase_${phaseIndex}`,
+        label: `phase_${phaseIndex}`,
+        instructionRefs: references.slice(start, start + 64),
+        required: true,
+        enter: { kind: 'phase', value: 'WORK' },
+        exit: { kind: 'phase', value: 'COMPLETE' },
+        capabilityRequests: [],
+        repeatLimit: 0,
+        nextPhaseIds: phaseIndex < 8 ? [`phase_${phaseIndex + 1}`] : [],
+      }
+    })
+    expect(() => parseAgentRuntimePolicyV1({
+      version: 1,
+      authority: 'loom',
+      scope: 'preset',
+      defaultMode: 'response',
+      loomPolicy: null,
+      phases,
+    })).toThrow(/distinct block occurrences/)
+  })
 
   test('parses the four fixed buckets and typed conditions', () => {
     const parsed = parseLoomPolicyBucketsV1(policyDocument())
@@ -997,6 +1160,10 @@ describe('Canonical Loom policy and custom phase contracts', () => {
       ...canonical,
       instructionRefs: [source(), { ...source(), blockRevision: 2 }],
     }])).toThrow(/duplicate instruction reference/)
+    expect(parseAgentCustomPhasesV1([{
+      ...canonical,
+      instructionRefs: [source('policy-block', 0), source('policy-block', 1)],
+    }])[0]!.instructionRefs).toHaveLength(2)
     expect(() => parseAgentCustomPhasesV1([{
       ...canonical,
       instructionRefs: [{ ...source(), legacyAlias: true }],

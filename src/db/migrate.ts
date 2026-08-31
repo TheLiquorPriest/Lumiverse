@@ -161,6 +161,7 @@ const BASELINE_MIGRATIONS: readonly string[] = [
   "132_persistent_workspace_chat_detach.sql",
   "133_agent_run_resync_snapshots.sql",
   "134_bounded_resync_and_portable_artifacts.sql",
+  "135_agent_work_segments.sql",
 ];
 
 const BASELINE_SET = new Set(BASELINE_MIGRATIONS);

@@ -1,10 +1,11 @@
-import type { StreamChunk } from "../types";
+import type { GenerationRequest, StreamChunk } from "../types";
 import { describe, expect, test } from "bun:test";
 import {
   OpenAICompatibleProvider,
   ReasoningDetailsAccumulator,
 } from "./openai-compatible";
 import { OpenAIProvider } from "./openai";
+import { DeepSeekProvider } from "./deepseek";
 import { INVALID_TOOL_ARGUMENTS } from "../tool-arguments";
 import { AGENT_PROVIDER_REASONING_CARRIER_MAX_BYTES } from "../../services/agent-runtime-accounting";
 import {
@@ -25,16 +26,151 @@ class TestOpenAICompatibleProvider extends OpenAICompatibleProvider {
     apiKeyRequired: false,
     modelListStyle: "openai" as const,
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: false,
     toolContinuationMode: "legacy" as const,
     toolsDisabledFinalization: true,
     supportsToolFinalization: true,
   };
 
+  constructor(requiredToolChoice = true) {
+    super();
+    this.capabilities = { ...this.capabilities, requiredToolChoice };
+  }
+
   public inspect(content: unknown, reasoning: unknown) {
     return this.splitMirroredReasoning(content, reasoning);
   }
+
+  public inspectBody(request: unknown): Record<string, unknown> {
+    return this.buildBody(request as Parameters<OpenAICompatibleProvider["generate"]>[2], false);
+  }
 }
+class TestDeepSeekProvider extends DeepSeekProvider {
+  inspectBody(request: GenerationRequest): Record<string, unknown> {
+    return this.buildBody(request, false) as Record<string, unknown>;
+  }
+}
+
+describe("DeepSeek required tool mode", () => {
+  const provider = new TestDeepSeekProvider();
+
+  test("disables default thinking when the host requires an admitted tool", () => {
+    const body = provider.inspectBody({
+      model: "deepseek-v4-flash",
+      messages: [{ role: "user", content: "continue" }],
+      parameters: {},
+      toolMode: "required",
+      tools: [{ name: "complete_turn", description: "Complete", parameters: { type: "object" } }],
+    });
+    expect(body.tool_choice).toBe("required");
+    expect(body.thinking).toEqual({ type: "disabled" });
+  });
+});
+describe("DeepSeek continuation thinking mode", () => {
+  const provider = new TestDeepSeekProvider();
+
+  test("keeps thinking disabled when a required-tool turn continues without a reasoning carrier", () => {
+    const body = provider.inspectBody({
+      model: "deepseek-v4-flash",
+      messages: [
+        { role: "user", content: "start" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.txt" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "call-1", content: "contents" }],
+        },
+      ],
+      parameters: {},
+      tools: [{ name: "read_file", description: "Read", parameters: { type: "object" } }],
+    });
+
+    expect(body.tool_choice).toBeUndefined();
+    expect(body.thinking).toEqual({ type: "disabled" });
+    expect((body.messages as Array<Record<string, unknown>>)[1]).not.toHaveProperty("reasoning_content");
+  });
+
+  test("preserves default thinking when every replayed tool call has its reasoning carrier", () => {
+    const body = provider.inspectBody({
+      model: "deepseek-v4-flash",
+      messages: [
+        { role: "user", content: "start" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.txt" } }],
+          reasoning_content: "I need to read the file.",
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "call-1", content: "contents" }],
+        },
+      ],
+      parameters: {},
+      tools: [{ name: "read_file", description: "Read", parameters: { type: "object" } }],
+    });
+
+    expect(body.tool_choice).toBeUndefined();
+    expect(body.thinking).toBeUndefined();
+    expect((body.messages as Array<Record<string, unknown>>)[1]?.reasoning_content).toBe("I need to read the file.");
+  });
+});
+
+describe("OpenAI-compatible required tool mode", () => {
+  const provider = new TestOpenAICompatibleProvider();
+
+  test("requires an arbitrary admitted host tool and suppresses custom tool controls", () => {
+    const body = provider.inspectBody({
+      model: "test-model",
+      messages: [{ role: "user", content: "continue" }],
+      parameters: {
+        tools: [{ type: "attacker" }],
+        tool_choice: { type: "function", function: { name: "attacker" } },
+        functions: [{ name: "attacker" }],
+      },
+      toolMode: "required",
+      tools: [{ name: "host_a", description: "A", parameters: { type: "object" } }],
+    });
+    expect(body.tool_choice).toBe("required");
+    expect(body.tools).toEqual([{
+      type: "function",
+      function: { name: "host_a", description: "A", parameters: { type: "object" }, strict: false },
+    }]);
+    expect(body.functions).toBeUndefined();
+  });
+
+  test("fails closed when no host tool was admitted", () => {
+    expect(() => provider.inspectBody({
+      model: "test-model",
+      messages: [{ role: "user", content: "continue" }],
+      toolMode: "required",
+      tools: [],
+    })).toThrow("at least one admitted host tool");
+  });
+
+  test("rejects unsupported required mode before constructing or sending a provider request", async () => {
+    const unsupported = new TestOpenAICompatibleProvider(false);
+    const originalFetch = globalThis.fetch;
+    let providerCalls = 0;
+    globalThis.fetch = (async () => {
+      providerCalls += 1;
+      throw new Error("provider must not be called");
+    }) as unknown as typeof fetch;
+    try {
+      await expect(unsupported.generate("", "https://example.com", {
+        model: "test-model",
+        messages: [{ role: "user", content: "continue" }],
+        toolMode: "required",
+        tools: [{ name: "host_a", description: "A", parameters: { type: "object" } }],
+      })).rejects.toThrow("does not support required tool choice");
+      expect(providerCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
 
 describe("OpenAICompatibleProvider reasoning mirroring", () => {
   const provider = new TestOpenAICompatibleProvider();

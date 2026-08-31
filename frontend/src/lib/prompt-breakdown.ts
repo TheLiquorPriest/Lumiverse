@@ -23,6 +23,7 @@ export interface BreakdownEntry {
   role?: string
   content?: string
   blockId?: string
+  promptOrder?: number
   extensionId?: string
   extensionName?: string
   messageCount?: number
@@ -155,6 +156,7 @@ export function inspectionDetailToBreakdown(detail: AgentRunInspectionDetailV1):
       role: entry.role,
       content: entry.content,
       blockId: entry.sourceId,
+      promptOrder: entry.promptOrder,
     })),
     messages: prompts.map((entry) => ({
       role: entry.role === 'user' || entry.role === 'assistant' ? entry.role : 'system',

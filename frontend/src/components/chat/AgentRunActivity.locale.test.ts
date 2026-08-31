@@ -240,7 +240,6 @@ describe('AgentRunActivity locale coverage', () => {
       'read_page',
       'update_assigned_progress',
       'submit_child_result',
-      'record_question',
     ])
   })
 })

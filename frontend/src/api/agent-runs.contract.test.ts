@@ -125,12 +125,12 @@ describe('agent run inspection API wire contracts', () => {
       generationId: 'generation-a',
     }
     post.mockResolvedValueOnce(response)
-    await expect(agentRunsApi.stop('turn-a', { chatId: 'chat-a', generationId: 'generation-a' })).resolves.toMatchObject({
+    await expect(agentRunsApi.stop('turn-a', { chatId: 'chat-a', generationId: 'generation-a', requestAuthorityId: '11111111-1111-4111-8111-111111111111' })).resolves.toMatchObject({
       status: 'accepted',
       turnId: 'turn-a',
       target: { chatId: 'chat-a' },
     })
-    expect(post).toHaveBeenCalledWith('/agent-runs/turn-a/stop', { chatId: 'chat-a', generationId: 'generation-a' })
+    expect(post).toHaveBeenCalledWith('/agent-runs/turn-a/stop', { chatId: 'chat-a', generationId: 'generation-a', requestAuthorityId: '11111111-1111-4111-8111-111111111111' })
 
     post.mockResolvedValueOnce({ ...response, turnId: 'turn-b' })
     await expect(agentRunsApi.stop('turn-a', { chatId: 'chat-a', generationId: 'generation-a' })).rejects.toThrow('Invalid agent run stop response')

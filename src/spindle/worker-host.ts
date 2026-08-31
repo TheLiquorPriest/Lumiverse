@@ -59,7 +59,6 @@ import * as spindleUploads from "./uploads";
 import * as generateSvc from "../services/generate.service";
 import * as connectionsSvc from "../services/connections.service";
 import * as chatsSvc from "../services/chats.service";
-import type * as presetsSvc from "../services/presets.service";
 import { resolveInterceptorTimeout } from "../services/spindle-settings.service";
 import { getSidecarSettings } from "../services/sidecar-settings.service";
 import * as promptAssemblySvc from "../services/prompt-assembly.service";
@@ -341,10 +340,6 @@ type RuntimeWorkerToHost =
   | { type: "presets_update"; requestId: string; presetId: string; input: UpdatePresetInput; userId?: string }
   | { type: "presets_delete"; requestId: string; presetId: string; userId?: string }
   | { type: "preset_blocks_list"; requestId: string; presetId: string; userId?: string }
-  | { type: "preset_blocks_get"; requestId: string; presetId: string; blockId: string; userId?: string }
-  | { type: "preset_blocks_create"; requestId: string; presetId: string; input: presetsSvc.CreatePromptBlockInput; index?: number; userId?: string }
-  | { type: "preset_blocks_update"; requestId: string; presetId: string; blockId: string; input: presetsSvc.UpdatePromptBlockInput; userId?: string }
-  | { type: "preset_blocks_delete"; requestId: string; presetId: string; blockId: string; userId?: string }
   | { type: "preset_categories_list"; requestId: string; presetId: string; userId?: string }
   | {
       type: "tokens_count_text";

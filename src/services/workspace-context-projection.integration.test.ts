@@ -8,6 +8,7 @@ import {
   createTurnWorkspace,
   createWorkspaceTask,
   freezeFrameCapabilities,
+  freezeWorkspaceForCompletionV1,
   recordWorkspaceRecord,
   submitWorkspaceChildResult,
   type WorkspaceErrorCode,
@@ -44,7 +45,7 @@ function seed(): void {
     (id, user_id, chat_id, generation_id, target_kind, target_chat_revision, mode,
      runtime_epoch, deadline_at, state, root_ledger_json, frame_capabilities_json,
      commit_key, expires_at)
-    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
+    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
     .run(TURN, USER, CHAT, "projection-generation", "projection-commit");
   db.query(`INSERT INTO agent_artifact_blobs
     (digest, user_id, byte_count, mime_type, storage_path, provenance_json, expires_at)
@@ -130,10 +131,27 @@ describe("owner-bound workspace context projection", () => {
     });
     workspaceRevision += 1;
 
-    const result = buildWorkspaceContextProjectionFromWorkspaceV1(
-      { userId: USER, chatId: CHAT, turnId: TURN, workspaceId: workspace.id, expectedRevision: workspaceRevision },
-      { reservedBytes: 100_000 },
-    );
+    const ownerRevision = workspaceRevision;
+    let result: ReturnType<typeof buildWorkspaceContextProjectionFromWorkspaceV1> | undefined;
+    const frozen = freezeWorkspaceForCompletionV1(hostContext(workspace.id, ownerRevision), {
+      prepare: (candidate) => {
+        result = buildWorkspaceContextProjectionFromWorkspaceV1(
+          {
+            userId: USER,
+            chatId: CHAT,
+            turnId: TURN,
+            workspaceId: workspace.id,
+            expectedRevision: ownerRevision,
+            sourceWorkspaceRevision: candidate.workspaceRevision,
+          },
+          { reservedBytes: 100_000 },
+        );
+        return true;
+      },
+    });
+    expect(frozen).toEqual({ accepted: true, workspaceRevision: ownerRevision + 1 });
+    if (!result) throw new Error("workspace projection was not prepared before completion freeze");
+    workspaceRevision = frozen.workspaceRevision;
 
     expect(result.sourceWorkspaceRevision).toBe(workspaceRevision);
     expect(result.mandatory.map((record) => record.kind)).toContain("required_task");

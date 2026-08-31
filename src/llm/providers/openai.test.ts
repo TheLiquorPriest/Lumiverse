@@ -833,6 +833,31 @@ describe("OpenAI Responses terminal and transient carrier contracts", () => {
     expect(body.parallel_tool_calls).toBe(false);
     expect(body.functions).toBeUndefined();
   });
+
+  test("Responses required mode selects some admitted host tool without naming one", () => {
+    const provider = new OpenAIProvider();
+    const body = (provider as unknown as {
+      buildResponsesBody(request: unknown): Record<string, unknown>;
+    }).buildResponsesBody({
+      model: "gpt-5",
+      messages: [{ role: "user", content: "continue" }],
+      parameters: {
+        use_responses_api: true,
+        tool_choice: { type: "function", name: "attacker" },
+        tools: [{ type: "computer_use_preview" }],
+      },
+      toolMode: "required",
+      tools: [
+        { name: "host_a", description: "A", parameters: { type: "object" } },
+        { name: "host_b", description: "B", parameters: { type: "object" } },
+      ],
+    });
+    expect(body.tool_choice).toBe("required");
+    expect(body.tools).toEqual([
+      { type: "function", name: "host_a", description: "A", parameters: { type: "object" }, strict: false },
+      { type: "function", name: "host_b", description: "B", parameters: { type: "object" }, strict: false },
+    ]);
+  });
   test("rejects malformed non-stream Responses usage", async () => {
     const provider = new OpenAIProvider();
     const originalFetch = globalThis.fetch;

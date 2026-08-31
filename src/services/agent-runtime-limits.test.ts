@@ -33,6 +33,19 @@ describe("agent runtime host limits", () => {
       logicalProviderRequests: 2_048,
       physicalDispatchAttempts: 4_096,
       childOutputTokens: 1_048_576,
+      workAttemptOutputTokens: 1_048_576,
+      workAttemptProviderDispatches: 256,
+      workAttemptUnsignedBoundaries: 256,
+      workAttemptToolCalls: 1_024,
+      workAttemptWorkspaceOperations: 1_024,
+      workSegmentOutputTokens: 262_144,
+      workSegmentProviderDispatches: 64,
+      workSegmentUnsignedBoundaries: 64,
+      workSegmentToolCalls: 256,
+      workSegmentWorkspaceOperations: 256,
+      workDispatchOutputTokens: 65_536,
+      workRecoveryReserveOutputTokens: 65_536,
+      workFuturePhaseReserveOutputTokens: 262_144,
       rootWallClockMs: 3_600_000,
       activityEvents: 512,
       activityBytes: 512 * 1024,
@@ -54,8 +67,10 @@ describe("agent runtime host limits", () => {
     const parsed = parseAgentRuntimeHostLimits(environment);
     expect(parsed.childAdmissions).toBe(1);
     expect(parsed.aggregateToolCalls).toBe(2);
-    expect(parsed.lifecycleLogRecords).toBe(9);
-    expect(parsed.toolExecutionsProcess).toBe(15);
+    expect(parsed.workAttemptOutputTokens).toBe(6);
+    expect(parsed.workFuturePhaseReserveOutputTokens).toBe(18);
+    expect(parsed.lifecycleLogRecords).toBe(22);
+    expect(parsed.toolExecutionsProcess).toBe(28);
   });
 
   test("falls back for malformed, non-positive, fractional, and unsafe values", () => {

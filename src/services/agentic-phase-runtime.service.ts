@@ -169,8 +169,8 @@ function validateSourceRef(
       source: "revision",
     };
   }
-  const block = source.blocks.find((candidate) => candidate.blockId === sourceRef.blockId);
-  if (!block || block.revision !== sourceRef.blockRevision || block.promptOrder !== sourceRef.promptOrder) {
+  const block = source.blocks.find((candidate) => candidate.promptOrder === sourceRef.promptOrder);
+  if (!block || block.blockId !== sourceRef.blockId || block.revision !== sourceRef.blockRevision) {
     return {
       code: "stale_source",
       detail: "source block " + sourceRef.blockId + " revision or order is stale",
@@ -196,7 +196,8 @@ function validateSourceRefs(
   const seen = new Set<string>();
   for (const [index, ref] of refs.entries()) {
     const invalid = validateSourceRef(ref, `instructionRefs[${index}]`, source);
-    if (invalid !== null || seen.has((ref as LoomPolicySourceV1)?.blockId)) {
+    const key = invalid === null ? sourceKey(ref as LoomPolicySourceV1) : "";
+    if (invalid !== null || seen.has(key)) {
       return issue(
         invalid?.code ?? "invalid_source",
         phase,
@@ -205,7 +206,7 @@ function validateSourceRefs(
         invalid?.source ?? "authoring",
       );
     }
-    seen.add((ref as LoomPolicySourceV1).blockId);
+    seen.add(key);
   }
   const subsets = phase.childInstructionSubsets === undefined ? [] : phase.childInstructionSubsets;
   if (!Array.isArray(subsets)) {
@@ -499,8 +500,19 @@ export interface AgentRuntimePhaseCheckpointInputV1 {
   readonly snapshotAvailable?: boolean;
 }
 
+/** Exact durable authority for resuming an already-admitted phase occurrence. */
+export interface AgentRuntimePhaseMachineInitialStateV1 {
+  readonly status: "entered";
+  readonly phaseIndex: number;
+  readonly phaseId: string;
+  readonly repeatCount: number;
+  readonly checkpointRevision: number;
+}
+
 export interface AgentRuntimePhaseMachineOptionsV1 {
   readonly admittedCapabilities?: readonly AgentRuntimePhaseCapabilityV1[];
+  /** Restored directly; construction never replays checkpoint predicates or evidence. */
+  readonly initialState?: AgentRuntimePhaseMachineInitialStateV1;
 }
 
 export interface AgentRuntimePhaseMachineV1 {
@@ -538,6 +550,74 @@ function checkpointKey(index: number, checkpoint: AgentRuntimePhaseCheckpointV1)
   return `${index}:${checkpoint}`;
 }
 
+function invalidInitialState(detail: string): never {
+  throw new TypeError("invalid initial phase machine state: " + detail);
+}
+function phaseParticipatesInAuthoredCycle(
+  phases: readonly CompiledAgentRuntimePhaseV1[],
+  phase: CompiledAgentRuntimePhaseV1,
+): boolean {
+  const phasesById = new Map(phases.map((candidate) => [candidate.id, candidate]));
+  const pending = [...phase.nextPhaseIds];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const candidateId = pending.pop()!;
+    if (candidateId === phase.id) return true;
+    if (visited.has(candidateId)) continue;
+    visited.add(candidateId);
+    const candidate = phasesById.get(candidateId);
+    if (candidate) pending.push(...candidate.nextPhaseIds);
+  }
+  return false;
+}
+
+function validateInitialState(
+  phases: readonly CompiledAgentRuntimePhaseV1[],
+  value: AgentRuntimePhaseMachineInitialStateV1 | undefined,
+): AgentRuntimePhaseMachineInitialStateV1 | null {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return invalidInitialState("state must be an object");
+  }
+  if (value.status !== "entered") {
+    return invalidInitialState("only an entered phase may be restored");
+  }
+  if (!Number.isSafeInteger(value.phaseIndex) || value.phaseIndex < 0) {
+    return invalidInitialState("phaseIndex must be a non-negative safe integer");
+  }
+  if (typeof value.phaseId !== "string" || value.phaseId.length === 0) {
+    return invalidInitialState("phaseId must be a non-empty string");
+  }
+  if (!Number.isSafeInteger(value.repeatCount) || value.repeatCount < 0) {
+    return invalidInitialState("repeatCount must be a non-negative safe integer");
+  }
+  if (!Number.isSafeInteger(value.checkpointRevision) || value.checkpointRevision < 0) {
+    return invalidInitialState("checkpointRevision must be a non-negative safe integer");
+  }
+
+  const phase = phases[value.phaseIndex];
+  if (phase === undefined || phase.index !== value.phaseIndex || phase.id !== value.phaseId) {
+    return invalidInitialState("phase index and id do not match compiled phase authority");
+  }
+  if (!Number.isSafeInteger(phase.repeatLimit) || phase.repeatLimit < 0 || !Array.isArray(phase.nextPhaseIds)) {
+    return invalidInitialState("compiled phase repeat authority is invalid");
+  }
+  if (value.repeatCount > phase.repeatLimit) {
+    return invalidInitialState("repeatCount exceeds the compiled phase repeat limit");
+  }
+  if (value.repeatCount > 0 && !phaseParticipatesInAuthoredCycle(phases, phase)) {
+    return invalidInitialState("a repeated occurrence requires an authored transition cycle");
+  }
+
+  return Object.freeze({
+    status: "entered",
+    phaseIndex: value.phaseIndex,
+    phaseId: value.phaseId,
+    repeatCount: value.repeatCount,
+    checkpointRevision: value.checkpointRevision,
+  });
+}
+
 class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
   readonly phases: readonly CompiledAgentRuntimePhaseV1[];
   private readonly admitted: readonly AgentRuntimePhaseCapabilityV1[];
@@ -554,7 +634,15 @@ class AgentRuntimePhaseMachine implements AgentRuntimePhaseMachineV1 {
   ) {
     this.phases = Object.freeze([...phases]);
     this.admitted = normalizeAdmittedCapabilities(options.admittedCapabilities);
-    this.status = this.phases.length === 0 ? "completed" : "ready";
+    const initialState = validateInitialState(this.phases, options.initialState);
+    if (initialState === null) {
+      this.status = this.phases.length === 0 ? "completed" : "ready";
+      return;
+    }
+    this.currentIndex = initialState.phaseIndex;
+    this.status = initialState.status;
+    this.repeatCount = initialState.repeatCount;
+    this.checkpointRevision = initialState.checkpointRevision;
   }
 
   state(): AgentRuntimePhaseMachineStateV1 {

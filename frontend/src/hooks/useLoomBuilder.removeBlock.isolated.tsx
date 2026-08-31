@@ -4,6 +4,7 @@ import { act, createElement } from 'react'
 import type { Root } from 'react-dom/client'
 import type { Preset, PresetRegistryItem, UpdatePresetInput } from '@/types/api'
 import type { PromptBlock } from '@/lib/loom/types'
+import type { LoomBlockOccurrence } from './useLoomBuilder'
 
 const presetId = 'preset-delete-regression'
 const deletedBlock: PromptBlock = {
@@ -160,7 +161,7 @@ const injectedPresetsApi = presetsApiMock as unknown as Parameters<typeof useLoo
 mock.restore()
 
 interface LoomBuilderTestSurface {
-  removeBlock(blockId: string): Promise<void>
+  removeBlock(target: LoomBlockOccurrence): Promise<void>
 }
 
 let hookSurface: LoomBuilderTestSurface
@@ -218,7 +219,7 @@ describe('useLoomBuilder removeBlock persistence', () => {
 
       let deletionResolved = false
       await act(async () => {
-        deletion = hookSurface.removeBlock('deleted-block').then(() => {
+        deletion = hookSurface.removeBlock({ blockId: 'deleted-block', promptOrder: 0 }).then(() => {
           deletionResolved = true
         })
         await Promise.resolve()
@@ -264,6 +265,165 @@ describe('useLoomBuilder removeBlock persistence', () => {
       })
       if (deletion) await deletion.catch(() => {})
       host.remove()
+    }
+  })
+
+  test('removes only the exact duplicate category and releases only its children', async () => {
+    const originalPromptOrder = persistedPreset.prompt_order
+    const originalMetadata = persistedPreset.metadata
+    const firstCategory: PromptBlock = {
+      ...deletedBlock,
+      id: 'duplicate-category',
+      name: 'First category',
+      marker: 'category',
+      categoryMode: 'checkbox',
+      variables: undefined,
+    }
+    const firstChild: PromptBlock = {
+      ...remainingBlock,
+      id: 'first-child',
+      name: 'First child',
+      group: 'duplicate-category',
+      variables: undefined,
+    }
+    const secondCategory: PromptBlock = { ...firstCategory, name: 'Second category' }
+    const secondChild: PromptBlock = { ...firstChild, id: 'second-child', name: 'Second child' }
+    persistedPreset.prompt_order = [firstCategory, firstChild, secondCategory, secondChild]
+    persistedPreset.metadata = { description: '', promptVariables: {} }
+
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    let root: Root | null = null
+    let deletion: Promise<void> | null = null
+    try {
+      const client = await import('react-dom/client')
+      root = client.createRoot(host)
+      await act(async () => {
+        root?.render(createElement(HookHarness))
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      await act(async () => {
+        deletion = hookSurface.removeBlock({ blockId: 'duplicate-category', promptOrder: 0 })
+        await Promise.resolve()
+      })
+      await waitForEvent('persist:start')
+
+      expect(updateCalls).toHaveLength(1)
+      const persistedBlocks = updateCalls[0]!.input.prompt_order!
+      expect(persistedBlocks.map((block) => block.name)).toEqual([
+        'First child',
+        'Second category',
+        'Second child',
+      ])
+      expect(persistedBlocks[0]?.group).toBeNull()
+      expect(persistedBlocks[2]?.group).toBe('duplicate-category')
+
+      await act(async () => {
+        resolvePersist?.()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      await waitForEvent('registry:start')
+      await act(async () => {
+        resolveRegistry?.()
+        await deletion
+      })
+    } finally {
+      await act(async () => {
+        resolvePersist?.()
+        resolveRegistry?.()
+        root?.unmount()
+        await Promise.resolve()
+      })
+      if (deletion) await deletion.catch(() => {})
+      host.remove()
+      persistedPreset.prompt_order = originalPromptOrder
+      persistedPreset.metadata = originalMetadata
+    }
+  })
+
+  test('remaps a later disabled category snapshot when deletion shifts duplicate children', async () => {
+    const originalPromptOrder = persistedPreset.prompt_order
+    const originalMetadata = persistedPreset.metadata
+    const prefix = { ...deletedBlock, id: 'prefix', name: 'Prefix', variables: undefined }
+    const category: PromptBlock = {
+      ...deletedBlock,
+      id: 'disabled-category',
+      name: 'Disabled category',
+      marker: 'category',
+      categoryMode: 'checkbox',
+      enabled: false,
+      variables: undefined,
+      savedChildEnabled: {
+        '["duplicate-child",2]': true,
+        '["duplicate-child",3]': false,
+      },
+    }
+    const enabledChild: PromptBlock = {
+      ...remainingBlock,
+      id: 'duplicate-child',
+      name: 'Originally enabled child',
+      enabled: false,
+      group: 'disabled-category',
+      variables: undefined,
+    }
+    const disabledChild: PromptBlock = { ...enabledChild, name: 'Originally disabled child' }
+    persistedPreset.prompt_order = [prefix, category, enabledChild, disabledChild]
+    persistedPreset.metadata = { description: '', promptVariables: {} }
+
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    let root: Root | null = null
+    let deletion: Promise<void> | null = null
+    try {
+      const client = await import('react-dom/client')
+      root = client.createRoot(host)
+      await act(async () => {
+        root?.render(createElement(HookHarness))
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      await act(async () => {
+        deletion = hookSurface.removeBlock({ blockId: 'prefix', promptOrder: 0 })
+        await Promise.resolve()
+      })
+      await waitForEvent('persist:start')
+
+      const saved = updateCalls[0]!.input.prompt_order!
+      expect(saved.map((block) => block.name)).toEqual([
+        'Disabled category',
+        'Originally enabled child',
+        'Originally disabled child',
+      ])
+      expect(saved[0]?.savedChildEnabled).toEqual({
+        '["duplicate-child",1]': true,
+        '["duplicate-child",2]': false,
+      })
+
+      await act(async () => {
+        resolvePersist?.()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      await waitForEvent('registry:start')
+      await act(async () => {
+        resolveRegistry?.()
+        await deletion
+      })
+    } finally {
+      await act(async () => {
+        resolvePersist?.()
+        resolveRegistry?.()
+        root?.unmount()
+        await Promise.resolve()
+      })
+      if (deletion) await deletion.catch(() => {})
+      host.remove()
+      persistedPreset.prompt_order = originalPromptOrder
+      persistedPreset.metadata = originalMetadata
     }
   })
 })

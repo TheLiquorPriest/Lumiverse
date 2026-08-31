@@ -304,6 +304,9 @@ interface StoredExecutionControlRow {
   readonly expires_at: number | null;
   readonly state?: string | null;
   readonly phase?: string | null;
+  readonly cancel_requested_at?: number | bigint | null;
+  readonly cancel_requested?: number | bigint | string | boolean | null;
+  readonly cancellation_requested?: number | bigint | string | boolean | null;
   readonly cas_owner?: string | null;
   readonly lease_owner?: string | null;
   readonly owner_token?: string | null;
@@ -947,6 +950,7 @@ function normalizeRun(
   sequence: number,
   revision: number,
   existing?: AgentRunPublicV2,
+  allowTerminalRejectedOutcomeRepair = false,
 ): AgentRunPublicV2 | null {
   const userId = boundedId(input.userId);
   const chatId = boundedId(input.chatId);
@@ -972,11 +976,13 @@ function normalizeRun(
       : input.workPhase ?? (derivesFromStoredState ? undefined : existing?.workPhase),
     storedState,
   );
-  const workOutcome = normalizeWorkOutcome(
-    input.workOutcome === undefined ? existing?.workOutcome : input.workOutcome,
-    storedState,
-    causalCode,
-  );
+  const workOutcome = allowTerminalRejectedOutcomeRepair && input.workOutcome === "rejected"
+    ? "rejected"
+    : normalizeWorkOutcome(
+        input.workOutcome === undefined ? existing?.workOutcome : input.workOutcome,
+        storedState,
+        causalCode,
+      );
   const workStatus = normalizeWorkStatus(
     terminalState
       ? undefined
@@ -1072,7 +1078,7 @@ function normalizeRun(
       : undefined;
     return {
       version: 2,
-      runId: turnId,
+      runId: generationId,
       turnId,
       generationId,
       chatId,
@@ -1291,6 +1297,22 @@ function executionTerminalCode(row: StoredExecutionControlRow | null): string | 
   return boundedText(row?.terminal_code ?? row?.error_code, MAX_ID_BYTES);
 }
 
+function storedCancellationMarkerSet(value: unknown): boolean {
+  if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
+  if (typeof value === "bigint") return value !== 0n;
+  return value === true || value === "true" || value === "1";
+}
+
+function executionCancellationRequested(row: StoredExecutionControlRow): boolean {
+  const requestedAt = row.cancel_requested_at;
+  if (
+    (typeof requestedAt === "number" && Number.isFinite(requestedAt))
+    || typeof requestedAt === "bigint"
+  ) return true;
+  return storedCancellationMarkerSet(row.cancel_requested)
+    || storedCancellationMarkerSet(row.cancellation_requested);
+}
+
 interface CanonicalExecutionProjection {
   readonly state: StoredRunState;
   readonly status: AgentRunPublicStatusV2;
@@ -1305,7 +1327,7 @@ function canonicalExecutionProjection(row: StoredExecutionControlRow | null): Ca
   const terminalCode = executionTerminalCode(row);
   return {
     state,
-    status: statusForStoredState(state, false, terminalCode),
+    status: statusForStoredState(state, executionCancellationRequested(row), terminalCode),
     outcome: outcomeForStoredState(state, terminalCode),
   };
 }
@@ -1414,7 +1436,7 @@ function convergeDurableTerminalOwnersInTransaction(
     chatId: run.chatId,
     attemptId: run.attemptLineage.attemptId,
     previousAttemptId: run.attemptLineage.previousAttemptId,
-    runId: run.turnId,
+    runId: run.generationId,
     turnSessionId: run.turnId,
     generationId: run.generationId,
     generationType: run.generationType,
@@ -1471,6 +1493,33 @@ function appendDurableTerminalProjection(
     usage: run.usage,
     omission: run.omission,
     error: stopTerminalError(status, terminalCode),
+    terminalHandoff: run.terminalHandoff ?? null,
+  });
+}
+function appendDurableCancellingProjection(
+  db: Database,
+  userId: string,
+  run: AgentRunPublicV2,
+): AgentRunProjectionCommitResult {
+  return appendAgentRunSnapshot(db, {
+    userId,
+    chatId: run.chatId,
+    turnId: run.turnId,
+    generationId: run.generationId,
+    generationType: run.generationType,
+    targetMessageId: run.target?.messageId ?? null,
+    targetSwipeId: run.target?.swipeId ?? null,
+    status: storedStateForRun(run),
+    workPhase: run.workPhase,
+    workStatus: "cancelling",
+    workOutcome: null,
+    reason: run.reason,
+    attemptLineage: run.attemptLineage,
+    revision: run.revision + 1,
+    activity: run.activity,
+    usage: run.usage,
+    omission: run.omission,
+    error: run.error,
     terminalHandoff: run.terminalHandoff ?? null,
   });
 }
@@ -2421,7 +2470,7 @@ function repairExistingReceiptProjection(
     }
     if (
       existing.chatId !== execution.chatId
-      || existing.runId !== execution.id
+      || existing.runId !== execution.generationId
       || existing.turnId !== execution.id
       || existing.generationId !== execution.generationId
       || existing.generationType !== execution.targetKind
@@ -2860,7 +2909,7 @@ function writeProjection(db: Database, rawInput: AgentRunProjectionInputV2): Age
     };
   }
   const sequence = allocateChatSequence(db, input.userId, input.chatId);
-  const run = normalizeRun(input, sequence, revision, existing);
+  const run = normalizeRun(input, sequence, revision, existing, terminalRejectedOutcomeRepair);
   if (!run) throw new Error("invalid agent run projection");
   const storedState = input.status !== undefined
     ? normalizeStoredState(input.status)
@@ -3381,7 +3430,7 @@ function parseResyncSnapshotRun(
     if (
       parsed.version !== 2
       || parsed.chatId !== chatId
-      || parsed.runId !== parsed.turnId
+      || parsed.runId !== parsed.generationId
       || parsed.turnId !== row.turn_id
       || !validId(parsed.runId)
       || !validId(parsed.turnId)
@@ -4563,6 +4612,7 @@ function stopResponseForRun(
     version: 2,
     status,
     turnId: run.turnId,
+    generationId: run.generationId,
     revision,
     target: run.attemptLineage.target,
     workPhase: run.workPhase,
@@ -4639,6 +4689,49 @@ export function requestAgentRunStop(userId: string, chatId: string, turnId: stri
     const status = handler({ userId, chatId, turnId, generationId: run.generationId });
     if (status !== "accepted" && status !== "too_late" && status !== "terminal") {
       throw new Error("invalid Agent Run stop handler result");
+    }
+    if (status === "terminal") {
+      try {
+        const control = executionControlRow(db, userId, chatId, turnId);
+        const durable = canonicalExecutionProjection(control);
+        if (!control || !durable || durable.status !== "terminal" || durable.outcome === null) {
+          throw new AgentRunStopUnavailableError(turnId);
+        }
+        if (!reconcileTerminalAgentTurn(turnId, userId, db)) {
+          throw new AgentRunStopUnavailableError(turnId);
+        }
+        const terminalRun = getAgentRun(userId, turnId, chatId);
+        if (
+          !terminalRun
+          || terminalRun.generationId !== run.generationId
+          || !isTerminal(terminalRun)
+          || !terminalProjectionMatchesState(terminalRun, durable.state, executionTerminalCode(control))
+        ) {
+          throw new AgentRunStopUnavailableError(turnId);
+        }
+        settlePoolAfterDurableRun(terminalRun);
+        return stopResponseForRun(
+          terminalRun,
+          TOO_LATE_STATES.has(durable.state) ? "too_late" : "terminal",
+          terminalRun.revision,
+        );
+      } catch (error) {
+        if (error instanceof AgentRunStopUnavailableError) throw error;
+        throw new AgentRunStopUnavailableError(turnId);
+      }
+    }
+    if (status === "accepted") {
+      withAgentRunProjectionTransaction((transactionDb) => {
+        const control = executionControlRow(transactionDb, userId, chatId, turnId);
+        const durable = canonicalExecutionProjection(control);
+        if (!control || durable?.status !== "cancelling") {
+          throw new AgentRunStopUnavailableError(turnId);
+        }
+        const current = getAgentRun(userId, turnId, chatId) ?? run;
+        if (!isTerminal(current) && current.workStatus !== "cancelling") {
+          appendDurableCancellingProjection(transactionDb, userId, current);
+        }
+      });
     }
     const latestRun = getAgentRun(userId, turnId, chatId) ?? run;
     return stopResponseForRun(latestRun, status, latestRun.revision);

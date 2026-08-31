@@ -224,7 +224,7 @@ export const agentRunsApi = {
       page || revision !== undefined ? { ...(page ? { page } : {}), ...(revision !== undefined ? { revision } : {}) } : undefined,
     )
   },
-  async stop(turnId: string, input?: { generationId?: string; chatId?: string }) {
+  async stop(turnId: string, input?: { generationId?: string; chatId?: string; requestAuthorityId?: string }) {
     const payload = await post<unknown>(`${base}/${turnId}/stop`, input ?? {})
     const result = normalizeAgentRunStopResultV2(payload, turnId, input?.chatId, input?.generationId)
     if (!result) throw new Error('Invalid agent run stop response')

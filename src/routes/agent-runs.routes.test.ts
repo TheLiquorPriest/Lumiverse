@@ -6,11 +6,13 @@ import { agentRunsRoutes } from "./agent-runs.routes";
 import {
   appendAgentRunSnapshot,
   withAgentRunProjectionTransaction,
+  registerAgentRunStopHandler,
 } from "../services/agent-run-projection.service";
 import {
   AGENT_RUN_INSPECTION_MAX_CURSOR_BYTES,
   persistAgentRunInspection,
 } from "../services/agent-activity-runs.service";
+import { __generationRequestAuthorityTesting } from "../services/generate.service";
 
 const OWNER = "route-owner";
 const OTHER = "route-other";
@@ -37,8 +39,8 @@ function seedRun(userId: string, chatId: string, turnId: string): void {
       (id, user_id, chat_id, generation_id, target_kind, target_chat_revision,
        mode, runtime_epoch, deadline_at, state, root_ledger_json,
        frame_capabilities_json, commit_key, expires_at)
-     VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999,
-             'WORK', '{}', '{}', ?, 9999999999)`,
+     VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999999,
+             'WORK', '{}', '{}', ?, 9999999999999)`,
   ).run(turnId, userId, chatId, turnId, `commit-${turnId}`);
 }
 
@@ -58,6 +60,9 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  __generationRequestAuthorityTesting.clearStoppedReceipts();
+  __generationRequestAuthorityTesting.clearAdmittedOwners();
+  __generationRequestAuthorityTesting.clearAcknowledgedReceipts();
   if (priorProcessAuthSecret === undefined) delete process.env.AUTH_SECRET;
   else process.env.AUTH_SECRET = priorProcessAuthSecret;
   closeDatabase();
@@ -149,7 +154,7 @@ describe("authenticated Agentic run routes", () => {
     expect(limited.status).toBe(429);
     expect(Number(limited.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);
   });
-  test("exact root Stop never broadens to another chat and is idempotent", async () => {
+  test("exact supplied-authority Stop never broadens to another chat", async () => {
     seedChat(OWNER, "route-stop-chat");
     seedChat(OWNER, "route-other-chat");
     seedRun(OWNER, "route-stop-chat", "route-stop-turn");
@@ -161,21 +166,22 @@ describe("authenticated Agentic run routes", () => {
       generationType: "normal",
       status: "WORK",
     }));
+    __generationRequestAuthorityTesting.retainAdmittedOwner(
+      OWNER,
+      "route-stop-chat",
+      "11111111-1111-4111-8111-111111111111",
+      "route-stop-turn",
+    );
 
     const accepted = await app.request("http://localhost/agent-runs/route-stop-turn/stop", {
       method: "POST",
       headers: { "x-test-user": OWNER, "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: "route-stop-chat", root_id: "route-stop-turn" }),
+      body: JSON.stringify({ chat_id: "route-stop-chat", root_id: "route-stop-turn", requestAuthorityId: "11111111-1111-4111-8111-111111111111" }),
     });
     expect(accepted.status).toBe(200);
-    expect((await accepted.json()).status).toBe("accepted");
+    expect(await accepted.json()).toMatchObject({ status: "terminal", generationId: "route-stop-turn" });
+    expect(__generationRequestAuthorityTesting.hasStoppedReceipt(OWNER, "route-stop-chat", "11111111-1111-4111-8111-111111111111")).toBe(true);
 
-    const terminal = await app.request("http://localhost/agent-runs/route-stop-turn/stop", {
-      method: "POST",
-      headers: { "x-test-user": OWNER, "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: "route-stop-chat", root_id: "route-stop-turn" }),
-    });
-    expect((await terminal.json()).status).toBe("terminal");
 
     const wrongRoot = await app.request("http://localhost/agent-runs/route-stop-turn/stop", {
       method: "POST",
@@ -183,6 +189,213 @@ describe("authenticated Agentic run routes", () => {
       body: JSON.stringify({ chat_id: "route-stop-chat", root_id: "other-root" }),
     });
     expect(wrongRoot.status).toBe(404);
+  });
+  test("resolves the admitted request authority for Activity Stop after reload", async () => {
+    seedChat(OWNER, "route-activity-chat");
+    seedRun(OWNER, "route-activity-chat", "route-activity-turn");
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      userId: OWNER,
+      chatId: "route-activity-chat",
+      turnId: "route-activity-turn",
+      generationId: "route-activity-turn",
+      generationType: "normal",
+      status: "WORK",
+    }));
+    __generationRequestAuthorityTesting.retainAdmittedOwner(
+      OWNER,
+      "route-activity-chat",
+      "22222222-2222-4222-8222-222222222222",
+      "route-activity-turn",
+    );
+
+    const response = await app.request("http://localhost/agent-runs/route-activity-turn/stop", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: "route-activity-chat", generation_id: "route-activity-turn" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "terminal", generationId: "route-activity-turn" });
+    expect(getDb().query("SELECT state FROM agent_turn_executions WHERE id = ?").get("route-activity-turn")).toEqual({ state: "CANCELLED" });
+    expect(__generationRequestAuthorityTesting.hasStoppedReceipt(OWNER, "route-activity-chat", "22222222-2222-4222-8222-222222222222")).toBe(true);
+  });
+
+  test("returns canonical terminal Stop fields when the registered owner terminalizes before projection", async () => {
+    const chatId = "route-live-terminal-chat";
+    const turnId = "route-live-terminal-turn";
+    const authorityId = "88888888-8888-4888-8888-888888888888";
+    seedChat(OWNER, chatId);
+    seedRun(OWNER, chatId, turnId);
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      userId: OWNER,
+      chatId,
+      turnId,
+      generationId: turnId,
+      generationType: "normal",
+      status: "WORK",
+    }));
+    __generationRequestAuthorityTesting.retainAdmittedOwner(OWNER, chatId, authorityId, turnId);
+    const unregister = registerAgentRunStopHandler(OWNER, chatId, turnId, () => {
+      getDb().query(
+        "UPDATE agent_turn_executions SET state = 'CANCELLED', terminal_code = 'cancelled', cas_owner = NULL WHERE user_id = ? AND chat_id = ? AND id = ?",
+      ).run(OWNER, chatId, turnId);
+      return "terminal";
+    });
+    try {
+      const response = await app.request("http://localhost/agent-runs/" + turnId + "/stop", {
+        method: "POST",
+        headers: { "x-test-user": OWNER, "content-type": "application/json" },
+        body: JSON.stringify({ chatId, generationId: turnId, requestAuthorityId: authorityId }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        status: "terminal",
+        turnId,
+        generationId: turnId,
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: "stopped",
+        reason: "stopped",
+      });
+    } finally {
+      unregister();
+    }
+  });
+  test("returns the exact generation identity for accepted and too_late direct Stops", async () => {
+    const acceptedChatId = "route-live-accepted-chat";
+    const acceptedTurnId = "route-live-accepted-turn";
+    const acceptedAuthorityId = "99999999-9999-4999-8999-999999999999";
+    seedChat(OWNER, acceptedChatId);
+    seedRun(OWNER, acceptedChatId, acceptedTurnId);
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      userId: OWNER,
+      chatId: acceptedChatId,
+      turnId: acceptedTurnId,
+      generationId: acceptedTurnId,
+      generationType: "normal",
+      status: "WORK",
+    }));
+    __generationRequestAuthorityTesting.retainAdmittedOwner(OWNER, acceptedChatId, acceptedAuthorityId, acceptedTurnId);
+    const unregister = registerAgentRunStopHandler(OWNER, acceptedChatId, acceptedTurnId, (context) => {
+      getDb().query(
+        "UPDATE agent_turn_executions SET cancel_requested_at = ? WHERE user_id = ? AND chat_id = ? AND id = ?",
+      ).run(Date.now(), context.userId, context.chatId, context.turnId);
+      return "accepted";
+    });
+    try {
+      const accepted = await app.request("http://localhost/agent-runs/" + acceptedTurnId + "/stop", {
+        method: "POST",
+        headers: { "x-test-user": OWNER, "content-type": "application/json" },
+        body: JSON.stringify({
+          chatId: acceptedChatId,
+          generationId: acceptedTurnId,
+          requestAuthorityId: acceptedAuthorityId,
+        }),
+      });
+      expect(accepted.status).toBe(200);
+      expect(await accepted.json()).toMatchObject({
+        status: "accepted",
+        turnId: acceptedTurnId,
+        generationId: acceptedTurnId,
+      });
+    } finally {
+      unregister();
+    }
+
+    const tooLateChatId = "route-too-late-chat";
+    const tooLateTurnId = "route-too-late-turn";
+    const tooLateAuthorityId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    seedChat(OWNER, tooLateChatId);
+    seedRun(OWNER, tooLateChatId, tooLateTurnId);
+    getDb().query(
+      "UPDATE agent_turn_executions SET state = 'COMPLETE' WHERE user_id = ? AND chat_id = ? AND id = ?",
+    ).run(OWNER, tooLateChatId, tooLateTurnId);
+    withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+      userId: OWNER,
+      chatId: tooLateChatId,
+      turnId: tooLateTurnId,
+      generationId: tooLateTurnId,
+      generationType: "normal",
+      status: "COMPLETE",
+    }));
+    __generationRequestAuthorityTesting.retainAdmittedOwner(OWNER, tooLateChatId, tooLateAuthorityId, tooLateTurnId);
+    const tooLate = await app.request("http://localhost/agent-runs/" + tooLateTurnId + "/stop", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({
+        chatId: tooLateChatId,
+        generationId: tooLateTurnId,
+        requestAuthorityId: tooLateAuthorityId,
+      }),
+    });
+    expect(tooLate.status).toBe(200);
+    expect(await tooLate.json()).toMatchObject({
+      status: "too_late",
+      turnId: tooLateTurnId,
+      generationId: tooLateTurnId,
+    });
+  });
+  test("rejects unknown, stale, cross-generation, cross-chat, and cross-user authorities without stopping", async () => {
+    for (const [userId, chatId, turnId] of [
+      [OWNER, "route-bound-chat", "route-bound-turn"],
+      [OWNER, "route-bound-chat", "route-second-turn"],
+      [OWNER, "route-other-bound-chat", "route-other-bound-turn"],
+      [OTHER, "route-foreign-chat", "route-foreign-turn"],
+    ] as const) {
+      if (!getDb().query("SELECT 1 FROM chats WHERE id = ?").get(chatId)) seedChat(userId, chatId);
+      seedRun(userId, chatId, turnId);
+      withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+        userId,
+        chatId,
+        turnId,
+        generationId: turnId,
+        generationType: "normal",
+        status: "WORK",
+      }));
+    }
+    const exactAuthority = "33333333-3333-4333-8333-333333333333";
+    const secondAuthority = "44444444-4444-4444-8444-444444444444";
+    const foreignAuthority = "55555555-5555-4555-8555-555555555555";
+    const unknownAuthority = "66666666-6666-4666-8666-666666666666";
+    const staleAuthority = "77777777-7777-4777-8777-777777777777";
+    __generationRequestAuthorityTesting.retainAdmittedOwner(OWNER, "route-bound-chat", exactAuthority, "route-bound-turn");
+    __generationRequestAuthorityTesting.retainAdmittedOwner(OWNER, "route-bound-chat", secondAuthority, "route-second-turn");
+    __generationRequestAuthorityTesting.retainAdmittedOwner(OTHER, "route-foreign-chat", foreignAuthority, "route-foreign-turn");
+    __generationRequestAuthorityTesting.retainAcknowledgedReceipt(OWNER, "route-bound-chat", staleAuthority, "route-bound-turn");
+
+    for (const authorityId of [unknownAuthority, staleAuthority, secondAuthority, foreignAuthority]) {
+      const response = await app.request("http://localhost/agent-runs/route-bound-turn/stop", {
+        method: "POST",
+        headers: { "x-test-user": OWNER, "content-type": "application/json" },
+        body: JSON.stringify({ chatId: "route-bound-chat", generationId: "route-bound-turn", requestAuthorityId: authorityId }),
+      });
+      expect(response.status).toBe(409);
+      expect(getDb().query("SELECT state FROM agent_turn_executions WHERE id = ?").get("route-bound-turn")).toEqual({ state: "WORK" });
+      expect(__generationRequestAuthorityTesting.hasStoppedReceipt(OWNER, "route-bound-chat", authorityId)).toBe(false);
+    }
+
+    const crossChat = await app.request("http://localhost/agent-runs/route-other-bound-turn/stop", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ chatId: "route-other-bound-chat", generationId: "route-other-bound-turn", requestAuthorityId: exactAuthority }),
+    });
+    expect(crossChat.status).toBe(409);
+    expect(getDb().query("SELECT state FROM agent_turn_executions WHERE id = ?").get("route-other-bound-turn")).toEqual({ state: "WORK" });
+    const unresolvedOmitted = await app.request("http://localhost/agent-runs/route-other-bound-turn/stop", {
+      method: "POST",
+      headers: { "x-test-user": OWNER, "content-type": "application/json" },
+      body: JSON.stringify({ chatId: "route-other-bound-chat", generationId: "route-other-bound-turn" }),
+    });
+    expect(unresolvedOmitted.status).toBe(409);
+    expect(getDb().query("SELECT state FROM agent_turn_executions WHERE id = ?").get("route-other-bound-turn")).toEqual({ state: "WORK" });
+
+    const crossUser = await app.request("http://localhost/agent-runs/route-bound-turn/stop", {
+      method: "POST",
+      headers: { "x-test-user": OTHER, "content-type": "application/json" },
+      body: JSON.stringify({ chatId: "route-bound-chat", generationId: "route-bound-turn", requestAuthorityId: foreignAuthority }),
+    });
+    expect(crossUser.status).toBe(404);
+    expect(getDb().query("SELECT state FROM agent_turn_executions WHERE id = ?").get("route-bound-turn")).toEqual({ state: "WORK" });
   });
   test("rejects malformed optional IDs instead of ignoring them", async () => {
     seedChat(OWNER, "route-invalid-chat");

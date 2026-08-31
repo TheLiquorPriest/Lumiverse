@@ -48,6 +48,20 @@ async function collect(stream: AsyncGenerator<StreamChunk, void, unknown>): Prom
 }
 
 describe("Pollinations text usage protocol", () => {
+  test("fails closed for unsupported required tool mode before network I/O", async () => {
+    let fetched = false;
+    globalThis.fetch = (async () => {
+      fetched = true;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+    await expect(provider.generate("", "https://pollinations.test", {
+      ...request(),
+      toolMode: "required",
+      tools: [{ name: "host_a", description: "A", parameters: { type: "object" } }],
+    })).rejects.toThrow("Pollinations Text cannot require a host tool");
+    expect(fetched).toBe(false);
+  });
+
   test("forwards valid terminal usage before the done marker", async () => {
     mockResponse(sse(
       { choices: [{ delta: { content: "answer" }, finish_reason: null }] },

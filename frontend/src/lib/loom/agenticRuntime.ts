@@ -389,7 +389,7 @@ function parseAgentCustomPhaseV1(value: unknown, path: string): AgentCustomPhase
   ))
   const sourceKeys = new Set<string>()
   parsedInstructionRefs.forEach((source, index) => {
-    const key = source.blockId
+    const key = loomSourceOccurrenceKey(source)
     if (sourceKeys.has(key)) loomPolicyError(`${path}.instructionRefs[${index}]`, 'duplicate instruction reference')
     sourceKeys.add(key)
   })
@@ -568,17 +568,17 @@ export function parseAgentRuntimePolicyV1(value: unknown): AgentRuntimePolicyV1 
       }
     }
   })
-  const sourceBlockIds = new Set<string>()
+  const sourceBlockOccurrences = new Set<string>()
   for (const bucket of LOOM_POLICY_BUCKET_ORDER) {
-    for (const entry of loomPolicy?.[bucket] ?? []) sourceBlockIds.add(entry.source.blockId)
+    for (const entry of loomPolicy?.[bucket] ?? []) sourceBlockOccurrences.add(loomSourceOccurrenceKey(entry.source))
   }
   for (const phase of phases) {
-    for (const source of phase.instructionRefs) sourceBlockIds.add(source.blockId)
+    for (const source of phase.instructionRefs) sourceBlockOccurrences.add(loomSourceOccurrenceKey(source))
   }
-  if (sourceBlockIds.size > AGENT_RUNTIME_POLICY_SOURCE_BLOCK_LIMIT) {
+  if (sourceBlockOccurrences.size > AGENT_RUNTIME_POLICY_SOURCE_BLOCK_LIMIT) {
     loomPolicyError(
       'runtimePolicy',
-      `source block references must contain at most ${AGENT_RUNTIME_POLICY_SOURCE_BLOCK_LIMIT} distinct block IDs`,
+      `source block references must contain at most ${AGENT_RUNTIME_POLICY_SOURCE_BLOCK_LIMIT} distinct block occurrences`,
     )
   }
   return Object.freeze({
@@ -596,18 +596,26 @@ function refsToLoomPolicyBuckets(
   refs: AgentCognitionPolicy,
   blocks: readonly PromptBlock[],
 ): LoomPolicyBucketsV1 {
-  const sourceById = new Map(blocks.map((block, index) => [block.id, {
-    kind: 'loom_block' as const,
-    blockId: block.id,
-    presetRevision: 0,
-    blockRevision: promptBlockRevision(block, `blocks[${index}].revision`),
-    promptOrder: index,
-  }]))
+  const sourcesById = new Map<string, LoomPolicySourceV1[]>()
+  blocks.forEach((block, index) => {
+    const source = {
+      kind: 'loom_block' as const,
+      blockId: block.id,
+      presetRevision: 0,
+      blockRevision: promptBlockRevision(block, `blocks[${index}].revision`),
+      promptOrder: index,
+    }
+    const matches = sourcesById.get(block.id) ?? []
+    matches.push(source)
+    sourcesById.set(block.id, matches)
+  })
   const convert = (bucket: LoomPolicyBucketV1): LoomPolicyEntryV1[] => {
     const refsForBucket = refs[bucket] ?? []
     return sortLoomPolicyEntriesV1(refsForBucket.map((ref, index) => {
-      const source = sourceById.get(ref.blockId)
-      if (!source) loomPolicyError(`${bucket}[${index}].blockId`, 'source block is unavailable')
+      const matches = sourcesById.get(ref.blockId) ?? []
+      if (matches.length === 0) loomPolicyError(`${bucket}[${index}].blockId`, 'source block is unavailable')
+      if (matches.length > 1) loomPolicyError(`${bucket}[${index}].blockId`, 'source block is ambiguous; explicit repair is required')
+      const source = matches[0]!
       return {
         version: 1,
         id: `${bucket}-${ref.blockId}`,
@@ -656,8 +664,8 @@ function loomSourcePin(source: LoomPolicySourceV1): string {
   return `${source.presetRevision}\u0000${source.blockRevision}\u0000${source.promptOrder}`
 }
 
-function loomDestBlockKey(destination: LoomPolicyDestinationV1, blockId: string): string {
-  return `${destination}\u0000${blockId}`
+function loomDestBlockKey(destination: LoomPolicyDestinationV1, source: LoomPolicySourceV1): string {
+  return `${destination}\u0000${source.blockId}\u0000${source.promptOrder}`
 }
 
 function conflictingDestBlockEntryIds(policies: LoomPolicyBucketsV1): ReadonlySet<string> {
@@ -665,7 +673,7 @@ function conflictingDestBlockEntryIds(policies: LoomPolicyBucketsV1): ReadonlySe
   const conflicting = new Set<string>()
   for (const bucket of LOOM_POLICY_BUCKET_ORDER) {
     for (const entry of policies[bucket]) {
-      const key = loomDestBlockKey(entry.destination, entry.source.blockId)
+      const key = loomDestBlockKey(entry.destination, entry.source)
       const pin = loomSourcePin(entry.source)
       const group = groups.get(key)
       if (!group) {
@@ -680,6 +688,10 @@ function conflictingDestBlockEntryIds(policies: LoomPolicyBucketsV1): ReadonlySe
     }
   }
   return conflicting
+}
+
+function loomSourceOccurrenceKey(source: LoomPolicySourceV1): string {
+  return `${source.kind}\u0000${source.blockId}\u0000${source.promptOrder}`
 }
 
 function loomSourceKey(source: LoomPolicySourceV1): string {
@@ -814,7 +826,7 @@ export function inspectLoomPromptPoliciesV1(
           continue
         }
       }
-      const dedupKey = loomDestBlockKey(entry.destination, entry.source.blockId)
+      const dedupKey = loomDestBlockKey(entry.destination, entry.source)
       const keptEntryId = kept.get(dedupKey)
       if (keptEntryId) {
         items.push(loomInspectionItem(entry, bucket, {
@@ -1283,7 +1295,7 @@ export function createLoomPolicyEntryV1(
   const blockRevision = promptBlockRevision(block, `block.${block.id}.revision`)
   return {
     version: 1,
-    id: existing?.id ?? `${bucket}-${block.id}`,
+    id: existing?.id ?? `${bucket}-${block.id}-${promptOrder}`,
     source: {
       kind: 'loom_block',
       blockId: block.id,
@@ -1641,10 +1653,8 @@ export function prepareAgentConfigForRuntimeSave(
   sourceBlocks: readonly PromptBlock[],
   expectedPresetRevision: number,
 ): AgentConfigV2 {
-  if (!Number.isSafeInteger(expectedPresetRevision)
-    || expectedPresetRevision < 0
-    || expectedPresetRevision === Number.MAX_SAFE_INTEGER) {
-    return loomPolicyError('expectedPresetRevision', 'must allow one atomic preset revision advance')
+  if (!Number.isSafeInteger(expectedPresetRevision) || expectedPresetRevision < 0) {
+    return loomPolicyError('expectedPresetRevision', 'must be a non-negative safe integer')
   }
   const normalized = normalizeAgentConfigForEditor(config, sourceBlocks)
   const normalizedRecord = normalized as unknown as Record<string, unknown>
@@ -1659,74 +1669,42 @@ export function prepareAgentConfigForRuntimeSave(
     return normalized
   }
   const runtimePolicy = parseAgentRuntimePolicyV1(rawRuntimePolicy)
-  const sourceById = new Map<string, { block: PromptBlock; promptOrder: number }>()
-  sourceBlocks.forEach((block, promptOrder) => {
-    if (sourceById.has(block.id)) {
-      loomPolicyError(`promptOrder.${promptOrder}.id`, 'duplicate Loom block id')
+  // The client submits sources against the editor revision it actually loaded.
+  // Only the server can decide whether prompt order changed and, when it did,
+  // atomically advance preset authority and rebase unchanged exact references.
+  const validateSource = (source: LoomPolicySourceV1, path: string): void => {
+    const current = sourceBlocks[source.promptOrder]
+    if (!current || current.id !== source.blockId || current.marker === 'category') {
+      loomPolicyError(path, 'source block requires explicit repair before save')
     }
-    sourceById.set(block.id, { block, promptOrder })
-  })
-  // The shared save always advances the preset exactly once. Projecting an
-  // already-verified source to that resulting revision is not source repair:
-  // block identity, block revision, and prompt order remain unchanged.
-  const nextPresetRevision = expectedPresetRevision + 1
-  const projectSource = (source: LoomPolicySourceV1, path: string): LoomPolicySourceV1 => {
-    const current = sourceById.get(source.blockId)
-    if (!current || current.block.marker === 'category') {
-      return loomPolicyError(path, 'source block requires explicit repair before save')
-    }
-    const blockRevision = promptBlockRevision(current.block, `${path}.blockRevision`)
+    const blockRevision = promptBlockRevision(current, `${path}.blockRevision`)
     if (source.presetRevision !== expectedPresetRevision
       || source.blockRevision !== blockRevision
-      || source.promptOrder !== current.promptOrder) {
-      return loomPolicyError(path, 'source revision requires explicit repair before save')
+      || source.promptOrder < 0 || source.promptOrder >= sourceBlocks.length) {
+      loomPolicyError(path, 'source revision requires explicit repair before save')
     }
-    return { ...source, presetRevision: nextPresetRevision }
   }
-  const loomPolicy = runtimePolicy.loomPolicy === null
-    ? null
-    : {
-        version: 1 as const,
-        workPolicy: runtimePolicy.loomPolicy.workPolicy.map((entry, index) => ({
-          ...entry,
-          source: projectSource(entry.source, `config.runtimePolicy.loomPolicy.workPolicy.${index}.source`),
-        })),
-        workspaceUsage: runtimePolicy.loomPolicy.workspaceUsage.map((entry, index) => ({
-          ...entry,
-          source: projectSource(entry.source, `config.runtimePolicy.loomPolicy.workspaceUsage.${index}.source`),
-        })),
-        completionCriteria: runtimePolicy.loomPolicy.completionCriteria.map((entry, index) => ({
-          ...entry,
-          source: projectSource(entry.source, `config.runtimePolicy.loomPolicy.completionCriteria.${index}.source`),
-        })),
-        renderPolicy: runtimePolicy.loomPolicy.renderPolicy.map((entry, index) => ({
-          ...entry,
-          source: projectSource(entry.source, `config.runtimePolicy.loomPolicy.renderPolicy.${index}.source`),
-        })),
-      }
-  const phases = runtimePolicy.phases.map((phase, phaseIndex) => ({
-    ...phase,
-    instructionRefs: phase.instructionRefs.map((source, sourceIndex) => (
-      projectSource(source, `config.runtimePolicy.phases.${phaseIndex}.instructionRefs.${sourceIndex}`)
-    )),
-    childInstructionSubsets: phase.childInstructionSubsets.map((subset, subsetIndex) => ({
-      ...subset,
-      instructionRefs: subset.instructionRefs.map((source, sourceIndex) => (
-        projectSource(
+  if (runtimePolicy.loomPolicy !== null) {
+    for (const bucket of ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'] as const) {
+      runtimePolicy.loomPolicy[bucket].forEach((entry, index) => {
+        validateSource(entry.source, `config.runtimePolicy.loomPolicy.${bucket}.${index}.source`)
+      })
+    }
+  }
+  runtimePolicy.phases.forEach((phase, phaseIndex) => {
+    phase.instructionRefs.forEach((source, sourceIndex) => {
+      validateSource(source, `config.runtimePolicy.phases.${phaseIndex}.instructionRefs.${sourceIndex}`)
+    })
+    phase.childInstructionSubsets.forEach((subset, subsetIndex) => {
+      subset.instructionRefs.forEach((source, sourceIndex) => {
+        validateSource(
           source,
           `config.runtimePolicy.phases.${phaseIndex}.childInstructionSubsets.${subsetIndex}.instructionRefs.${sourceIndex}`,
         )
-      )),
-    })),
-  }))
-  return {
-    ...normalized,
-    runtimePolicy: {
-      ...runtimePolicy,
-      loomPolicy,
-      phases,
-    },
-  }
+      })
+    })
+  })
+  return normalized
 }
 
 
@@ -2115,28 +2093,24 @@ function validateRuntimePolicy(
       return
     }
   }
-  const blocksById = new Map<string, { block: PromptBlock; promptOrder: number }>()
-  blocks.forEach((block, promptOrder) => {
-    if (typeof block.id === 'string') blocksById.set(block.id, { block, promptOrder })
-  })
   phases.forEach((phase, index) => {
     const path = `config.runtimePolicy.phases.${index}`
     const nextPhaseId = phases[index + 1]?.id
     phase.instructionRefs.forEach((source, refIndex) => {
-      const current = blocksById.get(source.blockId)
+      const block = blocks[source.promptOrder]
       const sourcePath = `${path}.instructionRefs.${refIndex}`
-      if (!current || current.block.marker === 'category') {
+      if (!block || block.id !== source.blockId || block.marker === 'category') {
         issues.push({ code: 'invalid_policy_entry', path: sourcePath })
         return
       }
-      if (current.block.revision !== undefined && !isCanonicalBlockRevision(current.block.revision)) {
+      if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
         issues.push({ code: 'invalid_policy_entry', path: sourcePath })
         return
       }
-      const blockRevision = current.block.revision ?? 1
+      const blockRevision = block.revision ?? 1
       if (source.presetRevision !== expectedPresetRevision
         || source.blockRevision !== blockRevision
-        || source.promptOrder !== current.promptOrder) {
+        || source.promptOrder < 0 || source.promptOrder >= blocks.length) {
         issues.push({ code: 'stale_policy_source', path: sourcePath })
       }
     })
@@ -2187,19 +2161,19 @@ function validateRuntimePolicy(
   for (const bucket of LOOM_POLICY_BUCKET_ORDER) {
     policies[bucket].forEach((entry, index) => {
       const path = `config.runtimePolicy.loomPolicy.${bucket}.${index}`
-      const source = blocksById.get(entry.source.blockId)
-      if (!source || source.block.marker === 'category') {
+      const block = blocks[entry.source.promptOrder]
+      if (!block || block.id !== entry.source.blockId || block.marker === 'category') {
         issues.push({ code: 'invalid_policy_entry', path })
         return
       }
-      if (source.block.revision !== undefined && !isCanonicalBlockRevision(source.block.revision)) {
+      if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
         issues.push({ code: 'invalid_policy_entry', path })
         return
       }
-      const currentBlockRevision = source.block.revision ?? 1
+      const currentBlockRevision = block.revision ?? 1
       if (entry.source.presetRevision !== expectedPresetRevision
         || entry.source.blockRevision !== currentBlockRevision
-        || entry.source.promptOrder !== source.promptOrder) {
+        || entry.source.promptOrder < 0 || entry.source.promptOrder >= blocks.length) {
         issues.push({ code: 'stale_policy_source', path: `${path}.source` })
       }
       if (entry.condition !== undefined) {
@@ -2506,21 +2480,26 @@ function isValidRepairItem(value: unknown): value is AgentConfigRepairItem {
     && ['acknowledge', 'map_slot', 'choose_response'].includes(action.kind)
 }
 
-function invalidReviewItem(reasonCode: string): AgentConfigRepairItem {
+type ImportedReviewReasonCode = 'foreign_import' | 'cognition_foreign_authority_blocked'
+
+function isImportedReviewReasonCode(value: unknown): value is ImportedReviewReasonCode {
+  return value === 'foreign_import' || value === 'cognition_foreign_authority_blocked'
+}
+
+function importedReviewItem(reasonCode: ImportedReviewReasonCode, acknowledged: boolean): AgentConfigRepairItem {
   return {
     id: `review:${reasonCode}`,
     kind: 'disabled_import',
     label: reasonCode,
     reasonCode,
     action: { kind: 'acknowledge' },
-    acknowledged: false,
+    acknowledged,
   }
 }
 
 export function getAgenticRuntimeRepairItems(preset: LoomPreset): AgentConfigRepairItem[] {
   const reviewValue: unknown = preset.agentConfigReview
-  if (reviewValue === null || reviewValue === undefined) return []
-  if (!isUnknownRecord(reviewValue)) return [invalidReviewItem('invalid_review')]
+  if (reviewValue === null || reviewValue === undefined || !isUnknownRecord(reviewValue)) return []
 
   const reviewState = reviewValue.state
   const stateIsKnown = reviewState === 'ready' || reviewState === 'review_required' || reviewState === 'repair_required'
@@ -2531,16 +2510,29 @@ export function getAgenticRuntimeRepairItems(preset: LoomPreset): AgentConfigRep
     && isStringList(reviewValue.staleSlotIds)
     && Array.isArray(reviewValue.items)
     && reviewValue.items.every((item) => isValidRepairItem(item))
-  const projected = Array.isArray(reviewValue.items)
-    ? reviewValue.items.filter((item): item is AgentConfigRepairItem => isValidRepairItem(item))
-    : []
-  if (reviewShapeIsValid && reviewState === 'ready') return []
-  const importItem = typeof reviewValue.reasonCode === 'string'
-    && (reviewValue.reasonCode === 'foreign_import' || reviewValue.reasonCode === 'cognition_foreign_authority_blocked')
-    ? invalidReviewItem(reviewValue.reasonCode)
+  if (!reviewShapeIsValid || reviewState === 'ready') return []
+
+  const importReason = isImportedReviewReasonCode(reviewValue.reasonCode)
+    ? reviewValue.reasonCode
     : null
+  const reviewItems = Array.isArray(reviewValue.items) ? reviewValue.items : []
+  const importAcknowledged = importReason !== null && reviewItems.some((item) => (
+    isValidRepairItem(item)
+      && item.id === `review:${importReason}`
+      && item.kind === 'disabled_import'
+      && item.reasonCode === importReason
+      && item.action.kind === 'acknowledge'
+      && item.acknowledged === true
+  ))
+  const importItem = importReason === null ? null : importedReviewItem(importReason, importAcknowledged)
+  // The import acknowledgement is reconstructed from trusted review provenance.
+  // Never inherit a disabled-import row from a generic or malformed projection.
+  const projected = reviewItems
+    .filter((item): item is AgentConfigRepairItem => (
+      isValidRepairItem(item) && item.kind !== 'disabled_import'
+    ))
   const withInheritedImportReview = (items: AgentConfigRepairItem[]): AgentConfigRepairItem[] => {
-    if (!importItem || items.some((item) => item.id === importItem.id)) return items
+    if (!importItem) return items
     return [...items, importItem]
   }
   if (projected.length > 0) return withInheritedImportReview(projected)
@@ -2564,16 +2556,7 @@ export function getAgenticRuntimeRepairItems(preset: LoomPreset): AgentConfigRep
     action: { kind: 'map_slot' },
     acknowledged: false,
   }))
-  if (items.length > 0) return withInheritedImportReview(items)
-
-  const reasonCode = typeof reviewValue.reasonCode === 'string' && reviewValue.reasonCode.trim()
-    ? reviewValue.reasonCode
-    : reviewState === 'repair_required'
-      ? 'repair_required'
-      : reviewState === 'review_required'
-        ? 'review_required'
-        : 'invalid_review'
-  return [invalidReviewItem(reasonCode)]
+  return withInheritedImportReview(items)
 }
 
 export function runtimeDraftFingerprint(draft: AgenticRuntimeSaveDraft): string {

@@ -39,6 +39,7 @@ import type {
   AgentRunInspectionDetailV1,
   AgentTurnSessionEntryV1,
   AgentWorkspaceAssociationV1,
+  WorkSegmentInspectionProjectionV1,
 } from '@/types/agent-runs'
 import type {
   LoomPromptInspectionItemV1,
@@ -53,6 +54,11 @@ import PersistentWorkspaceInspector, {
   type PersistentWorkspaceTaskInput,
 } from './PersistentWorkspaceInspector'
 import styles from './OwnerRunInspector.module.css'
+type WorkTransitionInspectionV1 = WorkSegmentInspectionProjectionV1['transitions'][number]
+type WorkDispatchInspectionV1 = WorkSegmentInspectionProjectionV1['dispatches'][number]
+type WorkCausalTimelineItemV1 =
+  | { readonly kind: 'recovery'; readonly id: string; readonly recovery: WorkSegmentInspectionProjectionV1['recovery']; readonly dispatch: WorkDispatchInspectionV1 | null }
+  | { readonly kind: 'transition'; readonly id: string; readonly transition: WorkTransitionInspectionV1; readonly dispatch: WorkDispatchInspectionV1 | null }
 
 const MAX_PAYLOAD_CHARS = 2_048
 const MAX_EXPANDED_PAYLOAD_CHARS = 16_384
@@ -491,6 +497,7 @@ function PromptCard({ prompt, t, position, resetKey }: {
         <Field label={t('ownerInspection.promptDestination')} value={valueLabel(t, prompt.destination)} />
         <Field label={t('ownerInspection.sourceId')} value={boundedId(prompt.sourceId)} mono />
         <Field label={t('ownerInspection.sourceRevision')} value={prompt.sourceRevision} />
+        <Field label={t('ownerInspection.promptOrder')} value={prompt.promptOrder} />
         <Field label={t('ownerInspection.contentDigest')} value={boundedId(prompt.contentDigest)} mono />
       </dl>
       {nativeProvenance?.kind === 'world_info' ? (
@@ -615,7 +622,11 @@ function LoomInspectionLedger({
           renderItem={(item) => {
             const repairReason = loomRepairReason(item, t)
             const outcomeReason = item.outcome.reason
-            const fixedRole = t(`ownerInspection.values.${item.bucket}`, { defaultValue: item.bucket })
+            const fixedRole = roleBySource.get(JSON.stringify([
+              item.source.blockId,
+              item.source.promptOrder,
+              item.source.blockRevision,
+            ]))
             return (
               <details className={styles.loomItem}>
                 <summary className={styles.loomItemSummary}>
@@ -636,7 +647,7 @@ function LoomInspectionLedger({
                     <Field label={t('ownerInspection.ar007.presetRevision')} value={item.source.presetRevision} />
                     <Field label={t('ownerInspection.ar007.blockRevision')} value={item.source.blockRevision} />
                     <Field label={t('ownerInspection.promptOrder')} value={item.source.promptOrder} />
-                    <Field label={t('ownerInspection.ar007.fixedRole')} value={fixedRole} />
+                    <Field label={t('ownerInspection.ar007.fixedRole')} value={fixedRole ? valueLabel(t, fixedRole) : notRecorded} />
                     <Field label={t('ownerInspection.loomDestination')} value={valueLabel(t, item.destination)} />
                     <Field label={t('ownerInspection.loomCheckpoint')} value={valueLabel(t, item.checkpoint)} />
                     <Field label={t('agentRuntime.provenance.loomInspection.required')} value={item.required ? t('ownerInspection.ar007.booleanTrue') : t('ownerInspection.ar007.booleanFalse')} />
@@ -705,7 +716,11 @@ function LoomInspectionLedger({
               getKey={({ phaseId, source }) => `${phaseId}:${source.blockId}:${source.presetRevision}:${source.blockRevision}:${source.promptOrder}`}
               t={t}
               renderItem={({ phaseId, source }) => {
-                const fixedRole = roleBySource.get(`${source.blockId}\u0000${source.blockRevision}`)
+                const fixedRole = roleBySource.get(JSON.stringify([
+                  source.blockId,
+                  source.promptOrder,
+                  source.blockRevision,
+                ]))
                 return (
                   <article className={styles.phaseItem}>
                     <header className={styles.recordHeader}>
@@ -1334,6 +1349,9 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
   const selectedRecord = renderedTranscript[selectedRecordIndex] ?? null
   const turnSession = useMemo(() => inspection ? [...inspection.turnSession].sort(compareTurnSession) : [], [inspection])
   const prompts = useMemo(() => inspection ? [...inspection.promptEvidence].sort(comparePromptEvidence) : [], [inspection])
+  const promptRoleCorrelationAvailable = inspection?.sectionAvailability.some(
+    (entry) => entry.section === 'prompt' && entry.state === 'available',
+  ) ?? false
   const orderedPromptRecords = useMemo(
     () => prompts.map((prompt, position) => ({ prompt, position })),
     [prompts],
@@ -1357,12 +1375,24 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
   }, [prompts])
   const loomRoleBySource = useMemo(() => {
     const roles = new Map<string, AgentPromptEvidenceV1['role']>()
+    if (!promptRoleCorrelationAvailable) return roles
+    const fingerprints = new Map<string, string>()
+    const collisions = new Set<string>()
     for (const prompt of prompts) {
-      const key = `${prompt.sourceId}\u0000${prompt.sourceRevision}`
-      if (!roles.has(key)) roles.set(key, prompt.role)
+      const key = JSON.stringify([prompt.sourceId, prompt.promptOrder, prompt.sourceRevision])
+      if (collisions.has(key)) continue
+      const fingerprint = JSON.stringify([prompt.role, prompt.contentDigest, prompt.content])
+      const retained = fingerprints.get(key)
+      if (retained === undefined) {
+        fingerprints.set(key, fingerprint)
+        roles.set(key, prompt.role)
+      } else if (retained !== fingerprint) {
+        roles.delete(key)
+        collisions.add(key)
+      }
     }
     return roles
-  }, [prompts])
+  }, [promptRoleCorrelationAvailable, prompts])
   const executionEvidence = useMemo(
     () => transcript.filter((record) => record.kind === 'tool' || record.kind === 'delegation' || record.kind === 'child_result'),
     [transcript],
@@ -1388,6 +1418,39 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
   const workspacePublicationsWindow = useCollectionWindow(workspacePublications, `${inspectionResetKey}:workspace-publications`)
   const cortexReceiptsWindow = useCollectionWindow(cortexReceipts, `${inspectionResetKey}:cortex-receipts`)
   const councilReceiptsWindow = useCollectionWindow(councilReceipts, `${inspectionResetKey}:council-receipts`)
+  const workCausalTimeline = useMemo<WorkCausalTimelineItemV1[]>(() => {
+    const workSegments = inspection?.workSegments
+    if (!workSegments) return []
+    const dispatchBySegment = new Map<string, WorkDispatchInspectionV1>()
+    const segmentOrdinalById = new Map(
+      workSegments.segments.map((segment) => [segment.identity.segmentId, segment.identity.segmentOrdinal] as const),
+    )
+    const compareDispatchOrder = (left: WorkDispatchInspectionV1, right: WorkDispatchInspectionV1) => {
+      const segmentOrder = (segmentOrdinalById.get(left.segmentId) ?? -1)
+        - (segmentOrdinalById.get(right.segmentId) ?? -1)
+      return segmentOrder || left.dispatchOrdinal - right.dispatchOrdinal
+    }
+    let latestDispatch: WorkDispatchInspectionV1 | null = null
+    let recoveryDispatch: WorkDispatchInspectionV1 | null = null
+    for (const dispatch of workSegments.dispatches) {
+      const existing = dispatchBySegment.get(dispatch.segmentId)
+      if (!existing || existing.dispatchOrdinal < dispatch.dispatchOrdinal) dispatchBySegment.set(dispatch.segmentId, dispatch)
+      if (!latestDispatch || compareDispatchOrder(latestDispatch, dispatch) < 0) latestDispatch = dispatch
+      if (dispatch.budgetClass === 'recovery' && (!recoveryDispatch || compareDispatchOrder(recoveryDispatch, dispatch) < 0)) recoveryDispatch = dispatch
+    }
+    const currentRecoveryDispatch = workSegments.recovery.currentSegmentId
+      ? dispatchBySegment.get(workSegments.recovery.currentSegmentId) ?? null
+      : recoveryDispatch ?? latestDispatch
+    return [
+      { kind: 'recovery', id: 'recovery:' + (workSegments.recovery.currentSegmentId ?? 'closed'), recovery: workSegments.recovery, dispatch: currentRecoveryDispatch },
+      ...workSegments.transitions.map((transition) => ({
+        kind: 'transition' as const,
+        id: transition.transitionId,
+        transition,
+        dispatch: dispatchBySegment.get(transition.sourceSegment.segmentId) ?? null,
+      })),
+    ]
+  }, [inspection])
   const tone = inspection ? statusTone(inspection) : 'live'
   const notRecorded = t('ownerInspection.notRecorded')
 
@@ -1489,6 +1552,65 @@ export default function OwnerRunInspector({ attemptId, chatId, isOpen, onClose, 
               {inspection.committedTarget ? <section className={styles.section} aria-labelledby="owner-inspection-committed-response-heading"><div className={styles.sectionHeading}><h3 id="owner-inspection-committed-response-heading">{t('ownerInspection.committedResponse')}</h3></div><dl className={styles.summaryGrid}><Field label={t('ownerInspection.message')} value={boundedId(inspection.committedTarget.messageId)} mono /><Field label={t('ownerInspection.swipe')} value={inspection.committedTarget.swipeId} /></dl></section> : null}
 
               <section className={styles.section} aria-labelledby="owner-inspection-lifecycle-heading"><div className={styles.sectionHeading}><h3 id="owner-inspection-lifecycle-heading">{t('ownerInspection.lifecycle')}</h3></div><dl className={styles.summaryGrid}><Field label={t('ownerInspection.lifecycle')} value={valueLabel(t, inspection.lifecycle)} /><Field label={t('ownerInspection.status')} value={valueLabel(t, inspection.status)} /><Field label={t('ownerInspection.outcome')} value={valueLabel(t, inspection.outcome)} /><Field label={t('ownerInspection.reason')} value={valueLabel(t, inspection.reason)} /><Field label={t('ownerInspection.started')} value={formatTimestamp(inspection.startedAt, notRecorded)} /><Field label={t('ownerInspection.updated')} value={formatTimestamp(inspection.updatedAt, notRecorded)} /><Field label={t('ownerInspection.terminal')} value={inspection.terminal ? t('ownerInspection.statusTerminal') : t('ownerInspection.runningApprox')} /><Field label={t('ownerInspection.duration')} value={formatDuration(inspection.terminalAt ? inspection.terminalAt - inspection.startedAt : inspection.updatedAt - inspection.startedAt, notRecorded, t)} /></dl></section>
+
+              {inspection.workSegments ? (
+                <section className={styles.section} aria-labelledby="owner-inspection-work-segments-heading">
+                  <div className={styles.sectionHeading}><div><h3 id="owner-inspection-work-segments-heading">{t('ownerInspection.workSegments')}</h3><p>{t('ownerInspection.workSegmentsIntro')}</p></div></div>
+                  <dl className={styles.summaryGrid}>
+                    <Field label={t('ownerInspection.segmentCount')} value={inspection.workSegments.segments.length} />
+                    <Field label={t('ownerInspection.dispatchCount')} value={inspection.workSegments.dispatches.length} />
+                    <Field label={t('ownerInspection.transitionCount')} value={inspection.workSegments.transitions.length} />
+                    <Field label={t('ownerInspection.workspaceRevision')} value={inspection.workSegments.recovery.workspaceRevision} />
+                  </dl>
+                  {inspection.workSegments.segments.map((segment) => (
+                    <article key={segment.identity.segmentId} className={styles.recordCard}>
+                      <div className={styles.recordHeader}><strong>{segment.identity.phaseId === null ? t('ownerInspection.builtInWork') : boundedId(segment.identity.phaseId)}</strong><span>{valueLabel(t, segment.lifecycle)}</span></div>
+                      <dl className={styles.summaryGrid}>
+                        <Field label={t('ownerInspection.occurrence')} value={segment.identity.phaseOccurrence} />
+                        <Field label={t('ownerInspection.status')} value={valueLabel(t, segment.lifecycle)} />
+                        <Field label={t('ownerInspection.boundaryClass')} value={valueLabel(t, segment.boundaryClass)} />
+                        <Field label={t('ownerInspection.providerDispatches')} value={segment.usage.providerDispatches} />
+                        <Field label={t('ownerInspection.toolCalls')} value={segment.usage.toolCalls} />
+                        <Field label={t('ownerInspection.workspaceOperations')} value={segment.usage.workspaceOperations} />
+                      </dl>
+                    </article>
+                  ))}
+                  <div className={styles.sectionHeading}><h4>{t('ownerInspection.causalTimeline')}</h4></div>
+                  <BoundedCollection
+                    items={workCausalTimeline}
+                    resetKey={inspectionResetKey + ':work-causal-timeline'}
+                    listId="owner-inspection-work-causal-timeline"
+                    label={t('ownerInspection.causalTimeline')}
+                    getKey={(item) => item.id}
+                    t={t}
+                    renderItem={(item) => item.kind === 'recovery' ? (
+                      <article className={styles.recordCard} aria-label={t('ownerInspection.causalTimeline') + ': ' + valueLabel(t, 'recovery')}>
+                        <div className={styles.recordHeader}><strong>{valueLabel(t, 'recovery')}</strong><span>{valueLabel(t, item.recovery.state)}</span></div>
+                        <dl className={styles.summaryGrid}>
+                          <Field label={t('ownerInspection.sourcePhase')} value={item.recovery.phaseId === null ? t('ownerInspection.builtInWork') : boundedId(item.recovery.phaseId)} />
+                          <Field label={t('ownerInspection.workspaceRevision')} value={item.recovery.workspaceRevision} />
+                          <Field label={t('ownerInspection.boundaryClass')} value={valueLabel(t, item.recovery.terminalBoundaryClass)} />
+                          <Field label={t('ownerInspection.dispatchId')} value={boundedId(item.dispatch?.dispatchId ?? null)} mono />
+                        </dl>
+                      </article>
+                    ) : (
+                      <article className={styles.recordCard} aria-label={t('ownerInspection.causalTimeline') + ': ' + valueLabel(t, item.transition.transitionKind)}>
+                        <div className={styles.recordHeader}><strong>{valueLabel(t, item.transition.transitionKind)}</strong><span>{boundedId(item.transition.handoffId)}</span></div>
+                        <dl className={styles.summaryGrid}>
+                          <Field label={t('ownerInspection.sourcePhase')} value={item.transition.sourceSegment.phaseId === null ? t('ownerInspection.builtInWork') : boundedId(item.transition.sourceSegment.phaseId)} />
+                          <Field label={t('ownerInspection.targetPhase')} value={item.transition.targetPhaseId === null ? valueLabel(t, 'terminal') : boundedId(item.transition.targetPhaseId)} />
+                          <Field label={t('ownerInspection.occurrence')} value={String(item.transition.sourceSegment.phaseOccurrence) + ' → ' + String(item.transition.targetPhaseOccurrence ?? '—')} />
+                          <Field label={t('ownerInspection.handoffId')} value={boundedId(item.transition.handoffId)} mono />
+                          <Field label={t('ownerInspection.workspaceRevision')} value={item.transition.sourceWorkspaceRevision} />
+                          <Field label={t('ownerInspection.cause')} value={valueLabel(t, item.transition.cause)} />
+                          <Field label={t('ownerInspection.dispatchId')} value={boundedId(item.dispatch?.dispatchId ?? null)} mono />
+                          <Field label={t('ownerInspection.boundaryClass')} value={valueLabel(t, item.dispatch?.boundaryClass ?? item.transition.cause)} />
+                        </dl>
+                      </article>
+                    )}
+                  />
+                </section>
+              ) : null}
 
               <section className={styles.section} aria-labelledby="owner-inspection-recovery-heading"><div className={styles.sectionHeading}><h3 id="owner-inspection-recovery-heading">{t('ownerInspection.retryEligibility')}</h3></div><div className={styles.recoveryGrid}><div className={inspection.retry.allowed ? styles.recoveryAllowed : styles.recoveryDenied}><strong>{inspection.retry.allowed ? t('ownerInspection.retryAllowed') : t('ownerInspection.retryUnavailable')}</strong><span>{t('ownerInspection.retryReason')}: {valueLabel(t, inspection.retry.reason)}</span><span>{t('ownerInspection.target')}: {inspection.retry.targetValid ? t('ownerInspection.included') : t('ownerInspection.omitted')}</span></div>{inspection.stop ? <div className={styles.stopReceipt}><strong>{t('ownerInspection.stopReceipt')}</strong><span>{t('ownerInspection.stopState')}: {valueLabel(t, inspection.stop.state)}</span><span>{t('ownerInspection.stopRequested')}: {formatTimestamp(inspection.stop.requestedAt, notRecorded)}</span><span>{t('ownerInspection.stopReceived')}: {formatTimestamp(inspection.stop.receiptAt, notRecorded)}</span></div> : null}</div></section>
               <p className={styles.boundaryNotice}><EyeOff aria-hidden="true" />{t('ownerInspection.noResponse')}</p>

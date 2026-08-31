@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { JSDOM } from 'jsdom'
 import type { ReactNode } from 'react'
 import type { Root } from 'react-dom/client'
@@ -57,6 +57,19 @@ const hostCeilings = {
   logicalProviderRequests: 32,
   physicalDispatchAttempts: 64,
   childOutputTokens: 16_384,
+  workAttemptOutputTokens: 1_048_576,
+  workAttemptProviderDispatches: 256,
+  workAttemptUnsignedBoundaries: 256,
+  workAttemptToolCalls: 1_024,
+  workAttemptWorkspaceOperations: 1_024,
+  workSegmentOutputTokens: 262_144,
+  workSegmentProviderDispatches: 64,
+  workSegmentUnsignedBoundaries: 64,
+  workSegmentToolCalls: 256,
+  workSegmentWorkspaceOperations: 256,
+  workDispatchOutputTokens: 65_536,
+  workRecoveryReserveOutputTokens: 65_536,
+  workFuturePhaseReserveOutputTokens: 262_144,
   rootWallClockMs: 120_000,
   activityEvents: 256,
   activityBytes: 262_144,
@@ -288,6 +301,10 @@ function agentConfig(): AgentConfigV2 {
 }
 
 function preset(reviewItems: AgentConfigRepairItem[] = []): LoomPreset {
+  const stickyImportReason = reviewItems.find((item) => (
+    item.kind === 'disabled_import'
+      && (item.reasonCode === 'foreign_import' || item.reasonCode === 'cognition_foreign_authority_blocked')
+  ))?.reasonCode ?? null
   return {
     id: 'preset-1',
     name: 'Preset',
@@ -306,7 +323,7 @@ function preset(reviewItems: AgentConfigRepairItem[] = []): LoomPreset {
     agentConfigReview: reviewItems.length === 0 ? null : {
       state: 'review_required',
       revision: 1,
-      reasonCode: 'import_review',
+      reasonCode: stickyImportReason ?? reviewItems[0]?.reasonCode ?? null,
       unresolvedSlotIds: [],
       staleSlotIds: [],
       acknowledged: false,
@@ -349,21 +366,172 @@ function wirePreset(loom: LoomPreset): Preset {
   }
 }
 
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false
+    return left.every((value, index) => sameJsonValue(value, right[index]))
+  }
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  const leftKeys = Object.keys(leftRecord).filter((key) => leftRecord[key] !== undefined)
+  const rightKeys = Object.keys(rightRecord).filter((key) => rightRecord[key] !== undefined)
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => Object.hasOwn(rightRecord, key) && sameJsonValue(leftRecord[key], rightRecord[key]))
+}
+
+function promptBlockRevisionValue(value: PromptBlock): number {
+  const revision: unknown = value.revision
+  if (typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= 0) return revision
+  if (typeof revision === 'string' && /^\d+$/.test(revision)) {
+    const parsed = Number(revision)
+    if (Number.isSafeInteger(parsed)) return parsed
+  }
+  return 1
+}
+
+function promptBlockSemanticValue(value: PromptBlock): unknown {
+  const { revision: _revision, ...semantic } = value
+  return semantic
+}
+
+function forEachLoomSource(config: AgentConfigV2, visit: (source: LoomPolicySourceV1) => void): void {
+  const runtimePolicy = config.runtimePolicy
+  if (!runtimePolicy) return
+  if (runtimePolicy.loomPolicy !== null) {
+    for (const bucket of ['workPolicy', 'workspaceUsage', 'completionCriteria', 'renderPolicy'] as const) {
+      runtimePolicy.loomPolicy[bucket].forEach((entry) => visit(entry.source))
+    }
+  }
+  runtimePolicy.phases.forEach((phase) => {
+    phase.instructionRefs.forEach(visit)
+    phase.childInstructionSubsets.forEach((subset) => subset.instructionRefs.forEach(visit))
+  })
+}
+
+function sourceMatchesPromptOrder(
+  source: LoomPolicySourceV1,
+  presetRevision: number,
+  promptOrder: readonly PromptBlock[],
+): boolean {
+  const block = promptOrder[source.promptOrder]
+  return block !== undefined
+    && block.marker !== 'category'
+    && block.id === source.blockId
+    && source.presetRevision === presetRevision
+    && source.blockRevision === promptBlockRevisionValue(block)
+}
+
 function saveResult(
   base: LoomPreset,
   draft: AgenticRuntimeSaveDraft,
   promptOrder: PromptBlock[],
 ): SaveAgenticRuntimeEditorResult {
+  const persistedRevision = base.cacheRevision ?? 0
+  const promptOrderChanged = !sameJsonValue(promptOrder, base.blocks)
+  const committedRevision = promptOrderChanged ? persistedRevision + 1 : persistedRevision
+  const committedConfig = structuredClone(prepareAgentConfigForRuntimeSave(
+    draft.config,
+    promptOrder,
+    persistedRevision,
+  ))
+  if (promptOrderChanged) {
+    forEachLoomSource(committedConfig, (source) => {
+      const block = promptOrder[source.promptOrder]
+      const persisted = base.blocks[source.promptOrder]
+      const safeOccurrence = block !== undefined
+        && persisted !== undefined
+        && block.marker !== 'category'
+        && block.id === source.blockId
+        && persisted.id === block.id
+        && source.blockRevision === promptBlockRevisionValue(block)
+        && promptBlockRevisionValue(persisted) === promptBlockRevisionValue(block)
+        && sameJsonValue(promptBlockSemanticValue(persisted), promptBlockSemanticValue(block))
+      if (safeOccurrence && source.presetRevision === persistedRevision) {
+        const mutableSource = source as { presetRevision: number }
+        mutableSource.presetRevision = committedRevision
+      }
+    })
+  }
+  let referencesReady = true
+  forEachLoomSource(committedConfig, (source) => {
+    if (!sourceMatchesPromptOrder(source, committedRevision, promptOrder)) referencesReady = false
+  })
+  const persistedReviewAcknowledgements = (base.agentConfigReview?.items ?? [])
+    .filter((item) => item.acknowledged === true)
+    .map((item) => item.id)
+    .sort()
+  const requestedReviewAcknowledgements = [...draft.reviewAcknowledgements].sort()
+  const configPayloadChanged = !sameJsonValue(committedConfig, base.agentConfig)
+    || !sameJsonValue(draft.slotBindings, base.agentSlotBindings)
+    || !sameJsonValue(draft.taskTemplates, base.agentTaskTemplates)
+    || !sameJsonValue(requestedReviewAcknowledgements, persistedReviewAcknowledgements)
+  const inheritedReviewReady = base.agentConfigReview === null || base.agentConfigReview.state === 'ready'
+  const committedConfigRevision = promptOrderChanged || configPayloadChanged || !inheritedReviewReady
+    ? base.agentConfigRevision + 1
+    : base.agentConfigRevision
+  const stickyImportReason = base.agentConfigReview?.state === 'review_required'
+    && (base.agentConfigReview.reasonCode === 'foreign_import'
+      || base.agentConfigReview.reasonCode === 'cognition_foreign_authority_blocked')
+    ? base.agentConfigReview.reasonCode
+    : null
+  const requiredStickyReviewIds = stickyImportReason === null
+    ? []
+    : [...new Set([
+        `review:${stickyImportReason}`,
+        ...(base.agentConfigReview?.unresolvedSlotIds ?? []).map((slotId) => `slot:${slotId}`),
+        ...(base.agentConfigReview?.staleSlotIds ?? []).map((slotId) => `stale-slot:${slotId}`),
+      ])]
+  const stickyReviewAcknowledged = requiredStickyReviewIds.length > 0
+    && requiredStickyReviewIds.every((id) => requestedReviewAcknowledgements.includes(id))
+    && (base.agentConfigReview?.unresolvedSlotIds.length ?? 0) === 0
+    && (base.agentConfigReview?.staleSlotIds.length ?? 0) === 0
+  const inheritedStickyReview = stickyImportReason !== null && !stickyReviewAcknowledged
+    ? {
+        ...structuredClone(base.agentConfigReview!),
+        revision: committedConfigRevision,
+        items: [
+          ...(base.agentConfigReview?.items ?? [])
+            .filter((item) => item.kind !== 'disabled_import')
+            .map((item) => ({ ...item, acknowledged: requestedReviewAcknowledgements.includes(item.id) })),
+          {
+            id: `review:${stickyImportReason}`,
+            kind: 'disabled_import' as const,
+            label: stickyImportReason,
+            reasonCode: stickyImportReason,
+            action: { kind: 'acknowledge' as const },
+            acknowledged: requestedReviewAcknowledgements.includes(`review:${stickyImportReason}`),
+          },
+        ],
+      }
+    : null
+  const committedReview: NonNullable<LoomPreset['agentConfigReview']> = referencesReady
+    ? inheritedStickyReview ?? {
+        state: 'ready',
+        revision: committedConfigRevision,
+        reasonCode: null,
+        unresolvedSlotIds: [],
+        staleSlotIds: [],
+        acknowledged: false,
+        items: [],
+      }
+    : {
+        state: 'repair_required',
+        revision: committedConfigRevision,
+        reasonCode: 'loom_reference_repair_required',
+        unresolvedSlotIds: [],
+        staleSlotIds: [],
+        acknowledged: false,
+        items: [],
+      }
   const committed: LoomPreset = {
     ...base,
-    cacheRevision: (base.cacheRevision ?? 0) + 1,
+    cacheRevision: committedRevision,
     blocks: structuredClone(promptOrder),
-    agentConfig: structuredClone(prepareAgentConfigForRuntimeSave(
-      draft.config,
-      promptOrder,
-      base.cacheRevision ?? 0,
-    )),
-    agentConfigRevision: base.agentConfigRevision + 1,
+    agentConfig: committedConfig,
+    agentConfigRevision: committedConfigRevision,
+    agentConfigReview: committedReview,
     agentSlotBindings: { ...draft.slotBindings },
     agentTaskTemplates: structuredClone(draft.taskTemplates),
   }
@@ -403,6 +571,7 @@ function reloadResult(base: LoomPreset): SaveAgenticRuntimeEditorResult {
 
 function renderPanel(options: {
   value?: LoomPreset
+  editorValue?: LoomPreset
   onSave?: (
     draft: AgenticRuntimeSaveDraft,
     promptOrder: PromptBlock[],
@@ -416,10 +585,11 @@ function renderPanel(options: {
   document.body.append(container)
   const root = createRoot(container)
   const value = options.value ?? preset()
-  editorPresetRevision = value.cacheRevision ?? 0
-  editorConfigRevision = value.agentConfigRevision
-  editorConfig = structuredClone(value.agentConfig)
-  editorReview = structuredClone(value.agentConfigReview)
+  const editorValue = options.editorValue ?? value
+  editorPresetRevision = editorValue.cacheRevision ?? 0
+  editorConfigRevision = editorValue.agentConfigRevision
+  editorConfig = structuredClone(editorValue.agentConfig)
+  editorReview = structuredClone(editorValue.agentConfigReview)
   flushSync(() => root.render(createElement(AgenticRuntimePanel, {
     preset: value,
     onSave: options.onSave ?? (async (draft, promptOrder) => saveResult(value, draft, promptOrder)),
@@ -489,6 +659,139 @@ afterAll(() => {
 })
 
 describe('Agentic Runtime shared editor', () => {
+  test('isolated save keeps object-key-only prompt changes as an authority no-op', () => {
+    const value = preset()
+    value.agentConfig = prepareAgentConfigForRuntimeSave(value.agentConfig!, value.blocks, value.cacheRevision ?? 0)
+    const reorderedBlock = Object.fromEntries(Object.entries(value.blocks[0]!).reverse()) as unknown as PromptBlock
+    const result = saveResult(value, {
+      config: value.agentConfig,
+      slotBindings: value.agentSlotBindings,
+      taskTemplates: value.agentTaskTemplates,
+      reviewAcknowledgements: [],
+    }, [reorderedBlock])
+
+    expect(result.editor.presetRevision).toBe(8)
+    expect(result.editor.configRevision).toBe(4)
+    expect(result.editor.review.state).toBe('ready')
+  })
+
+  test('isolated save rebases only an unchanged exact occurrence', () => {
+    const value = preset()
+    const persistedBlock = promptBlock(1)
+    delete persistedBlock.revision
+    value.blocks = [persistedBlock]
+    const source = { ...loomSource(), blockRevision: 1 }
+    const authoredConfig = agentConfig()
+    authoredConfig.runtimePolicy = runtimePolicy([], [{ ...workPolicyEntry(), source }])
+    value.agentConfig = authoredConfig
+    const committedBlock = { ...persistedBlock, revision: 1 }
+    const result = saveResult(value, {
+      config: authoredConfig,
+      slotBindings: {},
+      taskTemplates: [],
+      reviewAcknowledgements: [],
+    }, [committedBlock])
+
+    expect(result.editor.presetRevision).toBe(9)
+    expect(result.editor.review.state).toBe('ready')
+    expect(result.editor.config.runtimePolicy?.loomPolicy.workPolicy[0]?.source.presetRevision).toBe(9)
+  })
+
+  test('isolated save quarantines moved, new, replaced, and changed duplicate occurrences', () => {
+    const namedBlock = (id: string, content: string): PromptBlock => ({
+      ...promptBlock(1),
+      id,
+      name: id,
+      content,
+    })
+    const scenarios: Array<{
+      name: string
+      persisted: PromptBlock[]
+      submitted: PromptBlock[]
+      source: LoomPolicySourceV1
+    }> = [{
+      name: 'moved',
+      persisted: [namedBlock('first', 'first'), namedBlock('second', 'second')],
+      submitted: [namedBlock('second', 'second'), namedBlock('first', 'first')],
+      source: { kind: 'loom_block', blockId: 'second', presetRevision: 8, blockRevision: 1, promptOrder: 0 },
+    }, {
+      name: 'new',
+      persisted: [namedBlock('stable', 'stable')],
+      submitted: [namedBlock('stable', 'stable'), namedBlock('new', 'new')],
+      source: { kind: 'loom_block', blockId: 'new', presetRevision: 8, blockRevision: 1, promptOrder: 1 },
+    }, {
+      name: 'replaced',
+      persisted: [namedBlock('old', 'old')],
+      submitted: [namedBlock('replacement', 'replacement')],
+      source: { kind: 'loom_block', blockId: 'replacement', presetRevision: 8, blockRevision: 1, promptOrder: 0 },
+    }, {
+      name: 'changed duplicate',
+      persisted: [namedBlock('duplicate', 'A'), namedBlock('duplicate', 'B')],
+      submitted: [namedBlock('duplicate', 'C'), namedBlock('duplicate', 'A')],
+      source: { kind: 'loom_block', blockId: 'duplicate', presetRevision: 8, blockRevision: 1, promptOrder: 1 },
+    }]
+
+    for (const scenario of scenarios) {
+      const value = preset()
+      value.blocks = scenario.persisted
+      const authoredConfig = agentConfig()
+      authoredConfig.runtimePolicy = runtimePolicy([], [{ ...workPolicyEntry(), source: scenario.source }])
+      const result = saveResult(value, {
+        config: authoredConfig,
+        slotBindings: {},
+        taskTemplates: [],
+        reviewAcknowledgements: [],
+      }, scenario.submitted)
+
+      expect(result.editor.presetRevision, scenario.name).toBe(9)
+      expect(result.editor.review, scenario.name).toMatchObject({
+        state: 'repair_required',
+        reasonCode: 'loom_reference_repair_required',
+        items: [],
+      })
+      expect(result.editor.config.runtimePolicy, scenario.name).toEqual(authoredConfig.runtimePolicy)
+      expect(result.editor.config.runtimePolicy?.loomPolicy.workPolicy[0]?.source.presetRevision, scenario.name).toBe(8)
+    }
+  })
+
+  test('isolated source readiness rejects category occurrences', () => {
+    const categoryBlock = { ...promptBlock(1), marker: 'category' as const }
+    expect(sourceMatchesPromptOrder(loomSource(), 8, [categoryBlock])).toBe(false)
+  })
+
+  test('isolated save clears sticky import review only after its required acknowledgement', () => {
+    const value = preset([{
+      id: 'review:foreign_import',
+      kind: 'disabled_import',
+      label: 'Imported runtime',
+      reasonCode: 'foreign_import',
+      action: { kind: 'acknowledge' },
+      acknowledged: false,
+    }])
+    value.agentConfig = prepareAgentConfigForRuntimeSave(value.agentConfig!, value.blocks, value.cacheRevision ?? 0)
+
+    const unacknowledged = saveResult(value, {
+      config: value.agentConfig,
+      slotBindings: value.agentSlotBindings,
+      taskTemplates: value.agentTaskTemplates,
+      reviewAcknowledgements: [],
+    }, value.blocks)
+    expect(unacknowledged.editor.review).toMatchObject({
+      state: 'review_required',
+      reasonCode: 'foreign_import',
+      items: [expect.objectContaining({ id: 'review:foreign_import', acknowledged: false })],
+    })
+
+    const acknowledged = saveResult(value, {
+      config: value.agentConfig,
+      slotBindings: value.agentSlotBindings,
+      taskTemplates: value.agentTaskTemplates,
+      reviewAcknowledgements: ['review:foreign_import'],
+    }, value.blocks)
+    expect(acknowledged.editor.presetRevision).toBe(8)
+    expect(acknowledged.editor.configRevision).toBe(5)
+    expect(acknowledged.editor.review).toMatchObject({ state: 'ready', reasonCode: null, items: [] })
+  })
   test('keeps native World Info and Databank visibly outside Loom ownership', async () => {
     const { container } = renderPanel()
     await settle()
@@ -504,11 +807,16 @@ describe('Agentic Runtime shared editor', () => {
       promptOrder: PromptBlock[]
       expectedIdentity: { presetId: string; presetRevision: number; configRevision: number }
     }> = []
+    let returned: SaveAgenticRuntimeEditorResult | null = null
     const dirtyStates: boolean[] = []
+    const value = preset()
+    value.agentConfig!.runtimePolicy = runtimePolicy([], [workPolicyEntry()])
     const { container } = renderPanel({
+      value,
       onSave: async (savedDraft, promptOrder, expectedIdentity) => {
         saves.push({ draft: savedDraft, promptOrder, expectedIdentity })
-        return saveResult(preset(), savedDraft, promptOrder)
+        returned = saveResult(value, savedDraft, promptOrder)
+        return returned
       },
       onDirtyChange: (dirty) => { dirtyStates.push(dirty) },
     })
@@ -536,6 +844,10 @@ describe('Agentic Runtime shared editor', () => {
     expect(saves[0]?.draft.config.profiles[0]?.name).toBe('Evidence analyst')
     expect(saves[0]?.draft.config.profiles[0]?.toolIds).toEqual(['lore_search_entries'])
     expect(saves[0]?.promptOrder.map((item) => item.id)).toEqual(['policy-block'])
+    expect(returned?.editor.presetRevision).toBe(8)
+    expect(returned?.editor.configRevision).toBe(5)
+    expect(returned?.editor.config.runtimePolicy?.loomPolicy.workPolicy[0]?.source.presetRevision).toBe(8)
+    expect(returned?.editor.review.state).toBe('ready')
     expect(dirtyStates.at(-1)).toBe(false)
   })
 
@@ -738,6 +1050,48 @@ describe('Agentic Runtime shared editor', () => {
       value: 'WORK',
     })
   })
+  test('saves two same-ID prompt occurrences as distinct entries in one Loom policy bucket', async () => {
+    const value = preset()
+    value.blocks = [{
+      ...promptBlock(1),
+      id: 'duplicate-policy',
+      name: 'First duplicate policy',
+      content: 'First occurrence content',
+    }, {
+      ...promptBlock(1),
+      id: 'duplicate-policy',
+      name: 'Second duplicate policy',
+      content: 'Second occurrence content',
+    }]
+    let returned: SaveAgenticRuntimeEditorResult | null = null
+    const { container } = renderPanel({
+      value,
+      onSave: async (draft, promptOrder) => {
+        returned = saveResult(value, draft, promptOrder)
+        return returned
+      },
+    })
+    await settle()
+    flushSync(() => button(container, 'sections.phases.nav').click())
+
+    const policyToggle = (label: string): HTMLInputElement | undefined => (
+      [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+        .find((input) => input.closest('label')?.textContent?.includes(label))
+    )
+    expect(policyToggle('First duplicate policy')).not.toBeUndefined()
+    flushSync(() => policyToggle('First duplicate policy')!.click())
+    expect(policyToggle('Second duplicate policy')).not.toBeUndefined()
+    flushSync(() => policyToggle('Second duplicate policy')!.click())
+    flushSync(() => button(container, 'save.action').click())
+    await settle()
+
+    const entries = returned?.editor.config.runtimePolicy?.loomPolicy.workPolicy ?? []
+    expect(entries).toHaveLength(2)
+    expect(new Set(entries.map((entry) => entry.id)).size).toBe(2)
+    expect(entries.map((entry) => entry.source.blockId)).toEqual(['duplicate-policy', 'duplicate-policy'])
+    expect(entries.map((entry) => entry.source.promptOrder)).toEqual([0, 1])
+    expect(returned?.preset.prompt_order).toHaveLength(2)
+  })
 
   test('removes deleted profile markers before save', async () => {
     const value = preset()
@@ -791,18 +1145,15 @@ describe('Agentic Runtime shared editor', () => {
     flushSync(() => readSection!.click())
     flushSync(() => button(container, 'save.action').click())
     await settle()
-
     expect(saves).toHaveLength(1)
     expect(saves[0]?.config.profiles[0]?.workspaceCapabilities).toEqual(['read_section', 'read_page'])
   })
-
-
   test('blocks imported activation until every repair item is acknowledged', async () => {
     const repairItems: AgentConfigRepairItem[] = [{
-      id: 'import:review',
+      id: 'review:foreign_import',
       kind: 'disabled_import',
       label: 'Imported runtime',
-      reasonCode: 'disabled_import',
+      reasonCode: 'foreign_import',
       action: { kind: 'acknowledge' },
       acknowledged: false,
     }, {
@@ -832,6 +1183,21 @@ describe('Agentic Runtime shared editor', () => {
 
     flushSync(() => button(container, 'sections.activation.nav').click())
     expect(container.querySelector<HTMLButtonElement>('[role="switch"]')!.disabled).toBe(false)
+  })
+  test('does not turn a generic disabled-import row into an import acknowledgement', async () => {
+    const { container } = renderPanel({ value: preset([{
+      id: 'generic:disabled',
+      kind: 'disabled_import',
+      label: 'Generic disabled row',
+      reasonCode: 'disabled_import',
+      action: { kind: 'acknowledge' },
+      acknowledged: false,
+    }]) })
+    await settle()
+
+    flushSync(() => button(container, 'sections.repair.nav').click())
+    expect(container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).toHaveLength(0)
+    expect(container.textContent).not.toContain('validation.review_acknowledgement_required')
   })
   test('clears stale-slot review when a replacement binding is selected', async () => {
     const value = preset([{
@@ -1287,9 +1653,9 @@ describe('Agentic Runtime shared editor', () => {
   test('does not let an unknown acknowledgement satisfy a server-derived review item', async () => {
     editorReviewAcknowledgements = ['unknown-review-id']
     const item: AgentConfigRepairItem = {
-      id: 'import:review',
+      id: 'review:foreign_import',
       kind: 'disabled_import',
-      reasonCode: 'disabled_import',
+      reasonCode: 'foreign_import',
       action: { kind: 'acknowledge' },
     }
     const { container } = renderPanel({ value: preset([item]) })
@@ -1552,19 +1918,84 @@ describe('Agentic Runtime shared editor', () => {
     expect(container.textContent).not.toContain('validation.invalid_config')
   })
 
-  test('fails closed with a visible retry for a clean editor load failure', async () => {
-    editorGetError = new ApiError(500, 'Internal Server Error')
-    const value = preset()
-    const { container } = renderPanel({ value })
+  test('reconciles a newer clean editor projection through one matched initial reload', async () => {
+    const parent = preset()
+    const latest = structuredClone(parent)
+    latest.cacheRevision = (parent.cacheRevision ?? 0) + 1
+    latest.agentConfigRevision = parent.agentConfigRevision + 1
+    latest.agentConfig!.profiles[0]!.name = 'Matched analyst'
+    let reloads = 0
+    const { container } = renderPanel({
+      value: parent,
+      editorValue: latest,
+      onReload: async () => {
+        reloads += 1
+        return reloadResult(latest)
+      },
+    })
     await settle()
+
+    expect(reloads).toBe(1)
+    expect(container.textContent).not.toContain('load.error')
+    expect(container.querySelector('[role="tab"]')).not.toBeNull()
+    flushSync(() => button(container, 'sections.agents.nav').click())
+    expect(container.querySelector<HTMLInputElement>('input[value="Matched analyst"]')).not.toBeNull()
+  })
+  test('rejects an internally matched initial reload older than the observed editor projection', async () => {
+    const parent = preset()
+    parent.cacheRevision = 8
+    parent.agentConfigRevision = 4
+    if (parent.agentConfigReview) parent.agentConfigReview.revision = 4
+    const observed = structuredClone(parent)
+    observed.cacheRevision = 10
+    observed.agentConfigRevision = 6
+    if (observed.agentConfigReview) observed.agentConfigReview.revision = 6
+    observed.agentConfig!.profiles[0]!.name = 'Observed analyst'
+    const staleMatched = structuredClone(parent)
+    staleMatched.cacheRevision = 9
+    staleMatched.agentConfigRevision = 5
+    if (staleMatched.agentConfigReview) staleMatched.agentConfigReview.revision = 5
+    staleMatched.agentConfig!.profiles[0]!.name = 'Stale matched analyst'
+    let reloads = 0
+    const { container } = renderPanel({
+      value: parent,
+      editorValue: observed,
+      onReload: async () => {
+        reloads += 1
+        return reloadResult(staleMatched)
+      },
+    })
+    await settle()
+
+    expect(reloads).toBe(1)
     expect(container.textContent).toContain('load.error')
     expect(container.textContent).toContain('load.retry')
-    expect(container.textContent).not.toContain('save.saved')
     expect(container.querySelector('[role="tab"]')).toBeNull()
-    expect(container.querySelector<HTMLInputElement>('input[value="Researcher"]')).toBeNull()
-    expect(button(container, 'save.action').disabled).toBe(true)
+    expect(container.querySelector<HTMLInputElement>('input[value="Stale matched analyst"]')).toBeNull()
   })
 
+  test('fails closed with a visible retry for a clean editor load failure', async () => {
+    const loadError = new ApiError(500, 'Internal Server Error')
+    editorGetError = loadError
+    const consoleError = spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const value = preset()
+      const { container } = renderPanel({ value })
+      await settle()
+      expect(consoleError).toHaveBeenCalledWith(
+        '[AgenticRuntimePanel] Failed to load the runtime editor:',
+        loadError,
+      )
+      expect(container.textContent).toContain('load.error')
+      expect(container.textContent).toContain('load.retry')
+      expect(container.textContent).not.toContain('save.saved')
+      expect(container.querySelector('[role="tab"]')).toBeNull()
+      expect(container.querySelector<HTMLInputElement>('input[value="Researcher"]')).toBeNull()
+      expect(button(container, 'save.action').disabled).toBe(true)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
   test('preserves dirty conflict semantics while showing a non-404 load failure', async () => {
     const value = preset()
     const dirtyStates: boolean[] = []

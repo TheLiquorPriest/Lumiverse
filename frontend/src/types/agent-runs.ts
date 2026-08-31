@@ -521,6 +521,7 @@ export interface AgentPromptEvidenceV1 {
   id: string
   sourceId: string
   sourceRevision: AgentPromptRevisionV1
+  promptOrder: number
   destination: AgentPromptEvidenceDestinationV1
   role: AgentPromptEvidenceRoleV1
   correlation: AgentInspectionCorrelationV1
@@ -717,6 +718,73 @@ export interface AgentRunInspectionRetryV1 {
   targetValid: boolean
   linkedAttemptId: string | null
 }
+export type WorkSegmentBoundaryClassV1 = 'tool_action' | 'tool_free_stop' | 'reasoning_only_stop' | 'reasoning_only_length' | 'empty_provider_response' | 'provider_protocol_failure'
+export interface WorkSegmentUsageInspectionV1 {
+  providerDispatches: number
+  providerInputTokens: number
+  providerOutputTokens: number
+  providerTotalTokens: number
+  billedOutputTokens: number
+  toolCalls: number
+  workspaceOperations: number
+  unsignedBoundaries: number
+  receiveBytes: number
+  publishedOutputBytes: number
+}
+export interface WorkSegmentIdentityInspectionV1 {
+  segmentId: string
+  phaseId: string | null
+  phaseIndex: number
+  phaseOccurrence: number
+  segmentOrdinal: number
+}
+export interface WorkSegmentInspectionProjectionV1 {
+  recovery: {
+    state: 'active' | 'closed'
+    phaseId: string | null
+    phaseIndex: number | null
+    phaseOccurrence: number | null
+    nextSegmentOrdinal: number
+    currentSegmentId: string | null
+    workspaceRevision: number
+    terminalCloseResult: 'failed' | 'exhausted' | 'cancelled' | null
+    terminalBoundaryClass: WorkSegmentBoundaryClassV1 | null
+    usage: WorkSegmentUsageInspectionV1 & { segments: number }
+  }
+  segments: Array<{
+    identity: WorkSegmentIdentityInspectionV1
+    lifecycle: 'admitted' | 'running' | 'closed' | 'interrupted' | 'failed' | 'exhausted' | 'cancelled'
+    workspaceRevision: number
+    boundaryClass: WorkSegmentBoundaryClassV1 | null
+    closeResult: 'phase_advanced' | 'phase_repeated' | 'same_phase_rollover' | 'work_complete' | 'failed' | 'exhausted' | 'cancelled' | null
+    closedWorkspaceRevision: number | null
+    usage: WorkSegmentUsageInspectionV1
+  }>
+  dispatches: Array<{
+    dispatchId: string
+    segmentId: string
+    dispatchOrdinal: number
+    lifecycle: 'reserved' | 'in_flight' | 'settled' | 'interrupted'
+    toolMode: 'ordinary' | 'required'
+    budgetClass: 'normal' | 'recovery'
+    workspaceRevision: number
+    settledWorkspaceRevision: number | null
+    boundaryClass: WorkSegmentBoundaryClassV1 | null
+    usage: WorkSegmentUsageInspectionV1 | null
+  }>
+  transitions: Array<{
+    transitionId: string
+    handoffId: string
+    transitionKind: 'advance' | 'repeat' | 'rollover' | 'terminal'
+    sourceSegment: WorkSegmentIdentityInspectionV1
+    sourceWorkspaceRevision: number
+    targetPhaseId: string | null
+    targetPhaseIndex: number | null
+    targetPhaseOccurrence: number | null
+    targetSegmentOrdinal: number | null
+    cause: WorkSegmentBoundaryClassV1 | null
+  }>
+}
 export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 {
   transcript: AgentInspectionTranscriptRecordV1[]
   turnSession: AgentTurnSessionEntryV1[]
@@ -731,6 +799,7 @@ export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 
   workspaceAssociations: AgentWorkspaceAssociationV1[]
   stop: AgentRunInspectionStopV1 | null
   retry: AgentRunInspectionRetryV1
+  workSegments: WorkSegmentInspectionProjectionV1 | null
   sectionAvailability: AgentInspectionSectionAvailabilityV1[]
 }
 

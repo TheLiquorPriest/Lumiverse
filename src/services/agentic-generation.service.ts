@@ -67,6 +67,18 @@ export class AgenticGenerationError extends Error {
     this.retryable = options.retryable ?? false;
   }
 }
+export const AGENTIC_DISPATCH_ACKNOWLEDGEMENT_TIMEOUT_MS = 30_000;
+export type AgenticDispatchAcknowledgementState = "accepted" | "already_acknowledged";
+
+export interface AgenticDispatchAcknowledgementScheduler {
+  setTimeout(callback: () => void, delayMs: number): ReturnType<typeof setTimeout>;
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+}
+
+const SYSTEM_DISPATCH_ACKNOWLEDGEMENT_SCHEDULER: AgenticDispatchAcknowledgementScheduler = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle),
+};
 
 export interface AgenticGenerationInput {
   userId: string;
@@ -88,6 +100,8 @@ export interface AgenticGenerationInput {
   userInput?: string;
   regenFeedback?: string;
   regenFeedbackPosition?: "system" | "user";
+  /** Hold provider dispatch until the authenticated client accepts the durable generation ID. */
+  requireDispatchAcknowledgement?: boolean;
   /** Dry-run is a Response-only inspection surface. */
   isDryRun?: boolean;
   runtimeDecisionToken?: string;
@@ -262,6 +276,9 @@ export interface AgenticGenerationDependencies {
     execution: AgenticExecutionHandle,
     reason?: "stopped" | "cancelled" | "timed_out",
   ) => Promise<boolean | "too_late"> | boolean | "too_late";
+  /** Bounded client-ID handoff; defaults to the frontend request timeout. */
+  dispatchAcknowledgementTimeoutMs?: number;
+  dispatchAcknowledgementScheduler?: AgenticDispatchAcknowledgementScheduler;
   /**
    * Cancel the root signal and join every host-tracked child frame before
    * terminal projection. The callback owns child reservations and must be
@@ -406,6 +423,10 @@ type ActiveAgenticGeneration = {
   resolveAdmission: () => void;
   rejectAdmission: (reason?: unknown) => void;
   admissionSettled: boolean;
+  dispatchAcknowledgement: Promise<void>;
+  resolveDispatchAcknowledgement: () => boolean;
+  dispatchAcknowledged: boolean;
+  dispatchAcknowledgementExpired: boolean;
   phase: AgenticPhase;
   attemptLineage: AgentWorkAttemptLineageV1;
   terminal: boolean;
@@ -416,6 +437,50 @@ type ActiveAgenticGeneration = {
   /** A completed CAS is never retried by duplicate Stop requests. */
   cancellationRequested: boolean;
 };
+async function waitForDispatchAcknowledgement(active: ActiveAgenticGeneration): Promise<void> {
+  if (active.dispatchAcknowledged) return;
+  const signal = active.controller.signal;
+  if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  const scheduler = active.dependencies.dispatchAcknowledgementScheduler
+    ?? SYSTEM_DISPATCH_ACKNOWLEDGEMENT_SCHEDULER;
+  const configuredTimeoutMs = active.dependencies.dispatchAcknowledgementTimeoutMs;
+  const timeoutMs = configuredTimeoutMs !== undefined
+    && Number.isFinite(configuredTimeoutMs)
+    && configuredTimeoutMs >= 0
+    ? configuredTimeoutMs
+    : AGENTIC_DISPATCH_ACKNOWLEDGEMENT_TIMEOUT_MS;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (outcome: "acknowledged" | "aborted", reason?: unknown) => {
+      if (settled) return;
+      settled = true;
+      scheduler.clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      if (outcome === "acknowledged") resolve();
+      else reject(reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const onAbort = () => finish("aborted", signal.reason);
+    const timeout = scheduler.setTimeout(() => {
+      if (settled) return;
+      active.dispatchAcknowledgementExpired = true;
+      void expireDispatchAcknowledgement(active).catch((error) => finish("aborted", error));
+    }, timeoutMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    void active.dispatchAcknowledgement.then(() => finish("acknowledged"));
+  });
+}
+
+async function expireDispatchAcknowledgement(active: ActiveAgenticGeneration): Promise<void> {
+  await requestDurableCancellation(active, "timed_out");
+  if (!active.controller.signal.aborted) {
+    active.controller.abort(new AgenticGenerationError(
+      "agentic_timed_out",
+      "Agentic generation dispatch acknowledgement timed out.",
+      { phase: "ASSEMBLE" },
+    ));
+  }
+}
 
 const activeAgenticGenerations = new Map<string, ActiveAgenticGeneration>();
 const activeAgenticChats = new Map<string, string>();
@@ -1044,6 +1109,7 @@ async function runAgenticGenerationInternal(
         );
       }
     }
+    await waitForDispatchAcknowledgement(active);
     assertNotAborted(signal, "ASSEMBLE");
     await transition(deps, active, "ASSEMBLE");
 
@@ -1401,6 +1467,17 @@ export async function runAgenticGeneration(
     if (activeAdmissionOwner) activeAdmissionOwner.admissionSettled = true;
     rejectAdmissionPromise(reason);
   };
+  let resolveDispatchAcknowledgementPromise!: () => void;
+  const dispatchAcknowledgement = new Promise<void>((resolveDispatchAcknowledgement) => {
+    resolveDispatchAcknowledgementPromise = resolveDispatchAcknowledgement;
+  });
+  const resolveDispatchAcknowledgement = (): boolean => {
+    const owner = activeAdmissionOwner;
+    if (!owner || owner.dispatchAcknowledged || owner.dispatchAcknowledgementExpired) return false;
+    owner.dispatchAcknowledged = true;
+    resolveDispatchAcknowledgementPromise();
+    return true;
+  };
   const active: ActiveAgenticGeneration = {
     generationId,
     input,
@@ -1412,6 +1489,10 @@ export async function runAgenticGeneration(
     resolveAdmission,
     rejectAdmission,
     admissionSettled: false,
+    dispatchAcknowledgement,
+    resolveDispatchAcknowledgement,
+    dispatchAcknowledged: false,
+    dispatchAcknowledgementExpired: false,
     phase: "ASSEMBLE",
     attemptLineage,
     terminal: false,
@@ -1419,6 +1500,7 @@ export async function runAgenticGeneration(
     cancellationRequested: false,
   };
   activeAdmissionOwner = active;
+  if (!input.requireDispatchAcknowledgement) resolveDispatchAcknowledgement();
   const chatKey = `${input.userId}:${input.chatId}`;
   const existingGenerationId = activeAgenticChats.get(chatKey);
   if (existingGenerationId) {
@@ -1513,6 +1595,7 @@ export async function runAgenticGeneration(
       const oldestAdmission = agenticAdmissions.keys().next().value;
       if (typeof oldestAdmission === "string") agenticAdmissions.delete(oldestAdmission);
     }
+    active.resolveDispatchAcknowledgement();
     active.resolve(projected);
     activeAgenticGenerations.delete(generationId);
     if (activeAgenticChats.get(`${input.userId}:${input.chatId}`) === generationId) {
@@ -1540,6 +1623,16 @@ export async function startAgenticGeneration(
   deps?: AgenticGenerationDependencies,
 ): Promise<AgenticGenerationResult> {
   return runAgenticGeneration(input, deps);
+}
+
+export function acknowledgeAgenticGenerationDispatch(
+  userId: string,
+  generationId: string,
+): AgenticDispatchAcknowledgementState | false {
+  const active = activeAgenticGenerations.get(generationId);
+  if (!active || active.input.userId !== userId || active.terminal) return false;
+  if (active.dispatchAcknowledged) return "already_acknowledged";
+  return active.resolveDispatchAcknowledgement() ? "accepted" : false;
 }
 
 /** Wait for a detached turn in focused tests or recovery workers. */

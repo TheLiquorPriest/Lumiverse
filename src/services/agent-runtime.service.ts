@@ -263,7 +263,7 @@ export interface AgentProviderDispatchRequest {
   tools?: ToolDefinition[];
   maxOutputTokens: number;
   signal: AbortSignal;
-  toolMode?: "ordinary" | "finalization";
+  toolMode?: "ordinary" | "required" | "finalization";
   receiveLimitBytes?: number;
   providerTransientCarrier?: ProviderTransientCarrier;
 }

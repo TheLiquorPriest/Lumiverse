@@ -14,7 +14,7 @@ import {
 } from "../../types/media-limits";
 
 /** Bumped whenever the archive ownership/graph contract changes. */
-export const ARCHIVE_REGISTRY_VERSION = 3 as const;
+export const ARCHIVE_REGISTRY_VERSION = 5 as const;
 
 export type ArchiveTableKind = "canonical" | "derived" | "operational" | "forbidden";
 
@@ -739,6 +739,95 @@ const registry: ArchiveTableSpecV2[] = [
       compositeParent(["user_id", "chat_id"], "chats", ["user_id", "id"], false),
       compositeParent(["user_id", "previous_attempt_id"], "agent_run_attempts", ["user_id", "attempt_id"], true),
       parent("target_message_id", "messages", true),
+    ],
+  ),
+  operational(
+    "agent_work_segment_recovery",
+    direct("user_id"),
+    ["user_id", "execution_id"],
+    [["user_id", "execution_id"], ["user_id", "idempotency_key"], ["user_id", "execution_id", "attempt_id", "workspace_id"]],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "execution_id"], "agent_turn_executions", ["user_id", "id"], false),
+      compositeParent(["user_id", "execution_id", "attempt_id"], "agent_run_attempts", ["user_id", "turn_id", "attempt_id"], false),
+      compositeParent(["user_id", "execution_id", "workspace_id"], "agent_turn_workspaces", ["user_id", "execution_id", "workspace_id"], false),
+    ],
+  ),
+  operational(
+    "agent_work_segments",
+    direct("user_id"),
+    ["segment_id"],
+    [
+      ["segment_id"],
+      ["user_id", "execution_id", "segment_id"],
+      ["user_id", "execution_id", "segment_id", "attempt_id", "workspace_id"],
+      ["user_id", "execution_id", "segment_ordinal"],
+      ["user_id", "execution_id", "admission_key"],
+    ],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "execution_id", "attempt_id", "workspace_id"], "agent_work_segment_recovery", ["user_id", "execution_id", "attempt_id", "workspace_id"], false),
+      compositeParent(["user_id", "execution_id", "attempt_id"], "agent_run_attempts", ["user_id", "turn_id", "attempt_id"], false),
+      compositeParent(["user_id", "execution_id", "workspace_id"], "agent_turn_workspaces", ["user_id", "execution_id", "workspace_id"], false),
+      compositeParent(
+        ["user_id", "execution_id", "source_transition_id"],
+        "agent_work_segment_transitions",
+        ["user_id", "execution_id", "transition_id"],
+        true,
+        true,
+      ),
+    ],
+  ),
+  operational(
+    "agent_work_segment_transitions",
+    direct("user_id"),
+    ["transition_id"],
+    [
+      ["transition_id"],
+      ["user_id", "execution_id", "transition_id"],
+      ["user_id", "execution_id", "source_segment_id"],
+      ["user_id", "execution_id", "idempotency_key"],
+    ],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "execution_id", "attempt_id", "workspace_id"], "agent_work_segment_recovery", ["user_id", "execution_id", "attempt_id", "workspace_id"], false),
+      compositeParent(["user_id", "execution_id", "source_segment_id"], "agent_work_segments", ["user_id", "execution_id", "segment_id"], false),
+      compositeParent(["user_id", "execution_id", "attempt_id"], "agent_run_attempts", ["user_id", "turn_id", "attempt_id"], false),
+      compositeParent(["user_id", "execution_id", "workspace_id"], "agent_turn_workspaces", ["user_id", "execution_id", "workspace_id"], false),
+    ],
+  ),
+  operational(
+    "agent_work_segment_dispatches",
+    direct("user_id"),
+    ["dispatch_id"],
+    [
+      ["dispatch_id"],
+      ["user_id", "execution_id", "dispatch_id"],
+      ["user_id", "execution_id", "segment_id", "dispatch_ordinal"],
+      ["user_id", "execution_id", "idempotency_key"],
+      ["user_id", "execution_id", "settlement_key"],
+    ],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "execution_id", "attempt_id", "workspace_id"], "agent_work_segment_recovery", ["user_id", "execution_id", "attempt_id", "workspace_id"], false),
+      compositeParent(["user_id", "execution_id", "segment_id", "attempt_id", "workspace_id"], "agent_work_segments", ["user_id", "execution_id", "segment_id", "attempt_id", "workspace_id"], false),
+      compositeParent(["user_id", "execution_id", "attempt_id"], "agent_run_attempts", ["user_id", "turn_id", "attempt_id"], false),
+      compositeParent(["user_id", "execution_id", "workspace_id"], "agent_turn_workspaces", ["user_id", "execution_id", "workspace_id"], false),
+    ],
+  ),
+  operational(
+    "agent_work_workspace_receipts",
+    direct("user_id"),
+    ["user_id", "execution_id", "operation_key"],
+    [
+      ["user_id", "execution_id", "operation_key"],
+      ["user_id", "execution_id", "before_workspace_revision"],
+      ["user_id", "execution_id", "after_workspace_revision"],
+    ],
+    [
+      parent("user_id", "user", false),
+      compositeParent(["user_id", "execution_id", "workspace_id"], "agent_turn_workspaces", ["user_id", "execution_id", "workspace_id"], false),
+      compositeParent(["user_id", "execution_id", "segment_id", "logical_dispatch"], "agent_work_segment_dispatches", ["user_id", "execution_id", "segment_id", "dispatch_ordinal"], false),
     ],
   ),
   operational(

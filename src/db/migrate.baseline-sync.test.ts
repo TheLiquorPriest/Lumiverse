@@ -129,4 +129,40 @@ describe("baseline sync", () => {
       db.close();
     }
   });
+
+  test("baseline carries the bounded WORK segment contract", async () => {
+    const db = new Database(":memory:");
+    try {
+      const baselineSql = await Bun.file(join(import.meta.dir, "baseline.sql")).text();
+      db.run(baselineSql);
+      const tables = db.query(
+        `SELECT name FROM sqlite_schema
+          WHERE type = 'table' AND name LIKE 'agent_work_segment%'
+          ORDER BY name`,
+      ).all() as Array<{ name: string }>;
+      expect(tables.map((row) => row.name)).toEqual([
+        "agent_work_segment_dispatches",
+        "agent_work_segment_recovery",
+        "agent_work_segment_transitions",
+        "agent_work_segments",
+      ]);
+      for (const table of tables) {
+        const columns = db.query(`PRAGMA table_info(${table.name})`).all() as ColumnInfo[];
+        expect(columns.map((column) => column.name)).toContain("schema_version");
+        expect(columns.map((column) => column.name)).toContain("record_complete");
+        expect(columns.map((column) => column.name)).toContain("payload_digest");
+      }
+      const receiptColumns = db.query("PRAGMA table_info(agent_work_workspace_receipts)").all() as ColumnInfo[];
+      for (const required of ["segment_id", "logical_dispatch", "frame_id"]) {
+        expect(receiptColumns.find((column) => column.name === required)?.notnull).toBe(1);
+      }
+      const receiptDispatchIndex = db.query(
+        "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'idx_agent_work_workspace_receipts_dispatch'",
+      ).get() as { sql: string };
+      expect(receiptDispatchIndex.sql).toContain("segment_id, logical_dispatch");
+      expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
 });

@@ -75,8 +75,8 @@ The closed authored shape is `AgentConfigV2`:
 ```
 
 `profiles[].workspaceCapabilities` is an optional, closed
-`AgentChildWorkspaceCapabilityV1[]` child grant. The normalized projection
-emits values in this canonical sorted order:
+`AgentChildWorkspaceCapabilityV1[]` child-profile capability ceiling. The
+normalized projection emits values in this canonical sorted order:
 
 ```ts
 [
@@ -84,7 +84,6 @@ emits values in this canonical sorted order:
   'read_page',
   'update_assigned_progress',
   'submit_child_result',
-  'record_question',
 ]
 ```
 
@@ -92,12 +91,18 @@ Values must be unique and already in this order. Unknown, duplicate, or
 out-of-order values are rejected or quarantined; they are never silently
 reordered or widened.
 
-These grants authorize child frames only. A child may receive the five
-operations above, subject to host admission, frame, phase, and budget limits.
+These values are profile-level ceilings for child frames, not standalone
+runtime grants. An effective grant is the intersection of the profile ceiling,
+root policy, and the immutable capability set admitted on that exact frame.
+Pre-scheduled intrinsic children have no durable provider-dispatch grant and
+therefore receive no workspace capabilities; provider-delegated children may
+receive the four operations above, subject to host admission, phase, and budget
+limits.
 Operations outside this vocabulary—including `create_task`,
-`submit_root_result`, `accept_submission`, `record_finding`, `record_decision`,
-`attach_artifact`, and `propose_publication`—remain root/host authority and
-cannot be granted through a child profile. Profile-authored grants cannot
+`submit_root_result`, `accept_submission`, `record_finding`,
+`record_decision`, `record_question`, `attach_artifact`, and
+`propose_publication`—remain root/host authority and cannot be granted through
+a child profile. Profile-authored grants cannot
 widen root capabilities, completion authority, or publication authority.
 
 
@@ -165,6 +170,8 @@ disable established Response assembly, including native World Info and
 Databank behavior.
 
 The inspection source is exact: Loom entries retain `blockId`, `presetRevision`, `blockRevision`, `promptOrder`, optional typed condition, checkpoint result, route, and inclusion outcome. Unified owner inspection combines this Loom record with prompt evidence for role, destination/order, source identity and content hashes when recorded, every destination-level deduplication overlap and reason, omissions, custom-phase and explicit child-subset receipts, accepted WORK-to-RENDER crossings, and tools/delegation. An unavailable evidence layer is marked unavailable and is never inferred. The `inspection` and `responseOmission` wire names are stable and must not be replaced by a latest revision or compatibility alias. Ordinary Response preserves the conversation and native World Book/Databank assembly while omitting only WORK/Agentic-only Loom material.
+
+Prompt evidence preserves the same occurrence authority as Loom: cognition uses the frozen Loom source's `blockId`, `promptOrder`, and `blockRevision`, while non-cognition evidence uses the canonical assembly provenance coordinate. Owner inspection joins roles only by `sourceId + promptOrder + sourceRevision` when the complete prompt section is available; it never selects the first record sharing an ID/revision or correlates from a truncated prefix.
 
 `GET /api/v1/presets/:id/agent-config`, the shared-draft save, and the
 portable runtime envelope preserve `runtimePolicy.loomPolicy` verbatim
@@ -254,6 +261,10 @@ canonical saved `{ preset, editor }` state with refreshed `presetRevision`
 and `configRevision`; replace the local draft with that state. A caller that
 receives a conflict must refresh the canonical editor and intentionally
 reapply its preserved draft.
+Clients submit every exact Loom reference against `expectedPresetRevision`; they must not pre-advance those references. The server alone determines whether prompt order changed and advances preset authority only for that change. It rebases a submitted reference only when the persisted and submitted blocks at that exact `promptOrder` occurrence have the same ID, effective block revision, and semantic content. A moved, new, replaced, or occurrence-locally changed duplicate remains pinned to the authored old preset revision and returns `repair_required / loom_reference_repair_required` for explicit review. Config-only changes and current-reference repairs retain the preset revision while advancing config authority as needed.
+A config-only shared draft has no future preset authority to claim: a direct `current + 1` pre-pin against unchanged prompt order remains `repair_required` until the exact reference is resubmitted at the current preset revision.
+Structural category-marker blocks are never valid Loom sources. A direct current-revision category reference remains quarantined as `repair_required`; only a non-category exact block occurrence can return the runtime to `ready`.
+`repair_required` is not imported-review provenance and is never repairable by acknowledgement. The editor projects concrete validation/repair rows for it; `disabled_import` items remain exclusive to sticky foreign-import review reason codes.
 
 The separate ordinary `PUT /api/v1/presets/:id` route always requires
 `expected_cache_revision`. When the body includes top-level `agent_config`, it
@@ -272,6 +283,43 @@ ordinary Agentic-config write instead returns HTTP
 agent_config_revision, agent_config, agent_config_review, cache_revision }`.
 Use `PUT /api/v1/presets/:id/agent-config` when changing config, slots,
 cognition, context, tasks, and blocks together.
+
+`cache_revision` is the strict preset-revision authority. The ordinary update
+classifier compares persisted values recursively: object insertion order is
+irrelevant, while array order remains significant. A structurally identical
+full PUT is a no-op and advances neither preset nor config revision. Any real
+ordinary change to name, provider, engine, parameters, prompt order, prompts,
+metadata (including prompt-variable values), or preset-bound regex companions
+advances `cache_revision` exactly once. Built-in default-preset metadata
+upgrades use this same mutation path rather than writing revision columns
+directly.
+
+Whenever an ordinary mutation advances the preset revision, the same database
+transaction marks every exact Loom source reference for repair: all four Loom
+policy buckets, phase instruction references, and every child instruction
+subset. The dedicated shared Agent Runtime editor is the sole safe exception;
+it updates prompt blocks and normalized config together and atomically rebases
+only exact references that satisfy the persisted same-occurrence predicate.
+Other authored references are preserved at their old revision and quarantined
+for explicit repair. A config-only repair remains usable while the preset is
+quarantined and does not itself advance the preset revision; submitting an
+already-ready, structurally identical config is also a no-op.
+
+The shared editor rebases a submitted reference only when that referenced block occurrence already exists at the exact `(blockId, promptOrder)` pair and keeps both its effective block revision and semantic block content (the dynamic `revision` field is excluded from that comparison). Duplicate block IDs are therefore compared independently at their referenced prompt-order positions. Newly introduced, replaced, or moved occurrences are not rebased until they have been committed as authority. Any content or effective-revision change outside that safe case follows the ordinary repair/quarantine path rather than silently moving exact references.
+Portable preset payloads likewise permit duplicate prompt-block IDs at distinct array positions. Loom policy, phase, and child-subset sources round-trip by exact `promptOrder` occurrence; import quarantines missing, mismatched, category, stale, or future-pinned occurrences. Legacy sources without `promptOrder` are accepted only when their block ID identifies exactly one occurrence; duplicate-ID ambiguity never falls back to the first block.
+
+Removing a Prompt Stash entry is one atomic mutation across settings and every owning preset. The response reports `{ removed, presetAuthorityChanged, presetAuthorities }`; all changed owners are returned with their authoritative preset/config revisions. A settings-only removal reports no preset-authority change, and a missing/repeated removal is an exact no-op. Rollback publishes neither settings nor preset events.
+
+After any successful preset or preset-profile authority mutation, frontend
+writers commit through one runtime-authority invalidation point. This applies
+to InputArea and LoomBuilder, bound and unbound saves, and chat, persona,
+character, connection, and default profile mutations. The commit invalidates
+cached one-use decision tokens, fences unresolved display and send preflights,
+and makes every mounted runtime projection refetch. Responses from an older
+authority epoch cannot republish. A generation already admitted before the
+commit keeps its frozen mode, but a later Send cannot use the old authority.
+If readiness fails, preflight rejects before outbox creation, attempt creation,
+or provider invocation.
 
 The durable per-chat mode override is separate from the preset. `PUT
  /api/v1/chats/:id/agent-mode` accepts exactly:
@@ -407,63 +455,94 @@ no update is applied. Use the returned canonical state (or refresh it) before
 preparing the next write. All other fields from `UserPresetCreateDTO` are
 optional, including `name` and `provider`.
 
-!!! note "Prompt variable cleanup"
-    When `prompt_order` or `metadata` is updated, Lumiverse prunes stale `metadata.promptVariables` entries that no longer correspond to a variable definition on a block. This matches the built-in preset editor behavior.
+!!! note "Prompt variable cleanup and Agentic revisions"
+    When `prompt_order` or `metadata` is updated, Lumiverse prunes stale `metadata.promptVariables` entries that no longer correspond to a variable definition on any matching block occurrence. Same-ID occurrences keep their schemas distinct during validation, so a variable defined by either occurrence is preserved rather than overwritten by the last block. A changed `metadata.promptVariables` map is a prompt-input revision: normalized Agentic Loom references pinned to the prior preset revision are moved to `loom_reference_repair_required` instead of remaining deceptively ready. This matches the built-in preset editor behavior.
 
 ---
 
 ## Prompt Blocks
 
-Prompt blocks are managed through `spindle.presets.blocks`. Block operations update the parent preset's `prompt_order` and trigger the normal preset update flow.
+Prompt blocks are managed through `spindle.presets.blocks`. Block operations update the parent preset's `prompt_order` and trigger the normal preset update flow. Reads use the canonical occurrence coordinate `{ blockId, promptOrder }`: the zero-based `promptOrder` selects the occurrence and `blockId` verifies its identity. Every create, update, and delete also requires the caller-observed `expectedCacheRevision`. Lumiverse compares that revision before resolving a mutation target and retains it on the atomic conditional preset write, so a concurrent insert, delete, or reorder conflicts without touching a shifted same-ID sibling. Structural mutations reindex later blocks; refresh both the preset and `list()` before preparing the next mutation. There is no ID-only or revision-optional alias.
 
 ### Block Usage
 
 ```ts
-// List blocks in order
-const blocks = await spindle.presets.blocks.list('preset-id')
+// Read the current authority and canonical prompt order
+let preset = await spindle.presets.get('preset-id')
+if (!preset) throw new Error('Preset not found')
+let blocks = await spindle.presets.blocks.list('preset-id')
 
-// Get a single block
-const block = await spindle.presets.blocks.get('preset-id', 'block-id')
+// Get is read-only and verifies the occurrence at prompt order 0
+const firstOccurrence = { blockId: blocks[0].id, promptOrder: 0 }
+const block = await spindle.presets.blocks.get('preset-id', firstOccurrence)
 
-// Append a new system block
+// Every mutation is bound to the caller-observed preset revision
 const newBlock = await spindle.presets.blocks.create('preset-id', {
   name: 'Style Guide',
   content: 'Write with concise, vivid prose.',
   role: 'system',
   position: 'pre_history',
   enabled: true,
+}, { expectedCacheRevision: preset.cache_revision })
+
+preset = await spindle.presets.get('preset-id')
+if (!preset) throw new Error('Preset not found')
+blocks = await spindle.presets.blocks.list('preset-id')
+const newTarget = {
+  blockId: newBlock.id,
+  promptOrder: blocks.length - 1,
+  expectedCacheRevision: preset.cache_revision,
+}
+const updatedBlock = await spindle.presets.blocks.update('preset-id', newTarget, { enabled: false })
+
+// Refresh the revision again after update before deleting
+preset = await spindle.presets.get('preset-id')
+if (!preset) throw new Error('Preset not found')
+const blockDeleted = await spindle.presets.blocks.delete('preset-id', {
+  ...newTarget,
+  expectedCacheRevision: preset.cache_revision,
 })
 
-// Insert a category marker at the start of the preset
-const category = await spindle.presets.blocks.create(
-  'preset-id',
-  {
-    name: 'Tone',
-    marker: 'category',
-    categoryMode: 'radio',
-    content: '',
-  },
-  { index: 0 },
-)
-
-// Update a block
-const updatedBlock = await spindle.presets.blocks.update('preset-id', newBlock.id, {
-  enabled: false,
-})
-
-// Delete a block
-const blockDeleted = await spindle.presets.blocks.delete('preset-id', newBlock.id)
+// Indexed create is also revision-bound because it structurally reindexes
+// later occurrences.
+preset = await spindle.presets.get('preset-id')
+if (!preset) throw new Error('Preset not found')
+const category = await spindle.presets.blocks.create('preset-id', {
+  name: 'Tone',
+  marker: 'category',
+  categoryMode: 'radio',
+  content: '',
+}, { index: 0, expectedCacheRevision: preset.cache_revision })
 ```
 
 ### Block Methods
 
 | Method | Returns | Description |
 |---|---|---|
-| `list(presetId)` | `Promise<PromptBlockDTO[]>` | Return the preset's ordered prompt blocks. |
-| `get(presetId, blockId)` | `Promise<PromptBlockDTO \| null>` | Get a block by ID. Returns `null` if not found. |
-| `create(presetId, input, options?)` | `Promise<PromptBlockDTO>` | Create a prompt block. `options.index` inserts at a specific zero-based position; omitted appends. |
-| `update(presetId, blockId, input)` | `Promise<PromptBlockDTO>` | Update a block. All fields except `id` are optional. |
-| `delete(presetId, blockId)` | `Promise<boolean>` | Delete a block. Returns `true` if deleted. |
+| `list(presetId)` | `Promise<PromptBlockDTO[]>` | Return the preset's ordered prompt blocks. The array index is the canonical `promptOrder`. |
+| `get(presetId, occurrence)` | `Promise<PromptBlockDTO \| null>` | Read the block only when both `occurrence.promptOrder` and `occurrence.blockId` match. Returns `null` on missing or mismatched coordinates. Refresh after structural mutations. |
+| `create(presetId, input, options)` | `Promise<PromptBlockDTO>` | Create only against `options.expectedCacheRevision`. `options.index` inserts at a zero-based position; omitted appends. A stale revision conflicts without inserting. |
+| `update(presetId, target, input)` | `Promise<PromptBlockDTO>` | Update only when the occurrence and `target.expectedCacheRevision` match current authority. All fields except `id` are optional. |
+| `delete(presetId, target)` | `Promise<boolean>` | Delete only when the occurrence and `target.expectedCacheRevision` match current authority. Returns `false` only for a missing/mismatched occurrence at the current revision; stale revisions conflict. |
+
+### PromptBlockOccurrence and mutation authority
+
+```ts
+type PromptBlockOccurrence = {
+  blockId: string
+  promptOrder: number // zero-based canonical prompt_order index
+}
+
+type PromptBlockMutationTarget = PromptBlockOccurrence & {
+  expectedCacheRevision: number
+}
+
+type CreatePromptBlockOptions = {
+  expectedCacheRevision: number
+  index?: number
+  userId?: string
+}
+```
 
 ### PromptBlockDTO
 
@@ -563,11 +642,17 @@ For user-scoped extensions, the user context is inferred automatically. For oper
 
 ```ts
 // Operator-scoped extension targeting a specific user
-const { data } = await spindle.presets.list({ userId: 'user-id' })
+const preset = await spindle.presets.get('preset-id', 'user-id')
+
+if (!preset) throw new Error('Preset not found')
+
 const block = await spindle.presets.blocks.create(
-  'preset-id',
+  preset.id,
   { name: 'Operator Note', content: '...' },
-  { userId: 'user-id' },
+  {
+    userId: 'user-id',
+    expectedCacheRevision: preset.cache_revision,
+  },
 )
 ```
 

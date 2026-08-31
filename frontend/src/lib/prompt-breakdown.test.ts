@@ -104,6 +104,7 @@ function inspectionDetail(overrides: Partial<AgentRunInspectionDetailV1> = {}): 
     stop: null,
     retry: { allowed: true, reason: 'budget_exhausted', targetValid: true, linkedAttemptId: null },
     sectionAvailability: [],
+    workSegments: null,
     ...overrides,
   } as AgentRunInspectionDetailV1
 }
@@ -133,6 +134,7 @@ describe('inspectionDetailToBreakdown', () => {
         id: 'prompt-root',
         sourceId: 'loom-root',
         sourceRevision: 3,
+        promptOrder: 0,
         destination: 'root_work',
         role: 'system',
         correlation,
@@ -155,6 +157,7 @@ describe('inspectionDetailToBreakdown', () => {
         sourceRevision: 3,
         destination: 'completion_handoff',
         role: 'system',
+        promptOrder: 0,
         correlation: { ...correlation, hostSequence: 2 },
         included: true,
         content: 'PHASE_CONTINUATION',
@@ -177,6 +180,7 @@ describe('inspectionDetailToBreakdown', () => {
         role: 'system',
         correlation: { ...correlation, hostSequence: 3 },
         included: true,
+        promptOrder: 0,
         content: 'PRIVATE_CORTEX',
         contentDigest: 'c'.repeat(64),
         omissionReason: null,
@@ -187,6 +191,7 @@ describe('inspectionDetailToBreakdown', () => {
     expect(breakdown.assemblySurface).toBe('WORK')
     expect(breakdown.loomPromptInspection?.checkpoint).toBe('WORK')
     expect(breakdown.entries.map((entry) => entry.content)).toEqual(['ROOT_WORK_PROMPT', 'PHASE_CONTINUATION'])
+    expect(breakdown.entries.map((entry) => entry.promptOrder)).toEqual([0, 0])
     expect(JSON.stringify(breakdown)).not.toContain('PRIVATE_CORTEX')
     expect(workInspectionCheckpointLabel(breakdown.assemblySurface, breakdown.loomPromptInspection?.checkpoint)).toBe('WORK')
     expect(inspectionAttemptTargetMessageId({ target: null, committedTarget: null })).toBeNull()

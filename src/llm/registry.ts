@@ -28,6 +28,7 @@ const providers = new Map<string, LlmProvider>();
 const REQUIRED_TOOL_CAPABILITY_KEYS = [
   "supportsStreaming",
   "toolCalling",
+  "requiredToolChoice",
   "nativeToolContinuation",
   "toolContinuationMode",
   "toolsDisabledFinalization",
@@ -51,10 +52,16 @@ export function validateProviderCapabilities(provider: Pick<LlmProvider, "name" 
     throw new Error(`Provider "${provider.name}" has invalid capabilities.supportsStreaming`);
   }
   if (typeof capabilities.toolCalling !== "boolean") {
-    throw new Error(`Provider "${provider.name}" has invalid capabilities.toolCalling`);
+    throw new Error('Provider "' + provider.name + '" has invalid capabilities.toolCalling');
+  }
+  if (typeof capabilities.requiredToolChoice !== "boolean") {
+    throw new Error('Provider "' + provider.name + '" has invalid capabilities.requiredToolChoice');
+  }
+  if (capabilities.requiredToolChoice && !capabilities.toolCalling) {
+    throw new Error('Provider "' + provider.name + '" cannot require a tool without tool calling');
   }
   if (typeof capabilities.nativeToolContinuation !== "boolean") {
-    throw new Error(`Provider "${provider.name}" has invalid capabilities.nativeToolContinuation`);
+    throw new Error('Provider "' + provider.name + '" has invalid capabilities.nativeToolContinuation');
   }
   if (
     capabilities.toolContinuationMode !== "native" &&

@@ -21,6 +21,7 @@ export class PerplexityProvider extends OpenAICompatibleProvider {
     apiKeyRequired: true,
     modelListStyle: "none",
     toolCalling: true,
+    requiredToolChoice: false,
     nativeToolContinuation: false,
     toolContinuationMode: "legacy",
     toolsDisabledFinalization: true,

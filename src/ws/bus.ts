@@ -79,12 +79,13 @@ class EventBus {
   withBufferedEvents<T>(callback: () => T): BufferedEventRun<T> {
     const parent = this.bufferedEvents;
     const buffer = parent ?? [];
+    const startLength = buffer.length;
     this.bufferedEvents = buffer;
     try {
       const value = callback();
       return { value, events: parent ? [] : buffer.slice() };
     } catch (error) {
-      if (!parent) buffer.length = 0;
+      buffer.length = startLength;
       throw error;
     } finally {
       this.bufferedEvents = parent;

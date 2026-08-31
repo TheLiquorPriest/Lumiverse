@@ -55,6 +55,7 @@ export class AnthropicProvider implements LlmProvider {
     apiKeyRequired: true,
     modelListStyle: "anthropic",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,
@@ -1270,6 +1271,9 @@ export class AnthropicProvider implements LlmProvider {
   ]);
 
   private buildBody(request: GenerationRequest, stream: boolean): any {
+    if (request.toolMode === "required" && !this.capabilities.requiredToolChoice) {
+      throw new Error("Provider does not support required tool choice");
+    }
     const params = request.parameters || {};
     const omitSampling = this.omitsSamplingParams(request.model);
     const suppressThinking = this.shouldSuppressThinking(request);
@@ -1391,6 +1395,18 @@ export class AnthropicProvider implements LlmProvider {
     if (request.toolMode === "finalization") {
       body.tools = [];
       body.tool_choice = { type: "none" };
+    } else if (request.toolMode === "required") {
+      if (!request.tools || request.tools.length === 0) throw new Error("Required tool mode needs at least one admitted host tool");
+      body.tools = request.tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.parameters,
+        ...(this.normalizeCacheControl(t.cache_control)
+          ? { cache_control: this.normalizeCacheControl(t.cache_control) }
+          : {}),
+        strict: false,
+      }));
+      body.tool_choice = { type: "any" };
     } else if (request.toolMode === "ordinary") {
       if (request.tools && request.tools.length > 0) {
         body.tools = request.tools.map((t) => ({

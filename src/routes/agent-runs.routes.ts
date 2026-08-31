@@ -18,6 +18,7 @@ import {
 import { parsePagination } from "../services/pagination";
 import type { PaginationParams } from "../types/pagination";
 import { AgenticGenerationError, retryAgenticGeneration } from "../services/agentic-generation.service";
+import { resolveGenerationRequestAuthority, stopGenerationRequestAuthority } from "../services/generate.service";
 import {
   createPersistentWorkspaceTask,
   deletePersistentWorkspace,
@@ -743,16 +744,45 @@ app.post("/:turnId/stop", async (c) => {
   }
   const chatIdResult = optionalBodyId(body, ["chat_id", "chatId"]);
   const generationIdResult = optionalBodyId(body, ["generation_id", "generationId"]);
+  const requestAuthorityIdResult = optionalBodyId(body, ["request_authority_id", "requestAuthorityId"]);
   const rootIdResult = optionalBodyId(body, ["root_id", "rootId"]);
-  if (chatIdResult.invalid || generationIdResult.invalid || rootIdResult.invalid) {
+  if (chatIdResult.invalid || generationIdResult.invalid || rootIdResult.invalid || requestAuthorityIdResult.invalid) {
     return routeError(c, 400, "invalid_request", "invalid_stop_request");
   }
   const chatId = chatIdResult.value;
   const generationId = generationIdResult.value;
   const rootId = rootIdResult.value;
+  const requestAuthorityId = requestAuthorityIdResult.value;
   const run = getAgentRun(userId, turnId, chatId);
   if (!run || (generationId !== undefined && generationId !== run.generationId) || (rootId !== undefined && rootId !== turnId)) {
     return notFound(c);
+  }
+  const boundRequestAuthorityId = requestAuthorityId ?? resolveGenerationRequestAuthority(
+    userId,
+    run.chatId,
+    run.generationId,
+  );
+  if (!boundRequestAuthorityId) {
+    return routeError(c, 409, "stop_unavailable", "request_authority_unavailable", {
+      target: run.attemptLineage.target,
+      workPhase: run.workPhase,
+      workStatus: run.workStatus,
+      workOutcome: run.workOutcome,
+    });
+  }
+  const authorityStop = await stopGenerationRequestAuthority(
+    userId,
+    run.chatId,
+    boundRequestAuthorityId,
+    run.generationId,
+  );
+  if (authorityStop === false) {
+    return routeError(c, 409, "target_mismatch", "request_authority_mismatch", {
+      target: run.attemptLineage.target,
+      workPhase: run.workPhase,
+      workStatus: run.workStatus,
+      workOutcome: run.workOutcome,
+    });
   }
   try {
     const result = requestAgentRunStop(userId, run.chatId, turnId);

@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { beforeEach, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { Hono } from "hono";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { closeDatabaseAsync, getDb, initDatabase } from "../db/connection";
 import * as embeddingsSvc from "./embeddings.service";
 import { chatsRoutes } from "../routes/chats.routes";
@@ -23,13 +24,22 @@ import {
   persistAgentRunInspection,
   persistTerminalAgentActivityRun,
 } from "./agent-activity-runs.service";
+import type { WorkSegmentContextV1 } from "../types/agent-work-segment";
+import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import { getBreakdown, getBreakdownForAttempt, storeBreakdown } from "./breakdown.service";
 import { runMigrations } from "../db/migrate";
 import type { AgentActivitySnapshotV1 } from "../types/agent-runtime";
 import type { PersistAgentRunInspectionInputV1 } from "./agent-activity-runs.service";
 
-import { createChat, createMessage, deleteChat, deleteMessage, deleteSwipe } from "./chats.service";
+import { createTurnExecution, transitionTurnExecution } from "./turn-execution.service";
+import { computeWorkSegmentContextDigestV1 } from "./agentic-work-phase.service";
+import {
+  computeWorkPhasePlanDigestV1,
+  computeWorkSegmentResumeEnvelopeDigestV1,
+  createAndAdmitInitialWorkSegmentV1,
+} from "./agentic-work-segment.repository";
 import { ensurePersistentWorkspaceForChat, getPersistentWorkspaceById } from "./turn-workspace.service";
+import { createChat, createMessage, deleteChat, deleteMessage, deleteSwipe } from "./chats.service";
 
 const OWNER = "activity-owner";
 const OTHER = "activity-other";
@@ -93,7 +103,7 @@ function inspectionInput(
     turnSessionId: "inspection-turn",
     generationId: "inspection-generation",
     generationType: "normal",
-    hostCorrelationId: "inspection-host",
+    hostCorrelationId: `inspection-host:${overrides.attemptId ?? "inspection-attempt"}`,
     lifecycle: "TERMINAL",
     status: "terminal",
     outcome: "completed",
@@ -423,6 +433,351 @@ describe("agent run inspection terminal persistence", () => {
       },
     });
     expect(detail?.markers.some((marker) => marker.scope === "transcript")).toBe(false);
+  });
+
+  test("persists admission and terminal inspection before WORK segment authority exists", async () => {
+    const db = getDb();
+    db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "135_agent_work_segments.sql")).text());
+    const chat = createChat(OWNER, { name: "inspection-pre-segment-authority" });
+    const executionId = "inspection-pre-segment-turn";
+    const attemptId = "inspection-pre-segment-attempt";
+    createTurnExecution({
+      id: executionId,
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: executionId,
+      targetKind: "normal",
+      targetChatRevision: 0,
+      attemptLineage: { attemptId },
+      mode: "agentic",
+      deadlineAt: Date.now() + 60_000,
+      workspaceId: `workspace:${executionId}`,
+    }, db);
+
+    const writer = createAgentInspectionWriter({
+      userId: OWNER,
+      chatId: chat.id,
+      attemptId,
+      runId: executionId,
+      turnSessionId: executionId,
+      generationId: executionId,
+      generationType: "normal",
+      hostCorrelationId: `agentic:${executionId}:${attemptId}`,
+      lifecycle: "ADMIT",
+      status: "pending",
+    });
+    const admission = writer.record("target", {
+      id: "admit:target",
+      kind: "target",
+      actor: "host",
+      recipient: "agent",
+      arguments: JSON.stringify({
+        generationType: "normal",
+        messageId: null,
+        swipeId: null,
+        messageRevision: null,
+        chatGenerationRevision: 0,
+      }),
+    }, { lifecycle: "ADMIT", status: "pending" });
+
+    expect(admission).not.toBeNull();
+    expect(admission?.workSegments).toBeNull();
+    expect(db.query(
+      "SELECT COUNT(*) AS count FROM agent_run_attempts WHERE user_id = ? AND turn_id = ? AND attempt_id = ?",
+    ).get(OWNER, executionId, attemptId)).toEqual({ count: 1 });
+
+    const terminal = writer.record("terminal", {
+      id: "terminal:pre-work",
+      kind: "terminal",
+      actor: "host",
+      recipient: "owner",
+    }, {
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "failed",
+      reason: "invalid_input",
+    });
+
+    expect(terminal).not.toBeNull();
+    expect(terminal?.workSegments).toBeNull();
+    expect(getAgentRunInspection(OWNER, attemptId, chat.id)?.outcome).toBe("failed");
+  });
+
+  test("projects populated WORK segments through the production inspection surface without private authority", async () => {
+    const db = getDb();
+    db.run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "135_agent_work_segments.sql")).text());
+    const chat = createChat(OWNER, { name: "inspection-work-segment-redaction" });
+    const executionId = "inspection-work-segment-turn";
+    const attemptId = "inspection-work-segment-attempt";
+    const workspaceId = "inspection-work-segment-workspace";
+    const created = createTurnExecution({
+      id: executionId,
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: executionId,
+      targetKind: "normal",
+      targetChatRevision: 0,
+      attemptLineage: { attemptId },
+      mode: "agentic",
+      runtimeEpoch: 7,
+      deadlineAt: Date.now() + 60_000,
+      workspaceId,
+    }, db);
+    db.query(`INSERT INTO agent_turn_workspaces
+      (workspace_id, turn_id, execution_id, user_id, chat_id, objective,
+       constraints_json, state, revision, operation_caps_json, field_caps_json,
+       retention, expires_at, quota_tasks, quota_records, quota_submissions,
+       quota_artifacts, quota_bytes)
+      VALUES (?, ?, ?, ?, ?, 'inspection objective', '[]', 'active', 0, '{}', '{}',
+              'turn_terminal', ?, 10, 10, 10, 10, 1000000)`).run(
+      workspaceId, executionId, executionId, OWNER, chat.id, Date.now() + 60_000,
+    );
+    const durable = transitionTurnExecution({
+      db, executionId, ownerToken: created.ownerToken, expectedPhase: "ASSEMBLE", nextPhase: "WORK",
+    }).execution;
+    createAgentInspectionWriter({
+      userId: OWNER,
+      chatId: chat.id,
+      attemptId,
+      runId: executionId,
+      turnSessionId: executionId,
+      generationId: executionId,
+      generationType: "normal",
+      hostCorrelationId: "agentic:" + executionId + ":" + attemptId,
+      lifecycle: "WORK",
+      status: "running",
+    }).record("condition", { id: "work:admission", kind: "condition", actor: "host", recipient: "agent" });
+
+    const digest = (value: unknown): string => createHash("sha256")
+      .update(encodeCanonicalPlainData(value), "utf8").digest("hex");
+    const digestA = "a".repeat(64);
+    const digestB = "b".repeat(64);
+    const instructionRef = Object.freeze({
+      kind: "loom_block" as const,
+      blockId: "safe-phase-instruction",
+      presetRevision: 1,
+      blockRevision: 1,
+      promptOrder: 0,
+    });
+    const customPhase = Object.freeze({
+      version: 1 as const,
+      id: "safe-phase",
+      label: "Safe phase",
+      instructionRefs: Object.freeze([instructionRef]),
+      childInstructionSubsets: Object.freeze([]),
+      required: true,
+      enter: Object.freeze({ kind: "phase" as const, value: "WORK" as const }),
+      exit: Object.freeze({ kind: "phase" as const, value: "WORK" as const }),
+      capabilityRequests: Object.freeze(["workspace_read"]),
+      repeatLimit: 0,
+      nextPhaseIds: Object.freeze([]),
+      index: 0,
+      sourceStatus: "verified" as const,
+      sourceIdentity: Object.freeze([Object.freeze({
+        blockId: instructionRef.blockId,
+        presetRevision: 1,
+        blockRevision: 1,
+        promptOrder: 0,
+      })]),
+      childInstructionSubsetIdentity: Object.freeze([]),
+    });
+    const transitionAuthorityDigest = digest({
+      version: 1,
+      id: customPhase.id,
+      index: 0,
+      enter: customPhase.enter,
+      exit: customPhase.exit,
+      capabilityRequests: customPhase.capabilityRequests,
+      repeatLimit: customPhase.repeatLimit,
+      nextPhaseIds: customPhase.nextPhaseIds,
+      sourceStatus: customPhase.sourceStatus,
+      sourceIdentity: customPhase.sourceIdentity,
+    });
+    const admittedCapabilityDigest = digest({ version: 1, admittedCapabilities: ["workspace_read"] });
+    const phasePlan = Object.freeze({
+      version: 1 as const,
+      phases: Object.freeze([Object.freeze({
+        id: "safe-phase",
+        index: 0,
+        required: true,
+        nextPhaseIds: Object.freeze([]),
+        repeatLimit: 0,
+        transitionAuthorityDigest,
+        skipEligibilityDigest: null,
+      })]),
+    });
+    const phasePlanDigest = computeWorkPhasePlanDigestV1(phasePlan);
+    const connection = Object.freeze({
+      logicalId: "root",
+      concreteId: "connection",
+      label: "Connection",
+      provider: "test",
+      model: "model",
+      effectiveEndpoint: "https://example.invalid",
+      endpointRevision: "endpoint-1",
+      credentialSecretRef: "inspection-secret-reference",
+      credentialRevision: "credential-1",
+      candidateRevision: "candidate-1",
+      capabilities: Object.freeze({ toolCalls: true }),
+      capabilityDigest: digestA,
+      fingerprint: digestB,
+    });
+    const plan = Object.freeze({
+      version: 1,
+      customPhasePlan: Object.freeze({
+        status: "ready" as const,
+        phases: Object.freeze([customPhase]),
+        issues: Object.freeze([]),
+        omittedPhaseIds: Object.freeze([]),
+      }),
+      loomBlocks: Object.freeze([Object.freeze({
+        source: instructionRef,
+        content: "inspection-private-plan-instruction",
+      })]),
+      completionCriteriaMessages: Object.freeze([Object.freeze({ content: "safe completion" })]),
+    });
+    const envelopeAuthority = Object.freeze({
+      version: 1 as const,
+      snapshotDigest: digestA,
+      planDigest: digest(plan),
+      toolCatalogSchemaVersion: 1,
+      toolCatalogDigest: digestB,
+      configRevision: "config-1",
+      authoredRootToolIds: Object.freeze([]),
+      authoredChildToolIds: Object.freeze({}),
+      snapshot: Object.freeze({ snapshotId: "snapshot" }),
+      plan,
+      rootConnection: connection,
+      childConnections: Object.freeze({}),
+      generationParameters: null,
+      resumeInput: Object.freeze({ userId: OWNER, chatId: chat.id, generationType: "normal" }),
+      decisionAuthority: Object.freeze({
+        binding: Object.freeze({ userId: OWNER, chatId: chat.id, targetDigest: digestA }),
+        readinessVector: Object.freeze({}),
+      }),
+      liveTargetBinding: Object.freeze({ targetDigest: digestA, inputRevisionDigest: digestB }),
+      runtime: Object.freeze({
+        deadlineAt: Date.now() + 60_000,
+        rootFrameId: executionId,
+        workspaceId,
+        workspaceRevision: 0,
+        ownerLimits: Object.freeze({ providerDispatches: 1 }),
+        workspaceRetention: "turn_terminal" as const,
+        workspaceSharing: "root_only" as const,
+      }),
+    });
+    const resumeEnvelope = Object.freeze({
+      ...envelopeAuthority,
+      envelopeDigest: computeWorkSegmentResumeEnvelopeDigestV1(envelopeAuthority),
+    });
+    const attemptBudget = Object.freeze({
+      maxSegments: 2,
+      maxProviderDispatches: 2,
+      maxProviderOutputTokens: 32,
+      maxOutputTokensPerDispatch: 16,
+      maxUnsignedBoundaries: 2,
+      maxToolCalls: 2,
+      maxWorkspaceOperations: 2,
+      recoveryReserveOutputTokens: 0,
+      futurePhaseReserveOutputTokens: 0,
+    });
+    const segmentBudget = Object.freeze({
+      maxProviderDispatches: 1,
+      maxProviderOutputTokens: 16,
+      maxOutputTokensPerDispatch: 16,
+      maxUnsignedBoundaries: 1,
+      maxToolCalls: 1,
+      maxWorkspaceOperations: 1,
+    });
+    const contextAuthority: Omit<WorkSegmentContextV1, "contextDigest"> = Object.freeze({
+      version: 1,
+      bindingDigest: digestB,
+      resumeEnvelopeDigest: resumeEnvelope.envelopeDigest,
+      phasePlanDigest,
+      protocolDigest: digestA,
+      capabilityDigest: admittedCapabilityDigest,
+      phaseCapabilityDigest: admittedCapabilityDigest,
+      rootObjective: "inspection-private-root-objective",
+      rootSnapshotId: "snapshot",
+      rootSnapshotDigest: digestA,
+      phase: Object.freeze({
+        id: "safe-phase",
+        index: 0,
+        occurrence: 0,
+        instructions: Object.freeze(["inspection-private-plan-instruction"]),
+        completionCriteria: Object.freeze(["safe completion"]),
+        admittedCapabilities: Object.freeze(["workspace_read"]),
+      }),
+      workspace: Object.freeze({
+        id: workspaceId,
+        revision: 0,
+        acceptedRecords: Object.freeze([]),
+        openRequiredIds: Object.freeze([]),
+      }),
+      previousHandoff: null,
+      attemptBudget,
+      segmentBudget,
+      protocol: Object.freeze({ completeTurnCallMode: "standalone_only", requiredToolModeAvailable: true }),
+    });
+    const context = Object.freeze({
+      ...contextAuthority,
+      contextDigest: computeWorkSegmentContextDigestV1(contextAuthority),
+    });
+    const now = Date.now();
+    const authority = {
+      userId: OWNER,
+      executionId,
+      ownerToken: created.ownerToken,
+      expectedExecutionCasRevision: durable.casRevision,
+      expectedWorkspaceRevision: 0,
+      now,
+    } as const;
+    const admitted = createAndAdmitInitialWorkSegmentV1({
+      db,
+      attempt: {
+        ...authority,
+        attemptId,
+        workspaceId,
+        phaseId: "safe-phase",
+        phaseIndex: 0,
+        phaseOccurrence: 0,
+        remainingRequiredPhaseCount: 0,
+        snapshotDigest: digestA,
+        phasePlanDigest,
+        phasePlan,
+        bindingDigest: digestB,
+        idempotencyKey: "inspection-work-attempt",
+        resumeEnvelope,
+        budget: attemptBudget,
+      },
+      admission: {
+        ...authority,
+        attemptId,
+        workspaceId,
+        sourceTransitionId: null,
+        phaseId: "safe-phase",
+        phaseIndex: 0,
+        phaseOccurrence: 0,
+        segmentOrdinal: 0,
+        admissionKey: "inspection-work-segment",
+        contextDigest: context.contextDigest,
+        context,
+        budget: segmentBudget,
+      },
+    }).admission.record;
+
+    const workSegments = getAgentRunInspection(OWNER, attemptId, chat.id)?.workSegments;
+    expect(workSegments?.segments).toHaveLength(1);
+    expect(workSegments?.segments[0]?.identity).toMatchObject({
+      segmentId: admitted.identity.segmentId,
+      phaseId: "safe-phase",
+      segmentOrdinal: 0,
+    });
+    const serialized = JSON.stringify(workSegments);
+    expect(serialized).not.toContain("inspection-secret-reference");
+    expect(serialized).not.toContain("inspection-private-plan-instruction");
+    expect(serialized).not.toContain("inspection-private-root-objective");
+    expect(serialized).toContain(admitted.identity.segmentId);
   });
 
   test("redacts secret keys across casing and separator variants", () => {
@@ -940,7 +1295,7 @@ describe("agent run inspection terminal persistence", () => {
       taskId: "task-rich",
       toolId: "chat_search_history",
       parentId: null,
-      hostCorrelationId: "inspection-host",
+      hostCorrelationId: "inspection-host:rich-attempt",
       hostSequence: 1,
     };
     const detail = persistAgentRunInspection(inspectionInput(chat.id, {
@@ -1026,6 +1381,7 @@ describe("agent run inspection terminal persistence", () => {
         id: "prompt-1",
         sourceId: "loom-block",
         sourceRevision: 3,
+        promptOrder: 0,
         destination: "root_work",
         role: "system",
         correlation: { ...correlation, hostSequence: 4 },
@@ -1099,7 +1455,7 @@ describe("agent run inspection terminal persistence", () => {
           swipeId: 0,
         },
       },
-      hostCorrelationId: "inspection-host",
+      hostCorrelationId: "inspection-host:rich-attempt",
       lifecycle: "WORK",
       status: "running",
       outcome: null,
@@ -1124,6 +1480,179 @@ describe("agent run inspection terminal persistence", () => {
     expect(detail!.activity.milestones).toHaveLength(1);
     expect(detail!.activity.milestones[0]).not.toHaveProperty("privatePayload");
     expect(JSON.stringify(detail!.activity)).not.toContain("PRIVATE-");
+  });
+
+  test("retains exact prompt occurrences and suppresses missing or colliding order evidence", () => {
+    const chat = createChat(OWNER, { name: "inspection-prompt-occurrences" });
+    const evidence = (
+      id: string,
+      promptOrder: number,
+      role: "system" | "user",
+      content: string,
+      hostSequence: number,
+    ) => ({
+      version: 1 as const,
+      id,
+      sourceId: "shared-source",
+      sourceRevision: 7,
+      promptOrder,
+      destination: "root_work" as const,
+      role,
+      correlation: { hostSequence },
+      included: true,
+      content,
+      contentDigest: (role === "system" ? "a" : "b").repeat(64),
+      omissionReason: null,
+      nativeProvenance: null,
+      loomInspection: null,
+    });
+    const retained = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "prompt-occurrence-attempt",
+      runId: "prompt-occurrence-run",
+      turnSessionId: "prompt-occurrence-turn",
+      generationId: "prompt-occurrence-generation",
+      lifecycle: "WORK",
+      status: "running",
+      outcome: null,
+      promptEvidence: [
+        evidence("prompt-three", 3, "system", "SYSTEM OCCURRENCE", 1),
+        evidence("prompt-seven", 7, "user", "USER OCCURRENCE", 2),
+      ],
+    }));
+    expect(retained?.promptEvidence.map(({ promptOrder, role, content }) => ({ promptOrder, role, content }))).toEqual([
+      { promptOrder: 3, role: "system", content: "SYSTEM OCCURRENCE" },
+      { promptOrder: 7, role: "user", content: "USER OCCURRENCE" },
+    ]);
+    expect(getAgentRunInspection(OWNER, "prompt-occurrence-attempt", chat.id)?.promptEvidence).toEqual(
+      retained?.promptEvidence,
+    );
+
+    const missing = evidence("prompt-missing", 2, "system", "MISSING ORDER PRIVATE", 1) as Record<string, unknown>;
+    delete missing.promptOrder;
+    const forged = evidence("prompt-forged", 7, "user", "FORGED ORDER PRIVATE", 2) as Record<string, unknown>;
+    forged.promptOrder = "7";
+    const missingProjection = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "prompt-missing-attempt",
+      runId: "prompt-missing-run",
+      turnSessionId: "prompt-missing-turn",
+      generationId: "prompt-missing-generation",
+      lifecycle: "WORK",
+      status: "running",
+      outcome: null,
+      promptEvidence: [missing, forged],
+    }));
+    expect(missingProjection?.promptEvidence).toEqual([]);
+    expect(missingProjection?.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ scope: "prompt", kind: "unavailable" }),
+    ]));
+    expect(JSON.stringify(missingProjection)).not.toContain("MISSING ORDER PRIVATE");
+    expect(JSON.stringify(missingProjection)).not.toContain("FORGED ORDER PRIVATE");
+
+    const collisionProjection = persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "prompt-collision-attempt",
+      runId: "prompt-collision-run",
+      turnSessionId: "prompt-collision-turn",
+      generationId: "prompt-collision-generation",
+      lifecycle: "WORK",
+      status: "running",
+      outcome: null,
+      promptEvidence: [
+        evidence("prompt-collision-system", 0, "system", "COLLISION SYSTEM PRIVATE", 1),
+        evidence("prompt-collision-user", 0, "user", "COLLISION USER PRIVATE", 2),
+      ],
+    }));
+    expect(collisionProjection?.promptEvidence).toEqual([]);
+    expect(collisionProjection?.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        scope: "prompt",
+        kind: "unavailable",
+        detail: "Prompt occurrence unavailable: conflicting retained evidence.",
+      }),
+    ]));
+    expect(JSON.stringify(collisionProjection)).not.toContain("COLLISION SYSTEM PRIVATE");
+    expect(JSON.stringify(collisionProjection)).not.toContain("COLLISION USER PRIVATE");
+
+    expect(persistAgentRunInspection(inspectionInput(chat.id, {
+      attemptId: "prompt-truncation-attempt",
+      runId: "prompt-truncation-run",
+      turnSessionId: "prompt-truncation-turn",
+      generationId: "prompt-truncation-generation",
+      lifecycle: "WORK",
+      status: "running",
+      outcome: null,
+      promptEvidence: [
+        evidence("prompt-truncation-system", 3, "system", "RETAINED COLLISION PREFIX", 1),
+        evidence("prompt-truncation-user", 3, "user", "OMITTED COLLISION COUNTERPART", 2),
+      ],
+    }))).not.toBeNull();
+    const insertTranscript = getDb().query(
+      `INSERT INTO agent_run_audit_records
+        (record_id, user_id, chat_id, attempt_id, record_kind, event_id, causal_parent_id,
+         host_sequence, occurred_at, late, payload_json, byte_size, dedupe_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (let index = 0; index < AGENT_RUN_INSPECTION_MAX_RECORDS - 1; index += 1) {
+      const hostSequence = index + 10;
+      const id = `prompt-budget-transcript-${index}`;
+      const payloadJson = JSON.stringify({
+        version: 1,
+        id,
+        kind: "tool",
+        actor: "agent",
+        recipient: "tool",
+        occurredAt: hostSequence,
+        hostSequence,
+        late: false,
+        content: null,
+        arguments: null,
+        result: null,
+        durationMs: null,
+        provider: null,
+        errorReason: null,
+        correlation: {
+          turnSessionId: "prompt-truncation-turn",
+          runId: "prompt-truncation-run",
+          attemptId: "prompt-truncation-attempt",
+          chatId: chat.id,
+          generationId: "prompt-truncation-generation",
+          messageId: null,
+          swipeId: null,
+          actorId: "agent",
+          recipientId: "tool",
+          phase: "WORK",
+          taskId: null,
+          toolId: null,
+          parentId: null,
+          hostCorrelationId: "inspection-host:prompt-truncation-attempt",
+          hostSequence,
+        },
+      });
+      insertTranscript.run(
+        id,
+        OWNER,
+        chat.id,
+        "prompt-truncation-attempt",
+        "transcript",
+        id,
+        null,
+        hostSequence,
+        hostSequence,
+        0,
+        payloadJson,
+        Buffer.byteLength(payloadJson, "utf8"),
+        id,
+      );
+    }
+    const splitCollisionProjection = getAgentRunInspection(OWNER, "prompt-truncation-attempt", chat.id);
+    expect(splitCollisionProjection?.promptEvidence).toEqual([
+      expect.objectContaining({ promptOrder: 3, role: "system", content: "RETAINED COLLISION PREFIX" }),
+    ]);
+    expect(splitCollisionProjection?.markers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "truncated", scope: "prompt" }),
+    ]));
+    expect(splitCollisionProjection?.sectionAvailability).toEqual(expect.arrayContaining([
+      expect.objectContaining({ section: "prompt", state: "unavailable" }),
+    ]));
   });
 
   test("retains recovered and terminal lineage while late and reordered evidence cannot mutate terminal state", () => {
@@ -2052,6 +2581,141 @@ describe("agent run inspection terminal persistence", () => {
     ]);
   });
 
+  test("cleans task-scoped workspace artifacts through the canonical source_task_id column", () => {
+    const db = getDb();
+    const chat = createChat(OWNER, { name: "inspection-operational-artifact-cleanup" });
+    const executionId = "inspection-cleanup-turn";
+    const workspaceId = "inspection-cleanup-workspace";
+    const taskId = "inspection-cleanup-task";
+    const artifactId = "inspection-cleanup-artifact";
+    createTurnExecution({
+      id: executionId,
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "inspection-cleanup-generation",
+      targetKind: "normal",
+      targetChatRevision: 0,
+      attemptLineage: { attemptId: "inspection-cleanup-attempt" },
+      mode: "agentic",
+      deadlineAt: Date.now() + 60_000,
+      workspaceId,
+    }, db);
+    db.query(
+      `INSERT INTO agent_turn_workspaces
+        (workspace_id, turn_id, execution_id, user_id, chat_id, objective,
+         constraints_json, state, revision, operation_caps_json, field_caps_json,
+         retention, expires_at, quota_tasks, quota_records, quota_submissions,
+         quota_artifacts, quota_bytes)
+       VALUES (?, ?, ?, ?, ?, 'cleanup objective', '[]', 'active', 0, '{}', '{}',
+               'operational', ?, 1, 0, 0, 1, 1024)`,
+    ).run(workspaceId, executionId, executionId, OWNER, chat.id, Date.now() + 60_000);
+    db.query(
+      `INSERT INTO agent_workspace_tasks
+        (task_id, workspace_id, turn_id, user_id, chat_id, title, description,
+         state, required, dependencies_json, progress, byte_count, revision,
+         retention, expires_at)
+       VALUES (?, ?, ?, ?, ?, 'cleanup task', '', 'active', 1, '[]', 0, 0, 0,
+               'operational', ?)`,
+    ).run(taskId, workspaceId, executionId, OWNER, chat.id, Date.now() + 60_000);
+    db.query(
+      `INSERT INTO agent_workspace_artifacts
+        (artifact_id, workspace_id, turn_id, user_id, chat_id, blob_digest,
+         mime_type, byte_count, provenance_json, source_frame_id, source_task_id,
+         publication_state, retention, revision, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'text/plain', 7, '{}', 'cleanup-frame', ?,
+               'attached', 'operational', 0, ?)`,
+    ).run(
+      artifactId,
+      workspaceId,
+      executionId,
+      OWNER,
+      chat.id,
+      "a".repeat(64),
+      taskId,
+      Date.now() + 60_000,
+    );
+
+    const artifactColumns = db.query("PRAGMA table_info(agent_workspace_artifacts)")
+      .all() as Array<{ name: string }>;
+    expect(artifactColumns.map(({ name }) => name)).toContain("source_task_id");
+    expect(artifactColumns.map(({ name }) => name)).not.toContain("task_id");
+
+    expect(deleteChat(OWNER, chat.id)).toBe(true);
+    for (const [table, idColumn, id] of [
+      ["agent_workspace_artifacts", "artifact_id", artifactId],
+      ["agent_workspace_tasks", "task_id", taskId],
+      ["agent_turn_workspaces", "workspace_id", workspaceId],
+      ["agent_turn_executions", "id", executionId],
+    ] as const) {
+      expect(
+        db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${idColumn} = ?`).get(id),
+      ).toEqual({ count: 0 });
+    }
+  });
+
+  test("uses available legacy ownership columns and skips tables without an execution scope", () => {
+    const db = getDb();
+    db.run(`
+      DROP TABLE agent_workspace_records;
+      DROP TABLE agent_workspace_submissions;
+      CREATE TABLE agent_workspace_records (
+        record_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        turn_id TEXT,
+        workspace_id TEXT
+      );
+      CREATE TABLE agent_workspace_submissions (
+        submission_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        payload TEXT NOT NULL
+      );
+    `);
+    const chat = createChat(OWNER, { name: "inspection-legacy-operational-cleanup" });
+    const executionId = "inspection-legacy-cleanup-turn";
+    createTurnExecution({
+      id: executionId,
+      userId: OWNER,
+      chatId: chat.id,
+      generationId: "inspection-legacy-cleanup-generation",
+      targetKind: "normal",
+      targetChatRevision: 0,
+      attemptLineage: { attemptId: "inspection-legacy-cleanup-attempt" },
+      mode: "agentic",
+      deadlineAt: Date.now() + 60_000,
+      workspaceId: "inspection-legacy-cleanup-workspace",
+    }, db);
+    db.query(
+      "INSERT INTO agent_workspace_records (record_id, user_id, turn_id, workspace_id) VALUES (?, ?, ?, ?)",
+    ).run("legacy-record", OWNER, executionId, "inspection-legacy-cleanup-workspace");
+    db.query(
+      "INSERT INTO agent_workspace_submissions (submission_id, user_id, payload) VALUES (?, ?, ?)",
+    ).run("unscoped-submission", OWNER, "must remain");
+
+    const legacyColumns = db.query("PRAGMA table_info(agent_workspace_records)")
+      .all() as Array<{ name: string }>;
+    expect(legacyColumns.map(({ name }) => name)).toEqual([
+      "record_id",
+      "user_id",
+      "turn_id",
+      "workspace_id",
+    ]);
+    const unscopedColumns = db.query("PRAGMA table_info(agent_workspace_submissions)")
+      .all() as Array<{ name: string }>;
+    expect(unscopedColumns.map(({ name }) => name)).toEqual([
+      "submission_id",
+      "user_id",
+      "payload",
+    ]);
+
+    expect(deleteChat(OWNER, chat.id)).toBe(true);
+    expect(db.query(
+      "SELECT COUNT(*) AS count FROM agent_workspace_records WHERE record_id = ?",
+    ).get("legacy-record")).toEqual({ count: 0 });
+    expect(db.query(
+      "SELECT payload FROM agent_workspace_submissions WHERE submission_id = ?",
+    ).get("unscoped-submission")).toEqual({ payload: "must remain" });
+  });
+
   test("scrubs source-private evidence through owner deletion while retaining durable publication copies", () => {
     const chat = createChat(OWNER, { name: "inspection-source-deleted" });
     const target = createMessage(
@@ -2124,6 +2788,7 @@ describe("agent run inspection terminal persistence", () => {
         id: "private-prompt",
         sourceId: "loom-source",
         sourceRevision: 1,
+        promptOrder: 0,
         destination: "root_work",
         role: "system",
         correlation: { hostSequence: 3 },
@@ -2324,7 +2989,7 @@ describe("agent run inspection terminal persistence", () => {
       taskId: null,
       toolId: null,
       parentId: null,
-      hostCorrelationId: "inspection-host",
+      hostCorrelationId: "inspection-host:exhausted-attempt",
       hostSequence: 1,
     };
     const loomInspection = {
@@ -2350,6 +3015,7 @@ describe("agent run inspection terminal persistence", () => {
         id: "prompt-root",
         sourceId: "loom-root",
         sourceRevision: 3,
+        promptOrder: 0,
         destination: "root_work",
         role: "system",
         correlation,
@@ -2364,6 +3030,7 @@ describe("agent run inspection terminal persistence", () => {
         id: "prompt-handoff",
         sourceId: "phase-continuation",
         sourceRevision: 3,
+        promptOrder: 0,
         destination: "completion_handoff",
         role: "system",
         correlation: { ...correlation, hostSequence: 2 },
@@ -2384,6 +3051,7 @@ describe("agent run inspection terminal persistence", () => {
         id: "prompt-cortex",
         sourceId: "cortex-private",
         sourceRevision: 1,
+        promptOrder: 0,
         destination: "cortex",
         role: "system",
         correlation: { ...correlation, hostSequence: 3 },
@@ -2412,6 +3080,7 @@ describe("agent run inspection terminal persistence", () => {
         id: "prompt-failed",
         sourceId: "failed-root",
         sourceRevision: 1,
+        promptOrder: 0,
         destination: "root_work",
         role: "system",
         correlation: {
@@ -2457,6 +3126,7 @@ describe("agent run inspection terminal persistence", () => {
       "ROOT_WORK_PROMPT",
       "PHASE_CONTINUATION",
     ]);
+    expect((exhausted?.entries as Array<{ promptOrder: number }>).map((entry) => entry.promptOrder)).toEqual([0, 0]);
     expect(JSON.stringify(exhausted)).not.toContain("PRIVATE_CORTEX");
     expect(JSON.stringify(exhausted)).not.toContain("FAILED_WORK_PROMPT");
     expect(JSON.stringify(exhausted)).not.toContain("ordinary_response");

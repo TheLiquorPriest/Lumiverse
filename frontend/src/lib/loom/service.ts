@@ -2494,36 +2494,8 @@ function sameOrRepairablePromptVariableIdentity(previous: PromptBlock, next: Pro
     && !hasLegacyVariableIdentity(next.variables)
 }
 
-const PROMPT_BLOCK_IDENTITY_KEYS = [
-  'id',
-  'name',
-  'content',
-  'role',
-  'enabled',
-  'position',
-  'depth',
-  'marker',
-  'isLocked',
-  'color',
-  'injectionTrigger',
-  'characterTagTrigger',
-  'group',
-  'categoryMode',
-  'placementBinding',
-] as const
-
 function sameNativePromptBlockOccurrence(previous: PromptBlock, next: PromptBlock): boolean {
-  if (!sameOrRepairablePromptVariableIdentity(previous, next)) return false
-  return PROMPT_BLOCK_IDENTITY_KEYS.every((key) => {
-    const left = previous[key]
-    const right = next[key]
-    if (Object.is(left, right)) return true
-    try {
-      return JSON.stringify(left) === JSON.stringify(right)
-    } catch {
-      return false
-    }
-  })
+  return previous.id === next.id && sameOrRepairablePromptVariableIdentity(previous, next)
 }
 
 /**
@@ -2563,28 +2535,30 @@ export function validatePromptVariableSchema(
       selectedBaselineOccurrences.set(id, [])
       continue
     }
-    let safe = true
-    const selected: number[] = []
-    if (finalOccurrences.length === baselineOccurrences.length) {
-      finalOccurrences.forEach((block, index) => {
-        if (sameNativePromptBlockOccurrence(baselineOccurrences[index]!, block)) selected.push(index)
-        else safe = false
-      })
-    } else {
-      let baselineIndex = 0
-      for (const block of finalOccurrences) {
-        const match = baselineOccurrences.findIndex((candidate, index) => (
-          index >= baselineIndex && sameNativePromptBlockOccurrence(candidate, block)
-        ))
-        if (match < 0) {
-          safe = false
-          break
-        }
-        selected.push(match)
-        baselineIndex = match + 1
-      }
+    const selected = new Array<number>(finalOccurrences.length).fill(-1)
+    const availableBaselineOccurrences = new Set(baselineOccurrences.keys())
+    for (let finalIndex = 0; finalIndex < finalOccurrences.length; finalIndex += 1) {
+      const block = finalOccurrences[finalIndex]!
+      const match = baselineOccurrences.findIndex((candidate, baselineIndex) => (
+        availableBaselineOccurrences.has(baselineIndex)
+        && samePromptVariableIdentity(candidate, block)
+      ))
+      if (match < 0) continue
+      selected[finalIndex] = match
+      availableBaselineOccurrences.delete(match)
     }
-    if (safe) {
+    for (let finalIndex = 0; finalIndex < finalOccurrences.length; finalIndex += 1) {
+      if (selected[finalIndex]! >= 0) continue
+      const block = finalOccurrences[finalIndex]!
+      const match = baselineOccurrences.findIndex((candidate, baselineIndex) => (
+        availableBaselineOccurrences.has(baselineIndex)
+        && sameNativePromptBlockOccurrence(candidate, block)
+      ))
+      if (match < 0) break
+      selected[finalIndex] = match
+      availableBaselineOccurrences.delete(match)
+    }
+    if (selected.every((match) => match >= 0)) {
       legacyBlockIds.add(id)
       selectedBaselineOccurrences.set(id, selected)
     }

@@ -37,6 +37,7 @@ export class DeepSeekProvider extends OpenAICompatibleProvider {
     apiKeyRequired: true,
     modelListStyle: "openai",
     toolCalling: true,
+    requiredToolChoice: true,
     nativeToolContinuation: true,
     toolContinuationMode: "native",
     toolsDisabledFinalization: true,
@@ -50,6 +51,7 @@ export class DeepSeekProvider extends OpenAICompatibleProvider {
   protected override buildBody(request: GenerationRequest, stream: boolean) {
     const body = super.buildBody(request, stream) as Record<string, unknown>;
     const messages = Array.isArray(body.messages) ? body.messages : [];
+    let hasToolCallWithoutReasoning = false;
     for (const raw of messages) {
       if (!raw || typeof raw !== "object") continue;
       const message = raw as Record<string, unknown>;
@@ -60,7 +62,20 @@ export class DeepSeekProvider extends OpenAICompatibleProvider {
       const fromDetails = deepSeekReasoningText(message.reasoning_details);
       const reasoning = existing.length > 0 ? existing : fromDetails;
       delete message.reasoning_details;
-      if (reasoning.length > 0) message.reasoning_content = reasoning;
+      if (reasoning.length > 0) {
+        message.reasoning_content = reasoning;
+      } else {
+        hasToolCallWithoutReasoning = true;
+      }
+    }
+    // A host-required turn is emitted with thinking disabled because DeepSeek
+    // rejects thinking together with tool_choice. Keep that mode stable across
+    // the native continuation: re-enabling thinking while replaying the prior
+    // carrier-free assistant tool call makes DeepSeek reject the next request
+    // because there is no reasoning_content to echo back. Carrier-complete
+    // thinking continuations remain enabled.
+    if (body.tool_choice !== undefined || hasToolCallWithoutReasoning) {
+      body.thinking = { type: "disabled" };
     }
     return body;
   }

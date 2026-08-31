@@ -1003,13 +1003,24 @@ describe('Loom portable Agentic runtime adapter', () => {
       phases: [runtimePhase('one', { nextPhaseIds: ['missing'] })],
     })))).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
   })
+  test('distinguishes custom phase instruction refs by exact block occurrence', () => {
+    const occurrences = [
+      runtimeSource('same-source', 0, 1),
+      runtimeSource('same-source', 1, 2),
+    ]
+    const parsed = parsePortableAgenticRuntimeEnvelope(envelopeWithRuntimePolicy(runtimePolicy({
+      phases: [runtimePhase('occurrences', { instructionRefs: occurrences })],
+    })))
+    expect(parsed.agentConfig?.runtimePolicy?.phases[0]?.instructionRefs).toEqual([
+      { kind: 'loom_block', blockId: 'same-source', presetRevision: 0, blockRevision: 1, promptOrder: 0 },
+      { kind: 'loom_block', blockId: 'same-source', presetRevision: 0, blockRevision: 2, promptOrder: 1 },
+    ] as const)
 
-  test('rejects duplicate block IDs within one custom phase', () => {
     expect(() => parsePortableAgenticRuntimeEnvelope(envelopeWithRuntimePolicy(runtimePolicy({
       phases: [runtimePhase('duplicate', {
         instructionRefs: [
           runtimeSource('same-source', 0, 1),
-          runtimeSource('same-source', 1, 2),
+          runtimeSource('same-source', 0, 2),
         ],
       })],
     })))).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
@@ -1079,6 +1090,9 @@ describe('Loom portable Agentic runtime adapter', () => {
   test('fails closed when the envelope is malformed or contains a local binding', () => {
     const valid = envelope()
     expect(() => parsePortableAgenticRuntimeEnvelope({ ...valid, version: 2 })).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
+    const staleChildCapability = envelope()
+    ;(staleChildCapability.agentConfig!.profiles[0] as unknown as { workspaceCapabilities: unknown }).workspaceCapabilities = ['record_question']
+    expect(() => parsePortableAgenticRuntimeEnvelope(staleChildCapability)).toThrow('AGENT_RUNTIME_PORTABLE_INVALID')
     expect(() => parsePortableAgenticRuntimeEnvelope({
       ...valid,
       agentConfig: {

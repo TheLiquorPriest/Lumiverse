@@ -36,6 +36,19 @@ const hostCeilings = {
   logicalProviderRequests: 32,
   physicalDispatchAttempts: 64,
   childOutputTokens: 16_384,
+  workAttemptOutputTokens: 1_048_576,
+  workAttemptProviderDispatches: 256,
+  workAttemptUnsignedBoundaries: 256,
+  workAttemptToolCalls: 1_024,
+  workAttemptWorkspaceOperations: 1_024,
+  workSegmentOutputTokens: 262_144,
+  workSegmentProviderDispatches: 64,
+  workSegmentUnsignedBoundaries: 64,
+  workSegmentToolCalls: 256,
+  workSegmentWorkspaceOperations: 256,
+  workDispatchOutputTokens: 65_536,
+  workRecoveryReserveOutputTokens: 65_536,
+  workFuturePhaseReserveOutputTokens: 262_144,
   rootWallClockMs: 120_000,
   activityEvents: 256,
   activityBytes: 262_144,
@@ -271,23 +284,45 @@ describe('agentic runtime API save boundary', () => {
   })
 })
 describe('agentic runtime API matched editor boundary', () => {
-  test('returns only an exact pair and preserves every preset agent field', async () => {
+  test('maps the real GET review envelope through the matched onReload result', async () => {
+    const baseReview = {
+      state: 'ready' as const,
+      reasonCode: null,
+      unresolvedSlotIds: [],
+      staleSlotIds: [],
+      acknowledged: false,
+    }
+    const authoritativeReview = { ...baseReview, revision: 80, items: [] }
+    const backendPreset = {
+      ...savedPreset(),
+      cache_revision: 115,
+      agent_config_revision: 80,
+      agent_config_review: baseReview,
+    } as unknown as Preset
+    const editor = {
+      ...editorProjection(),
+      presetRevision: 115,
+      configRevision: 80,
+      review: authoritativeReview,
+    }
+    installApiFixture(editor, backendPreset)
+
     const result = await agenticRuntimeApi.getMatchedEditor('preset-1')
 
     expect(result.preset.id).toBe(result.editor.presetId)
     expect(result.preset.cache_revision).toBe(result.editor.presetRevision)
     expect(result.preset.agent_config_revision).toBe(result.editor.configRevision)
+    expect(result.editor.review).toEqual(authoritativeReview)
+    expect(result.preset.agent_config_review).toEqual(authoritativeReview)
     expect(result.preset.agent_config).toEqual(validConfig())
-    expect(result.preset.agent_config_review).toBeNull()
     expect(result.preset.agent_slot_bindings).toEqual({ writer: 'connection-1' })
     expect(result.preset.agent_task_templates).toEqual([])
   })
-
   test('reconciles an accepted save from the authoritative editor when the preset carries its base review shape', async () => {
     const committedConfig = validConfig()
     committedConfig.maxToolCalls = 63
     const baseReview = {
-      state: 'ready',
+      state: 'ready' as const,
       reasonCode: null,
       unresolvedSlotIds: [],
       staleSlotIds: [],
@@ -378,6 +413,16 @@ describe('agentic runtime API matched editor boundary', () => {
 })
 
 describe('agentic runtime API editor projection boundary', () => {
+  test('rejects the retired record_question child capability before editor hydration', async () => {
+    const stale = editorProjection()
+    const config = validConfig()
+    ;(config.profiles[0] as unknown as { workspaceCapabilities: unknown }).workspaceCapabilities = ['record_question']
+    stale.config = config
+    installApiFixture(stale)
+
+    await expect(agenticRuntimeApi.getEditor('preset-1')).rejects.toThrow('workspaceCapabilities')
+  })
+
   test('normalizes equivalent array and object slot binding forms identically', async () => {
     installApiFixture(editorProjection([{ slotId: 'writer', connectionId: null }]))
     const arrayProjection = await agenticRuntimeApi.getEditor('preset-1')
@@ -387,6 +432,7 @@ describe('agentic runtime API editor projection boundary', () => {
 
     expect(arrayProjection).toEqual(objectProjection)
     expect(arrayProjection.slotBindings).toEqual({ writer: null })
+    expect(arrayProjection.hostCeilings).toEqual(hostCeilings)
     expect(objectProjection.slotBindings).toEqual({ writer: null })
   })
 

@@ -415,6 +415,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
   const generationNonceRef = useRef(0)
   const pendingAgentStopRef = useRef<{
     generationId: string | null
+    requestAuthorityId: string | null
     stoppedTurnId: string | null
   } | null>(null)
   const composerStopAuthorityRef = useRef<{
@@ -600,6 +601,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
     void agentRunsApi.stop(activeAgentRun.turnId, {
       chatId,
       generationId: activeAgentRun.generationId,
+      requestAuthorityId: pending.requestAuthorityId ?? undefined,
     }).then((result) => {
       if (pendingAgentStopRef.current === pending && pending.stoppedTurnId === activeAgentRun.turnId) {
         pendingAgentStopRef.current = null
@@ -1741,6 +1743,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           void agentRunsApi.stop(knownRun.turnId, {
             chatId,
             generationId: knownRun.generationId,
+            requestAuthorityId: stoppedAuthority?.requestAuthorityId ?? undefined,
           }).then((result) => applyComposerStopResult(result, knownRun.generationId))
             .catch(console.error)
             .finally(settleComposerAbort)
@@ -1748,6 +1751,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           if (waitingForExactAgentRun) {
             pendingAgentStopRef.current = {
               generationId: generationIdForChat,
+              requestAuthorityId: stoppedAuthority?.requestAuthorityId ?? null,
               stoppedTurnId: null,
             }
             void recoverAgentRuns(chatId, agentRunsApi, useStore)
@@ -2799,6 +2803,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           const result = await agentRunsApi.stop(knownRun.turnId, {
             chatId,
             generationId: knownRun.generationId,
+            requestAuthorityId: stoppedAuthority?.requestAuthorityId ?? undefined,
           })
           applyComposerStopResult(result, knownRun.generationId)
         } catch (err: unknown) {
@@ -2809,6 +2814,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         if (waitingForExactAgentRun) {
           pendingAgentStopRef.current = {
             generationId: generationIdForChat,
+            requestAuthorityId: stoppedAuthority?.requestAuthorityId ?? null,
             stoppedTurnId: null,
           }
           void recoverAgentRuns(chatId, agentRunsApi, useStore)
@@ -2848,6 +2854,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         const result = await agentRunsApi.stop(recovered.turnId, {
           chatId,
           generationId: recovered.generationId,
+          requestAuthorityId: stoppedAuthority?.requestAuthorityId ?? undefined,
         })
         applyComposerStopResult(result, recovered.generationId)
       } else {
@@ -4922,6 +4929,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
                   turnId={activeAgentRun.turnId}
                   chatId={chatId}
                   generationId={activeAgentRun.generationId}
+                  requestAuthorityId={generationRequestAuthority?.requestAuthorityId ?? undefined}
                   onBeforeStop={beginComposerAbort}
                   onSettled={settleComposerAbort}
                   onResult={(result) => applyComposerStopResult(result, activeAgentRun.generationId)}

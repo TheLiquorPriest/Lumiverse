@@ -154,6 +154,12 @@ Groups are useful for creating alternative instruction sets (e.g., different wri
 
 ---
 
+## Prompt stash
+
+The Prompt Stash lets you reuse a shared block across presets. Removing an entry from the stash removes its stash link from every preset that owns it in one operation; it does not discard unrelated unsaved edits in an open Loom editor. If the entry was only in the stash, no preset or Agent Runtime authority changes. Repeating a removal after the entry is gone has no effect.
+
+---
+
 ## Tips
 
 !!! tip "Start simple"

@@ -34,7 +34,6 @@ import { executeHostCouncilTool } from "./host-tools";
 import { getExpressionLabels, hasExpressions } from "../expressions.service";
 import { getSidecarSettings } from "../sidecar-settings.service";
 import type { SidecarSettings } from "../sidecar-settings.service";
-import { getToolChoiceParams } from "../memory-cortex/salience-sidecar";
 import type { SidecarConfig } from "lumiverse-spindle-types";
 
 const MAX_RETRIES = 3;
@@ -1539,16 +1538,12 @@ Select the most appropriate arguments from the story context and call the provid
       signal,
     );
   }
-
-  if (GOOGLE_PLANNING_PROVIDERS.has(conn.provider)) {
-    // Gemini's forced ANY mode is documented to be more brittle for argument
-    // inference than AUTO. Keep the council tool mandatory at the host layer,
-    // but let Google/Vertex use AUTO for the planner step so the model can
-    // reason its way to better arguments before emitting the function call.
-    planningParameters.toolConfig = { functionCallingConfig: { mode: "AUTO" } };
-  } else {
-    Object.assign(planningParameters, getToolChoiceParams(conn.provider));
-  }
+  // Google/Vertex forced ANY is more brittle for argument inference than AUTO.
+  // Keep the council tool mandatory at the host layer, but let those adapters
+  // use their ordinary tool mode so the model can reason its way to arguments.
+  const planningToolMode = GOOGLE_PLANNING_PROVIDERS.has(conn.provider)
+    ? "ordinary" as const
+    : "required" as const;
 
   const response = await rawGenerate(userId, {
     provider: conn.provider,
@@ -1556,6 +1551,7 @@ Select the most appropriate arguments from the story context and call the provid
     connection_id: sidecar.connectionProfileId,
     messages: planningMessages,
     parameters: planningParameters,
+    toolMode: planningToolMode,
     tools: [planningTool],
     signal,
   });

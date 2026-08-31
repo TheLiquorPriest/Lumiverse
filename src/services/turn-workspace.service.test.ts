@@ -1,4 +1,5 @@
-import type { CognitionWorkspaceActivationFactoryV1 } from "../types/agent-cognition-runtime";
+import type { AgenticWorkMutatingWorkspaceOperationKindV1, AgenticWorkWorkspaceMutationReservationV1 } from "../types/agent-work-segment";
+import type { CognitionWorkspaceActivationFactoryV1, CognitionWorkspaceCompletionFactoryV1 } from "../types/agent-cognition-runtime";
 import type { WorkspaceArtifactReferenceV1, WorkspaceOperationCapabilitiesV1 } from "../types/turn-workspace";
 import { deriveCognitionOperationalTaskId, type CognitionActivationResultV1, type CognitionTaskTransition, type TaskTemplateV1 } from "../types/agent-cognition";
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
@@ -33,6 +34,7 @@ import {
   deletePersistentWorkspacePublication,
   ensurePersistentWorkspaceForChat,
   ensurePersistentWorkspaceHost,
+  freezeWorkspaceForCompletionWithCognition,
   freezeFrameCapabilities,
   freezeTurnWorkspace,
   freezeWorkspaceForCompletionV1,
@@ -55,6 +57,7 @@ import {
   readTurnWorkspaceSection,
   validateCreateWorkspaceTaskInput,
   validateReadWorkspaceSectionInput,
+  setWorkspaceMutationCommitBoundaryHookForTests,
   settleWorkspaceChildTask,
   settleWorkspaceChildTaskWithCognition,
   submitWorkspaceChildResult,
@@ -106,13 +109,13 @@ function seed(): void {
     (id, user_id, chat_id, generation_id, target_kind, target_chat_revision, mode,
      runtime_epoch, deadline_at, state, root_ledger_json, frame_capabilities_json,
      commit_key, expires_at)
-    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
+    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
     .run(TURN, USER, CHAT, "workspace-generation", "workspace-commit");
   db.query(`INSERT INTO agent_turn_executions
     (id, user_id, chat_id, generation_id, target_kind, target_chat_revision, mode,
      runtime_epoch, deadline_at, state, root_ledger_json, frame_capabilities_json,
      commit_key, expires_at)
-    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
+    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
     .run(OTHER_TURN, USER, OTHER_CHAT, "workspace-generation-other", "workspace-commit-other");
   db.query(`INSERT INTO agent_artifact_blobs
     (digest, user_id, byte_count, mime_type, storage_path, provenance_json, expires_at)
@@ -130,7 +133,7 @@ function insertTurnExecution(turnId: string, generationId: string, commitKey: st
     (id, user_id, chat_id, generation_id, target_kind, target_chat_revision, mode,
      runtime_epoch, deadline_at, state, root_ledger_json, frame_capabilities_json,
      commit_key, expires_at)
-    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
+    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
     .run(turnId, USER, chatId, generationId, commitKey);
 }
 type TurnAttemptOptions = {
@@ -184,7 +187,8 @@ function workspaceTurnId(workspaceId: string): string {
   return row?.turn_id ?? TURN;
 }
 function rootContext(workspaceId: string, revision: number) {
-  return { userId: USER, chatId: CHAT, turnId: workspaceTurnId(workspaceId), workspaceId, actor: "root" as const, expectedRevision: revision };
+  const turnId = workspaceTurnId(workspaceId);
+  return { userId: USER, chatId: CHAT, turnId, workspaceId, actor: "root" as const, frameId: turnId, expectedRevision: revision };
 }
 function hostContext(workspaceId: string, revision: number) {
   return { ...rootContext(workspaceId, revision), actor: "host" as const };
@@ -331,12 +335,52 @@ function expectWorkspaceError(code: WorkspaceErrorCode, callback: () => unknown)
   }
   throw new Error(`expected workspace error ${code}`);
 }
+function reservationFixtureId(namespace: string, executionId: string): string {
+  return `${namespace}:${createHash("sha256").update(`${namespace}\0${executionId}`).digest("hex")}`;
+}
+function receiptReservation(
+  workspaceId: string,
+  operationKey: string,
+  operationKind: AgenticWorkMutatingWorkspaceOperationKindV1,
+  frameId: string,
+): AgenticWorkWorkspaceMutationReservationV1 {
+  const executionId = workspaceTurnId(workspaceId);
+  const segmentId = reservationFixtureId("receipt-segment", executionId);
+  const logicalDispatch = 0;
+  const db = getDb();
+  db.run("PRAGMA foreign_keys = OFF");
+  try {
+    db.query(`INSERT OR IGNORE INTO agent_work_segment_dispatches
+      (dispatch_id, user_id, execution_id, attempt_id, segment_id, workspace_id,
+       workspace_revision, execution_cas_revision, dispatch_ordinal, lifecycle,
+       tool_mode, budget_class, reserved_output_tokens, ordinary_output_tokens_reserved,
+       recovery_reserve_output_tokens_reserved, lease_owner, lease_expires_at,
+       fence_generation, idempotency_key, payload_digest, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, 'reserved', 'ordinary', 'normal', 1, 1, 0,
+              ?, 9999999999, 1, ?, ?, 1, 1)`).run(
+      reservationFixtureId("receipt-dispatch", executionId),
+      USER,
+      executionId,
+      reservationFixtureId("receipt-attempt", executionId),
+      segmentId,
+      workspaceId,
+      logicalDispatch,
+      reservationFixtureId("receipt-owner", executionId),
+      reservationFixtureId("receipt-dispatch-key", executionId),
+      "0".repeat(64),
+    );
+  } finally {
+    db.run("PRAGMA foreign_keys = ON");
+  }
+  return Object.freeze({ version: 1, operationKey, operationKind, segmentId, logicalDispatch, frameId });
+}
+
 function cognitionProgressFactory(
   taskId: string,
   transition: CognitionTaskTransition,
   workspaceRevision: number,
-  materializeTemplates: readonly TaskTemplateV1[] = [],
-  operationKey?: string,
+  materializeTemplates: readonly TaskTemplateV1[],
+  reservation: AgenticWorkWorkspaceMutationReservationV1,
 ): CognitionWorkspaceActivationFactoryV1 {
   const state = Object.freeze({
     version: 1 as const,
@@ -355,7 +399,7 @@ function cognitionProgressFactory(
     update: (current) => ({
       taskId,
       transition,
-      ...(operationKey ? { operationKey } : {}),
+      reservation,
       state: Object.freeze({ ...current, workspaceRevision: current.workspaceRevision + 1 }),
       activation: Object.freeze({ ...activation, state: current }),
       materializeTemplates,
@@ -364,6 +408,45 @@ function cognitionProgressFactory(
 }
 
 
+function cognitionCompletionFactory(
+  workspaceRevision: number,
+  templateId: string,
+): CognitionWorkspaceCompletionFactoryV1 {
+  const state = Object.freeze({
+    version: 1 as const,
+    workspaceRevision,
+    activatedTemplateIds: [] as readonly string[],
+    requiredTemplateIds: [] as readonly string[],
+  });
+  return {
+    state,
+    update: (current) => {
+      const next = Object.freeze({
+        ...current,
+        workspaceRevision: current.workspaceRevision + 1,
+        activatedTemplateIds: Object.freeze([templateId]),
+      });
+      return {
+        state: next,
+        activation: Object.freeze({
+          point: "phase_entry" as const,
+          state: next,
+          newlyActivatedTemplateIds: Object.freeze([templateId]),
+          newlyRequiredTemplateIds: Object.freeze([]),
+        }),
+        accepted: true,
+        blockingRequiredTaskIds: Object.freeze([]),
+        materializeTemplates: Object.freeze([{
+          id: templateId,
+          required: false,
+          label: "Prepared cognition task",
+          description: "Must roll back with a post-preparation invalidation",
+        }]),
+      };
+    },
+  };
+}
+
 beforeEach(async () => {
   closeDatabase();
   initDatabase(":memory:");
@@ -371,6 +454,7 @@ beforeEach(async () => {
   seed();
 });
 afterEach(() => {
+  setWorkspaceMutationCommitBoundaryHookForTests();
   closeDatabase();
   if (artifactRoot) rmSync(artifactRoot, { recursive: true, force: true });
   artifactRoot = "";
@@ -656,6 +740,210 @@ describe("turn workspace validators and CAS operations", () => {
     expectWorkspaceError("capability_denied", () => readTurnWorkspaceSection(request));
   });
 
+  test("rejects every host/root mutation after durable Stop or deadline while preserving reads", () => {
+    for (const cause of ["stop", "deadline"] as const) {
+      const created = isolatedWorkspace(`global-write-fence-${cause}`);
+      const task = createWorkspaceTask({
+        ...hostContext(created.id, created.revision),
+        taskId: `global-write-fence-${cause}-task`,
+        title: "Existing root task",
+      });
+      const revision = created.revision + 1;
+      const turnId = workspaceTurnId(created.id);
+      if (cause === "stop") {
+        requestDormantTurnCancellation({ executionId: turnId, userId: USER, chatId: CHAT });
+      } else {
+        const crossedDeadline = Date.now() - 1;
+        getDb().query("UPDATE agent_turn_executions SET deadline_at = ? WHERE id = ? AND user_id = ?")
+          .run(crossedDeadline, turnId, USER);
+        expect(getDb().query(
+          "SELECT state, cancel_requested_at, deadline_at FROM agent_turn_executions WHERE id = ? AND user_id = ?",
+        ).get(turnId, USER)).toEqual({
+          state: "ASSEMBLE", cancel_requested_at: null, deadline_at: crossedDeadline,
+        });
+      }
+      expect(readTurnWorkspaceSection({
+        ...rootContext(created.id, revision), section: "summary", page: 0, pageSize: 10,
+      }).workspace.revision).toBe(revision);
+      const mutations = [
+        () => createWorkspaceTask({
+          ...hostContext(created.id, revision), taskId: `blocked-${cause}-task`, title: "Blocked task",
+        }),
+        () => submitWorkspaceRootResult({
+          ...rootContext(created.id, revision), taskId: task.id, summary: "Blocked root result", state: "completed",
+        }),
+        () => recordWorkspaceRecord({
+          ...rootContext(created.id, revision), kind: "finding", summary: "Blocked finding",
+          digest: "d".repeat(64), taskId: null,
+        }),
+        () => freezeWorkspaceForCompletionV1(hostContext(created.id, revision)),
+      ];
+      for (const mutate of mutations) expectWorkspaceError("workspace_frozen", mutate);
+      expect(getTurnWorkspace(rootContext(created.id, revision)).revision).toBe(revision);
+    }
+  });
+  test("commit-boundary refresh blocks Stop and deadline races across every mutation family", () => {
+    const families = ["task", "assignment", "submission", "record", "artifact", "cognition", "completion"] as const;
+    for (const cause of ["stop", "deadline"] as const) {
+      for (const family of families) {
+        const suffix = `${cause}-${family}`;
+        const created = isolatedWorkspace(`commit-boundary-${suffix}`);
+        const turnId = workspaceTurnId(created.id);
+        let revision = created.revision;
+        let mutate: () => unknown;
+        if (family === "task") {
+          mutate = () => createWorkspaceTask({
+            ...hostContext(created.id, revision), taskId: `commit-boundary-task-${suffix}`, title: "Blocked task",
+          });
+        } else if (family === "assignment") {
+          const task = createWorkspaceTask({
+            ...rootContext(created.id, revision), taskId: `commit-boundary-assignment-${suffix}`, title: "Assignment target",
+          });
+          revision += 1;
+          mutate = () => assignChildTasks({
+            ...hostContext(created.id, revision), assignments: [{ taskId: task.id, frameId: `blocked-frame-${suffix}` }],
+          });
+        } else if (family === "submission") {
+          const task = createWorkspaceTask({
+            ...rootContext(created.id, revision), taskId: `commit-boundary-submission-${suffix}`, title: "Submission target",
+          });
+          revision += 1;
+          mutate = () => submitWorkspaceRootResult({
+            ...rootContext(created.id, revision), taskId: task.id, summary: "Blocked submission", state: "completed",
+          });
+        } else if (family === "record") {
+          mutate = () => recordWorkspaceRecord({
+            ...rootContext(created.id, revision), kind: "finding", summary: "Blocked finding",
+            digest: createHash("sha256").update(suffix).digest("hex"), taskId: null,
+          });
+        } else if (family === "artifact") {
+          const creatorToken = `commit-boundary-creator-${suffix}`;
+          getDb().query(`INSERT INTO agent_artifact_blob_journal
+            (journal_id, blob_digest, user_id, turn_id, creator_token, fence_generation, staged_path, final_path, state, observed_identity, byte_count, digest)
+            SELECT ?, blob_digest, user_id, ?, ?, fence_generation, staged_path, final_path, state, observed_identity, byte_count, digest
+            FROM agent_artifact_blob_journal WHERE journal_id = ?`).run(`commit-boundary-journal-${suffix}`, turnId, creatorToken, "workspace-journal");
+          mutate = () => attachWorkspaceArtifactReference({
+            ...rootContext(created.id, revision), blobDigest: BLOB_DIGEST, byteCount: 3, mimeType: "text/plain",
+            provenance: "root", creatorToken, taskId: null,
+          });
+        } else if (family === "cognition") {
+          const taskId = `commit-boundary-cognition-${suffix}`;
+          const reservation = receiptReservation(created.id, `commit-boundary-cognition-receipt-${suffix}`, "create_task", turnId);
+          const factory = cognitionProgressFactory(taskId, "active", revision, [], reservation);
+          mutate = () => createWorkspaceTaskWithCognition({
+            ...rootContext(created.id, revision), taskId, title: "Blocked cognition task",
+            dependencyIds: [], assignedFrameId: null,
+          }, factory);
+        } else {
+          mutate = () => freezeWorkspaceForCompletionV1(hostContext(created.id, revision));
+        }
+        const snapshot = () => ({
+          workspace: getDb().query(
+            "SELECT state, revision, task_count, record_count, submission_count, artifact_count, byte_count FROM agent_turn_workspaces WHERE user_id = ? AND workspace_id = ?",
+          ).get(USER, created.id),
+          tasks: getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_tasks WHERE user_id = ? AND workspace_id = ?").get(USER, created.id),
+          submissions: getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_submissions WHERE user_id = ? AND workspace_id = ?").get(USER, created.id),
+          records: getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_records WHERE user_id = ? AND workspace_id = ?").get(USER, created.id),
+          artifacts: getDb().query("SELECT COUNT(*) AS count FROM agent_workspace_artifacts WHERE user_id = ? AND workspace_id = ?").get(USER, created.id),
+        });
+        const before = snapshot();
+        setWorkspaceMutationCommitBoundaryHookForTests(() => {
+          setWorkspaceMutationCommitBoundaryHookForTests();
+          if (cause === "stop") {
+            requestDormantTurnCancellation({ executionId: turnId, userId: USER, chatId: CHAT });
+          } else {
+            getDb().query("UPDATE agent_turn_executions SET deadline_at = ? WHERE id = ? AND user_id = ?")
+              .run(Date.now() - 1, turnId, USER);
+          }
+        });
+        expectWorkspaceError("workspace_frozen", mutate);
+        expect(snapshot()).toEqual(before);
+        expect(getDb().query(
+          "SELECT state, cancel_requested_at, deadline_at FROM agent_turn_executions WHERE id = ? AND user_id = ?",
+        ).get(turnId, USER)).toMatchObject(cause === "stop"
+          ? { state: "CANCELLED" }
+          : { state: "ASSEMBLE", cancel_requested_at: null });
+      }
+    }
+  });
+  test("cognition completion rolls back when preparation invalidates workspace writability", () => {
+    for (const cause of ["stop", "deadline", "ttl", "state"] as const) {
+      const created = isolatedWorkspace(`cognition-completion-prepare-${cause}`);
+      const turnId = workspaceTurnId(created.id);
+      const templateId = `prepared-template-${cause}`;
+      const frameId = `prepared-frame-${cause}`;
+      const childRead = {
+        ...boundedChildContext(created.id, created.revision, frameId, {
+          revision: 1,
+          allowed: ["read_section"],
+          maxOperationBytes: 131072,
+          maxOperations: 2,
+        }),
+        section: "summary" as const,
+        page: 0,
+        pageSize: 10,
+      };
+      const snapshot = () => ({
+        workspace: getDb().query(
+          "SELECT state, revision, frozen_at, expires_at, task_count, record_count, submission_count, artifact_count, byte_count FROM agent_turn_workspaces WHERE workspace_id = ? AND user_id = ?",
+        ).get(created.id, USER),
+        tasks: getDb().query(
+          "SELECT COUNT(*) AS count FROM agent_workspace_tasks WHERE workspace_id = ? AND user_id = ?",
+        ).get(created.id, USER),
+        cognitionTasks: getDb().query(
+          "SELECT COUNT(*) AS count FROM agent_workspace_tasks WHERE workspace_id = ? AND user_id = ? AND cognition_template_id IS NOT NULL",
+        ).get(created.id, USER),
+        execution: getDb().query(
+          "SELECT state, cas_revision, terminal_code, deadline_at FROM agent_turn_executions WHERE id = ? AND user_id = ?",
+        ).get(turnId, USER),
+        activeFrameCapabilities: getActiveFrameCapabilityCountForTests(),
+      });
+      const before = snapshot();
+      const factory = cognitionCompletionFactory(created.revision, templateId);
+      expectWorkspaceError("workspace_frozen", () => freezeWorkspaceForCompletionWithCognition(
+        hostContext(created.id, created.revision),
+        factory,
+        {
+          prepare: (candidate) => {
+            if (cause === "stop") {
+              requestDormantTurnCancellation({ executionId: turnId, userId: USER, chatId: CHAT });
+            } else if (cause === "deadline") {
+              getDb().query("UPDATE agent_turn_executions SET deadline_at = ? WHERE id = ? AND user_id = ?")
+                .run(Date.now() - 1, turnId, USER);
+            } else if (cause === "ttl") {
+              getDb().query("UPDATE agent_turn_workspaces SET expires_at = ? WHERE workspace_id = ? AND user_id = ?")
+                .run(Math.floor(Date.now() / 1000) - 1, created.id, USER);
+            } else {
+              getDb().query("UPDATE agent_turn_workspaces SET state = 'frozen', frozen_at = ? WHERE workspace_id = ? AND user_id = ?")
+                .run(Math.floor(Date.now() / 1000), created.id, USER);
+            }
+            return { candidate, bundle: Object.freeze({ cause }) };
+          },
+        },
+      ));
+      expect(snapshot()).toEqual(before);
+      expect(getDb().query(
+        "SELECT COUNT(*) AS count FROM agent_workspace_tasks WHERE workspace_id = ? AND cognition_template_id = ?",
+      ).get(created.id, templateId)).toEqual({ count: 0 });
+      expect(readTurnWorkspaceSection(childRead).workspace.revision).toBe(created.revision);
+      if (cause === "stop") {
+        requestDormantTurnCancellation({ executionId: turnId, userId: USER, chatId: CHAT });
+      } else if (cause === "deadline") {
+        getDb().query("UPDATE agent_turn_executions SET deadline_at = ? WHERE id = ? AND user_id = ?")
+          .run(Date.now() - 1, turnId, USER);
+      } else if (cause === "ttl") {
+        getDb().query("UPDATE agent_turn_workspaces SET expires_at = ? WHERE workspace_id = ? AND user_id = ?")
+          .run(Math.floor(Date.now() / 1000) - 1, created.id, USER);
+      } else {
+        getDb().query("UPDATE agent_turn_workspaces SET state = 'frozen', frozen_at = ? WHERE workspace_id = ? AND user_id = ?")
+          .run(Math.floor(Date.now() / 1000), created.id, USER);
+      }
+      getTurnWorkspace(rootContext(created.id, created.revision));
+      expect(getActiveFrameCapabilityCountForTests()).toBe(0);
+      expectWorkspaceError("capability_denied", () => readTurnWorkspaceSection(childRead));
+    }
+  });
+
   test("removes grants when the workspace expires", () => {
     const created = workspace("frame-expiry-cleanup");
     const frameId = "expiry-cleanup-frame";
@@ -701,7 +989,7 @@ describe("turn workspace validators and CAS operations", () => {
     ]) {
       const result = updateWorkspaceTaskProgressWithCognition(
         { ...childContext(created.id, revision), taskId: task.id, state: item.state, progress: 0.5 },
-        cognitionProgressFactory(task.id, item.transition, revision),
+        cognitionProgressFactory(task.id, item.transition, revision, [], receiptReservation(created.id, `cognition-progress-${item.transition}-${revision}`, "update_assigned_progress", "child-frame")),
       );
       expect(result.workspaceRevision).toBe(revision + 1);
       const row = getDb().query("SELECT state FROM agent_workspace_tasks WHERE task_id = ? AND workspace_id = ?").get(task.id, created.id) as { state: string } | null;
@@ -710,7 +998,7 @@ describe("turn workspace validators and CAS operations", () => {
     }
     expectWorkspaceError("invalid_state", () => updateWorkspaceTaskProgressWithCognition(
       { ...childContext(created.id, revision), taskId: task.id, state: "completed", progress: 1 },
-      cognitionProgressFactory(task.id, "completed", revision),
+      cognitionProgressFactory(task.id, "completed", revision, [], receiptReservation(created.id, "cognition-progress-invalid-completed", "update_assigned_progress", "child-frame")),
     ));
     expect(getDb().query("SELECT state FROM agent_workspace_tasks WHERE task_id = ? AND workspace_id = ?").get(task.id, created.id)).toEqual({ state: "pending" });
     expect(getTurnWorkspace(rootContext(created.id, revision)).revision).toBe(revision);
@@ -1141,7 +1429,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: cognitionSummary,
         state: "failed",
       },
-      cognitionProgressFactory(cognitionTask.id, "failed", cognition.revision + 1, [], "failed-summary-cognition"),
+      cognitionProgressFactory(cognitionTask.id, "failed", cognition.revision + 1, [], receiptReservation(cognition.id, "failed-summary-cognition", "submit_root_result", workspaceTurnId(cognition.id))),
     );
     expect(cognitionFailed.state.workspaceRevision).toBe(cognition.revision + 2);
     expect(getTurnWorkspace(rootContext(cognition.id, cognition.revision + 2)).usage.byteCount)
@@ -1165,7 +1453,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: cognitionSummary,
         state: "failed",
       },
-      cognitionProgressFactory(cognitionOverTask.id, "failed", cognitionOver.revision + 1, [], "failed-summary-cognition-over"),
+      cognitionProgressFactory(cognitionOverTask.id, "failed", cognitionOver.revision + 1, [], receiptReservation(cognitionOver.id, "failed-summary-cognition-over", "submit_root_result", workspaceTurnId(cognitionOver.id))),
     ));
     expect(getTurnWorkspace(rootContext(cognitionOver.id, cognitionOver.revision + 1)).usage.byteCount)
       .toBe(cognitionOverBefore);
@@ -1181,6 +1469,12 @@ describe("turn workspace validators and CAS operations", () => {
     });
     const completedSummary = "Cognition root completed";
     const completedOperationKey = "cognition-root-completed-operation";
+    const completedReservation = receiptReservation(
+      completed.id,
+      completedOperationKey,
+      "submit_root_result",
+      workspaceTurnId(completed.id),
+    );
     const completedFirst = submitWorkspaceRootResultWithCognition(
       {
         ...rootContext(completed.id, completed.revision + 1),
@@ -1188,7 +1482,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: completedSummary,
         state: "completed",
       },
-      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 1, [], completedOperationKey),
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 1, [], completedReservation),
     );
     const completedReplay = submitWorkspaceRootResultWithCognition(
       {
@@ -1197,12 +1491,27 @@ describe("turn workspace validators and CAS operations", () => {
         summary: completedSummary,
         state: "completed",
       },
-      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedOperationKey),
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedReservation),
     );
     expect(completedReplay.workspaceRevision).toBe(completedFirst.workspaceRevision);
     expect(completedReplay.state.workspaceRevision).toBe(completedFirst.state.workspaceRevision);
     expect(completedReplay.taskId).toBe(completedFirst.taskId);
     expect(completedReplay.transition).toBe(completedFirst.transition);
+    const completedOwner = {
+      operationKey: completedReservation.operationKey,
+      segmentId: completedReservation.segmentId,
+      logicalDispatch: completedReservation.logicalDispatch,
+      frameId: completedReservation.frameId,
+    };
+    expect(completedFirst).toMatchObject(completedOwner);
+    expect(completedReplay).toMatchObject(completedOwner);
+    expect(getDb().query(
+      "SELECT segment_id, logical_dispatch, frame_id FROM agent_work_workspace_receipts WHERE operation_key = ?",
+    ).get(completedOperationKey)).toEqual({
+      segment_id: completedReservation.segmentId,
+      logical_dispatch: completedReservation.logicalDispatch,
+      frame_id: completedReservation.frameId,
+    });
     expect(completedReplay.operationKey).toBe(completedOperationKey);
     expect(getDb().query("SELECT revision FROM agent_turn_workspaces WHERE workspace_id = ?").get(completed.id))
       .toEqual({ revision: completed.revision + 2 });
@@ -1217,7 +1526,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: "Different cognition root result",
         state: "completed",
       },
-      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedOperationKey),
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedReservation),
     ));
     expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResultWithCognition(
       {
@@ -1228,7 +1537,7 @@ describe("turn workspace validators and CAS operations", () => {
         retention: "turn_terminal",
         ttlSeconds: 10,
       },
-      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedOperationKey),
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], completedReservation),
     ));
     expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceRootResultWithCognition(
       {
@@ -1237,7 +1546,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: completedSummary,
         state: "completed",
       },
-      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], "different-cognition-root-operation"),
+      cognitionProgressFactory(completedTask.id, "completed", completed.revision + 2, [], receiptReservation(completed.id, "different-cognition-root-operation", "submit_root_result", workspaceTurnId(completed.id))),
     ));
 
     const failed = isolatedWorkspace("cognition-root-replay-failed");
@@ -1248,6 +1557,12 @@ describe("turn workspace validators and CAS operations", () => {
     });
     const failedSummary = "Cognition root failed";
     const failedOperationKey = "cognition-root-failed-operation";
+    const failedReservation = receiptReservation(
+      failed.id,
+      failedOperationKey,
+      "submit_root_result",
+      workspaceTurnId(failed.id),
+    );
     const failedFirst = submitWorkspaceRootResultWithCognition(
       {
         ...rootContext(failed.id, failed.revision + 1),
@@ -1255,7 +1570,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: failedSummary,
         state: "failed",
       },
-      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 1, [], failedOperationKey),
+      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 1, [], failedReservation),
     );
     const failedReplay = submitWorkspaceRootResultWithCognition(
       {
@@ -1264,7 +1579,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: failedSummary,
         state: "failed",
       },
-      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 2, [], failedOperationKey),
+      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 2, [], failedReservation),
     );
     expect(failedReplay.workspaceRevision).toBe(failedFirst.workspaceRevision);
     expect(failedReplay.state.workspaceRevision).toBe(failedFirst.state.workspaceRevision);
@@ -1284,7 +1599,7 @@ describe("turn workspace validators and CAS operations", () => {
         retention: "turn_terminal",
         ttlSeconds: 10,
       },
-      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 2, [], failedOperationKey),
+      cognitionProgressFactory(failedTask.id, "failed", failed.revision + 2, [], failedReservation),
     ));
   });
 
@@ -1302,7 +1617,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: "Failed root result",
         state: "failed",
       },
-      cognitionProgressFactory(failedTask.id, "completed", failed.revision + 1),
+      cognitionProgressFactory(failedTask.id, "completed", failed.revision + 1, [], receiptReservation(failed.id, "cognition-root-failed-invalid-completed", "submit_root_result", workspaceTurnId(failed.id))),
     ));
     expect(getDb().query("SELECT state, revision FROM agent_workspace_tasks WHERE task_id = ?").get(failedTask.id))
       .toEqual({ state: "active", revision: 0 });
@@ -1320,7 +1635,7 @@ describe("turn workspace validators and CAS operations", () => {
         summary: "Completed root result",
         state: "completed",
       },
-      cognitionProgressFactory(completedTask.id, "failed", completed.revision + 1),
+      cognitionProgressFactory(completedTask.id, "failed", completed.revision + 1, [], receiptReservation(completed.id, "cognition-root-completed-invalid-failed", "submit_root_result", workspaceTurnId(completed.id))),
     ));
     expect(getDb().query("SELECT state, revision FROM agent_workspace_tasks WHERE task_id = ?").get(completedTask.id))
       .toEqual({ state: "active", revision: 0 });
@@ -1347,13 +1662,14 @@ describe("turn workspace validators and CAS operations", () => {
         turnId: maxTurnId,
         workspaceId: created.id,
         actor: "root",
+        frameId: maxTurnId,
         expectedRevision: created.revision,
         taskId: "long-turn-root-task",
         title: "Long turn root task",
         dependencyIds: [],
         assignedFrameId: null,
       },
-      cognitionProgressFactory("long-turn-root-task", "active", created.revision, templates),
+      cognitionProgressFactory("long-turn-root-task", "active", created.revision, templates, receiptReservation(created.id, "long-turn-create-task", "create_task", maxTurnId)),
     );
     expect(result.materializedTaskIds).toHaveLength(templates.length);
     expect(new Set(result.materializedTaskIds).size).toBe(templates.length);
@@ -1422,6 +1738,12 @@ describe("turn workspace validators and CAS operations", () => {
       assignedFrameId: "cognition-child-settlement-frame",
     });
     const operationKey = "child-settlement-operation";
+    const settlementReservation = receiptReservation(
+      created.id,
+      operationKey,
+      "settle_child_task",
+      workspaceTurnId(created.id),
+    );
     const failed = settleWorkspaceChildTaskWithCognition(
       {
         ...hostContext(created.id, created.revision + 1),
@@ -1429,10 +1751,22 @@ describe("turn workspace validators and CAS operations", () => {
         assignedFrameId: "cognition-child-settlement-frame",
         state: "failed",
       },
-      cognitionProgressFactory(task.id, "failed", created.revision + 1, [], operationKey),
+      cognitionProgressFactory(task.id, "failed", created.revision + 1, [], settlementReservation),
     );
     expect(failed.workspaceRevision).toBe(created.revision + 2);
-    expect(failed.operationKey).toBe(operationKey);
+    expect(failed).toMatchObject({
+      operationKey,
+      segmentId: settlementReservation.segmentId,
+      logicalDispatch: settlementReservation.logicalDispatch,
+      frameId: settlementReservation.frameId,
+    });
+    expect(getDb().query(
+      "SELECT segment_id, logical_dispatch, frame_id FROM agent_work_workspace_receipts WHERE operation_key = ?",
+    ).get(operationKey)).toEqual({
+      segment_id: settlementReservation.segmentId,
+      logical_dispatch: settlementReservation.logicalDispatch,
+      frame_id: settlementReservation.frameId,
+    });
     expect(getDb().query("SELECT cas_owner FROM agent_workspace_tasks WHERE task_id = ?").get(task.id))
       .toEqual({ cas_owner: operationKey });
     expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTask({
@@ -1454,7 +1788,7 @@ describe("turn workspace validators and CAS operations", () => {
         state: "active",
         progress: 0.4,
       },
-      cognitionProgressFactory(task.id, "active", created.revision + 2),
+      cognitionProgressFactory(task.id, "active", created.revision + 2, [], receiptReservation(created.id, "settled-child-progress-rejected", "update_assigned_progress", "cognition-child-settlement-frame")),
     ));
     const replay = settleWorkspaceChildTaskWithCognition(
       {
@@ -1463,11 +1797,16 @@ describe("turn workspace validators and CAS operations", () => {
         assignedFrameId: "cognition-child-settlement-frame",
         state: "failed",
       },
-      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], operationKey),
+      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], settlementReservation),
     );
     expect(replay.workspaceRevision).toBe(created.revision + 2);
     expect(replay.state.workspaceRevision).toBe(created.revision + 2);
-    expect(replay.operationKey).toBe(operationKey);
+    expect(replay).toMatchObject({
+      operationKey,
+      segmentId: settlementReservation.segmentId,
+      logicalDispatch: settlementReservation.logicalDispatch,
+      frameId: settlementReservation.frameId,
+    });
     expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTaskWithCognition(
       {
         ...hostContext(created.id, created.revision + 2),
@@ -1475,7 +1814,7 @@ describe("turn workspace validators and CAS operations", () => {
         assignedFrameId: "cognition-child-settlement-frame",
         state: "failed",
       },
-      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], "different-settlement-operation"),
+      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], receiptReservation(created.id, "different-settlement-operation", "settle_child_task", workspaceTurnId(created.id))),
     ));
     expectWorkspaceError("child_confinement", () => settleWorkspaceChildTaskWithCognition(
       {
@@ -1484,7 +1823,7 @@ describe("turn workspace validators and CAS operations", () => {
         assignedFrameId: "different-settlement-frame",
         state: "failed",
       },
-      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], operationKey),
+      cognitionProgressFactory(task.id, "failed", created.revision + 2, [], settlementReservation),
     ));
     expectWorkspaceError("task_assignment_conflict", () => settleWorkspaceChildTaskWithCognition(
       {
@@ -1493,7 +1832,7 @@ describe("turn workspace validators and CAS operations", () => {
         assignedFrameId: "cognition-child-settlement-frame",
         state: "cancelled",
       },
-      cognitionProgressFactory(task.id, "cancelled", created.revision + 2, [], operationKey),
+      cognitionProgressFactory(task.id, "cancelled", created.revision + 2, [], settlementReservation),
     ));
   });
   test("normal and cognition child results cannot resurrect terminal host settlements", () => {
@@ -1594,7 +1933,7 @@ describe("turn workspace validators and CAS operations", () => {
         state: "active",
         progress: 0.4,
       },
-      cognitionProgressFactory(cognitionFailedTask.id, "active", cognitionFailed.revision + 2),
+      cognitionProgressFactory(cognitionFailedTask.id, "active", cognitionFailed.revision + 2, [], receiptReservation(cognitionFailed.id, "late-failed-progress", "update_assigned_progress", "cognition-result-after-failure-frame")),
     ));
     expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResultWithCognition(
       {
@@ -1604,7 +1943,7 @@ describe("turn workspace validators and CAS operations", () => {
         resultDigest: "c".repeat(64),
         byteCount: 1,
       },
-      cognitionProgressFactory(cognitionFailedTask.id, "completed", cognitionFailed.revision + 2),
+      cognitionProgressFactory(cognitionFailedTask.id, "completed", cognitionFailed.revision + 2, [], receiptReservation(cognitionFailed.id, "late-failed-result", "submit_child_result", "cognition-result-after-failure-frame")),
     ));
 
     const cognitionCancelled = isolatedWorkspace("cognition-result-after-cancellation");
@@ -1627,7 +1966,7 @@ describe("turn workspace validators and CAS operations", () => {
         state: "active",
         progress: 0.4,
       },
-      cognitionProgressFactory(cognitionCancelledTask.id, "active", cognitionCancelled.revision + 2),
+      cognitionProgressFactory(cognitionCancelledTask.id, "active", cognitionCancelled.revision + 2, [], receiptReservation(cognitionCancelled.id, "late-cancelled-progress", "update_assigned_progress", "cognition-result-after-cancellation-frame")),
     ));
     expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResultWithCognition(
       {
@@ -1637,7 +1976,7 @@ describe("turn workspace validators and CAS operations", () => {
         resultDigest: "d".repeat(64),
         byteCount: 1,
       },
-      cognitionProgressFactory(cognitionCancelledTask.id, "completed", cognitionCancelled.revision + 2),
+      cognitionProgressFactory(cognitionCancelledTask.id, "completed", cognitionCancelled.revision + 2, [], receiptReservation(cognitionCancelled.id, "late-cancelled-result", "submit_child_result", "cognition-result-after-cancellation-frame")),
     ));
     const cognitionCompleted = isolatedWorkspace("cognition-result-after-completion");
     const cognitionCompletedTask = createWorkspaceTask({
@@ -1655,7 +1994,7 @@ describe("turn workspace validators and CAS operations", () => {
         state: "active",
         progress: 0.4,
       },
-      cognitionProgressFactory(cognitionCompletedTask.id, "active", cognitionCompleted.revision + 1),
+      cognitionProgressFactory(cognitionCompletedTask.id, "active", cognitionCompleted.revision + 1, [], receiptReservation(cognitionCompleted.id, "late-completed-progress", "update_assigned_progress", "cognition-result-after-completion-frame")),
     ));
     expectWorkspaceError("task_assignment_conflict", () => submitWorkspaceChildResultWithCognition(
       {
@@ -1665,7 +2004,7 @@ describe("turn workspace validators and CAS operations", () => {
         resultDigest: "f".repeat(64),
         byteCount: 1,
       },
-      cognitionProgressFactory(cognitionCompletedTask.id, "completed", cognitionCompleted.revision + 1),
+      cognitionProgressFactory(cognitionCompletedTask.id, "completed", cognitionCompleted.revision + 1, [], receiptReservation(cognitionCompleted.id, "late-completed-result", "submit_child_result", "cognition-result-after-completion-frame")),
     ));
   });
   test("accepts a child submission, freezes atomically, and rejects later writes", () => {

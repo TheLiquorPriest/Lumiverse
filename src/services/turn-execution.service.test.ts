@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
 import {
   __testing,
   beginTurnCommit,
@@ -17,12 +18,39 @@ import {
   TURN_EXECUTION_RECONCILIATION,
   registerAgentTurnTerminalRecovery,
   requestDormantTurnCancellation,
+  requestActiveTurnCancellation,
   requestTurnCancellation,
   TURN_EXECUTION_PHASES,
   TURN_EXECUTION_TRANSITIONS,
   type TurnExecutionPhase,
 } from "./turn-execution.service";
 import { reconcileStartupState } from "./startup-recovery.service";
+import { repairAgentRunProjectionFromReceipt } from "./agent-run-projection.service";
+import type {
+  WorkAttemptBudgetV1,
+  WorkPhasePlanAuthorityV1,
+  WorkSegmentBudgetV1,
+  WorkSegmentContextV1,
+  WorkSegmentResumeEnvelopeV1,
+  WorkSegmentUsageV1,
+} from "../types/agent-work-segment";
+import { computeWorkSegmentContextDigestV1 } from "./agentic-work-phase.service";
+import {
+  closeAdmittedWorkSegmentWithoutDispatchTerminalV1,
+  commitWorkSegmentTransitionV1,
+  computeWorkPhasePlanDigestV1,
+  computeWorkSegmentResumeEnvelopeDigestV1,
+  computeWorkTransitionDecisionDigestV1,
+  createAndAdmitInitialWorkSegmentV1,
+  reserveWorkSegmentDispatchV1,
+  settleWorkSegmentDispatchV1,
+  startWorkSegmentDispatchV1,
+} from "./agentic-work-segment.repository";
+
+const WORK_SEGMENT_MIGRATION_SQL = readFileSync(
+  new URL("../db/migrations/135_agent_work_segments.sql", import.meta.url),
+  "utf8",
+);
 
 function createExecutionSchema(): Database {
   const db = new Database(":memory:");
@@ -63,6 +91,7 @@ function createExecutionSchema(): Database {
       commit_key TEXT NOT NULL UNIQUE,
       final_render_reservations_json TEXT NOT NULL,
       terminal_code TEXT,
+      terminal_event_id TEXT,
       retention TEXT NOT NULL,
       expires_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL,
@@ -116,6 +145,25 @@ function createTerminalRecoverySchema(db: Database): void {
       version INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(user_id, attempt_id)
+    )
+  `);
+  db.run(`
+    CREATE TABLE agent_run_audit_records (
+      record_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      record_kind TEXT NOT NULL,
+      event_id TEXT,
+      causal_parent_id TEXT,
+      host_sequence INTEGER NOT NULL,
+      occurred_at INTEGER NOT NULL,
+      late INTEGER NOT NULL DEFAULT 0,
+      payload_json TEXT NOT NULL,
+      byte_size INTEGER NOT NULL,
+      dedupe_key TEXT,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(user_id, attempt_id, dedupe_key)
     )
   `);
   db.run(`
@@ -185,20 +233,526 @@ function createTerminalRecoverySchema(db: Database): void {
     )
   `);
   db.query("INSERT INTO chats (id, user_id) VALUES (?, ?)").run("c1", "u1");
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_turn_workspaces (
+      workspace_id TEXT PRIMARY KEY,
+      turn_id TEXT NOT NULL,
+      execution_id TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      objective TEXT NOT NULL CHECK(length(objective) <= 65536),
+      constraints_json TEXT NOT NULL CHECK(length(constraints_json) <= 131072),
+      state TEXT NOT NULL CHECK(state IN ('active', 'frozen', 'expired')),
+      revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+      cas_owner TEXT,
+      cas_expires_at INTEGER,
+      operation_caps_json TEXT NOT NULL CHECK(length(operation_caps_json) <= 65536),
+      field_caps_json TEXT NOT NULL CHECK(length(field_caps_json) <= 65536),
+      retention TEXT NOT NULL CHECK(retention IN ('operational', 'turn_terminal', 'chat_lifetime')),
+      expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+      quota_tasks INTEGER NOT NULL CHECK(quota_tasks >= 0 AND quota_tasks <= 100000),
+      quota_records INTEGER NOT NULL CHECK(quota_records >= 0 AND quota_records <= 100000),
+      quota_submissions INTEGER NOT NULL CHECK(quota_submissions >= 0 AND quota_submissions <= 100000),
+      quota_artifacts INTEGER NOT NULL CHECK(quota_artifacts >= 0 AND quota_artifacts <= 100000),
+      quota_bytes INTEGER NOT NULL CHECK(quota_bytes >= 0 AND quota_bytes <= 2147483648),
+      task_count INTEGER NOT NULL DEFAULT 0 CHECK(task_count >= 0 AND task_count <= quota_tasks),
+      record_count INTEGER NOT NULL DEFAULT 0 CHECK(record_count >= 0 AND record_count <= quota_records),
+      submission_count INTEGER NOT NULL DEFAULT 0 CHECK(submission_count >= 0 AND submission_count <= quota_submissions),
+      artifact_count INTEGER NOT NULL DEFAULT 0 CHECK(artifact_count >= 0 AND artifact_count <= quota_artifacts),
+      byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count >= 0 AND byte_count <= quota_bytes),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      frozen_at INTEGER,
+      UNIQUE(user_id, workspace_id),
+      UNIQUE(user_id, turn_id),
+      UNIQUE(user_id, execution_id),
+      FOREIGN KEY (user_id, chat_id) REFERENCES chats(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_id) REFERENCES agent_turn_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (execution_id) REFERENCES agent_turn_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, turn_id) REFERENCES agent_turn_executions(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, execution_id) REFERENCES agent_turn_executions(user_id, id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_agent_turn_workspaces_expiry
+      ON agent_turn_workspaces(user_id, state, expires_at)
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_workspace_tasks (
+      task_id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 4096),
+      description TEXT NOT NULL DEFAULT '' CHECK(length(description) <= 65536),
+      state TEXT NOT NULL CHECK(state IN ('pending', 'active', 'blocked', 'completed', 'cancelled', 'failed')),
+      required INTEGER NOT NULL DEFAULT 0 CHECK(required IN (0, 1)),
+      dependencies_json TEXT NOT NULL DEFAULT '[]' CHECK(length(dependencies_json) <= 65536),
+      assigned_frame_id TEXT,
+      progress REAL NOT NULL DEFAULT 0 CHECK(progress >= 0 AND progress <= 1),
+      summary TEXT CHECK(summary IS NULL OR length(summary) <= 65536),
+      byte_count INTEGER NOT NULL DEFAULT 0 CHECK(byte_count >= 0 AND byte_count <= 131072),
+      revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+      cas_owner TEXT,
+      cas_expires_at INTEGER,
+      retention TEXT NOT NULL CHECK(retention IN ('operational', 'turn_terminal', 'chat_lifetime')),
+      expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE(user_id, task_id),
+      FOREIGN KEY (workspace_id) REFERENCES agent_turn_workspaces(workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_id) REFERENCES agent_turn_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, workspace_id) REFERENCES agent_turn_workspaces(user_id, workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, turn_id) REFERENCES agent_turn_executions(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, chat_id) REFERENCES chats(user_id, id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_agent_workspace_tasks_state
+      ON agent_workspace_tasks(user_id, workspace_id, state, updated_at)
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_workspace_records (
+      record_id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK(kind IN ('finding', 'decision', 'question')),
+      summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 65536),
+      digest TEXT NOT NULL CHECK(length(digest) = 64 AND digest GLOB '[0-9a-fA-F]*'),
+      task_id TEXT,
+      source_frame_id TEXT,
+      byte_count INTEGER NOT NULL CHECK(byte_count >= 0 AND byte_count <= 131072),
+      revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+      retention TEXT NOT NULL CHECK(retention IN ('operational', 'turn_terminal', 'chat_lifetime')),
+      expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE(user_id, record_id),
+      UNIQUE(workspace_id, kind, digest),
+      FOREIGN KEY (workspace_id) REFERENCES agent_turn_workspaces(workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_id) REFERENCES agent_turn_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, workspace_id) REFERENCES agent_turn_workspaces(user_id, workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, turn_id) REFERENCES agent_turn_executions(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, chat_id) REFERENCES chats(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, task_id) REFERENCES agent_workspace_tasks(user_id, task_id) ON DELETE RESTRICT
+    )
+  `);
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_agent_workspace_records_kind
+      ON agent_workspace_records(user_id, workspace_id, kind, created_at)
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_workspace_submissions (
+      submission_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      child_frame_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('submitted', 'accepted', 'rejected')),
+      summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 65536),
+      result_digest TEXT NOT NULL CHECK(length(result_digest) = 64 AND result_digest GLOB '[0-9a-fA-F]*'),
+      byte_count INTEGER NOT NULL CHECK(byte_count >= 0 AND byte_count <= 131072),
+      revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+      retention TEXT NOT NULL CHECK(retention IN ('operational', 'turn_terminal', 'chat_lifetime')),
+      expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE(user_id, submission_id),
+      UNIQUE(task_id, child_frame_id),
+      FOREIGN KEY (workspace_id) REFERENCES agent_turn_workspaces(workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_id) REFERENCES agent_turn_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, workspace_id) REFERENCES agent_turn_workspaces(user_id, workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, turn_id) REFERENCES agent_turn_executions(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, chat_id) REFERENCES chats(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, task_id) REFERENCES agent_workspace_tasks(user_id, task_id) ON DELETE CASCADE
+    )
+  `);
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_agent_workspace_submissions_state
+      ON agent_workspace_submissions(user_id, workspace_id, state, updated_at)
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS agent_workspace_artifacts (
+      artifact_id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+      chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      blob_digest TEXT NOT NULL,
+      mime_type TEXT NOT NULL CHECK(length(mime_type) BETWEEN 1 AND 255),
+      byte_count INTEGER NOT NULL CHECK(byte_count >= 0 AND byte_count <= 2147483648),
+      provenance_json TEXT NOT NULL CHECK(length(provenance_json) <= 65536),
+      source_frame_id TEXT,
+      source_task_id TEXT,
+      publication_state TEXT NOT NULL CHECK(publication_state IN ('attached', 'proposed', 'published')),
+      retention TEXT NOT NULL CHECK(retention IN ('operational', 'turn_terminal', 'chat_lifetime')),
+      revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+      expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE(user_id, artifact_id),
+      UNIQUE(workspace_id, blob_digest),
+      FOREIGN KEY (workspace_id) REFERENCES agent_turn_workspaces(workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (turn_id) REFERENCES agent_turn_executions(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, workspace_id) REFERENCES agent_turn_workspaces(user_id, workspace_id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, turn_id) REFERENCES agent_turn_executions(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, chat_id) REFERENCES chats(user_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id, source_task_id) REFERENCES agent_workspace_tasks(user_id, task_id) ON DELETE RESTRICT
+    )
+  `);
+  db.run(`
+    CREATE INDEX IF NOT EXISTS idx_agent_workspace_artifacts_publication
+      ON agent_workspace_artifacts(user_id, workspace_id, publication_state, updated_at)
+  `);
 }
+function createWorkSegmentRecoverySchema(db: Database): void {
+  db.run(WORK_SEGMENT_MIGRATION_SQL);
+}
+
+type ClosedWorkSegmentCrashResult = "work_complete" | "failed" | "exhausted" | "cancelled";
+type ExecutionFixtureRecord = NonNullable<ReturnType<typeof getTurnExecution>>;
+
+const WORK_FIXTURE_DIGEST_A = "a".repeat(64);
+const WORK_FIXTURE_DIGEST_B = "b".repeat(64);
+const WORK_FIXTURE_DIGEST_C = "c".repeat(64);
+const WORK_FIXTURE_PHASE_PLAN = Object.freeze({
+  version: 1,
+  phases: Object.freeze([Object.freeze({
+    id: "execute",
+    index: 0,
+    required: true,
+    nextPhaseIds: Object.freeze([]),
+    repeatLimit: 0,
+    transitionAuthorityDigest: WORK_FIXTURE_DIGEST_A,
+    skipEligibilityDigest: null,
+  })]),
+}) satisfies WorkPhasePlanAuthorityV1;
+const WORK_FIXTURE_PHASE_PLAN_DIGEST = computeWorkPhasePlanDigestV1(WORK_FIXTURE_PHASE_PLAN);
+const WORK_FIXTURE_ATTEMPT_BUDGET = Object.freeze({
+  maxSegments: 2,
+  maxProviderDispatches: 2,
+  maxProviderOutputTokens: 100,
+  maxOutputTokensPerDispatch: 50,
+  maxUnsignedBoundaries: 2,
+  maxToolCalls: 2,
+  maxWorkspaceOperations: 2,
+  recoveryReserveOutputTokens: 10,
+  futurePhaseReserveOutputTokens: 0,
+}) satisfies WorkAttemptBudgetV1;
+const WORK_FIXTURE_SEGMENT_BUDGET = Object.freeze({
+  maxProviderDispatches: 2,
+  maxProviderOutputTokens: 50,
+  maxOutputTokensPerDispatch: 25,
+  maxUnsignedBoundaries: 2,
+  maxToolCalls: 2,
+  maxWorkspaceOperations: 2,
+}) satisfies WorkSegmentBudgetV1;
+const WORK_FIXTURE_USAGE = Object.freeze({
+  providerDispatches: 1,
+  providerInputTokens: 10,
+  providerOutputTokens: 5,
+  providerTotalTokens: 15,
+  billedOutputTokens: 5,
+  toolCalls: 0,
+  workspaceOperations: 0,
+  unsignedBoundaries: 1,
+  receiveBytes: 100,
+  publishedOutputBytes: 0,
+}) satisfies WorkSegmentUsageV1;
+
+function workFixtureResumeEnvelope(execution: ExecutionFixtureRecord): WorkSegmentResumeEnvelopeV1 {
+  if (!execution.workspaceId) throw new Error("test WORK workspace authority is unavailable");
+  const withoutDigest: Omit<WorkSegmentResumeEnvelopeV1, "envelopeDigest"> = Object.freeze({
+    version: 1,
+    snapshotDigest: WORK_FIXTURE_DIGEST_A,
+    planDigest: WORK_FIXTURE_DIGEST_B,
+    toolCatalogSchemaVersion: 1,
+    toolCatalogDigest: WORK_FIXTURE_DIGEST_C,
+    configRevision: 1,
+    authoredRootToolIds: Object.freeze([]),
+    authoredChildToolIds: Object.freeze({}),
+    snapshot: Object.freeze({ snapshotId: execution.id + ":snapshot" }),
+    plan: Object.freeze({ version: 1 }),
+    rootConnection: Object.freeze({
+      logicalId: "root",
+      concreteId: "fixture-connection",
+      label: "Fixture Connection",
+      provider: "fixture",
+      model: "fixture-model",
+      effectiveEndpoint: "https://example.invalid",
+      endpointRevision: 1,
+      credentialSecretRef: "fixture-credential-ref",
+      credentialRevision: 1,
+      candidateRevision: 1,
+      capabilities: Object.freeze({ toolCalls: true }),
+      capabilityDigest: WORK_FIXTURE_DIGEST_A,
+      fingerprint: WORK_FIXTURE_DIGEST_B,
+    }),
+    childConnections: Object.freeze({}),
+    generationParameters: null,
+    resumeInput: Object.freeze({
+      userId: execution.userId,
+      chatId: execution.chatId,
+      generationType: execution.targetKind,
+    }),
+    decisionAuthority: Object.freeze({ bindingDigest: WORK_FIXTURE_DIGEST_A }),
+    liveTargetBinding: Object.freeze({
+      targetDigest: WORK_FIXTURE_DIGEST_A,
+      inputRevisionDigest: WORK_FIXTURE_DIGEST_B,
+    }),
+    runtime: Object.freeze({
+      deadlineAt: execution.deadlineAt,
+      rootFrameId: execution.id,
+      workspaceId: execution.workspaceId,
+      workspaceRevision: execution.workspaceRevision,
+      ownerLimits: Object.freeze({ providerDispatches: 2 }),
+      workspaceRetention: "turn_terminal",
+      workspaceSharing: "root_only",
+    }),
+  });
+  return Object.freeze({
+    ...withoutDigest,
+    envelopeDigest: computeWorkSegmentResumeEnvelopeDigestV1(withoutDigest),
+  });
+}
+
+function workFixtureContext(
+  execution: ExecutionFixtureRecord,
+  resumeEnvelope: WorkSegmentResumeEnvelopeV1,
+): WorkSegmentContextV1 {
+  if (!execution.workspaceId) throw new Error("test WORK workspace authority is unavailable");
+  const withoutDigest: Omit<WorkSegmentContextV1, "contextDigest"> = Object.freeze({
+    version: 1,
+    bindingDigest: WORK_FIXTURE_DIGEST_C,
+    resumeEnvelopeDigest: resumeEnvelope.envelopeDigest,
+    phasePlanDigest: WORK_FIXTURE_PHASE_PLAN_DIGEST,
+    protocolDigest: WORK_FIXTURE_DIGEST_A,
+    capabilityDigest: WORK_FIXTURE_DIGEST_B,
+    phaseCapabilityDigest: WORK_FIXTURE_DIGEST_C,
+    rootObjective: "test objective",
+    rootSnapshotId: execution.id + ":snapshot",
+    rootSnapshotDigest: WORK_FIXTURE_DIGEST_A,
+    phase: Object.freeze({
+      id: "execute",
+      index: 0,
+      occurrence: 0,
+      instructions: Object.freeze(["execute"]),
+      completionCriteria: Object.freeze(["complete"]),
+      admittedCapabilities: Object.freeze([]),
+    }),
+    workspace: Object.freeze({
+      id: execution.workspaceId,
+      revision: execution.workspaceRevision,
+      acceptedRecords: Object.freeze([]),
+      openRequiredIds: Object.freeze([]),
+    }),
+    previousHandoff: null,
+    attemptBudget: WORK_FIXTURE_ATTEMPT_BUDGET,
+    segmentBudget: WORK_FIXTURE_SEGMENT_BUDGET,
+    protocol: Object.freeze({
+      completeTurnCallMode: "standalone_only",
+      requiredToolModeAvailable: true,
+    }),
+  });
+  return Object.freeze({
+    ...withoutDigest,
+    contextDigest: computeWorkSegmentContextDigestV1(withoutDigest),
+  });
+}
+
+function seedClosedWorkSegmentCrash(
+  db: Database,
+  executionId: string,
+  closeResult: ClosedWorkSegmentCrashResult,
+  closeReason = closeResult === "work_complete" ? "transition:terminal" : "closed:" + closeResult,
+): void {
+  const execution = getTurnExecution(executionId, "u1", db);
+  if (!execution || execution.phase !== "WORK" || !execution.workspaceId || !execution.casOwner) {
+    throw new Error("test WORK execution authority is unavailable");
+  }
+  const now = Date.now();
+  const attemptId = execution.attemptLineage.attemptId;
+  db.query(`INSERT INTO agent_run_attempts (
+      user_id, chat_id, attempt_id, previous_attempt_id, run_id, turn_id,
+      generation_id, generation_type, target_message_id, target_swipe_id,
+      lifecycle, status, outcome, reason, terminal, started_at, updated_at,
+      terminal_at, host_correlation_id, reconciliation_state, terminal_receipt_json
+    ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, 'WORK', 'running', NULL,
+              'running', 0, ?, ?, NULL, ?, 'authoritative', NULL)`).run(
+    execution.userId,
+    execution.chatId,
+    attemptId,
+    execution.generationId,
+    execution.id,
+    execution.generationId,
+    execution.targetKind,
+    execution.createdAt,
+    now,
+    "agentic:" + execution.id + ":" + attemptId,
+  );
+  const resumeEnvelope = workFixtureResumeEnvelope(execution);
+  const context = workFixtureContext(execution, resumeEnvelope);
+  const authority = Object.freeze({
+    userId: execution.userId,
+    executionId: execution.id,
+    ownerToken: execution.casOwner,
+    expectedExecutionCasRevision: execution.casRevision,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+    now,
+    attemptId,
+    workspaceId: execution.workspaceId,
+  });
+  const admitted = createAndAdmitInitialWorkSegmentV1({
+    db,
+    attempt: {
+      ...authority,
+      phaseId: "execute",
+      phaseIndex: 0,
+      phaseOccurrence: 0,
+      remainingRequiredPhaseCount: 0,
+      snapshotDigest: WORK_FIXTURE_DIGEST_A,
+      phasePlanDigest: WORK_FIXTURE_PHASE_PLAN_DIGEST,
+      phasePlan: WORK_FIXTURE_PHASE_PLAN,
+      bindingDigest: WORK_FIXTURE_DIGEST_C,
+      idempotencyKey: execution.id + ":attempt",
+      resumeEnvelope,
+      budget: WORK_FIXTURE_ATTEMPT_BUDGET,
+    },
+    admission: {
+      ...authority,
+      sourceTransitionId: null,
+      phaseId: "execute",
+      phaseIndex: 0,
+      phaseOccurrence: 0,
+      segmentOrdinal: 0,
+      admissionKey: execution.id + ":segment:0",
+      contextDigest: context.contextDigest,
+      context,
+      budget: WORK_FIXTURE_SEGMENT_BUDGET,
+    },
+  }).admission.record;
+  if (closeResult !== "work_complete") {
+    closeAdmittedWorkSegmentWithoutDispatchTerminalV1({
+      db,
+      ...authority,
+      now: now + 1,
+      sourceSegmentId: admitted.identity.segmentId,
+      idempotencyKey: execution.id + ":terminal-close",
+      closeResult,
+      closeReason,
+    });
+    return;
+  }
+
+  const leaseOwner = execution.id + ":dispatch-owner";
+  const dispatch = reserveWorkSegmentDispatchV1({
+    db,
+    ...authority,
+    now: now + 1,
+    segmentId: admitted.identity.segmentId,
+    dispatchOrdinal: 0,
+    idempotencyKey: execution.id + ":dispatch:0",
+    toolMode: "ordinary",
+    budgetClass: "normal",
+    reservedOutputTokens: 20,
+    leaseOwner,
+    leaseExpiresAt: now + 10_000,
+  }).record;
+  startWorkSegmentDispatchV1({
+    db,
+    ...authority,
+    now: now + 2,
+    segmentId: admitted.identity.segmentId,
+    dispatchId: dispatch.dispatchId,
+    leaseOwner,
+    fenceGeneration: dispatch.fenceGeneration,
+  });
+  settleWorkSegmentDispatchV1({
+    db,
+    ...authority,
+    now: now + 3,
+    segmentId: admitted.identity.segmentId,
+    dispatchId: dispatch.dispatchId,
+    leaseOwner,
+    fenceGeneration: dispatch.fenceGeneration,
+    settlementKey: execution.id + ":settlement:0",
+    boundaryClass: "tool_free_stop",
+    usage: WORK_FIXTURE_USAGE,
+    workspaceMutations: [],
+  });
+  const terminalTarget = Object.freeze({
+    targetPhaseId: null,
+    targetPhaseIndex: null,
+    targetPhaseOccurrence: null,
+    targetSegmentOrdinal: null,
+  });
+  commitWorkSegmentTransitionV1({
+    db,
+    ...authority,
+    now: now + 4,
+    sourceSegmentId: admitted.identity.segmentId,
+    phasePlanDigest: WORK_FIXTURE_PHASE_PLAN_DIGEST,
+    transitionDecisionDigest: computeWorkTransitionDecisionDigestV1({
+      phasePlanDigest: WORK_FIXTURE_PHASE_PLAN_DIGEST,
+      source: admitted.identity,
+      transitionKind: "terminal",
+      ...terminalTarget,
+    }),
+    idempotencyKey: execution.id + ":transition:terminal",
+    transitionKind: "terminal",
+    ...terminalTarget,
+    remainingRequiredPhaseCount: 0,
+    boundaryClass: "tool_free_stop",
+    closeResult: "work_complete",
+    usage: WORK_FIXTURE_USAGE,
+    completion: {
+      summary: "Work completed before the simulated process interruption.",
+      unresolvedIds: [],
+      renderGuidance: null,
+    },
+  });
+}
+
 function newExecution(db: Database, id: string, deadlineAt = Date.now() + 60_000) {
-  return createTurnExecution({
+  const created = createTurnExecution({
     id,
     userId: "u1",
     chatId: "c1",
-    generationId: `${id}-generation`,
+    generationId: id + "-generation",
     target: "normal",
     targetChatRevision: 0,
     mode: "agentic",
-    workspaceId: "ws1",
+    workspaceId: id + "-workspace",
     deadlineAt,
     expiresAt: deadlineAt + 60_000,
   }, db);
+  const workspaceSchema = db.query(
+    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'agent_turn_workspaces' LIMIT 1",
+  ).get() as { present: number } | null;
+  if (workspaceSchema) {
+    const workspaceId = created.execution.workspaceId;
+    if (!workspaceId) throw new Error("execution fixture workspace identity is unavailable");
+    db.query(`INSERT INTO agent_turn_workspaces
+      (workspace_id, turn_id, execution_id, user_id, chat_id, objective,
+       constraints_json, state, revision, operation_caps_json, field_caps_json,
+       retention, expires_at, quota_tasks, quota_records, quota_submissions,
+       quota_artifacts, quota_bytes)
+      VALUES (?, ?, ?, ?, ?, 'test objective', '[]', 'active', ?, '{}', '{}',
+              'turn_terminal', ?, 10, 10, 10, 10, 1000000)`).run(
+      workspaceId,
+      created.execution.id,
+      created.execution.id,
+      created.execution.userId,
+      created.execution.chatId,
+      created.execution.workspaceRevision,
+      deadlineAt + 60_000,
+    );
+  }
+  return created;
 }
 
 function seedLegacyStaleDecisionTerminal(
@@ -404,6 +958,10 @@ function replayStartupTurnReconciliation(db: Database) {
       quarantined: 0,
       bytesRemoved: 0,
     }),
+    reconcileWorkSegmentRecovery: () => ({
+      scanned: 0, active: 0, closed: 0, queued: 0, reclaimed: 0, fenced: 0, terminalized: 0,
+      complete: true, healthy: true,
+    }),
     reconcileAgentTurns: (startupDb) => reconcileAgentTurns(startupDb),
     reconcileAgentRunProjections: () => ({
       inspectedProjections: 0,
@@ -497,6 +1055,30 @@ describe("closed transition contract", () => {
       expectedRevision: 0,
     })).toThrow("stale_execution");
   });
+
+  test("counts only the CAS row when an UPDATE trigger writes audit evidence", () => {
+    db.run("CREATE TABLE cas_trigger_audit (execution_id TEXT NOT NULL, state TEXT NOT NULL)");
+    db.run(`CREATE TRIGGER cas_state_audit
+      AFTER UPDATE OF state ON agent_turn_executions
+      BEGIN
+        INSERT INTO cas_trigger_audit (execution_id, state) VALUES (NEW.id, NEW.state);
+      END`);
+    const created = newExecution(db, "cas-trigger-audit");
+
+    const transitioned = transition(
+      db,
+      created.execution.id,
+      created.ownerToken,
+      "ASSEMBLE",
+      "WORK",
+    );
+
+    expect(transitioned.execution).toMatchObject({ phase: "WORK", casRevision: 1 });
+    expect(db.query("SELECT execution_id, state FROM cas_trigger_audit").get()).toEqual({
+      execution_id: created.execution.id,
+      state: "WORK",
+    });
+  });
 });
 
 describe("final render reservation envelope", () => {
@@ -548,6 +1130,15 @@ describe("final render reservation envelope", () => {
 });
 
 describe("control races and terminal ownership", () => {
+  test("bounds the initial owner lease to the root deadline", () => {
+    const deadlineAt = Date.now() + 1_000;
+    const created = newExecution(db, "initial-owner-lease-deadline", deadlineAt);
+    const authority = db.query(
+      "SELECT deadline_at, cas_expires_at FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id) as { deadline_at: number; cas_expires_at: number };
+    expect(authority).toEqual({ deadline_at: deadlineAt, cas_expires_at: deadlineAt });
+  });
+
   test("cancellation wins in a reversible phase and deadline wins at its CAS", () => {
     const cancelled = newExecution(db, "cancel");
     const cancellation = requestTurnCancellation({ db, executionId: "cancel", ownerToken: cancelled.ownerToken });
@@ -557,6 +1148,1068 @@ describe("control races and terminal ownership", () => {
     const timedOut = newExecution(db, "deadline", 10);
     const timeoutResult = transition(db, "deadline", timedOut.ownerToken, "ASSEMBLE", "WORK");
     expect(timeoutResult.execution.state).toBe("TIMED_OUT");
+  });
+
+  test("self-emitted direct cancellation canonicalizes its durable marker reason", () => {
+    const settlementAt = Date.now();
+    const created = newExecution(db, "self-emitted-canonical-stop", settlementAt + 60_000);
+    const result = requestTurnCancellation({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      reason: "operator_requested_stop",
+      now: settlementAt,
+    });
+    expect(result).toMatchObject({
+      code: "cancelled",
+      execution: {
+        phase: "CANCELLED",
+        terminalCode: "cancelled",
+        cancelRequestedAt: settlementAt,
+        casRevision: created.execution.casRevision + 1,
+      },
+    });
+    expect(db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id)).toEqual({
+      state: "CANCELLED",
+      terminal_code: "cancelled",
+      cancel_requested_at: settlementAt,
+      terminal_at: settlementAt,
+      updated_at: settlementAt,
+      cas_revision: created.execution.casRevision + 1,
+    });
+  });
+  test("live WORK cancellation retains owner/CAS until the requested terminal cause is applied", () => {
+    const stopped = newExecution(db, "active-stop", Date.now() + 60_000);
+    const working = transition(db, "active-stop", stopped.ownerToken, "ASSEMBLE", "WORK").execution;
+    const authorityQuery = db.query(
+      "SELECT state, cas_owner, cas_expires_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    );
+    const authorityBefore = authorityQuery.get(working.id);
+    const requested = requestActiveTurnCancellation({
+      db,
+      executionId: working.id,
+      ownerToken: stopped.ownerToken,
+      reason: "stopped",
+    });
+    expect(requested).toMatchObject({
+      code: "cancelled",
+      execution: {
+        phase: "WORK",
+        cancelRequested: true,
+        casOwner: working.casOwner,
+        casRevision: working.casRevision,
+      },
+    });
+    expect(authorityQuery.get(working.id)).toEqual(authorityBefore);
+    const markerAt = requested.execution.cancelRequestedAt;
+    expect(requestActiveTurnCancellation({
+      db,
+      executionId: working.id,
+      ownerToken: stopped.ownerToken,
+      reason: "stopped",
+      now: stopped.execution.deadlineAt + 1,
+    })).toMatchObject({
+      code: "cancelled",
+      execution: { cancelRequestedAt: markerAt, casRevision: working.casRevision },
+    });
+    expect(transitionTurnExecution({
+      db,
+      executionId: working.id,
+      ownerToken: stopped.ownerToken,
+      expectedPhase: "WORK",
+      nextPhase: "TIMED_OUT",
+      now: stopped.execution.deadlineAt + 1,
+    }).execution).toMatchObject({
+      phase: "CANCELLED",
+      casOwner: null,
+    });
+
+    const deadlineAt = Date.now() + 60_000;
+    const overdue = newExecution(db, "active-stop-after-deadline", deadlineAt);
+    const overdueWorking = transition(
+      db,
+      "active-stop-after-deadline",
+      overdue.ownerToken,
+      "ASSEMBLE",
+      "WORK",
+    ).execution;
+    const timeoutRequested = requestActiveTurnCancellation({
+      db,
+      executionId: overdueWorking.id,
+      ownerToken: overdue.ownerToken,
+      reason: "stopped",
+      now: deadlineAt,
+    });
+    expect(timeoutRequested).toMatchObject({
+      code: "timed_out",
+      execution: {
+        phase: "WORK",
+        cancelRequested: true,
+        casOwner: overdueWorking.casOwner,
+        casRevision: overdueWorking.casRevision,
+      },
+    });
+    expect(transitionTurnExecution({
+      db,
+      executionId: overdueWorking.id,
+      ownerToken: overdue.ownerToken,
+      expectedPhase: "WORK",
+      nextPhase: "TIMED_OUT",
+      now: deadlineAt,
+    }).execution).toMatchObject({ phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded" });
+  });
+
+  test("canonicalizes matching marked terminal phases despite caller reasons", () => {
+    const stopCreated = newExecution(db, "matching-stop-reason", Date.now() + 60_000);
+    const stopWorking = transition(
+      db, stopCreated.execution.id, stopCreated.ownerToken, "ASSEMBLE", "WORK",
+    ).execution;
+    requestActiveTurnCancellation({
+      db, executionId: stopWorking.id, ownerToken: stopCreated.ownerToken, reason: "stopped",
+    });
+    expect(transitionTurnExecution({
+      db, executionId: stopWorking.id, ownerToken: stopCreated.ownerToken, expectedPhase: "WORK",
+      nextPhase: "CANCELLED", reason: "agentic_cancelled",
+    }).execution).toMatchObject({ phase: "CANCELLED", terminalCode: "cancelled" });
+
+    const deadlineAt = Date.now() + 60_000;
+    const timeoutCreated = newExecution(db, "matching-timeout-reason", deadlineAt);
+    const timeoutWorking = transition(
+      db, timeoutCreated.execution.id, timeoutCreated.ownerToken, "ASSEMBLE", "WORK",
+    ).execution;
+    requestActiveTurnCancellation({
+      db, executionId: timeoutWorking.id, ownerToken: timeoutCreated.ownerToken,
+      reason: "timed_out", now: deadlineAt - 1,
+    });
+    expect(transitionTurnExecution({
+      db, executionId: timeoutWorking.id, ownerToken: timeoutCreated.ownerToken, expectedPhase: "WORK",
+      nextPhase: "TIMED_OUT", reason: "agentic_timed_out", now: deadlineAt,
+    }).execution).toMatchObject({
+      phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded",
+    });
+    expect(db.query(
+      "SELECT id, terminal_code FROM agent_turn_executions WHERE id IN (?, ?) ORDER BY id",
+    ).all(stopWorking.id, timeoutWorking.id)).toEqual([
+      { id: stopWorking.id, terminal_code: "cancelled" },
+      { id: timeoutWorking.id, terminal_code: "root_wall_clock_limit_exceeded" },
+    ]);
+  });
+  test("a Stop or timeout marker accepted between transition read and UPDATE wins the fenced CAS", () => {
+    for (const cause of ["stop", "timeout"] as const) {
+      const deadlineAt = Date.now() + 60_000;
+      const created = newExecution(db, `transition-marker-race-${cause}`, deadlineAt);
+      const working = transition(
+        db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK",
+      ).execution;
+      let injected = false;
+      let acceptedCode: string | undefined;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"state" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  acceptedCode = requestActiveTurnCancellation({
+                    db: target,
+                    executionId: working.id,
+                    ownerToken: created.ownerToken,
+                    reason: cause === "stop" ? "stopped" : "timed_out",
+                    ...(cause === "timeout" ? { now: deadlineAt } : {}),
+                  }).code;
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const result = transitionTurnExecution({
+        db: competingDb,
+        executionId: working.id,
+        ownerToken: created.ownerToken,
+        expectedPhase: "WORK",
+        nextPhase: "COMPLETE",
+        now: deadlineAt - 1,
+      });
+      expect(injected).toBe(true);
+      expect(acceptedCode).toBe(cause === "stop" ? "cancelled" : "timed_out");
+      expect(result).toMatchObject({
+        terminalEventEmitted: true,
+        execution: cause === "stop"
+          ? { phase: "CANCELLED", terminalCode: "cancelled", casRevision: working.casRevision + 1 }
+          : { phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded", casRevision: working.casRevision + 1 },
+      });
+      expect(db.query(
+        "SELECT state, terminal_code, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(working.id)).toEqual(cause === "stop"
+        ? { state: "CANCELLED", terminal_code: "cancelled", cas_revision: working.casRevision + 1 }
+        : { state: "TIMED_OUT", terminal_code: "root_wall_clock_limit_exceeded", cas_revision: working.casRevision + 1 });
+    }
+  });
+  test("expiry CAS preserves a Stop or timeout marker accepted before its terminal UPDATE", () => {
+    for (const cause of ["stop", "timeout"] as const) {
+      const deadlineAt = Date.now() + 60_000;
+      const created = newExecution(db, `expiry-marker-race-${cause}`, deadlineAt);
+      const working = transition(
+        db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK",
+      ).execution;
+      db.query("UPDATE agent_turn_executions SET cas_expires_at = ? WHERE id = ?")
+        .run(deadlineAt + 2_000, working.id);
+      let injected = false;
+      let acceptedCode: string | undefined;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  acceptedCode = requestActiveTurnCancellation({
+                    db: target,
+                    executionId: working.id,
+                    ownerToken: created.ownerToken,
+                    reason: cause === "stop" ? "stopped" : "timed_out",
+                    now: cause === "stop" ? deadlineAt - 1 : deadlineAt,
+                  }).code;
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const result = expireTurnExecution({
+        db: competingDb,
+        executionId: working.id,
+        ownerToken: created.ownerToken,
+        now: deadlineAt + 1_000,
+      });
+      expect(injected).toBe(true);
+      expect(acceptedCode).toBe(cause === "stop" ? "cancelled" : "timed_out");
+      expect(result).toMatchObject({
+        code: cause === "stop" ? "cancelled" : "timed_out",
+        execution: cause === "stop"
+          ? { phase: "CANCELLED", terminalCode: "cancelled", cancelRequestedAt: deadlineAt - 1, casRevision: working.casRevision + 1 }
+          : { phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded", cancelRequestedAt: deadlineAt, casRevision: working.casRevision + 1 },
+      });
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(working.id)).toEqual(cause === "stop"
+        ? { state: "CANCELLED", terminal_code: "cancelled", cancel_requested_at: deadlineAt - 1, cas_revision: working.casRevision + 1 }
+        : { state: "TIMED_OUT", terminal_code: "root_wall_clock_limit_exceeded", cancel_requested_at: deadlineAt, cas_revision: working.casRevision + 1 });
+    }
+  });
+
+  test("unmarked zero-deadline expiry emits canonical timeout authority once", () => {
+    const settlementAt = Date.now();
+    const created = newExecution(db, "zero-deadline-expiry", 0);
+    const result = expireTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      now: settlementAt,
+    });
+    expect(result).toMatchObject({
+      code: "timed_out",
+      execution: {
+        phase: "TIMED_OUT",
+        terminalCode: "root_wall_clock_limit_exceeded",
+        cancelRequested: false,
+        cancelRequestedAt: null,
+        casRevision: created.execution.casRevision + 1,
+      },
+    });
+    const terminalSnapshot = db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id);
+    expect(terminalSnapshot).toEqual({
+      state: "TIMED_OUT",
+      terminal_code: "root_wall_clock_limit_exceeded",
+      cancel_requested_at: null,
+      terminal_at: settlementAt,
+      updated_at: settlementAt,
+      cas_revision: created.execution.casRevision + 1,
+    });
+    expect(expireTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      now: settlementAt + 1,
+    })).toMatchObject({
+      code: "already_terminal",
+      execution: {
+        phase: "TIMED_OUT",
+        terminalCode: "root_wall_clock_limit_exceeded",
+        cancelRequested: false,
+      },
+    });
+    expect(db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id)).toEqual(terminalSnapshot);
+  });
+  test("expiry classifies competing marker-owned and unrelated terminal winners without mutation", () => {
+    createTerminalRecoverySchema(db);
+    const scenarios = [
+      { phase: "CANCELLED" as const, terminalCode: "cancelled", marker: "stop" as const, code: "cancelled" as const },
+      { phase: "TIMED_OUT" as const, terminalCode: "root_wall_clock_limit_exceeded", marker: "timeout" as const, code: "timed_out" as const },
+      { phase: "COMMITTED" as const, terminalCode: "committed", marker: null, code: "too_late" as const },
+      { phase: "FAILED" as const, terminalCode: "provider_failed", marker: null, code: "already_terminal" as const },
+      { phase: "EXHAUSTED" as const, terminalCode: "attempt_budget_exhausted", marker: null, code: "already_terminal" as const },
+    ];
+    for (const scenario of scenarios) {
+      const deadlineAt = Date.now() + 10_000;
+      const settlementAt = deadlineAt + 1_000;
+      const winnerAt = deadlineAt + 500;
+      const markerAt = scenario.marker === "stop"
+        ? deadlineAt - 1
+        : scenario.marker === "timeout" ? deadlineAt : null;
+      const created = newExecution(db, `expiry-competing-${scenario.phase.toLowerCase()}`, deadlineAt);
+      const working = transition(
+        db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK",
+      ).execution;
+      let injected = false;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  target.query(`UPDATE agent_turn_executions
+                    SET state = ?, terminal_code = ?, cancel_requested_at = ?, terminal_at = ?, updated_at = ?,
+                        cas_revision = cas_revision + 1, phase_revision = phase_revision + 1
+                    WHERE id = ?`).run(
+                    scenario.phase,
+                    scenario.terminalCode,
+                    markerAt,
+                    winnerAt,
+                    winnerAt,
+                    created.execution.id,
+                  );
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const result = expireTurnExecution({
+        db: competingDb,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: settlementAt,
+      });
+      expect(injected).toBe(true);
+      expect(result).toMatchObject({
+        code: scenario.code,
+        execution: {
+          phase: scenario.phase,
+          terminalCode: scenario.terminalCode,
+          cancelRequested: markerAt !== null,
+          cancelRequestedAt: markerAt,
+          casRevision: working.casRevision + 1,
+        },
+      });
+      const terminalSnapshot = db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id);
+      expect(terminalSnapshot).toEqual({
+        state: scenario.phase,
+        terminal_code: scenario.terminalCode,
+        cancel_requested_at: markerAt,
+        terminal_at: winnerAt,
+        updated_at: winnerAt,
+        cas_revision: working.casRevision + 1,
+      });
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get("u1", created.execution.id) as { count: number }).count).toBe(0);
+      expect(expireTurnExecution({
+        db,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: settlementAt + 1,
+      }).code).toBe(scenario.phase === "COMMITTED" ? "too_late" : "already_terminal");
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual(terminalSnapshot);
+    }
+  });
+  test("non-WORK direct cancellation preserves a marker accepted immediately before terminal UPDATE", () => {
+    for (const cause of ["stop", "timeout"] as const) {
+      const deadlineAt = Date.now() + 10_000;
+      const markerAt = cause === "stop" ? deadlineAt - 1 : deadlineAt;
+      const settlementAt = deadlineAt + 1_000;
+      const created = newExecution(db, `direct-terminal-marker-race-${cause}`, deadlineAt);
+      let injected = false;
+      let acceptedCode: string | undefined;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  acceptedCode = requestActiveTurnCancellation({
+                    db: target,
+                    executionId: created.execution.id,
+                    ownerToken: created.ownerToken,
+                    reason: cause === "stop" ? "stopped" : "timed_out",
+                    now: markerAt,
+                  }).code;
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const result = requestTurnCancellation({
+        db: competingDb,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        reason: cause === "stop" ? "stopped" : "timed_out",
+        now: settlementAt,
+      });
+      expect(injected).toBe(true);
+      expect(acceptedCode).toBe(cause === "stop" ? "cancelled" : "timed_out");
+      expect(result).toMatchObject({
+        code: cause === "stop" ? "cancelled" : "timed_out",
+        execution: cause === "stop"
+          ? { phase: "CANCELLED", terminalCode: "cancelled", cancelRequestedAt: markerAt }
+          : { phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded", cancelRequestedAt: markerAt },
+      });
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual({
+        state: cause === "stop" ? "CANCELLED" : "TIMED_OUT",
+        terminal_code: cause === "stop" ? "cancelled" : "root_wall_clock_limit_exceeded",
+        cancel_requested_at: markerAt,
+        terminal_at: settlementAt,
+        updated_at: settlementAt,
+        cas_revision: created.execution.casRevision + 1,
+      });
+      const terminalSnapshot = db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id);
+      expect(requestTurnCancellation({
+        db,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: settlementAt + 1,
+      })).toMatchObject({ code: "already_terminal" });
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual(terminalSnapshot);
+    }
+  });
+  test("fenced direct cancellation validates marked terminal winners before exposing marker authority", () => {
+    const scenarios = [
+      { id: "marked-winner-cancelled", markerOffset: -1, phase: "CANCELLED", terminalCode: "cancelled", canonical: true, code: "cancelled" },
+      { id: "marked-winner-timeout", markerOffset: 0, phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded", canonical: true, code: "timed_out" },
+      { id: "marked-winner-bad-code", markerOffset: -1, phase: "CANCELLED", terminalCode: "segment_failed", canonical: false, code: null },
+      { id: "marked-winner-bad-phase", markerOffset: -1, phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded", canonical: false, code: null },
+      { id: "marked-winner-failed", markerOffset: -1, phase: "FAILED", terminalCode: "provider_failed", canonical: false, code: null },
+      { id: "marked-winner-exhausted", markerOffset: -1, phase: "EXHAUSTED", terminalCode: "attempt_budget_exhausted", canonical: false, code: null },
+      { id: "marked-winner-commit-failed", markerOffset: -1, phase: "COMMIT_FAILED", terminalCode: "commit_failed", canonical: false, code: null },
+      { id: "marked-winner-committed", markerOffset: -1, phase: "COMMITTED", terminalCode: "committed", canonical: false, code: null },
+    ] as const;
+    for (const scenario of scenarios) {
+      const deadlineAt = Date.now() + 10_000;
+      const markerAt = deadlineAt + scenario.markerOffset;
+      const winnerAt = deadlineAt + 1_000;
+      const created = newExecution(db, scenario.id, deadlineAt);
+      let injected = false;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  target.query(`UPDATE agent_turn_executions
+                    SET state = ?, terminal_code = ?, cancel_requested_at = ?, terminal_at = ?, updated_at = ?,
+                        cas_revision = cas_revision + 1, phase_revision = phase_revision + 1
+                    WHERE id = ?`).run(
+                    scenario.phase,
+                    scenario.terminalCode,
+                    markerAt,
+                    winnerAt,
+                    winnerAt,
+                    created.execution.id,
+                  );
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const request = () => requestTurnCancellation({
+        db: competingDb,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: winnerAt + 1,
+      });
+      if (scenario.canonical) {
+        expect(request()).toMatchObject({
+          code: scenario.code,
+          execution: {
+            phase: scenario.phase,
+            terminalCode: scenario.terminalCode,
+            cancelRequestedAt: markerAt,
+            casRevision: created.execution.casRevision + 1,
+          },
+        });
+      } else {
+        expect(request).toThrow("accepted cancellation marker lost its terminal cause");
+      }
+      expect(injected).toBe(true);
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual({
+        state: scenario.phase,
+        terminal_code: scenario.terminalCode,
+        cancel_requested_at: markerAt,
+        terminal_at: winnerAt,
+        updated_at: winnerAt,
+        cas_revision: created.execution.casRevision + 1,
+      });
+    }
+  });
+
+  test("boolean marked non-cancellation terminal winners fail canonical cancellation authority", () => {
+    db.run("ALTER TABLE agent_turn_executions RENAME COLUMN cancel_requested_at TO cancel_requested");
+    for (const scenario of [
+      { phase: "FAILED", terminalCode: "provider_failed" },
+      { phase: "EXHAUSTED", terminalCode: "attempt_budget_exhausted" },
+      { phase: "COMMIT_FAILED", terminalCode: "commit_failed" },
+      { phase: "COMMITTED", terminalCode: "committed" },
+    ] as const) {
+      const deadlineAt = Date.now() + 10_000;
+      const markerAt = deadlineAt - 1;
+      const winnerAt = deadlineAt + 1_000;
+      const created = newExecution(db, `boolean-marked-winner-${scenario.phase.toLowerCase()}`, deadlineAt);
+      let injected = false;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('COALESCE("cancel_requested", 0) = 0')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  target.query(`UPDATE agent_turn_executions
+                    SET state = ?, terminal_code = ?, cancel_requested = 1, terminal_at = ?, updated_at = ?,
+                        cas_revision = cas_revision + 1, phase_revision = phase_revision + 1
+                    WHERE id = ?`).run(
+                    scenario.phase,
+                    scenario.terminalCode,
+                    winnerAt,
+                    markerAt,
+                    created.execution.id,
+                  );
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      expect(() => requestTurnCancellation({
+        db: competingDb,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: winnerAt + 1,
+      })).toThrow("accepted cancellation marker lost its terminal cause");
+      expect(injected).toBe(true);
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual({
+        state: scenario.phase,
+        terminal_code: scenario.terminalCode,
+        cancel_requested: 1,
+        terminal_at: winnerAt,
+        updated_at: markerAt,
+        cas_revision: created.execution.casRevision + 1,
+      });
+    }
+  });
+  test("direct cancellation reports unmarked FAILED, EXHAUSTED, and TIMED_OUT terminal winners accurately", () => {
+    createTerminalRecoverySchema(db);
+    for (const scenario of [
+      { phase: "FAILED", terminalCode: "provider_failed" },
+      { phase: "EXHAUSTED", terminalCode: "attempt_budget_exhausted" },
+      { phase: "TIMED_OUT", terminalCode: "root_wall_clock_limit_exceeded" },
+    ] as const) {
+      const winnerAt = Date.now();
+      const created = newExecution(db, `unmarked-direct-winner-${scenario.phase.toLowerCase()}`, winnerAt + 10_000);
+      let injected = false;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  target.query(`UPDATE agent_turn_executions
+                    SET state = ?, terminal_code = ?, terminal_at = ?, updated_at = ?,
+                        cas_revision = cas_revision + 1, phase_revision = phase_revision + 1
+                    WHERE id = ?`).run(
+                    scenario.phase,
+                    scenario.terminalCode,
+                    winnerAt,
+                    winnerAt,
+                    created.execution.id,
+                  );
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const result = requestTurnCancellation({
+        db: competingDb,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: winnerAt + 1,
+      });
+      expect(injected).toBe(true);
+      expect(result).toMatchObject({
+        code: "already_terminal",
+        execution: {
+          phase: scenario.phase,
+          terminalCode: scenario.terminalCode,
+          cancelRequested: false,
+          cancelRequestedAt: null,
+          casRevision: created.execution.casRevision + 1,
+        },
+      });
+      const terminalSnapshot = db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id);
+      expect(terminalSnapshot).toEqual({
+        state: scenario.phase,
+        terminal_code: scenario.terminalCode,
+        cancel_requested_at: null,
+        terminal_at: winnerAt,
+        updated_at: winnerAt,
+        cas_revision: created.execution.casRevision + 1,
+      });
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get("u1", created.execution.id) as { count: number }).count).toBe(0);
+      expect(requestTurnCancellation({
+        db,
+        executionId: created.execution.id,
+        ownerToken: created.ownerToken,
+        now: winnerAt + 2,
+      })).toMatchObject({ code: "already_terminal", execution: { phase: scenario.phase } });
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual(terminalSnapshot);
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get("u1", created.execution.id) as { count: number }).count).toBe(0);
+    }
+  });
+  test("live Stop retries across ASSEMBLE to WORK and preserves its pre-deadline timestamp after settlement", () => {
+    const requestAt = Date.now();
+    const deadlineAt = requestAt + 60_000;
+    const created = newExecution(db, "active-forward-retry", deadlineAt);
+    let forwarded: ReturnType<typeof transitionTurnExecution>["execution"] | undefined;
+    let markerUpdateAttempts = 0;
+    const competingDb = new Proxy(db, {
+      get(target, property) {
+        if (property !== "query") {
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return (sql: string) => {
+          const statement = target.query(sql);
+          if (!sql.startsWith('UPDATE "agent_turn_executions" SET')
+            || !sql.includes('"cancel_requested_at" = ?')
+            || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty) {
+              if (statementProperty !== "run") {
+                const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                return typeof value === "function" ? value.bind(statementTarget) : value;
+              }
+              return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                markerUpdateAttempts += 1;
+                if (!forwarded) {
+                  forwarded = transitionTurnExecution({
+                    db: target,
+                    executionId: created.execution.id,
+                    ownerToken: created.ownerToken,
+                    expectedPhase: "ASSEMBLE",
+                    nextPhase: "WORK",
+                    now: requestAt,
+                  }).execution;
+                }
+                return statementTarget.run(...bindings);
+              };
+            },
+          });
+        };
+      },
+    });
+
+    const stopped = requestActiveTurnCancellation({
+      db: competingDb,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      reason: "stopped",
+      now: requestAt,
+    });
+    expect(markerUpdateAttempts).toBe(2);
+    expect(forwarded).toMatchObject({ phase: "WORK", casRevision: created.execution.casRevision + 1 });
+    expect(stopped).toMatchObject({
+      code: "cancelled",
+      execution: {
+        phase: "WORK",
+        cancelRequested: true,
+        cancelRequestedAt: requestAt,
+        casRevision: created.execution.casRevision + 1,
+      },
+    });
+    expect(db.query(
+      "SELECT state, cancel_requested_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id)).toEqual({
+      state: "WORK",
+      cancel_requested_at: requestAt,
+      cas_revision: created.execution.casRevision + 1,
+    });
+
+    const abortedForward = transitionTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      expectedPhase: "WORK",
+      nextPhase: "COMPLETE",
+      now: deadlineAt + 1_000,
+    });
+    expect(abortedForward).toMatchObject({
+      terminalEventEmitted: true,
+      execution: {
+        phase: "CANCELLED",
+        terminalCode: "cancelled",
+        cancelRequestedAt: requestAt,
+        casRevision: created.execution.casRevision + 2,
+      },
+    });
+    const terminalSnapshot = db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id);
+    expect(terminalSnapshot).toEqual({
+      state: "CANCELLED",
+      terminal_code: "cancelled",
+      cancel_requested_at: requestAt,
+      terminal_at: deadlineAt + 1_000,
+      updated_at: deadlineAt + 1_000,
+      cas_revision: created.execution.casRevision + 2,
+    });
+    expect(expireTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      now: deadlineAt + 2_000,
+    })).toMatchObject({ code: "already_terminal", execution: { phase: "CANCELLED", cancelRequestedAt: requestAt } });
+    expect(db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id)).toEqual(terminalSnapshot);
+  });
+
+  test("live Stop returns canonical too_late when a WORK CAS reaches COMPLETE first", () => {
+    const requestAt = Date.now();
+    const created = newExecution(db, "active-work-forward-too-late", requestAt + 60_000);
+    const working = transition(
+      db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK",
+    ).execution;
+    let forwarded = false;
+    const competingDb = new Proxy(db, {
+      get(target, property) {
+        if (property !== "query") {
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return (sql: string) => {
+          const statement = target.query(sql);
+          if (forwarded
+            || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+            || !sql.includes('"cancel_requested_at" = ?')
+            || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty) {
+              if (statementProperty !== "run") {
+                const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                return typeof value === "function" ? value.bind(statementTarget) : value;
+              }
+              return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                forwarded = true;
+                transitionTurnExecution({
+                  db: target,
+                  executionId: working.id,
+                  ownerToken: created.ownerToken,
+                  expectedPhase: "WORK",
+                  nextPhase: "COMPLETE",
+                  now: requestAt,
+                });
+                return statementTarget.run(...bindings);
+              };
+            },
+          });
+        };
+      },
+    });
+
+    const result = requestActiveTurnCancellation({
+      db: competingDb,
+      executionId: working.id,
+      ownerToken: created.ownerToken,
+      reason: "stopped",
+      now: requestAt,
+    });
+    expect(forwarded).toBe(true);
+    expect(result).toMatchObject({
+      code: "too_late",
+      execution: { phase: "COMPLETE", cancelRequested: false, casRevision: working.casRevision + 1 },
+    });
+    expect(db.query(
+      "SELECT state, cancel_requested_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(working.id)).toEqual({
+      state: "COMPLETE",
+      cancel_requested_at: null,
+      cas_revision: working.casRevision + 1,
+    });
+  });
+
+  test("competing deadline marker wins the same SQL CAS over a pre-deadline Stop", () => {
+    const deadlineAt = Date.now() + 60_000;
+    const created = newExecution(db, "active-competing-cancellation-marker", deadlineAt);
+    const working = transition(
+      db,
+      created.execution.id,
+      created.ownerToken,
+      "ASSEMBLE",
+      "WORK",
+    ).execution;
+    db.query("UPDATE agent_turn_executions SET cas_expires_at = ? WHERE id = ?")
+      .run(deadlineAt + 1_000, working.id);
+    let injectedDeadlineMarker = false;
+    const competingDb = new Proxy(db, {
+      get(target, property) {
+        if (property !== "query") {
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return (sql: string) => {
+          const statement = target.query(sql);
+          if (injectedDeadlineMarker
+            || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+            || !sql.includes('"cancel_requested_at" = ?')) return statement;
+          return new Proxy(statement, {
+            get(statementTarget, statementProperty) {
+              if (statementProperty !== "run") {
+                const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                return typeof value === "function" ? value.bind(statementTarget) : value;
+              }
+              return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                injectedDeadlineMarker = true;
+                target.query(
+                  "UPDATE agent_turn_executions SET cancel_requested_at = ?, updated_at = ? WHERE id = ? AND cancel_requested_at IS NULL",
+                ).run(deadlineAt, deadlineAt, working.id);
+                return statementTarget.run(...bindings);
+              };
+            },
+          });
+        };
+      },
+    });
+
+    const result = requestActiveTurnCancellation({
+      db: competingDb,
+      executionId: working.id,
+      ownerToken: created.ownerToken,
+      reason: "stopped",
+      now: deadlineAt - 1,
+    });
+    expect(injectedDeadlineMarker).toBe(true);
+    expect(result).toMatchObject({
+      code: "timed_out",
+      execution: {
+        phase: "WORK",
+        cancelRequestedAt: deadlineAt,
+        casOwner: working.casOwner,
+        casRevision: working.casRevision,
+      },
+    });
+    expect(db.query(
+      "SELECT cancel_requested_at, updated_at FROM agent_turn_executions WHERE id = ?",
+    ).get(working.id)).toEqual({ cancel_requested_at: deadlineAt, updated_at: deadlineAt });
+  });
+
+  test("active cancellation writes compatibility markers and fails closed without one", () => {
+    db.run("ALTER TABLE agent_turn_executions RENAME COLUMN cancel_requested_at TO cancel_requested");
+    const compatible = newExecution(db, "active-compatible-marker");
+    const working = transition(db, compatible.execution.id, compatible.ownerToken, "ASSEMBLE", "WORK").execution;
+    const authorityQuery = db.query(
+      "SELECT state, cas_owner, cas_expires_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    );
+    const authorityBefore = authorityQuery.get(working.id);
+    expect(requestActiveTurnCancellation({
+      db,
+      executionId: working.id,
+      ownerToken: compatible.ownerToken,
+    })).toMatchObject({ code: "cancelled", execution: { phase: "WORK", cancelRequested: true } });
+    expect(db.query("SELECT cancel_requested FROM agent_turn_executions WHERE id = ?").get(working.id))
+      .toEqual({ cancel_requested: 1 });
+    expect(authorityQuery.get(working.id)).toEqual(authorityBefore);
+    const compatibilityDeadline = Date.now() + 60_000;
+    const compatibleTimeout = newExecution(db, "active-compatible-timeout-marker", compatibilityDeadline);
+    transition(db, compatibleTimeout.execution.id, compatibleTimeout.ownerToken, "ASSEMBLE", "WORK");
+    expect(requestActiveTurnCancellation({
+      db,
+      executionId: compatibleTimeout.execution.id,
+      ownerToken: compatibleTimeout.ownerToken,
+      reason: "timed_out",
+      now: compatibilityDeadline - 1_000,
+    })).toMatchObject({ code: "timed_out", execution: { phase: "WORK", cancelRequested: true } });
+    expect(transitionTurnExecution({
+      db,
+      executionId: compatibleTimeout.execution.id,
+      ownerToken: compatibleTimeout.ownerToken,
+      expectedPhase: "WORK",
+      nextPhase: "TIMED_OUT",
+      now: compatibilityDeadline,
+    }).execution.phase).toBe("TIMED_OUT");
+
+    const unavailableDb = createExecutionSchema();
+    try {
+      const unavailable = newExecution(unavailableDb, "active-marker-unavailable");
+      const unavailableWorking = transition(
+        unavailableDb,
+        unavailable.execution.id,
+        unavailable.ownerToken,
+        "ASSEMBLE",
+        "WORK",
+      ).execution;
+      unavailableDb.run("ALTER TABLE agent_turn_executions RENAME COLUMN cancel_requested_at TO unavailable_cancel_requested_at");
+      const rowQuery = unavailableDb.query(
+        "SELECT state, cas_owner, cas_expires_at, cas_revision, updated_at FROM agent_turn_executions WHERE id = ?",
+      );
+      const before = rowQuery.get(unavailableWorking.id);
+      expect(() => requestActiveTurnCancellation({
+        db: unavailableDb,
+        executionId: unavailableWorking.id,
+        ownerToken: unavailable.ownerToken,
+      })).toThrow("no durable cancellation marker");
+      expect(rowQuery.get(unavailableWorking.id)).toEqual(before);
+    } finally {
+      unavailableDb.close();
+    }
   });
   test("explicit timeout cancellation remains TIMED_OUT before the local deadline elapses", () => {
     const created = newExecution(db, "explicit-timeout", Date.now() + 60_000);
@@ -579,7 +2232,9 @@ describe("control races and terminal ownership", () => {
       db,
       executionId: "stop-work-boundary",
       ownerToken: working.ownerToken,
-    })).toMatchObject({ code: "cancelled", execution: { phase: "CANCELLED" } });
+    })).toMatchObject({ code: "cancelled", execution: { phase: "WORK", cancelRequested: true } });
+    expect(transition(db, "stop-work-boundary", working.ownerToken, "WORK", "COMPLETE").execution.phase)
+      .toBe("CANCELLED");
 
     const latePhases = [
       { id: "stop-complete", path: ["WORK", "COMPLETE"] as const },
@@ -627,6 +2282,36 @@ describe("control races and terminal ownership", () => {
       now: deadlineAt,
     })).toMatchObject({ code: "timed_out", execution: { phase: "TIMED_OUT" } });
   });
+  test("expiry preserves a predeadline cancellation marker after the deadline", () => {
+    const deadlineAt = Date.now() + 10_000;
+    const created = newExecution(db, "deadline-after-stop", deadlineAt);
+    transition(db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK");
+
+    expect(requestActiveTurnCancellation({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      reason: "stopped",
+      now: deadlineAt - 1,
+    })).toMatchObject({ code: "cancelled", execution: { phase: "WORK", cancelRequested: true } });
+
+    expect(expireTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      now: deadlineAt + 1,
+    })).toMatchObject({
+      code: "cancelled",
+      execution: { phase: "CANCELLED", terminalCode: "cancelled" },
+    });
+    expect(expireTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      now: deadlineAt + 2,
+    })).toMatchObject({ code: "already_terminal", execution: { phase: "CANCELLED" } });
+  });
+
   test("projects active and terminal phases with canonical status/outcome pairs", () => {
     const active = newExecution(db, "projection-active");
     expect(active.execution.workStatus).toBe("running");
@@ -754,12 +2439,233 @@ describe("control races and terminal ownership", () => {
     expect(timedOut.execution.cas.revision).toBe(deadline.execution.cas.revision + 1);
   });
 
+  test("dormant cancellation preserves the first marker after wall time crosses the deadline", () => {
+    const cases = [
+      { id: "dormant-marker-before", markerAt: 9_999, phase: "CANCELLED", code: "cancelled" },
+      { id: "dormant-marker-at", markerAt: 10_000, phase: "TIMED_OUT", code: "timed_out" },
+    ] as const;
+    for (const scenario of cases) {
+      newExecution(db, scenario.id, 10_000);
+      db.query(
+        "UPDATE agent_turn_executions SET cas_owner = NULL, cas_expires_at = NULL, cancel_requested_at = ?, updated_at = ? WHERE id = ?",
+      ).run(scenario.markerAt, scenario.markerAt, scenario.id);
+      const result = requestDormantTurnCancellation({
+        db, executionId: scenario.id, userId: "u1", chatId: "c1", now: 20_000,
+      });
+      expect(result).toMatchObject({ code: scenario.code, execution: { phase: scenario.phase } });
+    }
+  });
+
+  test("dormant cancellation classifies competing marker-owned and unrelated terminal winners", () => {
+    createTerminalRecoverySchema(db);
+    const scenarios = [
+      { phase: "CANCELLED" as const, terminalCode: "cancelled", marker: "stop" as const, code: "cancelled" as const },
+      { phase: "TIMED_OUT" as const, terminalCode: "root_wall_clock_limit_exceeded", marker: "timeout" as const, code: "timed_out" as const },
+      { phase: "COMMITTED" as const, terminalCode: "committed", marker: null, code: "too_late" as const },
+      { phase: "FAILED" as const, terminalCode: "provider_failed", marker: null, code: "already_terminal" as const },
+      { phase: "EXHAUSTED" as const, terminalCode: "attempt_budget_exhausted", marker: null, code: "already_terminal" as const },
+    ];
+    for (const scenario of scenarios) {
+      const deadlineAt = Date.now() + 10_000;
+      const settlementAt = deadlineAt + 1_000;
+      const winnerAt = deadlineAt + 500;
+      const markerAt = scenario.marker === "stop"
+        ? deadlineAt - 1
+        : scenario.marker === "timeout" ? deadlineAt : null;
+      const created = newExecution(db, `dormant-competing-${scenario.phase.toLowerCase()}`, deadlineAt);
+      db.query(
+        "UPDATE agent_turn_executions SET cas_owner = NULL, cas_expires_at = NULL WHERE id = ?",
+      ).run(created.execution.id);
+      let injected = false;
+      const competingDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.query(sql);
+            if (injected
+              || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+              || !sql.includes('"terminal_code" = ?')
+              || !sql.includes('"cancel_requested_at" IS NULL')) return statement;
+            return new Proxy(statement, {
+              get(statementTarget, statementProperty) {
+                if (statementProperty !== "run") {
+                  const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                  return typeof value === "function" ? value.bind(statementTarget) : value;
+                }
+                return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                  injected = true;
+                  target.query(`UPDATE agent_turn_executions
+                    SET state = ?, terminal_code = ?, cancel_requested_at = ?, terminal_at = ?, updated_at = ?,
+                        cas_revision = cas_revision + 1, phase_revision = phase_revision + 1
+                    WHERE id = ?`).run(
+                    scenario.phase,
+                    scenario.terminalCode,
+                    markerAt,
+                    winnerAt,
+                    winnerAt,
+                    created.execution.id,
+                  );
+                  return statementTarget.run(...bindings);
+                };
+              },
+            });
+          };
+        },
+      });
+
+      const result = requestDormantTurnCancellation({
+        db: competingDb,
+        executionId: created.execution.id,
+        userId: "u1",
+        chatId: "c1",
+        now: settlementAt,
+      });
+      expect(injected).toBe(true);
+      expect(result).toMatchObject({
+        code: scenario.code,
+        execution: {
+          phase: scenario.phase,
+          terminalCode: scenario.terminalCode,
+          cancelRequested: markerAt !== null,
+          cancelRequestedAt: markerAt,
+          casRevision: created.execution.casRevision + 1,
+        },
+      });
+      const terminalSnapshot = db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id);
+      expect(terminalSnapshot).toEqual({
+        state: scenario.phase,
+        terminal_code: scenario.terminalCode,
+        cancel_requested_at: markerAt,
+        terminal_at: winnerAt,
+        updated_at: winnerAt,
+        cas_revision: created.execution.casRevision + 1,
+      });
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get("u1", created.execution.id) as { count: number }).count).toBe(0);
+      expect(requestDormantTurnCancellation({
+        db,
+        executionId: created.execution.id,
+        userId: "u1",
+        chatId: "c1",
+        now: settlementAt + 1,
+      }).code).toBe(scenario.phase === "COMMITTED" ? "too_late" : "already_terminal");
+      expect(db.query(
+        "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+      ).get(created.execution.id)).toEqual(terminalSnapshot);
+    }
+  });
+  test("generic startup reconciliation preserves first markers without segment authority", () => {
+    const deadlineAt = Date.now() + 3_600_000;
+    const assemble = newExecution(db, "reconcile-marker-assemble", deadlineAt);
+    const work = newExecution(db, "reconcile-marker-work", deadlineAt);
+    transition(db, work.execution.id, work.ownerToken, "ASSEMBLE", "WORK");
+    const markerAt = Date.now();
+    db.query(
+      "UPDATE agent_turn_executions SET runtime_epoch = 0, cas_expires_at = 0, cancel_requested_at = ?, updated_at = ? WHERE id IN (?, ?)",
+    ).run(markerAt, markerAt, assemble.execution.id, work.execution.id);
+
+    const first = reconcileAgentTurns(db);
+    expect(first).toMatchObject({ claimed: 2, failedInterrupted: 0 });
+    expect(getTurnExecution(assemble.execution.id, "u1", db)?.phase).toBe("CANCELLED");
+    expect(getTurnExecution(work.execution.id, "u1", db)?.phase).toBe("CANCELLED");
+    expect(reconcileAgentTurns(db)).toMatchObject({ claimed: 0, failedInterrupted: 0 });
+  });
+
+  test("boolean-only reconciliation preserves marker time across its ownership claim", () => {
+    db.run("ALTER TABLE agent_turn_executions RENAME COLUMN cancel_requested_at TO cancel_requested");
+    const deadlineAt = 10_000;
+    const stopped = newExecution(db, "reconcile-compatible-stop", deadlineAt);
+    const timedOut = newExecution(db, "reconcile-compatible-timeout", deadlineAt);
+    db.query(`UPDATE agent_turn_executions
+      SET runtime_epoch = 0, cas_expires_at = 0, cancel_requested = 1, updated_at = ?
+      WHERE id = ?`).run(deadlineAt - 1, stopped.execution.id);
+    db.query(`UPDATE agent_turn_executions
+      SET runtime_epoch = 0, cas_expires_at = 0, cancel_requested = 1, updated_at = ?
+      WHERE id = ?`).run(deadlineAt + 1, timedOut.execution.id);
+
+    __testing.setReconciliationClock(() => deadlineAt + 10_000);
+    try {
+      expect(reconcileAgentTurns(db)).toMatchObject({ claimed: 2, failedInterrupted: 0 });
+    } finally {
+      __testing.setReconciliationClock(null);
+    }
+    expect(db.query(
+      "SELECT state, terminal_code, cancel_requested, updated_at, terminal_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(stopped.execution.id)).toEqual({
+      state: "CANCELLED",
+      terminal_code: "cancelled",
+      cancel_requested: 1,
+      updated_at: deadlineAt - 1,
+      terminal_at: deadlineAt + 10_000,
+      cas_revision: stopped.execution.casRevision + 2,
+    });
+    expect(db.query(
+      "SELECT state, terminal_code, cancel_requested, updated_at, terminal_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(timedOut.execution.id)).toEqual({
+      state: "TIMED_OUT",
+      terminal_code: "root_wall_clock_limit_exceeded",
+      cancel_requested: 1,
+      updated_at: deadlineAt + 1,
+      terminal_at: deadlineAt + 10_000,
+      cas_revision: timedOut.execution.casRevision + 2,
+    });
+  });
+
   test("cancellation is too late after the commit gate", () => {
     const created = newExecution(db, "late");
     moveToCommit(db, "late", created.ownerToken);
     const result = requestTurnCancellation({ db, executionId: "late", ownerToken: created.ownerToken });
     expect(result.code).toBe("too_late");
     expect(result.execution.state).toBe("COMMITTING");
+  });
+
+  test("direct cancellation synthesizes one marker only when none was accepted", () => {
+    const settlementAt = Date.now();
+    const created = newExecution(db, "terminal-synthesized-cancellation", settlementAt + 60_000);
+    const cancelled = transitionTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      expectedPhase: "ASSEMBLE",
+      nextPhase: "CANCELLED",
+      reason: "cancelled",
+      now: settlementAt,
+    });
+    expect(cancelled).toMatchObject({
+      terminalEventEmitted: true,
+      execution: {
+        phase: "CANCELLED",
+        terminalCode: "cancelled",
+        cancelRequestedAt: settlementAt,
+        casRevision: created.execution.casRevision + 1,
+      },
+    });
+    const terminalSnapshot = db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id);
+    expect(terminalSnapshot).toEqual({
+      state: "CANCELLED",
+      terminal_code: "cancelled",
+      cancel_requested_at: settlementAt,
+      terminal_at: settlementAt,
+      updated_at: settlementAt,
+      cas_revision: created.execution.casRevision + 1,
+    });
+    expect(expireTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      now: settlementAt + 1_000,
+    })).toMatchObject({ code: "already_terminal", execution: { cancelRequestedAt: settlementAt } });
+    expect(db.query(
+      "SELECT state, terminal_code, cancel_requested_at, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+    ).get(created.execution.id)).toEqual(terminalSnapshot);
   });
 
   test("terminal owner emits once and cannot transition again", () => {
@@ -832,12 +2738,309 @@ describe("receipt commit and startup recovery", () => {
     db.query(`INSERT INTO agent_turn_commit_receipts
       (receipt_id, turn_id, execution_id, workspace_id, user_id, chat_id, commit_key, idempotency_key, state, summary_digest, summary_json, committed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?, ?, ?)`)
-      .run("receipt-1", "receipt-crash", "receipt-crash", "ws1", "u1", "c1", created.commitKey, created.commitKey, "0".repeat(64), "{}", Date.now());
+      .run("receipt-1", "receipt-crash", "receipt-crash", created.execution.workspaceId, "u1", "c1", created.commitKey, created.commitKey, "0".repeat(64), "{}", Date.now());
     const recovered = reconcileAgentTurns(db);
     expect(recovered.committedFromReceipt).toBe(1);
     expect((db.query("SELECT state FROM agent_turn_executions WHERE id = ?").get("receipt-crash") as { state: string }).state).toBe("COMMITTED");
     expect(reconcileAgentTurns(db).committedFromReceipt).toBe(0);
   });
+  test("fences a crash after terminal transition close until specialized final render commits exactly once", () => {
+    createTerminalRecoverySchema(db);
+    createWorkSegmentRecoverySchema(db);
+    const created = newExecution(db, "closed-work-handoff-crash");
+    transition(db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK");
+    seedClosedWorkSegmentCrash(db, created.execution.id, "work_complete");
+    const before = getTurnExecution(created.execution.id, "u1", db);
+
+    let genericTerminalPublishes = 0;
+    registerAgentTurnTerminalRecovery(() => {
+      genericTerminalPublishes++;
+    });
+    const first = reconcileAgentTurns(db);
+    const second = reconcileAgentTurns(db);
+    expect(first).toMatchObject({ complete: false, failedInterrupted: 0, claimed: 0 });
+    expect(second).toMatchObject({ complete: false, failedInterrupted: 0, claimed: 0 });
+    expect(getTurnExecution(created.execution.id, "u1", db)).toEqual(before);
+    expect(genericTerminalPublishes).toBe(0);
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?",
+    ).get(created.execution.id) as { count: number }).count).toBe(0);
+
+    transition(db, created.execution.id, created.ownerToken, "WORK", "COMPLETE");
+    transition(db, created.execution.id, created.ownerToken, "COMPLETE", "RENDER");
+    transition(db, created.execution.id, created.ownerToken, "RENDER", "PREPARE_COMMIT");
+    beginTurnCommit({ db, executionId: created.execution.id, ownerToken: created.ownerToken });
+    const committed = finalizeTurnCommit({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      receiptId: "closed-work-handoff-receipt",
+      idempotencyKey: created.commitKey,
+      summary: { recovered: true },
+    });
+    const duplicate = finalizeTurnCommit({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      receiptId: "closed-work-handoff-receipt",
+      idempotencyKey: created.commitKey,
+      summary: { recovered: true },
+    });
+    expect(committed.duplicate).toBe(false);
+    expect(duplicate.duplicate).toBe(true);
+    expect(duplicate.receipt.id).toBe(committed.receipt.id);
+    expect(duplicate.execution.terminalEventId).toBeNull();
+    expect(committed.execution.phase).toBe("COMMITTED");
+    expect(committed.execution.terminalEventId).toBeNull();
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?",
+    ).get(created.execution.id) as { count: number }).count).toBe(1);
+
+    registerAgentTurnReceiptRepair((execution, receipt, options) => {
+      repairAgentRunProjectionFromReceipt(db, execution, receipt, options);
+    });
+    const afterRecovery = reconcileAgentTurns(db);
+    expect(afterRecovery).toMatchObject({ failedInterrupted: 0, projectionRepairs: 1 });
+    const convergedTerminalEventId = getTurnExecution(created.execution.id, "u1", db)?.terminalEventId;
+    expect(convergedTerminalEventId).not.toBeNull();
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+    ).get("u1", created.execution.id) as { count: number }).count).toBe(1);
+
+    expect(reconcileAgentTurns(db).projectionRepairs).toBe(0);
+    expect(getTurnExecution(created.execution.id, "u1", db)?.terminalEventId)
+      .toBe(convergedTerminalEventId);
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?",
+    ).get(created.execution.id) as { count: number }).count).toBe(1);
+    expect((db.query(
+      "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+    ).get("u1", created.execution.id) as { count: number }).count).toBe(1);
+    expect(genericTerminalPublishes).toBe(0);
+  });
+
+  test("converges crashes after terminal close to exact typed causes and publishes each once", () => {
+    createTerminalRecoverySchema(db);
+    createWorkSegmentRecoverySchema(db);
+    const cases = [
+      {
+        id: "closed-work-failed-crash",
+        result: "failed" as const,
+        phase: "FAILED" as const,
+        reason: "restart_existing_dispatch_no_replay",
+        outcome: "failed",
+      },
+      {
+        id: "closed-work-exhausted-crash",
+        result: "exhausted" as const,
+        phase: "EXHAUSTED" as const,
+        reason: "attempt_budget_exhausted",
+        outcome: "exhausted",
+      },
+      {
+        id: "closed-work-cancelled-crash",
+        result: "cancelled" as const,
+        phase: "CANCELLED" as const,
+        reason: "restart_resume_cancel_requested",
+        outcome: "stopped",
+      },
+    ];
+    for (const recovery of cases) {
+      const created = newExecution(db, recovery.id);
+      transition(db, created.execution.id, created.ownerToken, "ASSEMBLE", "WORK");
+      seedClosedWorkSegmentCrash(db, recovery.id, recovery.result, recovery.reason);
+    }
+
+    let interruptedFallbackPublishes = 0;
+    registerAgentTurnTerminalRecovery(() => {
+      interruptedFallbackPublishes++;
+    });
+    const first = reconcileAgentTurns(db);
+    expect(first).toMatchObject({ complete: true, failedInterrupted: 0, projectionRepairs: cases.length });
+    expect(interruptedFallbackPublishes).toBe(0);
+    const terminalEventIds = new Map<string, string | null>();
+    for (const recovery of cases) {
+      const execution = getTurnExecution(recovery.id, "u1", db);
+      expect(execution).toMatchObject({
+        phase: recovery.phase,
+        terminalCode: recovery.phase === "CANCELLED" ? "cancelled" : recovery.reason,
+        workOutcome: recovery.outcome,
+      });
+      terminalEventIds.set(recovery.id, execution?.terminalEventId ?? null);
+      expect(execution?.terminalEventId).not.toBeNull();
+      expect(db.query(
+        "SELECT status, phase FROM agent_run_projections WHERE user_id = ? AND turn_id = ?",
+      ).get("u1", recovery.id)).toEqual({ status: recovery.phase, phase: recovery.phase });
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get("u1", recovery.id) as { count: number }).count).toBe(1);
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_run_attempts WHERE user_id = ? AND turn_id = ? AND terminal = 1",
+      ).get("u1", recovery.id) as { count: number }).count).toBe(1);
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?",
+      ).get(recovery.id) as { count: number }).count).toBe(0);
+    }
+
+    const second = reconcileAgentTurns(db);
+    expect(second).toMatchObject({ complete: true, failedInterrupted: 0, projectionRepairs: 0 });
+    expect(interruptedFallbackPublishes).toBe(0);
+    for (const recovery of cases) {
+      expect(getTurnExecution(recovery.id, "u1", db)?.terminalEventId)
+        .toBe(terminalEventIds.get(recovery.id));
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+      ).get("u1", recovery.id) as { count: number }).count).toBe(1);
+      expect((db.query(
+        "SELECT COUNT(*) AS count FROM agent_turn_commit_receipts WHERE execution_id = ?",
+      ).get(recovery.id) as { count: number }).count).toBe(0);
+    }
+  });
+
+  test("WORK-close recovery preserves boolean markers accepted immediately before terminal UPDATE", () => {
+    const cases = [
+      { closeResult: "failed" as const, segmentPhase: "FAILED", cause: "stop" as const },
+      { closeResult: "exhausted" as const, segmentPhase: "EXHAUSTED", cause: "timeout" as const },
+    ];
+    for (const scenario of cases) {
+      const raceDb = createExecutionSchema();
+      try {
+        createTerminalRecoverySchema(raceDb);
+        createWorkSegmentRecoverySchema(raceDb);
+        const deadlineAt = Date.now() + 10_000;
+        const markerAt = scenario.cause === "stop" ? deadlineAt - 1 : deadlineAt;
+        const settlementAt = deadlineAt + 1_000;
+        const executionId = `closed-work-boolean-marker-race-${scenario.cause}`;
+        const created = newExecution(raceDb, executionId, deadlineAt);
+        const working = transition(
+          raceDb, executionId, created.ownerToken, "ASSEMBLE", "WORK",
+        ).execution;
+        seedClosedWorkSegmentCrash(
+          raceDb,
+          executionId,
+          scenario.closeResult,
+          scenario.closeResult === "failed" ? "restart_existing_dispatch_no_replay" : "attempt_budget_exhausted",
+        );
+        raceDb.run("ALTER TABLE agent_turn_executions RENAME COLUMN cancel_requested_at TO cancel_requested");
+        let injected = false;
+        let acceptedCode: string | undefined;
+        const competingDb = new Proxy(raceDb, {
+          get(target, property) {
+            if (property !== "query") {
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            }
+            return (sql: string) => {
+              const statement = target.query(sql);
+              if (injected
+                || !sql.startsWith('UPDATE "agent_turn_executions" SET')
+                || !sql.includes('"terminal_code" = ?')
+                || !sql.includes('COALESCE("cancel_requested", 0) = 0')) return statement;
+              return new Proxy(statement, {
+                get(statementTarget, statementProperty) {
+                  if (statementProperty !== "run") {
+                    const value = Reflect.get(statementTarget, statementProperty, statementTarget);
+                    return typeof value === "function" ? value.bind(statementTarget) : value;
+                  }
+                  return (...bindings: Parameters<(typeof statementTarget)["run"]>) => {
+                    injected = true;
+                    acceptedCode = requestActiveTurnCancellation({
+                      db: target,
+                      executionId,
+                      ownerToken: created.ownerToken,
+                      reason: scenario.cause === "stop" ? "stopped" : "timed_out",
+                      now: markerAt,
+                    }).code;
+                    return statementTarget.run(...bindings);
+                  };
+                },
+              });
+            };
+          },
+        });
+
+        __testing.setReconciliationClock(() => settlementAt);
+        const first = reconcileAgentTurns(competingDb);
+        expect(first).toMatchObject({ complete: true, failedInterrupted: 0, projectionRepairs: 1 });
+        expect(injected).toBe(true);
+        expect(acceptedCode).toBe(scenario.cause === "stop" ? "cancelled" : "timed_out");
+        const expected = {
+          state: scenario.cause === "stop" ? "CANCELLED" : "TIMED_OUT",
+          terminal_code: scenario.cause === "stop" ? "cancelled" : "root_wall_clock_limit_exceeded",
+          cancel_requested: 1,
+          terminal_at: settlementAt,
+          updated_at: markerAt,
+          cas_revision: working.casRevision + 1,
+        };
+        const terminal = raceDb.query(
+          "SELECT state, terminal_code, cancel_requested, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+        ).get(executionId);
+        expect(terminal).toEqual(expected);
+        expect(terminal).not.toMatchObject({ state: scenario.segmentPhase });
+        expect((raceDb.query(
+          "SELECT COUNT(*) AS count FROM agent_chat_events WHERE user_id = ? AND turn_id = ? AND event_kind = 'terminal'",
+        ).get("u1", executionId) as { count: number }).count).toBe(1);
+        expect(reconcileAgentTurns(competingDb)).toMatchObject({ projectionRepairs: 0 });
+        expect(raceDb.query(
+          "SELECT state, terminal_code, cancel_requested, terminal_at, updated_at, cas_revision FROM agent_turn_executions WHERE id = ?",
+        ).get(executionId)).toEqual(expected);
+      } finally {
+        __testing.setReconciliationClock(null);
+        raceDb.close();
+      }
+    }
+  });
+  test("converges a pre-WORK runtime admission failure to rejected inspection and projection authority", () => {
+    createTerminalRecoverySchema(db);
+    const created = newExecution(db, "runtime-admission-terminal");
+    transitionTurnExecution({
+      db,
+      executionId: created.execution.id,
+      ownerToken: created.ownerToken,
+      expectedPhase: "ASSEMBLE",
+      nextPhase: "FAILED",
+      reason: "agentic_runtime_unavailable",
+    });
+
+    const recovered = reconcileAgentTurns(db);
+    expect(recovered.complete).toBe(true);
+    const inspection = db.query(
+      "SELECT lifecycle, status, outcome, reason, terminal FROM agent_run_attempts WHERE turn_id = ?",
+    ).get(created.execution.id) as {
+      lifecycle: string;
+      status: string;
+      outcome: string;
+      reason: string;
+      terminal: number;
+    };
+    expect(inspection).toEqual({
+      lifecycle: "TERMINAL",
+      status: "terminal",
+      outcome: "rejected",
+      reason: "invalid_input",
+      terminal: 1,
+    });
+
+    const projection = db.query(
+      "SELECT status, phase, snapshot_json FROM agent_run_projections WHERE turn_id = ?",
+    ).get(created.execution.id) as { status: string; phase: string; snapshot_json: string };
+    expect({
+      status: projection.status,
+      phase: projection.phase,
+      snapshot: JSON.parse(projection.snapshot_json),
+    }).toMatchObject({
+      status: "FAILED",
+      phase: "FAILED",
+      snapshot: {
+        workPhase: "TERMINAL",
+        workStatus: "terminal",
+        workOutcome: "rejected",
+        reason: "invalid_input",
+        error: { code: "invalid_input", workOutcome: "rejected" },
+      },
+    });
+  });
+
   test("accepts canonical historical terminal outcome with a status-only projection schema", () => {
     const created = newExecution(db, "legacy-terminal-outcome")
     transition(db, created.execution.id, created.ownerToken, "ASSEMBLE", "FAILED")
@@ -1230,7 +3433,7 @@ describe("receipt commit and startup recovery", () => {
         "receipt-repair-failure-receipt",
         "receipt-repair-failure",
         "receipt-repair-failure",
-        "ws1",
+        created.execution.workspaceId,
         "u1",
         "c1",
         created.commitKey,
@@ -1486,6 +3689,10 @@ describe("receipt commit and startup recovery", () => {
           quarantined: 0,
           bytesRemoved: 0,
         }),
+        reconcileWorkSegmentRecovery: () => ({
+          scanned: 0, active: 0, closed: 0, queued: 0, reclaimed: 0, fenced: 0, terminalized: 0,
+          complete: true, healthy: true,
+        }),
         reconcileAgentTurns: (startupDb) => reconcileAgentTurns(startupDb),
         reconcileAgentRunProjections: () => ({
           inspectedProjections: 0,
@@ -1596,7 +3803,7 @@ describe("receipt commit and startup recovery", () => {
         "priority-receipt-row",
         prioritized.execution.id,
         prioritized.execution.id,
-        "ws1",
+        prioritized.execution.workspaceId,
         "u1",
         "c1",
         prioritized.execution.commitKey,
@@ -1669,7 +3876,7 @@ describe("receipt commit and startup recovery", () => {
       error: { code: "decision_refresh_required", workOutcome: "rejected" },
     });
     expect(db.query(`
-      SELECT phase, terminal_code FROM agent_turn_executions WHERE id = ?
+      SELECT state AS phase, terminal_code FROM agent_turn_executions WHERE id = ?
     `).get("legacy-stale-decision")).toEqual({
       phase: "FAILED",
       terminal_code: "decision_refresh_required",
@@ -1742,7 +3949,7 @@ describe("receipt commit and startup recovery", () => {
       error: { code: "invalid_input", workOutcome: "rejected" },
     });
     expect(db.query(
-      "SELECT phase, terminal_code FROM agent_turn_executions WHERE id = ?",
+      "SELECT state AS phase, terminal_code FROM agent_turn_executions WHERE id = ?",
     ).get("legacy-premature-failed-projection")).toEqual({
       phase: "FAILED",
       terminal_code: "invalid_input",

@@ -2,6 +2,7 @@ import { presetsApi } from '@/api/presets'
 import type { Preset, UpdatePresetInput } from '@/types/api'
 import { looksLikeLoomPresetData, marshalUpdate, unmarshalPreset } from './service'
 import type { LoomPreset } from './types'
+import { commitRuntimeAuthorityMutation } from '@/lib/agentRuntimeSelection'
 
 const PENDING_LOOM_PRESETS_KEY = '__lumiverse_pending_loom_presets'
 const PENDING_LOOM_PRESET_ENVELOPE_KEY = '__lumiverse_pending_loom_preset_v2'
@@ -107,7 +108,8 @@ export interface PresetSaveCoordinator {
    * paths are rebased over that row; untouched paths always come from the row.
    */
   hydrate(preset: LoomPreset, token?: PresetHydrationToken): LoomPreset
-  /** Return the current per-preset draft, if this coordinator owns one. */
+  /** Observe a server-authoritative mutation once, rebasing any unrelated local draft paths. */
+  observeAuthority(preset: LoomPreset, transformDraft?: (draft: LoomPreset) => LoomPreset): boolean
   getDraft(presetId: string): LoomPreset | null
   /** True when the preset has unsaved local changes. */
   hasPendingChanges(presetId: string): boolean
@@ -509,12 +511,16 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
   const latestHydrationReadEpochs = new Map<string, number>()
   const confirmedEpochs = new Map<string, number>()
   const confirmedCacheRevisions = new Map<string, number>()
+  const confirmedConfigRevisions = new Map<string, number>()
   const confirmedSnapshots = new Map<string, LoomPreset>()
   const rememberConfirmedCacheRevision = (presetId: string, preset: LoomPreset): void => {
-    if (typeof preset.cacheRevision !== 'number') return
-    const previous = confirmedCacheRevisions.get(presetId)
-    if (previous === undefined || preset.cacheRevision > previous) {
-      confirmedCacheRevisions.set(presetId, preset.cacheRevision)
+    const cacheRevision = typeof preset.cacheRevision === 'number' ? preset.cacheRevision : 0
+    const configRevision = preset.agentConfigRevision
+    const previousCache = confirmedCacheRevisions.get(presetId)
+    const previousConfig = confirmedConfigRevisions.get(presetId)
+    if (previousCache === undefined || cacheRevision > previousCache) confirmedCacheRevisions.set(presetId, cacheRevision)
+    if (previousConfig === undefined || configRevision > previousConfig) confirmedConfigRevisions.set(presetId, configRevision)
+    if (previousCache === undefined || cacheRevision > previousCache || previousConfig === undefined || configRevision > previousConfig) {
       confirmedSnapshots.set(presetId, clone(preset))
     }
   }
@@ -532,6 +538,7 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
     latestHydrationReadEpochs.clear()
     confirmedEpochs.clear()
     confirmedCacheRevisions.clear()
+    confirmedConfigRevisions.clear()
     confirmedSnapshots.clear()
     pendingHydrations.clear()
   }
@@ -644,13 +651,21 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
         // and retrying here would defeat the server's compare-and-swap guard.
         throw error
       }
+      const persisted = unmarshalPreset(savedRow)
+      // A successful response is globally authoritative even if this editor
+      // scope became stale while the request was in flight. Commit before the
+      // local-scope guard so a stale A response invalidates runtime admission
+      // without ever being published into scope B.
+      if (persisted.cacheRevision !== pendingSnapshot.cacheRevision) {
+        commitRuntimeAuthorityMutation()
+      }
       const current = entries.get(presetId)
       if (scopeEpoch !== enqueueEpoch || current !== entry) {
         return clone(entry.confirmed)
       }
       const responseSource = current.queuedSnapshot ?? pendingSnapshot
       const saved = preserveResponseState(
-        unmarshalPreset(savedRow),
+        persisted,
         responseSource,
         savedRow,
       )
@@ -859,6 +874,38 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
       }
     },
 
+    observeAuthority(preset, transformDraft): boolean {
+      const entry = entries.get(preset.id)
+      const incomingCache = typeof preset.cacheRevision === 'number' ? preset.cacheRevision : 0
+      const incomingConfig = preset.agentConfigRevision
+      const knownCache = Math.max(
+        confirmedCacheRevisions.get(preset.id) ?? -1,
+        entry?.confirmed.cacheRevision ?? -1,
+      )
+      const knownConfig = Math.max(
+        confirmedConfigRevisions.get(preset.id) ?? -1,
+        entry?.confirmed.agentConfigRevision ?? -1,
+      )
+      if (incomingCache <= knownCache && incomingConfig <= knownConfig) return false
+      if (!entry) {
+        const created = ensure(preset.id, preset)
+        advanceConfirmedEpoch(preset.id)
+        publish(created)
+        evictCleanEntry(preset.id)
+        return true
+      }
+      const localDraft = transformDraft ? transformDraft(clone(entry.draft)) : entry.draft
+      entry.confirmed = clone(preset)
+      entry.draft = isDirty(entry.dirty)
+        ? rebaseDirtyPaths(preset, localDraft, entry.dirty)
+        : clone(preset)
+      rememberConfirmedCacheRevision(preset.id, preset)
+      advanceConfirmedEpoch(preset.id)
+      writePendingEnvelope(preset.id, entry, pendingStorageScope)
+      publish(entry)
+      evictCleanEntry(preset.id)
+      return true
+    },
     getDraft(presetId: string): LoomPreset | null {
       const entry = entries.get(presetId)
       return entry ? clone(entry.draft) : null
@@ -950,6 +997,7 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
       entries.set(preset.id, accepted)
       listenersByPreset.set(preset.id, accepted.listeners)
       confirmedCacheRevisions.delete(preset.id)
+      confirmedConfigRevisions.delete(preset.id)
       confirmedSnapshots.delete(preset.id)
       rememberConfirmedCacheRevision(preset.id, preset)
       advanceConfirmedEpoch(preset.id)
@@ -962,6 +1010,7 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
       const entry = entries.get(presetId)
       clearTimeout(entry?.timer)
       confirmedCacheRevisions.delete(presetId)
+      confirmedConfigRevisions.delete(presetId)
       confirmedSnapshots.delete(presetId)
       entries.delete(presetId)
       advanceConfirmedEpoch(presetId)
@@ -974,13 +1023,63 @@ export function createPresetSaveCoordinator(adapter: PresetSaveAdapter): PresetS
 export const presetSaveCoordinator = createPresetSaveCoordinator({
   update: (presetId, input) => presetsApi.update(presetId, input),
 })
+const committedAuthorityRevisions = new Map<string, { cache: number; config: number }>()
 
+function authorityRevision(row: Preset): { cache: number; config: number } {
+  return { cache: Number(row.cache_revision ?? 0), config: Number(row.agent_config_revision ?? 0) }
+}
+
+function advancesAuthorityRevision(
+  previous: { cache: number; config: number } | undefined,
+  next: { cache: number; config: number },
+): boolean {
+  return previous === undefined || next.cache > previous.cache || next.config > previous.config
+}
+
+export interface PresetAuthorityResult {
+  presetAuthorityChanged: boolean
+  presetAuthorities: Preset[]
+}
+
+/** Commits persisted authority globally, while publishing only into the originating scope. */
+export function applyPresetAuthorityResult(
+  result: PresetAuthorityResult,
+  expectedScopeEpoch = presetSaveCoordinator.getScopeEpoch(),
+  transformDraft?: (draft: LoomPreset) => LoomPreset,
+): boolean {
+  const scopeIsCurrent = presetSaveCoordinator.getScopeEpoch() === expectedScopeEpoch
+  if (!scopeIsCurrent) {
+    if (result.presetAuthorityChanged && result.presetAuthorities.length > 0) {
+      commitRuntimeAuthorityMutation()
+    }
+    return false
+  }
+
+  let observed = false
+  let shouldCommit = false
+  for (const row of result.presetAuthorities) {
+    const nextRevision = authorityRevision(row)
+    const committedRevision = committedAuthorityRevisions.get(row.id)
+    const advancesCommittedAuthority = advancesAuthorityRevision(committedRevision, nextRevision)
+    if (result.presetAuthorityChanged && advancesCommittedAuthority) shouldCommit = true
+    if (advancesCommittedAuthority) {
+      committedAuthorityRevisions.set(row.id, {
+        cache: Math.max(committedRevision?.cache ?? 0, nextRevision.cache),
+        config: Math.max(committedRevision?.config ?? 0, nextRevision.config),
+      })
+    }
+    observed = presetSaveCoordinator.observeAuthority(unmarshalPreset(row), transformDraft) || observed
+  }
+  if (shouldCommit) commitRuntimeAuthorityMutation()
+  return observed
+}
 const durableRecoveryFlushes = new Map<string, Promise<void>>()
 export function setPresetSaveCoordinatorScope(scope: string | null): void {
   const previousScopeEpoch = presetSaveCoordinator.getScopeEpoch()
   presetSaveCoordinator.setScope(scope)
   if (presetSaveCoordinator.getScopeEpoch() !== previousScopeEpoch) {
     durableRecoveryFlushes.clear()
+    committedAuthorityRevisions.clear()
   }
 }
 export async function flushPresetForGeneration(presetId: string | undefined): Promise<void> {

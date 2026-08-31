@@ -454,6 +454,13 @@ function deleteLegacyActivityRows(db: Database, input: RetainAgentInspectionSour
   );
 }
 
+type ExecutionOwnershipColumn =
+  | "turn_id"
+  | "execution_id"
+  | "workspace_id"
+  | "task_id"
+  | "source_task_id";
+
 function deleteExecutionScopedRows(
   db: Database,
   table: string,
@@ -461,15 +468,33 @@ function deleteExecutionScopedRows(
   executionIds: readonly string[],
   workspaceIds: readonly string[],
   taskIds: readonly string[],
-  columns: readonly ("turn_id" | "execution_id" | "workspace_id" | "task_id")[],
+  columns: readonly ExecutionOwnershipColumn[],
+  columnCache: Map<string, ReadonlySet<string>>,
 ): void {
-  if (!hasTable(db, table)) return;
+  let tableColumns = columnCache.get(table);
+  if (tableColumns === undefined) {
+    const discoveredColumns = new Set<string>();
+    if (hasTable(db, table)) {
+      const quotedTable = table.replaceAll('"', '""');
+      const rows = db.query(`PRAGMA table_info("${quotedTable}")`).all() as unknown[];
+      for (const row of rows) {
+        if (typeof row === "object" && row !== null && "name" in row && typeof row.name === "string") {
+          discoveredColumns.add(row.name);
+        }
+      }
+    }
+    tableColumns = discoveredColumns;
+    columnCache.set(table, tableColumns);
+  }
+  if (!tableColumns.has("user_id")) return;
+
   const predicates: string[] = [];
   const params: string[] = [userId];
   for (const column of columns) {
+    if (!tableColumns.has(column)) continue;
     const ids = column === "workspace_id"
       ? workspaceIds
-      : column === "task_id"
+      : column === "task_id" || column === "source_task_id"
         ? taskIds
         : executionIds;
     if (ids.length === 0) continue;
@@ -477,8 +502,9 @@ function deleteExecutionScopedRows(
     params.push(...ids);
   }
   if (predicates.length === 0) return;
+  const quotedTable = table.replaceAll('"', '""');
   db.query(
-    `DELETE FROM ${table}
+    `DELETE FROM "${quotedTable}"
       WHERE user_id = ? AND (${predicates.join(" OR ")})`,
   ).run(...params);
 }
@@ -501,6 +527,7 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
   ).all(...target.params) as Array<{ id: string }>;
   const executionIds = [...new Set(executions.map((row) => row.id).filter(validId))];
   if (executionIds.length === 0) return;
+  const tableColumnCache = new Map<string, ReadonlySet<string>>();
   const executionMarks = placeholders(executionIds.length);
   const workspaceIds = hasTable(db, "agent_turn_workspaces")
     ? (db.query(
@@ -537,6 +564,7 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
     [],
     [],
     ["turn_id"],
+    tableColumnCache,
   );
   deleteExecutionScopedRows(
     db,
@@ -546,6 +574,7 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
     [],
     [],
     ["turn_id"],
+    tableColumnCache,
   );
 
 
@@ -559,6 +588,7 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
     workspaceIds,
     taskIds,
     ["turn_id", "execution_id", "workspace_id"],
+    tableColumnCache,
   );
   deleteExecutionScopedRows(
     db,
@@ -568,8 +598,9 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
     [],
     [],
     ["turn_id"],
+    tableColumnCache,
   );
-  for (const table of ["agent_workspace_records", "agent_workspace_submissions", "agent_workspace_artifacts"] as const) {
+  for (const table of ["agent_workspace_records", "agent_workspace_submissions"] as const) {
     deleteExecutionScopedRows(
       db,
       table,
@@ -578,8 +609,19 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
       workspaceIds,
       taskIds,
       ["turn_id", "workspace_id", "task_id"],
+      tableColumnCache,
     );
   }
+  deleteExecutionScopedRows(
+    db,
+    "agent_workspace_artifacts",
+    input.userId,
+    executionIds,
+    workspaceIds,
+    taskIds,
+    ["turn_id", "workspace_id", "source_task_id"],
+    tableColumnCache,
+  );
   deleteExecutionScopedRows(
     db,
     "agent_workspace_tasks",
@@ -588,6 +630,7 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
     workspaceIds,
     [],
     ["turn_id", "workspace_id"],
+    tableColumnCache,
   );
   deleteExecutionScopedRows(
     db,
@@ -597,6 +640,7 @@ function removeOperationalSourceRows(db: Database, input: RetainAgentInspectionS
     workspaceIds,
     [],
     ["turn_id", "execution_id", "workspace_id"],
+    tableColumnCache,
   );
   db.query(
     `DELETE FROM agent_turn_executions WHERE id IN (${executionMarks}) AND user_id = ?`,

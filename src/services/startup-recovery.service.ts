@@ -17,7 +17,11 @@ import { shutdownPromptAssemblyWorkerPool } from "./prompt-assembly-worker-clien
 import { reconcileStaleExportStaging, type ExportStagingReconcileResult } from "./user-data/export.service";
 import { reconcileUserDataImports, type ImportRecoveryResult } from "./user-data/import.service";
 import { reconcilePurgeCleanupIntents } from "./user-data/purge.service";
-import { installAgenticGenerationCoordinator } from "./agentic-generation-coordinator.service";
+import {
+  installAgenticGenerationCoordinator,
+  resumeQueuedWorkCompletionsAfterInstallV1,
+  resumeQueuedWorkSegmentsAfterInstallV1,
+} from "./agentic-generation-coordinator.service";
 import {
   reconcileAgentTurns,
   registerAgentTurnReceiptRepair,
@@ -33,6 +37,10 @@ import {
   repairAgentRunProjectionFromReceipt,
   type AgentRunProjectionReconcileResult,
 } from "./agent-run-projection.service";
+import {
+  reconcileWorkSegmentRecoveryAtStartupV1,
+  type ReconcileWorkSegmentRecoveryResultV1,
+} from "./agentic-work-segment.repository";
 
 export type StartupRecoveryStage = "imports" | "artifacts" | "turns" | "projections" | "isolate" | "readiness" | "coordinator";
 
@@ -77,6 +85,7 @@ export interface StartupRecoveryResult {
    */
   readonly artifacts: ArtifactReconcileResult;
   readonly turns: ReconcileAgentTurnsResult;
+  readonly workSegments: ReconcileWorkSegmentRecoveryResultV1;
   readonly projections: AgentRunProjectionReconcileResult;
   readonly stages: StartupRecoveryStages;
   readonly isolate: IsolateHealthSnapshotV1;
@@ -99,6 +108,19 @@ export interface StartupRecoveryDependencies {
   readonly reconcilePurgeCleanupIntents?: () => void;
   readonly reconcileAgentArtifactBlobs?: (options: { readonly db: Database; readonly maxRows?: number }) => Promise<ArtifactReconcileResult>;
   readonly reconcileAgentTurns?: (db: Database) => ReconcileAgentTurnsResult;
+  readonly reconcileWorkSegmentRecovery?: (db: Database, runtimeEpoch: number) => ReconcileWorkSegmentRecoveryResultV1;
+  readonly resumeQueuedWorkCompletions?: (runtimeEpoch: number) => Promise<{
+    readonly resumed: number;
+    readonly terminalized: number;
+    readonly complete: boolean;
+    readonly healthy: boolean;
+  }>;
+  readonly resumeQueuedWorkSegments?: (runtimeEpoch: number) => Promise<{
+    readonly resumed: number;
+    readonly terminalized: number;
+    readonly complete: boolean;
+    readonly healthy: boolean;
+  }>;
   readonly reconcileAgentRunProjections?: (db: Database) => AgentRunProjectionReconcileResult;
   readonly probeIsolateBackendsAtStartup?: () => Promise<IsolateHealthSnapshotV1>;
   readonly setAgenticRuntimeReadiness?: (
@@ -126,6 +148,9 @@ const defaultDependencies: Required<StartupRecoveryDependencies> = {
 
   reconcileAgentArtifactBlobs,
   reconcileAgentTurns,
+  reconcileWorkSegmentRecovery: reconcileWorkSegmentRecoveryAtStartupV1,
+  resumeQueuedWorkCompletions: resumeQueuedWorkCompletionsAfterInstallV1,
+  resumeQueuedWorkSegments: resumeQueuedWorkSegmentsAfterInstallV1,
   reconcileAgentRunProjections,
   probeIsolateBackendsAtStartup,
   setAgenticRuntimeReadiness,
@@ -138,7 +163,7 @@ const RECONCILIATION_CONTINUATION_MAX_DELAY_MS = 30_000;
 interface StartupContinuationReadiness {
   readonly schema: boolean;
   readonly archiveRegistry: boolean;
-  readonly turnsReady: boolean;
+  turnsReady: boolean;
   artifactsReady: boolean;
   projectionsReady: boolean;
   readonly isolateTermination: boolean;
@@ -167,17 +192,30 @@ function continuationReadinessPatch(state: StartupContinuationReadiness) {
     isolateTermination: state.isolateTermination,
   } as const;
 }
+async function drainQueuedWorkRecoveryV1(
+  deps: Required<StartupRecoveryDependencies>,
+  runtimeEpoch: number,
+): Promise<{ readonly healthy: boolean; readonly complete: boolean }> {
+  const completions = await deps.resumeQueuedWorkCompletions(runtimeEpoch);
+  if (!completions.healthy || !completions.complete) {
+    return Object.freeze({ healthy: completions.healthy, complete: false });
+  }
+  const active = await deps.resumeQueuedWorkSegments(runtimeEpoch);
+  return Object.freeze({ healthy: active.healthy, complete: active.healthy && active.complete });
+}
+
 
 function scheduleReconciliationContinuation(
   db: Database,
   deps: Required<StartupRecoveryDependencies>,
   readiness: StartupContinuationReadiness,
-  initial: { readonly artifactsPending: boolean; readonly projectionsPending: boolean },
+  initial: { readonly runtimeEpoch: number; readonly workSegmentsPending: boolean; readonly artifactsPending: boolean; readonly projectionsPending: boolean },
 ): void {
   reconciliationContinuationGeneration++;
   const generation = reconciliationContinuationGeneration;
   reconciliationContinuationTimer?.cancel();
   reconciliationContinuationTimer = undefined;
+  let workSegmentsPending = initial.workSegmentsPending;
   let artifactsPending = initial.artifactsPending;
   let projectionsPending = initial.projectionsPending;
   let delayMs = RECONCILIATION_CONTINUATION_INITIAL_DELAY_MS;
@@ -227,6 +265,37 @@ function scheduleReconciliationContinuation(
             artifactsPending = true;
           }
         }
+        if (workSegmentsPending) {
+          try {
+            const result = deps.reconcileWorkSegmentRecovery(db, initial.runtimeEpoch);
+            if (!result.healthy) {
+              workSegmentsPending = false;
+              readiness.turnsReady = false;
+              readinessChanged = true;
+              logStageFailure("turns", "unhealthy");
+            } else if (result.complete) {
+              const drained = await drainQueuedWorkRecoveryV1(deps, initial.runtimeEpoch);
+              if (!drained.healthy) {
+                workSegmentsPending = false;
+                readiness.turnsReady = false;
+                readinessChanged = true;
+                logStageFailure("turns", "unhealthy");
+              } else if (drained.complete) {
+                const turnResult = deps.reconcileAgentTurns(db);
+                readiness.turnsReady = turnResult.complete !== false;
+                workSegmentsPending = readiness.turnsReady === false;
+                readinessChanged = true;
+              } else {
+                workSegmentsPending = true;
+              }
+            }
+          } catch {
+            workSegmentsPending = false;
+            readiness.turnsReady = false;
+            readinessChanged = true;
+            logStageFailure("turns", "stage_failed");
+          }
+        }
         if (projectionsPending) {
           try {
             const result = deps.reconcileAgentRunProjections(db);
@@ -243,7 +312,7 @@ function scheduleReconciliationContinuation(
             logStageFailure("projections", "stage_failed");
           }
         }
-        const pending = artifactsPending || projectionsPending;
+        const pending = workSegmentsPending || artifactsPending || projectionsPending;
         const published = !readinessChanged || publishReadiness();
         if (pending || !published) scheduleNext();
       } finally {
@@ -411,11 +480,11 @@ function installProductionReceiptRepairer(db: Database): void {
   });
 }
 /**
- * Reconcile durable state in one fixed order before any route, provider, or
- * extension module is allowed to start. Import recovery owns its own lease and
- * archive invariant; artifact recovery owns its journal; turn recovery repairs
- * receipts and the public projection only. None of these stages dispatches a
- * provider or publishes a websocket event.
+ * Reconcile durable state in one fixed order before routes and extensions may
+ * start. Pre-install import/artifact/turn/projection housekeeping never invokes
+ * providers. After every coordinator authority is installed, the bounded WORK
+ * recovery drain may resume only atomically claimed admitted/no-dispatch
+ * segments; generic turn repair then reconciles their resulting terminal state.
  */
 export async function reconcileStartupState(
   db: Database,
@@ -474,12 +543,27 @@ export async function reconcileStartupState(
   }
 
   let turns = emptyTurnReconcileResult(runtimeEpoch);
+  let workSegments: ReconcileWorkSegmentRecoveryResultV1 = Object.freeze({
+    scanned: 0, active: 0, closed: 0, queued: 0, reclaimed: 0, fenced: 0, terminalized: 0,
+    complete: false, healthy: false,
+  });
   let turnsReady = false;
+  let workSegmentContinuationPending = false;
+  let turnFailureCode: StartupStageFailureCode = "stage_failed";
   try {
     installProductionTerminalRecovery(db);
     installProductionReceiptRepairer(db);
-    turns = deps.reconcileAgentTurns(db);
-    turnsReady = turns.complete !== false;
+    workSegments = deps.reconcileWorkSegmentRecovery(db, runtimeEpoch);
+    if (workSegments.complete && workSegments.healthy && workSegments.queued === 0) {
+      turns = deps.reconcileAgentTurns(db);
+      turnsReady = turns.complete !== false;
+      workSegmentContinuationPending = turnsReady === false;
+    } else if (workSegments.healthy) {
+      workSegmentContinuationPending = true;
+    } else {
+      turnFailureCode = "unhealthy";
+      logStageFailure("turns", "unhealthy");
+    }
   } catch {
     logStageFailure("turns", "stage_failed");
   } finally {
@@ -550,6 +634,22 @@ export async function reconcileStartupState(
   let coordinatorOutcome: StartupStageOutcome = completedStage();
   try {
     deps.installAgenticGenerationCoordinator();
+    if (workSegments.complete && workSegments.healthy && workSegments.queued > 0) {
+      const drained = await drainQueuedWorkRecoveryV1(deps, runtimeEpoch);
+      if (!drained.healthy) {
+        turnFailureCode = "unhealthy";
+        workSegmentContinuationPending = false;
+        logStageFailure("turns", turnFailureCode);
+      } else if (drained.complete) {
+        turns = deps.reconcileAgentTurns(db);
+        turnsReady = turns.complete !== false;
+        continuationReadiness.turnsReady = turnsReady;
+        workSegmentContinuationPending = turnsReady === false;
+        readiness = deps.setAgenticRuntimeReadiness(continuationReadinessPatch(continuationReadiness));
+      } else {
+        workSegmentContinuationPending = true;
+      }
+    }
   } catch {
     logStageFailure("coordinator", "stage_failed");
     closeReadinessForAgenticFailure();
@@ -559,14 +659,16 @@ export async function reconcileStartupState(
   if (isolateOutcome.ok && !readiness.isolateTermination) {
     isolateOutcome = failedStage("unhealthy");
   }
-
-  if ((artifactContinuationPending || projectionContinuationPending) && readinessOutcome.ok && coordinatorOutcome.ok) {
+  if ((workSegmentContinuationPending || artifactContinuationPending || projectionContinuationPending) && readinessOutcome.ok && coordinatorOutcome.ok) {
     try {
       scheduleReconciliationContinuation(db, deps, continuationReadiness, {
+        runtimeEpoch,
+        workSegmentsPending: workSegmentContinuationPending,
         artifactsPending: artifactContinuationPending,
         projectionsPending: projectionContinuationPending,
       });
     } catch {
+      if (workSegmentContinuationPending) logStageFailure("turns", "stage_failed");
       if (artifactContinuationPending) logStageFailure("artifacts", "stage_failed");
       if (projectionContinuationPending) logStageFailure("projections", "stage_failed");
     }
@@ -574,7 +676,7 @@ export async function reconcileStartupState(
   const stages: StartupRecoveryStages = {
     imports: importsReady ? completedStage() : failedStage(importFailureCode),
     artifacts: artifactsReady ? completedStage() : artifactContinuationPending ? pendingStage() : failedStage(artifactFailureCode),
-    turns: turnsReady ? completedStage() : failedStage(),
+    turns: turnsReady ? completedStage() : workSegmentContinuationPending ? pendingStage() : failedStage(turnFailureCode),
     projections: projectionsReady ? completedStage() : projectionContinuationPending ? pendingStage() : failedStage(projectionFailureCode),
     isolate: isolateOutcome,
     readiness: readinessOutcome,
@@ -585,6 +687,7 @@ export async function reconcileStartupState(
     imports,
     artifacts,
     turns,
+    workSegments,
     projections,
     stages,
     isolate,

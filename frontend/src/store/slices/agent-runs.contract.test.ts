@@ -121,8 +121,135 @@ function inspectionDetail(overrides: Record<string, unknown> = {}): Record<strin
     workspaceAssociations: [],
     stop: null,
     retry: { allowed: false, reason: 'none', targetValid: true, linkedAttemptId: 'attempt-a' },
+    workSegments: null,
     sectionAvailability: inspectionSections,
     ...overrides,
+  }
+}
+
+function workSegmentInspection(phaseId: string | null = 'research') {
+  const usage = {
+    providerDispatches: 1,
+    providerInputTokens: 8,
+    providerOutputTokens: 2,
+    providerTotalTokens: 10,
+    billedOutputTokens: 2,
+    toolCalls: 1,
+    workspaceOperations: 1,
+    unsignedBoundaries: 0,
+    receiveBytes: 48,
+    publishedOutputBytes: 0,
+  }
+  const identity = { segmentId: 'segment-a', phaseId, phaseIndex: 0, phaseOccurrence: 0, segmentOrdinal: 0 }
+  return {
+    recovery: {
+      state: 'closed',
+      phaseId: null,
+      phaseIndex: null,
+      phaseOccurrence: null,
+      nextSegmentOrdinal: 1,
+      currentSegmentId: null,
+      workspaceRevision: 3,
+      terminalCloseResult: null,
+      terminalBoundaryClass: null,
+      usage: { ...usage, segments: 1 },
+    },
+    segments: [{
+      identity,
+      lifecycle: 'closed',
+      workspaceRevision: 2,
+      boundaryClass: 'tool_free_stop',
+      closeResult: 'work_complete',
+      closedWorkspaceRevision: 3,
+      usage,
+    }],
+    dispatches: [{
+      dispatchId: 'dispatch-a',
+      segmentId: 'segment-a',
+      dispatchOrdinal: 0,
+      lifecycle: 'settled',
+      toolMode: 'required',
+      budgetClass: 'normal',
+      workspaceRevision: 2,
+      settledWorkspaceRevision: 3,
+      boundaryClass: 'tool_free_stop',
+      usage,
+    }],
+    transitions: [{
+      transitionId: 'transition-a',
+      handoffId: 'handoff-a',
+      transitionKind: 'terminal',
+      sourceSegment: identity,
+      sourceWorkspaceRevision: 3,
+      targetPhaseId: null,
+      targetPhaseIndex: null,
+      targetPhaseOccurrence: null,
+      targetSegmentOrdinal: null,
+      cause: 'tool_free_stop',
+    }],
+  }
+}
+
+function activeWorkSegmentInspection(phaseId: string | null = 'research') {
+  const projection = workSegmentInspection(phaseId)
+  return {
+    ...projection,
+    recovery: {
+      ...projection.recovery,
+      state: 'active',
+      phaseId,
+      phaseIndex: 0,
+      phaseOccurrence: 0,
+      nextSegmentOrdinal: 0,
+      currentSegmentId: 'segment-a',
+      terminalCloseResult: null,
+      terminalBoundaryClass: null,
+    },
+    segments: projection.segments.map((segment) => ({
+      ...segment,
+      lifecycle: 'running',
+      boundaryClass: null,
+      closeResult: null,
+      closedWorkspaceRevision: null,
+    })),
+    dispatches: projection.dispatches.map((dispatch) => ({
+      ...dispatch,
+      lifecycle: 'in_flight',
+      settledWorkspaceRevision: null,
+      boundaryClass: null,
+      usage: null,
+    })),
+    transitions: [],
+  }
+}
+
+function advancingWorkSegmentInspection() {
+  const projection = workSegmentInspection('research')
+  return {
+    ...projection,
+    recovery: {
+      ...projection.recovery,
+      state: 'active',
+      phaseId: 'draft',
+      phaseIndex: 1,
+      phaseOccurrence: 0,
+      nextSegmentOrdinal: 1,
+      currentSegmentId: null,
+      terminalCloseResult: null,
+      terminalBoundaryClass: null,
+    },
+    segments: projection.segments.map((segment) => ({
+      ...segment,
+      closeResult: 'phase_advanced',
+    })),
+    transitions: projection.transitions.map((transition) => ({
+      ...transition,
+      transitionKind: 'advance',
+      targetPhaseId: 'draft',
+      targetPhaseIndex: 1,
+      targetPhaseOccurrence: 0,
+      targetSegmentOrdinal: 1,
+    })),
   }
 }
 
@@ -268,6 +395,7 @@ function promptEvidence(overrides: Record<string, unknown> = {}): Record<string,
     sourceId: 'source-a',
     sourceRevision: 1,
     destination: 'completion_handoff',
+    promptOrder: 0,
     role: 'context',
     correlation: { ...inspectionCorrelation },
     included: true,
@@ -513,11 +641,144 @@ describe('strict owner inspection contracts', () => {
     ])
   })
 
+  test('accepts custom and built-in WORK identities while rejecting private recovery authority', () => {
+    const custom = normalizeAgentRunInspectionDetailV1(inspectionDetail({ workSegments: workSegmentInspection('research') }))
+    expect(custom?.workSegments?.segments[0]?.identity.phaseId).toBe('research')
+    expect(custom?.workSegments?.transitions[0]).toMatchObject({ handoffId: 'handoff-a', transitionKind: 'terminal' })
+
+    const builtIn = normalizeAgentRunInspectionDetailV1(inspectionDetail({ workSegments: workSegmentInspection(null) }))
+    expect(builtIn?.workSegments?.segments[0]?.identity.phaseId).toBeNull()
+    expect(JSON.stringify(builtIn?.workSegments)).not.toMatch(/resumeEnvelope|credentialSecretRef|effectiveEndpoint|fingerprint|snapshot|generationParameters|resumeInput|userInput|regenFeedback|decisionAuthority|providerTransientCarrier/)
+
+    const hostile = workSegmentInspection(null)
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...hostile,
+        recovery: {
+          ...hostile.recovery,
+          resumeEnvelope: { credentialSecretRef: 'secret-ref', userInput: 'private prompt' },
+        },
+      },
+    }))).toBeNull()
+  })
+
+  test('rejects incoherent WORK recovery, segment, and dispatch state unions', () => {
+    const active = activeWorkSegmentInspection()
+    const closed = workSegmentInspection()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({ workSegments: active }))).not.toBeNull()
+
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: { ...active, recovery: { ...active.recovery, state: 'closed' } },
+    }))).toBeNull()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: { ...closed, recovery: { ...closed.recovery, state: 'active' } },
+    }))).toBeNull()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...active,
+        recovery: { ...active.recovery, terminalCloseResult: 'failed' },
+      },
+    }))).toBeNull()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...active,
+        segments: active.segments.map((segment) => ({ ...segment, closeResult: 'failed' })),
+      },
+    }))).toBeNull()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...active,
+        dispatches: active.dispatches.map((dispatch) => ({ ...dispatch, settledWorkspaceRevision: 3 })),
+      },
+    }))).toBeNull()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...closed,
+        dispatches: closed.dispatches.map((dispatch) => ({ ...dispatch, usage: null })),
+      },
+    }))).toBeNull()
+  })
+
+  test('rejects terminal transitions with targets and advances without targets', () => {
+    const terminal = workSegmentInspection()
+    const advancing = advancingWorkSegmentInspection()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({ workSegments: advancing }))).not.toBeNull()
+
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...terminal,
+        transitions: terminal.transitions.map((transition) => ({
+          ...transition,
+          targetPhaseId: 'draft',
+          targetPhaseIndex: 1,
+          targetPhaseOccurrence: 0,
+          targetSegmentOrdinal: 1,
+        })),
+      },
+    }))).toBeNull()
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      workSegments: {
+        ...advancing,
+        transitions: advancing.transitions.map((transition) => ({
+          ...transition,
+          targetPhaseId: null,
+          targetPhaseIndex: null,
+          targetPhaseOccurrence: null,
+          targetSegmentOrdinal: null,
+        })),
+      },
+    }))).toBeNull()
+  })
+
+  test('rejects missing WORK references and non-contiguous local ordinals', () => {
+    const active = activeWorkSegmentInspection()
+    const closed = workSegmentInspection()
+    const advancing = advancingWorkSegmentInspection()
+    const invalidProjections = [
+      { ...active, recovery: { ...active.recovery, currentSegmentId: 'missing-segment' } },
+      { ...closed, dispatches: closed.dispatches.map((dispatch) => ({ ...dispatch, segmentId: 'missing-segment' })) },
+      {
+        ...closed,
+        transitions: closed.transitions.map((transition) => ({
+          ...transition,
+          sourceSegment: { ...transition.sourceSegment, segmentId: 'missing-segment' },
+        })),
+      },
+      {
+        ...closed,
+        segments: closed.segments.map((segment) => ({
+          ...segment,
+          identity: { ...segment.identity, segmentOrdinal: 1 },
+        })),
+      },
+      { ...closed, dispatches: closed.dispatches.map((dispatch) => ({ ...dispatch, dispatchOrdinal: 1 })) },
+      { ...closed, recovery: { ...closed.recovery, nextSegmentOrdinal: 2 } },
+      {
+        ...advancing,
+        transitions: advancing.transitions.map((transition) => ({ ...transition, targetSegmentOrdinal: 2 })),
+      },
+      {
+        ...closed,
+        recovery: { ...closed.recovery, usage: { ...closed.recovery.usage, segments: 2 } },
+      },
+    ]
+    for (const workSegments of invalidProjections) {
+      expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({ workSegments }))).toBeNull()
+    }
+  })
+
   test('normalizes detail-only section availability as the canonical nine-entry projection', () => {
     const normalized = normalizeAgentRunInspectionDetailV1(inspectionDetail())
 
     expect(normalized?.sectionAvailability).toEqual(inspectionSections)
     expect(normalized?.sectionAvailability).toHaveLength(9)
+  })
+
+  test('rejects inspection detail that omits required WORK segment authority', () => {
+    const detail = inspectionDetail()
+    delete detail.workSegments
+
+    expect(normalizeAgentRunInspectionDetailV1(detail)).toBeNull()
   })
 
   test('keeps a normal source target distinct from the committed Response target', () => {
@@ -614,6 +875,69 @@ describe('strict owner inspection contracts', () => {
       }],
     }))).toBeNull()
   })
+  test('uses source, revision, order, and destination as prompt occurrence identity', () => {
+    const distinctOccurrences = normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      promptEvidence: [
+        promptEvidence({ id: 'prompt-three', sourceId: 'shared-source', sourceRevision: 7, promptOrder: 3, role: 'system', content: 'SYSTEM OCCURRENCE' }),
+        promptEvidence({ id: 'prompt-seven', sourceId: 'shared-source', sourceRevision: 7, promptOrder: 7, role: 'user', content: 'USER OCCURRENCE', contentDigest: 'b'.repeat(64) }),
+      ],
+    }))
+    expect(distinctOccurrences?.promptEvidence.map(({ promptOrder, role, content }) => ({ promptOrder, role, content }))).toEqual([
+      { promptOrder: 3, role: 'system', content: 'SYSTEM OCCURRENCE' },
+      { promptOrder: 7, role: 'user', content: 'USER OCCURRENCE' },
+    ])
+
+    const distinctDestinations = normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      promptEvidence: [
+        promptEvidence({ id: 'root-occurrence', sourceId: 'shared-source', sourceRevision: 7, destination: 'root_work' }),
+        promptEvidence({ id: 'render-occurrence', sourceId: 'shared-source', sourceRevision: 7, destination: 'render' }),
+      ],
+    }))
+    expect(distinctDestinations?.promptEvidence.map((evidence) => evidence.destination)).toEqual(['root_work', 'render'])
+
+    const repeatedCanonicalEvidence = normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      promptEvidence: [
+        promptEvidence({ id: 'canonical-a', sourceId: 'shared-source', sourceRevision: 7 }),
+        promptEvidence({
+          id: 'canonical-b',
+          sourceId: 'shared-source',
+          sourceRevision: 7,
+          correlation: { ...inspectionCorrelation, hostSequence: 2 },
+        }),
+      ],
+    }))
+    expect(repeatedCanonicalEvidence?.promptEvidence).toHaveLength(2)
+
+    const missingOrder = promptEvidence()
+    delete missingOrder.promptOrder
+    expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({ promptEvidence: [missingOrder] }))).toBeNull()
+    for (const promptOrder of [-1, '0']) {
+      expect(normalizeAgentRunInspectionDetailV1(inspectionDetail({
+        promptEvidence: [promptEvidence({ promptOrder })],
+      }))).toBeNull()
+    }
+  })
+
+  test('rejects contradictory canonical evidence for one prompt occurrence', () => {
+    const occurrence = { sourceId: 'collision', sourceRevision: 2, promptOrder: 0, destination: 'root_work' }
+    const normalizeContradiction = (override: Record<string, unknown>) => normalizeAgentRunInspectionDetailV1(inspectionDetail({
+      promptEvidence: [
+        promptEvidence({ ...occurrence, id: 'collision-a' }),
+        promptEvidence({ ...occurrence, id: 'collision-b', ...override }),
+      ],
+    }))
+
+    expect(normalizeContradiction({ role: 'system' })).toBeNull()
+    expect(normalizeContradiction({ content: 'Contradictory content' })).toBeNull()
+    expect(normalizeContradiction({ contentDigest: 'b'.repeat(64) })).toBeNull()
+    expect(normalizeContradiction({ included: false })).toBeNull()
+    expect(normalizeContradiction({ omissionReason: 'not selected' })).toBeNull()
+    expect(normalizeContradiction({
+      nativeProvenance: { kind: 'world_info', sourceId: 'world-a', sourceRevision: 2, sourceIndex: 0 },
+    })).toBeNull()
+    expect(normalizeContradiction({ loomInspection: loomInspection() })).toBeNull()
+  })
+
   test('accepts nullable transcript payloads, omitted Loom text, and completion-handoff evidence', () => {
     const normalized = normalizeAgentRunInspectionDetailV1(inspectionDetail({
       transcript: [transcriptRecord()],

@@ -34,6 +34,7 @@ function inspectionToBreakdown(inspection: AgentRunInspectionDetailV1): Record<s
     role: entry.role === "user" || entry.role === "assistant" ? entry.role : "system",
     content: entry.content,
     blockId: entry.sourceId,
+    promptOrder: entry.promptOrder,
     destination: entry.destination,
   }));
   const messages = prompts.map((entry) => ({

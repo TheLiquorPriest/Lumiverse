@@ -11,6 +11,7 @@ export interface UseAgentRunStopOptions {
   turnId: string
   chatId?: string
   generationId?: string
+  requestAuthorityId?: string
   terminal?: boolean
   onBeforeStop?: () => void
   onResult?: (result: AgentRunStopResultV2) => void
@@ -31,14 +32,15 @@ function makeStopRequestKey({
   turnId,
   chatId,
   generationId,
-}: Pick<UseAgentRunStopOptions, 'turnId' | 'chatId' | 'generationId'>): string {
+  requestAuthorityId,
+}: Pick<UseAgentRunStopOptions, 'turnId' | 'chatId' | 'generationId' | 'requestAuthorityId'>): string {
   // Structured serialization keeps absent IDs distinct from empty IDs.
-  return JSON.stringify([turnId, chatId ?? null, generationId ?? null])
+  return JSON.stringify([turnId, chatId ?? null, generationId ?? null, requestAuthorityId ?? null])
 }
 
 export function useAgentRunStop(options: UseAgentRunStopOptions) {
-  const { turnId, chatId, generationId, terminal = false, onBeforeStop, onResult, onSettled } = options
-  const requestKey = makeStopRequestKey({ turnId, chatId, generationId })
+  const { turnId, chatId, generationId, requestAuthorityId, terminal = false, onBeforeStop, onResult, onSettled } = options
+  const requestKey = makeStopRequestKey({ turnId, chatId, generationId, requestAuthorityId })
   const initialState: AgentRunStopState = 'idle'
   const requestKeyRef = useRef(requestKey)
   const requestTokenRef = useRef(0)
@@ -94,7 +96,7 @@ export function useAgentRunStop(options: UseAgentRunStopOptions) {
     )
 
     try {
-      const result = await agentRunsApi.stop(turnId, { chatId, generationId })
+      const result = await agentRunsApi.stop(turnId, { chatId, generationId, requestAuthorityId })
       if (!isCurrentRequest()) return
       if (result.turnId !== turnId) {
         throw new Error('agent_run_stop_target_mismatch')
@@ -110,7 +112,7 @@ export function useAgentRunStop(options: UseAgentRunStopOptions) {
         onSettled?.()
       }
     }
-  }, [chatId, generationId, onBeforeStop, onResult, onSettled, requestKey, state, turnId])
+  }, [chatId, generationId, onBeforeStop, onResult, onSettled, requestAuthorityId, requestKey, state, turnId])
 
   return {
     state,

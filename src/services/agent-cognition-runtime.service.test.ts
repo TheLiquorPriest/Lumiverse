@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import type { AgenticWorkMutatingWorkspaceOperationKindV1, AgenticWorkWorkspaceMutationReservationV1 } from "../types/agent-work-segment";
 import { closeDatabase, getDb, initDatabase } from "../db/connection";
 import type {
   LoomPolicyCheckpointV1,
@@ -34,7 +35,7 @@ function seed(): void {
     (id, user_id, chat_id, generation_id, target_kind, target_chat_revision, mode,
      runtime_epoch, deadline_at, state, root_ledger_json, frame_capabilities_json,
      commit_key, expires_at)
-    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999)`)
+    VALUES (?, ?, ?, ?, 'normal', 0, 'agentic', 1, 9999999999999, 'ASSEMBLE', '{}', '{}', ?, 9999999999999)`)
     .run(TURN_ID, USER_ID, CHAT_ID, "cognition-freeze-generation", "cognition-freeze-commit");
 }
 
@@ -45,9 +46,41 @@ function workspaceContext(expectedRevision: number, extra: Record<string, unknow
     turnId: TURN_ID,
     workspaceId: WORKSPACE_ID,
     actor: "root",
+    frameId: TURN_ID,
     expectedRevision,
     ...extra,
   };
+}
+
+function receiptReservation(
+  operationKey: string,
+  operationKind: AgenticWorkMutatingWorkspaceOperationKindV1,
+): AgenticWorkWorkspaceMutationReservationV1 {
+  const segmentId = "cognition-freeze-segment";
+  const db = getDb();
+  db.run("PRAGMA foreign_keys = OFF");
+  try {
+    db.query(`INSERT OR IGNORE INTO agent_work_segment_dispatches
+      (dispatch_id, user_id, execution_id, attempt_id, segment_id, workspace_id,
+       workspace_revision, execution_cas_revision, dispatch_ordinal, lifecycle,
+       tool_mode, budget_class, reserved_output_tokens, ordinary_output_tokens_reserved,
+       recovery_reserve_output_tokens_reserved, lease_owner, lease_expires_at,
+       fence_generation, idempotency_key, payload_digest, created_at, updated_at)
+      VALUES ('cognition-freeze-dispatch', ?, ?, 'cognition-freeze-attempt', ?, ?,
+              0, 0, 0, 'reserved', 'ordinary', 'normal', 1, 1, 0,
+              'cognition-freeze-owner', 9999999999999, 1, 'cognition-freeze-dispatch-key', ?, 1, 1)`)
+      .run(USER_ID, TURN_ID, segmentId, WORKSPACE_ID, "0".repeat(64));
+  } finally {
+    db.run("PRAGMA foreign_keys = ON");
+  }
+  return Object.freeze({
+    version: 1,
+    operationKey,
+    operationKind,
+    segmentId,
+    logicalDispatch: 0,
+    frameId: TURN_ID,
+  });
 }
 
 function loomSource(blockId: string, promptOrder: number): LoomPolicySourceV1 {
@@ -166,7 +199,21 @@ describe("agent cognition Loom checkpoint evidence", () => {
       taskId: TASK_ID,
       transition: "pending",
       operation: "create_task",
+      reservation: receiptReservation("create-after-work", "create_task"),
       workspace: workspaceContext(work.workspaceRevision, { title: "Created after WORK" }),
+    });
+    expect(mutation).toMatchObject({
+      operationKey: "create-after-work",
+      segmentId: "cognition-freeze-segment",
+      logicalDispatch: 0,
+      frameId: TURN_ID,
+    });
+    expect(getDb().query(
+      "SELECT segment_id, logical_dispatch, frame_id FROM agent_work_workspace_receipts WHERE operation_key = ?",
+    ).get("create-after-work")).toEqual({
+      segment_id: "cognition-freeze-segment",
+      logical_dispatch: 0,
+      frame_id: TURN_ID,
     });
     const laterWorkInspection = mutation.cognition.policySurface?.promptInspection;
     expect(laterWorkInspection).toBe(workInspection);
@@ -206,6 +253,84 @@ describe("agent cognition Loom checkpoint evidence", () => {
       outcome: { status: "included", reason: "selected" },
     });
     expect(renderInspection?.effectiveEntryIds).toEqual(["completion-entry", "render-entry"]);
+  });
+
+  test("selects repeated block IDs independently by prompt-order occurrence", () => {
+    const occurrenceZero = loomSource("shared-work-block", 0);
+    const occurrenceOne = loomSource("shared-work-block", 1);
+    const workPolicy = [
+      { ...loomEntry("occurrence-zero", occurrenceZero, "root_work", "WORK"), condition: undefined },
+      { ...loomEntry("occurrence-one", occurrenceOne, "root_work", "WORK"), condition: undefined },
+    ].map(({ condition: _condition, ...entry }) => entry);
+    const workspace = createTurnWorkspace({
+      userId: USER_ID,
+      chatId: CHAT_ID,
+      turnId: TURN_ID,
+      workspaceId: WORKSPACE_ID,
+      objective: "Select exact Loom occurrences",
+      constraints: [],
+      retention: "operational",
+      ttlSeconds: 100,
+      quota: { maxTasks: 8, maxRecords: 8, maxSubmissions: 8, maxArtifacts: 4, maxBytes: 2048 },
+      capabilities: {
+        revision: 1,
+        allowed: ["read_section", "read_page"],
+        maxOperationBytes: 131_072,
+        maxOperations: 128,
+      },
+    });
+    const runtime = createAgentCognitionRuntime({
+      source: {
+        graph: {
+          version: 1,
+          policies: {
+            workPolicy: [occurrenceZero, occurrenceOne].map((source) => ({
+              blockId: source.blockId,
+              expectedPresetRevision: source.presetRevision,
+              expectedBlockRevision: source.blockRevision,
+              promptOrder: source.promptOrder,
+            })),
+            workspaceUsage: [],
+            completionCriteria: [],
+            renderPolicy: [],
+          },
+          templates: [],
+        },
+        source: {
+          presetRevision: 1,
+          blocks: [
+            { blockId: occurrenceZero.blockId, revision: 1, promptOrder: 0 },
+            { blockId: occurrenceOne.blockId, revision: 1, promptOrder: 1 },
+          ],
+        },
+        loomPolicy: { version: 1, workPolicy, workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
+        loomBlocks: [
+          { source: occurrenceZero, content: "Occurrence zero runtime policy." },
+          { source: occurrenceOne, content: "Occurrence one runtime policy." },
+        ],
+      },
+      evaluation: {
+        generationType: "normal",
+        phase: "ASSEMBLE",
+        presetVariables: {},
+        participantFacts: {},
+        availableTools: [],
+        taskTransitions: {},
+      },
+      workspaceRevision: workspace.revision,
+      workspace: workspaceContext(workspace.revision),
+    });
+
+    const work = runtime.enterPhase({ phase: "WORK", workspace: workspaceContext(runtime.initialActivation.workspaceRevision) });
+    expect(work.promptBlocks.refs.map((ref) => [ref.blockId, ref.promptOrder])).toEqual([
+      ["shared-work-block", 0],
+      ["shared-work-block", 1],
+    ]);
+    expect(work.policySurface?.promptInspection?.effectiveEntryIds).toEqual(["occurrence-zero", "occurrence-one"]);
+    expect(work.policySurface?.promptInspection?.items.map((item) => item.effectiveText)).toEqual([
+      "Occurrence zero runtime policy.",
+      "Occurrence one runtime policy.",
+    ]);
   });
 
   test("discards later-checkpoint evidence from a blocked completion before task transition retry", async () => {
@@ -301,11 +426,24 @@ describe("agent cognition Loom checkpoint evidence", () => {
       taskId: TASK_ID,
       transition: "completed",
       operation: "submit_root_result",
-      operationKey: "complete-required-task",
+      reservation: receiptReservation("complete-required-task", "submit_root_result"),
       workspace: workspaceContext(blocked.workspaceRevision, {
         summary: "Required task completed after the blocked attempt",
         state: "completed",
       }),
+    });
+    expect(completedTask).toMatchObject({
+      operationKey: "complete-required-task",
+      segmentId: "cognition-freeze-segment",
+      logicalDispatch: 0,
+      frameId: TURN_ID,
+    });
+    expect(getDb().query(
+      "SELECT segment_id, logical_dispatch, frame_id FROM agent_work_workspace_receipts WHERE operation_key = ?",
+    ).get("complete-required-task")).toEqual({
+      segment_id: "cognition-freeze-segment",
+      logical_dispatch: 0,
+      frame_id: TURN_ID,
     });
     expect(completedTask.cognition.policySurface?.promptInspection?.items.find((item) => item.entryId === "blocked-work-entry")).toEqual(workItem);
 

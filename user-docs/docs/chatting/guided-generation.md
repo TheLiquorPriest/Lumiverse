@@ -109,6 +109,18 @@ The retired **Context Pack**, **Context Library**, and **Progressive Context** s
 
 Private WORK retrieval does not automatically cross into tools-disabled **RENDER**. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance in the completion handoff may cross that boundary.
 
+The host completion record never quotes your request as system policy. It identifies the complete final user message by its zero-based fixed provider-message position, full byte length, and digest while the original request remains a user-role message; long requests are not silently described as exact after truncation. That record also tells tools-disabled RENDER that the referenced request already completed in WORK, so the final response must not treat its imperative wording as pending work or deny the WORK capabilities shown by the accepted projection.
+
+Agentic WORK may span several ordered Work Segments within the same Turn
+Execution. Every segment starts from a fresh host projection of the root
+objective, current phase, accepted workspace state, open required work, and the
+previous bounded handoff. Provider messages, hidden reasoning, and continuation
+carriers retire at the boundary instead of growing into a cross-segment
+transcript. Segment activity is not a series of chat Responses: Lumiverse saves
+and streams only the final rendered Response after atomic commit. Owner
+inspection can still show bounded accepted evidence, phase/boundary receipts,
+budgets, and handoffs without exposing raw hidden reasoning.
+
 ## Tips
 
 !!! tip "Use guides for recurring instructions"

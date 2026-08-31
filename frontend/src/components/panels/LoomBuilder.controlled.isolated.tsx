@@ -145,7 +145,112 @@ mock.module('@/api/macros', () => ({
   getMacroCatalog: async () => ({ categories: [] }),
 }))
 mock.module('@/store', () => ({ useStore: mockedStore }))
-mock.module('@/hooks/useLoomBuilder', () => ({ useLoomBuilder: () => mainLoomState }))
+mock.module('@/hooks/useLoomBuilder', () => ({
+  useLoomBuilder: () => mainLoomState,
+  canMovePromptVariableBetweenOccurrences: (
+    source: { blockId: string; promptOrder: number },
+    target: { blockId: string; promptOrder: number },
+  ) => source.promptOrder !== target.promptOrder && source.blockId !== target.blockId,
+  encodeLoomBlockOccurrence: (target: { blockId: string; promptOrder: number }) => (
+    JSON.stringify([target.blockId, target.promptOrder])
+  ),
+  decodeLoomBlockOccurrence: (value: unknown) => {
+    if (typeof value !== 'string') return null
+    try {
+      const parsed = JSON.parse(value) as unknown
+      if (!Array.isArray(parsed) || parsed.length !== 2) return null
+      const [blockId, promptOrder] = parsed
+      if (typeof blockId !== 'string' || blockId.length === 0) return null
+      if (!Number.isSafeInteger(promptOrder) || promptOrder < 0) return null
+      return { blockId, promptOrder }
+    } catch {
+      return null
+    }
+  },
+  getLoomBlockAtOccurrence: (blocks: readonly { id: string }[], target: { blockId: string; promptOrder: number }) => {
+    const block = blocks[target.promptOrder]
+    return block?.id === target.blockId ? block : null
+  },
+  remapCategorySnapshotsForReorder: (
+    sourceBlocks: PromptBlock[],
+    reorderedEntries: readonly {
+      block: PromptBlock
+      source: { blockId: string; promptOrder: number } | null
+    }[],
+  ) => {
+    const encode = (target: { blockId: string; promptOrder: number }) => (
+      JSON.stringify([target.blockId, target.promptOrder])
+    )
+    const getAt = (blocks: readonly PromptBlock[], target: { blockId: string; promptOrder: number }) => {
+      if (!Number.isSafeInteger(target.promptOrder) || target.promptOrder < 0) return null
+      const block = blocks[target.promptOrder]
+      return block?.id === target.blockId ? block : null
+    }
+    const groups: Array<{ categoryBlock: PromptBlock | null; children: PromptBlock[] }> = []
+    let current: { categoryBlock: PromptBlock | null; children: PromptBlock[] } = {
+      categoryBlock: null,
+      children: [],
+    }
+    for (const block of sourceBlocks) {
+      if (block.marker === 'category') {
+        if (current.categoryBlock || current.children.length > 0) groups.push(current)
+        current = { categoryBlock: block, children: [] }
+      } else {
+        if (block.group !== undefined && block.group !== (current.categoryBlock?.id ?? null)) {
+          if (current.categoryBlock || current.children.length > 0) groups.push(current)
+          current = { categoryBlock: null, children: [] }
+        }
+        current.children.push(block)
+      }
+    }
+    if (current.categoryBlock || current.children.length > 0) groups.push(current)
+
+    const replacements = new Map<PromptBlock, Record<string, boolean>>()
+    for (const group of groups) {
+      const category = group.categoryBlock
+      const snapshot = category?.savedChildEnabled
+      if (!category || !snapshot) continue
+      const children = new Set(group.children)
+      const canonical: Record<string, boolean> = {}
+      for (let promptOrder = 0; promptOrder < sourceBlocks.length; promptOrder += 1) {
+        const child = sourceBlocks[promptOrder]!
+        if (!children.has(child)) continue
+        const coordinateKey = encode({ blockId: child.id, promptOrder })
+        if (Object.hasOwn(snapshot, coordinateKey)) canonical[coordinateKey] = snapshot[coordinateKey] === true
+        else if (Object.hasOwn(snapshot, child.id)) canonical[coordinateKey] = snapshot[child.id] === true
+      }
+      const keys = Object.keys(snapshot)
+      const same = keys.length === Object.keys(canonical).length
+        && keys.every((key) => Object.hasOwn(canonical, key) && snapshot[key] === canonical[key])
+      if (!same) replacements.set(category, canonical)
+    }
+    const canonicalSourceBlocks = replacements.size
+      ? sourceBlocks.map((block) => {
+        const savedChildEnabled = replacements.get(block)
+        return savedChildEnabled ? { ...block, savedChildEnabled } : block
+      })
+      : sourceBlocks
+    const targetBySource = new Map<string, { blockId: string; promptOrder: number }>()
+    for (let promptOrder = 0; promptOrder < reorderedEntries.length; promptOrder += 1) {
+      const entry = reorderedEntries[promptOrder]!
+      if (!entry.source) continue
+      const sourceBlock = getAt(canonicalSourceBlocks, entry.source)
+      if (!sourceBlock || sourceBlock.id !== entry.block.id) continue
+      targetBySource.set(encode(entry.source), { blockId: entry.block.id, promptOrder })
+    }
+    return reorderedEntries.map((entry) => {
+      if (!entry.source) return entry.block
+      const sourceBlock = getAt(canonicalSourceBlocks, entry.source)
+      if (!sourceBlock?.savedChildEnabled) return entry.block
+      const savedChildEnabled: Record<string, boolean> = {}
+      for (const [sourceKey, enabled] of Object.entries(sourceBlock.savedChildEnabled)) {
+        const target = targetBySource.get(sourceKey)
+        if (target) savedChildEnabled[encode(target)] = enabled
+      }
+      return { ...entry.block, savedChildEnabled }
+    })
+  },
+}))
 mock.module('@/hooks/usePresetProfiles', () => ({
   usePresetProfiles: () => ({
     hasDefaults: false,
@@ -206,13 +311,17 @@ mock.module('@/components/shared/PromptVariablesModal', () => ({
 const MockVariablesEditor = ({
   variables,
   onChange,
+  moveTargets,
+  onMoveToBlock,
 }: {
   variables: PromptVariableDef[]
   onChange: (variables: PromptVariableDef[]) => void
+  moveTargets?: Array<{ id: string; name: string }>
+  onMoveToBlock?: (variableId: string, targetBlockId: string) => void
 }) => createElement(
   'div',
   { 'data-testid': 'controlled-prompt-variables' },
-  variables.map((variable, index) => {
+  ...variables.map((variable, index) => {
     const updateName = (event: { currentTarget: { value: string } }) => {
       onChange(variables.map((current, currentIndex) => (
         currentIndex === index ? { ...current, name: event.currentTarget.value } : current
@@ -220,23 +329,32 @@ const MockVariablesEditor = ({
     }
     return createElement('input', {
       key: variable.id,
-      'aria-label': `prompt-variable-${index}-name`,
+      'aria-label': 'prompt-variable-' + index + '-name',
       value: variable.name,
       onInput: updateName,
       onChange: updateName,
     })
   }),
+  ...(moveTargets ?? []).map((target) => createElement('button', {
+    key: target.id,
+    type: 'button',
+    'data-testid': 'prompt-variable-move-target',
+    onClick: () => onMoveToBlock?.(variables[0]?.id ?? '', target.id),
+  }, target.name)),
 )
+
 mock.module('./PromptVariablesEditor', () => ({ VariablesEditor: MockVariablesEditor }))
 mock.module('@/components/shared/ConfirmationModal', () => ({
   default: ({
     isOpen,
     title,
     onConfirm,
+    confirmText,
   }: {
     isOpen: boolean
     title?: string
     onConfirm?: () => void
+    confirmText?: string
   }) => (
     isOpen ? createElement(
       'div',
@@ -246,7 +364,7 @@ mock.module('@/components/shared/ConfirmationModal', () => ({
         type: 'button',
         'data-testid': 'confirmation-confirm',
         onClick: onConfirm,
-      }, 'confirm') : null,
+      }, confirmText ?? 'confirm') : null,
     ) : null
   ),
 }))
@@ -269,6 +387,7 @@ mock.module('./LoomBuilder.module.css', () => ({ default: {} }))
 
 // A static import would evaluate LoomBuilder before Bun installs the dependency mocks above.
 const { default: LoomBuilder, BlockEditor, ControlledLoomBlockEditor } = await import('./LoomBuilder')
+const { remapCategorySnapshotsForReorder: remapCategorySnapshotsForReorderMock } = await import('@/hooks/useLoomBuilder')
 mock.restore()
 
 const promptVariables: PromptVariableValues = {}
@@ -367,6 +486,8 @@ function configureMainLoomState(withPromptVariable = false): void {
     removeBlock: () => {},
     updateBlock: () => true,
     toggleBlock: () => {},
+    toggleCategoryChildren: () => {},
+    movePromptVariable: () => false,
     saveSamplerOverrides: () => {},
     savePromptBehavior: () => {},
     saveCompletionSettings: () => {},
@@ -392,6 +513,7 @@ function renderBlockEditor(
   flushSync(() => {
     root.render(createElement(BlockEditor, {
       block: block(),
+      blockOccurrence: { blockId: block().id, promptOrder: 0 },
       blocks: [block()],
       promptVariables,
       onSave,
@@ -534,6 +656,64 @@ describe('controlled Loom editor trust boundary', () => {
     unmountRoot(root)
   })
 
+  test('edits only the selected duplicate block occurrence', () => {
+    const blocks = [
+      { ...block(), id: 'duplicate', name: 'First occurrence', role: 'system' as const },
+      { ...block(), id: 'duplicate', name: 'Second occurrence', role: 'user' as const },
+    ]
+    let committed: PromptBlock[] | null = null
+    const { container, root } = renderControlled(blocks, (next) => { committed = next })
+    const editButtons = container.querySelectorAll<HTMLButtonElement>('button[title="actions.edit"]')
+    expect(editButtons).toHaveLength(2)
+    flushSync(() => editButtons[1].click())
+    editRole(container, 'assistant')
+    flushSync(() => saveButton(container).click())
+
+    expect(committed?.map(({ name, role }) => ({ name, role }))).toEqual([
+      { name: 'First occurrence', role: 'system' },
+      { name: 'Second occurrence', role: 'assistant' },
+    ])
+    unmountRoot(root)
+  })
+
+  test('offers distinct-ID move targets but hides a same-ID sibling of the exact source occurrence', () => {
+    const movingVariable: PromptVariableDef = {
+      id: 'moving-variable',
+      name: 'tone',
+      label: 'Tone',
+      type: 'text',
+      defaultValue: '',
+    }
+    const blocks = [
+      block({ id: 'duplicate', name: 'Same-ID sibling', variables: [] }),
+      block({ id: 'duplicate', name: 'Exact source', variables: [movingVariable] }),
+      block({ id: 'distinct', name: 'Distinct target', variables: [] }),
+    ]
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    mountedRoots.add(root)
+    flushSync(() => {
+      root.render(createElement(BlockEditor, {
+        block: blocks[1]!,
+        blockOccurrence: { blockId: 'duplicate', promptOrder: 1 },
+        blocks,
+        promptVariables,
+        onSave: () => {},
+        onBack: () => {},
+        availableMacros: [],
+        compact: true,
+        onMoveVariable: () => true,
+      }))
+    })
+
+    const visibleTargets = [...container.querySelectorAll<HTMLButtonElement>(
+      '[data-testid="prompt-variable-move-target"]',
+    )].map((button) => button.textContent)
+    expect(visibleTargets).toEqual(['Distinct target'])
+    unmountRoot(root)
+  })
+
   test('defaults BlockEditor trusted host features to deny', () => {
     let saved: Partial<PromptBlock> | undefined
     const { container, root } = renderBlockEditor(undefined, (updates) => {
@@ -590,6 +770,38 @@ describe('controlled Loom editor trust boundary', () => {
     flushSync(() => editButton!.click())
     expect(container.textContent).toContain('blockEditor.preview')
     expect(container.textContent).toContain('blockEditor.sealedBlockTitle')
+    unmountRoot(root)
+  })
+
+  test('dispatches duplicate row toggles and modal deletion by exact coordinate', () => {
+    configureMainLoomState()
+    const preset = mainLoomState.activePreset as { blocks: PromptBlock[] }
+    preset.blocks = [
+      { ...block(), id: 'duplicate', name: 'First duplicate' },
+      { ...block(), id: 'duplicate', name: 'Second duplicate' },
+    ]
+    const toggles: unknown[] = []
+    const deletions: unknown[] = []
+    mainLoomState.toggleBlock = (target: unknown) => { toggles.push(target) }
+    mainLoomState.removeBlock = async (target: unknown) => { deletions.push(target) }
+    const container = document.createElement('div')
+    document.body.append(container)
+    const root = createRoot(container)
+    flushSync(() => root.render(createElement(LoomBuilder)))
+    mountedRoots.add(root)
+
+    const toggleButtons = container.querySelectorAll<HTMLButtonElement>('button[title="block.disable"]')
+    expect(toggleButtons).toHaveLength(2)
+    flushSync(() => toggleButtons[1].click())
+    expect(toggles).toEqual([{ blockId: 'duplicate', promptOrder: 1 }])
+    const deleteButtons = container.querySelectorAll<HTMLButtonElement>('button[title="actions.delete"]')
+    expect(deleteButtons).toHaveLength(2)
+    flushSync(() => deleteButtons[1].click())
+    const confirmButton = [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'actions.delete')
+    expect(confirmButton).toBeDefined()
+    flushSync(() => confirmButton!.click())
+    expect(deletions).toEqual([{ blockId: 'duplicate', promptOrder: 1 }])
     unmountRoot(root)
   })
 
@@ -1100,5 +1312,36 @@ describe('controlled Loom editor trust boundary', () => {
     expect(container.querySelector('button[title="actions.edit"]')).not.toBeNull()
     expect(container.querySelector('[role="alert"]')).toBeNull()
     unmountRoot(root)
+  })
+  test('remaps saved category state by exact source occurrence during reorder', () => {
+    const sourceBlocks = [
+      block({
+        id: 'category',
+        marker: 'category',
+        savedChildEnabled: {
+          '["alpha",1]': false,
+          '["beta",2]': true,
+        },
+      }),
+      block({ id: 'alpha', group: 'category' }),
+      block({ id: 'beta', group: 'category' }),
+    ]
+    const reorderedEntries = [
+      { block: sourceBlocks[2]!, source: { blockId: 'beta', promptOrder: 2 } },
+      { block: sourceBlocks[1]!, source: { blockId: 'alpha', promptOrder: 1 } },
+      { block: sourceBlocks[0]!, source: { blockId: 'category', promptOrder: 0 } },
+    ]
+
+    const reordered = remapCategorySnapshotsForReorderMock(sourceBlocks, reorderedEntries)
+
+    expect(reordered[2]?.savedChildEnabled).toEqual({
+      '["alpha",1]': false,
+      '["beta",0]': true,
+    })
+    expect(reordered[2]?.savedChildEnabled).not.toBe(sourceBlocks[0]!.savedChildEnabled)
+    expect(sourceBlocks[0]!.savedChildEnabled).toEqual({
+      '["alpha",1]': false,
+      '["beta",2]': true,
+    })
   })
 })

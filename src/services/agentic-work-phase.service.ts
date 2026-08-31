@@ -6,6 +6,7 @@ import {
   type WorkspaceContextProjectionV1,
 } from "./workspace-context-projection.service";
 import type {
+  AssemblyCompiledPolicyProviderMessageV1,
   AssemblyChildDescriptorV1,
   AssemblyMediaSegmentV1,
   AssemblyPlanV1,
@@ -15,6 +16,7 @@ import type {
 } from "../types/agent-preprocessing";
 import { lowerPreparationLimitsV1 } from "../types/agent-preprocessing";
 import {
+  AGENT_RUNTIME_PHASE_CAPABILITIES,
   AGENT_SYSTEM_PROMPT_MAX_BYTES,
   CORE_AGENT_TOOL_IDS,
 } from "../types/agents";
@@ -56,6 +58,7 @@ import {
   utf8ByteLength,
 } from "./agent-runtime-accounting";
 import { compareUtf8 } from "../utils/utf8-order";
+import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import { resolveCounter } from "./tokenizer.service";
 import type {
   GenerationResponse,
@@ -72,6 +75,18 @@ import type {
   WorkspaceOperationKindV1,
   WorkspaceTaskAcceptanceV1,
 } from "../types/turn-workspace";
+import type {
+  AgenticWorkMutatingWorkspaceOperationKindV1,
+  AgenticWorkWorkspaceMutationReservationV1,
+  WorkProviderBoundaryClassV1,
+  WorkSegmentAllOptionalPhasesSkippedAuthorityV1,
+  WorkSegmentContextV1,
+  WorkSegmentIdentityV1,
+  WorkSegmentRunnerResultV1,
+  WorkSegmentRunnerV1,
+  WorkSegmentSkippedPhaseDecisionAuthorityV1,
+  WorkSegmentUsageV1,
+} from "../types/agent-work-segment";
 import { WORKSPACE_OPERATIONS } from "../types/turn-workspace";
 import {
   WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES,
@@ -94,6 +109,7 @@ import {
   validateAssemblyPlanAgainstSnapshotV1,
   validateAssemblyPlanV1,
   type AssemblyPlanV1 as CompilerAssemblyPlanV1,
+  type AssemblyCompiledPolicyProviderMessageV1 as CompilerAssemblyCompiledPolicyProviderMessageV1,
   type AssemblyProviderMessageV1 as CompilerAssemblyProviderMessageV1,
 } from "./agentic-assembly-compiler";
 import type { GenerationAssemblySnapshotV1 } from "./prompt-assembly-snapshot.service";
@@ -163,6 +179,11 @@ export type AgenticWorkErrorCode =
   | "council_required_failed"
   | "child_output_limit_exceeded"
   | "root_output_limit_exceeded"
+  | "logical_provider_request_limit_exceeded"
+  | "physical_dispatch_attempt_limit_exceeded"
+  | "recovery_unavailable"
+  | "resync_required"
+  | "integrity_error"
   | "child_schedule_invalid"
   | "child_executor_unavailable"
   | "provider_error"
@@ -194,6 +215,55 @@ function providerFailureCode(error: unknown): AgenticWorkErrorCode {
   if (isRecord(error) && error.code === "provider_response_too_large") return "child_output_limit_exceeded";
   if (isRecord(error) && error.code === "provider_protocol_error") return "provider_protocol_error";
   return "provider_error";
+}
+
+interface DurableWorkBoundaryFailureV1 {
+  readonly status: "failed" | "exhausted";
+  readonly code: AgenticWorkErrorCode;
+  /** Exact repository machine code. Host-only; never provider or public prose. */
+  readonly durableReason: string;
+}
+
+function durableWorkBoundaryFailureV1(error: unknown): DurableWorkBoundaryFailureV1 | undefined {
+  if (error instanceof AgenticWorkPhaseError || !isRecord(error) || typeof error.code !== "string") {
+    return undefined;
+  }
+  switch (error.code) {
+    case "dispatch_budget_exhausted":
+      return { status: "exhausted", code: "physical_dispatch_attempt_limit_exceeded", durableReason: error.code };
+    case "attempt_budget_exhausted":
+    case "segment_budget_exhausted":
+    case "recovery_reserve_exhausted":
+    case "future_phase_reserve_exhausted":
+    case "unsigned_boundary_budget_exhausted":
+      return { status: "exhausted", code: "logical_provider_request_limit_exceeded", durableReason: error.code };
+    case "stale_workspace":
+      return { status: "failed", code: "resync_required", durableReason: error.code };
+    case "not_found":
+    case "stale_execution":
+    case "stale_segment":
+    case "stale_owner":
+    case "idempotency_conflict":
+      return { status: "failed", code: "recovery_unavailable", durableReason: error.code };
+    case "invalid_input":
+      return { status: "failed", code: "integrity_error", durableReason: error.code };
+    case "integrity_error":
+      return { status: "failed", code: "internal_error", durableReason: error.code };
+    default:
+      return undefined;
+  }
+}
+
+class DurableWorkBoundaryPhaseErrorV1 extends AgenticWorkPhaseError {
+  declare readonly durableReason: string;
+  constructor(failure: DurableWorkBoundaryFailureV1) {
+    super(failure.code, "Durable WORK lifecycle failed");
+    this.name = "DurableWorkBoundaryPhaseErrorV1";
+    Object.defineProperty(this, "durableReason", {
+      value: failure.durableReason,
+      enumerable: false,
+    });
+  }
 }
 
 const encoder = new TextEncoder();
@@ -240,7 +310,6 @@ const AGENT_DELEGATE_TOOL = "agent_delegate" as const;
 const COMPLETE_TURN_TOOL = "complete_turn" as const;
 
 const CORE_TOOL_SET = new Set<string>(CORE_AGENT_TOOL_IDS);
-const WORK_TOOL_SET = new Set<string>(AGENTIC_WORK_TOOL_NAMES);
 const WORK_DISPATCH_TOOL_SET = new Set<string>([...AGENTIC_WORK_TOOL_NAMES, AGENT_DELEGATE_TOOL]);
 
 const WORKSPACE_TOOL_BY_OPERATION: Readonly<Record<WorkspaceOperationKindV1, AgenticWorkWorkspaceToolName>> = Object.freeze({
@@ -263,6 +332,56 @@ const OPERATION_BY_WORKSPACE_TOOL: Readonly<Record<AgenticWorkWorkspaceToolName,
     Object.entries(WORKSPACE_TOOL_BY_OPERATION).map(([operation, name]) => [name, operation]),
   ) as Record<AgenticWorkWorkspaceToolName, WorkspaceOperationKindV1>,
 );
+function isMutatingWorkspaceOperationV1(
+  operation: WorkspaceOperationKindV1,
+): operation is Exclude<WorkspaceOperationKindV1, "read_section" | "read_page"> {
+  return operation !== "read_section" && operation !== "read_page";
+}
+
+const WORKSPACE_MUTATION_RESERVATION_KEYS = new Set([
+  "version",
+  "operationKey",
+  "operationKind",
+  "segmentId",
+  "logicalDispatch",
+  "frameId",
+]);
+
+function snapshotWorkspaceMutationReservationV1(
+  candidate: unknown,
+  operationKind: AgenticWorkMutatingWorkspaceOperationKindV1,
+  frameId: string,
+): AgenticWorkWorkspaceMutationReservationV1 {
+  if (
+    !isRecord(candidate)
+    || Object.keys(candidate).length !== WORKSPACE_MUTATION_RESERVATION_KEYS.size
+    || Object.keys(candidate).some((key) => !WORKSPACE_MUTATION_RESERVATION_KEYS.has(key))
+    || candidate.version !== 1
+    || candidate.operationKind !== operationKind
+    || typeof candidate.operationKey !== "string"
+    || candidate.operationKey.length === 0
+    || boundedBytes(candidate.operationKey) > MAX_FRAME_ID_BYTES
+    || typeof candidate.segmentId !== "string"
+    || !WORKSPACE_SAFE_ID_PATTERN.test(candidate.segmentId)
+    || boundedBytes(candidate.segmentId) > WORKSPACE_ID_MAX_BYTES
+    || !Number.isSafeInteger(candidate.logicalDispatch)
+    || (candidate.logicalDispatch as number) < 0
+    || candidate.frameId !== frameId
+  ) {
+    throw new AgenticWorkPhaseError(
+      "internal_error",
+      "Durable workspace mutation reservation is malformed or has the wrong owner",
+    );
+  }
+  return Object.freeze({
+    version: 1,
+    operationKey: candidate.operationKey,
+    operationKind,
+    segmentId: candidate.segmentId,
+    logicalDispatch: candidate.logicalDispatch as number,
+    frameId,
+  });
+}
 
 const NO_PRIVATE_OUTPUT = Object.freeze({
   reasoning: undefined,
@@ -357,27 +476,6 @@ export function normalizeAgenticWorkBudget(
   });
 }
 
-/**
- * Root WORK billed-output fuse.
- *
- * `maxOutputTokens` stays the per-dispatch authored cap (published-content
- * remaining still governs that cap; reasoning does not zero it). Multiplying
- * by `maxUnsignedBoundaries` allows that many full-cap reasoning retries —
- * or equivalent billed completion across tool rounds — then stops before
- * another provider dispatch. Saturates at MAX_SAFE_INTEGER.
- */
-export function rootBilledOutputFuseLimit(
-  maxOutputTokens: number,
-  maxUnsignedBoundaries: number,
-): number {
-  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1) return 0;
-  if (!Number.isSafeInteger(maxUnsignedBoundaries) || maxUnsignedBoundaries < 1) return 0;
-  if (maxUnsignedBoundaries > 0 && maxOutputTokens > Math.floor(Number.MAX_SAFE_INTEGER / maxUnsignedBoundaries)) {
-    return Number.MAX_SAFE_INTEGER;
-  }
-  return maxOutputTokens * maxUnsignedBoundaries;
-}
-
 function reportedCompletionTokens(usage: GenerationResponse["usage"]): number {
   const reported = usage?.completion_tokens;
   return typeof reported === "number" && Number.isSafeInteger(reported) && reported >= 0 ? reported : 0;
@@ -393,13 +491,13 @@ function rootBilledCompletionTokens(
   finishReason: string,
   dispatchMaxOutputTokens: number,
   usage: GenerationResponse["usage"],
-  publishedSettlement: number,
+  canonicalSettlement: number,
 ): number {
   const reported = reportedCompletionTokens(usage);
-  const published = Number.isSafeInteger(publishedSettlement) && publishedSettlement > 0 ? publishedSettlement : 0;
+  const canonical = Number.isSafeInteger(canonicalSettlement) && canonicalSettlement > 0 ? canonicalSettlement : 0;
   const cap = Number.isSafeInteger(dispatchMaxOutputTokens) && dispatchMaxOutputTokens > 0 ? dispatchMaxOutputTokens : 0;
-  if (isLengthCapFinishReason(finishReason)) return Math.max(reported, published, cap);
-  return Math.max(reported, published);
+  if (isLengthCapFinishReason(finishReason)) return Math.max(reported, canonical, cap);
+  return Math.max(reported, canonical);
 }
 
 
@@ -959,6 +1057,7 @@ export interface AgenticWorkspaceToolContext {
   readonly actor: "root" | "child";
   readonly frame: AgenticWorkFrame;
   readonly operation: WorkspaceOperationKindV1;
+  readonly reservation?: AgenticWorkWorkspaceMutationReservationV1;
   readonly signal: AbortSignal;
 }
 
@@ -1002,6 +1101,7 @@ interface ParsedWorkspaceResultV1 {
 export interface AgenticWorkspaceChildAssignmentInput {
   readonly frame: AgenticWorkFrame;
   readonly assignments: readonly { readonly taskId: string; readonly frameId: string }[];
+  readonly reservation: AgenticWorkWorkspaceMutationReservationV1;
   readonly expectedRevision?: number;
   readonly signal: AbortSignal;
 }
@@ -1076,7 +1176,7 @@ export interface AgenticWorkspaceCapability {
       readonly taskId: string;
       readonly frameId: string;
       readonly state: "cancelled" | "failed";
-      readonly operationKey: string;
+      readonly reservation: AgenticWorkWorkspaceMutationReservationV1;
       readonly signal: AbortSignal;
     },
   ) => unknown | Promise<unknown>;
@@ -1122,6 +1222,12 @@ export interface AgenticChildExecutionContext {
   readonly phaseInstructionSubset?: readonly string[];
   /** The same host-authenticated workspace capability used by the child frame. */
   readonly workspace?: AgenticWorkspaceCapability;
+  /** Active durable root dispatch authority; required before any child mutation. */
+  readonly workspaceMutationReservation?: AgenticWorkSegmentRuntimeV1["workspaceMutationReservation"];
+  /** Exact workspace cursor inherited after durable child assignment. */
+  readonly initialWorkspaceRevision?: number;
+  /** Report authenticated child-owned effects to the parent dispatch accumulator. */
+  readonly recordWorkspaceMutationEffect?: (effect: AgenticWorkDispatchEffectFinalizationV1) => void;
 }
 
 export interface AgenticWorkUsage {
@@ -1152,16 +1258,318 @@ export interface AgenticWorkProviderRequest {
   readonly receiveLimitBytes: number;
   readonly publishedOutputLimitBytes: number;
   readonly tools: readonly ToolDefinition[];
-  readonly toolMode: "ordinary";
+  readonly toolMode: "ordinary" | "required";
   readonly maxOutputTokens: number;
   readonly roundIndex: number;
+  /** Host-authored occurrence identity; never sourced from model output. */
+  readonly segmentRolloverOrdinal?: number;
+  readonly segmentCapabilities?: readonly string[];
+  readonly segmentPhase?: Readonly<{ id: string | null; index: number; occurrence: number }>;
   readonly providerTransientCarrier?: ProviderTransientCarrier;
   readonly signal: AbortSignal;
 }
 
+export interface AgenticWorkSegmentAuthorityV1 {
+  readonly rootObjective: string;
+  readonly phaseInstructions: readonly string[];
+  readonly completionCriteria: readonly string[];
+  readonly admittedCapabilities: readonly AgentRuntimePhaseCapabilityV1[];
+  /** Host-owned transcript for only the current admitted occurrence/rollover. */
+  readonly occurrenceMessages: readonly LlmMessage[];
+  /** Fresh host phase-control authority appended exactly once by the Segment owner. */
+  readonly phaseControlMessage: LlmMessage;
+  readonly allOptionalPhasesSkippedAuthority?: WorkSegmentAllOptionalPhasesSkippedAuthorityV1;
+  readonly recovery: boolean;
+}
+
+export function computeAgenticWorkPhaseTransitionAuthorityDigestV1(
+  phase: CompiledAgentRuntimePhaseV1,
+): string {
+  return createHash("sha256").update(encodeCanonicalPlainData({
+    version: 1,
+    id: phase.id,
+    index: phase.index,
+    enter: phase.enter,
+    exit: phase.exit,
+    capabilityRequests: phase.capabilityRequests,
+    repeatLimit: phase.repeatLimit,
+    nextPhaseIds: phase.nextPhaseIds,
+    sourceStatus: phase.sourceStatus,
+    sourceIdentity: phase.sourceIdentity,
+  }), "utf8").digest("hex");
+}
+
+export function computeAgenticWorkPhaseSkipEligibilityDigestV1(
+  phase: CompiledAgentRuntimePhaseV1,
+): string | null {
+  return phase.skip === undefined ? null : createHash("sha256").update(encodeCanonicalPlainData({
+    version: 1,
+    id: phase.id,
+    index: phase.index,
+    skip: phase.skip,
+    sourceIdentity: phase.sourceIdentity,
+  }), "utf8").digest("hex");
+}
+
+function skippedPhaseEvaluationDigestV1(
+  decision: Omit<WorkSegmentSkippedPhaseDecisionAuthorityV1, "evaluationDigest">,
+): string {
+  return createHash("sha256").update(encodeCanonicalPlainData({ version: 1, ...decision }), "utf8").digest("hex");
+}
+
+function skippedPhaseAuthorityDigestV1(
+  authority: Omit<WorkSegmentAllOptionalPhasesSkippedAuthorityV1, "authorityDigest">,
+): string {
+  return createHash("sha256").update(encodeCanonicalPlainData(authority), "utf8").digest("hex");
+}
+
+function isReadonlyUnknownArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+type AgentRuntimeProvenOptionalPhaseSkipEvidenceV1 = AgentRuntimePhaseInspectionEvidenceV1 & (
+  | Readonly<{
+    status: "skipped";
+    required: false;
+    checkpoint: "entry";
+    condition: "false";
+  }>
+  | Readonly<{
+    status: "skipped";
+    required: false;
+    checkpoint: "skip";
+    condition: "true";
+  }>
+);
+
+function isAgentRuntimeProvenOptionalPhaseSkipEvidenceV1(
+  evidence: AgentRuntimePhaseInspectionEvidenceV1,
+): evidence is AgentRuntimeProvenOptionalPhaseSkipEvidenceV1 {
+  return evidence.status === "skipped"
+    && evidence.required === false
+    && ((evidence.checkpoint === "entry" && evidence.condition === "false")
+      || (evidence.checkpoint === "skip" && evidence.condition === "true"));
+}
+
+function validateAgentRuntimeProvenOptionalPhaseSkipEvidenceV1(
+  evidence: AgentRuntimePhaseInspectionEvidenceV1,
+): AgentRuntimeProvenOptionalPhaseSkipEvidenceV1 {
+  if (!isAgentRuntimeProvenOptionalPhaseSkipEvidenceV1(evidence)) {
+    throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK evidence is not a proven optional-phase skip");
+  }
+  return evidence;
+}
+
+export function validateAgenticWorkAllOptionalPhasesSkippedAuthorityV1(
+  value: unknown,
+  phases: readonly CompiledAgentRuntimePhaseV1[],
+): WorkSegmentAllOptionalPhasesSkippedAuthorityV1 {
+  if (!isRecord(value)) {
+    throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK authority is incomplete");
+  }
+  const skippedPhaseIds = value.skippedPhaseIds;
+  const rawDecisions = value.decisions;
+  const authorityDigest = value.authorityDigest;
+  if (value.version !== 1
+    || value.kind !== "all_authored_optional_phases_skipped"
+    || phases.length === 0
+    || phases.some((phase) => phase.required)
+    || !isReadonlyUnknownArray(skippedPhaseIds)
+    || !isReadonlyUnknownArray(rawDecisions)
+    || skippedPhaseIds.length !== phases.length
+    || rawDecisions.length !== phases.length
+    || typeof authorityDigest !== "string") {
+    throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK authority is incomplete");
+  }
+  const decisions = phases.map((phase, index): WorkSegmentSkippedPhaseDecisionAuthorityV1 => {
+    const raw = rawDecisions[index];
+    if (!isRecord(raw)
+      || skippedPhaseIds[index] !== phase.id
+      || raw.phaseId !== phase.id
+      || raw.phaseIndex !== phase.index
+      || typeof raw.revision !== "number"
+      || !Number.isSafeInteger(raw.revision)
+      || raw.revision < 0
+      || (raw.checkpoint !== "entry" && raw.checkpoint !== "skip")
+      || (raw.condition !== "true" && raw.condition !== "false")
+      || (raw.checkpoint === "entry" ? raw.condition !== "false" : raw.condition !== "true")
+      || typeof raw.evaluationDigest !== "string") {
+      throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK decision authority is malformed");
+    }
+    const phaseAuthorityDigest = raw.checkpoint === "skip"
+      ? computeAgenticWorkPhaseSkipEligibilityDigestV1(phase)
+      : computeAgenticWorkPhaseTransitionAuthorityDigestV1(phase);
+    if (phaseAuthorityDigest === null || raw.phaseAuthorityDigest !== phaseAuthorityDigest) {
+      throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK phase authority changed");
+    }
+    const withoutDigest: Omit<WorkSegmentSkippedPhaseDecisionAuthorityV1, "evaluationDigest"> = Object.freeze({
+      phaseId: phase.id,
+      phaseIndex: phase.index,
+      checkpoint: raw.checkpoint,
+      revision: raw.revision,
+      condition: raw.condition,
+      phaseAuthorityDigest,
+    });
+    if (raw.evaluationDigest !== skippedPhaseEvaluationDigestV1(withoutDigest)) {
+      throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK evaluation authority changed");
+    }
+    return Object.freeze({ ...withoutDigest, evaluationDigest: raw.evaluationDigest });
+  });
+  const withoutDigest: Omit<WorkSegmentAllOptionalPhasesSkippedAuthorityV1, "authorityDigest"> = Object.freeze({
+    version: 1,
+    kind: "all_authored_optional_phases_skipped",
+    skippedPhaseIds: Object.freeze(phases.map((phase) => phase.id)),
+    decisions: Object.freeze(decisions),
+  });
+  if (authorityDigest !== skippedPhaseAuthorityDigestV1(withoutDigest)) {
+    throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK aggregate authority changed");
+  }
+  return Object.freeze({ ...withoutDigest, authorityDigest });
+}
+
+export function createAgenticWorkAllOptionalPhasesSkippedAuthorityV1(
+  phases: readonly CompiledAgentRuntimePhaseV1[],
+  evidence: readonly AgentRuntimePhaseInspectionEvidenceV1[],
+): WorkSegmentAllOptionalPhasesSkippedAuthorityV1 {
+  const skipped = evidence.filter((entry) => entry.status === "skipped");
+  const decisions = Object.freeze(skipped.map((rawEntry): WorkSegmentSkippedPhaseDecisionAuthorityV1 => {
+    const entry = validateAgentRuntimeProvenOptionalPhaseSkipEvidenceV1(rawEntry);
+    const phase = phases[entry.phaseIndex];
+    if (!phase || phase.id !== entry.phaseId) {
+      throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK evidence does not match authored phase order");
+    }
+    const phaseAuthorityDigest = entry.checkpoint === "skip"
+      ? computeAgenticWorkPhaseSkipEligibilityDigestV1(phase)
+      : computeAgenticWorkPhaseTransitionAuthorityDigestV1(phase);
+    if (phaseAuthorityDigest === null) {
+      throw new AgenticWorkPhaseError("invalid_input", "All-skipped WORK evidence lacks phase authority");
+    }
+    const withoutDigest: Omit<WorkSegmentSkippedPhaseDecisionAuthorityV1, "evaluationDigest"> = Object.freeze({
+      phaseId: entry.phaseId,
+      phaseIndex: entry.phaseIndex,
+      checkpoint: entry.checkpoint,
+      revision: entry.revision,
+      condition: entry.condition,
+      phaseAuthorityDigest,
+    });
+    return Object.freeze({
+      ...withoutDigest,
+      evaluationDigest: skippedPhaseEvaluationDigestV1(withoutDigest),
+    });
+  }));
+  const candidate: Omit<WorkSegmentAllOptionalPhasesSkippedAuthorityV1, "authorityDigest"> = Object.freeze({
+    version: 1,
+    kind: "all_authored_optional_phases_skipped",
+    skippedPhaseIds: Object.freeze(phases.map((phase) => phase.id)),
+    decisions,
+  });
+  return validateAgenticWorkAllOptionalPhasesSkippedAuthorityV1(
+    Object.freeze({ ...candidate, authorityDigest: skippedPhaseAuthorityDigestV1(candidate) }),
+    phases,
+  );
+}
 export type AgenticWorkProvider = (
   request: AgenticWorkProviderRequest,
+  authority?: AgenticWorkSegmentAuthorityV1,
 ) => GenerationResponse | Promise<GenerationResponse>;
+
+export interface AgenticWorkDispatchAccountingV1 {
+  readonly boundaryClass: WorkProviderBoundaryClassV1;
+  readonly usage: WorkSegmentUsageV1;
+  /** Pre-side-effect public/internal receipt reservations; reads remain charged only in usage. */
+  readonly workspaceMutations: readonly AgenticWorkWorkspaceMutationReservationV1[];
+}
+
+/** Opaque, frame-private capability for exactly one settled provider dispatch. */
+export interface AgenticWorkDispatchSettlementReceiptV1 {
+  readonly version: 1;
+  readonly token: string;
+}
+
+export interface AgenticWorkDispatchEffectFinalizationV1
+  extends AgenticWorkWorkspaceMutationReservationV1 {
+  readonly outcome: "mutated" | "no_op" | "failed";
+  readonly outcomeCode: string | null;
+  readonly operationDigest: string | null;
+  readonly beforeWorkspaceRevision: number;
+  readonly afterWorkspaceRevision: number;
+}
+
+export interface AgenticWorkDispatchEffectOwnerV1 {
+  readonly segmentId: string;
+  readonly logicalDispatch: number;
+  readonly frameId: string;
+}
+
+export interface AgenticWorkDispatchEffectsFinalizationInputV1 {
+  readonly settlement: AgenticWorkDispatchSettlementReceiptV1;
+  /** One exact owner only; mixed root/child effects are never accepted. */
+  readonly owner: AgenticWorkDispatchEffectOwnerV1;
+  readonly effects: readonly AgenticWorkDispatchEffectFinalizationV1[];
+  readonly nextWorkspaceRevision: number;
+}
+
+/** Exact durable identity for one accepted delegate invocation. */
+export interface AgenticWorkDelegateInvocationIdentityV1 {
+  readonly version: 1;
+  readonly invocationId: string;
+  readonly childFrameId: string;
+}
+/**
+ * Host-authenticated nonterminal phase handoff. The durable occurrence owner
+ * commits the source handoff and admits the successor atomically before any
+ * successor-scoped sidecar, hook, child, or provider work may begin.
+ */
+export interface AgenticWorkSegmentTransitionInputV1 {
+  readonly targetPhase: Readonly<{ id: string; index: number; occurrence: number }>;
+  readonly targetAuthority: AgenticWorkSegmentAuthorityV1;
+  /** Exact private complete_turn payload accepted at the source phase exit. */
+  readonly sourceCompletion: AgenticCompletionPayload;
+}
+
+export interface AgenticWorkChildAssignmentAuthorityInputV1 {
+  readonly settlement: AgenticWorkDispatchSettlementReceiptV1;
+  readonly assignmentReservation: AgenticWorkWorkspaceMutationReservationV1;
+  readonly assignments: readonly Readonly<{
+    taskId: string;
+    frameId: string;
+    settlementReservation: AgenticWorkWorkspaceMutationReservationV1;
+  }>[];
+}
+
+export interface AgenticWorkSegmentRuntimeV1 {
+  readonly dispatch: (
+    request: AgenticWorkProviderRequest,
+    authority: AgenticWorkSegmentAuthorityV1,
+  ) => GenerationResponse | Promise<GenerationResponse>;
+  /**
+   * Exact active dispatch/frame scope. Before settlement this stages the reservation in
+   * settleDispatch; after settlement it durably appends/binds it before returning.
+   */
+  readonly workspaceMutationReservation: (input: {
+    readonly providerCallId: string;
+    readonly operationKind: AgenticWorkWorkspaceMutationReservationV1["operationKind"];
+    readonly frameId: string;
+  }) => AgenticWorkWorkspaceMutationReservationV1;
+  /** Exact active durable segment/dispatch scope; valid only after dispatch and before settlement. */
+  readonly delegateInvocationIdentity: (input: {
+    readonly providerCallId: string;
+  }) => AgenticWorkDelegateInvocationIdentityV1;
+  /** Exact pending durable logical dispatch; valid only after dispatch and before settlement. */
+  readonly providerExchangeId: () => string;
+  readonly settleDispatch: (
+    accounting: AgenticWorkDispatchAccountingV1,
+  ) => Promise<AgenticWorkDispatchSettlementReceiptV1>;
+  /** Durable child/task authority written before the assignment workspace mutation begins. */
+  readonly persistChildAssignmentAuthority: (
+    input: AgenticWorkChildAssignmentAuthorityInputV1,
+  ) => Promise<void>;
+  readonly finalizeDispatchEffects: (
+    input: AgenticWorkDispatchEffectsFinalizationInputV1,
+  ) => Promise<void>;
+  readonly transition: (input: AgenticWorkSegmentTransitionInputV1) => void | Promise<void>;
+  readonly close: (outcome: Pick<AgenticWorkPhaseOutcome, "status" | "code" | "errorMessage" | "durableReason" | "completion">) => void | Promise<void>;
+}
 
 type AgenticPhaseMessageKey = "workPolicyMessages" | "workspaceUsageMessages" | "completionCriteriaMessages" | "renderPolicyMessages";
 type AgenticPhasePlan = AssemblyPlanV1 & Readonly<{
@@ -1171,10 +1579,6 @@ type AgenticPhasePlan = AssemblyPlanV1 & Readonly<{
    * native provenance without falling back to private WORK material.
    */
   readonly providerMessages?: readonly CompilerAssemblyProviderMessageV1[];
-  readonly workPolicyMessages?: readonly AssemblyProviderMessageV1[];
-  readonly workspaceUsageMessages?: readonly AssemblyProviderMessageV1[];
-  readonly completionCriteriaMessages?: readonly AssemblyProviderMessageV1[];
-  readonly renderPolicyMessages?: readonly AssemblyProviderMessageV1[];
   readonly customPhasePlan?: AgentRuntimePhaseCompileResultV1;
   readonly loomBlocks?: readonly LoomPromptInspectionBlockV1[];
   readonly loomPolicy: CompilerAssemblyPlanV1["loomPolicy"];
@@ -1186,12 +1590,6 @@ type AgenticPhasePlan = AssemblyPlanV1 & Readonly<{
   }>;
 }>;
 
-function isPhaseMessageKey(value: string): value is AgenticPhaseMessageKey {
-  return value === "workPolicyMessages"
-    || value === "workspaceUsageMessages"
-    || value === "completionCriteriaMessages"
-    || value === "renderPolicyMessages";
-}
 
 export interface AgenticWorkOptions {
   readonly plan: AgenticPhasePlan;
@@ -1207,6 +1605,10 @@ export interface AgenticWorkOptions {
   readonly provider?: string | null;
   readonly connectionLabel?: string | null;
   readonly dispatch: AgenticWorkProvider;
+  /** Attempt/occurrence owner. When present, provider requests cannot bypass it. */
+  readonly segmentRuntime?: AgenticWorkSegmentRuntimeV1;
+  /** Frozen provider capability; required recovery is enabled only when positively admitted. */
+  readonly requiredToolChoiceAvailable?: boolean;
   readonly signal?: AbortSignal;
   readonly deadlineAt?: number;
   readonly budget?: AgenticWorkBudget;
@@ -1231,6 +1633,8 @@ export interface AgenticWorkOptions {
   readonly workspaceId?: string;
   /** Persistent workspace revision used only for the durable WORK inspection association. */
   readonly workspaceAssociationRevision?: number;
+  /** Turn-local durable Segment authority; distinct from the persistent inspection association. */
+  readonly turnWorkspaceAuthority?: Readonly<{ readonly id: string; readonly revision: number }>;
   /** Optional frozen cognition policy projections supplied by the host. */
   readonly workPolicyMessages?: readonly AssemblyProviderMessageV1[];
   readonly workspaceUsageMessages?: readonly AssemblyProviderMessageV1[];
@@ -1288,6 +1692,8 @@ export interface AgenticWorkPhaseOutcome {
   readonly code?: AgenticWorkErrorCode;
   /** Bounded host-owned detail for a failed WORK preflight or execution. */
   readonly errorMessage?: string;
+  /** Host-only exact durable lifecycle failure code; non-enumerable on outcomes. */
+  readonly durableReason?: string;
   readonly observations: readonly AgenticWorkObservation[];
   readonly childResults: readonly AgenticChildResultMetadata[];
   readonly unsignedBoundaryCount: number;
@@ -1376,11 +1782,11 @@ function conservativeOutputTokenBudget(maxBytes: number): number {
 function boundedBytes(value: string): number {
   return encoder.encode(value).byteLength;
 }
-interface BoundedProviderInputV1 {
+export interface BoundedProviderInputV1 {
   readonly messages: readonly LlmMessage[];
   readonly providerTransientCarrier?: ProviderTransientCarrier;
 }
-function cloneBoundedProviderInput(
+export function cloneBoundedProviderInput(
   messages: readonly LlmMessage[],
   providerTransientCarrier: ProviderTransientCarrier | undefined,
   maxBytes: number,
@@ -1548,6 +1954,42 @@ function assertProviderToolCallCorrelation(
 }
 
 
+function assertBoundedProviderThoughtSignature(value: unknown, path: string): asserts value is string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string") {
+    throw new AgenticWorkPhaseError("provider_protocol_error", "Provider thought signature is malformed", path);
+  }
+  if (boundedBytes(value) > MAX_PROVIDER_CARRIER_BYTES) {
+    throw new AgenticWorkPhaseError("child_output_limit_exceeded", "Provider thought signature exceeds the host limit", path);
+  }
+}
+
+function assertProviderToolCallsSnapshot(value: unknown): asserts value is ToolCallResult[] | undefined {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    throw new AgenticWorkPhaseError("provider_protocol_error", "Provider tool calls are malformed", "tool_calls");
+  }
+  for (const [index, call] of value.entries()) {
+    const path = `tool_calls[${index}]`;
+    if (
+      !isRecord(call)
+      || typeof call.name !== "string"
+      || typeof call.call_id !== "string"
+      || !isRecord(call.args)
+    ) {
+      throw new AgenticWorkPhaseError("provider_protocol_error", "Provider tool call is malformed", path);
+    }
+    if (
+      boundedBytes(call.name) > MAX_FRAME_ID_BYTES
+      || boundedBytes(call.call_id) > MAX_FRAME_ID_BYTES
+      || measureProviderJson(call.args, `${path}.args`) > MAX_ARGUMENT_BYTES
+    ) {
+      throw new AgenticWorkPhaseError("child_output_limit_exceeded", "Provider tool call exceeds the host limit", path);
+    }
+    assertBoundedProviderThoughtSignature(call.thought_signature, `${path}.thought_signature`);
+  }
+}
+
 function snapshotProviderResponse(value: unknown): GenerationResponse {
   if (!isRecord(value)) {
     throw new AgenticWorkPhaseError("provider_protocol_error", "Provider response is malformed");
@@ -1560,6 +2002,7 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
     "thinking_blocks",
     "reasoning_details",
     "providerTransientCarrier",
+    "thought_signature",
     "usage",
   ]);
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
@@ -1572,6 +2015,7 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
   let thinkingBlocks: unknown;
   let reasoningDetails: unknown;
   let providerTransientCarrier: unknown;
+  let thoughtSignature: unknown;
   let usage: unknown;
   try {
     content = value.content;
@@ -1581,6 +2025,7 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
     thinkingBlocks = value.thinking_blocks;
     reasoningDetails = value.reasoning_details;
     providerTransientCarrier = value.providerTransientCarrier;
+    thoughtSignature = value.thought_signature;
     usage = value.usage;
   } catch {
     throw new AgenticWorkPhaseError("provider_protocol_error", "Provider response fields are not readable");
@@ -1591,9 +2036,13 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
   if (boundedBytes(content) > MAX_SAFE_BYTES || boundedBytes(finishReason) > MAX_SAFE_BYTES) {
     throw new AgenticWorkPhaseError("child_output_limit_exceeded", "Provider response text exceeds the host limit");
   }
-  if (reasoning !== undefined && (typeof reasoning !== "string" || boundedBytes(reasoning) > MAX_SAFE_BYTES)) {
+  if (reasoning !== undefined && typeof reasoning !== "string") {
+    throw new AgenticWorkPhaseError("provider_protocol_error", "Provider reasoning is malformed", "reasoning");
+  }
+  if (typeof reasoning === "string" && boundedBytes(reasoning) > MAX_SAFE_BYTES) {
     throw new AgenticWorkPhaseError("child_output_limit_exceeded", "Provider reasoning exceeds the host limit");
   }
+  assertBoundedProviderThoughtSignature(thoughtSignature, "thought_signature");
   for (const [key, field] of [
     ["tool_calls", toolCalls],
     ["thinking_blocks", thinkingBlocks],
@@ -1608,6 +2057,14 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
       }
     }
   }
+  assertProviderToolCallsSnapshot(toolCalls);
+  if (thinkingBlocks !== undefined && !Array.isArray(thinkingBlocks)) {
+    throw new AgenticWorkPhaseError("provider_protocol_error", "Provider thinking blocks are malformed", "thinking_blocks");
+  }
+  if (reasoningDetails !== undefined && !Array.isArray(reasoningDetails)) {
+    throw new AgenticWorkPhaseError("provider_protocol_error", "Provider reasoning details are malformed", "reasoning_details");
+  }
+  assertKnownProviderCarrier(providerTransientCarrier);
   try {
     const clonedToolCalls = toolCalls === undefined ? undefined : structuredClone(toolCalls);
     const clonedThinkingBlocks = thinkingBlocks === undefined ? undefined : structuredClone(thinkingBlocks);
@@ -1622,6 +2079,7 @@ function snapshotProviderResponse(value: unknown): GenerationResponse {
       ...(clonedThinkingBlocks === undefined ? {} : { thinking_blocks: clonedThinkingBlocks as GenerationResponse["thinking_blocks"] }),
       ...(clonedReasoningDetails === undefined ? {} : { reasoning_details: clonedReasoningDetails as GenerationResponse["reasoning_details"] }),
       ...(clonedCarrier === undefined ? {} : { providerTransientCarrier: clonedCarrier as ProviderTransientCarrier }),
+      ...(thoughtSignature === undefined ? {} : { thought_signature: thoughtSignature }),
       ...(clonedUsage === undefined ? {} : { usage: clonedUsage as GenerationResponse["usage"] }),
     });
     assertProviderToolCallCorrelation(snapshot.tool_calls, snapshot.providerTransientCarrier);
@@ -1693,10 +2151,13 @@ export function accountProviderResponse(
     if (reasoningDetails !== undefined && !Array.isArray(reasoningDetails)) {
       throw new AgenticWorkPhaseError("provider_protocol_error", "Provider reasoning details are malformed");
     }
+    assertBoundedProviderThoughtSignature(response.thought_signature, "thought_signature");
+    assertKnownProviderCarrier(response.providerTransientCarrier);
     privateFields = [
       ["thinking_blocks", thinkingBlocks],
       ["reasoning_details", reasoningDetails],
       ["providerTransientCarrier", response.providerTransientCarrier],
+      ["thought_signature", response.thought_signature],
     ];
   } catch (error) {
     if (error instanceof AgenticWorkPhaseError) throw error;
@@ -1721,6 +2182,7 @@ export function accountProviderResponse(
         ...(response.tool_calls === undefined ? {} : { tool_calls: response.tool_calls }),
         ...(response.thinking_blocks === undefined ? {} : { thinking_blocks: response.thinking_blocks }),
         ...(response.reasoning_details === undefined ? {} : { reasoning_details: response.reasoning_details }),
+        ...(response.thought_signature === undefined ? {} : { thought_signature: response.thought_signature }),
       };
     const settlement = evaluateOutputTokens(
       options.tokenBasis === "published_content" ? undefined : response.usage,
@@ -1751,6 +2213,15 @@ function deepFreeze<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+function workAuthorityText(content: LlmMessage["content"]): string {
+  if (typeof content === "string") return content;
+  return content.map((part) => {
+    if (part.type === "text") return part.text;
+    if (part.type === "tool_result") return part.content;
+    if (part.type === "tool_use") return "[tool_use:" + part.name + "]";
+    return "[" + part.type + ":" + part.mime_type + "]";
+  }).join("\n");
 }
 
 function clonePrivateValue<T>(value: T, maxBytes: number, path: string): T {
@@ -1838,15 +2309,13 @@ function mapCompilerPlanError(error: unknown): AgenticWorkPhaseError {
 }
 
 function normalizePolicyMessages(
-  value: unknown,
+  value: readonly CompilerAssemblyCompiledPolicyProviderMessageV1[],
   key: AgenticPhaseMessageKey,
   limits: PreparationLimitsV1,
-): readonly AssemblyProviderMessageV1[] {
-  if (value === undefined) return Object.freeze([]);
-  if (!Array.isArray(value)) throw new AgenticWorkPhaseError("invalid_plan", `${key} must be an array`, key);
+): readonly AssemblyCompiledPolicyProviderMessageV1[] {
   if (value.length > limits.maxPromptBlocks) throw new AgenticWorkPhaseError("limit_exceeded", `${key} exceeds the message limit`, key);
   const roles = new Set(["system", "developer", "user", "assistant", "tool"]);
-  const messages: AssemblyProviderMessageV1[] = [];
+  const messages: AssemblyCompiledPolicyProviderMessageV1[] = [];
   let totalBytes = 0;
   for (let messageIndex = 0; messageIndex < value.length; messageIndex += 1) {
     const message = value[messageIndex];
@@ -1854,7 +2323,7 @@ function normalizePolicyMessages(
     if (!isRecord(message) || !roles.has(String(message.role)) || !Array.isArray(message.segments)) {
       throw new AgenticWorkPhaseError("invalid_plan", "Policy message envelope is invalid", path);
     }
-    const segments: AssemblyProviderMessageV1["segments"][number][] = [];
+    const segments: AssemblyCompiledPolicyProviderMessageV1["segments"][number][] = [];
     for (let segmentIndex = 0; segmentIndex < message.segments.length; segmentIndex += 1) {
       const segment = message.segments[segmentIndex];
       const segmentPath = `${path}.segments[${segmentIndex}]`;
@@ -1871,7 +2340,9 @@ function normalizePolicyMessages(
       segments.push(Object.freeze({ kind: "literal", text: segment.text }));
     }
     messages.push(Object.freeze({
-      role: message.role as AssemblyProviderMessageV1["role"],
+      role: message.role,
+      blockIndex: message.blockIndex,
+      provenance: deepFreeze(structuredClone(message.provenance)),
       segments: Object.freeze(segments),
     }));
   }
@@ -1880,11 +2351,10 @@ function normalizePolicyMessages(
 
 function phaseMessagesFromPlan(
   value: CompilerAssemblyPlanV1,
-  key: string,
+  key: AgenticPhaseMessageKey,
   limits: PreparationLimitsV1,
-): readonly AssemblyProviderMessageV1[] {
-  if (!isPhaseMessageKey(key)) throw new AgenticWorkPhaseError("invalid_plan", "Unknown phase message set", key);
-  return normalizePolicyMessages((value as unknown as Record<string, unknown>)[key], key, limits);
+): readonly AssemblyCompiledPolicyProviderMessageV1[] {
+  return normalizePolicyMessages(value[key], key, limits);
 }
 
 function normalizeCompilerAssemblyPlan(
@@ -2736,6 +3206,7 @@ function buildContinuation(
     ...(response.reasoning ? { reasoning_content: response.reasoning } : {}),
     ...(response.thinking_blocks ? { thinking_blocks: structuredClone(response.thinking_blocks) } : {}),
     ...(response.reasoning_details ? { reasoning_details: structuredClone(response.reasoning_details) } : {}),
+    ...(response.thought_signature === undefined ? {} : { thought_signature: response.thought_signature }),
   };
   return [
     assistantMessage,
@@ -2752,42 +3223,67 @@ function buildNativeHostContinuation(completionCriteria: readonly LlmMessage[] =
 }
 
 function isProviderTransientCarrier(value: unknown): value is ProviderTransientCarrier {
-  if (!isRecord(value) || value.kind !== "openai_responses" || !Array.isArray(value.items)) return false;
-  for (const item of value.items) {
-    if (!isRecord(item) || typeof item.type !== "string") return false;
-    if (item.type === "message") {
-      if (
-        typeof item.id !== "string"
-        || item.role !== "assistant"
-        || !Array.isArray(item.content)
-        || boundedBytes(item.id) > MAX_FRAME_ID_BYTES
-      ) return false;
-      continue;
+  try {
+    if (!isRecord(value) || value.kind !== "openai_responses" || !Array.isArray(value.items)) return false;
+    for (const item of value.items) {
+      if (!isRecord(item) || typeof item.type !== "string") return false;
+      if (item.type === "message") {
+        if (
+          typeof item.id !== "string"
+          || item.role !== "assistant"
+          || !Array.isArray(item.content)
+          || boundedBytes(item.id) > MAX_FRAME_ID_BYTES
+        ) return false;
+        for (const part of item.content) {
+          if (!isRecord(part)) return false;
+          if (part.type === "output_text") {
+            if (typeof part.text !== "string" || boundedBytes(part.text) > MAX_SAFE_BYTES) return false;
+          } else if (part.type === "refusal") {
+            if (typeof part.refusal !== "string" || boundedBytes(part.refusal) > MAX_SAFE_BYTES) return false;
+          } else {
+            return false;
+          }
+        }
+        continue;
+      }
+      if (item.type === "reasoning") {
+        if (
+          typeof item.id !== "string"
+          || !Array.isArray(item.summary)
+          || boundedBytes(item.id) > MAX_FRAME_ID_BYTES
+          || (item.encrypted_content !== undefined
+            && (typeof item.encrypted_content !== "string"
+              || boundedBytes(item.encrypted_content) > MAX_PROVIDER_CARRIER_BYTES))
+        ) return false;
+        for (const summary of item.summary) {
+          if (
+            !isRecord(summary)
+            || summary.type !== "summary_text"
+            || typeof summary.text !== "string"
+            || boundedBytes(summary.text) > MAX_SAFE_BYTES
+          ) return false;
+        }
+        continue;
+      }
+      if (item.type === "function_call") {
+        if (
+          typeof item.id !== "string"
+          || typeof item.call_id !== "string"
+          || typeof item.name !== "string"
+          || typeof item.arguments !== "string"
+          || boundedBytes(item.id) > MAX_FRAME_ID_BYTES
+          || boundedBytes(item.call_id) > MAX_FRAME_ID_BYTES
+          || boundedBytes(item.name) > MAX_FRAME_ID_BYTES
+          || boundedBytes(item.arguments) > MAX_ARGUMENT_BYTES
+        ) return false;
+        continue;
+      }
+      return false;
     }
-    if (item.type === "reasoning") {
-      if (
-        typeof item.id !== "string"
-        || !Array.isArray(item.summary)
-        || boundedBytes(item.id) > MAX_FRAME_ID_BYTES
-      ) return false;
-      continue;
-    }
-    if (item.type === "function_call") {
-      if (
-        typeof item.id !== "string"
-        || typeof item.call_id !== "string"
-        || typeof item.name !== "string"
-        || typeof item.arguments !== "string"
-        || boundedBytes(item.id) > MAX_FRAME_ID_BYTES
-        || boundedBytes(item.call_id) > MAX_FRAME_ID_BYTES
-        || boundedBytes(item.name) > MAX_FRAME_ID_BYTES
-        || boundedBytes(item.arguments) > MAX_ARGUMENT_BYTES
-      ) return false;
-      continue;
-    }
+    return true;
+  } catch {
     return false;
   }
-  return true;
 }
 
 function assertKnownProviderCarrier(value: unknown): ProviderTransientCarrier | undefined {
@@ -2913,71 +3409,6 @@ function appendNativeInputMessages(
     kind: "openai_responses" as const,
     items: [...carrier.items, ...nativeInputMessageItems(messages)],
   }, MAX_PROVIDER_CARRIER_BYTES, "providerTransientCarrier");
-}
-
-function replaceNativePhaseInputMessages(
-  carrier: ProviderTransientCarrier | undefined,
-  previous: readonly LlmMessage[],
-  next: readonly LlmMessage[],
-): ProviderTransientCarrier | undefined {
-  if (!carrier || carrier.kind !== "openai_responses") return carrier;
-  if (previous.length === 0 && next.length === 0) return carrier;
-  const previousItems = nativeInputMessageItems(previous);
-  const items = [...carrier.items];
-  if (previousItems.length > 0) {
-    let matchStart = -1;
-    for (let start = items.length - previousItems.length; start >= 0; start -= 1) {
-      const matches = previousItems.every((expected, offset) => {
-        const item = items[start + offset];
-        return item?.type === "message"
-          && "role" in item
-          && "content" in item
-          && item.role === expected.role
-          && item.content === expected.content;
-      });
-      if (matches) {
-        matchStart = start;
-        break;
-      }
-    }
-    if (matchStart < 0) {
-      throw new AgenticWorkPhaseError(
-        "provider_protocol_error",
-        "Native continuation lost the active host phase instruction",
-      );
-    }
-    items.splice(matchStart, previousItems.length);
-  }
-  items.push(...nativeInputMessageItems(next));
-  return clonePrivateValue({
-    kind: "openai_responses" as const,
-    items,
-  }, MAX_PROVIDER_CARRIER_BYTES, "providerTransientCarrier");
-}
-
-
-function buildUnsignedBoundaryContinuation(response: GenerationResponse): LlmMessage[] {
-  const content = response.content || "";
-  const assistantMessage: LlmMessage = {
-    role: "assistant",
-    content,
-    ...(response.reasoning ? { reasoning_content: response.reasoning } : {}),
-    ...(response.thinking_blocks ? { thinking_blocks: structuredClone(response.thinking_blocks) } : {}),
-    ...(response.reasoning_details ? { reasoning_details: structuredClone(response.reasoning_details) } : {}),
-  };
-  return [
-    assistantMessage,
-    {
-      role: "user",
-      content: UNSIGNED_BOUNDARY_GUIDANCE,
-    },
-  ];
-}
-function buildNativeUnsignedBoundaryGuidance(): LlmMessage[] {
-  return [{
-    role: "user",
-    content: UNSIGNED_BOUNDARY_GUIDANCE,
-  }];
 }
 
 interface ParsedCompletion {
@@ -3138,7 +3569,6 @@ class WorkBudgetState {
   receiveBytes = 0;
   providerInputTokens = 0;
   providerSettledOutputTokens = 0;
-  rootBilledOutputTokens = 0;
   providerTotalTokens = 0;
   reservedToolResultBytes = 0;
   observations = 0;
@@ -3161,8 +3591,8 @@ class WorkBudgetState {
     this.workspaceAssociationRevision = workspaceAssociationRevision;
   }
 
-  reserveProviderRound(): boolean {
-    if (this.providerRounds >= this.limits.maxProviderRounds) return false;
+  reserveProviderRound(enforceLegacyCeiling = true): boolean {
+    if (enforceLegacyCeiling && this.providerRounds >= this.limits.maxProviderRounds) return false;
     this.providerRounds += 1;
     return true;
   }
@@ -3205,16 +3635,15 @@ class WorkBudgetState {
   recordProviderUsage(
     usage: GenerationResponse["usage"],
     settledOutputTokens: number,
-    frameKind: "root" | "child" = "child",
   ): boolean {
     const inputTokens = usage?.prompt_tokens ?? 0;
     const outputTokens = Math.max(usage?.completion_tokens ?? 0, settledOutputTokens);
     const reportedTotalTokens = usage?.total_tokens ?? 0;
     const totalTokens = Math.max(reportedTotalTokens, inputTokens + outputTokens);
-    return this.mergeProviderUsage({ inputTokens, outputTokens, totalTokens }, frameKind);
+    return this.mergeProviderUsage({ inputTokens, outputTokens, totalTokens });
   }
 
-  mergeProviderUsage(usage: AgenticWorkUsage, frameKind: "root" | "child" = "child"): boolean {
+  mergeProviderUsage(usage: AgenticWorkUsage): boolean {
     if (
       !Number.isSafeInteger(usage.inputTokens)
       || usage.inputTokens < 0
@@ -3224,12 +3653,10 @@ class WorkBudgetState {
       || usage.totalTokens < usage.inputTokens + usage.outputTokens
       || this.providerInputTokens > Number.MAX_SAFE_INTEGER - usage.inputTokens
       || this.providerSettledOutputTokens > Number.MAX_SAFE_INTEGER - usage.outputTokens
-      || (frameKind === "root" && this.rootBilledOutputTokens > Number.MAX_SAFE_INTEGER - usage.outputTokens)
       || this.providerTotalTokens > Number.MAX_SAFE_INTEGER - usage.totalTokens
     ) return false;
     this.providerInputTokens += usage.inputTokens;
     this.providerSettledOutputTokens += usage.outputTokens;
-    if (frameKind === "root") this.rootBilledOutputTokens += usage.outputTokens;
     this.providerTotalTokens += usage.totalTokens;
     return true;
   }
@@ -3247,15 +3674,6 @@ class WorkBudgetState {
 
   remainingOutputTokens(limit: number): number {
     return Math.max(0, limit - this.providerOutputTokens);
-  }
-  billedOutputFuseLimit(): number {
-    return rootBilledOutputFuseLimit(this.limits.maxOutputTokens, this.limits.maxUnsignedBoundaries);
-  }
-  billedOutputFuseExceeded(): boolean {
-    return this.rootBilledOutputTokens >= this.billedOutputFuseLimit();
-  }
-  billedOutputFuseExhaustedMessage(): string {
-    return `Root billed completion tokens ${this.rootBilledOutputTokens} exceeded fuse ${this.billedOutputFuseLimit()} (maxOutputTokens × maxUnsignedBoundaries)`;
   }
 
   reserveToolResult(bytes: number, receiveLimitBytes = this.limits.maxWorkOutputBytes): boolean {
@@ -3280,6 +3698,7 @@ class WorkBudgetState {
     calls: readonly ToolCallResult[],
     resultBytes = this.limits.maxToolResultBytes,
     receiveLimitBytes = this.limits.maxWorkOutputBytes,
+    enforceLegacyCeilings = true,
   ): boolean {
     let workspace = 0;
     let completion = 0;
@@ -3296,9 +3715,9 @@ class WorkBudgetState {
     ) return false;
     const nextReservedResults = this.reservedToolResultBytes + calls.length * resultBytes;
     if (this.receiveBytes > receiveLimitBytes - nextReservedResults) return false;
-    if (this.toolCalls + calls.length > this.limits.maxToolCalls) return false;
-    if (this.workspaceOperations + workspace > this.limits.maxWorkspaceOperations) return false;
-    if (this.completionAttempts + completion > this.limits.maxCompletionAttempts) return false;
+    if (enforceLegacyCeilings && this.toolCalls + calls.length > this.limits.maxToolCalls) return false;
+    if (enforceLegacyCeilings && this.workspaceOperations + workspace > this.limits.maxWorkspaceOperations) return false;
+    if (enforceLegacyCeilings && this.completionAttempts + completion > this.limits.maxCompletionAttempts) return false;
     if (this.observations + calls.length > this.limits.maxObservations) return false;
     this.toolCalls += calls.length;
     this.workspaceOperations += workspace;
@@ -3307,14 +3726,20 @@ class WorkBudgetState {
     this.reservedToolResultBytes = nextReservedResults;
     return true;
   }
+  reserveWorkspaceOperations(count: number, enforceLegacyCeiling = true): boolean {
+    if (!Number.isSafeInteger(count) || count < 0) return false;
+    if (enforceLegacyCeiling && this.workspaceOperations + count > this.limits.maxWorkspaceOperations) return false;
+    this.workspaceOperations += count;
+    return true;
+  }
   reserveObservation(): boolean {
     if (this.observations >= this.limits.maxObservations) return false;
     this.observations += 1;
     return true;
   }
 
-  reserveUnsignedBoundary(): boolean {
-    if (this.unsignedBoundaries >= this.limits.maxUnsignedBoundaries) return false;
+  reserveUnsignedBoundary(enforceLegacyCeiling = true): boolean {
+    if (enforceLegacyCeiling && this.unsignedBoundaries >= this.limits.maxUnsignedBoundaries) return false;
     this.unsignedBoundaries += 1;
     return true;
   }
@@ -3363,12 +3788,6 @@ interface OpenAssignableTask {
   readonly required: boolean;
   readonly assignedFrameId?: string | null;
 }
-
-const TERMINAL_WORKSPACE_TASK_STATES: Record<string, true> = {
-  completed: true,
-  cancelled: true,
-  failed: true,
-};
 
 const WORKSPACE_SEMANTIC_ERROR_CODES: Record<string, AgenticWorkErrorCode> = {
   invalid_input: "invalid_input",
@@ -3803,10 +4222,20 @@ async function executeWorkspaceTool(
   name: AgenticWorkWorkspaceToolName,
   args: Record<string, unknown>,
   frame: AgenticWorkFrame,
-  operationKey: string,
+  reservation: AgenticWorkWorkspaceMutationReservationV1 | undefined,
   failedRootGuard?: FailedRootSettlementGuard,
 ): Promise<ParsedWorkspaceResultV1> {
   const operation = OPERATION_BY_WORKSPACE_TOOL[name];
+  const mutating = isMutatingWorkspaceOperationV1(operation);
+  if (
+    mutating
+    && (!reservation || reservation.operationKind !== operation || reservation.frameId !== frame.frameId)
+  ) {
+    throw new AgenticWorkPhaseError("internal_error", "Workspace mutation has no authenticated durable reservation");
+  }
+  if (!mutating && reservation) {
+    throw new AgenticWorkPhaseError("internal_error", "Read-only workspace operation carried a mutation reservation");
+  }
   if (!frame.workspaceCapabilities.has(operation)) throw new AgenticWorkPhaseError("tool_not_allowed", "Workspace operation is not granted");
   const rootOnly = operation === "create_task" || operation === "submit_root_result" || operation === "accept_submission";
   const childOnly = CHILD_ONLY_OPERATIONS.includes(operation);
@@ -3864,7 +4293,7 @@ async function executeWorkspaceTool(
     const cognitionResult = await abortable(Promise.resolve(workspace.applyCognitionWorkspaceTransition({
       taskId,
       transition,
-      operationKey: cognitionWorkspaceOperationKey(frame, operation, operationKey),
+      reservation: reservation!,
       workspace: authenticatedArgs,
       operation: operation as CognitionRuntimeTaskTransitionInputV1["operation"],
       signal: frame.signal,
@@ -3877,6 +4306,7 @@ async function executeWorkspaceTool(
     actor: frame.kind,
     frame,
     operation,
+    ...(reservation ? { reservation } : {}),
     signal: frame.signal,
   })), frame.signal);
   return parseWorkspaceResultEnvelope(result, false);
@@ -4083,6 +4513,7 @@ function recordWorkInspection(
   completion: AgenticCompletionPayload | undefined,
   workspaceRevision: number | undefined,
   errorMessage: string | undefined,
+  durableReason: string | undefined,
 ): boolean {
   const writer = state.inspection;
   if (!writer) return true;
@@ -4101,6 +4532,7 @@ function recordWorkInspection(
       status,
       ...(code ? { code } : {}),
       ...(errorMessage ? { errorMessage } : {}),
+      ...(durableReason ? { durableReason } : {}),
       providerRoundCount: state.providerRounds,
       observationCount: observations.length,
       childCount: childResults.length,
@@ -4265,6 +4697,7 @@ function makeOutcome(
   materializedMessages?: readonly LlmMessage[],
   renderHandoff?: AgenticWorkRenderHandoff,
   errorMessage?: string,
+  durableReason?: string,
 ): AgenticWorkPhaseOutcome {
   const outcome = {
     status,
@@ -4302,7 +4735,23 @@ function makeOutcome(
       enumerable: false,
     });
   }
-  if (!recordWorkInspection(state, status, observations, childResults, code, completion, workspaceRevision, errorMessage)) {
+  if (durableReason) {
+    Object.defineProperty(outcome, "durableReason", {
+      value: durableReason,
+      enumerable: false,
+    });
+  }
+  if (!recordWorkInspection(
+    state,
+    status,
+    observations,
+    childResults,
+    code,
+    completion,
+    workspaceRevision,
+    errorMessage,
+    durableReason,
+  )) {
     outcome.status = "failed";
     outcome.code = "internal_error";
     outcome.errorMessage = "Workspace inspection record was not accepted";
@@ -4324,28 +4773,49 @@ function cognitionWorkspaceOperationKey(
     .update(pair, "utf8")
     .digest("hex")}`;
 }
-const CHILD_SETTLEMENT_OPERATION_DOMAIN = "agentic-work:settle-assigned-task";
+function snapshotDispatchSettlementReceiptV1(
+  value: unknown,
+): AgenticWorkDispatchSettlementReceiptV1 {
+  const receipt = cloneDescriptorSafe(value, "dispatchSettlement");
+  if (
+    !isRecord(receipt)
+    || receipt.version !== 1
+    || typeof receipt.token !== "string"
+    || receipt.token.length === 0
+    || boundedBytes(receipt.token) > MAX_FRAME_ID_BYTES
+    || Object.keys(receipt).some((key) => key !== "version" && key !== "token")
+  ) {
+    throw new AgenticWorkPhaseError("internal_error", "Durable dispatch settlement receipt is malformed");
+  }
+  return Object.freeze({ version: 1, token: receipt.token });
+}
+
+function workspaceMutationOperationDigestV1(
+  result: unknown,
+  expectedOperationKey: string,
+): string | null {
+  if (!isRecord(result)) return null;
+  if (
+    result.operationKey !== undefined
+    && (typeof result.operationKey !== "string" || result.operationKey !== expectedOperationKey)
+  ) {
+    throw new AgenticWorkPhaseError("tool_protocol_error", "Workspace mutation operation identity is malformed");
+  }
+  if (result.operationDigest === undefined) return null;
+  if (
+    typeof result.operationDigest !== "string"
+    || !/^[a-f0-9]{64}$/u.test(result.operationDigest)
+  ) {
+    throw new AgenticWorkPhaseError("tool_protocol_error", "Workspace mutation receipt digest is malformed");
+  }
+  return result.operationDigest;
+}
 const DELEGATED_CHILD_STATUSES: Record<string, true> = {
   succeeded: true,
   failed: true,
   cancelled: true,
   timed_out: true,
 };
-
-function childSettlementOperationKey(taskId: string, frameId: string): string {
-  const pair = JSON.stringify({ taskId, frameId });
-  const explicit = `${CHILD_SETTLEMENT_OPERATION_DOMAIN}:${pair}`;
-  if (boundedBytes(explicit) <= 256) return explicit;
-  const digest = createHash("sha256")
-    .update(CHILD_SETTLEMENT_OPERATION_DOMAIN, "utf8")
-    .update("\u0000", "utf8")
-    .update(taskId, "utf8")
-    .update("\u0000", "utf8")
-    .update(frameId, "utf8")
-    .digest("hex");
-  return `${CHILD_SETTLEMENT_OPERATION_DOMAIN}:sha256:${digest}`;
-}
-
 function normalizeDelegatedChildStatus(
   status: unknown,
   errorCode?: string,
@@ -4634,6 +5104,9 @@ export interface BoundedChildFrameOptions {
   readonly dispatch: AgenticWorkProvider;
   readonly executeCore?: AgenticCoreToolCapability;
   readonly workspace?: AgenticWorkspaceCapability;
+  readonly workspaceMutationReservation?: AgenticWorkSegmentRuntimeV1["workspaceMutationReservation"];
+  readonly initialWorkspaceRevision?: number;
+  readonly recordWorkspaceMutationEffect?: (effect: AgenticWorkDispatchEffectFinalizationV1) => void;
   readonly budget?: AgenticWorkBudget;
   /** Test seam. Production resolves the model tokenizer. */
   readonly countTokens?: (text: string) => number;
@@ -4666,6 +5139,9 @@ export async function executeBoundedAgenticChildFrame(
     options.frame.kind !== "child"
     || options.frame.canComplete
     || (options.frame.workspaceCapabilities.size > 0 && !options.workspace)
+    || (options.initialWorkspaceRevision !== undefined && (
+      !Number.isSafeInteger(options.initialWorkspaceRevision) || options.initialWorkspaceRevision < 0
+    ))
   ) {
     return { status: "failed", content: "", observations: [], providerRoundCount: 0, code: "child_schedule_invalid" };
   }
@@ -4714,7 +5190,7 @@ export async function executeBoundedAgenticChildFrame(
   }
   const state = new WorkBudgetState(normalizeAgenticWorkBudget(options.budget));
   const observations: AgenticWorkObservation[] = [];
-  let workspaceRevision: number | undefined;
+  let workspaceRevision: number | undefined = options.initialWorkspaceRevision;
   const childOutcome = (
     outcome: Omit<BoundedChildFrameOutcome, "workspaceRevision" | "usage">,
   ): BoundedChildFrameOutcome => {
@@ -4885,6 +5361,9 @@ export async function executeBoundedAgenticChildFrame(
         let status: AgenticWorkObservation["status"] = "success";
         let code: AgenticWorkErrorCode | undefined;
         let serialized: string;
+        let mutationReservation: AgenticWorkWorkspaceMutationReservationV1 | undefined;
+        let mutationBeforeRevision: number | undefined;
+        let mutationEffectRecorded = false;
         if (errorCode) {
           status = "rejected";
           code = errorCode;
@@ -4892,13 +5371,62 @@ export async function executeBoundedAgenticChildFrame(
         } else {
           try {
             if (call.name.startsWith("workspace_")) {
+              const childOperation = OPERATION_BY_WORKSPACE_TOOL[call.name as AgenticWorkWorkspaceToolName];
+              if (childOperation === "submit_child_result") {
+                ensureBoundedString(
+                  call.args.summary,
+                  WORKSPACE_CHILD_SUBMISSION_SUMMARY_MAX_BYTES,
+                  "workspace_submit_child_result.summary",
+                );
+              }
+              if (isMutatingWorkspaceOperationV1(childOperation)) {
+                if (
+                  workspaceRevision === undefined
+                  || !options.workspaceMutationReservation
+                  || !options.recordWorkspaceMutationEffect
+                ) {
+                  throw new AgenticWorkPhaseError("internal_error", "Child mutation ownership authority is unavailable");
+                }
+                mutationBeforeRevision = workspaceRevision;
+                mutationReservation = snapshotWorkspaceMutationReservationV1(
+                  options.workspaceMutationReservation(Object.freeze({
+                    providerCallId: call.call_id,
+                    operationKind: childOperation,
+                    frameId: options.frame.frameId,
+                  })),
+                  childOperation,
+                  options.frame.frameId,
+                );
+              }
               const workspaceResult = await executeWorkspaceTool(
                 options.workspace,
                 call.name as AgenticWorkWorkspaceToolName,
                 call.args,
                 options.frame,
-                call.call_id,
+                mutationReservation,
               );
+              if (mutationReservation) {
+                const afterWorkspaceRevision = workspaceResult.workspaceRevision;
+                if (
+                  afterWorkspaceRevision === undefined
+                  || mutationBeforeRevision === undefined
+                  || afterWorkspaceRevision < mutationBeforeRevision
+                ) {
+                  throw new AgenticWorkPhaseError("tool_protocol_error", "Child workspace mutation revision is missing or stale");
+                }
+                const mutated = afterWorkspaceRevision > mutationBeforeRevision;
+                options.recordWorkspaceMutationEffect!(Object.freeze({
+                  ...mutationReservation,
+                  outcome: mutated ? "mutated" : "no_op",
+                  outcomeCode: null,
+                  operationDigest: mutated
+                    ? workspaceMutationOperationDigestV1(workspaceResult.result, mutationReservation.operationKey)
+                    : null,
+                  beforeWorkspaceRevision: mutationBeforeRevision,
+                  afterWorkspaceRevision,
+                }));
+                mutationEffectRecorded = true;
+              }
               if (workspaceResult.workspaceRevision !== undefined) workspaceRevision = workspaceResult.workspaceRevision;
               if (options.frame.signal.aborted) {
                 throw options.frame.signal.reason ?? new DOMException("Aborted", "AbortError");
@@ -4922,7 +5450,6 @@ export async function executeBoundedAgenticChildFrame(
                 throw options.frame.signal.reason ?? new DOMException("Aborted", "AbortError");
               }
               const normalized = normalizeToolResult(data, toolId, state.limits.maxToolResultBytes);
-
               serialized = normalized.serialized;
               code = normalized.code as AgenticWorkErrorCode | undefined;
               status = normalized.status === "error" ? "error" : "success";
@@ -4935,6 +5462,16 @@ export async function executeBoundedAgenticChildFrame(
             const mapped = workspaceToolErrorResult(error);
             code = mapped.code;
             serialized = JSON.stringify(mapped.result);
+            if (mutationReservation && mutationBeforeRevision !== undefined && !mutationEffectRecorded) {
+              options.recordWorkspaceMutationEffect?.(Object.freeze({
+                ...mutationReservation,
+                outcome: "failed",
+                outcomeCode: mapped.code,
+                operationDigest: null,
+                beforeWorkspaceRevision: mutationBeforeRevision,
+                afterWorkspaceRevision: mutationBeforeRevision,
+              }));
+            }
           }
         }
         let resultBytes: number;
@@ -5004,8 +5541,6 @@ export async function executeBoundedAgenticChildFrame(
   }
 }
 
-/** Alias used by orchestration code that names the helper by its frame role. */
-export const runAgenticChildFrame = executeBoundedAgenticChildFrame;
 
 const WORKSPACE_PROJECTION_RECORD_KINDS = new Set([
   "objective",
@@ -5241,13 +5776,19 @@ function validateCognitionActivation(
   if (!isRecord(value.promptBlocks)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition prompt block selection is malformed", `${path}.promptBlocks`);
   assertRequiredKeys(value.promptBlocks, ["phase", "refs"], `${path}.promptBlocks`);
   if (value.promptBlocks.phase !== value.phase || !Array.isArray(value.promptBlocks.refs) || value.promptBlocks.refs.length > 256) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition prompt block selection is invalid", `${path}.promptBlocks`);
+  const seenPromptOrders = new Set<number>();
   for (const [index, ref] of value.promptBlocks.refs.entries()) {
     const refPath = `${path}.promptBlocks.refs[${index}]`;
     if (!isRecord(ref)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition prompt block reference is malformed", refPath);
-    assertRequiredKeys(ref, ["blockId", "expectedPresetRevision", "expectedBlockRevision"], refPath);
+    assertRequiredKeys(ref, ["blockId", "expectedPresetRevision", "expectedBlockRevision", "promptOrder"], refPath);
     ensureBoundedString(ref.blockId, MAX_FRAME_ID_BYTES, `${refPath}.blockId`);
     ensureSafeInteger(ref.expectedPresetRevision, `${refPath}.expectedPresetRevision`);
     ensureSafeInteger(ref.expectedBlockRevision, `${refPath}.expectedBlockRevision`);
+    ensureSafeInteger(ref.promptOrder, `${refPath}.promptOrder`);
+    if (seenPromptOrders.has(ref.promptOrder as number)) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition prompt block references contain a duplicate prompt order", `${refPath}.promptOrder`);
+    }
+    seenPromptOrders.add(ref.promptOrder as number);
   }
   if (value.policySurface !== undefined) {
     validateCognitionPolicySurface(value.policySurface, String(value.phase), `${path}.policySurface`);
@@ -5256,12 +5797,18 @@ function validateCognitionActivation(
   assertRequiredKeys(value.sourceRevisions, ["presetRevision", "blockRevisions"], `${path}.sourceRevisions`);
   ensureSafeInteger(value.sourceRevisions.presetRevision, `${path}.sourceRevisions.presetRevision`);
   if (!Array.isArray(value.sourceRevisions.blockRevisions) || value.sourceRevisions.blockRevisions.length > 256) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition source block revisions are malformed", `${path}.sourceRevisions.blockRevisions`);
+  const seenSourcePromptOrders = new Set<number>();
   for (const [index, revision] of value.sourceRevisions.blockRevisions.entries()) {
     const revisionPath = `${path}.sourceRevisions.blockRevisions[${index}]`;
     if (!isRecord(revision)) throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition source block revision is malformed", revisionPath);
-    assertRequiredKeys(revision, ["blockId", "revision"], revisionPath);
+    assertRequiredKeys(revision, ["blockId", "revision", "promptOrder"], revisionPath);
     ensureBoundedString(revision.blockId, MAX_FRAME_ID_BYTES, `${revisionPath}.blockId`);
     ensureSafeInteger(revision.revision, `${revisionPath}.revision`);
+    ensureSafeInteger(revision.promptOrder, `${revisionPath}.promptOrder`);
+    if (seenSourcePromptOrders.has(revision.promptOrder as number)) {
+      throw new AgenticWorkPhaseError("completion_freeze_failed", "Cognition source block revisions contain a duplicate prompt order", `${revisionPath}.promptOrder`);
+    }
+    seenSourcePromptOrders.add(revision.promptOrder as number);
   }
   ensureBoundedString(value.sourceDigest, MAX_ARGUMENT_BYTES, `${path}.sourceDigest`);
 }
@@ -5691,12 +6238,174 @@ async function executeCompletion(
  * Run Agentic WORK after ASSEMBLE. Every provider batch is validated and
  * reserved as a whole; tool/child/context/workspace payloads remain transient.
  */
-export async function runAgenticWorkPhase(
+
+export type AgenticWorkSegmentExecutionV1 = (
+  input: Parameters<WorkSegmentRunnerV1["run"]>[0],
+) => Promise<WorkSegmentRunnerResultV1>;
+
+
+export function computeWorkSegmentContextDigestV1(context: Omit<WorkSegmentContextV1, "contextDigest">): string {
+  return createHash("sha256").update(encodeCanonicalPlainData(context), "utf8").digest("hex");
+}
+export function computeWorkSegmentProtocolDigestV1(protocol: WorkSegmentContextV1["protocol"]): string {
+  return createHash("sha256").update(encodeCanonicalPlainData({
+    version: 1,
+    completeTurnCallMode: protocol.completeTurnCallMode,
+    requiredToolModeAvailable: protocol.requiredToolModeAvailable,
+  }), "utf8").digest("hex");
+}
+
+export function computeWorkSegmentCapabilityDigestV1(capabilities: readonly string[]): string {
+  const canonicalCapabilities = [...new Set(capabilities)].sort(compareUtf8);
+  return createHash("sha256").update(encodeCanonicalPlainData({
+    version: 1,
+    admittedCapabilities: canonicalCapabilities,
+  }), "utf8").digest("hex");
+}
+
+export function computeWorkSegmentBindingDigestV1(input: Readonly<{
+  rootSnapshotDigest: string;
+  resumeEnvelopeDigest: string;
+  phasePlanDigest: string;
+  protocolDigest: string;
+  capabilityDigest: string;
+  attemptBudget: WorkSegmentContextV1["attemptBudget"];
+  segmentBudget: WorkSegmentContextV1["segmentBudget"];
+}>): string {
+  return createHash("sha256").update(encodeCanonicalPlainData({ version: 1, ...input }), "utf8").digest("hex");
+}
+
+function sameWorkSegmentIdentityV1(left: WorkSegmentIdentityV1, right: WorkSegmentIdentityV1): boolean {
+  return left.version === right.version
+    && left.executionId === right.executionId
+    && left.attemptId === right.attemptId
+    && left.segmentId === right.segmentId
+    && left.phaseId === right.phaseId
+    && left.phaseIndex === right.phaseIndex
+    && left.phaseOccurrence === right.phaseOccurrence
+    && left.segmentOrdinal === right.segmentOrdinal;
+}
+export type AgenticWorkSegmentRunnerInputV1 = Parameters<WorkSegmentRunnerV1["run"]>[0];
+
+function assertAgenticWorkSegmentRunnerInputV1(
+  input: AgenticWorkSegmentRunnerInputV1,
+): WorkSegmentIdentityV1 {
+  if (input.signal.aborted) throw new DOMException("Segment execution aborted", "AbortError");
+  const identity = input.admission.identity;
+  const phase = input.context.phase;
+  if (!phase || !Array.isArray(phase.admittedCapabilities)
+    || !input.context.protocol
+    || input.context.protocol.completeTurnCallMode !== "standalone_only"
+    || typeof input.context.protocol.requiredToolModeAvailable !== "boolean") {
+    throw new AgenticWorkPhaseError("invalid_input", "segment context protocol/capability binding is malformed");
+  }
+  const { contextDigest, ...boundContext } = input.context;
+  const canonicalCapabilities = [...new Set(phase.admittedCapabilities)].sort(compareUtf8);
+  const protocolDigest = computeWorkSegmentProtocolDigestV1(input.context.protocol);
+  const phaseCapabilityDigest = computeWorkSegmentCapabilityDigestV1(canonicalCapabilities);
+  const bindingDigest = computeWorkSegmentBindingDigestV1({
+    rootSnapshotDigest: input.context.rootSnapshotDigest,
+    resumeEnvelopeDigest: input.context.resumeEnvelopeDigest,
+    phasePlanDigest: input.context.phasePlanDigest,
+    protocolDigest,
+    capabilityDigest: input.context.capabilityDigest,
+    attemptBudget: input.context.attemptBudget,
+    segmentBudget: input.context.segmentBudget,
+  });
+  const contextMatches = /^[0-9a-f]{64}$/.test(contextDigest)
+    && contextDigest === input.admission.contextDigest
+    && contextDigest === computeWorkSegmentContextDigestV1(boundContext)
+    && input.admission.version === 1
+    && input.admission.complete === true
+    && input.admission.lifecycle === "admitted"
+    && input.admission.closeResult === null
+    && input.admission.closureDigest === null
+    && input.admission.closedAt === null
+    && input.admission.context.contextDigest === contextDigest
+    && encodeCanonicalPlainData(input.admission.context) === encodeCanonicalPlainData(input.context)
+    && identity.version === 1
+    && input.context.version === 1
+    && /^[0-9a-f]{64}$/.test(input.context.rootSnapshotDigest)
+    && /^[0-9a-f]{64}$/.test(input.context.phasePlanDigest)
+    && input.context.protocolDigest === protocolDigest
+    && input.context.phaseCapabilityDigest === phaseCapabilityDigest
+    && input.context.bindingDigest === bindingDigest
+    && input.context.rootSnapshotDigest === input.admission.snapshotDigest
+    && input.context.bindingDigest === input.admission.bindingDigest
+    && phase.admittedCapabilities.length === canonicalCapabilities.length
+    && phase.admittedCapabilities.every((capability, index) => capability === canonicalCapabilities[index])
+    && phase.admittedCapabilities.every((capability) => (
+      AGENT_RUNTIME_PHASE_CAPABILITIES as readonly string[]
+    ).includes(capability))
+    && identity.phaseId === phase.id
+    && identity.phaseIndex === phase.index
+    && identity.phaseOccurrence === phase.occurrence
+    && input.admission.workspaceId === input.context.workspace.id
+    && input.admission.workspaceRevision === input.context.workspace.revision
+    && encodeCanonicalPlainData(input.admission.budget) === encodeCanonicalPlainData(input.context.segmentBudget);
+  if (!contextMatches) {
+    throw new AgenticWorkPhaseError("invalid_input", "segment admission/context authority mismatch");
+  }
+  return identity;
+}
+
+/**
+ * Creates the single-occurrence runner without retaining transcript state in
+ * the runner itself. Admission and context identity must agree before any
+ * provider work can start.
+ */
+export function createAgenticWorkSegmentRunnerV1(
+  execute: AgenticWorkSegmentExecutionV1,
+): WorkSegmentRunnerV1 {
+  if (typeof execute !== "function") {
+    throw new AgenticWorkPhaseError("invalid_input", "segment executor is required");
+  }
+  return Object.freeze({
+    async run(input: Parameters<WorkSegmentRunnerV1["run"]>[0]): Promise<WorkSegmentRunnerResultV1> {
+      const identity = assertAgenticWorkSegmentRunnerInputV1(input);
+      const result = await execute(Object.freeze({ ...input }));
+      if (!result || typeof result !== "object") {
+        throw new AgenticWorkPhaseError("internal_error", "segment executor returned an unauthenticated result");
+      }
+      if (!("usage" in result) || !result.usage || typeof result.usage !== "object") {
+        throw new AgenticWorkPhaseError("internal_error", "segment executor returned an unauthenticated result");
+      }
+      const validBoundary = result.boundaryClass === null || [
+        "tool_action", "tool_free_stop", "reasoning_only_stop", "reasoning_only_length",
+        "empty_provider_response", "provider_protocol_failure",
+      ].includes(result.boundaryClass);
+      const usageValues = Object.values(result.usage);
+      const validKind = [
+        "phase_advanced", "phase_repeated", "same_phase_rollover", "work_complete",
+        "failed", "exhausted", "cancelled",
+      ].includes(result.kind);
+      if (result.version !== 1
+        || !sameWorkSegmentIdentityV1(result.segment, identity)
+        || !Number.isSafeInteger(result.workspaceRevision)
+        || result.workspaceRevision < input.context.workspace.revision
+        || !validBoundary
+        || !validKind
+        || usageValues.some((value) => !Number.isSafeInteger(value) || value < 0)
+        || result.usage.providerDispatches > input.context.segmentBudget.maxProviderDispatches
+        || result.usage.billedOutputTokens > input.context.segmentBudget.maxProviderOutputTokens
+        || result.usage.toolCalls > input.context.segmentBudget.maxToolCalls
+        || result.usage.workspaceOperations > input.context.segmentBudget.maxWorkspaceOperations
+        || result.usage.unsignedBoundaries > input.context.segmentBudget.maxUnsignedBoundaries) {
+        throw new AgenticWorkPhaseError("internal_error", "segment executor returned an unauthenticated result");
+      }
+      return result;
+    },
+  });
+}
+async function runSegmentedAgenticWorkAttemptCoreV1(
   options: AgenticWorkOptions,
+  resumedSegment?: AgenticWorkSegmentRunnerInputV1,
 ): Promise<AgenticWorkPhaseOutcome> {
-  const deadline = makeDeadlineSignal(options.signal, options.deadlineAt);
-  const signal = deadline.signal;
+  const resumedContext = resumedSegment?.context;
+  // Complete every synchronous budget/state validation before arming a timer;
+  // an invalid request must not leave scheduled deadline work behind.
   const limits = normalizeAgenticWorkBudget(options.budget);
+  const enforceLegacyWorkBudget = options.segmentRuntime === undefined;
   const state = new WorkBudgetState(
     limits,
     options.inspection,
@@ -5704,6 +6413,8 @@ export async function runAgenticWorkPhase(
     options.rootFrameId,
     options.workspaceAssociationRevision,
   );
+  const deadline = makeDeadlineSignal(options.signal, options.deadlineAt);
+  const signal = deadline.signal;
   const observations: AgenticWorkObservation[] = [];
   const childResults: AgenticChildResultMetadata[] = [];
   let reportedObservationCount = 0;
@@ -5738,6 +6449,7 @@ export async function runAgenticWorkPhase(
   let pendingBatchCalls: readonly ToolCallResult[] | undefined;
   let pendingBatchObservationStart = 0;
   let pendingBatchCleanup: ((status: AgenticChildResultMetadata["status"]) => Promise<AgenticChildSettlementError | undefined>) | undefined;
+  const recordedProviderExchangeIds = new Set<string>();
   let pendingRequiredDelegatedFailure: AgenticWorkErrorCode | undefined;
   let pendingRequiredDelegatedTaskId: string | undefined;
   try {
@@ -5746,14 +6458,49 @@ export async function runAgenticWorkPhase(
       options.trustedAssemblyLimits,
       options.snapshot,
     );
-    const phaseMachine = plan.customPhasePlan && plan.customPhasePlan.phases.length > 0
-      ? createAgentRuntimePhaseMachine(plan.customPhasePlan, {
-        admittedCapabilities: options.phaseAdmittedCapabilities,
+    const compiledPhases = plan.customPhasePlan?.phases ?? [];
+    const persistedAllSkippedAuthority = resumedContext?.allOptionalPhasesSkippedAuthority;
+    let allOptionalPhasesSkippedAuthority: WorkSegmentAllOptionalPhasesSkippedAuthorityV1 | undefined;
+    const resumedPhase = resumedContext?.phase.id === null
+      ? undefined
+      : compiledPhases[resumedContext?.phase.index ?? -1];
+    if (resumedContext?.phase.id === null) {
+      if (compiledPhases.length === 0) {
+        if (persistedAllSkippedAuthority !== undefined) {
+          throw new AgenticWorkPhaseError("invalid_input", "Built-in WORK cannot carry authored skip authority");
+        }
+      } else {
+        allOptionalPhasesSkippedAuthority = validateAgenticWorkAllOptionalPhasesSkippedAuthorityV1(
+          persistedAllSkippedAuthority,
+          compiledPhases,
+        );
+      }
+    } else if (resumedContext && (!resumedPhase
+      || resumedPhase.id !== resumedContext.phase.id
+      || persistedAllSkippedAuthority !== undefined)) {
+      throw new AgenticWorkPhaseError("invalid_input", "Persisted WORK phase authority does not match the assembled plan");
+    }
+    const phaseMachine = compiledPhases.length > 0 && allOptionalPhasesSkippedAuthority === undefined
+      ? createAgentRuntimePhaseMachine(plan.customPhasePlan!, {
+        admittedCapabilities: resumedContext
+          ? resumedContext.phase.admittedCapabilities as readonly AgentRuntimePhaseCapabilityV1[]
+          : options.phaseAdmittedCapabilities,
+        ...(resumedContext && resumedPhase
+          ? {
+            initialState: {
+              status: "entered" as const,
+              phaseIndex: resumedContext.phase.index,
+              phaseId: resumedPhase.id,
+              repeatCount: resumedContext.phase.occurrence,
+              checkpointRevision: resumedContext.workspace.revision,
+            },
+          }
+          : {}),
       })
       : null;
-    const phaseRevision = options.phaseRevision ?? 0;
+    const phaseRevision = resumedContext?.workspace.revision ?? options.phaseRevision ?? 0;
     const phaseBaseContext = options.phaseEvaluationContext;
-    let workspaceContextRevision: number | undefined;
+    let workspaceContextRevision: number | undefined = resumedContext?.workspace.revision;
     let phaseInput: AgentRuntimePhaseCheckpointInputV1 | null = null;
     const unavailablePhaseInput = (
       phase: AgenticWorkspacePhaseCheckpointV1,
@@ -5814,32 +6561,48 @@ export async function runAgenticWorkPhase(
         recordCustomPhaseEvidence(state.inspection, evidence[phaseEvidenceCount]!, phaseEvidenceCount);
       }
     };
-    state.inspection?.record("policy", {
-      id: "work:policy",
-      kind: "policy",
-      actor: "host",
-      recipient: "agent",
-      result: JSON.stringify({
-        workPolicyMessages: options.workPolicyMessages?.length ?? 0,
-        workspaceUsageMessages: options.workspaceUsageMessages?.length ?? 0,
-        completionCriteriaMessages: options.completionCriteriaMessages?.length ?? 0,
-        renderPolicyMessages: options.renderPolicyMessages?.length ?? 0,
-        cortex: options.cortexContext?.receipt.id ?? null,
-      }),
-    }, { lifecycle: "WORK", status: "running" });
-    if (options.cortexContext) {
-      state.inspection?.record("cortex", options.cortexContext.receipt, {
-        lifecycle: "WORK",
-        status: "running",
-      });
+    if (!resumedContext) {
+      state.inspection?.record("policy", {
+        id: "work:policy",
+        kind: "policy",
+        actor: "host",
+        recipient: "agent",
+        result: JSON.stringify({
+          workPolicyMessages: options.workPolicyMessages?.length ?? 0,
+          workspaceUsageMessages: options.workspaceUsageMessages?.length ?? 0,
+          completionCriteriaMessages: options.completionCriteriaMessages?.length ?? 0,
+          renderPolicyMessages: options.renderPolicyMessages?.length ?? 0,
+          cortex: options.cortexContext?.receipt.id ?? null,
+        }),
+      }, { lifecycle: "WORK", status: "running" });
+      if (options.cortexContext) {
+        state.inspection?.record("cortex", options.cortexContext.receipt, {
+          lifecycle: "WORK",
+          status: "running",
+        });
+      }
+      if (plan.customPhasePlan) {
+        recordCustomPhaseRepairEvidence(state.inspection, plan.customPhasePlan);
+      }
     }
-    if (plan.customPhasePlan) {
-      recordCustomPhaseRepairEvidence(state.inspection, plan.customPhasePlan);
-    }
-    let phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null = null;
-    let phaseEntryMessages: readonly LlmMessage[] = phaseMachine
-      ? Object.freeze([])
-      : materializeActivePhaseMessages(plan, null, null, options);
+    let segmentRolloverOrdinal = 0;
+    let recoveredDispatchPending = resumedContext !== undefined;
+    const rootBilledOutputTokenLimit = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      limits.maxOutputTokens * Math.max(1, limits.maxUnsignedBoundaries),
+    );
+    let rootBilledOutputTokens = 0;
+    let phaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1> | null = resumedContext?.phase.id === null
+      ? null
+      : resumedContext
+        ? new Set(resumedContext.phase.admittedCapabilities as readonly AgentRuntimePhaseCapabilityV1[])
+        : null;
+    let terminalProjectionSegmentPhase: AgenticWorkSegmentTransitionInputV1["targetPhase"] | undefined;
+    let phaseEntryMessages: readonly LlmMessage[] = resumedContext
+      ? Object.freeze(resumedContext.phase.instructions.map((content) => Object.freeze({ role: "system" as const, content })))
+      : phaseMachine
+        ? Object.freeze([])
+        : materializeActivePhaseMessages(plan, null, null, options);
     const phaseEntryDrainLimit = Math.max(
       1,
       (plan.customPhasePlan?.phases ?? []).reduce((total, phase) => total + phase.repeatLimit + 1, 0) + 1,
@@ -5883,7 +6646,7 @@ export async function runAgenticWorkPhase(
       }
       return false;
     };
-    if (!(await drainPhaseEntry())) {
+    if (!resumedContext && !(await drainPhaseEntry())) {
       return makeOutcome("failed", state, observations, childResults, "invalid_plan");
     }
     const coreToolIds = options.coreToolIds ?? [];
@@ -5933,101 +6696,107 @@ export async function runAgenticWorkPhase(
       }
     };
     const rejectFailedRootSettlement: FailedRootSettlementGuard = async (taskId) => {
-      if (!phaseMachine || phaseMachine.state().status !== "entered") return null;
+      const phaseState = phaseMachine?.state();
+      if (!phaseMachine || !phaseState || phaseState.status !== "entered") return null;
       const phase = phaseMachine.currentPhase();
       if (!phase) return null;
-      const syntacticRefs = collectPredicateTaskIds(phase.exit);
-      let rows: readonly WorkspaceTaskAcceptanceV1[] | undefined;
-      const syntacticallyNamed = syntacticRefs.has(taskId);
-      if (!syntacticallyNamed) {
-        try {
-          rows = await readTaskAcceptanceRequired();
-        } catch (error) {
-          if (signal.aborted) throw error;
-          return null;
-        }
-        const mapped = rows.find((item) => item.id === taskId || item.templateId === taskId);
-        if (!mapped) return null;
-        if (!(
-          (mapped.templateId !== null && syntacticRefs.has(mapped.templateId))
-          || syntacticRefs.has(mapped.id)
-        )) {
-          return null;
-        }
-      }
+      const currentRefs = collectPredicateTaskIds(phase.exit);
+      const rawCurrentReference = currentRefs.has(taskId);
+      const rawFutureReference = typeof phaseState.phaseIndex === "number"
+        && compiledPhases
+          .slice(phaseState.phaseIndex + 1)
+          .some((candidate) => collectPredicateTaskIds(candidate.exit).has(taskId));
       const blocked = (extraTaskIds: readonly string[] = []) => recoverableCompletionBlockedResultFor(
         options.workspace,
         rootFrame,
         phase.id,
         extraTaskIds,
       );
-      const input = await readPhaseInput("WORK");
-      if (!input || input.snapshotAvailable === false) return blocked(syntacticallyNamed ? [taskId] : []);
-      const witnesses = collectExitWitnesses(phase.exit, input.context);
-      if (witnesses.invalid) return blocked(syntacticallyNamed ? [taskId] : []);
+      let rows: readonly WorkspaceTaskAcceptanceV1[];
       try {
-        rows = rows ?? await readTaskAcceptanceRequired();
+        rows = await readTaskAcceptanceRequired();
       } catch (error) {
         if (signal.aborted) throw error;
-        return blocked(syntacticallyNamed ? [taskId] : []);
+        return rawCurrentReference || rawFutureReference ? blocked([taskId]) : null;
       }
       const row = rows.find((item) => item.id === taskId || item.templateId === taskId);
       if (!row || !row.required || row.state !== "active") return null;
+      const aliases = [taskId, row.id, ...(row.templateId === null ? [] : [row.templateId])];
+      const referencesAnyAlias = (refs: ReadonlySet<string>): boolean => aliases.some((alias) => refs.has(alias));
+      const currentReferenced = referencesAnyAlias(currentRefs);
+      const futureReferenced = typeof phaseState.phaseIndex === "number"
+        && compiledPhases
+          .slice(phaseState.phaseIndex + 1)
+          .some((candidate) => referencesAnyAlias(collectPredicateTaskIds(candidate.exit)));
+      if (!currentReferenced && !futureReferenced) return null;
+      // A task already activated as required for a later authored phase cannot
+      // be irreversibly failed while an earlier phase is current. Otherwise
+      // that later phase enters with a terminal task that can never satisfy its
+      // completion-accepted gate, leaving complete_turn in a retry loop.
+      if (futureReferenced) return blocked([row.id]);
+      const input = await readPhaseInput("WORK");
+      if (!input || input.snapshotAvailable === false) return blocked([row.id]);
+      const witnesses = collectExitWitnesses(phase.exit, input.context);
+      if (witnesses.invalid) return blocked([row.id]);
       const witnessHit = witnesses.positiveRefs.some((ref) => ref === row.templateId || ref === row.id);
       if (!witnessHit) return null;
       return blocked(unsatisfiedRequiredGatingIds(witnesses.positiveRefs, rows));
     };
-
-
-
-    if (!state.reserveChildIds([turnRootFrameId])) {
-      return makeOutcome("failed", state, observations, childResults, "child_schedule_invalid");
+    if (
+      !resumedContext
+      && compiledPhases.length > 0
+      && phaseMachine?.state().status === "completed"
+    ) {
+      // The frozen deterministic entry evidence admits exactly one built-in
+      // null-phase Segment. No required phase or unavailable predicate can
+      // authorize this route, and the authority is persisted with admission.
+      allOptionalPhasesSkippedAuthority = createAgenticWorkAllOptionalPhasesSkippedAuthorityV1(
+        compiledPhases,
+        phaseMachine.evidence(),
+      );
     }
-    const schedule = await executeChildSchedule(
-      plan,
-      options,
-      rootFrame,
-      state,
-      signal,
-      phaseMachine?.currentPhase() ?? null,
-      phaseCapabilities,
-    );
-    childResults.push(...schedule.metadata);
-    reportProgress();
-    if (schedule.failure) {
-      const status = schedule.failure === "cancelled" ? "cancelled" : schedule.failure === "timed_out" ? "timed_out" : "failed";
-      return makeOutcome(status, state, observations, childResults, schedule.failure);
+    let scheduleResults: ReadonlyMap<number, string> = new Map();
+    if (!resumedContext) {
+      if (!state.reserveChildIds([turnRootFrameId])) {
+        return makeOutcome("failed", state, observations, childResults, "child_schedule_invalid");
+      }
+      const schedule = await executeChildSchedule(
+        plan,
+        options,
+        rootFrame,
+        state,
+        signal,
+        phaseMachine?.currentPhase() ?? null,
+        phaseCapabilities,
+      );
+      scheduleResults = schedule.results;
+      childResults.push(...schedule.metadata);
+      reportProgress();
+      if (schedule.failure) {
+        const status = schedule.failure === "cancelled" ? "cancelled" : schedule.failure === "timed_out" ? "timed_out" : "failed";
+        return makeOutcome(status, state, observations, childResults, schedule.failure);
+      }
+      // Deterministic children may mutate their assigned turn workspace before
+      // the root's first projection, invalidating the phase-entry snapshot.
+      workspaceContextRevision = undefined;
     }
-    // Deterministic children may mutate their assigned turn workspace before
-    // the root's first projection, invalidating the phase-entry snapshot.
-    workspaceContextRevision = undefined;
-    const baseMaterializedMessages: readonly LlmMessage[] = Object.freeze(
-      (options.rootMessages
-        ? clonePrivateValue(options.rootMessages, MAX_PRIVATE_TRANSCRIPT_BYTES, "rootMessages")
-        : materializeWorkMessages(plan, schedule.results, options)).map((message) => deepFreeze(structuredClone(message))),
-    );
-    const messages: LlmMessage[] = [
+    const baseMaterializedMessages: readonly LlmMessage[] = resumedContext
+      ? Object.freeze([Object.freeze({ role: "user" as const, content: resumedContext.rootObjective })])
+      : Object.freeze(
+        (options.rootMessages
+          ? clonePrivateValue(options.rootMessages, MAX_PRIVATE_TRANSCRIPT_BYTES, "rootMessages")
+          : materializeWorkMessages(plan, scheduleResults, options)).map((message) => deepFreeze(structuredClone(message))),
+      );
+    const completionCriteriaAuthority = resumedContext
+      ? Object.freeze([...resumedContext.phase.completionCriteria])
+      : Object.freeze((options.completionCriteriaMessages ?? [])
+        .filter((message): message is AssemblyProviderMessageV1 & { readonly content: string } => "content" in message && typeof message.content === "string")
+        .map((message) => workAuthorityText(deepFreeze(structuredClone(message)).content)));
+    let messages: LlmMessage[] = [
       ...baseMaterializedMessages,
       ...phaseEntryMessages,
     ].map((message) => structuredClone(message));
     let phaseEntryMessageStart = baseMaterializedMessages.length;
-    let phaseEntryMessageCount = phaseEntryMessages.length;
-    const replacePhaseEntryMessages = (next: readonly LlmMessage[]): void => {
-      const previousStart = phaseEntryMessageStart;
-      const previousCount = phaseEntryMessageCount;
-      const previousEnd = previousStart + previousCount;
-      if (previousCount > 0) {
-        messages.splice(previousStart, previousCount);
-        if (workspaceContextMessageIndex >= previousEnd) {
-          workspaceContextMessageIndex -= previousCount;
-        } else if (workspaceContextMessageIndex >= previousStart) {
-          workspaceContextMessageIndex = -1;
-        }
-      }
-      phaseEntryMessageStart = messages.length;
-      messages.push(...next.map((message) => structuredClone(message)));
-      phaseEntryMessageCount = next.length;
-    };
     let councilAdviceMessage: LlmMessage | undefined;
     const clearCouncilAdvice = (): void => {
       if (councilAdviceMessage) {
@@ -6121,7 +6890,7 @@ export async function runAgenticWorkPhase(
       messages.push(councilAdviceMessage);
       return "ok";
     };
-    const councilStatus = await invokeCouncilForCurrentPhase();
+    const councilStatus = resumedContext ? "ok" as const : await invokeCouncilForCurrentPhase();
     if (councilStatus === "aborted") {
       const status = signalStatus(signal);
       return makeOutcome(status, state, observations, childResults, status);
@@ -6135,7 +6904,7 @@ export async function runAgenticWorkPhase(
     let definitions = composition.rootDefinitions;
     let definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
     let providerTransientCarrier: ProviderTransientCarrier | undefined;
-    let nativePhaseEntryMessages: readonly LlmMessage[] = Object.freeze([]);
+    let nextRootToolMode: "ordinary" | "required" = "ordinary";
     let workspaceContextMessageIndex = -1;
     const refreshWorkspaceContext = async (
       refreshFrame: AgenticWorkFrame = rootFrame,
@@ -6177,9 +6946,10 @@ export async function runAgenticWorkPhase(
       status: AgenticWorkStatus,
       code?: AgenticWorkErrorCode,
       errorMessage?: string,
+      durableReason?: string,
     ): AgenticWorkPhaseOutcome => {
       reportProgress();
-      if (pendingRequiredDelegatedFailure) {
+      if (pendingRequiredDelegatedFailure && !durableReason) {
         return makeOutcome(
           "failed",
           state,
@@ -6193,7 +6963,19 @@ export async function runAgenticWorkPhase(
           errorMessage,
         );
       }
-      return makeOutcome(status, state, observations, childResults, code, undefined, undefined, undefined, undefined, errorMessage);
+      return makeOutcome(
+        status,
+        state,
+        observations,
+        childResults,
+        code,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        errorMessage,
+        durableReason,
+      );
     };
     for (;;) {
       if (signal.aborted) {
@@ -6242,177 +7024,590 @@ export async function runAgenticWorkPhase(
           error instanceof AgenticWorkPhaseError ? error.code : "invalid_input",
         );
       }
-      if (state.billedOutputFuseExceeded()) {
+      if (enforceLegacyWorkBudget && rootBilledOutputTokens >= rootBilledOutputTokenLimit) {
         return outcomeAfterPending(
           "exhausted",
           "root_output_limit_exceeded",
-          state.billedOutputFuseExhaustedMessage(),
+          `Root billed output reached ${rootBilledOutputTokenLimit} (maxOutputTokens × maxUnsignedBoundaries).`,
         );
       }
-      if (!state.reserveProviderRound()) {
+      if (!state.reserveProviderRound(enforceLegacyWorkBudget)) {
         return outcomeAfterPending("exhausted", "provider_round_budget_exhausted");
       }
       const receiveLimitBytes = state.remainingReceiveBytes(limits.maxRootReceiveBytes);
-      const maxOutputTokens = state.remainingOutputTokens(limits.maxOutputTokens);
+      const maxOutputTokens = options.segmentRuntime
+        ? limits.maxOutputTokens
+        : state.remainingOutputTokens(limits.maxOutputTokens);
       if (receiveLimitBytes <= 0 || maxOutputTokens <= 0) {
         console.error(`[agentic] root WORK remaining exhausted receive=${receiveLimitBytes} tokens=${maxOutputTokens}`);
-        return outcomeAfterPending("exhausted", "child_output_limit_exceeded");
+        return outcomeAfterPending("exhausted", "root_output_limit_exceeded");
       }
+      const currentDurableWorkspaceRevision = (): number => {
+        const revision = workspaceContextRevision
+          ?? phaseInput?.revision
+          ?? resumedContext?.workspace.revision
+          ?? phaseRevision;
+        if (!Number.isSafeInteger(revision) || revision < 0) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable WORK workspace cursor is malformed");
+        }
+        return revision;
+      };
+      const finalizeDurableDispatchEffects = async (
+        settlement: AgenticWorkDispatchSettlementReceiptV1,
+        effects: readonly AgenticWorkDispatchEffectFinalizationV1[],
+      ): Promise<void> => {
+        if (!options.segmentRuntime || effects.length === 0) return;
+        const nextWorkspaceRevision = currentDurableWorkspaceRevision();
+        const effectsByOwner = new Map<string, {
+          readonly owner: AgenticWorkDispatchEffectOwnerV1;
+          readonly effects: AgenticWorkDispatchEffectFinalizationV1[];
+        }>();
+        for (const effect of effects) {
+          const owner: AgenticWorkDispatchEffectOwnerV1 = Object.freeze({
+            segmentId: effect.segmentId,
+            logicalDispatch: effect.logicalDispatch,
+            frameId: effect.frameId,
+          });
+          const ownerKey = encodeCanonicalPlainData({ version: 1, ...owner });
+          const group = effectsByOwner.get(ownerKey);
+          if (group) group.effects.push(effect);
+          else effectsByOwner.set(ownerKey, { owner, effects: [effect] });
+        }
+        for (const group of effectsByOwner.values()) {
+          await options.segmentRuntime.finalizeDispatchEffects(Object.freeze({
+            settlement,
+            owner: group.owner,
+            effects: Object.freeze(group.effects.map((effect) => Object.freeze({ ...effect }))),
+            nextWorkspaceRevision,
+          }));
+        }
+      };
+      const settleEmptyDispatch = async (
+        accounting: Omit<AgenticWorkDispatchAccountingV1, "workspaceMutations">,
+      ): Promise<void> => {
+        if (!options.segmentRuntime) return;
+        snapshotDispatchSettlementReceiptV1(
+          await options.segmentRuntime.settleDispatch(Object.freeze({
+            ...accounting,
+            workspaceMutations: Object.freeze([]),
+          })),
+        );
+      };
+      const recoverProviderProtocolFailure = async (): Promise<AgenticWorkPhaseOutcome | null> => {
+        if (!options.segmentRuntime) {
+          return outcomeAfterPending("failed", "provider_protocol_error");
+        }
+        const conservativeUsage: WorkSegmentUsageV1 = Object.freeze({
+          providerDispatches: 1,
+          providerInputTokens: 0,
+          providerOutputTokens: maxOutputTokens,
+          providerTotalTokens: maxOutputTokens,
+          billedOutputTokens: maxOutputTokens,
+          toolCalls: 0,
+          workspaceOperations: 0,
+          unsignedBoundaries: 1,
+          receiveBytes: 0,
+          publishedOutputBytes: 0,
+        });
+        if (!state.reserveProviderTokens(maxOutputTokens, maxOutputTokens)) {
+          return outcomeAfterPending("exhausted", "root_output_limit_exceeded");
+        }
+        if (!state.mergeProviderUsage({ inputTokens: 0, outputTokens: maxOutputTokens, totalTokens: maxOutputTokens })) {
+          return outcomeAfterPending("failed", "provider_protocol_error");
+        }
+        await settleEmptyDispatch({
+          boundaryClass: "provider_protocol_failure",
+          usage: conservativeUsage,
+        });
+        recoveredDispatchPending = false;
+        if (!state.reserveUnsignedBoundary(enforceLegacyWorkBudget)) {
+          return outcomeAfterPending("exhausted", "unsigned_boundary_budget_exhausted");
+        }
+        if (options.requiredToolChoiceAvailable === true && definitions.length > 0) nextRootToolMode = "required";
+        segmentRolloverOrdinal += 1;
+        providerTransientCarrier = undefined;
+        messages = [
+          ...baseMaterializedMessages.map((message) => structuredClone(message)),
+          ...phaseEntryMessages.map((message) => structuredClone(message)),
+          Object.freeze({
+            role: "system" as const,
+            content: JSON.stringify({
+              kind: "work_segment_recovery",
+              authority: "host",
+              boundaryClass: "provider_protocol_failure",
+              instruction: UNSIGNED_BOUNDARY_GUIDANCE,
+            }),
+          }),
+        ];
+        workspaceContextMessageIndex = -1;
+        return null;
+      };
+      let providerReturned = false;
       let response: GenerationResponse;
       try {
         const provider = options.provider ?? null;
         const connectionLabel = options.connectionLabel ?? options.connectionId ?? null;
         const model = options.model;
         reportProviderProgress("root_dispatch", "started", provider, connectionLabel, model);
-        const providerRequest = options.dispatch({
+        const dispatchPhaseState = phaseMachine?.state();
+        const dispatchSegmentPhase = terminalProjectionSegmentPhase ?? Object.freeze({
+          id: dispatchPhaseState?.phaseId ?? null,
+          index: dispatchPhaseState?.phaseIndex ?? 0,
+          occurrence: dispatchPhaseState?.repeatCount ?? 0,
+        });
+        const dispatchOccurrence = options.segmentRuntime?.dispatch ?? options.dispatch;
+        const providerRequest = dispatchOccurrence({
           frame: rootFrame,
           connectionId: rootFrame.connectionId,
           model: rootFrame.model,
           messages: dispatchInput.messages,
           tools: definitions,
-          toolMode: "ordinary",
+          toolMode: nextRootToolMode,
           maxOutputTokens,
           roundIndex: state.providerRounds - 1,
+          segmentPhase: dispatchSegmentPhase,
+          segmentRolloverOrdinal,
+          segmentCapabilities: Object.freeze([...(phaseCapabilities ?? options.phaseAdmittedCapabilities ?? [])].sort(compareUtf8)),
           ...(dispatchInput.providerTransientCarrier
             ? { providerTransientCarrier: dispatchInput.providerTransientCarrier }
             : {}),
           receiveLimitBytes,
           publishedOutputLimitBytes: receiveLimitBytes,
           signal,
-        });
+        }, Object.freeze({
+          rootObjective: workAuthorityText(baseMaterializedMessages.find((message) => message.role === "user")?.content ?? "Complete the authorized WORK objective."),
+          phaseInstructions: Object.freeze([...baseMaterializedMessages, ...phaseEntryMessages]
+            .filter((message) => message.role === "system")
+            .map((message) => workAuthorityText(message.content))),
+          completionCriteria: completionCriteriaAuthority,
+          admittedCapabilities: Object.freeze([...(phaseCapabilities ?? options.phaseAdmittedCapabilities ?? [])].sort(compareUtf8)),
+          ...(allOptionalPhasesSkippedAuthority
+            ? { allOptionalPhasesSkippedAuthority }
+            : {}),
+          occurrenceMessages: Object.freeze(messages
+            .slice(baseMaterializedMessages.length + phaseEntryMessages.length)
+            .map((message) => deepFreeze(structuredClone(message)))),
+          phaseControlMessage: deepFreeze(structuredClone(phaseControlMessage)),
+          recovery: recoveredDispatchPending || segmentRolloverOrdinal > 0,
+        }));
         reportProviderProgress("root_dispatch", "waiting", provider, connectionLabel, model);
         const rawResponse = await abortable(Promise.resolve(providerRequest), signal);
-        if (signal.aborted) {
-          reportProviderProgress("root_dispatch", "cancelled", provider, connectionLabel, model);
-          const status = signalStatus(signal);
-          return outcomeAfterPending(status, status);
-        }
+        providerReturned = true;
         response = snapshotProviderResponse(rawResponse);
         reportProviderProgress("root_dispatch", "completed", provider, connectionLabel, model);
       } catch (error) {
         const provider = options.provider ?? null;
         const connectionLabel = options.connectionLabel ?? options.connectionId ?? null;
         const model = options.model;
+        if (providerReturned) {
+          if (error instanceof AgenticWorkPhaseError && error.code === "child_output_limit_exceeded") {
+            return outcomeAfterPending("failed", error.code);
+          }
+          const recoveryOutcome = await recoverProviderProtocolFailure();
+          if (recoveryOutcome) return recoveryOutcome;
+          if (signal.aborted) {
+            const status = signalStatus(signal);
+            return outcomeAfterPending(status, status);
+          }
+          continue;
+        }
         if (signal.aborted) {
           reportProviderProgress("root_dispatch", "cancelled", provider, connectionLabel, model);
           const status = signalStatus(signal);
           return outcomeAfterPending(status, status);
         }
         reportProviderProgress("root_dispatch", "error", provider, connectionLabel, model);
-        const code = providerFailureCode(error);
-        console.error(`[agentic] root WORK dispatch failed (${code}): ${error instanceof Error ? error.message : String(error)}`);
-        return outcomeAfterPending("failed", code);
-      }
-      if (signal.aborted) {
-        const status = signalStatus(signal);
-        return outcomeAfterPending(status, status);
+        const durableFailure = options.segmentRuntime
+          ? durableWorkBoundaryFailureV1(error)
+          : undefined;
+        const code = durableFailure?.code ?? providerFailureCode(error);
+        console.error("[agentic] root WORK dispatch failed (" + code + "): " + (error instanceof Error ? error.message : String(error)));
+        return outcomeAfterPending(
+          durableFailure?.status ?? "failed",
+          code,
+          undefined,
+          durableFailure?.durableReason,
+        );
       }
       let accounting: ProviderResponseAccounting;
+      let canonicalProviderOutputTokens: number;
       try {
         accounting = accountProviderResponse(response, receiveLimitBytes, maxOutputTokens, { tokenBasis: "published_content", countTokens });
+        canonicalProviderOutputTokens = options.segmentRuntime
+          ? accountProviderResponse(response, receiveLimitBytes, maxOutputTokens, { tokenBasis: "all", countTokens }).outputTokens
+          : accounting.outputTokens;
       } catch (error) {
-        const code = error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error";
-        console.error(`[agentic] root WORK accounting failed (${code}): ${error instanceof Error ? error.message : String(error)}`);
-        return outcomeAfterPending("failed", code);
+        console.error("[agentic] root WORK accounting failed (provider_protocol_error): " + (error instanceof Error ? error.message : String(error)));
+        if (!options.segmentRuntime) {
+          return outcomeAfterPending(
+            "failed",
+            error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error",
+          );
+        }
+        const recoveryOutcome = await recoverProviderProtocolFailure();
+        if (recoveryOutcome) return recoveryOutcome;
+        continue;
+      }
+      let settledProviderCarrier: ProviderTransientCarrier | undefined;
+      try {
+        settledProviderCarrier = mergeResponseProviderCarrier(
+          providerTransientCarrier,
+          assertKnownProviderCarrier(response.providerTransientCarrier),
+        );
+      } catch {
+        const recoveryOutcome = await recoverProviderProtocolFailure();
+        if (recoveryOutcome) return recoveryOutcome;
+        continue;
+      }
+      const boundaryClass = !accounting.privateFieldsReadable && (response.tool_calls?.length ?? 0) === 0
+        ? "provider_protocol_failure" as const
+        : classifyWorkProviderBoundaryV1(response);
+      if (boundaryClass === "provider_protocol_failure") {
+        const recoveryOutcome = await recoverProviderProtocolFailure();
+        if (recoveryOutcome) return recoveryOutcome;
+        continue;
       }
       if (!state.reserveProviderResponse(accounting.totalBytes, receiveLimitBytes)) {
-        console.error(`[agentic] root WORK reserve bytes failed: ${accounting.totalBytes} vs ${receiveLimitBytes}`);
+        console.error("[agentic] root WORK response exceeds the admitted receive-byte budget");
         return outcomeAfterPending("failed", "child_output_limit_exceeded");
       }
       if (!state.reserveProviderTokens(accounting.outputTokens, maxOutputTokens)) {
-        console.error(`[agentic] root WORK reserve tokens failed: ${accounting.outputTokens} vs ${maxOutputTokens}`);
+        console.error("[agentic] root WORK response exceeds the admitted output-token budget");
         return outcomeAfterPending("failed", "child_output_limit_exceeded");
       }
-      if (!state.recordProviderUsage(
+      const providerInputTokens = typeof response.usage?.prompt_tokens === "number"
+        && Number.isSafeInteger(response.usage.prompt_tokens)
+        && response.usage.prompt_tokens >= 0 ? response.usage.prompt_tokens : 0;
+      const providerOutputTokens = Math.max(reportedCompletionTokens(response.usage), canonicalProviderOutputTokens);
+      const reportedTotalTokens = typeof response.usage?.total_tokens === "number"
+        && Number.isSafeInteger(response.usage.total_tokens)
+        && response.usage.total_tokens >= 0 ? response.usage.total_tokens : 0;
+      const providerTotalTokens = Math.max(reportedTotalTokens, providerInputTokens + providerOutputTokens);
+      const billedOutputTokens = rootBilledCompletionTokens(
+        response.finish_reason,
+        maxOutputTokens,
         response.usage,
-        rootBilledCompletionTokens(
-          response.finish_reason,
-          maxOutputTokens,
-          response.usage,
-          accounting.outputTokens,
-        ),
-        "root",
-      )) {
+        canonicalProviderOutputTokens,
+      );
+      if (enforceLegacyWorkBudget) {
+        rootBilledOutputTokens = Math.min(Number.MAX_SAFE_INTEGER, rootBilledOutputTokens + billedOutputTokens);
+      }
+      if (!state.recordProviderUsage(response.usage, providerOutputTokens)) {
         return outcomeAfterPending("failed", "provider_protocol_error");
       }
-      const billedFuseExhausted = state.billedOutputFuseExceeded();
-      if (!accounting.privateFieldsReadable && (response.tool_calls?.length ?? 0) === 0) {
-        return outcomeAfterPending("failed", "provider_protocol_error");
-      }
-      if (!response || typeof response.content !== "string" || !Array.isArray(response.tool_calls ?? [])) {
-        return outcomeAfterPending("failed", "provider_protocol_error");
-      }
-      state.inspection?.record("provider_exchange", {
-        id: `provider:work:${state.providerRounds - 1}`,
-        kind: "provider_exchange",
-        actor: "provider",
-        recipient: "agent",
-        content: response.content,
-        arguments: JSON.stringify({
-          roundIndex: state.providerRounds - 1,
-          toolCalls: (response.tool_calls ?? []).map((call) => ({
-            callId: call.call_id,
-            toolName: call.name,
-            args: call.args,
-          })),
-        }),
-        result: JSON.stringify({
-          finishReason: response.finish_reason,
-          usage: response.usage ?? null,
-        }),
-        provider: {
-          adapter: "agentic-work",
-          providerId: null,
-          modelId: options.model,
-          connectionRevision: null,
-          fingerprint: null,
-        },
-        correlation: { parentId: "root" },
-      }, { lifecycle: "WORK", status: "running" });
-      try {
-        providerTransientCarrier = mergeResponseProviderCarrier(providerTransientCarrier, assertKnownProviderCarrier(response.providerTransientCarrier));
-      } catch (error) {
+      if (enforceLegacyWorkBudget && rootBilledOutputTokens >= rootBilledOutputTokenLimit) {
         return outcomeAfterPending(
-          "failed",
-          error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error",
+          "exhausted",
+          "root_output_limit_exceeded",
+          `Root billed output reached ${rootBilledOutputTokenLimit} (maxOutputTokens × maxUnsignedBoundaries).`,
         );
       }
-      if (!state.appendWorkNote(response.content)) return outcomeAfterPending("exhausted", "work_budget_exhausted");
-      const calls = canonicalizeDelegateProfileIds(response.tool_calls ?? [], delegatableProfiles);
-      if (calls.length === 0) {
-        if (billedFuseExhausted) {
-          return outcomeAfterPending(
-            "exhausted",
-            "root_output_limit_exceeded",
-            state.billedOutputFuseExhaustedMessage(),
-          );
-        }
-        if (!state.reserveUnsignedBoundary()) return outcomeAfterPending("exhausted", "unsigned_boundary_budget_exhausted");
-        if (providerTransientCarrier?.kind === "openai_responses") {
-          providerTransientCarrier = appendNativeInputMessages(
-            providerTransientCarrier,
-            buildNativeUnsignedBoundaryGuidance(),
-          );
-        } else {
-          messages.push(...buildUnsignedBoundaryContinuation(response));
-        }
-        continue;
-      }
+      const settleProviderDispatch = async (
+        workspaceOperations: number,
+        workspaceMutations: readonly AgenticWorkWorkspaceMutationReservationV1[],
+      ): Promise<AgenticWorkDispatchSettlementReceiptV1 | undefined> => {
+        if (!options.segmentRuntime) return undefined;
+        return snapshotDispatchSettlementReceiptV1(await options.segmentRuntime.settleDispatch(Object.freeze({
+          boundaryClass,
+          usage: Object.freeze({
+            providerDispatches: 1,
+            providerInputTokens,
+            providerOutputTokens,
+            providerTotalTokens,
+            billedOutputTokens,
+            toolCalls: response.tool_calls?.length ?? 0,
+            workspaceOperations,
+            unsignedBoundaries: boundaryClass === "tool_action" ? 0 : 1,
+            receiveBytes: accounting.totalBytes,
+            publishedOutputBytes: utf8ByteLength(response.content),
+          }),
+          workspaceMutations: Object.freeze(workspaceMutations.map((reservation) => Object.freeze({ ...reservation }))),
+        })));
+      };
+      const finalizeProviderDispatch = async (
+        settlement: AgenticWorkDispatchSettlementReceiptV1 | undefined,
+        effects: readonly AgenticWorkDispatchEffectFinalizationV1[],
+      ): Promise<void> => {
+        if (settlement && effects.length > 0) await finalizeDurableDispatchEffects(settlement, effects);
+        recoveredDispatchPending = false;
+      };
+      let calls: readonly ToolCallResult[];
       let validation: { calls: readonly ToolCallResult[]; errors: ReadonlyMap<number, AgenticWorkErrorCode> };
       try {
-        validation = validateCalls(calls, rootFrame, definitionMap, limits.maxArgumentBytes);
+        calls = canonicalizeDelegateProfileIds(response.tool_calls ?? [], delegatableProfiles);
+        validation = calls.length === 0
+          ? { calls, errors: new Map() }
+          : validateCalls(calls, rootFrame, definitionMap, limits.maxArgumentBytes);
       } catch (error) {
+        const settlement = await settleProviderDispatch(0, Object.freeze([]));
+        await finalizeProviderDispatch(settlement, Object.freeze([]));
         return outcomeAfterPending(
           "failed",
           error instanceof AgenticWorkPhaseError ? error.code : "provider_protocol_error",
         );
+      }
+      const allWorkspaceMutationReservations: AgenticWorkWorkspaceMutationReservationV1[] = [];
+      const mutationReservationByOperationKey = new Map<string, AgenticWorkWorkspaceMutationReservationV1>();
+      const mutationEffectByOperationKey = new Map<string, AgenticWorkDispatchEffectFinalizationV1>();
+      let dispatchMutationOwner: Readonly<{ segmentId: string; logicalDispatch: number }> | undefined;
+      const reserveWorkspaceMutation = (
+        providerCallId: string,
+        operationKind: AgenticWorkMutatingWorkspaceOperationKindV1,
+        frameId: string,
+      ): AgenticWorkWorkspaceMutationReservationV1 => {
+        if (!options.segmentRuntime) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable workspace mutation authority is unavailable");
+        }
+        const reservation = snapshotWorkspaceMutationReservationV1(
+          options.segmentRuntime.workspaceMutationReservation(Object.freeze({ providerCallId, operationKind, frameId })),
+          operationKind,
+          frameId,
+        );
+        if (mutationReservationByOperationKey.has(reservation.operationKey)) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable workspace mutation reservation was reused");
+        }
+        if (dispatchMutationOwner && (
+          reservation.segmentId !== dispatchMutationOwner.segmentId
+          || reservation.logicalDispatch !== dispatchMutationOwner.logicalDispatch
+        )) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable workspace mutation dispatch owner changed");
+        }
+        dispatchMutationOwner ??= Object.freeze({
+          segmentId: reservation.segmentId,
+          logicalDispatch: reservation.logicalDispatch,
+        });
+        mutationReservationByOperationKey.set(reservation.operationKey, reservation);
+        allWorkspaceMutationReservations.push(reservation);
+        return reservation;
+      };
+      const recordOwnedWorkspaceMutationEffect = (
+        expectedFrameId: string,
+        effect: AgenticWorkDispatchEffectFinalizationV1,
+      ): void => {
+        const reservation = mutationReservationByOperationKey.get(effect.operationKey);
+        const revisionsValid = Number.isSafeInteger(effect.beforeWorkspaceRevision)
+          && effect.beforeWorkspaceRevision >= 0
+          && Number.isSafeInteger(effect.afterWorkspaceRevision)
+          && effect.afterWorkspaceRevision >= effect.beforeWorkspaceRevision;
+        const digestValid = effect.operationDigest === null
+          || (typeof effect.operationDigest === "string" && /^[a-f0-9]{64}$/u.test(effect.operationDigest));
+        const outcomeValid = effect.outcome === "mutated"
+          ? effect.afterWorkspaceRevision > effect.beforeWorkspaceRevision
+          : effect.outcome === "no_op"
+            ? effect.afterWorkspaceRevision === effect.beforeWorkspaceRevision && effect.operationDigest === null
+            : effect.outcome === "failed"
+              && effect.afterWorkspaceRevision === effect.beforeWorkspaceRevision
+              && effect.operationDigest === null;
+        if (
+          !reservation
+          || mutationEffectByOperationKey.has(effect.operationKey)
+          || Object.keys(effect).length !== 11
+          || effect.version !== reservation.version
+          || effect.operationKind !== reservation.operationKind
+          || effect.segmentId !== reservation.segmentId
+          || effect.logicalDispatch !== reservation.logicalDispatch
+          || effect.frameId !== expectedFrameId
+          || effect.frameId !== reservation.frameId
+          || (effect.outcomeCode !== null && typeof effect.outcomeCode !== "string")
+          || !revisionsValid
+          || !digestValid
+          || !outcomeValid
+        ) {
+          throw new AgenticWorkPhaseError("internal_error", "Child workspace mutation effect ownership is malformed");
+        }
+        mutationEffectByOperationKey.set(effect.operationKey, Object.freeze({ ...effect }));
+      };
+      const delegateInvocationIdentityByCallId = new Map<string, AgenticWorkDelegateInvocationIdentityV1>();
+      const durableDelegateIds = new Set<string>();
+      for (let index = 0; index < calls.length; index += 1) {
+        if (validation.errors.has(index)) continue;
+        const call = calls[index]!;
+        if (call.name !== AGENT_DELEGATE_TOOL) continue;
+        if (!options.segmentRuntime) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable delegate authority is unavailable");
+        }
+        const candidate = options.segmentRuntime.delegateInvocationIdentity(Object.freeze({ providerCallId: call.call_id }));
+        const ids = [candidate?.invocationId, candidate?.childFrameId];
+        if (
+          !candidate
+          || candidate.version !== 1
+          || ids.some((id) => typeof id !== "string"
+            || !WORKSPACE_SAFE_ID_PATTERN.test(id)
+            || boundedBytes(id) > WORKSPACE_ID_MAX_BYTES
+            || durableDelegateIds.has(id))
+          || candidate.invocationId === candidate.childFrameId
+        ) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable delegate invocation identity is malformed");
+        }
+        durableDelegateIds.add(candidate.invocationId);
+        durableDelegateIds.add(candidate.childFrameId);
+        delegateInvocationIdentityByCallId.set(call.call_id, Object.freeze({
+          version: 1,
+          invocationId: candidate.invocationId,
+          childFrameId: candidate.childFrameId,
+        }));
+      }
+
+      let validatedWorkspaceOperations = 0;
+      const mutationReservationByCallId = new Map<string, AgenticWorkWorkspaceMutationReservationV1>();
+      const durableDelegateCallIds = Object.freeze([...delegateInvocationIdentityByCallId.keys()]);
+      const assignmentReservation = durableDelegateCallIds.length === 0
+        ? undefined
+        : reserveWorkspaceMutation(
+          "internal:assign-child-tasks:" + createHash("sha256")
+            .update(encodeCanonicalPlainData({ version: 1, providerCallIds: durableDelegateCallIds }), "utf8")
+            .digest("hex"),
+          "assign_child_tasks",
+          rootFrame.frameId,
+        );
+      const settlementReservationByCallId = new Map<string, AgenticWorkWorkspaceMutationReservationV1>();
+      const settlementChildFrameIdByOperationKey = new Map<string, string>();
+      // Assignment commits before provider calls. Thereafter reserve every
+      // root-owned mutation in provider-call execution order; child-owned
+      // mutations append durably from the child executor at their real order.
+      for (let index = 0; index < calls.length; index += 1) {
+        if (validation.errors.has(index)) continue;
+        const call = calls[index]!;
+        const delegateIdentity = delegateInvocationIdentityByCallId.get(call.call_id);
+        if (delegateIdentity) {
+          const settlementReservation = reserveWorkspaceMutation(
+            call.call_id,
+            "settle_child_task",
+            rootFrame.frameId,
+          );
+          settlementReservationByCallId.set(call.call_id, settlementReservation);
+          settlementChildFrameIdByOperationKey.set(
+            settlementReservation.operationKey,
+            delegateIdentity.childFrameId,
+          );
+        }
+        const operation = OPERATION_BY_WORKSPACE_TOOL[call.name as AgenticWorkWorkspaceToolName];
+        if (operation === undefined) continue;
+        validatedWorkspaceOperations += 1;
+        if (!isMutatingWorkspaceOperationV1(operation)) continue;
+        const reservation = reserveWorkspaceMutation(call.call_id, operation, rootFrame.frameId);
+        mutationReservationByCallId.set(call.call_id, reservation);
+      }
+      const internalDelegateWorkspaceOperations = (assignmentReservation ? 1 : 0)
+        + settlementReservationByCallId.size;
+      if (!state.reserveWorkspaceOperations(internalDelegateWorkspaceOperations, enforceLegacyWorkBudget)) {
+        return outcomeAfterPending("exhausted", "workspace_budget_exhausted");
+      }
+      validatedWorkspaceOperations += internalDelegateWorkspaceOperations;
+      const preSettledWorkspaceMutations = Object.freeze([...allWorkspaceMutationReservations]);
+
+      const noEffectFinalizations = (
+        outcome: "no_op" | "failed",
+        outcomeCode: string,
+      ): readonly AgenticWorkDispatchEffectFinalizationV1[] => {
+        const revision = currentDurableWorkspaceRevision();
+        return Object.freeze(allWorkspaceMutationReservations.map((reservation) => Object.freeze({
+          ...reservation,
+          outcome,
+          outcomeCode,
+          operationDigest: null,
+          beforeWorkspaceRevision: revision,
+          afterWorkspaceRevision: revision,
+        })));
+      };
+      const settleAndFinalizeUnexecuted = async (
+        outcome: "no_op" | "failed",
+        outcomeCode: string,
+      ): Promise<void> => {
+        const settlement = await settleProviderDispatch(
+          validatedWorkspaceOperations,
+          preSettledWorkspaceMutations,
+        );
+        await finalizeProviderDispatch(settlement, noEffectFinalizations(outcome, outcomeCode));
+      };
+      // Durable settlement remains pre-side-effect authority. Known public and
+      // internal mutations are staged now; child mutations append durably later.
+      nextRootToolMode = "ordinary";
+      if (signal.aborted) {
+        const status = signalStatus(signal);
+        await settleAndFinalizeUnexecuted("failed", status);
+        return outcomeAfterPending(status, status);
+      }
+      if (state.inspection) {
+        const providerExchangeId = options.segmentRuntime
+          ? options.segmentRuntime.providerExchangeId()
+          : `provider:work:${state.providerRounds - 1}`;
+        if (options.segmentRuntime && (
+          typeof providerExchangeId !== "string"
+          || !/^provider:work:[0-9a-f]{64}$/.test(providerExchangeId)
+          || recordedProviderExchangeIds.has(providerExchangeId)
+        )) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable provider exchange identity is malformed or reused");
+        }
+        recordedProviderExchangeIds.add(providerExchangeId);
+        state.inspection.record("provider_exchange", {
+          id: providerExchangeId,
+          kind: "provider_exchange",
+          actor: "provider",
+          recipient: "agent",
+          content: response.content,
+          arguments: JSON.stringify({
+            roundIndex: state.providerRounds - 1,
+            toolCalls: (response.tool_calls ?? []).map((call) => ({
+              callId: call.call_id,
+              toolName: call.name,
+              args: call.args,
+            })),
+          }),
+          result: JSON.stringify({
+            finishReason: response.finish_reason,
+            boundaryClass: classifyWorkProviderBoundaryV1(response),
+            usage: response.usage ?? null,
+          }),
+          provider: {
+            adapter: "agentic-work",
+            providerId: null,
+            modelId: options.model,
+            connectionRevision: null,
+            fingerprint: null,
+          },
+          correlation: { parentId: "root" },
+        }, { lifecycle: "WORK", status: "running" });
+      }
+      providerTransientCarrier = settledProviderCarrier;
+      if (!state.appendWorkNote(response.content)) {
+        await settleAndFinalizeUnexecuted("failed", "work_budget_exhausted");
+        return outcomeAfterPending("exhausted", "work_budget_exhausted");
+      }
+      if (calls.length === 0) {
+        await settleAndFinalizeUnexecuted("no_op", "empty_provider_response");
+        if (!state.reserveUnsignedBoundary(enforceLegacyWorkBudget)) return outcomeAfterPending("exhausted", "unsigned_boundary_budget_exhausted");
+        if (options.requiredToolChoiceAvailable === true && definitions.length > 0) {
+          nextRootToolMode = "required";
+        }
+        segmentRolloverOrdinal += 1;
+        // Same-phase rollover closes the provider continuation. No opaque
+        // reasoning, response IDs, function-call IDs, or native messages from
+        // the predecessor segment are authorized in the fresh successor.
+        providerTransientCarrier = undefined;
+        messages = [
+          ...baseMaterializedMessages.map((message) => structuredClone(message)),
+          ...phaseEntryMessages.map((message) => structuredClone(message)),
+          Object.freeze({
+            role: "system" as const,
+            content: JSON.stringify({
+              kind: "work_segment_recovery",
+              authority: "host",
+              boundaryClass: classifyWorkProviderBoundaryV1(response),
+              instruction: UNSIGNED_BOUNDARY_GUIDANCE,
+            }),
+          }),
+        ];
+        workspaceContextMessageIndex = -1;
+        continue;
       }
       const hasCompletion = calls.some((call) => call.name === COMPLETE_TURN_TOOL);
       let completionCriteria: readonly LlmMessage[] = [];
       let acceptance: AgenticCompletionAcceptance | undefined;
       if (hasCompletion && calls.length !== 1) {
-        if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes)) {
+        if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes, enforceLegacyWorkBudget)) {
           appendBoundedBatchFailureObservations(state, observations, calls, "completion_control_budget_exhausted");
+          await settleAndFinalizeUnexecuted("failed", "completion_control_budget_exhausted");
           return outcomeAfterPending("exhausted", "completion_control_budget_exhausted");
         }
         pendingBatchObservationStart = observations.length;
@@ -6427,9 +7622,18 @@ export async function runAgenticWorkPhase(
         for (const serialized of serializedResults) {
           if (!state.reserveToolResult(utf8ByteLength(serialized), limits.maxRootReceiveBytes)) {
             pendingBatchCalls = undefined;
+            await settleAndFinalizeUnexecuted("failed", "tool_result_limit_exceeded");
             return outcomeAfterPending("failed", "tool_result_limit_exceeded");
           }
         }
+        const mixedSettlement = await settleProviderDispatch(
+          validatedWorkspaceOperations,
+          preSettledWorkspaceMutations,
+        );
+        await finalizeProviderDispatch(
+          mixedSettlement,
+          noEffectFinalizations("no_op", "completion_mixed_batch"),
+        );
         providerTransientCarrier = mergeWorkProviderCarrier(providerTransientCarrier, calls, serializedResults);
         if (providerTransientCarrier?.kind === "openai_responses") {
           providerTransientCarrier = appendNativeInputMessages(
@@ -6442,14 +7646,56 @@ export async function runAgenticWorkPhase(
         pendingBatchCalls = undefined;
         continue;
       }
-      if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes)) {
+      if (!state.reserveBatch(calls, limits.maxToolResultBytes, limits.maxRootReceiveBytes, enforceLegacyWorkBudget)) {
         appendBoundedBatchFailureObservations(state, observations, calls, "batch_reservation_failed");
+        await settleAndFinalizeUnexecuted("failed", "batch_reservation_failed");
         return outcomeAfterPending("exhausted", "batch_reservation_failed");
       }
       pendingBatchObservationStart = observations.length;
       pendingBatchCalls = calls;
       const batchObservationStart = pendingBatchObservationStart;
+      const providerDispatchSettlement = await settleProviderDispatch(
+        validatedWorkspaceOperations,
+        preSettledWorkspaceMutations,
+      );
+      let providerDispatchFinalized = false;
+      const finalizeCurrentProviderDispatch = async (fallbackCode: string): Promise<void> => {
+        if (providerDispatchFinalized) return;
+        const cursor = currentDurableWorkspaceRevision();
+        const orderedEffects = allWorkspaceMutationReservations.map((reservation) => {
+          const recorded = mutationEffectByOperationKey.get(reservation.operationKey);
+          if (recorded) return recorded;
+          if (reservation.operationKind === "settle_child_task") {
+            const childFrameId = settlementChildFrameIdByOperationKey.get(reservation.operationKey);
+            if (!childFrameId) {
+              throw new AgenticChildSettlementError(
+                "integrity_error",
+                "Child task settlement reservation lost its assigned frame authority",
+              );
+            }
+            if (assignedDelegates.has(childFrameId)) {
+              throw new AgenticChildSettlementError(
+                "integrity_error",
+                "Assigned child lacks a durable terminal settlement effect",
+              );
+            }
+          }
+          const internalNotExecuted = reservation.operationKind === "assign_child_tasks"
+            || reservation.operationKind === "settle_child_task";
+          return Object.freeze({
+            ...reservation,
+            outcome: internalNotExecuted ? "no_op" as const : "failed" as const,
+            outcomeCode: internalNotExecuted ? null : fallbackCode,
+            operationDigest: null,
+            beforeWorkspaceRevision: cursor,
+            afterWorkspaceRevision: cursor,
+          });
+        });
+        await finalizeProviderDispatch(providerDispatchSettlement, Object.freeze(orderedEffects));
+        providerDispatchFinalized = true;
+      };
       type PreparedDelegate = {
+        readonly providerCallId: string;
         readonly descriptor: AssemblyChildDescriptorV1 & Readonly<{ taskId: string }>;
         readonly frame: AgenticWorkFrame;
         readonly phaseId?: string;
@@ -6465,13 +7711,29 @@ export async function runAgenticWorkPhase(
       ): Promise<void> => {
         const frameId = prepared.frame.frameId;
         if (settlementAttempted.has(frameId) || settlementRetryExhausted.has(frameId)) return;
+        const reservation = settlementReservationByCallId.get(prepared.providerCallId);
+        if (
+          !reservation
+          || reservation.frameId !== rootFrame.frameId
+          || settlementChildFrameIdByOperationKey.get(reservation.operationKey) !== frameId
+        ) {
+          throw new AgenticChildSettlementError("internal_error", "Child task settlement reservation is unavailable");
+        }
+        const beforeSettlementRevision = currentDurableWorkspaceRevision();
         const settle = options.workspace?.settleAssignedTask;
         if (!settle) {
+          mutationEffectByOperationKey.set(reservation.operationKey, Object.freeze({
+            ...reservation,
+            outcome: "failed",
+            outcomeCode: "child_executor_unavailable",
+            operationDigest: null,
+            beforeWorkspaceRevision: beforeSettlementRevision,
+            afterWorkspaceRevision: beforeSettlementRevision,
+          }));
           settlementRetryExhausted.add(frameId);
           throw new AgenticChildSettlementError("child_executor_unavailable", "Child task settlement capability is unavailable");
         }
         const stateToPersist = settlementStateForChildStatus(childStatus);
-        const operationKey = childSettlementOperationKey(prepared.descriptor.taskId, frameId);
         let lastError: unknown = new Error("Child task settlement failed");
         const recovery = makeWorkspaceRecoverySignal(options.deadlineAt);
         const recoveryFrame = freezeFrame({ ...rootFrame, signal: recovery.signal });
@@ -6485,14 +7747,23 @@ export async function runAgenticWorkPhase(
                 taskId: prepared.descriptor.taskId,
                 frameId,
                 state: stateToPersist,
-                operationKey,
+                reservation,
                 signal: recovery.signal,
               })), recovery.signal));
-              if (
-                settlement.workspaceRevision < (workspaceContextRevision ?? 0)
-              ) {
+              if (settlement.workspaceRevision < beforeSettlementRevision) {
                 throw new AgenticWorkPhaseError("tool_protocol_error", "Child settlement acknowledgement was stale");
               }
+              const mutated = settlement.workspaceRevision > beforeSettlementRevision;
+              mutationEffectByOperationKey.set(reservation.operationKey, Object.freeze({
+                ...reservation,
+                outcome: mutated ? "mutated" : "no_op",
+                outcomeCode: null,
+                operationDigest: mutated
+                  ? workspaceMutationOperationDigestV1(settlement, reservation.operationKey)
+                  : null,
+                beforeWorkspaceRevision: beforeSettlementRevision,
+                afterWorkspaceRevision: settlement.workspaceRevision,
+              }));
               workspaceContextRevision = settlement.workspaceRevision;
               // Mark only after a durable acknowledgement; failed attempts remain retryable.
               settlementAttempted.add(frameId);
@@ -6520,11 +7791,23 @@ export async function runAgenticWorkPhase(
                 lastError = readError;
               }
               if (task?.state === stateToPersist) {
+                await refreshWorkspaceContext(recoveryFrame, recovery.signal, true);
+                const afterSettlementRevision = currentDurableWorkspaceRevision();
+                const mutated = afterSettlementRevision > beforeSettlementRevision;
+                mutationEffectByOperationKey.set(reservation.operationKey, Object.freeze({
+                  ...reservation,
+                  outcome: mutated ? "mutated" : "no_op",
+                  outcomeCode: null,
+                  operationDigest: mutated
+                    ? workspaceMutationOperationDigestV1(task, reservation.operationKey)
+                    : null,
+                  beforeWorkspaceRevision: beforeSettlementRevision,
+                  afterWorkspaceRevision: afterSettlementRevision,
+                }));
                 settlementAttempted.add(frameId);
                 assignedDelegates.delete(frameId);
                 return;
               }
-              if (task && TERMINAL_WORKSPACE_TASK_STATES[task.state]) break;
               if (attempt >= 1 || recovery.signal.aborted || !retryable) break;
               try {
                 await refreshWorkspaceContext(recoveryFrame, recovery.signal, true);
@@ -6544,6 +7827,14 @@ export async function runAgenticWorkPhase(
           : workspaceErrorCode(lastError) !== undefined
             ? mapWorkspaceAssignmentError(lastError)
             : "internal_error";
+        mutationEffectByOperationKey.set(reservation.operationKey, Object.freeze({
+          ...reservation,
+          outcome: "failed",
+          outcomeCode: code,
+          operationDigest: null,
+          beforeWorkspaceRevision: beforeSettlementRevision,
+          afterWorkspaceRevision: beforeSettlementRevision,
+        }));
         console.error(`[agentic] child task settlement failed (${code}): ${lastError instanceof Error ? lastError.message : String(lastError)}`);
         throw new AgenticChildSettlementError(code, `Child task settlement failed (${code})`);
       };
@@ -6575,10 +7866,12 @@ export async function runAgenticWorkPhase(
         childStatus: AgenticChildResultMetadata["status"],
       ): Promise<AgenticChildSettlementError | undefined> => {
         const failure = await settleAssignedFrames(childStatus);
+        if (failure) return failure;
+        await finalizeCurrentProviderDispatch(childStatus);
         assignedDelegates.clear();
         settlementAttempted.clear();
         settlementRetryExhausted.clear();
-        return failure;
+        return undefined;
       };
       const settlePendingBatch = async (
         childStatus: AgenticChildResultMetadata["status"],
@@ -6742,6 +8035,9 @@ export async function runAgenticWorkPhase(
       const delegatedSourceBase = state.childFrames;
       let delegatedSourceIndex = 0;
       let phaseTransitioned = false;
+      let terminalProjectionRefresh = false;
+      let phaseTransitionSourceId: string | null = null;
+      let phaseTransitionCompletion: AgenticCompletionPayload | undefined;
       let phaseTerminalPending = false;
       let phaseCompletionFailed = false;
       let phaseCompletionExpectedRevision: number | undefined;
@@ -6752,8 +8048,12 @@ export async function runAgenticWorkPhase(
         const candidate = delegateCandidates.get(call.call_id);
         if (!candidate) continue;
         const ordinal = delegatedSourceBase + delegatedSourceIndex++;
-        const childId = boundedDerivedId(rootFrame.frameId, `:delegate-${ordinal}`, WORKSPACE_ID_MAX_BYTES, true, "agentic-work-delegate");
-        const frameId = boundedDerivedId(rootFrame.frameId, `:child-${ordinal}`, WORKSPACE_ID_MAX_BYTES, true, "agentic-work-child");
+        const durableIdentity = delegateInvocationIdentityByCallId.get(call.call_id);
+        if (!durableIdentity) {
+          throw new AgenticWorkPhaseError("internal_error", "Durable delegate invocation identity is unavailable");
+        }
+        const childId = durableIdentity.invocationId;
+        const frameId = durableIdentity.childFrameId;
         const ids = [childId, frameId];
         if (
           ids.some((id) => !WORKSPACE_SAFE_ID_PATTERN.test(id) || boundedBytes(id) > WORKSPACE_ID_MAX_BYTES)
@@ -6799,6 +8099,7 @@ export async function runAgenticWorkPhase(
         ).map((message) => message.content);
         recordChildPhaseSubsetProvenance(state.inspection, currentPhase, candidate.profileId, childId);
         preparedDelegates.set(call.call_id, {
+          providerCallId: call.call_id,
           descriptor,
           frame,
           ...(currentPhase === null
@@ -6820,6 +8121,10 @@ export async function runAgenticWorkPhase(
         return finishBatchExit("exhausted", "work_budget_exhausted");
       }
       if (assignments.length > 0) {
+        if (!assignmentReservation) {
+          throw new AgenticWorkPhaseError("internal_error", "Child assignment reservation is unavailable");
+        }
+        const beforeAssignmentRevision = currentDurableWorkspaceRevision();
         const assignmentController = new AbortController();
         const assignmentFrame = freezeFrame({ ...rootFrame, signal: assignmentController.signal });
         let assignmentPromise: Promise<AgenticWorkspaceChildAssignmentResult> | undefined;
@@ -6854,16 +8159,60 @@ export async function runAgenticWorkPhase(
         };
         const commitAssignment = (candidate: AgenticWorkspaceChildAssignmentResult): void => {
           const assignment = validateAssignment(candidate);
+          if (assignment.workspaceRevision < beforeAssignmentRevision) {
+            throw new AgenticWorkPhaseError("tool_protocol_error", "Child assignment acknowledgement was stale");
+          }
           assignmentCommitted = true;
           workspaceContextRevision = assignment.workspaceRevision;
+          const mutated = assignment.workspaceRevision > beforeAssignmentRevision;
+          mutationEffectByOperationKey.set(assignmentReservation.operationKey, Object.freeze({
+            ...assignmentReservation,
+            outcome: mutated ? "mutated" : "no_op",
+            outcomeCode: null,
+            operationDigest: mutated
+              ? workspaceMutationOperationDigestV1(assignment, assignmentReservation.operationKey)
+              : null,
+            beforeWorkspaceRevision: beforeAssignmentRevision,
+            afterWorkspaceRevision: assignment.workspaceRevision,
+          }));
           for (const prepared of preparedDelegates.values()) {
             assignedDelegates.set(prepared.frame.frameId, prepared);
           }
         };
+        if (options.segmentRuntime) {
+          if (!providerDispatchSettlement) {
+            throw new AgenticWorkPhaseError(
+              "internal_error",
+              "Durable provider dispatch settlement is unavailable",
+            );
+          }
+          const durableAssignments = [...preparedDelegates.entries()].map(([callId, prepared]) => {
+            const settlementReservation = settlementReservationByCallId.get(callId);
+            if (
+              !settlementReservation
+              || settlementReservation.frameId !== rootFrame.frameId
+              || settlementChildFrameIdByOperationKey.get(settlementReservation.operationKey)
+                !== prepared.frame.frameId
+            ) {
+              throw new AgenticWorkPhaseError("internal_error", "Child settlement authority is unavailable");
+            }
+            return Object.freeze({
+              taskId: prepared.descriptor.taskId,
+              frameId: prepared.frame.frameId,
+              settlementReservation,
+            });
+          });
+          await options.segmentRuntime.persistChildAssignmentAuthority(Object.freeze({
+            settlement: providerDispatchSettlement,
+            assignmentReservation,
+            assignments: Object.freeze(durableAssignments),
+          }));
+        }
         try {
           assignmentPromise = Promise.resolve(options.workspace!.assignChildTasks!({
             frame: assignmentFrame,
             assignments,
+            reservation: assignmentReservation,
             ...(workspaceContextRevision === undefined ? {} : { expectedRevision: workspaceContextRevision }),
             signal: assignmentController.signal,
           }));
@@ -6877,6 +8226,17 @@ export async function runAgenticWorkPhase(
             phaseInput = await readPhaseInput("WORK");
           }
         } catch (error) {
+          const initialAssignmentFailureCode = error instanceof AgenticWorkPhaseError
+            ? error.code
+            : mapWorkspaceAssignmentError(error);
+          mutationEffectByOperationKey.set(assignmentReservation.operationKey, Object.freeze({
+            ...assignmentReservation,
+            outcome: "failed",
+            outcomeCode: initialAssignmentFailureCode,
+            operationDigest: null,
+            beforeWorkspaceRevision: beforeAssignmentRevision,
+            afterWorkspaceRevision: beforeAssignmentRevision,
+          }));
           let reconciliationError: unknown = error;
           abortAssignment();
           const recovery = makeWorkspaceRecoverySignal(options.deadlineAt);
@@ -7036,6 +8396,7 @@ export async function runAgenticWorkPhase(
                     ),
                   };
                 } else {
+                  const sourcePhaseState = phaseMachine.state();
                   const committedDecision = phaseMachine.exit(phaseInput);
                   recordPhaseEvidence();
                   if (isRecoverableUnsatisfiedLivePhaseExit(committedDecision, phaseMachine.state().status)) {
@@ -7052,7 +8413,30 @@ export async function runAgenticWorkPhase(
                     phaseCompletionFailed = true;
                   } else if (!(await drainPhaseEntry())) {
                     phaseCompletionFailed = true;
+                  } else if (phaseMachine.state().status === "completed" || !phaseMachine.currentPhase()) {
+                    if (
+                      sourcePhaseState.status !== "entered"
+                      || typeof sourcePhaseState.phaseId !== "string"
+                      || typeof sourcePhaseState.phaseIndex !== "number"
+                      || !Number.isSafeInteger(sourcePhaseState.phaseIndex)
+                      || sourcePhaseState.phaseIndex < 0
+                    ) {
+                      throw new AgenticWorkPhaseError("invalid_plan", "Completed custom phase lacks a durable source occurrence");
+                    }
+                    // A skipped authored tail still requires one freshly
+                    // materialized provider projection with no phase-native
+                    // instructions or capabilities before terminal WORK.
+                    terminalProjectionSegmentPhase = Object.freeze({
+                      id: sourcePhaseState.phaseId,
+                      index: sourcePhaseState.phaseIndex,
+                      occurrence: sourcePhaseState.repeatCount + 1,
+                    });
+                    phaseTransitionSourceId = sourcePhaseState.phaseId;
+                    phaseTransitionCompletion = phasePayload.payload;
+                    terminalProjectionRefresh = true;
                   } else {
+                    phaseTransitionSourceId = committedDecision.phaseId;
+                    phaseTransitionCompletion = phasePayload.payload;
                     phaseTransitioned = true;
                   }
                 }
@@ -7072,8 +8456,8 @@ export async function runAgenticWorkPhase(
                 code: "invalid_plan",
                 result: resultError("invalid_plan"),
               };
-            } else if (phaseTransitioned) {
-              const workspaceRevision = workspaceContextRevision ?? phaseInput?.revision ?? 0;
+            } else if (phaseTransitioned || terminalProjectionRefresh) {
+              const workspaceRevision: number = workspaceContextRevision ?? phaseInput?.revision ?? 0;
               const nextPhase = phaseMachine?.currentPhase() ?? null;
               completion = {
                 observationStatus: "success",
@@ -7117,13 +8501,45 @@ export async function runAgenticWorkPhase(
             return finishBatchAbort(status);
           }
         } else if (call.name.startsWith("workspace_")) {
+          const mutationReservation = mutationReservationByCallId.get(call.call_id);
+          const beforeWorkspaceRevision = currentDurableWorkspaceRevision();
           try {
-            const workspaceResult = await executeWorkspaceTool(options.workspace, call.name as AgenticWorkWorkspaceToolName, call.args, rootFrame, call.call_id, rejectFailedRootSettlement);
+            const workspaceResult = await executeWorkspaceTool(
+              options.workspace,
+              call.name as AgenticWorkWorkspaceToolName,
+              call.args,
+              rootFrame,
+              mutationReservation,
+              rejectFailedRootSettlement,
+            );
+            if (mutationReservation) {
+              const afterWorkspaceRevision = workspaceResult.workspaceRevision
+                ?? (isRecord(workspaceResult.result)
+                  && workspaceResult.result.errorCode === "completion_blocked"
+                  ? beforeWorkspaceRevision
+                  : undefined);
+              if (afterWorkspaceRevision === undefined || afterWorkspaceRevision < beforeWorkspaceRevision) {
+                throw new AgenticWorkPhaseError("tool_protocol_error", "Workspace mutation revision is missing or stale");
+              }
+              const mutated = afterWorkspaceRevision > beforeWorkspaceRevision;
+              const operationDigest = workspaceMutationOperationDigestV1(
+                workspaceResult.result,
+                mutationReservation.operationKey,
+              );
+              mutationEffectByOperationKey.set(mutationReservation.operationKey, Object.freeze({
+                ...mutationReservation,
+                outcome: mutated ? "mutated" : "no_op",
+                outcomeCode: null,
+                operationDigest: mutated ? operationDigest : null,
+                beforeWorkspaceRevision,
+                afterWorkspaceRevision,
+              }));
+            }
+            if (workspaceResult.workspaceRevision !== undefined) workspaceContextRevision = workspaceResult.workspaceRevision;
             if (signal.aborted) {
               const status = signalStatus(signal);
               return finishBatchAbort(status);
             }
-            if (workspaceResult.workspaceRevision !== undefined) workspaceContextRevision = workspaceResult.workspaceRevision;
             if (phaseMachine && phaseMachine.state().status === "entered") {
               phaseInput = await readPhaseInput("WORK");
             }
@@ -7131,6 +8547,13 @@ export async function runAgenticWorkPhase(
             observationStatus = normalized.status === "error" ? "error" : "success";
             code = normalized.code as AgenticWorkErrorCode | undefined;
             result = normalized.serialized;
+            if (mutationReservation && code) {
+              const recorded = mutationEffectByOperationKey.get(mutationReservation.operationKey);
+              if (recorded) mutationEffectByOperationKey.set(mutationReservation.operationKey, Object.freeze({
+                ...recorded,
+                outcomeCode: code,
+              }));
+            }
           } catch (error) {
             if (signal.aborted) {
               const status = signalStatus(signal);
@@ -7140,6 +8563,19 @@ export async function runAgenticWorkPhase(
             const mapped = workspaceToolErrorResult(error);
             code = mapped.code;
             result = mapped.result;
+            if (mutationReservation) {
+              const recorded = mutationEffectByOperationKey.get(mutationReservation.operationKey);
+              mutationEffectByOperationKey.set(mutationReservation.operationKey, recorded
+                ? Object.freeze({ ...recorded, outcomeCode: mapped.code })
+                : Object.freeze({
+                    ...mutationReservation,
+                    outcome: "failed",
+                    outcomeCode: mapped.code,
+                    operationDigest: null,
+                    beforeWorkspaceRevision,
+                    afterWorkspaceRevision: beforeWorkspaceRevision,
+                  }));
+            }
           }
         } else if (call.name === AGENT_DELEGATE_TOOL) {
           const profileId = typeof call.args.profile_id === "string" ? call.args.profile_id : "";
@@ -7172,6 +8608,11 @@ export async function runAgenticWorkPhase(
                     phaseId: prepared.phaseId,
                     phaseInstructionSubset: prepared.phaseInstructionSubset ?? [],
                   }),
+                workspaceMutationReservation: ({ providerCallId, operationKind, frameId }) =>
+                  reserveWorkspaceMutation(providerCallId, operationKind, frameId),
+                initialWorkspaceRevision: currentDurableWorkspaceRevision(),
+                recordWorkspaceMutationEffect: (effect) =>
+                  recordOwnedWorkspaceMutationEffect(prepared.frame.frameId, effect),
                 ...(options.workspace ? { workspace: options.workspace } : {}),
               })), signal);
               if (signal.aborted) {
@@ -7228,16 +8669,18 @@ export async function runAgenticWorkPhase(
                 throw new AgenticWorkPhaseError("provider_protocol_error", "Child provider usage is malformed");
               }
               const delegatedWorkspaceRevision = delegatedRecord.workspaceRevision;
-              if (delegatedWorkspaceRevision !== undefined) {
-                if (
+              if (
+                delegatedWorkspaceRevision !== undefined
+                && (
                   typeof delegatedWorkspaceRevision !== "number"
                   || !Number.isSafeInteger(delegatedWorkspaceRevision)
                   || delegatedWorkspaceRevision < 0
-                  || (workspaceContextRevision !== undefined && delegatedWorkspaceRevision < workspaceContextRevision)
-                ) {
-                  throw new AgenticWorkPhaseError("tool_protocol_error", "Child workspace revision is malformed or stale");
-                }
-                workspaceContextRevision = delegatedWorkspaceRevision;
+                )
+              ) {
+                throw new AgenticWorkPhaseError("tool_protocol_error", "Child workspace revision is malformed");
+              }
+              if (delegatedWorkspaceRevision !== undefined) {
+                workspaceContextRevision = Math.max(workspaceContextRevision ?? 0, delegatedWorkspaceRevision);
               }
               const publishedContent = childStatus === "succeeded" ? content : "";
               const bytes = boundedBytes(publishedContent);
@@ -7306,8 +8749,21 @@ export async function runAgenticWorkPhase(
                   pendingRequiredDelegatedFailure = undefined;
                   pendingRequiredDelegatedTaskId = undefined;
                 }
-                // A successful child is already terminal and must not be
-                // downgraded by cleanup for a later sibling failure/abort.
+                // A successful child already produced the terminal workspace mutation.
+                // Bind its reserved host settlement as an observed no-op before dispatch finalization.
+                const successfulSettlementReservation = settlementReservationByCallId.get(prepared.providerCallId);
+                if (!successfulSettlementReservation) {
+                  throw new AgenticChildSettlementError("integrity_error", "Successful child settlement reservation is unavailable");
+                }
+                const terminalRevision = currentDurableWorkspaceRevision();
+                mutationEffectByOperationKey.set(successfulSettlementReservation.operationKey, Object.freeze({
+                  ...successfulSettlementReservation,
+                  outcome: "no_op",
+                  outcomeCode: null,
+                  operationDigest: null,
+                  beforeWorkspaceRevision: terminalRevision,
+                  afterWorkspaceRevision: terminalRevision,
+                }));
                 assignedDelegates.delete(prepared.frame.frameId);
                 if (phaseMachine && phaseMachine.state().status === "entered") {
                   phaseInput = await readPhaseInput("WORK");
@@ -7457,45 +8913,86 @@ export async function runAgenticWorkPhase(
         hasCompletion
         && observations.slice(batchObservationStart).some((item) => item.code === "completion_blocked")
       ) {
-        if (!state.reserveUnsignedBoundary()) {
+        if (!state.reserveUnsignedBoundary(enforceLegacyWorkBudget)) {
           return finishBatchExit("exhausted", "unsigned_boundary_budget_exhausted");
         }
       }
 
-      if (providerTransientCarrier?.kind === "openai_responses") {
-        providerTransientCarrier = mergeWorkProviderCarrier(
-          providerTransientCarrier,
-          calls.slice(0, serializedResults.length),
-          serializedResults,
-        );
-        const nativeContinuation = hasCompletion
-          ? buildNativeHostContinuation(completionCriteria)
-          : [];
-        providerTransientCarrier = appendNativeInputMessages(
-          providerTransientCarrier,
-          nativeContinuation,
-        );
-      } else {
-        messages.push(...buildContinuation(
-          response,
-          calls.slice(0, serializedResults.length),
-          serializedResults,
-          resultErrors,
-          hasCompletion ? completionCriteria : [],
-        ));
+      if (!phaseTransitioned && !terminalProjectionRefresh) {
+        if (providerTransientCarrier?.kind === "openai_responses") {
+          providerTransientCarrier = mergeWorkProviderCarrier(
+            providerTransientCarrier,
+            calls.slice(0, serializedResults.length),
+            serializedResults,
+          );
+          const nativeContinuation = hasCompletion
+            ? buildNativeHostContinuation(completionCriteria)
+            : [];
+          providerTransientCarrier = appendNativeInputMessages(
+            providerTransientCarrier,
+            nativeContinuation,
+          );
+        } else {
+          messages.push(...buildContinuation(
+            response,
+            calls.slice(0, serializedResults.length),
+            serializedResults,
+            resultErrors,
+            hasCompletion ? completionCriteria : [],
+          ));
+        }
       }
       const settlementFailure = await settlePendingBatch("failed");
       if (settlementFailure) throw settlementFailure;
-      if (phaseTransitioned) {
-        const phaseTerminal = phaseMachine?.state().status === "completed";
-        phaseCapabilities = phaseTerminal
-          ? new Set()
-          : new Set(phaseMachine?.capabilities() ?? []);
+      if (phaseTransitioned || terminalProjectionRefresh) {
+        segmentRolloverOrdinal = 0;
+        // A phase boundary is a hard provider-continuation boundary. Source
+        // reasoning, response IDs, function-call IDs, and opaque carriers are
+        // never authorized in the successor occurrence.
+        providerTransientCarrier = undefined;
+        const transitionedPhaseMachine = phaseMachine;
+        const sourceCompletion = phaseTransitionCompletion;
+        if (!transitionedPhaseMachine || !sourceCompletion) {
+          throw new AgenticWorkPhaseError("invalid_plan", "Custom phase transition lacks durable source authority");
+        }
+        const nextPhase = terminalProjectionRefresh
+          ? null
+          : transitionedPhaseMachine.currentPhase();
+        const nextPhaseState = transitionedPhaseMachine.state();
+        let targetPhase: AgenticWorkSegmentTransitionInputV1["targetPhase"];
+        let targetPhaseCapabilities: ReadonlySet<AgentRuntimePhaseCapabilityV1>;
+        if (terminalProjectionRefresh) {
+          if (!terminalProjectionSegmentPhase) {
+            throw new AgenticWorkPhaseError("invalid_plan", "Terminal phase projection lacks a durable target occurrence");
+          }
+          targetPhase = terminalProjectionSegmentPhase;
+          targetPhaseCapabilities = new Set();
+        } else {
+          if (
+            !nextPhase
+            || nextPhaseState.status !== "entered"
+            || nextPhaseState.phaseId !== nextPhase.id
+            || typeof nextPhaseState.phaseIndex !== "number"
+            || !Number.isSafeInteger(nextPhaseState.phaseIndex)
+            || nextPhaseState.phaseIndex < 0
+            || !Number.isSafeInteger(nextPhaseState.repeatCount)
+            || nextPhaseState.repeatCount < 0
+          ) {
+            throw new AgenticWorkPhaseError("invalid_plan", "Custom phase transition has no admitted successor");
+          }
+          targetPhase = Object.freeze({
+            id: nextPhase.id,
+            index: nextPhaseState.phaseIndex,
+            occurrence: nextPhaseState.repeatCount,
+          });
+          targetPhaseCapabilities = new Set(transitionedPhaseMachine.capabilities());
+        }
+        phaseCapabilities = targetPhaseCapabilities;
         composition = composeAgenticWorkPhaseComposition(
           options,
           coreToolIds,
           delegatableProfiles,
-          phaseCapabilities,
+          targetPhaseCapabilities,
           signal,
         );
         rootFrame = freezeFrame({
@@ -7508,16 +9005,60 @@ export async function runAgenticWorkPhase(
         });
         definitions = composition.rootDefinitions;
         definitionMap = new Map(definitions.map((definition) => [definition.name, definition]));
-        const nextPhaseMessages = phaseTerminal
-          ? Object.freeze([])
-          : materializeActivePhaseMessages(
-            plan,
-            phaseMachine?.currentPhase() ?? null,
-            phaseCapabilities,
-            options,
-          );
+        const nextPhaseMessages: readonly LlmMessage[] = nextPhase
+          ? materializeActivePhaseMessages(
+              plan,
+              nextPhase,
+              targetPhaseCapabilities,
+              options,
+            )
+          : Object.freeze([]);
         phaseEntryMessages = nextPhaseMessages;
-        replacePhaseEntryMessages(nextPhaseMessages);
+        clearCouncilAdvice();
+        const handoffGates = await readPhaseControlCompletionGates(options.workspace, rootFrame);
+        const acceptanceRows = options.workspace ? await readTaskAcceptanceRequired() : [];
+        const previousHandoffMessage: LlmMessage = Object.freeze({
+          role: "system" as const,
+          content: JSON.stringify({
+            kind: "work_phase_handoff",
+            authority: "host",
+            sourcePhaseId: phaseTransitionSourceId,
+            targetPhaseId: nextPhase?.id ?? null,
+            workspaceRevision: handoffGates.workspaceRevision ?? workspaceContextRevision ?? 0,
+            acceptedTaskIds: acceptanceRows
+              .filter((row) => row.state !== "active")
+              .map((row) => row.id),
+            openRequiredIds: handoffGates.openRequiredTaskIds ?? [],
+          }),
+        });
+        messages = [
+          ...baseMaterializedMessages.map((message) => structuredClone(message)),
+          ...nextPhaseMessages.map((message) => structuredClone(message)),
+          previousHandoffMessage,
+        ];
+        phaseEntryMessageStart = baseMaterializedMessages.length;
+        workspaceContextMessageIndex = -1;
+        const successorPhaseControlMessage = rootPhaseControlMessage(
+          nextPhase?.id ?? null,
+          definitions,
+          handoffGates,
+        );
+        const targetAuthority: AgenticWorkSegmentAuthorityV1 = Object.freeze({
+          rootObjective: workAuthorityText(baseMaterializedMessages.find((message) => message.role === "user")?.content ?? "Complete the authorized WORK objective."),
+          phaseInstructions: Object.freeze([...baseMaterializedMessages, ...nextPhaseMessages]
+            .filter((message) => message.role === "system")
+            .map((message) => workAuthorityText(message.content))),
+          completionCriteria: completionCriteriaAuthority,
+          admittedCapabilities: Object.freeze([...targetPhaseCapabilities].sort(compareUtf8)),
+          occurrenceMessages: Object.freeze([deepFreeze(structuredClone(previousHandoffMessage))]),
+          phaseControlMessage: deepFreeze(structuredClone(successorPhaseControlMessage)),
+          recovery: false,
+        });
+        await options.segmentRuntime?.transition(Object.freeze({
+          targetPhase,
+          targetAuthority,
+          sourceCompletion,
+        }));
         const phaseCouncilStatus = await invokeCouncilForCurrentPhase();
         if (phaseCouncilStatus === "aborted") {
           const status = signalStatus(signal);
@@ -7526,31 +9067,24 @@ export async function runAgenticWorkPhase(
         if (phaseCouncilStatus === "failed") {
           return outcomeAfterPending("failed", "council_required_failed");
         }
-        if (providerTransientCarrier?.kind === "openai_responses") {
-          replacePhaseEntryMessages(Object.freeze([]));
-          providerTransientCarrier = replaceNativePhaseInputMessages(
-            providerTransientCarrier,
-            nativePhaseEntryMessages,
-            nextPhaseMessages,
-          );
-          nativePhaseEntryMessages = nextPhaseMessages;
-        } else {
-          nativePhaseEntryMessages = Object.freeze([]);
+        if (phaseCouncilStatus === "limit_exceeded") {
+          return outcomeAfterPending("failed", "limit_exceeded");
         }
-      }
-      if (billedFuseExhausted) {
-        return outcomeAfterPending(
-          "exhausted",
-          "root_output_limit_exceeded",
-          state.billedOutputFuseExhaustedMessage(),
-        );
       }
     }
   } catch (error) {
-    const failureCode = error instanceof AgenticWorkPhaseError ? error.code : "internal_error";
+    const durableFailure = options.segmentRuntime
+      ? durableWorkBoundaryFailureV1(error)
+      : undefined;
+    const failureCode = durableFailure?.code
+      ?? (error instanceof AgenticWorkPhaseError ? error.code : "internal_error");
     const detail = error instanceof Error ? error.message : String(error);
     const path = error instanceof AgenticWorkPhaseError && error.path ? ` path=${error.path}` : "";
-    const errorMessage = error instanceof AgenticWorkPhaseError ? `${detail}${path}` : undefined;
+    const errorMessage = durableFailure
+      ? undefined
+      : error instanceof AgenticWorkPhaseError
+        ? `${detail}${path}`
+        : undefined;
     console.error(`[agentic] WORK phase threw (${failureCode}): ${detail}${path}`);
     const pendingBatchFailureCalls = pendingBatchCalls;
     const pendingBatchFailureObservationStart = pendingBatchObservationStart;
@@ -7594,9 +9128,10 @@ export async function runAgenticWorkPhase(
       }
     }
     reportProgress();
-    const finalFailureCode = cleanupFailure?.code ?? failureCode;
-    const finalErrorMessage = errorMessage ?? cleanupFailure?.message;
-    if (pendingRequiredDelegatedFailure) {
+    const finalFailureCode = durableFailure?.code ?? cleanupFailure?.code ?? failureCode;
+    const finalErrorMessage = durableFailure ? undefined : errorMessage ?? cleanupFailure?.message;
+    const finalDurableReason = durableFailure?.durableReason;
+    if (pendingRequiredDelegatedFailure && !durableFailure) {
       return makeOutcome(
         "failed",
         state,
@@ -7610,7 +9145,7 @@ export async function runAgenticWorkPhase(
         finalErrorMessage,
       );
     }
-    if (signal.aborted) {
+    if (signal.aborted && !durableFailure) {
       const status = signalStatus(signal);
       if (status === "timed_out") {
         return makeOutcome(status, state, observations, childResults, status, undefined, undefined, undefined, undefined, finalErrorMessage);
@@ -7619,25 +9154,145 @@ export async function runAgenticWorkPhase(
         return makeOutcome(status, state, observations, childResults, status, undefined, undefined, undefined, undefined, finalErrorMessage);
       }
     }
-    return makeOutcome("failed", state, observations, childResults, finalFailureCode, undefined, undefined, undefined, undefined, finalErrorMessage);
+    return makeOutcome(
+      durableFailure?.status ?? "failed",
+      state,
+      observations,
+      childResults,
+      finalFailureCode,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      finalErrorMessage,
+      finalDurableReason,
+    );
   } finally {
     deadline.dispose();
   }
 }
-
-/** Short alias for callers that already have an Agentic phase object. */
-export const runWorkPhase = runAgenticWorkPhase;
-export const validateWorkAssemblyPlan = validateAgenticAssemblyPlan;
-export const composeWorkTools = composeAgenticWorkToolDefinitions;
-
-export function isAgenticWorkToolName(value: string): value is AgenticWorkToolName {
-  return WORK_TOOL_SET.has(value);
+export function classifyWorkProviderBoundaryV1(
+  response: unknown,
+): WorkProviderBoundaryClassV1 {
+  if (!isRecord(response)) return "provider_protocol_failure";
+  try {
+    assertProviderTreeSnapshot(response, "response");
+    if (typeof response.content !== "string" || typeof response.finish_reason !== "string") {
+      return "provider_protocol_failure";
+    }
+    const toolCalls = response.tool_calls === undefined ? [] : response.tool_calls;
+    assertProviderToolCallsSnapshot(toolCalls);
+    if (response.reasoning !== undefined && typeof response.reasoning !== "string") {
+      return "provider_protocol_failure";
+    }
+    if (response.thinking_blocks !== undefined && !Array.isArray(response.thinking_blocks)) {
+      return "provider_protocol_failure";
+    }
+    if (response.reasoning_details !== undefined && !Array.isArray(response.reasoning_details)) {
+      return "provider_protocol_failure";
+    }
+    assertBoundedProviderThoughtSignature(response.thought_signature, "thought_signature");
+    const carrier = assertKnownProviderCarrier(response.providerTransientCarrier);
+    if (toolCalls.length > 0) return "tool_action";
+    if (response.content.trim().length > 0) return "tool_free_stop";
+    const hasPrivateReasoningCarrier = (typeof response.reasoning === "string" && response.reasoning.trim().length > 0)
+      || (response.thinking_blocks?.length ?? 0) > 0
+      || (response.reasoning_details?.length ?? 0) > 0
+      || (carrier?.items.length ?? 0) > 0
+      || (typeof response.thought_signature === "string" && response.thought_signature.length > 0);
+    if (hasPrivateReasoningCarrier) {
+      return isLengthCapFinishReason(response.finish_reason) ? "reasoning_only_length" : "reasoning_only_stop";
+    }
+    return "empty_provider_response";
+  } catch {
+    return "provider_protocol_failure";
+  }
 }
 
-export function workspaceToolName(operation: WorkspaceOperationKindV1): AgenticWorkWorkspaceToolName {
-  return WORKSPACE_TOOL_BY_OPERATION[operation];
+
+async function closeAgenticWorkSegmentRuntimeV1(
+  runtime: AgenticWorkSegmentRuntimeV1 | undefined,
+  outcome: Parameters<AgenticWorkSegmentRuntimeV1["close"]>[0],
+): Promise<void> {
+  if (!runtime) return;
+  try {
+    await runtime.close(outcome);
+  } catch (error) {
+    if (error instanceof AgenticWorkPhaseError) throw error;
+    const durableFailure = durableWorkBoundaryFailureV1(error);
+    if (durableFailure) throw new DurableWorkBoundaryPhaseErrorV1(durableFailure);
+    throw new AgenticWorkPhaseError("internal_error", "Durable WORK lifecycle close failed");
+  }
 }
 
-export function workspaceOperationForTool(name: AgenticWorkWorkspaceToolName): WorkspaceOperationKindV1 {
-  return OPERATION_BY_WORKSPACE_TOOL[name];
+async function runAndCloseSegmentedAgenticWorkV1(
+  options: AgenticWorkOptions,
+  resumedSegment?: AgenticWorkSegmentRunnerInputV1,
+): Promise<AgenticWorkPhaseOutcome> {
+  let outcome: AgenticWorkPhaseOutcome;
+  try {
+    outcome = await runSegmentedAgenticWorkAttemptCoreV1(options, resumedSegment);
+  } catch (error) {
+    const durableFailure = options.segmentRuntime
+      ? durableWorkBoundaryFailureV1(error)
+      : undefined;
+    await closeAgenticWorkSegmentRuntimeV1(options.segmentRuntime, durableFailure
+      ? {
+        status: durableFailure.status,
+        code: durableFailure.code,
+        durableReason: durableFailure.durableReason,
+      }
+      : {
+        status: options.signal?.aborted ? "cancelled" : "failed",
+        ...(error instanceof AgenticWorkPhaseError
+          ? { code: error.code, errorMessage: error.message }
+          : { errorMessage: "WORK execution failed" }),
+      });
+    if (durableFailure) throw new DurableWorkBoundaryPhaseErrorV1(durableFailure);
+    throw error;
+  }
+  await closeAgenticWorkSegmentRuntimeV1(options.segmentRuntime, outcome);
+  return outcome;
+}
+/** Owns the full WORK attempt and closes the durable occurrence runtime exactly once. */
+export async function runSegmentedAgenticWorkV1(
+  options: AgenticWorkOptions,
+): Promise<AgenticWorkPhaseOutcome> {
+  return runAndCloseSegmentedAgenticWorkV1(options);
+}
+
+/**
+ * Continues an already-admitted durable WORK segment after process recovery.
+ * Persisted segment authority replaces every pre-segment sidecar, deterministic
+ * child, council, and phase-entry action; new provider/tool work remains live.
+ */
+export async function resumeAdmittedAgenticWorkSegmentV1(
+  options: AgenticWorkOptions,
+  input: AgenticWorkSegmentRunnerInputV1,
+): Promise<AgenticWorkPhaseOutcome> {
+  assertAgenticWorkSegmentRunnerInputV1(input);
+  if (!options.segmentRuntime) {
+    throw new AgenticWorkPhaseError("invalid_input", "Admitted WORK segment recovery requires its durable lifecycle");
+  }
+  const turnWorkspaceAuthority = options.turnWorkspaceAuthority;
+  if (!options.snapshot
+    || options.snapshot.snapshotId !== input.context.rootSnapshotId
+    || createHash("sha256").update(encodeCanonicalPlainData(options.snapshot), "utf8").digest("hex")
+      !== input.context.rootSnapshotDigest
+    || !turnWorkspaceAuthority
+    || turnWorkspaceAuthority.id !== input.context.workspace.id
+    || turnWorkspaceAuthority.revision !== input.context.workspace.revision) {
+    throw new AgenticWorkPhaseError("invalid_input", "Recovered WORK options do not match persisted segment authority");
+  }
+  const { cortexContext: _cortexContext, council: _council, ...resumableOptions } = options;
+  void _cortexContext;
+  void _council;
+  const resumedOptions: AgenticWorkOptions = Object.freeze({
+    ...resumableOptions,
+    signal: input.signal,
+    requiredToolChoiceAvailable: input.context.protocol.requiredToolModeAvailable,
+    phaseAdmittedCapabilities: input.context.phase.admittedCapabilities as readonly AgentRuntimePhaseCapabilityV1[],
+    phaseRevision: input.context.workspace.revision,
+  });
+  return runAndCloseSegmentedAgenticWorkV1(resumedOptions, input);
 }

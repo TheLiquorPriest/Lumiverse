@@ -65,6 +65,19 @@ export interface AgentRuntimeHostLimits {
   logicalProviderRequests: number
   physicalDispatchAttempts: number
   childOutputTokens: number
+  workAttemptOutputTokens: number
+  workAttemptProviderDispatches: number
+  workAttemptUnsignedBoundaries: number
+  workAttemptToolCalls: number
+  workAttemptWorkspaceOperations: number
+  workSegmentOutputTokens: number
+  workSegmentProviderDispatches: number
+  workSegmentUnsignedBoundaries: number
+  workSegmentToolCalls: number
+  workSegmentWorkspaceOperations: number
+  workDispatchOutputTokens: number
+  workRecoveryReserveOutputTokens: number
+  workFuturePhaseReserveOutputTokens: number
   rootWallClockMs: number
   activityEvents: number
   activityBytes: number

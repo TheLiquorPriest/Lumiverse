@@ -15,8 +15,9 @@ import { getProvider } from "../llm/registry";
 
 describe("resolveEffectiveApiUrl", () => {
   test("freezes the provider default for blank saved endpoints and preserves custom endpoints", () => {
-    const defaultUrl = getProvider("openai")?.defaultUrl;
-    expect(defaultUrl).toBeTruthy();
+    const openAiProvider = getProvider("openai");
+    if (!openAiProvider?.defaultUrl) throw new Error("OpenAI provider default URL is not registered");
+    const defaultUrl = openAiProvider.defaultUrl;
     expect(resolveEffectiveApiUrl({ provider: "openai", api_url: "   " })).toBe(defaultUrl);
     expect(resolveEffectiveApiUrl({ provider: "openai", api_url: "https://proxy.example/v1" }))
       .toBe("https://proxy.example/v1");
@@ -262,7 +263,9 @@ describe("resolveConcreteConnectionV1", () => {
       apiUrl: "   ",
     });
     const resolved = resolveConcreteConnectionV1(RESOLVER_USER_ID, "default-endpoint-profile")!;
-    expect(resolved.endpoint).toBe(getProvider("openai")?.defaultUrl);
+    const openAiProvider = getProvider("openai");
+    if (!openAiProvider?.defaultUrl) throw new Error("OpenAI provider default URL is not registered");
+    expect(resolved.endpoint).toBe(openAiProvider.defaultUrl);
     expect(resolved.effectiveEndpoint).toBe(resolved.endpoint);
     expect(resolved.endpointRevision).toBeTruthy();
     expect(resolved.fingerprint).toBeTruthy();

@@ -5,6 +5,13 @@
  * dependencies.
  */
 
+import type {
+  CognitionPredicateV1,
+  LoomPolicyBucketV1,
+  LoomPolicyCheckpointV1,
+  LoomPolicyDestinationV1,
+  LoomPolicySourceV1,
+} from "./agent-cognition";
 export type PreparationFailureCode =
   | "invalid_input"
   | "limit_exceeded"
@@ -659,20 +666,57 @@ export interface AssemblyDatabankMessageProvenanceV1 {
   readonly sources: readonly AssemblyDatabankMessageSourceV1[];
 }
 
-export interface AssemblyMessageProvenanceV1 {
+export interface AssemblyMessageProvenanceCoreV1 {
   readonly kind: AssemblyMessageSourceKindV1;
   readonly sourceId: string;
   readonly sourceRevision: string;
   readonly sourceIndex: number;
-  readonly databank?: AssemblyDatabankMessageProvenanceV1;
 }
 
-export interface AssemblyProviderMessageV1 {
+export interface AssemblyLoomMessageProvenanceV1 {
+  readonly entryId: string;
+  readonly bucket: LoomPolicyBucketV1;
+  readonly destination: LoomPolicyDestinationV1;
+  readonly checkpoint: LoomPolicyCheckpointV1;
+  readonly source: LoomPolicySourceV1;
+  readonly condition?: CognitionPredicateV1;
+  readonly effectiveText: string;
+}
+
+export interface AssemblyOrdinaryMessageProvenanceV1 extends AssemblyMessageProvenanceCoreV1 {
+  readonly databank?: AssemblyDatabankMessageProvenanceV1;
+  readonly loom?: never;
+}
+
+export interface AssemblyCompiledPolicyMessageProvenanceV1 extends AssemblyMessageProvenanceCoreV1 {
+  readonly kind: "cognition";
+  readonly databank?: never;
+  readonly loom: AssemblyLoomMessageProvenanceV1;
+}
+
+export type AssemblyMessageProvenanceV1 =
+  | AssemblyOrdinaryMessageProvenanceV1
+  | AssemblyCompiledPolicyMessageProvenanceV1;
+
+interface AssemblyProviderMessageBaseV1 {
   readonly role: AssemblyMessageRoleV1;
   readonly segments: readonly AssemblyMessageSegmentV1[];
-  /** Required at the strict isolate boundary; optional here for legacy DTO consumers. */
-  readonly provenance?: AssemblyMessageProvenanceV1;
 }
+
+export interface AssemblyOrdinaryProviderMessageV1 extends AssemblyProviderMessageBaseV1 {
+  /** Required at the strict isolate boundary; optional here for legacy DTO consumers. */
+  readonly provenance?: AssemblyOrdinaryMessageProvenanceV1;
+  readonly blockIndex?: number;
+}
+
+export interface AssemblyCompiledPolicyProviderMessageV1 extends AssemblyProviderMessageBaseV1 {
+  readonly provenance: AssemblyCompiledPolicyMessageProvenanceV1;
+  readonly blockIndex: number;
+}
+
+export type AssemblyProviderMessageV1 =
+  | AssemblyOrdinaryProviderMessageV1
+  | AssemblyCompiledPolicyProviderMessageV1;
 
 export interface AssemblyResultSlotV1 {
   readonly slotIndex: number;
@@ -729,10 +773,10 @@ export interface AssemblyPlanV1 extends PreparationProtocolEnvelopeV1 {
    * selects exactly one set for WORK/RENDER; each set is source-sealed and
    * cannot contain result slots or transformed content.
    */
-  readonly workPolicyMessages: readonly AssemblyProviderMessageV1[];
-  readonly workspaceUsageMessages: readonly AssemblyProviderMessageV1[];
-  readonly completionCriteriaMessages: readonly AssemblyProviderMessageV1[];
-  readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
+  readonly workPolicyMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
+  readonly workspaceUsageMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
+  readonly completionCriteriaMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
+  readonly renderPolicyMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
   readonly deltas: readonly PreparationDeltaV1[];
 }
 

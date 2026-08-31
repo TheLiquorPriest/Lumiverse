@@ -29,8 +29,9 @@ import type {
   RuntimeDecisionInternalV1,
 } from "../types/agent-runtime-decision";
 import { ARCHIVE_REGISTRY_VERSION } from "./user-data/table-registry";
-import { CanonicalDataError, canonicalPlainDataBounds } from "../utils/canonical-plain-data";
+import { CanonicalDataError, canonicalPlainDataBounds, encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import { compareUtf8 } from "../utils/utf8-order";
+import { cancellationTerminalCause } from "../utils/turn-cancellation-cause";
 import { getIsolateHealthEpoch } from "./isolate-pool";
 import {
   getPresetAgentConfig,
@@ -85,21 +86,40 @@ import {
   type WorldInfoStateDeltaV1,
 } from "../types/agent-preprocessing";
 import {
+  cloneBoundedProviderInput,
   accountProviderResponse,
   createAgenticChildFrame,
   executeBoundedAgenticChildFrame,
-  runAgenticWorkPhase,
+  runSegmentedAgenticWorkV1,
+  resumeAdmittedAgenticWorkSegmentV1,
+  classifyWorkProviderBoundaryV1,
+  computeAgenticWorkPhaseSkipEligibilityDigestV1,
+  computeAgenticWorkPhaseTransitionAuthorityDigestV1,
+  computeWorkSegmentBindingDigestV1,
+  computeWorkSegmentCapabilityDigestV1,
+  computeWorkSegmentContextDigestV1,
+  computeWorkSegmentProtocolDigestV1,
+  createAgenticWorkSegmentRunnerV1,
   AgenticWorkPhaseError,
   MAX_CHILD_OUTPUT_BYTES,
   type AgenticChildExecutionResult,
   type AgenticWorkFrame,
   type AgenticWorkProviderRequest,
+  type AgenticWorkDispatchAccountingV1,
+  type AgenticWorkDelegateInvocationIdentityV1,
+  type AgenticWorkDispatchEffectsFinalizationInputV1,
+  type AgenticWorkChildAssignmentAuthorityInputV1,
+  type AgenticWorkDispatchSettlementReceiptV1,
+  validateAgenticWorkAllOptionalPhasesSkippedAuthorityV1,
+  type AgenticWorkSegmentAuthorityV1,
+  type AgenticWorkSegmentTransitionInputV1,
   type AgenticWorkspaceCapability,
   type AgenticWorkspaceCompletionFixedPointResult,
   type AgenticWorkspacePreparationResult,
   type AgenticWorkPhaseOutcome,
   type AgenticWorkOptions,
   type AgenticWorkRenderHandoff,
+  type AgenticWorkSegmentRuntimeV1,
 } from "./agentic-work-phase.service";
 import {
   AgenticRenderPhaseError,
@@ -132,6 +152,8 @@ import {
 import type { FinalRenderReservationV1 } from "../types/turn-execution";
 import {
   createTurnWorkspace,
+  commitTurnWorkspaceMutationWithReceiptV1,
+  getPersistentWorkspaceTurnSessionByExecutionV1,
   freezeFrameCapabilities,
   invalidateFrameCapabilitiesForTurn,
   getCurrentWorkspaceRevisionV1,
@@ -178,6 +200,48 @@ import {
   type AgentRunProjectionInputV2,
 } from "./agent-run-projection.service";
 import {
+  createAndAdmitInitialWorkSegmentV1,
+  appendSettledWorkSegmentDispatchMutationReservationsV1,
+  persistWorkSegmentChildAssignmentAuthorityV1,
+  closeWorkSegmentTerminalV1,
+  closeAdmittedWorkSegmentWithoutDispatchTerminalV1,
+  commitAndAdmitWorkSegmentTransitionV1,
+  readWorkSegmentRecoveryChainV1,
+  commitWorkSegmentTransitionV1,
+  claimQueuedWorkCompletionRecoveryV1,
+  claimQueuedWorkSegmentRecoveryV1,
+  computeWorkPhasePlanDigestV1,
+  computeWorkTransitionDecisionDigestV1,
+  computeWorkSegmentResumeEnvelopeDigestV1,
+  finalizeSettledWorkSegmentDispatchEffectsV1,
+  listQueuedWorkCompletionRecoveriesV1,
+  listQueuedWorkSegmentRecoveriesV1,
+  readWorkSegmentWorkspaceAuthorityV1,
+  reserveWorkSegmentDispatchV1,
+  settleWorkSegmentDispatchV1,
+  WORK_CANCELLATION_TERMINAL_CLOSE_GRACE_MS,
+  renewWorkExecutionOwnerLeaseV1,
+  renewInFlightWorkSegmentDispatchLeaseV1,
+  renewWorkSegmentOwnerLeaseV1,
+  startWorkSegmentDispatchV1,
+} from "./agentic-work-segment.repository";
+import type {
+  AgenticWorkMutatingWorkspaceOperationKindV1,
+  AgenticWorkWorkspaceMutationReservationV1,
+  WorkAttemptBudgetV1,
+  WorkPhasePlanAuthorityV1,
+  WorkPhaseTransitionReceiptV1,
+  WorkSegmentAdmissionV1,
+  WorkSegmentBudgetV1,
+  WorkSegmentContextV1,
+  WorkSegmentDispatchReservationV1,
+  WorkSegmentIdentityV1,
+  WorkSegmentRecoveryChainV1,
+  WorkSegmentRunnerResultV1,
+  WorkSegmentResumeEnvelopeV1,
+  WorkSegmentUsageV1,
+} from "../types/agent-work-segment";
+import {
   freezeAgentCognitionV1,
 } from "./agent-cognition.service";
 import {
@@ -213,8 +277,11 @@ import type {
 import type {
   CognitionValue,
 } from "../types/agent-cognition";
-import { buildWorkspaceContextProjectionFromWorkspaceV1 } from "./workspace-context-projection.service";
-import { createHash } from "node:crypto";
+import {
+  buildWorkspaceContextProjectionFromWorkspaceV1,
+  projectRenderWorkspaceContextV1,
+} from "./workspace-context-projection.service";
+import { createHash, randomUUID } from "node:crypto";
 import {
   COGNITION_REPAIR_CODES,
   applyCognitionReadinessV1,
@@ -245,6 +312,7 @@ import {
   type AgentActivityNodeV1,
   type AgentActivityUsageV1,
   type AgentPublicErrorCode,
+  type AgentRuntimeHostLimits,
   type AgentWorkAttemptLineageV1,
 } from "../types/agent-runtime";
 import { getMessage } from "./chats.service";
@@ -253,8 +321,8 @@ import { getProvider, validateProviderCapabilities } from "../llm/registry";
 import type { LlmProvider } from "../llm/provider";
 import * as secretsSvc from "./secrets.service";
 import { CORE_AGENT_TOOL_IDS, createDisabledAgentConfigV2, parseAgentConfigV2, type AgentConfigStateV1, type AgentConfigV2, type AgentLoreScope, type AgentToolSnapshot, type CoreAgentToolId } from "../types/agents";
-import { createAgentOwnedLoreReader, createAgentToolSnapshot, executeCoreAgentTool, safeToolInspectionValue } from "./agent-tools.service";
-import { AgentRuntimeOwner } from "./agent-runtime.service";
+import { createAgentOwnedLoreReader, createAgentToolSnapshot, executeCoreAgentTool, getCoreAgentToolDefinitions, safeToolInspectionValue } from "./agent-tools.service";
+import { AgentRuntimeOwner, scheduleCancellableAgentTimeout, type AgentTimeoutScheduler } from "./agent-runtime.service";
 import { cloneAndFreeze, resolveConcreteConnectionV1, type ResolvedConcreteConnectionV1 } from "./connections.service";
 import * as pool from "./generation-pool.service";
 import { eventBus } from "../ws/bus";
@@ -282,13 +350,7 @@ function cognitionSnapshotInputs(
   const refs = new Map<string, SourceRef>();
   const strictRefs = new Map<string, SourceRef>();
   const blocks = listPromptBlocks(userId, presetId) ?? [];
-  const blocksById = new Map<string, (typeof blocks)[number]>();
-  for (const block of blocks) {
-    if (blocksById.has(block.id)) {
-      throw new Error("cognition block identity is ambiguous: " + block.id);
-    }
-    blocksById.set(block.id, block);
-  }
+  const sourceKey = (ref: Pick<SourceRef, "blockId" | "promptOrder">): string => `${ref.blockId.length}:${ref.blockId}:${ref.promptOrder}`;
   const parseCanonicalSource = (source: unknown): SourceRef | undefined => {
     if (!source || typeof source !== "object" || Array.isArray(source)) return undefined;
     const sourceRecord = source as Record<string, unknown>;
@@ -302,14 +364,14 @@ function cognitionSnapshotInputs(
     return { blockId: sourceRecord.blockId, revision: blockRevision, presetRevision, promptOrder };
   };
   const recordCanonicalSource = (ref: SourceRef, strict: boolean): void => {
-    const previous = refs.get(ref.blockId);
+    const key = sourceKey(ref);
+    const previous = refs.get(key);
     if (previous && (previous.revision !== ref.revision
-      || previous.presetRevision !== ref.presetRevision
-      || previous.promptOrder !== ref.promptOrder)) {
-      throw new Error(`cognition block provenance conflict: ${ref.blockId}`);
+      || previous.presetRevision !== ref.presetRevision)) {
+      throw new Error(`cognition block provenance conflict: ${ref.blockId} at prompt order ${ref.promptOrder}`);
     }
-    refs.set(ref.blockId, ref);
-    if (strict) strictRefs.set(ref.blockId, ref);
+    refs.set(key, ref);
+    if (strict) strictRefs.set(key, ref);
   };
   const collectCanonicalSource = (source: unknown, strict: boolean): void => {
     const ref = parseCanonicalSource(source);
@@ -335,17 +397,19 @@ function cognitionSnapshotInputs(
       : typeof rawRevision === "string" && /^\d+$/.test(rawRevision) ? Number(rawRevision) : 1;
   };
   const currentBlockFor = (ref: SourceRef): unknown => {
-    const block = blocksById.get(ref.blockId);
-    if (!block || actualBlockRevision(block) !== ref.revision
-      || ref.presetRevision !== authored.presetRevision
-      || blocks.indexOf(block) !== ref.promptOrder) return undefined;
+    const block = blocks[ref.promptOrder];
+    if (!block || block.id !== ref.blockId
+      || block.marker === "category"
+      || actualBlockRevision(block) !== ref.revision
+      || ref.presetRevision !== authored.presetRevision) return undefined;
     return block;
   };
   for (const ref of strictRefs.values()) {
-    if (!blocksById.has(ref.blockId)) {
-      throw new Error("cognition block is unavailable: " + ref.blockId);
+    const block = blocks[ref.promptOrder];
+    if (!block || block.id !== ref.blockId) {
+      throw new Error(`cognition block occurrence is unavailable: ${ref.blockId} at prompt order ${ref.promptOrder}`);
     }
-    if (!currentBlockFor(ref)) throw new Error("cognition block provenance is stale: " + ref.blockId);
+    if (!currentBlockFor(ref)) throw new Error(`cognition block provenance is stale: ${ref.blockId} at prompt order ${ref.promptOrder}`);
   }
   const collectCanonicalPhaseSources = (phases: readonly {
     instructionRefs: readonly unknown[];
@@ -368,7 +432,7 @@ function cognitionSnapshotInputs(
   const sourceBlocks = [...refs.values()].map((ref) => {
     const block = currentBlockFor(ref);
     if (!block) {
-      if (strictRefs.has(ref.blockId)) throw new Error(`cognition block provenance is stale: ${ref.blockId}`);
+      if (strictRefs.has(sourceKey(ref))) throw new Error(`cognition block provenance is stale: ${ref.blockId} at prompt order ${ref.promptOrder}`);
       return undefined;
     }
     return { blockId: ref.blockId, revision: actualBlockRevision(block), promptOrder: ref.promptOrder };
@@ -389,6 +453,8 @@ function cognitionSnapshotInputs(
 type AgenticRenderPolicyMessageInputV1 = {
   /** Strict ASSEMBLE projection with phased/agent-result carriers excluded. */
   readonly nativeMessages: readonly AssemblyProviderMessageV1[];
+  /** Persisted user rows that the host consumed as this exact root turn. */
+  readonly rootUserMessageIds: readonly string[];
   readonly materializeMedia?: (segment: AssemblyMediaSegmentV1) => LlmMessagePart;
   readonly renderGuidance: AgenticWorkRenderHandoff["renderGuidance"];
   readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
@@ -428,9 +494,18 @@ const DELEGATED_WORKSPACE_OPERATIONS: Readonly<Record<string, true>> = Object.fr
 
 function materializeNativeRenderMessages(
   messages: readonly AssemblyProviderMessageV1[],
+  rootUserMessageIds: readonly string[],
   materializeMedia?: (segment: AssemblyMediaSegmentV1) => LlmMessagePart,
-): readonly LlmMessage[] {
+): Readonly<{ messages: readonly LlmMessage[]; rootUserBindingDigests: readonly string[] }> {
   const allowedSources = new Set(["block", "history", "world_info", "databank"]);
+  const rootOrdinals = new Map<string, number>();
+  for (const [ordinal, messageId] of rootUserMessageIds.entries()) {
+    if (typeof messageId !== "string" || messageId.length === 0 || rootOrdinals.has(messageId)) {
+      throw new Error("Root user-message bindings must contain unique non-empty message IDs");
+    }
+    rootOrdinals.set(messageId, ordinal);
+  }
+  const matchedRootBindings = new Map<string, string>();
   const result: LlmMessage[] = [];
   for (const message of messages) {
     const provenance = message?.provenance;
@@ -467,35 +542,72 @@ function materializeNativeRenderMessages(
       flushText();
       content = parts;
     }
+    const rootOrdinal = provenance.kind === "history" && message.role === "user"
+      ? rootOrdinals.get(provenance.sourceId)
+      : undefined;
+    if (rootOrdinal !== undefined) {
+      const bindingDigest = createHash("sha256").update(encodeCanonicalPlainData({
+        version: 1,
+        kind: "root_user_message",
+        sourceId: provenance.sourceId,
+        sourceRevision: provenance.sourceRevision,
+      }), "utf8").digest("hex");
+      matchedRootBindings.set(provenance.sourceId, bindingDigest);
+      result.push({
+        role: "system",
+        content: encodeCanonicalPlainData({
+          version: 1,
+          kind: "host_root_user_message_binding",
+          sourceId: provenance.sourceId,
+          sourceRevision: provenance.sourceRevision,
+          ordinal: rootOrdinal,
+          count: rootUserMessageIds.length,
+          digest: bindingDigest,
+        }),
+      });
+    }
     result.push({
       role: message.role,
       content,
       ...(message.name ? { name: message.name } : {}),
     });
   }
-  return Object.freeze(result);
+  if (matchedRootBindings.size !== rootOrdinals.size) {
+    throw new Error("Agentic render is missing exact root user message identity");
+  }
+  return Object.freeze({
+    messages: Object.freeze(result),
+    rootUserBindingDigests: Object.freeze(rootUserMessageIds.map((id) => matchedRootBindings.get(id)!)),
+  });
 }
 
 function completionHandoffMessage(
   renderGuidance: AgenticWorkRenderHandoff["renderGuidance"],
+  rootUserBindingDigests: readonly string[],
 ): LlmMessage {
   return {
     role: "system",
     content: [
-      "Host-accepted completion handoff (not the reply):",
-      "WORK has completed. Treat the accepted workspace findings/submissions as additional host-accepted evidence alongside the supplied conversation and native World Info/Databank context. Never infer or expose private WORK records, reasoning, completion evidence, unresolved item IDs, or the operational transcript.",
+      "Current root-turn terminal handoff (host authority, not the reply):",
+      "The host accepted WORK completion for this exact current root turn at its frozen workspace revision. This terminal acceptance is current control state, not a claim inferred from workspace evidence, and remains authoritative even when accepted findings or submissions contain older or different scenario labels. Never state or imply that the current request was not executed, lacks a host-accepted completion handoff, or represents only a prior completion. Treat the accepted workspace findings/submissions as additional host-accepted evidence alongside the supplied conversation and native World Info/Databank context. Never infer or expose private WORK records, reasoning, completion evidence, unresolved item IDs, or the operational transcript.",
+      rootUserBindingDigests.length > 0
+        ? `The exact current root user message identity is bound only by the immediately-preceding host markers with digests ${JSON.stringify(rootUserBindingDigests)}; never substitute an arbitrary last user-role block.`
+        : "This generation target has no persisted root user-message identity; never infer one from an arbitrary last user-role block.",
       ...(renderGuidance ? [`Render guidance:\n${renderGuidance}`] : []),
     ].join("\n"),
   };
 }
 
 function buildAgenticRenderPolicyMessages(input: AgenticRenderPolicyMessageInputV1): readonly LlmMessage[] {
-  const messages: LlmMessage[] = [
-    ...materializeNativeRenderMessages(input.nativeMessages, input.materializeMedia),
-    completionHandoffMessage(input.renderGuidance),
-  ];
+  const native = materializeNativeRenderMessages(
+    input.nativeMessages,
+    input.rootUserMessageIds,
+    input.materializeMedia,
+  );
+  const messages: LlmMessage[] = [...native.messages];
   const authored = materializePolicyMessages(input.renderPolicyMessages);
   messages.push(...authored);
+  messages.push(completionHandoffMessage(input.renderGuidance, native.rootUserBindingDigests));
   if (authored.length === 0) messages.push({ role: "system", content: HOST_RENDER_FINAL_RESPONSE_CONTRACT });
   return Object.freeze(messages);
 }
@@ -540,6 +652,40 @@ type FrozenRenderCommitProjection = Readonly<{
   workspaceUsage: WorkspaceUsageV1;
   terminalHandoff: WorkspaceTerminalHandoffV1;
 }>;
+
+interface RecoveredRuntimeRegistrationV1 {
+  readonly execution: RuntimeExecution;
+  readonly snapshot: RuntimeSnapshot;
+  readonly plan: RuntimePlan;
+  readonly rootConnection: CompleteFrozenConnectionV1;
+  readonly binding: LiveTargetBinding;
+  readonly session: PersistentWorkspaceTurnSession;
+  readonly persistentWorkspaceId: string;
+  readonly persistentWorkspaceRevision: number;
+  readonly workspaceCapabilities: WorkspaceOperationCapabilitiesV1;
+  readonly materializeMedia: NativeMediaProjectionResultV1["materialize"];
+  readonly abortController: AbortController;
+  readonly disposeDeadline: () => void;
+}
+
+type CoordinatorWorkRequestV1 = Parameters<NonNullable<AgenticGenerationDependencies["runWork"]>>[0];
+interface RecoveredCompletedWorkV1 {
+  readonly outcome: AgenticWorkPhaseOutcome;
+  readonly usage: AgentActivityUsageV1;
+}
+
+
+interface CoordinatorGenerationDependenciesV1 extends AgenticGenerationDependencies {
+  readonly restoreRecoveredRuntime: (input: RecoveredRuntimeRegistrationV1) => Promise<void>;
+  readonly resumeRecoveredWork: (
+    input: CoordinatorWorkRequestV1,
+    recovery: WorkSegmentRecoveryChainV1,
+  ) => ReturnType<NonNullable<AgenticGenerationDependencies["runWork"]>>;
+  readonly restoreRecoveredWorkCompletion: (
+    input: CoordinatorWorkRequestV1,
+    recovery: RecoveredCompletedWorkV1,
+  ) => ReturnType<NonNullable<AgenticGenerationDependencies["runWork"]>>;
+}
 
 function requireRuntimeSnapshot(value: unknown): RuntimeSnapshot {
   if (!isGenerationAssemblySnapshotV1(value)) throw new Error("agentic_snapshot_invalid");
@@ -790,9 +936,8 @@ function assertProviderCapabilitySnapshot(
 ): void {
   const expectedDigest = connection.capabilityDigest;
   const frozenDigest = canonicalRuntimeCapabilityDigest(connection.capabilities);
-  const liveDigest = canonicalRuntimeCapabilityDigest(
-    provider.capabilities as unknown as Readonly<Record<string, unknown>>,
-  );
+  const liveCapabilities: Readonly<Record<string, unknown>> = { ...provider.capabilities };
+  const liveDigest = canonicalRuntimeCapabilityDigest(liveCapabilities);
   if (
     typeof expectedDigest !== "string"
     || expectedDigest.length === 0
@@ -819,6 +964,7 @@ type CompleteFrozenConnectionV1 = FrozenConcreteConnectionV1 & {
   readonly credentialRevision: Exclude<FrozenConcreteConnectionV1["credentialRevision"], null>;
   readonly candidateRevision: Exclude<FrozenConcreteConnectionV1["candidateRevision"], null>;
   readonly fingerprint: string;
+  readonly capabilities: FrozenConcreteConnectionV1["capabilities"] & Readonly<LlmProvider["capabilities"]>;
 };
 
 /**
@@ -876,7 +1022,143 @@ function requireCompleteFrozenConnection(
   }
   assertProviderCapabilitySnapshot(connection, provider);
   validateProviderCapabilities(provider);
-  return connection as CompleteFrozenConnectionV1;
+  const capabilities: FrozenConcreteConnectionV1["capabilities"] & Readonly<LlmProvider["capabilities"]> = Object.freeze({
+    ...provider.capabilities,
+  });
+  return Object.freeze({
+    ...connection,
+    logicalId,
+    concreteId,
+    label,
+    provider: providerName,
+    model,
+    effectiveEndpoint: resolvedEndpoint,
+    endpointRevision,
+    credentialSecretRef,
+    credentialRevision,
+    candidateRevision,
+    fingerprint,
+    capabilities,
+  });
+}
+
+const WORK_TOOL_CATALOG_SCHEMA_VERSION_V1 = 1;
+const WORK_TOOL_CATALOG_DIGEST_V1 = createHash("sha256").update(encodeCanonicalPlainData({
+  version: WORK_TOOL_CATALOG_SCHEMA_VERSION_V1,
+  coreToolDefinitions: getCoreAgentToolDefinitions([...CORE_AGENT_TOOL_IDS].sort(compareUtf8)),
+  workspaceOperationIds: [...WORKSPACE_OPERATIONS].sort(compareUtf8),
+}), "utf8").digest("hex");
+
+function workResumeConnectionV1(connection: CompleteFrozenConnectionV1) {
+  return Object.freeze({
+    logicalId: connection.logicalId,
+    concreteId: connection.concreteId,
+    label: connection.label,
+    provider: connection.provider,
+    model: connection.model,
+    effectiveEndpoint: connection.effectiveEndpoint,
+    endpointRevision: connection.endpointRevision,
+    credentialSecretRef: connection.credentialSecretRef,
+    credentialRevision: connection.credentialRevision,
+    candidateRevision: connection.candidateRevision,
+    capabilities: Object.freeze(structuredClone(connection.capabilities)),
+    capabilityDigest: connection.capabilityDigest,
+    fingerprint: connection.fingerprint,
+  });
+}
+
+function createWorkResumeEnvelopeV1(input: Readonly<{
+  snapshot: RuntimeSnapshot;
+  plan: AssemblyPlanV1;
+  root: CompleteFrozenConnectionV1;
+  childConnections: ReadonlyMap<string, CompleteFrozenConnectionV1>;
+  config: AgentConfigV2;
+  generationParameters: GenerationParameters | undefined;
+  execution: RuntimeExecution;
+  generationInput: AgenticGenerationInput;
+  decision: DecisionWithInternal;
+  liveTargetBinding: LiveTargetBinding;
+  workspaceId: string;
+  workspaceRevision: number;
+  hostLimits: AgentRuntimeHostLimits;
+}>): WorkSegmentResumeEnvelopeV1 {
+  const snapshot = JSON.parse(JSON.stringify(input.snapshot)) as Readonly<Record<string, unknown>>;
+  const plan = JSON.parse(JSON.stringify(input.plan)) as Readonly<Record<string, unknown>>;
+  const configRevision = runtimeInputRevisions(input.snapshot).config ?? input.snapshot.snapshotId;
+  const authoredChildToolIds = Object.freeze(Object.fromEntries((input.config.profiles ?? []).map((profile) => [
+    profile.id,
+    Object.freeze([...(profile.toolIds ?? [])].sort(compareUtf8)),
+  ])));
+  const childConnections = Object.freeze(Object.fromEntries([...input.childConnections.entries()]
+    .sort(([left], [right]) => compareUtf8(left, right))
+    .map(([profileId, connection]) => [profileId, workResumeConnectionV1(connection)])));
+  const resumeInput = JSON.parse(JSON.stringify({
+    userId: input.generationInput.userId,
+    chatId: input.generationInput.chatId,
+    connectionId: input.generationInput.connectionId,
+    presetId: input.generationInput.presetId,
+    forcePresetId: input.generationInput.forcePresetId,
+    personaId: input.generationInput.personaId,
+    personaAddonStates: input.generationInput.personaAddonStates,
+    sourceUserMessageIds: input.generationInput.sourceUserMessageIds,
+    messageId: input.generationInput.messageId,
+    swipeId: input.generationInput.swipeId,
+    targetCharacterId: input.generationInput.targetCharacterId,
+    generationType: input.generationInput.generationType,
+    attemptLineage: input.execution.attemptLineage,
+    parameters: input.generationParameters,
+    userInput: input.generationInput.userInput,
+    regenFeedback: input.generationInput.regenFeedback,
+    regenFeedbackPosition: input.generationInput.regenFeedbackPosition,
+    requestEpoch: input.generationInput.requestEpoch,
+    isImpersonate: input.generationInput.isImpersonate,
+    isGroupChat: input.generationInput.isGroupChat,
+    isMultiplayer: input.generationInput.isMultiplayer,
+    councilEnabled: input.generationInput.councilEnabled,
+    councilToolsEnabled: input.generationInput.councilToolsEnabled,
+  })) as Readonly<Record<string, unknown>>;
+  const decisionAuthority = JSON.parse(JSON.stringify({
+    binding: input.decision.internal.binding,
+    configSnapshot: input.decision.internal.configSnapshot,
+    councilProfile: input.decision.internal.councilProfile,
+    councilConnection: input.decision.internal.councilConnection
+      ? workResumeConnectionV1(requireCompleteFrozenConnection(input.decision.internal.councilConnection, "WORK", "child"))
+      : null,
+    runtimePolicy: input.decision.internal.runtimePolicy,
+    readinessVector: input.decision.internal.readinessVector,
+    issuedAt: input.decision.internal.issuedAt,
+    expiresAt: input.decision.internal.expiresAt,
+  })) as Readonly<Record<string, unknown>>;
+  const withoutDigest: Omit<WorkSegmentResumeEnvelopeV1, "envelopeDigest"> = Object.freeze({
+    version: 1,
+    snapshotDigest: createHash("sha256").update(encodeCanonicalPlainData(snapshot), "utf8").digest("hex"),
+    planDigest: createHash("sha256").update(encodeCanonicalPlainData(plan), "utf8").digest("hex"),
+    toolCatalogSchemaVersion: WORK_TOOL_CATALOG_SCHEMA_VERSION_V1,
+    toolCatalogDigest: WORK_TOOL_CATALOG_DIGEST_V1,
+    configRevision,
+    authoredRootToolIds: Object.freeze([...(input.config.mainToolIds ?? [])].sort(compareUtf8)),
+    authoredChildToolIds,
+    snapshot,
+    plan,
+    rootConnection: workResumeConnectionV1(input.root),
+    childConnections,
+    generationParameters: input.generationParameters
+      ? Object.freeze(JSON.parse(JSON.stringify(input.generationParameters)) as Record<string, unknown>)
+      : null,
+    resumeInput,
+    decisionAuthority,
+    liveTargetBinding: Object.freeze({ ...input.liveTargetBinding }),
+    runtime: Object.freeze({
+      deadlineAt: input.execution.deadlineAt,
+      rootFrameId: input.execution.id,
+      workspaceId: input.workspaceId,
+      workspaceRevision: input.workspaceRevision,
+      ownerLimits: Object.freeze({ ...input.hostLimits }),
+      workspaceRetention: input.execution.workspaceRetention,
+      workspaceSharing: input.execution.workspaceSharing,
+    }),
+  });
+  return Object.freeze({ ...withoutDigest, envelopeDigest: computeWorkSegmentResumeEnvelopeDigestV1(withoutDigest) });
 }
 
 function requireRenderConnection(connection: FrozenConcreteConnectionV1): ResolvedConcreteConnectionV1 {
@@ -1096,6 +1378,12 @@ function effectiveRootGenerationParameters(
     parameters: { ...merged, max_tokens: maxOutputTokens },
     maxOutputTokens,
   };
+}
+function workProviderGenerationParametersV1(
+  persisted: GenerationParameters | undefined,
+  hostMaxOutputTokens: number,
+): GenerationParameters {
+  return { ...(persisted ?? {}), max_tokens: hostMaxOutputTokens };
 }
 function normalizeLoreScope(value: string | undefined): AgentLoreScope {
   return value === "all_owned" ? "all_owned" : "active";
@@ -1445,17 +1733,23 @@ function makeRevisionReader(snapshotInputValue: GenerationAssemblySnapshotInputV
           "SELECT config_revision, binding_revision FROM preset_agent_configs WHERE user_id = ? AND preset_id = ? LIMIT 1",
         ).get(snapshotInputValue.userId, snapshotInputValue.presetId) as { config_revision?: unknown; binding_revision?: unknown } | null;
         if (!configRow) {
-          if (inTransaction) {
-            fencedSnapshotIndex = null;
-            fencedSnapshotDb = revisionDb;
+          const expectedConfig = snapshotInputValue.configRevision;
+          const expectedBinding = snapshotInputValue.bindingRevision;
+          if (expectedConfig !== undefined && expectedConfig !== null
+            || expectedBinding !== undefined && expectedBinding !== null) {
+            if (inTransaction) {
+              fencedSnapshotIndex = null;
+              fencedSnapshotDb = revisionDb;
+            }
+            return null;
           }
-          return null;
+        } else {
+          liveInput = {
+            ...liveInput,
+            configRevision: configRow.config_revision as number | string,
+            bindingRevision: configRow.binding_revision as number | string,
+          };
         }
-        liveInput = {
-          ...liveInput,
-          configRevision: configRow.config_revision as number | string,
-          bindingRevision: configRow.binding_revision as number | string,
-        };
       }
       if (snapshotInputValue.connectionId || frozenConcreteId) {
         let liveConnection: FrozenConcreteConnectionV1 | null = null;
@@ -1660,7 +1954,18 @@ async function freezeConnectionCredentials(
         connection.credentialSecretRef,
         String(connection.credentialRevision),
       );
-      carrier.set(identity, value ?? "");
+      if (value === null || value === undefined || value.length === 0) {
+        if (connection.capabilities.apiKeyRequired === false) {
+          carrier.set(identity, "");
+          continue;
+        }
+        throw new AgenticGenerationError(
+          "decision_refresh_required",
+          "Provider credential secret is missing at the admitted revision.",
+          { phase: "ASSEMBLE", retryable: true },
+        );
+      }
+      carrier.set(identity, value);
     } catch (error) {
       if (error instanceof Error && error.message === "credential_revision_mismatch") {
         throw new AgenticGenerationError(
@@ -1867,6 +2172,1391 @@ async function collectProviderResponse(
   return response;
 }
 
+const EMPTY_WORK_SEGMENT_USAGE_V1: WorkSegmentUsageV1 = Object.freeze({
+  providerDispatches: 0,
+  providerInputTokens: 0,
+  providerOutputTokens: 0,
+  providerTotalTokens: 0,
+  billedOutputTokens: 0,
+  toolCalls: 0,
+  workspaceOperations: 0,
+  unsignedBoundaries: 0,
+  receiveBytes: 0,
+  publishedOutputBytes: 0,
+});
+
+function addWorkSegmentUsageV1(left: WorkSegmentUsageV1, right: WorkSegmentUsageV1): WorkSegmentUsageV1 {
+  return Object.freeze({
+    providerDispatches: left.providerDispatches + right.providerDispatches,
+    providerInputTokens: left.providerInputTokens + right.providerInputTokens,
+    providerOutputTokens: left.providerOutputTokens + right.providerOutputTokens,
+    providerTotalTokens: left.providerTotalTokens + right.providerTotalTokens,
+    billedOutputTokens: left.billedOutputTokens + right.billedOutputTokens,
+    toolCalls: left.toolCalls + right.toolCalls,
+    workspaceOperations: left.workspaceOperations + right.workspaceOperations,
+    unsignedBoundaries: left.unsignedBoundaries + right.unsignedBoundaries,
+    receiveBytes: left.receiveBytes + right.receiveBytes,
+    publishedOutputBytes: left.publishedOutputBytes + right.publishedOutputBytes,
+  });
+}
+
+interface ProductionWorkSegmentLifecycleInputV1 {
+  readonly userId: string;
+  readonly execution: RuntimeExecution;
+  readonly attemptId: string;
+  readonly workspaceId: string;
+  readonly snapshot: NonNullable<AgenticWorkOptions["snapshot"]>;
+  readonly plan: AgenticWorkOptions["plan"];
+  readonly createResumeEnvelope: () => WorkSegmentResumeEnvelopeV1;
+  readonly requiredToolModeAvailable: boolean;
+  readonly maxOutputTokensPerDispatch: number;
+  readonly maxAttemptOutputTokens: number;
+  readonly maxAttemptProviderDispatches: number;
+  readonly maxAttemptUnsignedBoundaries: number;
+  readonly maxAttemptToolCalls: number;
+  readonly maxAttemptWorkspaceOperations: number;
+  readonly recovery?: WorkSegmentRecoveryChainV1;
+  readonly maxSegmentOutputTokens: number;
+  readonly maxSegmentProviderDispatches: number;
+  readonly maxSegmentUnsignedBoundaries: number;
+  readonly maxSegmentToolCalls: number;
+  readonly maxSegmentWorkspaceOperations: number;
+  readonly recoveryReserveOutputTokens: number;
+  readonly futurePhaseReserveOutputTokens: number;
+  readonly signal: AbortSignal;
+  readonly timeoutScheduler?: AgentTimeoutScheduler;
+  readonly preSegmentOwnerHeartbeat?: SerializedLeaseHeartbeatV1;
+  readonly publicActivityNodeIdsByCallId?: Map<string, string[]>;
+}
+
+type WorkDispatchFunctionV1 = (request: AgenticWorkProviderRequest) => Promise<GenerationResponse>;
+type WorkSegmentTerminalOutcomeV1 = Pick<AgenticWorkPhaseOutcome, "status" | "code" | "errorMessage" | "durableReason" | "completion">;
+
+interface ProductionWorkSegmentLifecycleV1 {
+  readonly dispatch: (
+    provider: WorkDispatchFunctionV1,
+    request: AgenticWorkProviderRequest,
+    authority: AgenticWorkSegmentAuthorityV1,
+  ) => Promise<GenerationResponse>;
+  readonly providerExchangeId: () => string;
+  readonly workspaceMutationReservation: (input: {
+    readonly providerCallId: string;
+    readonly operationKind: AgenticWorkMutatingWorkspaceOperationKindV1;
+    readonly frameId: string;
+  }) => AgenticWorkWorkspaceMutationReservationV1;
+  readonly delegateInvocationIdentity: (input: {
+    readonly providerCallId: string;
+  }) => AgenticWorkDelegateInvocationIdentityV1;
+  readonly transition: (input: AgenticWorkSegmentTransitionInputV1) => Promise<void>;
+  readonly settleDispatch: (
+    accounting: AgenticWorkDispatchAccountingV1,
+  ) => Promise<AgenticWorkDispatchSettlementReceiptV1>;
+  readonly persistChildAssignmentAuthority: (
+    input: AgenticWorkChildAssignmentAuthorityInputV1,
+  ) => Promise<void>;
+  readonly finalizeDispatchEffects: (
+    input: AgenticWorkDispatchEffectsFinalizationInputV1,
+  ) => Promise<void>;
+  readonly close: (outcome: WorkSegmentTerminalOutcomeV1) => Promise<void>;
+}
+
+interface WorkDispatchIdentityScopeV1 {
+  readonly executionId: string;
+  readonly segmentId: string;
+  readonly logicalDispatch: number;
+}
+
+function workDispatchIdentityDigestV1(
+  kind: "provider_exchange" | "public_tool_activity" | "workspace_operation" | "delegate_invocation" | "delegate_child_frame" | "settlement",
+  scope: WorkDispatchIdentityScopeV1,
+  providerCallId: string | null = null,
+  operationKind: AgenticWorkMutatingWorkspaceOperationKindV1 | null = null,
+  frameId: string | null = null,
+): string {
+  return createHash("sha256").update(encodeCanonicalPlainData({
+    version: 1,
+    kind,
+    executionId: scope.executionId,
+    segmentId: scope.segmentId,
+    logicalDispatch: scope.logicalDispatch,
+    providerCallId,
+    operationKind,
+    frameId,
+  }), "utf8").digest("hex");
+}
+
+function publicWorkActivityNodeIdV1(
+  scope: WorkDispatchIdentityScopeV1,
+  providerCallId: string,
+): string {
+  return "work-tool:" + workDispatchIdentityDigestV1(
+    "public_tool_activity",
+    scope,
+    providerCallId,
+  );
+}
+
+function createWorkDispatchIdentityAuthorityV1(
+  scope: WorkDispatchIdentityScopeV1,
+) {
+  let providerExchangeIssued = false;
+  const workspaceOperationKeys = new Set<string>();
+  const delegateCallIds = new Set<string>();
+  const childFrameIds = new Set<string>();
+  return Object.freeze({
+    providerExchangeId(): string {
+      if (providerExchangeIssued) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK provider exchange identity was already requested");
+      }
+      providerExchangeIssued = true;
+      return "provider:work:" + workDispatchIdentityDigestV1("provider_exchange", scope);
+    },
+    workspaceMutationReservation(input: {
+      readonly providerCallId: string;
+      readonly operationKind: AgenticWorkMutatingWorkspaceOperationKindV1;
+      readonly frameId: string;
+    }): AgenticWorkWorkspaceMutationReservationV1 {
+      const operationKey = "work-operation:" + workDispatchIdentityDigestV1(
+        "workspace_operation",
+        scope,
+        input.providerCallId,
+        input.operationKind,
+        input.frameId,
+      );
+      if (workspaceOperationKeys.has(operationKey)) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK workspace operation identity was already requested");
+      }
+      workspaceOperationKeys.add(operationKey);
+      return Object.freeze({
+        version: 1,
+        operationKey,
+        operationKind: input.operationKind,
+        segmentId: scope.segmentId,
+        logicalDispatch: scope.logicalDispatch,
+        frameId: input.frameId,
+      });
+    },
+    delegateInvocationIdentity(input: {
+      readonly providerCallId: string;
+    }): AgenticWorkDelegateInvocationIdentityV1 {
+      if (delegateCallIds.has(input.providerCallId)) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK delegate call identity was already requested");
+      }
+      delegateCallIds.add(input.providerCallId);
+      const childFrameId = "work-child-frame:" + workDispatchIdentityDigestV1(
+        "delegate_child_frame",
+        scope,
+        input.providerCallId,
+      );
+      childFrameIds.add(childFrameId);
+      return Object.freeze({
+        version: 1,
+        invocationId: "work-invocation:" + workDispatchIdentityDigestV1(
+          "delegate_invocation",
+          scope,
+          input.providerCallId,
+        ),
+        childFrameId,
+      });
+    },
+    ownsChildFrame(frameId: string): boolean {
+      return childFrameIds.has(frameId);
+    },
+  });
+}
+
+interface SerializedLeaseHeartbeatV1 {
+  readonly stop: () => Promise<unknown | null>;
+  readonly renewAndStop: () => Promise<unknown | null>;
+}
+
+function startSerializedLeaseHeartbeatV1(
+  tick: () => Promise<void> | void,
+  onFailure: (error: unknown) => void,
+  scheduler?: AgentTimeoutScheduler,
+): SerializedLeaseHeartbeatV1 {
+  let stopped = false;
+  let disposeTimer: (() => void) | null = null;
+  let inFlight: Promise<void> | null = null;
+  let failure: unknown | null = null;
+  const recordFailure = (error: unknown): void => {
+    if (failure !== null) return;
+    failure = error;
+    onFailure(error);
+  };
+  const runTick = (): Promise<void> => Promise.resolve().then(tick).catch(recordFailure);
+  const schedule = (): void => {
+    if (stopped || failure !== null) return;
+    const callback = () => {
+      if (stopped || failure !== null) return;
+      inFlight = runTick().finally(() => {
+        inFlight = null;
+        schedule();
+      });
+    };
+    disposeTimer = scheduler
+      ? scheduleCancellableAgentTimeout(callback, 10_000, scheduler)
+      : scheduleCancellableAgentTimeout(callback, 10_000);
+  };
+  const halt = async (finalRenewal: boolean): Promise<unknown | null> => {
+    stopped = true;
+    disposeTimer?.();
+    disposeTimer = null;
+    await inFlight;
+    if (finalRenewal && failure === null) await runTick();
+    return failure;
+  };
+  schedule();
+  return Object.freeze({
+    stop: () => halt(false),
+    renewAndStop: () => halt(true),
+  });
+}
+
+async function createPreSegmentHeartbeatOwnershipV1(
+  registry: Map<string, SerializedLeaseHeartbeatV1>,
+  executionId: string,
+  heartbeat: SerializedLeaseHeartbeatV1,
+  onRegistrySize?: (size: number) => void,
+) {
+  if (registry.has(executionId)) {
+    await heartbeat.stop();
+    throw new AgenticWorkPhaseError("recovery_unavailable", "WORK execution already owns a pre-segment heartbeat");
+  }
+  registry.set(executionId, heartbeat);
+  onRegistrySize?.(registry.size);
+  let entered = false;
+  return Object.freeze({
+    run: async <T>(work: () => Promise<T>): Promise<T> => {
+      if (entered) throw new AgenticWorkPhaseError("recovery_unavailable", "Pre-segment heartbeat ownership was already entered");
+      entered = true;
+      try {
+        return await work();
+      } finally {
+        if (registry.get(executionId) === heartbeat) registry.delete(executionId);
+        onRegistrySize?.(registry.size);
+        await heartbeat.stop();
+      }
+    },
+  });
+}
+
+function selectTerminalOwnerHeartbeatV1(
+  hasActiveSegment: boolean,
+  segmentHeartbeat: SerializedLeaseHeartbeatV1 | null,
+  preSegmentHeartbeat: SerializedLeaseHeartbeatV1 | null,
+  ensureSegmentHeartbeat: () => Promise<SerializedLeaseHeartbeatV1>,
+): Promise<SerializedLeaseHeartbeatV1 | null> {
+  if (hasActiveSegment && !segmentHeartbeat) return ensureSegmentHeartbeat();
+  return Promise.resolve(segmentHeartbeat ?? preSegmentHeartbeat);
+}
+
+async function finalizeUnderOwnerLeaseV1(
+  heartbeat: SerializedLeaseHeartbeatV1 | null,
+  hasLostAuthority: () => boolean,
+  beforeTerminalWrite: () => Promise<void>,
+  terminalWrite: () => void,
+  allowCancellationTerminalClose = false,
+): Promise<void> {
+  if (allowCancellationTerminalClose) {
+    await beforeTerminalWrite();
+    terminalWrite();
+    return;
+  }
+  if (hasLostAuthority()) {
+    throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner lease authority was lost before terminal settlement");
+  }
+  await beforeTerminalWrite();
+  if (hasLostAuthority()) {
+    throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner lease authority was lost during terminal preparation");
+  }
+  const heartbeatFailure = heartbeat ? await heartbeat.renewAndStop() : null;
+  if (heartbeatFailure !== null || hasLostAuthority()) {
+    throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner lease authority was lost before terminal write");
+  }
+  terminalWrite();
+}
+
+function boundFinalSegmentProviderInputV1(
+  context: WorkSegmentContextV1,
+  segmentAuthority: AgenticWorkSegmentAuthorityV1,
+  providerTransientCarrier: AgenticWorkProviderRequest["providerTransientCarrier"],
+  dispatchOrdinal: number,
+  maxInputBytes: number,
+) {
+  const authoritativeMessages = Object.freeze([
+    ...context.phase.instructions.map((content) => Object.freeze({ role: "system" as const, content })),
+    Object.freeze({ role: "user" as const, content: context.rootObjective }),
+    Object.freeze({
+      role: "system" as const,
+      content: JSON.stringify({
+        kind: "work_segment_context",
+        authority: "host",
+        contextDigest: context.contextDigest,
+        phase: context.phase,
+        workspace: context.workspace,
+        previousHandoff: context.previousHandoff,
+        protocol: context.protocol,
+      }),
+    }),
+    ...segmentAuthority.occurrenceMessages.map((message) => Object.freeze(structuredClone(message))),
+    Object.freeze(structuredClone(segmentAuthority.phaseControlMessage)),
+  ]);
+  return cloneBoundedProviderInput(
+    authoritativeMessages,
+    dispatchOrdinal > 0 ? providerTransientCarrier : undefined,
+    maxInputBytes,
+  );
+}
+
+type SettledMutationAppendActiveV1 = { usage: WorkSegmentUsageV1 };
+
+function appendSettledMutationReservationsForActiveV1(
+  active: SettledMutationAppendActiveV1 | null,
+  input: Parameters<typeof appendSettledWorkSegmentDispatchMutationReservationsV1>[0],
+  workspaceOperationCount: number,
+): ReturnType<typeof appendSettledWorkSegmentDispatchMutationReservationsV1> {
+  if (!active) {
+    throw new AgenticWorkPhaseError(
+      "integrity_error",
+      "Settled WORK mutation finalization lacks an active Segment",
+    );
+  }
+  const appended = appendSettledWorkSegmentDispatchMutationReservationsV1(input);
+  if (!appended.duplicate) {
+    active.usage = addWorkSegmentUsageV1(active.usage, Object.freeze({
+      ...EMPTY_WORK_SEGMENT_USAGE_V1,
+      workspaceOperations: workspaceOperationCount,
+    }));
+  }
+  return appended;
+}
+function createProductionWorkSegmentLifecycleV1(
+  input: ProductionWorkSegmentLifecycleInputV1,
+): ProductionWorkSegmentLifecycleV1 {
+  let resumeEnvelopeSnapshot: WorkSegmentResumeEnvelopeV1 | null = null;
+  const resumeEnvelope = (): WorkSegmentResumeEnvelopeV1 => {
+    resumeEnvelopeSnapshot ??= input.createResumeEnvelope();
+    return resumeEnvelopeSnapshot;
+  };
+  const authoredPhases = input.plan.customPhasePlan?.phases ?? [];
+  const phasePlan: WorkPhasePlanAuthorityV1 = Object.freeze({
+    version: 1,
+    phases: Object.freeze(authoredPhases.map((phase, index) => Object.freeze({
+      id: phase.id,
+      index,
+      required: phase.required,
+      nextPhaseIds: Object.freeze([...(phase.nextPhaseIds.length > 0
+        ? new Set(phase.nextPhaseIds)
+        : authoredPhases[index + 1] ? new Set([authoredPhases[index + 1]!.id]) : new Set<string>())].sort(compareUtf8)),
+      repeatLimit: phase.repeatLimit,
+      transitionAuthorityDigest: computeAgenticWorkPhaseTransitionAuthorityDigestV1(phase),
+      skipEligibilityDigest: computeAgenticWorkPhaseSkipEligibilityDigestV1(phase),
+    }))),
+  });
+  const phasePlanDigest = computeWorkPhasePlanDigestV1(phasePlan);
+  const authoredAttemptCapabilities = Object.freeze([...new Set(authoredPhases.flatMap((phase) => [...phase.capabilityRequests]))].sort(compareUtf8));
+  let attemptCapabilityDigest: string | null = authoredAttemptCapabilities.length > 0
+    ? computeWorkSegmentCapabilityDigestV1(authoredAttemptCapabilities)
+    : null;
+  const hasRequiredPhase = phasePlan.phases.some((phase) => phase.required);
+  const futurePhaseReserveOutputTokens = hasRequiredPhase
+    && (input.recovery === undefined || input.recovery.recovery.initialRequiredPhaseCount > 0)
+    ? input.futurePhaseReserveOutputTokens
+    : 0;
+  if (
+    input.maxOutputTokensPerDispatch > input.maxSegmentOutputTokens
+    || input.maxSegmentOutputTokens > input.maxAttemptOutputTokens
+    || input.recoveryReserveOutputTokens + futurePhaseReserveOutputTokens > input.maxAttemptOutputTokens
+  ) {
+    throw new AgenticWorkPhaseError("limit_exceeded", "Host WORK attempt, segment, dispatch, and reserve ceilings are inconsistent");
+  }
+  let attemptBudget: WorkAttemptBudgetV1 = Object.freeze({
+    maxSegments: 256,
+    maxProviderDispatches: input.maxAttemptProviderDispatches,
+    maxProviderOutputTokens: input.maxAttemptOutputTokens,
+    maxOutputTokensPerDispatch: input.maxOutputTokensPerDispatch,
+    maxUnsignedBoundaries: input.maxAttemptUnsignedBoundaries,
+    maxToolCalls: input.maxAttemptToolCalls,
+    maxWorkspaceOperations: input.maxAttemptWorkspaceOperations,
+    recoveryReserveOutputTokens: input.recoveryReserveOutputTokens,
+    futurePhaseReserveOutputTokens,
+  });
+  const segmentBudget: WorkSegmentBudgetV1 = Object.freeze({
+    maxProviderDispatches: input.maxSegmentProviderDispatches,
+    maxProviderOutputTokens: input.maxSegmentOutputTokens,
+    maxOutputTokensPerDispatch: input.maxOutputTokensPerDispatch,
+    maxUnsignedBoundaries: input.maxSegmentUnsignedBoundaries,
+    maxToolCalls: input.maxSegmentToolCalls,
+    maxWorkspaceOperations: input.maxSegmentWorkspaceOperations,
+  });
+  const protocol = Object.freeze({
+    completeTurnCallMode: "standalone_only" as const,
+    requiredToolModeAvailable: input.requiredToolModeAvailable,
+  });
+  const protocolDigest = computeWorkSegmentProtocolDigestV1(protocol);
+  const recoveredAdmission = input.recovery === undefined
+    ? null
+    : input.recovery.segments.find((candidate) => candidate.identity.segmentId === input.recovery!.recovery.currentSegmentId) ?? null;
+  if (input.recovery && (!recoveredAdmission
+    || recoveredAdmission.lifecycle !== "admitted"
+    || input.recovery.recovery.state !== "active"
+    || input.recovery.recovery.resumeEnvelopeDigest !== resumeEnvelope().envelopeDigest
+    || recoveredAdmission.context.contextDigest !== recoveredAdmission.contextDigest
+    || recoveredAdmission.context.rootSnapshotDigest !== resumeEnvelope().snapshotDigest
+    || encodeCanonicalPlainData(input.recovery.recovery.budget) !== encodeCanonicalPlainData(attemptBudget)
+    || encodeCanonicalPlainData(recoveredAdmission.budget) !== encodeCanonicalPlainData(segmentBudget))) {
+    throw new AgenticWorkPhaseError("recovery_unavailable", "Claimed WORK recovery authority is inconsistent");
+  }
+  let leaseAuthorityLost = false;
+  let attempted = input.recovery !== undefined;
+  const immutableOwnerToken = input.execution.ownerToken;
+  const immutableOwner = getTurnExecution(input.execution.id, input.userId);
+  if (!immutableOwnerToken || !immutableOwner || immutableOwner.phase !== "WORK"
+    || immutableOwner.casOwner !== immutableOwnerToken) {
+    throw new AgenticWorkPhaseError("recovery_unavailable", "WORK lifecycle lacks immutable owner authority");
+  }
+  const immutableExecutionCasRevision = immutableOwner.casRevision;
+  const immutableRuntimeEpoch = immutableOwner.runtimeEpoch;
+  let closed = false;
+  let previousHandoff: WorkPhaseTransitionReceiptV1["handoff"] | null = recoveredAdmission?.context.previousHandoff ?? null;
+  let active: {
+    admission: WorkSegmentAdmissionV1;
+    context: WorkSegmentContextV1;
+    usage: WorkSegmentUsageV1;
+    lastBoundary: ReturnType<typeof classifyWorkProviderBoundaryV1> | null;
+    dispatchOrdinal: number;
+    rolloverOrdinal: number;
+  } | null = recoveredAdmission === null ? null : {
+    admission: recoveredAdmission,
+    context: recoveredAdmission.context,
+    usage: recoveredAdmission.usage,
+    lastBoundary: recoveredAdmission.boundaryClass,
+    dispatchOrdinal: input.recovery!.dispatches.filter((dispatch) => dispatch.segmentId === recoveredAdmission.identity.segmentId).length,
+    rolloverOrdinal: 0,
+  };
+  let pending: {
+    reservation: WorkSegmentDispatchReservationV1;
+    accounting: AgenticWorkDispatchAccountingV1 | null;
+    heartbeat: SerializedLeaseHeartbeatV1;
+    identities: ReturnType<typeof createWorkDispatchIdentityAuthorityV1>;
+  } | null = null;
+  let pendingFinalization: {
+    reservation: WorkSegmentDispatchReservationV1;
+    expectedSettlementDigest: string;
+    settlement: AgenticWorkDispatchSettlementReceiptV1;
+    identities: ReturnType<typeof createWorkDispatchIdentityAuthorityV1>;
+  } | null = null;
+  let preSegmentOwnerHeartbeat: SerializedLeaseHeartbeatV1 | null = input.preSegmentOwnerHeartbeat ?? null;
+  let ownerHeartbeat: SerializedLeaseHeartbeatV1 | null = null;
+  let activeProviderLeaseController: AbortController | null = null;
+  const currentRevision = (): number => input.execution.workspaceRevision ?? 0;
+  const cancellationTerminalAuthority = () => {
+    const durable = getTurnExecution(input.execution.id, input.userId);
+    if (!durable || durable.phase !== "WORK" || durable.casOwner !== immutableOwnerToken
+      || durable.runtimeEpoch !== immutableRuntimeEpoch || durable.cancelRequestedAt === null
+      || durable.casRevision < immutableExecutionCasRevision) return null;
+    return durable;
+  };
+  const assertImmutableOwnerAuthority = (): void => {
+    const durable = getTurnExecution(input.execution.id, input.userId);
+    if (!durable || durable.phase !== "WORK" || durable.casOwner !== immutableOwnerToken
+      || durable.casRevision !== immutableExecutionCasRevision
+      || durable.runtimeEpoch !== immutableRuntimeEpoch) {
+      throw new AgenticWorkPhaseError("recovery_unavailable", "WORK lifecycle lost immutable execution authority");
+    }
+  };
+  const assertDispatchAdmissionAuthorityV1 = (signal: AbortSignal): void => {
+    const durable = getTurnExecution(input.execution.id, input.userId);
+    if (!durable || durable.phase !== "WORK" || durable.casOwner !== immutableOwnerToken
+      || durable.casRevision !== immutableExecutionCasRevision
+      || durable.runtimeEpoch !== immutableRuntimeEpoch) {
+      throw new AgenticWorkPhaseError("recovery_unavailable", "WORK dispatch lost immutable execution authority");
+    }
+    if (durable.cancelRequested) {
+      const cause = cancellationTerminalCause(
+        durable.cancelRequestedAt ?? durable.updatedAt,
+        durable.deadlineAt,
+      );
+      throw new DOMException(
+        cause.phase === "TIMED_OUT" ? "Agentic root deadline" : "WORK dispatch cancelled",
+        cause.phase === "TIMED_OUT" ? "TimeoutError" : "AbortError",
+      );
+    }
+    if (signal.aborted) throw signal.reason ?? new DOMException("WORK dispatch cancelled", "AbortError");
+  };
+  const hasCancellationTerminalCloseAuthority = (): boolean => cancellationTerminalAuthority() !== null;
+  const renewActiveSegmentOwner = (): void => {
+    if (!active) throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner renewal lacks an active Segment");
+    assertImmutableOwnerAuthority();
+    const now = Date.now();
+    renewWorkSegmentOwnerLeaseV1({
+      userId: input.userId,
+      executionId: input.execution.id,
+      ownerToken: immutableOwnerToken,
+      expectedExecutionCasRevision: immutableExecutionCasRevision,
+      expectedWorkspaceRevision: currentRevision(),
+      now,
+      runtimeEpoch: immutableRuntimeEpoch,
+      currentSegmentId: active.admission.identity.segmentId,
+      leaseExpiresAt: Math.min(input.execution.deadlineAt, now + 300_000),
+    });
+  };
+  const startSegmentOwnerHeartbeat = (): SerializedLeaseHeartbeatV1 => startSerializedLeaseHeartbeatV1(
+    renewActiveSegmentOwner,
+    (error) => {
+      leaseAuthorityLost = true;
+      activeProviderLeaseController?.abort(error);
+    },
+    input.timeoutScheduler,
+  );
+  const ensureOwnerHeartbeat = async (): Promise<SerializedLeaseHeartbeatV1> => {
+    if (ownerHeartbeat) return ownerHeartbeat;
+    renewActiveSegmentOwner();
+    const segmentHeartbeat = startSegmentOwnerHeartbeat();
+    ownerHeartbeat = segmentHeartbeat;
+    const genericHeartbeat = preSegmentOwnerHeartbeat;
+    preSegmentOwnerHeartbeat = null;
+    if (genericHeartbeat) {
+      const genericFailure = await genericHeartbeat.stop();
+      if (genericFailure !== null) {
+        leaseAuthorityLost = true;
+        await segmentHeartbeat.stop();
+        ownerHeartbeat = null;
+        throw new AgenticWorkPhaseError("recovery_unavailable", "Pre-segment owner renewal failed during Segment handoff");
+      }
+    }
+    return segmentHeartbeat;
+  };
+  const authority = (expectedWorkspaceRevision: number, allowCancellationTerminalClose = false) => {
+    const executionCasRevision = allowCancellationTerminalClose
+      ? cancellationTerminalAuthority()?.casRevision
+      : immutableExecutionCasRevision;
+    if (executionCasRevision === undefined) assertImmutableOwnerAuthority();
+    return {
+      userId: input.userId,
+      executionId: input.execution.id,
+      ownerToken: immutableOwnerToken,
+      expectedExecutionCasRevision: executionCasRevision ?? immutableExecutionCasRevision,
+      expectedWorkspaceRevision,
+      now: Date.now(),
+    };
+  };
+  const requiredPhasesAfter = (phaseIndex: number): number =>
+    phasePlan.phases.slice(phaseIndex + 1).filter((phase) => phase.required).length;
+  const completionAdvisory = (completion?: AgenticWorkPhaseOutcome["completion"]) => Object.freeze({
+    summary: completion?.summary ?? "Host-authoritative WORK segment settled.",
+    unresolvedIds: Object.freeze([...(completion?.unresolvedIds ?? [])]),
+    renderGuidance: completion?.renderGuidance ?? null,
+  });
+  const makeContext = (
+    segmentAuthority: AgenticWorkSegmentAuthorityV1,
+    identity: Pick<WorkSegmentIdentityV1, "phaseId" | "phaseIndex" | "phaseOccurrence">,
+    handoff: WorkSegmentContextV1["previousHandoff"] = previousHandoff,
+  ): WorkSegmentContextV1 => {
+    const allSkippedAuthority = segmentAuthority.allOptionalPhasesSkippedAuthority === undefined
+      ? undefined
+      : validateAgenticWorkAllOptionalPhasesSkippedAuthorityV1(
+        segmentAuthority.allOptionalPhasesSkippedAuthority,
+        authoredPhases,
+      );
+    if (allSkippedAuthority) {
+      if (identity.phaseId !== null || handoff !== null || authoredPhases.length === 0) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "All-skipped WORK authority may admit only the initial null phase");
+      }
+    } else if (identity.phaseId === null && authoredPhases.length > 0) {
+      throw new AgenticWorkPhaseError("provider_protocol_error", "Authored null-phase WORK lacks exact skip authority");
+    }
+    const capabilities = Object.freeze([...segmentAuthority.admittedCapabilities].sort(compareUtf8));
+    const phaseCapabilityDigest = computeWorkSegmentCapabilityDigestV1(capabilities);
+    if (attemptCapabilityDigest === null) attemptCapabilityDigest = phaseCapabilityDigest;
+    const capabilityDigest = attemptCapabilityDigest;
+    const bindingDigest = computeWorkSegmentBindingDigestV1({
+      rootSnapshotDigest: resumeEnvelope().snapshotDigest,
+      resumeEnvelopeDigest: resumeEnvelope().envelopeDigest,
+      phasePlanDigest,
+      protocolDigest,
+      capabilityDigest,
+      attemptBudget,
+      segmentBudget,
+    });
+    const workspaceAuthority = readWorkSegmentWorkspaceAuthorityV1(
+      input.userId,
+      input.execution.id,
+      input.workspaceId,
+    );
+    const withoutDigest: Omit<WorkSegmentContextV1, "contextDigest"> = Object.freeze({
+      version: 1 as const,
+      bindingDigest,
+      resumeEnvelopeDigest: resumeEnvelope().envelopeDigest,
+      phasePlanDigest,
+      protocolDigest,
+      capabilityDigest,
+      phaseCapabilityDigest,
+      rootObjective: segmentAuthority.rootObjective,
+      rootSnapshotId: input.snapshot.snapshotId,
+      rootSnapshotDigest: resumeEnvelope().snapshotDigest,
+      phase: Object.freeze({
+        id: identity.phaseId,
+        index: identity.phaseIndex,
+        occurrence: identity.phaseOccurrence,
+        instructions: Object.freeze([...segmentAuthority.phaseInstructions]),
+        completionCriteria: Object.freeze([...segmentAuthority.completionCriteria]),
+        admittedCapabilities: capabilities,
+      }),
+      workspace: Object.freeze({
+        id: input.workspaceId,
+        revision: workspaceAuthority.revision,
+        acceptedRecords: workspaceAuthority.acceptedRecords,
+        openRequiredIds: workspaceAuthority.openRequiredIds,
+      }),
+      ...(allSkippedAuthority
+        ? { allOptionalPhasesSkippedAuthority: allSkippedAuthority }
+        : {}),
+      previousHandoff: handoff,
+      attemptBudget,
+      segmentBudget,
+      protocol,
+    });
+    return Object.freeze({ ...withoutDigest, contextDigest: computeWorkSegmentContextDigestV1(withoutDigest) });
+  };
+
+  const admit = (
+    request: AgenticWorkProviderRequest,
+    segmentAuthority: AgenticWorkSegmentAuthorityV1,
+    sourceTransitionId: string | null,
+    segmentOrdinal: number,
+  ): void => {
+    const phase = request.segmentPhase ?? active?.context.phase ?? { id: null, index: 0, occurrence: 0 };
+    const remainingRequiredPhaseCount = requiredPhasesAfter(phase.index);
+    if (remainingRequiredPhaseCount === 0 && attemptBudget.futurePhaseReserveOutputTokens !== 0) {
+      attemptBudget = Object.freeze({ ...attemptBudget, futurePhaseReserveOutputTokens: 0 });
+    }
+    const provisionalIdentity = { phaseId: phase.id, phaseIndex: phase.index, phaseOccurrence: phase.occurrence };
+    const context = makeContext(segmentAuthority, provisionalIdentity);
+    if (attempted || sourceTransitionId !== null || segmentOrdinal !== 0) {
+      throw new AgenticWorkPhaseError("provider_protocol_error", "Initial WORK admission authority is inconsistent");
+    }
+    const initialAuthority = authority(currentRevision());
+    const admitted = createAndAdmitInitialWorkSegmentV1({
+      attempt: {
+        ...initialAuthority,
+        attemptId: input.attemptId,
+        workspaceId: input.workspaceId,
+        phaseId: phase.id,
+        phaseIndex: phase.index,
+        phaseOccurrence: phase.occurrence,
+        remainingRequiredPhaseCount,
+        snapshotDigest: resumeEnvelope().snapshotDigest,
+        phasePlanDigest,
+        phasePlan,
+        bindingDigest: context.bindingDigest,
+        idempotencyKey: "work-attempt:" + input.attemptId,
+        resumeEnvelope: resumeEnvelope(),
+        budget: attemptBudget,
+      },
+      admission: {
+        ...initialAuthority,
+        attemptId: input.attemptId,
+        workspaceId: input.workspaceId,
+        sourceTransitionId: null,
+        phaseId: phase.id,
+        phaseIndex: phase.index,
+        phaseOccurrence: phase.occurrence,
+        segmentOrdinal: 0,
+        admissionKey: `work-segment:${input.attemptId}:0`,
+        contextDigest: context.contextDigest,
+        context,
+        budget: segmentBudget,
+      },
+    }).admission.record;
+    attempted = true;
+    active = {
+      admission: admitted,
+      context,
+      usage: EMPTY_WORK_SEGMENT_USAGE_V1,
+      lastBoundary: null,
+      dispatchOrdinal: 0,
+      rolloverOrdinal: request.segmentRolloverOrdinal ?? 0,
+    };
+  };
+
+  const assertDispatchEffectsFinalized = (): void => {
+    if (pendingFinalization) {
+      throw new AgenticWorkPhaseError(
+        "provider_protocol_error",
+        "WORK dispatch workspace effects must be finalized before lifecycle advance",
+      );
+    }
+  };
+
+  const settlePending = async (allowCancellationTerminalClose = false): Promise<AgenticWorkDispatchSettlementReceiptV1 | null> => {
+    if (!pending || !active) return null;
+    const suppliedAccounting = pending.accounting;
+    if (!suppliedAccounting) {
+      throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch has no canonical accounting settlement");
+    }
+    const accounting = Object.freeze({
+      ...suppliedAccounting,
+      usage: Object.freeze({ ...suppliedAccounting.usage, providerDispatches: 1 }),
+    });
+    const settling = pending;
+    const settledActive = active;
+    const heartbeatFailure = await settling.heartbeat.stop();
+    activeProviderLeaseController = null;
+    if (heartbeatFailure !== null
+      && !(allowCancellationTerminalClose && hasCancellationTerminalCloseAuthority())) {
+      leaseAuthorityLost = true;
+      pending = null;
+      throw heartbeatFailure;
+    }
+    if (currentRevision() !== settling.reservation.workspaceRevision) {
+      throw new AgenticWorkPhaseError(
+        "provider_protocol_error",
+        "WORK dispatch settlement must precede its reserved workspace mutations",
+      );
+    }
+    const settled = settleWorkSegmentDispatchV1({
+      ...authority(settling.reservation.workspaceRevision, allowCancellationTerminalClose),
+      segmentId: settledActive.admission.identity.segmentId,
+      dispatchId: settling.reservation.dispatchId,
+      leaseOwner: settling.reservation.leaseOwner!,
+      fenceGeneration: settling.reservation.fenceGeneration,
+      settlementKey: "work-dispatch-settle:" + settling.reservation.dispatchId,
+      boundaryClass: accounting.boundaryClass,
+      usage: accounting.usage,
+      workspaceMutations: accounting.workspaceMutations,
+    }).record;
+    if (!settled.settlementDigest) {
+      throw new AgenticWorkPhaseError("integrity_error", "WORK dispatch settlement digest is unavailable");
+    }
+    const settlement = Object.freeze({
+      version: 1 as const,
+      token: "work-settlement:" + workDispatchIdentityDigestV1("settlement", {
+        executionId: input.execution.id,
+        segmentId: settling.reservation.segmentId,
+        logicalDispatch: settling.reservation.dispatchOrdinal,
+      }),
+    });
+    settledActive.usage = addWorkSegmentUsageV1(settledActive.usage, accounting.usage);
+    settledActive.lastBoundary = accounting.boundaryClass;
+    pending = null;
+    if (accounting.workspaceMutations.length > 0) {
+      pendingFinalization = Object.freeze({
+        reservation: settling.reservation,
+        expectedSettlementDigest: settled.settlementDigest,
+        settlement,
+        identities: settling.identities,
+      });
+    }
+    return settlement;
+  };
+
+  const runResult = async (
+    result: WorkSegmentRunnerResultV1,
+    resultSignal: AbortSignal = input.signal,
+  ): Promise<WorkSegmentRunnerResultV1> => {
+    if (!active) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK segment is not admitted");
+    return createAgenticWorkSegmentRunnerV1(async () => result).run({
+      admission: active.admission,
+      context: active.context,
+      signal: resultSignal,
+    });
+  };
+
+  type WorkSegmentTransitionTargetV1 = Readonly<{
+    id: string | null;
+    index: number;
+    occurrence: number;
+  }>;
+  const transitionFor = async (
+    target: WorkSegmentTransitionTargetV1,
+    rollover: number,
+    segmentAuthority: AgenticWorkSegmentAuthorityV1,
+    signal: AbortSignal,
+    sourceCompletion?: AgenticWorkSegmentTransitionInputV1["sourceCompletion"],
+  ): Promise<void> => {
+    if (!active) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK segment transition has no active source");
+    const source = active.admission.identity;
+    if (
+      source.phaseId === target.id
+      && source.phaseIndex === target.index
+      && source.phaseOccurrence === target.occurrence
+      && active.rolloverOrdinal === rollover
+    ) return;
+    if (!active.lastBoundary) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK segment transition lacks a settled provider boundary");
+    const sameOccurrence = source.phaseId === target.id
+      && source.phaseIndex === target.index
+      && source.phaseOccurrence === target.occurrence;
+    const repeated = source.phaseId === target.id
+      && source.phaseIndex === target.index
+      && target.occurrence === source.phaseOccurrence + 1;
+    if (!sameOccurrence && sourceCompletion === undefined) {
+      throw new AgenticWorkPhaseError("provider_protocol_error", "Phase transition lacks the accepted complete_turn advisory");
+    }
+    const kind = sameOccurrence ? "same_phase_rollover" : repeated ? "phase_repeated" : "phase_advanced";
+    const remainingRequiredPhaseCount = requiredPhasesAfter(
+      kind === "phase_advanced" ? target.index : source.phaseIndex,
+    );
+    let runnerResult: WorkSegmentRunnerResultV1;
+    if (kind === "same_phase_rollover") {
+      runnerResult = { version: 1, segment: source, workspaceRevision: currentRevision(), usage: active.usage, boundaryClass: active.lastBoundary, kind, cause: active.lastBoundary };
+    } else {
+      if (target.id === null) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "A transitioned WORK phase requires a non-null phase identifier");
+      }
+      runnerResult = { version: 1, segment: source, workspaceRevision: currentRevision(), usage: active.usage, boundaryClass: active.lastBoundary, kind, targetPhaseId: target.id, targetPhaseIndex: target.index, targetPhaseOccurrence: target.occurrence };
+    }
+    await runResult(runnerResult);
+    assertDispatchAdmissionAuthorityV1(signal);
+    const committed = commitAndAdmitWorkSegmentTransitionV1({
+      transition: {
+        ...authority(currentRevision()),
+        attemptId: input.attemptId,
+        workspaceId: input.workspaceId,
+        sourceSegmentId: source.segmentId,
+        phasePlanDigest,
+        transitionDecisionDigest: computeWorkTransitionDecisionDigestV1({
+          phasePlanDigest,
+          source,
+          transitionKind: kind === "same_phase_rollover" ? "rollover" : kind === "phase_repeated" ? "repeat" : "advance",
+          targetPhaseId: target.id,
+          targetPhaseIndex: target.index,
+          targetPhaseOccurrence: target.occurrence,
+          targetSegmentOrdinal: source.segmentOrdinal + 1,
+        }),
+        idempotencyKey: ["work-transition", source.segmentId, kind, target.index, target.occurrence, rollover].join(":"),
+        transitionKind: kind === "same_phase_rollover" ? "rollover" : kind === "phase_repeated" ? "repeat" : "advance",
+        targetPhaseId: target.id,
+        targetPhaseIndex: target.index,
+        targetPhaseOccurrence: target.occurrence,
+        targetSegmentOrdinal: source.segmentOrdinal + 1,
+        remainingRequiredPhaseCount,
+        boundaryClass: active.lastBoundary,
+        closeResult: kind,
+        usage: active.usage,
+        completion: completionAdvisory(sourceCompletion),
+      },
+      target: {
+        phaseId: target.id,
+        phaseIndex: target.index,
+        phaseOccurrence: target.occurrence,
+        segmentOrdinal: source.segmentOrdinal + 1,
+        admissionKey: ["work-segment", input.attemptId, source.segmentOrdinal + 1].join(":"),
+        budget: segmentBudget,
+      },
+      makeTargetContext: (handoff) => makeContext(segmentAuthority, {
+        phaseId: target.id,
+        phaseIndex: target.index,
+        phaseOccurrence: target.occurrence,
+      }, handoff),
+    });
+    previousHandoff = committed.transition.record.handoff;
+    active = {
+      admission: committed.admission.record,
+      context: committed.context,
+      usage: EMPTY_WORK_SEGMENT_USAGE_V1,
+      lastBoundary: null,
+      dispatchOrdinal: 0,
+      rolloverOrdinal: rollover,
+    };
+  };
+
+  const lifecycle: ProductionWorkSegmentLifecycleV1 = {
+    async dispatch(
+      provider: WorkDispatchFunctionV1,
+      request: AgenticWorkProviderRequest,
+      segmentAuthority: AgenticWorkSegmentAuthorityV1,
+    ): Promise<GenerationResponse> {
+      assertDispatchEffectsFinalized();
+      await settlePending();
+      assertDispatchAdmissionAuthorityV1(request.signal);
+      if (!active) admit(request, segmentAuthority, null, 0);
+      else if (request.segmentPhase) {
+        const phase = request.segmentPhase;
+        const targetPhase: WorkSegmentTransitionTargetV1 = Object.freeze({
+          id: phase.id,
+          index: phase.index,
+          occurrence: phase.occurrence,
+        });
+        const source = active.admission.identity;
+        const sameOccurrence = source.phaseId === targetPhase.id
+          && source.phaseIndex === targetPhase.index
+          && source.phaseOccurrence === targetPhase.occurrence;
+        if (!sameOccurrence) {
+          if (targetPhase.id === null) {
+            throw new AgenticWorkPhaseError("provider_protocol_error", "A transitioned WORK phase requires a non-null phase identifier");
+          }
+          throw new AgenticWorkPhaseError("provider_protocol_error", "Phase dispatch requires a committed explicit transition");
+        }
+        await transitionFor(
+          targetPhase,
+          request.segmentRolloverOrdinal ?? 0,
+          segmentAuthority,
+          request.signal,
+        );
+      }
+      if (!active) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK segment admission failed");
+      await ensureOwnerHeartbeat();
+      assertDispatchAdmissionAuthorityV1(request.signal);
+      const dispatchOrdinal = active.dispatchOrdinal;
+      const { messages: _legacyMessages, providerTransientCarrier: requestCarrier, ...providerFields } = request;
+      void _legacyMessages;
+      const boundedAuthoritativeInput = boundFinalSegmentProviderInputV1(
+        active.context,
+        segmentAuthority,
+        requestCarrier,
+        dispatchOrdinal,
+        input.snapshot.limits.maxInputBytes,
+      );
+      active.dispatchOrdinal += 1;
+      const leaseOwner = `work:${input.execution.id}:${active.admission.identity.segmentOrdinal}:${dispatchOrdinal}`;
+      const reserved = reserveWorkSegmentDispatchV1({
+        ...authority(currentRevision()),
+        attemptId: input.attemptId,
+        workspaceId: input.workspaceId,
+        segmentId: active.admission.identity.segmentId,
+        dispatchOrdinal,
+        idempotencyKey: `work-dispatch:${active.admission.identity.segmentId}:${dispatchOrdinal}`,
+        toolMode: request.toolMode,
+        budgetClass: segmentAuthority.recovery ? "recovery" : "normal",
+        reservedOutputTokens: request.maxOutputTokens,
+        leaseOwner,
+        leaseExpiresAt: Math.min(input.execution.deadlineAt, Date.now() + 120_000),
+      }).record;
+      startWorkSegmentDispatchV1({
+        ...authority(currentRevision()),
+        segmentId: active.admission.identity.segmentId,
+        dispatchId: reserved.dispatchId,
+        leaseOwner,
+        fenceGeneration: reserved.fenceGeneration,
+      });
+      const providerLeaseController = new AbortController();
+      activeProviderLeaseController = providerLeaseController;
+      const heartbeat = startSerializedLeaseHeartbeatV1(() => {
+        if (!active) throw new AgenticWorkPhaseError("recovery_unavailable", "WORK dispatch heartbeat lost active authority");
+        assertImmutableOwnerAuthority();
+        const now = Date.now();
+        renewInFlightWorkSegmentDispatchLeaseV1({
+          userId: input.userId,
+          executionId: input.execution.id,
+          ownerToken: immutableOwnerToken,
+          expectedExecutionCasRevision: immutableExecutionCasRevision,
+          expectedWorkspaceRevision: currentRevision(),
+          now,
+          segmentId: active.admission.identity.segmentId,
+          dispatchId: reserved.dispatchId,
+          leaseOwner,
+          fenceGeneration: reserved.fenceGeneration,
+          leaseExpiresAt: Math.min(input.execution.deadlineAt, now + 120_000),
+        });
+      }, (error) => {
+        leaseAuthorityLost = true;
+        providerLeaseController.abort(error);
+      }, input.timeoutScheduler);
+
+      try {
+        const authoritativeRequest: AgenticWorkProviderRequest = Object.freeze({
+          ...providerFields,
+          signal: AbortSignal.any([request.signal, providerLeaseController.signal]),
+          messages: boundedAuthoritativeInput.messages,
+          roundIndex: dispatchOrdinal,
+          ...(boundedAuthoritativeInput.providerTransientCarrier
+            ? { providerTransientCarrier: boundedAuthoritativeInput.providerTransientCarrier }
+            : {}),
+        });
+        const response = await provider(authoritativeRequest);
+        const scope = Object.freeze({
+          executionId: input.execution.id,
+          segmentId: reserved.segmentId,
+          logicalDispatch: reserved.dispatchOrdinal,
+        });
+        const identities = createWorkDispatchIdentityAuthorityV1(scope);
+        for (const call of response.tool_calls ?? []) {
+          const queue = input.publicActivityNodeIdsByCallId?.get(call.call_id) ?? [];
+          queue.push(publicWorkActivityNodeIdV1(scope, call.call_id));
+          input.publicActivityNodeIdsByCallId?.set(call.call_id, queue);
+        }
+        pending = { reservation: reserved, accounting: null, heartbeat, identities };
+        return response;
+      } catch (error) {
+        const heartbeatFailure = await heartbeat.stop();
+        activeProviderLeaseController = null;
+        if (heartbeatFailure !== null && !hasCancellationTerminalCloseAuthority()) {
+          leaseAuthorityLost = true;
+          pending = null;
+          throw heartbeatFailure;
+        }
+        const conservativeUsage: WorkSegmentUsageV1 = Object.freeze({
+          ...EMPTY_WORK_SEGMENT_USAGE_V1,
+          providerDispatches: 1,
+          providerOutputTokens: reserved.reservedOutputTokens,
+          providerTotalTokens: reserved.reservedOutputTokens,
+          billedOutputTokens: reserved.reservedOutputTokens,
+          unsignedBoundaries: 1,
+        });
+        settleWorkSegmentDispatchV1({
+          ...authority(currentRevision()),
+          segmentId: active.admission.identity.segmentId,
+          dispatchId: reserved.dispatchId,
+          leaseOwner,
+          fenceGeneration: reserved.fenceGeneration,
+          settlementKey: "work-dispatch-rejected:" + reserved.dispatchId,
+          boundaryClass: "provider_protocol_failure",
+          usage: conservativeUsage,
+          workspaceMutations: [],
+        });
+        active.usage = addWorkSegmentUsageV1(active.usage, conservativeUsage);
+        active.lastBoundary = "provider_protocol_failure";
+        pending = null;
+        throw error;
+      }
+    },
+    providerExchangeId(): string {
+      if (!pending) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK provider exchange identity has no pending dispatch");
+      return pending.identities.providerExchangeId();
+    },
+    workspaceMutationReservation(identityInput): AgenticWorkWorkspaceMutationReservationV1 {
+      const dispatch = pending ?? pendingFinalization;
+      if (!dispatch) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK workspace operation identity has no pending dispatch");
+      if (identityInput.frameId !== input.execution.id && !dispatch.identities.ownsChildFrame(identityInput.frameId)) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK workspace operation frame identity is invalid");
+      }
+      const mutation = dispatch.identities.workspaceMutationReservation(identityInput);
+      if (pendingFinalization && dispatch === pendingFinalization) {
+        const mutations = Object.freeze([mutation]);
+        appendSettledMutationReservationsForActiveV1(active, {
+          ...authority(currentRevision()),
+          attemptId: input.attemptId,
+          workspaceId: input.workspaceId,
+          segmentId: dispatch.reservation.segmentId,
+          dispatchId: dispatch.reservation.dispatchId,
+          fenceGeneration: dispatch.reservation.fenceGeneration,
+          expectedSettlementDigest: dispatch.expectedSettlementDigest,
+          appendKey: "work-dispatch-mutation-append:" + mutation.operationKey,
+          owner: {
+            segmentId: mutation.segmentId,
+            logicalDispatch: mutation.logicalDispatch,
+            frameId: mutation.frameId,
+          },
+          mutations,
+        }, mutations.length);
+      }
+      return mutation;
+    },
+    delegateInvocationIdentity(identityInput): AgenticWorkDelegateInvocationIdentityV1 {
+      if (!pending) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK delegate identity has no pending dispatch");
+      return pending.identities.delegateInvocationIdentity(identityInput);
+    },
+    async transition(transitionInput: AgenticWorkSegmentTransitionInputV1): Promise<void> {
+      assertDispatchEffectsFinalized();
+      await settlePending();
+      assertDispatchAdmissionAuthorityV1(input.signal);
+      await transitionFor(
+        transitionInput.targetPhase, 0, transitionInput.targetAuthority, input.signal, transitionInput.sourceCompletion,
+      );
+    },
+    async settleDispatch(accounting: AgenticWorkDispatchAccountingV1): Promise<AgenticWorkDispatchSettlementReceiptV1> {
+      assertDispatchEffectsFinalized();
+      if (!pending) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch accounting has no pending reservation");
+      if (pending.accounting) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch accounting was already supplied");
+      pending.accounting = Object.freeze({
+        ...structuredClone(accounting),
+        usage: Object.freeze({ ...structuredClone(accounting.usage), providerDispatches: 1 }),
+      });
+      const settlement = await settlePending();
+      if (!settlement) throw new AgenticWorkPhaseError("integrity_error", "WORK dispatch settlement receipt is unavailable");
+      return settlement;
+    },
+    async persistChildAssignmentAuthority(
+      childAuthority: AgenticWorkChildAssignmentAuthorityInputV1,
+    ): Promise<void> {
+      const pendingEffects = pendingFinalization;
+      if (!pendingEffects
+        || childAuthority.settlement.version !== 1
+        || childAuthority.settlement.token !== pendingEffects.settlement.token) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK child assignment settlement token is stale or invalid");
+      }
+      const assignment = childAuthority.assignmentReservation;
+      if (assignment.operationKind !== "assign_child_tasks"
+        || assignment.segmentId !== pendingEffects.reservation.segmentId
+        || assignment.logicalDispatch !== pendingEffects.reservation.dispatchOrdinal
+        || assignment.frameId !== input.execution.id
+        || childAuthority.assignments.length === 0
+        || childAuthority.assignments.some((entry) => (
+          entry.settlementReservation.frameId !== assignment.frameId
+          || entry.settlementReservation.operationKind !== "settle_child_task"
+          || entry.settlementReservation.segmentId !== pendingEffects.reservation.segmentId
+          || entry.settlementReservation.logicalDispatch !== pendingEffects.reservation.dispatchOrdinal
+          || !pendingEffects.identities.ownsChildFrame(entry.frameId)
+        ))) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK child assignment authority escaped its dispatch owner");
+      }
+      persistWorkSegmentChildAssignmentAuthorityV1({
+        ...authority(currentRevision()),
+        attemptId: input.attemptId,
+        workspaceId: input.workspaceId,
+        segmentId: pendingEffects.reservation.segmentId,
+        dispatchId: pendingEffects.reservation.dispatchId,
+        fenceGeneration: pendingEffects.reservation.fenceGeneration,
+        expectedSettlementDigest: pendingEffects.expectedSettlementDigest,
+        assignmentReservation: Object.freeze(structuredClone(assignment)),
+        assignments: Object.freeze(childAuthority.assignments.map((entry) => Object.freeze({
+          taskId: entry.taskId,
+          frameId: entry.frameId,
+          settlementReservation: Object.freeze(structuredClone(entry.settlementReservation)),
+        }))),
+      });
+    },
+    async finalizeDispatchEffects(finalization: AgenticWorkDispatchEffectsFinalizationInputV1): Promise<void> {
+      const pendingEffects = pendingFinalization;
+      if (!pendingEffects
+        || finalization.settlement.version !== 1
+        || finalization.settlement.token !== pendingEffects.settlement.token) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch effect settlement token is stale or invalid");
+      }
+      if (finalization.effects.length === 0) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK empty dispatch effects are finalized atomically at settlement");
+      }
+      if (finalization.nextWorkspaceRevision !== currentRevision()) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch effect finalization workspace cursor is stale");
+      }
+      const owner = Object.freeze({ ...finalization.owner });
+      if (owner.segmentId !== pendingEffects.reservation.segmentId
+        || owner.logicalDispatch !== pendingEffects.reservation.dispatchOrdinal
+        || (owner.frameId !== input.execution.id && !pendingEffects.identities.ownsChildFrame(owner.frameId))) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch effect owner is invalid");
+      }
+      if (finalization.effects.some((effect) => effect.segmentId !== owner.segmentId
+        || effect.logicalDispatch !== owner.logicalDispatch
+        || effect.frameId !== owner.frameId)) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK dispatch effects mix owner scopes");
+      }
+      const finalized = finalizeSettledWorkSegmentDispatchEffectsV1({
+        ...authority(finalization.nextWorkspaceRevision),
+        attemptId: input.attemptId,
+        workspaceId: input.workspaceId,
+        segmentId: pendingEffects.reservation.segmentId,
+        dispatchId: pendingEffects.reservation.dispatchId,
+        fenceGeneration: pendingEffects.reservation.fenceGeneration,
+        expectedSettlementDigest: pendingEffects.expectedSettlementDigest,
+        owner,
+        finalizationKey: "work-dispatch-effects:" + createHash("sha256")
+          .update(encodeCanonicalPlainData(owner), "utf8").digest("hex"),
+        effects: Object.freeze(finalization.effects.map((effect) => Object.freeze(structuredClone(effect)))),
+        nextWorkspaceRevision: finalization.nextWorkspaceRevision,
+      }).record;
+      if (finalized.settlementDigest !== pendingEffects.expectedSettlementDigest
+        && finalized.settledWorkspaceRevision === finalization.nextWorkspaceRevision) {
+        pendingFinalization = null;
+      }
+    },
+    async close(outcome: WorkSegmentTerminalOutcomeV1): Promise<void> {
+      if (closed) throw new AgenticWorkPhaseError("provider_protocol_error", "WORK segment attempt was already closed");
+      assertDispatchEffectsFinalized();
+      closed = true;
+      let terminalWrite = (): void => {};
+      if (pending && !pending.accounting && outcome.status !== "completed") {
+        const reservedOutputTokens = pending.reservation.reservedOutputTokens;
+        pending.accounting = Object.freeze({
+          boundaryClass: "provider_protocol_failure",
+          usage: Object.freeze({
+            ...EMPTY_WORK_SEGMENT_USAGE_V1,
+            providerDispatches: 1,
+            providerOutputTokens: reservedOutputTokens,
+            providerTotalTokens: reservedOutputTokens,
+            billedOutputTokens: reservedOutputTokens,
+            unsignedBoundaries: 1,
+          }),
+          workspaceMutations: Object.freeze([]),
+        });
+      }
+      try {
+        const cancellationTerminalClose = outcome.status === "cancelled" || outcome.status === "timed_out";
+        const heartbeat = cancellationTerminalClose
+          ? ownerHeartbeat ?? preSegmentOwnerHeartbeat
+          : await selectTerminalOwnerHeartbeatV1(
+              active !== null,
+              ownerHeartbeat,
+              preSegmentOwnerHeartbeat,
+              ensureOwnerHeartbeat,
+            );
+        await finalizeUnderOwnerLeaseV1(heartbeat, () => leaseAuthorityLost, async () => {
+          if (cancellationTerminalClose && !pending && active) {
+            const orphaned = readWorkSegmentRecoveryChainV1(input.userId, input.execution.id)?.dispatches.findLast(
+              (dispatch) => dispatch.segmentId === active!.admission.identity.segmentId
+                && (dispatch.lifecycle === "reserved" || dispatch.lifecycle === "in_flight"),
+            );
+            if (orphaned?.leaseOwner) {
+              if (orphaned.lifecycle === "reserved") {
+                startWorkSegmentDispatchV1({
+                  ...authority(currentRevision(), true),
+                  segmentId: orphaned.segmentId,
+                  dispatchId: orphaned.dispatchId,
+                  leaseOwner: orphaned.leaseOwner,
+                  fenceGeneration: orphaned.fenceGeneration,
+                });
+              }
+              const conservativeUsage = Object.freeze({
+                ...EMPTY_WORK_SEGMENT_USAGE_V1,
+                providerDispatches: 1,
+                providerOutputTokens: orphaned.reservedOutputTokens,
+                providerTotalTokens: orphaned.reservedOutputTokens,
+                billedOutputTokens: orphaned.reservedOutputTokens,
+                unsignedBoundaries: 1,
+              });
+              settleWorkSegmentDispatchV1({
+                ...authority(currentRevision(), true),
+                segmentId: orphaned.segmentId,
+                dispatchId: orphaned.dispatchId,
+                leaseOwner: orphaned.leaseOwner,
+                fenceGeneration: orphaned.fenceGeneration,
+                settlementKey: `work-dispatch-cancelled:${orphaned.dispatchId}`,
+                boundaryClass: "provider_protocol_failure",
+                usage: conservativeUsage,
+                workspaceMutations: Object.freeze([]),
+              });
+              active.usage = addWorkSegmentUsageV1(active.usage, conservativeUsage);
+              active.lastBoundary = "provider_protocol_failure";
+            }
+          }
+          await settlePending(cancellationTerminalClose);
+          if (leaseAuthorityLost && !cancellationTerminalClose) {
+            throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner lease authority was lost during dispatch settlement");
+          }
+          const settled = active;
+          if (settled && attempted) {
+            const source = settled.admission.identity;
+            const durableChain = cancellationTerminalClose
+              ? readWorkSegmentRecoveryChainV1(input.userId, input.execution.id)
+              : null;
+            const durableSegment = durableChain?.segments.find(
+              (candidate) => candidate.identity.segmentId === source.segmentId,
+            ) ?? null;
+            const durableDispatches = durableChain?.dispatches.filter(
+              (dispatch) => dispatch.segmentId === source.segmentId && dispatch.usage !== null,
+            ) ?? [];
+            const durableDispatchUsage = durableDispatches.length === 0
+              ? null
+              : durableDispatches.reduce(
+                  (total, dispatch) => addWorkSegmentUsageV1(total, dispatch.usage!),
+                  EMPTY_WORK_SEGMENT_USAGE_V1,
+                );
+            const usage = durableDispatchUsage ?? durableSegment?.usage ?? settled.usage;
+            const boundaryClass = durableDispatches[durableDispatches.length - 1]?.boundaryClass
+              ?? durableSegment?.boundaryClass
+              ?? settled.lastBoundary;
+            if (outcome.status === "completed") {
+              if (!boundaryClass) {
+                throw new AgenticWorkPhaseError("provider_protocol_error", "Completed WORK has no settled provider boundary");
+              }
+              const result: WorkSegmentRunnerResultV1 = {
+                version: 1,
+                segment: source,
+                workspaceRevision: currentRevision(),
+                usage,
+                boundaryClass,
+                kind: "work_complete",
+                completion: { authority: "model_advisory", ...completionAdvisory(outcome.completion) },
+              };
+              await runResult(result);
+              if (leaseAuthorityLost && !cancellationTerminalClose) {
+                throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner lease authority was lost before terminal transition commit");
+              }
+              terminalWrite = () => {
+                commitWorkSegmentTransitionV1({
+                  ...authority(currentRevision()),
+                  attemptId: input.attemptId,
+                  workspaceId: input.workspaceId,
+                  sourceSegmentId: source.segmentId,
+                  phasePlanDigest,
+                  transitionDecisionDigest: computeWorkTransitionDecisionDigestV1({
+                    phasePlanDigest,
+                    source,
+                    transitionKind: "terminal",
+                    targetPhaseId: null,
+                    targetPhaseIndex: null,
+                    targetPhaseOccurrence: null,
+                    targetSegmentOrdinal: null,
+                  }),
+                  idempotencyKey: `work-transition:${source.segmentId}:terminal`,
+                  transitionKind: "terminal",
+                  targetPhaseId: null,
+                  targetPhaseIndex: null,
+                  targetPhaseOccurrence: null,
+                  targetSegmentOrdinal: null,
+                  remainingRequiredPhaseCount: 0,
+                  boundaryClass,
+                  closeResult: "work_complete",
+                  usage,
+                  completion: completionAdvisory(outcome.completion),
+                });
+              };
+            } else {
+              const timedOut = outcome.status === "timed_out";
+              const closeResult = outcome.status === "exhausted"
+                ? "exhausted"
+                : outcome.status === "cancelled"
+                  ? "cancelled"
+                  : "failed";
+              const durableReason = typeof outcome.durableReason === "string" ? outcome.durableReason : undefined;
+              const outcomeCode = typeof outcome.code === "string" ? outcome.code : undefined;
+              const terminalReason = timedOut
+                ? "root_wall_clock_limit_exceeded"
+                : durableReason ?? outcomeCode ?? outcome.errorMessage ?? outcome.status;
+              const result: WorkSegmentRunnerResultV1 = {
+                version: 1,
+                segment: source,
+                workspaceRevision: currentRevision(),
+                usage,
+                boundaryClass,
+                kind: closeResult,
+                code: terminalReason,
+              };
+              await runResult(result, cancellationTerminalClose ? new AbortController().signal : input.signal);
+              if (leaseAuthorityLost && !cancellationTerminalClose) {
+                throw new AgenticWorkPhaseError("recovery_unavailable", "WORK owner lease authority was lost before terminal close");
+              }
+              terminalWrite = () => {
+                const closeReason = terminalReason;
+                if (settled.dispatchOrdinal === 0) {
+                  closeAdmittedWorkSegmentWithoutDispatchTerminalV1({
+                    ...authority(currentRevision(), cancellationTerminalClose),
+                    attemptId: input.attemptId,
+                    workspaceId: input.workspaceId,
+                    sourceSegmentId: source.segmentId,
+                    idempotencyKey: `work-terminal:${source.segmentId}:${closeResult}`,
+                    closeResult,
+                    closeReason,
+                  });
+                } else {
+                  closeWorkSegmentTerminalV1({
+                    ...authority(currentRevision(), cancellationTerminalClose),
+                    attemptId: input.attemptId,
+                    workspaceId: input.workspaceId,
+                    sourceSegmentId: source.segmentId,
+                    idempotencyKey: `work-terminal:${source.segmentId}:${closeResult}`,
+                    closeResult,
+                    closeReason,
+                    boundaryClass,
+                    usage,
+                  });
+                }
+              };
+            }
+          }
+        }, () => terminalWrite(), cancellationTerminalClose);
+      } finally {
+        const remainingHeartbeat = ownerHeartbeat ?? preSegmentOwnerHeartbeat;
+        ownerHeartbeat = null;
+        preSegmentOwnerHeartbeat = null;
+        await remainingHeartbeat?.stop();
+      }
+    },
+  };
+  return Object.freeze(lifecycle);
+}
+
 type WorkProviderExchangeOutcome =
   | { readonly status: "succeeded"; readonly response: GenerationResponse }
   | { readonly status: "failed"; readonly error: unknown };
@@ -1894,6 +3584,11 @@ function assertExactWorkDispatchIdentity(
   }
 }
 
+function hasNativeAgenticWorkContinuationV1(connection: CompleteFrozenConnectionV1): boolean {
+  return connection.capabilities.nativeToolContinuation === true
+    && connection.capabilities.toolContinuationMode === "native";
+}
+
 function makeWorkProvider(
   userId: string,
   connection: CompleteFrozenConnectionV1,
@@ -1904,19 +3599,18 @@ function makeWorkProvider(
 ) {
   return async (request: AgenticWorkProviderRequest): Promise<GenerationResponse> => {
     assertExactWorkDispatchIdentity(request, connection);
-    const continuationMode = connection.capabilities.toolContinuationMode;
-    if (continuationMode !== "native" && continuationMode !== "legacy") {
-      throw new AgenticWorkPhaseError("provider_protocol_error", "Provider tool continuation is unsupported");
+    if (!hasNativeAgenticWorkContinuationV1(connection)) {
+      throw new AgenticWorkPhaseError("provider_protocol_error", "Agentic WORK requires native provider tool continuation");
     }
     const generationRequest: GenerationRequest = {
       messages: [...request.messages],
       model: connection.model,
-      parameters: { ...(parameters ?? {}), max_tokens: request.maxOutputTokens },
+      parameters: workProviderGenerationParametersV1(parameters, request.maxOutputTokens),
       tools: [...request.tools],
       stream: true,
       signal: request.signal,
       receiveLimitBytes: request.receiveLimitBytes,
-      toolMode: "ordinary",
+      toolMode: request.toolMode,
       ...(request.providerTransientCarrier
         ? { providerTransientCarrier: request.providerTransientCarrier }
         : {}),
@@ -2074,16 +3768,21 @@ function recordChildProviderExchange(
 }
 
 type InspectionRecordArguments = Parameters<AgentInspectionWriterV1["record"]>;
+type PublicChildActivityIdentityV1 = Readonly<{
+  taskId: string;
+  frameId: string;
+}>;
 
 function createChildInspectionCorrelation(
   authority: AgentInspectionWriterV1 | undefined,
 ): {
   readonly writer: AgentInspectionWriterV1 | undefined;
-  readonly childTaskIds: ReadonlyMap<string, string>;
-  readonly bind: (childId: string, assignedTaskId?: string) => void;
+  readonly childActivityIdentities: ReadonlyMap<string, PublicChildActivityIdentityV1>;
+  readonly bind: (childId: string, assignedTaskId?: string, frameId?: string) => void;
   readonly flush: () => void;
 } {
   const childTaskIds = new Map<string, string>();
+  const childActivityIdentities = new Map<string, PublicChildActivityIdentityV1>();
   const pendingPolicies = new Map<string, InspectionRecordArguments[]>();
 
   const write = (
@@ -2123,8 +3822,10 @@ function createChildInspectionCorrelation(
     }, state);
   };
 
-  const bind = (childId: string, assignedTaskId?: string): void => {
-    childTaskIds.set(childId, assignedTaskId ?? childId);
+  const bind = (childId: string, assignedTaskId?: string, frameId = childId): void => {
+    const taskId = assignedTaskId ?? childId;
+    childTaskIds.set(childId, taskId);
+    childActivityIdentities.set(childId, Object.freeze({ taskId, frameId }));
     const pending = pendingPolicies.get(childId);
     if (!pending) return;
     pendingPolicies.delete(childId);
@@ -2138,7 +3839,7 @@ function createChildInspectionCorrelation(
         record: (...args: InspectionRecordArguments) => write(args[0], args[1], args[2], true),
       })
     : undefined;
-  return Object.freeze({ writer, childTaskIds, bind, flush });
+  return Object.freeze({ writer, childActivityIdentities, bind, flush });
 }
 
 /** Never throws: tokenizer resolution falls back to chars/4. */
@@ -2397,16 +4098,24 @@ function recordPublicWorkActivity(
   ledger: { recordActivityNode(node: AgentActivityNodeV1): void },
   outcome: Pick<AgenticWorkPhaseOutcome, "observations" | "childResults">,
   generationId: string,
-  childTaskIds?: ReadonlyMap<string, string>,
+  childActivityIdentities?: ReadonlyMap<string, PublicChildActivityIdentityV1>,
   seenNodeIds: Set<string> = new Set<string>(),
+  publicActivityNodeIdsByCallId?: Map<string, string[]>,
   usage: AgentActivityUsageV1 = publicWorkActivityUsage(outcome),
 ): AgentActivityUsageV1 {
-  if (usage.toolCalls === 0 && usage.childInvocations === 0) return usage;
+  if (outcome.observations.length === 0 && outcome.childResults.length === 0) return usage;
   const startedAt = Date.now();
   for (const observation of outcome.observations) {
-    const id = typeof observation.callId === "string" && observation.callId.length > 0
-      ? observation.callId
-      : `work-tool:${observation.sequence}`;
+    const durableIds = publicActivityNodeIdsByCallId?.get(observation.callId);
+    const durableId = durableIds?.shift();
+    if (durableIds?.length === 0) publicActivityNodeIdsByCallId?.delete(observation.callId);
+    const id = durableId ?? "work-tool:" + createHash("sha256").update(encodeCanonicalPlainData({
+      version: 1,
+      generationId,
+      sequence: observation.sequence,
+      callId: observation.callId,
+      correlationId: observation.correlationId,
+    }), "utf8").digest("hex");
     if (seenNodeIds.has(id)) continue;
     seenNodeIds.add(id);
     const status: AgentActivityLifecycle = observation.status === "error" || observation.status === "rejected"
@@ -2428,8 +4137,15 @@ function recordPublicWorkActivity(
     });
   }
   for (const child of outcome.childResults) {
-    const taskId = childTaskIds?.get(child.childId) ?? child.childId;
-    const id = "task:" + taskId;
+    const identity = childActivityIdentities?.get(child.childId);
+    const taskId = identity?.taskId ?? child.childId;
+    const childFrameId = identity?.frameId ?? child.childId;
+    const id = "child-activity:" + createHash("sha256").update(encodeCanonicalPlainData({
+      version: 1,
+      generationId,
+      childFrameId,
+      taskId,
+    }), "utf8").digest("hex");
     if (seenNodeIds.has(id)) continue;
     seenNodeIds.add(id);
     const status: AgentActivityLifecycle = child.status === "succeeded" ? "completed" : child.status;
@@ -2484,11 +4200,22 @@ function workspaceEnvelope(
     }),
   });
 }
-function readCognitionWorkspaceSettlement(value: unknown): { readonly workspaceRevision: number } {
+function readCognitionWorkspaceSettlement(
+  value: unknown,
+  reservation: AgenticWorkWorkspaceMutationReservationV1,
+): Readonly<{
+  workspaceRevision: number;
+  operationKey: string;
+  operationDigest: string;
+  segmentId: string;
+  logicalDispatch: number;
+  frameId: string;
+}> {
   if (!isRecord(value) || !Object.prototype.hasOwnProperty.call(value, "result") || !isRecord(value.result)) {
     throw new Error("workspace_settlement_result_invalid");
   }
-  const workspaceRevision = value.result.workspaceRevision;
+  const result = value.result;
+  const workspaceRevision = result.workspaceRevision;
   if (!Number.isSafeInteger(workspaceRevision) || (workspaceRevision as number) < 0) {
     throw new Error("workspace_settlement_result_invalid");
   }
@@ -2498,10 +4225,23 @@ function readCognitionWorkspaceSettlement(value: unknown): { readonly workspaceR
   const cognitionRevision = value.cognition.workspaceRevision;
   if (!Number.isSafeInteger(cognitionRevision)
     || (cognitionRevision as number) < 0
-    || cognitionRevision !== workspaceRevision) {
+    || cognitionRevision !== workspaceRevision
+    || result.operationKey !== reservation.operationKey
+    || result.segmentId !== reservation.segmentId
+    || result.logicalDispatch !== reservation.logicalDispatch
+    || result.frameId !== reservation.frameId
+    || typeof result.operationDigest !== "string"
+    || !/^[a-f0-9]{64}$/u.test(result.operationDigest)) {
     throw new Error("workspace_settlement_result_invalid");
   }
-  return { workspaceRevision: workspaceRevision as number };
+  return Object.freeze({
+    workspaceRevision: workspaceRevision as number,
+    operationKey: reservation.operationKey,
+    operationDigest: result.operationDigest,
+    segmentId: reservation.segmentId,
+    logicalDispatch: reservation.logicalDispatch,
+    frameId: reservation.frameId,
+  });
 }
 
 function frozenWorkspaceUsage(execution: RuntimeExecution, revision: number): WorkspaceUsageV1 {
@@ -2600,7 +4340,16 @@ function makeWorkspace(
   capabilities: WorkspaceOperationCapabilitiesV1,
   workspaceContextBytes: number,
   cognitionRuntime?: WorkspaceCognitionRuntime,
+  onWorkspaceRevision?: () => void,
 ): AgenticWorkspaceCapability {
+  const advanceAndProjectWorkspaceRevision = (result: unknown): void => {
+    advanceWorkspaceRevision(execution, result);
+    onWorkspaceRevision?.();
+  };
+  const advanceAndProjectNonCognitionRevision = (workspaceRevision: number): void => {
+    advanceNonCognitionWorkspaceRevision(execution, cognitionRuntime, workspaceRevision);
+    onWorkspaceRevision?.();
+  };
   const sanitizeWorkspaceArgs = (operationArgs: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(
     Object.entries(operationArgs).filter(([key]) =>
       key !== "userId" && key !== "chatId" && key !== "turnId" && key !== "workspaceId"
@@ -2639,7 +4388,7 @@ function makeWorkspace(
       turnId: execution.id,
       workspaceId: execution.workspaceId,
       actor: frame.kind,
-      ...(frame.kind === "child" ? { frameId: frame.frameId } : {}),
+      frameId: frame.frameId,
       expectedRevision,
       ...sanitizeWorkspaceArgs(operationArgs),
     };
@@ -2703,25 +4452,34 @@ function makeWorkspace(
         throw new Error("workspace_actor_forbidden");
       }
       const frameId = typeof rawWorkspace.frameId === "string" ? rawWorkspace.frameId : undefined;
-      const operationKey = requireOperationKey(input.operationKey);
+      const childSettlement = input.operation === "settle_child_failure";
+      const expectedOperationKind = childSettlement ? "settle_child_task" : input.operation;
+      const reservationFrameId = childSettlement ? execution.id : frameId;
+      if (input.reservation.operationKind !== expectedOperationKind
+        || (reservationFrameId !== undefined && input.reservation.frameId !== reservationFrameId)) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "Cognition workspace mutation reservation is invalid");
+      }
       const result = await withToolPermit(
         execution.userId,
         () => cognitionRuntime.applyWorkspaceTransition({
           ...input,
-          operationKey,
           workspace: authenticatedContext(actor, frameId, rawWorkspace, execution.workspaceRevision ?? 0),
         }),
         input.signal,
         execution.owner.ledger,
       );
-      advanceWorkspaceRevision(execution, result);
+      advanceAndProjectWorkspaceRevision(result);
       return workspaceEnvelope(
         {
           workspaceRevision: result.workspaceRevision,
           taskId: result.taskId,
           transition: result.transition,
           materializedTaskIds: result.materializedTaskIds,
-          ...(result.operationKey ? { operationKey: result.operationKey } : {}),
+          operationKey: result.operationKey,
+          segmentId: result.segmentId,
+          logicalDispatch: result.logicalDispatch,
+          frameId: result.frameId,
+          operationDigest: result.operationDigest,
         },
         result.cognition,
       );
@@ -2783,7 +4541,7 @@ function makeWorkspace(
         execution.owner.ledger,
       ), input.signal);
       if (input.signal.aborted) throw input.signal.reason ?? new DOMException("Aborted", "AbortError");
-      advanceWorkspaceRevision(execution, result);
+      advanceAndProjectWorkspaceRevision(result);
       const preparedFixedPoint = result.preparedAcceptance?.bundle as AgenticWorkspaceCompletionFixedPointResult | undefined;
       const { preparedAcceptance: _preparedAcceptance, ...publicCognition } = result;
       return {
@@ -2799,7 +4557,10 @@ function makeWorkspace(
     : undefined;
   return {
     authenticateFrame: registerFrame,
-    settleAssignedTask: async ({ taskId, frameId, state, operationKey, signal }) => {
+    settleAssignedTask: async ({ taskId, frameId, state, reservation, signal }) => {
+      if (reservation.operationKind !== "settle_child_task" || reservation.frameId !== execution.id) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK child settlement reservation is invalid");
+      }
       if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       const expectedRevision = execution.workspaceRevision ?? 0;
       const authenticated = authenticatedContext("host", frameId, {
@@ -2811,27 +4572,41 @@ function makeWorkspace(
         const rawResult = await abortable(Promise.resolve(applyCognitionWorkspaceTransition({
           taskId,
           transition: state,
-          operationKey: requireOperationKey(operationKey),
+          reservation,
           workspace: authenticated,
           operation: "settle_child_failure",
           signal,
         })), signal);
-        const settlement = readCognitionWorkspaceSettlement(rawResult);
-        advanceWorkspaceRevision(execution, rawResult);
+        const settlement = readCognitionWorkspaceSettlement(rawResult, reservation);
+        advanceAndProjectWorkspaceRevision(rawResult);
         return {
           accepted: true,
-          workspaceRevision: settlement.workspaceRevision,
+          ...settlement,
         };
       }
-      await abortable(withToolPermit(
+      const committed = await abortable(withToolPermit(
         execution.userId,
-        () => settleWorkspaceChildTask(authenticated),
+        () => commitTurnWorkspaceMutationWithReceiptV1({
+          userId: execution.userId,
+          executionId: execution.id,
+          workspaceId: execution.workspaceId,
+          expectedRevision,
+          reservation,
+          operationArgs: { ...authenticated, frameId: execution.id, childFrameId: frameId },
+        }, () => settleWorkspaceChildTask(authenticated)),
         signal,
         execution.owner.ledger,
       ), signal);
-      const workspaceRevision = getCurrentWorkspaceRevisionV1(workspaceIdentity());
-      advanceNonCognitionWorkspaceRevision(execution, cognitionRuntime, workspaceRevision);
-      return { accepted: true, workspaceRevision };
+      const workspaceRevision = committed.receipt?.afterWorkspaceRevision ?? expectedRevision;
+      advanceAndProjectNonCognitionRevision(workspaceRevision);
+      const receiptFields = committed.receipt ? {
+        operationKey: committed.receipt.operationKey,
+        operationDigest: committed.receipt.operationDigest,
+        segmentId: committed.receipt.segmentId,
+        logicalDispatch: committed.receipt.logicalDispatch,
+        frameId: committed.receipt.frameId,
+      } : {};
+      return { accepted: true, workspaceRevision, ...receiptFields };
     },
     getPhaseEvaluationSnapshot: async ({ phase: _phase, expectedRevision, signal }) => {
       const expected = expectedRevision ?? execution.workspaceRevision ?? 0;
@@ -2907,24 +4682,37 @@ function makeWorkspace(
           execution.owner.ledger,
         ));
       }
-      const result = await withToolPermit(execution.userId, async () => {
-        if (operation === "create_task") return createWorkspaceTask(raw);
-        if (operation === "update_assigned_progress") return updateWorkspaceTaskProgress(raw);
-        if (operation === "submit_child_result") return submitWorkspaceChildResult(raw);
-        if (operation === "submit_root_result") return submitWorkspaceRootResult(raw);
-        if (operation === "accept_submission") return acceptWorkspaceSubmission(raw);
-        if (operation === "record_finding" || operation === "record_decision" || operation === "record_question") {
-          const kind = operation === "record_finding"
-            ? "finding"
-            : operation === "record_decision"
-              ? "decision"
-              : "question";
-          const { digest: _untrustedDigest, ...recordInput } = raw;
-          return recordWorkspaceRecord({ ...recordInput, kind });
-        }
-        if (operation === "attach_artifact") return attachWorkspaceArtifactReference(raw);
-        return proposeWorkspacePublication(raw);
-      }, toolContext.signal, execution.owner.ledger);
+      const reservation = toolContext.reservation;
+      if (!reservation || reservation.operationKind !== operation || reservation.frameId !== toolContext.frame.frameId) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK workspace mutation reservation is invalid");
+      }
+      const committed = await withToolPermit(execution.userId, () =>
+        commitTurnWorkspaceMutationWithReceiptV1({
+          userId: execution.userId,
+          executionId: execution.id,
+          workspaceId: execution.workspaceId,
+          expectedRevision: execution.workspaceRevision ?? 0,
+          reservation,
+          operationArgs: raw,
+        }, () => {
+          if (operation === "create_task") return createWorkspaceTask(raw);
+          if (operation === "update_assigned_progress") return updateWorkspaceTaskProgress(raw);
+          if (operation === "submit_child_result") return submitWorkspaceChildResult(raw);
+          if (operation === "submit_root_result") return submitWorkspaceRootResult(raw);
+          if (operation === "accept_submission") return acceptWorkspaceSubmission(raw);
+          if (operation === "record_finding" || operation === "record_decision" || operation === "record_question") {
+            const kind = operation === "record_finding"
+              ? "finding"
+              : operation === "record_decision"
+                ? "decision"
+                : "question";
+            const { digest: _untrustedDigest, ...recordInput } = raw;
+            return recordWorkspaceRecord({ ...recordInput, kind });
+          }
+          if (operation === "attach_artifact") return attachWorkspaceArtifactReference(raw);
+          return proposeWorkspacePublication(raw);
+        }), toolContext.signal, execution.owner.ledger);
+      const result = committed.result;
       if (toolContext.signal.aborted) throw toolContext.signal.reason ?? new DOMException("Aborted", "AbortError");
       // Every mutating operation normally commits one workspace CAS revision.
       // Accepting an already-accepted submission is the canonical idempotent
@@ -2942,13 +4730,20 @@ function makeWorkspace(
         gates = getWorkspaceCompletionGatesV1(context(toolContext.frame, {}, execution.workspaceRevision ?? 0));
       }
       const workspaceRevision = gates.workspaceRevision;
-      advanceNonCognitionWorkspaceRevision(execution, cognitionRuntime, workspaceRevision);
+      advanceAndProjectNonCognitionRevision(workspaceRevision);
+      const receiptFields = committed.receipt ? {
+        operationKey: committed.receipt.operationKey,
+        operationDigest: committed.receipt.operationDigest,
+        segmentId: committed.receipt.segmentId,
+        logicalDispatch: committed.receipt.logicalDispatch,
+        frameId: committed.receipt.frameId,
+      } : {};
       const publicResult = isRecord(result)
-        ? { ...result, workspaceRevision }
-        : { result, workspaceRevision };
+        ? { ...result, ...receiptFields, workspaceRevision }
+        : { result, ...receiptFields, workspaceRevision };
       return workspaceEnvelope(publicResult);
     },
-    assignChildTasks: async ({ frame, assignments, expectedRevision, signal }) => {
+    assignChildTasks: async ({ frame, assignments, reservation, expectedRevision, signal }) => {
       if (signal.aborted) throw signal.reason ?? new Error("workspace_assignment_cancelled");
       const rootFrame =
         frame.kind === "root"
@@ -2959,18 +4754,29 @@ function makeWorkspace(
         : undefined;
       if (!rootFrame) throw new Error("workspace_assignment_root_required");
       const expected = expectedRevision ?? execution.workspaceRevision ?? 0;
-      const result = await withToolPermit(
+      const assignmentArgs = context(rootFrame, { assignments }, expected);
+      if (reservation.operationKind !== "assign_child_tasks" || reservation.frameId !== rootFrame.frameId) {
+        throw new AgenticWorkPhaseError("provider_protocol_error", "WORK child assignment reservation is invalid");
+      }
+      const committed = await withToolPermit(
         execution.userId,
-        () => assignWorkspaceChildTasks({
-          ...context(rootFrame, { assignments }, expected),
-        }),
+        () => commitTurnWorkspaceMutationWithReceiptV1({
+          userId: execution.userId,
+          executionId: execution.id,
+          workspaceId: execution.workspaceId,
+          expectedRevision: expected,
+          reservation,
+          operationArgs: { ...assignmentArgs },
+        }, () => assignWorkspaceChildTasks(assignmentArgs)),
         signal,
         execution.owner.ledger,
       );
-      if (result.tasks.length !== assignments.length) {
+      const result = committed.result;
+      const resultTasks = result?.tasks ?? assignments.map((assignment) => ({ id: assignment.taskId, assignedFrameId: assignment.frameId }));
+      if (resultTasks.length !== assignments.length) {
         throw new Error("workspace_assignment_mismatch");
       }
-      const persistedAssignments = result.tasks.map((task, index) => {
+      const persistedAssignments = resultTasks.map((task: { readonly id: string; readonly assignedFrameId?: string | null }, index: number) => {
         const requested = assignments[index];
         if (!requested || task.id !== requested.taskId || task.assignedFrameId !== requested.frameId) {
           throw new Error("workspace_assignment_mismatch");
@@ -2978,11 +4784,20 @@ function makeWorkspace(
         if (!task.assignedFrameId) throw new Error("workspace_assignment_missing_frame");
         return { taskId: task.id, frameId: task.assignedFrameId };
       });
-      advanceNonCognitionWorkspaceRevision(execution, cognitionRuntime, result.workspaceRevision);
+      const workspaceRevision = result?.workspaceRevision ?? committed.receipt?.afterWorkspaceRevision ?? expected;
+      advanceAndProjectNonCognitionRevision(workspaceRevision);
+      const receiptFields = committed.receipt ? {
+        operationKey: committed.receipt.operationKey,
+        operationDigest: committed.receipt.operationDigest,
+        segmentId: committed.receipt.segmentId,
+        logicalDispatch: committed.receipt.logicalDispatch,
+        frameId: committed.receipt.frameId,
+      } : {};
       return {
         accepted: true,
-        workspaceRevision: result.workspaceRevision,
+        workspaceRevision,
         assignments: persistedAssignments,
+        ...receiptFields,
       };
     },
     freezeForCompletion: async ({ frame, expectedRevision, signal, prepareAcceptance }) => {
@@ -3002,7 +4817,7 @@ function makeWorkspace(
           },
         } : undefined,
       ), signal, execution.owner.ledger);
-      advanceWorkspaceRevision(execution, frozen);
+      advanceAndProjectWorkspaceRevision(frozen);
       return {
         ...frozen,
         ...(preparedFixedPoint?.workspaceContextProjection
@@ -3198,9 +5013,8 @@ function installDecisionAuthorities(): void {
       // adapter contract; every other requirement is declared explicitly.
       const streamingReady = capabilities.supportsStreaming === true;
       const toolCallingReady = capabilities.toolCalling === true;
-      const continuationReady =
-        (capabilities.nativeToolContinuation === true && capabilities.toolContinuationMode === "native")
-        || (capabilities.toolCalling === true && capabilities.toolContinuationMode === "legacy");
+      const continuationReady = capabilities.nativeToolContinuation === true
+        && capabilities.toolContinuationMode === "native";
       const finalizationReady = capabilities.toolsDisabledFinalization === true;
       // Provider/configuration readiness is request-local. Startup intentionally
       // does not assert a global provider candidate because roulette and aliases
@@ -3628,9 +5442,10 @@ function recordInspectionPrompts(
     if (!forceEmpty) return false;
     const content = "";
     return writer.record("prompt", {
-      id: "prompt:" + destination + ":empty",
+      id: "prompt:" + lifecycle + ":" + destination + ":empty",
       sourceId: destination + ":empty",
       sourceRevision: 0,
+      promptOrder: 0,
       destination,
       role: "system",
       included: true,
@@ -3646,35 +5461,58 @@ function recordInspectionPrompts(
       segment.kind === "literal" ? segment.text : "[result_slot]",
     ).join("");
     const provenance = message.provenance;
-    const sourceId = provenance?.sourceId ?? destination + ":" + index;
-    const sourceRevision = provenance?.sourceRevision ?? 0;
+    const loomSource = provenance.kind === "cognition" ? provenance.loom?.source : undefined;
+    const sourceId = provenance.kind === "cognition" ? loomSource?.blockId : provenance.sourceId;
+    const sourceRevision = provenance.kind === "cognition" ? loomSource?.blockRevision : provenance.sourceRevision;
+    const promptOrder = provenance.kind === "cognition" ? loomSource?.promptOrder : provenance.sourceIndex;
+    const validSourceRevision = provenance.kind === "cognition"
+      ? typeof sourceRevision === "number" && Number.isSafeInteger(sourceRevision) && sourceRevision >= 0
+      : typeof sourceRevision === "string"
+        ? sourceRevision.length > 0
+        : typeof sourceRevision === "number" && Number.isSafeInteger(sourceRevision) && sourceRevision >= 0;
+    if (typeof sourceId !== "string" || sourceId.length === 0 || !validSourceRevision
+      || typeof promptOrder !== "number" || !Number.isSafeInteger(promptOrder) || promptOrder < 0) continue;
     const role = message.role === "developer" ? "system" : message.role;
-    const nativeProvenance = provenance?.kind === "world_info"
+    const nativeProvenance = provenance.kind === "world_info"
       ? {
         kind: "world_info" as const,
         sourceId: provenance.sourceId,
         sourceRevision: provenance.sourceRevision,
         sourceIndex: provenance.sourceIndex,
       }
-      : provenance?.kind === "databank" && provenance.databank
+      : provenance.kind === "databank" && provenance.databank
         ? {
           kind: "databank" as const,
           sourceRevision: provenance.sourceRevision,
           sources: provenance.databank.sources,
         }
         : null;
-    writer.record("prompt", {
-      id: "prompt:" + destination + ":" + index,
+    const contentDigest = createHash("sha256").update(content).digest("hex");
+    const evidence = {
       sourceId,
       sourceRevision,
+      promptOrder,
       destination,
       role,
       included: true,
       content,
-      contentDigest: createHash("sha256").update(content).digest("hex"),
+      contentDigest,
       omissionReason: null,
       nativeProvenance,
       loomInspection: loomInspection ?? null,
+    } as const;
+    const identityDigest = createHash("sha256").update(encodeCanonicalPlainData({
+      version: 1,
+      lifecycle,
+      sourceKind: provenance.kind,
+      loomEntryId: provenance.kind === "cognition" ? provenance.loom?.entryId ?? null : null,
+      loomBucket: provenance.kind === "cognition" ? provenance.loom?.bucket ?? null : null,
+      localIndex: index,
+      evidence,
+    }), "utf8").digest("hex");
+    writer.record("prompt", {
+      id: "prompt:" + lifecycle + ":" + destination + ":" + identityDigest,
+      ...evidence,
     }, { lifecycle, status: lifecycle === "PREPARE_COMMIT" ? "waiting" : "running" });
   }
   return true;
@@ -3707,6 +5545,7 @@ function recordRenderCrossings(
       id: "prompt:render-crossing:" + generationId + ":" + record.kind + ":" + record.id,
       sourceId: record.id,
       sourceRevision: record.sourceRevision,
+      promptOrder: 0,
       destination: "render",
       role: "system",
       included: true,
@@ -3735,6 +5574,7 @@ function recordRenderCrossings(
     id: "prompt:render-crossing:" + generationId + ":completion_guidance",
     sourceId,
     sourceRevision: 0,
+    promptOrder: 0,
     destination: "render",
     role: "system",
     included: true,
@@ -4066,10 +5906,17 @@ function preservedDecisionRefreshCode(errorCode: unknown): "decision_refresh_req
 }
 
 
+interface WorkLeaseDependenciesV1 {
+  readonly timeoutScheduler?: AgentTimeoutScheduler;
+  readonly onPreSegmentHeartbeatRegistrySize?: (size: number) => void;
+}
 
-function buildDependencies(): AgenticGenerationDependencies {
+function buildDependencies(workLeaseDependencies: WorkLeaseDependenciesV1 = {}): CoordinatorGenerationDependenciesV1 {
   const cognitionRuntimes = new Map<string, AgentCognitionRuntimeV1>();
   const snapshots = new Map<string, RuntimeSnapshot>();
+  const recoveredWorkChains = new Map<string, WorkSegmentRecoveryChainV1>();
+  const preSegmentOwnerHeartbeats = new Map<string, SerializedLeaseHeartbeatV1>();
+  let executeCoordinatorWorkV1!: NonNullable<AgenticGenerationDependencies["runWork"]>;
   const mediaMaterializers = new Map<string, NativeMediaProjectionResultV1["materialize"]>();
   const plans = new Map<string, RuntimePlan>();
   const renders = new Map<string, { content: string }>();
@@ -4122,6 +5969,9 @@ function buildDependencies(): AgenticGenerationDependencies {
       });
       const attemptId = input.attemptLineage?.attemptId ?? input.generationId;
       const committedAt = Date.now();
+      const commitHostSequence = (db.query(
+        "SELECT COALESCE(MAX(host_sequence), 0) AS max_sequence FROM agent_run_audit_records WHERE user_id = ? AND attempt_id = ?",
+      ).get(input.userId, attemptId) as { max_sequence: number }).max_sequence + 1;
       const commitRecorded = persistAgentRunInspectionInTransaction(db, {
         userId: input.userId,
         chatId: input.chatId,
@@ -4129,7 +5979,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         ...(input.attemptLineage?.previousAttemptId !== undefined
           ? { previousAttemptId: input.attemptLineage.previousAttemptId }
           : {}),
-        runId: input.turnId,
+        runId: input.generationId,
         turnSessionId: input.turnId,
         generationId: input.generationId,
         generationType: input.generationType,
@@ -4149,6 +5999,12 @@ function buildDependencies(): AgenticGenerationDependencies {
           actor: "host",
           recipient: "owner",
           occurredAt: committedAt,
+          hostSequence: commitHostSequence,
+          durationMs: null,
+          late: false,
+          content: null,
+          arguments: null,
+          provider: null,
           result: JSON.stringify({
             phase: "COMMIT",
             workPhase: "COMMIT",
@@ -4198,6 +6054,7 @@ function buildDependencies(): AgenticGenerationDependencies {
   const stopRegistrations = new Map<string, () => void>();
   const rootSignals = new Map<string, AbortSignal>();
   const rootDeadlines = new Map<string, number>();
+  const rootDeadlineControllers = new Map<string, AbortController>();
   const deadlineDisposers = new Map<string, () => void>();
   const childJoins = new Map<string, Set<Promise<void>>>();
   const trackChild = <T>(executionId: string, run: () => Promise<T>): Promise<T> => {
@@ -4362,6 +6219,97 @@ function buildDependencies(): AgenticGenerationDependencies {
     return mapDecision(result.decision);
   };
   return {
+    restoreRecoveredRuntime: async (value) => {
+      const { execution, snapshot, plan, rootConnection, binding, session, persistentWorkspaceId, persistentWorkspaceRevision, workspaceCapabilities, materializeMedia, abortController, disposeDeadline } = value;
+      const id = execution.id;
+      if (runtimeOwners.has(id) || snapshots.has(id) || bindings.has(id)) throw new Error("restart_resume_runtime_already_registered");
+      const writer = createAgentInspectionWriter({
+        userId: execution.userId,
+        chatId: execution.chatId,
+        attemptId: execution.attemptLineage.attemptId,
+        ...(execution.attemptLineage.previousAttemptId !== null ? { previousAttemptId: execution.attemptLineage.previousAttemptId } : {}),
+        runId: id,
+        turnSessionId: id,
+        generationId: id,
+        generationType: execution.attemptLineage.target.generationType,
+        targetMessageId: execution.attemptLineage.target.messageId,
+        targetSwipeId: execution.attemptLineage.target.swipeId,
+        hostCorrelationId: "agentic:" + id + ":" + execution.attemptLineage.attemptId,
+        startedAt: execution.attemptLineage.createdAt,
+      });
+      writer.record("condition", {
+        id: "restart:resume:" + id,
+        kind: "condition",
+        actor: "host",
+        recipient: "agent",
+        result: JSON.stringify({ recovery: "admitted_segment", workspaceRevision: execution.workspaceRevision }),
+      }, { lifecycle: "WORK", status: "running" });
+      persistentAssociations.set(id, {
+        authority: createPersistentWorkspaceHostAuthority(),
+        workspaceId: persistentWorkspaceId,
+        workspaceRevision: persistentWorkspaceRevision,
+        session,
+      });
+      snapshots.set(id, snapshot);
+      mediaMaterializers.set(id, materializeMedia);
+      plans.set(id, plan);
+      caps.set(id, workspaceCapabilities);
+      bindings.set(id, binding);
+      inspectionWriters.set(id, writer);
+      runtimeOwners.set(id, execution.owner);
+      rootSignals.set(id, abortController.signal);
+      rootDeadlines.set(id, execution.deadlineAt);
+      rootDeadlineControllers.set(id, abortController);
+      deadlineDisposers.set(id, disposeDeadline);
+      const cognitionRuntime = createCognitionRuntimeForTurn(execution, snapshot, plan, workspaceCapabilities);
+      if (cognitionRuntime) {
+        cognitionRuntimes.set(id, cognitionRuntime);
+      }
+      pool.createPoolEntry({
+        generationId: id,
+        userId: execution.userId,
+        chatId: execution.chatId,
+        generationType: binding.target,
+        characterName: "",
+        model: rootConnection.model,
+        provider: rootConnection.provider,
+        ...(binding.messageId ? { targetMessageId: binding.messageId } : {}),
+        ...(binding.swipeId !== null ? { targetSwipeId: binding.swipeId } : {}),
+      });
+      pool.registerPoolTerminalOwner(id, {
+        tryTerminate: (reason) => {
+          const durable = getTurnExecution(id, execution.userId);
+          if (!durable) return false;
+          return reason === "completed" ? durable.phase === "COMMITTED"
+            : reason === "stopped" ? durable.phase === "CANCELLED"
+              : reason === "timeout" ? durable.phase === "TIMED_OUT"
+                : durable.phase === "FAILED" || durable.phase === "EXHAUSTED" || durable.phase === "COMMIT_FAILED";
+        },
+        projectTerminal: (projection) => pool.projectPoolTerminal(id, projection),
+      });
+      const unregisterStop = registerAgentRunStopHandler(execution.userId, execution.chatId, id, () => {
+        try {
+          const outcome = requestTurnCancellation({ executionId: id, ownerToken: execution.ownerToken!, reason: "stopped" });
+          if (outcome.code === "too_late") return "too_late";
+          if (outcome.code === "already_terminal") return "terminal";
+          const inspectionReason = outcome.code === "timed_out" ? "deadline" : "user_stop";
+          inspectionWriters.get(id)?.record("stop", {
+            id: `stop:user:${id}`,
+            state: "accepted",
+            reason: inspectionReason,
+            requestedAt: Date.now(),
+            correlation: { actorId: "owner", recipientId: "host" },
+          }, { status: "cancelling", reason: inspectionReason });
+          abortController.abort(outcome.code === "timed_out"
+            ? new DOMException("Agentic root deadline", "TimeoutError")
+            : new DOMException("Agentic generation stopped", "AbortError"));
+          return "accepted";
+        } catch {
+          return "too_late";
+        }
+      });
+      stopRegistrations.set(id, unregisterStop);
+    },
     requestCancellation: (execution, reason) => {
       if (!execution.ownerToken) return false;
       const result = requestTurnCancellation({
@@ -4370,6 +6318,11 @@ function buildDependencies(): AgenticGenerationDependencies {
         reason: reason ?? "cancelled",
       });
       if (result.code === "too_late") return "too_late";
+      if (result.code === "timed_out") {
+        rootDeadlineControllers.get(execution.id)?.abort(
+          new DOMException("Agentic root deadline", "TimeoutError"),
+        );
+      }
       return result.code === "cancelled" || result.code === "timed_out";
     },
     cancelAndJoinChildren: (execution) => joinChildren(execution.id),
@@ -4416,28 +6369,32 @@ function buildDependencies(): AgenticGenerationDependencies {
       let executionOwnerToken: string | undefined;
       const deadlineTimer = setTimeout(
         () => {
-          // A deadline is a durable terminal decision too. CAS the live owner
-          // before aborting the signal consumed by provider/child work.
+          let acceptedCause: "cancelled" | "timed_out" = "timed_out";
+          // Persist the deadline request while retaining immutable WORK
+          // authority; the segmented runner closes before terminalization.
           if (executionOwnerToken) {
             try {
-              requestTurnCancellation({
+              const request = requestTurnCancellation({
                 executionId: value.executionId,
                 ownerToken: executionOwnerToken,
                 reason: "timed_out",
               });
+              if (request.code === "cancelled") acceptedCause = "cancelled";
             } catch {
-              // The terminal transition/recovery owner will reconcile a row
-              // that disappeared between the timer and this CAS.
+              // A terminal/recovery owner will reconcile a row that changed
+              // between the timer and this owner-scoped request.
             }
           }
           inspectionWriters.get(value.executionId)?.record("stop", {
             id: `stop:deadline:${value.executionId}`,
             state: "accepted",
-            reason: "deadline",
+            reason: acceptedCause === "timed_out" ? "deadline" : "user_stop",
             requestedAt: Date.now(),
             correlation: { actorId: "host", recipientId: "agent" },
-          }, { status: "cancelling", reason: "deadline" });
-          deadlineController.abort(new DOMException("Agentic root deadline", "TimeoutError"));
+          }, { status: "cancelling", reason: acceptedCause === "timed_out" ? "deadline" : "user_stop" });
+          deadlineController.abort(acceptedCause === "timed_out"
+            ? new DOMException("Agentic root deadline", "TimeoutError")
+            : new DOMException("Agentic generation stopped", "AbortError"));
         },
         Math.max(0, deadlineAt - now),
       );
@@ -4447,6 +6404,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       };
       rootSignals.set(value.executionId, rootSignal);
       rootDeadlines.set(value.executionId, deadlineAt);
+      rootDeadlineControllers.set(value.executionId, deadlineController);
       deadlineDisposers.set(value.executionId, disposeDeadline);
       let owner: AgentRuntimeOwner | undefined;
       let credentialCarrier: Map<string, string> | undefined;
@@ -4666,26 +6624,24 @@ function buildDependencies(): AgenticGenerationDependencies {
           },
           value.userId,
         );
-        const frozenConnections = [
-          root,
-          ...Object.values(decision.internal.childConnections),
-        ].filter((connection): connection is FrozenConcreteConnectionV1 => connection !== null);
-        const admittedConnections = new Map(
+        const completeRoot = requireCompleteFrozenConnection(root, "ASSEMBLE", "root");
+        const frozenConnections: CompleteFrozenConnectionV1[] = [completeRoot];
+        for (const childConnection of Object.values(decision.internal.childConnections)) {
+          if (childConnection) frozenConnections.push(requireCompleteFrozenConnection(childConnection, "ASSEMBLE", "child"));
+        }
+        const admittedConnections = new Map<string, CompleteFrozenConnectionV1>(
           frozenConnections.map((candidate) => [connectionIdentity(candidate), candidate] as const),
         );
         credentialCarrier = await freezeConnectionCredentials(value.userId, frozenConnections);
         const carrier = credentialCarrier;
         if (!carrier) throw new AgenticGenerationError("decision_refresh_required", "Frozen provider credentials are unavailable.", { phase: "ASSEMBLE", retryable: true });
-        const rootConnection = root ? requireRenderConnection(root) : null;
-        if (!rootConnection) throw new AgenticGenerationError(
-          "agentic_provider_failure",
-          "Agentic root connection is unavailable.",
-          { phase: "ASSEMBLE" },
+        const rootConnection = requireRenderConnection(completeRoot);
+        const normalizedRootConnection = requireCompleteFrozenConnection(
+          normalizeConcreteConnection(rootConnection),
+          "WORK",
+          "root",
         );
-        const normalizedRootConnection = normalizeConcreteConnection(rootConnection);
-        if (normalizedRootConnection && root) {
-          admittedConnections.set(connectionIdentity(normalizedRootConnection), root);
-        }
+        admittedConnections.set(connectionIdentity(normalizedRootConnection), normalizedRootConnection);
         let runtimeOwner: AgentRuntimeOwner;
         runtimeOwner = new AgentRuntimeOwner({
           generationId: value.executionId,
@@ -4710,15 +6666,15 @@ function buildDependencies(): AgenticGenerationDependencies {
                 { phase: "WORK", retryable: true },
               );
             }
-            if (frozen.capabilities.toolContinuationMode !== "native" && frozen.capabilities.toolContinuationMode !== "legacy") {
-              throw new AgenticGenerationError("agentic_provider_failure", "Provider tool continuation is unsupported.", { phase: "WORK" });
+            if (!hasNativeAgenticWorkContinuationV1(frozen)) {
+              throw new AgenticGenerationError("agentic_provider_failure", "Agentic WORK requires native provider tool continuation.", { phase: "WORK" });
             }
             const credential = carrier.get(connectionIdentity(frozen));
             if (credential === undefined) throw new AgenticGenerationError("decision_refresh_required", "Frozen provider credential is unavailable.", { phase: "WORK", retryable: true });
             const stream = await providerStream(value.userId, frozen, {
               messages: [...request.messages],
               model: frozen.model ?? "",
-              parameters: { max_tokens: request.maxOutputTokens },
+              parameters: workProviderGenerationParametersV1(undefined, request.maxOutputTokens),
               tools: [...(request.tools ?? [])],
               stream: true,
               signal: request.signal,
@@ -4796,17 +6752,21 @@ function buildDependencies(): AgenticGenerationDependencies {
               });
               if (outcome.code === "too_late") return "too_late";
               if (outcome.code === "already_terminal") return "terminal";
+              const inspectionReason = outcome.code === "timed_out" ? "deadline" : "user_stop";
               inspectionWriters.get(value.executionId)?.record("stop", {
                 id: `stop:user:${value.executionId}`,
                 state: "accepted",
-                reason: "user_stop",
+                reason: inspectionReason,
                 requestedAt: Date.now(),
                 correlation: { actorId: "owner", recipientId: "host" },
-              }, { status: "cancelling", reason: "user_stop" });
-              // The durable CAS above wins the reversible phase gate. Abort
-              // the live controller only after that CAS so provider/tool
-              // streams observe the same terminal decision and cannot later
-              // publish a stale failure or commit.
+              }, { status: "cancelling", reason: inspectionReason });
+              // The durable request above wins the reversible phase gate. A
+              // Stop accepted at/after the deadline first publishes timeout
+              // onto the root signal, so the later generic abort cannot replace
+              // the authoritative TIMED_OUT cause.
+              if (outcome.code === "timed_out" && !deadlineController.signal.aborted) {
+                deadlineController.abort(new DOMException("Agentic root deadline", "TimeoutError"));
+              }
               abortAcceptedAgenticGeneration(value.userId, value.executionId);
               return "accepted";
             } catch {
@@ -4896,7 +6856,6 @@ function buildDependencies(): AgenticGenerationDependencies {
                   expectedPhase: current.phase,
                   nextPhase,
                   reason: errorCode,
-                  ignoreCancellation: true,
                 });
               }
             }
@@ -4916,54 +6875,51 @@ function buildDependencies(): AgenticGenerationDependencies {
     },
     transitionExecution: (execution, expected, next, terminalReason) => {
       if (!execution.ownerToken || expected === next) return execution;
-      const result = transitionTurnExecution({
+      const persistentTarget = (() => {
+        switch (next) {
+          case "ASSEMBLE":
+          case "WORK":
+          case "RENDER":
+            return { phase: next, status: "running" as const };
+          case "COMPLETE":
+            return { phase: "PREPARE_COMMIT" as const, status: "waiting" as const };
+          case "PREPARE_COMMIT":
+            return { phase: "COMMIT" as const, status: "waiting" as const };
+          case "COMMITTING":
+            return { phase: "COMMIT" as const, status: "running" as const };
+          default:
+            return null;
+        }
+      })();
+      let committedSession: PersistentWorkspaceTurnSession | null = null;
+      const transition = (db?: Database) => transitionTurnExecution({
         executionId: execution.id,
-        ownerToken: execution.ownerToken,
+        ownerToken: execution.ownerToken!,
         expectedPhase: expected,
         nextPhase: next,
         ...(terminalReason ? { reason: terminalReason } : {}),
+        ...(db ? { db } : {}),
       });
-      if (result.execution.phase === next) {
-        try {
-          switch (next) {
-            case "ASSEMBLE":
-            case "WORK":
-            case "RENDER":
-              syncPersistentSession(execution.id, next, "running");
-              break;
-            case "COMPLETE":
-              syncPersistentSession(execution.id, "PREPARE_COMMIT", "waiting");
-              break;
-            case "PREPARE_COMMIT":
-              syncPersistentSession(execution.id, "COMMIT", "waiting");
-              break;
-            case "COMMITTING":
-              syncPersistentSession(execution.id, "COMMIT", "running");
-              break;
-            // Terminal publication owns the single immutable session boundary.
-            case "COMMITTED":
-              break;
-            case "CANCELLED":
-              break;
-            case "TIMED_OUT":
-              break;
-            case "EXHAUSTED":
-              break;
-            case "FAILED":
-            case "COMMIT_FAILED":
-              break;
-            default:
-              break;
+      const association = persistentAssociations.get(execution.id);
+      const result = association && persistentTarget
+        ? withAgentRunProjectionTransaction((db) => {
+          const transitioned = transition(db);
+          if (transitioned.execution.phase === next) {
+            committedSession = syncPersistentSession(
+              execution.id,
+              persistentTarget.phase,
+              persistentTarget.status,
+              undefined,
+              db,
+            );
           }
-        } catch (error) {
-          // The execution CAS already advanced. Do not retry it with the
-          // stale expected phase or let the caller publish a false rollback.
-          throw new AgenticGenerationError(
-            "agentic_commit_failed",
-            "Durable execution advanced but host session reconciliation failed.",
-            { phase: result.execution.phase as AgenticPhase, retryable: true, cause: error },
-          );
-        }
+          return transitioned;
+        })
+        : transition();
+      if (association && committedSession && persistentAssociations.get(execution.id) === association) {
+        association.session = committedSession;
+      }
+      if (result.execution.phase === next) {
         return { ...execution, phase: result.execution.phase as AgenticPhase };
       }
       const phase = result.execution.phase;
@@ -5053,6 +7009,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           id: "prompt:root:user_input",
           sourceId: "turn_input",
           sourceRevision: 0,
+          promptOrder: 0,
           destination: "root_work",
           role: "user",
           included: true,
@@ -5096,14 +7053,51 @@ function buildDependencies(): AgenticGenerationDependencies {
       }, { lifecycle: "ASSEMBLE", status: "running" });
       return plan;
     },
-    runWork: async ({ execution, input, decision, snapshot, plan, signal }) => {
+    restoreRecoveredWorkCompletion: async (request, recovery) => {
+      const { execution } = request;
+      const outcome = recovery.outcome;
+      if (!outcome.renderHandoff || outcome.status !== "completed") {
+        throw new Error("restart_resume_completion_handoff_invalid");
+      }
+      works.set(execution.id, outcome);
+      workUsages.set(execution.id, recovery.usage);
+      renderFrames.set(execution.id, Object.freeze({ handoff: outcome.renderHandoff }));
+      return {
+        status: "completed",
+        workspaceRevision: outcome.workspaceRevision,
+        summary: outcome.completion?.summary,
+        renderGuidance: outcome.completion?.renderGuidance,
+        workspace: { revision: outcome.workspaceRevision },
+        acceptedWorkspace: {
+          revision: outcome.renderHandoff.workspaceRevision,
+          workspaceContextProjection: outcome.renderHandoff.workspaceContextProjection,
+        },
+        usage: {
+          toolCalls: recovery.usage.toolCalls,
+          childInvocations: recovery.usage.childInvocations,
+        },
+        observations: [],
+        ...(outcome.completion?.unresolvedIds ? { unresolvedIds: outcome.completion.unresolvedIds } : {}),
+      };
+    },
+    resumeRecoveredWork: async (request, recovery) => {
+      if (recoveredWorkChains.has(request.execution.id)) throw new Error("restart_resume_work_already_registered");
+      recoveredWorkChains.set(request.execution.id, recovery);
+      try {
+        return await executeCoordinatorWorkV1(request);
+      } finally {
+        recoveredWorkChains.delete(request.execution.id);
+      }
+    },
+    runWork: executeCoordinatorWorkV1 = async ({ execution, input, decision, snapshot, plan, signal }) => {
       const runtimeExecution = requireRuntimeExecution(execution);
       const internal = internalDecision(decision).internal;
       const frozenRoot = internal.rootConnection;
       const runtimeSnapshot = snapshot;
       if (!frozenRoot) return { status: "failed", errorCode: "agentic_provider_failure" };
       const root = requireCompleteFrozenConnection(frozenRoot, "WORK", "root");
-      const phaseSignal = runtimeExecution.signal ?? signal;
+      const preSegmentLeaseController = new AbortController();
+      const phaseSignal = AbortSignal.any([runtimeExecution.signal ?? signal, preSegmentLeaseController.signal]);
       const workspaceCapabilities = caps.get(execution.id);
       if (!workspaceCapabilities) {
         throw new AgenticGenerationError("agentic_runtime_unavailable", "Workspace capabilities were not admitted.", { phase: "WORK" });
@@ -5117,6 +7111,114 @@ function buildDependencies(): AgenticGenerationDependencies {
         );
       }
       refreshPersistentAssociation(persistentAssociation);
+      const immutableWorkOwnerToken = runtimeExecution.ownerToken;
+      const immutableWorkOwner = getTurnExecution(execution.id, input.userId);
+      if (!immutableWorkOwnerToken || !immutableWorkOwner || immutableWorkOwner.phase !== "WORK"
+        || immutableWorkOwner.casOwner !== immutableWorkOwnerToken) {
+        throw new AgenticWorkPhaseError("recovery_unavailable", "WORK entry lacks immutable owner authority");
+      }
+      const immutableWorkCasRevision = immutableWorkOwner.casRevision;
+      const immutableWorkRuntimeEpoch = immutableWorkOwner.runtimeEpoch;
+      const preSegmentCancellationError = (durable: TurnExecutionRecord): DOMException | null => {
+        if (durable.phase !== "WORK" || durable.casOwner !== immutableWorkOwnerToken
+          || durable.runtimeEpoch !== immutableWorkRuntimeEpoch
+          || durable.casRevision < immutableWorkCasRevision) return null;
+        if (durable.cancelRequested && durable.cancelRequestedAt !== null) {
+          const cause = cancellationTerminalCause(durable.cancelRequestedAt, durable.deadlineAt);
+          return new DOMException(
+            cause.phase === "TIMED_OUT" ? "Agentic root deadline" : "WORK task mutation cancelled",
+            cause.phase === "TIMED_OUT" ? "TimeoutError" : "AbortError",
+          );
+        }
+        return Date.now() >= durable.deadlineAt
+          ? new DOMException("Agentic root deadline", "TimeoutError")
+          : null;
+      };
+      const preSegmentClosureErrorAfterStaleOwner = (durable: TurnExecutionRecord): DOMException | null => {
+        if (durable.runtimeEpoch !== immutableWorkRuntimeEpoch
+          || durable.casRevision < immutableWorkCasRevision) return null;
+        const immutableOwnerStillActive = durable.phase === "WORK"
+          && durable.casOwner === immutableWorkOwnerToken;
+        const immutableOwnerAlreadyClosed = durable.phase === "CANCELLED" || durable.phase === "TIMED_OUT";
+        if (!immutableOwnerStillActive && !immutableOwnerAlreadyClosed) return null;
+        if (durable.cancelRequestedAt !== null) {
+          const cause = cancellationTerminalCause(durable.cancelRequestedAt, durable.deadlineAt);
+          return new DOMException(
+            cause.phase === "TIMED_OUT" ? "Agentic root deadline" : "WORK task mutation cancelled",
+            cause.phase === "TIMED_OUT" ? "TimeoutError" : "AbortError",
+          );
+        }
+        return Date.now() >= durable.deadlineAt
+          ? new DOMException("Agentic root deadline", "TimeoutError")
+          : null;
+      };
+      const renewPreSegmentOwnerLease = (): void => {
+        const durable = getTurnExecution(execution.id, input.userId);
+        if (durable) {
+          const cancellationError = preSegmentCancellationError(durable);
+          if (cancellationError) throw cancellationError;
+        }
+        if (!durable || durable.phase !== "WORK" || durable.casOwner !== immutableWorkOwnerToken
+          || durable.casRevision !== immutableWorkCasRevision
+          || durable.runtimeEpoch !== immutableWorkRuntimeEpoch) {
+          throw new AgenticWorkPhaseError("recovery_unavailable", "Pre-segment heartbeat lost immutable WORK owner authority");
+        }
+        const now = Date.now();
+        try {
+          renewWorkExecutionOwnerLeaseV1({
+            userId: input.userId,
+            executionId: execution.id,
+            ownerToken: immutableWorkOwnerToken,
+            expectedExecutionCasRevision: immutableWorkCasRevision,
+            expectedWorkspaceRevision: runtimeExecution.workspaceRevision ?? durable.workspaceRevision,
+            now,
+            runtimeEpoch: immutableWorkRuntimeEpoch,
+            leaseExpiresAt: Math.min(runtimeExecution.deadlineAt, now + 300_000),
+          });
+        } catch (error) {
+          if (!isRecord(error) || error.code !== "stale_owner") throw error;
+          const latest = getTurnExecution(execution.id, input.userId);
+          const closureError = latest ? preSegmentClosureErrorAfterStaleOwner(latest) : null;
+          if (closureError) throw closureError;
+          throw error;
+        }
+      };
+      const assertPreSegmentTaskMutationAuthority = (): void => {
+        const durable = getTurnExecution(execution.id, input.userId);
+        if (durable) {
+          const cancellationError = preSegmentCancellationError(durable);
+          if (cancellationError) throw cancellationError;
+        }
+        if (!durable || durable.phase !== "WORK" || durable.casOwner !== immutableWorkOwnerToken
+          || durable.casRevision !== immutableWorkCasRevision
+          || durable.runtimeEpoch !== immutableWorkRuntimeEpoch) {
+          throw new AgenticWorkPhaseError("recovery_unavailable", "Pre-segment task mutation lost immutable WORK authority");
+        }
+        if (phaseSignal.aborted) {
+          throw phaseSignal.reason ?? new DOMException("WORK task mutation cancelled", "AbortError");
+        }
+      };
+      const preSegmentOwnerHeartbeat = startSerializedLeaseHeartbeatV1(
+        renewPreSegmentOwnerLease,
+        (error) => {
+          preSegmentLeaseController.abort(error);
+        },
+        workLeaseDependencies.timeoutScheduler,
+      );
+      const heartbeatOwnership = await createPreSegmentHeartbeatOwnershipV1(
+        preSegmentOwnerHeartbeats,
+        execution.id,
+        preSegmentOwnerHeartbeat,
+        workLeaseDependencies.onPreSegmentHeartbeatRegistrySize,
+      );
+      return heartbeatOwnership.run(async () => {
+      assertPreSegmentTaskMutationAuthority();
+      const recoveredWork = recoveredWorkChains.get(execution.id);
+      let cognitionRuntime = cognitionRuntimes.get(execution.id);
+      let workActivation: CognitionRuntimeActivationV1 | undefined;
+      let cortexContext: CortexSidecarAcceptedV1 | undefined;
+      let workAttemptId = runtimeExecution.attemptLineage.attemptId;
+      if (!recoveredWork) {
       for (const child of plan.children) {
         if (!child.required) continue;
         const currentWorkspace = getPersistentWorkspaceById({
@@ -5124,6 +7226,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           workspaceId: persistentAssociation.workspaceId,
         });
         persistentAssociation.workspaceRevision = currentWorkspace.revision;
+        assertPreSegmentTaskMutationAuthority();
         createPersistentWorkspaceHostTask(persistentAssociation.authority, {
           userId: persistentAssociation.session.userId,
           chatId: runtimeExecution.chatId,
@@ -5142,8 +7245,10 @@ function buildDependencies(): AgenticGenerationDependencies {
           workspaceId: persistentAssociation.workspaceId,
         }).revision;
       }
+      assertPreSegmentTaskMutationAuthority();
       refreshPersistentAssociation(persistentAssociation);
-      const cognitionRuntime = await withToolPermit(
+      renewPreSegmentOwnerLease();
+      cognitionRuntime = await withToolPermit(
         input.userId,
         () => createCognitionRuntimeForTurn(
           runtimeExecution,
@@ -5155,13 +7260,14 @@ function buildDependencies(): AgenticGenerationDependencies {
         runtimeExecution.owner.ledger,
       );
       if (cognitionRuntime) cognitionRuntimes.set(execution.id, cognitionRuntime);
-      let workActivation: CognitionRuntimeActivationV1 | undefined;
+      workActivation = undefined;
       if (cognitionRuntime) {
         runtimeExecution.workspaceRevision = cognitionRuntime.initialActivation.workspaceRevision;
         workActivation = await enterCognitionPhase(runtimeExecution, cognitionRuntime, "WORK", workspaceCapabilities, phaseSignal);
       }
       const cortexInspectionWriter = inspectionWriters.get(execution.id);
       const cortexAdmissionInput = cortexAuthorizedSnapshotForWork(runtimeExecution, runtimeSnapshot, cognitionRuntime);
+      workAttemptId = cortexAdmissionInput.attemptId;
       const cortexCorrelation = {
         turnSessionId: execution.id,
         runId: execution.id,
@@ -5191,7 +7297,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         correlation: cortexCorrelation,
         signal: phaseSignal,
       });
-      let cortexContext: CortexSidecarAcceptedV1 | undefined;
+      cortexContext = undefined;
       try {
         const cortexResult = await cortexAdmission.read({
           ownerId: runtimeSnapshot.userId,
@@ -5214,6 +7320,12 @@ function buildDependencies(): AgenticGenerationDependencies {
           throw mapCortexRequiredError(error);
         }
         throw error;
+      }
+      } else {
+        const recoveredSegment = activeRecoveredSegmentV1(recoveredWork);
+        if (!recoveredSegment) throw new Error("restart_resume_active_segment_missing");
+        runtimeExecution.workspaceRevision = recoveredWork.recovery.workspaceRevision;
+        refreshPersistentAssociation(persistentAssociation);
       }
       const config = frozenConfig(runtimeSnapshot.agentConfig);
       const available = new Set(runtimeSnapshot.availability.toolIds.filter(
@@ -5294,9 +7406,11 @@ function buildDependencies(): AgenticGenerationDependencies {
         workspaceCapabilities,
         runtimeSnapshot.limits.maxInputBytes,
         cognitionRuntime,
+        renewPreSegmentOwnerLease,
       );
       const { parameters: effectiveParameters, maxOutputTokens: rootOutputTokenLimit } =
         effectiveRootGenerationParameters(runtimeSnapshot, input);
+      const workDispatchOutputTokens = Math.min(rootOutputTokenLimit, hostLimits.workDispatchOutputTokens);
       const councilProfile = internal.councilProfile;
       const councilSettings = councilProfile?.council_settings;
       const councilAdmission: WorkCouncilAdmission | undefined =
@@ -5325,7 +7439,7 @@ function buildDependencies(): AgenticGenerationDependencies {
             correlation: {
               turnSessionId: execution.id,
               runId: execution.id,
-              attemptId: cortexAdmissionInput.attemptId,
+              attemptId: workAttemptId,
               chatId: runtimeSnapshot.chatId,
               generationId: runtimeSnapshot.generationId,
               messageId: runtimeSnapshot.target.messageId ?? null,
@@ -5336,7 +7450,7 @@ function buildDependencies(): AgenticGenerationDependencies {
               taskId: null,
               toolId: null,
               parentId: null,
-              hostCorrelationId: "agentic:" + execution.id + ":" + cortexAdmissionInput.attemptId + ":council:WORK",
+              hostCorrelationId: "agentic:" + execution.id + ":" + workAttemptId + ":council:WORK",
               hostSequence: 0,
             },
           }
@@ -5359,13 +7473,112 @@ function buildDependencies(): AgenticGenerationDependencies {
         runtimeSnapshot.limits,
         plan.loomPolicy.workspaceUsage.length,
       );
+      const resumeBinding = bindings.get(execution.id);
+      if (!resumeBinding) throw new Error("agentic_target_binding_missing");
       recordInspectionPrompts(inspectionWriters.get(execution.id), effectiveWorkPolicyMessages, "root_work", "WORK", workActivation?.policySurface?.promptInspection);
       recordInspectionPrompts(inspectionWriters.get(execution.id), effectiveWorkspaceUsageMessages, "root_work", "WORK", workActivation?.policySurface?.promptInspection);
-      const seenPublicActivityNodeIds = new Set<string>();
+      const maxWorkToolCalls = Math.min(config.maxToolCalls ?? hostLimits.aggregateToolCalls, hostLimits.aggregateToolCalls);
+      // A fresh attempt may advance the turn workspace before its first Segment.
+      // A recovered attempt already owns an admitted Segment under the recovery
+      // claim; renewing through the pre-segment path would re-validate stale
+      // pre-crash workspace authority before the Segment lifecycle can resume.
+      if (!recoveredWork) renewPreSegmentOwnerLease();
+      const publicActivityNodeIdsByCallId = new Map<string, string[]>();
+      const workSegmentLifecycle = createProductionWorkSegmentLifecycleV1({
+        userId: input.userId,
+        execution: runtimeExecution,
+        attemptId: workAttemptId,
+        workspaceId: runtimeExecution.workspaceId,
+        publicActivityNodeIdsByCallId,
+        ...(recoveredWork ? { recovery: recoveredWork } : {}),
+        snapshot: runtimeSnapshot,
+        plan,
+        createResumeEnvelope: () => createWorkResumeEnvelopeV1({
+          snapshot: runtimeSnapshot,
+          plan,
+          root,
+          childConnections: profileConnections,
+          generationInput: input,
+          decision: internalDecision(decision),
+          liveTargetBinding: resumeBinding,
+          config,
+          generationParameters: effectiveParameters,
+          execution: runtimeExecution,
+          workspaceId: runtimeExecution.workspaceId,
+          workspaceRevision: runtimeExecution.workspaceRevision ?? 0,
+          hostLimits,
+        }),
+        requiredToolModeAvailable: root.capabilities.requiredToolChoice === true,
+        maxOutputTokensPerDispatch: workDispatchOutputTokens,
+        maxAttemptOutputTokens: hostLimits.workAttemptOutputTokens,
+        maxAttemptProviderDispatches: hostLimits.workAttemptProviderDispatches,
+        maxAttemptUnsignedBoundaries: hostLimits.workAttemptUnsignedBoundaries,
+        maxAttemptToolCalls: hostLimits.workAttemptToolCalls,
+        maxAttemptWorkspaceOperations: hostLimits.workAttemptWorkspaceOperations,
+        maxSegmentOutputTokens: hostLimits.workSegmentOutputTokens,
+        maxSegmentProviderDispatches: hostLimits.workSegmentProviderDispatches,
+        maxSegmentUnsignedBoundaries: hostLimits.workSegmentUnsignedBoundaries,
+        maxSegmentToolCalls: hostLimits.workSegmentToolCalls,
+        maxSegmentWorkspaceOperations: hostLimits.workSegmentWorkspaceOperations,
+        recoveryReserveOutputTokens: hostLimits.workRecoveryReserveOutputTokens,
+        futurePhaseReserveOutputTokens: hostLimits.workFuturePhaseReserveOutputTokens,
+        preSegmentOwnerHeartbeat,
+        ...(workLeaseDependencies.timeoutScheduler
+          ? { timeoutScheduler: workLeaseDependencies.timeoutScheduler }
+          : {}),
+        signal: phaseSignal,
+      });
+      const rootWorkProvider = makeWorkProvider(
+        input.userId,
+        root,
+        effectiveParameters,
+        runtimeExecution.owner.ledger,
+        frozenCredentialFor(runtimeExecution, root),
+      );
+      const seenPublicActivityNodeIds = new Set(
+        runtimeExecution.owner.ledger.activitySnapshot().nodes.map((node) => node.id),
+      );
+      const persistPublicWorkActivity = (): AgentActivityUsageV1 => {
+        const activitySnapshot = runtimeExecution.owner.ledger.activitySnapshot();
+        workUsages.set(execution.id, activitySnapshot.usage);
+        const liveBinding = bindings.get(execution.id);
+        withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
+          userId: input.userId,
+          chatId: input.chatId,
+          turnId: execution.id,
+          generationId: execution.id,
+          generationType: runtimeSnapshot.target.generationType,
+          targetMessageId: liveBinding?.messageId ?? runtimeSnapshot.target.messageId ?? null,
+          targetSwipeId: liveBinding?.swipeId ?? runtimeSnapshot.target.swipeId ?? null,
+          attemptLineage: runtimeExecution.attemptLineage,
+          status: "WORK",
+          workPhase: "WORK",
+          workStatus: "running",
+          activity: activitySnapshot.nodes,
+          omission: { omittedNodeCount: activitySnapshot.omittedNodeCount },
+          usage: activitySnapshot.usage,
+        }));
+        return activitySnapshot.usage;
+      };
+      const segmentRuntime = Object.freeze<AgenticWorkSegmentRuntimeV1>({
+        dispatch: (request, segmentAuthority) => workSegmentLifecycle.dispatch(rootWorkProvider, request, segmentAuthority),
+        providerExchangeId: () => workSegmentLifecycle.providerExchangeId(),
+        workspaceMutationReservation: (reservationInput) => workSegmentLifecycle.workspaceMutationReservation(reservationInput),
+        delegateInvocationIdentity: (identityInput) => workSegmentLifecycle.delegateInvocationIdentity(identityInput),
+        transition: (transitionInput) => workSegmentLifecycle.transition(transitionInput),
+        settleDispatch: (accounting) => workSegmentLifecycle.settleDispatch(accounting),
+        persistChildAssignmentAuthority: (childAuthority) => workSegmentLifecycle.persistChildAssignmentAuthority(childAuthority),
+        finalizeDispatchEffects: (finalizationInput) => workSegmentLifecycle.finalizeDispatchEffects(finalizationInput),
+        close: (outcome) => workSegmentLifecycle.close(outcome),
+      });
       const options: AgenticWorkOptions = {
         rootFrameId: execution.id,
         workspaceId: persistentAssociation.workspaceId,
         workspaceAssociationRevision: persistentAssociation.workspaceRevision,
+        turnWorkspaceAuthority: Object.freeze({
+          id: runtimeExecution.workspaceId,
+          revision: runtimeExecution.workspaceRevision ?? 0,
+        }),
         trustedAssemblyLimits: runtimeSnapshot.limits,
         snapshot: runtimeSnapshot,
         materializeMedia: mediaMaterializers.get(execution.id),
@@ -5374,13 +7587,9 @@ function buildDependencies(): AgenticGenerationDependencies {
         model: root.model,
         provider: root.provider,
         connectionLabel: root.label,
-        dispatch: makeWorkProvider(
-          input.userId,
-          root,
-          effectiveParameters,
-          runtimeExecution.owner.ledger,
-          frozenCredentialFor(runtimeExecution, root),
-        ),
+        dispatch: rootWorkProvider,
+        segmentRuntime,
+        requiredToolChoiceAvailable: root.capabilities.requiredToolChoice === true,
         signal: phaseSignal,
         deadlineAt: runtimeExecution.deadlineAt,
         inspection: childInspection.writer,
@@ -5401,8 +7610,9 @@ function buildDependencies(): AgenticGenerationDependencies {
             runtimeExecution.owner.ledger,
             progress,
             execution.id,
-            childInspection.childTaskIds,
+            childInspection.childActivityIdentities,
             seenPublicActivityNodeIds,
+            publicActivityNodeIdsByCallId,
             {
               inputTokens: 0,
               outputTokens: 0,
@@ -5411,25 +7621,7 @@ function buildDependencies(): AgenticGenerationDependencies {
               childInvocations: progress.childResultCount,
             },
           );
-          const activitySnapshot = runtimeExecution.owner.ledger.activitySnapshot();
-          workUsages.set(execution.id, activitySnapshot.usage);
-          const liveBinding = bindings.get(execution.id);
-          withAgentRunProjectionTransaction((db) => appendAgentRunSnapshot(db, {
-            userId: input.userId,
-            chatId: input.chatId,
-            turnId: execution.id,
-            generationId: execution.id,
-            generationType: runtimeSnapshot.target.generationType,
-            targetMessageId: liveBinding?.messageId ?? runtimeSnapshot.target.messageId ?? null,
-            targetSwipeId: liveBinding?.swipeId ?? runtimeSnapshot.target.swipeId ?? null,
-            attemptLineage: runtimeExecution.attemptLineage,
-            status: "WORK",
-            workPhase: "WORK",
-            workStatus: "running",
-            activity: activitySnapshot.nodes,
-            omission: { omittedNodeCount: activitySnapshot.omittedNodeCount },
-            usage: activitySnapshot.usage,
-          }));
+          persistPublicWorkActivity();
         },
         ...(plan.customPhasePlan && plan.customPhasePlan.phases.length > 0
           ? {
@@ -5472,9 +7664,9 @@ function buildDependencies(): AgenticGenerationDependencies {
         delegatableProfiles,
         childProfiles,
         budget: {
-          maxToolCalls: Math.min(config.maxToolCalls ?? hostLimits.aggregateToolCalls, hostLimits.aggregateToolCalls),
+          maxToolCalls: maxWorkToolCalls,
           maxChildFrames: Math.min(config.maxInvocations ?? hostLimits.childAdmissions, hostLimits.childAdmissions),
-          maxOutputTokens: rootOutputTokenLimit,
+          maxOutputTokens: workDispatchOutputTokens,
         },
         executeChild: ({
           frame,
@@ -5483,17 +7675,25 @@ function buildDependencies(): AgenticGenerationDependencies {
           phaseId,
           phaseInstructionSubset,
           workspace: childWorkspace,
+          workspaceMutationReservation,
+          initialWorkspaceRevision,
+          recordWorkspaceMutationEffect,
         }): Promise<AgenticChildExecutionResult> =>
           trackChild(execution.id, async () => {
+          childInspection.bind(descriptor.childId, frame.assignedTaskId, frame.frameId);
           const profile = profiles.find((candidate) => candidate.id === descriptor.profileId);
           if (!profile || typeof profile.systemPrompt !== "string") {
             return { content: "", status: "failed" as const, errorCode: "child_profile_unauthorized" };
           }
           const child = connectionFor(descriptor.profileId);
           const childToolIds = (profile.toolIds ?? []).filter((id) => available.has(id));
+          // The immutable frame is the final child authority. A profile may narrow
+          // that grant, but it cannot add workspace capabilities the scheduling
+          // path did not admit.
           const childWorkspaceCapabilities = Object.freeze(
             (profile.workspaceCapabilities ?? []).filter((operation) =>
-              workspaceCapabilities.allowed.includes(operation)
+              frame.workspaceCapabilities.has(operation)
+              && workspaceCapabilities.allowed.includes(operation)
               && DELEGATED_WORKSPACE_OPERATIONS[operation] === true,
             ),
           );
@@ -5501,26 +7701,51 @@ function buildDependencies(): AgenticGenerationDependencies {
           if (descriptor.required && childWorkspaceCapabilities.includes("submit_child_result")) {
             const taskId = execution.id + ":task:" + descriptor.childId;
             const expectedRevision = runtimeExecution.workspaceRevision ?? 0;
-            createWorkspaceTask({
+            const taskArgs = {
               userId: runtimeExecution.userId,
               chatId: runtimeExecution.chatId,
               turnId: runtimeExecution.id,
               workspaceId: runtimeExecution.workspaceId,
-              actor: "host",
+              actor: "host" as const,
               expectedRevision,
               taskId,
               title: "Required task " + (descriptor.slotIndex + 1),
               objective: descriptor.task,
               required: true,
               assignedFrameId: frame.frameId,
+            };
+            if (!workspaceMutationReservation || !recordWorkspaceMutationEffect) {
+              throw new AgenticWorkPhaseError("provider_protocol_error", "Required child task lacks durable mutation ownership");
+            }
+            const taskReservation = workspaceMutationReservation({
+              providerCallId: "host-required-task:" + descriptor.childId,
+              operationKind: "create_task",
+              frameId: frame.frameId,
             });
-            const workspaceRevision = getCurrentWorkspaceRevisionV1({
+            const taskCommit = commitTurnWorkspaceMutationWithReceiptV1({
               userId: runtimeExecution.userId,
-              chatId: runtimeExecution.chatId,
-              turnId: runtimeExecution.id,
+              executionId: runtimeExecution.id,
               workspaceId: runtimeExecution.workspaceId,
-            });
-            advanceNonCognitionWorkspaceRevision(runtimeExecution, cognitionRuntime, workspaceRevision);
+              expectedRevision,
+              reservation: taskReservation,
+              operationArgs: taskArgs,
+            }, () => createWorkspaceTask(taskArgs));
+            if (!taskCommit.receipt) {
+              throw new AgenticWorkPhaseError("integrity_error", "Required child task mutation receipt is unavailable");
+            }
+            recordWorkspaceMutationEffect(Object.freeze({
+              ...taskReservation,
+              outcome: taskCommit.receipt.afterWorkspaceRevision > taskCommit.receipt.beforeWorkspaceRevision ? "mutated" : "no_op",
+              outcomeCode: null,
+              operationDigest: taskCommit.receipt.operationDigest,
+              beforeWorkspaceRevision: taskCommit.receipt.beforeWorkspaceRevision,
+              afterWorkspaceRevision: taskCommit.receipt.afterWorkspaceRevision,
+            }));
+            const workspaceRevision = taskCommit.receipt?.afterWorkspaceRevision ?? expectedRevision;
+            if (workspaceRevision !== expectedRevision) {
+              advanceNonCognitionWorkspaceRevision(runtimeExecution, cognitionRuntime, workspaceRevision);
+            }
+            renewPreSegmentOwnerLease();
             boundedFrame = createAgenticChildFrame({
               frameId: frame.frameId,
               parentFrameId: frame.parentFrameId!,
@@ -5534,12 +7759,15 @@ function buildDependencies(): AgenticGenerationDependencies {
               signal: frame.signal,
             });
           }
-          childInspection.bind(descriptor.childId, boundedFrame.assignedTaskId);
+          childInspection.bind(descriptor.childId, boundedFrame.assignedTaskId, boundedFrame.frameId);
           const result = await executeBoundedAgenticChildFrame({
             frame: boundedFrame, task: descriptor.task, definitions,
             ...(childWorkspace ? { workspace: childWorkspace } : {}),
             ...(phaseId !== undefined ? { phaseId } : {}),
             ...(phaseInstructionSubset ? { phaseInstructionSubset } : {}),
+            ...(workspaceMutationReservation ? { workspaceMutationReservation } : {}),
+            initialWorkspaceRevision: runtimeExecution.workspaceRevision ?? initialWorkspaceRevision,
+            ...(recordWorkspaceMutationEffect ? { recordWorkspaceMutationEffect } : {}),
             systemPrompt: profile.systemPrompt,
             maxInputBytes: runtimeSnapshot.limits.maxInputBytes,
             reserveInitialInput: (bytes) =>
@@ -5567,6 +7795,10 @@ function buildDependencies(): AgenticGenerationDependencies {
               maxOutputTokens: descriptor.maxOutputTokens,
             },
           });
+          if (result.workspaceRevision !== undefined) {
+            advanceWorkspaceRevision(runtimeExecution, { workspaceRevision: result.workspaceRevision });
+            renewPreSegmentOwnerLease();
+          }
           return {
             content: result.content,
             status: result.status,
@@ -5577,18 +7809,24 @@ function buildDependencies(): AgenticGenerationDependencies {
           };
           }),
       };
-      const outcome = await runAgenticWorkPhase(options).finally(() => childInspection.flush());
+      const outcome = await (recoveredWork && activeRecoveredSegmentV1(recoveredWork)
+        ? resumeAdmittedAgenticWorkSegmentV1(options, {
+          admission: activeRecoveredSegmentV1(recoveredWork)!,
+          context: activeRecoveredSegmentV1(recoveredWork)!.context,
+          signal: phaseSignal,
+        })
+        : runSegmentedAgenticWorkV1(options)).finally(() => childInspection.flush());
       const workspaceRevision = adoptWorkWorkspaceRevision(runtimeExecution, outcome);
       recordPublicWorkActivity(
         runtimeExecution.owner.ledger,
         outcome,
         execution.id,
-        childInspection.childTaskIds,
+        childInspection.childActivityIdentities,
         seenPublicActivityNodeIds,
+        publicActivityNodeIdsByCallId,
       );
-      const usage = runtimeExecution.owner.ledger.activitySnapshot().usage;
+      const usage = persistPublicWorkActivity();
       works.set(execution.id, outcome);
-      workUsages.set(execution.id, usage);
       if (outcome.renderHandoff) {
         renderFrames.set(execution.id, Object.freeze({
           handoff: outcome.renderHandoff,
@@ -5620,6 +7858,7 @@ function buildDependencies(): AgenticGenerationDependencies {
         ...(outcome.code ? { errorCode: outcome.code } : {}),
         ...(outcome.errorMessage ? { errorMessage: outcome.errorMessage } : {}),
       };
+      });
     },
     render: async ({ execution, input, decision, snapshot, plan, signal }) => {
       const runtimeExecution = requireRuntimeExecution(execution);
@@ -5690,6 +7929,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       );
       const renderMessages = buildAgenticRenderPolicyMessages({
         nativeMessages: plan.providerMessages,
+        rootUserMessageIds: input.sourceUserMessageIds ?? [],
         materializeMedia: mediaMaterializers.get(execution.id),
         renderGuidance: frame.handoff.renderGuidance,
         renderPolicyMessages: effectiveRenderPolicyMessages,
@@ -6380,7 +8620,7 @@ function buildDependencies(): AgenticGenerationDependencies {
           terminalOutcome,
           db,
         );
-        if (sourceDetached) return;
+        if (sourceDetached || committedSession?.chatId === null) return;
         const attemptId = durableExecution.attemptLineage.attemptId;
         const inspection = persistAgentRunInspectionInTransaction(db, {
           userId: event.userId,
@@ -6491,6 +8731,9 @@ function buildDependencies(): AgenticGenerationDependencies {
       }
       // Durable convergence owns terminalization. Cleanup only releases the
       // process-local association; it must never publish a partial terminal.
+      const preSegmentOwnerHeartbeat = preSegmentOwnerHeartbeats.get(id);
+      preSegmentOwnerHeartbeats.delete(id);
+      void preSegmentOwnerHeartbeat?.stop();
       persistentAssociations.delete(id);
       snapshots.delete(id);
       mediaMaterializers.delete(id);
@@ -6510,6 +8753,7 @@ function buildDependencies(): AgenticGenerationDependencies {
       childJoins.delete(id);
       rootSignals.delete(id);
       rootDeadlines.delete(id);
+      rootDeadlineControllers.delete(id);
       const disposeDeadline = deadlineDisposers.get(id);
       deadlineDisposers.delete(id);
       try {
@@ -6531,13 +8775,764 @@ function buildDependencies(): AgenticGenerationDependencies {
   };
 }
 
+type QueuedWorkResumeResultV1 = Readonly<{
+  resumed: number;
+  terminalized: number;
+  complete: boolean;
+  healthy: boolean;
+}>;
+
+function exactRecoveredConnectionV1(
+  userId: string,
+  expected: WorkSegmentResumeEnvelopeV1["rootConnection"],
+): CompleteFrozenConnectionV1 {
+  const resolved = resolveConcreteConnectionV1(userId, expected.logicalId, expected.concreteId);
+  const frozen = normalizeConcreteConnection(resolved);
+  if (!frozen) throw new Error("restart_resume_connection_missing");
+  let complete: CompleteFrozenConnectionV1;
+  try {
+    complete = requireCompleteFrozenConnection(frozen, "WORK", "root");
+  } catch {
+    throw new Error("restart_resume_connection_capability_mismatch");
+  }
+  if (encodeCanonicalPlainData(workResumeConnectionV1(complete)) !== encodeCanonicalPlainData(expected)) {
+    throw new Error("restart_resume_connection_identity_mismatch");
+  }
+  return complete;
+}
+
+function requireRecoveredBindingV1(raw: unknown): LiveTargetBinding {
+  if (!isRecord(raw)
+    || (raw.target !== "normal" && raw.target !== "continue" && raw.target !== "regenerate" && raw.target !== "swipe")
+    || typeof raw.chatId !== "string"
+    || (raw.branchId !== null && typeof raw.branchId !== "string")
+    || (raw.messageId !== null && typeof raw.messageId !== "string")
+    || (raw.swipeId !== null && (!Number.isSafeInteger(raw.swipeId) || (raw.swipeId as number) < 0))
+    || (raw.messageIndex !== null && (!Number.isSafeInteger(raw.messageIndex) || (raw.messageIndex as number) < 0))
+    || (raw.swipeCount !== null && (!Number.isSafeInteger(raw.swipeCount) || (raw.swipeCount as number) < 0))
+    || !Number.isSafeInteger(raw.chatGenerationRevision) || (raw.chatGenerationRevision as number) < 0
+    || (raw.messageGenerationRevision !== null && (!Number.isSafeInteger(raw.messageGenerationRevision) || (raw.messageGenerationRevision as number) < 0))) {
+    throw new Error("restart_resume_binding_invalid");
+  }
+  return Object.freeze({ ...raw }) as LiveTargetBinding;
+}
+
+function requireRecoveredHostLimitsV1(raw: unknown): AgentRuntimeHostLimits {
+  if (!isRecord(raw)) throw new Error("restart_resume_owner_limits_invalid");
+  const currentSchema = getAgentRuntimeHostLimits();
+  for (const key of Object.keys(currentSchema) as Array<keyof AgentRuntimeHostLimits>) {
+    const value = raw[key];
+    if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error("restart_resume_owner_limits_invalid");
+  }
+  if (Object.keys(raw).length !== Object.keys(currentSchema).length) throw new Error("restart_resume_owner_limits_invalid");
+  return Object.freeze({ ...raw }) as unknown as AgentRuntimeHostLimits;
+}
+
+function exactAuthoredToolGrantsV1(config: AgentConfigV2, envelope: WorkSegmentResumeEnvelopeV1): void {
+  const rootIds = [...(config.mainToolIds ?? [])].sort(compareUtf8);
+  const childIds = Object.fromEntries((config.profiles ?? []).map((profile) => [profile.id, [...(profile.toolIds ?? [])].sort(compareUtf8)]));
+  if (encodeCanonicalPlainData(rootIds) !== encodeCanonicalPlainData(envelope.authoredRootToolIds)
+    || encodeCanonicalPlainData(childIds) !== encodeCanonicalPlainData(envelope.authoredChildToolIds)) {
+    throw new Error("restart_resume_tool_grants_mismatch");
+  }
+}
+
+function activeRecoveredSegmentV1(chain: WorkSegmentRecoveryChainV1): WorkSegmentAdmissionV1 | null {
+  const id = chain.recovery.currentSegmentId;
+  if (id === null) return null;
+  return chain.segments.find((segment) => segment.identity.segmentId === id && segment.lifecycle === "admitted") ?? null;
+}
+function terminalizeQueuedWorkV1(
+  chain: WorkSegmentRecoveryChainV1,
+  reason: string,
+  terminal: "FAILED" | "CANCELLED" | "TIMED_OUT" = "FAILED",
+): void {
+  const current = activeRecoveredSegmentV1(chain);
+  const durable = getTurnExecution(chain.recovery.executionId, chain.recovery.userId);
+  if (!current || !durable?.casOwner || durable.phase !== "WORK"
+    || durable.casRevision !== chain.recovery.executionCasRevision) {
+    throw new Error("restart_resume_terminal_authority_missing");
+  }
+  const hasDispatchHistory = chain.dispatches.some((dispatch) => dispatch.segmentId === current.identity.segmentId);
+  const closeInput = {
+    userId: chain.recovery.userId,
+    executionId: chain.recovery.executionId,
+    ownerToken: durable.casOwner,
+    expectedExecutionCasRevision: chain.recovery.executionCasRevision,
+    expectedWorkspaceRevision: chain.recovery.workspaceRevision,
+    now: Date.now(),
+    attemptId: chain.recovery.attemptId,
+    workspaceId: chain.recovery.workspaceId,
+    sourceSegmentId: current.identity.segmentId,
+    idempotencyKey: "restart-resume-terminal:" + current.identity.segmentId + ":" + terminal.toLowerCase(),
+    closeResult: terminal === "CANCELLED" ? "cancelled" as const : "failed" as const,
+    closeReason: reason,
+  };
+  if (hasDispatchHistory) {
+    closeWorkSegmentTerminalV1({
+      ...closeInput,
+      boundaryClass: terminal === "CANCELLED" ? null : "provider_protocol_failure",
+      usage: current.usage,
+    });
+  } else {
+    closeAdmittedWorkSegmentWithoutDispatchTerminalV1(closeInput);
+  }
+  const refreshed = getTurnExecution(chain.recovery.executionId, chain.recovery.userId);
+  if (!refreshed?.casOwner || refreshed.phase !== "WORK"
+    || refreshed.casOwner !== durable.casOwner
+    || refreshed.casRevision !== chain.recovery.executionCasRevision) {
+    throw new Error("restart_resume_terminal_authority_changed");
+  }
+  transitionTurnExecution({
+    executionId: chain.recovery.executionId,
+    ownerToken: refreshed.casOwner,
+    expectedPhase: "WORK",
+    nextPhase: terminal,
+    reason,
+  });
+}
+
+function recoveredGenerationInputV1(
+  envelope: WorkSegmentResumeEnvelopeV1,
+  signal: AbortSignal,
+): AgenticGenerationInput {
+  const raw = envelope.resumeInput;
+  const allowed = new Set([
+    "userId", "chatId", "connectionId", "presetId", "forcePresetId", "personaId", "personaAddonStates",
+    "sourceUserMessageIds", "messageId", "swipeId", "targetCharacterId", "generationType", "attemptLineage",
+    "parameters", "userInput", "regenFeedback", "regenFeedbackPosition", "requestEpoch", "isImpersonate",
+    "isGroupChat", "isMultiplayer", "councilEnabled", "councilToolsEnabled",
+  ]);
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !allowed.has(key))
+    || typeof raw.userId !== "string" || typeof raw.chatId !== "string"
+    || !["normal", "continue", "regenerate", "swipe"].includes(String(raw.generationType))
+    || !isAgentWorkAttemptLineage(raw.attemptLineage)
+    || encodeCanonicalPlainData(raw.parameters ?? null) !== encodeCanonicalPlainData(envelope.generationParameters)) {
+    throw new Error("restart_resume_input_invalid");
+  }
+  return { ...(structuredClone(raw) as unknown as AgenticGenerationInput), signal };
+}
+
+function recoveredDecisionV1(
+  envelope: WorkSegmentResumeEnvelopeV1,
+  target: AgenticTargetSnapshot,
+  root: CompleteFrozenConnectionV1,
+  childConnections: Readonly<Record<string, CompleteFrozenConnectionV1>>,
+  councilConnection: CompleteFrozenConnectionV1 | null,
+): DecisionWithInternal {
+  const raw = envelope.decisionAuthority;
+  const allowed = new Set(["binding", "configSnapshot", "councilProfile", "councilConnection", "runtimePolicy", "readinessVector", "issuedAt", "expiresAt"]);
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !allowed.has(key))) throw new Error("restart_resume_decision_invalid");
+  const internal = {
+    ...structuredClone(raw),
+    rootConnection: root,
+    childConnections,
+    councilConnection,
+  };
+  if (!isRuntimeInternal(internal)) throw new Error("restart_resume_decision_invalid");
+  return Object.freeze({
+    mode: "agentic",
+    target,
+    connection: publicConnection(root),
+    configRevision: envelope.configRevision,
+    readiness: internal.readinessVector,
+    readinessDigest: internal.binding.readinessDigest,
+    expiresAt: internal.expiresAt,
+    internal,
+  }) as DecisionWithInternal;
+}
+
+function recoveredCompletedWorkV1(
+  chain: WorkSegmentRecoveryChainV1,
+  snapshot: RuntimeSnapshot,
+): RecoveredCompletedWorkV1 {
+  const terminalSegment = chain.segments[chain.segments.length - 1];
+  const terminalTransition = chain.transitions[chain.transitions.length - 1];
+  if (chain.recovery.state !== "closed" || chain.recovery.currentSegmentId !== null
+    || !terminalSegment || terminalSegment.lifecycle !== "closed" || terminalSegment.closeResult !== "work_complete"
+    || terminalSegment.closedWorkspaceRevision !== chain.recovery.workspaceRevision
+    || !terminalTransition || terminalTransition.handoff.transitionKind !== "terminal"
+    || terminalTransition.handoff.sourceSegment.segmentId !== terminalSegment.identity.segmentId
+    || terminalTransition.handoff.sourceWorkspaceRevision !== chain.recovery.workspaceRevision
+    || terminalTransition.handoff.completion.authority !== "model_advisory"
+    || terminalTransition.handoff.openRequiredIds.length !== 0) {
+    throw new Error("restart_resume_completion_authority_mismatch");
+  }
+  const projection = projectRenderWorkspaceContextV1(buildWorkspaceContextProjectionFromWorkspaceV1({
+    userId: chain.recovery.userId,
+    chatId: snapshot.chatId,
+    turnId: chain.recovery.executionId,
+    workspaceId: chain.recovery.workspaceId,
+    expectedRevision: chain.recovery.workspaceRevision,
+    sourceWorkspaceRevision: chain.recovery.workspaceRevision,
+  }, { reservedBytes: snapshot.limits.maxInputBytes }));
+  const completion = Object.freeze({
+    summary: terminalTransition.handoff.completion.summary,
+    unresolvedIds: terminalTransition.handoff.completion.unresolvedIds,
+    ...(terminalTransition.handoff.completion.renderGuidance === null
+      ? {}
+      : { renderGuidance: terminalTransition.handoff.completion.renderGuidance }),
+  });
+  const renderHandoff: AgenticWorkRenderHandoff = Object.freeze({
+    workspaceRevision: chain.recovery.workspaceRevision,
+    renderGuidance: terminalTransition.handoff.completion.renderGuidance,
+    completionCriteriaMessages: Object.freeze(terminalSegment.context.phase.completionCriteria.map((content) => Object.freeze({
+      role: "system" as const,
+      content,
+    }))),
+    workspaceContextProjection: projection,
+  });
+  const outcome: AgenticWorkPhaseOutcome = Object.freeze({
+    status: "completed",
+    phase: "WORK",
+    observations: Object.freeze([]),
+    childResults: Object.freeze([]),
+    unsignedBoundaryCount: chain.recovery.usage.unsignedBoundaries,
+    providerRoundCount: chain.recovery.usage.providerDispatches,
+    workspaceRevision: chain.recovery.workspaceRevision,
+    completion,
+    renderHandoff,
+    workNoteBytes: 0,
+    privateState: Object.freeze({ reasoning: undefined, transcript: undefined, carrier: undefined }),
+  });
+  return Object.freeze({
+    outcome,
+    usage: Object.freeze({
+      inputTokens: chain.recovery.usage.providerInputTokens,
+      outputTokens: chain.recovery.usage.providerOutputTokens,
+      totalTokens: chain.recovery.usage.providerTotalTokens,
+      toolCalls: chain.recovery.usage.toolCalls,
+      childInvocations: 0,
+    }),
+  });
+}
+
+function recoveredWorkFailureCauseV1(
+  execution: TurnExecutionRecord,
+  error: unknown,
+): Readonly<{ phase: "FAILED" | "CANCELLED" | "TIMED_OUT"; reason: string; code: string }> {
+  if (execution.cancelRequested) {
+    return cancellationTerminalCause(
+      execution.cancelRequestedAt ?? execution.updatedAt,
+      execution.deadlineAt,
+    );
+  }
+  const deadlineFailure = (error instanceof Error && error.message === "restart_resume_deadline_expired")
+    || isProviderTimeout(error);
+  if (deadlineFailure && execution.deadlineAt > 0 && Date.now() >= execution.deadlineAt) {
+    return {
+      phase: "TIMED_OUT",
+      reason: "root_wall_clock_limit_exceeded",
+      code: "root_wall_clock_limit_exceeded",
+    };
+  }
+  const reason = error instanceof Error && error.message.startsWith("restart_resume_")
+    ? error.message
+    : "restart_resume_internal_error";
+  return { phase: "FAILED", reason, code: reason };
+}
+
+function convergeReachedQueuedWorkDeadlineV1(
+  chain: WorkSegmentRecoveryChainV1,
+  execution: TurnExecutionRecord,
+  activeSegment: boolean,
+): boolean {
+  if (execution.deadlineAt <= 0 || execution.deadlineAt > Date.now()) return false;
+  const marked = requestTurnCancellation({
+    executionId: execution.id,
+    ownerToken: execution.casOwner ?? undefined,
+    reason: "timed_out",
+    now: execution.deadlineAt,
+  }).execution;
+  if (marked.phase !== "WORK" || !marked.casOwner
+    || marked.casRevision !== chain.recovery.executionCasRevision) {
+    throw new Error("restart_resume_deadline_authority_changed");
+  }
+  const cause = recoveredWorkFailureCauseV1(marked, new Error("restart_resume_deadline_expired"));
+  if (activeSegment) {
+    terminalizeQueuedWorkV1(chain, cause.reason, cause.phase);
+  } else {
+    transitionTurnExecution({
+      executionId: marked.id,
+      ownerToken: marked.casOwner,
+      expectedPhase: "WORK",
+      nextPhase: cause.phase,
+      reason: cause.reason,
+    });
+  }
+  return true;
+}
+
+async function resumeQueuedWorkChainV1(
+  chain: WorkSegmentRecoveryChainV1,
+  recoveryKind: "active" | "completed",
+  timeoutScheduler?: AgentTimeoutScheduler,
+): Promise<void> {
+  const envelope = chain.recovery.resumeEnvelope;
+  const userId = chain.recovery.userId;
+  const executionId = chain.recovery.executionId;
+  const recoveringCompletion = recoveryKind === "completed";
+  if ((recoveringCompletion && chain.recovery.state !== "closed")
+    || (!recoveringCompletion && chain.recovery.state !== "active")) {
+    throw new Error("restart_resume_recovery_state_mismatch");
+  }
+  const durable = getTurnExecution(executionId, userId);
+  if (!durable || durable.phase !== "WORK" || !durable.casOwner
+    || durable.casRevision !== chain.recovery.executionCasRevision
+    || durable.runtimeEpoch !== chain.recovery.recoveryEpoch) throw new Error("restart_resume_execution_fence_mismatch");
+  if (durable.cancelRequested) {
+    const cause = cancellationTerminalCause(durable.cancelRequestedAt ?? durable.updatedAt, durable.deadlineAt);
+    if (recoveringCompletion) {
+      transitionTurnExecution({
+        executionId,
+        ownerToken: durable.casOwner,
+        expectedPhase: "WORK",
+        nextPhase: cause.phase,
+        reason: cause.reason,
+      });
+    } else {
+      terminalizeQueuedWorkV1(chain, cause.reason, cause.phase);
+    }
+    return;
+  }
+  const snapshot = requireRuntimeSnapshot(envelope.snapshot);
+  const plan = envelope.plan as unknown as AssemblyPlanV1;
+  const { envelopeDigest, ...unsignedEnvelope } = envelope;
+  if (envelopeDigest !== computeWorkSegmentResumeEnvelopeDigestV1(unsignedEnvelope)
+    || chain.recovery.resumeEnvelopeDigest !== envelopeDigest) throw new Error("restart_resume_envelope_digest_mismatch");
+  if (createHash("sha256").update(encodeCanonicalPlainData(envelope.snapshot), "utf8").digest("hex") !== envelope.snapshotDigest
+    || chain.recovery.snapshotDigest !== envelope.snapshotDigest) throw new Error("restart_resume_snapshot_digest_mismatch");
+  if (createHash("sha256").update(encodeCanonicalPlainData(envelope.plan), "utf8").digest("hex") !== envelope.planDigest) throw new Error("restart_resume_plan_digest_mismatch");
+  const phaseAuthoritySegment = recoveringCompletion
+    ? chain.segments[chain.segments.length - 1]
+    : activeRecoveredSegmentV1(chain);
+  if (computeWorkPhasePlanDigestV1(chain.recovery.phasePlan) !== chain.recovery.phasePlanDigest
+    || phaseAuthoritySegment?.context.phasePlanDigest !== chain.recovery.phasePlanDigest) {
+    throw new Error("restart_resume_phase_plan_digest_mismatch");
+  }
+  if (envelope.toolCatalogSchemaVersion !== WORK_TOOL_CATALOG_SCHEMA_VERSION_V1
+    || envelope.toolCatalogDigest !== WORK_TOOL_CATALOG_DIGEST_V1) throw new Error("restart_resume_tool_catalog_mismatch");
+  if (envelope.runtime.rootFrameId !== executionId
+    || snapshot.userId !== userId || snapshot.chatId !== durable.chatId) throw new Error("restart_resume_identity_mismatch");
+  if (envelope.runtime.deadlineAt !== durable.deadlineAt) throw new Error("restart_resume_deadline_mismatch");
+  if (envelope.runtime.deadlineAt <= Date.now()) throw new Error("restart_resume_deadline_expired");
+  const activeSegmentAuthority = recoveringCompletion ? null : phaseAuthoritySegment;
+  if (envelope.runtime.workspaceId !== chain.recovery.workspaceId
+    || envelope.runtime.workspaceRevision > chain.recovery.workspaceRevision
+    || durable.workspaceId !== chain.recovery.workspaceId
+    || durable.workspaceRevision !== chain.recovery.workspaceRevision
+    || (!recoveringCompletion && (
+      !activeSegmentAuthority
+      || activeSegmentAuthority.workspaceId !== chain.recovery.workspaceId
+      || activeSegmentAuthority.workspaceRevision !== chain.recovery.workspaceRevision
+      || activeSegmentAuthority.executionCasRevision !== chain.recovery.executionCasRevision
+      || activeSegmentAuthority.identity.executionId !== executionId
+      || activeSegmentAuthority.identity.attemptId !== chain.recovery.attemptId
+      || activeSegmentAuthority.identity.segmentId !== chain.recovery.currentSegmentId
+      || activeSegmentAuthority.identity.phaseId !== chain.recovery.phaseId
+      || activeSegmentAuthority.identity.phaseIndex !== chain.recovery.phaseIndex
+      || activeSegmentAuthority.identity.phaseOccurrence !== chain.recovery.phaseOccurrence
+      || activeSegmentAuthority.identity.segmentOrdinal !== chain.recovery.nextSegmentOrdinal
+    ))) throw new Error("restart_resume_workspace_mismatch");
+
+  const binding = requireRecoveredBindingV1(envelope.liveTargetBinding);
+  if (encodeCanonicalPlainData(binding) !== encodeCanonicalPlainData(durable.target)) throw new Error("restart_resume_target_fence_mismatch");
+  const target = targetFromBinding(binding);
+  const expectedSnapshotGenerationId = `agentic:${durable.chatId}:${target.generationType}:${target.messageId ?? "new"}`;
+  if (snapshot.generationId !== expectedSnapshotGenerationId
+    || snapshot.target.generationType !== target.generationType
+    || snapshot.target.messageId !== (target.messageId ?? null)
+    || snapshot.target.swipeId !== (target.swipeId ?? null)) throw new Error("restart_resume_snapshot_target_mismatch");
+  const liveBinding = bindLiveTarget(userId, durable.chatId, target, true);
+  if (encodeCanonicalPlainData(liveBinding) !== encodeCanonicalPlainData(binding)) throw new Error("restart_resume_target_fence_mismatch");
+
+  const controller = new AbortController();
+  const deadlineError = new DOMException("Agentic root deadline", "TimeoutError");
+  const disposeDeadline = scheduleCancellableAgentTimeout(
+    () => {
+      try {
+        const current = getTurnExecution(executionId, userId);
+        if (current?.phase === "WORK" && current.casOwner
+          && current.casRevision === chain.recovery.executionCasRevision
+          && current.runtimeEpoch === chain.recovery.recoveryEpoch) {
+          requestTurnCancellation({
+            executionId,
+            ownerToken: current.casOwner,
+            reason: "timed_out",
+            now: envelope.runtime.deadlineAt,
+          });
+        }
+      } catch {
+        // The fallback classifiers still fail closed on the exact timeout error.
+      } finally {
+        controller.abort(deadlineError);
+      }
+    },
+    Math.max(0, envelope.runtime.deadlineAt - Date.now()),
+    timeoutScheduler,
+  );
+  const input = recoveredGenerationInputV1(envelope, controller.signal);
+  if (input.userId !== userId || input.chatId !== durable.chatId
+    || input.generationType !== target.generationType
+    || encodeCanonicalPlainData(input.attemptLineage) !== encodeCanonicalPlainData(envelope.resumeInput.attemptLineage)
+    || input.attemptLineage?.attemptId !== chain.recovery.attemptId) throw new Error("restart_resume_input_identity_mismatch");
+
+  const config = frozenConfig(snapshot.agentConfig);
+  exactAuthoredToolGrantsV1(config, envelope);
+  if (String(runtimeInputRevisions(snapshot).config ?? snapshot.snapshotId) !== String(envelope.configRevision)) throw new Error("restart_resume_config_revision_mismatch");
+  const root = exactRecoveredConnectionV1(userId, envelope.rootConnection);
+  const childConnections = Object.freeze(Object.fromEntries(Object.entries(envelope.childConnections).map(([profileId, expected]) => [
+    profileId,
+    exactRecoveredConnectionV1(userId, expected),
+  ]))) as Readonly<Record<string, CompleteFrozenConnectionV1>>;
+  if (encodeCanonicalPlainData(Object.keys(childConnections).sort(compareUtf8))
+    !== encodeCanonicalPlainData((config.profiles ?? []).map((profile) => profile.id).sort(compareUtf8))) {
+    throw new Error("restart_resume_child_connection_set_mismatch");
+  }
+  const councilExpected = isRecord(envelope.decisionAuthority) ? envelope.decisionAuthority.councilConnection : null;
+  const councilConnection = councilExpected === null || councilExpected === undefined
+    ? null
+    : exactRecoveredConnectionV1(userId, councilExpected as WorkSegmentResumeEnvelopeV1["rootConnection"]);
+  const decision = recoveredDecisionV1(envelope, target, root, childConnections, councilConnection);
+  const internal = decision.internal;
+  if (internal.binding.userId !== userId || internal.binding.chatId !== durable.chatId
+    || internal.binding.capabilityDigest !== root.capabilityDigest
+    || internal.binding.inputRevisionDigest !== canonicalInputRevisionDigest(runtimeInputRevisions(snapshot))
+    || encodeCanonicalPlainData(internal.configSnapshot) !== encodeCanonicalPlainData(snapshot.agentConfig)) throw new Error("restart_resume_decision_authority_mismatch");
+  const exactConnections = Object.freeze([root, ...Object.values(childConnections), ...(councilConnection ? [councilConnection] : [])]);
+  let carrier: Map<string, string>;
+  try {
+    carrier = await freezeConnectionCredentials(userId, exactConnections);
+  } catch {
+    disposeDeadline();
+    throw new Error("restart_resume_secret_revision_mismatch");
+  }
+  for (const connection of exactConnections) {
+    if (!carrier.has(connectionIdentity(connection))) {
+      carrier.clear();
+      disposeDeadline();
+      throw new Error("restart_resume_secret_missing");
+    }
+  }
+
+  const hostLimits = requireRecoveredHostLimitsV1(envelope.runtime.ownerLimits);
+  const admittedConnections = new Map<string, CompleteFrozenConnectionV1>(exactConnections.map((connection) => [connectionIdentity(connection), connection] as const));
+  let runtimeOwner!: AgentRuntimeOwner;
+  runtimeOwner = new AgentRuntimeOwner({
+    generationId: executionId,
+    userId,
+    config,
+    rootConnection: requireRenderConnection(root),
+    signal: controller.signal,
+    limits: hostLimits,
+    dispatch: async (request) => {
+      let requested: FrozenConcreteConnectionV1 | null = null;
+      try { requested = normalizeConcreteConnection(request.connection); } catch { requested = null; }
+      const frozen = requested ? admittedConnections.get(connectionIdentity(requested)) ?? null : null;
+      if (!frozen) throw new AgenticGenerationError("decision_refresh_required", "Provider connection no longer matches persisted WORK admission.", { phase: "WORK" });
+      const toolContinuationMode = frozen.capabilities.toolContinuationMode;
+      if (!hasNativeAgenticWorkContinuationV1(frozen)) {
+        throw new AgenticGenerationError("agentic_provider_failure", "Agentic WORK requires native provider tool continuation.", { phase: "WORK" });
+      }
+      const credential = carrier.get(connectionIdentity(frozen));
+      if (credential === undefined) throw new AgenticGenerationError("decision_refresh_required", "Persisted provider credential is unavailable.", { phase: "WORK" });
+      const stream = await providerStream(userId, frozen, {
+        messages: [...request.messages], model: frozen.model ?? "", parameters: workProviderGenerationParametersV1(envelope.generationParameters ?? undefined, request.maxOutputTokens),
+        tools: [...(request.tools ?? [])], stream: true, signal: request.signal,
+        receiveLimitBytes: request.receiveLimitBytes ?? MAX_OUTPUT_BYTES,
+        toolMode: request.toolMode ?? "ordinary",
+        ...(request.providerTransientCarrier ? { providerTransientCarrier: request.providerTransientCarrier } : {}),
+      }, credential, runtimeOwner.ledger);
+      const response = await collectProviderResponse(stream, request.receiveLimitBytes ?? MAX_OUTPUT_BYTES, runtimeOwner.ledger, false);
+      const counter = await resolveCounter(frozen.model ?? "");
+      return {
+        ...response,
+        toolContinuationMode,
+        supportsToolFinalization: frozen.capabilities.toolsDisabledFinalization === true,
+        observedOutputTokens: observeOutputTokens(response, { countTokens: counter.count }),
+      };
+    },
+  });
+  try {
+  const nativeProjection = await snapshotInputWithNativeContext(input, decision, target, root, controller.signal);
+  const rebuiltSnapshot = buildGenerationAssemblySnapshot(nativeProjection.snapshotInput);
+  if (encodeCanonicalPlainData(rebuiltSnapshot.inputRevisionSet) !== encodeCanonicalPlainData(snapshot.inputRevisionSet)) {
+    disposeDeadline(); carrier.clear(); runtimeOwner.close();
+    throw new Error("restart_resume_snapshot_revalidation_mismatch");
+  }
+  const session = getPersistentWorkspaceTurnSessionByExecutionV1({ userId, executionId });
+  if (!session || session.attemptId !== chain.recovery.attemptId || session.status === "terminal") {
+    disposeDeadline(); carrier.clear(); runtimeOwner.close();
+    throw new Error("restart_resume_workspace_mismatch");
+  }
+  const persistentWorkspace = getPersistentWorkspaceById({ userId, workspaceId: session.workspaceId });
+  const execution: RuntimeExecution = {
+    id: executionId, userId, chatId: durable.chatId, target,
+    attemptLineage: input.attemptLineage as AgentWorkAttemptLineageV1,
+    workspaceId: chain.recovery.workspaceId, workspaceRevision: chain.recovery.workspaceRevision,
+    workspaceRetention: envelope.runtime.workspaceRetention,
+    workspaceSharing: envelope.runtime.workspaceSharing,
+    deadlineAt: envelope.runtime.deadlineAt,
+    owner: runtimeOwner, credentialCarrier: carrier,
+    ownerToken: durable.casOwner, commitKey: durable.commitKey, signal: controller.signal,
+  };
+  const workspaceCapabilities: WorkspaceOperationCapabilitiesV1 = {
+    revision: 1, allowed: WORKSPACE_OPERATIONS, maxOperationBytes: 131_072, maxOperations: 128,
+  };
+  const deps = buildDependencies();
+  await deps.restoreRecoveredRuntime({
+    execution, snapshot, plan, rootConnection: root, binding, session,
+    persistentWorkspaceId: session.workspaceId, persistentWorkspaceRevision: persistentWorkspace.revision,
+    workspaceCapabilities, materializeMedia: nativeProjection.materializeMedia,
+    abortController: controller, disposeDeadline,
+  });
+  let resumedPhase: AgenticPhase = "WORK";
+  let terminalStatus: "completed" | "failed" | "cancelled" | "timed_out" | "exhausted" = "failed";
+  try {
+    if (!deps.transitionExecution || !deps.render || !deps.prepareRender || !deps.commit) throw new Error("restart_resume_authority_missing");
+    const workRequest = { execution, input, decision, snapshot, plan, signal: controller.signal };
+    const work = recoveringCompletion
+      ? await deps.restoreRecoveredWorkCompletion(workRequest, recoveredCompletedWorkV1(chain, snapshot))
+      : await deps.resumeRecoveredWork(workRequest, chain);
+    if (work.status !== "completed") {
+      const terminal = work.status === "exhausted" ? "EXHAUSTED" : work.status === "timed_out" ? "TIMED_OUT" : work.status === "cancelled" ? "CANCELLED" : "FAILED";
+      terminalStatus = work.status === "exhausted" ? "exhausted" : work.status === "timed_out" ? "timed_out" : work.status === "cancelled" ? "cancelled" : "failed";
+      await deps.transitionExecution(execution, "WORK", terminal, work.errorCode ?? work.status);
+      resumedPhase = terminal;
+      return;
+    }
+    await deps.transitionExecution(execution, "WORK", "COMPLETE");
+    resumedPhase = "COMPLETE";
+    await deps.transitionExecution(execution, "COMPLETE", "RENDER");
+    resumedPhase = "RENDER";
+    const render = await deps.render({ execution, input, decision, snapshot, plan, work, signal: controller.signal });
+    if (render.toolCalls?.length) throw new Error("restart_resume_render_tool_call");
+    await deps.transitionExecution(execution, "RENDER", "PREPARE_COMMIT");
+    resumedPhase = "PREPARE_COMMIT";
+    const prepared = await deps.prepareRender({ execution, input, decision, snapshot, plan, work, render, signal: controller.signal });
+    const receipt = await deps.commit({ execution, input, decision, snapshot, plan, work, render, prepared, signal: controller.signal });
+    const committed = getTurnExecution(executionId, userId);
+    const durableReceipt = getTurnCommitReceipt(executionId, userId);
+    if (!receipt?.receiptId || receipt.commitKey !== durable.commitKey || committed?.phase !== "COMMITTED"
+      || durableReceipt?.id !== receipt.receiptId || durableReceipt.commitKey !== receipt.commitKey) throw new Error("restart_resume_commit_receipt_mismatch");
+    resumedPhase = "COMMITTED";
+    terminalStatus = "completed";
+  } catch (error) {
+    const current = getTurnExecution(executionId, userId);
+    if (current?.phase === "COMMITTED") return;
+    if (resumedPhase !== "WORK" && deps.transitionExecution) {
+      await deps.transitionExecution(execution, resumedPhase, "FAILED", error instanceof Error ? error.message : "restart_resume_internal_error");
+      resumedPhase = "FAILED";
+      terminalStatus = "failed";
+      return;
+    }
+    throw error;
+  } finally {
+    await deps.cleanup?.({ execution, input, decision, phase: resumedPhase, status: terminalStatus });
+  }
+  } catch (error) {
+    disposeDeadline();
+    carrier.clear();
+    runtimeOwner.close();
+    throw error;
+  }
+}
+
+const QUEUED_WORK_RECOVERY_PAGE_SIZE_V1 = 1_024;
+const QUEUED_WORK_TERMINAL_PHASES_V1 = new Set(["COMMIT_FAILED", "EXHAUSTED", "FAILED", "CANCELLED", "TIMED_OUT"]);
+
+function observeQueuedWorkConvergenceV1(
+  userId: string,
+  executionId: string,
+  requireNoActiveSegment: boolean,
+): "committed" | "terminalized" | "incomplete" {
+  const execution = getTurnExecution(executionId, userId);
+  if (execution?.phase === "COMMITTED") return "committed";
+  if (execution && execution.phase !== "WORK" && QUEUED_WORK_TERMINAL_PHASES_V1.has(execution.phase)) {
+    return "terminalized";
+  }
+  if (requireNoActiveSegment) {
+    const recovery = readWorkSegmentRecoveryChainV1(userId, executionId);
+    if (recovery && activeRecoveredSegmentV1(recovery)) return "incomplete";
+  }
+  return "incomplete";
+}
+
+/** Drain durable closed work_complete handoffs before active-segment recovery or generic turn convergence. */
+export async function resumeQueuedWorkCompletionsAfterInstallV1(
+  runtimeEpoch: number,
+  dependencies: Readonly<{ timeoutScheduler?: AgentTimeoutScheduler }> = {},
+): Promise<QueuedWorkResumeResultV1> {
+  const candidates = listQueuedWorkCompletionRecoveriesV1(runtimeEpoch);
+  let resumed = 0;
+  let terminalized = 0;
+  let healthy = true;
+  for (const candidate of candidates) {
+    const durable = getTurnExecution(candidate.recovery.executionId, candidate.recovery.userId);
+    const terminalTransition = candidate.transitions[candidate.transitions.length - 1];
+    if (candidate.recovery.state !== "closed" || candidate.recovery.currentSegmentId !== null
+      || !terminalTransition || terminalTransition.handoff.transitionKind !== "terminal"
+      || !durable?.casOwner || durable.phase !== "WORK" || durable.runtimeEpoch !== runtimeEpoch
+      || durable.casRevision !== candidate.recovery.executionCasRevision) {
+      healthy = false;
+      continue;
+    }
+    try {
+      if (convergeReachedQueuedWorkDeadlineV1(candidate, durable, false)) {
+        terminalized += 1;
+        continue;
+      }
+    } catch {
+      healthy = false;
+      continue;
+    }
+
+    const claimed = claimQueuedWorkCompletionRecoveryV1({
+      userId: candidate.recovery.userId,
+      executionId: candidate.recovery.executionId,
+      runtimeEpoch,
+      expectedOwnerToken: durable.casOwner,
+      expectedExecutionCasRevision: candidate.recovery.executionCasRevision,
+      expectedAttemptId: candidate.recovery.attemptId,
+      expectedWorkspaceId: candidate.recovery.workspaceId,
+      expectedTerminalTransitionId: terminalTransition.transitionId,
+      claimOwnerToken: "restart-completion-drain:" + runtimeEpoch + ":" + randomUUID(),
+      now: Date.now(),
+    });
+    if (!claimed) {
+      healthy = false;
+      continue;
+    }
+    try {
+      await resumeQueuedWorkChainV1(claimed, "completed", dependencies.timeoutScheduler);
+    } catch (error) {
+      const after = getTurnExecution(claimed.recovery.executionId, claimed.recovery.userId);
+      if (after?.phase === "WORK" && after.casOwner
+        && after.casRevision === claimed.recovery.executionCasRevision) {
+        try {
+          const cause = recoveredWorkFailureCauseV1(after, error);
+          transitionTurnExecution({
+            executionId: after.id,
+            ownerToken: after.casOwner,
+            expectedPhase: "WORK",
+            nextPhase: cause.phase,
+            reason: cause.reason,
+          });
+        } catch {
+          healthy = false;
+        }
+      }
+    }
+    const convergence = observeQueuedWorkConvergenceV1(
+      claimed.recovery.userId,
+      claimed.recovery.executionId,
+      false,
+    );
+    if (convergence === "committed") resumed += 1;
+    else if (convergence === "terminalized") terminalized += 1;
+    else healthy = false;
+  }
+  return Object.freeze({
+    resumed,
+    terminalized,
+    healthy,
+    complete: healthy && candidates.length < QUEUED_WORK_RECOVERY_PAGE_SIZE_V1,
+  });
+}
+
+/** Internal-only post-install active-segment drain; never creates or replays a public generation. */
+export async function resumeQueuedWorkSegmentsAfterInstallV1(
+  runtimeEpoch: number,
+  dependencies: Readonly<{ timeoutScheduler?: AgentTimeoutScheduler }> = {},
+): Promise<QueuedWorkResumeResultV1> {
+  const candidates = listQueuedWorkSegmentRecoveriesV1(runtimeEpoch);
+  let resumed = 0;
+  let terminalized = 0;
+  let healthy = true;
+  for (const candidate of candidates) {
+    const current = activeRecoveredSegmentV1(candidate);
+    const durable = getTurnExecution(candidate.recovery.executionId, candidate.recovery.userId);
+    if (!current || !durable?.casOwner || durable.phase !== "WORK"
+      || durable.runtimeEpoch !== runtimeEpoch
+      || durable.casRevision !== candidate.recovery.executionCasRevision) {
+      healthy = false;
+      continue;
+    }
+    try {
+      if (convergeReachedQueuedWorkDeadlineV1(candidate, durable, true)) {
+        terminalized += 1;
+        continue;
+      }
+    } catch {
+      healthy = false;
+      continue;
+    }
+
+    const claimed = claimQueuedWorkSegmentRecoveryV1({
+      userId: candidate.recovery.userId,
+      executionId: candidate.recovery.executionId,
+      runtimeEpoch,
+      expectedOwnerToken: durable.casOwner,
+      expectedExecutionCasRevision: candidate.recovery.executionCasRevision,
+      expectedSegmentId: current.identity.segmentId,
+      claimOwnerToken: "restart-drain:" + runtimeEpoch + ":" + randomUUID(),
+      now: Date.now(),
+    });
+    if (!claimed) {
+      healthy = false;
+      continue;
+    }
+    try {
+      await resumeQueuedWorkChainV1(claimed, "active", dependencies.timeoutScheduler);
+    } catch (error) {
+      const after = getTurnExecution(claimed.recovery.executionId, claimed.recovery.userId);
+      if (after?.phase === "WORK" && after.casOwner
+        && after.casRevision === claimed.recovery.executionCasRevision) {
+        try {
+          const cause = recoveredWorkFailureCauseV1(after, error);
+          terminalizeQueuedWorkV1(claimed, cause.reason, cause.phase);
+        } catch {
+          healthy = false;
+        }
+      }
+    }
+    const convergence = observeQueuedWorkConvergenceV1(
+      claimed.recovery.userId,
+      claimed.recovery.executionId,
+      true,
+    );
+    if (convergence === "committed") resumed += 1;
+    else if (convergence === "terminalized") terminalized += 1;
+    else healthy = false;
+  }
+  return Object.freeze({
+    resumed,
+    terminalized,
+    healthy,
+    complete: healthy && candidates.length < QUEUED_WORK_RECOVERY_PAGE_SIZE_V1,
+  });
+}
 /** Install all concrete Agentic authorities before request routes are served. */
 export function installAgenticGenerationCoordinator(): void {
   if (installed || installationMarker.get()) return;
   try {
+    const runtimeEpoch = getRuntimeEpoch();
+    const deferredWorkExecutionIds = new Set([
+      ...listQueuedWorkCompletionRecoveriesV1(runtimeEpoch),
+      ...listQueuedWorkSegmentRecoveriesV1(runtimeEpoch),
+    ].map((candidate) => candidate.recovery.executionId));
     const recovery = reconcilePersistentWorkspaceSessions();
     if (!recovery.complete) {
-      throw new Error("persistent session recovery incomplete");
+      const unresolvedSessions = getDb().query(
+        "SELECT execution_id FROM persistent_workspace_turn_sessions WHERE phase <> 'TERMINAL' OR status <> 'terminal'",
+      ).all() as Array<{ execution_id?: unknown }>;
+      const exclusivelyDeferredWork = recovery.inspected > 0
+        && unresolvedSessions.length > 0
+        && unresolvedSessions.every(({ execution_id }) =>
+          typeof execution_id === "string" && deferredWorkExecutionIds.has(execution_id));
+      if (!exclusivelyDeferredWork) {
+        throw new Error("persistent session recovery incomplete");
+      }
     }
     // Publish the process marker only after every concrete authority is wired.
     // A bootstrap probe may have touched the default fail-closed decision
@@ -6556,7 +9551,21 @@ export function installAgenticGenerationCoordinator(): void {
 }
 
 export const __testing = {
+  appendSettledMutationReservationsForActiveV1,
+  freezeConnectionCredentials,
+  recoveredWorkFailureCauseV1,
+  createProductionWorkSegmentLifecycleV1,
+  createWorkDispatchIdentityAuthorityV1,
+  publicWorkActivityNodeIdV1,
+  startSerializedLeaseHeartbeatV1,
+  createPreSegmentHeartbeatOwnershipV1,
+  selectTerminalOwnerHeartbeatV1,
+  boundFinalSegmentProviderInputV1,
+  finalizeUnderOwnerLeaseV1,
+  recoveredGenerationInputV1,
+  recoveredDecisionV1,
   buildDependencies,
+  workProviderGenerationParametersV1,
   makeWorkProvider,
   recordChildProviderExchange,
   createChildInspectionCorrelation,
@@ -6582,6 +9591,7 @@ export const __testing = {
   HOST_RENDER_FINAL_RESPONSE_CONTRACT,
   buildAgenticRenderPolicyMessages,
   recordRenderCrossings,
+  recordInspectionPrompts,
   makeRevisionReader,
   terminalInspectionReason,
   setPersistentRecoveryClock(clock?: (() => number) | null): void {

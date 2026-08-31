@@ -153,7 +153,6 @@ const WORKSPACE_TOOL_KEYS: Record<WorkspaceCapability, string> = {
   read_page: 'workspace_read_page',
   update_assigned_progress: 'workspace_update_progress',
   submit_child_result: 'workspace_submit_result',
-  record_question: 'workspace_record_question',
 }
 
 const SECTION_ICONS: Record<SectionId, typeof Gauge> = {
@@ -1439,8 +1438,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       conflictSourceRef.current = 'external_hydration'
       setSaveState('conflict')
     }
-    void agenticRuntimeApi.getEditor(preset.id).then((projection) => {
+    void agenticRuntimeApi.getEditor(preset.id).then(async (projection) => {
       if (!active) return
+      let hydrationPreset = preset
+      let hydrationPromptOrder = preset.blocks
+      let reconciledIdentity = false
       const projectionShapeValid = projection.presetId === preset.id
         && isNonNegativeSafeInteger(projection.presetRevision)
         && isNonNegativeSafeInteger(projection.configRevision)
@@ -1450,7 +1452,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       const matched = projectionShapeValid
         && projection.presetRevision === currentPresetRevision
         && projection.configRevision === currentConfigRevision
-      if (!matched) {
+      if (!projectionShapeValid || !matched && dirtyRef.current) {
         hydratedIdentityRef.current = null
         pendingExternalDraftRef.current = null
         pendingExternalPromptOrderRef.current = null
@@ -1461,8 +1463,22 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         setSaveState(dirtyRef.current || revisionChanged ? 'conflict' : 'error')
         return
       }
+      if (!matched) {
+        const snapshot = readMatchedEditorSnapshot(await onReload())
+        if (!active) return
+        if (!snapshot
+          || snapshot.editor.presetId !== preset.id
+          || snapshot.editor.presetRevision < projection.presetRevision
+          || snapshot.editor.configRevision < projection.configRevision) {
+          throw new Error('Initial runtime reload did not return a current matched preset/editor snapshot')
+        }
+        projection = snapshot.editor
+        hydrationPreset = snapshot.preset
+        hydrationPromptOrder = snapshot.promptOrder
+        reconciledIdentity = true
+      }
       const projectedReviewItems = getAgenticRuntimeRepairItems({
-        ...preset,
+        ...hydrationPreset,
         agentConfigReview: projection.review,
       })
       const identity = {
@@ -1470,9 +1486,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         presetRevision: projection.presetRevision,
         configRevision: projection.configRevision,
       }
+      if (reconciledIdentity) lastReturnedIdentityRef.current = identity
       if (dirtyRef.current) {
-        pendingExternalDraftRef.current = hydrateDraftFromEditor(draftRef.current, projection, preset.blocks)
-        pendingExternalPromptOrderRef.current = structuredClone(preset.blocks)
+        pendingExternalDraftRef.current = hydrateDraftFromEditor(draftRef.current, projection, hydrationPromptOrder)
+        pendingExternalPromptOrderRef.current = structuredClone(hydrationPromptOrder)
         hydratedIdentityRef.current = identity
         setHostCeilings(projection.hostCeilings)
         setEditorReviewItems(projectedReviewItems)
@@ -1484,8 +1501,8 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         }
         return
       }
-      const hydrated = hydrateDraftFromEditor(draftRef.current, projection, preset.blocks)
-      const nextPromptOrder = structuredClone(preset.blocks)
+      const hydrated = hydrateDraftFromEditor(draftRef.current, projection, hydrationPromptOrder)
+      const nextPromptOrder = structuredClone(hydrationPromptOrder)
       committedDraftRef.current = structuredClone(hydrated)
       committedPromptOrderRef.current = nextPromptOrder
       pendingExternalDraftRef.current = null
@@ -1508,6 +1525,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       if (!active) return
       const missingProjection = error instanceof ApiError && error.status === 404
       if (!missingProjection || dirtyRef.current) {
+        console.error('[AgenticRuntimePanel] Failed to load the runtime editor:', error)
         hydratedIdentityRef.current = null
         pendingExternalDraftRef.current = null
         pendingExternalPromptOrderRef.current = null
@@ -1723,12 +1741,13 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   const updatePolicyEntry = (
     policyKey: PolicyKey,
     blockId: string,
+    occurrence: number,
     updater: (entry: LoomPolicyEntryV1) => LoomPolicyEntryV1,
   ) => {
     updateConfig((config) => {
       const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
       const entries = buckets[policyKey]
-      const index = entries.findIndex((entry) => entry.source.blockId === blockId)
+      const index = entries.findIndex((entry) => entry.source.blockId === blockId && entry.source.promptOrder === occurrence)
       if (index < 0) return config
       const nextEntries = entries.map((entry, entryIndex) => (
         entryIndex === index ? updater(entry) : entry
@@ -1740,7 +1759,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     })
   }
 
-  const togglePolicyBlock = (policyKey: PolicyKey, block: PromptBlock, checked: boolean) => {
+  const togglePolicyBlock = (policyKey: PolicyKey, block: PromptBlock, occurrence: number, checked: boolean) => {
     if (checked && block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
       toast.error(t('limits.invalidBlockRevision'))
       return
@@ -1748,16 +1767,16 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     updateConfig((config) => {
       const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
       const currentEntries = buckets[policyKey]
-      const existing = currentEntries.find((entry) => entry.source.blockId === block.id)
+      const existing = currentEntries.find((entry) => entry.source.blockId === block.id && entry.source.promptOrder === occurrence)
       const totalEntries = POLICY_KEYS.reduce((total, bucket) => total + buckets[bucket].length, 0)
       if (checked) {
-        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
-        if (promptIndex < 0) return config
+        const currentBlock = promptOrder[occurrence]
+        if (!currentBlock || currentBlock !== block || currentBlock.id !== block.id) return config
         const entry = createLoomPolicyEntryV1(
           policyKey,
           block,
           preset.cacheRevision ?? 0,
-          promptIndex,
+          occurrence,
           existing,
         )
         if (existing) {
@@ -1781,15 +1800,13 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       }
       return setAgentRuntimePolicyBuckets(config, {
         ...buckets,
-        [policyKey]: currentEntries.filter((entry) => entry.source.blockId !== block.id),
+        [policyKey]: currentEntries.filter((entry) => entry.source.blockId !== block.id || entry.source.promptOrder !== occurrence),
       })
     })
   }
-  const currentLoomSourceForBlock = (blockId: string): LoomPolicySourceV1 | null => {
-    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === blockId)
-    if (promptIndex < 0) return null
-    const block = promptOrder[promptIndex]
-    if (!block || block.marker === 'category'
+  const currentLoomSourceForBlock = (blockId: string, occurrence: number): LoomPolicySourceV1 | null => {
+    const block = promptOrder[occurrence]
+    if (!block || block.id !== blockId || block.marker === 'category'
       || block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
       return null
     }
@@ -1798,7 +1815,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       blockId,
       presetRevision: preset.cacheRevision ?? 0,
       blockRevision: block.revision ?? 1,
-      promptOrder: promptIndex,
+      promptOrder: occurrence,
     }
   }
   const stageCurrentLoomRevisions = () => {
@@ -1807,11 +1824,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     updateConfig((config) => {
       const buckets = getAgentRuntimePolicyBuckets(config, promptOrder)
       const restageEntry = (policyKey: PolicyKey, entry: LoomPolicyEntryV1): LoomPolicyEntryV1 => {
-        const promptIndex = promptOrder.findIndex((candidate) => candidate.id === entry.source.blockId)
-        const block = promptOrder[promptIndex]
-        if (promptIndex < 0 || !block || block.marker === 'category') return entry
+        const occurrence = entry.source.promptOrder
+        const block = promptOrder[occurrence]
+        if (!block || block.id !== entry.source.blockId || block.marker === 'category') return entry
         if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) return entry
-        return createLoomPolicyEntryV1(policyKey, block, currentPresetRevision, promptIndex, entry)
+        return createLoomPolicyEntryV1(policyKey, block, currentPresetRevision, occurrence, entry)
       }
       const restagedBuckets: LoomPolicyBucketsV1 = {
         version: 1,
@@ -1823,10 +1840,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       const withBuckets = setAgentRuntimePolicyBuckets(config, restagedBuckets)
       const restagedPhases = getAgentRuntimeCustomPhases(withBuckets).map((phase) => ({
         ...phase,
-        instructionRefs: phase.instructionRefs.map((source) => currentLoomSourceForBlock(source.blockId) ?? source),
+        instructionRefs: phase.instructionRefs.map((source) => currentLoomSourceForBlock(source.blockId, source.promptOrder) ?? source),
         childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
           ...subset,
-          instructionRefs: subset.instructionRefs.map((source) => currentLoomSourceForBlock(source.blockId) ?? source),
+          instructionRefs: subset.instructionRefs.map((source) => currentLoomSourceForBlock(source.blockId, source.promptOrder) ?? source),
         })),
       }))
       return setAgentRuntimeCustomPhases(withBuckets, restagedPhases)
@@ -1843,12 +1860,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         const entry = draftLoomPolicy[bucket][Number(entryMatch[2])]
         const promptIndex = entry === undefined
           ? -1
-          : promptOrder.findIndex((candidate) => candidate.id === entry.source.blockId)
+          : entry.source.promptOrder
         const block = promptOrder[promptIndex]
         if (entry && block && block.marker !== 'category' && (
           block.revision === undefined || isCanonicalBlockRevision(block.revision)
         )) {
-          updatePolicyEntry(bucket, entry.source.blockId, (current) => (
+          updatePolicyEntry(bucket, entry.source.blockId, entry.source.promptOrder, (current) => (
             createLoomPolicyEntryV1(
               bucket,
               block,
@@ -1865,7 +1882,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
         const phaseIndex = Number(phaseSourceMatch[1])
         const sourceIndex = Number(phaseSourceMatch[2])
         const source = draftCustomPhases[phaseIndex]?.instructionRefs[sourceIndex]
-        const replacement = source === undefined ? null : currentLoomSourceForBlock(source.blockId)
+        const replacement = source === undefined ? null : currentLoomSourceForBlock(source.blockId, source.promptOrder)
         if (source && replacement) {
           updateConfig((config) => {
             const phases = getAgentRuntimeCustomPhases(config)
@@ -1875,12 +1892,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
               ? {
                   ...phase,
                   instructionRefs: phase.instructionRefs.map((candidate) => (
-                    candidate.blockId === source.blockId ? replacement : candidate
+                    candidate.blockId === source.blockId && candidate.promptOrder === source.promptOrder ? replacement : candidate
                   )),
                   childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
                     ...subset,
                     instructionRefs: subset.instructionRefs.map((candidate) => (
-                      candidate.blockId === source.blockId ? replacement : candidate
+                      candidate.blockId === source.blockId && candidate.promptOrder === source.promptOrder ? replacement : candidate
                     )),
                   })),
                 }
@@ -1951,15 +1968,20 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
           const removedBlockId = isObjectRecord(removedSource) && typeof removedSource.blockId === 'string'
             ? removedSource.blockId
             : null
+          const removedPromptOrder = isObjectRecord(removedSource) && Number.isSafeInteger(removedSource.promptOrder)
+            ? removedSource.promptOrder
+            : null
           const nextRefs = rawPhase.instructionRefs.slice()
           nextRefs.splice(instructionIndex, 1)
           const nextSubsets = Array.isArray(rawPhase.childInstructionSubsets)
             ? rawPhase.childInstructionSubsets.map((subset) => (
-                isObjectRecord(subset) && Array.isArray(subset.instructionRefs) && removedBlockId !== null
+                isObjectRecord(subset) && Array.isArray(subset.instructionRefs) && removedBlockId !== null && removedPromptOrder !== null
                   ? {
                       ...subset,
                       instructionRefs: subset.instructionRefs.filter((source) => (
-                        !isObjectRecord(source) || source.blockId !== removedBlockId
+                        !isObjectRecord(source)
+                          || source.blockId !== removedBlockId
+                          || source.promptOrder !== removedPromptOrder
                       )),
                     }
                   : subset
@@ -2117,20 +2139,21 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
   const toggleCustomPhaseInstruction = (
     phaseIndex: number,
     block: PromptBlock,
+    occurrence: number,
     checked: boolean,
   ) => {
     if (!checked) {
       updateCustomPhase(phaseIndex, (phase) => ({
         ...phase,
-        instructionRefs: phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+        instructionRefs: phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id || candidate.promptOrder !== occurrence),
         childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
           ...subset,
-          instructionRefs: subset.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+          instructionRefs: subset.instructionRefs.filter((candidate) => candidate.blockId !== block.id || candidate.promptOrder !== occurrence),
         })),
       }))
       return
     }
-    const source = currentLoomSourceForBlock(block.id)
+    const source = currentLoomSourceForBlock(block.id, occurrence)
     if (!source) {
       if (block.revision !== undefined && !isCanonicalBlockRevision(block.revision)) {
         toast.error(t('limits.invalidBlockRevision'))
@@ -2140,13 +2163,13 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
     updateCustomPhase(phaseIndex, (phase) => ({
       ...phase,
       instructionRefs: [
-        ...phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id),
+        ...phase.instructionRefs.filter((candidate) => candidate.blockId !== block.id || candidate.promptOrder !== occurrence),
         source,
       ],
       childInstructionSubsets: phase.childInstructionSubsets.map((subset) => ({
         ...subset,
         instructionRefs: subset.instructionRefs.map((candidate) => (
-          candidate.blockId === block.id ? source : candidate
+          candidate.blockId === block.id && candidate.promptOrder === occurrence ? source : candidate
         )),
       })),
     }))
@@ -2172,12 +2195,15 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
           : phase
       }
       const existing = phase.childInstructionSubsets[existingIndex]!
+      const sameOccurrence = (candidate: LoomPolicySourceV1) => (
+        candidate.blockId === source.blockId && candidate.promptOrder === source.promptOrder
+      )
       const instructionRefs = checked
         ? [
-            ...existing.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId),
+            ...existing.instructionRefs.filter((candidate) => !sameOccurrence(candidate)),
             source,
           ]
-        : existing.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId)
+        : existing.instructionRefs.filter((candidate) => !sameOccurrence(candidate))
       return {
         ...phase,
         childInstructionSubsets: phase.childInstructionSubsets.map((subset, subsetIndex) => (
@@ -2852,7 +2878,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
       {draftCustomPhases.length === 0 && <p className={styles.empty}>{t('customPhases.empty')}</p>}
       {draftCustomPhases.map((phase, phaseIndex) => {
         const nextPhase = draftCustomPhases[phaseIndex + 1]
-        const selectedBlockIds = new Set(phase.instructionRefs.map((source) => source.blockId))
+        const selectedPromptOccurrences = new Set(phase.instructionRefs.map((source) => `${source.blockId}\u0000${source.promptOrder}`))
         const transitionTargets = [...new Set([
           phase.id,
           ...(nextPhase ? [nextPhase.id] : []),
@@ -2958,12 +2984,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                 <legend className={styles.fieldLabel}>{t('customPhases.instructions')}</legend>
                 <p className={styles.muted}>{t('customPhases.instructionsHint')}</p>
                 <div className={styles.optionList}>
-                  {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
-                    const source = phase.instructionRefs.find((candidate) => candidate.blockId === block.id)
+                  {promptOrder.map((block, promptIndex) => {
+                    if (block.marker === 'category') return null
+                    const source = phase.instructionRefs.find((candidate) => candidate.blockId === block.id && candidate.promptOrder === promptIndex)
                     const blockRevision = block.revision === undefined
                       ? 1
                       : isCanonicalBlockRevision(block.revision) ? block.revision : null
-                    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
                     const needsRepair = source !== undefined && (
                       blockRevision === null
                       || source.presetRevision !== (preset.cacheRevision ?? 0)
@@ -2971,17 +2997,17 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                       || source.promptOrder !== promptIndex
                     )
                     return (
-                      <div className={styles.sourceChoiceRow} key={`${phase.id}-instruction-${block.id}`}>
+                      <div className={styles.sourceChoiceRow} key={`${phase.id}-instruction-${block.id}-${promptIndex}`}>
                         <label className={clsx(
                           styles.listChoice,
                           (needsRepair || blockRevision === null) && styles.listChoiceInvalid,
                         )}>
                           <input
                             type="checkbox"
-                            checked={selectedBlockIds.has(block.id)}
+                            checked={selectedPromptOccurrences.has(`${block.id}\u0000${promptIndex}`)}
                             disabled={blockRevision === null && source === undefined}
                             aria-invalid={needsRepair || blockRevision === null}
-                            onChange={(event) => toggleCustomPhaseInstruction(phaseIndex, block, event.target.checked)}
+                            onChange={(event) => toggleCustomPhaseInstruction(phaseIndex, block, promptIndex, event.target.checked)}
                           />
                           <span>
                             <strong>{block.name}</strong>
@@ -2999,7 +3025,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                           <button
                             type="button"
                             className={styles.button}
-                            onClick={() => toggleCustomPhaseInstruction(phaseIndex, block, true)}
+                            onClick={() => toggleCustomPhaseInstruction(phaseIndex, block, promptIndex, true)}
                           >
                             <RefreshCw size={16} aria-hidden="true" />
                             {t('repair.actions.select_revision')}
@@ -3009,11 +3035,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                     )
                   })}
                   {phase.instructionRefs
-                    .filter((source) => !promptOrder.some((block) => (
-                      block.id === source.blockId && block.marker !== 'category'
-                    )))
+                    .filter((source) => {
+                      const block = promptOrder[source.promptOrder]
+                      return !block || block.id !== source.blockId || block.marker === 'category'
+                    })
                     .map((source) => (
-                      <div role="alert" className={clsx(styles.listChoice, styles.listChoiceInvalid, styles.sourceChoiceStatic)} key={`${phase.id}-unknown-${source.blockId}`}>
+                      <div role="alert" className={clsx(styles.listChoice, styles.listChoiceInvalid, styles.sourceChoiceStatic)} key={`${phase.id}-unknown-${source.blockId}-${source.promptOrder}`}>
                         <span>
                           <strong>{source.blockId}</strong>
                           <small>{t('customPhases.unavailableInstruction', { id: source.blockId })}</small>
@@ -3028,10 +3055,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                           className={styles.iconButton}
                           onClick={() => updateCustomPhase(phaseIndex, (current) => ({
                             ...current,
-                            instructionRefs: current.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId),
+                            instructionRefs: current.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId || candidate.promptOrder !== source.promptOrder),
                             childInstructionSubsets: current.childInstructionSubsets.map((subset) => ({
                               ...subset,
-                              instructionRefs: subset.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId),
+                              instructionRefs: subset.instructionRefs.filter((candidate) => candidate.blockId !== source.blockId || candidate.promptOrder !== source.promptOrder),
                             })),
                           }))}
                           aria-label={t('customPhases.removeInstruction', { id: source.blockId })}
@@ -3052,7 +3079,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                     {draftProfiles.map((profile) => {
                       const subsetIndex = phase.childInstructionSubsets.findIndex((subset) => subset.profileId === profile.id)
                       const subset = subsetIndex < 0 ? undefined : phase.childInstructionSubsets[subsetIndex]
-                      const assignedBlockIds = new Set(subset?.instructionRefs.map((source) => source.blockId) ?? [])
+                      const assignedPromptOccurrences = new Set(subset?.instructionRefs.map((source) => `${source.blockId}\u0000${source.promptOrder}`) ?? [])
                       const subsetHasRepair = subsetIndex >= 0 && validation.issues.some((issue) => (
                         issue.path.startsWith(
                           `config.runtimePolicy.phases.${phaseIndex}.childInstructionSubsets.${subsetIndex}`,
@@ -3095,10 +3122,8 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                           )}
                           <div className={styles.optionList}>
                             {phase.instructionRefs.map((source) => {
-                              const block = promptOrder.find((candidate) => candidate.id === source.blockId)
-                              const promptIndex = block === undefined
-                                ? -1
-                                : promptOrder.findIndex((candidate) => candidate.id === source.blockId)
+                              const block = promptOrder[source.promptOrder]
+                              const promptIndex = block === undefined || block.id !== source.blockId ? -1 : source.promptOrder
                               const blockRevision = block === undefined
                                 ? null
                                 : block.revision === undefined
@@ -3112,11 +3137,11 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                               return (
                                 <label
                                   className={clsx(styles.listChoice, stale && styles.listChoiceInvalid)}
-                                  key={`${phase.id}-${profile.id}-child-instruction-${source.blockId}`}
+                                  key={`${phase.id}-${profile.id}-child-instruction-${source.blockId}-${source.promptOrder}`}
                                 >
                                   <input
                                     type="checkbox"
-                                    checked={assignedBlockIds.has(source.blockId)}
+                                    checked={assignedPromptOccurrences.has(`${source.blockId}\u0000${source.promptOrder}`)}
                                     aria-invalid={stale}
                                     disabled={subset === undefined || draftControlsLocked}
                                     onChange={(event) => toggleCustomPhaseChildSubset(
@@ -3173,7 +3198,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                           <p className={styles.fieldError} role="alert">{t('customPhases.childSubsetRepair')}</p>
                           <div className={styles.optionList}>
                             {subset.instructionRefs.map((source) => (
-                              <div className={styles.listChoiceInvalid} key={`${phase.id}-orphan-${subset.profileId}-${source.blockId}`}>
+                              <div className={styles.listChoiceInvalid} key={`${phase.id}-orphan-${subset.profileId}-${source.blockId}-${source.promptOrder}`}>
                                 <span>
                                   <strong>{source.blockId}</strong>
                                   <small>{t('phases.sourceRevision', {
@@ -3350,7 +3375,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                       <strong>{phase.label || phase.id}</strong>
                       <small>{t('customPhases.summary', { number: phaseIndex + 1, id: phase.id })}</small>
                       {phase.instructionRefs.map((source) => (
-                        <small key={`response-omission-phase-${phase.id}-${source.blockId}`}>
+                        <small key={`response-omission-phase-${phase.id}-${source.blockId}-${source.promptOrder}`}>
                           {t('phases.responseOmissionPhaseInstruction', {
                             blockId: source.blockId,
                             blockRevision: source.blockRevision,
@@ -3390,12 +3415,12 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                   })}</span>
                 </div>
                 <div className={styles.optionList}>
-                  {promptOrder.filter((block) => block.marker !== 'category').map((block) => {
-                    const entry = entries.find((candidate) => candidate.source.blockId === block.id)
+                  {promptOrder.map((block, promptIndex) => {
+                    if (block.marker === 'category') return null
+                    const entry = entries.find((candidate) => candidate.source.blockId === block.id && candidate.source.promptOrder === promptIndex)
                     const blockRevision = block.revision === undefined
                       ? 1
                       : isCanonicalBlockRevision(block.revision) ? block.revision : null
-                    const promptIndex = promptOrder.findIndex((candidate) => candidate.id === block.id)
                     const needsRepair = entry !== undefined && (
                       blockRevision === null
                       || entry.source.presetRevision !== (preset.cacheRevision ?? 0)
@@ -3403,7 +3428,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                       || entry.source.promptOrder !== promptIndex
                     )
                     return (
-                      <div key={`${policyKey}-${block.id}`} className={styles.editorStack}>
+                      <div key={`${policyKey}-${block.id}-${promptIndex}`} className={styles.editorStack}>
                         <div className={styles.sourceChoiceRow}>
                           <label className={clsx(
                             styles.listChoice,
@@ -3414,7 +3439,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                               checked={entry !== undefined}
                               disabled={blockRevision === null && entry === undefined}
                               aria-invalid={needsRepair || blockRevision === null}
-                              onChange={(event) => togglePolicyBlock(policyKey, block, event.target.checked)}
+                              onChange={(event) => togglePolicyBlock(policyKey, block, promptIndex, event.target.checked)}
                             />
                             <span>
                               <strong>{block.name}</strong>
@@ -3432,7 +3457,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                             <button
                               type="button"
                               className={styles.button}
-                              onClick={() => togglePolicyBlock(policyKey, block, true)}
+                              onClick={() => togglePolicyBlock(policyKey, block, promptIndex, true)}
                             >
                               <RefreshCw size={16} aria-hidden="true" />
                               {t('repair.actions.select_revision')}
@@ -3455,7 +3480,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                                   type="checkbox"
                                   checked={entry.required}
                                   aria-label={t('phases.requiredFor', { name: block.name })}
-                                  onChange={(event) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, required: event.target.checked }))}
+                                  onChange={(event) => updatePolicyEntry(policyKey, block.id, promptIndex, (current) => ({ ...current, required: event.target.checked }))}
                                 />
                               </label>
                               <label className={styles.settingRow}>
@@ -3464,7 +3489,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                                   type="checkbox"
                                   checked={entry.condition !== undefined}
                                   aria-label={t('phases.conditionFor', { name: block.name })}
-                                  onChange={(event) => updatePolicyEntry(policyKey, block.id, (current) => {
+                                  onChange={(event) => updatePolicyEntry(policyKey, block.id, promptIndex, (current) => {
                                     if (event.target.checked) {
                                       return {
                                         ...current,
@@ -3482,7 +3507,7 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                                 value={entry.condition}
                                 taskTemplateIds={taskTemplateIds}
                                 disabled={draftControlsLocked}
-                                onChange={(condition) => updatePolicyEntry(policyKey, block.id, (current) => ({ ...current, condition }))}
+                                onChange={(condition) => updatePolicyEntry(policyKey, block.id, promptIndex, (current) => ({ ...current, condition }))}
                               />
                             )}
                           </div>
@@ -3491,9 +3516,10 @@ export default function AgenticRuntimePanel({ preset, onSave, onReload, onDirtyC
                     )
                   })}
                   {entries
-                    .filter((entry) => !promptOrder.some((block) => (
-                      block.id === entry.source.blockId && block.marker !== 'category'
-                    )))
+                    .filter((entry) => {
+                      const block = promptOrder[entry.source.promptOrder]
+                      return !block || block.id !== entry.source.blockId || block.marker === 'category'
+                    })
                     .map((entry) => (
                       <div
                         role="alert"

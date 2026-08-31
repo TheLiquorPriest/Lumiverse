@@ -37,9 +37,10 @@ On Lumiverse boot, all enabled extensions are started after database migrations 
 ## WORK Engine lifecycle
 
 The WORK Engine is a strict, single-turn runtime behind the authenticated
-generation routes. A request creates one **Turn Session** and one immutable
-attempt lineage. The request is admitted only after the server resolves the
-authenticated target, runtime mode, concrete provider capability set, frozen
+generation routes. A request creates one **Turn Execution** and one immutable
+attempt lineage. An attempt contains ordered durable **Work Segments**, never a
+new user turn per segment. The request is admitted only after the server resolves
+the authenticated target, runtime mode, concrete provider capability set, frozen
 input revisions, and readiness gates. A request that asks for WORK never
 silently becomes Response.
 
@@ -101,9 +102,17 @@ creates no attempt, projection, or terminal publication.
 3. **Assembly:** the host freezes the `GenerationAssemblySnapshotV1` and
    produces an `AssemblyPlanV1`. No provider request or workspace mutation is
    made before the plan passes validation.
-4. **WORK:** deterministic child descriptors run in order, then the root
-   provider may use only its admitted tool/delegation capabilities. WORK
-   notes and private child material are retained only for owner inspection.
+4. **WORK:** deterministic child descriptors run in order, then the root runs
+   one or more ordered Work Segments with only its admitted tool/delegation
+   capabilities. Every segment receives fresh current-phase provider context;
+   prior-segment provider prose/messages, tool calls/results, hidden reasoning,
+   opaque continuation carrier, and stale phase instructions are not replayed
+   into it. This next-segment retirement does not reduce the pre-existing
+   bounded provider/tool fields available to authenticated owner inspection;
+   only raw hidden reasoning and opaque continuation carriers are prohibited.
+   The provider-neutral `WorkSegmentRunnerV1` owns this boundary: one future
+   Pi run maps to exactly one admitted segment, while the host alone owns
+   completion, final render, durable commit, and attempt closure.
 5. **Completion handoff and render:** public `PREPARE_COMMIT` marks accepted
    completion and freezes the workspace and render context. Public `RENDER`
    then produces the final response with tools disabled. A tool call in
@@ -115,6 +124,94 @@ creates no attempt, projection, or terminal publication.
    one transaction. Cancellation, deadline, provider failure, required-work
    failure, or exhaustion before that boundary produces a terminal outcome
    without an authoritative chat write.
+
+Within WORK, each provider result is durably classified as an admissible host
+tool action, tool-free stop, reasoning-only stop, reasoning-only length
+exhaustion, empty provider response, or provider protocol failure. An admitted
+tool action executes and settles before continuation. Tool-free and
+reasoning-only stops consume bounded unsigned-boundary recovery; length
+exhaustion may roll over under the same authored occurrence. Empty or protocol
+failure boundaries recover only under explicit host policy and otherwise close
+with a typed cause; an unknown in-flight dispatch is never replayed. Recoverable
+boundaries close only the current segment. Only terminal attempt failure,
+exhaustion, or cancellation closes the attempt. Provider prose never chooses
+the recovery branch.
+
+Four limits remain independent: attempt budget, segment budget, the hard
+per-dispatch output cap, and protected recovery/future-phase reserves. Exhausting
+one does not borrow from or reset another. Terminal closure records a typed
+`failed`, `exhausted`, or `cancelled` result and stable cause. Authored advance
+may release reserve only for phases no longer required; repeat and rollover
+cannot. Required-tool recovery is available only when the frozen provider
+positively declares provider-neutral support and at least one host tool is
+admitted.
+
+When a durable Segment lifecycle is present, its attempt, segment, dispatch,
+reserve, unsigned-boundary, tool, and workspace-operation balances are the sole
+WORK budget authority; the legacy process-wide provider/tool/workspace fuses
+remain only for non-segment callers. Workspace operations reserve their durable
+count before the side effect, including failed operations. Provider billing
+uses the conservative canonical result across visible content, reasoning,
+thinking blocks, and tool payloads when provider usage is absent or lower;
+visible output bytes remain a separate publication bound.
+
+Crash persistence is ordered: reserve the dispatch, mark it in flight, settle
+its boundary and accepted workspace effects, commit the handoff/segment close,
+then admit the successor. Every step is idempotent under exact identity and CAS.
+Recovery atomically claims one admitted no-dispatch Segment before resolving a
+credential or provider. It reconstructs only the persisted input, decision,
+target, snapshot, phase, workspace, tool-grant, owner-limit, and attempt
+authorities, then enters the admitted-Segment resume seam without replaying
+Assembly, deterministic children, Cortex, council, or pre-Segment mutations.
+The execution-owner lease renews from WORK entry through Cortex, children, and
+council under the immutable admitted owner token, CAS revision, and runtime
+epoch. On first durable Segment admission, the host performs an immediate
+segment-fenced renewal, arms that cadence, and only then joins the generic
+cadence, so the ownership handoff has no unleased gap. An admitted recovered
+Segment that is cancelled or fails before its first dispatch performs the same
+handoff before terminal preparation; only a close with no durable Segment may
+final-renew and stop the generic cadence directly. The process registry retains
+ownership of the generic cadence through root credential resolution, option
+construction, and resumed-input validation. A single failure-safe ownership
+scope removes the registry entry and joins the timer on every return or throw,
+including failures before the runner reaches its guaranteed-close boundary.
+Each in-flight dispatch lease renews independently under its exact
+segment/dispatch fence; losing any fence aborts the local provider signal and
+leaves unknown dispatch work for later fencing. Renewal remains active through
+dispatch settlement and terminal
+preparation. The host then joins one final fenced renewal, stops the cadence,
+and immediately performs the synchronous atomic terminal write under that
+retained, unexpired authority; no renewal may run after the recovery row closes.
+A lost owner fence projects typed recovery failure rather than an apparent
+local close. Recovery may also atomically admit the deterministic successor in
+the zero-active committed-handoff gap, but never duplicates
+unknown provider work, tools-disabled render, or the atomic chat commit.
+
+### Authoring WORK phases
+
+Author each phase as one bounded objective with explicit exit criteria and the
+smallest capability set it needs. Fresh context includes the frozen root
+objective/snapshot, exact current-phase instructions and criteria, frozen
+admitted tool/delegation capabilities and protocol capability state, remaining
+budgets, host-accepted workspace records and open required IDs, and at most the
+previous bounded handoff. It excludes prior-segment provider prose/messages,
+tool calls/results, hidden reasoning, opaque continuation carrier, stale phase
+instructions, and unaccepted workspace/prose claims.
+Immediately before durable dispatch reservation, the Segment owner reconstructs
+the provider input from those authorities, appends occurrence messages followed
+by exactly one fresh host phase-control message, clones the final aggregate, and
+applies the trusted input-byte bound. Reconstruction failure or an over-limit
+aggregate creates no dispatch reservation and incurs no provider charge.
+
+Facts needed later must be recorded durably through accepted workspace records,
+accepted submissions, or the bounded handoff. Provider prose and tool-result
+text are not continuity. **Advance** selects a declared later phase. A
+**same-phase repeat** creates a new segment and increments the authored phase
+occurrence. A **recovery rollover** creates a new segment but retains the same
+authored occurrence. A skipped phase creates no segment. A preset with no custom
+phases has exactly one WORK segment unless recovery creates a rollover segment.
+The declared plan is immutable: runtime routing cannot synthesize a phase or
+carry provider text across a boundary.
 
 The immutable execution row is terminal cause authority. Terminal publication
 then uses one exact-identity transaction for the persistent Turn Session,
@@ -131,7 +228,10 @@ execution and exact inspection agree on `FAILED / rejected / invalid_input`,
 the target identity is exact, and no commit receipt exists. Any near-match or
 unrelated terminal mismatch remains immutable and fails readiness closed.
 This includes failures after durable admission but before workspace setup
-finishes. Cleanup releases process resources only. When source-chat deletion
+finishes: an authoritative `agentic_runtime_unavailable` execution converges
+an absent inspection/projection pair as terminal `rejected / invalid_input`,
+never as a conflicting generic failure. Cleanup releases process resources
+only. When source-chat deletion
 has already removed every chat-owned projection, recovery converges the
 surviving detached Turn Session from the terminal execution and emits no chat
 event.
@@ -173,6 +273,7 @@ no-longer-visible record is a non-disclosing `404`.
 Inspection is layered: summary/activity, Turn Session entries, transcript
 records, prompt evidence, Cortex/Council receipts, workspace associations,
 usage evidence, and causal error detail are separate retained projections.
+Prompt evidence persists a required canonical source occurrence: frozen Loom `blockId + promptOrder + blockRevision` for cognition, assembly provenance identity/revision/`sourceIndex` otherwise. Projection and owner inspection fail closed on missing, malformed, truncated, or conflicting occurrence identity, so one same-ID/revision sibling or incomplete retained prefix cannot supply another occurrence's role or content.
 Bounded omission markers identify reconnect gaps, truncation, unavailable
 layers, withheld credentials, and recovered duplicates. Public run payloads
 remain status-only and never contain prompts, work prose, provider carriers,
@@ -195,6 +296,7 @@ response contains the new attempt lineage only after durable admission.
 
 World Books and Databanks remain native, live context systems outside Loom. World Books own lore activation, placement, attachment, editing, and access; Databanks own document attachment, editing, access, semantic retrieval, and explicit `#slug` retrieval. [Context Filters](../../user-docs/docs/presets/context-filters.md) and unrelated native Loom content [packs](../../user-docs/docs/packs/index.md) remain supported. Loom does not copy, pin, or repair these objects.
 
-Loom owns only existing prompt blocks plus **Phased Instructions**. Fixed buckets route work policy and workspace usage to root **WORK** / **WORK**, completion criteria to completion handoff / **PREPARE_COMMIT**, and render policy to tools-disabled **RENDER** / **RENDER**. Conditions fail closed at their owning checkpoint against its immutable snapshot and remain fixed. Custom phases are bounded and current-phase-only with explicit per-child instruction subsets.
+Loom owns only existing prompt blocks plus **Phased Instructions**. Fixed buckets route work policy and workspace usage to root **WORK** / **WORK**, completion criteria to completion handoff / **PREPARE_COMMIT**, and render policy to tools-disabled **RENDER** / **RENDER**. Conditions fail closed at their owning checkpoint against its immutable snapshot and remain fixed. Custom phases are bounded and current-phase-only with explicit per-child instruction subsets. After PREPARE_COMMIT accepts the current root turn, RENDER frames the native conversation with a concrete accepted workspace envelope before the consumed user request, and keeps the host-owned handoff after authored render policy as the final policy message. The envelope records host authority, accepted status, current scope, exact frozen workspace revision, and a full-request binding to the final user-role message by host-fixed position, UTF-8 byte length, and SHA-256 digest. It requires a completed/settled response and forbids future-tense execution announcements or next-phase/tool narration because WORK is already terminal. Stale, missing, or differently labeled evidence cannot negate the terminal record or make the final response report that the current turn was never executed or lacks a handoff.
+RENDER does not copy user-authored request text into a host-authority system record. The terminal record instead binds to the final user-role message already present in the frozen provider request by its zero-based host-fixed message position, complete UTF-8 byte length, and SHA-256 digest. The full request remains in its user role, so multiline or system-looking user text cannot become system policy and requests longer than 1,024 characters are bound without truncation or misleading "exact text" claims. The host record also states that the referenced request was already executed by WORK, that its imperative wording is historical input rather than pending RESPONSE work, and that tools-disabled RENDER must not deny the WORK capabilities recorded by the accepted projection.
 
 Unified owner inspection explains route/order, roles, conditions, source identities and revisions/hashes when recorded, destination-level deduplication, omissions, custom-phase/child-subset receipts, accepted WORK-to-RENDER crossings, and tools/delegation. Unavailable evidence is marked unavailable and never inferred. Only bounded host-accepted findings, accepted task submissions, and explicitly response-shaping completion guidance cross private WORK; ordinary Response preserves the conversation and native World Book/Databank assembly while omitting private WORK. The retired **Context Pack**, **Context Library**, and **Progressive Context** surfaces are unsupported.

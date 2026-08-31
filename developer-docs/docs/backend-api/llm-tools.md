@@ -68,13 +68,23 @@ Each child profile and the main model has an independent tool allowlist and lore
 
 Tool results are host-framed lower-authority derived data. They do not expose credentials, exception stacks, arbitrary metadata bags, hidden messages, disabled lore, or raw user IDs beyond documented IDs. In `text` format, rendering uses only a fresh minimal context and the no-argument display-name/group macros `user`, `char`, `group`, `groupNotMuted`, `notChar`, `isGroupChat`, `groupOthers`, and `groupMemberCount` (and their built-in aliases); disallowed macro syntax remains literal and does not receive the full macro environment.
 
-This catalog is not Council. Council still uses registered tools and its configured sidecar/inline behavior described below. The Agents & Tools feature does not discover extension tools or invoke extension workers. Live activity stays status-only, while owner-only inspection may retain a bounded WORK transcript, provider and private child content, and tool arguments/results subject to retention and omission limits; raw private reasoning and opaque continuation carriers are not promised. A real staged/target assistant message may retain a compact swipe-scoped summary.
+This catalog is not Council. Council still uses registered tools and its configured sidecar/inline behavior described below. The Agents & Tools feature does not discover extension tools or invoke extension workers. Live activity stays status-only. Authenticated owner inspection preserves its existing bounded provider exchanges, tool calls/results, accounting, accepted workspace evidence, receipts, IDs, and handoff guidance under retention/omission limits. Prior-segment prose/messages and tool calls/results are retired only from the next segment's provider context and are never replayed as continuity; raw hidden reasoning and opaque continuation carriers are prohibited. A real staged/target assistant message may retain a compact swipe-scoped summary.
 
 ### Runtime activity and privacy
 
 The host-owned catalog runs inside the same root ledger as the provider loop. A call batch is validated before any side effect, executed serially in provider order, and returned with one bounded correlated result per call before continuation. When the authored aggregate-call or host request budget is exhausted, the host performs one tools-disabled finalization request; it does not silently persist pending calls.
 
 `GENERATION_AGENT_ACTIVITY` and terminal activity snapshots are status-only. They contain server-authored IDs, actor/kind, phase/status, allowlisted profile/tool identifiers, elapsed time, continuation mode, bounded counters/usage, and stable public error codes. They never contain task text, provider messages, model labels, arguments, result bodies, retrieved content, credentials, stacks, or reasoning carriers. Live snapshots and retained swipe/fallback summaries are bounded and evict detail deterministically while preserving aggregate counts. See [Generation](generation.md#preset-owned-agents--tools-during-generation) for effective host ceilings, environment settings, and recovery behavior.
+
+Provider dispatches use `GenerationRequest.toolMode` with `ordinary`,
+`required`, or `finalization`. `required` is provider-neutral: it requires some
+admitted host tool and never selects a named tool. The frozen provider must
+positively declare `ProviderCapabilities.requiredToolChoice`; unknown and custom
+providers default to false. Both orchestration and each provider serializer fail
+closed before a request when that declaration or an admitted tool is absent.
+OpenAI-compatible serializers emit `tool_choice: 'required'`, Anthropic emits
+`{ type: 'any' }`, and Google/Vertex emit function-calling mode `ANY`.
+`finalization` removes or explicitly disables every tool surface.
 
 See [Generation](generation.md#preset-owned-agents--tools-during-generation) for provider continuation, runtime limits, cancellation, and Dry Run/multiplayer behavior, and [World Books](world-books.md#agents--tools-lore-boundary) for the frozen lore-corpus boundary.
 

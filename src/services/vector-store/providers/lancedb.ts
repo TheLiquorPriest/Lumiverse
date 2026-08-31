@@ -496,11 +496,13 @@ async function withWriteLockForOwner<T>(
       const origResolve = entry.resolve;
       entry.resolve = () => { clearTimeout(timer); origResolve(); };
     });
-    assertLanceGenerationOwner(owner);
   }
 
   let releaseCrossProcessLock: (() => void) | null = null;
   try {
+    // Once this owner receives the in-process lock, every exit — including a
+    // generation cancellation at handoff — must advance the queue in finally.
+    assertLanceGenerationOwner(owner);
     releaseCrossProcessLock = await acquireCrossProcessWriteLockIfNeeded();
     assertLanceGenerationOwner(owner);
     const result = await fn();

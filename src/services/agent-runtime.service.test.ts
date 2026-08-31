@@ -85,6 +85,7 @@ function connection(logicalId = "root-connection"): ResolvedConcreteConnectionV1
       apiKeyRequired: false,
       modelListStyle: "none",
       toolCalling: true,
+      requiredToolChoice: true,
       nativeToolContinuation: true,
       toolContinuationMode: "native",
       toolsDisabledFinalization: true,

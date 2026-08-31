@@ -142,6 +142,101 @@ Use the same `call_id` returned in `ToolCallDTO` as `tool_use.id` and `tool_resu
 
 ---
 
+## Agentic Turn Executions and durable WORK segments
+
+One authenticated Agentic generation owns one Turn Execution and one attempt
+composed of ordered Work Segments. A segment's fresh provider context contains
+the frozen root objective/snapshot, exact current-phase instructions and exit
+criteria, frozen admitted tools/delegation and protocol capability state,
+remaining budgets, host-accepted workspace records and open required IDs, and
+at most the preceding bounded handoff. It excludes prior-segment provider
+prose/messages, tool calls/results, hidden reasoning, opaque continuation
+carrier, stale phase instructions, and unaccepted records or claims.
+
+Those exclusions govern next-segment provider input and replay. Owner inspection exposes a dedicated bounded redacted WORK DTO containing only safe recovery state and attempt usage, segment identity/lifecycle/usage/closure, provider dispatch identity/state/accounting, typed boundaries, workspace revisions, and handoff/transition causality. It never serializes the durable resume envelope, snapshots or plans, generation parameters, user input or regeneration feedback, credential references, endpoints or fingerprints, private decision authority, hidden reasoning, or opaque continuation carriers. Public Activity stays status-only, segment output is not a per-segment user message or public token stream, and only the final tools-disabled render plus atomic commit produces the Response contract.
+
+Every settled provider dispatch has one of six boundary classes: admissible
+host tool action, tool-free stop, reasoning-only stop, reasoning-only length
+exhaustion, empty provider response, or provider protocol failure. Tool actions
+settle admitted effects before continuation; stop classes consume bounded
+unsigned recovery; length may roll over; empty/protocol failures recover only
+under explicit host policy and otherwise close with a typed cause. No provider
+prose selects routing and no unknown in-flight dispatch is replayed.
+
+Dispatch settlement durably reserves every validated mutating operation before
+its tool runs, then effect finalization binds each successful receipt—or typed
+no-op/failure—exactly once after execution. Every reservation, receipt, and
+effect carries its authenticated segment ID, logical dispatch, and root or
+child frame ID. Finalization binds only receipts owned by that tuple while
+validating the complete global workspace-revision chronology; revisions owned
+by independently executing child frames are legitimate gaps, not missing root
+effects. A dispatch with unresolved reservations cannot advance, transition,
+or close, and startup recovery backfills the mutation-to-link crash window
+without replaying the mutation.
+
+Pre-scheduled intrinsic children run before a Segment has a provider dispatch.
+Their immutable frame grant is therefore authoritative: profile-declared
+workspace capabilities may narrow that grant but can never add to it. Such a
+child returns its bounded result directly and receives neither mutating
+workspace tools nor a synthetic assigned task. Provider-delegated children can
+receive the exact admitted workspace subset only after the host has persisted
+the corresponding dispatch-owned assignment and mutation authority.
+
+On abort or failure, every assigned child is terminal-settled first and its
+owned receipt/cursor is recorded before aggregate dispatch finalization.
+Durable assignment authority lets startup repeat that ordering after a crash;
+missing child settlement effects are never fabricated ahead of the mutation.
+
+Attempt budget, Segment budget, hard per-dispatch output cap, and protected
+recovery/future-phase reserves are independent. Closure reports typed `failed`,
+`exhausted`, or `cancelled` causes. Agentic WORK requires at least one admitted
+host tool plus frozen provider capability with `nativeToolContinuation=true`
+and `toolContinuationMode=native`; live and recovered root and child dispatches
+revalidate that exact pair before provider work. Legacy synthesized continuation
+remains available only to Response/Council and fails Agentic readiness before
+WORK. Required mode additionally requires positive required-tool capability;
+unknown/custom capability fails closed before dispatch.
+
+A repeat creates a new Segment and occurrence; rollover creates a new Segment
+in the same occurrence. A skipped custom phase creates no custom Segment. With
+no authored custom phases, WORK admits one built-in null-phase Segment. When
+all authored phases are optional and deterministically skipped, exactly one
+built-in Segment may be admitted only under frozen authority containing every
+exact skipped phase ID; retry and recovery validate that same authority. A
+completed required source followed only by skipped optional phases closes
+terminally without admitting a null successor. Persistence orders reserve →
+in-flight → settle → handoff close → successor admission, idempotently under
+exact identity/CAS, so recovery cannot
+duplicate provider work, tools-disabled render, or final commit.
+
+The durable resume envelope has its own 8 MiB canonical bound. Envelope digest
+creation and durable validation use that same bound; the generic 1 MiB WORK
+record bound does not reject an otherwise admissible exact resume authority.
+
+Persistent-workspace required-child tasks are materialized before WORK execution,
+but their revision never substitutes for the execution's turn-workspace revision.
+When child binding commits a turn-workspace task, pre-segment owner renewal
+atomically projects that turn revision into execution authority. Child workspace
+operations advance private cognition authority; child completion then adopts
+the returned revision into process execution and renews its durable projection
+before root Segment admission. The resume envelope is frozen only when the
+first Segment is admitted and binds the same turn-workspace identity and
+revision used by Segment lifecycle fencing; the persistent workspace remains a
+separate chat-lifetime association.
+DeepSeek V4 enables thinking by default but rejects requests that also carry
+`tool_choice`. The DeepSeek adapter therefore sends `thinking.type=disabled`
+whenever host tool choice is present, including required standalone completion;
+ordinary requests without tool choice retain the provider's default thinking.
+
+Turn-attempt inspection is admitted before workspace and WORK-segment authority.
+During that boundary, owner detail reports `workSegments: null` while the
+admission target and any terminal cause remain durable. Once the exact workspace
+and recovery authority exist for the attempt, inspection authenticates and
+projects that segment chain strictly; malformed or stale authority still fails
+closed rather than being treated as an absent pre-WORK layer.
+
+---
+
 ## Response-mode Agents & Tools during generation
 
 The existing preset-owned Agents & Tools pipeline is **Response mode**. Its
@@ -468,6 +563,13 @@ host-enforced budget or limit exhaustion.
 | `COMMITTING` | Recompute every `InputRevisionSetV1` member. A single CAS owns this boundary; cancellation/deadline can win before it, while Stop after it is `too_late`. |
 | `COMMITTED` | One synchronous SQLite transaction writes the message/swipe/extras, authorized macro/source/chat/world-info/regex deltas, artifact references, a mutable `COMMITTING` projection, the idempotent receipt, and the execution's `COMMITTED` CAS. Duplicate commit returns the existing receipt. A second exact-identity convergence transaction terminalizes the persistent Turn Session, owner inspection attempt, immutable Agent Run projection, compatibility activity, and terminal outbox. |
 
+The record/artifact/publication mutations—`workspace_record_finding`,
+`workspace_record_decision`, `workspace_record_question`,
+`workspace_attach_artifact`, and `workspace_propose_publication`—are
+root/orchestrator-only. Child profiles can author only the four closed
+workspace capabilities documented by the preset contract; immutable frame
+admission may narrow that profile ceiling further.
+
 Before every root WORK provider dispatch, the host rebuilds one concise private structured phase-control envelope from live state: `{ kind: "host_private_phase_control_v1", currentPhaseId: string | null, admittedRootToolNames: string[], openRequiredTaskIds: string[], completeTurn: { instruction: "MUST call complete_turn as the sole tool call after the current custom phase exit predicate is satisfied; without an active custom phase, call it only after all completion gates are settled.", callMode: "standalone_only", nonFinalAcceptance: "phase_advanced", nonFinalWorkContinues: true, terminalAcceptance: "final_custom_phase_or_no_active_custom_phase_only" } }`. Future conditional tasks are never speculated. This message belongs only to private WORK input, is not persisted, and is not copied into RENDER, the public workspace projection, or Response.
 
 Unknown phase transitions fail closed. A reversible-phase provider/protocol
@@ -746,6 +848,8 @@ The retired **Context Pack**, **Context Library**, and **Progressive Context** s
 not supported.
 
 The unified owner inspection projection combines `LoomPromptInspectionV1` with prompt evidence. It explains routes and order, roles, conditions, exact source identities and revisions, hashes when recorded, one effective copy for each destination-level overlap while retaining every role/reason/overlap outcome, omissions, custom-phase and explicit child-subset receipts, accepted WORK-to-RENDER crossings, and tools/delegation. If a layer is unavailable or not recorded, inspection marks it unavailable; it is never inferred.
+
+Each `AgentPromptEvidenceV1` record carries a required canonical zero-based `promptOrder`. Cognition evidence takes `sourceId`, `sourceRevision`, and `promptOrder` from the frozen Loom source's `blockId`, `blockRevision`, and `promptOrder`; other assembly sources use their provenance source coordinate. Bounded deterministic prompt record IDs hash lifecycle, destination, source kind, exact occurrence, cognition entry/bucket, role, content digest, local index, and the retained evidence payload so separate buckets, lifecycles, and conflicting payloads remain distinct durable records. Loom role correlation uses the exact `sourceId + promptOrder + sourceRevision` occurrence only when the prompt section is fully available; missing, malformed, truncated, mismatched, or conflicting evidence remains unavailable rather than borrowing a sibling or retained prefix.
 
 The Loom inspection shape is `{ version, surface, checkpoint, items, effectiveEntryIds, responseOmission? }`; the public wire fields remain `inspection` and `responseOmission`. Each item identifies its bucket, destination, checkpoint, exact Loom source, optional typed condition and checkpoint result, requiredness, effective text, and a typed outcome: `included`, `skipped`, `rejected`, `omitted`, or `deduplicated`. On a Response surface, every omitted item carries the `response_mode` outcome and `responseOmission` explains the `work_only` boundary. This is inspection evidence, not authority to edit the preset.
 

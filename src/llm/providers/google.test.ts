@@ -11,6 +11,34 @@ import { GoogleProvider } from "./google";
 // {name, args}. FunctionResponse is {name, response: Record<string, unknown>}
 // where response uses "output"/"error" keys per the API docs.
 describe("GoogleProvider tool calling wire shape", () => {
+  test("required mode uses ANY over exactly the admitted host tools", () => {
+    const body = (new GoogleProvider() as any).buildBody({
+      model: "gemini-2.5-flash",
+      messages: [{ role: "user", content: "continue" }],
+      parameters: {
+        tools: [{ googleSearch: {} }],
+        toolConfig: { functionCallingConfig: { mode: "NONE" } },
+      },
+      toolMode: "required",
+      tools: [{ name: "host_a", description: "A", parameters: { type: "object" } }],
+    });
+    expect(body.toolConfig).toEqual({ functionCallingConfig: { mode: "ANY" } });
+    expect(body.tools).toEqual([{ functionDeclarations: [{
+      name: "host_a",
+      description: "A",
+      parameters: { type: "object" },
+    }] }]);
+  });
+
+  test("rejects required mode without an admitted function declaration", () => {
+    expect(() => (new GoogleProvider() as any).buildBody({
+      model: "gemini-2.5-flash",
+      messages: [{ role: "user", content: "continue" }],
+      toolMode: "required",
+      tools: [],
+    })).toThrow("at least one admitted host tool");
+  });
+
   test("tool_use part becomes a functionCall part on a model-role Content", () => {
     const provider = new GoogleProvider();
     const body = (provider as any).buildBody({

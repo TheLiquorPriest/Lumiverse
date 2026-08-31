@@ -927,6 +927,9 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
 
   /** Build the request body using capabilities as the parameter allowlist. */
   protected buildBody(request: GenerationRequest, stream: boolean): any {
+    if (request.toolMode === "required" && !this.capabilities.requiredToolChoice) {
+      throw new Error("Provider does not support required tool choice");
+    }
     const params = request.parameters || {};
     const allowed = this.capabilities.parameters;
 
@@ -962,13 +965,13 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
       body.stream_options = { include_usage: true };
     }
 
-    // Inline council tools: pass as OpenAI function calling format
-    // Feature-active finalization is an explicit no-tools request. Ordinary
-    // mode receives only the immutable host snapshot in request.tools.
+    // Inline council tools: pass as OpenAI function calling format.
     if (request.toolMode === "finalization") {
       body.tools = [];
       body.tool_choice = "none";
       body.parallel_tool_calls = false;
+    } else if (request.toolMode === "required" && (!request.tools || request.tools.length === 0)) {
+      throw new Error("Required tool mode needs at least one admitted host tool");
     } else if (request.tools && request.tools.length > 0) {
       body.tools = request.tools.map((t) => ({
         type: "function",
@@ -979,6 +982,7 @@ export abstract class OpenAICompatibleProvider implements LlmProvider {
           strict: false,
         },
       }));
+      if (request.toolMode === "required") body.tool_choice = "required";
     }
     return body;
   }

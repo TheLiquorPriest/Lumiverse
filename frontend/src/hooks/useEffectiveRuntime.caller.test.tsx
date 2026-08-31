@@ -177,6 +177,22 @@ function HookHarness() {
   return null
 
 }
+let secondarySurface: HookSurface
+function MultiHookHarness() {
+  surface = useEffectiveRuntime({
+    chatId: 'chat-1',
+    generationType: 'normal',
+    supported: true,
+    dependencies,
+  })
+  secondarySurface = useEffectiveRuntime({
+    chatId: 'chat-2',
+    generationType: 'normal',
+    supported: true,
+    dependencies,
+  })
+  return null
+}
 async function render() {
   if (!host) {
     host = document.createElement('div')
@@ -632,6 +648,86 @@ describe('useEffectiveRuntime chat override CAS caller', () => {
     await render()
     expect(surface.canShowSelector).toBe(true)
     expect(surface.repairCategories).toContain('readiness')
+  })
+
+  test('refetches active and inactive chat projections while fencing both stale pre-commit responses', async () => {
+    const requestChatId = (request: unknown) => (request as { chatId: string }).chatId
+    resolve.mockImplementation(async (request: unknown) => response(requestChatId(request), 1))
+    if (!host) {
+      host = document.createElement('div')
+      document.body.append(host)
+      root = createRoot(host)
+    }
+    await act(async () => {
+      root!.render(createElement(MultiHookHarness))
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const staleActive = deferred<EffectiveRuntimePublicResponseV1>()
+    const staleInactive = deferred<EffectiveRuntimePublicResponseV1>()
+    resolve
+      .mockImplementationOnce(() => staleActive.promise)
+      .mockImplementationOnce(() => staleInactive.promise)
+      .mockImplementation(async (request: unknown) => {
+        const chatId = requestChatId(request)
+        return response(chatId, chatId === 'chat-1' ? 9 : 10)
+      })
+
+    let oldActive!: Promise<void>
+    let oldInactive!: Promise<void>
+    await act(async () => {
+      oldActive = surface.refresh()
+      oldInactive = secondarySurface.refresh()
+      await Promise.resolve()
+      runtime.commitRuntimeAuthorityMutation()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(surface.decision?.chatId).toBe('chat-1')
+    expect(surface.decision?.chatOverride?.revision).toBe(9)
+    expect(secondarySurface.decision?.chatId).toBe('chat-2')
+    expect(secondarySurface.decision?.chatOverride?.revision).toBe(10)
+
+    staleActive.settle(response('chat-1', 5))
+    staleInactive.settle(response('chat-2', 6))
+    await act(async () => {
+      await Promise.all([oldActive, oldInactive])
+      await Promise.resolve()
+    })
+    expect(surface.decision?.chatOverride?.revision).toBe(9)
+    expect(secondarySurface.decision?.chatOverride?.revision).toBe(10)
+  })
+  test('refetches every mounted projection and fences stale responses after authority commits', async () => {
+    await render()
+    const baselineCalls = resolve.mock.calls.length
+    const stale = deferred<EffectiveRuntimePublicResponseV1>()
+    resolve
+      .mockImplementationOnce(() => stale.promise)
+      .mockResolvedValueOnce(response('chat-1', 9))
+
+    await act(async () => {
+      runtime.commitRuntimeAuthorityMutation()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(resolve.mock.calls.length).toBe(baselineCalls + 1)
+
+    await act(async () => {
+      runtime.commitRuntimeAuthorityMutation()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(resolve.mock.calls.length).toBe(baselineCalls + 2)
+    expect(surface.decision?.chatOverride?.revision).toBe(9)
+
+    stale.settle(response('chat-1', 5))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(surface.decision?.chatOverride?.revision).toBe(9)
   })
 
   for (const [label, changeScope] of scopeChanges) {

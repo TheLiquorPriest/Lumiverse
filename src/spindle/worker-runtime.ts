@@ -13,6 +13,13 @@ import type {
   UserPresetDTO,
   UserPresetCreateDTO,
   UserPresetUpdateDTO,
+  PromptBlockSnapshotDTO,
+  PromptBlockCreateDTO,
+  PromptBlockUpdateDTO,
+  PromptBlockOccurrenceDTO,
+  PromptBlockMutationTargetDTO,
+  PromptBlockCreateOptionsDTO,
+  PromptBlockCategoryGroupDTO,
   PermissionDeniedDetail,
   PermissionChangedDetail,
   CharacterDTO,
@@ -146,11 +153,6 @@ type SpindleBatchOperation = {
 type SpindleBatchResult =
   | { ok: true; result: SpindleBatchJsonValue }
   | { ok: false; error: string };
-
-type PromptBlockCategoryGroup = {
-  categoryBlock: PromptBlock | null;
-  children: PromptBlock[];
-};
 
 type AssembleRequest = {
   blocks: PromptBlock[];
@@ -346,10 +348,6 @@ type RuntimeWorkerToHost =
   | { type: "presets_update"; requestId: string; presetId: string; input: UserPresetUpdateDTO; userId?: string }
   | { type: "presets_delete"; requestId: string; presetId: string; userId?: string }
   | { type: "preset_blocks_list"; requestId: string; presetId: string; userId?: string }
-  | { type: "preset_blocks_get"; requestId: string; presetId: string; blockId: string; userId?: string }
-  | { type: "preset_blocks_create"; requestId: string; presetId: string; input: Partial<PromptBlock>; index?: number; userId?: string }
-  | { type: "preset_blocks_update"; requestId: string; presetId: string; blockId: string; input: Partial<Omit<PromptBlock, "id">>; userId?: string }
-  | { type: "preset_blocks_delete"; requestId: string; presetId: string; blockId: string; userId?: string }
   | { type: "preset_categories_list"; requestId: string; presetId: string; userId?: string }
   | { type: "uploads_get"; requestId: string; uploadId: string; userId?: string }
   | { type: "uploads_read_chunk"; requestId: string; uploadId: string; offset: number; userId?: string }
@@ -687,11 +685,7 @@ type RuntimeWorldBooksAPI = Omit<SpindleAPI["world_books"], "entries"> & {
   };
 };
 
-// `presets` is replaced wholesale (not intersected) because the local
-// PromptBlock type also carries host-only sealed-block provenance. Keeping the
-// runtime CRUD surface on the native type avoids narrowing data returned by
-// newer hosts when the installed public type package lags a release.
-type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen" | "world_books"> & {
+type RuntimeSpindleAPI = Omit<SpindleAPI, "imageGen" | "world_books"> & {
   frontendCapabilities: {
     declare(capability: "message_tag_interceptor"): () => void;
   };
@@ -823,23 +817,6 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen" | "world_books"
     } | void>,
     priority?: number
   ): void;
-  presets: {
-    list(options?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: UserPresetDTO[]; total: number }>;
-    get(presetId: string, userId?: string): Promise<UserPresetDTO | null>;
-    create(input: UserPresetCreateDTO, userId?: string): Promise<UserPresetDTO>;
-    update(presetId: string, input: UserPresetUpdateDTO, userId?: string): Promise<UserPresetDTO>;
-    delete(presetId: string, userId?: string): Promise<boolean>;
-    blocks: {
-      list(presetId: string, userId?: string): Promise<PromptBlock[]>;
-      get(presetId: string, blockId: string, userId?: string): Promise<PromptBlock | null>;
-      create(presetId: string, input: Partial<PromptBlock>, options?: { index?: number; userId?: string }): Promise<PromptBlock>;
-      update(presetId: string, blockId: string, input: Partial<Omit<PromptBlock, "id">>, userId?: string): Promise<PromptBlock>;
-      delete(presetId: string, blockId: string, userId?: string): Promise<boolean>;
-    };
-    categories: {
-      list(presetId: string, userId?: string): Promise<PromptBlockCategoryGroup[]>;
-    };
-  };
   uploads: {
     get(uploadId: string, userId?: string): Promise<{ fileName: string; size: number; data: Uint8Array } | null>;
     readChunk(uploadId: string, offset: number, userId?: string): Promise<{
@@ -2725,17 +2702,17 @@ const spindleApi: RuntimeSpindleAPI = {
       return result as boolean;
     },
     blocks: {
-      async list(presetId: string, userId?: string): Promise<PromptBlock[]> {
+      async list(presetId: string, userId?: string): Promise<PromptBlockSnapshotDTO[]> {
         const requestId = crypto.randomUUID();
         const result = await request({ type: "preset_blocks_list", requestId, presetId, userId });
-        return result as PromptBlock[];
+        return result as PromptBlockSnapshotDTO[];
       },
-      async get(presetId: string, blockId: string, userId?: string): Promise<PromptBlock | null> {
+      async get(presetId: string, occurrence: PromptBlockOccurrenceDTO, userId?: string): Promise<PromptBlockSnapshotDTO | null> {
         const requestId = crypto.randomUUID();
-        const result = await request({ type: "preset_blocks_get", requestId, presetId, blockId, userId });
-        return result as PromptBlock | null;
+        const result = await request({ type: "preset_blocks_get", requestId, presetId, occurrence, userId });
+        return result as PromptBlockSnapshotDTO | null;
       },
-      async create(presetId: string, input: Partial<PromptBlock>, options?: { index?: number; userId?: string }): Promise<PromptBlock> {
+      async create(presetId: string, input: PromptBlockCreateDTO, options: PromptBlockCreateOptionsDTO): Promise<PromptBlockSnapshotDTO> {
         assertMutationAllowed("spindle.presets.blocks.create()");
         const requestId = crypto.randomUUID();
         const result = await request({
@@ -2743,29 +2720,32 @@ const spindleApi: RuntimeSpindleAPI = {
           requestId,
           presetId,
           input,
-          index: options?.index,
-          userId: options?.userId,
+          options: {
+            expectedCacheRevision: options.expectedCacheRevision,
+            ...(options.index === undefined ? {} : { index: options.index }),
+          },
+          userId: options.userId,
         });
-        return result as PromptBlock;
+        return result as PromptBlockSnapshotDTO;
       },
-      async update(presetId: string, blockId: string, input: Partial<Omit<PromptBlock, "id">>, userId?: string): Promise<PromptBlock> {
+      async update(presetId: string, target: PromptBlockMutationTargetDTO, input: PromptBlockUpdateDTO, userId?: string): Promise<PromptBlockSnapshotDTO> {
         assertMutationAllowed("spindle.presets.blocks.update()");
         const requestId = crypto.randomUUID();
-        const result = await request({ type: "preset_blocks_update", requestId, presetId, blockId, input, userId });
-        return result as PromptBlock;
+        const result = await request({ type: "preset_blocks_update", requestId, presetId, target, input, userId });
+        return result as PromptBlockSnapshotDTO;
       },
-      async delete(presetId: string, blockId: string, userId?: string): Promise<boolean> {
+      async delete(presetId: string, target: PromptBlockMutationTargetDTO, userId?: string): Promise<boolean> {
         assertMutationAllowed("spindle.presets.blocks.delete()");
         const requestId = crypto.randomUUID();
-        const result = await request({ type: "preset_blocks_delete", requestId, presetId, blockId, userId });
+        const result = await request({ type: "preset_blocks_delete", requestId, presetId, target, userId });
         return result as boolean;
       },
     },
     categories: {
-      async list(presetId: string, userId?: string): Promise<PromptBlockCategoryGroup[]> {
+      async list(presetId: string, userId?: string): Promise<PromptBlockCategoryGroupDTO[]> {
         const requestId = crypto.randomUUID();
         const result = await request({ type: "preset_categories_list", requestId, presetId, userId });
-        return result as PromptBlockCategoryGroup[];
+        return result as PromptBlockCategoryGroupDTO[];
       },
     },
   },

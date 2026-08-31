@@ -714,6 +714,84 @@ describe('agent runtime generation preparation', () => {
     expect(prepared.request.runtime_decision_token).toBe('one-use-token')
   })
 
+  test('a committed preset authority mutation fences the cached send token and resolves fresh', async () => {
+    const authorityRequest: EffectiveRuntimeRequestV1 = {
+      chatId: 'chat-1',
+      generationType: 'normal',
+      target: {
+        generationType: 'normal',
+        messageId: null,
+        swipeId: null,
+        branchId: null,
+        targetCharacterId: null,
+        revision: null,
+      },
+      requestEpoch: 1,
+    }
+    runtime.nextRuntimeRequestEpoch('chat-1')
+    runtime.publishRuntimeDecision(decision(authorityRequest), 1)
+    let notifications = 0
+    const unsubscribe = runtime.subscribeRuntimeAuthority(() => { notifications += 1 })
+
+    runtime.commitRuntimeAuthorityMutation()
+    const prepared = await runtime.prepareAgentRuntimeRequest({
+      chat_id: 'chat-1',
+      generation_type: 'normal',
+    })
+    unsubscribe()
+
+    expect(runtime.getRuntimeAuthorityRevision()).toBe(1)
+    expect(notifications).toBe(1)
+    expect(resolveCalls).toHaveLength(1)
+    expect(prepared.request.request_epoch).toBe(2)
+    expect(prepared.request.runtime_decision_token).toBe('one-use-token')
+  })
+
+  test('fences a deferred Agentic preflight on authority commit without consuming the selection', async () => {
+    const pending = Promise.withResolvers<EffectiveRuntimePublicResponseV1>()
+    resolveRuntime = () => pending.promise
+    runtime.setOneTurnRuntimeMode('chat-1', 'agentic')
+
+    const oldPrepare = runtime.prepareAgentRuntimeRequest({
+      chat_id: 'chat-1',
+      generation_type: 'normal',
+    })
+    runtime.commitRuntimeAuthorityMutation()
+    pending.resolve(decision(resolveCalls[0]))
+
+    await expect(oldPrepare).rejects.toMatchObject({ code: 'decision_refresh_required' })
+    expect(runtime.getRuntimeSelectionSnapshot('chat-1')).toMatchObject({
+      decision: null,
+      effectiveMode: null,
+      activeGenerationMode: null,
+      oneTurnMode: 'agentic',
+    })
+
+    resolveRuntime = async (request) => decision(request)
+    const fresh = await runtime.prepareAgentRuntimeRequest({
+      chat_id: 'chat-1',
+      generation_type: 'normal',
+    })
+    expect(fresh.request.mode).toBe('agentic')
+  })
+
+  test('preserves an admitted Agentic run and its request epoch across authority commit', async () => {
+    runtime.setOneTurnRuntimeMode('chat-1', 'agentic')
+    const prepared = await runtime.prepareAgentRuntimeRequest({
+      chat_id: 'chat-1',
+      generation_type: 'normal',
+    })
+    const requestEpoch = prepared.request.request_epoch!
+    expect(runtime.getRuntimeSelectionSnapshot('chat-1').activeGenerationMode).toBe('agentic')
+
+    runtime.commitRuntimeAuthorityMutation()
+
+    expect(runtime.getRuntimeAuthorityRevision()).toBe(1)
+    expect(runtime.getRuntimeSelectionSnapshot('chat-1').activeGenerationMode).toBe('agentic')
+    expect(runtime.isCurrentRuntimeRequest('chat-1', requestEpoch)).toBe(true)
+    runtime.resetActiveGenerationMode('chat-1')
+    expect(runtime.getRuntimeSelectionSnapshot('chat-1').activeGenerationMode).toBeNull()
+  })
   test('keeps explicit Response swipe generation on the legacy request path', async () => {
     runtime.setOneTurnRuntimeMode('chat-1', 'response')
     const prepared = await runtime.prepareAgentRuntimeRequest({

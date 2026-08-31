@@ -46,16 +46,19 @@ import {
 import type {
   AssemblyActivationEvidenceV1,
   AssemblyChildDescriptorV1 as SharedAssemblyChildDescriptorV1,
+  AssemblyCompiledPolicyMessageProvenanceV1 as SharedAssemblyCompiledPolicyMessageProvenanceV1,
+  AssemblyCompiledPolicyProviderMessageV1 as SharedAssemblyCompiledPolicyProviderMessageV1,
   AssemblyDatabankMessageProvenanceV1,
-  AssemblyProfileOutputLimitV1,
   AssemblyLiteralSegmentV1 as SharedAssemblyLiteralSegmentV1,
+  AssemblyLoomMessageProvenanceV1 as SharedAssemblyLoomMessageProvenanceV1,
   AssemblyMediaSegmentV1 as SharedAssemblyMediaSegmentV1,
-  AssemblyMessageProvenanceV1 as SharedAssemblyMessageProvenanceV1,
   AssemblyMessageSourceKindV1,
+  AssemblyOrdinaryMessageProvenanceV1 as SharedAssemblyOrdinaryMessageProvenanceV1,
+  AssemblyOrdinaryProviderMessageV1 as SharedAssemblyOrdinaryProviderMessageV1,
   AssemblyPlanV1 as SharedAssemblyPlanV1,
-  AssemblyProviderMessageV1 as SharedAssemblyProviderMessageV1,
-  AssemblyResultSlotV1 as SharedAssemblyResultSlotV1,
+  AssemblyProfileOutputLimitV1,
   AssemblyResultSlotSegmentV1 as SharedAssemblyResultSlotSegmentV1,
+  AssemblyResultSlotV1 as SharedAssemblyResultSlotV1,
   AssemblyTokenEvidenceV1,
   InputRevisionSetV1,
   PreparationLimitsV1,
@@ -138,26 +141,28 @@ export type AssemblyMessageSegmentV1 =
   | AssemblyLiteralSegmentV1
   | AssemblyResultSlotSegmentV1
   | AssemblyMediaSegmentV1;
-export interface AssemblyLoomMessageProvenanceV1 {
-  readonly entryId: string;
-  readonly bucket: LoomPolicyBucketV1;
-  readonly destination: "root_work" | "completion_handoff" | "render";
-  readonly checkpoint: "ASSEMBLE" | "WORK" | "PREPARE_COMMIT" | "RENDER";
-  readonly source: LoomPolicyBucketsV1["workPolicy"][number]["source"];
-  readonly condition?: LoomPolicyBucketsV1["workPolicy"][number]["condition"];
-  readonly effectiveText: string;
-}
-export type AssemblyMessageProvenanceV1 = SharedAssemblyMessageProvenanceV1 & {
-  readonly loom?: AssemblyLoomMessageProvenanceV1;
-};
-export type AssemblyProviderMessageV1 = SharedAssemblyProviderMessageV1 & {
+export type AssemblyLoomMessageProvenanceV1 = SharedAssemblyLoomMessageProvenanceV1;
+export type AssemblyOrdinaryMessageProvenanceV1 = SharedAssemblyOrdinaryMessageProvenanceV1;
+export type AssemblyCompiledPolicyMessageProvenanceV1 = SharedAssemblyCompiledPolicyMessageProvenanceV1;
+export type AssemblyMessageProvenanceV1 =
+  | AssemblyOrdinaryMessageProvenanceV1
+  | AssemblyCompiledPolicyMessageProvenanceV1;
+type AssemblyProviderMessageFieldsV1 = {
   readonly name?: string;
   readonly blockIndex?: number;
   readonly blockId?: string;
   readonly contentKind: "segments";
-  readonly provenance: AssemblyMessageProvenanceV1;
   readonly segments: readonly AssemblyMessageSegmentV1[];
 };
+export type AssemblyOrdinaryProviderMessageV1 = SharedAssemblyOrdinaryProviderMessageV1
+  & AssemblyProviderMessageFieldsV1
+  & { readonly provenance: AssemblyOrdinaryMessageProvenanceV1 };
+export type AssemblyCompiledPolicyProviderMessageV1 = SharedAssemblyCompiledPolicyProviderMessageV1
+  & AssemblyProviderMessageFieldsV1
+  & { readonly provenance: AssemblyCompiledPolicyMessageProvenanceV1 };
+export type AssemblyProviderMessageV1 =
+  | AssemblyOrdinaryProviderMessageV1
+  | AssemblyCompiledPolicyProviderMessageV1;
 
 export type AssemblyChildDescriptorV1 = SharedAssemblyChildDescriptorV1 & {
   readonly slotIndex: number;
@@ -224,10 +229,10 @@ export type AssemblyPlanV1 = SharedAssemblyPlanV1 & {
   readonly inputRevisionSet: InputRevisionSetV1;
   /** Canonical ordered custom WORK phase plan; never part of the four Loom buckets. */
   readonly customPhasePlan: AgentRuntimePhaseCompileResultV1;
-  readonly workPolicyMessages: readonly AssemblyProviderMessageV1[];
-  readonly workspaceUsageMessages: readonly AssemblyProviderMessageV1[];
-  readonly completionCriteriaMessages: readonly AssemblyProviderMessageV1[];
-  readonly renderPolicyMessages: readonly AssemblyProviderMessageV1[];
+  readonly workPolicyMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
+  readonly workspaceUsageMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
+  readonly completionCriteriaMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
+  readonly renderPolicyMessages: readonly AssemblyCompiledPolicyProviderMessageV1[];
   /** Canonical Loom authoring retained beside materialized phase projections. */
   readonly loomPolicy: LoomPolicyBucketsV1;
   readonly loomBlocks: readonly LoomPromptInspectionBlockV1[];
@@ -796,8 +801,8 @@ function projectStructuralBlockAdmission(
 }
 async function preprocessSnapshot(
   snapshot: GenerationAssemblySnapshotV1,
-  phasePolicyBlockIds: ReadonlySet<string> = new Set(),
-  ignoredCognitionBlockIds: ReadonlySet<string> = new Set(),
+  phasePolicyBlockOccurrences: ReadonlySet<string> = new Set(),
+  ignoredCognitionBlockOccurrences: ReadonlySet<string> = new Set(),
 ): Promise<SnapshotPreprocessingResult> {
   const worldInfo = activateSnapshotWorldInfo(snapshot);
   const env = buildSnapshotMacroEnv(snapshot);
@@ -944,12 +949,12 @@ async function preprocessSnapshot(
   const structuralBlockValues = snapshot.participants.structuralBlockValues;
   for (const [blockIndex, sourceBlock] of snapshot.blocks.entries()) {
     const block = projectStructuralBlockAdmission(sourceBlock, structuralBlockValues);
-    if (ignoredCognitionBlockIds.has(block.id)) {
+    if (ignoredCognitionBlockOccurrences.has(blockOccurrenceKey(block.id, blockIndex))) {
       blocks.push(frozen({ ...block, enabled: false, content: "" }));
       continue;
     }
     const child = assertChildMarkersAreSealed(block.content, block, blockIndex);
-    if (child && phasePolicyBlockIds.has(block.id)) {
+    if (child && phasePolicyBlockOccurrences.has(blockOccurrenceKey(block.id, blockIndex))) {
       failForBlock("requires_response_mode", "Cognition policy blocks cannot contain agent result references", block, blockIndex);
     }
     if (child && block.enabled) {
@@ -1152,12 +1157,16 @@ function configFor(snapshot: GenerationAssemblySnapshotV1, explicit: unknown): u
   return snapshot.agentConfig;
 }
 
+function blockOccurrenceKey(blockId: string, promptOrder: number): string {
+  return `${blockId.length}:${blockId}:${promptOrder}`;
+}
+
 interface CognitionPhaseRefsV1 {
   readonly workPolicy: readonly CognitionLoomBlockRefV1[];
   readonly workspaceUsage: readonly CognitionLoomBlockRefV1[];
   readonly completionCriteria: readonly CognitionLoomBlockRefV1[];
   readonly renderPolicy: readonly CognitionLoomBlockRefV1[];
-  readonly excludedBlockIds: ReadonlySet<string>;
+  readonly excludedBlockOccurrences: ReadonlySet<string>;
 }
 
 function cognitionPhaseRefs(
@@ -1167,13 +1176,12 @@ function cognitionPhaseRefs(
 ): CognitionPhaseRefsV1 {
   const source = snapshot.agentCognition.cognitionSource;
   const loomPolicy = loomPolicyForSnapshot(snapshot, parsedConfig);
-  const sourceBlocks = new Map(source?.blocks.map((block) => [block.blockId, block] as const) ?? []);
-  const snapshotBlocks = new Map(snapshot.blocks.map((block) => [block.id, block] as const));
+  const sourceBlocks = new Map(source?.blocks.map((block) => [block.promptOrder, block] as const) ?? []);
   const destPins = new Map<string, string>();
   for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
     for (const entry of loomPolicy[bucket]) {
-      const destKey = `${LOOM_BUCKET_DESTINATION[bucket]}\u0000${entry.source.blockId}`;
-      const pin = `${entry.source.presetRevision}\u0000${entry.source.blockRevision}\u0000${entry.source.promptOrder}`;
+      const destKey = `${LOOM_BUCKET_DESTINATION[bucket]}:${blockOccurrenceKey(entry.source.blockId, entry.source.promptOrder)}`;
+      const pin = `${entry.source.presetRevision}:${entry.source.blockRevision}`;
       const previous = destPins.get(destKey);
       if (previous !== undefined && previous !== pin) {
         throw new AssemblyPlanValidationError(
@@ -1187,21 +1195,25 @@ function cognitionPhaseRefs(
   const refsForBucket = (bucket: LoomPolicyBucketV1): CognitionLoomBlockRefV1[] => {
     const refs: CognitionLoomBlockRefV1[] = [];
     for (const entry of loomPolicy[bucket]) {
-      const sourceBlock = sourceBlocks.get(entry.source.blockId);
-      const snapshotBlock = snapshotBlocks.get(entry.source.blockId);
+      const sourceBlock = sourceBlocks.get(entry.source.promptOrder);
+      const snapshotBlock = snapshot.blocks[entry.source.promptOrder];
+      if (snapshotBlock?.marker === "category") {
+        throw new AssemblyPlanValidationError("invalid_input", `${bucket}.${entry.id} cannot use a category marker as a Loom source`);
+      }
       const exact = source !== null
         && source !== undefined
         && sourceBlock !== undefined
+        && sourceBlock.blockId === entry.source.blockId
         && snapshotBlock !== undefined
+        && snapshotBlock.id === entry.source.blockId
         && source.presetRevision === entry.source.presetRevision
         && sourceBlock.revision === entry.source.blockRevision
-        && sourceBlock.promptOrder === entry.source.promptOrder
         && String(snapshotBlock.revision) === String(sourceBlock.revision);
       if (!exact) {
         if (entry.required) {
           throw new AssemblyPlanValidationError(
             "invalid_input",
-            `${bucket}.${entry.id} is not bound to the frozen Loom block revision`,
+            `${bucket}.${entry.id} is not bound to the frozen Loom block occurrence`,
           );
         }
         continue;
@@ -1210,6 +1222,7 @@ function cognitionPhaseRefs(
         blockId: entry.source.blockId,
         expectedPresetRevision: entry.source.presetRevision,
         expectedBlockRevision: entry.source.blockRevision,
+        promptOrder: entry.source.promptOrder,
       });
     }
     return refs;
@@ -1225,32 +1238,37 @@ function cognitionPhaseRefs(
       ...phase.childInstructionSubsets.flatMap((subset) => subset.instructionRefs),
     ];
     for (const ref of phaseSources) {
-      const sourceBlock = sourceBlocks.get(ref.blockId);
-      const snapshotBlock = snapshotBlocks.get(ref.blockId);
+      const sourceBlock = sourceBlocks.get(ref.promptOrder);
+      const snapshotBlock = snapshot.blocks[ref.promptOrder];
+      if (snapshotBlock?.marker === "category") {
+        throw new AssemblyPlanValidationError("invalid_input", `customPhases.${phase.id}.${ref.blockId} cannot use a category marker as a Loom source`);
+      }
       if (
         !source
         || !sourceBlock
+        || sourceBlock.blockId !== ref.blockId
         || !snapshotBlock
+        || snapshotBlock.id !== ref.blockId
         || source.presetRevision !== ref.presetRevision
         || sourceBlock.revision !== ref.blockRevision
-        || sourceBlock.promptOrder !== ref.promptOrder
         || String(snapshotBlock.revision) !== String(sourceBlock.revision)
       ) {
         throw new AssemblyPlanValidationError(
           "invalid_input",
-          `customPhases.${phase.id}.${ref.blockId} is not bound to the frozen Loom block revision`,
+          `customPhases.${phase.id}.${ref.blockId} at prompt order ${ref.promptOrder} is not bound to the frozen Loom block occurrence`,
         );
       }
       customInstructions.push({
         blockId: ref.blockId,
         expectedPresetRevision: ref.presetRevision,
         expectedBlockRevision: ref.blockRevision,
+        promptOrder: ref.promptOrder,
       });
     }
   }
   const all = [...workPolicy, ...workspaceUsage, ...completionCriteria, ...renderPolicy, ...customInstructions];
   if (all.length === 0) {
-    return { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [], excludedBlockIds: new Set() };
+    return { workPolicy: [], workspaceUsage: [], completionCriteria: [], renderPolicy: [], excludedBlockOccurrences: new Set() };
   }
   const normalize = (
     refs: readonly CognitionLoomBlockRefV1[],
@@ -1260,57 +1278,57 @@ function cognitionPhaseRefs(
     const seen = new Map<string, CognitionLoomBlockRefV1>();
     const retained: CognitionLoomBlockRefV1[] = [];
     for (const ref of refs) {
-      const previous = seen.get(ref.blockId);
+      const occurrenceKey = blockOccurrenceKey(ref.blockId, ref.promptOrder);
+      const previous = seen.get(occurrenceKey);
       if (previous && (
         previous.expectedPresetRevision !== ref.expectedPresetRevision
         || previous.expectedBlockRevision !== ref.expectedBlockRevision
       )) {
-        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} has conflicting source revisions`);
+        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId}@${ref.promptOrder} has conflicting source revisions`);
       }
-      const sourceBlock = sourceBlocks.get(ref.blockId);
-      const snapshotBlock = snapshotBlocks.get(ref.blockId);
-      if (!source || !sourceBlock || !snapshotBlock) {
-        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} is not in the frozen source`);
+      const sourceBlock = sourceBlocks.get(ref.promptOrder);
+      const snapshotBlock = snapshot.blocks[ref.promptOrder];
+      if (!source || !sourceBlock || sourceBlock.blockId !== ref.blockId || !snapshotBlock || snapshotBlock.id !== ref.blockId) {
+        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId}@${ref.promptOrder} is not in the frozen source`);
+      }
+      if (snapshotBlock.marker === "category") {
+        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId}@${ref.promptOrder} cannot use a category marker as a Loom source`);
       }
       if (
         source.presetRevision !== ref.expectedPresetRevision
         || sourceBlock.revision !== ref.expectedBlockRevision
         || String(snapshotBlock.revision) !== String(sourceBlock.revision)
       ) {
-        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId} source revision mismatch`);
+        throw new AssemblyPlanValidationError("invalid_input", `${path}.${ref.blockId}@${ref.promptOrder} source revision mismatch`);
       }
-      if (!previous) seen.set(ref.blockId, ref);
+      if (!previous) seen.set(occurrenceKey, ref);
       if (preserveDuplicates || !previous) retained.push(ref);
     }
-    return retained.sort((left, right) => {
-      const leftOrder = sourceBlocks.get(left.blockId)?.promptOrder ?? 0;
-      const rightOrder = sourceBlocks.get(right.blockId)?.promptOrder ?? 0;
-      return leftOrder - rightOrder || compareUtf8(left.blockId, right.blockId);
-    });
+    return retained.sort((left, right) => left.promptOrder - right.promptOrder || compareUtf8(left.blockId, right.blockId));
   };
   const normalizedWork = normalize(workPolicy, "workPolicy", true);
   const normalizedUsage = normalize(workspaceUsage, "workspaceUsage", true);
   const normalizedCompletion = normalize(completionCriteria, "completionCriteria", true);
   const normalizedRender = normalize(renderPolicy, "renderPolicy", true);
   const normalizedCustom = normalize(customInstructions, "customPhases");
-  const excludedBlockIds = new Set([
+  const excludedBlockOccurrences = new Set([
     ...normalizedWork,
     ...normalizedUsage,
     ...normalizedCompletion,
     ...normalizedRender,
     ...normalizedCustom,
-  ].map((ref) => ref.blockId));
+  ].map((ref) => blockOccurrenceKey(ref.blockId, ref.promptOrder)));
   return {
     workPolicy: normalizedWork,
     workspaceUsage: normalizedUsage,
     completionCriteria: normalizedCompletion,
     renderPolicy: normalizedRender,
-    excludedBlockIds,
+    excludedBlockOccurrences,
   };
 }
 interface CognitionBlockAdmissionV1 {
-  readonly excludedBlockIds: ReadonlySet<string>;
-  readonly ignoredBlockIds: ReadonlySet<string>;
+  readonly excludedBlockOccurrences: ReadonlySet<string>;
+  readonly ignoredBlockOccurrences: ReadonlySet<string>;
 }
 
 function cognitionBlockAdmission(
@@ -1318,22 +1336,22 @@ function cognitionBlockAdmission(
   parsedConfig: AgentConfigV2 | undefined,
   phaseRefs: CognitionPhaseRefsV1,
 ): CognitionBlockAdmissionV1 {
-  const authoredBlockIds = new Set<string>();
+  const authoredBlockOccurrences = new Set<string>();
   for (const bucket of ["workPolicy", "workspaceUsage", "completionCriteria", "renderPolicy"] as const) {
-    for (const entry of loomPolicy[bucket]) authoredBlockIds.add(entry.source.blockId);
+    for (const entry of loomPolicy[bucket]) authoredBlockOccurrences.add(blockOccurrenceKey(entry.source.blockId, entry.source.promptOrder));
   }
   for (const phase of parsedConfig?.runtimePolicy?.phases ?? []) {
-    for (const ref of phase.instructionRefs) authoredBlockIds.add(ref.blockId);
+    for (const ref of phase.instructionRefs) authoredBlockOccurrences.add(blockOccurrenceKey(ref.blockId, ref.promptOrder));
     for (const subset of phase.childInstructionSubsets) {
-      for (const ref of subset.instructionRefs) authoredBlockIds.add(ref.blockId);
+      for (const ref of subset.instructionRefs) authoredBlockOccurrences.add(blockOccurrenceKey(ref.blockId, ref.promptOrder));
     }
   }
-  const ignoredBlockIds = new Set(
-    [...authoredBlockIds].filter((blockId) => !phaseRefs.excludedBlockIds.has(blockId)),
+  const ignoredBlockOccurrences = new Set(
+    [...authoredBlockOccurrences].filter((occurrence) => !phaseRefs.excludedBlockOccurrences.has(occurrence)),
   );
   return {
-    excludedBlockIds: new Set([...phaseRefs.excludedBlockIds, ...authoredBlockIds]),
-    ignoredBlockIds,
+    excludedBlockOccurrences: new Set([...phaseRefs.excludedBlockOccurrences, ...authoredBlockOccurrences]),
+    ignoredBlockOccurrences,
   };
 }
 const EMPTY_LOOM_POLICY: LoomPolicyBucketsV1 = Object.freeze({
@@ -1367,16 +1385,16 @@ function loomBlocksForPolicy(
   cognitionSource: CognitionSourceSnapshotV1 | null,
   customPhasePlan?: AgentRuntimePhaseCompileResultV1,
 ): readonly LoomPromptInspectionBlockV1[] {
-  const byId = new Map(blocks.map((block) => [block.id, block] as const));
-  const sourceById = new Map(cognitionSource?.blocks.map((block) => [block.blockId, block] as const) ?? []);
+  const sourceByPromptOrder = new Map(cognitionSource?.blocks.map((block) => [block.promptOrder, block] as const) ?? []);
   const exactBlock = (source: LoomPolicySourceV1): SnapshotBlockV1 | null => {
     if (!cognitionSource || cognitionSource.presetRevision !== source.presetRevision) return null;
-    const frozenSource = sourceById.get(source.blockId);
-    const block = byId.get(source.blockId);
+    const frozenSource = sourceByPromptOrder.get(source.promptOrder);
+    const block = blocks[source.promptOrder];
     if (!frozenSource
+      || frozenSource.blockId !== source.blockId
       || !block
+      || block.id !== source.blockId
       || frozenSource.revision !== source.blockRevision
-      || frozenSource.promptOrder !== source.promptOrder
       || String(block.revision) !== String(frozenSource.revision)) return null;
     return block;
   };
@@ -1446,9 +1464,9 @@ function parseBlocks(
   snapshot: GenerationAssemblySnapshotV1,
   explicitConfig: unknown,
   blocks: readonly SnapshotBlockV1[] = snapshot.blocks,
-  excludedBlockIds: ReadonlySet<string> = new Set(),
+  excludedBlockOccurrences: ReadonlySet<string> = new Set(),
 ): InternalBlockPlan[] {
-  const selectedBlocks = blocks.map((block, index) => ({ block, index })).filter(({ block }) => !excludedBlockIds.has(block.id));
+  const selectedBlocks = blocks.map((block, index) => ({ block, index })).filter(({ block, index }) => !excludedBlockOccurrences.has(blockOccurrenceKey(block.id, index)));
   if (selectedBlocks.length > snapshot.limits.maxPromptBlocks) {
     throw new AssemblyPlanValidationError("limit_exceeded", "Prompt block limit exceeded");
   }
@@ -1571,21 +1589,21 @@ function phasePolicyMessages(
   limits: PreparationLimitsV1,
   bucket: LoomPolicyBucketV1,
   policy: LoomPolicyBucketsV1,
-): readonly AssemblyProviderMessageV1[] {
-  const byId = new Map(blocks.map((block, index) => [block.id, { block, index }] as const));
+): readonly AssemblyCompiledPolicyProviderMessageV1[] {
+  const byPromptOrder = blocks.map((block, index) => ({ block, index }));
   const policyBySource = new Map<string, LoomPolicyEntryV1[]>();
   for (const entry of policy[bucket]) {
-    const key = `${entry.source.blockId}\u0000${entry.source.presetRevision}\u0000${entry.source.blockRevision}`;
+    const key = `${blockOccurrenceKey(entry.source.blockId, entry.source.promptOrder)}:${entry.source.presetRevision}:${entry.source.blockRevision}`;
     const entries = policyBySource.get(key) ?? [];
     entries.push(entry);
     policyBySource.set(key, entries);
   }
   const consumedBySource = new Map<string, number>();
-  const messages: AssemblyProviderMessageV1[] = [];
+  const messages: AssemblyCompiledPolicyProviderMessageV1[] = [];
   for (const [order, ref] of refs.entries()) {
-    const entry = byId.get(ref.blockId);
-    if (!entry) throw new AssemblyPlanValidationError("invalid_input", `Loom policy block ${ref.blockId} is missing`);
-    const sourceKey = `${ref.blockId}\u0000${ref.expectedPresetRevision}\u0000${ref.expectedBlockRevision}`;
+    const entry = byPromptOrder[ref.promptOrder];
+    if (!entry || entry.block.id !== ref.blockId) throw new AssemblyPlanValidationError("invalid_input", `Loom policy block occurrence ${ref.blockId}@${ref.promptOrder} is missing`);
+    const sourceKey = `${blockOccurrenceKey(ref.blockId, ref.promptOrder)}:${ref.expectedPresetRevision}:${ref.expectedBlockRevision}`;
     const sourceEntries = policyBySource.get(sourceKey);
     const sourceEntryIndex = consumedBySource.get(sourceKey) ?? 0;
     const sourceEntry = sourceEntries?.[sourceEntryIndex];
@@ -1600,8 +1618,12 @@ function phasePolicyMessages(
     const message = messageForBlock(entry.block, entry.index, [literal], "cognition", order);
     messages.push(frozen({
       ...message,
+      blockIndex: entry.index,
       provenance: {
-        ...message.provenance,
+        kind: "cognition" as const,
+        sourceId: message.provenance.sourceId,
+        sourceRevision: message.provenance.sourceRevision,
+        sourceIndex: message.provenance.sourceIndex,
         loom: {
           entryId: sourceEntry.id,
           bucket,
@@ -1615,6 +1637,15 @@ function phasePolicyMessages(
     }));
   }
   return frozen(messages);
+}
+
+function isCompiledPolicyMessage(
+  message: AssemblyProviderMessageV1,
+): message is AssemblyCompiledPolicyProviderMessageV1 {
+  return message.provenance.kind === "cognition"
+    && message.provenance.loom !== undefined
+    && Number.isSafeInteger(message.blockIndex)
+    && (message.blockIndex ?? -1) >= 0;
 }
 
 /**
@@ -1641,10 +1672,13 @@ export function selectEffectiveLoomPolicyMessagesV1(
     throw new AssemblyPlanValidationError("invalid_input", `Loom ${bucket} messages exceed the inspected policy`);
   }
   const itemById = new Map(bucketItems.map((item) => [item.entryId, item] as const));
-  const messageById = new Map<string, AssemblyProviderMessageV1>();
+  const messageById = new Map<string, AssemblyCompiledPolicyProviderMessageV1>();
   for (const message of messages) {
-    const loom = message.provenance?.loom;
-    if (!loom || loom.bucket !== bucket || messageById.has(loom.entryId)) {
+    if (!isCompiledPolicyMessage(message)) {
+      throw new AssemblyPlanValidationError("invalid_input", `Loom ${bucket} message provenance is invalid`);
+    }
+    const loom = message.provenance.loom;
+    if (loom.bucket !== bucket || messageById.has(loom.entryId)) {
       throw new AssemblyPlanValidationError("invalid_input", `Loom ${bucket} message provenance is invalid`);
     }
     const item = itemById.get(loom.entryId);
@@ -1673,7 +1707,7 @@ export function selectEffectiveLoomPolicyMessagesV1(
       const rightIndex = right.outcome.status === "included" ? right.outcome.effectiveIndex : -1;
       return leftIndex - rightIndex;
     });
-  const selected: AssemblyProviderMessageV1[] = [];
+  const selected: AssemblyCompiledPolicyProviderMessageV1[] = [];
   let totalBytes = 0;
   for (const item of bucketItems) {
     if (item.outcome.status === "rejected") {
@@ -1715,12 +1749,12 @@ function cognitionPhaseActivationEvidence(
 ): readonly AssemblyCognitionEvidenceV1[] {
   const source = snapshot.agentCognition.cognitionSource;
   if (!source) return frozen([]);
-  const sourceById = new Map(source.blocks.map((block) => [block.blockId, block] as const));
-  const messageById = new Map(messages.map((message) => [message.blockId, message] as const));
+  const sourceByPromptOrder = new Map(source.blocks.map((block) => [block.promptOrder, block] as const));
   return frozen(refs.map((ref, order): AssemblyCognitionEvidenceV1 => {
-    const sourceBlock = sourceById.get(ref.blockId);
-    const message = messageById.get(ref.blockId);
-    if (!sourceBlock || !message) throw new AssemblyPlanValidationError("invalid_input", `Cognition evidence source is missing for ${ref.blockId}`);
+    const sourceBlock = sourceByPromptOrder.get(ref.promptOrder);
+    const message = messages[order];
+    const messageSource = message?.provenance?.loom?.source;
+    if (!sourceBlock || sourceBlock.blockId !== ref.blockId || !message || message.blockId !== ref.blockId || !messageSource || messageSource.promptOrder !== ref.promptOrder) throw new AssemblyPlanValidationError("invalid_input", `Cognition evidence source occurrence is missing for ${ref.blockId}@${ref.promptOrder}`);
     const byteCost = message.segments.reduce((total, segment) => total + (segment.kind === "literal" ? bytes(segment.text) : 0), 0);
     const tokenCost = Math.max(1, Math.ceil(byteCost / 4));
     return frozen({
@@ -1747,7 +1781,7 @@ function messageProvenance(
   sourceRevision: string,
   sourceIndex: number,
   databank?: AssemblyDatabankMessageProvenanceV1,
-): AssemblyMessageProvenanceV1 {
+): AssemblyOrdinaryMessageProvenanceV1 {
   if (sourceId.length === 0 || sourceRevision.length === 0 || !Number.isSafeInteger(sourceIndex) || sourceIndex < 0) {
     throw new AssemblyPlanValidationError("invalid_input", "Assembly message provenance is invalid");
   }
@@ -1766,7 +1800,7 @@ function messageForBlock(
   segments: readonly AssemblyMessageSegmentV1[],
   kind: "block" | "cognition" = "block",
   sourceIndex = blockIndex,
-): AssemblyProviderMessageV1 {
+): AssemblyOrdinaryProviderMessageV1 {
   const role = block.role === "user_append" ? "user" : block.role === "assistant_append" ? "assistant" : block.role;
   return frozen({
     role,
@@ -1911,14 +1945,15 @@ export async function compileAgentAssemblyPlan(
   const cognitionAdmission = cognitionBlockAdmission(loomPolicy, parsedConfig, phaseRefs);
   const preparation = await preprocessSnapshot(
     snapshot,
-    cognitionAdmission.excludedBlockIds,
-    cognitionAdmission.ignoredBlockIds,
+    cognitionAdmission.excludedBlockOccurrences,
+    cognitionAdmission.ignoredBlockOccurrences,
   );
   const authoredNonCognitionBlocks = snapshot.blocks
-    .map((block) => projectStructuralBlockAdmission(block, snapshot.participants.structuralBlockValues))
-    .filter((block) => !cognitionAdmission.excludedBlockIds.has(block.id));
+    .map((block, index) => ({ block: projectStructuralBlockAdmission(block, snapshot.participants.structuralBlockValues), index }))
+    .filter(({ block, index }) => !cognitionAdmission.excludedBlockOccurrences.has(blockOccurrenceKey(block.id, index)))
+    .map(({ block }) => block);
   const macroHandlesDatabank = snapshotUsesDatabankRetrievalMacro(authoredNonCognitionBlocks);
-  const parsed = parseBlocks(snapshot, parsedConfig, preparation.blocks, cognitionAdmission.excludedBlockIds);
+  const parsed = parseBlocks(snapshot, parsedConfig, preparation.blocks, cognitionAdmission.excludedBlockOccurrences);
   const loomBlocks = loomBlocksForPolicy(loomPolicy, preparation.blocks, snapshot.agentCognition.cognitionSource, customPhasePlan);
   const producerByName = new Map<string, { block: SnapshotBlockV1; blockIndex: number; child: ParsedChild }>();
   for (const item of parsed) {
@@ -3117,7 +3152,6 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
         || typeof message !== "object"
         || Array.isArray(message)
         || Object.keys(message).some((key) => !messageKeys.has(key))
-        || !isValidAssemblyMessageProvenance(message.provenance)
         || message.contentKind !== "segments"
         || !Array.isArray(message.segments)
         || (message.name !== undefined && (typeof message.name !== "string" || bytes(message.name) > 256))
@@ -3128,6 +3162,9 @@ export function validateAssemblyPlanV1(plan: unknown, trustedLimits: Preparation
         || message.blockIndex < 0
       ) {
         throw new AssemblyPlanValidationError("invalid_input", "Invalid cognition policy message envelope");
+      }
+      if (!isValidAssemblyMessageProvenance(message.provenance)) {
+        throw new AssemblyPlanValidationError("invalid_input", "Invalid cognition policy message provenance");
       }
       if (message.segments.length > maxSegmentsPerMessage) {
         throw new AssemblyPlanValidationError("limit_exceeded", "Cognition message segment limit exceeded");
@@ -3325,7 +3362,7 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
   const cognitionAdmission = cognitionBlockAdmission(expectedPlan.loomPolicy, config, phaseRefs);
   const validationBlocks = snapshot.blocks.map((block) =>
     projectStructuralBlockAdmission(block, snapshot.participants.structuralBlockValues));
-  const parsed = parseBlocks(snapshot, config, validationBlocks, cognitionAdmission.excludedBlockIds);
+  const parsed = parseBlocks(snapshot, config, validationBlocks, cognitionAdmission.excludedBlockOccurrences);
   const expectedProfileOutputLimits = profileOutputLimitsFor(snapshot, config);
   if (canonical(plan.profileOutputLimits) !== canonical(expectedProfileOutputLimits)) {
     throw new AssemblyPlanValidationError("invalid_input", "Profile output limits are not bound to the requested snapshot");
@@ -3403,7 +3440,12 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
     message.id,
     { message, sourceIndex },
   ] as const));
-  const blockById = new Map(snapshot.blocks.map((block) => [block.id, block] as const));
+  const cognitionMessagesByBucket: Readonly<Record<LoomPolicyBucketV1, readonly AssemblyProviderMessageV1[]>> = {
+    workPolicy: plan.workPolicyMessages,
+    workspaceUsage: plan.workspaceUsageMessages,
+    completionCriteria: plan.completionCriteriaMessages,
+    renderPolicy: plan.renderPolicyMessages,
+  };
   const seenProviderProvenance = new Set<string>();
   for (const message of plan.providerMessages) {
     const provenanceKey = canonical(message.provenance);
@@ -3442,7 +3484,67 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
         throw new AssemblyPlanValidationError("invalid_input", "Provider block provenance is not source-bound");
       }
     } else if (provenance.kind === "cognition") {
-      expectedRevision = blockById.get(provenance.sourceId)?.revision;
+      const loom = provenance.loom;
+      const promptOrder = loom?.source.promptOrder;
+      const sourceIndex = provenance.sourceIndex;
+      const sourceMessages = loom ? cognitionMessagesByBucket[loom.bucket] : undefined;
+      const sourceMessage = Number.isSafeInteger(sourceIndex) && sourceIndex >= 0
+        ? sourceMessages?.[sourceIndex]
+        : undefined;
+      const sourceLoom = sourceMessage?.provenance.loom;
+      const block = Number.isSafeInteger(promptOrder) && promptOrder! >= 0
+        ? snapshot.blocks[promptOrder!]
+        : undefined;
+      const cognitionSource = snapshot.agentCognition.cognitionSource;
+      const frozenSourceBlock = Number.isSafeInteger(promptOrder)
+        ? cognitionSource?.blocks.find((entry) => entry.promptOrder === promptOrder)
+        : undefined;
+      const policyEntry = loom
+        ? plan.loomPolicy[loom.bucket].find((entry) => entry.id === loom.entryId)
+        : undefined;
+      if (
+        !loom
+        || !Number.isSafeInteger(promptOrder)
+        || promptOrder! < 0
+        || promptOrder! >= snapshot.blocks.length
+        || !Number.isSafeInteger(sourceIndex)
+        || sourceIndex < 0
+        || !block
+        || block.marker === "category"
+        || !sourceMessage
+        || sourceMessage.provenance.kind !== "cognition"
+        || sourceMessage.provenance.sourceIndex !== sourceIndex
+        || sourceMessage.blockId !== block.id
+        || sourceMessage.blockIndex !== promptOrder
+        || sourceMessage.provenance.sourceId !== provenance.sourceId
+        || sourceMessage.provenance.sourceRevision !== provenance.sourceRevision
+        || !sourceLoom
+        || sourceLoom.entryId !== loom.entryId
+        || sourceLoom.bucket !== loom.bucket
+        || sourceLoom.destination !== loom.destination
+        || sourceLoom.checkpoint !== loom.checkpoint
+        || canonical(sourceLoom.source) !== canonical(loom.source)
+        || canonical(sourceLoom.condition) !== canonical(loom.condition)
+        || !policyEntry
+        || policyEntry.destination !== loom.destination
+        || policyEntry.checkpoint !== loom.checkpoint
+        || canonical(policyEntry.source) !== canonical(loom.source)
+        || canonical(policyEntry.condition) !== canonical(loom.condition)
+        || provenance.sourceId !== block.id
+        || provenance.sourceRevision !== block.revision
+        || message.blockId !== block.id
+        || message.blockIndex !== promptOrder
+        || loom.source.blockId !== block.id
+        || String(loom.source.blockRevision) !== block.revision
+        || !cognitionSource
+        || cognitionSource.presetRevision !== loom.source.presetRevision
+        || !frozenSourceBlock
+        || frozenSourceBlock.blockId !== block.id
+        || frozenSourceBlock.revision !== loom.source.blockRevision
+      ) {
+        throw new AssemblyPlanValidationError("invalid_input", "Provider cognition provenance is not source-bound");
+      }
+      expectedRevision = block.revision;
     } else if (provenance.kind === "world_info" && !/^[0-9a-f]{8}$/i.test(provenance.sourceRevision)) {
       throw new AssemblyPlanValidationError("invalid_input", "Provider world-info provenance is not source-bound");
     }
@@ -3559,17 +3661,18 @@ export async function validateAssemblyPlanAgainstSnapshotV1(
     for (let order = 0; order < refs.length; order += 1) {
       const ref = refs[order]!;
       const source = snapshot.agentCognition.cognitionSource;
-      const sourceBlock = source?.blocks.find((block) => block.blockId === ref.blockId);
+      const sourceBlock = source?.blocks.find((block) => block.promptOrder === ref.promptOrder);
       const message = messages[order]!;
       if (
         message.blockId !== ref.blockId
-        || message.blockIndex !== snapshot.blocks.findIndex((block) => block.id === ref.blockId)
+        || message.blockIndex !== ref.promptOrder
         || message.segments.some((segment) => segment.kind !== "literal")
         || agentMarkersPresent(message.segments.map((segment) => segment.kind === "literal" ? segment.text : "").join(""))
         || !sourceBlock
+        || sourceBlock.blockId !== ref.blockId
       ) throw new AssemblyPlanValidationError("invalid_input", "Cognition policy source binding changed");
-      const policyBlock = snapshot.blocks.find((block) => block.id === ref.blockId);
-      if (!policyBlock) throw new AssemblyPlanValidationError("invalid_input", "Cognition policy block is not in the frozen blocks");
+      const policyBlock = snapshot.blocks[ref.promptOrder];
+      if (!policyBlock || policyBlock.id !== ref.blockId) throw new AssemblyPlanValidationError("invalid_input", "Cognition policy block occurrence is not in the frozen blocks");
       if (rawComparable(policyBlock)) {
         const expectedSegments = [frozen({ kind: "literal" as const, text: policyBlock.content, bytes: bytes(policyBlock.content) })];
         if (canonical(message.segments) !== canonical(expectedSegments)) {

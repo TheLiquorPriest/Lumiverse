@@ -46,6 +46,76 @@ async function initPresetsTestDb(): Promise<void> {
     created_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0
   )`);
+  getDb().exec(`
+    CREATE TABLE preset_agent_configs (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 2,
+      agents_enabled INTEGER NOT NULL DEFAULT 0,
+      allowed_modes TEXT NOT NULL DEFAULT '["response"]',
+      default_mode TEXT NOT NULL DEFAULT 'response',
+      max_invocations INTEGER NOT NULL DEFAULT 64,
+      max_tool_calls INTEGER NOT NULL DEFAULT 64,
+      main_tool_ids TEXT NOT NULL DEFAULT '[]',
+      main_lore_scope TEXT NOT NULL DEFAULT 'active',
+      phase_policy_json TEXT NOT NULL DEFAULT '{}',
+      cognition_policy_json TEXT NOT NULL DEFAULT '{}',
+      task_policy_json TEXT NOT NULL DEFAULT '{}',
+      workspace_policy_json TEXT NOT NULL DEFAULT '{}',
+      state TEXT NOT NULL DEFAULT 'ready',
+      review_code TEXT,
+      review_acknowledged INTEGER NOT NULL DEFAULT 0,
+      config_revision INTEGER NOT NULL DEFAULT 1,
+      binding_revision INTEGER NOT NULL DEFAULT 1,
+      config_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, preset_id)
+    );
+    CREATE TABLE preset_agent_connection_slots (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      slot_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      required_capabilities TEXT NOT NULL DEFAULT '[]',
+      slot_revision INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, preset_id, slot_id)
+    );
+    CREATE TABLE preset_agent_profiles (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      system_prompt TEXT NOT NULL,
+      connection_ref_kind TEXT NOT NULL,
+      slot_id TEXT,
+      tool_ids TEXT NOT NULL DEFAULT '[]',
+      workspace_capabilities TEXT NOT NULL DEFAULT '[]',
+      lore_scope TEXT NOT NULL,
+      allow_main_delegation INTEGER NOT NULL,
+      failure_policy TEXT NOT NULL,
+      stream_activity INTEGER NOT NULL,
+      max_output_tokens INTEGER NOT NULL,
+      timeout_ms INTEGER NOT NULL,
+      profile_revision INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, preset_id, profile_id)
+    );
+    CREATE TABLE preset_agent_slot_bindings (
+      user_id TEXT NOT NULL,
+      preset_id TEXT NOT NULL,
+      slot_id TEXT NOT NULL,
+      connection_id TEXT,
+      binding_revision INTEGER NOT NULL DEFAULT 1,
+      state TEXT NOT NULL DEFAULT 'ready',
+      review_code TEXT,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, preset_id, slot_id)
+    );
+  `);
   getDb().run(await Bun.file(join(import.meta.dir, "..", "db", "migrations", "127_agent_runtime_repair_acknowledgements.sql")).text());
   getDb().query('INSERT INTO "user" (id) VALUES (?)').run("u1");
   getDb().run(`CREATE TABLE regex_scripts (
@@ -107,6 +177,63 @@ describe("preset cache validators", () => {
     expect(second.status).toBe(200);
     expect(second.headers.get("etag")).not.toBe(etag);
     expect(second.headers.get("vary")).toBe("Cookie, Accept-Encoding");
+  });
+  test("invalidates a full preset ETag after a config-only Agent Runtime save", async () => {
+    insertPreset("preset-1", "u1", 7);
+    getDb().query(
+      "INSERT INTO preset_agent_configs (user_id, preset_id, config_revision, binding_revision) VALUES (?, ?, ?, ?)",
+    ).run("u1", "preset-1", 1, 1);
+
+    const first = await app.request("http://localhost/preset-1", {
+      headers: { "x-test-user": "u1" },
+    });
+    const firstEtag = first.headers.get("etag");
+    const firstBody = await first.json();
+    expect(first.status).toBe(200);
+    expect(firstEtag).not.toBeNull();
+    expect(firstBody.cache_revision).toBe(7);
+    expect(firstBody.agent_config_revision).toBe(1);
+
+    const editorResponse = await app.request("http://localhost/preset-1/agent-config", {
+      headers: { "x-test-user": "u1" },
+    });
+    const editor = await editorResponse.json();
+    expect(editorResponse.status).toBe(200);
+
+    const savedResponse = await app.request("http://localhost/preset-1/agent-config", {
+      method: "PUT",
+      headers: { "x-test-user": "u1", "content-type": "application/json" },
+      body: JSON.stringify({
+        config: { ...editor.config, maxInvocations: 63 },
+        slotBindings: editor.slotBindings,
+        taskTemplates: editor.taskTemplates,
+        reviewAcknowledgements: editor.reviewAcknowledgements,
+        promptOrder: [],
+        expectedPresetRevision: 7,
+        expectedConfigRevision: 1,
+      }),
+    });
+    const saved = await savedResponse.json();
+    expect(savedResponse.status).toBe(200);
+    expect(saved.editor.presetRevision).toBe(7);
+    expect(saved.editor.configRevision).toBe(2);
+
+    const refreshed = await app.request("http://localhost/preset-1", {
+      headers: { "x-test-user": "u1", "if-none-match": firstEtag! },
+    });
+    const refreshedEtag = refreshed.headers.get("etag");
+    const refreshedBody = await refreshed.json();
+    expect(refreshed.status).toBe(200);
+    expect(refreshedEtag).not.toBe(firstEtag);
+    expect(refreshedBody.cache_revision).toBe(7);
+    expect(refreshedBody.agent_config_revision).toBe(2);
+    expect(refreshedBody.agent_config.maxInvocations).toBe(63);
+
+    const unchanged = await app.request("http://localhost/preset-1", {
+      headers: { "x-test-user": "u1", "if-none-match": refreshedEtag! },
+    });
+    expect(unchanged.status).toBe(304);
+    expect(unchanged.headers.get("etag")).toBe(refreshedEtag);
   });
   test("returns a revision conflict without clobbering, then increments on a matching update", async () => {
     insertPreset("preset-1", "u1", 3);

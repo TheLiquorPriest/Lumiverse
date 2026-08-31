@@ -163,9 +163,9 @@ app.post("/stash", async (c) => {
 });
 
 app.delete("/stash/:stashId", (c) => {
-  const deleted = stashSvc.removePromptBlockFromStash(c.get("userId"), c.req.param("stashId"));
-  if (!deleted) return c.json({ error: "Not found" }, 404);
-  return c.json({ success: true });
+  const result = stashSvc.removePromptBlockFromStash(c.get("userId"), c.req.param("stashId"));
+  if (!result.removed) return c.json({ error: "Not found" }, 404);
+  return c.json({ success: true, ...result });
 });
 
 app.get("/agent-runtime-limits", (c) => {
@@ -334,12 +334,12 @@ app.get("/:id", (c) => {
   const userId = c.get("userId");
   const id = c.req.param("id");
 
-  // A dedicated monotonic revision drives this ETag, so same-second updates
-  // invalidate cache entries without altering the user's visible update time.
-  const cacheRevision = svc.getPresetCacheRevision(userId, id);
-  if (cacheRevision == null) return c.json({ error: "Not found" }, 404);
+  // The full preset embeds both prompt data and the normalized Agent Runtime.
+  // Its validator must advance when either independently versioned half changes.
+  const revision = svc.getPresetRepresentationRevision(userId, id);
+  if (revision == null) return c.json({ error: "Not found" }, 404);
 
-  const etag = `W/"preset-${id}-${cacheRevision}-${userEtagScope(userId)}"`;
+  const etag = `W/"preset-${id}-${revision.cacheRevision}-${revision.agentConfigRevision}-${userEtagScope(userId)}"`;
   if (ifNoneMatchSatisfies(c.req.header("if-none-match"), etag)) {
     return new Response(null, { status: 304, headers: { ETag: etag, "Cache-Control": REVALIDATE_PRIVATE, Vary: "Cookie, Accept-Encoding" } });
   }

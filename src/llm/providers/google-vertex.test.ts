@@ -38,6 +38,31 @@ async function createTestServiceAccount(): Promise<string> {
 // functionCall is {name, args}, functionResponse is {name, response} with
 // "output"/"error" keys per the docs.
 describe("GoogleVertexProvider tool calling wire shape", () => {
+  test("required mode uses ANY over exactly the admitted host tools", () => {
+    const body = (new GoogleVertexProvider() as any).buildBody({
+      model: "gemini-2.5-flash",
+      messages: [{ role: "user", content: "continue" }],
+      parameters: { toolConfig: { functionCallingConfig: { mode: "NONE" } } },
+      toolMode: "required",
+      tools: [{ name: "host_a", description: "A", parameters: { type: "object" } }],
+    });
+    expect(body.toolConfig).toEqual({ functionCallingConfig: { mode: "ANY" } });
+    expect(body.tools).toEqual([{ functionDeclarations: [{
+      name: "host_a",
+      description: "A",
+      parameters: { type: "object" },
+    }] }]);
+  });
+
+  test("rejects required mode without an admitted function declaration", () => {
+    expect(() => (new GoogleVertexProvider() as any).buildBody({
+      model: "gemini-2.5-flash",
+      messages: [{ role: "user", content: "continue" }],
+      toolMode: "required",
+      tools: [],
+    })).toThrow("at least one admitted host tool");
+  });
+
   test("hoists only the leading system prefix and preserves later placement", () => {
     const provider = new GoogleVertexProvider();
     const body = (provider as any).buildBody({

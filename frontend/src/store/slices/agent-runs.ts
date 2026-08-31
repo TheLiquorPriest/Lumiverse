@@ -57,6 +57,7 @@ import type {
   AgentRunInspectionListV1,
   AgentRunInspectionRetryResponseV1,
   AgentRunInspectionRetryV1,
+  WorkSegmentInspectionProjectionV1,
   AgentRunInspectionSummaryV1,
   AgentRunOutcomeV2,
   AgentRunPublicErrorCodeV2,
@@ -1643,6 +1644,7 @@ function normalizePromptEvidence(value: unknown): AgentPromptEvidenceV1 | null {
   const id = boundedString(value.id)
   const sourceId = boundedString(value.sourceId)
   const sourceRevision = normalizePromptRevision(value.sourceRevision)
+  const promptOrder = nonNegativeInteger(value.promptOrder)
   const destination = isOwn(PROMPT_DESTINATIONS, value.destination) ? value.destination : null
   const role = isOwn(PROMPT_ROLES, value.role) ? value.role : null
   const correlation = normalizeInspectionCorrelation(value.correlation)
@@ -1651,10 +1653,29 @@ function normalizePromptEvidence(value: unknown): AgentPromptEvidenceV1 | null {
   const omissionReason = nullableBoundedText(value.omissionReason, 2_048)
   const nativeProvenance = value.nativeProvenance === null ? null : normalizePromptNativeProvenance(value.nativeProvenance)
   const loomInspection = value.loomInspection === null ? null : normalizeLoomInspection(value.loomInspection)
-  if (!id || !sourceId || sourceRevision === null || !destination || !role || !correlation || typeof value.included !== 'boolean'
+  if (!id || !sourceId || sourceRevision === null || promptOrder === null || !destination || !role || !correlation || typeof value.included !== 'boolean'
     || content === null || !contentDigest || omissionReason === undefined || !Object.hasOwn(value, 'nativeProvenance') || !Object.hasOwn(value, 'loomInspection')
     || value.nativeProvenance !== null && nativeProvenance === null || value.loomInspection !== null && loomInspection === null) return null
-  return { version: 1, id, sourceId, sourceRevision, destination, role, correlation, included: value.included, content, contentDigest, omissionReason, nativeProvenance, loomInspection }
+  return { version: 1, id, sourceId, sourceRevision, promptOrder, destination, role, correlation, included: value.included, content, contentDigest, omissionReason, nativeProvenance, loomInspection }
+}
+function hasPromptOccurrenceCollision(prompts: readonly AgentPromptEvidenceV1[]): boolean {
+  const fingerprints = new Map<string, string>()
+  for (const prompt of prompts) {
+    const key = JSON.stringify([prompt.sourceId, prompt.promptOrder, prompt.sourceRevision, prompt.destination])
+    const fingerprint = JSON.stringify([
+      prompt.role,
+      prompt.content,
+      prompt.contentDigest,
+      prompt.included,
+      prompt.omissionReason,
+      prompt.nativeProvenance,
+      prompt.loomInspection,
+    ])
+    const retained = fingerprints.get(key)
+    if (retained !== undefined && retained !== fingerprint) return true
+    fingerprints.set(key, fingerprint)
+  }
+  return false
 }
 function normalizeCortexReceipt(value: unknown): AgentCortexReceiptV1 | null {
   if (!isUnknownRecord(value) || value.version !== 1 || value.checkpoint !== 'WORK' || value.canonical !== false) return null
@@ -1738,8 +1759,327 @@ function normalizeStrictInspectionArray<T>(value: unknown, normalize: (item: unk
   return normalized
 }
 
+const WORK_BOUNDARY_CLASSES = new Set(['tool_action', 'tool_free_stop', 'reasoning_only_stop', 'reasoning_only_length', 'empty_provider_response', 'provider_protocol_failure'])
+const WORK_SEGMENT_LIFECYCLES = new Set(['admitted', 'running', 'closed', 'interrupted', 'failed', 'exhausted', 'cancelled'])
+const WORK_SEGMENT_CLOSE_RESULTS = new Set(['phase_advanced', 'phase_repeated', 'same_phase_rollover', 'work_complete', 'failed', 'exhausted', 'cancelled'])
+const WORK_DISPATCH_LIFECYCLES = new Set(['reserved', 'in_flight', 'settled', 'interrupted'])
+const WORK_TRANSITION_KINDS = new Set(['advance', 'repeat', 'rollover', 'terminal'])
+
+function workBoundary(value: unknown): WorkSegmentInspectionProjectionV1['segments'][number]['boundaryClass'] | undefined {
+  return value === null || typeof value === 'string' && WORK_BOUNDARY_CLASSES.has(value)
+    ? value as WorkSegmentInspectionProjectionV1['segments'][number]['boundaryClass']
+    : undefined
+}
+function workTerminalCloseResult(value: unknown): WorkSegmentInspectionProjectionV1['recovery']['terminalCloseResult'] | undefined {
+  if (value === null) return null
+  if (value === 'failed') return 'failed'
+  if (value === 'exhausted') return 'exhausted'
+  if (value === 'cancelled') return 'cancelled'
+  return undefined
+}
+function normalizeWorkIdentity(value: unknown): WorkSegmentInspectionProjectionV1['segments'][number]['identity'] | null {
+  if (!isUnknownRecord(value) || !inspectionExactKeys(value, ['segmentId', 'phaseId', 'phaseIndex', 'phaseOccurrence', 'segmentOrdinal'])) return null
+  const segmentId = boundedString(value.segmentId)
+  const phaseId = nullableBoundedString(value.phaseId)
+  const phaseIndex = nonNegativeInteger(value.phaseIndex)
+  const phaseOccurrence = nonNegativeInteger(value.phaseOccurrence)
+  const segmentOrdinal = nonNegativeInteger(value.segmentOrdinal)
+  return segmentId && phaseId !== undefined && phaseIndex !== null && phaseOccurrence !== null && segmentOrdinal !== null
+    ? { segmentId, phaseId, phaseIndex, phaseOccurrence, segmentOrdinal }
+    : null
+}
+function normalizeWorkUsage(value: unknown): WorkSegmentInspectionProjectionV1['segments'][number]['usage'] | null {
+  const keys = ['providerDispatches', 'providerInputTokens', 'providerOutputTokens', 'providerTotalTokens', 'billedOutputTokens', 'toolCalls', 'workspaceOperations', 'unsignedBoundaries', 'receiveBytes', 'publishedOutputBytes'] as const
+  if (!isUnknownRecord(value) || !inspectionExactKeys(value, keys)) return null
+  const normalized = Object.fromEntries(keys.map((key) => [key, nonNegativeInteger(value[key])])) as Record<typeof keys[number], number | null>
+  if (keys.some((key) => normalized[key] === null)) return null
+  return normalized as WorkSegmentInspectionProjectionV1['segments'][number]['usage']
+}
+function sameWorkSegmentIdentity(
+  left: WorkSegmentInspectionProjectionV1['segments'][number]['identity'],
+  right: WorkSegmentInspectionProjectionV1['segments'][number]['identity'],
+): boolean {
+  return left.segmentId === right.segmentId
+    && left.phaseId === right.phaseId
+    && left.phaseIndex === right.phaseIndex
+    && left.phaseOccurrence === right.phaseOccurrence
+    && left.segmentOrdinal === right.segmentOrdinal
+}
+function hasCoherentWorkSegmentState(segment: WorkSegmentInspectionProjectionV1['segments'][number]): boolean {
+  if (segment.lifecycle === 'admitted' || segment.lifecycle === 'running') {
+    return segment.boundaryClass === null
+      && segment.closeResult === null
+      && segment.closedWorkspaceRevision === null
+  }
+  if (segment.closeResult === null || segment.closedWorkspaceRevision === null) return false
+  if (segment.lifecycle === 'closed') {
+    return segment.closeResult === 'phase_advanced'
+      || segment.closeResult === 'phase_repeated'
+      || segment.closeResult === 'same_phase_rollover'
+      || segment.closeResult === 'work_complete'
+  }
+  if (segment.lifecycle === 'failed') return segment.closeResult === 'failed'
+  if (segment.lifecycle === 'exhausted') return segment.closeResult === 'exhausted'
+  if (segment.lifecycle === 'cancelled') return segment.closeResult === 'cancelled'
+  return segment.lifecycle === 'interrupted'
+}
+function hasCoherentWorkDispatchState(dispatch: WorkSegmentInspectionProjectionV1['dispatches'][number]): boolean {
+  if (dispatch.lifecycle === 'reserved' || dispatch.lifecycle === 'in_flight') {
+    return dispatch.settledWorkspaceRevision === null
+      && dispatch.boundaryClass === null
+      && dispatch.usage === null
+  }
+  return dispatch.settledWorkspaceRevision !== null
+    && dispatch.boundaryClass !== null
+    && dispatch.usage !== null
+}
+function hasCoherentWorkSegmentInspection(projection: WorkSegmentInspectionProjectionV1): boolean {
+  const { recovery, segments, dispatches, transitions } = projection
+  if (recovery.state === 'active') {
+    if (recovery.phaseIndex === null || recovery.phaseOccurrence === null
+      || recovery.terminalCloseResult !== null || recovery.terminalBoundaryClass !== null) return false
+  } else if (recovery.phaseId !== null || recovery.phaseIndex !== null || recovery.phaseOccurrence !== null
+    || recovery.currentSegmentId !== null
+    || recovery.terminalCloseResult === null && recovery.terminalBoundaryClass !== null) return false
+
+  const expectedNextSegmentOrdinal = recovery.currentSegmentId === null
+    ? segments.length
+    : Math.max(0, segments.length - 1)
+  if (recovery.usage.segments !== segments.length || recovery.nextSegmentOrdinal !== expectedNextSegmentOrdinal) return false
+
+  const segmentsById = new Map<string, WorkSegmentInspectionProjectionV1['segments'][number]>()
+  let activeSegment: WorkSegmentInspectionProjectionV1['segments'][number] | null = null
+  for (let ordinal = 0; ordinal < segments.length; ordinal += 1) {
+    const segment = segments[ordinal]
+    if (!segment || segmentsById.has(segment.identity.segmentId)
+      || segment.identity.segmentOrdinal !== ordinal
+      || segment.identity.phaseOccurrence > segment.identity.segmentOrdinal
+      || !hasCoherentWorkSegmentState(segment)) return false
+    segmentsById.set(segment.identity.segmentId, segment)
+    if (segment.lifecycle === 'admitted' || segment.lifecycle === 'running') {
+      if (activeSegment !== null || ordinal !== segments.length - 1) return false
+      activeSegment = segment
+    }
+  }
+
+  if (recovery.currentSegmentId === null) {
+    if (activeSegment !== null) return false
+  } else {
+    const current = segmentsById.get(recovery.currentSegmentId)
+    if (recovery.state !== 'active' || !current || current !== activeSegment
+      || current.identity.phaseId !== recovery.phaseId
+      || current.identity.phaseIndex !== recovery.phaseIndex
+      || current.identity.phaseOccurrence !== recovery.phaseOccurrence
+      || current.identity.segmentOrdinal !== recovery.nextSegmentOrdinal) return false
+  }
+
+  const dispatchIds = new Set<string>()
+  const nextDispatchOrdinal = new Map<string, number>()
+  for (const dispatch of dispatches) {
+    const segment = segmentsById.get(dispatch.segmentId)
+    const expectedOrdinal = nextDispatchOrdinal.get(dispatch.segmentId) ?? 0
+    if (!segment || dispatchIds.has(dispatch.dispatchId) || dispatch.dispatchOrdinal !== expectedOrdinal
+      || !hasCoherentWorkDispatchState(dispatch)
+      || segment.lifecycle !== 'admitted' && segment.lifecycle !== 'running'
+        && (dispatch.lifecycle === 'reserved' || dispatch.lifecycle === 'in_flight')) return false
+    dispatchIds.add(dispatch.dispatchId)
+    nextDispatchOrdinal.set(dispatch.segmentId, expectedOrdinal + 1)
+  }
+
+  const transitionIds = new Set<string>()
+  const handoffIds = new Set<string>()
+  const transitionsBySource = new Map<string, WorkSegmentInspectionProjectionV1['transitions'][number]>()
+  for (const transition of transitions) {
+    const source = segmentsById.get(transition.sourceSegment.segmentId)
+    if (!source || transitionIds.has(transition.transitionId) || handoffIds.has(transition.handoffId)
+      || transitionsBySource.has(transition.sourceSegment.segmentId)
+      || !sameWorkSegmentIdentity(source.identity, transition.sourceSegment)
+      || source.lifecycle !== 'closed'
+      || source.closedWorkspaceRevision !== transition.sourceWorkspaceRevision
+      || source.boundaryClass !== transition.cause) return false
+    transitionIds.add(transition.transitionId)
+    handoffIds.add(transition.handoffId)
+    transitionsBySource.set(transition.sourceSegment.segmentId, transition)
+
+    const closeResultMatches = transition.transitionKind === 'advance' && source.closeResult === 'phase_advanced'
+      || transition.transitionKind === 'repeat' && source.closeResult === 'phase_repeated'
+      || transition.transitionKind === 'rollover' && source.closeResult === 'same_phase_rollover'
+      || transition.transitionKind === 'terminal' && source.closeResult === 'work_complete'
+    if (!closeResultMatches) return false
+
+    if (transition.transitionKind === 'terminal') {
+      if (transition.targetPhaseId !== null || transition.targetPhaseIndex !== null
+        || transition.targetPhaseOccurrence !== null || transition.targetSegmentOrdinal !== null
+        || source.identity.segmentOrdinal !== segments.length - 1 || recovery.state !== 'closed') return false
+      continue
+    }
+    if (transition.targetPhaseIndex === null || transition.targetPhaseOccurrence === null
+      || transition.targetSegmentOrdinal === null
+      || transition.targetSegmentOrdinal !== source.identity.segmentOrdinal + 1) return false
+    if (transition.transitionKind === 'advance') {
+      if (transition.targetPhaseId === null || transition.targetPhaseIndex <= source.identity.phaseIndex
+        || transition.targetPhaseOccurrence !== 0) return false
+    } else if (transition.transitionKind === 'repeat') {
+      if (source.identity.phaseId === null || transition.targetPhaseId !== source.identity.phaseId
+        || transition.targetPhaseIndex !== source.identity.phaseIndex
+        || transition.targetPhaseOccurrence !== source.identity.phaseOccurrence + 1) return false
+    } else if (transition.targetPhaseId !== source.identity.phaseId
+      || transition.targetPhaseIndex !== source.identity.phaseIndex
+      || transition.targetPhaseOccurrence !== source.identity.phaseOccurrence) return false
+
+    const target = segments[transition.targetSegmentOrdinal]
+    if (target) {
+      if (target.identity.phaseId !== transition.targetPhaseId
+        || target.identity.phaseIndex !== transition.targetPhaseIndex
+        || target.identity.phaseOccurrence !== transition.targetPhaseOccurrence) return false
+    } else if (transition.targetSegmentOrdinal !== segments.length
+      || recovery.state !== 'active' || recovery.currentSegmentId !== null
+      || recovery.phaseId !== transition.targetPhaseId
+      || recovery.phaseIndex !== transition.targetPhaseIndex
+      || recovery.phaseOccurrence !== transition.targetPhaseOccurrence
+      || recovery.nextSegmentOrdinal !== transition.targetSegmentOrdinal) return false
+  }
+
+  for (const segment of segments) {
+    if ((segment.lifecycle === 'closed') !== transitionsBySource.has(segment.identity.segmentId)) return false
+  }
+  if (recovery.state === 'active' && recovery.currentSegmentId === null && segments.length > 0) {
+    const finalSegment = segments.at(-1)
+    const finalTransition = finalSegment && transitionsBySource.get(finalSegment.identity.segmentId)
+    if (!finalTransition || finalTransition.transitionKind === 'terminal') return false
+  }
+  if (recovery.state === 'closed' && segments.length > 0) {
+    const finalSegment = segments.at(-1)
+    if (!finalSegment) return false
+    if (finalSegment.lifecycle === 'closed') {
+      if (recovery.terminalCloseResult !== null || recovery.terminalBoundaryClass !== null) return false
+    } else if (recovery.terminalCloseResult !== finalSegment.closeResult
+      || recovery.terminalBoundaryClass !== finalSegment.boundaryClass) return false
+  }
+  return true
+}
+function normalizeWorkSegmentInspection(value: unknown): WorkSegmentInspectionProjectionV1 | null {
+  if (!isUnknownRecord(value) || !inspectionExactKeys(value, ['recovery', 'segments', 'dispatches', 'transitions'])
+    || !isUnknownRecord(value.recovery) || !isIndexedArray(value.segments) || value.segments.length > MAX_INSPECTION_RECORDS
+    || !isIndexedArray(value.dispatches) || value.dispatches.length > MAX_INSPECTION_RECORDS
+    || !isIndexedArray(value.transitions) || value.transitions.length > MAX_INSPECTION_RECORDS) return null
+  const recovery = value.recovery
+  if (!inspectionExactKeys(recovery, ['state', 'phaseId', 'phaseIndex', 'phaseOccurrence', 'nextSegmentOrdinal', 'currentSegmentId', 'workspaceRevision', 'terminalCloseResult', 'terminalBoundaryClass', 'usage'])
+    || !isUnknownRecord(recovery.usage)
+    || !inspectionExactKeys(recovery.usage, ['providerDispatches', 'providerInputTokens', 'providerOutputTokens', 'providerTotalTokens', 'billedOutputTokens', 'toolCalls', 'workspaceOperations', 'unsignedBoundaries', 'receiveBytes', 'publishedOutputBytes', 'segments'])) return null
+  const recoveryUsage = normalizeWorkUsage(Object.fromEntries(Object.entries(recovery.usage).filter(([key]) => key !== 'segments')))
+  const recoveryPhaseId = nullableBoundedString(recovery.phaseId)
+  const recoveryPhaseIndex = nullableNonNegativeInteger(recovery.phaseIndex)
+  const recoveryPhaseOccurrence = nullableNonNegativeInteger(recovery.phaseOccurrence)
+  const currentSegmentId = nullableBoundedString(recovery.currentSegmentId)
+  const terminalBoundaryClass = workBoundary(recovery.terminalBoundaryClass)
+  const terminalCloseResult = workTerminalCloseResult(recovery.terminalCloseResult)
+  const nextSegmentOrdinal = nonNegativeInteger(recovery.nextSegmentOrdinal)
+  const workspaceRevision = nonNegativeInteger(recovery.workspaceRevision)
+  const recoverySegments = nonNegativeInteger(recovery.usage.segments)
+  if ((recovery.state !== 'active' && recovery.state !== 'closed') || recoveryPhaseId === undefined
+    || recoveryPhaseIndex === undefined || recoveryPhaseOccurrence === undefined || currentSegmentId === undefined || terminalBoundaryClass === undefined || !recoveryUsage
+    || nextSegmentOrdinal === null || workspaceRevision === null || recoverySegments === null
+    || terminalCloseResult === undefined) return null
+  const segments: WorkSegmentInspectionProjectionV1['segments'] = []
+  for (const item of value.segments) {
+    if (!isUnknownRecord(item) || !inspectionExactKeys(item, ['identity', 'lifecycle', 'workspaceRevision', 'boundaryClass', 'closeResult', 'closedWorkspaceRevision', 'usage'])) return null
+    const identity = normalizeWorkIdentity(item.identity)
+    const usage = normalizeWorkUsage(item.usage)
+    const boundaryClass = workBoundary(item.boundaryClass)
+    const segmentWorkspaceRevision = nonNegativeInteger(item.workspaceRevision)
+    const closedWorkspaceRevision = nullableNonNegativeInteger(item.closedWorkspaceRevision)
+    if (!identity || !usage || typeof item.lifecycle !== 'string' || !WORK_SEGMENT_LIFECYCLES.has(item.lifecycle)
+      || boundaryClass === undefined || segmentWorkspaceRevision === null || closedWorkspaceRevision === undefined
+      || !(item.closeResult === null || typeof item.closeResult === 'string' && WORK_SEGMENT_CLOSE_RESULTS.has(item.closeResult))) return null
+    segments.push({
+      identity,
+      lifecycle: item.lifecycle as WorkSegmentInspectionProjectionV1['segments'][number]['lifecycle'],
+      workspaceRevision: segmentWorkspaceRevision,
+      boundaryClass,
+      closeResult: item.closeResult as WorkSegmentInspectionProjectionV1['segments'][number]['closeResult'],
+      closedWorkspaceRevision,
+      usage,
+    })
+  }
+  const dispatches: WorkSegmentInspectionProjectionV1['dispatches'] = []
+  for (const item of value.dispatches) {
+    if (!isUnknownRecord(item) || !inspectionExactKeys(item, ['dispatchId', 'segmentId', 'dispatchOrdinal', 'lifecycle', 'toolMode', 'budgetClass', 'workspaceRevision', 'settledWorkspaceRevision', 'boundaryClass', 'usage'])) return null
+    const dispatchId = boundedString(item.dispatchId)
+    const segmentId = boundedString(item.segmentId)
+    const dispatchOrdinal = nonNegativeInteger(item.dispatchOrdinal)
+    const dispatchWorkspaceRevision = nonNegativeInteger(item.workspaceRevision)
+    const settledWorkspaceRevision = nullableNonNegativeInteger(item.settledWorkspaceRevision)
+    const boundaryClass = workBoundary(item.boundaryClass)
+    const usage = item.usage === null ? null : normalizeWorkUsage(item.usage)
+    if (!dispatchId || !segmentId || dispatchOrdinal === null || dispatchWorkspaceRevision === null || settledWorkspaceRevision === undefined
+      || boundaryClass === undefined || item.usage !== null && !usage
+      || typeof item.lifecycle !== 'string' || !WORK_DISPATCH_LIFECYCLES.has(item.lifecycle)
+      || item.toolMode !== 'ordinary' && item.toolMode !== 'required'
+      || item.budgetClass !== 'normal' && item.budgetClass !== 'recovery') return null
+    dispatches.push({
+      dispatchId,
+      segmentId,
+      dispatchOrdinal,
+      lifecycle: item.lifecycle as WorkSegmentInspectionProjectionV1['dispatches'][number]['lifecycle'],
+      toolMode: item.toolMode,
+      budgetClass: item.budgetClass,
+      workspaceRevision: dispatchWorkspaceRevision,
+      settledWorkspaceRevision,
+      boundaryClass,
+      usage,
+    })
+  }
+  const transitions: WorkSegmentInspectionProjectionV1['transitions'] = []
+  for (const item of value.transitions) {
+    if (!isUnknownRecord(item) || !inspectionExactKeys(item, ['transitionId', 'handoffId', 'transitionKind', 'sourceSegment', 'sourceWorkspaceRevision', 'targetPhaseId', 'targetPhaseIndex', 'targetPhaseOccurrence', 'targetSegmentOrdinal', 'cause'])) return null
+    const transitionId = boundedString(item.transitionId)
+    const handoffId = boundedString(item.handoffId)
+    const sourceSegment = normalizeWorkIdentity(item.sourceSegment)
+    const sourceWorkspaceRevision = nonNegativeInteger(item.sourceWorkspaceRevision)
+    const targetPhaseId = nullableBoundedString(item.targetPhaseId)
+    const targetPhaseIndex = nullableNonNegativeInteger(item.targetPhaseIndex)
+    const targetPhaseOccurrence = nullableNonNegativeInteger(item.targetPhaseOccurrence)
+    const targetSegmentOrdinal = nullableNonNegativeInteger(item.targetSegmentOrdinal)
+    const cause = workBoundary(item.cause)
+    if (!transitionId || !handoffId || !sourceSegment || sourceWorkspaceRevision === null || targetPhaseId === undefined
+      || targetPhaseIndex === undefined || targetPhaseOccurrence === undefined || targetSegmentOrdinal === undefined || cause === undefined
+      || typeof item.transitionKind !== 'string' || !WORK_TRANSITION_KINDS.has(item.transitionKind)) return null
+    transitions.push({
+      transitionId,
+      handoffId,
+      transitionKind: item.transitionKind as WorkSegmentInspectionProjectionV1['transitions'][number]['transitionKind'],
+      sourceSegment,
+      sourceWorkspaceRevision,
+      targetPhaseId,
+      targetPhaseIndex,
+      targetPhaseOccurrence,
+      targetSegmentOrdinal,
+      cause,
+    })
+  }
+  const projection: WorkSegmentInspectionProjectionV1 = {
+    recovery: {
+      state: recovery.state,
+      phaseId: recoveryPhaseId,
+      phaseIndex: recoveryPhaseIndex,
+      phaseOccurrence: recoveryPhaseOccurrence,
+      nextSegmentOrdinal,
+      currentSegmentId,
+      workspaceRevision,
+      terminalCloseResult,
+      terminalBoundaryClass,
+      usage: { ...recoveryUsage, segments: recoverySegments },
+    },
+    segments,
+    dispatches,
+    transitions,
+  }
+  return hasCoherentWorkSegmentInspection(projection) ? projection : null
+}
 export function normalizeAgentRunInspectionDetailV1(value: unknown, expectedAttemptId?: string, expectedChatId?: string): AgentRunInspectionDetailV1 | null {
   if (!isUnknownRecord(value)
+    || !Object.hasOwn(value, 'workSegments')
     || !isIndexedArray(value.transcript)
     || !isIndexedArray(value.turnSession)
     || !isIndexedArray(value.markers)
@@ -1753,6 +2093,7 @@ export function normalizeAgentRunInspectionDetailV1(value: unknown, expectedAtte
   const summary = normalizeInspectionSummary(value)
   const usage = normalizeInspectionUsageProjection(value.usage)
   const retry = normalizeInspectionRetry(value.retry)
+  const workSegments = value.workSegments === null ? null : normalizeWorkSegmentInspection(value.workSegments)
   const error = value.error === null ? null : normalizeInspectionErrorDetail(value.error)
   const transcript = normalizeStrictInspectionArray(value.transcript, normalizeInspectionTranscriptRecord)
   const turnSession = normalizeStrictInspectionArray(value.turnSession, normalizeTurnSessionEntry)
@@ -1769,8 +2110,9 @@ export function normalizeAgentRunInspectionDetailV1(value: unknown, expectedAtte
     || expectedAttemptId !== undefined && summary.attempt.attemptId !== expectedAttemptId
     || expectedChatId !== undefined && summary.attempt.target.chatId !== expectedChatId
     || value.error !== null && !error
-    || !transcript || !turnSession || !markers || !usageEvidence || !promptEvidence || !renderCrossings || !cortexReceipts || !councilReceipts || !workspaceAssociations
+    || !transcript || !turnSession || !markers || !usageEvidence || !promptEvidence || hasPromptOccurrenceCollision(promptEvidence) || !renderCrossings || !cortexReceipts || !councilReceipts || !workspaceAssociations
     || value.stop !== null && !stop
+    || value.workSegments !== null && !workSegments
     || usage.inspectionAttemptId !== summary.attempt.attemptId
     || retry.linkedAttemptId !== null && retry.linkedAttemptId !== summary.attempt.attemptId
     || error !== null && (error.inspectionAttemptId !== summary.attempt.attemptId || !sameWorkTarget(error.target, summary.attempt.target))
@@ -1817,6 +2159,7 @@ export function normalizeAgentRunInspectionDetailV1(value: unknown, expectedAtte
     workspaceAssociations,
     stop,
     retry,
+    workSegments,
     sectionAvailability,
   }
 }

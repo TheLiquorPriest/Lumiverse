@@ -68,9 +68,18 @@ import clsx from 'clsx'
 import ExpandedTextEditor, { ExpandableTextarea } from '@/components/shared/ExpandedTextEditor'
 import { ModalShell } from '@/components/shared/ModalShell'
 import { GuideViewer } from '@/components/shared/GuideViewer'
+import {
+  canMovePromptVariableBetweenOccurrences,
+  decodeLoomBlockOccurrence,
+  encodeLoomBlockOccurrence,
+  remapCategorySnapshotsForReorder,
+  getLoomBlockAtOccurrence,
+  useLoomBuilder,
+  type LoomBlockOccurrence,
+  type LoomBlockReorderEntry,
+} from '@/hooks/useLoomBuilder'
 import { RangeSlider } from '@/components/shared/RangeSlider'
 import { resolveMacros as resolveMacrosApi } from '@/api/macros'
-import { useLoomBuilder } from '@/hooks/useLoomBuilder'
 import { presetsApi, type StashedPromptBlock } from '@/api/presets'
 import { imagesApi } from '@/api/images'
 import { usePresetProfiles } from '@/hooks/usePresetProfiles'
@@ -166,8 +175,8 @@ function parseRootDropId(id: unknown) {
   return Number.isFinite(index) ? index : null
 }
 
-function rootDropId(index: number, appendCategoryId?: string) {
-  return `${ROOT_DROP_PREFIX}${index}${appendCategoryId ? `:category:${appendCategoryId}` : ''}`
+function rootDropId(index: number, appendCategoryOccurrenceId?: string) {
+  return `${ROOT_DROP_PREFIX}${index}${appendCategoryOccurrenceId ? `:category:${appendCategoryOccurrenceId}` : ''}`
 }
 
 function hasExplicitGroup(block: PromptBlock) {
@@ -217,25 +226,25 @@ function inferGroupAtIndex(blocks: PromptBlock[], index: number) {
   return null
 }
 
-function getCategoryEndIndex(blocks: PromptBlock[], categoryId: string) {
-  const categoryIndex = blocks.findIndex((block) => block.id === categoryId)
-  if (categoryIndex === -1) return -1
+function getCategoryEndIndex(blocks: PromptBlock[], target: LoomBlockOccurrence) {
+  const category = getLoomBlockAtOccurrence(blocks, target)
+  if (!category || category.marker !== 'category') return -1
 
-  let endIndex = categoryIndex + 1
+  let endIndex = target.promptOrder + 1
   while (endIndex < blocks.length) {
     const block = blocks[endIndex]
     if (block.marker === 'category') break
-    if (hasExplicitGroup(block) && blockGroup(block) !== categoryId) break
+    if (hasExplicitGroup(block) && blockGroup(block) !== category.id) break
     endIndex += 1
   }
   return endIndex
 }
 
-function parseRootDropCategoryId(id: unknown) {
+function parseRootDropCategoryId(id: unknown): LoomBlockOccurrence | null {
   if (typeof id !== 'string' || !id.startsWith(ROOT_DROP_PREFIX)) return null
   const marker = ':category:'
   const markerIndex = id.indexOf(marker)
-  return markerIndex === -1 ? null : id.slice(markerIndex + marker.length) || null
+  return markerIndex === -1 ? null : decodeLoomBlockOccurrence(id.slice(markerIndex + marker.length))
 }
 
 function RootDropSlot({ id, active, appendArmed }: { id: string; active: boolean; appendArmed?: boolean }) {
@@ -265,22 +274,23 @@ function RootDropSlot({ id, active, appendArmed }: { id: string; active: boolean
 
 interface SortableCategoryItemProps {
   block: PromptBlock
+  occurrence: LoomBlockOccurrence
   isCollapsed: boolean
   onToggleCollapse: () => void
-  onEdit: (block: PromptBlock) => void
-  onDelete: (id: string) => void
-  onToggle: (id: string) => void
+  onEdit: (target: LoomBlockOccurrence) => void
+  onDelete: (target: LoomBlockOccurrence) => void
+  onToggle: (target: LoomBlockOccurrence) => void
   /** Blanket enable/disable of the category and all of its children. */
-  onToggleChildren: (id: string) => void
+  onToggleChildren: (target: LoomBlockOccurrence) => void
   childCount: number
   dragDisabled?: boolean
 }
 
 function SortableCategoryItem({
-  block, isCollapsed, onToggleCollapse, onEdit, onDelete, onToggle, onToggleChildren, childCount, dragDisabled = false,
+  block, occurrence, isCollapsed, onToggleCollapse, onEdit, onDelete, onToggle, onToggleChildren, childCount, dragDisabled = false,
 }: SortableCategoryItemProps) {
   const { t } = useLb()
-  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: block.id, disabled: dragDisabled })
+  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: encodeLoomBlockOccurrence(occurrence), disabled: dragDisabled })
   const { setNodeRef, style } = useScaledSortableStyle({ setNodeRef: setSortableRef, transform, transition, isDragging })
   const isDisabled = !block.enabled
   const displayName = block.name.replace(/^\u2501\s*/, '')
@@ -315,16 +325,16 @@ function SortableCategoryItem({
           )}
         </span>
       </div>
-      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(block.id)} title={block.enabled ? t('category.disable') : t('category.enable')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(occurrence)} title={block.enabled ? t('category.disable') : t('category.enable')}>
         {block.enabled ? <Eye size={14} /> : <EyeOff size={14} />}
       </Button>
-      <Button size="icon-sm" variant="ghost" onClick={() => onToggleChildren(block.id)} title={block.enabled ? t('category.disableAll') : t('category.enableAll')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onToggleChildren(occurrence)} title={block.enabled ? t('category.disableAll') : t('category.enableAll')}>
         <Layers size={14} />
       </Button>
-      <Button size="icon-sm" variant="ghost" onClick={() => onEdit(block)} title={t('category.rename')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onEdit(occurrence)} title={t('category.rename')}>
         <Edit2 size={14} />
       </Button>
-      <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(block.id)} title={t('category.deleteCategory')}>
+      <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(occurrence)} title={t('category.deleteCategory')}>
         <Trash2 size={14} />
       </Button>
     </div>
@@ -337,19 +347,20 @@ function SortableCategoryItem({
 
 interface SortableBlockItemProps {
   block: PromptBlock
+  occurrence: LoomBlockOccurrence
   effectiveRole?: PromptBlock['role']
-  onEdit: (block: PromptBlock) => void
-  onDelete: (id: string) => void
-  onToggle: (id: string) => void
-  onStash?: (block: PromptBlock) => void
+  onEdit: (target: LoomBlockOccurrence) => void
+  onDelete: (target: LoomBlockOccurrence) => void
+  onToggle: (target: LoomBlockOccurrence) => void
+  onStash?: (target: LoomBlockOccurrence, block: PromptBlock) => void
   indented: boolean
   dragDisabled?: boolean
 }
 
-function SortableBlockItem({ block, effectiveRole, onEdit, onDelete, onToggle, onStash, indented, dragDisabled = false }: SortableBlockItemProps) {
+function SortableBlockItem({ block, occurrence, effectiveRole, onEdit, onDelete, onToggle, onStash, indented, dragDisabled = false }: SortableBlockItemProps) {
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
-  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: block.id, disabled: dragDisabled })
+  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: encodeLoomBlockOccurrence(occurrence), disabled: dragDisabled })
   const { setNodeRef, style } = useScaledSortableStyle({ setNodeRef: setSortableRef, transform, transition, isDragging })
   const isMarker = block.marker && block.marker !== 'category'
   const isDisabled = !block.enabled
@@ -398,19 +409,19 @@ function SortableBlockItem({ block, effectiveRole, onEdit, onDelete, onToggle, o
           </span>
         )}
       </span>
-      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(block.id)} title={block.enabled ? t('block.disable') : t('block.enable')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onToggle(occurrence)} title={block.enabled ? t('block.disable') : t('block.enable')}>
         {block.enabled ? <Eye size={14} /> : <EyeOff size={14} />}
       </Button>
       {!isMarker && !block.stashId && onStash && (
-        <Button size="icon-sm" variant="ghost" onClick={() => onStash(block)} title={t('actions.addToStash')}>
+        <Button size="icon-sm" variant="ghost" onClick={() => onStash(occurrence, block)} title={t('actions.addToStash')}>
           <Archive size={14} />
         </Button>
       )}
-      <Button size="icon-sm" variant="ghost" onClick={() => onEdit(block)} title={tc('actions.edit')}>
+      <Button size="icon-sm" variant="ghost" onClick={() => onEdit(occurrence)} title={tc('actions.edit')}>
         <Edit2 size={14} />
       </Button>
       {!block.isLocked && (
-        <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(block.id)} title={tc('actions.delete')}>
+        <Button size="icon-sm" variant="danger-ghost" onClick={() => onDelete(occurrence)} title={tc('actions.delete')}>
           <Trash2 size={14} />
         </Button>
       )}
@@ -568,6 +579,7 @@ function TrustedMacroPreviewControls({
 
 interface BlockEditorProps {
   block: PromptBlock
+  blockOccurrence: LoomBlockOccurrence
   blocks: PromptBlock[]
   promptVariables: PromptVariableValues
   onSave: (updates: Partial<PromptBlock>) => boolean | void
@@ -579,7 +591,7 @@ interface BlockEditorProps {
   trustedHostFeatures?: boolean
   /** Preset-level move: relocates a variable def (and its value bucket) to
    * another block. Returns false when the move was rejected. */
-  onMoveVariable?: (sourceBlockId: string, variable: PromptVariableDef, targetBlockId: string) => boolean
+  onMoveVariable?: (source: LoomBlockOccurrence, variable: PromptVariableDef, target: LoomBlockOccurrence) => boolean
 }
 
 function cleanPlacementBinding(
@@ -613,6 +625,7 @@ function cleanPlacementBinding(
 
 export function BlockEditor({
   block,
+  blockOccurrence,
   blocks,
   promptVariables,
   onSave,
@@ -988,18 +1001,26 @@ export function BlockEditor({
             fallbackPlacement={{ role, position, depth }}
             onPlacementBindingChange={setPlacementBinding}
             moveTargets={blocks
-              .filter((candidate) => candidate.id !== block.id)
-              .map((candidate) => {
+              .map((candidate, promptOrder) => ({
+                candidate,
+                occurrence: { blockId: candidate.id, promptOrder },
+              }))
+              .filter(({ occurrence }) => (
+                canMovePromptVariableBetweenOccurrences(blockOccurrence, occurrence)
+              ))
+              .map(({ candidate, occurrence }) => {
+                const group = computeGroups(blocks).find((entry) => (
+                  entry.categoryBlock === candidate || entry.children.includes(candidate)
+                ))
+                const category = group?.categoryBlock
                 const isCategory = candidate.marker === 'category'
-                const category = isCategory
-                  ? candidate
-                  : candidate.group
-                    ? blocks.find((entry) => entry.id === candidate.group && entry.marker === 'category')
-                    : undefined
                 return {
-                  id: candidate.id,
+                  id: encodeLoomBlockOccurrence(occurrence),
                   name: candidate.name || candidate.id,
-                  categoryId: category?.id ?? null,
+                  categoryId: category ? encodeLoomBlockOccurrence({
+                    blockId: category.id,
+                    promptOrder: blocks.indexOf(category),
+                  }) : null,
                   categoryName: category?.name || null,
                   isCategory,
                   variableNames: (candidate.variables ?? [])
@@ -1007,13 +1028,14 @@ export function BlockEditor({
                     .filter(Boolean),
                 }
               })}
-            onMoveToBlock={onMoveVariable ? (variableId, targetBlockId) => {
+            onMoveToBlock={onMoveVariable ? (variableId, encodedTarget) => {
               const moving = variables.find((variable) => variable.id === variableId)
-              if (!moving) return
+              const target = decodeLoomBlockOccurrence(encodedTarget)
+              if (!moving || !target) return
               // Move the in-editor version of the def (it may carry unsaved
               // edits) and drop it from the local list so a later Save of
               // this block doesn't resurrect it.
-              if (onMoveVariable(block.id, moving, targetBlockId)) {
+              if (onMoveVariable(blockOccurrence, moving, target)) {
                 setVariables((current) => current.filter((variable) => variable.id !== variableId))
               }
             } : undefined}
@@ -1064,34 +1086,34 @@ export function ControlledLoomBlockEditor({
 }: ControlledLoomBlockEditorProps) {
   const { t } = useLb()
   const { t: tc } = useTranslation('common')
-  const [editingBlockId, setEditingBlockId] = useState<string | null>(null)
+  const [editingBlockTarget, setEditingBlockTarget] = useState<LoomBlockOccurrence | null>(null)
   const [validationError, setValidationError] = useState<string | null>(null)
-  const editingBlock = editingBlockId
-    ? blocks.find((block) => block.id === editingBlockId) ?? null
+  const editingBlock = editingBlockTarget
+    ? getLoomBlockAtOccurrence(blocks, editingBlockTarget)
     : null
-  const effectiveRoles = useMemo(() => new Map(
-    resolvePromptBlockPlacements(blocks, promptVariables)
-      .map((block) => [block.id, block.role] as const),
-  ), [blocks, promptVariables])
+  const effectiveBlocks = useMemo(
+    () => resolvePromptBlockPlacements(blocks, promptVariables),
+    [blocks, promptVariables],
+  )
 
   useEffect(() => {
-    if (editingBlockId && !blocks.some((block) => block.id === editingBlockId)) {
-      setEditingBlockId(null)
+    if (editingBlockTarget && !getLoomBlockAtOccurrence(blocks, editingBlockTarget)) {
+      setEditingBlockTarget(null)
     }
-  }, [blocks, editingBlockId])
+  }, [blocks, editingBlockTarget])
 
-  if (editingBlock && !readOnly) {
+  if (editingBlock && editingBlockTarget && !readOnly) {
     return (
       <BlockEditor
-        key={JSON.stringify(editingBlock)}
+        key={`${encodeLoomBlockOccurrence(editingBlockTarget)}:${JSON.stringify(editingBlock)}`}
         block={editingBlock}
+        blockOccurrence={editingBlockTarget}
         blocks={blocks}
         promptVariables={promptVariables}
         validationError={validationError}
         onSave={(updates) => {
-          const nextBlocks = blocks.map((block) => (
-            block.id === editingBlock.id ? { ...block, ...updates } : block
-          ))
+          const nextBlocks = [...blocks]
+          nextBlocks[editingBlockTarget.promptOrder] = { ...editingBlock, ...updates }
           const callbackBlocks = structuredClone(nextBlocks)
           let callbackResult: unknown = undefined
           try {
@@ -1105,11 +1127,11 @@ export function ControlledLoomBlockEditor({
             return
           }
           setValidationError(null)
-          setEditingBlockId(null)
+          setEditingBlockTarget(null)
         }}
         onBack={() => {
           setValidationError(null)
-          setEditingBlockId(null)
+          setEditingBlockTarget(null)
         }}
         availableMacros={availableMacros}
         refreshMacros={refreshMacros}
@@ -1128,38 +1150,42 @@ export function ControlledLoomBlockEditor({
         <div className={s.blockList}>
           {blocks.length === 0 ? (
             <div className={s.empty}>{t('empty.noBlocksTitle')}</div>
-          ) : blocks.map((block) => (
-            <div key={block.id} className={clsx(s.item, !block.enabled && s.itemDisabled)}>
-              <div className={s.blockContent}>
-                <div className={s.blockNameRow}>
-                  <span className={s.blockName}>{block.name}</span>
+          ) : blocks.map((block, promptOrder) => {
+            const effectiveRole = effectiveBlocks[promptOrder]?.role ?? block.role
+            const occurrence = { blockId: block.id, promptOrder }
+            return (
+              <div key={encodeLoomBlockOccurrence(occurrence)} className={clsx(s.item, !block.enabled && s.itemDisabled)}>
+                <div className={s.blockContent}>
+                  <div className={s.blockNameRow}>
+                    <span className={s.blockName}>{block.name}</span>
+                  </div>
+                  {block.content && (
+                    <span className={s.blockPreview}>
+                      {block.content.slice(0, 100)}{block.content.length > 100 ? '…' : ''}
+                    </span>
+                  )}
                 </div>
-                {block.content && (
-                  <span className={s.blockPreview}>
-                    {block.content.slice(0, 100)}{block.content.length > 100 ? '…' : ''}
+                <span className={s.blockMetaRow}>
+                  <span className={clsx(s.badge, ROLE_BADGES[effectiveRole] || s.badgeSystem)}>
+                    {ROLE_DISPLAY_LABELS[effectiveRole] || effectiveRole}
                   </span>
+                </span>
+                {!readOnly && (
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setValidationError(null)
+                      setEditingBlockTarget(occurrence)
+                    }}
+                    title={tc('actions.edit')}
+                  >
+                    <Edit2 size={14} />
+                  </Button>
                 )}
               </div>
-              <span className={s.blockMetaRow}>
-                <span className={clsx(s.badge, ROLE_BADGES[effectiveRoles.get(block.id) ?? block.role] || s.badgeSystem)}>
-                  {ROLE_DISPLAY_LABELS[effectiveRoles.get(block.id) ?? block.role] || effectiveRoles.get(block.id) || block.role}
-                </span>
-              </span>
-              {!readOnly && (
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  onClick={() => {
-                    setValidationError(null)
-                    setEditingBlockId(block.id)
-                  }}
-                  title={tc('actions.edit')}
-                >
-                  <Edit2 size={14} />
-                </Button>
-              )}
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
     </div>
@@ -2413,11 +2439,11 @@ function LoomBuilderNative({
   const presetSelectionBlockerRef = useRef<ActiveLoomPresetSelectionBlockerRegistration | null>(null)
   const cleanPresetSelectionReleaseRef = useRef<string | null>(null)
   const loomBuilderMountedRef = useRef(true)
-  const [editingBlock, setEditingBlock] = useState<PromptBlock | null>(null)
+  const [editingBlockTarget, setEditingBlockTarget] = useState<LoomBlockOccurrence | null>(null)
   const [blockValidationError, setBlockValidationError] = useState<string | null>(null)
   const [promptMenuOpen, setPromptMenuOpen] = useState(false)
   const [markerMenuOpen, setMarkerMenuOpen] = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<LoomBlockOccurrence | null>(null)
   const [confirmDeletePresetId, setConfirmDeletePresetId] = useState<string | null>(null)
   const [showLegacyExportConfirm, setShowLegacyExportConfirm] = useState(false)
   const [showPromptVariablesModal, setShowPromptVariablesModal] = useState(false)
@@ -2428,6 +2454,17 @@ function LoomBuilderNative({
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const [hoveredAppendRootDropId, setHoveredAppendRootDropId] = useState<string | null>(null)
   const [armedAppendRootDropId, setArmedAppendRootDropId] = useState<string | null>(null)
+
+  const editingBlock = editingBlockTarget
+    ? getLoomBlockAtOccurrence(activePreset?.blocks ?? [], editingBlockTarget)
+    : null
+
+  useEffect(() => {
+    if (editingBlockTarget && !editingBlock) {
+      setEditingBlockTarget(null)
+      setView('list')
+    }
+  }, [editingBlock, editingBlockTarget])
 
   useEffect(() => {
     setShowPromptVariablesModal(false)
@@ -2551,7 +2588,7 @@ function LoomBuilderNative({
   const blockPresetChangeForDirtyAgenticRuntime = useCallback(() => {
     if (!agenticRuntimeDirty) return false
     setView('list')
-    setEditingBlock(null)
+    setEditingBlockTarget(null)
     setActivePresetEditorTab('agentic-runtime')
     addToast({
       type: 'warning',
@@ -2566,7 +2603,7 @@ function LoomBuilderNative({
     if (tabId === 'agentic-runtime' && !activePreset) return false
     if (tabId !== 'agentic-runtime' && blockPresetChangeForDirtyAgenticRuntime()) return false
     setView('list')
-    setEditingBlock(null)
+    setEditingBlockTarget(null)
     setActivePresetEditorTab(tabId)
     return true
   }, [
@@ -2712,17 +2749,20 @@ function LoomBuilderNative({
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
 
-  const groups = useMemo(() => computeGroups(activePreset?.blocks), [activePreset?.blocks])
-  const effectiveRoles = useMemo(() => new Map(
-    resolvePromptBlockPlacements(
-      activePreset?.blocks ?? [],
-      activePreset?.promptVariables ?? {},
-    ).map((block) => [block.id, block.role] as const),
+  const promptOrderBlocks = activePreset?.blocks ?? []
+  const groups = useMemo(() => computeGroups(promptOrderBlocks), [activePreset?.blocks])
+  const blockOccurrences = useMemo(() => new Map(
+    promptOrderBlocks.map((block, promptOrder) => [block, { blockId: block.id, promptOrder }] as const),
+  ), [activePreset?.blocks])
+  const effectiveBlocks = useMemo(() => resolvePromptBlockPlacements(
+    promptOrderBlocks,
+    activePreset?.promptVariables ?? {},
   ), [activePreset?.blocks, activePreset?.promptVariables])
   const categoryIds = useMemo(
-    () => (activePreset?.blocks ?? [])
-      .filter((block) => block.marker === 'category')
-      .map((block) => block.id),
+    () => promptOrderBlocks
+      .map((block, promptOrder) => ({ block, promptOrder }))
+      .filter(({ block }) => block.marker === 'category')
+      .map(({ block, promptOrder }) => encodeLoomBlockOccurrence({ blockId: block.id, promptOrder })),
     [activePreset?.blocks],
   )
   const allCategoriesCollapsed = categoryIds.length > 0
@@ -2733,12 +2773,13 @@ function LoomBuilderNative({
     [deferredTrimmedSearchQuery],
   )
 
-  const searchableBlockText = useMemo(() => {
-    const entries = (activePreset?.blocks ?? [])
-      .filter((block) => block.marker !== 'category')
-      .map((block) => [block.id, `${block.name}\n${block.content || ''}`.toLowerCase()] as const)
-    return new Map(entries)
-  }, [activePreset?.blocks])
+  const searchableBlockText = useMemo(() => new Map(promptOrderBlocks
+    .map((block, promptOrder) => ({ block, promptOrder }))
+    .filter(({ block }) => block.marker !== 'category')
+    .map(({ block, promptOrder }) => [
+      encodeLoomBlockOccurrence({ blockId: block.id, promptOrder }),
+      `${block.name}\n${block.content || ''}`.toLowerCase(),
+    ] as const)), [activePreset?.blocks])
 
   const isSearchActive = searchTokens.length > 0
 
@@ -2749,12 +2790,15 @@ function LoomBuilderNative({
       .map((group) => ({
         ...group,
         children: group.children.filter((block) => {
-          const searchableText = searchableBlockText.get(block.id) ?? ''
+          const target = blockOccurrences.get(block)
+          const searchableText = target
+            ? searchableBlockText.get(encodeLoomBlockOccurrence(target)) ?? ''
+            : ''
           return searchTokens.every((token) => searchableText.includes(token))
         }),
       }))
       .filter((group) => group.children.length > 0)
-  }, [groups, isSearchActive, searchableBlockText, searchTokens])
+  }, [blockOccurrences, groups, isSearchActive, searchableBlockText, searchTokens])
 
   const searchMatchCount = useMemo(
     () => displayedGroups.reduce((count, group) => count + group.children.length, 0),
@@ -2797,28 +2841,34 @@ function LoomBuilderNative({
 
   const visibleBlockIds = useMemo(() => {
     const ids: string[] = []
+    const appendOccurrence = (block: PromptBlock) => {
+      const target = blockOccurrences.get(block)
+      if (target) ids.push(encodeLoomBlockOccurrence(target))
+    }
     for (const group of displayedGroups) {
       if (group.categoryBlock) {
-        ids.push(group.categoryBlock.id)
-        if (isSearchActive || !collapsedCategories.has(group.categoryBlock.id)) {
-          for (const child of group.children) ids.push(child.id)
+        const categoryTarget = blockOccurrences.get(group.categoryBlock)
+        const categoryId = categoryTarget ? encodeLoomBlockOccurrence(categoryTarget) : null
+        appendOccurrence(group.categoryBlock)
+        if (isSearchActive || !categoryId || !collapsedCategories.has(categoryId)) {
+          for (const child of group.children) appendOccurrence(child)
         }
       } else {
-        for (const child of group.children) ids.push(child.id)
+        for (const child of group.children) appendOccurrence(child)
       }
     }
     return ids
-  }, [displayedGroups, collapsedCategories, isSearchActive])
+  }, [blockOccurrences, displayedGroups, collapsedCategories, isSearchActive])
 
   const activeDraggedBlock = useMemo(() => {
-    if (!activeDragId) return null
-    return activePreset?.blocks.find((block) => block.id === activeDragId) ?? null
+    const target = decodeLoomBlockOccurrence(activeDragId)
+    return target ? getLoomBlockAtOccurrence(promptOrderBlocks, target) : null
   }, [activeDragId, activePreset?.blocks])
 
   const rootDropIndexAfterGroup = useCallback((group: CategoryGroup) => {
     const blocks = activePreset?.blocks ?? []
     if (group.categoryBlock) {
-      const categoryIndex = blocks.findIndex((block) => block.id === group.categoryBlock!.id)
+      const categoryIndex = blocks.indexOf(group.categoryBlock)
       if (categoryIndex === -1) return blocks.length
       let endIndex = categoryIndex + 1
       while (endIndex < blocks.length) {
@@ -2831,7 +2881,7 @@ function LoomBuilderNative({
     }
 
     const childIndexes = group.children
-      .map((child) => blocks.findIndex((block) => block.id === child.id))
+      .map((child) => blocks.indexOf(child))
       .filter((index) => index >= 0)
     return childIndexes.length > 0 ? Math.max(...childIndexes) + 1 : blocks.length
   }, [activePreset?.blocks])
@@ -2886,71 +2936,97 @@ function LoomBuilderNative({
     if (!over || active.id === over.id || !activePreset) return
 
     const blocks = activePreset.blocks
-    const draggedBlock = blocks.find(b => b.id === active.id)
-    if (!draggedBlock) return
+    const draggedTarget = decodeLoomBlockOccurrence(active.id)
+    const draggedBlock = draggedTarget ? getLoomBlockAtOccurrence(blocks, draggedTarget) : null
+    if (!draggedTarget || !draggedBlock) return
+    const reorderedEntries: LoomBlockReorderEntry[] = blocks.map((block, promptOrder) => ({
+      block,
+      source: { blockId: block.id, promptOrder },
+    }))
+    const saveReorderedBlocks = (entries: LoomBlockReorderEntry[]) => {
+      saveBlocks(remapCategorySnapshotsForReorder(blocks, entries))
+    }
     const rootDropIndex = parseRootDropId(over.id)
-    const armedAppendCategoryId = armedAppendRootDropId === over.id ? parseRootDropCategoryId(over.id) : null
+    const armedAppendCategory = armedAppendRootDropId === over.id ? parseRootDropCategoryId(over.id) : null
 
     if (draggedBlock.marker === 'category') {
-      const catIdx = blocks.findIndex(b => b.id === active.id)
+      const catIdx = draggedTarget.promptOrder
       let endIdx = blocks.length
       for (let i = catIdx + 1; i < blocks.length; i++) {
         if (blocks[i].marker === 'category') { endIdx = i; break }
         if (hasExplicitGroup(blocks[i]) && blockGroup(blocks[i]) !== draggedBlock.id) { endIdx = i; break }
       }
-      const group = blocks.slice(catIdx, endIdx)
-      const remaining = [...blocks.slice(0, catIdx), ...blocks.slice(endIdx)]
+      const group = reorderedEntries.slice(catIdx, endIdx)
+      const remaining = [...reorderedEntries.slice(0, catIdx), ...reorderedEntries.slice(endIdx)]
+      const overTarget = decodeLoomBlockOccurrence(over.id)
+      const overBlock = overTarget ? getLoomBlockAtOccurrence(blocks, overTarget) : null
       const overIdx = rootDropIndex == null
-        ? remaining.findIndex(b => b.id === over.id)
+        ? overBlock && overTarget
+          ? remaining.findIndex((entry) => (
+              entry.source?.promptOrder === overTarget.promptOrder
+              && entry.source.blockId === overTarget.blockId
+            ))
+          : -1
         : Math.max(0, Math.min(remaining.length, rootDropIndex > catIdx ? rootDropIndex - group.length : rootDropIndex))
       if (overIdx === -1) return
       remaining.splice(overIdx, 0, ...group)
-      saveBlocks(remaining)
-    } else {
-      const oldIndex = blocks.findIndex(b => b.id === active.id)
-      if (oldIndex === -1) return
-
-      if (armedAppendCategoryId) {
-        const endIndex = getCategoryEndIndex(blocks, armedAppendCategoryId)
-        if (endIndex === -1) return
-        const nextBlocks = [...blocks]
-        const [moved] = nextBlocks.splice(oldIndex, 1)
-        const insertAt = Math.max(0, Math.min(nextBlocks.length, endIndex > oldIndex ? endIndex - 1 : endIndex))
-        nextBlocks.splice(insertAt, 0, { ...moved, group: armedAppendCategoryId })
-        saveBlocks(nextBlocks)
-        return
-      }
-
-      if (rootDropIndex != null) {
-        const nextBlocks = [...blocks]
-        const [moved] = nextBlocks.splice(oldIndex, 1)
-        const insertAt = Math.max(0, Math.min(nextBlocks.length, rootDropIndex > oldIndex ? rootDropIndex - 1 : rootDropIndex))
-        nextBlocks.splice(insertAt, 0, { ...moved, group: null })
-        saveBlocks(nextBlocks)
-        return
-      }
-
-      const newIndex = blocks.findIndex(b => b.id === over.id)
-      if (newIndex === -1) return
-      if (blocks[newIndex].marker === 'category') {
-        const nextBlocks = [...blocks]
-        const [moved] = nextBlocks.splice(oldIndex, 1)
-        const insertAt = newIndex > oldIndex ? newIndex : newIndex + 1
-        nextBlocks.splice(insertAt, 0, { ...moved, group: blocks[newIndex].id })
-        saveBlocks(nextBlocks)
-        return
-      }
-
-      const movedGroup = inferGroupAtIndex(blocks, newIndex)
-      const reordered = arrayMove(blocks, oldIndex, newIndex)
-      saveBlocks(reordered.map(block => block.id === draggedBlock.id ? { ...block, group: movedGroup } : block))
+      saveReorderedBlocks(remaining)
+      return
     }
+
+    const oldIndex = draggedTarget.promptOrder
+    if (armedAppendCategory) {
+      const category = getLoomBlockAtOccurrence(blocks, armedAppendCategory)
+      const endIndex = getCategoryEndIndex(blocks, armedAppendCategory)
+      if (!category || endIndex === -1) return
+      const nextBlocks = [...reorderedEntries]
+      const [moved] = nextBlocks.splice(oldIndex, 1)
+      if (!moved) return
+      const insertAt = Math.max(0, Math.min(nextBlocks.length, endIndex > oldIndex ? endIndex - 1 : endIndex))
+      nextBlocks.splice(insertAt, 0, { ...moved, block: { ...moved.block, group: category.id } })
+      saveReorderedBlocks(nextBlocks)
+      return
+    }
+
+    if (rootDropIndex != null) {
+      const nextBlocks = [...reorderedEntries]
+      const [moved] = nextBlocks.splice(oldIndex, 1)
+      if (!moved) return
+      const insertAt = Math.max(0, Math.min(nextBlocks.length, rootDropIndex > oldIndex ? rootDropIndex - 1 : rootDropIndex))
+      nextBlocks.splice(insertAt, 0, { ...moved, block: { ...moved.block, group: null } })
+      saveReorderedBlocks(nextBlocks)
+      return
+    }
+
+    const overTarget = decodeLoomBlockOccurrence(over.id)
+    const overBlock = overTarget ? getLoomBlockAtOccurrence(blocks, overTarget) : null
+    if (!overTarget || !overBlock) return
+    const newIndex = overTarget.promptOrder
+    if (overBlock.marker === 'category') {
+      const nextBlocks = [...reorderedEntries]
+      const [moved] = nextBlocks.splice(oldIndex, 1)
+      if (!moved) return
+      const insertAt = newIndex > oldIndex ? newIndex : newIndex + 1
+      nextBlocks.splice(insertAt, 0, { ...moved, block: { ...moved.block, group: overBlock.id } })
+      saveReorderedBlocks(nextBlocks)
+      return
+    }
+
+    const movedGroup = inferGroupAtIndex(blocks, newIndex)
+    const reordered = arrayMove(reorderedEntries, oldIndex, newIndex)
+    const moved = reordered[newIndex]
+    if (!moved) return
+    reordered[newIndex] = { ...moved, block: { ...moved.block, group: movedGroup } }
+    saveReorderedBlocks(reordered)
   }, [activePreset, armedAppendRootDropId, saveBlocks])
 
   const handleDragOver = useCallback((event: any) => {
-    const activeBlock = activePreset?.blocks.find((block) => block.id === event.active?.id)
-    const appendCategoryId = parseRootDropCategoryId(event.over?.id)
-    setHoveredAppendRootDropId(appendCategoryId && activeBlock?.marker !== 'category' ? event.over.id : null)
+    const activeTarget = decodeLoomBlockOccurrence(event.active?.id)
+    const activeBlock = activeTarget
+      ? getLoomBlockAtOccurrence(activePreset?.blocks ?? [], activeTarget)
+      : null
+    const appendCategory = parseRootDropCategoryId(event.over?.id)
+    setHoveredAppendRootDropId(appendCategory && activeBlock?.marker !== 'category' ? event.over.id : null)
   }, [activePreset?.blocks])
 
   const handleDragCancel = useCallback(() => {
@@ -2958,25 +3034,24 @@ function LoomBuilderNative({
     setHoveredAppendRootDropId(null)
     setArmedAppendRootDropId(null)
   }, [])
-
-  const handleEdit = useCallback((block: PromptBlock) => {
+  const handleEdit = useCallback((target: LoomBlockOccurrence) => {
     setBlockValidationError(null)
-    setEditingBlock(block)
+    setEditingBlockTarget(target)
     setView('edit')
   }, [])
 
   const handleEditSave = useCallback((updates: Partial<PromptBlock>): boolean => {
-    if (!editingBlock) return false
-    const accepted = updateBlock(editingBlock.id, updates)
+    if (!editingBlockTarget || !editingBlock) return false
+    const accepted = updateBlock(editingBlockTarget, updates)
     if (!accepted) {
       setBlockValidationError(lb('blockEditor.validationFailed'))
       return false
     }
     setBlockValidationError(null)
     setView('list')
-    setEditingBlock(null)
+    setEditingBlockTarget(null)
     return true
-  }, [editingBlock, lb, updateBlock])
+  }, [editingBlock, editingBlockTarget, lb, updateBlock])
 
   const handleAddTemplate = useCallback((template: { name: string; content: string; role: string }) => {
     addBlock(createBlock({ name: template.name, content: template.content, role: template.role as PromptBlock['role'] }))
@@ -2987,19 +3062,10 @@ function LoomBuilderNative({
     addBlock(createBlock({ ...entry.block, stashId: entry.id }))
   }, [addBlock])
 
-  const handleUnstash = useCallback((entry: StashedPromptBlock) => {
-    if (!activePreset) return
-    saveBlocks(activePreset.blocks.map((block) => {
-      if (block.stashId !== entry.id) return block
-      const { stashId: _stashId, ...unlinked } = block
-      return unlinked
-    }))
-  }, [activePreset, saveBlocks])
-
-  const handleAddToStash = useCallback(async (block: PromptBlock) => {
+  const handleAddToStash = useCallback(async (target: LoomBlockOccurrence, block: PromptBlock) => {
     try {
       const entry = await presetsApi.addToStash(block, activePreset?.id)
-      updateBlock(block.id, { stashId: entry.id })
+      updateBlock(target, { stashId: entry.id })
       addToast({ type: 'success', message: lb('actions.addedToStash') })
     } catch {
       addToast({ type: 'error', message: lb('actions.stashFailed') })
@@ -3015,13 +3081,13 @@ function LoomBuilderNative({
     setMarkerMenuOpen(false)
   }, [addBlock])
 
-  const handleDelete = useCallback((blockId: string) => {
-    setConfirmDelete(blockId)
+  const handleDelete = useCallback((target: LoomBlockOccurrence) => {
+    setConfirmDelete(target)
   }, [])
 
   const confirmDeleteBlock = useCallback(() => {
     if (confirmDelete) {
-      removeBlock(confirmDelete)
+      void removeBlock(confirmDelete)
       setConfirmDelete(null)
     }
   }, [confirmDelete, removeBlock])
@@ -3154,7 +3220,7 @@ function LoomBuilderNative({
   ) : null
 
   // Edit view
-  if (activePresetEditorTab === 'preset' && view === 'edit' && editingBlock) {
+  if (activePresetEditorTab === 'preset' && view === 'edit' && editingBlockTarget && editingBlock) {
     return (
       <>
         {presetEditorToolbar}
@@ -3163,6 +3229,7 @@ function LoomBuilderNative({
         <span data-spindle-mount="loom_builder_inspector" data-spindle-scope={`loom:${activePreset?.id ?? activePresetId ?? 'none'}:inspector`} style={{ display: 'contents' }} />
         <BlockEditor
           block={editingBlock}
+          blockOccurrence={editingBlockTarget}
           blocks={activePreset?.blocks ?? []}
           promptVariables={activePreset?.promptVariables ?? {}}
           validationError={blockValidationError}
@@ -3170,7 +3237,7 @@ function LoomBuilderNative({
           onBack={() => {
             setBlockValidationError(null)
             setView('list')
-            setEditingBlock(null)
+            setEditingBlockTarget(null)
           }}
           availableMacros={availableMacros}
           refreshMacros={refreshMacros}
@@ -3697,43 +3764,64 @@ function LoomBuilderNative({
             >
               <SortableContext items={visibleBlockIds} strategy={verticalListSortingStrategy}>
                 <RootDropSlot id={rootDropId(0)} active={!!activeDragId && !isSearchActive} />
-                {displayedGroups.map(group => (
-                  <Fragment key={group.categoryBlock?.id || group.children[0]?.id || 'ungrouped'}>
-                    {group.categoryBlock && (
-                      <SortableCategoryItem
-                        block={group.categoryBlock}
-                        isCollapsed={isSearchActive ? false : collapsedCategories.has(group.categoryBlock.id)}
-                        onToggleCollapse={isSearchActive ? () => {} : () => toggleCollapse(group.categoryBlock!.id)}
-                        onEdit={handleEdit}
-                        onDelete={handleDelete}
-                        onToggle={toggleBlock}
-                        onToggleChildren={toggleCategoryChildren}
-                        childCount={group.children.length}
-                        dragDisabled={isSearchActive}
-                      />
-                    )}
-                    {(!group.categoryBlock || isSearchActive || !collapsedCategories.has(group.categoryBlock.id)) &&
-                      group.children.map(block => (
-                        <SortableBlockItem
-                          key={block.id}
-                          block={block}
-                          effectiveRole={effectiveRoles.get(block.id)}
+                {displayedGroups.map((group) => {
+                  const categoryTarget = group.categoryBlock
+                    ? blockOccurrences.get(group.categoryBlock) ?? null
+                    : null
+                  const categoryOccurrenceId = categoryTarget
+                    ? encodeLoomBlockOccurrence(categoryTarget)
+                    : null
+                  const firstChildTarget = group.children[0]
+                    ? blockOccurrences.get(group.children[0]) ?? null
+                    : null
+                  const groupKey = categoryOccurrenceId
+                    ?? (firstChildTarget ? encodeLoomBlockOccurrence(firstChildTarget) : `ungrouped:${rootDropIndexAfterGroup(group)}`)
+                  const categoryCollapsed = !!categoryOccurrenceId && collapsedCategories.has(categoryOccurrenceId)
+                  const endDropId = rootDropId(rootDropIndexAfterGroup(group), categoryOccurrenceId ?? undefined)
+                  return (
+                    <Fragment key={groupKey}>
+                      {group.categoryBlock && categoryTarget && (
+                        <SortableCategoryItem
+                          block={group.categoryBlock}
+                          occurrence={categoryTarget}
+                          isCollapsed={isSearchActive ? false : categoryCollapsed}
+                          onToggleCollapse={isSearchActive ? () => {} : () => toggleCollapse(categoryOccurrenceId!)}
                           onEdit={handleEdit}
                           onDelete={handleDelete}
                           onToggle={toggleBlock}
-                          onStash={handleAddToStash}
-                          indented={!!group.categoryBlock}
+                          onToggleChildren={toggleCategoryChildren}
+                          childCount={group.children.length}
                           dragDisabled={isSearchActive}
                         />
-                      ))
-                    }
-                    <RootDropSlot
-                      id={rootDropId(rootDropIndexAfterGroup(group), group.categoryBlock?.id)}
-                      active={!!activeDragId && !isSearchActive}
-                      appendArmed={!!activeDraggedBlock && activeDraggedBlock.marker !== 'category' && armedAppendRootDropId === rootDropId(rootDropIndexAfterGroup(group), group.categoryBlock?.id)}
-                    />
-                  </Fragment>
-                ))}
+                      )}
+                      {(!group.categoryBlock || isSearchActive || !categoryCollapsed) &&
+                        group.children.map((block) => {
+                          const occurrence = blockOccurrences.get(block)
+                          if (!occurrence) return null
+                          return (
+                            <SortableBlockItem
+                              key={encodeLoomBlockOccurrence(occurrence)}
+                              block={block}
+                              occurrence={occurrence}
+                              effectiveRole={effectiveBlocks[occurrence.promptOrder]?.role}
+                              onEdit={handleEdit}
+                              onDelete={handleDelete}
+                              onToggle={toggleBlock}
+                              onStash={handleAddToStash}
+                              indented={!!group.categoryBlock}
+                              dragDisabled={isSearchActive}
+                            />
+                          )
+                        })
+                      }
+                      <RootDropSlot
+                        id={endDropId}
+                        active={!!activeDragId && !isSearchActive}
+                        appendArmed={!!activeDraggedBlock && activeDraggedBlock.marker !== 'category' && armedAppendRootDropId === endDropId}
+                      />
+                    </Fragment>
+                  )
+                })}
               </SortableContext>
             </DndContext>
           )}
@@ -3865,7 +3953,6 @@ function LoomBuilderNative({
           isOpen={showPromptStashModal}
           onClose={() => setShowPromptStashModal(false)}
           onSelect={handleInsertStashedBlock}
-          onUnstash={handleUnstash}
         />
       </div>
     </PanelFadeIn>

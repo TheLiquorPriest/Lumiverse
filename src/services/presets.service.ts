@@ -6,7 +6,7 @@ import type { Preset, CreatePresetInput, UpdatePresetInput, PromptBlock, PromptB
 import { PresetRevisionConflictError } from "../types/preset";
 import type { AgentConfigV2 } from "../types/agents";
 import { parseAgentConfigV2 } from "../types/agents";
-import { getPresetAgentConfig, importPortablePresetRegexScriptsWithDb, preparePresetAgentConfigForWrite, quarantineAgentConfigForPromptEditWithDb, scrubPresetMetadata, writePresetAgentConfigWithDb } from "./agent-config-portability.service";
+import { AgentConfigRevisionConflictError, getPresetAgentConfig, importPortablePresetRegexScriptsWithDb, portablePresetRegexScriptsMatchStored, preparePresetAgentConfigForWrite, quarantineAgentConfigForPresetRevisionWithDb, scrubPresetMetadata, writePresetAgentConfigWithDb } from "./agent-config-portability.service";
 import { assertAgentConfigWithinHostLimits } from "./agent-runtime-limits";
 import { toPublicConnection } from "./connections.service";
 import type { ConnectionProfile } from "../types/connection-profile";
@@ -20,6 +20,7 @@ import {
   syncStashedBlocksAcrossPresets,
 } from "./prompt-stash.service";
 import { withUserDataMutationSync } from "./user-data/snapshot";
+import { sameJsonValue } from "../utils/json-value";
 
 /**
  * Drop entries in metadata.promptVariables that no longer correspond to a
@@ -36,14 +37,19 @@ function prunePromptVariableOrphans(
   if (!raw || typeof raw !== "object") return metadata;
 
   const blocks = Array.isArray(promptOrder) ? (promptOrder as PromptBlock[]) : [];
-  const blockById = new Map<string, PromptBlock>();
-  for (const b of blocks) if (b && typeof b === "object" && b.id) blockById.set(b.id, b);
+  const schemasByPromptOrder = blocks.map((block) => ({
+    blockId: block && typeof block === "object" && typeof block.id === "string" ? block.id : null,
+    validNames: Array.isArray(block?.variables) ? block.variables.map((variable) => variable.name) : [],
+  }));
 
   const cleaned: Record<string, Record<string, PromptVariableValue>> = {};
   for (const [blockId, bucket] of Object.entries(raw as Record<string, Record<string, PromptVariableValue>>)) {
-    const block = blockById.get(blockId);
-    if (!block || !block.variables?.length) continue;
-    const validNames = new Set(block.variables.map((v) => v.name));
+    const validNames = new Set<string>();
+    for (const schema of schemasByPromptOrder) {
+      if (schema.blockId !== blockId) continue;
+      for (const name of schema.validNames) validNames.add(name);
+    }
+    if (validNames.size === 0) continue;
     const kept: Record<string, PromptVariableValue> = {};
     for (const [name, value] of Object.entries(bucket || {})) {
       if (validNames.has(name)) kept[name] = value;
@@ -53,6 +59,7 @@ function prunePromptVariableOrphans(
 
   return { ...(metadata as Record<string, unknown>), promptVariables: cleaned };
 }
+
 export interface PresetRegistryRow {
   id: string;
   name: string;
@@ -71,7 +78,21 @@ export interface CreatePromptBlockInput extends Partial<PromptBlock> {
   name?: string;
 }
 
+export interface CreatePromptBlockOptions {
+  readonly expectedCacheRevision: number;
+  readonly index?: number;
+}
+
 export type UpdatePromptBlockInput = Partial<Omit<PromptBlock, "id">>;
+
+export interface PromptBlockOccurrence {
+  readonly blockId: string;
+  readonly promptOrder: number;
+}
+
+export interface PromptBlockMutationTarget extends PromptBlockOccurrence {
+  readonly expectedCacheRevision: number;
+}
 
 function rowToPreset(row: any): Preset {
   const projection = getPresetAgentConfig(String(row.user_id), String(row.id));
@@ -331,6 +352,22 @@ export function getPresetCacheRevision(userId: string, id: string): number | nul
 }
 
 
+/** Fetch every monotonic revision embedded by the full preset representation. */
+export function getPresetRepresentationRevision(
+  userId: string,
+  id: string,
+): { readonly cacheRevision: number; readonly agentConfigRevision: number } | null {
+  const row = getDb().query(
+    `SELECT p.cache_revision, COALESCE(c.config_revision, 0) AS agent_config_revision
+       FROM presets p
+       LEFT JOIN preset_agent_configs c ON c.user_id = p.user_id AND c.preset_id = p.id
+       WHERE p.id = ? AND p.user_id = ?`,
+  ).get(id, userId) as { cache_revision: number; agent_config_revision: number } | null;
+  return row
+    ? { cacheRevision: row.cache_revision, agentConfigRevision: row.agent_config_revision }
+    : null;
+}
+
 /**
  * Validate that a usable preset exists for generation. Throws a config error
  * (mapped to HTTP 400 by the route) when the user has no presets at all or
@@ -377,11 +414,18 @@ function hasNormalizedAgentConfigTable(): boolean {
   ).get());
 }
 
+function withCommittedPresetEvents<T>(callback: () => T): T {
+  const buffered = eventBus.withBufferedEvents(callback);
+  for (const event of buffered.events) {
+    eventBus.emit(event.event, event.payload, event.userId, event.options);
+  }
+  return buffered.value;
+}
 
 export function createPreset(userId: string, input: CreatePresetInput): Preset {
   const db = getDb();
   const id = crypto.randomUUID();
-  return withUserDataMutationSync(userId, () => db.transaction(() => {
+  return withUserDataMutationSync(userId, () => withCommittedPresetEvents(() => db.transaction(() => {
     const now = Math.floor(Date.now() / 1000);
     const submittedConfig = Object.hasOwn(input as object, "agent_config")
       ? (input as CreatePresetInput & { agent_config?: unknown }).agent_config
@@ -409,17 +453,17 @@ export function createPreset(userId: string, input: CreatePresetInput): Preset {
     const created = getPreset(userId, id);
     if (!created) throw new Error("Preset creation failed");
     return created;
-  })());
+  })()));
 }
 
 export function updatePreset(userId: string, id: string, input: UpdatePresetInput): Preset | null {
   const db = getDb();
-  return withUserDataMutationSync(userId, () => db.transaction(() => {
+  const outcome = withUserDataMutationSync(userId, () => withCommittedPresetEvents(() => db.transaction(() => {
   const submittedConfig = Object.hasOwn(input as object, "agent_config")
     ? (input as UpdatePresetInput & { agent_config?: unknown }).agent_config
     : undefined;
   const existing = getPreset(userId, id);
-  if (!existing) return null;
+  if (!existing) return { preset: null, changed: false };
   // Avoid mutating shared stash state for a request we already know is stale.
   // The conditional UPDATE below remains the authoritative race-safe check.
   if (input.expected_cache_revision !== undefined && input.expected_cache_revision !== (existing.cache_revision ?? 0)) {
@@ -432,6 +476,22 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
     throw new Error("AGENT_CONFIG_REVISION_REQUIRED");
   }
   const preparedConfig = submittedConfig === undefined ? undefined : preparePresetAgentConfigForWrite(submittedConfig);
+  const configWriteRequired = preparedConfig !== undefined && (
+    existing.agent_config === undefined
+    || !sameJsonValue(preparedConfig.config, existing.agent_config)
+    || existing.agent_config_review?.state !== "ready"
+  );
+  if (
+    preparedConfig !== undefined
+    && !configWriteRequired
+    && input.expected_config_revision !== existing.agent_config_revision
+  ) {
+    throw new AgentConfigRevisionConflictError(
+      id,
+      input.expected_config_revision as number,
+      existing.agent_config_revision ?? 0,
+    );
+  }
 
   // A stashed block has global content/configuration but local visibility and
   // list placement. Reconcile before validating prompt variables so the
@@ -451,8 +511,7 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
     changedStashIds = reconciliation.changedStashIds;
     commitStashReconciliation = reconciliation.commit;
   }
-  const promptOrderChanged = reconciledPromptOrder !== undefined
-    && JSON.stringify(reconciledPromptOrder) !== JSON.stringify(existing.prompt_order ?? []);
+
 
   const fields: string[] = [];
   const values: any[] = [];
@@ -468,54 +527,60 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
     writeMetadata = (prunePromptVariableOrphans(resolvedOrder, localMetadata) as Record<string, any>) ?? localMetadata;
   } else if (reconciledPromptOrder !== undefined) {
     const cleaned = prunePromptVariableOrphans(reconciledPromptOrder, existing.metadata as Record<string, unknown>);
-    if (cleaned && JSON.stringify(cleaned) !== JSON.stringify(existing.metadata)) {
+    if (cleaned && !sameJsonValue(cleaned, existing.metadata)) {
       writeMetadata = cleaned as Record<string, any>;
     }
   }
 
-  if (input.name !== undefined) { fields.push("name = ?"); values.push(input.name); }
-  if (input.provider !== undefined) { fields.push("provider = ?"); values.push(input.provider); }
-  if (input.engine !== undefined) { fields.push("engine = ?"); values.push(input.engine); }
-  if (input.parameters !== undefined) { fields.push("parameters = ?"); values.push(JSON.stringify(input.parameters)); }
-  if (reconciledPromptOrder !== undefined) { fields.push("prompt_order = ?"); values.push(JSON.stringify(reconciledPromptOrder)); }
-  if (input.prompts !== undefined) { fields.push("prompts = ?"); values.push(JSON.stringify(input.prompts)); }
-  if (writeMetadata !== undefined) { fields.push("metadata = ?"); values.push(JSON.stringify(writeMetadata)); }
+  if (input.name !== undefined && input.name !== existing.name) { fields.push("name = ?"); values.push(input.name); }
+  if (input.provider !== undefined && input.provider !== existing.provider) { fields.push("provider = ?"); values.push(input.provider); }
+  if (input.engine !== undefined && input.engine !== existing.engine) { fields.push("engine = ?"); values.push(input.engine); }
+  if (input.parameters !== undefined && !sameJsonValue(input.parameters, existing.parameters)) { fields.push("parameters = ?"); values.push(JSON.stringify(input.parameters)); }
+  if (reconciledPromptOrder !== undefined && !sameJsonValue(reconciledPromptOrder, existing.prompt_order ?? [])) { fields.push("prompt_order = ?"); values.push(JSON.stringify(reconciledPromptOrder)); }
+  if (input.prompts !== undefined && !sameJsonValue(input.prompts, existing.prompts)) { fields.push("prompts = ?"); values.push(JSON.stringify(input.prompts)); }
+  if (writeMetadata !== undefined && !sameJsonValue(writeMetadata, existing.metadata)) { fields.push("metadata = ?"); values.push(JSON.stringify(writeMetadata)); }
+  const regexScriptsSubmitted = Object.hasOwn(input as object, "regex_scripts");
+  const regexScriptsChanged = regexScriptsSubmitted
+    && !portablePresetRegexScriptsMatchStored(userId, id, input.regex_scripts ?? []);
+  const presetRevisionChanged = fields.length > 0 || regexScriptsChanged;
 
   const expectedCacheRevision = input.expected_cache_revision;
-  if (fields.length === 0 && submittedConfig === undefined) {
+  if (!presetRevisionChanged && !configWriteRequired) {
     if (expectedCacheRevision !== undefined && expectedCacheRevision !== (existing.cache_revision ?? 0)) {
       throw new PresetRevisionConflictError(id, expectedCacheRevision, existing.cache_revision ?? 0);
     }
-    return getPreset(userId, id)!;
+    return { preset: existing, changed: false };
   }
 
-  fields.push("updated_at = ?", "cache_revision = cache_revision + 1");
-  values.push(Math.floor(Date.now() / 1000));
+  if (presetRevisionChanged) {
+    fields.push("updated_at = ?", "cache_revision = cache_revision + 1");
+    values.push(Math.floor(Date.now() / 1000));
 
-  const where = ["id = ?", "user_id = ?"];
-  values.push(id, userId);
-  if (expectedCacheRevision !== undefined) {
-    where.push("cache_revision = ?");
-    values.push(expectedCacheRevision);
-  }
-
-  const changes = getDb()
-    .query(`UPDATE presets SET ${fields.join(", ")} WHERE ${where.join(" AND ")}`)
-    .run(...values)
-    .changes;
-  if (changes === 0) {
-    // A conditional miss is either a deleted row (the normal not-found result)
-    // or a stale writer. Read the current revision only after the atomic update
-    // has failed so the distinction cannot race the mutation itself.
-    const current = getPreset(userId, id);
-    if (!current) return null;
+    const where = ["id = ?", "user_id = ?"];
+    values.push(id, userId);
     if (expectedCacheRevision !== undefined) {
-      throw new PresetRevisionConflictError(id, expectedCacheRevision, current.cache_revision ?? 0);
+      where.push("cache_revision = ?");
+      values.push(expectedCacheRevision);
     }
-    return null;
+
+    const changes = db
+      .query("UPDATE presets SET " + fields.join(", ") + " WHERE " + where.join(" AND "))
+      .run(...values)
+      .changes;
+    if (changes === 0) {
+      // A conditional miss is either a deleted row (the normal not-found result)
+      // or a stale writer. Read the current revision only after the atomic update
+      // has failed so the distinction cannot race the mutation itself.
+      const current = getPreset(userId, id);
+      if (!current) return { preset: null, changed: false };
+      if (expectedCacheRevision !== undefined) {
+        throw new PresetRevisionConflictError(id, expectedCacheRevision, current.cache_revision ?? 0);
+      }
+      return { preset: null, changed: false };
+    }
   }
 
-  if (preparedConfig !== undefined && hasNormalizedAgentConfigTable()) {
+  if (configWriteRequired && preparedConfig !== undefined && hasNormalizedAgentConfigTable()) {
     writePresetAgentConfigWithDb(
       db,
       userId,
@@ -527,16 +592,16 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
       preparedConfig,
     );
   }
-  if (promptOrderChanged && reconciledPromptOrder !== undefined && hasNormalizedAgentConfigTable()) {
-    quarantineAgentConfigForPromptEditWithDb(
+  if (presetRevisionChanged && hasNormalizedAgentConfigTable()) {
+    quarantineAgentConfigForPresetRevisionWithDb(
       db,
       userId,
       id,
       (existing.cache_revision ?? 0) + 1,
-      reconciledPromptOrder,
+      (reconciledPromptOrder ?? existing.prompt_order ?? []) as readonly unknown[],
     );
   }
-  if (Object.hasOwn(input as object, "regex_scripts")) {
+  if (regexScriptsSubmitted && regexScriptsChanged) {
     deleteRegexScriptsByPresetId(userId, id);
     const nextName = input.name ?? existing.name;
     importPortablePresetRegexScriptsWithDb(db, userId, id, nextName, {
@@ -546,12 +611,15 @@ export function updatePreset(userId: string, id: string, input: UpdatePresetInpu
     });
   }
   const updated = getPreset(userId, id);
-  if (!updated) return null;
+  if (!updated) return { preset: null, changed: false };
   commitStashReconciliation?.();
   syncStashedBlocksAcrossPresets(userId, id, changedStashIds);
-  eventBus.emit(EventType.PRESET_CHANGED, { id, preset: updated }, userId);
-  return updated;
-  })());
+  return { preset: updated, changed: true };
+  })()));
+  if (outcome.changed && outcome.preset) {
+    eventBus.emit(EventType.PRESET_CHANGED, { id, preset: outcome.preset }, userId);
+  }
+  return outcome.preset;
 }
 
 export function deletePreset(userId: string, id: string): boolean {
@@ -677,7 +745,7 @@ function normalizePromptBlockPlacementBinding(
   return { variableId: raw.variableId.trim(), options };
 }
 
-export function normalizePromptBlocks(blocks: PromptBlock[]): PromptBlock[] {
+export function normalizePromptBlocks(blocks: readonly CreatePromptBlockInput[]): PromptBlock[] {
   return blocks.map((block) => normalizePromptBlock(block));
 }
 
@@ -687,62 +755,111 @@ export function listPromptBlocks(userId: string, presetId: string): PromptBlock[
   return normalizePromptBlocks((preset.prompt_order || []) as PromptBlock[]);
 }
 
-export function getPromptBlock(userId: string, presetId: string, blockId: string): PromptBlock | null {
+function requirePresetCacheRevision(preset: Preset): number {
+  const cacheRevision = preset.cache_revision;
+  if (typeof cacheRevision !== "number"
+    || !Number.isSafeInteger(cacheRevision)
+    || cacheRevision < 0) {
+    throw new Error("preset cache_revision must be a non-negative safe integer");
+  }
+  return cacheRevision;
+}
+
+function assertPromptBlockExpectedCacheRevision(
+  presetId: string,
+  actualCacheRevision: number,
+  authority: { readonly expectedCacheRevision: number } | null | undefined,
+): void {
+  const expectedCacheRevision = authority?.expectedCacheRevision;
+  if (typeof expectedCacheRevision !== "number"
+    || !Number.isSafeInteger(expectedCacheRevision)
+    || expectedCacheRevision < 0) {
+    throw new Error("expectedCacheRevision is required and must be a non-negative safe integer");
+  }
+  if (expectedCacheRevision !== actualCacheRevision) {
+    throw new PresetRevisionConflictError(presetId, expectedCacheRevision, actualCacheRevision);
+  }
+}
+function promptBlockAtOccurrence(blocks: readonly PromptBlock[], occurrence: PromptBlockOccurrence): PromptBlock | null {
+  if (typeof occurrence !== "object" || occurrence === null
+    || typeof occurrence.blockId !== "string" || occurrence.blockId.length === 0
+    || !Number.isSafeInteger(occurrence.promptOrder) || occurrence.promptOrder < 0) return null;
+  const block = blocks[occurrence.promptOrder];
+  return block?.id === occurrence.blockId ? block : null;
+}
+
+export function getPromptBlock(userId: string, presetId: string, occurrence: PromptBlockOccurrence): PromptBlock | null {
   const blocks = listPromptBlocks(userId, presetId);
   if (!blocks) return null;
-  return blocks.find((block) => block.id === blockId) || null;
+  return promptBlockAtOccurrence(blocks, occurrence);
 }
 
 export function createPromptBlock(
   userId: string,
   presetId: string,
   input: CreatePromptBlockInput,
-  index?: number
+  options: CreatePromptBlockOptions,
 ): PromptBlock | null {
   const preset = getPreset(userId, presetId);
   if (!preset) return null;
-
   const blocks = normalizePromptBlocks((preset.prompt_order || []) as PromptBlock[]);
+  const requestedIndex = options?.index;
+  if (requestedIndex !== undefined && (
+    !Number.isSafeInteger(requestedIndex)
+    || requestedIndex < 0
+    || requestedIndex > blocks.length
+  )) {
+    throw new Error("index must be a non-negative safe integer within the prompt block bounds");
+  }
+  const insertAt = requestedIndex ?? blocks.length;
+  assertPromptBlockExpectedCacheRevision(presetId, requirePresetCacheRevision(preset), options);
   const block = normalizePromptBlock(input || {});
-  const insertAt = typeof index === "number" && Number.isFinite(index)
-    ? Math.max(0, Math.min(blocks.length, Math.floor(index)))
-    : blocks.length;
   blocks.splice(insertAt, 0, block);
 
-  updatePreset(userId, presetId, { prompt_order: blocks, expected_cache_revision: preset.cache_revision });
-  return block;
+  const committed = updatePreset(userId, presetId, {
+    prompt_order: blocks,
+    expected_cache_revision: options.expectedCacheRevision,
+  });
+  return committed ? block : null;
 }
 
 export function updatePromptBlock(
   userId: string,
   presetId: string,
-  blockId: string,
-  input: UpdatePromptBlockInput
+  target: PromptBlockMutationTarget,
+  input: UpdatePromptBlockInput,
 ): PromptBlock | null {
   const preset = getPreset(userId, presetId);
   if (!preset) return null;
+  assertPromptBlockExpectedCacheRevision(presetId, requirePresetCacheRevision(preset), target);
 
   const blocks = normalizePromptBlocks((preset.prompt_order || []) as PromptBlock[]);
-  const index = blocks.findIndex((block) => block.id === blockId);
-  if (index === -1) return null;
+  const current = promptBlockAtOccurrence(blocks, target);
+  if (!current) return null;
 
-  const updated = normalizePromptBlock({ ...blocks[index], ...(input || {}), id: blockId });
-  blocks[index] = updated;
-  updatePreset(userId, presetId, { prompt_order: blocks, expected_cache_revision: preset.cache_revision });
-  return updated;
+  const updated = normalizePromptBlock({ ...current, ...(input || {}), id: target.blockId });
+  blocks[target.promptOrder] = updated;
+  const committed = updatePreset(userId, presetId, {
+    prompt_order: blocks,
+    expected_cache_revision: target.expectedCacheRevision,
+  });
+  return committed ? updated : null;
 }
 
-export function deletePromptBlock(userId: string, presetId: string, blockId: string): boolean {
+export function deletePromptBlock(userId: string, presetId: string, target: PromptBlockMutationTarget): boolean {
   const preset = getPreset(userId, presetId);
   if (!preset) return false;
+  assertPromptBlockExpectedCacheRevision(presetId, requirePresetCacheRevision(preset), target);
 
   const blocks = normalizePromptBlocks((preset.prompt_order || []) as PromptBlock[]);
-  const index = blocks.findIndex((block) => block.id === blockId);
-  if (index === -1) return false;
+  if (!promptBlockAtOccurrence(blocks, target)) return false;
 
-  blocks.splice(index, 1);
-  updatePreset(userId, presetId, { prompt_order: blocks, expected_cache_revision: preset.cache_revision });
-  return true;
+  blocks.splice(target.promptOrder, 1);
+  const committed = updatePreset(userId, presetId, {
+    prompt_order: blocks,
+    expected_cache_revision: target.expectedCacheRevision,
+  });
+  return committed !== null;
 }
 
 export function listPromptBlockCategories(userId: string, presetId: string): PromptBlockCategoryGroup[] | null {

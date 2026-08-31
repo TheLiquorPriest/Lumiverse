@@ -72,6 +72,24 @@ export interface AgentRuntimeHostLimits {
   readonly logicalProviderRequests: number;
   readonly physicalDispatchAttempts: number;
   readonly childOutputTokens: number;
+  /** Independent total WORK-attempt provider-output ceiling. */
+  readonly workAttemptOutputTokens: number;
+  readonly workAttemptProviderDispatches: number;
+  readonly workAttemptUnsignedBoundaries: number;
+  readonly workAttemptToolCalls: number;
+  readonly workAttemptWorkspaceOperations: number;
+  /** Independent one-segment ceilings; none are derived from dispatch or attempt limits. */
+  readonly workSegmentOutputTokens: number;
+  readonly workSegmentProviderDispatches: number;
+  readonly workSegmentUnsignedBoundaries: number;
+  readonly workSegmentToolCalls: number;
+  readonly workSegmentWorkspaceOperations: number;
+  /** Independent hard ceiling for one provider dispatch. */
+  readonly workDispatchOutputTokens: number;
+  /** Independent reserve available only to recovery dispatches. */
+  readonly workRecoveryReserveOutputTokens: number;
+  /** Independent reserve protected for later authored phases. */
+  readonly workFuturePhaseReserveOutputTokens: number;
   readonly rootWallClockMs: number;
   readonly activityEvents: number;
   readonly activityBytes: number;
@@ -474,7 +492,7 @@ export interface AgentTurnLedger {
 
 export type AgentLoopFrameKind = "root" | "child";
 
-export type AgentToolMode = "ordinary" | "finalization";
+export type AgentToolMode = "ordinary" | "required" | "finalization";
 
 export interface AgentAdapterCapabilities {
   readonly toolCalling: boolean;

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { getDb } from "../db/connection";
 import { compareUtf8 } from "../utils/utf8-order";
+import { encodeCanonicalPlainData } from "../utils/canonical-plain-data";
 import {
   PERSISTENT_WORKSPACE_RECORD_KINDS,
   PERSISTENT_WORKSPACE_TERMINAL_OUTCOMES,
@@ -73,6 +74,7 @@ import {
   type CognitionTaskTransition,
   type TaskTemplateV1,
 } from "../types/agent-cognition";
+import type { AgenticWorkWorkspaceMutationReservationV1 } from "../types/agent-work-segment";
 import type {
   CognitionWorkspaceActivationFactoryV1,
   CognitionWorkspaceActivationUpdateV1,
@@ -865,10 +867,11 @@ function findWorkspace(workspaceId: string, userId: string, chatId: string, turn
     invalidateFrameCapabilitiesForTurn({ userId, chatId, turnId });
     return null;
   }
-  const now = Math.floor(Date.now() / 1000);
+  const nowMilliseconds = Date.now();
+  const nowSeconds = Math.floor(nowMilliseconds / 1000);
   const expiresAt = rowNumber(raw, ["expires_at"]);
   const persistedState = rowString(raw, ["state"], "active") as WorkspaceStateV1;
-  const state = persistedState === "active" && expiresAt > 0 && expiresAt <= now ? "expired" : persistedState;
+  const state = persistedState === "active" && expiresAt > 0 && expiresAt <= nowSeconds ? "expired" : persistedState;
   if (state !== "active" && state !== "frozen" && state !== "expired") fail("invalid_state", "workspace state is invalid");
   if (state !== "active") invalidateFrameCapabilitiesForTurn({ userId, chatId, turnId });
   const executionId = rowString(raw, ["execution_id"], turnId);
@@ -886,7 +889,7 @@ function findWorkspace(workspaceId: string, userId: string, chatId: string, turn
     turnActive = !!execution
       && !TERMINAL_TURN_STATES.has(executionState)
       && (execution.cancel_requested_at === null || execution.cancel_requested_at === undefined)
-      && (deadlineAt <= 0 || deadlineAt > now);
+      && (deadlineAt <= 0 || deadlineAt > nowMilliseconds);
     if (!turnActive) invalidateFrameCapabilitiesForTurn({ userId, chatId, turnId });
   }
   let constraints: string[];
@@ -908,7 +911,7 @@ function requireWorkspace(input: WorkspaceFrameContextV1): WorkspaceRow {
 }
 function requireWritable(input: WorkspaceFrameContextV1): WorkspaceRow {
   const row = requireWorkspace(input);
-  if (row.state === "frozen" || row.state === "expired" || (row.expiresAt > 0 && row.expiresAt <= Math.floor(Date.now() / 1000))) fail("workspace_frozen", "workspace is not writable");
+  if (!row.turnActive || row.state === "frozen" || row.state === "expired" || (row.expiresAt > 0 && row.expiresAt <= Math.floor(Date.now() / 1000))) fail("workspace_frozen", "workspace is not writable");
   return row;
 }
 function frameCapabilityKey(value: Pick<WorkspaceFrameCapabilityGrantV1, "userId" | "chatId" | "turnId" | "workspaceId" | "frameId">): string {
@@ -1088,9 +1091,20 @@ function currentWorkspaceUsage(database: Database, row: WorkspaceRow): Workspace
   };
 }
 
-function currentWorkspaceForMutation(row: WorkspaceRow): WorkspaceRow {
+let workspaceMutationCommitBoundaryHookForTests: (() => void) | undefined;
+
+export function setWorkspaceMutationCommitBoundaryHookForTests(hook?: (() => void) | null): void {
+  workspaceMutationCommitBoundaryHookForTests = hook ?? undefined;
+}
+
+function currentWorkspaceForMutation(row: WorkspaceRow, allowFrozen = false): WorkspaceRow {
   const current = findWorkspace(row.workspaceId, row.userId, row.chatId, row.turnId);
   if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before mutation");
+  const expired = current.state === "expired"
+    || (current.expiresAt > 0 && current.expiresAt <= Math.floor(Date.now() / 1000));
+  if (!current.turnActive || expired || (current.state !== "active" && !(allowFrozen && current.state === "frozen"))) {
+    fail("workspace_frozen", "workspace is not writable");
+  }
   return current;
 }
 
@@ -1235,13 +1249,217 @@ function assertAcyclic(row: WorkspaceRow, taskId: string, dependencies: readonly
   };
   for (const id of graph.keys()) visit(id);
 }
-function mutateWorkspace(row: WorkspaceRow, operation: () => void): number {
-  getDb().transaction(operation)();
+function withWritableWorkspaceTransaction<T>(
+  row: WorkspaceRow,
+  operation: (current: WorkspaceRow) => T,
+  allowFrozen = false,
+): T {
+  workspaceMutationCommitBoundaryHookForTests?.();
+  purgeExpiredFrameCapabilities();
+  const capabilitiesBefore = new Map(frameCapabilities);
+  try {
+    return getDb().transaction(() => operation(currentWorkspaceForMutation(row, allowFrozen)))();
+  } catch (error) {
+    frameCapabilities.clear();
+    for (const [key, grant] of capabilitiesBefore) frameCapabilities.set(key, grant);
+    // SQLite has rolled back. Re-read each restored authority so a Stop or
+    // deadline committed outside this transaction still wins over the snapshot.
+    const restoredScopes = new Set<string>();
+    for (const grant of capabilitiesBefore.values()) {
+      const scope = frameCapabilityKey(grant);
+      if (restoredScopes.has(scope)) continue;
+      restoredScopes.add(scope);
+      try {
+        findWorkspace(grant.workspaceId, grant.userId, grant.chatId, grant.turnId);
+      } catch {
+        invalidateFrameCapabilitiesForTurn(grant);
+      }
+    }
+    throw error;
+  }
+}
+
+function mutateWorkspace(row: WorkspaceRow, operation: () => void, allowFrozen = false): number {
+  withWritableWorkspaceTransaction(row, operation, allowFrozen);
   return row.revision + 1;
 }
 function casWorkspace(row: WorkspaceRow, values: Record<string, unknown>): void {
   const changed = updateRow(getDb(), "agent_turn_workspaces", { ...values, revision: row.revision + 1, updated_at: values.updated_at ?? Math.floor(Date.now() / 1000) }, { workspace_id: row.workspaceId, turn_id: row.turnId, execution_id: row.executionId, user_id: row.userId, chat_id: row.chatId, revision: row.revision });
   if (changed !== 1) fail("stale_revision", "workspace revision is stale");
+}
+export interface TurnWorkspaceMutationReceiptV1 {
+  readonly operationKey: string;
+  readonly segmentId: string;
+  readonly logicalDispatch: number;
+  readonly frameId: string;
+  readonly operationDigest: string;
+  readonly beforeWorkspaceRevision: number;
+  readonly afterWorkspaceRevision: number;
+}
+
+function workspaceMutationReservationV1(
+  raw: AgenticWorkWorkspaceMutationReservationV1,
+): AgenticWorkWorkspaceMutationReservationV1 {
+  if (!raw || raw.version !== 1) fail("invalid_input", "workspace mutation reservation version is invalid");
+  const operationKind = raw.operationKind;
+  if (
+    typeof operationKind !== "string"
+    || (!OPERATIONS.has(operationKind as WorkspaceOperationKindV1)
+      && operationKind !== "assign_child_tasks"
+      && operationKind !== "settle_child_task")
+  ) {
+    fail("invalid_input", "workspace mutation reservation operation kind is invalid");
+  }
+  return Object.freeze({
+    version: 1,
+    operationKey: stringValue(raw.operationKey, "reservation.operationKey", 256),
+    operationKind,
+    segmentId: idValue(raw.segmentId, "reservation.segmentId"),
+    logicalDispatch: integer(raw.logicalDispatch, "reservation.logicalDispatch", 0, 2_147_483_648),
+    frameId: idValue(raw.frameId, "reservation.frameId"),
+  });
+}
+
+function requireWorkspaceMutationOriginV1(
+  database: Database,
+  userId: string,
+  executionId: string,
+  reservation: AgenticWorkWorkspaceMutationReservationV1,
+): void {
+  const origin = database.query("SELECT 1 AS present FROM agent_work_segment_dispatches WHERE user_id = ? AND execution_id = ? AND segment_id = ? AND dispatch_ordinal = ?")
+    .get(userId, executionId, reservation.segmentId, reservation.logicalDispatch);
+  if (!origin) fail("invalid_state", "workspace mutation reservation has no exact durable dispatch origin");
+}
+
+function workspaceMutationReceiptV1(
+  raw: Record<string, unknown>,
+  reservation: AgenticWorkWorkspaceMutationReservationV1,
+): TurnWorkspaceMutationReceiptV1 {
+  const segmentId = idValue(raw.segment_id, "receipt.segmentId");
+  const logicalDispatch = integer(raw.logical_dispatch, "receipt.logicalDispatch", 0, 2_147_483_648);
+  const frameId = idValue(raw.frame_id, "receipt.frameId");
+  if (
+    segmentId !== reservation.segmentId
+    || logicalDispatch !== reservation.logicalDispatch
+    || frameId !== reservation.frameId
+  ) {
+    fail("invalid_state", "workspace operation identity is already bound to another durable owner");
+  }
+  return Object.freeze({
+    operationKey: reservation.operationKey,
+    segmentId,
+    logicalDispatch,
+    frameId,
+    operationDigest: stringValue(raw.operation_digest, "receipt.operationDigest", 64),
+    beforeWorkspaceRevision: integer(raw.before_workspace_revision, "receipt.beforeWorkspaceRevision", 0, Number.MAX_SAFE_INTEGER),
+    afterWorkspaceRevision: integer(raw.after_workspace_revision, "receipt.afterWorkspaceRevision", 0, Number.MAX_SAFE_INTEGER),
+  });
+}
+
+/**
+ * Executes one authenticated turn-workspace mutation and records its exact CAS
+ * effect in the same SQLite transaction. The digest is derived here from the
+ * accepted host operation envelope; callers cannot attest a receipt digest.
+ */
+export function commitTurnWorkspaceMutationWithReceiptV1<T>(input: Readonly<{
+  userId: string;
+  executionId: string;
+  workspaceId: string;
+  expectedRevision: number;
+  reservation: AgenticWorkWorkspaceMutationReservationV1;
+  operationArgs: Readonly<Record<string, unknown>>;
+}>, mutation: () => T): Readonly<{ result: T | null; receipt: TurnWorkspaceMutationReceiptV1 | null }> {
+  const database = getDb();
+  const reservation = workspaceMutationReservationV1(input.reservation);
+  const { expectedRevision: _expectedRevision, revision: _revision, ...canonicalOperationArgs } = input.operationArgs;
+  if (canonicalOperationArgs.frameId !== reservation.frameId) {
+    fail("invalid_input", "workspace mutation reservation frame does not match the authenticated mutation frame");
+  }
+  let committed: Readonly<{ result: T | null; receipt: TurnWorkspaceMutationReceiptV1 | null }> | undefined;
+  database.transaction(() => {
+    requireWorkspaceMutationOriginV1(database, input.userId, input.executionId, reservation);
+    const prior = database.query("SELECT workspace_id, segment_id, logical_dispatch, frame_id, operation_digest, before_workspace_revision, after_workspace_revision FROM agent_work_workspace_receipts WHERE user_id = ? AND execution_id = ? AND operation_key = ?")
+      .get(input.userId, input.executionId, reservation.operationKey) as Record<string, unknown> | null;
+    if (prior) {
+      const receipt = workspaceMutationReceiptV1(prior, reservation);
+      const expectedDigest = createHash("sha256").update(encodeCanonicalPlainData({
+        version: 1,
+        executionId: input.executionId,
+        workspaceId: input.workspaceId,
+        operationKey: reservation.operationKey,
+        operationKind: reservation.operationKind,
+        segmentId: reservation.segmentId,
+        logicalDispatch: reservation.logicalDispatch,
+        frameId: reservation.frameId,
+        operationArgs: canonicalOperationArgs,
+        workspaceRevisionBefore: receipt.beforeWorkspaceRevision,
+        workspaceRevisionAfter: receipt.afterWorkspaceRevision,
+      }), "utf8").digest("hex");
+      if (
+        prior.workspace_id !== input.workspaceId
+        || receipt.operationDigest !== expectedDigest
+        || receipt.afterWorkspaceRevision !== receipt.beforeWorkspaceRevision + 1
+      ) {
+        fail("invalid_state", "workspace operation identity is already bound to another mutation");
+      }
+      committed = Object.freeze({ result: null, receipt });
+      return;
+    }
+    const before = database.query("SELECT workspace_id, revision FROM agent_turn_workspaces WHERE user_id = ? AND execution_id = ? AND workspace_id = ?")
+      .get(input.userId, input.executionId, input.workspaceId) as Record<string, unknown> | null;
+    if (!before || before.revision !== input.expectedRevision) fail("stale_revision", "workspace revision changed before receipted mutation");
+    const result = mutation();
+    const after = database.query("SELECT revision FROM agent_turn_workspaces WHERE user_id = ? AND execution_id = ? AND workspace_id = ?")
+      .get(input.userId, input.executionId, input.workspaceId) as Record<string, unknown> | null;
+    if (!after || typeof after.revision !== "number"
+      || (after.revision !== input.expectedRevision && after.revision !== input.expectedRevision + 1)) {
+      fail("stale_revision", "workspace mutation did not commit an exact contiguous CAS revision");
+    }
+    if (after.revision === input.expectedRevision) {
+      committed = Object.freeze({ result, receipt: null });
+      return;
+    }
+    const operationDigest = createHash("sha256").update(encodeCanonicalPlainData({
+      version: 1,
+      executionId: input.executionId,
+      workspaceId: input.workspaceId,
+      operationKey: reservation.operationKey,
+      operationKind: reservation.operationKind,
+      segmentId: reservation.segmentId,
+      logicalDispatch: reservation.logicalDispatch,
+      frameId: reservation.frameId,
+      operationArgs: canonicalOperationArgs,
+      workspaceRevisionBefore: input.expectedRevision,
+      workspaceRevisionAfter: after.revision,
+    }), "utf8").digest("hex");
+    insertRow(database, "agent_work_workspace_receipts", {
+      user_id: input.userId,
+      execution_id: input.executionId,
+      workspace_id: input.workspaceId,
+      segment_id: reservation.segmentId,
+      logical_dispatch: reservation.logicalDispatch,
+      frame_id: reservation.frameId,
+      operation_key: reservation.operationKey,
+      operation_digest: operationDigest,
+      before_workspace_revision: input.expectedRevision,
+      after_workspace_revision: after.revision,
+      settled_at: Math.floor(Date.now() / 1000),
+    }, ["user_id", "execution_id", "workspace_id", "segment_id", "logical_dispatch", "frame_id", "operation_key", "operation_digest"]);
+    committed = Object.freeze({
+      result,
+      receipt: Object.freeze({
+        operationKey: reservation.operationKey,
+        segmentId: reservation.segmentId,
+        logicalDispatch: reservation.logicalDispatch,
+        frameId: reservation.frameId,
+        operationDigest,
+        beforeWorkspaceRevision: input.expectedRevision,
+        afterWorkspaceRevision: after.revision,
+      }),
+    });
+  })();
+  if (!committed) fail("invalid_state", "workspace receipted mutation did not commit");
+  return committed;
 }
 
 export function createTurnWorkspace(raw: unknown): WorkspaceSnapshotV1 {
@@ -1373,11 +1591,7 @@ export function assignChildTasks(raw: unknown): AssignWorkspaceTasksResultV1 {
   let committedRevision = -1;
   let assignedIds: readonly string[] = [];
   const database = getDb();
-  database.transaction(() => {
-    const row = requireWorkspace(input);
-    if (row.state === "frozen" || row.state === "expired" || (row.expiresAt > 0 && row.expiresAt <= Math.floor(Date.now() / 1000))) {
-      fail("workspace_frozen", "workspace is not writable");
-    }
+  withWritableWorkspaceTransaction(initial, (row) => {
     const taskRows = listWorkspaceRows("agent_workspace_tasks", row);
     const tasksById = new Map(taskRows.map((candidate) => {
       const task = taskFromRow(candidate);
@@ -1429,7 +1643,7 @@ export function assignChildTasks(raw: unknown): AssignWorkspaceTasksResultV1 {
     casWorkspace(row, { updated_at: now });
     committedRevision = row.revision + 1;
     assignedIds = Object.freeze(assignments.map(({ task }) => task.id));
-  })();
+  });
   if (committedRevision < 0 || initial.revision !== input.expectedRevision) fail("stale_revision", "workspace assignment did not commit");
   const committed = requireWorkspace({ ...input, expectedRevision: committedRevision });
   const taskByIdAfterCommit = new Map(listWorkspaceRows("agent_workspace_tasks", committed).map((candidate) => {
@@ -1515,8 +1729,7 @@ export function updateWorkspaceTaskProgress(raw: unknown): WorkspaceTaskV1 {
     fail("task_assignment_conflict", "terminal task cannot receive progress updates");
   }
   mutateWorkspace(row, () => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current) fail("stale_revision", "workspace revision changed before task progress");
+    const current = currentWorkspaceForMutation(row);
     const currentTask = taskById(current, task.id);
     assertAssignedChild(input, currentTask);
     if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
@@ -1646,8 +1859,7 @@ export function submitWorkspaceRootResult(raw: unknown): WorkspaceTaskV1 {
   const submissionBytes = input.state === "completed" ? utf8ByteLength(input.summary) : 0;
   const submissionId = input.state === "completed" ? crypto.randomUUID() : undefined;
   mutateWorkspace(row, () => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current) fail("stale_revision", "workspace revision changed before mutation");
+    const current = currentWorkspaceForMutation(row);
     const currentTask = taskById(current, task.id);
     const currentSubmission = listWorkspaceRows("agent_workspace_submissions", current)
       .find((candidate) => rowString(candidate, ["task_id"]) === currentTask.id);
@@ -1770,8 +1982,7 @@ export function settleWorkspaceChildTask(raw: unknown): WorkspaceTaskV1 {
     fail("task_assignment_conflict", "terminal task cannot be downgraded by child settlement");
   }
   mutateWorkspace(row, () => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current) fail("stale_revision", "workspace revision changed before child settlement");
+    const current = currentWorkspaceForMutation(row);
     const currentTask = taskById(current, task.id);
     if (currentTask.assignedFrameId !== input.assignedFrameId) {
       fail("child_confinement", "child settlement does not match the assigned frame");
@@ -1903,8 +2114,7 @@ export function attachWorkspaceArtifactReference(raw: unknown): WorkspaceArtifac
         fail("duplicate_id", "artifact reference is already attached");
       }
       const assertFence = (): void => {
-        const latest = findWorkspace(current.workspaceId, current.userId, current.chatId, current.turnId);
-        if (!latest || latest.revision !== current.revision) fail("stale_revision", "workspace revision changed while attaching artifact");
+        currentWorkspaceForMutation(current);
       };
       try {
         assertArtifactAttachable(database, {
@@ -2050,7 +2260,7 @@ export function setWorkspaceCompletionMetadata(raw: unknown): WorkspaceSnapshotV
   const next = mutateWorkspace(row, () => {
     if (tableExists(getDb(), "agent_turn_executions")) updateRow(getDb(), "agent_turn_executions", { terminal_code: input.completionCode, updated_at: Math.floor(Date.now() / 1000) }, { id: row.executionId, user_id: row.userId, chat_id: row.chatId });
     casWorkspace(row, { updated_at: Math.floor(Date.now() / 1000) });
-  });
+  }, true);
   return getTurnWorkspace({ ...input, expectedRevision: next });
 }
 function hasAcceptedSubmissionForTask(
@@ -2269,9 +2479,7 @@ export function freezeWorkspaceForCompletionV1(
   if (input.actor !== "host" && input.actor !== "root") fail("forbidden", "only host/root freeze workspaces");
   const database = getDb();
   let result: WorkspaceCompletionPreviewV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace changed before completion freeze");
+  withWritableWorkspaceTransaction(row, (current) => {
     const gates = planWorkspaceCompletion(
       current,
       listWorkspaceRows("agent_workspace_tasks", current).map(taskFromRow),
@@ -2295,6 +2503,7 @@ export function freezeWorkspaceForCompletionV1(
       result = candidate;
       return;
     }
+    currentWorkspaceForMutation(current);
     const now = Math.floor(Date.now() / 1000);
     if (updateRow(database, "agent_turn_workspaces", {
       state: "frozen",
@@ -2310,7 +2519,7 @@ export function freezeWorkspaceForCompletionV1(
       revision: current.revision,
     }) !== 1) fail("stale_revision", "workspace changed during completion freeze");
     result = candidate;
-  })();
+  });
   if (!result) fail("stale_revision", "completion freeze transaction did not complete");
   return result;
 }
@@ -2451,13 +2660,122 @@ function materializeCognitionTemplates(
   return plan;
 }
 
+function persistCognitionWorkspaceReceipt(
+  database: Database,
+  row: WorkspaceRow,
+  update: CognitionWorkspaceActivationUpdateV1,
+  reservation: AgenticWorkWorkspaceMutationReservationV1,
+  nextRevision: number,
+  now: number,
+): TurnWorkspaceMutationReceiptV1 {
+  requireWorkspaceMutationOriginV1(database, row.userId, row.executionId, reservation);
+  const operationDigest = createHash("sha256").update(encodeCanonicalPlainData({
+    version: 1,
+    executionId: row.executionId,
+    workspaceId: row.workspaceId,
+    operationKey: reservation.operationKey,
+    operationKind: reservation.operationKind,
+    segmentId: reservation.segmentId,
+    logicalDispatch: reservation.logicalDispatch,
+    frameId: reservation.frameId,
+    taskId: update.taskId,
+    transition: update.transition,
+    state: update.state,
+    activation: update.activation,
+    materializeTemplates: update.materializeTemplates,
+    workspaceRevisionBefore: row.revision,
+    workspaceRevisionAfter: nextRevision,
+  }), "utf8").digest("hex");
+  const existing = database.query("SELECT workspace_id, segment_id, logical_dispatch, frame_id, operation_digest, before_workspace_revision, after_workspace_revision FROM agent_work_workspace_receipts WHERE user_id = ? AND execution_id = ? AND operation_key = ?")
+    .get(row.userId, row.executionId, reservation.operationKey) as Record<string, unknown> | null;
+  if (existing) {
+    const receipt = workspaceMutationReceiptV1(existing, reservation);
+    const exact = existing.workspace_id === row.workspaceId
+      && receipt.operationDigest === operationDigest
+      && receipt.beforeWorkspaceRevision === row.revision
+      && receipt.afterWorkspaceRevision === nextRevision;
+    if (!exact) fail("invalid_state", "workspace operation identity is already bound to another mutation");
+    return receipt;
+  }
+  insertRow(database, "agent_work_workspace_receipts", {
+    user_id: row.userId,
+    execution_id: row.executionId,
+    workspace_id: row.workspaceId,
+    segment_id: reservation.segmentId,
+    logical_dispatch: reservation.logicalDispatch,
+    frame_id: reservation.frameId,
+    operation_key: reservation.operationKey,
+    operation_digest: operationDigest,
+    before_workspace_revision: row.revision,
+    after_workspace_revision: nextRevision,
+    settled_at: now,
+  }, ["user_id", "execution_id", "workspace_id", "segment_id", "logical_dispatch", "frame_id", "operation_key", "operation_digest"]);
+  return Object.freeze({
+    operationKey: reservation.operationKey,
+    segmentId: reservation.segmentId,
+    logicalDispatch: reservation.logicalDispatch,
+    frameId: reservation.frameId,
+    operationDigest,
+    beforeWorkspaceRevision: row.revision,
+    afterWorkspaceRevision: nextRevision,
+  });
+}
+
+function requireCognitionWorkspaceReceipt(
+  database: Database,
+  row: WorkspaceRow,
+  rawReservation: AgenticWorkWorkspaceMutationReservationV1,
+): TurnWorkspaceMutationReceiptV1 {
+  const reservation = workspaceMutationReservationV1(rawReservation);
+  requireWorkspaceMutationOriginV1(database, row.userId, row.executionId, reservation);
+  const raw = database.query("SELECT workspace_id, segment_id, logical_dispatch, frame_id, operation_digest, before_workspace_revision, after_workspace_revision FROM agent_work_workspace_receipts WHERE user_id = ? AND execution_id = ? AND operation_key = ?")
+    .get(row.userId, row.executionId, reservation.operationKey) as Record<string, unknown> | null;
+  if (!raw || raw.workspace_id !== row.workspaceId) {
+    fail("invalid_state", "committed cognition mutation has no exact durable workspace receipt");
+  }
+  const receipt = workspaceMutationReceiptV1(raw, reservation);
+  if (receipt.afterWorkspaceRevision !== row.revision || !/^[0-9a-f]{64}$/.test(receipt.operationDigest)) {
+    fail("invalid_state", "committed cognition mutation has no exact durable workspace receipt");
+  }
+  return receipt;
+}
+
+function cognitionWorkspaceReceiptFields(
+  receipt: TurnWorkspaceMutationReceiptV1,
+): Pick<CognitionWorkspaceCommitResultV1, "operationKey" | "segmentId" | "logicalDispatch" | "frameId" | "operationDigest"> {
+  return Object.freeze({
+    operationKey: receipt.operationKey,
+    segmentId: receipt.segmentId,
+    logicalDispatch: receipt.logicalDispatch,
+    frameId: receipt.frameId,
+    operationDigest: receipt.operationDigest,
+  });
+}
+function cognitionMutationReservationV1(
+  update: CognitionWorkspaceActivationUpdateV1,
+  expectedFrameId: string | undefined,
+  expectedOperationKind: AgenticWorkWorkspaceMutationReservationV1["operationKind"],
+): AgenticWorkWorkspaceMutationReservationV1 {
+  const reservation = workspaceMutationReservationV1(update.reservation);
+  if (!expectedFrameId || reservation.frameId !== expectedFrameId) {
+    fail("invalid_input", "cognition mutation reservation frame does not match the authenticated mutation frame");
+  }
+  if (reservation.operationKind !== expectedOperationKind) {
+    fail("invalid_input", "cognition mutation reservation does not match the authenticated operation");
+  }
+  return reservation;
+}
+
 function cognitionUpdateValues(
   row: WorkspaceRow,
   update: CognitionWorkspaceActivationUpdateV1,
   now: number,
-): { readonly state: CognitionActivationStateV1; readonly materializedTaskIds: readonly string[]; readonly revision: number } {
+  expectedFrameId: string | undefined,
+  expectedOperationKind: AgenticWorkWorkspaceMutationReservationV1["operationKind"],
+): { readonly state: CognitionActivationStateV1; readonly materializedTaskIds: readonly string[]; readonly revision: number; readonly receipt: TurnWorkspaceMutationReceiptV1 } {
   if (update.state.workspaceRevision !== row.revision + 1) fail("stale_revision", "cognition activation revision does not match workspace CAS");
   if (update.activation.state.workspaceRevision !== row.revision) fail("stale_revision", "cognition activation observed a stale workspace revision");
+  const reservation = cognitionMutationReservationV1(update, expectedFrameId, expectedOperationKind);
   const database = getDb();
   const usage = currentWorkspaceUsage(database, row);
   const materialized = materializeCognitionTemplates(database, row, update.materializeTemplates, now);
@@ -2479,7 +2797,8 @@ function cognitionUpdateValues(
     revision: row.revision,
   });
   if (changed !== 1) fail("stale_revision", "workspace revision changed during cognition activation");
-  return Object.freeze({ state: update.state, materializedTaskIds: materialized.ids, revision: nextRevision });
+  const receipt = persistCognitionWorkspaceReceipt(database, row, update, reservation, nextRevision, now);
+  return Object.freeze({ state: update.state, materializedTaskIds: materialized.ids, revision: nextRevision, receipt });
 }
 
 function requireCognitionWorkspaceUpdate(
@@ -2513,9 +2832,7 @@ export function activateWorkspaceCognitionAtPhase(
   if (factory.state.workspaceRevision !== row.revision) fail("stale_revision", "cognition phase state is stale for workspace CAS");
   const database = getDb();
   let result: CognitionWorkspacePhaseResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed during cognition phase activation");
+  withWritableWorkspaceTransaction(row, (current) => {
     const update = factory.update(factory.state);
     const now = Math.floor(Date.now() / 1000);
     const usage = currentWorkspaceUsage(database, current);
@@ -2544,7 +2861,7 @@ export function activateWorkspaceCognitionAtPhase(
       activation: update.activation,
       materializedTaskIds: materialized.ids,
     });
-  })();
+  });
   if (!result) fail("stale_revision", "cognition phase activation transaction did not commit");
   return result;
 }
@@ -2670,9 +2987,7 @@ export function createWorkspaceTaskWithCognition(
   const byteCount = utf8ByteLength(input.title) + utf8ByteLength(objective) + utf8ByteLength(JSON.stringify(input.dependencyIds));
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition task creation");
+  withWritableWorkspaceTransaction(row, (current) => {
     const taskId = allocateWritableTaskId(current, input.taskId);
     assertAcyclic(current, taskId, input.dependencyIds);
     const usage = currentWorkspaceUsage(database, current);
@@ -2704,7 +3019,7 @@ export function createWorkspaceTaskWithCognition(
       updated_at: now,
     });
     const update = cognitionActivationUpdate(current, factory);
-    const committed = cognitionUpdateValues(current, update, now);
+    const committed = cognitionUpdateValues(current, update, now, input.frameId, "create_task");
     result = Object.freeze({
       workspaceRevision: committed.revision,
       state: committed.state,
@@ -2712,9 +3027,9 @@ export function createWorkspaceTaskWithCognition(
       materializedTaskIds: committed.materializedTaskIds,
       taskId,
       transition: update.transition,
-      ...(update.operationKey ? { operationKey: update.operationKey } : {}),
+      ...cognitionWorkspaceReceiptFields(committed.receipt),
     });
-  })();
+  });
   if (!result) fail("stale_revision", "cognition task creation transaction did not commit");
   return result;
 }
@@ -2733,9 +3048,7 @@ export function updateWorkspaceTaskProgressWithCognition(
   }
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current) fail("stale_revision", "workspace revision changed before cognition transition");
+  withWritableWorkspaceTransaction(row, (current) => {
     const currentTask = taskById(current, task.id);
     assertAssignedChild(input, currentTask);
     if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
@@ -2761,7 +3074,7 @@ export function updateWorkspaceTaskProgressWithCognition(
       chat_id: current.chatId,
       revision: currentTask.revision,
     }) !== 1) fail("stale_revision", "task revision changed before cognition transition");
-    const committed = cognitionUpdateValues(current, update, now);
+    const committed = cognitionUpdateValues(current, update, now, input.frameId, "update_assigned_progress");
     result = Object.freeze({
       workspaceRevision: committed.revision,
       state: committed.state,
@@ -2769,9 +3082,9 @@ export function updateWorkspaceTaskProgressWithCognition(
       materializedTaskIds: committed.materializedTaskIds,
       taskId: update.taskId,
       transition: update.transition,
-      ...(update.operationKey ? { operationKey: update.operationKey } : {}),
+      ...cognitionWorkspaceReceiptFields(committed.receipt),
     });
-  })();
+  });
   if (!result) fail("stale_revision", "cognition workspace transaction did not commit");
   return result;
 }
@@ -2797,9 +3110,7 @@ export function submitWorkspaceChildResultWithCognition(
   const submissionBytes = input.byteCount + utf8ByteLength(input.summary);
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition submission");
+  withWritableWorkspaceTransaction(row, (current) => {
     const currentTask = taskById(current, task.id);
     if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
     assertAssignedChild(input, currentTask);
@@ -2840,9 +3151,17 @@ export function submitWorkspaceChildResultWithCognition(
     const update = cognitionActivationUpdate(current, factory);
     if (update.taskId !== task.id) fail("invalid_input", "cognition submission task does not match persisted task");
     requireCognitionWorkspaceUpdate(current, update);
-    const committed = cognitionUpdateValues(current, update, now);
-    result = Object.freeze({ workspaceRevision: committed.revision, state: committed.state, activation: update.activation, materializedTaskIds: committed.materializedTaskIds, taskId: update.taskId, transition: update.transition, ...(update.operationKey ? { operationKey: update.operationKey } : {}) });
-  })();
+    const committed = cognitionUpdateValues(current, update, now, input.frameId, "submit_child_result");
+    result = Object.freeze({
+      workspaceRevision: committed.revision,
+      state: committed.state,
+      activation: update.activation,
+      materializedTaskIds: committed.materializedTaskIds,
+      taskId: update.taskId,
+      transition: update.transition,
+      ...cognitionWorkspaceReceiptFields(committed.receipt),
+    });
+  });
   if (!result) fail("stale_revision", "cognition submission transaction did not commit");
   return result;
 }
@@ -2853,6 +3172,7 @@ export function submitWorkspaceRootResultWithCognition(
   const input = validateSubmitWorkspaceRootResultInput(raw);
   const row = requireWritable(input);
   requireCapability(input, "submit_root_result", raw);
+  const database = getDb();
   const task = taskById(row, input.taskId);
   if (task.assignedFrameId !== null) fail("child_confinement", "root may not settle a child-assigned task");
   const existingSubmission = listWorkspaceRows("agent_workspace_submissions", row)
@@ -2864,14 +3184,12 @@ export function submitWorkspaceRootResultWithCognition(
     const update = cognitionActivationUpdate(row, factory);
     if (update.taskId !== task.id) fail("invalid_input", "cognition root replay task does not match persisted task");
     if (update.transition !== input.state) fail("invalid_state", "cognition root replay transition does not match persisted task");
-    if (
-      typeof update.operationKey !== "string"
-      || update.operationKey.length === 0
-      || taskOperationKey(row, task.id) !== update.operationKey
-    ) {
+    const reservation = cognitionMutationReservationV1(update, input.frameId, "submit_root_result");
+    if (taskOperationKey(row, task.id) !== reservation.operationKey) {
       fail("task_assignment_conflict", "terminal cognition root operation key does not match the committed result");
     }
     requireCognitionWorkspaceUpdate(row, update);
+    const receipt = requireCognitionWorkspaceReceipt(database, row, reservation);
     return Object.freeze({
       workspaceRevision: row.revision,
       state: factory.state,
@@ -2879,15 +3197,12 @@ export function submitWorkspaceRootResultWithCognition(
       materializedTaskIds: Object.freeze([]),
       taskId: update.taskId,
       transition: update.transition,
-      operationKey: update.operationKey,
+      ...cognitionWorkspaceReceiptFields(receipt),
     });
   }
   const submissionBytes = input.state === "completed" ? utf8ByteLength(input.summary) : 0;
-  const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition root result");
+  withWritableWorkspaceTransaction(row, (current) => {
     const currentTask = taskById(current, task.id);
     if (currentTask.assignedFrameId !== null) fail("child_confinement", "root may not settle a child-assigned task");
     const currentSubmission = listWorkspaceRows("agent_workspace_submissions", current)
@@ -2899,14 +3214,12 @@ export function submitWorkspaceRootResultWithCognition(
       const replay = cognitionActivationUpdate(current, factory);
       if (replay.taskId !== currentTask.id) fail("invalid_input", "cognition root replay task does not match persisted task");
       if (replay.transition !== input.state) fail("invalid_state", "cognition root replay transition does not match persisted task");
-      if (
-        typeof replay.operationKey !== "string"
-        || replay.operationKey.length === 0
-        || taskOperationKey(current, currentTask.id) !== replay.operationKey
-      ) {
+      const replayReservation = cognitionMutationReservationV1(replay, input.frameId, "submit_root_result");
+      if (taskOperationKey(current, currentTask.id) !== replayReservation.operationKey) {
         fail("task_assignment_conflict", "terminal cognition root operation key does not match the committed result");
       }
       requireCognitionWorkspaceUpdate(current, replay);
+      const receipt = requireCognitionWorkspaceReceipt(database, current, replayReservation);
       result = Object.freeze({
         workspaceRevision: current.revision,
         state: factory.state,
@@ -2914,7 +3227,7 @@ export function submitWorkspaceRootResultWithCognition(
         materializedTaskIds: Object.freeze([]),
         taskId: replay.taskId,
         transition: replay.transition,
-        operationKey: replay.operationKey,
+        ...cognitionWorkspaceReceiptFields(receipt),
       });
       return;
     }
@@ -2923,12 +3236,10 @@ export function submitWorkspaceRootResultWithCognition(
     const update = cognitionActivationUpdate(current, factory);
     if (update.taskId !== currentTask.id) fail("invalid_input", "cognition root result task does not match persisted task");
     if (update.transition !== input.state) fail("invalid_state", "cognition root result transition does not match requested state");
-    if (typeof update.operationKey !== "string" || update.operationKey.length === 0) {
-      fail("invalid_input", "cognition root result operation key is required");
-    }
+    const reservation = cognitionMutationReservationV1(update, input.frameId, "submit_root_result");
     requireCognitionWorkspaceUpdate(current, update);
     const previousOperationKey = taskOperationKey(current, currentTask.id);
-    if (previousOperationKey !== null && previousOperationKey !== update.operationKey) {
+    if (previousOperationKey !== null && previousOperationKey !== reservation.operationKey) {
       fail("task_assignment_conflict", "cognition root operation identity is already committed");
     }
     const now = Math.floor(Date.now() / 1000);
@@ -2941,7 +3252,7 @@ export function submitWorkspaceRootResultWithCognition(
       if (updateRow(database, "agent_workspace_tasks", {
         state: "failed",
         summary: input.summary,
-        cas_owner: update.operationKey,
+        cas_owner: reservation.operationKey,
         cas_expires_at: rootResultPolicyIdentity(input),
         revision: currentTask.revision + 1,
         updated_at: now,
@@ -2981,7 +3292,7 @@ export function submitWorkspaceRootResultWithCognition(
         state: "completed",
         progress: 1,
         summary: input.summary,
-        cas_owner: update.operationKey,
+        cas_owner: reservation.operationKey,
         cas_expires_at: rootResultPolicyIdentity(input),
         revision: currentTask.revision + 1,
         updated_at: now,
@@ -2994,7 +3305,7 @@ export function submitWorkspaceRootResultWithCognition(
         revision: currentTask.revision,
       }) !== 1) fail("stale_revision", "task revision changed before cognition root result");
     }
-    const committed = cognitionUpdateValues(current, update, now);
+    const committed = cognitionUpdateValues(current, update, now, input.frameId, "submit_root_result");
     result = Object.freeze({
       workspaceRevision: committed.revision,
       state: committed.state,
@@ -3002,9 +3313,9 @@ export function submitWorkspaceRootResultWithCognition(
       materializedTaskIds: committed.materializedTaskIds,
       taskId: update.taskId,
       transition: update.transition,
-      operationKey: update.operationKey,
+      ...cognitionWorkspaceReceiptFields(committed.receipt),
     });
-  })();
+  });
   if (!result) fail("stale_revision", "cognition root result transaction did not commit");
   return result;
 }
@@ -3016,6 +3327,7 @@ export function settleWorkspaceChildTaskWithCognition(
   const input = validateSettleWorkspaceChildTaskInput(raw);
   const row = requireWritable(input);
   requireCapability(input, "update_assigned_progress", raw);
+  const database = getDb();
   const task = taskById(row, input.taskId);
   if (task.assignedFrameId !== input.assignedFrameId) {
     fail("child_confinement", "child settlement does not match the assigned frame");
@@ -3027,14 +3339,12 @@ export function settleWorkspaceChildTaskWithCognition(
     const update = cognitionActivationUpdate(row, factory);
     if (update.taskId !== task.id) fail("invalid_input", "cognition child settlement task does not match persisted task");
     if (update.transition !== input.state) fail("invalid_state", "cognition child settlement transition does not match persisted task");
-    if (
-      typeof update.operationKey !== "string"
-      || update.operationKey.length === 0
-      || taskOperationKey(row, task.id) !== update.operationKey
-    ) {
+    const reservation = cognitionMutationReservationV1(update, input.frameId, "settle_child_task");
+    if (taskOperationKey(row, task.id) !== reservation.operationKey) {
       fail("task_assignment_conflict", "terminal task settlement operation key does not match the committed settlement");
     }
     requireCognitionWorkspaceUpdate(row, update);
+    const receipt = requireCognitionWorkspaceReceipt(database, row, reservation);
     return Object.freeze({
       workspaceRevision: row.revision,
       state: factory.state,
@@ -3042,15 +3352,12 @@ export function settleWorkspaceChildTaskWithCognition(
       materializedTaskIds: Object.freeze([]),
       taskId: update.taskId,
       transition: update.transition,
-      operationKey: update.operationKey,
+      ...cognitionWorkspaceReceiptFields(receipt),
     });
   }
 
-  const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current) fail("stale_revision", "workspace revision changed before child settlement");
+  withWritableWorkspaceTransaction(row, (current) => {
     const currentTask = taskById(current, task.id);
     if (currentTask.assignedFrameId !== input.assignedFrameId) fail("child_confinement", "child settlement does not match the assigned frame");
     if (currentTask.state === "completed" || currentTask.state === "cancelled" || currentTask.state === "failed") {
@@ -3060,14 +3367,12 @@ export function settleWorkspaceChildTaskWithCognition(
       const update = cognitionActivationUpdate(current, factory);
       if (update.taskId !== currentTask.id) fail("invalid_input", "cognition child settlement task does not match persisted task");
       if (update.transition !== input.state) fail("invalid_state", "cognition child settlement transition does not match persisted task");
-      if (
-        typeof update.operationKey !== "string"
-        || update.operationKey.length === 0
-        || taskOperationKey(current, currentTask.id) !== update.operationKey
-      ) {
+      const reservation = cognitionMutationReservationV1(update, input.frameId, "settle_child_task");
+      if (taskOperationKey(current, currentTask.id) !== reservation.operationKey) {
         fail("task_assignment_conflict", "terminal task settlement operation key does not match the committed settlement");
       }
       requireCognitionWorkspaceUpdate(current, update);
+      const receipt = requireCognitionWorkspaceReceipt(database, current, reservation);
       result = Object.freeze({
         workspaceRevision: current.revision,
         state: factory.state,
@@ -3075,7 +3380,7 @@ export function settleWorkspaceChildTaskWithCognition(
         materializedTaskIds: Object.freeze([]),
         taskId: update.taskId,
         transition: update.transition,
-        operationKey: update.operationKey,
+        ...cognitionWorkspaceReceiptFields(receipt),
       });
       return;
     }
@@ -3083,9 +3388,7 @@ export function settleWorkspaceChildTaskWithCognition(
     if (currentTask.revision !== task.revision) fail("stale_revision", "task revision is stale");
     const update = cognitionActivationUpdate(current, factory);
     if (update.taskId !== currentTask.id) fail("invalid_input", "cognition child settlement task does not match persisted task");
-    if (typeof update.operationKey !== "string" || update.operationKey.length === 0) {
-      fail("invalid_input", "cognition child settlement operation key is required");
-    }
+    const reservation = cognitionMutationReservationV1(update, input.frameId, "settle_child_task");
     if (update.transition !== input.state) fail("invalid_state", "cognition child settlement transition does not match persisted task");
     requireCognitionWorkspaceUpdate(current, update);
     const now = Math.floor(Date.now() / 1000);
@@ -3093,12 +3396,12 @@ export function settleWorkspaceChildTaskWithCognition(
     // the committed cognition settlement key in the durable task row so a
     // later service call cannot accept a new key from terminal state alone.
     const previousOperationKey = taskOperationKey(current, currentTask.id);
-    if (previousOperationKey !== null && previousOperationKey !== update.operationKey) {
+    if (previousOperationKey !== null && previousOperationKey !== reservation.operationKey) {
       fail("task_assignment_conflict", "task settlement operation identity is already committed");
     }
     if (updateRow(database, "agent_workspace_tasks", {
       state: input.state,
-      cas_owner: update.operationKey,
+      cas_owner: reservation.operationKey,
       revision: currentTask.revision + 1,
       updated_at: now,
     }, {
@@ -3109,7 +3412,7 @@ export function settleWorkspaceChildTaskWithCognition(
       chat_id: current.chatId,
       revision: currentTask.revision,
     }) !== 1) fail("stale_revision", "task revision changed before child settlement");
-    const committed = cognitionUpdateValues(current, update, now);
+    const committed = cognitionUpdateValues(current, update, now, input.frameId, "settle_child_task");
     result = Object.freeze({
       workspaceRevision: committed.revision,
       state: committed.state,
@@ -3117,9 +3420,9 @@ export function settleWorkspaceChildTaskWithCognition(
       materializedTaskIds: committed.materializedTaskIds,
       taskId: update.taskId,
       transition: update.transition,
-      operationKey: update.operationKey,
+      ...cognitionWorkspaceReceiptFields(committed.receipt),
     });
-  })();
+  });
   if (!result) fail("stale_revision", "cognition child settlement transaction did not commit");
   return result;
 }
@@ -3138,9 +3441,7 @@ export function acceptWorkspaceSubmissionWithCognition(
   if (submission.state === "rejected") fail("submission_rejected", "rejected submissions cannot be accepted");
   const database = getDb();
   let result: CognitionWorkspaceCommitResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition acceptance");
+  withWritableWorkspaceTransaction(row, (current) => {
     const currentSubmission = submissionById(current, input.submissionId);
     const currentTask = submissionTaskForAcceptance(current, input, currentSubmission);
     const now = Math.floor(Date.now() / 1000);
@@ -3149,9 +3450,17 @@ export function acceptWorkspaceSubmissionWithCognition(
     const update = cognitionActivationUpdate(current, factory);
     if (update.taskId !== currentSubmission.taskId) fail("invalid_input", "cognition acceptance task does not match persisted submission task");
     requireCognitionWorkspaceUpdate(current, update);
-    const committed = cognitionUpdateValues(current, update, now);
-    result = Object.freeze({ workspaceRevision: committed.revision, state: committed.state, activation: update.activation, materializedTaskIds: committed.materializedTaskIds, taskId: update.taskId, transition: update.transition, ...(update.operationKey ? { operationKey: update.operationKey } : {}) });
-  })();
+    const committed = cognitionUpdateValues(current, update, now, input.frameId, "accept_submission");
+    result = Object.freeze({
+      workspaceRevision: committed.revision,
+      state: committed.state,
+      activation: update.activation,
+      materializedTaskIds: committed.materializedTaskIds,
+      taskId: update.taskId,
+      transition: update.transition,
+      ...cognitionWorkspaceReceiptFields(committed.receipt),
+    });
+  });
   if (!result) fail("stale_revision", "cognition acceptance transaction did not commit");
   return result;
 }
@@ -3183,9 +3492,7 @@ export function freezeWorkspaceForCompletionWithCognition(
   if (input.actor !== "host" && input.actor !== "root") fail("forbidden", "only host/root freeze workspaces");
   const database = getDb();
   let result: CognitionWorkspaceCompletionResultV1 | undefined;
-  database.transaction(() => {
-    const current = findWorkspace(input.workspaceId, input.userId, input.chatId, input.turnId);
-    if (!current || current.revision !== row.revision) fail("stale_revision", "workspace revision changed before cognition completion");
+  withWritableWorkspaceTransaction(row, (current) => {
     const update = cognitionCompletionUpdate(current, factory);
     if (update.state.workspaceRevision !== current.revision + 1) fail("stale_revision", "cognition completion revision does not match workspace CAS");
     const preview = planCognitionCompletion(
@@ -3218,6 +3525,7 @@ export function freezeWorkspaceForCompletionWithCognition(
         fail("completion_preparation_failed", "Completion handoff preparation failed");
       }
     }
+    currentWorkspaceForMutation(current);
     if (updateRow(database, "agent_turn_workspaces", {
       state: candidate.accepted ? "frozen" : "active",
       frozen_at: candidate.accepted ? now : null,
@@ -3245,7 +3553,7 @@ export function freezeWorkspaceForCompletionWithCognition(
         }),
       } : {}),
     });
-  })();
+  });
   if (!result) fail("stale_revision", "cognition completion transaction did not commit");
   return result;
 }
@@ -4109,6 +4417,18 @@ function persistentSessionFromRow(raw: Record<string, unknown>): PersistentWorks
     updatedAt: rowNumber(raw, ["updated_at"]),
     terminalAt: raw.terminal_at === null || raw.terminal_at === undefined ? null : rowNumber(raw, ["terminal_at"]),
   });
+}
+
+/** Host recovery lookup; returns only the exact active/durable execution binding. */
+export function getPersistentWorkspaceTurnSessionByExecutionV1(raw: unknown): PersistentWorkspaceTurnSession | null {
+  if (!isRecord(raw)) persistentFail("invalid_input", "persistent session identity must be an object");
+  persistentAllowed(raw, ["userId", "executionId"], "persistentSessionByExecution");
+  const userId = idValue(raw.userId, "persistentSessionByExecution.userId");
+  const executionId = idValue(raw.executionId, "persistentSessionByExecution.executionId");
+  const row = getDb().query(
+    "SELECT * FROM persistent_workspace_turn_sessions WHERE user_id = ? AND execution_id = ? LIMIT 1",
+  ).get(userId, executionId) as Record<string, unknown> | null;
+  return row ? persistentSessionFromRow(row) : null;
 }
 
 function persistentArtifactFromRow(raw: Record<string, unknown>): PersistentWorkspaceArtifactV1 {

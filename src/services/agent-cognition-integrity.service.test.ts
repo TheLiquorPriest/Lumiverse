@@ -83,7 +83,7 @@ describe("agent cognition integrity", () => {
   test("freezes Loom revisions and parser caps into stable repair reasons", () => {
     const graph = {
       version: 1,
-      policies: { workPolicy: [{ blockId: "block-1", expectedPresetRevision: 1, expectedBlockRevision: 1 }], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
+      policies: { workPolicy: [{ blockId: "block-1", expectedPresetRevision: 1, expectedBlockRevision: 1, promptOrder: 0 }], workspaceUsage: [], completionCriteria: [], renderPolicy: [] },
       templates: [],
     };
     const missingBlock = validateCognitionIntegrity(snapshot({

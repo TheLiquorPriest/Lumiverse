@@ -91,6 +91,7 @@ class TestProvider extends OpenAICompatibleProvider {
     apiKeyRequired: false,
     modelListStyle: "openai" as const,
     toolCalling: true,
+    requiredToolChoice: false,
     nativeToolContinuation: false,
     toolContinuationMode: "legacy" as const,
     toolsDisabledFinalization: true,

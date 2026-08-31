@@ -287,6 +287,7 @@ export interface AgentRunStopResponseV2 {
   readonly version: 2;
   readonly status: AgentRunStopResultV2;
   readonly turnId: string;
+  readonly generationId: string;
   readonly revision: number;
   readonly target: AgentWorkTargetIdentityV1;
   readonly workPhase: AgentRunPublicPhaseV2;
@@ -666,6 +667,8 @@ export interface AgentPromptEvidenceV1 {
   readonly id: string;
   readonly sourceId: string;
   readonly sourceRevision: AgentPromptRevisionV1;
+  /** Canonical zero-based source occurrence: the frozen Loom source coordinate for cognition, assembly source index otherwise. */
+  readonly promptOrder: number;
   readonly destination: AgentPromptEvidenceDestinationV1;
   readonly role: "system" | "user" | "assistant" | "tool" | "context" | "policy";
   readonly correlation: AgentInspectionCorrelationV1;
@@ -842,6 +845,84 @@ export interface AgentRunInspectionRetryV1 {
   readonly linkedAttemptId: string | null;
 }
 
+export type AgentWorkSegmentBoundaryClassV1 =
+  | "tool_action"
+  | "tool_free_stop"
+  | "reasoning_only_stop"
+  | "reasoning_only_length"
+  | "empty_provider_response"
+  | "provider_protocol_failure";
+
+export interface AgentWorkSegmentUsageInspectionV1 {
+  readonly providerDispatches: number;
+  readonly providerInputTokens: number;
+  readonly providerOutputTokens: number;
+  readonly providerTotalTokens: number;
+  readonly billedOutputTokens: number;
+  readonly toolCalls: number;
+  readonly workspaceOperations: number;
+  readonly unsignedBoundaries: number;
+  readonly receiveBytes: number;
+  readonly publishedOutputBytes: number;
+}
+
+export interface AgentWorkSegmentIdentityInspectionV1 {
+  readonly segmentId: string;
+  readonly phaseId: string | null;
+  readonly phaseIndex: number;
+  readonly phaseOccurrence: number;
+  readonly segmentOrdinal: number;
+}
+
+/** Explicit owner-safe projection. It cannot carry prompts, credentials, endpoints, or continuation state. */
+export interface AgentWorkSegmentInspectionProjectionV1 {
+  readonly recovery: {
+    readonly state: "active" | "closed";
+    readonly phaseId: string | null;
+    readonly phaseIndex: number | null;
+    readonly phaseOccurrence: number | null;
+    readonly nextSegmentOrdinal: number;
+    readonly currentSegmentId: string | null;
+    readonly workspaceRevision: number;
+    readonly terminalCloseResult: "failed" | "exhausted" | "cancelled" | null;
+    readonly terminalBoundaryClass: AgentWorkSegmentBoundaryClassV1 | null;
+    readonly usage: AgentWorkSegmentUsageInspectionV1 & { readonly segments: number };
+  };
+  readonly segments: readonly {
+    readonly identity: AgentWorkSegmentIdentityInspectionV1;
+    readonly lifecycle: "admitted" | "running" | "closed" | "interrupted" | "failed" | "exhausted" | "cancelled";
+    readonly workspaceRevision: number;
+    readonly boundaryClass: AgentWorkSegmentBoundaryClassV1 | null;
+    readonly closeResult: "phase_advanced" | "phase_repeated" | "same_phase_rollover" | "work_complete" | "failed" | "exhausted" | "cancelled" | null;
+    readonly closedWorkspaceRevision: number | null;
+    readonly usage: AgentWorkSegmentUsageInspectionV1;
+  }[];
+  readonly dispatches: readonly {
+    readonly dispatchId: string;
+    readonly segmentId: string;
+    readonly dispatchOrdinal: number;
+    readonly lifecycle: "reserved" | "in_flight" | "settled" | "interrupted";
+    readonly toolMode: "ordinary" | "required";
+    readonly budgetClass: "normal" | "recovery";
+    readonly workspaceRevision: number;
+    readonly settledWorkspaceRevision: number | null;
+    readonly boundaryClass: AgentWorkSegmentBoundaryClassV1 | null;
+    readonly usage: AgentWorkSegmentUsageInspectionV1 | null;
+  }[];
+  readonly transitions: readonly {
+    readonly transitionId: string;
+    readonly handoffId: string;
+    readonly transitionKind: "advance" | "repeat" | "rollover" | "terminal";
+    readonly sourceSegment: AgentWorkSegmentIdentityInspectionV1;
+    readonly sourceWorkspaceRevision: number;
+    readonly targetPhaseId: string | null;
+    readonly targetPhaseIndex: number | null;
+    readonly targetPhaseOccurrence: number | null;
+    readonly targetSegmentOrdinal: number | null;
+    readonly cause: AgentWorkSegmentBoundaryClassV1 | null;
+  }[];
+}
+
 export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 {
   readonly transcript: readonly AgentInspectionTranscriptRecordV1[];
   readonly turnSession: readonly AgentTurnSessionEntryV1[];
@@ -856,6 +937,8 @@ export interface AgentRunInspectionDetailV1 extends AgentRunInspectionSummaryV1 
   readonly workspaceAssociations: readonly AgentWorkspaceAssociationV1[];
   readonly stop: AgentRunInspectionStopV1 | null;
   readonly retry: AgentRunInspectionRetryV1;
+  /** Bounded redacted WORK ledger; null before durable segment authority exists. */
+  readonly workSegments: AgentWorkSegmentInspectionProjectionV1 | null;
   readonly sectionAvailability: readonly AgentInspectionSectionAvailabilityV1[];
 }
 
