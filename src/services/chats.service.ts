@@ -3319,6 +3319,7 @@ export function addSwipe(userId: string, messageId: string, content: string, opt
       message: updated,
       action: "added",
       swipeId: newSwipeId,
+      previousSwipeId: msg.swipe_id,
     },
     userId,
   );

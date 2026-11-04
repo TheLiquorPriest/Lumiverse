@@ -495,7 +495,7 @@ export interface MessageSwipedPayload {
   action: MessageSwipeAction
   /**
    * The swipe index this event concerns:
-   *  - `'added'`     → index of the new swipe (= `message.swipe_id`)
+   *  - `'added'`     → index of the new swipe (= `message.swipe_id` unless staged unselected)
    *  - `'updated'`   → index of the edited swipe
    *  - `'deleted'`   → index that was removed (no longer present in `message.swipes`,
    *                     and `message.swipe_id` may have shifted)
@@ -503,8 +503,8 @@ export interface MessageSwipedPayload {
    */
   swipeId: number
   /**
-   * For `'navigated'` and `'deleted'`: the active swipe index before the change.
-   * Omitted for `'added'` and `'updated'`.
+   * For `'added'`, `'navigated'`, and `'deleted'`: the active swipe index before the change.
+   * Omitted for `'updated'`.
    */
   previousSwipeId?: number
 }

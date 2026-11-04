@@ -784,6 +784,33 @@ describe("recent chats", () => {
     expect(deleteSwipe("u1", "msg-1", 2, { restoreSwipeId: 0 })).toMatchObject({ swipe_id: 1, content: "second" });
   });
 
+  test("swipe-added events report the swipe that was active before the add", async () => {
+    seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+    seedMessage("msg-1", "chat-1", "first", {});
+    const events: EventMessage[] = [];
+    const { promise: delivered, resolve } = Promise.withResolvers<void>();
+    const unsubscribe = eventBus.on(EventType.MESSAGE_SWIPED, (event) => {
+      if (events.push(event) === 3) resolve();
+    });
+    try {
+      addSwipe("u1", "msg-1", "second");
+      cycleSwipe("u1", "msg-1", "left");
+      addSwipe("u1", "msg-1", "staged", { select: false });
+      await delivered;
+    } finally {
+      unsubscribe();
+    }
+    const added = events.filter((event) => event.payload.action === "added").map(({ payload }) => ({
+      swipeId: payload.swipeId,
+      previousSwipeId: payload.previousSwipeId,
+      activeSwipeId: payload.message.swipe_id,
+    }));
+    expect(added).toEqual([
+      { swipeId: 1, previousSwipeId: 0, activeSwipeId: 1 },
+      { swipeId: 2, previousSwipeId: 0, activeSwipeId: 0 },
+    ]);
+  });
+
   test("keeps reasoning scoped to the swipe it belongs to", () => {
     seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
     seedMessage("msg-1", "chat-1", "first swipe", {

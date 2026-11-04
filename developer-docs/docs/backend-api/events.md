@@ -67,7 +67,11 @@ spindle.on('MESSAGE_SWIPED', (payload) => {
   // payload: MessageSwipedPayloadDTO — fully typed
   switch (payload.action) {
     case 'added':
-      // payload.swipeId === payload.message.swipe_id (the new variant)
+      // payload.swipeId is the new variant's slot
+      // payload.previousSwipeId is the slot that was active before the add
+      // (the swipe the new one replaced in view, or the one it was generated from).
+      // Usually payload.swipeId === payload.message.swipe_id; a background-staged
+      // swipe leaves message.swipe_id === payload.previousSwipeId.
       break
     case 'updated':
       // payload.swipeId is the edited slot (may not be the active one)
@@ -93,7 +97,7 @@ spindle.on('MESSAGE_SWIPED', (payload) => {
 | `message` | `ChatMessageDTO` | The full message after the mutation. Use `message.swipes[]` for the current swipe set. |
 | `action` | `'added' \| 'updated' \| 'deleted' \| 'navigated'` | Discriminator for the swipe operation. |
 | `swipeId` | `number` | The swipe index this event concerns. For `deleted`, the slot is no longer present in `message.swipes`; for the other actions, `message.swipes[swipeId]` is the affected variant. |
-| `previousSwipeId` | `number?` | Active swipe index *before* the change. Present for `navigated` and `deleted`; omitted for `added` and `updated`. |
+| `previousSwipeId` | `number?` | Active swipe index *before* the change. Present for `added`, `navigated`, and `deleted`; omitted for `updated`. |
 
 !!! note "Backwards compatibility"
     Subscribers that only read `payload.chatId` and `payload.message` keep working unchanged — the discriminator fields are purely additive.
